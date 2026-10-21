@@ -8,8 +8,8 @@
 //! own detached window, the one placement once the carve is gone.
 //!
 //! Differential across the cooperative multiplex and the OS-thread parallel driver: a child storing at
-//! 8 traps `MemoryFault` on both; the same child storing above the guard returns the value on both. A
-//! spawned thread gets the same treatment.
+//! 8 traps `MemoryFault` on both, which its parent's join answers (#2066); the same child storing above
+//! the guard returns the value on both. A spawned thread gets the same treatment.
 
 #[path = "support/rec.rs"]
 mod rec;
@@ -20,22 +20,25 @@ use temen_interp::{bytecode, Host, Region, Trap, Value};
 use temen_ir::SpawnRec;
 use temen_text::parse_module;
 
-/// Root `(inst, budget, child) -> child`: spawns `child` (func 1's child image, #2219) detached through
-/// the v1 record at 17408, paid from `budget`, and `join`s it. The child stores 7 at `addr` in its own
-/// window and loads it back.
+/// Root `(inst, budget, child) -> status * 1000 + value`: spawns `child` (func 1's child image, #2219)
+/// detached through the spawn record at 17408, paid from `budget`, and `join`s it. The child stores 7 at
+/// `addr` in its own window and loads it back.
 fn child_src(addr: u64) -> String {
     format!(
         r#"memory 17
 func (i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vbud: i32, vmod: i32) {{
-  vm = i64.const 17432
+  vm = i64.const 17416
   i32.store vm vmod
-  vb = i64.const 17436
+  vb = i64.const 17420
   i32.store vb vbud
   vrec = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vinst (vrec)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (vh)
-  return vr
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
+  vk = i64.const 1000
+  vs = i64.mul vr_st vk
+  vt = i64.add vs vr
+  return vt
   }}
 }}
 func (i64) -> (i64) {{
@@ -48,7 +51,7 @@ block 0 (v0: i64) {{
   }}
 }}
 {}"#,
-        rec::segment(17408, &SpawnRec::v1(0))
+        rec::segment(17408, &SpawnRec::default())
     )
 }
 
@@ -81,7 +84,7 @@ block 0 (vsp: i64, varg: i64) {{
 /// The spawning root's powerbox: an instantiator, a budget, and the child image of its func 1.
 fn spawn_host(m: &temen_ir::Module) -> (Host, Vec<Value>) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << 17);
+    let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let child = host.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
     (host, [inst, budget, child].map(Value::I32).to_vec())
@@ -134,16 +137,9 @@ fn none(_: &temen_ir::Module) -> (Host, Vec<Value>) {
 #[test]
 fn child_store_at_null_traps_on_both_engines() {
     let src = child_src(8);
-    assert_eq!(
-        coop(&src, spawn_host),
-        Err(Trap::MemoryFault),
-        "cooperative"
-    );
-    assert_eq!(
-        parallel(&src, spawn_host),
-        Err(Trap::MemoryFault),
-        "parallel"
-    );
+    let faulted = Ok(vec![Value::I64(temen_ir::trap_code::MEMORY_FAULT * 1000)]);
+    assert_eq!(coop(&src, spawn_host), faulted, "cooperative");
+    assert_eq!(parallel(&src, spawn_host), faulted, "parallel");
 }
 
 #[test]

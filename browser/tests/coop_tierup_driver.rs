@@ -20,9 +20,10 @@ use temen_browser::{
     temen_coop_jit_wasm_by_handle_ptr, temen_coop_jit_wasm_by_slot_len, temen_coop_jit_wasm_len,
     temen_coop_jit_wasm_ptr, temen_coop_mapped, temen_coop_mapped_now, temen_coop_nfuncs,
     temen_coop_open, temen_coop_open_fs, temen_coop_paged, temen_coop_pagestate_len,
-    temen_coop_pagestate_ptr, temen_coop_run, temen_coop_set_tierup_floor, temen_coop_shim_ptr,
-    temen_coop_shim_wasm, temen_coop_slot_unit, temen_coop_spill_bytes, temen_coop_spill_ptr,
-    temen_coop_table_gen, temen_coop_table_log2, temen_coop_tierup_win_len,
+    temen_coop_pagestate_ptr, temen_coop_region_emits, temen_coop_reset_hotness, temen_coop_run,
+    temen_coop_set_emit_cap, temen_coop_set_emitted_work, temen_coop_set_hotness,
+    temen_coop_shim_ptr, temen_coop_shim_wasm, temen_coop_slot_unit, temen_coop_spill_bytes,
+    temen_coop_spill_ptr, temen_coop_table_gen, temen_coop_table_log2, temen_coop_tierup_win_len,
     temen_coop_tierup_win_ptr, temen_coop_value, temen_coop_wasm_len, temen_coop_wasm_ptr,
     temen_coop_win_len, temen_coop_win_ptr, temen_framebuffer_height, temen_framebuffer_len,
     temen_framebuffer_ptr, temen_framebuffer_width, temen_onramp_artifact_ptr, temen_onramp_close,
@@ -59,23 +60,22 @@ mod rec;
 /// in this binary across them.
 static FFI_LOCK: Mutex<()> = Mutex::new(());
 
-/// Acquire [`FFI_LOCK`] and disable the #1026 leaf tier-up **size floor** for this test. These
+/// Acquire [`FFI_LOCK`] and tier up every eligible call at its start for this test (#2474). These
 /// differentials exercise the emitted-tier **mechanism** with deliberately tiny synthetic leaves; the
-/// size **policy** (a leaf below the floor stays on the interpreter) is pinned separately in
-/// [`leaf_tierup_size_floor_gates_tiny_and_admits_heavy`]. Floor 0 ⇒ any emittable leaf tiers up, the
-/// behavior these tests were written against. The guard resets to production default on drop so a
+/// **policy** (a call tiers up once the work it does repays the crossing) is pinned separately in
+/// [`calls_tier_up_on_the_work_they_do`]. The guard restores the production default on drop so a
 /// test that does *not* call this (the policy test) sees the real default even after one that did.
-fn ffi_guard() -> FloorGuard {
+fn ffi_guard() -> HotnessGuard {
     let g = FFI_LOCK.lock().unwrap();
-    temen_coop_set_tierup_floor(0);
-    FloorGuard(g)
+    temen_coop_set_hotness(0, 0);
+    HotnessGuard(g)
 }
 // The `MutexGuard` is held purely for its lifetime/Drop (it keeps `FFI_LOCK` locked for the test and
-// resets the floor on drop), never read — so the field trips `dead_code` under `-D warnings`.
-struct FloorGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
-impl Drop for FloorGuard {
+// restores the default on drop), never read — so the field trips `dead_code` under `-D warnings`.
+struct HotnessGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+impl Drop for HotnessGuard {
     fn drop(&mut self) {
-        temen_coop_set_tierup_floor(temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES);
+        temen_coop_reset_hotness();
     }
 }
 
@@ -226,7 +226,14 @@ fn service_coop_on_wasmi(n_results: usize) -> Result<Vec<i64>, i32> {
     let mut params = vec![Val::I32(WIN_BASE as i32), Val::I32(ENV_PTR as i32)];
     params.extend(argv.iter().map(|a| Val::I64(*a)));
     let mut results: Vec<Val> = (0..n_results).map(|_| Val::I64(0)).collect();
+    // #2474: the work the call does is the fuel its code burns, which the driver reports.
+    let fuel = instance.get_global(&store, "fuel");
+    let armed = fuel.map(|g| g.get(&store).i64().unwrap_or(0));
     let ran = f.call(&mut store, &params, &mut results);
+    if let (Some(g), Some(armed)) = (fuel, armed) {
+        let left = g.get(&store).i64().unwrap_or(armed);
+        temen_coop_set_emitted_work(armed.saturating_sub(left).max(0) as u64);
+    }
 
     // Copy emitted writes back into the live window before the task resumes.
     mirror_out(&store);
@@ -285,7 +292,10 @@ fn mirror_in(mut store: impl AsContextMut<Data = Mirror>, mapped: i64) {
 
 /// Copy the mirror back into the pending window.
 fn mirror_out(store: impl wasmi::AsContext<Data = Mirror>) {
-    let (mem, len) = (store.as_context().data().mem.unwrap(), store.as_context().data().len);
+    let (mem, len) = (
+        store.as_context().data().mem.unwrap(),
+        store.as_context().data().len,
+    );
     let mut buf = vec![0u8; len];
     mem.read(&store, WIN_BASE as usize, &mut buf).unwrap();
     // SAFETY: as in `mirror_in`.
@@ -547,7 +557,7 @@ fn coop_jit_invoke_pump_matches_the_bytecode_oracle() {
         temen_status()
     );
 
-    let mut jit_invokes = 0u32;
+    let (mut jit_invokes, mut entries) = (0u32, 0u32);
     loop {
         match temen_coop_run() {
             COOP_RUN_JIT_INVOKE => {
@@ -566,7 +576,16 @@ fn coop_jit_invoke_pump_matches_the_bytecode_oracle() {
                     Err(code) => temen_coop_deliver_jit_trap(code),
                 }
             }
-            COOP_RUN_TIERUP => panic!("unexpected TIERUP from the leafless vm_jit_* guest"),
+            // The worker's entry, which returns 0 at once, is the one function that tiers up
+            // (#1414 ED-1).
+            COOP_RUN_TIERUP => {
+                entries += 1;
+                assert_eq!(temen_coop_func(), 1, "only the worker's entry tiers up");
+                match service_coop_on_wasmi(1) {
+                    Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                    Err(code) => temen_coop_deliver_trap(code),
+                }
+            }
             COOP_RUN_DONE => break,
             ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
         }
@@ -577,6 +596,7 @@ fn coop_jit_invoke_pump_matches_the_bytecode_oracle() {
         jit_invokes, 1,
         "expected exactly one emitted Jit.invoke, got {jit_invokes}"
     );
+    assert_eq!(entries, 1, "the worker's entry tiered up");
 
     assert_eq!(temen_status(), want.status, "status parity with the oracle");
     assert_eq!(
@@ -627,14 +647,14 @@ fn coop_tierup_pump_matches_the_bytecode_oracle() {
         temen_status()
     );
 
+    // The worker's entry f1 and the leaf f2 both return one value.
     let n_results = m.funcs[2].results.len();
-    let mut tierups = 0u32;
+    let mut funcs = Vec::new();
     loop {
         match temen_coop_run() {
             COOP_RUN_TIERUP => {
-                tierups += 1;
-                assert!(tierups < 50, "runaway tier-ups");
-                assert_eq!(temen_coop_func(), 2, "only the leaf (func 2) tiers up");
+                assert!(funcs.len() < 50, "runaway tier-ups");
+                funcs.push(temen_coop_func());
                 match service_coop_on_wasmi(n_results) {
                     Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
                     Err(code) => temen_coop_deliver_trap(code),
@@ -644,12 +664,14 @@ fn coop_tierup_pump_matches_the_bytecode_oracle() {
             ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
         }
     }
-    // Non-vacuity: exactly two tier-ups — the root's `call 2` and the worker's — proving the
-    // cooperative driver tiered up across both vCPUs (the single-vCPU pump would have declined the
-    // spawn entirely).
+    // Non-vacuity: exactly two tier-ups — the root's `call 2` and the worker's entry, which runs
+    // its own call to the leaf in emitted code (#1414 ED-1) — proving the cooperative driver tiered
+    // up across both vCPUs (the single-vCPU pump would have declined the spawn entirely).
+    funcs.sort();
     assert_eq!(
-        tierups, 2,
-        "expected 2 tier-ups (root + worker), got {tierups}"
+        funcs,
+        [1, 2],
+        "the worker's entry and the root's leaf call tier up"
     );
 
     assert_eq!(temen_status(), want.status, "status parity with the oracle");
@@ -670,105 +692,231 @@ fn coop_tierup_pump_matches_the_bytecode_oracle() {
     temen_coop_close();
 }
 
-/// #1026 slice 4 — the leaf tier-up **size floor** gates strictly by [`temen_wasm_jit::est_emitted_size`]:
-/// the same guest tiers up when the floor is at-or-below its leaf's estimated body and stays on the
-/// interpreter when the floor is one byte above — with **identical** guest-observable results either
-/// way (INVARIANTS.md #9: the gate changes which tier runs, never the semantics). Pins that a
-/// dispatch-heavy card's tiny leaves (far below the production default) will not tier up, while a
-/// genuinely heavy leaf still does — the "decision in one place" #1026 asks for.
-#[test]
-fn leaf_tierup_size_floor_gates_tiny_and_admits_heavy() {
-    let _g = ffi_guard(); // resets the floor to the production default on drop
-    let m = temen_text::parse_module(&coop_guest_text()).expect("parse");
+/// A guest whose `_start` makes one call of function 1, which counts to 50 000 in a loop and returns
+/// the sum of the counts, then writes it to stdout.
+fn one_long_call_text() -> String {
+    let out_h = onramp_out_handle();
+    format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vn = i64.const 50000
+  vr = call 1 (vn)
+  vsl = i64.const {SLOT}
+  i64.store vsl vr
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vn: i64) {{
+  v0 = i64.const 0
+  br 1(vn, v0, v0)
+}}
+block 1 (vm: i64, vk: i64, vs: i64) {{
+  vlt = i64.lt_s vk vm
+  br_if vlt 2(vm, vk, vs) 3(vs)
+}}
+block 2 (am: i64, ak: i64, as: i64) {{
+  v1 = i64.const 1
+  ak1 = i64.add ak v1
+  as1 = i64.add as ak
+  br 1(am, ak1, as1)
+}}
+block 3 (rs: i64) {{
+  return rs
+  }}
+}}
+export 0 func "_start" 0
+"#
+    )
+}
+
+/// A guest whose `_start` calls function 1 40 times in a loop, then writes the sum of the results to
+/// stdout. Function 1 counts to `iters` in a loop and returns the sum of the counts.
+fn many_calls_text(iters: u32) -> String {
+    let out_h = onramp_out_handle();
+    format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  v0 = i64.const 0
+  br 1(v0, v0)
+}}
+block 1 (vk: i64, vs: i64) {{
+  vn = i64.const 40
+  vlt = i64.lt_s vk vn
+  br_if vlt 2(vk, vs) 3(vs)
+}}
+block 2 (ak: i64, as: i64) {{
+  vi = i64.const {iters}
+  vr = call 1 (vi)
+  v1 = i64.const 1
+  ak1 = i64.add ak v1
+  as1 = i64.add as vr
+  br 1(ak1, as1)
+}}
+block 3 (rs: i64) {{
+  vsl = i64.const {SLOT}
+  i64.store vsl rs
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return rs
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vn: i64) {{
+  v0 = i64.const 0
+  br 1(vn, v0, v0)
+}}
+block 1 (vm: i64, vk: i64, vs: i64) {{
+  vlt = i64.lt_s vk vm
+  br_if vlt 2(vm, vk, vs) 3(vs)
+}}
+block 2 (am: i64, ak: i64, as: i64) {{
+  v1 = i64.const 1
+  ak1 = i64.add ak v1
+  as1 = i64.add as ak
+  br 1(am, ak1, as1)
+}}
+block 3 (rs: i64) {{
+  return rs
+  }}
+}}
+export 0 func "_start" 0
+"#
+    )
+}
+
+/// Open `src` on the coop driver and drive it to completion on wasmi, returning the functions its
+/// tier-ups named. Parity with the oracle is asserted: the tier-up rule changes which tier runs,
+/// never the result. The caller holds [`FFI_LOCK`].
+fn drive_coop(src: &str, what: &str) -> Vec<i32> {
+    let m = temen_text::parse_module(src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
-    // The floor is compared against the *outlined* module the open builds its eligibility from
-    // (`outline_cap_calls` runs first), so compute the leaf's estimate on the same shape.
-    let leaf_sz = {
-        let mut outlined = m.clone();
-        temen_wasm_jit::outline_cap_calls(&mut outlined);
-        temen_wasm_jit::est_emitted_size(&outlined.funcs[2])
-    };
-    assert!(
-        leaf_sz < temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES,
-        "the synthetic leaf ({leaf_sz}B) must sit below the production default \
-         ({}B) — so the default gates it, as it gates every dispatch-heavy card's leaves",
-        temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES
-    );
-
     let want = onramp_exec_root(&m, b"");
-    assert_eq!(want.status, STATUS_OK, "oracle sanity");
-    assert_eq!(want.value, 38, "oracle: f(3) + f(5) = 16 + 22 = 38");
-
-    // Drive the guest to completion at a given floor, returning the tier-up count. Parity with the
-    // oracle is asserted on every arm — the gate must never change the result.
-    let drive_at_floor = |floor: usize| -> u32 {
-        temen_coop_set_tierup_floor(floor);
-        let opened = temen_coop_open(
-            bytes.as_ptr(),
-            bytes.len(),
-            core::ptr::null(),
-            0,
-            0,
-            core::ptr::null(),
-            0,
-            0,
-        );
-        assert_eq!(opened, 0, "open (floor {floor}) status {}", temen_status());
-        let n_results = m.funcs[2].results.len();
-        let mut tierups = 0u32;
-        loop {
-            match temen_coop_run() {
-                COOP_RUN_TIERUP => {
-                    tierups += 1;
-                    assert!(tierups < 50, "runaway tier-ups");
-                    assert_eq!(temen_coop_func(), 2, "only the leaf (func 2) can tier up");
-                    match service_coop_on_wasmi(n_results) {
-                        Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
-                        Err(code) => temen_coop_deliver_trap(code),
-                    }
+    assert_eq!(want.status, STATUS_OK, "oracle sanity ({what})");
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
+    assert_eq!(opened, 0, "open ({what}) status {}", temen_status());
+    let mut tierups = Vec::new();
+    loop {
+        match temen_coop_run() {
+            COOP_RUN_TIERUP => {
+                tierups.push(temen_coop_func());
+                assert!(tierups.len() < 50, "runaway tier-ups ({what})");
+                match service_coop_on_wasmi(1) {
+                    Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                    Err(code) => temen_coop_deliver_trap(code),
                 }
-                COOP_RUN_DONE => break,
-                ev => panic!(
-                    "unexpected event {ev} (floor {floor}, status {})",
-                    temen_status()
-                ),
             }
+            COOP_RUN_DONE => break,
+            ev => panic!("unexpected event {ev} ({what}, status {})", temen_status()),
         }
-        assert_eq!(temen_status(), want.status, "status parity (floor {floor})");
-        assert_eq!(
-            temen_coop_value(),
-            want.value,
-            "value parity (floor {floor})"
-        );
-        // SAFETY: DONE-arm capture slots; sole accessor under FFI_LOCK.
-        let got_out =
-            unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
-        assert_eq!(got_out, want.stdout, "stdout parity (floor {floor})");
-        temen_coop_close();
-        tierups
-    };
+    }
+    assert_eq!(temen_status(), want.status, "status parity ({what})");
+    assert_eq!(temen_coop_value(), want.value, "value parity ({what})");
+    // SAFETY: DONE-arm capture slots; sole accessor under FFI_LOCK.
+    let got_out =
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+    assert_eq!(got_out, want.stdout, "stdout parity ({what})");
+    temen_coop_close();
+    tierups
+}
 
-    // A floor comfortably below the leaf's estimate ⇒ eligible (the predicate is `>=`) ⇒ both the
-    // root's and the worker's `call 2` tier up. (Floors are held off the exact estimate to stay
-    // robust to a byte or two of encode/outline drift between here and the open.)
+/// #2474 — a coop run's calls tier up on the work they do ([`temen_coop_set_hotness`]), with
+/// **identical** guest-observable results whichever tier runs them (INVARIANTS.md #9):
+/// - At the production default every eligible function starts tiering up: each of
+///   [`coop_guest_text`]'s tasks tiers its one call up, and one long call tiers up at its start.
+/// - A function whose calls turn out light backs off after one window of them: of 40 calls that each
+///   count to 2, the first window's tier up and the rest interpret. Calls that each count to 1000
+///   repay the crossing, as their host reports the fuel they burned, so all 40 tier up.
+/// - At `0, 0` every eligible call tiers up, light or not.
+#[test]
+fn calls_tier_up_on_the_work_they_do() {
+    // The guard restores the production default on drop.
+    let _g = ffi_guard();
+    let drive = drive_coop;
+    let light = coop_guest_text();
+    temen_coop_reset_hotness();
+    let mut first = drive(&light, "light calls, the default");
+    first.sort_unstable();
     assert_eq!(
-        drive_at_floor(leaf_sz / 2),
-        2,
-        "a floor below the leaf est size admits it (root + worker tier up)"
+        first,
+        [1, 2],
+        "the worker's entry and the root's call of the leaf, before either is seen"
     );
-    // A floor a few times the leaf ⇒ gated ⇒ the interpreter runs the leaf inline, zero crossings,
-    // same result — the size comparison, not an on/off switch.
     assert_eq!(
-        drive_at_floor(leaf_sz * 4),
-        0,
-        "a floor above the leaf est size suppresses its tier-up"
+        drive(&one_long_call_text(), "one long call, the default"),
+        [1],
+        "the long call tiers up at its start"
     );
-    // And the production default (well above any dispatch leaf) gates it too.
     assert_eq!(
-        drive_at_floor(temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES),
-        0,
-        "the production default gates this dispatch-leaf-sized function"
+        drive(&many_calls_text(2), "many light calls, the default"),
+        [1; 8],
+        "the callee backs off after a window of calls too light to repay a crossing"
+    );
+    assert_eq!(
+        drive(&many_calls_text(1000), "many heavy calls, the default"),
+        [1; 40],
+        "the callee's emitted calls repay the crossing, so it stays hot"
+    );
+    temen_coop_set_hotness(0, 0);
+    assert_eq!(
+        drive(&many_calls_text(2), "many light calls, every call"),
+        [1; 40],
+        "every call tiers up"
+    );
+}
+
+/// #2503 — a Run of the program the last open ran reuses its region emit ([`temen_coop_region_emits`]
+/// counts the ones made): another program, or another emitter cap, is emitted anew. A reused emit
+/// tiers up by the rule as it is at its open, with the same results.
+#[test]
+fn a_reopened_program_reuses_its_region_emit() {
+    let _g = ffi_guard();
+    temen_coop_reset_hotness();
+    // Programs no other test opens, so what an earlier test left in the cache is not one of them.
+    let (a, b) = (many_calls_text(5), many_calls_text(6));
+    let made = temen_coop_region_emits;
+    let before = made();
+    assert_eq!(drive_coop(&a, "a, first"), [1; 8]);
+    assert_eq!(made(), before + 1, "the first open of a program emits it");
+    temen_coop_set_hotness(0, 0);
+    assert_eq!(
+        drive_coop(&a, "a, again"),
+        [1; 40],
+        "the reused emit tiers up by the rule its open reads"
+    );
+    assert_eq!(made(), before + 1, "the next open of it reuses the emit");
+    temen_coop_reset_hotness();
+    assert_eq!(drive_coop(&b, "b"), [1; 8]);
+    assert_eq!(made(), before + 2, "another program is emitted");
+    assert_eq!(drive_coop(&a, "a, after b"), [1; 8]);
+    assert_eq!(
+        made(),
+        before + 3,
+        "only the program the last open ran is kept"
+    );
+    temen_coop_set_emit_cap(1 << 20);
+    assert_eq!(drive_coop(&a, "a, another cap"), [1; 8]);
+    temen_coop_set_emit_cap(0);
+    assert_eq!(
+        made(),
+        before + 4,
+        "the emitter's cap is part of what an emit is made from"
     );
 }
 
@@ -2161,15 +2309,16 @@ fn coop_invoked_unit_bounces_and_native_edges_match_the_oracle() {
     // Non-vacuity: the unit ran emitted (invoke), and — post-#889 outlining (#1026 slice 1: this
     // driver now outlines cap sites exactly like the pump) — the helper `f1` itself **emits** (its
     // cap sites hoist to wrappers), so BOTH program slots dispatch natively and the live-window
-    // bounces are f1's outlined wrappers 8/9 (append order: f0's map/compile/invoke/write = 4–7,
-    // f1's grow/write = 8/9). The mid-invoke growth now happens inside wrapper 8's bounce — same
-    // contract, the pump's `linked_unit_bounces` shape on the cooperative driver.
+    // bounces are f1's outlined wrappers 10/11 (append order: f0's spawn/map/compile/invoke/join/
+    // write = 4–9, the spawn and join since #2443; f1's grow/write = 10/11). The mid-invoke growth
+    // now happens inside wrapper 10's bounce — same contract, the pump's `linked_unit_bounces`
+    // shape on the cooperative driver.
     assert!(
         invokes >= 1,
         "the linked unit must run emitted (invoke non-vacuity)"
     );
     assert!(
-        d.bounces().contains(&8) && d.bounces().contains(&9),
+        d.bounces().contains(&10) && d.bounces().contains(&11),
         "the helper's outlined wrappers must bounce during the invoke: {:?}",
         d.bounces()
     );
@@ -2910,6 +3059,98 @@ export 0 func "_start" 0
     temen_coop_close();
 }
 
+/// #2443: a fiber resumed inside a bounce cannot stop its task, so where the module holds a
+/// scheduler op a resume is a seed. Here f2 resumes a fiber whose `atomic.notify` is a scheduler
+/// stop. Were f2 a cross-tier leaf, f1 would emit and the notify would fault inside f2's bounce;
+/// as a seed it keeps f1 interpreted, and the run matches the oracle. f4 is the run's emitted
+/// region, which the open needs.
+#[test]
+fn coop_a_fiber_that_stops_keeps_its_resumers_callers_interpreted() {
+    let _g = ffi_guard();
+    let (out_h, _mem_h) = onramp_out_mem_handles();
+    let src = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vx = i64.const 500
+  vr1 = call 1 (vx)
+  vr4 = call 4 (vx)
+  vr = i64.add vr1 vr4
+  vsl = i64.const {SLOT}
+  i64.store vsl vr
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const 100
+  vsum = i64.add v0 vk
+  vr = call 2 (vsum)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vf = ref.func 3
+  vsp = i64.const 0
+  vk = cont.new vf vsp
+  vs, vv = cont.resume vk v0
+  return vv
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vaddr = i64.const 16384
+  vc = i32.const 1
+  vn = atomic.notify vaddr vc
+  vk = i64.const 7
+  vr = i64.add varg vk
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const 3
+  vr = i64.mul v0 vk
+  return vr
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = temen_text::parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+
+    let want = onramp_exec_root(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(
+        want.value,
+        (500 + 100 + 7) + 500 * 3,
+        "oracle: the fiber notifies and returns"
+    );
+
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
+    assert_eq!(opened, 0, "open must admit (status {})", temen_status());
+    let (_d, tierups) = drive_coop_b2_session_allow_trap(&m);
+    assert!(tierups >= 1, "f4 must tier up");
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
+    assert_eq!(temen_coop_value(), want.value, "value parity");
+    temen_coop_close();
+}
+
 /// Pump port (#888/#889, direct cross-tier over the live window): an eligible leaf's **direct
 /// `Call`** to a cap-calling helper — post-#889 the helper's cap sites are outlined, so the helper
 /// itself emits and the live-window bounces are its wrappers 4/5 (grow + stream), with the leaf
@@ -3486,9 +3727,9 @@ fn coop_forth_thread_words_decline_to_the_oracle() {
 
 /// #816: opt the on-ramp powerbox into the `"instantiator"` grant for this test, resetting on drop
 /// (panic-safe) so no other test's guest inherits spawn authority. Composes with [`ffi_guard`]
-/// (holds the FFI lock + zeroes the tier-up floor first).
-// The inner `FloorGuard` is held purely for its Drop (resets the instantiator grant), never read.
-struct InstantiatorGuard(#[allow(dead_code)] FloorGuard);
+/// (holds the FFI lock + tiers up every eligible call first).
+// The inner `HotnessGuard` is held purely for its Drop (resets the instantiator grant), never read.
+struct InstantiatorGuard(#[allow(dead_code)] HotnessGuard);
 fn instantiator_guard() -> InstantiatorGuard {
     let g = ffi_guard();
     temen_onramp_set_grant_instantiator(1);
@@ -3501,7 +3742,7 @@ impl Drop for InstantiatorGuard {
 }
 
 /// The #816 guest: `_start` resolves its (knob-granted) `"instantiator"` and `"budget"` by name,
-/// spawns a same-module child (f1) detached through a v1 record — a window of its own — joins it,
+/// spawns its child image (f1) detached through a spawn record — a window of its own — joins it,
 /// then calls the eligible leaf f2 itself. f2 stores marker 21 at offset 16384 of whichever window
 /// runs it and returns x*3 + 7. The child adds the marker it reads back in its own window to its
 /// result (f(5) = 22, + 21); the root reads its own 16384 before its leaf call (0) and after (21). A
@@ -3517,62 +3758,34 @@ const BUDGET_NAME: i64 = i64::from_le_bytes(*b"budget\0\0");
 /// word for `self.resolve`.
 const CHILD_NAME: i64 = i64::from_le_bytes(*b"child\0\0\0");
 
-/// What a guest's child runs f1 in: a copy of the guest's own program (module `-1`, which #2219's
-/// slice 3 retires), or the program's child image (#2219), which the host emits on its own (#2248).
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Child {
-    Copy,
-    Image,
-}
-
-impl Child {
-    /// The program the child's tier-ups name: the guest's own, or the image, the first module the
-    /// run compiles after it.
-    fn program(self) -> u32 {
-        match self {
-            Child::Copy => 0,
-            Child::Image => 1,
-        }
-    }
-}
-
-/// The stores that resolve `"budget"` and build a v1 record at 34816 spawning `child`'s f1 detached
-/// — its declared window, no pager or pre-mapped region — paid from that budget. Leaves the
-/// record's address in `vrec`.
-fn v1_record_f1(child: Child) -> String {
-    // The record's first word: detached, and the entry. An image starts at its bootstrap,
-    // function 0, which calls f1.
-    let (module, entry) = match child {
-        Child::Copy => ("  vrm = i32.const -1\n".to_string(), 1u64 << 32),
-        Child::Image => (
-            format!(
-                "  vcw = i64.const {CHILD_NAME}\n  vca = i64.const 33824\n  i64.store vca vcw\n  \
-                 vcl = i64.const 5\n  vrm = self.resolve vca vcl\n"
-            ),
-            0,
-        ),
-    };
+/// The stores that resolve `"budget"` and `"child"` (the guest's child image, which starts at its
+/// bootstrap, function 0, which calls f1) and build a spawn record at 34816 spawning that image
+/// detached — its declared window, no pager or pre-mapped region — paid from that budget. Leaves
+/// the record's address in `vrec`.
+fn record_f1() -> String {
     format!(
         "  vbw = i64.const {BUDGET_NAME}
   vba = i64.const 33808
   i64.store vba vbw
   vbl = i64.const 6
   vb = self.resolve vba vbl
-{module}  vrec = i64.const 34816
-  vrw0 = i64.const {word}
+  vcw = i64.const {CHILD_NAME}
+  vca = i64.const 33824
+  i64.store vca vcw
+  vcl = i64.const 5
+  vrm = self.resolve vca vcl
+  vrec = i64.const 34816
+  vrw0 = i64.const -4294967296
   i64.store vrec vrw0
-  vrw2 = i64.const -4294967296
-  i64.store vrec vrw2 offset=16
-  i32.store vrec vrm offset=24
-  i32.store vrec vb offset=28
-  vrw9 = i64.const 4294967295
-  i64.store vrec vrw9 offset=72
-",
-        word = entry | 1
+  i32.store vrec vrm offset=8
+  i32.store vrec vb offset=12
+  vrw6 = i64.const 4294967295
+  i64.store vrec vrw6 offset=48
+"
     )
 }
 
-fn coop_child_guest_text(child: Child) -> String {
+fn coop_child_guest_text() -> String {
     let out_h = onramp_out_handle();
     let name = b"instantiator";
     let mut w0 = [0u8; 8];
@@ -3593,7 +3806,7 @@ block 0 () {{
   vnl = i64.const 12
   vh = self.resolve va0 vnl
 {record}  vch = call.cap 6 17 (i64) -> (i32) vh (vrec)
-  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)
   vma = i64.const 16384
   vpre = i32.load8_u vma
   vpree = i64.extend_i32_u vpre
@@ -3638,121 +3851,297 @@ block 0 (vx: i64) {{
 export 0 func "_start" 0
 export 1 func "_child" 1
 "#,
-        record = v1_record_f1(child)
+        record = record_f1()
     )
 }
 
-/// The child tiers up over its own window: in a copy of the guest's program, its call to the leaf,
-/// through the guest's emit (#816); in the guest's child image, its bootstrap's call to f1, through
-/// the image's own emit (#2248), which runs f1's call to the leaf in emitted code too.
+/// The child, the guest's child image, tiers up over its own window, at its entry (#1414 ED-1): the
+/// image's bootstrap f0, through the image's own emit (#2248), which runs the child's call to the
+/// leaf in emitted code too. The image is the first module the run compiles after the guest:
+/// program 1.
 #[test]
 fn coop_tierup_serves_a_detached_child_over_its_own_window() {
     let _g = instantiator_guard();
-    for child in [Child::Copy, Child::Image] {
-        let m = temen_text::parse_module(&coop_child_guest_text(child)).expect("parse");
-        temen_verify::verify_module(&m).expect("verify");
-        let bytes = temen_encode::encode_module(&m);
+    let m = temen_text::parse_module(&coop_child_guest_text()).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
 
-        // Oracle: the plain bytecode path with the identical (knob-granted) powerbox.
-        let want = onramp_exec_root(&m, b"");
-        assert_eq!(want.status, STATUS_OK, "{child:?}: oracle sanity");
-        assert_eq!(
-            want.value, 80,
-            "{child:?}: oracle: 43 + 16 + 21 - 0 (each marker landed in its own window)"
-        );
+    // Oracle: the plain bytecode path with the identical (knob-granted) powerbox.
+    let want = onramp_exec_root(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(
+        want.value, 80,
+        "oracle: 43 + 16 + 21 - 0 (each marker landed in its own window)"
+    );
 
-        let opened = temen_coop_open(
-            bytes.as_ptr(),
-            bytes.len(),
-            core::ptr::null(),
-            0,
-            0,
-            core::ptr::null(),
-            0,
-            0,
-        );
-        assert_eq!(
-            opened,
-            0,
-            "{child:?}: open must accept the instantiating eligible-leaf guest (status {})",
-            temen_status()
-        );
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
+    assert_eq!(
+        opened,
+        0,
+        "open must accept the instantiating eligible-leaf guest (status {})",
+        temen_status()
+    );
 
-        // f1 and the leaf f2 both return one value.
-        let n_results = m.funcs[2].results.len();
-        // Per-event ((program, function), window base, mapped): the child's event serves its own
-        // window with its own committed extent; the root's serves the run window with the root's.
-        let mut events: Vec<((u32, i32), usize, i64)> = Vec::new();
-        loop {
-            match temen_coop_run() {
-                COOP_RUN_TIERUP => {
-                    assert!(events.len() < 50, "runaway tier-ups");
-                    events.push((
-                        (temen_coop_module(), temen_coop_func()),
-                        temen_coop_tierup_win_ptr() as usize,
-                        temen_coop_mapped(),
-                    ));
-                    match service_coop_on_wasmi(n_results) {
+    // f1 and the leaf f2 both return one value.
+    let n_results = m.funcs[2].results.len();
+    // Per-event ((program, function), window base, mapped): the child's event serves its own
+    // window with its own committed extent; the root's serves the run window with the root's.
+    let mut events: Vec<((u32, i32), usize, i64)> = Vec::new();
+    loop {
+        match temen_coop_run() {
+            COOP_RUN_TIERUP => {
+                assert!(events.len() < 50, "runaway tier-ups");
+                events.push((
+                    (temen_coop_module(), temen_coop_func()),
+                    temen_coop_tierup_win_ptr() as usize,
+                    temen_coop_mapped(),
+                ));
+                match service_coop_on_wasmi(n_results) {
+                    Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                    Err(code) => temen_coop_deliver_trap(code),
+                }
+            }
+            COOP_RUN_DONE => break,
+            ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
+        }
+    }
+    // The child's event first (the root is parked on the join), then the root's own leaf
+    // call — each served over ITS task's window (#1117's env routing, here over real emitted
+    // wasm).
+    let [(child_call, child_win, child_mapped), (root_call, root_win, root_mapped)] = events[..]
+    else {
+        panic!("expected the child's event then the root's, got {events:?}");
+    };
+    assert_eq!(
+        (child_call, root_call),
+        ((1, 0), (0, 2)),
+        "each event's (program, function): its task's program's"
+    );
+    assert_eq!(
+        root_win,
+        temen_coop_win_ptr() as usize,
+        "the root's event serves the run window"
+    );
+    assert_ne!(
+        child_win, root_win,
+        "the child's event serves its own window, not the run window"
+    );
+    assert_eq!(
+        (child_mapped, root_mapped),
+        (131072, 131072),
+        "each event's mapped is its own window's committed extent"
+    );
+
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        temen_coop_value(),
+        want.value,
+        "value parity with the oracle (both markers landed in the right windows)"
+    );
+    // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor
+    // (FFI_LOCK).
+    let got_out =
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+    assert_eq!(got_out, want.stdout, "stdout parity with the oracle");
+    temen_coop_close();
+}
+
+/// #2398 — a detached child's emitted `call.dyn` resolves in the child's own dispatch table, as its
+/// interpreted one does, never in the root's. The root installs a unit `u(a, b) = a + 7` into its own
+/// table and calls it through its slot with 5 (12). It spawns `"worker"`, a separate program, with
+/// the slot in its args payload, and joins it. The worker's entry `call.dyn`s the slot with 5. The
+/// worker holds no `Jit`, so its table holds only its own four functions, and the slot, masked as
+/// every `call.dyn` index is, lands on one of them: f1, f2 or f3 (105, 205 or 305), or the entry,
+/// whose signature traps. The worker is wholly emittable, so its entry runs emitted (#1414 ED-1),
+/// `call.dyn` included. While a child read the pump's one mirror of the root's table, its emitted
+/// call ran the root's unit there. A child runs a granted module now (#2219), whose emit dispatches
+/// through a table of the module's own functions.
+#[test]
+fn a_childs_emitted_call_dyn_resolves_in_its_own_table() {
+    let _g = instantiator_guard();
+    let unit = temen_text::parse_module(
+        "memory 17\nfunc (i64, i64) -> (i64) {\nblock 0 (va: i64, vb: i64) {\n  vk = i64.const 7\n  \
+         vr = i64.add va vk\n  return vr\n  }\n}\n",
+    )
+    .expect("parse unit");
+    temen_verify::verify_module(&unit).expect("verify unit");
+    let blob = temen_encode::encode_module(&unit);
+    let mut install = String::new();
+    for (i, chunk) in blob.chunks(8).enumerate() {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        let (addr, val) = (BLOB_BASE + i as i64 * 8, i64::from_le_bytes(word));
+        install.push_str(&format!(
+            "  vba{i} = i64.const {addr}\n  vbv{i} = i64.const {val}\n  i64.store vba{i} vbv{i}\n"
+        ));
+    }
+    let root = temen_text::parse_module(&format!(
+        r#"memory 17
+import 0 "vm_jit_compile" (i64, i64) -> (i64)
+data ro 40960 "instantiator"
+data ro 40976 "budget"
+data ro 40984 "worker"
+data ro 40992 "jit"
+func () -> (i64) {{
+block 0 () {{
+  vjp = i64.const 40992
+  vjl = i64.const 3
+  vjit = self.resolve vjp vjl
+{install}  vblp = i64.const {BLOB_BASE}
+  vbll = i64.const {blob_len}
+  vcode = call.import 0 (vblp, vbll)
+  vslot = call.cap 11 3 (i64) -> (i64) vjit (vcode)
+  vx = i64.const 5
+  vown = call 1 (vslot, vx)
+  vsa = i64.const 35840
+  i64.store vsa vslot
+  vip = i64.const 40960
+  vil = i64.const 12
+  vinst = self.resolve vip vil
+  vbp = i64.const 40976
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  vwp = i64.const 40984
+  vwl = i64.const 6
+  vw = self.resolve vwp vwl
+  vrec = i64.const 34816
+  vw0 = i64.const -4294967296
+  i64.store vrec vw0
+  i32.store vrec vw offset=8
+  i32.store vrec vb offset=12
+  i64.store vrec vsa offset=32
+  vpl = i64.const 8
+  i64.store vrec vpl offset=40
+  vw6 = i64.const 4294967295
+  i64.store vrec vw6 offset=48
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vrec)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
+  vz = i64.const 0
+  vtr = i64.ne vj_st vz
+  vtrw = i64.extend_i32_u vtr
+  vm = i64.const 1000000
+  vtrm = i64.mul vtrw vm
+  vk = i64.const 1000
+  vjk = i64.mul vj vk
+  vs1 = i64.add vjk vown
+  vsum = i64.add vs1 vtrm
+  return vsum
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vs: i64, vx: i64) {{
+  vs32 = i32.wrap_i64 vs
+  vr = call.dyn (i64, i64) -> (i64) vs32 (vx, vx)
+  return vr
+  }}
+}}
+export 0 func "_start" 0
+"#,
+        blob_len = blob.len()
+    ))
+    .expect("parse");
+    let worker_fn = |k: i64| {
+        format!(
+            "func (i64, i64) -> (i64) {{\nblock 0 (va: i64, vb: i64) {{\n  vk = i64.const {k}\n  \
+             vr = i64.add va vk\n  return vr\n  }}\n}}\n"
+        )
+    };
+    let worker = temen_text::parse_module(&format!(
+        r#"memory 17
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vap = i64.const {args}
+  vs = i64.load vap
+  vs32 = i32.wrap_i64 vs
+  vx = i64.const 5
+  vr = call.dyn (i64, i64) -> (i64) vs32 (vx, vx)
+  return vr
+  }}
+}}
+{f1}{f2}{f3}"#,
+        args = temen_ir::module_args_base(),
+        f1 = worker_fn(100),
+        f2 = worker_fn(200),
+        f3 = worker_fn(300),
+    ))
+    .expect("parse");
+    temen_verify::verify_module(&root).expect("verify");
+    temen_verify::verify_module(&worker).expect("verify");
+    let bytes = temen_encode::encode_module(&root);
+
+    // Each run takes the staged program, so stage it before each.
+    stage_child_program("worker", worker.clone());
+    let want = onramp_exec_root(&root, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle status");
+    assert_eq!(
+        want.value % 1000,
+        12,
+        "oracle: the root's call runs its unit, u(5, 5) = 12"
+    );
+    let child = want.value / 1000;
+    assert!(
+        matches!(child, 105 | 205 | 305 | 1000),
+        "oracle: the worker's call runs one of its own functions, or traps (1000), never the \
+         root's unit: {child}"
+    );
+
+    stage_child_program("worker", worker);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
+    assert_eq!(opened, 0, "open (status {})", temen_status());
+    // The root's events run its emit over the shared table, which the driver mirrors with the
+    // unit (B2); the worker's emit dispatches through a table of its own.
+    let mut root_tier = CoopB2Driver::new();
+    let mut calls = Vec::new();
+    loop {
+        match temen_coop_run() {
+            COOP_RUN_TIERUP => {
+                assert!(calls.len() < 50, "runaway tier-ups");
+                calls.push((temen_coop_module(), temen_coop_func()));
+                if temen_coop_module() == 0 {
+                    root_tier.service_tierup(1);
+                } else {
+                    match service_coop_on_wasmi(1) {
                         Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
                         Err(code) => temen_coop_deliver_trap(code),
                     }
                 }
-                COOP_RUN_DONE => break,
-                ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
             }
+            COOP_RUN_DONE => break,
+            ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
         }
-        // The child's event first (the root is parked on the join), then the root's own leaf
-        // call — each served over ITS task's window (#1117's env routing, here over real emitted
-        // wasm).
-        let [(child_call, child_win, child_mapped), (root_call, root_win, root_mapped)] =
-            events[..]
-        else {
-            panic!("{child:?}: expected the child's event then the root's, got {events:?}");
-        };
-        let child_func = match child {
-            Child::Copy => 2,
-            Child::Image => 1,
-        };
-        assert_eq!(
-            (child_call, root_call),
-            ((child.program(), child_func), (0, 2)),
-            "{child:?}: each event's (program, function): its task's program's"
-        );
-        assert_eq!(
-            root_win,
-            temen_coop_win_ptr() as usize,
-            "{child:?}: the root's event serves the run window"
-        );
-        assert_ne!(
-            child_win, root_win,
-            "{child:?}: the child's event serves its own window, not the run window"
-        );
-        assert_eq!(
-            (child_mapped, root_mapped),
-            (131072, 131072),
-            "{child:?}: each event's mapped is its own window's committed extent"
-        );
-
-        assert_eq!(
-            temen_status(),
-            want.status,
-            "{child:?}: status parity with the oracle"
-        );
-        assert_eq!(
-            temen_coop_value(),
-            want.value,
-            "{child:?}: value parity with the oracle (both markers landed in the right windows)"
-        );
-        // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor
-        // (FFI_LOCK).
-        let got_out =
-            unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
-        assert_eq!(
-            got_out, want.stdout,
-            "{child:?}: stdout parity with the oracle"
-        );
-        temen_coop_close();
     }
+    // The worker is program 2: the root's unit, compiled before the spawn, is program 1.
+    calls.sort();
+    assert_eq!(
+        calls,
+        vec![(0, 1), (2, 0)],
+        "the root's call to its `call.dyn` helper and the worker's entry run emitted, (program, \
+         function)"
+    );
+    assert_eq!(
+        (temen_status(), temen_coop_value()),
+        (want.status, want.value),
+        "parity with the oracle: the worker's emitted `call.dyn` resolved in its own table"
+    );
+    temen_coop_close();
 }
 
 /// #2248 — a child that runs a module the run did not build tiers up through that module's own
@@ -3780,16 +4169,14 @@ block 0 () {{
   vwl = i64.const 6
   vw = self.resolve vwp vwl
   vrec = i64.const 34816
-  vw0 = i64.const 1
+  vw0 = i64.const -4294967296
   i64.store vrec vw0
-  vw2 = i64.const -4294967296
-  i64.store vrec vw2 offset=16
-  i32.store vrec vw offset=24
-  i32.store vrec vb offset=28
-  vw9 = i64.const 4294967295
-  i64.store vrec vw9 offset=72
+  i32.store vrec vw offset=8
+  i32.store vrec vb offset=12
+  vw6 = i64.const 4294967295
+  i64.store vrec vw6 offset=48
   vh = call.cap 6 17 (i64) -> (i32) vinst (vrec)
-  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   v3 = i64.const 3
   vlocal = call 1 (v3)
   vk = i64.const 1000
@@ -3877,11 +4264,12 @@ block 0 (vx: i64) {
             ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
         }
     }
-    // The worker's call first (the root is parked on the join), then the root's.
+    // The worker's entry first (the root is parked on the join), which runs its f1 call in emitted
+    // code (#1414 ED-1), then the root's f1 call.
     assert_eq!(
         calls,
-        vec![(1, 1), (0, 1)],
-        "each f1 call tiers up in its own program, (program, function)"
+        vec![(1, 0), (0, 1)],
+        "each tiers up in its own program, (program, function)"
     );
     assert_eq!(
         (temen_status(), temen_coop_value()),
@@ -3898,7 +4286,7 @@ block 0 (vx: i64) {
 // ---- #744: a parent serves its child's calls on the coop tier -----------------------------------
 
 /// The #744 guest (EXEC.md row 4) on the coop tier. `_start` resolves `"instantiator"`, `"budget"`
-/// and `"child"`, spawns its child image (#2219: f1 is its `_child`) through the v1 record at 17408,
+/// and `"child"`, spawns its child image (#2219: f1 is its `_child`) through the spawn record at 17408,
 /// granting it an `"exec"` capability backed by its own impl export (`GRANT_SERVE_LIVE_TAG`), serves
 /// one call with `svc.wait`, joins the child and returns `join*100 + served`. The child calls `exec.run(40, 2)`
 /// through the helper f3, then the leaf f4 on the reply. The handler f2 answers `f4(a) + b`. f4,
@@ -3909,7 +4297,7 @@ fn coop_serve_guest_text() -> String {
     let child = temen_ir::SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..temen_ir::SpawnRec::v1(0)
+        ..temen_ir::SpawnRec::default()
     };
     format!(
         r#"memory 17
@@ -3951,7 +4339,7 @@ block 0 () {{
 block 1 (vh1: i32, vch1: i32) {{
   vz1 = i32.const 0
   vn = svc.wait vz1
-  vj = call.cap 6 1 (i32) -> (i64) vh1 (vch1)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh1 (vch1)
   vk = i64.const 100
   vt = i64.mul vj vk
   vs = i64.add vt vn
@@ -4000,8 +4388,8 @@ export 0 func "_start" 0
 export 1 func "_child" 1
 "#,
         rec = rec::segment(17408, &child),
-        budget_at = 17408 + rec::BUDGET_AT,
-        module_at = 17408 + rec::MODULE_AT,
+        budget_at = 17408 + temen_ir::SpawnRec::BUDGET_AT,
+        module_at = 17408 + temen_ir::SpawnRec::MODULE_AT,
         tag = temen_interp::GRANT_SERVE_LIVE_TAG as i32,
     )
 }
@@ -4114,14 +4502,14 @@ fn coop_tierup_serves_a_parents_children() {
 // ---- #1151: a §14 child page-op traps in REAL emitted wasm over its own window --------------------
 
 /// The §14 child page-op guest. f0 (root): resolve the granted `Instantiator` and `"budget"`, spawn
-/// a child at f1 (`child`) detached through a v1 record, join it, return the join value. f1 (child
+/// a child at f1 (`child`) detached through a spawn record, join it, return the join's status: how the
+/// child ended, its trap's wire code if it trapped (#2066). f1 (child
 /// entry `(inst, as)`): `unmap` `[16384, 32768)` of its own window through its starter AddressSpace,
 /// then call the eligible leaf f2. f2 (leaf): load `[16384]` — a page the child just unmapped — so the
 /// **emitted** leaf's paged per-access check must trap `MemoryFault` over the child's window, exactly
-/// as the interpreter oracle does. This is the emitted-execution twin of `temen-wasm-jit`'s
-/// `nested_paged.rs` (which drives the same trap with a hand-rolled harness), carried here through the
-/// real coop FFI over a confined child's own window (#1151, INVARIANTS #14 nesting + code-origin axes).
-fn coop_child_paged_guest_text(child: Child) -> String {
+/// as the interpreter oracle does, through the real coop FFI over a confined child's own window
+/// (#1151, INVARIANTS #14 nesting + code-origin axes).
+fn coop_child_paged_guest_text() -> String {
     let name = b"instantiator";
     let mut w0 = [0u8; 8];
     w0.copy_from_slice(&name[0..8]);
@@ -4141,8 +4529,8 @@ block 0 () {{
   vnl = i64.const 12
   vh = self.resolve va0 vnl
 {record}  vch = call.cap 6 17 (i64) -> (i32) vh (vrec)
-  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
-  return vj
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)
+  return vj_st
   }}
 }}
 func (i64, i64) -> (i64) {{
@@ -4166,98 +4554,80 @@ block 0 (vx: i64) {{
 export 0 func "_start" 0
 export 1 func "_child" 1
 "#,
-        record = v1_record_f1(child)
+        record = record_f1()
     )
 }
 
 #[test]
 fn coop_tierup_child_paged_traps_over_its_own_window() {
     let _g = instantiator_guard();
-    for child in [Child::Copy, Child::Image] {
-        let m = temen_text::parse_module(&coop_child_paged_guest_text(child)).expect("parse");
-        temen_verify::verify_module(&m).expect("verify");
-        let bytes = temen_encode::encode_module(&m);
+    let m = temen_text::parse_module(&coop_child_paged_guest_text()).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
 
-        // Oracle: the plain bytecode path with the identical powerbox — the child unmaps part of
-        // its window then loads it, so the run traps `MemoryFault`.
-        let want = onramp_exec_root(&m, b"");
-        assert_eq!(
-            want.status, STATUS_TRAP,
-            "{child:?}: oracle: the child's load of its own unmapped page traps"
-        );
+    // Oracle: the plain bytecode path with the identical powerbox — the child unmaps part of
+    // its window then loads it, so it traps `MemoryFault`, which the root's join answers.
+    let want = onramp_exec_root(&m, b"");
+    assert_eq!(
+        (want.status, want.value),
+        (STATUS_OK, temen_ir::trap_code::MEMORY_FAULT),
+        "oracle: the child's load of its own unmapped page traps"
+    );
 
-        let opened = temen_coop_open(
-            bytes.as_ptr(),
-            bytes.len(),
-            core::ptr::null(),
-            0,
-            0,
-            core::ptr::null(),
-            0,
-            0,
-        );
-        assert_eq!(
-            opened,
-            0,
-            "{child:?}: open must accept the page-op child guest paged (status {})",
-            temen_status()
-        );
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
+    assert_eq!(
+        opened,
+        0,
+        "open must accept the page-op child guest paged (status {})",
+        temen_status()
+    );
 
-        // f1 and the leaf f2 both return one value.
-        let n_results = m.funcs[2].results.len();
-        let mut calls = Vec::new();
-        loop {
-            match temen_coop_run() {
-                COOP_RUN_TIERUP => {
-                    assert!(calls.len() < 50, "runaway tier-ups");
-                    assert_ne!(temen_coop_paged(), 0, "{child:?}: the child's code is paged");
-                    calls.push((temen_coop_module(), temen_coop_func()));
-                    // The child's code runs paged over its window; loading the unmapped page must
-                    // trap, so `service_coop_on_wasmi` returns the emitted `MemoryFault`'s code.
-                    match service_coop_on_wasmi(n_results) {
-                        Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
-                        Err(code) => temen_coop_deliver_trap(code),
-                    }
+    // f1 and the leaf f2 both return one value.
+    let n_results = m.funcs[2].results.len();
+    let mut calls = Vec::new();
+    loop {
+        match temen_coop_run() {
+            COOP_RUN_TIERUP => {
+                assert!(calls.len() < 50, "runaway tier-ups");
+                assert_ne!(temen_coop_paged(), 0, "the child's code is paged");
+                calls.push((temen_coop_module(), temen_coop_func()));
+                // The child's code runs paged over its window; loading the unmapped page must
+                // trap, so `service_coop_on_wasmi` returns the emitted `MemoryFault`'s code.
+                match service_coop_on_wasmi(n_results) {
+                    Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                    Err(code) => temen_coop_deliver_trap(code),
                 }
-                COOP_RUN_DONE | COOP_RUN_TRAP => break,
-                ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
             }
+            COOP_RUN_DONE | COOP_RUN_TRAP => break,
+            ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
         }
-
-        // Non-vacuity: the child's paged code tiered up (and trapped) in emitted wasm, in its own
-        // program's emit. In a copy, f1 is the child's entry and runs interpreted, and its call to
-        // the leaf tiers up; in the image, the bootstrap's call to f1 does, and f1 bounces to the
-        // `unmap` and calls the leaf in emitted code.
-        let child_func = match child {
-            Child::Copy => 2,
-            Child::Image => 1,
-        };
-        assert_eq!(
-            calls,
-            vec![(child.program(), child_func)],
-            "{child:?}: the child tiers up once, (program, function)"
-        );
-        assert_eq!(
-            temen_status(),
-            want.status,
-            "{child:?}: trap parity with the interpreter oracle over the child's window"
-        );
-        assert_eq!(
-            temen_coop_value(),
-            want.value,
-            "{child:?}: value parity with the oracle on the trapping run"
-        );
-        // #1822: and it is the oracle's trap — the emitted leaf's `env.trap(MEMORY_FAULT)` code
-        // reaches the guest, where it used to be delivered as `Unreachable`.
-        // SAFETY: the end-of-run trap-name slot, read before anything else runs.
-        let trap = unsafe { std::slice::from_raw_parts(temen_trap_ptr(), temen_trap_len()) };
-        assert_eq!(
-            std::str::from_utf8(trap).unwrap(),
-            want.trap.as_ref().map_or("", |t| t.name()),
-            "{child:?}: trap-kind parity with the oracle on the trapping run"
-        );
-        temen_coop_close();
     }
+
+    // Non-vacuity: the child's paged code tiered up (and trapped) in emitted wasm, in its own
+    // program's emit, at its entry (#1414 ED-1): the image's bootstrap f0, whose code bounces to the
+    // `unmap` and calls the leaf in emitted code.
+    assert_eq!(
+        calls,
+        vec![(1, 0)],
+        "the child tiers up once, (program, function)"
+    );
+    // #1822: the child's trap is the oracle's — the emitted leaf's `env.trap(MEMORY_FAULT)` code
+    // reaches the root's join, where it used to be delivered as `Unreachable`.
+    assert_eq!(
+        (temen_status(), temen_coop_value()),
+        (want.status, want.value),
+        "trap-kind parity with the interpreter oracle over the child's window"
+    );
+    temen_coop_close();
 }
 
 // ============================================================================================
@@ -5174,8 +5544,9 @@ fn coop_jit_invoke_inside_a_bounce_matches_the_oracle() {
         unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
     assert_eq!(got_out, want.stdout, "stdout parity");
     // Non-vacuity: the leaf tiered up and bounced into the helper; the invoke was serviced on that
-    // nested interpretation (never surfaced as a JIT_INVOKE event).
-    assert_eq!(tierups, 1, "the leaf tiered up");
+    // nested interpretation (never surfaced as a JIT_INVOKE event). The worker's entry, which
+    // returns 0 at once, tiers up too (#1414 ED-1).
+    assert_eq!(tierups, 2, "the leaf and the worker's entry tiered up");
     // (The target is the outlined `call.import` wrapper's slot, not `f3`'s own index — #889 outlining
     // appends the wrapper — so pin the count, not the slot.)
     assert_eq!(
@@ -5307,8 +5678,9 @@ fn coop_jit_install_and_uninstall_inside_a_bounce_match_the_oracle() {
     assert_eq!(got_out, want.stdout, "stdout parity");
     // Non-vacuity: the leaf tiered up; the region bounced exactly twice — into the installing helper
     // and the uninstalling one — and the installed slot's `call.dyn` between them was native (a third
-    // bounce would mean the mirror move went unseen and the edge fell to a shim or trapped).
-    assert_eq!(tierups, 1, "the leaf tiered up");
+    // bounce would mean the mirror move went unseen and the edge fell to a shim or trapped). The
+    // worker's entry, which returns 0 at once, tiers up too (#1414 ED-1).
+    assert_eq!(tierups, 2, "the leaf and the worker's entry tiered up");
     assert_eq!(
         invokes, 0,
         "no task-level JIT event: both ops ran inside bounces"

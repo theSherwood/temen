@@ -2507,6 +2507,49 @@ fn c_thread_local_debug_info_locates_the_root_copy() {
     assert_eq!(seg.bytes[at..at + 8], 100i64.to_le_bytes());
 }
 
+/// **A system header's code is library code (#2401).** `-g` marks a file chibicc found on the include
+/// search path `debug.lib`, so a debugger dims its frames and `justMyCode` steps past them. The main
+/// file and a header it includes by a relative path stay the program's.
+#[test]
+fn c_a_header_found_on_the_include_path_is_library_code() {
+    let pid = std::process::id();
+    let sys = std::env::temp_dir().join(format!("temen_cfe_sys_{pid}"));
+    std::fs::create_dir_all(&sys).unwrap();
+    std::fs::write(
+        sys.join("helper.h"),
+        "static int helper(int v) {\n  return v + 1;\n}\n",
+    )
+    .unwrap();
+    let own = format!("temen_cfe_own_{pid}.h");
+    std::fs::write(
+        std::env::temp_dir().join(&own),
+        "static int twice(int v) {\n  return v * 2;\n}\n",
+    )
+    .unwrap();
+    let ir = c_to_ir_with(
+        &format!(
+            "#include <helper.h>\n#include \"{own}\"\nint main(void) {{\n  return helper(1) + twice(2);\n}}\n"
+        ),
+        &["--emit-ir", "-g", &format!("-I{}", sys.display())],
+    );
+    let m = parse_module(&ir).expect("parse");
+    let dbg = m.debug_info.as_ref().expect("-g emits debug info");
+    assert_eq!(
+        dbg.files.len(),
+        3,
+        "main, its own header, the system header:\n{ir}"
+    );
+    let lib: Vec<&str> = dbg
+        .lib_files
+        .iter()
+        .map(|&f| dbg.files[f as usize].as_str())
+        .collect();
+    assert!(
+        lib.len() == 1 && lib[0].ends_with("/helper.h"),
+        "only the header found on the include path is library code: {lib:?}"
+    );
+}
+
 /// The line table keys each `debug.loc` to an instruction index, which chibicc counts as it emits.
 /// A zero-filled local's initializer (`ND_MEMZERO`) emitted each chunk's `const` and `store` from one
 /// emit call and was counted as one instruction, so every later row in the block landed a chunk-count

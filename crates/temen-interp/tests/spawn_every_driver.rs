@@ -1,10 +1,11 @@
 //! **#1855 — a spawn answers the same on every driver.** The §14 spawns had one admission per
 //! driver, and three of them still refused what the cooperative driver serves: a budget-funded or
 //! grant-carrying op-17 spawn trapped `Malformed` on the parallel driver and the debug scheduler (the
-//! grant list on `Vcpu` too). The §5 detached spawn (op 15) had a second admission on `Vcpu`, whose
-//! host built the child's powerbox and seeded its window (#1414). The carve forms this file pinned
-//! beside them (ops 0, 5 and 13 and a version-0 record) are retired: every driver refuses them,
-//! which `crates/temen/tests/carve_spawn_refused.rs` pins (#1867).
+//! grant list on `Vcpu` too). The §5 detached spawn had a second admission on `Vcpu`, whose host
+//! built the child's powerbox and seeded its window (#1414). The carve forms this file pinned beside
+//! them (ops 0, 5 and 13 and the carve record) are retired, and so is op 15's positional spawn: every
+//! driver refuses them, which `crates/temen/tests/carve_spawn_refused.rs` and `self_spawn_refused.rs`
+//! pin (#1867, #2067). Every spawn here is a spawn record (op 17).
 //!
 //! Each case runs on the oracle, the cooperative executor, the parallel driver, the debug scheduler
 //! and an orchestrated `Vcpu`, and every one must give the oracle's result and stream bytes.
@@ -62,21 +63,33 @@ block 1 (ve: i32) {
   return vr
 }
 block 2 (vi2: i32, vch2: i32) {
-  vr = call.cap 6 1 (i32) -> (i64) vi2 (vch2)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vi2 (vch2)
   return vr
   }
 }
 ";
 
+/// #2066 — the tail of a parent that `join`s its child and returns `status * 1000 + value`: how the
+/// child ended (0 if it returned, else its trap's wire code, `temen_ir::trap_code`) beside its result.
+const JOIN_BOTH: &str = "\
+  js, jv = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  k = i64.const 1000
+  s1 = i64.mul js k
+  s2 = i64.add s1 jv
+  return s2
+  }
+}
+";
+
 /// An op-17 parent `(i32 inst, i32 out, i32 err, i32 budget, i32 child) -> i64` that re-grants
-/// `stdout` and `stderr` by name to `child` (func 1's child image, #2219), spawned detached by the v1
+/// `stdout` and `stderr` by name to `child` (func 1's child image, #2219), spawned detached by the
 /// record at 17408 and paid from `budget`. Func 1 resolves the two names from the module's data,
 /// writes `O` and `E` through them and returns 7.
 fn op17_granted() -> String {
     let child = SpawnRec {
         grants_ptr: 17600,
         grants_n: 2,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::default()
     };
     format!(
         "memory 17
@@ -84,9 +97,9 @@ data 17700 \"stdout\"
 data 17710 \"stderr\"
 func (i32, i32, i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vout: i32, verr: i32, vbud: i32, vmod: i32) {{
-{g0}{g1}  vmf = i64.const 17432
+{g0}{g1}  vmf = i64.const 17416
   i32.store vmf vmod
-  vbf = i64.const 17436
+  vbf = i64.const 17420
   i32.store vbf vbud
   vrp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
@@ -128,21 +141,21 @@ block 0 (v0: i64) {
 ";
 
 /// A module-form op-17 parent `(i32 inst, i32 module, i64 budget) -> i64`: `module`'s entry 0 in its
-/// declared window, spawned detached by the v1 record at 17536 and paid from `budget`.
+/// declared window, spawned detached by the spawn record at 17536 and paid from `budget`.
 fn op17_module_funded() -> String {
     format!(
         "memory 17
 func (i32, i32, i64) -> (i64) {{
 block 0 (vinst: i32, vmod: i32, vbud: i64) {{
-  vma = i64.const 17560
+  vma = i64.const 17544
   i32.store vma vmod
   vb = i32.wrap_i64 vbud
-  vba = i64.const 17564
+  vba = i64.const 17548
   i32.store vba vb
   vrp = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
 {JOIN_OR_ERRNO}{rec}",
-        rec = rec::segment(17536, &SpawnRec::v1(0)),
+        rec = rec::segment(17536, &SpawnRec::default()),
     )
 }
 
@@ -151,7 +164,7 @@ fn a_grant_carrying_record_spawn() {
     let m = module(&op17_granted());
     let setup = || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 17);
+        let i = h.grant_instantiator();
         let o = h.grant_stream(StreamRole::Out);
         let e = h.grant_stream(StreamRole::Err);
         let b = h.grant_budget(-1, 1 << 20, -1);
@@ -172,7 +185,7 @@ fn a_budget_funded_module_record_spawn() {
     let child = module(CHILD_42);
     let setup = || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 17);
+        let i = h.grant_instantiator();
         let c = h.grant_module(&child);
         let b = h.grant_budget(5_000_000, -1, -1);
         (h, vec![Value::I32(i), Value::I32(c), Value::I64(b as i64)])
@@ -180,16 +193,29 @@ fn a_budget_funded_module_record_spawn() {
     agree_on_every_driver("op 17 module form + Budget", &m, &setup, &ok(42));
 }
 
-// ---- §5 detached spawns (op 15): a fresh window of the child's own, never a carve ----
+// ---- §5 detached spawns: a fresh window of the child's own, never a carve ----
 
-/// The payload word an op-15 parent hands its child at `module_args_base()`.
+/// The payload word a [`detached`] parent hands its child at `module_args_base()`.
 const PAYLOAD: i64 = 1000;
 
-/// An op-15 parent `(i32 inst, i32 module, i32 budget, i32 out) -> i64`: `module`'s entry 0 in a fresh
-/// 32 KiB window, funded by `budget`, handed `PAYLOAD` as its 8-byte args payload and, iff `grant`,
-/// `stdout` by name.
-fn op15(grant: bool) -> String {
-    op15_then(grant, 0, JOIN_OR_ERRNO)
+/// Where a detached spawn's spawn record sits in its parent's window.
+const REC_AT: u64 = 17408;
+
+/// Text IR storing the parent's `vmod` and `vbud` into the record at [`REC_AT`]: the module the child
+/// runs and the `Budget` that pays for it, handles the parent learns at run time.
+fn store_handles() -> String {
+    format!(
+        "  rm = i64.const {m}\n  i32.store rm vmod\n  rb = i64.const {b}\n  i32.store rb vbud\n",
+        m = REC_AT + SpawnRec::MODULE_AT,
+        b = REC_AT + SpawnRec::BUDGET_AT,
+    )
+}
+
+/// A parent `(i32 inst, i32 module, i32 budget, i32 out) -> i64` spawning from the spawn record at
+/// [`REC_AT`]: `module`'s entry 0 in a fresh 32 KiB window, funded by `budget`, handed `PAYLOAD` as
+/// its 8-byte args payload and, iff `grant`, `stdout` by name.
+fn detached(grant: bool) -> String {
+    detached_then(grant, JOIN_OR_ERRNO)
 }
 
 /// #1975 — the tail of a parent that reports what a refused spawn left in its budget: the `mem` room,
@@ -211,9 +237,15 @@ block 2 () {
 }
 ";
 
-/// [`op15`] passing the fuel `quota` operand `quota` and ending in `tail` instead of
-/// [`JOIN_OR_ERRNO`].
-fn op15_then(grant: bool, quota: i64, tail: &str) -> String {
+/// [`detached`] ending in `tail` instead of [`JOIN_OR_ERRNO`].
+fn detached_then(grant: bool, tail: &str) -> String {
+    let rec = SpawnRec {
+        size_log2: 15,
+        grants_ptr: 16384,
+        grants_n: u64::from(grant),
+        args: (20480, 8),
+        ..SpawnRec::default()
+    };
     format!(
         "memory 17
 func (i32, i32, i32, i32) -> (i64) {{
@@ -221,27 +253,21 @@ block 0 (vinst: i32, vmod: i32, vbud: i32, vout: i32) {{
 {g}  pa = i64.const 20480
   pw = i64.const {PAYLOAD}
   i64.store pa pw
-  vm = i64.extend_i32_s vmod
-  vb = i64.extend_i32_s vbud
-  gp = i64.const 16384
-  gn = i64.const {n}
-  en = i64.const 0
-  sl = i64.const 15
-  q = i64.const {quota}
-  al = i64.const 8
-  vch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vm, gp, gn, en, sl, q, pa, al)
-{tail}",
+{h}  vrp = i64.const {REC_AT}
+  vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+{tail}{seg}",
         g = store_grant("g", 16384, 16484, "stdout", "vout"),
-        n = u8::from(grant),
+        h = store_handles(),
+        seg = rec::segment(REC_AT, &rec),
     )
 }
 
-/// The powerbox an op-15 parent runs over: its `Instantiator`, `child` as a `Module`, a `Budget` whose
-/// `mem` quota is `mem` bytes, and `stdout`.
-fn op15_setup(child: &Module, mem: i64) -> impl Fn() -> (Host, Vec<Value>) + '_ {
+/// The powerbox a [`detached`] parent runs over: its `Instantiator`, `child` as a `Module`, a
+/// `Budget` whose `mem` quota is `mem` bytes, and `stdout`.
+fn detached_setup(child: &Module, mem: i64) -> impl Fn() -> (Host, Vec<Value>) + '_ {
     move || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 17);
+        let i = h.grant_instantiator();
         let c = h.grant_module(child);
         let b = h.grant_budget(-1, mem, -1);
         let o = h.grant_stream(StreamRole::Out);
@@ -328,13 +354,13 @@ block 0 (v0: i64) {{
 
 #[test]
 fn a_detached_child_starts_with_its_data_and_payload() {
-    let m = module(&op15(false));
+    let m = module(&detached(false));
     let child = module(CHILD_READS);
     let want = ok(PAYLOAD.wrapping_add(i64::from_le_bytes(*b"ABCDEFGH")));
     agree_on_every_driver(
-        "op 15, data + payload",
+        "a detached spawn, data + payload",
         &m,
-        &op15_setup(&child, 1 << 20),
+        &detached_setup(&child, 1 << 20),
         &want,
     );
 }
@@ -343,9 +369,9 @@ fn a_detached_child_starts_with_its_data_and_payload() {
 /// §5). `Vcpu`'s host used to build the child's powerbox and gave it the default report, tier 1.
 #[test]
 fn a_detached_child_attests_its_spawners_tier() {
-    let m = module(&op15(false));
+    let m = module(&detached(false));
     let child = module(CHILD_ATTESTS);
-    let base = op15_setup(&child, 1 << 20);
+    let base = detached_setup(&child, 1 << 20);
     let setup = || {
         let (mut h, args) = base();
         h.set_attestation(Attestation {
@@ -355,22 +381,22 @@ fn a_detached_child_attests_its_spawners_tier() {
         });
         (h, args)
     };
-    agree_on_every_driver("op 15, a tier-0 spawner", &m, &setup, &ok(0));
+    agree_on_every_driver("a detached spawn, a tier-0 spawner", &m, &setup, &ok(0));
 }
 
 /// An unbound required import refuses the spawn `-EINVAL` (IMPORTS.md §3.3 withhold). `Vcpu`'s host
 /// used to bind the manifest when it built the child and trapped `Malformed`.
 #[test]
 fn a_detached_child_whose_import_is_unbound_is_refused() {
-    let m = module(&op15(false));
+    let m = module(&detached(false));
     let child = module(DETACHED_IMPORTS_EXIT);
-    let setup = op15_setup(&child, 1 << 20);
-    agree_on_every_driver("op 15, an unbound import", &m, &setup, &ok(-22));
+    let setup = detached_setup(&child, 1 << 20);
+    agree_on_every_driver("a detached spawn, an unbound import", &m, &setup, &ok(-22));
     // #1975 — and it charged nothing: the import is bound after the admission, whose take the refusal
     // hands back, so the budget still has all its room.
-    let m = module(&op15_then(false, 0, ROOM_AFTER_REFUSAL));
+    let m = module(&detached_then(false, ROOM_AFTER_REFUSAL));
     agree_on_every_driver(
-        "op 15, an unbound import charges nothing",
+        "a detached spawn, an unbound import charges nothing",
         &m,
         &setup,
         &ok(1 << 20),
@@ -379,7 +405,7 @@ fn a_detached_child_whose_import_is_unbound_is_refused() {
 
 #[test]
 fn a_detached_child_gets_the_caps_granted_it_by_name() {
-    let m = module(&op15(true));
+    let m = module(&detached(true));
     let child = module(&detached_writes_m());
     let want = Ran {
         result: Ok(vec![Value::I64(42)]),
@@ -387,55 +413,57 @@ fn a_detached_child_gets_the_caps_granted_it_by_name() {
         stderr: Vec::new(),
     };
     agree_on_every_driver(
-        "op 15 + a named grant",
+        "a detached spawn + a named grant",
         &m,
-        &op15_setup(&child, 1 << 20),
+        &detached_setup(&child, 1 << 20),
         &want,
     );
 }
 
-/// A `ro` data segment is read-only in the child's fresh window. `Vcpu`'s hosts used to seed the
-/// window themselves, writably.
+/// A `ro` data segment is read-only in the child's fresh window: the child's write faults, and its
+/// parent's join answers `MEMORY_FAULT`. `Vcpu`'s hosts used to seed the window themselves,
+/// writably.
 #[test]
 fn a_detached_childs_read_only_data_stays_read_only() {
-    let m = module(&op15(false));
+    let m = module(&detached_then(false, JOIN_BOTH));
     let child = module(CHILD_WRITES_RO);
-    let want = Ran {
-        result: Err(Trap::MemoryFault),
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-    };
+    let want = ok(temen_ir::trap_code::MEMORY_FAULT * 1000);
     agree_on_every_driver(
-        "op 15, a write to ro data",
+        "a detached spawn, a write to ro data",
         &m,
-        &op15_setup(&child, 1 << 20),
+        &detached_setup(&child, 1 << 20),
         &want,
     );
 }
 
 #[test]
 fn a_detached_spawn_beyond_the_budget_is_refused() {
-    let m = module(&op15(false));
+    let m = module(&detached(false));
     let child = module(CHILD_READS);
-    let setup = op15_setup(&child, (1 << 15) - 1);
-    agree_on_every_driver("op 15, a budget one byte short", &m, &setup, &ok(-22));
+    let setup = detached_setup(&child, (1 << 15) - 1);
+    agree_on_every_driver(
+        "a detached spawn, a budget one byte short",
+        &m,
+        &setup,
+        &ok(-22),
+    );
 }
 
-/// [`op15_setup`] over a budget tree: a node split from the root with `node_mem` (`-1` = unbounded on
+/// [`detached_setup`] over a budget tree: a node split from the root with `node_mem` (`-1` = unbounded on
 /// its own), and the root already charged `root_used`. The guest pays with the node, or with the root
 /// when `pay_root`.
-fn op15_tree_setup(
+fn detached_tree_setup(
     child: &Module,
     root_mem: i64,
     node_mem: i64,
     root_used: u64,
     pay_root: bool,
 ) -> impl Fn() -> (Host, Vec<Value>) + '_ {
-    let base = op15_setup(child, root_mem);
+    let base = detached_setup(child, root_mem);
     move || {
         let (mut h, mut args) = base();
         let Value::I32(root) = args[2] else {
-            unreachable!("op15_setup hands the budget third")
+            unreachable!("detached_setup hands the budget third")
         };
         let node = h
             .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[-1, node_mem, -1], None)
@@ -454,31 +482,31 @@ fn op15_tree_setup(
 /// for the window its 32 KiB child node could have used.
 #[test]
 fn a_detached_window_is_charged_to_every_level_of_the_chain() {
-    let m = module(&op15(false));
+    let m = module(&detached(false));
     let child = module(CHILD_READS);
     let ran = ok(PAYLOAD.wrapping_add(i64::from_le_bytes(*b"ABCDEFGH")));
     agree_on_every_driver(
-        "op 15, the root's use caps its node",
+        "a detached spawn, the root's use caps its node",
         &m,
-        &op15_tree_setup(&child, 1 << 16, 1 << 15, 3 << 14, false),
+        &detached_tree_setup(&child, 1 << 16, 1 << 15, 3 << 14, false),
         &ok(-22),
     );
     agree_on_every_driver(
-        "op 15, room at every level",
+        "a detached spawn, room at every level",
         &m,
-        &op15_tree_setup(&child, 1 << 16, 1 << 15, 1 << 14, false),
+        &detached_tree_setup(&child, 1 << 16, 1 << 15, 1 << 14, false),
         &ran,
     );
     agree_on_every_driver(
-        "op 15, the node one byte short",
+        "a detached spawn, the node one byte short",
         &m,
-        &op15_tree_setup(&child, 1 << 20, (1 << 15) - 1, 0, false),
+        &detached_tree_setup(&child, 1 << 20, (1 << 15) - 1, 0, false),
         &ok(-22),
     );
     agree_on_every_driver(
-        "op 15, a split reserves nothing",
+        "a detached spawn, a split reserves nothing",
         &m,
-        &op15_tree_setup(&child, 1 << 15, 1 << 15, 0, true),
+        &detached_tree_setup(&child, 1 << 15, 1 << 15, 0, true),
         &ran,
     );
 }
@@ -507,14 +535,14 @@ block 2 () {
 }
 ";
 
-/// [`op15_setup`] paying with a node split from the root with a `fuel` ceiling (`-1` = unbounded on
+/// [`detached_setup`] paying with a node split from the root with a `fuel` ceiling (`-1` = unbounded on
 /// its own, so only the run's fuel caps it).
-fn op15_fuel_setup(child: &Module, fuel: i64) -> impl Fn() -> (Host, Vec<Value>) + '_ {
-    let base = op15_setup(child, 1 << 20);
+fn detached_fuel_setup(child: &Module, fuel: i64) -> impl Fn() -> (Host, Vec<Value>) + '_ {
+    let base = detached_setup(child, 1 << 20);
     move || {
         let (mut h, mut args) = base();
         let Value::I32(root) = args[2] else {
-            unreachable!("op15_setup hands the budget third")
+            unreachable!("detached_setup hands the budget third")
         };
         let node = h
             .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[fuel, -1, -1], None)
@@ -533,56 +561,54 @@ fn trapped(t: Trap) -> Ran {
 }
 
 /// #1944 slice 3 — on every driver, a detached child burns the fuel of the budget that paid for it:
-/// a node's fuel ceiling ends a child that loops past it, though its parent has fuel to spare (the
-/// join hands the child's trap to the parent), and a node with room lets it finish.
+/// a node's fuel ceiling ends a child that loops past it, though its parent has fuel to spare (its
+/// join answers the child's `OUT_OF_FUEL`), and a node with room lets it finish.
 #[test]
 fn a_detached_childs_fuel_is_capped_by_its_budget() {
-    let m = module(&op15(false));
+    let m = module(&detached_then(false, JOIN_BOTH));
     let child = module(CHILD_LOOPS);
     agree_on_every_driver(
-        "op 15, a fuel ceiling with room",
+        "a detached spawn, a fuel ceiling with room",
         &m,
-        &op15_fuel_setup(&child, 2 * PAYLOAD),
+        &detached_fuel_setup(&child, 2 * PAYLOAD),
         &ok(7),
     );
     agree_on_every_driver(
-        "op 15, a node unbounded on its own",
+        "a detached spawn, a node unbounded on its own",
         &m,
-        &op15_fuel_setup(&child, -1),
+        &detached_fuel_setup(&child, -1),
         &ok(7),
     );
     agree_on_every_driver(
-        "op 15, a fuel ceiling the child loops past",
+        "a detached spawn, a fuel ceiling the child loops past",
         &m,
-        &op15_fuel_setup(&child, PAYLOAD / 2),
-        &trapped(Trap::OutOfFuel),
+        &detached_fuel_setup(&child, PAYLOAD / 2),
+        &ok(temen_ir::trap_code::OUT_OF_FUEL * 1000),
     );
 }
 
-/// #1944 slice 3 — the per-spawn fuel `quota` is retired (the budget is the one fuel limit): a
-/// nonzero one traps `CapFault` on every driver, as op 15's operand and as a v1 record's field.
+/// A spawn record's padding word (offset 52) must be zero: a nonzero one traps `CapFault` on every
+/// driver, as any malformed record does (#2091).
 #[test]
-fn a_detached_spawn_with_a_fuel_quota_traps() {
-    let child = module(CHILD_LOOPS);
-    let m = module(&op15_then(false, 5, JOIN_OR_ERRNO));
-    agree_on_every_driver(
-        "op 15, a nonzero quota",
-        &m,
-        &op15_setup(&child, 1 << 20),
-        &trapped(Trap::CapFault),
+fn a_spawn_record_with_nonzero_padding_traps() {
+    let clean = SpawnRec::default();
+    let mut bytes = clean.encode();
+    bytes[52] = 5;
+    let padded: String = bytes.iter().map(|b| format!("\\x{b:02x}")).collect();
+    let src = record_spawn(&clean).replace(
+        &rec::segment(17408, &clean),
+        &format!("data 17408 \"{padded}\"\n"),
     );
-    let mut rec = SpawnRec::v1(0);
-    rec.quota = 5;
-    let m = module(&record_spawn(&rec));
+    let m = module(&src);
     agree_on_every_driver(
-        "op 17, a v1 record with a nonzero quota",
+        "a record with nonzero padding",
         &m,
         &generations_setup(&m, &[1]),
         &trapped(Trap::CapFault),
     );
-    let m = module(&record_spawn(&SpawnRec::v1(0)));
+    let m = module(&record_spawn(&clean));
     agree_on_every_driver(
-        "op 17, a v1 record with no quota",
+        "the same record, zero-padded",
         &m,
         &generations_setup(&m, &[1]),
         &ok(3),
@@ -600,40 +626,30 @@ block 0 (v0: i64) {
 }
 ";
 
-/// An op-15 parent `(i32 inst, i32 module, i32 budget) -> i64`: spawns three detached children
-/// `vh0..vh2`, child `k` handed payload word `100 + k`, then runs `joins`, which must leave the result
-/// in `vr`.
+/// A parent `(i32 inst, i32 module, i32 budget, i32 out) -> i64`: spawns three detached children
+/// `vh0..vh2` ([`spawn_into`]), child `k` handed payload word `100 + k`, then runs `joins`, which
+/// must leave the result in `vr`. `out` is a stdout stream, a cap a parent may grant into a child.
 fn three_children_then(joins: &str) -> String {
     let spawns: String = (0..3)
-        .map(|k| {
-            format!(
-                "  pa{k} = i64.const {at}\n  pw{k} = i64.const {w}\n  i64.store pa{k} pw{k}\n\
-                 \x20 vh{k} = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vm, gz, gz, gz, sl, gz, pa{k}, al)\n",
-                at = 20480 + 8 * k,
-                w = 100 + k,
-            )
-        })
+        .map(|k| spawn_into(&format!("vh{k}"), 20480 + 8 * k, 100 + k as i64))
         .collect();
     format!(
         "memory 17
-func (i32, i32, i32) -> (i64) {{
-block 0 (vinst: i32, vmod: i32, vbud: i32) {{
-  vm = i64.extend_i32_s vmod
-  vb = i64.extend_i32_s vbud
-  gz = i64.const 0
-  sl = i64.const 15
-  al = i64.const 8
-{spawns}{joins}
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vmod: i32, vbud: i32, vout: i32) {{
+{h}{spawns}{joins}
   return vr
   }}
 }}
-"
+{seg}",
+        h = store_handles(),
+        seg = rec::segment(REC_AT, &payload_rec()),
     )
 }
 
-/// Join handle `h` (a text-IR operand) into `dst`.
+/// Join handle `h` (a text-IR operand): its value into `dst`, its status into `{dst}_st`.
 fn join(dst: &str, h: &str) -> String {
-    format!("  {dst} = call.cap 6 1 (i32) -> (i64) vinst ({h})\n")
+    format!("  {dst}_st, {dst} = call.cap 6 1 (i32) -> (i64, i64) vinst ({h})\n")
 }
 
 /// Run `joins` after three detached spawns on every driver. A join's handle is resolved by the
@@ -641,20 +657,26 @@ fn join(dst: &str, h: &str) -> String {
 /// span, and a spent or never-issued slot traps. The `Vcpu`'s hosts each kept their own table and
 /// rule until the engine took it over: the test orchestrator waited forever on a re-join.
 fn joins_agree(what: &str, joins: &str, want: &Ran) {
-    let m = module(&three_children_then(joins));
+    handles_agree(&drivers::ALL, what, joins, want);
+}
+
+/// [`joins_agree`] on `drivers`: `ops` runs after the three spawns and leaves its answer in `vr`.
+fn handles_agree(drivers: &[Driver], what: &str, ops: &str, want: &Ran) {
+    let m = module(&three_children_then(ops));
     let child = module(CHILD_RETURNS_PAYLOAD);
     let setup = |h: &mut Host| {
-        let i = h.grant_instantiator(0, 1 << 17);
+        let i = h.grant_instantiator();
         let c = h.grant_module(&child);
         let b = h.grant_budget(-1, 1 << 20, -1);
-        vec![Value::I32(i), Value::I32(c), Value::I32(b)]
+        let o = h.grant_stream(StreamRole::Out);
+        vec![Value::I32(i), Value::I32(c), Value::I32(b), Value::I32(o)]
     };
     let setup = || {
         let mut h = Host::new();
         let args = setup(&mut h);
         (h, args)
     };
-    agree_on_every_driver(what, &m, &setup, want);
+    agree_on(drivers, what, &m, &setup, want);
 }
 
 #[test]
@@ -703,6 +725,101 @@ fn a_handle_masks_onto_the_table() {
     );
 }
 
+/// The drivers that answer `child_offer` (op 14): the debug scheduler declines it.
+const OFFERING: [Driver; 4] = [Driver::Oracle, Driver::Coop, Driver::Parallel, Driver::Vcpu];
+
+/// #2378 — every child op resolves a handle by the join's rule, so a spent or forged one gets one
+/// answer on every driver: the oracle's. `join`, `poll`, `detach` and `kill` trap `ThreadFault`;
+/// `child_offer` and `grant` answer `-EINVAL`, the value they give a child they cannot reach. The
+/// handles: child 0 spent by a join, child 0 spent by a detach, a negative one, and 3, past the
+/// table (the span is 4, and slot 3 was never issued). The `Vcpu` has no surface for ops 9, 10, 12
+/// and 19 yet (#2083), so those run on the drivers that schedule their children, and the debug
+/// scheduler declines op 14 ([`OFFERING`]).
+#[test]
+fn a_spent_or_forged_handle_gets_the_oracles_answer_from_every_child_op() {
+    let spend = [
+        ("joined", join("vsp", "vh0") + "  vbad = i32.const 0\n"),
+        (
+            "detached",
+            "  vsp = call.cap 6 10 (i32) -> (i32) vinst (vh0)\n  vbad = i32.const 0\n".to_string(),
+        ),
+        ("negative", "  vbad = i32.const -1\n".to_string()),
+        ("past the table", "  vbad = i32.const 3\n".to_string()),
+    ];
+    let einval = ok(temen_ir::errno::EINVAL);
+    let faults = trapped(Trap::ThreadFault);
+    // An op answering an `i32` leaves it in `vo`, widened into `vr`.
+    let widen = |call: &str| format!("{call}  vr = i64.extend_i32_s vo\n");
+    let ops: [(&str, String, &[Driver], &Ran); 6] = [
+        ("join", join("vr", "vbad"), &drivers::ALL, &faults),
+        (
+            "poll",
+            widen("  vo = call.cap 6 9 (i32) -> (i32) vinst (vbad)\n"),
+            &SCHEDULING,
+            &faults,
+        ),
+        (
+            "detach",
+            widen("  vo = call.cap 6 10 (i32) -> (i32) vinst (vbad)\n"),
+            &SCHEDULING,
+            &faults,
+        ),
+        (
+            "kill",
+            widen("  vo = call.cap 6 12 (i32) -> (i32) vinst (vbad)\n"),
+            &SCHEDULING,
+            &faults,
+        ),
+        (
+            "child_offer",
+            widen("  vx = i64.const 0\n  vo = call.cap 6 14 (i32, i64) -> (i32) vinst (vbad, vx)\n"),
+            &OFFERING,
+            &einval,
+        ),
+        (
+            "grant",
+            widen(
+                "  vgh = i64.extend_i32_s vout\n  vo = call.cap 6 19 (i32, i64) -> (i32) vinst (vbad, vgh)\n",
+            ),
+            &SCHEDULING,
+            &einval,
+        ),
+    ];
+    for (handle, prelude) in &spend {
+        for (op, call, drivers, want) in &ops {
+            // Spending a handle by `detach` is itself an op the `Vcpu` has no surface for.
+            let drivers: Vec<Driver> = drivers
+                .iter()
+                .copied()
+                .filter(|d| *handle != "detached" || !matches!(d, Driver::Vcpu))
+                .collect();
+            handles_agree(
+                &drivers,
+                &format!("{op} on a {handle} handle"),
+                &format!("{prelude}{call}"),
+                want,
+            );
+        }
+    }
+}
+
+/// #2378 — a handle past the table that the mask folds onto a live child names that child for every
+/// op, as for `join` ([`a_handle_masks_onto_the_table`]): `detach(5)` detaches child 1, so its own
+/// handle is spent after.
+#[test]
+fn a_masked_handle_detaches_the_child_it_names() {
+    let ops = format!(
+        "  vn = i32.const 5\n  vd = call.cap 6 10 (i32) -> (i32) vinst (vn)\n{}",
+        join("vr", "vh1")
+    );
+    handles_agree(
+        &SCHEDULING,
+        "detach(5), then join child 1",
+        &ops,
+        &trapped(Trap::ThreadFault),
+    );
+}
+
 // ---- #1944: a detached child pays for its own detached child ------------------------------------
 
 /// Three generations of one `memory 16` module, each window 64 KiB, each a child image (#2219). The
@@ -716,7 +833,7 @@ fn three_generations(mem: i64, spawn: i64) -> String {
     let r1 = SpawnRec {
         grants_ptr: 17600,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::default()
     };
     format!(
         "memory 16
@@ -731,13 +848,13 @@ block 0 (vinst: i32, vc1: i32, vc2: i32) {{
   cap = i64.const {mem}
   sp = i64.const {spawn}
   vsub = call.cap 14 0 (i64, i64, i64) -> (i32) vroot (all, cap, sp)
-  bf = i64.const 17436
+  bf = i64.const 17420
   i32.store bf vsub
-  mf = i64.const 17432
+  mf = i64.const 17416
   i32.store mf vc1
 {g2}  rp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vinst (rp)
-  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   k = i64.const 100
   vr = i64.add vj k
   return vr
@@ -749,12 +866,12 @@ block 0 (va: i64) {{
   np = i64.const 16384
   nl = i64.const 6
   vb = self.resolve np nl
-  bf = i64.const 17532
+  bf = i64.const 17516
   i32.store bf vb
   gp = i64.const 16400
   gl = i64.const 2
   vg = self.resolve gp gl
-  mf = i64.const 17528
+  mf = i64.const 17512
   i32.store mf vg
   rp = i64.const 17504
   vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
@@ -767,7 +884,7 @@ block 1 (ve: i32) {{
   return vr
   }}
 block 2 (vi: i32, vh: i32) {{
-  vj = call.cap 6 1 (i32) -> (i64) vi (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vh)
   k = i64.const 20
   vr = i64.add vj k
   return vr
@@ -781,7 +898,7 @@ block 0 (va: i64) {{
 }}
 ",
         r1 = rec::segment(17408, &r1),
-        r2 = rec::segment(17504, &SpawnRec::v1(0)),
+        r2 = rec::segment(17504, &SpawnRec::default()),
         g2 = store_grant("g", 17600, 16400, "g2", "vc2"),
     )
 }
@@ -794,7 +911,7 @@ fn generations_setup<'a>(
 ) -> impl Fn() -> (Host, Vec<Value>) + 'a {
     move || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 16);
+        let i = h.grant_instantiator();
         let b = h.grant_budget(-1, 1 << 20, -1);
         h.register_cap_name("budget", b);
         let mut args = vec![Value::I32(i)];
@@ -807,7 +924,7 @@ fn generations_setup<'a>(
 }
 
 /// A `memory 16` root `(i32 inst, i32 child) -> i64` that spawns `child` (func 1's child image) by the
-/// v1 record `rec`, paid from its `"budget"`, and returns the join. Func 1 returns 3.
+/// spawn record `rec`, paid from its `"budget"`, and returns the join. Func 1 returns 3.
 fn record_spawn(rec: &SpawnRec) -> String {
     format!(
         "memory 16
@@ -817,13 +934,13 @@ block 0 (vinst: i32, vmod: i32) {{
   np = i64.const 16384
   nl = i64.const 6
   vb = self.resolve np nl
-  bf = i64.const 17436
+  bf = i64.const 17420
   i32.store bf vb
-  mf = i64.const 17432
+  mf = i64.const 17416
   i32.store mf vmod
   rp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vinst (rp)
-  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   return vj
   }}
 }}
@@ -862,16 +979,29 @@ fn a_childs_ceiling_caps_its_subtree_while_its_parent_has_room() {
 
 // ---- #1944 slice 3: a detached child is one `spawn` of the budget that pays for it while it lives ----
 
-/// An op-15 spawn of `module` into `dst` (a text-IR operand), funded by `vb`, whose payload word is
-/// `word` at `at`. Expects `vinst`, `vb`, `vm`, `gz`, `sl` and `al` in scope.
+/// The record [`spawn_into`] spawns from, at [`REC_AT`]: a 32 KiB window and an 8-byte payload, its
+/// pointer set at each spawn. The parent stores its handles into it ([`store_handles`]).
+fn payload_rec() -> SpawnRec {
+    SpawnRec {
+        size_log2: 15,
+        args: (0, 8),
+        ..SpawnRec::default()
+    }
+}
+
+/// A spawn into `dst` (a text-IR operand) from [`payload_rec`], whose payload word is `word` at `at`:
+/// the record's args pointer moves to `at` first. Expects `vinst` in scope.
 fn spawn_into(dst: &str, at: u64, word: i64) -> String {
     format!(
         "  pa{dst} = i64.const {at}\n  pw{dst} = i64.const {word}\n  i64.store pa{dst} pw{dst}\n\
-         \x20 {dst} = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vm, gz, gz, gz, sl, gz, pa{dst}, al)\n"
+         \x20 ap{dst} = i64.const {args_at}\n  i64.store ap{dst} pa{dst}\n\
+         \x20 rp{dst} = i64.const {REC_AT}\n\
+         \x20 {dst} = call.cap 6 17 (i64) -> (i32) vinst (rp{dst})\n",
+        args_at = REC_AT + 32, // the record's args pointer (`temen_ir::SpawnRec`)
     )
 }
 
-/// An op-15 parent `(i32 inst, i32 module, i32 budget) -> i64` that spawns child A, joins it, then spawns
+/// A parent `(i32 inst, i32 module, i32 budget) -> i64` that spawns child A, joins it, then spawns
 /// child C and joins it, returning `join(A) + join(C)`: each child returns its payload word, A's 100
 /// and C's 102. A refused C traps its join (a negative handle).
 fn spawn_after_join() -> String {
@@ -879,20 +1009,17 @@ fn spawn_after_join() -> String {
         "memory 17
 func (i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vmod: i32, vbud: i32) {{
-  vm = i64.extend_i32_s vmod
-  vb = i64.extend_i32_s vbud
-  gz = i64.const 0
-  sl = i64.const 15
-  al = i64.const 8
-{a}{ja}{c}{jc}  vr = i64.add ja jc
+{h}{a}{ja}{c}{jc}  vr = i64.add ja jc
   return vr
   }}
 }}
-",
+{seg}",
+        h = store_handles(),
         a = spawn_into("vha", 20480, 100),
         ja = join("ja", "vha"),
         c = spawn_into("vhc", 20496, 102),
         jc = join("jc", "vhc"),
+        seg = rec::segment(REC_AT, &payload_rec()),
     )
 }
 
@@ -901,7 +1028,7 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
 fn spawn_setup(child: &Module, spawn: i64) -> impl Fn() -> (Host, Vec<Value>) + '_ {
     move || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 17);
+        let i = h.grant_instantiator();
         let c = h.grant_module(child);
         let b = h.grant_budget(-1, 1 << 20, spawn);
         (h, vec![Value::I32(i), Value::I32(c), Value::I32(b)])
@@ -916,7 +1043,7 @@ fn a_joined_detached_child_hands_its_spawn_back() {
     let m = module(&spawn_after_join());
     let child = module(CHILD_RETURNS_PAYLOAD);
     agree_on_every_driver(
-        "op 15, a one-child budget spawning twice in turn",
+        "a detached spawn, a one-child budget spawning twice in turn",
         &m,
         &spawn_setup(&child, 1),
         &ok(100 + 102),
@@ -927,14 +1054,19 @@ fn a_joined_detached_child_hands_its_spawn_back() {
 /// nothing: the budget's `mem` room is whole after it.
 #[test]
 fn a_spawn_0_budget_funds_no_child() {
-    let m = module(&op15_then(false, 0, ROOM_AFTER_REFUSAL));
+    let m = module(&detached_then(false, ROOM_AFTER_REFUSAL));
     let child = module(CHILD_READS);
     let setup = || {
-        let (mut h, mut args) = op15_setup(&child, 1 << 20)();
+        let (mut h, mut args) = detached_setup(&child, 1 << 20)();
         args[2] = Value::I32(h.grant_budget(-1, 1 << 20, 0));
         (h, args)
     };
-    agree_on_every_driver("op 15, a spawn-0 budget", &m, &setup, &ok(1 << 20));
+    agree_on_every_driver(
+        "a detached spawn, a spawn-0 budget",
+        &m,
+        &setup,
+        &ok(1 << 20),
+    );
 }
 
 /// On every driver, a child's `spawn` ceiling counts its own first vCPU and its children: a child
@@ -994,13 +1126,13 @@ block 3 (vnok: i64) {
 /// whose budget holds one pipe's channel memory mints exactly one.
 #[test]
 fn a_detached_childs_pipes_are_capped_by_its_budget() {
-    let m = module(&op15(false));
+    let m = module(&detached(false));
     let child = module(CHILD_MINTS_PIPES);
-    let base = op15_setup(&child, 1 << 20);
+    let base = detached_setup(&child, 1 << 20);
     let setup = || {
         let (mut h, mut args) = base();
         let Value::I32(root) = args[2] else {
-            unreachable!("op15_setup hands the budget third")
+            unreachable!("detached_setup hands the budget third")
         };
         let node = h
             .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[-1, -1, -1, PIPE_CAP], None)
@@ -1008,7 +1140,12 @@ fn a_detached_childs_pipes_are_capped_by_its_budget() {
         args[2] = Value::I32(node as i32);
         (h, args)
     };
-    agree_on_every_driver("op 15, a one-pipe channel ceiling", &m, &setup, &ok(1));
+    agree_on_every_driver(
+        "a detached spawn, a one-pipe channel ceiling",
+        &m,
+        &setup,
+        &ok(1),
+    );
 }
 
 // ---- #2001: a domain's threads are `spawn`s of its node while they live ----
@@ -1039,20 +1176,22 @@ block 0 (vsp: i64, varg: i64) {
 ";
 
 /// On every driver, a detached child's threads are `spawn`s of the budget that pays for it while they
-/// live: a child whose ceiling is one vCPU fills it itself, so its first `thread.spawn` traps, and one
-/// whose ceiling is two runs a thread, joins it, and runs another in its place.
+/// live: a child whose ceiling is one vCPU fills it itself, so its first `thread.spawn` traps (its
+/// parent's join answers `THREAD_FAULT`), and one whose ceiling is two runs a thread, joins it, and
+/// runs another in its place.
 #[test]
 fn a_detached_childs_threads_are_capped_by_its_budget() {
-    let m = module(&op15(false));
+    let m = module(&detached_then(false, JOIN_BOTH));
     let child = module(CHILD_SPAWNS_THREADS_IN_TURN);
-    for (spawn, want) in [(1, trapped(Trap::ThreadFault)), (2, ok(11 + 21))] {
+    let thread_fault = temen_ir::trap_code::THREAD_FAULT * 1000;
+    for (spawn, want) in [(1, ok(thread_fault)), (2, ok(11 + 21))] {
         let setup = || {
-            let (mut h, mut args) = op15_setup(&child, 1 << 20)();
+            let (mut h, mut args) = detached_setup(&child, 1 << 20)();
             args[2] = Value::I32(h.grant_budget(-1, 1 << 20, spawn));
             (h, args)
         };
         agree_on_every_driver(
-            &format!("op 15, a child whose budget holds {spawn} vCPUs spawning threads in turn"),
+            &format!("a detached spawn, a child whose budget holds {spawn} vCPUs spawning threads in turn"),
             &m,
             &setup,
             &want,
@@ -1060,36 +1199,13 @@ fn a_detached_childs_threads_are_capped_by_its_budget() {
     }
 }
 
-// ---- #2053: `wait` (op 18) — how a child ended, without inheriting its trap ----
+// ---- #2066: `join` answers how a child ended, without inheriting its trap ----
 
-/// The tail of a parent that `wait`s for its child and returns the answer.
-const WAIT: &str = "\
-  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
-  return w1
-  }
-}
-";
-
-/// The tail of a parent that `wait`s twice, then `join`s: `(first * 1000 + second) * 1000 + value`.
-const WAIT_WAIT_JOIN: &str = "\
-  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
-  w2 = call.cap 6 18 (i32) -> (i64) vinst (vch)
-  jr = call.cap 6 1 (i32) -> (i64) vinst (vch)
-  k = i64.const 1000
-  s1 = i64.mul w1 k
-  s2 = i64.add s1 w2
-  s3 = i64.mul s2 k
-  s4 = i64.add s3 jr
-  return s4
-  }
-}
-";
-
-/// The tail of a parent that `wait`s, then `join`s the same handle.
-const WAIT_JOIN: &str = "\
-  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
-  jr = call.cap 6 1 (i32) -> (i64) vinst (vch)
-  return jr
+/// The tail of a parent that `join`s the same handle twice.
+const JOIN_JOIN: &str = "\
+  j1s, j1 = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  j2s, j2 = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  return j2
   }
 }
 ";
@@ -1103,38 +1219,52 @@ block 0 (v0: i64) {
 }
 ";
 
-/// #2053 — on every driver, `wait` parks until the child ends and answers how: 0 for a child that
-/// returned, which stays for its `join` (a second `wait` answers 0 again, and the `join` still gets its
-/// value); else the child's trap's wire code, and the parent runs on — a child that loops past its
-/// node's fuel ceiling answers `OUT_OF_FUEL`, one that reaches `unreachable` answers `UNREACHABLE`. A
-/// trapped child has nothing left to join: the wait reaps it, so a `join` after it is a spent handle.
+/// #2066 — on every driver, `join` parks until the child ends and answers how, as `(status, value)`:
+/// `(0, its result)` for a child that returned; else `(its trap's wire code, 0)`, and the parent runs
+/// on — a child that loops past its node's fuel ceiling answers `OUT_OF_FUEL`, one that reaches
+/// `unreachable` answers `UNREACHABLE`, and one that calls `exit(7)` answers `exit(7)`, its status in
+/// the high 32 bits. Either way the join reaps the child, so a second `join` of it is a spent handle.
 #[test]
-fn wait_answers_how_a_detached_child_ended() {
+fn join_answers_how_a_detached_child_ended() {
     use temen_ir::trap_code;
     let loops = module(CHILD_LOOPS);
     let crashes = module(CHILD_UNREACHABLE);
+    let both = module(&detached_then(false, JOIN_BOTH));
     agree_on_every_driver(
-        "wait, wait, join on a child that returned",
-        &module(&op15_then(false, 0, WAIT_WAIT_JOIN)),
-        &op15_fuel_setup(&loops, 2 * PAYLOAD),
+        "a child that returned",
+        &both,
+        &detached_fuel_setup(&loops, 2 * PAYLOAD),
         &ok(7),
     );
     agree_on_every_driver(
-        "wait on a child past its fuel ceiling",
-        &module(&op15_then(false, 0, WAIT)),
-        &op15_fuel_setup(&loops, PAYLOAD / 2),
-        &ok(trap_code::OUT_OF_FUEL),
+        "a child past its fuel ceiling",
+        &both,
+        &detached_fuel_setup(&loops, PAYLOAD / 2),
+        &ok(trap_code::OUT_OF_FUEL * 1000),
     );
     agree_on_every_driver(
-        "wait on a child that reaches unreachable",
-        &module(&op15_then(false, 0, WAIT)),
-        &op15_setup(&crashes, 1 << 20),
-        &ok(trap_code::UNREACHABLE),
+        "a child that reaches unreachable",
+        &both,
+        &detached_setup(&crashes, 1 << 20),
+        &ok(trap_code::UNREACHABLE * 1000),
+    );
+    let exits = module(DETACHED_CALLS_EXIT);
+    let base = detached_setup(&exits, 1 << 20);
+    let granted_exit = || {
+        let (mut h, mut args) = base();
+        args[3] = Value::I32(h.grant_exit());
+        (h, args)
+    };
+    agree_on_every_driver(
+        "a child that exits",
+        &module(&op17_granting_then(&[("exit", None)], JOIN_BOTH)),
+        &granted_exit,
+        &ok(trap_code::exit(7) * 1000),
     );
     agree_on_every_driver(
-        "join after a wait reaped a trapped child",
-        &module(&op15_then(false, 0, WAIT_JOIN)),
-        &op15_fuel_setup(&loops, PAYLOAD / 2),
+        "a second join of a child that trapped",
+        &module(&detached_then(false, JOIN_JOIN)),
+        &detached_fuel_setup(&loops, PAYLOAD / 2),
         &trapped(Trap::ThreadFault),
     );
 }
@@ -1153,51 +1283,69 @@ block 1 () {
 }
 ";
 
-/// The tail of a parent that `kill`s the child it just spawned, then `wait`s:
-/// `kill * 1000 + wait`.
-const KILL_WAIT: &str = "\
+/// The tail of a parent that `kill`s the child it just spawned, then `join`s it:
+/// `(kill * 1000 + status) * 1000 + value`.
+const KILL_JOIN: &str = "\
   k1 = call.cap 6 12 (i32) -> (i32) vinst (vch)
-  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
+  js, jv = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   k2 = i64.extend_i32_s k1
   k = i64.const 1000
   s1 = i64.mul k2 k
-  s2 = i64.add s1 w1
-  return s2
-  }
-}
-";
-
-/// The tail of a parent that `wait`s, `poll`s, then `join`s: `(wait * 1000 + poll) * 1000 + value`.
-const WAIT_POLL_JOIN: &str = "\
-  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
-  p1 = call.cap 6 9 (i32) -> (i32) vinst (vch)
-  jr = call.cap 6 1 (i32) -> (i64) vinst (vch)
-  p2 = i64.extend_i32_s p1
-  k = i64.const 1000
-  s1 = i64.mul w1 k
-  s2 = i64.add s1 p2
+  s2 = i64.add s1 js
   s3 = i64.mul s2 k
-  s4 = i64.add s3 jr
+  s4 = i64.add s3 jv
   return s4
   }
 }
 ";
 
-/// The tail of a parent that `wait`s, then `detach`es, then `join`s the spent handle.
-const WAIT_DETACH_JOIN: &str = "\
-  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
-  d1 = call.cap 6 10 (i32) -> (i32) vinst (vch)
-  jr = call.cap 6 1 (i32) -> (i64) vinst (vch)
-  return jr
+/// The tail of a parent that `poll`s its child until it has ended, then runs `rest` in a block with
+/// `vinst` and `vch` rebound and the last `poll`'s answer in `p1` (1 returned, 2 trapped).
+fn polled_until_it_ends(rest: &str) -> String {
+    format!(
+        "\
+  br 1(vinst, vch)
+}}
+block 1 (vinst: i32, vch: i32) {{
+  p = call.cap 6 9 (i32) -> (i32) vinst (vch)
+  z = i32.const 0
+  running = i32.eq p z
+  br_if running 1(vinst, vch) 2(vinst, vch, p)
+}}
+block 2 (vinst: i32, vch: i32, p1: i32) {{
+{rest}"
+    )
+}
+
+/// After [`polled_until_it_ends`]: `join`, and return `poll * 1000 + value`.
+const POLL_THEN_JOIN: &str = "\
+  js, jv = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  p2 = i64.extend_i32_s p1
+  k = i64.const 1000
+  s1 = i64.mul p2 k
+  s2 = i64.add s1 jv
+  return s2
   }
 }
 ";
 
-/// The tail of a parent that `wait`s, then `kill`s the child that has already ended, then `join`s.
-const WAIT_KILL_JOIN: &str = "\
-  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
+/// After [`polled_until_it_ends`]: `kill` the child that has ended, then `join` it, and return
+/// `status * 1000 + value`.
+const POLL_THEN_KILL_JOIN: &str = "\
   k1 = call.cap 6 12 (i32) -> (i32) vinst (vch)
-  jr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  js, jv = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  k = i64.const 1000
+  s1 = i64.mul js k
+  s2 = i64.add s1 jv
+  return s2
+  }
+}
+";
+
+/// The tail of a parent that `detach`es, then `join`s the spent handle.
+const DETACH_JOIN: &str = "\
+  d1 = call.cap 6 10 (i32) -> (i32) vinst (vch)
+  jr_st, jr = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   return jr
   }
 }
@@ -1205,7 +1353,7 @@ const WAIT_KILL_JOIN: &str = "\
 
 /// #2068, #2074 — `poll`, `detach` and `kill` answer as the tree-walker's do on every driver that
 /// schedules its own children:
-/// - a kill ends a child that would spin forever, and `wait` answers `THREAD_FAULT` (a kill that
+/// - a kill ends a child that would spin forever, and its `join` answers `THREAD_FAULT` (a kill that
 ///   did nothing would run the child into its node's fuel ceiling: `OUT_OF_FUEL`);
 /// - `poll` on a child that returned answers 1, and leaves it for its `join`;
 /// - `detach` spends the handle, so a `join` after it is a `ThreadFault`;
@@ -1220,27 +1368,39 @@ fn poll_detach_and_kill_answer_on_every_scheduling_driver() {
     let loops = module(CHILD_LOOPS);
     // The spinning child's node holds 10M fuel, so a kill that did nothing fails in seconds, not
     // at the run's ceiling; the kill reaches it long before.
-    let cases: [(&str, &str, &Module, i64, Ran); 4] = [
+    let cases: [(&str, String, &Module, i64, Ran); 4] = [
         (
-            "kill, then wait",
-            KILL_WAIT,
+            "kill, then join",
+            KILL_JOIN.into(),
             &spins,
             10_000_000,
-            ok(trap_code::THREAD_FAULT),
+            ok(trap_code::THREAD_FAULT * 1000),
         ),
-        ("wait, poll, join", WAIT_POLL_JOIN, &loops, -1, ok(1007)),
         (
-            "wait, detach, join",
-            WAIT_DETACH_JOIN,
+            "poll until it ends, then join",
+            polled_until_it_ends(POLL_THEN_JOIN),
+            &loops,
+            -1,
+            ok(1007),
+        ),
+        (
+            "detach, join",
+            DETACH_JOIN.into(),
             &loops,
             -1,
             trapped(Trap::ThreadFault),
         ),
-        ("wait, kill, join", WAIT_KILL_JOIN, &loops, -1, ok(7)),
+        (
+            "poll until it ends, kill, join",
+            polled_until_it_ends(POLL_THEN_KILL_JOIN),
+            &loops,
+            -1,
+            ok(7),
+        ),
     ];
     for (what, tail, child, fuel, want) in cases {
-        let m = module(&op15_then(false, 0, tail));
-        let setup = op15_fuel_setup(child, fuel);
+        let m = module(&detached_then(false, &tail));
+        let setup = detached_fuel_setup(child, fuel);
         agree_on(&SCHEDULING, what, &m, &setup, &want);
         assert_eq!(
             run_on(Driver::Vcpu, &m, &setup),
@@ -1252,7 +1412,7 @@ fn poll_detach_and_kill_answer_on_every_scheduling_driver() {
 
 /// A parent that `join`s, with a `kill` on a branch it never takes.
 const JOIN_THEN_DEAD_KILL: &str = "\
-  jr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  jr_st, jr = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   z = i32.const 0
   br_if z 1(vinst, vch) 2(jr)
 }
@@ -1272,8 +1432,8 @@ block 2 (rv: i64) {
 #[test]
 fn a_kill_that_never_runs_does_not_stop_a_module_on_any_driver() {
     let loops = module(CHILD_LOOPS);
-    let m = module(&op15_then(false, 0, JOIN_THEN_DEAD_KILL));
-    agree_on_every_driver("dead kill", &m, &op15_fuel_setup(&loops, -1), &ok(7));
+    let m = module(&detached_then(false, JOIN_THEN_DEAD_KILL));
+    agree_on_every_driver("dead kill", &m, &detached_fuel_setup(&loops, -1), &ok(7));
 }
 
 /// A detached child parked on a 1 ms timed wait, which returns its wait status.
@@ -1315,9 +1475,9 @@ fn budget_held(h: &Host) -> (i64, i64) {
 /// #2119.)
 #[test]
 fn a_child_live_at_the_runs_end_hands_its_window_back() {
-    let m = module(&op15_then(false, 0, NO_JOIN));
+    let m = module(&detached_then(false, NO_JOIN));
     let child = module(CHILD_WAITS);
-    let setup = op15_setup(&child, 1 << 15);
+    let setup = detached_setup(&child, 1 << 15);
     for d in SCHEDULING {
         let (ran, held) = run_on_then(d, &m, &setup, &budget_held).expect("runs");
         assert_eq!(ran, ok(0), "{d:?}");
@@ -1387,18 +1547,23 @@ fn data_segment(at: u64, bytes: &[u8]) -> String {
     format!("data {at} \"{esc}\"\n")
 }
 
-/// An op-17 parent `(i32 inst, i32 module, i32 budget, i32 out) -> i64` (the [`op15_setup`] powerbox):
+/// An op-17 parent `(i32 inst, i32 module, i32 budget, i32 out) -> i64` (the [`detached_setup`] powerbox):
 /// `module`'s entry 0, detached and paid from `budget`, with `grants` as its grant list. A `None`
 /// handle grants `out` under the name; `Some(h)` writes `h` as the record's handle, such as
 /// `GRANT_EMPTY`.
 fn op17_granting(grants: &[(&str, Option<u32>)]) -> String {
+    op17_granting_then(grants, JOIN_OR_ERRNO)
+}
+
+/// [`op17_granting`] ending in `tail` instead of [`JOIN_OR_ERRNO`].
+fn op17_granting_then(grants: &[(&str, Option<u32>)], tail: &str) -> String {
     const REC: u64 = 17536;
     const GRANTS: u64 = 17664;
     const NAMES: u64 = 17920;
     let rec = SpawnRec {
         grants_ptr: GRANTS,
         grants_n: grants.len() as u64,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::default()
     };
     let mut segments = rec::segment(REC, &rec);
     let mut stores = String::new();
@@ -1428,9 +1593,9 @@ block 0 (vinst: i32, vmod: i32, vbud: i32, vout: i32) {{
   i32.store vba vbud
 {stores}  vrp = i64.const {REC}
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
-{JOIN_OR_ERRNO}{segments}",
-        ma = REC + rec::MODULE_AT,
-        ba = REC + rec::BUDGET_AT,
+{tail}{segments}",
+        ma = REC + SpawnRec::MODULE_AT,
+        ba = REC + SpawnRec::BUDGET_AT,
     )
 }
 
@@ -1471,7 +1636,7 @@ block 0 (v0: i64) {
 #[test]
 fn an_empty_grant_satisfies_an_import_nothing_else_does() {
     let child = module(DETACHED_IMPORTS_EXIT);
-    let setup = op15_setup(&child, 1 << 20);
+    let setup = detached_setup(&child, 1 << 20);
     for (what, grants, want) in [
         ("no grant", vec![], -22),
         ("an exact empty grant", vec![("exit", EMPTY)], 42),
@@ -1485,18 +1650,13 @@ fn an_empty_grant_satisfies_an_import_nothing_else_does() {
 }
 
 /// An emptied import is bound to nothing, so the child faults when it calls it, as a withheld slot
-/// does. The child's `CapFault` reaches the parent through its `join` (until #2066 makes `join`
-/// report it instead).
+/// does. The parent's `join` answers the child's `CAP_FAULT` (#2066).
 #[test]
 fn an_emptied_import_faults_on_use() {
     let child = module(DETACHED_CALLS_EXIT);
-    let setup = op15_setup(&child, 1 << 20);
-    let m = module(&op17_granting(&[("exit", EMPTY)]));
-    let faulted = Ran {
-        result: Err(Trap::CapFault),
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-    };
+    let setup = detached_setup(&child, 1 << 20);
+    let m = module(&op17_granting_then(&[("exit", EMPTY)], JOIN_BOTH));
+    let faulted = ok(temen_ir::trap_code::CAP_FAULT * 1000);
     agree_on_every_driver("calls an emptied import", &m, &setup, &faulted);
 }
 
@@ -1505,7 +1665,7 @@ fn an_emptied_import_faults_on_use() {
 #[test]
 fn a_concrete_grant_beats_an_empty_one() {
     let child = module(DETACHED_WRITES_M_BY_IMPORT);
-    let setup = op15_setup(&child, 1 << 20);
+    let setup = detached_setup(&child, 1 << 20);
     let want = Ran {
         result: Ok(vec![Value::I64(42)]),
         stdout: b"M".to_vec(),
@@ -1526,7 +1686,7 @@ fn a_concrete_grant_beats_an_empty_one() {
 #[test]
 fn a_pattern_is_only_an_empty_grant() {
     let child = module(DETACHED_IMPORTS_EXIT);
-    let setup = op15_setup(&child, 1 << 20);
+    let setup = detached_setup(&child, 1 << 20);
     let refused = Ran {
         result: Err(Trap::CapFault),
         stdout: Vec::new(),
@@ -1547,7 +1707,7 @@ fn a_pattern_is_only_an_empty_grant() {
 #[test]
 fn a_refusal_notes_the_import_nothing_satisfied() {
     let child = module(DETACHED_IMPORTS_EXIT);
-    let setup = op15_setup(&child, 1 << 20);
+    let setup = detached_setup(&child, 1 << 20);
     for (grants, want, noted) in [(vec![], -22, true), (vec![("exit", EMPTY)], 42, false)] {
         let m = module(&op17_granting(&grants));
         for d in drivers::ALL {
@@ -1586,8 +1746,8 @@ fn a_run_whose_every_task_waits_forever_is_a_deadlock() {
     );
 }
 
-/// The root spawns a serving child, func 1's image (its second argument), through a v1 record
-/// (`SpawnRec::v1(0)` at 17600) paid from the `Budget` its third argument names. It mints a
+/// The root spawns a serving child, func 1's image (its second argument), through a spawn record
+/// (`SpawnRec::default()` at 17600) paid from the `Budget` its third argument names. It mints a
 /// live-callee offer over the child (`child_offer`) and calls `add(40, 2)` through it. The call parks
 /// the root until the child's `svc.wait` serves it; the child returns how many calls it served, which
 /// the root joins: `1 * 100 + 42`. A fixture, so the browser runs it too, with the child image as the
@@ -1600,7 +1760,7 @@ const LIVE_CALLER: &str = include_str!("fixtures/live_caller.temt");
 #[test]
 fn a_live_call_to_a_serving_child_parks_until_the_child_serves_it() {
     // Without its newline: a Windows checkout ends the fixture's lines with `\r\n`.
-    let record = rec::segment(17600, &SpawnRec::v1(0));
+    let record = rec::segment(17600, &SpawnRec::default());
     assert!(
         LIVE_CALLER.contains(record.trim_end()),
         "the fixture's spawn record starts the child image at its entry"
@@ -1608,7 +1768,7 @@ fn a_live_call_to_a_serving_child_parks_until_the_child_serves_it() {
     let m = module(LIVE_CALLER);
     let setup = || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 17);
+        let i = h.grant_instantiator();
         let b = h.grant_budget(-1, 1 << 20, -1);
         let c = h.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
         (h, [i, c, b].map(Value::I32).to_vec())

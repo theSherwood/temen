@@ -33,9 +33,9 @@ data 16684 "svc"
 data 16694 "o"
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
-  qsm = i64.const 17560
+  qsm = i64.const 17544
   i32.store qsm vsm
-  q1b = i64.const 17564
+  q1b = i64.const 17548
   i32.store q1b vbud
   q1p = i64.const 17536
   vs = call.cap 6 17 (i64) -> (i32) v0 (q1p)
@@ -57,13 +57,13 @@ block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  qcm = i64.const 17688
+  qcm = i64.const 17672
   i32.store qcm vcm
-  q2b = i64.const 17692
+  q2b = i64.const 17676
   i32.store q2b vbud
   q2p = i64.const 17664
   vc = call.cap 6 17 (i64) -> (i32) v0 (q2p)
-  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vjc
   }
 }
@@ -159,12 +159,12 @@ fn build(ro: i64, rt: i64) -> Option<Arc<temen_ir::Module>> {
     let caller = SpawnRec {
         grants_ptr: 16640,
         grants_n: 2,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::default()
     };
     let src = TEMPLATE
         .replace("__RO__", &ro.to_string())
         .replace("__RT__", &rt.to_string())
-        + &rec::segment(17536, &SpawnRec::v1(0))
+        + &rec::segment(17536, &SpawnRec::default())
         + &rec::segment(17664, &caller);
     let m = temen_text::parse_module(&src).ok()?;
     temen_verify::verify_module(&m).ok()?;
@@ -198,7 +198,7 @@ fn observe(
     run: impl FnOnce(&Arc<temen_ir::Module>, &[Value], &mut Host) -> RunOut,
 ) -> Observed {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1u64 << 18);
+    let inst = host.grant_instantiator();
     let sink = host.shared_stdout();
     let out = host.grant_stream(StreamRole::Out);
     let budget = host.grant_budget(-1, 64 << 20, -1);

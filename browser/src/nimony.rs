@@ -1,10 +1,10 @@
 //! **nimony's own driver, in the browser** (#958). `nimony t` builds a program as it does on a host:
 //! it parses the program's dependency graph, writes a build plan and runs nifmake over it, which
-//! spawns every step through `/bin/sh` — nifler2 and nimsem per module, hexer, then
+//! spawns every step through `/bin/sh` — nifler2 and nimsem per module, shoggoth (hexer), then
 //! temen-link — and nimsem's compile-time evaluation builds and runs programs of its own. The process
 //! tree runs on the browser's interpreter tier, over one POSIX personality and its memfs, as the
 //! self-hosted lane runs it natively (`scripts/ci/nim-selfhost-lane.sh`); a **leaf** process — one
-//! that cannot park, such as hexer and nifler2, or one that parks only on its pipes and its children
+//! that cannot park, such as shoggoth and nifler2, or one that parks only on its pipes and its children
 //! where the host can suspend its emitted frames, such as nimsem — runs whole on the emitted tier
 //! (#1896).
 
@@ -165,62 +165,6 @@ pub fn nim_build(
     })
 }
 
-/// The **library pack** of a build run in `at`: every file it wrote under `<at>/nimcache/` for a
-/// library module, in the order it wrote them, and nimony's memo of the options the cache was built
-/// with. A library module is one whose `.p.nif` records a source in nimony's tree: under `lib/`,
-/// or under `src/`, which the library imports (#2033). Its files include what a build of it as a
-/// program wrote (`<stem>.temen/…`), such as the helper compile-time evaluation runs. So do the
-/// plugins the library declares (#2049): their executables, which nimony links into the cache's
-/// root (`deps.nim`'s `pluginExe`). Seeded into a later build in the same directory, after the
-/// library's sources and in this order, they are newer than everything they were made from, so that
-/// build compiles only its own modules (#958).
-pub fn library_pack(posix: &temen_posix::Posix, at: &str) -> Vec<(String, Vec<u8>)> {
-    let cache = format!("{at}/nimcache/");
-    let mut library = std::collections::HashMap::new();
-    let mut pack = Vec::new();
-    for name in posix.file_names_by_write() {
-        let Some(rest) = name.strip_prefix(&cache) else {
-            continue;
-        };
-        let Some(bytes) = posix.read_file(&name) else {
-            continue;
-        };
-        let stem = rest.split(['.', '/']).next().unwrap_or(rest).to_string();
-        let keep = rest == OPTIONS_MEMO
-            || (!rest.contains('/') && temen_encode::wire::is_module_blob(&bytes))
-            || *library.entry(stem).or_insert_with_key(|stem| {
-                posix
-                    .read_file(&format!("{cache}{stem}.p.nif"))
-                    .is_some_and(|nif| {
-                        nif_source(&nif).is_some_and(|src| {
-                            src.starts_with("lib/") || src.starts_with("src/")
-                        })
-                    })
-            });
-        if keep {
-            pack.push((name, bytes));
-        }
-    }
-    pack
-}
-
-/// nimony's memo of the options its cache was built with (`deps.nim`'s `cachedConfigFile`), compared
-/// by content, not by time. A build that finds it missing or different re-runs every step, so a pack
-/// without it would be rebuilt from its sources.
-const OPTIONS_MEMO: &str = "cachedconfigfile.txt";
-
-/// The source file a `.p.nif` was parsed from: the file of its top `stmts` node's line info
-/// (`(stmts@<col>,<line>,<file>`).
-fn nif_source(nif: &[u8]) -> Option<&str> {
-    const TOP: &[u8] = b"(stmts@";
-    let at = nif.windows(TOP.len()).position(|w| w == TOP)? + TOP.len();
-    let info = nif[at..]
-        .split(|b| b.is_ascii_whitespace() || *b == b')')
-        .next()?;
-    let file = info.splitn(3, |&b| b == b',').nth(2)?;
-    core::str::from_utf8(file).ok()
-}
-
 /// The toolchain's `temen-link`, run natively: [`temen_leng::link_command`], the function the in-guest
 /// `temen-link` is built from, over the files of the process that exec'd it. Interpreted, the same
 /// link of a 7-module program took 30–40 s on this tier; natively it takes a fraction of a second, and
@@ -291,7 +235,7 @@ fn relative_path(path: &str, base: &str) -> String {
 
 /// `gear2/modnames.moduleSuffix` — `name[0..3]` + base36(`uhash`) of the shortest of the file's path
 /// relative to the cwd (`/`) and to each search path (`/lib`).
-fn module_suffix(file: &str) -> String {
+pub fn module_suffix(file: &str) -> String {
     let mut rel = relative_path(file, "/");
     let c = relative_path(file, "/lib");
     if c.len() < rel.len() {
@@ -306,7 +250,7 @@ fn module_suffix(file: &str) -> String {
 
 /// nimony's module-stem hash for `[path)`, a path relative to the build's directory ([`module_suffix`]),
 /// onto the stdout slot; returns its length. The card finds the module a build of `prog.nim` linked by
-/// it: `nimcache/<stem>.temen/prog.temen`.
+/// it: `nimcache/t/<stem>/prog.temen`.
 ///
 /// # Safety
 /// `(path_ptr, path_len)` must be a live `temen_alloc`ation the host just filled.

@@ -1,6 +1,6 @@
 //! #1234 — **the Forth `sandbox` word**: `s" …" sandbox` runs a program in a confined §14 child.
 //!
-//! The child is this same kernel in a detached window of its own — an op-17 v1 record over the
+//! The child is this same kernel in a detached window of its own — an op-17 record over the
 //! kernel's child image, which the powerbox grants as `child` (#2219), entered at its function 0, a
 //! bootstrap that runs `child_start` (75). Its program is the spawn's args payload and its window is
 //! paid from the powerbox's `budget` (#1864). It is born with what the spawn record's grant list
@@ -113,5 +113,16 @@ fn a_child_cannot_read_the_parents_memory() {
              200000 @ . cr\n",
         );
         assert_eq!(out, "4242 \n0 \n4242 \n", "{backend:?}");
+    }
+}
+
+/// #2066 — a sandboxed program that faults ends only its sandbox: `sandbox` returns the wire code of
+/// the trap the child ended in, here `MEMORY_FAULT` (8) for a load from its NULL guard, and the parent
+/// runs on. Before, the child's trap ended the parent too.
+#[test]
+fn a_sandbox_that_faults_returns_its_trap() {
+    for backend in TIERS {
+        let (out, _) = run(backend, "s\" 0 @ . cr\" sandbox . cr\n7 . cr\n");
+        assert_eq!(out, "8 \n7 \n", "{backend:?}");
     }
 }

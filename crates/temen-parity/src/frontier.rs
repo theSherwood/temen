@@ -49,7 +49,8 @@
 //! is derived by driving each capability's ops on `bytecode::drive` and on the parallel driver
 //! and comparing the answers shape by shape (`tests/concurrency_conformance.rs`). Since #1414 3e
 //! the parallel driver runs the pump's own scheduling rules, so this compares two executors of one
-//! rule set, not the per-Worker driver (#2230). The comparison is
+//! rule set; since #1414 B6-4a it is also the browser's only parallel driver, each thread on a
+//! Worker (#2230). The comparison is
 //! of *answers*, not of refusals: the op-15 gap #1531 closed was a driver returning a different
 //! value, not refusing, so a column that only asked "does it trap" would have scored it `Full`.
 //!
@@ -205,7 +206,7 @@ impl Capability {
 /// failure this matrix exists to prevent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Axis {
-    /// Can a **§14 child** (nested carve or detached) be granted this? Decided by
+    /// Can a **§14 child** be granted this? Decided by
     /// `Host::can_regrant`.
     Nesting,
     /// Does a handle of this kind **survive a freeze**? Decided by the `NonDurableKind` match in
@@ -215,7 +216,7 @@ pub enum Axis {
     RuntimeBackend,
     /// native (x86/arm), wasm32, Windows.
     HostTarget,
-    /// The cooperative multiplex driver and the genuinely-parallel per-Worker driver.
+    /// The cooperative multiplex driver and the genuinely-parallel driver (executor 2).
     ConcurrencyModel,
     /// The host-translated base module and a §22 guest-JIT unit.
     CodeOrigin,
@@ -254,7 +255,7 @@ impl Axis {
             Axis::Durability => "does it survive a freeze? (`capture_durable_handles`)",
             Axis::RuntimeBackend => "same on every engine? (see OPS_PARITY.md for op-level detail)",
             Axis::HostTarget => "same on native / wasm32 / Windows?",
-            Axis::ConcurrencyModel => "carried by both the coop and per-Worker drivers?",
+            Axis::ConcurrencyModel => "carried by both the coop and parallel drivers?",
             Axis::CodeOrigin => "usable from a §22 guest-JIT unit as from the base module?",
             Axis::Debugger => "observable under the debug tier?",
         }
@@ -404,9 +405,9 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
                  seam-free leaf with no Instantiator, so every op CapFaults there (§22, #1578)",
             ),
             conditional(
-                "join/instantiate_rec/instantiate_detached run on the debug scheduler through the \
-                 executor's admission (#1855), and so does grant (op 19, #2220); child_offer (op \
-                 14) reaches the debug scheduler and is declined",
+                "join/instantiate_rec run on the debug scheduler through the executor's \
+                 admission (#1855), and so does grant (op 19, #2220); child_offer (op 14) reaches \
+                 the debug scheduler and is declined",
             )],
 
         // Declines on nesting as a re-grant (a grant list cannot carry one): a child's own `"budget"` is

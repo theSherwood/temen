@@ -1,9 +1,9 @@
 //! #1867 decision 3 — the escape oracle's **detached-child placement**. A small root spawns a
-//! module as a detached child through a v1 record, so the child runs from its function 0 (#2219)
-//! in a window of its own (base 0, its declared size). The root waits for the child and joins it if
-//! it returned, then reports how the child ended and whether its own window changed across the
-//! child's life: the canary. Every engine is held to the same report, the bytecode drivers
-//! included, which return no window snapshot.
+//! module as a detached child through a spawn record, so the child runs from its function 0 (#2219)
+//! in a window of its own (base 0, its declared size). The root joins the child, which answers how
+//! it ended (#2066), then reports that and whether its own window changed across the child's life:
+//! the canary. Every engine is held to the same report, the bytecode drivers included, which return
+//! no window snapshot.
 //!
 //! Included by `irgen.rs` (the differential's detached pass) and `escape_oracle.rs` (the hand-written
 //! pins).
@@ -54,15 +54,14 @@ block 3 (dr: i64) {{
     )
 }
 
-/// The root module: `(instantiator, module, budget) -> (trapped, value, canary)`. It fills the
-/// granted `module` and `budget` into a v1 record (the module's declared window, no grants),
-/// digests its own window, spawns the child, and waits for it (`Instantiator.wait`, which answers
-/// how the child ended without inheriting its trap). For a child that returned it joins the child:
-/// `trapped` is 0 and `value` the child's result. For one that trapped, `trapped` is 1 and `value`
-/// the trap's wire code. `canary` is the root's window digest before the spawn xor after the
-/// child's life: 0 when the child never touched the root's window.
+/// The root module: `(instantiator, module, budget) -> (status, value, canary)`. It fills the
+/// granted `module` and `budget` into a spawn record (the module's declared window, no grants),
+/// digests its own window, spawns the child, and joins it, which answers how the child ended without
+/// inheriting its trap: `status` 0 and `value` the child's result if it returned, else `status` the
+/// trap's wire code. `canary` is the root's window digest before the spawn xor after the child's
+/// life: 0 when the child never touched the root's window.
 pub fn root() -> Module {
-    let rec = temen_ir::SpawnRec::v1(0).encode();
+    let rec = temen_ir::SpawnRec::default().encode();
     let rec: String = rec.iter().map(|b| format!("\\x{b:02x}")).collect();
     let src = format!(
         "memory {ROOT_LOG2}
@@ -70,27 +69,14 @@ data {REC_AT} \"{rec}\"
 func (i32, i32, i32) -> (i64, i64, i64) {{
 block 0 (vi: i32, vm: i32, vb: i32) {{
   vr = i64.const {REC_AT}
-  i32.store vr vm offset=24
-  i32.store vr vb offset=28
+  i32.store vr vm offset=8
+  i32.store vr vb offset=12
   vd0 = call 1 ()
   vc = call.cap 6 17 (i64) -> (i32) vi (vr)
-  vw = call.cap 6 18 (i32) -> (i64) vi (vc)
-  vz = i64.const 0
-  vok = i64.eq vw vz
-  br_if vok 1(vi, vc, vd0) 2(vw, vd0)
-}}
-block 1 (vi1: i32, vc1: i32, vd01: i64) {{
-  vv = call.cap 6 1 (i32) -> (i64) vi1 (vc1)
+  vs, vv = call.cap 6 1 (i32) -> (i64, i64) vi (vc)
   vd1 = call 1 ()
-  vcan = i64.xor vd01 vd1
-  vk0 = i64.const 0
-  return vk0, vv, vcan
-}}
-block 2 (vt: i64, vd02: i64) {{
-  vd2 = call 1 ()
-  vcan2 = i64.xor vd02 vd2
-  vk1 = i64.const 1
-  return vk1, vt, vcan2
+  vcan = i64.xor vd0 vd1
+  return vs, vv, vcan
   }}
 }}
 {digest}",
@@ -106,7 +92,7 @@ block 2 (vt: i64, vd02: i64) {{
 /// `Budget`. Returns the host and the root's arguments.
 pub fn powerbox(child: &Module) -> (Host, [i32; 3]) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << ROOT_LOG2);
+    let inst = host.grant_instantiator();
     let module = host.grant_module(child);
     let budget = host.grant_budget(-1, -1, -1);
     (host, [inst, module, budget])
@@ -122,14 +108,14 @@ pub struct Report {
 impl Report {
     /// Read the root's three results.
     pub fn of(values: &[i64]) -> Report {
-        let [trapped, value, canary] = values else {
+        let [status, value, canary] = values else {
             panic!("the probe root returns three values, got {values:?}");
         };
         Report {
-            child: if *trapped == 0 {
+            child: if *status == 0 {
                 Ok(*value)
             } else {
-                Err(*value)
+                Err(*status)
             },
             canary: *canary,
         }

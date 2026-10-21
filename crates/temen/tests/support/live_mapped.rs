@@ -10,13 +10,13 @@
 //! into the reserved tail (contiguous, above a hole, or filling one; both interp-serviced on both tiers)
 //! — and a pure leaf then performs one fuzzer-chosen access (scalar widths 1/2/4/8, a `v128`, an aligned atomic, or a bulk
 //! span) at a fuzzer-chosen address near a page, window, or width boundary. The driver syncs `"mapped"`
-//! from the [`bytecode::VcpuEvent::TierUp`] snapshot exactly as the browser Worker does.
+//! from the [`CoopEvent::TierUp`] snapshot exactly as the browser host does.
 //!
 //! The invariant, per input: `run(guest, args, Interp) == run(guest, args, TierUp)` — outcome (value /
 //! trap kind) **and** the window bytes after the run — and the emitted run never touches a byte past
 //! the reservation (a canary placed there stays intact: the `& MASK` clamp is unconditional, so a wrong
 //! bound is a trap-parity divergence, never an escape). A window state the single bound cannot
-//! represent (a hole below the high-water) makes the vCPU **decline** tier-up (`Mem::scalar_extent`
+//! represent (a hole below the high-water) makes the run **decline** tier-up (`Mem::scalar_extent`
 //! has no answer) and interpret the leaf — tallied separately so the sweep proves that arm fires too.
 //! Only grows: a module that `unmap`s/`protect`s is page-managing and the mask-only tier emits nothing
 //! for it (#750's gate — the paged tier and the `pagestate` target own that surface), so a live bound
@@ -28,7 +28,8 @@
 #![allow(dead_code)] // included via `#[path]` by both the fuzz target and the stable test.
 
 use std::sync::{Arc, OnceLock};
-use temen_interp::{bytecode, Host, Region, Trap, Value};
+use temen_interp::bytecode::{CoopEvent, CoopRun, ProgramEmit, TierUpConfig};
+use temen_interp::{host_page_size, Host, Region, Trap, Value};
 use temen_wasm_jit::{compile_module_tierup, TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
@@ -65,7 +66,7 @@ pub enum Cat {
     Trapped,
     /// Both tiers passed (the access stayed within the committed extent).
     Passed,
-    /// The vCPU declined tier-up (an unrepresentable window state) and interpreted the leaf; parity
+    /// The run declined tier-up (an unrepresentable window state) and interpreted the leaf; parity
     /// held trivially — counted so the sweep proves the fail-closed arm is reached.
     Declined,
     /// Inconclusive (out-of-fuel / a non-memory trap) — not counted toward coverage.
@@ -198,7 +199,7 @@ fn shared_window(size: usize) -> (Arc<Region>, *mut u8, std::alloc::Layout) {
 /// with the `"mapped"` global set to `sync` (the #717 driver contract) and a canary past the
 /// reservation. Asserts the canary survived (the escape property) and copies emitted writes back.
 ///
-/// SAFETY: `base` is the live window buffer, touched only while the vCPU is paused (single-threaded).
+/// SAFETY: `base` is the live window buffer, touched only while the run is paused (single-threaded).
 fn run_emitted(
     m: &temen_ir::Module,
     wasm: &[u8],
@@ -300,36 +301,34 @@ fn run_emitted(
 }
 
 /// Drive `entry(handle, ..tail)` over a reserved live window. With `tier`, the leaf's call surfaces as
-/// [`bytecode::VcpuEvent::TierUp`] and is serviced on emitted wasm with the `"mapped"` sync; without,
-/// this is the pure-interpreter oracle. Returns the outcome, the window bytes after the run, and how
-/// many tier-ups fired (0 under `tier` means the vCPU declined — an unrepresentable window state).
+/// [`CoopEvent::TierUp`] and is serviced on emitted wasm with the `"mapped"` sync; without, this is the
+/// pure-interpreter oracle. Returns the outcome, the window bytes after the run, and how many tier-ups
+/// fired (0 under `tier` means the run declined — an unrepresentable window state).
 fn frame(g: &Guest, tail: &[i64], tier: bool) -> (Outcome, Vec<u8>, u32) {
     let win_size = 1usize << RESERVED_LOG2;
     let (back, base, layout) = shared_window(win_size);
-    let prog = bytecode::VcpuProgram::compile(&g.m).expect("compile");
     let mut host = Host::new();
     let handle = host.grant_memory();
     let mut args = vec![Value::I64(handle as i64)];
     args.extend(tail.iter().map(|&a| Value::I64(a)));
-    let mut vcpu = bytecode::Vcpu::new_root_reserved_over_with_powerbox(
-        &prog,
-        0,
-        &args,
-        &[],
-        host,
-        RESERVED_LOG2,
-        back,
-    )
-    .expect("root vcpu");
-    if tier {
-        vcpu = vcpu.with_jit_eligible(Arc::clone(&g.eligible));
-    }
+    let tierup = tier.then(|| TierUpConfig {
+        root: ProgramEmit {
+            eligible: Arc::clone(&g.eligible),
+            page_checked: false,
+            ..Default::default()
+        },
+        leaf: None,
+        modules: None,
+    });
+    let mut run = CoopRun::new_over(&g.m, 0, &args, FUEL, host, tierup, &[], RESERVED_LOG2, back)
+        .expect("supported")
+        .expect("entry in range");
     let emit_m = bumped_for_emit(&g.m);
 
     let mut tierups = 0u32;
     let out = loop {
-        match vcpu.run() {
-            bytecode::VcpuEvent::Done(vals) => {
+        match run.run() {
+            CoopEvent::Done(vals) => {
                 break Outcome::Vals(
                     vals.iter()
                         .map(|v| match v {
@@ -340,56 +339,32 @@ fn frame(g: &Guest, tail: &[i64], tier: bool) -> (Outcome, Vec<u8>, u32) {
                         .collect(),
                 )
             }
-            bytecode::VcpuEvent::Trapped(Trap::MemoryFault) => {
-                break Outcome::Trap(TrapKind::MemoryFault)
-            }
-            bytecode::VcpuEvent::Trapped(Trap::OutOfFuel) => {
-                break Outcome::Trap(TrapKind::OutOfFuel)
-            }
-            bytecode::VcpuEvent::Trapped(_) => break Outcome::Trap(TrapKind::Other),
-            bytecode::VcpuEvent::TierUp { func, argv, mapped } => {
+            CoopEvent::Trapped(Trap::MemoryFault) => break Outcome::Trap(TrapKind::MemoryFault),
+            CoopEvent::Trapped(Trap::OutOfFuel) => break Outcome::Trap(TrapKind::OutOfFuel),
+            CoopEvent::Trapped(_) => break Outcome::Trap(TrapKind::Other),
+            CoopEvent::TierUp {
+                func, argv, mapped, ..
+            } => {
                 tierups += 1;
                 match run_emitted(&emit_m, &g.wasm, func, &argv, base, win_size, mapped) {
-                    Outcome::Vals(v) => vcpu.deliver_tierup(&v),
-                    Outcome::Trap(TrapKind::OutOfFuel) => vcpu.deliver_tierup_trap(Trap::OutOfFuel),
-                    Outcome::Trap(_) => vcpu.deliver_tierup_trap(Trap::MemoryFault),
+                    Outcome::Vals(v) => run.deliver_tierup(&v),
+                    Outcome::Trap(TrapKind::OutOfFuel) => run.deliver_tierup_trap(Trap::OutOfFuel),
+                    Outcome::Trap(_) => run.deliver_tierup_trap(Trap::MemoryFault),
                 }
             }
-            _ => panic!("unexpected event on this single-vCPU run"),
+            // One task over one window, serviced only for tier-up.
+            CoopEvent::Paused
+            | CoopEvent::Idle
+            | CoopEvent::CapPark { .. }
+            | CoopEvent::Resume { .. }
+            | CoopEvent::JitInvoke { .. } => panic!("unexpected event on a one-task run"),
         }
     };
-    drop(vcpu);
-    // SAFETY: the vCPU (and its `Mem` aliasing the region) is dropped; copy, then free the buffer.
+    drop(run);
+    // SAFETY: the run (and its `Mem` aliasing the region) is dropped; copy, then free the buffer.
     let bytes = unsafe { std::slice::from_raw_parts(base, win_size) }.to_vec();
     unsafe { std::alloc::dealloc(base, layout) };
     (out, bytes, tierups)
-}
-
-/// The host software page size, probed once (a throwaway vCPU over a reserved window) and cached —
-/// the offsets the fuzzer chooses are page-relative, so the search adapts to 4-KiB and 16-KiB hosts.
-fn page_size() -> u64 {
-    static PAGE: OnceLock<u64> = OnceLock::new();
-    *PAGE.get_or_init(|| {
-        let g = &guests()[0];
-        let prog = bytecode::VcpuProgram::compile(&g.m).expect("compile");
-        let (back, base, layout) = shared_window(1usize << RESERVED_LOG2);
-        let args: Vec<Value> = (0..8).map(|_| Value::I64(0)).collect();
-        let vcpu = bytecode::Vcpu::new_root_reserved_over_with_powerbox(
-            &prog,
-            0,
-            &args,
-            &[],
-            Host::new(),
-            RESERVED_LOG2,
-            back,
-        )
-        .expect("probe vcpu");
-        let page = vcpu.mem_map_info().expect("window").0;
-        drop(vcpu);
-        // SAFETY: the vCPU (and its Mem aliasing the region) is dropped; free the buffer.
-        unsafe { std::alloc::dealloc(base, layout) };
-        page
-    })
 }
 
 /// Map a byte to a window offset near a boundary: a page index (up to one past the reservation — the
@@ -453,7 +428,7 @@ pub fn fuzz_one(data: &[u8]) -> Cat {
     let n = data.len().min(b.len());
     b[..n].copy_from_slice(&data[..n]);
 
-    let page = page_size();
+    let page = host_page_size();
     let declared = 1u64 << DECLARED_LOG2;
     let reserved = 1u64 << RESERVED_LOG2;
     let npages = reserved / page;

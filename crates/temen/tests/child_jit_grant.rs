@@ -45,7 +45,8 @@ fn blob(zero_arg: bool) -> Vec<u8> {
 /// func 0 (parent, `(Instantiator, Jit, Budget, Module)`): one grant record at 16384 naming the `Jit`
 /// handle `"jit"` (the name a data segment at 16484 holds), spawn the child detached through a v1
 /// record at 17536 (the `Module`, func 1's child image, #2219, paid from the `Budget`, grant list
-/// `(16384, grants_n)`), join, return its result.
+/// `(16384, grants_n)`), join, return `status * 1000 + value` (#2066): its result, or its trap's wire
+/// code times 1000.
 /// func 1 (child, `(Instantiator)`): resolve `"jit"` by name (the same data in its own window),
 /// compile the blob at `BLOB_OFF` `times` times (the last compile's code handle is what it invokes),
 /// invoke `(3, 4)`, return the sum. `times == 2` is the quota probe: it returns the **second compile's**
@@ -60,7 +61,7 @@ fn src(grants_n: u32, blob: &[u8], mode: u32) -> String {
     let spawn = SpawnRec {
         grants_ptr: 16384,
         grants_n: u64::from(grants_n),
-        ..SpawnRec::v1(0)
+        ..SpawnRec::default()
     };
     let child_pre = format!(
         "  n0 = i64.const 16484\n  len3 = i64.const 3\n  hj = self.resolve n0 len3\n  vb = i64.const {}\n  vl = i64.const {}\n  vc = call.cap 11 0 (i64, i64) -> (i64) hj (vb, vl)\n",
@@ -84,7 +85,7 @@ fn src(grants_n: u32, blob: &[u8], mode: u32) -> String {
     let parent_tail = match mode {
         5 => "  rs = i32.wrap_i64 r\n  rd = call.dyn () -> (i32) rs ()\n  rd64 = i64.extend_i32_s rd\n  return rd64\n",
         7 => "  k16 = i64.const 65536\n  ps = i64.mul pslot k16\n  out = i64.add ps r\n  return out\n",
-        _ => "  return r\n",
+        _ => "  k1000 = i64.const 1000\n  rs1000 = i64.mul r_st k1000\n  out = i64.add rs1000 r\n  return out\n",
     };
     format!(
         r#"memory 17
@@ -101,13 +102,13 @@ block 0 (vinst: i32, vjit: i32, vbud: i32, vmod: i32) {{
   a12 = i64.const 16396
   z0 = i32.const 0
   i32.store a12 z0
-  qm = i64.const 17560
+  qm = i64.const 17544
   i32.store qm vmod
-  qb = i64.const 17564
+  qb = i64.const 17548
   i32.store qb vbud
   q0a0 = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (q0a0)
-  r = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  r_st, r = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
 {parent_tail}  }}
 }}
 func (i64) -> (i64) {{
@@ -134,7 +135,7 @@ fn table_log2(mode: u32) -> u8 {
 /// probe) with a `units` compile quota, a `Budget` that pays for the child, and the child.
 fn setup(m: &temen_ir::Module, mode: u32, units: u32) -> (Host, [i32; 4]) {
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 128 << 10);
+    let ih = host.grant_instantiator();
     let jh = grant_jit(&mut host, m, table_log2(mode));
     host.set_jit_quota(units, 1 << 20);
     let bh = host.grant_budget(-1, 1 << 20, -1);
@@ -231,23 +232,14 @@ fn the_child_table_quota_is_at_most_the_parents_remaining() {
 
 #[test]
 fn a_child_without_the_grant_cannot_reach_the_parents_table() {
+    // No `jit` name resolves, so the child's compile goes through a negative handle and traps
+    // `CapFault`, which its parent's join answers (#2066).
+    let want = temen_ir::trap_code::CAP_FAULT * 1000;
     let [tw, bc] = run_both(0, 1, 4096);
-    for (r, name) in [(&tw, "tree-walker"), (&bc, "bytecode")] {
-        // A trap is an equally closed outcome; a value must be a negative errno.
-        if let Ok(v) = r {
-            assert!(
-                matches!(v.first(), Some(Value::I64(x)) if *x < 0),
-                "{name}: no `jit` name resolves, got {v:?}"
-            );
-        }
-    }
-    assert_eq!(tw, bc, "both engines refuse the same way");
+    assert_eq!(tw, Ok(vec![Value::I64(want)]), "tree-walker");
+    assert_eq!(bc, tw, "both engines refuse the same way");
     let jo = run_jit(0, 1, 4096);
-    assert!(
-        matches!(&jo, JitOutcome::Returned(r) if r.first().is_some_and(|x| *x < 0))
-            || matches!(jo, JitOutcome::Trapped(_)),
-        "native JIT: no `jit` name resolves, got {jo:?}"
-    );
+    assert!(agrees(&tw, &jo), "native JIT agrees: {jo:?}");
 }
 
 #[test]

@@ -9,7 +9,11 @@
 //! The default is unbounded, so every run that sets no cap is untouched — the hot path skips both
 //! scheduler locks. These tests set one.
 
+#[path = "support/rec.rs"]
+mod rec;
+
 use temen_interp::{cap_id, run_with_host, Host, Value};
+use temen_ir::SpawnRec;
 
 fn module(text: &str) -> temen_ir::Module {
     let m = temen_text::parse_module(text).expect("parse");
@@ -143,11 +147,18 @@ block 0 (v0: i64) {
 
 /// `v0` Instantiator, `v1` Module, `v2` Budget. Three sub-budgets split off `v2` — lanes 2, 1, 1 —
 /// then: spawn with lane 2 (fits a cap of 2), spawn with lane 1 (Σ 3 > 2: refused, charges nothing),
-/// join the first (its lane returns), spawn with lane 1 (fits). Returns
+/// join the first (its lane returns), spawn with lane 1 (fits). Each spawn reads its own spawn record,
+/// at 17408, 17536 and 17664, paid from its sub-budget. Returns
 /// `100·(c1 ≥ 0) + 10·(c2 == -EINVAL) + (c3 ≥ 0)`, so the expected answer is `111`.
-const SIGMA: &str = r#"memory 16
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
+fn sigma() -> String {
+    let child = SpawnRec {
+        size_log2: 12,
+        ..SpawnRec::default()
+    };
+    format!(
+        r#"memory 16
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
   vf = i64.const -1
   vm = i64.const 4096
   vs = i64.const -1
@@ -157,18 +168,25 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vb1 = call.cap 14 0 (i64, i64, i64, i64, i64) -> (i32) v2 (vf, vm, vs, vc, vl2)
   vb2 = call.cap 14 0 (i64, i64, i64, i64, i64) -> (i32) v2 (vf, vm, vs, vc, vl1)
   vb3 = call.cap 14 0 (i64, i64, i64, i64, i64) -> (i32) v2 (vf, vm, vs, vc, vl1)
-  vmh = i64.extend_i32_u v1
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 12
-  vq = i64.const 0
-  vb1w = i64.extend_i32_u vb1
-  vc1 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb1w, vmh, vz, vz, ve, vlog, vq)
-  vb2w = i64.extend_i32_u vb2
-  vc2 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb2w, vmh, vz, vz, ve, vlog, vq)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vc1)
-  vb3w = i64.extend_i32_u vb3
-  vc3 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb3w, vmh, vz, vz, ve, vlog, vq)
+  vma1 = i64.const 17416
+  i32.store vma1 v1
+  vba1 = i64.const 17420
+  i32.store vba1 vb1
+  vrp1 = i64.const 17408
+  vc1 = call.cap 6 17 (i64) -> (i32) v0 (vrp1)
+  vma2 = i64.const 17544
+  i32.store vma2 v1
+  vba2 = i64.const 17548
+  i32.store vba2 vb2
+  vrp2 = i64.const 17536
+  vc2 = call.cap 6 17 (i64) -> (i32) v0 (vrp2)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc1)
+  vma3 = i64.const 17672
+  i32.store vma3 v1
+  vba3 = i64.const 17676
+  i32.store vba3 vb3
+  vrp3 = i64.const 17664
+  vc3 = call.cap 6 17 (i64) -> (i32) v0 (vrp3)
   vzero = i32.const 0
   veinval = i32.const -22
   vok1 = i32.ge_s vc1 vzero
@@ -182,9 +200,14 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vabc = i32.add vab vok3
   vr = i64.extend_i32_s vabc
   return vr
-  }
+  }}
+}}
+{r1}{r2}{r3}"#,
+        r1 = rec::segment(17408, &child),
+        r2 = rec::segment(17536, &child),
+        r3 = rec::segment(17664, &child),
+    )
 }
-"#;
 
 /// **The grant-time Σ and the reap credit**, on the tree-walk oracle: a parent with cap 2 can hold
 /// children whose lanes sum to 2, is refused a third that would make 3, and gets the lane back when a
@@ -192,11 +215,11 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 /// `mem` is intact, so the third spawn can use a fresh one.
 #[test]
 fn a_parents_granted_lanes_may_not_exceed_its_cap_and_a_reaped_child_returns_its_lane() {
-    let parent = module(SIGMA);
+    let parent = module(&sigma());
     let child = module(CHILD);
     let mut host = Host::new();
     host.set_lane_cap(2);
-    let inst = host.grant_instantiator(0, 1 << 16);
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(&child);
     let budget = host.grant_budget(-1, 3 << 12, -1);
     let args = vec![Value::I32(inst), Value::I32(modh), Value::I32(budget)];
@@ -256,6 +279,9 @@ fn split_bounds_a_childs_lane_by_the_holders_cap_and_never_draws_the_cap_down() 
 #[test]
 fn budget_mem_give_is_the_exact_undo_of_a_take() {
     let mut host = Host::new();
+    // An unbounded run, so a read of an unbounded budget is unbounded along its whole chain: a guest
+    // sees the run's own node's `mem` too (#2337).
+    host.set_grant(-1, -1, -1, -1);
     let b = host.grant_budget(-1, 8192, -1);
     let read_mem = |host: &mut Host| -> i64 {
         host.cap_dispatch_slots(cap_id::BUDGET, 1, b, &[1], None)

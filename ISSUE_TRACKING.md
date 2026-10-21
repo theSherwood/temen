@@ -42,7 +42,7 @@ Twelve. File every issue as a sub-issue of exactly one:
 | #709 | **Process** — domains, offers, serving, capabilities, nesting | PROCESS.md, IMPORTS.md, POWERBOX.md; DESIGN §12a |
 | #710 | **Durability** — freeze/thaw, snapshots, C-ABI embedding | DURABILITY.md, INTERACTIVE_EMBEDDING.md; DESIGN §21 |
 | #711 | **Debugging** — stepping, DAP, observability | DEBUGGING.md; DESIGN §19; `temen-dap` |
-| #712 | **Consumers** — fork/exec/POSIX shell + language on-ramps | FORK/EXEC/POSIX/STAGE1.md, SELFHOST_C.md, NIM/GO/TYPESCRIPT.md; DESIGN §20 |
+| #2368 (#712 is full) | **Consumers** — fork/exec/POSIX shell + language on-ramps | FORK/EXEC/POSIX/STAGE1.md, SELFHOST_C.md, NIM/GO/TYPESCRIPT.md; DESIGN §20 |
 | #713 | **Web/Playground** — browser deploy, Pages, boot speed | FRONTEND.md, BROWSER.md, BOOTSPEED.md; `browser/` |
 | #714 | **Perf** — benchmark harness, regressions vs wasmtime | INTERP_PERF.md, OPT.md; DESIGN §1a; `bench/` |
 | #702 | **CI** — CI matrix, fuzzing, flakiness, dev tooling | AGENTS.md, `.github/` |

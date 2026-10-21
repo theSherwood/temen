@@ -265,6 +265,7 @@ fn a_punted_host_call_parks_the_fiber_not_the_vcpu() {
             let a = *args.first().unwrap_or(&0);
             OffloadOutcome::Offload(Box::new(move || a + 100))
         }),
+        None,
         temen_interp::CapState::Stateless,
     );
     let comps = host.completions();
@@ -369,13 +370,14 @@ fn two_fibers_on_one_vcpu_overlap_their_punts() {
     assert_eq!(comps.outstanding(), 0, "all completions delivered");
 }
 
-/// **Submission-ordered delivery holds for fiber parks (the §18 pin).** Fiber 1 punts a job
-/// gated on a host-side latch; fiber 2 punts a job that completes immediately. The drain stops
-/// at the first not-yet-arrived id, so fiber 2's ready result must NOT be delivered while fiber
-/// 1's earlier id is outstanding: 50 polls of fiber 2 all observe `FIBER_PARKED`. The root then
-/// releases the latch (op 1, inline `Done`) and polls both to completion. Composite:
-/// parked_polls*1_000_000 + v1*1_000 + v2 = 50*1_000_000 + 111_000 + 222 = 50_111_222.
-const ORDERED_FIBER_DELIVERY: &str = r#"
+/// **A later call's answer reaches its fiber while an earlier call is still held** (#2477). Fiber
+/// 1 punts a job gated on a host-side latch; fiber 2 punts a job that completes at once. The root
+/// polls fiber 2, 1 ms apart, up to 1,000 times, until it returns; then polls fiber 1 once, which
+/// is still parked (`FIBER_PARKED`, 3); then releases the latch (op 1, inline `Done`) and polls
+/// fiber 1 to completion. Composite: returned*10_000_000 + held*1_000_000 + v1*1_000 + v2 =
+/// 10_000_000 + 3_000_000 + 111_000 + 222 = 13_111_222. When answers were delivered in the order
+/// of the calls, fiber 2 never returned while fiber 1 was held: 3_111_000.
+const LATER_ANSWER_FIRST: &str = r#"
 memory 16 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
@@ -387,50 +389,52 @@ block 0 (v0: i32) {
   vk2 = cont.new vf2 vz
   vsa, vva = cont.resume vk1 vh64
   vsb, vvb = cont.resume vk2 vh64
-  vcnt0 = i64.const 0
   vi0 = i64.const 0
-  br 1(vk1, vk2, vh64, vcnt0, vi0)
+  br 1(vk1, vk2, vh64, vi0)
 }
-block 1 (ka: i64, kb: i64, h1: i64, cnt: i64, vi: i64) {
-  vlim = i64.const 50
+block 1 (ka: i64, kb: i64, h1: i64, vi: i64) {
+  vlim = i64.const 1000
   vlt = i64.lt_s vi vlim
-  br_if vlt 2(ka, kb, h1, cnt, vi) 3(ka, kb, h1, cnt)
+  vno = i64.const 0
+  br_if vlt 2(ka, kb, h1, vi) 3(ka, h1, vno, vno)
 }
-block 2 (ka2: i64, kb2: i64, h2: i64, cnt2: i64, vi2: i64) {
+block 2 (ka2: i64, kb2: i64, h2: i64, vi2: i64) {
+  vpa = i64.const 16384
+  vpe = i32.const 0
+  vpt = i64.const 1000000
+  vps = i32.atomic.wait vpa vpe vpt
   vs, vv = cont.resume kb2 h2
-  vthree = i32.const 3
-  veq = i32.eq vs vthree
-  veq64 = i64.extend_i32_u veq
-  vcnt3 = i64.add cnt2 veq64
-  vone = i64.const 1
-  vi3 = i64.add vi2 vone
-  br 1(ka2, kb2, h2, vcnt3, vi3)
+  vone = i32.const 1
+  vdone = i32.eq vs vone
+  vstep = i64.const 1
+  vi3 = i64.add vi2 vstep
+  vyes = i64.const 1
+  br_if vdone 3(ka2, h2, vyes, vv) 1(ka2, kb2, h2, vi3)
 }
-block 3 (ka4: i64, kb4: i64, h4: i64, cnt4: i64) {
-  vh = i32.wrap_i64 h4
-  vz4 = i64.const 0
-  vrel = call.cap 13 1 (i64) -> (i64) vh (vz4)
-  br 4(ka4, kb4, h4, cnt4)
+block 3 (ka3: i64, h3: i64, vok: i64, v2: i64) {
+  vs1, vv1 = cont.resume ka3 h3
+  vheld = i64.extend_i32_u vs1
+  vh = i32.wrap_i64 h3
+  vz3 = i64.const 0
+  vrel = call.cap 13 1 (i64) -> (i64) vh (vz3)
+  br 4(ka3, h3, vok, v2, vheld)
 }
-block 4 (ka5: i64, kb5: i64, h5: i64, cnt5: i64) {
-  vs5, vv5 = cont.resume ka5 h5
+block 4 (ka4: i64, h4: i64, vok4: i64, v24: i64, vheld4: i64) {
+  vs5, vv5 = cont.resume ka4 h4
   vone5 = i32.const 1
   vdone5 = i32.eq vs5 vone5
-  br_if vdone5 5(kb5, h5, cnt5, vv5) 4(ka5, kb5, h5, cnt5)
+  br_if vdone5 5(vok4, v24, vheld4, vv5) 4(ka4, h4, vok4, v24, vheld4)
 }
-block 5 (kb6: i64, h6: i64, cnt6: i64, v1: i64) {
-  vs6, vv6 = cont.resume kb6 h6
-  vone6 = i32.const 1
-  vdone6 = i32.eq vs6 vone6
-  br_if vdone6 6(cnt6, v1, vv6) 5(kb6, h6, cnt6, v1)
-}
-block 6 (cnt7: i64, v1b: i64, v2: i64) {
-  vm = i64.const 1000000
-  vp = i64.mul cnt7 vm
+block 5 (vok5: i64, v25: i64, vheld5: i64, v1: i64) {
+  vm7 = i64.const 10000000
+  va = i64.mul vok5 vm7
+  vm6 = i64.const 1000000
+  vb = i64.mul vheld5 vm6
   vk = i64.const 1000
-  vq = i64.mul v1b vk
-  vpq = i64.add vp vq
-  vr = i64.add vpq v2
+  vc = i64.mul v1 vk
+  vab = i64.add va vb
+  vabc = i64.add vab vc
+  vr = i64.add vabc v25
   return vr
   }
 }
@@ -499,6 +503,7 @@ fn root_return_abandons_a_cap_parked_fiber() {
                 a + 100
             }))
         }),
+        None,
         temen_interp::CapState::Stateless,
     );
     let comps = host.completions();
@@ -532,6 +537,7 @@ fn a_durable_caller_never_fiber_parks_on_a_punt() {
             let a = *args.first().unwrap_or(&0);
             OffloadOutcome::Offload(Box::new(move || a + 100))
         }),
+        None,
         temen_interp::CapState::Stateless,
     );
     let comps = host.completions();
@@ -555,8 +561,8 @@ fn a_durable_caller_never_fiber_parks_on_a_punt() {
 }
 
 #[test]
-fn ordered_delivery_holds_a_ready_later_completion_for_an_earlier_park() {
-    let m = temen_text::parse_module(ORDERED_FIBER_DELIVERY).expect("parse");
+fn a_later_answer_is_not_held_behind_an_earlier_call() {
+    let m = temen_text::parse_module(LATER_ANSWER_FIRST).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let gate = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let gate_job = std::sync::Arc::clone(&gate);
@@ -586,6 +592,7 @@ fn ordered_delivery_holds_a_ready_later_completion_for_an_earlier_park() {
                 OffloadOutcome::Offload(Box::new(move || 222))
             }
         }),
+        None,
         temen_interp::CapState::Stateless,
     );
     let comps = host.completions();
@@ -593,8 +600,8 @@ fn ordered_delivery_holds_a_ready_later_completion_for_an_earlier_park() {
     let r = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host).expect("no trap");
     assert_eq!(
         r,
-        vec![Value::I64(50_111_222)],
-        "fiber 2 stayed parked (50/50 polls) while its ready result waited on fiber 1's id"
+        vec![Value::I64(13_111_222)],
+        "fiber 2 returned while fiber 1's earlier call was still held"
     );
     assert_eq!(
         comps.minted(),

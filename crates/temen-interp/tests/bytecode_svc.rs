@@ -278,7 +278,7 @@ fn a_serve_nested_under_a_handler_is_refused() {
 }
 
 /// The §3.6 separate-module corpus: the parent spawns a serving child from a granted module, detached
-/// (`v1` the module, `v2` the `Budget` its window spends, patched into the v1 record [`sep_caller`]
+/// (`v1` the module, `v2` the `Budget` its window spends, patched into the spawn record [`sep_caller`]
 /// appends at 17408), mints a live offer over its export (op 14), calls through it (enqueue + park),
 /// and joins — 142 = join(served=1)*100 + add(40,2).
 const SEP_CALLER: &str = r#"
@@ -286,9 +286,9 @@ memory 17
 
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 17432
+  vrm = i64.const 17416
   i32.store vrm v1
-  vrb = i64.const 17436
+  vrb = i64.const 17420
   i32.store vrb v2
   vrp = i64.const 17408
   v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -297,7 +297,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   va = i64.const 40
   vb = i64.const 2
   vr = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (v5)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (v5)
   vk = i64.const 100
   vm = i64.mul vj vk
   vs = i64.add vm vr
@@ -332,7 +332,7 @@ block 0 (va: i64, vb: i64) {
 fn sep_caller() -> String {
     format!(
         "{SEP_CALLER}{}",
-        rec::segment(17408, &temen_ir::SpawnRec::v1(0))
+        rec::segment(17408, &temen_ir::SpawnRec::default())
     )
 }
 
@@ -355,7 +355,7 @@ fn a_native_caller_parks_on_a_native_serving_child_and_wakes_with_the_reply() {
     );
     let run = |entry: Entry| {
         let mut host = Host::new();
-        let hi = host.grant_instantiator(0, 1u64 << 17);
+        let hi = host.grant_instantiator();
         let hm = host.grant_module(&b);
         let hb = host.grant_budget(-1, 1 << 20, -1);
         let mut fuel = 5_000_000u64;
@@ -416,7 +416,7 @@ func () -> (i64) {{
 block 0 () {{
   vz = i32.const 0
 {serve}
-  vj = call.cap 6 1 (i32) -> (i64) vz (vz)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vz (vz)
   vr = i64.add vn vj
   return vr
   }}
@@ -466,7 +466,7 @@ fn a_spawning_server_runs_natively_only_while_its_handlers_cannot_park() {
     )));
     for helper in [
         // a join
-        "  vz = i32.const 0\n  vj = call.cap 6 1 (i32) -> (i64) vz (vz)\n  return vj",
+        "  vz = i32.const 0\n  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vz (vz)\n  return vj",
         // an indirect call
         "  vf = ref.func 2\n  vr = call.dyn (i64) -> (i64) vf (vx)\n  return vr",
         // a call through a live offer
@@ -500,13 +500,13 @@ export 0 interface "svc" 1 { op: 3 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 17432
+  vrm = i64.const 17416
   i32.store vrm v2
-  vrb = i64.const 17436
+  vrb = i64.const 17420
   i32.store vrb v1
   vrp = i64.const 17408
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vj
   }
 }
@@ -540,11 +540,11 @@ block 0 (vx: i64) {
 fn a_live_offer_over_a_thread_is_refused() {
     let m = module(&format!(
         "{OFFER_OVER_A_THREAD}{}",
-        rec::segment(17408, &temen_ir::SpawnRec::v1(0))
+        rec::segment(17408, &temen_ir::SpawnRec::default())
     ));
     let run = |entry: Entry| {
         let mut host = Host::new();
-        let hi = host.grant_instantiator(0, 1u64 << 17);
+        let hi = host.grant_instantiator();
         let hb = host.grant_budget(-1, 1 << 20, -1);
         let hm = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
         let mut fuel = 5_000_000u64;

@@ -1,38 +1,54 @@
 //! #1469 — a §14 child that uses `thread.spawn`/`join` runs on the **Cranelift JIT**, as on the
-//! tree-walk oracle. A detached (op 15) child runs as an executor task; a task's spawned vCPUs run
-//! in a domain of the child's own — its thread handles number from 0, they share the child's window
-//! and fiber registry — while waits, notifies and the run-wide vCPU count stay the run's. Each
-//! program runs on both engines, and the child must have been JIT-compiled.
+//! tree-walk oracle. A detached child (spawned from a record, op 17) runs as an executor task; a
+//! task's spawned vCPUs run in a domain of the child's own — its thread handles number from 0, they
+//! share the child's window and fiber registry — while waits, notifies and the run-wide vCPU count
+//! stay the run's. Each program runs on both engines, and the child must have been JIT-compiled.
 #![cfg(any(
     all(unix, target_arch = "x86_64"),
     all(unix, target_arch = "aarch64"),
     all(windows, target_arch = "x86_64")
 ))]
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use core::ffi::c_void;
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
-use temen_ir::Module;
+use temen_ir::{Module, SpawnRec};
 use temen_jit::{compile_and_run_capture_reserved_with_host_ex, JitOutcome};
 
 const PARENT_LOG2: u8 = 23;
 const CHILD_LOG2: u8 = 16;
 
-/// The parent (args `(instantiator, child module, budget)`): spawns the child detached and returns
-/// its join status.
+/// The parent (args `(instantiator, child module, budget)`): spawns the child detached from the
+/// record at 17408, joins it, and returns `status * 1000 + value`: what the child returned, or its
+/// trap's wire code times 1000 (#2066).
 fn parent_src() -> String {
+    let child = SpawnRec {
+        size_log2: CHILD_LOG2.into(),
+        ..SpawnRec::default()
+    };
     format!(
         "memory {PARENT_LOG2}
 func (i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vmod: i32, vbud: i32) {{
-  me = i64.extend_i32_s vmod
-  vb = i64.extend_i32_s vbud
-  gz = i64.const 0
-  sl = i64.const {CHILD_LOG2}
-  ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
-  return vr
+  vma = i64.const {module_at}
+  i32.store vma vmod
+  vba = i64.const {budget_at}
+  i32.store vba vbud
+  vrp = i64.const 17408
+  ch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (ch)
+  vk = i64.const 1000
+  vsk = i64.mul vr_st vk
+  vt = i64.add vsk vr
+  return vt
   }}
-}}"
+}}
+{rec}",
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        rec = rec::segment(17408, &child),
     )
 }
 
@@ -44,7 +60,7 @@ fn parse(src: &str) -> Module {
 
 fn powerbox(child: &Module) -> (Host, [i32; 3]) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
+    let inst = host.grant_instantiator();
     let module = host.grant_module(child);
     let budget = host.grant_budget(-1, -1, -1);
     (host, [inst, module, budget])
@@ -238,7 +254,7 @@ block 0 (vsp: i64, varg: i64) {{
 }
 
 /// A trap in a child's vCPU ends the child's domain — its root, parked in the join, included — and
-/// the parent's join of the child reports it, as on the oracle.
+/// the parent's join of the child answers it, as on the oracle: the thread's `1 / 0`.
 #[test]
 fn a_trap_in_a_childs_thread_ends_the_child() {
     let child = format!(
@@ -260,8 +276,7 @@ block 0 (vsp: i64, varg: i64) {{
   }}
 }}"
     );
-    let got = parity(&child);
-    assert!(got.is_err(), "the child's trap surfaces: {got:?}");
+    assert_eq!(parity(&child), Ok(temen_ir::trap_code::DIV_BY_ZERO * 1000));
 }
 
 /// A child's root that returns while a vCPU it spawned still runs: the child's outcome is the

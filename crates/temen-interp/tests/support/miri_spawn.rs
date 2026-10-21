@@ -43,9 +43,13 @@ fn module(src: &str) -> Module {
 pub fn root() -> Module {
     let rec = SpawnRec {
         child_off: 65536,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::default()
     };
-    let (m, b, r) = (rec::MODULE_AT, rec::BUDGET_AT, rec::REGION_AT);
+    let (m, b, r) = (
+        SpawnRec::MODULE_AT,
+        SpawnRec::BUDGET_AT,
+        SpawnRec::REGION_AT,
+    );
     module(&format!(
         r#"memory 18
 func (i32, i32, i32, i32) -> (i64) {{
@@ -71,8 +75,8 @@ block 0 (vinst: i32, vas: i32, vmod: i32, vbud: i32) {{
   i32.store vpb vrb offset={r}
   vha = call.cap 6 17 (i64) -> (i32) vinst (vpa)
   vhb = call.cap 6 17 (i64) -> (i32) vinst (vpb)
-  vja = call.cap 6 1 (i32) -> (i64) vinst (vha)
-  vjb = call.cap 6 1 (i32) -> (i64) vinst (vhb)
+  vja_st, vja = call.cap 6 1 (i32) -> (i64, i64) vinst (vha)
+  vjb_st, vjb = call.cap 6 1 (i32) -> (i64, i64) vinst (vhb)
   vxa = i32.load8_u vwa
   vxb = i32.load8_u vwb
   vya = i64.extend_i32_u vxa
@@ -93,7 +97,7 @@ block 0 (vinst: i32, vas: i32, vmod: i32, vbud: i32) {{
 /// child module, and a `Budget` that pays for both children's windows.
 pub fn host() -> (Host, Vec<Value>) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << 18);
+    let inst = host.grant_instantiator();
     let aspace = host.grant_address_space(0, 1 << 18);
     let child = host.grant_module(&module(CHILD));
     let budget = host.grant_budget(-1, 1 << 18, -1);

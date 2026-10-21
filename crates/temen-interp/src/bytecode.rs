@@ -12,16 +12,13 @@
 //! capability seam (generic `call.cap` + `self.*`, via `host.cap_dispatch_slots`); §12 **fibers**
 //! (`cont.*`/`suspend`, cooperative single-vCPU switching in [`step_vcpu`]); and §12 **threads**
 //! (`thread.spawn`/`join` + `memory.wait`/`notify`) on a cooperative single-threaded scheduler
-//! ([`drive`]) over one shared `Mem`; and §14 **coroutines** (`Instantiator.spawn_coroutine`/`resume`
-//! + `Yielder.yield`, inline-driven over a confined `nested_view` child window — including the
-//! separate-**module** and **demand** (fault-driven-yield, lazy-paged) variants) and §14 **executor
-//! children** (`Instantiator.instantiate`/`join` + the separate-module variant, scheduler-driven over
-//! a confined child env with an attenuated `Instantiator`+`AddressSpace` powerbox and a `quota`
-//! sub-budget) — §14 is fully covered (ops 0–7). Faithful for the
-//! interleaving-invariant programs the oracle uses; and §22 **guest-driven JIT units**
-//! (`Jit.install`/`uninstall`/`invoke` + cross-module `call.dyn` into an installed unit) over a
-//! multi-module [`Domain`] (a runtime dispatch table spanning `mods`; `invoke` runs a unit nested
-//! over the shared window/table). Hot scalar/memory ops dispatch inline; the SIMD/`v128`/fence long
+//! ([`drive`]) over one shared `Mem`; and §14 **executor children** (the `Instantiator`'s op-17
+//! spawn and its `join`/`poll`/`detach`/`kill`/`child_offer`/`grant`, scheduler-driven over a child
+//! env with a window of its own and an attenuated `Instantiator`+`AddressSpace` powerbox, paid from a
+//! `Budget`). Faithful for the interleaving-invariant programs the oracle uses; and §22
+//! **guest-driven JIT units** (`Jit.install`/`uninstall`/`invoke` + cross-module `call.dyn` into an
+//! installed unit) over a multi-module [`Domain`] (a runtime dispatch table spanning `mods`;
+//! `invoke` runs a unit nested over the shared window/table). Hot scalar/memory ops dispatch inline; the SIMD/`v128`/fence long
 //! tail is delegated to the reference [`super::eval_inst`]. Threads and fibers compose (the fiber
 //! registry is run-shared, so fibers migrate across vCPUs); and **tail calls** (`return_call`/
 //! `return_call.dyn`, reusing the current window — O(1) deep tail recursion); §GC **`gc.roots`**
@@ -37,23 +34,24 @@
 //! via `run_fast`/`run_with_host_fast` (and, with a trap-time backtrace, `run_with_host_fast_traced`).
 //! Correctness is gated by exact-equality harnesses against the tree-walker (`bytecode_diff.rs` — which
 //! also checks trap-backtrace parity on every trapping generated module, `bytecode_{caps,fibers,threads,
-//! coroutines,instantiate,separate_module,demand_coroutine,tailcall,debug,traced,gc_roots,durable,
-//! dynlink}.rs`; `gc_roots` checks soundness rather than equality; `durable` checks freeze/thaw artifact
+//! instantiate,separate_module,tailcall,debug,traced,gc_roots,durable,dynlink}.rs`; `gc_roots` checks
+//! soundness rather than equality; `durable` checks freeze/thaw artifact
 //! + round-trip equality; `traced` checks trap-time backtrace `IrPc`-equality with `run_with_host_traced`).
 //!
 //! Like the reference interpreter, it is total and panic-free: every slot/pc index is in range by
 //! construction of the compiler, and `compile_module` rejects anything it can't lower.
 
 use temen_ir::{
-    BinOp, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx,
-    IToF, Inst, IntTy, IntUnOp, LoadOp, Module, SpawnRec, StoreOp, Terminator, ValType, VarLoc,
+    default_reserved_log2, window_reserved_log2, BinOp, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp,
+    FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx, IToF, Inst, IntTy, IntUnOp, LoadOp, Module,
+    SpawnRec, StoreOp, Terminator, ValType, VarLoc,
 };
 
 use super::{
     bin32, bin64, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32, fun64, i_to_f,
-    intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, Fuel, GuestMem, Host, Lease,
-    LentFuel, LiveFiber, LiveVcpu, LockUnpoisoned, Mem, MemLayout, Reg, RootWindow, Trap, Value,
-    VarValue, WindowSpec, DEFAULT_FUEL, DEFAULT_RESERVED_LOG2,
+    intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, Fuel, GuestMem, Host, HostCharge,
+    Lease, LentFuel, LiveFiber, LiveVcpu, LockUnpoisoned, Mem, MemLayout, NodeRef, Reg, RootWindow,
+    Trap, Value, VarValue, WindowSpec, DEFAULT_FUEL,
 };
 use crate::moment::{Moment, Refusal};
 
@@ -145,11 +143,12 @@ struct Copies {
 }
 impl Copies {
     /// Build from resolved `(src, dst)` pairs, classifying `aliasing` = some `dst` is also some `src`
-    /// (so a one-pass sequential copy could clobber a not-yet-read source). O(n²) over a tiny edge.
+    /// (so a one-pass sequential copy could clobber a not-yet-read source). An edge can carry
+    /// hundreds of copies (#2447), so the sources are sorted and each `dst` searched for.
     fn new(pairs: Box<[(u32, u32)]>) -> Copies {
-        let aliasing = pairs
-            .iter()
-            .any(|&(_, d)| pairs.iter().any(|&(s, _)| s == d));
+        let mut srcs: Vec<u32> = pairs.iter().map(|&(s, _)| s).collect();
+        srcs.sort_unstable();
+        let aliasing = pairs.iter().any(|&(_, d)| srcs.binary_search(&d).is_ok());
         Copies { pairs, aliasing }
     }
 }
@@ -401,9 +400,8 @@ enum Op {
     CloneCaller {
         /// The reply-value arg registers (0, 1, or 2), resolved to i64s in the driver.
         args: Box<[u32]>,
+        /// The twin handle (or an errno) lands here.
         dst: u32,
-        /// Whether the `call.cap` has a result slot (the twin handle / errno lands here).
-        has_result: bool,
     },
     /// FORK.md §9.2 — `reap` (self-op 12): the servicer side of `wait(pid)`. From within a serve
     /// handler, reap a twin `pid` a prior `clone_caller` minted, on behalf of the caller parked on
@@ -414,7 +412,6 @@ enum Op {
         /// The `pid` arg register (`None` = no arg → an out-of-range pid → `-ECHILD`).
         pid: Option<u32>,
         dst: u32,
-        has_result: bool,
     },
     /// FORK.md §8.6 — `exec_module` (self-op 14): **`execve` image-replace** (#1080). The running vCPU
     /// replaces its own image with a granted *separate command module*, in place, keeping its task id
@@ -523,44 +520,24 @@ enum Op {
         handle: u32,
         dst: u32,
     },
-    /// PROCESS.md §5 `Instantiator.instantiate_detached(budget, module, grants_ptr, grants_n, entry,
-    /// size_log2, quota[, args_ptr, args_len])` (op 15, #1286): a separate-module child in a **fresh
-    /// window** minted through a `Budget` — no carve, no alias; the host owns the window. The
-    /// optional trailing `(args_ptr, args_len)` is the spawn-time args payload copied to the child's
-    /// `module_args_base()` (the detached twin of the op-13 "parent data segment in the carve"); the
-    /// further optional `(region, child_off)` pre-maps a `SharedRegion` whole into the child's window
-    /// at `child_off` before it starts (the 11-arg form).
-    InstantiateDetached {
-        handle: u32,
-        budget: u32,
-        module: u32,
-        grants: Option<(u32, u32)>,
-        entry: u32,
-        size_log2: u32,
-        quota: u32,
-        args: Option<(u32, u32)>,
-        premap: Option<(u32, u32)>,
-        dst: u32,
-    },
-    /// CONSOLIDATION.md §3d — `instantiate_rec(record_ptr)` (op 17): the config-record spawn.
-    /// The record ([`SpawnRec`]) is **runtime data**, so unlike op 15's scalars its fields are read
-    /// from the vCPU's confined window at **exec** time; the op then folds onto the same
-    /// [`Outcome::InstantiateDetached`] op 15 produces (#1863).
+    /// CONSOLIDATION.md §3d — `instantiate_rec(record_ptr)` (op 17): the one spawn form (#1863), a
+    /// separate-module child in a **fresh window** minted through a `Budget` — no carve, no alias;
+    /// the host owns the window. The record ([`SpawnRec`]) is **runtime data**, so its fields are read
+    /// from the vCPU's confined window at **exec** time; the op then yields
+    /// [`Outcome::InstantiateDetached`].
     InstantiateRec {
         handle: u32,
         rec: u32,
         dst: u32,
     },
-    /// §14 `Instantiator.join(child)` (op 1): park until executor child `child` finishes; its result
-    /// (or trap) lands at `dst`. `handle` is the Instantiator cap (authority). The join itself reuses
-    /// the §12 thread machinery — children share one handle namespace (`threads`) with `thread.spawn`.
-    /// With `wait` it is `Instantiator.wait` (op 18): how the child ended lands at `dst` instead
-    /// ([`super::join_delivery`]).
+    /// §14 `Instantiator.join(child)` (op 1): park until executor child `child` ends; how it ended
+    /// lands at `dst` and `dst + 1`, `(status, value)` ([`super::join_delivery`]). `handle` is the
+    /// Instantiator cap (authority). The join itself reuses the §12 thread machinery — children share
+    /// one handle namespace (`threads`) with `thread.spawn`.
     InstJoin {
         handle: u32,
         child: u32,
         dst: u32,
-        wait: bool,
     },
     /// §12 `memory.wait`: futex wait (`ty`-wide) on `addr` while it equals `expected`, up to
     /// `timeout` ns; the status (0/1/2) lands at `dst`. Scheduler-driven.
@@ -635,17 +612,18 @@ enum Op {
         want_results: Box<[ValType]>,
     },
     Unreachable,
-    /// A `CapFault` trap: an `Instantiator` op the oracle has no arm for, which it refuses after the
-    /// handle resolves (a forged handle is a `CapFault` too) — the retired carve spawns (ops 0, 5
-    /// and 13, #1867) and the deleted coroutine ops (#2069).
+    /// A `CapFault` trap: an `Instantiator` call that isn't a live op at its contracted shape
+    /// (`temen_ir::served_contract`), which the oracle refuses after the handle resolves (a
+    /// forged handle is a `CapFault` too) — the retired carve spawns (ops 0, 5 and 13, #1867), `wait`
+    /// (op 18, #2066) and the other deleted ops #2065 lists, or a live op shaped otherwise.
     CapFault,
     /// Long-tail value/store ops (SIMD, `v128` load/store, fences) delegated to the reference
-    /// [`super::eval_inst`] — same semantics, no duplication. The original instruction keeps its
-    /// **block-local** operand indices, so it's run against the sub-window `regs[base + block_base
-    /// ..]`; `dst` is the frame-relative result slot (unused when `eval_inst` yields no value).
+    /// [`super::eval_inst`] — same semantics, no duplication. The instruction's operands are
+    /// rewritten to the **frame slots** every other op reads (an operand that names a forwarded
+    /// param reads its value's slot, #2448), so it's run against the frame `regs[base..]`; `dst`
+    /// is the frame-relative result slot (unused when `eval_inst` yields no value).
     Eval {
         inst: Box<Inst>,
-        block_base: u32,
         dst: u32,
     },
     /// §12.8 4A.5 durable-runtime-internal: push the active context's shadow-SP word address (the
@@ -772,9 +750,10 @@ impl Compiled {
 pub struct SharedSlots {
     slots: Box<[std::sync::atomic::AtomicU64]>,
     /// The modules this domain's `Jit.install`s put in the source, each with its unit's `(table,
-    /// unit)` on the domain's host ([`super::Host::resolve_jit_code`]). A frame of one reports it when
-    /// it spawns, so its `module = -1` names the unit's program (#2143). Per domain, not on the shared
-    /// [`Compiled`]: a child whose program is that same unit runs it as its own.
+    /// unit)` on the domain's host ([`super::Host::resolve_jit_code`]): what a host mirroring the
+    /// table in emitted code fetches each slot's unit by ([`SharedSlots::slot_unit`]), and where a
+    /// unit that names its own functions runs ([`SharedSlots::own_module`]). Per domain, not on the
+    /// shared [`Compiled`].
     jit_units: std::sync::Mutex<Vec<(usize, (u32, u32))>>,
     /// Bumped by every install and uninstall, after the slot it changed (#1009), so a host that
     /// mirrors the table in emitted code rebuilds only when it moved ([`SharedSlots::gen`]).
@@ -1025,7 +1004,61 @@ mod frame_bound_tests {
         let m = temen_text::parse_module("func () -> () {\nblock 0 () {\n  return\n  }\n}\n")
             .expect("parse");
         let c = compile_module(&m.funcs, &m.types, None).expect("compile");
-        Vm::new(&c, 0, &[]).expect("vm")
+        Vm::new(&c, 0, &[], None).expect("vm")
+    }
+
+    /// A guest whose func 1 recurses `depth` deep through a frame of about `slots` registers.
+    fn fat_recursion(slots: usize) -> temen_ir::Module {
+        let chain: String = (1..slots)
+            .map(|i| format!("  c{i} = i64.add c{} vd1\n", i - 1))
+            .collect();
+        temen_text::parse_module(&format!(
+            "func (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vr = call 1 (v0)\n  return vr\n  }}\n}}\n\
+             func (i64) -> (i64) {{\n\
+             block 0 (vd: i64) {{\n  vz = i64.const 0\n  vstop = i64.eq vd vz\n  br_if vstop 2(vd) 1(vd)\n  }}\n\
+             block 1 (vd1: i64) {{\n  c0 = i64.add vd1 vd1\n{chain}  vone = i64.const 1\n  vn = i64.sub vd1 vone\n\
+               vr = call 1 (vn)\n  vs = i64.add vr c{last}\n  return vs\n  }}\n\
+             block 2 (vd2: i64) {{\n  return vd2\n  }}\n}}\n",
+            last = slots - 1
+        ))
+        .expect("parse")
+    }
+
+    /// #2336 — a register file is charged to `mem` of its vCPU's domain past the stack a vCPU's own
+    /// charge pays for: a recursion that passes the domain's ceiling traps `StackOverflow`, the trap
+    /// an exhausted stack is, and what it held goes back when the run ends.
+    #[test]
+    fn a_register_file_is_charged_to_its_domains_mem() {
+        let m = fat_recursion(1000);
+        let run = |mem: i64, depth: i64| {
+            let mut h = Host::new();
+            h.set_grant(mem, -1, -1, -1);
+            let mut fuel = u64::MAX;
+            let r = compile_and_run_with_host(&m, 0, &[Value::I64(depth)], &mut fuel, &mut h)
+                .expect("the bytecode engine runs it");
+            (
+                r.map(|_| ()),
+                h.budgets.used(h.own_budget, super::super::BUDGET_MEM),
+            )
+        };
+        let (shallow, held) = run(256 << 20, 1);
+        assert_eq!(shallow, Ok(()));
+        // 2,000 frames of about 16 KiB: 32 MiB of registers.
+        assert_eq!(
+            run(256 << 20, 2000),
+            (Ok(()), held),
+            "fits, and is handed back"
+        );
+        assert_eq!(
+            run(8 << 20, 2000).0,
+            Err(Trap::StackOverflow),
+            "past the ceiling"
+        );
+        assert_eq!(
+            run(8 << 20, 2000).1,
+            held,
+            "and what it held is handed back"
+        );
     }
 
     /// #1958 — a call that would nest past [`MAX_FRAMES`], or grow the register file past
@@ -1037,9 +1070,9 @@ mod frame_bound_tests {
         assert_eq!(v.open_frame(MAX_REG_SLOTS + 1), Err(Trap::StackOverflow));
         assert_eq!(v.regs.len(), regs, "nothing allocated");
         assert_eq!(v.open_frame(regs + 1), Ok(()), "under both bounds");
-        v.stack.resize(MAX_FRAMES - 1, (0, 0, 0, 0, 0));
+        v.stack.resize(MAX_FRAMES - 1, (0, 0, 0, 0, 0, 0));
         assert_eq!(v.open_frame(regs + 1), Ok(()), "the last frame opens");
-        v.stack.push((0, 0, 0, 0, 0));
+        v.stack.push((0, 0, 0, 0, 0, 0));
         assert_eq!(v.open_frame(regs + 2), Err(Trap::StackOverflow));
         assert_eq!(v.regs.len(), regs + 1, "nothing allocated");
         // A tail call pushes no frame, so only the register file's bound applies (#2082).
@@ -1137,7 +1170,7 @@ block 0 () {
   vch = call.cap 6 17 (i64) -> (i32) vh (vrec)
   vz = i32.const 0
   vn = svc.wait vz
-  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)
   vr = i64.add vn vj
   return vr
   }
@@ -1190,19 +1223,6 @@ fn build_table_for(n_funcs: usize, table_log2: u8, module: u32) -> SharedSlots {
 /// Build the primary's natural module-0 dispatch table.
 fn build_table(n_funcs: usize, table_log2: u8) -> SharedSlots {
     SharedSlots::new(n_funcs, table_log2, 0)
-}
-
-/// The program a **same-module** §14 child (op 0 / op 11, a detached `-1`) runs: the **spawning
-/// frame's** module — the primary for a plain guest, the unit itself for an installed §22 unit — as
-/// `(index, program)`. Every driver validates the child's entry against, and builds the child over,
-/// this one module, so the two cannot disagree (#1726: they used to validate or build against module
-/// 0, so an installed unit's child ran the base program's function of the same index). The
-/// module-aware rule `thread.spawn` already follows (`VcpuEvent::Spawn { module }`). `None` only for a
-/// module index the source does not hold, which a running frame cannot have.
-fn spawner_module(source: &ModuleSource, spawner: &Vm) -> Option<(u32, std::sync::Arc<Compiled>)> {
-    source
-        .get(spawner.module)
-        .map(|c| (spawner.module as u32, c))
 }
 
 /// A running domain (THREADS.md 4c-domain): its shared [`ModuleSource`] (`mods[0]` = primary, `k≥1` =
@@ -1610,15 +1630,16 @@ fn scan_seams<'a>(funcs: impl IntoIterator<Item = &'a Func>) -> Seams {
             }
             for inst in &b.insts {
                 match inst {
-                    // ops 1/18 = join/wait, op 15 = instantiate_detached, op 17 = instantiate_rec,
-                    // ops 9/10/12 = poll/detach/kill, ops 14/19 = child_offer/grant (all executor
-                    // children, scheduler-driven). Every other INSTANTIATOR op traps `CapFault`
+                    // Every live op (`temen_ir::served_contract`) drives executor children,
+                    // scheduler-driven. Every other INSTANTIATOR op traps `CapFault`
                     // (`Op::CapFault`), so it is no seam.
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
-                        op: 1 | 9 | 10 | 12 | 14 | 15 | 17 | 18 | 19,
+                        op,
                         ..
-                    } => s.has_instantiate = true,
+                    } if temen_ir::served_contract(super::cap_id::INSTANTIATOR, *op).is_some() => {
+                        s.has_instantiate = true
+                    }
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
                         ..
@@ -1711,27 +1732,10 @@ pub fn serve_qualifies(funcs: &[Func]) -> bool {
 /// `serves_children`: the caller's driver serves the children a module spawns — the cooperative
 /// scheduler, `drive` and [`CoopRun`] alike, whose every domain sits in a cell its children can
 /// call back into (#744). The [`bytecode_serves_children`] escape applies to it alone; every other
-/// driver declines such a module to the tree-walk oracle.
-///
-/// CONSOLIDATION.md §3d, #744 — the **pager guard**: a record-spawn (op 17) module that declares a
-/// pager-shaped export ([`Module::declares_pager`]) could build a pager record, which only the
-/// oracle serves (native paging is #2164), so it declines. A module with no such export builds no
-/// valid pager record — spawn validation refuses one identically on every tier — so the record
-/// spawn runs natively. The same key as temen-run's `module_demand_spawns` fold for the JIT.
+/// driver declines such a module to the tree-walk oracle, as it declines one that may page a child
+/// ([`may_page_a_child`]).
 fn compile_module_for(m: &Module, serves_children: bool) -> Option<Compiled> {
-    let uses_rec = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
-        b.insts.iter().any(|i| {
-            matches!(
-                i,
-                Inst::CapCall {
-                    type_id: super::cap_id::INSTANTIATOR,
-                    op: 17,
-                    ..
-                }
-            )
-        })
-    });
-    if uses_rec && m.declares_pager() {
+    if !serves_children && may_page_a_child(m) {
         return None;
     }
     let escape = serves_children && bytecode_serves_children(m);
@@ -1745,6 +1749,29 @@ fn compile_module_for(m: &Module, serves_children: bool) -> Option<Compiled> {
     )?;
     c.serves_children = serves_children;
     Some(c)
+}
+
+/// CONSOLIDATION.md §3d, #744 — the **pager guard**: a record-spawn (op 17) module that declares a
+/// pager-shaped export ([`Module::declares_pager`]) could build a pager record. A driver that serves
+/// its children pages them (#2164): a paged child's fault is a call into its spawner's domain, which
+/// sits in a cell. Every other driver declines such a module to the oracle: `Vcpu` at its compile
+/// ([`compile_module_for`]), the debug scheduler when a session opens
+/// ([`ScheduledDebugRun::new_with_host`]). A module with no such export builds no valid pager record
+/// — spawn validation refuses one identically on every tier — so its record spawn runs natively.
+fn may_page_a_child(m: &Module) -> bool {
+    m.declares_pager()
+        && m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::CapCall {
+                        type_id: super::cap_id::INSTANTIATOR,
+                        op: 17,
+                        ..
+                    }
+                )
+            })
+        })
 }
 
 /// The §14 entry-shape rule and the starter handles each shape takes live in `temen-ir`, the one
@@ -1765,19 +1792,16 @@ pub(crate) fn read_spawn_rec(m: &Mem, rp: u64) -> Result<SpawnRec, Trap> {
     SpawnRec::parse(&m.read_window(rp, temen_ir::SPAWN_REC_LEN)?).ok_or(Trap::CapFault)
 }
 
-/// A §5 detached spawn (op 15, #1286) as its lowering resolved it: a separate module in a fresh
-/// window of its own, never a carve of the spawner's.
+/// A §5 detached spawn (#1286) as its record (op 17) names it: a separate module in a fresh window
+/// of its own, never a carve of the spawner's.
 #[derive(Clone, Copy)]
 struct DetachedSpawn {
     /// The `Budget` handle whose `mem` quota pays for the window.
     budget: i32,
-    /// The granted `Module` handle the child runs.
+    /// The granted `Module` handle the child runs, from its function 0 (#2219).
     module: i32,
-    entry: i64,
     /// The window: `1 << size_log2` bytes, the module's declared memory.
     size_log2: i64,
-    /// The child's fuel quota (`<= 0` inherits the parent's remaining).
-    quota: i64,
     /// The by-name grant list's `(ptr, count)` in the spawner's window; `None` grants only the
     /// starter caps.
     grants: Option<(u64, u64)>,
@@ -1787,40 +1811,29 @@ struct DetachedSpawn {
     /// A `SharedRegion` of the spawner's, `(region, child_off)`, aliased into the child's window
     /// before it starts.
     premap: Option<(i32, u64)>,
+    /// §2.2 — the pager: an export of the spawner's program whose `page` op supplies the child's
+    /// demand-paged window (#2164). Admission checks it ([`admit_detached_child`]).
+    pager: Option<u32>,
 }
 
 impl DetachedSpawn {
-    /// A v1 (detached) op-17 record's spawn: op 15 as data (#1863).
+    /// An op-17 record's spawn, always detached (#1863).
     fn of(sr: &SpawnRec) -> DetachedSpawn {
         DetachedSpawn {
             budget: sr.budget,
             module: sr.modh,
-            entry: sr.entry as i64,
             size_log2: sr.size_log2,
-            quota: sr.quota,
             grants: (sr.grants_n > 0).then_some((sr.grants_ptr, sr.grants_n)),
             args: (sr.args.1 > 0).then_some(sr.args),
             premap: (sr.region >= 0).then_some((sr.region, sr.child_off)),
+            pager: (sr.pager != u32::MAX).then_some(sr.pager),
         }
     }
 }
 
-/// What an admitted child runs.
-enum ChildProgram {
-    /// The spawning frame's own module (#1726): a same-module child (op 0, a module-less op 17).
-    Spawner(u32, std::sync::Arc<Compiled>),
-    /// A granted separate module, as the run compiled it once ([`granted_program`]).
-    Granted(u32, std::sync::Arc<Compiled>),
-}
-
-impl ChildProgram {
-    /// The module index the child runs in the run's source, and its compiled unit.
-    fn unit(self) -> (u32, std::sync::Arc<Compiled>) {
-        match self {
-            ChildProgram::Spawner(m, p) | ChildProgram::Granted(m, p) => (m, p),
-        }
-    }
-}
+/// What an admitted child runs: its granted module's index in the run's source, and its program as
+/// the run compiled it once ([`granted_program`]).
+type ChildProgram = (u32, std::sync::Arc<Compiled>);
 
 /// The program a child of granted module `g` runs: the unit this run compiled from the same module
 /// (by content digest), or a fresh compile, added to `source` (#2219). Every child is a granted module,
@@ -1836,19 +1849,19 @@ fn granted_program(
         .unit_of(&g.digest, || compile_granted(host, g, source))
         .ok_or(Trap::Malformed)?;
     let p = source.get(i).ok_or(Trap::Malformed)?;
-    Ok(ChildProgram::Granted(i as u32, p))
+    Ok((i as u32, p))
 }
 
 /// A §5 detached child as every in-process bytecode driver builds it — the **one definition** of
-/// admission and of the child powerbox (INVARIANTS #15), made by [`admit_detached_child`] (and by
-/// `admit_confined_child` for the carve spawn, until it retired, #1867) and shared by the cooperative executor
-/// (`drive`), the OS-thread parallel driver ([`drive_threads`]) and the debug scheduler. Only *how
+/// admission and of the child powerbox (INVARIANTS #15), made by [`admit_detached_child`] and shared
+/// by the cooperative executor (`drive`), the OS-thread parallel driver ([`drive_threads`]) and the
+/// debug scheduler. Only *how
 /// the child is scheduled* differs per driver: an executor task, an OS thread, a debug task. (Until
 /// #1855 each driver admitted a confined child its own way, and two of them trapped on a budget or a
 /// grant list the cooperative driver serves.)
 struct AdmittedChild {
-    /// The child's window: a view of the holder's carve (confined), or a fresh window of its own
-    /// (detached) once its [`FreshWindow`] is built over the driver's backing.
+    /// The child's fresh window of its own, once its [`FreshWindow`] is built over the driver's
+    /// backing.
     mem: Option<Mem>,
     /// The child powerbox: the starter `Instantiator`/`AddressSpace`, the by-name re-grants, the
     /// module the child serves, its import manifest bound, and a funding budget's channel ceiling.
@@ -1856,14 +1869,12 @@ struct AdmittedChild {
     program: ChildProgram,
     /// The entry's arguments: the starter `Instantiator` (plus `AddressSpace` for a two-arg entry).
     args: Vec<Value>,
-    /// The child's fuel (#1944 slice 3): a detached child draws from its own budget node, the one
-    /// that paid for its window; a carve child keeps its fixed allowance (the record's budget, or the
-    /// op's quota, capped at what its parent can still burn).
+    /// The child's fuel (#1944 slice 3): it draws from its own budget node, the one that paid for its
+    /// window.
     fuel: Fuel,
-    /// A detached child's window lease: `Budget` accounts live windows (INVARIANTS #3, 2026-09-29),
-    /// so the driver gives what it holds back to the spawner's budget when the child ends. `None` for
-    /// a confined (carve) child, which spends no `Budget.mem`.
-    lease: Option<Lease>,
+    /// The child's window lease: `Budget` accounts live windows (INVARIANTS #3, 2026-09-29), so the
+    /// driver gives what it holds back to the spawner's budget when the child ends.
+    lease: Lease,
 }
 
 /// An [`AdmittedChild`] ready to schedule ([`AdmittedChild::build`]): its program landed in the run's
@@ -1875,16 +1886,15 @@ struct BuiltChild {
     mem: Option<Mem>,
     host: Host,
     fuel: Fuel,
-    lease: Option<Lease>,
+    lease: Lease,
 }
 
 impl AdmittedChild {
-    /// Build the child's task at `entry` ([`child_task`]), for the driver to schedule — or refuse
-    /// it: with no `room` under the driver's vCPU ceiling (the instantiate bomb, `ThreadFault`), or an
-    /// entry its program cannot start at. A refused child hands its window lease to `refund`, its
-    /// spawner's budget, so a spawn refused after its admission charges nothing (#1975, #2006), as the
-    /// oracle's undo does.
-    fn build(self, entry: i64, room: bool, refund: impl FnOnce(Lease)) -> Result<BuiltChild, Trap> {
+    /// Build the child's task ([`child_task`]), for the driver to schedule — or refuse it: with no
+    /// `room` under the driver's vCPU ceiling (the instantiate bomb, `ThreadFault`). A refused child
+    /// hands its window lease to `refund`, its spawner's budget, so a spawn refused after its
+    /// admission charges nothing (#1975, #2006), as the oracle's undo does.
+    fn build(self, room: bool, refund: impl FnOnce(Lease)) -> Result<BuiltChild, Trap> {
         let AdmittedChild {
             mem,
             host,
@@ -1896,8 +1906,9 @@ impl AdmittedChild {
         let built = match room {
             false => Err(Trap::ThreadFault), // instantiate bomb
             true => {
-                let (module, prog) = program.unit();
-                child_task(module, &prog, entry, &args, host.jit_table_log2())
+                let (module, prog) = program;
+                let payer = Some(host.own_node());
+                child_task(module, &prog, &args, host.jit_table_log2(), payer)
                     .map(|(vt, table)| (module, vt, table))
             }
         };
@@ -1915,35 +1926,39 @@ impl AdmittedChild {
                 // #2268 — its window, if built, started: what it held of `maps` goes back too.
                 let mut host = host;
                 host.release_memory();
-                if let Some(lease) = lease {
-                    refund(lease);
-                }
+                refund(lease);
                 Err(t)
             }
         }
     }
 }
 
-/// A child's entry task in `module` (`prog`, its landed program) and its own natural dispatch table
-/// over that module — no installed §22 units; #1296: sized for the install slots its re-granted
-/// `Jit` carries.
+/// A child's task in `module` (`prog`, its landed program), entered at function 0, the module's
+/// child bootstrap (#2219), and its own natural dispatch table over that module — no installed §22
+/// units; #1296: sized for the install slots its re-granted `Jit` carries.
 fn child_task(
     module: u32,
     prog: &Compiled,
-    entry: i64,
     args: &[Value],
     jit_table_log2: u8,
+    payer: Option<NodeRef>,
 ) -> Result<(VTask, SharedSlots), Trap> {
     let table = build_table_for(prog.progs.len(), jit_table_log2, module);
-    let vt = entry_task(prog, module as usize, entry as usize, args)?;
+    let vt = entry_task(prog, module as usize, 0, args, payer)?;
     Ok((vt, table))
 }
 
 /// A new vCPU's task, entered at `func` of `module` (`unit`, that module's program) with `args`, its
 /// frames homed there: a thread's, a §14/§5 child's, an exec'd image's or a host-built [`Vcpu`]'s
 /// first frame. `Malformed` for a function `unit` does not have.
-fn entry_task(unit: &Compiled, module: usize, func: usize, args: &[Value]) -> Result<VTask, Trap> {
-    let mut vt = VTask::new(unit, func, args)?;
+fn entry_task(
+    unit: &Compiled,
+    module: usize,
+    func: usize,
+    args: &[Value],
+    payer: Option<NodeRef>,
+) -> Result<VTask, Trap> {
+    let mut vt = VTask::new(unit, func, args, payer)?;
     vt.active.module = module;
     vt.active.home = module;
     Ok(vt)
@@ -1959,6 +1974,7 @@ fn thread_task(
     func: u32,
     sp: i64,
     arg: i64,
+    payer: Option<NodeRef>,
 ) -> Result<VTask, Trap> {
     let cm = source.get(module).ok_or(Trap::Malformed)?;
     entry_task(
@@ -1966,6 +1982,7 @@ fn thread_task(
         module,
         func as usize,
         &[Value::I64(sp), Value::I64(arg)],
+        payer,
     )
 }
 
@@ -1978,6 +1995,8 @@ struct FreshWindow {
     /// The module the child runs: its data segments seed the window.
     module: std::sync::Arc<Module>,
     payload: Vec<u8>,
+    /// §2.2 — the window starts demand-paged: every page arrives through its pager's reply.
+    paged: bool,
 }
 
 impl FreshWindow {
@@ -1990,7 +2009,7 @@ impl FreshWindow {
         host: &mut Host,
     ) -> Result<Mem, Trap> {
         let mut mem = Mem::from_spec(WindowSpec {
-            reserved_log2: DEFAULT_RESERVED_LOG2,
+            reserved_log2: window_reserved_log2(self.size_log2),
             mapped_log2: self.size_log2,
             shadow: self.shadow,
             back,
@@ -2000,6 +2019,10 @@ impl FreshWindow {
         });
         if !self.payload.is_empty() {
             let _ = mem.write_bytes(temen_ir::module_args_base(), &self.payload);
+        }
+        // As the tree-walker builds a paged window: seeded, then demand-paged, then pre-mapped.
+        if self.paged {
+            mem.demand_page();
         }
         if host.apply_premap(&mut mem) < 0 {
             return Err(Trap::Malformed);
@@ -2018,7 +2041,7 @@ impl FreshWindow {
     }
 }
 
-/// Admit an op-15 spawn against `host` (the parent powerbox) and build the child, with its window
+/// Admit a detached spawn against `host` (the parent powerbox) and build the child, with its window
 /// still to be built over a backing the driver supplies. `pm` is the parent's window (the grant list
 /// and the args payload are read from it). `Ok(None)` is a **probeable refusal** — the driver lands
 /// `-EINVAL` and nothing was charged; `Err` is a trap (a forged handle, an unreadable payload, a
@@ -2034,37 +2057,25 @@ impl FreshWindow {
 /// durable domain's detached spawn refuses (#1893).
 ///
 /// `source`: the run's compiled modules, where a granted module's program is found or added
-/// ([`granted_program`]). `spawner`: the spawning frame's module in it ([`spawner_module`]), and
-/// `unit`, the `Jit` unit that module is when the spawning domain installed it
-/// ([`SharedSlots::jit_unit`]): `module = -1` then names the unit's program (#2143). A child of the
-/// frame's module runs it, with no second compile; `None` (an emitted frame's spawn, whose code is
-/// never a unit's) runs the child's program as a granted module's.
+/// ([`granted_program`]).
 fn admit_detached_child(
     host: &mut Host,
     pm: Option<&Mem>,
     s: DetachedSpawn,
     freezes_detached: bool,
     source: &ModuleSource,
-    spawner: Option<(u32, std::sync::Arc<Compiled>)>,
-    unit: Option<(u32, u32)>,
 ) -> Result<Option<(AdmittedChild, FreshWindow)>, Trap> {
-    // #1944 slice 3 — `quota` is retired: the budget is the one way to limit a child's fuel, so any
-    // other value fails closed, checked first as the tree-walker's op-15 arm does.
-    if s.quota != 0 {
+    // §2.2 — a record's pager must be a `{ page: (i64) -> (i64) }` export of the spawner's own
+    // program, as on the tree-walker (#744, #1862). The record named the pager before anything else
+    // was checked, so it fails first (#2164). Only a driver that serves its children pages one: the
+    // others decline a module that could page a child ([`may_page_a_child`]), and a granted child
+    // that serves and spawns ([`bytecode_serves_children`]).
+    if s.pager.is_some_and(|export| !host.has_pager_export(export)) {
         return Err(Trap::CapFault);
     }
-    // A child of the spawning frame's own module runs it, as a same-module confined child does
-    // (#1726): no second compile, and the child's code keeps the identity the debugger keys
-    // breakpoints and §6 debug info on (#2076). `-1` always names that module; a grant of the
-    // domain's program does too when the frame runs the program rather than a unit.
-    let runs_spawner =
-        s.module == super::SELF_MODULE || (unit.is_none() && host.is_self_module(s.module));
     let (program, cmem_log2, cmodule, cshadow, cdurable) = {
-        let g = host.resolve_spawn_module(s.module, unit)?;
-        let program = match spawner {
-            Some((m, p)) if runs_spawner => ChildProgram::Spawner(m, p),
-            _ => granted_program(host, source, g)?,
-        };
+        let g = host.resolve_module(s.module)?;
+        let program = granted_program(host, source, g)?;
         (
             program,
             g.memory_log2(),
@@ -2073,9 +2084,7 @@ fn admit_detached_child(
             g.durable,
         )
     };
-    let sig = match &program {
-        ChildProgram::Spawner(_, p) | ChildProgram::Granted(_, p) => p.sigs.get(s.entry as usize),
-    };
+    let sig = program.1.sigs.first();
     let arity = sig.map_or(0, |(p, _)| p.len());
     let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
     let size_log2 = temen_ir::detached_size_log2(s.size_log2, cmem_log2);
@@ -2134,11 +2143,12 @@ fn admit_detached_child(
     let mut child_host = host.child_host();
     // §4: a durable domain's child is durable too, so its own spawns re-apply the rule above.
     child_host.set_durable(durable);
-    child_host.set_attestation(host.detached_child_attestation());
+    child_host.set_attestation(host.detached_child_attestation(s.pager.is_some()));
+    child_host.pager = s.pager;
     // D66 — the child's lane cap is the lane its budget carries, as on the tree-walker and the JIT:
     // its `self.parallelism`, and the ceiling on the lanes it grants its own children.
     child_host.set_lane_cap(lane);
-    let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
+    let reservation = 1u64 << window_reserved_log2(size_log2 as u8);
     let (cinst, cas) = child_host.grant_starter_caps(reservation);
     // #1944 — the budget that paid for the window is the child's own.
     host.give_child_budget(lease, &mut child_host);
@@ -2153,14 +2163,10 @@ fn admit_detached_child(
         }
     }
     child_host.set_self_module(&cmodule);
-    // A child of the running module itself binds leniently (#1234 — its manifest is the parent's
-    // whole import surface, not one written for the child).
-    let bound = if host.is_self_module(s.module) {
-        child_host.bind_same_module_manifest(&cmodule.imports, &cmodule.types)
-    } else {
-        child_host.bind_child_manifest(&cmodule.imports, &cmodule.types)
-    };
-    if bound.is_err() {
+    if child_host
+        .bind_child_manifest(&cmodule.imports, &cmodule.types)
+        .is_err()
+    {
         host.undo_detached_spawn(lease, lane);
         return Ok(None);
     }
@@ -2177,39 +2183,52 @@ fn admit_detached_child(
         program,
         args,
         fuel,
-        lease: Some(lease),
+        lease,
     };
     let window = FreshWindow {
         size_log2: size_log2 as u8,
         shadow: cshadow,
         module: cmodule,
         payload,
+        paged: s.pager.is_some(),
     };
     Ok(Some((child, window)))
 }
 
 /// [`admit_detached_child`] for the in-process drivers, which hold the child's window themselves:
-/// built at once, over a reservation of the engine's own. Returns the child, and the emit of the
-/// program it runs, as `emit` answers for it: the cooperative pump's ([`ProgramEmits::for_child`]),
-/// `None` on a driver with no emitted tier. A child with an emit gets its window over a
-/// [`FreshWindow::flat_backing`] instead, so that it can tier up on every target (#2102). Only the
-/// cooperative pump has emits, and it is the single owner a backing that relocates needs.
+/// built at once, over a reservation of the engine's own, or over a backing `backing` makes
+/// ([`ThreadPlatform::child_window`]). A backing it cannot make refuses the spawn, and hands the
+/// window's bytes back to the budget that paid for them. Returns the child, and the emit of the
+/// program it runs, as `emit` answers for it ([`ProgramEmits::for_child`]): `None` on a driver with
+/// no emitted tier. Without a backing, a child with an emit gets its window over a
+/// [`FreshWindow::flat_backing`], so that it can tier up on every target (#2102): the cooperative
+/// pump is the single owner a backing that relocates needs. A backing's memory is the child's own,
+/// which its host runs the emit over (#1414 ED-2).
+#[allow(clippy::too_many_arguments)] // the spawn's inputs, its emit, and where its window can live
 fn admit_detached_in_process(
     host: &mut Host,
     pm: Option<&Mem>,
     s: DetachedSpawn,
     source: &ModuleSource,
-    spawner: Option<(u32, std::sync::Arc<Compiled>)>,
-    unit: Option<(u32, u32)>,
     emit: impl FnOnce(&AdmittedChild) -> Option<ProgramEmit>,
+    backing: Option<ChildBacking>,
 ) -> Result<Option<(AdmittedChild, Option<ProgramEmit>)>, Trap> {
-    let Some((mut child, window)) =
-        admit_detached_child(host, pm, s, false, source, spawner, unit)?
-    else {
+    let Some((mut child, window)) = admit_detached_child(host, pm, s, false, source)? else {
         return Ok(None);
     };
-    let tierup = emit(&child);
-    let back = tierup.as_ref().and_then(|_| window.flat_backing());
+    let (back, tierup) = match backing {
+        Some(make) => match make(window.size_log2) {
+            Some(back) => (Some(back), emit(&child)),
+            None => {
+                host.release_detached(child.lease);
+                return Ok(None);
+            }
+        },
+        None => {
+            let tierup = emit(&child);
+            (tierup.as_ref().and_then(|_| window.flat_backing()), tierup)
+        }
+    };
     child.mem = Some(window.build(back, &mut child.host)?);
     Ok(Some((child, tierup)))
 }
@@ -2289,20 +2308,14 @@ fn compile_module_with(
     escape: bool,
     mut memo: Option<&mut FuncMemo>,
 ) -> Option<Compiled> {
-    // Coroutines (§14, `spawn_coroutine`/`resume`/`yield`) are driven **inline** as single-vCPU
-    // children with a Yielder-only powerbox. A coroutine module that *also* uses fibers or threads
-    // would need the child to participate in those seams (a coroutine child can use `cont.*`/`thread.*`
-    // in the tree-walker), which the inline coroutine driver here doesn't service — so reject the
-    // combination (→ tree-walker fallback). §14 **executor children** (`instantiate`/`join`, ops 0/1)
-    // are different: they run on the scheduler like threads, not inline — so they classify as
-    // scheduler-driven, not as coroutines — and they combine with `cont.*` fibers too: every driver
-    // gives each confined child domain its own fiber registry (the cooperative `ChildEnv::fibers`,
-    // which the parallel driver shares, and the debugger's `DbgEnv::fibers`), as the oracle does. Plain coroutine /
-    // fiber / thread / instantiate modules are each fine, as are instantiate+thread,
-    // instantiate+coroutine and instantiate+fiber.
+    // §14 **executor children** (the `Instantiator`'s spawn and `join`) run on the scheduler like
+    // threads, and they combine with `cont.*` fibers: every driver gives each child domain its own
+    // fiber registry (the cooperative `ChildEnv::fibers`, which the parallel driver shares, and the
+    // debugger's `DbgEnv::fibers`), as the oracle does. Fiber / thread / instantiate modules are each
+    // fine, as are instantiate+thread and instantiate+fiber.
     let s = scan_seams(funcs);
     // `gc.roots` (§GC) is per-vCPU **conservative root enumeration**: on this engine it scans the
-    // calling vCPU's continuation (`vt.active` + `vt.chain` + `vt.coroutines`) **plus the run-shared
+    // calling vCPU's continuation (`vt.active` + `vt.chain`) **plus the run-shared
     // fiber registry** (`fibers`, scanned in [`step_vcpu`]'s `Outcome::GcRoots` arm) — the exact
     // scope the tree-walker's op documents ("the caller's own live frames, the parked root, and every
     // registry fiber's frames", `crates/temen/tests/gc_roots.rs`). Neither engine scans a *sibling
@@ -2311,12 +2324,11 @@ fn compile_module_with(
     // `crates/temen/tests/gc_quiesce.rs`); JACL's roots live in the migratable fibers the shared
     // registry covers. So `gc.roots` + `thread.*` is **not** vetoed — the criterion for this op is
     // soundness (`tw ⊆ bc`, GC.md §3.2), which holds because the bytecode scope is a superset of the
-    // tree-walker's. (`gc.roots` + fibers / coroutines was always fine — those continuations are
-    // scanned.)
+    // tree-walker's. (`gc.roots` + fibers was always fine — those continuations are scanned.)
     //
     // §3.6 (I36 slice 1): a **serving** module is admitted natively only when no handler could
     // park or unwind mid-dispatch ([`serve_qualifies`]) — any park-capable seam anywhere in the
-    // module (futex waits / threads, fibers, coroutines, nested instantiate, setjmp/longjmp — a
+    // module (futex waits / threads, fibers, nested instantiate, setjmp/longjmp — a
     // `longjmp` out of a handler would unwind past the serve linkage — blocking stream reads,
     // spawn-bound imports, gc.roots) falls the whole module back to the tree-walk oracle, whose
     // serve arm has the fiber-park machinery (slice 5b).
@@ -2474,6 +2486,11 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
             nslots += view.results(inst) as u32;
         }
     }
+    // #2353 — one slot past every value's: the `dst` of an instruction that defines none. A driver
+    // answering such a call later (a `fork`'s return-twice value, a parked call's result) writes it
+    // here, where no value lives, not over the slot of the value defined next, nor past the frame.
+    let discard = nslots;
+    nslots += 1;
     let mut block_pc = vec![0u32; f.blocks.len()];
     let mut ops: Vec<Op> = Vec::new();
     // Debug reverse map (Slice 1c-3), built **incrementally** alongside `ops` (was a positional
@@ -2484,14 +2501,38 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
     // (it can never trap), and the fused-away `IntCmp`'s entry is dropped — the fused program is
     // never single-stepped (debug/trace compile unfused), so no source location is lost there.
     let mut src: Vec<Option<(u32, u32)>> = Vec::new();
+    // #2448: in the fused compile, a block param that only forwards a value reads that value's
+    // slot, and no edge copies into it. The unfused compile (stepping, tracing, a debug run's
+    // frames, read by `(block, value)`) keeps every param in a slot of its own.
+    let forwards = fuse.then(|| f.forwards());
+    let forwarded = |b: usize, i: usize| forwards.as_ref().and_then(|w| w.source(b, i));
+    // The slots a forwarding param reads: read outside their block with no edge copy, so their
+    // values must be written (the `IntCmp` fusion below checks this).
+    let mut read_forwarded = vec![false; nslots as usize];
+    for (b, blk) in f.blocks.iter().enumerate() {
+        for i in 0..blk.params.len() {
+            if let Some((sb, si)) = forwarded(b, i) {
+                read_forwarded[(base[sb as usize] + si) as usize] = true;
+            }
+        }
+    }
     for (bi, b) in f.blocks.iter().enumerate() {
         block_pc[bi] = ops.len() as u32;
-        let g = |local: u32| base[bi] + local; // operand: block-local index -> frame slot
-        let mut local = b.params.len() as u32;
+        let params = b.params.len() as u32;
+        // operand: block-local index -> frame slot
+        let g = |local: u32| match local < params {
+            true => forwarded(bi, local as usize)
+                .map_or(base[bi] + local, |(sb, si)| base[sb as usize] + si),
+            false => base[bi] + local,
+        };
+        let mut local = params;
         for (i, inst) in b.insts.iter().enumerate() {
-            let dst = base[bi] + local;
+            let dst = match view.results(inst) {
+                0 => discard,
+                _ => base[bi] + local,
+            };
             local += view.results(inst) as u32;
-            ops.push(compile_inst(inst, dst, base[bi], view, &g)?);
+            ops.push(compile_inst(inst, dst, view, &g)?);
             src.push(Some((bi as u32, i as u32)));
         }
         // Terminator -> edge copies (block-local src in this block -> first slots of target) + jump.
@@ -2505,6 +2546,7 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
             let pairs: Box<[(u32, u32)]> = args
                 .iter()
                 .enumerate()
+                .filter(|&(i, _)| forwarded(bidx, i).is_none())
                 .map(|(i, a)| (g(*a), base[bidx] + i as u32))
                 .filter(|(src, dst)| src != dst)
                 .collect();
@@ -2527,9 +2569,10 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
                 let cond_slot = g(*cond);
                 // Slice 5a: fuse a block-final `IntCmp` whose result is this branch's condition and
                 // is used nowhere else into a single `BrIfCmp`. Valid because the compare is pure and
-                // single-use *here*: it is the last instruction (so no later in-block reader) and the
-                // cond slot is not carried to any successor (not an edge-copy source). Fused compile
-                // only — `fuse == false` (debug/trace) keeps the compare as its own steppable op.
+                // single-use *here*: it is the last instruction (so no later in-block reader), the
+                // cond slot is not carried to any successor (not an edge-copy source), and no
+                // forwarding param reads it (#2448). Fused compile only — `fuse == false`
+                // (debug/trace) keeps the compare as its own steppable op.
                 let fused = if fuse && !b.insts.is_empty() {
                     match ops.last() {
                         Some(Op::IntCmp {
@@ -2539,6 +2582,7 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
                             ty,
                             op,
                         }) if *dst == cond_slot
+                            && !read_forwarded[cond_slot as usize]
                             && !then_copies.pairs.iter().any(|(s, _)| *s == cond_slot)
                             && !else_copies.pairs.iter().any(|(s, _)| *s == cond_slot) =>
                         {
@@ -2648,7 +2692,6 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
 fn compile_inst(
     inst: &Inst,
     dst: u32,
-    block_base: u32,
     view: &ModuleView<'_>,
     g: &impl Fn(u32) -> u32,
 ) -> Option<Op> {
@@ -2862,36 +2905,24 @@ fn compile_inst(
         } => {
             use super::cap_id;
             match (*type_id, *op) {
-                // op 18 = wait: join's park, delivering how the child ended (`join_delivery`).
-                (cap_id::INSTANTIATOR, op @ (1 | 18)) if !args.is_empty() => Op::InstJoin {
+                // The ops below are served here, each delivering at `dst` the results its op's
+                // contract names (`temen_ir::served_contract`). A call declaring another shape, or an
+                // Instantiator op that isn't live, traps `CapFault`, as on every engine (#2066,
+                // #2361). Past this arm every served call has its op's arg prefix and results.
+                _ if !temen_ir::served_shape_ok(*type_id, *op, view.sig(*sig)) => Op::CapFault,
+                (cap_id::INSTANTIATOR, 1) => Op::InstJoin {
                     handle: g(*handle),
                     child: g(args[0]),
-                    dst,
-                    wait: op == 18,
-                },
-                // op 15 = instantiate_detached (#1286): (budget, module, grants_ptr, grants_n, entry,
-                // size_log2, quota[, args_ptr, args_len]) — the fresh-window spawn; the driver mints the
-                // window and seeds the payload. A `grants_n` of 0 is the grant-less form.
-                (cap_id::INSTANTIATOR, 15) if args.len() >= 7 => Op::InstantiateDetached {
-                    handle: g(*handle),
-                    budget: g(args[0]),
-                    module: g(args[1]),
-                    grants: Some((g(args[2]), g(args[3]))),
-                    entry: g(args[4]),
-                    size_log2: g(args[5]),
-                    quota: g(args[6]),
-                    args: (args.len() >= 9).then(|| (g(args[7]), g(args[8]))),
-                    premap: (args.len() >= 11).then(|| (g(args[9]), g(args[10]))),
                     dst,
                 },
                 // CONSOLIDATION.md §3d — instantiate_rec (op 17): the record pointer is the one
                 // arg; every other spawn parameter is data in the record, read at exec time.
-                (cap_id::INSTANTIATOR, 17) if !args.is_empty() => Op::InstantiateRec {
+                (cap_id::INSTANTIATOR, 17) => Op::InstantiateRec {
                     handle: g(*handle),
                     rec: g(args[0]),
                     dst,
                 },
-                (cap_id::INSTANTIATOR, op @ (9 | 10 | 12)) if !args.is_empty() => Op::ChildCtl {
+                (cap_id::INSTANTIATOR, op @ (9 | 10 | 12)) => Op::ChildCtl {
                     handle: g(*handle),
                     child: g(args[0]),
                     dst,
@@ -2905,7 +2936,7 @@ fn compile_inst(
                 // child's export; #2220 — grant (op 19): grant a capability into it. Both need the
                 // child's live env, so the op surfaces to the driver; the compile only marshals
                 // `(child, arg)`.
-                (cap_id::INSTANTIATOR, op @ (14 | 19)) if args.len() >= 2 => Op::ChildOffer {
+                (cap_id::INSTANTIATOR, op @ (14 | 19)) => Op::ChildOffer {
                     handle: g(*handle),
                     child: g(args[0]),
                     arg: g(args[1]),
@@ -2915,12 +2946,12 @@ fn compile_inst(
                 // §22 guest-driven JIT units: install/uninstall drive the dispatch table; compile /
                 // compile_linked (ops 0/5) are pure host ops, so they fall through to the generic
                 // dispatch below. `invoke` (op 1) is the next slice — reject it for now (fall back).
-                (cap_id::JIT, 3) if !args.is_empty() => Op::JitInstall {
+                (cap_id::JIT, 3) => Op::JitInstall {
                     handle: g(*handle),
                     code: g(args[0]),
                     dst,
                 },
-                (cap_id::JIT, 4) if !args.is_empty() => Op::JitUninstall {
+                (cap_id::JIT, 4) => Op::JitUninstall {
                     handle: g(*handle),
                     slot: g(args[0]),
                     dst,
@@ -2941,33 +2972,21 @@ fn compile_inst(
                         .into(),
                     results: view.sig(*sig).results.clone().into(),
                 },
-                // Every Instantiator op the oracle has no arm for traps `CapFault` there (#1867,
-                // #2069). A known op with too few args declines: the oracle's answer is `Malformed`.
-                (cap_id::INSTANTIATOR, op)
-                    if !matches!(op, 1 | 9 | 10 | 12 | 14 | 15 | 17 | 18 | 19) =>
-                {
-                    Op::CapFault
-                }
+                // A live op this lowering has no arm for declines to the oracle.
                 (cap_id::INSTANTIATOR, _) => return None,
                 (cap_id::SHARED_REGION, 4) => return None,
-                // §3.6 service points (I36 slice 1): `svc.poll` with the canonical one-result
-                // shape compiles to the native serve-loop-core op — the module-level veto in
-                // [`compile_module`] guarantees its handlers cannot park mid-dispatch, so the
-                // rewind linkage runs each one to completion (or trap). `svc.wait`'s
-                // empty-queue park needs a waker topology (cross-domain callers, timers) the
-                // cooperative scheduler doesn't host yet, and a no-result `svc.poll` would
-                // leave the op without its result-slot scratch — both still decline, falling
-                // the whole module back to the tree-walk oracle, which serves.
+                // §3.6 service points (I36 slice 1): `svc.poll` compiles to the native
+                // serve-loop-core op — the module-level veto in [`compile_module`] guarantees its
+                // handlers cannot park mid-dispatch, so the rewind linkage runs each one to
+                // completion (or trap). `svc.wait`'s empty-queue park needs a waker topology
+                // (cross-domain callers, timers) the cooperative scheduler doesn't host yet, so it
+                // declines, falling the whole module back to the tree-walk oracle, which serves.
                 // (The timed `svc.wait` form — op 10 with the optional timeout arg — is
                 // oracle-only and declines below; `serve_qualifies` already vetoed the module.)
-                (temen_ir::CAP_SELF_TYPE_ID, op @ (9 | 10))
-                    if view.sig(*sig).results.len() == 1 && args.is_empty() =>
-                {
-                    Op::SvcPoll {
-                        dst,
-                        wait: op == 10,
-                    }
-                }
+                (temen_ir::CAP_SELF_TYPE_ID, op @ (9 | 10)) if args.is_empty() => Op::SvcPoll {
+                    dst,
+                    wait: op == 10,
+                },
                 (temen_ir::CAP_SELF_TYPE_ID, 9 | 10) => return None,
                 // FORK.md §9.2 — `clone_caller` (op 11) / `reap` (op 12): compiled to the native fork
                 // ops (the module reached here only via the [`Seams::bytecode_serves_fork`] escape).
@@ -2975,12 +2994,10 @@ fn compile_inst(
                 (temen_ir::CAP_SELF_TYPE_ID, 11) => Op::CloneCaller {
                     args: args.iter().map(|a| g(*a)).collect(),
                     dst,
-                    has_result: !view.sig(*sig).results.is_empty(),
                 },
                 (temen_ir::CAP_SELF_TYPE_ID, 12) => Op::Reap {
                     pid: args.first().map(|a| g(*a)),
                     dst,
-                    has_result: !view.sig(*sig).results.is_empty(),
                 },
                 // CALLS.md §10.6 — `fuel.remaining` (op 13) reads the vCPU's live fuel counter, which
                 // the host-side `cap_dispatch_slots` can't see; rather than add a native bytecode op,
@@ -2994,7 +3011,7 @@ fn compile_inst(
                 // `-EINVAL` of a refused exec (a successful exec never returns to this activation).
                 // (The tree-walker folds this to `Step::Exec`; this tier does the replace natively so
                 // an exec-bearing module — bash — runs on the browser's bytecode engine.)
-                (temen_ir::CAP_SELF_TYPE_ID, 14) if args.len() >= 5 => Op::ExecModule {
+                (temen_ir::CAP_SELF_TYPE_ID, 14) => Op::ExecModule {
                     module: g(args[0]),
                     grants_ptr: g(args[1]),
                     grants_n: g(args[2]),
@@ -3002,9 +3019,6 @@ fn compile_inst(
                     size_log2: g(args[4]),
                     dst,
                 },
-                // A malformed `exec_module` (< 5 args) is outside the ABI — decline the module so it
-                // folds to the tree-walker rather than mis-lowering.
-                (temen_ir::CAP_SELF_TYPE_ID, 14) => return None,
                 // Generic synchronous powerbox dispatch (Stream/Clock/Memory/host-fn/JIT compile/…).
                 _ => Op::CapCall {
                     type_id: *type_id,
@@ -3186,13 +3200,17 @@ fn compile_inst(
         Inst::VcpuTlsGet => Op::VcpuTlsGet { dst },
         Inst::VcpuTlsSet { val } => Op::VcpuTlsSet { val: g(*val) },
         // Everything else is a pure value op or a no-result store that the reference `eval_inst`
-        // already implements (the SIMD/`v128`/fence long tail): delegate to it against this block's
-        // sub-window, reusing the exact semantics rather than re-inlining ~30 lane ops.
-        other => Op::Eval {
-            inst: Box::new(other.clone()),
-            block_base,
-            dst,
-        },
+        // already implements (the SIMD/`v128`/fence long tail): delegate to it against the frame,
+        // its operands the frame slots `g` gives, reusing the exact semantics rather than
+        // re-inlining ~30 lane ops.
+        other => {
+            let mut inst = other.clone();
+            inst.for_each_operand_mut(&mut |v| *v = g(*v));
+            Op::Eval {
+                inst: Box::new(inst),
+                dst,
+            }
+        }
     })
 }
 
@@ -3249,19 +3267,19 @@ pub fn compile_and_run_seeded_with_host(
     // Size the dispatch table to the granted `Jit` table reservation (matching the tree-walker's
     // `DomainTable::new(funcs, jit_table_log2)`), so guest-driven `install` returns the same slots.
     let dom = Domain::new(c, host.jit_table_log2());
-    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, init_mem);
+    let mut mem = Mem::root(m, default_reserved_log2(), None, init_mem);
     super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
     let r = run(dom, func, args, fuel, &mut mem, host);
     // #1714: the faulting address of a `MemoryFault`, in the same per-run slot the tree-walker's
     // run funnel fills (`last_capture_fault_addr`) — this path dropped the window with it, so an
-    // embedder of a plain run could not say *where* a segfault was. Cleared on any other outcome,
-    // so a later clean run never reports an earlier run's fault. The scheduler records the
-    // trap-origin task's address as it traps (#1720: a joined child's, not the joiner's window).
-    let origin = super::last_capture_fault_addr();
-    let fault = match &r {
-        Err(Trap::MemoryFault) => origin.or_else(|| mem.as_ref().and_then(|m| m.peek_fault_rel())),
+    // embedder of a plain run could not say *where* a segfault was. The scheduler records the
+    // trap-origin task's address as it traps, first-wins, as the tree-walker's capture does (#1720):
+    // a child's too, whose trap its parent's join answers (#2066), so a root that ends in the trap
+    // it was answered names the child's window, not its own. The slot was cleared at the start.
+    let fault = super::last_capture_fault_addr().or_else(|| match &r {
+        Err(Trap::MemoryFault) => mem.as_ref().and_then(|m| m.peek_fault_rel()),
         _ => None,
-    };
+    });
     super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = fault);
     Some(r)
 }
@@ -3297,8 +3315,13 @@ pub fn compile_and_run_with_host_traced(
         return Some((Err(Trap::Malformed), Vec::new(), None));
     }
     let dom = Domain::new(c, host.jit_table_log2());
-    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
-    let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
+    let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
+    let mut vm = match Vm::new(
+        &dom.source.primary(),
+        func as usize,
+        args,
+        Some(host.own_node()),
+    ) {
         Ok(v) => v,
         Err(e) => return Some((Err(e), Vec::new(), None)),
     };
@@ -3371,7 +3394,7 @@ fn vm_trap_bt(vm: &Vm, source: &ModuleSource, trap: &Trap) -> Vec<super::IrPc> {
     // Each suspended caller resumes at `call_pc + 1` (a call is an instruction, never a terminator),
     // so its call op sits at `resume_pc - 1`; report `inst + 1`, mirroring the tree-walker advancing a
     // caller's `inst` past the call before descending.
-    for &(module, prog, _base, resume_pc, _ret) in vm.stack.iter().rev() {
+    for &(module, prog, _base, resume_pc, ..) in vm.stack.iter().rev() {
         let call_pc = resume_pc.wrapping_sub(1);
         let Some(cm) = source.get(module) else {
             continue;
@@ -3408,7 +3431,7 @@ pub fn compile_and_run_capture(
     }
     let mut host = Host::new();
     let dom = Domain::new(c, host.jit_table_log2());
-    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, init_mem);
+    let mut mem = Mem::root(m, default_reserved_log2(), None, init_mem);
     let r = run(dom, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
@@ -3442,7 +3465,7 @@ pub fn compile_and_run_capture_over(
     let dom = Domain::new(c, host.jit_table_log2());
     let mut mem = Mem::root(
         m,
-        DEFAULT_RESERVED_LOG2,
+        default_reserved_log2(),
         Some(std::sync::Arc::clone(&back)),
         init_mem,
     );
@@ -3483,7 +3506,7 @@ pub fn compile_and_run_over_shared_with_host(
     // every call, as the cached form does; only the data waits for `seed_data`.
     let mut mem = m.memory.map(|mc| {
         Mem::from_spec(WindowSpec {
-            reserved_log2: DEFAULT_RESERVED_LOG2,
+            reserved_log2: default_reserved_log2(),
             mapped_log2: mc.size_log2,
             shadow: mc.shadow,
             back: Some(back),
@@ -3547,7 +3570,7 @@ impl SharedProgram {
             back,
             host,
             seed_data,
-            DEFAULT_RESERVED_LOG2,
+            default_reserved_log2(),
             None,
         )
         .0
@@ -3796,7 +3819,7 @@ pub fn compile_and_run_capture_over_parallel_with_host(
     // `ParkEvent`s through it (the same wiring the cooperative entries install); without it the ops
     // degrade to `-ENOSYS`/the ECHILD poll and the `ForkSelf`/`ReapWait` rules never apply.
     host.wire_park_door();
-    let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, back, init_mem);
+    let mem = Mem::root(m, default_reserved_log2(), back, init_mem);
     let (r, mem) = drive_threads(dom, func, args, fuel, mem, host);
     let snap = mem
         .as_ref()
@@ -3823,9 +3846,6 @@ pub struct VcpuProgram {
     mem_size_log2: Option<u8>,
     /// The module compiled — see [`module`](VcpuProgram::module).
     module: std::sync::Arc<Module>,
-    /// The run's fiber registry (#1761) — run-level state, like `dom`'s §22 install slots: see
-    /// [`fibers`](VcpuProgram::fibers).
-    fibers: SharedFibers,
     /// The next dense vCPU id a `thread.spawn` hands out (root = 0), in spawn order across the run —
     /// see [`VcpuEvent::Spawn`]'s `vcpu`.
     next_vcpu: std::sync::atomic::AtomicU64,
@@ -3852,13 +3872,12 @@ impl VcpuProgram {
             dom,
             mem_size_log2: m.memory.as_ref().map(|mc| mc.size_log2),
             module: std::sync::Arc::new(m.clone()),
-            fibers: SharedFibers::new(),
             next_vcpu: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
     /// The module this program was compiled from: the running module a host registers
-    /// ([`Host::set_self_module`]), so a spawn record's `module = -1` names it.
+    /// ([`Host::set_self_module`]).
     pub fn module(&self) -> &std::sync::Arc<Module> {
         &self.module
     }
@@ -3867,20 +3886,6 @@ impl VcpuProgram {
     fn take_vcpu_id(&self) -> u64 {
         self.next_vcpu
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// The run's **shared fiber registry** (#1761), for [`Vcpu::with_shared_fibers`]: an embedder
-    /// that drives one run's vCPUs on separate threads or Workers (the browser's Worker driver)
-    /// attaches it to the root and every `thread.spawn` child, so a fiber migrates between them.
-    /// Like the domain's §22 install slots it is state of the run this program drives — compile a
-    /// fresh program per run.
-    pub fn fibers(&self) -> &SharedFibers {
-        &self.fibers
-    }
-
-    /// Number of functions (a `thread.spawn` target is bounds-checked against this).
-    pub fn func_count(&self) -> usize {
-        self.dom.source.primary().progs.len()
     }
 }
 
@@ -3927,7 +3932,7 @@ impl Reactor {
         Some(Reactor {
             source: std::sync::Arc::new(ModuleSource::new(c)),
             n_funcs,
-            mem: Mem::root(m, DEFAULT_RESERVED_LOG2, back, &[]),
+            mem: Mem::root(m, default_reserved_log2(), back, &[]),
         })
     }
 
@@ -3984,10 +3989,21 @@ impl Reactor {
     }
 
     /// Capture the live window as a [`MemLayout`] — the memory half of a **moment** (a reactor
-    /// keyframe: time travel, a save-state, a branch point). See [`VcpuReactor::window_layout`] for
-    /// why a reactor moment needs no continuation; the two reactors delegate to the one capture.
+    /// keyframe: time travel, a save-state, a branch point).
+    ///
+    /// A reactor moment needs **no continuation**. `tick` returns to the host every frame, so between
+    /// frames there is no guest stack to capture, no shadow stack to unwind, and no handle table to
+    /// serialize: the window — plus whatever host-side capability state the embedder holds alongside
+    /// it — *is* the state. That is why this costs one image copy and no `temen-durable`
+    /// instrumentation, unlike a freeze at an arbitrary safepoint (DURABILITY.md §2).
+    ///
+    /// A page that aliases a §13 `SharedRegion` is captured as the region it names (#2051): a §12
+    /// save-state carries the region and re-aliases it, and a moment, which cannot, refuses such a
+    /// layout ([`Moment::capture`]). `None` for a memory-less module.
+    ///
+    /// [`Moment::capture`]: crate::moment::Moment::capture
     pub fn window_layout(&self) -> Option<MemLayout> {
-        window_layout_of(self.mem.as_ref())
+        Some(self.mem.as_ref()?.layout_snapshot())
     }
 
     /// Reinstate a [`window_layout`](Self::window_layout) capture into the live window, its §13 pages
@@ -3997,30 +4013,16 @@ impl Reactor {
         restore_window_of(self.mem.as_mut(), layout, host)
     }
 
-    /// This window's reservation as a log2 — see [`window_reserved_log2_of`].
+    /// This window's **reservation** as a log2 — the mask domain the guest grew within, which a §12
+    /// artifact records alongside the committed image so a thaw restores a window that can grow as far
+    /// again. `None` for a memory-less module.
     pub fn window_reserved_log2(&self) -> Option<u8> {
-        window_reserved_log2_of(self.mem.as_ref())
+        let (_, _, reserved, _) = self.mem.as_ref()?.map_info();
+        Some(reserved.trailing_zeros() as u8)
     }
 }
 
-/// Capture a reactor's window, or `None` for a memory-less module. A page that aliases a §13
-/// `SharedRegion` is captured as the region it names (#2051): a §12 save-state carries the region and
-/// re-aliases it, and a moment, which cannot, refuses such a layout ([`Moment::capture`]).
-///
-/// [`Moment::capture`]: crate::moment::Moment::capture
-fn window_layout_of(mem: Option<&Mem>) -> Option<MemLayout> {
-    Some(mem?.layout_snapshot())
-}
-
-/// A reactor window's **reservation** as a log2 — the mask domain the guest grew within, which a §12
-/// artifact records alongside the committed image so a thaw restores a window that can grow as far
-/// again. `None` for a memory-less module.
-fn window_reserved_log2_of(mem: Option<&Mem>) -> Option<u8> {
-    let (_, _, reserved, _) = mem?.map_info();
-    Some(reserved.trailing_zeros() as u8)
-}
-
-/// Reinstate `layout` into a reactor's live window (the write half of [`window_layout_of`]), each §13
+/// Reinstate `layout` into a live window (the write half of [`Reactor::window_layout`]), each §13
 /// page aliased back onto the region of `host` it names — the thaw of a save-state, whose restore
 /// rebuilt the regions on `host` (#2051). `false` with no window, or for a page naming no region of
 /// `host`.
@@ -4028,196 +4030,9 @@ fn restore_window_of(mem: Option<&mut Mem>, layout: &MemLayout, host: &Host) -> 
     match mem {
         Some(m) => {
             m.restore_layout(layout);
-            host.realias_regions(m, &layout.dense_prots())
+            host.realias_regions(m, layout.page_map())
         }
         None => false,
-    }
-}
-
-/// A persistent single-vCPU reactor driven through the **resumable [`Vcpu`]** — the vehicle the
-/// browser wasm-JIT **tier-up** rides (BROWSER.md § "wasm-JIT tier"). Like [`Reactor`], it keeps the
-/// guest window live across frames (globals, BSS, and the `vm_map`-grown heap, with its address-space
-/// commit state), but each frame runs on a `Vcpu` instead of the one-shot [`run`]: a direct `Call` to
-/// a [`with_jit_eligible`](Vcpu::with_jit_eligible) function surfaces as a [`VcpuEvent::TierUp`] the
-/// caller services (the browser runs the emitted `f{func}` on the raw window; a native driver runs the
-/// callee on the interpreter) instead of interpreting it. With no eligibility set it is a faithful,
-/// interpreter-only substitute for [`Reactor`] — the differential the reactor tests assert.
-///
-/// The window lives in the caller-provided `back` [`Region`] (a `Region::shared` over the host's
-/// linear memory in the browser; a leaked buffer natively), sized to hold the guest's grown heap. The
-/// `Host` is shared (a `Mutex<Host>`) so its capabilities — `display`/`keyboard`/`fs`, stdout —
-/// persist across frames and are serviced inline during each frame's `call.cap`s.
-pub struct VcpuReactor {
-    prog: VcpuProgram,
-    /// The live window, carried across per-frame vCPUs via [`Vcpu::take_mem`]. `None` only for a
-    /// memory-less module.
-    mem: Option<Mem>,
-    /// The tier-up eligibility bitmap (`None` ⇒ everything interprets — the pure-substitute mode).
-    eligible: Option<std::sync::Arc<[bool]>>,
-    /// #750 **paged tier-up**: the eligible set was emitted with the software page-check
-    /// (`compile_module_tierup_paged`). Frames then surface tier-up regardless of the window's
-    /// scalar representability, and each `TierUp` hands `service` the live [`MemMapInfo`] to build
-    /// its page-state table from ([`build_pagestate_table`]).
-    page_checked: bool,
-}
-
-impl VcpuReactor {
-    /// Open over the persistent window `back`: compile `m`, then run `_start` (func 0) once over a
-    /// freshly seeded + data-initialised window to bootstrap the guest, keeping the window live for
-    /// the per-frame [`frame`](VcpuReactor::frame) calls. `call.cap`s in `_start` (e.g. Doom's WAD
-    /// read through `fs`) are serviced inline against `host`. `Err` if `m` is outside the engine's
-    /// subset (`Malformed`) or `_start` traps.
-    pub fn open(
-        m: &Module,
-        back: std::sync::Arc<super::Region>,
-        host: &std::sync::Mutex<Host>,
-        start_args: &[Value],
-    ) -> Result<VcpuReactor, Trap> {
-        let prog = VcpuProgram::compile(m).ok_or(Trap::Malformed)?;
-        let mem;
-        {
-            let mut vcpu = Vcpu::new_root(&prog, 0, start_args, back, &[])?.with_shared_host(host);
-            // `_start` runs to completion in one `run`: `call.cap`s are serviced inline (shared host),
-            // and a reactor is single-vCPU with no tier-up during open — so no spawn/join/wait/JIT/
-            // tier-up event can occur (a `thread.spawn`ing guest is out of scope).
-            match vcpu.run() {
-                VcpuEvent::Done(_) => {}
-                VcpuEvent::Trapped(t) => return Err(t),
-                // Out of a reactor's scope, named rather than `_` (see `VcpuEvent`): a `_start` that
-                // spawns, joins, waits, JITs, tiers up, parks on a cap or on stdin is not a reactor.
-                VcpuEvent::TierUp { .. }
-                | VcpuEvent::Spawn { .. }
-                | VcpuEvent::Join { .. }
-                | VcpuEvent::Wait { .. }
-                | VcpuEvent::Notify { .. }
-                | VcpuEvent::JitInstall { .. }
-                | VcpuEvent::JitUninstall { .. }
-                | VcpuEvent::JitInvoke { .. }
-                | VcpuEvent::InstantiateDetached { .. }
-                | VcpuEvent::CapPending { .. }
-                | VcpuEvent::StdinPark => return Err(Trap::Malformed),
-            }
-            mem = vcpu.take_mem();
-        }
-        Ok(VcpuReactor {
-            prog,
-            mem,
-            eligible: None,
-            page_checked: false,
-        })
-    }
-
-    /// Enable wasm-JIT tier-up: a direct `Call` to a function `f` with `eligible[f] == true` surfaces
-    /// as [`VcpuEvent::TierUp`] for the `frame` caller to service. `None` (the default) interprets
-    /// everything — the faithful [`Reactor`] substitute.
-    pub fn with_jit_eligible(mut self, eligible: std::sync::Arc<[bool]>) -> VcpuReactor {
-        self.eligible = Some(eligible);
-        self
-    }
-
-    /// #750 paged tier-up: mark the eligible set as page-checked (see [`Vcpu::with_jit_page_checked`]).
-    /// Each frame's `TierUp` then carries the live [`MemMapInfo`] to `service` so the driver can
-    /// refresh its page-state table ([`build_pagestate_table`]) before running emitted code.
-    pub fn with_jit_page_checked(mut self) -> VcpuReactor {
-        self.page_checked = true;
-        self
-    }
-
-    /// Run `func(args)` on the live window for one frame, servicing host caps inline against `host`.
-    /// A [`VcpuEvent::TierUp`] is handed to `service(func, argv, mapped, map_info)` — return the
-    /// callee's i64 result slots (or an `Err(Trap)` to propagate the emitted region's trap).
-    /// `mapped` is the window's scalar committed extent at call entry: `service` MUST write it to
-    /// the emitted module's `"mapped"` global before invoking `f{func}` (#717 host sync).
-    /// `map_info` is `Some` only on a [`with_jit_page_checked`](Self::with_jit_page_checked)
-    /// reactor: the live page map, from which `service` builds its page-state table
-    /// ([`build_pagestate_table`]) and writes the returned coverage to `"mapped"` **instead** of
-    /// the event's value (#750). With no eligibility set, `service` is never called. The window
-    /// persists after the call (reclaimed for the next frame).
-    pub fn frame<F>(
-        &mut self,
-        func: FuncIdx,
-        args: &[Value],
-        host: &std::sync::Mutex<Host>,
-        mut service: F,
-    ) -> Result<Vec<Value>, Trap>
-    where
-        F: FnMut(u32, &[i64], u64, Option<MemMapInfo>) -> Result<Vec<i64>, Trap>,
-    {
-        let mem = self.mem.take();
-        let result;
-        let reclaimed;
-        {
-            let mut vcpu =
-                Vcpu::with_mem(&self.prog, func, args, mem, Host::new())?.with_shared_host(host);
-            if let Some(e) = &self.eligible {
-                vcpu = vcpu.with_jit_eligible(e.clone());
-            }
-            if self.page_checked {
-                vcpu = vcpu.with_jit_page_checked();
-            }
-            result = loop {
-                match vcpu.run() {
-                    VcpuEvent::Done(v) => break Ok(v),
-                    VcpuEvent::Trapped(t) => break Err(t),
-                    VcpuEvent::TierUp { func, argv, mapped } => {
-                        // Paged reactors snapshot the live page map for the driver's table build;
-                        // computed only here (page state is frozen while emitted code runs).
-                        let info = if self.page_checked {
-                            vcpu.mem_map_info()
-                        } else {
-                            None
-                        };
-                        match service(func, &argv, mapped, info) {
-                            Ok(vals) => vcpu.deliver_tierup(&vals),
-                            Err(t) => vcpu.deliver_tierup_trap(t),
-                        }
-                    }
-                    // A reactor frame is one vCPU over one window, serviced only for tier-up: it
-                    // runs no threads or futex waits, spawns no §14 children, hosts no §22 guest
-                    // JIT, and has no embedder to complete a host call or feed a blocking stdin.
-                    VcpuEvent::Spawn { .. }
-                    | VcpuEvent::Join { .. }
-                    | VcpuEvent::Wait { .. }
-                    | VcpuEvent::Notify { .. }
-                    | VcpuEvent::InstantiateDetached { .. }
-                    | VcpuEvent::JitInstall { .. }
-                    | VcpuEvent::JitUninstall { .. }
-                    | VcpuEvent::JitInvoke { .. }
-                    | VcpuEvent::CapPending { .. }
-                    | VcpuEvent::StdinPark => break Err(Trap::Malformed),
-                }
-            };
-            reclaimed = vcpu.take_mem();
-        }
-        self.mem = reclaimed;
-        result
-    }
-
-    /// Capture the live window as a [`MemLayout`] — the memory half of a **moment** (a reactor
-    /// keyframe: time travel, a save-state, a branch point).
-    ///
-    /// A reactor moment needs **no continuation**. `tick` returns to the host every frame, so between
-    /// frames there is no guest stack to capture, no shadow stack to unwind, and no handle table to
-    /// serialize: the window — plus whatever host-side capability state the embedder holds alongside
-    /// it — *is* the state. That is why this costs one image copy and no `temen-durable`
-    /// instrumentation, unlike a freeze at an arbitrary safepoint (DURABILITY.md §2).
-    ///
-    /// `None` when there is nothing faithfully capturable — see [`window_layout_of`].
-    pub fn window_layout(&self) -> Option<MemLayout> {
-        window_layout_of(self.mem.as_ref())
-    }
-
-    /// Reinstate a [`window_layout`](Self::window_layout) capture into the live window — the window
-    /// this reactor keeps across frames, so the next `frame` runs over the restored state — its §13
-    /// pages aliased back onto the regions `host` holds. `false` for a memory-less module (nothing to
-    /// restore into), or a page naming no region of `host`.
-    pub fn restore_window(&mut self, layout: &MemLayout, host: &Host) -> bool {
-        restore_window_of(self.mem.as_mut(), layout, host)
-    }
-
-    /// This window's reservation as a log2 — see [`window_reserved_log2_of`].
-    pub fn window_reserved_log2(&self) -> Option<u8> {
-        window_reserved_log2_of(self.mem.as_ref())
     }
 }
 
@@ -4233,21 +4048,8 @@ impl VcpuReactor {
 pub enum VcpuEvent {
     /// The vCPU finished with these results.
     Done(Vec<Value>),
-    /// The vCPU trapped (a child-join trap propagates here too).
+    /// The vCPU trapped (a joined thread's trap propagates here too; a §14 child's, its join answers).
     Trapped(Trap),
-    /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): the interpreter reached a direct `Call`
-    /// to the eligible function `func` (see [`Vcpu::with_jit_eligible`]). The host runs the emitted
-    /// `f{func}(win, env, ...argv)` region on its Worker — a **top-level** call, so a guest trap is a
-    /// catchable `RuntimeError` and never corrupts the engine — then calls [`Vcpu::deliver_tierup`]
-    /// with the results, or [`Vcpu::deliver_tierup_trap`] if the region trapped. `argv` is the
-    /// marshalled arguments as raw i64 slots (the host reads them per `func`'s signature).
-    TierUp {
-        func: u32,
-        argv: Box<[i64]>,
-        /// The window's scalar committed extent at call entry ([`Mem::scalar_extent`]) — write it to
-        /// the emitted module's `"mapped"` global before invoking `f{func}` (#717 host sync).
-        mapped: u64,
-    },
     /// `thread.spawn`: start `func(sp, arg)` as a new vCPU, then call [`Vcpu::deliver_child`] with the
     /// host's token for it (the engine issues the handle the guest `join`s it by).
     /// `module` is the spawning frame's module (0 for plain guests; an installed §22 unit's index
@@ -4294,7 +4096,7 @@ pub enum VcpuEvent {
     /// A **codegen** host runs the unit on emitted wasm instead ([`Vcpu::deliver_jit_invoke_vals`]).
     /// `mapped` is the window's scalar committed extent at the invoke ([`Mem::scalar_extent`]):
     /// `Some(H)` MUST be written to the emitted unit's `"mapped"` global before running it (#717
-    /// host sync — same contract as [`VcpuEvent::TierUp`]); `None` means the window state is not
+    /// host sync); `None` means the window state is not
     /// representable by the single bound, so the host must **decline** emitted execution for this
     /// invoke and use the interpreted delivery — fail-closed, the interpreter honors the full page
     /// map. `Some(0)` for a memory-less module (nothing to bound).
@@ -4306,8 +4108,7 @@ pub enum VcpuEvent {
         results: Box<[ValType]>,
         mapped: Option<u64>,
     },
-    /// §5 `Instantiator.instantiate_detached` (op 15, #1286) or a §3d record (op 17; THREADS.md
-    /// 4c-domain §14-D2): start a child in a **fresh window the host mints** — nothing of it in the
+    /// §5 `Instantiator.instantiate_rec` (op 17, #1286; THREADS.md 4c-domain §14-D2): start a child in a **fresh window the host mints** — nothing of it in the
     /// parent's window. The engine already admitted it with the one admission every driver uses
     /// ([`admit_detached_child`]): the entry, the window = the declared memory, the `Budget` quota;
     /// its powerbox built (the starter caps span the reservation, as a root's do, so `vm_map` grows
@@ -4323,13 +4124,13 @@ pub enum VcpuEvent {
         /// The child's window: its module's declared memory, `1 << size_log2` bytes at start.
         size_log2: u8,
     },
-    /// #1366 — a **host-completed cap call** ([`crate::OffloadOutcome::Host`]): the guest's
-    /// `call.cap` punted to the embedder, which will supply the scalar asynchronously. The vCPU is
-    /// parked on it; the host services the request it recorded under `id` (in its submit hook),
-    /// then calls [`Vcpu::deliver_cap`]`(id, value)` and [`run`](Vcpu::run) again. The guest saw a
-    /// plain synchronous call. `dst` is the awaiting result slot (informational — `deliver_cap`
-    /// writes it). The single-threaded-embedder twin of the pool's inline wait; the
-    /// `StdinPark`/`push_stdin` shape generalized to any cap.
+    /// #1366 — a **host-answered cap call** ([`crate::OffloadOutcome::Host`]): the guest's
+    /// `call.cap` punted to the embedder, which answers it later. The vCPU is parked on it; the
+    /// host answers the request it recorded under `id` (in its submit hook) with the call's
+    /// [`crate::Completer`] and calls [`run`](Vcpu::run) again, which goes on once it has answered
+    /// (surfacing this again until then). The guest saw a plain synchronous call. `dst` is the
+    /// awaiting result slot (informational). The single-threaded-embedder twin of the pool's
+    /// inline wait; the `StdinPark`/`push_stdin` shape generalized to any cap.
     CapPending { id: u64, dst: u32 },
     /// **Blocking stdin park** (a persistent interactive session): the guest `read` a `Stream{In}` cap
     /// whose buffer is exhausted, under [`Host::set_stdin_blocking`]. The read did **not** complete
@@ -4397,48 +4198,20 @@ pub struct Vcpu<'p> {
     /// (stream writes, clock) works from every vCPU of the run. `None` ⇒ the owned (default deny-all)
     /// host, as before.
     shared_host: Option<&'p std::sync::Mutex<Host>>,
-    /// The run's **shared fiber registry** (#1761, see [`with_shared_fibers`](Vcpu::with_shared_fibers)):
-    /// when set, `cont.*` go through it instead of this vCPU's own `fibers`, so a fiber created on one
-    /// vCPU of the run can be resumed on another. `None` ⇒ the owned tables, as before.
-    shared_fibers: Option<&'p SharedFibers>,
     /// A §14 **confined child**'s own domain (its natural table over the shared source — no parent
     /// §22 install slots); `None` for a root / `thread.spawn` child, which dispatch through
     /// [`VcpuProgram::dom`]'s table (`prog.dom`). The `source` `Arc` is the same either way.
     own_dom: Option<Domain>,
     /// The dst register awaiting a `deliver_*` after a host-serviced event.
     pending: Option<u32>,
+    /// #2495 — the host-answered call the vCPU is parked on ([`VcpuEvent::CapPending`]): its id and
+    /// the dst its answer lands in, once the embedder's [`crate::Completer`] has answered it.
+    cap_wait: Option<(u64, u32)>,
     /// A §22 JIT op awaiting its `deliver_jit_*` (carries the op's dst + parameters across the
     /// host round-trip). Distinct from `pending` because the reply payload is richer than one register.
     pending_jit: Option<PendingJit>,
-    /// #846 — the **emitted-invoke** fiber registry: while a codegen host services a
-    /// [`VcpuEvent::JitInvoke`] on emitted wasm, each cross-tier callback it bounces back here
-    /// ([`bounce_call`](Vcpu::bounce_call)) shares this registry, so a fiber parked by one callback
-    /// is resumable by a later one — the same one-registry-per-invoke scope the interpreted
-    /// `run_invoke` has by construction. Cleared when the invoke resolves (`deliver_jit_invoke_*`).
-    invoke_fibers: FiberTables,
-    /// The entry's initial arguments as the constructor built them — a §14 confined child's starter
-    /// cap handles (`[Instantiator, AddressSpace?]`, widened to `i64`), so a host that runs the
-    /// child's entry on emitted wasm (the browser's codegen path) passes exactly the handles the
-    /// interpreter would, and a bounced leaf's `call.cap` resolves them on this vCPU. Empty on the
-    /// other constructors.
-    entry_args: Vec<Value>,
-    /// A trap to surface on the next `run` (a joined child trap propagates to the joiner).
+    /// A trap to surface on the next `run` (a joined thread's trap propagates to the joiner).
     trap: Option<Trap>,
-    /// **wasm-JIT tier-up eligibility** (browser wasm-JIT threads slice). When set, `jit_eligible[f]`
-    /// means function `f`'s whole reachable region is JIT-compilable and suspension-free, so a direct
-    /// `Call` to it is surfaced as a [`VcpuEvent::TierUp`] — the host runs the emitted `f{f}` on the
-    /// Worker (top-level caller, so a guest trap is a catchable `RuntimeError`) and delivers the
-    /// result back via [`deliver_tierup`](Vcpu::deliver_tierup). `None` ⇒ everything interprets, as
-    /// before this seam existed. The engine stays wasm-agnostic: it consults only this bitmap; the
-    /// embedder computes it (e.g. from `temen_wasm_jit::analyze`).
-    jit_eligible: Option<std::sync::Arc<[bool]>>,
-    /// #750 paged tier-up: see the `Vm` field of the same name; mirrored here for the `JitInvoke`
-    /// surfacing (which reads the Vcpu, not the Vm).
-    jit_page_checked: bool,
-    /// A tier-up call awaiting its [`deliver_tierup`](Vcpu::deliver_tierup): the caller-frame-relative
-    /// dst slot the emitted region's results land in, and their types (to re-tag the delivered raw
-    /// slots — the caller's window base is the one the spill persisted).
-    pending_tierup: Option<(usize, Box<[ValType]>)>,
     /// The child the last [`VcpuEvent::InstantiateDetached`] announced — admitted, and waiting for
     /// the host to take it ([`take_child`](Self::take_child)).
     pending_child: Option<PendingChild>,
@@ -4457,8 +4230,9 @@ pub struct Vcpu<'p> {
     /// The child whose join is in flight, whose charges go back on
     /// [`deliver_join`](Self::deliver_join).
     joining: Option<VcpuChild>,
-    /// The slot of the child a `wait` (op 18) has in flight, where a child that returned goes back.
-    join_wait: Option<usize>,
+    /// Whether the join in flight is a §14 child's (`Instantiator.join`), which answers how the child
+    /// ended ([`super::join_delivery`]), rather than a `thread.join`.
+    join_status: bool,
 }
 
 /// A child in a [`Vcpu`]'s table: the host's token for it, a detached child's window lease, and a
@@ -4469,11 +4243,9 @@ struct VcpuChild {
     token: u64,
     lease: Option<Lease>,
     live: LiveVcpu,
-    /// The outcome a `wait` (op 18) received for this child, which returned: its `join` takes it.
-    ended: Option<Result<Vec<Value>, Trap>>,
 }
 
-/// A child that a [`VcpuEvent::InstantiateDetached`] (§5, ops 15 and 17) announced, as the engine
+/// A child that a [`VcpuEvent::InstantiateDetached`] (§5, op 17) announced, as the engine
 /// admitted it. The one admission every driver uses ([`admit_detached_child`]) built its powerbox — the starter
 /// `Instantiator`/`AddressSpace`, the by-name re-grants, the module it serves and its import
 /// manifest, a funding budget's channel ceiling, a pre-mapped region — charged its budget, and landed
@@ -4485,7 +4257,6 @@ struct VcpuChild {
 pub struct PendingChild {
     host: Host,
     module: u32,
-    entry: u32,
     args: Vec<Value>,
     fuel: Fuel,
     /// Its fresh window (§5), seeded when it is built.
@@ -4498,10 +4269,11 @@ const _: fn() = || {
 };
 
 impl PendingChild {
-    /// The module the child runs, as its spawner's program source numbers it, and its entry — what
-    /// a host that runs the child on an emitted tier checks its emit against.
-    pub fn module_entry(&self) -> (u32, u32) {
-        (self.module, self.entry)
+    /// The module the child runs, as its spawner's program source numbers it — what a host that
+    /// runs the child on an emitted tier checks its emit against. The child starts at its function
+    /// 0 (#2219).
+    pub fn module(&self) -> u32 {
+        self.module
     }
 
     /// The module the child's program is (its powerbox's running module) — how a host that emitted
@@ -4519,15 +4291,7 @@ impl PendingChild {
         back: std::sync::Arc<super::Region>,
     ) -> Result<Vcpu<'_>, Trap> {
         let mem = self.window.build(Some(back), &mut self.host)?;
-        Vcpu::child_over(
-            prog,
-            self.module,
-            self.entry,
-            mem,
-            self.fuel,
-            self.host,
-            self.args,
-        )
+        Vcpu::child_over(prog, self.module, mem, self.fuel, self.host, self.args)
     }
 
     /// The child's powerbox and its entry's starter handles — its `Instantiator` and `AddressSpace`,
@@ -4561,15 +4325,16 @@ impl<'p> Vcpu<'p> {
         back: std::sync::Arc<super::Region>,
         init_mem: &[u8],
     ) -> Result<Vcpu<'p>, Trap> {
-        let mem = Mem::root(&prog.module, DEFAULT_RESERVED_LOG2, Some(back), init_mem);
+        let mem = Mem::root(&prog.module, default_reserved_log2(), Some(back), init_mem);
         Vcpu::with_mem(prog, func, args, mem, Host::new())
     }
 
     /// Like [`new_root`](Vcpu::new_root), but the vCPU carries a **powerbox** (its own `Host`) instead
     /// of the deny-all default — the seam §14 needs (THREADS.md 4c-domain §14-D). Unlike §22 JIT
     /// (whose ops hand the raw cap handle to the host to resolve), §14 resolves its `Instantiator`
-    /// authority **in-Vm** during `resume`, so the grant must live in this vCPU's own host; with it,
-    /// `spawn_coroutine_module` is then serviced entirely inside [`run`](Vcpu::run) (no host event).
+    /// authority **in-Vm**, so the grant must live in this vCPU's own host: the engine admits a spawn
+    /// against it and hands the host only the admitted child to run
+    /// ([`VcpuEvent::InstantiateDetached`]).
     /// Grant only the non-I/O caps (`Instantiator`/`Module`) — the resumable path still has no host
     /// I/O, so an I/O `call.cap` remains an inert `CapFault`.
     pub fn new_root_with_powerbox(
@@ -4580,7 +4345,7 @@ impl<'p> Vcpu<'p> {
         init_mem: &[u8],
         host: Host,
     ) -> Result<Vcpu<'p>, Trap> {
-        let mem = Mem::root(&prog.module, DEFAULT_RESERVED_LOG2, Some(back), init_mem);
+        let mem = Mem::root(&prog.module, default_reserved_log2(), Some(back), init_mem);
         Vcpu::with_mem(prog, func, args, mem, host)
     }
 
@@ -4590,7 +4355,7 @@ impl<'p> Vcpu<'p> {
     /// persistent-backend seam: a single owned-host vCPU that grows its heap into the `reserved_log2`
     /// tail and stays alive across [`run`](Vcpu::run) parks, so blocking stdin
     /// ([`set_stdin_blocking`](Vcpu::set_stdin_blocking)) can suspend it between queries. Uses the same
-    /// `DEFAULT_RESERVED_LOG2`-scale window a one-shot `--single` boot uses; pass that.
+    /// [`default_reserved_log2`] window a one-shot `--single` boot uses; pass that.
     pub fn new_root_reserved_with_powerbox(
         prog: &'p VcpuProgram,
         func: u32,
@@ -4650,8 +4415,8 @@ impl<'p> Vcpu<'p> {
     }
 
     /// [`new_child_in`] with the window mask chosen by the caller: a thread shares its **spawner's**
-    /// window, which for a §14 confined spawner is its carve — smaller than the guest module's
-    /// declared memory — so the driver passes the actual window's `size_log2` (CONSOLIDATION.md §11).
+    /// window, which a §14 spawn may size past the guest module's declared memory, so the driver
+    /// passes the actual window's `size_log2` (CONSOLIDATION.md §11).
     pub fn new_child_sized(
         prog: &'p VcpuProgram,
         module: u32,
@@ -4676,7 +4441,7 @@ impl<'p> Vcpu<'p> {
         // data: the window is already live with the root's image.
         let mem = size_log2.map(|sl| {
             Mem::from_spec(WindowSpec {
-                reserved_log2: DEFAULT_RESERVED_LOG2,
+                reserved_log2: default_reserved_log2(),
                 mapped_log2: sl,
                 shadow: prog.dom.source.get(module as usize).and_then(|c| c.shadow),
                 back: Some(back),
@@ -4713,7 +4478,13 @@ impl<'p> Vcpu<'p> {
             .source
             .get(module as usize)
             .ok_or(Trap::Malformed)?;
-        let vt = entry_task(&cm, module as usize, func as usize, args)?;
+        let vt = entry_task(
+            &cm,
+            module as usize,
+            func as usize,
+            args,
+            Some(host.own_node()),
+        )?;
         Ok(Vcpu {
             vt,
             fibers: Vec::new(),
@@ -4726,24 +4497,19 @@ impl<'p> Vcpu<'p> {
             fuel: Fuel::fixed(u64::MAX),
             host,
             shared_host: None,
-            shared_fibers: None,
             own_dom: None,
             prog,
             pending: None,
+            cap_wait: None,
             pending_jit: None,
-            invoke_fibers: FiberTables::default(),
-            entry_args: Vec::new(),
             trap: None,
-            jit_eligible: None,
-            jit_page_checked: false,
-            pending_tierup: None,
             pending_child: None,
             children: Vec::new(),
             pending_lease: None,
             pending_live: LiveVcpu::none(),
             opens: None,
             joining: None,
-            join_wait: None,
+            join_status: false,
         })
     }
 
@@ -4753,7 +4519,6 @@ impl<'p> Vcpu<'p> {
     fn child_over(
         prog: &'p VcpuProgram,
         module: u32,
-        entry: u32,
         mem: Mem,
         fuel: Fuel,
         host: Host,
@@ -4767,9 +4532,9 @@ impl<'p> Vcpu<'p> {
         let (vt, table) = child_task(
             module,
             &cunit,
-            i64::from(entry),
             &args,
             host.jit_table_log2(),
+            Some(host.own_node()),
         )?;
         let own_dom = Domain::child(std::sync::Arc::clone(&prog.dom.source), table);
         Ok(Vcpu {
@@ -4781,24 +4546,19 @@ impl<'p> Vcpu<'p> {
             fuel,
             host,
             shared_host: None,
-            shared_fibers: None,
             own_dom: Some(own_dom),
             prog,
             pending: None,
+            cap_wait: None,
             pending_jit: None,
-            invoke_fibers: FiberTables::default(),
-            entry_args: args,
             trap: None,
-            jit_eligible: None,
-            jit_page_checked: false,
-            pending_tierup: None,
             pending_child: None,
             children: Vec::new(),
             pending_lease: None,
             pending_live: LiveVcpu::none(),
             opens: None,
             joining: None,
-            join_wait: None,
+            join_status: false,
         })
     }
 
@@ -4813,56 +4573,10 @@ impl<'p> Vcpu<'p> {
         self
     }
 
-    /// Set how many vCPUs the driver running this one can run at once ([`Host::set_workers`]) on the
-    /// host its `call.cap`s go through: the shared powerbox when it has one, else its own. The
-    /// browser's per-Worker driver gives each vCPU its own Worker, so it passes the page's core count.
-    pub fn with_workers(mut self, n: usize) -> Vcpu<'p> {
-        match self.shared_host {
-            Some(h) => h.lock_unpoisoned().set_workers(n),
-            None => self.host.set_workers(n),
-        }
-        self
-    }
-
-    /// Attach the run's **shared fiber registry** (#1761, builder-style, the fiber twin of
-    /// [`with_shared_host`](Vcpu::with_shared_host)): every `cont.new` / `cont.resume` / `suspend` of
-    /// this vCPU then goes through `fibers`, so a fiber created on one vCPU of the run can be resumed
-    /// on another — a language runtime's worker pool, whose jobs are fibers pinned to whichever
-    /// worker owns them. Attach one registry to the root and every `thread.spawn` child of a run;
-    /// never to a §14 confined child, whose fibers are its own process's. Every path that touches the
-    /// registry — `step_vcpu`, a tier-up bounce's nested drive, a `gc.roots` view beneath an invoke —
-    /// locks it per fiber transition or scan, never across execution.
-    pub fn with_shared_fibers(mut self, fibers: &'p SharedFibers) -> Vcpu<'p> {
-        self.shared_fibers = Some(fibers);
-        self
-    }
-
     /// Seed this vCPU's `vcpu.tls` word with its dense vCPU id (builder-style) — a `thread.spawn`
     /// child's, from its [`VcpuEvent::Spawn`]'s `vcpu`. A root is 0, the constructors' default.
     pub fn with_vcpu_id(mut self, id: u64) -> Vcpu<'p> {
         self.vt.active.tls = id as i64;
-        self
-    }
-
-    /// Attach the **wasm-JIT tier-up bitmap** (browser wasm-JIT threads slice, builder-style). A
-    /// direct `Call` to a function `f` with `eligible[f] == true` then surfaces as
-    /// [`VcpuEvent::TierUp`] instead of interpreting `f` — the host runs the emitted region and
-    /// `deliver_tierup`s the result. `eligible.len()` should cover the primary module's functions;
-    /// an out-of-range index is treated as not-eligible (interprets).
-    pub fn with_jit_eligible(mut self, eligible: std::sync::Arc<[bool]>) -> Vcpu<'p> {
-        self.vt.active.jit_eligible = Some(std::sync::Arc::clone(&eligible));
-        self.jit_eligible = Some(eligible);
-        self
-    }
-
-    /// #750 **paged tier-up**: mark the eligible set as emitted with the software page-check
-    /// (`compile_module_tierup_paged`). The dispatch then surfaces tier-up regardless of the
-    /// window's scalar representability — the event's `mapped` is the reserved window size, and the
-    /// driver's page-state table (refreshed per call from [`mem_map_info`](Vcpu::mem_map_info))
-    /// carries the per-page fidelity the scalar cannot.
-    pub fn with_jit_page_checked(mut self) -> Vcpu<'p> {
-        self.vt.active.jit_page_checked = true;
-        self.jit_page_checked = true;
         self
     }
 
@@ -4881,27 +4595,12 @@ impl<'p> Vcpu<'p> {
         self.mem.as_ref().map_or(0, |m| m.win_flat_len())
     }
 
-    /// The entry's initial arguments (see [`entry_args`](Self::entry_args) on the struct) — a §14
-    /// confined child's starter cap handles, for a host that drives the entry on emitted wasm.
-    pub fn entry_args(&self) -> &[Value] {
-        &self.entry_args
-    }
-
     /// #1009 paged tier-up: the window's page-map version — a cheap `O(1)` counter bumped on every
     /// `map`/`unmap`/`protect`. A page-checked driver caches the page-state table it built from
     /// [`mem_map_info`](Vcpu::mem_map_info) and rebuilds only when this changes (the table is
     /// identical between two tier-ups with no intervening page-op). `0` for a memory-less module.
     pub fn mem_map_version(&self) -> u64 {
         self.mem.as_ref().map_or(0, |m| m.map_version())
-    }
-
-    /// Reclaim this vCPU's live guest window after it finishes — the seam a **reactor** uses to keep
-    /// the window (globals, BSS, and the `vm_map`-grown heap, with its address-space commit state)
-    /// alive across per-frame vCPUs: build a vCPU over the persistent [`Mem`] with
-    /// [`with_mem`](Vcpu::with_mem), run one frame to `Done`, then `take_mem` it back for the next
-    /// frame. `None` for a memory-less module (or if already taken).
-    pub(crate) fn take_mem(&mut self) -> Option<Mem> {
-        self.mem.take()
     }
 
     /// Enable **blocking stdin** on this vCPU's owned powerbox (a persistent interactive session). A
@@ -4918,28 +4617,12 @@ impl<'p> Vcpu<'p> {
         self.host.push_stdin(bytes);
     }
 
-    /// #1366 — finish a host-completed cap call the vCPU parked on ([`VcpuEvent::CapPending`] with
-    /// this `id`): `value` lands in the call's result slot and the completion record settles, then
-    /// [`run`](Vcpu::run) again. The twin of [`push_stdin`](Vcpu::push_stdin) for a cap the
-    /// embedder services asynchronously (the guest saw a plain synchronous `call.cap`).
-    pub fn deliver_cap(&mut self, id: u64, value: i64) {
-        let dst = self
-            .pending
-            .take()
-            .expect("deliver_cap with no pending CapPending");
-        let comps = match self.shared_host {
-            Some(m) => {
-                let mut h = m.lock_unpoisoned();
-                settle_host_cap(&mut h, id, value);
-                h.completions()
-            }
-            None => {
-                settle_host_cap(&mut self.host, id, value);
-                self.host.completions()
-            }
-        };
-        let r = comps.try_take(id).unwrap_or(value);
-        self.vt.active.set(dst, Reg::from_i64(r));
+    /// #2495 — call `id`'s answer, if it has come ([`take_answer`]).
+    fn take_answer(&mut self, id: u64) -> Option<i64> {
+        match self.shared_host {
+            Some(m) => take_answer(&mut m.lock_unpoisoned(), id),
+            None => take_answer(&mut self.host, id),
+        }
     }
 
     /// Borrow this vCPU's owned powerbox — e.g. to read `stdout` after a [`run`](Vcpu::run) that parked
@@ -5020,22 +4703,25 @@ impl<'p> Vcpu<'p> {
     /// [`Vcpu::run`]'s loop, up to the next event.
     fn run_to_event(&mut self) -> VcpuEvent {
         let durable = self.durable();
-        // #1366: this driver surfaces cap parks (`VcpuEvent::CapPending`) — admit host-completed
-        // punts on its host. A cheap flag store per resume.
-        match self.shared_host {
-            Some(m) => m.lock_unpoisoned().completions().allow_host_completed(),
-            None => self.host.completions().allow_host_completed(),
-        }
         if let Some(t) = self.trap.take() {
             return VcpuEvent::Trapped(t);
+        }
+        // #2495 — parked on a host-answered call: go on once its embedder has answered it.
+        if let Some((id, dst)) = self.cap_wait {
+            let Some(r) = self.take_answer(id) else {
+                return VcpuEvent::CapPending { id, dst };
+            };
+            self.cap_wait = None;
+            self.vt.active.set(dst, Reg::from_i64(r));
         }
         debug_assert!(
             self.pending.is_none(),
             "deliver the last event before resuming"
         );
-        // Loop so §14 `spawn_coroutine_module` (serviced in-Rust against this vCPU's own powerbox)
+        // Loop so a stop serviced in-Rust against this vCPU's own powerbox (a §14 `child_offer`)
         // never surfaces to the orchestrating host — it only ever sees the multi-vCPU events
-        // `spawn`/`join`/`wait`/`notify`, the §22 JIT events, and §14 `Instantiate` (+ `done`/`trap`).
+        // `spawn`/`join`/`wait`/`notify`, the §22 JIT events, and §14 `InstantiateDetached` (+
+        // `done`/`trap`).
         loop {
             // A §14 confined child dispatches through its OWN domain (own natural table, no parent
             // install slots); everything else through the program's shared one. Host access goes
@@ -5051,14 +4737,10 @@ impl<'p> Vcpu<'p> {
                     None => HostCell::Excl(&mut self.host),
                 },
             };
-            // The run's shared fiber registry when attached (#1761), else this vCPU's own.
-            let mut fibers = match self.shared_fibers {
-                Some(s) => FiberCell::Shared(s),
-                None => FiberCell::Excl {
-                    fibers: &mut self.fibers,
-                    sp: &mut self.fiber_sp,
-                    meta: &mut self.fiber_meta,
-                },
+            let mut fibers = FiberCell::Excl {
+                fibers: &mut self.fibers,
+                sp: &mut self.fiber_sp,
+                meta: &mut self.fiber_meta,
             };
             let stop = step_vcpu(
                 &mut self.vt,
@@ -5132,6 +4814,9 @@ impl<'p> Vcpu<'p> {
                 | Ok(VcpuStop::ChildOffer { grant: true, .. }) => {
                     return VcpuEvent::Trapped(Trap::ThreadFault)
                 }
+                // #2164 — no child of this driver pages (its compile declines a module that could
+                // page one, [`may_page_a_child`]), so a fault here is a pagerless one.
+                Ok(VcpuStop::PageFault(_)) => return VcpuEvent::Trapped(Trap::MemoryFault),
                 Err(t) => return VcpuEvent::Trapped(t),
                 Ok(VcpuStop::Done(vals)) => {
                     let froze = durable
@@ -5151,17 +4836,9 @@ impl<'p> Vcpu<'p> {
                     }
                     return VcpuEvent::Done(vals);
                 }
-                Ok(VcpuStop::TierUp {
-                    func,
-                    argv,
-                    dst,
-                    results,
-                    mapped,
-                    ..
-                }) => {
-                    self.pending_tierup = Some((dst, results));
-                    return VcpuEvent::TierUp { func, argv, mapped };
-                }
+                // A vCPU's tasks carry no tier-up eligibility, so its VM never stops for one; a
+                // stop it did not ask for fails closed.
+                Ok(VcpuStop::TierUp { .. }) => return VcpuEvent::Trapped(Trap::Malformed),
                 Ok(VcpuStop::Spawn {
                     func,
                     sp,
@@ -5197,57 +4874,41 @@ impl<'p> Vcpu<'p> {
                         vcpu: self.prog.take_vcpu_id(),
                     };
                 }
-                Ok(VcpuStop::Join { handle, dst, wait }) => {
-                    let slot = match super::resolve_thread(&self.children, handle) {
-                        Ok(slot) => slot,
-                        Err(t) => return VcpuEvent::Trapped(t),
-                    };
-                    // A child a `wait` found returned keeps its outcome here for its `join`: the
-                    // host handed its token back once already, so it is delivered without one.
-                    if let Some(res) = self.children[slot].as_ref().and_then(|c| c.ended.clone()) {
-                        let (out, keep) = super::join_delivery(&res, wait);
-                        if !keep {
-                            self.joining = self.children[slot].take();
-                            self.end_join();
-                        }
-                        match out {
-                            Ok(r) => self.vt.active.set(dst, r),
-                            Err(t) => return VcpuEvent::Trapped(t),
-                        }
-                    } else {
-                        match self.join_child(handle) {
-                            Ok(child) => {
-                                self.pending = Some(dst);
-                                self.join_wait = wait.then_some(slot);
-                                return VcpuEvent::Join { child };
-                            }
-                            Err(t) => return VcpuEvent::Trapped(t),
-                        }
+                Ok(VcpuStop::Join {
+                    handle,
+                    dst,
+                    status,
+                }) => match self.join_child(handle) {
+                    Ok(child) => {
+                        self.pending = Some(dst);
+                        self.join_status = status;
+                        return VcpuEvent::Join { child };
                     }
-                }
+                    Err(t) => return VcpuEvent::Trapped(t),
+                },
                 Ok(VcpuStop::CapPending { id, dst }) => {
                     let comps = match self.shared_host {
                         Some(m) => m.lock_unpoisoned().completions(),
                         None => self.host.completions(),
                     };
                     if comps.is_host_owned(id) {
-                        // #1366 host-completed posture: the embedder finishes this one. If it
-                        // already did (inside its submit hook), deliver and keep going; else park
-                        // the vCPU and surface the id — resume via `deliver_cap` + `run`, the
-                        // `StdinPark`/`push_stdin` shape.
-                        match comps.try_take(id) {
-                            Some(r) => self.vt.active.set(dst, Reg::from_i64(r)),
-                            None => {
-                                self.pending = Some(dst);
-                                return VcpuEvent::CapPending { id, dst };
-                            }
-                        }
-                    } else {
-                        // F2: a pool-completed punt keeps the inline completion wait — identical
-                        // to the pre-F2 in-op wait (the I45 whole-vCPU posture for this driver).
-                        let r = comps.wait(id);
-                        self.vt.active.set(dst, Reg::from_i64(r));
+                        // #1366, #2495 — a host-answered call: its embedder may answer it only
+                        // once it has control back, so park the vCPU and hand control back
+                        // (`CapPending`), the `StdinPark`/`push_stdin` shape; the next `run` goes
+                        // on once it has answered.
+                        self.cap_wait = Some((id, dst));
+                        return VcpuEvent::CapPending { id, dst };
                     }
+                    // F2: a pool-completed punt keeps the inline completion wait — identical to
+                    // the pre-F2 in-op wait (the I45 whole-vCPU posture for this driver). A call
+                    // its embedder answered already (inside its submit hook) is taken the same
+                    // way, and taped.
+                    let r = comps.wait(id);
+                    let r = match self.shared_host {
+                        Some(m) => tape_answer(&mut m.lock_unpoisoned(), id, r),
+                        None => tape_answer(&mut self.host, id, r),
+                    };
+                    self.vt.active.set(dst, Reg::from_i64(r));
                 }
                 Ok(VcpuStop::Wait {
                     base,
@@ -5297,11 +4958,8 @@ impl<'p> Vcpu<'p> {
                     // host — `Some(H)` goes into the emitted unit's `"mapped"` global; `None`
                     // (unrepresentable page state) tells it to decline emitted execution and use
                     // the interpreted delivery instead. A memory-less module has nothing to bound.
-                    // #750: a page-checked run surfaces the reserved size instead (see the tier-up
-                    // dispatch), the table carrying per-page fidelity.
                     let mapped = match self.mem.as_ref() {
                         None => Some(0),
-                        Some(m) if self.jit_page_checked => Some(m.reserved_size()),
                         Some(m) => m.scalar_extent(),
                     };
                     return VcpuEvent::JitInvoke {
@@ -5313,7 +4971,7 @@ impl<'p> Vcpu<'p> {
                         mapped,
                     };
                 }
-                // op 15 (`instantiate_detached`, #1286) and a §3d record (op 17): admitted by
+                // A §3d record (op 17, #1286): admitted by
                 // `admit_detached_child`, the one admission every driver uses, against this vCPU's
                 // own window and powerbox. A refusal lands `-EINVAL` in place and the run continues; a
                 // forged handle traps. The child's window is fresh, so the host mints its backing and
@@ -5321,8 +4979,6 @@ impl<'p> Vcpu<'p> {
                 // its embedder's freeze.
                 Ok(VcpuStop::InstantiateDetached { spawn, dst }) => {
                     let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
-                    let spawner = spawner_module(&dom.source, &self.vt.active);
-                    let unit = dom.table.jit_unit(self.vt.active.module);
                     let admitted = match self.shared_host {
                         Some(m) => admit_detached_child(
                             &mut m.lock_unpoisoned(),
@@ -5330,8 +4986,6 @@ impl<'p> Vcpu<'p> {
                             spawn,
                             true,
                             &dom.source,
-                            spawner,
-                            unit,
                         ),
                         None => admit_detached_child(
                             &mut self.host,
@@ -5339,17 +4993,15 @@ impl<'p> Vcpu<'p> {
                             spawn,
                             true,
                             &dom.source,
-                            spawner,
-                            unit,
                         ),
                     };
                     match admitted {
                         Ok(Some((child, window))) => {
                             let (size_log2, lease) = (window.size_log2, child.lease);
-                            match self.pending_child(child, spawn.entry as u32, window) {
+                            match self.pending_child(child, window) {
                                 Ok(child) => {
                                     // The window lease, filed against the handle the host delivers.
-                                    self.pending_lease = lease;
+                                    self.pending_lease = Some(lease);
                                     self.pending = Some(dst);
                                     self.pending_child = Some(child);
                                     return VcpuEvent::InstantiateDetached { size_log2 };
@@ -5373,14 +5025,12 @@ impl<'p> Vcpu<'p> {
     fn pending_child(
         &self,
         child: AdmittedChild,
-        entry: u32,
         window: FreshWindow,
     ) -> Result<PendingChild, Trap> {
-        let (module, _) = child.program.unit();
+        let (module, _) = child.program;
         Ok(PendingChild {
             host: child.host,
             module,
-            entry,
             args: child.args,
             fuel: child.fuel,
             window,
@@ -5398,25 +5048,22 @@ impl<'p> Vcpu<'p> {
     }
 
     /// File the host's `token` for a child this vCPU admitted under the next handle, with the
-    /// admission's window lease, and return the handle. What [`deliver_child`](Self::deliver_child)
-    /// does for an interpreted spawn, and what a host calls itself for a spawn its emitted code
-    /// issued ([`admit_record`](Self::admit_record)), whose handle goes back to that code.
-    pub fn file_child(&mut self, token: u64) -> i32 {
+    /// admission's window lease, and return the handle: [`deliver_child`](Self::deliver_child)'s
+    /// first step.
+    fn file_child(&mut self, token: u64) -> i32 {
         let handle = self.children.len() as i32;
         self.children.push(Some(VcpuChild {
             token,
             lease: self.pending_lease.take(),
             live: std::mem::replace(&mut self.pending_live, LiveVcpu::none()),
-            ended: None,
         }));
         handle
     }
 
-    /// A `join` this vCPU's **emitted** code issued (the browser's `env.join` bounce): resolve
-    /// `handle` by the oracle's child-table rule, as the interpreted join does, and return the host's
-    /// token for the child, once. The host waits on the child, then calls
-    /// [`end_join`](Self::end_join). `Err` is the trap the interpreted join raises.
-    pub fn join_child(&mut self, handle: i32) -> Result<u64, Trap> {
+    /// A `join`: resolve `handle` by the oracle's child-table rule and return the host's token for the
+    /// child, once. [`deliver_join`](Self::deliver_join) ends it ([`end_join`](Self::end_join)). `Err`
+    /// is the trap the join raises.
+    fn join_child(&mut self, handle: i32) -> Result<u64, Trap> {
         let child = super::take_child(&mut self.children, handle)?;
         let token = child.token;
         self.joining = Some(child);
@@ -5425,7 +5072,7 @@ impl<'p> Vcpu<'p> {
 
     /// The child a join resolved has ended: its window's bytes and its first vCPU, or a thread's
     /// `spawn`, go back to the budget that paid.
-    pub fn end_join(&mut self) {
+    fn end_join(&mut self) {
         let Some(VcpuChild { lease, live, .. }) = self.joining.take() else {
             return;
         };
@@ -5433,57 +5080,6 @@ impl<'p> Vcpu<'p> {
             self.release_detached(lease);
         }
         drop(live);
-    }
-
-    /// An op-17 record this vCPU's **emitted** code spawned (the browser's `env.instantiate_rec`
-    /// bounce, #1865), admitted as the interpreted op is: the `Instantiator` resolved in this vCPU's
-    /// powerbox, the record read from its window, and a v1 record through [`admit_detached_child`],
-    /// the one detached admission. A v0 (carve) record traps, as the interpreted op does on every
-    /// host that runs this vCPU over a window of its own. `Ok(Some((child, size_log2)))`: admitted —
-    /// the host starts it, then [`file_child`](Self::file_child)s its token; `Ok(None)`: refused
-    /// (`-EINVAL`); `Err`: a trap.
-    pub fn admit_record(
-        &mut self,
-        inst: i32,
-        rec: u64,
-    ) -> Result<Option<(PendingChild, u8)>, Trap> {
-        match self.shared_host {
-            Some(m) => m.lock_unpoisoned().resolve_instantiator(inst)?,
-            None => self.host.resolve_instantiator(inst)?,
-        };
-        let sr = read_spawn_rec(self.mem.as_ref().ok_or(Trap::Malformed)?, rec)?;
-        if sr.pager != u32::MAX {
-            return Err(Trap::CapFault);
-        }
-        let spawn = DetachedSpawn::of(&sr);
-        let source = &self.own_dom.as_ref().unwrap_or(&self.prog.dom).source;
-        let admitted = match self.shared_host {
-            Some(m) => admit_detached_child(
-                &mut m.lock_unpoisoned(),
-                self.mem.as_ref(),
-                spawn,
-                true,
-                source,
-                None,
-                None,
-            ),
-            None => admit_detached_child(
-                &mut self.host,
-                self.mem.as_ref(),
-                spawn,
-                true,
-                source,
-                None,
-                None,
-            ),
-        }?;
-        let Some((child, window)) = admitted else {
-            return Ok(None);
-        };
-        let (size_log2, lease) = (window.size_log2, child.lease);
-        let child = self.pending_child(child, spawn.entry as u32, window)?;
-        self.pending_lease = lease;
-        Ok(Some((child, size_log2)))
     }
 
     /// Settle a detached child's window lease in this vCPU's powerbox ([`Host::release_detached`]).
@@ -5508,23 +5104,18 @@ impl<'p> Vcpu<'p> {
         self.vt.active.set(dst, Reg::from_i32(v));
     }
 
-    /// Deliver a joined child's result (after `Join`): its first value lands in the joiner's dst, or a
-    /// child trap propagates (the joiner traps on its next `run`).
+    /// Deliver how a joined child ended (after `Join`), as the host saw it: what it gives the joiner
+    /// lands from the joiner's dst — a §14 child's `(status, value)`, a thread's first value — or a
+    /// thread's trap propagates (the joiner traps on its next `run`) ([`super::join_delivery`]).
     pub fn deliver_join(&mut self, res: Result<Vec<Value>, Trap>) {
-        let wait = self.join_wait.take();
-        let (out, keep) = super::join_delivery(&res, wait.is_some());
-        match wait {
-            // A `wait` on a child that returned: it goes back to its slot for its `join`.
-            Some(slot) if keep => {
-                let mut child = self.joining.take().expect("a join in flight");
-                child.ended = Some(res);
-                self.children[slot] = Some(child);
-            }
-            _ => self.end_join(),
-        }
+        self.end_join();
         let dst = self.pending.take().expect("deliver with no pending event");
-        match out {
-            Ok(r) => self.vt.active.set(dst, r),
+        match super::join_delivery(&res, std::mem::take(&mut self.join_status)) {
+            Ok(regs) => {
+                for (i, r) in regs.enumerate() {
+                    self.vt.active.set(dst + i as u32, r);
+                }
+            }
             Err(t) => self.trap = Some(t),
         }
     }
@@ -5532,9 +5123,7 @@ impl<'p> Vcpu<'p> {
     /// Deliver the resolved unit for a `JitInstall` ([`Host::resolve_jit_unit`]) and install it into
     /// this vCPU's domain ([`jit_install`]): the **shared** [`Domain`] for a root, so every
     /// vCPU/Worker can `call.dyn` it, or a §14 child's own. An `Err` resolution traps, as does a unit
-    /// outside engine coverage (`Malformed`); a full table is `-ENOSPC` at the awaiting dst. A
-    /// wasm-tier host mirrors the table into a per-Worker `WebAssembly.Table` (§22 Model B2
-    /// cross-Worker: funcrefs can't cross Workers) from [`Vcpu::slot_unit`].
+    /// outside engine coverage (`Malformed`); a full table is `-ENOSPC` at the awaiting dst.
     pub fn deliver_jit_install(&mut self, unit: Result<super::ResolvedJitUnit, Trap>) {
         let Some(PendingJit::Install { dst }) = self.pending_jit.take() else {
             panic!("deliver_jit_install with no pending install");
@@ -5557,20 +5146,6 @@ impl<'p> Vcpu<'p> {
         if let Err(t) = jit_uninstall(authorized, &dom.source, &dom.table, slot, active, dst) {
             self.trap = Some(t);
         }
-    }
-
-    /// #1339 — the `(domain, unit)` installed at `slot` of this vCPU's dispatch table (`None` =
-    /// empty or one of the program's own functions): what a per-Worker `WebAssembly.Table` holds
-    /// there. The root's table is the one its threads share; a §14 child's is its own (#1296).
-    pub fn slot_unit(&self, slot: u32) -> Option<(u32, u32)> {
-        let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
-        dom.table.slot_unit(slot as usize)
-    }
-
-    /// #1339 — the generation of this vCPU's dispatch table ([`Vcpu::slot_unit`]): it moves with
-    /// every install and uninstall, so a Worker rebuilds its mirror only when it changed.
-    pub fn table_gen(&self) -> u32 {
-        self.own_dom.as_ref().unwrap_or(&self.prog.dom).table.gen()
     }
 
     /// Deliver the resolved unit for a `JitInvoke` ([`Host::resolve_jit_unit`], as for
@@ -5598,12 +5173,8 @@ impl<'p> Vcpu<'p> {
             Some(m) => HostCell::Shared(m),
             None => HostCell::Excl(&mut self.host),
         };
-        // The unit's `gc.roots` sees the run's parked fibers beneath it (#1660): the run-shared
-        // registry when attached — locked only while such a scan reads it — else our own.
-        let parked = match self.shared_fibers {
-            Some(s) => FiberRegRef::Shared(s),
-            None => FiberRegRef::Owned(&self.fibers),
-        };
+        // The unit's `gc.roots` sees the run's parked fibers beneath it (#1660).
+        let parked = FiberRegRef::Owned(&self.fibers);
         let ran = jit_invoke_unit(unit, &dom.source, &dom.table, &argv, &params, &results)
             .and_then(|(umod, args)| {
                 run_invoke(
@@ -5636,7 +5207,6 @@ impl<'p> Vcpu<'p> {
     /// args)`) calls this with the emitted region's results; a host that interprets calls the other.
     /// Too few results is a `Malformed` trap (a mis-marshalled host reply).
     pub fn deliver_jit_invoke_vals(&mut self, vals: &[i64]) {
-        self.invoke_fibers = FiberTables::default(); // the emitted invoke resolved — its bounce registry dies with it
         let Some(PendingJit::Invoke { results, dst, .. }) = self.pending_jit.take() else {
             panic!("deliver_jit_invoke_vals with no pending invoke");
         };
@@ -5647,158 +5217,12 @@ impl<'p> Vcpu<'p> {
         set_slot_results(&mut self.vt.active, dst, &results, vals.iter().copied());
     }
 
-    /// #846 slice 1 — service **one cross-tier bounce** out of an emitted §22 unit: the codegen host
-    /// is mid-way through running a [`VcpuEvent::JitInvoke`] on emitted wasm (this vCPU is parked on
-    /// the pending invoke), and the unit reached a call the emit routed to `env.call_interp` — a
-    /// trampoline'd `call.dyn` target or a cross-tier direct call. `target` resolves through
-    /// the **shared dispatch table** exactly as [`Op::CallIndirect`] does (the natural prefix maps a
-    /// program function's index to itself; an installed unit sits at its install slot; empty padding
-    /// is an `IndirectCallType` trap), and the resolved function runs on a nested interpretation
-    /// over this vCPU's **live** window/powerbox/fuel — observably identical to the same call inside
-    /// an interpreted invoke. Fibers are serviced against the persistent emitted-invoke registry
-    /// ([`invoke_fibers`](Vcpu::invoke_fibers)), so a fiber parked by one callback is resumable by a
-    /// later one within the same invoke.
-    ///
-    /// `io` carries the i64 arg slots in and the result slots out (the `env.call_interp` scratch
-    /// ABI — floats by bits, i32s in the low half). Returns the result count. `Err` is the
-    /// callback's trap — the host must unwind the emitted unit and deliver it via
-    /// [`deliver_jit_invoke_trap`](Vcpu::deliver_jit_invoke_trap) (an `Exit` included: it must
-    /// resolve the invoke as the interpreted path would, not be swallowed).
-    ///
-    /// A §22 `Jit.install`/`uninstall` the callback reaches (a guest whose *emitted* frame defines
-    /// and dispatches units) moves this vCPU's table, and so its generation ([`Vcpu::table_gen`]): a
-    /// driver mirroring the table rebuilds before the emitted frame resumes (#1339).
-    pub fn bounce_call(&mut self, target: u32, io: &mut [i64]) -> Result<usize, Trap> {
-        step(&mut self.fuel, None)?; // fuel unification: the dispatch-site safepoint
-        let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
-        let slot = (target as usize) & (dom.table.len() - 1);
-        let ts = dom.table.slot(slot);
-        if ts.module == super::TABLE_EMPTY {
-            return Err(Trap::IndirectCallType);
-        }
-        let tm = dom.source.get(ts.module as usize).ok_or(Trap::Malformed)?;
-        let (cp, cr) = tm.sigs[ts.func as usize].clone();
-        if cp.len() > io.len() || cr.len() > io.len() {
-            return Err(Trap::Malformed); // scratch too small — a mis-marshalled host call
-        }
-        // The i64-slot transport carries scalars only; a v128-sig target can never have been given
-        // a trampoline (the host gates that at open) — a bounce naming one is a mis-wired host.
-        let scalar =
-            |t: &ValType| matches!(t, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64);
-        if !cp.iter().all(scalar) || !cr.iter().all(scalar) {
-            return Err(Trap::Malformed);
-        }
-        let args: Vec<Value> = cp
-            .iter()
-            .zip(io.iter())
-            .map(|(ty, s)| slot_to_val(*ty, *s))
-            .collect();
-        let mut vm = Vm::new(&tm, ts.func as usize, &args)?;
-        vm.module = ts.module as usize;
-        vm.tls = self.vt.active.tls; // the callback runs on this vCPU: its `vcpu.tls` word
-        let mut cell = match self.shared_host {
-            Some(m) => HostCell::Shared(m),
-            None => HostCell::Excl(&mut self.host),
-        };
-        // Registry context (#880): during an emitted **invoke**, callbacks share the
-        // invoke-confined registry (`run_invoke` parity — fibers die with the invoke). During an
-        // emitted **TIERUP region**, the callback is interpreted-inline-call territory: its fibers
-        // register in the vCPU's *run-level* registry (parallel arrays mirrored), so one created
-        // here persists for the run to resume later — exactly as the same call inline would.
-        let vals = if self.pending_jit.is_some() {
-            drive_nested(
-                &dom.source,
-                &dom.table,
-                VTask::of(vm, 0),
-                &mut self.fuel,
-                &mut self.mem,
-                &mut cell,
-                // Invoke fibers live as long as the invoke, across its bounces.
-                &mut self.invoke_fibers.cell(),
-                None,
-                None, // #1660: emitted frames lie beneath a bounce; opaque until they spill (#1627)
-                false,
-            )?
-            .done()
-        } else {
-            // The run-level registry: the run-shared one when attached (#1761), else this vCPU's.
-            let mut fibers = match self.shared_fibers {
-                Some(s) => FiberCell::Shared(s),
-                None => FiberCell::Excl {
-                    fibers: &mut self.fibers,
-                    sp: &mut self.fiber_sp,
-                    meta: &mut self.fiber_meta,
-                },
-            };
-            drive_nested(
-                &dom.source,
-                &dom.table,
-                VTask::of(vm, 0),
-                &mut self.fuel,
-                &mut self.mem,
-                &mut cell,
-                &mut fibers,
-                Some(BounceRunCtx { park: None }),
-                None, // #1660: emitted frames lie beneath a bounce; opaque until they spill (#1627)
-                false,
-            )?
-            .done()
-        };
-        for (i, v) in vals.iter().enumerate() {
-            io[i] = val_to_slot(*v);
-        }
-        Ok(cr.len())
-    }
-
-    /// The window's committed **scalar extent** right now ([`Mem::scalar_extent`]) — the #717 value
-    /// the codegen host re-syncs to every live instance's `"mapped"` global after a
-    /// [`bounce_call`](Vcpu::bounce_call) (a bounced callback may have `vm_map`-grown the window
-    /// mid-invoke; the fan-out makes the growth visible to the emitted tier exactly when the
-    /// interpreted path would see it — after the call returns). `0` when the window state is no
-    /// longer scalar-representable — deny-everything, the diverge-toward-refusal posture
-    /// (INVARIANTS.md #9), or when there is no window.
-    pub fn window_scalar_extent(&self) -> u64 {
-        self.mem
-            .as_ref()
-            .and_then(|m| m.scalar_extent())
-            .unwrap_or(0)
-    }
-
     /// Deliver a **trap** from a host-run [`VcpuEvent::JitInvoke`] unit (the emitted region hit a
     /// guest `unreachable` / memory fault / div-by-zero / out-of-fuel, surfaced to the host as a
     /// catchable `RuntimeError`). The vCPU traps on its next `run`, exactly as an interpreted invoke
     /// trap would (`deliver_jit_invoke` sets `self.trap` on the unit's `Err`).
     pub fn deliver_jit_invoke_trap(&mut self, trap: Trap) {
-        self.invoke_fibers = FiberTables::default(); // the emitted invoke resolved — its bounce registry dies with it
         self.pending_jit = None;
-        self.trap = Some(trap);
-    }
-
-    /// Deliver the results of a [`VcpuEvent::TierUp`]: the emitted region returned `vals` (raw i64
-    /// result slots, one per the callee's result type). Re-tag each into the awaiting `dst` slot(s) of
-    /// the caller's window and resume — the tier-up call then looks exactly like an interpreted call
-    /// that returned. Too few results is a `Malformed` trap (a mis-marshalled host reply).
-    pub fn deliver_tierup(&mut self, vals: &[i64]) {
-        let Some((dst, results)) = self.pending_tierup.take() else {
-            panic!("deliver_tierup with no pending tier-up");
-        };
-        if vals.len() < results.len() {
-            self.trap = Some(Trap::Malformed);
-            return;
-        }
-        for (i, ty) in results.iter().enumerate() {
-            self.vt.active.set(
-                dst as u32 + i as u32,
-                Reg::from_value(slot_to_val(*ty, vals[i])),
-            );
-        }
-    }
-
-    /// Deliver a **trap** from a [`VcpuEvent::TierUp`] region (the emitted `f{func}` hit a guest
-    /// `unreachable` / memory fault / div-by-zero / out-of-fuel, surfaced to the host as a catchable
-    /// `RuntimeError`). The vCPU traps on its next `run`, exactly as if the interpreted call had.
-    pub fn deliver_tierup_trap(&mut self, trap: Trap) {
-        self.pending_tierup = None;
         self.trap = Some(trap);
     }
 
@@ -5951,9 +5375,14 @@ pub fn ir_trace(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Op
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
     let dom = Domain::new(c, 0);
-    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
+    let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
     let mut host = Host::new();
-    let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
+    let mut vm = match Vm::new(
+        &dom.source.primary(),
+        func as usize,
+        args,
+        Some(host.own_node()),
+    ) {
         Ok(v) => v,
         Err(e) => return Some((Vec::new(), Err(e))),
     };
@@ -6001,9 +5430,14 @@ pub fn ir_window_trace(
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
     let dom = Domain::new(c, 0);
-    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
+    let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
     let mut host = Host::new();
-    let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
+    let mut vm = match Vm::new(
+        &dom.source.primary(),
+        func as usize,
+        args,
+        Some(host.own_node()),
+    ) {
         Ok(v) => v,
         Err(e) => return Some((Vec::new(), Err(e))),
     };
@@ -6069,9 +5503,14 @@ pub fn ir_value_trace(
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
     let dom = Domain::new(c, 0);
-    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
+    let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
     let mut host = Host::new();
-    let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
+    let mut vm = match Vm::new(
+        &dom.source.primary(),
+        func as usize,
+        args,
+        Some(host.own_node()),
+    ) {
         Ok(v) => v,
         Err(e) => return Some((Vec::new(), Err(e))),
     };
@@ -6198,27 +5637,8 @@ impl LineBreakpoints {
     }
 }
 
-/// Whether a §14 child window (a coroutine or an `instantiate` env) is captured by a checkpoint: its own
-/// page map is capturable ([`Mem::layout_snapshot_safe`] — no §13 region aliasing) **and** its extent
-/// lies within the parent's snapshotted prefix ([`Mem::nested_within_prefix`], so its bytes ride in the
-/// parent reseed rather than a separate copy). A memoryless child is trivially fine. Shared by the
-/// scheduled checkpointable gate's carve arm.
-fn child_checkpointable(child: Option<&Mem>, parent: Option<&Mem>) -> Result<(), Refusal> {
-    let Some(m) = child else {
-        return Ok(());
-    };
-    if !m.layout_snapshot_safe() {
-        return Err(Refusal::Region);
-    }
-    if !parent.is_some_and(|p| m.nested_within_prefix(p)) {
-        return Err(Refusal::WindowLayout);
-    }
-    Ok(())
-}
-
-/// Whether a child env's host is one a restore rebuilds: a checkpoint rebuilds a child's host with
-/// only its `Instantiator` and `AddressSpace` (`rebuild_env`), so on top of the root host's rule it
-/// must hold no `Jit` table and no §13 region.
+/// Whether a child env's host is one a restore rebuilds ([`rebuild_detached_env`]): on top of the
+/// root host's rule it must hold no `Jit` table and no §13 region.
 fn child_host_admits(host: &Host) -> Result<(), Refusal> {
     host.admits_checkpoint()?;
     if host.has_jit_table() {
@@ -6243,91 +5663,40 @@ fn any_event_parked<'a>(mut fibers: impl Iterator<Item = &'a FiberState>) -> boo
     })
 }
 
-/// Capture a live `instantiate`-child [`DbgEnv`] into an [`EnvSnapshot`]: its window geometry
-/// (`nested_view` base + size) + host replay substate + fuel + its own page-protection map. Its bytes ride
-/// in the shared window snapshot (the view shares the root backing region).
-///
-/// #1866 — a detached child's env carries its own window image and powerbox instead, or nothing of
-/// either once it is `spent` ([`env_spent`]). Refused when a live one's powerbox holds a binding that
-/// is not a plain value ([`Host::child_powerbox`]), or it has no window.
+/// Capture a child [`DbgEnv`] into an [`EnvSnapshot`] (#1866): host replay substate, fuel, fibers,
+/// the env that spawned it, and its own window image and powerbox, or nothing of either once it is
+/// `spent` ([`env_spent`]). Refused when a live one's powerbox holds a binding that is not a plain
+/// value ([`Host::child_powerbox`]), or it has no window.
 fn env_snapshot(e: &DbgEnv, spent: bool) -> Result<EnvSnapshot, Refusal> {
-    let detached = match e.place {
-        EnvPlace::Carve => None,
-        EnvPlace::Detached { spawner } => Some(DetachedEnv {
-            spawner,
-            live: match (&e.mem, spent) {
-                (_, true) => None,
-                (Some(m), false) => Some(DetachedLive {
-                    image: m.layout_snapshot(),
-                    reserved_log2: m.window.reserved().trailing_zeros() as u8,
-                    mapped_log2: m.window.mapped().trailing_zeros() as u8,
-                    shadow: m.shadow,
-                    powerbox: e.host.child_powerbox().ok_or(Refusal::ChildPowerbox)?,
-                }),
-                (None, false) => return Err(Refusal::NoWindow),
-            },
+    let live = match (&e.mem, spent) {
+        (_, true) => None,
+        (Some(m), false) => Some(DetachedLive {
+            image: m.layout_snapshot(),
+            reserved_log2: m.window.reserved().trailing_zeros() as u8,
+            mapped_log2: m.window.mapped().trailing_zeros() as u8,
+            shadow: m.shadow,
+            powerbox: e.host.child_powerbox().ok_or(Refusal::ChildPowerbox)?,
         }),
+        (None, false) => return Err(Refusal::NoWindow),
     };
     Ok(EnvSnapshot {
-        win_base: e.mem.as_ref().map_or(0, |m| m.window.base()),
-        size_log2: e
-            .mem
-            .as_ref()
-            .map_or(0, |m| m.window.reserved().trailing_zeros() as u8),
         module: e.program as usize,
         host: e.host.replay_substate(),
         fuel: e.fuel.can_burn(),
-        prot: e.mem.as_ref().map_or_else(Vec::new, |m| m.prot_snapshot()),
         fibers: e.fibers.fibers.clone(),
-        detached,
+        spawner: e.spawner,
+        live,
     })
 }
 
-/// Rebuild a §14 `instantiate`-child [`DbgEnv`] from an [`EnvSnapshot`] on restore — the inverse of
-/// [`env_snapshot`]: recreate its `nested_view` over the (reseeded) `shared_mem` window, its attenuated
-/// `Instantiator` + `AddressSpace` powerbox over `[0, child_size)` (deterministic in `child_size`), the
-/// captured host replay substate, its natural module-0 table, and its fuel quota.
-fn rebuild_env(es: &EnvSnapshot, shared_mem: Option<&Mem>, source: &ModuleSource) -> DbgEnv {
-    let child_size = 1u64 << es.size_log2;
-    let child_shadow = source
-        .get(es.module)
-        .and_then(|c| c.shadow)
-        .unwrap_or(super::ShadowArena::EMPTY);
-    let mem = shared_mem.map(|m| m.nested_view(es.win_base, es.size_log2, child_shadow));
-    if let Some(m) = &mem {
-        m.install_prot(&es.prot); // its `map`/`unmap`/`protect`ed pages (bytes rode in the shared reseed)
-    }
-    let progs_len = source.get(es.module).map_or(0, |u| u.progs.len());
-    let mut host = Host::new();
-    host.grant_instantiator(0, child_size);
-    host.grant_address_space(0, child_size);
-    host.restore_replay_substate(&es.host);
-    let table_log2 = host.jit_table_log2(); // #1296: the child's reserved install slots
-    DbgEnv {
-        mem,
-        table: build_table_for(progs_len, table_log2, es.module as u32),
-        program: es.module as u32,
-        fuel: Fuel::fixed(es.fuel),
-        fibers: FiberTables::restored(es.fibers.clone(), &host),
-        host,
-        place: EnvPlace::Carve,
-    }
-}
-
 /// #1866 — rebuild a detached child's [`DbgEnv`] under `spawner`, the powerbox of the env that spawned
-/// it (already rebuilt: envs come back in spawn order). Its window is built as op 15 builds it, then
+/// it (already rebuilt: envs come back in spawn order). Its window is built as a spawn builds it, then
 /// its own image laid over it, as a thaw's relaunch does; its powerbox is rebuilt from its
 /// [`ChildPowerbox`](super::ChildPowerbox), its inherited stdio aliased to `spawner`'s. A spent env comes
 /// back empty: nothing runs in it again.
-fn rebuild_detached_env(
-    es: &EnvSnapshot,
-    d: &DetachedEnv,
-    spawner: &mut Host,
-    source: &ModuleSource,
-) -> DbgEnv {
+fn rebuild_detached_env(es: &EnvSnapshot, spawner: &mut Host, source: &ModuleSource) -> DbgEnv {
     let progs_len = source.get(es.module).map_or(0, |u| u.progs.len());
-    let place = EnvPlace::Detached { spawner: d.spawner };
-    let Some(live) = &d.live else {
+    let Some(live) = &es.live else {
         let host = Host::new();
         let table = build_table_for(progs_len, host.jit_table_log2(), es.module as u32);
         return DbgEnv {
@@ -6337,7 +5706,7 @@ fn rebuild_detached_env(
             program: es.module as u32,
             fuel: Fuel::fixed(es.fuel),
             fibers: FiberTables::default(),
-            place,
+            spawner: es.spawner,
         };
     };
     let mut mem = Mem::from_spec(WindowSpec {
@@ -6358,7 +5727,7 @@ fn rebuild_detached_env(
         fuel: Fuel::fixed(es.fuel),
         fibers: FiberTables::restored(es.fibers.clone(), &host),
         host,
-        place,
+        spawner: es.spawner,
     }
 }
 
@@ -6626,8 +5995,8 @@ fn emit_access(
 /// only — and takes its spans from [`watch_accesses`](super::watch_accesses), the same per-op analysis
 /// the watchpoint check runs, so bulk `mem.copy`/`mem.fill` and v128 stores are covered on the one
 /// definition and no store path is touched. Inert while the journal is disarmed, and for `mem: None`:
-/// a caller passes the root window only for a task that writes it, since a child of the root's own
-/// program runs module 0 in its own window (#2076), which each anchor carries whole (#2058).
+/// a caller passes the root window only for a task that writes it; a child runs in its own window
+/// (#2076), which each anchor carries whole (#2058).
 fn journal_op(
     journal: &mut super::journal::Journal,
     vm: &Vm,
@@ -6714,7 +6083,8 @@ fn journal_state(
     let invertible = host.journal_invertible()
         && extra_envs.iter().all(|e| e.host.region_count() == 0)
         && tasks.iter().all(|t| t.vm.vt.active_invoke.is_none())
-        && !any_event_parked(fibers.iter());
+        && !any_event_parked(fibers.iter())
+        && !pool_parked(tasks, extra_envs, host);
     if !invertible {
         return;
     }
@@ -6771,7 +6141,7 @@ fn journal_state(
         + cont
             .extra_envs
             .iter()
-            .filter_map(|e| e.detached.as_ref()?.live.as_ref())
+            .filter_map(|e| e.live.as_ref())
             .map(|l| (l.image.bytes.len() / std::mem::size_of::<super::Reg>()) as u64)
             .sum::<u64>();
     journal.record_state(
@@ -6877,7 +6247,8 @@ fn debug_advance_fiber(
                 match claim_fiber(&mut cell, &mut HostCell::Excl(host), k, arg, None, false) {
                     Ok(Claim::Continue(vm)) => vm,
                     Ok(Claim::Start { funcref, sp }) => {
-                        match start_fiber(source, table, mem, k, funcref, sp, arg) {
+                        let payer = Some(host.own_node());
+                        match start_fiber(source, table, mem, k, funcref, sp, arg, payer) {
                             Ok(vm) => vm,
                             Err(t) => return FiberStep::Trapped(t),
                         }
@@ -6938,21 +6309,19 @@ fn debug_advance_fiber(
                 Err(t) => FiberStep::Trapped(t),
             }
         }
-        // F2 — a punted host call in a debug advance keeps the pre-F2 inline wait (the debug
-        // drivers' whole-vCPU-park shape is sanctioned tiering, invariant 9 observability
-        // corollary; checkpointing across one is already excluded by `admits_checkpoint`'s
-        // replay-substate rules — the wait happens inside the advance, leaving no parked state).
-        Ok(Outcome::CapPending { id, dst }) => {
-            match host.completions().wait_unless_host_owned(id) {
-                Some(r) => {
-                    vt.active.set(dst, Reg::from_i64(r));
-                    FiberStep::Stepped
-                }
-                // #1366: a host-completed punt — the debug run parks on it (`cap_parked`) and the
-                // backend surfaces `StopReason::CapPark`; `deliver_cap` resumes.
-                None => FiberStep::CapParked { id, dst, at },
-            }
+        // #2047 — a punted host call parks the thread, as the oracle parks the vCPU: the call may
+        // wait on the world, or on what another thread does. The run takes its answer once nothing
+        // else can run ([`dbg_take_answer`]), so the schedule stays deterministic. A durable run
+        // keeps the inline wait (the freeze must never meet a park); a host-answered call never
+        // reaches it, declined at dispatch (#2495).
+        Ok(Outcome::CapPending { id, dst }) if host.is_durable() => {
+            vt.active
+                .set(dst, Reg::from_i64(host.completions().wait(id)));
+            FiberStep::Stepped
         }
+        // #1366: a host-answered call parks the same way, and the backend surfaces
+        // `StopReason::CapPark` until its embedder answers it.
+        Ok(Outcome::CapPending { id, dst }) => FiberStep::CapParked { id, dst, at },
         // Threads / wait / notify / instantiate / (scheduled-engine) separate-module coroutine / tier-up
         // — a scheduler seam the caller applies (`service_advance` dispatches its subset, declines the rest).
         Ok(other) => FiberStep::Other(other),
@@ -7028,8 +6397,7 @@ fn journaled_write(
 /// ([`ScheduledDebugRun::task_mem`]): the root's (`None`), journaled, or a child env's (#2072). A
 /// child's edit is not journaled, since the journal's pre-images cover the root window only. Each
 /// anchor carries a live detached child's whole window (#2058), so an undo restores it from there and
-/// the replay re-applies the edit at its turn. (A carve's bytes are the root's, which the journal
-/// records for no child — #2064, retiring with the carve.)
+/// the replay re-applies the edit at its turn.
 fn write_task_window(
     journal: &mut super::journal::Journal,
     turn: u64,
@@ -7178,7 +6546,7 @@ impl<'a> FrameReader<'a> {
             return Some((self.vm.module, self.vm.cur, pc.block, pc.inst, self.vm.base));
         }
         let n = self.vm.stack.len();
-        let &(module, f, base, resume_pc, _) = self.vm.stack.get(n.checked_sub(depth)?)?;
+        let &(module, f, base, resume_pc, ..) = self.vm.stack.get(n.checked_sub(depth)?)?;
         let cm = self.source.get(module)?;
         let (block, inst) = cm
             .progs
@@ -7374,9 +6742,8 @@ pub enum SchedStop {
     /// re-issues the read. Distinct from `Blocked` (a true deadlock) so the backend can show an
     /// input prompt instead of a dead end.
     StdinPark { pc: super::IrPc },
-    /// #1366 — a thread is parked on a host-completed cap call `id` (at `pc`): live, resumable once
-    /// the embedder [`deliver_cap`](ScheduledDebugRun::deliver_cap)s the value. The cap twin of
-    /// `StdinPark`.
+    /// #1366 — a thread is parked on a host-answered cap call `id` (at `pc`): live, resumable once
+    /// the embedder answers it with its [`crate::Completer`]. The cap twin of `StdinPark`.
     CapPark { id: u64, pc: super::IrPc },
     /// A thread reached an op outside the debug scheduler's subset — only JIT tier-up (never enabled on
     /// this engine). Threads, `wait`/`notify`, fibers, `instantiate`/`instantiate_module`, and §14
@@ -7400,13 +6767,6 @@ pub enum SchedBreak {
     Pause,
 }
 
-/// A §14 `instantiate` **confined executor child**'s runtime under the multi-vCPU debug scheduler — the
-/// debug-engine counterpart of the production [`ChildEnv`]. Its `mem` is a `nested_view` sub-window
-/// sharing the parent's backing (the confinement masking is the production primitive, unchanged — the
-/// debugger only drives an already-confined child op-by-op), `host` an attenuated powerbox (an
-/// `Instantiator` + `AddressSpace`, each over `[0, child_size)`), `table` a fresh natural dispatch table
-/// over module 0 (no installed §22 units), and `fuel` a sub-allocated quota. Plain `Host` (the debug
-/// scheduler is single-threaded and the §3.6 live-call/serve machinery is not yet driven here).
 /// [`refund_ended_windows`] on the debugger's scheduler: a finished detached child's window goes back
 /// to the budget that paid for it, in the spawner's own powerbox, and what the window grew with it
 /// (#1909), from the child's own. The debugger's child envs see no other end (it declines fork, spawn
@@ -7447,37 +6807,17 @@ struct DbgEnv {
     mem: Option<Mem>,
     host: Host,
     table: SharedSlots,
-    /// The unit of the run's source the domain runs (the root's is module 0): a child of its own
-    /// program runs it too (#2076), and a checkpoint rebuilds the env's table over it.
+    /// The unit of the run's source the domain runs (the root's is module 0, a child's the unit of the
+    /// module it was granted): a checkpoint rebuilds the env's table over it.
     program: u32,
     /// A fixed allowance (#1944 slice 3): a checkpoint captures it whole, and a seek replays it.
     fuel: Fuel,
     /// The child domain's own §12 fiber registry: each domain numbers its fibers from 0 and cannot
     /// reach another's, as on the oracle (the root's is [`ScheduledDebugRun::fibers`]).
     fibers: FiberTables,
-    /// Where its window lives, which decides what a checkpoint carries of it (#1866).
-    place: EnvPlace,
-}
-
-/// Where a [`DbgEnv`]'s window lives (#1866).
-#[derive(Clone, Copy)]
-enum EnvPlace {
-    /// A carve: a view of the root window, whose bytes ride the root's image.
-    Carve,
-    /// A §5 detached child's window of its own. `spawner` is the env whose powerbox spawned it
-    /// (`None`: the root's), whose stdio its inherited streams alias on a rebuild.
-    Detached { spawner: Option<usize> },
-}
-
-impl DbgEnv {
-    /// The env whose powerbox spawned this one — a detached child's spawner — for a `kill` to end
-    /// the subtree ([`kill_env`]). A carve child records none.
-    fn spawner(&self) -> Option<usize> {
-        match self.place {
-            EnvPlace::Detached { spawner } => spawner,
-            EnvPlace::Carve => None,
-        }
-    }
+    /// The env whose powerbox spawned this one (`None`: the root's): whose stdio its inherited
+    /// streams alias on a rebuild (#1866), and whose `kill` ends it with its subtree ([`kill_env`]).
+    spawner: Option<usize>,
 }
 
 /// #1866 — whether nothing runs in env `k` again and nothing still leans on it: every task in it has
@@ -7490,17 +6830,15 @@ fn env_spent(tasks: &[TaskSlot], envs: &[DbgEnv], k: usize) -> bool {
         .filter(live)
         .any(|t| t.env == Some(k) || matches!(t.lease, Some((Some(e), _)) if e == k))
         && !envs.iter().enumerate().any(|(i, e)| {
-            matches!(e.place, EnvPlace::Detached { spawner: Some(sp) } if sp == k)
-                && tasks.iter().filter(live).any(|t| t.env == Some(i))
+            e.spawner == Some(k) && tasks.iter().filter(live).any(|t| t.env == Some(i))
         })
 }
 
 /// One scheduled vCPU's captured state inside a [`ScheduledContinuation`] — its full `VTask` continuation
-/// (active `Vm`, active fiber id, resume `chain`, same-module coroutine children, active-coroutine
-/// cursor, durable shadow-SP), the join-handle table, the env index (`Some(k)` for a §14 `instantiate`
-/// child — see [`ScheduledContinuation::extra_envs`]), the run state, and the breakpoint-skip flag. The
-/// fiber `Vm`s share the run's window(s), and each coroutine's window is a `nested_view` sharing the
-/// parent backing, so their bytes ride in the snapshot's window bytes; `restore` rebuilds the `VTask`.
+/// (active `Vm`, active fiber id, resume `chain`, durable shadow-SP), the join-handle table, the env
+/// index (`Some(k)` for a §14 child — see [`ScheduledContinuation::extra_envs`]), the run state, and
+/// the breakpoint-skip flag. The fiber `Vm`s share their domain's window, so their bytes ride in its
+/// image; `restore` rebuilds the `VTask`.
 #[derive(Clone)]
 struct DbgTaskSnapshot {
     active: Vm,
@@ -7563,45 +6901,27 @@ impl ScheduledContinuation {
     }
 }
 
-/// A §14 `instantiate`-child environment ([`DbgEnv`]) inside a [`Moment`]. Like a coroutine
-/// child, its window is a `nested_view` sharing the root backing region — so its bytes ride in the
-/// snapshot's window bytes and only the view geometry (`win_base`/`size_log2`) is stored; `restore`
-/// rebuilds the view over the reseeded shared window. Its attenuated powerbox (an `Instantiator` +
-/// `AddressSpace`, each over `[0, child_size)`) is deterministic in `child_size = 1 << size_log2`, so
-/// only the host replay substate is carried; a natural dispatch table over the child's [`module`] (a
-/// **separate-module** `instantiate_module` child's pushed unit rides in `extra_units`) and the
-/// sub-allocated `fuel` complete it. The child's own page-protection map (`prot`) is captured alongside,
-/// admitting a child that `map`/`unmap`/`protect`ed its own window; its bytes still ride in the shared
-/// snapshot. A §13 region-aliased child stays outside the checkpointable subset.
+/// A §14 child environment ([`DbgEnv`]) inside a [`Moment`] (#1866): its own window and powerbox
+/// ([`DetachedLive`]) unless it is spent, its host replay substate, a natural dispatch table over the
+/// child's [`module`] (whose pushed unit rides in `extra_units`) and its fixed `fuel`. A §13
+/// region-aliased child stays outside the checkpointable subset.
 #[derive(Clone)]
 struct EnvSnapshot {
-    win_base: u64,
-    size_log2: u8,
-    /// The unit the child's domain runs ([`DbgEnv::program`]): `0` for a child of the root's own
-    /// program (a same-module `instantiate`, or a detached child of it, #2076); `>= 1` for a
-    /// **separate** module's, whose pushed unit is captured in the run snapshot's `extra_units`. Its
-    /// natural dispatch table is rebuilt over this index.
+    /// The unit the child's domain runs ([`DbgEnv::program`]): the granted module's, whose pushed unit
+    /// is captured in the run snapshot's `extra_units`. Its natural dispatch table is rebuilt over this
+    /// index.
     module: usize,
     host: super::HostReplaySubstate,
     fuel: u64,
-    /// The child's own page-protection map ([`Mem::prot_snapshot`]), reinstalled with
-    /// [`Mem::install_prot`] on restore (its bytes ride in the shared snapshot). Empty for a pristine child.
-    prot: Vec<(u64, super::PageProt)>,
-    /// The child's fiber registry (its `Vm`s' bytes ride in the shared snapshot, like the root's).
+    /// The child's fiber registry (its `Vm`s' bytes ride in its window image).
     fibers: Vec<FiberState>,
-    /// #1866 — a detached child's own window and powerbox, which a carve's need not carry.
-    detached: Option<DetachedEnv>,
-}
-
-/// #1866 — what a checkpoint carries of a detached child's env beyond a carve's: the env that spawned
-/// it, and, unless it is spent ([`env_spent`]), its own window and powerbox.
-#[derive(Clone)]
-struct DetachedEnv {
+    /// The env that spawned it ([`DbgEnv::spawner`]).
     spawner: Option<usize>,
+    /// Its own window and powerbox, unless it is spent ([`env_spent`]).
     live: Option<DetachedLive>,
 }
 
-/// #1866 — a live detached child's window (its image, and the geometry op 15 built it with) and its
+/// #1866 — a live detached child's window (its image, and the geometry its spawn built it with) and its
 /// powerbox.
 #[derive(Clone)]
 struct DetachedLive {
@@ -7823,7 +7143,7 @@ fn trace_frame(task: &TaskSlot, level: usize) -> (usize, usize) {
 /// A compact `(state-tag, aux)` per task for the trace differ: 0 = runnable, 1 = blocked-join
 /// (aux = child), 2 = blocked-wait (aux = address), 3 = done, 4 = blocked-stdin (a park/wake the differ
 /// records as no timeline edge: the wake is the embedder's `provide_stdin`, not another task's act),
-/// 5 = cap-parked (aux = completion id; likewise no edge — the wake is the embedder's `deliver_cap`),
+/// 5 = cap-parked (aux = completion id; likewise no edge — the wake is the call's answer),
 /// 6 = a park only the cooperative pump makes (the debug scheduler declines the ops behind them).
 fn trace_tags(tasks: &[TaskSlot]) -> Vec<(u8, u64)> {
     tasks
@@ -7837,6 +7157,7 @@ fn trace_tags(tasks: &[TaskSlot]) -> Vec<(u8, u64)> {
             TaskState::BlockedHostCap { id, .. } => (5, id),
             TaskState::BlockedSvc
             | TaskState::BlockedTicket { .. }
+            | TaskState::BlockedPage { .. }
             | TaskState::BlockedReap { .. }
             | TaskState::BlockedReapPersonality { .. }
             | TaskState::BlockedPipeRead { .. }
@@ -7960,7 +7281,7 @@ fn dbg_spawn(
     source: &ModuleSource,
     host: &mut Host,
 ) -> Result<(), Trap> {
-    let mut vt = thread_task(source, module, func, sp, arg)?;
+    let mut vt = thread_task(source, module, func, sp, arg, Some(host.own_node()))?;
     if live_tasks(tasks) >= super::MAX_VCPUS {
         return Err(Trap::ThreadFault); // thread bomb
     }
@@ -8056,10 +7377,9 @@ fn service_advance(
             *turn += 1;
             complete(tasks, ti, Err(t));
         }
-        // #1366 — a host-completed cap park: the call did not run and the turn holds (as a stdin
-        // park); `drive` reports `SchedStop::CapPark` once nothing else can run, and `deliver_cap`
-        // lands the value and re-admits the task. Until #1517 this engine failed closed here — and
-        // could not in fact reach it, since it never admitted host-completed punts at all.
+        // #1366 — a cap park: the call has no answer yet and the turn holds (as a stdin park). Once
+        // nothing else can run, `drive` takes its answer (#2047), reporting `SchedStop::CapPark`
+        // while it waits on its embedder (#2495); taking it re-admits the task and counts the turn.
         FiberStep::CapParked { id, dst, at } => {
             tasks[ti].state = TaskState::BlockedHostCap { id, dst, at };
         }
@@ -8081,13 +7401,17 @@ fn service_advance(
                     complete(tasks, ti, Err(t));
                 }
             }
-            Outcome::ThreadJoin { handle, dst, wait } => {
+            Outcome::ThreadJoin {
+                handle,
+                dst,
+                status,
+            } => {
                 *turn += 1;
-                join_child(tasks, ti, handle, dst, wait);
+                join_child(tasks, ti, handle, dst, status);
             }
             Outcome::ChildCtl { child, dst, ctl } => {
                 *turn += 1;
-                let spawners: Vec<_> = extra_envs.iter().map(DbgEnv::spawner).collect();
+                let spawners: Vec<_> = extra_envs.iter().map(|e| e.spawner).collect();
                 child_ctl(tasks, &spawners, ti, child, dst, ctl);
             }
             Outcome::ChildOffer {
@@ -8150,14 +7474,14 @@ fn service_advance(
                 woken += wake_fiber_waiters(regs, key, want - woken);
                 tasks[ti].deliver(dst, Reg::from_i32(woken as i32));
             }
-            // §5 `instantiate_detached` (op 15): a fresh window of its own as a debug task — the
+            // §5 detached spawn (op 17): a fresh window of its own as a debug task — the
             // cooperative executor's spawn on this path, so a spawning guest stays steppable through
             // its child (a `DbgEnv` over the child's own `Mem`, joined like a confined child's).
             Outcome::InstantiateDetached { spawn, dst } => {
                 *turn += 1;
-                if let Err(t) = dbg_instantiate_detached(
-                    tasks, ti, extra_envs, source, table, mem, host, spawn, dst,
-                ) {
+                if let Err(t) =
+                    dbg_instantiate_detached(tasks, ti, extra_envs, source, mem, host, spawn, dst)
+                {
                     complete(tasks, ti, Err(t));
                 }
             }
@@ -8197,6 +7521,11 @@ fn service_advance(
             | Outcome::SvcWait
             | Outcome::ChildOffer { grant: false, .. }
             | Outcome::CloneCaller { .. } => return Serviced::Declined,
+
+            // Paging: a page comes from its pager's serve loop, which this engine runs for no
+            // child; it declines a root that could page one when a session opens
+            // ([`may_page_a_child`]).
+            Outcome::PageFault(_) => return Serviced::Declined,
 
             // Process / POSIX seams: fork, exec, reap and pipes are the personality's, driven by the
             // run harness rather than the debug scheduler.
@@ -8263,9 +7592,7 @@ fn dbg_start_child(
     extra_envs: &mut Vec<DbgEnv>,
     host: &mut Host,
     child: AdmittedChild,
-    entry: i64,
     dst: u32,
-    place: EnvPlace,
 ) -> Result<(), Trap> {
     let spawner = tasks[ti].env;
     let room = live_tasks(tasks) < super::MAX_VCPUS;
@@ -8277,7 +7604,7 @@ fn dbg_start_child(
         host: child_host,
         fuel,
         lease,
-    } = child.build(entry, room, |lease| match spawner {
+    } = child.build(room, |lease| match spawner {
         None => host.release_detached(lease),
         Some(k) => extra_envs[k].host.release_detached(lease),
     })?;
@@ -8292,11 +7619,11 @@ fn dbg_start_child(
         // (#1944 slice 3).
         fuel: Fuel::fixed(fuel.can_burn()),
         fibers: FiberTables::default(),
-        place,
+        spawner,
     });
     let cidx = tasks.len();
     tasks.push(TaskSlot {
-        lease: lease.map(|lease| (spawner, lease)),
+        lease: Some((spawner, lease)),
         ..TaskSlot::new(vt, Some(eidx), LiveVcpu::none())
     });
     let handle = tasks[ti].threads.len() as i32;
@@ -8305,7 +7632,7 @@ fn dbg_start_child(
     Ok(())
 }
 
-/// §5 `instantiate_detached` (op 15) on the debugger path — [`dbg_instantiate_confined`]'s twin over
+/// §5 detached spawn (op 17) on the debugger path — [`dbg_instantiate_confined`]'s twin over
 /// a **fresh window** instead of a carve. Admission and the child powerbox are [`admit_detached_child`]
 /// (the executor's); the child is scheduled by [`dbg_start_child`], joined like a confined child.
 #[allow(clippy::too_many_arguments)]
@@ -8314,17 +7641,11 @@ fn dbg_instantiate_detached(
     ti: usize,
     extra_envs: &mut Vec<DbgEnv>,
     source: &ModuleSource,
-    table: &SharedSlots,
     shared_mem: &Option<Mem>,
     host: &mut Host,
     spawn: DetachedSpawn,
     dst: u32,
 ) -> Result<(), Trap> {
-    // The spawning frame's module, which a child of its own program runs (#2076, #2143), and the
-    // unit it is when the spawning domain installed it.
-    let spawner = spawner_module(source, &tasks[ti].vm.vt.active);
-    let table = tasks[ti].env.map_or(table, |k| &extra_envs[k].table);
-    let unit = table.jit_unit(tasks[ti].vm.vt.active.module);
     // The parent's window and the powerbox its handles resolve in: its own (#1727).
     let (pm, owner) = match tasks[ti].env {
         None => (shared_mem.as_ref(), &mut *host),
@@ -8333,16 +7654,12 @@ fn dbg_instantiate_detached(
             (e.mem.as_ref(), &mut e.host)
         }
     };
-    let Some((child, _)) =
-        admit_detached_in_process(owner, pm, spawn, source, spawner, unit, |_| None)?
+    let Some((child, _)) = admit_detached_in_process(owner, pm, spawn, source, |_| None, None)?
     else {
         tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
     };
-    let place = EnvPlace::Detached {
-        spawner: tasks[ti].env,
-    };
-    dbg_start_child(tasks, ti, extra_envs, host, child, spawn.entry, dst, place)
+    dbg_start_child(tasks, ti, extra_envs, host, child, dst)
 }
 
 /// #2220 — `Instantiator.grant` (op 19) from task `ti` into the child handle `child` names
@@ -8386,7 +7703,7 @@ fn dbg_jit_step_into(
 ) -> Result<(), Trap> {
     let parent_depth = vt.active.stack.len() + 1;
     vt.active_invoke = Some(Box::new(InvokeStep {
-        vt: VTask::of(invoke_entry(source, umod, args)?, 0),
+        vt: VTask::of(invoke_entry(source, umod, args, None)?, 0),
         fibers: FiberTables::default(),
         dst,
         results,
@@ -8631,17 +7948,98 @@ fn dbg_pick_runnable(
     }
 }
 
+/// #2047 — with nothing runnable and no timer left, a thread parked on a punted call takes its
+/// answer, counting the turn: the lowest-index one whose answer has come, or, with none come yet,
+/// the first to come (#2424 — one thread's answer never waits on another's call, which may wait on
+/// what that thread does). Taken only here, where nothing else could run meanwhile, so when it
+/// comes changes nothing a replay sees, and taped as it is taken ([`tape_answer`]).
+///
+/// `Ok` when a thread took its answer. Else, with no answer in, the lowest-index thread whose call
+/// waits on its embedder (#2495), as `(thread, id, at)`, for the run to stop on; or `None` when no
+/// thread is parked. The stop is the one found here: the embedder may answer the call from another
+/// thread before it sees the stop, and the next advance takes the answer. Looking for it again
+/// after this returned could find it answered, and the run, with its answer in, read as blocked.
+fn dbg_take_answer(
+    tasks: &mut [TaskSlot],
+    extra_envs: &mut [DbgEnv],
+    host: &mut Host,
+    turn: &mut u64,
+) -> Result<(), Option<(usize, u64, Option<super::IrPc>)>> {
+    let parked: Vec<_> = tasks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| match t.state {
+            TaskState::BlockedHostCap { id, dst, at } => Some((i, t.env, dst, id, at)),
+            _ => None,
+        })
+        .collect();
+    let calls: Vec<_> = parked
+        .iter()
+        .map(|&(_, env, _, id, _)| (dbg_completions(env, extra_envs, host), id))
+        .collect();
+    loop {
+        for &(p, env, dst, id, _) in &parked {
+            let h = match env {
+                None => &mut *host,
+                Some(k) => &mut extra_envs[k].host,
+            };
+            if let Some(r) = take_answer(h, id) {
+                tasks[p].deliver(dst, Reg::from_i64(r));
+                tasks[p].state = TaskState::Runnable;
+                *turn += 1;
+                return Ok(());
+            }
+        }
+        let on_embedder = parked
+            .iter()
+            .zip(&calls)
+            .find(|(_, (comps, id))| comps.is_host_owned(*id));
+        if let Some((&(p, _, _, id, at), _)) = on_embedder {
+            return Err(Some((p, id, at)));
+        }
+        if calls.is_empty() {
+            return Err(None);
+        }
+        super::Completions::wait_any(&calls, None, None);
+    }
+}
+
+/// Whether a thread is parked on a punted call the offload pool answers (#2047): its answer comes
+/// from outside the run, which a restore cannot reach, so it keeps a checkpoint and a journal state
+/// record out, as a fiber's cap park does. A host-completed park is the replay's to serve.
+fn pool_parked(tasks: &[TaskSlot], extra_envs: &[DbgEnv], host: &Host) -> bool {
+    tasks.iter().any(|t| match t.state {
+        TaskState::BlockedHostCap { id, .. } => {
+            !dbg_completions(t.env, extra_envs, host).is_host_owned(id)
+        }
+        _ => false,
+    })
+}
+
+/// The completion store of a debug task's domain: the root's, or its child env's.
+fn dbg_completions(
+    env: Option<usize>,
+    extra_envs: &[DbgEnv],
+    host: &Host,
+) -> std::sync::Arc<super::Completions> {
+    match env {
+        None => host.completions(),
+        Some(k) => extra_envs[k].host.completions(),
+    }
+}
+
 impl ScheduledDebugRun {
     /// Open a multithreaded debug session on `m`'s `func(args)`. `None` if the module is outside the
-    /// bytecode engine's subset (`compile_module` declines it). The powerbox is empty; use
-    /// [`new_with_host`](ScheduledDebugRun::new_with_host) to debug a guest needing a granted capability
-    /// (e.g. a §14 `Instantiator` for `instantiate`).
+    /// bytecode engine's subset (`compile_module` declines it), or may page a child, which this
+    /// scheduler cannot serve and the oracle's debugger can (#2164). The powerbox is empty; use
+    /// [`new_with_host`](ScheduledDebugRun::new_with_host) to debug a guest needing a granted
+    /// capability (e.g. a §14 `Instantiator` for `instantiate`).
     pub fn new(m: &Module, func: FuncIdx, args: &[Value]) -> Option<ScheduledDebugRun> {
         ScheduledDebugRun::new_with_host(m, func, args, Host::new())
     }
 
     /// [`new`](ScheduledDebugRun::new) carrying a live powerbox `host`, so a granted `Instantiator`
-    /// (`host.grant_instantiator(..)`) reaches the guest as an argument and makes an `instantiate`-using
+    /// (`host.grant_instantiator()`) reaches the guest as an argument and makes an `instantiate`-using
     /// multithreaded guest debuggable.
     pub fn new_with_host(
         m: &Module,
@@ -8650,6 +8048,11 @@ impl ScheduledDebugRun {
         host: Host,
     ) -> Option<ScheduledDebugRun> {
         m.funcs.get(func as usize)?;
+        // #2164 — this scheduler's domains sit in no cell, so it serves no child, as `Vcpu` serves
+        // none.
+        if may_page_a_child(m) {
+            return None;
+        }
         let root_md = std::sync::Arc::new(ModuleDebug::build(m));
         // Unfused: debug stepping (Slice 5a).
         let mut c = compile_module_unfused(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow))?;
@@ -8658,8 +8061,14 @@ impl ScheduledDebugRun {
         let mut source = ModuleSource::over(std::sync::Arc::new(c));
         source.debug = true;
         let source = std::sync::Arc::new(source);
-        let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
-        let vt = VTask::new(&source.primary(), func as usize, args).ok()?;
+        let mem = Mem::root(m, default_reserved_log2(), None, &[]);
+        let vt = VTask::new(
+            &source.primary(),
+            func as usize,
+            args,
+            Some(host.own_node()),
+        )
+        .ok()?;
         // #2113 — the run's window and main vCPU, charged to the powerbox's own node. The debugger
         // lends its fuel per resume. #2268 — a run the process has no room for is not debugged here.
         let mut host = host;
@@ -9112,11 +8521,6 @@ impl ScheduledDebugRun {
         } = self;
         let fn_block_base = &root_md.fn_block_base;
         *stopped = None;
-        // #1366: admit host-completed punts on this run's host, so an offloadable cap the embedder
-        // services asynchronously parks the thread (`CapParked`) instead of being waited inline.
-        // The single-vCPU engine does the same at the top of every advance; without it
-        // `wait_unless_host_owned` never yields `None` and this engine could not park at all.
-        host.completions().allow_host_completed();
         loop {
             if let TaskState::Done(res) = &tasks[0].state {
                 let res = res.clone();
@@ -9158,14 +8562,13 @@ impl ScheduledDebugRun {
                     // read (#1146 deeper) makes this a live `StdinPark` stop on that thread (the
                     // lowest-index one), else a true deadlock.
                     None => {
-                        // #1366: a thread parked on a host-completed cap is a live `CapPark`
-                        // stop on that thread (lowest-index), resumable via `deliver_cap`.
-                        if let Some((p, id, at)) =
-                            tasks.iter().enumerate().find_map(|(i, t)| match t.state {
-                                TaskState::BlockedHostCap { id, at, .. } => Some((i, id, at)),
-                                _ => None,
-                            })
-                        {
+                        let on_embedder = match dbg_take_answer(tasks, extra_envs, host, turn) {
+                            Ok(()) => continue,
+                            Err(on_embedder) => on_embedder,
+                        };
+                        // #1366: a thread parked on a host-answered cap is a live `CapPark` stop
+                        // on that thread (lowest-index), resumed once its embedder answers.
+                        if let Some((p, id, at)) = on_embedder {
                             // The stop location is the call itself, falling back to the live pc.
                             let pc = at.or_else(|| tasks[p].vm.vt.debug_active().cur_ir_pc(source));
                             if let Some(pc) = pc {
@@ -9211,7 +8614,7 @@ impl ScheduledDebugRun {
                         // A window-range watch (cross-thread) stops *before* the access; a value
                         // watch (#1229) stops when a watched SSA-held variable's value changed.
                         // Both name the root's window, which a task in a child's window does not
-                        // run in, though a child of the root's own program runs module 0 (#2076).
+                        // run in (#2076).
                         Some(pc) if tasks[ti].env.is_none() => watch_stop_before(
                             cur_vm,
                             &*mem,
@@ -9472,11 +8875,11 @@ impl ScheduledDebugRun {
             ..
         } = self;
         let fn_block_base = &root_md.fn_block_base;
-        host.completions().allow_host_completed(); // #1366: see `drive`
-                                                   // A task mid-coroutine is pinned (atomic resume — the same vCPU runs the whole body); the same
-                                                   // pin on replay reconstructs the coroutine's op sequence deterministically. The policy pick
-                                                   // (seed + forced) matches `drive`'s, so a tick-replay reproduces the interactive schedule.
-                                                   // A `CapParked` task is not runnable, so a parked run refuses to tick — as the single engine's.
+        // A task mid-coroutine is pinned (atomic resume — the same vCPU runs the whole body); the
+        // same pin on replay reconstructs the coroutine's op sequence deterministically. The policy
+        // pick (seed + forced) matches `drive`'s, so a tick-replay reproduces the interactive
+        // schedule. A `CapParked` task is not runnable, so a parked run refuses to tick — as the
+        // single engine's.
         let pre_pick = (sched_trace.is_some() || sched_sink.is_some()).then(|| trace_tags(tasks));
         let Some(ti) = dbg_pinned_coro(tasks).or_else(|| {
             let pref = span_at(step_spans, *turn); // #1942: replay a recorded step's thread
@@ -9491,7 +8894,9 @@ impl ScheduledDebugRun {
                 *turn,
             )
         }) else {
-            return false; // no runnable thread and no waiter (deadlock) — can't advance
+            // A parked thread's answer is this tick, as in `drive`; else no runnable thread and no
+            // waiter (deadlock, or its embedder's to answer) — can't advance.
+            return dbg_take_answer(tasks, extra_envs, host, turn).is_ok();
         };
         if let Some(before) = pre_pick.as_ref() {
             let mut events = Vec::new();
@@ -9617,48 +9022,30 @@ impl ScheduledDebugRun {
         }
     }
 
-    /// #1366 — the completion id some thread is parked on (a host-completed cap call), if any: the
-    /// lowest-index parked thread's. The backend reports it as `StopReason::CapPark { id }`;
-    /// [`deliver_cap`](ScheduledDebugRun::deliver_cap) resumes it.
+    /// #1366 — the completion id some thread is parked on (a host-answered cap call its embedder
+    /// has not answered yet), if any: the lowest-index parked thread's. The backend reports it as
+    /// `StopReason::CapPark { id }`; once its [`crate::Completer`] has answered, the next advance
+    /// takes the answer. A park the offload pool answers is not one (#2047).
     pub fn cap_parked(&self) -> Option<u64> {
-        self.tasks.iter().find_map(|t| match t.state {
-            TaskState::BlockedHostCap { id, .. } => Some(id),
-            _ => None,
-        })
+        self.host_cap_park().map(|(id, _)| id)
     }
 
     /// #1366 — the pc of the host-completed cap call the parked thread is on (the stop location), if
     /// parked and the call had a source position.
     pub fn cap_park_pc(&self) -> Option<super::IrPc> {
-        self.tasks.iter().find_map(|t| match t.state {
-            TaskState::BlockedHostCap { at, .. } => at,
-            _ => None,
-        })
+        self.host_cap_park().and_then(|(_, at)| at)
     }
 
-    /// #1366 — finish the host-completed cap call a thread is parked on: `value` lands in the call's
-    /// result slot, the completion settles, the delivered value joins the cap tape as the call's record
-    /// (so a reverse `seek` replays it without re-parking), the thread is re-admitted, and the op
-    /// counts on the turn. `false` if no thread is parked on `id`. The twin of `provide_stdin`, and
-    /// op-for-op the same delivery the single-vCPU engine performs.
-    pub fn deliver_cap(&mut self, id: u64, value: i64) -> bool {
-        let Some((ti, dst)) = self
-            .tasks
-            .iter()
-            .enumerate()
-            .find_map(|(i, t)| match t.state {
-                TaskState::BlockedHostCap { id: pid, dst, .. } if pid == id => Some((i, dst)),
-                _ => None,
-            })
-        else {
-            return false;
-        };
-        settle_host_cap(&mut self.host, id, value);
-        let _ = self.host.completions().try_take(id);
-        self.tasks[ti].deliver(dst, Reg::from_i64(value));
-        self.tasks[ti].state = TaskState::Runnable;
-        self.turn += 1;
-        true
+    /// The lowest-index thread's park on a host-completed cap call: its id and the call's pc.
+    fn host_cap_park(&self) -> Option<(u64, Option<super::IrPc>)> {
+        self.tasks.iter().find_map(|t| match t.state {
+            TaskState::BlockedHostCap { id, at, .. }
+                if dbg_completions(t.env, &self.extra_envs, &self.host).is_host_owned(id) =>
+            {
+                Some((id, at))
+            }
+            _ => None,
+        })
     }
 
     /// Position the session at the current schedule point after a raw `tick`-replay `seek`: the stopped +
@@ -9686,18 +9073,13 @@ impl ScheduledDebugRun {
     /// multi-vCPU time-travel **checkpoint** (W1) snapshots, over every task:
     /// **§12 fibers** are admitted (the run-shared registry + each task's active fiber / resume chain,
     /// all sharing the run's window) except an event-parked (`memory.wait`) fiber (non-deterministic
-    /// wall-clock deadline); **§14 coroutines** are admitted (not demand, pristine `nested_view`),
-    /// same-module *or* separate-module (a separate module's pushed unit rides in `extra_units`); and
-    /// **§14 `instantiate` / `instantiate_module` children** are admitted (each [`DbgEnv`] a `nested_view`
-    /// over the shared backing + a deterministic `Instantiator`/`AddressSpace` powerbox + a natural table
-    /// over the child's module, rebuilt on restore) — this is what admits scheduled coroutines, which only
-    /// ever arise alongside an `instantiate` sibling (the bytecode engine rejects `coroutine + thread`).
-    /// Both coroutines and children may be **demand**/self-page-mapping: each child's own page map is
-    /// captured (`child_checkpointable`: `layout_snapshot_safe`, no §13 regions, within the parent's
-    /// prefix) and its bytes ride in the shared snapshot. The root's §13 regions ride the moment
-    /// ([`Moment::checkpoint`](super::moment::Moment::checkpoint), #2026), its window's aliases in its
-    /// page map. Still excluded (→ replay-from-turn-0): a child holding or aliasing a region, or one
-    /// carved beyond the parent's captured prefix.
+    /// wall-clock deadline); **§14 children** are admitted, each [`DbgEnv`] carrying its own window
+    /// image and powerbox ([`DetachedLive`]) and rebuilt under its spawner's on restore
+    /// ([`rebuild_detached_env`]), or nothing of either once spent (#1866). The root's §13 regions
+    /// ride the moment ([`Moment::checkpoint`](super::moment::Moment::checkpoint), #2026), its
+    /// window's aliases in its page map. Still excluded (→ replay-from-turn-0): a task
+    /// mid-§22-invoke, and a live child with no window, a `Jit` table, a §13 region, or a powerbox
+    /// binding that is not a plain value.
     fn checkpointable(&self) -> Result<(), Refusal> {
         // A task mid-§22-invoke is out-of-subset (CONSOLIDATION.md §11 debug boundary).
         if self.tasks.iter().any(|t| t.vm.vt.active_invoke.is_some()) {
@@ -9708,27 +9090,22 @@ impl ScheduledDebugRun {
                 .fibers
                 .iter()
                 .chain(self.extra_envs.iter().flat_map(|e| e.fibers.fibers.iter())),
-        ) {
+        ) || pool_parked(&self.tasks, &self.extra_envs, &self.host)
+        {
             return Err(Refusal::Fiber);
         }
-        // A detached child's window is its own (#1866): its image rides its env's snapshot, so only a
+        // A child's window is its own (#1866): its image rides its env's snapshot, so only a
         // §13 region keeps it out; and once spent, nothing of it does. Its powerbox must be plain
         // values, which the capture itself checks (`env_snapshot`).
         for (k, e) in self.extra_envs.iter().enumerate() {
-            match e.place {
-                EnvPlace::Carve => {
-                    child_host_admits(&e.host)?;
-                    child_checkpointable(e.mem.as_ref(), self.mem.as_ref())?;
-                }
-                EnvPlace::Detached { .. } if env_spent(&self.tasks, &self.extra_envs, k) => {}
-                EnvPlace::Detached { .. } => {
-                    child_host_admits(&e.host)?;
-                    match &e.mem {
-                        None => return Err(Refusal::NoWindow),
-                        Some(m) if !m.layout_snapshot_safe() => return Err(Refusal::Region),
-                        Some(_) => {}
-                    }
-                }
+            if env_spent(&self.tasks, &self.extra_envs, k) {
+                continue;
+            }
+            child_host_admits(&e.host)?;
+            match &e.mem {
+                None => return Err(Refusal::NoWindow),
+                Some(m) if !m.layout_snapshot_safe() => return Err(Refusal::Region),
+                Some(_) => {}
             }
         }
         Ok(())
@@ -9832,22 +9209,15 @@ impl ScheduledDebugRun {
         self.source.reset_extra(&c.extra_units);
         // The units past the restored ones are gone, and a later spawn adds its module afresh.
         self.line_bps.unbind();
-        // Rebuild each task's full `VTask` and each §14 `instantiate`-child env. Coroutine and carve
-        // windows are `nested_view`s over the shared window (their bytes — shared via the backing
-        // region — are already correct); each table is rebuilt over the child's own module. A
-        // detached child's env is rebuilt under its spawner's, which comes back first (#1866).
+        // Rebuild each task's full `VTask` and each §14 child env, each table over the child's own
+        // module. A child's env is rebuilt under its spawner's, which comes back first (#1866).
         let mut envs: Vec<DbgEnv> = Vec::with_capacity(c.extra_envs.len());
         for es in &c.extra_envs {
-            let env = match &es.detached {
-                None => rebuild_env(es, self.mem.as_ref(), &self.source),
-                Some(d) => {
-                    let spawner = match d.spawner {
-                        None => &mut self.host,
-                        Some(k) => &mut envs[k].host,
-                    };
-                    rebuild_detached_env(es, d, spawner, &self.source)
-                }
+            let spawner = match es.spawner {
+                None => &mut self.host,
+                Some(k) => &mut envs[k].host,
             };
+            let env = rebuild_detached_env(es, spawner, &self.source);
             envs.push(env);
         }
         self.extra_envs = envs;
@@ -9857,9 +9227,23 @@ impl ScheduledDebugRun {
             .map(|ts| TaskSlot {
                 vm: Box::new(TaskVm {
                     vt: VTask {
-                        active: ts.active.clone(),
+                        // #2336 — and its register files, as its thread is below: its own and
+                        // those of the fibers on its resume chain.
+                        active: {
+                            let mut vm = ts.active.clone();
+                            vm.recharge();
+                            vm
+                        },
                         active_id: ts.active_id,
-                        chain: ts.chain.clone(),
+                        chain: ts
+                            .chain
+                            .iter()
+                            .map(|(k, vm, dst)| {
+                                let mut vm = vm.clone();
+                                vm.recharge();
+                                (*k, vm, *dst)
+                            })
+                            .collect(),
                         root_shadow_sp: ts.root_shadow_sp,
                         active_invoke: None, // never captured mid-invoke (`checkpointable`)
                     },
@@ -9953,7 +9337,7 @@ impl ScheduledDebugRun {
     }
 
     /// A [`FrameReader`] over the **focused** thread's currently-stepping `Vm` (what `select_task` chose):
-    /// the thread's own vCPU over its window (a confined `instantiate` child reads its `nested_view`).
+    /// the thread's own vCPU over its window (a §14 child's own, for a task in a child env).
     fn reader(&self) -> FrameReader<'_> {
         let vm = self.tasks[self.focus].vm.vt.debug_active();
         FrameReader {
@@ -10086,7 +9470,7 @@ pub fn compile_and_run_sliced(
         return Some(Err(Trap::Malformed));
     }
     let dom = Domain::new(c, 0);
-    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
+    let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
     let mut host = Host::new();
     Some(drive(
         dom,
@@ -10502,23 +9886,28 @@ fn fork_bare<T>(children: &[Option<T>], vt: &VTask) -> bool {
 }
 
 /// What a fork twin takes from its parent's process (the oracle's `fork_vcpu`): one `spawn` of the
-/// node they share while it lives (#2001), a private copy of its window `mem`, and its powerbox
-/// `host` duplicated as process `pid`, which pays the node for the copy (#2106). `None` refuses the
-/// fork, with nothing left charged: a full ceiling, or a window or powerbox that cannot be duplicated.
-/// The window is copied outside the powerbox's lock.
+/// node they share while it lives (#2001), its task ([`twin_task`]: the `parent` frame answered
+/// `reply` at `dst`), a private copy of its window `mem`, and its powerbox `host` duplicated as
+/// process `pid`, which pays the node for the copy (#2106). `None` refuses the fork, with nothing
+/// left charged: a full ceiling, or a window or powerbox that cannot be duplicated. The powerbox
+/// comes last: its providers register the process as they copy it, so nothing after may refuse the
+/// fork (#2373). The window is copied outside the powerbox's lock.
 fn fork_process(
     host: &std::sync::Mutex<Host>,
     mem: Option<&Mem>,
     pid: u64,
-) -> Option<(Option<Mem>, Host, LiveVcpu)> {
-    let live = LiveVcpu::charge(host.lock_unpoisoned().own_node())?;
+    (parent, dst, reply): (&Vm, u32, i64),
+) -> Option<(Option<Mem>, Host, LiveVcpu, VTask)> {
+    let payer = host.lock_unpoisoned().own_node();
+    let live = LiveVcpu::charge(payer.clone())?;
+    let task = twin_task(parent, dst, reply, payer)?;
     let twin_mem = match mem {
         Some(m) => Some(m.fork_private()?),
         None => None,
     };
     let window = mem.map_or(0, Mem::mapped_size);
     let twin_host = host.lock_unpoisoned().fork_powerbox(pid, window)?;
-    Some((twin_mem, twin_host, live))
+    Some((twin_mem, twin_host, live, task))
 }
 
 /// Wire a new process's powerbox as the root's is: its own park door, which its personality's
@@ -10552,12 +9941,19 @@ fn wire_kill(host: &Host) {
 }
 
 /// A fork twin's task: its parent's frame (`parent`, a bare root's, so no resume chain or invoke) at
-/// the post-fork resume point, answered `reply` at `dst` — the return-twice value.
-fn twin_task(parent: &Vm, dst: u32, reply: i64) -> VTask {
+/// the post-fork resume point, answered `reply` at `dst` — the return-twice value. #2336 — its copy
+/// of its parent's register file is its own, charged to `payer`, the node it shares with its parent,
+/// as its window is: `None`, with nothing charged, when there is no room for it, which fails the
+/// fork as no room for the window does.
+fn twin_task(parent: &Vm, dst: u32, reply: i64, payer: NodeRef) -> Option<VTask> {
     let mut active = parent.clone();
+    active.room = RegsRoom::new(Some(payer));
+    if !active.room.charge.resize(reg_bytes(active.regs.capacity())) {
+        return None;
+    }
     active.set(dst, Reg::from_i64(reply));
     let root_shadow_sp = active.durable_region_base + super::REGION_HEADER_LEN; // its context's empty frame base
-    VTask::of(active, root_shadow_sp)
+    Some(VTask::of(active, root_shadow_sp))
 }
 
 /// FORK.md §8.6 (#1080) — build the `execve` image-replace for the bytecode engine's exec pump arm,
@@ -10637,7 +10033,7 @@ fn exec_image_build(
     let win = m.exec_window(
         back,
         img.child_size,
-        &img.module.data,
+        &img.module,
         temen_ir::module_null_guard(),
         args.as_deref(),
     );
@@ -10649,7 +10045,9 @@ fn exec_image_build(
     child_host.start_window(win.window_runs());
     let cunit = dom.source.get(cm).ok_or(super::EINVAL)?;
     let child_table = build_table_for(cunit.progs.len(), child_host.jit_table_log2(), cm as u32);
-    let new_vt = entry_task(&cunit, cm, entry as usize, &child_args).map_err(|_| super::EINVAL)?;
+    let payer = Some(child_host.own_node());
+    let new_vt =
+        entry_task(&cunit, cm, entry as usize, &child_args, payer).map_err(|_| super::EINVAL)?;
     let leaf = leaf.map(|(paged, parks)| LeafStart {
         module: cm as u32,
         entry: entry as u32,
@@ -10730,10 +10128,15 @@ impl DispatchParks {
 enum Outcome {
     Done(Vec<Value>),
     Suspended,
-    /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): a direct `Call` to an eligible
-    /// function of program `module` ([`Vm::jit_module`]). The host runs the emitted `f{func}`
-    /// region and delivers its `n_results` results to the absolute register slot `dst`. `argv` is
-    /// the marshalled arguments (raw i64 slots). `mapped` is the window's scalar committed extent
+    /// §2.2 / #2164 — a demand-paged child's recoverable fault at this window address: its pager
+    /// must supply the page. The cursor sits AT the faulting op, which re-executes once the page is
+    /// in place. Only a child the driver pages raises it ([`Host::pager`]).
+    PageFault(u64),
+    /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): a call, direct or `call.dyn`, to an
+    /// eligible function of program `module` ([`Vm::jit_module`]), or a task's eligible entry
+    /// ([`Vm::jit_entry`]). The host runs the emitted `f{func}` region and delivers its `n_results`
+    /// results to `dst`: the caller frame's slots, or the task's end. `argv` is the marshalled
+    /// arguments (raw i64 slots). `mapped` is the window's scalar committed extent
     /// at call entry ([`Mem::scalar_extent`]) — the host MUST write it to the emitted module's
     /// `"mapped"` global before invoking `f{func}`, so the emitted bounds check admits exactly what
     /// the interpreter would (#717). Surfaced only when the extent is scalar-representable;
@@ -10742,7 +10145,7 @@ enum Outcome {
         module: u32,
         func: u32,
         argv: Box<[i64]>,
-        dst: usize,
+        dst: TierUpDst,
         results: Box<[ValType]>,
         mapped: u64,
     },
@@ -10787,12 +10190,12 @@ enum Outcome {
         dst: u32,
         module: usize,
     },
-    /// `thread.join`: park until child `handle` finishes; its result (or trap) lands at `dst` — or,
-    /// with `wait` (`Instantiator.wait`, op 18), how it ended ([`super::join_delivery`]).
+    /// A join (`thread.join`, or with `status` a §14 child's `Instantiator.join`, op 1): park until
+    /// child `handle` ends; what it gives the joiner lands from `dst` ([`super::join_delivery`]).
     ThreadJoin {
         handle: i32,
         dst: u32,
-        wait: bool,
+        status: bool,
     },
     /// §3.6 (I36 slice 2) — a caller's `call.cap` through a live-callee offer. The dispatch is
     /// already enqueued on the callee (the op exec holds the callee `Arc`); the driver parks this
@@ -10827,19 +10230,17 @@ enum Outcome {
     /// twin. Driver-side (it owns the task/env set + the parked caller). `reply_orig` = `Some` in the
     /// explicit two-reply form, `None` in pid mode (the parent gets the twin's task id). The driver
     /// reads the handler's `serve_ticket` to name the caller; the twin handle (or an errno) lands at
-    /// `dst` when `has_result`.
+    /// `dst`.
     CloneCaller {
         reply_orig: Option<i64>,
         reply_twin: i64,
         dst: u32,
-        has_result: bool,
     },
     /// FORK.md §9.2 — `reap`: reap twin `pid` on behalf of the caller parked on this handler's
     /// dispatch ([`Outcome::Reap`]).
     Reap {
         pid: i64,
         dst: u32,
-        has_result: bool,
     },
     /// FORK.md §8.6 — `exec_module` (`execve` image-replace, #1080): the running vCPU asks the driver
     /// to replace its image with command module `mh`, granting the by-name cap list at `(grants_ptr,
@@ -10892,7 +10293,7 @@ enum Outcome {
     PipeWrite {
         pipe: u32,
     },
-    /// §5 `Instantiator.instantiate_detached` (op 15, #1286) or a §3d record (op 17): the driver
+    /// §5 `Instantiator.instantiate_rec` (op 17, #1286): the driver
     /// admits the separate-module child `spawn` describes, in a fresh window of its own
     /// ([`admit_detached_child`]), and writes the join handle (or `EINVAL`) to `dst`. The child runs
     /// on the scheduler, joinable via the shared thread machinery (`Instantiator.join` compiles to
@@ -11061,12 +10462,11 @@ enum FiberState {
     /// call punted to the offload pool (`Pending(completion_id)`) and parked the FIBER, not its
     /// vCPU (the oracle's `CapPending` fiber park, `fiber_parks.rs`). Not resumable until the
     /// completion is claimed into `woken`; a `cont.resume` meanwhile reports `FIBER_PARKED`
-    /// without switching (the cooperative poll). Claims happen ONLY through the ordered drain
-    /// (`drain_cap_parked` — smallest outstanding id first, stop at the first not-yet-arrived),
-    /// so a later completion never overtakes an earlier parked fiber: bit-exact with the
-    /// oracle's `completion_drain` (the §18 pin). The drain runs at each `cont.resume` poll of
-    /// a cap-parked fiber and at driver idle (which blocks on the completion store when only
-    /// cap parks remain — a pool completion is pending work, never a deadlock).
+    /// without switching (the cooperative poll). Claims happen ONLY through the drain
+    /// (`drain_cap_parked`), each call's answer as it comes (#2477), as the oracle's
+    /// `completion_drain` delivers them. The drain runs at each `cont.resume` poll of a cap-parked
+    /// fiber and at driver idle (which blocks on the completion store when only cap parks remain —
+    /// a pool completion is pending work, never a deadlock).
     CapParked {
         vm: Vm,
         /// The `call.cap`'s result register in `vm`; the waking resume writes the scalar here.
@@ -11119,7 +10519,13 @@ impl FiberTables {
     /// fiber not yet done takes its charge on `host`'s node again, past any ceiling, as a thaw's
     /// re-created fiber does. The restore then puts back the budget tree as the checkpoint saw it,
     /// which held these charges.
-    fn restored(fibers: Vec<FiberState>, host: &Host) -> FiberTables {
+    fn restored(mut fibers: Vec<FiberState>, host: &Host) -> FiberTables {
+        // #2336 — and its register file, which the tree charged too.
+        for f in &mut fibers {
+            if let FiberState::Parked { vm, .. } | FiberState::HostParked { vm, .. } = f {
+                vm.recharge();
+            }
+        }
         let meta = fibers
             .iter()
             .map(|f| FiberMeta {
@@ -11149,55 +10555,30 @@ struct FiberMeta {
     charge: LiveFiber,
 }
 
-/// A **run-shared** §12 fiber registry for vCPUs on separate OS threads or Web Workers (#1761): one
-/// handle namespace for the root and all its `thread.spawn` children, so a fiber created on one vCPU
-/// can be resumed on another (D57 migration) — the cooperative driver's single registry, and the
-/// tree-walker's `FiberRegistry`, made shareable. Attach with [`Vcpu::with_shared_fibers`]. The
-/// lock is a leaf, held only for a fiber state transition
-/// (`cont.new`, the `cont.resume` claim, `suspend`, a fiber's return) or a `gc.roots` scan, never
-/// across execution. The claim is the arbiter: `cont.resume` swaps a parked fiber for a `Running`
-/// marker under the lock, so exactly one resumer wins and any other gets `FiberFault`.
-#[derive(Default)]
-pub struct SharedFibers(std::sync::Mutex<FiberTables>);
-
-impl SharedFibers {
-    pub fn new() -> SharedFibers {
-        SharedFibers::default()
-    }
-}
-
 /// How [`step_vcpu`] reaches the run's fiber registry — the fiber twin of [`HostCell`]: exclusively
-/// owned tables (the cooperative driver, the freeze unwind, a `Vcpu` with no shared registry), or a
-/// [`SharedFibers`] locked per transition (the parallel driver, the browser's Worker driver).
+/// owned tables (the cooperative driver, the freeze unwind, a `Vcpu`), or a registry inside
+/// executor 2's scheduling core, locked per transition.
 enum FiberCell<'a> {
     Excl {
         fibers: &'a mut Vec<FiberState>,
         sp: &'a mut Vec<u64>,
         meta: &'a mut Vec<FiberMeta>,
     },
-    Shared(&'a SharedFibers),
     /// Executor 2 ([`drive_threads`]): a domain's registry inside the run's scheduling core, under
     /// the core's lock — the root domain's (`None`) or child env `k`'s (`Some(k)`).
     Core(&'a std::sync::Mutex<Threads>, Option<usize>),
 }
 
 impl FiberCell<'_> {
-    /// Run `f` over the three tables: directly (`Excl`) or under the registry's lock (`Shared`,
-    /// `Core`). `f` is called in one place, so each use inlines one copy of it.
+    /// Run `f` over the three tables: directly (`Excl`) or under the registry's lock (`Core`). `f` is called in one place, so each use inlines one copy of it.
     #[inline]
     fn with<R>(
         &mut self,
         f: impl FnOnce(&mut Vec<FiberState>, &mut Vec<u64>, &mut Vec<FiberMeta>) -> R,
     ) -> R {
-        let mut shared;
         let mut core;
         let (fibers, sp, meta) = match self {
             FiberCell::Excl { fibers, sp, meta } => (&mut **fibers, &mut **sp, &mut **meta),
-            FiberCell::Shared(s) => {
-                shared = s.0.lock_unpoisoned();
-                let t = &mut *shared;
-                (&mut t.fibers, &mut t.sp, &mut t.meta)
-            }
             FiberCell::Core(m, env) => {
                 core = m.lock_unpoisoned();
                 let c = &mut core.core;
@@ -11217,7 +10598,6 @@ impl FiberCell<'_> {
     fn view(&self) -> FiberRegRef<'_> {
         match self {
             FiberCell::Excl { fibers, .. } => FiberRegRef::Owned(fibers),
-            FiberCell::Shared(s) => FiberRegRef::Shared(s),
             FiberCell::Core(m, env) => FiberRegRef::Core(m, *env),
         }
     }
@@ -11240,13 +10620,12 @@ impl FiberCell<'_> {
     }
 }
 
-/// A fiber registry as a `gc.roots` view ([`Beneath`]) holds it: borrowed tables, or a run-shared
-/// registry locked only while the scan reads it (#1761) — so a drive paused beneath a nested one
-/// never holds the lock across the nested one's execution.
+/// A fiber registry as a `gc.roots` view ([`Beneath`]) holds it: borrowed tables, or executor 2's
+/// registry locked only while the scan reads it — so a drive paused beneath a nested one never
+/// holds the lock across the nested one's execution.
 #[derive(Clone, Copy)]
 enum FiberRegRef<'a> {
     Owned(&'a [FiberState]),
-    Shared(&'a SharedFibers),
     /// A registry inside executor 2's core ([`FiberCell::Core`]).
     Core(&'a std::sync::Mutex<Threads>, Option<usize>),
 }
@@ -11278,7 +10657,8 @@ fn take_pending(fibers: &mut [FiberState], slot: usize) -> Option<i64> {
 
 /// #1538 — whether a durable freeze is in progress (the global freeze word reads `UNWINDING`): a park
 /// under it is **fresh** (the resumer's trailing poll unwinds before it observes the value), one under
-/// `NORMAL` is consumed by the resumer that runs on.
+/// `NORMAL` is consumed by the resumer that runs on. Callers ask only for a durable run: any other
+/// keeps its own data at the guard base (#2101).
 fn is_unwinding(mem: &Option<Mem>) -> bool {
     mem.as_ref().map(|m| m.durable_state()) == Some(super::STATE_UNWINDING)
 }
@@ -11353,13 +10733,14 @@ fn claim_fiber(
             _ => None,
         })
         .is_some_and(|on| host.with(|h| on.ready(h)));
-    // F2 (FIBER_PARK.md) — a poll of a cap-parked fiber runs the ordered drain first (so a busy
-    // resume-poll loop observes its completion without waiting for driver idle — the WaitParked
-    // `real_deadline` shape, completion form). The drain, not a direct `try_take`, so a poll of a
-    // LATER id never lets its ready result overtake an earlier outstanding park (the §18 pin).
+    // F2 (FIBER_PARK.md) — a poll of a cap-parked fiber runs the drain first, so a busy
+    // resume-poll loop observes its completion without waiting for driver idle (the WaitParked
+    // `real_deadline` shape, completion form).
     if fibers.with(|f, _, _| matches!(f.get(k), Some(FiberState::CapParked { woken: None, .. }))) {
         let comps = host.with(|p| p.completions());
-        fibers.with(|f, _, _| drain_cap_parked(f, &comps));
+        for (id, r) in fibers.with(|f, _, _| drain_cap_parked(f, &comps)) {
+            host.with(|p| tape_answer(p, id, r));
+        }
     }
     let blocked = || match blocking_ip {
         Some(_) if may_block => Claim::Block,
@@ -11478,6 +10859,7 @@ fn claim_fiber(
 /// JIT's `fn_table` resolve it), so a fiber may start on an **installed §22 unit** function, not only a
 /// module-0 one (#1226, DESIGN.md §22 "Concurrency"). A forged or mistyped funcref is a `FiberFault`.
 /// The fiber spills into its own durable shadow region (slot `k` = context `k + 1`, §12.8 4A.5).
+#[allow(clippy::too_many_arguments)]
 fn start_fiber(
     source: &ModuleSource,
     table: &SharedSlots,
@@ -11486,10 +10868,11 @@ fn start_fiber(
     funcref: i32,
     sp: i64,
     arg: i64,
+    payer: Option<NodeRef>,
 ) -> Result<Vm, Trap> {
     let (module, func, unit) =
         resolve_fiber_entry(source, table, funcref).ok_or(Trap::FiberFault)?;
-    let mut vm = Vm::new(&unit, func, &[Value::I64(sp), Value::I64(arg)])?;
+    let mut vm = Vm::new(&unit, func, &[Value::I64(sp), Value::I64(arg)], payer)?;
     vm.module = module;
     vm.durable_region_base = mem
         .as_ref()
@@ -11542,7 +10925,7 @@ fn suspend_fiber(
     // `vcpu.tls` goes back to the resumer with execution (the fiber may have set it).
     resumer.tls = vt.active.tls;
     let suspended = std::mem::replace(&mut vt.active, resumer);
-    let consumed = !is_unwinding(mem);
+    let consumed = !(durable && is_unwinding(mem));
     fibers.with(|f, _, _| {
         f[id] = FiberState::Parked {
             vm: suspended,
@@ -11642,34 +11025,106 @@ impl HostWait {
     }
 }
 
-/// F2 (FIBER_PARK.md) — the ordered completion drain over the fiber registry: claim ready punt
-/// completions for [`FiberState::CapParked`] fibers **smallest-id-first, stopping at the first
-/// not-yet-arrived** — the bytecode mirror of the oracle scheduler's `completion_drain`
-/// (submission-ordered delivery, the §18 pin). Returns whether anything was claimed.
-fn drain_cap_parked(fibers: &mut [FiberState], comps: &super::Completions) -> bool {
-    let mut claimed = false;
-    loop {
-        let Some((fi, id)) = fibers
-            .iter()
-            .enumerate()
-            .filter_map(|(i, f)| match f {
-                FiberState::CapParked {
-                    id, woken: None, ..
-                } => Some((i, *id)),
-                _ => None,
-            })
-            .min_by_key(|&(_, id)| id)
-        else {
-            return claimed;
-        };
-        let Some(r) = comps.try_take(id) else {
-            return claimed;
-        };
-        if let FiberState::CapParked { woken, .. } = &mut fibers[fi] {
-            *woken = Some(r);
+/// F2 (FIBER_PARK.md) — the completion drain over the fiber registry: claim each
+/// [`FiberState::CapParked`] fiber's answer that has come (#2477), as the oracle scheduler's
+/// `completion_drain` does. A call that has not answered holds back no other. Returns the answers
+/// claimed, `(id, answer)`, for the caller to tape over the domain's powerbox ([`tape_answer`]),
+/// which this registry's lock must not be held across.
+fn drain_cap_parked(fibers: &mut [FiberState], comps: &super::Completions) -> Vec<(u64, i64)> {
+    let mut claimed = Vec::new();
+    for f in fibers.iter_mut() {
+        if let FiberState::CapParked {
+            id,
+            woken: woken @ None,
+            ..
+        } = f
+        {
+            if let Some(r) = comps.try_take(*id) {
+                *woken = Some(r);
+                claimed.push((*id, r));
+            }
         }
-        claimed = true;
     }
+    claimed
+}
+
+/// #2047 — wake each task parked on a punted call whose answer has come, once a round: no one polls
+/// a parked task, as a resumer polls a parked fiber ([`drain_cap_parked`]). A task is a vCPU of its
+/// own, so between tasks the order is whatever the world's is, as on the oracle. Each task's call is
+/// in its own domain's store, a child's as the root's (#2424).
+fn drain_task_completions(tasks: &mut [TaskSlot], extra_envs: &[ChildEnv], root: &DomainCell) {
+    for t in tasks.iter_mut() {
+        if let TaskState::BlockedHostCap { id, dst, .. } = t.state {
+            let answer = take_answer(
+                &mut task_host(root, extra_envs, t.env).lock_unpoisoned(),
+                id,
+            );
+            if let Some(r) = answer {
+                t.deliver(dst, Reg::from_i64(r));
+                t.state = TaskState::Runnable;
+            }
+        }
+    }
+}
+
+/// #2424 — [`drain_cap_parked`] over every domain's fiber registry, each against its own store:
+/// the root's (`fibers`) and each child's. Whether anything was claimed.
+fn drain_fiber_completions(
+    fibers: &mut [FiberState],
+    extra_envs: &mut [ChildEnv],
+    root: &DomainCell,
+) -> bool {
+    let regs = std::iter::once((fibers, root)).chain(
+        extra_envs
+            .iter_mut()
+            .map(|e| (&mut e.fibers.fibers[..], &e.host)),
+    );
+    let mut claimed = false;
+    for (reg, host) in regs {
+        if reg
+            .iter()
+            .any(|f| matches!(f, FiberState::CapParked { woken: None, .. }))
+        {
+            let mut host = host.lock_unpoisoned();
+            for (id, r) in drain_cap_parked(reg, &host.completions()) {
+                tape_answer(&mut host, id, r);
+                claimed = true;
+            }
+        }
+    }
+    claimed
+}
+
+/// The punted calls whose answer would wake a parked task, each with the domain it was made in
+/// (`None` the root): a task's own (`BlockedHostCap`), and that of a `CapParked` fiber a task
+/// resumes, blocking (`BlockedOnFiber`), as the parallel driver counts them. A fiber no task
+/// resumes is left out, one of a domain that has finished, say (#2480): its answer wakes no one,
+/// so nothing waits for it.
+fn outstanding_calls(
+    tasks: &[TaskSlot],
+    fibers: &[FiberState],
+    extra_envs: &[ChildEnv],
+) -> Vec<(Option<usize>, u64)> {
+    let parked = |t: &TaskSlot| match t.state {
+        TaskState::BlockedHostCap { id, .. } => Some(id),
+        TaskState::BlockedOnFiber { fiber } => {
+            let reg = match t.env {
+                None => fibers,
+                Some(k) => &extra_envs[k].fibers.fibers[..],
+            };
+            match reg.get(fiber) {
+                Some(FiberState::CapParked {
+                    id, woken: None, ..
+                }) => Some(*id),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    tasks
+        .iter()
+        .filter_map(|t| parked(t).map(|id| (t.env, id)))
+        .collect()
 }
 
 /// The root activation's id in a vCPU's resume chain (it has no fiber handle).
@@ -11724,10 +11179,15 @@ struct InvokeStep {
 }
 
 impl VTask {
-    fn new(c: &Compiled, entry: usize, args: &[Value]) -> Result<VTask, Trap> {
+    fn new(
+        c: &Compiled,
+        entry: usize,
+        args: &[Value],
+        payer: Option<NodeRef>,
+    ) -> Result<VTask, Trap> {
         // §12.8 4A.5: an empty root shadow stack sits at its context's frame base.
         let root_shadow_sp = c.shadow.unwrap_or(super::ShadowArena::EMPTY).frame_base(0);
-        Ok(VTask::of(Vm::new(c, entry, args)?, root_shadow_sp))
+        Ok(VTask::of(Vm::new(c, entry, args, payer)?, root_shadow_sp))
     }
 
     /// A task running `active` as its root activation, in no fiber, with `root_shadow_sp` as its root
@@ -11747,9 +11207,10 @@ impl VTask {
     fn release(&mut self) {
         let vm = &mut self.active;
         vm.regs = Vec::new();
+        vm.room = RegsRoom::new(vm.room.charge.payer().cloned());
         vm.stack = Vec::new();
         vm.scratch = Vec::new();
-        vm.setjmp_points = std::collections::BTreeMap::new();
+        vm.rare = None;
         vm.sig_handler_stack = Vec::new();
         self.chain = Vec::new();
         self.active_invoke = None;
@@ -11802,11 +11263,13 @@ fn shadow_switch(
     // cannot keep it refuse durable hosts (#1694).
     let arena = m.shadow_arena();
     let region_of = |ctx: usize| arena.region_base(if ctx == ROOT_FIBER { 0 } else { ctx + 1 });
-    let sp = m.durable_get_sp(region_of(out_ctx));
-    if out_ctx == ROOT_FIBER {
-        *root_shadow_sp = sp;
-    } else {
-        fiber_sp[out_ctx] = sp;
+    // The host-side slot stands when the word cannot be read: it is what was written.
+    if let Some(sp) = m.durable_get_sp(region_of(out_ctx)) {
+        if out_ctx == ROOT_FIBER {
+            *root_shadow_sp = sp;
+        } else {
+            fiber_sp[out_ctx] = sp;
+        }
     }
     let in_sp = if in_ctx == ROOT_FIBER {
         *root_shadow_sp
@@ -11864,7 +11327,7 @@ fn freeze_drive(
     let root_sp = ctx
         .mem
         .as_ref()
-        .map(|m| m.durable_get_sp(root_word))
+        .and_then(|m| m.durable_get_sp(root_word))
         .unwrap_or(arena.frame_base(0));
     // The tree-walker's classification, before anything is consumed: an unwoken **cap** park would
     // spill the freeze placeholder as the call's result, which its thaw cannot re-derive, so it
@@ -11959,7 +11422,7 @@ fn freeze_drive(
         let shadow_sp = ctx
             .mem
             .as_ref()
-            .map(|m| m.durable_get_sp(arena.region_base(slot + 1)))
+            .and_then(|m| m.durable_get_sp(arena.region_base(slot + 1)))
             .unwrap_or(arena.frame_base(slot + 1));
         fiber_sp[slot] = shadow_sp;
         frozen.push(super::FrozenFiber {
@@ -11989,7 +11452,7 @@ fn freeze_drive(
 /// host data out by construction.
 fn scan_vm_roots(vm: &Vm, source: &ModuleSource, consider: &mut impl FnMut(u64)) {
     let frames = std::iter::once((vm.module, vm.cur, vm.base))
-        .chain(vm.stack.iter().map(|&(m, p, b, _, _)| (m, p, b)));
+        .chain(vm.stack.iter().map(|&(m, p, b, ..)| (m, p, b)));
     for (module, prog, base) in frames {
         let Some(c) = source.get(module) else {
             continue;
@@ -12122,8 +11585,6 @@ fn gc_scan_beneath(
         for r in &view.fibers {
             match *r {
                 FiberRegRef::Owned(f) => scan(f),
-                // A run-shared registry is locked only for the scan (#1761).
-                FiberRegRef::Shared(s) => scan(&s.0.lock_unpoisoned().fibers),
                 FiberRegRef::Core(m, env) => {
                     let g = m.lock_unpoisoned();
                     scan(match env {
@@ -12177,12 +11638,11 @@ fn run_invoke(
     host: &mut HostCell,
     beneath: Option<&Beneath<'_>>,
 ) -> Result<Vec<Value>, Trap> {
-    // The interpreted invoke completes synchronously, so its fiber registry is loop-local; the
-    // emitted-invoke bounce path threads the vCPU's persistent registry instead (`bounce_call`).
+    // The interpreted invoke completes synchronously, so its fiber registry is loop-local.
     drive_nested(
         source,
         table,
-        VTask::of(invoke_entry(source, module, args)?, 0),
+        VTask::of(invoke_entry(source, module, args, payer(host))?, 0),
         fuel,
         mem,
         host,
@@ -12195,9 +11655,14 @@ fn run_invoke(
 }
 
 /// An invoked unit's entry frame: function 0 of the unit `module`, over `args`.
-fn invoke_entry(source: &ModuleSource, module: usize, args: &[Value]) -> Result<Vm, Trap> {
+fn invoke_entry(
+    source: &ModuleSource,
+    module: usize,
+    args: &[Value],
+    payer: Option<NodeRef>,
+) -> Result<Vm, Trap> {
     let unit = source.get(module).ok_or(Trap::Malformed)?;
-    let mut vm = Vm::new(&unit, 0, args)?;
+    let mut vm = Vm::new(&unit, 0, args, payer)?;
     vm.module = module;
     Ok(vm)
 }
@@ -12207,10 +11672,26 @@ fn invoke_entry(source: &ModuleSource, module: usize, args: &[Value]) -> Result<
 /// run's (#880 — a `cont.new` then keeps the registry's shadow-SP / freeze-metadata tables
 /// index-aligned).
 struct BounceRunCtx<'a> {
-    /// #1896 — where a bounce out of a leaf whose host suspends its emitted frames
-    /// ([`LeafOffer::parks`]) leaves a call that stops: its continuation, and what it stopped for.
-    /// `None` for any other bounce, in which a park faults.
-    park: Option<&'a mut Option<(Vm, Handoff)>>,
+    /// #1896, #2443 — where a bounce whose host can wait for its task leaves a call that stops for
+    /// the task's scheduler: its continuation, and the stop. The pump's leaf host suspends its
+    /// emitted frames ([`LeafOffer::parks`]); executor 2's thread waits with them on its stack
+    /// ([`ThreadRun::bounce_park`]). `None` for any other bounce, in which such a stop faults.
+    park: Option<&'a mut Option<(Vm, VcpuStop)>>,
+}
+
+/// Where a nested drive hands back a stop for its task's scheduler ([`BounceRunCtx::park`]): only
+/// in a bounce whose host can wait for the task, and only from the bounce's own call. A fiber the
+/// call resumed would park alone and let its resumer run on, which a drive that stops cannot do.
+/// Anywhere else the stop faults: nothing beneath could wait.
+fn park_slot<'s>(
+    run_meta: &'s mut Option<BounceRunCtx<'_>>,
+    vt: &VTask,
+) -> Result<&'s mut Option<(Vm, VcpuStop)>, Trap> {
+    run_meta
+        .as_mut()
+        .and_then(|c| c.park.as_deref_mut())
+        .filter(|_| vt.chain.is_empty())
+        .ok_or(Trap::CapFault)
 }
 
 /// What a nested drive ([`drive_nested`]) came back with.
@@ -12234,7 +11715,7 @@ impl Nested {
     }
 }
 
-/// The nested drive under [`run_invoke`] (an interpreted `Jit.invoke`) and [`Vcpu::bounce_call`]
+/// The nested drive under [`run_invoke`] (an interpreted `Jit.invoke`) and [`CoopRun::bounce`]
 /// (#846 — one cross-tier callback out of an *emitted* unit): run `vt` — the unit's entry or the
 /// callback, and the fibers it resumes — to its end over the shared window, powerbox and dispatch
 /// table, servicing fibers against `fibers`. The registry is caller-owned so the bounce path can
@@ -12285,29 +11766,27 @@ fn drive_nested(
             // so blocking in place is the contract, not a divergence). Because every cap call
             // completes inline, an invoke fiber is never `CapParked` — no drain arm needed.
             //
-            // #1954 — a **host-completed** call is the exception: only the embedder finishes it, so
-            // waiting here would never return. In a bounce out of a leaf whose host suspends its
-            // emitted frames it parks, as a pipe read does below — but not rewound: the task waits in
-            // `BlockedHostCap` with the call's continuation, and `deliver_cap` writes its result
-            // into it. Anywhere else it declines, fail-closed, rather than hang.
+            // #1954 — a **host-answered** call is the exception: its embedder may answer it only
+            // once it has control back, so waiting here might never return. In a bounce whose host
+            // can wait for its task it stops, as a pipe read does below — but not rewound: the task
+            // waits in `BlockedHostCap` with the call's continuation, and its answer is written into
+            // it. Anywhere else it declines, fail-closed, rather than hang (#2495: withdrawn).
             Outcome::CapPending { id, dst } => {
                 let comps = host.with(|p| p.completions());
                 if comps.is_host_owned(id) {
-                    let slot = run_meta
-                        .as_mut()
-                        .and_then(|c| c.park.as_deref_mut())
-                        .filter(|_| vt.chain.is_empty())
-                        .ok_or(Trap::CapFault)?;
-                    let state = TaskState::BlockedHostCap { id, dst, at: None };
-                    *slot = Some((vt.active, Handoff::Park(state)));
+                    let Ok(slot) = park_slot(&mut run_meta, &vt) else {
+                        comps.withdraw(id);
+                        return Err(Trap::CapFault);
+                    };
+                    *slot = Some((vt.active, VcpuStop::CapPending { id, dst }));
                     return Ok(Nested::Done(Vec::new()));
                 }
                 let r = comps.wait(id);
                 vt.active.set(dst, Reg::from_i64(r));
             }
-            // #2050 — a futex wait in a bounce out of a leaf whose host suspends its emitted frames
-            // parks as an interpreted task's does (the pump's `VcpuStop::Wait` arm): the value is
-            // re-read here, so a word that changed answers not-equal at once; else the task waits in
+            // #2050 — a futex wait in a bounce whose host can wait for its task parks as an
+            // interpreted task's does (the `VcpuStop::Wait` rule): the value is read here first, so
+            // a word that changed answers not-equal at once, with no stop; else the task waits in
             // `BlockedWait` with the call's continuation, not rewound, and the wake writes the status
             // into it. Anywhere else it faults, as ever: nothing beneath could wait.
             Outcome::MemoryWait {
@@ -12317,25 +11796,20 @@ fn drive_nested(
                 timeout,
                 dst,
             } => {
-                let slot = run_meta
-                    .as_mut()
-                    .and_then(|c| c.park.as_deref_mut())
-                    .filter(|_| vt.chain.is_empty())
-                    .ok_or(Trap::CapFault)?;
+                let slot = park_slot(&mut run_meta, &vt)?;
                 let w = mem.as_ref().ok_or(Trap::CapFault)?;
                 if w.atomic_value(base, width) != expected {
                     vt.active.set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
                     continue;
                 }
-                *slot = Some((
-                    vt.active,
-                    Handoff::Wait {
-                        addr: base,
-                        site: w.futex_site(base),
-                        timeout,
-                        dst,
-                    },
-                ));
+                let stop = VcpuStop::Wait {
+                    base,
+                    expected,
+                    width,
+                    timeout,
+                    dst,
+                };
+                *slot = Some((vt.active, stop));
                 return Ok(Nested::Done(Vec::new()));
             }
             Outcome::ContNew { funcref, sp, dst } => {
@@ -12350,7 +11824,7 @@ fn drive_nested(
                 let target = match claim_fiber(fibers, host, k, arg, None, false)? {
                     Claim::Continue(vm) => vm,
                     Claim::Start { funcref, sp } => {
-                        start_fiber(source, table, mem, k, funcref, sp, arg)?
+                        start_fiber(source, table, mem, k, funcref, sp, arg, payer(host))?
                     }
                     Claim::Block | Claim::Poll => {
                         vt.active.set(dst, Reg::from_i32(super::FIBER_PARKED));
@@ -12427,39 +11901,6 @@ fn drive_nested(
                 let total = gc_write(mem, buf, cap, roots)?;
                 vt.active.set(dst, Reg::from_i64(total));
             }
-            // #1896 — a call parks, or asks for a process, in a bounce out of a leaf whose host
-            // suspends the emitted frames beneath this drive. The drive stops here and hands back its
-            // continuation: a park with its op rewound to re-execute and the state the task parks in,
-            // which the pump runs on once the park clears; a spawn past its op, which the pump starts
-            // first ([`spawn_task`]). Anywhere else these fault, as ever: nothing beneath could wait.
-            stop @ (Outcome::PipeRead { .. }
-            | Outcome::PipeWrite { .. }
-            | Outcome::StdinPark
-            | Outcome::ReapWait { .. }
-            | Outcome::SpawnSelf { .. }) => {
-                let slot = run_meta
-                    .as_mut()
-                    .and_then(|c| c.park.as_deref_mut())
-                    .filter(|_| vt.chain.is_empty())
-                    .ok_or(Trap::CapFault)?;
-                let handoff = match stop {
-                    Outcome::PipeRead { pipe } => {
-                        Handoff::Park(TaskState::BlockedPipeRead { pipe })
-                    }
-                    Outcome::PipeWrite { pipe } => {
-                        Handoff::Park(TaskState::BlockedPipeWrite { pipe })
-                    }
-                    Outcome::ReapWait { child } => {
-                        Handoff::Park(TaskState::BlockedReapPersonality { child })
-                    }
-                    Outcome::SpawnSelf { cmd, plan, dst } => {
-                        Handoff::Spawn(Box::new(SpawnAsk { cmd, plan, dst }))
-                    }
-                    _ => Handoff::Park(TaskState::BlockedStdin),
-                };
-                *slot = Some((vt.active, handoff));
-                return Ok(Nested::Done(Vec::new()));
-            }
             // #1578 — DESIGN §22: an **invoked** unit (`run_meta` `None`) is a seam-free leaf, so the
             // whole `Instantiator` is unavailable inside it — named here rather than left to the
             // catch-all, because it is the contract, not an unserviced seam. The tree-walker refuses
@@ -12473,6 +11914,29 @@ fn drive_nested(
             {
                 return Err(Trap::CapFault)
             }
+            // #1896, #2443 — an op that stops for its task's scheduler, in a bounce whose host can
+            // wait for the task: a thread, futex or child op, a stream read or write, a reap, a
+            // process spawn. The drive stops here and hands back its continuation and the stop, which
+            // the host applies to the task as an interpreted op's (`SchedCore::on_stop`): a park with
+            // its op rewound to re-execute, or an answer delivered into the continuation. Anywhere
+            // else these fault, as ever: nothing beneath could wait.
+            o @ (Outcome::ThreadSpawn { .. }
+            | Outcome::ThreadJoin { .. }
+            | Outcome::MemoryNotify { .. }
+            | Outcome::InstantiateDetached { .. }
+            | Outcome::ChildOffer { .. }
+            | Outcome::ChildCtl { .. }
+            | Outcome::PipeRead { .. }
+            | Outcome::PipeWrite { .. }
+            | Outcome::StdinPark
+            | Outcome::ReapWait { .. }
+            | Outcome::SpawnSelf { .. }) => {
+                let slot = park_slot(&mut run_meta, &vt)?;
+                *slot = Some((vt.active, o.into_stop().map_err(|_| Trap::Malformed)?));
+                return Ok(Nested::Done(Vec::new()));
+            }
+            // An unserviced seam. Among them a fault on a paged child's unsupplied page: a nested
+            // drive cannot park on its pager yet, where the oracle's invoke pages (#2472).
             _ => return Err(Trap::CapFault),
         }
     }
@@ -12482,6 +11946,9 @@ fn drive_nested(
 /// (`thread.*` / `memory.*`) event the scheduler must service. Fiber switches never reach here —
 /// `step_vcpu` handles them against the run's fiber registry ([`FiberCell`]).
 enum VcpuStop {
+    /// §2.2 / #2164 — a demand-paged child's fault at this window address ([`Outcome::PageFault`]):
+    /// park the task on its `page` request to its pager.
+    PageFault(u64),
     /// I48 — a `cont.resume.block` whose target fiber is still event-parked: idle this task on the
     /// fiber (`TaskState::BlockedOnFiber`). `step_vcpu` already rewound the resumer's cursor to the
     /// resume op, so the wake re-executes it.
@@ -12524,14 +11991,12 @@ enum VcpuStop {
         reply_orig: Option<i64>,
         reply_twin: i64,
         dst: u32,
-        has_result: bool,
     },
     /// FORK.md §9.2 — `reap`: reap twin `pid` on behalf of the caller parked on this handler's
     /// dispatch ([`Outcome::Reap`]).
     Reap {
         pid: i64,
         dst: u32,
-        has_result: bool,
     },
     /// FORK.md §8.6 — `exec_module` image-replace (#1080): surfaced to the cooperative driver, which
     /// owns the task/env set + `dom.source`. Cooperative-driver-only (like [`VcpuStop::CloneCaller`]);
@@ -12579,14 +12044,14 @@ enum VcpuStop {
     Preempted,
     Done(Vec<Value>),
     /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): run the emitted `f{func}` region of
-    /// program `module` on the host, delivering its `n_results` results to absolute slot `dst` via
+    /// program `module` on the host, delivering its `n_results` results to `dst` via
     /// `deliver_tierup`. `mapped` is the entry-snapshot scalar committed extent the host must write
     /// to the emitted `"mapped"` global first (#717 — see [`Outcome::TierUp`]).
     TierUp {
         module: u32,
         func: u32,
         argv: Box<[i64]>,
-        dst: usize,
+        dst: TierUpDst,
         results: Box<[ValType]>,
         mapped: u64,
     },
@@ -12601,9 +12066,9 @@ enum VcpuStop {
     Join {
         handle: i32,
         dst: u32,
-        wait: bool,
+        status: bool,
     },
-    /// §5 `Instantiator.instantiate_detached` (op 15, #1286) — see [`Outcome::InstantiateDetached`].
+    /// §5 `Instantiator.instantiate_rec` (op 17, #1286) — see [`Outcome::InstantiateDetached`].
     InstantiateDetached {
         spawn: DetachedSpawn,
         dst: u32,
@@ -12647,6 +12112,153 @@ enum VcpuStop {
     StdinPark,
 }
 
+impl Outcome {
+    /// The stop an op makes for its executor ([`step_vcpu`]), or, for what a drive serves itself (its
+    /// end, a spent quantum, a fiber op, `gc.roots`), the outcome back. A nested drive hands back the
+    /// same stops ([`BounceRunCtx::park`]), so both reach the one rule set ([`SchedCore::on_stop`]).
+    fn into_stop(self) -> Result<VcpuStop, Outcome> {
+        Ok(match self {
+            Outcome::TierUp {
+                module,
+                func,
+                argv,
+                dst,
+                results,
+                mapped,
+            } => VcpuStop::TierUp {
+                module,
+                func,
+                argv,
+                dst,
+                results,
+                mapped,
+            },
+            Outcome::ThreadSpawn {
+                func,
+                sp,
+                arg,
+                dst,
+                module,
+            } => VcpuStop::Spawn {
+                func,
+                sp,
+                arg,
+                dst,
+                module: module as u32,
+            },
+            Outcome::ThreadJoin {
+                handle,
+                dst,
+                status,
+            } => VcpuStop::Join {
+                handle,
+                dst,
+                status,
+            },
+            // §3.6 (I36 slice 2): the serve/call/offer trio surface straight to the driver. The
+            // qualification veto keeps them out of fiber contexts, so no registry state is live.
+            Outcome::LiveCall {
+                ticket,
+                callee,
+                dst,
+            } => VcpuStop::LiveCall {
+                ticket,
+                callee,
+                dst,
+            },
+            Outcome::SvcWait => VcpuStop::SvcWait,
+            Outcome::ChildCtl { child, dst, ctl } => VcpuStop::ChildCtl { child, dst, ctl },
+            Outcome::ChildOffer {
+                child,
+                arg,
+                dst,
+                grant,
+            } => VcpuStop::ChildOffer {
+                child,
+                arg,
+                dst,
+                grant,
+            },
+            Outcome::CloneCaller {
+                reply_orig,
+                reply_twin,
+                dst,
+            } => VcpuStop::CloneCaller {
+                reply_orig,
+                reply_twin,
+                dst,
+            },
+            Outcome::Reap { pid, dst } => VcpuStop::Reap { pid, dst },
+            Outcome::Exec {
+                cmd,
+                grants_ptr,
+                grants_n,
+                entry,
+                size_log2,
+                dst,
+                personality,
+            } => VcpuStop::Exec {
+                cmd,
+                grants_ptr,
+                grants_n,
+                entry,
+                size_log2,
+                dst,
+                personality,
+            },
+            Outcome::ForkSelf { dst } => VcpuStop::ForkSelf { dst },
+            Outcome::SpawnSelf { cmd, plan, dst } => VcpuStop::SpawnSelf { cmd, plan, dst },
+            Outcome::PipeRead { pipe } => VcpuStop::PipeRead { pipe },
+            Outcome::PipeWrite { pipe } => VcpuStop::PipeWrite { pipe },
+            Outcome::ReapWait { child } => VcpuStop::ReapWait { child },
+            Outcome::InstantiateDetached { spawn, dst } => {
+                VcpuStop::InstantiateDetached { spawn, dst }
+            }
+            Outcome::CapPending { id, dst } => VcpuStop::CapPending { id, dst },
+            Outcome::PageFault(addr) => VcpuStop::PageFault(addr),
+            Outcome::MemoryWait {
+                base,
+                expected,
+                width,
+                timeout,
+                dst,
+            } => VcpuStop::Wait {
+                base,
+                expected,
+                width,
+                timeout,
+                dst,
+            },
+            // Blocking-stdin park (owned-host session): surface it for the `Vcpu` driver to pump.
+            Outcome::StdinPark => VcpuStop::StdinPark,
+            Outcome::MemoryNotify { base, count, dst } => VcpuStop::Notify { base, count, dst },
+            Outcome::JitInstall { h, code, dst } => VcpuStop::JitInstall { h, code, dst },
+            Outcome::JitUninstall { h, slot, dst } => VcpuStop::JitUninstall { h, slot, dst },
+            Outcome::JitInvoke {
+                h,
+                code,
+                argv,
+                dst,
+                params,
+                results,
+            } => VcpuStop::JitInvoke {
+                h,
+                code,
+                argv,
+                dst,
+                params,
+                results,
+            },
+            o @ (Outcome::Done(_)
+            | Outcome::Suspended
+            | Outcome::ContNew { .. }
+            | Outcome::ContResume { .. }
+            | Outcome::FiberSuspend { .. }
+            | Outcome::GcRoots { .. }) => return Err(o),
+        })
+    }
+}
+
 /// How the eval loop reaches the powerbox (THREADS.md 4c-host). The cooperative `drive` locks a task's
 /// domain cell for the task's step and hands it over exclusively (`&mut Host`); the **parallel**
 /// driver shares one `Arc<Mutex<Host>>` across vCPU threads and takes the lock only for the duration
@@ -12659,6 +12271,11 @@ enum HostCell<'a> {
     Excl(&'a mut Host),
     /// Shared behind a lock — the parallel driver's vCPUs; `with` takes the lock per host call.
     Shared(&'a std::sync::Mutex<Host>),
+}
+
+/// #2336 — who pays for a register file a vCPU on `host` grows: its domain's node.
+fn payer(host: &mut HostCell) -> Option<NodeRef> {
+    Some(host.with(|h| h.own_node()))
 }
 
 impl HostCell<'_> {
@@ -12774,7 +12391,17 @@ fn step_vcpu(
                     match claim_fiber(fibers, &mut ctx.host, k, arg, blocking_ip, cooperative)? {
                         Claim::Continue(vm) => vm,
                         Claim::Start { funcref, sp } => {
-                            start_fiber(&dom.source, ctx.table, ctx.mem, k, funcref, sp, arg)?
+                            let payer = payer(&mut ctx.host);
+                            start_fiber(
+                                &dom.source,
+                                ctx.table,
+                                ctx.mem,
+                                k,
+                                funcref,
+                                sp,
+                                arg,
+                                payer,
+                            )?
                         }
                         // The oracle's rule: a durable run whose freeze is unwinding takes the
                         // advisory downgrade (the poll status), so the resumer reaches its trailing
@@ -12802,168 +12429,6 @@ fn step_vcpu(
                 dst,
                 Trap::FiberFault,
             )?,
-            Outcome::TierUp {
-                module,
-                func,
-                argv,
-                dst,
-                results,
-                mapped,
-            } => {
-                return Ok(VcpuStop::TierUp {
-                    module,
-                    func,
-                    argv,
-                    dst,
-                    results,
-                    mapped,
-                })
-            }
-            Outcome::ThreadSpawn {
-                func,
-                sp,
-                arg,
-                dst,
-                module,
-            } => {
-                return Ok(VcpuStop::Spawn {
-                    func,
-                    sp,
-                    arg,
-                    dst,
-                    module: module as u32,
-                })
-            }
-            Outcome::ThreadJoin { handle, dst, wait } => {
-                return Ok(VcpuStop::Join { handle, dst, wait })
-            }
-            // §3.6 (I36 slice 2): the serve/call/offer trio surface straight to the driver. The
-            // qualification veto keeps them out of fiber contexts, so no registry state is live.
-            Outcome::LiveCall {
-                ticket,
-                callee,
-                dst,
-            } => {
-                return Ok(VcpuStop::LiveCall {
-                    ticket,
-                    callee,
-                    dst,
-                })
-            }
-            Outcome::SvcWait => return Ok(VcpuStop::SvcWait),
-            Outcome::ChildCtl { child, dst, ctl } => {
-                return Ok(VcpuStop::ChildCtl { child, dst, ctl })
-            }
-            Outcome::ChildOffer {
-                child,
-                arg,
-                dst,
-                grant,
-            } => {
-                return Ok(VcpuStop::ChildOffer {
-                    child,
-                    arg,
-                    dst,
-                    grant,
-                })
-            }
-            Outcome::CloneCaller {
-                reply_orig,
-                reply_twin,
-                dst,
-                has_result,
-            } => {
-                return Ok(VcpuStop::CloneCaller {
-                    reply_orig,
-                    reply_twin,
-                    dst,
-                    has_result,
-                })
-            }
-            Outcome::Reap {
-                pid,
-                dst,
-                has_result,
-            } => {
-                return Ok(VcpuStop::Reap {
-                    pid,
-                    dst,
-                    has_result,
-                })
-            }
-            Outcome::Exec {
-                cmd,
-                grants_ptr,
-                grants_n,
-                entry,
-                size_log2,
-                dst,
-                personality,
-            } => {
-                return Ok(VcpuStop::Exec {
-                    cmd,
-                    grants_ptr,
-                    grants_n,
-                    entry,
-                    size_log2,
-                    dst,
-                    personality,
-                })
-            }
-            Outcome::ForkSelf { dst } => return Ok(VcpuStop::ForkSelf { dst }),
-            Outcome::SpawnSelf { cmd, plan, dst } => {
-                return Ok(VcpuStop::SpawnSelf { cmd, plan, dst })
-            }
-            Outcome::PipeRead { pipe } => return Ok(VcpuStop::PipeRead { pipe }),
-            Outcome::PipeWrite { pipe } => return Ok(VcpuStop::PipeWrite { pipe }),
-            Outcome::ReapWait { child } => return Ok(VcpuStop::ReapWait { child }),
-            Outcome::InstantiateDetached { spawn, dst } => {
-                return Ok(VcpuStop::InstantiateDetached { spawn, dst })
-            }
-            Outcome::CapPending { id, dst } => return Ok(VcpuStop::CapPending { id, dst }),
-            Outcome::MemoryWait {
-                base,
-                expected,
-                width,
-                timeout,
-                dst,
-            } => {
-                return Ok(VcpuStop::Wait {
-                    base,
-                    expected,
-                    width,
-                    timeout,
-                    dst,
-                })
-            }
-            // Blocking-stdin park (owned-host session): surface it for the `Vcpu` driver to pump.
-            Outcome::StdinPark => return Ok(VcpuStop::StdinPark),
-            Outcome::MemoryNotify { base, count, dst } => {
-                return Ok(VcpuStop::Notify { base, count, dst })
-            }
-            Outcome::JitInstall { h, code, dst } => {
-                return Ok(VcpuStop::JitInstall { h, code, dst })
-            }
-            Outcome::JitUninstall { h, slot, dst } => {
-                return Ok(VcpuStop::JitUninstall { h, slot, dst })
-            }
-            Outcome::JitInvoke {
-                h,
-                code,
-                argv,
-                dst,
-                params,
-                results,
-            } => {
-                return Ok(VcpuStop::JitInvoke {
-                    h,
-                    code,
-                    argv,
-                    dst,
-                    params,
-                    results,
-                })
-            }
             // §GC `gc.roots`: scan the whole vCPU continuation — the active window, its call stack
             // (covered by `scan_vm_roots`), every resume-chain ancestor, every parked fiber, and every
             // suspended coroutine — for words that (masked) land in `[lo, hi)`. A **sound superset**
@@ -12980,6 +12445,8 @@ fn step_vcpu(
                 let total = gc_write(ctx.mem, buf, cap, roots)?;
                 vt.active.set(dst, Reg::from_i64(total));
             }
+            // Every other outcome is a stop for the executor's rules.
+            o => return o.into_stop().map_err(|_| Trap::Malformed),
         }
     }
 }
@@ -13016,12 +12483,11 @@ fn resolve_fiber_entry(
     }
 }
 
-/// A §14 `instantiate` child's confined runtime, owned by [`drive`] alongside the task set. Its `mem`
-/// is a `nested_view` sub-window sharing the parent's backing (the §14 shared data plane), its `host`
-/// an attenuated powerbox (an `Instantiator` + an `AddressSpace`, each over `[0, child_size)`), its
-/// `table` a fresh **natural** dispatch table over module 0 (no access to installed §22 units — like
-/// the tree-walker's fresh `DomainTable::new(&cfuncs, 0)`), and `fuel` its own (#1944 slice 3: drawn
-/// from its budget node when detached, a fixed allowance when carved).
+/// A child domain's runtime (a §14 child, a fork twin or an exec image), owned by [`drive`] alongside
+/// the task set. Its `mem` is the domain's own window, its `host` its powerbox, its `table` a fresh
+/// **natural** dispatch table over its unit (no access to installed §22 units — like the
+/// tree-walker's fresh `DomainTable`), and `fuel` its own (#1944 slice 3: a §14 child's is drawn
+/// from its budget node).
 struct ChildEnv {
     mem: Option<Mem>,
     /// The child's live powerbox, in its cell ([`DomainCell`]): a §3.6 live-callee offer holds the
@@ -13040,10 +12506,10 @@ struct ChildEnv {
     /// a fork twin or an exec image, which are not §14 children. A kill descends through it.
     spawner: Option<usize>,
     /// A §14 child's domain, not a fork twin's or an exec image's: its end releases the services
-    /// it was a client of (#1217), as the oracle's does for a nested or detached child's.
+    /// it was a client of (#1217), as the oracle's does for a detached child's.
     nested: bool,
-    /// The unit of the run's [`ModuleSource`] this env's domain runs — its own program, which a
-    /// detached spawn of it reuses (#2078). The root domain's is unit 0.
+    /// The unit of the run's [`ModuleSource`] this env's domain runs, which a fork twin of it runs
+    /// too. The root domain's is unit 0.
     program: u32,
 }
 
@@ -13106,7 +12572,6 @@ fn coop_start_child(
     root: &DomainCell,
     ti: usize,
     child: AdmittedChild,
-    entry: i64,
     dst: u32,
     tierup: Option<ProgramEmit>,
 ) -> Result<(), Trap> {
@@ -13120,13 +12585,15 @@ fn coop_start_child(
         host: child_host,
         fuel,
         lease,
-    } = child.build(entry, room, |lease| {
+    } = child.build(room, |lease| {
         task_host(root, extra_envs, spawner)
             .lock_unpoisoned()
             .release_detached(lease)
     })?;
+    // It tiers up at its entry too (#1414 ED-1), unless its domain is durable: a thaw replays the
+    // entry interpreted.
     if let Some(e) = &tierup {
-        vt.active.tier_up(module, e);
+        vt.active.tier_up(module, e, !child_host.is_durable());
     }
     let eidx = extra_envs.len();
     extra_envs.push(ChildEnv {
@@ -13141,7 +12608,7 @@ fn coop_start_child(
     });
     let cidx = tasks.len();
     tasks.push(TaskSlot {
-        lease: lease.map(|lease| (spawner, lease)),
+        lease: Some((spawner, lease)),
         ..TaskSlot::new(vt, Some(eidx), LiveVcpu::none())
     });
     let handle = tasks[ti].threads.len() as i32;
@@ -13202,6 +12669,13 @@ impl TaskSlot {
     fn deliver(&mut self, dst: u32, value: Reg) {
         self.vm.parked_frame().set(dst, value);
     }
+
+    /// [`deliver`](Self::deliver) each of `values` in turn, from `dst`: a join's results.
+    fn deliver_from(&mut self, dst: u32, values: impl IntoIterator<Item = Reg>) {
+        for (i, v) in values.into_iter().enumerate() {
+            self.deliver(dst + i as u32, v);
+        }
+    }
 }
 
 /// A task's VM state: what its executor steps, as opposed to what the scheduler decides about it.
@@ -13215,9 +12689,9 @@ struct TaskVm {
 }
 
 impl TaskVm {
-    /// Where the result of this task's parked call lands: the continuation of a call that parked in
-    /// a bounce out of the task's emitted leaf ([`Suspended`], #1896), which the pump runs next, or
-    /// else the task's own frame.
+    /// Where the result of this task's parked call lands: the continuation of a call that stopped in
+    /// a bounce out of the task's emitted code ([`Suspended`], #1896, #2443), or else the task's own
+    /// frame.
     fn parked_frame(&mut self) -> &mut Vm {
         match self.suspended.as_mut() {
             Some(s) => &mut s.vm,
@@ -13258,13 +12732,13 @@ fn refund_ended_windows(
 #[derive(Clone)]
 enum TaskState {
     Runnable,
-    /// Parked on `thread.join` of task `child`; deliver its result to `dst` and wake (with `wait`,
-    /// how it ended: [`super::join_delivery`]).
+    /// Parked on a join of task `child` (with `status`, a §14 child's); deliver what it gives the
+    /// joiner from `dst` ([`super::join_delivery`]) and wake.
     BlockedJoin {
         child: usize,
         slot: usize,
         dst: u32,
-        wait: bool,
+        status: bool,
     },
     /// Parked on `memory.wait` at address `addr` of its own window until notified or `deadline`
     /// (logical clock). It waits at `site`, taken at the park as the oracle takes its key; a `notify`
@@ -13292,6 +12766,14 @@ enum TaskState {
         ticket: u64,
         callee: std::sync::Arc<std::sync::Mutex<Host>>,
         dst: u32,
+    },
+    /// §2.2 / #2164 — parked on a page fault: `ticket` is its `page(addr)` request on `pager`, its
+    /// spawner's domain. The settle-wake scan claims the reply as it claims a live call's: the page
+    /// is in place, so the task runs again and its faulting op re-executes; or the pager refused
+    /// it (`< 0`), and the task ends with `MemoryFault`, as a pagerless fault does.
+    BlockedPage {
+        ticket: u64,
+        pager: std::sync::Arc<std::sync::Mutex<Host>>,
     },
     /// FORK.md §9.2 — parked in `reap` (`wait(pid)`) until fork twin `pid` (a task index) finishes;
     /// the settle scan delivers its exit status ([`super::reap_status`]) to `dst` and wakes. A
@@ -13343,13 +12825,15 @@ enum TaskState {
     BlockedOnFiber {
         fiber: usize,
     },
-    /// #1953 — parked on a **host-completed cap call** ([`crate::OffloadOutcome::Host`]): the
-    /// embedder answers completion `id` ([`CoopRun::deliver_cap`]), whose value lands in `dst`.
-    /// Only a [`CoopRun`] admits such calls, and only on its root powerbox; once nothing else can
-    /// run, the pump surfaces the smallest outstanding id as [`CoopStep::CapPark`]. The task twin
-    /// of a fiber's [`FiberState::CapParked`]. A debug session parks the same way and records the
-    /// call's own pc, `at`, as the stop location (#1366); the pump keeps none. A checkpoint `restore`
-    /// re-admits it, the replay serving the call from the tape.
+    /// #2047 — parked on a **punted cap call**: completion `id`'s value lands in `dst`. The offload
+    /// pool posts it, and a round's drain delivers it ([`drain_task_completions`]). #1953, #2495 —
+    /// or the call is **host-answered** ([`crate::OffloadOutcome::Host`]), and its embedder posts
+    /// the answer ([`crate::Completer`]) to the same store; once nothing else can run, a pump its
+    /// embedder drives hands control back for it ([`CoopStep::CapPark`]). The task twin of a
+    /// fiber's [`FiberState::CapParked`]. A debug session parks the same way and records the call's
+    /// own pc, `at`, as the stop location (#1366); the pump keeps none. A checkpoint `restore`
+    /// re-admits a host-answered park, the replay serving the call from the tape; a pool park keeps
+    /// a checkpoint out, as a fiber's does.
     BlockedHostCap {
         id: u64,
         dst: u32,
@@ -13359,28 +12843,23 @@ enum TaskState {
     Done(Result<Vec<Value>, Trap>),
 }
 
-/// #1366 — settle a host-completed cap call the embedder answered: post `value` for completion
-/// `id` (waking whoever waits on it), and, when `host` is recording its cap tape, record the
-/// delivered value as the call's [`super::CapRecord`] so a replay serves it without re-parking.
-/// `false` if `id` is not an outstanding host-completed call. The one delivery every driver that
-/// surfaces cap parks shares ([`Vcpu::deliver_cap`], [`ScheduledDebugRun::deliver_cap`],
-/// [`CoopRun::deliver_cap`]); each then hands the value to its parked task its own way.
-fn settle_host_cap(host: &mut Host, id: u64, value: i64) -> bool {
-    let comps = host.completions();
-    if !comps.is_host_owned(id) {
-        return false;
+/// #2495 — `host`'s caller of call `id` takes its answer `r`: when `host` records its cap tape, a
+/// host-answered call's delivered value joins it as the call's [`super::CapRecord`]
+/// ([`super::Completions::take_record`]), so a replay serves the call without re-parking. Every
+/// bytecode driver delivers an answer through here or [`take_answer`].
+fn tape_answer(host: &mut Host, id: u64, r: i64) -> i64 {
+    if host.records_caps() {
+        if let Some(rec) = host.completions().take_record(id, r) {
+            host.tape_cap_record(rec);
+        }
     }
-    if let Some((type_id, op, handle, args)) = comps.complete_host(id, value) {
-        host.tape_cap_record(super::CapRecord {
-            type_id,
-            op,
-            handle,
-            args,
-            result: Ok(vec![value]),
-            mem_writes: Vec::new(),
-        });
-    }
-    true
+    r
+}
+
+/// Call `id`'s answer, if it has come to `host`'s store: taken, and taped ([`tape_answer`]).
+fn take_answer(host: &mut Host, id: u64) -> Option<i64> {
+    let r = host.completions().try_take(id)?;
+    Some(tape_answer(host, id, r))
 }
 
 /// Park `vt`'s running fiber (never fiber 0) as `park(vm)` — §3.6 slice 5a, the one route every
@@ -13505,6 +12984,7 @@ impl TaskState {
             // A `cont.resume.block` resumer idles beside the serve loop, as on the oracle.
             TaskState::BlockedSvc | TaskState::BlockedOnFiber { .. } => Some(ParkSite::Svc),
             TaskState::BlockedTicket { .. } => Some(ParkSite::Reply),
+            TaskState::BlockedPage { .. } => Some(ParkSite::PageFault),
             TaskState::BlockedReapPersonality { .. } => Some(ParkSite::Reap),
             TaskState::BlockedPipeRead { .. } => Some(ParkSite::PipeRead),
             TaskState::BlockedPipeWrite { .. } => Some(ParkSite::PipeWrite),
@@ -13566,12 +13046,15 @@ fn freeze_step(
     host.is_durable() && is_unwinding(mem) && admit_parks(tasks)
 }
 
-/// The rule this engine applies at `site`: the oracle's, but for a reply wait. The oracle re-issues the
-/// wait and the thaw re-parks the call on its ticket (#1901); this engine has no re-park yet, so a
-/// re-admitted call would be issued twice, and it declines instead (#1904).
+/// The rule this engine applies at `site`: the oracle's, but for a reply wait and a page fault. The
+/// oracle re-issues the wait and the thaw re-parks the call on its ticket (#1901); this engine has no
+/// re-park yet, so a re-admitted call would be issued twice, and it declines instead (#1904). The
+/// oracle holds a pager until its paged children have unwound (#2455), so a fault waits for its page;
+/// this engine has no hold, so it declines. No fault parks in a freeze yet: a durable run on this
+/// engine refuses a detached spawn (#1893), and only a detached child pages.
 fn freeze_rule_here(site: super::ParkSite) -> super::FreezeRule {
     match site {
-        super::ParkSite::Reply => super::FreezeRule::Decline,
+        super::ParkSite::Reply | super::ParkSite::PageFault => super::FreezeRule::Decline,
         s => s.freeze_rule(),
     }
 }
@@ -13659,13 +13142,14 @@ fn drive(
             &mut root.lock_unpoisoned(),
             None,
         )?;
+        sched.wall = cfg!(not(target_family = "wasm"));
         match sched.pump(&dom, mem, &root, &mut root_fuel, budget)? {
             CoopStep::Done(vals) => Ok(vals),
             CoopStep::Idle => unreachable!("idle suspension not enabled on the native driver"),
             CoopStep::Paused => unreachable!("slicing not enabled on the native driver"),
-            // This driver never admits host-completed calls (only `CoopRun` does), so nothing
-            // could answer one: decline fail-closed, as its inline wait always has.
-            CoopStep::CapPark { .. } => Err(Trap::CapFault),
+            CoopStep::CapPark { .. } => {
+                unreachable!("only a pump its embedder drives hands control back for a call")
+            }
             CoopStep::TierUp { .. } | CoopStep::Resume { .. } => {
                 unreachable!("tier-up not enabled on the native driver")
             }
@@ -13681,7 +13165,7 @@ fn drive(
 }
 
 /// A pause point of [`CoopSched::pump`]: either the run finished (`Done`) or a task hit an eligible
-/// direct `Call` of its program and the emitted region must run on the host (`TierUp`) before the
+/// call of its program and the emitted region must run on the host (`TierUp`) before the
 /// paused task is resumed via [`CoopSched::deliver_tierup`]. `pump` returns `Err(trap)` for a
 /// run-fatal trap (the root task trapped, or a driver operation failed) — mirroring the `Result`
 /// `drive` returns.
@@ -13690,7 +13174,7 @@ enum CoopStep {
     Done(Vec<Value>),
     /// The slice of a [`CoopRun::run_for`] pump is spent; the run is live and resumable.
     Paused,
-    /// #1953 — nothing can run until the embedder answers host-completed cap call `id`
+    /// #1953 — nothing can run until the embedder answers host-answered cap call `id`
     /// ([`CoopEvent::CapPark`]).
     CapPark { id: u64 },
     /// #1122 route (a) — every task is parked, nothing internal can wake one, and at least one park is
@@ -13728,27 +13212,36 @@ enum CoopStep {
     },
 }
 
-/// Where a surfaced tier-up's results land ([`EmitTier::pending_tierup`]).
+/// Where a tier-up's results land ([`Outcome::TierUp`], [`EmitTier::pending_tierup`]).
 #[derive(Clone, Copy)]
 enum TierUpDst {
     /// The paused caller frame's result slots, from this one on.
     Frame(usize),
-    /// No frame: the task tiered up at its entry (#1896), so its results end it. `parks`: its host
-    /// suspends its emitted frames where a call parks ([`LeafOffer::parks`]).
+    /// No frame: the task tiered up at its entry, a leaf image's (#1896) or one the run started
+    /// (#1414 ED-1), so its results end it. `parks`: its host suspends its emitted frames where a
+    /// call parks ([`LeafOffer::parks`]).
     Entry { parks: bool },
 }
 
-/// #1896 — a leaf running emitted whose call parked in a bounce ([`LeafOffer::parks`]): its host
-/// holds the emitted frames, suspended, and this is the rest of the call, which the pump runs once
-/// the park clears ([`CoopStep::Resume`]).
+/// #1896, #2443 — the rest of a call out of a task's emitted code that stopped in a bounce for the
+/// task's scheduler ([`BounceRunCtx::park`]). The emitted frames beneath it wait for it: the pump's
+/// leaf host holds them suspended until [`CoopStep::Resume`], and executor 2's thread holds them on
+/// its stack ([`ThreadRun::bounce_park`]).
 struct Suspended {
     /// The call's interpreted continuation, its parked op rewound.
     vm: Vm,
+    /// The pump's leaf call ([`LeafOffer::parks`]); `None` on executor 2, whose thread runs the
+    /// continuation on itself.
+    leaf: Option<LeafCall>,
+}
+
+/// #1896 — what the pump keeps for a leaf's call that stopped in a bounce ([`Suspended::leaf`]).
+struct LeafCall {
     /// Where the leaf's results land, and their types ([`EmitTier::pending_tierup`]).
     dst: TierUpDst,
     results: Box<[ValType]>,
-    /// A process the call asked for ([`Handoff::Spawn`]), which the pump starts before the call runs
-    /// on.
+    /// A process the call asked for ([`VcpuStop::SpawnSelf`]), which the pump starts before the
+    /// call runs on.
     spawn: Option<Box<SpawnAsk>>,
 }
 
@@ -13760,60 +13253,47 @@ struct SpawnAsk {
     dst: u32,
 }
 
-/// #1896 — what a leaf's call hands back when it stops in a bounce ([`BounceRunCtx::park`]).
-enum Handoff {
-    /// It parked: the state its task waits in.
-    Park(TaskState),
-    /// #2050 — it waits on a futex word whose value it found unchanged: [`hand_off`] parks the task
-    /// in [`TaskState::BlockedWait`], its deadline taken on the pump's clock.
-    Wait {
-        addr: u64,
-        site: super::FutexSite,
-        timeout: Option<u64>,
-        dst: u32,
-    },
-    /// It asked for a process, which only the pump can start.
-    Spawn(Box<SpawnAsk>),
-}
-
-/// Leave task `ti`, whose leaf's call stopped in a bounce ([`Handoff`]): parked in the state the call
-/// waits in, or runnable with the spawn it asked for. Answers the spawn, for the call's
-/// [`Suspended`].
+/// #1896 — leave task `ti`, whose leaf's call stopped in a bounce, as the stop leaves an
+/// interpreted task: parked in the state the call waits in, or runnable with the process it asked
+/// for, which this answers for the call's [`LeafCall`]. The pump cannot pause for its host inside a
+/// bounce, so only these stops can wait in a leaf's; any other refuses, as a bounce that cannot wait
+/// does. `win` is the task's window, which a futex wait's site is taken on.
 fn hand_off(
     tasks: &mut [TaskSlot],
     forked_twins: &mut std::collections::BTreeSet<usize>,
     hooked_twins: &std::collections::BTreeSet<usize>,
     ti: usize,
-    handoff: Handoff,
+    stop: VcpuStop,
+    win: Option<&Mem>,
     clock: u64,
-) -> Option<Box<SpawnAsk>> {
-    match handoff {
-        Handoff::Park(state) => {
-            park_task(tasks, forked_twins, hooked_twins, ti, state);
-            None
-        }
-        Handoff::Wait {
-            addr,
-            site,
-            timeout,
-            dst,
+) -> Result<Option<Box<SpawnAsk>>, Trap> {
+    let state = match stop {
+        VcpuStop::PipeRead { pipe } => TaskState::BlockedPipeRead { pipe },
+        VcpuStop::PipeWrite { pipe } => TaskState::BlockedPipeWrite { pipe },
+        VcpuStop::StdinPark => TaskState::BlockedStdin,
+        VcpuStop::ReapWait { child } => TaskState::BlockedReapPersonality { child },
+        VcpuStop::CapPending { id, dst } => TaskState::BlockedHostCap { id, dst, at: None },
+        // The interpreted wait's park (the pump's `VcpuStop::Wait` arm): `None` for an infinite wait
+        // (#1638).
+        VcpuStop::Wait {
+            base, timeout, dst, ..
         } => {
-            // The interpreted wait's park (the pump's `VcpuStop::Wait` arm): `None` for an
-            // infinite wait (#1638).
-            let deadline = timeout.map(|t| clock.saturating_add(t));
             tasks[ti].state = TaskState::BlockedWait {
-                addr,
-                site,
-                deadline,
+                addr: base,
+                site: win.ok_or(Trap::CapFault)?.futex_site(base),
+                deadline: timeout.map(|t| clock.saturating_add(t)),
                 dst,
             };
-            None
+            return Ok(None);
         }
-        Handoff::Spawn(ask) => {
+        VcpuStop::SpawnSelf { cmd, plan, dst } => {
             tasks[ti].state = TaskState::Runnable;
-            Some(ask)
+            return Ok(Some(Box::new(SpawnAsk { cmd, plan, dst })));
         }
-    }
+        _ => return Err(Trap::CapFault),
+    };
+    park_task(tasks, forked_twins, hooked_twins, ti, state);
+    Ok(None)
 }
 
 /// Park task `ti` in `state`, whichever tier its call parked from.
@@ -13844,6 +13324,18 @@ fn park_task(
     tasks[ti].state = state;
 }
 
+/// The child envs (§14 children and fork twins) whose domains have finished, as [`settle_wakes`]
+/// releases them.
+#[derive(Default)]
+struct Released {
+    /// FORK.md §8.6 / #1807 — the envs whose pipe ends were released at their domain's finish.
+    /// Released once: the release decrements the shared end counts.
+    envs: std::collections::BTreeSet<usize>,
+    /// #2359 — the powerbox each is left holding: one empty `Host` for the run rather than a fresh
+    /// one apiece, whose handle table alone is kilobytes.
+    host: DomainCell,
+}
+
 /// A run's scheduling core (#1414 3e): the task set and the state the scheduling rules read and
 /// write — the run-shared §12 fiber registry (+ its durable parallel arrays), the §14 confined
 /// child environments, the fork/teardown bookkeeping, and the logical clock.
@@ -13872,12 +13364,14 @@ struct SchedCore {
     /// their completion). Fired once, in the settle scan, before a personality `waitpid` re-execution
     /// reads the retired status (the bytecode port of the tree-walker's exit-hook-at-death step).
     hooked_twins: std::collections::BTreeSet<usize>,
-    /// FORK.md §8.6 / #1807 — child envs (§14 children and fork twins) whose pipe ends were released at
-    /// their domain's finish. Released once: the release decrements the shared end counts.
-    released_envs: std::collections::BTreeSet<usize>,
+    /// The child envs whose domains have finished ([`Released`]).
+    released: Released,
     /// The scheduler's logical clock, in ns: it moves by the ops of each quantum that runs out
     /// (#2224), and jumps to the earliest `wait` deadline when no task is runnable.
     clock: u64,
+    /// Where a detached child's window lives ([`ThreadPlatform::child_window`]): executor 2's
+    /// platform may give it a backing of its own; the pump builds it in the engine's.
+    child_window: Option<ChildBacking>,
 }
 
 /// The cooperative pump's state for the host's emitted tier (#926): which programs' calls tier up,
@@ -13886,7 +13380,7 @@ struct SchedCore {
 #[derive(Default)]
 struct EmitTier {
     /// #926 slice 2, #2248: what each program's tasks tier up into. A task running a program with
-    /// an emit carries it in its `Vm`, so a direct `Call` in that program to an eligible function
+    /// an emit carries it in its `Vm`, so a call in that program to an eligible function
     /// surfaces as [`CoopStep::TierUp`] instead of interpreting the callee — the host runs the
     /// emitted `f{func}` and delivers the results back.
     programs: ProgramEmits,
@@ -13898,6 +13392,11 @@ struct EmitTier {
     /// pumping again — so a single slot suffices. `None` between round-trips (and always, on the
     /// native driver).
     pending_tierup: Option<(usize, TierUpDst, Box<[ValType]>)>,
+    /// #2474 — the function the pending tier-up called, `(program, function)`, whose calls count
+    /// the work the host reports it did ([`CoopSched::set_emitted_work`]); `None` for a leaf.
+    pending_call: Option<(u32, u32)>,
+    /// #2474 — the work the host counted the pending tier-up doing on the emitted tier.
+    emitted_work: u64,
     /// The task currently paused on a surfaced §22 `Jit.invoke`, awaiting
     /// [`deliver_jit_invoke_vals`](CoopSched::deliver_jit_invoke_vals): `(task index, dst slot,
     /// result types)` — the same one-outstanding-round-trip discipline as `pending_tierup` (a
@@ -13955,8 +13454,8 @@ impl ProgramEmits {
         host: &Host,
         source: &ModuleSource,
     ) -> Option<ProgramEmit> {
-        let (ChildProgram::Spawner(m, _) | ChildProgram::Granted(m, _)) = program;
-        if let (ChildProgram::Granted(..), Some(emit)) = (program, &self.modules) {
+        let (m, _) = program;
+        if let Some(emit) = &self.modules {
             if !self.granted.iter().any(|&(g, _)| g == *m) {
                 let offer = host.self_module().zip(source.digest_of(*m as usize));
                 let answer = offer.and_then(|(image, digest)| {
@@ -13989,6 +13488,14 @@ struct CoopSched {
     /// At zero the pump returns [`CoopStep::Paused`], every task's cursor persisted — the next pump
     /// resumes exactly where this one stopped, as after a #1157 preemption.
     slice_left: Option<u64>,
+    /// #1979 — an idle pump lets the time to its next deadline pass in real time ([`wait_out`])
+    /// instead of jumping its clock there. Set by the native `drive`; a [`CoopRun`]'s embedder
+    /// keeps the jump (a browser has no clock to wait on, #2439).
+    wall: bool,
+    /// #2495 — set by a [`CoopRun`]: its embedder pumps it, and may answer a host-answered call
+    /// only once it has control back, so a pump idle while one waits hands control back
+    /// ([`CoopStep::CapPark`]). The native `drive` waits on such a call as on a pool job.
+    embedder_pumps: bool,
     /// DURABILITY.md §13.4 slice 4c-bis — **freeze-on-quiesce**, one-shot: a durable run armed to
     /// freeze the moment it quiesces ([`freeze_step`]). Read once at run setup from the window's
     /// arm-quiesce flag, as the oracle's `Sched::freeze_on_quiesce`.
@@ -14043,29 +13550,39 @@ fn settle_wakes(
     fibers: &[FiberState],
     forked_twins: &mut std::collections::BTreeSet<usize>,
     hooked_twins: &mut std::collections::BTreeSet<usize>,
-    released_envs: &mut std::collections::BTreeSet<usize>,
+    released: &mut Released,
     root: &DomainCell,
 ) {
     // §3.6 (I36 slice 2) — settle wakes: a task parked on a live-call ticket wakes when the
     // callee's serve loop completed its dispatch; claiming the completion cell delivers the
-    // reply (the tree-walker's cap_reply preference — a parked caller beats the cell).
-    for t in tasks.iter_mut() {
-        let hit = match &t.state {
-            TaskState::BlockedTicket {
-                ticket,
-                callee,
-                dst,
-            } => callee
-                .lock_unpoisoned()
-                .svc_results
-                .remove(ticket)
-                .map(|v| (v, *dst)),
-            _ => None,
+    // reply (the tree-walker's cap_reply preference — a parked caller beats the cell). A task
+    // parked on a page request claims its reply the same way (#2164): the page is in place and
+    // the faulting op re-executes, or the pager refused it and the fault is fatal.
+    let mut refused = Vec::new();
+    for (i, t) in tasks.iter_mut().enumerate() {
+        let (TaskState::BlockedTicket { ticket, callee, .. }
+        | TaskState::BlockedPage {
+            ticket,
+            pager: callee,
+        }) = &t.state
+        else {
+            continue;
         };
-        if let Some((v, dst)) = hit {
-            t.deliver(dst, Reg::from_i64(v));
-            t.state = TaskState::Runnable;
+        let Some(v) = callee.lock_unpoisoned().svc_results.remove(ticket) else {
+            continue;
+        };
+        match t.state {
+            TaskState::BlockedTicket { dst, .. } => t.deliver(dst, Reg::from_i64(v)),
+            _ if v < 0 => {
+                refused.push(i);
+                continue;
+            }
+            _ => {}
         }
+        t.state = TaskState::Runnable;
+    }
+    for i in refused {
+        complete(tasks, i, Err(Trap::MemoryFault));
     }
     // #1215 — the default-action TERMINATE, cooperative form (invariant 14). A domain the
     // personality has terminated (a `SIG_DFL` SIGKILL/SIGTERM/SIGINT delivered through the gate,
@@ -14107,18 +13624,23 @@ fn settle_wakes(
     }
     let mut finished: Vec<usize> = Vec::new();
     for k in 0..extra_envs.len() {
-        if seen[k] && !live[k] && released_envs.insert(k) {
+        if seen[k] && !live[k] && released.envs.insert(k) {
             let mut h = extra_envs[k].host.lock_unpoisoned();
             h.release_memory();
             h.release_pipe_ends();
-            // #1217 — a §14 child's end releases every service it held a live offer to: it
-            // can no longer call one, so a `svc.wait` there answers `0` instead of waiting
-            // for it (a token, when no serve loop is parked yet), as on the oracle.
-            let services = if extra_envs[k].nested {
+            // #1217 — a §14 child's end releases every service it held a live offer to, and the
+            // pager its faults called (#2164): it can no longer call one, so a `svc.wait` there
+            // answers `0` instead of waiting for it (a token, when no serve loop is parked yet),
+            // as on the oracle (`client_gone_targets`).
+            let mut services = if extra_envs[k].nested {
                 h.live_offer_providers()
             } else {
                 Vec::new()
             };
+            if h.pager.is_some() {
+                let pager = task_host(root, extra_envs, extra_envs[k].spawner);
+                services.push(std::sync::Arc::clone(pager));
+            }
             drop(h);
             for service in services {
                 service.lock_unpoisoned().set_client_gone();
@@ -14157,11 +13679,13 @@ fn settle_wakes(
     // A finished domain gives back what it held — its window, its powerbox, its frames — now
     // that its pipe ends are released and its exit hooks have fired. What a reaper reads is its
     // tasks' `Done` results, which stay. Without this a run holds every process it ever ran: a
-    // build that forks and execs a compiler per module grew by a window per process.
+    // build that forks and execs a compiler per module grew by a window per process. The env is
+    // left holding the run's one empty powerbox (#2359): a fresh one apiece grew a run by its
+    // handle table per child.
     for k in finished {
         let env = &mut extra_envs[k];
         env.mem = None;
-        env.host = std::sync::Arc::new(std::sync::Mutex::new(Host::new()));
+        env.host = std::sync::Arc::clone(&released.host);
         env.fibers = FiberTables::default();
         for t in tasks.iter_mut().filter(|t| t.env == Some(k)) {
             t.vm.vt.release();
@@ -14288,9 +13812,11 @@ fn settle_wakes(
 impl SchedCore {
     /// #926 slice 2: arm the root task's `Vm` for tier-up. The entry runs in module 0, so a direct
     /// call to an eligible function surfaces (`Vm::resume`'s `jit_module` gate). `thread.spawn`
-    /// children and child domains take their own program's emit in the stop rules (#2248).
+    /// children and child domains take their own program's emit in the stop rules (#2248), and
+    /// tier up at their entry; the root's entry has a rule of its own, the root leaf ([`root_leaf`]),
+    /// which runs it whole with the slicing and suspension a region call has not.
     fn arm_tierup(&mut self, emit: &ProgramEmit) {
-        self.tasks[0].vm.vt.active.tier_up(0, emit);
+        self.tasks[0].vm.vt.active.tier_up(0, emit, false);
     }
 
     /// A run's initial scheduling state: the root task at `entry`, plus any fibers a durable freeze
@@ -14312,7 +13838,12 @@ impl SchedCore {
         if !thaws(host, mem) {
             fuel.burn()?;
         }
-        let root_vt = VTask::new(&dom.source.primary(), entry as usize, args)?;
+        let root_vt = VTask::new(
+            &dom.source.primary(),
+            entry as usize,
+            args,
+            Some(host.own_node()),
+        )?;
         let tasks = vec![TaskSlot::new(root_vt, None, LiveVcpu::none())];
         wire_kill(host);
         // #1122/#1146/#1262 — an armed external-wake doorbell: wire the root's personality doors to
@@ -14390,7 +13921,6 @@ impl SchedCore {
         // `-ECHILD`, never a park that hangs); an id is retired when reaped.
         let forked_twins: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         let hooked_twins: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-        let released_envs: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         Ok(SchedCore {
             tasks,
             extra_envs,
@@ -14400,8 +13930,9 @@ impl SchedCore {
             dead_envs,
             forked_twins,
             hooked_twins,
-            released_envs,
+            released: Released::default(),
             clock,
+            child_window: None,
         })
     }
 }
@@ -14410,7 +13941,7 @@ impl CoopSched {
     /// Build the initial scheduler state: the run's [`SchedCore`] (`drive`'s former preamble
     /// verbatim, so its behaviour is unchanged) and the emitted tier's. `tierup` is the run's #926
     /// slice 2 config: `None` (the native `drive`) leaves everything interpreting; a config makes
-    /// each task's direct calls to the functions its program's emit makes eligible surface as
+    /// each task's calls to the functions its program's emit makes eligible surface as
     /// tier-ups.
     fn new(
         dom: &Domain,
@@ -14442,6 +13973,8 @@ impl CoopSched {
                 programs,
                 leaf,
                 pending_tierup: None,
+                pending_call: None,
+                emitted_work: 0,
                 pending_jit: None,
                 // Empty until a surfaced `Jit.invoke` bounces; populated only across that invoke's
                 // bounces.
@@ -14450,6 +13983,8 @@ impl CoopSched {
             },
             suspend_on_idle: false,
             slice_left: None,
+            wall: false,
+            embedder_pumps: false,
             freeze_on_quiesce: host.is_durable()
                 && mem.as_ref().is_some_and(|m| m.durable_freeze_on_quiesce()),
         })
@@ -14500,6 +14035,8 @@ impl CoopSched {
             emit,
             suspend_on_idle,
             slice_left,
+            wall,
+            embedder_pumps,
             freeze_on_quiesce,
         } = self;
         // #1954 — a root the host emitted whole tiers up at its entry, once, before anything runs
@@ -14525,8 +14062,9 @@ impl CoopSched {
                 dead_envs,
                 forked_twins,
                 hooked_twins,
-                released_envs,
+                released,
                 clock,
+                child_window: _, // the pump builds every child's window in the engine's memory
             } = &mut *core;
             let EmitTier {
                 leaf,
@@ -14586,13 +14124,14 @@ impl CoopSched {
                 // trap stays `Err(trap)` (the run's fatal trap), exactly as `drive` returned it.
                 return res.map(CoopStep::Done);
             }
+            drain_task_completions(tasks, extra_envs, root);
             settle_wakes(
                 tasks,
                 extra_envs,
                 fibers,
                 forked_twins,
                 hooked_twins,
-                released_envs,
+                released,
                 root,
             );
             // #1198 — a Runnable task whose DOMAIN is stopped (SIGTSTP/SIGTTIN/SIGTTOU, before its
@@ -14628,53 +14167,29 @@ impl CoopSched {
                 ) {
                     continue;
                 }
-                // F2 (FIBER_PARK.md) — no runnable task with punt completions outstanding: that is
-                // pending work on the offload pool, never a deadlock and never a reason to jump the
-                // logical clock. Block on the store for the smallest outstanding id (submission
-                // order), deliver through the ordered drain, and loop — the woken fibers'
-                // resumers observe the wake at their next poll (or their own timers fire below on
-                // a later pass).
-                //
-                // #1953 — a host-completed call (a task's `BlockedHostCap`, or a fiber's `CapParked`
-                // on a host-owned id) is the same pending work, finished by the embedder instead of
-                // the pool: when the smallest outstanding id is one, surface it rather than wait.
-                let min_cap = fibers
-                    .iter()
-                    .filter_map(|f| match f {
-                        FiberState::CapParked {
-                            id, woken: None, ..
-                        } => Some(*id),
-                        _ => None,
+                // The punted calls outstanding (F2, FIBER_PARK.md), each in its domain's store
+                // (#2424): a fiber's `CapParked`, a task's `BlockedHostCap`. #1953, #2495 — one
+                // its embedder answers, in any domain, is the embedder's to answer: a pump the
+                // embedder drives hands control back for the earliest.
+                let calls: Vec<_> = outstanding_calls(tasks, fibers, extra_envs)
+                    .into_iter()
+                    .map(|(env, id)| {
+                        let h = task_host(root, extra_envs, env).lock_unpoisoned();
+                        (h.completions(), id)
                     })
-                    .chain(tasks.iter().filter_map(|t| match t.state {
-                        TaskState::BlockedHostCap { id, .. } => Some(id),
-                        _ => None,
-                    }))
-                    .min();
-                if let Some(id) = min_cap {
-                    let comps = root.lock_unpoisoned().completions();
-                    if comps.is_host_owned(id) {
+                    .collect();
+                if *embedder_pumps {
+                    let on_embedder = calls.iter().filter(|(c, id)| c.is_host_owned(*id));
+                    if let Some(id) = on_embedder.map(|(_, id)| *id).min() {
                         return Ok(CoopStep::CapPark { id });
                     }
-                    let r = comps.wait(id);
-                    for f in fibers.iter_mut() {
-                        if let FiberState::CapParked {
-                            id: fid,
-                            woken: w @ None,
-                            ..
-                        } = f
-                        {
-                            if *fid == id {
-                                *w = Some(r);
-                            }
-                        }
-                    }
-                    drain_cap_parked(fibers, &comps);
+                }
+                // #1979 — on the native driver the time to the earliest deadline passes first.
+                if *wall && wait_out(tasks, fibers, extra_envs, clock, root, &calls, bell_gen) {
                     continue;
                 }
                 // No runnable task: fire the earliest `wait` timeout — whole-vCPU waiters and
-                // event-parked fiber waiters alike (§3.6 slice 5a), in every domain — else it is a
-                // deadlock.
+                // event-parked fiber waiters alike (§3.6 slice 5a), in every domain.
                 let mut regs: Vec<&mut Vec<FiberState>> = std::iter::once(&mut *fibers)
                     .chain(extra_envs.iter_mut().map(|e| &mut e.fibers.fibers))
                     .collect();
@@ -14684,14 +14199,10 @@ impl CoopSched {
                     if interrupt_parks(tasks, extra_envs, root) {
                         continue;
                     }
-                    // #1122 — every task is parked and no internal wake can come. With an
-                    // armed doorbell and at least one task parked on a PIPE — the state an
-                    // embedder can feed from outside the run (the interactive terminal) —
-                    // BLOCK for the next ring instead of declaring deadlock, then re-settle
-                    // (the readiness poll above sees the deposit). The `bell_gen` snapshot
-                    // predates that poll, so a feed racing this park is never lost. Without
-                    // a doorbell, or with only internally-wakeable parks (a join cycle),
-                    // this is the deadlock it always was.
+                    // #1122 — every task is parked and no internal wake can come: only the world
+                    // can wake the run. A task parked on a PIPE is the state an embedder can feed
+                    // from outside the run (the interactive terminal); a punted call is work in
+                    // flight, never a deadlock (#2047), in any domain (#2424).
                     let external = tasks.iter().any(|t| {
                         matches!(
                             t.state,
@@ -14707,27 +14218,41 @@ impl CoopSched {
                     // #1122 route (a) — a suspend/resume session: hand the idle state back to the
                     // driver (it feeds the terminal and pumps again; the loop-top settle then sees
                     // the deposit / the signal) instead of sleeping this thread on the bell.
-                    if *suspend_on_idle && external {
+                    if *suspend_on_idle && external && calls.is_empty() {
                         return Ok(CoopStep::Idle);
                     }
+                    // #2480 — BLOCK for whichever comes first, on one bell: an answer to an
+                    // outstanding call, delivered by the next round (a fiber's by the drain
+                    // here), or a ring of the armed doorbell past `bell_gen` — a feed, a signal,
+                    // a kill — then re-settle (the readiness poll above sees the deposit). The
+                    // snapshot predates that poll, so a feed racing this park is never lost. Only
+                    // after the timers, as a call may wait on the world, or on what a timed
+                    // waiter will do: it must not hold the clock back. With no call outstanding
+                    // the doorbell counts only for a task parked on what an embedder feeds; with
+                    // neither (a join cycle), this is the deadlock it always was.
                     let bell = root.lock_unpoisoned().external_wake();
-                    match bell.filter(|_| external) {
-                        Some(bell) => {
-                            let (gen, cv) = &*bell;
-                            let mut g = gen.lock().unwrap_or_else(|e| e.into_inner());
-                            while *g == bell_gen {
-                                g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
-                            }
-                        }
-                        None => return Err(Trap::ThreadFault), // deadlock (no runnable, no waiters)
+                    let bell = bell.filter(|_| external || !calls.is_empty());
+                    if calls.is_empty() && bell.is_none() {
+                        return Err(Trap::ThreadFault);
                     }
+                    super::Completions::wait_any(
+                        &calls,
+                        bell.as_ref().map(|b| (b, bell_gen)),
+                        None,
+                    );
+                    drain_fiber_completions(fibers, extra_envs, root);
                 }
                 continue;
             };
             last_pick = ti;
             // #1896 — a leaf's call that asked for a process in its bounce: start it, as the spawn
             // arm starts one for an interpreted caller, before the call runs on (below).
-            if let Some(ask) = tasks[ti].vm.suspended.as_mut().and_then(|s| s.spawn.take()) {
+            let leaf_call = tasks[ti]
+                .vm
+                .suspended
+                .as_mut()
+                .and_then(|s| s.leaf.as_mut());
+            if let Some(ask) = leaf_call.and_then(|l| l.spawn.take()) {
                 let SpawnAsk { cmd, plan, dst } = *ask;
                 let (r, step) = spawn_task(
                     tasks,
@@ -14832,9 +14357,15 @@ impl CoopSched {
             // it parks again, the task waits again. A trap ends the process, whose frames the host
             // never resumes.
             if let Some(s) = tasks[ti].vm.suspended.take() {
+                // Only the pump's leaf leaves a call here ([`CoopRun::bounce`]).
                 let Suspended {
-                    vm, dst, results, ..
-                } = *s;
+                    vm,
+                    leaf: Some(LeafCall { dst, results, .. }),
+                } = *s
+                else {
+                    complete(tasks, ti, Err(Trap::Malformed));
+                    continue;
+                };
                 let mut parked = None;
                 let meta = BounceRunCtx {
                     park: Some(&mut parked),
@@ -14855,15 +14386,21 @@ impl CoopSched {
                 charge_slice(slice_left, ctx.fuel.can_burn());
                 match (done, parked) {
                     (Err(trap), _) => complete(tasks, ti, Err(trap)),
-                    (Ok(_), Some((vm, handoff))) => {
-                        let spawn =
-                            hand_off(tasks, forked_twins, hooked_twins, ti, handoff, *clock);
-                        tasks[ti].vm.suspended = Some(Box::new(Suspended {
-                            vm,
-                            dst,
-                            results,
-                            spawn,
-                        }));
+                    (Ok(_), Some((vm, stop))) => {
+                        let win = ctx.mem.as_ref();
+                        match hand_off(tasks, forked_twins, hooked_twins, ti, stop, win, *clock) {
+                            Ok(spawn) => {
+                                tasks[ti].vm.suspended = Some(Box::new(Suspended {
+                                    vm,
+                                    leaf: Some(LeafCall {
+                                        dst,
+                                        results,
+                                        spawn,
+                                    }),
+                                }))
+                            }
+                            Err(trap) => complete(tasks, ti, Err(trap)),
+                        }
                     }
                     (Ok(vals), None) => {
                         *pending_tierup = Some((ti, dst, results));
@@ -14884,9 +14421,9 @@ impl CoopSched {
             );
 
             charge_slice(slice_left, ctx.fuel.can_burn());
-            // #1720 — the **trap-origin** fault address (the tree-walker's rule): a child's trap
-            // re-raises at its joiner, whose window is not the one that faulted, so the run's
-            // `last_capture_fault_addr` must be read here, from the trapping task's own.
+            // #1720 — the **trap-origin** fault address (the tree-walker's rule): a child's trap is
+            // answered at its joiner (#2066), whose window is not the one that faulted, so the
+            // run's `last_capture_fault_addr` must be read here, from the trapping task's own.
             let fault = match &stop {
                 Err(Trap::MemoryFault) => ctx.mem.as_ref().and_then(|m| m.peek_fault_rel()),
                 _ => None,
@@ -14921,10 +14458,15 @@ impl CoopSched {
         }
     }
 
+    /// #2474 — the work the pending tier-up did on the emitted tier ([`CoopRun::set_emitted_work`]).
+    fn set_emitted_work(&mut self, work: u64) {
+        self.emit.emitted_work = work;
+    }
+
     /// #926 slice 2 — deliver an emitted tier-up region's results into the paused task and clear the
     /// pending slot, so the next [`pump`](Self::pump) resumes it. `vals` are the raw i64 result slots
     /// the host read out of the emitted `f{func}` run; they are re-tagged into the caller frame's `dst`
-    /// slots per the recorded result types (mirroring [`Vcpu::deliver_tierup`]). A short reply is a
+    /// slots per the recorded result types. A short reply is a
     /// malformed host reply, which traps the task (its domain tears down, surfacing as the run result).
     fn deliver_tierup(&mut self, vals: &[i64]) {
         let (ti, dst, results) = self
@@ -14932,6 +14474,10 @@ impl CoopSched {
             .pending_tierup
             .take()
             .expect("deliver_tierup with no pending tier-up");
+        let (call, work) = (
+            self.emit.pending_call.take(),
+            core::mem::take(&mut self.emit.emitted_work),
+        );
         if vals.len() < results.len() {
             complete(&mut self.core.tasks, ti, Err(Trap::Malformed));
             return;
@@ -14939,12 +14485,12 @@ impl CoopSched {
         let vals = results.iter().zip(vals).map(|(ty, v)| slot_to_val(*ty, *v));
         match dst {
             TierUpDst::Frame(dst) => {
+                let vm = &mut self.core.tasks[ti].vm.vt.active;
                 for (i, v) in vals.enumerate() {
-                    self.core.tasks[ti]
-                        .vm
-                        .vt
-                        .active
-                        .set(dst as u32 + i as u32, Reg::from_value(v));
+                    vm.set(dst as u32 + i as u32, Reg::from_value(v));
+                }
+                if let Some((module, func)) = call {
+                    vm.emitted_returned(module as usize, func as usize, work);
                 }
             }
             // #1896: the process ran whole: it returned from its entry.
@@ -14953,8 +14499,10 @@ impl CoopSched {
     }
 
     /// #926 slice 2 — the emitted tier-up region trapped: surface it exactly where the interpreter
-    /// would by trapping the paused task (mirroring [`Vcpu::deliver_tierup_trap`]).
+    /// would by trapping the paused task.
     fn deliver_tierup_trap(&mut self, trap: Trap) {
+        self.emit.pending_call = None;
+        self.emit.emitted_work = 0;
         let (ti, _dst, _results) = self
             .emit
             .pending_tierup
@@ -15029,12 +14577,14 @@ impl SchedCore {
             forked_twins,
             hooked_twins,
             clock,
+            child_window,
             ..
         } = self;
         let EmitTier {
             programs,
             leaf,
             pending_tierup,
+            pending_call,
             pending_jit,
             ..
         } = emit;
@@ -15042,8 +14592,8 @@ impl SchedCore {
             Err(trap) => complete(tasks, ti, Err(trap)),
             Ok(VcpuStop::Preempted) => {}
             Ok(VcpuStop::Done(vals)) => complete(tasks, ti, Ok(vals)),
-            // #926 slice 2 — wasm-JIT tier-up: this task hit a direct call to an eligible function
-            // of `module`, the program its `Vm` carries an emit for (#2248). `step_vcpu` has
+            // #926 slice 2 — wasm-JIT tier-up: this task hit a call to an eligible function of
+            // `module`, the program its `Vm` carries an emit for (#2248). `step_vcpu` has
             // already spilled the frame past the call, so the task is resumable with just the
             // result slots filled. Stash the delivery target — `(task, dst, result types)` — and
             // surface the region to the driver; `deliver_tierup` writes the emitted results back
@@ -15063,7 +14613,8 @@ impl SchedCore {
                     pending_tierup.is_none(),
                     "a tier-up is already outstanding — deliver_tierup was skipped"
                 );
-                *pending_tierup = Some((ti, TierUpDst::Frame(dst), results));
+                *pending_tierup = Some((ti, dst, results));
+                *pending_call = Some((module, func));
                 return Some(CoopStep::TierUp {
                     module,
                     func,
@@ -15124,24 +14675,68 @@ impl SchedCore {
                     dst,
                 };
             }
+            // §2.2 / #2164 — a demand-paged child's fault, the oracle's `Step::PageFault` in
+            // cooperative form: a `page(addr)` request to the pager export on its spawner's domain,
+            // with the sink its reply lands in, and the task parks on the reply as a live caller
+            // parks on its ticket. A full queue is backpressure: the task stays runnable, and its
+            // re-executed op faults and asks again.
+            Ok(VcpuStop::PageFault(addr)) => {
+                let paged = tasks[ti].env.and_then(|k| {
+                    let e = &extra_envs[k];
+                    let export = e.host.lock_unpoisoned().pager?;
+                    Some((
+                        e.spawner,
+                        export,
+                        super::PageSink::at(e.mem.as_ref()?, addr),
+                    ))
+                });
+                // Only a paged child's window raises a fault, and a pager that is gone can never
+                // reply: either way it is a pagerless fault.
+                let Some((pager_env, export, sink)) =
+                    paged.filter(|&(p, ..)| !p.is_some_and(|p| dead_envs.contains(&p)))
+                else {
+                    complete(tasks, ti, Err(Trap::MemoryFault));
+                    return None;
+                };
+                let pager = std::sync::Arc::clone(task_host(root, extra_envs, pager_env));
+                let ticket = pager.lock_unpoisoned().request_page(export, sink);
+                wake_serve_loops(tasks, pager_env);
+                if let Some(ticket) = ticket {
+                    tasks[ti].state = TaskState::BlockedPage { ticket, pager };
+                }
+            }
             Ok(VcpuStop::CapPending { id, dst }) => {
-                // F2 (FIBER_PARK.md) — a punted dispatch, cooperative form. A FIBER parks
-                // (`CapParked` — the slice-5a contract; the ordered drain right after the
-                // park is the register-then-recheck closing the completion-raced-the-park
-                // window). The root keeps the inline wait (guest-invisible — the oracle
-                // parks the vCPU here instead; the cooperative driver has nothing else to
-                // run on this task anyway). Two more inline cases, both mirroring the
-                // oracle's predicate: a durable run (`freeze_drive` has no cap-park
-                // re-derivation — the freeze must never meet one) and a confined
-                // `instantiate` child (its completions live on ITS host; keeping the child
-                // inline keeps the drain single-store — recorded FIBER_PARK.md residue).
+                // F2 (FIBER_PARK.md), #2047 — a punted dispatch, cooperative form: what made the
+                // call parks, and the rest of the run goes on, as the oracle parks the vCPU. The
+                // call may wait on the world, or on what another task does. The call is in its
+                // domain's store, a child's as the root's (#2424). A FIBER parks (`CapParked` — the
+                // slice-5a contract; the drain right after the park is the
+                // register-then-recheck closing the completion-raced-the-park window). A task's own
+                // call parks the task (`BlockedHostCap`), and a round's drain wakes it
+                // ([`drain_task_completions`]); a host-answered one the same way, its embedder's
+                // answer posted to the same store (#2495). A durable run waits inline, as the
+                // oracle's: `freeze_drive` has no cap-park re-derivation, so the freeze must never
+                // meet one (a host-answered call never reaches it, declined at dispatch).
+                let env = tasks[ti].env;
+                let comps = task_host(root, extra_envs, env)
+                    .lock_unpoisoned()
+                    .completions();
                 let durable = root.lock_unpoisoned().is_durable();
-                if tasks[ti].vm.vt.active_id != ROOT_FIBER && !durable && tasks[ti].env.is_none() {
-                    let comps = root.lock_unpoisoned().completions();
+                if durable {
+                    tasks[ti].deliver(dst, Reg::from_i64(comps.wait(id)));
+                } else if tasks[ti].vm.vt.active_id != ROOT_FIBER {
+                    let (fibers, fiber_sp, mem) = match env {
+                        None => (fibers, fiber_sp, mem),
+                        Some(e) => {
+                            let e = &mut extra_envs[e];
+                            (&mut e.fibers.fibers, &mut e.fibers.sp, &mut e.mem)
+                        }
+                    };
                     let k = tasks[ti].vm.vt.active_id;
                     // The drain right after the park is the register-then-recheck: a completion
                     // that raced the park wakes the fiber at once.
-                    if let Some(k) = park_running_fiber(
+                    let mut claimed = Vec::new();
+                    let parked = park_running_fiber(
                         &mut tasks[ti].vm.vt,
                         fibers,
                         fiber_sp,
@@ -15155,34 +14750,23 @@ impl SchedCore {
                             woken: None,
                         },
                         |fibers| {
-                            drain_cap_parked(fibers, &comps);
+                            claimed = drain_cap_parked(fibers, &comps);
                             matches!(
                                 fibers.get(k),
                                 Some(FiberState::CapParked { woken: Some(_), .. })
                             )
                         },
-                    ) {
+                    );
+                    let mut host = task_host(root, extra_envs, env).lock_unpoisoned();
+                    for (id, r) in claimed {
+                        tape_answer(&mut host, id, r);
+                    }
+                    drop(host);
+                    if let Some(k) = parked {
                         tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
                     }
-                } else if tasks[ti].env.is_none()
-                    && !durable
-                    && root.lock_unpoisoned().completions().is_host_owned(id)
-                {
-                    // #1953: a host-completed punt, which only a `CoopRun` admits (on its root
-                    // powerbox): park the task until the embedder answers it. The pump surfaces
-                    // the park once nothing else can run.
-                    tasks[ti].state = TaskState::BlockedHostCap { id, dst, at: None };
                 } else {
-                    let comps = task_host(root, extra_envs, tasks[ti].env)
-                        .lock_unpoisoned()
-                        .completions();
-                    // #1366: a host-completed punt no one here can surface — decline. (A
-                    // confined child's host never admits one; a durable run's freeze cannot
-                    // meet a park.)
-                    match comps.wait_unless_host_owned(id) {
-                        Some(r) => tasks[ti].deliver(dst, Reg::from_i64(r)),
-                        None => complete(tasks, ti, Err(Trap::CapFault)),
-                    }
+                    tasks[ti].state = TaskState::BlockedHostCap { id, dst, at: None };
                 }
             }
             // #2220 — grant into a running child: the spawner's cell and the child's, locked
@@ -15213,9 +14797,9 @@ impl SchedCore {
                 // `thread.spawn` handle, whose domain is the caller's own: no domain holds an
                 // offer into itself, so a step never locks its own cell twice.
                 let export = arg as u32;
-                let callee = usize::try_from(child)
+                let callee = super::resolve_thread(&tasks[ti].threads, child)
                     .ok()
-                    .and_then(|h| tasks[ti].threads.get(h).copied().flatten())
+                    .and_then(|slot| tasks[ti].threads[slot])
                     .and_then(|cidx| tasks[cidx].env)
                     .filter(|&k| Some(k) != tasks[ti].env)
                     .map(|k| std::sync::Arc::clone(&extra_envs[k].host));
@@ -15232,7 +14816,6 @@ impl SchedCore {
                 reply_orig,
                 reply_twin,
                 dst,
-                has_result,
             }) => {
                 // FORK.md §9.2 — fork-returns-twice on the cooperative driver. Duplicate the caller
                 // parked on this handler's dispatch into a live **twin** (private window +
@@ -15244,7 +14827,7 @@ impl SchedCore {
                 let result: i64 = 'fork: {
                     // The running handler's dispatch ticket names the parked caller; outside a
                     // handler there is none → `-EINVAL`, exactly as the oracle.
-                    let Some((ticket, _)) = tasks[ti].vm.vt.active.serve_ticket else {
+                    let Some((ticket, _)) = tasks[ti].vm.vt.active.serve_ticket() else {
                         break 'fork super::EINVAL;
                     };
                     // The server (this task) is the callee the caller parked on. In the fork
@@ -15293,38 +14876,38 @@ impl SchedCore {
                     // here and that push, so the fork factories learn it up front (#863 slice 2).
                     let twin_pid = tasks.len() as u64;
                     // The run's live cap, as the oracle's `fork_vcpu` checks it (#2006).
+                    // The twin's continuation is the caller's, with `reply_twin` injected at the
+                    // caller's reply slot.
                     let forked = if bare && live_tasks(tasks) < super::MAX_VCPUS {
                         caller_env.and_then(|ck| {
                             let env = &extra_envs[ck];
-                            let (twin_mem, twin_host, live) =
-                                fork_process(&env.host, env.mem.as_ref(), twin_pid)?;
-                            Some((ck, twin_mem, twin_host, live))
+                            let at = (&tasks[caller_ti].vm.vt.active, caller_dst, reply_twin);
+                            let (twin_mem, twin_host, live, twin_vt) =
+                                fork_process(&env.host, env.mem.as_ref(), twin_pid, at)?;
+                            Some((ck, twin_mem, twin_host, live, twin_vt))
                         })
                     } else {
                         None
                     };
-                    let Some((ck, twin_mem, twin_host, live)) = forked else {
+                    let Some((ck, twin_mem, twin_host, live, mut twin_vt)) = forked else {
                         break 'fork degrade(tasks, Some(caller_ti));
                     };
-                    // The twin's continuation is the caller's, with `reply_twin` injected at the
-                    // caller's reply slot.
-                    let mut twin_vt =
-                        twin_task(&tasks[caller_ti].vm.vt.active, caller_dst, reply_twin);
                     // #816 env-routed tier-up: same rule as the `ForkSelf` twin — the clone may
                     // keep an inherited bitmap only if its private `fork_private` window is
                     // servable (flat; the owned-flat twin backing makes the tier-up shapes so
-                    // on every target); a `Paged` twin window strips it and interprets,
-                    // fail-closed.
-                    if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
-                        twin_vt.active.jit_eligible = None;
-                        twin_vt.active.jit_page_checked = false;
+                    // on every target), and only if its calls dispatch through the table its
+                    // program's emit reads (#2273). Otherwise it interprets, fail-closed.
+                    let program = extra_envs[ck].program;
+                    if !tierup_servable(twin_mem.as_ref(), mem.as_ref())
+                        || !child_runs_emit(program, &twin_host)
+                    {
+                        twin_vt.active.tier_down();
                     }
                     // The twin is its own domain: a fresh env over the private window + duplicated
                     // powerbox, its own dispatch table seeded with the caller's installs (#1297),
                     // the caller's env fuel.
                     let twin_table = extra_envs[ck].table.fork();
                     let twin_eidx = extra_envs.len();
-                    let program = extra_envs[ck].program;
                     extra_envs.push(ChildEnv {
                         mem: twin_mem,
                         host: twin_host.into_cell(),
@@ -15349,21 +14932,15 @@ impl SchedCore {
                     tasks[caller_ti].state = TaskState::Runnable;
                     twin_ti as i64
                 };
-                if has_result {
-                    tasks[ti].deliver(dst, Reg::from_i64(result));
-                }
+                tasks[ti].deliver(dst, Reg::from_i64(result));
             }
-            Ok(VcpuStop::Reap {
-                pid,
-                dst,
-                has_result,
-            }) => {
+            Ok(VcpuStop::Reap { pid, dst }) => {
                 // FORK.md §9.2 — the servicer side of `wait(pid)`. Reap fork twin `pid` on behalf of
                 // the caller parked on this handler's dispatch: deliver the twin's exit status now (if
                 // it finished) or park the caller until it does. `-ECHILD` for a pid this run did not
                 // mint (the handler's own reply carries it); `-EINVAL` outside a handler. Never a hang.
                 let result: i64 = 'reap: {
-                    let Some((ticket, _)) = tasks[ti].vm.vt.active.serve_ticket else {
+                    let Some((ticket, _)) = tasks[ti].vm.vt.active.serve_ticket() else {
                         break 'reap super::EINVAL;
                     };
                     let Some(server_env) = tasks[ti].env else {
@@ -15412,9 +14989,7 @@ impl SchedCore {
                         0
                     }
                 };
-                if has_result {
-                    tasks[ti].deliver(dst, Reg::from_i64(result));
-                }
+                tasks[ti].deliver(dst, Reg::from_i64(result));
             }
             Ok(VcpuStop::Exec {
                 cmd,
@@ -15439,7 +15014,7 @@ impl SchedCore {
                 // (`env: None` — the shell / `bash -c` replacing itself) and a **fork-twin** exec
                 // (`env: Some` — bash forking then exec'ing an external command) are serviced; they
                 // differ only in where the rebuilt activation's window/host/table live.
-                let clean = tasks[ti].vm.vt.active.serve_ticket.is_none()
+                let clean = tasks[ti].vm.vt.active.serve_ticket().is_none()
                     && tasks[ti].vm.vt.active_id == ROOT_FIBER
                     && !root.lock_unpoisoned().is_durable();
                 if !clean {
@@ -15536,7 +15111,7 @@ impl SchedCore {
                     tasks[ti].deliver(dst, Reg::from_i64(temen_ir::errno::ENOSYS));
                     return None;
                 }
-                if tasks[ti].vm.vt.active.serve_ticket.is_some() {
+                if tasks[ti].vm.vt.active.serve_ticket().is_some() {
                     tasks[ti].deliver(dst, Reg::from_i64(super::EINVAL));
                     return None;
                 }
@@ -15584,7 +15159,9 @@ impl SchedCore {
                         Some(k) => extra_envs[k].mem.as_ref(),
                         None => mem.as_ref(),
                     };
-                    fork_process(task_host(root, extra_envs, env), win, twin_pid)
+                    // The return-twice `0`; the parent keeps the twin's pid, set below.
+                    let at = (&tasks[ti].vm.vt.active, dst, 0);
+                    fork_process(task_host(root, extra_envs, env), win, twin_pid, at)
                 } else {
                     None
                 };
@@ -15592,25 +15169,11 @@ impl SchedCore {
                     None => {
                         tasks[ti].deliver(dst, Reg::from_i64(super::EAGAIN));
                     }
-                    Some((twin_mem, twin_host, live)) => {
+                    Some((twin_mem, twin_host, live, mut twin_vt)) => {
                         // #1080 / #1262 — the twin's own park door, so its own `fork()`/`waitpid()`
                         // park (a bash pipeline subshell is a twin that forks and waits its
                         // command), and its signal doors on the run's bell.
                         wire_process(&twin_host, root);
-                        // The return-twice `0`; the parent keeps the twin's pid, set below.
-                        let mut twin_vt = twin_task(&tasks[ti].vm.vt.active, dst, 0);
-                        // #816 env-routed tier-up: the clone carries the parent's bitmap; the twin
-                        // may keep it only if its OWN private window (`fork_private`, pushed into
-                        // `extra_envs` below) is servable — the driver then answers each of the
-                        // twin's events over that window via the pending-env routing. The
-                        // owned-flat twin backing (#816 item 3) makes the tier-up shapes servable
-                        // on every target; a twin still on the `Paged` fallback (unbounded
-                        // reservation, allocation failure) is not: strip the bitmap so it
-                        // interprets, fail-closed.
-                        if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
-                            twin_vt.active.jit_eligible = None;
-                            twin_vt.active.jit_page_checked = false;
-                        }
                         // #1297: the twin's own dispatch table, seeded with the caller's installs.
                         let (twin_table, twin_fuel, program) = match env {
                             Some(k) => (
@@ -15620,6 +15183,20 @@ impl SchedCore {
                             ),
                             None => (dom.table.fork(), fuel.for_thread(), 0),
                         };
+                        // #816 env-routed tier-up: the clone carries the parent's bitmap; the twin
+                        // may keep it only if its OWN private window (`fork_private`, pushed into
+                        // `extra_envs` below) is servable — the driver then answers each of the
+                        // twin's events over that window via the pending-env routing. The
+                        // owned-flat twin backing (#816 item 3) makes the tier-up shapes servable
+                        // on every target; a twin still on the `Paged` fallback (unbounded
+                        // reservation, allocation failure) is not. Nor is a twin whose calls would
+                        // not dispatch through the table its program's emit reads (#2273). Either
+                        // strips the bitmap so it interprets, fail-closed.
+                        if !tierup_servable(twin_mem.as_ref(), mem.as_ref())
+                            || !child_runs_emit(program, &twin_host)
+                        {
+                            twin_vt.active.tier_down();
+                        }
                         let twin_eidx = extra_envs.len();
                         extra_envs.push(ChildEnv {
                             mem: twin_mem,
@@ -15660,22 +15237,24 @@ impl SchedCore {
                 dst,
                 module,
             }) => {
-                let mut child = match thread_task(&dom.source, module as usize, func, sp, arg) {
-                    Ok(vt) => vt,
-                    Err(t) => {
-                        complete(tasks, ti, Err(t));
-                        return None;
-                    }
-                };
+                let node = task_host(root, extra_envs, tasks[ti].env)
+                    .lock_unpoisoned()
+                    .own_node();
+                let payer = Some(node.clone());
+                let mut child =
+                    match thread_task(&dom.source, module as usize, func, sp, arg, payer) {
+                        Ok(vt) => vt,
+                        Err(t) => {
+                            complete(tasks, ti, Err(t));
+                            return None;
+                        }
+                    };
                 if live_tasks(tasks) >= super::MAX_VCPUS {
                     complete(tasks, ti, Err(Trap::ThreadFault)); // thread bomb
                     return None;
                 }
                 // #2001 — the thread is one `spawn` of its domain's node while it lives: a full
                 // ceiling refuses it as the live cap does.
-                let node = task_host(root, extra_envs, tasks[ti].env)
-                    .lock_unpoisoned()
-                    .own_node();
                 let Some(live) = LiveVcpu::charge(node) else {
                     complete(tasks, ti, Err(Trap::ThreadFault));
                     return None;
@@ -15683,24 +15262,33 @@ impl SchedCore {
                 // #926 slice 2, #2248: a `thread.spawn` child tiers up its own eligible calls when
                 // the program it runs has an emit: the run's own, or a granted module's that a
                 // child domain runs. A thread in another program (a §22 unit spawning its own
-                // function) has none, and interprets.
+                // function) has none, and interprets. It tiers up at its entry too (#1414 ED-1),
+                // except in a durable run, whose thaw replays the entry interpreted.
                 //
                 // #816 env-routed tier-up: the thread shares its spawner's env (below), so it may
                 // tier up exactly when that env's window is tier-up-servable — the driver answers
                 // every per-event read (`win` base, mapped extent, page state) for the pending
-                // task's env ([`CoopRun::pending_win`] and friends), so a §14 confined child's
-                // thread tiers up over its own carve. A window the driver cannot flatly address (a
+                // task's env ([`CoopRun::pending_win`] and friends), so a §14 child's thread tiers
+                // up over that child's own window. A window the driver cannot flatly address (a
                 // fork twin's `Paged` private copy on wasm) fails closed to the interpreter, which
-                // is always right.
-                let window = match tasks[ti].env {
-                    None => mem.as_ref(),
-                    Some(k) => extra_envs[k].mem.as_ref(),
+                // is always right. So does a thread of a child over a memory of its own, whose one
+                // context its root task holds (#1414 ED-2), and a child domain whose calls would not
+                // dispatch through the table the emit reads (#2273, [`child_runs_emit`]).
+                let (window, dispatches) = match tasks[ti].env {
+                    None => (mem.as_ref(), true),
+                    Some(k) => (
+                        extra_envs[k].mem.as_ref(),
+                        child_runs_emit(module, &extra_envs[k].host.lock_unpoisoned()),
+                    ),
                 };
                 if let Some(e) = programs
                     .of(module)
-                    .filter(|_| tierup_servable(window, mem.as_ref()))
+                    .filter(|_| dispatches && tierup_servable(window, mem.as_ref()))
                 {
-                    child.active.tier_up(module, e);
+                    let durable = task_host(root, extra_envs, tasks[ti].env)
+                        .lock_unpoisoned()
+                        .is_durable();
+                    child.active.tier_up(module, e, !durable);
                 }
                 let cidx = tasks.len();
                 // §12: its `vcpu.tls` starts at its id in its domain (#1775).
@@ -15716,9 +15304,9 @@ impl SchedCore {
                 tasks[ti].threads.push(Some(cidx));
                 tasks[ti].deliver(dst, Reg::from_i32(handle));
             }
-            // §5 `instantiate_detached` (op 15): the child is a task of this executor over a
+            // §5 detached spawn (op 17): the child is a task of this executor over a
             // **fresh window of its own** (`Mem::from_spec`, its own guard) — not a carve — the
-            // tree-walk oracle's spawn (`run_with_host`'s op-15 arm) on the cooperative driver.
+            // tree-walk oracle's spawn (`run_with_host`'s op-17 arm) on the cooperative driver.
             // Admission first (entry shape, the window = the module's declared memory, the args
             // payload, `premap_admit`, no durable domain, then the `Budget.mem` take — a refused
             // spawn lands `-EINVAL` and charges nothing); then the child powerbox: starter
@@ -15730,20 +15318,13 @@ impl SchedCore {
                     None => mem.as_ref(),
                     Some(k) => extra_envs[k].mem.as_ref(),
                 };
-                // #2078 — a child of the spawning frame's own module runs it, as a same-module
-                // confined child does: no second compile (#2143: an installed unit's, from a
-                // frame of one).
-                let spawner = spawner_module(&dom.source, &tasks[ti].vm.vt.active);
-                let table = tasks[ti].env.map_or(&*dom.table, |k| &*extra_envs[k].table);
-                let unit = table.jit_unit(tasks[ti].vm.vt.active.module);
                 let admitted = admit_detached_in_process(
                     &mut task_host(root, extra_envs, tasks[ti].env).lock_unpoisoned(),
                     pm,
                     spawn,
                     &dom.source,
-                    spawner,
-                    unit,
                     |c| programs.for_child(&c.program, &c.host, &dom.source),
+                    *child_window,
                 );
                 let (child, tierup) = match admitted {
                     Ok(Some(c)) => c,
@@ -15758,10 +15339,13 @@ impl SchedCore {
                 };
                 // #816 env-routed tier-up, as for a confined child: the child tiers up its
                 // program's emit while the driver can address its window flatly, which only a
-                // failed flat allocation prevents.
-                let tierup = tierup.filter(|_| tierup_servable(child.mem.as_ref(), mem.as_ref()));
-                let started =
-                    coop_start_child(tasks, extra_envs, root, ti, child, spawn.entry, dst, tierup);
+                // failed flat allocation prevents. A window in a memory of its own (executor 2's)
+                // holds one context for emitted code, which the child's root task takes, so its
+                // threads interpret (#1414 ED-2).
+                let own = child.mem.as_ref().is_some_and(|m| m.foreign_id().is_some());
+                let tierup =
+                    tierup.filter(|_| own || tierup_servable(child.mem.as_ref(), mem.as_ref()));
+                let started = coop_start_child(tasks, extra_envs, root, ti, child, dst, tierup);
                 if let Err(t) = started {
                     complete(tasks, ti, Err(t));
                 }
@@ -15772,7 +15356,11 @@ impl SchedCore {
                 let spawners: Vec<_> = extra_envs.iter().map(|e| e.spawner).collect();
                 child_ctl(tasks, &spawners, ti, child, dst, ctl);
             }
-            Ok(VcpuStop::Join { handle, dst, wait }) => join_child(tasks, ti, handle, dst, wait),
+            Ok(VcpuStop::Join {
+                handle,
+                dst,
+                status,
+            }) => join_child(tasks, ti, handle, dst, status),
             Ok(VcpuStop::Wait {
                 base,
                 expected,
@@ -15964,7 +15552,7 @@ impl SchedCore {
 }
 
 /// #926 slice 2 tier-up configuration for a cooperative run — a `None` config is "no tier-up",
-/// exactly the native `drive`. A task tiers up the direct calls of the program it runs that the
+/// exactly the native `drive`. A task tiers up the calls of the program it runs that the
 /// program's emit makes eligible: the run's own program's, and a granted module's that a child runs
 /// (#2248).
 pub struct TierUpConfig {
@@ -15983,11 +15571,27 @@ pub struct TierUpConfig {
 /// What the host emitted of a program for its tasks to tier up into (#926 slice 2).
 #[derive(Clone, Default)]
 pub struct ProgramEmit {
-    /// Per-function eligibility (index = function). `true` ⇒ a direct call tiers up.
+    /// Per-function eligibility (index = function). `true` ⇒ a call may tier up, direct or through
+    /// the dispatch table (`call.dyn`), while [`Self::hot`] says it is worth the crossing.
     pub eligible: std::sync::Arc<[bool]>,
     /// #750 paged tier-up: the emitted region carries a per-access page check, so an
     /// unrepresentable window surfaces with the reserved size instead of declining.
     pub page_checked: bool,
+    /// #2474 — when an eligible function's calls tier up.
+    pub hot: Hotness,
+}
+
+/// #2474 — when a task's calls to an eligible function tier up: from the first, until `window` of
+/// them in a row average under `per_call` work, and again once `window` of them average that. A
+/// crossing into emitted code costs a fixed amount, which only a call doing enough work repays.
+/// Work is the fuel a call burns, its taken back edges and calls, its callees' included: an
+/// interpreted call's from [`Vm::work`], an emitted call's as its host reports it
+/// ([`Vm::emitted_returned`]), the same safepoints (INVARIANTS #9). Each task keeps its own count.
+/// The default, `per_call` 0, tiers up every eligible call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hotness {
+    pub per_call: u64,
+    pub window: u32,
 }
 
 /// The host's emitter for granted modules ([`TierUpConfig::modules`]). Offered one
@@ -16057,17 +15661,18 @@ pub enum CoopEvent {
     /// call [`run`](CoopRun::run) again. Never surfaced with the flag off (the pump blocks on the
     /// doorbell instead, or faults as a deadlock).
     Idle,
-    /// #1953 — every runnable task is waiting on the embedder: completion `id` is a
-    /// **host-completed cap call** (a proc granted with [`crate::OffloadOutcome::Host`]) whose
-    /// request the proc's submit hook recorded. The run is live: answer it with
-    /// [`CoopRun::deliver_cap`] and pump again. The guest saw a plain synchronous call.
+    /// #1953 — nothing can run until the embedder answers: completion `id` is a **host-answered
+    /// cap call** (a proc granted with [`crate::OffloadOutcome::Host`]), in any domain, whose
+    /// request the proc's submit hook recorded; the earliest such call, when there are several.
+    /// The run is live: answer it with its [`crate::Completer`] and pump again (pumping first
+    /// surfaces this again). The guest saw a plain synchronous call.
     CapPark { id: u64 },
     /// The run finished; these are the root task's results.
     Done(Vec<Value>),
     /// The run trapped (the root task, or a fatal driver fault).
     Trapped(Trap),
     /// A task paused to run `func` of program `module` emitted, with raw i64 arg slots `argv`: a
-    /// task on an eligible direct `Call` of the program it runs — the run's own (`0`), or a granted
+    /// task on an eligible call of the program it runs — the run's own (`0`), or a granted
     /// module a child runs ([`TierUpConfig::modules`]) — or a process whose exec'd image is a leaf
     /// the host emitted ([`TierUpConfig::leaf`]), at its entry. `mapped` is the committed scalar
     /// window extent for the emitted `"mapped"` global. The host runs the emitted `f{func}` and
@@ -16145,7 +15750,7 @@ impl CoopRun {
             fuel,
             host,
             tierup,
-            Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]),
+            Mem::root(m, default_reserved_log2(), None, &[]),
         )
     }
 
@@ -16168,7 +15773,7 @@ impl CoopRun {
             fuel,
             host,
             None,
-            Mem::root(m, DEFAULT_RESERVED_LOG2, None, init_mem),
+            Mem::root(m, default_reserved_log2(), None, init_mem),
         )
     }
 
@@ -16308,6 +15913,7 @@ impl CoopRun {
         let mut fuel = Fuel::drawn(node.ok_or(Trap::ThreadFault)?);
         let mut sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
         sched.emit.root_leaf = root_leaf;
+        sched.embedder_pumps = true;
         Ok(CoopRun {
             dom,
             mem,
@@ -16354,7 +15960,7 @@ impl CoopRun {
 
     /// #816: the pending round-trip task's env identity — `-1` for the root env, the `extra_envs`
     /// index for a confined child. Part of the driver's page-state cache key: env windows have their
-    /// **own** `map_version` counters (a fresh Arc per `nested_view`), so a version compare is only
+    /// **own** `map_version` counters (each env's window is its own `Mem`), so a version compare is only
     /// meaningful within one env — the driver rebuilds whenever (env, version) changes.
     pub fn pending_env(&self) -> i64 {
         self.pending_ti()
@@ -16363,15 +15969,14 @@ impl CoopRun {
     }
 
     /// #816: the pending task's **flat window view** for the emitted call — `(base ptr, addressable
-    /// len)`. For the root this is the run backing itself; for a §14 child it is the backing plus
-    /// the carve offset, so the emitted `win + addr` accesses land exactly where the interpreter's
-    /// confined accesses do. `None` when the pending window has no flat address (a `Paged`-backed
+    /// len)`: the pending window's own backing, so the emitted `win + addr` accesses land exactly where
+    /// the interpreter's confined accesses do. `None` when the pending window has no flat address (a `Paged`-backed
     /// window, e.g. a fork twin's private copy on wasm) — such tasks never carry the tier-up bitmap
     /// (the eligibility gates check [`Mem::flat_win_base`] at task creation), so a pending tier-up
     /// always resolves `Some`; the `None` arm is the fail-closed default for defensive callers.
     ///
     /// #1312: the length is the backing-clamped [`Mem::win_flat_len`], not the reservation — a
-    /// cooperative run now reserves the oracle's `DEFAULT_RESERVED_LOG2` over a growable backing, and
+    /// cooperative run now reserves the oracle's [`default_reserved_log2`] over a growable backing, and
     /// a driver must mirror what exists, not the mask domain. **Re-read both per event and after any
     /// bounce**: a `vm_map` grow can extend *and relocate* the backing.
     pub fn pending_win(&self) -> Option<(*const u8, u64)> {
@@ -16382,9 +15987,8 @@ impl CoopRun {
     /// The pending task's window committed **scalar extent** right now — the #717 value the cdylib
     /// re-syncs to every emitted instance's `"mapped"` global after a [`bounce`](Self::bounce) (a
     /// bounced callback may have grown the window). `0` when there is no window or its state is not
-    /// representable by one bound. #816: routed to the pending round-trip's task env, so a confined
-    /// child's own extent (its fully-mapped carve) bounds its emitted accesses — the confinement
-    /// bound — rather than the root's.
+    /// representable by one bound. #816: routed to the pending round-trip's task env, so a child's
+    /// own extent bounds its emitted accesses — the confinement bound — rather than the root's.
     pub fn window_scalar_extent(&self) -> u64 {
         self.pending_mem()
             .and_then(|m| m.scalar_extent())
@@ -16396,29 +16000,6 @@ impl CoopRun {
     /// of a run. (§14 confined children keep their own `host` in `extra_envs`, not exposed here.)
     pub fn host_mut(&mut self) -> std::sync::MutexGuard<'_, Host> {
         self.host.lock_unpoisoned()
-    }
-
-    /// #1953 — answer the host-completed cap call a [`CoopEvent::CapPark`] surfaced: `value` is the
-    /// call's result. A parked task gets it in its result slot and runs again; a parked fiber is
-    /// woken by the pump's ordered drain. `false` if no call is outstanding on `id`. Then pump again.
-    pub fn deliver_cap(&mut self, id: u64, value: i64) -> bool {
-        if !settle_host_cap(&mut self.host.lock_unpoisoned(), id, value) {
-            return false;
-        }
-        let parked = self.sched.core.tasks.iter().position(
-            |t| matches!(t.state, TaskState::BlockedHostCap { id: pid, .. } if pid == id),
-        );
-        if let Some(ti) = parked {
-            let _ = self.host.lock_unpoisoned().completions().try_take(id);
-            let t = &mut self.sched.core.tasks[ti];
-            if let TaskState::BlockedHostCap { dst, .. } = t.state {
-                // #1954: a call that parked in a bounce out of an emitted leaf waits in the call's
-                // continuation, which the pump runs next; any other in the task's own frame.
-                t.deliver(dst, Reg::from_i64(value));
-            }
-            t.state = TaskState::Runnable;
-        }
-        true
     }
 
     /// Read `len` bytes of the root window at `addr` (bounded — an out-of-window range is an error):
@@ -16448,9 +16029,9 @@ impl CoopRun {
 
     /// #1009 paged tier-up: the pending task's window memory-map introspection ([`MemMapInfo`]) — a
     /// paged coop driver rebuilds its page-state table from this. `None` for a memory-less run.
-    /// #816: routed to the pending round-trip's task env, so a confined child's own page map (its
-    /// carve geometry, its `protect`/`unmap` state) is what the emitted page check enforces —
-    /// window-relative on both sides, no translation needed.
+    /// #816: routed to the pending round-trip's task env, so a child's own page map (its
+    /// `protect`/`unmap` state) is what the emitted page check enforces — window-relative on both
+    /// sides, no translation needed.
     pub fn mem_map_info(&self) -> Option<MemMapInfo> {
         self.pending_mem().map(|m| m.map_info())
     }
@@ -16500,12 +16081,6 @@ impl CoopRun {
     /// Pump the schedule to its next pause: [`CoopEvent::Done`]/[`CoopEvent::Trapped`] end the run,
     /// [`CoopEvent::TierUp`] hands an emitted region to the host (resume with `deliver_tierup*`).
     pub fn run(&mut self) -> CoopEvent {
-        // #1953: this driver surfaces cap parks (`CoopEvent::CapPark`) — admit host-completed
-        // punts on its root powerbox, as the single-vCPU and debug drivers do. A cheap flag store.
-        self.host
-            .lock_unpoisoned()
-            .completions()
-            .allow_host_completed();
         // `budget` is the per-step op budget `step_vcpu` hands `Vm::resume` (a `0` would run zero ops
         // and spin on `Outcome::Suspended`); the native `drive` runs unsliced, so match it with
         // `u64::MAX` — run each vCPU to its next stop. It doubles as the §3d spawn record budget
@@ -16558,6 +16133,12 @@ impl CoopRun {
         self.sched.deliver_tierup(vals);
     }
 
+    /// #2474 — the work the pending tier-up did on the emitted tier, as its host counted it: the
+    /// fuel its code burned. Call before [`Self::deliver_tierup`]; a delivery without it counts none.
+    pub fn set_emitted_work(&mut self, work: u64) {
+        self.sched.set_emitted_work(work);
+    }
+
     /// Surface an emitted tier-up region's trap and resume (the paused task traps). Call once after a
     /// [`CoopEvent::TierUp`] in lieu of [`deliver_tierup`](Self::deliver_tierup).
     pub fn deliver_tierup_trap(&mut self, trap: Trap) {
@@ -16581,7 +16162,7 @@ impl CoopRun {
     /// to *that task's* env — a §14 confined child steps its own window/powerbox/dispatch table
     /// (`env == Some`), the root and its `thread.spawn` threads the shared ones (`env == None`) — so a
     /// confined leaf's callback can never reach outside its window (the confinement hinge). The fiber
-    /// registry is picked by which round-trip is outstanding (#926 slice 2g, `Vcpu::bounce_call` parity):
+    /// registry is picked by which round-trip is outstanding (#926 slice 2g):
     /// a tier-up region uses the **run-level** registry (a parked fiber persists for the run to resume),
     /// while a surfaced `Jit.invoke` uses the **invoke-confined** registry (`invoke_fibers` — its fibers
     /// die when the invoke resolves). Marshals results back into `io` and returns the result count. Call
@@ -16707,18 +16288,24 @@ impl CoopRun {
             }
         }?;
         drop(beneath);
-        let Some((vm, handoff)) = parked else {
+        let Some((vm, stop)) = parked else {
             return Ok(Some(n));
         };
         // #1896: the call stopped. Its task waits with the rest of the call, and its host with the
-        // emitted frames.
+        // emitted frames. A stop the leaf cannot wait on refuses, before the round-trip ends.
+        let win = match tasks[ti].env {
+            None => mem.as_ref(),
+            Some(k) => extra_envs[k].mem.as_ref(),
+        };
+        let spawn = hand_off(tasks, forked_twins, hooked_twins, ti, stop, win, *clock)?;
         let (ti, dst, results) = pending_tierup.take().expect("a leaf's call parked");
-        let spawn = hand_off(tasks, forked_twins, hooked_twins, ti, handoff, *clock);
         tasks[ti].vm.suspended = Some(Box::new(Suspended {
             vm,
-            dst,
-            results,
-            spawn,
+            leaf: Some(LeafCall {
+                dst,
+                results,
+                spawn,
+            }),
         }));
         Ok(None)
     }
@@ -16727,9 +16314,8 @@ impl CoopRun {
 /// #816 env-routed tier-up: may a task running over `cand` carry the tier-up bitmap? Either arm
 /// keeps the driver contract satisfiable — [`CoopRun::pending_win`] must resolve a flat view of the
 /// pending window:
-/// - a window sharing the **root backing** (a root-env thread, a §14 child carve via `nested_view`)
-///   is servable wherever the root is (the per-event `win` is the backing base plus the window's
-///   carve offset);
+/// - a window sharing the **root backing** (a root-env thread) is servable wherever the root is (the
+///   per-event `win` is the backing base);
 /// - any other window (a detached child's own, a fork twin's private `fork_private` copy) qualifies
 ///   only if its own region is flat-addressable ([`Mem::flat_win_base`]). A detached child that
 ///   inherits the run's bitmap gets a growable flat window on every target (#2102), and a twin
@@ -16747,6 +16333,18 @@ fn tierup_servable(cand: Option<&Mem>, root: Option<&Mem>) -> bool {
     }
 }
 
+/// #2273 — whether a task of a child domain may run program `module`'s emit, `host` being the
+/// domain's powerbox. A granted module's emitted `call.dyn` dispatches through a table of the
+/// module's own functions, but program 0's dispatches through the root's dispatch table, which the
+/// driver mirrors. A child domain that runs program 0 (a fork twin, its threads, its own twins)
+/// dispatches through its own table, a fork of its parent's. The two stay equal until a domain
+/// installs a unit, which takes a `Jit`. A fork carries its parent's `Jit` into the twin's
+/// powerbox, so such a domain runs the emit only while its powerbox holds none. Otherwise its
+/// tasks interpret, which is always right.
+fn child_runs_emit(module: u32, host: &Host) -> bool {
+    module != 0 || !host.has_jit_table()
+}
+
 /// #926 slice 2 — the cooperative driver's cross-tier **bounce** body: an emitted tier-up region, mid
 /// run, calls back to an interp-resident leaf `target`. Resolves `target` through the caller's dispatch
 /// `table` (masked, exactly as `Op::CallIndirect`), marshals the i64 scratch `io` per the callee's
@@ -16755,10 +16353,9 @@ fn tierup_servable(cand: Option<&Mem>, root: Option<&Mem>) -> bool {
 /// region**'s callbacks run against the **run-level** registry (`fiber_meta = Some(shadow-SP/freeze
 /// halves)` — a parked fiber persists for the run, the same registry `step_vcpu` mirrors its parallel
 /// arrays into), while a surfaced **`Jit.invoke`** unit's callbacks run against an **invoke-confined**
-/// registry (`fiber_meta = None`, the transient loop-local scope `run_invoke` and `Vcpu::bounce_call`'s
-/// invoke branch use — its fibers die when the invoke resolves). The multi-task analogue of
-/// [`Vcpu::bounce_call`], differing only in that the window/powerbox/table come from the *paused task's*
-/// env (resolved by [`CoopRun::bounce`]).
+/// registry (`fiber_meta = None`, the transient loop-local scope `run_invoke` uses — its fibers die
+/// when the invoke resolves). The window/powerbox/table come from the *paused task's* env (resolved
+/// by [`CoopRun::bounce`]).
 #[allow(clippy::too_many_arguments)] // an inherently many-input dispatch shim; a config struct would obscure it
 fn coop_bounce(
     source: &ModuleSource,
@@ -16795,7 +16392,12 @@ fn coop_bounce(
         .zip(io.iter())
         .map(|(ty, s)| slot_to_val(*ty, *s))
         .collect();
-    let mut vm = Vm::new(&tm, ts.func as usize, &args)?;
+    let mut vm = Vm::new(
+        &tm,
+        ts.func as usize,
+        &args,
+        Some(host.with(|h| h.own_node())),
+    )?;
     vm.module = ts.module as usize;
     // #1660/#1627: `beneath` is `Some` only when the emitted frames under this bounce have spilled.
     let vals = drive_nested(
@@ -16828,7 +16430,7 @@ mod dbg_domain_end_tests {
         let m = temen_text::parse_module("func () -> () {\nblock 0 () {\n  return\n  }\n}\n")
             .expect("parse");
         let unit = compile_module(&m.funcs, &m.types, None).expect("compile");
-        let vt = VTask::new(&unit, 0, &[]).expect("task");
+        let vt = VTask::new(&unit, 0, &[], None).expect("task");
         TaskSlot {
             state,
             ..TaskSlot::new(vt, Some(0), LiveVcpu::none())
@@ -16868,7 +16470,7 @@ mod dbg_domain_end_tests {
             program: 0,
             fuel: Fuel::fixed(0),
             fibers,
-            place: EnvPlace::Detached { spawner: None },
+            spawner: None,
         }];
         let held = |h: &Host| h.capture_durable_budgets()[0].used.mem;
         let done = || TaskState::Done(Ok(Vec::new()));
@@ -16925,10 +16527,10 @@ mod live_cap_tests {
         let child = AdmittedChild {
             mem: None,
             host: Host::new(),
-            program: ChildProgram::Spawner(0, std::sync::Arc::new(unit())),
+            program: (0, std::sync::Arc::new(unit())),
             args: Vec::new(),
             fuel: Fuel::fixed(0),
-            lease: Some(lease),
+            lease,
         };
         assert_eq!(held(&host), (WINDOW as i64, 1), "the admission's charge");
         (host, child)
@@ -16945,7 +16547,7 @@ mod live_cap_tests {
     }
 
     fn vtask() -> VTask {
-        VTask::new(&unit(), 0, &[]).expect("task")
+        VTask::new(&unit(), 0, &[], None).expect("task")
     }
 
     #[test]
@@ -16955,7 +16557,7 @@ mod live_cap_tests {
         let mut tasks: Vec<TaskSlot> = (0..crate::MAX_VCPUS)
             .map(|_| TaskSlot::new(vtask(), None, LiveVcpu::none()))
             .collect();
-        let r = coop_start_child(&mut tasks, &mut Vec::new(), &root, 0, child, 0, 0, None);
+        let r = coop_start_child(&mut tasks, &mut Vec::new(), &root, 0, child, 0, None);
         assert_eq!(r, Err(Trap::ThreadFault));
         assert_eq!(tasks.len(), crate::MAX_VCPUS, "nothing was scheduled");
         assert_eq!(
@@ -16971,17 +16573,7 @@ mod live_cap_tests {
         let mut tasks: Vec<TaskSlot> = (0..crate::MAX_VCPUS)
             .map(|_| TaskSlot::new(vtask(), None, LiveVcpu::none()))
             .collect();
-        let place = EnvPlace::Detached { spawner: None };
-        let r = dbg_start_child(
-            &mut tasks,
-            0,
-            &mut Vec::new(),
-            &mut host,
-            child,
-            0,
-            0,
-            place,
-        );
+        let r = dbg_start_child(&mut tasks, 0, &mut Vec::new(), &mut host, child, 0);
         assert_eq!(r, Err(Trap::ThreadFault));
         assert_eq!(tasks.len(), crate::MAX_VCPUS, "nothing was scheduled");
         assert_eq!(held(&host), (0, 0), "nothing stays charged");
@@ -17064,21 +16656,35 @@ struct ThreadRun {
 /// of its own, and a browser's threads can run emitted wasm.
 #[derive(Clone)]
 pub struct ThreadPlatform {
-    /// Start `f` on a thread of its own, which nothing joins. An error refuses the thread.
-    pub spawn: fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    /// Start `f` on a thread of its own, which nothing joins. The second argument names the memory
+    /// the thread's window lives in when it is one of [`Self::child_window`]'s
+    /// ([`super::Region::foreign_id`]), which the thread must be able to reach. An error refuses the
+    /// thread.
+    pub spawn: fn(ThreadStart, Option<u32>) -> std::io::Result<()>,
     /// Nanoseconds of wall time on a monotonic clock that every thread of the run reads alike.
     pub now_ns: fn() -> u64,
     /// The emitted tier the run's tasks tier up to, if any ([`ThreadTier`]).
     pub tier: Option<ThreadTier>,
+    /// Where a detached child's window lives (#1414 B6-3c): a backing of the embedder's own, apart
+    /// from the engine's memory, `2^size_log2` bytes to start with; `None` builds it in the engine's,
+    /// as every other driver does. A backing the embedder cannot make refuses the spawn.
+    pub child_window: Option<ChildBacking>,
 }
+
+/// A thread a run starts ([`ThreadPlatform::spawn`]), for the platform to run on a thread of its own.
+pub type ThreadStart = Box<dyn FnOnce() + Send>;
+
+/// Make a detached child's window backing of `2^size_log2` bytes ([`ThreadPlatform::child_window`]).
+pub type ChildBacking = fn(u8) -> Option<std::sync::Arc<super::Region>>;
 
 impl ThreadPlatform {
     /// An OS thread per task (D56), the process-wide monotonic clock the pump's busy-poll deadlines
     /// use, and no emitted tier.
     pub const OS: ThreadPlatform = ThreadPlatform {
-        spawn: |f| std::thread::Builder::new().spawn(f).map(drop),
+        spawn: |f, _| std::thread::Builder::new().spawn(f).map(drop),
         now_ns: sched_wall_now,
         tier: None,
+        child_window: None,
     };
 }
 
@@ -17087,9 +16693,19 @@ impl ThreadPlatform {
 /// wasm.
 #[derive(Clone)]
 pub struct ThreadTier {
-    /// Per-module-0-function eligibility, as the pump's root emit ([`ProgramEmit::eligible`]): a
-    /// module-0 task's direct call to an eligible function runs on the emitted tier.
-    pub eligible: std::sync::Arc<[bool]>,
+    /// The run's own program's emit, as the pump's ([`TierUpConfig::root`]): a module-0 task's
+    /// call to a function it tiers up runs on the emitted tier. Where its code checks each
+    /// access against a page-state table (#750), each call carries its thread's
+    /// ([`EmittedCall::pagestate`]).
+    pub root: ProgramEmit,
+    /// The words of the spill stack each thread keeps for its emitted frames to push their live words
+    /// to (#1627), as the coop driver's spilling emit does; `0` when the emit does not spill. A bounce
+    /// under a tier-up hands the interpreter's `gc.roots` what the frames beneath it pushed.
+    pub spill: usize,
+    /// The host's emitter for granted modules, as the pump's ([`TierUpConfig::modules`]): a
+    /// detached child tiers up through its module's emit, over its own memory (#1414 ED-2). `None`
+    /// leaves every child interpreted.
+    pub modules: Option<ModuleEmitter>,
     /// Run one call on the emitted tier, on the calling thread. Once the run is over
     /// ([`EmittedCall::over`]) it returns by the emitted code's next fuel check, whatever it
     /// returns: the run waits for its thread.
@@ -17098,8 +16714,9 @@ pub struct ThreadTier {
 
 /// What a call on the emitted tier runs ([`EmittedCall::target`]).
 pub enum EmittedTarget<'a> {
-    /// Function `func` of the run's tier-up module: a direct call to it tiered up.
-    Region(u32),
+    /// Function `func` of program `module`, the run's own (`0`) or a granted module a child runs: a
+    /// call to it, or the entry of a task the run started, tiered up.
+    Region { module: u32, func: u32 },
     /// The entry `f0` of the §22 unit the guest invoked with code handle `code`: its emitted `wasm`,
     /// and the types the argument and result slots carry.
     Unit {
@@ -17116,19 +16733,34 @@ pub struct EmittedCall<'a> {
     pub target: EmittedTarget<'a>,
     /// The arguments, as raw i64 slots.
     pub argv: &'a [i64],
-    /// The window's committed extent, the emitted `"mapped"` global (#717).
+    /// The window's committed extent, the emitted `"mapped"` global (#717). On a page-checked tier,
+    /// the coverage of the call's page-state table ([`EmittedCall::pagestate`]).
     pub mapped: u64,
-    /// The window's flat base, the emitted code's `win`. Null for a module with no memory.
+    /// The window's flat base, the emitted code's `win`. Null for a module with no memory, and for
+    /// a window in a memory of its own ([`EmittedCall::memory`]).
     pub win: *const u8,
+    /// The memory the window lives in when it is not the engine's: a detached child's own
+    /// ([`super::Region::foreign_id`], #1414 ED-2), where the host places the window and the
+    /// call's context.
+    pub memory: Option<u32>,
     /// Set once the run is over. Emitted code still running then stops at its next fuel check.
     pub over: &'a std::sync::atomic::AtomicBool,
     /// The results, as raw i64 slots: `run` fills them.
     pub results: Vec<i64>,
+    /// #2474 — the work the call did on the emitted tier, the fuel its code burned: `run` counts it,
+    /// and the task's count of the callee's calls takes it ([`Hotness`]).
+    pub work: u64,
+    /// Where a `MemoryFault` the emitted code ended with faulted, window-relative: the address its
+    /// guard left (#2126). `run` sets it, and the task's window records it, as it records an
+    /// interpreted fault (#2275).
+    pub fault: Option<u64>,
     /// A call out of the emitted code back into the interpreter ([`Bounce`]).
     pub bounce: &'a mut Bounce<'a>,
     table: &'a SharedSlots,
     host: &'a std::sync::Mutex<super::Host>,
     now: &'a std::cell::Cell<u64>,
+    pagestate: &'a std::cell::Cell<(*const u8, usize)>,
+    spill: (*mut u64, usize),
 }
 
 impl EmittedCall<'_> {
@@ -17163,6 +16795,55 @@ impl EmittedCall<'_> {
     pub fn mapped_now(&self) -> u64 {
         self.now.get()
     }
+
+    /// The call's page-state table, a byte per page ([`build_pagestate_table`]), as `(base, len)`,
+    /// on a page-checked tier (`None` otherwise): the emitted `"pagestate"` global. A host whose
+    /// window is in a memory of its own copies it there ([`EmittedCall::memory`]). A bounce
+    /// rebuilds the table if the page map moved, so read it again after one, with
+    /// [`mapped_now`](Self::mapped_now).
+    pub fn pagestate(&self) -> Option<(*const u8, usize)> {
+        let (p, len) = self.pagestate.get();
+        (!p.is_null()).then_some((p, len))
+    }
+
+    /// The thread's spill stack, `(base, words)`, on a spilling tier (`None` otherwise): it lives
+    /// as long as the thread, and a bounce takes how many words the frames beneath it pushed.
+    pub fn spill(&self) -> Option<(*mut u64, usize)> {
+        (self.spill.1 > 0).then_some(self.spill)
+    }
+}
+
+/// A thread's page-state table for a page-checked emitted tier ([`build_pagestate_table`]), from
+/// its task's page map. It is rebuilt only when the map moves ([`Mem::map_version`]), and starts
+/// over when the thread's window does.
+#[derive(Default)]
+struct PageTable {
+    /// The map version the table was built at.
+    version: Option<u64>,
+    table: Vec<u8>,
+    /// The bytes the table covers.
+    cover: u64,
+}
+
+impl PageTable {
+    /// Bring the table up to `m`'s page map; returns its coverage.
+    fn sync(&mut self, m: &Mem) -> u64 {
+        let version = m.map_version();
+        if self.version != Some(version) {
+            (self.table, self.cover) = build_pagestate_table(&m.map_info(), m.win_flat_len());
+            self.version = Some(version);
+        }
+        self.cover
+    }
+}
+
+/// What a thread keeps for its emitted calls: its page-state table, and its spill stack
+/// ([`ThreadTier::spill`]), made at its first emitted call and never moved after, since its emitted
+/// tier keeps the address.
+#[derive(Default)]
+struct TierState {
+    pages: PageTable,
+    spill: Vec<u64>,
 }
 
 /// A §22 invoke the rules surfaced to run on the emitted tier ([`CoopStep::JitInvoke`]): its task's
@@ -17183,8 +16864,9 @@ type NewTask = (usize, Option<Mem>, Fuel);
 
 /// A call out of emitted code back into the interpreter (`env.call_interp`): function
 /// `target` of the task's dispatch table, its arguments in `io` and its results written back over
-/// them, run over the task's live window and powerbox. Returns how many results it wrote.
-pub type Bounce<'a> = dyn FnMut(u32, &mut [i64]) -> Result<usize, Trap> + 'a;
+/// them, run over the task's live window and powerbox, with how many words the emitted frames beneath
+/// it pushed to the thread's spill stack ([`EmittedCall::spill`]). Returns how many results it wrote.
+pub type Bounce<'a> = dyn FnMut(u32, &mut [i64], usize) -> Result<usize, Trap> + 'a;
 
 /// A thread steps this many tier-ups at most before it looks at the run, as a preemption makes it:
 /// a loop of calls that each tier up never spends a quantum.
@@ -17272,17 +16954,17 @@ fn drive_threads(
     };
     let bell = host.external_wake();
     let platform = host.thread_platform();
-    // The platform's tier emits the run's own program only: no granted module is offered.
+    // The platform's tier emits the run's own program, and each granted module a child runs
+    // (#1414 ED-2).
     let programs = ProgramEmits {
-        root: platform.tier.as_ref().map(|t| ProgramEmit {
-            eligible: std::sync::Arc::clone(&t.eligible),
-            page_checked: false,
-        }),
-        ..ProgramEmits::default()
+        root: platform.tier.as_ref().map(|t| t.root.clone()),
+        modules: platform.tier.as_ref().and_then(|t| t.modules.clone()),
+        granted: Vec::new(),
     };
     if let Some(e) = &programs.root {
         core.arm_tierup(e);
     }
+    core.child_window = platform.child_window;
     let run = std::sync::Arc::new(ThreadRun {
         dom: std::sync::Arc::new(dom),
         root: std::mem::take(host).into_cell(),
@@ -17313,7 +16995,7 @@ fn drive_threads(
         let seen = *bell.0.lock().unwrap_or_else(|e| e.into_inner());
         run.state.lock_unpoisoned().live += 1;
         let r = std::sync::Arc::clone(&run);
-        run.start_thread(move || r.watch(&bell, seen));
+        run.start_thread(move || r.watch(&bell, seen), None);
     }
     run_task_thread(std::sync::Arc::clone(&run), 0, view, hand);
     // The run is over, and every thread leaves at its next look: wait for them all to go.
@@ -17340,11 +17022,11 @@ fn drive_threads(
     *host = std::mem::take(&mut *root.lock_unpoisoned());
     *fuel = host.fuel_left();
     let result = over.unwrap_or(Err(Trap::ThreadFault));
-    // #1720: the trap-origin fault address, as the pump records it.
-    let fault = match &result {
-        Err(Trap::MemoryFault) => fault.or_else(|| mem.as_ref().and_then(|m| m.peek_fault_rel())),
+    // #1720: the trap-origin fault address, first-wins, as the pump records it.
+    let fault = fault.or_else(|| match &result {
+        Err(Trap::MemoryFault) => mem.as_ref().and_then(|m| m.peek_fault_rel()),
         _ => None,
-    };
+    });
     super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = fault);
     (result, mem)
 }
@@ -17369,26 +17051,20 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
     // A §22 invoke the rules surfaced at the task's last stop, which the thread runs on the emitted
     // tier before it steps the task on.
     let mut invoke = None;
-    'run: loop {
-        loop {
-            if g.over.is_some() {
-                break 'run;
-            }
-            match g.core.tasks[ti].state {
-                TaskState::Runnable if !(look && run.stopped(&g.core, ti)) => break,
-                TaskState::Done(_) => break 'run,
-                _ => {
-                    g = run.park(g, ti, &park);
-                    look = true;
-                }
-            }
+    let mut tier = TierState::default();
+    loop {
+        let runs;
+        (g, runs) = run.await_runnable(g, ti, &park, look);
+        if !runs {
+            break;
         }
         if exec || g.core.tasks[ti].env != env {
             env = g.core.tasks[ti].env;
             (mem, fuel) = g.hand(env);
+            tier.pages = PageTable::default();
         }
         std::mem::swap(&mut g.core.tasks[ti].vm, &mut vm);
-        let exits = g.core.hooked_twins.len();
+        let mut exits = g.core.hooked_twins.len();
         let host = std::sync::Arc::clone(task_host(&run.root, &g.core.extra_envs, env));
         let table = env.map(|k| std::sync::Arc::clone(&g.core.extra_envs[k].table));
         release(g);
@@ -17401,9 +17077,9 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
         };
         let stop = match invoke.take() {
             Some(inv) => run
-                .invoke(&mut vm, &mut ctx, inv)
-                .and_then(|()| run.step(&mut vm, env, &mut ctx)),
-            None => run.step(&mut vm, env, &mut ctx),
+                .invoke(&mut vm, &mut ctx, &mut tier, inv)
+                .and_then(|()| run.step(ti, &mut exits, &mut vm, env, &mut ctx, &mut tier)),
+            None => run.step(ti, &mut exits, &mut vm, env, &mut ctx, &mut tier),
         };
         let fault = match &stop {
             Err(Trap::MemoryFault) => ctx.mem.as_ref().and_then(|m| m.peek_fault_rel()),
@@ -17422,16 +17098,80 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
         look = matches!(stop, Ok(VcpuStop::Preempted));
         let (made, surfaced) = run.apply(&mut g, ti, stop, exits);
         invoke = surfaced;
-        if !made.is_empty() {
-            release(g);
-            for (j, mem, fuel) in made {
-                let r = std::sync::Arc::clone(&run);
-                run.start_thread(move || run_task_thread(r, j, mem, fuel));
-            }
-            g = run.state.lock_unpoisoned();
-        }
+        g = start_tasks(&run, g, made);
     }
     release(g);
+}
+
+/// Start the threads of the tasks a rule made ([`ThreadRun::apply`]), with the lock let go meanwhile.
+fn start_tasks<'g>(
+    run: &'g std::sync::Arc<ThreadRun>,
+    g: std::sync::MutexGuard<'g, Threads>,
+    made: Vec<NewTask>,
+) -> std::sync::MutexGuard<'g, Threads> {
+    if made.is_empty() {
+        return g;
+    }
+    release(g);
+    for (j, mem, fuel) in made {
+        let r = std::sync::Arc::clone(run);
+        let window = mem.as_ref().and_then(Mem::foreign_id);
+        run.start_thread(move || run_task_thread(r, j, mem, fuel), window);
+    }
+    run.state.lock_unpoisoned()
+}
+
+/// #2443 — the task a tier-up's bounces can stop ([`BounceTask::park`]): its run and index, its VM,
+/// and how many children had ended when it last left the table ([`ThreadRun::missed_wake`]).
+struct BounceTask<'a> {
+    run: &'a std::sync::Arc<ThreadRun>,
+    ti: usize,
+    vm: &'a mut TaskVm,
+    exits: &'a mut usize,
+}
+
+impl BounceTask<'_> {
+    /// What a `gc.roots` in the task's bounce scans beneath it (#1627): the task's paused VMs, and
+    /// the `words` its emitted frames pushed to the thread's spill stack.
+    fn beneath<'b>(&'b self, words: &'b [u64]) -> Beneath<'b> {
+        let mut b = Beneath::task(&self.vm.vt, FiberRegRef::Owned(&[]));
+        b.words.push(words);
+        b
+    }
+
+    /// #2443 — the call the task's bounce made stopped for its scheduler: a thread, futex or child op
+    /// ([`BounceRunCtx::park`]). The task stops with it. Its VM goes back to the table with the
+    /// call's continuation ([`TaskVm::suspended`]), where the rules write a parked task's registers,
+    /// and the stop is applied as an interpreted op's ([`ThreadRun::apply`]). The thread waits, the
+    /// emitted frames on its stack, until the task can run, and takes the continuation back to run
+    /// on. If the task ended or the run is over meanwhile, the bounce traps: the emitted frames
+    /// unwind, and the thread leaves as it does after a step that ended mid-way.
+    fn park(&mut self, cont: Vm, stop: VcpuStop) -> Result<Vm, Trap> {
+        let (run, ti) = (self.run, self.ti);
+        let mut g = run.state.lock_unpoisoned();
+        if g.over.is_some() || matches!(g.core.tasks[ti].state, TaskState::Done(_)) {
+            return Err(Trap::ThreadFault);
+        }
+        std::mem::swap(&mut *g.core.tasks[ti].vm, self.vm);
+        let call = Suspended {
+            vm: cont,
+            leaf: None,
+        };
+        g.core.tasks[ti].vm.suspended = Some(Box::new(call));
+        // A §22 invoke in the call is served in the bounce (`drive_nested`): none surfaces here.
+        let (made, _) = run.apply(&mut g, ti, Ok(stop), *self.exits);
+        g = start_tasks(run, g, made);
+        let park = std::sync::Arc::clone(&g.parks[ti]);
+        let runs;
+        (g, runs) = run.await_runnable(g, ti, &park, false);
+        std::mem::swap(&mut *g.core.tasks[ti].vm, self.vm);
+        *self.exits = g.core.hooked_twins.len();
+        release(g);
+        match self.vm.suspended.take() {
+            Some(call) if runs => Ok(call.vm),
+            _ => Err(Trap::ThreadFault),
+        }
+    }
 }
 
 /// Let go of executor 2's lock, then signal the threads its holder woke ([`ThreadRun::wake`]).
@@ -17448,11 +17188,15 @@ impl ThreadRun {
     /// thread, on the platform's emitted tier ([`ThreadTier`]), and the step goes on; after
     /// [`TIERUP_LOOK`] of them in a row the thread stops to look at the run, as a preemption makes
     /// it.
+    #[allow(clippy::too_many_arguments)]
     fn step(
-        &self,
+        self: &std::sync::Arc<Self>,
+        ti: usize,
+        exits: &mut usize,
         vm: &mut TaskVm,
         env: Option<usize>,
         ctx: &mut RunCtx,
+        state: &mut TierState,
     ) -> Result<VcpuStop, Trap> {
         let mut fibers = FiberCell::Core(&self.state, env);
         for _ in 0..TIERUP_LOOK {
@@ -17473,18 +17217,43 @@ impl ThreadRun {
                     results,
                     mapped,
                 }) => {
-                    // Only a tier arms the eligibility a tier-up needs, and only for the run's own
-                    // program (`drive_threads`).
-                    let tier = (self.platform.tier.as_ref())
-                        .filter(|_| module == 0)
-                        .ok_or(Trap::Malformed)?;
-                    let target = EmittedTarget::Region(func);
-                    let vals = self.emitted(tier, &mut fibers, true, ctx, target, &argv, mapped)?;
+                    // Only a tier arms the eligibility a tier-up needs (`drive_threads`), with the
+                    // page check of the program it is for.
+                    let tier = self.platform.tier.as_ref().ok_or(Trap::Malformed)?;
+                    let paged = vm.vt.active.jit_page_checked;
+                    let target = EmittedTarget::Region { module, func };
+                    let task = BounceTask {
+                        run: self,
+                        ti,
+                        vm: &mut *vm,
+                        exits: &mut *exits,
+                    };
+                    let (vals, work) = self.emitted(
+                        tier,
+                        &mut fibers,
+                        Some(task),
+                        ctx,
+                        state,
+                        target,
+                        &argv,
+                        (mapped, paged),
+                    )?;
                     // A short reply is malformed, as the pump's `deliver_tierup` has it.
                     if vals.len() < results.len() {
                         return Err(Trap::Malformed);
                     }
-                    set_slot_results(&mut vm.vt.active, dst as u32, &results, vals);
+                    match dst {
+                        TierUpDst::Frame(dst) => {
+                            set_slot_results(&mut vm.vt.active, dst as u32, &results, vals);
+                            let f = func as usize;
+                            vm.vt.active.emitted_returned(module as usize, f, work);
+                        }
+                        // A task that tiered up at its entry ran whole: its results end it.
+                        TierUpDst::Entry { .. } => {
+                            let vals = results.iter().zip(vals).map(|(t, v)| slot_to_val(*t, v));
+                            return Ok(VcpuStop::Done(vals.collect()));
+                        }
+                    }
                 }
                 stop => return stop,
             }
@@ -17492,11 +17261,42 @@ impl ThreadRun {
         Ok(VcpuStop::Preempted)
     }
 
+    /// Wait until task `ti` can run, or has ended, or the run is over, parking its thread meanwhile
+    /// ([`Self::park`]); returns whether it runs. `look`: whether its process may have stopped since
+    /// its thread last looked (#1198), after a park or a preemption.
+    fn await_runnable<'g>(
+        &self,
+        mut g: std::sync::MutexGuard<'g, Threads>,
+        ti: usize,
+        park: &std::sync::Condvar,
+        mut look: bool,
+    ) -> (std::sync::MutexGuard<'g, Threads>, bool) {
+        loop {
+            if g.over.is_some() {
+                return (g, false);
+            }
+            match g.core.tasks[ti].state {
+                TaskState::Runnable if !(look && self.stopped(&g.core, ti)) => return (g, true),
+                TaskState::Done(_) => return (g, false),
+                _ => {
+                    g = self.park(g, ti, park);
+                    look = true;
+                }
+            }
+        }
+    }
+
     /// Run the §22 invoke `inv` the rules surfaced at the task's last stop on this thread's emitted
     /// tier ([`ThreadTier::run`]), and hand its results to the task as the interpreted invoke would.
     /// Its calls back into the interpreter share a registry of their own, whose fibers die with the
     /// invoke, as `run_invoke`'s do.
-    fn invoke(&self, vm: &mut TaskVm, ctx: &mut RunCtx, inv: SurfacedInvoke) -> Result<(), Trap> {
+    fn invoke(
+        &self,
+        vm: &mut TaskVm,
+        ctx: &mut RunCtx,
+        state: &mut TierState,
+        inv: SurfacedInvoke,
+    ) -> Result<(), Trap> {
         let tier = self.platform.tier.as_ref().ok_or(Trap::Malformed)?;
         let mut fibers = FiberTables::default();
         let target = EmittedTarget::Unit {
@@ -17506,7 +17306,8 @@ impl ThreadRun {
             results: &inv.results,
         };
         let mut cell = fibers.cell();
-        let vals = self.emitted(tier, &mut cell, false, ctx, target, &inv.argv, inv.mapped)?;
+        let at = (inv.mapped, tier.root.page_checked);
+        let (vals, _) = self.emitted(tier, &mut cell, None, ctx, state, target, &inv.argv, at)?;
         // A short reply is malformed, as the pump's `deliver_jit_invoke_vals` has it.
         if vals.len() < inv.results.len() {
             return Err(Trap::Malformed);
@@ -17517,48 +17318,114 @@ impl ThreadRun {
 
     /// Run one call on this thread's emitted tier ([`ThreadTier::run`]): `target`, over the task's
     /// window and dispatch table. Its calls back into the interpreter run over the task's live
-    /// window, powerbox and table, with their fibers in `fibers`: the run's registry for a tier-up
-    /// (`run_level`), as the pump's are, or an invoke's own.
+    /// window, powerbox and table, with their fibers in `fibers`: the run's registry for a tier-up,
+    /// as the pump's are, or an invoke's own. A tier-up's `task` is what a `gc.roots` in a bounce
+    /// scans beneath it, with what its emitted frames pushed to the thread's spill stack (#1627),
+    /// as the pump's bounce does, and what a call in a bounce stops for its scheduler (#2443,
+    /// [`BounceTask::park`]); an invoked unit's calls never stop (#1578). `at` is the extent the
+    /// stop surfaced with, and whether the code is page-checked: then the call reads the thread's
+    /// page-state table, brought up to the task's page map, and is bounded by its coverage instead
+    /// (#750).
     #[allow(clippy::too_many_arguments)]
     fn emitted(
         &self,
         tier: &ThreadTier,
         fibers: &mut FiberCell,
-        run_level: bool,
+        mut task: Option<BounceTask<'_>>,
         ctx: &mut RunCtx,
+        state: &mut TierState,
         target: EmittedTarget<'_>,
         argv: &[i64],
-        mapped: u64,
-    ) -> Result<Vec<i64>, Trap> {
-        // Emitted code runs only over a window with a flat span, or none at all.
-        let win = match ctx.mem.as_ref() {
-            None => std::ptr::null(),
-            Some(m) => m.flat_win_base().ok_or(Trap::Malformed)?,
+        at: (u64, bool),
+    ) -> Result<(Vec<i64>, u64), Trap> {
+        // Emitted code runs over a window with a flat span in the engine's memory, over a window in
+        // a memory of its own, which the host places (#1414 ED-2), or over none at all.
+        let (win, memory) = match ctx.mem.as_ref() {
+            None => (std::ptr::null(), None),
+            Some(m) => match (m.flat_win_base(), m.foreign_id()) {
+                (Some(base), _) => (base, None),
+                (None, Some(id)) => (std::ptr::null(), Some(id)),
+                (None, None) => return Err(Trap::Malformed),
+            },
         };
+        let (mapped, paged) = at;
         let host = match &ctx.host {
             HostCell::Shared(h) => *h,
             HostCell::Excl(_) => return Err(Trap::Malformed),
         };
+        let TierState { pages, spill } = state;
+        if spill.is_empty() {
+            spill.resize(tier.spill, 0);
+        }
+        let paged = paged && ctx.mem.is_some();
+        let (mapped, at) = match ctx.mem.as_ref().filter(|_| paged) {
+            Some(m) => (pages.sync(m), (pages.table.as_ptr(), pages.table.len())),
+            None => (mapped, (std::ptr::null(), 0)),
+        };
+        let spilled = (spill.as_mut_ptr(), spill.len());
         let now = std::cell::Cell::new(mapped);
+        let pagestate = std::cell::Cell::new(at);
         let RunCtx {
             table, fuel, mem, ..
         } = ctx;
         let table: &SharedSlots = table;
-        let mut bounce = |target: u32, io: &mut [i64]| {
-            let ran = coop_bounce(
+        let mut bounce = |target: u32, io: &mut [i64], pushed: usize| {
+            // A tier that does not spill, or a count past its stack, leaves `gc.roots` refused: a
+            // scan that cannot see the emitted frames' words would miss roots.
+            let words = (!spill.is_empty()).then(|| spill.get(..pushed)).flatten();
+            let mut parked = None;
+            let first = task.as_ref().zip(words).map(|(t, w)| t.beneath(w));
+            let mut ran = coop_bounce(
                 &self.dom.source,
                 table,
                 fuel,
                 mem,
                 &mut HostCell::Shared(host),
                 fibers,
-                run_level.then_some(BounceRunCtx { park: None }),
+                task.as_ref().map(|_| BounceRunCtx {
+                    park: Some(&mut parked),
+                }),
                 target,
                 io,
-                None,
+                first.as_ref(),
             );
-            // The bounce may have grown the window, which the emitted code reads again after it.
-            now.set(mem.as_ref().map_or(0, |m| m.scalar_extent().unwrap_or(0)));
+            drop(first);
+            // #2443 — the call stopped for its task's scheduler: the task stops with it, and the
+            // call runs on once the task can, until it returns.
+            while let Some((cont, stop)) = parked.take() {
+                let cont = task.as_mut().ok_or(Trap::Malformed)?.park(cont, stop)?;
+                let under = task.as_ref().zip(words).map(|(t, w)| t.beneath(w));
+                ran = drive_nested(
+                    &self.dom.source,
+                    table,
+                    VTask::of(cont, 0),
+                    fuel,
+                    mem,
+                    &mut HostCell::Shared(host),
+                    fibers,
+                    Some(BounceRunCtx {
+                        park: Some(&mut parked),
+                    }),
+                    under.as_ref(),
+                    false,
+                )
+                .map(|ran| {
+                    let vals = ran.done();
+                    for (slot, v) in io.iter_mut().zip(&vals) {
+                        *slot = val_to_slot(*v);
+                    }
+                    vals.len()
+                });
+            }
+            // The bounce may have grown the window or moved its page map, which the emitted code
+            // reads again after it.
+            match mem.as_ref() {
+                Some(m) if paged => {
+                    now.set(pages.sync(m));
+                    pagestate.set((pages.table.as_ptr(), pages.table.len()));
+                }
+                m => now.set(m.map_or(0, |m| m.scalar_extent().unwrap_or(0))),
+            }
             ran
         };
         let mut call = EmittedCall {
@@ -17566,14 +17433,24 @@ impl ThreadRun {
             argv,
             mapped,
             win,
+            memory,
             over: &self.over,
             results: Vec::new(),
+            work: 0,
+            fault: None,
             bounce: &mut bounce,
             table,
             host,
             now: &now,
+            pagestate: &pagestate,
+            spill: spilled,
         };
-        (tier.run)(&mut call).map(|()| call.results)
+        let ran = (tier.run)(&mut call);
+        let (results, work, fault) = (call.results, call.work, call.fault);
+        if let (Err(Trap::MemoryFault), Some(rel), Some(m)) = (&ran, fault, mem.as_ref()) {
+            m.report_fault_rel(rel);
+        }
+        ran.map(|()| (results, work))
     }
 
     /// Ring the run's external-wake bell, if it has one: its watcher looks at the run.
@@ -17607,8 +17484,10 @@ impl ThreadRun {
 
     /// Start `f` on a thread of its own, one the run has counted in ([`Threads::live`]). A thread
     /// that cannot start ends the run, which cannot go on without it (D56: a task is a thread).
-    fn start_thread(&self, f: impl FnOnce() + Send + 'static) {
-        if (self.platform.spawn)(Box::new(f)).is_err() {
+    /// Start `f` on a thread of its own, over a window in `window`, the memory
+    /// [`ThreadPlatform::spawn`] must let it reach, if any.
+    fn start_thread(&self, f: impl FnOnce() + Send + 'static, window: Option<u32>) {
+        if (self.platform.spawn)(Box::new(f), window).is_err() {
             let mut g = self.state.lock_unpoisoned();
             g.live -= 1;
             self.end(&mut g);
@@ -17706,20 +17585,17 @@ impl ThreadRun {
             .chain(core.extra_envs.iter_mut().map(|e| &mut e.fibers.fibers))
             .collect();
         time_out_due(&mut core.tasks, &mut regs, core.clock);
-        // F2: a fiber parked on a punted call wakes once the call completes (only the root domain's
-        // fibers park on one).
-        let cap_parked = |f: &FiberState| matches!(f, FiberState::CapParked { woken: None, .. });
-        if core.fibers.iter().any(cap_parked) {
-            let comps = self.root.lock_unpoisoned().completions();
-            drain_cap_parked(&mut core.fibers, &comps);
-        }
+        // F2: a fiber parked on a punted call wakes once the call completes; #2047: a task too.
+        // #2424: in any domain.
+        drain_fiber_completions(&mut core.fibers, &mut core.extra_envs, &self.root);
+        drain_task_completions(&mut core.tasks, &core.extra_envs, &self.root);
         settle_wakes(
             &mut core.tasks,
             &mut core.extra_envs,
             &core.fibers,
             &mut core.forked_twins,
             &mut core.hooked_twins,
-            &mut core.released_envs,
+            &mut core.released,
             &self.root,
         );
         interrupt_parks(&mut core.tasks, &core.extra_envs, &self.root);
@@ -17896,9 +17772,10 @@ impl ThreadRun {
     }
 }
 
-/// Mark task `ti` finished with `res`, then wake any vCPU parked on `thread.join` of it: an `Ok`
-/// result is delivered into the joiner's `dst` (it becomes runnable); a trap propagates — the joiner
-/// completes with the same trap (transitively, via the worklist).
+/// Mark task `ti` finished with `res`, then wake any vCPU parked on a join of it: what the end gives
+/// the joiner is delivered from its `dst` and it becomes runnable ([`super::join_delivery`]), or a
+/// thread's trap propagates — its joiner completes with the same trap (transitively, via the
+/// worklist).
 fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
     let mut work = vec![(ti, res)];
     while let Some((done, res)) = work.pop() {
@@ -17909,7 +17786,7 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
                 child,
                 slot,
                 dst,
-                wait,
+                status,
             } = t.state
             else {
                 continue;
@@ -17917,13 +17794,10 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
             if child != done {
                 continue;
             }
-            let (out, keep) = super::join_delivery(&res, wait);
-            if !keep {
-                t.threads[slot] = None;
-            }
-            match out {
-                Ok(r) => {
-                    t.deliver(dst, r);
+            t.threads[slot] = None;
+            match super::join_delivery(&res, status) {
+                Ok(regs) => {
+                    t.deliver_from(dst, regs);
                     t.state = TaskState::Runnable;
                 }
                 Err(trap) => work.push((j, Err(trap))),
@@ -17932,10 +17806,10 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
     }
 }
 
-/// `thread.join` of child handle `handle` (`wait`: [`super::join_delivery`]'s mode). A child that
-/// already finished delivers its result into `dst` now, or its trap completes the joiner; else the
-/// joiner parks on it until [`complete`] wakes it. A bad handle completes the joiner with its trap.
-fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32, wait: bool) {
+/// A join of child handle `handle` (`status`: [`super::join_delivery`]'s mode). A child that already
+/// finished delivers now, or its trap completes the joiner; else the joiner parks on it until
+/// [`complete`] wakes it. A bad handle completes the joiner with its trap.
+fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32, status: bool) {
     let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
         Ok(s) => s,
         Err(t) => return complete(tasks, ti, Err(t)),
@@ -17943,12 +17817,10 @@ fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32, wait: bo
     let child = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
     match &tasks[child].state {
         TaskState::Done(res) => {
-            let (out, keep) = super::join_delivery(res, wait);
-            if !keep {
-                tasks[ti].threads[slot] = None;
-            }
+            let out = super::join_delivery(res, status);
+            tasks[ti].threads[slot] = None;
             match out {
-                Ok(r) => tasks[ti].deliver(dst, r),
+                Ok(regs) => tasks[ti].deliver_from(dst, regs),
                 Err(t) => complete(tasks, ti, Err(t)),
             }
         }
@@ -17957,7 +17829,7 @@ fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32, wait: bo
                 child,
                 slot,
                 dst,
-                wait,
+                status,
             }
         }
     }
@@ -18181,6 +18053,20 @@ fn fire_next_timeout(
     fibers: &mut [&mut Vec<FiberState>],
     clock: &mut u64,
 ) -> bool {
+    let Some(next) = next_timeout(tasks, fibers.iter().flat_map(|reg| reg.iter())) else {
+        return false;
+    };
+    *clock = (*clock).max(next);
+    time_out_due(tasks, fibers, *clock);
+    true
+}
+
+/// The earliest deadline on the logical clock: a task's futex wait's, or an event-parked fiber's
+/// among `fibers`. `None` when no wait has one.
+fn next_timeout<'a>(
+    tasks: &[TaskSlot],
+    fibers: impl Iterator<Item = &'a FiberState>,
+) -> Option<u64> {
     let fiber_deadline = |f: &FiberState| match f {
         FiberState::WaitParked {
             deadline,
@@ -18189,17 +18075,56 @@ fn fire_next_timeout(
         } => *deadline,
         _ => None,
     };
-    let next = fibers
-        .iter()
-        .flat_map(|reg| reg.iter().filter_map(fiber_deadline))
+    fibers
+        .filter_map(fiber_deadline)
         .chain(next_wait_deadline(tasks))
-        .min();
-    let Some(next) = next else {
+        .min()
+}
+
+/// #1979 — an idle native pump lets the time to its earliest deadline pass in real time, as the
+/// other engines' waits do, instead of jumping its `clock` there. The answer to any of the
+/// outstanding `calls` ends the wait early, or with none a ring of the embedder's bell past
+/// generation `seen`. The clock moves by the time that passed, so the schedule is still the clock's
+/// (#2224). Whether something came first: the pump then runs a round, the fibers' answers drained.
+#[cold]
+fn wait_out(
+    tasks: &[TaskSlot],
+    fibers: &mut [FiberState],
+    extra_envs: &mut [ChildEnv],
+    clock: &mut u64,
+    root: &DomainCell,
+    calls: &[(std::sync::Arc<super::Completions>, u64)],
+    seen: u64,
+) -> bool {
+    let regs = std::iter::once(&*fibers).chain(extra_envs.iter().map(|e| &e.fibers.fibers[..]));
+    let next = next_timeout(tasks, regs.flat_map(|reg| reg.iter()));
+    let Some(left) = next
+        .and_then(|next| next.checked_sub(*clock))
+        .filter(|&l| l > 0)
+    else {
         return false;
     };
-    *clock = (*clock).max(next);
-    time_out_due(tasks, fibers, *clock);
-    true
+    let began = sched_wall_now();
+    let woke = idle_wait(root, calls, seen, left);
+    *clock += sched_wall_now().saturating_sub(began).min(left);
+    if woke {
+        drain_fiber_completions(fibers, extra_envs, root);
+    }
+    woke
+}
+
+/// [`wait_out`]'s wait: `ns` of real time, ended early by an answer to one of `calls` or a ring
+/// of the embedder's bell past generation `seen`, one bell for both (#2480). Whether something came
+/// before the time was up. No lock is held while it waits.
+fn idle_wait(
+    root: &DomainCell,
+    calls: &[(std::sync::Arc<super::Completions>, u64)],
+    seen: u64,
+    ns: u64,
+) -> bool {
+    let bell = root.lock_unpoisoned().external_wake();
+    let within = Some(std::time::Duration::from_nanos(ns));
+    super::Completions::wait_any(calls, bell.as_ref().map(|b| (b, seen)), within)
 }
 
 /// #1146 slice 2 — interrupt an all-parked run's interruptible parks before it blocks, when a
@@ -18342,7 +18267,7 @@ fn time_out_waits(tasks: &mut [TaskSlot], clock: u64) {
 /// world its `env` names (`None` = the root + its `thread.spawn` threads; `Some(k)` = a §14
 /// child + its threads). Fixpoint: find a domain with a `Done(Err)` member and a still-live
 /// member, kill every live member with the same trap (via [`complete`], so a cross-domain joiner
-/// re-raises and a `poll` reports status 2 — the I37 supervision mechanics), then errno-wake
+/// is answered its code and a `poll` reports status 2 — the I37 supervision mechanics), then errno-wake
 /// cross-domain callers parked through the dying child (D37 death-is-revocation: cancellation is
 /// a value, never a hang); repeat until no such domain remains (a kill that propagates into a
 /// joiner may fell *its* domain next). The root domain's death is read by the caller's loop-top
@@ -18388,18 +18313,33 @@ fn teardown_domains(
         // The dying child's undelivered dispatches: wake every caller parked on a ticket
         // against its host with the probeable errno (queued or admitted — no reply will ever
         // come), and drop the queue. Later calls are refused at the LiveCall arm (`dead_envs`).
+        // A fault parked on a page it was to supply is a pagerless one (#2164), and its sink goes.
         if let Some(k) = env {
             let dying = &extra_envs[k].host;
-            for t in tasks.iter_mut() {
-                if let TaskState::BlockedTicket { callee, dst, .. } = &t.state {
-                    if std::sync::Arc::ptr_eq(callee, dying) {
+            let mut stranded = Vec::new();
+            for (i, t) in tasks.iter_mut().enumerate() {
+                match &t.state {
+                    TaskState::BlockedTicket { callee, dst, .. }
+                        if std::sync::Arc::ptr_eq(callee, dying) =>
+                    {
                         let dst = *dst;
                         t.deliver(dst, Reg::from_i64(super::CAP_REVOKED));
                         t.state = TaskState::Runnable;
                     }
+                    TaskState::BlockedPage { pager, .. }
+                        if std::sync::Arc::ptr_eq(pager, dying) =>
+                    {
+                        stranded.push(i)
+                    }
+                    _ => {}
                 }
             }
-            dying.lock_unpoisoned().svc_queue.clear();
+            for i in stranded {
+                complete(tasks, i, Err(Trap::MemoryFault));
+            }
+            let mut h = dying.lock_unpoisoned();
+            h.svc_queue.clear();
+            h.page_sinks.clear();
         }
     }
 }
@@ -18452,10 +18392,12 @@ struct Vm {
     /// Function-wide register file, shared across activations by register windows (`[base, base +
     /// nslots)` per activation). Grows on demand as calls open deeper windows.
     regs: Vec<Reg>,
-    /// Suspended caller activations: `(module, prog, base, resume pc, absolute first result slot)`.
-    /// `module` is carried so a cross-module `call.dyn` (into an installed §22 unit) returns to
-    /// the caller's module.
-    stack: Vec<(usize, usize, usize, usize, usize)>,
+    /// #2336 — what [`Self::regs`]' room holds of its vCPU's domain's node.
+    room: RegsRoom,
+    /// Suspended caller activations: `(module, prog, base, resume pc, absolute first result slot,
+    /// the caller's `entered`)`. `module` is carried so a cross-module `call.dyn` (into an installed
+    /// §22 unit) returns to the caller's module.
+    stack: Vec<(usize, usize, usize, usize, usize, u64)>,
     /// The running activation's module (index into `Domain::mods`; 0 = primary), function index,
     /// window base, and op cursor.
     module: usize,
@@ -18464,43 +18406,39 @@ struct Vm {
     pc: usize,
     /// Edge-copy staging buffer (parallel-copy safety); kept here so it is reused across resumes.
     scratch: Vec<Reg>,
-    /// `<setjmp.h>` checkpoints — `setjmp` records its activation's resume point here, keyed by a
-    /// per-`setjmp` **token** it writes into the guest `jmp_buf`'s opaque first 8 bytes (#1062);
-    /// `longjmp` reads the token back from the (possibly-copied) buffer and looks it up. No register
-    /// snapshot is needed (unlike the tree-walker): the flat per-function register layout gives each
-    /// block its own slots, so the `setjmp` block's values survive a deeper call in place.
-    /// Token-keying (vs the old address key) is what lets a guest *copy* a `jmp_buf` — bash's
-    /// `COPY_PROCENV` memcpy of `top_level` — carry the checkpoint identity with the bytes; bounded
-    /// by pruning checkpoints whose `setjmp` activation has returned (`SetJmp` op).
-    setjmp_points: std::collections::BTreeMap<u64, ByteSetJmp>,
     /// §12.8 4A.5: the window offset of this context's shadow-SP **word** — the base of its own region
     /// (`shadow_region_base`), which `durable.shadow_base` returns so the instrumented IR addresses its
     /// per-context SP word. The root's is context 0 (`ShadowArena::region_base(0)`); a fiber's its `slot + 1`. Set when
     /// the Vm is created (fiber) / activated; unused on a non-durable run.
     durable_region_base: u64,
     /// **wasm-JIT tier-up bitmap** (browser wasm-JIT threads slice), for program `jit_module`'s
-    /// functions only. Set on the root Vm via [`Vcpu::with_jit_eligible`], and on a cooperative
-    /// task running a program with an emit ([`ProgramEmits`]); a direct `Call` in that program to
-    /// an eligible function surfaces [`Outcome::TierUp`] instead of interpreting. `None` (fibers,
+    /// functions only. Set by [`Vm::tier_up`] on a task running a program with an emit
+    /// ([`ProgramEmits`]); a call in that program to an eligible function surfaces
+    /// [`Outcome::TierUp`] instead of interpreting. `None` (fibers,
     /// invoked units, non-JIT runs) ⇒ everything interprets — tier-up is a pure acceleration, never
     /// a correctness gate.
     jit_eligible: Option<std::sync::Arc<[bool]>>,
     /// #2248 — the program `jit_eligible` is for: `0`, the run's own, or a granted module a child
     /// runs.
     jit_module: usize,
+    /// #1414 ED-1 — the task tiers up at its entry, which `jit_eligible` makes eligible: its first
+    /// resume surfaces the entry as [`Outcome::TierUp`], as a call to it would, and the results end
+    /// the task. Set by [`Vm::tier_up`] for a task the run starts, and spent by that first resume.
+    jit_entry: bool,
     /// #750 **paged tier-up**: the eligible functions were emitted with the software page-check
     /// (`compile_module_tierup_paged`), so the dispatch must NOT decline tier-up on a
     /// scalar-unrepresentable window — the host-maintained page table carries per-page fidelity,
     /// and the event's `mapped` becomes the reserved window size (the bound must never under-admit
-    /// a table-admitted page). Set only via [`Vcpu::with_jit_page_checked`].
+    /// a table-admitted page). Set by [`Vm::tier_up`] from the emit it arms.
     jit_page_checked: bool,
-    /// §3.6 serve-loop core (I36 slice 1): the in-flight handler's completion ticket and the depth
-    /// of the serve frame that admitted it (`stack.len()` there) — `Some` between admitting a
-    /// handler activation (whose return linkage rewinds into the `SvcPoll` op) and the
-    /// re-execution that settles its result — and the count of dispatches completed by the current
-    /// `svc.poll` activation.
-    serve_ticket: Option<(u64, usize)>,
-    serve_count: i64,
+    /// #2474 — what this task has seen of program `jit_module`'s calls, where its emit tiers a call
+    /// up on observed work ([`Hotness`]). `None`: every eligible call tiers up.
+    profile: Option<Box<Profile>>,
+    /// #2474 — the safepoints this `Vm` has run, one per taken back edge and per call: the fuel it
+    /// burned. It only grows, so the difference of two readings is the work done between them.
+    work: u64,
+    /// #2474 — [`Self::work`] when the running activation was entered.
+    entered: u64,
     /// §12 per-vCPU **thread-local register** (`vcpu.tls.get`/`set`). One i64 of per-vCPU state,
     /// seeded to this vCPU's dense id at construction (root = 0; a spawned thread's `Vm` is re-seeded
     /// to its id in `drive`'s `Spawn` arm), guest-overwritable. Read at the op's execution point.
@@ -18522,6 +18460,80 @@ struct Vm {
     /// (bash's `throw_to_top_level`) pops every crossed entry the same way. Bounded to
     /// `MAX_SIG_HANDLER_NEST` nested deliveries. Empty on any run without a signal personality.
     sig_handler_stack: Vec<usize>,
+    /// [`VmRare`], made on first use.
+    rare: Option<Box<VmRare>>,
+}
+
+/// #2336 — the part of a [`Vm`] only `setjmp`/`longjmp` and the serve loop use, made on first use.
+/// A fiber's start and return move its `Vm` by value about a dozen times, and glibc's `memcpy` costs
+/// about twice as much past 256 bytes, so the `Vm` is held to that (below) and what most never touch
+/// stays off it.
+#[derive(Clone, Default)]
+struct VmRare {
+    /// `<setjmp.h>` checkpoints — `setjmp` records its activation's resume point here, keyed by a
+    /// per-`setjmp` **token** it writes into the guest `jmp_buf`'s opaque first 8 bytes (#1062);
+    /// `longjmp` reads the token back from the (possibly-copied) buffer and looks it up. No register
+    /// snapshot is needed (unlike the tree-walker): the flat per-function register layout gives each
+    /// block its own slots, so the `setjmp` block's values survive a deeper call in place.
+    /// Token-keying (vs the old address key) is what lets a guest *copy* a `jmp_buf` — bash's
+    /// `COPY_PROCENV` memcpy of `top_level` — carry the checkpoint identity with the bytes; bounded
+    /// by pruning checkpoints whose `setjmp` activation has returned (`SetJmp` op).
+    setjmp_points: std::collections::BTreeMap<u64, ByteSetJmp>,
+    /// §3.6 serve-loop core (I36 slice 1): the in-flight handler's completion ticket and the depth
+    /// of the serve frame that admitted it (`stack.len()` there) — `Some` between admitting a
+    /// handler activation (whose return linkage rewinds into the `SvcPoll` op) and the
+    /// re-execution that settles its result — and the count of dispatches completed by the current
+    /// `svc.poll` activation.
+    serve_ticket: Option<(u64, usize)>,
+    serve_count: i64,
+}
+
+const _: () = assert!(std::mem::size_of::<Vm>() <= 256);
+
+/// #2474 — a task's count of its calls into a program its emit tiers up on observed work
+/// ([`Hotness`]): per function, the calls and their work since its last decision, and whether its
+/// calls interpret.
+#[derive(Clone)]
+struct Profile {
+    rule: Hotness,
+    fns: Box<[FnCount]>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct FnCount {
+    calls: u32,
+    /// Its last window of calls averaged under the rule's work: its calls interpret.
+    cold: bool,
+    work: u64,
+}
+
+impl Profile {
+    /// Every function's calls tier up until some of them are seen.
+    fn new(rule: Hotness, funcs: usize) -> Profile {
+        Profile {
+            rule,
+            fns: vec![FnCount::default(); funcs].into(),
+        }
+    }
+
+    fn hot(&self, f: usize) -> bool {
+        self.fns.get(f).is_some_and(|c| !c.cold)
+    }
+
+    /// A call of `f` that did `work` returned, on either tier. With `window` calls in, `f` goes cold
+    /// if they averaged under `per_call` work and hot otherwise, and the count starts again.
+    fn returned(&mut self, f: usize, work: u64) {
+        let Some(c) = self.fns.get_mut(f) else {
+            return;
+        };
+        c.calls += 1;
+        c.work = c.work.saturating_add(work);
+        if c.calls >= self.rule.window.max(1) {
+            c.cold = c.work < self.rule.per_call.saturating_mul(c.calls.into());
+            c.calls = 0;
+            c.work = 0;
+        }
+    }
 }
 
 /// #1958 — the deepest one `Vm`'s calls may nest (its return stack), past which a call traps
@@ -18542,6 +18554,70 @@ const MAX_FRAMES: usize = 1 << 17;
 const MAX_REG_SLOTS: usize = 1 << 25;
 const _: () = assert!(MAX_REG_SLOTS > 21 << 20);
 
+/// #2336 — what a register file of `slots` slots holds of the host.
+fn reg_bytes(slots: usize) -> u64 {
+    (slots * std::mem::size_of::<Reg>()) as u64
+}
+
+/// #2336 — the charge a register file holds ([`HostCharge::stack`]). A copy of its `Vm` (a
+/// checkpoint, the undo journal, a continuation) holds none of it, so a history costs the guest
+/// nothing, and remembers what it held: put back to run, it holds that again ([`Vm::recharge`]), as
+/// the restore puts back the budget tree that charged it. A copy that grows first charges what it
+/// holds then.
+#[derive(Default)]
+struct RegsRoom {
+    charge: HostCharge,
+    /// What the `Vm` this copies held, while this holds nothing.
+    held: u64,
+}
+
+impl RegsRoom {
+    fn new(payer: Option<NodeRef>) -> RegsRoom {
+        RegsRoom {
+            charge: HostCharge::stack(payer),
+            held: 0,
+        }
+    }
+
+    /// [`Vm::grow_regs`] for `regs`, the file this charges for.
+    fn grow(&mut self, regs: &mut Vec<Reg>, need: usize) -> Result<(), Trap> {
+        if need > MAX_REG_SLOTS {
+            return Err(Trap::StackOverflow);
+        }
+        if regs.len() < need {
+            if need > regs.capacity() {
+                // #2336 — the guest's calls size the file, so its room is charged to the vCPU's
+                // domain before it is allocated, then allocated fallibly: doubled, or exactly what
+                // this call needs when that does not fit. Neither is `StackOverflow`, the trap an
+                // exhausted stack is on every engine.
+                let cap = grown_capacity(regs.capacity(), need, MAX_REG_SLOTS);
+                let room = [cap, need]
+                    .into_iter()
+                    .find(|&slots| self.charge.resize(reg_bytes(slots)))
+                    .ok_or(Trap::StackOverflow)?;
+                if regs.try_reserve_exact(room - regs.len()).is_err() {
+                    self.charge.resize(reg_bytes(regs.capacity()));
+                    return Err(Trap::StackOverflow);
+                }
+            }
+            regs.resize(need, Reg::default());
+        }
+        Ok(())
+    }
+}
+
+impl Clone for RegsRoom {
+    fn clone(&self) -> RegsRoom {
+        RegsRoom {
+            charge: HostCharge::stack(self.charge.payer().cloned()),
+            held: match self.charge.bytes() {
+                0 => self.held,
+                bytes => bytes,
+            },
+        }
+    }
+}
+
 /// The capacity the register file grows to for a window ending at slot `need`: geometric, so a deep
 /// recursion grows it O(log n) times, but never past `max` (#2082).
 fn grown_capacity(capacity: usize, need: usize, max: usize) -> usize {
@@ -18549,11 +18625,79 @@ fn grown_capacity(capacity: usize, need: usize, max: usize) -> usize {
 }
 
 impl Vm {
-    /// Tier up program `module`'s direct calls to the functions `emit` makes eligible (#2248).
-    fn tier_up(&mut self, module: u32, emit: &ProgramEmit) {
+    /// Tier up program `module`'s calls to the functions `emit` makes eligible (#2248). With
+    /// `entry`, this task's own entry tiers up too when `emit` makes it eligible: the run started
+    /// the task at it, as a call to it ([`Vm::jit_entry`], #1414 ED-1).
+    fn tier_up(&mut self, module: u32, emit: &ProgramEmit, entry: bool) {
         self.jit_eligible = Some(std::sync::Arc::clone(&emit.eligible));
         self.jit_page_checked = emit.page_checked;
         self.jit_module = module as usize;
+        self.profile =
+            (emit.hot.per_call > 0).then(|| Box::new(Profile::new(emit.hot, emit.eligible.len())));
+        self.jit_entry = entry && self.module == self.jit_module && self.tiers_up(self.cur);
+    }
+
+    /// Undo [`Self::tier_up`]: every call interprets.
+    fn tier_down(&mut self) {
+        self.jit_eligible = None;
+        self.jit_page_checked = false;
+        self.profile = None;
+    }
+
+    /// Whether a call to function `f` of program `jit_module` tiers up: `f` is eligible, and hot
+    /// where the emit tiers calls up on observed work (#2474).
+    fn tiers_up(&self, f: usize) -> bool {
+        self.jit_eligible
+            .as_ref()
+            .is_some_and(|e| e.get(f).copied().unwrap_or(false))
+            && self.profile.as_ref().is_none_or(|p| p.hot(f))
+    }
+
+    /// #2474 — the running activation of program `module` returns, or tail-calls out: count its
+    /// work where calls tier up on observed work.
+    fn count_call(&mut self, module: usize, f: usize) {
+        if module == self.jit_module {
+            if let Some(p) = &mut self.profile {
+                p.returned(f, self.work - self.entered);
+            }
+        }
+    }
+
+    /// #2474 — a call of function `f` of program `module` that tiered up returned, having done
+    /// `work` on the emitted tier as its host counted it: the caller's work includes it, and so does
+    /// the count of `f`'s calls.
+    fn emitted_returned(&mut self, module: usize, f: usize, work: u64) {
+        self.work = self.work.wrapping_add(work);
+        if module == self.jit_module {
+            if let Some(p) = &mut self.profile {
+                p.returned(f, work);
+            }
+        }
+    }
+
+    /// The `"mapped"` extent a tier-up surfaces with over `mem` (#717 host sync), or `None` where
+    /// it declines and the callee interprets.
+    ///
+    /// The window's scalar committed extent is what the host writes into the emitted `"mapped"`
+    /// global. A window whose page state is not representable by one bound (sparse grow,
+    /// `Ro`/`Unmapped`/aliased pages) declines tier-up: the interpreted call honors the full
+    /// per-page map (fail-closed; the interpreter is always right). A memory-less module has
+    /// nothing to bound (no emitted access): `0`.
+    ///
+    /// #750 paged tier: the emitted code carries a per-access page check, so an unrepresentable
+    /// window must NOT decline: it surfaces with the reserved size (the bound must never
+    /// under-admit a page the driver's table admits).
+    ///
+    /// #1414 B6-3: the emitted code addresses the window as one flat span (`win + addr`), so a
+    /// window backed without one (`Sparse`, `Paged`) declines whatever its page state. A memory of
+    /// its own (`Foreign`) is one such span, which its host places (#1414 ED-2).
+    fn tierup_extent(&self, mem: Option<&Mem>) -> Option<u64> {
+        match mem {
+            None => Some(0),
+            Some(m) if m.flat_win_base().is_none() && m.foreign_id().is_none() => None,
+            Some(m) if self.jit_page_checked => Some(m.reserved_size()),
+            Some(m) => m.scalar_extent(),
+        }
     }
 
     /// Open a callee window ending at slot `need` for a call that pushes a return entry, bounded by
@@ -18570,17 +18714,24 @@ impl Vm {
     /// [`MAX_REG_SLOTS`] it traps `StackOverflow` before it allocates anything (#1958); below it, it
     /// grows no further than the bound (#2082).
     fn grow_regs(&mut self, need: usize) -> Result<(), Trap> {
-        if need > MAX_REG_SLOTS {
-            return Err(Trap::StackOverflow);
-        }
-        if self.regs.len() < need {
-            if need > self.regs.capacity() {
-                let cap = grown_capacity(self.regs.capacity(), need, MAX_REG_SLOTS);
-                self.regs.reserve_exact(cap - self.regs.len());
-            }
-            self.regs.resize(need, Reg::default());
-        }
-        Ok(())
+        self.room.grow(&mut self.regs, need)
+    }
+
+    /// [`VmRare`], made on first use.
+    fn rare(&mut self) -> &mut VmRare {
+        self.rare.get_or_insert_default()
+    }
+
+    /// The serve loop's in-flight ticket and the depth of the frame that admitted it.
+    fn serve_ticket(&self) -> Option<(u64, usize)> {
+        self.rare.as_ref()?.serve_ticket
+    }
+
+    /// #2336 — hold again, past any ceiling, what the `Vm` this copies held ([`RegsRoom`]): a copy
+    /// put back to run, whose restore puts back the budget tree that charged it.
+    fn recharge(&mut self) {
+        let held = std::mem::take(&mut self.room.held);
+        self.room.charge.force(held);
     }
 
     /// The slots a clone of this `Vm` copies, its registers and return entries: what the journal
@@ -18591,31 +18742,37 @@ impl Vm {
 
     /// Open the entry activation: a zero-based window sized to the entry function, seeded with the
     /// call arguments. Total — an out-of-range entry or arg overflow is a clean `Malformed` trap.
-    /// Every entry (root, fiber, thread, coroutine) starts in module 0.
-    fn new(c: &Compiled, entry: usize, args: &[Value]) -> Result<Vm, Trap> {
+    /// Every entry (root, fiber, thread, coroutine) starts in module 0. #2336 — its register file is
+    /// charged to `payer`, the node of the vCPU's domain, as it grows; `None` charges nothing (a
+    /// trace or a test run no budget governs).
+    fn new(c: &Compiled, entry: usize, args: &[Value], payer: Option<NodeRef>) -> Result<Vm, Trap> {
         let prog = c.progs.get(entry).ok_or(Trap::Malformed)?;
-        let mut regs: Vec<Reg> = vec![Reg::default(); prog.nslots as usize];
+        let (mut regs, mut room) = (Vec::new(), RegsRoom::new(payer));
+        room.grow(&mut regs, prog.nslots as usize)?;
         for (i, a) in args.iter().enumerate() {
             *regs.get_mut(i).ok_or(Trap::Malformed)? = Reg::from_value(*a);
         }
         Ok(Vm {
             regs,
+            room,
             stack: Vec::new(),
             module: 0,
             cur: entry,
             base: 0,
             pc: 0,
             scratch: Vec::new(),
-            setjmp_points: std::collections::BTreeMap::new(),
             durable_region_base: c.shadow.unwrap_or(super::ShadowArena::EMPTY).region_base(0), // root context (overwritten for fibers)
-            jit_eligible: None, // set only on the root Vm via `Vcpu::with_jit_eligible`
+            jit_eligible: None, // set by `Vm::tier_up`
             jit_module: 0,
+            jit_entry: false,
             jit_page_checked: false,
-            serve_ticket: None,
-            serve_count: 0,
+            profile: None,
+            work: 0,
+            entered: 0,
             tls: 0, // §12 per-vCPU TLS seed: dense vCPU id (root = 0; a spawned thread re-seeds to its id)
             home: 0,
             sig_handler_stack: Vec::new(), // #1146 — no delivery in flight at entry
+            rare: None,
         })
     }
 
@@ -18642,20 +18799,34 @@ impl Vm {
         })
     }
 
-    /// Run the continuation for at most `budget` ops, then return [`Outcome::Suspended`] at the next
-    /// op boundary with the cursor persisted into `self` (resume by calling again); return
-    /// [`Outcome::Done`] when the entry activation returns, or `Err` on a trap. Per-op fuel is
-    /// charged here, one charge per op, exactly as the run-to-completion form did — slicing only
-    /// chooses *where* to pause, never *what* runs, so the result is independent of `budget`.
-    ///
-    /// The cursor (`cur`/`base`/`pc`) lives in locals for the duration of the loop so the optimizer
-    /// keeps it in registers; it is written back to `self` only when the loop exits (suspend), which
-    /// is also what a future blocking-op / debug-stop seam will do before yielding.
     /// Write a host op's result slots into the registers from `at`.
     fn set_results(&mut self, at: usize, res: &[i64], results: &[ValType]) {
         for (i, (s, ty)) in res.iter().zip(results.iter()).enumerate() {
             self.regs[at + i] = Reg::from_value(slot_to_val(*ty, *s));
         }
+    }
+
+    /// §2.2 / #2164 — the fault arm of [`paged!`](Self::run_ops) in a demand-paged child: a
+    /// recoverable fault becomes [`Outcome::PageFault`] with the cursor left at the op, `at`; any
+    /// other trap stands. Out of line and cold, so the memory ops keep only their branch on the
+    /// error in the op loop.
+    #[cold]
+    #[inline(never)]
+    fn page_fault_or_trap(
+        &mut self,
+        trap: Trap,
+        mem: &Option<Mem>,
+        (module, cur, base, pc): (usize, usize, usize, usize),
+    ) -> Result<Outcome, Trap> {
+        if trap != Trap::MemoryFault {
+            return Err(trap);
+        }
+        let addr = mem.as_ref().and_then(Mem::take_fault).ok_or(trap)?;
+        self.module = module;
+        self.cur = cur;
+        self.base = base;
+        self.pc = pc;
+        Ok(Outcome::PageFault(addr))
     }
 
     /// #1904 — under a landing freeze a durable domain never parks (the oracle's `decide`, #1672):
@@ -18672,7 +18843,62 @@ impl Vm {
         freezing
     }
 
+    /// Run the continuation for at most `budget` ops, then return [`Outcome::Suspended`] at the next
+    /// op boundary with the cursor persisted into `self` (resume by calling again); return
+    /// [`Outcome::Done`] when the entry activation returns, or `Err` on a trap. Per-op fuel is
+    /// charged here, one charge per op, exactly as the run-to-completion form did — slicing only
+    /// chooses *where* to pause, never *what* runs, so the result is independent of `budget`.
+    ///
+    /// #1414 ED-1: a task the run started at an eligible entry runs the entry emitted instead,
+    /// surfaced as a call to it would be, and the results end the task ([`Vm::jit_entry`]). A window
+    /// the emitted code cannot bound interprets it. The check sits here, outside the op loop's
+    /// function ([`Vm::run_ops`]): at the loop's head it slowed the interpreter's calls by a tenth.
+    ///
+    /// #2164: a demand-paged child's vCPU (its powerbox holds a pager, [`Host::pager`]) runs the op
+    /// loop with the arms that fetch a page on a recoverable fault. Every other vCPU runs it without
+    /// them: in the one loop, they slowed the interpreter's kernels by 2 to 5%, by how they moved its
+    /// register allocation, not by any work they do.
     fn resume(
+        &mut self,
+        source: &ModuleSource,
+        table: &SharedSlots,
+        fuel: &mut Fuel,
+        mem: &mut Option<Mem>,
+        host: &mut HostCell,
+        budget: u64,
+    ) -> Result<Outcome, Trap> {
+        if self.jit_entry {
+            self.jit_entry = false;
+            if let Some(mapped) = self.tierup_extent(mem.as_ref()) {
+                let c = source.get(self.module).ok_or(Trap::Malformed)?;
+                let (cur, base) = (self.cur, self.base);
+                let params = c.sigs[cur].0.len();
+                return Ok(Outcome::TierUp {
+                    module: self.module as u32,
+                    func: cur as u32,
+                    argv: self.regs[base..base + params]
+                        .iter()
+                        .map(|r| r.i64())
+                        .collect(),
+                    dst: TierUpDst::Entry { parks: false },
+                    results: c.result_types[cur].clone().into(),
+                    mapped,
+                });
+            }
+        }
+        if host.with(|p| p.pager.is_some()) {
+            self.run_ops::<true>(source, table, fuel, mem, host, budget)
+        } else {
+            self.run_ops::<false>(source, table, fuel, mem, host, budget)
+        }
+    }
+
+    /// [`Vm::resume`]'s op loop. The cursor (`cur`/`base`/`pc`) lives in locals for the duration of
+    /// the loop so the optimizer keeps it in registers; it is written back to `self` only when the
+    /// loop exits (suspend), which is also what a future blocking-op / debug-stop seam will do
+    /// before yielding. `PAGED`: a recoverable memory fault fetches a page ([`Vm::resume`] says why
+    /// it is a parameter).
+    fn run_ops<const PAGED: bool>(
         &mut self,
         source: &ModuleSource,
         table: &SharedSlots,
@@ -18725,6 +18951,20 @@ impl Vm {
                 self.regs[base + $i as usize]
             };
         }
+        // §2.2 / #2164 — a memory op's result. In a demand-paged child (`PAGED`), a recoverable
+        // fault is a page to fetch, not a trap: the cursor is left AT the op, which re-executes once
+        // the page is in place, and the fault goes to the driver. The oracle's `handle_mem`.
+        macro_rules! paged {
+            ($access:expr) => {
+                match $access {
+                    Ok(v) => v,
+                    Err(t) if PAGED => {
+                        return self.page_fault_or_trap(t, mem, (module, cur, base, pc))
+                    }
+                    Err(t) => return Err(t),
+                }
+            };
+        }
         // Apply edge copies parallel-safely (a self-loop can alias src/dst): gather then scatter.
         macro_rules! edge {
             ($copies:expr) => {{
@@ -18749,6 +18989,13 @@ impl Vm {
                 }
             }};
         }
+        // #2474 — a safepoint burns a fuel and counts as the work [`Vm::work`] measures calls by.
+        macro_rules! safepoint {
+            () => {{
+                step(fuel, None)?;
+                self.work += 1;
+            }};
+        }
         // Fuel unification: fuel is metered at **IR safepoints** — a taken back-edge and each function
         // entry — not per op. A back-edge is a *backward* jump in the flat op array: blocks are laid
         // out in index order, so a terminator (the last op of its block, at index `pc`) taking a target
@@ -18759,7 +19006,39 @@ impl Vm {
         macro_rules! backedge {
             ($t:expr) => {
                 if ($t as usize) <= pc {
-                    step(fuel, None)?;
+                    safepoint!();
+                }
+            };
+        }
+        // wasm-JIT tier-up: a call (`$args` into `$dst`) to function `$f` of program `$m`, the one
+        // this Vm has an emit for, while `$f` is hot, surfaces to the host, which runs the emitted
+        // region and delivers the results. `argv` is the raw i64 arg slots; the host reads them per
+        // the callee's signature. Suspension-free by construction (`mixed_ok`), so this is a plain
+        // "fast call": spill past the op and resume with the results in `dst` (`deliver_tierup`),
+        // exactly like an interp call. A window the emitted code cannot bound declines, and the call
+        // interprets ([`Vm::tierup_extent`]).
+        macro_rules! tier_up {
+            ($m:expr, $f:expr, $results:expr, $args:expr, $dst:expr) => {
+                if $m == self.jit_module && self.tiers_up($f) {
+                    if let Some(mapped) = self.tierup_extent(mem.as_ref()) {
+                        let argv: Box<[i64]> = $args.iter().map(|a| r!(*a).i64()).collect();
+                        let results: Box<[ValType]> = $results.clone().into();
+                        // Spill past the call with the caller's window intact (no callee frame
+                        // pushed); `deliver_tierup` writes the results into `dst` relative to
+                        // this base.
+                        self.module = module;
+                        self.cur = cur;
+                        self.base = base;
+                        self.pc = pc + 1;
+                        return Ok(Outcome::TierUp {
+                            module: $m as u32,
+                            func: $f as u32,
+                            argv,
+                            dst: TierUpDst::Frame(*$dst as usize),
+                            results,
+                            mapped,
+                        });
+                    }
                 }
             };
         }
@@ -18822,7 +19101,8 @@ impl Vm {
                                     // Return linkage resumes at the SAME `pc` so the interrupted op
                                     // re-runs; the void handler writes no results (`ret_abs` unused —
                                     // `base` is a harmless placeholder).
-                                    self.stack.push((module, cur, base, pc, base));
+                                    self.stack.push((module, cur, base, pc, base, self.entered));
+                                    self.entered = self.work;
                                     if tmod != module {
                                         module = tmod;
                                         c = tm;
@@ -18944,7 +19224,7 @@ impl Vm {
                 } => {
                     let m = mem.as_ref().ok_or(Trap::Malformed)?;
                     let a = r!(*addr).i64() as u64;
-                    r!(*dst) = m.load_scalar(a, *offset, *op)?;
+                    r!(*dst) = paged!(m.load_scalar(a, *offset, *op));
                     pc += 1;
                 }
                 Op::Store {
@@ -18955,9 +19235,10 @@ impl Vm {
                 } => {
                     let a = r!(*addr).i64() as u64;
                     let lo = r!(*value).i64() as u64;
-                    mem.as_mut()
+                    paged!(mem
+                        .as_mut()
                         .ok_or(Trap::Malformed)?
-                        .store_scalar(a, *offset, *op, lo)?;
+                        .store_scalar(a, *offset, *op, lo));
                     pc += 1;
                 }
                 // Bulk-memory ops (D62): both `MemCopy` and `MemMove` use the overlap-safe fast path
@@ -18967,18 +19248,14 @@ impl Vm {
                     let d = r!(*dst).i64() as u64;
                     let s = r!(*src).i64() as u64;
                     let n = r!(*len).i64() as u64;
-                    mem.as_mut()
-                        .ok_or(Trap::Malformed)?
-                        .mem_copy_fast(d, s, n)?;
+                    paged!(mem.as_mut().ok_or(Trap::Malformed)?.mem_copy_fast(d, s, n));
                     pc += 1;
                 }
                 Op::MemFill { dst, val, len } => {
                     let d = r!(*dst).i64() as u64;
                     let v = r!(*val).i32() as u8;
                     let n = r!(*len).i64() as u64;
-                    mem.as_mut()
-                        .ok_or(Trap::Malformed)?
-                        .mem_fill_fast(d, v, n)?;
+                    paged!(mem.as_mut().ok_or(Trap::Malformed)?.mem_fill_fast(d, v, n));
                     pc += 1;
                 }
                 Op::AtomicLoad {
@@ -18989,7 +19266,7 @@ impl Vm {
                 } => {
                     let m = mem.as_ref().ok_or(Trap::Malformed)?;
                     let a = r!(*addr).i64() as u64;
-                    r!(*dst) = Reg::from_value(m.atomic_load(a, *offset, *ty)?);
+                    r!(*dst) = Reg::from_value(paged!(m.atomic_load(a, *offset, *ty)));
                     pc += 1;
                 }
                 Op::AtomicStore {
@@ -19000,9 +19277,10 @@ impl Vm {
                 } => {
                     let a = r!(*addr).i64() as u64;
                     let v = Value::I64(r!(*value).i64());
-                    mem.as_mut()
+                    paged!(mem
+                        .as_mut()
                         .ok_or(Trap::Malformed)?
-                        .atomic_store(a, *offset, *ty, v)?;
+                        .atomic_store(a, *offset, *ty, v));
                     pc += 1;
                 }
                 Op::AtomicRmw {
@@ -19015,10 +19293,10 @@ impl Vm {
                 } => {
                     let a = r!(*addr).i64() as u64;
                     let v = Value::I64(r!(*value).i64());
-                    let res = mem
+                    let res = paged!(mem
                         .as_mut()
                         .ok_or(Trap::Malformed)?
-                        .atomic_rmw(a, *offset, *ty, *op, v)?;
+                        .atomic_rmw(a, *offset, *ty, *op, v));
                     r!(*dst) = Reg::from_value(res);
                     pc += 1;
                 }
@@ -19033,10 +19311,10 @@ impl Vm {
                     let a = r!(*addr).i64() as u64;
                     let exp = Value::I64(r!(*expected).i64());
                     let rep = Value::I64(r!(*replacement).i64());
-                    let res = mem
+                    let res = paged!(mem
                         .as_mut()
                         .ok_or(Trap::Malformed)?
-                        .atomic_cmpxchg(a, *offset, *ty, exp, rep)?;
+                        .atomic_cmpxchg(a, *offset, *ty, exp, rep));
                     r!(*dst) = Reg::from_value(res);
                     pc += 1;
                 }
@@ -19119,11 +19397,12 @@ impl Vm {
                     // would trap regardless. A copied-but-live checkpoint sits at a still-live
                     // activation (`depth <= stack.len()`) and is retained.
                     let live = self.stack.len();
-                    self.setjmp_points.retain(|_, p| p.depth <= live);
-                    self.setjmp_points.insert(
+                    let points = &mut self.rare().setjmp_points;
+                    points.retain(|_, p| p.depth <= live);
+                    points.insert(
                         token,
                         ByteSetJmp {
-                            depth: self.stack.len(),
+                            depth: live,
                             module,
                             cur,
                             base,
@@ -19148,9 +19427,14 @@ impl Vm {
                         .ok_or(Trap::Malformed)?
                         .load_scalar(buf_addr, 0, LoadOp::I64)?
                         .i64() as u64;
-                    let point = *self.setjmp_points.get(&token).ok_or(Trap::Malformed)?;
+                    let point = *(self.rare.as_ref())
+                        .and_then(|r| r.setjmp_points.get(&token))
+                        .ok_or(Trap::Malformed)?;
                     if point.depth > self.stack.len() {
                         return Err(Trap::Malformed); // the setjmp activation already returned
+                    }
+                    if let Some(&(.., entered)) = self.stack.get(point.depth) {
+                        self.entered = entered;
                     }
                     self.stack.truncate(point.depth);
                     // #1146 — a longjmp OUT of an injected signal handler leaves it exactly like a
@@ -19178,61 +19462,13 @@ impl Vm {
                     self.regs[base + point.dst as usize] = Reg::from_i32(resume);
                 }
                 Op::Call { callee, args, dst } => {
-                    step(fuel, None)?; // fuel unification: function-entry safepoint
+                    safepoint!(); // fuel unification: function-entry safepoint
                     let callee = *callee as usize;
                     #[cfg(feature = "callprof")]
                     if module == 0 {
                         callprof::hit(callee);
                     }
-                    // wasm-JIT tier-up: a direct call to an eligible function of the program this
-                    // Vm has an emit for surfaces to the host, which runs the emitted region and
-                    // delivers the results. `argv` is the raw i64 arg slots; the host reads them
-                    // per the callee's signature. Suspension-free by construction (`mixed_ok`), so
-                    // this is a plain "fast call": spill past the op and resume with the results in
-                    // `dst` (`deliver_tierup`), exactly like an interp call.
-                    if self.jit_eligible.as_ref().is_some_and(|e| {
-                        module == self.jit_module && e.get(callee).copied().unwrap_or(false)
-                    }) {
-                        // #717 host sync: snapshot the window's scalar committed extent for the host
-                        // to write into the emitted `"mapped"` global. A window whose page state is
-                        // not representable by one bound (sparse grow, `Ro`/`Unmapped`/aliased pages)
-                        // declines tier-up — fall through to the interpreted call below, which honors
-                        // the full per-page map (fail-closed; the interpreter is always right). A
-                        // memory-less module has nothing to bound (no emitted access): sync `0`.
-                        //
-                        // #750 paged tier: the emitted code carries a per-access page check, so an
-                        // unrepresentable window must NOT decline — surface with the reserved size
-                        // (the bound must never under-admit a page the driver's table admits).
-                        //
-                        // #1414 B6-3: the emitted code addresses the window as one flat span
-                        // (`win + addr`), so a window backed without one (`Sparse`, `Paged`,
-                        // `Foreign`) declines whatever its page state.
-                        let extent = match mem.as_ref() {
-                            None => Some(0),
-                            Some(m) if m.flat_win_base().is_none() => None,
-                            Some(m) if self.jit_page_checked => Some(m.reserved_size()),
-                            Some(m) => m.scalar_extent(),
-                        };
-                        if let Some(mapped) = extent {
-                            let argv: Box<[i64]> = args.iter().map(|a| r!(*a).i64()).collect();
-                            let results: Box<[ValType]> = c.result_types[callee].clone().into();
-                            // Spill past the call with the caller's window intact (no callee frame
-                            // pushed); `deliver_tierup` writes the results into `dst` relative to
-                            // this base.
-                            self.module = module;
-                            self.cur = cur;
-                            self.base = base;
-                            self.pc = pc + 1;
-                            return Ok(Outcome::TierUp {
-                                module: module as u32,
-                                func: callee as u32,
-                                argv,
-                                dst: *dst as usize,
-                                results,
-                                mapped,
-                            });
-                        }
-                    }
+                    tier_up!(module, callee, c.result_types[callee], args, dst);
                     // A direct call stays in the current module.
                     let nb = base + c.progs[cur].nslots as usize;
                     let need = nb + c.progs[callee].nslots as usize;
@@ -19240,8 +19476,15 @@ impl Vm {
                     for (i, a) in args.iter().enumerate() {
                         self.regs[nb + i] = self.regs[base + *a as usize];
                     }
-                    self.stack
-                        .push((module, cur, base, pc + 1, base + *dst as usize));
+                    self.stack.push((
+                        module,
+                        cur,
+                        base,
+                        pc + 1,
+                        base + *dst as usize,
+                        self.entered,
+                    ));
+                    self.entered = self.work;
                     cur = callee;
                     base = nb;
                     pc = 0;
@@ -19253,10 +19496,11 @@ impl Vm {
                     want_params,
                     want_results,
                 } => {
-                    step(fuel, None)?; // fuel unification: function-entry safepoint
-                                       // Resolve through the **runtime dispatch table** (slot ⇒ (module, func)); an empty
-                                       // padding slot or a signature mismatch is an inert IndirectCallType trap. The
-                                       // target may be an installed §22 unit (a different module) — a cross-module call.
+                    safepoint!(); // fuel unification: function-entry safepoint
+
+                    // Resolve through the **runtime dispatch table** (slot ⇒ (module, func)); an empty
+                    // padding slot or a signature mismatch is an inert IndirectCallType trap. The
+                    // target may be an installed §22 unit (a different module) — a cross-module call.
                     let slot = (r!(*idx).i32() as u32 as usize) & (table.len() - 1);
                     let ts = table.slot(slot);
                     if ts.module == super::TABLE_EMPTY {
@@ -19268,14 +19512,23 @@ impl Vm {
                     if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
                         return Err(Trap::IndirectCallType);
                     }
+                    // #2474 — a call through the table tiers up as a direct one does.
+                    tier_up!(tmod, tfunc, tm.result_types[tfunc], args, dst);
                     let nb = base + c.progs[cur].nslots as usize;
                     let need = nb + tm.progs[tfunc].nslots as usize;
                     self.open_frame(need)?;
                     for (i, a) in args.iter().enumerate() {
                         self.regs[nb + i] = self.regs[base + *a as usize];
                     }
-                    self.stack
-                        .push((module, cur, base, pc + 1, base + *dst as usize));
+                    self.stack.push((
+                        module,
+                        cur,
+                        base,
+                        pc + 1,
+                        base + *dst as usize,
+                        self.entered,
+                    ));
+                    self.entered = self.work;
                     if tmod != module {
                         module = tmod;
                         c = tm;
@@ -19307,7 +19560,9 @@ impl Vm {
                                     .collect(),
                             ));
                         }
-                        Some((cmod, cprog, cbase, cpc, ret_abs)) => {
+                        Some((cmod, cprog, cbase, cpc, ret_abs, centered)) => {
+                            self.count_call(module, cur);
+                            self.entered = centered;
                             for (i, s) in srcs.iter().enumerate() {
                                 self.regs[ret_abs + i] = self.regs[base + *s as usize];
                             }
@@ -19325,12 +19580,14 @@ impl Vm {
                 // return entry, so the callee returns to this activation's caller. Args may alias the
                 // destination prefix, so gather into `scratch` then scatter (like edge copies).
                 Op::TailCall { callee, args } => {
-                    step(fuel, None)?; // fuel unification: function-entry safepoint
+                    safepoint!(); // fuel unification: function-entry safepoint
                     let callee = *callee as usize;
                     #[cfg(feature = "callprof")]
                     if module == 0 {
                         callprof::hit(callee);
                     }
+                    self.count_call(module, cur);
+                    self.entered = self.work;
                     self.grow_regs(base + c.progs[callee].nslots as usize)?;
                     self.scratch.clear();
                     for a in args.iter() {
@@ -19348,7 +19605,7 @@ impl Vm {
                     want_params,
                     want_results,
                 } => {
-                    step(fuel, None)?; // fuel unification: function-entry safepoint
+                    safepoint!(); // fuel unification: function-entry safepoint
                     let slot = (r!(*idx).i32() as u32 as usize) & (table.len() - 1);
                     let ts = table.slot(slot);
                     if ts.module == super::TABLE_EMPTY {
@@ -19360,6 +19617,8 @@ impl Vm {
                     if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
                         return Err(Trap::IndirectCallType);
                     }
+                    self.count_call(module, cur);
+                    self.entered = self.work;
                     self.grow_regs(base + tm.progs[tfunc].nslots as usize)?;
                     self.scratch.clear();
                     for a in args.iter() {
@@ -19400,6 +19659,12 @@ impl Vm {
                     for a in args.iter() {
                         argv.push(r!(*a).i64());
                     }
+                    // #2361 — the call defines every result it declares: whatever lands below (the
+                    // host's results, an errno, a parked call's delivery) lands over zeros, as the
+                    // oracle and the Cranelift JIT define them.
+                    for i in 0..results.len() {
+                        self.regs[base + *dst as usize + i] = Reg::default();
+                    }
                     // #1904 — the oracle's stop see-through (#1672): a stopped domain runs under a
                     // landing freeze only to reach its next freeze point, so nothing may leave it on the
                     // way — a host call is abandoned rather than performed, for the thaw to re-issue.
@@ -19407,9 +19672,6 @@ impl Vm {
                     if signal_poll.as_ref().is_some_and(|(_, s)| s.stopped())
                         && self.abandon_for_freeze(mem, host)
                     {
-                        for i in 0..results.len() {
-                            self.regs[base + *dst as usize + i] = Reg::default();
-                        }
                         pc += 1;
                         continue;
                     }
@@ -19421,9 +19683,7 @@ impl Vm {
                         let mut sole = mem.as_mut().map(super::SoleMem);
                         let gm = sole.as_mut().map(|m| m as &mut dyn GuestMem);
                         let r = host.with(|p| p.mint_pipe(fds, gm));
-                        if !results.is_empty() {
-                            self.regs[base + *dst as usize] = Reg::from_i64(r);
-                        }
+                        self.regs[base + *dst as usize] = Reg::from_i64(r);
                         pc += 1;
                         continue;
                     }
@@ -19441,8 +19701,16 @@ impl Vm {
                                 && b.type_id == super::cap_id::JIT
                                 && matches!(b.op, 1 | 3 | 4)
                             {
-                                if argv.is_empty() {
-                                    return Err(Trap::CapFault); // invoke/install/uninstall need arg0
+                                // invoke needs its code handle in arg0; install and uninstall are
+                                // held to their contract, as on the oracle (#2361).
+                                let sig = temen_ir::FuncType {
+                                    params: params.to_vec(),
+                                    results: results.to_vec(),
+                                };
+                                if argv.is_empty()
+                                    || !temen_ir::served_shape_ok(b.type_id, b.op, &sig)
+                                {
+                                    return Err(Trap::CapFault);
                                 }
                                 self.module = module;
                                 self.cur = cur;
@@ -19550,8 +19818,11 @@ impl Vm {
                             self.pc = pc + 1;
                             return Ok(Outcome::CapPending { id, dst: *dst });
                         }
+                        // #1722 — no other reply shape parks, so a host-completed punt, which only
+                        // its embedder can finish, declines as the oracle's does: waiting for it
+                        // would never return (the single-threaded build's wait panics).
                         let comps = host.with(|p| p.completions());
-                        let r = comps.wait(id);
+                        let r = comps.wait_unless_host_owned(id).ok_or(Trap::CapFault)?;
                         if let Some(ty) = results.first() {
                             self.regs[base + *dst as usize] = Reg::from_value(slot_to_val(*ty, r));
                         }
@@ -19762,17 +20033,22 @@ impl Vm {
                     // than the serve frame) is a probeable refusal that serves nothing — the serve
                     // loop is the domain's outermost dispatcher.
                     if self
-                        .serve_ticket
+                        .serve_ticket()
                         .is_some_and(|(_, depth)| self.stack.len() > depth)
                     {
                         self.regs[base + *dst as usize] = Reg::from_i64(super::EINVAL);
                         pc += 1;
                         continue;
                     }
-                    if let Some((t, _)) = self.serve_ticket.take() {
+                    if let Some((t, _)) = self.rare.as_mut().and_then(|r| r.serve_ticket.take()) {
                         let v = self.regs[base + *dst as usize].i64();
-                        host.with(|p| p.svc_results.insert(t, v));
-                        self.serve_count += 1;
+                        // #1862, #2164: a page request's bytes move now, from this serving vCPU's
+                        // window, before its child can claim the reply.
+                        host.with(|p| {
+                            let v = p.settle_page(t, v, mem.as_ref().map(|m| m as _));
+                            p.svc_results.insert(t, v)
+                        });
+                        self.rare().serve_count += 1;
                     }
                     // DURABILITY.md §13.4 slice 4b, the oracle's rule: under `UNWINDING` a serve op
                     // makes **no progress** — it delivers an inert sentinel so its trailing poll
@@ -19780,7 +20056,7 @@ impl Vm {
                     // re-executes the drain on thaw (#1904).
                     if is_unwinding(mem) && host.with(|p| p.is_durable()) {
                         self.regs[base + *dst as usize] = Reg::from_i64(0);
-                        self.serve_count = 0;
+                        self.rare().serve_count = 0;
                         pc += 1;
                         continue;
                     }
@@ -19805,7 +20081,10 @@ impl Vm {
                         }
                         let (params, _) = c.sigs.get(fidx).ok_or(Trap::CapFault)?;
                         if d.args.len() != params.len() {
-                            host.with(|p| p.svc_results.insert(d.ticket, super::EINVAL));
+                            host.with(|p| {
+                                let v = p.settle_page(d.ticket, super::EINVAL, None);
+                                p.svc_results.insert(d.ticket, v)
+                            });
                             continue;
                         }
                         let nb = base + c.progs[cur].nslots as usize;
@@ -19814,9 +20093,17 @@ impl Vm {
                         for (i, (s, ty)) in d.args.iter().zip(params.iter()).enumerate() {
                             self.regs[nb + i] = Reg::from_value(slot_to_val(*ty, *s));
                         }
-                        self.serve_ticket = Some((d.ticket, self.stack.len()));
-                        self.stack
-                            .push((module, cur, base, pc, base + *dst as usize));
+                        let depth = self.stack.len();
+                        self.rare().serve_ticket = Some((d.ticket, depth));
+                        self.stack.push((
+                            module,
+                            cur,
+                            base,
+                            pc,
+                            base + *dst as usize,
+                            self.entered,
+                        ));
+                        self.entered = self.work;
                         cur = fidx;
                         base = nb;
                         pc = 0;
@@ -19828,7 +20115,10 @@ impl Vm {
                         // form's no-progress answer) instead of parking on a queue no client can
                         // fill. Consulted only where it would park, so queued work is served first
                         // and the token outlives it.
-                        if *wait && self.serve_count == 0 && !host.with(Host::take_client_gone) {
+                        if *wait
+                            && self.rare().serve_count == 0
+                            && !host.with(Host::take_client_gone)
+                        {
                             // svc.wait with no progress: persist the cursor AT this op (a wake
                             // re-executes the whole drain) and park the task on its domain.
                             self.module = module;
@@ -19838,8 +20128,8 @@ impl Vm {
                             return Ok(Outcome::SvcWait);
                         }
                         // Queue drained: deliver the completed count and close the activation.
-                        self.regs[base + *dst as usize] = Reg::from_i64(self.serve_count);
-                        self.serve_count = 0;
+                        let served = std::mem::take(&mut self.rare().serve_count);
+                        self.regs[base + *dst as usize] = Reg::from_i64(served);
                         pc += 1;
                     }
                 }
@@ -19883,7 +20173,7 @@ impl Vm {
                     // Fuel unification: charge one fuel per `cont.resume` op — the tree-walker charges
                     // the same at its `Inst::ContResume` arm. Resuming a fiber is a control transfer
                     // per-op fuel used to meter; without this, a long fiber-resume chain runs unmetered.
-                    step(fuel, None)?;
+                    safepoint!();
                     let kh = r!(*k).i32();
                     let arg = r!(*arg).i64();
                     let dst = *dst;
@@ -19944,7 +20234,7 @@ impl Vm {
                     return Ok(Outcome::ThreadJoin {
                         handle,
                         dst,
-                        wait: false,
+                        status: false,
                     });
                 }
                 // §14 executor children — the Instantiator authority `(ibase, isize)` is resolved here
@@ -19991,11 +20281,7 @@ impl Vm {
                         grant,
                     });
                 }
-                Op::CloneCaller {
-                    args,
-                    dst,
-                    has_result,
-                } => {
+                Op::CloneCaller { args, dst } => {
                     // Arity picks the mode (mirrors the oracle, `temen-interp` clone_caller arm):
                     // 2 args = explicit `(reply_orig, reply_twin)`; 0/1 args = pid mode
                     // (`reply_orig = None` → the parent gets the twin's task id).
@@ -20006,7 +20292,6 @@ impl Vm {
                         (None, twin)
                     };
                     let dst = *dst;
-                    let has_result = *has_result;
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
@@ -20015,27 +20300,17 @@ impl Vm {
                         reply_orig,
                         reply_twin,
                         dst,
-                        has_result,
                     });
                 }
-                Op::Reap {
-                    pid,
-                    dst,
-                    has_result,
-                } => {
+                Op::Reap { pid, dst } => {
                     // The pid to reap (an out-of-range default → the driver answers -ECHILD).
                     let pid = pid.map(|p| r!(p).i64()).unwrap_or(-1);
                     let dst = *dst;
-                    let has_result = *has_result;
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    return Ok(Outcome::Reap {
-                        pid,
-                        dst,
-                        has_result,
-                    });
+                    return Ok(Outcome::Reap { pid, dst });
                 }
                 // FORK.md §8.6 — `exec_module` (#1080): resolve the five register operands and surface
                 // the image-replace to the driver. The cursor is saved (pc+1) so a *refused* exec
@@ -20068,82 +20343,41 @@ impl Vm {
                         personality: false,
                     });
                 }
-                // §5 detached spawn (op 15, #1286): the Instantiator is the authority (a forged one is a
-                // CapFault, as every op above); the budget's quota take and the module resolve happen at
-                // the driver's commit site (`admit_detached_child`), peek-then-drain like op 13.
-                Op::InstantiateDetached {
-                    handle,
-                    budget,
-                    module: module_reg,
-                    grants,
-                    entry,
-                    size_log2,
-                    quota,
-                    args,
-                    premap,
-                    dst,
-                } => {
-                    let ih = r!(*handle).i32();
-                    host.with(|p| p.resolve_instantiator(ih))?;
-                    let spawn = DetachedSpawn {
-                        budget: r!(*budget).i64() as i32,
-                        module: r!(*module_reg).i64() as i32,
-                        entry: r!(*entry).i64(),
-                        size_log2: r!(*size_log2).i64(),
-                        quota: r!(*quota).i64(),
-                        grants: grants
-                            .map(|(pr, nr)| (r!(pr).i64() as u64, r!(nr).i64() as u64))
-                            .filter(|(_, n)| *n != 0),
-                        args: args.map(|(pr, lr)| (r!(pr).i64() as u64, r!(lr).i64() as u64)),
-                        premap: premap.map(|(rr, or)| (r!(rr).i64() as i32, r!(or).i64() as u64)),
-                    };
-                    let dst = *dst;
-                    self.module = module;
-                    self.cur = cur;
-                    self.base = base;
-                    self.pc = pc + 1;
-                    return Ok(Outcome::InstantiateDetached { spawn, dst });
-                }
-                // CONSOLIDATION.md §3d — `instantiate_rec` (op 17): read the record from this vCPU's
+                // CONSOLIDATION.md §3d — `instantiate_rec` (op 17): the Instantiator is the authority
+                // (a forged one is a CapFault, as every op above); read the record from this vCPU's
                 // confined window and fail closed exactly as the tree-walker's arm does (bad version
-                // or reserved field → `CapFault`). A record is op 15 as data (#1863): the same outcome
-                // op 15 produces, served by every driver's detached arm. This tier never natively
-                // demand-pages: the module-level entries decline any op-17 module with a pager-shaped
-                // export ([`compile_module_for`]), so a surviving pager field can only come from a
-                // module without one — which `CapFault`s identically on the tree-walker.
+                // or reserved field → `CapFault`). The outcome is served by every driver's detached
+                // arm, where the budget's take and the module resolve happen at the driver's commit
+                // site (`admit_detached_child`), and its pager is checked first (#2164).
                 Op::InstantiateRec { handle, rec, dst } => {
                     let ih = r!(*handle).i32();
                     host.with(|p| p.resolve_instantiator(ih))?;
                     let rp = r!(*rec).i64() as u64;
                     let sr = read_spawn_rec(mem.as_ref().ok_or(Trap::Malformed)?, rp)?;
-                    if sr.pager != u32::MAX {
-                        return Err(Trap::CapFault);
-                    }
+                    let spawn = DetachedSpawn::of(&sr);
                     let dst = *dst;
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    let spawn = DetachedSpawn::of(&sr);
                     return Ok(Outcome::InstantiateDetached { spawn, dst });
                 }
                 // §14 `join` — check the Instantiator authority, then reuse the thread join machinery
                 // (executor children live in the same `threads` handle namespace as `thread.spawn`).
-                Op::InstJoin {
-                    handle,
-                    child,
-                    dst,
-                    wait,
-                } => {
+                Op::InstJoin { handle, child, dst } => {
                     let ih = r!(*handle).i32();
                     host.with(|p| p.resolve_instantiator(ih))?; // authority
                     let handle = r!(*child).i32();
-                    let (dst, wait) = (*dst, *wait);
+                    let dst = *dst;
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    return Ok(Outcome::ThreadJoin { handle, dst, wait });
+                    return Ok(Outcome::ThreadJoin {
+                        handle,
+                        dst,
+                        status: true,
+                    });
                 }
                 Op::MemoryWait {
                     ty,
@@ -20290,17 +20524,13 @@ impl Vm {
                     return Err(Trap::Unreachable);
                 }
                 Op::CapFault => return Err(Trap::CapFault),
-                Op::Eval {
-                    inst,
-                    block_base,
-                    dst,
-                } => {
-                    // Run the op against this block's sub-window with its original block-local operand
-                    // indices; reuse the reference semantics. `eval_inst` borrows the window immutably
-                    // and `mem` mutably (disjoint), so we read the result before writing it back.
-                    let win_lo = base + *block_base as usize;
+                Op::Eval { inst, dst } => {
+                    // Run the op against the frame, its operands frame slots; reuse the reference
+                    // semantics. `eval_inst` borrows the frame immutably and `mem` mutably
+                    // (disjoint), so we read the result before writing it back. A `v128` access
+                    // pages as the oracle's `eval_inst` fallback does (its `handle_mem`).
                     let win_hi = base + c.progs[cur].nslots as usize;
-                    let r = super::eval_inst(inst, &self.regs[win_lo..win_hi], mem)?;
+                    let r = paged!(super::eval_inst(inst, &self.regs[base..win_hi], mem));
                     if let Some(v) = r {
                         self.regs[base + *dst as usize] = v;
                     }
@@ -20375,7 +20605,11 @@ mod func_memo_tests {
             2,
             "the same module again reuses both functions"
         );
-        assert_eq!(again.progs[0].nslots, 1);
+        assert_eq!(
+            again.progs[0].nslots,
+            1 + 1,
+            "its value's slot and the discard slot"
+        );
         let changed = compile_module_memo(&two, &[], None, &mut memo).unwrap();
         assert_eq!(
             memo.reused(),
@@ -20384,7 +20618,7 @@ mod func_memo_tests {
         );
         let fresh = compile_module(&two, &[], None).unwrap();
         assert_eq!(changed.progs[0].nslots, fresh.progs[0].nslots);
-        assert_eq!(changed.progs[0].nslots, 2);
+        assert_eq!(changed.progs[0].nslots, 2 + 1);
     }
 
     /// A `call.dyn` whose signature's parameters change keeps its result count, so only the logged

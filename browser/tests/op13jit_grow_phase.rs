@@ -1,23 +1,20 @@
-//! **#1253 — a phase-scale `vm_map`-growing §14 op-13 child on the single-shot wasm-JIT tier, byte-
-//! identical to the interpreter oracle, with NO pre-sized carve.** The op-13 servicer used to back a
-//! phase child with a fixed `alloc_zeroed` carve pre-sized 8× its declared window (`(decl + 3).max(24)`,
-//! doubled into its buddy parent) — for a ~256 MiB phase, a 4 GiB block inside the browser's 1 GiB
-//! memory, so the big nim phases could not tier up. Now the child is granted the policy carve
-//! (a 256 MiB buddy half) and **commits only its declared window**: `"mapped"`
-//! starts at `1 << DECL` and each `vm_map` bounce (an outlined `env.call_interp` leaf) grows it into the
-//! carve — the #1243 growable-child model, whose confinement `nested_grow_window` fuzzes.
+//! **#1253 — a phase-scale `vm_map`-growing §14 child on the single-shot wasm-JIT tier, byte-
+//! identical to the interpreter oracle.** The child's run commits only its declared window: `"mapped"`
+//! starts at `1 << DECL` and each `vm_map` bounce (an outlined `env.call_interp` leaf) grows it into
+//! the child's reservation — the #1243 growable-child model. (The op-13 servicer once backed a phase
+//! child with a fixed region pre-sized 8× its declared window, so the big nim phases could not tier up.)
 //!
-//! This pins the *scale* the pre-size blocked: a child declaring 1 MiB grows to the full 256 MiB carve
-//! in four `vm_map`s and touches the deepest page of every grown chunk. The wasmi driver plays
-//! `driveDetachedRun` (`env.call_interp` → `run_cross_tier`, re-pointing `"mapped"` after each bounce); the
-//! oracle is the interpreter over the same carve with starter caps spanning it — the committed-declared,
-//! carve-growing window the op-13 step's interpreter fallback starts its child over
-//! (`PendingChild::start` with `committed_log2`). Value parity, four bounces, and a `"mapped"`
-//! high-water at the whole carve are the non-vacuity proof.
+//! This pins the scale: a child declaring 1 MiB grows to a 256 MiB reservation in four `vm_map`s and
+//! touches the deepest page of every grown chunk. The run opens as the op-13 servicer opens a detached
+//! child's (`JitOnrampRun::open_detached_run` over a granted powerbox), its window inside a wasmi memory
+//! standing in for the child's own `WebAssembly.Memory`. The wasmi driver plays `driveDetachedRun`
+//! (`env.call_interp` → `run_cross_tier`, re-pointing `"mapped"` after each bounce); the oracle is the
+//! interpreter over the same reservation with starter caps spanning it. Value parity, four bounces,
+//! and a `"mapped"` high-water at the whole reservation are the non-vacuity proof.
 
 use std::sync::Arc;
 
-use temen_browser::JitOnrampRun;
+use temen_browser::{JitOnrampRun, RunInput};
 use temen_interp::{bytecode, Host, Region, Value};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
@@ -25,8 +22,8 @@ const ENV_PTR: u32 = 1024;
 const WIN_BASE: u32 = 0x1_0000;
 /// The child's declared window: `memory 20` = 1 MiB — the initial `"mapped"`.
 const DECL: u8 = 20;
-/// The parent-granted carve: the policy buddy half, 256 MiB — the child grows into `[1 MiB, 256 MiB)`.
-const CARVE: u8 = 28;
+/// The child's reservation, 256 MiB: it grows into `[1 MiB, 256 MiB)`.
+const RESERVED: u8 = 28;
 const MIB: u64 = 1 << 20;
 
 /// The child entry `(inst, as) -> i64`: four `vm_map`s (op 0 on its starter `AddressSpace`, `Rw`)
@@ -82,33 +79,33 @@ fn build() -> temen_ir::Module {
     m
 }
 
-/// The interpreter oracle: the child as a **growable** confined child over the carve — declared `DECL`
-/// committed, `vm_map`-growing into `1 << CARVE` — the window the op-13 step's fallback starts it over.
-/// Its starter caps span the carve; the window over it is a root vCPU's, since a sub-window is
-/// indistinguishable from a top-level window (DESIGN.md §14).
+/// The interpreter oracle: the child over its reservation — declared `DECL` committed, `vm_map`-growing
+/// into `1 << RESERVED`. Its starter caps span the reservation, and the window over it is a root
+/// vCPU's, which is what a detached child's window is.
 fn oracle(m: &temen_ir::Module) -> i64 {
     let prog = bytecode::VcpuProgram::compile(m).expect("compile");
-    let carve = 1usize << CARVE;
-    let layout = std::alloc::Layout::from_size_align(carve, 8).unwrap();
+    let reserved = 1usize << RESERVED;
+    let layout = std::alloc::Layout::from_size_align(reserved, 8).unwrap();
     // SAFETY: non-zero 8-aligned layout; owned here until freed after the vCPU (and its `Mem`) drop.
     let base = unsafe { std::alloc::alloc_zeroed(layout) };
     assert!(!base.is_null());
-    // SAFETY: `base` is `carve` valid bytes, exclusively this child's window, freed only after the vCPU.
-    let back = Arc::new(unsafe { Region::shared(base, carve as u64) });
+    // SAFETY: `base` is `reserved` valid bytes, exclusively this child's window, freed only after the
+    // vCPU.
+    let back = Arc::new(unsafe { Region::shared(base, reserved as u64) });
     let out = {
         let mut host = Host::new();
-        let (inst, space) = host.grant_starter_caps(1 << CARVE);
+        let (inst, space) = host.grant_starter_caps(1 << RESERVED);
         let args = [Value::I64(inst.into()), Value::I64(space.into())];
         let mut vcpu =
             bytecode::Vcpu::new_root_with_powerbox(&prog, 0, &args, Arc::clone(&back), &[], host)
-                .expect("growable confined child builds");
+                .expect("the growable child builds");
         match vcpu.run() {
             bytecode::VcpuEvent::Done(v) => match v.first() {
                 Some(Value::I64(x)) => *x,
                 other => panic!("child returns one i64, got {other:?}"),
             },
             bytecode::VcpuEvent::Trapped(t) => panic!("the child trapped: {t:?}"),
-            _ => panic!("unexpected confined-child event (expected Done)"),
+            _ => panic!("unexpected child event (expected Done)"),
         }
     };
     drop(back);
@@ -227,7 +224,7 @@ fn drive(
 }
 
 #[test]
-fn phase_scale_child_grows_to_the_full_carve_matching_the_interpreter() {
+fn phase_scale_child_grows_to_its_whole_reservation_matching_the_interpreter() {
     let m = build();
     let want = oracle(&m);
     assert_eq!(
@@ -236,11 +233,11 @@ fn phase_scale_child_grows_to_the_full_carve_matching_the_interpreter() {
     );
 
     let mut host = Host::new();
-    let carve = 1u64 << CARVE;
-    // The op-13 step's setup: the starter caps span the parent-granted CARVE (authorizing the grow),
-    // while the run below commits only the child's declared window.
-    let cinst = host.grant_instantiator(0, carve);
-    let cas = host.grant_address_space(0, carve);
+    let reserved = 1u64 << RESERVED;
+    // A detached child's starter caps span its reservation (authorizing the grow), while the run below
+    // commits only its declared window.
+    let cinst = host.grant_instantiator();
+    let cas = host.grant_address_space(0, reserved);
     let engine = Engine::default();
     let mut store: Store<Drv> = Store::new(
         &engine,
@@ -249,36 +246,37 @@ fn phase_scale_child_grows_to_the_full_carve_matching_the_interpreter() {
             bounces: 0,
         },
     );
-    // Physically cover `[WIN_BASE, WIN_BASE + carve)` — the reserved (demand-zero) carve the browser
-    // arena provides — so a non-faulting grown access lands in real memory.
-    let pages = ((WIN_BASE as u64 + carve) as u32).div_ceil(1 << 16) + 1;
+    // Physically cover `[WIN_BASE, WIN_BASE + reserved)` — the reservation the child's memory grows
+    // into — so a non-faulting grown access lands in real memory.
+    let pages = ((WIN_BASE as u64 + reserved) as u32).div_ceil(1 << 16) + 1;
     let memory = Memory::new(&mut store, MemoryType::new(pages, Some(pages))).unwrap();
-    // SAFETY: the child's window (its carve) lives inside the fixed wasmi memory for the run's lifetime.
-    let win_ptr = unsafe {
-        memory
-            .data_mut(&mut store)
-            .as_mut_ptr()
-            .add(WIN_BASE as usize)
-    };
-    let run = unsafe {
-        JitOnrampRun::open_shared_run_over_host(
-            &m,
-            win_ptr,
-            carve,
-            CARVE,
-            false,
-            host,
-            Vec::new(),
-            cinst as u64,
-            cas as u64,
-            None,
+    // SAFETY: the child's window lives inside the fixed wasmi memory for the run's lifetime.
+    let back = Arc::new(unsafe {
+        Region::shared(
+            memory
+                .data_mut(&mut store)
+                .as_mut_ptr()
+                .add(WIN_BASE as usize),
+            reserved,
         )
-    }
-    .expect("a map-only op-13 child opens as a single-shot JIT run");
+    });
+    let run = JitOnrampRun::open_detached_run(
+        &m,
+        back,
+        false,
+        RunInput::PreGranted {
+            host: Box::new(host),
+            init_mem: Vec::new(),
+            entry_inst: cinst as u64,
+            entry_as: cas as u64,
+        },
+        None,
+    )
+    .expect("a map-only child opens as a single-shot JIT run");
     assert_eq!(
         run.mapped(),
         1u64 << DECL,
-        "the run commits the DECLARED window, not the carve — no pre-size"
+        "the run commits the DECLARED window, not the reservation — no pre-size"
     );
     let slots: Vec<Val> = run
         .slots()
@@ -299,7 +297,7 @@ fn phase_scale_child_grows_to_the_full_carve_matching_the_interpreter() {
     );
     assert_eq!(bounces, 4, "the four outlined `vm_map` leaves bounced");
     assert_eq!(
-        high_water, carve,
-        "\"mapped\" grew to the whole 256 MiB carve — the scale the 8× pre-size could not back"
+        high_water, reserved,
+        "\"mapped\" grew to the whole 256 MiB reservation — the scale the 8× pre-size could not back"
     );
 }

@@ -196,7 +196,7 @@ fn jit_unarmed_path_is_unchanged() {
 }
 
 /// A §14 parent (a powerbox `_start`) that spawns its `"child"` (its child image, #2219: func 1,
-/// exported as `_child`) detached through a v1 record at 17408, paid from its `"budget"`, and `join`s
+/// exported as `_child`) detached through a spawn record at 17408, paid from its `"budget"`, and `join`s
 /// it. The child **spins forever**, so the run's kill must reach
 /// *into the child*: the host's deadline watchdog sets the run's interrupt cell, the parent's parked
 /// `join` traps `OutOfFuel`, and the run's teardown ends the running child with it. Without that, the
@@ -216,16 +216,16 @@ block 0 () {
   vbp = i64.const 16656
   vbl = i64.const 6
   vb = self.resolve vbp vbl
-  vrb = i64.const 17436
+  vrb = i64.const 17420
   i32.store vrb vb
   vcp = i64.const 16672
   vcl = i64.const 5
   vc = self.resolve vcp vcl
-  vrm = i64.const 17432
+  vrm = i64.const 17416
   i32.store vrm vc
   vrp = i64.const 17408
   v5 = call.cap 6 17 (i64) -> (i32) vi (vrp)
-  v6 = call.cap 6 1 (i32) -> (i64) vi (v5)
+  v6_st, v6 = call.cap 6 1 (i32) -> (i64, i64) vi (v5)
   v7 = i32.wrap_i64 v6
   return v7
   }
@@ -250,7 +250,7 @@ fn jit_killpath_stops_runaway_child() {
     }
     let src = format!(
         "{PARENT_WITH_RUNAWAY_CHILD}{}",
-        rec::segment(17408, &SpawnRec::v1(0))
+        rec::segment(17408, &SpawnRec::default())
     );
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");

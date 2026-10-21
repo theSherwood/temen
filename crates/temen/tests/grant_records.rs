@@ -3,10 +3,11 @@
 //! engine parses it with one reader (`temen_interp::read_grant_records`, #1736), so a malformed list
 //! gets one answer everywhere — a trap in the guest, never a host failure.
 //!
-//! The case that motivated pinning it: a huge `grants_n`. The records run off the end of the window
-//! long before the count is reached, so the answer is the out-of-window read's `MemoryFault`. The
-//! native reader used to pre-size its list on the untrusted count, so on Cranelift the same guest
-//! aborted the host process on the allocation instead.
+//! The case that motivated pinning it: a huge `grants_n`. The native reader used to pre-size its
+//! list on the untrusted count, so on Cranelift the guest aborted the host process on the allocation.
+//! Since #2349 the count is bounded before anything is read (`MAX_SPAWN_GRANTS`): a longer list is
+//! malformed, `CapFault`, on every engine. Within the bound, a record outside the window is the read's
+//! `MemoryFault`.
 
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
@@ -18,14 +19,14 @@ use temen_run::jit_cap_run;
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-/// Spawns [`CHILD`] detached over `grants_n` records at `grants_ptr`, through a v1 record at 17408
+/// Spawns [`CHILD`] detached over `grants_n` records at `grants_ptr`, through a spawn record at 17408
 /// paid from the root's `Budget`. Records 0 and 1 at 16640 (clear of the guarded low pages) are
 /// written to grant the stream under an empty name, so a list there is well formed.
 fn guest(grants_ptr: i64, grants_n: i64) -> temen_ir::Module {
     let spawn = SpawnRec {
         grants_ptr: grants_ptr as u64,
         grants_n: grants_n as u64,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::default()
     };
     let src = format!(
         r#"memory 19
@@ -35,9 +36,9 @@ block 0 (vi: i32, vm: i32, vs: i32, vb: i32) {{
   i32.store h0 vs
   h1 = i64.const 16664
   i32.store h1 vs
-  am = i64.const 17432
+  am = i64.const 17416
   i32.store am vm
-  ab = i64.const 17436
+  ab = i64.const 17420
   i32.store ab vb
   rp = i64.const 17408
   ch = call.cap 6 17 (i64) -> (i32) vi (rp)
@@ -69,7 +70,7 @@ fn host() -> (Host, [i32; 4]) {
     let child = parse_module(CHILD).expect("parse child");
     verify_module(&child).expect("verify child");
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << 19);
+    let inst = host.grant_instantiator();
     let module = host.grant_module(&child);
     let out = host.grant_stream(StreamRole::Out);
     let budget = host.grant_budget(-1, 1 << 20, -1);
@@ -105,10 +106,22 @@ fn cranelift(m: &temen_ir::Module) -> JitOutcome {
     .0
 }
 
-/// The list starts past any window, so it fails at record 0 however long it says it is.
+/// A count past the bound is refused before anything is read, wherever the list starts.
 #[test]
-fn a_huge_grant_count_is_a_memory_fault_on_every_engine() {
+fn a_huge_grant_count_is_refused_on_every_engine() {
     let m = guest(-16, 1 << 60);
+    assert_eq!(oracle(&m), Err(Trap::CapFault), "oracle");
+    assert_eq!(bytecode_engine(&m), Err(Trap::CapFault), "bytecode");
+    assert!(
+        matches!(cranelift(&m), JitOutcome::Trapped(TrapKind::CapFault)),
+        "cranelift"
+    );
+}
+
+/// Within the bound, a list starting past any window fails at record 0: the read's `MemoryFault`.
+#[test]
+fn a_record_outside_the_window_is_a_memory_fault_on_every_engine() {
+    let m = guest(-16, temen_interp::MAX_SPAWN_GRANTS as i64);
     assert_eq!(oracle(&m), Err(Trap::MemoryFault), "oracle");
     assert_eq!(bytecode_engine(&m), Err(Trap::MemoryFault), "bytecode");
     assert!(

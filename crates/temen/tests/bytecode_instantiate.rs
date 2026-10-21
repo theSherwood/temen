@@ -21,7 +21,7 @@ fn host(m: &Module) -> (Host, i32) {
     let mut h = Host::new();
     let budget = h.grant_budget(-1, 1 << 20, -1);
     h.register_cap_name("budget", budget);
-    let inst = h.grant_instantiator(0, 128 << 10);
+    let inst = h.grant_instantiator();
     let child = h.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
     h.register_cap_name("child", child);
     (h, inst)
@@ -29,7 +29,7 @@ fn host(m: &Module) -> (Host, i32) {
 
 /// Run `src`'s entry on both engines with an `Instantiator` granted over `[0, 128 KiB)`, and assert
 /// the results are identical and equal to `want`.
-fn check(src: &str, want: Result<Vec<Value>, ()>) {
+fn check(src: &str, want: Vec<Value>) {
     let m = parse_module(src).expect("parse");
 
     let (mut h_tw, inst_tw) = host(&m);
@@ -43,10 +43,7 @@ fn check(src: &str, want: Result<Vec<Value>, ()>) {
             .expect("bytecode engine must support instantiate/join (Slice 1c-5g)");
 
     assert_eq!(tw, bc, "instantiate: tree-walker != bytecode\n{src}");
-    match want {
-        Ok(vals) => assert_eq!(bc, Ok(vals), "instantiate result\n{src}"),
-        Err(()) => assert!(bc.is_err(), "expected a trap, got {bc:?}\n{src}"),
-    }
+    assert_eq!(bc, Ok(want), "instantiate result\n{src}");
 }
 
 /// A two-arg child receives its starter caps `(Instantiator, AddressSpace)`. It uses the
@@ -62,16 +59,16 @@ block 0 (v0: i32) {
   vnp = i64.const 16640
   vnl = i64.const 6
   vb = self.resolve vnp vnl
-  q3b = i64.const 17756
+  q3b = i64.const 17740
   i32.store q3b vb
   vcp = i64.const 16656
   vcl = i64.const 5
   vc = self.resolve vcp vcl
-  q3m = i64.const 17752
+  q3m = i64.const 17736
   i32.store q3m vc
   q3a0 = i64.const 17728
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q3a0)
-  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
+  v6_st, v6 = call.cap 6 1 (i32) -> (i64, i64) v0 (v5)
   return v6
   }
 }
@@ -88,13 +85,16 @@ block 0 (v0: i64, v1: i64) {
 
 #[test]
 fn two_arg_child_manages_its_own_pages() {
-    let src = format!("{ADDRESS_SPACE}{}", rec::segment(17728, &SpawnRec::v1(0)));
-    check(&src, Ok(vec![Value::I64(0)]));
+    let src = format!(
+        "{ADDRESS_SPACE}{}",
+        rec::segment(17728, &SpawnRec::default())
+    );
+    check(&src, vec![Value::I64(0)]);
 }
 
-/// A child trap (`unreachable`) must propagate through `join` as the parent's trap — identically on
-/// both engines. The parent spawns its `"child"` as [`ADDRESS_SPACE`]'s does, by the v1 record at
-/// 17728.
+/// A child trap (`unreachable`) is its parent's `join` status, never the parent's trap (#2066) —
+/// identically on both engines. The parent spawns its `"child"` as [`ADDRESS_SPACE`]'s does, by the
+/// spawn record at 17728, and returns the status.
 const CHILD_TRAP: &str = r#"memory 17
 data 16640 "budget"
 data 16656 "child"
@@ -103,17 +103,17 @@ block 0 (v0: i32) {
   vnp = i64.const 16640
   vnl = i64.const 6
   vb = self.resolve vnp vnl
-  q3b = i64.const 17756
+  q3b = i64.const 17740
   i32.store q3b vb
   vcp = i64.const 16656
   vcl = i64.const 5
   vc = self.resolve vcp vcl
-  q3m = i64.const 17752
+  q3m = i64.const 17736
   i32.store q3m vc
   q3a0 = i64.const 17728
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q3a0)
-  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
-  return v6
+  v6_st, v6 = call.cap 6 1 (i32) -> (i64, i64) v0 (v5)
+  return v6_st
   }
 }
 func (i64) -> (i64) {
@@ -124,7 +124,7 @@ block 0 (v0: i64) {
 "#;
 
 #[test]
-fn child_trap_propagates_through_join() {
-    let src = format!("{CHILD_TRAP}{}", rec::segment(17728, &SpawnRec::v1(0)));
-    check(&src, Err(()));
+fn a_child_trap_is_its_joins_status() {
+    let src = format!("{CHILD_TRAP}{}", rec::segment(17728, &SpawnRec::default()));
+    check(&src, vec![Value::I64(temen_ir::trap_code::UNREACHABLE)]);
 }

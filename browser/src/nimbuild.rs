@@ -2,30 +2,23 @@
 //! [`temen_browser::nim_build`] — the session the wasm export `temen_nim_open` opens, driven to its
 //! end — over the self-hosted lane's toolchain and a program tree, and reports how long the build
 //! took, the process's peak resident memory, and what the run held at its end. A measurement, not a
-//! gate: the engine's cost before the wasm factor, from the code the browser runs. It also writes
-//! the library pack the browser seeds ([`temen_browser::library_pack`]), and the toolchain the
-//! playground's nim card ships.
+//! gate: the engine's cost before the wasm factor, from the code the browser runs. The toolchain the
+//! playground's nim card ships is built on the native JIT instead, by temen-run's `nim_card_bundle`
+//! (#2442).
 //!
 //! ```text
-//! nimbuild <toolchain-dir> <tree> <prog.nim> [--at <dir>] [--lib <pack>] [--pack <pack>]
-//!          [--bundle <toolchain>] [--expect <module.temen>] [--leaves]
+//! nimbuild <toolchain-dir> <tree> <prog.nim> [--at <dir>] [--lib <pack>] [--expect <module.temen>]
+//!          [--leaves]
 //! ```
 //!
 //! `<toolchain-dir>` holds what `scripts/nim-toolchain.sh` builds: `nimony.temen`, `nifmake.temen`,
-//! `nimsem.temen`, `nifler2.temen`, `hexer.temen`, the shell's `sh.ir`, and the guest libc as
+//! `nimsem.temen`, `nifler2.temen`, `shoggoth.temen`, the shell's `sh.ir`, and the guest libc as
 //! `libc.temeno`. `<tree>` holds `lib/` and `<prog.nim>`; it is seeded at `--at` (by default its
 //! host path, where the lane builds), without its `bin/` or `nimcache/`.
 //!
 //! - `--lib <pack>` seeds a library pack after the tree, so the build compiles only the program's
-//!   own modules. The pack must come from a build at the same `--at`.
-//! - `--pack <pack>` writes the library pack of this build: build a program that imports the
-//!   library, and the pack holds everything it compiled of the library.
-//! - `--bundle <toolchain>` writes the toolchain the nim card ships (`web/assets/nimony.blob.gz`,
-//!   gzipped): a registry blob ([`temen_browser::registry_blob`]) of three entries. `cwd` is `--at`,
-//!   where a build that uses it runs: the pack names it. `commands` is what this build ran with, as
-//!   `temen_nim_open` takes it, the driver (nimony) first. `files` is what this build seeded before
-//!   its program, without the program: the tree's library, then this build's library pack, then the
-//!   guest libc.
+//!   own modules: `nim_card_bundle --pack` writes one. The pack must come from a build at the same
+//!   `--at`.
 //! - `--expect <module.temen>` is the module the build must link.
 //! - `--leaves` tiers up each leaf process at its entry and serves it by bouncing the entry, the
 //!   native stand-in for running it emitted (#1896).
@@ -35,7 +28,7 @@ use std::time::Instant;
 
 /// The toolchain's guests. `temen-link` is not one of them: [`temen_browser::nim_build`] serves it
 /// natively.
-const TOOLS: [&str; 5] = ["nimony", "nifmake", "nimsem", "nifler2", "hexer"];
+const TOOLS: [&str; 5] = ["nimony", "nifmake", "nimsem", "nifler2", "shoggoth"];
 
 fn read(path: &Path) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
@@ -84,17 +77,11 @@ fn main() {
         args.drain(i..=i + 1);
         Some(value)
     };
-    let (at, lib, pack, bundle, expect) = (
-        flag("--at"),
-        flag("--lib"),
-        flag("--pack"),
-        flag("--bundle"),
-        flag("--expect"),
-    );
+    let (at, lib, expect) = (flag("--at"), flag("--lib"), flag("--expect"));
     let [tools, tree, prog] = &args[..] else {
         panic!(
             "usage: nimbuild <toolchain-dir> <tree> <prog.nim> [--at <dir>] [--lib <pack>] \
-             [--pack <pack>] [--bundle <toolchain>] [--expect <module.temen>] [--leaves]"
+             [--expect <module.temen>] [--leaves]"
         );
     };
     let tools = Path::new(tools);
@@ -157,13 +144,15 @@ fn main() {
         .chain([libc])
         .collect();
 
-    let argv: [&[u8]; 4] = [b"bin/nimony", b"t", b"--isMain", prog.as_bytes()];
+    // No `validator` ships with the toolchain, so the build says so up front instead of nimony
+    // warning about it at every plugin it builds (the card passes the same).
+    let argv: [&[u8]; 5] = [b"bin/nimony", b"t", b"--novalidate", b"--isMain", prog.as_bytes()];
     let t0 = Instant::now();
     let b = temen_browser::nim_build(&modules[0], &commands, None, &files, &argv, &dir, leaves)
         .expect("the interpreter tier runs nimony");
     let secs = t0.elapsed().as_secs_f64();
 
-    // `nimcache/<main>.temen/<prog>.temen`, `<main>` the driver's stem for the program.
+    // `nimcache/t/<main>/<prog>.temen`, `<main>` the driver's stem for the program.
     let out = format!(
         "/{}.temen",
         Path::new(prog).file_stem().unwrap().to_string_lossy()
@@ -200,53 +189,5 @@ fn main() {
             "the module built on the browser's tier is not {e}"
         );
         eprintln!("✅ it is {e}, byte for byte");
-    }
-    if pack.is_none() && bundle.is_none() {
-        return;
-    }
-    let library = temen_browser::library_pack(&b.posix, &dir);
-    let library: Vec<(&str, &[u8])> = library
-        .iter()
-        .map(|(n, b)| (n.as_str(), b.as_slice()))
-        .collect();
-    if let Some(p) = pack {
-        let blob = temen_browser::registry_blob(&library);
-        std::fs::write(&p, &blob).unwrap_or_else(|e| panic!("{p}: {e}"));
-        eprintln!(
-            "wrote the library pack {p}: {} files, {} bytes",
-            library.len(),
-            blob.len()
-        );
-    }
-    if let Some(p) = bundle {
-        let sh = temen_encode::encode_module(&sh);
-        let named: Vec<String> = paths.iter().map(|p| p.join("\n")).collect();
-        let commands: Vec<(&str, &[u8])> = named
-            .iter()
-            .map(String::as_str)
-            .zip(encoded.iter().map(Vec::as_slice))
-            .chain([("/bin/sh", sh.as_slice())])
-            .collect();
-        let program = format!("{dir}/{prog}");
-        let seeded: Vec<(&str, &[u8])> = tree_files
-            .iter()
-            .filter(|(p, _)| *p != program)
-            .map(|(p, b)| (p.as_str(), b.as_slice()))
-            .chain(library.iter().copied())
-            .chain([libc])
-            .collect();
-        let blob = temen_browser::registry_blob(&[
-            ("cwd", dir.as_bytes()),
-            ("commands", &temen_browser::registry_blob(&commands)),
-            ("files", &temen_browser::registry_blob(&seeded)),
-        ]);
-        std::fs::write(&p, &blob).unwrap_or_else(|e| panic!("{p}: {e}"));
-        eprintln!(
-            "wrote the toolchain {p}: {} commands, {} files ({} from the library pack), {} bytes",
-            commands.len(),
-            seeded.len(),
-            library.len(),
-            blob.len()
-        );
     }
 }

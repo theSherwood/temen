@@ -153,7 +153,7 @@ export function registryBlob(entries) {
 }
 
 // #958 — nimony's toolchain as the nim card ships it (`web/assets/nimony.blob.gz`, written by
-// `nimbuild --bundle`): a registry blob of `cwd`, the directory a build with it runs in (its library
+// temen-run's `nim_card_bundle`): a registry blob of `cwd`, the directory a build with it runs in (its library
 // pack names it); `commands`, as `temen_nim_open` takes them, nimony first; and `files`, what a build
 // seeds before its program — nimony's library, the library pack, the guest libc.
 export function nimToolchain(bundle) {
@@ -167,9 +167,11 @@ export function nimToolchain(bundle) {
 }
 
 // #958 — compile `source` as `prog.nim` with nimony's own driver and run what it builds:
-// `nimony t -r --isMain prog.nim`, one `temen_nim_open` session over `toolchain` ([`nimToolchain`])
-// that `driveCoopTierupRun` runs. The process tree (nimony, nifmake, nimsem, the shell) runs on the
-// interpreter, each leaf process (nifler2, hexer, the program itself) whole on the emitted tier
+// `nimony t -r --novalidate --isMain prog.nim`, one `temen_nim_open` session over `toolchain`
+// ([`nimToolchain`]) that `driveCoopTierupRun` runs. No plugin validator ships with the toolchain, so
+// `--novalidate` keeps nimony from warning about it at every plugin it builds. The process tree
+// (nimony, nifmake, nimsem, the shell) runs on the interpreter, each leaf process (nifler2, shoggoth,
+// the program itself) whole on the emitted tier
 // (#1896), and temen-link natively. Each build continues in the directory the engine's last one left
 // (#2099), so nimony redoes only what `source` changed. nimony prints nothing when a build succeeds,
 // so what the session prints is the program's. When the build fails, nothing is linked and what it
@@ -186,15 +188,15 @@ export async function nimCompileRun(ex, memory, toolchain, source) {
     return [p, bytes.length];
   };
   const { cwd } = toolchain;
-  // `nimcache/<stem>.temen/prog.temen`, `<stem>` nimony's for `prog.nim`, which lands on the stdout
+  // `nimcache/t/<stem>/prog.temen`, `<stem>` nimony's for `prog.nim`, which lands on the stdout
   // slot (read it only after the call: the slot moves).
   const stemLen = ex.temen_nim_module_suffix(...put(enc.encode('prog.nim')));
-  const program = enc.encode(`${cwd}/nimcache/${text(Number(ex.temen_stdout_ptr()), stemLen)}.temen/prog.temen`);
+  const program = enc.encode(`${cwd}/nimcache/t/${text(Number(ex.temen_stdout_ptr()), stemLen)}/prog.temen`);
   // A build continues in the directory the last one left (#2099), so the program there may be the
   // last build's: remove it, and the program after this build is this build's.
   ex.temen_nim_remove(...put(program));
   const files = registryBlob([...toolchain.files, [`${cwd}/prog.nim`, enc.encode(source)]]);
-  const argv = enc.encode(['bin/nimony', 't', '-r', '--isMain', 'prog.nim'].map((a) => `${a}\0`).join(''));
+  const argv = enc.encode(['bin/nimony', 't', '-r', '--novalidate', '--isMain', 'prog.nim'].map((a) => `${a}\0`).join(''));
   const args = [put(toolchain.nimony), put(toolchain.commands), put(files), put(argv), put(enc.encode(cwd))];
   const opened = ex.temen_nim_open(...args.flat(), suspendsLeaves ? 1 : 0);
   // The session holds its own copies of what it was opened with.

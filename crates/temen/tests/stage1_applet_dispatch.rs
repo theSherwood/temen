@@ -7,7 +7,7 @@
 //!
 //! The binary exports each applet by name, and the host grants each one's child image (#2219) under
 //! that name, so the shell looks a command up by name and spawns what it finds. BusyBox-multicall
-//! shape (a detached v1 record spawn with one named grant, + `join`), differential interp==JIT.
+//! shape (a detached spawn record spawn with one named grant, + `join`), differential interp==JIT.
 //!
 //! Gated `#![cfg(unix)]` like the other JIT differential suites (temen-jit's guard page is unix-only).
 #![cfg(unix)]
@@ -27,7 +27,7 @@ const TOKEN_AT: u64 = 16700;
 
 /// One module: parent (func 0) plus three applets — func 1 `true` (→0), func 2 `false` (→1), func 3
 /// `echo` (resolve `stdout`, write its 3 argv bytes, →3). The parent stores `token`, lays a `stdout`
-/// grant record, resolves `applet`, spawns it detached through a v1 record paid from its `Budget`
+/// grant record, resolves `applet`, spawns it detached through a spawn record paid from its `Budget`
 /// that carries the token as the args payload (it lands at the applet's `module_args_base`), joins,
 /// and returns its status.
 fn src(applet: &str, token: &[u8; 3]) -> String {
@@ -43,7 +43,7 @@ fn src(applet: &str, token: &[u8; 3]) -> String {
         grants_ptr: 16384,
         grants_n: 1,
         args: (TOKEN_AT, token.len() as u64),
-        ..SpawnRec::v1(0)
+        ..SpawnRec::default()
     };
     let args = module_args_base();
     format!(
@@ -58,13 +58,13 @@ block 0 (vinst: i32, vout: i32, vbud: i32) {{
 {stdout_grant}{seed}  vap = i64.const 16620
   val = i64.const {applet_len}
   vapp = self.resolve vap val
-  rrm = i64.const 17560
+  rrm = i64.const 17544
   i32.store rrm vapp
-  rrb = i64.const 17564
+  rrb = i64.const 17548
   i32.store rrb vbud
   rra0 = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (rra0)
-  r = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  r_st, r = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   return r
   }}
 }}
@@ -106,7 +106,7 @@ fn setup(applet: &str, token: &[u8; 3]) -> (Module, Host, [i32; 3]) {
     let m = parse_module(&src(applet, token)).expect("parse");
     verify_module(&m).expect("verify");
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, WIN as u64);
+    let ih = host.grant_instantiator();
     let oh = host.grant_stream(StreamRole::Out);
     let bh = host.grant_budget(-1, 1 << 20, -1);
     for e in &m.exports {

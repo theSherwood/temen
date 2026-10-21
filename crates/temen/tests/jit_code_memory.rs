@@ -8,11 +8,11 @@
 //! (`memory allocation of N bytes failed` → `0xc0000409`) or window commits failed
 //! (`os error 1455`) — the I3 Windows flake family.
 //!
-//! Linux-only: `/proc/self/status` is the cheap, deterministic observable. The Windows symptom
+//! Linux and Android only: `/proc/self/status` is the cheap, deterministic observable. The Windows symptom
 //! (commit exhaustion) is this same leak seen through eager commit charging, so pinning VA
 //! growth here covers both. (The whole file is gated — on other targets even the imports would
 //! trip `-D unused-imports`.)
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "android"))]
 
 #[path = "support/irgen.rs"]
 mod irgen;

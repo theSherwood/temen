@@ -10,7 +10,7 @@
 //! survives freeze/thaw through the value-typed re-grant path, and can be asked. These pin the three
 //! properties that makes true.
 
-use temen_interp::{cap_id, FreezeScope, Host, Lease, WINDOW_RUNS};
+use temen_interp::{cap_id, Host, Lease, WINDOW_RUNS};
 
 /// A 64 KiB detached window's lease on `budget`.
 fn window(budget: i32) -> Lease {
@@ -21,89 +21,22 @@ fn window(budget: i32) -> Lease {
     }
 }
 
-/// Authority over a range covers anything **inside** it — the same containment `AddressSpace` and
-/// `Instantiator` sub-ranges use, and what lets one grant over an instantiator's range cover every
-/// child carved from it rather than costing a handle-table slot per spawn.
-#[test]
-fn authority_covers_sub_ranges_not_just_the_exact_range() {
-    let mut h = Host::new();
-    let _ = h.grant_freeze_authority(FreezeScope::Carve {
-        base: 0x1000,
-        size: 0x1000,
-    });
-
-    assert!(
-        h.holds_freeze_authority(FreezeScope::Carve {
-            base: 0x1000,
-            size: 0x1000
-        }),
-        "the range itself"
-    );
-    assert!(
-        h.holds_freeze_authority(FreezeScope::Carve {
-            base: 0x1400,
-            size: 0x400
-        }),
-        "a carve inside it"
-    );
-    assert!(
-        h.holds_freeze_authority(FreezeScope::Carve {
-            base: 0x1fff,
-            size: 1
-        }),
-        "its last byte"
-    );
-
-    assert!(
-        !h.holds_freeze_authority(FreezeScope::Carve {
-            base: 0x0fff,
-            size: 1
-        }),
-        "one byte below"
-    );
-    assert!(
-        !h.holds_freeze_authority(FreezeScope::Carve {
-            base: 0x2000,
-            size: 1
-        }),
-        "one byte above"
-    );
-    assert!(
-        !h.holds_freeze_authority(FreezeScope::Carve {
-            base: 0x1000,
-            size: 0x1001
-        }),
-        "a range that overhangs the grant is not covered — partial authority is no authority"
-    );
-}
-
 /// **A domain nobody holds authority over is confidential.** That is the whole of the
 /// confidential/ancestor-freezable distinction (R1 §6): it is derived from the absence of a grant,
 /// not tracked as a state of its own, so there is nothing to keep in step.
 #[test]
 fn a_host_with_no_grant_holds_no_authority() {
-    let h = Host::new();
-    assert!(!h.holds_freeze_authority(FreezeScope::DetachedProgeny));
-    assert!(!h.holds_freeze_authority(FreezeScope::Carve {
-        base: 0,
-        size: u64::MAX
-    }));
-    assert!(!h.holds_freeze_authority(FreezeScope::Carve {
-        base: 0x1000,
-        size: 1
-    }));
+    assert!(!Host::new().holds_freeze_authority());
 }
 
-/// **It survives freeze/thaw.** A thawed parent must hold over its thawed child exactly what it held
-/// before — otherwise a round trip launders the domain's exposure away and `attest.freeze_exposed`
-/// starts lying about a window an ancestor can still read.
+/// **It survives freeze/thaw.** A thawed parent must hold over its thawed children exactly what it
+/// held before — otherwise a round trip launders their exposure away and `attest.freeze_exposed`
+/// starts lying, and a thawed parent loses the ability to freeze children it could freeze a moment
+/// earlier.
 #[test]
 fn authority_round_trips_through_the_durable_handle_capture() {
     let mut h = Host::new();
-    let handle = h.grant_freeze_authority(FreezeScope::Carve {
-        base: 0x2000,
-        size: 0x1000,
-    });
+    let _ = h.grant_freeze_authority();
 
     let captured = h
         .capture_durable_handles()
@@ -118,119 +51,32 @@ fn authority_round_trips_through_the_durable_handle_capture() {
     let mut thawed = Host::new();
     thawed.restore_durable_handles(&captured);
     assert!(
-        thawed.holds_freeze_authority(FreezeScope::Carve {
-            base: 0x2000,
-            size: 0x1000
-        }),
+        thawed.holds_freeze_authority(),
         "a thawed holder holds what it held before the freeze"
     );
-    assert!(
-        thawed.holds_freeze_authority(FreezeScope::Carve {
-            base: 0x2800,
-            size: 0x400
-        }),
-        "and the containment rule comes back with it"
-    );
-    let _ = handle;
 }
 
-/// **Detached-progeny authority is all-or-nothing, and separate from carve authority.** A detached
-/// child owns its own window, so no address range names it; holding authority over *ranges* therefore
-/// says nothing about whether the holder may freeze its detached children, and vice versa.
+/// #2018 — **an ancestor hands freeze authority down by grant**, the one way INVARIANTS' R1 ruling
+/// lets it reach a descendant. A durable detached child has no other source of it, and without it the
+/// shared admission refuses every detached spawn of its own, so a durable tree could never be deeper
+/// than one level. The parent keeps its own.
 #[test]
-fn detached_progeny_authority_is_its_own_scope() {
-    let mut carves = Host::new();
-    let _ = carves.grant_freeze_authority(FreezeScope::Carve {
-        base: 0,
-        size: u64::MAX,
-    });
-    assert!(
-        !carves.holds_freeze_authority(FreezeScope::DetachedProgeny),
-        "authority over every address in the window still does not reach a detached child — \
-         it lives outside that window entirely, which is what detached means"
-    );
-
-    let mut detached = Host::new();
-    let _ = detached.grant_freeze_authority(FreezeScope::DetachedProgeny);
-    assert!(detached.holds_freeze_authority(FreezeScope::DetachedProgeny));
-    assert!(
-        !detached.holds_freeze_authority(FreezeScope::Carve { base: 0, size: 1 }),
-        "and the reverse: detached-progeny authority confers nothing over the holder's own carves"
-    );
-}
-
-/// **A §14 nested spawn mints carve authority, never detached-progeny authority.**
-///
-/// This is the property that keeps detachment meaningful. A nested parent already reads its child's
-/// carve, so self-granting authority there documents a fact. A detached child's window is *not*
-/// readable by its parent, so authority over one is a real new power — and a parent able to mint it
-/// for itself at spawn would dissolve the isolation it just asked for. It has to come from above.
-///
-/// Pinned on `Host` directly rather than through a spawn, because the guarantee is about what the
-/// grant paths *can* produce: nothing in the host mints `DetachedProgeny`, and no guest-reachable op
-/// mints a capability at all, so the only way in is an embedder grant or a re-grant from an ancestor.
-#[test]
-fn nothing_self_mints_detached_progeny_authority() {
-    let mut h = Host::new();
-    // The shape the §14 nested spawn path mints (see `child_attestation`'s call site).
-    let _ = h.grant_freeze_authority(FreezeScope::Carve {
-        base: 0,
-        size: 1 << 20,
-    });
-    assert!(
-        !h.holds_freeze_authority(FreezeScope::DetachedProgeny),
-        "a spawn-minted carve grant must not confer authority over detached children"
-    );
-}
-
-/// Detached-progeny authority survives freeze/thaw like the carve scope does — otherwise a round trip
-/// would silently revoke it, and a thawed parent would lose the ability to freeze children it could
-/// freeze a moment earlier.
-#[test]
-fn detached_progeny_authority_round_trips() {
-    let mut h = Host::new();
-    let _ = h.grant_freeze_authority(FreezeScope::DetachedProgeny);
-
-    let captured = h
-        .capture_durable_handles()
-        .expect("detached-progeny authority is durable");
-    assert!(captured
-        .iter()
-        .any(|d| d.type_id == cap_id::FREEZE_AUTHORITY));
-
-    let mut thawed = Host::new();
-    thawed.restore_durable_handles(&captured);
-    assert!(thawed.holds_freeze_authority(FreezeScope::DetachedProgeny));
-}
-
-/// #2018 — **an ancestor hands detached-progeny authority down by grant**, the one way INVARIANTS' R1
-/// ruling lets it reach a descendant. A durable detached child has no other source of it, and without
-/// it the shared admission refuses every detached spawn of its own, so a durable tree could never be
-/// deeper than one level. The parent keeps its own, and the carve form, which names a range of the
-/// parent's window, is never handed down.
-#[test]
-fn detached_progeny_authority_is_handed_down_by_grant() {
+fn freeze_authority_is_handed_down_by_grant() {
     let mut parent = Host::new();
     parent.set_durable(true);
-    let progeny = parent.grant_freeze_authority(FreezeScope::DetachedProgeny);
-    let carve = parent.grant_freeze_authority(FreezeScope::Carve {
-        base: 0,
-        size: 1 << 16,
-    });
+    let authority = parent.grant_freeze_authority();
     let budget = parent.grant_budget(-1, 1 << 20, -1);
     let (mut child, _, _) = parent
         .spawn_detached_child(
-            &[("freeze".to_string(), progeny)],
+            &[("freeze".to_string(), authority)],
             1 << 16,
             window(budget),
             -1,
+            false,
         )
-        .expect("detached-progeny authority re-grants");
-    assert!(child.holds_freeze_authority(FreezeScope::DetachedProgeny));
-    assert!(
-        parent.holds_freeze_authority(FreezeScope::DetachedProgeny),
-        "the parent keeps its own"
-    );
+        .expect("freeze authority re-grants");
+    assert!(child.holds_freeze_authority());
+    assert!(parent.holds_freeze_authority(), "the parent keeps its own");
     let own = child
         .resolve_cap_name("budget")
         .expect("the child's budget");
@@ -240,22 +86,11 @@ fn detached_progeny_authority_is_handed_down_by_grant() {
     );
 
     let (mut bare, _, _) = parent
-        .spawn_detached_child(&[], 1 << 16, window(budget), -1)
+        .spawn_detached_child(&[], 1 << 16, window(budget), -1, false)
         .expect("spawn");
     let own = bare.resolve_cap_name("budget").expect("the child's budget");
     assert!(
         bare.admit_detached_spawn(window(own)).is_none(),
         "without the grant it holds none, and its detached spawn is refused"
-    );
-    assert!(
-        parent
-            .spawn_detached_child(
-                &[("freeze".to_string(), carve)],
-                1 << 16,
-                window(budget),
-                -1
-            )
-            .is_none(),
-        "the carve form is never handed down"
     );
 }

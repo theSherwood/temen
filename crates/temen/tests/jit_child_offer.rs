@@ -20,7 +20,7 @@ use temen_text::parse_module;
 use temen_verify::verify_module;
 
 /// Parent (func 0, `(Instantiator, Budget)`): spawn a same-module child (entry 1) detached through
-/// a v1 record paid from the `Budget`, mint `child_offer(child, export 0)` via op 14, return the
+/// a spawn record paid from the `Budget`, mint `child_offer(child, export 0)` via op 14, return the
 /// minted handle widened to i64 (negative = the errno). Child (func 1): returns 0. Func 2 is the
 /// `add` handler behind `export 0 interface "adder"`.
 const MINT_SRC: &str = r#"memory 17
@@ -30,9 +30,9 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vbud: i32, vmod: i32) {
-  vrm = i64.const 17560
+  vrm = i64.const 17544
   i32.store vrm vmod
-  vrb = i64.const 17564
+  vrb = i64.const 17548
   i32.store vrb vbud
   vrp = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
@@ -65,9 +65,9 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vbud: i32, vmod: i32) {
-  vrm = i64.const 17560
+  vrm = i64.const 17544
   i32.store vrm vmod
-  vrb = i64.const 17564
+  vrb = i64.const 17548
   i32.store vrb vbud
   vrp = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
@@ -104,9 +104,9 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vbud: i32, vmod: i32) {
-  vrm = i64.const 17560
+  vrm = i64.const 17544
   i32.store vrm vmod
-  vrb = i64.const 17564
+  vrb = i64.const 17548
   i32.store vrb vbud
   vrp = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
@@ -133,11 +133,11 @@ block 0 (va: i64, vb: i64) {
 /// `src` with its spawn record (at 17536), and a host for it: the parent's three args, an
 /// `Instantiator`, the `Budget` that pays for the child, and the child, func 1's child image (#2219).
 fn setup(src: &str) -> (Arc<Module>, Host, [i32; 3]) {
-    let src = format!("{src}{}", rec::segment(17536, &SpawnRec::v1(0)));
+    let src = format!("{src}{}", rec::segment(17536, &SpawnRec::default()));
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 128 << 10);
+    let ih = host.grant_instantiator();
     let bh = host.grant_budget(-1, 1 << 20, -1);
     let ch = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
     (Arc::new(m), host, [ih, bh, ch])
@@ -270,9 +270,9 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vbud: i32, vmod: i32) {
-  vrm = i64.const 17560
+  vrm = i64.const 17544
   i32.store vrm vmod
-  vrb = i64.const 17564
+  vrb = i64.const 17548
   i32.store vrb vbud
   vrp = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
@@ -290,7 +290,7 @@ block 2 (vh2: i32, vch2: i32, vin2: i32) {
   va = i64.const 40
   vb = i64.const 2
   vr = call.cap 268435456 0 (i64, i64) -> (i64) vh2 (va, vb)
-  vj = call.cap 6 1 (i32) -> (i64) vin2 (vch2)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vin2 (vch2)
   vk = i64.const 100
   vm = i64.mul vr vk
   vs = i64.add vm vj
@@ -322,9 +322,9 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vbud: i32, vmod: i32) {
-  vrm = i64.const 17560
+  vrm = i64.const 17544
   i32.store vrm vmod
-  vrb = i64.const 17564
+  vrb = i64.const 17548
   i32.store vrb vbud
   vrp = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
@@ -342,7 +342,7 @@ block 2 (vh2: i32, vch2: i32, vin2: i32) {
   va = i64.const 40
   vb = i64.const 2
   vr = call.cap 268435456 0 (i64, i64) -> (i64) vh2 (va, vb)
-  vj = call.cap 6 1 (i32) -> (i64) vin2 (vch2)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vin2 (vch2)
   vk = i64.const 100
   vm = i64.mul vr vk
   vs = i64.add vm vj
@@ -377,9 +377,9 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vbud: i32, vmod: i32) {
-  vrm = i64.const 17560
+  vrm = i64.const 17544
   i32.store vrm vmod
-  vrb = i64.const 17564
+  vrb = i64.const 17548
   i32.store vrb vbud
   vrp = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
@@ -397,7 +397,7 @@ block 2 (vh2: i32, vch2: i32, vin2: i32) {
   va = i64.const 40
   vb = i64.const 2
   vr = call.cap 268435456 0 (i64, i64) -> (i64) vh2 (va, vb)
-  vj = call.cap 6 1 (i32) -> (i64) vin2 (vch2)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vin2 (vch2)
   vk = i64.const 100
   vm = i64.mul vr vk
   vs = i64.add vm vj
@@ -477,13 +477,13 @@ fn a_childs_serve_nested_under_its_handler_is_refused() {
 }
 
 /// #2166 — like [`JOIN_SRC`], but the handler stores to `addr` before it answers, and the parent
-/// asks how the child ended with `Instantiator.wait` (op 18) rather than joining it. The parent
-/// returns `call * 100000 + wait`.
+/// returns `call * 100000 + status`: how the child ended, as its join answers it (#2066), rather than
+/// its value.
 fn faulting_handler_src(addr: u64) -> String {
     JOIN_SRC
         .replace(
-            "vj = call.cap 6 1 (i32) -> (i64) vin2 (vch2)\n  vk = i64.const 100\n",
-            "vj = call.cap 6 18 (i32) -> (i64) vin2 (vch2)\n  vk = i64.const 100000\n",
+            "vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vin2 (vch2)\n  vk = i64.const 100\n",
+            "vj, vj_v = call.cap 6 1 (i32) -> (i64, i64) vin2 (vch2)\n  vk = i64.const 100000\n",
         )
         .replace(
             "block 0 (va: i64, vb: i64) {\n  s = i64.add va vb\n",
@@ -494,7 +494,7 @@ fn faulting_handler_src(addr: u64) -> String {
 }
 
 /// #2166 — a serving child whose handler faults dies of it on every transport, as the oracle's does:
-/// its caller's call answers the dead-callee errno (`CAP_REVOKED`, -9) and `wait` reports the
+/// its caller's call answers the dead-callee errno (`CAP_REVOKED`, -9) and its join reports the
 /// child's `MemoryFault`. Both addresses fault: the NULL guard, and the first word past the child's
 /// mapped window (inside its reservation). The JIT's child routes used to lose the first fault (the
 /// child kept running) and not recover the second at all (the process died of SIGSEGV).
@@ -504,7 +504,7 @@ fn a_childs_faulting_handler_kills_the_child_on_every_transport() {
     for addr in [8u64, (128 << 10) + 8] {
         let src = faulting_handler_src(addr);
         assert!(
-            src.contains("call.cap 6 18") && src.contains("i64.store vbad va"),
+            src.contains("vj, vj_v = call.cap 6 1") && src.contains("i64.store vbad va"),
             "the rewrites must apply"
         );
         assert_eq!(run_interp_i64(&src), want, "interp, store at {addr}");

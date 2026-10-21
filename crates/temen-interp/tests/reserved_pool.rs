@@ -1,11 +1,11 @@
-//! #2305 — the process-wide pool of address space (`RESERVED_POOL`): every domain's window is held
+//! #2305 — the process-wide pool of address space (`reserved_pool`): every domain's window is held
 //! against it at its admission, which no grant bounds. Once the runs of a process hold it all, a run's
 //! activation, a detached spawn's admission and a fork's or a spawn's new process are each refused,
 //! charging nothing, and a domain that ends hands its window's reservation back. One test in its own
 //! binary: the pool is the process's, and tests in one binary share their process.
 
 use temen_interp::{
-    maps_pool, Host, Lease, RootWindow, SpawnPlan, MAPS_PER_DOMAIN, MAPS_PER_VCPU, RESERVED_POOL,
+    maps_pool, reserved_pool, Host, Lease, RootWindow, SpawnPlan, MAPS_PER_DOMAIN, MAPS_PER_VCPU,
     WINDOW_RUNS,
 };
 
@@ -38,8 +38,9 @@ fn hold() -> Option<Host> {
 
 #[test]
 fn the_pool_refuses_every_window_past_it_and_takes_back_what_ends() {
-    let slots = RESERVED_POOL / WINDOW;
-    if RESERVED_POOL == u64::MAX || maps_pool() < 2 * slots * (MAPS_PER_DOMAIN + MAPS_PER_VCPU) {
+    let pool = reserved_pool();
+    let slots = pool / WINDOW;
+    if pool == u64::MAX || maps_pool() < 2 * slots * (MAPS_PER_DOMAIN + MAPS_PER_VCPU) {
         eprintln!("skipped: no address-space pool, or a pool of mappings too small to fill it");
         return;
     }

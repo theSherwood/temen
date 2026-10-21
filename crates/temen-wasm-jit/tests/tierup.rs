@@ -8,8 +8,8 @@
 
 use temen_interp::{bytecode, Trap, Value};
 use temen_wasm_jit::{
-    compile_module_tierup, compile_module_tierup_b2, compile_module_tierup_live, TRAP_MEMORY_FAULT,
-    TRAP_OUT_OF_FUEL,
+    compile_module_tierup, compile_module_tierup_b2, compile_module_tierup_live, BounceHost,
+    TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL,
 };
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
@@ -400,7 +400,8 @@ fn widened_cross_tier_uncascades_the_caller() {
         vec![false, false, false],
         "local table: f1 cascades to the interpreter (f2 isn't a strict interp_leaf)"
     );
-    let (_, widened) = compile_module_tierup_b2(&m, false, 10, false).expect("B2 tier-up emit");
+    let (_, widened) =
+        compile_module_tierup_b2(&m, false, 10, BounceHost::default()).expect("B2 tier-up emit");
     assert_eq!(
         widened,
         vec![false, true, false],
@@ -475,7 +476,8 @@ fn futex_callee_is_not_a_widened_cross_tier_leaf() {
     );
     // B2 must now agree: f2 is not bounce-serviceable, so f1 cascades off rather than being emitted
     // into a bounce that CapFaults. Before #1370 this was `[false, true, false]`.
-    let (_, widened) = compile_module_tierup_b2(&m, false, 10, false).expect("B2 tier-up emit");
+    let (_, widened) =
+        compile_module_tierup_b2(&m, false, 10, BounceHost::default()).expect("B2 tier-up emit");
     assert_eq!(
         widened,
         vec![false, false, false],
@@ -493,8 +495,10 @@ fn the_futex_gate_does_not_narrow_the_888_widening() {
     let cap = build(CASCADE);
     // Identical shape (f0 interp-driven root, f1 pure compute calling f2); the ONLY difference is
     // what f2 does — futex ops vs a `call.cap`.
-    let (_, futex_widened) = compile_module_tierup_b2(&futex, false, 10, false).expect("B2 emit");
-    let (_, cap_widened) = compile_module_tierup_b2(&cap, false, 10, false).expect("B2 emit");
+    let (_, futex_widened) =
+        compile_module_tierup_b2(&futex, false, 10, BounceHost::default()).expect("B2 emit");
+    let (_, cap_widened) =
+        compile_module_tierup_b2(&cap, false, 10, BounceHost::default()).expect("B2 emit");
     assert_eq!(
         futex_widened,
         vec![false, false, false],
@@ -505,6 +509,174 @@ fn the_futex_gate_does_not_narrow_the_888_widening() {
         vec![false, true, false],
         "cap callee: f1 still emits — the #888 widening is intact"
     );
+}
+
+/// #2443 — a host whose bounce can wait for its task (executor 2's) serves the futex callee there,
+/// so its caller emits; a host that cannot keeps the #1370 cascade above.
+#[test]
+fn a_host_whose_bounce_parks_serves_the_futex_callee() {
+    let m = build(FUTEX_CALLEE);
+    let parks = BounceHost {
+        spill: false,
+        parks: true,
+    };
+    let (_, served) = compile_module_tierup_b2(&m, false, 10, parks).expect("B2 emit");
+    assert_eq!(
+        served,
+        vec![false, true, false],
+        "f1 emits, its futex callee f2 a cross-tier leaf whose wait parks the task"
+    );
+}
+
+/// f1 spawns a thread of f2, sums `n..1` in a loop, joins the thread, and adds what it returned.
+const SPAWN_AND_LOOP: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  vn = i64.const 1000
+  vr = call 1 (vn)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vn: i64) {
+  vz = i64.const 0
+  vt = thread.spawn 2 vz vz
+  v0 = i64.const 0
+  br 1(vn, v0, vt)
+}
+block 1 (vm: i64, vacc: i64, vt1: i32) {
+  vzero = i64.const 0
+  vdone = i64.eq vm vzero
+  br_if vdone 3(vacc, vt1) 2(vm, vacc, vt1)
+}
+block 2 (vk: i64, va: i64, vt2: i32) {
+  vs = i64.add va vk
+  v1 = i64.const 1
+  vk1 = i64.sub vk v1
+  br 1(vk1, vs, vt2)
+}
+block 3 (vsum: i64, vt3: i32) {
+  vj = thread.join vt3
+  vr = i64.add vsum vj
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v5 = i64.const 5
+  return v5
+  }
+}
+"#;
+
+/// #2443 — the outliner hoists a function's `thread.spawn` and `thread.join` into wrappers of their
+/// own, so where the host's bounce can wait for them the function's loop emits and only the two ops
+/// bounce. Where it cannot, the wrappers are seeds and the function stays interpreted, as before.
+#[test]
+fn outlined_scheduler_ops_keep_a_spawning_loop_emitted_where_bounces_park() {
+    let m = build(SPAWN_AND_LOOP);
+    let parks = BounceHost {
+        spill: false,
+        parks: true,
+    };
+    // Unoutlined, the spawner is outside the emitter's subset whatever the host.
+    let (_, unoutlined) = compile_module_tierup_b2(&m, false, 10, parks).expect("B2 emit");
+    assert!(!unoutlined[1], "an inline spawn keeps f1 interpreted");
+    let mut outlined = m.clone();
+    temen_wasm_jit::outline_cap_calls(&mut outlined);
+    assert_eq!(
+        outlined.funcs.len(),
+        5,
+        "a wrapper each for the spawn and the join, appended"
+    );
+    let (_, parked) = compile_module_tierup_b2(&outlined, false, 10, parks).expect("B2 emit");
+    assert_eq!(
+        parked,
+        vec![true, true, true, false, false],
+        "f1's loop emits; the spawn and join wrappers bounce"
+    );
+    let (_, pump) =
+        compile_module_tierup_b2(&outlined, false, 10, BounceHost::default()).expect("B2 emit");
+    assert_eq!(
+        pump,
+        vec![false, false, true, false, false],
+        "a host that cannot wait: f1 and its caller cascade off, as unoutlined"
+    );
+}
+
+/// f2 resumes a fiber running f3, which no call edge names: `cont.new` takes it as a funcref.
+fn resume_into(body: &str) -> String {
+    format!(
+        r#"
+memory 16
+func () -> (i64) {{
+block 0 () {{
+  vh = i32.const 0
+  vp = i64.const 0
+  vl = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vp, vl)
+  vx = i64.const 3
+  vr = call 1 (vx)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const 100
+  vsum = i64.add v0 vk
+  vr = call 2 (vsum)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vf = ref.func 3
+  vsp = i64.const 0
+  vk = cont.new vf vsp
+  vs, vv = cont.resume vk v0
+  return vv
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  {body}
+  return varg
+  }}
+}}
+"#
+    )
+}
+
+/// #2443 — a fiber the bounce's call resumes may run any function, and its stop cannot wait for
+/// the task even where the call's own can: interpreted, it would park the fiber alone. So in a
+/// module holding a scheduler op, a resume is a seed whatever the host, and f1 cascades off. With
+/// nothing a fiber could stop on, the resume stays a cross-tier leaf and f1 emits.
+#[test]
+fn a_resume_is_a_seed_where_a_fiber_may_stop() {
+    let notify = build(&resume_into(
+        "vaddr = i64.const 16384\n  vc = i32.const 1\n  vn = atomic.notify vaddr vc",
+    ));
+    let pure = build(&resume_into("vk = i64.const 2\n  vm = i64.mul varg vk"));
+    for host in [
+        BounceHost::default(),
+        BounceHost {
+            spill: false,
+            parks: true,
+        },
+    ] {
+        let (_, stops) = compile_module_tierup_b2(&notify, false, 10, host).expect("B2 emit");
+        assert_eq!(
+            stops,
+            vec![false, false, false, false],
+            "{host:?}: f1 cascades off"
+        );
+        let (_, runs) = compile_module_tierup_b2(&pure, false, 10, host).expect("B2 emit");
+        assert!(
+            runs[1],
+            "{host:?}: nothing a fiber could stop on, so f1 emits: {runs:?}"
+        );
+    }
 }
 
 /// #2248 — [`compile_module_tierup_live`], the cooperative driver's emit for a granted module a
@@ -556,9 +728,11 @@ block 0 (v0: i64) {
 fn the_live_emit_widens_but_keeps_its_own_dispatch() {
     let m = build(LIVE);
     let (_, local) = compile_module_tierup(&m, false).expect("local tier-up emit");
-    let (_, b2) = compile_module_tierup_b2(&m, false, 10, false).expect("B2 tier-up emit");
-    let (_, live) = compile_module_tierup_live(&m, false, None).expect("live tier-up emit");
-    let (_, paged) = compile_module_tierup_live(&m, false, Some(12)).expect("paged live emit");
+    let (_, b2) =
+        compile_module_tierup_b2(&m, false, 10, BounceHost::default()).expect("B2 tier-up emit");
+    let (_, live) = compile_module_tierup_live(&m, false, None, false).expect("live tier-up emit");
+    let (_, paged) =
+        compile_module_tierup_live(&m, false, Some(12), false).expect("paged live emit");
     assert_eq!(
         local,
         vec![false, false, false, false],
@@ -577,7 +751,7 @@ fn the_live_emit_widens_but_keeps_its_own_dispatch() {
     assert_eq!(paged, live, "paged, the same set");
     // The #1370 gate holds too: a callee a bounce cannot complete is no cross-tier leaf.
     let (_, futex) =
-        compile_module_tierup_live(&build(FUTEX_CALLEE), false, None).expect("live emit");
+        compile_module_tierup_live(&build(FUTEX_CALLEE), false, None, false).expect("live emit");
     assert_eq!(
         futex,
         vec![false, false, false],
@@ -612,7 +786,7 @@ block 0 (v0: i64) {{
 func (i64) -> (i64) {{
 block 0 (v0: i64) {{
   vh = i32.const 0
-  vw = {call}
+  {call}
   return v0
   }}
 }}
@@ -620,33 +794,42 @@ block 0 (v0: i64) {{
     )
 }
 
-/// #744, the fifth seed: a callee that spawns or joins a child, serves, or calls through a guest
-/// interface (a live offer may answer it) needs its task's scheduler, which a bounce does not have.
+/// #744: a callee that spawns or joins a child, serves, or calls through a guest interface (a live
+/// offer may answer it) needs its task's scheduler, which this host's bounce cannot wait for.
 /// So it is not a widened cross-tier leaf and its caller cascades off, as for a futex — while a
 /// stream write, the control row, still leaves f1 emitted.
 #[test]
 fn a_callee_that_needs_its_task_is_not_a_widened_cross_tier_leaf() {
     for (what, call, f1_emits) in [
-        ("a join", "call.cap 6 1 (i32) -> (i64) vh (vh)", false),
         (
-            "svc.wait",
-            "call.cap 4294967295 10 () -> (i64) vh ()",
+            "a join",
+            "vs, vw = call.cap 6 1 (i32) -> (i64, i64) vh (vh)",
             false,
         ),
-        ("svc.poll", "call.cap 4294967295 9 () -> (i64) vh ()", false),
+        (
+            "svc.wait",
+            "vw = call.cap 4294967295 10 () -> (i64) vh ()",
+            false,
+        ),
+        (
+            "svc.poll",
+            "vw = call.cap 4294967295 9 () -> (i64) vh ()",
+            false,
+        ),
         (
             "a guest-interface call",
-            "call.cap 268435456 0 (i64) -> (i64) vh (v0)",
+            "vw = call.cap 268435456 0 (i64) -> (i64) vh (v0)",
             false,
         ),
         (
             "a stream write",
-            "call.cap 0 1 (i64, i64) -> (i64) vh (v0, v0)",
+            "vw = call.cap 0 1 (i64, i64) -> (i64) vh (v0, v0)",
             true,
         ),
     ] {
         let m = build(&cascade_into(call));
-        let (_, widened) = compile_module_tierup_b2(&m, false, 10, false).expect("B2 emit");
+        let (_, widened) =
+            compile_module_tierup_b2(&m, false, 10, BounceHost::default()).expect("B2 emit");
         assert_eq!(widened, vec![false, f1_emits, false], "{what}");
     }
 }
@@ -701,7 +884,8 @@ fn a_futex_reaching_callee_closure_is_not_a_leaf() {
     // f2's own body is clean — only f3 carries the futex. The closure is what disqualifies it.
     assert!(!m.funcs[2].uses_futex(), "f2's own body must be clean");
     assert!(m.funcs[3].uses_futex(), "f3 carries the futex");
-    let (_, widened) = compile_module_tierup_b2(&m, false, 10, false).expect("B2 tier-up emit");
+    let (_, widened) =
+        compile_module_tierup_b2(&m, false, 10, BounceHost::default()).expect("B2 tier-up emit");
     assert_eq!(
         widened,
         vec![false, false, false, false],
@@ -747,7 +931,8 @@ block 0 (v0: i64) {
 fn a_suspending_callee_is_not_a_widened_cross_tier_leaf() {
     let m = build(SUSPEND_CALLEE);
     assert!(m.funcs[2].uses_suspend(), "f2 must carry the suspend");
-    let (_, widened) = compile_module_tierup_b2(&m, false, 10, false).expect("B2 tier-up emit");
+    let (_, widened) =
+        compile_module_tierup_b2(&m, false, 10, BounceHost::default()).expect("B2 tier-up emit");
     assert_eq!(
         widened,
         vec![false, false, false],
@@ -855,7 +1040,8 @@ fn an_indirect_caller_is_gated_only_when_the_module_has_an_unserviceable_op() {
     // With a futex op in the module, the indirect-dispatching callee f2 could reach it → not a leaf,
     // so f1 cascades off.
     let dirty = build(INDIRECT_DISPATCH);
-    let (_, widened) = compile_module_tierup_b2(&dirty, false, 10, false).expect("B2 tier-up emit");
+    let (_, widened) = compile_module_tierup_b2(&dirty, false, 10, BounceHost::default())
+        .expect("B2 tier-up emit");
     assert!(
         !widened[1],
         "an indirect callee may dispatch to the futex function, so its caller must cascade off: \
@@ -864,8 +1050,8 @@ fn an_indirect_caller_is_gated_only_when_the_module_has_an_unserviceable_op() {
 
     // Same module, nothing unserviceable: the indirect clause is dormant and f1 still emits.
     let clean = build(INDIRECT_DISPATCH_CLEAN);
-    let (_, widened_clean) =
-        compile_module_tierup_b2(&clean, false, 10, false).expect("B2 tier-up emit");
+    let (_, widened_clean) = compile_module_tierup_b2(&clean, false, 10, BounceHost::default())
+        .expect("B2 tier-up emit");
     assert!(
         widened_clean[1],
         "with no unserviceable op anywhere the indirect clause must not fire — the #888 widening \
@@ -890,7 +1076,7 @@ fn an_indirect_caller_is_gated_only_when_the_module_has_an_unserviceable_op() {
 /// * the **local** table's strict `interp_leaf` — a `gc.roots` body is marshallable, call-free,
 ///   cap-free and `Inst::Store`-free, so it qualified as a leaf on the predicate's own terms (the
 ///   `gc.roots` write is not a `Store`, and `uses_concurrency` does not cover the op);
-/// * the **B2** widened `cross` set, via [`bounce_serviceable`]'s fourth seed.
+/// * the **B2** widened `cross` set, via [`bounce_serviceable`]'s `gc.roots` seed.
 const GC_ROOTS_CALLEE: &str = r#"
 memory 16
 func () -> (i64) {
@@ -948,7 +1134,8 @@ fn gc_roots_callee_is_not_a_cross_tier_leaf_on_either_table() {
     );
     // B2 widened table: same verdict by the bounce-serviceable seed. Before #1546: `[false, true,
     // false]`.
-    let (_, widened) = compile_module_tierup_b2(&m, false, 10, false).expect("B2 tier-up emit");
+    let (_, widened) =
+        compile_module_tierup_b2(&m, false, 10, BounceHost::default()).expect("B2 tier-up emit");
     assert_eq!(
         widened,
         vec![false, false, false],

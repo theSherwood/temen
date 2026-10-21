@@ -1,30 +1,28 @@
-// Real-browser (V8) test for #1286 slice 3b: **concurrent detached children on the parallel Worker
-// driver**. A root vCPU (on its own Worker) holds an `Instantiator`, a child `Module` and a
-// `WindowMinter` (the §14 recipe + `minter`), and issues three §5 `instantiate_detached` (op 15) spawns
-// back to back — each child lands in its OWN fresh shared `WebAssembly.Memory` on its OWN Worker (the
-// spawning Worker mints the memory and posts it with the admitted child's ticket; the child's Worker
-// starts it, and the engine seeds the window; the page relays the Worker start) — then a fourth the
-// exhausted minter must refuse probeably (`-EINVAL`), then joins the three.
-// Each child reads the 8-byte payload the root passed at `module_args_base()`, `vm_map`s a page PAST
-// its declared 64 KiB window (the grow reaches the child memory through `Region::Foreign` →
+// Real-browser (V8) test for #1286 slice 3b: **concurrent detached children on the parallel driver**
+// (executor 2, #1414 B6-3c). A root (on its own Worker) holds an `Instantiator`, a child `Module` and a
+// `WindowMinter` (the §14 recipe + `minter`), and issues three §5 detached spawns (op-17 records)
+// back to back — each child lands in its OWN fresh shared `WebAssembly.Memory`, its thread on its OWN
+// Worker (the spawning thread's Worker mints the memory, and the Worker that runs the child's thread
+// is handed it) — then a fourth the exhausted minter must refuse probeably (`-EINVAL`), then joins the
+// three. Each child reads the 8-byte payload the root passed at `module_args_base()`, `vm_map`s a page
+// PAST its declared 64 KiB window (the grow reaches the child memory through `Region::Foreign` →
 // `foreign_grow`), stores/loads the word on the grown page and returns it + 1.
 //
 // The root returns Σ(word_i + 1) + h4 = (1001 + 2001 + 3001) - 22. Non-vacuity: `started === 4` — the
-// root and three child Workers were all created (the children are spawned before any join, so all
-// three run at once, each over its own memory).
+// root's and three children's Workers were all created (the children are spawned before any join, so
+// all three run at once), and `childMems === 3`, one thread over each child's own memory.
 //
-// #1865: the same run again with `instCodegen` — each child's entry runs on EMITTED wasm bound to its
-// own Memory. Its `vm_map` sits in a helper the emitted entry bounces to the child's own vCPU, so the
-// emitted store on the grown page passes only if the Worker re-read the child's `"mapped"` after the
-// bounce. Non-vacuity: `tierups === 3`, one per child that ran emitted.
+// #1865, #1414 ED-2: the same run again under `tierup` — each child's entry runs on its granted
+// module's EMITTED wasm over its own Memory. Its `vm_map` sits in a helper the emitted entry bounces to
+// the interpreter, so the emitted store on the grown page passes only if the Worker re-read the
+// child's `"mapped"` after the bounce. Non-vacuity: `tierups === 3`, one per child that ran emitted.
 //
 // Two more #1865 pins. A root's child that runs the root's own child image (granted as `"child"`)
-// stays on the interpreter under `instCodegen` even though the granted unit emits functions at the same
-// indices: only a child whose program is the unit runs the unit's emit. And a carve spawn (op 0) fails
-// closed.
+// runs that image's emit under `tierup` and answers its func 1 (7), though the granted unit's func 1
+// answers 9: a child runs the emit of its own program only. And a carve spawn (op 0) fails closed.
 //
 // #2251: a plain root that returns its `self.parallelism` answers the page's core count
-// (`navigator.hardwareConcurrency`), since this driver gives each vCPU its own Worker.
+// (`navigator.hardwareConcurrency`): each of the run's threads gets a Worker of its own.
 import { startServer } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -47,9 +45,26 @@ page.on('console', (m) => { if (m.type() === 'error' && !benign(m.text())) error
 await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 
 // The root: v0 Instantiator, v1 the child Module, v2 the WindowMinter. Three payload words at
-// 18432/18440/18448 (above the 16 KiB NULL guard), three 9-arg spawns (payload `(addr, 8)`), one 7-arg
-// spawn the minter refuses, three joins.
-const OP15 = 'call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq, ';
+// 18432/18440/18448 (above the 16 KiB NULL guard), three spawns with a payload `(addr, 8)`, one without
+// that the minter refuses, three joins.
+//
+// `spawn(dst, at, payload)`: a spawn record (op 17) laid at `at` by stores, then the spawn into
+// `dst`: a 64 KiB window, no pager, the child Module (v1) paid from the minter (v2), no region, and
+// the 8-byte payload at `payload` if there is one. Every field left 0 is none.
+const spawn = (dst, at, payload) => `  ${dst}a = i64.const ${at}
+  ${dst}l = i32.const 16
+  i32.store ${dst}a ${dst}l
+  ${dst}n = i32.const -1
+  i32.store ${dst}a ${dst}n offset=4
+  i32.store ${dst}a v1 offset=8
+  i32.store ${dst}a v2 offset=12
+  i32.store ${dst}a ${dst}n offset=48
+${payload === undefined ? '' : `  ${dst}p = i64.const ${payload}
+  i64.store ${dst}a ${dst}p offset=32
+  ${dst}s = i64.const 8
+  i64.store ${dst}a ${dst}s offset=40
+`}  ${dst} = call.cap 6 17 (i64) -> (i32) v0 (${dst}a)
+`;
 const ROOT_SRC = `memory 16
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
@@ -62,20 +77,9 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vb2 = i64.const 18448
   vw2 = i64.const 3000
   i64.store vb2 vw2
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 16
-  vq = i64.const 0
-  vl = i64.const 8
-  vh0 = ${OP15}vb0, vl)
-  vh1 = ${OP15}vb1, vl)
-  vh2 = ${OP15}vb2, vl)
-  vh3 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
-  vr0 = call.cap 6 1 (i32) -> (i64) v0 (vh0)
-  vr1 = call.cap 6 1 (i32) -> (i64) v0 (vh1)
-  vr2 = call.cap 6 1 (i32) -> (i64) v0 (vh2)
+${spawn('vh0', 17408, 18432)}${spawn('vh1', 17496, 18440)}${spawn('vh2', 17584, 18448)}${spawn('vh3', 17672)}  vr0_st, vr0 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh0)
+  vr1_st, vr1 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh1)
+  vr2_st, vr2 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh2)
   vs0 = i64.add vr0 vr1
   vs1 = i64.add vs0 vr2
   vh3x = i64.extend_i32_s vh3
@@ -118,9 +122,9 @@ block 0 () {
 const CHILD_LOG2 = 16, CHILD_GROWTH = 16384;
 const MINTER_QUOTA = 3 * ((1 << CHILD_LOG2) + CHILD_GROWTH);
 // #1865: the root spawns a copy of itself — its child image, which starts at its `_child` export
-// (func 1, → 7), granted as `"child"` (#2219) — through an op-17 v1 record and joins it, with a
+// (func 1, → 7), granted as `"child"` (#2219) — through an op-17 record and joins it, with a
 // granted unit whose func 1 (→ 9) is emitted. Only a child that runs the granted unit may run its
-// emit, so with `instCodegen` this child stays interpreted: 7, no emitted children.
+// emit, so under `tierup` this child runs its own image's emit and answers 7.
 const SELF_ROOT_SRC = `memory 16
 data 17504 "child"
 export 0 func "_child" 1
@@ -130,20 +134,17 @@ block 0 (v0: i32, vm: i32, vbud: i32) {
   vcl = i64.const 5
   vchild = self.resolve vcp vcl
   vr0 = i64.const 17408
-  vf0 = i64.const 1
+  vf0 = i64.const -4294967296
   i64.store vr0 vf0
-  vr2 = i64.const 17424
-  vf2 = i64.const -4294967296
-  i64.store vr2 vf2
-  vr3 = i64.const 17432
-  i32.store vr3 vchild
-  vr3b = i64.const 17436
-  i32.store vr3b vbud
-  vr9 = i64.const 17480
+  vr1 = i64.const 17416
+  i32.store vr1 vchild
+  vr1b = i64.const 17420
+  i32.store vr1b vbud
+  vr6 = i64.const 17456
   vnone = i32.const -1
-  i32.store vr9 vnone
+  i32.store vr6 vnone
   vh = call.cap 6 17 (i64) -> (i32) v0 (vr0)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vr
   }
 }
@@ -168,7 +169,7 @@ block 0 (v0: i64) {
   }
 }
 `;
-// A §14 carve spawn (op 0) fails closed on the par driver as on every engine, a `CapFault` trap
+// A §14 carve spawn (op 0) fails closed on the parallel driver as on every engine, a `CapFault` trap
 // (#1867).
 const CARVE_ROOT_SRC = `memory 20
 func (i32) -> (i64) {
@@ -178,7 +179,7 @@ block 0 (v0: i32) {
   vslog = i64.const 16
   vq = i64.const 0
   vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (ve, voff, vslog, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vr
   }
 }
@@ -203,7 +204,7 @@ block 0 () {
 
 const res = await page.evaluate(async ({ rootSrc, childSrc, minter, selfRootSrc, nineUnitSrc, carveRootSrc, cpusSrc }) => {
   const { loadEngine, makeRunner } = await import('./par.js');
-  const once = async (eng, codegen = false, src = { root: rootSrc, child: childSrc, minter }) => {
+  const once = async (eng, emitted = false, src = { root: rootSrc, child: childSrc, minter }) => {
   const ex = eng.ex, memory = eng.memory;
   const u8 = () => new Uint8Array(memory.buffer);
   const parse = (src) => {
@@ -218,11 +219,13 @@ const res = await page.evaluate(async ({ rootSrc, childSrc, minter, selfRootSrc,
   };
   const root = parse(src.root), child = src.child ? parse(src.child) : null;
   const run = makeRunner(eng);
+  // The children's entries are short: the emitted runs' engines tier up every eligible call at its
+  // start (#2474), as coop's own tests do.
+  if (emitted) ex.temen_coop_set_hotness(0, 0);
   try {
-    const { value, started, tierups } = await run(root, src.plain ? { x2: !!src.x2 } : codegen
-      ? { instCodegen: true, unit: child, minter: src.minter, winSize: src.winSize }
-      : { inst: true, unit: child, minter: src.minter, winSize: src.winSize });
-    return { value: value.toString(), started, tierups };
+    const { value, started, tierups, childMems } = await run(root, src.plain ? {}
+      : { inst: true, unit: child, minter: src.minter, winSize: src.winSize, tierup: emitted });
+    return { value: value.toString(), started, tierups, childMems };
   } catch (e) {
     return { err: String(e && e.message ? e.message : e) };
   }
@@ -239,9 +242,8 @@ const res = await page.evaluate(async ({ rootSrc, childSrc, minter, selfRootSrc,
   const self = await once(await loadEngine(fresh), true, { root: selfRootSrc, child: nineUnitSrc, minter: 1 << 16 });
   const carve = await once(await loadEngine(fresh), false, { root: carveRootSrc, child: null, minter: 0, winSize: 1 << 20 });
   const cpus = await once(await loadEngine(fresh), false, { root: cpusSrc, child: null, plain: true });
-  const cpusX2 = await once(await loadEngine(fresh), false, { root: cpusSrc, child: null, plain: true, x2: true });
   const cores = String(navigator.hardwareConcurrency || 1);
-  return { ...first, second, emitted, self, carve, cpus, cpusX2, cores, reused: fresh.module === eng.module, freshMemory: fresh.memory !== eng.memory && freshBytes < usedBytes };
+  return { ...first, second, emitted, self, carve, cpus, cores, reused: fresh.module === eng.module, freshMemory: fresh.memory !== eng.memory && freshBytes < usedBytes };
 }, { rootSrc: ROOT_SRC, childSrc: CHILD_SRC, minter: MINTER_QUOTA, selfRootSrc: SELF_ROOT_SRC, nineUnitSrc: NINE_UNIT_SRC, carveRootSrc: CARVE_ROOT_SRC, cpusSrc: CPUS_SRC });
 
 await browser.close();
@@ -253,16 +255,15 @@ const again = res.second && !res.second.err && res.second.value === EXPECT && re
 const em = res.emitted;
 const emittedOk = em && !em.err && em.value === EXPECT && em.started === 4 && em.tierups === 3;
 const sf = res.self, cv = res.carve;
-const selfOk = sf && !sf.err && sf.value === '7' && sf.tierups === 0;
+const selfOk = sf && !sf.err && sf.value === '7' && sf.tierups === 1;
 const carveOk = cv && cv.err === 'guest trap: CapFault';
-const cpusOk = [res.cpus, res.cpusX2].every((c) => c && !c.err && c.value === res.cores);
-const ok = errors.length === 0 && !res.err && res.value === EXPECT && res.started === 4 && again && res.reused && res.freshMemory && emittedOk && selfOk && carveOk && cpusOk;
-console.log(`  detached children across Workers: value ${res.value}/${EXPECT} workers ${res.started}/4${res.err ? ` · ERR ${res.err}` : ''}`);
+const cpusOk = res.cpus && !res.cpus.err && res.cpus.value === res.cores;
+const ok = errors.length === 0 && !res.err && res.value === EXPECT && res.started === 4 && res.childMems === 3 && again && res.reused && res.freshMemory && emittedOk && selfOk && carveOk && cpusOk;
+console.log(`  detached children across Workers: value ${res.value}/${EXPECT} workers ${res.started}/4 threads over a child's own memory ${res.childMems}/3${res.err ? ` · ERR ${res.err}` : ''}`);
 console.log(`  again on loadEngine(prev): value ${res.second?.value}/${EXPECT} · compiled module reused ${res.reused} · fresh memory ${res.freshMemory}`);
 console.log(`  on emitted wasm: value ${em?.value}/${EXPECT} workers ${em?.started}/4 emitted children ${em?.tierups}/3${em?.err ? ` · ERR ${em.err}` : ''}`);
-console.log(`  own-module child under instCodegen: value ${sf?.value}/7 emitted ${sf?.tierups}/0${sf?.err ? ` · ERR ${sf.err}` : ''}`);
+console.log(`  own-module child under tierup: value ${sf?.value}/7 emitted ${sf?.tierups}/1${sf?.err ? ` · ERR ${sf.err}` : ''}`);
 console.log(`  carve spawn: ${carveOk ? 'fails closed' : `NOT refused (${cv?.err ?? cv?.value})`}`);
 console.log(`  self.parallelism: ${res.cpus?.value}/${res.cores} (the page's core count)${res.cpus?.err ? ` · ERR ${res.cpus.err}` : ''}`);
-console.log(`  self.parallelism on the parallel driver: ${res.cpusX2?.value}/${res.cores}${res.cpusX2?.err ? ` · ERR ${res.cpusX2.err}` : ''}`);
 console.log(ok ? 'PASS — three detached children ran concurrently, each on its own Worker in its own WebAssembly.Memory, grew it on vm_map, and the exhausted minter refused a fourth' : 'FAIL');
 process.exit(ok ? 0 : 1);

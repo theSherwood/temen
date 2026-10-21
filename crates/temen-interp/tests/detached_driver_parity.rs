@@ -1,4 +1,5 @@
-//! **#1528 — every run loop services `instantiate_detached` (op 15), and they agree.**
+//! **#1528 — every run loop services a detached spawn (an `instantiate_rec` record, op 17), and
+//! they agree.**
 //!
 //! The tree-walker hosts detached windows itself (`detached_windows.rs`); the resumable engine
 //! surfaces the spawn as an event (`detached_engine.rs`). The three run loops that *drive* the
@@ -17,27 +18,47 @@
 //! ABI, and a powerbox `_start` (no params) returning an `i32` status (read back sign-extended) or
 //! nothing (read back as `0`). A card module nests as built through exactly these arms.
 
+#[path = "support/rec.rs"]
+mod rec;
+
 use std::sync::Arc;
 use temen_interp::bytecode::{self, SchedStop, ScheduledDebugRun};
 use temen_interp::{run_with_host, Host, Region, StreamRole, Trap, Value};
+use temen_ir::SpawnRec;
 
-/// The parent: `v0` Instantiator, `v1` a granted `Module`, `v2` a detached-spawn `Budget`. Issues
-/// op 15 (the 7-arg form) and `join`s the child, returning what the child returned.
-const PARENT: &str = r#"memory 16
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 15
-  vq = i64.const 0
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vr
-  }
+/// A spawn record for a `memory 15` child, granted the `grants_n` records at `grants_ptr`. Each
+/// parent below stores the child's module and `Budget` handles into it at run time.
+fn record(grants_ptr: u64, grants_n: u64) -> SpawnRec {
+    SpawnRec {
+        size_log2: 15,
+        grants_ptr,
+        grants_n,
+        ..SpawnRec::default()
+    }
 }
-"#;
+
+/// The parent: `v0` Instantiator, `v1` a granted `Module`, `v2` a detached-spawn `Budget`. Spawns
+/// from its spawn record at 17408 (no grants, no payload) and `join`s the child, returning what the
+/// child returned.
+fn parent() -> String {
+    format!(
+        r#"memory 16
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vma = i64.const 17416
+  i32.store vma v1
+  vba = i64.const 17420
+  i32.store vba v2
+  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
+  return vr
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(17408, &record(0, 0)),
+    )
+}
 
 /// The children, one per admitted entry shape, each over its own `memory 15` window, with what the
 /// parent's `join` reads back. The child-entry one stores and reloads a word in its fresh window
@@ -92,7 +113,7 @@ fn for_each_child(
     for (shape, text, answer) in CHILDREN {
         check(
             shape,
-            &module(PARENT),
+            &module(&parent()),
             &module(text),
             Ok(vec![Value::I64(answer)]),
         );
@@ -105,9 +126,9 @@ fn module(text: &str) -> temen_ir::Module {
     m
 }
 
-/// Grant the three caps op 15 needs and hand back the argument vector.
-fn powerbox(host: &mut Host, child: &temen_ir::Module, window: u64) -> Vec<Value> {
-    let inst = host.grant_instantiator(0, window);
+/// Grant the three caps a detached spawn needs and hand back the argument vector.
+fn powerbox(host: &mut Host, child: &temen_ir::Module) -> Vec<Value> {
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(child);
     let budget = host.grant_budget(-1, 1 << 20, -1);
     vec![Value::I32(inst), Value::I32(modh), Value::I32(budget)]
@@ -130,7 +151,7 @@ fn shared_window(size: u64) -> (Arc<Region>, *mut u8, std::alloc::Layout) {
 fn the_tree_walk_oracle_spawns_and_joins_a_detached_child() {
     for_each_child(|shape, parent, child, want| {
         let mut host = Host::new();
-        let args = powerbox(&mut host, child, 1 << 16);
+        let args = powerbox(&mut host, child);
         let mut fuel = u64::MAX;
         let result = run_with_host(parent, 0, &args, &mut fuel, &mut host);
         assert_eq!(result, want, "{shape}");
@@ -141,7 +162,7 @@ fn the_tree_walk_oracle_spawns_and_joins_a_detached_child() {
 fn the_cooperative_executor_spawns_and_joins_a_detached_child() {
     for_each_child(|shape, parent, child, want| {
         let mut host = Host::new();
-        let args = powerbox(&mut host, child, 1 << 16);
+        let args = powerbox(&mut host, child);
         let mut fuel = u64::MAX;
         let result = bytecode::compile_and_run_with_host(parent, 0, &args, &mut fuel, &mut host)
             .expect("the cooperative executor runs this module");
@@ -156,7 +177,7 @@ fn the_cooperative_executor_spawns_and_joins_a_detached_child() {
 fn the_parallel_driver_spawns_and_joins_a_detached_child() {
     for_each_child(|shape, parent, child, want| {
         let mut host = Host::new();
-        let args = powerbox(&mut host, child, 1 << 16);
+        let args = powerbox(&mut host, child);
         let (back, base, layout) = shared_window(1 << 16);
         let mut fuel = u64::MAX;
 
@@ -187,7 +208,7 @@ fn the_parallel_driver_spawns_and_joins_a_detached_child() {
 fn the_debug_scheduler_spawns_and_joins_a_detached_child() {
     for_each_child(|shape, parent, child, want| {
         let mut host = Host::new();
-        let args = powerbox(&mut host, child, 1 << 16);
+        let args = powerbox(&mut host, child);
         let mut run = ScheduledDebugRun::new_with_host(parent, 0, &args, host).expect("in subset");
         let mut fuel = u64::MAX;
 
@@ -195,7 +216,7 @@ fn the_debug_scheduler_spawns_and_joins_a_detached_child() {
             match run.run_until_stop(&mut fuel) {
                 SchedStop::Finished(r) => break r,
                 SchedStop::Break { .. } => continue,
-                other => panic!("{shape}: the debug scheduler must drive op 15, got {other:?}"),
+                other => panic!("{shape}: the debug scheduler must drive op 17, got {other:?}"),
             }
         };
         assert_eq!(result, want, "{shape}");
@@ -210,13 +231,16 @@ fn the_debug_scheduler_spawns_and_joins_a_detached_child() {
 // stream from one position. With stdin `abc`: the parent reads `a`, the child reads `b` and writes it
 // to its re-granted stdout, then the parent reads `c` — on every runner.
 
-/// Params `(inst, module, budget, stdin, stdout)`. Reads one byte, spawns the child (op 15) with
-/// `{"stdin", "stdout"}` re-granted by name, joins it, reads one more byte and returns it.
-const STDIO_PARENT: &str = r#"memory 16
+/// Params `(inst, module, budget, stdin, stdout)`. Reads one byte, spawns the child (its spawn record
+/// at 17536) with `{"stdin", "stdout"}` re-granted by name, joins it, reads one more byte and
+/// returns it.
+fn stdio_parent() -> String {
+    format!(
+        r#"memory 16
 data 17472 "stdin"
 data 17480 "stdout"
-func (i32, i32, i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32, vin: i32, vout: i32) {
+func (i32, i32, i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32, vin: i32, vout: i32) {{
   vb0 = i64.const 16384
   vone = i64.const 1
   vr0 = call.cap 0 0 (i64, i64) -> (i64) vin (vb0, vone)
@@ -232,21 +256,23 @@ block 0 (v0: i32, v1: i32, v2: i32, vin: i32, vout: i32) {
   vg1h = i64.const 17432
   vout64 = i64.extend_i32_u vout
   i64.store vg1h vout64
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vgn = i64.const 2
-  ve = i64.const 0
-  vlog = i64.const 15
-  vq = i64.const 0
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vg0, vgn, ve, vlog, vq)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vma = i64.const 17544
+  i32.store vma v1
+  vba = i64.const 17548
+  i32.store vba v2
+  vrp = i64.const 17536
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   vb1 = i64.const 16392
   vr1 = call.cap 0 0 (i64, i64) -> (i64) vin (vb1, vone)
   vc = i64.load vb1
   return vc
-  }
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(17536, &record(17408, 2)),
+    )
 }
-"#;
 
 /// A powerbox `_start` child: resolves the stdin and stdout it was granted, copies one byte across.
 const STDIO_CHILD: &str = r#"memory 15
@@ -275,7 +301,7 @@ block 0 () {
 fn stdio_host(child: &temen_ir::Module) -> (Host, Vec<Value>) {
     let mut host = Host::new();
     host.stdin = b"abc".to_vec();
-    let mut args = powerbox(&mut host, child, 1 << 16);
+    let mut args = powerbox(&mut host, child);
     args.push(Value::I32(host.grant_stream(StreamRole::In)));
     args.push(Value::I32(host.grant_stream(StreamRole::Out)));
     (host, args)
@@ -330,7 +356,7 @@ fn on_every_runner(
             SchedStop::Finished(r) => break Some(r),
             SchedStop::Break { .. } => continue,
             SchedStop::Declined => break None,
-            other => panic!("the debug scheduler must drive op 15, got {other:?}"),
+            other => panic!("the debug scheduler must drive op 17, got {other:?}"),
         }
     };
     out.push(("debug scheduler", r, run.host_mut().take_stdout()));
@@ -339,7 +365,7 @@ fn on_every_runner(
 
 #[test]
 fn a_child_reads_its_parents_stdin_from_where_the_parent_left_it_on_every_runner() {
-    let (parent, child) = (module(STDIO_PARENT), module(STDIO_CHILD));
+    let (parent, child) = (module(&stdio_parent()), module(STDIO_CHILD));
     for (runner, r, stdout) in on_every_runner(&parent, || stdio_host(&child)) {
         assert_eq!(
             (r, stdout),
@@ -356,12 +382,15 @@ fn a_child_reads_its_parents_stdin_from_where_the_parent_left_it_on_every_runner
 // write end is gone — the parent's, closed explicitly, and the writer's, released when the writer's
 // domain finishes. A runner that skipped that release would park the reader forever.
 
-/// Params `(inst, writer, reader, budget)`. Returns `reader * 1000 + writer`.
-const PIPE_PARENT: &str = r#"memory 16
+/// Params `(inst, writer, reader, budget)`. Spawns the writer from its spawn record at 17536 and the
+/// reader from its own at 17664. Returns `reader * 1000 + writer`.
+fn pipe_parent() -> String {
+    format!(
+        r#"memory 16
 data 17472 "stdin"
 data 17480 "stdout"
-func (i32, i32, i32, i32) -> (i64) {
-block 0 (v0: i32, vmw: i32, vmr: i32, vbud: i32) {
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, vmw: i32, vmr: i32, vbud: i32) {{
   vfds = i64.const 16896
   vz = i32.const 0
   vpm = call.cap 4294967295 16 (i64) -> (i32) vz (vfds)
@@ -380,26 +409,33 @@ block 0 (v0: i32, vmw: i32, vmr: i32, vbud: i32) {
   vg1h = i64.const 17432
   vrd64 = i64.extend_i32_u vrd
   i64.store vg1h vrd64
-  vmin = i64.extend_i32_u vbud
-  vgn = i64.const 1
-  ve = i64.const 0
-  vlog = i64.const 15
-  vq = i64.const 0
-  vmw64 = i64.extend_i32_u vmw
-  vhw = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmw64, vg0, vgn, ve, vlog, vq)
-  vmr64 = i64.extend_i32_u vmr
-  vhr = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmr64, vg1, vgn, ve, vlog, vq)
+  vwma = i64.const 17544
+  i32.store vwma vmw
+  vwba = i64.const 17548
+  i32.store vwba vbud
+  vwrp = i64.const 17536
+  vhw = call.cap 6 17 (i64) -> (i32) v0 (vwrp)
+  vrma = i64.const 17672
+  i32.store vrma vmr
+  vrba = i64.const 17676
+  i32.store vrba vbud
+  vrrp = i64.const 17664
+  vhr = call.cap 6 17 (i64) -> (i32) v0 (vrrp)
   vcr = call.cap 0 2 () -> (i64) vrd ()
   vcw = call.cap 0 2 () -> (i64) vwr ()
-  vjr = call.cap 6 1 (i32) -> (i64) v0 (vhr)
-  vjw = call.cap 6 1 (i32) -> (i64) v0 (vhw)
+  vjr_st, vjr = call.cap 6 1 (i32) -> (i64, i64) v0 (vhr)
+  vjw_st, vjw = call.cap 6 1 (i32) -> (i64, i64) v0 (vhw)
   vk = i64.const 1000
   vs = i64.mul vjr vk
   vt = i64.add vs vjw
   return vt
-  }
+  }}
+}}
+{writer}{reader}"#,
+        writer = rec::segment(17536, &record(17408, 1)),
+        reader = rec::segment(17664, &record(17424, 1)),
+    )
 }
-"#;
 
 /// Writes `hello, pipe\n` (12 bytes) to its `stdout`; returns what the write returned.
 const PIPE_WRITER: &str = r#"memory 15
@@ -452,13 +488,13 @@ block 3 (h3: i32, tot3: i64, n: i64) {
 #[test]
 fn a_pipe_between_two_detached_children_reaches_eof_on_every_runner() {
     let (parent, writer, reader) = (
-        module(PIPE_PARENT),
+        module(&pipe_parent()),
         module(PIPE_WRITER),
         module(PIPE_READER),
     );
     let host = || {
         let mut h = Host::new();
-        let inst = h.grant_instantiator(0, 1 << 16);
+        let inst = h.grant_instantiator();
         let mw = h.grant_module(&writer);
         let mr = h.grant_module(&reader);
         let budget = h.grant_budget(-1, 1 << 20, -1);

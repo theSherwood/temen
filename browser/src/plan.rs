@@ -61,7 +61,7 @@ pub struct Pipe {
     pub to_name: String,
 }
 
-/// One §14 child: a module the host grants the root (func 0 is its entry), run detached (op 17 v1) in
+/// One §14 child: a module the host grants the root (func 0 is its entry), run detached (op 17) in
 /// a fresh window paid from the root's budget.
 pub struct Node {
     /// The node's window, `1 << window_log2` bytes.
@@ -91,7 +91,9 @@ impl Plan {
     }
 
     /// The root guest's Temen IR text. Its params are `(inst, module_0 … module_{n-1}, budget, cap_0 …)`
-    /// — the order [`root_args`](Self::root_args) builds. `Err` names what does not fit or resolve.
+    /// — the order [`root_args`](Self::root_args) builds. It joins every node and returns how the last
+    /// one ended, `(status, value)` as its join answers it (#2066), which [`outcome`] reads back. `Err`
+    /// names what does not fit or resolve.
     pub fn root_src(&self) -> Result<String, String> {
         let n = self.nodes.len();
         if n == 0 {
@@ -214,7 +216,7 @@ impl Plan {
         if REC_BASE + r * SLOT > NAME_BASE {
             return Err(format!("{r} grant records do not fit"));
         }
-        // Spawn every node (op 17 v1: its own window, paid from the budget), then join every node.
+        // Spawn every node (op 17: its own window, paid from the budget), then join every node.
         let sfx = |k: usize| {
             if k == 0 {
                 String::new()
@@ -231,7 +233,7 @@ impl Plan {
                 grants_ptr: first_rec[k],
                 grants_n: rec_n[k] as u64,
                 args: (argv_at[k].0, argv_at[k].1 as u64),
-                ..temen_ir::SpawnRec::v1(0)
+                ..temen_ir::SpawnRec::default()
             };
             let (seg, stores) =
                 spawn_rec_ir(at, &rec, &format!("v{}", 1 + k), &format!("v{}", 1 + n));
@@ -253,7 +255,7 @@ impl Plan {
         for k in 0..n {
             let s = sfx(k);
             body.push_str(&format!(
-                "  vr{s} = call.cap 6 1 (i32) -> (i64) v0 (vh{s})\n"
+                "  vs{s}, vr{s} = call.cap 6 1 (i32) -> (i64, i64) v0 (vh{s})\n"
             ));
         }
         let params = 2 + n + self.caps.len();
@@ -263,8 +265,8 @@ impl Plan {
             .collect::<Vec<_>>()
             .join(", ");
         Ok(format!(
-            "memory {ROOT_WINDOW_LOG2}\n{data}func ({sig}) -> (i64) {{\nblock 0 ({bparams}) {{\n{records}{body}  \
-             return vr{last}\n  }}\n}}\n",
+            "memory {ROOT_WINDOW_LOG2}\n{data}func ({sig}) -> (i64, i64) {{\nblock 0 ({bparams}) {{\n{records}{body}  \
+             return vs{last}, vr{last}\n  }}\n}}\n",
             last = sfx(n - 1),
         ))
     }
@@ -280,7 +282,7 @@ impl Plan {
     pub fn root_args(&self, host: &mut Host, modules: &[&Module], caps: &[i32]) -> Vec<Value> {
         debug_assert_eq!(modules.len(), self.nodes.len());
         debug_assert_eq!(caps.len(), self.caps.len());
-        let inst = host.grant_instantiator(0, 1u64 << ROOT_WINDOW_LOG2);
+        let inst = host.grant_instantiator();
         let mods: Vec<i32> = modules.iter().map(|m| host.grant_module(m)).collect();
         let budget = host.grant_budget(-1, -1, -1);
         std::iter::once(inst)
@@ -305,15 +307,26 @@ pub fn spawn_rec_ir(
     let stores = format!(
         "  rm{at} = i64.const {m}\n  i32.store rm{at} {modh}\n  rb{at} = i64.const {b}\n  \
          i32.store rb{at} {budget}\n",
-        m = at + 24,
-        b = at + 28
+        m = at + temen_ir::SpawnRec::MODULE_AT,
+        b = at + temen_ir::SpawnRec::BUDGET_AT
     );
     (format!("data {at} \"{esc}\"\n"), stores)
 }
 
+/// How the last node ended, from what the root returns ([`Plan::root_src`]): its result if it returned,
+/// else the trap it ended in — the run's outcome is the node's, as a node's join answers it (#2066).
+/// A root that itself trapped ends the run with its trap.
+pub fn outcome(root: Result<Vec<Value>, Trap>) -> Result<Vec<Value>, Trap> {
+    match root?.as_slice() {
+        [Value::I64(0), value] => Ok(vec![*value]),
+        [Value::I64(status), _] => Err(Trap::from_code(*status).unwrap_or(Trap::Malformed)),
+        _ => Err(Trap::Malformed),
+    }
+}
+
 /// Run `plan` to completion on the resumable interpreter (the native / single-threaded driver,
 /// [`drive_op13`]): generate the root, grant it [`Plan::root_args`] over `host` (which already holds
-/// `caps`), and return what the root returns — the last node's result.
+/// `caps`), and return the last node's outcome ([`outcome`]).
 pub fn run(
     plan: &Plan,
     modules: &[&Module],
@@ -350,7 +363,7 @@ pub fn run(
     drop(back);
     // SAFETY: same layout; the root vCPU and its region views are dropped above.
     unsafe { std::alloc::dealloc(base, layout) };
-    out
+    outcome(out)
 }
 
 /// The resumable-engine drive loop (mirrors `temen-run/tests/child_entry_fs.rs`), for a root (see
@@ -397,8 +410,7 @@ pub(crate) fn drive_op13<'p>(
             // window — this inline (interpreter) path has no emitted-unit servicer (that is the staged
             // `JIT_RUN` path's bounce), correct and slower. The unit resolves on the child's host.
             bytecode::VcpuEvent::JitInstall { handle, code } => {
-                let unit = crate::par_resolve_unit_rt(vcpu.host_mut(), handle, code)
-                    .map(|(f, t, _wasm, id)| (f, t, id));
+                let unit = vcpu.host_mut().resolve_jit_unit(handle, code);
                 vcpu.deliver_jit_install(unit);
             }
             bytecode::VcpuEvent::JitUninstall { handle, .. } => {
@@ -406,16 +418,14 @@ pub(crate) fn drive_op13<'p>(
                 vcpu.deliver_jit_uninstall(authorized);
             }
             bytecode::VcpuEvent::JitInvoke { handle, code, .. } => {
-                let unit = crate::par_resolve_unit_rt(vcpu.host_mut(), handle, code)
-                    .map(|(f, t, _wasm, id)| (f, t, id));
+                let unit = vcpu.host_mut().resolve_jit_unit(handle, code);
                 vcpu.deliver_jit_invoke(unit);
             }
             // The children this loop drives are single-threaded and non-interactive: no threads, no
-            // tier-up (this is the interpreter path), no cap or stdin park. The driver's decline — a
+            // cap or stdin park. The driver's decline — a
             // value at the parent's join, never a parent-killing trap (see `crate::declined_child`).
             // Named rather than `_` (see `VcpuEvent`).
-            bytecode::VcpuEvent::TierUp { .. }
-            | bytecode::VcpuEvent::Spawn { .. }
+            bytecode::VcpuEvent::Spawn { .. }
             | bytecode::VcpuEvent::Wait { .. }
             | bytecode::VcpuEvent::Notify { .. }
             | bytecode::VcpuEvent::CapPending { .. }

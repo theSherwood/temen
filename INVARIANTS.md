@@ -81,16 +81,16 @@ spawn refused after its admission charges nothing (#1975). The bytecode drivers 
 fuel is charged up the chain like the window: a domain's vCPUs draw it in chunks from the node that
 pays for the domain (the run's root node, or the budget named in a detached spawn), each draw charged
 to every level, and a vCPU that ends or freezes refunds the unburned rest of its chunk. So no subtree
-burns more than any ancestor's fuel ceiling, and a spawn's per-child fuel `quota` is retired (a nonzero
-one on op 15 or a v1 record traps `CapFault`). The run's own node carries the embedder's fuel limit
-(`Limits.fuel`): it bounds every draw, but a guest's `read`, `split` and `transfer` see only the
+burns more than any ancestor's fuel ceiling, and a spawn's per-child fuel `quota` is retired (the
+spawn record has no field for one, #2091). The run's own node carries the embedder's fuel limit
+(`Limits.fuel`): it bounds every draw, but a guest's `read`, `split` and `transfer` bound fuel by the
 budgets below it, since what is left of it differs by engine (each draws on its own schedule). Every
 host grants it, the default fuel when it names none: the CLI, the C API, the browser, and the JIT's
 compile-once programs, which re-arm their fuel cell for each run (#2113). *Node 0's other dimensions
-(owner, 2026-10-06):* once #1867 deletes the carve, a guest sees node 0's `mem`, `channel` and
-`spawn` too; while the carve spawned, showing them would have bounded every budget's `spawn`, which
-the carve's budget-funded spawns refused. Every engine now refuses the carve spawn, and showing them
-is #2337. *Spawn and channel (2026-09-30, #1944 slice 3):* a node's `spawn`
+(owner, 2026-10-06; #2337):* a guest sees node 0's `mem`, `channel`, `spawn` and `maps` as it sees any
+level's, so the embedder's grant bounds what its reads report. They stayed hidden while the carve
+spawned (#1867): showing them would have bounded every budget's `spawn`, which the carve's
+budget-funded spawns refused. *Spawn and channel (2026-09-30, #1944 slice 3):* a node's `spawn`
 ceiling counts the live vCPUs of its subtree (the cgroups `pids.max` model). A detached child's first
 vCPU is charged with its window at the admission, so a spawn-0 budget funds no child, and handed back
 with the window when the child ends. Every other vCPU a domain makes (a thread, a fork twin, a spawned
@@ -100,8 +100,11 @@ as the live cap refuses it (`thread.spawn` traps `ThreadFault`; `fork` and `posi
 windows, charged to `mem` of that node, the twin's with the growth it copies, before the process
 exists, and handed back when it ends; an exec moves the charge to its image's window, the image's
 declared memory: what that needs past the caller's window is charged first, all or nothing, and what
-the caller's held past it goes back (#2106, #2110, #2332). A thaw re-charges the
-threads it re-creates. On the resumable `Vcpu` engine a
+the caller's held past it goes back (#2106, #2110, #2332). A thaw re-charges what it rebuilds: the
+threads it re-creates, a relaunched child's lease, its regions and stores. That is past any ceiling,
+since the artifact's use was granted, but never past the process's pools: one they have no room for
+is not rebuilt (a thread or a detached child ends with `ThreadFault`; a region or a store refuses the
+thaw), and what the thaw charged for it goes back (#2318). On the resumable `Vcpu` engine a
 thread's charge goes back at its join, where that engine learns it ended. The run's own node holds
 the embedder's grant (#2113): `Limits` sets its `mem`, `channel`, `spawn` and `maps` ceilings
 (`Host::set_grant`), and a run whose embedder names none holds modest defaults, since a default must
@@ -111,20 +114,29 @@ it as a child is to its budget, on every engine: its window and main vCPU when a
 (`Host::begin_activation`), past any ceiling, since they are what the embedder chose to run, but
 never past the process's pools of mappings and of address space (a run the process cannot hold ends
 with `ThreadFault` before it starts; every domain's window is held against the address-space pool at
-its admission, #2305), and everything it makes after, its growth and its processes' windows included. A carve child, which
-only a thaw of an artifact frozen around one can still re-create, charges no node: `MAX_VCPUS` alone
-bounds its vCPUs and `MAX_FIBERS` its fibers until #1867 deletes the carve. A pipe's worst-case FIFO is charged to the
+its admission, #2305), and everything it makes after, its growth and its processes' windows included. A pipe's worst-case FIFO is charged to the
 `channel` of the node of the domain that minted it, and every ancestor, until its last end closes. A
 region a guest mints is charged there too, its bytes, until no domain holds it; a domain lets go of a
 region when it closes its handle (`SharedRegion.close`, #2358), and a domain a budget paid for lets go
 of the rest when it ends, while a run's root keeps its own for its embedder (#2111).
 Host memory a guest grows through a capability (a file's bytes; a pipe's, socket's or captured
-stream's queue; a job's output; a table of names, descriptors, listings or mappings) is `channel` of
+stream's queue; a job's output; a process's environment, #2345; a table of names, descriptors,
+listings or mappings; a POSIX process's heap records, arguments, working directory and `getenv`
+copies, #2373) is
+`channel` of
 the node of the domain the capability's state was granted to, and every ancestor, plus one `maps` for
 each buffer of 128 KiB or more: charged before it is allocated, refused with an errno past a ceiling
 (`-ENOSPC` from a filesystem, `-ENOMEM` elsewhere), never an abort, and handed back as it shrinks or
-goes (#2306). A descriptor a guest causes holds one of the process's pool over its soft
-`RLIMIT_NOFILE` while it is open, and is refused with `-EMFILE` past it. A
+goes (#2306). A fork twin's copy of that state, or a spawned child's, is the guest's own act: it is
+charged with the fork, within every limit, and a provider with no room for it refuses the fork
+(`-EAGAIN`) or the re-grant, having registered nothing (#2373, #2428). A descriptor a guest causes
+holds one of the process's pool over its soft
+`RLIMIT_NOFILE` while it is open, and is refused with `-EMFILE` past it. A stack an engine keeps in
+host memory (the bytecode engine's register file) is `mem` of its vCPU's domain past the
+`FIBER_STACK` the vCPU's own charge pays for, plus its one `maps` from 128 KiB, and growing past a
+ceiling is `StackOverflow` (#2336). What a capability keeps per guest with no budget dimension of
+its own has a fixed bound and an errno past it: a POSIX process's descriptors and the personality's
+process table (#2306, #2345), a spawn's grant list (#2349). A
 fiber `cont.new` makes is `FIBER_STACK` (256 KiB) of its domain's `mem` while it lives: charged to
 the domain's node and every ancestor, `FiberFault` past a ceiling, and handed back when the fiber
 returns or its domain ends. A freeze hands it back as it flattens the fiber, and the thaw re-charges
@@ -135,7 +147,7 @@ exec its way out of its budget.
 
 *No code exceeds its grant (owner, 2026-10-06):* every resource a domain uses is charged to a grant
 from above, so no code can use more than it was granted, and the root is a domain like any other,
-its grant the embedder's. The gaps are tracked, not exceptions: the carve (#1867), a `Vcpu` child its
+its grant the embedder's. The gaps are tracked, not exceptions: a `Vcpu` child its
 parent never joins (#2119), the pipe ends a spawn refused after its admission re-granted (#2120), and
 the wasm-JIT's emitted `thread.spawn` (#2007) and fuel (#1997).
 
@@ -340,28 +352,37 @@ through the carve while both ran completed on the oracle and deadlocked on the C
 a parked difference. The resolution is the one this ruling reserved: **every §14 child is placed in a
 detached window, and the carve path is deleted** — on every engine, with its spawn forms, its
 host-side machinery, and the docs that describe it. No live-aliasing fix is built for carves, and no
-new feature lands on the carve path. Retiring it is invariant-14 work: *in flight*, prioritized as the
-frontier's own repair, never parked. Until it is gone:
+new feature lands on the carve path. **It is gone (#1867, 2026-10-15):**
 
-- **The carve spawn is gone** (#1867 slice 2): ops 0, 5 and 13 and the version-0 record trap
-  `CapFault` on every engine (`carve_spawn_refused.rs`), so #1814's divergence cannot arise. A thaw
-  of an artifact frozen around a carve child still re-creates one, until the nested freeze goes.
-- **The one spawn form is the op-17 record at version 1** (owner, 2026-09-29, #1863): placed
-  detached, with the spawn-time args payload and the pre-mapped region as fields, `module = -1` the
-  spawner's own program. The v0 carve record is retired (it traps `CapFault`), and op 15's positional form
-  retires too (#2067); the version word, always 1 now, is that migration's scaffolding (#2091).
-  The window is always the child module's
-  declared memory; `size_log2 = 0` asks for exactly that (owner, 2026-09-29), so a spawner holding a
-  module it did not build need not know its size — any other value must equal it. A query for the
-  size is #1908; growth past it spends the same budget as the pages commit (#1909, ruling R2).
-- **Live and bulk sharing is explicit:** a `SharedRegion` pre-mapped into the child (op 15's
-  `(region, child_off)`), with futex keyed on the region's canonical identity. Argv rides op 15's
-  spawn-time args payload; results ride the join and the region.
-- **What still leans on the carve moves first:** the §2.2 pager (the parent wrote the page through
-  its own window — now a byte transfer at supply, #1862, retiring "pager ⇒ nested"); the durable subtree
-  freeze (the `UNWINDING` word written into the carve — becomes the detached child's freeze doorbell;
-  `FreezeScope`'s carve-named form folds into the detached one). The carve-specific escape oracle and fuzz targets retire with the path they test, once
-  detached-window twins cover the same confinement property.
+- **The carve spawn is gone** (#1867 slice 2): ops 0, 5 and 13 trap `CapFault` on every engine
+  (`carve_spawn_refused.rs`), and the carve record went with the record's version word (#2091), so
+  #1814's divergence cannot arise. The nested freeze and thaw went with it (slice 3), so no artifact
+  carries a carve child, and every window starts at 0 of its own reservation.
+- **The one spawn form is the op-17 record** (owner, 2026-09-29, #1863): placed detached, with the
+  spawn-time args payload and the pre-mapped region as fields. The carve record is retired, and so
+  is op 15's positional form (#2067): every engine traps it `CapFault`, and no producer emits it.
+  The record carries no version word: the migration's tag was its scaffolding, and #2091 retired it
+  by repacking the record (owner, 2026-10-15), so a layout change moves every producer at once. The
+  window is always the child module's declared memory; `size_log2 = 0` asks for exactly that
+  (owner, 2026-09-29), so a spawner holding a module it did not build need not know its size — any
+  other value must equal it. A query for the size is #1908; growth past it spends the same budget as
+  the pages commit (#1909, ruling R2).
+- **A child runs a module, never a function of its spawner** (owner, 2026-10-08, #2219): the
+  record's `module` is a `Module` handle the spawner holds, and the child starts at that module's
+  function 0, its child bootstrap. `module = -1`, which once named the spawner's own program, is a
+  forged handle like any other, and the record's word at 4, once the entry, must be 0: each traps
+  `CapFault` on every engine (`self_spawn_refused.rs`). "A copy of
+  myself" is the host granting the program's child image (`"child"`). Every child binds its manifest
+  strictly; one that leaves an import empty on purpose says so with a `VM_EMPTY` grant.
+- **Live and bulk sharing is explicit:** a `SharedRegion` pre-mapped into the child (the record's
+  `region` and `child_off`), with futex keyed on the region's canonical identity. Argv rides the
+  record's spawn-time args payload; results ride the join and the region.
+- **What leaned on the carve moved first:** the §2.2 pager (the parent wrote the page through its
+  own window — now a byte transfer at supply, #1862); the durable subtree freeze (the `UNWINDING`
+  word written into the carve — now the detached child's freeze doorbell; freeze authority has one
+  form, #1867). The carve-specific escape-oracle passes and fuzz arms went with the path they tested,
+  replaced by detached-window twins (#1867 decision 3). The `Instantiator` no longer names a window
+  range (#2433).
 
 ## 14. One frontier, consistent across every axis
 
@@ -376,7 +397,8 @@ every axis it can reach —
 - **Host target** — native (x86/arm), wasm32, Windows: a guest never behaves differently by platform;
   a capability landing native-first is not done until it reaches the others.
 - **Concurrency model** — the cooperative multiplex driver (`CoopRun`) and the genuinely-parallel
-  per-Worker driver (`temen_par_*`) both carry it.
+  driver (executor 2: a thread per task, an OS thread natively and a Worker in the browser) both
+  carry it.
 - **Code origin** — the host-translated base module and a §22 guest-JIT unit (`vm_jit_*`,
   runtime-compiled by the guest) both support it.
 - **Nesting** — it holds for a confined §14 child, a fork/clone twin, and a spawned thread, not just
@@ -404,18 +426,17 @@ O14's conceptual half):** who may snapshot a domain is a capability (invariant 3
 its placement. The platform holds freeze authority over every domain it runs; an ancestor holds it
 over a descendant *only by grant*, attenuating down the grant graph like any other authority, and
 `attest.freeze_authority` reports the actual holders. Because a snapshot is a read of the window
-(PROCESS.md §6), freeze-ability follows window-read authority: a **nested carve** child's window is a
-sub-range of its parent's, so the parent can read — hence freeze — it by construction (the grant is
-implied by the aliasing, the current behavior); a **detached** child owns its window, so an ancestor
-can freeze it *only if granted*. The converse holds too (owner, 2026-10-01, #1866): reading a detached
-child's window, as a debugger does, *is* that grant, with no separate inspect authority; no guest-held
-inspection surface is built until a consumer needs one (2026-10-02). (The nested case is being retired with the carve path — #13's 2026-09-29 ruling — after which every
-child is the detached case.) Placement is therefore orthogonal to durability, and §6's rule reads:
+(PROCESS.md §6), freeze-ability follows window-read authority: a §14 child owns its window, so an
+ancestor can freeze it *only if granted*. (A nested carve child, whose window was a sub-range of its
+parent's, was freezable by construction until the carve went, #1867.) The converse holds too (owner,
+2026-10-01, #1866): reading a detached child's window, as a debugger does, *is* that grant, with no
+separate inspect authority; no guest-held inspection surface is built until a consumer needs one
+(2026-10-02). Placement is therefore orthogonal to durability, and §6's rule reads:
 *confidential = freezable by nobody below the platform; a domain is confidential **or**
 ancestor-freezable per grant, not per placement* — a detached child may be platform-durable **and**
 ancestor-confidential at once. A detached child freezes as its own root-shaped artifact (the one codec
 form, R3); a subtree snapshot is a consistent cut over the parent's artifact and each detached child's,
-coordinated by the authority holder. This makes the op-15 durable refusal an **un-wired-support** gap
+coordinated by the authority holder. This makes the detached spawn's durable refusal an **un-wired-support** gap
 (*in flight* — the run driver cannot yet reach a detached child's `Mem`+`Host` at quiesce, and a thaw
 must restore a child's `Attestation`, O14's remaining plumbing), **not** a placement-derived decline
 this invariant would forbid; it becomes "refuse unless a freeze-authority holder is registered for this
@@ -424,26 +445,25 @@ child" once that lands.
 **Amendment — R1's spawn lift is deferred until the capture exists (2026-09-14, #1412):** R1's *end
 state* stands and is unchanged: freeze authority is a per-grant capability, placement is orthogonal to
 durability, and a durable parent will spawn detached children whose freeze **captures** them. What is
-withdrawn is the slice-1 lift of the op-15 `!durable` gate, which ran ahead of two things it depends on.
+withdrawn is the slice-1 lift of the detached spawn's `!durable` gate, which ran ahead of two things it depends on.
 It was applied to the tree-walk oracle alone, leaving the resumable engine and the native thunk refusing
 what the oracle admitted — a live invariant-9 divergence that stood six days unwitnessed. And the
 safety it moved to the freeze, `detached_live_refused`, ends the run with `Trap::ThreadFault`: a
 platform lifecycle action the guest cannot see coming, killing the domain, which invariant 5 forbids in
 terms ("a lifecycle event is never a domain-killing surprise"). Refusing the spawn probeably on all
 three engines is therefore the resting state until (a) freeze authority is **represented in code** —
-`Binding::FreezeAuthority { base, size }` now is that representation for a §14 **nested carve**, whose
-carve names it: granted at spawn while the carve spawned (#1867), containment-covering so one grant serves every child of an
-instantiator range, durable so a thawed parent holds what it held, and askable through
-`Host::holds_freeze_authority` (#1440). A **detached** child, which owns its own window and has no
-sub-range to be named by, is covered by `FreezeScope::DetachedProgeny` — all-or-nothing, and never
-self-minted: a nested parent already reads its child's carve, so self-granting there documents a fact,
+`Binding::FreezeAuthority` is that representation (#1440): durable so a thawed parent holds what it
+held, and askable through `Host::holds_freeze_authority`. Its first form named a §14 **nested
+carve** by the carve's range and went with the carve (#1867). A **detached** child, which owns its
+own window and has no sub-range to be named by, is covered by the all-or-nothing form, the one that
+remains — and never self-minted: a nested parent read its child's carve, so self-granting there documented a fact,
 whereas a detached child's window is *not* parent-readable, so a self-mint would dissolve the very
 isolation the spawn asked for. Authority over detached children therefore arrives from above or not at
 all — and (b) the per-child-artifact capture lands (#1361), which is what the gate is still waiting on. Then the gate comes out everywhere at once and the rule is
 R1's, as written above. Note what this is *not*: it is not a ruling that durable and detached are
 incompatible. The gap is un-wired support, tracked and in flight, exactly as R1 classified it.
 **It came out on 2026-09-23 (#1361 step 4):** all three engines now admit a durable parent's detached
-spawn of an attested-freezable module iff the parent holds `FreezeScope::DetachedProgeny` — asked in the
+spawn of an attested-freezable module iff the parent holds freeze authority — asked in the
 one shared admission, `Host::admit_detached_spawn` — and the oracle's and the JIT's freezes capture the
 child as its own artifact inside the parent's (DURABILITY.md §4).
 
@@ -505,4 +525,7 @@ calls it — invariant 15). (Owner decision 2026-09-16, #1503; sharpens 4 — gu
 15. It earned its place by rejecting three real proposals in one afternoon: donating heap to move
 the guest's data around the reserve, mapping the NULL guard as scratch during freeze, and widening
 the session snapshot to make room — each a workaround for the substrate owning a placement that was
-the guest's to make.)
+the guest's to make.) The substrate also fixes the *protection* of the pages those words, and a
+declared arena, lie on: the host reads and writes them outside the guest's guarded code, so every
+engine refuses a page op over them, as over the NULL guard (owner decision 2026-10-15, #2426). The
+placement stays the guest's; only the protection of what it declared to the runtime is fixed.

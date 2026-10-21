@@ -162,9 +162,9 @@ memory 17
 
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 17432
+  vrm = i64.const 17416
   i32.store vrm v1
-  vrb = i64.const 17436
+  vrb = i64.const 17420
   i32.store vrb v2
   vrp = i64.const 17408
   v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -177,7 +177,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vd = i64.const 2
   vr2 = call.cap 268435456 0 (i64, i64) -> (i64) v7 (vc, vd)
   vr3 = call.cap 268435456 1 () -> (i64) v7 ()
-  vj = call.cap 6 1 (i32) -> (i64) v0 (v5)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (v5)
   vk = i64.const 100
   vm = i64.mul vj vk
   vs1 = i64.add vr1 vr2
@@ -190,7 +190,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 
 /// [`SEP_CALLER`] with its spawn record: the module's entry 0 in its declared window.
 fn sep_caller() -> String {
-    format!("{SEP_CALLER}{}", rec::segment(17408, &SpawnRec::v1(0)))
+    format!("{SEP_CALLER}{}", rec::segment(17408, &SpawnRec::default()))
 }
 
 const SEP_SERVER_TWO_WORKERS: &str = r#"
@@ -261,7 +261,7 @@ fn two_svc_wait_consumers_serve_a_live_caller_across_every_interleaving() {
     // complete with the same packed result.
     for i in 0..10 {
         let mut host = Host::new();
-        let hi = host.grant_instantiator(0, 1u64 << 17);
+        let hi = host.grant_instantiator();
         let hm = host.grant_module(&b);
         let hb = host.grant_budget(-1, 1 << 20, -1);
         let mut fuel = u64::MAX;

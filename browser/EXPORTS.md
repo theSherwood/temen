@@ -2,20 +2,20 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**348 exports** in 39 families — 301 referenced from JS, 47 referenced by nothing, 23 behind a `cfg`.
+**299 exports** in 39 families — 252 referenced from JS, 47 referenced by nothing, 42 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
-| `(corpus runners)` | 17 | 0 | 0 |
+| `(corpus runners)` | 16 | 0 | 0 |
 | `abi` | 1 | 1 | 0 |
 | `alloc` | 1 | 1 | 0 |
 | `bash` | 10 | 9 | 0 |
 | `callprof` | 4 | 4 | 4 |
 | `child` | 1 | 1 | 0 |
-| `coop` | 62 | 52 | 0 |
+| `coop` | 65 | 54 | 0 |
 | `dap` | 4 | 4 | 0 |
 | `dealloc` | 1 | 1 | 0 |
-| `detached` | 5 | 5 | 1 |
+| `detached` | 4 | 4 | 1 |
 | `durable` | 4 | 4 | 0 |
 | `exit` | 1 | 1 | 0 |
 | `fault` | 1 | 1 | 0 |
@@ -29,7 +29,7 @@
 | `notes` | 2 | 2 | 0 |
 | `onramp` | 46 | 37 | 0 |
 | `op13jit` | 9 | 9 | 0 |
-| `par` | 74 | 74 | 2 |
+| `par` | 17 | 17 | 14 |
 | `parse` | 3 | 3 | 0 |
 | `pg` | 6 | 6 | 0 |
 | `prep` | 1 | 1 | 0 |
@@ -44,7 +44,7 @@
 | `trap` | 2 | 2 | 0 |
 | `warm` | 5 | 5 | 0 |
 | `wasmjit` | 10 | 10 | 0 |
-| `x2` | 13 | 13 | 13 |
+| `x2` | 20 | 20 | 20 |
 
 ## Exports by family
 
@@ -53,7 +53,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 ### `(corpus runners)`
 
 - `run_capture` — *unreferenced*
-- `run_coroutine` — *unreferenced*
 - `run_durable` — *unreferenced*
 - `run_dynlink` — *unreferenced*
 - `run_fiber` — *unreferenced*
@@ -146,10 +145,13 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_coop_program_wasm_ptr`
 - `temen_coop_read` — *unreferenced*
 - `temen_coop_read_ptr` — *unreferenced*
+- `temen_coop_region_emits` — *unreferenced*
+- `temen_coop_reset_hotness`
 - `temen_coop_run`
 - `temen_coop_run_for`
 - `temen_coop_set_emit_cap` — *unreferenced*
-- `temen_coop_set_tierup_floor`
+- `temen_coop_set_emitted_work`
+- `temen_coop_set_hotness`
 - `temen_coop_shim_ptr`
 - `temen_coop_shim_wasm`
 - `temen_coop_slot_unit`
@@ -182,7 +184,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 
 - `temen_detached_header_bytes`
 - `temen_detached_jit_run_open` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
-- `temen_detached_max_bytes`
 - `temen_detached_oracle_run`
 - `temen_detached_pagestate_off`
 
@@ -327,79 +328,22 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 ### `par`
 
 - `temen_par_alloc`
-- `temen_par_child`
-- `temen_par_child_detached` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
-- `temen_par_compile`
-- `temen_par_compile_jit`
-- `temen_par_deliver_child`
-- `temen_par_deliver_code`
-- `temen_par_deliver_jit_invoke`
-- `temen_par_deliver_jit_invoke_trap`
-- `temen_par_deliver_join`
-- `temen_par_deliver_tierup`
-- `temen_par_deliver_tierup_trap`
-- `temen_par_enable_inst_codegen`
-- `temen_par_enable_jit`
-- `temen_par_enable_jit_codegen`
-- `temen_par_enable_jit_paged`
-- `temen_par_ev_a`
-- `temen_par_ev_b`
-- `temen_par_ev_c`
-- `temen_par_ev_d`
-- `temen_par_free`
-- `temen_par_inst_call_interp`
-- `temen_par_inst_eligible`
-- `temen_par_inst_end_join`
-- `temen_par_inst_file_child`
-- `temen_par_inst_instantiate_rec`
-- `temen_par_inst_join`
-- `temen_par_inst_paged`
-- `temen_par_inst_pagestate_sync`
-- `temen_par_inst_unit_wasm_len`
-- `temen_par_inst_unit_wasm_ptr`
-- `temen_par_jit_argv_len`
-- `temen_par_jit_argv_ptr`
-- `temen_par_jit_code`
-- `temen_par_jit_code_wasm_len`
-- `temen_par_jit_code_wasm_ptr`
-- `temen_par_jit_codegen_service`
-- `temen_par_jit_param_types_ptr`
-- `temen_par_jit_result_types_len`
-- `temen_par_jit_result_types_ptr`
-- `temen_par_jit_set_b2`
-- `temen_par_jit_set_codegen`
-- `temen_par_jit_slot_unit`
-- `temen_par_jit_table_gen`
-- `temen_par_jit_table_log2`
-- `temen_par_jit_unit_wasm_by_id_len`
-- `temen_par_jit_unit_wasm_by_id_ptr`
-- `temen_par_jit_unit_wasm_len`
-- `temen_par_jit_unit_wasm_ptr`
+- `temen_par_jit_codegen_service` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_par_jit_set_codegen` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_par_last_panic_len`
 - `temen_par_last_panic_ptr`
-- `temen_par_nfuncs`
-- `temen_par_powerbox`
-- `temen_par_powerbox_inst`
-- `temen_par_powerbox_io`
-- `temen_par_powerbox_jit_codegen`
-- `temen_par_powerbox_jit_runtime`
-- `temen_par_powerbox_none`
-- `temen_par_powerbox_onramp`
-- `temen_par_root`
-- `temen_par_run`
-- `temen_par_set_workers`
-- `temen_par_shim_wasm_len`
-- `temen_par_shim_wasm_ptr`
-- `temen_par_stderr_len`
-- `temen_par_stderr_ptr`
-- `temen_par_stdout_len`
-- `temen_par_stdout_ptr`
-- `temen_par_thread_detached` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
-- `temen_par_tierup_argv_len`
-- `temen_par_tierup_argv_ptr`
-- `temen_par_tierup_pagestate_len`
-- `temen_par_tierup_pagestate_ptr`
-- `temen_par_win_len`
+- `temen_par_powerbox` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_par_powerbox_inst` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_par_powerbox_io` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_par_powerbox_jit_codegen` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_par_powerbox_jit_runtime` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_par_powerbox_none` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_par_powerbox_onramp` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_par_set_workers` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_par_stderr_len` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_par_stderr_ptr` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_par_stdout_len` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_par_stdout_ptr` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 
 ### `parse`
 
@@ -503,11 +447,18 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 
 - `temen_x2_bytes_ptr` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_call_interp` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_deliver_fault_addr` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_mapped_now` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_nfuncs` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_paged` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_pagestate_len` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_pagestate_ptr` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_program_len` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_shim_len` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_slot_unit` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_slot_wasm_len` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_spill_bytes` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_spill_ptr` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_start` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_table_gen` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_table_log2` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`

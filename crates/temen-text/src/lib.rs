@@ -231,6 +231,10 @@ fn print_debug_info(s: &mut String, m: &Module) {
     if let Some(root) = di.tls_root {
         let _ = writeln!(s, "debug.tls_root {root}");
     }
+    // `debug.lib <file>` — a file that holds a library's code (#2341).
+    for f in &di.lib_files {
+        let _ = writeln!(s, "debug.lib {f}");
+    }
     for l in &di.locs {
         let _ = writeln!(
             s,
@@ -1278,6 +1282,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
     let mut dbg_blobs: Vec<ProducerBlob> = Vec::new();
     let mut dbg_func_names: Vec<FuncName> = Vec::new();
     let mut dbg_tls_root: Option<u64> = None;
+    let mut dbg_lib_files: Vec<u32> = Vec::new();
     while !p.at_end() {
         match p.peek() {
             // Debug-info waist (DEBUGGING.md §6) — strippable tooling, parsed into `Module::
@@ -1305,6 +1310,11 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
             Some(Tok::Ident(s)) if s == "debug.tls_root" => {
                 p.next()?;
                 dbg_tls_root = Some(p.parse_u64()?);
+            }
+            // `debug.lib <file>` — a file that holds a library's code (#2341).
+            Some(Tok::Ident(s)) if s == "debug.lib" => {
+                p.next()?;
+                dbg_lib_files.push(p.parse_u32()?);
             }
             Some(Tok::Ident(s)) if s == "debug.loc" => {
                 p.next()?;
@@ -1719,6 +1729,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
         blobs: dbg_blobs,
         func_names: dbg_func_names,
         tls_root: dbg_tls_root,
+        lib_files: dbg_lib_files,
     };
     let debug_info = if !explicit.is_vacuous() {
         // An explicit `debug` section wins verbatim.
@@ -1733,6 +1744,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
             blobs: Vec::new(),
             func_names: Vec::new(),
             tls_root: None,
+            lib_files: Vec::new(),
         })
     } else {
         None
@@ -1921,6 +1933,10 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 p.parse_str()?; // name
             }
             Some(Tok::Ident(s)) if s == "debug.tls_root" => {
+                p.next()?;
+                p.parse_int()?;
+            }
+            Some(Tok::Ident(s)) if s == "debug.lib" => {
                 p.next()?;
                 p.parse_int()?;
             }
@@ -4166,6 +4182,7 @@ block 0 (v0: i32) {
                 name: nasty.into(),
             }],
             tls_root: None,
+            lib_files: vec![],
         });
         let printed = print_module(&m);
         assert!(
@@ -4199,6 +4216,7 @@ block 0 (v0: i32) {
                 blobs: vec![],
                 func_names: vec![],
                 tls_root: None,
+                lib_files: vec![],
             }),
             ..Default::default()
         };
@@ -4311,6 +4329,32 @@ debug.loc 0 0 0 0 7 5
             (di.func_names[1].func, di.func_names[1].name.as_str()),
             (1, "helper")
         );
+        assert_eq!(
+            parse_module(&print_module(&m)).unwrap(),
+            m,
+            "print → re-parse is identity"
+        );
+    }
+
+    #[test]
+    fn debug_lib_files_round_trip() {
+        // The library files (#2341) parse into `debug_info.lib_files` and survive print → re-parse
+        // (the `debug.lib <file>` directive).
+        let src = "\
+func (i32) -> (i32) {
+block 0 (v0: i32) {
+  return v0
+  }
+}
+debug.file 0 \"lib.c\"
+debug.file 1 \"main.c\"
+debug.lib 0
+debug.loc 0 0 0 0 3 1
+";
+        let m = parse_module(src).expect("parse debug.lib");
+        let di = m.debug_info.as_ref().expect("module carries debug info");
+        assert_eq!(di.lib_files, [0]);
+        assert!(di.is_lib_file(0) && !di.is_lib_file(1));
         assert_eq!(
             parse_module(&print_module(&m)).unwrap(),
             m,

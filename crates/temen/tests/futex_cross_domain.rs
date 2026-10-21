@@ -1,6 +1,6 @@
 //! PROCESS.md S0 spike (O2): do futex `wait`/`notify` rendezvous **across domains** on shared memory?
 //! A parent and its detached child share a §13 `SharedRegion`: the parent maps it at 128 KiB in its
-//! own window, and op 15 pre-maps it into the child's window at 64 KiB. The futex key of a
+//! own window, and the spawn record pre-maps it into the child's window at 64 KiB. The futex key of a
 //! region-aliased page is `(backing, byte offset within the region)` (`FutexKey::Region`), so the two
 //! rendezvous on the *same region byte* under *different guest addresses* in *different domains*
 //! (parent: `128 KiB + a`; child: `64 KiB + a`). That is the load-bearing fact for building endpoints
@@ -12,9 +12,11 @@
 
 #[path = "../../temen-interp/tests/support/drivers.rs"]
 mod drivers;
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
 
 use temen_interp::{Host, Value};
-use temen_ir::Module;
+use temen_ir::{Module, SpawnRec};
 
 fn module(src: &str) -> Module {
     let m = temen_text::parse_module(src).expect("parse");
@@ -23,10 +25,15 @@ fn module(src: &str) -> Module {
 }
 
 /// The parent `(Instantiator, AddressSpace, child Module, Budget) -> i64`: mints a 64 KiB region, maps
-/// it at 128 KiB, spawns the child detached with the region pre-mapped at 64 KiB of the child's
-/// window, then runs `body` (which sees the child as `vc` and the region byte 20480 as `va`) and
-/// returns its `vr`.
+/// it at 128 KiB, spawns the child detached through the spawn record at 17408 with the region pre-mapped
+/// at 64 KiB of the child's window, then runs `body` (which sees the child as `vc` and the region
+/// byte 20480 as `va`) and returns its `vr`.
 fn parent(body: &str) -> Module {
+    let spawn = SpawnRec {
+        size_log2: 17,
+        child_off: 65536,
+        ..SpawnRec::default()
+    };
     module(&format!(
         "memory 18
 func (i32, i32, i32, i32) -> (i64) {{
@@ -38,19 +45,21 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
   vro = i64.const 0
   vprot = i32.const 3
   vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
-  vmh = i64.extend_i32_u v2
-  vb = i64.extend_i32_u v3
-  vz = i64.const 0
-  vlog = i64.const 17
-  vreg = i64.extend_i32_u vrh
-  voff = i64.const 65536
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz, vreg, voff)
+  vpm = i64.const 17416
+  i32.store vpm v2
+  vpb = i64.const 17420
+  i32.store vpb v3
+  vpr = i64.const 17456
+  i32.store vpr vrh
+  vp = i64.const 17408
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vp)
   va = i64.const 151552
 {body}
   return vr
   }}
 }}
-"
+{rec}",
+        rec = rec::segment(17408, &spawn)
     ))
 }
 
@@ -60,7 +69,7 @@ fn setup(child: &str) -> impl Fn() -> (Host, Vec<Value>) {
     let child = module(child);
     move || {
         let mut host = Host::new();
-        let inst = host.grant_instantiator(0, 1 << 18);
+        let inst = host.grant_instantiator();
         let aspace = host.grant_address_space(0, 1 << 18);
         let modh = host.grant_module(&child);
         let budget = host.grant_budget(-1, 1 << 17, -1);
@@ -84,7 +93,7 @@ fn parent_waits_child_notifies_across_domains() {
         "  vexp = i32.const 0
   vinf = i64.const -1
   vw = i32.atomic.wait va vexp vinf
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vw64 = i64.extend_i32_u vw
   vh = i64.const 100
   vwh = i64.mul vw64 vh
@@ -137,7 +146,7 @@ fn child_waits_parent_notifies_across_domains() {
         "  vone = i32.const 1
   i32.atomic.store va vone
   vn = atomic.notify va vone
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vten = i64.const 10
   vj10 = i64.mul vj vten
   vn64 = i64.extend_i32_u vn

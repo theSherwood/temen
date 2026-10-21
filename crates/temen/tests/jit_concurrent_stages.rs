@@ -2,7 +2,7 @@
 //! granted `SharedRegion` + canonical-key futex — the fast-backend twin of
 //! `temen-interp/tests/concurrent_stages.rs`, running the same program (`support/pipeline.rs`). The
 //! parent mints a region (the run's backing factory is `temen_run::new_shared_region`, so it is a
-//! real OS shared-memory object), spawns producer and consumer detached (op 15, each granted the
+//! real OS shared-memory object), spawns producer and consumer detached (op 17, each granted the
 //! region by name), and joins both.
 //!
 //! What this pins, JIT-specifically:

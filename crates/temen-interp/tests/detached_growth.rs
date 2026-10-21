@@ -39,17 +39,17 @@ fn src(commit: &str, release: &str) -> String {
         "memory 16
 func (i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vbud: i32, vmod: i32) {{
-  rm = i64.const 17432
+  rm = i64.const 17416
   i32.store rm vmod
   f = i64.const -1
   m = i64.const {CEILING}
   vsub = call.cap 14 0 (i64, i64, i64) -> (i64) vbud (f, m, f)
   vnode = i32.wrap_i64 vsub
-  rb = i64.const 17436
+  rb = i64.const 17420
   i32.store rb vnode
   rp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   one = i64.const 1
   vroom = call.cap 14 1 (i64) -> (i64) vnode (one)
   k = i64.const 1000000
@@ -96,7 +96,7 @@ block 0 (vinst: i64, vas64: i64) {{
         c2 = op("r2", commit, 2),
         r3 = op("r3", release, 1),
         c4 = op("r4", commit, 2),
-        rec = rec::segment(17408, &SpawnRec::v1(0)),
+        rec = rec::segment(17408, &SpawnRec::default()),
     )
 }
 
@@ -111,7 +111,7 @@ fn module(src: &str) -> Module {
 fn setup(m: &Module) -> impl Fn() -> (Host, Vec<Value>) + '_ {
     move || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 16);
+        let i = h.grant_instantiator();
         let b = h.grant_budget(-1, -1, -1);
         let c = h.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
         (h, [i, b, c].map(Value::I32).to_vec())

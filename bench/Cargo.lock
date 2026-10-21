@@ -1430,6 +1430,7 @@ dependencies = [
 name = "temen-interp"
 version = "0.0.0"
 dependencies = [
+ "libm",
  "page_size",
  "temen-encode",
  "temen-ir",
@@ -1454,6 +1455,7 @@ dependencies = [
  "cranelift-native",
  "libc",
  "loom",
+ "temen-encode",
  "temen-fiber",
  "temen-ir",
  "windows-sys 0.59.0",

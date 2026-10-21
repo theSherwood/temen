@@ -94,10 +94,11 @@ Ordered by leverage ÷ risk; each lands with tests per AGENTS.md.
 ### Slice 0 — mainline tier-up over a live window (DIAGNOSED; gate fix landed)
 
 **Diagnosis (empirical, native).** A new native harness (`temen-wasm-jit/tests/tierup_live_window.rs`)
-drives the real loop — `bytecode::VcpuReactor` opens over a caller-owned window, runs `_start`
-(materializing `m.data`), and tiers up a mainline `Call` onto emitted wasm mirrored over that live
-window. It is the native twin of the browser `temen_par_run`/`PAR_TIERUP` lane, which had **no native
-coverage** (every prior `tierup.rs` test ran each `f{func}` in isolation over a hand-seeded window).
+drives the real loop — a run over a caller-owned window (a `bytecode::VcpuReactor` then, the pump's
+`CoopRun` since #1414) materializes `m.data` and tiers up a mainline `Call` onto emitted wasm
+mirrored over that live window. It is the native twin of the browser `temen_par_run`/`PAR_TIERUP`
+lane, which had **no native coverage** (every prior `tierup.rs` test ran each `f{func}` in isolation
+over a hand-seeded window).
 
 Against the JACL doc's ranked hypotheses:
 - **Hypothesis 1 (data/window-materialization) — ruled out for the native path.** With a
@@ -114,7 +115,7 @@ Against the JACL doc's ranked hypotheses:
   `MemoryFault → unreachable` mid-body, before any `env.call_interp`, that the spike saw. The JACL
   spike called `compile_module_tierup` directly, bypassing `compile_jit`'s gate.
 
-**Fix (landed).** `compile_module_tierup_caps` now self-applies the page-op gate: a page-op module
+**Fix (landed).** `compile_module_tierup`'s one assembly point now self-applies the page-op gate: a page-op module
 emits nothing (all-`false` bitmap, valid imports-only wasm), identical to `compile_interp_only` and
 to `compile_jit(Threaded)`. The gate now holds regardless of which public entry a host calls.
 Pinned by `tierup_page_op_module_emits_nothing` (red→green: was `[false, true]`, now `[false,

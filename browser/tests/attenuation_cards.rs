@@ -114,7 +114,7 @@ fn c_card_grants_stdout_to_one_child_only() {
     );
 }
 
-/// The `detached` card (§5 op 15 over a pre-mapped SharedRegion) through the same `onramp_exec` the
+/// The `detached` card (§5 op 17 over a pre-mapped SharedRegion) through the same `onramp_exec` the
 /// page's on-ramp recipe calls: the parent finds `child` (its child image, #2219) and `budget` by name
 /// and spawns the image detached — 1000 × 42 + 82. `budget` cannot cross into a §14 child yet, so a
 /// card that spawns detached runs at the root (#1720); this pins that it still runs at all.
@@ -127,7 +127,7 @@ fn detached_card_spawns_over_a_premapped_region() {
     assert_eq!(run.value, 42082);
 }
 
-/// The `inst` card under the grants of the parallel §14 recipe it runs on (`temen_par_root`): an
+/// The `inst` card under the grants of the parallel §14 recipe it runs on (`temen_x2_start`): an
 /// `Instantiator` over its window, the `budget` its children's windows spend, and its child image as
 /// `"child"` (#2219). The page runs each child on a Worker of its own; here they share the bytecode
 /// engine's cooperative driver, which admits them the same way. Eight copies return 5 each.
@@ -139,7 +139,7 @@ fn inst_card_sums_eight_copies_of_itself() {
     );
     let mut host = temen_interp::Host::new();
     host.set_self_module(&m);
-    let inst = host.grant_instantiator(0, 1 << 16);
+    let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 1 << 20, -1); // the page's `minter`
     host.grant_child_image();
     let mut fuel = 50_000_000u64;

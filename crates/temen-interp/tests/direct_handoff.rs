@@ -28,9 +28,9 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 17560
+  vrm = i64.const 17544
   i32.store vrm v2
-  vrb = i64.const 17564
+  vrb = i64.const 17548
   i32.store vrb v1
   vrp = i64.const 17536
   v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -79,9 +79,9 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 17624
+  vrm = i64.const 17608
   i32.store vrm v2
-  vrb = i64.const 17628
+  vrb = i64.const 17612
   i32.store vrb v1
   vrp = i64.const 17600
   v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -127,7 +127,7 @@ fn run_handoff(
 ) -> Result<Vec<Value>, temen_interp::Trap> {
     let mut host = Host::new();
     host.set_handoff(handoff);
-    let h = host.grant_instantiator(0, 1u64 << 17);
+    let h = host.grant_instantiator();
     let b = host.grant_budget(-1, 1 << 20, -1);
     let m = host.grant_module(&temen_ir::child_image_at(module, 1).expect("child image"));
     let mut fuel = 5_000_000u64;
@@ -140,10 +140,10 @@ fn run_handoff(
     )
 }
 
-/// `src` with the v1 record at `at` that spawns its serve loop: func 1's child image (#2219), whose
+/// `src` with the spawn record at `at` that spawns its serve loop: func 1's child image (#2219), whose
 /// handle the root stores in it.
 fn with_record(src: &str, at: u64) -> String {
-    format!("{src}{}", rec::segment(at, &SpawnRec::v1(0)))
+    format!("{src}{}", rec::segment(at, &SpawnRec::default()))
 }
 
 /// **4d.1 — run-to-completion handoff ≡ enqueue+park.** The same program serves its second live

@@ -16,16 +16,16 @@ pub mod moment;
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use temen_ir::{
-    AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
-    FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, SpawnRec,
-    SsaLoc, StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp,
-    VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx,
-    ValType, VarInfo, VarLoc, DEFAULT_RESERVED_LOG2,
+    default_reserved_log2, window_reserved_log2, AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data,
+    DebugInfo, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy,
+    IntUnOp, LoadOp, Memory, Module, SsaLoc, StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp,
+    VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp,
+    VShape, VShiftOp, VWidenOp, ValIdx, ValType, VarInfo, VarLoc,
 };
 use temen_mask::Window;
 use temen_mem::RmwOp;
@@ -428,8 +428,8 @@ pub enum StopReason {
     /// and the clock did not advance; push bytes (the DAP `provideStdin` request) and resume —
     /// the parked read re-issues against them.
     StdinPark,
-    /// #1366 — parked on a **host-completed cap call** with this completion id: the embedder
-    /// services the request it recorded under `id`, then `deliver_cap`/`provideCap` resumes.
+    /// #1366 — parked on a **host-answered cap call** with this completion id: the embedder
+    /// answers the request it recorded under `id` (`provideCap`), then resumes.
     CapPark { id: u64 },
     /// A budgeted run reached the end of its budget with no other stop (the bytecode engine's
     /// `run_until_turn`). Live and resumable: the embedder runs a long program in slices.
@@ -945,7 +945,7 @@ struct SeekInit {
     /// [`attach_scheduled_seeded`]: Inspector::attach_scheduled_seeded
     seed: Option<u64>,
     /// The module's NULL-guard extent (#964/#1094): `POWERBOX_NULL_GUARD` for every module (the guard
-    /// is unconditional; `0` only for a sub-window smaller than the guard). Captured from the module at
+    /// is unconditional; `0` only for a window smaller than the guard). Captured from the module at
     /// attach so `seek`'s freshly-rebuilt `Mem` re-seeds `[0, guard)` `Unmapped` — a NULL deref traps
     /// identically on a debugger attach and
     /// its replay, not only on a direct run (the bare funcs/data the harness rebuilds from carry no
@@ -974,6 +974,8 @@ pub struct SourceLoc {
     pub line: u32,
     /// 0 means "no column".
     pub col: u32,
+    /// `file` holds a library's code, not the program's (`DebugInfo::lib_files`, #2341).
+    pub library: bool,
 }
 
 /// Resolve an [`IrPc`] to its source position using `m`'s `-g` debug info (nearest-preceding `loc`
@@ -1017,6 +1019,7 @@ pub fn source_loc_in(di: &DebugInfo, pc: IrPc) -> Option<SourceLoc> {
         file,
         line: l.line,
         col: l.col,
+        library: di.is_lib_file(l.file),
     })
 }
 
@@ -1061,19 +1064,21 @@ pub enum VarValue {
     Bytes(Vec<u8>),
 }
 
-/// #1366 / #1953 — a call parked on a **declared host-completed cap**
-/// ([`Host::grant_declared_host_caps`]): its completion id, the cap's name, and the guest's flat
-/// call arguments (the guest's own op rides in `args[0]` by convention, like `vm_fs`).
-#[derive(Clone, Debug, PartialEq)]
+/// #1366 / #1953 — a call parked on a **declared host-answered cap**
+/// ([`Host::grant_declared_host_caps`]): the cap's name, the guest's flat call arguments (the
+/// guest's own op rides in `args[0]` by convention, like `vm_fs`), and the [`Completer`] that
+/// answers it.
+#[derive(Debug)]
 pub struct CapRequest {
-    pub id: u64,
     pub name: String,
     pub args: Vec<i64>,
+    pub completer: Completer,
 }
 
-/// The calls parked on one session's declared host-completed caps, keyed by completion id: filled by
-/// the procs' submit hooks, read and cleared by the embedder. Shared (`Arc`) so a rebuilt run's procs
-/// file into the same map.
+/// The calls parked on one session's declared host-answered caps, keyed by completion id: filled by
+/// the procs' submit hooks; the embedder takes a request out to answer it. Shared (`Arc`) so a
+/// rebuilt run's procs file into the same map. Dropping a request answers its call
+/// `CAP_REVOKED`.
 pub type CapRequests = Arc<Mutex<BTreeMap<u64, CapRequest>>>;
 
 /// One recorded crossing of the capability boundary (DEBUGGING.md W1 `CapTape`): the inputs the
@@ -1263,10 +1268,11 @@ impl Inspector {
     ) -> Box<VCpu> {
         // #964/#1094: this harness gets bare funcs/data, never the module, so the caller threads the
         // module's guard extent in — `[0, guard)` seeds `Unmapped` and a NULL deref traps on a debugger
-        // attach/seek exactly as on a direct run (unconditional; `0` only for a sub-window).
+        // attach/seek exactly as on a direct run (unconditional; `0` only for a window smaller than the
+        // guard).
         let mem = memory.map(|mc| {
             Mem::from_spec(WindowSpec {
-                reserved_log2: DEFAULT_RESERVED_LOG2,
+                reserved_log2: default_reserved_log2(),
                 mapped_log2: mc.size_log2,
                 shadow: mc.shadow,
                 data,
@@ -1423,7 +1429,7 @@ impl Inspector {
         // a scheduled attach/seek guards `[0, guard)` too (see `fresh_single_root`).
         let mem = memory.map(|mc| {
             Mem::from_spec(WindowSpec {
-                reserved_log2: DEFAULT_RESERVED_LOG2,
+                reserved_log2: default_reserved_log2(),
                 mapped_log2: mc.size_log2,
                 shadow: mc.shadow,
                 data,
@@ -2280,7 +2286,7 @@ pub fn run_with_host_traced(
     // One linear-memory window per run, zero-initialized and lazily paged. The whole module
     // shares it. The window is a large reserved range (§4 default policy) with only `mapped`
     // backed, so an out-of-`mapped` access faults (detect-and-kill) instead of wrapping.
-    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
+    let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
     drive(&m.funcs, &m.types, func, args, fuel, &mut mem, host)
 }
 
@@ -2369,10 +2375,9 @@ fn drive(
 
 /// [`drive`] over an already-shared function table — the §3.2 wired-offer dispatch reuses the
 /// offer's `Arc<[Func]>` verbatim instead of re-copying the table per call.
-/// One B2-installed unit to re-apply onto a sub-run's fresh dispatch table: `(slot, funcs, types,
-/// (table, unit))` — the unit's own type section (#922) rides alongside its funcs so its interned call
-/// sigs resolve, and its id so a spawn from it names its program (#2143).
-type JitReapply = (u32, Arc<[Func]>, Arc<[temen_ir::TypeEntry]>, (u32, u32));
+/// One B2-installed unit to re-apply onto a sub-run's fresh dispatch table: `(slot, funcs, types)` —
+/// the unit's own type section (#922) rides alongside its funcs so its interned call sigs resolve.
+type JitReapply = (u32, Arc<[Func]>, Arc<[temen_ir::TypeEntry]>);
 
 fn drive_arc(
     funcs: Arc<[Func]>,
@@ -2488,8 +2493,8 @@ fn drive_arc(
 /// the live cell (their mutations land in the instance directly, exactly as an eval-loop
 /// animation's do), so concurrent eval-loop animations keep working while the sub-run is in
 /// flight — where the by-value take would gut the cell under them. The cell persists after the
-/// run (no unwrap-back); the sub-run's transient `completion_notify` hook is cleared by the core's
-/// teardown. Durable providers are refused upstream (a durable world can't be sub-run over a
+/// run (no unwrap-back); the completion-wake hook a sub-run's park installs on it holds the
+/// sub-run's scheduler weakly, so it pins nothing once the run ends. Durable providers are refused upstream (a durable world can't be sub-run over a
 /// live shared cell — the freeze/thaw seeds assume exclusive ownership), so the thaw seeds are
 /// empty by construction.
 fn drive_arc_shared(
@@ -2547,9 +2552,7 @@ struct ThawResidue {
     root_sp: Option<u64>,
     fibers: Vec<FrozenFiber>,
     vcpus: Vec<FrozenVCpu>,
-    nested: Vec<FrozenNested>,
     detached: Vec<FrozenDetached>,
-    child_state: Vec<FrozenChildState>,
     /// #1361 step 4 — live detached children, each a domain with its own window and residue.
     live_detached: Vec<ThawedDetached>,
 }
@@ -2563,17 +2566,15 @@ impl ThawResidue {
             root_sp: host.frozen_root_sp.take(),
             fibers: std::mem::take(&mut host.frozen_fibers),
             vcpus: std::mem::take(&mut host.frozen_vcpus),
-            nested: std::mem::take(&mut host.frozen_nested),
             detached: std::mem::take(&mut host.frozen_detached),
-            child_state: std::mem::take(&mut host.frozen_child_state),
             live_detached: std::mem::take(&mut host.thawed_detached),
         }
     }
 }
 
 /// Seed a domain's root vCPU for this run — its durable phase and shadow-SP extent — and re-create
-/// every vCPU its thaw residue names (fibers, spawned vCPUs, §14 nested children, completed detached
-/// children), enqueueing all but the root, which the caller enqueues. `root` is the domain's root:
+/// every vCPU its thaw residue names (fibers, spawned vCPUs, detached children), enqueueing all but
+/// the root, which the caller enqueues. `root` is the domain's root:
 /// the run's root, or a re-launched detached child, which is a root of its own window.
 #[allow(clippy::too_many_arguments)]
 fn seed_domain(
@@ -2587,9 +2588,6 @@ fn seed_domain(
     residue: ThawResidue,
 ) {
     let id = root.id;
-    // A re-created §14 carve child gets the fixed allowance a carve child always had: what its domain
-    // can still burn (#1944 slice 3 leaves the carve path's fuel as it was).
-    let carve_fuel = root.fuel.can_burn();
     // The residue names tasks by their ids in the **frozen** run; the thaw hands out its own. Every
     // re-created task enters this `freeze id → thaw id` map as it is created, and every `parent_task`
     // resolves through it (#1687), so a record re-attaches to the parent it names whatever order ids
@@ -2597,27 +2595,23 @@ fn seed_domain(
     // re-created either: the parent's rewound join then fails closed rather than meeting a stranger.
     let mut live_ids: BTreeMap<TaskId, TaskId> = BTreeMap::from([(residue.task, id)]);
     let live = |m: &BTreeMap<TaskId, TaskId>, t: usize| m.get(&(t as TaskId)).copied();
-    // A re-created task keeps its frozen id when still free, so the §12.6 canonical re-freeze is
-    // byte-identical; a fresh id otherwise, never a collision.
-    let claim = claim_task;
-    // Every vCPU the thaw re-creates below the root (spawned and nested), by thaw id, so any record
-    // can attach to any of them. Enqueued together at the end, ascending id = parents first.
+    // Every vCPU the thaw re-creates below the root, by thaw id, so any record can attach to any of
+    // them. Enqueued together at the end, ascending id = parents first.
     let mut children: BTreeMap<TaskId, Box<VCpu>> = BTreeMap::new();
     let ThawResidue {
         task: _,
         root_sp: thaw_root_sp,
         fibers: thaw_fibers,
         vcpus: thaw_vcpus,
-        nested: thaw_nested,
         detached: thaw_detached,
-        child_state: thaw_child_state,
         live_detached: thaw_live_detached,
     } = residue;
-    root.dstate = root
-        .mem
-        .as_ref()
-        .map(|m| m.durable_load_dstate(root.vcpu_ctx))
-        .unwrap_or(STATE_NORMAL);
+    // Only a durable window has control words at the guard base; any other run keeps its own data
+    // there, and starts in no freeze phase whatever it holds (#2101).
+    root.dstate = match root.mem.as_ref() {
+        Some(m) if root.durable => m.durable_load_dstate(root.vcpu_ctx),
+        _ => STATE_NORMAL,
+    };
     // The root's active shadow-SP: its flattened extent on a multi-vCPU thaw (recorded residue), or
     // the window's active-SP word otherwise (a fresh/freeze run leaves it at the root region base; a
     // single-vCPU thaw's window already holds the root's extent). The runtime swaps it in per
@@ -2627,7 +2621,7 @@ fn seed_domain(
     root.root_shadow_sp = thaw_root_sp.unwrap_or_else(|| {
         root.mem
             .as_ref()
-            .map(|m| m.durable_get_sp(root_word))
+            .and_then(|m| m.durable_get_sp(root_word))
             .unwrap_or_else(|| arena.frame_base(root.vcpu_ctx))
     });
     // Thaw seeding (slice 3.1.5): re-create each frozen fiber in the run-shared registry, in
@@ -2662,280 +2656,15 @@ fn seed_domain(
     // root — the runtime re-creates it here ([`seed_thread`]), under `REWINDING`, with its
     // flattened shadow-SP restored, so it rewinds from its frozen point and runs forward.
     //
-    // Ascending task = ascending spawn order across the whole tree, and a parent's id is always
-    // < its children's, so taking threads and §14 nested children together in task order
-    // re-creates **every parent before its children** — a thread whose spawner is a nested child
-    // (#1686) as much as a nested child whose instantiator is a thread. The nested loop below
-    // takes each thread due before its next record.
+    // Ascending task = ascending spawn order, and a parent's id is always < its children's, so
+    // taking threads in task order re-creates **every parent before its children**.
     let mut vseed: Vec<FrozenVCpu> = thaw_vcpus;
     vseed.sort_by_key(|f| f.task);
-    let mut vseed = vseed.into_iter().peekable();
-    // §4 subtree thaw (DURABILITY.md): re-attach the §14 nested children a subtree freeze
-    // recorded — now to **arbitrary depth** (parent→child→grandchild, …). Each child's whole
-    // state — window, durable reserve, unwound continuation — is already in the restored image
-    // (its carve is a sub-range of the *root's* window, at any nesting depth); this re-creates
-    // each child *domain* around it: a nested view of the carve, a fresh attenuated powerbox
-    // (the same grants, in the same order, as `instantiate` minted — so the child's reloaded
-    // handle values still resolve), and a `REWINDING` re-entry from the extent its carve's own
-    // shadow-SP word holds. Mirrors the `thread.spawn` [`FrozenVCpu`] two-phase re-attach
-    // (above): the residue is grouped by `parent_task` so each child's handle is rebuilt into
-    // **its own parent's** join table (the root for a direct child, a re-created child for a
-    // grandchild) — so every re-executed `join` (root's *and* a child's) resolves and parks
-    // until its rewound child completes, exactly as pre-freeze.
     {
-        let mut nseed: Vec<FrozenNested> = thaw_nested;
-        // Ascending own task id: a parent's id is always < its children's (it was instantiated
-        // first, and the thaw keeps that order), so this re-creates **parents before their
-        // children**, and claiming ids in this order keeps each one free to be preserved.
-        nseed.sort_by_key(|n| n.task);
-        // Each re-created child's **absolute** (root-window-relative) carve offset. A record's
-        // `carve_off` is relative to *its parent's* window (the parent's Instantiator base is 0
-        // in its own view), so a grandchild's offset into the root image is its parent-child's
-        // absolute base + its own recorded offset — accumulated down the chain here.
-        let mut abs_off: std::collections::BTreeMap<TaskId, u64> =
-            std::collections::BTreeMap::new();
-        // §13.4 slice 4d: the re-created children's host Arcs, so a holder's restored
-        // `LiveImpl` can be re-linked to its callee after the whole subtree is rebuilt.
-        // `child_hosts_by_edge` resolves a callee by the **(holder task, join slot)** edge —
-        // root-direct children key on `(id, slot)`, a grandchild on `(its parent-child's cid,
-        // slot)` — so a *nested* holder (a child holding a cap onto a grandchild) re-links too,
-        // not just the root. `holder_hosts` pairs every re-created child with its own cid, so
-        // each is drained as a potential holder (the root is prepended explicitly below).
-        let mut child_hosts_by_edge: std::collections::BTreeMap<(TaskId, usize), Arc<Mutex<Host>>> =
-            std::collections::BTreeMap::new();
-        let mut holder_hosts: Vec<(TaskId, Arc<Mutex<Host>>)> = Vec::new();
-        for fnr in nseed {
-            while let Some(ff) = vseed.next_if(|f| f.task < fnr.task) {
-                seed_thread(
-                    s,
-                    sched,
-                    root,
-                    &mut children,
-                    &mut live_ids,
-                    funcs,
-                    types,
-                    dt,
-                    ff,
-                );
-            }
-            let Some(parent) = live(&live_ids, fnr.parent_task) else {
-                continue;
-            };
-            // The parent-child's absolute carve base (0 for a direct child of the root).
-            let parent_base = if parent == id {
-                0
-            } else {
-                abs_off.get(&parent).copied().unwrap_or(0)
-            };
-            let abs_carve = parent_base + fnr.carve_off;
-            // A **completed** child is not re-created (reload-not-reissue): its result is posted
-            // straight into the scheduler and mapped to the recording parent's join slot, so the
-            // parent's re-executed `thread.join` delivers it without re-running the child.
-            if let Some(r) = fnr.completed_result {
-                let cid = claim(s, fnr.task);
-                s.results.insert(
-                    cid,
-                    Outcome {
-                        result: r.map(|x| vec![Value::I64(x)]),
-                        mem: None,
-                        trap_bt: Vec::new(),
-                        trap_fiber: None,
-                        trap_fault: None,
-                    },
-                );
-                if parent == id {
-                    while root.threads.len() <= fnr.slot {
-                        root.threads.push(None);
-                    }
-                    root.threads[fnr.slot] = Some(cid);
-                } else if let Some(p) = children.get_mut(&parent) {
-                    while p.threads.len() <= fnr.slot {
-                        p.threads.push(None);
-                    }
-                    p.threads[fnr.slot] = Some(cid);
-                }
-                abs_off.insert(cid, abs_carve);
-                continue;
-            }
-            let csize = 1u64 << fnr.size_log2;
-            // Resolve the child's function table and type section (#922): the parent's own for a
-            // same-module child, or a re-granted **separate module** matched by content digest
-            // (host-supplied at restore). A missing / mismatched re-grant leaves the join slot
-            // empty, so the recording parent's re-executed `thread.join` fails closed — the
-            // per-child R5 identity gate.
-            let tables = match fnr.module_digest {
-                None => Some((Arc::clone(funcs), Arc::clone(types))),
-                Some(d) => host_shared.lock_unpoisoned().tables_by_digest(&d),
-            };
-            let Some((cfuncs, ctypes)) = tables else {
-                if parent == id {
-                    while root.threads.len() <= fnr.slot {
-                        root.threads.push(None);
-                    }
-                } else if let Some(p) = children.get_mut(&parent) {
-                    while p.threads.len() <= fnr.slot {
-                        p.threads.push(None);
-                    }
-                }
-                continue;
-            };
-            // Flip the child's carve from its frozen phase to a thaw: clear its own global freeze
-            // word and set its context-0 thaw word — `begin_thaw`, at the **absolute** carve offset
-            // (the carve rides the root image at any depth).
-            if let Some(m) = root.mem.as_mut() {
-                let _ = m.write_bytes(abs_carve + STATE_OFF, &STATE_NORMAL.to_le_bytes());
-                let _ = m.write_bytes(
-                    abs_carve + m.thaw_state_off(0),
-                    &STATE_REWINDING.to_le_bytes(),
-                );
-            }
-            // The child's flattened extent: a nested child is a single-vCPU durable domain in
-            // its carve (`vcpu_ctx == 0`), so its shadow-SP word sits at its context-0 **region
-            // base** (`DurableShadowBase`, where the transform reads/writes it) — *not* the old
-            // fixed global `SHADOW_SP_OFF`. A leaf child re-runs idempotently from base, so the
-            // read location was immaterial before; a **depth-2 middle child** reloads its
-            // `instantiate` checkpoint on rewind, so it must resume from the true drained extent.
-            let child_extent = root
-                .mem
-                .as_ref()
-                .map(|m| m.durable_get_sp(abs_carve + m.shadow_region_base(0)))
-                .unwrap_or_else(|| root.arena().frame_base(0));
-            let child_mem = root.mem.as_ref().map(|m| {
-                // A nested durable child is same-module (§4), so its arena is this one's.
-                m.nested_view(m.window.base() + abs_carve, fnr.size_log2, m.shadow_arena())
-            });
-            let mut ch = host_shared.lock_unpoisoned().child_host();
-            ch.set_durable(true);
-            // #1289 R1 / O14: re-stamp the child's §6 attestation, which the thaw otherwise
-            // defaults (`window_exposed = false` — a lie: the parent reads this child's carve).
-            // A §14 child reconstructed here is **nested** (it lives in the parent's window image)
-            // and **durable** (it froze), so it is `window_exposed` + `freeze_exposed`, tier
-            // inherited from the root — `child_attestation(true)`, the same the spawn path stamps.
-            // (A *detached* durable child — not reconstructible on this carve path yet — will carry
-            // its own captured attestation instead, since `window_exposed = false` cannot be
-            // re-derived from "nested"; that lands with the detached-durable freeze plumbing.)
-            ch.set_attestation(host_shared.lock_unpoisoned().child_attestation(true, None));
-            // §13.4 slice 4c: a child with recorded host state restores it **verbatim** —
-            // the captured handle table (slots/generations preserved, so guest handle
-            // values reloaded from its spilled frames still resolve) and its serve trio —
-            // instead of the fresh-grant path. Its `self_module` (serve admission /
-            // handler resolution for the re-issued drain) is the grant's own module for a
-            // separate-module child, or the root's registered module otherwise. Entry
-            // args are inert for a rewind (the prologue reloads spilled values), so the
-            // restored path passes zero placeholders of the entry's shape.
-            let cstate = thaw_child_state
-                .iter()
-                .find(|cs| cs.parent_task == fnr.parent_task && cs.slot == fnr.slot);
-            let arity = cfuncs.get(fnr.entry as usize).map_or(0, |f| f.params.len());
-            let child_args = if let Some(cs) = cstate {
-                // #1680: its pipe ends re-open on the pipes the root's restore rebuilt, shared
-                // with every other domain of the tree that holds an end.
-                ch.thaw_pipes = host_shared.lock_unpoisoned().thaw_pipes.clone();
-                ch.restore_durable_handles(&cs.handles);
-                // #1296: rebuild the child's §22 unit tables (from their captured, re-verified IR)
-                // and its dispatch-table reservation *before* the run resolves its `JitTable`
-                // handle — so a thawed child invokes its restored units exactly as the root does
-                // (native/wasm code pointers restore to 0; an interpreter invoke runs the funcs
-                // directly, a JIT-tier invoke lazily re-emits from IR, #1301). A corrupt captured
-                // unit fails the subtree thaw closed, like the root's `JitReconstruct`.
-                if !cs.jit_tables.is_empty() {
-                    if ch.restore_durable_jit(&cs.jit_tables).is_err() {
-                        // Leave the table empty; the child's re-resolved `JitTable` handle then
-                        // faults probeably rather than aliasing a stale table.
-                    }
-                    ch.set_jit_table_log2(cs.jit_table_log2);
-                    // Re-inject the durable-JIT admission fns from the root (the embedder set them
-                    // on the root at restore) so a thawed child can also compile *new* units, not
-                    // only invoke restored ones. Its own tainted set re-resolves from its module.
-                    host_shared.lock_unpoisoned().lend_jit_admission(&mut ch);
-                }
-                ch.set_svc_state(
-                    cs.svc_queue.clone(),
-                    cs.svc_results.clone(),
-                    cs.svc_next_ticket,
-                );
-                let sm = {
-                    let hg = host_shared.lock_unpoisoned();
-                    match fnr.module_digest {
-                        Some(d) => hg.module_arc_by_digest(&d),
-                        None => hg.self_module.clone(),
-                    }
-                };
-                ch.set_self_module_opt(sm);
-                bytecode::child_entry_args(arity, 0, 0)
-            } else {
-                // The starter caps every spawn arm grants (#1720) — so a re-launched child holds the
-                // powerbox its first launch did.
-                let (cinst, cas) = ch.grant_starter_caps(csize);
-                bytecode::child_entry_args(arity, cinst, cas)
-            };
-            let cid = claim(s, fnr.task);
-            live_ids.insert(fnr.task as TaskId, cid);
-            s.live += 1;
-            // True nesting depth: a direct child of the root is depth 1; a grandchild is its
-            // parent-child's depth + 1 (the parent is already in `children`, built first).
-            let cdepth = if parent == id {
-                1
-            } else {
-                children.get(&parent).map(|p| p.depth + 1).unwrap_or(1)
-            };
-            // #1296: a child's table reserves the slots its (re-granted) `Jit` table carries.
-            let cdt = Arc::new(DomainTable::new(&cfuncs, ch.jit_table_log2()));
-            // §13.4 slice 4d: keep the child's host Arc so a holder's restored `LiveImpl`
-            // can be re-linked to it once the whole subtree is rebuilt (below). Key the callee
-            // by its `(parent task, join slot)` edge and record the child as a holder under its
-            // own cid, so both root-direct and nested (child→grandchild) re-links resolve.
-            let child_host = Arc::new(Mutex::new(ch));
-            child_hosts_by_edge.insert((parent, fnr.slot), Arc::clone(&child_host));
-            holder_hosts.push((cid, Arc::clone(&child_host)));
-            let mut child = Box::new(VCpu::new(
-                Arc::clone(&cfuncs),
-                Arc::clone(&ctypes),
-                fnr.entry,
-                &child_args,
-                child_mem,
-                child_host,
-                Fuel::fixed(carve_fuel),
-                cdepth,
-                cid,
-                SchedRef::Real(Arc::clone(sched)),
-                cdt,
-            ));
-            child.durable = true;
-            child.nested_child = true;
-            child.nested_slot = fnr.slot;
-            child.dstate = STATE_REWINDING;
-            child.root_shadow_sp = child_extent;
-            child.parent_task = parent;
-            // §4 depth-2+: a great-grandchild's residue coalesces in the root host too (the same
-            // shared sink the freeze used), so re-freezing a thawed deep subtree stays canonical.
-            child.freeze_sink = Some(Arc::clone(host_shared));
-            let info = NestedChildInfo {
-                slot: fnr.slot,
-                carve_off: fnr.carve_off,
-                size_log2: fnr.size_log2,
-                entry: fnr.entry,
-                module_digest: fnr.module_digest,
-            };
-            // Rebuild the recording parent's join table + nested-child record at the recorded
-            // slot (the root for a direct child, a re-created child for a grandchild).
-            if parent == id {
-                while root.threads.len() <= fnr.slot {
-                    root.threads.push(None);
-                }
-                root.threads[fnr.slot] = Some(cid);
-                root.nested_children.push(info);
-            } else if let Some(p) = children.get_mut(&parent) {
-                while p.threads.len() <= fnr.slot {
-                    p.threads.push(None);
-                }
-                p.threads[fnr.slot] = Some(cid);
-                p.nested_children.push(info);
-            }
-            abs_off.insert(cid, abs_carve);
-            children.insert(cid, child);
-        }
-        for ff in vseed.by_ref() {
+        // The re-launched detached children's host Arcs by their `(spawner task, join slot)` edge,
+        // so the root's restored `LiveImpl` handles re-link to their callees (§13.4 slice 4d).
+        let mut child_hosts_by_edge: BTreeMap<(TaskId, usize), Arc<Mutex<Host>>> = BTreeMap::new();
+        for ff in vseed {
             seed_thread(
                 s,
                 sched,
@@ -2950,9 +2679,9 @@ fn seed_domain(
         }
         // #1361 step 2 — deliver each completed-but-unjoined **detached** child: post its result
         // into the scheduler and map it to the recording parent's join slot, so the parent's
-        // re-executed `thread.join` reloads it (reload-not-reissue). Mirrors the completed-nested
-        // branch above; a detached child owns a separate window that (being completed) need not
-        // ride, so unlike a nested child nothing is re-created — only the join edge is rebuilt.
+        // re-executed `thread.join` reloads it (reload-not-reissue). A detached child owns a
+        // separate window that (being completed) need not ride, so nothing is re-created — only the
+        // join edge is rebuilt.
         {
             let mut dseed: Vec<FrozenDetached> = thaw_detached;
             dseed.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
@@ -2960,36 +2689,26 @@ fn seed_domain(
                 let Some(parent) = live(&live_ids, fd.parent_task) else {
                     continue;
                 };
-                let cid = s.next_task;
-                s.next_task += 1;
-                s.results.insert(
-                    cid,
-                    Outcome {
-                        result: fd.completed_result.map(|x| vec![Value::I64(x)]),
-                        mem: None,
-                        trap_bt: Vec::new(),
-                        trap_fiber: None,
-                        trap_fault: None,
-                    },
-                );
                 let spawner = if parent == id {
                     Some(&mut *root)
                 } else {
                     children.get_mut(&parent).map(|p| &mut **p)
                 };
-                if let Some(p) = spawner {
-                    while p.threads.len() <= fd.slot {
-                        p.threads.push(None);
+                let result = fd.completed_result.map(|x| vec![Value::I64(x)]);
+                match spawner {
+                    Some(p) => deliver_detached(s, p, fd.slot, result),
+                    None => {
+                        let cid = s.next_task;
+                        s.next_task += 1;
+                        s.results.insert(cid, Outcome::ended(result));
                     }
-                    p.threads[fd.slot] = Some(cid);
-                    p.delivered_detached.push((fd.slot, cid));
                 }
             }
         }
         // #1361 step 4 — re-launch each **live** detached child: a domain of its own window and
         // powerbox, rewound from its own artifact (see [`relaunch_detached`]), re-linked into its
         // spawner's join table, doorbell, kill flag and lane at the recorded slot — so the spawner's
-        // rewound `thread.join` (op 15 is a `call.cap` checkpoint: its slot handle reloads, the spawn
+        // rewound `thread.join` (op 17 is a `call.cap` checkpoint: its slot handle reloads, the spawn
         // is not re-issued) parks on the child exactly as before the cut.
         let mut lseed = thaw_live_detached;
         lseed.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
@@ -3004,33 +2723,47 @@ fn seed_domain(
             };
             let edge = (spawner.id, td.slot);
             if let Some(child) = relaunch_detached(s, sched, spawner, host_shared, td) {
-                // A detached child is a callee like a nested one (#1901).
+                // A detached child is a callee (#1901).
                 child_hosts_by_edge.insert(edge, Arc::clone(&child.host));
                 s.runnable.push_back(child);
             }
         }
-        // §13.4 slice 4d: re-link every holder's restored `LiveImpl` handles to their
-        // re-created callees now that the subtree exists, nested and detached — the holder's rewound call then
-        // dispatches to the live callee exactly as before the freeze. Each holder (the root and
-        // every re-created child) resolves its callee by the `(holder task, join slot)` edge, so
-        // a nested holder (a child holding a cap onto a grandchild) re-links against its *own*
-        // children, not just the root against its direct children.
-        let holders = std::iter::once((id, Arc::clone(host_shared))).chain(holder_hosts);
-        for (htask, hhost) in holders {
-            let pending = hhost.lock_unpoisoned().take_pending_live_impls();
-            for (idx, cslot, export) in pending {
-                if let Some(chost) = child_hosts_by_edge.get(&(htask, cslot)) {
-                    hhost
-                        .lock_unpoisoned()
-                        .relink_live_impl(idx, Arc::clone(chost), export);
-                }
+        // §13.4 slice 4d: re-link the root's restored `LiveImpl` handles to their re-launched
+        // callees now that they exist — the root's rewound call then dispatches to the live callee
+        // exactly as before the freeze. A re-launched child re-links its own as the root of its
+        // window ([`relaunch_detached`] seeds it through this function).
+        let pending = host_shared.lock_unpoisoned().take_pending_live_impls();
+        for (idx, cslot, export) in pending {
+            if let Some(chost) = child_hosts_by_edge.get(&(id, cslot)) {
+                host_shared
+                    .lock_unpoisoned()
+                    .relink_live_impl(idx, Arc::clone(chost), export);
             }
         }
-        // Enqueue every re-created child, spawned and nested, parents first (ascending cid).
+        // Enqueue every re-created child, parents first (ascending cid).
         for (_, child) in children {
             s.runnable.push_back(child);
         }
     }
+}
+
+/// A detached child of `spawner`'s, at its join `slot`, that the thaw delivers ended with `result`
+/// rather than relaunch: one that completed before the freeze, or (#2318) one it cannot relaunch,
+/// which ends with `ThreadFault`. The spawner's rewound join reloads it.
+fn deliver_detached(
+    s: &mut Sched,
+    spawner: &mut VCpu,
+    slot: usize,
+    result: Result<Vec<Value>, Trap>,
+) {
+    let cid = s.next_task;
+    s.next_task += 1;
+    s.results.insert(cid, Outcome::ended(result));
+    while spawner.threads.len() <= slot {
+        spawner.threads.push(None);
+    }
+    spawner.threads[slot] = Some(cid);
+    spawner.delivered_detached.push((slot, cid));
 }
 
 /// A re-created task keeps its frozen id when still free, so the §12.6 canonical re-freeze is
@@ -3042,12 +2775,12 @@ fn claim_task(s: &mut Sched, want: usize) -> TaskId {
 }
 
 /// Thaw: re-create one spawned vCPU a freeze recorded ([`seed_domain`]), under the parent that spawned
-/// it — the root, a re-created thread, or a re-created §14 nested child (#1686). The thread gets its
+/// it — the root or a re-created thread. The thread gets its
 /// parent's window, powerbox, fiber registry and freeze-residue sink, exactly as `thread.spawn` gave
 /// them, and its handle lands at its recorded slot in the parent's join table (#1685). A parent the
 /// thaw did not re-create leaves the thread out: that parent's rewound join then fails closed.
 ///
-/// Per-piece rebuild (none of "top `n`, densely" holds with recycling / nesting):
+/// Per-piece rebuild (none of "top `n`, densely" holds with recycling):
 ///   • context — *derived* from the restored shadow-SP (`ShadowArena::ctx_of_sp`), since the region
 ///     rides in the absolute shadow-SP; added to the parent registry's occupancy mask so a post-thaw
 ///     spawn lands in a genuinely-free context.
@@ -3084,18 +2817,19 @@ fn seed_thread(
     // #1685 — a child that finished unjoined is not re-created: its result waits in the scheduler
     // for the rewound `join`, as it did before the freeze.
     if let Some(r) = ff.completed_result {
-        s.results.insert(
-            cid,
-            Outcome {
-                result: Ok(vec![Value::I64(r)]),
-                mem: None,
-                trap_bt: Vec::new(),
-                trap_fiber: None,
-                trap_fault: None,
-            },
-        );
+        s.results
+            .insert(cid, Outcome::ended(Ok(vec![Value::I64(r)])));
         return;
     }
+    // #2001 — the thread handed its `spawn` back when it unwound for the freeze, and lived before
+    // it: charged again past any ceiling. #2318 — never past the process's pools: a thread they
+    // have no room for is one the process cannot hold, so it ends with `ThreadFault`, which its
+    // rewound join answers, and nothing it spawned is re-created.
+    let Some(live) = LiveVcpu::rebuild(p.host.lock_unpoisoned().own_node()) else {
+        s.results
+            .insert(cid, Outcome::ended(Err(Trap::ThreadFault)));
+        return;
+    };
     live_ids.insert(ff.task as TaskId, cid);
     s.live += 1;
     let ctx = p.arena().ctx_of_sp(ff.shadow_sp);
@@ -3117,11 +2851,8 @@ fn seed_thread(
         Arc::clone(dt),
     ));
     child.registry = Arc::clone(&p.registry);
-    child.freeze_sink = p.freeze_sink.clone();
     child.kill = p.kill.clone();
-    // #2001 — the thread handed its `spawn` back when it unwound for the freeze, and lived before
-    // it: charged again past any ceiling.
-    child.live = LiveVcpu::force(p.host.lock_unpoisoned().own_node());
+    child.live = live;
     child.durable = true;
     child.dstate = STATE_REWINDING; // re-enter under rewind, from its restored extent
     child.root_shadow_sp = ff.shadow_sp;
@@ -3137,7 +2868,7 @@ fn seed_thread(
 /// and re-link the spawner's per-slot state — join, doorbell, kill flag, lane, powerbox — exactly as op
 /// 15 minted them. `grants` is the spawner's domain powerbox, which holds the module grant the child
 /// runs. `None` if the grant is gone or the child's imports no longer bind; the spawner's slot then
-/// stays empty and its rewound join fails closed, the same per-child rule a nested child follows.
+/// stays empty and its rewound join fails closed.
 fn relaunch_detached(
     s: &mut Sched,
     sched: &Arc<Scheduler>,
@@ -3164,14 +2895,23 @@ fn relaunch_detached(
     } = grants
         .lock_unpoisoned()
         .prepare_detached_relaunch(&launch, host, window.page_map())?;
-    // #1971 — the lease op 15 filed at the spawn, filed again: the child's window goes back to the
+    // #1971 — the lease op 17 filed at the spawn, filed again: the child's window goes back to the
     // budget that paid for it when the child ends, on the spawner's handle, as an unfrozen child's does.
-    let lease = spawner
+    // #2318 — refused when the process's pools have no room for it: the child is not relaunched, and
+    // ends with `ThreadFault` (its window went back).
+    let runs = window
+        .page_map()
+        .window_runs(temen_ir::module_null_guard(), 1u64 << reserved_log2);
+    let filed = spawner
         .host
         .lock_unpoisoned()
-        .relaunch_lease(&mut host, memory_log2)
-        .map(|lease| (Arc::clone(&spawner.host), lease));
-    // The window: built as op 15 builds it (its NULL guard included, #1733), then the child's image
+        .relaunch_lease(&mut host, memory_log2, runs);
+    let Ok(lease) = filed else {
+        deliver_detached(s, spawner, slot, Err(Trap::ThreadFault));
+        return None;
+    };
+    let lease = lease.map(|lease| (Arc::clone(&spawner.host), lease));
+    // The window: built as op 17 builds it (its NULL guard included, #1733), then the child's image
     // and page map laid over it, its freeze word cleared and its context-0 thaw word set —
     // `begin_thaw`, on the child's own window.
     let mut mem = Mem::from_spec(WindowSpec {
@@ -3183,23 +2923,31 @@ fn relaunch_detached(
         ..WindowSpec::default()
     });
     mem.restore_layout(&window);
-    // #2025 — and its §13 pages aliased back onto the regions its restored powerbox holds.
-    if !host.realias_regions(&mut mem, &window.dense_prots()) {
+    // #2025 — and its §13 pages aliased back onto the regions its restored powerbox holds. #2268 —
+    // then the window has started, with the runs its artifact gave it, which its lease paid for.
+    let started = host.realias_regions(&mut mem, window.page_map()) && {
+        host.start_window(mem.window_runs());
+        mem.durable_set_state(STATE_NORMAL);
+        let thaw_off = mem.thaw_state_off(0);
+        mem.write_bytes(thaw_off, &STATE_REWINDING.to_le_bytes())
+            .is_some()
+    };
+    if !started {
+        // #2318 — a relaunch refused once its lease is filed hands the child's window back, as its
+        // end would: it never runs, and ends with `ThreadFault`.
+        host.release_memory();
+        if let Some((spawner_host, lease)) = lease {
+            spawner_host.lock_unpoisoned().release_detached(lease);
+        }
+        deliver_detached(s, spawner, slot, Err(Trap::ThreadFault));
         return None;
     }
-    // #2268 — the window has started, with the runs its artifact gave it.
-    host.start_window(mem.window_runs());
-    mem.durable_set_state(STATE_NORMAL);
-    let thaw_off = mem.thaw_state_off(0);
-    mem.write_bytes(thaw_off, &STATE_REWINDING.to_le_bytes())?;
     let dom = host.domain_id() as usize;
     let child_host = Arc::new(Mutex::new(host));
     sched.wire_signal_doors(&child_host);
     // Entry args are inert under a rewind (the prologue reloads spilled values), so pass zero
     // placeholders of the entry's shape, as the nested re-attach does.
-    let arity = funcs
-        .get(launch.entry as usize)
-        .map_or(0, |f| f.params.len());
+    let arity = funcs.first().map_or(0, |f| f.params.len());
     let args = bytecode::child_entry_args(arity, 0, 0);
     let cid = s.next_task;
     s.next_task += 1;
@@ -3216,7 +2964,7 @@ fn relaunch_detached(
     let mut child = Box::new(VCpu::new(
         Arc::clone(&funcs),
         Arc::clone(&types),
-        launch.entry,
+        0,
         &args,
         Some(mem),
         Arc::clone(&child_host),
@@ -3230,7 +2978,18 @@ fn relaunch_detached(
     child.durable = true;
     child.kill = Some(Arc::clone(&kflag));
     child.freeze_bell = Some(Arc::clone(&bell));
+    child.spawner_domain = Some(domain_key_of(spawner)); // #2455, as op 17 sets it
     child.window_lease = lease;
+    // #2438 — a demand-paged child's faults go to its spawner's pager again, as op 17 wired them: its
+    // unsupplied pages are still unmapped in its image. The codec checked the export against the
+    // spawner's program.
+    if let Some(export) = launch.pager {
+        child.pager = Some(PagerRef {
+            cell: Arc::clone(&spawner.host),
+            export,
+        });
+        child.fault_pager = true;
+    }
     child.lane_chain = std::iter::once((dom, launch.lane))
         .chain(spawner.lane_chain.iter().copied())
         .collect();
@@ -3255,10 +3014,9 @@ fn relaunch_detached(
         (
             bell,
             DetachedSpawn {
-                entry: launch.entry,
                 module: Arc::clone(&module),
                 digest: launch.digest,
-                same_module: launch.same_module,
+                pager: launch.pager,
             },
         ),
     );
@@ -3327,19 +3085,6 @@ fn drive_over_cell(
         s.handoff = handoff;
         Arc::new(s)
     };
-    // §9/§12 async ring: wire the completion `notify` hook to this run's M:N scheduler, so an offload
-    // worker waking a vCPU parked in `wait` is a `Scheduler::notify` on the confined counter key.
-    // §12 — the completion-wake hook: a pool worker posting a punted dispatch's result
-    // triggers the scheduler's ordered drain, finishing vCPUs parked in `Blocked::CapPending`.
-    // Cleared at teardown (it captures the run's scheduler — cycle discipline).
-    {
-        let sched_for_comp = Arc::clone(&sched);
-        let mut hg = host_shared.lock_unpoisoned();
-        let comps = hg.completions();
-        hg.set_completion_notify(Arc::new(move || {
-            sched_for_comp.completion_drain(&comps);
-        }));
-    }
     // #799 L1 (embedder `^C`) / #863 slice 3 — hand the signal source a scheduler-wake closure so an
     // embedder raise (`Posix::raise_signal`) can interrupt a parked blocking syscall even when every
     // fiber is parked and no safepoint fires. The personality invokes it only for a *deliverable*
@@ -3451,13 +3196,8 @@ fn drive_over_cell(
         // artifact on thaw, so the padding these slots land in exists. A unit that names its own
         // functions installs them again first, in the first free slots: the record holds only
         // entries, so they land where they did only if they were the first free then too.
-        for (slot, unit_funcs, unit_types, id) in &jit_reapply {
-            dt.install(
-                Arc::clone(unit_funcs),
-                Arc::clone(unit_types),
-                *id,
-                Some(*slot),
-            );
+        for (slot, unit_funcs, unit_types) in &jit_reapply {
+            dt.install(Arc::clone(unit_funcs), Arc::clone(unit_types), Some(*slot));
         }
         let mut root = Box::new(VCpu::new(
             Arc::clone(&funcs),
@@ -3499,16 +3239,10 @@ fn drive_over_cell(
     for h in handles {
         let _ = h.join();
     }
-    // Drain any in-flight async-ring offload jobs (they hold the window's `Arc<Region>` and may still
-    // be writing the futex counter) and drop the `notify` hook's `Arc<Scheduler>` before reading the
-    // final window back. Safe to lock: all vCPUs are gone, so the shared host is otherwise idle.
-    {
-        let mut h = host_shared.lock_unpoisoned();
-        h.quiesce_pool();
-        h.clear_completion_notify();
-        // #863 slice 3 — no signal-wake clear: the wake closure holds the scheduler *weakly*, so a
-        // source kept alive past the run pins nothing and a post-run raise is a no-op.
-    }
+    // The run waits for no punted call still in flight (#2493): one never touches the window, and
+    // posts its answer into its store. Nothing to unwire: the completion-wake hooks (#2424) and the
+    // signal-wake closure (#863 slice 3) hold the scheduler *weakly*, so a store or source kept
+    // alive past the run pins nothing, and a late completion or raise is a no-op.
     // #1361 step 3 — harvest each live detached child the freeze rang the doorbell for. By here
     // `worker_loop` has run until every vCPU finished, so a child that took the bell has unwound and
     // delivered its window through the ordinary result channel; claim it and pair it with the
@@ -3531,8 +3265,20 @@ fn drive_over_cell(
                 // `layout_snapshot` is root-window-only, and a detached child's window *is* a root
                 // window. A §13 page rides as its alias; the codec decides whether the cut holds the
                 // region (R4, #2025).
-                let out = sched.lock().results.remove(&p.child_task);
-                let Some(m) = out.and_then(|o| o.mem) else {
+                // #2438 — only a child that unwound. One that trapped, or that a deadlock teardown
+                // reaped before it reached its poll, keeps its window but has nothing to resume: it is
+                // unreached, never written as if it had unwound. So is one that ran to its end while
+                // its domain was held for its own paged children (#2455): it did not unwind.
+                let out = {
+                    let mut s = sched.lock();
+                    let unwound = s.unwound.contains(&p.child_task);
+                    s.withheld
+                        .remove(&p.child_task)
+                        .map(|w| w.outcome)
+                        .or_else(|| s.results.remove(&p.child_task))
+                        .filter(|_| unwound)
+                };
+                let Some(m) = out.filter(|o| o.result.is_ok()).and_then(|o| o.mem) else {
                     unreached.push(p);
                     continue;
                 };
@@ -3549,11 +3295,10 @@ fn drive_over_cell(
                     host: p.host,
                     launch: DetachedLaunch {
                         task: p.child_task,
-                        entry: p.spawn.entry,
                         digest: p.spawn.digest,
                         lane,
-                        same_module: p.spawn.same_module,
                         names,
+                        pager: p.spawn.pager,
                     },
                     module: p.spawn.module,
                 });
@@ -3564,9 +3309,12 @@ fn drive_over_cell(
     }
     let (out, trap_origin, twin_traps) = {
         let mut s = sched.lock();
+        // Whether the run froze: its root unwound. Some vCPU can have unwound in a run whose root
+        // then finished, held at `NORMAL` for its paged children (#2455): that run did not freeze.
+        let froze = s.unwound.contains(&root_id);
         // #1684 — every fiber slot the freeze did not flatten rides too: a fresh one (never
         // resumed) and a free one (its generation), so the thaw rebuilds the table slot for slot.
-        if s.froze {
+        if froze {
             host_shared
                 .lock_unpoisoned()
                 .frozen_fibers
@@ -3574,7 +3322,7 @@ fn drive_over_cell(
         }
         // #1685 — a thread that finished and was never joined rides the freeze as completed
         // residue at its join slot; the thaw hands its result to the rewound `join`.
-        if s.froze {
+        if froze {
             for (task, f) in std::mem::take(&mut s.finished_threads) {
                 let Some(Ok(r)) = s.results.get(&task).map(|o| join_outcome(o.result.clone()))
                 else {
@@ -3599,7 +3347,7 @@ fn drive_over_cell(
         // was in flight — a §14 child's backstop refusal, say — fails the run, though the root
         // itself unwound `Ok` before it. Otherwise the residue already recorded looks like a whole
         // freeze.
-        if let (Ok(_), Some(t)) = (&out.result, s.freeze_fault) {
+        if let (true, Ok(_), Some(t)) = (froze, &out.result, s.freeze_fault) {
             out.result = Err(t);
         }
         (out, s.trap_origin.take(), std::mem::take(&mut s.twin_traps))
@@ -3611,7 +3359,8 @@ fn drive_over_cell(
     *fuel = host_shared.lock_unpoisoned().fuel_left();
     *mem = out.mem;
     // Prefer the trap-origin capture (the first vCPU to actually trap) over the root's own outcome,
-    // which for a join-propagated child trap names the join site, not the origin. `None` ⇒ clean run
+    // which for a trap the root ended in on another's behalf — a sibling's teardown, a child's trap
+    // its join answered (#2066) — names where the root was, not the origin. `None` ⇒ nothing trapped
     // (use the root's empty backtrace). This mirrors the JIT's `root_trap_cap.or(worker_trap_cap)`.
     let origin = trap_origin.unwrap_or(TrapOrigin {
         bt: out.trap_bt,
@@ -3640,7 +3389,7 @@ pub fn run_capture(
     init_mem: &[u8],
 ) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
     // Default reservation policy (§4): a large reserved range, only `mapped` backed.
-    run_capture_reserved(m, func, args, fuel, init_mem, DEFAULT_RESERVED_LOG2)
+    run_capture_reserved(m, func, args, fuel, init_mem, default_reserved_log2())
 }
 
 /// Like [`run_capture`], but with a host **reservation policy**: only the declared `1 << size_log2`
@@ -3721,9 +3470,9 @@ thread_local! {
         const { core::cell::RefCell::new(Vec::new()) };
 }
 
-/// The trap-time backtrace of the last run on this thread — innermost frame first, empty if that run
-/// finished cleanly or none has happened. This is the **trap-origin** capture (first vCPU to trap),
-/// so a child domain's trap names the child's frames, not the parent's join site.
+/// The trap-time backtrace of the last run on this thread — innermost frame first, empty if nothing
+/// in that run trapped or none has happened. This is the **trap-origin** capture (first vCPU to
+/// trap), so a child domain's trap names the child's frames, not the parent's join site.
 pub fn last_capture_backtrace() -> Vec<IrPc> {
     LAST_CAPTURE_BACKTRACE.with(|c| c.borrow().clone())
 }
@@ -3737,9 +3486,11 @@ thread_local! {
         const { core::cell::RefCell::new(None) };
 }
 
-/// The window-relative address of the last run's `MemoryFault` (a NULL deref is `0`); `None` if that
-/// run did not fault on an address. For a nested (op-13) child it is relative to the child's own
-/// carve — the frame its backtrace is already in.
+/// The window-relative address of the last run's first `MemoryFault` (a NULL deref is `0`); `None`
+/// if no vCPU of that run faulted on an address. It rides the first-wins trap-origin capture, so a
+/// §14 child's fault counts though its parent's join answers it (#2066): a root that ends in the
+/// trap it was answered reports where the child faulted, relative to the child's own window — the
+/// frame its backtrace is already in.
 ///
 /// Worth more than it looks next to a backtrace: a **small** address says the pointer was never
 /// initialized, a **wild** one says the arithmetic that produced it was wrong. Those point at
@@ -3838,79 +3589,43 @@ pub enum CapturedProt {
     },
 }
 
-/// [`run_capture_reserved_with_host`] that **seeds** an initial per-page protection map (the
-/// durable-restore step — re-establishing `Ro`/`Unmapped` pages so a thawed guest faults exactly
-/// as the frozen one would) and **returns** the post-run protection map (the durable-freeze step),
-/// both one [`CapturedProt`] per [`DURABLE_SNAPSHOT_PAGE`]-byte page (DURABILITY.md §12.3). Pass
-/// `init_prots = None` to capture only (every page starts at its default). A `Backed` entry in
-/// `init_prots` re-aliases the region it names, which must already be in `host` (the codec's restore
-/// rebuilt it, #2025); one that does not map traps the run `Malformed` before it starts.
-#[allow(clippy::too_many_arguments)]
-pub fn run_capture_reserved_with_host_prots(
+/// [`run_capture_reserved_with_host`] over a whole window [`MemLayout`]: the run **starts** from
+/// `init` and **returns** its window's layout ([`Mem::layout_snapshot`], the durable-freeze step),
+/// `None` for a memoryless module. A fresh run's seed ([`MemLayout::is_seed`]) is the low bytes the
+/// module's data segments are laid over. Any other `init` is the window a thaw starts from as it is
+/// (#2441): its bytes, its page map in place of the one the segments made (#2307), and the pages it
+/// holds past them, so a thawed guest reads and faults exactly as the frozen one would (the
+/// durable-restore step). #2427 — a layout carries the prefix and each page held past it, so neither
+/// step costs more than the window holds. A `Backed` page of `init` re-aliases the region it names,
+/// which must already be in `host` (the codec's restore rebuilt it, #2025); one that does not map
+/// traps the run `Malformed` before it starts.
+pub fn run_capture_reserved_with_host_layout(
     m: &Module,
     func: FuncIdx,
     args: &[Value],
     fuel: &mut u64,
-    init_mem: &[u8],
-    init_prots: Option<&[CapturedProt]>,
+    init: &MemLayout,
     reserved_log2: u8,
     host: &mut Host,
-) -> (Result<Vec<Value>, Trap>, Vec<u8>, Vec<CapturedProt>) {
+) -> (Result<Vec<Value>, Trap>, Option<MemLayout>) {
     if m.funcs.get(func as usize).is_none() {
-        return (Err(Trap::Malformed), Vec::new(), Vec::new());
+        return (Err(Trap::Malformed), None);
     }
-    let mut mem = Mem::root(m, reserved_log2, None, init_mem);
-    if let (Some(mm), Some(prots)) = (mem.as_mut(), init_prots) {
-        mm.apply_prots(prots, init_mem);
-        if !host.realias_regions(mm, prots) {
-            return (Err(Trap::Malformed), Vec::new(), Vec::new());
+    // A thaw's image is written once, by its restore below.
+    let seed = if init.is_seed() { init.bytes() } else { &[] };
+    let mut mem = Mem::root(m, reserved_log2, None, seed);
+    if let Some(mm) = mem.as_mut() {
+        // A thaw's window is the layout's: its bytes over what instantiation laid, and its page map
+        // in place of the one the data segments made.
+        if !init.is_seed() {
+            mm.restore_layout(init);
+        }
+        if !host.realias_regions(mm, init.page_map()) {
+            return (Err(Trap::Malformed), None);
         }
     }
     let (r, ..) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, host);
-    let (snap, prots) = mem
-        .as_ref()
-        .map(|mm| {
-            let span = mm.capture_extent(SNAP_CAP) as usize;
-            (mm.snapshot_window(span), mm.snapshot_prots(span))
-        })
-        .unwrap_or_default();
-    (r, snap, prots)
-}
-
-/// Run the guest confined to a §14 **nested sub-window** `[base, base+size)` of a fully-backed
-/// parent of `parent_bytes` (the child runs over the parent's `Region`; `size = 1 << size_log2` is
-/// the module's declared memory). The confinement unit ([`temen_mask::Window::sub`]) bounds every child
-/// access to its slice (faulting otherwise), so a *verified* guest reaches only `[base, base+size)`. This is the
-/// interpreter side of the **sub-window escape-oracle**: pair it with the JIT's
-/// [`temen_jit::compile_and_run_capture_sub`] and byte-compare the whole parent — every byte outside
-/// the slice must stay as seeded (confinement) and the slice must match the JIT (codegen). `init_mem`
-/// seeds the whole parent; the returned `Vec` is the whole parent window (`parent_bytes` bytes).
-pub fn run_capture_sub(
-    m: &Module,
-    func: FuncIdx,
-    args: &[Value],
-    fuel: &mut u64,
-    init_mem: &[u8],
-    base: u64,
-    parent_bytes: u64,
-) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
-    let mut host = Host::new();
-    if m.funcs.get(func as usize).is_none() {
-        return (Err(Trap::Malformed), Vec::new());
-    }
-    let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::sub_window(base, mc.size_log2, parent_bytes, mc.shadow);
-        mm.seed_parent(init_mem); // seed the whole parent, not just the child slice
-        mm.init_data_at(&m.data, base); // child-relative segments shifted into the slice
-        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
-        mm
-    });
-    let (r, ..) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, &mut host);
-    let snap = mem
-        .as_ref()
-        .map(|mm| mm.snapshot_parent(parent_bytes))
-        .unwrap_or_default();
-    (r, snap)
+    (r, mem.as_ref().map(Mem::layout_snapshot))
 }
 
 /// Run a module under the **deterministic explorer** (§18) with scheduling decisions driven by
@@ -3931,7 +3646,7 @@ pub fn run_scheduled(
     }
     let funcs: Arc<[Func]> = m.funcs.clone().into();
     let types: Arc<[temen_ir::TypeEntry]> = m.types.clone().into();
-    let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
+    let mem = Mem::root(m, default_reserved_log2(), None, &[]);
     let det = Arc::new(DetSched::new(seed, MAX_VCPUS));
     let root_id = {
         let mut s = det.lock();
@@ -4715,7 +4430,7 @@ fn run_one_schedule(
     // `fresh_single_root`).
     let mem = memory.map(|mc| {
         Mem::from_spec(WindowSpec {
-            reserved_log2: DEFAULT_RESERVED_LOG2,
+            reserved_log2: default_reserved_log2(),
             mapped_log2: mc.size_log2,
             shadow: mc.shadow,
             data,
@@ -4862,11 +4577,6 @@ struct DomainTable {
     /// `unit_types[i]` is the type section of the unit installed as module `i + 1`, so a call
     /// variant executed in that unit resolves its interned signature.
     unit_types: Mutex<Vec<Arc<[temen_ir::TypeEntry]>>>,
-    /// Which host unit each installed module is, in lockstep with `units`: its `(table, unit)`
-    /// ([`Host::resolve_jit_code`]), or `None` for funcs no `Jit` table holds (an offer's handler
-    /// unit). A frame of the module reports it when it spawns, so its `module = -1` names the unit's
-    /// program ([`Host::resolve_spawn_module`], #2143).
-    unit_ids: Mutex<Vec<Option<(u32, u32)>>>,
     /// The slots each installed module's own functions fill, in lockstep with `units` (DESIGN.md §22
     /// "Unit-own funcrefs", #2314): `ref.func N` run in the module yields slot `[N]`. `None` for a
     /// unit that names none of its own functions, whose slots hold only its entry.
@@ -4896,7 +4606,6 @@ impl DomainTable {
             slots,
             units: Mutex::new(Vec::new()),
             unit_types: Mutex::new(Vec::new()),
-            unit_ids: Mutex::new(Vec::new()),
             unit_ref_slots: Mutex::new(Vec::new()),
         }
     }
@@ -4920,7 +4629,6 @@ impl DomainTable {
                 .collect(),
             units: Mutex::new(self.units.lock_unpoisoned().clone()),
             unit_types: Mutex::new(self.unit_types.lock_unpoisoned().clone()),
-            unit_ids: Mutex::new(self.unit_ids.lock_unpoisoned().clone()),
             unit_ref_slots: Mutex::new(self.unit_ref_slots.lock_unpoisoned().clone()),
         }
     }
@@ -4947,7 +4655,6 @@ impl DomainTable {
         &self,
         unit: Arc<[Func]>,
         unit_types: Arc<[temen_ir::TypeEntry]>,
-        id: (u32, u32),
         at: Option<u32>,
     ) -> Option<u32> {
         if at.is_some_and(|s| s as usize >= self.slots.len()) {
@@ -4955,7 +4662,7 @@ impl DomainTable {
         }
         let mut units = self.units.lock_unpoisoned();
         let own = if unit_names_own_funcs(&unit) {
-            let (module, _) = self.place_unit_funcs(&mut units, &unit, &unit_types, Some(id))?;
+            let (module, _) = self.place_unit_funcs(&mut units, &unit, &unit_types)?;
             Some(module)
         } else {
             None
@@ -4966,7 +4673,7 @@ impl DomainTable {
         };
         let module = match own {
             Some(k) => k,
-            None => self.push_unit(&mut units, unit, unit_types, Some(id), None),
+            None => self.push_unit(&mut units, unit, unit_types, None),
         };
         self.slots[slot].store(pack_slot(module, 0), Ordering::Release);
         Some(slot as u32)
@@ -4987,10 +4694,9 @@ impl DomainTable {
         &self,
         unit: Arc<[Func]>,
         unit_types: Arc<[temen_ir::TypeEntry]>,
-        id: Option<(u32, u32)>,
     ) -> Option<(u32, Arc<[u32]>)> {
         let mut units = self.units.lock_unpoisoned();
-        self.place_unit_funcs(&mut units, &unit, &unit_types, id)
+        self.place_unit_funcs(&mut units, &unit, &unit_types)
     }
 
     /// [`Self::install_unit_funcs`] under the held `units` lock.
@@ -4999,7 +4705,6 @@ impl DomainTable {
         units: &mut Vec<Arc<[Func]>>,
         unit: &Arc<[Func]>,
         unit_types: &Arc<[temen_ir::TypeEntry]>,
-        id: Option<(u32, u32)>,
     ) -> Option<(u32, Arc<[u32]>)> {
         let placed = self.unit_ref_slots.lock_unpoisoned();
         let found = units
@@ -5021,7 +4726,6 @@ impl DomainTable {
             units,
             Arc::clone(unit),
             Arc::clone(unit_types),
-            id,
             Some(Arc::clone(&slots)),
         );
         for (func, &slot) in free.iter().enumerate() {
@@ -5037,12 +4741,10 @@ impl DomainTable {
         units: &mut Vec<Arc<[Func]>>,
         unit: Arc<[Func]>,
         unit_types: Arc<[temen_ir::TypeEntry]>,
-        id: Option<(u32, u32)>,
         ref_slots: Option<Arc<[u32]>>,
     ) -> u32 {
         units.push(unit);
         self.unit_types.lock_unpoisoned().push(unit_types); // lockstep (#922)
-        self.unit_ids.lock_unpoisoned().push(id); // lockstep (#2143)
         self.unit_ref_slots.lock_unpoisoned().push(ref_slots); // lockstep (#2314)
         units.len() as u32
     }
@@ -5086,13 +4788,6 @@ impl DomainTable {
 
     fn unit_ref_slots_snapshot(&self) -> Vec<Option<Arc<[u32]>>> {
         self.unit_ref_slots.lock_unpoisoned().clone()
-    }
-
-    /// The host unit module `m` is (`unit_ids`): `None` for the primary program, the transient
-    /// invoked unit, and an installed module no `Jit` table holds.
-    fn unit_id(&self, m: u32) -> Option<(u32, u32)> {
-        let i = m.checked_sub(1)? as usize;
-        self.unit_ids.lock_unpoisoned().get(i).copied().flatten()
     }
 }
 
@@ -5362,9 +5057,32 @@ struct Outcome {
     trap_fiber: Option<i64>,
     /// The **window-relative address** this vCPU's `MemoryFault` named, when it trapped on one
     /// (#1591). Read off the vCPU's own [`Mem`] before it is dropped, so a *child* domain's fault
-    /// address survives the join propagation that flattens its trap to a bare `Err(Trap)` — the
-    /// parent's window has no record of it. `None` on a clean finish or a non-address trap.
+    /// address survives the join that answers its trap as a bare code (#2066) — the parent's window
+    /// has no record of it. `None` on a clean finish or a non-address trap.
     trap_fault: Option<u64>,
+}
+
+impl Outcome {
+    /// What a task the thaw does not run leaves its join: a result from before the freeze, or a
+    /// trap.
+    fn ended(result: Result<Vec<Value>, Trap>) -> Outcome {
+        Outcome {
+            result,
+            mem: None,
+            trap_bt: Vec::new(),
+            trap_fiber: None,
+            trap_fault: None,
+        }
+    }
+}
+
+/// #2455 — a child that unwound while its spawner's domain was held ([`Sched::withheld`]).
+struct Withheld {
+    /// The child's own domain ([`domain_key_of`]), which a `kill` names.
+    domain: usize,
+    outcome: Outcome,
+    /// Its window's lease, handed back if a kill ends it ([`VCpu::window_lease`]).
+    lease: Option<(Arc<Mutex<Host>>, Lease)>,
 }
 
 /// What the first vCPU to trap recorded about *its own* trap — the run-shared, first-wins capture
@@ -5372,8 +5090,8 @@ struct Outcome {
 struct TrapOrigin {
     bt: Vec<IrPc>,
     fiber: Option<i64>,
-    /// The window-relative faulting address (#1591). For a nested (op-13) child this is relative to
-    /// the child's own carve, which is the frame its own backtrace is in.
+    /// The faulting address in the faulting domain's own window (#1591), the frame its own backtrace
+    /// is in.
     fault: Option<u64>,
 }
 
@@ -5409,12 +5127,10 @@ fn frames_to_pcs(frames: &[Frame]) -> Vec<IrPc> {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 enum FutexKey {
     /// A normal (anonymous) window page — keyed by `(backing identity, backing-absolute address)`.
-    /// The address alone is **not** a sound identity across domains (#1283): every detached window
-    /// (op 15) and the root have `window.base() == 0`, and all of a run's domains share one
-    /// `wait_waiters`, so two detached siblings waiting on the same guest offset would rendezvous. The
-    /// backing identity (the `Arc<Region>` allocation address, stable while the window lives) separates
-    /// them; a §14 nested child shares its parent's `Arc<Region>` and its confined absolute address is
-    /// already backing-absolute, so parent↔nested-child rendezvous on anonymous memory is unchanged.
+    /// The address alone is **not** a sound identity across domains (#1283): every window starts at 0
+    /// of its own backing, and all of a run's domains share one `wait_waiters`, so two detached
+    /// siblings waiting on the same guest offset would rendezvous. The backing identity (the
+    /// `Arc<Region>` allocation address, stable while the window lives) separates them.
     Anon(u64, u64),
     /// A §13 `SharedRegion`-aliased page — keyed by `(backing identity, byte offset within the
     /// region)`, so every alias of the same region byte maps to the same key regardless of which
@@ -5508,10 +5224,10 @@ enum Blocked {
     /// re-executes from the top and either writes into the freed room or fails `-EPIPE`.
     PipeWrite { pipe: u32 },
     /// §12 parking-on-blocking (slice 2) — parked inside a **punted offloadable dispatch**, keyed
-    /// by its completion id. The offload pool posts the scalar result to [`Completions`]; the
-    /// run's `completion_notify` hook drains `completion_waiters` smallest-id-first (ids are
-    /// minted monotonically, so this is **submission order** — the §18 ordered-delivery pin) and
-    /// finishes the call via [`Pending::CapResult`]. Whole-vCPU and guest-invisible (a blocking
+    /// by its completion id. The offload pool posts the scalar result to the domain's
+    /// [`Completions`]; the wake hook the park installed there drains the domain's
+    /// `completion_waiters`, each answered call as it comes (#2477), and finishes the call via
+    /// [`Pending::CapResult`]. Whole-vCPU and guest-invisible (a blocking
     /// call just takes time), so a backend that blocks inline instead stays byte-identical.
     CapPending { id: u64 },
     /// §3.6 slice 3 — parked inside a call to a **live callee** awaiting its reply, keyed by
@@ -5564,9 +5280,9 @@ enum Blocked {
 
 /// Set on a parked vCPU before it is re-enqueued, telling its driver how to finish the op on resume.
 enum Pending {
-    /// Finish a `thread.join`: take the child's result from `threads[slot]`. With `wait`
-    /// (`Instantiator.wait`, op 18), push how the child ended instead ([`join_delivery`]).
-    Join { slot: usize, wait: bool },
+    /// Finish a join of the child at `threads[slot]`: a `thread.join`, or with `status` a §14
+    /// child's (`Instantiator.join`, op 1), which pushes how the child ended ([`join_delivery`]).
+    Join { slot: usize, status: bool },
     /// Finish a `reap` (FORK.md §8.6 — servicer-side `wait()`): take the twin's outcome from the
     /// scheduler by `TaskId` and push its **exit status** (a clean `Ok(first i64)`; a trapped twin
     /// becomes a nonzero crash status — never a propagated trap, so the waiting shell survives).
@@ -5659,7 +5375,7 @@ struct ExecReq {
     /// command's entry takes two params (§14 child-entry ABI).
     entry_args: Vec<Value>,
     /// The command module's NULL-guard extent (#1059/#1094): `POWERBOX_NULL_GUARD` for every command
-    /// (unconditional; `0` only for a sub-window smaller than the guard). The exec args region rides
+    /// (unconditional; `0` only for a window smaller than the guard). The exec args region rides
     /// it (`exec_window`), so a command's `_start` finds argv where it reads it (`module_args_base` =
     /// `guard + 128`).
     null_guard: u64,
@@ -5690,7 +5406,7 @@ impl ExecReq {
             m.exec_window(
                 back,
                 self.window,
-                &self.module.data,
+                &self.module,
                 self.null_guard,
                 self.args.as_deref(),
             )
@@ -5732,11 +5448,26 @@ struct PagerRef {
     export: u32,
 }
 
+/// #2164 — a demand-paged Cranelift JIT child's window, as its powerbox keeps it
+/// ([`Host::jit_paging`]): what its embedder's page sinks, page map and miss thunk need of it.
+#[derive(Clone)]
+pub struct JitPaging {
+    /// The **access table**: one byte per page of the declared window (`temen_ir::PAGE_READ`,
+    /// `temen_ir::PAGE_WRITE`), and one more for the page past it, which admits every access. The
+    /// child's code tests it before each access, and the window's page map, which it mirrors, writes
+    /// it.
+    pub table: Arc<[AtomicU8]>,
+    /// The declared window's length: the extent its pager supplies.
+    pub mapped: u64,
+}
+
 /// §2.2 / #1862 — where a pager's reply lands: a view of the faulting child's window and the page
 /// (child-relative) the reply supplies. The pager never addresses the child's memory; the runtime
-/// copies its bytes here at the settle, so the child may sit in a window the pager cannot see.
-struct PageSink {
-    child: Mem,
+/// copies its bytes here at the settle, so the child may sit in a window the pager cannot see. Every
+/// engine files and settles it through the pager's host ([`Host::request_page`],
+/// [`Host::settle_page`], #2164), whichever engine runs the pager and whichever runs the child.
+pub struct PageSink {
+    child: Box<dyn ChildWindow>,
     /// The page's child-relative base.
     page: u64,
     /// The page's length: one host page, or less when the window is smaller than a page.
@@ -5746,36 +5477,65 @@ struct PageSink {
     off: u64,
 }
 
-/// §2.2 / #1862 — settle a `page(addr)` request: copy the page the pager's reply `value` names
-/// out of the **pager's own window** (`pager_mem`, the serving vCPU's) into the faulting child's,
-/// then mark it mapped. `value` is the pager-window address of the faulting byte's source; the
-/// page around it is `[value - off, value - off + len)`. Runs on the pager's vCPU at the settle,
-/// before the reply is delivered, so the pager cannot reuse its buffer before the copy. Returns
-/// the value to deliver: unchanged, or `EFAULT` when the pager's window cannot supply that range
-/// (the child's fault is then fatal, as a pagerless one is). A ticket with no sink (not a page
-/// request) passes through.
-fn supply_page_at_settle(
-    sched: &SchedRef,
-    pager: &Arc<Mutex<Host>>,
-    ticket: u64,
-    value: i64,
-    pager_mem: Option<&Mem>,
-) -> i64 {
-    let Some(sink) = sched.take_page_sink(pager, ticket) else {
-        return value;
-    };
-    if value < 0 {
-        return value;
+/// #2164 — the faulting child's window, as a [`PageSink`] writes a supplied page into it: an
+/// interpreter's [`Mem`], or the Cranelift JIT's window, which its embedder implements (temen-run).
+pub trait ChildWindow: Send {
+    /// Write `bytes` at the child-relative page base `page`, then make the page read-write, in that
+    /// order, so no vCPU of the child sees the page mapped before its bytes are in place. `false`
+    /// when the window could not take the page (its OS refused to commit it), and then the fault is
+    /// fatal.
+    fn supply(&self, page: u64, bytes: &[u8]) -> bool;
+}
+
+impl ChildWindow for Mem {
+    fn supply(&self, page: u64, bytes: &[u8]) -> bool {
+        self.supply_page(page, bytes);
+        true
     }
-    let bytes = (value as u64)
-        .checked_sub(sink.off)
-        .and_then(|src| pager_mem?.read_bytes_impl(src, sink.len));
-    match bytes {
-        Some(b) => {
-            sink.child.supply_page(sink.page, &b);
-            value
+}
+
+impl PageSink {
+    /// The sink for a recoverable fault at `addr` in `child`'s window: the host page around it.
+    /// [`Mem::take_fault`] admits only a page of the declared window, so the page starts below
+    /// `mapped`.
+    fn at(child: &Mem, addr: u64) -> PageSink {
+        let page = addr / child.page * child.page;
+        PageSink::new(
+            Box::new(child.fork_for_thread()),
+            page,
+            child.page.min(child.window.mapped() - page),
+            addr - page,
+        )
+    }
+
+    /// The sink for a recoverable fault in `child`: the page at child-relative `page`, `len` bytes of
+    /// it (one host page, or less when the window is smaller), with the fault address `off` into it.
+    pub fn new(child: Box<dyn ChildWindow>, page: u64, len: u64, off: u64) -> PageSink {
+        PageSink {
+            child,
+            page,
+            len,
+            off,
         }
-        None => EFAULT,
+    }
+
+    /// Settle the request: copy the page the pager's reply `value` names out of the **pager's own
+    /// window** (`pager_mem`, the serving vCPU's) into the faulting child's, then mark it mapped.
+    /// `value` is the pager-window address of the faulting byte's source; the page around it is
+    /// `[value - off, value - off + len)`. Returns the value to deliver: unchanged, or `EFAULT`
+    /// when the pager's window cannot supply that range (the child's fault is then fatal, as a
+    /// pagerless one is).
+    fn supply(self, value: i64, pager_mem: Option<&dyn GuestMem>) -> i64 {
+        if value < 0 {
+            return value;
+        }
+        let bytes = (value as u64)
+            .checked_sub(self.off)
+            .and_then(|src| pager_mem?.read_bytes(src, self.len));
+        match bytes {
+            Some(b) if self.child.supply(self.page, &b) => value,
+            _ => EFAULT,
+        }
     }
 }
 
@@ -6099,13 +5859,13 @@ impl ParkSite {
             | ParkSite::Stopped
             | ParkSite::StreamRead
             | ParkSite::Reply => FreezeRule::Reissue,
-            ParkSite::Join | ParkSite::Lane => FreezeRule::Phase,
-            // A `wait(-1)` needs a live fork twin (#1688). A faulting access is no call, and it cannot
-            // unwind until its page arrives (#1940). A completion is a host operation outside the cut
-            // (#1902). A durable caller never animates an offer, so never waits to enter one (#1681).
-            ParkSite::ReapAny | ParkSite::PageFault | ParkSite::Completion | ParkSite::Admit => {
-                FreezeRule::Decline
-            }
+            // A faulting access is no call to re-issue, and cannot unwind until its page arrives
+            // (#1940); a freeze holds its pager to serve it (#2455), so it waits, then unwinds.
+            ParkSite::Join | ParkSite::Lane | ParkSite::PageFault => FreezeRule::Phase,
+            // A `wait(-1)` needs a live fork twin (#1688). A completion is a host operation outside
+            // the cut (#1902). A durable caller never animates an offer, so never waits to enter one
+            // (#1681).
+            ParkSite::ReapAny | ParkSite::Completion | ParkSite::Admit => FreezeRule::Decline,
         }
     }
 }
@@ -6161,36 +5921,43 @@ impl Sched {
         }
     }
 
-    /// Take the vCPUs parked at `site` out of it; its parked fibers stay, unless `fibers_too`, when
-    /// they are dropped with it (a run's teardown).
+    /// Take the vCPUs parked at `site` out of it, of each domain `of` picks; its parked fibers stay,
+    /// unless `fibers_too`, when they are dropped with it (a run's teardown).
     #[allow(clippy::vec_box)]
-    fn take(&mut self, site: ParkSite, fibers_too: bool) -> Vec<Box<VCpu>> {
-        fn pick<T: DomainMember>(fibers_too: bool) -> impl FnMut(&T) -> bool {
-            move |e| fibers_too || e.vcpu().is_some()
+    fn take(
+        &mut self,
+        site: ParkSite,
+        fibers_too: bool,
+        of: &dyn Fn(usize) -> bool,
+    ) -> Vec<Box<VCpu>> {
+        fn pick<'a, T: DomainMember>(
+            fibers_too: bool,
+            of: &'a dyn Fn(usize) -> bool,
+        ) -> impl FnMut(&T) -> bool + 'a {
+            move |e| (fibers_too || e.vcpu().is_some()) && of(e.domain_key())
         }
         let f = fibers_too;
         match site {
-            ParkSite::Svc => drain_queues(&mut self.svc_waiters, pick(f)),
-            ParkSite::Futex => drain_queues(&mut self.wait_waiters, pick(f)),
-            ParkSite::PipeRead => drain_queues(&mut self.pipe_waiters, pick(f)),
-            ParkSite::PipeWrite => drain_queues(&mut self.pipe_write_waiters, pick(f)),
-            ParkSite::Reap => drain_queues(&mut self.posix_reap_waiters, pick(f)),
-            ParkSite::Stopped => drain_queues(&mut self.stopped, pick(f)),
-            ParkSite::StreamRead => drain_queues(&mut self.cap_waiters, pick(f)),
-            ParkSite::Join => drain_where(&mut self.join_waiters, pick(f)),
-            ParkSite::Lane => drain_where(&mut self.lane_waiters, pick(f)),
-            ParkSite::ReapAny => drain_where(&mut self.reap_any_waiters, pick(f)),
+            ParkSite::Svc => drain_queues(&mut self.svc_waiters, pick(f, of)),
+            ParkSite::Futex => drain_queues(&mut self.wait_waiters, pick(f, of)),
+            ParkSite::PipeRead => drain_queues(&mut self.pipe_waiters, pick(f, of)),
+            ParkSite::PipeWrite => drain_queues(&mut self.pipe_write_waiters, pick(f, of)),
+            ParkSite::Reap => drain_queues(&mut self.posix_reap_waiters, pick(f, of)),
+            ParkSite::Stopped => drain_queues(&mut self.stopped, pick(f, of)),
+            ParkSite::StreamRead => drain_queues(&mut self.cap_waiters, pick(f, of)),
+            ParkSite::Join => drain_where(&mut self.join_waiters, pick(f, of)),
+            ParkSite::Lane => drain_where(&mut self.lane_waiters, pick(f, of)),
+            ParkSite::ReapAny => drain_where(&mut self.reap_any_waiters, pick(f, of)),
             ParkSite::Reply => {
-                let mut pick = pick(f);
+                let mut pick = pick(f, of);
                 drain_where(&mut self.ticket_waiters, |e| is_reply(e) && pick(e))
             }
             ParkSite::PageFault => {
-                drain_where(&mut self.ticket_waiters, |e: &((usize, u64), Waiter)| {
-                    !is_reply(e)
-                })
+                let mut pick = pick(f, of);
+                drain_where(&mut self.ticket_waiters, |e| !is_reply(e) && pick(e))
             }
-            ParkSite::Completion => drain_where(&mut self.completion_waiters, pick(f)),
-            ParkSite::Admit => drain_queues(&mut self.admit_waiters, pick(f)),
+            ParkSite::Completion => drain_where(&mut self.completion_waiters, pick(f, of)),
+            ParkSite::Admit => drain_queues(&mut self.admit_waiters, pick(f, of)),
         }
     }
 }
@@ -6328,17 +6095,18 @@ fn client_gone_locked(s: &mut Sched, service: usize) {
 }
 
 /// #1217 — the service domains a finishing vCPU was a client of, whose `svc.wait` its end
-/// releases: its §2.2 pager, and — for a §14 child's entry vCPU, carve (`nested_child`) or detached
-/// (the one vCPU with a `freeze_bell`): the child domain's end, not a thread of it finishing — the
-/// provider of every live offer its powerbox still holds ([`Binding::LiveImpl`], the re-granted
-/// `child_offer` shape). Instanced offers (CALLS.md 4x, animated on the caller's own vCPU) never
-/// park a provider on this client, so they are not listed. Locks the host cells briefly, never
-/// nested; call it before taking the scheduler lock.
+/// releases. Only a §14 child's entry vCPU (the one vCPU with a `freeze_bell`) has any: its end is
+/// the child domain's, where a thread of it finishing is not. They are its §2.2 pager, which its
+/// threads share (#2164), and the provider of every live offer its powerbox still holds
+/// ([`Binding::LiveImpl`], the re-granted `child_offer` shape). Instanced offers (CALLS.md 4x,
+/// animated on the caller's own vCPU) never park a provider on this client, so they are not
+/// listed. Locks the host cells briefly, never nested; call it before taking the scheduler lock.
 fn client_gone_targets(v: &VCpu) -> Vec<usize> {
-    let mut cells: Vec<Arc<Mutex<Host>>> = v.pager.iter().map(|p| Arc::clone(&p.cell)).collect();
-    if v.nested_child || v.freeze_bell.is_some() {
-        cells.extend(v.host.lock_unpoisoned().live_offer_providers());
+    if v.freeze_bell.is_none() {
+        return Vec::new();
     }
+    let mut cells: Vec<Arc<Mutex<Host>>> = v.pager.iter().map(|p| Arc::clone(&p.cell)).collect();
+    cells.extend(v.host.lock_unpoisoned().live_offer_providers());
     let mut ids: Vec<usize> = cells
         .iter()
         .map(|c| c.lock_unpoisoned().domain_id() as usize)
@@ -6397,7 +6165,7 @@ struct Twin {
 struct FinishedThread {
     parent_task: TaskId,
     slot: usize,
-    /// The spawner's freeze-residue sink (the root host, for a thread inside a §14 subtree).
+    /// The thread's powerbox, where its domain's freeze residue lands.
     sink: Arc<Mutex<Host>>,
 }
 
@@ -6478,15 +6246,13 @@ struct Sched {
     /// drain the entry into `runnable` and the write re-issues.
     pipe_write_waiters: BTreeMap<u32, Vec<Waiter>>,
     /// §12 parking-on-blocking (slice 2) — callers parked inside a punted offloadable dispatch,
-    /// keyed by **completion id** (unique: [`Completions`] mints monotonically per host, and one
-    /// cell runs at most one sub-run at a time — the `busy` gate). Per host is per run: only the
-    /// run's root host can punt, because the punting caps (offloadable host procs, `Blocking`) are
-    /// neither re-grantable nor forkable, so no child, twin or instance powerbox ever holds one
-    /// (#1817), and only the root host carries the drain hook. Drained smallest-id-first by
-    /// [`Scheduler::completion_drain`], which stops at the first waiter whose result has not
-    /// arrived — so delivery is in submission order (§18) and a later completion never overtakes
-    /// an earlier parked caller.
-    completion_waiters: BTreeMap<u64, Waiter>,
+    /// keyed by **`(domain id, completion id)`**: each domain mints its ids in its own
+    /// [`Completions`] store, from 0, so a child's, twin's or instance's punt (#2424) never meets
+    /// another domain's id. Drained by [`Scheduler::completion_drain`]: each call's answer as it
+    /// comes, so no outstanding call holds back another (#2477).
+    completion_waiters: BTreeMap<(u64, u64), Waiter>,
+    /// #2424 — the store each domain in `completion_waiters` parks on, by domain id.
+    completion_stores: BTreeMap<u64, Arc<Completions>>,
     /// §3.6 slice 3 — callers parked awaiting a live-callee **reply**, keyed by
     /// `(callee domain id, dispatch ticket)` (exactly one caller per key; woken by
     /// [`Scheduler::cap_reply_or_stash`] with the result). The **callee** must be part of the key:
@@ -6507,11 +6273,6 @@ struct Sched {
     /// that itself dies (its reply never comes). Bounded by in-flight-calls-across-a-death, not by
     /// call volume.
     orphan_tickets: BTreeSet<(usize, u64)>,
-    /// §2.2 / #1862 — the page each in-flight `page(addr)` request supplies, keyed like
-    /// [`Sched::ticket_waiters`] by `(pager domain id, ticket)`. Filed by the faulting child in
-    /// the same scheduler critical section as its enqueue, so the pager can never settle the
-    /// request before its sink exists; taken at the settle ([`supply_page_at_settle`]).
-    page_sinks: BTreeMap<(usize, u64), PageSink>,
     /// §3.6 slice 3 — serving vCPUs parked in `svc.wait` on an empty queue, keyed by their
     /// domain identity (the powerbox `Arc` pointer — all vCPUs of a domain share it). Woken by
     /// a caller's enqueue ([`Scheduler::svc_wake`]); resume re-executes the `svc.wait`.
@@ -6604,15 +6365,24 @@ struct Sched {
     /// #1685 — the vCPUs that finished by unwinding for the freeze: their results are placeholders,
     /// so a `join` that takes one is re-issued on thaw rather than reloaded.
     unwound: std::collections::BTreeSet<TaskId>,
+    /// #2455 — leaves-first: a domain ([`domain_key_of`]) that pages live detached children when a
+    /// freeze reaches it is **held** at `NORMAL`, so it keeps serving their faults, until each child
+    /// it waits on here has ended. Then [`release_hold`] lets it unwind ([`hold_for_paged`]).
+    held: BTreeMap<usize, std::collections::BTreeSet<TaskId>>,
+    /// #2455 — a child that unwound while its spawner's domain was held. Its outcome is kept from
+    /// `results`, so to its spawner, which runs on, it reads as running, as the spawner's own cut will
+    /// record it; the harvest takes it, and a `kill` ends it ([`kill_withheld`]).
+    withheld: BTreeMap<TaskId, Withheld>,
     /// #1689 — the first trap of any vCPU (a fork twin's excepted) that finished once the freeze was
     /// in flight. `drive` fails the run with it: a freeze with a failed member is not a freeze.
     freeze_fault: Option<Trap>,
     /// §5 W3 / §23-D57 — the **trap-origin capture**: the backtrace, fiber and faulting address of
-    /// the *first* vCPU to trap on its own op, run-shared and **first-wins**. A child trap propagates
-    /// to its `thread.join`er as a bare `Err(Trap)` (the parent re-traps with *its* frames at the
-    /// join), so the root's own outcome would name the join site, not the origin. `drive` reads this
-    /// instead, so the trap diagnostic names *where the guest actually trapped* — the interpreter
-    /// counterpart to the JIT's `Domain` trap-capture handoff. `None` on a clean run.
+    /// the *first* vCPU to trap on its own op, run-shared and **first-wins**. A thread's trap ends its
+    /// domain, the root's with the same trap where it stood, and a child's trap reaches its joiner as
+    /// a bare code (#2066) that a root may end the run in, so the root's own outcome would name where
+    /// the root was, not the origin. `drive` reads this instead, so the trap diagnostic names *where
+    /// the guest actually trapped* — the interpreter counterpart to the JIT's `Domain` trap-capture
+    /// handoff. `None` when nothing trapped.
     trap_origin: Option<TrapOrigin>,
     /// #1665 — every **fork twin** that trapped this run, in completion order. A twin's trap never
     /// propagates — reap is not join; it becomes the crash status its parent `wait`s on — so it is
@@ -7058,9 +6828,12 @@ impl Scheduler {
     /// fiber early-probe, so the pair can't deadlock.
     fn cap_reply_or_stash(&self, ticket: u64, result: i64, callee: &Arc<Mutex<Host>>) {
         let mut s = self.lock();
-        let callee_id = callee.lock_unpoisoned().domain_id() as usize;
-        // #1862 — a page request settled without a copy (an error reply) drops its sink here.
-        s.page_sinks.remove(&(callee_id, ticket));
+        let callee_id = {
+            let mut c = callee.lock_unpoisoned();
+            // #1862 — a page request answered without a settle (an error reply) drops its sink.
+            c.page_sinks.remove(&ticket);
+            c.domain_id() as usize
+        };
         match s.ticket_waiters.remove(&(callee_id, ticket)) {
             Some(Waiter::VCpu(mut v)) => {
                 v.pending = Some(Pending::CapResult(result));
@@ -7084,45 +6857,69 @@ impl Scheduler {
         }
     }
 
-    /// §12 parking-on-blocking (slice 2) — deliver ready punt completions to parked callers **in
-    /// submission order**: drain `completion_waiters` smallest-id-first and stop at the first
-    /// waiter whose result has not arrived, so a later completion never overtakes an earlier
-    /// parked caller (the §18 ordered-delivery pin; latency stays timing-dependent, order does
-    /// not). Called by the run's `completion_notify` hook after each completion posts, and by the
-    /// [`Blocked::CapPending`] park handler right after registering — the register-then-recheck
-    /// TOCTOU close (`cap_reply_or_stash`'s pattern, park side): a completion that raced the park
-    /// is delivered here instead of stranding the caller. Unclaimed results simply stay in
+    /// §12 parking-on-blocking (slice 2) — deliver each parked caller's punted call that has
+    /// answered, lowest id first among those in (#2477). A call that has not answered holds back no
+    /// other, in its domain or another (#2424): a call may wait on the world for as long as it
+    /// likes. When every answer is in, the order is the calls' order; otherwise it is the world's,
+    /// as real I/O's is. Called by each store's wake hook after a completion posts
+    /// ([`Scheduler::wake_on`]), and right after a park registers — the register-then-recheck TOCTOU
+    /// close (`cap_reply_or_stash`'s pattern, park side): a completion that raced the park is
+    /// delivered here instead of stranding the caller. Unclaimed results simply stay in
     /// [`Completions::ready`] for their (not-yet-registered or blocking-wait) caller — the stash
     /// **is** the store, so there is no lost-wakeup window. Lock order sched → completions; the
     /// completions lock is never held while taking the scheduler's.
-    fn completion_drain(&self, comps: &Completions) {
+    fn completion_drain(&self) {
         let mut s = self.lock();
         let mut woke = false;
-        while let Some((&id, _)) = s.completion_waiters.first_key_value() {
-            let Some(r) = comps.try_take(id) else {
-                break;
-            };
-            match s.completion_waiters.remove(&id) {
-                Some(Waiter::VCpu(mut v)) => {
-                    v.pending = Some(Pending::CapResult(r));
-                    s.runnable.push_back(v);
-                    woke = true;
+        let doms: Vec<u64> = s.completion_stores.keys().copied().collect();
+        for dom in doms {
+            let comps = Arc::clone(&s.completion_stores[&dom]);
+            let of_dom = (dom, 0)..=(dom, u64::MAX);
+            let answered: Vec<((u64, u64), i64)> = s
+                .completion_waiters
+                .range(of_dom.clone())
+                .filter_map(|(&key, _)| comps.try_take(key.1).map(|r| (key, r)))
+                .collect();
+            for (key, r) in answered {
+                match s.completion_waiters.remove(&key) {
+                    Some(Waiter::VCpu(mut v)) => {
+                        v.pending = Some(Pending::CapResult(r));
+                        s.runnable.push_back(v);
+                        woke = true;
+                    }
+                    // F1 (FIBER_PARK.md) — a punt inside a fiber parks the FIBER; its completion
+                    // rides the same drain. The wake pair is the established one: the
+                    // result lands on the parked frame, and the domain's `svc.wait` consumers are
+                    // re-admitted so a woken handler fiber gets re-claimed (slice 5b).
+                    Some(Waiter::Fiber { reg, slot, svc, .. }) => {
+                        reg.wake_blocked(slot, Reg::from_i64(r));
+                        svc_wake_locked(&mut s, svc);
+                        woke = true;
+                    }
+                    None => unreachable!("range then remove under one lock"),
                 }
-                // F1 (FIBER_PARK.md) — a punt inside a fiber parks the FIBER; its completion
-                // rides the same ordered drain. The wake pair is the established one: the
-                // result lands on the parked frame, and the domain's `svc.wait` consumers are
-                // re-admitted so a woken handler fiber gets re-claimed (slice 5b).
-                Some(Waiter::Fiber { reg, slot, svc, .. }) => {
-                    reg.wake_blocked(slot, Reg::from_i64(r));
-                    svc_wake_locked(&mut s, svc);
-                    woke = true;
-                }
-                None => unreachable!("first_key_value then remove under one lock"),
+            }
+            if s.completion_waiters.range(of_dom).next().is_none() {
+                s.completion_stores.remove(&dom);
             }
         }
         if woke {
             self.work.notify_all();
         }
+    }
+
+    /// #2424 — make this scheduler's drain the wake hook of `comps`, the store a caller is about to
+    /// park on: the root's, or a child's, twin's or instance's. Installed at every park, not once
+    /// per run, so a domain created after the run started is covered, and a store that outlives
+    /// its run (a reactor's) answers to the scheduler now parking on it. The hook holds the
+    /// scheduler weakly: a store keeps no run alive, and a late completion after the run is a no-op.
+    fn wake_on(self: &Arc<Self>, comps: &Completions) {
+        let sched = Arc::downgrade(self);
+        comps.set_notify(Some(Arc::new(move || {
+            if let Some(s) = sched.upgrade() {
+                s.completion_drain();
+            }
+        })));
     }
 
     /// #1677 — where fiber `slot` of `reg` is parked ([`Sched::fiber_park`]). Probe only.
@@ -7333,7 +7130,6 @@ impl Scheduler {
             && v.chain.as_slice() == [ROOT_FIBER]
             && v.root_parked.is_none()
             && v.threads.is_empty()
-            && v.nested_children.is_empty()
             && v.child_hosts.is_empty()
             && !v.registry.has_blocked_parks();
         macro_rules! put_back_none {
@@ -7638,27 +7434,24 @@ enum ReapOutcome {
     Retry,
 }
 
-/// What a finished child's outcome `res` gives the vCPU that joined it (`join`, op 1, or
-/// `thread.join`) or waited on it (`Instantiator.wait`, op 18), and whether the child stays in its
-/// slot. `join` takes the child: its first value, or its trap to re-raise. `wait` answers how it
-/// ended without inheriting a trap: 0 for a child that returned, which stays for its `join` (its
-/// value), else its trap's wire code ([`Trap::code`]), the child taken — a trapped child has nothing
-/// left to join. One rule for every driver.
+/// The registers a finished child's outcome `res` gives the vCPU that joined it, in result order.
+/// A §14 child's `join` (`Instantiator` op 1, `status`) answers how it ended as two results:
+/// `(0, its first value)` if it returned, `(its trap's wire code, 0)` if not ([`Trap::code`]). A
+/// child's end is never its parent's trap (INVARIANTS #5, #2066). A `thread.join` answers the
+/// thread's first value, and a thread's trap is its joiner's: a trap ends the whole domain
+/// (INVARIANTS #6). Either way the child is reaped. One rule for every driver.
 pub(crate) fn join_delivery(
     res: &Result<Vec<Value>, Trap>,
-    wait: bool,
-) -> (Result<Reg, Trap>, bool) {
-    match (res, wait) {
-        (Ok(_), true) => (Ok(Reg::from_i64(0)), true),
-        (Ok(vals), false) => (
-            Ok(Reg::from_value(
-                vals.first().copied().unwrap_or(Value::I64(0)),
-            )),
-            false,
-        ),
-        (Err(t), true) => (Ok(Reg::from_i64(t.code())), false),
-        (Err(t), false) => (Err(*t), false),
-    }
+    status: bool,
+) -> Result<impl Iterator<Item = Reg>, Trap> {
+    let value = |vals: &[Value]| Reg::from_value(vals.first().copied().unwrap_or(Value::I64(0)));
+    let (first, second) = match (res, status) {
+        (Ok(vals), true) => (Reg::from_i64(0), Some(value(vals))),
+        (Err(t), true) => (Reg::from_i64(t.code()), Some(Reg::from_i64(0))),
+        (Ok(vals), false) => (value(vals), None),
+        (Err(t), false) => return Err(*t),
+    };
+    Ok(core::iter::once(first).chain(second))
 }
 
 /// FORK.md §8.6 — a twin's exit status for servicer-side `wait()`. A clean finish yields the twin's
@@ -7943,13 +7736,14 @@ fn kill_child_locked(s: &mut Sched, flag: &AtomicBool, host: Option<&Arc<Mutex<H
     if let Some(h) = host {
         let key = h.lock_unpoisoned().domain_id() as usize;
         teardown_domain(s, key, &Trap::ThreadFault, h);
+        kill_withheld(s, key, h); // #2455 — one that unwound while its spawner was held
     }
 }
 
 /// Kill one vCPU at a teardown (DESIGN.md §12 "Domain lifetime & teardown", owner 2026-07-24):
-/// record `Err(reason)` as its outcome — the owner's `poll` sees status 2, its `join` re-raises
-/// (I37 supervision mechanics) — keeping `mem`/`fuel` residue (the root's is read back by
-/// [`drive_arc`] when a sibling's trap ended the run), wake any cross-domain joiner, free its
+/// record `Err(reason)` as its outcome — the owner's `poll` sees status 2, its `join` the trap's
+/// code (I37 supervision mechanics, #2066) — keeping `mem`/`fuel` residue (the root's is read back
+/// by [`drive_arc`] when a sibling's trap ended the run), wake any cross-domain joiner, free its
 /// durable shadow context, and kill its own §14 children (ownership anchors *their* lifetime too —
 /// the owner's death propagates as the S3 kill, [`kill_child_locked`]). Returns the dispatch tickets the vCPU had admitted but not replied
 /// (`handler_parks` / `serve_run`) so the caller can errno-wake their cross-domain callers (D37).
@@ -8018,6 +7812,7 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
         wake_reap_any(s, id); // a `wait(-1)` caller reaps this twin if no named waiter claimed it
     }
     s.results.insert(id, outcome);
+    end_hold_member(s, id); // #2455
     s.live -= 1;
     if s.live == 0 {
         s.shutdown = true;
@@ -8054,7 +7849,7 @@ fn wake_dead_tickets(s: &mut Sched, callee: usize, tickets: impl IntoIterator<It
 /// [`Sched::dead`]. Cross-domain callers parked *through* the dying domain — its queued
 /// dispatches and its in-flight handler tickets — complete with a probeable errno, never a hang
 /// (D37). Only vCPUs OF the dying domain are killed; for a §14 live child the run continues and
-/// the owner observes the outcomes (`poll` → 2, `join` re-raises).
+/// the owner observes the outcomes (`poll` → 2, `join` → the trap's code).
 fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<Host>>) {
     if s.dead.contains_key(&key) {
         return; // already down (a second member's trap raced the sweep)
@@ -8157,7 +7952,7 @@ fn teardown_run(s: &mut Sched) {
     // waiters, whose reap drops their `admit_parked`); a parked fiber's stack dies with it.
     let mut victims: Vec<Box<VCpu>> = s.runnable.drain(..).collect();
     for site in ParkSite::ALL {
-        victims.extend(s.take(site, true));
+        victims.extend(s.take(site, true, &|_| true));
     }
     s.reap_pending.clear();
     for v in victims {
@@ -8363,13 +8158,145 @@ fn freeze_in_flight(s: &Sched) -> bool {
 }
 
 /// #1584 — would [`admit_parks_for_freeze`] re-admit anything? A vCPU at a [`FreezeRule::Reissue`]
-/// site; a joiner or lane waiter is woken by something else, and a fiber park is its owner's
-/// `freeze_drive`'s. Without this an in-flight freeze with only those left would spin the worker loop
-/// instead of falling through to the deadlock check.
+/// site, outside a held domain (#2455); a joiner or lane waiter is woken by something else, and a
+/// fiber park is its owner's `freeze_drive`'s. Without this an in-flight freeze with only those left
+/// would spin the worker loop instead of falling through to the deadlock check.
 fn freeze_can_admit(s: &Sched) -> bool {
-    ParkSite::ALL
+    ParkSite::ALL.iter().any(|&site| {
+        site.freeze_rule() == FreezeRule::Reissue
+            && s.parked(site)
+                .iter()
+                .any(|v| !s.held.contains_key(&domain_key_of(v)))
+    })
+}
+
+/// #2455 — **leaves first.** A paged child's pages arrive only through its pager's serve loop, so a
+/// child that faults on its way to a safepoint unwinds only once its pager has served the fault. A
+/// freeze must not take a pager down while a child it pages still runs: a freeze that reaches a
+/// domain paging live detached children **holds** it instead. The domain's phase stays `NORMAL`, so
+/// it runs on and serves. Each such child is rung now and its parks are brought through the freeze
+/// ([`reach`]), and the hold waits on them ([`Sched::held`]) until [`release_hold`] lets the domain
+/// unwind after them. `me` is the running vCPU, whose tables the scheduler does not hold. Answers
+/// whether `domain` is held.
+fn hold_for_paged(s: &mut Sched, domain: usize, me: Option<&Seat>) -> bool {
+    let mut rung: Vec<(Arc<AtomicBool>, TaskId, usize)> = Vec::new();
+    {
+        let others: Vec<Seat> = scheduled_vcpus(s)
+            .into_iter()
+            .filter(|v| domain_key_of(v) == domain)
+            .map(VCpu::seat)
+            .collect();
+        for seat in me.into_iter().chain(others.iter()) {
+            for (slot, (bell, spawn)) in seat.child_freeze {
+                let Some(&Some(cid)) = seat.threads.get(*slot) else {
+                    continue;
+                };
+                let live = spawn.pager.is_some()
+                    && !s.results.contains_key(&cid)
+                    && !s.unwound.contains(&cid);
+                if let (true, Some(h)) = (live, seat.child_hosts.get(slot)) {
+                    rung.push((
+                        Arc::clone(bell),
+                        cid,
+                        h.lock_unpoisoned().domain_id() as usize,
+                    ));
+                }
+            }
+        }
+    }
+    if rung.is_empty() {
+        return s.held.contains_key(&domain);
+    }
+    for (bell, cid, child_domain) in rung {
+        bell.store(true, Ordering::Relaxed);
+        s.held.entry(domain).or_default().insert(cid);
+        reach(s, child_domain);
+    }
+    true
+}
+
+/// #2455 — the freeze reaches `domain`'s parks: it is held if it pages live children
+/// ([`hold_for_paged`]); otherwise each of its parks follows its site's rule ([`admit_parks`]).
+fn reach(s: &mut Sched, domain: usize) {
+    if !hold_for_paged(s, domain, None) {
+        admit_parks(s, &|d| d == domain);
+    }
+}
+
+/// #2455 — `id` has ended (unwound, returned, trapped or been killed): the hold that waits on it, if
+/// any, no longer does, and is released once it waits on nothing.
+fn end_hold_member(s: &mut Sched, id: TaskId) {
+    let Some(domain) = s
+        .held
         .iter()
-        .any(|&site| site.freeze_rule() == FreezeRule::Reissue && !s.parked(site).is_empty())
+        .find(|(_, waits)| waits.contains(&id))
+        .map(|(&d, _)| d)
+    else {
+        return;
+    };
+    let waits = s.held.get_mut(&domain).expect("found just above");
+    waits.remove(&id);
+    if waits.is_empty() {
+        release_hold(s, domain);
+    }
+}
+
+/// #2455 — the children a held domain waited on have all ended, so the freeze reaches the domain now:
+/// each of its vCPUs takes the `UNWINDING` phase, which the `dispatch` prologue writes into the window
+/// before it runs, and its parks follow their rules ([`reach`]). A join parked on a child whose unwind
+/// was withheld would wait for an end that has already come, so it wakes, and re-issues as a join on
+/// any child the freeze unwound does (#1904).
+fn release_hold(s: &mut Sched, domain: usize) {
+    s.held.remove(&domain);
+    let ends: Vec<TaskId> = s
+        .withheld
+        .keys()
+        .copied()
+        .filter(|c| {
+            s.join_waiters
+                .get(c)
+                .is_some_and(|v| domain_key_of(v) == domain)
+        })
+        .collect();
+    for child in ends {
+        let joiner = s.join_waiters.remove(&child).expect("filtered just above");
+        s.runnable.push_back(joiner);
+    }
+    for v in s.runnable.iter_mut() {
+        if domain_key_of(v) == domain && v.dstate != STATE_REWINDING {
+            v.dstate = STATE_UNWINDING;
+        }
+    }
+    reach(s, domain);
+}
+
+/// #2455 — a `kill` of a child whose unwind is withheld ends it, as a kill of a running child does:
+/// its outcome becomes the kill's, its window goes back to its budget ([`reap`]), and a join on it
+/// wakes. The spawner's cut is past the kill, so the child must not ride the artifact.
+fn kill_withheld(s: &mut Sched, domain: usize, host: &Arc<Mutex<Host>>) {
+    let Some(id) = s
+        .withheld
+        .iter()
+        .find(|(_, w)| w.domain == domain)
+        .map(|(&id, _)| id)
+    else {
+        return;
+    };
+    let w = s.withheld.remove(&id).expect("found just above");
+    host.lock_unpoisoned().release_memory();
+    if let Some((cell, lease)) = w.lease {
+        cell.lock_unpoisoned().release_detached(lease);
+    }
+    s.unwound.remove(&id);
+    if let Some(joiner) = s.join_waiters.remove(&id) {
+        s.runnable.push_back(joiner);
+    }
+    let outcome = Outcome {
+        result: Err(Trap::ThreadFault),
+        mem: None,
+        ..w.outcome
+    };
+    s.results.insert(id, outcome);
 }
 
 /// #1584 / §13.4 4c-bis — bring every park the scheduler owns through a freeze, for either trigger
@@ -8397,11 +8324,29 @@ fn freeze_can_admit(s: &Sched) -> bool {
 ///
 /// A parked **fiber** stays where it is: its owner's `freeze_drive` purges and flattens it (§13.4
 /// step 2), and the thaw re-issues its wait.
+///
+/// #2455 — leaves first: a domain paging live children is held instead, and its parks wait for the
+/// hold's release ([`hold_for_paged`]).
 fn admit_parks_for_freeze(s: &mut Sched) {
+    let parked: BTreeSet<usize> = ParkSite::ALL
+        .iter()
+        .flat_map(|&site| s.parked(site))
+        .map(domain_key_of)
+        .collect();
+    for domain in parked {
+        hold_for_paged(s, domain, None);
+    }
+    let held: BTreeSet<usize> = s.held.keys().copied().collect();
+    admit_parks(s, &|d| !held.contains(&d));
+}
+
+/// The parks of each domain `of` picks, through the freeze by their sites' rules
+/// ([`admit_parks_for_freeze`]).
+fn admit_parks(s: &mut Sched, of: &dyn Fn(usize) -> bool) {
     for site in ParkSite::ALL {
         match site.freeze_rule() {
             FreezeRule::Reissue => {
-                for mut v in s.take(site, false) {
+                for mut v in s.take(site, false, of) {
                     v.dstate = STATE_UNWINDING;
                     match site {
                         // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
@@ -8431,7 +8376,9 @@ fn admit_parks_for_freeze(s: &mut Sched) {
             }
             FreezeRule::Phase => {
                 for v in s.parked_mut(site) {
-                    v.dstate = STATE_UNWINDING;
+                    if of(domain_key_of(v)) {
+                        v.dstate = STATE_UNWINDING;
+                    }
                 }
             }
             // The census declined a freeze with a vCPU parked here before it began.
@@ -8445,9 +8392,7 @@ fn admit_parks_for_freeze(s: &mut Sched) {
 /// `run_inner` holds.
 struct Seat<'a> {
     id: TaskId,
-    nested_child: bool,
     threads: &'a [Option<TaskId>],
-    nested_children: &'a [NestedChildInfo],
     child_hosts: &'a BTreeMap<usize, Arc<Mutex<Host>>>,
     child_freeze: &'a BTreeMap<usize, (Arc<AtomicBool>, DetachedSpawn)>,
     host: &'a Arc<Mutex<Host>>,
@@ -8458,23 +8403,13 @@ impl VCpu {
     fn seat(&self) -> Seat<'_> {
         Seat {
             id: self.id,
-            nested_child: self.nested_child,
             threads: &self.threads,
-            nested_children: &self.nested_children,
             child_hosts: &self.child_hosts,
             child_freeze: &self.child_freeze,
             host: &self.host,
             registry: &self.registry,
         }
     }
-}
-
-/// Whether join slot `slot` holds a `thread.spawn` sibling — a thread of this domain, neither a
-/// nested child (a carve) nor a detached one (a window of its own). The two §14 kinds re-attach at
-/// their recorded slot on thaw; a thread re-attaches by push, so it is the one that can't be mixed
-/// with a nested child yet (#1673).
-fn is_thread_slot(seat: &Seat, slot: usize) -> bool {
-    !seat.nested_children.iter().any(|c| c.slot == slot) && !seat.child_hosts.contains_key(&slot)
 }
 
 /// Every vCPU the scheduler holds — runnable or parked anywhere. With the durable single worker, that
@@ -8493,9 +8428,9 @@ fn scheduled_vcpus(s: &Sched) -> Vec<&VCpu> {
 /// (whose own handles are the codec's to answer, since its embedder can still drain them). Walks every
 /// vCPU of the run. `None` = go ahead; `Some` = decline, and the caller leaves the run untouched.
 ///
-/// Mirrors the fail-closed refusals the unwind makes (`nested_refused`, `child_state_refused`,
-/// `detached_live_refused`, `freeze_drive`), which stay as the backstop for a cause that arises after
-/// this — the census is what makes them unreachable for everything visible here. Each cause is a gap
+/// Mirrors the fail-closed refusals the unwind makes (`detached_live_refused`, `freeze_drive`), which
+/// stay as the backstop for a cause that arises after this — the census is what makes them
+/// unreachable for everything visible here. Each cause is a gap
 /// filed to be closed (#1703); this is the fallback, not the design point.
 fn freeze_census(
     me: Option<&Seat>,
@@ -8509,7 +8444,7 @@ fn freeze_census(
     // Phase 1, under the scheduler lock: the structural facts, and the powerboxes and fiber tables to
     // look into once it is released (a powerbox lock is never taken under the scheduler's).
     let mut hosts: Vec<(TaskId, Arc<Mutex<Host>>)> = Vec::new();
-    let mut registries: Vec<(TaskId, bool, Arc<FiberRegistry>)> = Vec::new();
+    let mut registries: Vec<(TaskId, Arc<FiberRegistry>)> = Vec::new();
     {
         let s = rs.lock();
         if let Some(&twin) = s.forked_twins.keys().next() {
@@ -8523,41 +8458,21 @@ fn freeze_census(
                 }
             }
         }
-        // #1901 — a reply wait's ticket rides its caller's powerbox, and a nested carve's powerbox
-        // carries only its serve trio and handles: its thaw would issue the call twice. The carve is
-        // retiring (INVARIANTS #13), so it gets no new record.
-        if let Some(v) = s
-            .parked(ParkSite::Reply)
-            .into_iter()
-            .find(|v| v.freeze_sink.is_some())
-        {
-            return declined(DeclineCause::Parked(ParkSite::Reply), v.id, None);
-        }
         let others: Vec<Seat> = scheduled_vcpus(&s).into_iter().map(VCpu::seat).collect();
         for seat in me.into_iter().chain(others.iter()) {
-            let mut live_nested = false;
-            let mut live_thread = false;
+            // A §14 child's slot holds a `child_hosts` entry; a `thread.spawn` sibling's never does.
             for (slot, cid) in seat
                 .threads
                 .iter()
                 .enumerate()
                 .filter_map(|(i, t)| t.map(|c| (i, c)))
             {
-                if is_thread_slot(seat, slot) {
-                    live_thread = true;
-                    continue;
-                }
-                let nested = seat.nested_children.iter().any(|c| c.slot == slot);
-                live_nested |= nested;
-                if !nested
+                if seat.child_hosts.contains_key(&slot)
                     && !s.results.contains_key(&cid)
                     && !seat.child_freeze.contains_key(&slot)
                 {
                     return declined(DeclineCause::DetachedUnreachable, seat.id, Some(slot));
                 }
-            }
-            if live_nested && live_thread {
-                return declined(DeclineCause::NestedWithThread, seat.id, None);
             }
             let root_domain = Arc::ptr_eq(seat.host, root);
             if !root_domain && !hosts.iter().any(|(_, h)| Arc::ptr_eq(h, seat.host)) {
@@ -8565,9 +8480,9 @@ fn freeze_census(
             }
             if !registries
                 .iter()
-                .any(|(_, _, r)| Arc::ptr_eq(r, seat.registry))
+                .any(|(_, r)| Arc::ptr_eq(r, seat.registry))
             {
-                registries.push((seat.id, seat.nested_child, Arc::clone(seat.registry)));
+                registries.push((seat.id, Arc::clone(seat.registry)));
             }
         }
     }
@@ -8577,10 +8492,7 @@ fn freeze_census(
             return declined(DeclineCause::NonDurableHandle(nd), *task, None);
         }
     }
-    for (task, nested_child, reg) in &registries {
-        if *nested_child && reg.has_freeze_residue() {
-            return declined(DeclineCause::NestedChildFibers, *task, None);
-        }
+    for (task, reg) in &registries {
         // #1677 — an unwoken fiber park follows its site's rule, as a vCPU's does.
         for (slot, woken) in reg.blocked_parks() {
             match rs.fiber_park(reg, slot) {
@@ -8898,7 +8810,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // §12.8 concurrent-thaw stage 1: recombine the phase from the freeze (global) + thaw
                 // (per-context) words — the rewind's re-issue flipped *its own* thaw word to `NORMAL`.
                 v.dstate = m.durable_load_dstate(v.vcpu_ctx);
-                v.root_shadow_sp = m.durable_get_sp(root_word);
+                // The vCPU's own copy stands when the word cannot be read: it is what was written.
+                if let Some(sp) = m.durable_get_sp(root_word) {
+                    v.root_shadow_sp = sp;
+                }
             }
         }
         match step {
@@ -8916,7 +8831,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         m.durable_state() == STATE_UNWINDING
                             && (v.spawn_residue.is_none()
                                 || m.durable_get_sp(m.shadow_region_base(v.vcpu_ctx))
-                                    > v.arena().frame_base(v.vcpu_ctx))
+                                    .is_some_and(|sp| sp > v.arena().frame_base(v.vcpu_ctx)))
                     });
                 // Freeze driver (DURABILITY.md §12.8 slice 3.1.4 / 3.4): a durable run left in `UNWINDING`
                 // has drained THIS vCPU's native stack into its shadow region; now flatten the fibers it
@@ -8926,160 +8841,19 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // walks the *shared* registry's parked set and removes what it takes, so each vCPU's drive
                 // catches exactly the fibers still parked when it runs (its own), with no double-flatten. A
                 // drive trap (out-of-scope module) surfaces as the run's result.
-                // §4 subtree freeze (DURABILITY.md): handle this vCPU's live §14 children before its
-                // own residue is recorded. The **covered** shape — same-module, still-running children,
-                // no unjoined `thread.spawn` siblings — is frozen for real: broadcast `UNWINDING` into
-                // each live child's carve state word (the subtree STW; the child self-unwinds into its
-                // carve's own durable reserve, which is inside this window's image, at its next poll) and
-                // record it as [`FrozenNested`] re-attach residue, tagged with **this** vCPU's task id as
-                // its `parent_task`. Depth is now covered to **arbitrary nesting** (parent→child→
-                // grandchild, …): a §14 child records its *own* live children (its grandchildren of the
-                // root) into the subtree's shared freeze-residue **sink** — the root host, reached via
-                // [`VCpu::freeze_sink`] since the child's own powerbox is private — so the whole subtree's
-                // residue coalesces where a thaw reads it, disambiguated by `parent_task` (the exact
-                // shape by which `thread.spawn`'s shared host coalesces [`FrozenVCpu`]). A
-                // **completed-but-unjoined** child rides via `completed_result` (its result taken from
-                // the scheduler; no `UNWINDING` broadcast — nothing to unwind). Everything else stays
-                // **fail-closed** (`ThreadFault`, like the join-deadlock): a suspended coroutine
-                // (host-side native continuation), a separate-module child (its module identity can't ride
-                // the artifact yet), a completed child that **trapped** (its trap can't ride yet), and
-                // mixing with unjoined `thread.spawn` children (the two thaw seedings would contend for
-                // the join table).
-                let nested_refused = froze && {
-                    let live: Vec<NestedChildInfo> = v
-                        .nested_children
-                        .iter()
-                        .filter(|c| v.threads.get(c.slot).is_some_and(Option::is_some))
-                        .copied()
-                        .collect();
-                    if live.is_empty() {
-                        false
-                    } else if v
-                        .threads
-                        .iter()
-                        .enumerate()
-                        .any(|(slot, t)| t.is_some() && is_thread_slot(&v.seat(), slot))
-                        || v.mem.is_none()
-                    {
-                        true // uncovered shape / malformed durable freeze
-                    } else {
-                        // NB: a nested child (`v.nested_child`) is **no longer** refused here — a §14
-                        // child may record its own live children (grandchildren), tagged with this
-                        // vCPU's task id and pushed to the subtree's shared sink (depth-2+, §4).
-                        for c in &live {
-                            let cid = v.threads[c.slot].expect("filtered to Some");
-                            let completed_result = if v.sched.has_result(cid) {
-                                // Take the finished child's join outcome — its value, or its trap
-                                // (#1674) — which rides the artifact for the rewound `join`.
-                                v.sched.take_result(cid).map(|o| join_outcome(o.result))
-                            } else {
-                                // Still running: broadcast `UNWINDING` into its carve; it self-unwinds.
-                                if let Some(m) = v.mem.as_mut() {
-                                    m.write_bytes(
-                                        c.carve_off + STATE_OFF,
-                                        &STATE_UNWINDING.to_le_bytes(),
-                                    );
-                                }
-                                None
-                            };
-                            // §4 depth-2: push to the subtree's **effective sink** (the root host for a
-                            // nested child, our own host for the root), tagged with our own task id as
-                            // the child's `parent_task`, so the whole nesting subtree's residue coalesces
-                            // where a thaw reads it — the root records its child with `parent_task = 0`,
-                            // a child records its grandchild with `parent_task = <child's task>`.
-                            let sink = v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
-                            sink.lock_unpoisoned().frozen_nested.push(FrozenNested {
-                                parent_task: v.id as usize,
-                                task: cid as usize,
-                                slot: c.slot,
-                                carve_off: c.carve_off,
-                                size_log2: c.size_log2,
-                                entry: c.entry,
-                                module_digest: c.module_digest,
-                                completed_result,
-                            });
-                        }
-                        false
-                    }
-                };
-                // DURABILITY.md §13.4 slice 4c: a **nested child's** host state — its serve trio
-                // and durable handle table — rides the subtree's shared sink as a
-                // [`FrozenChildState`] keyed by `(parent_task, nested_slot)`, merged into its
-                // nested record at codec time and seeded back onto the re-created child's fresh
-                // host at thaw. A child holding a **non-durable** handle refuses the subtree
-                // freeze exactly like a root would (`capture_durable_handles` errs — the same
-                // fail-closed shape as `nested_refused`). Plain children (empty trio, only the
-                // fresh-grant instantiator/AS handles) record nothing, keeping plain-subtree
-                // artifacts unchanged.
-                let child_state_refused = froze && v.nested_child && {
-                    let hg = v.host.lock_unpoisoned();
-                    let (q, r, t) = hg.svc_state();
-                    match hg.capture_durable_handles() {
-                        Err(_) => true, // a non-durable child handle: fail the freeze closed
-                        Ok(handles) => {
-                            // #1296: a child holding a `Jit` cap carries its unit tables here (the
-                            // root's ride Section 5; a child's would otherwise be dropped, dangling
-                            // its `JitTable` handle on thaw). Captured beside the handles + serve trio.
-                            let jit_tables = hg.capture_durable_jit();
-                            let jit_table_log2 = hg.jit_table_log2();
-                            // #1680: the pipes its ends name ride the sink too; their bytes are
-                            // read at capture, once the whole tree has quiesced.
-                            let pipes = hg.durable_pipe_backings();
-                            // Record whenever the child holds ANY state a fresh-host thaw would
-                            // drop — handles included (every child holds at least its
-                            // instantiator grant; restoring the captured table verbatim
-                            // preserves guest-held handle values exactly).
-                            if !q.is_empty()
-                                || !r.is_empty()
-                                || t != 0
-                                || !handles.is_empty()
-                                || !jit_tables.is_empty()
-                            {
-                                drop(hg);
-                                let sink =
-                                    v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
-                                let mut sg = sink.lock_unpoisoned();
-                                sg.frozen_pipes.extend(pipes);
-                                sg.frozen_child_state.push(FrozenChildState {
-                                    parent_task: v.parent_task as usize,
-                                    slot: v.nested_slot,
-                                    svc_queue: q,
-                                    svc_results: r,
-                                    svc_next_ticket: t,
-                                    handles,
-                                    jit_tables,
-                                    jit_table_log2,
-                                });
-                            }
-                            false
-                        }
-                    }
-                };
-                // #1289 R1 — a live **detached** §14 child (its own separate window, so it holds a
-                // `child_hosts` entry but has NO carve in `nested_children` — distinct from a
-                // `thread.spawn` sibling, which is in neither) cannot yet ride the parent's artifact:
-                // the subtree STW broadcasts `UNWINDING` only into carves within *this* window image,
-                // never reaching a detached child's separate window, so it would not self-unwind and
-                // its window would be silently dropped. Fail closed until the per-child-artifact
-                // capture lands (the detached-durable freeze slices). Unlike `nested_refused` this
-                // fires even with no live nested child. A completed-and-reaped child (its `threads`
-                // slot cleared) left nothing to capture and does not refuse.
-                // #1361 step 2 — a detached §14 child (own window: a `child_hosts` entry with NO
-                // carve in `nested_children`, so not a nested child; and not a `thread.spawn`
-                // sibling, which is in neither map). A **completed-but-unjoined** one rides via
+                // #1361 step 2 — a §14 child (its own window: a `child_hosts` entry, which a
+                // `thread.spawn` sibling never has). A **completed-but-unjoined** one rides via
                 // `completed_result` — its result is taken from the scheduler and its separate window
-                // need not ride (reload-not-reissue on thaw, exactly like a completed nested child).
-                // A **still-running** one is rung (step 3) and captured by the harvest (step 4). A
-                // completed-**trapped** one rides its trap the same way (#1674).
+                // need not ride (reload-not-reissue on thaw). A **still-running** one is rung (step
+                // 3) and captured by the harvest (step 4). A completed-**trapped** one rides its trap
+                // the same way (#1674). A completed-and-reaped child (its `threads` slot cleared)
+                // left nothing to capture.
                 let detached_live_refused = froze && {
                     let detached: Vec<usize> = v
                         .child_hosts
                         .keys()
                         .copied()
-                        .filter(|slot| {
-                            !v.nested_children.iter().any(|c| c.slot == *slot)
-                                && v.threads.get(*slot).and_then(|t| *t).is_some()
-                        })
+                        .filter(|slot| v.threads.get(*slot).and_then(|t| *t).is_some())
                         // #2044 — and each a thaw delivered as completed, still unjoined.
                         .chain(
                             v.delivered_detached
@@ -9095,12 +8869,14 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         // parked, #1904) is harvested like a running one, not recorded as complete.
                         let finished = !v.sched.unwound(cid);
                         if let Some(o) = finished.then(|| v.sched.take_result(cid)).flatten() {
-                            let sink = v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
-                            sink.lock_unpoisoned().frozen_detached.push(FrozenDetached {
-                                parent_task: v.id as usize,
-                                slot,
-                                completed_result: join_outcome(o.result),
-                            });
+                            v.host
+                                .lock_unpoisoned()
+                                .frozen_detached
+                                .push(FrozenDetached {
+                                    parent_task: v.id as usize,
+                                    slot,
+                                    completed_result: join_outcome(o.result),
+                                });
                         } else {
                             // #1361 step 3 — **still running**: ring the freeze doorbell and record
                             // the child for harvest. We do not wait for it: this vCPU is itself
@@ -9117,9 +8893,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                             if let Some((bell, spawn)) = v.child_freeze.get(&slot) {
                                 bell.store(true, Ordering::Relaxed);
                                 let host = Arc::clone(&v.child_hosts[&slot]);
-                                let sink =
-                                    v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
-                                sink.lock_unpoisoned()
+                                v.host
+                                    .lock_unpoisoned()
                                     .pending_detached
                                     .push(PendingDetached {
                                         parent_task: v.id as usize,
@@ -9138,7 +8913,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     }
                     refuse
                 };
-                let result = if nested_refused || child_state_refused || detached_live_refused {
+                let result = if detached_live_refused {
                     Err(Trap::ThreadFault)
                 } else if froze {
                     // Record this vCPU's own flattened extent (the live shadow-SP) *before* `freeze_drive`
@@ -9146,14 +8921,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     let self_sp = v
                         .mem
                         .as_ref()
-                        .map(|m| m.durable_get_sp(m.shadow_region_base(v.vcpu_ctx)))
+                        .and_then(|m| m.durable_get_sp(m.shadow_region_base(v.vcpu_ctx)))
                         .unwrap_or_else(|| v.arena().frame_base(v.vcpu_ctx));
                     if let Some((func, args, slot)) = v.spawn_residue.clone() {
                         // A **spawned** vCPU (slice 3.2.1) records *itself* as residue: its continuation now
-                        // lives in its own region (extent = `self_sp`); a thaw re-spawns it there. Into
-                        // the subtree's sink, so a thread of a §14 child reaches the artifact (#1686).
-                        let sink = v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
-                        sink.lock_unpoisoned().frozen_vcpus.push(FrozenVCpu {
+                        // lives in its own region (extent = `self_sp`); a thaw re-spawns it there.
+                        v.host.lock_unpoisoned().frozen_vcpus.push(FrozenVCpu {
                             task: v.id as usize,
                             parent_task: v.parent_task as usize,
                             slot,
@@ -9162,40 +8935,18 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                             shadow_sp: self_sp,
                             completed_result: None, // re-spawned and rewound on thaw
                         });
-                    } else if !v.nested_child {
+                    } else {
                         // The root: record its extent (the shared active-SP word will be overwritten by a
                         // later child, so the root's residue can't ride the window).
                         v.host.lock_unpoisoned().frozen_root_sp = Some(self_sp);
                     }
-                    // (A §14 nested child records nothing: its extent is its carve's own shadow-SP
-                    // word, inside the parent's window image — carve-self-describing.)
-                    let mut r = v.freeze_drive().and(result);
+                    let r = v.freeze_drive().and(result);
                     // Hand this vCPU's flattened fibers back to the embedder via the shared host. **Extend**
                     // (not assign): every vCPU contributes its own, and the snapshot's canonical sort-by-slot
                     // makes the accumulation order irrelevant to the artifact.
                     if !v.frozen.is_empty() {
                         let frozen = std::mem::take(&mut v.frozen);
-                        if v.freeze_sink.is_some() {
-                            // A §14 subtree's fiber residue — a nested child's or its threads' — is
-                            // child-local (its slots/extents name the child's own registry + carve):
-                            // it cannot ride the parent's tables. Fail closed until per-child fiber
-                            // residue lands (DURABILITY.md §4, #1675).
-                            drop(frozen);
-                            r = Err(Trap::ThreadFault);
-                        } else {
-                            v.host.lock_unpoisoned().frozen_fibers.extend(frozen);
-                        }
-                    }
-                    // Likewise a fresh fiber in a §14 child's own table (#1684: the root's rides
-                    // from `drive`): refused rather than lost.
-                    let arena = v.arena();
-                    if v.nested_child
-                        && v.registry
-                            .unflattened_for_freeze(arena)
-                            .iter()
-                            .any(|f| !f.is_free())
-                    {
-                        r = Err(Trap::ThreadFault);
+                        v.host.lock_unpoisoned().frozen_fibers.extend(frozen);
                     }
                     r
                 } else {
@@ -9214,9 +8965,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     Vec::new()
                 };
                 let trap_fiber = result.is_err().then(|| trap_fiber_of(&v));
-                // #1591: and the address it faulted on, off this vCPU's own window. A nested (op-13)
-                // child's `Mem` dies with its outcome, so reading it here is the only chance — the
-                // join propagation that reaches `drive` carries a bare `Err(Trap)`.
+                // #1591: and the address it faulted on, off this vCPU's own window. A child's `Mem`
+                // dies with its outcome, so reading it here is the only chance — the join that
+                // answers its trap carries a bare code (#2066).
                 let trap_fault = result
                     .is_err()
                     .then(|| v.mem.as_ref().and_then(|m| m.peek_fault_rel()))
@@ -9225,6 +8976,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // is dropped — its domain key, its powerbox (the dying domain's queue), and the tickets
                 // of dispatches it admitted but never replied (their cross-domain callers wake, D37).
                 let key = domain_key_of(&v);
+                // #2480 — the domain's main vCPU finishing ends the domain (#1917), and with it the
+                // fibers no one will resume now.
+                let ends_domain = !froze && v.spawn_residue.is_none();
+                let spawner_domain = v.spawner_domain;
                 let dying_host = Arc::clone(&v.host);
                 let own_tickets: Vec<u64> = v
                     .handler_parks
@@ -9254,12 +9009,15 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // service it could have called (its pager, its granted live offers).
                 let gone = client_gone_targets(&v);
                 // A detached child's window goes back to the budget that paid for it (no lock held
-                // here). Never during a freeze unwind: the child is captured, not ended.
-                if !froze {
-                    if let Some((cell, lease)) = v.window_lease.take() {
+                // here). Never during a freeze unwind: the child is captured, not ended, unless a kill
+                // ends it while its unwind is withheld (#2455, [`kill_withheld`]).
+                let frozen_lease = match v.window_lease.take() {
+                    Some((cell, lease)) if !froze => {
                         cell.lock_unpoisoned().release_detached(lease);
+                        None
                     }
-                }
+                    kept => kept,
+                };
                 // #1685 — a durable thread that finished cleanly: its result must ride a freeze
                 // until it is joined.
                 let finished_thread = match &v.spawn_residue {
@@ -9267,7 +9025,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         Some(FinishedThread {
                             parent_task: v.parent_task,
                             slot: *slot,
-                            sink: v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host)),
+                            sink: Arc::clone(&v.host),
                         })
                     }
                     _ => None,
@@ -9301,6 +9059,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 if froze {
                     s.unwound.insert(id);
                 }
+                // #2455 — a child that unwound while its spawner's domain is held is withheld from the
+                // spawner, which runs on: until the hold releases, it reads as still running.
+                let withhold = froze && spawner_domain.is_some_and(|d| s.held.contains_key(&d));
                 if s.froze && !s.forked_twins.contains_key(&id) {
                     if let Err(t) = &outcome.result {
                         s.freeze_fault.get_or_insert(*t);
@@ -9323,9 +9084,19 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 for pipe in &pipe_epipes {
                     wake_pipe_writers_locked(&mut s, *pipe);
                 }
+                // #2480 — a call a fiber of the ended domain is parked on wakes no one: it leaves
+                // the wait set, as a dying domain's does at its teardown, so the run's deadlock
+                // verdict does not wait for its answer.
+                if ends_domain {
+                    let of_dom = |&(d, _): &(u64, u64), w: &Waiter| {
+                        d == key as u64 && matches!(w, Waiter::Fiber { .. })
+                    };
+                    s.completion_waiters.retain(|k, w| !of_dom(k, w));
+                }
                 // First-wins trap-origin capture (§5 W3 / §23-D57): the first vCPU to trap records its own
-                // backtrace + fiber, so a later join-propagated re-trap on the root can't overwrite the
-                // true origin. A clean finish leaves it untouched.
+                // backtrace + fiber, so the root's later trap on its behalf (a teardown, or a child's
+                // trap its join answered) can't overwrite the true origin. A clean finish leaves it
+                // untouched.
                 //
                 // #1665 — except a **fork twin's**: it does not propagate (its parent reaps a crash
                 // status), so it is recorded apart, with the frames and fault a bare status 128 would
@@ -9363,17 +9134,30 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     }
                 }
                 let died: Option<Trap> = outcome.result.as_ref().err().cloned();
-                if let Some(parent) = s.join_waiters.remove(&id) {
-                    s.runnable.push_back(parent);
-                    sched.work.notify_one();
-                } else if wake_reap_any(&mut s, id) {
-                    // a `wait(-1)` caller reaps this twin (no named `wait(pid)` claimed it).
-                    sched.work.notify_one();
+                // A withheld child's join wakes when the hold releases ([`release_hold`]).
+                if !withhold {
+                    if let Some(parent) = s.join_waiters.remove(&id) {
+                        s.runnable.push_back(parent);
+                        sched.work.notify_one();
+                    } else if wake_reap_any(&mut s, id) {
+                        // a `wait(-1)` caller reaps this twin (no named `wait(pid)` claimed it).
+                        sched.work.notify_one();
+                    }
                 }
                 if let Some(f) = finished_thread {
                     s.finished_threads.insert(id, f);
                 }
-                s.results.insert(id, outcome);
+                if withhold {
+                    let w = Withheld {
+                        domain: key,
+                        outcome,
+                        lease: frozen_lease,
+                    };
+                    s.withheld.insert(id, w);
+                } else {
+                    s.results.insert(id, outcome);
+                }
+                end_hold_member(&mut s, id);
                 s.live -= 1;
                 // Domain lifetime & teardown (DESIGN.md §12 / ISSUES.md I37, owner 2026-07-24):
                 // executors never anchor a domain's lifetime — ownership does. `exit(n)` or any trap
@@ -9403,7 +9187,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_all();
                     return;
                 };
-                if s.results.contains_key(&child) {
+                // #2455 — a child whose unwind is withheld has ended once the joiner's domain is no
+                // longer held.
+                let ended = s.results.contains_key(&child)
+                    || (s.withheld.contains_key(&child)
+                        && !s.held.contains_key(&domain_key_of(&v)));
+                if ended {
                     // Already finished between the join check and here — resume immediately.
                     s.runnable.push_back(v);
                     sched.work.notify_one();
@@ -9644,11 +9433,15 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             Step::Park(Blocked::CapPending { id }) => {
                 // §12 slice 2: park inside a punted offloadable dispatch, keyed by completion id.
                 // Register-then-recheck (the `cap_reply_or_stash` TOCTOU close, park side): insert
-                // the waiter under the scheduler lock, then run the ordered drain — a completion
+                // the waiter under the scheduler lock, then run the drain — a completion
                 // that landed before the insert is delivered right here instead of stranding the
                 // caller. (The host guard below is released before the scheduler lock is taken —
                 // lock order sched → host is never crossed.)
-                let comps = v.host.lock_unpoisoned().completions();
+                let (comps, dom) = {
+                    let h = v.host.lock_unpoisoned();
+                    (h.completions(), h.domain_id())
+                };
+                sched.wake_on(&comps);
                 {
                     let mut s = sched.lock();
                     // §12 domain-lifetime park gate (owner 2026-07-24): never park into a
@@ -9657,9 +9450,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         sched.work.notify_all();
                         return;
                     };
-                    s.completion_waiters.insert(id, Waiter::VCpu(v));
+                    s.completion_waiters.insert((dom, id), Waiter::VCpu(v));
+                    s.completion_stores.insert(dom, comps);
                 }
-                sched.completion_drain(&comps);
+                sched.completion_drain();
             }
             Step::Park(Blocked::CapReply { ticket, callee }) => {
                 v.reply_ticket = Some(ticket);
@@ -9683,27 +9477,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     return;
                 };
                 // #1862: the pager gets the fault address in the child's own coordinates, and its
-                // reply is copied into the child through the sink filed here. Enqueue and sink are
-                // one scheduler critical section (lock order sched → host), so the pager cannot
-                // settle the request before its sink exists.
+                // reply is copied into the child through the sink filed with the request.
                 let (ticket, pager_id) = {
                     let m = v.mem.as_ref().expect("a demand child has a window");
-                    let rel = addr - m.window.base();
-                    let page = rel / m.page * m.page;
-                    let sink = PageSink {
-                        child: m.fork_for_thread(),
-                        page,
-                        len: m.page.min(m.window.mapped() - page),
-                        off: rel - page,
-                    };
-                    let mut s = sched.lock();
+                    let sink = PageSink::at(m, addr);
                     let mut cg = pb.cell.lock_unpoisoned();
-                    let id = cg.domain_id();
-                    let t = cg.svc_enqueue(pb.export, 0, vec![rel as i64]);
-                    if let Some(t) = t {
-                        s.page_sinks.insert((id as usize, t), sink);
-                    }
-                    (t, id)
+                    (cg.request_page(pb.export, sink), cg.domain_id())
                 };
                 let Some(t) = ticket else {
                     // Full pager queue is backpressure, not a trap: requeue and re-fault (the access
@@ -9922,17 +9701,6 @@ enum SchedRef {
 }
 
 impl SchedRef {
-    /// §2.2 / #1862 — take the page sink filed for `pager`'s dispatch `ticket`, if that dispatch is
-    /// a page request. The explorer runs no demand children, so it never has one.
-    fn take_page_sink(&self, pager: &Arc<Mutex<Host>>, ticket: u64) -> Option<PageSink> {
-        match self {
-            SchedRef::Real(s) => {
-                let id = pager.lock_unpoisoned().domain_id() as usize;
-                s.lock().page_sinks.remove(&(id, ticket))
-            }
-            SchedRef::Det(_) => None,
-        }
-    }
     fn spawn(&self, make: impl FnOnce(TaskId) -> Box<VCpu>) -> Option<TaskId> {
         match self {
             SchedRef::Real(s) => s.spawn(make),
@@ -10071,6 +9839,40 @@ impl SchedRef {
         match self {
             SchedRef::Real(s) => s.lock().results.contains_key(&id),
             SchedRef::Det(d) => d.lock().results.contains_key(&id),
+        }
+    }
+    /// #2455 — a freeze reached `domain` at `me`: hold the domain if it pages live children
+    /// ([`hold_for_paged`]). The explorer has no durable freeze.
+    fn hold_for_paged(&self, domain: usize, me: &Seat) -> bool {
+        match self {
+            SchedRef::Real(s) => {
+                let held = hold_for_paged(&mut s.lock(), domain, Some(me));
+                s.work.notify_all();
+                held
+            }
+            SchedRef::Det(_) => false,
+        }
+    }
+    /// #2455 — whether `domain` is held for its paged children.
+    fn held(&self, domain: usize) -> bool {
+        match self {
+            SchedRef::Real(s) => s.lock().held.contains_key(&domain),
+            SchedRef::Det(_) => false,
+        }
+    }
+    /// #2455 — `domain`, at `me`, has spawned a paged child. If the freeze has reached it (it is
+    /// `unwinding`, or held), it holds for the child as for any other ([`hold_for_paged`]).
+    fn hold_spawn(&self, domain: usize, me: &Seat, unwinding: bool) -> bool {
+        match self {
+            SchedRef::Real(s) => {
+                let mut g = s.lock();
+                let held = (unwinding || g.held.contains_key(&domain))
+                    && hold_for_paged(&mut g, domain, Some(me));
+                drop(g);
+                s.work.notify_all();
+                held
+            }
+            SchedRef::Det(_) => false,
         }
     }
     /// `Instantiator.kill` (#2074): [`kill_child_locked`] on this run's scheduler.
@@ -10224,7 +10026,7 @@ impl DetState {
 }
 
 /// Reap one explorer vCPU at a teardown (DESIGN.md §12 "Domain lifetime & teardown", owner
-/// 2026-07-24): record `Err(reason)` — the owner's `poll` sees 2, `join` re-raises (I37) — and
+/// 2026-07-24): record `Err(reason)` — the owner's `poll` sees 2, `join` its code (I37) — and
 /// wake any cross-domain joiner. The explorer's single-threaded, so unlike the executor's
 /// [`reap`] there is no running member to gate, no fiber waiters, and no durable contexts.
 fn det_reap(s: &mut DetState, mut v: Box<VCpu>, reason: &Trap) {
@@ -10968,12 +10770,14 @@ fn shadow_switch(
             shadow_context_index(ctx)
         })
     };
-    // Save the outgoing context's live SP to its host-side slot.
-    let sp = m.durable_get_sp(region_of(out_ctx));
-    if out_ctx == ROOT_FIBER {
-        *root_shadow_sp = sp;
-    } else {
-        registry.set_saved_sp(out_ctx, sp);
+    // Save the outgoing context's live SP to its host-side slot (which stands when the word cannot be
+    // read: it is what was written).
+    if let Some(sp) = m.durable_get_sp(region_of(out_ctx)) {
+        if out_ctx == ROOT_FIBER {
+            *root_shadow_sp = sp;
+        } else {
+            registry.set_saved_sp(out_ctx, sp);
+        }
     }
     // Load the incoming context's SP into its (own) region word.
     let in_sp = if in_ctx == ROOT_FIBER {
@@ -11078,39 +10882,6 @@ impl FrozenFiber {
     }
 }
 
-/// §13.4 slice 4c — a nested child's **host state** at a subtree freeze: its serve trio and its
-/// durable handle table, keyed by the same `(parent_task, slot)` as its [`FrozenNested`] record.
-/// Pushed by the child's own self-unwind into the subtree's shared freeze-residue sink (its own
-/// powerbox is private); the codec merges it into the child's nested record, and the thaw seeds
-/// the re-created child's fresh host from it (`set_svc_state` + `restore_durable_handles` —
-/// preserving the original slots/generations, so guest handle values reloaded from the child's
-/// spilled frames still resolve). Absent for a plain child (fresh-grant thaw path, unchanged).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FrozenChildState {
-    /// The task id of the vCPU that instantiated the child (mirrors [`FrozenNested::parent_task`]).
-    pub parent_task: usize,
-    /// The parent's join-table slot for the child (mirrors [`FrozenNested::slot`]).
-    pub slot: usize,
-    /// The child's inbound dispatch queue (FIFO), completion cells (ascending ticket), and ticket
-    /// counter — the child-side v13 serve trio.
-    pub svc_queue: Vec<SvcDispatch>,
-    pub svc_results: Vec<(u64, i64)>,
-    pub svc_next_ticket: u64,
-    /// The child's durable handle table (its `capture_durable_handles` output — a child holding a
-    /// non-durable handle refuses the subtree freeze exactly like a root).
-    pub handles: Vec<DurableHandle>,
-    /// The child's §22 guest-JIT unit tables (its `capture_durable_jit` output), when it holds a
-    /// `Jit` cap (#1296). The root's units ride artifact Section 5 (`capture_durable_jit` on the root
-    /// host); a *child's* `JitTable` handle in `handles` would otherwise point at a table that was
-    /// never captured, so its state rides here and is rebuilt (`restore_durable_jit`) on thaw before
-    /// the handle resolves. Empty for a child without a `Jit` cap.
-    pub jit_tables: Vec<DurableJitTable>,
-    /// The child's call.dyn dispatch-table reservation (`Host::jit_table_log2`), restored on thaw so a
-    /// re-applied install lands in the same padded slot the child chose. `0` for a child with no `Jit`
-    /// cap (the default).
-    pub jit_table_log2: u8,
-}
-
 /// A **spawned vCPU** (a `thread.spawn` child) flattened for freeze (DURABILITY.md §12.8 slice 3.2.1).
 /// Like [`FrozenFiber`] but for a whole green thread rather than a fiber: under a multi-vCPU freeze the
 /// child unwinds its own native stack into *its* per-context shadow region (`context = task id`), and
@@ -11147,91 +10918,22 @@ pub struct FrozenVCpu {
     pub completed_result: Option<i64>,
 }
 
-/// A vCPU's record of one live §14 child it instantiated: the child's join-table slot, its carve
-/// geometry (window-relative), and its entry — everything the subtree freeze needs to broadcast
-/// into the child's carve and record it as [`FrozenNested`] residue (DURABILITY.md §4).
-#[derive(Clone, Copy, Debug)]
-struct NestedChildInfo {
-    /// The [`VCpu::threads`] slot the child's join handle names.
-    slot: usize,
-    /// The carve's **window-relative** base (holder base + requested offset) — the child's window
-    /// is `[carve_off, carve_off + (1 << size_log2))` of the parent's.
-    carve_off: u64,
-    size_log2: u8,
-    /// The child's entry function index — into the parent's own table for a same-module child, or
-    /// into the child's granted module for a separate-module child (resolved by `module_digest`).
-    entry: u32,
-    /// The child's module content digest, or `None` for a **same-module** child (`instantiate`,
-    /// op 0) that runs the parent's own funcs. `Some` for a **separate-module** child (op 5): its
-    /// module is host-supplied at restore, and this digest resolves the re-granted module on thaw.
-    module_digest: Option<[u8; 32]>,
-}
-
-/// A **§14 instantiated child** flattened for freeze (DURABILITY.md §4 "STW quiesces the subtree
-/// as a unit" — first slice: depth-1, same-module, interp). The child's entire state — its window,
-/// its durable reserve (shadow regions, state/SP words), its unwound continuation — lives in its
-/// carve, a sub-range of the parent's window, so it is **already in the artifact's window image**;
-/// this is the small host-side residue a thaw needs to re-attach it: where the carve is, how to
-/// re-enter it, and which join slot the parent's reloaded handle names. (Carried through the
-/// snapshot codec's Section 2 from `FORMAT_VERSION` v8.)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FrozenNested {
-    /// The task id of the vCPU that **instantiated** this child (DURABILITY.md §4, depth-2 nesting).
-    /// A root's direct child carries the root's id (`0`); a grandchild carries its parent-child's
-    /// task. Mirrors [`FrozenVCpu::parent_task`] for `thread.spawn`: the whole §14 nesting subtree
-    /// coalesces its residue in the *root* host (the §14 child's own capability host is private, so
-    /// a shared **freeze-residue sink** is threaded down the subtree — see [`VCpu::freeze_sink`]),
-    /// and thaw groups by this to rebuild the per-parent join table, re-attaching parents before
-    /// children so a grandchild's reloaded handle resolves in its *parent-child's* table, not the
-    /// root's. Depth-1 residue carries `0` and is byte-identical over the codec (not yet on the
-    /// wire — a depth-2 artifact is refused at freeze; see `temen-snapshot`).
-    pub parent_task: usize,
-    /// The child's own task id in the frozen run — what its children's `parent_task` names. The thaw
-    /// maps it to the id the re-created child receives, so a grandchild re-attaches to its recorded
-    /// parent whatever order the thaw assigns ids in (#1687).
-    pub task: usize,
-    /// The parent's join-table slot for this child (the guest-held handle value).
-    pub slot: usize,
-    /// The carve's window-relative base.
-    pub carve_off: u64,
-    /// The carve's (= the child window's) size, `log2`.
-    pub size_log2: u8,
-    /// The child's entry function index — into the parent's own table (`module_digest == None`) or
-    /// the child's granted module (`module_digest == Some`).
-    pub entry: u32,
-    /// `None` for a **same-module** child (runs the parent's funcs); `Some(digest)` for a
-    /// **separate-module** child, whose module a thaw resolves against the restore host's re-granted
-    /// modules (host-supplied at restore, D-scope — the module bytes never ride the artifact). A
-    /// missing / mismatched re-grant makes the thaw fail closed (per-child R5 identity gate).
-    pub module_digest: Option<[u8; 32]>,
-    /// `Some(outcome)` for a **completed-but-unjoined** child — one that finished before the freeze
-    /// point, so its `thread.join` outcome must survive in the artifact (its continuation is gone; the
-    /// scheduler result cell isn't captured): its value, or the trap its `join` re-raises (#1674).
-    /// The thaw delivers this straight into the parent's join table **without re-running** the child
-    /// (reload-not-reissue — no double side effects); its carve gets no `UNWINDING` broadcast (nothing
-    /// to unwind). `None` for a still-running child (re-attached + rewound on thaw).
-    pub completed_result: Option<Result<i64, Trap>>,
-}
-
 /// #1361 step 2 — a **completed-but-unjoined detached §14 child** captured at a subtree freeze. A
-/// detached child owns a *separate* window (it holds a `child_hosts` entry but has NO carve in
-/// `nested_children`), so a **live** one stays fail-closed: the freeze STW broadcasts `UNWINDING`
-/// only into carves within *this* window image, never reaching a detached child's own window (the O6
-/// mid-flight case — step 3). A **completed** one has nothing to unwind — only its `thread.join`
-/// result crosses the boundary, exactly like a completed [`FrozenNested`]'s `completed_result`
-/// (reload-not-reissue). On thaw the runtime posts the result into the scheduler and maps it to the
+/// detached child owns a *separate* window (it holds a `child_hosts` entry); a **live** one is rung
+/// and harvested (steps 3–4). A **completed** one has nothing to unwind — only its `thread.join`
+/// result crosses the boundary (reload-not-reissue). On thaw the runtime posts the result into the scheduler and maps it to the
 /// recording parent's join `slot`, so the parent's re-executed `thread.join` delivers it without
-/// re-spawning the child: op 15 is a `call.cap` checkpoint, so the rewind reloads its spilled slot
+/// re-spawning the child: op 17 is a `call.cap` checkpoint, so the rewind reloads its spilled slot
 /// handle (the transform instruments every `call.cap`) rather than re-running the spawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrozenDetached {
-    /// The task that spawned this child (op 15): `0` for a direct child of the root; a deeper
+    /// The task that spawned this child (op 17): `0` for a direct child of the root; a deeper
     /// parent carries its own task id, so the thaw rebuilds the join edge in the right table.
     pub parent_task: usize,
     /// The spawner's `threads`/join slot the child was minted at — where the reloaded handle resolves.
     pub slot: usize,
     /// The child's `thread.join` outcome: its value (an `i32` result is sign-extended at capture), or
-    /// the trap its `join` re-raises (#1674).
+    /// the trap its `join` answers (#1674).
     pub completed_result: Result<i64, Trap>,
 }
 
@@ -11257,7 +10959,7 @@ fn join_outcome(r: Result<Vec<Value>, Trap>) -> Result<i64, Trap> {
 /// codec sees the harvested [`CapturedDetached`], not this.
 #[derive(Clone)]
 pub struct PendingDetached {
-    /// The task that spawned this child (op 15) — `0` for a direct child of the root.
+    /// The task that spawned this child (op 17) — `0` for a direct child of the root.
     pub parent_task: usize,
     /// The spawner's `threads`/join slot the child was minted at.
     pub slot: usize,
@@ -11271,20 +10973,19 @@ pub struct PendingDetached {
     pub spawn: DetachedSpawn,
 }
 
-/// #1361 step 4 — what op 15 knew when it minted a detached child that a thaw needs to mint it again,
+/// #1361 step 4 — what op 17 knew when it minted a detached child that a thaw needs to mint it again,
 /// kept beside the child's freeze doorbell. Everything else a thaw needs is in the child's own
 /// artifact; these are the facts only the spawner held.
 #[derive(Clone)]
 pub struct DetachedSpawn {
-    /// The child's entry function in its module.
-    pub entry: u32,
     /// The module grant it runs, by §4 content digest — a thaw resolves it against the restoring
     /// host's durable grants, as a separate-module nested child does.
     pub module: Arc<Module>,
     /// The grant's digest ([`module_digest`] of `module`).
     pub digest: [u8; 32],
-    /// The spawner's own module (`is_self_module`), whose imports bind leniently (#1234).
-    pub same_module: bool,
+    /// #2438 — the spawner's pager export, when the record named one: the child's window is
+    /// demand-paged and its faults are served there (§2.2), across a freeze as before it.
+    pub pager: Option<u32>,
 }
 
 /// #1361 step 4 — the spawner-held half of a detached child's freeze record: how to launch it again.
@@ -11296,17 +10997,16 @@ pub struct DetachedLaunch {
     /// The child's own task id in the frozen run. Its residue's `parent_task`s name this, so the thaw
     /// resolves them against it rather than against whatever id the re-launch receives.
     pub task: u64,
-    /// The child's entry function.
-    pub entry: u32,
     /// The §4 content digest of the module grant it runs.
     pub digest: [u8; 32],
     /// The child's D66 lane cap (`-1` = unbounded).
     pub lane: i64,
-    /// Whether the child runs its spawner's own module (its imports then bind leniently, #1234).
-    pub same_module: bool,
     /// The names the spawner registered the child's grants under, `(name, handle)` — what its imports
     /// resolve by. The handles are the child's own, restored verbatim by its artifact.
     pub names: Vec<(String, i32)>,
+    /// #2438 — the spawner's pager export, if the child is demand-paged (v47). Its unsupplied pages
+    /// stay unmapped in its image, so after a thaw they fault again and this pager serves them.
+    pub pager: Option<u32>,
 }
 
 /// #1361 step 3 — a live detached child **after** the harvest: its unwound window plus its powerbox,
@@ -11778,20 +11478,7 @@ impl FiberRegistry {
         t.shadow[slot] = shadow_sp;
     }
 
-    /// Freeze driver (slice 3.1.4): take the lowest still-`Parked` fiber's frames and mark its slot
-    /// `Frozen`, so the driver can flatten it into its shadow region and not revisit it. Returns
-    /// `(slot, frames)`, or `None` once every fiber is flattened (no `Parked` slot remains).
-    /// §3.6 slice 5a — whether any fiber is **event-parked** (`ParkedOn`). A durable freeze
-    /// fails closed on one: its wake is host-side scheduler state (a waiter entry) that no
-    /// snapshot can carry — durable event-parks are a recorded follow-up.
-    /// #1671 — whether a freeze would flatten any fiber here (a suspend-parked or event-parked one).
-    fn has_freeze_residue(&self) -> bool {
-        self.lock()
-            .fibers
-            .iter()
-            .any(|f| matches!(f, RegFiber::Parked(_) | RegFiber::ParkedOn { .. }))
-    }
-
+    /// §3.6 slice 5a — whether any fiber is **event-parked** (`ParkedOn`).
     fn has_blocked_parks(&self) -> bool {
         self.lock()
             .fibers
@@ -11946,20 +11633,11 @@ fn fiber_sig() -> FuncType {
 /// forgeable, so it is **masked** into the power-of-two-padded table, then bounds- and
 /// liveness-checked: out of range or an already-joined (`None`) slot is inert ([`Trap::ThreadFault`]).
 fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> {
-    // #773 defense-in-depth: a join handle is a small non-negative slot; a **negative** value is never
-    // one — it is a forged handle or (the real footgun) a failed-spawn errno the guest forwarded to
-    // `join`/`poll`/`detach` without checking. Reject it (invariant 5: a trap for forgery) rather than
-    // let the `& mask` fold it onto a live slot (e.g. a background server), which would wedge the join
-    // on a child that never exits. `threads.is_empty()` alone missed this.
-    if handle < 0 || threads.is_empty() {
-        return Err(Trap::ThreadFault);
-    }
-    let mask = threads.len().next_power_of_two() - 1;
-    let slot = (handle as u32 as usize) & mask;
-    if slot >= threads.len() || threads[slot].is_none() {
-        return Err(Trap::ThreadFault);
-    }
-    Ok(slot)
+    // The one rule every engine resolves a handle by ([`temen_ir::handle_slot`], #2378); a slot is
+    // live while its entry is.
+    temen_ir::handle_slot(threads.len(), handle)
+        .filter(|&slot| threads[slot].is_some())
+        .ok_or(Trap::ThreadFault)
 }
 
 /// Join child `handle`: take its entry out of `children` and retire the slot, by the
@@ -11971,6 +11649,24 @@ pub(crate) fn take_child<T>(children: &mut [Option<T>], handle: i32) -> Result<T
     Ok(children[slot]
         .take()
         .expect("resolve_thread checked liveness"))
+}
+
+/// #2359 — drop what a vCPU keeps for the child at join `slot` once no handle names the child and it
+/// has ended: its powerbox, its kill flag, its freeze doorbell and spawn, and a thaw's
+/// delivery of it (PROCESS.md §3: a domain's end drops its records). Every reader of these reaches
+/// them through a live slot, so a spent slot's are dead weight, and the powerbox is a whole `Host`.
+/// The slot itself stays `None`, so a stale handle answers as it did.
+fn forget_child(
+    slot: usize,
+    child_hosts: &mut BTreeMap<usize, Arc<Mutex<Host>>>,
+    child_kill: &mut BTreeMap<usize, Arc<AtomicBool>>,
+    child_freeze: &mut BTreeMap<usize, (Arc<AtomicBool>, DetachedSpawn)>,
+    delivered_detached: &mut Vec<(usize, TaskId)>,
+) {
+    child_hosts.remove(&slot);
+    child_kill.remove(&slot);
+    child_freeze.remove(&slot);
+    delivered_detached.retain(|&(s, _)| s != slot);
 }
 
 #[cfg(test)]
@@ -12097,43 +11793,17 @@ struct VCpu {
     /// in any thread and I/O from any thread reaches the same sink (matching the JIT, whose `call.cap`s
     /// all hit the one host ctx). Locked briefly per `call.cap`.
     host: Arc<Mutex<Host>>,
-    /// The residue sink for a §14 subtree freeze (DURABILITY.md §4) — where this vCPU's
-    /// [`FrozenNested`] records are pushed. `None` = use `self.host` (the root, or a `thread.spawn`
-    /// domain that shares its host). A §14 nested child, whose capability host is **private** (its
-    /// own attenuated powerbox), inherits its parent's *effective* sink so a whole nesting subtree's
-    /// residue coalesces in the root host — mirroring how `thread.spawn`'s shared host coalesces
-    /// [`FrozenVCpu`] residue. Without this a grandchild's [`FrozenNested`] would be orphaned in the
-    /// child's private host and lost to the snapshot.
-    freeze_sink: Option<Arc<Mutex<Host>>>,
     /// This vCPU's fuel (metering, §5): drawn from its domain's budget node (#1944 slice 3).
     fuel: Fuel,
     /// This vCPU's spawned children, by `thread.join` handle (slot) ⇒ child [`TaskId`]; `None` once
     /// joined (a re-join is inert).
     threads: Vec<Option<TaskId>>,
-    /// Which [`VCpu::threads`] slots were created by a §14 **`Instantiator.instantiate`** (vs. a §12
-    /// `thread.spawn`), with each child's carve geometry + entry. A durable freeze must distinguish
-    /// them: a spawned vCPU rides the artifact as `FrozenVCpu` residue, while a §14 child is its
-    /// **own domain** whose window (a sub-range of this vCPU's — shadow regions and state words
-    /// included) already rides the parent's window image. On a freeze, a **live** same-module child
-    /// is driven to self-unwind into its carve (the subtree STW broadcast) and recorded as
-    /// [`FrozenNested`] residue; the un-covered shapes (separate-module child, completed-but-unjoined
-    /// child, nested-in-nested) still fail closed (DURABILITY.md §4).
-    nested_children: Vec<NestedChildInfo>,
     /// §3.6 slice 3 — live powerboxes of this vCPU's §14 children, keyed by their `threads`
-    /// slot. Retained so the parent can mint a [`Binding::LiveImpl`] over a child's offer
-    /// (`Instantiator.child_offer`, op 14) — the caller-parking linkage. Live-only (never
-    /// frozen: a LiveImpl is non-durable), kept out of `NestedChildInfo` so the freeze
-    /// records stay `Copy`.
+    /// slot (a `thread.spawn` slot has none). Retained so the parent can mint a
+    /// [`Binding::LiveImpl`] over a child's offer (`Instantiator.child_offer`, op 14) — the
+    /// caller-parking linkage. Dropped with the slot's other records once its handle is spent
+    /// ([`forget_child`], #2359).
     child_hosts: BTreeMap<usize, Arc<Mutex<Host>>>,
-    /// This vCPU **is** a §14 instantiated child (depth-1). Its freeze-unwind is self-describing —
-    /// its extent lives in its carve's shadow-SP word, inside the parent's window image — so its
-    /// freeze completion records no host-side residue (and must not clobber the root's).
-    nested_child: bool,
-    /// §13.4 slice 4c — this nested child's join-table slot in its **parent's** table, threaded in
-    /// at instantiation so the child's own self-unwind can key its [`FrozenChildState`] residue
-    /// (`(parent_task, nested_slot)` matches its `FrozenNested` record). Meaningless unless
-    /// `nested_child`.
-    nested_slot: usize,
     /// CONSOLIDATION.md §2.2: this vCPU is a **demand process child** (`Instantiator` op 16)
     /// whose recoverable page faults become calls on its parent's pager offer instead of
     /// trapping. Set together with `pager`; `false` for every ordinary vCPU (a page fault is
@@ -12218,17 +11888,23 @@ struct VCpu {
     /// self-terminates. `None` on the root and top-level threads (nothing above them to kill them).
     kill: Option<Arc<AtomicBool>>,
     /// #1361 step 3 — the **freeze doorbell**: `Some` on a *detached* §14 child, whose window its
-    /// parent cannot reach. A nested child is told to unwind by one word written into the parent's
-    /// own image (`carve_off + STATE_OFF`); a detached child owns its window elsewhere and the
-    /// parent deliberately holds no pointer into it (`window_exposed = false` is structural), so the
-    /// broadcast is rung out-of-band instead — the same shape as [`kill`](Self::kill), which already
-    /// crosses this boundary.
+    /// parent cannot reach. The child owns its window elsewhere and the parent holds no pointer into
+    /// it, so the broadcast is rung out-of-band — the same shape as [`kill`](Self::kill), which
+    /// already crosses this boundary.
     ///
     /// It is a **doorbell, not a second unwinding path** (INVARIANTS #15): all it does is write
     /// `UNWINDING` into this domain's *own* global freeze word, which is the one thing that makes any
     /// durable domain unwind. The instrumented code takes it from there exactly as it would for a
     /// root freeze. `None` on every other vCPU — the common case, one predicted branch.
     freeze_bell: Option<Arc<AtomicBool>>,
+    /// #2455 — on a detached child's root, its spawner's domain ([`domain_key_of`]): while that
+    /// domain is held for a leaves-first freeze ([`Sched::held`]), this child's unwind is withheld
+    /// from it.
+    spawner_domain: Option<usize>,
+    /// #2455 — this vCPU's bell found its domain paging live children, so the domain is held at
+    /// `NORMAL` ([`hold_for_paged`]) instead of unwinding; the bell is not asked again until the hold
+    /// releases, which puts the domain's phase to `UNWINDING`.
+    held_for_paged: bool,
     /// The window a detached spawn spent on this vCPU — `(parent powerbox, budget, bytes)` — on a
     /// detached child's root only. Its bytes go back to that budget when the child ends (the `Done`
     /// arm, or [`reap`] at a teardown): `Budget.mem` accounts live windows (owner, 2026-09-29), the
@@ -12236,8 +11912,8 @@ struct VCpu {
     window_lease: Option<(Arc<Mutex<Host>>, Lease)>,
     /// #2001 — this vCPU's `spawn` charge on its domain's node, handed back when the vCPU is
     /// dropped. Taken by what makes the vCPU: `thread.spawn`, a fork, a `posix_spawn`, or a thaw
-    /// re-creating a thread. None on a run's root, which its embedder makes ([`LiveVcpu`]), on a
-    /// detached child's root (its [`Self::window_lease`] holds the charge) and on a carve child.
+    /// re-creating a thread. None on a run's root, which its embedder makes ([`LiveVcpu`]), and on a
+    /// detached child's root (its [`Self::window_lease`] holds the charge).
     live: LiveVcpu,
     /// #796 L2 async signals — one entry (`frames.len()` just after the push) per **live injected
     /// signal-handler frame**, innermost last. Empty = not in a handler. Delivery may **nest**
@@ -12253,8 +11929,8 @@ struct VCpu {
     child_kill: BTreeMap<usize, Arc<AtomicBool>>,
     /// #1361 step 3 — a parent's map from a **detached** child's join slot to that child's freeze
     /// doorbell ([`VCpu::freeze_bell`]), so a subtree freeze can ring it. The detached twin of
-    /// [`child_kill`](Self::child_kill), and sparse for the same reason: only op-15 children have one
-    /// (a nested child is reached through its carve, a `thread.spawn` sibling shares our window).
+    /// [`child_kill`](Self::child_kill), and sparse for the same reason: only §14 children have one
+    /// (a `thread.spawn` sibling shares our window).
     /// Beside the bell, what the spawn knew that a thaw needs to mint the child again (#1361 step 4).
     child_freeze: BTreeMap<usize, (Arc<AtomicBool>, DetachedSpawn)>,
     /// #2044 — the completed detached children a thaw delivered at this vCPU's join slots, as `(slot,
@@ -12262,6 +11938,10 @@ struct VCpu {
     /// so they are in no `child_hosts`; a freeze before the `join` reads them here and records each as
     /// completed again, while the slot still names that task.
     delivered_detached: Vec<(usize, TaskId)>,
+    /// #2359 — the children this vCPU detached (`Instantiator.detach`, op 10) before they ended, as
+    /// `(slot, task)`. What it keeps for each, its kill flag among it, stays until a later detach
+    /// finds the child ended and reaps it ([`forget_child`]).
+    unreaped: Vec<(usize, TaskId)>,
     /// D66 — this vCPU's **lane chain**: `(domain, cap)` for its own domain and every ancestor,
     /// innermost first. A worker may run it only while every bounded cap in the chain has room
     /// ([`lane_enter`]); it holds those lanes from that dispatch until it parks or finishes
@@ -12276,7 +11956,7 @@ struct VCpu {
     /// skips admission, and [`reap`] gives them back if it never runs again.
     holds_lanes: bool,
     /// D66 — a parent's map from a **detached** child's join slot to the lane it was granted, so the
-    /// reap ([`credit_child_lane`]) returns it to `granted_lanes`. Only op-15 children have one.
+    /// reap ([`credit_child_lane`]) returns it to `granted_lanes`. Only op-17 children have one.
     child_lane: BTreeMap<usize, i64>,
     /// §3.6 slice 5b — the serve loop's **running handler fiber**, set when the
     /// `svc.poll`/`svc.wait` arm switches into one and consumed when the serve frame re-executes
@@ -12391,13 +12071,9 @@ impl VCpu {
             wait_indefinite: false,
             mem,
             host,
-            freeze_sink: None,
             fuel,
             threads: Vec::new(),
-            nested_children: Vec::new(),
             child_hosts: BTreeMap::new(),
-            nested_child: false,
-            nested_slot: 0,
             fault_pager: false,
             pager: None,
             page_fault: None,
@@ -12418,12 +12094,15 @@ impl VCpu {
             debug: None,
             kill: None,
             freeze_bell: None,
+            spawner_domain: None,
+            held_for_paged: false,
             window_lease: None,
             live: LiveVcpu::none(),
             sig_handler_stack: Vec::new(),
             child_kill: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
             delivered_detached: Vec::new(),
+            unreaped: Vec::new(),
             lane_chain: Vec::new(),
             holds_lanes: false,
             child_lane: BTreeMap::new(),
@@ -12473,13 +12152,9 @@ impl VCpu {
             wait_indefinite: false,
             mem: twin_mem,
             host: twin_host,
-            freeze_sink: None,
             fuel: self.fuel.for_thread(), // a twin shares the budget node (the powerbox's `fork`)
             threads: Vec::new(),
-            nested_children: Vec::new(),
             child_hosts: BTreeMap::new(),
-            nested_child: false,
-            nested_slot: 0,
             fault_pager: false,
             pager: None,
             page_fault: None,
@@ -12500,12 +12175,15 @@ impl VCpu {
             debug: None,
             kill: None,
             freeze_bell: None,
+            spawner_domain: None,
+            held_for_paged: false,
             window_lease: None,
             live: LiveVcpu::none(),
             sig_handler_stack: self.sig_handler_stack.clone(), // forked mid-handler: the twin returns from the inherited frame too
             child_kill: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
             delivered_detached: Vec::new(),
+            unreaped: Vec::new(),
             lane_chain: Vec::new(),
             holds_lanes: false,
             child_lane: BTreeMap::new(),
@@ -12570,13 +12248,9 @@ impl VCpu {
             wait_indefinite: false,
             mem,
             host,
-            freeze_sink: None,
             fuel,
             threads: Vec::new(),
-            nested_children: Vec::new(),
             child_hosts: BTreeMap::new(),
-            nested_child: false,
-            nested_slot: 0,
             fault_pager: false,
             pager: None,
             page_fault: None,
@@ -12597,12 +12271,15 @@ impl VCpu {
             debug: None,
             kill: None,
             freeze_bell: None,
+            spawner_domain: None,
+            held_for_paged: false,
             window_lease: None,
             live: LiveVcpu::none(),
             sig_handler_stack: Vec::new(),
             child_kill: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
             delivered_detached: Vec::new(),
+            unreaped: Vec::new(),
             lane_chain: Vec::new(),
             holds_lanes: false,
             child_lane: BTreeMap::new(),
@@ -12802,7 +12479,7 @@ impl VCpu {
         let root_sp = self
             .mem
             .as_ref()
-            .map(|m| m.durable_get_sp(root_word))
+            .and_then(|m| m.durable_get_sp(root_word))
             .unwrap_or_else(|| arena.frame_base(self.vcpu_ctx));
         while let Some((slot, frames)) = self.registry.take_parked_for_freeze() {
             // Placeholder resume value (inert; not spilled by `Yield`).
@@ -12895,7 +12572,7 @@ impl VCpu {
         let shadow_sp = self
             .mem
             .as_ref()
-            .map(|m| m.durable_get_sp(arena.region_base(fctx)))
+            .and_then(|m| m.durable_get_sp(arena.region_base(fctx)))
             .unwrap_or_else(|| arena.frame_base(fctx));
         self.registry.set_saved_sp(slot, shadow_sp);
         self.frozen.push(FrozenFiber {
@@ -13332,7 +13009,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     let mut svc_timed_out = false;
     // Resuming from a park: finish the op the scheduler woke us for.
     match v.pending.take() {
-        Some(Pending::Join { slot, wait }) => {
+        Some(Pending::Join { slot, status }) => {
             let child = v
                 .threads
                 .get(slot)
@@ -13340,19 +13017,24 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 .ok_or(Trap::ThreadFault)?;
             // #1904 — a **detached** child the freeze unwound is not joined: it keeps its slot, and its
             // result (its window) is left for the harvest, so it rides the artifact. The join is
-            // re-issued on thaw against the re-launched child.
-            let detached = v.child_hosts.contains_key(&slot)
-                && !v.nested_children.iter().any(|c| c.slot == slot);
+            // re-issued on thaw against the re-launched child, so its results here are placeholders.
+            let detached = v.child_hosts.contains_key(&slot);
             if v.durable && detached && v.sched.unwound(child) {
                 abandon_for_freeze(&mut v.mem, v.durable_sp_ctx);
                 let top = v.frames.len() - 1;
-                v.frames[top].vals.push(Reg::from_i64(0));
-            } else if wait && v.sched.outcome_code(child) == Some(0) {
-                // op 18 on a child that returned: it stays for its `join` ([`join_delivery`]).
-                let top = v.frames.len() - 1;
-                v.frames[top].vals.push(Reg::from_i64(0));
+                let n = if status { 2 } else { 1 };
+                v.frames[top]
+                    .vals
+                    .extend(core::iter::repeat_n(Reg::from_i64(0), n));
             } else {
                 v.threads[slot] = None; // a handle is joined once
+                forget_child(
+                    slot,
+                    &mut v.child_hosts,
+                    &mut v.child_kill,
+                    &mut v.child_freeze,
+                    &mut v.delivered_detached,
+                );
                 credit_child_lane(&mut v.child_lane, &v.host, slot); // D66 — before the `?`: a trapped child returns its lane too
                                                                      // #1685 — under a freeze, a child that unwound hands back a placeholder: mark the join
                                                                      // for re-issue on thaw, against the re-spawned child. A child that finished for real is
@@ -13361,10 +13043,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     abandon_for_freeze(&mut v.mem, v.durable_sp_ctx);
                 }
                 let out = v.sched.take_result(child).ok_or(Trap::Malformed)?;
-                // A child trap propagates as this vCPU's trap, but to a `wait` it is a value.
-                let r = join_delivery(&out.result, wait).0?;
+                // A thread's trap is this vCPU's; a §14 child's end is a value (#2066).
+                let regs = join_delivery(&out.result, status)?;
                 let top = v.frames.len() - 1;
-                v.frames[top].vals.push(r);
+                v.frames[top].vals.extend(regs);
             }
         }
         Some(Pending::ReapPid { pid }) => {
@@ -13423,7 +13105,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         chain,
         cur,
         fault_pager,
-        pager: _,
+        pager,
         page_fault: _,
         reply_ticket: _,
         frames,
@@ -13440,13 +13122,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         wait_indefinite: _, // #1584 — set at the futex park site, read by the quiesce gate
         mem,
         host,
-        freeze_sink, // §4: the effective sink a §14 child inherits so its residue reaches the root host
         fuel,
         threads,
-        nested_children,
         child_hosts,
-        nested_child,
-        nested_slot: _,
         depth,
         pending,
         sched,
@@ -13464,6 +13142,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         debug,
         kill,
         freeze_bell,
+        spawner_domain: _, // read where the vCPU ends (`Done`)
+        held_for_paged,
         sig_handler_stack,
         child_kill,
         child_freeze,
@@ -13479,7 +13159,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         unit_ref_cache,
         window_lease: _, // settled where the vCPU ends (`Done` / `reap`), never mid-run
         live: _,         // #2001: handed back when the vCPU is dropped
-        delivered_detached: _, // #2044: read by the freeze scan, at the dispatch boundary
+        delivered_detached,
+        unreaped,
     } = v;
     let depth = *depth;
     let durable = *durable;
@@ -13502,22 +13183,29 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // (its freeze word now reads `UNWINDING`). If the cut cannot complete, put the word back to
     // `NORMAL` before any poll reads it — nothing has unwound, so the run continues untouched — and
     // record the decline on the run root's powerbox for the embedder.
-    macro_rules! freeze_census_at_trigger {
-        ($m:expr) => {{
-            let seat = Seat {
+    //
+    // #2455 — a cut that can complete reaches this domain now: if it pages live children it is held
+    // instead, back at `NORMAL`, to serve them until they have unwound ([`hold_for_paged`]).
+    macro_rules! seat {
+        () => {
+            Seat {
                 id: *id,
-                nested_child: *nested_child,
                 threads: threads.as_slice(),
-                nested_children: nested_children.as_slice(),
                 child_hosts: &*child_hosts,
                 child_freeze: &*child_freeze,
                 host: &*host,
                 registry: &*registry,
-            };
-            let root = freeze_sink.clone().unwrap_or_else(|| Arc::clone(host));
-            if let Some(d) = freeze_census(Some(&seat), sched, &root) {
+            }
+        };
+    }
+    macro_rules! freeze_census_at_trigger {
+        ($m:expr) => {{
+            let seat = seat!();
+            if let Some(d) = freeze_census(Some(&seat), sched, host) {
                 $m.durable_set_state(STATE_NORMAL);
-                root.lock_unpoisoned().freeze_declined = Some(d);
+                host.lock_unpoisoned().freeze_declined = Some(d);
+            } else if sched.hold_for_paged(sig_domain, &seat) {
+                $m.durable_set_state(STATE_NORMAL);
             }
         }};
     }
@@ -13903,7 +13591,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             {
                                                 Some((_, s_)) => s_.clone(),
                                                 None => {
-                                                    let s_ = dt.install_unit_funcs(entry_.funcs.clone(), entry_.types.clone(), None).map(|(_, s)| s.to_vec());
+                                                    let s_ = dt.install_unit_funcs(entry_.funcs.clone(), entry_.types.clone()).map(|(_, s)| s.to_vec());
                                                     unit_ref_cache.push((key_, s_.clone()));
                                                     s_
                                                 }
@@ -14128,20 +13816,28 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // fuel, and a §14 child must self-terminate even in a loop that exits on its first
             // iteration (no back-edge), so it can't wait for a safepoint.
             poll_kill(kill.as_deref())?;
-            // #1361 step 3 — the freeze doorbell. A **detached** child owns a window its parent
-            // cannot write, so a subtree freeze rings this instead of broadcasting into a carve. All
+            // #1361 step 3 — the freeze doorbell. A §14 child owns a window its parent cannot
+            // write, so a subtree freeze rings this instead of writing the child's freeze word. All
             // it does is set our OWN global freeze word: from here the instrumented code unwinds
             // exactly as it would for a root freeze, so there is still one unwinding path and this is
             // a doorbell for it (#15). Idempotent, and placed here rather than at a safepoint for the
             // same reason `kill` is — a child must be reachable even in a loop with no back-edge.
             // Free when unarmed (`None`); when armed, one relaxed load per op.
+            //
+            // #2455 — unless this domain pages live children: then it is held, still `NORMAL`, to
+            // serve them until they have unwound ([`hold_for_paged`]), and the bell is not asked again.
             if freeze_bell
                 .as_deref()
                 .is_some_and(|b| b.load(Ordering::Relaxed))
+                && !*held_for_paged
             {
                 if let Some(m) = mem.as_mut() {
                     if m.durable_state() == STATE_NORMAL {
-                        m.durable_set_state(STATE_UNWINDING);
+                        if sched.hold_for_paged(sig_domain, &seat!()) {
+                            *held_for_paged = true;
+                        } else {
+                            m.durable_set_state(STATE_UNWINDING);
+                        }
                     }
                 }
             }
@@ -14459,7 +14155,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // names its own functions installs them first, once ("Unit-own funcrefs"), as
                     // the JIT's compile does. The padding starts at `funcs.len()` on both backends,
                     // so the install lands at the same index the JIT's `install` returns.
-                    let res = match dt.install(unit_funcs, unit_types, (domain, cu), None) {
+                    let res = match dt.install(unit_funcs, unit_types, None) {
                         Some(slot) => {
                             // Record the occupancy on the domain so it survives the run (the table is
                             // a per-run transient) and rides a snapshot (DURABILITY.md §12.5).
@@ -14501,7 +14197,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let ch =
                         get(&frames[top].vals, *$args.first().ok_or(Trap::Malformed)?)?.i64() as i32;
                     // A code handle is only valid on the domain that compiled it.
-                    let (unit_funcs, unit_types, unit_id) =
+                    let (unit_funcs, unit_types, _) =
                         host.lock_unpoisoned().resolve_jit_unit($h, ch)?;
                     let entry = unit_funcs.first().ok_or(Trap::CapFault)?;
                     // Strict arity: the call.cap's declared signature must match the unit entry's
@@ -14523,11 +14219,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // too few slots left it cannot, where the JIT refused its compile: fail closed.
                     let ref_slots = if unit_names_own_funcs(&unit_funcs) {
                         let (_, slots) = dt
-                            .install_unit_funcs(
-                                Arc::clone(&unit_funcs),
-                                Arc::clone(&unit_types),
-                                Some(unit_id),
-                            )
+                            .install_unit_funcs(Arc::clone(&unit_funcs), Arc::clone(&unit_types))
                             .ok_or(Trap::CapFault)?;
                         Some(slots.to_vec())
                     } else {
@@ -14641,6 +14333,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     });
                     continue 'frames;
                 }
+                // The arms below serve their ops here, each delivering the results its op's contract
+                // names (`temen_ir::served_contract`). A call declaring another shape, or an
+                // Instantiator op that isn't live, is a `CapFault` before any of them runs, as on
+                // every engine: no arm numbers a result it doesn't push (#2066, #2361).
+                Inst::CapCall {
+                    type_id, op, sig, ..
+                } if !temen_ir::served_shape_ok(*type_id, *op, call_sig(&cur_types, *sig)) => {
+                    return Err(Trap::CapFault);
+                }
                 Inst::CapCall {
                     type_id: cap_id::INSTANTIATOR,
                     op,
@@ -14660,66 +14361,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let h = get_i32(&frames[top].vals, *handle)?;
                     // The handle must name an `Instantiator`: the authority every op below needs.
                     host.lock_unpoisoned().resolve_instantiator(h)?;
-                    // §2.2: a record's resolved pager binding, threaded into the spawn tail (the
-                    // child's window starts demand-paged and holds the pager substrate-side).
-                    let mut pager_ref: Option<(Arc<Mutex<Host>>, u32)> = None;
-                    // #1863 (op 17): a spawn record is op 15 as data. Its fields replace the
-                    // op-15 arm's positional-arg parse; the arm is the one spawn path.
-                    let mut rec_detached: Option<SpawnRec> = None;
-                    let op = match *op {
-                        // CONSOLIDATION.md §3 — `instantiate_rec(record_ptr)` (op 17): the
-                        // config-record spawn. One record subsumes every spawn variant as data —
-                        // module (`-1` = self), entry, window, pager export (`u32::MAX` = none;
-                        // anything else makes a §2.2 demand child paged by the spawner's own impl
-                        // export), budget, the named-grant list, args and a pre-mapped region.
-                        // Spawn shape is data, not opcode; `join`/`poll`/`detach`/`kill` stay
-                        // verbs. A malformed record (bad version, nonzero reserved field) fails the
-                        // spawn closed before any child state exists.
-                        17 => {
-                            let rp =
-                                get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
-                                    as u64;
-                            let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                            // Shared layout decode (#911); budget/grant/pager handling stays
-                            // tier-local (this arm alone validates the pager export against
-                            // `self_module`).
-                            let sr = bytecode::read_spawn_rec(m, rp)?;
-                            // A pager that is not a `{ page: (i64) -> (i64) }` export fails the
-                            // spawn closed (§3.3, #744, #1862).
-                            if sr.pager != u32::MAX {
-                                let hg = host.lock_unpoisoned();
-                                let ok = hg
-                                    .self_module
-                                    .as_ref()
-                                    .is_some_and(|sm| sm.is_pager_export(sr.pager));
-                                if !ok {
-                                    return Err(Trap::CapFault);
-                                }
-                                pager_ref = Some((Arc::clone(host), sr.pager));
-                            }
-                            rec_detached = Some(sr);
-                            15
-                        }
-                        o => o,
-                    };
-                    match op {
-                        // join(child) -> result: park only this fiber until the child finishes (its
-                        // result/trap is delivered on resume via `Pending::Join`); siblings run on.
-                        //
-                        // wait(child) -> 0 | trap code (op 18): park as `join` does, then answer how
-                        // the child ended: 0 if it returned (it stays for its `join`), else its trap's
-                        // wire code (`temen_ir::trap_code`), the child reaped ([`join_delivery`]). So
-                        // a spawner learns its child ran out of fuel, or crashed, without inheriting
-                        // the trap (INVARIANTS #5).
-                        1 | 18 => {
+                    match *op {
+                        // join(child) -> (status, value): park only this fiber until the child ends,
+                        // then answer how it ended — `(0, its first result)` or `(its trap's wire
+                        // code, 0)`, the child reaped ([`join_delivery`], on resume via
+                        // `Pending::Join`). Siblings run on. A spawner learns its child ran out of
+                        // fuel, crashed, was killed or exited without inheriting it (INVARIANTS #5).
+                        1 => {
                             let ch =
                                 get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
                             let slot = resolve_thread(threads, ch)?;
                             let child = threads[slot].ok_or(Trap::ThreadFault)?;
-                            *pending = Some(Pending::Join {
-                                slot,
-                                wait: op == 18,
-                            });
+                            *pending = Some(Pending::Join { slot, status: true });
                             return Ok(Inner::Park(Blocked::Join { child }));
                         }
                         // poll(child) -> 0 running | 1 returned | 2 trapped (PROCESS.md S3). Never
@@ -14740,32 +14393,53 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].vals.push(Reg::from_i32(status));
                         }
                         // detach(child) -> 0 (PROCESS.md S3): drop the parent's join claim. The child
-                        // keeps running to completion (detach is not kill); its result is reaped now if
-                        // it already finished, else discarded when the run tears down — never joinable
-                        // again. A forged / already-joined handle is a `ThreadFault`. (Auto-reap of a
-                        // still-running detached child's eventual result — vs. run-end cleanup — is a
-                        // follow-up, as is `kill`, which needs a per-child §5 interrupt.)
+                        // keeps running to completion (detach is not kill) and is never joinable again.
+                        // A forged / already-joined handle is a `ThreadFault`. #2359 — it is reaped, its
+                        // result and what this vCPU keeps for it, once it has ended: now if it has, else
+                        // at a later detach. Until then its kill flag stays, so a kill of this vCPU
+                        // still ends it.
                         10 => {
                             let ch =
                                 get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
                             let slot = resolve_thread(threads, ch)?;
                             let child = threads[slot].ok_or(Trap::ThreadFault)?;
                             threads[slot] = None; // no longer joinable
-                            let _ = sched.take_result(child); // reap if already finished
                             credit_child_lane(child_lane, host, slot); // D66
+                            unreaped.push((slot, child));
+                            unreaped.retain(|&(slot, child)| {
+                                let ended = sched.take_result(child).is_some();
+                                if ended {
+                                    forget_child(
+                                        slot,
+                                        child_hosts,
+                                        child_kill,
+                                        child_freeze,
+                                        delivered_detached,
+                                    );
+                                }
+                                !ended
+                            });
                             frames[top].vals.push(Reg::from_i32(0));
                         }
                         // kill(child) -> 0 (PROCESS.md S3, #2074): end the child and everything under
-                        // it, running or parked, with `ThreadFault` (`poll` → 2, `wait` → its code).
-                        // Idempotent; killing an already-finished child is a harmless success. The
-                        // parent then `wait`s or `poll`s (a `join` re-raises the trap). A forged or
-                        // joined handle is a `ThreadFault`.
+                        // it, running or parked, with `ThreadFault` (`poll` → 2, `join` → its code).
+                        // Idempotent; killing an already-finished child is a harmless success. A
+                        // forged or joined handle is a `ThreadFault`.
                         12 => {
                             let ch =
                                 get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
                             let slot = resolve_thread(threads, ch)?;
                             if let Some(flag) = child_kill.get(&slot) {
+                                // #2455 — a kill can end the last child this domain is held for. The
+                                // release then reaches every vCPU of the domain but this running one,
+                                // which takes the freeze itself.
+                                let held = durable && sched.held(sig_domain);
                                 sched.kill_child(flag, child_hosts.get(&slot));
+                                if held && !sched.held(sig_domain) {
+                                    if let Some(m) = mem.as_mut() {
+                                        m.durable_set_state(STATE_UNWINDING);
+                                    }
+                                }
                             }
                             frames[top].vals.push(Reg::from_i32(0));
                         }
@@ -14815,102 +14489,65 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let r = grant_into_running(host, callee, gh)?;
                             frames[top].vals.push(Reg::from_i32(r as i32));
                         }
-                        // PROCESS.md §5 — `instantiate_detached(budget, module, grants_ptr,
-                        // grants_n, entry, size_log2, quota) -> child | -EINVAL`: spawn a
-                        // child from a granted module into a **fresh platform window**, minted
-                        // by spending arg-0's `Budget.mem` (#1289 R2) — outside this domain's window,
-                        // so no ancestor below the platform holds read authority and the child
-                        // attests `window_exposed = false` (the distrust-spawner trust model).
-                        // The §14 free data plane is gone BY DESIGN: data flows through the
-                        // module's own segments and the named grants (streams / pipe ends /
-                        // regions — the op-11 record format), the separate-process discipline.
-                        // The spawner keeps kill/join/fuel authority — detachment severs
-                        // *read*, not lifecycle. A quota miss / non-`Budget` arg / bad entry or
-                        // size refuses probeably (and a refused spawn charges nothing); a
-                        // **durable** domain refuses outright (a detached window is outside
-                        // the subtree snapshot — fail closed; multi-window freeze is the
-                        // recorded §5/O6 follow-up). No D38 contact: the child's window is an
-                        // ordinary reservation with its own guard, exactly a root run's.
-                        15 => {
-                            // #1863: the op-17 v1 record, when that is how the spawn came in, else
-                            // op 15's positional args — one decoded spawn either way.
-                            let rec = rec_detached.take();
-                            let argn = |i: usize| -> Result<i64, Trap> {
-                                if let Some(r) = &rec {
-                                    return Ok(match i {
-                                        0 => r.budget as i64,
-                                        1 => r.modh as i64,
-                                        2 => r.grants_ptr as i64,
-                                        3 => r.grants_n as i64,
-                                        4 => r.entry as i64,
-                                        5 => r.size_log2,
-                                        6 => r.quota,
-                                        _ => return Err(Trap::Malformed),
-                                    });
+                        // CONSOLIDATION.md §3 — `instantiate_rec(record_ptr) -> child | -EINVAL`
+                        // (op 17), the one spawn form (INVARIANTS #13, #1863): the record
+                        // ([`SpawnRec`]) names the module the child runs from its function 0 (#2219),
+                        // the `Budget` whose `mem` mints its **fresh platform window** (#1289 R2), the
+                        // window's size, the named grants, a spawn-time args payload, a pre-mapped
+                        // region and a pager export (`u32::MAX` = none). The window is outside this
+                        // domain's, so no ancestor below the platform holds read authority and an
+                        // unpaged child attests `window_exposed = false` (the distrust-spawner trust
+                        // model): data flows through the module's own segments, the named grants, the
+                        // payload and the region, the separate-process discipline. A paged child
+                        // attests it exposed: its pager chooses each page and sees each fault (#2095). The spawner keeps
+                        // kill/join/fuel authority — detachment severs *read*, not lifecycle. A
+                        // malformed record (a bad version, a nonzero reserved word) fails the spawn
+                        // closed before any child state exists; a non-`Budget`, bad size, budget miss
+                        // or unbound import refuses probeably, and a refused spawn charges nothing.
+                        // No D38 contact: the child's window is an ordinary reservation with its own
+                        // guard, exactly a root run's.
+                        17 => {
+                            let rp =
+                                get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
+                                    as u64;
+                            // Shared layout decode (#911); budget/grant/pager handling stays
+                            // tier-local (this arm alone validates the pager export against
+                            // `self_module`).
+                            let rec =
+                                bytecode::read_spawn_rec(mem.as_ref().ok_or(Trap::Malformed)?, rp)?;
+                            // §2.2: the record's pager binding, threaded into the spawn tail (the
+                            // child's window starts demand-paged and holds the pager substrate-side).
+                            // A pager that is not a `{ page: (i64) -> (i64) }` export fails the
+                            // spawn closed (§3.3, #744, #1862).
+                            let pager_ref = if rec.pager == u32::MAX {
+                                None
+                            } else {
+                                if !host.lock_unpoisoned().has_pager_export(rec.pager) {
+                                    return Err(Trap::CapFault);
                                 }
-                                Ok(
-                                    get(&frames[top].vals, *args.get(i).ok_or(Trap::Malformed)?)?
-                                        .i64(),
-                                )
+                                Some((Arc::clone(host), rec.pager))
                             };
-                            let budget = argn(0)? as i32;
-                            let mh = argn(1)? as i32;
-                            let grants_ptr = argn(2)? as u64;
-                            let grants_n = argn(3)? as u64;
-                            let entry = argn(4)? as u64;
-                            let size_log2 = argn(5)?;
-                            // #1944 slice 3 — `quota` is retired: the budget in arg 0 is the one way
-                            // to limit a child's fuel, so any other value fails closed, as a v0
-                            // record naming a budget and a quota both does.
-                            if argn(6)? != 0 {
-                                return Err(Trap::CapFault);
-                            }
-                            // #1286 — optional spawn-time args payload `(args_ptr, args_len)` (args
-                            // 7–8): bytes of this domain's window copied to the child's
-                            // `module_args_base()` before start — the detached twin of the op-13
-                            // convention (a parent data segment landing inside the carve), which has
-                            // no analogue across windows. The 7-arg form seeds nothing. An over-long
-                            // payload refuses probeably, before anything is read: its length is the
-                            // guest's (#2338).
-                            let payload_at: Option<(u64, u64)> = match (args.get(7), args.get(8)) {
-                                _ if rec.is_some() => {
-                                    rec.as_ref().map(|r| r.args).filter(|&(_, len)| len > 0)
-                                }
-                                (Some(&p), Some(&l)) => Some((
-                                    get(&frames[top].vals, p)?.i64() as u64,
-                                    get(&frames[top].vals, l)?.i64() as u64,
-                                )),
-                                _ => None,
-                            };
+                            let budget = rec.budget;
+                            let mh = rec.modh;
+                            let (grants_ptr, grants_n) = (rec.grants_ptr, rec.grants_n);
+                            let size_log2 = rec.size_log2;
+                            // #1286 — the spawn-time args payload: bytes of this domain's window
+                            // copied to the child's `module_args_base()` before start (length 0 seeds
+                            // nothing). An over-long payload refuses probeably, before anything is
+                            // read: its length is the guest's (#2338).
+                            let payload_at = (rec.args.1 > 0).then_some(rec.args);
                             let payload_ok = payload_at.is_none_or(|(_, len)| {
                                 len <= temen_ir::module_args_end() - temen_ir::module_args_base()
                             });
-                            // Optional **pre-mapped region** `(region, child_off)` (args 9–10): a
+                            // The **pre-mapped region** `(region, child_off)` (`region` −1 = none): a
                             // `SharedRegion` of this domain aliased whole, read-write, into the
                             // child's window at `child_off` before it starts — the same alias the
-                            // child would get by `map`ping a granted handle itself, minus the
-                            // ceremony (`Host::premap_admit` / `stage_premap` / `apply_premap`). The
-                            // 9-arg form pre-maps nothing.
-                            let premap: Option<(i32, u64)> = match (args.get(9), args.get(10)) {
-                                _ if rec.is_some() => rec
-                                    .as_ref()
-                                    .filter(|r| r.region >= 0)
-                                    .map(|r| (r.region, r.child_off)),
-                                (Some(&r), Some(&o)) => Some((
-                                    get(&frames[top].vals, r)?.i64() as i32,
-                                    get(&frames[top].vals, o)?.i64() as u64,
-                                )),
-                                _ => None,
-                            };
+                            // child would get by `map`ping a granted handle itself, minus the ceremony
+                            // (`Host::premap_admit` / `stage_premap` / `apply_premap`).
+                            let premap = (rec.region >= 0).then_some((rec.region, rec.child_off));
                             // The module grant (a forged module handle is a CapFault, as ops
-                            // 5/13); the child runs it as its own program + self module. `-1` is
-                            // the spawning frame's program: an installed unit's own, from a frame
-                            // of one (#2143).
-                            let unit = dt.unit_id(frames[top].module);
-                            let cm = host
-                                .lock_unpoisoned()
-                                .resolve_spawn_module(mh, unit)?
-                                .clone();
+                            // 5/13); the child runs it as its own program + self module.
+                            let cm = host.lock_unpoisoned().resolve_module(mh)?.clone();
                             // The payload is read after the module resolves, as every engine reads
                             // it, so a forged module faults the same way beside a bad payload.
                             let payload = match payload_at {
@@ -14921,8 +14558,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 _ => None,
                             };
                             // Named grants (the op-11 record format), pre-validated fail-closed. A
-                            // detached spawn may carry #744's live self-serve grant, from a v1
-                            // record or op 15's positional form alike.
+                            // spawn may carry #744's live self-serve grant.
                             let glist = match grants_n {
                                 0 => Vec::new(),
                                 _ => {
@@ -14934,9 +14570,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             };
                             authorize_eval_grants(&host.lock_unpoisoned(), &glist)?;
                             let cfs: &[Func] = &cm.module.funcs;
-                            let arity = cfs.get(entry as usize).map_or(0, |f| f.params.len());
+                            let arity = cfs.first().map_or(0, |f| f.params.len());
                             let ok_entry = cfs
-                                .get(entry as usize)
+                                .first()
                                 .is_some_and(|f| bytecode::child_entry_ok(&f.params, &f.results));
                             let size_log2 =
                                 temen_ir::detached_size_log2(size_log2, cm.memory_log2());
@@ -14990,7 +14626,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // The fresh platform window: its own reservation + guard,
                                 // exactly a root run's — nothing of it in this domain's VA.
                                 let mut fm = Mem::from_spec(WindowSpec {
-                                    reserved_log2: DEFAULT_RESERVED_LOG2,
+                                    reserved_log2: window_reserved_log2(size_log2 as u8),
                                     mapped_log2: size_log2 as u8,
                                     shadow: cm.shadow(),
                                     data: &cm.module.data,
@@ -15000,9 +14636,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 if let Some(p) = &payload {
                                     let _ = fm.write_bytes(temen_ir::module_args_base(), p);
                                 }
-                                // #1862/#1863: a v1 record's pager — the whole window starts
+                                // #1862/#1863: a spawn record's pager — the whole window starts
                                 // demand-paged and every page arrives through the pager's reply.
-                                let pager_for_child = pager_ref.take();
+                                let pager_for_child = pager_ref;
                                 if pager_for_child.is_some() {
                                     fm.demand_page();
                                 }
@@ -15016,7 +14652,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 ch.set_durable(durable);
                                 ch.set_attestation({
                                     let hg = host.lock_unpoisoned();
-                                    hg.detached_child_attestation()
+                                    hg.detached_child_attestation(pager_for_child.is_some())
                                 });
                                 // #1286: the starter caps span the child's whole **reservation**, as a
                                 // root run's `grant_memory` does — a detached window has no carve to be
@@ -15024,7 +14660,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // refuse every `vm_map` past it (the growth a detached window exists
                                 // for). The minter quota governs *minting*; growth is bounded by the
                                 // reservation (and, on wasm, the minted memory's `maximum`).
-                                let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
+                                let reservation = 1u64 << window_reserved_log2(size_log2 as u8);
                                 let (cinst, cas) = ch.grant_starter_caps(reservation);
                                 // #1944 — the budget that paid for the window is the child's own.
                                 host.lock_unpoisoned().give_child_budget(lease, &mut ch);
@@ -15053,17 +14689,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         return Err(Trap::Malformed);
                                     }
                                 }
-                                // A child of the running module itself binds leniently (#1234
-                                // — its manifest is the parent's whole import surface).
-                                let same_module = host.lock_unpoisoned().is_self_module(mh);
-                                let bound = if same_module {
-                                    ch.bind_same_module_manifest(
-                                        &cm.module.imports,
-                                        &cm.module.types,
-                                    )
-                                } else {
-                                    ch.bind_child_manifest(&cm.module.imports, &cm.module.types)
-                                };
+                                let bound =
+                                    ch.bind_child_manifest(&cm.module.imports, &cm.module.types);
                                 if bound.is_err() {
                                     undo();
                                     frames[top].vals.push(Reg::from_i32(EINVAL as i32));
@@ -15092,6 +14719,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         Fuel::drawn(child_host.lock_unpoisoned().own_node());
                                     let (cfuncs, ctypes) = cm.tables(); // with its type section (#922)
                                     let csched = sched.clone();
+                                    let pager_export = pager_for_child.as_ref().map(|&(_, e)| e);
                                     let kflag = Arc::new(AtomicBool::new(false));
                                     let kflag_child = Arc::clone(&kflag);
                                     // #1361 step 3 — the freeze doorbell, minted beside the kill flag
@@ -15114,10 +14742,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     };
                                     let made = sched.spawn(move |id| {
                                         // A detached child is its own domain: own dispatch
-                                        // table, own window; NOT `nested_child` (no carve to
-                                        // self-describe) and never in `nested_children` (no
-                                        // carve geometry exists — and the durable refusal
-                                        // above keeps it out of every freeze path).
+                                        // table, own window.
                                         // #1296: reserve the install slots the child's re-granted
                                         // `Jit` table carries (none ⇒ the natural table).
                                         let cdt = Arc::new(DomainTable::new(
@@ -15127,7 +14752,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         let mut child = VCpu::new(
                                             cfuncs,
                                             ctypes,
-                                            entry as u32,
+                                            0,
                                             &child_args,
                                             Some(fm),
                                             child_host,
@@ -15144,6 +14769,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         child.durable = durable;
                                         child.kill = Some(kflag_child); // lifecycle stays the spawner's
                                         child.freeze_bell = Some(bell_child); // and so does the freeze
+                                        child.spawner_domain = Some(sig_domain); // #2455
                                         child.window_lease = Some(lease); // its window's bytes, until it ends
                                         if let Some((cell, export)) = pager_for_child {
                                             child.pager = Some(PagerRef { cell, export });
@@ -15161,10 +14787,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                 (
                                                     bell,
                                                     DetachedSpawn {
-                                                        entry: entry as u32,
                                                         module: Arc::clone(&cm.module),
                                                         digest: cm.digest,
-                                                        same_module,
+                                                        pager: pager_export,
                                                     },
                                                 ),
                                             );
@@ -15176,6 +14801,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             frames[top]
                                                 .vals
                                                 .push(Reg::from_i32((threads.len() - 1) as i32));
+                                            // #2455 — a domain the freeze has reached that now pages
+                                            // a live child holds for it, as at the trigger: one still
+                                            // unwinding goes back to `NORMAL`, to serve the child
+                                            // until it has unwound.
+                                            if pager_export.is_some() && durable {
+                                                let unwinding = mem.as_ref().is_some_and(|m| {
+                                                    m.durable_state() == STATE_UNWINDING
+                                                });
+                                                if sched.hold_spawn(sig_domain, &seat!(), unwinding)
+                                                    && unwinding
+                                                {
+                                                    if let Some(m) = mem.as_mut() {
+                                                        m.durable_set_state(STATE_NORMAL);
+                                                    }
+                                                }
+                                            }
                                         }
                                         None => {
                                             // #2268 — and its window's own charge, as it started.
@@ -15261,7 +14902,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: op @ (CAP_SELF_SVC_POLL | CAP_SELF_SVC_WAIT),
-                    sig,
                     args,
                     ..
                 } => {
@@ -15271,9 +14911,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // frame is a parked ancestor): probeable refusal — the serve loop
                             // is the domain's outermost dispatcher (re-entry into a domain is
                             // a fresh dispatch, never a nested drain).
-                            if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(EINVAL));
-                            }
+                            frames[top].vals.push(Reg::from_i64(EINVAL));
                             continue;
                         }
                     }
@@ -15295,12 +14933,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 if !run.replied {
                                     // #1862: a page request's bytes move now, from this serving
                                     // vCPU's window, before the reply can wake the child.
-                                    let value = supply_page_at_settle(
-                                        sched,
-                                        host,
+                                    let value = host.lock_unpoisoned().settle_page(
                                         run.ticket,
                                         value,
-                                        mem.as_ref(),
+                                        mem.as_ref().map(|m| m as _),
                                     );
                                     sched.cap_reply_or_stash(run.ticket, value, host);
                                 }
@@ -15328,9 +14964,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         && serve_run.is_none()
                         && mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING)
                     {
-                        if !call_sig(&cur_types, *sig).results.is_empty() {
-                            frames[top].vals.push(Reg::from_i64(0));
-                        }
+                        frames[top].vals.push(Reg::from_i64(0));
                         continue;
                     }
                     // Switch into handler-fiber frames: the `cont.resume` tail with the serve
@@ -15488,9 +15122,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         };
                         return Ok(Inner::Park(Blocked::SvcWait { key, deadline_ns }));
                     }
-                    if !call_sig(&cur_types, *sig).results.is_empty() {
-                        frames[top].vals.push(Reg::from_i64(*serve_count));
-                    }
+                    frames[top].vals.push(Reg::from_i64(*serve_count));
                     *serve_count = 0;
                 }
                 // FORK.md PR 1/PR 5 — `clone_caller` (self-namespace op 11): serviced here because it
@@ -15513,7 +15145,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_CLONE_CALLER,
-                    sig,
                     args,
                     ..
                 } => {
@@ -15556,9 +15187,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         _ => EINVAL,
                     };
-                    if !call_sig(&cur_types, *sig).results.is_empty() {
-                        frames[top].vals.push(Reg::from_i64(r));
-                    }
+                    frames[top].vals.push(Reg::from_i64(r));
                 }
                 // FORK.md §8.6 — `reap` (self-namespace op 12): serviced here (needs the eval-loop
                 // -local `serve_run`). From within a handler, reap the twin named by the `pid` arg on
@@ -15571,7 +15200,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_REAP,
-                    sig,
                     args,
                     ..
                 } => {
@@ -15625,16 +15253,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         _ => EINVAL,
                     };
-                    if !call_sig(&cur_types, *sig).results.is_empty() {
-                        frames[top].vals.push(Reg::from_i64(r));
-                    }
+                    frames[top].vals.push(Reg::from_i64(r));
                 }
                 // FORK.md §8.6 — `pipe(fds)` (self-namespace op 16): the one mint ([`Host::mint_pipe`]),
                 // on the `Real` scheduler, whose `PipeEnd` parks the pipe's reads and writes need.
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_PIPE,
-                    sig,
                     args,
                     ..
                 } => {
@@ -15648,9 +15273,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     } else {
                         EINVAL
                     };
-                    if !call_sig(&cur_types, *sig).results.is_empty() {
-                        frames[top].vals.push(Reg::from_i64(r));
-                    }
+                    frames[top].vals.push(Reg::from_i64(r));
                 }
                 // CALLS.md §10.6 / increment 5 — `fuel.remaining` (self-namespace op 13): push this
                 // domain's remaining fuel. No handler context, no host lock — just the live counter,
@@ -15662,12 +15285,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_FUEL_REMAINING,
-                    sig,
                     ..
                 } => {
-                    if !call_sig(&cur_types, *sig).results.is_empty() {
-                        frames[top].vals.push(Reg::from_i64(fuel.remaining()));
-                    }
+                    frames[top].vals.push(Reg::from_i64(fuel.remaining()));
                 }
                 // FORK.md §8.6 — `exec_module(module, grants_ptr, grants_n, entry, size_log2)`
                 // (self-namespace op 14): **`execve` image-replace**. Resolve the command module + the
@@ -15680,7 +15300,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_EXEC,
-                    sig,
                     args,
                     ..
                 } => {
@@ -15706,10 +15325,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         clean_root,
                     ) {
                         Ok(req) => return Ok(Inner::Exec(req)),
-                        Err(e) if !call_sig(&cur_types, *sig).results.is_empty() => {
-                            frames[top].vals.push(Reg::from_i64(e));
-                        }
-                        Err(_) => {}
+                        Err(e) => frames[top].vals.push(Reg::from_i64(e)),
                     }
                 }
                 Inst::CapCall {
@@ -15761,9 +15377,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             let served =
                                                 callee.lock_unpoisoned().svc_results.remove(&t);
                                             if let Some(rv) = served {
-                                                if !call_sig(&cur_types, *sig).results.is_empty() {
-                                                    frames[top].vals.push(Reg::from_i64(rv));
-                                                }
+                                                push_results(
+                                                    &mut frames[top].vals,
+                                                    &[rv],
+                                                    &call_sig(&cur_types, *sig).results,
+                                                );
                                                 continue;
                                             }
                                         }
@@ -15804,9 +15422,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
                             }
                             None => {
-                                if !call_sig(&cur_types, *sig).results.is_empty() {
-                                    frames[top].vals.push(Reg::from_i64(EAGAIN));
-                                }
+                                push_results(
+                                    &mut frames[top].vals,
+                                    &[EAGAIN],
+                                    &call_sig(&cur_types, *sig).results,
+                                );
                                 continue;
                             }
                         }
@@ -15839,32 +15459,30 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // host locking). Threads of a domain serialize their capability calls here.
                     let mut hg = host.lock_unpoisoned();
                     let mut pending_id = None;
-                    let results = hg.cap_dispatch_slots_pending(
-                        *type_id,
-                        *op,
-                        h,
-                        &argv,
-                        gm,
-                        &mut pending_id,
-                    )?;
+                    // #2495 — under a recording host this engine offers no parking face: it tapes
+                    // no delivered value, so a host-answered call declines before its embedder
+                    // sees it. A pool job runs inline under a tape on either face.
+                    let face = (!hg.records_caps()).then_some(&mut pending_id);
+                    let results = hg.cap_dispatch_slots_impl(*type_id, *op, h, &argv, gm, face)?;
                     // §12 parking-on-blocking: a punted offloadable dispatch — release the host
                     // lock **before** waiting (the §5b serialization fix), then take the scalar
                     // completion. The placeholder `results` is discarded.
                     if let Some(id) = pending_id {
+                        let comps = hg.completions();
+                        let svck = hg.domain_id() as usize;
+                        drop(hg);
                         if call_sig(&cur_types, *sig).results.len() > 1 {
                             // Parkable ops carry a single-slot scalar reply (invariant 8) — a
                             // wider declared signature is a registration bug, fail-closed. Checked
                             // BEFORE any park: a fault after the vCPU is filed is unrecoverable.
+                            comps.withdraw(id);
                             return Err(Trap::CapFault);
                         }
-                        let comps = hg.completions();
-                        let svck = hg.domain_id() as usize;
-                        drop(hg);
                         // F1 (FIBER_PARK.md) — a punt inside a FIBER parks the fiber, not the
                         // vCPU: the §3.6 slice-5a contract (`FIBER_PARKED` unwinds to the
                         // resumer; the completion wakes the fiber; the next resume delivers the
                         // scalar). The waiter rides the same `completion_waiters` map as the
-                        // vCPU park, so submission-ordered delivery (§18) is one drain for both.
+                        // vCPU park, so one drain delivers both.
                         // Register-then-recheck is the drain itself: a completion that raced the
                         // park is delivered (in order) by the recheck, never stranded. Durable
                         // callers keep the degenerate wait below (`freeze_drive` fails closed on
@@ -15886,11 +15504,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             if let SchedRef::Real(sr) = sched {
                                 let regc = Arc::clone(registry);
                                 fiber_park!(|slot: usize| {
+                                    sr.wake_on(&comps);
                                     let mut sg = sr.lock();
-                                    sg.completion_waiters
-                                        .insert(id, Waiter::fiber(Arc::clone(&regc), slot, svck));
+                                    sg.completion_waiters.insert(
+                                        (svck as u64, id),
+                                        Waiter::fiber(Arc::clone(&regc), slot, svck),
+                                    );
+                                    sg.completion_stores.insert(svck as u64, Arc::clone(&comps));
                                     drop(sg);
-                                    sr.completion_drain(&comps);
+                                    sr.completion_drain();
                                 });
                             }
                         }
@@ -15904,13 +15526,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // blocking discipline), and an exactly-i64 reply (the wake pushes a raw
                         // i64 reg — the `Pending::CapResult` precedent; `Blocking`/offloadable
                         // jobs return one i64 by contract).
-                        // #1366: a host-completed punt (`OffloadOutcome::Host`) has no completer
-                        // on the oracle — no driver surfaces the park to an embedder — so
-                        // neither parking nor the degenerate wait below could ever finish it.
-                        // Decline fail-closed rather than hang (invariant 9).
-                        if comps.is_host_owned(id) {
-                            return Err(Trap::CapFault);
-                        }
+                        // #2495: a host-answered call (`OffloadOutcome::Host`) parks the same
+                        // way; its embedder's answer posts to the same store.
                         let parkable = *cur == ROOT_FIBER
                             && !durable
                             && matches!(sched, SchedRef::Real(_))
@@ -15922,11 +15539,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             return Ok(Inner::Park(Blocked::CapPending { id }));
                         }
                         // Degenerate blocking wait (slice 1): single-fiber guests, durable
-                        // callers, non-i64 signatures, the deterministic explorer.
-                        let r = comps.wait(id);
-                        if let Some(ty) = call_sig(&cur_types, *sig).results.first() {
-                            frames[top].vals.push(Reg::from_value(slot_to_val(*ty, r)));
-                        }
+                        // callers, non-i64 signatures, the deterministic explorer. A
+                        // host-answered call declines here, as on every engine where its caller
+                        // cannot park (#2495).
+                        let r = comps.wait_unless_host_owned(id).ok_or(Trap::CapFault)?;
+                        push_results(
+                            &mut frames[top].vals,
+                            &[r],
+                            &call_sig(&cur_types, *sig).results,
+                        );
                         continue;
                     }
                     // §3.6 slice 1 — the two revocation-unparks hooks, direct-call route:
@@ -15994,22 +15615,26 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::PipeRead(pipe) => pipe_park!(top, pipe, false),
                         Decision::PipeWrite(pipe) => pipe_park!(top, pipe, true),
                         Decision::Eintr => {
-                            frames[top].vals.push(Reg::from_i64(EINTR));
+                            push_results(
+                                &mut frames[top].vals,
+                                &[EINTR],
+                                &call_sig(&cur_types, *sig).results,
+                            );
                             eintr_done = true;
                         }
                         Decision::Abandon => abandon_for_freeze(mem, *durable_sp_ctx),
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if let Some(e) = refused {
-                            if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(e));
-                            }
-                        } else {
-                            for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
-                                frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
-                            }
-                        }
+                        let results = match refused {
+                            Some(e) => vec![e],
+                            None => results,
+                        };
+                        push_results(
+                            &mut frames[top].vals,
+                            &results,
+                            &call_sig(&cur_types, *sig).results,
+                        );
                     }
                 }
                 // §7 executable named import (IMPORTS.md phase 1): dispatch through the reserved
@@ -16038,6 +15663,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         .lock_unpoisoned()
                         .import_binding(*import)
                         .ok_or(Trap::CapFault)?;
+                    // The bound op is served here too, so the import's declared shape is held to
+                    // its contract as a `call.cap`'s is (#2361).
+                    if !temen_ir::served_shape_ok(b.type_id, b.op, call_sig(&cur_types, *sig)) {
+                        return Err(Trap::CapFault);
+                    }
                     let h = b.handle;
                     match b.op {
                         3 => jit_install_body!(h, args),
@@ -16093,9 +15723,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             let served =
                                                 callee.lock_unpoisoned().svc_results.remove(&t);
                                             if let Some(rv) = served {
-                                                if !call_sig(&cur_types, *sig).results.is_empty() {
-                                                    frames[top].vals.push(Reg::from_i64(rv));
-                                                }
+                                                push_results(
+                                                    &mut frames[top].vals,
+                                                    &[rv],
+                                                    &call_sig(&cur_types, *sig).results,
+                                                );
                                                 continue;
                                             }
                                         }
@@ -16136,9 +15768,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
                             }
                             None => {
-                                if !call_sig(&cur_types, *sig).results.is_empty() {
-                                    frames[top].vals.push(Reg::from_i64(EAGAIN));
-                                }
+                                push_results(
+                                    &mut frames[top].vals,
+                                    &[EAGAIN],
+                                    &call_sig(&cur_types, *sig).results,
+                                );
                                 continue;
                             }
                         }
@@ -16206,15 +15840,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if let Some(e) = refused {
-                            if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(e));
-                            }
-                        } else {
-                            for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
-                                frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
-                            }
-                        }
+                        let results = match refused {
+                            Some(e) => vec![e],
+                            None => results,
+                        };
+                        push_results(
+                            &mut frames[top].vals,
+                            &results,
+                            &call_sig(&cur_types, *sig).results,
+                        );
                     }
                 }
                 // §7/§22 symbolic call: when the instance bound the name, dispatch exactly like
@@ -16259,9 +15893,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             let served =
                                                 callee.lock_unpoisoned().svc_results.remove(&t);
                                             if let Some(rv) = served {
-                                                if !call_sig(&cur_types, *sig).results.is_empty() {
-                                                    frames[top].vals.push(Reg::from_i64(rv));
-                                                }
+                                                push_results(
+                                                    &mut frames[top].vals,
+                                                    &[rv],
+                                                    &call_sig(&cur_types, *sig).results,
+                                                );
                                                 continue;
                                             }
                                         }
@@ -16298,9 +15934,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
                             }
                             None => {
-                                if !call_sig(&cur_types, *sig).results.is_empty() {
-                                    frames[top].vals.push(Reg::from_i64(EAGAIN));
-                                }
+                                push_results(
+                                    &mut frames[top].vals,
+                                    &[EAGAIN],
+                                    &call_sig(&cur_types, *sig).results,
+                                );
                                 continue;
                             }
                         }
@@ -16369,15 +16007,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if let Some(e) = refused {
-                            if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(e));
-                            }
-                        } else {
-                            for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
-                                frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
-                            }
-                        }
+                        let results = match refused {
+                            Some(e) => vec![e],
+                            None => results,
+                        };
+                        push_results(
+                            &mut frames[top].vals,
+                            &results,
+                            &call_sig(&cur_types, *sig).results,
+                        );
                     }
                 }
                 // §3.5 dynamic-mode dispatch by type-section reference: the reserved dyn entry
@@ -16454,18 +16092,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if let Some(e) = refused {
-                            if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(e));
-                            }
-                        } else {
-                            for (s, tyv) in results.iter().zip(&call_sig(&cur_types, *sig).results)
-                            {
-                                frames[top]
-                                    .vals
-                                    .push(Reg::from_value(slot_to_val(*tyv, *s)));
-                            }
-                        }
+                        let results = match refused {
+                            Some(e) => vec![e],
+                            None => results,
+                        };
+                        push_results(
+                            &mut frames[top].vals,
+                            &results,
+                            &call_sig(&cur_types, *sig).results,
+                        );
                     }
                 }
                 // §3.5 self-namespace extensions: reify own offer / intern own shape / probe
@@ -16969,11 +16604,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // state word — under a freeze it spawns into `UNWINDING` so it too unwinds at its next
                     // safepoint. (A child existing *before* the freeze point is reconstructed by the
                     // runtime at thaw, not re-spawned here — the root's rewind skips the prologue
-                    // `thread.spawn`, so thaw re-attach is a `drive`-setup concern, not this op's.)
-                    let child_state = mem
-                        .as_ref()
-                        .map(|m| m.durable_state())
-                        .unwrap_or(STATE_NORMAL);
+                    // `thread.spawn`, so thaw re-attach is a `drive`-setup concern, not this op's.) Any
+                    // other run's word there is its own data, and its child starts `NORMAL` (#2101).
+                    let child_state = match mem.as_ref() {
+                        Some(m) if durable => m.durable_state(),
+                        _ => STATE_NORMAL,
+                    };
                     // Durable multi-vCPU (slice 3.2.2): reserve this child's shadow context top-down
                     // (`MAX_SHADOW_CTX`, −1, …) so it can't collide with a fiber's `slot+1` region.
                     // Fail closed (`ThreadFault`) if the reserve is full — the vCPU pool growing down
@@ -17006,9 +16642,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // flag, so killing the §14 child terminates its whole thread subtree; `None` (root
                     // / top-level thread) stays unkillable.
                     let kill_inherit = kill.clone();
-                    // #1686: its freeze residue goes where its spawner's does — the root host for a
-                    // thread inside a §14 subtree, whose own powerbox is private.
-                    let sink_inherit = freeze_sink.clone();
+                    // §2.2 / #2164 — and its pager: the thread runs over the same demand-paged window,
+                    // whose pages the pager supplies whichever vCPU touches one first.
+                    let pager_inherit = pager.clone();
                     // #2001 — the thread is one `spawn` of its domain's node while it lives: a full
                     // ceiling refuses it as the live cap does (dropped with the closure if that does).
                     let mut h = host.lock_unpoisoned();
@@ -17047,7 +16683,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         child.spawn_residue = Some((entry, vec![spv, av], slot));
                         child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));
                         child.kill = kill_inherit; // S3: inherit the §14 subtree kill flag (or None)
-                        child.freeze_sink = sink_inherit;
+                        child.fault_pager = pager_inherit.is_some();
+                        child.pager = pager_inherit;
                         child.lane_chain = chain_sib; // D66: a sibling shares its domain's chain
                         child.live = live;
                         Box::new(child)
@@ -17069,7 +16706,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let h = get_i32(&frames[top].vals, *handle)?;
                     let slot = resolve_thread(threads, h)?;
                     let child = threads[slot].ok_or(Trap::ThreadFault)?;
-                    *pending = Some(Pending::Join { slot, wait: false });
+                    *pending = Some(Pending::Join {
+                        slot,
+                        status: false,
+                    });
                     return Ok(Inner::Park(Blocked::Join { child }));
                 }
                 // §12 futex wait: validate the address (confine/align/prot — traps surface here), then
@@ -17475,7 +17115,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let region_base = arena.region_base(lctx);
                     let shadow_sp = mem
                         .as_ref()
-                        .map(|m| m.durable_get_sp(region_base))
+                        .and_then(|m| m.durable_get_sp(region_base))
                         .unwrap_or_else(|| arena.frame_base(lctx));
                     // §12.8 4A.5: an unwound fiber spilled *past* its frame base (the SP word occupies
                     // the region's first 8 bytes); an empty stack sits exactly at the frame base.
@@ -17813,13 +17453,16 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
             FloatTy::F32 => Reg::from_f32(fun32(*op, get_f32(vals, *a)?)),
             FloatTy::F64 => Reg::from_f64(fun64(*op, get_f64(vals, *a)?)),
         },
+        // The `libm` crate's correctly-rounded fused FMA, the one temen-opt folds with (#2519): its
+        // results are Cranelift's `fma`'s but for which NaN, which the JIT differential ignores.
         Inst::Fma { ty, a, b, c } => match ty {
-            // `mul_add` is the correctly-rounded fused FMA — bit-identical to Cranelift's `fma`.
             FloatTy::F32 => {
-                Reg::from_f32(get_f32(vals, *a)?.mul_add(get_f32(vals, *b)?, get_f32(vals, *c)?))
+                let (x, y, z) = (get_f32(vals, *a)?, get_f32(vals, *b)?, get_f32(vals, *c)?);
+                Reg::from_f32(libm::fmaf(x, y, z))
             }
             FloatTy::F64 => {
-                Reg::from_f64(get_f64(vals, *a)?.mul_add(get_f64(vals, *b)?, get_f64(vals, *c)?))
+                let (x, y, z) = (get_f64(vals, *a)?, get_f64(vals, *b)?, get_f64(vals, *c)?);
+                Reg::from_f64(libm::fma(x, y, z))
             }
         },
         Inst::FCmp { ty, op, a, b } => {
@@ -18580,9 +18223,9 @@ fn simd_vfloat_bin(shape: VShape, op: VFloatBinOp, a: [u8; 16], b: [u8; 16]) -> 
     o
 }
 
-/// Lane-wise fused multiply-add (`relaxed_madd`/`nmadd`): `±a·b + c` with a single rounding.
-/// `f*::mul_add` is the correctly-rounded IEEE-754 FMA — bit-identical to Cranelift's `fma`, so the
-/// interp↔JIT differential holds. `neg` negates the product (the `nmadd` form, `−a·b + c`).
+/// Lane-wise fused multiply-add (`relaxed_madd`/`nmadd`): `±a·b + c` with a single rounding, by the
+/// scalar `Fma`'s `libm` function (#2519), so the interp↔JIT differential holds as it does there.
+/// `neg` negates the product (the `nmadd` form, `−a·b + c`).
 fn simd_fma(shape: VShape, neg: bool, a: [u8; 16], b: [u8; 16], c: [u8; 16]) -> [u8; 16] {
     let mut o = [0u8; 16];
     match shape {
@@ -18592,7 +18235,7 @@ fn simd_fma(shape: VShape, neg: bool, a: [u8; 16], b: [u8; 16], c: [u8; 16]) -> 
                 let y = f32::from_bits(lane_read(&b, i, 4) as u32);
                 let z = f32::from_bits(lane_read(&c, i, 4) as u32);
                 let x = if neg { -x } else { x };
-                lane_write(&mut o, i, 4, x.mul_add(y, z).to_bits() as u64);
+                lane_write(&mut o, i, 4, libm::fmaf(x, y, z).to_bits() as u64);
             }
         }
         VShape::F64x2 => {
@@ -18601,7 +18244,7 @@ fn simd_fma(shape: VShape, neg: bool, a: [u8; 16], b: [u8; 16], c: [u8; 16]) -> 
                 let y = f64::from_bits(lane_read(&b, i, 8));
                 let z = f64::from_bits(lane_read(&c, i, 8));
                 let x = if neg { -x } else { x };
-                lane_write(&mut o, i, 8, x.mul_add(y, z).to_bits());
+                lane_write(&mut o, i, 8, libm::fma(x, y, z).to_bits());
             }
         }
         _ => {}
@@ -19326,7 +18969,7 @@ struct ChargedRegion {
 
 /// #2111, #2268 — what a region the run's domains made costs its node: `bytes` of `channel` (what the
 /// host keeps of it in memory: `0` for a file's), and the one mapping the host holds of it, whose
-/// `size` (#2306) is address space the process's pool of it counts ([`RESERVED_POOL`]).
+/// `size` (#2306) is address space the process's pool of it counts ([`reserved_pool`]).
 fn region_cost(bytes: u64, size: u64) -> [(usize, u64); 3] {
     [(BUDGET_CHANNEL, bytes), (BUDGET_MAPS, 1), (RESERVED, size)]
 }
@@ -19372,7 +19015,8 @@ pub struct TailBytes {
     pub tail: u64,
     /// Of those, the bytes the window holds committed as its own memory: what its budget pays for.
     pub held: u64,
-    /// Of those, the bytes aliased to a §13 region: the region's memory, not the window's.
+    /// Of those, the bytes a `protect` granting access leaves not the window's own: aliased to a §13
+    /// region (the region's memory), or past a growable backing (#1153, #2407: no memory at all).
     pub aliased: u64,
 }
 
@@ -19418,6 +19062,53 @@ pub fn window_tail_bytes<S>(
         held: count(&held) * page,
         aliased: count(&aliased) * page,
     }
+}
+
+/// #2407 — [`GuestMem::tail_bytes`] over a growable backing ([`Region::can_grow`]), `len` bytes long:
+/// one flat buffer, which holds every byte below its length whatever its pages' state, and which a
+/// commit past it grows over every page up to the span's `end`. So of the
+/// reserved tail up to `end`, it holds what lies below `len`, and what lies past it is what a `map`
+/// granting access grows it over. A `protect` past it grows nothing (#1153), like an alias.
+fn flat_tail_bytes(mapped: u64, len: u64, end: u64) -> TailBytes {
+    let tail = end.saturating_sub(mapped);
+    let held = len.min(end).saturating_sub(mapped);
+    TailBytes {
+        tail,
+        held,
+        aliased: tail - held,
+    }
+}
+
+/// #2370 — the runs of `pages`, as `(first, last)` page indices, that a page op leaving them `prot`
+/// can change, on every engine's page map. One that grants access commits every page, and
+/// [`Host::page_op`] charges each first, so the budget bounds that walk. One that grants none
+/// changes only the pages that hold something: each of the declared window's, `[0, mapped)`, mapped
+/// unless its entry says otherwise, and each of the reserved tail's that has an entry. A tail page
+/// without one is unmapped and reads zero already, so the op's host work is bounded by the declared
+/// window and by what the guest holds, however large the span it names.
+pub fn changed_runs<S>(
+    map: &BTreeMap<u64, S>,
+    pages: core::ops::RangeInclusive<u64>,
+    mapped: u64,
+    prot: i32,
+) -> Vec<(u64, u64)> {
+    let (first, last) = pages.into_inner();
+    if prot & (PROT_READ | PROT_WRITE) != 0 {
+        return vec![(first, last)];
+    }
+    let mut runs = Vec::new();
+    if first < mapped {
+        runs.push((first, last.min(mapped - 1)));
+    }
+    if first.max(mapped) <= last {
+        for &page in map.range(first.max(mapped)..=last).map(|(page, _)| page) {
+            match runs.last_mut() {
+                Some((_, end)) if *end + 1 == page => *end = page,
+                _ => runs.push((page, page)),
+            }
+        }
+    }
+    runs
 }
 
 /// #2268 — what decides whether two neighbouring window pages can share one OS mapping where the
@@ -19748,41 +19439,6 @@ pub enum StreamRole {
 /// The host-side object a handle-table entry dispatches to — the mock equivalent of
 /// §3c's `(methods, object)`. The guest never names or writes this (it lives in host
 /// memory); it is selected only by a *granted* handle index.
-/// What a [`Binding::FreezeAuthority`] covers.
-///
-/// Two scopes because the two kinds of child are named differently, and that difference is the whole
-/// of #1440's hard half. A §14 **nested carve** child *is* a sub-range of its parent's window, so an
-/// address range names it. A **detached** child owns a separate window and has no address in its
-/// parent's frame at all — there is nothing to point at.
-///
-/// One binding parameterized by scope rather than two bindings: "may this holder snapshot that
-/// domain?" is one question, and two variants would be two places to keep the answer (INVARIANTS #15).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FreezeScope {
-    /// The window sub-range `[base, base+size)` — a §14 nested carve, where the range *is* the child.
-    /// Covers by **containment**: authority over a range covers anything inside it, the same rule
-    /// [`Binding::AddressSpace`]/[`Binding::Instantiator`] sub-ranges use. One grant over an
-    /// instantiator's range therefore covers every carve from it, instead of costing a handle-table
-    /// slot per spawn.
-    Carve { base: u64, size: u64 },
-    /// Every **detached** child the holder spawns — all of them or none.
-    ///
-    /// Deliberately not per-child (owner decision): a detached child has no sub-range to be named by,
-    /// and the per-child alternatives both have costs worth deferring — a domain id would have to be
-    /// recorded in the artifact and re-linked on thaw first, and naming a child by its spawn edge
-    /// rebinds silently when a join slot is recycled. All-or-nothing needs none of that and is the
-    /// granularity the blocking question actually wants.
-    ///
-    /// **This one must never be self-minted.** A nested parent already reads its child's carve, so
-    /// granting itself authority there documents a fact. A detached child's window is *not* readable
-    /// by its parent — that is what detached means — so authority over one is a real new power, and a
-    /// parent that could mint it for itself would dissolve the isolation it just asked for. It comes
-    /// from above (the embedder, or an ancestor re-granting downward through a spawn's named grants,
-    /// #2018) or not at all, which holds by construction: no guest-reachable op mints a capability.
-    /// (The carve spawn minted the [`Carve`](FreezeScope::Carve) form; it is retired, #1867.)
-    DetachedProgeny,
-}
-
 #[derive(Clone, Copy, Debug)]
 enum Binding {
     Stream {
@@ -19836,17 +19492,26 @@ enum Binding {
         base: u64,
         size: u64,
     },
-    /// A §14 `Instantiator` handle conferring authority to spawn children confined to the window
-    /// sub-range `[base, base+size)` in the **holder's own (guest-relative) coordinates**. The eval
-    /// loop (not the generic dispatch) services it — spawning needs executor access — translating to
-    /// backing-absolute via the holder's window base, so nesting composes at any depth.
-    Instantiator {
-        base: u64,
-        size: u64,
-    },
-    /// **Freeze authority** — the authority to snapshot a domain (#1440, INVARIANTS #14 R1,
-    /// PROCESS.md O14). What it covers is the [`FreezeScope`].
-    FreezeAuthority(FreezeScope),
+    /// A §14 `Instantiator` handle: the authority to spawn children, each in a fresh window of its
+    /// own that a `Budget` pays for (#2433: it once named the window sub-range a carve child was
+    /// confined to). The eval loop (not the generic dispatch) services it, since spawning needs
+    /// executor access.
+    Instantiator,
+    /// **Freeze authority** over every **detached** child the holder spawns — the authority to
+    /// snapshot them, all or none (#1440, INVARIANTS #14 R1, PROCESS.md O14).
+    ///
+    /// Deliberately not per-child (owner decision): a detached child has no sub-range of its
+    /// parent's window to be named by, and the per-child alternatives both have costs worth deferring
+    /// — a domain id would have to be recorded in the artifact and re-linked on thaw first, and naming
+    /// a child by its spawn edge rebinds silently when a join slot is recycled. All-or-nothing needs
+    /// none of that and is the granularity the blocking question actually wants.
+    ///
+    /// **Never self-minted.** A detached child's window is *not* readable by its parent — that is what
+    /// detached means — so authority over one is a real new power, and a parent that could mint it
+    /// for itself would dissolve the isolation it just asked for. It comes from above (the embedder,
+    /// or an ancestor re-granting downward through a spawn's named grants, #2018) or not at all, which
+    /// holds by construction: no guest-reachable op mints a capability.
+    FreezeAuthority,
     /// A §14 `ModuleLoader` handle (iface 7) — pure authority (no per-instance state), so a unit
     /// variant like [`Binding::Exit`]. op 0 `from_bytes(ptr, len)` has the host decode+verify a
     /// wire-encoded module from the holder's window and mints a [`Binding::Module`] for it. The
@@ -19976,7 +19641,7 @@ const BUDGET_LANE: usize = 4;
 /// The `maps` dimension's index: the OS mappings a subtree causes (#2268, [`BudgetState::maps`]).
 const BUDGET_MAPS: usize = 5;
 /// #2305 — no budget's dimension: the address space a use's windows reserve, which rides the charge
-/// set that admits them, so the process's pool of it ([`RESERVED_POOL`]) refuses all of the charge or
+/// set that admits them, so the process's pool of it ([`reserved_pool`]) refuses all of the charge or
 /// none. No ceiling bounds it and no guest reads it: an embedder bounds a run's windows with its
 /// `maps` grant, a domain's [`MAPS_PER_DOMAIN`] each. The tree counts it per node
 /// ([`BudgetNode::reserved`]) only so that a run's end, or a debugger's restore, settles the pool.
@@ -20001,18 +19666,18 @@ pub const MAPS_PER_DOMAIN: u64 = WINDOW_RUNS + 5 + OFFLOAD_POOL_THREADS as u64 *
 /// #2268 — Linux's default `vm.max_map_count`, for a host that cannot read its own.
 const MAPS_LINUX_DEFAULT: u64 = 65530;
 
-/// #2268 — how many OS mappings the guests of this process may cause between them: Linux's
-/// per-process `vm.max_map_count` less what the host keeps for itself ([`MAPS_HOST_RESERVE`]). One
-/// mapping past the OS limit fails an `mmap` or `mprotect` anywhere in the process, the host's own
-/// allocations included, which aborts it; so every `maps` charge, on every engine and in every run,
-/// is held against this as well as its own chain, and refused past it as past a ceiling, even one no
-/// grant refuses (a run's activation, [`Fits::Pool`]). A charge forced past every limit
-/// ([`Fits::Forced`]: a use that exists already, accounted again) counts here too, unrefused. Other
-/// hosts have no such limit: unbounded.
+/// #2268 — how many OS mappings the guests of this process may cause between them: Linux's (and so
+/// Android's) per-process `vm.max_map_count` less what the host keeps for itself
+/// ([`MAPS_HOST_RESERVE`]). One mapping past the OS limit fails an `mmap` or `mprotect` anywhere in
+/// the process, the host's own allocations included, which aborts it; so every `maps` charge, on
+/// every engine and in every run, is held against this as well as its own chain, and refused past it
+/// as past a ceiling, even one no grant refuses (a run's activation, [`Fits::Pool`]). A charge
+/// forced past every limit ([`Fits::Forced`]: a use that exists already, accounted again) counts
+/// here too, unrefused. Other hosts have no such limit: unbounded.
 pub fn maps_pool() -> u64 {
     static POOL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *POOL.get_or_init(|| {
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "android")) {
             std::fs::read_to_string("/proc/sys/vm/max_map_count")
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
@@ -20024,29 +19689,36 @@ pub fn maps_pool() -> u64 {
     })
 }
 
-/// #2305 — how much address space the windows of this process's guests may reserve between them,
-/// and (#2306) the host's mappings of their regions: 64 TiB, half of what a 47-bit host gives a
-/// process, so the host's own mappings keep the other half. Every window reserves its whole mask
-/// domain up front, 128 GiB by default ([`DEFAULT_RESERVED_LOG2`]), so 512 such windows fill it. Past what the OS can give, a window could
-/// only be refused where it is built, which differs by engine (the interpreter falls back to a
-/// heap-backed window, the JIT cannot); so every domain's window is held against this at its
-/// admission ([`RESERVED`]), on every engine alike, and refused there as the pool of mappings refuses
-/// ([`maps_pool`]). A host without a 64-bit address space has no such pool: unbounded.
-pub const RESERVED_POOL: u64 = if cfg!(target_pointer_width = "64") {
-    64 << 40
-} else {
-    u64::MAX
-};
+/// #2305, #2517 — how much address space the windows of this process's guests may reserve between
+/// them, and (#2306) the host's mappings of their regions: half of what the host gives a process
+/// ([`temen_mem::user_address_bits`]; 47 bits where it cannot be read), so the host's own mappings
+/// keep the other half. That is 64 TiB on a 47-bit host and 256 GiB on a 39-bit phone. Every window
+/// reserves its whole mask domain up front ([`default_reserved_log2`]), so 512 windows of the default
+/// 128 GiB fill a 47-bit host's pool, and two fill a phone's. Past what the OS can give, a window
+/// could only be refused where it is built, which differs by engine (the interpreter falls back to
+/// a heap-backed window, the JIT cannot); so every domain's window is held against this at its
+/// admission ([`RESERVED`]), on every engine alike, and refused there as the pool of mappings
+/// refuses ([`maps_pool`]). A host without a 64-bit address space has no such pool: unbounded.
+pub fn reserved_pool() -> u64 {
+    static POOL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *POOL.get_or_init(|| {
+        if cfg!(target_pointer_width = "64") {
+            1 << (temen_mem::user_address_bits().unwrap_or(47) - 1)
+        } else {
+            u64::MAX
+        }
+    })
+}
 
 /// #2268, #2305 — what every run in this process holds between them of a resource the process has a
-/// fixed amount of: its OS mappings ([`maps_pool`]), its address space ([`RESERVED_POOL`]), or
+/// fixed amount of: its OS mappings ([`maps_pool`]), its address space ([`reserved_pool`]), or
 /// (#2306, `temen-run`'s) its file descriptors.
 #[derive(Debug, Default)]
 pub struct Pool(AtomicU64);
 
 /// #2268 — what every run holds of [`maps_pool`].
 static MAPS_IN_USE: Pool = Pool::new();
-/// #2305 — what every run's windows and regions hold of [`RESERVED_POOL`].
+/// #2305 — what every run's windows and regions hold of [`reserved_pool`].
 static RESERVED_IN_USE: Pool = Pool::new();
 
 impl Pool {
@@ -20098,7 +19770,7 @@ impl Pool {
 /// #2268 — the limits a charge to the budget tree must fit.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Fits {
-    /// Every bounded level's ceiling, and the process's pools ([`maps_pool`], [`RESERVED_POOL`]).
+    /// Every bounded level's ceiling, and the process's pools ([`maps_pool`], [`reserved_pool`]).
     All,
     /// The pools alone: a use its embedder chose (a run's activation), which no grant refuses but the
     /// process must still have room for.
@@ -20179,7 +19851,7 @@ impl Lease {
     /// #2305 — the address space its window reserves: the default mask domain, raised to its size, as
     /// every engine builds a detached window.
     fn reserved(&self) -> u64 {
-        reservation(self.bytes, DEFAULT_RESERVED_LOG2)
+        reservation(self.bytes, default_reserved_log2())
     }
 }
 
@@ -20298,7 +19970,7 @@ impl BudgetTree {
     }
 
     /// #2268, #2305 — what `nodes` hold of the process's pools, of [`maps_pool`] and of
-    /// [`RESERVED_POOL`]: what each tree root has charged, since every charge reaches its root.
+    /// [`reserved_pool`]: what each tree root has charged, since every charge reaches its root.
     fn pooled(nodes: &[BudgetNode]) -> (u64, u64) {
         nodes
             .iter()
@@ -20321,17 +19993,19 @@ impl BudgetTree {
     /// `room` what is left of them. `-1` when every level is unbounded. The lane is `n`'s own ceiling
     /// in both.
     ///
-    /// A guest sees every level but the tree's root (#1944 slice 3): the run's own node, whose fuel
-    /// ceiling is its embedder's per-activation limit ([`Host::begin_activation`]), not a budget any
-    /// guest holds. What is left of it moves with when each engine's vCPUs draw their chunks, and
-    /// engines must give a guest the same answers, so `read`, `split` and `transfer` bound by the
-    /// levels below it. A use is bounded by, and charged to, every level ([`Self::left`]).
+    /// A guest sees every level, the tree's root included, except the root's fuel (#1944 slice 3,
+    /// #2337): the run's own fuel ceiling is its embedder's per-activation limit
+    /// ([`Host::begin_activation`]), not a budget any guest holds, and what is left of it moves with
+    /// when each engine's vCPUs draw their chunks. Engines must give a guest the same answers, so
+    /// `read`, `split` and `transfer` bound fuel by the levels below it. A use is bounded by, and
+    /// charged to, every level ([`Self::left`]).
     fn bound(nodes: &[BudgetNode], n: u32, room: bool) -> [i64; BUDGET_DIMS] {
         let mut out = [-1i64; BUDGET_DIMS];
-        for i in Self::chain(nodes, n).filter(|&i| i != Self::RUN_NODE) {
+        for i in Self::chain(nodes, n) {
             let node = &nodes[i as usize];
+            let shown = |d: usize| d != BUDGET_LANE && !(i == Self::RUN_NODE && d == BUDGET_FUEL);
             let dims = out.iter_mut().zip(node.ceiling).zip(node.used).enumerate();
-            for (_, ((o, ceiling), used)) in dims.filter(|&(d, _)| d != BUDGET_LANE) {
+            for (_, ((o, ceiling), used)) in dims.filter(|&(d, _)| shown(d)) {
                 if ceiling >= 0 {
                     let left = if room {
                         (ceiling - used).max(0)
@@ -20404,7 +20078,7 @@ impl BudgetTree {
         if !MAPS_IN_USE.take(maps, maps_pool(), check) {
             return false;
         }
-        if !RESERVED_IN_USE.take(reserved, RESERVED_POOL, check) {
+        if !RESERVED_IN_USE.take(reserved, reserved_pool(), check) {
             MAPS_IN_USE.give(maps);
             return false;
         }
@@ -20507,18 +20181,6 @@ impl BudgetTree {
                 .and_then(|f| node.used[BUDGET_FUEL].checked_add(f))
                 .unwrap_or(-1);
         }
-    }
-
-    /// A carve record's consume (§3b, until #1867 retires the carve): the room left, then `n`'s
-    /// ceilings zeroed, so a budget funds exactly one carve child.
-    fn take(&self, n: u32) -> Option<[i64; BUDGET_DIMS]> {
-        let mut nodes = self.0.lock_unpoisoned();
-        if (n as usize) >= nodes.len() {
-            return None;
-        }
-        let room = Self::bound(&nodes, n, true);
-        nodes[n as usize].ceiling = [0; BUDGET_DIMS];
-        Some(room)
     }
 
     /// A child of `holder`: each requested ceiling clamped to the tightest one along the holder's
@@ -20647,10 +20309,11 @@ impl NodeRef {
         self.tree.add(self.node, VcpuCost::SET, Fits::All)
     }
 
-    /// [`Self::charge_vcpu`] past any ceiling: a vCPU a thaw re-creates, which lived before the
-    /// freeze.
-    pub fn force_vcpu(&self) {
-        self.tree.add(self.node, VcpuCost::SET, Fits::Forced);
+    /// [`Self::charge_vcpu`] past any ceiling, since it lived before the freeze, but never past the
+    /// process's pools (#2318): a vCPU a thaw re-creates. `false` when they have no room, and the thaw
+    /// then ends the vCPU with `ThreadFault` rather than re-create it.
+    pub fn rebuild_vcpu(&self) -> bool {
+        self.tree.add(self.node, VcpuCost::SET, Fits::Pool)
     }
 
     /// Hand back a vCPU's charge when it ends.
@@ -20711,10 +20374,18 @@ impl<C: Cost> Held<C> {
         held.then(|| Held(Some(node), core::marker::PhantomData))
     }
 
-    /// Charge `node` past any ceiling: what a thaw re-creates, which lived before the freeze.
+    /// Charge `node` past any ceiling: what a debugger's rewind re-creates, whose tree it puts back
+    /// right after, or a fiber, which costs the process's pools nothing.
     pub(crate) fn force(node: NodeRef) -> Self {
         node.tree.add(node.node, C::SET, Fits::Forced);
         Held(Some(node), core::marker::PhantomData)
+    }
+
+    /// #2318 — charge `node` past any ceiling, since it lived before the freeze, but never past the
+    /// process's pools: what a thaw re-creates. `None`, with nothing charged, when they have no room.
+    pub(crate) fn rebuild(node: NodeRef) -> Option<Self> {
+        let held = node.tree.add(node.node, C::SET, Fits::Pool);
+        held.then(|| Held(Some(node), core::marker::PhantomData))
     }
 
     /// One that holds no charge.
@@ -20743,8 +20414,7 @@ impl<C: Cost> Drop for Held<C> {
 /// What makes a vCPU inside the budget tree charges it: `thread.spawn`, a fork, a `posix_spawn`, a
 /// detached spawn's admission. A run's root is its embedder's and holds none: its domain's node is
 /// either the run's own, which no guest reads, or a detached child's, whose admission charged the
-/// first vCPU with the window. That window's lease hands it back ([`Host::release_detached`]). A carve
-/// child's holds none either, until #1867 deletes the carve path.
+/// first vCPU with the window. That window's lease hands it back ([`Host::release_detached`]).
 pub type LiveVcpu = Held<VcpuCost>;
 
 /// #2112 — a live fiber's charge on its domain's node: [`temen_ir::FIBER_STACK`] of `mem`, taken when
@@ -20768,16 +20438,34 @@ pub const TABLE_ENTRY: u64 = 128;
 /// `channel`, and one `maps` while those reach [`MAPPED_BUFFER`]. Growing is all or nothing, refused
 /// at any ceiling or at the process's pool of mappings; shrinking hands the difference back, and
 /// dropping it the rest. One with no payer charges nothing: state an embedder keeps for itself.
+/// #2336 — the same holds for a bytecode vCPU's register file, as `mem` ([`HostCharge::stack`]).
 #[derive(Default)]
 pub struct HostCharge {
     payer: Option<NodeRef>,
     bytes: u64,
+    stack: bool,
 }
 
 impl HostCharge {
     /// One that holds nothing yet, charging `payer` as it grows.
     pub fn new(payer: Option<NodeRef>) -> HostCharge {
-        HostCharge { payer, bytes: 0 }
+        HostCharge {
+            payer,
+            bytes: 0,
+            stack: false,
+        }
+    }
+
+    /// #2336 — one for a vCPU's stack as an engine keeps it in host memory (the bytecode engine's
+    /// register file): its bytes past the [`temen_ir::FIBER_STACK`] a vCPU's own charge already
+    /// pays for are `mem`, which a stack is on every engine, and it holds one `maps` from
+    /// [`MAPPED_BUFFER`], as any buffer does.
+    pub fn stack(payer: Option<NodeRef>) -> HostCharge {
+        HostCharge {
+            payer,
+            bytes: 0,
+            stack: true,
+        }
     }
 
     /// Who it charges.
@@ -20792,35 +20480,49 @@ impl HostCharge {
 
     /// Hold `bytes` from now on: `false`, holding what it held, when growing to them would pass a
     /// ceiling or the pool.
+    #[inline]
     pub fn resize(&mut self, bytes: u64) -> bool {
         self.set(bytes, Fits::All)
     }
 
     /// [`Self::resize`] past every limit: what a restore rebuilds, which existed before it.
+    #[inline]
     pub fn force(&mut self, bytes: u64) {
         self.set(bytes, Fits::Forced);
     }
 
-    /// Room in `bytes` for `len` of them, charged as this holds it and then allocated, fallibly: what a
-    /// [`HostBuffer`] grows by, for a buffer its embedder also reads as a plain `Vec` (a host's
-    /// captured stdout). The room grows by doubling, or to exactly `len` when the doubling does not
-    /// fit: `false`, with nothing charged or allocated, when neither does.
+    /// Room for `held` bytes: it grows by doubling, or to exactly `held` when the doubling does not
+    /// fit, so a use that grows a little at a time rarely reaches the budget tree. `false`, holding
+    /// what it held, when neither fits.
+    #[inline]
+    pub fn grow_to(&mut self, held: u64) -> bool {
+        held <= self.bytes
+            || [self.bytes.saturating_mul(2), held]
+                .into_iter()
+                .any(|r| r >= held && usize::try_from(r).is_ok() && self.resize(r))
+    }
+
+    /// #2373 — [`Self::grow_to`]'s other half: once `held` is under a quarter of the room, hand back
+    /// all but twice `held`.
+    #[inline]
+    pub fn shrink_to(&mut self, held: u64) {
+        if held < self.bytes / 4 {
+            self.resize(held * 2);
+        }
+    }
+
+    /// Room in `bytes` for `len` of them, charged as this holds it ([`Self::grow_to`]) and then
+    /// allocated, fallibly: what a [`HostBuffer`] grows by, for a buffer its embedder also reads as a
+    /// plain `Vec` (a host's captured stdout). `false`, with nothing charged or allocated, when there
+    /// is no room.
     pub fn reserve(&mut self, bytes: &mut Vec<u8>, len: u64) -> bool {
         let had = self.bytes;
-        let room = if len <= had {
-            had
-        } else {
-            match [had.saturating_mul(2), len]
-                .into_iter()
-                .find(|&r| r >= len && usize::try_from(r).is_ok() && self.resize(r))
-            {
-                Some(room) => room,
-                None => return false,
-            }
-        };
+        if !self.grow_to(len) {
+            return false;
+        }
         if bytes.capacity() < len as usize
             && bytes
-                .try_reserve_exact((room as usize).saturating_sub(bytes.len()))
+                .try_reserve_exact((self.bytes as usize).saturating_sub(bytes.len()))
                 .is_err()
         {
             self.resize(had);
@@ -20832,21 +20534,56 @@ impl HostCharge {
     /// Charge `payer` for what it holds, past every limit, if it charged no one yet: state made
     /// before its capability was granted (a seeded store), which the grantee pays for from then on.
     pub fn bind(&mut self, payer: &NodeRef) {
-        if self.payer.is_none() {
-            let bytes = std::mem::take(&mut self.bytes);
-            self.payer = Some(payer.clone());
-            self.force(bytes);
+        self.bind_as(payer, Fits::Forced);
+    }
+
+    /// #2318 — [`Self::bind`] for state a thaw rebuilt from its artifact: past any ceiling, since the
+    /// artifact's use was granted, but never past the process's pools. `false`, charging no one,
+    /// when they have no room.
+    pub fn rebind(&mut self, payer: &NodeRef) -> bool {
+        self.bind_as(payer, Fits::Pool)
+    }
+
+    /// #2428 — [`Self::bind`] for a copy a guest's own act makes (a fork twin's): within every
+    /// ceiling and pool, as a resize is. `false`, charging no one, when they have no room.
+    pub fn bind_within(&mut self, payer: &NodeRef) -> bool {
+        self.bind_as(payer, Fits::All)
+    }
+
+    fn bind_as(&mut self, payer: &NodeRef, fits: Fits) -> bool {
+        if self.payer.is_some() {
+            return true;
+        }
+        let bytes = std::mem::take(&mut self.bytes);
+        self.payer = Some(payer.clone());
+        if self.set(bytes, fits) {
+            return true;
+        }
+        (self.payer, self.bytes) = (None, bytes);
+        false
+    }
+
+    /// What holding `bytes` costs: its `channel` (or a stack's `mem`), and its `maps`.
+    #[inline]
+    fn cost(&self, bytes: u64) -> [(usize, u64); 2] {
+        let maps = (BUDGET_MAPS, u64::from(bytes >= MAPPED_BUFFER));
+        match self.stack {
+            false => [(BUDGET_CHANNEL, bytes), maps],
+            true => [
+                (BUDGET_MEM, bytes.saturating_sub(temen_ir::FIBER_STACK)),
+                maps,
+            ],
         }
     }
 
+    #[inline]
     fn set(&mut self, bytes: u64, fits: Fits) -> bool {
-        if let Some(n) = self.payer.as_ref().filter(|_| bytes != self.bytes) {
-            let maps = |b: u64| u64::from(b >= MAPPED_BUFFER);
-            let (lo, hi) = (self.bytes.min(bytes), self.bytes.max(bytes));
-            let diff = [
-                (BUDGET_CHANNEL, hi - lo),
-                (BUDGET_MAPS, maps(hi) - maps(lo)),
-            ];
+        // A stack's first `FIBER_STACK` costs nothing, so most never reach the tree.
+        let (was, now) = (self.cost(self.bytes), self.cost(bytes));
+        if let Some(n) = self.payer.as_ref().filter(|_| was != now) {
+            // Each dimension's cost only grows with the bytes, so the difference is one-signed.
+            let diff: [(usize, u64); 2] =
+                std::array::from_fn(|i| (was[i].0, was[i].1.abs_diff(now[i].1)));
             if bytes < self.bytes {
                 n.tree.refund_set(n.node, &diff);
             } else if !n.tree.add(n.node, &diff, fits) {
@@ -20904,6 +20641,16 @@ impl HostBuffer {
     /// [`HostCharge::bind`].
     pub fn bind(&mut self, payer: &NodeRef) {
         self.room.bind(payer);
+    }
+
+    /// [`HostCharge::rebind`].
+    pub fn rebind(&mut self, payer: &NodeRef) -> bool {
+        self.room.rebind(payer)
+    }
+
+    /// [`HostCharge::bind_within`].
+    pub fn bind_within(&mut self, payer: &NodeRef) -> bool {
+        self.room.bind_within(payer)
     }
 
     /// Hold `bytes` instead, charged past every limit: what a rewind puts back, which it held before.
@@ -20987,9 +20734,8 @@ impl core::ops::DerefMut for HostBuffer {
 /// #1944 slice 3 — a vCPU's fuel: what is `left` of its last draw, and the node it draws the next one
 /// from. A safepoint burns one unit; when `left` is spent a draw refills it, and a spent chain traps
 /// [`Trap::OutOfFuel`]. With no `src` it is a fixed allowance, never refilled: an unmetered vCPU's
-/// (its chain unbounded, `left = u64::MAX`) or a carve child's (the carve path keeps its per-spawn
-/// fuel until #1867 deletes it). Dropping it hands `left` back to the chain, so a vCPU that ends, or
-/// unwinds for a freeze, returns what it drew and did not burn.
+/// (its chain unbounded, `left = u64::MAX`) or a debug tier's. Dropping it hands `left` back to the
+/// chain, so a vCPU that ends, or unwinds for a freeze, returns what it drew and did not burn.
 pub(crate) struct Fuel {
     left: u64,
     src: Option<NodeRef>,
@@ -21108,8 +20854,8 @@ pub struct Attestation {
     /// from a distrusted host must see `3` or refuse.
     pub tier: u8,
     /// `true` iff an **ancestor** (beyond the platform) holds map/read/pager rights over the domain's
-    /// backing — a §14 nested carve is exposed (the parent sees the superset); a platform-minted or
-    /// root window is not.
+    /// backing — a paged §14 child is exposed (its spawner is its pager, #2095); an unpaged child's
+    /// platform-minted window or a root window is not.
     pub window_exposed: bool,
     /// `true` iff an ancestor may **snapshot** the domain (a snapshot is a complete read). A domain is
     /// *confidential* (freezable by nobody below the platform) or *ancestor-durable*, never both.
@@ -21118,8 +20864,8 @@ pub struct Attestation {
 
 impl Default for Attestation {
     /// A **root** domain: in-process (tier 1), platform-only window (no ancestor read), not
-    /// ancestor-freezable. The embedder overrides via [`Host::set_attestation`]; the §14 spawn path
-    /// stamps a nested child's (exposed) report.
+    /// ancestor-freezable. The embedder overrides via [`Host::set_attestation`]; a §14 spawn stamps
+    /// its child's report.
     fn default() -> Attestation {
         Attestation {
             tier: 1,
@@ -21164,14 +20910,11 @@ pub enum DurableBinding {
         base: u64,
         size: u64,
     },
-    Instantiator {
-        base: u64,
-        size: u64,
-    },
-    /// Freeze authority, and what it covers (#1440). Value-typed, so a thawed parent holds the same
+    Instantiator,
+    /// Freeze authority over detached progeny (#1440). Durable, so a thawed parent holds the same
     /// authority over its thawed child that it held before the freeze — without this, a round trip
     /// would launder a domain's exposure away and `attest` would start lying.
-    FreezeAuthority(FreezeScope),
+    FreezeAuthority,
     /// §13.4 slice 4d — a live-callee offer (`child_offer`) over a §14 child, named
     /// **structurally** by the callee's join `slot` in the holder's own table + the offer
     /// `export` (a `DomainId`/`Arc` is process-local and never rides the artifact). The thaw
@@ -21215,9 +20958,8 @@ pub enum DurableBinding {
     /// #1361 — a §14 [`Binding::Module`] grant the granting host attested **freezable**
     /// (`grant_durable_module` ran `temen_durable::transform_module` on it), named by its §4
     /// content digest. The module *bytes* never ride an artifact (D-scope): the restoring host
-    /// re-grants the same module and this digest re-resolves the handle against it — exactly the
-    /// rule a separate-module [`FrozenNested`] child already re-attaches by
-    /// ([`Host::tables_by_digest`]), reused rather than duplicated.
+    /// re-grants the same module and this digest re-resolves the handle against it
+    /// ([`Host::check_modules_for_thaw`]).
     ///
     /// #2245: the running program's child image ([`Host::grant_child_image`]) rides the same way,
     /// unattested: it is a pure function of the program, so the restoring powerbox derives it
@@ -21346,10 +21088,6 @@ pub enum DeclineCause {
     /// A child domain holds a handle no artifact can carry (§12.5). The root's own handles are the
     /// codec's to answer ([`Host::capture_durable_handles`]), since its embedder can still drain them.
     NonDurableHandle(NonDurableHandle),
-    /// A live §14 nested child beside a live `thread.spawn` sibling (#1673).
-    NestedWithThread,
-    /// A §14 nested child owns fibers (#1675).
-    NestedChildFibers,
     /// A live detached child has no freeze doorbell, so nothing can reach it.
     DetachedUnreachable,
     /// A fiber is parked where no scheduler waiter records it, so no rule applies (#1677).
@@ -21597,11 +21335,9 @@ const fn handle_of(slot: u32, generation: u32) -> i32 {
     (((generation & GEN_MASK) << CAP_LOG2) | slot) as i32
 }
 
-/// Worker-thread count of the host **bounded blocking-offload pool** (§12 "Keeping cores busy under
-/// blocking", path 2 — the io_uring increment-2 path). At most this many *blocking* SQEs run
-/// concurrently; the `(K+1)`th queues — so the OS-thread cost of a `submit` batch is bounded by `K`,
-/// never by the number of deferred ops. The guest's own vCPU thread is **not** multiplied (it parks
-/// on the one `submit` while the pool absorbs the blocking) — the "0 blocked vCPU threads" win.
+/// How many workers a domain's offload pool runs (§12 path 2): at most this many of its punted calls
+/// run at once, and the next waits for a free worker. The guest's own threads are never multiplied:
+/// each parks while the pool runs its call.
 pub const OFFLOAD_POOL_THREADS: usize = 4;
 
 /// Shared, thread-safe state behind a [`cap_id::BLOCKING`] capability — a *mock* synchronous-only host
@@ -21658,94 +21394,122 @@ impl AsyncState {
     }
 }
 
-/// A job handed to the offload pool: a self-contained closure that writes its own result (it captures
-/// the destination), so completion *order* is irrelevant — the data it leaves is deterministic.
+/// A job handed to the offload pool: a punted call, wrapped to post its answer to its domain's store.
 type OffloadJob = Box<dyn FnOnce() + Send + 'static>;
 
-/// The **bounded blocking-offload pool** (§12 path 2): [`OFFLOAD_POOL_THREADS`] long-lived workers
-/// that run window-independent blocking SQEs *off* the guest's vCPU thread. A `submit` of `n` blocking
-/// ops costs `K` OS threads regardless of `n` (waves of `K`). Each worker owns its **own** channel —
-/// a single shared `Mutex<Receiver>` would serialize the blocking `recv`s and defeat the overlap.
+/// A domain's **offload pool** (§12 path 2): [`OFFLOAD_POOL_THREADS`] workers that run its punted
+/// calls off the guest's threads.
+///
+/// The workers take jobs from one queue, so a call waits only while every worker is busy, never
+/// behind a long call while another worker idles (#2477). A job wakes one idle worker, and a worker
+/// holds the queue's lock only to take a job or count one finished, never while it waits or runs.
+///
+/// Nothing waits for the workers (#2493). A punted call never touches the window, and posts its
+/// answer into its store, which outlives the pool. A call may wait on the world for as long as it
+/// likes, so dropping the pool closes the queue and lets each worker finish the calls queued and
+/// exit on its own: a domain's teardown, its parent's `join`, or the run's end never waits for one.
 struct OffloadPool {
-    /// Per-worker job channels; a batch is round-robined across them.
-    txs: Vec<std::sync::mpsc::Sender<OffloadJob>>,
-    workers: Vec<std::thread::JoinHandle<()>>,
-    /// Jobs dispatched but not yet finished — `(count, condvar)`. [`OffloadPool::dispatch`] (the async
-    /// path) returns without waiting, so [`OffloadPool::quiesce`] uses this to drain in-flight work at
-    /// run end before the window's `Arc<Region>` (which a late job may still write) is read back.
-    inflight: Arc<(Mutex<usize>, Condvar)>,
-    next: usize,
+    shared: Arc<PoolShared>,
+}
+
+/// What a pool shares with its workers.
+struct PoolShared {
+    state: Mutex<PoolState>,
+    /// A job came, or the pool is gone.
+    work: Condvar,
+    /// The last call in flight finished ([`OffloadPool::quiesce`]).
+    idle: Condvar,
+}
+
+#[derive(Default)]
+struct PoolState {
+    /// Calls dispatched and not yet taken by a worker.
+    jobs: std::collections::VecDeque<OffloadJob>,
+    /// Calls dispatched and not yet finished.
+    inflight: usize,
+    /// The pool is gone: a worker that finds no job exits.
+    closed: bool,
 }
 
 impl OffloadPool {
     fn new(k: usize) -> OffloadPool {
-        let mut txs = Vec::with_capacity(k);
-        let mut workers = Vec::with_capacity(k);
+        let shared = Arc::new(PoolShared {
+            state: Mutex::default(),
+            work: Condvar::new(),
+            idle: Condvar::new(),
+        });
         for _ in 0..k {
-            let (tx, rx) = std::sync::mpsc::channel::<OffloadJob>();
-            txs.push(tx);
-            workers.push(std::thread::spawn(move || {
-                while let Ok(job) = rx.recv() {
-                    job();
-                }
-            }));
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || shared.work());
         }
-        OffloadPool {
-            txs,
-            workers,
-            inflight: Arc::new((Mutex::new(0), Condvar::new())),
-            next: 0,
-        }
+        OffloadPool { shared }
     }
 
-    /// **Async dispatch** (the increment-3 path): round-robin `jobs` to the workers and return
-    /// **immediately**. Each job is wrapped to decrement the in-flight count + notify on completion;
-    /// the job itself posts its own completion (host-side result + futex counter + `notify`). The
-    /// guest's vCPU parks via the futex `wait` rather than blocking here — the whole point of async.
-    fn dispatch(&mut self, jobs: Vec<OffloadJob>) {
-        if jobs.is_empty() {
-            return;
-        }
-        {
-            let (m, _) = &*self.inflight;
-            *m.lock().unwrap() += jobs.len();
-        }
-        for job in jobs {
-            let inflight = Arc::clone(&self.inflight);
-            let wrapped: OffloadJob = Box::new(move || {
-                job();
-                let (m, c) = &*inflight;
-                let mut g = m.lock().unwrap();
-                *g -= 1;
-                if *g == 0 {
-                    c.notify_all();
-                }
-            });
-            let w = self.next % self.txs.len();
-            self.next = self.next.wrapping_add(1);
-            self.txs[w].send(wrapped).expect("offload worker vanished");
-        }
+    /// Queue `job` for the next free worker and return at once: the caller parks, or waits on the
+    /// store, for its answer.
+    fn dispatch(&self, job: OffloadJob) {
+        let mut g = self.shared.state.lock_unpoisoned();
+        g.jobs.push_back(job);
+        g.inflight += 1;
+        drop(g);
+        self.shared.work.notify_one();
     }
 
-    /// Block until every dispatched async job has finished. Called at run end so no worker still holds
-    /// (and might still write) the window's `Arc<Region>` after the caller reads the final memory back.
+    /// Block until every dispatched call has finished.
     fn quiesce(&self) {
-        let (m, c) = &*self.inflight;
-        let mut g = m.lock().unwrap();
-        while *g > 0 {
-            g = c.wait(g).unwrap();
-        }
+        let g = self.shared.state.lock_unpoisoned();
+        let idle = self.shared.idle.wait_while(g, |s| s.inflight > 0);
+        drop(idle.unwrap_or_else(|e| e.into_inner()));
     }
 }
 
 impl Drop for OffloadPool {
     fn drop(&mut self) {
-        // Dropping the senders closes each worker's channel → its `recv` returns `Err` → it exits.
-        self.txs.clear();
-        for w in self.workers.drain(..) {
-            let _ = w.join();
+        self.shared.state.lock_unpoisoned().closed = true;
+        self.shared.work.notify_all();
+    }
+}
+
+impl PoolShared {
+    /// A worker: run the queued calls, one at a time, until the pool is gone and none is left.
+    fn work(&self) {
+        let mut g = self.state.lock_unpoisoned();
+        loop {
+            match g.jobs.pop_front() {
+                Some(job) => {
+                    drop(g);
+                    job();
+                    g = self.state.lock_unpoisoned();
+                    g.inflight -= 1;
+                    if g.inflight == 0 {
+                        self.idle.notify_all();
+                    }
+                }
+                None if g.closed => return,
+                None => g = self.work.wait(g).unwrap_or_else(|e| e.into_inner()),
+            }
         }
     }
+}
+
+/// A run's doorbell (#1122): how many times it has rung, and the condvar each ring notifies. The
+/// embedder's ([`Host::arm_external_wake`]) rings when it feeds the run or signals it; a store rings
+/// it when an answer posts, while a driver waits on it ([`Completions::wait_any`]).
+pub(crate) type Bell = Arc<(Mutex<u64>, Condvar)>;
+
+/// Wait on `bell` until it rings past count `seen`, or for at most `within`: whether it rang.
+pub(crate) fn wait_for_ring(bell: &Bell, seen: u64, within: Option<std::time::Duration>) -> bool {
+    let (rung, cv) = &**bell;
+    let g = rung.lock_unpoisoned();
+    let not_yet = |g: &mut u64| *g == seen;
+    let g = match within {
+        None => cv.wait_while(g, not_yet).unwrap_or_else(|e| e.into_inner()),
+        Some(d) => {
+            let waited = cv.wait_timeout_while(g, d, not_yet);
+            waited.unwrap_or_else(|e| e.into_inner()).0
+        }
+    };
+    *g != seen
 }
 
 /// §12 parking-on-blocking — the **completion store** behind a `Pending` dispatch. When an
@@ -21762,40 +21526,45 @@ impl Drop for OffloadPool {
 pub struct Completions {
     mx: Mutex<CompletionState>,
     cv: Condvar,
-    /// #1366 — whether a driver that **surfaces** cap parks to the embedder is running this host
-    /// (set by [`bytecode::Vcpu::run`]). A host-completed punt is admitted only then; every other
-    /// driver could only wait inline on it, so the dispatch declines *before* the submit hook runs
-    /// — the embedder is never handed a request nobody can finish.
-    host_ok: std::sync::atomic::AtomicBool,
+    /// §12 slice 2 — the **completion wake** hook: called after each result posts, so the driver
+    /// whose callers park on this store can deliver it ([`Completions::set_notify`]). On the store,
+    /// not the `Host`, so a pool job reads the hook installed when it finishes, not when it was
+    /// punted, and a driver can install it on any domain's store a caller parks on (#2424).
+    notify: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 struct CompletionState {
     /// Results posted by pool workers, keyed by completion id, awaiting their waiter.
     ready: BTreeMap<u64, i64>,
-    /// #1366 — ids minted for an [`OffloadOutcome::Host`] punt: completed by the embedder, never
-    /// by a pool worker. An inline waiter must not block on one (nobody could wake it).
+    /// #1366 — ids minted for an [`OffloadOutcome::Host`] punt and not yet answered: the embedder
+    /// answers them ([`Completer`]), never a pool worker, so a driver whose embedder answers only
+    /// once it has control back must hand control back rather than wait on one.
     host_owned: BTreeSet<u64>,
     /// #1366 — for a host-owned id minted while the host is **recording** its cap tape: the call's
     /// `(type_id, op, handle, args)`, so the *delivered* value (not the dispatch-time placeholder)
-    /// joins the tape as the call's `CapRecord` when the embedder completes it — a reverse `seek`
-    /// then serves it from the tape and never re-parks.
+    /// joins the tape as the call's `CapRecord` where a driver delivers it
+    /// ([`Completions::take_record`]) — a reverse `seek` then serves it from the tape and never
+    /// re-parks.
     host_pending: BTreeMap<u64, (u32, u32, i32, Vec<i64>)>,
     /// Ids minted but not yet completed — `outstanding()` is the freeze/teardown drain signal.
     in_flight: usize,
-    /// Next completion id. Monotonic per host; ids double as submission order (the cooperative
-    /// tier's ordered-delivery key, §18 determinism).
-    next_id: u64,
+    /// How many ids this store has minted ([`Completions::minted`]).
+    minted: u64,
+    /// #2495 — the host-answered call whose submit hook is running, under its dispatcher's host
+    /// lock (one at a time: the store is its domain's). An answer it gets meanwhile posts without
+    /// ringing the wake hook, which may take a scheduler lock the dispatcher must not nest under
+    /// its host lock; no one waits on the call yet, and its caller's park finds the answer.
+    submitting: Option<u64>,
     /// F3 (FIBER_PARK.md) — Cranelift-JIT fiber-park cells, keyed by completion id: a punting
-    /// fiber registers here and its resumer's polls read the cell; the ordered drain moves
-    /// ready results into cells **smallest-id-first, stopping at the first not-yet-arrived**
-    /// (the §18 submission-order pin, JIT form — the tree-walk scheduler's `completion_drain`
-    /// and the bytecode `drain_cap_parked`, cell form). One lock with the store, so
-    /// register-then-recheck is atomic and a completion can never race past a registration.
+    /// fiber registers here and its resumer's polls read the cell. Each cell takes its answer as
+    /// it comes (#2477): [`complete`](Completions::complete) fills a registered cell, and a
+    /// registration takes an answer already in. One lock with the store, so a completion can
+    /// never race past a registration.
     fiber_cells: BTreeMap<u64, Arc<CapFiberCell>>,
 }
 
-/// F3 (FIBER_PARK.md) — a JIT fiber's per-punt wait cell: empty until the ordered drain claims
-/// the completion; the parked fiber's resume-poll [`take`](CapFiberCell::take)s the scalar.
+/// F3 (FIBER_PARK.md) — a JIT fiber's per-punt wait cell: empty until its call answers; the
+/// parked fiber's resume-poll [`take`](CapFiberCell::take)s the scalar.
 pub struct CapFiberCell {
     result: Mutex<Option<i64>>,
 }
@@ -21815,36 +21584,33 @@ impl Completions {
                 host_owned: BTreeSet::new(),
                 host_pending: BTreeMap::new(),
                 in_flight: 0,
-                next_id: 0,
+                minted: 0,
+                submitting: None,
                 fiber_cells: BTreeMap::new(),
             }),
             cv: Condvar::new(),
-            host_ok: std::sync::atomic::AtomicBool::new(false),
+            notify: Mutex::new(None),
         }
     }
 
-    /// #1366 — declare that the running driver surfaces cap parks ([`bytecode::VcpuEvent::CapPending`])
-    /// and completes them via `deliver_cap`, admitting [`OffloadOutcome::Host`] punts on this host.
-    pub fn allow_host_completed(&self) {
-        self.host_ok
-            .store(true, std::sync::atomic::Ordering::Release);
+    /// §12 — install (`Some`) or remove the hook each posted result calls
+    /// ([`Completions::notify`]). Called before the caller parks: a result posted before it was
+    /// installed is found by the driver's recheck after the park, one posted after rings it.
+    pub fn set_notify(&self, f: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.notify.lock_unpoisoned() = f;
     }
 
-    /// #1366 — whether host-completed punts are admitted (see [`allow_host_completed`](Self::allow_host_completed)).
-    pub fn host_completed_allowed(&self) -> bool {
-        self.host_ok.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// F3 (FIBER_PARK.md) — register the calling JIT fiber's wait cell for punt `id`, then run
-    /// the ordered drain under the same lock (register-then-recheck: a completion that raced
-    /// the park is claimed here, in submission order, never stranded).
+    /// F3 (FIBER_PARK.md) — register the calling JIT fiber's wait cell for punt `id`, under the
+    /// store's lock: an answer already in fills the cell at once, so a completion that raced the
+    /// park is never stranded.
     pub fn fiber_register(&self, id: u64) -> Arc<CapFiberCell> {
         let mut g = self.mx.lock_unpoisoned();
         let cell = Arc::new(CapFiberCell {
-            result: Mutex::new(None),
+            result: Mutex::new(g.ready.remove(&id)),
         });
-        g.fiber_cells.insert(id, Arc::clone(&cell));
-        Self::fiber_drain_locked(&mut g);
+        if cell.result.lock_unpoisoned().is_none() {
+            g.fiber_cells.insert(id, Arc::clone(&cell));
+        }
         cell
     }
 
@@ -21856,93 +21622,130 @@ impl Completions {
         g.fiber_cells.remove(&id);
     }
 
-    /// The F3 ordered drain: claim ready results into registered fiber cells smallest-id-first,
-    /// stopping at the first not-yet-arrived id. Runs at registration and at every
-    /// [`complete`](Completions::complete), always under the one state lock.
-    fn fiber_drain_locked(g: &mut CompletionState) {
-        while let Some((&id, _)) = g.fiber_cells.first_key_value() {
-            let Some(r) = g.ready.remove(&id) else {
-                break;
-            };
-            let (_, cell) = g.fiber_cells.pop_first().expect("first_key_value above");
-            *cell.result.lock_unpoisoned() = Some(r);
-        }
-    }
-
-    /// Mint the next completion id (also counts it in-flight). Called only on the punt path.
+    /// Mint the next completion id (also counts it in-flight). Called only on the punt path. Ids
+    /// come from one count for the whole process (#2495), so a call's id names it in every domain:
+    /// an embedder answering calls from several domains keys them by id, and within a store the
+    /// lowest id among the answers in is still its earliest call (#2477).
     fn mint(&self) -> u64 {
-        let mut g = self.mx.lock_unpoisoned();
-        let id = g.next_id;
-        g.next_id += 1;
-        g.in_flight += 1;
-        id
+        Self::mint_locked(&mut self.mx.lock_unpoisoned())
     }
 
-    /// Post a punted job's scalar result (pool-worker side) and wake waiters — including the
-    /// F3 fiber cells, via the ordered drain (their resumers observe the wake at the next
-    /// `cont.resume` poll; no separate notify hook is needed on the JIT tier).
+    fn mint_locked(g: &mut CompletionState) -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        g.minted += 1;
+        g.in_flight += 1;
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Post a punted job's scalar result (pool-worker side) and wake waiters. A JIT fiber's cell
+    /// registered for `id` takes it directly (F3): its resumer observes it at the next
+    /// `cont.resume` poll, so no separate notify hook is needed on the JIT tier.
     fn complete(&self, id: u64, result: i64) {
         let mut g = self.mx.lock_unpoisoned();
-        g.ready.insert(id, result);
         g.in_flight -= 1;
-        Self::fiber_drain_locked(&mut g);
+        match g.fiber_cells.remove(&id) {
+            Some(cell) => *cell.result.lock_unpoisoned() = Some(result),
+            None => {
+                g.ready.insert(id, result);
+            }
+        }
+        let quiet = g.submitting == Some(id);
         drop(g);
         self.cv.notify_all();
+        if quiet {
+            return;
+        }
+        // The result post happens-before the wake hook, so a drain the hook runs always finds the
+        // result it is delivering (no lost wakeup). Called with no lock held: the hook drains.
+        let hook = self.notify.lock_unpoisoned().clone();
+        if let Some(h) = hook {
+            h();
+        }
     }
 
-    /// #1366 — mint an id for a host-completed punt ([`OffloadOutcome::Host`]): minted + marked
-    /// host-owned under the one lock.
-    fn mint_host_owned(&self, record: Option<(u32, u32, i32, Vec<i64>)>) -> u64 {
-        let mut g = self.mx.lock_unpoisoned();
-        let id = g.next_id;
-        g.next_id += 1;
-        g.in_flight += 1;
-        g.host_owned.insert(id);
-        if let Some(prefix) = record {
-            g.host_pending.insert(id, prefix);
-        }
+    /// #1366 — mint an id for a host-answered punt ([`OffloadOutcome::Host`]) and run its submit
+    /// hook with the call's [`Completer`]: minted + marked host-owned under the one lock, with the
+    /// call's tape prefix when its host records. An answer the hook gives at once posts quietly
+    /// ([`CompletionState::submitting`]).
+    fn submit_host_owned(
+        self: &Arc<Self>,
+        record: Option<(u32, u32, i32, Vec<i64>)>,
+        submit: HostCompletion,
+    ) -> u64 {
+        let id = {
+            let mut g = self.mx.lock_unpoisoned();
+            let id = Self::mint_locked(&mut g);
+            g.host_owned.insert(id);
+            if let Some(prefix) = record {
+                g.host_pending.insert(id, prefix);
+            }
+            g.submitting = Some(id);
+            id
+        };
+        submit(Completer {
+            store: Arc::downgrade(self),
+            id,
+        });
+        self.mx.lock_unpoisoned().submitting = None;
         id
     }
 
-    /// #1366 — whether `id` is a host-completed punt (the embedder, not a pool worker, finishes
-    /// it). A driver that surfaces parks checks this to decide between "surface the id" and the
-    /// inline pool wait.
+    /// #1366 — whether `id` is a host-answered call still waiting for its answer: the embedder,
+    /// not a pool worker, answers it. A driver whose embedder answers only once it has control back
+    /// hands control back on one instead of waiting.
     pub fn is_host_owned(&self, id: u64) -> bool {
         self.mx.lock_unpoisoned().host_owned.contains(&id)
     }
 
-    /// #1366 — the embedder finishes a host-completed punt: post `result` for `id` and wake
-    /// waiters exactly as a pool worker's [`complete`](Completions::complete) would. The id stops
-    /// being host-owned. Unknown/foreign ids are ignored (no-op, `None`) rather than corrupting the
-    /// store. Returns the call's recorded `(type_id, op, handle, args)` when the host was taping
-    /// (so the caller can push the delivered value as the call's [`CapRecord`]).
-    pub fn complete_host(&self, id: u64, result: i64) -> Option<(u32, u32, i32, Vec<i64>)> {
-        let prefix = {
-            let mut g = self.mx.lock_unpoisoned();
-            if !g.host_owned.remove(&id) {
-                return None;
-            }
-            g.host_pending.remove(&id)
-        };
+    /// #2495 — a host-answered call's answer ([`Completer`]): post it as a pool worker's
+    /// [`complete`](Completions::complete) does, waking whoever waits on it. `false`, posting
+    /// nothing, for an id that is not an unanswered host-answered call: answered already, or
+    /// withdrawn ([`withdraw`](Completions::withdraw)).
+    fn complete_host(&self, id: u64, result: i64) -> bool {
+        if !self.mx.lock_unpoisoned().host_owned.remove(&id) {
+            return false;
+        }
         self.complete(id, result);
-        prefix
+        true
     }
 
-    /// #1366 — the inline-wait form for drivers that cannot surface a park: block for a
-    /// pool-completed `id` as [`wait`](Completions::wait) does, but **decline** (`None`) a
-    /// host-owned one, which no pool worker will ever complete — the caller traps `CapFault`
-    /// instead of hanging.
-    pub fn wait_unless_host_owned(&self, id: u64) -> Option<i64> {
+    /// #2495 — decline host-answered call `id` after it was minted (its caller cannot park on
+    /// it): no answer will be taken, so its completer answers nothing and it stops counting as in
+    /// flight. `false` if it is not an unanswered host-answered call.
+    pub fn withdraw(&self, id: u64) -> bool {
         let mut g = self.mx.lock_unpoisoned();
-        loop {
-            if let Some(r) = g.ready.remove(&id) {
-                return Some(r);
-            }
-            if g.host_owned.contains(&id) {
-                return None;
-            }
-            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        if !g.host_owned.remove(&id) {
+            return false;
         }
+        g.host_pending.remove(&id);
+        g.in_flight -= 1;
+        true
+    }
+
+    /// #2495 — the [`CapRecord`] a driver tapes as it delivers answer `result` to call `id`: `Some`
+    /// for a host-answered call minted while its host recorded its cap tape (DEBUGGING.md W1), so
+    /// the delivered value, not the dispatch-time placeholder, joins the tape.
+    pub fn take_record(&self, id: u64, result: i64) -> Option<CapRecord> {
+        let (type_id, op, handle, args) = self.mx.lock_unpoisoned().host_pending.remove(&id)?;
+        Some(CapRecord {
+            type_id,
+            op,
+            handle,
+            args,
+            result: Ok(vec![result]),
+            mem_writes: Vec::new(),
+        })
+    }
+
+    /// The inline wait of a caller that cannot park: block for `id` as
+    /// [`wait`](Completions::wait) does, but **decline** (`None`) a host-answered call, withdrawn
+    /// ([`withdraw`](Completions::withdraw)): its embedder may answer only once it has control
+    /// back, so the caller traps `CapFault` instead of hanging (INVARIANTS.md 9).
+    pub fn wait_unless_host_owned(&self, id: u64) -> Option<i64> {
+        if self.withdraw(id) {
+            return None;
+        }
+        Some(self.wait(id))
     }
 
     /// Block until completion `id` is ready and take its result — the **single-fiber degenerate
@@ -21957,6 +21760,57 @@ impl Completions {
             }
             g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
         }
+    }
+
+    /// [`wait`](Completions::wait) for at most `d`: `None` if `id` has not arrived by then. What a
+    /// waiter that must also watch for its run's end waits with (#2047).
+    pub fn wait_timeout(&self, id: u64, d: std::time::Duration) -> Option<i64> {
+        let g = self.mx.lock_unpoisoned();
+        let (mut g, _) = self
+            .cv
+            .wait_timeout_while(g, d, |s| !s.ready.contains_key(&id))
+            .unwrap_or_else(|e| e.into_inner());
+        g.ready.remove(&id)
+    }
+
+    /// Block until one of `calls` (each a store and an id minted there) has its answer in, or
+    /// `bell` (a run's doorbell, and the ring count already seen) rings again, or for at most
+    /// `within`, and leave the answer for its drain to take: a cooperative driver's idle wait
+    /// (#2047), its wait for its next deadline (#1979) and the debug scheduler's, while callers in
+    /// any number of domains are parked, each domain's calls in its own store (#2424). One wait
+    /// for every wake source (#2480): each store rings the bell when an answer posts
+    /// ([`Completions::set_notify`]), hung before any is looked at, so an answer posted meanwhile is
+    /// not missed; with no bell, the wait rings one of its own. Whether something came. The hook
+    /// outlives the wait, ringing a bell no one may be waiting on.
+    pub(crate) fn wait_any(
+        calls: &[(Arc<Completions>, u64)],
+        bell: Option<(&Bell, u64)>,
+        within: Option<std::time::Duration>,
+    ) -> bool {
+        let own: Bell;
+        let (bell, seen) = match bell {
+            Some(rung) => rung,
+            None => {
+                own = Arc::new((Mutex::new(0), Condvar::new()));
+                (&own, 0)
+            }
+        };
+        for (comps, _) in calls {
+            let bell = Arc::downgrade(bell);
+            comps.set_notify(Some(Arc::new(move || {
+                if let Some(bell) = bell.upgrade() {
+                    *bell.0.lock_unpoisoned() += 1;
+                    bell.1.notify_all();
+                }
+            })));
+        }
+        let arrived = |(comps, id): &(Arc<Completions>, u64)| {
+            comps.mx.lock_unpoisoned().ready.contains_key(id)
+        };
+        if calls.iter().any(arrived) {
+            return true;
+        }
+        wait_for_ring(bell, seen, within)
     }
 
     /// Take completion `id`'s result if it has already arrived (non-blocking) — the ordered
@@ -21975,7 +21829,7 @@ impl Completions {
     /// Total completion ids ever minted on this host — `0` proves no dispatch ever touched the
     /// parking machinery (the §12 "sync ops never pay" pin, asserted by tests).
     pub fn minted(&self) -> u64 {
-        self.mx.lock_unpoisoned().next_id
+        self.mx.lock_unpoisoned().minted
     }
 }
 
@@ -22013,7 +21867,11 @@ pub type HostProc = Box<
 /// parent's `fork()` returns), so a personality can register the new process in its own process
 /// table at birth (`kill(pid)`/`waitpid(pid)` then mean the same pid everywhere). A provider with
 /// no process table ignores it ([`ForkedProc::shared`] mints).
-pub type HostProcFork = Arc<dyn Fn(u64) -> ForkedProc + Send + Sync>;
+///
+/// #2373, #2428 — what a fork copies is charged with it: `None` when the provider has no room for
+/// the twin's copy of its state, and the fork then fails with `-EAGAIN`, as a full `spawn` ceiling
+/// does.
+pub type HostProcFork = Arc<dyn Fn(u64) -> Option<ForkedProc> + Send + Sync>;
 
 /// #863 — what a [`HostProcFork`] factory mints for a **new process domain**. Beyond the fresh
 /// handler closure, a personality may hand the new domain two extras — both *mechanism-neutral*:
@@ -22024,8 +21882,9 @@ pub type HostProcFork = Arc<dyn Fn(u64) -> ForkedProc + Send + Sync>;
 pub type ExecRemapHook = Arc<dyn Fn(&[(i32, i32)]) + Send + Sync>;
 
 pub struct ForkedProc {
-    /// The new domain's handler closure over the provider's (duplicated or shared) state.
-    pub handler: HostProc,
+    /// The new domain's handler over the provider's (duplicated or shared) state: synchronous, or
+    /// offloadable (#2424), as the provider mints it.
+    pub handler: ProcHandler,
     /// A signal door over the **new process's own** signal state, installed on the new domain's
     /// `Host` ([`Host::set_signal_source`]). `None` = the twin shares its parent's source (the
     /// pre-split behavior, right for providers whose state is fully shared).
@@ -22061,6 +21920,10 @@ pub struct ForkedProc {
     /// #1699 — the new handler's own [`CapState`]: its serializer closes over the *new* domain's
     /// state, which the parent's would not.
     pub state: CapState,
+    /// #2373 — undo what the factory registered for the twin when the fork is refused after it ran
+    /// (a later provider had no room for its copy): the twin never runs, so a personality drops it
+    /// from its process table rather than retiring it there. `None` = nothing to undo.
+    pub abandon: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl ForkedProc {
@@ -22068,6 +21931,15 @@ impl ForkedProc {
     /// fork-of-fork through the same factory. The pre-#863 contract, right for providers whose
     /// state is deliberately global (a scripted table, a shared service shim).
     pub fn shared(handler: HostProc, state: CapState) -> Self {
+        Self::of(ProcHandler::Sync(handler), state)
+    }
+
+    /// [`Self::shared`] for an offloadable handler ([`Host::grant_host_proc_offloadable`], #2424).
+    pub fn offloadable(handler: OffloadHostProc, state: CapState) -> Self {
+        Self::of(ProcHandler::Offloadable(handler), state)
+    }
+
+    fn of(handler: ProcHandler, state: CapState) -> Self {
         Self {
             handler,
             signal: None,
@@ -22075,6 +21947,7 @@ impl ForkedProc {
             exit: None,
             exec_remap: None,
             state,
+            abandon: None,
         }
     }
 }
@@ -22098,23 +21971,60 @@ pub enum OffloadOutcome {
     /// Would block: run this job off the vCPU thread. The call's declared signature must have at
     /// most one result (checked at the delivery site; more is a `CapFault`, fail-closed).
     Offload(OffloadWork),
-    /// **Host-completed** (#1366): would block, and the *embedder* — not a pool thread — will
-    /// supply the scalar later. On the parking face the dispatch mints a completion id, marks it
-    /// host-owned, hands it to `submit` (so the host can record the request against that id), and
-    /// parks the caller; a resumable driver surfaces [`bytecode::VcpuEvent::CapPending`] and the
-    /// host finishes it with [`bytecode::Vcpu::deliver_cap`] (or [`Completions::complete_host`]).
-    /// This is how a single-threaded embedder (the `wasm32` cdylib, where no offload pool can
-    /// exist) services a cap asynchronously while the guest still sees a plain synchronous call.
-    /// Admitted only under a driver that surfaces the park (`Vcpu` flags its host via
-    /// [`Completions::allow_host_completed`]); any other driver has no way to complete it and
-    /// **declines** with `CapFault` before `submit` runs (invariant 9: decline, never diverge —
-    /// and never hang).
+    /// **Host-answered** (#1366, #2495): would block, and the *embedder* — not a pool thread —
+    /// answers it later. On the parking face the dispatch mints a completion id, hands `submit` the
+    /// call's [`Completer`], and parks the caller, which waits on the call as on a pool job: a
+    /// call that waits on the world holds no thread while it waits. Admitted on every engine and in
+    /// every domain wherever the caller can park; it declines with `CapFault` before `submit` runs
+    /// on the sync face and in a durable run (invariant 9: never hang), and after it where the
+    /// caller cannot park (a reply that is not one `i64`). A driver its embedder pumps
+    /// ([`bytecode::Vcpu`], [`bytecode::CoopRun`], the debug run) hands control back while such a
+    /// call waits, so a single-threaded embedder (the `wasm32` cdylib, where no offload pool can
+    /// exist) answers between pumps.
     Host(HostCompletion),
 }
 
-/// #1366 — the submit hook of an [`OffloadOutcome::Host`]: called once with the minted completion
-/// id on the parking face, before the caller parks.
-pub type HostCompletion = Box<dyn FnOnce(u64) + Send>;
+/// #1366 — the submit hook of an [`OffloadOutcome::Host`]: called once on the parking face, before
+/// the caller parks, with the call's [`Completer`].
+pub type HostCompletion = Box<dyn FnOnce(Completer) + Send>;
+
+/// #2495 — the right to answer one host-answered call ([`OffloadOutcome::Host`]), handed to its
+/// submit hook: the embedder answers it with [`complete`](Completer::complete), from any thread, at
+/// any time. A completer dropped unanswered answers `CAP_REVOKED` (`-9`), so a call its host can no
+/// longer answer never hangs (INVARIANTS.md 9). It holds its domain's store weakly: once the domain
+/// is gone, answering does nothing.
+#[derive(Debug)]
+pub struct Completer {
+    store: std::sync::Weak<Completions>,
+    id: u64,
+}
+
+impl Completer {
+    /// The call's completion id: what a driver that hands control back reports the call by
+    /// ([`bytecode::VcpuEvent::CapPending`], [`bytecode::CoopEvent::CapPark`]). Unique in the
+    /// process.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Answer the call with `result`, waking its caller. A call whose caller declined it, or whose
+    /// domain is gone, takes nothing.
+    pub fn complete(mut self, result: i64) {
+        self.answer(result);
+    }
+
+    fn answer(&mut self, result: i64) {
+        if let Some(store) = std::mem::take(&mut self.store).upgrade() {
+            store.complete_host(self.id, result);
+        }
+    }
+}
+
+impl Drop for Completer {
+    fn drop(&mut self) {
+        self.answer(CAP_REVOKED);
+    }
+}
 
 /// §12 — the **offloadable** registration's handler shape ([`Host::grant_host_proc_offloadable`]):
 /// scalars in, [`OffloadOutcome`] out. Compared to a plain [`HostProc`] it *loses* powers — no
@@ -22150,8 +22060,9 @@ pub type StdinSource = Box<dyn FnMut() -> Option<Vec<u8>> + Send>;
 /// The two handler shapes one [`HostProcEntry`] can carry — the *registration* decides
 /// (CONSOLIDATION §7 per-entry powers, extended by §12 parking): `Sync` is today's full-powered
 /// synchronous closure; `Offloadable` declares blockingness and trades window/minter access for
-/// the right to punt to the offload pool.
-enum ProcHandler {
+/// the right to punt to the offload pool. A fork factory mints either ([`ForkedProc::handler`]),
+/// so a spawned child or a fork twin inherits a handler of the shape its parent was granted (#2424).
+pub enum ProcHandler {
     Sync(HostProc),
     Offloadable(OffloadHostProc),
 }
@@ -22328,9 +22239,14 @@ type ImportReq = Arc<(Vec<String>, Vec<FuncType>)>;
 /// is carried (streams, the exit and clock, address spaces, instantiators, freeze authority,
 /// budgets), so a rebuild needs no thaw seam; any other binding keeps the run out of the
 /// checkpointable subset, and a seek replays from an earlier checkpoint ([`Host::child_powerbox`]).
+/// Its module grants ride whole, each at its slot: a child that spawns holds the modules it spawns
+/// (#2219), and the checkpoint stays in the run, so nothing re-pins them by digest.
 #[derive(Clone)]
 pub(crate) struct ChildPowerbox {
     handles: Vec<DurableHandle>,
+    /// `(slot, generation, type_id, index into modules)` of each module handle.
+    module_slots: Vec<(u32, u32, u32, u32)>,
+    modules: Vec<ModuleGrant>,
     names: Vec<(String, i32)>,
     import_bindings: Vec<BoundImport>,
     import_remaps: Vec<Option<Arc<[u32]>>>,
@@ -22479,7 +22395,7 @@ pub const CAP_SELF_REAP: u32 = 12;
 /// `exec_module(module_handle, grants_ptr, grants_n)` replaces the **calling vCPU's own image** with a
 /// granted command `Module`, in place, keeping the vCPU's `TaskId` and fuel — so a parent's `wait(pid)`
 /// reaps the *command's* exit, exactly as POSIX `execve` keeps the pid. The command runs in the caller's
-/// existing window (its declared memory must equal the carve); its data segments are materialized, its
+/// existing window (its declared memory must fit it); its data segments are materialized, its
 /// import manifest is bound against a fresh powerbox carrying the inherited caps named in the grant list
 /// (POSIX fd inheritance), and it starts at its entry. On success `exec_module` **never returns** — the
 /// caller's continuation is gone (the whole point of image-replace) — so the eval loop hands the driver a
@@ -22525,6 +22441,13 @@ pub const CAP_SELF_FUEL_REMAINING: u32 = 13;
 /// (DEBUGGING.md W1).
 pub const CAP_SELF_PARALLELISM: u32 = 19;
 
+/// #2349 — the most records a spawn's or an exec's grant list may hold: a child's whole handle table.
+/// A powerbox's list is a handful of names, and a longer one could not fit the child anyway.
+pub const MAX_SPAWN_GRANTS: u64 = CAP as u64;
+
+/// #2349 — the longest name a grant record may carry. A powerbox's names are short words.
+pub const MAX_GRANT_NAME: usize = 255;
+
 /// **The §14 by-name grant list parser** — the one reader of every spawn's grant records (#1736):
 /// `grants_n` records of 16 bytes `{name_off: u32, name_len: u32, handle: i32, flags: u32}` at
 /// window-relative `grants_ptr`, each naming a window-relative UTF-8 string. `read(off, len)` is the
@@ -22532,14 +22455,19 @@ pub const CAP_SELF_PARALLELISM: u32 = 19;
 /// why), and `handle` is returned as written — tag decoding and the authority check are the caller's
 /// policy, applied to the whole list after it parses.
 ///
-/// A record or name outside the window is `MemoryFault`, a non-UTF-8 name `CapFault`. `grants_n` is
-/// untrusted, so nothing is sized from it: the list grows one record at a time and the first
-/// out-of-window record ends it.
+/// A record or name outside the window is `MemoryFault`, a non-UTF-8 name `CapFault`. `grants_n` and
+/// each `name_len` are the guest's, so both are bounded before anything is read (#2349): a list of
+/// more than [`MAX_SPAWN_GRANTS`] records, or a name longer than [`MAX_GRANT_NAME`], is malformed,
+/// `CapFault`, as a non-UTF-8 name is. Every engine's spawn and exec reads its list here, so they
+/// refuse it alike.
 pub fn read_grant_records(
     grants_ptr: u64,
     grants_n: u64,
     read: impl Fn(u64, usize) -> Result<Vec<u8>, Trap>,
 ) -> Result<Vec<(String, i32)>, Trap> {
+    if grants_n > MAX_SPAWN_GRANTS {
+        return Err(Trap::CapFault);
+    }
     let mut list = Vec::new();
     for i in 0..grants_n {
         let off = i
@@ -22550,6 +22478,9 @@ pub fn read_grant_records(
         let word = |at: usize| [rec[at], rec[at + 1], rec[at + 2], rec[at + 3]];
         let name_off = u32::from_le_bytes(word(0)) as u64;
         let name_len = u32::from_le_bytes(word(4)) as usize;
+        if name_len > MAX_GRANT_NAME {
+            return Err(Trap::CapFault);
+        }
         let handle = i32::from_le_bytes(word(8));
         let name = String::from_utf8(read(name_off, name_len)?).map_err(|_| Trap::CapFault)?;
         list.push((name, handle));
@@ -22585,7 +22516,7 @@ pub fn read_slice(window: &[u8], off: u64, len: usize) -> Result<Vec<u8>, Trap> 
 /// already the ABI's non-grant space (`-errno` results; `can_regrant` refuses every negative), so the
 /// tag lives where nothing valid can collide; the `10` top bits keep it clear of the small-magnitude
 /// `-errno` range (top bits `11`). Honored ([`Host::can_grant`]) by the tree-walker's spawn arms for
-/// op 13, op 15 and the op-17 record (v0 and v1), and by the detached spawns of the Cranelift JIT and
+/// op 13 and the op-17 record (v0 and v1), and by the detached spawns of the Cranelift JIT and
 /// the bytecode engine, whose spawner sits in a shared cell its child can call back through
 /// ([`Host::into_cell`]: a JIT root that can mint the grant runs locked,
 /// `temen_run::jit_proc::locked`, and so does every JIT child and every domain of the cooperative
@@ -23276,19 +23207,6 @@ pub enum OpParks {
 /// are half the key, so `self.schema` names are canonical). The `Host::iface_intern` element.
 type IfaceKey = (Arc<[String]>, Arc<[FuncType]>);
 
-/// Why [`Host::spawn_named_child_from_window`] refused a §14 op-13 grant list — each maps to the
-/// fail-closed trap the wasm-JIT `env.instantiate_module` servicer raises (matching the native
-/// `grant_named_child_build`: `OutOfWindow` → `MemoryFault`, `BadName`/`NotRegrantable` → `CapFault`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrantMarshalError {
-    /// A record (`grants_ptr + i*16`) or a name (`name_off..name_off+name_len`) fell outside the window.
-    OutOfWindow,
-    /// A grant name was not valid UTF-8.
-    BadName,
-    /// A record named a forged / non-re-grantable handle (`spawn_named_child` fail-closed).
-    NotRegrantable,
-}
-
 /// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
 /// capability state (captured stdio, a monotonic clock). Construct with [`Host::new`],
 /// `grant_*` the initial capabilities, then pass to [`run_with_host`]; afterwards read
@@ -23342,7 +23260,7 @@ pub struct Host {
     /// PROCESS.md S2: optional **shared** stdout/stderr sinks. `None` (default) ⇒ writes go to the
     /// local `stdout`/`stderr` Vec (the existing public API — untouched for hosts that never share).
     /// `Some` ⇒ writes go to the shared buffer instead — set on a **child** host whose stdout/stderr
-    /// was re-granted from a parent (`instantiate_granted`), so the child's output reaches the same
+    /// was re-granted from a parent (a spawn record's grant list), so the child's output reaches the same
     /// buffer the granting embedder observes (POSIX stdio inheritance). Promoted lazily by
     /// [`Host::shared_stdout`]/[`Host::shared_stderr`]; read the effective bytes via [`Host::stdout_bytes`].
     out_sink: Option<Arc<Mutex<HostBuffer>>>,
@@ -23385,14 +23303,14 @@ pub struct Host {
     /// `PageProt::Backed` already canonicalizes) and on any host with no recorder installed.
     #[allow(clippy::type_complexity)]
     region_hook: Option<Arc<dyn Fn(u64, u64, Option<(u64, u64)>) + Send + Sync>>,
-    /// Op-15 **pre-mapped region** staged into this (child) powerbox at spawn ([`Host::stage_premap`]):
+    /// A spawn record's **pre-mapped region** staged into this (child) powerbox at spawn ([`Host::stage_premap`]):
     /// `(this host's region id, window offset)`. Applied once, onto the child's freshly minted window,
     /// by [`Host::apply_premap`] — the whole region aliased read-write at the offset, exactly what the
     /// child would get by `map`ping the handle itself. `None` for every root and every child spawned
     /// without one.
     premap: Option<(u32, u64)>,
     /// #2025 — the §13 aliases a JIT thaw's window is restored with ([`Host::reset_cap_pages`]),
-    /// re-established with the op-15 pre-map by [`Host::apply_premap`] once the window exists.
+    /// re-established with the op-17 pre-map by [`Host::apply_premap`] once the window exists.
     realias: Vec<RegionAlias>,
     /// §15 / PROCESS.md §5, #1944 — the run's budget tree, whose node ids the [`Binding::Budget`]s in
     /// this table carry. A fork twin shares it, as a forked process stays in its cgroup.
@@ -23525,12 +23443,6 @@ pub struct Host {
     /// grants a child is compiled through it, so functions a previous run compiled at the same
     /// positions are reused. `None` compiles every child afresh.
     compile_memo: Option<Arc<std::sync::Mutex<bytecode::FuncMemo>>>,
-    /// The grant [`SELF_MODULE`] resolves to — [`ModuleGrant::of`] the running module, built at the
-    /// first resolve and reset by [`Host::set_self_module_opt`], its one writer. Lazily, because
-    /// every fork, spawn and exec sets the self module, and a grant copies the module's code and
-    /// hashes its encoding: tens of milliseconds for a compiler, where only a spawn of the running
-    /// program (`module = -1`) ever reads it.
-    self_grant: std::sync::OnceLock<ModuleGrant>,
     /// #2245 — the `modules` index of the running program's child image, once
     /// [`Host::grant_child_image`] granted it. The image is a pure function of the program, so the
     /// restoring powerbox grants it again and a handle to it rides a freeze
@@ -23559,6 +23471,24 @@ pub struct Host {
     frozen_handlers: BTreeMap<u32, u64>,
     /// Completion cells for served dispatches, keyed by ticket ([`Host::svc_result`] drains).
     svc_results: BTreeMap<u64, i64>,
+    /// §2.2 / #1862 — where each in-flight `page(addr)` request on this domain lands, by ticket:
+    /// filed with the request ([`Host::request_page`]), taken at its settle
+    /// ([`Host::settle_page`]) or dropped by an error reply that settles nothing. Never cut data:
+    /// a freeze holds a pager until its paged children have unwound, so no request is in flight
+    /// at the cut (#2455).
+    page_sinks: BTreeMap<u64, PageSink>,
+    /// §2.2 / #2164 — the pager edge of a demand-paged detached child's powerbox, on the bytecode
+    /// engine and the Cranelift JIT: the export, on its spawner's program, whose `page` op supplies
+    /// this domain's window, served by its spawner's domain. A recoverable fault in the window is a
+    /// request to it. (The tree-walker keeps its edge on the vCPU, [`VCpu::pager`].)
+    pager: Option<u32>,
+    /// #2164 — a demand-paged Cranelift JIT child's spawner: the cell its faults' requests go to
+    /// ([`Host::jit_pager`]). The bytecode engine finds the spawner through its task tree instead.
+    /// Taken at the child's end, which releases the pager's `svc.wait` (#1217).
+    jit_pager: Option<Arc<Mutex<Host>>>,
+    /// #2164 — a demand-paged Cranelift JIT child's window ([`JitPaging`]). It lives as long as the
+    /// powerbox, as the code that reads its access table does.
+    jit_paging: Option<JitPaging>,
     svc_next_ticket: u64,
     /// CALLS.md 4d — **direct-handoff** mode (the §10.2 arm-4 optimization). When set on the domain
     /// that becomes the root of a run, [`drive_arc`] copies it into the run-global
@@ -23641,23 +23571,14 @@ pub struct Host {
     /// [`Host::restore_durable_handles`] on this domain's own buffer until the relaunch aliases each
     /// to the spawner's cell ([`Host::prepare_detached_relaunch`]).
     pending_inherited: Vec<(u32, StreamRole)>,
-    /// The §12 bounded blocking-offload pool, created lazily on the first batched `submit` that has a
-    /// blocking SQE (so a `Host` that never offloads spawns no threads). Dropping it joins the
-    /// workers ([`OffloadPool`]'s `Drop`).
+    /// The §12 offload pool, created lazily on the first punted call ([`Host::punt_or_inline`]), so
+    /// a `Host` that never offloads spawns no threads. Dropping it waits for no worker (#2493).
     pool: Option<OffloadPool>,
     /// §12 parking-on-blocking — the completion store behind `Pending` dispatches
     /// ([`Completions`]): pool workers post punted jobs' results here; the eval loop waits
     /// without the host lock. Shared out by [`Host::completions`] before the wait. Untouched
     /// (nothing minted) unless an offloadable handler punts on the parking-aware face.
     completions: Arc<Completions>,
-    /// §12 parking-on-blocking (slice 2) — the **completion wake** hook: a pool worker calls this
-    /// after posting a punted job's result, so the run's scheduler can drain
-    /// `completion_waiters` (deliver to parked vCPUs in submission order). Installed per run by
-    /// the executor that owns the wake mechanism (`drive_over_cell` wires it to
-    /// `Scheduler::completion_drain`), cleared at run teardown (it captures the `Arc<Scheduler>`
-    /// — same reference-cycle discipline as `async_notify`); `None` ⇒ parked callers don't exist
-    /// (every waiter is a blocking `Completions::wait`), so no wake is needed.
-    completion_notify: Option<Arc<dyn Fn() + Send + Sync>>,
     /// #796 L2 async signals — a **cheap per-op armed flag** the running vCPU polls (like `kill`): a
     /// [`SignalSource`] sets it when a caught, unmasked signal becomes pending. A relaxed atomic load per
     /// op when a source is installed, and free (no source ⇒ never consulted) otherwise.
@@ -23687,6 +23608,10 @@ pub struct Host {
     /// #972 — hooks the exec image-replace fires with the pipe-end handle remap (see
     /// [`ForkedProc::exec_remap`]); carried across exec like `exit_hooks` (same process).
     exec_remap_hooks: Vec<ExecRemapHook>,
+    /// #2373 — what the providers registered for this domain as its powerbox was built (a fork
+    /// twin's factories, a spawned child's re-grants, [`ForkedProc::abandon`]): the fork or spawn
+    /// that refuses the domain before it runs undoes them ([`Host::abandon`]).
+    abandon_hooks: Vec<Box<dyn FnOnce() + Send>>,
     /// #798 slice 2 — the domain's **job-control stop depth**: raised (+1) by the personality's stop
     /// closure and lowered (−1) by its continue ([`SignalSource::set_stop`]); every vCPU of the
     /// domain polls it per op (beside `poll_kill`, free-when-clear) and parks [`Blocked::Stopped`]
@@ -23734,6 +23659,11 @@ pub struct Host {
     /// (`temen_run` owns the encoding); absent ⇒ region default. Reset when a new window base appears;
     /// filed under [`UNCLAIMED_BASE`] while seeded for a window not built yet ([`Host::reset_cap_pages`]).
     cap_pages: Option<(usize, CapPageMap)>,
+    /// #2426 — the shadow arena the module in that window declared, given as the window starts
+    /// ([`Host::start_window_pages`]): it fences the window's runtime-private pages against the
+    /// guest's page ops ([`ShadowArena::fences`]), as the interpreters' `Mem` fences its own.
+    /// [`ShadowArena::EMPTY`], fencing nothing, for a window no engine started so.
+    cap_shadow: ShadowArena,
     /// Guest-driven `Jit` unit tables (iface 11), indexed by the id a [`Binding::JitTable`] carries.
     /// Append-only for the life of the `Host` (units are never removed — `release` only revokes
     /// the *handle*; code reclaim is a DESIGN.md §22 follow-up), so unit `Arc`s and native pointers stay
@@ -23831,8 +23761,6 @@ pub struct Host {
     /// (the root's re-executed `thread.spawn` re-attaches these, in spawn order, under `REWINDING`).
     /// Empty for a single-vCPU or ordinary run.
     frozen_vcpus: Vec<FrozenVCpu>,
-    /// §14 nested-child residue of a subtree freeze (DURABILITY.md §4) — see [`FrozenNested`].
-    frozen_nested: Vec<FrozenNested>,
     /// #1361 step 2 — completed-but-unjoined **detached** §14 child residue of a subtree freeze:
     /// **out** of a freeze (a finished detached child records its join result here instead of being
     /// refused) and **in** to a thaw (the seeding posts each result and rebuilds the join edge).
@@ -23851,18 +23779,8 @@ pub struct Host {
     thawed_detached: Vec<ThawedDetached>,
     /// #1671 — the last freeze this run declined, if any (see [`FreezeDeclined`]).
     freeze_declined: Option<FreezeDeclined>,
-    /// §13.4 slice 4c — per-child **host state** residue of a subtree freeze: a serving (or
-    /// cap-holding) nested child's serve trio + durable handle table, keyed by the same
-    /// `(parent_task, slot)` as its [`FrozenNested`] record (pushed by the child's own
-    /// self-unwind into the subtree's shared sink; the codec merges it into the child's
-    /// nested record). Empty for plain children, so plain-subtree artifacts are unchanged.
-    frozen_child_state: Vec<FrozenChildState>,
-    /// #1680 — the pipes a subtree freeze's nested children hold, by global id, pushed into the
-    /// shared sink by each child's self-unwind beside its [`FrozenChildState`]. Their bytes are read
-    /// at capture ([`Host::capture_durable_pipes`]), once every vCPU has quiesced.
-    frozen_pipes: BTreeMap<u32, PipeBacking>,
     /// #1680 — the pipes a restore rebuilt ([`Host::restore_durable_pipes`]), by their new global id,
-    /// for [`Host::restore_durable_handles`] to re-open ends on. A thawed nested child is handed a copy.
+    /// for [`Host::restore_durable_handles`] to re-open ends on.
     thaw_pipes: BTreeMap<u32, PipeBacking>,
     /// #1859 — the names [`Host::restore_durable_named`] rebuilt `host_procs` under, by index, for
     /// [`Host::restore_durable_handles`] to register at each re-pinned `Named { idx }` handle.
@@ -23936,9 +23854,8 @@ impl BoundImport {
 
     /// An **unbound `required`** entry (#1234): the slot is declared but nothing is bound, so
     /// `call.import` through it is a fail-closed `CapFault` *and* `import.attach` may not retarget
-    /// it (unlike an empty `rebindable` slot). What a same-module §14 child gets for an import it
-    /// inherited from its parent's manifest and was granted nothing for — see
-    /// [`Host::bind_same_module_manifest`].
+    /// it (unlike an empty `rebindable` slot). What a §14 child gets for a `required` import its
+    /// parent left empty on purpose with a `VM_EMPTY` grant (#2219).
     pub fn withheld() -> BoundImport {
         BoundImport {
             type_id: 0,
@@ -24112,11 +24029,11 @@ pub fn jit_validate(
 /// run-in-guest). Unlike [`jit_blob_validator`] (which compiles a unit into the caller's own domain,
 /// so the unit's data can only go where the guest's symbol table places it, and its memory is the
 /// parent window), this promotes a **whole, self-contained module** — its own memory declaration,
-/// data segments, and `_start` are exactly what the `Instantiator`'s module ops want (the child
-/// runs it confined to a carve, data materialized into that carve). So the gate is just
-/// `decode_module` (untrusted-input-facing, fail-closed) → `verify_module` (the escape-freedom
-/// floor — the same trusted verifier a host-granted module passed); the carve/memory sizing is
-/// enforced later, at the op-13 spawn (`cm.memory_log2 <= size_log2`). All failures are `-EINVAL`
+/// data segments, and `_start` are exactly what a spawn wants (the child runs it in a fresh window
+/// of its own, its data materialized there). So the gate is just `decode_module`
+/// (untrusted-input-facing, fail-closed) → `verify_module` (the escape-freedom floor — the same
+/// trusted verifier a host-granted module passed); the window sizing is enforced later, at the
+/// spawn. All failures are `-EINVAL`
 /// (guest-visible, non-fatal; nothing minted).
 pub fn module_blob_validator(bytes: &[u8]) -> Result<Module, i64> {
     let m = temen_encode::decode_module(bytes).map_err(|_| EINVAL)?;
@@ -24182,12 +24099,6 @@ struct JitUnit {
     /// interpreter. The bytes are opaque here: the core stores and returns them, never decoding or
     /// executing them.
     wasm: Option<Arc<[u8]>>,
-    /// What a detached self-spawn from this unit runs (#2143): the grant `module = -1` names in a
-    /// frame of the unit ([`Host::resolve_spawn_module`]), its program as a module
-    /// ([`jit_unit_module`]). Built at the first such spawn, because a grant hashes the module. Never
-    /// durable: the module declares no shadow arena, so a durable domain refuses the spawn, as it
-    /// refuses its root program's `-1`.
-    grant: std::sync::OnceLock<ModuleGrant>,
 }
 
 /// Where a [`JitTableState`]'s memory-match precondition comes from.
@@ -24198,9 +24109,7 @@ enum JitMem {
     /// Read off [`Host::self_module`] at use: a table minted into a §14 child by re-grant
     /// ([`Host::regrant_into_child`]) exists before the child's module is bound, and a unit must
     /// match the module it joins — the child's, not the granting parent's. The payload is the
-    /// **granting parent's** resolved precondition, the answer when no module is bound (a
-    /// same-module child of a root the embedder never `set_self_module`d runs the parent's program,
-    /// so the parent's declared memory is the child's).
+    /// **granting parent's** resolved precondition, the answer when no module is bound.
     SelfModule(Option<u8>),
 }
 
@@ -24241,10 +24150,9 @@ const JIT_DEFAULT_MAX_UNITS: u32 = 4096;
 const JIT_DEFAULT_MAX_BLOB_BYTES: u64 = 1 << 26; // 64 MiB of cumulative submitted IR
 
 /// One §14 module grant: the verified module — its functions, declared window size, data segments, what
-/// spawning a child domain of it needs — and its first-class export table, so a parent can resolve a
-/// child entry **by name** (`Module` op 0, F2) instead of hardcoding its funcidx. It holds the module
-/// once (#1883): the engines compile and spawn from `module`, and only the tree-walker, which runs
-/// from shared slices, makes its own ([`ModuleGrant::tables`]).
+/// spawning a child domain of it needs. It holds the module once (#1883): the engines compile and
+/// spawn from `module`, and only the tree-walker, which runs from shared slices, makes its own
+/// ([`ModuleGrant::tables`]).
 /// `Clone` so a module can be **re-granted into a child** (FORK.md §8.6 — its fields are `Arc`s, so
 /// the copy is cheap): a parent hands a command module to a nested guest to `execve`.
 #[derive(Clone)]
@@ -24259,10 +24167,10 @@ struct ModuleGrant {
     /// verification). A durable domain refuses to instantiate a grant without this bit, so its
     /// nesting subtree stays snapshottable as a unit.
     durable: bool,
-    /// Content digest of the granted module's semantic image (§4 separate-module nesting): a §14
-    /// **separate-module** child records this in its `FrozenNested` residue so a thaw can resolve it
-    /// against the restore host's re-granted modules (host-supplied at restore, D-scope — the module
-    /// bytes never ride the artifact). Computed by [`module_digest`], shared with the codec's R5 gate.
+    /// Content digest of the granted module's semantic image: what a durable `Module` handle and a
+    /// detached child's launch record carry, so a thaw resolves them against the restore host's
+    /// re-granted modules (host-supplied at restore, D-scope — the module bytes never ride the
+    /// artifact). Computed by [`module_digest`], shared with the codec's R5 gate.
     digest: [u8; 32],
     /// The module's function table and type section as the shared slices the tree-walker runs a
     /// vCPU from ([`Self::tables`]): made the first time it is asked for, and shared by every copy of
@@ -24343,10 +24251,10 @@ pub fn module_digest(m: &Module) -> [u8; 32] {
 }
 
 /// A compiled §22 unit's program as a module: its already-instrumented+verified funcs and type
-/// section, with the domain's declared `memory` — what its snapshot encodes ([`encode_jit_unit`]) and
-/// what a detached self-spawn from it runs (#2143). The resolved funcs are self-contained
-/// (`call.dyn`/`call.cap` carry inline signatures, imports are already linked away), so no
-/// import/export section is needed. Debug info is dropped (untrusted, backend-ignored).
+/// section, with the domain's declared `memory` — what its snapshot encodes ([`encode_jit_unit`]).
+/// The resolved funcs are self-contained (`call.dyn`/`call.cap` carry inline signatures, imports are
+/// already linked away), so no import/export section is needed. Debug info is dropped (untrusted,
+/// backend-ignored).
 fn jit_unit_module(funcs: &[Func], types: &[temen_ir::TypeEntry], mem_log2: Option<u8>) -> Module {
     Module {
         funcs: funcs.to_vec(),
@@ -24374,12 +24282,6 @@ impl Default for Host {
         Host::new()
     }
 }
-
-/// The spawn-record `module` selector meaning **this module** — a §14 child that runs the parent's
-/// own program rather than a granted separate `Module` (CONSOLIDATION.md §3d, [`temen_ir::SpawnRec`]).
-/// A spawn's module operand takes it ([`Host::spawn_module`]), so a same-module child is named the
-/// way a separate-module child is, and binds the running module's manifest (#1234).
-pub const SELF_MODULE: i32 = -1;
 
 impl Host {
     pub fn new() -> Host {
@@ -24439,12 +24341,15 @@ impl Host {
             import_reqs: Vec::new(),
             self_module: None,
             compile_memo: None,
-            self_grant: std::sync::OnceLock::new(),
             child_image: None,
             self_instance: None,
             self_reified: BTreeMap::new(),
             svc_queue: VecDeque::new(),
             svc_results: BTreeMap::new(),
+            page_sinks: BTreeMap::new(),
+            pager: None,
+            jit_pager: None,
+            jit_paging: None,
             reply_waits: BTreeMap::new(),
             frozen_handlers: BTreeMap::new(),
             svc_next_ticket: 0,
@@ -24464,12 +24369,12 @@ impl Host {
             pending_inherited: Vec::new(),
             pool: None,
             completions: Arc::new(Completions::new()),
-            completion_notify: None,
             sig_armed: Arc::new(AtomicBool::new(false)),
             multi_door: AtomicBool::new(false),
             sig_source: None,
             exit_hooks: Vec::new(),
             exec_remap_hooks: Vec::new(),
+            abandon_hooks: Vec::new(),
             stop_depth: Arc::new(AtomicI64::new(0)),
             term_flag: Arc::new(AtomicBool::new(false)),
             park_request: Arc::new(AtomicU64::new(0)),
@@ -24477,6 +24382,7 @@ impl Host {
             thread_platform: bytecode::ThreadPlatform::OS,
             exec_replace: None,
             cap_pages: None,
+            cap_shadow: ShadowArena::EMPTY,
             jit_tables: Vec::new(),
             jit_validator: None,
             module_validator: None,
@@ -24494,14 +24400,11 @@ impl Host {
             durable: false,
             frozen_fibers: Vec::new(),
             frozen_vcpus: Vec::new(),
-            frozen_nested: Vec::new(),
             frozen_detached: Vec::new(),
             pending_detached: Vec::new(),
             captured_detached: Vec::new(),
             thawed_detached: Vec::new(),
             freeze_declined: None,
-            frozen_child_state: Vec::new(),
-            frozen_pipes: BTreeMap::new(),
             thaw_pipes: BTreeMap::new(),
             thaw_names: Vec::new(),
             frozen_root_sp: None,
@@ -24550,13 +24453,13 @@ impl Host {
     /// powerbox cannot be duplicated.
     ///
     /// #2305 — and the address space its window reserves, held against the process's pool
-    /// ([`RESERVED_POOL`]). A fork copies this domain's window and a spawn builds one of its geometry,
+    /// ([`reserved_pool`]). A fork copies this domain's window and a spawn builds one of its geometry,
     /// so it reserves what this domain's does: [`Self::reserved`], or for a detached child, whose
     /// lease holds its own, the default mask domain raised to its size ([`Lease::reserved`]).
     fn process_powerbox(&self, pid: u64, window: u64, grown: u64, runs: u64) -> Option<Host> {
         let maps = runs.saturating_sub(WINDOW_RUNS);
         let reserved = match self.reserved {
-            0 => reservation(window, DEFAULT_RESERVED_LOG2),
+            0 => reservation(window, default_reserved_log2()),
             own => own,
         };
         let cost = [
@@ -24596,8 +24499,10 @@ impl Host {
         //   * In-flight run state, not a capability — cloning it into a *second* live domain would
         //     double-drive it, so fork refuses even though a snapshot (which resumes the SAME domain,
         //     not a duplicate) serializes some of it: the serve queue/results (a twin re-serving the
-        //     same dispatches would double-execute — snapshot carries them to resume one domain), the
-        //     offload pool, §13.4 replay recording, and freeze residue (a freeze in progress).
+        //     same dispatches would double-execute — snapshot carries them to resume one domain),
+        //     §13.4 replay recording, and freeze residue (a freeze in progress). Not the offload
+        //     pool (#2424): its jobs are punted calls, which never touch the window and answer into
+        //     this domain's own store, so the twin, with a fresh store and pool, shares none of them.
         //   * `self_instance` is the run's own §3.5 reflection surface, re-registered by the embedder.
         // Fork is MORE capable than snapshot for: forkable host procs (a provider fork factory carries
         // them; snapshot cannot), and — carried in the twin below, not gated — shared regions, module
@@ -24611,20 +24516,16 @@ impl Host {
             && self.svc_queue.is_empty()
             && self.svc_results.is_empty()
             && self.self_instance.is_none()
-            && self.pool.is_none()
-            // `completion_notify` is deliberately NOT gated (#799): it is per-run executor
-            // wiring (the §12 completion-wake hook, installed on every root host at run start),
-            // not a capability — a root-domain personality `fork` must not fail on it. The twin
-            // starts unwired (`Host::new`), so its offloadable ops degrade to inline — the
-            // decline-never-diverge default every twin already had.
+            // The §12 completion store is deliberately NOT gated (#799): its wake hook is per-run
+            // executor wiring, not a capability — a root-domain personality `fork` must not fail
+            // on it. The twin gets a fresh store (`Host::new`); its first park wires it to the
+            // scheduler running the twin (#2424).
             && self.cap_record.is_none()
             && self.cap_replay.is_none()
             && self.cap_pages.is_none()
             && self.frozen_fibers.is_empty()
             && self.frozen_vcpus.is_empty()
-            && self.frozen_nested.is_empty()
-            && self.frozen_detached.is_empty()
-            && self.frozen_child_state.is_empty();
+            && self.frozen_detached.is_empty();
         // #1648 — a powerbox whose providers disagree about who owns the domain's signal door was
         // refused once already; refuse now, before any factory runs, so exactly one attempt ever
         // reaches them (see [`Host::multi_door`]).
@@ -24659,7 +24560,6 @@ impl Host {
                         install_code: 0,
                         install_type_id: u.install_type_id,
                         wasm: u.wasm.clone(),
-                        grant: u.grant.clone(),
                     })
                     .collect(),
                 native_ctx: 0,
@@ -24712,13 +24612,19 @@ impl Host {
         twin.host_procs = Vec::with_capacity(self.host_procs.len());
         for e in self.host_procs.iter() {
             let factory = e.fork.as_ref().unwrap();
-            let forked = factory(twin_pid);
+            // #2373, #2428 — a provider with no room for the twin's copy of its state refuses it.
+            let Some(forked) = factory(twin_pid) else {
+                twin.abandon();
+                return None;
+            };
+            twin.abandon_hooks.extend(forked.abandon);
             if let Some(door) = forked.signal {
                 if twin_sig.is_some() {
                     // Latch it: this powerbox cannot be forked faithfully, and every later attempt
                     // now refuses before any factory runs (see [`Host::multi_door`]). The caller
                     // sees the same probeable `-EAGAIN` every other unforkable powerbox gives.
                     self.multi_door.store(true, Ordering::SeqCst);
+                    twin.abandon();
                     return None;
                 }
                 twin_sig = Some(door);
@@ -24730,7 +24636,7 @@ impl Host {
                 twin_exec_remap.push(x);
             }
             twin.host_procs.push(HostProcEntry {
-                handler: ProcHandler::Sync(forked.handler),
+                handler: forked.handler,
                 fork: Some(forked.refork.unwrap_or_else(|| Arc::clone(factory))),
                 mints: e.mints,
                 // #801 — the vtable rides the fork: a twin can exec a `__px_`-linked
@@ -24827,33 +24733,15 @@ impl Host {
     ///
     /// Shared by the interpreter's inline spawn and the JIT's child builders (differential
     /// lockstep), and by `execve`'s image-replace ([`Host::exec_carry`]) — see there for why an exec
-    /// binds this strictly. [`Host::bind_same_module_manifest`] is the same walk with step 3
-    /// softened, for a child running the parent's own program.
+    /// binds this strictly. Every child binds strictly: it runs a granted module, whose manifest
+    /// states its own needs (#2219), and a parent that means to leave an import empty says so with
+    /// a `VM_EMPTY` grant.
     pub fn bind_child_manifest(
         &mut self,
         imports: &[temen_ir::Import],
         tsec: &[temen_ir::TypeEntry],
     ) -> Result<(), u32> {
-        self.bind_manifest(imports, tsec, false)
-    }
-
-    /// #1234 — [`Host::bind_child_manifest`] for a §14 **same-module** child: the identical walk,
-    /// except that a `required` slot with nothing to bind is left **empty** (fail-closed at use,
-    /// and not attachable) instead of refusing the spawn.
-    ///
-    /// The difference is whose manifest it is. A separate-module child's manifest describes *that
-    /// child's* own needs, so an unmet `required` import is a real instantiation failure and §3.3
-    /// says withhold. A same-module child runs the **parent's** program, so its manifest is the
-    /// parent's entire import surface — it never declared those needs, and a parent that re-grants
-    /// two of its seven capabilities would otherwise be unable to nest at all. The authority story
-    /// is unchanged either way: an empty slot `CapFault`s on use, so a child still reaches exactly
-    /// what it was granted.
-    pub fn bind_same_module_manifest(
-        &mut self,
-        imports: &[temen_ir::Import],
-        tsec: &[temen_ir::TypeEntry],
-    ) -> Result<(), u32> {
-        self.bind_manifest(imports, tsec, true)
+        self.bind_manifest(imports, tsec)
     }
 
     /// [`Self::bind_manifest_slots`], and on a refusal, a note naming the import nothing satisfied
@@ -24862,9 +24750,8 @@ impl Host {
         &mut self,
         imports: &[temen_ir::Import],
         tsec: &[temen_ir::TypeEntry],
-        lenient: bool,
     ) -> Result<(), u32> {
-        let bound = self.bind_manifest_slots(imports, tsec, lenient);
+        let bound = self.bind_manifest_slots(imports, tsec);
         if let Err(i) = bound {
             if let Some(im) = imports.get(i as usize) {
                 self.note(format!(
@@ -24881,7 +24768,6 @@ impl Host {
         &mut self,
         imports: &[temen_ir::Import],
         tsec: &[temen_ir::TypeEntry],
-        lenient: bool,
     ) -> Result<(), u32> {
         if imports.is_empty() {
             return Ok(());
@@ -24979,12 +24865,9 @@ impl Host {
         let mut remaps: Vec<Option<Arc<[u32]>>> = Vec::with_capacity(imports.len());
         let mut reqs: Vec<(Vec<String>, Vec<FuncType>)> = Vec::with_capacity(imports.len());
         for (i, im) in imports.iter().enumerate() {
+            // An unmet `rebindable` slot is left empty rather than refusing the spawn: it is declared
+            // empty-able.
             let rebindable = im.mode == temen_ir::ImportMode::Rebindable;
-            // Whether an unmet slot may be left empty rather than refusing the spawn: a
-            // `rebindable` one always may (it is declared empty-able), and every one may for a
-            // same-module child (see `bind_same_module_manifest`). The *entry* still records the
-            // declared mode, so a lenient-empty `required` slot stays un-attachable.
-            let soft = rebindable || lenient;
             let unmet = || {
                 if rebindable {
                     BoundImport::rebindable(0, 0, None)
@@ -25013,7 +24896,7 @@ impl Host {
                             remaps.push(Some(remap));
                             continue;
                         }
-                        None if soft => {
+                        None if rebindable => {
                             bindings.push(unmet());
                             remaps.push(None);
                             continue;
@@ -25044,7 +24927,7 @@ impl Host {
                             }
                             None => return Err(i as u32),
                         },
-                        None if soft => {
+                        None if rebindable => {
                             bindings.push(unmet());
                             remaps.push(None);
                             continue;
@@ -25069,7 +24952,7 @@ impl Host {
                             remaps.push(Some(remap));
                             continue;
                         }
-                        None if soft => {
+                        None if rebindable => {
                             bindings.push(unmet());
                             remaps.push(None);
                             continue;
@@ -25123,7 +25006,7 @@ impl Host {
                 }
                 // #2219: nothing binds it, and the parent emptied it on purpose — an empty grant
                 // fills only an import no grant reached, so a concrete one beats it.
-                None if soft || self.emptied(&im.name) => {
+                None if rebindable || self.emptied(&im.name) => {
                     bindings.push(unmet());
                     remaps.push(None);
                 }
@@ -25554,6 +25437,11 @@ impl Host {
         self.durable
     }
 
+    /// Whether this host records its cap tape ([`record_caps`](Host::record_caps)).
+    pub fn records_caps(&self) -> bool {
+        self.cap_record.is_some()
+    }
+
     /// The fibers the freeze driver flattened on the last freeze run (slice 3.1.5) — the host-side
     /// residue a snapshot records (their continuations are in the captured window). Empty otherwise.
     pub fn frozen_fibers(&self) -> &[FrozenFiber] {
@@ -25581,28 +25469,12 @@ impl Host {
         self.frozen_vcpus = frozen;
     }
 
-    /// The §14 nested children a subtree freeze flattened on the last freeze run (DURABILITY.md §4
-    /// — each child's continuation is in its own carve inside the captured window; this is the
-    /// re-attach residue). Empty unless a live nested child was frozen. **Not yet carried by the
-    /// snapshot codec** — `temen-snapshot::freeze` refuses while this is non-empty.
-    pub fn frozen_nested(&self) -> &[FrozenNested] {
-        &self.frozen_nested
-    }
-
-    /// Seed the §14 nested children a **thaw** must re-attach, alongside the restored window and
-    /// [`Host::set_durable`] (the in-memory counterpart of [`Host::set_frozen_vcpus`]).
-    pub fn set_frozen_nested(&mut self, frozen: Vec<FrozenNested>) {
-        self.frozen_nested = frozen;
-    }
-
     /// #1361 step 2 — the completed detached children a freeze captured (see [`FrozenDetached`]),
     /// read by the codec's control-section encoder.
     pub fn frozen_detached(&self) -> &[FrozenDetached] {
         &self.frozen_detached
     }
 
-    /// Seed the completed detached children a **thaw** must deliver, alongside the restored window
-    /// (the in-memory counterpart of [`Host::set_frozen_nested`]).
     /// #1361 step 3 — the **live** detached children this run's freeze captured, each with its own
     /// unwound window and powerbox (see [`CapturedDetached`]). The codec freezes each as its own
     /// root-shaped artifact and embeds it in the parent's.
@@ -25631,6 +25503,7 @@ impl Host {
         self.pending_detached = unreached;
     }
 
+    /// Seed the completed detached children a **thaw** must deliver, alongside the restored window.
     pub fn set_frozen_detached(&mut self, frozen: Vec<FrozenDetached>) {
         self.frozen_detached = frozen;
     }
@@ -25683,10 +25556,10 @@ impl Host {
     /// #1361 step 4 — prepare a thawed detached child's re-launch, the one preparation both engines use:
     /// resolve its program by digest among this (spawner's) powerbox's durable grants, and re-apply to
     /// its restored powerbox what the spawner decided — durability, its lane cap, its program
-    /// as self module, its grant names, the stdio it inherited (#2054), and its import bindings
-    /// (leniently for a same-module child, #1234). `None` if the grant is gone, it declares no memory,
-    /// or its imports no longer bind. `window` is its restored window's page map: what it had grown
-    /// past its declared size stays charged, as the artifact carries it (#1909).
+    /// as self module, its grant names, the stdio it inherited (#2054), and its import bindings.
+    /// `None` if the grant is gone, it declares no memory, or its imports no longer bind. `window` is
+    /// its restored window's page map: what it had grown past its declared size stays charged, as the
+    /// artifact carries it (#1909).
     pub fn prepare_detached_relaunch(
         &mut self,
         launch: &DetachedLaunch,
@@ -25712,12 +25585,8 @@ impl Host {
             host.own_budget = node;
             host.grown = window.grown_bytes();
         }
-        let bound = if launch.same_module {
-            host.bind_same_module_manifest(&g.module.imports, &g.module.types)
-        } else {
-            host.bind_child_manifest(&g.module.imports, &g.module.types)
-        };
-        bound.ok()?;
+        host.bind_child_manifest(&g.module.imports, &g.module.types)
+            .ok()?;
         let (funcs, types) = g.tables();
         Some(DetachedRelaunch {
             funcs,
@@ -25729,14 +25598,9 @@ impl Host {
         })
     }
 
-    /// The `Module` a spawn's module operand names, if live: a granted module, or for
-    /// [`SELF_MODULE`] the spawning frame's program — this domain's own, or the installed unit `unit`
-    /// ([`Self::resolve_spawn_module`]).
-    pub fn spawn_module(&self, handle: i32, unit: Option<(u32, u32)>) -> Option<Arc<Module>> {
-        if handle == SELF_MODULE && unit.is_none() {
-            return self.self_module.clone(); // without building its grant (`Host::self_grant`)
-        }
-        self.resolve_spawn_module(handle, unit)
+    /// The `Module` a spawn's module operand names, if it is a live `Module` grant.
+    pub fn spawn_module(&self, handle: i32) -> Option<Arc<Module>> {
+        self.resolve_module(handle)
             .ok()
             .map(|g| Arc::clone(&g.module))
     }
@@ -25803,18 +25667,6 @@ impl Host {
     /// Take the live detached children seeded for the next thaw (see [`Host::set_thawed_detached`]).
     pub fn take_thawed_detached(&mut self) -> Vec<ThawedDetached> {
         std::mem::take(&mut self.thawed_detached)
-    }
-
-    /// §13.4 slice 4c — the per-child host-state residue of the last subtree freeze (serve trio +
-    /// durable handles of serving / cap-holding nested children), keyed by `(parent_task, slot)`.
-    pub fn frozen_child_state(&self) -> &[FrozenChildState] {
-        &self.frozen_child_state
-    }
-
-    /// Seed the per-child host state a **thaw** must re-establish on the re-created children
-    /// (alongside [`Host::set_frozen_nested`]).
-    pub fn set_frozen_child_state(&mut self, state: Vec<FrozenChildState>) {
-        self.frozen_child_state = state;
     }
 
     /// The root vCPU's flattened shadow-SP extent from the last multi-vCPU freeze (slice 3.2.1), or
@@ -26164,7 +26016,7 @@ impl Host {
     /// takes none and can only find them this way. The one place every tier's child builders mint them.
     /// Registered first, so they own those names.
     pub fn grant_starter_caps(&mut self, size: u64) -> (i32, i32) {
-        let inst = self.grant_instantiator(0, size);
+        let inst = self.grant_instantiator();
         let space = self.grant_address_space(0, size);
         self.register_cap_name("instantiator", inst);
         self.register_cap_name("addrspace", space);
@@ -26226,19 +26078,29 @@ impl Host {
             _ => {
                 let m = Arc::new(Mutex::new(BTreeMap::new()));
                 self.cap_pages = Some((base, Arc::clone(&m)));
+                self.cap_shadow = ShadowArena::EMPTY;
                 m
             }
         }
     }
 
+    /// #2426 — the shadow arena of the window [`Host::cap_window_pages`] last named
+    /// ([`Host::cap_shadow`]).
+    pub fn cap_window_shadow(&self) -> ShadowArena {
+        self.cap_shadow
+    }
+
     /// #2268 — the page map of JIT window `base` as the window starts, before its guest runs: what
     /// [`Host::reset_cap_pages`] staged for it (a thaw's), else a fresh one, never an earlier window's,
     /// whose address this one may reuse. Its first `call.cap` finds it ([`Host::cap_window_pages`]).
-    pub fn start_window_pages(&mut self, base: usize) -> CapPageMap {
+    /// #2426 — with the shadow arena its module declared, which fences its runtime-private pages.
+    pub fn start_window_pages(&mut self, base: usize, shadow: ShadowArena) -> CapPageMap {
         if !matches!(self.cap_pages, Some((UNCLAIMED_BASE, _))) {
             self.cap_pages = None;
         }
-        self.cap_window_pages(base)
+        let pages = self.cap_window_pages(base);
+        self.cap_shadow = shadow;
+        pages
     }
 
     /// Start the JIT window page map (see [`Host::cap_window_pages`]) of a run about to build a fresh
@@ -26260,124 +26122,90 @@ impl Host {
             })
             .collect();
         self.cap_pages = (!pages.is_empty()).then(|| (UNCLAIMED_BASE, Arc::new(Mutex::new(pages))));
-        self.realias = region_aliases(
-            map.page,
-            map.prot.iter().filter_map(|(&p, prot)| match *prot {
-                PageProt::Backed {
-                    region,
-                    region_off,
-                    writable,
-                } => Some((p, region, region_off, writable)),
-                _ => None,
-            }),
-        );
+        self.realias = map.aliases();
     }
 
-    /// #1810 — how far the guest grew JIT window `base` through the Memory capability: one past the
-    /// highest page in its `cap_pages` (whatever that page's state, as the interpreter's own map
-    /// counts it), or `0` when it grew none.
-    pub fn cap_high_water(&self, base: usize) -> u64 {
+    /// #2427 — the pages past `mapped` (the declared window) that JIT window `base` holds with contents
+    /// of its own through the Memory capability — committed, or protected to nothing with its contents
+    /// kept (#1909) — the byte offset of each, ascending, in host pages. What a durable capture reads
+    /// of the window past its prefix ([`Host::capture_window_layout`]), however far apart the pages
+    /// lie.
+    pub fn cap_held_tail(&self, base: usize, mapped: u64) -> Vec<u64> {
+        use temen_ir::PageState as ps;
+        let page = host_page_size();
         match &self.cap_pages {
             Some((b, m)) if *b == base || *b == UNCLAIMED_BASE => m
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .keys()
-                .next_back()
-                .map_or(0, |&p| (p + 1) * host_page_size()),
-            _ => 0,
+                .range(mapped.div_ceil(page)..)
+                .filter(|(_, s)| matches!(s, ps::Rw | ps::Ro | ps::Unmapped))
+                .map(|(&p, _)| p * page)
+                .collect(),
+            _ => Vec::new(),
         }
     }
 
-    /// Capture the window's per-page protections for a durable freeze of a **JIT** run
-    /// (DURABILITY.md §12.3). The JIT keeps protections in the OS page tables, so — unlike the
-    /// interpreter, where [`run_capture_reserved_with_host_prots`] reads its software map — a
-    /// freeze reconstructs them here from the two host-side sources, mirroring the interpreter's
-    /// `snapshot_prots` so the backends agree page-for-page:
+    /// Capture a **JIT** window for a durable freeze (DURABILITY.md §12.3): `bytes`, its prefix, and
+    /// `tail`, each page past it the window holds ([`Host::cap_held_tail`]) whose bytes are not all
+    /// zero, under the window's page map. The JIT keeps protections in the OS page tables, so the map
+    /// is the one the host keeps beside them (`cap_pages`), which matches the interpreter's own page
+    /// for page: the read-only pages the window started with (#2268: its data segments' as a fresh
+    /// window lays them, or a thaw's artifact's), then every `map`/`unmap`/`protect` and §13 alias
+    /// (#2025) since. A `readonly` segment's page the guest made writable has no entry, as in the
+    /// interpreter's map (#2307). The NULL guard, which no page op can change, is outside it and
+    /// added here (`Unmapped`).
     ///
-    /// * the module's `readonly` data segments → `Ro` (applied to the window at instantiation but
-    ///   not recorded in `cap_pages`), and
-    /// * the runtime page-state map the Memory cap maintained (`cap_pages`: `map`/`unmap`/`protect`)
-    ///   — which **overrides** the segment/default for any page the guest changed.
-    ///
-    /// One [`CapturedProt`] per [`DURABLE_SNAPSHOT_PAGE`]-byte page over `npages`; `mapped` is the
-    /// backed-prefix byte length (pages beyond it default `Unmapped`). A `Backed` (§13) page can't
-    /// arise here — a domain holding a shared region isn't freezable (its handle is non-durable).
-    pub fn capture_window_prots(
+    /// `mapped` is the declared window's length; past it, a page in neither is one the window does not
+    /// hold (#2427).
+    pub fn capture_window_layout(
         &self,
-        data: &[Data],
         mapped: u64,
-        npages: usize,
         null_guard: u64,
-    ) -> Vec<CapturedProt> {
-        // Default: Rw in the backed prefix, Unmapped in the reserved tail.
-        let mut out: Vec<CapturedProt> = (0..npages as u64)
-            .map(|p| {
-                if p * DURABLE_SNAPSHOT_PAGE < mapped {
-                    CapturedProt::Rw
-                } else {
-                    CapturedProt::Unmapped
-                }
-            })
-            .collect();
-        let host = host_page_size();
+        bytes: Vec<u8>,
+        tail: Vec<(u64, Vec<u8>)>,
+    ) -> MemLayout {
+        let page = host_page_size();
+        let mut prot = BTreeMap::new();
         // #1094: the NULL guard seeds `[0, null_guard)` `Unmapped` at window construction
-        // (`seed_null_guard`) — outside `cap_pages`, so reconstruct it here (mirroring the same
+        // (`seed_null_guard`) — outside `cap_pages`, so reconstruct it here (with the same
         // host-page-alignment / `guard <= mapped` gate) or this capture would report the guard pages
-        // `Rw` and diverge from the interpreter's `snapshot_prots` (and un-seed the guard on thaw).
-        // Runtime `map`/`protect` below still overrides, matching the live seed→init→runtime order.
-        if null_guard > 0 && null_guard.is_multiple_of(host) && null_guard <= mapped {
-            let guard_pages = (null_guard / DURABLE_SNAPSHOT_PAGE).min(npages as u64);
-            for p in 0..guard_pages {
-                out[p as usize] = CapturedProt::Unmapped;
-            }
+        // `Rw` and diverge from the interpreter's capture (and un-seed the guard on thaw).
+        if null_guard > 0 && null_guard.is_multiple_of(page) && null_guard <= mapped {
+            prot.extend((0..null_guard / page).map(|p| (p, PageProt::Unmapped)));
         }
-        // `readonly` data segments → Ro. Protection is **host-page** granular (the runtime's
-        // `protect_ro` and the interpreter's `init_data` protect the whole host page), so a
-        // segment marks every codec page of the host page(s) it touches — this is what makes the
-        // result match `snapshot_prots` on a host whose page is larger than a codec page.
-        for d in data {
-            if !d.readonly || d.bytes.is_empty() {
-                continue;
-            }
-            let lo = (d.offset / host) * host / DURABLE_SNAPSHOT_PAGE;
-            let hi =
-                (d.offset + d.bytes.len() as u64).div_ceil(host) * host / DURABLE_SNAPSHOT_PAGE;
-            for p in lo..hi.min(npages as u64) {
-                out[p as usize] = CapturedProt::Ro;
-            }
-        }
-        // Runtime map/unmap/protect (host-page-indexed) override the defaults.
+        // The window's page map, host-page-indexed.
         if let Some((_, map)) = &self.cap_pages {
-            let m = map.lock().unwrap();
-            for (p, slot) in out.iter_mut().enumerate() {
-                let hp = (p as u64 * DURABLE_SNAPSHOT_PAGE) / host;
-                use temen_ir::PageState as ps;
-                match m.get(&hp).copied() {
-                    Some(ps::Rw) => *slot = CapturedProt::Rw,
-                    Some(ps::Ro) => *slot = CapturedProt::Ro,
-                    Some(ps::Unmapped) => *slot = CapturedProt::Unmapped,
-                    // A §13 alias names its region (#2025): this codec page's bytes are the
-                    // region's at the host page's offset plus this page's place in it.
-                    Some(ps::Backed {
+            use temen_ir::PageState as ps;
+            let m = map.lock().unwrap_or_else(|e| e.into_inner());
+            prot.extend(m.iter().map(|(&p, &st)| {
+                let st = match st {
+                    ps::Rw => PageProt::Rw,
+                    ps::Ro => PageProt::Ro,
+                    ps::Unmapped => PageProt::Unmapped,
+                    ps::Backed {
                         region,
                         off,
                         writable,
-                    }) => {
-                        *slot = CapturedProt::Backed {
-                            region,
-                            off: off + (p as u64 * DURABLE_SNAPSHOT_PAGE - hp * host),
-                            writable,
-                        }
-                    }
-                    None => {}
-                }
-            }
+                    } => PageProt::Backed {
+                        region,
+                        region_off: off,
+                        writable,
+                    },
+                };
+                (p, st)
+            }));
         }
-        out
+        MemLayout {
+            bytes,
+            tail: tail.into_iter().collect(),
+            map: PageMap { prot, page, mapped },
+            seed: false,
+        }
     }
 
-    /// Drain any in-flight offload-pool jobs (run end), so no worker still holds the window backing (or
-    /// the JIT's window/`Domain` pointers) when the caller frees them.
+    /// Wait until this domain's punted calls have all finished and posted their answers: for a test
+    /// or an embedder that reads [`Completions::outstanding`] after a run. No run waits for them
+    /// (#2493).
     pub fn quiesce_pool(&self) {
         if let Some(p) = &self.pool {
             p.quiesce();
@@ -26411,18 +26239,10 @@ impl Host {
             Some(slot) => {
                 let id = self.completions.mint();
                 let comps = Arc::clone(&self.completions);
-                // The result post happens-before the wake hook, so a drain triggered by the
-                // hook always finds the result it is delivering (no lost wakeup).
-                let hook = self.completion_notify.clone();
                 let pool = self
                     .pool
                     .get_or_insert_with(|| OffloadPool::new(OFFLOAD_POOL_THREADS));
-                pool.dispatch(vec![Box::new(move || {
-                    comps.complete(id, job());
-                    if let Some(h) = &hook {
-                        h();
-                    }
-                })]);
+                pool.dispatch(Box::new(move || comps.complete(id, job())));
                 *slot = Some(id);
                 Ok(Vec::new())
             }
@@ -26430,11 +26250,12 @@ impl Host {
         }
     }
 
-    /// #1366 — dispose of a host-completed punt ([`OffloadOutcome::Host`]) per the dispatch face:
-    /// on the parking face mint a host-owned completion id, hand it to `submit`, and return it
-    /// through `pending` (the caller parks; a resumable driver surfaces the id and the embedder
-    /// completes it). On the sync face there is nothing to run inline and no one to complete the
-    /// call — decline fail-closed with `CapFault` rather than block forever.
+    /// #1366 — dispose of a host-answered punt ([`OffloadOutcome::Host`]) per the dispatch face:
+    /// on the parking face mint a host-owned completion id, hand `submit` its [`Completer`], and
+    /// return the id through `pending` (the caller parks on it as on a pool job). The sync face has
+    /// nothing to run inline and no caller that can park, and a durable run's caller never parks on
+    /// a call (the freeze has no cap park to re-derive): both decline fail-closed with `CapFault`,
+    /// before the embedder sees the call, rather than block forever (#2495).
     fn punt_host(
         &mut self,
         type_id: u32,
@@ -26444,49 +26265,27 @@ impl Host {
         submit: HostCompletion,
         pending: Option<&mut Option<u64>>,
     ) -> Result<Vec<i64>, Trap> {
-        // Only a driver that surfaces the park (`Vcpu`, `ScheduledDebugRun`) can ever finish this call:
-        // decline before the submit hook runs under any other, so the embedder never records a
-        // dead request.
-        if !self.completions.host_completed_allowed() {
+        let Some(slot) = pending.filter(|_| !self.durable) else {
             return Err(Trap::CapFault);
-        }
-        match pending {
-            Some(slot) => {
-                // While taping, remember the call so the *delivered* value can be recorded as its
-                // `CapRecord` (the dispatch-time placeholder below is never taped).
-                let record = self
-                    .cap_record
-                    .is_some()
-                    .then(|| (type_id, op, handle, args.to_vec()));
-                let id = self.completions.mint_host_owned(record);
-                submit(id);
-                *slot = Some(id);
-                Ok(Vec::new())
-            }
-            None => Err(Trap::CapFault),
-        }
+        };
+        // While taping, remember the call so the *delivered* value can be recorded as its
+        // `CapRecord` (the dispatch-time placeholder below is never taped).
+        let record = self
+            .cap_record
+            .is_some()
+            .then(|| (type_id, op, handle, args.to_vec()));
+        *slot = Some(self.completions.submit_host_owned(record, submit));
+        Ok(Vec::new())
     }
 
     /// #1366 — push a [`CapRecord`] onto this host's cap tape if it is recording (no-op otherwise):
-    /// the embedder's delivered value for a host-completed call, recorded by `deliver_cap`.
+    /// the embedder's delivered value for a host-answered call, taped where a driver delivers it
+    /// ([`Completions::take_record`]).
     pub fn tape_cap_record(&mut self, rec: CapRecord) {
         if let Some(r) = &mut self.cap_record {
             r.push(rec);
             self.cap_consumed += 1;
         }
-    }
-
-    /// §12 slice 2 — install the per-run completion-wake hook (see the `completion_notify`
-    /// field). The executor that owns the wake mechanism wires it to its scheduler's ordered
-    /// drain and clears it at teardown.
-    pub fn set_completion_notify(&mut self, f: Arc<dyn Fn() + Send + Sync>) {
-        self.completion_notify = Some(f);
-    }
-
-    /// §12 slice 2 — drop the completion-wake hook at run teardown (it captures the run's
-    /// `Arc<Scheduler>`; leaving it would cycle Host → Scheduler → Host).
-    pub fn clear_completion_notify(&mut self) {
-        self.completion_notify = None;
     }
 
     /// #796 L2 — install the async-signal source (a personality) and the shared **armed** flag it sets.
@@ -26601,10 +26400,17 @@ impl Host {
             .collect()
     }
 
+    /// How many more entries this host's handle table holds. A guest-reachable path that installs
+    /// entries with the infallible [`Host::grant`] checks it first, so a table the guest filled
+    /// refuses the operation instead of panicking the host (#2222).
+    fn room(&self) -> usize {
+        self.table.iter().filter(|s| s.entry.is_none()).count()
+    }
+
     /// Infallible grant for **host-controlled** powerbox setup (`grant_stream`/`grant_memory`/… and
     /// the `grant_*` embedder APIs): the host grants a bounded handful into a fresh `CAP`-slot table,
     /// so the table cannot be full. Never call this on a **guest-reachable** path — use
-    /// [`Host::try_grant`] there (a guest can exhaust the table; see its docs).
+    /// [`Host::try_grant`] there, or check [`Host::room`] first (a guest can exhaust the table).
     fn grant(&mut self, type_id: u32, binding: Binding) -> i32 {
         self.try_grant(type_id, binding)
             .expect("handle table full during host powerbox setup (bounded by construction)")
@@ -26615,10 +26421,17 @@ impl Host {
     /// **first** offending slot — if any live slot holds a non-durable binding, so freeze is
     /// all-or-nothing rather than dropping authority on restore.
     pub fn capture_durable_handles(&self) -> Result<Vec<DurableHandle>, NonDurableHandle> {
+        self.capture_handles(false)
+    }
+
+    /// [`Host::capture_durable_handles`], leaving out every `Module` grant when `skip_modules`: a
+    /// checkpoint that stays in the run carries those whole ([`Host::child_powerbox`]).
+    fn capture_handles(&self, skip_modules: bool) -> Result<Vec<DurableHandle>, NonDurableHandle> {
         let mut out = Vec::new();
         for (slot, s) in self.table.iter().enumerate() {
             let Some(binding) = s.entry else { continue };
             let binding = match binding {
+                Binding::Module(_) if skip_modules => continue,
                 // #2054: a stream the spawner re-granted (§7c) rides as inherited, and the relaunch
                 // aliases it to the spawner's again. One a restore left pending is inherited too,
                 // so a re-freeze before the relaunch is canonical (§12.6).
@@ -26633,8 +26446,8 @@ impl Host {
                 Binding::Exit => DurableBinding::Exit,
                 Binding::Clock => DurableBinding::Clock,
                 Binding::AddressSpace { base, size } => DurableBinding::AddressSpace { base, size },
-                Binding::Instantiator { base, size } => DurableBinding::Instantiator { base, size },
-                Binding::FreezeAuthority(scope) => DurableBinding::FreezeAuthority(scope),
+                Binding::Instantiator => DurableBinding::Instantiator,
+                Binding::FreezeAuthority => DurableBinding::FreezeAuthority,
                 // #2025: durable here; whether the cut holds every holder is the codec's check.
                 Binding::SharedRegion(region) => DurableBinding::SharedRegion { region },
                 // #1361: a module grant the restoring host grants again is durable — named by its
@@ -26740,8 +26553,8 @@ impl Host {
                 | Binding::Exit
                 | Binding::Clock
                 | Binding::AddressSpace { .. }
-                | Binding::Instantiator { .. }
-                | Binding::FreezeAuthority(_)
+                | Binding::Instantiator
+                | Binding::FreezeAuthority
                 // Slice 2: guest-JIT handles are durable (their unit state rides the artifact via
                 // `capture_durable_jit`), so a drain keeps them — the complement of `capture` above.
                 | Binding::JitTable(_)
@@ -26808,8 +26621,8 @@ impl Host {
                 DurableBinding::Exit => Binding::Exit,
                 DurableBinding::Clock => Binding::Clock,
                 DurableBinding::AddressSpace { base, size } => Binding::AddressSpace { base, size },
-                DurableBinding::Instantiator { base, size } => Binding::Instantiator { base, size },
-                DurableBinding::FreezeAuthority(scope) => Binding::FreezeAuthority(scope),
+                DurableBinding::Instantiator => Binding::Instantiator,
+                DurableBinding::FreezeAuthority => Binding::FreezeAuthority,
                 DurableBinding::LiveImpl { slot, export } => {
                     // §13.4 slice 4d: install a placeholder entry (its `callee`/`sigs` are
                     // patched once the §14 child at `slot` is re-created — see
@@ -26949,21 +26762,10 @@ impl Host {
         self.region(id).map(region_key)
     }
 
-    /// #2025 — alias back into `mem` every region `prots` names: the thaw half of a captured
-    /// `Backed` page. `false` if one names no region of this host or does not map.
-    fn realias_regions(&self, mem: &mut dyn GuestMem, prots: &[CapturedProt]) -> bool {
-        let backed = prots
-            .iter()
-            .enumerate()
-            .filter_map(|(p, prot)| match *prot {
-                CapturedProt::Backed {
-                    region,
-                    off,
-                    writable,
-                } => Some((p as u64, region, off, writable)),
-                _ => None,
-            });
-        self.map_aliases(mem, &region_aliases(DURABLE_SNAPSHOT_PAGE, backed))
+    /// #2025 — alias back into `mem` every region `map` names: the thaw half of a captured `Backed`
+    /// page. `false` if one names no region of this host or does not map.
+    fn realias_regions(&self, mem: &mut dyn GuestMem, map: &PageMap) -> bool {
+        self.map_aliases(mem, &map.aliases())
     }
 
     /// #2025 — map each of `aliases` into `mem` through [`Self::region_map`], the path a guest's own
@@ -26982,29 +26784,36 @@ impl Host {
     /// #2025 — a fresh backing holding a captured region's bytes, as a thaw rebuilds it: a backing
     /// as a guest mint gets one ([`Self::new_region`]). #2111 — charged to this domain's node whatever
     /// its ceilings, as a thaw re-charges each pipe it rebuilds to the thawing root: a freeze carries
-    /// no node's `channel` use. #2306 — `Err`, the errno, when no backing can be had: the thaw
-    /// refuses, rather than run without the region.
+    /// no node's `channel` use. #2318 — but never past the process's pools, of mappings and of address
+    /// space. #2306 — `Err`, the errno, when no backing can be had or the pools have no room for it:
+    /// the thaw refuses, rather than run without the region.
     pub fn rebuild_region(&self, bytes: &[u8]) -> Result<RegionBacking, i64> {
-        Ok(self.refill_region(self.new_region(bytes.len())?, bytes))
+        let backing = self.new_region(bytes.len())?;
+        let cost = region_cost(bytes.len() as u64, backing.size());
+        if !self.budgets.add(self.own_budget, &cost, Fits::Pool) {
+            return Err(ENOMEM);
+        }
+        Ok(self.refill_region(backing, bytes))
     }
 
     /// #2306 — a debugger moment's region, as [`Self::rebuild_region`] makes it, else on the heap: a
     /// moment is the interpreter's, which any backing serves, so a seek is never refused for want of
-    /// an OS object.
+    /// an OS object. Charged past every limit: a seek puts back a state the run held.
     pub(crate) fn rebuild_moment_region(&self, bytes: &[u8]) -> RegionBacking {
         let backing = self
             .new_region(bytes.len())
             .unwrap_or_else(|_| Arc::new(VecBacking(Mutex::new(vec![0u8; bytes.len()]))));
+        let cost = region_cost(bytes.len() as u64, backing.size());
+        self.budgets.add(self.own_budget, &cost, Fits::Forced);
         self.refill_region(backing, bytes)
     }
 
-    /// `backing` holding `bytes`, charged to this domain's node past any ceiling ([`ChargedRegion`]).
+    /// `backing` holding `bytes`, which their caller charged to this domain's node ([`ChargedRegion`]
+    /// hands it back).
     fn refill_region(&self, backing: RegionBacking, bytes: &[u8]) -> RegionBacking {
         for (o, &b) in bytes.iter().enumerate() {
             backing.write_byte(o as u64, b);
         }
-        let cost = region_cost(bytes.len() as u64, backing.size());
-        self.budgets.add(self.own_budget, &cost, Fits::Forced);
         Arc::new(ChargedRegion {
             backing,
             node: self.own_node(),
@@ -27110,14 +26919,13 @@ impl Host {
         }
     }
 
-    /// #1680 — the tree-minted pipes this domain's live ends name, with those its nested children
-    /// pushed into this sink, by global id: the pipe half of [`DurableBinding::PipeEnd`]. Read after
-    /// the freeze has quiesced, so the bytes are the cut's. Ascending key.
+    /// #1680 — the tree-minted pipes this domain's live ends name, by global id: the pipe half of
+    /// [`DurableBinding::PipeEnd`]. Read after the freeze has quiesced, so the bytes are the cut's.
+    /// Ascending key.
     pub fn capture_durable_pipes(&self) -> Vec<DurablePipe> {
         use std::sync::atomic::Ordering::SeqCst;
-        let mut all = self.frozen_pipes.clone();
-        all.extend(self.durable_pipe_backings());
-        all.into_iter()
+        self.durable_pipe_backings()
+            .into_iter()
             .map(|(key, (fifo, writers, readers, _, _, _))| DurablePipe {
                 key,
                 bytes: fifo.lock_unpoisoned().iter().copied().collect(),
@@ -27141,9 +26949,8 @@ impl Host {
     }
 
     /// #1680 — rebuild the cut's pipes before [`Self::restore_durable_handles`] re-opens their ends:
-    /// each gets its bytes, a fresh global id, the cut's end counts (every end the tree carries,
-    /// including those of nested children the thaw has yet to re-create), and a channel charge on
-    /// this domain (the thawing root holds the tree's pipe memory). Replaces any earlier set.
+    /// each gets its bytes, a fresh global id, the cut's end counts (every end the tree carries), and
+    /// a channel charge on this domain (the thawing root holds the tree's pipe memory). Replaces any earlier set.
     /// Refuses, with nothing rebuilt, a pipe holding more than a pipe can.
     ///
     /// Returns each pipe's new global id, in order: the caller rewrites the carried ends' keys to
@@ -27454,7 +27261,6 @@ impl Host {
                     install_code: 0,
                     install_type_id: u.install_type_id,
                     wasm: None,
-                    grant: std::sync::OnceLock::new(),
                 });
             }
             rebuilt.push(JitTableState {
@@ -27524,15 +27330,6 @@ impl Host {
         self.budgets
             .set_ceiling(self.own_budget, BUDGET_SPAWN, spawn);
         self.budgets.set_ceiling(self.own_budget, BUDGET_MAPS, maps);
-    }
-
-    /// #989 — set this domain's own node's channel-memory ceiling (bytes); `-1` = unbounded. The carve
-    /// spawn paths call it on a carve child's `Host`, whose node heads a tree of its own, with the
-    /// funding record's `Budget.channel` (until #1867 deletes the carve). A detached child needs none:
-    /// its own node is the budget that paid for it, whose chain bounds its pipes (#1944 slice 3).
-    pub fn set_channel_cap(&mut self, cap: i64) {
-        self.budgets
-            .set_ceiling(self.own_budget, BUDGET_CHANNEL, cap);
     }
 
     /// D66 — set this domain's lane cap (see [`Host::lane_cap`]); `-1` = unbounded. The embedder sets
@@ -27608,7 +27405,7 @@ impl Host {
         // #1361 step 4 — R1's endpoint (#1440): a **durable** domain spawns detached only over children
         // a freeze of it may capture, i.e. while it holds freeze authority over its detached progeny.
         // Checked first, so a refusal charges nothing.
-        if self.durable && !self.holds_freeze_authority(FreezeScope::DetachedProgeny) {
+        if self.durable && !self.holds_freeze_authority() {
             return None;
         }
         let lane = self.peek_budget(lease.budget).map_or(-1, |b| b.lane);
@@ -27643,31 +27440,54 @@ impl Host {
 
     /// #1971 — the lease a thaw's relaunch of `child`, a detached child this domain spawned, files for
     /// its window: this domain's handle on the budget that paid for it (the node `child` holds as its
-    /// `"budget"`), and the window's size, `1 << window_log2`. The same lease op 15 filed at the spawn,
-    /// so the thawed child's end hands its window back as an unfrozen child's does. `None` when `child`
-    /// holds no budget or this domain no handle on it.
+    /// `"budget"`), and the window's size, `1 << window_log2`. The same lease op 17 filed at the spawn,
+    /// so the thawed child's end hands its window back as an unfrozen child's does. `Ok(None)` when
+    /// `child` holds no budget or this domain no handle on it.
     ///
     /// #2268 — a freeze carries no `maps` (each process's mappings are its own), so the lease's are
-    /// charged again here, past any ceiling: the bound on its window's runs from its program
-    /// ([`window_runs_bound`]), which `child`'s window is paid for up to ([`Self::paid_runs`]); what
-    /// it holds past them, its §13 pages among them, is counted once it starts. #2305 — nor any
-    /// address space, so the lease's is charged again with them.
-    pub fn relaunch_lease(&self, child: &mut Host, window_log2: u8) -> Option<Lease> {
-        let node = child.budget_node(child.resolve_cap_name("budget")?)?;
-        let slot = self
-            .table
-            .iter()
-            .position(|s| matches!(s.entry, Some(Binding::Budget(n)) if n == node))?;
+    /// charged again here: the bound on its window's runs from its program ([`window_runs_bound`]),
+    /// which `child`'s window is paid for up to ([`Self::paid_runs`]), and (#2318) what its restored
+    /// window holds past them, of its `runs` ([`PageMap::window_runs`]), its §13 pages among them.
+    /// #2305 — nor any address space, so the lease's is charged again with them. #2318 — past any
+    /// ceiling, since the artifact's use was granted, but never past the process's pools: `-ENOMEM`
+    /// when they have no room, and then the window the freeze kept charged goes back, as the child's
+    /// end would hand it back. The relaunch is refused, and the child never runs.
+    pub fn relaunch_lease(
+        &self,
+        child: &mut Host,
+        window_log2: u8,
+        runs: u64,
+    ) -> Result<Option<Lease>, i64> {
+        let node = child
+            .resolve_cap_name("budget")
+            .and_then(|h| child.budget_node(h));
+        let slot = node.and_then(|node| {
+            self.table
+                .iter()
+                .position(|s| matches!(s.entry, Some(Binding::Budget(n)) if n == node))
+        });
+        let (Some(node), Some(slot)) = (node, slot) else {
+            return Ok(None);
+        };
         let data = child.self_module.as_ref().map_or(&[][..], |m| &m.data[..]);
         let lease = Lease {
             budget: handle_of(slot as u32, self.table[slot].generation),
             bytes: 1u64 << window_log2,
             runs: window_runs_bound(data, false),
         };
-        let held = [(BUDGET_MAPS, lease.maps()), (RESERVED, lease.reserved())];
-        self.budgets.add(node, &held, Fits::Forced);
-        (child.paid_runs, child.leased) = (lease.runs, lease.bytes);
-        Some(lease)
+        let past = runs.saturating_sub(lease.runs);
+        let held = [
+            (BUDGET_MAPS, lease.maps() + past),
+            (RESERVED, lease.reserved()),
+        ];
+        if !self.budgets.add(node, &held, Fits::Pool) {
+            let kept = [(BUDGET_MEM, lease.bytes), (BUDGET_SPAWN, 1)];
+            self.budgets.refund_set(node, &kept);
+            child.release_memory();
+            return Err(ENOMEM);
+        }
+        (child.paid_runs, child.leased, child.maps) = (lease.runs, lease.bytes, past);
+        Ok(Some(lease))
     }
 
     /// The node a live `Budget` handle names.
@@ -27865,7 +27685,7 @@ impl Host {
     /// back first. Then the root's window and its main vCPU are its own node's, as a child's are its
     /// budget's, charged past any ceiling, since they are what its embedder chose to run: a grant they
     /// exceed leaves the run room for nothing more. #2268, #2305 — but never past the process's pools
-    /// of mappings ([`maps_pool`]) and of address space ([`RESERVED_POOL`]): with the domain's own
+    /// of mappings ([`maps_pool`]) and of address space ([`reserved_pool`]): with the domain's own
     /// mappings, its window's runs and its reservation, they are one charge, and `None`, with nothing
     /// charged, is a run the process has no room for, which every engine ends with
     /// [`Trap::ThreadFault`] before it starts, its main vCPU refused. Otherwise the domain the last
@@ -28015,7 +27835,7 @@ impl Host {
     pub fn try_grant_pipe(&mut self) -> Option<(i32, i32)> {
         // Both ends must land or neither: check two free slots before minting the FIFO, so a
         // half-granted pipe (a write end with no reader) can never escape.
-        if self.table.iter().filter(|s| s.entry.is_none()).count() < 2 {
+        if self.room() < 2 {
             return None;
         }
         // #989 — the guest-reachable mint: refuse before allocating when it would push the domain's
@@ -28152,7 +27972,7 @@ impl Host {
     }
 
     /// PROCESS.md S2 — promote `stdout` to a **shared** sink and return a handle to it, so a child
-    /// host can be pointed at the same buffer (stdio inheritance via `instantiate_granted`).
+    /// host can be pointed at the same buffer (stdio inheritance through a spawn record's grant list).
     /// Idempotent (a second call returns the same sink). After promotion, new writes go to the sink;
     /// read the effective bytes via [`Host::stdout_bytes`] (`stdout` itself no longer receives them).
     /// #2306: what every writer appends to it is charged to this domain's node, the domain its stdout
@@ -28390,12 +28210,22 @@ impl Host {
     /// parking-aware eval loop the punting call returns `Pending` and the caller waits **without
     /// the host lock**; everywhere else the job runs inline, byte-identical to a synchronous
     /// handler. Compared to [`Host::grant_host_proc`] this face *loses* powers — no window, no
-    /// minter, no fork factory — the pool must never touch the window (the ring's discipline,
-    /// kept), and a punted call's declared signature carries at most one result (invariant 8).
-    pub fn grant_host_proc_offloadable(&mut self, f: OffloadHostProc, state: CapState) -> i32 {
+    /// minter — the pool must never touch the window (the ring's discipline, kept), and a punted
+    /// call's declared signature carries at most one result (invariant 8).
+    ///
+    /// #2424 — with a `fork` factory, as [`Host::grant_host_proc_forkable`]'s, a spawn can re-grant
+    /// it to a §14 child and a fork twin carries it: the factory mints the new domain's handler
+    /// (typically [`ForkedProc::offloadable`]), whose punts park the new domain's caller as this
+    /// domain's park its own. Without one it stays with this domain, as before.
+    pub fn grant_host_proc_offloadable(
+        &mut self,
+        f: OffloadHostProc,
+        fork: Option<HostProcFork>,
+        state: CapState,
+    ) -> i32 {
         self.grant_host_proc_entry(HostProcEntry {
             handler: ProcHandler::Offloadable(f),
-            fork: None,
+            fork,
             mints: false,
             vtable: None,
             state,
@@ -28403,14 +28233,15 @@ impl Host {
         })
     }
 
-    /// #1366 / #1953 — grant the embedder's **declared host-completed caps**: for each of `names`
+    /// #1366 / #1953 — grant the embedder's **declared host-answered caps**: for each of `names`
     /// (in order) that `imports` imports, an offloadable proc that always punts to the embedder
     /// ([`OffloadOutcome::Host`]). The guest's flat `call.sym "<name>"` (its own op in `args[0]`)
-    /// parks the run; the proc's submit hook files the call in `requests` under its completion id,
-    /// and the embedder answers it with the driver's `deliver_cap`. Each is registered under its
-    /// name. Returns the `(name, handle)` seams for [`Host::bind_powerbox_manifest`]. Nothing here
-    /// is embedder-specific: temen never learns what a name means. The one grant every session
-    /// that serves declared caps uses (the DAP debug session, the browser release session).
+    /// parks its caller; the proc's submit hook files the call in `requests` under its completion
+    /// id, and the embedder takes the request out and answers it with its [`Completer`]. Each is
+    /// registered under its name. Returns the `(name, handle)` seams for
+    /// [`Host::bind_powerbox_manifest`]. Nothing here is embedder-specific: temen never learns what
+    /// a name means. The one grant every session that serves declared caps uses (the DAP debug
+    /// session, the browser release session).
     pub fn grant_declared_host_caps(
         &mut self,
         imports: &[temen_ir::Import],
@@ -28429,12 +28260,17 @@ impl Host {
                     let requests = Arc::clone(&requests);
                     let name = cap.clone();
                     let args = args.to_vec();
-                    OffloadOutcome::Host(Box::new(move |id| {
-                        requests
-                            .lock_unpoisoned()
-                            .insert(id, CapRequest { id, name, args });
+                    OffloadOutcome::Host(Box::new(move |completer: Completer| {
+                        let request = CapRequest {
+                            name,
+                            args,
+                            completer,
+                        };
+                        let id = request.completer.id();
+                        requests.lock_unpoisoned().insert(id, request);
                     }))
                 }),
+                None,
                 // Each call is answered afresh by the embedder; nothing is held between calls.
                 CapState::Stateless,
             );
@@ -28695,7 +28531,7 @@ impl Host {
             .collect();
         // The provider's window, exactly as a run of `m` would build it (§3a data segments
         // included) — the exporter's own memory, not the wirer's and not any caller's.
-        let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
+        let mem = Mem::root(m, default_reserved_log2(), None, &[]);
         // A bare fn-list wire carries no op names — the anonymous-shape family (#1109).
         let type_id = self.intern_interface(&[], &sigs);
         let idx = self.offers.len() as u32;
@@ -28740,12 +28576,9 @@ impl Host {
         self.set_self_module_opt(Some(Arc::clone(m)));
     }
 
-    /// Set (or clear) the running module — the one writer of [`Host::self_module`], so the grant
-    /// [`SELF_MODULE`] resolves to ([`Host::resolve_module`]) is always the current module's (#1863:
-    /// a spawn record's `module = -1` means "my own program", on every tier). A child image granted
-    /// before is no longer this program's, so it stops riding a freeze.
+    /// Set (or clear) the running module — the one writer of [`Host::self_module`]. A child image
+    /// granted before is no longer this program's, so it stops riding a freeze.
     pub(crate) fn set_self_module_opt(&mut self, m: Option<Arc<Module>>) {
-        self.self_grant = std::sync::OnceLock::new();
         self.child_image = None;
         self.self_module = m;
     }
@@ -28768,6 +28601,80 @@ impl Host {
             ticket,
         });
         Some(ticket)
+    }
+
+    /// §2.2 / #1862 — enqueue a demand child's `page(addr)` request on pager export `export`, the
+    /// fault address `sink`'s, and file `sink`, where its reply lands. One lock of this host covers
+    /// both, so the pager cannot settle the request before its sink exists. `None` when the queue
+    /// is full: backpressure, and the child re-faults.
+    pub fn request_page(&mut self, export: u32, sink: PageSink) -> Option<u64> {
+        let addr = sink.page + sink.off;
+        let ticket = self.svc_enqueue(export, 0, vec![addr as i64])?;
+        self.page_sinks.insert(ticket, sink);
+        Some(ticket)
+    }
+
+    /// §2.2 / #1862 — settle served dispatch `ticket`, whose handler returned `value`: a page
+    /// request's page moves from the pager's window `pager_mem`, the serving vCPU's, into its
+    /// child's ([`PageSink::supply`]). The settle runs before the reply is delivered, so the pager
+    /// cannot reuse its buffer before the copy, and the child cannot run before its page is in
+    /// place. Returns the value to deliver; any other dispatch's passes through. Out of line: every
+    /// engine's serve loop calls it at every settle, and its copy would otherwise grow the
+    /// interpreters' op loops.
+    #[inline(never)]
+    pub fn settle_page(
+        &mut self,
+        ticket: u64,
+        value: i64,
+        pager_mem: Option<&dyn GuestMem>,
+    ) -> i64 {
+        match self.page_sinks.remove(&ticket) {
+            Some(sink) => sink.supply(value, pager_mem),
+            None => value,
+        }
+    }
+
+    /// #2164 — withdraw page request `ticket`, whose child stopped waiting for it (a kill, or its
+    /// run's teardown): its dispatch, its sink and any reply. The Cranelift JIT's sink writes into
+    /// the child's window, which goes with the child, so no settle may reach it afterwards; this
+    /// host's lock orders the two.
+    pub fn abandon_page(&mut self, ticket: u64) {
+        self.svc_queue.retain(|d| d.ticket != ticket);
+        self.page_sinks.remove(&ticket);
+        self.svc_results.remove(&ticket);
+    }
+
+    /// §2.2 — whether this domain's program has a pager export `export`: a `{ page: (i64) -> (i64)
+    /// }` interface, the only one a spawn record may name to supply its child's pages (#744, #1862).
+    /// Every engine's op 17 checks a record's pager here, before anything else of the record.
+    pub fn has_pager_export(&self, export: u32) -> bool {
+        self.self_module
+            .as_ref()
+            .is_some_and(|sm| sm.is_pager_export(export))
+    }
+
+    /// #2164 — make this Cranelift JIT child's powerbox a demand-paged one: its faults go to export
+    /// `export` of `spawner`'s program, over the window `paging` describes.
+    pub fn set_jit_pager(&mut self, spawner: Arc<Mutex<Host>>, export: u32, paging: JitPaging) {
+        self.pager = Some(export);
+        self.jit_pager = Some(spawner);
+        self.jit_paging = Some(paging);
+    }
+
+    /// #2164 — a demand-paged Cranelift JIT child's pager: its spawner's cell and the export there,
+    /// until the child's end takes it ([`Host::take_jit_pager`]).
+    pub fn jit_pager(&self) -> Option<(Arc<Mutex<Host>>, u32)> {
+        Some((Arc::clone(self.jit_pager.as_ref()?), self.pager?))
+    }
+
+    /// #2164 — the child has ended: its pager, to release (#1217).
+    pub fn take_jit_pager(&mut self) -> Option<Arc<Mutex<Host>>> {
+        self.jit_pager.take()
+    }
+
+    /// #2164 — a demand-paged Cranelift JIT child's window ([`JitPaging`]).
+    pub fn jit_paging(&self) -> Option<JitPaging> {
+        self.jit_paging.clone()
     }
 
     /// Take a served dispatch's result (first result slot; `0` for a no-result handler).
@@ -29299,12 +29206,17 @@ impl Host {
             return Err(Trap::CapFault);
         }
         let named = m.interface_named_ops(e.interface).ok_or(Trap::CapFault)?;
+        // #2222 — guest-minting: a module may export more offers than the table holds, so a full
+        // table is `-EMFILE`, never the infallible grant's panic.
+        if self.room() == 0 {
+            return Ok(EMFILE as i32);
+        }
         let sigs: Arc<[FuncType]> = named.iter().map(|&(_, ft)| ft.clone()).collect();
         let names: Arc<[String]> = named.iter().map(|(n, _)| n.to_string()).collect();
         let state = self
             .self_instance
             .get_or_insert_with(|| {
-                let mem = Mem::root(&m, DEFAULT_RESERVED_LOG2, None, &[]);
+                let mem = Mem::root(&m, default_reserved_log2(), None, &[]);
                 Arc::new(Mutex::new(ProviderState {
                     mem,
                     host: Arc::new(Mutex::new(Host::new())),
@@ -29450,70 +29362,53 @@ impl Host {
     }
 
     /// Grant a §14 `AddressSpace` capability over the window sub-range `[base, base+size)` (§14). The
-    /// root grant is normally the whole window (`base = 0`, `size` the window size); the guest then
-    /// `sub`-attenuates it to carve children. `size` must be a power of two and `base` a multiple of
+    /// root grant is normally the whole window (`base = 0`, `size` the window size); the guest may
+    /// `sub`-attenuate it. `size` must be a power of two and `base` a multiple of
     /// it (so the range and every sub-range are power-of-two aligned, §4/D19) — the caller's
     /// contract, mirroring how the host lays out windows.
     pub fn grant_address_space(&mut self, base: u64, size: u64) -> i32 {
         self.grant(cap_id::ADDRESS_SPACE, Binding::AddressSpace { base, size })
     }
 
-    /// Grant a §14 `Instantiator` capability over the window sub-range `[base, base+size)` — the
-    /// authority to spawn children (`instantiate`/`join`) confined to power-of-two sub-windows of it
-    /// (§14). Like `grant_address_space`, `size` must be a power of two and `base` a multiple of it.
-    pub fn grant_instantiator(&mut self, base: u64, size: u64) -> i32 {
-        self.grant(cap_id::INSTANTIATOR, Binding::Instantiator { base, size })
+    /// Grant a §14 `Instantiator` capability: the authority to spawn children, each in a window of
+    /// its own that a `Budget` pays for, and to join and signal them.
+    pub fn grant_instantiator(&mut self) -> i32 {
+        self.grant(cap_id::INSTANTIATOR, Binding::Instantiator)
     }
 
-    /// Grant **freeze authority** over the window sub-range `[base, base+size)` — the authority to
-    /// snapshot the domain living there (#1440).
-    ///
-    /// For a §14 nested carve the range is the child's carve, which is what makes the R1 rule
-    /// ("for a nested carve child the grant is implied by the aliasing") expressible as a real grant
-    /// rather than an inference from placement: the spawn path mints this, and
-    /// [`holds_freeze_authority`](Host::holds_freeze_authority) is how a later freeze asks.
-    pub fn grant_freeze_authority(&mut self, scope: FreezeScope) -> i32 {
-        self.grant(cap_id::FREEZE_AUTHORITY, Binding::FreezeAuthority(scope))
+    /// Grant **freeze authority** over every detached child this domain spawns — the authority to
+    /// snapshot them (#1440, [`Binding::FreezeAuthority`]). An embedder's act, or a spawn's re-grant
+    /// of one its spawner holds (#2018); never a guest's.
+    pub fn grant_freeze_authority(&mut self) -> i32 {
+        self.grant(cap_id::FREEZE_AUTHORITY, Binding::FreezeAuthority)
     }
 
     /// [`grant_freeze_authority`](Host::grant_freeze_authority), fallible — `None` when the handle
-    /// table is full. The spawn path uses this rather than the panicking form: a guest chooses how
-    /// many children it spawns, so a per-spawn grant that could exhaust the handle table would hand
-    /// it a way to abort the host (INVARIANTS #5 — a trap is for forgery, not for a benign guest doing
-    /// a lot of legitimate work).
-    pub fn try_grant_freeze_authority(&mut self, scope: FreezeScope) -> Option<i32> {
-        self.try_grant(cap_id::FREEZE_AUTHORITY, Binding::FreezeAuthority(scope))
+    /// table is full. The spawn path's re-grant uses this rather than the panicking form: a guest
+    /// chooses how many children it spawns, so a per-spawn grant that could exhaust the handle table
+    /// would hand it a way to abort the host (INVARIANTS #5 — a trap is for forgery, not for a benign
+    /// guest doing a lot of legitimate work).
+    pub fn try_grant_freeze_authority(&mut self) -> Option<i32> {
+        self.try_grant(cap_id::FREEZE_AUTHORITY, Binding::FreezeAuthority)
     }
 
-    /// Whether this host holds freeze authority covering `scope` — i.e. may snapshot what it names.
-    ///
-    /// A [`Carve`](FreezeScope::Carve) matches by **containment**: authority over a range covers
-    /// anything inside it. [`DetachedProgeny`](FreezeScope::DetachedProgeny) matches exactly — it is
-    /// all-or-nothing by construction, so there is nothing to contain.
+    /// Whether this host holds freeze authority — i.e. may snapshot the detached children it spawns.
     ///
     /// A domain nobody holds authority over is **confidential**; that is the whole of the
     /// confidential/ancestor-freezable distinction (INVARIANTS #14 R1 §6), derived from the absence of
     /// a grant rather than tracked as a state of its own.
-    pub fn holds_freeze_authority(&self, scope: FreezeScope) -> bool {
-        self.table.iter().any(|slot| match (slot.entry, scope) {
-            (
-                Some(Binding::FreezeAuthority(FreezeScope::Carve { base: b, size: n })),
-                FreezeScope::Carve { base, size },
-            ) => b <= base && base.saturating_add(size) <= b.saturating_add(n),
-            (
-                Some(Binding::FreezeAuthority(FreezeScope::DetachedProgeny)),
-                FreezeScope::DetachedProgeny,
-            ) => true,
-            _ => false,
-        })
+    pub fn holds_freeze_authority(&self) -> bool {
+        self.table
+            .iter()
+            .any(|slot| matches!(slot.entry, Some(Binding::FreezeAuthority)))
     }
 
-    /// Resolve a handle as an `Instantiator` (§14) and return its `(base, size)` sub-range, or a
-    /// `CapFault` for a forged / closed / wrong-type handle. Used by the eval loop, which services
-    /// `instantiate`/`join` itself (the generic dispatch can't reach the executor).
-    fn resolve_instantiator(&self, handle: i32) -> Result<(u64, u64), Trap> {
+    /// Check that a handle is an `Instantiator` (§14): a `CapFault` for a forged / closed /
+    /// wrong-type one. Used by the eval loop, which services the spawn ops itself (the generic
+    /// dispatch can't reach the executor).
+    fn resolve_instantiator(&self, handle: i32) -> Result<(), Trap> {
         match self.resolve(handle, cap_id::INSTANTIATOR)? {
-            Binding::Instantiator { base, size } => Ok((base, size)),
+            Binding::Instantiator => Ok(()),
             _ => Err(Trap::CapFault),
         }
     }
@@ -29529,20 +29424,6 @@ impl Host {
         self.grant_module_inner(m, false)
     }
 
-    /// The two **by-name grants a detached spawn needs** beyond `"instantiator"` itself, so a guest
-    /// can reach `Instantiator` op 15 from a plain powerbox: `"module"` — a `Module` handle for the
-    /// **running module**, letting a program spawn one of its own functions as the child (a child
-    /// that is a *different* module is a host grant, as the shell's PATH registry); and `"budget"`
-    /// — the detached-window allowance, `win` bytes of `Budget.mem` (a detached window is minted
-    /// *outside* this window, so this is a quota, not a carve: one child as large as the parent, or
-    /// several smaller). Both reference powerboxes (`temen-run`'s and the browser on-ramp's) grant
-    /// them beside `"instantiator"` — one frontier (INVARIANTS #14) — to a guest that can spawn
-    /// detached ([`temen_ir::spawns_detached`]): least authority, and the `"module"` grant is
-    /// non-durable, so a guest that never spawns keeps a powerbox a warm snapshot can freeze. Spawn authority
-    /// stays a subset of the guest's own reach: the child runs this guest's code, on this budget.
-    ///
-    /// Requires [`Host::set_self_module`] first (both powerboxes register the running module before
-    /// granting anything); with no running module registered, nothing is granted.
     /// [`temen_ir::spawns_detached`] over the running module ([`Host::set_self_module`]); `false`
     /// with none registered.
     pub fn self_module_spawns_detached(&self) -> bool {
@@ -29551,27 +29432,15 @@ impl Host {
             .is_some_and(|m| temen_ir::spawns_detached(m))
     }
 
-    /// [`temen_ir::spawns_by_module_handle`] over the running module; `false` with none registered.
-    pub fn self_module_spawns_by_module_handle(&self) -> bool {
-        self.self_module
-            .as_ref()
-            .is_some_and(|m| temen_ir::spawns_by_module_handle(m))
-    }
-
-    /// Grant the by-name spawn set, each name at most once: `"module"` (this program, spawnable) for
-    /// a guest that spawns by module handle (`by_module_handle`, [`temen_ir::spawns_by_module_handle`]
-    /// — an op-17 guest names itself as `-1`, and the `"module"` grant is non-durable), `"child"`
-    /// (this program's [`temen_ir::child_image`]) for a guest that exports a `_child` entry, and
-    /// `"budget"` (one `win` of `Budget.mem`, which pays for a child's growth as well as its
-    /// window, #1909). The one-window ceiling is a grant tighter than the root's, which a guest
-    /// sizes its child from (owner, 2026-10-06, #2113).
-    pub fn grant_detached_spawn_caps(&mut self, win: u64, by_module_handle: bool) {
-        let Some(m) = self.self_module.clone() else {
+    /// Grant the by-name spawn set, each name at most once: `"child"` (this program's
+    /// [`temen_ir::child_image`]) for a guest that exports a `_child` entry, and `"budget"` (one
+    /// `win` of `Budget.mem`, which pays for a child's growth as well as its window, #1909). The
+    /// one-window ceiling is a grant tighter than the root's, which a guest sizes its child from
+    /// (owner, 2026-10-06, #2113). A child runs a module the spawner holds (#2219), so nothing here
+    /// names the running program itself.
+    pub fn grant_detached_spawn_caps(&mut self, win: u64) {
+        if self.self_module.is_none() {
             return;
-        };
-        if by_module_handle && self.resolve_cap_name("module").is_none() {
-            let module = self.grant_module_shared(Arc::clone(&m), false);
-            self.register_cap_name("module", module);
         }
         if self.resolve_cap_name("budget").is_none() {
             let budget = self.grant_budget(-1, win as i64, -1);
@@ -29637,9 +29506,7 @@ impl Host {
         self.grant_module_shared(Arc::new(m.clone()), durable)
     }
 
-    /// [`grant_module_inner`](Self::grant_module_inner) over an already-shared module — the grant
-    /// keeps `m` itself, so a grant of the **running** module (`set_self_module`'s Arc) stays
-    /// recognizable as such ([`Host::is_self_module`]).
+    /// [`grant_module_inner`](Self::grant_module_inner) over an already-shared module.
     fn grant_module_shared(&mut self, m: Arc<Module>, durable: bool) -> i32 {
         self.grant_record(ModuleGrant::of(m, durable))
     }
@@ -29654,18 +29521,6 @@ impl Host {
         let id = self.modules.len() as u32;
         self.modules.push(g);
         self.grant(cap_id::MODULE, Binding::Module(id))
-    }
-
-    /// Whether `handle` names the **running module** — the [`SELF_MODULE`] sentinel, or a `Module`
-    /// grant of the very module [`Host::set_self_module`] registered (a `"module"` by-name grant,
-    /// [`Host::grant_detached_spawn_caps`]). A child spawned from it runs the parent's own program,
-    /// so the spawn arms bind its manifest leniently ([`Host::bind_same_module_manifest`]).
-    pub fn is_self_module(&self, handle: i32) -> bool {
-        handle == SELF_MODULE
-            || match (self.resolve_module(handle), &self.self_module) {
-                (Ok(g), Some(s)) => Arc::ptr_eq(&g.module, s),
-                _ => false,
-            }
     }
 
     /// Find a granted **durable** module by its content digest (§4 separate-module thaw): the restore
@@ -29701,13 +29556,6 @@ impl Host {
         })
     }
 
-    /// The function table and type section ([`ModuleGrant::tables`]) of the grant
-    /// [`Self::grant_by_digest`] names — what a re-granted separate-module thread child runs from,
-    /// its call variants' interned signatures resolved in the type section (#922).
-    fn tables_by_digest(&self, digest: &[u8; 32]) -> Option<Tables> {
-        self.grant_by_digest(digest).map(|(_, g)| g.tables())
-    }
-
     /// §13.4 slice 4c — the whole granted `Module` matching a nested record's digest, for the
     /// thaw to register as the re-created serving child's **self module** (serve admission +
     /// handler resolution need the module, not just its functions).
@@ -29719,82 +29567,29 @@ impl Host {
     /// Resolve a handle as a §14 `Module` grant — the eval loop's lookup for the Instantiator's
     /// module ops. A forged / closed / wrong-type handle is a `CapFault`.
     fn resolve_module(&self, handle: i32) -> Result<&ModuleGrant, Trap> {
-        // #1863: `-1` names the running module — a spawn of "my own program" needs no grant, as
-        // the op-17 record always allowed. With no module registered it faults like a forgery.
-        if handle == SELF_MODULE {
-            let m = self.self_module.as_ref().ok_or(Trap::CapFault)?;
-            return Ok(self
-                .self_grant
-                .get_or_init(|| ModuleGrant::of(Arc::clone(m), false)));
-        }
         match self.resolve(handle, cap_id::MODULE)? {
             Binding::Module(id) => self.modules.get(id as usize).ok_or(Trap::CapFault),
             _ => Err(Trap::CapFault),
         }
     }
 
-    /// What a spawn's module operand names: the grant `handle` resolves to, where [`SELF_MODULE`]
-    /// names the **spawning frame's** program — the running module, or the installed §22 unit the
-    /// frame runs, `unit` (`(table, unit)`, as [`Self::resolve_jit_code`] names it). DESIGN.md §22: a
-    /// same-module child runs the spawning frame's module, so from a unit's frame `-1` is the unit's
-    /// own program (#2143). The one rule every engine's detached spawn asks.
-    fn resolve_spawn_module(
-        &self,
-        handle: i32,
-        unit: Option<(u32, u32)>,
-    ) -> Result<&ModuleGrant, Trap> {
-        let Some((t, u)) = unit.filter(|_| handle == SELF_MODULE) else {
-            return self.resolve_module(handle);
-        };
-        let d = self.jit_tables.get(t as usize).ok_or(Trap::CapFault)?;
-        let ju = d.units.get(u as usize).ok_or(Trap::CapFault)?;
-        Ok(ju.grant.get_or_init(|| {
-            let m = jit_unit_module(&ju.funcs, &ju.types, self.jit_mem_log2(d));
-            ModuleGrant::of(Arc::new(m), false)
-        }))
-    }
-
-    /// Resolve a §14 `Module` handle to **raw views** of its grant — the bridge the JIT's nesting
-    /// runtime uses (via `temen-run`'s `module_resolver` callback; `temen-jit` cannot name `Host`).
-    /// `None` for a forged/closed/wrong-type handle. The returned pointers borrow [`Host::modules`]
-    /// (append-only), or a unit's own grant, which lives as long as the unit (`JitUnit::grant`), so
-    /// they stay valid for as long as this `Host` lives — which outlives the run,
-    /// the same lifetime contract as the `call.cap` ctx itself. `memory_log2` is `-1` when the
-    /// module declares no memory. Host-side callers only; never reachable from a guest `call.cap`
-    /// (the generic dispatch on a `Module` handle is an inert `CapFault`), so no host address ever
-    /// leaks into a guest-readable value.
-    ///
-    /// `handle` is a spawn's module operand, `unit` the installed unit the spawning frame runs, if
-    /// any ([`Self::resolve_spawn_module`]).
-    #[allow(clippy::type_complexity)]
+    /// Resolve a §14 `Module` handle to its grant — the bridge the JIT's nesting runtime uses (via
+    /// `temen-run`'s `module_resolver` callback; `temen-jit` cannot name `Host`): the module, its
+    /// declared window's `log2` (`-1` when it declares no memory), its shadow arena, whether it was
+    /// attested freezable, and its digest. `None` for a forged/closed/wrong-type handle. The module
+    /// borrows [`Host::modules`] (append-only), so views into it stay valid for as long as this
+    /// `Host` lives — which outlives the run, the same lifetime contract as the `call.cap` ctx
+    /// itself. Host-side callers only; never reachable from a guest `call.cap` (the generic
+    /// dispatch on a `Module` handle is an inert `CapFault`), so no host address ever leaks into a
+    /// guest-readable value.
     pub fn resolve_module_parts(
         &self,
         handle: i32,
-        unit: Option<(u32, u32)>,
-    ) -> Option<(
-        *const Func,
-        usize,
-        i32,
-        *const Data,
-        usize,
-        *const temen_ir::TypeEntry,
-        usize,
-        ShadowArena,
-        bool,
-        [u8; 32],
-    )> {
-        let g = self.resolve_spawn_module(handle, unit).ok()?;
-        let m = &g.module;
+    ) -> Option<(&Module, i32, ShadowArena, bool, [u8; 32])> {
+        let g = self.resolve_module(handle).ok()?;
         Some((
-            m.funcs.as_ptr(),
-            m.funcs.len(),
+            &g.module,
             g.memory_log2().map_or(-1, |l| l as i32),
-            m.data.as_ptr(),
-            m.data.len(),
-            // #922: the child module's type section, so the JIT nesting runtime can resolve the
-            // child's interned `call.dyn` type indices when it re-compiles the child.
-            m.types.as_ptr(),
-            m.types.len(),
             g.shadow().unwrap_or(ShadowArena::EMPTY),
             g.durable,
             // temen#2168: what names its code to the JIT's cache of compiled children.
@@ -29821,7 +29616,7 @@ impl Host {
     /// §13 `SharedRegion.map` — **the one region-aliasing path**: alias `backing`'s
     /// `[region_off, region_off+len)` into `mem` at `[win_off, win_off+len)` with `prot`, then tell the
     /// futex region hook (a JIT run's canonical-key recorder; none on the interpreter) which pages now
-    /// alias which region bytes. The guest's own `map` op (dispatch op 0) and the op-15 pre-map
+    /// alias which region bytes. The guest's own `map` op (dispatch op 0) and the op-17 pre-map
     /// ([`Host::apply_premap`]) both go through here, so a pre-mapped page is indistinguishable from a
     /// self-mapped one on every backend. `0` or a negative errno (the backend's).
     #[allow(clippy::too_many_arguments)]
@@ -29854,7 +29649,7 @@ impl Host {
         r
     }
 
-    /// Op-15 **pre-map admission** (the parent side): may `region` — a `SharedRegion` handle in THIS
+    /// Spawn **pre-map admission** (the parent side): may `region` — a `SharedRegion` handle in THIS
     /// powerbox — be aliased whole into a child window of `child_size` bytes at `child_off`? A forged /
     /// wrong-kind handle is a `CapFault` (invariant 5: forgery traps); bad geometry is `Ok(false)` — the
     /// spawn refuses `-EINVAL`, charging nothing. The geometry is exactly what the child's own
@@ -29870,7 +29665,7 @@ impl Host {
                 .is_some_and(|end| end <= child_size))
     }
 
-    /// Op-15 **pre-map staging** (after admission and the grant list): re-grant `region` from this
+    /// Spawn **pre-map staging** (after admission and the grant list): re-grant `region` from this
     /// (parent) powerbox into `child` and record the pending alias at `child_off` for
     /// [`Host::apply_premap`]. The child ends up holding the region handle (unnamed) exactly as if it
     /// were in the grant list, so it can `unmap` / size it. `false` only for a handle
@@ -29889,12 +29684,12 @@ impl Host {
         true
     }
 
-    /// Whether [`Host::apply_premap`] has anything to map: an op-15 pre-map, or a JIT thaw's §13
+    /// Whether [`Host::apply_premap`] has anything to map: an op-17 pre-map, or a JIT thaw's §13
     /// pages (#2025).
     pub fn has_premap(&self) -> bool {
         self.premap.is_some() || !self.realias.is_empty()
     }
-    /// Take the staged op-15 pre-map — `(the region's backing, window offset)` — **instead of**
+    /// Take the staged op-17 pre-map — `(the region's backing, window offset)` — **instead of**
     /// applying it, for a driver whose emitted tier cannot alias (#1527): the browser's op-13
     /// servicer copies the region's bytes into the child's own `WebAssembly.Memory` at the offset
     /// before the child starts and copies `[offset, offset + size)` back into the region when it
@@ -29908,7 +29703,7 @@ impl Host {
         Some((backing, off))
     }
 
-    /// Op-15 **pre-map apply** (the child side, once): alias the staged region whole, read-write, into
+    /// Spawn **pre-map apply** (the child side, once): alias the staged region whole, read-write, into
     /// `mem` at the staged offset through [`region_map`](Self::region_map) — the child's own
     /// `SharedRegion.map` path. #2025 — and the §13 aliases a JIT thaw's window is restored with
     /// ([`Host::reset_cap_pages`]), on a root's window as on a child's. `0` with nothing staged;
@@ -29958,39 +29753,6 @@ impl Host {
         }
     }
 
-    /// §3b — **consume** a Budget at a carve spawn's commit: the room left is returned and the node's
-    /// ceilings are zeroed (the handle stays granted; `read` reports 0s), so one budget funds exactly
-    /// one carve child — split first to fund several. `None` for a dangling/mistyped handle.
-    pub(crate) fn take_budget(&mut self, h: i32) -> Option<BudgetState> {
-        match self.resolve(h, cap_id::BUDGET).ok()? {
-            Binding::Budget(node) => self.budgets.take(node).map(BudgetState::from_dims),
-            _ => None,
-        }
-    }
-
-    /// §3c.2 — the one Budget read/consume a record spawn performs, exposed for the JIT tier's
-    /// `BudgetTaker` callback (the interpreter's op-17 arm does the same peek-then-drain
-    /// inline). `drain = false` peeks (validates the handle and gates `child_size` against the
-    /// mem quota; budget untouched); `drain = true` consumes to zero at spawn commit. Returns
-    /// `None` for a dangling/mistyped handle (CapFault), `Some(Err(()))` when a bounded mem
-    /// quota refuses the carve (probeable `-EINVAL`, budget intact), else `Some(Ok((fuel,
-    /// spawn)))` with the Budget's `-1` = unbounded convention.
-    pub fn budget_for_spawn(
-        &mut self,
-        handle: i32,
-        child_size: u64,
-        drain: bool,
-    ) -> Option<Result<(i64, i64), ()>> {
-        let b = self.peek_budget(handle)?;
-        if b.mem >= 0 && child_size > b.mem as u64 {
-            return Some(Err(()));
-        }
-        if drain {
-            self.take_budget(handle)?;
-        }
-        Some(Ok((b.fuel, b.spawn)))
-    }
-
     /// Grant a §15 / PROCESS.md §5 `Budget`, a node under this domain's own node with these
     /// ceilings, returning its handle. The embedder mints it with what it lends a domain;
     /// the guest `split`s child nodes under it and `read`s the room left. A field of `-1` means
@@ -30029,45 +29791,19 @@ impl Host {
         self.attestation
     }
 
-    /// The §6 [`Attestation`] to stamp on a §14 **nested child** this host spawns: the child inherits
-    /// the parent's isolation tier, is always `window_exposed` (the parent sees its carve — the §14
-    /// superset, so an ancestor holds read authority), and is `freeze_exposed` iff spawned into a
-    /// **durable** subtree (an ancestor may snapshot it — a snapshot is a read).
-    /// PROCESS.md §5 — a **detached** child's attestation: same in-process tier (never a
-    /// Spectre boundary — real distrust is a separate process), but `window_exposed = false`
-    /// (no ancestor below the platform holds read authority over its platform-minted window)
-    /// and never ancestor-freezable. The jacl distrust-spawner report.
-    fn detached_child_attestation(&self) -> Attestation {
+    /// PROCESS.md §5 — a **detached** child's attestation: the spawner's in-process tier (never a
+    /// Spectre boundary — real distrust is a separate process), and `window_exposed` only for a
+    /// `paged` child (#2095): its spawner is its pager, which chooses each page's contents at first
+    /// touch and sees every fault address in the child's coordinates. Otherwise no ancestor below the
+    /// platform holds rights over its platform-minted window: the jacl distrust-spawner report.
+    fn detached_child_attestation(&self, paged: bool) -> Attestation {
         Attestation {
             tier: self.attestation.tier,
-            window_exposed: false,
-            // Derived, like the nested case (#1440): an ancestor may snapshot this child iff the
-            // spawner holds `DetachedProgeny` *and* the subtree is durable. Both conjuncts matter —
-            // authority is *who may*, durability is *whether a snapshot is possible at all*.
-            freeze_exposed: self.durable
-                && self.holds_freeze_authority(FreezeScope::DetachedProgeny),
-        }
-    }
-
-    /// `freeze_exposed` is **derived** when the caller can name the child's carve: an ancestor may
-    /// snapshot it iff someone holds freeze authority covering that range *and* the subtree is
-    /// durable. The two are different questions the single bit had been conflating — authority is
-    /// *who may*, durability is *whether a snapshot is possible at all* — and separating them is what
-    /// lets a detached child be platform-durable and ancestor-confidential at once (PROCESS.md §6).
-    ///
-    /// `carve = None` keeps the old placement reading (durable ⇒ exposed) for the two callers with no
-    /// range in hand: a non-durable child, where the answer is `false` either way, and the thaw
-    /// re-stamp, whose parent's authority rode the freeze but whose carve the restore path does not
-    /// thread through yet. A parameter rather than a second function, so there is one answer to what a
-    /// child's report says (INVARIANTS #15); threading the carve through the thaw closes the `None`.
-    fn child_attestation(&self, durable: bool, carve: Option<(u64, u64)>) -> Attestation {
-        Attestation {
-            tier: self.attestation.tier,
-            window_exposed: true,
-            freeze_exposed: durable
-                && carve.is_none_or(|(base, size)| {
-                    self.holds_freeze_authority(FreezeScope::Carve { base, size })
-                }),
+            window_exposed: paged,
+            // Derived (#1440): an ancestor may snapshot this child iff the spawner holds freeze
+            // authority *and* the subtree is durable. Both conjuncts matter — authority is *who
+            // may*, durability is *whether a snapshot is possible at all*.
+            freeze_exposed: self.durable && self.holds_freeze_authority(),
         }
     }
 
@@ -30125,6 +29861,10 @@ impl Host {
         let Some(validate) = self.module_validator else {
             return EINVAL;
         };
+        // #2222 — guest-minting, so a full table is `-EMFILE`, checked before the gate's work.
+        if self.room() == 0 {
+            return EMFILE;
+        }
         match validate(bytes) {
             Ok(m) => self.grant_module_shared(Arc::new(m), false) as i64,
             Err(e) => e,
@@ -30226,15 +29966,10 @@ impl Host {
     /// no-op there.
     fn jit_reapply(&self) -> Vec<JitReapply> {
         let mut out = Vec::new();
-        for (d, t) in self.jit_tables.iter().enumerate() {
+        for t in &self.jit_tables {
             for &(slot, unit) in &t.installed {
                 if let Some(u) = t.units.get(unit as usize) {
-                    out.push((
-                        slot,
-                        Arc::clone(&u.funcs),
-                        Arc::clone(&u.types),
-                        (d as u32, unit),
-                    ));
+                    out.push((slot, Arc::clone(&u.funcs), Arc::clone(&u.types)));
                 }
             }
         }
@@ -30480,13 +30215,12 @@ impl Host {
         }
         d.units_left -= 1;
         // #1529: [`temen_ir::spawns_detached`] scans the **root** module, so the two reference
-        // powerboxes never granted the by-name spawn set to a guest whose only `call.cap 6 15` lives
-        // in a §22 submitted unit — its op 15 then refused `-EINVAL` for want of a `"module"` /
-        // `"budget"` it could not ask for. Noted here, granted below: the grant appears exactly when
-        // a spawner appears, which is the same least-authority rule, just evaluated at install
-        // instead of at powerbox build.
+        // powerboxes never granted the by-name spawn set to a guest whose only spawn `call.cap` lives
+        // in a §22 submitted unit — its spawn then refused `-EINVAL` for want of a `"budget"` it
+        // could not ask for. Noted here, granted below: the grant appears exactly when a spawner
+        // appears, which is the same least-authority rule, just evaluated at install instead of at
+        // powerbox build.
         let unit_spawns_detached = funcs.iter().any(temen_ir::Func::spawns_detached);
-        let unit_by_handle = funcs.iter().any(temen_ir::Func::spawns_by_module_handle);
         let unit = d.units.len() as u32;
         // No wasm yet: the browser tier emits a unit **lazily**, on its first read through
         // [`Self::jit_unit_wasm_or_emit`] — the one emit path for a `compile`d, a `compile_linked`,
@@ -30498,31 +30232,28 @@ impl Host {
             install_code: 0,
             install_type_id: 0,
             wasm: None,
-            grant: std::sync::OnceLock::new(),
         });
         // #1529 (see above): the unit installed and it spawns detached, so grant the set now —
         // each name once (`grant_detached_spawn_caps` skips a name already registered). Three conditions keep it
         // a strict subset of what this guest already holds, never a new frontier:
         //
         // - a named `"instantiator"` must be present — the embedder's own decision to hand this
-        //   guest §14 spawn authority over its window; its size is the budget, exactly as both
-        //   reference powerboxes pass one `win` to both calls. No instantiator, no grant.
-        // - `"module"` is the **running module** ([`Host::set_self_module`]), i.e. this guest's own
-        //   code, and `grant_detached_spawn_caps` no-ops with none registered.
-        // - **not durable**: the `"module"` grant is non-durable (a freeze fails
-        //   `NonDurableKind::Module`), so granting it mid-run would silently make a snapshot-taking
-        //   domain unfreezable. A durable domain spawns detached only from an attested-freezable
-        //   grant (#1501), which this is not, so this forgoes nothing.
+        //   guest §14 spawn authority. No instantiator, no grant. The budget is one window, the one
+        //   the unit was validated against (`mem_log2`): the `win` every reference powerbox grants
+        //   its spawn set from.
+        // - `"child"` is the **running module's** child image ([`Host::set_self_module`]), i.e. this
+        //   guest's own code, and `grant_detached_spawn_caps` no-ops with none registered.
+        // - **not durable**: a durable domain spawns detached only from an attested-freezable grant
+        //   (#1501), which the child image is not, so this forgoes nothing.
         //
         // The decision lives here, not in the powerbox tier, because this is the only point that sees
         // both the validated unit and the host — the injected [`JitValidator`] is a bare `fn`.
-        if unit_spawns_detached && !self.durable {
-            if let Some(win) = self
-                .resolve_cap_name("instantiator")
-                .and_then(|h| self.resolve_instantiator(h).ok())
-                .map(|(_, size)| size)
-            {
-                self.grant_detached_spawn_caps(win, unit_by_handle);
+        // #2222 — at most three grants, mid-run, into a table the guest may have filled: with no room
+        // for them the unit installs without the set, and its spawns refuse as before #1529.
+        if unit_spawns_detached && !self.durable && self.room() >= 3 {
+            let inst = self.resolve_cap_name("instantiator");
+            if inst.is_some_and(|h| self.resolve_instantiator(h).is_ok()) {
+                self.grant_detached_spawn_caps(mem_log2.map_or(0, |m| 1u64 << m));
             }
         }
         // Guest-minting: a full handle table is -EMFILE, never a panic (§3c / audit #1). The
@@ -30709,7 +30440,7 @@ impl Host {
     /// `-EMFILE` instead of panicking). Checks for a free slot **before** registering the backing, so
     /// a full table leaves `regions` untouched (no leaked backing).
     pub fn try_grant_shared_region_backed(&mut self, backing: RegionBacking) -> Option<i32> {
-        if self.table.iter().all(|s| s.entry.is_some()) {
+        if self.room() == 0 {
             return None; // table full — don't register a backing we can't hand out
         }
         let id = self.hold_region(backing);
@@ -30841,7 +30572,7 @@ impl Host {
     }
 
     /// PROCESS.md S2 — resolve `handle` to its `(type_id, binding)` for **re-granting into a child**
-    /// (`Instantiator.instantiate_granted`), so a §14 child is not born destitute. Only a
+    /// (a spawn record's grant list), so a §14 child is not born destitute. Only a
     /// **coordinate-free, self-contained** capability qualifies — one a fresh child `Host` can hold
     /// as-is: `Stream` (stdio), `Exit`, `Clock`. Refused (`CapFault`), deliberately:
     /// - **index-carrying** caps (`SharedRegion`/`Module`/`Blocking`/`HostProc*`) whose index
@@ -30862,41 +30593,6 @@ impl Host {
             },
             _ => Err(Trap::CapFault),
         }
-    }
-
-    /// PROCESS.md S2 (JIT parity) — build a §14 **granted child** powerbox: a fresh `Host` holding an
-    /// `Instantiator` + `AddressSpace` over its own window `[0, child_size)` and the parent's
-    /// re-granted coordinate-free capability `grant_handle` (`Stream`/`Exit`/`Clock`). Returns the
-    /// child `Host` and its three entry-arg handles `(instantiator, address_space, grant)`, or `None`
-    /// for a forged / non-copyable handle ([`Self::resolve_copyable`]). A stdout/stderr `Stream` grant
-    /// points the child's sink at the parent's shared buffer (stdio inheritance), so the child's output
-    /// reaches the granting embedder rather than the child's discarded host buffer.
-    ///
-    /// This is the child-host construction the interpreter's own `instantiate_granted` (op 8) inlines,
-    /// factored out so the **JIT** backend can build the *same* child powerbox host-side (via
-    /// `temen_run::grant_child_build`) and keep both backends in differential lockstep — the child sees an
-    /// identical set of handles and the same shared sink.
-    ///
-    /// The grant may be a coordinate-free cap (`Stream`/`Exit`/`Clock`) **or a pipe end** — the latter
-    /// aliases its shared FIFO into the child (the cross-domain `cmd1 | cmd2` grant), see
-    /// [`Self::regrant_into_child`].
-    pub fn spawn_granted_child(
-        &mut self,
-        grant_handle: i32,
-        child_size: u64,
-    ) -> Option<(Host, i32, i32, i32)> {
-        // Reject a non-grantable handle before building anything (fail closed, no state mutated).
-        if !self.can_regrant(grant_handle) {
-            return None;
-        }
-        let mut ch = self.child_host();
-        // §3.6/5c.0: same-program child — seed the holder's self module (see spawn_named_child).
-        ch.set_self_module_opt(self.self_module.clone());
-        // §6: a granted child is nested (window-exposed) and non-durable (not ancestor-freezable).
-        ch.set_attestation(self.child_attestation(false, None));
-        let (cinst, cas) = ch.grant_starter_caps(child_size);
-        let cg = self.regrant_into_child(grant_handle, &mut ch)?;
-        Some((ch, cinst, cas, cg))
     }
 
     /// The spawn's authority check for one entry of a grant list: a re-grantable table handle
@@ -30955,6 +30651,8 @@ impl Host {
         match serve_live_export(handle) {
             Some(k) => {
                 let (names, sigs) = self.offer_shape(k)?;
+                // #2222 — as [`Self::regrant_into_child`] refuses a full table.
+                (child.room() > 0).then_some(())?;
                 Some(child.install_live_impl(Arc::clone(cell?), k, names.into(), sigs.into(), None))
             }
             None => self.regrant_into_child(handle, child),
@@ -30973,8 +30671,8 @@ impl Host {
     ///
     /// - `CapFault`: `handle` is one no spawn could grant ([`Self::can_grant`]). Checked first, so a
     ///   forgery traps whatever became of the child.
-    /// - `-EINVAL`: no live child: it has ended, or it is a carve child — a carve charges no node, so
-    ///   its own is the run node — whose path is retired (INVARIANTS #13, #1867).
+    /// - `-EINVAL`: no live child: it has ended, or it holds no budget node of its own (its node is
+    ///   the run's).
     /// - `-EINVAL`: a `Jit` table, whose install slots size the child's dispatch table, or a forkable
     ///   host proc, which wires the child's signal doors. Both are fixed when the child starts, so
     ///   only a spawn grants them.
@@ -30995,7 +30693,7 @@ impl Host {
         if self.jit_table(handle) || self.forkable_host_proc(handle) {
             return Ok(EINVAL);
         }
-        if child.table.iter().all(|s| s.entry.is_some()) {
+        if child.room() == 0 {
             return Ok(EMFILE);
         }
         Ok(self
@@ -31028,7 +30726,7 @@ impl Host {
             || self.forkable_host_proc(handle)
             || matches!(self.resolve(handle, cap_id::MODULE), Ok(Binding::Module(_)))
             || self.jit_table(handle)
-            || self.progeny_authority(handle).is_some()
+            || self.freeze_authority(handle)
     }
 
     /// #1296 — whether `handle` names a `Jit` table, which a spawn re-grants as a fresh table of the
@@ -31037,14 +30735,13 @@ impl Host {
         matches!(self.resolve(handle, cap_id::JIT), Ok(Binding::JitTable(_)))
     }
 
-    /// #2018 — the freeze authority over **detached progeny** `handle` names, the one form a spawn
-    /// re-grants ([`Self::regrant_into_child`]). Never the [`FreezeScope::Carve`] form: that names a
-    /// range of this domain's window, which is no range of the child's.
-    fn progeny_authority(&self, handle: i32) -> Option<FreezeScope> {
-        match self.resolve(handle, cap_id::FREEZE_AUTHORITY) {
-            Ok(Binding::FreezeAuthority(s @ FreezeScope::DetachedProgeny)) => Some(s),
-            _ => None,
-        }
+    /// #2018 — whether `handle` names freeze authority, which a spawn re-grants
+    /// ([`Self::regrant_into_child`]).
+    fn freeze_authority(&self, handle: i32) -> bool {
+        matches!(
+            self.resolve(handle, cap_id::FREEZE_AUTHORITY),
+            Ok(Binding::FreezeAuthority)
+        )
     }
 
     /// FORK.md §8.5 slice 3 — whether `handle` is a **forkable** host proc (carries a fork factory),
@@ -31063,6 +30760,12 @@ impl Host {
     /// or `None` for a forged / non-grantable cap. (A pipe end is checked first: it is index-carrying,
     /// so `resolve_copyable` would refuse it.)
     pub(crate) fn regrant_into_child(&mut self, handle: i32, child: &mut Host) -> Option<i32> {
+        // #2222 — every arm below installs exactly one entry, most with the infallible grant, and a
+        // guest reaches this with a table it filled (an offer call's `cap` argument, a spawn's grant
+        // list): a full table refuses it before any arm changes either host.
+        if child.room() == 0 {
+            return None;
+        }
         if let Some((write, backing)) = self.resolve_pipe_end(handle) {
             return Some(child.install_pipe_end(write, backing));
         }
@@ -31119,11 +30822,13 @@ impl Host {
                 .host_procs
                 .get(idx as usize)
                 .and_then(|e| e.fork.clone())
-                .map(|factory| {
+                .and_then(|factory| {
                     // Pid `0` = anonymous: this re-grant wires a *spawned* child (no fork pid — its
                     // TaskId is minted later, by the spawn), so the personality mints the clone
-                    // without registering it in its process table (#863 slice 2).
-                    let forked = factory(0);
+                    // without registering it in its process table (#863 slice 2). A provider with
+                    // no room for the child's copy refuses the re-grant (#2373).
+                    let forked = factory(0)?;
+                    child.abandon_hooks.extend(forked.abandon);
                     if let Some((source, armed)) = forked.signal {
                         child.set_signal_source(source, armed);
                     }
@@ -31133,11 +30838,16 @@ impl Host {
                     if let Some(x) = forked.exec_remap {
                         child.exec_remap_hooks.push(x);
                     }
-                    let h = child.grant_host_proc_forkable(
-                        forked.handler,
-                        forked.refork.unwrap_or_else(|| Arc::clone(&factory)),
-                        forked.state,
-                    );
+                    // #2424 — the handler the factory minted, of whichever shape: an offloadable
+                    // one parks the child's caller as the parent's parks its own.
+                    let h = child.grant_host_proc_entry(HostProcEntry {
+                        handler: forked.handler,
+                        fork: Some(forked.refork.unwrap_or_else(|| Arc::clone(&factory))),
+                        mints: false,
+                        vtable: None,
+                        state: forked.state,
+                        on_host: false,
+                    });
                     // #801 — the vtable rides the re-grant, and its op names enter the child's
                     // directory: a spawned `__px_`-linked child binds its manifest in-loop, same
                     // as an exec'd one.
@@ -31151,7 +30861,7 @@ impl Host {
                             }
                         }
                     }
-                    h
+                    Some(h)
                 });
         }
         // #1296 — a §22 **`Jit`** grant: the child gets a **fresh, empty unit table** of its own, not an
@@ -31201,8 +30911,8 @@ impl Host {
         // the one way INVARIANTS' R1 ruling lets an ancestor's authority reach a descendant ("only by
         // grant"). A copy, so the parent keeps its own. A durable child holding it may spawn detached
         // children of its own, which a freeze of the tree then captures (`admit_detached_spawn`).
-        if let Some(scope) = self.progeny_authority(handle) {
-            return child.try_grant_freeze_authority(scope);
+        if self.freeze_authority(handle) {
+            return child.try_grant_freeze_authority();
         }
         let (tid, binding) = self.resolve_copyable(handle).ok()?;
         if let Binding::Stream { role, sink } = binding {
@@ -31274,9 +30984,9 @@ impl Host {
     }
 
     /// #1866 — this (detached child's) powerbox as a [`ChildPowerbox`], or `None` when its table holds
-    /// a binding that is not a plain value.
+    /// a binding that is neither a plain value nor a module grant.
     pub(crate) fn child_powerbox(&self) -> Option<ChildPowerbox> {
-        let handles = self.capture_durable_handles().ok()?;
+        let handles = self.capture_handles(true).ok()?;
         let plain = handles.iter().all(|h| {
             matches!(
                 h.binding,
@@ -31284,13 +30994,24 @@ impl Host {
                     | DurableBinding::Exit
                     | DurableBinding::Clock
                     | DurableBinding::AddressSpace { .. }
-                    | DurableBinding::Instantiator { .. }
-                    | DurableBinding::FreezeAuthority(_)
+                    | DurableBinding::Instantiator
+                    | DurableBinding::FreezeAuthority
                     | DurableBinding::Budget { .. }
             )
         });
+        let module_slots = self
+            .table
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, s)| match s.entry {
+                Some(Binding::Module(id)) => Some((slot as u32, s.generation, s.type_id, id)),
+                _ => None,
+            })
+            .collect();
         plain.then(|| ChildPowerbox {
             handles,
+            module_slots,
+            modules: self.modules.clone(),
             names: self.cap_names.clone(),
             import_bindings: self.import_bindings.clone(),
             import_remaps: self.import_remaps.clone(),
@@ -31317,6 +31038,10 @@ impl Host {
         child.set_window_held(pb.held);
         child.lane_cap = pb.lane_cap;
         child.restore_durable_handles(&pb.handles);
+        child.modules = pb.modules.clone();
+        for &(slot, generation, type_id, id) in &pb.module_slots {
+            child.grant_at(slot, generation, type_id, Binding::Module(id));
+        }
         child.cap_names = pb.names.clone();
         child.import_bindings = pb.import_bindings.clone();
         child.import_remaps = pb.import_remaps.clone();
@@ -31342,32 +31067,14 @@ impl Host {
         *tree = nodes.to_vec();
     }
 
-    /// PROCESS.md S2 (JIT parity) — build a §14 **named-grant child** powerbox: a fresh `Host` holding
-    /// an `Instantiator` + `AddressSpace` over `[0, child_size)` and each of `grants` (a list of
-    /// `(name, handle)`) re-granted under its name, so the child discovers them by `self.resolve`.
-    /// Returns the child `Host` and its `(instantiator, address_space)` handles, or `None` if **any**
-    /// grant's handle is forged / non-copyable (the whole spawn fails closed, `CapFault`, matching the
-    /// interpreter's op-11 path). stdout/stderr grants share the parent's sinks (stdio inheritance).
-    ///
-    /// The multi-cap, by-name analog of [`Self::spawn_granted_child`]; the JIT reads the guest's grant
-    /// records from the window (host-side, `temen_run::grant_named_child_build`) and calls this, so both
-    /// backends register the same names against the same shared sinks.
-    pub fn spawn_named_child(
-        &mut self,
-        grants: &[(String, i32)],
-        child_size: u64,
-    ) -> Option<(Host, i32, i32)> {
-        // §6: a named-grant child is nested (window-exposed) and non-durable (not ancestor-freezable).
-        let attestation = self.child_attestation(false, None);
-        self.spawn_child_powerbox(grants, child_size, attestation, None, None)
-    }
-
-    /// PROCESS.md §5 / #1287 — the **detached** twin of [`Self::spawn_named_child`]: the same by-name
-    /// re-grants, but the child attests `window_exposed = false` (no ancestor below the platform holds
-    /// read authority over its minted window) and its starter caps span `reservation` — the whole
-    /// window reservation, a root's shape, so the child's `vm_map` grows it. The native JIT's op-15
-    /// thunk builds the child powerbox through this (`temen_run::grant_detached_child_build`), so
-    /// both backends stamp the same attestation and caps. `lease` and `lane` are what the admission
+    /// PROCESS.md §5 / #1287 — build a **detached** child's powerbox: each of `grants` (a list of
+    /// `(name, handle)`) re-granted under its name, so the child discovers them by `self.resolve`
+    /// (stdout/stderr grants share the spawner's sinks), or `None` if any handle is forged or not
+    /// re-grantable — the whole spawn fails closed. It attests `window_exposed = false` (no ancestor
+    /// below the platform holds rights over its minted window) unless it is `paged`: its spawner pages
+    /// it (#2095, #2164). Its starter caps span `reservation` — the whole window reservation, a root's shape, so the
+    /// child's `vm_map` grows it. The native JIT's op-17 thunk builds the child powerbox through this
+    /// (`temen_run::grant_detached_child_build`), so both backends stamp the same attestation and caps. `lease` and `lane` are what the admission
     /// before this build ([`Self::admit_detached_spawn`]) charged and reserved for the child.
     pub fn spawn_detached_child(
         &mut self,
@@ -31375,10 +31082,12 @@ impl Host {
         reservation: u64,
         lease: Lease,
         lane: i64,
+        paged: bool,
     ) -> Option<(Host, i32, i32)> {
-        let attestation = self.detached_child_attestation();
+        // #2095 — a paged child's window is exposed to its spawner, which pages it.
+        let attestation = self.detached_child_attestation(paged);
         // §4 / #1501: the detached child inherits the spawner's durability, as the tree-walker's
-        // op-15 arm sets it (this builder is the native path's twin of that arm).
+        // op-17 arm sets it (this builder is the native path's twin of that arm).
         // `spawn_child_powerbox` itself stays durability-neutral — its nested callers carry the bit on
         // the vCPU; the nesting × durability cell on the resumable engine is #1413's to audit, not
         // this builder's to decide.
@@ -31436,45 +31145,23 @@ impl Host {
             self.give_child_budget(lease, &mut ch);
         }
         for (name, handle) in grants {
-            // Pre-checked above, so this cannot fail: each entry is granted into the child under its
-            // name, a live self-serve grant as an offer over this host's own cell.
-            self.grant_entry_into_child(cell, name, *handle, &mut ch)?;
+            // Each entry is granted into the child under its name, a live self-serve grant as an offer
+            // over this host's own cell. Pre-checked above, so only a provider with no room for the
+            // child's copy refuses one (#2373), which refuses the spawn and undoes the grants before it.
+            if self
+                .grant_entry_into_child(cell, name, *handle, &mut ch)
+                .is_none()
+            {
+                ch.abandon();
+                return None;
+            }
         }
         Some((ch, cinst, cas))
     }
 
-    /// **Marshal a §14 op-13 grant list from a confined window and build the child powerbox** (#1025
-    /// slice 3a) — the safe, wasmi-friendly counterpart of the native `temen_run::grant_named_child_build`.
-    /// Reads `grants_n` × 16-byte records `{name_off: u32, name_len: u32, handle: i32, flags: u32}` at
-    /// window-relative `grants_ptr` from `window` (the parent's confined, readable window), then re-grants
-    /// each `(name, handle)` from `self` via [`Self::spawn_named_child`]. `flags` (bytes 12..16) is
-    /// reserved and ignored, exactly as on the native and interpreter (`read_grant_records`) paths.
-    ///
-    /// Fail-closed ([`GrantMarshalError`]): an out-of-window record/name (`OutOfWindow`), a non-UTF-8 name
-    /// (`BadName`), or any non-re-grantable handle (`NotRegrantable`, surfaced by `spawn_named_child`)
-    /// refuses the whole spawn — no partial child is built. This is the mechanism the wasm-JIT
-    /// `env.instantiate_module` servicer calls to carry a shared `fs` (or `stdout`) across the emitted
-    /// bounce; the `can_regrant` re-grant policy stays in `spawn_named_child` (INVARIANTS §4 — the
-    /// constructor is mechanism, the authority decision is one place).
-    pub fn spawn_named_child_from_window(
-        &mut self,
-        window: &[u8],
-        grants_ptr: u64,
-        grants_n: u64,
-        child_size: u64,
-    ) -> Result<(Host, i32, i32), GrantMarshalError> {
-        let grants = read_grant_records(grants_ptr, grants_n, |o, l| read_slice(window, o, l))
-            .map_err(|t| match t {
-                Trap::CapFault => GrantMarshalError::BadName,
-                _ => GrantMarshalError::OutOfWindow,
-            })?;
-        self.spawn_named_child(&grants, child_size)
-            .ok_or(GrantMarshalError::NotRegrantable)
-    }
-
     /// FORK.md §8.6 (#1080) — carry an `execve` **image-replace**'s process-surviving state from `self`
     /// (the old powerbox, about to be dropped) into `child` (the command's fresh powerbox from
-    /// [`Self::spawn_named_child`]). Same-process semantics: the personality (`host_procs`) moves
+    /// [`Self::exec_image`]). Same-process semantics: the personality (`host_procs`) moves
     /// verbatim (fds/pid/env survive exec, POSIX), the exit-hook + signal + stop/term/park cells are
     /// shared so the exec'd image stays kill/stop/wait-addressable, and the process's pipe **ends** are
     /// re-installed into the new powerbox (returned as `(old, new)` remap pairs) with the exec-remap
@@ -31543,6 +31230,7 @@ impl Host {
         self.cap_pages = pages;
         let mut twin = twin?;
         twin.cap_pages = Some((twin_base, Arc::new(Mutex::new(copy))));
+        twin.cap_shadow = self.cap_shadow;
         Some(twin)
     }
 
@@ -31563,6 +31251,14 @@ impl Host {
             source.spawn_commit(plan);
         }
         Some(twin)
+    }
+
+    /// #2373 — the fork or spawn building this domain refused it before it ran: undo what its
+    /// providers registered for it, so no personality keeps a process that never was.
+    fn abandon(&mut self) {
+        std::mem::take(&mut self.abandon_hooks)
+            .into_iter()
+            .for_each(|undo| undo());
     }
 
     /// A spawned process whose image could not be built in its powerbox (this, from
@@ -31729,6 +31425,38 @@ impl Host {
         child.stop_depth = Arc::clone(&self.stop_depth);
         child.term_flag = Arc::clone(&self.term_flag);
         child.park_request = Arc::clone(&self.park_request);
+        // The process's pipe ends re-install into the new powerbox (POSIX keeps fds), gated on a
+        // provider having DECLARED fd-preservation (an exec-remap hook registered) — a capability-path
+        // guest manages its ends explicitly and its exec contract is drop-by-default. The count bumps
+        // (`install_pipe_end`, below) happen BEFORE the driver's old-image release, so the shared
+        // counts never dip through the image-replace.
+        //
+        // Of those, only the ends the process can still reach ([`SignalSource::exec_keeps`]: its
+        // descriptors name them): an end nothing names would ride into the new image only to hold
+        // its pipe open — a spawned child's own stdin writer, closed by a file action, would keep
+        // the child from ever reading EOF. The ends left behind go with the old powerbox.
+        let keep_fds = !self.exec_remap_hooks.is_empty();
+        let keeps = self
+            .signal_poll()
+            .and_then(|(_, source)| source.exec_keeps());
+        let ends: Vec<(i32, bool, PipeBacking)> = (0..if keep_fds { self.table.len() } else { 0 })
+            .filter_map(|slot| {
+                let st = &self.table[slot];
+                st.entry?;
+                let old_h = handle_of(slot as u32, st.generation);
+                if keeps.as_ref().is_some_and(|k| !k.contains(&old_h)) {
+                    return None;
+                }
+                let (is_w, backing) = self.resolve_pipe_end(old_h)?;
+                Some((old_h, is_w, backing))
+            })
+            .collect();
+        // #2222 — each carried personality and each kept end installs one entry with the infallible
+        // grant, over the new image's own: a process whose table was full refuses the exec here,
+        // before either host changes, instead of panicking the host.
+        if child.room() < self.host_procs.len() + ends.len() {
+            return Err(());
+        }
         // The host-served personality moves VERBATIM (same handler over the same Proc — fds, pid, env
         // survive exec), never through a fresh fork-clone. Each carried entry re-grants a handle in the
         // new powerbox, and its published vtable registers its op names in the new image's directory so
@@ -31746,34 +31474,10 @@ impl Host {
                 }
             }
         }
-        // The process's pipe ends re-install into the new powerbox (POSIX keeps fds), gated on a
-        // provider having DECLARED fd-preservation (an exec-remap hook registered) — a capability-path
-        // guest manages its ends explicitly and its exec contract is drop-by-default. The count bumps
-        // (`install_pipe_end`) happen BEFORE the driver's old-image release, so the shared counts never
-        // dip through the image-replace.
-        //
-        // Of those, only the ends the process can still reach ([`SignalSource::exec_keeps`]: its
-        // descriptors name them): an end nothing names would ride into the new image only to hold
-        // its pipe open — a spawned child's own stdin writer, closed by a file action, would keep
-        // the child from ever reading EOF. The ends left behind go with the old powerbox.
         let mut remap: Vec<(i32, i32)> = Vec::new();
-        let keep_fds = !self.exec_remap_hooks.is_empty();
-        let keeps = self
-            .signal_poll()
-            .and_then(|(_, source)| source.exec_keeps());
-        for slot in 0..(if keep_fds { self.table.len() } else { 0 }) {
-            let st = &self.table[slot];
-            if st.entry.is_none() {
-                continue;
-            }
-            let old_h = handle_of(slot as u32, st.generation);
-            if keeps.as_ref().is_some_and(|k| !k.contains(&old_h)) {
-                continue;
-            }
-            if let Some((is_w, backing)) = self.resolve_pipe_end(old_h) {
-                let nh = child.install_pipe_end(is_w, backing);
-                remap.push((old_h, nh));
-            }
+        for (old_h, is_w, backing) in ends {
+            let nh = child.install_pipe_end(is_w, backing);
+            remap.push((old_h, nh));
         }
         // The new image's manifest binds **strictly** — the same walk as a §14 child, so an import
         // nothing can satisfy refuses the exec and the caller gets `-EINVAL` back while it still
@@ -31864,8 +31568,8 @@ impl Host {
     /// The new image's starter caps span `window_reserved`, the caller's **whole window** — its
     /// reservation, the confinement bound its `GuestMem` reports ([`GuestMem::window_size`]). The
     /// image replaces the caller's in the same window, so it holds the memory authority the caller
-    /// held there: its `vm_map` grows the heap past the backed prefix as the caller's could, a root's
-    /// up to its reservation and a §14 child's up to its carve. Spanning only the backed prefix, a
+    /// held there: its `vm_map` grows the heap past the backed prefix as the caller's could, up to
+    /// its reservation. Spanning only the backed prefix, a
     /// process lost its heap's growth on `execve`, and a compiler it ran ran out of memory (#763).
     ///
     /// `Err(errno)` is a refusal that changed nothing — the caller keeps running and gets the errno:
@@ -31936,6 +31640,7 @@ impl Host {
             &mut starters,
         );
         if carried.is_err() {
+            host.abandon();
             return Err(refused(self));
         }
         // #2106, #2332 — committed: the domain pays for the image's window now, as a root's main vCPU
@@ -32072,8 +31777,8 @@ impl Host {
         // real one (the same reasoning as the parked-stdin tape suppression below).
         // #1366: the face is no longer forced sync under a W1 tape — a pool job is still run inline
         // under a tape (see `punt_or_inline`, so the taped result is the real one), while a
-        // host-completed punt keeps the parking face: it has no job to run inline, parks, and its
-        // delivered value joins the tape at `deliver_cap`.
+        // host-answered punt keeps the parking face: it has no job to run inline, parks, and its
+        // delivered value joins the tape where a driver delivers it (#2495).
         // §7 executable named import (IMPORTS.md phase 1): the reserved pseudo-`type_id` carries the
         // **import index** in `op`; translate it through the instantiation-time binding table to the
         // bound `(type_id, op, granted handle)` and fall through to the ordinary flow. Translating
@@ -32216,9 +31921,9 @@ impl Host {
                 // A parked blocking-stdin read (W4) is a placeholder the driver discards and
                 // re-issues — taping it would replay as a phantom EOF. Only the re-issued
                 // (completed) read joins the tape. Likewise a **punted** dispatch (#1366 host-
-                // completed, or an offloaded job): its result slots are a placeholder the
-                // completion fills in later — a host-completed call's delivered value is taped by
-                // `deliver_cap` instead.
+                // answered, or an offloaded job): its result slots are a placeholder the
+                // completion fills in later — a host-answered call's delivered value is taped
+                // where a driver delivers it instead ([`Completions::take_record`]).
                 let punted = pending.as_deref().is_some_and(|p| p.is_some());
                 if !self.stdin_parked && !punted {
                     rec.push(CapRecord {
@@ -32474,9 +32179,9 @@ impl Host {
             // #1440: freeze authority is pure authority, like `Module` — the freeze path consults it,
             // nothing calls it. An `EINVAL` rather than a trap keeps it probeable (INVARIANTS #5:
             // traps are for forgery, and the handle here is genuine).
-            Binding::FreezeAuthority(_) => Ok(vec![EINVAL]),
-            // PROCESS.md §5: a window minter is spawn *evidence* (an `instantiate_detached`
-            // argument), not a dispatch target — inert probeable refusal.
+            Binding::FreezeAuthority => Ok(vec![EINVAL]),
+            // PROCESS.md §5: a window minter is spawn *evidence* (a detached spawn's budget), not
+            // a dispatch target — inert probeable refusal.
             // §3.6 slice 1: `Stream.close` is **real** — the guest-side revocation act (D37
             // turned inward: the holder hangs up). Null the slot entry so every later use of the
             // handle is the clean use-after-close answer (I41: the probeable `-EBADF`, matching
@@ -32558,9 +32263,9 @@ impl Host {
                         // window and clones of the cell), while the shared sub-run coexists with
                         // them. `busy` serves here as a **host-side-only gate**: one sub-run per
                         // instance at a time (a second host-side caller answers `-EAGAIN`,
-                        // probeable) because the sub-run wires transient run hooks
-                        // (`completion_notify`) onto the cell that two concurrent sub-runs would
-                        // clobber. The eval-loop threaded arm ignores `busy` entirely, so
+                        // probeable) because a sub-run's park wires the cell's completion store
+                        // to the sub-run's scheduler (`Completions::set_notify`), a hook that two
+                        // concurrent sub-runs would clobber. The eval-loop threaded arm ignores `busy` entirely, so
                         // eval-loop admission stays unbounded alongside one host-side sub-run —
                         // exactly the tier split §10.1 orders (gate = the provider's declaration,
                         // never the runtime's convenience).
@@ -32850,10 +32555,13 @@ impl Host {
                         let len = *args.get(1).unwrap_or(&0) as u64;
                         let gone = ClassChange::Every(PageClass::Own(0));
                         self.page_op(mem, win_off, len, Commits::Nothing, gone, |h, m| {
-                            if let Some(hook) = &h.region_hook {
+                            let r = m.unmap(win_off, len);
+                            // As `region_map`'s: the hook hears of a span only once the op took
+                            // it, so a span outside the window never reaches it (#2400).
+                            if let (0, Some(hook)) = (r, &h.region_hook) {
                                 hook(win_off, len, None);
                             }
-                            m.unmap(win_off, len)
+                            r
                         })
                     }
                     2 => backing.size() as i64,
@@ -32934,6 +32642,15 @@ impl Host {
                         } else {
                             EINVAL // `dst` is not under this node (itself, a peer, an ancestor)
                         }])
+                    }
+                    // close() -> 0 (#2384): give the handle up, as a `Stream`'s or a region's is
+                    // ([`Host::close`]): a later use answers `-EBADF`. The node stays in the tree,
+                    // where charges name it by id, so a child spawned from it is capped and charged
+                    // as before. A parent that splits a node per child closes its handle once the
+                    // child holds its own, or its table fills with them.
+                    3 => {
+                        self.close(handle);
+                        Ok(vec![0])
                     }
                     _ => Ok(vec![EINVAL]),
                 }
@@ -33060,14 +32777,15 @@ impl Host {
                     _ => EINVAL,
                 }])
             }
-            // The interpreter services `instantiate`/`join` in its eval loop (spawning a child vCPU
-            // needs the executor the generic dispatch can't reach), so it never routes an Instantiator
-            // here. A flat-window backend (the JIT) *does* — but only to **resolve this handle's
-            // authority**: op 0 returns the carve range `[base, base+size)` so the JIT can compile and
-            // run the child confined to a sub-window of it (the JIT owns the actual spawn). Other ops
-            // are inert here (the JIT routes `join` to its own child table, never to the Host).
-            Binding::Instantiator { base, size } => match op {
-                0 => Ok(vec![base as i64, size as i64]),
+            // Every engine services the spawn ops in its own executor (spawning a child vCPU needs
+            // what the generic dispatch can't reach), and no guest call reaches here: every engine
+            // refuses an Instantiator op it does not service (`temen_ir::served_shape_ok`). The
+            // Cranelift JIT, which cannot name a `Host`, routes op 0 here to resolve the handle's
+            // authority before it services an op itself: the resolve above has refused a forged or
+            // closed handle, so a live one answers with nothing (#2433: it once returned the carve
+            // range).
+            Binding::Instantiator => match op {
+                0 => Ok(vec![]),
                 _ => Err(Trap::CapFault),
             },
             // §14 `ModuleLoader` (iface 7): op 0 `from_bytes(ptr, len) -> module_handle | -errno`.
@@ -33088,40 +32806,10 @@ impl Host {
                 }
                 _ => Ok(vec![EINVAL]),
             },
-            // A §14 `Module` handle confers instantiation authority (through the Instantiator's module
-            // ops 5/6/7) plus one callable op:
-            //   op 0 `resolve_export(name_ptr, name_len) -> funcidx | -errno` (F2): look a name up in
-            //   the child module's first-class export table so a parent can address a child entry **by
-            //   name** rather than hardcoding its funcidx; the result is passed as the `entry` to the
-            //   Instantiator's module ops. The name is borrowed from the calling domain's window
-            //   (fail-closed: `-EFAULT` out of bounds, `-EINVAL` on bad UTF-8 / unknown name). Only the
-            //   funcidx (a small integer, already implicit in the granted module) crosses back — no
-            //   host pointer or grant-internal data is ever exposed.
-            Binding::Module(id) => match op {
-                0 => {
-                    let Some(mem) = mem else {
-                        return Ok(vec![EFAULT]);
-                    };
-                    let ptr = *args.first().unwrap_or(&0) as u64;
-                    let len = *args.get(1).unwrap_or(&0) as u64;
-                    let Some(bytes) = mem.read_bytes(ptr, len) else {
-                        return Ok(vec![EFAULT]);
-                    };
-                    let Some(g) = self.modules.get(id as usize) else {
-                        return Ok(vec![EINVAL]);
-                    };
-                    let Ok(name) = std::str::from_utf8(&bytes) else {
-                        return Ok(vec![EINVAL]);
-                    };
-                    Ok(vec![
-                        match g.module.exports.iter().find(|e| e.name == name) {
-                            Some(e) => e.func as i64,
-                            None => EINVAL,
-                        },
-                    ])
-                }
-                _ => Err(Trap::CapFault),
-            },
+            // A §14 `Module` handle confers instantiation authority (a spawn names it) and has no
+            // callable op. Its op 0 looked an export up by name, to pick a child's entry; a child
+            // starts at its module's function 0 now (#2219), so it went.
+            Binding::Module(_) => Err(Trap::CapFault),
             // Guest-driven `Jit` (iface 11, DESIGN.md §22). This generic arm is the **reference**
             // path (an interpreter run, or a wiring-bug fallback): op 0 `compile` validates +
             // stores the unit and mints its handle; op 2 `release` revokes one. op 1 `invoke` can
@@ -33662,6 +33350,21 @@ impl PageMap {
         self.prot.is_empty()
     }
 
+    /// #2025 — its §13 pages as maximal aliases, each run re-mapped in one `map`.
+    fn aliases(&self) -> Vec<RegionAlias> {
+        region_aliases(
+            self.page,
+            self.prot.iter().filter_map(|(&p, prot)| match *prot {
+                PageProt::Backed {
+                    region,
+                    region_off,
+                    writable,
+                } => Some((p, region, region_off, writable)),
+                _ => None,
+            }),
+        )
+    }
+
     /// #2268 — the runs of page state ([`PageClass`]) a window of `reserved` bytes with a `guard`-byte
     /// NULL guard starts with when restored from this map, in this host's pages: what its activation
     /// reserves of `maps` before the window exists.
@@ -33687,7 +33390,7 @@ impl PageMap {
 
     /// This map re-expressed in `page`-byte pages. Identity when the units already agree; otherwise
     /// every page of the target unit an entry covers takes that entry, last one winning — a finer
-    /// entry into a coarser page marks the whole page, the same rounding [`Mem::apply_prots`] does.
+    /// entry into a coarser page marks the whole page.
     ///
     /// The conversion lives here rather than at the restore site because it is a property of the map,
     /// not of who is installing it — and because the §12 codec's fixed 4 KiB, a 16 KiB native capture
@@ -33708,11 +33411,20 @@ impl PageMap {
 
 #[derive(Clone)]
 pub struct MemLayout {
-    /// Window bytes `[0, high_water)` — the mapped prefix plus any grown reserved-tail page (page-wise;
-    /// uncommitted pages read zero).
+    /// The window's bytes `[0, len)`: a capture's committed prefix, its declared window, or the whole
+    /// image a holder handed in (uncommitted pages read zero).
     bytes: Vec<u8>,
+    /// #2427 — the pages past `bytes` the window holds with contents of its own that are not all zero:
+    /// each `map.page` bytes long, by byte offset. Past `bytes` the page map names every page the
+    /// window holds (these, the zero ones, and those it aliased), and a page it does not hold is in
+    /// neither: a capture spends nothing on the span between two pages it holds.
+    tail: BTreeMap<u64, Vec<u8>>,
     /// Which pages deviate, in what unit, over what committed prefix.
     map: PageMap,
+    /// #2441 — a fresh run's seed ([`MemLayout::image`]): the low bytes a new instance's window starts
+    /// with, its data segments laid over them. Every other layout is a whole window, a capture's or an
+    /// artifact's, which a run starts from as it is.
+    seed: bool,
 }
 
 impl MemLayout {
@@ -33732,7 +33444,9 @@ impl MemLayout {
     ) -> Option<MemLayout> {
         Some(MemLayout {
             bytes,
+            tail: BTreeMap::new(),
             map: PageMap::from_entries(page, mapped, prot)?,
+            seed: false,
         })
     }
 
@@ -33754,27 +33468,19 @@ impl MemLayout {
     /// Build a layout from the §12 codec's **dense** form — one [`CapturedProt`] per
     /// [`DURABLE_SNAPSHOT_PAGE`] over `bytes` — for a window whose committed prefix is `mapped` (the
     /// module's declared memory). The inverse of [`dense_prots`](Self::dense_prots), and the same
-    /// rule [`Mem::apply_prots`] installs by: `Ro`/`Unmapped` always, `Rw` only where it is not the
-    /// default (a grown reserved-tail page).
+    /// rule the window installs it by: `Ro`/`Unmapped` always, `Rw` only where it is not the default
+    /// (a grown reserved-tail page). Its page unit is the codec's, so [`hold`](Self::hold) adds the
+    /// codec's tail pages to it.
     pub fn from_dense(bytes: Vec<u8>, prots: &[CapturedProt], mapped: u64) -> MemLayout {
         // A `Backed` page keeps its alias (#2025): the thaw maps it back onto its region.
-        let backed = prots.iter().enumerate().filter_map(|(i, &p)| match p {
-            CapturedProt::Backed {
-                region,
-                off,
-                writable,
-            } => Some((
-                i as u64,
-                PageProt::Backed {
-                    region,
-                    region_off: off,
-                    writable,
-                },
-            )),
-            _ => None,
-        });
+        let backed = prots
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| matches!(p, CapturedProt::Backed { .. }))
+            .map(|(i, &p)| (i as u64, p.into()));
         MemLayout {
             bytes,
+            tail: BTreeMap::new(),
             map: PageMap {
                 prot: sparse_prots(prots, DURABLE_SNAPSHOT_PAGE, mapped)
                     .chain(backed)
@@ -33782,14 +33488,27 @@ impl MemLayout {
                 page: DURABLE_SNAPSHOT_PAGE,
                 mapped,
             },
+            seed: false,
+        }
+    }
+
+    /// #2427 — hold one more page past the head in state `prot`, with `bytes` (`DURABLE_SNAPSHOT_PAGE`
+    /// of them) when it has contents: the codec's restore of a page a capture carried past the window's
+    /// head ([`tail_pages`](Self::tail_pages)). A layout from [`from_dense`](Self::from_dense), whose
+    /// page unit is the codec's.
+    pub fn hold(&mut self, off: u64, prot: CapturedProt, bytes: Option<Vec<u8>>) {
+        let page = off / self.map.page;
+        self.map.prot.insert(page, prot.into());
+        if let Some(bytes) = bytes {
+            self.tail.insert(page * self.map.page, bytes);
         }
     }
 
     /// The protection map in the §12 codec's **dense** form: one [`CapturedProt`] per
-    /// [`DURABLE_SNAPSHOT_PAGE`] over the captured bytes — the same rule [`Mem::snapshot_prots`]
-    /// uses, so an absent page is `Rw` below `mapped` and `Unmapped` above (an uncommitted hole
-    /// under a grown high-water stays a hole), and an entry in a coarser page unit covers every codec
-    /// page it spans.
+    /// [`DURABLE_SNAPSHOT_PAGE`] over the head ([`bytes`](Self::bytes)) — an absent page is `Rw`
+    /// below `mapped` and `Unmapped` above, the window's own default, and an entry in a coarser page
+    /// unit covers every codec page it spans. The pages held past the head are
+    /// [`tail_pages`](Self::tail_pages).
     pub fn dense_prots(&self) -> Vec<CapturedProt> {
         dense_prots(
             &self.map.prot,
@@ -33797,6 +33516,53 @@ impl MemLayout {
             self.map.mapped,
             self.bytes.len() as u64,
         )
+    }
+
+    /// The layout in the §12 codec's **dense** form, the inverse of [`from_dense`](Self::from_dense):
+    /// one image through the last page it holds, and one [`CapturedProt`] per
+    /// [`DURABLE_SNAPSHOT_PAGE`] of it. A page between two it holds past the head reads as an
+    /// `Unmapped` zero one — the image of a flat window, which holds its whole buffer (#2427).
+    pub fn to_dense(&self) -> (Vec<u8>, Vec<CapturedProt>) {
+        let unit = DURABLE_SNAPSHOT_PAGE as usize;
+        let (mut bytes, mut prots) = (self.bytes.clone(), self.dense_prots());
+        for (off, prot, page) in self.tail_pages() {
+            let at = off as usize;
+            bytes.resize(bytes.len().max(at + unit), 0);
+            prots.resize(bytes.len() / unit, CapturedProt::Unmapped);
+            prots[at / unit] = prot;
+            if let Some(page) = page {
+                bytes[at..at + page.len()].copy_from_slice(page);
+            }
+        }
+        (bytes, prots)
+    }
+
+    /// #2427 — each [`DURABLE_SNAPSHOT_PAGE`] past the head that the window holds or aliases,
+    /// ascending: its byte offset, its protection, and its bytes when it has contents of its own that
+    /// are not all zero (`None` reads zero; a §13 alias's bytes are its region's). A page the window
+    /// does not hold is not listed, however far the next one is.
+    pub fn tail_pages(&self) -> Vec<(u64, CapturedProt, Option<&[u8]>)> {
+        let head = self.bytes.len() as u64;
+        let unit = DURABLE_SNAPSHOT_PAGE;
+        let page = self.map.page;
+        self.map
+            .prot
+            .range(head / page..)
+            .flat_map(|(&pg, &p)| {
+                let base = pg * page;
+                let bytes = self.tail.get(&base);
+                (0..page.div_ceil(unit))
+                    .map(move |k| base + k * unit)
+                    .filter(move |&off| off >= head)
+                    .map(move |off| {
+                        let within = (off - base) as usize;
+                        let bytes = bytes
+                            .and_then(|b| b.get(within..(within + unit as usize).min(b.len())))
+                            .filter(|b| b.iter().any(|&x| x != 0));
+                        (off, p.captured(off - base), bytes)
+                    })
+            })
+            .collect()
     }
 
     /// Whether a page of this layout aliases a §13 region (#2025): its bytes are the region's, which
@@ -33809,23 +33575,54 @@ impl MemLayout {
     }
 
     /// A bare image under the region default — no page deviating from it: what a fresh run is seeded
-    /// with.
+    /// with, its data segments laid over it ([`is_seed`](Self::is_seed)).
     pub fn image(bytes: Vec<u8>) -> MemLayout {
         MemLayout {
             bytes,
+            tail: BTreeMap::new(),
             map: PageMap::empty(),
+            seed: true,
         }
     }
 
-    /// The captured window bytes `[0, len)`.
+    /// #2441 — whether this is a fresh run's seed ([`image`](Self::image)), over which the new
+    /// instance's window lays its data segments, rather than a whole window (a capture's, or a thaw's
+    /// from an artifact), which a run starts from as it is.
+    pub fn is_seed(&self) -> bool {
+        self.seed
+    }
+
+    /// The captured window bytes `[0, len)`: the head. The pages held past it are
+    /// [`tail_pages`](Self::tail_pages).
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 
-    /// The captured image's byte length — what holding this layout costs (the protection map is a
-    /// handful of entries beside it), and the window extent a restore will overwrite.
+    /// #2427 — whether the pages this layout holds past its head with contents cover `[off, off + len)`
+    /// whole, so a restore that writes them leaves nothing of what was there.
+    fn rewrites(&self, off: u64, len: u64) -> bool {
+        let unit = self.map.page;
+        (off / unit * unit..off + len)
+            .step_by(unit as usize)
+            .all(|at| self.tail.contains_key(&at))
+    }
+
+    /// #2427 — how far into the window this layout reaches: the end of the last page it holds, its
+    /// head included. What a flat window restoring it must cover, as it holds its whole buffer.
+    pub fn span(&self) -> u64 {
+        let head = self.bytes.len() as u64;
+        let page = self.map.page;
+        self.map
+            .prot
+            .range(head / page..)
+            .next_back()
+            .map_or(head, |(&pg, _)| head.max((pg + 1) * page))
+    }
+
+    /// What holding this layout costs: its head's bytes and those of each page it holds past it (the
+    /// protection map is a handful of entries beside them).
     pub fn byte_len(&self) -> usize {
-        self.bytes.len()
+        self.bytes.len() + self.tail.values().map(Vec::len).sum::<usize>()
     }
 }
 
@@ -33851,6 +33648,46 @@ enum PageProt {
     },
 }
 
+impl PageProt {
+    /// This page's state as a capture reports the codec page `within` bytes into it: a §13 alias
+    /// names its region from that page on.
+    fn captured(self, within: u64) -> CapturedProt {
+        match self {
+            PageProt::Rw => CapturedProt::Rw,
+            PageProt::Ro => CapturedProt::Ro,
+            PageProt::Unmapped => CapturedProt::Unmapped,
+            PageProt::Backed {
+                region,
+                region_off,
+                writable,
+            } => CapturedProt::Backed {
+                region,
+                off: region_off + within,
+                writable,
+            },
+        }
+    }
+}
+
+impl From<CapturedProt> for PageProt {
+    fn from(p: CapturedProt) -> PageProt {
+        match p {
+            CapturedProt::Rw => PageProt::Rw,
+            CapturedProt::Ro => PageProt::Ro,
+            CapturedProt::Unmapped => PageProt::Unmapped,
+            CapturedProt::Backed {
+                region,
+                off,
+                writable,
+            } => PageProt::Backed {
+                region,
+                region_off: off,
+                writable,
+            },
+        }
+    }
+}
+
 /// A guest linear-memory window. Confinement itself lives in [`temen_mask::Window`]
 /// (the isolated, separately-fuzzed security unit, §4); `Mem` owns the lazily paged backing
 /// store, threads accesses through that confinement, and carries the guest-visible page
@@ -33864,7 +33701,7 @@ struct Mem {
     /// #964/#1094 trap-on-NULL: the reserved NULL extent — `[0, null_guard)` is seeded `Unmapped` for
     /// every module ([`Mem::seed_null_guard`]) and **permanently refused** to the page ops
     /// (`prot_pages` returns `EINVAL` below it, the `mmap_min_addr` analogue — what keeps the tiers'
-    /// baked guard constant sound). `0` only for a sub-window smaller than the guard. A guard fault
+    /// baked guard constant sound). `0` only for a window smaller than the guard. A guard fault
     /// is **fatal**, never a §14 recoverable page fault (a demand parent could not legally map it).
     null_guard: u64,
     /// The module-declared durable **shadow arena** (INVARIANTS.md #16): where a freeze/thaw run
@@ -33911,7 +33748,12 @@ struct Mem {
     /// after a `MemoryFault` to distinguish a recoverable page fault (suspend to the parent, which
     /// supplies the page) from an out-of-window fault (a real trap). Per-`Mem` (each vCPU owns its
     /// own), written/read only by the owning thread; `AtomicU64` keeps `Mem: Sync` for the futex path.
+    /// It holds the access's first byte, which a report names (#2126).
     last_fault: AtomicU64,
+    /// #2469 — the first byte of that access in the page that refused it: the page a pager must
+    /// supply ([`Mem::take_fault`]). It differs from [`last_fault`] only for an access that crosses
+    /// into the refused page from one it may touch. Valid while `last_fault` is set.
+    refused_at: AtomicU64,
     /// #1190 debugger side-channel: the confined address of the most recent **fatal** memory fault
     /// (a NULL-guard access, an unmapped/read-only page), recorded by `check_prot` for the DAP layer
     /// to report a segfault's address (a NULL deref → `0`). Distinct from [`last_fault`], which is the
@@ -33954,7 +33796,7 @@ struct AddrSpace {
 
 /// How a fresh window starts (#1737): its geometry, the backing it sits on, and what is laid into it,
 /// in the one order every window is built by — reserve, `seed`, the data segments, the NULL guard
-/// ([`Mem::from_spec`]). Root runs, detached (op 15) children, thaws and forks all build through it,
+/// ([`Mem::from_spec`]). Root runs, detached (op 17) children, thaws and forks all build through it,
 /// so no copy of the recipe can forget a step (#1730, #1733, #1206 each did). What a caller lays over
 /// the result — a thaw's image, a reactor's page map, a child's args — stays the caller's.
 #[derive(Default)]
@@ -34031,6 +33873,7 @@ impl Mem {
             prot_dirty: Arc::new(AtomicBool::new(false)),
             map_version: Arc::new(AtomicU64::new(0)),
             last_fault: AtomicU64::new(NO_FAULT),
+            refused_at: AtomicU64::new(NO_FAULT),
             fault_report: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: 0,
@@ -34078,7 +33921,7 @@ impl Mem {
     /// `Region::shared` call, not here. Today still driven cooperatively; only the backing changes.
     ///
     /// `back` may be **narrower than the reservation** (every Region-backed vCPU path asks for the
-    /// 128 GiB `DEFAULT_RESERVED_LOG2` over a window-sized backing). A `map`/`protect` past the backing
+    /// default reservation, [`default_reserved_log2`], over a window-sized backing). A `map`/`protect` past the backing
     /// is then admitted by the reservation — deliberately: a guest that `vm_map`s high behaves as it
     /// would over the engine's own reservation right up to the first access, which the emitted tier's
     /// bounds check turns into a **decline** (#1153, the browser re-runs on the interpreter) — while
@@ -34104,34 +33947,7 @@ impl Mem {
             prot_dirty: Arc::new(AtomicBool::new(false)),
             map_version: Arc::new(AtomicU64::new(0)),
             last_fault: AtomicU64::new(NO_FAULT),
-            fault_report: AtomicU64::new(NO_FAULT),
-            writes: 0,
-            null_guard: 0,
-            shadow: shadow.unwrap_or(ShadowArena::EMPTY),
-        }
-    }
-
-    /// A fully-mapped **§14 sub-window**: a `1 << size_log2`-byte child window at absolute offset
-    /// `base` inside a parent backing of `parent_bytes` bytes (the child runs over the parent's
-    /// `Region`). The confinement unit ([`temen_mask::Window::sub`], fuzzed as the escape hinge) bounds
-    /// every child access to `[base, base + size)` (faulting otherwise), so the child can reach **only
-    /// its slice** — never
-    /// the parent's other memory or outside the parent window. `base` is size-aligned by `Window::sub`;
-    /// the whole slice is backed (no `map`-growth inside a child yet). The backing is sized to hold
-    /// `[0, base + size)`.
-    fn sub_window(base: u64, size_log2: u8, parent_bytes: u64, shadow: Option<ShadowArena>) -> Mem {
-        let window = Window::sub(base, size_log2, 1u64 << size_log2.min(63));
-        let page = host_page_size();
-        let need = window.base().saturating_add(window.reserved());
-        Mem {
-            back: Arc::new(Region::new(parent_bytes.max(need), page)),
-            window,
-            page,
-            space: Arc::new(RwLock::new(AddrSpace::default())),
-            has_regions: Arc::new(AtomicBool::new(false)),
-            prot_dirty: Arc::new(AtomicBool::new(false)),
-            map_version: Arc::new(AtomicU64::new(0)),
-            last_fault: AtomicU64::new(NO_FAULT),
+            refused_at: AtomicU64::new(NO_FAULT),
             fault_report: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: 0,
@@ -34189,6 +34005,7 @@ impl Mem {
             prot_dirty: Arc::clone(&self.prot_dirty),
             map_version: Arc::clone(&self.map_version),
             last_fault: AtomicU64::new(NO_FAULT),
+            refused_at: AtomicU64::new(NO_FAULT),
             fault_report: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: self.null_guard,
@@ -34198,8 +34015,7 @@ impl Mem {
     /// FORK.md PR 1 increment 3b — a **private** window copy for a live `fork()` twin: a fresh `Mem`
     /// with its **own** backing (a new `Region`) holding a byte-for-byte copy of this window's mapped
     /// prefix, and its own empty address space. Unlike [`fork_for_thread`](Mem::fork_for_thread) (shares
-    /// the `Arc<Region>` bytes) and [`nested_view`](Mem::nested_view) (shares bytes, confines), the twin
-    /// does **not** alias the parent's memory — a write by either copy after the fork is invisible to
+    /// the `Arc<Region>` bytes), the twin does **not** alias the parent's memory — a write by either copy after the fork is invisible to
     /// the other (POSIX-fork semantics). Requires a [`snapshot_safe`](Mem::snapshot_safe) window (no §13
     /// region aliasing, no non-prefix page protections — the shape [`Host::fork_powerbox`] already
     /// restricts a forkable domain to); returns `None` otherwise, fail-closed.
@@ -34257,19 +34073,20 @@ impl Mem {
             twin.space_write().prot = prot_copy;
         }
         // The `vm_map`-committed tail pages (collected above): copy the parent's bytes into the twin's
-        // own fresh backing — base-relative on both sides, like [`snapshot`](Mem::snapshot). Every byte
-        // of each page is written, so no zeroing first. The prot entries came over in `prot_copy`.
-        let base = self.window.base();
-        let tbase = twin.window.base();
-        if let Some(&last) = tail_pages.last() {
-            if !twin.back.grow_to(tbase + (last + 1) * self.page) {
-                return None;
-            }
+        // own fresh backing, like [`snapshot`](Mem::snapshot). Every byte of each page is written, so
+        // no zeroing first. The prot entries came over in `prot_copy`. Its backing covers them, and
+        // (#2407) a growable one all of mine, which the twin's charge (my growth) pays for.
+        let mut end = tail_pages.last().map_or(0, |&last| (last + 1) * self.page);
+        if self.back.can_grow() {
+            end = end.max(self.back.len());
+        }
+        if end > 0 && !twin.back.grow_to(end) {
+            return None;
         }
         for &pg in &tail_pages {
             let off = pg * self.page;
             for i in 0..self.page {
-                twin.set_byte(off + i, self.byte(base + off + i));
+                twin.set_byte(off + i, self.byte(off + i));
             }
         }
         // #964: the twin runs the same module — its NULL guard (already in `prot_copy` as pages,
@@ -34318,40 +34135,6 @@ impl Mem {
         default
     }
 
-    /// Build the memory view a **§14 nested child** runs over: it shares this (parent's) `Arc<Region>`
-    /// bytes — so the parent intrinsically sees all of the child's bytes (the superset, §14) — but
-    /// **confines** the child to the fully-mapped sub-window `[abs_base, abs_base + 2^size_log2)`
-    /// (window-absolute, in the shared backing's coordinates). The child sees a zero-based `[0, size)`
-    /// and cannot learn it is nested; trap-confinement ([`Window::sub`]) bounds the child to its slice.
-    ///
-    /// Unlike [`fork_for_thread`](Mem::fork_for_thread), the child gets its **own** address space (a
-    /// fresh, empty page-protection map + §13 region set), *not* the parent's: page protections are a
-    /// per-domain view, and the prot map is keyed window-relative, so a shared map would alias the
-    /// child's pages onto the parent's (a child `unmap` of *its* page 0 would hit the parent's). The
-    /// domains share **bytes**, not page-protection state — cross-domain memory sharing is §13, and
-    /// lazy paging is the parent fielding the child's faults (co-fiber), not a shared map.
-    fn nested_view(&self, abs_base: u64, size_log2: u8, shadow: ShadowArena) -> Mem {
-        let mut v = Mem {
-            shadow,
-            window: Window::sub(abs_base, size_log2, 1u64 << size_log2.min(63)),
-            page: self.page,
-            back: Arc::clone(&self.back),
-            space: Arc::new(RwLock::new(AddrSpace::default())),
-            has_regions: Arc::new(AtomicBool::new(false)),
-            prot_dirty: Arc::new(AtomicBool::new(false)),
-            map_version: Arc::new(AtomicU64::new(0)),
-            last_fault: AtomicU64::new(NO_FAULT),
-            fault_report: AtomicU64::new(NO_FAULT),
-            writes: 0,
-            null_guard: 0,
-        };
-        // #964/#1094/#1206: a §14 child's carve reserves `[0, POWERBOX_NULL_GUARD)` like any window —
-        // the one canonical layout, on every engine's nested arm (this is the chokepoint they share).
-        // A carve smaller than the guard skips (`seed_null_guard`), so a tiny grandchild stays usable.
-        v.seed_null_guard(temen_ir::module_null_guard());
-        v
-    }
-
     /// One page's access state: `None` ⇒ faults (unmapped), `Some(writable)` ⇒ committed. A page
     /// absent from the map takes its region default — read+write in the initial prefix
     /// `[0, mapped)`, unmapped in the reserved tail (growth must be an explicit `map`).
@@ -34370,11 +34153,7 @@ impl Mem {
     /// lies wholly in the committed prefix and no page has been re-protected (the common case), so
     /// unprotected windows pay nothing.
     fn check_prot(&self, base: u64, width: u32, write: bool) -> Result<(), Trap> {
-        // `base` is the *absolute* confined address; the page-map and `mapped` bound are
-        // window-relative (`rel == base` for a top-level window; offset by the sub-window base for a
-        // §14 child).
-        let rel = base.wrapping_sub(self.window.base());
-        let last = rel + width as u64 - 1;
+        let last = base + width as u64 - 1;
         // Lock-free fast path: the address space has never been mutated, so every page is in its
         // region default — RW inside `[0, mapped)`. An in-prefix access is unconditionally fine and
         // skips the `RwLock` read entirely (the hot, overwhelmingly common case).
@@ -34385,25 +34164,34 @@ impl Mem {
         if space.prot.is_empty() && last < self.window.mapped() {
             return Ok(());
         }
-        for page in (rel / self.page)..=(last / self.page) {
+        for page in (base / self.page)..=(last / self.page) {
             match self.page_access(&space.prot, page) {
-                // A **recoverable** in-window page fault: record the confined address so a §14
-                // coroutine child can suspend to its parent (fault-driven yield) instead of trapping.
-                None if page * self.page < self.null_guard => {
-                    // #964: a NULL dereference — fatal, never a recoverable §14 page fault (a
-                    // demand parent could not legally map the reserved region anyway). #1190: record
-                    // the faulting address for the debugger (a segfault at `base`) in the dedicated
-                    // report field — *not* `last_fault`, whose recoverable-fault contract the guard
-                    // deliberately sidesteps here.
-                    self.fault_report.store(base, Ordering::Relaxed);
-                    return Err(Trap::MemoryFault);
-                }
-                None => return Err(self.page_fault(base)), // unmapped
-                Some(false) if write => return Err(self.page_fault(base)), // read-only store
+                None => return Err(self.refused(base, page)), // unmapped
+                Some(false) if write => return Err(self.refused(base, page)), // read-only store
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    /// The fault for an access starting at `base` that `page` refuses: the page is unmapped, or the
+    /// access stores to it and it is read-only.
+    ///
+    /// - **Below the NULL guard**, fatal (#964): never a recoverable §14 page fault, since a demand
+    ///   parent could not legally map the reserved region anyway. #1190: the address goes to the
+    ///   debugger (a segfault at `base`) in the dedicated report field, not in `last_fault`, whose
+    ///   recoverable-fault contract the guard sidesteps.
+    /// - **Otherwise recoverable**: a demand child's pager supplies the page. A report names the
+    ///   access's first byte, `base`, on every engine (#2126). The page to supply is `page`, the one
+    ///   that refused it, which holds the access's first byte only when the access starts there: one
+    ///   that crosses into `page` starts in a page it may touch (#2469).
+    fn refused(&self, base: u64, page: u64) -> Trap {
+        let start = page * self.page;
+        if start < self.null_guard {
+            self.fault_report.store(base, Ordering::Relaxed);
+            return Trap::MemoryFault;
+        }
+        self.page_fault(base, base.max(start))
     }
 
     /// The **scalar-representable committed extent** (#717 wasm-JIT host sync): `Some(H)` iff the
@@ -34485,15 +34273,13 @@ impl Mem {
     pub(crate) fn seed_pages(&mut self, mapped: u64, entries: &[(u64, u8)]) {
         let reserved = self.window.reserved();
         let mut high = self.window.mapped().max(mapped.min(reserved));
-        if self.window.base() == 0 {
-            for &(off, kind) in entries {
-                if kind == 1 && off == high {
-                    high = high.saturating_add(self.page).min(reserved);
-                }
+        for &(off, kind) in entries {
+            if kind == 1 && off == high {
+                high = high.saturating_add(self.page).min(reserved);
             }
-            if high > self.window.mapped() {
-                self.window = Window::with_mapped(reserved.trailing_zeros() as u8, high);
-            }
+        }
+        if high > self.window.mapped() {
+            self.window = Window::with_mapped(reserved.trailing_zeros() as u8, high);
         }
         if entries.is_empty() {
             return;
@@ -34515,12 +34301,6 @@ impl Mem {
         self.prot_dirty.store(true, Ordering::Release);
     }
 
-    /// #964/#1094 trap-on-NULL: seed the reserved NULL region for a module (unconditional guard) —
-    /// `[0, guard)` becomes `Unmapped` (a guest access traps exactly like native) and `prot_pages`
-    /// permanently refuses the page ops below `guard` (the `mmap_min_addr` analogue, which keeps
-    /// the JIT tiers' baked guard constant sound). `guard = 0` (a sub-window smaller than the guard) is
-    /// a no-op — those fast paths stay lock-free. The guard is a multiple of every supported page size
-    /// (16 KiB = the max host page; the browser's software page is 4 KiB), asserted here.
     /// The module-declared shadow arena ([`ShadowArena::EMPTY`] when it declared none).
     pub(crate) fn shadow_arena(&self) -> ShadowArena {
         self.shadow
@@ -34554,13 +34334,17 @@ impl Mem {
         )
     }
 
+    /// #964/#1094 trap-on-NULL: seed the reserved NULL region for a module (unconditional guard) —
+    /// `[0, guard)` becomes `Unmapped` (a guest access traps exactly like native) and `prot_pages`
+    /// permanently refuses the page ops below `guard` (the `mmap_min_addr` analogue, which keeps
+    /// the JIT tiers' baked guard constant sound). `guard = 0` is a no-op — those fast paths stay
+    /// lock-free.
     pub(crate) fn seed_null_guard(&mut self, guard: u64) {
         // Page-exact or skip: on a host whose page exceeds the guard (e.g. 64 KiB aarch64), a
         // page-map seed would swallow live scratch above the guard — so the guard disengages, and
         // the native tier's `mprotect` seeding skips identically (per-platform trap parity). A
-        // window smaller than the guard (a tiny §14 sub-window of a marked module) also skips —
-        // seeding would unmap the whole window, and the native tier could not mirror it without
-        // protecting past the carve.
+        // window smaller than the guard (a module that declares less memory) also skips, as the
+        // native tier does: seeding would unmap the whole window.
         if guard == 0 || !guard.is_multiple_of(self.page) || guard > self.window.mapped() {
             return;
         }
@@ -34573,27 +34357,40 @@ impl Mem {
         self.prot_dirty.store(true, Ordering::Release);
     }
 
-    /// Record `base` as the pending recoverable page fault (for §14 fault-driven yield) and return the
-    /// `MemoryFault` to propagate. A normal guest treats it as a trap (detect-and-kill); a coroutine
-    /// child reads the recorded address and suspends to its parent instead.
-    fn page_fault(&self, base: u64) -> Trap {
+    /// Record a pending recoverable page fault of the access starting at `base`, refused at `at`, and
+    /// return the `MemoryFault` to propagate. A normal guest treats it as a trap (detect-and-kill); a
+    /// demand child's pager supplies the page instead.
+    fn page_fault(&self, base: u64, at: u64) -> Trap {
         self.last_fault.store(base, Ordering::Relaxed);
+        self.refused_at.store(at, Ordering::Relaxed);
         Trap::MemoryFault
     }
 
-    /// Take the pending recoverable page-fault address (set by [`check_prot`], cleared by
-    /// [`confine_checked`]), clearing it. `None` if the last `MemoryFault` was an out-of-window fault
-    /// (a real trap), not a recoverable page fault.
+    /// Take the pending recoverable page fault (set by [`check_prot`], cleared by
+    /// [`confine_checked`]), clearing it: the access's first byte in the page that refused it, the
+    /// page to supply (#2469). `None` if the last `MemoryFault` was an out-of-window fault (a real
+    /// trap), not a recoverable page fault.
+    ///
+    /// #2164 — `None` too when the refused page is not one a pager supplies: one at or past the
+    /// declared window, whose tail is the guest's growth room ([`Mem::demand_page`]), or a §13 alias,
+    /// whose bytes are its region's. Every engine's pager supplies only the window's own declared
+    /// pages, so a fault on any other is fatal, as it is in a window with no pager.
     fn take_fault(&self) -> Option<u64> {
-        match self.last_fault.swap(NO_FAULT, Ordering::Relaxed) {
-            NO_FAULT => None,
-            addr => Some(addr),
+        if self.last_fault.swap(NO_FAULT, Ordering::Relaxed) == NO_FAULT {
+            return None;
         }
+        let at = self.refused_at.load(Ordering::Relaxed);
+        let page = at / self.page;
+        let own = page * self.page < self.window.mapped()
+            && !matches!(
+                self.space_read().prot.get(&page),
+                Some(PageProt::Backed { .. })
+            );
+        own.then_some(at)
     }
 
-    /// The window-relative guest address of the run's last **fatal** memory fault (`base −
-    /// window.base()`; a top-level window's base is `0`, so a NULL deref reads back as `0`), for the
-    /// debugger to report a segfault's address (#1190). Reads the dedicated [`fault_report`] field
+    /// The guest address of the run's last **fatal** memory fault (a NULL deref reads back as `0`), for
+    /// the debugger to report a segfault's address (#1190). Reads the dedicated [`fault_report`] field
     /// (set by the NULL-guard arm of [`check_prot`]) first, then falls back to [`last_fault`] — which
     /// a top-level unmapped/read-only fault leaves set at the offending address (a satisfied §14
     /// recoverable fault clears it via `take_fault`, so no stale value survives). Non-clearing, so it
@@ -34608,21 +34405,27 @@ impl Mem {
         };
         match raw {
             NO_FAULT => None,
-            base => Some(base.wrapping_sub(self.window.base())),
+            base => Some(base),
         }
     }
 
-    /// Mark **every** page of this window unmapped — demand-paging it (§14 lazy paging): a coroutine
-    /// child started this way faults on first access of each page, suspending to the parent, which
-    /// supplies the page and resumes. The parent virtualizes the whole sub-window.
+    /// Mark the pages of this window's declared extent unmapped — demand-paging it (§14 lazy
+    /// paging): a child started this way faults on first access of each page, and its pager supplies
+    /// the page (#1862/#1863).
+    ///
+    /// #2438 — except the pages a durable module's runtime keeps its words on, the ones its page ops
+    /// may not touch either ([`ShadowArena::fences`], #2426): the control words and the declared
+    /// shadow arena. The runtime reads and writes them at every safepoint, freeze and thaw; they are
+    /// never the pager's to supply, and it could only supply a stale copy, since it cannot see this
+    /// window (#1862).
     fn demand_page(&self) {
-        // `div_ceil` so a child smaller than one host page (e.g. a 4 KiB sub-window on a 16 KiB-page
-        // host) still gets its single covering page marked — confinement keeps its accesses in-window.
-        // The **declared** window, not the reservation: a carve's are equal, but a detached window
-        // reserves 2^37 bytes (#1863) — its tail is growth (`vm_map`), never pager-supplied.
+        // `div_ceil` so a window smaller than one host page (e.g. 4 KiB on a 16 KiB-page host) still
+        // gets its single covering page marked — confinement keeps its accesses in-window. The
+        // **declared** window, not the reservation: a detached window reserves 2^37 bytes (#1863) —
+        // its tail is growth (`vm_map`), never pager-supplied.
         let pages = self.window.mapped().div_ceil(self.page).max(1);
         let mut space = self.space_write();
-        for p in 0..pages {
+        for p in (0..pages).filter(|&p| !self.shadow.fences(p, p, self.page)) {
             space.prot.insert(p, PageProt::Unmapped);
         }
     }
@@ -34632,9 +34435,8 @@ impl Mem {
     /// the page mapped before its bytes are in place. The write goes straight to the backing: the
     /// page is `Unmapped` until this call maps it.
     fn supply_page(&self, page: u64, bytes: &[u8]) {
-        let base = self.window.base() + page;
         for (k, b) in bytes.iter().enumerate() {
-            self.set_byte(base + k as u64, *b);
+            self.set_byte(page + k as u64, *b);
         }
         self.space_write()
             .prot
@@ -34642,13 +34444,15 @@ impl Mem {
     }
 
     /// FORK.md §8.6 — the window an `execve` replaces this one with. An exec replaces the address
-    /// space: the new image gets this window's reservation and shadow arena, a backed prefix of
-    /// `mapped` bytes (its declared memory, [`ExecImage::child_size`], #2332) over `back`, a fresh
-    /// backing, and nothing else of this window. The caller's bytes
-    /// past the image, the pages it `vm_map`ped in the reserved tail and its page protections stay
-    /// behind, as they do on the Cranelift JIT, whose exec starts the image in a fresh instance. Nor
-    /// is the caller's window zeroed or copied, which for a compiler's forked child was most of what
-    /// an exec cost.
+    /// space: the new image gets this window's reservation, a backed prefix of `mapped` bytes (its
+    /// declared memory, [`ExecImage::child_size`], #2332) over `back`, a fresh backing, and nothing
+    /// else of this window. Its shadow arena is the one `image` declares (INVARIANTS #16), never the
+    /// caller's: the arena fences the image's own page ops (#2426), and the caller's layout is gone,
+    /// so a fence it left would refuse the image's heap growth over pages it now owns. The caller's
+    /// bytes past the image, the pages it `vm_map`ped in the reserved tail and its page protections
+    /// stay behind, as they do on the Cranelift JIT, whose exec starts the image in a fresh instance.
+    /// Nor is the caller's window zeroed or copied, which for a compiler's forked child was most of
+    /// what an exec cost.
     ///
     /// The image arrives as a fresh instantiation's does ([`Mem::from_spec`], #1737): its data
     /// segments written, the `readonly` ones RO, behind the NULL guard (#1094: a null dereference in
@@ -34662,7 +34466,7 @@ impl Mem {
         &self,
         back: Region,
         mapped: u64,
-        data: &[temen_ir::Data],
+        image: &Module,
         null_guard: u64,
         args: Option<&[u8]>,
     ) -> Mem {
@@ -34685,10 +34489,10 @@ impl Mem {
         let m = Mem::from_spec(WindowSpec {
             reserved_log2: reserved.trailing_zeros() as u8,
             mapped_log2: mapped.trailing_zeros() as u8,
-            shadow: Some(self.shadow),
+            shadow: image.memory.and_then(|mc| mc.shadow),
             back: Some(Arc::new(back)),
             seed: &seed,
-            data,
+            data: &image.data,
             null_guard,
         });
         if let Some(blob) = args {
@@ -34701,7 +34505,7 @@ impl Mem {
     /// [`Self::exec_window`] carries over, so the new image's `_start` reads its own argv there.
     /// Only ever called once the exec is committed; the personality bounded the blob to the region.
     fn write_exec_args(&self, blob: &[u8]) {
-        self.write_run(self.window.base() + temen_ir::module_args_base(), blob);
+        self.write_run(temen_ir::module_args_base(), blob);
     }
 
     /// **Trap-confinement** (§4): bounds-check the `width`-byte access and reject any that leaves the
@@ -34713,14 +34517,13 @@ impl Mem {
     /// [`Window::checked`]) so a wild `addr+offset` that would overflow `u64` faults rather than
     /// wrapping into a valid offset.
     fn confine_checked(&self, addr: u64, offset: u64, width: u32) -> Result<u64, Trap> {
-        // `confine` returns the **absolute** address `base + (addr+offset)` (`base == 0` for a
-        // top-level window, the sub-window base for a §14 child); the guest `addr`/`offset` are
-        // window-relative, so the bound is on `addr+offset` directly. The returned absolute address
-        // indexes the (possibly parent-sized) backing.
-        self.last_fault.store(NO_FAULT, Ordering::Relaxed); // fresh: clear any prior page fault
-                                                            // The reserved-bound overflow-free arithmetic is temen-mask's (the one fuzzed reference). An
-                                                            // out-of-window fault is a real trap (not a recoverable page fault), so `last_fault` stays
-                                                            // cleared and `take_fault` returns `None` for the coroutine path to propagate the trap.
+        // Every window starts at 0 of its own backing (§14: a child owns a window of its own), so the
+        // guest `addr+offset` is both what is bounded and the backing index returned. A fresh check
+        // clears any prior page fault.
+        self.last_fault.store(NO_FAULT, Ordering::Relaxed);
+        // The reserved-bound overflow-free arithmetic is temen-mask's (the one fuzzed reference). An
+        // out-of-window fault is a real trap (not a recoverable page fault), so `last_fault` stays
+        // cleared and `take_fault` returns `None`.
         self.window
             .checked_reserved(addr, offset, width)
             .ok_or_else(|| self.report_out_of_window(addr, offset))
@@ -34746,10 +34549,15 @@ impl Mem {
     /// produced a rejected address is allowed to have overflowed — reporting the wrapped value is
     /// honest about what was asked for, where saturating would invent a different question.
     fn report_out_of_window(&self, addr: u64, offset: u64) -> Trap {
-        let rel = addr.wrapping_add(offset);
-        self.fault_report
-            .store(self.window.base().wrapping_add(rel), Ordering::Relaxed);
+        self.report_fault_rel(addr.wrapping_add(offset));
         Trap::MemoryFault
+    }
+
+    /// Record `rel`, a window-relative address, as where this window's fatal memory fault faulted
+    /// ([`Self::peek_fault_rel`]): an out-of-window refusal's, or the address the emitted tier's
+    /// guard left for a fault in emitted code (#2126, #2275).
+    pub(crate) fn report_fault_rel(&self, rel: u64) {
+        self.fault_report.store(rel, Ordering::Relaxed);
     }
 
     /// Read `len` raw bytes from confined window address `addr` (DEBUGGING.md W2 inspection). Bounds
@@ -34805,8 +34613,7 @@ impl Mem {
     /// Per-page committed-ness / RO enforcement over a whole span — the `len: u64` analogue of
     /// [`Self::check_prot`]. `len >= 1` (see [`Self::confine_span`]).
     fn check_prot_span(&self, base: u64, len: u64, write: bool) -> Result<(), Trap> {
-        let rel = base.wrapping_sub(self.window.base());
-        let last = rel + (len - 1);
+        let last = base + (len - 1);
         if !self.prot_dirty.load(Ordering::Acquire) && last < self.window.mapped() {
             return Ok(());
         }
@@ -34814,10 +34621,10 @@ impl Mem {
         if space.prot.is_empty() && last < self.window.mapped() {
             return Ok(());
         }
-        for page in (rel / self.page)..=(last / self.page) {
+        for page in (base / self.page)..=(last / self.page) {
             match self.page_access(&space.prot, page) {
-                None => return Err(self.page_fault(base)),
-                Some(false) if write => return Err(self.page_fault(base)),
+                None => return Err(self.refused(base, page)), // unmapped
+                Some(false) if write => return Err(self.refused(base, page)), // read-only store
                 _ => {}
             }
         }
@@ -35013,8 +34820,8 @@ impl Mem {
     }
 
     /// §12 atomics share the confinement + page-protection path with `load`/`store`, and add a
-    /// **natural-alignment** requirement: a misaligned effective address traps (`MemoryFault`). The
-    /// window base and reserved domain are width-aligned, so checking the confined address suffices.
+    /// **natural-alignment** requirement: a misaligned effective address traps (`MemoryFault`). A
+    /// window starts at 0 of its own backing, so checking the confined address suffices.
     /// Single-threaded, an atomic's *value* semantics equal the non-atomic op; the JIT lowers these
     /// to hardware atomics so they stay correct once threads exist (§12). All operate on the full
     /// `ty` width (`i32`/`i64`).
@@ -35044,9 +34851,7 @@ impl Mem {
         let space = self.space_read();
         let Some(PageProt::Backed {
             region, region_off, ..
-        }) = space
-            .prot
-            .get(&(base.wrapping_sub(self.window.base()) / self.page))
+        }) = space.prot.get(&(base / self.page))
         else {
             return None;
         };
@@ -35098,12 +34903,11 @@ impl Mem {
     /// and byte offset of a §13-aliased page, else the address.
     fn futex_site(&self, base: u64) -> FutexSite {
         if self.has_regions.load(Ordering::Relaxed) {
-            let rel = base.wrapping_sub(self.window.base());
             if let Some(PageProt::Backed {
                 region, region_off, ..
-            }) = self.space_read().prot.get(&(rel / self.page))
+            }) = self.space_read().prot.get(&(base / self.page))
             {
-                return FutexSite::Region(*region, region_off + rel % self.page);
+                return FutexSite::Region(*region, region_off + base % self.page);
             }
         }
         FutexSite::Anon(base)
@@ -35130,8 +34934,8 @@ impl Mem {
     }
 
     /// The identity of this window's anonymous backing for the futex key (#1283): the `Arc<Region>`
-    /// allocation address. Equal across every `Mem` that shares the backing (a `thread.spawn` fork, a §14
-    /// `nested_view`), distinct for every independently-minted window (root, detached, fork twin).
+    /// allocation address. Equal across every `Mem` that shares the backing (a `thread.spawn` fork),
+    /// distinct for every independently-minted window (root, detached child, fork twin).
     fn backing_ident(&self) -> u64 {
         Arc::as_ptr(&self.back) as *const u8 as u64
     }
@@ -35221,12 +35025,13 @@ impl Mem {
     /// Validate a `map`/`unmap`/`protect` range (§3e): the offset must be page-aligned and the
     /// whole `[offset, offset+len)` must lie within the **reserved** window `[0, reserved)` — the
     /// guest may now grow into the reserved tail `[mapped, reserved)`, not just the initial backed
-    /// prefix. Returns the inclusive page-index range it covers, or `Err(EINVAL)`.
+    /// prefix. Returns the inclusive page-index range it covers, or `Err(EINVAL)`: also for a range
+    /// over the NULL guard, or (#2426) over a page that holds a durable module's runtime-private
+    /// words ([`ShadowArena::fences`]).
     fn prot_pages(&self, offset: u64, len: u64) -> Result<core::ops::RangeInclusive<u64>, i64> {
-        // `offset` is **guest-relative** — the zero-based window the guest sees (the whole `GuestMem`
-        // surface speaks guest coordinates; a §14 child names its own `[0, size)`, never its position
-        // in the parent). The prot map is keyed by the same relative pages
-        // (`check_prot`/`page_access`); only backing-store accesses add `window.base()`.
+        // `offset` is the guest's — every window starts at 0 of its own backing (a §14 child owns a
+        // window of its own) — so it keys the prot map (`check_prot`/`page_access`) and indexes the
+        // backing alike.
         if len == 0 || !offset.is_multiple_of(self.page) {
             return Err(EINVAL);
         }
@@ -35239,7 +35044,12 @@ impl Mem {
         if end > self.window.reserved() {
             return Err(EINVAL);
         }
-        Ok((offset / self.page)..=((end - 1) / self.page)) // len need not be a page multiple; round up
+        let (first, last) = (offset / self.page, (end - 1) / self.page); // len need not be a page multiple
+                                                                         // #2426: nor may one touch the pages a durable module's runtime keeps its words on.
+        if self.shadow.fences(first, last, self.page) {
+            return Err(EINVAL);
+        }
+        Ok(first..=last)
     }
 
     /// Zero the window's own backing under `pages` (a [`prot_pages`](Mem::prot_pages) range) in one
@@ -35247,10 +35057,25 @@ impl Mem {
     /// range stays unbacked until the guest touches it — one call per range, never one per page.
     fn zero_pages(&self, pages: core::ops::RangeInclusive<u64>) {
         let (first, last) = pages.into_inner();
-        self.back.zero(
-            self.window.base() + first * self.page,
-            (last + 1 - first) * self.page,
-        );
+        self.back
+            .zero(first * self.page, (last + 1 - first) * self.page);
+    }
+
+    /// #2370 — `set` on each page of `pages` that a change to `prot` can alter ([`changed_runs`]),
+    /// in order, under the address-space write lock; the runs it visited.
+    fn change_pages(
+        &self,
+        pages: core::ops::RangeInclusive<u64>,
+        prot: i32,
+        mut set: impl FnMut(&mut BTreeMap<u64, PageProt>, u64),
+    ) -> Vec<(u64, u64)> {
+        let mut space = self.space_write();
+        let mapped = self.window.mapped().div_ceil(self.page);
+        let runs = changed_runs(&space.prot, pages, mapped, prot);
+        for page in runs.iter().flat_map(|&(first, last)| first..=last) {
+            set(&mut space.prot, page);
+        }
+        runs
     }
 
     /// Set one page's protection from cap `prot` bits: `WRITE` ⇒ read+write, `READ` only ⇒
@@ -35284,20 +35109,12 @@ impl Mem {
     /// don't fault). RO protection is page-granular, so a producer keeps RO data on its own pages
     /// (the verifier already bounds each segment to `[0, size)`).
     fn init_data(&mut self, data: &[Data]) {
-        self.init_data_at(data, 0);
-    }
-
-    /// Like [`init_data`], but place each (child-relative) segment at `win_base + offset` — the §14
-    /// sub-window's slice base, so segment bytes and their read-only protections land in the child's
-    /// region of the parent backing (matching trap-confinement, which confines child accesses to
-    /// `[win_base, win_base + size)`). `win_base == 0` is the ordinary top-level window.
-    fn init_data_at(&mut self, data: &[Data], win_base: u64) {
         // Byte writes first. No §13 regions exist at init, so each segment is one bulk write into
         // the backing — a single call even through a `Region::Foreign` (a detached child's own
         // `WebAssembly.Memory`), where a byte at a time is a host call per byte...
         let aliased = self.has_regions.load(Ordering::Relaxed);
         for d in data {
-            let at = win_base + d.offset;
+            let at = d.offset;
             if aliased {
                 for (i, &b) in d.bytes.iter().enumerate() {
                     self.set_byte(at + i as u64, b);
@@ -35306,13 +35123,11 @@ impl Mem {
                 self.back.write_from(at, &d.bytes);
             }
         }
-        // ...then the read-only protections, under one address-space write lock. The prot map is
-        // keyed by window-relative page (trap-confinement confines accesses to this window, and
-        // `check_prot` looks up relative pages), so fold the window base out of the absolute address.
+        // ...then the read-only protections, under one address-space write lock.
         let mut space = self.space_write();
         for d in data {
             if d.readonly && !d.bytes.is_empty() {
-                let first = (win_base + d.offset).wrapping_sub(self.window.base());
+                let first = d.offset;
                 let last = first + d.bytes.len() as u64 - 1;
                 for page in (first / self.page)..=(last / self.page) {
                     space.prot.insert(page, PageProt::Ro);
@@ -35340,12 +35155,11 @@ impl Mem {
     }
 
     /// Borrow-validate a `(ptr, len)` capability buffer (§7): every page of `[ptr, ptr+len)` must be
-    /// committed, and writable to `write` it. Returns where the buffer starts in the (possibly
-    /// parent-shared) backing, which is indexed absolutely, or `None` (→ `-EFAULT`). Confinement
-    /// holds regardless; this explicit check is the recoverable guest-bug path, not a safety boundary.
+    /// committed, and writable to `write` it. Returns where the buffer starts in the backing, or
+    /// `None` (→ `-EFAULT`). Confinement holds regardless; this explicit check is the recoverable
+    /// guest-bug path, not a safety boundary.
     fn buffer(&self, ptr: u64, len: u64, write: bool) -> Option<u64> {
-        self.range_committed(ptr, len, write)
-            .then(|| self.window.base() + ptr)
+        self.range_committed(ptr, len, write).then_some(ptr)
     }
 
     /// Read a capability buffer ([`Mem::buffer`]) one relaxed atomic byte at a time, which stays
@@ -35366,15 +35180,16 @@ impl Mem {
         Some(())
     }
 
-    /// The durable **active shadow-SP** word at [`SHADOW_SP_OFF`] (the running context's
-    /// shadow-stack pointer). Read/written by the runtime on a fiber switch to keep it pointing at
-    /// the current context's region (D-fiber-cont option A). Falls back to the root region base (`ShadowArena::region_base(0)`) if the
-    /// word's page is somehow uncommitted (a malformed durable window) — `set` then no-ops.
-    fn durable_get_sp(&self, sp_word: u64) -> u64 {
+    /// A context's **shadow-SP** word at `sp_word` (its shadow-stack pointer, which the runtime reads
+    /// and writes on a fiber switch to keep it pointing at that context's region, D-fiber-cont option
+    /// A), or `None` when the word's page cannot be read (a malformed durable window; `set` then
+    /// no-ops). Never a stand-in: an SP the caller did not read is one it must not use (#2438, where a
+    /// demand-paged control page read as the region base and the next freeze spilled over the
+    /// region's header).
+    fn durable_get_sp(&self, sp_word: u64) -> Option<u64> {
         self.read_bytes_impl(sp_word, 8)
             .and_then(|b| b.try_into().ok())
             .map(u64::from_le_bytes)
-            .unwrap_or(self.shadow.region_base(0))
     }
 
     fn durable_set_sp(&mut self, sp_word: u64, sp: u64) {
@@ -35558,13 +35373,10 @@ impl Mem {
         }
         let idx = (off % self.page) as usize;
         let space = self.space_read();
-        // The prot map is keyed by window-relative page (base folds out; the within-page `idx` is
-        // unchanged since the base is page-aligned).
+        // The prot map is keyed by the window's own page.
         if let Some(PageProt::Backed {
             region, region_off, ..
-        }) = space
-            .prot
-            .get(&(off.wrapping_sub(self.window.base()) / self.page))
+        }) = space.prot.get(&(off / self.page))
         {
             return space
                 .regions
@@ -35609,9 +35421,7 @@ impl Mem {
         let space = self.space_read();
         if let Some(PageProt::Backed {
             region, region_off, ..
-        }) = space
-            .prot
-            .get(&(off.wrapping_sub(self.window.base()) / self.page))
+        }) = space.prot.get(&(off / self.page))
         {
             // §13 aliased page: write through to the shared region backing.
             if let Some(r) = space.regions.get(region).and_then(Weak::upgrade) {
@@ -35635,15 +35445,10 @@ impl Mem {
         self.write_run(0, &init[..n]);
     }
 
-    /// Snapshot the low `n` bytes of the window (clamped to the backed `mapped` extent). Reads are
-    /// **window-base-relative**: [`byte`](Mem::byte) indexes the shared backing *absolutely*, so a
-    /// nested view (`window.base() != 0` — a §14 carve) must offset by its base, or the snapshot would
-    /// capture the wrong slice of the backing (e.g. the parent's low memory). For a top-level window
-    /// (`base == 0`) this is identical to the old `byte(i)`. Fixes `fork_private` of a nested guest:
-    /// the twin now inherits the carve's high-offset globals, not zeros (FORK.md §8.6).
+    /// Snapshot the low `n` bytes of the window (clamped to the backed `mapped` extent).
     fn snapshot(&self, n: u64) -> Vec<u8> {
         // The per-run window capture and `fork_private`'s `window_snapshot` both flow through here.
-        self.read_run(self.window.base(), n.min(self.window.mapped()))
+        self.read_run(0, n.min(self.window.mapped()))
     }
 
     /// Whether the live memory state is **fully captured** by a [`window_snapshot`](Mem::window_snapshot)
@@ -35730,96 +35535,109 @@ impl Mem {
         !self.has_regions.load(Ordering::Relaxed)
     }
 
+    /// The embedder's id of the memory this window lives in when it is not the engine's own
+    /// ([`Region::Foreign`]): what a thread that steps over the window must be able to reach.
+    pub(crate) fn foreign_id(&self) -> Option<u32> {
+        self.back.foreign_id()
+    }
+
     /// #816 env-routed tier-up: the **flat base address** of this window — the backing region's raw
-    /// base plus the window's absolute base offset — or `None` when the backing is non-flat (`Sparse`,
-    /// `Paged` or `Foreign`: no contiguous address, so the emitted tier cannot serve this window and it stays
-    /// interpreted — the fail-closed arm of the tier-up eligibility gate). For a §14 nested child
-    /// this is the parent backing's base plus the carve offset, so the same pointer arithmetic the
-    /// emitted `win + addr` accesses perform lands exactly where the interpreter's confined
-    /// accesses do.
+    /// base — or `None` when the backing is non-flat (`Sparse`, `Paged` or `Foreign`: no contiguous
+    /// address, so the emitted tier cannot serve this window and it stays interpreted — the
+    /// fail-closed arm of the tier-up eligibility gate).
     pub(crate) fn flat_win_base(&self) -> Option<*const u8> {
-        // `window.base() + reserved <= back.len()` by construction (`with_reservation*` size the
-        // backing to cover the window; `nested_view` carves are `carve_fits`-checked inside the
-        // parent window); `raw_base_at` re-checks the offset bound regardless.
-        self.back
-            .raw_base_at(self.window.base())
-            .map(|p| p as *const u8)
+        self.back.raw_base_at(0).map(|p| p as *const u8)
     }
 
     /// #816/#1312 — the **flat span** this window's base actually addresses: its reservation, clamped to
     /// what the backing holds. This is what a codegen host mirrors or bounds its view to, and it is
-    /// *not* the reservation: a cooperative run reserves `DEFAULT_RESERVED_LOG2` (the oracle's, so a
+    /// *not* the reservation: a cooperative run reserves [`default_reserved_log2`] (the oracle's, so a
     /// guest `vm_map` past the declared window is admitted rather than `-EINVAL`) over a backing that
     /// starts at the declared size and grows on demand. Reporting the reservation there would tell a
-    /// driver to mirror a terabyte. For a §14 child carve the two agree — the parent backing covers
-    /// the whole carve — so this only ever narrows where narrowing is correct.
+    /// driver to mirror a terabyte.
     pub(crate) fn win_flat_len(&self) -> u64 {
-        self.window
-            .reserved()
-            .min(self.back.len().saturating_sub(self.window.base()))
+        self.window.reserved().min(self.back.len())
     }
 
-    /// The high-water mark: the mapped prefix, extended over any grown reserved-tail page in the map.
-    fn high_water(&self, space: &AddrSpace) -> u64 {
-        let mut high = self.window.mapped();
-        if let Some((&max_pg, _)) = space.prot.iter().next_back() {
-            high = high.max(max_pg.saturating_add(1).saturating_mul(self.page));
-        }
-        high.min(self.window.reserved())
-    }
-
-    /// A durable capture's span: at least `snap_cap` (the escape-oracle span the JIT captures too),
-    /// and always through the high-water mark, so a page grown past `snap_cap` rides a freeze
-    /// (#1700). Only the freeze capture wants it — a run that reads just its low window must not
-    /// copy a grown heap (a compiler guest's is hundreds of MiB).
-    fn capture_extent(&self, snap_cap: usize) -> u64 {
-        let high = self.high_water(&self.space_read());
-        self.window.reserved().min(high.max(snap_cap as u64))
-    }
-
-    /// Capture the window's full guest-visible memory state — the committed byte range plus the
-    /// page-protection map — for a time-travel checkpoint of a page-mapping window, restored with
-    /// [`restore_layout`](Mem::restore_layout). A page aliasing a §13 region is captured as the
-    /// region it names, its bytes the region's to carry. The byte range runs to the high-water mark —
-    /// the mapped prefix, extended to cover any grown reserved-tail page present in the map — so a
-    /// `map`-grown heap is captured;
-    /// uncommitted/unmapped pages inside it read zero (the demand-zeroed backing, and `map`/`unmap`
-    /// zero on commit), matching a fresh window. Only for the **root** window (`base == 0`); nested
-    /// children ride in the root capture.
+    /// Capture the window's full guest-visible memory state — its bytes and its page-protection map —
+    /// for a time-travel checkpoint, a moment or a §12 freeze, restored with
+    /// [`restore_layout`](Mem::restore_layout). Any domain's window: the root's, or a §14 child's own
+    /// (#1866).
+    ///
+    /// #2427 — the image is the committed prefix, then each page past it the window holds, apart: a
+    /// page the window does not hold costs the capture nothing, so a guest that maps one page at the
+    /// top of its reservation is captured as one page, not as the span below it, and the layout's map
+    /// holds what the window's budget pays for ([`PageMap::grown_bytes`]). A held page keeps its bytes
+    /// unless they are all zero, a page protected to nothing included (its contents are kept, #1909);
+    /// a page aliasing a §13 region is captured as the region it names, its bytes the region's to
+    /// carry ([`Mem::held_map`]).
     fn layout_snapshot(&self) -> MemLayout {
         let space = self.space.read_unpoisoned();
-        let high = self.high_water(&space);
+        let mapped = self.window.mapped();
         // Bulk fast path (the mirror of [`snapshot`](Mem::snapshot)/[`seed`](Mem::seed)): with no §13
-        // region mapped no page is `Backed`, so the whole extent reads straight out of `back` in one
-        // pass — a `memcpy` (flat backing) or a single-lock page walk (`Paged`) instead of a dispatch
-        // PER BYTE. This is what makes a moment of a multi-MiB window (a reactor keyframe) a memcpy
-        // rather than millions of calls; the per-byte arm is a window that aliased a region, which a
+        // region mapped no page is `Backed`, so the prefix reads straight out of `back` in one pass —
+        // a `memcpy` (flat backing) or a single-lock page walk (`Paged`) instead of a dispatch PER
+        // BYTE. This is what makes a moment of a multi-MiB window (a reactor keyframe) a memcpy rather
+        // than millions of calls; the per-byte arm is a window that aliased a region, which a
         // reactor's §12 save-state (#2051) and a debugger checkpoint (#2026) capture, reading through
-        // it. Offset `0`, not
-        // `window.base()`, exactly as the per-byte arm's `self.byte(i)` indexes: this capture is
-        // root-only (see the doc above), where the two agree.
+        // it.
         let bytes = if !self.has_regions.load(Ordering::Relaxed) {
-            let mut out = vec![0u8; high as usize];
+            let mut out = vec![0u8; mapped as usize];
             self.back.read_into(0, &mut out);
             out
         } else {
-            (0..high).map(|i| self.byte(i)).collect()
+            (0..mapped).map(|i| self.byte(i)).collect()
         };
+        let first = mapped.div_ceil(self.page);
+        let prot = self.held_map(&space);
+        let tail = prot
+            .range(first..)
+            .filter(|(_, p)| held_tail(p))
+            .map(|(&page, _)| {
+                let off = page * self.page;
+                let mut out = vec![0u8; self.page as usize];
+                self.back.read_into(off, &mut out);
+                (off, out)
+            })
+            .filter(|(_, out)| out.iter().any(|&x| x != 0))
+            .collect();
         MemLayout {
             bytes,
+            tail,
             map: PageMap {
-                prot: space.prot.clone(),
+                prot,
                 page: self.page,
-                mapped: self.window.mapped(),
+                mapped,
             },
+            seed: false,
         }
     }
 
-    /// Reinstate a [`layout_snapshot`](Mem::layout_snapshot) into this freshly built window: reseed the
-    /// captured bytes (committing any grown-tail page), then install the page-protection map verbatim.
-    /// Bytes first so a `Ro`/grown page has its contents before the protection is applied. The fresh
-    /// window has no regions, so this reproduces the guest-visible state exactly.
+    /// #2427 — this window's page map as a capture records it: its entries, and on a flat window, which
+    /// holds its whole buffer (#2407), each page of the buffer past the declared window that has none,
+    /// as an inaccessible one it holds.
+    fn held_map(&self, space: &AddrSpace) -> BTreeMap<u64, PageProt> {
+        let mut prot = space.prot.clone();
+        if self.back.can_grow() {
+            let first = self.window.mapped().div_ceil(self.page);
+            let end = self
+                .back
+                .len()
+                .min(self.window.reserved())
+                .div_ceil(self.page);
+            for page in first..end {
+                prot.entry(page).or_insert(PageProt::Unmapped);
+            }
+        }
+        prot
+    }
+
+    /// Reinstate a [`layout_snapshot`](Mem::layout_snapshot) into this window: install the
+    /// page-protection map, then write the captured prefix and each page held past it. A thaw's
+    /// fresh window, or a live one a reactor rewinds; either way its regions are the host's to re-alias
+    /// ([`Host::realias_regions`]).
     fn restore_layout(&mut self, layout: &MemLayout) {
+        let first = (layout.bytes.len() as u64).div_ceil(self.page);
         // Install the captured map first, *replacing* whatever this window carries. The guard is only
         // the fast-path one: a window with no explicit protections restoring an image that has none
         // stays off `prot_dirty` (the lock-free `check_prot` path). Whenever either side has entries
@@ -35831,62 +35649,47 @@ impl Mem {
         // already agree. A `Backed` page is the host's to re-alias ([`Host::realias_regions`]), which
         // installs its entry with the region it names.
         if !layout.map.is_empty() || self.prot_dirty.load(Ordering::Acquire) {
-            let mut space = self.space_write(); // marks prot_dirty, matching the captured window
+            // Marks prot_dirty, matching the captured window.
+            let mut space = self.space_write();
+            // #2427 — a page a live window holds past the image that the layout does not rewrite whole
+            // is zeroed first, in runs: the layout writes only the pages it holds with contents, so a
+            // page it holds zero, or not at all, must not keep what the guest wrote there since the
+            // moment was taken. A fresh window holds nothing there.
+            let mut stale: Vec<(u64, u64)> = Vec::new();
+            for (&page, _) in self
+                .held_map(&space)
+                .range(first..)
+                .filter(|&(&page, p)| held_tail(p) && !layout.rewrites(page * self.page, self.page))
+            {
+                match stale.last_mut() {
+                    Some((_, end)) if *end == page => *end += 1,
+                    _ => stale.push((page, page + 1)),
+                }
+            }
             space.prot = layout.map.rebased_to(self.page);
             space
                 .prot
                 .retain(|_, p| !matches!(p, PageProt::Backed { .. }));
+            // The NULL guard is this window's, not the layout's (#964): a layout captured where the
+            // guard disengaged, on a host whose page is larger than it, still faults here as a fresh
+            // window does, and as the JIT's restore re-seeds it.
+            let guard = self.null_guard / self.page;
+            space
+                .prot
+                .extend((0..guard).map(|p| (p, PageProt::Unmapped)));
+            drop(space);
+            for (lo, hi) in stale {
+                self.back.zero(lo * self.page, (hi - lo) * self.page);
+            }
         }
-        // Then the image, straight into `back` in one pass (the mirror of the capture above and of
-        // `seed`). No page is `Backed` now (an alias dirties the map, so the map above replaced it),
-        // so every byte is the window's own: a region the live window aliased since the moment was
-        // taken keeps its bytes out of the restore (#2059). Same root-only offset convention as
-        // `layout_snapshot`.
+        // Then the image, straight into `back` (the mirror of the capture above and of `seed`). No page
+        // is `Backed` now (an alias dirties the map, so the map above replaced it), so every byte is
+        // the window's own: a region the live window aliased since the moment was taken keeps its
+        // bytes out of the restore (#2059). The prefix last overwrites what a fresh window seeded.
         self.back.write_from(0, &layout.bytes);
-    }
-
-    /// Capture just this window's page-protection map (window-relative page ⇒ state) for checkpointing a
-    /// §14 **child** window — a coroutine or `instantiate` child, whose *bytes* live in the parent backing
-    /// (shared via [`nested_view`](Mem::nested_view)) and ride in the parent's [`layout_snapshot`], but
-    /// whose page map is its own (a fresh `AddrSpace`, not the parent's). Precondition:
-    /// [`layout_snapshot_safe`](Mem::layout_snapshot_safe) (no §13 regions). Reinstated with
-    /// [`install_prot`](Mem::install_prot).
-    fn prot_snapshot(&self) -> Vec<(u64, PageProt)> {
-        let space = self.space.read_unpoisoned();
-        space.prot.iter().map(|(&pg, &p)| (pg, p)).collect()
-    }
-
-    /// Install a [`prot_snapshot`](Mem::prot_snapshot) into this freshly built child window — the page-map
-    /// half of a child restore (the byte half is the parent reseed the child's `nested_view` shares). No
-    /// reseed: the child's bytes are already correct in the shared backing.
-    fn install_prot(&self, prot: &[(u64, PageProt)]) {
-        if !prot.is_empty() {
-            self.space_write().prot = prot.iter().copied().collect();
+        for (&off, bytes) in &layout.tail {
+            self.back.write_from(off, bytes);
         }
-    }
-
-    /// Whether this child window's full extent `[base, base + reserved)` lies within `parent`'s mapped
-    /// prefix `[0, mapped)` — i.e. the child's bytes are wholly covered by the parent's
-    /// [`layout_snapshot`] (which reaches at least `parent.mapped`), so a child checkpoint need only carry
-    /// the child's page map. A child carved into the parent's uncommitted reserved tail is *not* covered
-    /// and stays outside the checkpointable subset.
-    fn nested_within_prefix(&self, parent: &Mem) -> bool {
-        self.window.base().saturating_add(self.window.reserved()) <= parent.window.mapped()
-    }
-
-    /// Seed the **whole parent backing** of a §14 sub-window (parent-absolute bytes), so the
-    /// escape-oracle starts with non-zero bytes *outside* the child's slice — a child write that
-    /// escaped its `[base, base+size)` slice would then perturb a byte the snapshot catches.
-    fn seed_parent(&self, init: &[u8]) {
-        for (i, &b) in init.iter().enumerate() {
-            self.set_byte(i as u64, b);
-        }
-    }
-
-    /// Snapshot the **whole parent backing** `[0, parent_bytes)` of a §14 sub-window (paired with
-    /// the JIT's `compile_and_run_capture_sub`, which returns the full parent window).
-    fn snapshot_parent(&self, parent_bytes: u64) -> Vec<u8> {
-        (0..parent_bytes).map(|i| self.byte(i)).collect()
     }
 
     /// Snapshot the low `min(reserved, max(mapped, snap_cap))` bytes for the escape-oracle —
@@ -35922,49 +35725,12 @@ impl Mem {
         }
         out
     }
-
-    /// Per-page protections over the same span as [`snapshot_window`], one [`CapturedProt`] per
-    /// [`DURABLE_SNAPSHOT_PAGE`]-byte page (DURABILITY.md §12.3). A page absent from the map is
-    /// `Rw` in the committed prefix and `Unmapped` in the reserved tail — the same default the
-    /// access path and the JIT's page tables use.
-    fn snapshot_prots(&self, snap_cap: usize) -> Vec<CapturedProt> {
-        let snap = self
-            .window
-            .reserved()
-            .min(self.window.mapped().max(snap_cap as u64));
-        let space = self.space_read();
-        dense_prots(&space.prot, self.page, self.window.mapped(), snap)
-    }
-
-    /// Re-establish a captured protection map on this window (the durable-restore step, the
-    /// inverse of [`snapshot_prots`]): mark each `Ro`/`Unmapped` page so a thawed guest faults
-    /// exactly as the frozen one would. `Rw` is the prefix default (left absent) but is set
-    /// explicitly for a reserved-tail page (a grown commit); `Backed` is skipped — a §13
-    /// shared-region alias isn't restorable here (D-region), the embedder re-grants the region.
-    /// A committed reserved-tail page takes its bytes from `init`, the image the map was captured
-    /// with (#1834) — [`seed`](Mem::seed) stops at the prefix. The JIT's `GuestWindow::apply_prots`
-    /// is this rule on its page tables.
-    fn apply_prots(&mut self, prots: &[CapturedProt], init: &[u8]) {
-        let mapped = self.window.mapped();
-        for (i, p) in prots.iter().enumerate() {
-            let off = i as u64 * DURABLE_SNAPSHOT_PAGE;
-            if off >= mapped && matches!(p, CapturedProt::Rw | CapturedProt::Ro) {
-                let src = init.get(off as usize..).unwrap_or(&[]);
-                let n = src.len().min(DURABLE_SNAPSHOT_PAGE as usize);
-                // A fresh window has no §13 region, so the bytes go straight to the backing.
-                self.back.write_from(off, &src[..n]);
-            }
-        }
-        let mut space = self.space_write();
-        space.prot.extend(sparse_prots(prots, self.page, mapped));
-    }
 }
 
 /// The one sparse ⇒ dense protection conversion: a window's page map (in `page`-byte pages, committed
 /// prefix `mapped`) as one [`CapturedProt`] per [`DURABLE_SNAPSHOT_PAGE`] over `[0, len)`. A page
 /// absent from the map is `Rw` in the committed prefix and `Unmapped` in the reserved tail — the same
-/// default the access path and the JIT's page tables use. Shared by [`Mem::snapshot_prots`] and
-/// [`MemLayout::dense_prots`], so the live window and its captured image agree page for page.
+/// default the access path and the JIT's page tables use. [`MemLayout::dense_prots`]'s.
 fn dense_prots(
     prot: &BTreeMap<u64, PageProt>,
     page: u64,
@@ -35975,18 +35741,7 @@ fn dense_prots(
         .map(|i| {
             let byte_off = i * DURABLE_SNAPSHOT_PAGE;
             match prot.get(&(byte_off / page)) {
-                Some(PageProt::Rw) => CapturedProt::Rw,
-                Some(PageProt::Ro) => CapturedProt::Ro,
-                Some(PageProt::Unmapped) => CapturedProt::Unmapped,
-                Some(&PageProt::Backed {
-                    region,
-                    region_off,
-                    writable,
-                }) => CapturedProt::Backed {
-                    region,
-                    off: region_off + byte_off % page,
-                    writable,
-                },
+                Some(p) => p.captured(byte_off % page),
                 None if byte_off < mapped => CapturedProt::Rw,
                 None => CapturedProt::Unmapped,
             }
@@ -35997,7 +35752,7 @@ fn dense_prots(
 /// The one dense ⇒ sparse protection conversion, the inverse of [`dense_prots`]: the entries a window
 /// with `page`-byte pages and committed prefix `mapped` carries for a codec map. `Ro`/`Unmapped`
 /// always; `Rw` only in the reserved tail (a grown commit — in the prefix it is the default and stays
-/// absent); `Backed` never (D-region). Shared by [`Mem::apply_prots`] and [`MemLayout::from_dense`].
+/// absent); `Backed` never (D-region). [`MemLayout::from_dense`]'s.
 fn sparse_prots(
     prots: &[CapturedProt],
     page: u64,
@@ -36030,31 +35785,31 @@ impl GuestMem for Mem {
     /// anywhere in the reserved window `[0, reserved)` — including **growth** into the reserved
     /// tail `[mapped, reserved)`, the §1a sparse-address-space capability. Out-of-range /
     /// misaligned → `-EINVAL`. Over a **growable** backing ([`Region::can_grow`] — a detached
-    /// child's own embedder memory, #1286; a cooperative run's relocatable window, #1312) the
-    /// backing is asked to cover the pages first; a refusal (the foreign memory's `maximum`, or an
-    /// allocator that cannot serve the buffer) is `-ENOMEM`, probeable, before a byte of protection
-    /// state changes. (A **fixed** backing shorter than the reservation keeps its #1153 contract:
-    /// the op succeeds and accesses past the backing are dropped/read zero —
-    /// `region_backing_bound.rs`.)
+    /// child's own embedder memory, #1286; a cooperative run's relocatable window, #1312) a `map`
+    /// granting access asks the backing to cover the pages first, which [`Host::page_op`] charged
+    /// (#2407: one flat buffer, so it covers every page below them too); a refusal (the foreign
+    /// memory's `maximum`, or an allocator that cannot serve the buffer) is `-ENOMEM`, probeable,
+    /// before a byte of protection state changes. A `map` to no access commits nothing and grows
+    /// nothing. (A **fixed** backing shorter than the reservation keeps its #1153 contract: the op
+    /// succeeds and accesses past the backing are dropped/read zero — `region_backing_bound.rs`.
+    /// So does a `protect` past a growable one.)
     fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
         let pages = match self.prot_pages(offset, len) {
             Ok(p) => p,
             Err(e) => return e,
         };
-        if self.back.can_grow()
-            && !self
-                .back
-                .grow_to(self.window.base() + (pages.end() + 1) * self.page)
+        if prot & (PROT_READ | PROT_WRITE) != 0
+            && self.back.can_grow()
+            && !self.back.grow_to((pages.end() + 1) * self.page)
         {
             return ENOMEM;
         }
-        {
-            let mut space = self.space_write();
-            for page in pages.clone() {
-                self.set_prot(&mut space.prot, page, prot, false);
-            }
+        let runs = self.change_pages(pages, prot, |map, page| {
+            self.set_prot(map, page, prot, false)
+        });
+        for (first, last) in runs {
+            self.zero_pages(first..=last); // commit ⇒ fresh zeroed pages
         }
-        self.zero_pages(pages); // commit ⇒ fresh zeroed pages
         0
     }
 
@@ -36064,13 +35819,10 @@ impl GuestMem for Mem {
             Ok(p) => p,
             Err(e) => return e,
         };
-        {
-            let mut space = self.space_write();
-            for page in pages.clone() {
-                self.set_prot(&mut space.prot, page, 0, false);
-            }
+        let runs = self.change_pages(pages, 0, |map, page| self.set_prot(map, page, 0, false));
+        for (first, last) in runs {
+            self.zero_pages(first..=last);
         }
-        self.zero_pages(pages);
         0
     }
 
@@ -36078,6 +35830,10 @@ impl GuestMem for Mem {
         let Ok(pages) = self.prot_pages(offset, len) else {
             return TailBytes::default();
         };
+        if self.back.can_grow() {
+            let len = self.back.len();
+            return flat_tail_bytes(self.window.mapped(), len, (pages.end() + 1) * self.page);
+        }
         let space = self.space_read();
         window_tail_bytes(
             &space.prot,
@@ -36118,16 +35874,15 @@ impl GuestMem for Mem {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let mut space = self.space_write();
-        for page in pages {
+        self.change_pages(pages, prot, |map, page| {
             if let Some(PageProt::Backed {
                 region, region_off, ..
-            }) = space.prot.get(&page).copied()
+            }) = map.get(&page).copied()
             {
                 if prot & (PROT_READ | PROT_WRITE) == 0 {
-                    self.set_prot(&mut space.prot, page, 0, false); // the region's, not kept
+                    self.set_prot(map, page, 0, false); // the region's, not kept
                 } else {
-                    space.prot.insert(
+                    map.insert(
                         page,
                         PageProt::Backed {
                             region,
@@ -36137,9 +35892,9 @@ impl GuestMem for Mem {
                     );
                 }
             } else {
-                self.set_prot(&mut space.prot, page, prot, true);
+                self.set_prot(map, page, prot, true);
             }
-        }
+        });
         0
     }
 
@@ -36660,6 +36415,19 @@ fn val_to_slot(v: Value) -> i64 {
 }
 
 /// Decode a capability-ABI result slot back to a `Value` of the declared type.
+/// #2361 — the values a host-served `call.cap` defines: one per declared result, each the host's
+/// result at that place converted to its declared type, or zero past the results the host returned.
+/// Results past the declared ones are dropped. Every engine defines the same: the Cranelift JIT's
+/// result slots start zeroed, and the bytecode engine zeroes its result registers.
+fn push_results(vals: &mut Vec<Reg>, results: &[i64], declared: &[ValType]) {
+    vals.extend(
+        declared
+            .iter()
+            .enumerate()
+            .map(|(i, &ty)| Reg::from_value(slot_to_val(ty, results.get(i).copied().unwrap_or(0)))),
+    );
+}
+
 fn slot_to_val(ty: ValType, s: i64) -> Value {
     match ty {
         ValType::I32 => Value::I32(s as i32),
@@ -37102,6 +36870,173 @@ mod growth_tests {
         assert_eq!(used(&root, BudgetTree::RUN_NODE), (WINDOW + GROWTH) as i64);
     }
 
+    /// #2407 — a growable backing is one flat buffer, so its window holds the buffer's length,
+    /// whatever its pages' state. Only a `map` granting access grows it, over every page up to the
+    /// span's end, and that growth is charged first, all or nothing. The buffer never shrinks, so
+    /// nothing hands it back before the window ends.
+    #[test]
+    fn a_growable_window_pays_for_its_backings_length() {
+        const RW: i32 = PROT_READ | PROT_WRITE;
+        let page = host_page_size();
+        let mut root = Host::new();
+        root.set_grant((WINDOW + 18 * page) as i64, -1, -1, -1);
+        let (_, space) = root.grant_starter_caps(1 << 20);
+        let back = Arc::new(Region::growable(WINDOW, page).expect("allocates"));
+        let mut mem = Mem::with_reservation_over(20, 16, back.clone(), None);
+        let _ = root.begin_activation(u64::MAX, RootWindow::of(Some(&mem)));
+        let run = BudgetTree::RUN_NODE;
+        let op = |root: &mut Host, mem: &mut Mem, op: u32, at: u64, len: u64, prot: i32| {
+            let args = [at as i64, len as i64, prot as i64];
+            root.cap_dispatch_slots(cap_id::ADDRESS_SPACE, op, space, &args, Some(mem))
+                .expect("dispatch")[0]
+        };
+        let held = |root: &Host| (back.len() - WINDOW, used(root, run) - WINDOW as i64);
+        // A map to no access, an unmap and a protect to none of the whole tail grow nothing.
+        let tail = (1 << 20) - WINDOW;
+        for (code, prot) in [(0, 0), (1, 0), (2, 0)] {
+            assert_eq!(op(&mut root, &mut mem, code, WINDOW, tail, prot), 0);
+        }
+        assert_eq!(held(&root), (0, 0));
+        // Nor does a protect granting access past the backing (#1153): its page reads zero and a
+        // store to it is dropped.
+        assert_eq!(op(&mut root, &mut mem, 2, WINDOW, page, RW), 0);
+        assert!(mem.store(WINDOW, 0, StoreOp::I64, Value::I64(7)).is_ok());
+        assert_eq!(mem.load(WINDOW, 0, LoadOp::I64), Ok(Value::I64(0)));
+        assert_eq!(held(&root), (0, 0));
+        // A map granting access a page past the window grows the backing over both pages, exactly.
+        assert_eq!(op(&mut root, &mut mem, 0, WINDOW + page, page, RW), 0);
+        assert_eq!(held(&root), (2 * page, 2 * page as i64));
+        // One the grant has no room for is refused before anything grows; one at its edge grows
+        // the backing over the gap below it: sixteen pages for one.
+        assert_eq!(
+            op(&mut root, &mut mem, 0, WINDOW + 18 * page, page, RW),
+            ENOMEM
+        );
+        assert_eq!(held(&root), (2 * page, 2 * page as i64));
+        assert_eq!(op(&mut root, &mut mem, 0, WINDOW + 17 * page, page, RW), 0);
+        assert_eq!(held(&root), (18 * page, 18 * page as i64));
+        // Unmapped, its pages are still the buffer's, and mapped again they cost nothing more.
+        assert_eq!(op(&mut root, &mut mem, 1, WINDOW, 18 * page, 0), 0);
+        assert_eq!(op(&mut root, &mut mem, 0, WINDOW, 18 * page, RW), 0);
+        assert_eq!(held(&root), (18 * page, 18 * page as i64));
+        // An activation counts the window the same way, and its end hands it all back.
+        assert_eq!(RootWindow::of(Some(&mem)).grown, 18 * page);
+        root.release_memory();
+        assert_eq!(used(&root, run), 0);
+    }
+
+    /// #2407 — a capture of a growable window holds each page up to its backing's end, though no
+    /// page up there is mapped any more, so the window a thaw rebuilds from it holds what the frozen
+    /// one was charged. #2427 — as pages held past the declared window, which the codec rebuilds.
+    #[test]
+    fn a_flat_windows_capture_carries_what_it_holds() {
+        let page = host_page_size();
+        let back = Arc::new(Region::growable(WINDOW, page).expect("allocates"));
+        let mut mem = Mem::with_reservation_over(20, 16, back, None);
+        assert_eq!(mem.map(WINDOW + 7 * page, page, PROT_READ | PROT_WRITE), 0);
+        assert_eq!(mem.unmap(WINDOW, 8 * page), 0);
+        let held = mem.tail_bytes(0, 1 << 20).held;
+        assert_eq!(held, 8 * page);
+        let image = mem.layout_snapshot();
+        assert_eq!(image.page_map().grown_bytes(), held);
+        let mut thawed =
+            MemLayout::from_dense(image.bytes().to_vec(), &image.dense_prots(), WINDOW);
+        for (off, prot, bytes) in image.tail_pages() {
+            thawed.hold(off, prot, bytes.map(<[u8]>::to_vec));
+        }
+        assert_eq!(thawed.page_map().grown_bytes(), held);
+    }
+
+    /// #2427 — a capture holds the pages a window holds past its declared size, apart, and nothing
+    /// between them: a page mapped at the top of the reservation is one page of the capture, which a
+    /// window rebuilt from it holds, contents and all.
+    #[test]
+    fn a_capture_holds_a_far_page_alone() {
+        let page = host_page_size();
+        let top = (1 << 20) - page;
+        let mut mem = Mem::with_reservation(20, 16, None);
+        assert_eq!(mem.map(top, page, PROT_READ | PROT_WRITE), 0);
+        assert_eq!(mem.write_bytes(top + 7, &[0x5a]), Some(()));
+        let image = mem.layout_snapshot();
+        assert_eq!(
+            image.bytes().len() as u64,
+            WINDOW,
+            "the head is the declared window"
+        );
+        assert_eq!(
+            image.byte_len() as u64,
+            WINDOW + page,
+            "nothing of the span below"
+        );
+        assert_eq!(image.page_map().grown_bytes(), page);
+        let mut thawed = Mem::with_reservation(20, 16, None);
+        thawed.restore_layout(&image);
+        assert_eq!(thawed.read_bytes(top + 7, 1), Some(vec![0x5a]));
+        assert_eq!(thawed.tail_bytes(0, 1 << 20).held, page);
+    }
+
+    /// #2441 — a window restored from a layout keeps its own NULL guard, though the layout names none
+    /// (one captured where the guard disengaged): the root's thaw replaces the window's page map with
+    /// the layout's, as a detached child's relaunch does, and the guard stays as a fresh window has it.
+    #[test]
+    fn a_restored_window_keeps_its_null_guard() {
+        let guard = temen_ir::module_null_guard();
+        if guard == 0 || !guard.is_multiple_of(host_page_size()) {
+            return; // the guard disengages on this host
+        }
+        let mut mem = Mem::from_spec(WindowSpec {
+            reserved_log2: 17,
+            mapped_log2: 17,
+            null_guard: guard,
+            ..WindowSpec::default()
+        });
+        mem.restore_layout(&MemLayout::from_parts(vec![1; 1 << 17], 4096, 1 << 17, &[]).unwrap());
+        assert_eq!(mem.read_bytes(0, 1), None, "the guard still faults");
+        assert_eq!(
+            mem.read_bytes(guard, 1),
+            Some(vec![1]),
+            "the image above it"
+        );
+    }
+
+    /// #2427 — a window rewound to a capture holds what the capture held, though the guest wrote and
+    /// mapped past its declared size since: a page it held zero reads zero again, and one it did not
+    /// hold is gone.
+    #[test]
+    fn a_rewound_window_forgets_what_was_written_past_its_capture() {
+        let page = host_page_size();
+        let (held_zero, later) = (WINDOW + 2 * page, WINDOW + 5 * page);
+        let mut mem = Mem::with_reservation(20, 16, None);
+        assert_eq!(mem.map(held_zero, page, PROT_READ | PROT_WRITE), 0);
+        let moment = mem.layout_snapshot();
+        assert_eq!(mem.write_bytes(held_zero, &[7; 8]), Some(()));
+        assert_eq!(mem.map(later, page, PROT_READ | PROT_WRITE), 0);
+        assert_eq!(mem.write_bytes(later, &[9; 8]), Some(()));
+        mem.restore_layout(&moment);
+        assert_eq!(mem.read_bytes(held_zero, 8), Some(vec![0; 8]));
+        assert_eq!(
+            mem.tail_bytes(0, 1 << 20).held,
+            page,
+            "the later page is gone"
+        );
+        assert_eq!(mem.map(later, page, PROT_READ | PROT_WRITE), 0);
+        assert_eq!(mem.read_bytes(later, 8), Some(vec![0; 8]));
+    }
+
+    /// #2407 — a fork twin of a growable window holds what its parent's holds, which is what the twin
+    /// is charged ([`Host::fork_powerbox`]), though its parent's top page is no longer mapped.
+    #[test]
+    fn a_flat_windows_fork_twin_holds_what_its_parent_does() {
+        let page = host_page_size();
+        let back = Arc::new(Region::growable(WINDOW, page).expect("allocates"));
+        let mut mem = Mem::with_reservation_over(20, 16, back, None);
+        assert_eq!(mem.map(WINDOW, 8 * page, PROT_READ | PROT_WRITE), 0);
+        assert_eq!(mem.unmap(WINDOW + 7 * page, page), 0);
+        let twin = mem.fork_private().expect("a simple window forks");
+        let held = |m: &Mem| m.tail_bytes(0, 1 << 20).held;
+        assert_eq!((held(&mem), held(&twin)), (8 * page, 8 * page));
+    }
+
     /// #2113 — a root's fork twin pays for its copy from the root's grant, as a child's twin pays
     /// from its budget, and its end hands it back.
     #[test]
@@ -37190,6 +37125,151 @@ mod exec_maps_tests {
         );
         image.host.release_memory();
         assert_eq!(maps(&parent, node), 0, "and its end hands them back");
+    }
+}
+
+#[cfg(test)]
+mod full_table_tests {
+    //! #2222 — a guest can fill its own handle table (`pipe()` takes two slots a call), then reach a
+    //! path that installs entries with the infallible grant. Each refuses instead of panicking the
+    //! host.
+    use super::*;
+
+    /// Fill `host`'s table as a guest's `pipe()` loop does.
+    fn fill(host: &mut Host) {
+        while host.try_grant_pipe().is_some() {}
+        while host.room() > 0 {
+            host.grant_stream(StreamRole::Out);
+        }
+    }
+
+    #[test]
+    fn a_re_grant_into_a_full_table_is_refused() {
+        let mut parent = Host::new();
+        let out = parent.grant_stream(StreamRole::Out);
+        let mut child = Host::new();
+        fill(&mut child);
+        assert_eq!(parent.regrant_into_child(out, &mut child), None);
+        let mut slots = [out as i64];
+        assert_eq!(
+            translate_cap_slots(&mut parent, &mut child, &[ValType::Cap], &mut slots),
+            Err(Trap::CapFault),
+            "an offer call passing a capability to a provider with a full table fails closed"
+        );
+    }
+
+    #[test]
+    fn a_spawn_whose_grants_do_not_fit_is_refused() {
+        let mut parent = Host::new();
+        let out = parent.grant_stream(StreamRole::Out);
+        let grants: Vec<(String, i32)> = (0..CAP).map(|i| (format!("out{i}"), out)).collect();
+        assert!(
+            parent
+                .spawn_child_powerbox(&grants, 1 << 20, parent.attestation, None, None)
+                .is_none(),
+            "more grants than a child's table holds"
+        );
+    }
+
+    #[test]
+    fn minting_into_a_full_table_is_emfile() {
+        let pm = temen_text::parse_module(
+            "type 0 func (i64) -> (i64)\n\
+             type 1 interface { dbl: 0 }\n\
+             export 0 interface \"svc\" 1 { dbl: 0 }\n\n\
+             func (i64) -> (i64) {\n\
+             block 0 (va: i64) {\n\
+               vs = i64.add va va\n\
+               return vs\n\
+               }\n\
+             }\n",
+        )
+        .expect("parse");
+        let mut host = Host::new();
+        host.set_self_module(&Arc::new(pm));
+        host.set_module_validator(|_| panic!("a full table refuses before the gate runs"));
+        fill(&mut host);
+        assert_eq!(host.reify_export(0), Ok(EMFILE as i32), "export.handle");
+        assert_eq!(host.module_from_bytes(b"\0asm"), EMFILE, "from_bytes");
+    }
+
+    #[test]
+    fn an_exec_whose_kept_ends_do_not_fit_is_refused() {
+        let mut host = Host::new();
+        let cmd = temen_text::parse_module(
+            "memory 16\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n",
+        )
+        .expect("parse");
+        let mh = host.grant_module(&cmd);
+        let command = host.exec_module(ExecCmd::Granted(mh)).expect("resolves");
+        let personality =
+            host.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless);
+        // A personality that keeps descriptors across exec, as temen-posix's does.
+        host.exec_remap_hooks.push(Arc::new(|_: &[(i32, i32)]| {}));
+        fill(&mut host);
+        assert_eq!(
+            host.exec_image(&command, &[], 0, 0, 1 << 20).err(),
+            Some(EINVAL),
+            "the new image's own grants leave no room for every end"
+        );
+        assert_eq!(
+            host.cap_dispatch_slots(cap_id::HOST_PROC, 0, personality, &[], None),
+            Ok(vec![0]),
+            "the caller keeps its personality"
+        );
+    }
+}
+
+#[cfg(test)]
+mod grant_list_tests {
+    //! #2349 — a spawn's or an exec's grant list is the guest's to size: its length and each name's
+    //! are bounded before anything is read, so a list of 2^33 records or a 4 GiB name refuses at once
+    //! instead of making the host loop or allocate.
+    use super::*;
+
+    /// A window holding `n` records, each naming the string just past them, `name_len` bytes long.
+    fn window(n: usize, name_len: u32) -> Vec<u8> {
+        let name = n * 16;
+        let mut w = vec![b'x'; name + MAX_GRANT_NAME];
+        for i in 0..n {
+            let rec = &mut w[i * 16..i * 16 + 16];
+            rec[..4].copy_from_slice(&(name as u32).to_le_bytes());
+            rec[4..8].copy_from_slice(&name_len.to_le_bytes());
+            rec[8..12].copy_from_slice(&7i32.to_le_bytes());
+        }
+        w
+    }
+
+    #[test]
+    fn a_list_past_its_bounds_refuses_before_it_is_read() {
+        let w = window(1, 4);
+        let read = |o, l| read_slice(&w, o, l);
+        assert_eq!(read_grant_records(0, 1, read), Ok(vec![("xxxx".into(), 7)]));
+        let reads = std::cell::Cell::new(0);
+        let counted = |o, l| {
+            reads.set(reads.get() + 1);
+            read_slice(&w, o, l)
+        };
+        assert_eq!(
+            read_grant_records(0, 1 << 33, counted),
+            Err(Trap::CapFault),
+            "2^33 records"
+        );
+        assert_eq!(reads.get(), 0, "and nothing was read");
+        let w = window(1, u32::MAX);
+        assert_eq!(
+            read_grant_records(0, 1, |o, l| read_slice(&w, o, l)),
+            Err(Trap::CapFault),
+            "a 4 GiB name"
+        );
+        let w = window(1, MAX_GRANT_NAME as u32);
+        assert!(read_grant_records(0, 1, |o, l| read_slice(&w, o, l)).is_ok());
+        let w = window(MAX_SPAWN_GRANTS as usize, 4);
+        let read = |o, l| read_slice(&w, o, l);
+        assert_eq!(
+            read_grant_records(0, MAX_SPAWN_GRANTS, read).map(|l| l.len()),
+            Ok(MAX_SPAWN_GRANTS as usize)
+        );
     }
 }
 
@@ -37667,16 +37747,6 @@ mod fiber_charge_tests {
 mod spawn_module_tests {
     use super::*;
 
-    fn validator(bytes: &[u8], _mem: Option<u8>, _symtab: &[u8]) -> Result<JitValidated, i64> {
-        let m = temen_encode::decode_module(bytes).map_err(|_| EINVAL)?;
-        temen_verify::verify_module(&m).map_err(|_| EINVAL)?;
-        Ok(JitValidated {
-            funcs: m.funcs.into(),
-            types: m.types.into(),
-            data: None,
-        })
-    }
-
     /// #1883 — a grant holds its module once. It shares the granted `Arc<Module>` and makes no copy
     /// of the code; the tree-walker's own tables are made when first asked for, and every copy of the
     /// grant shares them.
@@ -37702,49 +37772,18 @@ mod spawn_module_tests {
         );
     }
 
-    /// #2143 — from an installed unit's frame, `-1` names the unit's program as a module: its
-    /// functions over the table's memory, with no data, no shadow arena and no durable attestation, so
-    /// a durable domain refuses the spawn. Without a unit it is still the running module, and a unit
-    /// the host does not hold is a forgery.
+    /// #2219 — `-1` names no module. With a running module registered it is a forged handle like any
+    /// other, so a spawn naming it faults rather than running the spawner's own program.
     #[test]
-    fn a_units_own_module_is_its_program() {
+    fn minus_one_names_no_module() {
         let program = temen_text::parse_module(
-            "memory 16\ndata 16400 \"x\"\nfunc () -> () {\nblock 0 () {\n  return\n  }\n}\n",
+            "memory 16\nfunc () -> () {\nblock 0 () {\n  return\n  }\n}\n",
         )
-        .expect("parse program");
-        let unit = temen_text::parse_module(
-            "memory 16\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n",
-        )
-        .expect("parse unit");
+        .expect("parse");
         let mut host = Host::new();
         host.set_self_module(&Arc::new(program));
-        host.set_jit_validator(validator);
-        let jit = host.grant_jit(Some(16));
-        let c = host
-            .jit_compile(jit, &temen_encode::encode_module(&unit))
-            .expect("no trap")
-            .expect("compiled");
-
-        let g = host
-            .resolve_spawn_module(SELF_MODULE, Some((c.domain, c.unit)))
-            .expect("the unit's module");
-        assert_eq!(g.module.funcs, unit.funcs);
-        assert_eq!(g.memory_log2(), Some(16));
-        assert!(g.module.data.is_empty() && g.shadow().is_none() && !g.durable);
-
-        let own = host
-            .resolve_spawn_module(SELF_MODULE, None)
-            .expect("the running module");
-        assert_eq!(
-            own.module.data.len(),
-            1,
-            "without a unit, `-1` is the running module"
-        );
-
-        assert!(matches!(
-            host.resolve_spawn_module(SELF_MODULE, Some((c.domain, c.unit + 1))),
-            Err(Trap::CapFault)
-        ));
+        assert!(matches!(host.resolve_module(-1), Err(Trap::CapFault)));
+        assert!(host.spawn_module(-1).is_none());
     }
 }
 
@@ -37759,7 +37798,7 @@ mod fork_powerbox_tests {
     #[test]
     fn fork_copies_the_handle_namespace_and_mints_a_new_domain() {
         let mut host = Host::new();
-        let h_inst = host.grant_instantiator(0, 1u64 << 16);
+        let h_inst = host.grant_instantiator();
         let h_out = host.grant_stream(StreamRole::Out);
         let twin = host.fork_powerbox(7, 0).expect("a simple domain forks");
         // A distinct domain identity — the twin is its own domain.
@@ -37772,7 +37811,7 @@ mod fork_powerbox_tests {
         assert!(
             matches!(
                 twin.resolve(h_inst, cap_id::INSTANTIATOR),
-                Ok(Binding::Instantiator { .. })
+                Ok(Binding::Instantiator)
             ),
             "the instantiator handle resolves in the twin"
         );
@@ -38113,7 +38152,10 @@ mod fork_powerbox_tests {
         host.grant_host_proc_forkable(
             Box::new(|_, _, _, _| Ok(vec![1])),
             Arc::new(|_pid| {
-                ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![1])), CapState::Stateless)
+                Some(ForkedProc::shared(
+                    Box::new(|_, _, _, _| Ok(vec![1])),
+                    CapState::Stateless,
+                ))
             }),
             CapState::Stateless,
         );
@@ -38144,7 +38186,7 @@ mod fork_powerbox_tests {
         let mut host = Host::new();
         let h = host.grant_host_proc_forkable(
             make(),
-            Arc::new(move |_pid| ForkedProc::shared(make(), CapState::Stateless)),
+            Arc::new(move |_pid| Some(ForkedProc::shared(make(), CapState::Stateless))),
             CapState::Stateless,
         );
         let twin = host
@@ -38181,7 +38223,10 @@ mod fork_powerbox_tests {
         parent.grant_host_proc_forkable(
             Box::new(|_, _, _, _| Ok(vec![0])),
             Arc::new(move |_pid| {
-                ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![0])), captured(9))
+                Some(ForkedProc::shared(
+                    Box::new(|_, _, _, _| Ok(vec![0])),
+                    captured(9),
+                ))
             }),
             captured(1),
         );
@@ -38212,7 +38257,7 @@ mod fork_powerbox_tests {
         let mut parent = Host::new();
         let h = parent.grant_host_proc_forkable(
             make(),
-            Arc::new(move |_pid| ForkedProc::shared(make(), CapState::Stateless)),
+            Arc::new(move |_pid| Some(ForkedProc::shared(make(), CapState::Stateless))),
             CapState::Stateless,
         );
         let mut child = Host::new();
@@ -38240,6 +38285,69 @@ mod fork_powerbox_tests {
             parent.regrant_into_child(opaque, &mut child).is_none(),
             "a factory-less host proc fails the re-grant closed"
         );
+        // #2373 — as does a provider with no room for the child's copy.
+        let full = parent.grant_host_proc_forkable(
+            Box::new(|_, _, _, _| Ok(vec![0])),
+            Arc::new(|_pid| None),
+            CapState::Stateless,
+        );
+        assert!(
+            parent.regrant_into_child(full, &mut child).is_none(),
+            "no room for the child's copy fails the re-grant closed"
+        );
+    }
+
+    /// #2424 — an offloadable host proc whose provider gave it a fork factory goes with a spawned
+    /// child and a fork twin, even after its domain has called it, and each new domain's call
+    /// punts into its own completion store.
+    #[test]
+    fn an_offloadable_host_proc_goes_with_a_child_and_a_twin() {
+        let offload = || -> OffloadHostProc {
+            Box::new(|_op, args| {
+                let x = args[0];
+                OffloadOutcome::Offload(Box::new(move || x + 1))
+            })
+        };
+        let mut parent = Host::new();
+        let h = parent.grant_host_proc_offloadable(
+            offload(),
+            Some(Arc::new(move |_pid| {
+                Some(ForkedProc::offloadable(offload(), CapState::Stateless))
+            })),
+            CapState::Stateless,
+        );
+        let call = |host: &mut Host, handle: i32, x: i64| {
+            let mut id = None;
+            let r =
+                host.cap_dispatch_slots_pending(cap_id::HOST_PROC, 0, handle, &[x], None, &mut id);
+            assert_eq!(r, Ok(vec![]), "a punted call answers later");
+            host.completions().wait(id.expect("the call punts"))
+        };
+        assert_eq!(call(&mut parent, h, 1), 2, "the parent's own call");
+        let mut child = Host::new();
+        let ch = parent
+            .regrant_into_child(h, &mut child)
+            .expect("an offloadable proc with a fork factory re-grants into a child");
+        let mut twin = parent
+            .fork_powerbox(7, 0)
+            .expect("a domain that has punted still forks");
+        assert_eq!(call(&mut child, ch, 10), 11, "the child's call");
+        assert_eq!(call(&mut twin, h, 20), 21, "the twin's call");
+        assert_eq!(
+            parent.completions().minted(),
+            1,
+            "the parent's store has only its own call"
+        );
+        assert_eq!(
+            child.completions().minted(),
+            1,
+            "the child's store has its call"
+        );
+        assert_eq!(
+            twin.completions().minted(),
+            1,
+            "the twin's store has its call"
+        );
     }
 }
 
@@ -38247,7 +38355,7 @@ mod fork_powerbox_tests {
 mod mem_fork_tests {
     //! FORK.md PR 1 increment 3b — `Mem::fork_private`, the twin's **private** window copy. It copies
     //! the parent's mapped bytes into a fresh backing that does **not** alias the parent (POSIX-fork
-    //! memory semantics), distinct from `fork_for_thread`/`nested_view`, which share the backing bytes.
+    //! memory semantics), distinct from `fork_for_thread`, which shares the backing bytes.
     use super::*;
 
     #[test]
@@ -38351,7 +38459,7 @@ mod mem_fork_tests {
     fn a_twin_of_a_window_that_grows_in_place_grows_in_place() {
         let page = host_page_size();
         let m = Mem::with_reservation_over(
-            DEFAULT_RESERVED_LOG2,
+            temen_ir::DEFAULT_RESERVED_LOG2,
             16,
             Arc::new(Region::growable(1 << 16, page).expect("64 KiB allocates")),
             None,
@@ -38800,6 +38908,74 @@ mod prot_tests {
         assert!(m.store(0, 0, StoreOp::I64, Value::I64(1)).is_ok());
     }
 
+    /// #2370 — the runs an op can change: the whole span when it grants access, else the declared
+    /// window's part of it and the tail pages with an entry, adjacent ones joined.
+    #[test]
+    fn changed_runs_are_the_span_or_what_it_holds() {
+        let map: BTreeMap<u64, PageProt> = [
+            (2, PageProt::Unmapped),
+            (16, PageProt::Rw),
+            (17, PageProt::Ro),
+            (20, PageProt::Unmapped),
+            (99, PageProt::Rw),
+        ]
+        .into_iter()
+        .collect();
+        let runs = |pages, prot| changed_runs(&map, pages, 16, prot);
+        assert_eq!(runs(0..=1 << 40, PROT_READ), [(0, 1 << 40)]);
+        assert_eq!(runs(0..=1 << 40, 0), [(0, 17), (20, 20), (99, 99)]);
+        assert_eq!(runs(3..=98, 0), [(3, 17), (20, 20)]);
+        assert_eq!(runs(18..=19, 0), []);
+        assert_eq!(runs(21..=1 << 40, 0), [(99, 99)]);
+    }
+
+    /// #2370 — a page op that grants no access changes only what the window holds, so its host work
+    /// is bounded by that, not by the span it names. Over a 128 GiB reservation's 2^25 pages, a walk
+    /// of the span took seconds per op; this one costs microseconds. Measured in this thread's CPU
+    /// time, which a loaded machine does not stretch.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_page_op_over_the_whole_reservation_costs_what_the_window_holds() {
+        let cpu_ns = || -> u64 {
+            let stat = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap();
+            stat.split(' ').next().unwrap().parse().unwrap()
+        };
+        let (p, mapped, reserved) = (page(), 1u64 << 16, 1u64 << 37);
+        let mut m = Mem::with_reservation(37, 16, None);
+        // Two adjacent tail pages and one far up, each holding a value.
+        let held = [mapped, mapped + p, reserved - p];
+        let fill = |m: &mut Mem| {
+            for at in held {
+                assert_eq!(m.map(at, p, PROT_READ | PROT_WRITE), 0);
+                assert!(m.store(at, 0, StoreOp::I64, Value::I64(7)).is_ok());
+            }
+        };
+        let read = |m: &mut Mem, at| {
+            assert_eq!(m.protect(at, p, PROT_READ), 0);
+            m.load(at, 0, LoadOp::I64)
+        };
+        let start = cpu_ns();
+        for _ in 0..4 {
+            fill(&mut m);
+            // To no access: the pages keep their contents, which a later `protect` shows.
+            assert_eq!(m.protect(0, reserved, 0), 0);
+            assert_eq!(m.load(0, 0, LoadOp::I64), Err(Trap::MemoryFault));
+            assert_eq!(read(&mut m, held[2]), Ok(Value::I64(7)));
+            // A `map` to no access and an `unmap` zero them, the declared window's included.
+            assert_eq!(m.map(0, reserved, 0), 0);
+            assert_eq!(read(&mut m, held[0]), Ok(Value::I64(0)));
+            fill(&mut m);
+            assert_eq!(m.unmap(0, reserved), 0);
+            for at in [0, held[1], held[2]] {
+                assert_eq!(read(&mut m, at), Ok(Value::I64(0)));
+            }
+            assert_eq!(m.unmap(0, reserved), 0);
+            assert_eq!(m.map(0, mapped, PROT_READ | PROT_WRITE), 0);
+        }
+        let spent = cpu_ns() - start;
+        assert!(spent < 500_000_000, "16 ops took {spent} ns of CPU");
+    }
+
     /// §12 shared synchronized address space: a forked vCPU view (`thread.spawn`) sees `map`/`unmap`
     /// made by another vCPU *after* the fork — the address space is shared, not snapshotted.
     #[test]
@@ -38822,59 +38998,10 @@ mod prot_tests {
         assert_eq!(child.load(tail, 0, LoadOp::I64), Err(Trap::MemoryFault));
     }
 
-    /// §14 nesting (interp `Mem` plumbing) under **trap-confinement**: a sub-window child admits an
-    /// access iff it lies within its own slice `[base, base + size)` of the parent backing and **faults**
-    /// on any out-of-child address (no aliasing back into the slice); every parent byte outside the slice
-    /// is therefore unreachable (stays zero). This is the interpreter half of running a guest in a nested
-    /// child window.
-    #[test]
-    fn sub_window_child_confined_to_its_slice() {
-        let base = 1u64 << 16; // child at 64 KiB
-        let size_log2 = 12u8; // 4 KiB child
-        let size = 1u64 << size_log2;
-        let parent = 1u64 << 17; // 128 KiB parent backing
-        let mut mem = Mem::sub_window(base, size_log2, parent, None);
-
-        // A store at child offset 8 lands at absolute base+8; a far offset (size+8) now **faults**
-        // (trap-confinement: no wrap), leaving the earlier write intact.
-        assert!(mem.store(8, 0, StoreOp::I64, Value::I64(0x1111)).is_ok());
-        assert_eq!(
-            mem.store(size + 8, 0, StoreOp::I64, Value::I64(0x2222)),
-            Err(Trap::MemoryFault),
-            "an out-of-child store faults, it does not wrap"
-        );
-        assert_eq!(mem.load(8, 0, LoadOp::I64), Ok(Value::I64(0x1111))); // untouched by the faulted store
-        assert_eq!(mem.confine_checked(8, 0, 8), Ok(base + 8)); // confined to the child's slice
-
-        // In-child offsets confine to `[base, base+size)`; every out-of-child address **faults**
-        // (never aliased back in).
-        assert_eq!(mem.confine_checked(0, 0, 1), Ok(base));
-        assert_eq!(mem.confine_checked(size - 1, 0, 1), Ok(base + size - 1));
-        for &a in &[size, size * 1000, u64::MAX, base, parent] {
-            assert_eq!(
-                mem.confine_checked(a, 0, 1),
-                Err(Trap::MemoryFault),
-                "out-of-child address {a:#x} must fault, not alias into the slice"
-            );
-        }
-
-        // Decisive: every parent byte *outside* the child's slice is untouched (unreachable).
-        for i in 0..parent {
-            if i < base || i >= base + size {
-                assert_eq!(
-                    mem.back.byte(i),
-                    0,
-                    "child wrote outside its slice at {i:#x}"
-                );
-            }
-        }
-    }
-
     /// #1283 (PROCESS.md S1c): the anonymous futex key is **per backing**, not per address. Two
-    /// independently-minted windows — the root and a detached child, or two detached siblings — all have
-    /// `window.base() == 0`, so the same guest offset is the same confined absolute address; keying on
-    /// the address alone made them share a wait queue. A §14 nested child shares its parent's backing
-    /// and must keep rendezvousing with it at the same backing-absolute byte.
+    /// independently-minted windows — the root and a detached child, or two detached siblings — name
+    /// the same guest offset by the same address; keying on the address alone made them share a wait
+    /// queue.
     #[test]
     fn anon_futex_key_is_per_backing() {
         let off = 2048u64;
@@ -38885,58 +39012,6 @@ mod prot_tests {
             a.futex_key(off),
             b.futex_key(off),
             "two independent windows at the same offset must not share a futex queue"
-        );
-        let parent = Mem::with_reservation(20, 17, None);
-        let child = parent.nested_view(1 << 16, 12, ShadowArena::EMPTY);
-        let abs = (1u64 << 16) + 8;
-        assert_eq!(
-            parent.futex_key(abs),
-            child.futex_key(abs),
-            "a nested child shares its parent's backing: same byte, same key"
-        );
-    }
-
-    /// §14 nesting: a child's `AddressSpace`-style `map`/`unmap` (page protection) now works on a
-    /// sub-window `Mem`. The prot map is keyed window-relative, so the base folds out consistently —
-    /// before the fix, `unmap` on a sub-window `-EINVAL`'d (its absolute address was bounded against
-    /// the child's window-relative `reserved`). A page unmapped via its **absolute** (§14-shifted)
-    /// address faults a later plain access; re-`map` recommits it zeroed; and an address below the
-    /// child's base or past its top is out of range.
-    #[test]
-    fn sub_window_page_protection_is_window_relative() {
-        let base = 1u64 << 16; // child at 64 KiB
-        let size_log2 = 16u8; // 64 KiB child (≥ one host page, so a whole page fits)
-        let parent = 1u64 << 18; // 256 KiB parent backing
-        let p = page();
-        let mut mem = Mem::sub_window(base, size_log2, parent, None);
-
-        // Initially fully mapped: a store/load at child offset 0 works.
-        assert!(mem.store(0, 0, StoreOp::I64, Value::I64(0xABCD)).is_ok());
-        assert_eq!(mem.load(0, 0, LoadOp::I64), Ok(Value::I64(0xABCD)));
-
-        // Unmap the child's first page via its **guest-relative** offset 0 (the whole `GuestMem`
-        // surface speaks the zero-based window the guest sees; the page lands at `base` in the
-        // shared parent backing).
-        assert_eq!(mem.unmap(0, p), 0, "sub-window unmap should succeed");
-        assert_eq!(
-            mem.load(0, 0, LoadOp::I64),
-            Err(Trap::MemoryFault),
-            "an access to the child's unmapped page must fault"
-        );
-        // A different page still within the child is unaffected.
-        assert!(mem.store(p, 0, StoreOp::I64, Value::I64(0x1234)).is_ok());
-
-        // Re-map recommits the page, zeroed — and the backing byte that changed is the *parent's*
-        // byte at `base` (the child's slice), not the parent's page 0.
-        assert_eq!(mem.map(0, p, PROT_WRITE), 0);
-        assert_eq!(mem.load(0, 0, LoadOp::I64), Ok(Value::I64(0)));
-
-        // The child cannot name anything at/past its own window top — its reserved domain is
-        // `[0, size)`, wherever that sits in an ancestor's window.
-        assert_eq!(
-            mem.unmap(1u64 << size_log2, p),
-            EINVAL,
-            "at/after the child's window top is out of range"
         );
     }
 
@@ -39396,7 +39471,7 @@ mod domain_table_tests {
         let worker = Arc::clone(&dt);
 
         let slot = dt
-            .install(unit(2), Arc::from(Vec::new()), (0, 0), None)
+            .install(unit(2), Arc::from(Vec::new()), None)
             .expect("install"); // a (i32,i32)->(i32) unit
         assert_eq!(
             slot, 1,
@@ -39427,7 +39502,7 @@ mod domain_table_tests {
         let parent: Arc<[Func]> = unit(1);
         let dt = Arc::new(DomainTable::new(&parent, 2)); // 4 slots, 1 real func
         let slot = dt
-            .install(unit(1), Arc::from(Vec::new()), (0, 0), None)
+            .install(unit(1), Arc::from(Vec::new()), None)
             .expect("install") as usize;
         assert_eq!(slot, 1);
         assert!(!dt.uninstall(0, 1), "slot 0 is the real function");
@@ -39450,7 +39525,7 @@ mod domain_table_tests {
     fn resolve_module_routes_program_invoke_and_installed() {
         let parent: Arc<[Func]> = unit(1);
         let dt = Arc::new(DomainTable::new(&parent, 2));
-        dt.install(unit(2), Arc::from(Vec::new()), (0, 0), None)
+        dt.install(unit(2), Arc::from(Vec::new()), None)
             .expect("install"); // module 1
         let invoked = Some(unit(3));
         let mut local: Vec<Arc<[Func]>> = Vec::new();
@@ -39742,14 +39817,14 @@ block 0 (vsp: i64, v0: i64) {
     /// dies; the run continues and the owner observes the death as a value: `poll` (iface 6 op 9)
     /// reports status 2 (trapped, non-propagating — the I37 supervision idiom), which the root
     /// returns. The owner's world must NOT be torn down. The root spawns the child (func 1's child
-    /// image, #2219) detached (op 17) through the v1 record the test lays at 17536, paying for it
+    /// image, #2219) detached (op 17) through the spawn record the test lays at 17536, paying for it
     /// from its budget.
     const CHILD_TRAP_POLLED: &str = r#"memory 17
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vbud: i32, vmod: i32) {
-  vm = i64.const 17560
+  vm = i64.const 17544
   i32.store vm vmod
-  vb = i64.const 17564
+  vb = i64.const 17548
   i32.store vb vbud
   vrec = i64.const 17536
   v5 = call.cap 6 17 (i64) -> (i32) v0 (vrec)
@@ -39786,10 +39861,10 @@ block 0 (v0: i64) {
         m.data.push(temen_ir::Data {
             offset: 17536,
             readonly: false,
-            bytes: temen_ir::SpawnRec::v1(0).encode(),
+            bytes: temen_ir::SpawnRec::default().encode(),
         });
         let mut host = Host::new();
-        let inst = host.grant_instantiator(0, 128 << 10);
+        let inst = host.grant_instantiator();
         let budget = host.grant_budget(-1, 1 << 20, -1);
         let child = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
         let mut fuel = 10_000_000u64;
@@ -39812,10 +39887,21 @@ mod channel_budget_tests {
     //! without a double-charge and the refund credits the minter's node exactly once.
     use super::*;
 
+    /// A root whose embedder grants `channel` bytes of channel memory, and the default of the rest.
+    fn root_with_channel(channel: i64) -> Host {
+        let mut h = Host::new();
+        h.set_grant(
+            DEFAULT_MEM as i64,
+            channel,
+            DEFAULT_SPAWN as i64,
+            DEFAULT_MAPS as i64,
+        );
+        h
+    }
+
     #[test]
     fn cap_bounds_guest_pipe_mints_and_refunds_at_last_close() {
-        let mut h = Host::new();
-        h.set_channel_cap(2 * PIPE_CAP as i64); // room for exactly two pipes
+        let mut h = root_with_channel(2 * PIPE_CAP as i64); // room for exactly two pipes
 
         // Two guest mints fit; the third is refused (fail-closed, nothing charged past the cap).
         assert!(h.try_grant_pipe().is_some());
@@ -39858,8 +39944,7 @@ mod channel_budget_tests {
 
     #[test]
     fn fork_shares_a_backing_without_double_charging_and_refunds_the_minter_once() {
-        let mut parent = Host::new();
-        parent.set_channel_cap(4 * PIPE_CAP as i64);
+        let mut parent = root_with_channel(4 * PIPE_CAP as i64);
         assert!(parent.try_grant_pipe().is_some()); // pipe 0, charged to the parent
         assert_eq!(parent.channel_used(), PIPE_CAP as i64);
 
@@ -39937,8 +40022,7 @@ mod channel_budget_tests {
     /// Linux's `pipe` releases what it made when the copy-out faults.
     #[test]
     fn a_mint_whose_fds_fault_leaves_nothing_behind() {
-        let mut h = Host::new();
-        h.set_channel_cap(PIPE_CAP as i64); // room for exactly one pipe
+        let mut h = root_with_channel(PIPE_CAP as i64); // room for exactly one pipe
         let mut window = vec![0u8; 4096];
         let mut mem = WindowMem::new(&mut window, 4096);
         let held = |h: &Host| h.table.iter().filter(|s| s.entry.is_some()).count();
@@ -39972,9 +40056,9 @@ mod channel_budget_tests {
 
     #[test]
     fn embedder_and_terminal_mints_are_uncharged() {
-        let mut h = Host::new();
-        h.set_channel_cap(0); // a guest mint would be refused at this cap
-                              // Embedder-owned inputs are not guest-minted channel memory — uncharged, unaffected by the cap.
+        // A guest mint would be refused at this cap. Embedder-owned inputs are not guest-minted
+        // channel memory — uncharged, unaffected by the cap.
+        let mut h = root_with_channel(0);
         let _ = h.grant_terminal_input();
         let _ = h.grant_input_pipe();
         assert_eq!(
@@ -40074,8 +40158,8 @@ mod signal_door_claim_tests {
         let calls = Arc::clone(calls);
         Arc::new(move |_pid| {
             calls.fetch_add(1, Ordering::SeqCst);
-            ForkedProc {
-                handler: Box::new(|_op, _args, _mem, _reg| Ok(vec![0])),
+            Some(ForkedProc {
+                handler: ProcHandler::Sync(Box::new(|_op, _args, _mem, _reg| Ok(vec![0]))),
                 signal: claims_door.then(|| {
                     let door: Arc<dyn SignalSource + Send + Sync> = Arc::new(NoSignals);
                     (door, Arc::new(AtomicBool::new(false)))
@@ -40084,7 +40168,8 @@ mod signal_door_claim_tests {
                 exit: None,
                 exec_remap: None,
                 state: CapState::Stateless,
-            }
+                abandon: None,
+            })
         })
     }
 
@@ -40157,6 +40242,272 @@ mod signal_door_claim_tests {
             first,
             "and it is latched: no factory runs again, so no further processes are minted"
         );
+    }
+
+    /// #2373 — a provider with no room for its copy refuses the fork whole: the twins the providers
+    /// before it minted are abandoned, the ones after it mint nothing, and the fork's own charge
+    /// goes back. Unlike two claimants, the refusal does not latch: a later fork may find room.
+    #[test]
+    fn a_provider_with_no_room_refuses_the_fork_and_abandons_the_twins_before_it() {
+        let shared = || ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless);
+        let (calls, abandoned) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let room = Arc::new(AtomicBool::new(false));
+        let mut h = Host::new();
+        let gone = Arc::clone(&abandoned);
+        h.grant_host_proc_forkable(
+            Box::new(|_, _, _, _| Ok(vec![0])),
+            Arc::new(move |_pid| {
+                let gone = Arc::clone(&gone);
+                Some(ForkedProc {
+                    abandon: Some(Box::new(move || {
+                        gone.fetch_add(1, Ordering::SeqCst);
+                    })),
+                    ..shared()
+                })
+            }),
+            CapState::Stateless,
+        );
+        let fits = Arc::clone(&room);
+        h.grant_host_proc_forkable(
+            Box::new(|_, _, _, _| Ok(vec![0])),
+            Arc::new(move |_pid| fits.load(Ordering::SeqCst).then(shared)),
+            CapState::Stateless,
+        );
+        h.grant_host_proc_forkable(
+            Box::new(|_, _, _, _| Ok(vec![0])),
+            factory(false, &calls),
+            CapState::Stateless,
+        );
+        let mem = h.budgets.used(h.own_budget, BUDGET_MEM);
+        assert!(h.fork_powerbox(7, 1 << 16).is_none(), "no room refuses it");
+        assert_eq!(
+            abandoned.load(Ordering::SeqCst),
+            1,
+            "the twin before is abandoned"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the provider after mints nothing"
+        );
+        assert_eq!(
+            h.budgets.used(h.own_budget, BUDGET_MEM),
+            mem,
+            "the fork's charge goes back"
+        );
+        room.store(true, Ordering::SeqCst);
+        h.fork_powerbox(8, 1 << 16).expect("room found later forks");
+        assert_eq!(abandoned.load(Ordering::SeqCst), 1, "abandoning nothing");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// #2373 — so does a spawn: a provider with no room for the child's copy refuses its re-grant,
+    /// which refuses the spawn, and what the grants before it registered for the child is undone.
+    #[test]
+    fn a_provider_with_no_room_refuses_a_spawn_and_abandons_the_grants_before_it() {
+        let abandoned = Arc::new(AtomicUsize::new(0));
+        let mut h = Host::new();
+        let gone = Arc::clone(&abandoned);
+        let first = h.grant_host_proc_forkable(
+            Box::new(|_, _, _, _| Ok(vec![0])),
+            Arc::new(move |_pid| {
+                let gone = Arc::clone(&gone);
+                Some(ForkedProc {
+                    abandon: Some(Box::new(move || {
+                        gone.fetch_add(1, Ordering::SeqCst);
+                    })),
+                    ..ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless)
+                })
+            }),
+            CapState::Stateless,
+        );
+        let full = h.grant_host_proc_forkable(
+            Box::new(|_, _, _, _| Ok(vec![0])),
+            Arc::new(|_pid| None),
+            CapState::Stateless,
+        );
+        let lease = Lease {
+            budget: h.grant_budget(-1, 1 << 20, -1),
+            bytes: 1 << 16,
+            runs: WINDOW_RUNS,
+        };
+        let grants = [("first".to_string(), first), ("full".to_string(), full)];
+        assert!(h
+            .spawn_detached_child(&grants, 1 << 16, lease, -1, false)
+            .is_none());
+        assert_eq!(
+            abandoned.load(Ordering::SeqCst),
+            1,
+            "the first grant is undone"
+        );
+    }
+}
+
+#[cfg(test)]
+mod offload_pool_tests {
+    //! #2477, #2493 — a domain's offload pool: a call waits only for a free worker, and nothing
+    //! waits for the workers.
+    use super::*;
+    use std::sync::mpsc;
+
+    /// A job that runs until the test lets it go (or for 10 s), and the sender whose drop does.
+    fn held() -> (OffloadJob, mpsc::Sender<()>) {
+        let (let_go, held) = mpsc::channel::<()>();
+        let job: OffloadJob = Box::new(move || {
+            let _ = held.recv_timeout(Duration::from_secs(10));
+        });
+        (job, let_go)
+    }
+
+    /// A long call, then as many quick ones as the pool has workers: each quick call finishes
+    /// while the long one runs. Rotating the calls over the workers queued the last behind the
+    /// long one.
+    #[test]
+    fn a_call_waits_only_for_a_free_worker() {
+        let pool = OffloadPool::new(OFFLOAD_POOL_THREADS);
+        let (long, let_go) = held();
+        pool.dispatch(long);
+        let (done, finished) = mpsc::channel();
+        for i in 0..OFFLOAD_POOL_THREADS {
+            let done = done.clone();
+            pool.dispatch(Box::new(move || done.send(i).unwrap()));
+        }
+        for _ in 0..OFFLOAD_POOL_THREADS {
+            finished
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a quick call waited behind the long one");
+        }
+        drop(let_go);
+    }
+
+    /// A `Host` dropped while one of its punted calls still runs returns at once: the call finishes
+    /// on its own, its answer posted into a store no one waits on. The pool used to join its
+    /// workers, so the drop waited out the call: a domain's teardown, its parent's `join` and the
+    /// run's end with it.
+    #[test]
+    fn a_hosts_drop_waits_for_no_punted_call() {
+        let (long, let_go) = held();
+        let long = Mutex::new(Some(long));
+        let mut host = Host::new();
+        let h = host.grant_host_proc_offloadable(
+            Box::new(move |_op, _args| {
+                let long = long.lock().unwrap().take().expect("one call");
+                OffloadOutcome::Offload(Box::new(move || {
+                    long();
+                    0
+                }))
+            }),
+            None,
+            CapState::Stateless,
+        );
+        let mut id = None;
+        let r = host.cap_dispatch_slots_pending(cap_id::HOST_PROC, 0, h, &[0], None, &mut id);
+        assert_eq!(r, Ok(vec![]), "the call punts");
+        assert!(id.is_some());
+        let started = std::time::Instant::now();
+        drop(host);
+        let took = started.elapsed();
+        drop(let_go);
+        assert!(
+            took < Duration::from_secs(1),
+            "the drop waited {took:?} for the call"
+        );
+    }
+}
+
+#[cfg(test)]
+mod completer_tests {
+    //! #2495 — a host-answered call's [`Completer`], against its domain's store.
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A store whose wake hook counts its rings.
+    fn store() -> (Arc<Completions>, Arc<AtomicUsize>) {
+        let comps = Arc::new(Completions::new());
+        let rings = Arc::new(AtomicUsize::new(0));
+        let r = Arc::clone(&rings);
+        comps.set_notify(Some(Arc::new(move || {
+            r.fetch_add(1, Ordering::SeqCst);
+        })));
+        (comps, rings)
+    }
+
+    /// The completer of a call minted on `comps`, taken out of its submit hook.
+    fn submit(comps: &Arc<Completions>) -> Completer {
+        let (tx, rx) = std::sync::mpsc::channel();
+        comps.submit_host_owned(None, Box::new(move |c| tx.send(c).unwrap()));
+        rx.recv().unwrap()
+    }
+
+    /// An answer given later posts and rings the wake hook, as a pool answer does.
+    #[test]
+    fn an_answer_posts_and_rings() {
+        let (comps, rings) = store();
+        let c = submit(&comps);
+        let id = c.id();
+        assert!(comps.is_host_owned(id));
+        c.complete(7);
+        assert_eq!(comps.try_take(id), Some(7));
+        assert_eq!(rings.load(Ordering::SeqCst), 1);
+        assert_eq!(comps.outstanding(), 0);
+    }
+
+    /// An answer given inside its submit hook, under its dispatcher's host lock, posts without
+    /// ringing: the hook may take a scheduler lock the dispatcher must not nest under its host
+    /// lock (the tree-walker's pipe park takes them the other way round). Its caller's park finds
+    /// the answer.
+    #[test]
+    fn an_answer_inside_its_submit_hook_does_not_ring() {
+        let (comps, rings) = store();
+        let id = comps.submit_host_owned(None, Box::new(|c| c.complete(7)));
+        assert_eq!(comps.try_take(id), Some(7));
+        assert_eq!(rings.load(Ordering::SeqCst), 0);
+        // The next call's answer rings again.
+        submit(&comps).complete(8);
+        assert_eq!(rings.load(Ordering::SeqCst), 1);
+    }
+
+    /// A completer dropped unanswered answers `CAP_REVOKED`, so its caller never hangs.
+    #[test]
+    fn a_dropped_completer_answers_cap_revoked() {
+        let (comps, _) = store();
+        let id = submit(&comps).id();
+        assert_eq!(comps.try_take(id), Some(CAP_REVOKED));
+        assert_eq!(comps.outstanding(), 0);
+    }
+
+    /// A withdrawn call takes no answer and no longer counts in flight.
+    #[test]
+    fn a_withdrawn_call_takes_no_answer() {
+        let (comps, rings) = store();
+        let c = submit(&comps);
+        let id = c.id();
+        assert!(comps.withdraw(id));
+        assert_eq!(comps.outstanding(), 0);
+        c.complete(7);
+        assert_eq!(comps.try_take(id), None);
+        assert_eq!(rings.load(Ordering::SeqCst), 0);
+        assert!(!comps.withdraw(id), "withdrawn once");
+    }
+
+    /// A completer whose domain's store is gone answers nothing, and does not fail.
+    #[test]
+    fn a_completer_outliving_its_store_answers_nothing() {
+        let (comps, _) = store();
+        let c = submit(&comps);
+        drop(comps);
+        c.complete(7);
+    }
+
+    /// Ids are unique across stores, so one embedder serving several domains keys its calls by
+    /// id.
+    #[test]
+    fn ids_are_unique_across_stores() {
+        let (a, _) = store();
+        let (b, _) = store();
+        let (ca, cb) = (submit(&a), submit(&b));
+        assert_ne!(ca.id(), cb.id());
+        assert_eq!((a.minted(), b.minted()), (1, 1));
     }
 }
 

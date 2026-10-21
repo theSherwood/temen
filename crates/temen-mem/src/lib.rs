@@ -129,7 +129,10 @@ pub enum Region {
 
 /// The accessor table behind [`Region::Foreign`]: how to reach the bytes of foreign backing `id`.
 /// Offsets are region-relative and already bounded to `[0, len)` by `Region` before the call, so an
-/// implementation may trust them. `atomic` is the one seq-cst primitive: `kind` 0 = load, 1 = store
+/// implementation may trust them. `read`/`write` copy a span; `load`/`store` move one little-endian
+/// word of `width` 1, 2, 4 or 8 bytes, zero-extended on load and truncated on store, and serve every
+/// byte and word access, so an embedder can answer them without a buffer (#2416). `atomic` is the
+/// one seq-cst primitive: `kind` 0 = load, 1 = store
 /// (`a` = value), 2..=7 = read-modify-write ([`RmwOp::code`], `a` = operand), 8 = compare-exchange
 /// (`a` = expected, `b` = replacement); it returns the **old** value (`width` 4 or 8, `off` aligned).
 /// `grow` asks the embedder to make at least `len` bytes addressable (a `memory.grow` of the foreign
@@ -137,6 +140,8 @@ pub enum Region {
 pub struct ForeignOps {
     pub read: fn(id: u32, off: u64, out: &mut [u8]),
     pub write: fn(id: u32, off: u64, data: &[u8]),
+    pub load: fn(id: u32, off: u64, width: u32) -> u64,
+    pub store: fn(id: u32, off: u64, width: u32, val: u64),
     pub fill: fn(id: u32, off: u64, len: u64, b: u8),
     pub copy_within: fn(id: u32, dst: u64, src: u64, len: u64),
     pub atomic: fn(id: u32, kind: u32, off: u64, width: u32, a: u64, b: u64) -> u64,
@@ -159,13 +164,10 @@ pub struct Foreign {
 
 impl Foreign {
     fn word(&self, off: u64, width: u32) -> u64 {
-        let mut b = [0u8; 8];
-        (self.ops.read)(self.id, off, &mut b[..width as usize]);
-        u64::from_le_bytes(b)
+        (self.ops.load)(self.id, off, width)
     }
     fn set_word(&self, off: u64, width: u32, val: u64) {
-        let b = val.to_le_bytes();
-        (self.ops.write)(self.id, off, &b[..width as usize]);
+        (self.ops.store)(self.id, off, width, val)
     }
 }
 
@@ -241,8 +243,8 @@ impl Region {
     /// #1312: an owned flat buffer of `size` zero bytes that [`grow_to`](Region::grow_to) can
     /// **enlarge** — the backing a cooperative run's window uses so a guest allocator's `vm_map` can
     /// commit past the declared window (the interpreter oracle reserves 2^37 and grows on demand; a
-    /// fixed backing made the same `map` `-EINVAL`). Rounded up to `page`; the whole allocation is
-    /// addressable and zeroed, so a grow inside it costs nothing.
+    /// fixed backing made the same `map` `-EINVAL`). Rounded up to `page`. #2407 — its length is what
+    /// was asked for, page-rounded, and no more, so a window's budget can pay for exactly its length.
     ///
     /// `None` when `size` is 0 or the allocation fails, so callers refuse rather than abort. See
     /// [`Region::Growable`] for the single-owner contract the caller must meet — the base moves.
@@ -271,6 +273,15 @@ impl Region {
     /// Whether this is a proxied [`Region::Foreign`].
     pub fn is_foreign(&self) -> bool {
         matches!(self, Region::Foreign(_))
+    }
+
+    /// The embedder's id of a [`Region::Foreign`] backing, the memory its accesses reach: `None` for
+    /// every other variant.
+    pub fn foreign_id(&self) -> Option<u32> {
+        match self {
+            Region::Foreign(f) => Some(f.id),
+            _ => None,
+        }
     }
 
     /// Whether [`grow_to`](Region::grow_to) can actually **extend** this backing past its current
@@ -993,6 +1004,23 @@ mod shared {
     }
 }
 
+/// #2517 — how many bits of address space the OS gives this process: 47 on most x86-64 and arm64
+/// hosts, 39 on many Android phones. Linux and Android put a process's initial stack, and the
+/// `AT_RANDOM` bytes on it, just under the top of the space an `mmap` without a hint draws from, so
+/// their address rounds up to its size. qemu-user puts the stack lower, a third of the way into the
+/// space it gives, so there the size reads smaller, never larger. `None` where it cannot be read:
+/// other hosts, and Miri.
+pub fn user_address_bits() -> Option<u32> {
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
+    {
+        // SAFETY: `getauxval` only reads the auxiliary vector the kernel gave the process.
+        let at_random = unsafe { libc::getauxval(libc::AT_RANDOM) } as u64;
+        (at_random != 0).then(|| u64::BITS - at_random.leading_zeros())
+    }
+    #[cfg(not(all(any(target_os = "linux", target_os = "android"), not(miri))))]
+    None
+}
+
 #[cfg(unix)]
 pub use mapped::Mapped;
 
@@ -1011,8 +1039,8 @@ mod mapped {
         pub(super) raw: Shared,
         map_len: usize,
         /// The page the mapping was rounded to — the alignment [`zero`](Mapped::zero) drops at. Only
-        /// Linux drops pages, so only Linux keeps it.
-        #[cfg(all(target_os = "linux", not(miri)))]
+        /// Linux (Android's kernel too) drops pages, so only there is it kept.
+        #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
         page: usize,
     }
 
@@ -1062,20 +1090,21 @@ mod mapped {
             Some(Mapped {
                 raw: Shared::new(base, size),
                 map_len,
-                #[cfg(all(target_os = "linux", not(miri)))]
+                #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
                 page,
             })
         }
 
         /// Zero `[off, off+len)` (already clamped to `[0, size)`) — the same contract as `Paged`'s
         /// and `Sparse`'s `zero`: a **whole page is dropped**, a partial one is cleared in place. On
-        /// Linux the whole pages go back to the kernel with `MADV_DONTNEED`, which on this private
-        /// anonymous mapping guarantees they read zero (zero-fill on demand). So a `map`/`unmap` of a
-        /// large range costs no residency: a page is only backed once the guest touches it (#2267).
+        /// Linux, Android's kernel included, the whole pages go back to the kernel with
+        /// `MADV_DONTNEED`, which on this private anonymous mapping guarantees they read zero
+        /// (zero-fill on demand). So a `map`/`unmap` of a large range costs no residency: a page is
+        /// only backed once the guest touches it (#2267).
         /// Elsewhere — Darwin treats `MADV_DONTNEED` as advisory, and miri has a heap backing — or if
         /// the call fails, zeros are written.
         pub(super) fn zero(&self, off: u64, len: u64) {
-            #[cfg(all(target_os = "linux", not(miri)))]
+            #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
             {
                 let page = self.page as u64;
                 let (lo, hi) = (off.next_multiple_of(page), (off + len) / page * page);
@@ -1196,9 +1225,12 @@ mod growable {
         Ordering::{Acquire, Release},
     };
 
-    /// A growable, **relocating** flat buffer. `size` is the addressable length (always the whole
-    /// allocation — every byte is zeroed, so a grow within it is free); `alloc_len` is the layout
-    /// size `Drop`/`realloc` must pass back to the allocator.
+    /// A growable, **relocating** flat buffer. `size` is the addressable length: what was asked for,
+    /// page-rounded, every byte of it zeroed or written since. `alloc_len` is the allocation, the
+    /// layout size `Drop`/`realloc` must pass back to the allocator. It grows by at least doubling,
+    /// so repeated growth copies little, but its bytes past `size` are neither addressable nor
+    /// touched: they are zeroed only as a grow reaches them (#2407), so a window's budget pays for
+    /// `size`, which is all the host commits, and never for the allocator's slack.
     ///
     /// `Send`/`Sync` come from the atomics, but soundness under *concurrent* use does not: the
     /// single-owner contract on [`Region::Growable`](super::Region::Growable) is what makes a
@@ -1240,12 +1272,14 @@ mod growable {
             Shared::new(self.base.load(Acquire), size)
         }
 
-        /// Make at least `len` bytes addressable, reallocating (and possibly **moving**) the buffer.
-        /// The new tail is zeroed, so grown pages read as fresh zeroes exactly like a `map`-committed
-        /// page elsewhere. `false` = the allocator refused and **nothing changed**, so the caller
-        /// answers `-ENOMEM` (probeable) before any protection state moves.
+        /// Make `len` bytes addressable, page-rounded, reallocating (and possibly **moving**) the
+        /// buffer when the allocation is too short. The new tail is zeroed, so grown pages read as
+        /// fresh zeroes exactly like a `map`-committed page elsewhere. `false` = the allocator refused
+        /// and **nothing changed**, so the caller answers `-ENOMEM` (probeable) before any protection
+        /// state moves.
         pub(super) fn grow(&self, len: u64) -> bool {
-            if len <= self.size.load(Acquire) {
+            let size = self.size.load(Acquire);
+            if len <= size {
                 return true;
             }
             let old_alloc = self.alloc_len.load(Acquire);
@@ -1255,6 +1289,23 @@ mod growable {
             let Some(need) = need.checked_next_multiple_of(self.page) else {
                 return false;
             };
+            if need > old_alloc && !self.reallocate(old_alloc, need) {
+                return false;
+            }
+            // Bytes past the old length were never handed out: `realloc` leaves them uninitialized,
+            // and an earlier grow's slack was left untouched. Zero what becomes addressable.
+            // SAFETY: the allocation covers `need` bytes and `size < need`.
+            unsafe {
+                let base = self.base.load(Acquire);
+                core::ptr::write_bytes(base.add(size as usize), 0, need - size as usize);
+            }
+            self.size.store(need as u64, Release);
+            true
+        }
+
+        /// Reallocate to at least `need > old_alloc` bytes, doubling where the allocator allows.
+        /// `false`, the buffer unchanged, when it serves neither.
+        fn reallocate(&self, old_alloc: usize, need: usize) -> bool {
             // Amortize repeated allocator growth (a bump allocator commits page by page) by at least
             // doubling — but fall back to the exact requirement if the doubled ask is refused, so a
             // legitimate grow near the address-space limit is not lost to the overshoot.
@@ -1282,14 +1333,10 @@ mod growable {
             if p.is_null() {
                 return false;
             }
-            // `realloc` leaves the grown tail uninitialized; commit it as zeroes.
-            // SAFETY: `p` addresses `new_alloc` bytes and `new_alloc > old_alloc`.
-            unsafe { core::ptr::write_bytes(p.add(old_alloc), 0, new_alloc - old_alloc) };
-            // Publish the buffer before the length: a reader that races (contract violation) then
-            // sees at worst the old, smaller length over the new, larger buffer.
+            // Publish the buffer before the length (`grow` stores it): a reader that races (contract
+            // violation) then sees at worst the old, smaller length over the new, larger buffer.
             self.base.store(p, Release);
             self.alloc_len.store(new_alloc, Release);
-            self.size.store(new_alloc as u64, Release);
             true
         }
     }
@@ -2121,7 +2168,7 @@ mod tests {
     /// dirty one, while partial edge pages are cleared in place. Checked per page with `mincore`,
     /// which reads only this mapping, so parallel tests cannot perturb it (unlike process RSS).
     /// Residency is read before any byte is: a read of a dropped page maps the zero page back in.
-    #[cfg(all(target_os = "linux", not(miri)))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
     #[test]
     fn mapped_zero_drops_whole_pages() {
         // SAFETY: `sysconf` has no preconditions.
@@ -2166,6 +2213,28 @@ mod tests {
         r.set_byte(3 * page + 7, 0x5A);
         assert_eq!(r.byte(3 * page + 7), 0x5A);
     }
+
+    /// #2517 — the address space read from the initial stack holds what the process maps: this
+    /// thread's stack and a fresh mapping both lie below its top.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
+    #[test]
+    fn the_address_space_holds_the_process_mappings() {
+        let bits = user_address_bits().expect("Linux and Android give every process AT_RANDOM");
+        assert!(bits >= 32, "{bits} bits");
+        let on_stack = &bits as *const u32 as u64;
+        // SAFETY: `sysconf` has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let r = Region::new(16 * page, page);
+        let Region::Mapped(m) = &r else {
+            panic!("unix Region::new is the mmap backing")
+        };
+        for at in [on_stack, m.raw.base_ptr() as u64] {
+            assert!(
+                at < 1 << bits,
+                "{at:#x} lies past a {bits}-bit address space"
+            );
+        }
+    }
 }
 
 /// A native stand-in for the browser's JS-backed [`ForeignOps`]: each foreign id is a zeroed `Vec<u8>`
@@ -2194,6 +2263,14 @@ mod mock_foreign {
         let mut g = MEMS.lock().unwrap();
         let o = off as usize;
         g[id as usize][o..o + data.len()].copy_from_slice(data);
+    }
+    fn load(id: u32, off: u64, width: u32) -> u64 {
+        let mut b = [0u8; 8];
+        read(id, off, &mut b[..width as usize]);
+        u64::from_le_bytes(b)
+    }
+    fn store(id: u32, off: u64, width: u32, val: u64) {
+        write(id, off, &val.to_le_bytes()[..width as usize]);
     }
     fn fill(id: u32, off: u64, len: u64, b: u8) {
         let mut g = MEMS.lock().unwrap();
@@ -2251,6 +2328,8 @@ mod mock_foreign {
     pub static OPS: ForeignOps = ForeignOps {
         read,
         write,
+        load,
+        store,
         fill,
         copy_within,
         atomic,
@@ -2328,7 +2407,7 @@ mod growable_tests {
         r.write_word(64, 8, 0x0123_4567_89ab_cdef);
 
         assert!(r.grow_to(5 * page), "the allocator serves a modest grow");
-        assert!(r.len() >= 5 * page, "the request is now addressable");
+        assert_eq!(r.len(), 5 * page, "the request is now addressable");
 
         let mut got = [0u8; 15];
         r.read_into(0, &mut got);
@@ -2340,6 +2419,27 @@ mod growable_tests {
         // Reachable only because the region grew: write high, read it back.
         r.set_byte(4 * page + 3, 0xab);
         assert_eq!(r.byte(4 * page + 3), 0xab);
+    }
+
+    /// #2407 — a grow makes addressable what was asked for, page-rounded, and no more: the allocation
+    /// may double, but its slack is out of reach, so a write there is dropped, until a later grow
+    /// reaches it and zeroes it.
+    #[test]
+    fn its_length_is_what_was_asked_for() {
+        let page = 4096;
+        let r = Region::growable(4 * page, page).expect("growable region");
+        assert!(r.grow_to(4 * page + 1));
+        assert_eq!(r.len(), 5 * page, "page-rounded, and no more");
+        r.set_byte(6 * page, 0xab);
+        assert_eq!(r.byte(6 * page), 0, "past its length, a write is dropped");
+        assert!(r.grow_to(7 * page), "inside the allocation");
+        assert_eq!(r.len(), 7 * page);
+        let mut grown = vec![0xffu8; 2 * page as usize];
+        r.read_into(5 * page, &mut grown);
+        assert!(
+            grown.iter().all(|&b| b == 0),
+            "the bytes it reaches read zero"
+        );
     }
 
     /// A grow the allocator cannot serve leaves the region **exactly** as it was and reports

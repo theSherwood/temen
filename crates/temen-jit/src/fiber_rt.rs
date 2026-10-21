@@ -361,18 +361,31 @@ pub(crate) enum ParkOn {
     Futex(Arc<crate::os_thread_rt::WaitCell>),
     /// #2010 — a `thread.join`: it also ends on the joiner's own freeze word, as a futex wait does.
     Thread,
-    /// #2010 — an `Instantiator.join` (or `wait`): the joined child's end re-offers it.
+    /// #2010 — an `Instantiator.join`: the joined child's end re-offers it.
     Child,
+    /// #2164 — a demand-paged child's page fault: its own event, as [`ParkOn::Event`], but its
+    /// vCPU's park ([`crate::Parks::Vcpu`]).
+    Page,
+    /// #2424 — a host call's answer from outside the run (a job on the embedder's offload pool,
+    /// which may wait on the world): never counted blocked, as an OS vCPU waiting outside is not
+    /// ([`crate::wait_outside`]), since it may yet end a peer's wait. The answer re-offers it
+    /// ([`crate::outside_waker`]).
+    Outside,
 }
 
 impl ParkOn {
     /// #1820 — a join counts itself in `Domain::parked` through the joined vCPU's completion cell
     /// (`Domain::join_park`), which the publisher settles before the joinee leaves `live`; the
-    /// executor must not count the task's park a second time. Counted as its vCPU's block, a join
-    /// must be one: a guest fiber's join parks every context up to its task (#2322,
-    /// [`fiber_resume`]), never the fiber alone.
+    /// executor must not count the task's park a second time.
     pub(crate) fn counts_itself(&self) -> bool {
         matches!(self, ParkOn::Thread | ParkOn::Child)
+    }
+
+    /// Whether the park blocks its whole vCPU, as on every engine: a join (counted as its vCPU's
+    /// block, it must be one) and a page fault. A guest fiber's such park parks every context up to
+    /// its task (#2322, [`fiber_resume`]), never the fiber alone.
+    pub(crate) fn blocks_vcpu(&self) -> bool {
+        matches!(self, ParkOn::Thread | ParkOn::Child | ParkOn::Page)
     }
 }
 
@@ -1332,18 +1345,17 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             *((mem_base + resumer_region + STATE_IN_REGION_OFF) as *mut i32) = phase;
             rtm.cur_shadow = resumer;
         }
-        // #2322 — the fiber parked on a join (`ParkOn::counts_itself`). A join blocks its whole
-        // vCPU — the oracle parks the vCPU, the bytecode drivers the task, an OS vCPU its thread —
-        // and has counted it blocked (`Domain::join_park`), so the resumer must not run on, nor see
-        // `FIBER_PARKED`. Only a task's join event-parks (an OS vCPU blocks in place), so this
-        // resumer runs inside the task too: park its own context in turn with the same park, which
-        // hands it on to the next resumer up, until the task's platform slot parks the task and
-        // gives its lanes back. Each pass back down re-enters here and switches into the fiber,
-        // whose join re-checks.
+        // #2322 — the fiber parked on a join, or #2164 a page fault (`ParkOn::blocks_vcpu`). Either
+        // blocks its whole vCPU — the oracle parks the vCPU, the bytecode drivers the task, an OS
+        // vCPU its thread — so the resumer must not run on, nor see `FIBER_PARKED`. Only a task's
+        // such park event-parks (an OS vCPU blocks in place), so this resumer runs inside the task
+        // too: park its own context in turn with the same park, which hands it on to the next
+        // resumer up, until the task's platform slot parks the task and gives its lanes back. Each
+        // pass back down re-enters here and switches into the fiber, whose park re-checks.
         if let State::Yielded(_) = st {
             if slot.event_park.load(Ordering::Relaxed) {
                 let on = slot.parked_on();
-                if on.counts_itself() {
+                if on.blocks_vcpu() {
                     if let Some(own) = current_fiber_slot() {
                         fiber_event_park(&own, slot.took_park_deadline(), on);
                         arg = 0; // a park's poll delivers nothing (`fiber_event_park`)
@@ -1517,6 +1529,18 @@ pub(crate) unsafe fn park_cell(handle: i64) -> Option<Arc<crate::os_thread_rt::W
             ParkOn::Futex(cell) => Some(cell),
             _ => None,
         })
+}
+
+/// #2424 — whether `handle`'s fiber is event-parked on an answer from outside the run
+/// ([`ParkOn::Outside`]): what it waits for may come although no vCPU of the run is live.
+///
+/// # Safety
+/// As [`park_deadline`].
+pub(crate) unsafe fn parked_outside(handle: i64) -> bool {
+    let rt = &*current();
+    rt.table
+        .resolve(handle)
+        .is_some_and(|(_, slot)| matches!(slot.parked_on(), ParkOn::Outside))
 }
 
 /// #1469 — is this thread running a child-domain task (its root or a guest fiber inside it)?
@@ -1755,12 +1779,12 @@ unsafe fn scan_words(
 /// fibers are scanned normally.
 ///
 /// # Safety
-/// `mem_base`/`mask`/`mapped`/`sub_base`/`trap_out` are the threaded guest-window context (as for
+/// `mem_base`/`mask`/`mapped`/`trap_out` are the threaded guest-window context (as for
 /// `call.cap`). `payload_mask` is the §GC tagged-pointer mask (distinct from the window-confinement
 /// `mask`). The running vCPU's fiber runtime is read from [`CURRENT_RT`]; a null runtime, an
 /// out-of-window `buf`, a non-STW call (a fiber running on another vCPU), or a `payload_mask` that
 /// clears more than the top byte faults (`FiberFault`).
-/// The ten `gc.roots` arguments, marshalled by the JIT into one stack slot so the flush trampoline
+/// The nine `gc.roots` arguments, marshalled by the JIT into one stack slot so the flush trampoline
 /// ([`temen_gc_roots_flush`]) can hand them to [`gc_roots`] as a single pointer with no per-argument
 /// register/stack reshuffle. Field order is the historical argument order. `#[repr(C)]` so the JIT's
 /// 8-byte-slot stores line up with these reads.
@@ -1774,8 +1798,10 @@ pub(crate) struct GcRootsArgs {
     mem_base: u64,
     mask: u64,
     mapped: u64,
-    sub_base: u64,
     trap_out: u64,
+    /// #2164 — a demand-paged instance's declared page count, which bounds its access table
+    /// ([`crate::VmCtx::pages`]); `0` for any other.
+    pages: u64,
 }
 
 /// The scan itself. Reached **only** via [`temen_gc_roots_flush`], which has already spilled the
@@ -1786,9 +1812,10 @@ pub(crate) struct GcRootsArgs {
 /// # Safety
 /// `args` points at a live [`GcRootsArgs`] (the JIT's stack slot, valid for the call).
 pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
-    // SAFETY: the JIT hands the address of a live 10-field slot; the flush trampoline is the only caller.
+    // SAFETY: the JIT hands the address of a live 10-field slot; the flush trampoline is the only
+    // caller.
     let a = unsafe { &*args };
-    let (heap_lo, heap_hi, payload_mask, buf, cap, mem_base, mask, mapped, sub_base, trap_out) = (
+    let (heap_lo, heap_hi, payload_mask, buf, cap, mem_base, mask, mapped, trap_out) = (
         a.heap_lo,
         a.heap_hi,
         a.payload_mask,
@@ -1797,7 +1824,6 @@ pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
         a.mem_base,
         a.mask,
         a.mapped,
-        a.sub_base,
         a.trap_out,
     );
     let rt = current();
@@ -1910,18 +1936,31 @@ pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
     let total = roots.len();
     let nwrite = total.min(cap.max(0) as usize);
     if nwrite > 0 {
-        // Confine the buffer offset exactly like the JIT's `mask_addr`: the window `[0, bound)`
-        // (child-relative), physically at `mem_base + sub_base + off`. #826: `bound` (the `mapped`
+        // Confine the buffer offset exactly like the JIT's `mask_addr`: the window `[0, bound)`,
+        // physically at `mem_base + off`. #826: `bound` (the `mapped`
         // slot) carries the **reserved** span, so a roots buffer in a `map`-grown tail page is
         // admitted where the interpreter's live page map admits it; a write into an uncommitted or
         // `Ro` page faults through the SIGSEGV guard (`MemoryFault`), exactly like a guest store.
         let masked = buf & mask;
         let nbytes = (nwrite as u64) * 8;
-        if masked.checked_add(nbytes).is_none_or(|end| end > mapped) {
-            fault(trap_out); // a forged / out-of-window buffer — like the interp's `MemoryFault`
+        // #2164 — a demand-paged child's unsupplied pages are committed, and its access table gates
+        // them: a page the table does not let it write faults, as the interpreters' checked buffer
+        // write does (never paged in: they write the buffer from the host, as this does).
+        let refused = masked.checked_add(nbytes).is_none_or(|end| end > mapped)
+            || (a.pages != 0
+                && !crate::table_admits(
+                    crate::VmCtx::of_trap_out(trap_out as *mut i64).pages,
+                    a.pages,
+                    masked,
+                    nbytes,
+                    temen_ir::PAGE_WRITE,
+                ));
+        if refused {
+            // A forged, out-of-window or unwritable buffer: the interpreters' `MemoryFault`.
+            *(trap_out as *mut i64) = TrapKind::MemoryFault as i64;
             return 0;
         }
-        let dst = (mem_base + sub_base + masked) as *mut u8;
+        let dst = (mem_base + masked) as *mut u8;
         let mut off = 0usize;
         for w in roots.iter().take(nwrite) {
             std::ptr::copy_nonoverlapping(w.to_le_bytes().as_ptr(), dst.add(off), 8);

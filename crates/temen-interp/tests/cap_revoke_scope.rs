@@ -34,9 +34,9 @@ block 0 (v0: i32, vin: i32, vout: i32, vbud: i32, vmod: i32) {
   i32.store va1 vnl
   va2 = i64.const 16648
   i32.store va2 vout
-  vrm = i64.const 17880
+  vrm = i64.const 17864
   i32.store vrm vmod
-  vrb = i64.const 17884
+  vrb = i64.const 17868
   i32.store vrb vbud
   vrp = i64.const 17856
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -46,7 +46,7 @@ block 0 (v0: i32, vin: i32, vout: i32, vbud: i32, vmod: i32) {
   vma = i64.const 16400
   vm = i64.load vma
   vtj = thread.join vt
-  vk = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vk_st, vk = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vmil = i64.const 1000000000
   vmm = i64.mul vm vmil
   vthou = i64.const 1000
@@ -91,7 +91,7 @@ fn src() -> String {
     let child = SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::default()
     };
     format!("{SRC}{}", rec::segment(17856, &child))
 }
@@ -101,7 +101,7 @@ fn a_close_in_one_domain_does_not_revoke_another_domains_parked_read() {
     let m = temen_text::parse_module(&src()).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let hout = host.grant_stream(StreamRole::Out);
     // Granted before stdin: the child's table holds its `"budget"` there too, so `"o"` lands on
     // stdin's number.

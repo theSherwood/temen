@@ -157,7 +157,10 @@ pub extern "C" fn temen_jspb_run(mod_ptr: *const u8, mod_len: usize) -> i64 {
             };
             // The JS function's state lives on the page, which nothing here serializes (#1699).
             let fork: temen_interp::HostProcFork = std::sync::Arc::new(move |_pid| {
-                temen_interp::ForkedProc::shared(mint(), temen_interp::CapState::Uncaptured)
+                Some(temen_interp::ForkedProc::shared(
+                    mint(),
+                    temen_interp::CapState::Uncaptured,
+                ))
             });
             let handle =
                 host.grant_host_proc_forkable(mint(), fork, temen_interp::CapState::Uncaptured);

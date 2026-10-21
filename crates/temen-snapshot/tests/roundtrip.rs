@@ -6,9 +6,7 @@ use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, transform_module,
     transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
-use temen_interp::{
-    run_capture_reserved_with_host, Attestation, FreezeScope, FrozenDetached, Host, Value,
-};
+use temen_interp::{run_capture_reserved_with_host, Attestation, FrozenDetached, Host, Value};
 use temen_ir::{Memory, Module};
 use temen_snapshot::{freeze, restore, FreezeError, RestoreError};
 
@@ -1394,17 +1392,15 @@ type 1 interface { echo: 0 }
 export 0 interface "svc" 1 { echo: 1 }
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  ; a v1 record at 17536 (op 17): entry 0 of the durable image `v1`, its declared window, no
-  ; pager or pre-mapped region, paid from the budget `v2`
+  ; a spawn record at 17536 (op 17): the durable image `v1`, its declared window, no pager or
+  ; pre-mapped region, paid from the budget `v2`
   q0a0 = i64.const 17536
-  q0v0 = i64.const 1
+  q0v0 = i64.const -4294967296
   i64.store q0a0 q0v0
-  q0v2 = i64.const -4294967296
-  i64.store q0a0 q0v2 offset=16
-  i32.store q0a0 v1 offset=24
-  i32.store q0a0 v2 offset=28
-  q0v9 = i64.const 4294967295
-  i64.store q0a0 q0v9 offset=72
+  i32.store q0a0 v1 offset=8
+  i32.store q0a0 v2 offset=12
+  q0v6 = i64.const 4294967295
+  i64.store q0a0 q0v6 offset=48
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   v6 = i64.const 0
   v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
@@ -1453,12 +1449,12 @@ fn a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked() {
     h.set_durable(true);
     h.set_self_module(&inst);
     let args = [
-        h.grant_instantiator(0, WINDOW as u64),
+        h.grant_instantiator(),
         h.grant_durable_module(&server),
         h.grant_budget(-1, 1 << 20, -1),
     ]
     .map(Value::I32);
-    h.grant_freeze_authority(FreezeScope::DetachedProgeny);
+    h.grant_freeze_authority();
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_on_quiesce(&mut win);
     let mut fuel = 5_000_000u64;
@@ -1719,7 +1715,10 @@ fn a_budget_survives_freeze_and_thaw_with_its_remaining_intact() {
     let win = init_durable_window(WINDOW, TEST_ARENA);
     let artifact = freeze(&inst, &win, &host).expect("a Budget no longer refuses the freeze");
 
-    let mut thost = Host::new(); // no hook: the carried state verbatim
+    // No hook: the carried state verbatim. An unbounded run, so a read reports the carried node
+    // alone: a guest sees the run's own node's `channel` too (#2337).
+    let mut thost = Host::new();
+    thost.set_grant(-1, -1, -1, -1);
     restore(&artifact, &inst, &mut thost).expect("restore");
     assert_eq!(
         read_mem(&mut thost, h),
@@ -1902,13 +1901,13 @@ fn a_completed_detached_child_rides_the_control_section() {
 // ---------------------------------------------------------------------------------------------
 // #1361 — a **freezable** module handle rides the artifact. Before this, a durable domain holding
 // any `Module` grant could not be frozen at all: `capture_durable_handles` refused every one, so a
-// parent that had spawned a §14 child (op 15 takes a module handle) hit `NonDurableHandle` before
+// parent that had spawned a §14 child (a spawn names a module handle) hit `NonDurableHandle` before
 // any capture logic ran. Now an attested-freezable grant is carried by its §4 **content digest** —
 // a name, never the bytes — and the restoring host re-grants the module it chooses to.
 // ---------------------------------------------------------------------------------------------
 
-/// A granted module with one named export, so a thawed handle can be asked *which* module it names
-/// rather than merely whether it resolved.
+/// A granted module. A thawed handle is asked *which* module it names, by digest, rather than
+/// merely whether it resolved.
 const SRC_GRANT_A: &str = r#"
 export 0 func "alpha" 0
 func () -> (i64) {
@@ -1919,8 +1918,8 @@ block 0 () {
 }
 "#;
 
-/// A second, content-distinct grant — its export name is different, so a handle that resolved to the
-/// wrong grant answers `-EINVAL` for `"alpha"` instead of a funcidx.
+/// A second, content-distinct grant, so a handle that resolved to the wrong grant names another
+/// digest.
 const SRC_GRANT_B: &str = r#"
 export 0 func "beta" 0
 func () -> (i64) {
@@ -1937,35 +1936,10 @@ fn verified(src: &str) -> Module {
     m
 }
 
-/// The minimum a `Module.resolve_export` probe needs: the name lives in the caller's window.
-struct VecMem(Vec<u8>);
-
-impl temen_interp::GuestMem for VecMem {
-    fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
-        let (a, b) = (ptr as usize, (ptr + len) as usize);
-        self.0.get(a..b).map(<[u8]>::to_vec)
-    }
-    fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
-        let a = ptr as usize;
-        self.0.get_mut(a..a + data.len())?.copy_from_slice(data);
-        Some(())
-    }
-}
-
-/// Ask the module behind `h` for the funcidx it exports as `name` (`-EINVAL` if it exports no such
-/// name — i.e. if the handle resolved to a different module).
-fn resolve_export(host: &mut Host, h: i32, name: &str) -> i64 {
-    let mut mem = VecMem(vec![0u8; 64]);
-    <VecMem as temen_interp::GuestMem>::write_bytes(&mut mem, 0, name.as_bytes())
-        .expect("the name fits");
-    host.cap_dispatch_slots(
-        temen_interp::cap_id::MODULE,
-        0,
-        h,
-        &[0, name.len() as i64],
-        Some(&mut mem),
-    )
-    .expect("a live module handle dispatches")[0]
+/// The digest of the module behind `h`, or `None` if `h` names none.
+fn named(host: &Host, h: i32) -> Option<[u8; 32]> {
+    host.spawn_module(h)
+        .map(|m| temen_interp::module_digest(&m))
 }
 
 /// **The headline**, and the discriminating half: the thaw host re-grants the module at a *different*
@@ -1979,7 +1953,9 @@ fn a_freezable_module_handle_survives_freeze_and_thaw_at_a_different_index() {
     let mut host = Host::new();
     host.grant_clock();
     let h = host.grant_durable_module(&a); // the freeze host's only grant: index 0
-    assert_eq!(resolve_export(&mut host, h, "alpha"), 0);
+    let digest = temen_interp::module_digest(&a);
+    assert_ne!(digest, temen_interp::module_digest(&b), "the grants differ");
+    assert_eq!(named(&host, h), Some(digest));
 
     let win = init_durable_window(WINDOW, TEST_ARENA);
     let artifact =
@@ -1992,15 +1968,10 @@ fn a_freezable_module_handle_survives_freeze_and_thaw_at_a_different_index() {
     restore(&artifact, &inst, &mut thost).expect("restore");
 
     assert_eq!(
-        resolve_export(&mut thost, h, "alpha"),
-        0,
+        named(&thost, h),
+        Some(digest),
         "the guest's handle value resolves to the module the artifact named, not to whatever grant \
          sits at the captured index"
-    );
-    assert_eq!(
-        resolve_export(&mut thost, h, "beta"),
-        -22, // -EINVAL
-        "and it is not the other grant"
     );
 }
 

@@ -5,12 +5,15 @@
 // Every instantiation of the THREADS engine build supplies `...foreignImports(memory)` in `temen_host`
 // (par.js, the Workers, engine-imports.mjs); the plain build imports none of these.
 //
-// ABI (all u32, no BigInt on the hot path): offsets are region-relative and already bounded by the
-// engine; `ab` points at 16 bytes of ENGINE memory holding the atomic's operands `a` (0..8) and `b`
-// (8..16) little-endian, and receives the old value at 0..8. `kind`: 0 load · 1 store(a) ·
-// 2 add · 3 sub · 4 and · 5 or · 6 xor · 7 xchg (operand a) · 8 cmpxchg(expected a, replacement b).
-// Widths 4/8; `off` naturally aligned. A registry is per agent (page or Worker): a Memory registered
-// here is addressable by the engine instance(s) of THIS agent.
+// ABI (u32 offsets, no BigInt in JavaScript): offsets are region-relative and already bounded by
+// the engine. A byte or word access (`foreign_load`/`foreign_store`, width 1, 2, 4 or 8) never calls
+// JavaScript: both imports are bound to this agent's dispatcher, a wasm instance that calls the
+// memory's own accessor instance through its table (#2416). For the atomics, `ab` points at 16 bytes
+// of ENGINE memory holding the operands `a` (0..8) and `b` (8..16) little-endian, and receives the old
+// value at 0..8. `kind`: 0 load · 1 store(a) · 2 add · 3 sub · 4 and · 5 or · 6 xor · 7 xchg
+// (operand a) · 8 cmpxchg(expected a, replacement b). Widths 4/8; `off` naturally aligned. A registry
+// is per agent (page or Worker): a Memory registered here is addressable by the engine instance(s) of
+// THIS agent.
 
 /**
  * Adopt a shared memory this agent was handed — a Worker's copy of the engine memory, or of a detached
@@ -31,16 +34,118 @@ export function adoptMemory(memory) {
 }
 
 const mems = []; // id -> { m: WebAssembly.Memory, base: byte offset of region offset 0 within it }
+// Views of each registered memory, by id, refreshed when stale (`foreignImports`).
+const u8s = [], i32s = [], i64s = [];
+
+// The word path (#2416). A JS import per access cost ~28 ns in Chromium; a wasm-to-wasm call costs ~3.
+// The engine's `foreign_load(id, off, width)` and `foreign_store(id, off, width, val)` are this agent's
+// dispatcher's exports, which call the accessor at slot `id * 8 + log2(width)` of its table, the
+// stores 4 slots on. `registerForeign` instantiates an accessor over each memory and puts its 8
+// functions in their slots; an unregistered id finds an empty slot and traps. Both modules are
+// assembled from the WAT beside them, and `browser/tests/foreign_accessor.rs` pins the bytes to it.
+/* wasm:dispatch
+(module
+  (type (func (param i32) (result i64)))
+  (type (func (param i32 i64)))
+  (table (export "slots") 0 funcref)
+  ;; load(id, off, width): the accessor at slot id * 8 + log2(width)
+  (func (export "load") (param i32 i32 i32) (result i64)
+    local.get 1
+    local.get 0
+    i32.const 3
+    i32.shl
+    local.get 2
+    i32.ctz
+    i32.add
+    call_indirect (type 0))
+  ;; store(id, off, width, val): the accessor 4 slots later
+  (func (export "store") (param i32 i32 i32 i64)
+    local.get 1
+    local.get 3
+    local.get 0
+    i32.const 3
+    i32.shl
+    local.get 2
+    i32.ctz
+    i32.add
+    i32.const 4
+    i32.add
+    call_indirect (type 1)))
+*/
+const DISPATCH_WASM = new Uint8Array([
+  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x19, 0x04, 0x60, 0x01, 0x7f, 0x01, 0x7e,
+  0x60, 0x02, 0x7f, 0x7e, 0x00, 0x60, 0x03, 0x7f, 0x7f, 0x7f, 0x01, 0x7e, 0x60, 0x04, 0x7f, 0x7f,
+  0x7f, 0x7e, 0x00, 0x03, 0x03, 0x02, 0x02, 0x03, 0x04, 0x04, 0x01, 0x70, 0x00, 0x00, 0x07, 0x18,
+  0x03, 0x05, 0x73, 0x6c, 0x6f, 0x74, 0x73, 0x01, 0x00, 0x04, 0x6c, 0x6f, 0x61, 0x64, 0x00, 0x00,
+  0x05, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x00, 0x01, 0x0a, 0x28, 0x02, 0x10, 0x00, 0x20, 0x01, 0x20,
+  0x00, 0x41, 0x03, 0x74, 0x20, 0x02, 0x68, 0x6a, 0x11, 0x00, 0x00, 0x0b, 0x15, 0x00, 0x20, 0x01,
+  0x20, 0x03, 0x20, 0x00, 0x41, 0x03, 0x74, 0x20, 0x02, 0x68, 0x6a, 0x41, 0x04, 0x6a, 0x11, 0x01,
+  0x00, 0x0b,
+]);
+/* wasm:accessor
+(module
+  (import "a" "m" (memory 0 65536 shared))
+  (import "a" "base" (global i32))
+  ;; "0".."3": a 1-, 2-, 4- or 8-byte load at base + off, zero-extended
+  (func (export "0") (param i32) (result i64)
+    local.get 0 global.get 0 i32.add i64.load8_u)
+  (func (export "1") (param i32) (result i64)
+    local.get 0 global.get 0 i32.add i64.load16_u)
+  (func (export "2") (param i32) (result i64)
+    local.get 0 global.get 0 i32.add i64.load32_u)
+  (func (export "3") (param i32) (result i64)
+    local.get 0 global.get 0 i32.add i64.load)
+  ;; "4".."7": the matching stores, keeping the low bytes of the value
+  (func (export "4") (param i32 i64)
+    local.get 0 global.get 0 i32.add local.get 1 i64.store8)
+  (func (export "5") (param i32 i64)
+    local.get 0 global.get 0 i32.add local.get 1 i64.store16)
+  (func (export "6") (param i32 i64)
+    local.get 0 global.get 0 i32.add local.get 1 i64.store32)
+  (func (export "7") (param i32 i64)
+    local.get 0 global.get 0 i32.add local.get 1 i64.store))
+*/
+const ACCESSOR_WASM = new Uint8Array([
+  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0b, 0x02, 0x60, 0x01, 0x7f, 0x01, 0x7e,
+  0x60, 0x02, 0x7f, 0x7e, 0x00, 0x02, 0x15, 0x02, 0x01, 0x61, 0x01, 0x6d, 0x02, 0x03, 0x00, 0x80,
+  0x80, 0x04, 0x01, 0x61, 0x04, 0x62, 0x61, 0x73, 0x65, 0x03, 0x7f, 0x00, 0x03, 0x09, 0x08, 0x00,
+  0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x07, 0x21, 0x08, 0x01, 0x30, 0x00, 0x00, 0x01, 0x31,
+  0x00, 0x01, 0x01, 0x32, 0x00, 0x02, 0x01, 0x33, 0x00, 0x03, 0x01, 0x34, 0x00, 0x04, 0x01, 0x35,
+  0x00, 0x05, 0x01, 0x36, 0x00, 0x06, 0x01, 0x37, 0x00, 0x07, 0x0a, 0x61, 0x08, 0x0a, 0x00, 0x20,
+  0x00, 0x23, 0x00, 0x6a, 0x31, 0x00, 0x00, 0x0b, 0x0a, 0x00, 0x20, 0x00, 0x23, 0x00, 0x6a, 0x33,
+  0x01, 0x00, 0x0b, 0x0a, 0x00, 0x20, 0x00, 0x23, 0x00, 0x6a, 0x35, 0x02, 0x00, 0x0b, 0x0a, 0x00,
+  0x20, 0x00, 0x23, 0x00, 0x6a, 0x29, 0x03, 0x00, 0x0b, 0x0c, 0x00, 0x20, 0x00, 0x23, 0x00, 0x6a,
+  0x20, 0x01, 0x3c, 0x00, 0x00, 0x0b, 0x0c, 0x00, 0x20, 0x00, 0x23, 0x00, 0x6a, 0x20, 0x01, 0x3d,
+  0x01, 0x00, 0x0b, 0x0c, 0x00, 0x20, 0x00, 0x23, 0x00, 0x6a, 0x20, 0x01, 0x3e, 0x02, 0x00, 0x0b,
+  0x0c, 0x00, 0x20, 0x00, 0x23, 0x00, 0x6a, 0x20, 0x01, 0x37, 0x03, 0x00, 0x0b,
+]);
+let dispatch = null, accessor = null;
+const dispatcher = () => (dispatch ??= new WebAssembly.Instance(new WebAssembly.Module(DISPATCH_WASM)).exports);
 
 /**
  * Register a child `WebAssembly.Memory`; returns the id the engine names it by. `base` is where the
  * engine's region offset 0 lands in the memory — a detached child's window starts one host header page
  * in (`temen_detached_header_bytes()`), so its region is `[base, …)` and the header below stays the
- * host's (DETACHED_JIT.md §3.1).
+ * host's (DETACHED_JIT.md §3.1). `id` is the next free one, or the id another agent gave the memory,
+ * for a Worker the memory was handed to with it (#1414 B6-3c): such a Worker registers it first, so
+ * the ids it mints after cannot meet it.
  */
-export function registerForeign(memory, base = 0) {
-  mems.push({ m: adoptMemory(memory), base }); // a detached child's memory, shared by its threads' Workers
-  return mems.length - 1;
+export function registerForeign(memory, base = 0, id = mems.length) {
+  if (mems[id] !== undefined) throw new Error(`foreign memory ${id} is already registered`);
+  mems[id] = { m: adoptMemory(memory), base }; // a detached child's memory, shared by its threads' Workers
+  accessor ??= new WebAssembly.Module(ACCESSOR_WASM);
+  const words = new WebAssembly.Instance(accessor, { a: { m: memory, base } }).exports;
+  const slots = dispatcher().slots;
+  if (slots.length < 8 * (id + 1)) slots.grow(8 * (id + 1) - slots.length);
+  for (let k = 0; k < 8; k++) slots.set(8 * id + k, words[k]);
+  return id;
+}
+
+/** Let go of the memory registered as `id`, and of this agent's views of it. Its id is not reused. */
+export function releaseForeign(id) {
+  mems[id] = u8s[id] = i32s[id] = i64s[id] = undefined;
+  const slots = dispatcher().slots;
+  for (let k = 0; k < 8 && 8 * id + k < slots.length; k++) slots.set(8 * id + k, null);
 }
 
 /** The registered Memory for `id` (e.g. to read a result out). */
@@ -68,7 +173,6 @@ export function foreignImports(engineMemory) {
     }
     return eu8;
   };
-  const u8s = [], i32s = [], i64s = [];
   // `end` is the memory-absolute end of the access (region offset + base + length).
   const child = (id, end) => {
     const v = u8s[id];
@@ -79,7 +183,10 @@ export function foreignImports(engineMemory) {
     return (u8s[id] = new Uint8Array(buf));
   };
   const RMW = [null, null, 'add', 'sub', 'and', 'or', 'xor', 'exchange'];
+  const { load, store } = dispatcher();
   return {
+    foreign_load: load,
+    foreign_store: store,
     foreign_read: (id, off, dst, len) => {
       off += mems[id].base;
       const e = eng(dst + len), c = child(id, off + len);

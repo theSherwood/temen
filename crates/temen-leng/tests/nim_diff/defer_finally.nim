@@ -1,6 +1,7 @@
 # `defer` and `try`/`finally` on both the normal and the raising path, under nimony's ErrorCode
 # exceptions (see exceptions.nim). The log records the order they ran in.
 import std/syncio
+{.feature: "assumeSync".}  # `log` is shared by the procs that write it, on one thread
 var log = ""
 proc work(fail: bool): int {.raises.} =
   defer: log.add "d"

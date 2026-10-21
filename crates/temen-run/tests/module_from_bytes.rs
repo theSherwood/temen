@@ -29,7 +29,7 @@ const CHILD_BYTES_OFF: u64 = 20480;
 
 // The parent: `main(inst, loader, fs, blen, budget)`. It (1) `from_bytes(CHILD_BYTES_OFF, blen)` over
 // the child's encoded module in its window — `call.cap MODULE_LOADER(=7) 0` — to mint a `Module`
-// handle, then (2) spawns that handle through an op-17 v1 record at 17600 — the child's own 64 KiB
+// handle, then (2) spawns that handle through an op-17 record at 17600 — the child's own 64 KiB
 // window, paid from `budget` — with a one-entry grant list `{"fs" -> fs}` (the grant record at 17408,
 // the name at 18432), and (3) op-1 joins it. The same spawn `temen_run::conductor` issues — only the
 // module handle's *origin* differs (minted from bytes here, host-granted there).
@@ -50,19 +50,17 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   vgptr = i64.const 17408
   vgn = i64.const 1
   vr0 = i64.const 17600
-  vver = i64.const 1
-  i64.store vr0 vver
   vslp = i64.const -4294967280
-  i64.store vr0 vslp offset=16
+  i64.store vr0 vslp
   vmh32 = i32.wrap_i64 vmh
-  i32.store vr0 vmh32 offset=24
-  i32.store vr0 v4 offset=28
-  i64.store vr0 vgptr offset=40
-  i64.store vr0 vgn offset=48
+  i32.store vr0 vmh32 offset=8
+  i32.store vr0 v4 offset=12
+  i64.store vr0 vgptr offset=16
+  i64.store vr0 vgn offset=24
   vnone = i32.const -1
-  i32.store vr0 vnone offset=72
+  i32.store vr0 vnone offset=48
   vh = call.cap 6 17 (i64) -> (i32) v0 (vr0)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vr
   }
 }
@@ -127,11 +125,11 @@ fn run_parent(child_bytes: &[u8]) -> (Vec<Value>, MemFsHandle) {
         let factory = Arc::clone(&factory);
         Arc::new(move |_pid| {
             let (h, s) = (*factory)();
-            ForkedProc::shared(h, s)
+            Some(ForkedProc::shared(h, s))
         })
     };
     let fs_h = host.grant_host_proc_forkable(init, fork, init_state);
-    let inst = host.grant_instantiator(0, 1u64 << 17);
+    let inst = host.grant_instantiator();
     let loader = temen_run::grant_module_loader(&mut host);
     let budget = host.grant_budget(-1, 1 << 16, -1);
 

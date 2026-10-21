@@ -24,7 +24,7 @@ use temen_text::parse_module;
 use temen_verify::verify_module;
 
 /// func 0 (parent, `(Instantiator, grant_handle, Budget, Module)`): spawn the child (the `Module`,
-/// func 1's child image, #2219) detached through the v1 record at 20544, paid from the `Budget` and
+/// func 1's child image, #2219) detached through the spawn record at 20544, paid from the `Budget` and
 /// re-granting the parent's `grant_handle` under
 /// the name `"g"` (name at 20480, grant record at 20488), then `join` and return the child's result.
 ///
@@ -48,13 +48,13 @@ block 0 (vinst: i32, vstream: i32, vbud: i32, vmod: i32) {\n\
   vgr3 = i64.const 20500\n\
   vz32 = i32.const 0\n\
   i32.store vgr3 vz32\n\
-  rrm = i64.const 20568\n\
+  rrm = i64.const 20552\n\
   i32.store rrm vmod\n\
-  rrb = i64.const 20572\n\
+  rrb = i64.const 20556\n\
   i32.store rrb vbud\n\
   rra0 = i64.const 20544\n\
   vch = call.cap 6 17 (i64) -> (i32) vinst (rra0)\n\
-  vres = call.cap 6 1 (i32) -> (i64) vinst (vch)\n\
+  vres_st, vres = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)\n\
   return vres\n\
   }\n\
 }\n\
@@ -90,7 +90,7 @@ fn module() -> Module {
     let spawn = SpawnRec {
         grants_ptr: 20488,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::default()
     };
     let m = parse_module(&format!("{SRC}{}", rec::segment(20544, &spawn))).expect("parse");
     verify_module(&m).expect("verify");
@@ -101,7 +101,7 @@ fn module() -> Module {
 /// `Stream` (happy path) or the non-copyable `Instantiator` (negative path), to prove it is refused.
 fn host(m: &Module, stream_grant: bool) -> (Host, [i32; 4]) {
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 128 << 10);
+    let ih = host.grant_instantiator();
     let sh = host.grant_stream(StreamRole::Out);
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let child = host.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));

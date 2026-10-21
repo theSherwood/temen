@@ -4,7 +4,7 @@
 //! shared source (the mutable-`Domain` step), then seeds its data segments into the child's window. So
 //! a breakpoint fires inside the **granted module's** body (a distinct pushed module index) on a
 //! distinct thread, `read_window` reads the child's own window, and the run stays bit-identical to the
-//! production bytecode engine + tree-walker oracle. The child is spawned detached, by a v1 record; a
+//! production bytecode engine + tree-walker oracle. The child is spawned detached, by a spawn record; a
 //! detached child's checkpoints are `bytecode_debug_detached.rs`.
 
 #[path = "../../temen-interp/tests/support/rec.rs"]
@@ -36,18 +36,18 @@ block 0 (v0: i64) {
 }
 "#;
 
-// The parent `(instantiator, module, budget) -> i64` spawns the granted module through a v1 record at
+// The parent `(instantiator, module, budget) -> i64` spawns the granted module through a spawn record at
 // 17408 paid from the budget, joins it, and returns its value (1086).
 const DETACHED_PARENT: &str = r#"memory 17
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vm = i64.const 17432
+  vm = i64.const 17416
   i32.store vm v1
-  vb = i64.const 17436
+  vb = i64.const 17420
   i32.store vb v2
   vr = i64.const 17408
   v6 = call.cap 6 17 (i64) -> (i32) v0 (vr)
-  v7 = call.cap 6 1 (i32) -> (i64) v0 (v6)
+  v7_st, v7 = call.cap 6 1 (i32) -> (i64, i64) v0 (v6)
   return v7
   }
 }
@@ -59,7 +59,7 @@ const WANT: i64 = 1086;
 fn powerbox() -> (Host, i32, i32) {
     let child = parse_module(CHILD_SRC).expect("parse child");
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 128 << 10);
+    let inst = host.grant_instantiator();
     let mh = host.grant_module(&child);
     (host, inst, mh)
 }
@@ -67,7 +67,10 @@ fn powerbox() -> (Host, i32, i32) {
 /// [`DETACHED_PARENT`] with its record, and its powerbox and args: [`powerbox`] and a `Budget` for the
 /// child's window.
 fn detached() -> (temen_ir::Module, Host, [Value; 3]) {
-    let src = format!("{DETACHED_PARENT}{}", rec::segment(17408, &SpawnRec::v1(0)));
+    let src = format!(
+        "{DETACHED_PARENT}{}",
+        rec::segment(17408, &SpawnRec::default())
+    );
     let m = parse_module(&src).expect("parse");
     let (mut host, inst, mh) = powerbox();
     let budget = host.grant_budget(-1, 1 << 20, -1);
@@ -188,10 +191,13 @@ debug.var 0 "byte" ssa 2 "unsigned char"
 #[test]
 fn a_line_of_a_childs_own_source_binds_when_the_run_admits_it() {
     let child = parse_module(&format!("{CHILD_SRC}{PLUGIN_DEBUG}")).expect("parse child");
-    let src = format!("{DETACHED_PARENT}{}", rec::segment(17408, &SpawnRec::v1(0)));
+    let src = format!(
+        "{DETACHED_PARENT}{}",
+        rec::segment(17408, &SpawnRec::default())
+    );
     let m = parse_module(&src).expect("parse");
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 128 << 10);
+    let inst = host.grant_instantiator();
     let mh = host.grant_module(&child);
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let args = [inst, mh, budget].map(Value::I32);

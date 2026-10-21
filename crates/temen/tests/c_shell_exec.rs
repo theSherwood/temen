@@ -77,7 +77,7 @@ const SPAWN_C: &str = include_str!("../../temen-run/demos/posix_libc/spawn.c");
 
 /// The shell: `main(argc, argv)` — exec `argv[1]` as an external command, passing it `argv[1..]` as
 /// the spawn's args payload (the §3e buffer the command's `main(argc, argv)` reads). The command runs
-/// in a window of its own (the v1 detached record, #1863), so nothing is written into its memory.
+/// in a window of its own (the detached spawn record, #1863), so nothing is written into its memory.
 /// Names link via imports (see [`link_shim`]); handles come from the guest's own cap.self reflection
 /// (`vm_cap_of`).
 ///
@@ -109,7 +109,9 @@ int main(int argc, char **argv){
   g[0].name = "stdout";
   g[0].handle = (int)out;
   long child = vm_spawn(mod, 17, g, 1, ab, p - ab, scratch);
-  return (int)vm_join(child);
+  long st;
+  long r = vm_join(child, &st);
+  return st == 0 ? (int)r : 128;   /* a command that ended in a trap: a crash status, not ours */
 }
 "#;
 
@@ -142,10 +144,11 @@ int main(int argc, char **argv){
   vm_grant g[1];
   g[0].name = "stdout";
   g[0].handle = (int)out;
+  long st;
   long a = vm_spawn(mod, 17, g, 1, 0, 0, scratch);
-  long ra = vm_join(a);
+  long ra = vm_join(a, &st);
   long b = vm_spawn(mod, 17, g, 0, 0, 0, scratch);
-  long rb = vm_join(b);
+  long rb = vm_join(b, &st);
   return (int)(ra * 10 + rb);
 }
 "#;
@@ -211,7 +214,7 @@ fn run(
     let mut host = Host::new();
     let _sink = host.shared_stdout(); // route the stdout Stream + re-granted child streams to one sink
     let out_h = host.grant_stream(StreamRole::Out);
-    let _inst_h = host.grant_instantiator(0, win as u64);
+    let _inst_h = host.grant_instantiator();
     // The `Budget` each child's detached window spends (`vm_spawn` finds it by reflection).
     let _budget_h = host.grant_budget(-1, 1 << 20, -1);
     let echo_h = host.grant_module(cmd);

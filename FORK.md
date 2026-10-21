@@ -58,12 +58,12 @@ re-issues.
 
 ## 4. How a parent names a child (the handle model — nesting-friendly by construction)
 
-The Instantiator's spawns (op 15, and its op-17 record; the carve spawns 0 `instantiate` and 5/13
+The Instantiator's spawn (the op-17 record; the carve spawns 0 `instantiate` and 5/13
 `instantiate_module` this section was written against are retired, #1867) return an `i32`
 **`child_handle`**, non-blocking. That handle is a **capability** — "holding the handle is the authority
 to nest (D19)". It resolves (in the *parent's* runtime) to a scheduler `TaskId` → the child's `VCpu`
-(its own `vcpu_ctx`, shadow region, and window carve via `nested_view` — the carve is being retired,
-INVARIANTS #13 2026-09-29; an op-15 detached child's handle names its own window). Sibling ops
+(its own `vcpu_ctx`, shadow region, and window carve via `nested_view` — the carve is retired,
+INVARIANTS #13 2026-09-29, deleted in #1867; a detached child's handle names its own window). Sibling ops
 already take it: `join` (1), `poll` (9), `kill` (12), `child_offer` (14). It is **capability-scoped,
 not a global PID table**: a parent only holds handles to children it spawned.
 
@@ -114,8 +114,8 @@ it `clone_caller() -> twin_child_handle` (self-namespace, servicer-side) or `clo
    **reply slot** — the reply-injection capture, not a placeholder and not a re-issue arm.
 2. **Twin it.** Copy the caller's carve (window slice) into a fresh child domain (via the
    `spawn_named_child` path), re-grant its pass-through handles, and re-seed a `CapReply` park for the
-   twin with a second `(callee, ticket')` in `ticket_waiters`. (The carve is being retired —
-   INVARIANTS #13, 2026-09-29; #1289. A detached caller's window is its own, and `Mem::fork_private`
+   twin with a second `(callee, ticket')` in `ticket_waiters`. (The carve is retired —
+   INVARIANTS #13, 2026-09-29; #1289; deleted with `spawn_named_child` in #1867. A detached caller's window is its own, and `Mem::fork_private`
    already copies into a fresh private window.)
 3. **Reply to each.** The servicer delivers `A` to the caller's ticket and `B` to the twin's — each
    fiber reloads its injected reply and resumes **past** the call.
@@ -375,8 +375,10 @@ structure. Split into sub-slices by risk:
   re-granted by the embedder on thaw). Fork's own refusals are either the shared `NonDurableKind`s
   (live offers, pending live impls, blockings, window minters) or in-flight run state whose duplication
   into a *second live domain* would double-drive it (the serve queue/results — a snapshot carries these
-  to resume the SAME domain, but a twin re-serving them would double-execute — the offload pool, replay
-  recording, freeze residue). Pinned by `fork_carries_a_module_loader_and_its_validator`.
+  to resume the SAME domain, but a twin re-serving them would double-execute — replay recording, freeze
+  residue). Pinned by `fork_carries_a_module_loader_and_its_validator`. (The offload pool was on that
+  list until #2424: its jobs are punted calls, which never touch the window and answer into their own
+  domain's store, so a domain that has punted forks, and its twin carries its offloadable procs.)
 - **Increment 3b — wire the twin into `clone_caller`. NEXT.** The remaining sub-steps, each with a real
   primitive gap to fill:
   1. **Window deep-copy — a NEW `Mem` primitive is needed.** Both existing builders *share* the backing
@@ -425,10 +427,13 @@ granted, exactly as it reaches `fork`). Confinement is capability-shaped **plus*
 allow-set: `reap` acts only on ids `fork` actually minted, so a bogus/foreign pid is `-ECHILD`, never a
 park that hangs.
 
-**Reap ≠ join — a crashing command must not crash the shell.** `join` propagates a child trap as the
-joiner's own trap (`out.result?`). `wait` must not: a trapped twin reaps as a nonzero *crash status*
-(`reap_status`; the exact POSIX `128 + signal` encoding is a shell/guest concern, ISSUES.md I43). This
-is the one real semantic difference, and it is why `reap` is its own op rather than a rebind of `join`.
+**Reap ≠ join — a crashing command must not crash the shell.** `join` propagated a child trap as the
+joiner's own trap (`out.result?`) when this landed. `wait` must not: a trapped twin reaps as a nonzero
+*crash status* (`reap_status`; the exact POSIX `128 + signal` encoding is a shell/guest concern,
+ISSUES.md I43). That was the one real semantic difference, and why `reap` became its own op rather than
+a rebind of `join`. `join` has since taken the same rule (#2066): it answers a child's trap as
+`(trap code, 0)` and never traps the joiner. `reap` stays its own op because it reaps a twin by pid,
+which no handle table holds.
 
 **Two paths.** `reap_parked_caller` claims the parked caller (the shape `fork_parked_caller` removes),
 then: twin already finished → deliver its status now (`CapResult`); twin still running → move the caller
@@ -562,7 +567,7 @@ in `c_fork.rs`:
   name. A raw host cap carries no typed interface, so there's no coverage walk — a flat import binds
   op-0 straight to the handle, and the `CAP_IMPORT_TYPE_ID` translation routes the call (with the fs op
   in `args[0]`) to the registered closure. This is the same op-in-arg0 wrapper `c_link.rs` uses at the
-  top level, now reachable through a spawn's grant list (op 13's then, op 15/17's now) so a spawned/exec'd child
+  top level, now reachable through a spawn's grant list (op 13's then, the op-17 record's now) so a spawned/exec'd child
   inherits fs authority.
   The cap is granted **forkable** (`grant_host_proc_forkable`), the shape `regrant_into_child` re-mints
   into a child, so the memfs store is shared across the fork.
@@ -998,15 +1003,19 @@ unwind at the fork call (`temen_run`'s `jit_proc`):
   fork sites. An embedder can keep these compiles past the run (`RunConfig::jit_code`, a
   `JitCodeCache`, #2145). Every run handed the same cache compiles each program once, the root's
   included. Each instance polls its own run's cells, which reach the code through the `vmctx`, so
-  code compiled in one run serves the next. The §14 children a tree's processes spawn are compiled
+  code compiled in one run serves the next. A cache kept in a directory (`JitCodeCache::kept_in`,
+  temen#2452, DESIGN D71) carries that to the next process, which defines the code instead of
+  compiling it; a forked program's code is kept under its fork sites too. The §14 children a tree's processes spawn are compiled
   once too, in the same cache (temen#2168): a child's code loads its nursery from the `vmctx`, and
-  each of its tasks brings its own fiber runtime and domain. A program's code that needs
-  a runtime one instance owns (a §14 nursery, a `setjmp` table, the fiber and thread runtime), or
-  that a program able to drive the §22 `Jit` could extend, is compiled per process. Code that only
-  waits and notifies is shared: its futex sites load the thread domain from the `vmctx`, and each
-  instance gets a domain of its own. Such a program is single-threaded, so it also runs as a process
-  when it is the tree's root, and it forks. Before, the sites baked the domain, and a program that
-  could wait (nim's `nanosleep` is a timed wait, #1930) could not fork.
+  each of its tasks brings its own fiber runtime and domain. Every runtime a program's code runs on,
+  each instance stands up its own (temen#2389): its thread domain, its fiber table and runtime, its
+  §14 nursery and its `setjmp` table. The code loads each from the `vmctx` or finds it through a
+  thread-local its entry sets, so the root of a session that spawns and parks fibers compiles once
+  too. A program that can drive the §22 `Jit`, whose code a unit could extend, is still compiled
+  per process. The tree finds a program over the locked powerbox apart from a raw one's, since the
+  code's link binds the `call.cap` thunk for the powerbox's shape. Before, sites baked the domain,
+  and a program that could wait (nim's `nanosleep` is a timed wait, #1930) could not fork. A
+  program forks only when it is bare and runs over the raw powerbox: a twin's powerbox is raw.
 - **Fork again.** Every fork after a process's first unwinds through frames the previous fork's
   rewind rebuilt, each by re-issuing its call. The transform's thaw arms now poll after an op they
   re-run, as the forward path does (`temen-durable`'s `poll`). Before, an arm ran on into its

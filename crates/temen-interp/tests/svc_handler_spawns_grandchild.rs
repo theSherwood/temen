@@ -76,13 +76,13 @@ block 0 (vx: i64) {
   vg = i32.load a1
   a2 = i64.const 17296
   vb = i32.load a2
-  rm = i64.const 17432
+  rm = i64.const 17416
   i32.store rm vg
-  rb = i64.const 17436
+  rb = i64.const 17420
   i32.store rb vb
   rp = i64.const 17408
   vc = call.cap 6 17 (i64) -> (i32) vi (rp)
-  vr = call.cap 6 1 (i32) -> (i64) vi (vc)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vi (vc)
   return vr
   }
 }
@@ -90,7 +90,7 @@ block 0 (vx: i64) {
 
 /// [`SERVICER`] with the grandchild's spawn record: the module's entry 0 in its declared window.
 fn servicer() -> String {
-    format!("{SERVICER}{}", rec::segment(17408, &SpawnRec::v1(0)))
+    format!("{SERVICER}{}", rec::segment(17408, &SpawnRec::default()))
 }
 
 fn module(src: &str) -> Arc<temen_ir::Module> {
@@ -132,7 +132,7 @@ data 16608 "g4"
 
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
-  sm = i64.const 17688
+  sm = i64.const 17672
   i32.store sm v2
   h0 = i64.const 16656
   hn = i32.const 16608
@@ -142,7 +142,7 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   i32.store h1 hl
   h2 = i64.const 16664
   i32.store h2 v4
-  sb = i64.const 17692
+  sb = i64.const 17676
   i32.store sb v1
   sp = i64.const 17664
   vS = call.cap 6 17 (i64) -> (i32) v0 (sp)
@@ -156,14 +156,14 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   i32.store g1 gl
   g2 = i64.const 16648
   i32.store g2 vcap
-  cm = i64.const 17784
+  cm = i64.const 17768
   i32.store cm v3
-  cb = i64.const 17788
+  cb = i64.const 17772
   i32.store cb v1
   cp = i64.const 17760
   vC = call.cap 6 17 (i64) -> (i32) v0 (cp)
-  vjC = call.cap 6 1 (i32) -> (i64) v0 (vC)
-  vjS = call.cap 6 1 (i32) -> (i64) v0 (vS)
+  vjC_st, vjC = call.cap 6 1 (i32) -> (i64, i64) v0 (vC)
+  vjS_st, vjS = call.cap 6 1 (i32) -> (i64, i64) v0 (vS)
   vk = i64.const 1000
   vm = i64.mul vjC vk
   vr = i64.add vm vjS
@@ -200,16 +200,16 @@ block 0 (vx: i64) {
   np = i64.const 16600
   nl = i64.const 6
   vb = self.resolve np nl
-  fb = i64.const 18460
+  fb = i64.const 18444
   i32.store fb vb
   gp = i64.const 16608
   gl = i64.const 2
   vg = self.resolve gp gl
-  fm = i64.const 18456
+  fm = i64.const 18440
   i32.store fm vg
   fp = i64.const 18432
   vG = call.cap 6 17 (i64) -> (i32) vi (fp)
-  vr = call.cap 6 1 (i32) -> (i64) vi (vG)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vi (vG)
   return vr
   }
 }
@@ -228,18 +228,18 @@ fn sibling_driven() -> String {
     let s = SpawnRec {
         grants_ptr: 16656,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::default()
     };
     let c = SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::default()
     };
     format!(
         "{SIBLING_DRIVEN}{}{}{}",
         rec::segment(17664, &s),
         rec::segment(17760, &c),
-        rec::segment(18432, &SpawnRec::v1(0))
+        rec::segment(18432, &SpawnRec::default())
     )
 }
 
@@ -252,7 +252,7 @@ fn a_child_cap_call_is_serviced_by_a_handler_that_nests_a_grandchild_spawn() {
         "serve+instantiate folds to the oracle"
     );
     let mut host = Host::new();
-    let hi = host.grant_instantiator(0, 1u64 << 18);
+    let hi = host.grant_instantiator();
     let hb = host.grant_budget(-1, 4 << 20, -1);
     let [s, c, g] = [1, 2, 4]
         .map(|f| host.grant_module(&temen_ir::child_image_at(&m, f).expect("child image")));
@@ -280,7 +280,7 @@ fn a_serve_handler_services_a_dispatch_by_nesting_a_spawn_and_join() {
 
     let mut host = Host::new();
     host.set_self_module(&servicer);
-    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hi = host.grant_instantiator();
     let hg = host.grant_module(&grandchild);
     let hb = host.grant_budget(-1, 1 << 20, -1);
     // The host enqueues one dispatch to "svc".go (embedder-enqueue path); its result cell is filled

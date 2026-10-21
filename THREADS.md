@@ -8,11 +8,12 @@ once it closes.
 
 > **Plan complete; later threads work is tracked elsewhere.** Every item below is landed — both
 > modes live natively and across real Web Workers (spawn/join + futex + atomics, §22 JIT, §14
-> children, shared-`Host` I/O, the playground). Threads-touching work since then lives in its
-> owning docs: **per-Worker wasm-JIT tier-up** of the parallel driver's vCPUs
-> (`Vcpu::with_jit_eligible` → `VcpuEvent::TierUp`; `vcpu_tierup.rs`, `threads-spawn.mjs
-> TEMEN_TIERUP=1` → 4000 with 8 tier-ups fired, the Chromium `#tierup` item — plus §22/§14
-> per-Worker codegen and the `VcpuReactor` frame loop over the resumable vCPU) in `BROWSER.md`;
+> children, shared-`Host` I/O, the playground). Since #1414 B6-4a the browser's parallel mode is
+> executor 2, the native parallel driver, with each thread on a Worker; the per-Worker `Vcpu` driver
+> this plan built (`temen_par_run` and its Node twin `threads-spawn.mjs`) is deleted, and the entries
+> below record it as history. Threads-touching work since then lives in its owning docs:
+> **wasm-JIT tier-up** of a parallel run's threads, each on its own Worker (the Chromium `#x2`
+> item — plus §22 units and §14 children on emitted wasm) in `BROWSER.md`;
 > `VcpuEvent::StdinPark` (exhausted interactive stdin parks a resumable vCPU instead of spinning)
 > in `BOOTSPEED.md`; the native-side futex extensions (canonical-key `FutexKey::{Anon,Region}`,
 > the cross-domain futex for async §14 children) in `PROCESS.md`.
@@ -238,9 +239,9 @@ property, so in practice:
     asserts the same in **real Chromium** (the `#jit` work item). Validates std `Mutex<Vec<Arc<…>>>`
     (the `Domain`'s `ModuleSource`) working cross-Worker on wasm atomics. (Invoked units still run over
     the vCPU's deny-all powerbox — a `call.cap`ing unit is out of scope, the C1 limitation.)
-  - **§14 `instantiate` in parallel** *(Retiring: this design runs each child over a carve of the
-    shared backing — `nested_view`, `carve_region` — and the carve path is being deleted (INVARIANTS
-    #13, 2026-09-29; #1289). The detached equivalent is op 15: `drive_threads` and the resumable
+  - **§14 `instantiate` in parallel** *(Retired: this design ran each child over a carve of the
+    shared backing — `nested_view`, `carve_region` — and the carve path is deleted (INVARIANTS
+    #13, 2026-09-29; #1289; #1867). The detached equivalent is the op-17 record: `drive_threads` and the resumable
     `Vcpu` (`VcpuEvent::InstantiateDetached`) run the child over its own `Mem`, and the browser runs
     it on its own Worker over a per-child `WebAssembly.Memory` through `Region::Foreign`
     (`temen_par_child_detached`; DETACHED_JIT.md §3.1, §3.3).)* — a confined executor child runs as
@@ -264,7 +265,8 @@ property, so in practice:
       children, each compiled+pushed, data materialized, run, joined → oracle's value) and a
       `instantiate_module` case in `parallel_instantiate_miri.rs` (data-materialization + cross-thread
       access over the pushed module, race/UB-clean).
-    - [x] **§14-C — `spawn_coroutine_module` (op 6/7)**: resolve + compile + push the granted module,
+    - [x] **§14-C — `spawn_coroutine_module` (op 6/7)** *(retired with the coroutine ops, #2065)*:
+      resolve + compile + push the granted module,
       materialize its data segments (demand-page for op 7), and build the `Coro` in the vCPU's
       coroutine set — driven **inline** by `resume` (no thread), so it then runs exactly as a
       same-module coroutine already does in this driver. With this, **every** multi-vCPU `VcpuStop` is
@@ -278,7 +280,8 @@ property, so in practice:
       during `resume`, so the resumable vCPU must carry a **real powerbox** (not the deny-all default)
       — [`Vcpu::new_root_with_powerbox`]. With the grant in its own host, a §14 op is then serviced
       *internally* (no host-serviced event, unlike JIT C1).
-      - [x] **§14-D1 — `spawn_coroutine_module` via the resumable `Vcpu`**: serviced inside `Vcpu::run`
+      - [x] **§14-D1 — `spawn_coroutine_module` via the resumable `Vcpu`** *(retired with the
+        coroutine ops, #2065)*: serviced inside `Vcpu::run`
         (resolve the granted module from the vCPU's own powerbox, build the inline `Coro`), so the host
         sees no §14 event; the coroutine then runs inline via `resume`. Proven by
         `bytecode_vcpu_coroutine_module.rs` (a powerbox-carrying root vCPU builds + resumes 8
@@ -358,6 +361,9 @@ property, so in practice:
   (`ParDomain` is gone, #1414 3e): a parked member is finalized there, and a running one ends at its
   next stop (its next event or the 1M-op quantum); on Workers a root-domain vCPU's trap ends the run.
   A §14 confined child stays its own domain.
+  *Superseded (#1414 B6-4):* `par_onramp.rs`, the `#capio` item and `SharedFibers` went with the
+  per-Worker driver. Executor 2 keeps a run's fibers in its `SchedCore`, and the `#x2` item runs
+  these fixtures.
 - [x] **4e — the playground (`browser/web/play.html`) — the motivating demo, live.** The "web
   interpreter playground" this whole plan cites as its motivation now exists: Temen text typed into an
   editor is parsed → verified → encoded **inside the wasm sandbox** (`temen_parse` — `temen-text`/
@@ -382,8 +388,9 @@ property, so in practice:
     the host services it and `deliver_*`s the result. Proven natively by `bytecode_vcpu_orchestration.rs`
     (a `std::thread` host — the native model of the JS host — drives the counter kernel to 4000 and a
     futex handoff to 987654), which is the wasm driver's **differential oracle**.
-  - **The wasm driver** (`browser/src/lib.rs` `temen_par_*` C-ABI + `browser/threads-spawn.mjs`): each vCPU
-    runs on its own Worker through the resumable API; the host services `thread.spawn` → start a Worker,
+  - **The wasm driver** (`browser/src/lib.rs` `temen_par_*` C-ABI + `browser/threads-spawn.mjs`, both
+    deleted in #1414 B6-4a, when executor 2 replaced them): each vCPU ran on its own Worker through the
+    resumable API; the host services `thread.spawn` → start a Worker,
     `thread.join` → `Atomics.wait` on the child's completion slot, `memory.wait`/`notify` → `Atomics` on
     the futex word. The 4b per-Worker stack/TLS bootstrap and the "main can't `atomic.wait`" wrinkle are
     both handled (every vCPU runs on a Worker; main only fans out). Verified: the counter kernel runs on
@@ -393,11 +400,12 @@ property, so in practice:
   The `4c-host` / `4c-domain` follow-ons this left open (`call.cap` under a shared `Host`; §14/§22
   domain-mutating events) have since landed — see their checked entries above.
 
-  *Next (#1414 B6):* the native parallel driver, executor 2, runs in the browser too. The page hands
+  *Since #1414 B6:* the native parallel driver, executor 2, runs in the browser too, and since B6-4a
+  it is the browser's only parallel driver. The page hands
   it a thread platform (`Host::set_thread_platform`): each thread of a run is a Worker the page
   starts, running a boxed closure out of the one shared memory (`temen_x2_thread`), and the clock is
   `performance.timeOrigin + performance.now()`. The whole run is one in-Rust call on the root's Worker
-  (`temen_x2_start`) under the same recipes, and `par.js`'s `x2` option picks it. With `tierup`, a
+  (`temen_x2_start`) under the same recipes; `par.js` runs every guest this way. With `tierup`, a
   thread runs its own task's tier-ups on its Worker's instance of the run's tier-up module
   (`ThreadTier`), over a flat window, without the lock. Emitted code runs on slices of fuel, and at
   the end of each it looks at the run's `over` flag, so the run's end stops emitted code still
@@ -405,15 +413,26 @@ property, so in practice:
   (`SchedCore::on_stop`, as on the cooperative pump), and the task's thread runs it on its Worker
   before it steps the task on. Each Worker keeps the coop driver's emitted tier (`emittedTier`), so
   its `WebAssembly.Table` follows the run's dispatch table by its generation and a unit's
-  `call.dyn` reaches what any thread installed (B6-3b). The coop emit for regions (paged included)
-  and detached children on their own memories (B6-3c) follow; then it replaces the per-Worker `Vcpu`
-  driver (B6-4).
+  `call.dyn` reaches what any thread installed (B6-3b). Regions and units are the coop driver's
+  emit (`coop_emit_for` and its unit emitter): the run is of the module that emit outlined, and
+  units mask against the run's window and table. A paged emit checks each access against its
+  thread's page-state table, rebuilt from the task's page map when it moves (B6-3b-4b). A spilling
+  emit pushes its frames' live words to its thread's spill stack, and a `gc.roots` in a bounce scans
+  them with the task beneath (B6-3b-4c). A detached child's window is a `WebAssembly.Memory` of its
+  own (`ThreadPlatform::child_window`): the spawning thread's Worker
+  mints it, and the Worker of each of the child's threads is handed it, so the child's threads
+  interpret over it through `Region::Foreign` (B6-3c-1). A thread whose entry is eligible runs the
+  entry itself on its Worker's tier, and the results end the thread (#1414 ED-1). The child's root
+  task runs its granted module's emit over the child's memory, with its context in the memory's
+  header; the header holds one, so the child's threads interpret (#1414 ED-2). Then it replaced the
+  per-Worker `Vcpu` driver (B6-4a). A child entry that spawns or joins interprets on executor 2, since
+  a region tier-up cannot serve a spawn; #2443 runs such entries emitted.
 
 ### Known wrinkles — all resolved in `4c-wasm`
 
 - **Main thread can't `atomic.wait`** (it traps in browsers) — *resolved*: every vCPU (including the
-  root) runs on a Worker; `threads-spawn.mjs`'s main thread only compiles, carves the window, and fans
-  out Workers — it never blocks.
+  root) runs on a Worker; the page's main thread only publishes the run's recipe and fans out Workers
+  — it never blocks.
 - **Per-thread stack + TLS** — *resolved*: each vCPU's Worker sets its own `__stack_pointer` +
   `__wasm_init_tls` (the 4b bootstrap); a spawner `temen_par_alloc`s the child's stack/TLS before asking
   main to start it.
@@ -464,8 +483,6 @@ RUSTFLAGS="-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals \
 W=target/wasm32-unknown-unknown/release/temen_browser.wasm
 node threads-engine.mjs   "$W" corpus/threads.temenc 4000      # 4a: engine over a shared-mem window
 node threads-parallel.mjs "$W" corpus/threads.temenc 4000 8    # 4b: 8 Workers, independent domains → 4000
-node threads-spawn.mjs    "$W" corpus/threads.temenc 4000      # 4c-wasm: ONE guest's vCPUs across Workers
-node threads-spawn.mjs    "$W" corpus/futex.temenc   987654    # 4c-wasm: the cross-Worker futex handoff
 node browser-test.mjs             # 4c-wasm + 4d + 4e in a REAL browser (Chromium): validation page + playground
 ```
 

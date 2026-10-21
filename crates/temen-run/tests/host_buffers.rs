@@ -1,6 +1,7 @@
 //! #2306 — host memory a guest causes through `temen-run`'s capabilities is charged to the domain
 //! they were granted to, and refused with an errno past its ceiling, never an abort: the output a
-//! host process writes to an `exec` job, and the listings a host-directory `opendir` holds.
+//! host process writes to an `exec` job, the listings a host-directory `opendir` holds, and (#2428)
+//! a fork twin's copy of a seeded store.
 #![cfg(unix)]
 
 use temen_fs::{FS_CLOSEDIR, FS_OPENDIR, FS_READDIR};
@@ -76,4 +77,26 @@ fn a_listing_is_charged_until_it_is_closed() {
     assert_eq!(call(&mut h, FS_CLOSEDIR, &[dh]), 0);
     assert_eq!(h.channel_used(), 0, "closed, the listing holds nothing");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #2428 — a `fork()` twin's copy of a seeded store is charged with the fork, within its grantee's
+/// limits: a fork with no room for it is refused, charging nothing, and the twin's end hands its
+/// copy back.
+#[test]
+fn a_twins_copy_of_a_seeded_store_is_charged_with_the_fork() {
+    let seed = vec![("data".to_string(), vec![7u8; 64 << 10])];
+    let mut h = host(-1);
+    temen_run::fs::mem_fs_seeded(seed, Vec::new()).install(&mut h, 0);
+    let held = h.channel_used();
+    assert!(held >= 64 << 10, "the grant is charged: {held}");
+    h.set_grant(-1, 2 * held, -1, -1);
+    let twin = h.fork_powerbox_jit(7, 0, 0).expect("room for one copy");
+    assert_eq!(h.channel_used(), 2 * held, "the twin's copy is charged");
+    assert!(
+        h.fork_powerbox_jit(8, 0, 0).is_none(),
+        "no room for another refuses the fork"
+    );
+    assert_eq!(h.channel_used(), 2 * held, "charging nothing");
+    drop(twin);
+    assert_eq!(h.channel_used(), held, "the twin's end hands its copy back");
 }

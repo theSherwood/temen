@@ -64,15 +64,18 @@ fn main() {
     ];
     for (name, src, small, large) in kernels {
         let m = ir_from_text(src);
+        // A kernel that traps measures nothing: it would read as 0 ns.
         let tw = per_iter(&m, small, large, |m, n| {
             let mut fuel = u64::MAX;
             let r = temen_interp::run(m, 0, &[Value::I32(n)], &mut fuel);
+            assert!(r.is_ok(), "{name} trapped on the tree-walker: {r:?}");
             std::hint::black_box(&r);
         });
         let bc = per_iter(&m, small, large, |m, n| {
             let mut fuel = u64::MAX;
             let r = bytecode::compile_and_run(m, 0, &[Value::I32(n)], &mut fuel)
                 .expect("bytecode engine drives the kernel");
+            assert!(r.is_ok(), "{name} trapped on the bytecode engine: {r:?}");
             std::hint::black_box(&r);
         });
         println!("{name:>12}  {tw:>10.2}ns  {bc:>10.2}ns  {:>7.2}×", tw / bc);
@@ -508,7 +511,8 @@ block 0 (v0: i32) {
 "#;
 
 /// Each iteration does one `i32.store` + one `i32.load` at a fixed address — the memory kernel that
-/// Phase 2 (width-specialized load/store + inlined confinement) targets.
+/// Phase 2 (width-specialized load/store + inlined confinement) targets. The address sits above the
+/// NULL guard (#1094), which would trap the first store.
 const MEM: &str = r#"memory 16
 func (i32) -> (i32) {
 block 0 (v0: i32) {
@@ -516,7 +520,7 @@ block 0 (v0: i32) {
   br 1(v0, v1)
 }
 block 1 (v2: i32, v3: i32) {
-  v4 = i64.const 0
+  v4 = i64.const 16384
   i32.store v4 v3
   v5 = i32.load v4
   v6 = i32.const 1

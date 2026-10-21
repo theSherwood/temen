@@ -49,7 +49,7 @@ fn bytecode_drives_two_concurrent_stages_through_a_shared_region_ring() {
         &mut h_bc,
     )
     .expect(
-        "bytecode engine must drive the concurrent pipeline (op 15 + region ops), not fall back",
+        "bytecode engine must drive the concurrent pipeline (op 17 + region ops), not fall back",
     );
     assert_eq!(
         bc, tw,

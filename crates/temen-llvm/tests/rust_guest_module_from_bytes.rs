@@ -74,7 +74,7 @@ static CHILD_BYTES: [u8; {n}] = [{bytes_lit}
 extern "C" {{
     fn __vm_cap_resolve(name: *const u8, len: i64) -> i32;
     fn __vm_module_from_bytes(loader: i32, ptr: i64, len: i64) -> i64;
-    fn __vm_join(inst: i32, child: i64) -> i64;
+    fn __vm_join(inst: i32, child: i64, status: *mut i64) -> i64;
 }}
 
 #[no_mangle]
@@ -97,7 +97,12 @@ pub extern "C" fn run() -> i64 {{
             return -2;
         }}
         let child = vm_spawn(inst, budget, mh as i32, &[(b"fs", fs)], &[]);
-        __vm_join(inst, child)
+        let mut st = 0i64;
+        let r = __vm_join(inst, child, &mut st);
+        if st != 0 {{
+            return -st; // the child ended in a trap: its wire code, negated (#2066)
+        }}
+        r
     }}
 }}
 {vm_spawn}"##,
@@ -119,14 +124,14 @@ fn grant_fs(host: &mut Host, counter: &Arc<Mutex<i64>>) -> i32 {
     let c2 = Arc::clone(counter);
     let fork = Arc::new(move |_pid: u64| {
         let c = Arc::clone(&c2);
-        ForkedProc::shared(
+        Some(ForkedProc::shared(
             Box::new(move |_op, _args, _mem, _| {
                 let mut c = c.lock().unwrap();
                 *c += 1;
                 Ok(vec![*c])
             }),
             temen_interp::CapState::Stateless,
-        )
+        ))
     });
     host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Stateless)
 }
@@ -167,10 +172,10 @@ fn grant_hooks(host: *mut temen_interp::Host) -> GrantChildHooks {
 
 /// A host granting `inst` (Instantiator), `loader` (ModuleLoader — the run-in-guest cap), `budget`, and `fs` by
 /// name over a fresh counter. **No** `child` module is host-granted — the guest mints it from bytes.
-fn granted_host(win: u64) -> (Host, Arc<Mutex<i64>>) {
+fn granted_host() -> (Host, Arc<Mutex<i64>>) {
     let counter = Arc::new(Mutex::new(0i64));
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, win);
+    let inst = host.grant_instantiator();
     let loader = temen_run::grant_module_loader(&mut host);
     let budget = host.grant_budget(-1, 1 << 17, -1); // the child's window
     let fsh = grant_fs(&mut host, &counter);
@@ -182,8 +187,8 @@ fn granted_host(win: u64) -> (Host, Arc<Mutex<i64>>) {
 }
 
 /// Interpreter (cooperative engine — honors the grant list inline): returns `(result, counter)`.
-fn run_interp(m: &temen_ir::Module, entry: u32, sp: i64, win: u64) -> (i64, i64) {
-    let (mut host, counter) = granted_host(win);
+fn run_interp(m: &temen_ir::Module, entry: u32, sp: i64) -> (i64, i64) {
+    let (mut host, counter) = granted_host();
     let mut fuel = 200_000_000u64;
     let (r, _) =
         run_capture_reserved_with_host(m, entry, &[Value::I64(sp)], &mut fuel, &[], 0, &mut host);
@@ -197,8 +202,8 @@ fn run_interp(m: &temen_ir::Module, entry: u32, sp: i64, win: u64) -> (i64, i64)
 }
 
 /// JIT (given the module resolver + named-grant hooks the spawn needs): returns `(result, counter)`.
-fn run_jit(m: &temen_ir::Module, entry: u32, sp: i64, win: u64) -> (i64, i64) {
-    let (mut host, counter) = granted_host(win);
+fn run_jit(m: &temen_ir::Module, entry: u32, sp: i64) -> (i64, i64) {
+    let (mut host, counter) = granted_host();
     let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
         m,
         entry,
@@ -246,10 +251,8 @@ fn rust_guest_mints_module_from_bytes_then_spawns_it() {
         .expect("guest exports `run`")
         .1;
     let sp = t.entry_sp as i64;
-    let win = 1u64 << t.module.memory.expect("guest window").size_log2;
-
-    let (io, ic) = run_interp(&t.module, entry, sp, win);
-    let (jo, jc) = run_jit(&t.module, entry, sp, win);
+    let (io, ic) = run_interp(&t.module, entry, sp);
+    let (jo, jc) = run_jit(&t.module, entry, sp);
 
     assert_eq!(
         io, 1,

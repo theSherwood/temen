@@ -1,19 +1,22 @@
 //! A module that both spawns §14 children and uses §12 fibers runs on the bytecode engine, and each
 //! domain has its **own** fiber registry, as on the tree-walk oracle. The parent parks a fiber of its
-//! own, spawns a child (detached, op 15) that creates and drives fibers of its own, joins it, and
-//! then resumes its parked fiber. The child reports its first fiber's handle, so a registry shared
-//! across domains (the child's handles numbered after the parent's, or the parent's fiber reachable
-//! from the child) shows up as a different result. Checked on the cooperative driver, the OS-thread
-//! parallel driver and the debug scheduler.
+//! own, spawns a child (detached, through a spawn record) that creates and drives fibers of its own,
+//! joins it, and then resumes its parked fiber. The child reports its first fiber's handle, so a
+//! registry shared across domains (the child's handles numbered after the parent's, or the parent's
+//! fiber reachable from the child) shows up as a different result. Checked on the cooperative
+//! driver, the OS-thread parallel driver and the debug scheduler.
 #![cfg(any(
     all(unix, target_arch = "x86_64"),
     all(unix, target_arch = "aarch64"),
     all(windows, target_arch = "x86_64")
 ))]
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use temen_interp::bytecode::{self, SchedStop, ScheduledDebugRun};
 use temen_interp::{run_capture_reserved_with_host, Host, Region, Trap, Value};
-use temen_ir::Module;
+use temen_ir::{Module, SpawnRec};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
@@ -57,9 +60,14 @@ block 0 (vs: i64) {{
     )
 }
 
-/// The parent (args `(instantiator, child module, budget)`): parks a fiber at its suspend, spawns and
-/// joins the child, resumes the fiber to its return. Result: child status × 1000 + 11 + 25.
+/// The parent (args `(instantiator, child module, budget)`): parks a fiber at its suspend, spawns the
+/// child through the spawn record at 17408 and joins it, resumes the fiber to its return. Result: child
+/// status × 1000 + 11 + 25.
 fn parent_src() -> String {
+    let spawn = SpawnRec {
+        size_log2: CHILD_LOG2.into(),
+        ..SpawnRec::default()
+    };
     format!(
         "memory {PARENT_LOG2}
 func (i32, i32, i32) -> (i64) {{
@@ -69,12 +77,13 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
   pf = cont.new f0 z
   a = i64.const 10
   s1, r1 = cont.resume pf a
-  me = i64.extend_i32_s vmod
-  vb = i64.extend_i32_s vbud
-  gz = i64.const 0
-  sl = i64.const {CHILD_LOG2}
-  ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
+  rm = i64.const 17416
+  i32.store rm vmod
+  rb = i64.const 17420
+  i32.store rb vbud
+  rp = i64.const 17408
+  ch = call.cap 6 17 (i64) -> (i32) vinst (rp)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (ch)
   b = i64.const 20
   s2, r2 = cont.resume pf b
   k = i64.const 1000
@@ -84,7 +93,8 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
   return out
   }}
 }}
-{FIBER}"
+{FIBER}{rec}",
+        rec = rec::segment(17408, &spawn)
     )
 }
 
@@ -96,7 +106,7 @@ fn parse(src: &str) -> Module {
 
 fn powerbox(child: &Module) -> (Host, [Value; 3]) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
+    let inst = host.grant_instantiator();
     let module = host.grant_module(child);
     let budget = host.grant_budget(-1, -1, -1);
     (host, [inst, module, budget].map(Value::I32))
@@ -163,8 +173,9 @@ fn a_detached_child_has_its_own_fiber_registry() {
 }
 
 /// The parent (args `(instantiator, child module, budget, address space)`): creates a 64 KiB region,
-/// maps it at window offset 1 MiB, spawns the child detached with the region pre-mapped at the
-/// child's 64 KiB, then spin-`notify`s region byte 0 until a waiter is woken, and joins.
+/// maps it at window offset 1 MiB, spawns the child detached through the spawn record at 17408
+/// ([`notifier`] lays it) with the region pre-mapped at the child's 64 KiB, then spin-`notify`s
+/// region byte 0 until a waiter is woken, and joins.
 const NOTIFIER: &str = "memory 23
 func (i32, i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vmod: i32, vbud: i32, vas: i32) {
@@ -176,12 +187,14 @@ block 0 (vinst: i32, vmod: i32, vbud: i32, vas: i32) {
   vz = i64.const 0
   vprot = i32.const 3
   vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwin, vz, vps, vprot)
-  me = i64.extend_i32_s vmod
-  vb = i64.extend_i32_s vbud
-  gz = i64.const 0
-  sl = i64.const 17
-  coff = i64.const 65536
-  ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz, gz, gz, vrh64, coff)
+  rm = i64.const 17416
+  i32.store rm vmod
+  rb = i64.const 17420
+  i32.store rb vbud
+  rr = i64.const 17456
+  i32.store rr vrh
+  rp = i64.const 17408
+  ch = call.cap 6 17 (i64) -> (i32) vinst (rp)
   br 1(vinst, ch)
   }
 block 1 (i1: i32, c1: i32) {
@@ -193,11 +206,22 @@ block 1 (i1: i32, c1: i32) {
   br_if more 1(i1, c1) 2(i1, c1)
   }
 block 2 (i2: i32, c2: i32) {
-  vr = call.cap 6 1 (i32) -> (i64) i2 (c2)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) i2 (c2)
   return vr
   }
 }
 ";
+
+/// [`NOTIFIER`] with its spawn record at 17408: the child's 128 KiB window, and the region the parent
+/// stores in it pre-mapped at the child's 64 KiB.
+fn notifier() -> String {
+    let spawn = SpawnRec {
+        size_log2: 17,
+        child_off: 65536,
+        ..SpawnRec::default()
+    };
+    format!("{NOTIFIER}{}", rec::segment(17408, &spawn))
+}
 
 /// The waiter: its fiber waits on the pre-mapped region byte (window 64 KiB, expected 0, no
 /// timeout), which parks the FIBER; the child's root polls it with `cont.resume` while it reports
@@ -246,7 +270,7 @@ fn region_powerbox(child: &Module) -> (Host, [Value; 4]) {
 /// registry. On the oracle, the cooperative driver and the parallel driver (#1787).
 #[test]
 fn a_notify_from_another_domain_wakes_a_childs_parked_fiber() {
-    let (parent, child) = (parse(NOTIFIER), parse(WAITER));
+    let (parent, child) = (parse(&notifier()), parse(WAITER));
     let want = Ok(vec![Value::I64(7)]);
     {
         let (mut host, args) = region_powerbox(&child);

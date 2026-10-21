@@ -92,8 +92,27 @@ export const suspendsLeaves = typeof WebAssembly.Suspending === 'function'
 // - `spillBytes()`, `spillPtr()`: the spill stack a collecting guest's frames push to (#1627);
 // - `fuelOut()` (optional): emitted code spent its fuel. Return more for every instance to run on
 //   with, or nothing to let the code trap `OutOfFuel`; without it, it traps.
+// - `envCell` (optional): where in `memory` the env cell is, when the host places it (a detached
+//   child's, in the header of its own memory: #1414 ED-2); without it, the tier allocates one in the
+//   engine's memory.
 // Everything here is synchronous but `syncTable` and `unitFor`, which the coop driver awaits at its
 // event boundaries; a host that cannot await uses `syncTableSync` and `unitForSync`.
+// #2126 — a native wasm trap (no `env.trap`) still names itself in its `RuntimeError` message. The
+// wording is the engine's, not the spec's, so only messages that say exactly one of the interpreter's
+// traps are named (their `temen_ir::trap_code`); any other stays unnamed (`0`). ("integer overflow" is
+// not one: SpiderMonkey and JSC say it for an out-of-range float→int conversion too, which the
+// interpreter calls `BadConversion`.)
+const NATIVE_TRAPS = [
+  [/^(divide by zero|remainder by zero|integer divide by zero|division by zero)$/i, 1], // DIV_BY_ZERO
+  [/^divide result unrepresentable$/i, 2], // INT_OVERFLOW
+  [/^(float unrepresentable in integer range|invalid conversion to integer|out of bounds trunc operation)$/i, 3], // BAD_CONVERSION
+];
+export const nativeTrap = (e) => {
+  if (!(e instanceof WebAssembly.RuntimeError)) return 0;
+  const hit = NATIVE_TRAPS.find(([re]) => re.test(e.message));
+  return hit ? hit[1] : 0;
+};
+
 export function emittedTier(ex, memory, x) {
   const mappedGlobals = []; // every live instance's "mapped" — the post-bounce fan-out set (#717)
   const fuelGlobals = [];
@@ -120,7 +139,8 @@ export function emittedTier(ex, memory, x) {
   const tsize = 1 << x.tableLog2();
   const table = new WebAssembly.Table({ initial: tsize, maximum: tsize, element: 'anyfunc' });
   const envBytes = ex.temen_wasmjit_env_bytes();
-  const envCell = Number(ex.temen_alloc(envBytes));
+  const placed = x.envCell !== undefined;
+  const envCell = placed ? x.envCell : Number(ex.temen_alloc(envBytes));
   // #1627: a collecting guest's emitted frames push their live words to a spill stack named by the
   // env cell's cursor pair; every event is an outermost entry, so each one re-arms it at the base.
   const spillBytes = x.spillBytes();
@@ -200,21 +220,6 @@ export function emittedTier(ex, memory, x) {
     trap: onTrap,
     call_interp,
   } });
-  // #2126 — a native wasm trap (no `env.trap`) still names itself in its `RuntimeError` message. The
-  // wording is the engine's, not the spec's, so only messages that say exactly one of the
-  // interpreter's traps are named; any other stays unnamed (`0`), as before. ("integer overflow" is
-  // not one: SpiderMonkey and JSC say it for an out-of-range float→int conversion too, which the
-  // interpreter calls `BadConversion`.)
-  const NATIVE_TRAPS = [
-    [/^(divide by zero|remainder by zero|integer divide by zero|division by zero)$/i, 1], // DIV_BY_ZERO
-    [/^divide result unrepresentable$/i, 2], // INT_OVERFLOW
-    [/^(float unrepresentable in integer range|invalid conversion to integer|out of bounds trunc operation)$/i, 3], // BAD_CONVERSION
-  ];
-  const nativeTrap = (e) => {
-    if (!(e instanceof WebAssembly.RuntimeError)) return 0;
-    const hit = NATIVE_TRAPS.find(([re]) => re.test(e.message));
-    return hit ? hit[1] : 0;
-  };
   // The trap emitted frames ended with (`e`, what they threw): their `env.trap` code, else the native
   // trap's. A memory fault's guard left its faulting address in the env cell (#2126), which the run
   // reports as the interpreter would.
@@ -372,7 +377,9 @@ export function emittedTier(ex, memory, x) {
       program = exports;
       register(exports);
     },
-    free: () => ex.temen_dealloc(envCell, envBytes),
+    free: () => {
+      if (!placed) ex.temen_dealloc(envCell, envBytes);
+    },
   };
 }
 
@@ -432,7 +439,7 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
   const u8 = () => new Uint8Array(memory.buffer);
   const i64 = () => new BigInt64Array(memory.buffer);
   // #816 env-routed tier-up: `win` is PER EVENT — the pending task's window base (root backing for
-  // a root-env task, backing + carve offset for a §14 confined child). Read inside each event arm
+  // a root-env task, the base of its own window for a §14 child). Read inside each event arm
   // via temen_coop_tierup_win_ptr(); never cache it across events.
   const eventWin = () => Number(ex.temen_coop_tierup_win_ptr());
 
@@ -746,8 +753,12 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
         }
         continue;
       }
+      const fuel = program.fuel, armed = fuel?.value;
       try {
-        deliver(program['f' + func](eventWin(), envCell, ...args));
+        const ret = program['f' + func](eventWin(), envCell, ...args);
+        // #2474: the work the call did, for the run's tier-up profile.
+        if (fuel && armed > fuel.value) ex.temen_coop_set_emitted_work(armed - fuel.value);
+        deliver(ret);
       } catch (e) {
         ex.temen_coop_deliver_trap(trapOf(e));
       }

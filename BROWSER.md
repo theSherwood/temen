@@ -93,9 +93,9 @@ reproduced (not argued):
    production `temen-encode` decode path `temen_run` depends on), the host powerbox
    (`run_powerbox() == 17` — `Stream.write` + capture and `Exit.exit(42)`), the seed→transform→snapshot
    capture (`run_capture() == 1007`), **and** cooperative continuations
-   (`run_fiber() == 107`, `run_coroutine() == 1001329`). So the full stack — compute, concurrency,
-   codec, capabilities, memory capture, sub-guest isolation, *and* fibers/coroutines — runs on the
-   real production target.
+   (`run_fiber() == 107`; a `run_coroutine` probe went with the coroutine ops, #2065). So the full
+   stack — compute, concurrency, codec, capabilities, memory capture, sub-guest isolation, *and*
+   fibers — runs on the real production target.
    *Node/V8 22.x cannot yet load it:* Rust's `wasm64` target emits **64-bit tables** (`table64` —
    table limits flag `0x05`, i64 element-segment offsets), and V8 implements memory64 *memory* but
    not 64-bit *tables* (`--v8-options` shows `--experimental-wasm-memory64` on by default, no table64
@@ -124,7 +124,6 @@ wasmtime run --invoke run_roundtrip -W memory64=y "$W"   # 1442695040888963407 (
 wasmtime run --invoke run_powerbox  -W memory64=y "$W"   # 17 (stream write + capture + exit(42))
 wasmtime run --invoke run_capture   -W memory64=y "$W"   # 1007 (seed window → transform → snapshot)
 wasmtime run --invoke run_fiber     -W memory64=y "$W"   # 107 (cont.new/resume cooperative fiber)
-wasmtime run --invoke run_coroutine -W memory64=y "$W"   # 1001329 (spawn_coroutine/resume/yield)
 wasmtime run --invoke run_tailcall  -W memory64=y "$W"   # 120 (return_call tail recursion, O(1) state)
 wasmtime run --invoke run_simd      -W memory64=y "$W"   # 42 (i64x2 splat/add/extract_lane)
 wasmtime run --invoke run_gcroots  -W memory64=y "$W"   # 2 (gc.roots conservative root scan)
@@ -312,14 +311,14 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   differential, byte-for-byte) and wasm64 (`run_capture() == 1007`). Closes the last output channel —
   return value ✓, streams ✓, **memory image ✓**.
 - [x] **§14 nested child guests (`temen_run_nested`).** Function 0 gets an `Instantiator` (iface 6) and
-  a `"budget"` by name, and spawns **detached child domains** of its own module (op-17 v1 records) —
+  a `"budget"` by name, and spawns **detached child domains** of its own module (op-17 records) —
   each in a fresh window of its own paid from the budget, running on the cooperative executor and
   joinable through the §12 thread machinery. 5-case differential (all matching native): isolation — a
   child's store never reaches the parent's window (`42000`), depth-2 VM-in-VM (`77`: the child pays for
   the grandchild from its own budget, #1944), a two-arg child managing its own pages via an
   attenuated `AddressSpace` (`0`), a window that disagrees with the module's refused at admission
-  (`-22`), and a child trap propagating through `join` (`STATUS_TRAP`). So a guest can spin up isolated
-  sub-guests inside the wasm sandbox.
+  (`-22`), and a child trap its `join` answers rather than raises (the `unreachable` code, #2066). So
+  a guest can spin up isolated sub-guests inside the wasm sandbox.
 - [x] **§12 fibers.** Cooperative continuation switching — the engine's signature.
   *Fibers* (`cont.new`/`cont.resume`/`suspend`, no powerbox → the plain `temen_run0` path): run-to-
   completion (`107`), suspend round-trip (`36`), multi-suspend loop (`19`), and forged-handle / root-
@@ -380,7 +379,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   `WebAssembly.Memory` are exposed, and `browser-test.mjs` drives the preinstalled Chromium against a
   page (`web/index.html` + `main.js` + `worker.js`) that (1) runs the **powerbox** (`temen_run_pb` →
   `"hello, powerbox!"`, single-threaded on the page) and (2) runs **one guest's `thread.spawn`ed vCPUs
-  across real Web Workers** over the shared memory — the browser twin of `threads-spawn.mjs`: the page
+  across real Web Workers** over the shared memory (since #1414 B6-4a on executor 2): the page
   creates every Worker and never blocks (a browser bans main-thread `Atomics.wait`); each Worker sets
   its own stack/TLS and services `thread.join` via `Atomics.wait` and the futex via
   `Atomics.wait`/`notify`. Verified: **crossOriginIsolated**, powerbox PASS, and the 8-vCPU counter
@@ -768,8 +767,8 @@ in session discussion; collected here so the next slice has a home to be picked 
   (`bench/cross-engine/README.md` § "TEMEN-in-wasm, the JIT tier"). The remaining loose ends are
   itemized in the slice notes: cross-tier `call.dyn` (the trampoline), relaxed SIMD + scalar
   `Fma`, §22 Model B2 (`install` + shared-table funcrefs), guest-*compiled* units crossing Workers,
-  nested VM-in-VM on the emitted tier (on op 15's detached path — the carve is being retired,
-  INVARIANTS #13, 2026-09-29), and deopt (a genuine no-op until `call.cap` joins the
+  nested VM-in-VM on the emitted tier (on the detached spawn's path — the carve is retired,
+  INVARIANTS #13, 2026-09-29, deleted in #1867), and deopt (a genuine no-op until `call.cap` joins the
   emitted subset).
 
 ## wasm-JIT tier — design & implementation plan
@@ -804,7 +803,7 @@ schedule/IO-shaped; the real-language playground tab is what makes this the high
 
 v86 JITs discovered x86 *machine code*: decode, self-modifying-code invalidation, lazy hot-block
 discovery. Temen has none of that. Code arrives as **complete, verified, immutable IR units at exactly
-three explicit points** — module load (`temen_par_compile`), §22 `jit_compile`/`install` (already
+three explicit points** — module load, §22 `jit_compile`/`install` (already
 literally the API for "compile this unit"), and a §14 spawn's granted module — and uninstall is drop, never
 patch. And Temen IR is deliberately wasm-flavored (`i64.mul`, `br_if`, `v128`, typed
 SSA blocks): the compute long tail translates ~1:1. What's left of v86's architecture is the easy
@@ -909,6 +908,18 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
 
 ### Slice plan (each its own PR, oracle-gated like everything above)
 
+> **Since #1414 B6-4a** the browser's parallel mode is executor 2 (THREADS.md §4c-wasm): one
+> in-Rust run on the root's Worker, each thread on a Worker of its own, its tier-ups, §22 units and
+> §14 children on emitted wasm through the shared emitted-tier host (`emittedTier`). The per-Worker
+> `Vcpu` driver the slices below built on (`temen_par_run`, the `instCodegen`/`jitB2` options, and
+> the Node harnesses `threads-spawn.mjs`, `tierup.mjs` and `jitcodegen*.mjs`) is deleted; the
+> slices record it as history. The Chromium `#x2` item and the `#inst*` items cover what its page
+> items did. Since B6-4b the nested emit its §14 codegen ran (`compile_nested*`,
+> `outline_nested_cap_calls`, the `env.join`/`env.instantiate_rec`/`env.thread_*` bounces) and the
+> `Vcpu` lanes only it used (`with_jit_eligible`, `VcpuEvent::TierUp`, `bounce_call`,
+> `with_shared_fibers`) are deleted too: a function that spawns, joins or waits interprets on executor
+> 2 until #2443.
+
 1. **[landed] Emitter core, proven natively first.** Compute ops + dispatcher control flow +
    masking + traps + fuel back-edges → wasm bytes; the whole differential gate works before any
    browser/JS exists. Landed as **`crates/temen-wasm-jit`** (`compile_module(&temen_ir::Module) →
@@ -996,8 +1007,8 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    (wasm tables aren't shareable across Workers). Proofs: `crates/temen-wasm-jit/tests/tierup.rs` (4
    differential cases pinning the emit set — spawn-only leaf, transitive leaves, a dropped
    unroutable caller, all-in-subset — each emitted `f{i}` matched to the bytecode oracle over an arg
-   sweep); the native `crates/temen-interp/tests/vcpu_tierup.rs` (the `TierUp` seam on the resumable
-   `Vcpu`, value + trap parity vs pure interp); the single-vCPU Node FFI harness `browser/tierup.mjs`
+   sweep); the native `crates/temen-interp/tests/coop_tierup.rs` (the `TierUp` seam, value + trap
+   parity vs pure interp — on the resumable `Vcpu` until #1414 moved it to the pump); the single-vCPU Node FFI harness `browser/tierup.mjs`
    (the real emitted-call + deliver path over shared memory, compute + trap); the multi-Worker Node
    twin `threads-spawn.mjs` (`TEMEN_TIERUP=1`: the 4000 kernel across 9 `worker_threads`, 8 tier-ups
    fired, result identical to the all-interp run); and the **Chromium** `#tierup` page item (the same
@@ -1033,9 +1044,9 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    TEMEN_JIT_CODEGEN=1` (`TEMEN_JIT_SERVICE=1` for the f64 kernel) (8 Workers
    each `Jit.invoke` on emitted wasm → 1136, = interp, non-vacuity-counted), and the **Chromium**
    `#jitcodegen` page item (same across real Web Workers → 1136, 8 units ran on emitted wasm).
-   *(Retiring: the §14 entries in this slice run a child over a carve of the engine memory —
+   *(Retired: the §14 entries in this slice ran a child over a carve of the engine memory —
    `win = carve base`, `env.call_interp` bounces over the carve, the op-13 loop — and the carve path
-   is being deleted (INVARIANTS #13, 2026-09-29; #1289). The detached equivalent is op 15: a
+   is deleted (INVARIANTS #13, 2026-09-29; #1289; #1867). The detached equivalent is the op-17 record: a
    per-child `WebAssembly.Memory` reached through `Region::Foreign` (DETACHED_JIT.md §3.1, §3.3).)*
    **[landed — §14 `instantiate_module` compile-on-push]** A confined executor child whose granted
    module is fully **in-subset** runs its entry on **emitted wasm** on its own Worker (the unit
@@ -1135,7 +1146,8 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    exactly as the interpreter surfaced `VcpuStop::Instantiate` to its driver; the emitted parent does
    no confinement itself (the child's window carve + attenuated powerbox stay the host's job, unchanged
    from the interpreter path). Opt-in, so the production paths are byte-identical. The spawn is now
-   op 17's `env.instantiate_rec` bounce (the op-0 carve is retired and no longer lowered, #1867), pinned by
+   op 17's `env.instantiate_rec` bounce (the op-0 carve is retired and no longer lowered, and its
+   `env.instantiate` import is gone, #1867), pinned by
    `crates/temen-wasm-jit/tests/instantiate_rec.rs`: an emitted entry that spawns + `join`s a child
    returns exactly the child's **interpreter** result (with a non-vacuity guard that the host imports
    actually fired).
@@ -1175,7 +1187,7 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    and `protect`s the "K" page read-only, the entry reads K and stores on an `Rw` page → 7509; root
    sums 8 × 7509 = 60072, interp ≡ codegen with every child emitted **paged**; the trap twin storing on
    the unmapped page faults on both tiers). *Superseded (#1865):* these items run **detached**
-   children now — the spawn is an op-17 v1 record, serviced from emitted code as `env.instantiate_rec`
+   children now — the spawn is an op-17 record, serviced from emitted code as `env.instantiate_rec`
    (`temen_par_inst_instantiate_rec`, admitted by the child's own vCPU) — and
    `temen_par_inst_instantiate` is gone. The JS-orchestrated **op-13** loop (`temen_op13jit_*`,
    #1025 Path 1) runs its separate-module child on the single-shot emit, which since #1201 emits a

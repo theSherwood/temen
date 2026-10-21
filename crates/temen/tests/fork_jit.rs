@@ -63,9 +63,9 @@ data 16694 "o"
 data 16704 "jit"
 func (i32, i32, i32, i32, i32, i32) -> (i64) {{
 block 0 (v0: i32, vout: i32, vjit: i32, vbud: i32, vsm: i32, vcm: i32) {{
-  q1m = i64.const 17560
+  q1m = i64.const 17544
   i32.store q1m vsm
-  q1b = i64.const 17564
+  q1b = i64.const 17548
   i32.store q1b vbud
   q1p = i64.const 17536
   vs = call.cap 6 17 (i64) -> (i32) v0 (q1p)
@@ -94,13 +94,13 @@ block 0 (v0: i32, vout: i32, vjit: i32, vbud: i32, vsm: i32, vcm: i32) {{
   i32.store va7 vnl
   va8 = i64.const 16680
   i32.store va8 vjit
-  q2m = i64.const 17688
+  q2m = i64.const 17672
   i32.store q2m vcm
-  q2b = i64.const 17692
+  q2b = i64.const 17676
   i32.store q2b vbud
   q2p = i64.const 17664
   vc = call.cap 6 17 (i64) -> (i32) v0 (q2p)
-  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vjc
   }}
 }}
@@ -186,11 +186,11 @@ block 4 (vr: i64, vho: i32, vhj: i32, vc: i64, vs0: i64) {{
     let caller = SpawnRec {
         grants_ptr: 16640,
         grants_n: 3,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::default()
     };
     format!(
         "{src}{}{}",
-        rec::segment(17536, &SpawnRec::v1(0)),
+        rec::segment(17536, &SpawnRec::default()),
         rec::segment(17664, &caller)
     )
 }
@@ -201,7 +201,7 @@ fn run(bytecode: bool) -> (Vec<Value>, Vec<i64>) {
     let m = parse_module(&src()).expect("parse");
     verify_module(&m).expect("verify");
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
     let jh = grant_jit(&mut host, &m, 4); // 16 install slots, carried into C by the grant

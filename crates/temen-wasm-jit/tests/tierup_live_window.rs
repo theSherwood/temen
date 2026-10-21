@@ -6,17 +6,17 @@
 //! Every existing tier-up test (`tierup.rs`) runs each emitted `f{func}` **in isolation** under
 //! wasmi over a hand-seeded window; none drives the real loop — the interpreter owns the top frame,
 //! materializes the guest window (incl. `m.data`), and *tiers up* a mainline `Call` to emitted code
-//! running over that **same live window**. That loop exists only in the browser (`temen_par_run` +
-//! `worker.js`), which is exactly why the path went unpinned. [`bytecode::VcpuReactor`] is its
-//! faithful native vehicle (BROWSER.md § "wasm-JIT tier"): it opens over a caller-owned window,
-//! runs `_start` once (materializing data), keeps the window live, and hands each
-//! [`VcpuEvent::TierUp`] to a `service` closure — here that closure runs the emitted `f{func}` over
+//! running over that **same live window**. That loop ran only in the browser, which is exactly why
+//! the path went unpinned. [`bytecode::CoopRun`], the pump every emitted run goes through, is its
+//! native vehicle: it runs over a caller-owned window (materializing data) and pauses on each
+//! [`CoopEvent::TierUp`](bytecode::CoopEvent::TierUp). Here the host runs the emitted `f{func}` over
 //! a wasmi memory mirrored from the live window, then copies any writes back.
 //!
 //! The differential contract is INVARIANTS.md #9: a tiered-up frame must be observably identical to
 //! the interpreter-only frame (same result, same trap). A divergence here is the JACL fault.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use temen_interp::bytecode::{CoopEvent, ProgramEmit, TierUpConfig};
 use temen_interp::{bytecode, Host, Region, Trap, Value};
 use temen_wasm_jit::{compile_module_tierup, TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
@@ -60,8 +60,8 @@ fn shared_window(size: usize) -> (Arc<Region>, *mut u8, std::alloc::Layout) {
 /// shared linear memory, where emitted code and the interpreter address the same `win`. Returns the
 /// region's outcome the way the browser host classifies it (`env.trap` code, else the wasm trap).
 ///
-/// SAFETY: `base` is the live window buffer, read/written only here while the vCPU is paused inside
-/// the `service` callback (single-threaded), so no aliasing with the interpreter's own access.
+/// SAFETY: `base` is the live window buffer, read/written only here while the run is paused on the
+/// tier-up (single-threaded), so no aliasing with the interpreter's own access.
 fn run_emitted_over_live_window(
     m: &temen_ir::Module,
     wasm: &[u8],
@@ -82,7 +82,7 @@ fn run_emitted_over_live_window(
         .write(&mut store, ENV_PTR as usize, &(FUEL as i64).to_le_bytes())
         .unwrap();
     // Mirror the live window into wasmi at WIN_BASE.
-    // SAFETY: see fn doc — `base` is `win_size` valid bytes, vCPU paused.
+    // SAFETY: see fn doc — `base` is `win_size` valid bytes, the run paused.
     let live = unsafe { std::slice::from_raw_parts(base, win_size) };
     memory.write(&mut store, WIN_BASE as usize, live).unwrap();
 
@@ -164,8 +164,8 @@ fn run_emitted_over_live_window(
     outcome
 }
 
-/// Drive `entry(arg)` on a live window through [`VcpuReactor`], tiering up eligible callees onto the
-/// emitted wasm mirrored over that window. Returns the mainline frame's outcome.
+/// Drive `entry(arg)` on a live window through a [`CoopRun`](bytecode::CoopRun), tiering up eligible
+/// callees onto the emitted wasm mirrored over that window. Returns the mainline frame's outcome.
 fn tiered_frame(
     m: &temen_ir::Module,
     wasm: &[u8],
@@ -173,28 +173,59 @@ fn tiered_frame(
     entry: u32,
     arg: i64,
 ) -> Outcome {
-    let win_size = 1usize << m.memory.expect("module declares memory").size_log2;
+    let size_log2 = m.memory.expect("module declares memory").size_log2;
+    let win_size = 1usize << size_log2;
     let (back, base, layout) = shared_window(win_size);
-    let host = Mutex::new(Host::new());
-    let mut reactor = bytecode::VcpuReactor::open(m, back, &host, &[])
-        .expect("reactor opens (_start runs, window + data materialized)")
-        .with_jit_eligible(Arc::from(eligible.to_vec().into_boxed_slice()));
-
-    let out = reactor.frame(
-        entry,
-        &[Value::I64(arg)],
-        &host,
-        |func, argv, mapped, _info| match run_emitted_over_live_window(
-            m, wasm, func, argv, base, win_size, mapped,
-        ) {
-            Outcome::Vals(v) => Ok(v),
-            Outcome::Trap(TrapKind::OutOfFuel) => Err(Trap::OutOfFuel),
-            Outcome::Trap(_) => Err(Trap::MemoryFault),
+    let tierup = TierUpConfig {
+        root: ProgramEmit {
+            eligible: Arc::from(eligible),
+            page_checked: false,
+            ..Default::default()
         },
-    );
-
-    // SAFETY: reactor (and its `Mem` aliasing `back`) dropped above; free the window buffer.
+        leaf: None,
+        modules: None,
+    };
+    let args = [Value::I64(arg)];
+    let mut run = bytecode::CoopRun::new_over(
+        m,
+        entry,
+        &args,
+        FUEL,
+        Host::new(),
+        Some(tierup),
+        &[],
+        size_log2,
+        back,
+    )
+    .expect("supported")
+    .expect("entry in range");
+    let mut tierups = 0;
+    let out = loop {
+        match run.run() {
+            CoopEvent::Done(v) => break Ok(v),
+            CoopEvent::Trapped(t) => break Err(t),
+            CoopEvent::TierUp {
+                func, argv, mapped, ..
+            } => {
+                tierups += 1;
+                match run_emitted_over_live_window(m, wasm, func, &argv, base, win_size, mapped) {
+                    Outcome::Vals(v) => run.deliver_tierup(&v),
+                    Outcome::Trap(TrapKind::OutOfFuel) => run.deliver_tierup_trap(Trap::OutOfFuel),
+                    Outcome::Trap(_) => run.deliver_tierup_trap(Trap::MemoryFault),
+                }
+            }
+            // One task over one window, serviced only for tier-up.
+            CoopEvent::Paused
+            | CoopEvent::Idle
+            | CoopEvent::CapPark { .. }
+            | CoopEvent::Resume { .. }
+            | CoopEvent::JitInvoke { .. } => panic!("unexpected event on a one-task run"),
+        }
+    };
+    drop(run);
+    // SAFETY: the run (and its `Mem` aliasing `back`) is dropped; free the window buffer.
     unsafe { std::alloc::dealloc(base, layout) };
+    assert_eq!(tierups, 1, "the leaf ran emitted");
 
     match out {
         Ok(v) => Outcome::Vals(v.iter().map(as_i64).collect()),

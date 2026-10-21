@@ -787,14 +787,14 @@ pub fn fold_fcmp(ty: FloatTy, op: FCmpOp, a: Known, b: Known) -> Option<Known> {
     };
     Some(Known::I32(r as i32))
 }
-/// Fold a fused multiply-add `a·b + c` (single rounding), matching the interpreter's `mul_add`.
+/// Fold a fused multiply-add `a·b + c` (single rounding) with the interpreter's own function (#2519).
 /// FMA needs `libm` (correctly-rounded software FMA → x86 inline-asm + i128), so it folds only with
 /// the `libm-floats` feature; the in-temen build leaves `fma` unfolded (sound — it runs at runtime).
 #[cfg(feature = "libm-floats")]
 pub fn fold_fma(ty: FloatTy, a: Known, b: Known, c: Known) -> Option<Known> {
     Some(match ty {
-        // `libm::fmaf`/`fma` is the correctly-rounded IEEE FMA, bit-identical to the interpreter's
-        // `mul_add` (a hardware/correctly-rounded FMA).
+        // `libm::fmaf`/`fma`, the correctly-rounded IEEE FMA the interpreters compute with, so a
+        // folded result is bit-identical to the one the residual would compute.
         FloatTy::F32 => Known::F32(libm::fmaf(a.as_f32()?, b.as_f32()?, c.as_f32()?).to_bits()),
         FloatTy::F64 => Known::F64(libm::fma(a.as_f64()?, b.as_f64()?, c.as_f64()?).to_bits()),
     })

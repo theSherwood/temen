@@ -28,7 +28,6 @@ fn compile_host(src: &str) -> CompiledModule {
         DEFAULT_RESERVED_LOG2,
         None,
         None,
-        None,
         None, // fuel
         None,
         None,
@@ -98,7 +97,7 @@ fn host_assisted_resolve_links_a_serialized_plugin_by_name() {
     // through the shared table to the host's F — F(10,3) = 23. #922: resolution is source-to-source
     // and preserves the type section, so the unit's types resolve the interned call sigs.
     let ptrs = cm
-        .define_extra(&unit.funcs, &unit.types, None)
+        .define_extra(&unit.funcs, &unit.types)
         .expect("define_extra (compile the plugin)");
     let (out, _) =
         unsafe { cm.run_extra(ptrs[0].tramp, 2, 1, &[10, 3], None) }.expect("run plugin");

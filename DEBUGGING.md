@@ -54,7 +54,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Source-level debugging — chibicc `-g` → `debug.var` + `debug.loc` → named locals & `file:line` (interpreter `source_loc` nearest-preceding) | **Built — W4 slices 5–6** | `codegen_ir.c`, `temen-text`, `temen-interp` |
 | Backtrace *materialization* (unwind tables → frames) | **Built** — gdb-facing DWARF CFI (`.debug_frame`) + a host-side fiber-rooted walk of a *suspended* fiber (W5 JIT/DWARF Stage 4), **and** the always-on **trap-time** backtrace: a JIT trap (memory fault *or* explicit check) symbolizes its stack into `last_trap_backtrace()`, folded into the host kill message (W3 Stages 0–3, unix) | §5, `temen-jit` `trap_backtrace`/`fiber_backtrace`/`dwarf` |
 | Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text **and** binary); chibicc `-g` emits the full waist; **wasm ingests embedded DWARF (source lines + vars + aggregate/pointer/array types)**; **LLVM ingests `!DILocation` source lines + (`-O0`) `dbg.declare` variables/types from the textual `.ll` metadata (`ll::debug`)** — three independent producers on both halves; DAP consumes types** (D-DBG-7/§6) | `temen-ir` `DebugInfo`/`TypeDef`, `temen-text`, `temen-encode`, `temen-interp`, `codegen_ir.c`, `temen-wasm`, `temen-llvm` |
-| DAP server (interpreter-backed: source breakpoints + **conditions**, **data breakpoints** (watchpoints, incl. cross-thread), frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array/pointer expansion**, **`powerbox` launch mode** — run a capability-using guest (a chibicc `printf`) under the on-ramp I/O powerbox, streaming its captured stdout as `output` events that **rewind on reverse** via the CapTape replay; #1528: it grants the same §14 by-name set the two Run paths do — `instantiator`, plus `module`/`budget` for a guest that spawns detached — so a §5/§14 guest is debuggable at all) | **Built — W5 slices 1–6 + W4 slices 8, 10, 11** | `temen-dap` (`DapServer` / `backend` / `expr` / `run_stdio`) |
+| DAP server (interpreter-backed: source breakpoints + **conditions**, **data breakpoints** (watchpoints, incl. cross-thread), frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array/pointer expansion**, **`powerbox` launch mode** — run a capability-using guest (a chibicc `printf`) under the on-ramp I/O powerbox, streaming its captured stdout as `output` events that **rewind on reverse** via the CapTape replay; #1528: it grants the same §14 by-name set the two Run paths do — `instantiator`, plus `budget` (and `child` for a program that exports `_child`) for a guest that spawns detached — so a §5/§14 guest is debuggable at all; **library frames + `justMyCode`** — #2341: §6 `lib_files` (text `debug.lib <file>`) marks a library's code, set where a unit becomes a resident library (`temen_link_lib_open`) and, #2401, by chibicc `-g` for a system header (a file it found on the include search path, such as `<pthread.h>`'s thread trampoline compiled into the program), and relocated by `link`, so it holds per module; its frames are `presentationHint: "subtle"`, and under the launch arg `justMyCode` a step does not end in them and `stopOnEntry` stops on the program's own first line; **structured value shapes** — #2341: a variable or `evaluate` result whose type is in §6's table carries `typeInfo` (`kind` scalar/pointer/array/aggregate/opaque, `size`, a scalar's `encoding`, an array's `count`, and the pointee's or element's summary as `target`), so a client renders it from data, not a C spelling) | **Built — W5 slices 1–6 + W4 slices 8, 10, 11** | `temen-dap` (`DapServer` / `backend` / `expr` / `run_stdio`) |
 | DWARF emission (gdb/lldb on JIT native code) | **Built — W5 JIT/DWARF tier, Stages 0–4** — source-line breakpoints, `print` of register **and** spilled variables, `bt` across guest frames, type DIEs, GDB JIT registration, and a fiber-rooted backtrace; all confirmed under gdb 15.1 (Stage 5 DAP-over-JIT + guest-window-memory var forms deferred) | `temen-jit` `dwarf`/`gdb`/`symbolize`/`var_locations` |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
 | DRF-or-trap hardened race-detection tier | **Missing** (designed, §12) | — |
@@ -230,14 +230,15 @@ different things depending on which pair you compare:
   children, `active_coro`, `root_shadow_sp`) instead of only the root `Vm`, and `ScheduledSnapshot` adds
   the **run-shared** `fibers` registry (a fiber migrates across vCPUs — D57) and the §14 same-module
   `instantiate`-child environments (`extra_envs`, as `EnvSnapshot`). On restore each coroutine window
-  (`rebuild_coro`, shared with the single-vCPU path) and each child env (`rebuild_env`: `nested_view` +
-  a deterministic `Instantiator`/`AddressSpace` powerbox over `[0, child_size)` + fuel) is rebuilt over
+  (`rebuild_coro`, shared with the single-vCPU path) and each child env (a `nested_view` + a
+  deterministic `Instantiator`/`AddressSpace` powerbox over `[0, child_size)` + fuel) is rebuilt over
   the reseeded shared window. Admitting `instantiate` children is what unlocked **scheduled coroutines**:
   the bytecode engine rejected `coroutine + thread`, so a scheduled coroutine only ever arose alongside
   an `instantiate` sibling. (Both are since retired: the coroutine ops by #2069, the carve
-  `instantiate` by #1867.) Still excluded (→ fall back to replay-from-turn-0): any child/coroutine that
-  **maps its own pages** (non-pristine `nested_view` layout — a **demand** coroutine), plus event-parked
-  (`memory.wait`) fibers. Oracles:
+  `instantiate` by #1867. A child env is now a detached child's own window image and powerbox,
+  rebuilt under its spawner's by `rebuild_detached_env`, #1866.) Still excluded (→ fall back to
+  replay-from-turn-0): any child/coroutine that **maps its own pages** (non-pristine `nested_view`
+  layout — a **demand** coroutine), plus event-parked (`memory.wait`) fibers. Oracles:
   `dap_checkpoints.rs::scheduled_warm_seek_matches_cold_with_live_fibers` (backend ladder, two
   worker vCPUs each driving a fiber body) and
   `bytecode_debug_scheduled_coroutine.rs::scheduled_coroutine_checkpoint_snapshot_restore_round_trips`
@@ -270,9 +271,10 @@ different things depending on which pair you compare:
   `Mem::snapshot_safe` admitted only a window fully reproduced by reseeding the prefix *bytes*, so any
   `Ro`/`Unmapped`/grown entry vetoed it. The checkpoint now captures the window's **page-protection map
   alongside its bytes** (`Mem::layout_snapshot`/`restore_layout`, a new `MemLayout` in both
-  `DebugRunSnapshot` and `ScheduledSnapshot`): the byte range runs to the high-water mark (prefix + any
-  grown tail page — `map`/`unmap` zero on commit, so uncommitted pages read zero and round-trip trivially),
-  and the prot map is reinstalled verbatim on restore. The root gate weakens from `snapshot_safe` to
+  `DebugRunSnapshot` and `ScheduledSnapshot`): the declared window's bytes and each page held past it
+  (#2427: apart, so a capture costs what the window holds, not the span below its highest page), and
+  the prot map is reinstalled verbatim on restore, which first zeroes what the live window held past the
+  prefix, so a page the checkpoint held zero, or not at all, keeps nothing written since. The root gate weakens from `snapshot_safe` to
   `layout_snapshot_safe`, whose sole disqualifier is §13 region aliasing (a `Backed` page's bytes live in a
   shared cross-domain `SharedRegion`, not this window's backing). **#2026 lifts that for the root:** the
   checkpoint carries the root host's regions (bytes, ids, handles) and the restore re-aliases the
@@ -283,7 +285,11 @@ different things depending on which pair you compare:
   entry were dropped) and the terminal unmapped load (would *not* fault, diverging, if the `Unmapped` entry
   were dropped), so it pins protection-map fidelity, not just bytes.
 
-  **Subset extended to page-mapping *children* + demand coroutines (slice 6b, both engines).** The bytes
+  **Subset extended to page-mapping *children* + demand coroutines (slice 6b, both engines).** *(Retired
+  with the carve windows, #1867: `EnvSnapshot.prot`, `Mem::prot_snapshot`/`install_prot`,
+  `child_checkpointable` and `nested_within_prefix` are deleted. A child's window is its own (#1866), so
+  its env snapshot carries its bytes and page map whole — `DetachedLive.image`, a `MemLayout` — under the
+  checkpoint's own gate, `ScheduledDebugRun::checkpointable`.)* The bytes
   +protmap capture now reaches §14 children too. A **demand** (`fault_yields`) coroutine — its window
   starts all-`Unmapped`, pages supplied `Rw` by the parent on fault — and a coroutine or `instantiate`
   child that `map`/`unmap`/`protect`ed its own confined window were the last non-pristine cases still
@@ -434,7 +440,8 @@ different things depending on which pair you compare:
   `bytecode_fiber_plus_thread_tick_replays_deterministically`) and `dap_over_bytecode_fiber_on_a_spawned_
   thread` (over DAP). `debug_advance_fiber` is now the single shared per-op driver for both engines.
 
-  **§14 same-module coroutines on the single-vCPU engine (slice 14a).** `debug_advance_fiber` now also
+  **§14 same-module coroutines on the single-vCPU engine (slice 14a; retired with the coroutine ops,
+  #2065).** `debug_advance_fiber` now also
   drives §14 **coroutines** inline — exactly as production `run_inner` does, never via the thread
   scheduler: `spawn_coroutine` builds the confined child in `vt.coroutines`, `resume` drives it via
   `resume_coro` (delivering yields / supplying demand-fault pages / collecting the return), and a leaked
@@ -460,7 +467,8 @@ different things depending on which pair you compare:
   (breakpoint-inside-the-body, step-descends, step-over-runs-the-coroutine, confined-window inspection,
   and body-position tick-replay), with the slice-14a oracle-parity suites unchanged (result-identical).
 
-  **§14 separate-module coroutines on the single-vCPU engine (slice 14c).** `spawn_coroutine_module`
+  **§14 separate-module coroutines on the single-vCPU engine (slice 14c; retired with the coroutine
+  ops, #2065).** `spawn_coroutine_module`
   (op 6 / demand op 7) is no longer declined: a new `spawn_coroutine_module` helper (the debug-engine
   counterpart of `Vcpu::service_coroutine_module`) resolves the host-granted `Module` from the powerbox,
   compiles it, **pushes it to the shared source** (the mutable-`Domain` step that was the blocker),
@@ -479,7 +487,7 @@ different things depending on which pair you compare:
   **§14 `instantiate` confined children on the multi-vCPU engine (slice 15a).** *(Retired: slices
   15a–15c debug carve children, and every engine now traps the carve spawn — INVARIANTS #13; #1867.
   These slices are history, and their tests are deleted. The detached equivalent is
-  `dbg_instantiate_detached`: op 15's child as a `DbgEnv` over its own `Mem`, joined like a confined
+  `dbg_instantiate_detached`: a detached spawn's child as a `DbgEnv` over its own `Mem`, joined like a confined
   child.)* `instantiate` (op 0) is
   no longer declined on the scheduled engine: `ScheduledDebugRun` grew a per-task `env` (the debug-engine
   counterpart of the production `TaskSlot::env`) and an `extra_envs: Vec<DbgEnv>`. A new `dbg_instantiate`
@@ -532,14 +540,9 @@ different things depending on which pair you compare:
   child goes through `admit_detached_child` the same way, and `dbg_start_child` only schedules it.
   `spawn_every_driver.rs` pins the answers on the oracle and all four bytecode drivers.
 
-  **A detached child of the debuggee's own program (#2076), and edits in a child (#2072).** A detached
-  child whose module is its spawner's own program (`module = -1`) runs the spawning frame's module, as a
-  same-module confined child does (#1726): the program's unit, or an installed §22 unit's when the frame
-  runs one (#2143). The shared admission takes that module as a parameter, and every driver passes the
-  spawning frame's (`spawner_module`). So a breakpoint in the program stops such a child, and its frames
-  read the program's §6 debug info, as a carve child's did. A child of a granted module still runs a
-  unit of its own, and so does a spawn from emitted code (the browser's `env.instantiate_rec` bounce),
-  which compiles the program again. A debugger edit lands in the focused
+  **A child of the debuggee's own program (#2076), and edits in a child (#2072).** A child runs a
+  granted module (#2219), so a copy of the debuggee is its child image, a unit of the debug run's own;
+  breakpoints reach it by source line (#2239, below). A debugger edit lands in the focused
   task's window, the one `read_window` reads: `write_window`, a variable in memory, and the scheduled
   replays of both, each of which records its task (#2072). The window observers — the watch scan, the
   access sink and the undo journal — name the root's window, so they skip a task in a child's window,
@@ -584,8 +587,8 @@ different things depending on which pair you compare:
   deterministic tick-replay). This closes the op-coverage gap — the scheduled engine now debugs everything
   the single-vCPU engine does.
 
-  **§14 separate-module source-variable inspection (slice 17 — single-vCPU *and* scheduled).** Stepping into
-  a separate-module coroutine child, `read_var`/`var_addr` now resolve the child's *own* named source
+  **§14 separate-module source-variable inspection (slice 17 — single-vCPU *and* scheduled; its
+  coroutine half retired with the coroutine ops, #2065).** Stepping into a separate-module coroutine child, `read_var`/`var_addr` now resolve the child's *own* named source
   variables — the `FrameReader`'s module-0 gate + per-module debug metadata that were the 14c/15b/15c
   follow-up. The granted child module already retained its whole `Module` (`ModuleGrant.module`, for §3.6),
   so `spawn_coroutine_module` builds a `ModuleDebug` from it (its `-g` info + per-`(func, block)` slot base
@@ -640,7 +643,7 @@ different things depending on which pair you compare:
   separate-module, single-vCPU *and* on the multi-vCPU scheduler with the coroutine's vCPU pinned), and
   **§14 `instantiate` / `instantiate_module`** confined children as scheduled vCPUs nesting to any depth
   (slices 14b/14c, 15a/15b/15c, 16; both since retired, the coroutines by #2069 and the carve spawns by
-  #1867, leaving the detached children of op 15/17 — #1866), and **source-variable inspection inside a separate-module child body**
+  #1867, leaving the detached children of op 17 — #1866), and **source-variable inspection inside a separate-module child body**
   on both the single-vCPU and scheduled engines (slice 17), and the **§22 guest-JIT `Jit` capability**
   (`compile`/`install`/`uninstall`/`invoke`) — serviced inline in `debug_advance_fiber`, so a guest-JIT
   program steps op-by-op on both engines with breakpoints firing around the ops, bit-identical to the
@@ -660,8 +663,8 @@ different things depending on which pair you compare:
   *and* separate-module) on **both** engines, plus **§14 `instantiate` / `instantiate_module` children**
   on the scheduled engine (which is what admits scheduled coroutines) and **page-mapping windows**
   (`map`/`unmap`/`protect`/grow) — root *and* child, plus **demand** (`fault_yields`) coroutines — the
-  page-protection map is captured alongside the bytes. (A carve child's bytes ride the parent's image,
-  and the carve is being retired — INVARIANTS #13, 2026-09-29. A **detached** child's env carries its
+  page-protection map is captured alongside the bytes. (A carve child's bytes rode the parent's image,
+  and the carve is retired — INVARIANTS #13, 2026-09-29, deleted in #1867. A **detached** child's env carries its
   own window image and its powerbox, the handle table by the freeze's own durable capture with
   inherited stdio re-aliased to the spawner's on restore, and the checkpoint carries the run's budget
   tree, which the child's spawn charged (#1866). A child whose powerbox holds anything but plain values
@@ -922,7 +925,10 @@ arm it declined on was unreachable; the admission at the top of every advance is
 exist at all. The DAP backend's `Engine::Threaded` arms for `provideCap`, the `cap` stop and the
 request stop answering `false`/`None` — "single-vCPU sessions only" — now call through. Gated by
 `debug_run_cap_park.rs` (both engines, same cases) and `dap_cap_park.rs`'s threaded twin, which makes
-the declared call from a spawned thread and gets its value back through the join.
+the declared call from a spawned thread and gets its value back through the join. (#2495 folded
+`deliver_cap` into the call's `Completer`: the embedder answers through it, the next advance takes
+the answer, counting the turn, and tapes it; and every driver admits such calls, so the admission
+flag is gone.)
 
 ---
 
@@ -1828,11 +1834,11 @@ exposing the read-only/control verbs W1–W3/W7 need (breakpoints, watchpoints, 
 read window/locals, record/replay control, model-check/replay). It is **not** a guest-callable
 capability by default — it is a *host* capability (the embedder/debugger holds it), consistent
 with "debugger observes from outside." Nesting (§14) makes a parent a natural debugger of a
-child. (That rests on the carve child's parent-readable window, which is being retired —
-INVARIANTS #13, 2026-09-29. A detached child's window is ancestor-readable only by grant, and the
+child. (That rested on the carve child's parent-readable window, which is retired —
+INVARIANTS #13, 2026-09-29, deleted in #1867. A detached child's window is ancestor-readable only by grant, and the
 owner decided on 2026-10-01 (#1866) which grant: **inspecting a detached child is the freeze
-grant**, since a snapshot is a read. An ancestor may inspect a child it holds
-`FreezeScope::DetachedProgeny` over and that attests `freeze_exposed`; a child nobody may freeze is
+grant**, since a snapshot is a read. An ancestor may inspect a child it holds freeze authority
+over and that attests `freeze_exposed`; a child nobody may freeze is
 uninspectable. No domain-held inspection surface exists: D-DBG-5 keeps the `Inspector` host-only,
 and none is built until a consumer needs one (owner, 2026-10-02, #1866), so that grant is the gate
 for the first one. The platform's debugger holds authority over every domain and reads, writes and

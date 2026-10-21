@@ -269,7 +269,7 @@ fn scheduled_window_write_survives_seek() {
 }
 
 /// A guest that resolves its `"instantiator"`, `"budget"` and `"child"`, spawns a detached copy of
-/// itself (an op-17 v1 record naming its child image, which starts at its `_child` export, func 1)
+/// itself (an op-17 record naming its child image, which starts at its `_child` export, func 1)
 /// and returns what the copy returns. The copy adds 1 to a word of its own window 3000 times and
 /// returns it.
 const SELF_SPAWN: &str = r#"memory 17
@@ -289,38 +289,31 @@ block 0 () {
   l3 = i64.const 5
   vchild = self.resolve p3 l3
   vz = i64.const 0
-  r0 = i64.const 1
+  r0 = i64.const -4294967296
   a0 = i64.const 17536
   i64.store a0 r0
-  a1 = i64.const 17544
-  i64.store a1 vz
-  r2 = i64.const -4294967296
-  a2 = i64.const 17552
-  i64.store a2 r2
   vb64 = i64.extend_i32_u vbud
   v32 = i64.const 32
   vbs = i64.shl vb64 v32
   vc64 = i64.extend_i32_u vchild
-  r3 = i64.or vbs vc64
+  r1 = i64.or vbs vc64
+  a1 = i64.const 17544
+  i64.store a1 r1
+  a2 = i64.const 17552
+  i64.store a2 vz
   a3 = i64.const 17560
-  i64.store a3 r3
+  i64.store a3 vz
   a4 = i64.const 17568
   i64.store a4 vz
   a5 = i64.const 17576
   i64.store a5 vz
+  vnone = i64.const 4294967295
   a6 = i64.const 17584
-  i64.store a6 vz
+  i64.store a6 vnone
   a7 = i64.const 17592
   i64.store a7 vz
-  a8 = i64.const 17600
-  i64.store a8 vz
-  vnone = i64.const 4294967295
-  a9 = i64.const 17608
-  i64.store a9 vnone
-  a10 = i64.const 17616
-  i64.store a10 vz
   vh = call.cap 6 17 (i64) -> (i32) vi (a0)
-  vj = call.cap 6 1 (i32) -> (i64) vi (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vh)
   return vj
   }
 }

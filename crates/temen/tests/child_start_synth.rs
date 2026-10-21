@@ -1,8 +1,8 @@
 //! `synth_manifest_child_start`: a module a frontend linked itself (a runtime plus a program, no
 //! translator-made `_start`) runs as a §14 child. Its synthesized `_start` takes the starter
 //! capability, ignores it, calls the entry with the powerbox `sp`, and returns the entry's result
-//! widened to the `i64` status `join` reads — spawned detached (op 15), on the tree-walk oracle, the
-//! cooperative bytecode driver, and Cranelift.
+//! widened to the `i64` status `join` reads — spawned detached through a spawn record, on the tree-walk
+//! oracle, the cooperative bytecode driver, and Cranelift.
 //!
 //! And `vm_region_create` in `CHILD_BINDABLE`: a child whose manifest imports it (a separately
 //! compiled runtime that can mint §13 regions) binds it to its own `AddressSpace` instead of failing
@@ -13,8 +13,11 @@
     all(windows, target_arch = "x86_64")
 ))]
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use temen_interp::{bytecode, run_capture_reserved_with_host, Host, MemLayout, Trap, Value};
-use temen_ir::{Module, ValType};
+use temen_ir::{Module, SpawnRec, ValType};
 use temen_jit::{JitError, JitOutcome};
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -48,23 +51,29 @@ block 0 (sp: i64) {
 }
 ";
 
-/// The parent (args `(instantiator, child module, budget)`): spawn the child detached (op 15) with a
-/// `2^child_log2` window, join it, return its status.
+/// The parent (args `(instantiator, child module, budget)`): spawn the child detached through the v1
+/// record at 17408, with a `2^child_log2` window, join it, return its status.
 fn parent(child_log2: u8) -> String {
+    let spawn = SpawnRec {
+        size_log2: child_log2.into(),
+        ..SpawnRec::default()
+    };
     format!(
         "memory {PARENT_LOG2}
 func (i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vmod: i32, vbud: i32) {{
-  me = i64.extend_i32_s vmod
-  vb = i64.extend_i32_s vbud
-  gz = i64.const 0
-  sl = i64.const {child_log2}
-  ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
+  rm = i64.const 17416
+  i32.store rm vmod
+  rb = i64.const 17420
+  i32.store rb vbud
+  rp = i64.const 17408
+  ch = call.cap 6 17 (i64) -> (i32) vinst (rp)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (ch)
   return vr
   }}
 }}
-"
+{rec}",
+        rec = rec::segment(17408, &spawn)
     )
 }
 
@@ -83,7 +92,7 @@ fn child(src: &str) -> Module {
 
 fn powerbox(child: &Module) -> (Host, [i32; 3]) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(child);
     let budget = host.grant_budget(-1, -1, -1);
     (host, [inst, modh, budget])

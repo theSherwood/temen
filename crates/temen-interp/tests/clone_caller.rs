@@ -19,7 +19,7 @@ use temen_ir::SpawnRec;
 /// The server's spawn record at 17536: S, func 1's child image (#2219), in the window the module
 /// declares.
 fn server() -> String {
-    rec::segment(17536, &SpawnRec::v1(0))
+    rec::segment(17536, &SpawnRec::default())
 }
 
 /// `src` with its spawn records: the server S at 17536, and the caller C at 17664, granted `"svc"`
@@ -29,7 +29,7 @@ fn forking(src: &str) -> String {
     let c = SpawnRec {
         grants_ptr: 16640,
         grants_n: 2,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::default()
     };
     format!("{src}{}{}", server(), rec::segment(17664, &c))
 }
@@ -126,9 +126,9 @@ type 1 interface { op: 0 }
 export 0 interface "svc" 1 { op: 2 }
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vbud: i32, vsm: i32) {
-  qsm = i64.const 17560
+  qsm = i64.const 17544
   i32.store qsm vsm
-  q0b = i64.const 17564
+  q0b = i64.const 17548
   i32.store q0b vbud
   q0p = i64.const 17536
   vc = call.cap 6 17 (i64) -> (i32) v0 (q0p)
@@ -216,7 +216,7 @@ fn clone_caller_outside_a_handler_is_probeable_einval() {
 fn clone_caller_injects_the_callers_reply_out_of_band() {
     let m = module(&format!("{SRC}{}", server()));
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let [sm] = images(&mut host, &m, [1]);
     let mut fuel = 20_000_000u64;
@@ -275,9 +275,9 @@ data 16684 "svc"
 data 16694 "o"
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
-  qsm = i64.const 17560
+  qsm = i64.const 17544
   i32.store qsm vsm
-  q1b = i64.const 17564
+  q1b = i64.const 17548
   i32.store q1b vbud
   q1p = i64.const 17536
   vs = call.cap 6 17 (i64) -> (i32) v0 (q1p)
@@ -299,13 +299,13 @@ block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  qcm = i64.const 17688
+  qcm = i64.const 17672
   i32.store qcm vcm
-  q2b = i64.const 17692
+  q2b = i64.const 17676
   i32.store q2b vbud
   q2p = i64.const 17664
   vc = call.cap 6 17 (i64) -> (i32) v0 (q2p)
-  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vjc
   }
 }
@@ -378,7 +378,7 @@ block 4 (vr: i64, vho: i32) {
 fn clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply() {
     let m = module(&forking(SRC_TWIN));
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout(); // promote stdout to a shared sink the twin inherits
     let out_h = host.grant_stream(StreamRole::Out);
@@ -425,7 +425,7 @@ fn clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply() {
 fn run_src_twin_oracle() -> (Vec<Value>, Vec<u8>) {
     let m = module(&forking(SRC_TWIN));
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
@@ -450,7 +450,7 @@ fn bytecode_forks_the_twin_identically_to_the_oracle() {
     // The bytecode engine must run the fork module NATIVELY (`Some`) — a fold would return `None`.
     let m = module(&forking(SRC_TWIN));
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
@@ -498,7 +498,7 @@ fn the_parallel_driver_forks_the_twin_identically_to_the_oracle() {
     let (oracle_r, oracle_bytes) = run_src_twin_oracle();
     let m = module(&forking(SRC_TWIN));
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
@@ -555,9 +555,9 @@ data 16684 "svc"
 data 16694 "o"
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
-  qsm = i64.const 17560
+  qsm = i64.const 17544
   i32.store qsm vsm
-  q3b = i64.const 17564
+  q3b = i64.const 17548
   i32.store q3b vbud
   q3p = i64.const 17536
   vs = call.cap 6 17 (i64) -> (i32) v0 (q3p)
@@ -579,13 +579,13 @@ block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  qcm = i64.const 17688
+  qcm = i64.const 17672
   i32.store qcm vcm
-  q4b = i64.const 17692
+  q4b = i64.const 17676
   i32.store q4b vbud
   q4p = i64.const 17664
   vc = call.cap 6 17 (i64) -> (i32) v0 (q4p)
-  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vjc
   }
 }
@@ -659,7 +659,7 @@ block 5 (vpid: i64) {
 fn pid_mode_replies_the_twins_task_id_to_the_parent_and_zero_to_the_child() {
     let m = module(&forking(SRC_FORK_PID));
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
@@ -720,9 +720,9 @@ data 16684 "svc"
 data 16694 "o"
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
-  qsm = i64.const 17560
+  qsm = i64.const 17544
   i32.store qsm vsm
-  q5b = i64.const 17564
+  q5b = i64.const 17548
   i32.store q5b vbud
   q5p = i64.const 17536
   vs = call.cap 6 17 (i64) -> (i32) v0 (q5p)
@@ -744,13 +744,13 @@ block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  qcm = i64.const 17688
+  qcm = i64.const 17672
   i32.store qcm vcm
-  q6b = i64.const 17692
+  q6b = i64.const 17676
   i32.store q6b vbud
   q6p = i64.const 17664
   vc = call.cap 6 17 (i64) -> (i32) v0 (q6p)
-  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vjc
   }
 }
@@ -828,7 +828,7 @@ block 5 () {
 fn fork_then_wait_reaps_the_twins_exit_status_through_the_shared_offer() {
     let m = module(&forking(SRC_FORK_WAIT));
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
@@ -877,9 +877,9 @@ data 16684 "svc"
 data 16694 "o"
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
-  qsm = i64.const 17560
+  qsm = i64.const 17544
   i32.store qsm vsm
-  q5b = i64.const 17564
+  q5b = i64.const 17548
   i32.store q5b vbud
   q5p = i64.const 17536
   vs = call.cap 6 17 (i64) -> (i32) v0 (q5p)
@@ -901,13 +901,13 @@ block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  qcm = i64.const 17688
+  qcm = i64.const 17672
   i32.store qcm vcm
-  q6b = i64.const 17692
+  q6b = i64.const 17676
   i32.store q6b vbud
   q6p = i64.const 17664
   vc = call.cap 6 17 (i64) -> (i32) v0 (q6p)
-  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vjc
   }
 }
@@ -992,7 +992,7 @@ block 5 () {
 fn waitpid_wnohang_returns_zero_for_a_still_running_twin_without_blocking() {
     let m = module(&forking(SRC_FORK_WAITPID));
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
@@ -1085,7 +1085,7 @@ block 2 (vs: i64) {
     std::thread::spawn(move || {
         let m = module(&forking(&src));
         let mut host = Host::new();
-        let ih = host.grant_instantiator(0, 1u64 << 18);
+        let ih = host.grant_instantiator();
         let hb = host.grant_budget(-1, 8 << 20, -1);
         let out_h = host.grant_stream(StreamRole::Out);
         let [sm, cm] = images(&mut host, &m, [1, 4]);

@@ -9,8 +9,8 @@ use temen_interp::{ForkedProc, Host, HostProc, HostProcFork, Trap, Value};
 use temen_ir::Module;
 
 /// A one-node plan is the nim phase driver, byte for byte: grant records for the node's caps, its argv
-/// payload, and one op-17 v1 spawn record (at 20480: version 1, entry 0, window 2^20, no pager, grants
-/// at 17408 × 2, args at 24576 × 12, no region) whose module and budget the root fills in.
+/// payload, and one op-17 spawn record (at 20480: window 2^20, no pager, grants at
+/// 17408 × 2, args at 24576 × 12, no region) whose module and budget the root fills in.
 #[test]
 fn a_one_node_plan_is_the_phase_driver() {
     let src = Plan::single(20, &["a", "b"], &["fs", "stdout"])
@@ -22,8 +22,8 @@ fn a_one_node_plan_is_the_phase_driver() {
 data 18432 "fs"
 data 18448 "stdout"
 data 24576 "\x02\x00\x00\x00\x00\x00\x00\x00\x61\x00\x62\x00"
-data 20480 "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x14\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x44\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x60\x00\x00\x00\x00\x00\x00\x0c\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-func (i32, i32, i32, i32, i32) -> (i64) {
+data 20480 "\x14\x00\x00\x00\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x44\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x60\x00\x00\x00\x00\x00\x00\x0c\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+func (i32, i32, i32, i32, i32) -> (i64, i64) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   xr17408 = i64.const 8589953024
   or17408 = i64.const 17408
@@ -37,14 +37,14 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   h17424 = i64.extend_i32_u v4
   oh17424 = i64.const 17432
   i64.store oh17424 h17424
-  rm20480 = i64.const 20504
+  rm20480 = i64.const 20488
   i32.store rm20480 v1
-  rb20480 = i64.const 20508
+  rb20480 = i64.const 20492
   i32.store rb20480 v2
   vrp = i64.const 20480
   vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vr
+  vs, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
+  return vs, vr
   }
 }
 "#
@@ -111,7 +111,12 @@ fn run_two(grants_a: &[&str], grants_b: &[&str]) -> (i64, Vec<i64>) {
     let mut host = Host::new();
     let fork: HostProcFork = {
         let mint = mint.clone();
-        Arc::new(move |_pid| ForkedProc::shared(mint(), temen_interp::CapState::Stateless))
+        Arc::new(move |_pid| {
+            Some(ForkedProc::shared(
+                mint(),
+                temen_interp::CapState::Stateless,
+            ))
+        })
     };
     let tally = host.grant_host_proc_forkable(mint(), fork, temen_interp::CapState::Stateless);
     let (a, b) = (tally_node(1), tally_node(2));
@@ -166,7 +171,7 @@ fn a_plan_the_root_cannot_honour_is_refused() {
     assert!(err(plan(&wide, vec![node(&[])])).contains("do not fit"));
 }
 
-/// A node the spawn refuses (here: an entry of no admitted shape — three params — so op 15 answers
+/// A node the spawn refuses (here: an entry of no admitted shape — three params — so op 17 answers
 /// `-EINVAL`) ends the run with a trap when the root joins the refused handle. It used to panic the
 /// driver (`drive_op13` indexed its child list with the negative handle).
 #[test]
@@ -303,7 +308,11 @@ fn a_pipe_edge_carries_one_nodes_stdout_to_anothers_stdin() {
         temen_interp::bytecode::compile_and_run_with_host(&root, 0, &args, &mut fuel, &mut host)
             .expect("the bytecode engine runs the root");
 
-    assert_eq!(out, Ok(vec![Value::I64(12)]), "echo wrote its whole line");
+    assert_eq!(
+        temen_browser::plan::outcome(out),
+        Ok(vec![Value::I64(12)]),
+        "echo wrote its whole line"
+    );
     assert_eq!(&sink.lock().unwrap()[..], b"hello, pipe\n", "cat echoed it");
     // The same plan cannot run on the spawn-to-completion driver: it is refused, not half-run.
     assert_eq!(

@@ -61,9 +61,9 @@ use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
     capture_cut_regions, Attestation, BudgetState, BudgetThawRefused, CapturedDetached,
     DetachedLaunch, DurableBinding, DurableBudget, DurableHandle, DurableJitTable, DurableJitUnit,
-    DurableNamedCap, DurablePipe, DurableRegion, FreezeScope, FrozenChildState, FrozenDetached,
-    FrozenFiber, FrozenNested, FrozenVCpu, Host, MemLayout, NonDurableHandle, RegionBacking,
-    RegionNotCaptured, RegionRefusal, ShadowArena, StreamRole, SvcDispatch, ThawedDetached, Trap,
+    DurableNamedCap, DurablePipe, DurableRegion, FrozenDetached, FrozenFiber, FrozenVCpu, Host,
+    MemLayout, NonDurableHandle, RegionBacking, RegionNotCaptured, RegionRefusal, ShadowArena,
+    StreamRole, SvcDispatch, ThawedDetached, Trap,
 };
 use temen_ir::Module;
 
@@ -223,7 +223,7 @@ use temen_ir::Module;
 /// assuming it re-derives the freeze's ids.
 /// v31 (#1674): a completed-but-unjoined child's join outcome is `0` none | `1` + value | `2` + the
 /// trap's code ([`Trap::code`]), so a child that finished with a trap rides the artifact and the
-/// thawed `join` re-raises it. A nested record's `0 | 1 + value` is unchanged; a detached record's
+/// thawed `join` answers it as a live one does. A nested record's `0 | 1 + value` is unchanged; a detached record's
 /// bare value gains the tag.
 /// v32 (#1680, #1672): pipes inside the cut ride. `B_PIPE_END` names a pipe by its artifact number
 /// (first appearance: the root's table by slot, then each nested child's in record order), and
@@ -265,7 +265,24 @@ use temen_ir::Module;
 /// was `<< 8` and 24 bits: a domain's table has 1,024 slots. The records are unchanged, but the
 /// window image holds the guest's handle values, which a v41 artifact wrote in the old layout and a
 /// thaw would decode to the wrong slots; so a v41 artifact is refused.
-const FORMAT_VERSION: u16 = 42;
+/// v43 (#2219): a detached child's launch record drops its entry function and its same-module flag. A
+/// child runs a module its spawner holds, from the module's function 0, and binds its manifest
+/// strictly, so neither varies.
+/// v44 (#1867): the §14 nested (carve) child is gone, and with it Section 2's nested-child block and
+/// each record's host state. The completed detached-child block follows the vCPU residue directly,
+/// present iff non-empty. Freeze authority has one scope, detached progeny, so `B_FREEZE_DETACHED`
+/// carries it and `B_FREEZE_AUTHORITY` (12), the carve range, is retired.
+/// v45 (#2433): `B_INSTANTIATOR` (6) carries no payload. The `Instantiator` named the window range a
+/// carve child was confined to, which nothing reads now that every child has a window of its own.
+/// v46 (#2427): Section 1 carries a window sparsely. The header's `mapped` is its head, the bytes
+/// `[0, mapped)` read whole, where an unlisted page is a zero read-write one; past it each page the
+/// window holds is listed, however far apart, and an unlisted page is one it does not hold. A page's
+/// protection byte gains [`PAGE_BYTES`] when its bytes follow, which they do for each page with
+/// contents of its own that are not all zero, an inaccessible one included (its contents are kept,
+/// #1909), so a zero page stores none, whatever its protection.
+/// v47 (#2438): a Section 8 launch record carries the spawner's pager export (plus one; `0` = an
+/// unpaged child), so a demand-paged child thaws with its pager.
+const FORMAT_VERSION: u16 = 47;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -317,6 +334,7 @@ const B_CLOCK: u8 = 2;
 // authority now rides B_ADDRESS_SPACE `{0, u64::MAX}`; the tag stays reserved.
 // B_YIELDER (4) retired with the §2.3 coroutine deletion; the tag stays reserved.
 const B_ADDRESS_SPACE: u8 = 5;
+/// No payload since v45 (#2433).
 const B_INSTANTIATOR: u8 = 6;
 const B_LIVE_IMPL: u8 = 7;
 /// §22 guest-JIT bindings (Slice 2). Index-only payloads — the domain's units ride [`TAG_JIT`].
@@ -327,14 +345,12 @@ const B_JIT_CODE: u8 = 9;
 const B_NAMED: u8 = 10;
 /// #1502, #1944 — a `Budget` handle: its node's artifact number in [`TAG_BUDGETS`].
 const B_BUDGET: u8 = 11;
-/// `FreezeAuthority` (#1440): the `(base, size)` sub-range an ancestor may snapshot. A durable
+// B_FREEZE_AUTHORITY (12) — freeze authority over a carve's range — retired with the carve (#1867);
+// the tag stays reserved.
+/// `FreezeAuthority` (#1440): all-or-nothing authority over the holder's detached children. A durable
 /// binding because the authority has to survive a round trip — a thawed parent must hold over its
 /// thawed child what it held before, or a freeze/thaw would quietly launder a domain's exposure away
 /// and `attest.freeze_exposed` would start lying.
-const B_FREEZE_AUTHORITY: u8 = 12;
-/// `FreezeAuthority(DetachedProgeny)` (#1440): all-or-nothing authority over the holder's detached
-/// children. Its own tag rather than a scope byte on `B_FREEZE_AUTHORITY`, so a v25 artifact — whose
-/// only scope was the carve — still decodes unchanged.
 const B_FREEZE_DETACHED: u8 = 13;
 /// #1361 — a durable §14 module handle, carried as the 32-byte §4 content digest of the grant. A
 /// *name*, not a payload: the restore resolves it against the modules the restoring host itself
@@ -352,13 +368,46 @@ const PROT_RO: u8 = 1;
 const PROT_UNMAPPED: u8 = 2;
 /// v39 (#2025): a page aliasing a region inside the cut — no bytes; the region's carry them.
 const PROT_BACKED: u8 = 3;
+/// v46 (#2427): set on a page's protection byte when its bytes follow — never on a `PROT_BACKED`
+/// page, and only for bytes that are not all zero.
+const PAGE_BYTES: u8 = 0x80;
 
 /// Per-page protection carried in the window image (§12.3): the interpreter's `CapturedProt`, one
-/// type for the capture and the codec. A `Rw` zero page is elided from the image, `Ro`/`Unmapped`
-/// are always stored, and a `Backed` page stores no bytes — its region's ride Section 11 (#2025).
-/// On freeze a `Backed` page's `region` is the capturing host's region id; on restore, the id the
-/// restoring host rebuilt it under.
+/// type for the capture and the codec. In the head a zero `Rw` page is elided from the image and
+/// every other page is listed; past it each page the window holds is listed (#2427). A page stores
+/// its bytes when they are not all zero, and a `Backed` page stores none — its region's ride Section
+/// 11 (#2025). On freeze a `Backed` page's `region` is the capturing host's region id; on restore,
+/// the id the restoring host rebuilt it under.
 pub use temen_interp::CapturedProt as PageProt;
+
+/// A window as Section 1 carries it (§12.3): its head — the bytes `[0, len)`, one protection per
+/// page — and each page it holds past the head (#2427): its byte offset, its protection, and its
+/// bytes when they are not all zero (`None` reads zero).
+struct Image<'a> {
+    bytes: &'a [u8],
+    prots: Vec<PageProt>,
+    tail: Vec<(u64, PageProt, Option<&'a [u8]>)>,
+}
+
+impl<'a> Image<'a> {
+    /// The image of a window [`MemLayout`]: its bytes, their [`dense_prots`](MemLayout::dense_prots),
+    /// and its [`tail_pages`](MemLayout::tail_pages).
+    fn of(layout: &'a MemLayout) -> Image<'a> {
+        Image {
+            bytes: layout.bytes(),
+            prots: layout.dense_prots(),
+            tail: layout.tail_pages(),
+        }
+    }
+
+    /// Each page's protection: the head's, then the tail's.
+    fn all_prots(&self) -> impl Iterator<Item = PageProt> + '_ {
+        self.prots
+            .iter()
+            .copied()
+            .chain(self.tail.iter().map(|t| t.1))
+    }
+}
 
 /// Why a domain can't be frozen.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -366,7 +415,9 @@ pub enum FreezeError {
     /// A live handle isn't re-grantable, so freeze refuses rather than dropping authority
     /// (§12.5). The domain must close/drain it first.
     NonDurableHandle(NonDurableHandle),
-    /// The window length isn't a power of two `≥ PAGE` — it can't be a valid masked window.
+    /// The window's geometry is not one restore accepts ([`geometry_ok`]): its head's length, or the
+    /// offset of a page it holds past the head that is not page-aligned, ascending, and inside the
+    /// reservation (#2427).
     WindowGeometry(usize),
     /// The supplied per-page protection map's length doesn't match the window's page count.
     ProtCount { pages: usize, prots: usize },
@@ -384,9 +435,6 @@ pub enum FreezeError {
     /// #1680 — a pipe has an end outside the cut (held by a domain the freeze does not carry, such
     /// as a fork twin or a detached child). The cut's boundary is not yet carried (#1680 slice 2).
     PipeCrossesCut,
-    /// #1944 — a nested (carve) child's table holds a `Budget`. No spawn gives a carve child one, so
-    /// nothing carries it; carves retire with #1867.
-    NestedBudget { slot: u32 },
     /// #1944 slice 2 — a captured detached child holds budget nodes of a tree other than the root's.
     /// A child's `"budget"` is its spawner's node, so the cut is one tree and its numbers name nodes
     /// across every artifact; a child outside it could not be numbered.
@@ -485,6 +533,22 @@ fn geometry_ok(module: &Module, mapped: u64, reserved_log2: u8) -> bool {
         .is_none_or(|mem| (mem.size_log2 as u32) < u64::BITS && 1u64 << mem.size_log2 <= mapped)
 }
 
+/// #2427 — whether a page held past a window's head, at byte offset `off`, lies where restore accepts
+/// it: page-aligned, at or past `floor` (the head's end, then the end of the page listed before it),
+/// and inside the reservation `1 << reserved_log2` ([`geometry_ok`] bounds its log).
+fn tail_ok(off: u64, floor: u64, reserved_log2: u8) -> bool {
+    off.is_multiple_of(PAGE as u64)
+        && off >= floor
+        && off
+            .checked_add(PAGE as u64)
+            .is_some_and(|end| end <= 1u64 << reserved_log2)
+}
+
+/// Whether a page's bytes are not all zero: the pages whose bytes Section 1 stores (v46).
+fn nonzero(page: &[u8]) -> bool {
+    page.iter().any(|&x| x != 0)
+}
+
 /// The first handle whose binding falls outside a window of `size` bytes, as the restore gate reads
 /// it ([`binding_in_window`]).
 fn first_out_of_window(handles: &[DurableHandle], size: u64) -> Option<&DurableHandle> {
@@ -504,13 +568,7 @@ fn binding_in_window(binding: &DurableBinding, mapped: u64) -> bool {
             base: 0,
             size: u64::MAX,
         } => return true,
-        DurableBinding::AddressSpace { base, size }
-        | DurableBinding::Instantiator { base, size }
-        // #1440: a carve-scoped freeze authority names a window sub-range too, so it takes the same
-        // bounds check. Falling through to the permissive arm would let an artifact carry authority
-        // over a range outside the window it restores into — laundering exposure past the very check
-        // this is. `DetachedProgeny` names no range, so it has nothing to bound and falls through.
-        | DurableBinding::FreezeAuthority(FreezeScope::Carve { base, size }) => (base, size),
+        DurableBinding::AddressSpace { base, size } => (base, size),
         _ => return true,
     };
     size != 0
@@ -556,36 +614,31 @@ pub fn freeze(module: &Module, window: &[u8], host: &Host) -> Result<Vec<u8>, Fr
     )
 }
 
-/// [`freeze_with_prots`] over the one window-image form ([`MemLayout`], the capture a reactor or
-/// the checkpoint ladder already holds): the image is its bytes, the protection map its
-/// [`dense_prots`](MemLayout::dense_prots) — so a caller never re-derives the codec's page map by
-/// hand. `reserved_log2` is the window's reservation, as for [`freeze_with_prots`].
+/// Freeze over the one window-image form ([`MemLayout`], the capture every engine's freeze, a reactor
+/// or the checkpoint ladder already holds): its bytes as the head, under their
+/// [`dense_prots`](MemLayout::dense_prots), and each page it holds past them (#2427) — so a caller
+/// never re-derives the codec's page map by hand. `reserved_log2` is the window's reservation, as
+/// for [`freeze_with_prots`].
 pub fn freeze_layout(
     module: &Module,
     layout: &MemLayout,
     reserved_log2: u8,
     host: &Host,
 ) -> Result<Vec<u8>, FreezeError> {
-    freeze_with_prots(
-        module,
-        layout.bytes(),
-        &layout.dense_prots(),
-        reserved_log2,
-        host,
-    )
+    freeze_image(module, Image::of(layout), reserved_log2, host)
 }
 
 /// [`freeze`] with an explicit per-page protection map (§12.3): `prots[i]` is the protection of
-/// the window page at `[i*PAGE, (i+1)*PAGE)` and must cover every page. `Ro` pages are always
-/// stored (bytes + prot) so restore can re-establish them; `Unmapped` pages store no bytes;
-/// zero `Rw` pages are elided.
+/// the window page at `[i*PAGE, (i+1)*PAGE)` and must cover every page. A page stores its bytes
+/// when they are not all zero, and a zero `Rw` page is elided.
 ///
-/// `window` is the guest's **committed extent** (`mapped`) — the `vm_map`-grown high-water, so its
-/// length is page-aligned in `[1 << size_log2, 1 << reserved_log2]` and need **not** be a power of
-/// two (#1154). `reserved_log2` is the mask-domain reservation the window grew within; grown pages
-/// ride the image as `Rw` above `1 << size_log2` (the interp `snapshot_window`/`snapshot_prots`
-/// shape). A flat, non-grown window passes `reserved_log2 = window.len().trailing_zeros()` and
-/// reproduces the pre-#1154 bytes (only the container version differs).
+/// The **dense** form: `window` is the whole image, its length page-aligned in
+/// `[1 << size_log2, 1 << reserved_log2]` and **not** necessarily a power of two (#1154), so a page
+/// past the declared memory is one the window holds, `Rw`, `Ro` or `Unmapped` with its contents
+/// kept — the image of a flat window, which holds its whole buffer. A window that holds pages apart
+/// past its declared memory freezes as a [`MemLayout`] ([`freeze_layout`], #2427), which spends
+/// nothing on the span between them. `reserved_log2` is the mask-domain reservation the window grew
+/// within. A flat, non-grown window passes `reserved_log2 = window.len().trailing_zeros()`.
 pub fn freeze_with_prots(
     module: &Module,
     window: &[u8],
@@ -593,11 +646,26 @@ pub fn freeze_with_prots(
     reserved_log2: u8,
     host: &Host,
 ) -> Result<Vec<u8>, FreezeError> {
+    let image = Image {
+        bytes: window,
+        prots: prots.to_vec(),
+        tail: Vec::new(),
+    };
+    freeze_image(module, image, reserved_log2, host)
+}
+
+/// The depth-0 freeze of `image`: the cut is numbered from it, then [`freeze_at`].
+fn freeze_image(
+    module: &Module,
+    image: Image<'_>,
+    reserved_log2: u8,
+    host: &Host,
+) -> Result<Vec<u8>, FreezeError> {
     let cut = Cut {
         budgets: number_cut_budgets(host)?,
-        regions: number_cut_regions(host, prots)?,
+        regions: number_cut_regions(host, &image)?,
     };
-    freeze_at(module, window, prots, reserved_log2, host, 0, &cut)
+    freeze_at(module, image, reserved_log2, host, 0, &cut)
 }
 
 /// What a freeze numbers once for the whole cut, and every artifact in it names by number: the
@@ -608,12 +676,11 @@ struct Cut {
     regions: Vec<DurableRegion>,
 }
 
-/// [`freeze_with_prots`] at detached-nesting `depth` (0 for the artifact an embedder asked for), in
-/// the [`Cut`] the depth-0 freeze numbered.
+/// Freeze `image` at detached-nesting `depth` (0 for the artifact an embedder asked for), in the
+/// [`Cut`] the depth-0 freeze numbered.
 fn freeze_at(
     module: &Module,
-    window: &[u8],
-    prots: &[PageProt],
+    mut image: Image<'_>,
     reserved_log2: u8,
     host: &Host,
     depth: usize,
@@ -625,16 +692,25 @@ fn freeze_at(
             slot: p.slot,
         });
     }
-    // The committed extent is page-granular (a `vm_map` grows whole pages), covers the declared
-    // window, and fits the mask domain it grew within — restore's own rule ([`geometry_ok`]).
-    if !geometry_ok(module, window.len() as u64, reserved_log2) {
-        return Err(FreezeError::WindowGeometry(window.len()));
+    // The head is page-granular, covers the declared window, and fits the mask domain it grew
+    // within; each page held past it lies in that domain, apart, ascending — restore's own rule
+    // ([`geometry_ok`], [`tail_ok`]).
+    let len = image.bytes.len();
+    if !geometry_ok(module, len as u64, reserved_log2) {
+        return Err(FreezeError::WindowGeometry(len));
     }
-    let npages = window.len() / PAGE;
-    if prots.len() != npages {
+    let mut floor = len as u64;
+    for &(off, _, bytes) in &image.tail {
+        if !tail_ok(off, floor, reserved_log2) || bytes.is_some_and(|b| b.len() != PAGE) {
+            return Err(FreezeError::WindowGeometry(off as usize));
+        }
+        floor = off + PAGE as u64;
+    }
+    let npages = len / PAGE;
+    if image.prots.len() != npages {
         return Err(FreezeError::ProtCount {
             pages: npages,
-            prots: prots.len(),
+            prots: image.prots.len(),
         });
     }
     let handles = host
@@ -646,21 +722,6 @@ fn freeze_at(
     if let Some(h) = first_out_of_window(&handles, 1u64 << reserved_log2) {
         return Err(FreezeError::BindingOutOfWindow { slot: h.slot });
     }
-    // ... and on each nested child's handles against the child's own window, as restore reads them
-    // (#1700). A child's host state rides only beside its nested record, so that names the window.
-    for c in host.frozen_child_state() {
-        let Some(n) = host
-            .frozen_nested()
-            .iter()
-            .find(|n| n.parent_task == c.parent_task && n.slot == c.slot)
-        else {
-            continue;
-        };
-        let size = 1u64.checked_shl(n.size_log2 as u32).unwrap_or(0);
-        if let Some(h) = first_out_of_window(&c.handles, size) {
-            return Err(FreezeError::BindingOutOfWindow { slot: h.slot });
-        }
-    }
     // The freeze/thaw fiber residue (§12.4 / slice 3.1.5), canonical = ascending slot.
     let mut fibers = host.frozen_fibers().to_vec();
     fibers.sort_by_key(|f| f.slot);
@@ -669,30 +730,14 @@ fn freeze_at(
     // shared active-SP word holds only the last child's extent at freeze end).
     let mut vcpus = host.frozen_vcpus().to_vec();
     vcpus.sort_by_key(|v| v.task);
-    // The §14 nested-child residue (DURABILITY.md §4, v8). Each child's continuation is in its own
-    // carve inside the window image; this is the re-attach record. v12 carries each record's
-    // `parent_task` on the wire (see the encode below), so the format now represents nesting to
-    // **arbitrary depth** and the interp thaw reconstructs the subtree topologically from it. Canonical
-    // order is `(parent_task, slot)` — `slot` is only unique *within* a parent's namespace (the root's
-    // first child and that child's first grandchild are both `slot 0`), so the parent tag is the
-    // primary key. This matches the interp thaw's own sort (parents before children). For a depth-1
-    // artifact (every `parent_task == 0`) this reduces to ascending slot, as in v8–v11.
-    let mut nested = host.frozen_nested().to_vec();
-    nested.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
-    // #1361 step 2 — the completed detached-child residue, same canonical `(parent_task, slot)` order.
+    // #1361 step 2 — the completed detached-child residue, canonical `(parent_task, slot)` order:
+    // `slot` is only unique *within* a spawner's join table, so the spawner is the primary key.
     let mut detached = host.frozen_detached().to_vec();
     detached.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
-    // §13.4 slice 4c: per-child host state, merged into each nested record by (parent_task, slot).
-    let mut child_state = host.frozen_child_state().to_vec();
     let mut handles = handles;
-    let pipes = number_pipes(
-        &host.capture_durable_pipes(),
-        &mut handles,
-        &mut child_state,
-    )?;
-    number_budgets(&cut.budgets, &mut handles, &child_state)?;
-    let prots = number_regions(&cut.regions, host, &mut handles, &child_state, prots)?;
-    let prots = &prots[..];
+    let pipes = number_pipes(&host.capture_durable_pipes(), &mut handles)?;
+    number_budgets(&cut.budgets, &mut handles);
+    number_regions(&cut.regions, host, &mut handles, &mut image)?;
     let root_sp = host.frozen_root_sp().unwrap_or(
         module
             .memory
@@ -706,42 +751,39 @@ fn freeze_at(
     wire::write_header(&mut out, wire::KIND_SNAPSHOT, FORMAT_VERSION, 0);
 
     // Section 0 — Header (§12.2). `reserved_log2` is the caller's mask domain (v18: no longer derived
-    // from `window.len()`, so a grown committed extent < reservation is representable); `mapped` is the
-    // committed-extent window-image length.
+    // from the image's length, so a head < reservation is representable); `mapped` is the head's
+    // length (v46: the pages held past it are listed apart).
     section(&mut out, TAG_HEADER, |b| {
         b.extend_from_slice(&digest);
         b.push(reserved_log2);
-        write_uleb(b, window.len() as u64); // mapped (committed extent)
+        write_uleb(b, len as u64); // mapped (the head)
         write_uleb(b, PAGE as u64); // host page size at capture
         write_uleb(b, 1 + vcpus.len() as u64); // vcpu_count = root + spawned (§12.4 / slice 3.2.1)
         write_uleb(b, fibers.len() as u64); // fiber_count (§12.4)
     });
 
-    // Section 1 — Window image (§12.3): sparse + zero-eliding, ascending page index. A page is
-    // stored when it carries protection or content the restore can't infer: `Ro`/`Unmapped`
-    // always, `Rw` only when non-zero (an elided page restores as zero `Rw`).
+    // Section 1 — Window image (§12.3): sparse + zero-eliding, ascending page index. A head page is
+    // listed when it carries protection or content the restore can't infer — every page but a zero
+    // `Rw` one, which an unlisted page restores as — and each page held past the head is listed
+    // (#2427). A page's bytes follow its protection when they are not all zero.
     section(&mut out, TAG_WINDOW, |b| {
-        let entries: Vec<(usize, &[u8])> = window
+        let head = image
+            .bytes
             .chunks_exact(PAGE)
+            .zip(&image.prots)
             .enumerate()
-            .filter(|&(i, p)| match prots[i] {
-                PageProt::Rw => p.iter().any(|&x| x != 0),
-                PageProt::Ro | PageProt::Unmapped | PageProt::Backed { .. } => true,
-            })
-            .collect();
+            .map(|(i, (page, &prot))| ((i * PAGE) as u64, prot, Some(page)))
+            .filter(|&(_, prot, page)| prot != PageProt::Rw || page.is_some_and(nonzero));
+        let entries: Vec<_> = head.chain(image.tail.iter().copied()).collect();
         write_uleb(b, entries.len() as u64);
-        for (idx, page) in entries {
-            write_uleb(b, idx as u64);
-            match prots[idx] {
-                PageProt::Rw => {
-                    b.push(PROT_RW);
-                    b.extend_from_slice(page);
-                }
-                PageProt::Ro => {
-                    b.push(PROT_RO);
-                    b.extend_from_slice(page);
-                }
-                PageProt::Unmapped => b.push(PROT_UNMAPPED), // no bytes
+        for (off, prot, page) in entries {
+            write_uleb(b, off / PAGE as u64);
+            let bytes = page.filter(|p| nonzero(p) && !matches!(prot, PageProt::Backed { .. }));
+            let flag = if bytes.is_some() { PAGE_BYTES } else { 0 };
+            match prot {
+                PageProt::Rw => b.push(PROT_RW | flag),
+                PageProt::Ro => b.push(PROT_RO | flag),
+                PageProt::Unmapped => b.push(PROT_UNMAPPED | flag),
                 // #2025: no bytes — the region's ride Section 11.
                 PageProt::Backed {
                     region,
@@ -754,6 +796,9 @@ fn freeze_at(
                     b.push(writable as u8);
                 }
             }
+            if let Some(bytes) = bytes {
+                b.extend_from_slice(bytes);
+            }
         }
     });
 
@@ -762,7 +807,7 @@ fn freeze_at(
     // this records the small host-side residue needed to re-enter it on thaw. Emitted only when there
     // are fibers or spawned vCPUs. The vCPU residue is **appended** after the fiber residue and only
     // when present, so a fiber-only (or single-vCPU no-fiber) artifact is byte-identical to before.
-    if !fibers.is_empty() || !vcpus.is_empty() || !nested.is_empty() || !detached.is_empty() {
+    if !fibers.is_empty() || !vcpus.is_empty() || !detached.is_empty() {
         section(&mut out, TAG_CONTROL, |b| {
             write_uleb(b, fibers.len() as u64);
             for f in &fibers {
@@ -797,65 +842,10 @@ fn freeze_at(
                 }
                 write_uleb(b, root_sp); // the root vCPU's flattened extent (its implicit residue)
             }
-            // §4 subtree freeze (v8): the nested-child re-attach residue is **appended** after the
-            // fiber + vCPU residue and only when present, so fiber-/vCPU-only artifacts keep the
-            // pre-nesting Section-2 byte layout (only the container version differs).
-            // #1361 step 2: emitted when nested OR detached residue is present — a nested count
-            // (possibly 0) must precede the detached block so the decoder's positional read lines up.
-            if !nested.is_empty() || !detached.is_empty() {
-                write_uleb(b, nested.len() as u64);
-                for n in &nested {
-                    write_uleb(b, n.slot as u64);
-                    // v12: the task that instantiated this child (depth-2+ nesting). `0` for a direct
-                    // child of the root; a grandchild carries its parent-child's task. The interp thaw
-                    // groups the residue by this to re-attach parents before their children.
-                    write_uleb(b, n.parent_task as u64);
-                    write_uleb(b, n.task as u64); // v30 (#1687): the child's own task
-                    write_uleb(b, n.carve_off);
-                    write_uleb(b, n.size_log2 as u64);
-                    write_uleb(b, n.entry as u64);
-                    // v11: a separate-module child carries its module content digest (1 + 32 bytes)
-                    // so a thaw resolves it against the restore host's re-granted modules; a
-                    // same-module child writes 0 (runs the parent's own funcs).
-                    match n.module_digest {
-                        None => write_uleb(b, 0),
-                        Some(d) => {
-                            write_uleb(b, 1);
-                            b.extend_from_slice(&d);
-                        }
-                    }
-                    // v9/v31: a completed-but-unjoined child carries its join outcome; a still-running
-                    // child writes 0 (re-attached + rewound on thaw instead).
-                    write_join_outcome(b, n.completed_result);
-                    // v14 (§13.4 slice 4c): the child's host state — serve trio + durable
-                    // handle table — when its self-unwind recorded one; 0 for a plain child.
-                    let cs = child_state
-                        .iter()
-                        .find(|c| c.parent_task == n.parent_task && c.slot == n.slot);
-                    match cs {
-                        None => write_uleb(b, 0),
-                        Some(c) => {
-                            write_uleb(b, 1);
-                            write_serve_trio(b, &c.svc_queue, &c.svc_results, c.svc_next_ticket);
-                            write_handle_recs(b, &c.handles);
-                            // v19 (#1296): the child's §22 unit tables, when it holds a `Jit` cap —
-                            // the same `table_log2` + domains shape Section 5 uses. Elided (presence
-                            // byte 0) for a child with no JIT, so a plain child block grows by one byte.
-                            match c.jit_tables.is_empty() {
-                                true => write_uleb(b, 0),
-                                false => {
-                                    write_uleb(b, 1);
-                                    write_jit(b, c.jit_table_log2, &c.jit_tables);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // #1361 step 2 — the completed detached-child residue trails the nested block: each is
+            // #1361 step 2 — the completed detached-child residue trails the vCPU residue: each is
             // `(parent_task, slot, join-result)`. A detached child's separate window need not ride (it
-            // is completed), so unlike a nested record there is no carve/entry/digest — only the join
-            // edge and its result. Present iff bytes remain after the nested block on decode.
+            // is completed) — only the join edge and its result. Present iff non-empty (v44), so on
+            // decode it is exactly "bytes remain".
             if !detached.is_empty() {
                 write_uleb(b, detached.len() as u64);
                 for d in &detached {
@@ -977,7 +967,7 @@ fn freeze_at(
 /// captured detached descendant's, parents first in the canonical `(parent_task, slot)` order the
 /// artifacts nest in. A thawed tree re-freezes to the same numbers, because each domain's restore
 /// adopts the regions it names in number order (§12.6).
-fn number_cut_regions(host: &Host, prots: &[PageProt]) -> Result<Vec<DurableRegion>, FreezeError> {
+fn number_cut_regions(host: &Host, image: &Image<'_>) -> Result<Vec<DurableRegion>, FreezeError> {
     // The ids a domain names. A handle the codec cannot carry refuses the freeze anyway.
     fn named(h: &Host, prots: &[PageProt]) -> BTreeSet<u32> {
         let handles = h.capture_durable_handles().unwrap_or_default();
@@ -998,7 +988,8 @@ fn number_cut_regions(host: &Host, prots: &[PageProt]) -> Result<Vec<DurableRegi
         let mut order: Vec<&CapturedDetached> = h.captured_detached().iter().collect();
         order.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
         for c in order {
-            out.push((Arc::clone(&c.host), c.window.dense_prots()));
+            let prots = Image::of(&c.window).all_prots().collect();
+            out.push((Arc::clone(&c.host), prots));
             descendants(&c.host.lock().unwrap_or_else(|e| e.into_inner()), out);
         }
     }
@@ -1008,33 +999,21 @@ fn number_cut_regions(host: &Host, prots: &[PageProt]) -> Result<Vec<DurableRegi
         .iter()
         .map(|(h, p)| (h.lock().unwrap_or_else(|e| e.into_inner()), p))
         .collect();
-    let mut cut = vec![(host, named(host, prots))];
+    let prots: Vec<PageProt> = image.all_prots().collect();
+    let mut cut = vec![(host, named(host, &prots))];
     cut.extend(guards.iter().map(|(g, p)| (&**g, named(g, p))));
     capture_cut_regions(&cut).map_err(FreezeError::RegionNotCaptured)
 }
 
 /// #2025 — rewrite each region id this artifact's domain names, its handles' and its window pages',
-/// to the region's number in the cut ([`number_cut_regions`]); returns the renumbered page map. A
-/// nested (carve) child's host is not this one, so a region it holds is not one this artifact can
-/// name; carves retire with #1867, and until then such a child declines the freeze.
+/// to the region's number in the cut ([`number_cut_regions`]).
 fn number_regions(
     regions: &[DurableRegion],
     host: &Host,
     root: &mut [DurableHandle],
-    children: &[FrozenChildState],
-    prots: &[PageProt],
-) -> Result<Vec<PageProt>, FreezeError> {
+    image: &mut Image<'_>,
+) -> Result<(), FreezeError> {
     let refused = |region, why| FreezeError::RegionNotCaptured(RegionNotCaptured { region, why });
-    if let Some(region) = children
-        .iter()
-        .flat_map(|c| &c.handles)
-        .find_map(|h| match h.binding {
-            DurableBinding::SharedRegion { region } => Some(region),
-            _ => None,
-        })
-    {
-        return Err(refused(region, RegionRefusal::HolderOutsideCut));
-    }
     let number = |id: u32| {
         host.region_key(id)
             .and_then(|key| regions.iter().position(|r| r.key == key))
@@ -1046,21 +1025,13 @@ fn number_regions(
             *region = number(*region)?;
         }
     }
-    prots
-        .iter()
-        .map(|&p| match p {
-            PageProt::Backed {
-                region,
-                off,
-                writable,
-            } => Ok(PageProt::Backed {
-                region: number(region)?,
-                off,
-                writable,
-            }),
-            other => Ok(other),
-        })
-        .collect()
+    let tail = image.tail.iter_mut().map(|t| &mut t.1);
+    for p in image.prots.iter_mut().chain(tail) {
+        if let PageProt::Backed { region, .. } = p {
+            *region = number(*region)?;
+        }
+    }
+    Ok(())
 }
 
 /// #1944 — the budget nodes a freeze carries: every node the cut's domains name — the root's handles
@@ -1111,25 +1082,12 @@ fn number_cut_budgets(host: &Host) -> Result<CutBudgets, FreezeError> {
 }
 
 /// Rewrite each of this artifact's `Budget` bindings from its live node id to its number in the cut.
-/// A nested (carve) child's table holds no `Budget`: the freeze refuses one.
-fn number_budgets(
-    cut: &CutBudgets,
-    root: &mut [DurableHandle],
-    children: &[FrozenChildState],
-) -> Result<(), FreezeError> {
-    if let Some(h) = children
-        .iter()
-        .flat_map(|c| c.handles.iter())
-        .find(|h| matches!(h.binding, DurableBinding::Budget { .. }))
-    {
-        return Err(FreezeError::NestedBudget { slot: h.slot });
-    }
+fn number_budgets(cut: &CutBudgets, root: &mut [DurableHandle]) {
     for h in root.iter_mut() {
         if let DurableBinding::Budget { node } = &mut h.binding {
             *node = cut.numbers[node]; // the cut reaches every handle's node
         }
     }
-    Ok(())
 }
 
 /// A budget vector's six fields, in `read`'s order.
@@ -1204,22 +1162,16 @@ fn decode_budgets(body: Option<&[u8]>) -> Result<Vec<DurableBudget>, RestoreErro
 
 /// #1680 — number the pipes the cut's ends name, and check the cut holds every end of each.
 ///
-/// A pipe's number is the order its first end appears in: the root's table by slot, then each nested
-/// child's table in canonical record order (`(parent_task, slot)`, as Section 2 writes them). That
-/// order is structural, so a thawed tree re-freezes to the same numbers (§12.6). Each `PipeEnd`'s live
-/// id is rewritten to its number. A pipe whose live end counts exceed the ends the cut holds has an
-/// end outside it, and fails the freeze. Returns each pipe's bytes, by number.
+/// A pipe's number is the order its first end appears in the domain's table, by slot. That order is
+/// structural, so a thawed tree re-freezes to the same numbers (§12.6). Each `PipeEnd`'s live id is
+/// rewritten to its number. A pipe whose live end counts exceed the ends the cut holds has an end
+/// outside it, and fails the freeze. Returns each pipe's bytes, by number.
 fn number_pipes(
     live: &[DurablePipe],
-    root: &mut [DurableHandle],
-    children: &mut [FrozenChildState],
+    handles: &mut [DurableHandle],
 ) -> Result<Vec<Vec<u8>>, FreezeError> {
-    children.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
     let mut order: Vec<(u32, usize, usize)> = Vec::new(); // (live id, write ends, read ends)
-    let ends = root
-        .iter_mut()
-        .chain(children.iter_mut().flat_map(|c| c.handles.iter_mut()));
-    for h in ends {
+    for h in handles.iter_mut() {
         let DurableBinding::PipeEnd { pipe, write } = &mut h.binding else {
             continue;
         };
@@ -1290,31 +1242,23 @@ fn write_detached(
     for c in order {
         let art = {
             let h = c.host.lock().unwrap_or_else(|e| e.into_inner());
-            let prots = c.window.dense_prots();
-            freeze_at(
-                &c.module,
-                c.window.bytes(),
-                &prots,
-                c.reserved_log2,
-                &h,
-                depth + 1,
-                cut,
-            )?
+            let image = Image::of(&c.window);
+            freeze_at(&c.module, image, c.reserved_log2, &h, depth + 1, cut)?
         };
         let l = &c.launch;
         write_uleb(&mut b, c.parent_task as u64);
         write_uleb(&mut b, c.slot as u64);
         write_uleb(&mut b, l.task);
-        write_uleb(&mut b, l.entry as u64);
         b.extend_from_slice(&l.digest);
         write_uleb(&mut b, l.lane as u64);
-        b.push(l.same_module as u8);
         write_uleb(&mut b, l.names.len() as u64);
         for (name, h) in &l.names {
             write_uleb(&mut b, name.len() as u64);
             b.extend_from_slice(name.as_bytes());
             write_uleb(&mut b, *h as u32 as u64);
         }
+        // v47 (#2438): the spawner's pager export plus one, `0` for an unpaged child.
+        write_uleb(&mut b, l.pager.map_or(0, |e| u64::from(e) + 1));
         write_uleb(&mut b, art.len() as u64);
         b.extend_from_slice(&art);
     }
@@ -1472,35 +1416,28 @@ pub fn restore_layout(
     module: &Module,
     host: &mut Host,
 ) -> Result<(MemLayout, u8), RestoreError> {
-    restore_layout_at(artifact, module, host, 0, &mut ThawCut::default())
-}
-
-/// [`restore_layout`] at detached-nesting `depth`.
-fn restore_layout_at(
-    artifact: &[u8],
-    module: &Module,
-    host: &mut Host,
-    depth: usize,
-    cut: &mut ThawCut,
-) -> Result<(MemLayout, u8), RestoreError> {
-    let (bytes, prots, reserved_log2) = restore_at(artifact, module, host, depth, cut)?;
-    let mapped = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-    Ok((MemLayout::from_dense(bytes, &prots, mapped), reserved_log2))
+    restore_at(artifact, module, host, 0, &mut ThawCut::default())
 }
 
 /// [`restore`] that also recovers the per-page protection map (§12.3) and the mask-domain
 /// `reserved_log2`: `prots[i]` is the protection to re-establish on the window page at
-/// `[i*PAGE, (i+1)*PAGE)` (default `Rw` for an elided page). The returned `window` is the committed
-/// extent (`mapped`, page-aligned, possibly a grown high-water — #1154), and `reserved_log2` is the
-/// reservation the guest grew within, so a thaw rebuilds its `Mem` with the same mask domain (its
-/// future `vm_map` growth bound), not just the current extent. Re-applying `prots` to the runtime
-/// window is the escape-TCB restore step.
+/// `[i*PAGE, (i+1)*PAGE)` (default `Rw` for an elided page). The returned `window` is page-aligned
+/// and covers the declared memory, and `reserved_log2` is the reservation the guest grew within, so
+/// a thaw rebuilds its `Mem` with the same mask domain (its future `vm_map` growth bound), not just
+/// the current extent. Re-applying `prots` to the runtime window is the escape-TCB restore step.
+///
+/// The **dense** form ([`freeze_with_prots`], [`MemLayout::to_dense`]): the image runs through the
+/// last page the window holds, so a page between two it holds past the declared memory reads as an
+/// `Unmapped` zero one — the image a flat window, which holds its whole buffer, thaws from.
+/// [`restore_layout`] keeps the window as it was held (#2427).
 pub fn restore_with_prots(
     artifact: &[u8],
     module: &Module,
     host: &mut Host,
 ) -> Result<(Vec<u8>, Vec<PageProt>, u8), RestoreError> {
-    restore_at(artifact, module, host, 0, &mut ThawCut::default())
+    let (layout, reserved_log2) = restore_layout(artifact, module, host)?;
+    let (window, prots) = layout.to_dense();
+    Ok((window, prots, reserved_log2))
 }
 
 /// The cut as the depth-0 restore rebuilt it, for every artifact in it to name by number: each budget
@@ -1515,14 +1452,14 @@ struct ThawCut {
     regions_reached: Vec<bool>,
 }
 
-/// [`restore_with_prots`] at detached-nesting `depth` (0 for the artifact an embedder handed in).
+/// [`restore_layout`] at detached-nesting `depth` (0 for the artifact an embedder handed in).
 fn restore_at(
     artifact: &[u8],
     module: &Module,
     host: &mut Host,
     depth: usize,
     cut: &mut ThawCut,
-) -> Result<(Vec<u8>, Vec<PageProt>, u8), RestoreError> {
+) -> Result<(MemLayout, u8), RestoreError> {
     // The unified TEMEN wire header (WIRE.md): magic, then this codec's own kind/version/flags,
     // each fail-closed at the header before any section is read.
     let (hdr, payload) = wire::read_header(artifact).map_err(|e| match e {
@@ -1612,34 +1549,39 @@ fn restore_at(
     }
     let mut region_named = BTreeSet::new();
 
-    // ---- Window image: zeroed window (default `Rw`); splat each stored page + its prot. ----
+    // ---- Window image: the head zeroed (default `Rw`), each stored page + its prot splatted over it;
+    // past the head, each page the window holds (#2427). ----
     let mut window = vec![0u8; mapped];
     let mut prots = vec![PageProt::Rw; mapped / PAGE];
+    let mut tail: Vec<(u64, PageProt, Option<Vec<u8>>)> = Vec::new();
     let mut w = Reader::new(win_body);
     let n_pages = w.uleb()?;
-    let mut last: Option<u64> = None;
+    let mut floor = 0u64;
     for _ in 0..n_pages {
-        let idx = w.uleb()?;
-        if last.is_some_and(|p| idx <= p) {
-            return Err(RestoreError::Malformed); // non-canonical: pages must ascend
-        }
-        last = Some(idx);
-        let page = idx as usize;
-        let start = page
-            .checked_mul(PAGE)
-            .filter(|&s| s + PAGE <= mapped)
+        // Canonical: pages ascend, and lie inside the reservation.
+        let off = w
+            .uleb()?
+            .checked_mul(PAGE as u64)
             .ok_or(RestoreError::Malformed)?;
-        match w.u8()? {
-            PROT_RW => {
-                window[start..start + PAGE].copy_from_slice(w.take(PAGE)?);
-            }
-            PROT_RO => {
-                window[start..start + PAGE].copy_from_slice(w.take(PAGE)?);
-                prots[page] = PageProt::Ro;
-            }
-            PROT_UNMAPPED => prots[page] = PageProt::Unmapped, // no bytes; window stays zero
+        if !tail_ok(off, floor, reserved_log2) {
+            return Err(RestoreError::Malformed);
+        }
+        floor = off + PAGE as u64;
+        let kind = w.u8()?;
+        let bytes = match kind & PAGE_BYTES {
+            0 => None,
+            _ => Some(w.take(PAGE)?),
+        };
+        // Canonical: a page stores its bytes only when they are not all zero.
+        if bytes.is_some_and(|b| !nonzero(b)) {
+            return Err(RestoreError::Malformed);
+        }
+        let prot = match kind & !PAGE_BYTES {
+            PROT_RW => PageProt::Rw,
+            PROT_RO => PageProt::Ro,
+            PROT_UNMAPPED => PageProt::Unmapped,
             // #2025: the page aliases a carried region at a page-aligned offset inside it; no bytes.
-            PROT_BACKED => {
+            PROT_BACKED if bytes.is_none() => {
                 let region = u32::try_from(w.uleb()?).map_err(|_| RestoreError::Malformed)?;
                 let off = w.uleb()?;
                 let writable = match w.u8()? {
@@ -1658,13 +1600,26 @@ fn restore_at(
                     return Err(RestoreError::Malformed);
                 }
                 region_named.insert(region);
-                prots[page] = PageProt::Backed {
+                PageProt::Backed {
                     region,
                     off,
                     writable,
-                };
+                }
             }
             _ => return Err(RestoreError::Malformed),
+        };
+        let at = off as usize;
+        if at < mapped {
+            // Canonical: an unlisted head page is a zero `Rw` one, so none is listed.
+            if prot == PageProt::Rw && bytes.is_none() {
+                return Err(RestoreError::Malformed);
+            }
+            prots[at / PAGE] = prot;
+            if let Some(bytes) = bytes {
+                window[at..at + PAGE].copy_from_slice(bytes);
+            }
+        } else {
+            tail.push((off, prot, bytes.map(<[u8]>::to_vec)));
         }
     }
     if !w.at_end() {
@@ -1700,10 +1655,9 @@ fn restore_at(
         return Err(RestoreError::Malformed);
     }
 
-    // ---- Control state (§12.4): decode the frozen-fiber + spawned-vCPU residue. The section is
-    // present iff there are fibers or spawned vCPUs (canonical). Decoded before anything is granted,
-    // so the pipe check below sees every nested child's ends too. ----
-    let (fibers, vcpus, root_sp, nested, mut child_state, detached) = decode_control(
+    // ---- Control state (§12.4): decode the frozen-fiber, spawned-vCPU and completed detached-child
+    // residue. The section is present iff any of them is (canonical). ----
+    let (fibers, vcpus, root_sp, detached) = decode_control(
         control_body,
         fiber_count,
         spawned_count,
@@ -1713,15 +1667,11 @@ fn restore_at(
             .unwrap_or(ShadowArena::EMPTY)
             .region_base(0),
     )?;
-    // ---- Pipes inside the cut (#1680, v32): every end, the root's or a nested child's, must name a
-    // carried pipe, and every carried pipe must be named (canonical: a freeze carries only pipes with
-    // an end in the cut). ----
+    // ---- Pipes inside the cut (#1680, v32): every end must name a carried pipe, and every carried
+    // pipe must be named (canonical: a freeze carries only pipes with an end in the cut). ----
     // Each pipe's end counts are the ends the cut carries, so they are rebuilt here, not stored.
     let mut pipes = decode_pipes(pipes_body)?;
-    let ends = handles
-        .iter()
-        .chain(child_state.iter().flat_map(|c| c.handles.iter()));
-    for h in ends {
+    for h in &handles {
         if let DurableBinding::PipeEnd { pipe, write } = h.binding {
             let p = pipes
                 .get_mut(pipe as usize)
@@ -1737,16 +1687,9 @@ fn restore_at(
         return Err(RestoreError::Malformed);
     }
     // ---- Budget nodes (#1944, v37): the depth-0 artifact carries the whole cut's; a detached
-    // child's names them by number, and a nested (carve) child holds none (the freeze refuses one).
+    // child's names them by number.
     let mut budgets = decode_budgets(budgets_body)?;
     if depth > 0 && !budgets.is_empty() {
-        return Err(RestoreError::Malformed);
-    }
-    if child_state
-        .iter()
-        .flat_map(|c| c.handles.iter())
-        .any(|h| matches!(h.binding, DurableBinding::Budget { .. }))
-    {
         return Err(RestoreError::Malformed);
     }
     let named_budgets = handles
@@ -1825,17 +1768,13 @@ fn restore_at(
     let ids = host
         .restore_durable_pipes(&pipes)
         .map_err(|_| RestoreError::Malformed)?;
-    let ends = handles
-        .iter_mut()
-        .chain(child_state.iter_mut().flat_map(|c| c.handles.iter_mut()));
-    for h in ends {
+    for h in handles.iter_mut() {
         if let DurableBinding::PipeEnd { pipe, .. } = &mut h.binding {
             *pipe = ids[*pipe as usize];
         }
     }
-    // #2025: every region handle names a region of the cut; a nested child names none (the freeze
-    // refuses one). This domain holds each region it names under one new id, adopted in number order,
-    // and each number is rewritten to it.
+    // #2025: every region handle names a region of the cut. This domain holds each region it names
+    // under one new id, adopted in number order, and each number is rewritten to it.
     for h in &handles {
         if let DurableBinding::SharedRegion { region } = h.binding {
             if region as usize >= cut.regions.len() {
@@ -1843,13 +1782,6 @@ fn restore_at(
             }
             region_named.insert(region);
         }
-    }
-    if child_state
-        .iter()
-        .flat_map(|c| &c.handles)
-        .any(|h| matches!(h.binding, DurableBinding::SharedRegion { .. }))
-    {
-        return Err(RestoreError::Malformed);
     }
     let region_ids: BTreeMap<u32, u32> = region_named
         .into_iter()
@@ -1863,28 +1795,23 @@ fn restore_at(
             *region = region_ids[region];
         }
     }
-    for p in prots.iter_mut() {
+    for p in prots.iter_mut().chain(tail.iter_mut().map(|t| &mut t.1)) {
         if let PageProt::Backed { region, .. } = p {
             *region = region_ids[region];
         }
     }
     host.restore_durable_handles(&handles);
 
-    // ---- Control state (§12.4): seed the frozen-fiber + spawned-vCPU residue (decoded above) for
-    // the thaw, so the next (REWINDING) run re-creates the fibers and re-spawns the vCPUs. ----
+    // ---- Control state (§12.4): seed the residue (decoded above) for the thaw, so the next
+    // (REWINDING) run re-creates the fibers, re-spawns the vCPUs and delivers the completed
+    // detached children's results. ----
     host.set_frozen_fibers(fibers);
     if !vcpus.is_empty() {
         host.set_frozen_vcpus(vcpus);
         host.set_frozen_root_sp(root_sp);
     }
-    if !nested.is_empty() {
-        host.set_frozen_nested(nested);
-    }
     if !detached.is_empty() {
         host.set_frozen_detached(detached);
-    }
-    if !child_state.is_empty() {
-        host.set_frozen_child_state(child_state);
     }
 
     // ---- Serve state (§13.4 step 3, v13): decode the serve trio and the reply waits (v35, #1901)
@@ -1946,7 +1873,7 @@ fn restore_at(
     // handle table (and so the registrar's answers for it) is settled first; all-or-nothing — any
     // child failing fails this restore. ----
     if let Some(body) = detached_body {
-        let children = decode_detached(body, host, depth, cut)?;
+        let children = decode_detached(body, module, host, depth, cut)?;
         host.set_thawed_detached(children);
     }
     // #1944: every carried budget node is one some domain of the cut named, or an ancestor of one
@@ -1962,14 +1889,22 @@ fn restore_at(
         }
     }
 
-    Ok((window, prots, reserved_log2))
+    // The window: its head under the module's declared memory, then each page it holds past it.
+    let declared = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let mut layout = MemLayout::from_dense(window, &prots, declared);
+    for (off, prot, bytes) in tail {
+        layout.hold(off, prot, bytes);
+    }
+    Ok((layout, reserved_log2))
 }
 
 /// Decode Section 8 ([`write_detached`]) and restore each child's artifact into a fresh powerbox that
 /// holds the restoring host's thaw seams ([`Host::detached_thaw_host`]). A child whose module the
-/// restoring host no longer grants is `ModuleUnresolved`, the same answer as for a handle.
+/// restoring host no longer grants is `ModuleUnresolved`, the same answer as for a handle. `spawner`
+/// is the program whose Section 8 this is: a paged child's pager must be one of its pager exports.
 fn decode_detached(
     body: &[u8],
+    spawner: &Module,
     host: &mut Host,
     depth: usize,
     cut: &mut ThawCut,
@@ -1993,17 +1928,11 @@ fn decode_detached(
             return Err(RestoreError::Malformed); // canonical: strictly ascending `(parent_task, slot)`
         }
         let task = r.uleb()?;
-        let entry = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
         let digest: [u8; 32] = r
             .take(32)?
             .try_into()
             .expect("take(32) yields exactly 32 bytes");
         let lane = r.uleb()? as i64;
-        let same_module = match r.u8()? {
-            0 => false,
-            1 => true,
-            _ => return Err(RestoreError::Malformed),
-        };
         let n_names = r.uleb()? as usize;
         let mut names = Vec::with_capacity(n_names.min(64));
         for _ in 0..n_names {
@@ -2014,13 +1943,24 @@ fn decode_detached(
             let h = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)? as i32;
             names.push((name, h));
         }
+        // #2438 — op 17 admits only a `{ page: (i64) -> (i64) }` export of the spawner's program as a
+        // pager (`Module::is_pager_export`), so an artifact naming anything else is malformed.
+        let pager = match r.uleb()? {
+            0 => None,
+            e => Some(
+                u32::try_from(e - 1)
+                    .ok()
+                    .filter(|&e| spawner.is_pager_export(e))
+                    .ok_or(RestoreError::Malformed)?,
+            ),
+        };
         let art_len = r.uleb()? as usize;
         let art = r.take(art_len)?;
         let module = host
             .durable_module_by_digest(&digest)
             .ok_or(RestoreError::ModuleUnresolved(digest))?;
         let mut child = host.detached_thaw_host();
-        let restored = restore_layout_at(art, &module, &mut child, depth + 1, cut);
+        let restored = restore_at(art, &module, &mut child, depth + 1, cut);
         host.reclaim_thaw_seams(&mut child);
         let (window, reserved_log2) = restored?;
         out.push(ThawedDetached {
@@ -2031,11 +1971,10 @@ fn decode_detached(
             host: child,
             launch: DetachedLaunch {
                 task,
-                entry,
                 digest,
                 lane,
-                same_module,
                 names,
+                pager,
             },
         });
     }
@@ -2047,8 +1986,9 @@ fn decode_detached(
 
 /// Decode Section 2: the frozen-fiber residue (canonical ascending slot), then — appended only when
 /// `spawned_count > 0` (slice 3.2.1) — the spawned-vCPU residue (canonical ascending task) and the
-/// root's extent. Enforces the header's counts. A `None` body is valid only when both counts are zero
-/// (the section is elided then). Returns `(fibers, vcpus, root_sp, nested)`.
+/// root's extent, then — present iff bytes remain — the completed detached-child residue (canonical
+/// ascending `(parent_task, slot)`). Enforces the header's counts. A `None` body is valid only when
+/// both counts are zero (the section is elided then). Returns `(fibers, vcpus, root_sp, detached)`.
 #[allow(clippy::type_complexity)]
 fn decode_control(
     body: Option<&[u8]>,
@@ -2056,29 +1996,10 @@ fn decode_control(
     spawned_count: u64,
     // The root's empty extent when the artifact carries no residue: the module's arena base.
     root_default: u64,
-) -> Result<
-    (
-        Vec<FrozenFiber>,
-        Vec<FrozenVCpu>,
-        u64,
-        Vec<FrozenNested>,
-        Vec<FrozenChildState>,
-        Vec<FrozenDetached>,
-    ),
-    RestoreError,
-> {
+) -> Result<(Vec<FrozenFiber>, Vec<FrozenVCpu>, u64, Vec<FrozenDetached>), RestoreError> {
     let body = match (body, fiber_count, spawned_count) {
-        (None, 0, 0) => {
-            return Ok((
-                Vec::new(),
-                Vec::new(),
-                root_default,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ));
-            // no residue ⇒ no section
-        }
+        // no residue ⇒ no section
+        (None, 0, 0) => return Ok((Vec::new(), Vec::new(), root_default, Vec::new())),
         (None, _, _) => return Err(RestoreError::MissingSection(TAG_CONTROL)),
         (Some(b), _, _) => b,
     };
@@ -2155,108 +2076,14 @@ fn decode_control(
         }
         root_sp = cr.uleb()?;
     }
-    // §4 subtree freeze (v8): the optional nested-child residue trails the section; its presence is
-    // exactly "bytes remain" (canonical: absent when empty, ascending `(parent_task, slot)` — `slot`
-    // is only unique within a parent's namespace, so the parent tag is the primary key; v12).
-    let mut nested = Vec::new();
-    let mut child_state = Vec::new();
-    if !cr.at_end() {
-        let nn = cr.uleb()?;
-        let mut last: Option<(u64, u64)> = None; // (parent_task, slot)
-        for _ in 0..nn {
-            let slot = cr.uleb()?;
-            // v12: the task that instantiated this child (depth-2+ nesting); `0` for a direct child of
-            // the root. The interp thaw reconstructs the subtree topologically from it.
-            let parent_task_raw = cr.uleb()?;
-            let key = (parent_task_raw, slot);
-            if last.is_some_and(|p| key <= p) {
-                return Err(RestoreError::Malformed); // non-canonical: (parent_task, slot) must ascend
-            }
-            last = Some(key);
-            let parent_task =
-                usize::try_from(parent_task_raw).map_err(|_| RestoreError::Malformed)?;
-            // v30 (#1687): the child's own task, which its children's `parent_task` names.
-            let task = usize::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
-            let carve_off = cr.uleb()?;
-            let size_log2 = u8::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
-            let entry = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
-            // v11: separate-module child's module content digest.
-            let module_digest = match cr.uleb()? {
-                0 => None,
-                _ => Some(
-                    cr.take(32)?
-                        .try_into()
-                        .map_err(|_| RestoreError::Malformed)?,
-                ),
-            };
-            // v9/v31: completed-but-unjoined child's join outcome.
-            let completed_result = read_join_outcome(&mut cr)?;
-            // v14 (§13.4 slice 4c): the child's optional host state.
-            if cr.uleb()? != 0 {
-                let (svc_queue, svc_results, svc_next_ticket) = read_serve_trio(&mut cr)?;
-                let nh = cr.uleb()?;
-                let mut handles = Vec::with_capacity(nh as usize);
-                for _ in 0..nh {
-                    let hslot = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
-                    let generation =
-                        u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
-                    let type_id = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
-                    let binding = read_binding(&mut cr)?;
-                    // The child-window containment gate, mirroring the root handle table's
-                    // `binding_in_window`: a child's AddressSpace/Instantiator base/size are
-                    // carve-relative and must stay inside its own window.
-                    if !binding_in_window(&binding, 1u64 << size_log2) {
-                        return Err(RestoreError::BindingOutOfWindow);
-                    }
-                    handles.push(DurableHandle {
-                        slot: hslot,
-                        generation,
-                        type_id,
-                        binding,
-                    });
-                }
-                // v19 (#1296): the child's optional §22 unit tables (presence byte, then the
-                // Section-5 body shape). Canonical: presence 1 ⇒ a non-empty set (an empty one elides).
-                let (jit_tables, jit_table_log2) = if cr.uleb()? != 0 {
-                    let (tl, ds) = read_jit_body(&mut cr)?;
-                    if ds.is_empty() {
-                        return Err(RestoreError::Malformed);
-                    }
-                    (ds, tl)
-                } else {
-                    (Vec::new(), 0)
-                };
-                child_state.push(FrozenChildState {
-                    parent_task,
-                    slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
-                    svc_queue,
-                    svc_results,
-                    svc_next_ticket,
-                    handles,
-                    jit_tables,
-                    jit_table_log2,
-                });
-            }
-            nested.push(FrozenNested {
-                // v12: carried on the wire (above), so a restored subtree reconstructs to arbitrary
-                // depth — a grandchild's `parent_task` is its parent-child's task, not `0`.
-                parent_task,
-                task,
-                slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
-                carve_off,
-                size_log2,
-                entry,
-                module_digest,
-                completed_result,
-            });
-        }
-    }
-    // #1361 step 2 — the detached residue trails the nested block, present iff bytes remain after it.
-    // A nested count (possibly 0) always precedes it (see the encoder), so reaching here means the
-    // nested block was consumed and any remaining bytes are the detached block.
+    // #1361 step 2 — the completed detached-child residue trails the section, present iff bytes
+    // remain; canonical: absent when empty (v44).
     let mut detached = Vec::new();
     if !cr.at_end() {
         let nd = cr.uleb()?;
+        if nd == 0 {
+            return Err(RestoreError::Malformed);
+        }
         let mut last: Option<(u64, u64)> = None; // (parent_task, slot)
         for _ in 0..nd {
             let parent_task_raw = cr.uleb()?;
@@ -2278,7 +2105,7 @@ fn decode_control(
     if !cr.at_end() {
         return Err(RestoreError::Malformed);
     }
-    Ok((fibers, vcpus, root_sp, nested, child_state, detached))
+    Ok((fibers, vcpus, root_sp, detached))
 }
 
 /// Decode Section 5: the `table_log2` header and the durable guest-JIT domains (v17). A `None` body
@@ -2481,19 +2308,8 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
             write_uleb(b, base);
             write_uleb(b, size);
         }
-        DurableBinding::Instantiator { base, size } => {
-            b.push(B_INSTANTIATOR);
-            write_uleb(b, base);
-            write_uleb(b, size);
-        }
-        DurableBinding::FreezeAuthority(FreezeScope::Carve { base, size }) => {
-            b.push(B_FREEZE_AUTHORITY);
-            write_uleb(b, base);
-            write_uleb(b, size);
-        }
-        DurableBinding::FreezeAuthority(FreezeScope::DetachedProgeny) => {
-            b.push(B_FREEZE_DETACHED);
-        }
+        DurableBinding::Instantiator => b.push(B_INSTANTIATOR),
+        DurableBinding::FreezeAuthority => b.push(B_FREEZE_DETACHED),
         DurableBinding::LiveImpl { slot, export } => {
             b.push(B_LIVE_IMPL);
             write_uleb(b, slot as u64);
@@ -2552,15 +2368,9 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
             base: r.uleb()?,
             size: r.uleb()?,
         },
-        B_FREEZE_AUTHORITY => DurableBinding::FreezeAuthority(FreezeScope::Carve {
-            base: r.uleb()?,
-            size: r.uleb()?,
-        }),
-        B_FREEZE_DETACHED => DurableBinding::FreezeAuthority(FreezeScope::DetachedProgeny),
-        B_INSTANTIATOR => DurableBinding::Instantiator {
-            base: r.uleb()?,
-            size: r.uleb()?,
-        },
+        // B_FREEZE_AUTHORITY (12): the carve range, retired with the carve (#1867) — fails closed.
+        B_FREEZE_DETACHED => DurableBinding::FreezeAuthority,
+        B_INSTANTIATOR => DurableBinding::Instantiator,
         B_LIVE_IMPL => DurableBinding::LiveImpl {
             slot: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
             export: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
@@ -2676,11 +2486,9 @@ mod binding_window_tests {
     #[test]
     fn rejects_only_out_of_window_or_malformed_address_bindings() {
         let mapped = 1u64 << 18; // 256 KiB window
-        let ok = |base, size| {
-            binding_in_window(&DurableBinding::Instantiator { base, size }, mapped)
-                && binding_in_window(&DurableBinding::AddressSpace { base, size }, mapped)
-        };
-        // Legitimate sub-ranges: the whole window, an aligned interior carve, the top slot.
+        let ok =
+            |base, size| binding_in_window(&DurableBinding::AddressSpace { base, size }, mapped);
+        // Legitimate sub-ranges: the whole window, an aligned interior range, the top slot.
         assert!(ok(0, mapped));
         assert!(ok(1 << 12, 1 << 12));
         assert!(ok(mapped - (1 << 12), 1 << 12));
@@ -2710,13 +2518,7 @@ mod binding_window_tests {
             },
             mapped
         ));
-        assert!(!binding_in_window(
-            &DurableBinding::Instantiator {
-                base: 0,
-                size: u64::MAX
-            },
-            mapped
-        ));
+        assert!(binding_in_window(&DurableBinding::Instantiator, mapped));
     }
 }
 
@@ -2742,33 +2544,24 @@ mod pipe_numbering_tests {
         }
     }
 
-    /// #1680: pipes are numbered by first appearance (root by slot, then children in record order),
-    /// not by their process-global ids, so a thawed tree re-freezes to the same numbers.
+    /// #1680: pipes are numbered by first appearance (by slot), not by their process-global ids, so
+    /// a thawed tree re-freezes to the same numbers.
     #[test]
     fn pipes_are_numbered_by_first_appearance() {
-        let mut root = vec![end(1, 90, false), end(2, 40, true)];
-        let mut children = vec![FrozenChildState {
-            parent_task: 0,
-            slot: 0,
-            svc_queue: Vec::new(),
-            svc_results: Vec::new(),
-            svc_next_ticket: 0,
-            handles: vec![end(0, 90, true), end(1, 40, false)],
-            jit_tables: Vec::new(),
-            jit_table_log2: 0,
-        }];
-        let bytes = number_pipes(&[live(40, 1, 1), live(90, 1, 1)], &mut root, &mut children)
+        let mut handles = vec![
+            end(1, 90, false),
+            end(2, 40, true),
+            end(3, 90, true),
+            end(4, 40, false),
+        ];
+        let bytes = number_pipes(&[live(40, 1, 1), live(90, 1, 1)], &mut handles)
             .expect("every end is inside the cut");
         assert_eq!(
             bytes,
             vec![vec![90], vec![40]],
             "numbered in appearance order"
         );
-        let pipes: Vec<_> = root
-            .iter()
-            .chain(&children[0].handles)
-            .map(|h| h.binding)
-            .collect();
+        let pipes: Vec<_> = handles.iter().map(|h| h.binding).collect();
         assert_eq!(
             pipes,
             vec![
@@ -2799,8 +2592,146 @@ mod pipe_numbering_tests {
     fn a_pipe_with_an_end_outside_the_cut_refuses() {
         let mut root = vec![end(1, 7, false), end(2, 7, true)];
         assert_eq!(
-            number_pipes(&[live(7, 2, 1)], &mut root, &mut []),
+            number_pipes(&[live(7, 2, 1)], &mut root),
             Err(FreezeError::PipeCrossesCut)
+        );
+    }
+}
+
+#[cfg(test)]
+mod window_section_tests {
+    //! #2427 — Section 1 (v46) carries a window's head, dense, and each page it holds past the head,
+    //! apart. An artifact has one encoding, so a restore refuses every other.
+    use super::*;
+
+    const RESERVED_LOG2: u8 = 20;
+    const WINDOW: u64 = 1 << 17;
+
+    fn module() -> Module {
+        let src =
+            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 7\n  return v1\n  }\n}\n";
+        let mut m = temen_text::parse_module(src).expect("parse");
+        m.memory = Some(temen_ir::Memory {
+            size_log2: 17,
+            shadow: None,
+        });
+        m
+    }
+
+    /// A page of zeros but for one byte.
+    fn marked() -> Vec<u8> {
+        let mut page = vec![0u8; PAGE];
+        page[7] = 0x5a;
+        page
+    }
+
+    /// A window that holds, past its 128 KiB head, a marked page, a zero one, and one protected to
+    /// nothing with its contents kept, far apart.
+    fn layout() -> MemLayout {
+        let at = |page: u64| WINDOW + page * PAGE as u64;
+        let mut l = MemLayout::from_dense(vec![0; WINDOW as usize], &[PageProt::Rw; 32], WINDOW);
+        l.hold(at(10), PageProt::Rw, Some(marked()));
+        l.hold(at(40), PageProt::Rw, None);
+        l.hold(at(200), PageProt::Unmapped, Some(marked()));
+        l
+    }
+
+    #[test]
+    fn a_sparse_window_round_trips_as_itself() {
+        let (m, l) = (module(), layout());
+        let art = freeze_layout(&m, &l, RESERVED_LOG2, &Host::new()).expect("freeze");
+        assert!(
+            art.len() < 3 * PAGE,
+            "{} bytes: the head is zero, two pages hold bytes",
+            art.len()
+        );
+        let (back, reserved) = restore_layout(&art, &m, &mut Host::new()).expect("restore");
+        assert_eq!(reserved, RESERVED_LOG2);
+        assert_eq!(back.bytes(), l.bytes());
+        assert_eq!(back.tail_pages(), l.tail_pages());
+        let held = 3 * temen_interp::host_page_size();
+        assert_eq!(back.page_map().grown_bytes(), held, "the gaps stay absent");
+        let again = freeze_layout(&m, &back, RESERVED_LOG2, &Host::new()).expect("re-freeze");
+        assert_eq!(again, art, "restore → re-serialize reproduces the artifact");
+    }
+
+    /// `art` with its Section 1 body replaced by `body`.
+    fn with_window(art: &[u8], body: &[u8]) -> Vec<u8> {
+        let (_, payload) = wire::read_header(art).expect("header");
+        let mut out = art[..art.len() - payload.len()].to_vec();
+        let mut r = Reader::new(payload);
+        while !r.at_end() {
+            let tag = r.uleb().expect("tag");
+            let len = r.uleb().expect("len") as usize;
+            let section = r.take(len).expect("body");
+            let section = if tag == TAG_WINDOW { body } else { section };
+            write_uleb(&mut out, tag);
+            write_uleb(&mut out, section.len() as u64);
+            out.extend_from_slice(section);
+        }
+        out
+    }
+
+    /// A Section 1 body of `entries`: each page's index, protection byte, and the bytes that follow.
+    fn window(entries: &[(u64, u8, Option<&[u8]>)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        write_uleb(&mut b, entries.len() as u64);
+        for &(idx, kind, bytes) in entries {
+            write_uleb(&mut b, idx);
+            b.push(kind);
+            b.extend_from_slice(bytes.unwrap_or(&[]));
+        }
+        b
+    }
+
+    #[test]
+    fn a_restore_refuses_every_other_encoding() {
+        let m = module();
+        let art = freeze_layout(&m, &layout(), RESERVED_LOG2, &Host::new()).expect("freeze");
+        let (zero, one) = (vec![0u8; PAGE], marked());
+        let (zero, one) = (Some(&zero[..]), Some(&one[..]));
+        let head = WINDOW / PAGE as u64;
+        let past = 1u64 << (RESERVED_LOG2 - 12);
+        let restored =
+            |body: Vec<u8>| restore_layout(&with_window(&art, &body), &m, &mut Host::new());
+        let cases = [
+            (
+                "zero bytes stored",
+                window(&[(head, PROT_RW | PAGE_BYTES, zero)]),
+            ),
+            ("a zero Rw head page listed", window(&[(1, PROT_RW, None)])),
+            (
+                "pages out of order",
+                window(&[(head + 2, PROT_RW, None), (head + 1, PROT_RW, None)]),
+            ),
+            (
+                "a page listed twice",
+                window(&[(head + 1, PROT_RW, None), (head + 1, PROT_RW, None)]),
+            ),
+            (
+                "a page past the reservation",
+                window(&[(past, PROT_RW, None)]),
+            ),
+            (
+                "a region page with bytes",
+                window(&[(head, PROT_BACKED | PAGE_BYTES, one)]),
+            ),
+            ("an unknown protection", window(&[(head, 4, None)])),
+        ];
+        for (what, body) in cases {
+            assert_eq!(
+                restored(body).err(),
+                Some(RestoreError::Malformed),
+                "{what}"
+            );
+        }
+        let held = restored(window(&[
+            (head, PROT_RW | PAGE_BYTES, one),
+            (past - 1, PROT_RO, None),
+        ]));
+        assert!(
+            held.is_ok(),
+            "the control: pages held past the head, at its end and the top"
         );
     }
 }

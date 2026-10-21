@@ -29,7 +29,7 @@ fn durable_handles_round_trip_through_capture_restore() {
     a.grant_memory();
     a.grant_exit();
     a.grant_address_space(0x2000, 0x1000);
-    a.grant_instantiator(0x0, 0x4000);
+    a.grant_instantiator();
 
     let captured = a
         .capture_durable_handles()
@@ -369,7 +369,10 @@ fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
     }
     fn factory() -> temen_interp::HostProcFork {
         std::sync::Arc::new(|_pid| {
-            temen_interp::ForkedProc::shared(answer(), temen_interp::CapState::Stateless)
+            Some(temen_interp::ForkedProc::shared(
+                answer(),
+                temen_interp::CapState::Stateless,
+            ))
         })
     }
     let mut a = Host::new();
@@ -395,7 +398,7 @@ fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
             bytes: 1 << 16,
             runs: WINDOW_RUNS,
         };
-        let child = b.spawn_detached_child(&[("display".into(), h)], 1 << 16, lease, -1);
+        let child = b.spawn_detached_child(&[("display".into(), h)], 1 << 16, lease, -1, false);
         assert_eq!(
             child.is_some(),
             forkable,
@@ -539,6 +542,9 @@ fn a_budget_node_round_trips_with_its_ceilings_charge_and_parent() {
 
     let mut t = Host::new();
     t.grant_clock();
+    // An unbounded run, so a read reports the restored nodes alone: a guest sees the run's own
+    // node's `channel` too (#2337).
+    t.set_grant(-1, -1, -1, -1);
     restore_budgets(&mut t, &nodes, &captured);
     assert_eq!(read(&mut t, root, 1), (1 << 20) - 4096, "the root's room");
     assert_eq!(read(&mut t, b, 1), (1 << 19) - 4096, "b's room");

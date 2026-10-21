@@ -1,5 +1,5 @@
-//! **Child-domain executor** (DESIGN.md §23, D66) — every non-durable §14 child (the carve children
-//! of Instantiator ops 0/5/8/11/13 and the detached children of op 15) runs as a **task on a bounded
+//! **Child-domain executor** (DESIGN.md §23, D66) — every non-durable §14 child (a detached child of
+//! Instantiator op 17) runs as a **task on a bounded
 //! pool of platform workers**, not one OS thread each. A task is a platform-owned fiber ([`FiberSlot::platform`]) carrying the child's own window,
 //! trap cell and fiber execution context; any worker may resume it (migration under the same
 //! single-owner claim guest fibers use), and a task that parks — a futex `wait` inside the child —
@@ -59,10 +59,6 @@ const RECHECK: Duration = Duration::from_millis(20);
 type LimitedEntry =
     extern "C" fn(*const i64, *mut i64, *mut u8, *const core::ffi::c_void, *mut i64, u64);
 
-/// A **carve** child's copy-back: the parent is the superset, so the child's window image is
-/// written back into its carve at finish. `None` for a detached child (its window is its own).
-pub(crate) type CopyBack = Box<dyn FnOnce(&[u8]) + Send>;
-
 /// A task's one-shot teardown: release the child powerbox, return its lane and its window's bytes.
 /// Its argument says whether a freeze captured the child (#1971): a child that unwound for a freeze
 /// is carried by the artifact, not ended, so its window stays charged, as on the interpreter.
@@ -84,9 +80,7 @@ pub(crate) struct ChildTask {
     /// The child's own fiber execution context — published as `CURRENT_RT` for each resume so the
     /// futex thunk's "inside a fiber ⇒ park the fiber" arm sees this task.
     rt: Box<FiberRuntime>,
-    /// The child's window — its own for a detached child, a private image of the parent's carve
-    /// for a carve child (seeded by `init`, written back by `copy_back`). Moves with the task
-    /// (`GuestWindow: Send`).
+    /// The child's own window (seeded by `init`). Moves with the task (`GuestWindow: Send`).
     window: mem::GuestWindow,
     fault: (usize, usize),
     /// The task's own instance context — the child's powerbox, the parent's kill-path cell, its own
@@ -108,10 +102,6 @@ pub(crate) struct ChildTask {
     /// on whichever worker picks it up ([`vcpu_tls::serve_handlers`]).
     serve_handlers: u32,
     done: Arc<ChildDone>,
-    /// A **carve** child's copy-back: runs once at finish over the task's window image, before
-    /// `teardown` — the parent (superset) then sees the child's writes. `None` for a detached child
-    /// (its window is its own; nothing to copy anywhere).
-    copy_back: Option<CopyBack>,
     /// Runs exactly once, after the last resume, while the window is still alive: releases the
     /// child powerbox and returns the child's lane to the parent.
     teardown: Option<Teardown>,
@@ -140,9 +130,11 @@ unsafe impl Send for ChildTask {}
 
 impl ChildTask {
     /// Build a task around a compiled detached child. `init` seeds the fresh window (data segments,
-    /// payload) and may protect its pages (a detached child's readonly segments); `premap` aliases the op-15 pre-mapped region onto it (`false` ⇒ the child never
-    /// runs: a `CapFault` outcome, as on the OS-thread path it replaces). `Err` hands `teardown` back
-    /// when the child never runs: its window or its pre-map refused.
+    /// payload) and may protect its pages (a detached child's readonly segments, a thawed one's page
+    /// map), `false` when the OS refuses one; `premap` aliases the spawn's pre-mapped region onto it
+    /// (`false` ⇒ the child never runs: a `CapFault` outcome, as on the OS-thread path it replaces).
+    /// `Err` hands `teardown` back when the child never runs: its window, its seeding or its pre-map
+    /// refused.
     ///
     /// # Safety
     /// `code` was compiled by `compile_child_windowed` for exactly `(mapped_log2, reserved_log2)`
@@ -152,34 +144,31 @@ impl ChildTask {
         code: Arc<CompiledModule>,
         mapped_log2: u8,
         reserved_log2: u8,
-        init: impl FnOnce(&mut mem::GuestWindow),
+        init: impl FnOnce(&mut mem::GuestWindow) -> bool,
         premap: impl FnOnce(*mut u8, u64, u64) -> bool,
         args: Vec<i64>,
         n_results: usize,
         chain: Vec<(usize, i64)>,
         done: Arc<ChildDone>,
-        copy_back: Option<CopyBack>,
         teardown: Teardown,
         node: Option<Arc<dyn crate::BudgetNode>>,
     ) -> Result<ChildTask, Teardown> {
-        // #2305 — a window the address space has no room for refuses the child as a refused pre-map
-        // does: it never runs, and its spawn answers what a refused filing answers.
+        // #2305/#2286 — a window the OS will not give refuses the child as a refused pre-map does:
+        // no room for its reservation, or a commit or protection its seeding needs. It never runs,
+        // and its spawn answers what a refused filing answers.
         let Some(mut window) =
             mem::GuestWindow::try_new(1usize << mapped_log2, 1usize << reserved_log2)
         else {
             return Err(teardown);
         };
         let base = window.base();
-        init(&mut window);
         // #964/#1733: every child window reserves its own `[0, guard)`, as the interpreter's windows
-        // do — last, after the host's seeding above; a window smaller than the guard skips, as the
+        // do — last, after the host's seeding; a window smaller than the guard skips, as the
         // interpreter's `seed_null_guard` does. `finish` re-asserts RW before the host reads it back.
         let guard = temen_ir::module_null_guard();
-        if guard <= 1u64 << mapped_log2 {
-            window.seed_null_guard(0, guard);
-        }
-        if !premap(base, 1u64 << mapped_log2, 1u64 << reserved_log2) {
-            window.restore_rw();
+        let seeded =
+            init(&mut window) && (guard > 1u64 << mapped_log2 || window.seed_null_guard(guard));
+        if !seeded || !premap(base, 1u64 << mapped_log2, 1u64 << reserved_log2) {
             return Err(teardown);
         }
         let fault = window.fault_range();
@@ -229,7 +218,6 @@ impl ChildTask {
             tramp(a.0, r.0, b.0, t.0, c.0, stack_low);
         });
         let Some(fiber) = fiber else {
-            window.restore_rw();
             return Err(teardown);
         };
         // The child root's frames live on the task stack: its top is the high bound of the
@@ -251,7 +239,6 @@ impl ChildTask {
             tls: 0,
             serve_handlers: 0,
             done,
-            copy_back,
             teardown: Some(teardown),
             dom: None,
             node,
@@ -314,6 +301,71 @@ impl ChildTask {
             && unsafe { fiber_rt::window_is_unwinding(base) }
             && unsafe { fiber_rt::read_shadow_sp(base, d.shadow.region_base(0)) }
                 > d.shadow.frame_base(0)
+    }
+
+    /// Open the window for the host's read of it: the guest may have closed pages through the Memory
+    /// capability (`GuestWindow::restore_rw`). #2286 — when the OS refuses, the process cannot hold
+    /// the child's window, so the child ends refused ([`Self::end_refused`]) and nothing reads the
+    /// window: a capture needs a child that did not trap, and [`Self::root_unwound`] reads the trap
+    /// first.
+    fn open_for_host(&mut self) {
+        if !self.window.restore_rw() {
+            self.end_refused();
+        }
+    }
+
+    /// The child ends with `ThreadFault`, unless it trapped already: the host could not read its
+    /// window (#2286, #2318).
+    fn end_refused(&self) {
+        let fault = TrapKind::ThreadFault as i64;
+        let _ = (self.vm.trap).compare_exchange(0, fault, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    /// #1361 step 4 — what a durable child whose root unwound for a freeze leaves for its parent's
+    /// artifact: its window, with the `fibers` its root flattened and what its vCPUs left. `None`
+    /// when the OS will not commit its grown tail for the read (#2318).
+    fn capture(
+        &mut self,
+        d: &crate::instantiator_rt::DurableCell,
+        mut fibers: Vec<crate::FrozenFiber>,
+    ) -> Option<crate::DetachedCapture> {
+        // #1854, #2427 — its declared window and each page it holds past that, as the root's capture
+        // reads its own, so a page it grew through the Memory capability rides the artifact.
+        let image = self.window.rw_mut().to_vec();
+        let tail = match d.held_tail {
+            // SAFETY: the hook reads the child's own powerbox, alive until `teardown`.
+            Some((f, ctx)) => self.window.read_pages(&unsafe {
+                f(
+                    ctx as *mut core::ffi::c_void,
+                    self.window.base() as usize,
+                    image.len() as u64,
+                )
+            })?,
+            None => Vec::new(),
+        };
+        // #2010 — with what its vCPUs left as they ended: the ones that unwound, the ones that
+        // finished unjoined, and the fibers they flattened.
+        let mut vcpus = Vec::new();
+        if let Some(dom) = &self.dom {
+            vcpus = dom.take_frozen_vcpus();
+            vcpus.extend(dom.take_completed_children_residue());
+            fibers.extend(dom.take_frozen_fibers());
+        }
+        // #1684 — and every slot nobody flattened, so a thaw rebuilds the table slot for slot.
+        let flattened: Vec<usize> = fibers.iter().map(|f| f.slot).collect();
+        fibers.extend(self.rt.table().unflattened_for_freeze(&flattened));
+        // SAFETY: as `root_unwound`, which read the same word.
+        let root_sp =
+            unsafe { fiber_rt::read_shadow_sp(self.window.base() as u64, d.shadow.region_base(0)) };
+        Some(crate::DetachedCapture {
+            image,
+            tail,
+            residue: crate::DurableResidue {
+                fibers,
+                vcpus,
+                root_sp: Some(root_sp),
+            },
+        })
     }
 }
 
@@ -467,7 +519,7 @@ impl ChildExec {
                     .store(TrapKind::FiberFault as i64, Ordering::Relaxed);
             }
         }
-        if task._code.thread.spawn_thunk != 0 || durable {
+        if task._code.spawns || durable {
             if let Some(hub) = self.domain() {
                 let d = Arc::new(Domain::new_child(hub, task.chain.clone(), task.node.take()));
                 d.set_env(
@@ -763,9 +815,12 @@ impl ChildExec {
                 Outcome::Retiring if !task.threads_live() => Outcome::Finished,
                 o => o,
             };
-            // #1820 — a join counts itself through its completion cell, so it is not counted here.
-            let self_counted =
-                matches!(outcome, Outcome::Parked { .. }) && task.slot.parked_on().counts_itself();
+            // #1820 — a join counts itself through its completion cell, so it is not counted here;
+            // #2424 — nor is a wait on an answer from outside the run, which is not blocked.
+            let uncounted = matches!(outcome, Outcome::Parked { .. }) && {
+                let on = task.slot.parked_on();
+                on.counts_itself() || matches!(on, fiber_rt::ParkOn::Outside)
+            };
             let mut task = Some(task);
             let mut g = lock(&self.state);
             match outcome {
@@ -800,7 +855,7 @@ impl ChildExec {
                         // #1631 — a park that wakes on its own deadline is a potential notifier, so
                         // it stays out of the deadlock predicate's count. It is still `parked` for
                         // the cadence sweep, which is what fires that deadline.
-                        if deadline.is_none() && !self_counted {
+                        if deadline.is_none() && !uncounted {
                             e.counted = true;
                             if let Some(d) = self.domain() {
                                 d.task_parked();
@@ -945,13 +1000,17 @@ impl ChildExec {
         if let Some(d) = &task.dom {
             d.join_all(false);
         }
+        // The host reads a durable child's window, for its state and its capture.
+        if task.done.durable.is_some() {
+            task.open_for_host();
+        }
         let unwound = task.root_unwound();
-        task.window.restore_rw();
         // #1361 step 4 — a durable child that unwound for a freeze leaves its window image for the
         // harvest (the parent's artifact carries it). Retire the base under the cell's lock first, so
         // no doorbell store can land on a window about to be freed.
+        let done = Arc::clone(&task.done);
         let mut captured = false;
-        if let Some(d) = task.done.durable.as_ref() {
+        if let Some(d) = done.durable.as_ref() {
             *d.base.lock().unwrap_or_else(|e| e.into_inner()) = 0;
             if unwound {
                 // #2031 — first flatten the root's parked fibers into their own regions, as a run's
@@ -960,7 +1019,7 @@ impl ChildExec {
                 // SAFETY: the root has unwound and every vCPU has ended, so the table is at rest;
                 // the runtime is armed over the live window, and the register names this window's
                 // context-0 region while the fibers run, as in a residency.
-                let mut fibers = unsafe {
+                let fibers = unsafe {
                     let prev = crate::durable_shadow::get();
                     crate::durable_shadow::seed(d.shadow.region_base(0));
                     let rt = &mut *task.rt as *mut FiberRuntime;
@@ -971,62 +1030,28 @@ impl ChildExec {
                 // A fiber that traps as it flattens is the child's trap, as a run's root's is: its
                 // outcome, not a capture.
                 if task.vm.trap.load(Ordering::Relaxed) == 0 {
-                    // #1854 — up to the child's high-water, as the root's capture reaches its own,
-                    // so a page it grew through the Memory capability rides the artifact.
-                    let mapped = task.window.rw_mut().len();
-                    let reserved = 1usize << d.reserved_log2;
-                    // SAFETY: the hook reads the child's own powerbox, alive until `teardown`.
-                    let high = d.high_water.map_or(0, |(f, ctx)| unsafe {
-                        f(ctx as *mut core::ffi::c_void, task.window.base() as usize) as usize
-                    });
-                    let image = if high > mapped {
-                        task.window.read_low(high.min(reserved))
-                    } else {
-                        task.window.rw_mut().to_vec()
-                    };
-                    // #2010 — with what its vCPUs left as they ended: the ones that unwound, the
-                    // ones that finished unjoined, and the fibers they flattened.
-                    let mut vcpus = Vec::new();
-                    if let Some(dom) = &task.dom {
-                        vcpus = dom.take_frozen_vcpus();
-                        vcpus.extend(dom.take_completed_children_residue());
-                        fibers.extend(dom.take_frozen_fibers());
+                    match task.capture(d, fibers) {
+                        Some(c) => {
+                            *d.capture.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
+                            captured = true;
+                        }
+                        // #2318 — a grown tail the OS will not commit for the read cannot ride:
+                        // the child ends refused, as a window it cannot open does.
+                        None => task.end_refused(),
                     }
-                    // #1684 — and every slot nobody flattened, so a thaw rebuilds the table slot
-                    // for slot.
-                    let flattened: Vec<usize> = fibers.iter().map(|f| f.slot).collect();
-                    fibers.extend(task.rt.table().unflattened_for_freeze(&flattened));
-                    // SAFETY: as `root_unwound`, which read the same word.
-                    let root_sp = unsafe {
-                        fiber_rt::read_shadow_sp(task.window.base() as u64, d.shadow.region_base(0))
-                    };
-                    *d.capture.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(crate::DetachedCapture {
-                            image,
-                            residue: crate::DurableResidue {
-                                fibers,
-                                vcpus,
-                                nested: Vec::new(),
-                                root_sp: Some(root_sp),
-                            },
-                        });
-                    captured = true;
                 }
             }
         }
         // #2112 — the child's domain has ended: its fibers' charges go back before its parent can
         // learn of the end, as its window's do in `teardown`.
         task.rt.table().release_charges();
-        if let Some(c) = task.copy_back.take() {
-            c(task.window.rw_mut());
-        }
         if let Some(t) = task.teardown.take() {
             t(captured);
         }
         // A retiring task published at `settle`, unless its root unwound, whose capture this is.
         let trap = task.vm.trap.load(Ordering::Relaxed);
         let result = task.results.first().copied().unwrap_or(0);
-        task.done.publish(result, trap, self.domain());
+        done.publish(result, trap, self.domain());
         let retiring = task.retiring;
         drop(task);
         // `settle` dropped a retiring task's live count when its root returned.
@@ -1035,13 +1060,14 @@ impl ChildExec {
                 d.child_finished();
             }
         }
+        // #2359 — nothing of the task is left: its parent's nursery may let go of its powerbox.
+        done.torn_down.store(true, Ordering::Release);
     }
 
     /// #1469 — the root of a task whose vCPUs still run has returned: publish its outcome now, as
     /// the oracle does at the root's completion (a `join` of the child returns), and drop it from
     /// the run's live count. Its window and powerbox stay until the vCPUs end ([`Self::finish`]).
-    /// A carve child's copy-back happens here, so the parent's join sees the child's writes; what
-    /// the vCPUs write after it stays in the child's image. A durable root that unwound for a freeze
+    /// A durable root that unwound for a freeze
     /// has no outcome yet (#2010): its vCPUs are unwinding too, and the capture `finish` takes once
     /// they have ended is what its parent's join is owed.
     fn settle(&self, task: &mut ChildTask) {
@@ -1053,10 +1079,6 @@ impl ChildExec {
             if let Some(d) = &task.dom {
                 d.wake_own_parked();
             }
-        }
-        if let Some(c) = task.copy_back.take() {
-            task.window.restore_rw();
-            c(task.window.rw_mut());
         }
         if !task.root_unwound() {
             task.done.publish(result, trap, self.domain());
@@ -1072,7 +1094,7 @@ impl ChildExec {
     /// sweep. A task that parks after this began is poisoned too (`worker_loop`).
     ///
     /// `end_domain` — the run is ending (not freezing): every task ends with it, running or not yet
-    /// started, carve or detached, as the oracle ends a child domain with the run (DESIGN §23, D66).
+    /// started, as the oracle ends a child domain with the run (DESIGN §23, D66).
     /// Its stop word gets the completion sentinel, which its entry and back-edge polls observe
     /// (`emit_domain_poll`). A freeze skips this, so a child the freeze reaches still unwinds under
     /// its own freeze word.

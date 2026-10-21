@@ -292,6 +292,38 @@ jobs:
       # nearly free — it is here so that adding a second starts running it rather than silently not.
       - run: cargo test --workspace --doc
 
+  # #2514 — Android, with the NDK the runner image carries (`ANDROID_NDK_LATEST_HOME`), so nothing is
+  # fetched past the toolchain. `scripts/ci/android.sh` wires the NDK in, for this job and the local
+  # gate alike. The workspace is linted for aarch64-linux-android, and its tests run as x86-64 Android
+  # executables: they link statically, so they run on the runner itself, with no emulator. That
+  # exercises Bionic and temen's Android code paths; aarch64 code generation is macOS's lane, and
+  # ART's signal chaining and the app sandbox need a device (#2514).
+  android:
+    name: android (aarch64 clippy · x86-64 Bionic tests)
+    runs-on: ubuntu-latest
+    # The I7 backstop, as `cross-os` has it.
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+          components: clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: rustup target add aarch64-linux-android x86_64-linux-android
+      - run: bash scripts/ci/android.sh aarch64-linux-android clippy --workspace --all-targets -- -D warnings
+      # #1605's verified nextest archive, as `cross-os` restores it.
+      - name: cache cargo-nextest archive
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+        with:
+          path: ~/.cache/temen-ci/nextest
+          key: nextest-${{ runner.os }}-${{ hashFiles('scripts/ci/install-nextest.sh') }}
+      - name: install cargo-nextest (pinned + checksummed per platform)
+        run: bash scripts/ci/install-nextest.sh
+      - run: bash scripts/ci/android.sh x86_64-linux-android nextest run --workspace
+
   fuzz:
     name: cargo-fuzz (all targets)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -305,8 +337,7 @@ jobs:
       # (oracle⇄bytecode fork), wasm_diff (interp⇄wasm-JIT, the third confinement lowering), onramp_diff
       # (LLVM on-ramp source oracle), wasm_transpile, spec_ops, roundtrip (format identity), opt_*
       # (SSA round-trip / SCCP), coverage_walk, paged_walk (interp⇄wasm-JIT paged bulk-mem per-page walk,
-      # #1081 — the fourth confinement lowering, which wasm_diff can't reach), nested_paged (interp⇄wasm-JIT
-      # nested paged scalar page check with the page-op bounce serviced on a real vCPU, #1151), live_mapped
+      # #1081 — the fourth confinement lowering, which wasm_diff can't reach), live_mapped
       # (interp⇄wasm-JIT mask-only tier over a guest-shaped window: the emitted bound reads the driver-synced
       # live "mapped" global, #810) and pagestate (interp⇄wasm-JIT paged tier over randomized multi-run page
       # tables, #810), trap_walk (the trap-time backtrace walk's own fault recovery, #1487 — its input is the
@@ -331,7 +362,6 @@ jobs:
             opt_ssa_roundtrip,
             coverage_walk,
             paged_walk,
-            nested_paged,
             live_mapped,
             pagestate,
             durable,
@@ -341,6 +371,7 @@ jobs:
             durable_loop_jit,
             durable_recycle,
             durable_recycle_jit,
+            cap_abi,
           ]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -877,7 +908,7 @@ jobs:
         # -j 2 caps concurrent test-binary links (the OOM peak — ISSUES.md I30).
         run: |
           cargo test -j 2 --lib --test exports_abi \
-            --test coop_tierup_driver --test par_tierup_driver \
+            --test coop_tierup_driver \
             --test fork --test warm_grow --test mem_profile \
             --test onramp --test onramp_posix --test powerbox_cap_names \
             --test emit_budget --test dap_batch --test link_run \
@@ -1084,10 +1115,10 @@ jobs:
           # install + the by-slot unit fetch), byte-identical to the interpreter; thread words pin the
           # declared decline. The native wasmi pin is `coop_forth_kernel_tiers_up_and_matches_the_oracle`.
           node browser-forth-coop-test.mjs
-          # A guest-issued op 15 on the op-13 loop (#1286): the driver's child is minted its own Memory by
+          # A guest-issued detached spawn (op 17) on the op-13 loop (#1286): the driver's child is minted its own Memory by
           # the servicer and driven emitted; args payload, attest, growth.
           node browser-op13jit-detached-test.mjs
-          # Concurrent detached children on the parallel Worker driver (#1286 slice 3b): three op-15
+          # Concurrent detached children on the parallel Worker driver (#1286 slice 3b): three op-17
           # children, each on its own Worker in its own minted WebAssembly.Memory, grown on vm_map;
           # the exhausted WindowMinter refuses a fourth.
           node browser-par-detached-test.mjs

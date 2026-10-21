@@ -12,17 +12,16 @@
 //! oracle `crates/temen/tests/debug_checkpoints.rs` uses for the time-travel checkpoint ladder, and
 //! `crates/temen-run/demos/doom/doom_diff.c` uses for the Doom renderer — a frame hash stream.
 //!
-//! Both interpreter reactors run every case through one harness (INVARIANTS #15): `OnrampReactor`
-//! (engine-backed window) and `SharedOnrampReactor` (window in a caller-owned region — the shape the
-//! wasm-JIT tier drives). Fixtures are the reactor suite's own, so no built asset is needed:
+//! The cases run on `OnrampReactor`, the one reactor; `coop_tierup_driver.rs` runs its frames on the
+//! emitted tier too. Fixtures are the reactor suite's own, so no built asset is needed:
 //! `bounce` (state in globals), `life` (state in a **malloc heap above the mapped window** — the
 //! grown-page case Doom's zone heap is), and `fsread` (state behind the `fs` capability).
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use temen_browser::{
-    Frame, Moment, MomentReactor, OnrampReactor, ReactorTimeline, Refusal, SharedOnrampReactor,
-    SteppableReactor, STATUS_OK,
+    Frame, Moment, MomentReactor, OnrampReactor, ReactorTimeline, Refusal, SteppableReactor,
+    STATUS_OK,
 };
 
 /// Keyframe stride / ring / byte budget for the timeline cases. The budget is off (0) except where a
@@ -31,20 +30,18 @@ use temen_browser::{
 const STRIDE: usize = 8;
 const RING: usize = 4;
 
-/// The shared window the `SharedOnrampReactor` cases run over (matches `shared_reactor.rs`).
-const WIN_LOG2: u8 = 25;
 // JS keyCodes the `bounce` guest steers on.
 const LEFT: i32 = 37;
 const RIGHT: i32 = 39;
 
 /// Opening one reactor under test from a fixture — the only part of the surface these cases need
 /// that the library's [`MomentReactor`] does not carry (that trait is about *driving* a reactor, not
-/// building one). Every case below is written once against this and run against each interpreter
-/// reactor.
+/// building one). Every case below is written once against this: the reactor implements it, and so
+/// does [`Counting`], which wraps it to count its ticks.
 trait Fixture: SteppableReactor + Sized {
     fn open_fixture(bytes: &[u8]) -> Self;
     /// The frame the last tick presented. Not on [`MomentReactor`]: that trait drives ticks, and what
-    /// a reactor *presents* is its own business (the wasm-JIT one hands its framebuffer to a JS host).
+    /// a reactor *presents* is its own business.
     fn presented(&self) -> Option<Frame>;
 }
 
@@ -52,16 +49,6 @@ impl Fixture for OnrampReactor {
     fn open_fixture(bytes: &[u8]) -> Self {
         let m = temen_encode::decode_module(bytes).expect("decode fixture");
         OnrampReactor::open(&m).expect("open the reactor")
-    }
-    fn presented(&self) -> Option<Frame> {
-        self.take_frame()
-    }
-}
-
-impl Fixture for SharedOnrampReactor {
-    fn open_fixture(bytes: &[u8]) -> Self {
-        let m = temen_encode::decode_module(bytes).expect("decode fixture");
-        SharedOnrampReactor::open_owned(&m, WIN_LOG2).expect("open the shared reactor")
     }
     fn presented(&self) -> Option<Frame> {
         self.take_frame()
@@ -155,7 +142,6 @@ fn rewind_replays_the_recorded_future<R: Fixture>(fixture: &[u8]) {
 #[test]
 fn rewind_replays_the_recorded_future_bounce() {
     rewind_replays_the_recorded_future::<OnrampReactor>(BOUNCE);
-    rewind_replays_the_recorded_future::<SharedOnrampReactor>(BOUNCE);
 }
 
 /// The Doom-shaped case: `life` keeps its grids in a **malloc heap above the mapped window**, so its
@@ -165,7 +151,6 @@ fn rewind_replays_the_recorded_future_bounce() {
 #[test]
 fn rewind_carries_a_heap_grown_above_the_window() {
     rewind_replays_the_recorded_future::<OnrampReactor>(LIFE);
-    rewind_replays_the_recorded_future::<SharedOnrampReactor>(LIFE);
 }
 
 /// A moment is a **branch point**: two different input sequences from the same moment produce two
@@ -499,23 +484,21 @@ block 0 (vsp: i64) {{
   i32.store vg0 vcap offset=8
   vgz = i32.const 0
   i32.store vg0 vgz offset=12
-  ; the v1 spawn record at 17408 (temen_ir::SpawnRec): the child image, at its bootstrap (entry 0,
+  ; the spawn record at 17408 (temen_ir::SpawnRec): the child image, at its bootstrap (function 0,
   ; which calls func 2), its declared window, no pager or pre-mapped region, paid from `budget`,
   ; one grant
   vr0 = i64.const 17408
-  vf0 = i64.const 1
+  vf0 = i64.const -4294967296
   i64.store vr0 vf0
-  vf2 = i64.const -4294967296
-  i64.store vr0 vf2 offset=16
-  i32.store vr0 vchild offset=24
-  i32.store vr0 vbud offset=28
-  i64.store vr0 vg0 offset=40
+  i32.store vr0 vchild offset=8
+  i32.store vr0 vbud offset=12
+  i64.store vr0 vg0 offset=16
   vn = i64.const 1
-  i64.store vr0 vn offset=48
-  vf9 = i64.const 4294967295
-  i64.store vr0 vf9 offset=72
+  i64.store vr0 vn offset=24
+  vf6 = i64.const 4294967295
+  i64.store vr0 vf6 offset=48
   vh = call.cap 6 17 (i64) -> (i32) vinst (vr0)
-  vgot = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vgot_st, vgot = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   vbp = i64.const 16432
   i64.store vbp vgot
   vop = i64.const 16416
@@ -795,7 +778,6 @@ fn a_timeline_seeks_to_any_recorded_tick<R: Fixture>(fixture: &[u8]) {
 #[test]
 fn a_timeline_seeks_to_any_recorded_tick_bounce() {
     a_timeline_seeks_to_any_recorded_tick::<OnrampReactor>(BOUNCE);
-    a_timeline_seeks_to_any_recorded_tick::<SharedOnrampReactor>(BOUNCE);
 }
 
 /// The grown-heap case again, now through the ladder: `life`'s grids live in `vm_map`-grown pages
@@ -803,7 +785,6 @@ fn a_timeline_seeks_to_any_recorded_tick_bounce() {
 #[test]
 fn a_timeline_seeks_over_a_heap_grown_above_the_window() {
     a_timeline_seeks_to_any_recorded_tick::<OnrampReactor>(LIFE);
-    a_timeline_seeks_to_any_recorded_tick::<SharedOnrampReactor>(LIFE);
 }
 
 /// What the ladder is *for*: a backward seek costs the tail after the nearest rung, not the whole run.

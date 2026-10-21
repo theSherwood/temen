@@ -122,14 +122,16 @@ impl GuestWindow {
     /// Re-enable read+write on the whole backed region `[0, mapped)`. The guest may have changed
     /// page protections through the `Memory` capability (`unmap`→inaccessible, `protect`→read-only),
     /// so a snapshot read of the window could otherwise fault *outside* the guarded call and crash
-    /// the host. Idempotent; a no-op cost when nothing changed.
-    pub(crate) fn restore_rw(&self) {
+    /// the host. Idempotent; a no-op cost when nothing changed. `false` when the OS refuses (#2286:
+    /// at `vm.max_map_count`, a boundary split): the caller must not read the window then.
+    #[must_use]
+    pub(crate) fn restore_rw(&self) -> bool {
         if self.mapped == 0 {
-            return;
+            return true;
         }
         let rw = round_up(self.mapped, pal::page_size());
         // SAFETY: `[base, base+rw)` is the window's backed region, owned for its lifetime.
-        unsafe { pal::protect(self.base, rw, Prot::Rw) };
+        unsafe { pal::protect(self.base, rw, Prot::Rw) }
     }
 
     /// Commit + read the low `snap` bytes of the window for the escape-oracle snapshot — including
@@ -137,103 +139,134 @@ impl GuestWindow {
     /// makes an uncommitted reserved page readable-as-zero and re-asserts RW on a `NOACCESS`/RO page,
     /// so the host read can't fault outside the guarded call. `snap` is clamped to the reservation
     /// (excluding the trailing guard page). Used only by the `_with_host` capture; the common path
-    /// reads `[0, mapped)` directly.
-    pub(crate) fn read_low(&self, snap: usize) -> Vec<u8> {
+    /// reads `[0, mapped)` directly. `None`, nothing read, when the OS refuses the commit (#2318).
+    pub(crate) fn read_low(&self, snap: usize) -> Option<Vec<u8>> {
         if self.mapped == 0 || snap == 0 {
-            return Vec::new();
+            return Some(Vec::new());
         }
         let max = self.total - trailing_guard(); // everything but the trailing guard page
         let snap = snap.min(max);
         let commit = round_up(snap, pal::page_size()).min(max);
-        // SAFETY: `[base, base+commit)` lies in the reservation (≤ total − guard); `commit_rw` makes
-        // it committed + RW, so the subsequent `[0, snap)` read is in-bounds and cannot fault.
+        // SAFETY: `[base, base+commit)` lies in the reservation (≤ total − guard); once `commit_rw`
+        // makes it committed + RW, the `[0, snap)` read is in-bounds and cannot fault.
         unsafe {
-            commit_rw_or_panic(self.base, commit);
-            std::slice::from_raw_parts(self.base, snap).to_vec()
+            pal::commit_rw(self.base, commit)
+                .then(|| std::slice::from_raw_parts(self.base, snap).to_vec())
         }
     }
 
-    /// Map the whole pages touched by `[offset, offset+len)` **read-only** — the D40 const data
-    /// segment (§3a/§4): a later guest write to them faults into the guarded range. The data must
-    /// already be written (this only changes protection). A producer keeps RO data on its own
-    /// pages; protection is page-granular, so a shared page would over-protect.
-    pub(crate) fn protect_ro(&self, offset: u64, len: u64) {
+    /// Give the whole pages touched by `[offset, offset+len)` the protection `prot`: `Ro` for the D40
+    /// const data segment (§3a/§4), whose later guest write faults into the guarded range; `None`
+    /// for a durable-restored `Unmapped` page (DURABILITY.md §12.3), whose every access does, as on
+    /// the frozen guest. The data must already be written (this only changes protection). A
+    /// producer keeps RO data on its own pages; protection is page-granular, so a shared page would
+    /// over-protect. `false` when the OS refuses (#2286): the window then lacks a protection its
+    /// page map has, so the caller must not run a guest on it.
+    #[must_use]
+    pub(crate) fn protect(&self, offset: u64, len: u64, prot: Prot) -> bool {
         if self.mapped == 0 || len == 0 {
-            return;
+            return true;
         }
         let page = pal::page_size();
         let start = (offset as usize / page) * page;
         let end = round_up((offset + len) as usize, page);
-        // SAFETY: `[base+start, base+end)` lies within the backed region (the caller bounds
-        // `offset+len <= mapped`, which is page-rounded up to `rw`), owned for the lifetime.
-        unsafe { pal::protect(self.base.add(start), end - start, Prot::Ro) };
-    }
-
-    /// Map the whole pages touched by `[offset, offset+len)` **inaccessible** — a durable-restored
-    /// `Unmapped` page (DURABILITY.md §12.3): any later access faults into the guarded range,
-    /// exactly as on the frozen guest. The snapshot's `read_low` re-commits it RW before reading.
-    pub(crate) fn protect_none(&self, offset: u64, len: u64) {
-        if self.mapped == 0 || len == 0 {
-            return;
-        }
-        let page = pal::page_size();
-        let start = (offset as usize / page) * page;
-        let end = round_up((offset + len) as usize, page);
-        // SAFETY: as `protect_ro` — `[base+start, base+end)` is within the backed region.
-        unsafe { pal::protect(self.base.add(start), end - start, Prot::None) };
+        // SAFETY: `[base+start, base+end)` lies within the reservation (the caller bounds
+        // `offset+len` by the backed region, or by a tail page it committed).
+        unsafe { pal::protect(self.base.add(start), end - start, prot) }
     }
 
     /// Re-establish a captured page map on a freshly seeded window (DURABILITY.md §12.3): one
-    /// [`crate::WindowProt`] per [`crate::DURABLE_SNAPSHOT_PAGE`] from window-relative `base`. In
-    /// the first `mapped` bytes `Rw` entries keep the default; past them (the reserved tail) an
-    /// `Rw`/`Ro` page is one the guest grew, so it is committed and seeded from `init` (#1834),
-    /// and an `Unmapped` one stays uncommitted. A thawed guest then faults on a restored
+    /// [`crate::WindowProt`] per [`crate::DURABLE_SNAPSHOT_PAGE`] of `init` from the window's start,
+    /// then each page of `tail` (#2427: those the window holds past `init`). In the first `mapped`
+    /// bytes `Rw` entries keep the default; past them (the reserved tail) every page listed is one the
+    /// window holds — grown, or protected to nothing with its contents kept (#1909) — so it is
+    /// committed and seeded with its bytes (#1834). A thawed guest then faults on a restored
     /// `Ro`/`Unmapped` page exactly as the frozen one would — matching `temen-interp`'s
-    /// `apply_prots`. The root's thaw and a detached child's (#1733) both apply theirs here.
+    /// `restore_layout`. The root's thaw and a detached child's (#1733) both apply theirs here. `false`
+    /// when the OS refuses a commit or a protection (#2318): the thaw is refused then, as the window
+    /// cannot hold the page map it captured.
+    #[must_use]
     pub(crate) fn apply_prots(
         &self,
-        base: u64,
         prots: &[crate::WindowProt],
         mapped: u64,
         init: &[u8],
-    ) {
+        tail: &[crate::TailPage],
+    ) -> bool {
         if self.mapped == 0 {
-            return;
+            return true;
         }
+        let page = crate::DURABLE_SNAPSHOT_PAGE as u64;
+        let head = prots.iter().enumerate().map(|(i, &p)| {
+            let off = i as u64 * page;
+            (off, p, init.get(off as usize..).unwrap_or(&[]))
+        });
+        let tail = tail
+            .iter()
+            .map(|t| (t.off, t.prot, t.bytes.as_deref().unwrap_or(&[])));
+        head.chain(tail)
+            .all(|(off, p, bytes)| self.apply_page(off, p, mapped, bytes))
+    }
+
+    /// [`Self::apply_prots`] for the one codec page at `off`, given its bytes (from its start; a
+    /// short or empty slice leaves the rest zero).
+    fn apply_page(&self, off: u64, p: crate::WindowProt, mapped: u64, bytes: &[u8]) -> bool {
         let page = crate::DURABLE_SNAPSHOT_PAGE as u64;
         // Everything but the trailing guard page, as `read_low` bounds it.
         let limit = (self.total - trailing_guard()) as u64;
-        for (i, &p) in prots.iter().enumerate() {
-            let off = i as u64 * page;
-            if off >= mapped {
-                if p == crate::WindowProt::Unmapped {
-                    continue;
-                }
-                if base + off + page > limit {
-                    break;
-                }
-                let host = pal::page_size();
-                let start = ((base + off) as usize / host) * host;
-                let end = round_up((base + off + page) as usize, host);
-                let src = init.get(off as usize..).unwrap_or(&[]);
-                let n = src.len().min(page as usize);
-                // SAFETY: `[base+start, base+end)` lies in the reservation below its guard page
-                // (checked above); committed, it takes the `n` image bytes at its offset.
-                unsafe {
-                    commit_rw_or_panic(self.base.add(start), end - start);
-                    std::ptr::copy_nonoverlapping(
-                        src.as_ptr(),
-                        self.base.add((base + off) as usize),
-                        n,
-                    );
-                }
+        if off >= mapped {
+            if off + page > limit {
+                return true;
             }
-            match p {
-                crate::WindowProt::Ro => self.protect_ro(base + off, page),
-                crate::WindowProt::Unmapped => self.protect_none(base + off, page),
-                crate::WindowProt::Rw => {}
+            let host = pal::page_size();
+            let start = (off as usize / host) * host;
+            let end = round_up((off + page) as usize, host);
+            let n = bytes.len().min(page as usize);
+            // SAFETY: `[start, end)` lies in the reservation below its guard page (checked above);
+            // committed, it takes the `n` image bytes at its offset.
+            unsafe {
+                if !pal::commit_rw(self.base.add(start), end - start) {
+                    return false;
+                }
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(off as usize), n);
             }
         }
+        match p {
+            crate::WindowProt::Ro => self.protect(off, page, Prot::Ro),
+            crate::WindowProt::Unmapped => self.protect(off, page, Prot::None),
+            crate::WindowProt::Rw => true,
+        }
+    }
+
+    /// #2427 — read the host pages at byte offsets `offs`, ascending (the pages a window holds past
+    /// its declared size, [`crate::HeldTail`]), each run of consecutive ones committed read/write first
+    /// so the read cannot fault outside the guarded call: what a durable capture carries past the
+    /// window's prefix, read apart, never the span between them. A page whose bytes are all zero is
+    /// left out (its offset says it is held). `None`, nothing read, when the OS refuses a commit
+    /// (#2286).
+    pub(crate) fn read_pages(&self, offs: &[u64]) -> Option<Vec<(u64, Vec<u8>)>> {
+        let page = pal::page_size();
+        let limit = self.total - trailing_guard();
+        let offs: Vec<usize> = offs
+            .iter()
+            .map(|&off| off as usize)
+            .filter(|&off| off + page <= limit)
+            .collect();
+        for run in offs.chunk_by(|a, b| b - a == page) {
+            // SAFETY: the run lies in the reservation below its guard page (filtered above).
+            if !unsafe { pal::commit_rw(self.base.add(run[0]), run.len() * page) } {
+                return None;
+            }
+        }
+        let pages = offs.into_iter().filter_map(|off| {
+            // SAFETY: committed read/write above, so the read cannot fault.
+            let bytes = unsafe { std::slice::from_raw_parts(self.base.add(off), page) };
+            bytes
+                .iter()
+                .any(|&b| b != 0)
+                .then(|| (off as u64, bytes.to_vec()))
+        });
+        Some(pages.collect())
     }
 
     /// #964/#1094: reserve `[0, guard)` inaccessible — the unconditional NULL guard: a NULL
@@ -242,18 +275,16 @@ impl GuestWindow {
     /// Page-granular, so it engages only when `guard` is host-page-exact (4 KiB / 16 KiB hosts;
     /// on a larger-page host protecting would swallow live scratch above the guard, so it skips —
     /// and the interpreter skips identically, keeping the tiers trap-parity per platform).
-    pub(crate) fn seed_null_guard(&self, base: u64, guard: u64) {
-        if self.mapped == 0
-            || guard == 0
-            || !(guard as usize).is_multiple_of(pal::page_size())
-            || !(base as usize).is_multiple_of(pal::page_size())
-        {
-            return;
+    /// `false` when the OS refuses (#2286): a NULL dereference would then read the window where
+    /// the interpreter traps, so the caller must not run a guest on it.
+    #[must_use]
+    pub(crate) fn seed_null_guard(&self, guard: u64) -> bool {
+        if self.mapped == 0 || guard == 0 || !(guard as usize).is_multiple_of(pal::page_size()) {
+            return true;
         }
-        // SAFETY: `[base, base+guard)` lies within the backed region — the marked layout puts the
-        // args blob and stack above the guard, so a marked window is always larger than it (and a
-        // §14 sub-window's `base` is its verifier-bounded carve base).
-        unsafe { pal::protect(self.base.add(base as usize), guard as usize, Prot::None) };
+        // The marked layout puts the args blob and stack above the guard, so a marked window is
+        // always larger than it.
+        self.protect(0, guard, Prot::None)
     }
 
     /// #1768 — a **private duplicate** of this window for a fork twin (the JIT's
@@ -472,20 +503,6 @@ pub(crate) fn page_size() -> usize {
 /// D61/D67): it reads its reach from here, so the guard cannot shrink under it.
 pub(crate) fn trailing_guard() -> usize {
     pal::page_size()
-}
-
-/// Commit `[base, base+len)` read/write for the JIT's own window bookkeeping, which has no way to
-/// report a refusal: panic, naming the OS's error.
-///
-/// # Safety
-/// As [`pal::commit_rw`].
-unsafe fn commit_rw_or_panic(base: *mut u8, len: usize) {
-    if !pal::commit_rw(base, len) {
-        panic!(
-            "temen-jit: window commit failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
 }
 
 /// Windows-only: make `[base, base+len)` committed read/write across this window's **placeholder**
@@ -1346,6 +1363,56 @@ mod pal {
 mod tests {
     use super::*;
 
+    /// `vm.max_map_count`, when it is small enough to fill in a test (#2286).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn max_map_count() -> Option<usize> {
+        let max: usize = std::fs::read_to_string("/proc/sys/vm/max_map_count")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        (max <= 1 << 22).then_some(max)
+    }
+
+    /// Fill this process's mapping table up to `max` (`vm.max_map_count`), then free `spare` mappings:
+    /// a scratch reservation, every other page made readable until the OS refuses, each one splitting
+    /// it into two more mappings. Allocates nothing.
+    ///
+    /// # Safety
+    /// Only in a forked child that leaves with `_exit`: nothing else in the process may need a mapping
+    /// afterwards.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) unsafe fn fill_mapping_table(max: usize, spare: usize) {
+        let page = pal::page_size();
+        let len = 2 * (max + 16) * page;
+        let scratch = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        ) as *mut u8;
+        if scratch as *mut c_void == libc::MAP_FAILED {
+            return;
+        }
+        let mut made = 0;
+        while 2 * made * page < len
+            && libc::mprotect(
+                scratch.add(2 * made * page) as *mut c_void,
+                page,
+                libc::PROT_READ,
+            ) == 0
+        {
+            made += 1;
+        }
+        // A readable page between two inaccessible ones is a mapping of its own (the first may have
+        // merged with whatever lies below the scratch, so it is not one of them).
+        for i in (1..made).take(spare) {
+            libc::munmap(scratch.add(2 * i * page) as *mut c_void, page);
+        }
+    }
+
     // Entry-shaped probes (the trampoline ABI). They do a single volatile read at a fixed window
     // offset; if it faults inside the guarded range the guard unwinds and `run_guarded` reports it.
     extern "C" fn read_at_0(
@@ -1699,6 +1766,176 @@ mod tests {
             "pal::release leaked {leaked} bytes of the placeholder reservation \
              (fragments past the first not freed)"
         );
+    }
+
+    /// #2286 — a run whose window the OS will not seed ends with `ThreadFault` before its first
+    /// instruction, as one with no room for its window does (#2305), instead of running with its
+    /// read-only data writable and its NULL guard open. In a forked child that fills its own mapping
+    /// table, then frees just enough for the window itself: the window alone is granted (checked);
+    /// its read-only page and its NULL guard each need a split the table has no room for.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_run_whose_window_cannot_be_seeded_ends_with_thread_fault() {
+        const WRONG_RAN: i32 = 1;
+        const WRONG_OTHER: i32 = 2;
+        const INCONCLUSIVE: i32 = 3;
+        let Some(max) = max_map_count() else {
+            eprintln!("skipped: vm.max_map_count is too large to fill");
+            return;
+        };
+        // Its read-only page lies inside the backed prefix, above the NULL guard: protecting it
+        // splits the prefix's mapping in two more.
+        let m = temen_text::parse_module(
+            "memory 16\ndata ro 32768 \"const\"\nfunc () -> (i64) {\nblock 0 () {\n  v = i64.const 7\n  return v\n  }\n}\n",
+        )
+        .expect("parse");
+        let mut cm = crate::compile(&m, 0).expect("compile");
+        assert_eq!(
+            cm.run(&[], None, None).expect("run").0,
+            crate::JitOutcome::Returned(vec![7])
+        );
+        let (mapped, reserved) = (cm.win_mapped, cm.win_reserved);
+        // SAFETY: the child runs only the code below, allocating nothing once the table is full, and
+        // leaves with `_exit`.
+        match unsafe { libc::fork() } {
+            0 => {
+                // SAFETY: the child's own alarm: a child that hangs dies of SIGALRM, so the test fails
+                // rather than hangs.
+                unsafe { libc::alarm(60) };
+                // SAFETY: the forked child's own table; two spare mappings, the window's own two.
+                unsafe { fill_mapping_table(max, 2) };
+                let wrong = if GuestWindow::try_new(mapped, reserved).is_none() {
+                    INCONCLUSIVE
+                } else {
+                    match cm.run(&[], None, None) {
+                        Ok((crate::JitOutcome::Trapped(crate::TrapKind::ThreadFault), _)) => 0,
+                        Ok((crate::JitOutcome::Returned(_), _)) => WRONG_RAN,
+                        _ => WRONG_OTHER,
+                    }
+                };
+                // SAFETY: leaves the child without running the parent's exit handlers.
+                unsafe { libc::_exit(wrong) }
+            }
+            pid => {
+                assert!(pid > 0, "fork failed");
+                let mut status = 0;
+                // SAFETY: waits for the child just forked; `status` is a valid out-parameter.
+                assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+                assert!(
+                    libc::WIFEXITED(status),
+                    "the child died of signal {}: it faulted, or (SIGALRM) hung",
+                    libc::WTERMSIG(status)
+                );
+                match libc::WEXITSTATUS(status) {
+                    0 => {}
+                    INCONCLUSIVE => eprintln!("inconclusive: the window alone was refused"),
+                    WRONG_RAN => panic!("the run ran on a window missing its protections"),
+                    _ => panic!("the run did not end with ThreadFault"),
+                }
+            }
+        }
+    }
+
+    /// #2286/#2318 — at the process's mapping limit, each window operation the host makes that needs
+    /// another mapping reports the refusal, where it used to panic or leave a protection missing. Run
+    /// in a forked child, which fills its own mapping table and leaves this process's alone; once the
+    /// table is full the child allocates nothing.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn window_operations_report_a_refusal_at_the_mapping_limit() {
+        const WRONG_PROTECT: i32 = 1;
+        const WRONG_THAW_TAIL: i32 = 4;
+        const WRONG_THAW_RO: i32 = 8;
+        const WRONG_RESTORE: i32 = 16;
+        const WRONG_READ: i32 = 32;
+        let page = pal::page_size();
+        let Some(max) = max_map_count() else {
+            eprintln!("skipped: vm.max_map_count is too large to fill");
+            return;
+        };
+        let at = |pages: usize| (pages * page) as u64;
+        // 16 backed pages in a 64-page reservation: one read-write, one with its prefix closed, so
+        // that re-opening it splits the mapping it shares with the inaccessible tail.
+        let open = GuestWindow::try_new(16 * page, 64 * page).expect("window");
+        let closed = GuestWindow::try_new(16 * page, 64 * page).expect("window");
+        assert!(closed.protect(0, at(16), Prot::None));
+        // A thaw's page maps, built now: a page the guest grew in the tail; a read-only prefix page.
+        let snap = crate::DURABLE_SNAPSHOT_PAGE;
+        let mut grown = vec![crate::WindowProt::Unmapped; 20 * page / snap + 1];
+        grown[..16 * page / snap].fill(crate::WindowProt::Rw);
+        grown[20 * page / snap] = crate::WindowProt::Rw;
+        let mut ro = vec![crate::WindowProt::Rw; 2 * page / snap + 1];
+        ro[2 * page / snap] = crate::WindowProt::Ro;
+        // SAFETY: the child runs only the code below, allocating nothing once the table is full, and
+        // leaves with `_exit`.
+        match unsafe { libc::fork() } {
+            0 => {
+                // SAFETY: the child's own alarm: a child that hangs dies of SIGALRM, so the test fails
+                // rather than hangs.
+                unsafe { libc::alarm(60) };
+                // SAFETY: the forked child's own table.
+                unsafe { fill_mapping_table(max, 0) };
+                let mut wrong = 0;
+                // A read-only data page inside the read-write prefix splits it. (A NULL guard is the
+                // same `protect` at the window's start, where it may merge with the mapping below
+                // instead of splitting, so it can succeed here.)
+                if open.protect(at(2), at(1), Prot::Ro) {
+                    wrong |= WRONG_PROTECT;
+                }
+                // A thaw commits the tail page the guest grew inside the inaccessible tail, and
+                // protects a read-only page inside the prefix.
+                if open.apply_prots(&grown, at(16), &[], &[]) {
+                    wrong |= WRONG_THAW_TAIL;
+                }
+                if open.apply_prots(&ro, at(16), &[], &[]) {
+                    wrong |= WRONG_THAW_RO;
+                }
+                // Re-opening the closed prefix for a snapshot, or committing past it for one, splits
+                // the mapping it shares with the tail.
+                if closed.restore_rw() {
+                    wrong |= WRONG_RESTORE;
+                }
+                if closed.read_low(20 * page).is_some() {
+                    wrong |= WRONG_READ;
+                }
+                // SAFETY: leaves the child without running the parent's exit handlers.
+                unsafe { libc::_exit(wrong) }
+            }
+            pid => {
+                assert!(pid > 0, "fork failed");
+                let mut status = 0;
+                // SAFETY: waits for the child just forked; `status` is a valid out-parameter.
+                assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+                assert!(
+                    libc::WIFEXITED(status),
+                    "the child died of signal {}: a window operation panicked, faulted or (SIGALRM) hung",
+                    libc::WTERMSIG(status)
+                );
+                let wrong = libc::WEXITSTATUS(status);
+                let names = [
+                    (WRONG_PROTECT, "protect"),
+                    (WRONG_THAW_TAIL, "apply_prots (a grown tail page)"),
+                    (WRONG_THAW_RO, "apply_prots (a read-only page)"),
+                    (WRONG_RESTORE, "restore_rw"),
+                    (WRONG_READ, "read_low"),
+                ];
+                let passed: Vec<&str> = names
+                    .iter()
+                    .filter(|(bit, _)| wrong & bit != 0)
+                    .map(|(_, name)| *name)
+                    .collect();
+                assert!(
+                    passed.is_empty(),
+                    "at the mapping limit these reported success: {passed:?}"
+                );
+            }
+        }
+        // Away from the limit, each one applies.
+        assert!(open.protect(at(2), at(1), Prot::Ro));
+        assert!(open.seed_null_guard(at(1)));
+        assert!(open.apply_prots(&grown, at(16), &[], &[]));
+        assert!(closed.restore_rw());
+        assert_eq!(closed.read_low(20 * page).map(|b| b.len()), Some(20 * page));
     }
 }
 

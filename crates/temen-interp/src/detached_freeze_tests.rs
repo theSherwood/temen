@@ -7,23 +7,31 @@
 //! residue through the codec, and `temen`'s `durable_detached_jit.rs` runs the whole arc on the JIT.
 
 use super::*;
-use temen_durable::{begin_thaw, init_durable_window, read_state, transform_module, write_state};
+use temen_durable::{
+    begin_thaw, init_durable_window, read_state, transform_module_assume_confined, write_state,
+};
 use temen_ir::durable_abi::ShadowArena;
+use temen_ir::{Data, SpawnRec};
 
 const ARENA: ShadowArena = ShadowArena::new(16448, 65536);
 const PARENT_LOG2: u8 = 18;
 
-/// The parent: spawn the child detached (op 15, 7-arg form: budget, module, no grants, entry 0,
-/// `size_log2` 17, no quota), join it, return what it returns.
+/// Where a parent lays its spawn record ([`spawn_rec`]): past the shadow arena, which spans
+/// `[16448, 65536)`.
+const REC_AT: u64 = 65536;
+
+/// The parent: spawn the child detached (its spawn record at [`REC_AT`]: module, budget, no grants,
+/// `size_log2` 17), join it, return what it returns.
 const PARENT: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
-  vz = i64.const 0
-  vlog = i64.const 17
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vma = i64.const 65544
+  i32.store vma v1
+  vba = i64.const 65548
+  i32.store vba v2
+  vrp = i64.const 65536
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vr
   }
 }
@@ -55,22 +63,39 @@ block 3 (v12: i64) {
 }
 ";
 
-fn instrument(src: &str) -> Module {
-    let m = temen_text::parse_module(src).expect("parse");
-    let inst = transform_module(&m).expect("transform");
+/// Parse `src`, add `data` to it, instrument it, and verify the result. Confined: the parent stores
+/// its spawn record's handles at [`REC_AT`], past the shadow arena (R9).
+fn instrument(src: &str, data: Option<Data>) -> Module {
+    let mut m = temen_text::parse_module(src).expect("parse");
+    m.data.extend(data);
+    let inst = transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("instrumented module verifies");
     inst
 }
 
-/// A durable powerbox granting what the parent's op 15 needs, in a fixed order so a thaw host minted
+/// A parent's spawn record, at [`REC_AT`]: a `size_log2` 17 child, whose module and budget the
+/// parent stores in at run time.
+fn spawn_rec() -> Option<Data> {
+    Some(Data {
+        offset: REC_AT,
+        readonly: false,
+        bytes: SpawnRec {
+            size_log2: 17,
+            ..SpawnRec::default()
+        }
+        .encode(),
+    })
+}
+
+/// A durable powerbox granting what the parent's spawn needs, in a fixed order so a thaw host minted
 /// the same way holds the same handle values (the in-memory stand-in for the codec's verbatim table).
 fn powerbox(child: &Module) -> (Host, Vec<Value>) {
     let mut host = Host::new();
     host.set_durable(true);
-    let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
+    let inst = host.grant_instantiator();
     let modh = host.grant_durable_module(child);
     let budget = host.grant_budget(-1, 1 << 20, -1);
-    host.grant_freeze_authority(FreezeScope::DetachedProgeny);
+    host.grant_freeze_authority();
     (
         host,
         vec![Value::I32(inst), Value::I32(modh), Value::I32(budget)],
@@ -106,8 +131,8 @@ fn thawed(c: CapturedDetached) -> ThawedDetached {
 
 #[test]
 fn a_live_detached_child_is_captured_and_its_thaw_completes_the_join() {
-    let parent = instrument(PARENT);
-    let child = instrument(CHILD);
+    let parent = instrument(PARENT, spawn_rec());
+    let child = instrument(CHILD, None);
 
     // Control: uninterrupted, the child's total reaches the parent through the join.
     let (mut host, args) = powerbox(&child);
@@ -143,7 +168,6 @@ fn a_live_detached_child_is_captured_and_its_thaw_completes_the_join() {
         (0, 0),
         "the root's first join slot"
     );
-    assert_eq!(c.launch.entry, 0);
     assert_eq!(c.launch.digest, module_digest(&child));
     assert!(
         c.launch.task > 0,
@@ -185,26 +209,27 @@ fn a_durable_parent_without_authority_is_refused_the_spawn() {
     const SPAWN_ONLY: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
-  vz = i64.const 0
-  vlog = i64.const 17
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
+  vma = i64.const 65544
+  i32.store vma v1
+  vba = i64.const 65548
+  i32.store vba v2
+  vrp = i64.const 65536
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vr = i64.extend_i32_s vc
   return vr
   }
 }
 ";
-    let parent = instrument(SPAWN_ONLY);
-    let child = instrument(CHILD);
+    let parent = instrument(SPAWN_ONLY, spawn_rec());
+    let child = instrument(CHILD, None);
     let spawn = |authority: bool| {
         let mut host = Host::new();
         host.set_durable(true);
-        let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
+        let inst = host.grant_instantiator();
         let modh = host.grant_durable_module(&child);
         let budget = host.grant_budget(-1, 1 << 20, -1);
         if authority {
-            host.grant_freeze_authority(FreezeScope::DetachedProgeny);
+            host.grant_freeze_authority();
         }
         let args = [Value::I32(inst), Value::I32(modh), Value::I32(budget)];
         run(

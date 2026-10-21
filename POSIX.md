@@ -107,7 +107,8 @@ singleton case, not a replacement for first-class handles.
 
 Op numbers on the shared `HOST_FN` handle. `ptr`/`buf` are **window offsets**; `-errno` on
 failure (`< 0`), a `>= 0` count / handle on success (except `malloc`, which returns `0` for
-"no memory", the C `NULL`). Pure-compute functions are **guest code** (no cap) and are listed
+"no memory", the C `NULL`: no room in the arena, or none in the payer's budget for the host's record
+of the block, #2373; `getenv` too, for its cached copy). Pure-compute functions are **guest code** (no cap) and are listed
 only to mark the boundary.
 
 | # | Function | Shape | Backed by | Status |
@@ -131,10 +132,10 @@ only to mark the boundary.
 | 16 | `closedir(dir)` | `-> 0 \| -errno` | dir stream | **done** — `-EBADF` on a stale handle |
 | 17 | `argc()` | `-> n` | host arg vector | **done** — personality ext. (the `sh -c` path; `argv[0]` = program name) |
 | 18 | `argv(i, buf, cap)` | `-> len \| -errno` | host arg vector | **done** — NUL-terminated arg `i`; `-EINVAL`/`-ERANGE` |
-| 19 | `exec_lookup(name, len)` | `-> module \| -1` | host PATH registry (`register_command`) | **done** — Stage 1 exec (STAGE1.md §5); the spawn itself is the shell's `Instantiator` op 17 (a v1 record, `vm_spawn`) + `join` |
+| 19 | `exec_lookup(name, len)` | `-> module \| -1` | host PATH registry (`register_command`) | **done** — Stage 1 exec (STAGE1.md §5); the spawn itself is the shell's `Instantiator` op 17 (a spawn record, `vm_spawn`) + `join` |
 | 20 | `exec_stdout()` | `-> stream` | host stdout `Stream` | **done** — the handle the shell re-grants to a child under the name `"stdout"` |
 | 21 | `exec_stdin(ptr, len)` | `-> stream` | host input-pipe `Stream` + FIFO | **done** — a filter command's `"stdin"`: pushes `[ptr,len)` into the FIFO, returns the read end |
-| 22 | `exec_win(module)` | `-> size_log2 \| -1` | host PATH registry | **done** — the granted command's declared window, so the shell carves each spawn to match (a detached window of that size once carves retire — INVARIANTS #13, 2026-09-29) |
+| 22 | `exec_win(module)` | `-> size_log2 \| -1` | host PATH registry | **done** — the granted command's declared window, so the shell sizes each spawn's detached window to match |
 | 23 | `pipe(fds_ptr)` | `-> 0 \| -errno` | host fd table + shared byte FIFO | **done** — stores `[read_fd, write_fd]` (`i32`×2); intra-personality, non-blocking (empty reads `0`). **Superseded for shells by op 52** (#972): the libc `pipe()` shim now composes `__vm_pipe` + `pipe_adopt`; op-23 `PipeBuf` minting retires with #972 slice 3 |
 | 24 | `dup2(oldfd, newfd)` | `-> newfd \| -errno` | host fd table | **done** — the redirect primitive; pipe ends share the buffer, a `File` copies its description |
 | 25 | `dup(oldfd)` | `-> fd \| -errno` | host fd table | **done** — clone onto the lowest free fd |

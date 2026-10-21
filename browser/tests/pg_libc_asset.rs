@@ -593,15 +593,6 @@ fn the_multi_handle_entries_link_and_fail_closed() {
     temen_browser::temen_link_lib_close(hh);
 }
 
-/// A library as [`temen_browser::temen_link_lib_open`] keeps it resident: without the variables its
-/// debug info scopes globally, which stay out of a linked program's debug vars.
-fn resident(mut lib: temen_ir::Module) -> temen_ir::Module {
-    if let Some(di) = lib.debug_info.as_mut() {
-        di.vars.retain(|v| v.func != temen_ir::GLOBAL_SCOPE);
-    }
-    lib
-}
-
 /// The resident libc and heap ([`temen_browser::temen_link_lib_open`]), in the card's link order.
 fn open_pg_units(libc: &[u8], heap: &[u8]) -> [i32; 2] {
     [libc, heap].map(|bytes| {
@@ -666,7 +657,12 @@ fn a_program_links_against_the_laid_out_libraries_as_against_the_libraries() {
         eprintln!("SKIP: chibicc.temen / pg_libc.temeno / pg_heap.temeno not built");
         return;
     };
-    let libs = [&libc, &heap].map(|b| resident(temen_encode::decode_unit(b).expect("decode")));
+    // Each library as `temen_link_lib_open` keeps it resident.
+    let libs = [&libc, &heap].map(|b| {
+        let mut lib = temen_encode::decode_unit(b).expect("decode");
+        temen_browser::make_resident(&mut lib);
+        lib
+    });
     let exports: Vec<Vec<(String, temen_ir::FuncIdx)>> = libs
         .iter()
         .map(|m| m.exports.iter().map(|e| (e.name.clone(), e.func)).collect())
@@ -836,7 +832,8 @@ int main(void) {
   g[2].name = "*";
   g[2].handle = VM_EMPTY;
   long a = vm_spawn(talker, 0, g, 3, 0, 0, scratch);
-  long ra = a < 0 ? a : vm_join(a);
+  long st;
+  long ra = a < 0 ? a : vm_join(a, &st);
   long b = vm_spawn(talker, 0, g, 0, 0, 0, scratch);
   printf("granted: %ld, refused: %ld\n", ra, b);
   return 0;

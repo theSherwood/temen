@@ -7,16 +7,22 @@
 #
 # writes into <out>:
 #   nimony/          nimony's tree, laid out as nimony's own is (`bin/ lib/ src/ doc/`), its `bin/`
-#                    holding the phases step 1 builds
-#   nimony.temen nifmake.temen nifler2.temen nimsem.temen hexer.temen
+#                    holding the phases and the driver step 1 builds: a link into the cache below
+#   nimony.temen nifmake.temen nifler2.temen nimsem.temen shoggoth.temen
 #                    the tools, through the POSIX edge; nimsem's build in the tree's own nimcache,
-#                    each other's in `nimcache-<tool>/`
+#                    each other's in the cache's `nimcache-<tool>/`
 #   sh.ir            /bin/sh: the POSIX build of demos/shell
 #   libc.temeno      the guest libc temen-link links a program against (the committed
 #                    `browser/web/assets/pg_libc.temeno`)
 #
 # Every tool nimony builds from the tree, so a tool nimony builds in-guest from the same tree is one
 # this script built: what the lane's fixed point holds nimsem to.
+#
+# Everything but the link depends only on nimony: the sources at the pin, the patches, the
+# `nimony/bin` that builds them, and this script. So the tree, its native phases and the tools'
+# build directories are built once per such input, in `target/nim-toolchain/<key>/`, and each run
+# after that reuses them (#2442). nimony's own build finds them up to date and reruns only
+# `temen-link`, the one step that is this repo's.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -27,6 +33,19 @@ export PATH="$NIMONY_BIN:$NIM_BIN:$PATH"
 mkdir -p "$1"
 W="$(cd "$1" && pwd)"
 
+# `temen-link` on the host: the driver plans it as the build's last step (`nimony t`).
+cargo build --release -q -p temen-run --example temen_link
+export TEMEN_PG_LIBC="$ROOT/browser/web/assets/pg_libc.temeno"
+
+# One build of the cache at a time: a run writes it, even when it only relinks.
+mkdir -p target/nim-toolchain
+exec 9>target/nim-toolchain/lock
+flock 9
+KEY="$({
+  git -C nimony rev-parse HEAD
+  find patches/nimony "$NIMONY_BIN" scripts/nim-toolchain.sh -type f -print0 | sort -z | xargs -0 cat
+} | sha256sum | cut -c1-16)"
+C="$ROOT/target/nim-toolchain/$KEY"
 # The tree, from a COPY of the pinned sources (the submodule is never modified), patched: nifmake is a
 # classic-Nim-only program upstream, the driver learns the Temen backend, a compiler built for
 # Temen builds the programs it runs itself (compile-time evaluation, plugins) for Temen, and a
@@ -35,40 +54,61 @@ W="$(cd "$1" && pwd)"
 # the guest's memfs holds it at the same path, so both record the same paths — nimony records a
 # source path relative to its cwd, but writes a compile-time evaluation program's imports and output
 # file absolute.
-N="$W/nimony"
-mkdir -p "$N"
-cp -r "$ROOT/nimony/bin" "$ROOT/nimony/lib" "$ROOT/nimony/src" "$ROOT/nimony/doc" "$N/"
-for p in "$ROOT"/patches/nimony/*.patch; do (cd "$N" && git apply "$p"); done
-cargo build --release -q -p temen-run --example build_nim_hello_temen
-B=target/release/examples
+N="$C/nimony"
+if [ ! -e "$C/built" ]; then
+  # Another key's cache is a gigabyte that no build of this checkout uses again.
+  find target/nim-toolchain -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
+  mkdir -p "$N"
+  # The sources as the pin has them (`git archive`), not as the checkout is: hastur's build fetches
+  # git-ignored files into it (Nim's parser for classic nifler, Nim's cycle collectors for
+  # `--mm:orc`), which no tool here imports, and the card's pack ships the tree's `lib/` and `src/`.
+  cp -r "$ROOT/nimony/bin" "$N/"
+  git -C "$ROOT/nimony" archive HEAD lib src doc | tar -x -C "$N"
+  # The cache is inside this repo's worktree, where `git apply` patches paths relative to the
+  # repo's root and silently skips the tree's: the ceiling keeps git from finding the repo.
+  for p in "$ROOT"/patches/nimony/*.patch; do
+    (cd "$N" && GIT_CEILING_DIRECTORIES="$C" git apply "$p")
+  done
 
-echo "[toolchain 1/3] the phases, native: nimony builds nifler2, nimsem and hexer"
-# `nimony/bin`'s phases are built by classic Nim — a different compiler, whose hash tables iterate in
-# another order (#1753) — so nimony builds each again from the tree, and those replace them: they are
-# the reference every artifact is held to, and the compiler of step 2. The driver and nifmake only
-# sequence work; theirs stay as they are.
-pids=()
-for p in nifler2/nifler2 nimony/nimsem hexer/hexer; do
-  n="$(basename "$p")"
-  (cd "$N" && nimony c --isMain --nimcache:"$W/native-$n" "src/$p.nim" >/dev/null \
-    && cp "$(ls "$W/native-$n"/*/"$n" | head -1)" "bin/$n") &
-  pids+=($!)
-done
-for pid in "${pids[@]}"; do wait "$pid"; done
+  echo "[toolchain 1/3] the phases and the driver, native: nimony builds nifler2, nimsem, shoggoth and itself"
+  # `nimony/bin`'s phases are built by classic Nim — a different compiler, whose hash tables iterate
+  # in another order (#1753) — so nimony builds each again from the tree, and those replace them:
+  # they are the reference every artifact is held to, and the compiler of step 2. The driver is
+  # rebuilt for its Temen backend, which step 2 plans with; nifmake only sequences work, so `bin/`'s
+  # stays.
+  pids=()
+  for p in nifler2/nifler2 nimony/nimsem lengc/shoggoth/shoggoth nimony/nimony; do
+    n="$(basename "$p")"
+    (cd "$N" && nimony c --isMain --nimcache:"$C/native-$n" "src/$p.nim" >/dev/null) &
+    pids+=($!)
+  done
+  for pid in "${pids[@]}"; do wait "$pid"; done
+  for n in nifler2 nimsem shoggoth nimony; do
+    cp "$(ls "$C/native-$n"/c/*/"$n" | head -1)" "$N/bin/$n"
+  done
+  touch "$C/built"
+fi
+cp target/release/examples/temen_link "$N/bin/temen-link"
+ln -sfn "$N" "$W/nimony"
 
-echo "[toolchain 2/3] the tools, through the POSIX edge, built by those phases"
+echo "[toolchain 2/3] the tools, through the POSIX edge: nimony t builds each, and temen-link links it"
 # nimsem builds in the tree's own nimcache, which the lane's self-build compares against; the others
-# each get their own, because the builds run at once and would otherwise all write it.
-build() { NIMONY_BIN="$N/bin" "$B/build_nim_hello_temen" --posix --root "$N" "$@"; }
+# each get their own, because the builds run at once and would otherwise all write it. Each build's
+# module goes first, so its link reruns over what the cache holds.
+cache() { if [ "$1" = nimsem ]; then echo "$N/nimcache"; else echo "$C/nimcache-$1"; fi; }
 pids=()
-build src/nimony/nimsem.nim "$W/nimsem.temen" &
-pids+=($!)
-for p in nifler2/nifler2 hexer/hexer nimony/nimony nifmake/nifmake; do
+for p in nimony/nimsem nifler2/nifler2 lengc/shoggoth/shoggoth nimony/nimony nifmake/nifmake; do
   n="$(basename "$p")"
-  build --nimcache "$W/nimcache-$n" "src/$p.nim" "$W/$n.temen" &
+  rm -f "$(cache "$n")"/t/*/"$n.temen"
+  args=(t --isMain "src/$p.nim")
+  [ "$n" = nimsem ] || args=(t --isMain --nimcache:"$(cache "$n")" "src/$p.nim")
+  (cd "$N" && PATH="$N/bin:$PATH" nimony "${args[@]}" >/dev/null) &
   pids+=($!)
 done
 for pid in "${pids[@]}"; do wait "$pid"; done
+for n in nimsem nifler2 shoggoth nimony nifmake; do
+  cp "$(ls "$(cache "$n")"/t/*/"$n.temen" | head -1)" "$W/$n.temen"
+done
 
 echo "[toolchain 3/3] /bin/sh: the POSIX build of demos/shell"
 make -s -C frontend/chibicc

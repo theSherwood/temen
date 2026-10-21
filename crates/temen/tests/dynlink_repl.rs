@@ -47,7 +47,6 @@ impl Repl {
             DEFAULT_RESERVED_LOG2,
             None,
             None,
-            None,
             None, // fuel
             None,
             None,
@@ -79,7 +78,7 @@ impl Repl {
         // call sigs in the resolved funcs.
         let defs = self
             .cm
-            .define_extra(&unit.funcs, &unit.types, None)
+            .define_extra(&unit.funcs, &unit.types)
             .expect("compile the definition");
         let slot = self
             .cm

@@ -4,7 +4,7 @@
 //! and, when it is spent, calls the cell's refill (word 1) instead of trapping at once: the refill
 //! draws the next chunk from the budget chain the embedder accounts in ([`BudgetNode`]), and only a
 //! spent chain traps `OutOfFuel`. A cell with no source is a fixed allowance, refilled never — a
-//! carve child's, or a harness's `u64` budget. The JIT meters; the embedder's budget tree accounts.
+//! harness's `u64` budget. The JIT meters; the embedder's budget tree accounts.
 //!
 //! The refill is called through a `PreserveAll` trampoline ([`refill_trampoline`]), which clobbers
 //! no register. A plain call would clobber the caller-saved registers at every safepoint, so a value
@@ -26,8 +26,9 @@ pub trait BudgetNode: Send + Sync {
     fn room(&self) -> i64;
     /// Charge one live vCPU to every level, all or nothing: `false` when a level's `spawn` is full.
     fn charge_vcpu(&self) -> bool;
-    /// [`Self::charge_vcpu`] past any ceiling: a vCPU a thaw re-creates, which lived before the freeze.
-    fn force_vcpu(&self);
+    /// [`Self::charge_vcpu`] past any ceiling, since it lived before the freeze, but never past the
+    /// process's pools (#2318): a vCPU a thaw re-creates. `false` when they have no room.
+    fn rebuild_vcpu(&self) -> bool;
     /// Hand back a vCPU's charge when it ends.
     fn vcpu_ended(&self);
     /// #2112 — charge one live fiber, [`temen_ir::FIBER_STACK`] of `mem`, to every level, all or
@@ -134,7 +135,7 @@ impl Drop for FuelCell {
 ///
 /// # Safety
 /// `cell` is a live [`FuelCell`].
-unsafe extern "C" fn fuel_refill(cell: *mut FuelCell) {
+pub(crate) unsafe extern "C" fn fuel_refill(cell: *mut FuelCell) {
     // Only the `src` field is borrowed: compiled code writes `left` through the raw cell pointer.
     let mut src = (*cell).src.lock().unwrap_or_else(|e| e.into_inner());
     let left = core::ptr::addr_of_mut!((*cell).left);
@@ -179,7 +180,7 @@ fn compile_refill_trampoline() -> Result<(crate::OwnedJit, usize), crate::JitErr
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
     use cranelift_module::{Linkage, Module};
     let backend = |e: cranelift_module::ModuleError| crate::JitError::Backend(e.to_string());
-    let mut module = crate::new_jit_module()?;
+    let mut module = crate::new_jit_module(crate::Imports::NONE)?;
     let mut sig = Signature::new(CallConv::PreserveAll);
     sig.params.push(AbiParam::new(I64)); // the cell
     let id = module
@@ -194,16 +195,10 @@ fn compile_refill_trampoline() -> Result<(crate::OwnedJit, usize), crate::JitErr
     b.switch_to_block(entry);
     b.seal_block(entry);
     let cell = b.block_params(entry)[0];
-    let mut inner = Signature::new(module.isa().default_call_conv());
-    inner.params.push(AbiParam::new(I64));
-    let inner = b.import_signature(inner);
-    let refill = b
-        .ins()
-        .iconst(I64, fuel_refill as *const () as usize as i64);
-    b.ins().call_indirect(inner, refill, &[cell]);
+    crate::call_host(&mut module, &mut b, crate::HostFn::FuelRefill, &[cell])?;
     b.ins().return_(&[]);
     b.finalize();
-    module.define_function(id, &mut ctx).map_err(backend)?;
+    crate::define_verified(&mut module, id, &mut ctx)?;
     module.finalize_definitions().map_err(backend)?;
     let code = module.get_finalized_function(id) as usize;
     Ok((crate::OwnedJit::new(module), code))
@@ -278,7 +273,9 @@ mod tests {
         fn charge_vcpu(&self) -> bool {
             true
         }
-        fn force_vcpu(&self) {}
+        fn rebuild_vcpu(&self) -> bool {
+            true
+        }
         fn vcpu_ended(&self) {}
         fn charge_fiber(&self) -> bool {
             true

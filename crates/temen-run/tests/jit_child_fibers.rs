@@ -1,8 +1,8 @@
 //! #1469 — a §14 child that uses §12 fibers runs on the **Cranelift JIT**, with a fiber registry of
-//! its own, as on the tree-walk oracle. A detached (op 15) child runs as an executor task, and each
-//! task carries its own fiber runtime: the child's `cont.*` handles number from 0
-//! and never reach the parent's fibers. The parent parks a fiber of its own across the spawn, so a
-//! registry shared across domains shows up as a different result (the programs are
+//! its own, as on the tree-walk oracle. A detached child (spawned from a record, op 17) runs as an
+//! executor task, and each task carries its own fiber runtime: the child's `cont.*` handles number
+//! from 0 and never reach the parent's fibers. The parent parks a fiber of its own across the spawn,
+//! so a registry shared across domains shows up as a different result (the programs are
 //! `temen`'s `bytecode_spawn_fibers.rs`, the bytecode engine's half of the same guarantee).
 #![cfg(any(
     all(unix, target_arch = "x86_64"),
@@ -10,9 +10,12 @@
     all(windows, target_arch = "x86_64")
 ))]
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use core::ffi::c_void;
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
-use temen_ir::Module;
+use temen_ir::{Module, SpawnRec};
 use temen_jit::{compile_and_run_capture_reserved_with_host_ex, JitOutcome};
 
 const PARENT_LOG2: u8 = 23;
@@ -55,9 +58,14 @@ block 0 (vs: i64) {{
     )
 }
 
-/// The parent (args `(instantiator, child module, budget)`): parks a fiber at its suspend, spawns and
-/// joins the child, resumes the fiber to its return. Result: child status × 1000 + 11 + 25.
+/// The parent (args `(instantiator, child module, budget)`): parks a fiber at its suspend, spawns the
+/// child from the record at 17408 and joins it, resumes the fiber to its return. Result: child
+/// status × 1000 + 11 + 25.
 fn parent_src() -> String {
+    let child = SpawnRec {
+        size_log2: CHILD_LOG2.into(),
+        ..SpawnRec::default()
+    };
     format!(
         "memory {PARENT_LOG2}
 func (i32, i32, i32) -> (i64) {{
@@ -67,12 +75,13 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
   pf = cont.new f0 z
   a = i64.const 10
   s1, r1 = cont.resume pf a
-  me = i64.extend_i32_s vmod
-  vb = i64.extend_i32_s vbud
-  gz = i64.const 0
-  sl = i64.const {CHILD_LOG2}
-  ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
+  vma = i64.const {module_at}
+  i32.store vma vmod
+  vba = i64.const {budget_at}
+  i32.store vba vbud
+  vrp = i64.const 17408
+  ch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (ch)
   b = i64.const 20
   s2, r2 = cont.resume pf b
   k = i64.const 1000
@@ -82,7 +91,10 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
   return out
   }}
 }}
-{FIBER}"
+{FIBER}{rec}",
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        rec = rec::segment(17408, &child),
     )
 }
 
@@ -94,7 +106,7 @@ fn parse(src: &str) -> Module {
 
 fn powerbox(child: &Module) -> (Host, [i32; 3]) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
+    let inst = host.grant_instantiator();
     let module = host.grant_module(child);
     let budget = host.grant_budget(-1, -1, -1);
     (host, [inst, module, budget])
@@ -162,21 +174,34 @@ fn a_detached_child_has_its_own_fiber_registry_on_the_jit() {
     );
 }
 
-/// A parent with no fibers of its own: spawns the child, returns its join status.
+/// A parent with no fibers of its own: spawns the child from the record at 17408, joins it, and
+/// returns `status * 1000 + value` (#2066).
 fn spawner_src() -> String {
+    let child = SpawnRec {
+        size_log2: CHILD_LOG2.into(),
+        ..SpawnRec::default()
+    };
     format!(
         "memory {PARENT_LOG2}
 func (i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vmod: i32, vbud: i32) {{
-  me = i64.extend_i32_s vmod
-  vb = i64.extend_i32_s vbud
-  gz = i64.const 0
-  sl = i64.const {CHILD_LOG2}
-  ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
-  return vr
+  vma = i64.const {module_at}
+  i32.store vma vmod
+  vba = i64.const {budget_at}
+  i32.store vba vbud
+  vrp = i64.const 17408
+  ch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (ch)
+  vk = i64.const 1000
+  vsk = i64.mul vr_st vk
+  vt = i64.add vsk vr
+  return vt
   }}
-}}"
+}}
+{rec}",
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        rec = rec::segment(17408, &child),
     )
 }
 
@@ -194,8 +219,11 @@ block 0 (vs: i64) {{
   }}
 }}"
     );
-    let got = parity(&spawner_src(), &child);
-    assert!(got != Ok(7), "the suspend did not fault");
+    assert_eq!(
+        parity(&spawner_src(), &child),
+        Ok(temen_ir::trap_code::FIBER_FAULT * 1000),
+        "the suspend faults, and the parent's join answers it"
+    );
 }
 
 /// The child's fiber waits on a window word with a 1 ms timeout. Its `cont.resume` reports

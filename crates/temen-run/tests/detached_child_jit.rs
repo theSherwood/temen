@@ -1,13 +1,14 @@
-//! PROCESS.md §5 / #1287 — **`instantiate_detached` (op 15) on the native JIT**, differential against the
-//! tree-walker. The parent (compiled by Cranelift) spawns a separate-module child DETACHED: the JIT's
-//! op-15 thunk takes the detached-spawn `Budget` quota, builds the child powerbox through
+//! PROCESS.md §5 / #1287 — **the detached spawn (`instantiate_rec`, op 17) on the native JIT**,
+//! differential against the tree-walker. The parent (compiled by Cranelift) spawns a separate-module
+//! child DETACHED from a spawn record (`temen_ir::SpawnRec`): the JIT's spawn thunk reads the record,
+//! takes the detached-spawn `Budget` quota, builds the child powerbox through
 //! `Host::spawn_detached_child` (attests `window_exposed = false`, starter caps over the reservation),
 //! compiles the child over a **decoupled window** (its declared 64 KiB committed inside a root-sized lazy
 //! reservation), seeds the module's data + the spawn-time argv payload into that window, and runs it on
 //! its own OS thread — no carve, no copy-in, no copy-back. The child reads the argv word, `self.attest`s,
 //! `vm_map`s past its declared window (committing a tail page of ITS reservation through its own
 //! `AddressSpace`), stores/loads on the grown page and returns `word + attest`. Same result as the
-//! interpreter's op-15 arm; an exhausted budget refuses `-EINVAL` on both.
+//! interpreter's record spawn; an exhausted budget refuses `-EINVAL` on both.
 
 #[path = "support/detached.rs"]
 mod detached;
@@ -20,6 +21,7 @@ use detached::{
 };
 use std::sync::Mutex;
 use temen_interp::{cap_id, run_with_host, Host, MemLayout, Trap, Value};
+use temen_ir::SpawnRec;
 use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChild, JitOutcome, TrapKind};
 
 /// "hello-de" as a little-endian i64 — the word the child reads at `args_base + 8`.
@@ -49,19 +51,32 @@ block 0 (v0: i64) {
 "#;
 
 /// The parent: `v0` Instantiator, `v1` the child `Module`, `v2` the detached-spawn `Budget`. Stores the args
-/// blob (`argc 1`, `"hello-detached\0"`) as three words at 18432, spawns the child detached (9-arg op 15,
-/// payload `(18432, 24)`, no grants, entry 0, window 2^16), then joins it — or, in the refusal probe,
-/// returns the spawn's own result.
+/// blob (`argc 1`, `"hello-detached\0"`) as three words at 18432, spawns the child detached from the
+/// record at 17408 (payload `(18432, 24)`, no grants, window 2^16), then joins it — or, in the refusal
+/// probe, returns the spawn's own result.
 fn parent(join: bool) -> String {
     parent_then(if join {
-        "vr = call.cap 6 1 (i32) -> (i64) v0 (vh)\n  return vr"
+        "vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n  return vr"
     } else {
         "vr = i64.extend_i32_s vh\n  return vr"
     })
 }
 
+/// A [`parent_then`] tail that joins the child and returns `status * 1000 + value`: what the child
+/// returned, or its trap's wire code times 1000 (#2066).
+const JOIN_BOTH: &str = "vs, vv = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n  \
+                         vk = i64.const 1000\n  \
+                         vsk = i64.mul vs vk\n  \
+                         vr = i64.add vsk vv\n  \
+                         return vr";
+
 /// [`parent`], ending in `tail` (which sees `v0` and the child handle `vh`).
 fn parent_then(tail: &str) -> String {
+    let child = SpawnRec {
+        size_log2: 16,
+        args: (18432, 24),
+        ..SpawnRec::default()
+    };
     format!(
         r#"memory 17
 func (i32, i32, i32) -> (i64) {{
@@ -75,21 +90,21 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   vb2 = i64.const 18448
   vw2 = i64.const {w2}
   i64.store vb2 vw2
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 16
-  vq = i64.const 0
-  vap = i64.const 18432
-  val = i64.const 24
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq, vap, val)
+  vma = i64.const {module_at}
+  i32.store vma v1
+  vba = i64.const {budget_at}
+  i32.store vba v2
+  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   {tail}
   }}
 }}
-"#,
+{rec}"#,
         w1 = ARGV_WORD,
         w2 = i64::from_le_bytes(*b"tached\0\0"),
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        rec = rec::segment(17408, &child),
     )
 }
 
@@ -207,96 +222,79 @@ fn fuel_host(child: &temen_ir::Module, fuel: i64) -> (Host, [i32; 3]) {
     (host, h)
 }
 
-/// #1944 slice 3, #1705 — a detached child burns the fuel of the budget that paid for it, on the JIT
-/// as on the interpreter, though the JIT's root runs with no fuel armed at all: a ceiling the child
-/// loops past ends it (the join hands its trap to the parent), and one with room lets it finish.
+/// #1944 slice 3, #1705, #2066 — a detached child burns the fuel of the budget that paid for it, on
+/// the JIT as on the interpreter, though the JIT's root runs with no fuel armed at all: a ceiling the
+/// child loops past ends it, and the parent's join answers `OUT_OF_FUEL` while the parent runs on,
+/// unmetered as its root is; a ceiling with room lets the child finish.
 #[test]
 fn a_detached_childs_budget_bounds_its_fuel_under_an_unmetered_jit_root() {
-    let p = module(&parent(true));
+    let p = module(&parent_then(JOIN_BOTH));
     let c = module(CHILD_LOOPS);
-    for (fuel, want_interp, want_jit) in [
-        (2000, Ok(vec![Value::I64(7)]), JitOutcome::Returned(vec![7])),
-        (
-            500,
-            Err(Trap::OutOfFuel),
-            JitOutcome::Trapped(TrapKind::OutOfFuel),
-        ),
-    ] {
+    for (fuel, want) in [(2000, 7), (500, temen_ir::trap_code::OUT_OF_FUEL * 1000)] {
         assert_eq!(
             interp_result(&p, fuel_host(&c, fuel)),
-            want_interp,
-            "interpreter, ceiling {fuel}"
-        );
-        assert_eq!(
-            jit_outcome(&p, fuel_host(&c, fuel)),
-            want_jit,
-            "the JIT, ceiling {fuel}"
-        );
-    }
-}
-
-/// #2053 — `wait` (op 18) on the JIT answers as the interpreter does: a child that loops past its
-/// node's fuel ceiling answers `OUT_OF_FUEL` and the parent runs on, unmetered as its root is, the
-/// child reaped; one with room answers 0 and stays for its `join`.
-#[test]
-fn wait_reports_a_detached_childs_fuel_running_out_on_the_jit() {
-    let wait = module(&parent_then(
-        "vr = call.cap 6 18 (i32) -> (i64) v0 (vh)\n  return vr",
-    ));
-    let wait_join = module(&parent_then(
-        "vw = call.cap 6 18 (i32) -> (i64) v0 (vh)\n  \
-         vj = call.cap 6 1 (i32) -> (i64) v0 (vh)\n  \
-         vk = i64.const 1000\n  \
-         vs = i64.mul vw vk\n  \
-         vr = i64.add vs vj\n  \
-         return vr",
-    ));
-    let c = module(CHILD_LOOPS);
-    for (p, fuel, want) in [
-        (&wait_join, 2000, 7),
-        (&wait, 500, temen_ir::trap_code::OUT_OF_FUEL),
-    ] {
-        assert_eq!(
-            interp_result(p, fuel_host(&c, fuel)),
             Ok(vec![Value::I64(want)]),
             "interpreter, ceiling {fuel}"
         );
         assert_eq!(
-            jit_outcome(p, fuel_host(&c, fuel)),
+            jit_outcome(&p, fuel_host(&c, fuel)),
             JitOutcome::Returned(vec![want]),
             "the JIT, ceiling {fuel}"
         );
     }
-    // The wait reaped the trapped child: joining it after is a spent handle.
+}
+
+/// #2066 — the join that answers a child's `OUT_OF_FUEL` reaps it, on the JIT as on the
+/// interpreter: joining it again is a spent handle.
+#[test]
+fn a_join_reaps_a_child_that_ran_out_of_fuel_on_the_jit() {
+    let join_join = module(&parent_then(
+        "vs, vv = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n  \
+         vs2, vv2 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n  \
+         return vv2",
+    ));
+    let c = module(CHILD_LOOPS);
     assert_eq!(
-        interp_result(&wait_join, fuel_host(&c, 500)),
+        interp_result(&join_join, fuel_host(&c, 500)),
         Err(Trap::ThreadFault)
     );
     assert_eq!(
-        jit_outcome(&wait_join, fuel_host(&c, 500)),
+        jit_outcome(&join_join, fuel_host(&c, 500)),
         JitOutcome::Trapped(TrapKind::ThreadFault)
     );
 }
 
-/// `v0` Instantiator, `v1` the child `Module`, `v2` the `Budget`: spawn the child detached (window
-/// 2^16, no payload), join it, then spawn and join it again, returning the two results' sum. A refused
-/// second spawn traps its join (a negative handle).
-const SPAWN_JOIN_SPAWN: &str = r#"memory 17
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
-  vz = i64.const 0
-  vlog = i64.const 16
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  vh2 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz)
-  vj2 = call.cap 6 1 (i32) -> (i64) v0 (vh2)
+/// `v0` Instantiator, `v1` the child `Module`, `v2` the `Budget`: spawn the child detached from the
+/// record at 17408 (window 2^16, no payload), join it, then spawn and join it again from the same
+/// record, returning the two results' sum. A refused second spawn traps its join (a negative handle).
+fn spawn_join_spawn() -> String {
+    let child = SpawnRec {
+        size_log2: 16,
+        ..SpawnRec::default()
+    };
+    format!(
+        r#"memory 17
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vma = i64.const {module_at}
+  i32.store vma v1
+  vba = i64.const {budget_at}
+  i32.store vba v2
+  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
+  vh2 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vj2_st, vj2 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh2)
   vr = i64.add vj vj2
   return vr
-  }
+  }}
+}}
+{rec}"#,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        rec = rec::segment(17408, &child),
+    )
 }
-"#;
 
 /// [`host`] whose `Budget` funds `spawn` live children (1 MiB of window).
 fn spawn_host(child: &temen_ir::Module, spawn: i64) -> (Host, [i32; 3]) {
@@ -322,7 +320,7 @@ fn a_detached_child_is_one_spawn_of_its_budget_on_the_jit() {
         JitOutcome::Returned(vec![-22]),
         "the JIT, a spawn-0 budget"
     );
-    let twice = module(SPAWN_JOIN_SPAWN);
+    let twice = module(&spawn_join_spawn());
     assert_eq!(
         interp_result(&twice, spawn_host(&c, 1)),
         Ok(vec![Value::I64(14)]),
@@ -335,25 +333,46 @@ fn a_detached_child_is_one_spawn_of_its_budget_on_the_jit() {
     );
 }
 
-/// `v0` Instantiator, `v1` the child `Module`, `v2` the `Budget`: spawn the child detached (window
-/// 2^16, no payload) and join it.
-const SPAWN_JOIN: &str = r#"memory 17
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
-  vz = i64.const 0
-  vlog = i64.const 16
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vj
-  }
+/// `v0` Instantiator, `v1` the child `Module`, `v2` the `Budget`: spawn the child detached from the
+/// record at 17408 (window 2^16, no payload), join it, and return `status * 1000 + value` (#2066).
+fn spawn_join() -> String {
+    let child = SpawnRec {
+        size_log2: 16,
+        ..SpawnRec::default()
+    };
+    format!(
+        r#"memory 17
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vma = i64.const {module_at}
+  i32.store vma v1
+  vba = i64.const {budget_at}
+  i32.store vba v2
+  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
+  vk = i64.const 1000
+  vsk = i64.mul vj_st vk
+  vr = i64.add vsk vj
+  return vr
+  }}
+}}
+{rec}"#,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        rec = rec::segment(17408, &child),
+    )
 }
-"#;
 
-/// [`SPAWN_JOIN`], granting the child what the host named `name`, under that name: the root resolves
-/// it and hands it on in the spawn's grant list.
+/// [`spawn_join`], granting the child what the host named `name`, under that name: the root resolves
+/// it and hands it on in the spawn record's grant list (one grant record, at 17664).
 fn parent_granting_by_name(name: &str) -> String {
+    let child = SpawnRec {
+        size_log2: 16,
+        grants_ptr: 17664,
+        grants_n: 1,
+        ..SpawnRec::default()
+    };
     format!(
         r#"memory 17
 data 17920 "{name}"
@@ -362,20 +381,22 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   vnp = i64.const 17920
   vnl = i64.const {len}
   vg = self.resolve vnp vnl
-{grant}  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
-  vgp = i64.const 17664
-  vgn = i64.const 1
-  vz = i64.const 0
-  vlog = i64.const 16
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vgp, vgn, vz, vlog, vz, vz, vz)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+{grant}  vma = i64.const {module_at}
+  i32.store vma v1
+  vba = i64.const {budget_at}
+  i32.store vba v2
+  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vj
   }}
 }}
-"#,
+{rec}"#,
         len = name.len(),
         grant = rec::grant("g", 17664, 17920, name.len(), "vg"),
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        rec = rec::segment(17408, &child),
     )
 }
 
@@ -406,17 +427,19 @@ block 0 (vsp: i64, varg: i64) {
 
 /// #2001 — a detached child's threads are `spawn`s of the budget that pays for it while they live, on
 /// the JIT as on the interpreter: a child whose ceiling is one vCPU fills it itself, so its first
-/// `thread.spawn` traps, and one whose ceiling is two runs a thread, joins it and runs another in its
-/// place (`Done::publish` hands the first one's charge back).
+/// `thread.spawn` traps (its parent's join answers `THREAD_FAULT`), and one whose ceiling is two runs
+/// a thread, joins it and runs another in its place (`Done::publish` hands the first one's charge
+/// back).
 #[test]
 fn a_detached_childs_threads_are_capped_by_its_budget_on_the_jit() {
-    let p = module(SPAWN_JOIN);
+    let p = module(&spawn_join());
     let c = module(CHILD_SPAWNS_THREADS_IN_TURN);
+    let fault = temen_ir::trap_code::THREAD_FAULT * 1000;
     for (spawn, want_interp, want_jit) in [
         (
             1,
-            Err(Trap::ThreadFault),
-            JitOutcome::Trapped(TrapKind::ThreadFault),
+            Ok(vec![Value::I64(fault)]),
+            JitOutcome::Returned(vec![fault]),
         ),
         (2, Ok(vec![Value::I64(32)]), JitOutcome::Returned(vec![32])),
     ] {
@@ -486,7 +509,7 @@ fn a_detached_spawn_trapping_on_its_grant_records_charges_nothing() {
     assert_eq!(room, 1 << 20, "the trap handed the window back");
 }
 
-/// #1972 — the JIT's op-15 thunk admits a child (`budget_mem_take`) and builds it
+/// #1972 — the JIT's detached spawn admits a child (`budget_mem_take`) and builds it
 /// (`build_detached`) in two hook calls, and a concurrent run's hooks each take the parent's lock on
 /// their own. So two vCPUs of one domain can admit, admit, build, build. Each build must still give
 /// its child the lane and the `"budget"` that child's own admission charged. While the admission left
@@ -519,6 +542,7 @@ fn two_interleaved_detached_spawns_each_get_their_own_lane_and_budget() {
             lane_cap: -1,
             parent_domain: 0,
             parent_lane_cap: -1,
+            pages: std::ptr::null(),
         };
         let mut trap = 0i64;
         let reservation = 1u64 << temen_ir::DEFAULT_RESERVED_LOG2;
@@ -536,6 +560,7 @@ fn two_interleaved_detached_spawns_each_get_their_own_lane_and_budget() {
                 WINDOW,
                 temen_ir::WINDOW_RUNS,
                 lane,
+                u32::MAX, // no pager
                 &mut gc,
                 &mut trap,
             )
@@ -620,18 +645,26 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   vall = i64.const -1
   vmaps = i64.const {maps}
   vsub = call.cap 14 0 (i64, i64, i64, i64, i64, i64) -> (i32) v2 (vall, vall, vall, vall, vall, vmaps)
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u vsub
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 16
-  vq = i64.const 0
-  vs = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+  vma = i64.const {module_at}
+  i32.store vma v1
+  vba = i64.const {budget_at}
+  i32.store vba vsub
+  vrp = i64.const 17408
+  vs = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vr = i64.extend_i32_s vs
   return vr
   }}
 }}
-"#
+{rec}"#,
+            module_at = 17408 + SpawnRec::MODULE_AT,
+            budget_at = 17408 + SpawnRec::BUDGET_AT,
+            rec = rec::segment(
+                17408,
+                &SpawnRec {
+                    size_log2: 16,
+                    ..SpawnRec::default()
+                }
+            ),
         ))
     };
     let short = parent(lease - 1);
@@ -680,18 +713,26 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   vall = i64.const -1
   vmaps = i64.const {maps}
   vsub = call.cap 14 0 (i64, i64, i64, i64, i64, i64) -> (i32) v2 (vall, vall, vall, vall, vall, vmaps)
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u vsub
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 18
-  vq = i64.const 0
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vma = i64.const {module_at}
+  i32.store vma v1
+  vba = i64.const {budget_at}
+  i32.store vba vsub
+  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vr
   }}
 }}
-"#
+{rec}"#,
+            module_at = 17408 + SpawnRec::MODULE_AT,
+            budget_at = 17408 + SpawnRec::BUDGET_AT,
+            rec = rec::segment(
+                17408,
+                &SpawnRec {
+                    size_log2: 18,
+                    ..SpawnRec::default()
+                }
+            ),
         ))
     };
     const ENOMEM: i64 = -12;
@@ -703,23 +744,34 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
     assert_eq!(run_jit(&short, &c, 1 << 18), ENOMEM, "jit: one short");
 }
 
-/// A parent that only issues the 7-arg op 15 and returns its result — no window stores, so it runs
-/// unchanged under a **durable** host (whose shadow reserve spans `[0, 64 KiB)`).
-const SPAWN_ONLY_PARENT: &str = r#"memory 17
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 16
-  vq = i64.const 0
-  vs = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+/// A parent that only spawns from its record at 17408 (window 2^16, nothing else) and returns the
+/// spawn's result. Its only window writes are the record's two handles, above the durable control
+/// words, so it runs unchanged under a **durable** host.
+fn spawn_only_parent() -> String {
+    let child = SpawnRec {
+        size_log2: 16,
+        ..SpawnRec::default()
+    };
+    format!(
+        r#"memory 17
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vma = i64.const {module_at}
+  i32.store vma v1
+  vba = i64.const {budget_at}
+  i32.store vba v2
+  vrp = i64.const 17408
+  vs = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vr = i64.extend_i32_s vs
   return vr
-  }
+  }}
+}}
+{rec}"#,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        rec = rec::segment(17408, &child),
+    )
 }
-"#;
 
 /// #1412 / #1501 — **a durable detached spawn of an un-attested module declines identically on the
 /// interpreter and the native JIT.**
@@ -733,7 +785,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 /// is `temen-interp`'s `durable_detached_parity.rs`.)
 #[test]
 fn a_durable_detached_spawn_of_an_unattested_module_declines_the_same_way_on_both_backends() {
-    let p = module(SPAWN_ONLY_PARENT);
+    let p = module(&spawn_only_parent());
     let c = module(CHILD);
 
     // Native JIT tier, through the embedder's path (`jit_cap_run`, which installs the grant hooks): the
@@ -796,11 +848,11 @@ fn a_durable_detached_spawn_of_an_unattested_module_declines_the_same_way_on_bot
     }
 }
 
-/// Op-15 **pre-mapped region** (the 11-arg form) on the native JIT, differential against the
-/// tree-walker: the parent mints a 64 KiB `SharedRegion`, maps it at 65536 in its own window, stores
-/// the word 41 at region byte 0 and spawns the child detached with the region pre-mapped at 65536 of
-/// ITS window. The child reads the word through the alias, writes `2 × 41` at region byte 8 and
-/// returns `41 + 1`; the parent joins and reads the child's word back through its own mapping:
+/// A spawn record's **pre-mapped region** on the native JIT, differential against the tree-walker:
+/// the parent mints a 64 KiB `SharedRegion`, maps it at 65536 in its own window, stores the word 41
+/// at region byte 0 and spawns the child detached with the region pre-mapped at 65536 of ITS window.
+/// The child reads the word through the alias, writes `2 × 41` at region byte 8 and returns
+/// `41 + 1`; the parent joins and reads the child's word back through its own mapping:
 /// `1000 × 42 + 82`. On the JIT both mappings are real `MAP_SHARED` views of one memfd/section
 /// (`Host::apply_premap` over the child's `MprotectWindow`, before its first instruction); on the
 /// interpreter they are `PageProt::Backed` aliases — same bytes, same result.
@@ -820,11 +872,11 @@ block 0 (v0: i64) {
 }
 "#;
 
-/// `v0` Instantiator, `v1` AddressSpace, `v2` the child `Module`, `v3` the `Budget`; `off` is the
-/// child-window offset the region is pre-mapped at (`65536` round-trips; `1 << 17` overruns the
-/// child's window and refuses `-EINVAL`, which the non-joining form returns). `hand_off` unmaps the
-/// parent's own view after filling the region and before the spawn (#1707), so the parent returns
-/// only the child's result.
+/// `v0` Instantiator, `v1` AddressSpace, `v2` the child `Module`, `v3` the `Budget`; the spawn record
+/// at 17408 names the region and `off`, the child-window offset it is pre-mapped at (`65536`
+/// round-trips; `1 << 17` overruns the child's window and refuses `-EINVAL`, which the non-joining
+/// form returns). `hand_off` unmaps the parent's own view after filling the region and before the
+/// spawn (#1707), so the parent returns only the child's result.
 fn premap_parent(off: u64, join: bool, hand_off: bool) -> String {
     let unmap = if hand_off {
         "vu = call.cap 4 1 (i64, i64) -> (i64) vrh (vwo, vlen)"
@@ -832,11 +884,16 @@ fn premap_parent(off: u64, join: bool, hand_off: bool) -> String {
         ""
     };
     let tail = if hand_off {
-        "vj = call.cap 6 1 (i32) -> (i64) v0 (vc)\n  return vj"
+        "vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)\n  return vj"
     } else if join {
-        "vj = call.cap 6 1 (i32) -> (i64) v0 (vc)\n  vk = i64.const 1000\n  vm = i64.mul vj vk\n  vob = i64.const 65544\n  vo = i64.load vob\n  vr = i64.add vm vo\n  return vr"
+        "vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)\n  vk = i64.const 1000\n  vm = i64.mul vj vk\n  vob = i64.const 65544\n  vo = i64.load vob\n  vr = i64.add vm vo\n  return vr"
     } else {
         "vr = i64.extend_i32_s vc\n  return vr"
+    };
+    let child = SpawnRec {
+        size_log2: 17,
+        child_off: off,
+        ..SpawnRec::default()
     };
     format!(
         r#"memory 17
@@ -852,17 +909,22 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
   vin = i64.const 41
   i64.store vwo vin
   {unmap}
-  vmh = i64.extend_i32_u v2
-  vb = i64.extend_i32_u v3
-  vz = i64.const 0
-  vlog = i64.const 17
-  vreg = i64.extend_i32_u vrh
-  voff = i64.const {off}
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz, vreg, voff)
+  vma = i64.const {module_at}
+  i32.store vma v2
+  vba = i64.const {budget_at}
+  i32.store vba v3
+  vra = i64.const {region_at}
+  i32.store vra vrh
+  vrp = i64.const 17408
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   {tail}
   }}
 }}
-"#
+{rec}"#,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        region_at = 17408 + SpawnRec::REGION_AT,
+        rec = rec::segment(17408, &child),
     )
 }
 
@@ -871,7 +933,7 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
 fn premap_host(child: &temen_ir::Module) -> (Host, [i32; 4]) {
     let mut host = Host::new();
     host.set_region_factory(temen_run::new_shared_region);
-    let inst = host.grant_instantiator(0, 1u64 << 17);
+    let inst = host.grant_instantiator();
     let aspace = host.grant_address_space(0, 1u64 << 17);
     let modh = host.grant_module(child);
     let budget = host.grant_budget(-1, 1i64 << 17, -1);
@@ -961,9 +1023,17 @@ fn a_pre_map_overrunning_the_child_window_refuses_probeably_on_both_backends() {
     );
 }
 
-/// `v0` Instantiator, `v1` the [`nester`] module, `v2` the `Budget`: spawn it detached with depth `d`
-/// as its payload and itself granted as `"nester"`, join it, and return its result.
+/// `v0` Instantiator, `v1` the [`nester`] module, `v2` the `Budget`: spawn it detached from the record
+/// at 17408 with depth `d` as its payload and itself granted as `"nester"`, join it, and return its
+/// result.
 fn nest_root(d: i64) -> String {
+    let child = SpawnRec {
+        size_log2: 16,
+        grants_ptr: 20032,
+        grants_n: 1,
+        args: (18432, 8),
+        ..SpawnRec::default()
+    };
     format!(
         r#"memory 17
 data 20016 "nester"
@@ -972,20 +1042,21 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   vpp = i64.const 18432
   vd = i64.const {d}
   i64.store vpp vd
-{grant}  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
-  vgp = i64.const 20032
-  vgn = i64.const 1
-  vz = i64.const 0
-  vlog = i64.const 16
-  vpl = i64.const 8
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vgp, vgn, vz, vlog, vz, vpp, vpl)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+{grant}  vma = i64.const {module_at}
+  i32.store vma v1
+  vba = i64.const {budget_at}
+  i32.store vba v2
+  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vj
   }}
 }}
-"#,
+{rec}"#,
         grant = rec::grant("g", 20032, 20016, 6, "v1"),
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        rec = rec::segment(17408, &child),
     )
 }
 
@@ -1057,47 +1128,59 @@ fn a_child_joining_its_child_under_a_lane_cap_of_one_steps_aside_on_the_jit() {
 }
 
 /// A detached child (`memory 16`) whose thread spawns a grandchild (the image of func 2, which returns
-/// 5, granted it as `"grandchild"`) from the child's `"budget"` and joins it; the child joins the
-/// thread, which returns the result plus 100.
-const CHILD_THREAD_SPAWNS: &str = r#"memory 16
+/// 5, granted it as `"grandchild"`) from the child's `"budget"`, by the record at 17408, and joins it;
+/// the child joins the thread, which returns the result plus 100.
+fn child_thread_spawns() -> String {
+    let grandchild = SpawnRec {
+        size_log2: 16,
+        ..SpawnRec::default()
+    };
+    format!(
+        r#"memory 16
 data 20000 "budget"
 data 20016 "grandchild"
 export 0 func "grandchild" 2
-func (i64) -> (i64) {
-block 0 (v0: i64) {
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
   vz = i64.const 0
   vt = thread.spawn 1 vz v0
   vj = thread.join vt
   return vj
-  }
-}
-func (i64, i64) -> (i64) {
-block 0 (vsp: i64, vi: i64) {
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, vi: i64) {{
   vnp = i64.const 20000
   vnl = i64.const 6
   vb = self.resolve vnp vnl
-  vbw = i64.extend_i32_u vb
   vgp = i64.const 20016
   vgl = i64.const 10
   vg = self.resolve vgp vgl
-  vgw = i64.extend_i32_u vg
-  vz = i64.const 0
-  vlog = i64.const 16
+  vma = i64.const {module_at}
+  i32.store vma vg
+  vba = i64.const {budget_at}
+  i32.store vba vb
+  vrp = i64.const 17408
   vinst = i32.wrap_i64 vi
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vgw, vz, vz, vz, vlog, vz, vz, vz)
-  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   vk = i64.const 100
   vr = i64.add vj vk
   return vr
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
   v = i64.const 5
   return v
-  }
+  }}
+}}
+{rec}"#,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        rec = rec::segment(17408, &grandchild),
+    )
 }
-"#;
 
 /// #1956 — a detached child's thread that joins a grandchild gives back its own lanes while it waits,
 /// on the JIT as on the interpreter: the child's budget holds one lane, which the thread runs in and
@@ -1105,7 +1188,7 @@ block 0 (v0: i64) {
 #[test]
 fn a_childs_thread_joining_a_grandchild_gives_back_the_childs_lane_on_the_jit() {
     let (interp, jit) = within_a_minute("a child's thread joining a grandchild", || {
-        let c = module(CHILD_THREAD_SPAWNS);
+        let c = module(&child_thread_spawns());
         let grandchild = temen_ir::child_image_at(&c, 2).expect("grandchild image");
         let p = module(&parent_granting_by_name("grandchild"));
         // The run's budget, narrowed to a node with one lane: the child's lane. The host names the
@@ -1179,9 +1262,10 @@ block 1 () {
 
 /// #2074 — `kill` (op 12) ends a detached child however it is occupied, on the JIT as on the
 /// interpreter: spinning, parked on a word of its own window, or with its thread parked while its main
-/// joins it. The parent sleeps 50 ms so the child is spinning or parked first, kills it, and `wait`s:
-/// each answers `THREAD_FAULT`. A kill that only flags a parked child leaves the `wait` hanging (or, on
-/// the interpreter with nothing else alive, ends the run as a deadlock), so neither stands in for it.
+/// joins it. The parent sleeps 50 ms so the child is spinning or parked first, kills it, and joins it:
+/// each join answers `THREAD_FAULT` (#2066). A kill that only flags a parked child leaves the join
+/// hanging (or, on the interpreter with nothing else alive, ends the run as a deadlock), so neither
+/// stands in for it.
 #[test]
 fn kill_ends_a_detached_child_spinning_or_parked() {
     let p = module(&parent_then(
@@ -1190,8 +1274,8 @@ fn kill_ends_a_detached_child_spinning_or_parked() {
          vst = i64.const 50000000\n  \
          vsl = i32.atomic.wait vsa vse vst\n  \
          vk = call.cap 6 12 (i32) -> (i32) v0 (vh)\n  \
-         vr = call.cap 6 18 (i32) -> (i64) v0 (vh)\n  \
-         return vr",
+         vs, vv = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n  \
+         return vs",
     ));
     let fault = temen_ir::trap_code::THREAD_FAULT;
     let children = [
@@ -1253,14 +1337,14 @@ block 1 () {
 
 /// #2088 — a kill on the JIT survives the child's host calls: each successful `call.cap` resets the
 /// trap cell, which used to erase a kill that landed during (or before) one, so the child ran on and
-/// its parent's `wait` hung. The parent kills each child as soon as it is spawned; both answer
+/// its parent's join hung. The parent kills each child as soon as it is spawned; both joins answer
 /// `THREAD_FAULT`, as on the interpreter.
 #[test]
 fn a_kill_survives_the_childs_host_calls_on_the_jit() {
     let p = module(&parent_then(
         "vk = call.cap 6 12 (i32) -> (i32) v0 (vh)\n  \
-         vr = call.cap 6 18 (i32) -> (i64) v0 (vh)\n  \
-         return vr",
+         vs, vv = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n  \
+         return vs",
     ));
     let fault = temen_ir::trap_code::THREAD_FAULT;
     for (name, child) in [
@@ -1325,28 +1409,40 @@ block 2 (verr: i64) {
 }
 "#;
 
-/// `v0` Instantiator, `v1` the [`MINTING_CHILD`] module, `v2` the `Budget`: spawn it detached with a
-/// window of `2^17`, join it, and return its result.
-const MINTING_PARENT: &str = r#"memory 17
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
-  vz = i64.const 0
-  vlog = i64.const 17
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+/// `v0` Instantiator, `v1` the [`MINTING_CHILD`] module, `v2` the `Budget`: spawn it detached from the
+/// record at 17408, with a window of `2^17`, join it, and return its result.
+fn minting_parent() -> String {
+    let child = SpawnRec {
+        size_log2: 17,
+        ..SpawnRec::default()
+    };
+    format!(
+        r#"memory 17
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vma = i64.const {module_at}
+  i32.store vma v1
+  vba = i64.const {budget_at}
+  i32.store vba v2
+  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vj
-  }
+  }}
+}}
+{rec}"#,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        rec = rec::segment(17408, &child),
+    )
 }
-"#;
 
 /// #1978 — a detached child maps a region it minted itself on the JIT, as on the interpreter. Its
 /// host inherits the embedder's OS shared-memory region factory (`Host::child_host`); before, it
 /// minted a software `VecBacking` the JIT cannot `mmap`, and the map answered `-EINVAL`.
 #[test]
 fn a_detached_child_maps_a_region_it_minted_on_the_jit_as_on_the_interpreter() {
-    let parent = module(MINTING_PARENT);
+    let parent = module(&minting_parent());
     let child = module(MINTING_CHILD);
     let minting_host = || {
         let (mut host, h) = host(&child, 1 << 20);
@@ -1382,7 +1478,7 @@ fn parent_granting(grants: &[(&str, u32)]) -> String {
     let rec = temen_ir::SpawnRec {
         grants_ptr: GRANTS,
         grants_n: grants.len() as u64,
-        ..temen_ir::SpawnRec::v1(0)
+        ..temen_ir::SpawnRec::default()
     };
     let mut segments = seg(REC, &rec.encode());
     for (i, (name, handle)) in grants.iter().enumerate() {
@@ -1416,13 +1512,13 @@ block 1 (ve: i32) {{
   return vr
 }}
 block 2 (vi: i32, vc: i32) {{
-  vr = call.cap 6 1 (i32) -> (i64) vi (vc)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vi (vc)
   return vr
   }}
 }}
 {segments}"#,
-        ma = REC + 24,
-        ba = REC + 28,
+        ma = REC + temen_ir::SpawnRec::MODULE_AT,
+        ba = REC + temen_ir::SpawnRec::BUDGET_AT,
     )
 }
 

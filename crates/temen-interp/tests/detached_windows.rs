@@ -1,18 +1,32 @@
-//! PROCESS.md §5 — **detached windows**: a child spawned through a detached-spawn `Budget` capability
-//! (`Instantiator.instantiate_detached`, op 15) runs in a fresh platform window *outside* its
-//! spawner's — no ancestor below the platform holds read authority, and the child attests
-//! `window_exposed = false` (the jacl distrust-spawner trust anchor). Detachment severs READ,
-//! not lifecycle (the spawner keeps kill/join) and not coordination (live offers work — the
-//! linkage is the powerbox, not the window). The budget's byte quota is host-enforced at each
+//! PROCESS.md §5 — **detached windows**: a child spawned through a detached-spawn `Budget`
+//! capability (a spawn record, `Instantiator.instantiate_rec`, op 17) runs in a fresh platform
+//! window *outside* its spawner's — no ancestor below the platform holds read authority, and the
+//! child attests `window_exposed = false` (the jacl distrust-spawner trust anchor). Detachment
+//! severs READ, not lifecycle (the spawner keeps kill/join) and not coordination (live offers work
+//! — the linkage is the powerbox, not the window). The budget's byte quota is host-enforced at each
 //! mint; misses refuse probeably.
+
+#[path = "support/rec.rs"]
+mod rec;
 
 use std::sync::Arc;
 use temen_interp::{run_with_host, Host, Value};
+use temen_ir::SpawnRec;
 
 fn module(text: &str) -> Arc<temen_ir::Module> {
     let m = temen_text::parse_module(text).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     Arc::new(m)
+}
+
+/// The spawn record each parent below lays at 17408 (above the durable control words): a child
+/// window of `1 << size_log2` bytes. The parent stores the child's module and `Budget` handles into
+/// it at run time, at 17432 and 17436.
+fn record(size_log2: i64) -> SpawnRec {
+    SpawnRec {
+        size_log2,
+        ..SpawnRec::default()
+    }
 }
 
 /// The detached serving child: its own module, own offer, own serve loop, in a window the parent
@@ -39,41 +53,45 @@ block 0 (va: i64, vb: i64) {
 }
 "#;
 
-/// The parent: spawns the server DETACHED (op 15 — budget, module, no grants), wires its live
-/// offer (`child_offer` — the linkage is the powerbox Arc, not the window), calls
+/// The parent: spawns the server DETACHED (its spawn record at 17408 — module, budget, no grants),
+/// wires its live offer (`child_offer` — the linkage is the powerbox Arc, not the window), calls
 /// `add(40, 2)` through it (park, serve, reply), joins. Composite: join(1)*100 + 42 = 142.
-const DETACHED_CALLER: &str = r#"
+fn detached_caller() -> String {
+    format!(
+        r#"
 memory 17
 
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 12
-  vq = i64.const 0
-  vB = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vma = i64.const 17416
+  i32.store vma v1
+  vba = i64.const 17420
+  i32.store vba v2
+  vrp = i64.const 17408
+  vB = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vex = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vB, vex)
   va = i64.const 40
   vb = i64.const 2
   vr = call.cap 268435456 0 (i64, i64) -> (i64) vcap (va, vb)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vB)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vB)
   vk = i64.const 100
   vm = i64.mul vj vk
   vs = i64.add vm vr
   return vs
-  }
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(17408, &record(12)),
+    )
 }
-"#;
 
 #[test]
 fn a_detached_child_serves_live_calls_from_a_window_its_parent_cannot_see() {
-    let a = module(DETACHED_CALLER);
+    let a = module(&detached_caller());
     let b = module(DETACHED_SERVER);
     let mut host = Host::new();
-    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hi = host.grant_instantiator();
     let hm = host.grant_module(&b);
     let hw = host.grant_budget(-1, (1 << 12) as i64, -1);
     let mut fuel = 5_000_000u64;
@@ -105,30 +123,36 @@ block 0 (v0: i64) {
 }
 "#;
 
-/// The trust anchor: [`ATTEST_MOD`] spawned **detached** (op 15) attests `tier 1` alone — no
-/// `window_exposed`, the distrust-spawner report, platform-vouched.
-const ATTEST_DETACHED: &str = r#"
+/// The trust anchor: [`ATTEST_MOD`] spawned **detached** (the spawn record at 17408) attests `tier 1`
+/// alone — no `window_exposed`, the distrust-spawner report, platform-vouched.
+fn attest_detached() -> String {
+    format!(
+        r#"
 memory 17
 
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vz = i64.const 0
-  vlog = i64.const 12
-  vD = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, vz, vlog, vz)
-  vjD = call.cap 6 1 (i32) -> (i64) v0 (vD)
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vma = i64.const 17416
+  i32.store vma v1
+  vba = i64.const 17420
+  i32.store vba v2
+  vrp = i64.const 17408
+  vD = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vjD_st, vjD = call.cap 6 1 (i32) -> (i64, i64) v0 (vD)
   return vjD
-  }
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(17408, &record(12)),
+    )
 }
-"#;
 
 #[test]
 fn a_detached_child_attests_its_window_unexposed() {
-    let a = module(ATTEST_DETACHED);
+    let a = module(&attest_detached());
     let b = module(ATTEST_MOD);
     let mut host = Host::new();
-    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hi = host.grant_instantiator();
     let hm = host.grant_module(&b);
     let hw = host.grant_budget(-1, (1 << 12) as i64, -1);
     let mut fuel = 5_000_000u64;
@@ -148,26 +172,28 @@ fn a_detached_child_attests_its_window_unexposed() {
 /// charged) — a numeric quota, host-enforced at mint. The first child is [`DETACHED_SERVER`],
 /// parked in `svc.wait` until the parent calls it after the second mint, so it holds its window
 /// across that mint: a child that returned at once could end on another worker and hand its window
-/// back first (#2077). Composite: first_failed*10 + second_failed = 0*10 + 1 = 1.
-const QUOTA_EXHAUSTS: &str = r#"
+/// back first (#2077). Both spawns read the one spawn record at 17408. Composite:
+/// first_failed*10 + second_failed = 0*10 + 1 = 1.
+fn quota_exhausts() -> String {
+    format!(
+        r#"
 memory 17
 
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 12
-  vq = i64.const 0
-  vfst = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
-  vsnd = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vma = i64.const 17416
+  i32.store vma v1
+  vba = i64.const 17420
+  i32.store vba v2
+  vrp = i64.const 17408
+  vfst = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vsnd = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vex = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vfst, vex)
   va = i64.const 40
   vb = i64.const 2
   vsum = call.cap 268435456 0 (i64, i64) -> (i64) vcap (va, vb)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vfst)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vfst)
   vzero = i32.const 0
   vf1 = i32.lt_s vfst vzero
   vf2 = i32.lt_s vsnd vzero
@@ -176,16 +202,19 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vs = i32.add vm vf2
   vr = i64.extend_i32_s vs
   return vr
-  }
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(17408, &record(12)),
+    )
 }
-"#;
 
 #[test]
 fn the_minter_quota_bounds_detached_mints() {
-    let a = module(QUOTA_EXHAUSTS);
+    let a = module(&quota_exhausts());
     let b = module(DETACHED_SERVER);
     let mut host = Host::new();
-    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hi = host.grant_instantiator();
     let hm = host.grant_module(&b);
     let hw = host.grant_budget(-1, (1 << 12) as i64, -1); // exactly one 2^12 window
     let mut fuel = 5_000_000u64;
@@ -206,30 +235,34 @@ fn the_minter_quota_bounds_detached_mints() {
 
 /// A forged budget handle (the Instantiator handle itself, wrong type) refuses probeably —
 /// the budget is spawn evidence, and no evidence means no detached window, never a trap.
-const FORGED_MINTER: &str = r#"
+fn forged_minter() -> String {
+    format!(
+        r#"
 memory 17
 
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v0
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 12
-  vq = i64.const 0
-  vs = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+func (i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32) {{
+  vma = i64.const 17416
+  i32.store vma v1
+  vba = i64.const 17420
+  i32.store vba v0
+  vrp = i64.const 17408
+  vs = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vr = i64.extend_i32_s vs
   return vr
-  }
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(17408, &record(12)),
+    )
 }
-"#;
 
 #[test]
 fn a_forged_minter_refuses_probeably() {
-    let a = module(FORGED_MINTER);
+    let a = module(&forged_minter());
     let b = module(ATTEST_MOD);
     let mut host = Host::new();
-    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hi = host.grant_instantiator();
     let hm = host.grant_module(&b);
     let mut fuel = 5_000_000u64;
     let r = run_with_host(
@@ -260,25 +293,27 @@ block 0 (v0: i64) {
 }
 "#;
 
-/// The parent spawns the waiter DETACHED, then hammers `atomic.notify` on the same offset 32768 of
-/// **its own** window, OR-ing the woken counts, and joins. Composite: `join + 10 * woke_any`.
-const NOTIFYING_PARENT: &str = r#"
+/// The parent spawns the waiter DETACHED (the spawn record at 17408), then hammers `atomic.notify` on
+/// the same offset 32768 of **its own** window, OR-ing the woken counts, and joins. Composite:
+/// `join + 10 * woke_any`.
+fn notifying_parent() -> String {
+    format!(
+        r#"
 memory 17
 
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 16
-  vq = i64.const 0
-  vD = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vma = i64.const 17416
+  i32.store vma v1
+  vba = i64.const 17420
+  i32.store vba v2
+  vrp = i64.const 17408
+  vD = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vi0 = i64.const 0
   vw0 = i32.const 0
   br 1(v0, vD, vi0, vw0)
-  }
-block 1 (vh: i32, vd: i32, vi: i64, vw: i32) {
+  }}
+block 1 (vh: i32, vd: i32, vi: i64, vw: i32) {{
   vaddr = i64.const 32768
   vcnt = i32.const 1
   vn = atomic.notify vaddr vcnt
@@ -288,17 +323,20 @@ block 1 (vh: i32, vd: i32, vi: i64, vw: i32) {
   vlim = i64.const 200000
   vdone = i64.eq vi2 vlim
   br_if vdone 2(vh, vd, vw2) 1(vh, vd, vi2, vw2)
-  }
-block 2 (vh2: i32, vd2: i32, vwf: i32) {
-  vj = call.cap 6 1 (i32) -> (i64) vh2 (vd2)
+  }}
+block 2 (vh2: i32, vd2: i32, vwf: i32) {{
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh2 (vd2)
   vwe = i64.extend_i32_u vwf
   vk = i64.const 10
   vm = i64.mul vwe vk
   vs = i64.add vj vm
   return vs
-  }
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(17408, &record(16)),
+    )
 }
-"#;
 
 /// #1283: a detached child's anonymous futex words are **its own**. The parent and the detached child
 /// both have `window.base() == 0`, so before the fix the same guest offset produced the same
@@ -308,10 +346,10 @@ block 2 (vh2: i32, vd2: i32, vwf: i32) {
 /// pass; a fixed build can never fail.
 #[test]
 fn a_detached_child_does_not_rendezvous_with_its_parent_on_anonymous_memory() {
-    let a = module(NOTIFYING_PARENT);
+    let a = module(&notifying_parent());
     let b = module(DETACHED_WAITER);
     let mut host = Host::new();
-    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hi = host.grant_instantiator();
     let hm = host.grant_module(&b);
     let hw = host.grant_budget(-1, (1 << 17) as i64, -1);
     let mut fuel = 50_000_000u64;
@@ -346,14 +384,20 @@ block 0 (v0: i64) {
 }
 "#;
 
-/// The parent stores the args blob (`argc 1`, `"hello-detached\0"`) at 18432 in ITS window and passes
-/// `(18432, 24)` as the optional 8th/9th op-15 args (#1286): the host copies it to the child's
+/// The parent stores the args blob (`argc 1`, `"hello-detached\0"`) at 18432 in ITS window and
+/// names `(18432, 24)` as its spawn record's args payload (#1286): the host copies it to the child's
 /// `module_args_base()` before start.
-const ARGV_PARENT: &str = r#"
+fn argv_parent() -> String {
+    let child = SpawnRec {
+        args: (18432, 24),
+        ..record(16)
+    };
+    format!(
+        r#"
 memory 17
 
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
   vb0 = i64.const 18432
   vw0 = i64.const 1
   i64.store vb0 vw0
@@ -363,27 +407,27 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vb2 = i64.const 18448
   vw2 = i64.const 28265164885364
   i64.store vb2 vw2
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 16
-  vq = i64.const 0
-  vap = i64.const 18432
-  val = i64.const 24
-  vD = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq, vap, val)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vD)
+  vma = i64.const 17416
+  i32.store vma v1
+  vba = i64.const 17420
+  i32.store vba v2
+  vrp = i64.const 17408
+  vD = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vD)
   return vj
-  }
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(17408, &child),
+    )
 }
-"#;
 
 #[test]
 fn a_detached_child_receives_the_spawn_time_args_payload() {
-    let a = module(ARGV_PARENT);
+    let a = module(&argv_parent());
     let b = module(ARGV_CHILD);
     let mut host = Host::new();
-    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hi = host.grant_instantiator();
     let hm = host.grant_module(&b);
     let hw = host.grant_budget(-1, (1 << 16) as i64, -1);
     let mut fuel = 5_000_000u64;
@@ -434,10 +478,10 @@ block 0 (v0: i64) {
 /// that pays for the window pays for its growth too (#1909), so it holds both.
 #[test]
 fn a_detached_child_grows_past_its_declared_window() {
-    let a = module(ARGV_PARENT);
+    let a = module(&argv_parent());
     let b = module(GROWING_CHILD);
     let mut host = Host::new();
-    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hi = host.grant_instantiator();
     let hm = host.grant_module(&b);
     let hw = host.grant_budget(-1, (1 << 16) + (1 << 14), -1);
     let mut fuel = 5_000_000u64;
@@ -456,26 +500,31 @@ fn a_detached_child_grows_past_its_declared_window() {
     );
 }
 
-/// A parent that only issues the 7-arg op 15 and returns its result — no window stores, so it
-/// runs unchanged under a **durable** host (whose shadow reserve spans `[0, 64 KiB)`).
-const SPAWN_ONLY_PARENT: &str = r#"memory 17
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 12
-  vq = i64.const 0
-  vs = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+/// A parent that only spawns from its spawn record at 17408 and returns the result. Its only window
+/// writes are the record's two handles, above the durable control words, so it runs unchanged under
+/// a **durable** host.
+fn spawn_only_parent() -> String {
+    format!(
+        r#"memory 17
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vma = i64.const 17416
+  i32.store vma v1
+  vba = i64.const 17420
+  i32.store vba v2
+  vrp = i64.const 17408
+  vs = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vr = i64.extend_i32_s vs
   return vr
-  }
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(17408, &record(12)),
+    )
 }
-"#;
 
-/// #1412 (owner decision 2026-09-14): a **durable** domain **refuses** op 15, on this engine as on
-/// the other two — probeably (`-EINVAL`), charging nothing.
+/// #1412 (owner decision 2026-09-14): a **durable** domain **refuses** a detached spawn, on this
+/// engine as on the other two — probeably (`-EINVAL`), charging nothing.
 ///
 /// This reverses #1289 R1's slice-1 lift, deliberately and temporarily. R1 is right about the end
 /// state: freeze authority is a per-grant capability, not a placement rule, so a durable parent and a
@@ -496,11 +545,11 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 /// the spawn succeeds, the budget is charged, and the freeze captures the child.
 #[test]
 fn a_durable_domain_refuses_a_detached_spawn_until_the_capture_lands() {
-    let a = module(SPAWN_ONLY_PARENT);
+    let a = module(&spawn_only_parent());
     let b = module(ATTEST_MOD);
     let mut host = Host::new();
     host.set_durable(true);
-    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hi = host.grant_instantiator();
     let hm = host.grant_module(&b);
     let hw = host.grant_budget(-1, (1 << 12) as i64, -1); // exactly the child's 2^12 window
     let mut fuel = 5_000_000u64;
@@ -524,21 +573,22 @@ fn a_durable_domain_refuses_a_detached_spawn_until_the_capture_lands() {
     );
 }
 
-/// [`SPAWN_ONLY_PARENT`] that then reads what is left of `Budget.mem` while its child is still live,
-/// returning `(slot, remaining)`. The charge has to be observed from inside: the child's window goes
-/// back to the budget when the child ends (INVARIANTS #3, 2026-09-29). The child is
-/// [`DETACHED_SERVER`], parked in `svc.wait` until the parent calls it after the read, so it is live
-/// at the read (#2077); the parent then joins it.
-const SPAWN_THEN_READ_PARENT: &str = r#"memory 17
-func (i32, i32, i32) -> (i64, i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 12
-  vq = i64.const 0
-  vs = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+/// [`spawn_only_parent`] that then reads what is left of `Budget.mem` while its child is still
+/// live, returning `(slot, remaining)`. The charge has to be observed from inside: the child's
+/// window goes back to the budget when the child ends (INVARIANTS #3, 2026-09-29). The child is
+/// [`DETACHED_SERVER`], parked in `svc.wait` until the parent calls it after the read, so it is
+/// live at the read (#2077); the parent then joins it.
+fn spawn_then_read_parent() -> String {
+    format!(
+        r#"memory 17
+func (i32, i32, i32) -> (i64, i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vma = i64.const 17416
+  i32.store vma v1
+  vba = i64.const 17420
+  i32.store vba v2
+  vrp = i64.const 17408
+  vs = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vr = i64.extend_i32_s vs
   fld = i64.const 1
   vleft = call.cap 14 1 (i64) -> (i64) v2 (fld)
@@ -547,21 +597,24 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   va = i64.const 40
   vb = i64.const 2
   vsum = call.cap 268435456 0 (i64, i64) -> (i64) vcap (va, vb)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vs)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vs)
   return vr, vleft
-  }
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(17408, &record(12)),
+    )
 }
-"#;
 
 /// The same spawn in a **non-durable** domain still spawns and still charges — so the test above
-/// pins the `durable` gate specifically, not a broken op 15. Without this pair, a change that broke
+/// pins the `durable` gate specifically, not a broken spawn. Without this pair, a change that broke
 /// detached spawns outright would leave the refusal test passing for the wrong reason.
 #[test]
 fn a_non_durable_domain_still_spawns_a_detached_child_and_charges_the_budget() {
-    let a = module(SPAWN_THEN_READ_PARENT);
+    let a = module(&spawn_then_read_parent());
     let b = module(DETACHED_SERVER);
     let mut host = Host::new();
-    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hi = host.grant_instantiator();
     let hm = host.grant_module(&b);
     let hw = host.grant_budget(-1, (1 << 12) as i64, -1);
     let mut fuel = 5_000_000u64;

@@ -1,7 +1,7 @@
 //! **A Rust guest drives a §14 spawn.** The on-ramp lowers `__vm_instantiate_rec`/`__vm_join` (§14
 //! Instantiator ops 17 and 1) to a `call.cap` on a name-resolved handle, so a real Rust guest — not a
 //! hand-written shell — can issue the spawn, through the guest-side helper `support/guest_vm_spawn.rs`
-//! (an op-17 v1 record, the child in a window of its own). The C precedent is
+//! (an op-17 record, the child in a window of its own). The C precedent is
 //! `temen/tests/c_shell_exec.rs`. This was first light for the nim driver guest of #1011 slice 3c,
 //! which nimony's own driver has since replaced.
 //!
@@ -56,7 +56,7 @@ pub extern "C" fn rust_eh_personality() {}
 
 extern "C" {
     fn __vm_cap_resolve(name: *const u8, len: i64) -> i32;
-    fn __vm_join(inst: i32, child: i64) -> i64;
+    fn __vm_join(inst: i32, child: i64, status: *mut i64) -> i64;
 }
 
 #[no_mangle]
@@ -70,7 +70,12 @@ pub extern "C" fn run() -> i64 {
             return -1;
         }
         let child = vm_spawn(inst, budget, child_mod, &[(b"fs", fs)], &[]);
-        __vm_join(inst, child)
+        let mut st = 0i64;
+        let r = __vm_join(inst, child, &mut st);
+        if st != 0 {
+            return -st; // the child ended in a trap: its wire code, negated (#2066)
+        }
+        r
     }
 }
 "##;
@@ -108,7 +113,7 @@ pub extern "C" fn rust_eh_personality() {}
 
 extern "C" {
     fn __vm_cap_resolve(name: *const u8, len: i64) -> i32;
-    fn __vm_join(inst: i32, child: i64) -> i64;
+    fn __vm_join(inst: i32, child: i64, status: *mut i64) -> i64;
 }
 
 #[no_mangle]
@@ -124,12 +129,19 @@ pub extern "C" fn run() -> i64 {
         if first < 0 {
             return first;
         }
-        let r1 = __vm_join(inst, first);
+        let mut st = 0i64;
+        let r1 = __vm_join(inst, first, &mut st);
+        if st != 0 {
+            return -st; // the child ended in a trap: its wire code, negated (#2066)
+        }
         let second = vm_spawn(inst, budget, child_mod, &[], &[b"zz", b"y"]);
         if second < 0 {
             return second;
         }
-        let r2 = __vm_join(inst, second);
+        let r2 = __vm_join(inst, second, &mut st);
+        if st != 0 {
+            return -st;
+        }
         r1 * 10000 + r2
     }
 }
@@ -150,14 +162,14 @@ fn grant_fs(host: &mut Host, counter: &Arc<Mutex<i64>>) -> i32 {
     let c2 = Arc::clone(counter);
     let fork = Arc::new(move |_pid: u64| {
         let c = Arc::clone(&c2);
-        ForkedProc::shared(
+        Some(ForkedProc::shared(
             Box::new(move |_op, _args, _mem, _| {
                 let mut c = c.lock().unwrap();
                 *c += 1;
                 Ok(vec![*c])
             }),
             temen_interp::CapState::Stateless,
-        )
+        ))
     });
     host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Stateless)
 }
@@ -195,10 +207,10 @@ fn grant_hooks(host: *mut temen_interp::Host) -> GrantChildHooks {
 }
 
 /// Build a host granting `inst`/`child`/`fs` by name over a fresh counter; returns `(host, counter)`.
-fn granted_host(child: &temen_ir::Module, win: u64) -> (Host, Arc<Mutex<i64>>) {
+fn granted_host(child: &temen_ir::Module) -> (Host, Arc<Mutex<i64>>) {
     let counter = Arc::new(Mutex::new(0i64));
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, win);
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(child);
     let budget = host.grant_budget(-1, 1 << 17, -1); // the child's window
     let fsh = grant_fs(&mut host, &counter);
@@ -210,14 +222,8 @@ fn granted_host(child: &temen_ir::Module, win: u64) -> (Host, Arc<Mutex<i64>>) {
 }
 
 /// Interpreter (cooperative engine — honors the grant list inline): returns `(result, counter)`.
-fn run_interp(
-    m: &temen_ir::Module,
-    entry: u32,
-    sp: i64,
-    child: &temen_ir::Module,
-    win: u64,
-) -> (i64, i64) {
-    let (mut host, counter) = granted_host(child, win);
+fn run_interp(m: &temen_ir::Module, entry: u32, sp: i64, child: &temen_ir::Module) -> (i64, i64) {
+    let (mut host, counter) = granted_host(child);
     let mut fuel = 200_000_000u64;
     let (r, _) =
         run_capture_reserved_with_host(m, entry, &[Value::I64(sp)], &mut fuel, &[], 0, &mut host);
@@ -231,14 +237,8 @@ fn run_interp(
 }
 
 /// JIT (given the module resolver + named-grant hooks the spawn needs): returns `(result, counter)`.
-fn run_jit(
-    m: &temen_ir::Module,
-    entry: u32,
-    sp: i64,
-    child: &temen_ir::Module,
-    win: u64,
-) -> (i64, i64) {
-    let (mut host, counter) = granted_host(child, win);
+fn run_jit(m: &temen_ir::Module, entry: u32, sp: i64, child: &temen_ir::Module) -> (i64, i64) {
+    let (mut host, counter) = granted_host(child);
     let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
         m,
         entry,
@@ -262,7 +262,7 @@ fn run_jit(
 
 /// Build a guest (`src` plus the shared spawn) through `rustc` and the on-ramp: `(module, entry of
 /// `run`, its sp, its window)`. `None` if `rustc` is absent or codegen fails.
-fn build_guest(src: &str, tag: &str) -> Option<(temen_ir::Module, u32, i64, u64)> {
+fn build_guest(src: &str, tag: &str) -> Option<(temen_ir::Module, u32, i64)> {
     let dir = std::env::temp_dir().join(format!("rust_guest_op13_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create work dir");
     let src_path = dir.join("guest.rs");
@@ -281,19 +281,18 @@ fn build_guest(src: &str, tag: &str) -> Option<(temen_ir::Module, u32, i64, u64)
         .expect("guest exports `run`")
         .1;
     let sp = t.entry_sp as i64;
-    let win = 1u64 << t.module.memory.expect("guest window").size_log2;
-    Some((t.module, entry, sp, win))
+    Some((t.module, entry, sp))
 }
 
 #[test]
 fn rust_guest_spawns_a_child() {
-    let Some((guest, entry, sp, win)) = build_guest(GUEST_SRC, "fs") else {
+    let Some((guest, entry, sp)) = build_guest(GUEST_SRC, "fs") else {
         return;
     };
     let child = parse_child(CHILD);
 
-    let (io, ic) = run_interp(&guest, entry, sp, &child, win);
-    let (jo, jc) = run_jit(&guest, entry, sp, &child, win);
+    let (io, ic) = run_interp(&guest, entry, sp, &child);
+    let (jo, jc) = run_jit(&guest, entry, sp, &child);
 
     assert_eq!(
         io, 1,
@@ -313,13 +312,13 @@ fn rust_guest_spawns_a_child() {
 /// gives `2 * 1000 + 'z'` (2122).
 #[test]
 fn rust_guest_spawns_children_with_argv() {
-    let Some((guest, entry, sp, win)) = build_guest(ARGV_GUEST_SRC, "argv") else {
+    let Some((guest, entry, sp)) = build_guest(ARGV_GUEST_SRC, "argv") else {
         return;
     };
     let child = parse_child(ARGV_CHILD);
 
-    let (io, _) = run_interp(&guest, entry, sp, &child, win);
-    let (jo, _) = run_jit(&guest, entry, sp, &child, win);
+    let (io, _) = run_interp(&guest, entry, sp, &child);
+    let (jo, _) = run_jit(&guest, entry, sp, &child);
 
     assert_eq!(
         io,

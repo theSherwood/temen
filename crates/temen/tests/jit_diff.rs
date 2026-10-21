@@ -2555,7 +2555,7 @@ fn jit_instantiate_rec_reads_the_record_from_a_grown_tail_page() {
 
     const REC: u64 = 80 * 1024; // 5 * 16 KiB — in the reserved tail (prefix 64 KiB), page-aligned
                                 // The record's words as stores: the page is grown at run time, so no data segment can hold it.
-    let words: String = temen_ir::SpawnRec::v1(0)
+    let words: String = temen_ir::SpawnRec::default()
         .encode()
         .chunks(8)
         .enumerate()
@@ -2580,7 +2580,7 @@ fn jit_instantiate_rec_reads_the_record_from_a_grown_tail_page() {
          \x20 i32.store vra v2 offset={module_at}\n\
          \x20 i32.store vra v3 offset={budget_at}\n\
          \x20 vch = call.cap 6 17 (i64) -> (i32) v1 (vra)\n\
-         \x20 vj = call.cap 6 1 (i32) -> (i64) v1 (vch)\n\
+         \x20 vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v1 (vch)\n\
          \x20 return vj\n\
            }}\n\
          }}\n\
@@ -2590,8 +2590,8 @@ fn jit_instantiate_rec_reads_the_record_from_a_grown_tail_page() {
          \x20 return v5\n\
            }}\n\
          }}\n",
-        module_at = rec::MODULE_AT,
-        budget_at = rec::BUDGET_AT,
+        module_at = temen_ir::SpawnRec::MODULE_AT,
+        budget_at = temen_ir::SpawnRec::BUDGET_AT,
     );
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
@@ -2599,7 +2599,7 @@ fn jit_instantiate_rec_reads_the_record_from_a_grown_tail_page() {
     let powerbox = || {
         let mut h = Host::new();
         let mem = h.grant_memory();
-        let inst = h.grant_instantiator(0, 1 << 16);
+        let inst = h.grant_instantiator();
         let modh = h.grant_module(&child);
         let budget = h.grant_budget(-1, 1 << 20, -1);
         (h, [mem, inst, modh, budget])

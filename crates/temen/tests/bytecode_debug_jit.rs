@@ -594,11 +594,18 @@ block 0 (vh: i64) {
 ";
     let m = parse_module(guest).expect("parse guest");
     verify_module(&m).expect("verify guest");
-    // The `Jit` cap and an offloadable host procedure whose op 1 only the embedder completes.
-    let setup = |m: &temen_ir::Module| {
+    // The `Jit` cap and an offloadable host procedure whose op 1 only the embedder answers: it
+    // holds each call's completer and never answers (one dropped would answer `CAP_REVOKED`).
+    let held = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let setup = move |m: &temen_ir::Module| {
         let (mut host, jit, codes) = compiled(m, &[unit]);
+        let held = std::sync::Arc::clone(&held);
         let proc = host.grant_host_proc_offloadable(
-            Box::new(|_, _| temen_interp::OffloadOutcome::Host(Box::new(|_| ()))),
+            Box::new(move |_, _| {
+                let held = std::sync::Arc::clone(&held);
+                temen_interp::OffloadOutcome::Host(Box::new(move |c| held.lock().unwrap().push(c)))
+            }),
+            None,
             temen_interp::CapState::Stateless,
         );
         let args = vec![Value::I32(jit), Value::I32(codes[0]), Value::I32(proc)];

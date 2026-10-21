@@ -23,23 +23,26 @@ use temen_jit::{JitError, JitOutcome};
 const WINDOW: i64 = 1 << 16;
 
 /// A root that pays for its child (func 1's child image, #2219) from its `Budget` and returns
-/// `child * 10_000_000 + room`: the child's
-/// result (with `wait`, the trap code it ended with) and the budget's `mem` room once it has ended.
-/// The child returns a bit per expected room: 1 a new fiber spends `FIBER_STACK`, 2 its return hands
-/// it back, 4 a second fiber spends it again.
-fn src(collect: &str) -> String {
+/// `(status * 1000 + value) * 10_000_000 + room`: how the child ended, as its join answers it
+/// (#2066) — its result, or its trap's wire code times 1000 — and the budget's `mem` room once it
+/// has ended. The child returns a bit per expected room: 1 a new fiber spends `FIBER_STACK`, 2 its
+/// return hands it back, 4 a second fiber spends it again.
+fn src() -> String {
     format!(
         "memory 16
 data 20000 \"budget\"
 func (i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vbud: i32, vmod: i32) {{
-  rm = i64.const 17432
+  rm = i64.const 17416
   i32.store rm vmod
-  rb = i64.const 17436
+  rb = i64.const 17420
   i32.store rb vbud
   rp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
-  vr = call.cap 6 {collect} (i32) -> (i64) vinst (vch)
+  vst, vval = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  thousand = i64.const 1000
+  vst1000 = i64.mul vst thousand
+  vr = i64.add vst1000 vval
   one = i64.const 1
   vroom = call.cap 14 1 (i64) -> (i64) vbud (one)
   k = i64.const 10000000
@@ -87,12 +90,12 @@ block 0 (vsp: i64, varg: i64) {{
   }}
 }}
 {rec}",
-        rec = rec::segment(17408, &SpawnRec::v1(0)),
+        rec = rec::segment(17408, &SpawnRec::default()),
     )
 }
 
-fn module(collect: &str) -> Module {
-    let m: Module = temen_text::parse_module(&src(collect)).expect("parse");
+fn module() -> Module {
+    let m: Module = temen_text::parse_module(&src()).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     m
 }
@@ -102,7 +105,7 @@ fn module(collect: &str) -> Module {
 fn setup(m: &Module, fibers: i64) -> impl Fn() -> (Host, Vec<Value>) + '_ {
     move || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 16);
+        let i = h.grant_instantiator();
         let b = h.grant_budget(-1, WINDOW + fibers * FIBER_STACK as i64, -1);
         let c = h.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
         (h, [i, b, c].map(Value::I32).to_vec())
@@ -138,21 +141,21 @@ fn every_engine(what: &str, m: &Module, setup: &dyn Fn() -> (Host, Vec<Value>), 
 /// back, and the one left unfinished hands it back as the child ends: the whole ceiling is room again.
 #[test]
 fn a_fiber_spends_its_domains_mem_until_it_returns_or_the_domain_ends_on_every_engine() {
-    let m = module("1"); // join: the child's result
+    let m = module();
     let ceiling = WINDOW + 2 * FIBER_STACK as i64;
     every_engine("fibers", &m, &setup(&m, 2), 7 * 10_000_000 + ceiling);
 }
 
 /// With no room past the child's window, its first `cont.new` traps `FiberFault`, which the parent's
-/// `wait` reads; the refusal charged nothing, and the window goes back as the child ends.
+/// `join` answers; the refusal charged nothing, and the window goes back as the child ends.
 #[test]
 fn a_fiber_past_the_ceiling_traps_and_charges_nothing_on_every_engine() {
-    let m = module("18"); // wait: how the child ended
+    let m = module();
     let fiber_fault = temen_ir::trap_code::FIBER_FAULT;
     every_engine(
         "a fiber past the ceiling",
         &m,
         &setup(&m, 0),
-        fiber_fault * 10_000_000 + WINDOW,
+        fiber_fault * 1000 * 10_000_000 + WINDOW,
     );
 }

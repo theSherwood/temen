@@ -14,8 +14,9 @@ use paged::{case_from_seed_pagestate, fuzz_one_pagestate, Cat};
 
 #[test]
 fn paged_access_matches_interp_over_randomized_page_maps() {
-    // Each case builds + emits + wasmi-instantiates two runs, so keep the sweep modest (the unbounded
-    // depth comes from the libFuzzer target); this is the regression + coverage floor.
+    // Each case runs three times (interpreted, the leaf tiered up, the guest as the root leaf), two of
+    // them emitted and wasmi-instantiated, so keep the sweep modest (the unbounded depth comes from
+    // the libFuzzer target); this is the regression + coverage floor.
     let iters: u64 = if cfg!(windows) { 400 } else { 1500 };
     let (mut trapped, mut passed) = (0u32, 0u32);
     for seed in 0..iters {

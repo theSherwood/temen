@@ -1,9 +1,9 @@
-//! The detached ring pipeline: two stages spawned detached through op 15, each into a window the
-//! parent cannot read, moving four items through a one-slot ring in a `SharedRegion` the parent
-//! grants them by name. One program for every engine: temen-interp's `concurrent_stages` runs it on
-//! the interpreters, temen's `bytecode_concurrent_stages` on the cooperative bytecode driver and
-//! `jit_concurrent_stages` on the Cranelift JIT. Include with
-//! `#[path = "support/pipeline.rs"] mod pipeline;`.
+//! The detached ring pipeline: two stages spawned detached from spawn records (op 17), each into
+//! a window the parent cannot read, moving four items through a one-slot ring in a `SharedRegion`
+//! the parent grants them by name. One program for every engine: temen-interp's `concurrent_stages`
+//! runs it on the interpreters, temen's `bytecode_concurrent_stages` on the cooperative bytecode
+//! driver and `jit_concurrent_stages` on the Cranelift JIT. Include with
+//! `#[path = "support/pipeline.rs"] mod pipeline;` (it brings its own `rec`).
 //!
 //! With a 1-slot ring and 4 items, run-to-completion order deadlocks: the producer must park
 //! mid-stream and be woken by the consumer. A missed wake shows up as a wrong number, not a hang:
@@ -11,15 +11,18 @@
 //! that times out more than 6 times bails.
 #![allow(dead_code)] // each test binary uses a different subset
 
+#[path = "rec.rs"]
+mod rec;
+
 use temen_interp::Host;
-use temen_ir::Module;
+use temen_ir::{Module, SpawnRec};
 
 /// The **detached** variant — the §5 model sentence as a test ("a shell would plausibly run
 /// coreutils detached"): the same one-slot ring, but the two stages are spawned through a
-/// detached-spawn `Budget` (op 15) from their own module into windows the parent cannot read. The
-/// region grant rides the same op-11-format named-grant records; the module's own data
-/// segment carries the `"ring"` name into each private window. Private memory and an
-/// explicit shared channel compose — exactly the separate-process discipline, in-process.
+/// detached-spawn `Budget` (a spawn record, op 17) from their own module into windows the parent
+/// cannot read. The region grant rides the same op-11-format named-grant records; the module's own
+/// data segment carries the `"ring"` name into each private window. Private memory and an explicit
+/// shared channel compose — exactly the separate-process discipline, in-process.
 pub const STAGES: &str = r#"
 memory 17
 data 16384 "ring"
@@ -140,14 +143,23 @@ block 5 (vsum: i64, vtos: i64) {
 "#;
 
 /// The detached-pipeline parent: mint the region, build the grant record, spawn the producer (the
-/// granted stages' module, whose func 0 it is) and the consumer (that module's child image of func 1,
-/// #2219) DETACHED, join both → 410.
-pub const PARENT: &str = r#"
+/// granted stages' module, whose func 0 it is) and the consumer (that module's child image of func
+/// 1, #2219) DETACHED, from their spawn records at 17408 and 17536, each granted the region; join both
+/// → 410.
+pub fn parent() -> String {
+    let stage = SpawnRec {
+        size_log2: 17,
+        grants_ptr: 16640,
+        grants_n: 1,
+        ..SpawnRec::default()
+    };
+    format!(
+        r#"
 memory 17
 data 16584 "ring"
 
-func (i32, i32, i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
+func (i32, i32, i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
   vlen = i64.const 65536
   vrh64 = call.cap 5 5 (i64) -> (i64) v1 (vlen)
   vrh = i32.wrap_i64 vrh64
@@ -159,25 +171,31 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   i32.store va2 vv2
   va3 = i64.const 16648
   i32.store va3 vrh
-  vmh = i64.extend_i32_u v2
-  vmin = i64.extend_i32_u v3
-  vch = i64.extend_i32_u v4
-  vgp = i64.const 16640
-  vgn = i64.const 1
-  ve0 = i64.const 0
-  vlog = i64.const 17
-  vq = i64.const 0
-  vp = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgp, vgn, ve0, vlog, vq)
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vch, vgp, vgn, ve0, vlog, vq)
-  vjp = call.cap 6 1 (i32) -> (i64) v0 (vp)
-  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vpma = i64.const 17416
+  i32.store vpma v2
+  vpba = i64.const 17420
+  i32.store vpba v3
+  vprp = i64.const 17408
+  vp = call.cap 6 17 (i64) -> (i32) v0 (vprp)
+  vcma = i64.const 17544
+  i32.store vcma v4
+  vcba = i64.const 17548
+  i32.store vcba v3
+  vcrp = i64.const 17536
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vcrp)
+  vjp_st, vjp = call.cap 6 1 (i32) -> (i64, i64) v0 (vp)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vk = i64.const 100
   vm = i64.mul vjp vk
   vs = i64.add vm vjc
   return vs
-  }
+  }}
+}}
+{producer}{consumer}"#,
+        producer = rec::segment(17408, &stage),
+        consumer = rec::segment(17536, &stage),
+    )
 }
-"#;
 
 /// The parent and the stages' module, each verified.
 pub fn modules() -> (Module, Module) {
@@ -186,7 +204,7 @@ pub fn modules() -> (Module, Module) {
         temen_verify::verify_module(&m).expect("verify");
         m
     };
-    (load(PARENT), load(STAGES))
+    (load(&parent()), load(STAGES))
 }
 
 /// The parent's five arguments in a fresh host: an `Instantiator` and an `AddressSpace` over its
@@ -194,7 +212,7 @@ pub fn modules() -> (Module, Module) {
 /// image of func 1, the consumer.
 pub fn host(stages: &Module) -> (Host, [i32; 5]) {
     let mut host = Host::new();
-    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hi = host.grant_instantiator();
     let ha = host.grant_address_space(0, 1u64 << 17);
     let hm = host.grant_module(stages);
     let hw = host.grant_budget(-1, (2 << 17) as i64, -1);

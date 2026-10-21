@@ -11,16 +11,19 @@
 //! reads `first` from the region's carried bytes: the restored window holds no bytes for an aliased
 //! page, so it reads `0` unless the region came back aliased.
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use std::sync::Arc;
 
 use temen_durable::{
     begin_thaw, init_durable_window, read_state, transform_module_assume_confined, STATE_UNWINDING,
 };
 use temen_interp::{
-    run_capture_reserved_with_host_prots, CapturedProt, DurableBinding, Host, MemLayout,
+    run_capture_reserved_with_host_layout, CapturedProt, DurableBinding, Host, MemLayout,
     RegionNotCaptured, RegionRefusal, SharedBacking, Value,
 };
-use temen_ir::Module;
+use temen_ir::{Module, SpawnRec};
 use temen_jit::JitOutcome;
 use temen_snapshot::{freeze, freeze_layout, freeze_with_prots, restore_with_prots, FreezeError};
 
@@ -120,7 +123,14 @@ fn run(
     Vec<CapturedProt>,
 ) {
     let mut fuel = 50_000_000u64;
-    run_capture_reserved_with_host_prots(m, func, args, &mut fuel, win, prots, SIZE_LOG2, host)
+    let init = match prots {
+        Some(prots) => MemLayout::from_dense(win.to_vec(), prots, WINDOW as u64),
+        None => MemLayout::image(win.to_vec()),
+    };
+    let (res, left) =
+        run_capture_reserved_with_host_layout(m, func, args, &mut fuel, &init, SIZE_LOG2, host);
+    let left = left.expect("the guest has a window");
+    (res, left.bytes().to_vec(), left.dense_prots())
 }
 
 /// [`run`] on the native JIT: `m`'s `func` over `layout`, its result (`None` for a run the freeze
@@ -471,24 +481,28 @@ fn a_freeze_without_a_page_map_declines_a_region() {
     );
 }
 
-/// Step 2 — the parent `(Instantiator, child module, Budget, region)` spawns the child detached with
-/// the region pre-mapped at the child's 128 KiB, then maps it at its own 128 KiB (a freeze requested
-/// from the start lands there, the first call that can suspend), joins, and returns
-/// `child + 2·(what the child stored)`, read back through its own mapping.
+/// Step 2 — the parent `(Instantiator, child module, Budget, region)` spawns the child detached, with
+/// the region pre-mapped at the child's 128 KiB, through the spawn record at 65536 ([`with_spawn_rec`]
+/// lays it), then maps it at its own 128 KiB (a freeze requested from the start lands there, the
+/// first call that can suspend), joins, and returns `child + 2·(what the child stored)`, read back
+/// through its own mapping.
 const SHARING_PARENT: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vmod: i32, vbud: i32, vrh: i32) {
-  vrh64 = i64.extend_i32_s vrh
   vwin = i64.const 131072
-  me = i64.extend_i32_s vmod
-  vb = i64.extend_i32_s vbud
   gz = i64.const 0
-  sl = i64.const 18
-  ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz, gz, gz, vrh64, vwin)
+  vsm = i64.const 65544
+  i32.store vsm vmod
+  vsb = i64.const 65548
+  i32.store vsb vbud
+  vsr = i64.const 65584
+  i32.store vsr vrh
+  vsp = i64.const 65536
+  ch = call.cap 6 17 (i64) -> (i32) vinst (vsp)
   vlen = i64.const 65536
   vprot = i64.const 3
   vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vrh (vwin, gz, vlen, vprot)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (ch)
   vq = i64.const 131088
   vy = i64.load vq
   vy2 = i64.add vy vy
@@ -531,6 +545,18 @@ block 3 (vd: i64) {
 ";
 const SHARED_WANT: i64 = 1111 + 2 * 3333;
 
+/// `src`, a parent that spawns as [`SHARING_PARENT`] does, with its spawn record: at 65536, between
+/// its shadow arena and the regions it maps, the child's 256 KiB window with the region the parent
+/// stores in it pre-mapped at the child's 128 KiB.
+fn with_spawn_rec(src: &str) -> String {
+    let spawn = SpawnRec {
+        size_log2: 18,
+        child_off: AT as u64,
+        ..SpawnRec::default()
+    };
+    format!("{src}{}", rec::segment(65536, &spawn))
+}
+
 fn confined(src: &str) -> Module {
     let inst = transform_module_assume_confined(&temen_text::parse_module(src).expect("parse"))
         .expect("transform");
@@ -544,14 +570,14 @@ fn confined(src: &str) -> Module {
 fn sharing_host(child: &Module, backing: Arc<dyn SharedBacking>) -> (Host, [Value; 4]) {
     let mut host = Host::new();
     host.set_durable(true);
-    let inst = host.grant_instantiator(0, WINDOW as u64);
+    let inst = host.grant_instantiator();
     let modh = host.grant_durable_module(child);
     let budget = host.grant_budget(-1, 1 << 20, 4);
     for (o, b) in 1111i64.to_le_bytes().into_iter().enumerate() {
         backing.write_byte(8 + o as u64, b);
     }
     let rh = host.grant_shared_region_backed(backing);
-    host.grant_freeze_authority(temen_interp::FreezeScope::DetachedProgeny);
+    host.grant_freeze_authority();
     (
         host,
         [
@@ -571,7 +597,7 @@ fn sharing_host(child: &Module, backing: Arc<dyn SharedBacking>) -> (Host, [Valu
 #[test]
 fn a_region_shared_with_a_detached_child_rides_and_stays_shared() {
     let child = confined(SHARING_CHILD);
-    let parent = confined(SHARING_PARENT);
+    let parent = confined(&with_spawn_rec(SHARING_PARENT));
     let (mut host, args) = sharing_host(&child, heap_region());
     let win = init_durable_window(WINDOW, TEST_ARENA);
     let (base, ..) = run(&parent, 0, &mut host, &args, &win, None);
@@ -657,7 +683,7 @@ fn a_thawed_child_spinning_on_its_parent_lets_the_parent_run() {
 block 4 (vd: i64) {
 ";
     assert!(SHARING_PARENT.contains(map) && SHARING_CHILD.contains(tail));
-    let parent = confined(&SHARING_PARENT.replace(map, &signal));
+    let parent = confined(&with_spawn_rec(&SHARING_PARENT.replace(map, &signal)));
     let child = confined(&SHARING_CHILD.replace(tail, spin));
     let want = Ok(vec![Value::I64(SHARED_WANT)]);
     for cap in [-1, 2] {
@@ -696,7 +722,7 @@ block 4 (vd: i64) {
 #[test]
 fn a_region_shared_with_a_detached_child_rides_a_jit_freeze() {
     let child = confined(SHARING_CHILD);
-    let parent = confined(SHARING_PARENT);
+    let parent = confined(&with_spawn_rec(SHARING_PARENT));
     let shm = || temen_run::new_shared_region(LEN).expect("a region");
     let fresh = init_durable_window(WINDOW, TEST_ARENA);
     let (mut host, args) = sharing_host(&child, shm());
@@ -769,22 +795,26 @@ fn a_region_shared_with_a_detached_child_rides_a_jit_freeze() {
 }
 
 /// #2220 — the parent `(Instantiator, child module, Budget, mailbox, region)` spawns the child
-/// detached with the mailbox pre-mapped at the child's 128 KiB, then grants the running child
-/// `region` (`Instantiator.grant`, op 19). `FLIP` requests the freeze just before the grant, so the
-/// freeze lands at it, once the grant has taken effect. The parent then maps the mailbox at its own
-/// 128 KiB, posts the child's index of the region in its first word and wakes the child, maps the
-/// region at its own 192 KiB, joins, and returns `index·1_000_000 + child + 2·(what the child
-/// stored)`, read back through its mapping: a thaw that granted again would answer a second index.
+/// detached with the mailbox pre-mapped at the child's 128 KiB, through the spawn record at 65536 as
+/// [`SHARING_PARENT`] does, then grants the running child `region` (`Instantiator.grant`, op 19).
+/// `FLIP` requests the freeze just before the grant, so the freeze lands at it, once the grant has
+/// taken effect. The parent then maps the mailbox at its own 128 KiB, posts the child's index of the
+/// region in its first word and wakes the child, maps the region at its own 192 KiB, joins, and
+/// returns `index·1_000_000 + child + 2·(what the child stored)`, read back through its mapping: a
+/// thaw that granted again would answer a second index.
 const GRANTING_PARENT: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vmod: i32, vbud: i32, vmb: i32, vgr: i32) {
-  vmb64 = i64.extend_i32_s vmb
   vwin = i64.const 131072
-  me = i64.extend_i32_s vmod
-  vb = i64.extend_i32_s vbud
   gz = i64.const 0
-  sl = i64.const 18
-  ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz, gz, gz, vmb64, vwin)
+  vsm = i64.const 65544
+  i32.store vsm vmod
+  vsb = i64.const 65548
+  i32.store vsb vbud
+  vsr = i64.const 65584
+  i32.store vsr vmb
+  vsp = i64.const 65536
+  ch = call.cap 6 17 (i64) -> (i32) vinst (vsp)
 FLIP
   vgr64 = i64.extend_i32_s vgr
   vh = call.cap 6 19 (i32, i64) -> (i32) vinst (ch, vgr64)
@@ -797,7 +827,7 @@ FLIP
   vwoke = atomic.notify vwin vone
   vgat = i64.const 196608
   vm2 = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vgr (vgat, gz, vlen, vprot)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (ch)
   vq = i64.const 196624
   vy = i64.load vq
   vy2 = i64.add vy vy
@@ -872,7 +902,9 @@ block 6 () {
 const GRANTED_WANT: i64 = 2222 + 2 * 3333;
 
 fn granting_parent(flip: bool) -> Module {
-    confined(&GRANTING_PARENT.replace("FLIP", if flip { FLIP } else { "" }))
+    confined(&with_spawn_rec(
+        &GRANTING_PARENT.replace("FLIP", if flip { FLIP } else { "" }),
+    ))
 }
 
 /// [`sharing_host`] over `mailbox`, and `region`, holding `2222` at byte 8, for the parent to grant.

@@ -34,7 +34,7 @@
 //! [`Domain::wake_all_parked`] — so the caller's trailing guard unwinds it at its next safepoint. A
 //! *running* vCPU reaches no park site, so code that runs beside other vCPUs polls the same cell at
 //! every loop back-edge and on entry to a function that tail-calls (`emit_domain_poll`), and
-//! unwinds from there. A §14 carve child has a cell of its own, which the parent's teardown sets
+//! unwinds from there. A §14 child has a cell of its own, which the parent's teardown sets
 //! (`ChildExec::shutdown_and_join`). A
 //! durable **freeze** is *not* teardown: the root unwinds under `UNWINDING` and parked siblings
 //! return through the freeze re-issue machinery instead (the sentinel is skipped).
@@ -98,6 +98,31 @@ unsafe fn store_trap(p: *mut i64, v: i64) {
 /// As [`store_trap`].
 unsafe fn load_trap(p: *mut i64) -> i64 {
     (*(p as *const AtomicI64)).load(Ordering::Relaxed)
+}
+
+/// Whether the domain the caller's instance runs in has ended: a trap or exit in its trap cell, or a
+/// code in its stop word, which the root's completion ([`Domain::begin_teardown`]) and a parent's
+/// kill or teardown set (#2088). A sibling's successful `call.cap` resets the trap cell to `0`, never
+/// the stop word, so a park that read the trap cell alone slept through an end that landed during
+/// one (#2498). A stop found here moves into the trap cell, unless a trap is recorded there, so the
+/// caller's trailing trap-propagation guard unwinds before the guest observes the park's status, as
+/// `emit_domain_poll` does for running code.
+///
+/// # Safety
+/// `trap_out` is the caller's live instance context (a [`crate::VmCtx`]'s field 0).
+unsafe fn domain_ended(trap_out: *mut i64) -> bool {
+    let vm = crate::VmCtx::of_trap_out(trap_out);
+    if vm.trap.load(Ordering::Relaxed) != 0 {
+        return true;
+    }
+    let stop = vm.stop.load(Ordering::Relaxed);
+    if stop == 0 {
+        return false;
+    }
+    let _ = vm
+        .trap
+        .compare_exchange(0, stop, Ordering::Relaxed, Ordering::Relaxed);
+    true
 }
 
 /// True iff the kill-path is armed (`addr != 0`) **and** the host has set the interrupt cell — i.e.
@@ -224,11 +249,24 @@ pub enum HostPark {
     Ended,
 }
 
+/// #2164 — whose park a host call's is ([`park_host_call`]).
+#[cfg(not(loom))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Parks {
+    /// The calling fiber's alone: a guest fiber yields `FIBER_PARKED` to its resumer, which runs on
+    /// (#1952). A host call's park, on every engine.
+    Fiber,
+    /// The calling vCPU's, whatever fiber it is in: a demand-paged child's page fault, which blocks
+    /// its whole vCPU on every engine, as a join does (#2322).
+    Vcpu,
+}
+
 /// #1826 — park the calling fiber's host call until `still_parked` turns false. Fiber 0 parks its
 /// vCPU on `key` through the run's futex hub ([`futex_wait`]), so it has the futex wait's every exit:
 /// a kill, the domain's teardown, a freeze (`WAIT_FROZEN`), and deadlock detection (no live vCPU left
-/// to end it); a [`wake_host_parks`] on `key` re-checks it. Any other fiber parks alone (#1952). `still_parked` must not take the `Host` (a waker holds
-/// it while it takes the futex lock): it reads state the host shares, such as a pipe's FIFO.
+/// to end it); a [`wake_host_parks`] on `key` re-checks it. Any other fiber parks as `parks` says:
+/// alone, or with its vCPU. `still_parked` must not take the `Host` (a waker holds it while it takes
+/// the futex lock): it reads state the host shares, such as a pipe's FIFO.
 ///
 /// A durable run's deferred children run first ([`Domain::drive_deferred_before_park`]): one of
 /// them may be what ends the park. The caller holds no lock the run's other vCPUs need.
@@ -241,21 +279,29 @@ pub unsafe fn park_host_call(
     trap_out: *mut i64,
     unwind_base: u64,
     key: u64,
+    parks: Parks,
     still_parked: impl Fn() -> bool,
 ) -> HostPark {
     let vm = crate::vmctx::VmCtx::of_trap_out(trap_out);
     let frozen = || unwind_base != 0 && fiber_rt::window_is_unwinding(unwind_base);
     // #1952 — a fiber's park takes the fiber alone: it yields `FIBER_PARKED` to its resumer, which
     // runs on, and re-checks each time a `cont.resume` polls it. It parks before the first re-check,
-    // for the one transient `FIBER_PARKED` the oracle's register-then-recheck gives.
-    if let Some(slot) = fiber_rt::current_fiber_slot() {
-        let ended = || epoch_fired(vm.epoch as usize) || load_trap(trap_out) != 0;
+    // for the one transient `FIBER_PARKED` the oracle's register-then-recheck gives. A vCPU's park
+    // in a task parks every context up to the task's own (`fiber_rt::fiber_resume`); on an OS vCPU
+    // it blocks in place, below.
+    let on = match parks {
+        Parks::Fiber => fiber_rt::ParkOn::Event,
+        Parks::Vcpu => fiber_rt::ParkOn::Page,
+    };
+    let slot = fiber_rt::current_fiber_slot().filter(|_| !on.blocks_vcpu() || fiber_rt::in_task());
+    if let Some(slot) = slot {
+        let ended = || epoch_fired(vm.epoch as usize) || domain_ended(trap_out);
         loop {
             if frozen() {
                 mark_reissue(unwind_base);
                 return HostPark::Frozen;
             }
-            fiber_rt::fiber_event_park(&slot, None, fiber_rt::ParkOn::Event);
+            fiber_rt::fiber_event_park(&slot, None, on.clone());
             if ended() {
                 return HostPark::Ended;
             }
@@ -290,9 +336,9 @@ pub unsafe fn park_host_call(
         unwind_base,
         &hub.parked,
         || hub.peers_live(),
-        || load_trap(trap_out) != 0,
+        || domain_ended(trap_out),
     );
-    let ended = || epoch_fired(dom.env().epoch_addr) || load_trap(trap_out) != 0;
+    let ended = || epoch_fired(dom.env().epoch_addr) || domain_ended(trap_out);
     if !dom.lane_acquire(&lane, ended) || ended() {
         return HostPark::Ended;
     }
@@ -305,6 +351,70 @@ pub unsafe fn park_host_call(
         WAIT_DEADLOCK => HostPark::Deadlock,
         _ => HostPark::Woken,
     }
+}
+
+/// #2047 — wait outside the run for a host call's answer (a job punted to the offload pool, which
+/// may wait on the world), as a park waits: the calling vCPU gives its lane back for the wait (D66)
+/// and takes it again after, and a kill or its domain's end stops the wait. It is not counted
+/// parked: the answer comes from outside, so it may yet end a peer's wait. `wait(d)` waits at most
+/// `d` for the answer, and is asked again every [`KILL_RECHECK`] until it has it. `None`: the run
+/// was killed (the trap cell now says `OutOfFuel`, as a join's does) or its domain ended, and the
+/// answer is left unclaimed.
+///
+/// # Safety
+/// `trap_out` is a live JIT call's trap cell (its `VmCtx`); a call in a fiber waits with its vCPU.
+/// The caller holds no lock the run's other vCPUs need.
+#[cfg(not(loom))]
+pub unsafe fn wait_outside<R>(
+    trap_out: *mut i64,
+    mut wait: impl FnMut(Duration) -> Option<R>,
+) -> Option<R> {
+    let vm = crate::vmctx::VmCtx::of_trap_out(trap_out);
+    let dom = (!vm.sched.is_null()).then(|| current_domain(vm.sched as *const Domain));
+    let lane = dom.map(|d| d.lane_chain()).unwrap_or_default();
+    if let Some(d) = dom {
+        d.lane_give_back(&lane);
+    }
+    let killed = || epoch_fired(vm.epoch as usize);
+    let ended = || killed() || domain_ended(trap_out);
+    let answer = loop {
+        if let Some(r) = wait(KILL_RECHECK) {
+            break Some(r);
+        }
+        if ended() {
+            break None;
+        }
+    };
+    let back = dom.is_none_or(|d| d.lane_acquire(&lane, ended));
+    if killed() {
+        store_trap(trap_out, TrapKind::OutOfFuel as i64);
+    }
+    answer.filter(|_| back && !ended())
+}
+
+/// #2424 — what re-offers a §14 child's task parked on an answer from outside the run
+/// ([`crate::fiber_park_outside`]), for the thread that posts the answer to call: it re-offers the
+/// run's parked tasks, as a `notify` does, so the task sees its answer now rather than at the
+/// executor's next sweep. It holds the executor weakly: once the run has ended it does nothing.
+/// `None` off a task (an OS vCPU waits on the answer itself, [`wait_outside`]).
+///
+/// # Safety
+/// `trap_out` is a live JIT call's trap cell (its `VmCtx`).
+#[cfg(not(loom))]
+pub unsafe fn outside_waker(trap_out: *mut i64) -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
+    let vm = crate::vmctx::VmCtx::of_trap_out(trap_out);
+    if vm.sched.is_null() || !fiber_rt::in_task() {
+        return None;
+    }
+    let dom = current_domain(vm.sched as *const Domain);
+    let exec = lock(&dom.hub().child_exec)
+        .as_ref()
+        .map(std::sync::Arc::downgrade)?;
+    Some(std::sync::Arc::new(move || {
+        if let Some(exec) = exec.upgrade() {
+            exec.wake_all_parked_locked();
+        }
+    }))
 }
 
 /// #1826 — wake every host call parked on `key` ([`park_host_call`]): each re-checks its predicate.
@@ -448,8 +558,8 @@ pub(crate) struct Domain {
     /// the run under one scheduler: one live cap, one futex, one deadlock count.
     hub: usize,
     /// #2001 — the budget node this domain's spawned vCPUs are charged to, one `spawn` each while
-    /// it lives: a run's own (the embedder's grant, #2113) or a detached child's. `None` for a carve
-    /// child's (#1867) and for shared code's ([`Self::fresh`]), which spawns nothing.
+    /// it lives: a run's own (the embedder's grant, #2113) or a detached child's. `None` for shared
+    /// code's ([`Self::fresh`]), which spawns nothing.
     node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
 }
 
@@ -695,12 +805,6 @@ pub fn region_canon_lookup(phys: u64) -> Option<(u64, u64)> {
 }
 
 impl Domain {
-    /// A new domain with nothing of this one's: what another instance of the same code runs on
-    /// (#1825). Shared code makes no thread or fiber, so it charges no node.
-    pub(crate) fn fresh(&self) -> Domain {
-        Domain::new(None)
-    }
-
     /// A run's own domain: its vCPUs (and a §14 child task's, through [`Self::new_child`]) are charged
     /// to `node` (#2001, #2113), and [`MAX_VCPUS`] bounds the run's live vCPUs.
     pub(crate) fn new(node: Option<std::sync::Arc<dyn crate::BudgetNode>>) -> Domain {
@@ -1168,8 +1272,9 @@ impl Domain {
     /// Called by `run_inner` when the **root vCPU** has finished — clean return, trap, exit, or
     /// fault — right before [`Self::join_all`]. If no trap/exit is already stored, store the
     /// internal [`crate::DOMAIN_DONE_CODE`] sentinel ("root completion ends the activation"), so
-    /// every surviving sibling's trap-propagation guard treats the domain as over; then wake every
-    /// parked vCPU so it observes the non-zero cell and unwinds instead of waiting forever.
+    /// every surviving sibling's trap-propagation guard treats the domain as over. Whatever ended
+    /// it also goes in the stop word, which no host call resets. Then wake every parked vCPU so it
+    /// observes the end and unwinds instead of waiting forever.
     ///
     /// `freezing` (a durable **freeze**: the root unwound under `UNWINDING`) is *not* teardown —
     /// the sentinel is skipped so parked siblings park-and-unwind through the freeze re-issue
@@ -1178,17 +1283,21 @@ impl Domain {
     pub(crate) fn begin_teardown(&self, freezing: bool) {
         if !freezing {
             let env = self.env();
+            // SAFETY: `trap_out` is the run's live instance context (its field 0 the trap cell),
+            // valid until run teardown.
+            let vm = unsafe { crate::VmCtx::of_trap_out(env.trap_out) };
             // CAS 0 → sentinel: never clobber a real trap / exit a dying vCPU already stored.
-            // SAFETY: `trap_out` is the run's live trap cell (an `AtomicI64`'s storage; see
-            // [`store_trap`]), valid until run teardown.
-            unsafe {
-                let _ = (*(env.trap_out as *const AtomicI64)).compare_exchange(
-                    0,
-                    crate::DOMAIN_DONE_CODE as i64,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
-            }
+            let done = crate::DOMAIN_DONE_CODE as i64;
+            let ended = vm
+                .trap
+                .compare_exchange(0, done, Ordering::Relaxed, Ordering::Relaxed)
+                .map_or_else(|code| code, |_| done);
+            // #2498 — and in the stop word, which a sibling's successful `call.cap` cannot reset as
+            // it resets the trap cell (#2088). A sibling whose host call was in flight here wiped the
+            // sentinel as the call returned and ran on, and `join_all` waited for it forever.
+            let _ = vm
+                .stop
+                .compare_exchange(0, ended, Ordering::Relaxed, Ordering::Relaxed);
         }
         self.wake_all_parked();
     }
@@ -1402,10 +1511,10 @@ std::thread_local! {
 
 std::thread_local! {
     /// #1469 — the domain the code on this thread spawns into and joins from when it is not the
-    /// one baked into its thunks: a §14 child task's. Seeded on each of the child's vCPU threads
+    /// one its vmctx names (`sched`): a §14 child task's. Seeded on each of the child's vCPU threads
     /// ([`run_child`]) and around each residency of the task on an executor worker (`child_exec`);
-    /// null elsewhere, where the baked `sched` is the domain. Child code is shared across spawns
-    /// (`instantiator_rt`'s code cache), so the domain cannot be baked into it.
+    /// null elsewhere, where the vmctx's `sched` is the domain. Child code is shared across spawns
+    /// (`instantiator_rt`'s code cache), so no domain can be part of it.
     static CURRENT_DOMAIN: std::cell::Cell<*const Domain> = const { std::cell::Cell::new(std::ptr::null()) };
 }
 
@@ -1414,7 +1523,7 @@ pub(crate) fn set_current_domain(dom: *const Domain) -> *const Domain {
     CURRENT_DOMAIN.with(|c| c.replace(dom))
 }
 
-/// The domain a thread thunk acts in: this thread's current one, else the baked `sched`. Not
+/// The domain a thread thunk acts in: this thread's current one, else the vmctx's `sched`. Not
 /// inlined: a task can move to another worker across a park, so the thread-local is re-read on the
 /// thread that asks (R2, #1466).
 ///
@@ -1504,7 +1613,7 @@ fn run_child(a: SpawnArgs) {
     let chain = dom.lane_chain();
     let got_lane = dom.lane_acquire(&chain, || {
         // SAFETY: the run's live interrupt cell / trap cell, as everywhere in this file.
-        epoch_fired(env.epoch_addr) || unsafe { load_trap(env.trap_out) } != 0
+        epoch_fired(env.epoch_addr) || unsafe { domain_ended(env.trap_out) }
     });
     let mut call = ChildCall {
         env,
@@ -2156,7 +2265,18 @@ impl Domain {
             // its Done cell is pre-filled and it is **not** re-run (its side effects are already in the
             // snapshot). Every child lands at its recorded slot (#1685); a slot joined before the
             // freeze gets an inert, already-joined cell, so a re-join of it traps as it would have.
-            let done = Done::new(v.completed_result.map(|r| (r, 0)));
+            // #2001 — a live one handed its `spawn` back as it unwound for the freeze, and lived before
+            // it: charged again. #2318 — never past the process's pools: one they have no room for is
+            // a vCPU the process cannot hold, so it is not re-run either, and its join answers
+            // `ThreadFault`, as a re-spawn the OS refuses does (below).
+            let ended = match v.completed_result {
+                Some(r) => Some((r, 0)),
+                None if self.node.as_ref().is_some_and(|n| !n.rebuild_vcpu()) => {
+                    Some((0, TrapKind::ThreadFault as i64))
+                }
+                None => None,
+            };
+            let done = Done::new(ended);
             {
                 let mut dc = lock(&self.dchildren);
                 let tbl = dc.entry(v.parent_task as u64).or_default();
@@ -2168,7 +2288,7 @@ impl Domain {
                 tbl.cells[v.slot] = std::sync::Arc::clone(&done);
                 tbl.joined[v.slot] = false;
             }
-            if v.completed_result.is_some() {
+            if ended.is_some() {
                 continue; // already-done: no re-run, no §15 live count, no context
             }
             lock(&self.threads).live += 1;
@@ -2177,10 +2297,6 @@ impl Domain {
             // the thawed one ran, and a joiner's deadlock check saw quiescence (#1820).
             if !std::ptr::eq(self.hub(), self) {
                 lock(&self.hub().threads).live += 1;
-            }
-            // #2001 — it handed its `spawn` back as it unwound for the freeze, and lived before it.
-            if let Some(n) = &self.node {
-                n.force_vcpu();
             }
             let entry = (env.fn_table_base as *const FnEntry).add(v.func as u32 as usize);
             runs.push(Run {
@@ -2291,13 +2407,14 @@ pub(crate) unsafe extern "C" fn thread_join(
             // handle ⇒ inert trap.
             match dc.get_mut(&cur) {
                 Some(tbl) => {
-                    let n = tbl.cells.len();
-                    let mask = if n == 0 { 0 } else { n.next_power_of_two() - 1 };
-                    let slot = (handle as u32 as usize) & mask;
-                    if slot >= n || tbl.joined[slot] {
+                    // The oracle's rule (`temen_ir::handle_slot`, #2378): a forged, negative or
+                    // already-joined handle is inert.
+                    let Some(slot) =
+                        temen_ir::handle_slot(tbl.cells.len(), handle).filter(|&s| !tbl.joined[s])
+                    else {
                         store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
                         return 0;
-                    }
+                    };
                     tbl.joined[slot] = true;
                     tbl.cells[slot].joined.store(true, Ordering::Relaxed);
                     std::sync::Arc::clone(&tbl.cells[slot])
@@ -2310,14 +2427,13 @@ pub(crate) unsafe extern "C" fn thread_join(
         } else {
             drop(dc);
             let mut t = lock(&dom.threads);
-            let n = t.cells.len();
-            let mask = if n == 0 { 0 } else { n.next_power_of_two() - 1 };
-            let slot = (handle as u32 as usize) & mask;
-            // Out-of-range or already-joined handles are inert (trap), like a forged capability index.
-            if slot >= n || t.joined[slot] {
+            // Out-of-range, negative or already-joined handles are inert (trap), like a forged
+            // capability index: the oracle's rule (`temen_ir::handle_slot`, #2378).
+            let Some(slot) = temen_ir::handle_slot(t.cells.len(), handle).filter(|&s| !t.joined[s])
+            else {
                 store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
                 return 0;
-            }
+            };
             t.joined[slot] = true;
             t.cells[slot].joined.store(true, Ordering::Relaxed);
             std::sync::Arc::clone(&t.cells[slot])
@@ -2395,8 +2511,8 @@ pub(crate) unsafe extern "C" fn thread_join(
             // ends the domain; sibling outcomes are unobservable past teardown. Return so the join's
             // trailing trap-propagation guard (which checks this same cell) unwinds this thread.
             // Woken promptly by [`Domain::wake_all_parked`].
-            // SAFETY: `trap_out` is the caller's live trap cell (an `AtomicI64`'s storage).
-            if unsafe { load_trap(trap_out as *mut i64) } != 0 {
+            // SAFETY: `trap_out` is the caller's live instance context.
+            if unsafe { domain_ended(trap_out as *mut i64) } {
                 return 0;
             }
             // A timeout wait so the kill (`epoch_addr`) and freeze (`unwind_base`) re-checks above run
@@ -2416,7 +2532,7 @@ pub(crate) unsafe extern "C" fn thread_join(
     // Back from the park; re-take the lane before the guest runs again.
     if !dom.lane_acquire(&lane, || {
         // SAFETY: the run's live interrupt cell / the caller's live trap cell.
-        epoch_fired(epoch_addr) || unsafe { load_trap(trap_out as *mut i64) } != 0
+        epoch_fired(epoch_addr) || unsafe { domain_ended(trap_out as *mut i64) }
     }) {
         store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
         return 0;
@@ -2463,7 +2579,7 @@ unsafe fn task_join(
             }
         }
         // Killed, or the child's domain is over: return; the join's trailing guards unwind.
-        if epoch_fired(env.epoch_addr) || load_trap(trap_out as *mut i64) != 0 {
+        if epoch_fired(env.epoch_addr) || domain_ended(trap_out as *mut i64) {
             return 0;
         }
         if unwind_base != 0 && fiber_rt::window_is_unwinding(unwind_base) {
@@ -2581,19 +2697,19 @@ pub(crate) unsafe extern "C" fn thread_wait(
         // wait/join (incl. this waiter). `live > parked` ⇒ some live vCPU is still runnable and could
         // notify; `live == parked` ⇒ every live vCPU is blocked (a lone or **mutual** deadlock).
         || hub.peers_live(),
-        // Owner decision 2026-07-24 (domain teardown): return on a non-zero trap cell — the
-        // **caller's own** cell (`trap_out`), i.e. the one this waiter's trailing guard checks, so
-        // the wake always unwinds the right thread (a §14 child parked on the shared futex has its
-        // own cell and is untouched by a parent-domain teardown, as before).
-        // SAFETY: `trap_out` is the caller's live trap cell (an `AtomicI64`'s storage).
-        || unsafe { load_trap(trap_out as *mut i64) } != 0,
+        // Owner decision 2026-07-24 (domain teardown): return once the **caller's own** instance
+        // (`trap_out`) has ended ([`domain_ended`]), its trap cell being the one this waiter's
+        // trailing guard checks, so the wake always unwinds the right thread (a §14 child parked on
+        // the shared futex has its own cell and is untouched by a parent-domain teardown, as before).
+        // SAFETY: `trap_out` is the caller's live instance context.
+        || unsafe { domain_ended(trap_out as *mut i64) },
     );
     // Back from the park: re-take the lane before any guest code runs again. An abort (kill or a
     // torn-down domain) leaves it untaken and the caller's trailing guard unwinds, exactly as the
     // wait statuses below do.
     if !dom.lane_acquire(&lane, || {
         // SAFETY: the run's live interrupt cell / the caller's live trap cell.
-        epoch_fired(dom.env().epoch_addr) || unsafe { load_trap(trap_out as *mut i64) } != 0
+        epoch_fired(dom.env().epoch_addr) || unsafe { domain_ended(trap_out as *mut i64) }
     }) {
         store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
         return 0;
@@ -2688,7 +2804,7 @@ unsafe fn fiber_futex_wait_loop(
         // return as if woken — the caller's trailing guards (the epoch poll, the trap
         // propagation, the durable re-issue safepoint) unwind before the guest observes it.
         let frozen = unwind_base != 0 && fiber_rt::window_is_unwinding(unwind_base);
-        if epoch_fired(dom.env().epoch_addr) || load_trap(trap_out as *mut i64) != 0 || frozen {
+        if epoch_fired(dom.env().epoch_addr) || domain_ended(trap_out as *mut i64) || frozen {
             wait_deregister(&mut lock(&dom.hub().futex), key, cell);
             // A freeze ended this wait, not its event: the thaw re-issues it (#1769).
             return if frozen {
@@ -2779,22 +2895,26 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
         let value = fiber_rt::fiber_resume(handle, arg, status_out, trap_out);
         // Done (guest suspend / return), a trap in flight, or not event-parked: hand back to the
         // guest exactly as `cont.resume` would (its `status_out`/value are already set).
-        if *status_out != FIBER_PARKED_STATUS || load_trap(trap_out as *mut i64) != 0 {
+        if *status_out != FIBER_PARKED_STATUS || domain_ended(trap_out as *mut i64) {
             return value;
         }
+        // #2424 — a fiber waiting on an answer from outside the run may be woken although no vCPU
+        // of the run is live, so its resumer idling on it is not blocked either.
+        let outside = fiber_rt::parked_outside(handle);
         // #1469 — inside a child-domain task the thread that would idle is an executor worker, not
         // a vCPU of this Domain: its lanes and deadlock count are the task's, which the executor
-        // keeps. So the task root parks the *task* on the one event park (counted, woken by every
-        // notify, poisoned at teardown) and re-polls when woken. A guest fiber inside the task
-        // fails closed rather than block a worker.
+        // keeps. So the task root parks the *task* on the one event park (counted, unless the
+        // fiber waits on the outside, woken by every notify, poisoned at teardown) and re-polls
+        // when woken. A guest fiber inside the task fails closed rather than block a worker.
         if fiber_rt::in_task() {
             match fiber_rt::current_fiber_slot() {
                 Some(s) if s.is_platform() => {
-                    fiber_rt::fiber_event_park(
-                        &s,
-                        fiber_rt::park_deadline(handle),
-                        fiber_rt::ParkOn::Event,
-                    );
+                    let on = if outside {
+                        fiber_rt::ParkOn::Outside
+                    } else {
+                        fiber_rt::ParkOn::Event
+                    };
+                    fiber_rt::fiber_event_park(&s, fiber_rt::park_deadline(handle), on);
                     continue;
                 }
                 _ => {
@@ -2825,7 +2945,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                 // counting it let a *sibling*'s indefinite wait read `live == parked` and trap a
                 // correct program. Same rule as the OS park (#1625) and the task park, asked of the
                 // one park this vCPU is actually waiting on.
-                let self_resolving = fiber_rt::park_deadline(handle).is_some();
+                let self_resolving = fiber_rt::park_deadline(handle).is_some() || outside;
                 let cell = fiber_rt::park_cell(handle);
                 let g = lock(&hub.futex);
                 // A `notify` that claimed the fiber's wait since the poll above: re-poll at once
@@ -2883,7 +3003,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
             }
             if !dom.lane_acquire(&lane, || {
                 // SAFETY: the run's live interrupt cell / trap cell.
-                epoch_fired(dom.env().epoch_addr) || unsafe { load_trap(trap_out as *mut i64) } != 0
+                epoch_fired(dom.env().epoch_addr) || unsafe { domain_ended(trap_out as *mut i64) }
             }) {
                 store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
                 return value;

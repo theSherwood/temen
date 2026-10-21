@@ -6,7 +6,7 @@
 //! Until §2.3 this file raced the offer lane against the bespoke coroutine ops (Instantiator
 //! ops 2/3 + `Yielder`) it replaced; the collapse deleted those ops, so the offer lane is now the
 //! only transport and this pin holds the absolute per-round shape: the parent spawns a serving
-//! child detached (a v1 record paid from its `"budget"`), mints a live offer over its `adder`
+//! child detached (a spawn record paid from its `"budget"`), mints a live offer over its `adder`
 //! export (op 14), and calls `add(i, 1)`
 //! through it n times, the child replying from a `svc.wait` loop — checksum
 //! `Σ_{i=0}^{n-1}(i+1) = n(n+1)/2`. Known asymmetry, same as `serving_bench` documents: the
@@ -56,9 +56,9 @@ block 0 () {{
   vcp = i64.const 16416
   vcl = i64.const 5
   vcm = self.resolve vcp vcl
-  q0m = i64.const 17560
+  q0m = i64.const 17544
   i32.store q0m vcm
-  q0b = i64.const 17564
+  q0b = i64.const 17548
   i32.store q0b vb
   q0a0 = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vh (q0a0)
@@ -78,7 +78,7 @@ block 1 (vh1: i32, vch1: i32, voffer1: i32, vi: i64, vacc: i64) {{
   br_if vcmp 1(vh1, vch1, voffer1, vi2, vacc2) 2(vh1, vch1, vacc2)
 }}
 block 2 (vh2: i32, vch2: i32, vaccf: i64) {{
-  vj = call.cap 6 1 (i32) -> (i64) vh2 (vch2)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh2 (vch2)
   vc = i32.wrap_i64 vaccf
   call.import 0 (vc)
   unreachable
@@ -115,7 +115,7 @@ block 0 (va: i64, vb: i64) {{
             &SpawnRec {
                 grants_ptr: 16448,
                 grants_n: 1,
-                ..SpawnRec::v1(0)
+                ..SpawnRec::default()
             }
         ),
         exit = rec::empty_grant(16448, 16432, "exit"),
@@ -142,10 +142,7 @@ fn run(backend: Backend, src: &str) -> i32 {
             backend,
             &RunConfig::default(),
             &[
-                (
-                    "vm",
-                    HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
-                ),
+                ("vm", HostCap::custom(6, 0, |h, _| h.grant_instantiator())),
                 ("budget", HostCap::detached_budget(1 << 20)),
                 (
                     "child",

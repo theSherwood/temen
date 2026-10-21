@@ -93,8 +93,12 @@ fn compile_to_leng(nim_path: &str, source: &str) -> Vec<(String, String)> {
 /// evaluates at compile time (and `std/macros` routes `parsegen`/`regex` through plugins of its own).
 /// Each helper has its own `<stem>/<stem>.linkmanifest.nif`, and sweeping its modules in too fails
 /// the link with `DuplicateSymbol("main")`. Empty when no manifest names `output`.
+///
+/// A backend writes under its own directory, `<nimcache>/c/` for `nimony c` (nim-lang/nimony#2616):
+/// each program's build directory, and beside them the `.x.nif` of every module but a main one.
 fn program_modules(nimcache: &std::path::Path, output: &str, nif: &str) -> Vec<(String, String)> {
-    let manifest = std::fs::read_dir(nimcache)
+    let backend = nimcache.join("c");
+    let manifest = std::fs::read_dir(&backend)
         .into_iter()
         .flatten()
         .flatten()
@@ -114,8 +118,8 @@ fn program_modules(nimcache: &std::path::Path, output: &str, nif: &str) -> Vec<(
         .filter_map(|f| std::path::Path::new(f).file_name()?.to_str())
         .map(|stem| {
             // A program's `.c.nif` are all in its build directory. Of its `.x.nif`, only its own
-            // module's is; the rest are in `nimcache`.
-            let file = [build_dir.as_path(), nimcache]
+            // module's is; the rest are the backend's.
+            let file = [build_dir.as_path(), backend.as_path()]
                 .map(|d| d.join(format!("{stem}.{nif}.nif")))
                 .into_iter()
                 .find(|p| p.exists())
@@ -963,6 +967,7 @@ fn run_io_capture(
         &argv,
         &temen_run::ExecGrants::default(),
         backend,
+        None,
         None,
     ) {
         // A guest that wrote before it died names its own problem — the plain `?` dropped that with
@@ -2137,6 +2142,7 @@ fn run_on_edge(
             &temen_run::ExecGrants::default(),
             engine,
             None,
+            None,
         )?;
         return Ok(Ran {
             outcome,
@@ -2781,6 +2787,7 @@ fn nim_shells_out_through_the_posix_sh() {
             },
             engine,
             None,
+            None,
         );
         // The tree-walker and the JIT record twin traps (#1665); a bytecode crash shows in the output.
         let crashed = temen_interp::last_twin_traps();
@@ -2874,6 +2881,7 @@ fn a_nim_process_that_polls_its_child_sleeps() {
                 built: false,
             },
             engine,
+            None,
             None,
         );
         assert!(
@@ -2969,6 +2977,7 @@ fn an_execd_nim_programs_heap_grows_past_its_window() {
             },
             engine,
             None,
+            None,
         );
         let crashed = temen_interp::last_twin_traps();
         assert!(
@@ -2997,7 +3006,8 @@ fn an_execd_nim_programs_heap_grows_past_its_window() {
 /// evaluation runs the program it built for a `const` and reads its answer, and how it builds that
 /// program in the first place. Unlike `execShellCmd`, the child's stdin, stdout and stderr are
 /// pipes (`startProcess` without `poParentStreams`): the parent reads the child's stdout until EOF
-/// and reaps its exit code.
+/// and reaps its exit code. The second command is the shell's own builtins: the shell itself writes
+/// the pipe, a core pipe, whose redirect tag its shim used to drop as a failed write (#2371).
 #[test]
 fn nim_reads_a_commands_output_through_execcmdex() {
     let Some(path) = toolchain_path() else {
@@ -3014,8 +3024,9 @@ fn nim_reads_a_commands_output_through_execcmdex() {
         &path,
         "import std/syncio\nimport std/osproc\n\
          try:\n\
-         \x20 let (outp, rc) = execCmdEx(\"bin/child hi\")\n\
-         \x20 write(stdout, \"parent:\" & $rc & \"|\" & outp)\n\
+         \x20 for cmd in [\"bin/child hi\", \"echo builtin; exit 4\"]:\n\
+         \x20   let (outp, rc) = execCmdEx(cmd)\n\
+         \x20   write(stdout, \"parent:\" & $rc & \"|\" & outp)\n\
          except ErrorCode as e:\n\
          \x20 write(stdout, \"parent raised:\" & $e)\n",
     );
@@ -3040,6 +3051,7 @@ fn nim_reads_a_commands_output_through_execcmdex() {
             },
             engine,
             None,
+            None,
         );
         assert!(
             run.as_ref().is_ok_and(is_clean_exit),
@@ -3047,8 +3059,8 @@ fn nim_reads_a_commands_output_through_execcmdex() {
         );
         assert_eq!(
             String::from_utf8_lossy(&posix.stdout()),
-            "parent:3|child:hi\n",
-            "{engine:?}: the parent read the child's output and its exit code (stderr: {:?})",
+            "parent:3|child:hi\nparent:4|builtin\n",
+            "{engine:?}: the parent read each command's output and its exit code (stderr: {:?})",
             String::from_utf8_lossy(&posix.stderr())
         );
     }
@@ -3114,6 +3126,7 @@ fn nim_forks_and_execs_a_nim_program() {
                 built: false,
             },
             engine,
+            None,
             None,
         );
         assert!(
@@ -3203,7 +3216,7 @@ fn nim_reads_and_writes_files_through_the_posix_personality() {
 /// edge rather than the sizing.
 ///
 /// **Knobs**, for bisecting from the outside: `NIM_NIFLER2_SRC` picks a different in-tree program
-/// (a smaller probe against the same parser, or another phase — `src/hexer/hexer.nim`,
+/// (a smaller probe against the same parser, or another phase — `src/lengc/shoggoth/shoggoth.nim`,
 /// `src/nimony/nimsem.nim`), `NIM_NIFLER2_ARGS` the guest's argv, `NIM_NIFLER2_SEED` the inputs to
 /// seed into both the guest memfs and the oracle's cwd (so a phase is driven over **real work**
 /// rather than an argv it rejects), `NIM_NIFLER2_OUT` the file to compare, `NIM_NIFLER2_SL` the
@@ -3626,34 +3639,65 @@ int main(void) {
 }
 "#;
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 /// The parent, over `(Instantiator, AddressSpace, Nim producer, C module, Budget)`: it mints a 64 KiB
 /// region, spawns the Nim child (the producer's image, its 16 MiB window, the region at 8 MiB) and
 /// the C child (its 128 KiB window, the region at 64 KiB, above its data and stack), each detached
-/// at entry 0 with the region pre-mapped, and returns both children's results. A pre-map must lie
-/// inside the window the child's module declares.
+/// from a spawn record of its own (the Nim child's at 17408, the C child's at 17536) with the region
+/// pre-mapped, and returns both children's results. A pre-map must lie inside the window the child's
+/// module declares.
 fn ring_parent() -> temen_ir::Module {
-    let text = "memory 17
-func (i32, i32, i32, i32, i32) -> (i64, i64) {
-block 0 (inst: i32, aspace: i32, nim: i32, c: i32, budget: i32) {
+    let nim_child = temen_ir::SpawnRec {
+        size_log2: 24,
+        child_off: 8388608,
+        ..temen_ir::SpawnRec::default()
+    };
+    let c_child = temen_ir::SpawnRec {
+        size_log2: 17,
+        child_off: 65536,
+        ..temen_ir::SpawnRec::default()
+    };
+    let text = format!(
+        "memory 17
+func (i32, i32, i32, i32, i32) -> (i64, i64) {{
+block 0 (inst: i32, aspace: i32, nim: i32, c: i32, budget: i32) {{
   len = i64.const 65536
   region = call.cap 5 5 (i64) -> (i64) aspace (len)
-  b = i64.extend_i32_u budget
-  z = i64.const 0
-  nm = i64.extend_i32_u nim
-  nl = i64.const 24
-  no = i64.const 8388608
-  pn = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) inst (b, nm, z, z, z, nl, z, z, z, region, no)
-  cm = i64.extend_i32_u c
-  cl = i64.const 17
-  co = i64.const 65536
-  pc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) inst (b, cm, z, z, z, cl, z, z, z, region, co)
-  jn = call.cap 6 1 (i32) -> (i64) inst (pn)
-  jc = call.cap 6 1 (i32) -> (i64) inst (pc)
+  rh = i32.wrap_i64 region
+  nma = i64.const {nim_module}
+  i32.store nma nim
+  nba = i64.const {nim_budget}
+  i32.store nba budget
+  nra = i64.const {nim_region}
+  i32.store nra rh
+  nrec = i64.const 17408
+  pn = call.cap 6 17 (i64) -> (i32) inst (nrec)
+  cma = i64.const {c_module}
+  i32.store cma c
+  cba = i64.const {c_budget}
+  i32.store cba budget
+  cra = i64.const {c_region}
+  i32.store cra rh
+  crec = i64.const 17536
+  pc = call.cap 6 17 (i64) -> (i32) inst (crec)
+  jn_st, jn = call.cap 6 1 (i32) -> (i64, i64) inst (pn)
+  jc_st, jc = call.cap 6 1 (i32) -> (i64, i64) inst (pc)
   return jn, jc
-  }
-}
-";
-    let m = temen_text::parse_module(text).expect("parse the parent");
+  }}
+}}
+{nim_rec}{c_rec}",
+        nim_module = 17408 + temen_ir::SpawnRec::MODULE_AT,
+        nim_budget = 17408 + temen_ir::SpawnRec::BUDGET_AT,
+        nim_region = 17408 + temen_ir::SpawnRec::REGION_AT,
+        c_module = 17536 + temen_ir::SpawnRec::MODULE_AT,
+        c_budget = 17536 + temen_ir::SpawnRec::BUDGET_AT,
+        c_region = 17536 + temen_ir::SpawnRec::REGION_AT,
+        nim_rec = rec::segment(17408, &nim_child),
+        c_rec = rec::segment(17536, &c_child),
+    );
+    let m = temen_text::parse_module(&text).expect("parse the parent");
     temen_verify::verify_module(&m).expect("verify the parent");
     m
 }
@@ -3710,7 +3754,7 @@ fn a_nim_domain_and_a_c_domain_share_a_ring() {
     let parent = ring_parent();
     let host = || {
         let mut host = temen_interp::Host::new();
-        let inst = host.grant_instantiator(0, 1 << 17);
+        let inst = host.grant_instantiator();
         let aspace = host.grant_address_space(0, 1 << 17);
         let nim = host.grant_module(&producer);
         let c = host.grant_module(&c);

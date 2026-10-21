@@ -15,16 +15,17 @@
 >
 > Proposed decision: **D60** (D59 is currently the last). See bottom of file.
 
-**Carve placement is being retired** (INVARIANTS.md #13, ruling 2026-09-29; #1289): every §14 child
-moves to a detached window, and the nested carve path is deleted on every engine. For this document
-that means the nested subtree freeze that rides the parent's window image (the `UNWINDING` broadcast
-into a child's carve, `FrozenNested` re-attach records, thaw's in-place carve re-attach, the
-carve-named `FreezeAuthority`) is the path being deleted; the surviving mechanism is the detached
-child's own root-shaped artifact (Section 8), rung to unwind by its freeze doorbell under
-`FreezeScope::DetachedProgeny` (§4, "Detached children"). Carve descriptions below are marked
-**Retiring**. Every engine now traps the carve spawn `CapFault` (#1867 slice 2), so no new carve child
-arises; the machinery below still re-attaches one that a thaw finds in an older artifact, until the
-nested freeze goes. The tests that pinned it by spawning a carve child are deleted with the spawn
+**Carve placement is retired** (INVARIANTS.md #13, ruling 2026-09-29; deleted in #1867): every §14
+child runs in a detached window, and the nested carve path is gone from every engine. For this
+document that means the nested subtree freeze that rode the parent's window image (the `UNWINDING`
+broadcast into a child's carve, `FrozenNested` re-attach records, thaw's in-place carve re-attach, the
+carve-named `FreezeAuthority`) is deleted; the surviving mechanism is the detached child's own
+root-shaped artifact (Section 8), rung to unwind by its freeze doorbell under freeze authority over
+the holder's detached progeny (§4, "Detached children"). Carve descriptions below are marked
+**Retired** and are history. Every engine traps the carve spawn `CapFault` (#1867 slice 2), and the
+nested freeze/thaw is deleted on every engine (#1867 slice 3): snapshot v44 drops Section 2's
+nested-child block and the carve-named freeze authority, so an older artifact carrying either is
+refused by its version. The tests that pinned it by spawning a carve child are deleted with the spawn
 (`durable_nesting.rs`'s nested half, `durable_nesting_jit.rs`); the detached path's twins are
 `durable_detached_jit.rs` and temen-interp's `durable_detached_parity.rs`. New work targets the
 detached path, and planned work below that would extend the carve path (JIT nesting parity,
@@ -60,8 +61,9 @@ Grounding the proposal in what already exists (verified against the tree):
   (`PageProt`) and bulk snapshot-read (`read_into`, `SNAP_CAP`) already exist for the
   escape-oracle. **Restore (write pages back + re-establish prots) does not exist yet
   and is new escape-TCB code** — see §6/§9.
-- **Nesting is real.** A child window is a power-of-two sub-range of the parent's via
-  `Window::sub()` (`crates/temen-mask/src/lib.rs`). This is the §4 subtree.
+- **Nesting is real.** A child window was a power-of-two sub-range of the parent's via
+  `Window::sub()` (`crates/temen-mask/src/lib.rs`), the §4 subtree. *(Retired: every §14 child now
+  has a window of its own, and `Window::sub` is deleted, #1867.)*
 - **The oracle is production machinery.** `crates/temen/tests/jit_diff.rs` and
   `fuzz/fuzz_targets/diff.rs` already run every program on interp and JIT and assert
   equivalence. The new snapshot property (§7) plugs straight in.
@@ -285,7 +287,7 @@ is a parser over attacker-controlled frames in the host.
 
 ## 4. Unit of durability
 
-> **Retiring:** this section's nested-subtree freeze describes the carve path, which is being deleted
+> **Retired (#1867):** this section's nested-subtree freeze describes the carve path, deleted in #1867
 > (INVARIANTS #13, 2026-09-29): the carve half of the snapshot-unit bullet, the subtree freeze and its
 > codec, separate-module and depth-2 nesting, and the JIT-parity arc. The detached equivalent is
 > "Detached children — live capture and re-launch (v29)" and "The gate is lifted" below.
@@ -295,13 +297,13 @@ is a parser over attacker-controlled frames in the host.
   verification, so guest-driven JIT composes for free.
 - **Snapshot unit = the domain, closed over its nesting subtree (§14).** State lives
   in the domain (window, vCPUs/fibers, handle/dispatch tables); a **nested** child's window
-  is a power-of-two sub-range of the parent's (`Window::sub`), and a fault-suspended child
+  was a power-of-two sub-range of the parent's (`Window::sub`, deleted with the carve, #1867), and a fault-suspended child
   can only be drained-then-unwound if its code is instrumented. A **detached** child (its own
   window, not a sub-range — §14 / DETACHED_JIT.md) is *not* covered by this subtree freeze:
   under the freeze-authority ruling (INVARIANTS #14, #1289 R1) it freezes as its own
   root-shaped artifact and a subtree snapshot is a consistent cut over the parent's and each
   detached child's — in-flight plumbing (the run driver must reach the detached child's
-  `Mem`+`Host` at quiesce), which is why a durable op-15 detached spawn refuses today.
+  `Mem`+`Host` at quiesce), which is why a durable detached spawn refused then.
 
 **The cut and its boundary (owner direction, 2026-09-24).** *Everything inside the cut is data;
 only the cut's boundary is an interface, and a boundary edge is recorded and re-bound, never
@@ -323,21 +325,22 @@ where it sits, not what kind it is:
   either completes before the cut or is cancelled and re-issued on thaw (R2/R6). This is the one
   case that needs per-operation semantics.
 
-**One rule per park site (#1898).** The oracle's scheduler parks a vCPU at one of fourteen sites (its
-waiter collections, with a reply and a page fault told apart in the one they share), each a `ParkSite`
-with one `FreezeRule`: **re-issue** (re-admit the vCPU under the
-freeze; its op is abandoned and the thaw re-issues it), **phase** (it stays parked and another
-vCPU's unwind wakes it), or **decline** (no rule yet: the census refuses the freeze up front,
+**One rule per park site (#1898).** The oracle's scheduler parks a vCPU at one of fourteen sites
+(its waiter collections, with a reply and a page fault told apart in the one they share), each a
+`ParkSite` with one `FreezeRule`: **re-issue** (re-admit the vCPU under the freeze; its op is
+abandoned and the thaw re-issues it), **phase** (it stays parked and another vCPU's unwind wakes
+it), or **decline** (no rule yet: the census refuses the freeze up front,
 `DeclineCause::Parked(site)`, rather than start one that would stall). Every list that walks the
-parked vCPUs (teardown, the census, a freeze's re-admission) is a loop over `ParkSite::ALL`, so a new
-collection cannot be missed by one of them. Re-issue: `svc.wait`, futex, pipe read and write,
-`waitpid`, a job-control stop, a stream read, and a live call's reply. Phase: `thread.join`, a lane.
-Decline: a fork-twin `wait(-1)` (#1688), a demand-paged child's page fault (#1940), a punted
-completion, which is a host call outside the cut (#1902), and an offer admission, which a durable
-caller never reaches (#1681). A fiber parked at a site follows the same rule: the freeze drive of
-whichever vCPU finishes first gives an unwoken fiber park the placeholder and re-issue word its
-site calls for, and a resumer that then claims the flattened fiber sees it still parked (#1677). A
-serve handler, parked or caught mid-run, rides the same way, with its reply linkage (#1676).
+parked vCPUs (teardown, the census, a freeze's re-admission) is a loop over `ParkSite::ALL`, so a
+new collection cannot be missed by one of them. Re-issue: `svc.wait`, futex, pipe read and write,
+`waitpid`, a job-control stop, a stream read, and a live call's reply. Phase: `thread.join`, a lane,
+and a demand-paged child's page fault, whose pager the freeze holds to serve it (#1940, #2455,
+below). Decline: a fork-twin `wait(-1)` (#1688), a punted completion, which is a host call outside
+the cut (#1902), and an offer admission, which a durable caller never reaches (#1681). A fiber
+parked at a site follows the same rule: the freeze drive of whichever vCPU finishes first gives an
+unwoken fiber park the placeholder and re-issue word its site calls for, and a resumer that then
+claims the flattened fiber sees it still parked (#1677). A serve handler, parked or caught mid-run,
+rides the same way, with its reply linkage (#1676).
 
 **A reply wait is a re-issue of the wait, not the call (#1901).** A caller parked on a live callee's
 reply has already issued its dispatch: it is queued on the callee, in the callee's handler, or
@@ -345,8 +348,8 @@ answered. Every one of those rides the cut on the callee (its serve section), so
 caller's *wait*: it records the ticket for the caller's shadow context on the caller's powerbox (the
 serve section's reply waits, codec v35), and the caller unwinds with its re-issue word set. On thaw the
 re-issued call finds the record and waits on that ticket instead of enqueueing the call again, and the
-callee, rewound, serves or has served it. A caller in a nested carve declines instead, since the carve's
-powerbox rides without the record, and the carve is retiring. A thaw re-links a `LiveImpl` to a
+callee, rewound, serves or has served it. (A caller in a nested carve declined instead, since the
+carve's powerbox rode without the record; the carve is deleted, #1867.) A thaw re-links a `LiveImpl` to a
 re-launched detached child as it does to a re-created nested one.
 
 **How the rule stays enforced (proposed 2026-09-29, for owner sign-off; #1898–#1904).** The rule
@@ -395,7 +398,7 @@ as a unit.
 `temen_durable::transform_module` — a compile-mode fact the runtime cannot re-derive from the
 IR, so it is attested like verification; plain `grant_module` grants unmarked). A **durable**
 domain's §14 ops then enforce the rule fail-closed (`-EINVAL`): a spawn — `instantiate` /
-`spawn_coroutine` (module forms 5/6/7) then, the detached spawn (op 15/17) now that every engine
+`spawn_coroutine` (module forms 5/6/7) then, the detached spawn (op 17) now that every engine
 refuses the carve spawn (#1867) — refuses an **unmarked** grant; a **same-module** child
 stays admissible (it runs the parent's own instrumented funcs); and the admitted child
 **inherits durability** — its `Host` + vCPU run durable, so its own spawns/fibers reserve
@@ -444,7 +447,7 @@ occupancy records only its entry's: the thaw installs its functions again in the
 re-compiles it), which is where they were only when nothing was installed before the unit. Pinned
 for that case by `durable_guest_jit.rs::durable_jit_install_own_funcref_survives_freeze_thaw`.
 
-> **Retiring:** this describes the carve path, which is being deleted (INVARIANTS #13, 2026-09-29).
+> **Retired (#1867):** this describes the carve path, deleted in #1867 (INVARIANTS #13, 2026-09-29).
 > The detached equivalent: a detached child's units ride Section 5 of its own root-shaped artifact
 > ("Detached children — live capture and re-launch (v29)" below).
 
@@ -505,9 +508,9 @@ interpreter was the reference for durable nesting). Both are retired (#2069, #18
 run's detached children freeze through `durable_detached_jit.rs`'s path. Non-durable
 domains are unaffected (`separate_module.rs` unchanged).
 
-> **Retiring:** from its subtree-freeze slice on, this block describes the carve path (the
-> `UNWINDING` broadcast into the carve, `FrozenNested`, in-place carve re-attach), which is being
-> deleted (INVARIANTS #13, 2026-09-29). The detached equivalent is the doorbell, harvest and
+> **Retired (#1867):** from its subtree-freeze slice on, this block describes the carve path (the
+> `UNWINDING` broadcast into the carve, `FrozenNested`, in-place carve re-attach), deleted in #1867
+> (INVARIANTS #13, 2026-09-29). The detached equivalent is the doorbell, harvest and
 > `relaunch_detached` path in "Detached children — live capture and re-launch (v29)" below.
 
 **Freeze × live §14 children — fail-closed (same PR).** A freeze that completes while a §14
@@ -570,23 +573,24 @@ live child → serialize → restore into a fresh host → **§12.6 canonical re
 `freeze → serialize → restore → thaw ≡ uninterrupted` contract across the nesting boundary.
 
 **Detached children — completed-result residue (v23, #1361 step 2).** The §14 **detached** spawn (op
-15, `instantiate_detached`) gives a child its *own* window rather than a carve in the parent's, so a
+15 then, the op-17 record since #2067) gives a child its *own* window rather than a carve in the parent's, so a
 **live** one at a freeze stays fail-closed: the subtree STW broadcasts `UNWINDING` only into carves
 within *this* window image, never reaching a detached child's separate window (the O6 mid-flight
 capture — step 3). A **completed-but-unjoined** one, though, needs nothing of that separate window:
 only its `thread.join` result crosses, exactly as for a completed nested child. It rides as a
 `FrozenDetached { parent_task, slot, completed_result }` in **Section 2**, trailing the nested block
 (which is emitted with count 0 when only detached residue is present, so the decoder always reads a
-nested count first); a domain that froze no detached child is byte-identical to v22 but for the
-version field. On thaw the runtime posts the result into the scheduler and rebuilds the parent's join
-edge — the parent's re-executed `thread.join` reloads it **without re-spawning** the child (op 15 is a
+nested count first; since v44, #1867, the nested block is gone and the detached block follows the
+vCPU residue directly, present iff non-empty); a domain that froze no detached child is
+byte-identical to v22 but for the version field. On thaw the runtime posts the result into the scheduler and rebuilds the parent's join
+edge — the parent's re-executed `thread.join` reloads it **without re-spawning** the child (the spawn is a
 `call.cap` checkpoint, so the rewind reloads its spilled slot handle rather than re-running the
 spawn). The residue type, the freeze-capture (completed → capture, else the existing fail-closed
 refusal), the codec, and the thaw-delivery are a verbatim structural mirror of the nested
 completed-result path above; the codec round-trip is pinned by
-`roundtrip.rs::a_completed_detached_child_rides_the_control_section`. (The op-15 `!durable` admission
+`roundtrip.rs::a_completed_detached_child_rides_the_control_section`. (The detached spawn's `!durable` admission
 gate that kept this inert came out with step 4, below.) The module-handle prerequisite was cleared
-first: op 15 takes a *module handle*, which
+first: a detached spawn takes a *module handle*, which
 `capture_durable_handles` used to refuse outright, so a durable parent that spawned a detached child
 could not be frozen at all; an attested-freezable grant is durable as of #1361 (§12.5 above), and no
 post-spawn cap-close op is needed. Under a scratch
@@ -603,8 +607,11 @@ the tree is flattened into the root's `unreached_detached()`, which `freeze` ref
 **Section 8** (`TAG_DETACHED`) as its **own root-shaped artifact** — this same format, frozen from its
 own powerbox, so its fibers, vCPUs, nested and detached children ride its own sections — behind the
 spawner-held `DetachedLaunch`: the edge (`parent_task`, `slot`), the child's frozen `task` id, its
-entry and module digest, its lane and its import names. Its fuel, `spawn` and `channel` bounds are its
-budget node's (Section 10, #1944 slice 3; the launch record carried them itself until v38). A thaw
+module digest, its lane, its import names and, for a demand-paged child, its pager export
+(v47, #2438). A child starts at its module's function 0 and binds its manifest strictly, so the
+record carried an entry and a same-module flag only until v43 (#2219). Its
+fuel, `spawn` and `channel` bounds are its budget node's (Section 10, #1944 slice 3; the launch record
+carried them itself until v38). A thaw
 may narrow those bounds, never widen them. Restore rebuilds each child
 into a fresh powerbox holding the restoring host's thaw seams (`Host::detached_thaw_host`: its durable
 module grants and JIT admission copied, its registrar and budget hook lent), so one restoring host
@@ -619,6 +626,46 @@ is bounded by the window's **reservation**, not its committed image: a detached 
 span its reservation (as a root's do, so `vm_map` can grow into it), and every host-side use is
 contained by the reservation, whose uncommitted tail faults inside the window.
 
+**A demand-paged child is durable too (#2438).** A child whose spawn record named a pager
+(§2.2, #1862) freezes like any detached child, and its pager rides its launch record: the
+codec refuses a record naming anything but a `{ page: (i64) -> (i64) }` export of the
+spawner's program, as op 17 does, and the thaw re-links the child's faults to that export on
+the re-created spawner. Nothing about faults rides the artifact. A page the pager never
+supplied is still unmapped in the child's image, so after the thaw it faults again and the
+pager supplies it then: the rewound access is the re-issue (INVARIANTS #7). The runtime's own
+words are never demand-paged: the pages a durable module's page ops may not touch
+(`ShadowArena::fences`, #2426), its control words and its declared shadow arena, stay mapped,
+because the runtime reads and writes them at every safepoint, freeze and thaw, and the pager,
+which cannot see the child's window, could only supply a stale copy (the cause of #2438's
+silent wrong results). The harvest captures only a child whose run ended by unwinding; one
+that trapped, that ran to its end, or that a deadlock teardown reaped keeps a window but has
+nothing to resume, and the freeze is refused (`DetachedUnreached`). A durable run pages on the
+tree-walker only: the bytecode engine's durable entry declines a module that spawns (§4), so a
+routed run of a pager-capable program freezes and thaws there. The Cranelift JIT pages a child
+only in a run that is not durable: it refuses a pager record in a durable run, and refuses to thaw
+a paged child rather than run it with no pager (#2489).
+Pinned by `temen`'s `durable_paged_detached.rs` and `temen-snapshot`'s
+`detached_roundtrip.rs`.
+
+**Leaves first (#2455).** A paged child's pages arrive only through its pager's serve loop, so
+a child that faults on its way to a safepoint unwinds only once the fault is served. A freeze
+therefore never takes a pager down while a child it pages still runs. Wherever it reaches a
+domain (the domain's trigger, its doorbell, the admission of its parks, or a paged spawn in a
+domain already unwinding), a domain paging live detached children is **held** instead
+(`hold_for_paged`). Its phase stays `NORMAL`, so it runs on and serves. Each such child is rung
+at once and its parks are brought through the freeze: a fault park takes the freeze's phase and
+waits for its page, as a join waits for its child (#1940). The hold waits on those children,
+and when the last has ended it releases, and the domain unwinds after them.
+
+A held domain's guest is still running, so it can meet a child that unwound before it. Such a
+child is **withheld**: its outcome is kept from the domain until the release, so to `poll`,
+`join`, `grant` and `child_offer` it reads as running, which is how the domain's own cut records
+it. A `kill` of it ends it as a kill of a running child does. The cut is consistent because a
+withheld child unwound before its spawner's cut and nothing crosses back: the spawner's later
+calls into it wait on its queue or ride the cut as a running child's. A root that returns while
+held has completed the run, and nothing froze. A domain that keeps spawning paged children keeps
+its hold only as long as its budget lasts: a withheld child keeps its window's charge.
+
 **The JIT captures them too.** A durable detached child on the JIT runs as a child-executor task over
 its own window, with a freeze cell beside its join-table entry (`DurableCell`: its live window base,
 its image once it unwinds). A root freeze **rings** each live child — a store of `UNWINDING` into the
@@ -632,7 +679,7 @@ word `NORMAL` and thaw word `REWINDING`. The child records its program on its ow
 (the import-binding hook sets `self_module`), which is how the harvest names it by digest. A child
 that completed but was not joined rides as its `join` outcome (`FrozenDetached`), and a thaw
 re-creates it at its join slot as a finished child, so the rewound `join` reloads the value or
-re-raises the trap without spawning the child again (#2041). A thawed run frozen again before that
+answers the trap without spawning the child again (#2041). A thawed run frozen again before that
 `join` carries the outcome again (#2044): the interpreter's spawner remembers each `(slot, task)` it
 was delivered, and the JIT's nursery marks the child, so the next freeze records it as completed as
 it did the first time. A thaw can be armed for that next freeze: a context's `REWINDING` is its own
@@ -674,13 +721,13 @@ own, so its children are durable too, and the freeze reaches them through it:
   flattened (#1684). A thaw seeds them back into its table before its threads and its root.
 
 **The gate is lifted on all three engines (step 4).** A durable parent spawns detached exactly when it
-holds `FreezeScope::DetachedProgeny` (#1440) and the module is attested freezable (#1501) — the
+holds freeze authority (#1440) and the module is attested freezable (#1501) — the
 authority half inside the one shared admission, `Host::admit_detached_spawn`, which the oracle, the
 JIT's budget-take hook and the resumable engine all call. A durable detached child holds that
 authority only if its parent hands it down as one of the spawn's named grants (#2018). Nothing mints
 it, so a durable tree grows only as deep as each holder lets it. The resumable engine hands its child to its
 embedder's driver, so capturing that child is the driver's; the browser's grants neither the authority
-nor an attested module, so its durable reactors refuse op 15 on the same rule. Pinned by
+nor an attested module, so its durable reactors refuse a detached spawn on the same rule. Pinned by
 `temen-interp/src/detached_freeze_tests.rs` (oracle: freeze a live child → harvest → re-launch → the
 join delivers the uninterrupted total), `temen-snapshot/tests/detached_roundtrip.rs` (every field
 survives, the child's table restores into the child's powerbox, a re-freeze is byte-identical, a
@@ -692,7 +739,7 @@ child or a grandchild that completed unjoined, with its value or its trap, #2041
 `durable_detached_parity.rs` (the
 oracle and the resumable engine admit with the authority and refuse without it, alike).
 
-> **Retiring:** this describes the carve path, which is being deleted (INVARIANTS #13, 2026-09-29).
+> **Retired (#1867):** this describes the carve path, deleted in #1867 (INVARIANTS #13, 2026-09-29).
 > The detached equivalent is `DetachedLaunch`'s module digest, resolved against the restoring host
 > (`ModuleUnresolved` otherwise) — "Detached children — live capture and re-launch (v29)" above.
 
@@ -712,7 +759,7 @@ handles. Pinned by
 thaw_separate_module_child_fails_closed_on_missing_or_mismatched_module}`. This completes depth-1
 nesting for **both** module kinds (same- and separate-module) in every child state.
 
-> **Retiring:** this describes the carve path, which is being deleted (INVARIANTS #13, 2026-09-29).
+> **Retired (#1867):** this describes the carve path, deleted in #1867 (INVARIANTS #13, 2026-09-29).
 > The detached equivalent is the recursive harvest: a captured detached child's own detached children
 > ride its own Section 8, bounded by `MAX_DETACHED_DEPTH` ("Detached children — live capture" above).
 
@@ -765,9 +812,9 @@ stays byte-identical. The JIT's re-attach runs each child as its recorded `task`
 a counter. Pinned by `durable_nesting.rs::a_grandchild_reattaches_to_its_recorded_parent_when_a_joined_sibling_shifted_the_ids`
 (interpreter and JIT thaw of one artifact).
 
-> **Retiring:** this JIT-parity arc (through "Completed children need no separate residue", including
-> the carve-masking security hinge) describes the carve path, which is being deleted (INVARIANTS #13,
-> 2026-09-29). The detached equivalent is "The JIT captures them too" above: a `DurableCell` per
+> **Retired (#1867):** this JIT-parity arc (through "Completed children need no separate residue",
+> including the carve-masking security hinge) describes the carve path, deleted in #1867 (INVARIANTS
+> #13, 2026-09-29). The detached equivalent is "The JIT captures them too" above: a `DurableCell` per
 > child, rung by a store of `UNWINDING` into the child's own freeze word.
 
 **JIT parity (design; the interpreter is the oracle).** All of the above — depth-1, depth-2, and the
@@ -922,7 +969,7 @@ module digest for a host-supplied re-grant at thaw) are the remaining §14 gap.
 *(The §14 surface itself has since grown — PROCESS.md's S-slices. The grant-carrying instantiate
 forms (S2 `instantiate_granted` / `instantiate_named`, Stage-1 `instantiate_module_named`) **failed
 closed (`-EINVAL`) under a durable JIT run** — a granted child's separate powerbox host had no freeze
-story, the same exclusion as the separate-module child. All three are retired (#1867); they trap
+story, the same exclusion as the separate-module child. All three are retired (#1867, #2065); they trap
 `CapFault` on every run. And
 `self.attest` (S6) stamps a nested child `freeze_exposed = durable`, adding one follow-up here: a
 durable freeze/thaw must capture + restore the child's `Attestation` — the thaw re-attach currently
@@ -1263,15 +1310,28 @@ detail; pin the exact one in the implementing crate.
 
 ### 12.3 Section 1 — Window image (sparse)
 
-Captured at the quiescent point. Sparse over **committed** pages, with zero-page
-elision. Per entry:
+Captured at the quiescent point. Sparse over the pages the window **holds**, with zero-page
+elision. The header's `mapped` is the image's **head**: the declared window, which is what every
+engine's capture reads whole, or the whole image a dense caller hands in (`freeze_with_prots`, a
+flat window's buffer). Per entry, in ascending page order:
 
 - `page_index: uleb` (window offset ÷ page)
-- `prot: u8` — `Rw=0, Ro=1, Unmapped=2, Backed=3` (mirrors `CapturedProt`, `temen-interp`)
-- if `prot ∈ {Rw, Ro}`: page bytes (run-length / zero-eliding to keep it small)
+- `prot: u8` — `Rw=0, Ro=1, Unmapped=2, Backed=3` (mirrors `CapturedProt`, `temen-interp`), with
+  `0x80` set when the page's bytes follow (v46)
+- with `0x80`: the page's bytes — stored for each page that has contents of its own that are not
+  all zero, whatever its protection: an `Unmapped` page protected to nothing keeps its contents
+  (#1909), which a guest that protects it readable again reads
 - if `prot = Backed` (#2025, v39): `region: uleb` (the region's number in Section 11), `off: uleb`
   (page-aligned byte offset into it), `writable: u8`. No bytes: the page's contents are the
   region's, which Section 11 carries once however many pages alias it.
+
+In the head an unlisted page is a zero `Rw` one. Past it (v46, #2427) each page the window holds
+is listed, however far apart, and an unlisted page is one it does not hold. So the capture, the
+artifact and the thaw grow with what the guest holds and its budget pays for, never with the span
+its highest page names: a guest that maps one page at the top of its reservation costs a freeze one
+page, and the thawed window's growth (`PageMap::grown_bytes`) is the page its freeze kept charged.
+One window has one encoding: a restore refuses pages out of order or past the reservation, stored
+bytes that are all zero, and a listed zero `Rw` head page.
 
 The in-window shadow stacks + state words ride along in this image for free (§12.0).
 
@@ -1293,7 +1353,7 @@ something outside the VM can write (`SharedBacking::outside_writers`, e.g. a hos
 (`temen_ir::PageState`) names the region and offset each aliased page maps, so its capture and its
 artifact are the interpreter's; a JIT thaw starts the window private and, once the window exists
 and before the guest runs, re-aliases each `Backed` run onto the rebuilt region through the same
-`SharedRegion.map` path as the op-15 pre-map (`Host::apply_premap`), on a root's window and on a
+`SharedRegion.map` path as the spawn's pre-map (`Host::apply_premap`), on a root's window and on a
 re-launched child's. A JIT thaw needs an OS-backed region factory (`temen_run::new_shared_region`),
 as a live JIT run does to map a region at all. A bytecode reactor's save-state (#2051) carries them
 the same way: its window is still live at the frame boundary it freezes on, but an interpreter window
@@ -1325,6 +1385,9 @@ construction. What's stored:
   fiber/funcref handles stay valid across restore; its in-window shadow-stack
   location; and `suspended | runnable` status. The pending `Suspend`/`ContResume`
   value is already spilled in-window at the resume point, so it is *not* stored here.
+- **Per completed-but-unjoined detached child** (v23; straight after the vCPU residue since v44):
+  `(parent_task, slot, join outcome)`, which the spawner's rewound `join` reloads. A live detached
+  child rides as its own artifact in Section 8.
 - **Dispatch table** (`DomainTable`, `temen-interp:2002`): the table's **identity** part is
   module-derived — `slot i → (module 0, func i)` plus trapping padding — so it is re-created
   bit-identically on thaw from the same module, and only the runtime mutation needs capturing.
@@ -1338,9 +1401,9 @@ construction. What's stored:
 
 ### 12.5 Section 3 — Handle table (durability classification)
 
-> **Retiring:** the `FreezeAuthority` row's carve-named form (a carve's `base`/`size`) rests on the
-> carve path, which is being deleted (INVARIANTS #13, 2026-09-29). The detached equivalent is the
-> same row's detached-progeny scope, `FreezeScope::DetachedProgeny`, into which the carve form folds.
+> **Retired (#1867, v44):** the `FreezeAuthority` row's carve-named form (a carve's `base`/`size`,
+> tag 12) went with the carve path (INVARIANTS #13, 2026-09-29). Freeze authority has one scope, the
+> holder's detached progeny, into which the carve form folded.
 
 Per **live** slot (`Slot.entry.is_some()`, `temen-interp` `:4427`), sparse:
 
@@ -1353,15 +1416,15 @@ Per **live** slot (`Slot.entry.is_some()`, `temen-interp` `:4427`), sparse:
 | `Stream { role, inherited }` (inherited: #2054, v40) | role; `B_STREAM_INHERITED` for a stream the spawner re-granted (§7c) | `grant_stream`. An inherited one is re-pinned on the child's own buffer and left pending until the relaunch (`Host::prepare_detached_relaunch`) aliases it to its spawner's stream of that role, as the spawn's re-grant did; all of a tree's inherited cells of one role are its root's. Restored and not yet re-launched, it still captures as inherited, so a re-freeze is canonical |
 | `Exit` / `Clock` / `Memory` / `Yielder` | — | `grant_exit`/`grant_clock`/`grant_memory`/`grant_yielder` |
 | `AddressSpace { base, size }` | base, size | `grant_address_space` |
-| `Instantiator { base, size }` | base, size | `grant_instantiator` |
+| `Instantiator` | — (it names no window range since v45, #2433: every child gets a window of its own) | `grant_instantiator` |
 | `JitTable { idx }` (Slice 2) | idx | domain units ride Section 5 (`capture_durable_jit`), rebuilt positionally |
 | `JitCode { domain, unit }` (Slice 2) | domain, unit | resolves against the rebuilt domain's re-verified units |
 | `Named { idx }` (#1455) | idx | name + provider state ride Section 7 (`capture_durable_named`); the thaw's **registrar** re-grants by name |
 | `Module { digest }` (#1361, v27) | the module's 32-byte §4 content digest | resolved against the **restoring** host's durable module grants, or its program's child image (`module_id_by_digest`); the bytes are D-scope and never ride. Durable only for an attested-freezable grant or the running program's child image (#2245) |
-| `FreezeAuthority(scope)` (#1440, v25/v26) | a carve's `base`/`size`, or the all-or-nothing detached-progeny scope | `grant_freeze_authority` — a thawed parent holds the same authority over its thawed children it held at freeze |
-| `PipeEnd { pipe, write }` (#1680, v32) | the pipe's artifact number (first appearance: the root's table by slot, then each nested child's in record order) and which end | Section 9 carries each pipe's bytes; `Host::restore_durable_pipes` rebuilds it with the cut's end counts and a fresh id, and the end re-opens on it. Durable only for a pipe the tree minted with every end inside the cut: an embedder-fed pipe refuses (`NonDurableKind::Pipe`), one with an end outside the cut refuses `FreezeError::PipeCrossesCut` (the boundary, #1680 slice 2) |
+| `FreezeAuthority` (#1440, v26; one scope since v44) | — (all-or-nothing over the holder's detached progeny) | `grant_freeze_authority` — a thawed parent holds the same authority over its thawed children it held at freeze |
+| `PipeEnd { pipe, write }` (#1680, v32) | the pipe's artifact number (first appearance in the domain's table, by slot) and which end | Section 9 carries each pipe's bytes; `Host::restore_durable_pipes` rebuilds it with the cut's end counts and a fresh id, and the end re-opens on it. Durable only for a pipe the tree minted with every end inside the cut: an embedder-fed pipe refuses (`NonDurableKind::Pipe`), one with an end outside the cut refuses `FreezeError::PipeCrossesCut` (the boundary, #1680 slice 2) |
 | `SharedRegion { region }` (#2025, v39) | the region's number in the depth-0 artifact's Section 11 | the depth-0 restore rebuilds each region once (`Host::rebuild_region`: the embedder's region factory, else a heap backing) with the frozen bytes; each domain adopts the ones it names (`Host::adopt_region`) and its handles and `Backed` pages re-open on them, so a region shared across the tree stays shared. Durable only for a region whose holders are all inside the cut (D-region, §12.3) |
-| `Budget { node }` (#1502, v22; `lane` D66, v28; node form #1944, v37) | the node's number in the depth-0 artifact's Section 10, which carries every node a handle of the whole cut reaches (the root's and every detached descendant's, which name the same numbers), parents first: its parent, its six **ceilings** (fuel, mem, spawn, channel, lane, maps — v41; `-1` = unbounded) and what its subtree has **used** (its `channel` use carried as 0, since the thaw re-charges every pipe it rebuilds; #1944 slice 3, v38. Its `maps` use too, since each process's mappings are its own: the thaw re-charges every window, vCPU and region it rebuilds, #2268, v41. A thread hands its `spawn` back as it unwinds, and the thaw that re-creates it charges it again, #2001). A ceiling caps a subtree and is never a stock (INVARIANTS #3) | `Host::restore_durable_budgets` re-mints the nodes into the thawing run's tree with their links and charges, and the handle re-opens on its node. The thaw's **budget hook** (`set_budget_thaw_hook`) may lower a node's ceilings, never raise them; no hook ⇒ verbatim. A node a parent and its detached child share is rebuilt once, so it stays shared. A nested (carve) child's `Budget` refuses `FreezeError::NestedBudget`: no spawn gives a carve child one |
+| `Budget { node }` (#1502, v22; `lane` D66, v28; node form #1944, v37) | the node's number in the depth-0 artifact's Section 10, which carries every node a handle of the whole cut reaches (the root's and every detached descendant's, which name the same numbers), parents first: its parent, its six **ceilings** (fuel, mem, spawn, channel, lane, maps — v41; `-1` = unbounded) and what its subtree has **used** (its `channel` use carried as 0, since the thaw re-charges every pipe it rebuilds; #1944 slice 3, v38. Its `maps` use too, since each process's mappings are its own: the thaw re-charges every window, vCPU and region it rebuilds, #2268, v41, within the process's pools, refusing what they have no room for, #2318. A thread hands its `spawn` back as it unwinds, and the thaw that re-creates it charges it again, #2001). A ceiling caps a subtree and is never a stock (INVARIANTS #3) | `Host::restore_durable_budgets` re-mints the nodes into the thawing run's tree with their links and charges, and the handle re-opens on its node. The thaw's **budget hook** (`set_budget_thaw_hook`) may lower a node's ceilings, never raise them; no hook ⇒ verbatim. A node a parent and its detached child share is rebuilt once, so it stays shared |
 
 **Not durable in v1** — carry out-of-line host state or native pointers; their
 presence in a live, non-drainable state makes the subtree non-snapshottable, so
@@ -1379,8 +1442,9 @@ the Slice-3 follow-on.)*
 **Freezable module grants — `Module` left the non-durable set (#1361, v27).** A `Module` grant is a
 host-side registration, so the grant itself cannot be serialized; what *can* is the §4 **content
 digest** of the module it names (`module_digest`), and the restoring host re-grants the module. That
-is not a new mechanism: a separate-module `FrozenNested` child has re-attached by exactly this digest
-since v11 (below), so the handle now rides the same rule instead of a second one (INVARIANTS #15).
+was not a new mechanism: a separate-module nested child re-attached by exactly this digest from v11
+(below) until the carve went (#1867), so the handle rode the same rule instead of a second one
+(INVARIANTS #15).
 Carried as `DurableBinding::Module { digest }` / `B_MODULE`; the restore resolves every carried digest
 against this host's durable grants **before** any slot is pinned (`Host::check_modules_for_thaw`) and
 fails closed with `RestoreError::ModuleUnresolved` otherwise. **Ordering contract:** the restoring
@@ -1406,7 +1470,7 @@ pure function of the program, which the artifact already binds, so the restoring
 the same image again when it grants the same program. A handle to it rides as `Module { digest }`
 and re-pins to that image (`Host::module_rides_freeze`); no other grant of the same bytes satisfies
 it, and a thaw whose powerbox derived no such image fails `ModuleUnresolved`. Before this, a domain
-holding the grant could not be frozen at all, so once #2219 retires self-spawn a reactor that spawns
+holding the grant could not be frozen at all, so with self-spawn retired (#2219) a reactor that spawns
 copies of itself could take no save-state. A durable domain still cannot *spawn* the image: an
 instrumented image is #2245's other half. Pinned by
 `handle_durability.rs::{the_programs_child_image_rides_a_freeze,
@@ -1542,23 +1606,31 @@ non-durable freeze refusal. The **cross-backend** property (`crates/temen/tests/
 + the libFuzzer `durable_jit` target) now runs through the codec too: it serializes each
 backend's freeze and asserts a **byte-identical artifact** across interp/JIT, checks the
 canonical re-serialize invariant, and thaws the **restored** interpreter artifact on the JIT.
-**Capture + re-establish** landed for the interpreter: `run_capture_reserved_with_host_prots`
-both **seeds** an initial per-page protection map (restore) and **returns** the post-run map
-(freeze) — `CapturedProt` (`Rw`/`Ro`/`Unmapped`/`Backed`) at the fixed `DURABLE_SNAPSHOT_PAGE`
-(= codec `PAGE`) granularity. `crates/temen/tests/durable_prot_capture.rs` shows a D40 `readonly`
+**Capture + re-establish** landed for the interpreter: `run_capture_reserved_with_host_layout`
+both **starts** from a window layout (restore) and **returns** the post-run one (freeze) — a
+`MemLayout`: the head's bytes, each page held past it (#2427), and the page map, read in the codec's
+form as `CapturedProt` (`Rw`/`Ro`/`Unmapped`/`Backed`) at the fixed `DURABLE_SNAPSHOT_PAGE`
+(= codec `PAGE`) granularity. A fresh run's seed (`MemLayout::image`) is the low bytes the module's
+data segments are laid over; any other layout is a thaw's whole window, which the run starts from as
+it is, its page map in place of the one the segments made, so what the guest wrote to its data
+segments and which of their pages it made writable survive the thaw (#2441, #2307) — on either
+engine, frozen on either. `crates/temen/tests/durable_prot_capture.rs` shows a D40 `readonly`
 data segment captured as `Ro` and surviving freeze→restore through the codec (where Phase-1's
 flat all-`Rw` image would have lost it), **and** that re-establishing the map on a thawed run
 makes a write to a restored `Ro` page fault — while the same window without it writes through. A
 `Backed` page rides as a region reference and is re-aliased on thaw (D-region, §12.3). **JIT re-establish parity** also landed:
-`temen_jit::compile_and_run_capture_reserved_with_host_prots` takes a `WindowProt` map and applies
-it to the freshly-seeded window (`protect_ro` / new `protect_none` via real
-`mprotect`/`VirtualProtect`) before the run, so a thawed `Ro`/`Unmapped` page faults on the JIT
-exactly as on the interpreter (`durable_prot_capture.rs` asserts both). Note module-defined
-`readonly` segments already re-apply on every JIT instantiation; this adds the *runtime*-captured
-map. **JIT-side capture** also landed: `Host::capture_window_prots(data, mapped, npages)`
-reconstructs the window's protection map from the two host-side sources — the module's `readonly`
-data segments (`Ro`) merged with the runtime page-state map (`cap_pages`, populated by Memory-cap
-`map`/`unmap`/`protect`) — mirroring the interpreter's `snapshot_prots`. `durable_prot_capture.rs`
+`temen_jit::compile_and_run_capture_reserved_with_host_prots` takes a `WindowProt` map — a thaw's
+(`WindowRestore`, as `jit_cap_run` passes one for any layout but a seed) — and applies it to the
+thaw's image (`protect_ro` / new `protect_none` via real `mprotect`/`VirtualProtect`) before the run,
+so a thawed `Ro`/`Unmapped` page faults on the JIT exactly as on the interpreter
+(`durable_prot_capture.rs` asserts both). A thaw's window lays no data segment and protects none
+read-only but as its map says (#2441, #2307); a fresh window lays them. **JIT-side capture** also
+landed: `Host::capture_window_layout` reads the window's page map (`cap_pages`), which starts with
+the read-only pages a fresh window's data segments made (#2268) or a thaw's artifact's, and records
+every Memory-cap `map`/`unmap`/`protect` since, plus the NULL guard no page op can change —
+mirroring the interpreter's `layout_snapshot`, a `readonly` page the guest made writable unrecorded
+in both (#2307) — and reads the pages held past the declared window apart (`Host::cap_held_tail`,
+#2427). A fork twin's window is built from the same map (FORK.md §9.5). `durable_prot_capture.rs`
 asserts interp and JIT capture the **same** map for a readonly-segment module, and that a runtime
 `cap_pages` entry overrides the default. So page protections now round-trip on **both** backends,
 both directions. The page-protection story is complete.
@@ -1598,6 +1670,12 @@ toolchain guest points the arena at a BSS array (the allocator never manages it)
 declares `[0x74000, 0x80000)` and its data block at `0x8000` needed no move. Note the `+8` root-SP value
 quoted in the 4A.5 "Helpers / format" entry below predates the §12.8 stage-1 thaw word: the empty root
 extent is `frame_base(0)` = base+16.
+
+**Its pages keep the runtime's protection (#2426).** The host reads and writes the control words and
+the arena outside the guest's guarded code: a freeze request rings the state word, and a freeze
+flattens each parked fiber into its region. So every engine refuses a guest page op over a page
+either lies on (`ShadowArena::fences`), as it refuses the NULL guard. Before, a guest that made one
+read-only or inaccessible crashed the JIT's host at its next freeze.
 
 The transform's spill/reload code and the suspended representation meet here. Two
 properties drive the whole design:
@@ -2163,8 +2241,8 @@ below) (LOOM); 4A.6 recycled-context async freeze (sparse-residue payoff); 4A.7 
 `Blocking.work` latency
 (narrows R6/R2 — freeze refuses on an in-flight `Blocking` call; full offload-cancellation deferred).
 
-> **Retiring:** this describes the carve path (a nested child run inside `instantiate`), which is
-> being deleted (INVARIANTS #13, 2026-09-29). The detached equivalent is `FrozenDetached`'s
+> **Retired (#1867):** this describes the carve path (a nested child run inside `instantiate`),
+> deleted in #1867 (INVARIANTS #13, 2026-09-29). The detached equivalent is `FrozenDetached`'s
 > completed-result residue (§4, "Detached children — completed-result residue (v23)").
 
 **A finished, unjoined §14 child on the JIT (#1692).** A durable JIT child runs synchronously inside
@@ -2178,17 +2256,15 @@ traps under an inherited freeze no longer counts as unwound: it finished, with i
 `durable_nesting_jit.rs::jit_freeze_carries_a_finished_unjoined_childs_result`.
 
 **A trapped child's outcome rides the artifact (#1674, v31).** A child's `join` outcome is its value
-*or its trap*: `join` re-raises a finished child's trap in the parent. `completed_result` on
-`FrozenNested` and `FrozenDetached` now carries either, so a child that finished with a trap before the
-cut rides the freeze like one that finished cleanly, and the thawed parent's `join` re-raises the same
-trap. On the wire the outcome is `0` none | `1` + value | `2` + the trap's code. `Trap::code` is the one
+*or its trap*: `join` answers a finished child's trap as `(trap code, 0)` (#2066; it re-raised the
+trap in the parent when this landed). `completed_result` on `FrozenNested` and `FrozenDetached` now
+carries either, so a child that finished with a trap before the cut rides the freeze like one that
+finished cleanly, and the thawed parent's `join` answers the same trap. On the wire the outcome is `0` none | `1` + value | `2` + the trap's code. `Trap::code` is the one
 stable numbering, shared with the JIT's trap cell (`TrapKind`, `Exit` as `7 | code << 32`). This retires
 the interpreter's `ChildTrapped` decline cause and the JIT's fail-closed `ThreadFault` for the same shape.
 (A `thread.spawn` thread has no such state: its trap tears down the whole domain on both engines.) Pinned
-by `durable_nesting.rs::freeze_with_trapped_unjoined_child_rides_and_the_thawed_join_re_raises_it`
-(through the codec, byte-identical re-freeze), `durable_nesting_jit.rs::{jit_freeze_carries_a_trapped_unjoined_childs_trap,
-jit_freeze_carries_a_trapped_unjoined_grandchilds_trap}`, the detached round trip in
-`temen-snapshot/tests/roundtrip.rs`, and `trap_code_tests`.
+by the detached round trip in `temen-snapshot/tests/roundtrip.rs` and `trap_code_tests`; the end-to-end
+pins over the carve placement went with it (#1867).
 
 **A request that races the run's end (4A.3, #1748).** `request_freeze` and the run's `retire` exclude
 each other through the controller's `base` word (a request holds `STORING` across its store; retire
@@ -2847,11 +2923,11 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
 
 ### 13.4 Build order
 
-> **Retiring:** step 4's nested-subtree wiring (4c's `FrozenChildState` in the nested record, the
-> nested variant of 4c-bis, and the 4d / nested-holder `LiveImpl` re-link by join slot) rides the
-> carve path, which is being deleted (INVARIANTS #13, 2026-09-29). A detached child's serve trio
-> rides its own root-shaped artifact (§4, v29); a `LiveImpl` re-link onto a detached child has no
-> detached equivalent yet — tracked in #1289.
+> **Retired (#1867):** step 4's nested-subtree wiring (4c's `FrozenChildState` in the nested record,
+> the nested variant of 4c-bis, and the 4d / nested-holder `LiveImpl` re-link by join slot) rode the
+> carve path, deleted in #1867 (INVARIANTS #13, 2026-09-29). A detached child's serve trio rides its
+> own root-shaped artifact (§4, v29), and the thaw re-links a restored `LiveImpl` to its re-launched
+> detached callee by the spawner's join slot (`Host::relink_live_impl`, the thaw's re-launch pass).
 
 1. **Stable domain keys** (13.3) — behavior-neutral, unblocks everything.
    **BUILT 2026-07-24:** `Host::domain_id` (process-unique, minted at construction from a

@@ -151,7 +151,7 @@ for (const c of corpus.nested ?? []) {
     console.log(`  FAIL ${c.name}: native {status:${c.status},value:${c.value}} ` +
       `wasm {status:${gotStatus},value:${got}}`);
   } else {
-    const detail = c.status === 3 ? 'child trap propagated' : `value ${got}`;
+    const detail = c.status === 3 ? 'trapped' : `value ${got}`;
     console.log(`  ${c.name}: match (${detail})`);
   }
 }

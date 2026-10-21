@@ -1,7 +1,8 @@
-//! The op-15 (`instantiate_detached`) fixtures more than one test binary drives: a parent that
-//! spawns a child detached, the host that grants it, and its run on the tree-walker and the JIT. A binary that holds a
-//! process-wide resource (the address space, #2305) needs its own process, so it includes these by
-//! `#[path]` rather than copying them.
+//! The detached-spawn fixtures more than one test binary drives: a parent that spawns a child
+//! detached from a spawn record (`Instantiator` op 17, [`temen_ir::SpawnRec`]), the host that grants
+//! it, and its run on the tree-walker and the JIT. A binary that holds a process-wide resource (the
+//! address space, #2305) needs its own process, so it includes these by `#[path]` rather than
+//! copying them.
 #![allow(dead_code)] // each including binary uses a different subset
 
 #[path = "../../../temen-interp/tests/support/rec.rs"]
@@ -9,6 +10,7 @@ pub mod rec;
 
 use core::ffi::c_void;
 use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
+use temen_ir::SpawnRec;
 use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
 
 /// #1234 — the production table, derived from one [`temen_run::CapCtx`] so the hook family and
@@ -28,26 +30,32 @@ pub fn module(text: &str) -> temen_ir::Module {
 /// bytes of `mem`.
 pub fn host(child: &temen_ir::Module, minter_quota: u64) -> (Host, [i32; 3]) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1u64 << 17);
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(child);
     let budget = host.grant_budget(-1, (minter_quota) as i64, -1);
     (host, [inst, modh, budget])
 }
 
-/// `v0` Instantiator, `v1` the child `Module`, `v2` the `Budget`: spawn the child detached (window
-/// 2^16, grants `(gp, gn)`), and if the spawn is refused return the room left in `v2`, else `-1`.
+/// `v0` Instantiator, `v1` the child `Module`, `v2` the `Budget`: spawn the child detached from the
+/// record at 17408 (window 2^16, grants `(gp, gn)`), and if the spawn is refused return the room left
+/// in `v2`, else `-1`.
 pub fn parent_room_after_refusal(gp: u64, gn: u64) -> String {
+    let child = SpawnRec {
+        size_log2: 16,
+        grants_ptr: gp,
+        grants_n: gn,
+        ..SpawnRec::default()
+    };
     format!(
         r#"memory 17
 func (i32, i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32, v2: i32) {{
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vz = i64.const 0
-  vgp = i64.const {gp}
-  vgn = i64.const {gn}
-  vlog = i64.const 16
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgp, vgn, vz, vlog, vz, vz, vz)
+  vma = i64.const {module_at}
+  i32.store vma v1
+  vba = i64.const {budget_at}
+  i32.store vba v2
+  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vz32 = i32.const 0
   vneg = i32.lt_s vh vz32
   br_if vneg 1(v2) 2()
@@ -62,7 +70,10 @@ block 2 () {{
   return vm
   }}
 }}
-"#
+{rec}"#,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        rec = rec::segment(17408, &child),
     )
 }
 
@@ -104,10 +115,10 @@ pub fn interp_on_reserved(
 }
 
 /// #1956 — a detached child (`memory 16`) that reads a depth `d` from its payload. While `d > 0` it
-/// spawns the module it was granted as `"nester"` (itself) detached from its own `"budget"`, with
-/// `d - 1` as the payload and `"nester"` granted on, joins it and returns `10 * result + d`; at `d = 0`
-/// it returns 7. `orphan` makes the `d = 1` level return 5 without joining, and the `d = 0` level
-/// count down 200 000 first, so it outlives its parent.
+/// spawns the module it was granted as `"nester"` (itself) detached from its own `"budget"`, by its
+/// spawn record at 17408, with `d - 1` as the payload and `"nester"` granted on, joins it and returns
+/// `10 * result + d`; at `d = 0` it returns 7. `orphan` makes the `d = 1` level return 5 without
+/// joining, and the `d = 0` level count down 200 000 first, so it outlives its parent.
 pub fn nester(orphan: bool) -> String {
     let (join, leaf) = if orphan {
         (
@@ -116,9 +127,16 @@ pub fn nester(orphan: bool) -> String {
         )
     } else {
         (
-            "vj = call.cap 6 1 (i32) -> (i64) vinst (vh)\n  vten = i64.const 10\n  vm = i64.mul vj vten\n  vr = i64.add vm vd1\n  return vr",
+            "vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)\n  vten = i64.const 10\n  vm = i64.mul vj vten\n  vr = i64.add vm vd1\n  return vr",
             "v7 = i64.const 7\n  return v7",
         )
+    };
+    let child = SpawnRec {
+        size_log2: 16,
+        grants_ptr: 20032,
+        grants_n: 1,
+        args: (24576, 8),
+        ..SpawnRec::default()
     };
     format!(
         r#"memory 16
@@ -140,18 +158,16 @@ block 1 (vi: i64, vd1: i64) {{
   vnp = i64.const 20000
   vnl = i64.const 6
   vb = self.resolve vnp vnl
-  vbw = i64.extend_i32_u vb
   vmp = i64.const 20016
   vml = i64.const 6
   vnest = self.resolve vmp vml
-{grant}  vmw = i64.extend_i32_u vnest
-  vgp = i64.const 20032
-  vgn = i64.const 1
-  vzero = i64.const 0
-  vlog = i64.const 16
-  vpl = i64.const 8
+{grant}  vma = i64.const {module_at}
+  i32.store vma vnest
+  vba = i64.const {budget_at}
+  i32.store vba vb
+  vrp = i64.const 17408
   vinst = i32.wrap_i64 vi
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmw, vgp, vgn, vzero, vlog, vzero, vpp, vpl)
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vrp)
   {join}
 }}
 block 2 () {{
@@ -168,9 +184,12 @@ block 4 () {{
   return v7l
   }}
 }}
-"#,
+{rec}"#,
         args = temen_ir::module_args_base(),
         grant = rec::grant("g", 20032, 20016, 6, "vnest"),
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        rec = rec::segment(17408, &child),
     )
 }
 

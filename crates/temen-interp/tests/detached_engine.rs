@@ -1,15 +1,20 @@
-//! #1286 — **`instantiate_detached` (op 15) on the resumable `Vcpu` engine.** The tree-walker hosts
-//! detached windows itself (`detached_windows.rs`); the resumable engine instead **surfaces** the spawn
-//! as [`bytecode::VcpuEvent::InstantiateDetached`] — no carve, the host mints the window — after doing
-//! the authority-bearing work in-engine, in the one admission every driver uses: the `Instantiator`
-//! resolved, the module compiled + pushed to the shared source, the detached-spawn `Budget` quota taken
-//! (a miss lands `-EINVAL` probeably), the child's powerbox built, and the optional spawn-time **args
-//! payload** read out of the parent's window. The host here only mints a backing for the window and
-//! starts the admitted child over it (`take_child` + `PendingChild::start`, which seeds the data
-//! segments and the payload at `module_args_base()`).
+//! #1286 — **a detached spawn (an `instantiate_rec` record, op 17) on the resumable `Vcpu`
+//! engine.** The tree-walker hosts detached windows itself (`detached_windows.rs`); the resumable
+//! engine instead **surfaces** the spawn as [`bytecode::VcpuEvent::InstantiateDetached`] — no
+//! carve, the host mints the window — after doing the authority-bearing work in-engine, in the one
+//! admission every driver uses: the `Instantiator` resolved, the module compiled + pushed to the
+//! shared source, the detached-spawn `Budget` quota taken (a miss lands `-EINVAL` probeably), the
+//! child's powerbox built, and the optional spawn-time **args payload** the record names read out
+//! of the parent's window. The host here only mints a backing for the window and starts the
+//! admitted child over it (`take_child` + `PendingChild::start`, which seeds the data segments and
+//! the payload at `module_args_base()`).
+
+#[path = "support/rec.rs"]
+mod rec;
 
 use std::sync::Arc;
 use temen_interp::{bytecode, Host, Region, Trap, Value};
+use temen_ir::SpawnRec;
 
 fn module(text: &str) -> temen_ir::Module {
     let m = temen_text::parse_module(text).expect("parse");
@@ -36,18 +41,18 @@ block 0 (v0: i64) {
 /// "hello-de" as a little-endian i64 — the word the child reads at `args_base + 8`.
 const ARGV_WORD: i64 = i64::from_le_bytes(*b"hello-de");
 
-/// The parent: `v0` Instantiator, `v1` the child `Module`, `v2` the detached-spawn `Budget`. Stores the args
-/// blob (`argc = 1`, `"hello-detached\0"`) as three words at 18432, issues op 15 with the 9-arg form
-/// (payload `(18432, 24)`) or the 7-arg form, then `join`s the child (or, in the refusal probe, returns
-/// the spawn's own result).
+/// The parent: `v0` Instantiator, `v1` the child `Module`, `v2` the detached-spawn `Budget`. Stores
+/// the args blob (`argc = 1`, `"hello-detached\0"`) as three words at 18432, stores the module and
+/// budget into its spawn record at 17408, which names that payload `(18432, 24)` or none, and spawns
+/// from it, then `join`s the child (or, in the refusal probe, returns the spawn's own result).
 fn parent(payload: bool, join: bool) -> String {
-    let spawn = if payload {
-        "vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq, vap, val)"
-    } else {
-        "vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)"
+    let child = SpawnRec {
+        size_log2: 16,
+        args: if payload { (18432, 24) } else { (0, 0) },
+        ..SpawnRec::default()
     };
     let tail = if join {
-        "vr = call.cap 6 1 (i32) -> (i64) v0 (vh)\n  return vr"
+        "vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n  return vr"
     } else {
         "vr = i64.extend_i32_s vh\n  return vr"
     };
@@ -64,21 +69,19 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   vb2 = i64.const 18448
   vw2 = i64.const {w2}
   i64.store vb2 vw2
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 16
-  vq = i64.const 0
-  vap = i64.const 18432
-  val = i64.const 24
-  {spawn}
+  vma = i64.const 17416
+  i32.store vma v1
+  vba = i64.const 17420
+  i32.store vba v2
+  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   {tail}
   }}
 }}
-"#,
+{rec}"#,
         w1 = ARGV_WORD,
         w2 = i64::from_le_bytes(*b"tached\0\0"),
+        rec = rec::segment(17408, &child),
     )
 }
 
@@ -131,7 +134,7 @@ fn run_in(
     let prog = bytecode::VcpuProgram::compile(&parent).expect("compile parent");
     let mut host = Host::new();
     host.set_durable(durable);
-    let inst = host.grant_instantiator(0, 1u64 << 17);
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(&child);
     let budget = host.grant_budget(-1, (minter_quota) as i64, -1);
     let back = Arc::new(Region::new(1u64 << 17, 4096));
@@ -150,7 +153,7 @@ fn run_in(
 }
 
 #[test]
-fn op15_surfaces_a_detached_spawn_with_its_args_payload() {
+fn a_spawn_record_surfaces_a_detached_spawn_with_its_args_payload() {
     let (r, seen) = run(&parent(true, true), 1 << 16);
     assert_eq!(
         r,
@@ -165,7 +168,7 @@ fn op15_surfaces_a_detached_spawn_with_its_args_payload() {
 }
 
 #[test]
-fn the_seven_arg_form_seeds_no_payload() {
+fn a_record_without_a_payload_seeds_none() {
     let (r, seen) = run(&parent(false, true), 1 << 16);
     assert_eq!(
         r,
@@ -183,34 +186,46 @@ fn an_exhausted_minter_refuses_probeably_without_surfacing() {
     assert!(seen.is_empty(), "a refused spawn never reaches the host");
 }
 
-/// A parent that only issues the 7-arg op 15 and returns its result — no window stores, so it runs
-/// unchanged under a **durable** host (whose shadow reserve spans `[0, 64 KiB)`).
-const SPAWN_ONLY_PARENT: &str = r#"memory 17
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 16
-  vq = i64.const 0
-  vs = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+/// A parent that only spawns from its spawn record at 17408 (no payload) and returns the result. Its
+/// only window writes are the record's two handles, above the durable control words, so it runs
+/// unchanged under a **durable** host.
+fn spawn_only_parent() -> String {
+    format!(
+        r#"memory 17
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vma = i64.const 17416
+  i32.store vma v1
+  vba = i64.const 17420
+  i32.store vba v2
+  vrp = i64.const 17408
+  vs = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vr = i64.extend_i32_s vs
   return vr
-  }
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(
+            17408,
+            &SpawnRec {
+                size_log2: 16,
+                ..SpawnRec::default()
+            }
+        ),
+    )
 }
-"#;
 
-/// #1299 — the resumable engine's op-15 arm had **no durable gate** (the tree-walker's and the native
-/// thunk's refuse): a durable domain could mint a detached child no freeze can see. Now it lands
-/// `-EINVAL` before the quota take, exactly like the other refusals in `admit_detached_child`.
+/// #1299 — the resumable engine's detached-spawn arm had **no durable gate** (the tree-walker's and
+/// the native thunk's refuse): a durable domain could mint a detached child no freeze can see. Now
+/// it lands `-EINVAL` before the quota take, exactly like the other refusals in
+/// `admit_detached_child`.
 #[test]
 fn a_durable_domain_refuses_a_detached_spawn_without_surfacing() {
-    let (r, seen) = run_in(SPAWN_ONLY_PARENT, 1 << 16, true);
+    let (r, seen) = run_in(&spawn_only_parent(), 1 << 16, true);
     assert_eq!(r, Ok(vec![Value::I64(-22)]), "EINVAL, not a trap");
     assert!(seen.is_empty(), "a refused spawn never reaches the host");
     // The same spawn under a non-durable host is admitted — the gate is durability, not the shape.
-    let (r, seen) = run_in(SPAWN_ONLY_PARENT, 1 << 16, false);
+    let (r, seen) = run_in(&spawn_only_parent(), 1 << 16, false);
     assert_eq!(r, Ok(vec![Value::I64(0)]), "join handle 0");
     assert_eq!(seen.len(), 1);
 }

@@ -1,14 +1,14 @@
 //! #1867 — **the carve spawn is refused on every engine.** Ops 0 (`instantiate`), 5
-//! (`instantiate_module`) and 13 (`instantiate_module_named`), and an op-17 record of version 0,
-//! spawned a child into a carve of its spawner's window. That placement is retired (INVARIANTS #13):
+//! (`instantiate_module`) and 13 (`instantiate_module_named`) spawned a child into a carve of its
+//! spawner's window. That placement is retired (INVARIANTS #13):
 //! each traps `CapFault` once the `Instantiator` resolves, the answer the oracle gives every op it
 //! has no arm for, on the tree-walker, each bytecode driver and the Cranelift JIT alike. No engine
 //! runs a spawn another refuses (INVARIANTS #9). The browser's nested path is pinned by
 //! `gencorpus`'s `carve_*` entries, against its wasm build.
 //!
 //! Each form is otherwise well-formed — a granted module where one is named, a 4 KiB carve the
-//! window holds, an entry that exists — so only the form is refused, and the same harness runs a
-//! version-1 record of the same child to its join on every engine. A deleted coroutine op (op 2,
+//! window holds, an entry that exists — so only the form is refused, and the same harness runs an
+//! op-17 record of the same child to its join on every engine. A deleted coroutine op (op 2,
 //! #2069) rides along: the bytecode engine lowers every op the oracle has no arm for to the same
 //! trap, where it used to decline the whole module.
 
@@ -39,21 +39,6 @@ block 0 (v0: i64) {
 
 /// Where every parent keeps its spawn record.
 const REC: u64 = 17408;
-
-/// A version-0 record at [`REC`]: entry 1 in a 4 KiB carve at 64 KiB, no pager, the spawner's own
-/// module, no budget, quota or grants. The record's 32-byte tail reads as zeros.
-fn v0_record() -> String {
-    let mut b = Vec::new();
-    for w in [0u32, 1] {
-        b.extend_from_slice(&w.to_le_bytes());
-    }
-    b.extend_from_slice(&65536u64.to_le_bytes());
-    for w in [12u32, u32::MAX, u32::MAX, 0] {
-        b.extend_from_slice(&w.to_le_bytes());
-    }
-    let bytes: String = b.iter().map(|x| format!("\\x{x:02x}")).collect();
-    format!("data {REC} \"{bytes}\"\n")
-}
 
 /// A parent `(inst, module, budget) -> i64` that runs `body` and returns its `vr`, then func 1, an
 /// entry that returns 42. `body` sees `vi` (the `Instantiator`), `vmod` and `vb` (the module and the
@@ -113,10 +98,6 @@ fn forms() -> Vec<(&'static str, Module)> {
             ),
         ),
         (
-            "a version-0 record",
-            spawn("call.cap 6 17 (i64) -> (i32) vi (vp)", &v0_record()),
-        ),
-        (
             "op 2",
             spawn(
                 "call.cap 6 2 (i64, i64, i64, i64) -> (i32) vi (ve, vo, vs, vz)",
@@ -130,7 +111,7 @@ fn forms() -> Vec<(&'static str, Module)> {
 /// `Budget` a detached child's window spends, with their handles.
 fn powerbox() -> (Host, [i32; 3]) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << 17);
+    let inst = host.grant_instantiator();
     let child = host.grant_module(&module(CHILD));
     let budget = host.grant_budget(-1, 1 << 20, -1);
     (host, [inst, child, budget])
@@ -175,10 +156,10 @@ fn every_engine_traps_a_carve_spawn_with_capfault() {
     }
 }
 
-/// The control: a version-1 record naming the same child, paid from the `Budget`, spawns and joins
-/// to 42 on every engine — so the harness can spawn, and each refusal above is the form's.
+/// The control: an op-17 record naming the same child, paid from the `Budget`, spawns and joins to
+/// 42 on every engine — so the harness can spawn, and each refusal above is the form's.
 #[test]
-fn the_same_harness_runs_a_version_1_spawn() {
+fn the_same_harness_runs_a_record_spawn() {
     let m = parent(
         &format!(
             "  vma = i64.const {}
@@ -186,11 +167,11 @@ fn the_same_harness_runs_a_version_1_spawn() {
   vba = i64.const {}
   i32.store vba vb
   vh = call.cap 6 17 (i64) -> (i32) vi (vp)
-  vr = call.cap 6 1 (i32) -> (i64) vi (vh)",
-            REC + rec::MODULE_AT,
-            REC + rec::BUDGET_AT,
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vi (vh)",
+            REC + SpawnRec::MODULE_AT,
+            REC + SpawnRec::BUDGET_AT,
         ),
-        &rec::segment(REC, &SpawnRec::v1(0)),
+        &rec::segment(REC, &SpawnRec::default()),
     );
     for driver in drivers::ALL {
         let ran = drivers::run_on(driver, &m, &setup)

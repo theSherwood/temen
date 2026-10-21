@@ -12,29 +12,33 @@
 
 #[path = "../../temen-interp/tests/support/drivers.rs"]
 mod drivers;
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
 
 use drivers::{agree_on, Driver, Ran};
 use temen_interp::{Host, MemLayout, Value};
-use temen_ir::{Module, DEFAULT_RESERVED_LOG2};
+use temen_ir::{Module, SpawnRec, DEFAULT_RESERVED_LOG2};
 use temen_jit::{JitError, JitOutcome};
 
 /// The root's window: `memory 18`.
 const WIN: usize = 256 << 10;
 
-/// The root (args `(instantiator, CHILD, budget)`): a thread, then a detached `CHILD`, then another
-/// thread, each joined before the next starts. Returns the first thread's seed, the child's
-/// result and the second thread's seed.
+/// The root (args `(instantiator, CHILD, budget)`): a thread, then a detached `CHILD` (through the v1
+/// record at 17408 that [`root`] lays), then another thread, each joined before the next starts.
+/// Returns the first thread's seed, the child's result and the second thread's seed.
 const ROOT: &str = "memory 18
 func (i32, i32, i32) -> (i64, i64, i64) {
 block 0 (vinst: i32, vmod: i32, vbud: i32) {
   z = i64.const 0
   ha = thread.spawn 1 z z
   ta = thread.join ha
-  vm = i64.extend_i32_s vmod
-  vb = i64.extend_i32_s vbud
-  sl = i64.const 16
-  hc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vm, z, z, z, sl, z)
-  rc = call.cap 6 1 (i32) -> (i64) vinst (hc)
+  rm = i64.const 17416
+  i32.store rm vmod
+  rb = i64.const 17420
+  i32.store rb vbud
+  rp = i64.const 17408
+  hc = call.cap 6 17 (i64) -> (i32) vinst (rp)
+  rc_st, rc = call.cap 6 1 (i32) -> (i64, i64) vinst (hc)
   hb = thread.spawn 1 z z
   tb = thread.join hb
   return ta, rc, tb
@@ -84,9 +88,18 @@ fn module(src: &str) -> Module {
     m
 }
 
+/// [`ROOT`] with its spawn record at 17408: `CHILD`'s 64 KiB window.
+fn root() -> Module {
+    let spawn = SpawnRec {
+        size_log2: 16,
+        ..SpawnRec::default()
+    };
+    module(&format!("{ROOT}{}", rec::segment(17408, &spawn)))
+}
+
 fn setup() -> (Host, Vec<Value>) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, WIN as u64);
+    let inst = host.grant_instantiator();
     let child = host.grant_module(&module(CHILD));
     let budget = host.grant_budget(-1, 1 << 20, -1);
     (host, [inst, child, budget].map(Value::I32).to_vec())
@@ -94,7 +107,7 @@ fn setup() -> (Host, Vec<Value>) {
 
 #[test]
 fn a_domains_vcpus_are_numbered_within_it() {
-    let m = module(ROOT);
+    let m = root();
     let want = Ran {
         result: Ok(WANT.map(Value::I64).to_vec()),
         stdout: Vec::new(),

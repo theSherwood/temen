@@ -2,7 +2,7 @@
 # Rebuild **every committed `.temen` playground/self-host asset** in one pass — the single entry point
 # for the "a wire-format / encoder / IR change invalidated the prebuilt binary assets" chore (which
 # recurs on every such change: the committed modules decode as `BadOpcode` under the new format and
-# their asset-gate tests — leng_selfhost_asset, nim_hello_asset, browser/tests/nimony.rs, and the
+# their asset-gate tests — leng_selfhost_asset, browser/tests/nimony.rs, and the
 # real-browser play cards — go red until regenerated).
 #
 # This orchestrates the existing per-asset builders (it does NOT reimplement them) and, crucially,
@@ -16,13 +16,13 @@
 # (decode → verify → bytecode-compile) via `prep_temen`. A final summary lists ✓ / SKIP / ✗.
 #
 #   Usage:  bash scripts/rebuild-assets.sh              # rebuild everything the toolchain allows
-#           ONLY=leng,nim_hello bash scripts/...        # rebuild a subset (comma-separated step names)
-#   Steps:  leng chibicc pg_libc pg_heap coop_grow onramp shell coreutils forth uxn nim_hello
-#           nim_card lua_snapshot
+#           ONLY=leng,nim_card bash scripts/...         # rebuild a subset (comma-separated step names)
+#   Steps:  leng chibicc pg_libc pg_heap coop_grow onramp shell coreutils forth uxn nim_card
+#           lua_snapshot
 #
 # Toolchains, per step: leng needs rustc (+rust-src) & llvm; chibicc/onramp/pg_heap need clang &
 # llvm-link (onramp also fetches QuickJS/SQLite/Lua sources — skipped offline); shell needs the
-# in-tree chibicc; nim_hello & nim_card need the nimony toolchain (Nim + nimony/bin, as
+# in-tree chibicc; nim_card needs the nimony toolchain (Nim + nimony/bin, as
 # scripts/ci/provision-nimony.sh builds it).
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -60,9 +60,13 @@ if [ -x "$REPO/nimony/bin/nimony" ]; then
 fi
 
 # --- shared build products --------------------------------------------------------------------------
-echo "=== building temen-llvm-translate + prep_temen (shared by every step) ==="
-( cd "$REPO/crates/temen-llvm" && cargo build --release --bin temen-llvm-translate ) || true
-cargo build --release -p temen-run --example prep_temen || true
+# Every step but nim_card uses the translator or prep_temen. The builders build the translator only
+# when it is missing, so it is built fresh here, unless nim_card is all this run rebuilds (#2442).
+if [ "$ONLY" != nim_card ]; then
+  echo "=== building temen-llvm-translate + prep_temen (shared by every step but nim_card) ==="
+  ( cd "$REPO/crates/temen-llvm" && cargo build --release --bin temen-llvm-translate ) || true
+  cargo build --release -p temen-run --example prep_temen || true
+fi
 PREP="$REPO/target/release/examples/prep_temen"
 
 # Validate that a produced .temen decodes+verifies (prep_temen exits non-zero / panics otherwise).
@@ -191,39 +195,43 @@ if want uxn; then
   fi
 fi
 
-# --- 5) nim_hello.temen (nimony → temen-leng powerbox bridge) ----------------------------------------
-if want nim_hello; then
-  echo "=== [nim_hello] build_nim_hello_temen example ==="
-  if cargo run --release -p temen-run --example build_nim_hello_temen -- \
-       crates/temen-run/demos/nim_hello/hello.nim browser/web/assets/nim_hello.temen; then
-    validate browser/web/assets/nim_hello.temen \
-      && note "nim_hello ✓" || note "nim_hello ✗ (rebuilt but failed re-validate)"
-  else
-    note "nim_hello SKIP/✗ (NIMONY_BIN/NIM_BIN + nimony/bin/nimony?)"
-  fi
-fi
-
 # --- 6) nimony.blob.gz (the nim card's toolchain, #958): nimony's own tools, each built by nimony with
 # no C compiler (scripts/nim-toolchain.sh — the self-hosted lane's), with nimony's library and that
-# library prebuilt. `nimbuild --bundle` builds the program below with them at `/nim`, where the card
-# builds, and writes what it ran with plus the library pack the build left. Nothing in the blob is
-# wire-coupled but the tools, and all of it is rebuilt together, so the pack always matches them. -----
+# library prebuilt. temen-run's `nim_card_bundle` builds the program below with them at `/nim`, where
+# the card builds, in-guest on the JIT with one guest CPU, so the pack comes out the same from every
+# build of the same inputs (#2442). It writes what the build ran with plus the library pack it left.
+# Nothing in the blob is wire-coupled but the tools, and all of it is rebuilt together, so the pack
+# always matches them. -----
 if want nim_card; then
-  echo "=== [nim_card] scripts/nim-toolchain.sh + nimbuild --bundle → web/assets/nimony.blob.gz ==="
+  echo "=== [nim_card] scripts/nim-toolchain.sh + nim_card_bundle → web/assets/nimony.blob.gz ==="
   T="$(mktemp -d)"
   mkdir -p "$T/card"
   # The library a playground program reaches for, compiled once so a build compiles only its own
   # modules; the `const` makes compile-time evaluation build its helper too. `std/macros` brings the
   # plugins its grammar declares (parsegen, regex), which the pack carries built, so a program's
   # macro builds only its own plugin, in the program's cache (#2049). `std/json` costs the pack
-  # 0.45 MB gzipped and saves a json program two-thirds of its build (#2070).
-  cat >"$T/card/prelude.nim" <<'NIM'
+  # 0.45 MB gzipped and saves a json program two-thirds of its build (#2070). `rawthreads`, `osproc`
+  # and `cmdline` are what the card's Threads and Processes programs import (#2374). `parfor`'s `||`
+  # is a plugin (`std/deps/parfor`): the prelude's parallel for makes the build compile it, so the
+  # pack carries it built, and a parallel-for program builds in seconds (#2375). It is built as
+  # `prog.nim`, the program the card builds, so the pack carries that program's options memo
+  # (`nimcache/t/<main>/config.nif`, nim-lang/nimony#2616): a card build that found none would rerun
+  # its whole backend stage, every module of the library lowered again.
+  cat >"$T/card/prog.nim" <<'NIM'
 import std/[syncio, strutils, sequtils, tables, sets, hashes, algorithm, math, options, deques,
-  parseutils, bitops, intsets, macros, json]
+  parseutils, bitops, intsets, macros, json, rawthreads, osproc, cmdline, parfor]
 
 proc prelude(s: string): int = s.len
 const atCompileTime = prelude("prebuilt")
-echo "prelude ", atCompileTime
+
+proc squares(n: int): int =
+  var s = newSeq[int](n)
+  for i in `||`(0, n - 1, workload = CpuBound):
+    s[i] = i * i
+  result = 0
+  for x in s: result += x
+
+echo "prelude ", atCompileTime, " ", squares(4)
 NIM
   # The card's tree is nimony's library and nimony's own sources, which the library imports: `std/json`
   # imports `src/lib`, `std/macros` reaches the nifler2 grammar, and a plugin's build puts `src/lib`
@@ -232,8 +240,8 @@ NIM
   # library's relative imports resolve.
   if [ -n "${NIMONY_BIN:-}" ] && [ -n "${NIM_BIN:-}" ] && bash scripts/nim-toolchain.sh "$T" \
      && ln -s "$T/nimony/lib" "$T/card/lib" && ln -s "$T/nimony/src" "$T/card/src" \
-     && ( cd browser && cargo build --release -q --bin nimbuild ) \
-     && browser/target/release/nimbuild "$T" "$T/card" prelude.nim --at /nim --leaves --bundle "$T/nimony.blob" \
+     && cargo build --release -q -p temen-run --example nim_card_bundle \
+     && target/release/examples/nim_card_bundle "$T" "$T/card" prog.nim --at /nim --bundle "$T/nimony.blob" \
      && gzip -9 -n -c "$T/nimony.blob" > browser/web/assets/nimony.blob.gz; then
     note "nim_card ✓ (nimony.blob.gz — gated by browser/tests/nimony.rs)"
   else

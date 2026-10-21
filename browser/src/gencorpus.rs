@@ -19,7 +19,7 @@ use temen_durable::{
     init_durable_window, transform_module, write_state, STATE_NORMAL, STATE_REWINDING,
     STATE_UNWINDING,
 };
-use temen_interp::{bytecode, Value};
+use temen_interp::{bytecode, Host, Value};
 
 // Three op-family kernels lifted verbatim from `crates/temen/tests/bytecode_diff.rs` (known parseable
 // and engine-supported), plus a divide-by-zero trap kernel.
@@ -200,6 +200,77 @@ block 3 () {
 // func 2 is reachable **only** through `thread.spawn`, so `compile_module_tierup` (not the func-0
 // whole-module path) is what emits it. Result 4000 on every interleaving (asserted in the JS host,
 // like the plain threads kernel); tiers up once per worker (8×).
+/// #1414 ED-1 — eight threads, each counting to 500 in its entry, which is pure compute: no call, no
+/// atomic. The root sums what it joins, 4000. Each thread's entry runs whole on the emitted tier.
+const THREADS_ENTRY_TIERUP: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 0
+  br 1(v0)
+}
+block 1 (v1: i64) {
+  v2 = i64.const 8
+  v3 = i64.lt_u v1 v2
+  br_if v3 2(v1) 3()
+}
+block 2 (v4: i64) {
+  v5 = i64.const 500
+  v6 = thread.spawn 1 v5 v5
+  v7 = i64.const 4
+  v8 = i64.mul v4 v7
+  v9 = i64.const 16400
+  v10 = i64.add v9 v8
+  i32.store v10 v6
+  v11 = i64.const 1
+  v12 = i64.add v4 v11
+  br 1(v12)
+}
+block 3 () {
+  v13 = i64.const 0
+  br 4(v13, v13)
+}
+block 4 (v14: i64, v15: i64) {
+  v16 = i64.const 8
+  v17 = i64.lt_u v14 v16
+  br_if v17 5(v14, v15) 6(v15)
+}
+block 5 (v18: i64, v19: i64) {
+  v20 = i64.const 4
+  v21 = i64.mul v18 v20
+  v22 = i64.const 16400
+  v23 = i64.add v22 v21
+  v24 = i32.load v23
+  v25 = thread.join v24
+  v26 = i64.add v19 v25
+  v27 = i64.const 1
+  v28 = i64.add v18 v27
+  br 4(v28, v26)
+}
+block 6 (v29: i64) {
+  return v29
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, v0: i64) {
+  v1 = i64.const 0
+  br 1(v0, v1)
+}
+block 1 (v2: i64, v3: i64) {
+  v4 = i64.lt_s v3 v2
+  br_if v4 2(v2, v3) 3(v3)
+}
+block 2 (v5: i64, v6: i64) {
+  v7 = i64.const 1
+  v8 = i64.add v6 v7
+  br 1(v5, v8)
+}
+block 3 (v9: i64) {
+  return v9
+  }
+}
+"#;
+
 const THREADS_TIERUP: &str = r#"
 memory 16
 func () -> (i64) {
@@ -469,7 +540,7 @@ block 3 () {
 // ---- §14 nested child guests (detached child domains) -------------------------------------------
 // Func 0 receives an `Instantiator` (iface 6) and resolves the 1 MiB `"budget"` and its child images
 // by name (`instantiate_exec` grants the image of each function the guest exports, under its name);
-// it spawns the image it exports func 1 under, `"child"`, detached — an op-17 v1 record at 17408 — in
+// it spawns the image it exports func 1 under, `"child"`, detached — an op-17 record at 17408 — in
 // a fresh window of the module's declared size, paid from the budget; `join` is `call.cap 6 1`.
 
 /// Text-IR stores laying the 16-byte grant record `{name_off, name_len, handle, flags = 0}` at `at`:
@@ -483,8 +554,9 @@ fn grant_rec_ir(at: u64, name_at: u64, name_len: usize, handle: &str) -> String 
 }
 
 /// A nested-corpus guest (`memory {mem}`): func 0 spawns `"child"`, the image of func 1 (`child`,
-/// whole `func`s), through a v1 record asking for window `2^size_log2` (`0`: the declared one). With
-/// `join` it joins the child into `vj`; either way `tail` ends the block (the spawn's handle is `vh`).
+/// whole `func`s), through a spawn record asking for window `2^size_log2` (`0`: the declared one). With
+/// `join` it joins the child: `vj_st` how it ended (0 returned, else its trap's code, #2066), `vj` its
+/// result. Either way `tail` ends the block (the spawn's handle is `vh`).
 /// `data` adds segments. With `grandchild`, func 2 is exported as `"grandchild"` too, and the child is
 /// granted its image under that name.
 fn nested_guest(
@@ -500,11 +572,11 @@ fn nested_guest(
         size_log2,
         grants_ptr: 16448,
         grants_n: u64::from(grandchild),
-        ..temen_ir::SpawnRec::v1(0)
+        ..temen_ir::SpawnRec::default()
     };
     let (seg, stores) = temen_browser::plan::spawn_rec_ir(17408, &rec, "vchild", "vbud");
     let join = if join {
-        "  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)\n"
+        "  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n"
     } else {
         ""
     };
@@ -550,7 +622,7 @@ fn child_isolated() -> String {
 // granted it as `"grandchild"`, returns 77, propagated up through two joins.
 fn child_depth2() -> String {
     let (seg, stores) =
-        temen_browser::plan::spawn_rec_ir(17504, &temen_ir::SpawnRec::v1(0), "vgc", "vb");
+        temen_browser::plan::spawn_rec_ir(17504, &temen_ir::SpawnRec::default(), "vgc", "vb");
     nested_guest(
         17,
         0,
@@ -562,7 +634,7 @@ fn child_depth2() -> String {
              vbp = i64.const 16384\n  vbl = i64.const 6\n  vb = self.resolve vbp vbl\n  \
              vgp = i64.const 16416\n  vgl = i64.const 10\n  vgc = self.resolve vgp vgl\n{stores}  \
              vrp = i64.const 17504\n  vh = call.cap 6 17 (i64) -> (i32) vi (vrp)\n  \
-             vj = call.cap 6 1 (i32) -> (i64) vi (vh)\n  return vj\n  }}\n}}\n\
+             vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vh)\n  return vj\n  }}\n}}\n\
              func (i64) -> (i64) {{\nblock 0 (va: i64) {{\n  v = i64.const 77\n  return v\n  }}\n}}\n"
         ),
         true,
@@ -600,14 +672,15 @@ fn child_refused() -> String {
     )
 }
 
-// A child trap (`unreachable`) must propagate through `join` as the parent's trap (STATUS_TRAP).
+// A child trap (`unreachable`) stays the child's: the parent's `join` answers it with the trap's wire
+// code (#2066), which the parent returns.
 fn child_trap() -> String {
     nested_guest(
         17,
         0,
         true,
         "",
-        "  return vj\n",
+        "  return vj_st\n",
         "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  unreachable\n  }\n}\n",
         false,
     )
@@ -719,7 +792,7 @@ block 0 () {
 "#;
 
 // ---- §14 retired carve spawns (#1867) -----------------------------------------------------------
-// Ops 0, 5 and 13 and a version-0 op-17 record spawned a child into a carve of the spawner's window.
+// Ops 0, 5 and 13 spawned a child into a carve of the spawner's window.
 // That placement is gone: each traps `CapFault` once the handle resolves, on every engine, as an
 // Instantiator op the oracle has no arm for always did. The entries and modules they name don't
 // matter; the spawn traps before it reads them.
@@ -766,18 +839,6 @@ block 0 (v0: i32) {
   v8 = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4, v5, v6, v7)
   v9 = i64.extend_i32_s v8
   return v9
-  }
-}
-"#;
-
-// An all-zero record is a version-0 one.
-const CARVE_REC_V0: &str = r#"memory 17
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  v1 = i64.const 65536
-  v2 = call.cap 6 17 (i64) -> (i32) v0 (v1)
-  v3 = i64.extend_i32_s v2
-  return v3
   }
 }
 "#;
@@ -1078,6 +1139,60 @@ block 0 (v0: i64) {
 // `75 × 100 + 9 = 7509`; the root sums 8 × 7509 = 60072. Offsets are 16 KiB multiples so they are
 // page-aligned on a 4 KiB (wasm) or 16 KiB host page. `target` on an `Rw` page (16 KiB + 8) passes; on
 // the unmapped page P (`threads_inst_paged_trap_unit`) the child faults on BOTH tiers.
+/// #1414 B6-3b-4b — paged regions on the parallel driver: an on-ramp guest whose `_start` seeds 7 at
+/// 64 KiB, protects that page read-only through the on-ramp's memory capability (`mem`, the handle
+/// the recipe grants it), spawns 4 threads that each read the cell through function 2, joins them,
+/// reads it itself, and returns the sum: 5 × 7 = 35. Function 2 is a leaf each thread runs on its
+/// Worker's emitted wasm, against that thread's page-state table. With `store`, the leaf first stores
+/// to the protected page, and the run traps `MemoryFault`.
+fn threads_paged(mem: i32, store: bool) -> String {
+    let store = if store { "  i64.store v0 v0\n" } else { "" };
+    format!(
+        r#"memory 17
+func () -> (i64) {{
+block 0 () {{
+  vp = i64.const 65536
+  v7 = i64.const 7
+  i64.store vp v7
+  vas = i32.const {mem}
+  vlen = i64.const 16384
+  vro = i32.const 1
+  vr = call.cap 5 2 (i64, i64, i32) -> (i64) vas (vp, vlen, vro)
+  vz = i64.const 0
+  t0 = thread.spawn 1 vz vz
+  t1 = thread.spawn 1 vz vz
+  t2 = thread.spawn 1 vz vz
+  t3 = thread.spawn 1 vz vz
+  j0 = thread.join t0
+  j1 = thread.join t1
+  j2 = thread.join t2
+  j3 = thread.join t3
+  va = call 2 (vp)
+  s0 = i64.add j0 j1
+  s1 = i64.add j2 j3
+  s2 = i64.add s0 s1
+  vs = i64.add s2 va
+  return vs
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vp = i64.const 65536
+  vl = call 2 (vp)
+  return vl
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+{store}  vl = i64.load v0
+  return vl
+  }}
+}}
+export 0 func "_start" 0
+"#
+    )
+}
+
 fn inst_paged_unit(target: u64) -> String {
     format!(
         r#"memory 16
@@ -1115,8 +1230,8 @@ block 0 (vas: i64) {{
 }
 
 // #1201 — the **page-op op-13 child** for the real-Chromium `browser-op13jit-e2e-test.mjs` (the twin of
-// `browser/tests/op13jit_paged.rs`): a §14 child-entry (`f0(inst, as)`, `memory 15` — the mini driver's
-// buddy-half carve) whose leaf resolves the marshaled `fs` (→ 1) and `protect`s the page holding "K" = 75
+// `browser/tests/op13jit_paged.rs`): a §14 child-entry (`f0(inst, as)`, `memory 15`, its own window)
+// whose leaf resolves the marshaled `fs` (→ 1) and `protect`s the page holding "K" = 75
 // read-only; `f0` reads K back through the `Ro` page → 40 + 1 + 75 = 116. On the op-13 JIT loop it emits
 // PAGED and runs on `driveDetachedRun` with the page-state table re-synced after the bounce. "K" sits
 // at 16 KiB, above the NULL guard the single-shot bounce seeds; the browser's software page is 4 KiB.
@@ -1314,15 +1429,17 @@ block 0 (va: i64, vb: i64) {
 "#;
 
 // #1865 — a root `(instantiator, module, budget) -> sum`
-// that spawns the granted module `n` times through one op-17 v1 record (module and budget filled in
+// that spawns the granted module `n` times through one op-17 record (module and budget filled in
 // at run time), each child in a fresh window of its own on its own Worker and `Memory`, paid from the
-// budget, then joins them and sums. With [`THREADS_INST_UNIT`]: 8 × 75 = 600. With `grant_unit` each
-// child is granted the module itself as `"unit"`, to spawn copies of itself by (#2219).
+// budget, then joins them and sums. A join answers a child's trap rather than raising it (#2066), so
+// the root ends in `unreachable` when a child did not return: a faulting child still fails the run.
+// With [`THREADS_INST_UNIT`]: 8 × 75 = 600. With `grant_unit` each child is granted the module itself
+// as `"unit"`, to spawn copies of itself by (#2219).
 fn inst_detached_root(n: u64, grant_unit: bool) -> String {
     let rec = temen_ir::SpawnRec {
         grants_ptr: 16464,
         grants_n: u64::from(grant_unit),
-        ..temen_ir::SpawnRec::v1(0)
+        ..temen_ir::SpawnRec::default()
     };
     let (seg, stores) = temen_browser::plan::spawn_rec_ir(17408, &rec, "vmod0", "vbud0");
     // The grant record at 16464 names the module `"unit"`.
@@ -1372,14 +1489,19 @@ block 5 (vj2: i64, vs2: i64, vinst5: i32) {{
   v16b = i64.const 16400
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
-  vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst5 (vhh)
   vsn = i64.add vs2 vr
   v1b = i64.const 1
   vjn = i64.add vj2 v1b
-  br 4(vjn, vsn, vinst5)
+  vz = i64.const 0
+  vfault = i64.ne vr_st vz
+  br_if vfault 7() 4(vjn, vsn, vinst5)
 }}
 block 6 (vs3: i64) {{
   return vs3
+}}
+block 7 () {{
+  unreachable
   }}
 }}
 "#
@@ -1388,16 +1510,14 @@ block 6 (vs3: i64) {{
 
 // #1865, #2219 — the §14 VM-in-VM granted module, its role selected by its args payload. Spawned with
 // none, the child reads its own "K" (75), spawns the module it was granted as `"unit"` — itself —
-// detached through an op-17 v1 record, paid from its own `"budget"` (the node that paid for its
+// detached through an op-17 record, paid from its own `"budget"` (the node that paid for its
 // window, #1944), with a one-word payload that makes it the pure grandchild (→ 9), joins it and
-// returns 75 + 9 = 84. With [`inst_detached_root`] granting the unit on: 8 × 84 = 672. On the codegen
-// tier the spawn and join arrive as the Worker's `env.instantiate_rec`/`env.join`, admitted and
-// resolved by the child's own vCPU; the name lookups (`self.resolve`, outside the emitter subset) are
-// func 1, a bounce, so the entry emits.
+// returns 75 + 9 = 84. With [`inst_detached_root`] granting the unit on: 8 × 84 = 672. On executor 2
+// the entry spawns and joins, so it interprets until #2443.
 fn inst_nested_detached_unit() -> String {
     let rec = temen_ir::SpawnRec {
         args: (24576, 8),
-        ..temen_ir::SpawnRec::v1(0)
+        ..temen_ir::SpawnRec::default()
     };
     let (seg, stores) = temen_browser::plan::spawn_rec_ir(17408, &rec, "vu", "vb");
     format!(
@@ -1429,7 +1549,7 @@ block 1 (va1: i64) {{
   i64.store vpay vone
 {stores}  vrp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vinst (vrp)
-  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   vr = i64.add vk vj
   return vr
 }}
@@ -2080,12 +2200,15 @@ fn main() {
             refused.as_str(),
             (STATUS_OK, temen_ir::errno::EINVAL),
         ),
-        ("child_trap", trap.as_str(), (STATUS_TRAP, 0)),
+        (
+            "child_trap",
+            trap.as_str(),
+            (STATUS_OK, temen_ir::trap_code::UNREACHABLE),
+        ),
         // The retired carve spawns trap (#1867).
         ("carve_op0", CARVE_OP0, (STATUS_TRAP, 0)),
         ("carve_op5", CARVE_OP5, (STATUS_TRAP, 0)),
         ("carve_op13", CARVE_OP13, (STATUS_TRAP, 0)),
-        ("carve_rec_v0", CARVE_REC_V0, (STATUS_TRAP, 0)),
     ];
     json.push_str("],\n\"nested\":[\n");
     for (i, (name, src, want)) in nested.iter().enumerate() {
@@ -2237,13 +2360,13 @@ fn main() {
     // 4d host I/O across Workers — ground truth (result 8, stdout "tick\n"×8) asserted in JS.
     emit("threads_io", THREADS_IO);
     // #152 the on-ramp recipe across Workers — ground truth (exit 7, letters, total 8060) asserted in
-    // JS; the native twin is `tests/par_onramp.rs` over the same fixture.
+    // JS.
     emit(
         "threads_onramp",
         include_str!("../tests/fixtures/threads_onramp.temt"),
     );
-    // #1761 a fiber migrating between Workers under one run-shared registry, reading `vcpu.tls` —
-    // ground truth (13) asserted in JS; the native twin is `tests/par_onramp.rs` over the fixture.
+    // #1761 a fiber migrating between Workers, reading `vcpu.tls` — ground truth (13) asserted in
+    // JS.
     emit(
         "threads_fibers",
         include_str!("../tests/fixtures/threads_fibers.temt"),
@@ -2288,6 +2411,10 @@ fn main() {
             "root_leaves_a_spinner",
             include_str!("../../crates/temen-interp/tests/fixtures/root_leaves_a_spinner.temt"),
         ),
+        (
+            "fork_join_in_a_call",
+            include_str!("../../crates/temen-interp/tests/fixtures/fork_join_in_a_call.temt"),
+        ),
     ] {
         let (m, _) = emit(name, src);
         // #2219: the live caller spawns func 1's child image, which the page grants as the run's
@@ -2301,9 +2428,22 @@ fn main() {
             .expect("write module");
         }
     }
+    // #1414 B6-3b-4b — paged regions on the parallel driver (35, and its `MemoryFault` twin). The
+    // on-ramp recipe grants its memory capability fourth in its fixed prefix.
+    let mem = Host::new().grant_powerbox_prefix(1 << 17)[3];
+    emit("threads_paged", &threads_paged(mem, false));
+    emit("threads_paged_trap", &threads_paged(mem, true));
+    // #1414 B6-3b-4c — a collecting guest whose regions spill: each of its 5 tasks' emitted leaf
+    // pushes the words it holds across its call to the collector to its thread's spill stack, and the
+    // collector counts them (55). The native suite runs the same fixture (`thread_platform.rs`).
+    emit(
+        "threads_gc_spill",
+        include_str!("../../crates/temen-interp/tests/fixtures/threads_gc_spill.temt"),
+    );
     // wasm-JIT **tier-up** across Workers (BROWSER.md § "wasm-JIT tier", per-Worker JIT) — the 4000
     // kernel whose worker compute leaf tiers up onto emitted wasm. Ground truth (4000) asserted in JS.
     emit("threads_tierup", THREADS_TIERUP);
+    emit("threads_entry_tierup", THREADS_ENTRY_TIERUP);
     // Dynamic-linking corpus — §22 compile_linked: resolve the unit's "clock" import via the symbol
     // table (link=1 → 777) or leave it unresolved (link=0 → fail-closed trap). One guest, both cases.
     {

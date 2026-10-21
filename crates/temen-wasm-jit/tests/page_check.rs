@@ -5,7 +5,7 @@
 //! A paged guest `unmap`s / `protect`s its own pages (`call.cap 5 1/2` — interp-serviced; such
 //! functions are never emitted), then a tiered-up leaf accesses the window on emitted wasm. The
 //! driver contract: before each emitted call, refresh the byte-per-page state table (`0 = Unmapped`,
-//! `1 = Rw`, `2 = Ro`) from the live page map ([`bytecode::Vcpu::mem_map_info`]), write its base to
+//! `1 = Rw`, `2 = Ro`) from the live page map ([`bytecode::CoopRun::mem_map_info`]), write its base to
 //! the `"pagestate"` global and its **coverage** to `"mapped"` (the bound check traps everything
 //! above the table, where `check_prot` — no entries above — faults too). The emitted check traps
 //! exactly where the interpreter's `check_prot` does (INVARIANTS #9):
@@ -20,9 +20,10 @@
 //! trap-parity divergence, never an escape (INVARIANTS #2) — same argument as the #717 live bound.
 
 use std::sync::Arc;
-use temen_interp::{bytecode, Host, Region, Trap, Value};
+use temen_interp::bytecode::{CoopEvent, CoopRun, ProgramEmit, TierUpConfig};
+use temen_interp::{bytecode, host_page_size, Host, Region, Trap, Value};
 use temen_wasm_jit::{
-    compile_module_tierup, compile_module_tierup_b2_paged, compile_module_tierup_paged,
+    compile_module_tierup, compile_module_tierup_b2_paged, compile_module_tierup_paged, BounceHost,
     ENV_FAULT_OFF, TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL,
 };
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
@@ -260,7 +261,7 @@ fn shared_window(size: usize) -> (Arc<Region>, *mut u8, std::alloc::Layout) {
 /// window, with the page-state `table` placed after the window and both driver globals written
 /// (`"mapped"` = reserved, `"pagestate"` = the table's address). Copies emitted writes back.
 ///
-/// SAFETY: `base` is the live window buffer, touched only while the vCPU is paused (single-threaded).
+/// SAFETY: `base` is the live window buffer, touched only while the run is paused (single-threaded).
 fn run_emitted(
     wasm: &[u8],
     func: u32,
@@ -365,25 +366,17 @@ fn run_emitted(
     outcome
 }
 
-/// The host's software page size, probed from a throwaway run of `m` (the guests take page-aligned
-/// offsets as arguments, so the test adapts to 4-KiB and 16-KiB hosts alike).
-fn probe_page_size(m: &temen_ir::Module) -> u64 {
-    let prog = bytecode::VcpuProgram::compile(m).expect("compile");
-    let (back, base, layout) = shared_window(1usize << WIN_LOG2);
-    let vcpu = bytecode::Vcpu::new_root_with_powerbox(
-        &prog,
-        0,
-        &[Value::I32(0), Value::I64(0), Value::I64(0), Value::I64(0)],
-        back,
-        &[],
-        Host::new(),
-    )
-    .expect("probe vcpu");
-    let (page, ..) = vcpu.mem_map_info().expect("window");
-    drop(vcpu);
-    // SAFETY: the vCPU (and its `Mem` aliasing the region) is dropped; free the buffer.
-    unsafe { std::alloc::dealloc(base, layout) };
-    page
+/// A run's tier-up into `eligible`, emitted with the page check.
+fn paged_tierup(eligible: Vec<bool>) -> TierUpConfig {
+    TierUpConfig {
+        root: ProgramEmit {
+            eligible: Arc::from(eligible),
+            page_checked: true,
+            ..Default::default()
+        },
+        leaf: None,
+        modules: None,
+    }
 }
 
 thread_local! {
@@ -398,7 +391,6 @@ fn run_guest(guest_src: &str, off: u64, len: u64, probe: i64, mode: Mode) -> (Ou
     let m = build(guest_src);
     let win_size = 1usize << WIN_LOG2;
     let (back, base, layout) = shared_window(win_size);
-    let prog = bytecode::VcpuProgram::compile(&m).expect("compile");
     let mut host = Host::new();
     let asl = host.grant_memory();
     let args = [
@@ -407,32 +399,41 @@ fn run_guest(guest_src: &str, off: u64, len: u64, probe: i64, mode: Mode) -> (Ou
         Value::I64(len as i64),
         Value::I64(probe),
     ];
-    let mut vcpu = bytecode::Vcpu::new_root_with_powerbox(&prog, 0, &args, back, &[], host)
-        .expect("root vcpu");
-
-    let page = vcpu.mem_map_info().expect("window").0;
-    let (wasm, eligible) = if mode != Mode::Interp {
-        let (wasm, eligible) =
-            compile_module_tierup_paged(&m, false, page.trailing_zeros() as u8).expect("emit");
+    let (wasm, tierup) = if mode != Mode::Interp {
+        let page_log2 = host_page_size().trailing_zeros() as u8;
+        let (wasm, eligible) = compile_module_tierup_paged(&m, false, page_log2).expect("emit");
         assert_eq!(
             eligible,
             vec![false, true],
             "paged mode: the page-op entry stays interpreted, the pure leaf emits"
         );
-        let e: Arc<[bool]> = Arc::from(eligible.into_boxed_slice());
-        vcpu = vcpu
-            .with_jit_eligible(Arc::clone(&e))
-            .with_jit_page_checked();
-        (wasm, e)
+        (wasm, Some(paged_tierup(eligible)))
     } else {
-        (Vec::new(), Arc::from(vec![].into_boxed_slice()))
+        (Vec::new(), None)
     };
-    let _ = &eligible;
+    let mut run = CoopRun::new_over(&m, 0, &args, FUEL, host, tierup, &[], WIN_LOG2, back)
+        .expect("supported")
+        .expect("entry in range");
+    let out = pump(&mut run, &wasm, base, win_size, mode);
+    drop(run);
+    // SAFETY: the run (and its `Mem` aliasing the region) is dropped; free the window buffer.
+    unsafe { std::alloc::dealloc(base, layout) };
+    out
+}
 
+/// Pump `run` to its end, servicing each tier-up on `wasm` over the live window at `base` with the
+/// page-check driver contract `mode` names. Returns the outcome and how many tier-ups ran.
+fn pump(
+    run: &mut CoopRun,
+    wasm: &[u8],
+    base: *mut u8,
+    win_size: usize,
+    mode: Mode,
+) -> (Outcome, u32) {
     let mut tierups = 0u32;
     let out = loop {
-        match vcpu.run() {
-            bytecode::VcpuEvent::Done(vals) => {
+        match run.run() {
+            CoopEvent::Done(vals) => {
                 break Outcome::Vals(
                     vals.iter()
                         .map(|v| match v {
@@ -443,54 +444,53 @@ fn run_guest(guest_src: &str, off: u64, len: u64, probe: i64, mode: Mode) -> (Ou
                         .collect(),
                 )
             }
-            bytecode::VcpuEvent::Trapped(Trap::MemoryFault) => {
-                break Outcome::Trap(TrapKind::MemoryFault)
-            }
-            bytecode::VcpuEvent::Trapped(Trap::OutOfFuel) => {
-                break Outcome::Trap(TrapKind::OutOfFuel)
-            }
-            bytecode::VcpuEvent::Trapped(_) => break Outcome::Trap(TrapKind::Other),
-            bytecode::VcpuEvent::TierUp { func, argv, mapped } => {
+            CoopEvent::Trapped(Trap::MemoryFault) => break Outcome::Trap(TrapKind::MemoryFault),
+            CoopEvent::Trapped(Trap::OutOfFuel) => break Outcome::Trap(TrapKind::OutOfFuel),
+            CoopEvent::Trapped(_) => break Outcome::Trap(TrapKind::Other),
+            CoopEvent::TierUp {
+                func, argv, mapped, ..
+            } => {
                 tierups += 1;
-                let info = vcpu.mem_map_info().expect("window");
+                let info = run.mem_map_info().expect("window");
                 // #750: a page-checked run surfaces the RESERVED mask-domain size, never a decline
                 // — the driver then narrows the global to its table coverage below.
                 assert_eq!(mapped, info.2, "paged runs surface reserved");
+                let (_, backed) = run.pending_win().expect("a flat window");
                 let (table, cover) = match mode {
-                    Mode::PagedSynced => {
-                        bytecode::build_pagestate_table(&info, vcpu.win_flat_len())
-                    }
+                    Mode::PagedSynced => bytecode::build_pagestate_table(&info, backed),
                     // The broken driver: region defaults only, the guest's remaps ignored.
                     Mode::PagedUnsynced => bytecode::build_pagestate_table(
                         &(info.0, info.1, info.2, Vec::new()),
-                        vcpu.win_flat_len(),
+                        backed,
                     ),
-                    Mode::Interp => unreachable!(),
+                    Mode::Interp => unreachable!("an interpreted run never tiers up"),
                 };
-                match run_emitted(&wasm, func, &argv, base, win_size, &table, cover) {
-                    Outcome::Vals(v) => vcpu.deliver_tierup(&v),
-                    Outcome::Trap(TrapKind::OutOfFuel) => vcpu.deliver_tierup_trap(Trap::OutOfFuel),
-                    Outcome::Trap(_) => vcpu.deliver_tierup_trap(Trap::MemoryFault),
+                match run_emitted(wasm, func, &argv, base, win_size, &table, cover) {
+                    Outcome::Vals(v) => run.deliver_tierup(&v),
+                    Outcome::Trap(TrapKind::OutOfFuel) => run.deliver_tierup_trap(Trap::OutOfFuel),
+                    Outcome::Trap(_) => run.deliver_tierup_trap(Trap::MemoryFault),
                 }
             }
-            _ => panic!("unexpected event on this single-vCPU run"),
+            // One task over one window, serviced only for tier-up.
+            CoopEvent::Paused
+            | CoopEvent::Idle
+            | CoopEvent::CapPark { .. }
+            | CoopEvent::Resume { .. }
+            | CoopEvent::JitInvoke { .. } => panic!("unexpected event on a one-task run"),
         }
     };
-    drop(vcpu);
-    // SAFETY: the vCPU (and its `Mem` aliasing the region) is dropped; free the window buffer.
-    unsafe { std::alloc::dealloc(base, layout) };
     (out, tierups)
 }
 
 /// The managed page: the window's last page (`[win - page, win)`), on every host page size.
-fn last_page(m_src: &str) -> (u64, u64) {
-    let page = probe_page_size(&build(m_src));
+fn last_page() -> (u64, u64) {
+    let page = host_page_size();
     ((1u64 << WIN_LOG2) - page, page)
 }
 
 #[test]
 fn unmapped_load_traps_on_both_tiers() {
-    let (off, len) = last_page(UNMAP_LOAD);
+    let (off, len) = last_page();
     let probe = (off + 16) as i64; // inside the unmapped page
     let (want, _) = run_guest(UNMAP_LOAD, off, len, probe, Mode::Interp);
     assert_eq!(want, Outcome::Trap(TrapKind::MemoryFault), "oracle sanity");
@@ -501,7 +501,7 @@ fn unmapped_load_traps_on_both_tiers() {
 
 #[test]
 fn ro_load_succeeds_store_traps_on_both_tiers() {
-    let (off, len) = last_page(PROTECT_LOAD);
+    let (off, len) = last_page();
     let probe = (off + 16) as i64; // inside the now-Ro page; the marker was stored pre-protect
     let (want, _) = run_guest(PROTECT_LOAD, off, len, probe, Mode::Interp);
     assert_eq!(
@@ -528,7 +528,7 @@ fn ro_load_succeeds_store_traps_on_both_tiers() {
 fn straddling_store_traps_at_the_page_edge() {
     // The width>1 second consultation: an 8-byte store whose LAST byte lands on the unmapped page
     // ([off-4, off+4)) — a first-page-only check would admit it; the oracle walks both pages.
-    let (off, len) = last_page(UNMAP_STORE);
+    let (off, len) = last_page();
     let straddle = (off - 4) as i64;
     let (want, _) = run_guest(UNMAP_STORE, off, len, straddle, Mode::Interp);
     assert_eq!(want, Outcome::Trap(TrapKind::MemoryFault), "oracle sanity");
@@ -550,7 +550,7 @@ fn paged_bulk_fill_straddling_unmapped_traps_on_both_tiers() {
     // #1081: the paged per-page walk for bulk memory. A `mem.fill [off-8, off+8)` straddles from the
     // Rw neighbor into the unmapped last page — a first-page-only check would admit the write; the walk
     // (like the oracle's `check_prot_span`) traps on the unmapped page. Both tiers must trap.
-    let (off, len) = last_page(UNMAP_FILL);
+    let (off, len) = last_page();
     let straddle = (off - 8) as i64;
     let (want, _) = run_guest(UNMAP_FILL, off, len, straddle, Mode::Interp);
     assert_eq!(
@@ -583,7 +583,7 @@ fn paged_bulk_fill_straddling_unmapped_traps_on_both_tiers() {
 #[test]
 fn paged_bulk_fill_straddling_ro_traps_on_both_tiers() {
     // A write straddling into an `Ro` page faults on both tiers (a store admits only `Rw`).
-    let (off, len) = last_page(PROTECT_FILL);
+    let (off, len) = last_page();
     let straddle = (off - 8) as i64;
     let (want, _) = run_guest(PROTECT_FILL, off, len, straddle, Mode::Interp);
     assert_eq!(
@@ -604,7 +604,7 @@ fn paged_bulk_copy_read_ro_succeeds_unmapped_traps() {
     // The read side of the walk: a `mem.copy` whose SOURCE straddles the managed page. A load of an
     // `Ro` page is fine (succeeds on both tiers — the walk must NOT over-trap reads); a load of an
     // `Unmapped` page faults on both. This pins that the walk distinguishes read from write.
-    let (off, len) = last_page(PROTECT_COPY);
+    let (off, len) = last_page();
     let straddle = (off - 8) as i64;
     let (want, _) = run_guest(PROTECT_COPY, off, len, straddle, Mode::Interp);
     assert_eq!(
@@ -619,7 +619,7 @@ fn paged_bulk_copy_read_ro_succeeds_unmapped_traps() {
         "paged bulk walk over-trapped a read straddling an Ro page"
     );
 
-    let (off, len) = last_page(UNMAP_COPY);
+    let (off, len) = last_page();
     let straddle = (off - 8) as i64;
     let (want, _) = run_guest(UNMAP_COPY, off, len, straddle, Mode::Interp);
     assert_eq!(
@@ -640,7 +640,7 @@ fn unsynced_table_diverges() {
     // The negative pin: a driver that never applies the guest's remaps (defaults-only table)
     // admits the unmapped load the interpreter faults on. This divergence is why the per-call
     // table refresh is the contract, exactly like #717's unsynced-global pin.
-    let (off, len) = last_page(UNMAP_LOAD);
+    let (off, len) = last_page();
     let probe = (off + 16) as i64;
     let (got, tierups) = run_guest(UNMAP_LOAD, off, len, probe, Mode::PagedUnsynced);
     assert_eq!(tierups, 1);
@@ -657,7 +657,7 @@ fn unsynced_table_diverges() {
 /// which leaves the guard out, admits the load, since nothing else stands behind the table.
 #[test]
 fn the_null_guard_is_the_page_tables() {
-    let (off, len) = last_page(UNMAP_LOAD);
+    let (off, len) = last_page();
     for guest in [UNMAP_LOAD, UNMAP_STORE] {
         let (want, _) = run_guest(guest, off, len, 8, Mode::Interp);
         assert_eq!(
@@ -692,7 +692,7 @@ fn agree(guest: &str, off: u64, len: u64, probe: i64, want: Outcome) {
 /// [`straddling_store_traps_at_the_page_edge`].
 #[test]
 fn a_straddle_starting_on_an_unmapped_page_traps() {
-    let page = probe_page_size(&build(UNMAP_LOAD));
+    let page = host_page_size();
     let win = 1u64 << WIN_LOG2;
     let (off, len) = (win - 2 * page, page); // the second-to-last page; the last stays Rw
     let fault = Outcome::Trap(TrapKind::MemoryFault);
@@ -712,7 +712,7 @@ fn a_straddle_starting_on_an_unmapped_page_traps() {
 /// bytes load on both tiers; an access reaching one byte past the window faults on both.
 #[test]
 fn the_window_end_bounds_the_check() {
-    let page = probe_page_size(&build(UNMAP_LOAD));
+    let page = host_page_size();
     let win = 1u64 << WIN_LOG2;
     let (off, len) = (32768, page); // a page well clear of the window's end
     agree(
@@ -738,7 +738,7 @@ fn the_window_end_bounds_the_check() {
 /// past the guard it lands on an ordinary page, and only the explicit overflow compare stops it.
 #[test]
 fn wrapping_addresses_trap_on_both_tiers() {
-    let (off, len) = last_page(UNMAP_LOAD);
+    let (off, len) = last_page();
     let fault = Outcome::Trap(TrapKind::MemoryFault);
     for probe in [-1i64, -4, -7, -8, -16] {
         agree(UNMAP_LOAD, off, len, probe, fault.clone());
@@ -864,8 +864,8 @@ block 0 (v0: i64) {
 "#,
     );
     assert!(m.data.iter().any(|d| d.readonly), "guest carries rodata");
-    let (wasm, emit) =
-        compile_module_tierup_b2_paged(&m, false, 10, 16, false).expect("emit b2+paged");
+    let (wasm, emit) = compile_module_tierup_b2_paged(&m, false, 10, 16, BounceHost::default())
+        .expect("emit b2+paged");
     assert!(emit.iter().any(|&e| e), "some function tiers up");
 
     let engine = Engine::default();
@@ -888,7 +888,8 @@ block 0 (v0: i64) {
 
 /// The reactor guest: func 0 `_start(as, off, len)` unmaps `[off, off+len)` at open; func 1
 /// `tick(probe)` calls the load leaf (func 2) — the frame's tier-up. The reactor shape of the
-/// paged driver seam ([`bytecode::VcpuReactor::with_jit_page_checked`]).
+/// paged driver seam: a frame is a pump run over the reactor's live window
+/// ([`bytecode::Reactor::coop_call`]).
 const REACTOR_UNMAP: &str = r#"memory 17
 func (i32, i64, i64) -> () {
 block 0 (vas: i32, voff: i64, vlen: i64) {
@@ -910,124 +911,69 @@ block 0 (v0: i64) {
 }
 "#;
 
-/// Drive one `tick(probe)` frame through a **paged `VcpuReactor`** (the driver seam the browser
-/// wiring mirrors): `_start` unmaps the window's last page at open, each tier-up hands the live
-/// `map_info` to the service, which builds the table ([`bytecode::build_pagestate_table`]) and
-/// runs the emitted leaf over the live window with the coverage as the bound.
-fn reactor_frame(probe: i64, paged: bool) -> (Result<Vec<Value>, Trap>, u32) {
+/// Drive one `tick(probe)` frame on the reactor: `_start` unmaps the window's last page at open,
+/// then the frame runs over the live window. Paged, each tier-up builds the table from the run's
+/// live page map ([`bytecode::build_pagestate_table`]) and runs the emitted leaf over the live
+/// window with the coverage as the bound. Returns the frame's outcome and how many tier-ups ran.
+fn reactor_frame(probe: i64, paged: bool) -> (Outcome, u32) {
     let m = build(REACTOR_UNMAP);
     let win_size = 1usize << WIN_LOG2;
     let (back, base, layout) = shared_window(win_size);
-    let page = probe_page_size_of(&m, Arc::clone(&back));
+    let page = host_page_size();
     let (off, len) = ((1u64 << WIN_LOG2) - page, page);
-
-    let host = std::sync::Mutex::new({
-        let mut h = Host::new();
-        h.grant_memory();
-        h
-    });
-    // The AddressSpace handle is powerbox slot-granted; re-grant inside for the arg value.
-    let asl = {
-        let mut g = host.lock().unwrap();
-        *g = Host::new();
-        g.grant_memory()
-    };
-    let start_args = [
+    let mut reactor = bytecode::Reactor::open_over(&m, back).expect("supported");
+    let mut host = Host::new();
+    let asl = host.grant_memory();
+    let start = [
         Value::I32(asl),
         Value::I64(off as i64),
         Value::I64(len as i64),
     ];
-    let mut r = bytecode::VcpuReactor::open(&m, back, &host, &start_args).expect("open");
-    let wasm = if paged {
+    reactor
+        .call(0, &start, &mut FUEL.clone(), &mut host)
+        .expect("_start");
+    let (wasm, tierup) = if paged {
         let (wasm, eligible) =
             compile_module_tierup_paged(&m, false, page.trailing_zeros() as u8).expect("emit");
         assert!(eligible[2], "the load leaf must be paged-eligible");
-        r = r
-            .with_jit_eligible(Arc::from(eligible.into_boxed_slice()))
-            .with_jit_page_checked();
-        wasm
+        (wasm, Some(paged_tierup(eligible)))
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
-
-    let mut tierups = 0u32;
-    let out = r.frame(
-        1,
-        &[Value::I64(probe)],
-        &host,
-        |func, argv, _mapped, info| {
-            tierups += 1;
-            let info = info.expect("a paged reactor hands the live map to every tier-up");
-            let (table, cover) = bytecode::build_pagestate_table(&info, win_size as u64);
-            match run_emitted(&wasm, func, argv, base, win_size, &table, cover) {
-                Outcome::Vals(v) => Ok(v),
-                Outcome::Trap(TrapKind::OutOfFuel) => Err(Trap::OutOfFuel),
-                Outcome::Trap(_) => Err(Trap::MemoryFault),
-            }
-        },
-    );
-    drop(r);
-    // SAFETY: the reactor (and its `Mem` aliasing the region) is dropped; free the window buffer.
+    let mut run = reactor
+        .coop_call(1, &[Value::I64(probe)], FUEL, host, tierup, None)
+        .expect("the frame starts");
+    let out = pump(&mut run, &wasm, base, win_size, Mode::PagedSynced);
+    reactor.end_coop_call(&mut run);
+    drop((run, reactor));
+    // SAFETY: the run and the reactor (and the `Mem` aliasing the region) are dropped; free the
+    // window buffer.
     unsafe { std::alloc::dealloc(base, layout) };
-    (out, tierups)
-}
-
-/// Page-size probe over an already-built module + backing (reactor-shape twin of
-/// [`probe_page_size`], reusing the same region so no second buffer is needed).
-fn probe_page_size_of(m: &temen_ir::Module, back: Arc<Region>) -> u64 {
-    let prog = bytecode::VcpuProgram::compile(m).expect("compile");
-    let vcpu = bytecode::Vcpu::new_root_with_powerbox(
-        &prog,
-        1, // a pure func as entry: constructing never runs it
-        &[Value::I64(0)],
-        back,
-        &[],
-        Host::new(),
-    )
-    .expect("probe vcpu");
-    vcpu.mem_map_info().expect("window").0
+    out
 }
 
 #[test]
 fn paged_reactor_frame_matches_interpreter() {
-    let m = build(REACTOR_UNMAP);
     let win = 1i64 << WIN_LOG2;
-    let (back, base, layout) = shared_window(1usize << WIN_LOG2);
-    let page = probe_page_size_of(&m, back) as i64;
-    // SAFETY: probe vcpu dropped inside probe_page_size_of; free the probe buffer.
-    unsafe { std::alloc::dealloc(base, layout) };
+    let page = host_page_size() as i64;
 
     // Inside the unmapped last page: the oracle (unpaged reactor, interpreted leaf) faults, and
     // the paged reactor's emitted leaf must fault identically through the table.
     let probe_unmapped = win - page + 16;
     let (want, t0) = reactor_frame(probe_unmapped, false);
-    assert_eq!(want, Err(Trap::MemoryFault), "oracle sanity");
+    assert_eq!(want, Outcome::Trap(TrapKind::MemoryFault), "oracle sanity");
     assert_eq!(t0, 0, "unpaged reactor never tiers up");
     let (got, t1) = reactor_frame(probe_unmapped, true);
     assert_eq!(t1, 1, "the leaf must tier up through the reactor seam");
-    assert_eq!(
-        got,
-        Err(Trap::MemoryFault),
-        "paged reactor diverged on the unmapped page"
-    );
+    assert_eq!(got, want, "paged reactor diverged on the unmapped page");
 
     // Inside the mapped prefix, above the #1094 NULL guard `[0, 16384)`: both succeed (zeroed window ⇒ 0).
     let probe_ok = 16384 + 8;
     let (want, _) = reactor_frame(probe_ok, false);
-    assert_eq!(want, Ok(vec![Value::I64(0)]), "oracle sanity");
+    assert_eq!(want, Outcome::Vals(vec![0]), "oracle sanity");
     let (got, t2) = reactor_frame(probe_ok, true);
     assert_eq!(t2, 1);
-    assert_eq!(
-        got.map(|v| v
-            .iter()
-            .map(|x| match x {
-                Value::I64(i) => *i,
-                _ => panic!(),
-            })
-            .collect::<Vec<_>>()),
-        Ok(vec![0]),
-        "paged reactor diverged inside the prefix"
-    );
+    assert_eq!(got, want, "paged reactor diverged inside the prefix");
 }
 
 /// Guest `(as, off, len, probe)`: `unmap` `[off, off+len)`, then the leaf does an **aligned atomic
@@ -1054,7 +1000,7 @@ fn aligned_atomic_load_traps_on_unmapped_page() {
     // The align=true paged path: the (single) first-page consultation must still fire — an
     // aligned atomic load of the unmapped page traps on both tiers, and inside the prefix it
     // round-trips. Pins that eliding the redundant second consultation removed nothing needed.
-    let (off, len) = last_page(UNMAP_ATOMIC_LOAD);
+    let (off, len) = last_page();
     let probe = (off + 16) as i64; // 8-aligned, inside the unmapped page
     let (want, _) = run_guest(UNMAP_ATOMIC_LOAD, off, len, probe, Mode::Interp);
     assert_eq!(want, Outcome::Trap(TrapKind::MemoryFault), "oracle sanity");
@@ -1079,7 +1025,7 @@ fn aligned_atomic_load_traps_on_unmapped_page() {
 #[test]
 fn paged_faults_report_the_oracles_address() {
     for (src, delta) in [(UNMAP_LOAD, 16i64), (PROTECT_STORE, 16), (UNMAP_STORE, -4)] {
-        let (off, len) = last_page(src);
+        let (off, len) = last_page();
         let probe = off as i64 + delta;
         let fault = |mode| {
             LAST_FAULT.set(None);

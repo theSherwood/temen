@@ -13,8 +13,8 @@ no fork-returns-twice yet.
 
 ## The substrate already exists
 
-> **Retiring:** this section describes the carve path, which is being deleted (INVARIANTS #13,
-> 2026-09-29; #1289). The detached equivalent is op 15 (`instantiate_detached`: its own window,
+> **Retired (#1867):** this section describes the carve path, deleted in #1867 (INVARIANTS #13,
+> 2026-09-29; #1289). The detached equivalent is the op-17 spawn record (its own window,
 > by-name grants), with argv in its spawn-time args payload and the status through `join`
 > (DETACHED_JIT.md §1).
 
@@ -24,17 +24,18 @@ glue, not new substrate**:
 - **`Instantiator` (iface 6)** — `instantiate_module` (op 5) spawns a child
   running a **separate host-verified `Module`** confined to a carve of the
   parent's window; `join` (op 1) parks the caller until the child completes and
-  yields its result. Proven on both backends (`separate_module.rs`,
-  `jit_separate_module.rs`), including data-segment materialization and
+  yields its result. Proven on both backends (`jit_separate_module.rs`),
+  including data-segment materialization and
   confinement (a child cannot touch bytes outside its carve).
 - **`Module` (iface 8)** — host-verified code a guest may instantiate. The host
   grants a `Module` capability (`Host::grant_module`); on the JIT the child is
   resolved through `temen_run::module_resolver` (never guest-reachable) and
   compiled **at instantiate** — §14's "nesting cost paid at setup".
-- **Grants into children** — `instantiate_granted` (op 8) / `instantiate_named`
-  (op 11) re-grant the parent's own capabilities (stdout/stderr/stdin) into the
-  child, discovered by name via `self.resolve` (`instantiate_granted.rs`,
-  `instantiate_named.rs`). This is stdio inheritance.
+- **Grants into children** — an op-17 spawn record's grant list re-grants the
+  parent's own capabilities (stdout/stderr/stdin) into the child, discovered by
+  name via `self.resolve` (`instantiate_granted.rs`); `grant` (op 19) adds one to
+  a running child. This is stdio inheritance. (Ops 8 and 11 did this before
+  op 17 folded them in, #2065.)
 - **argv delivery** — a child runs over the **parent's shared window backing**;
   the carve is not zeroed, so the parent seeds `argv` bytes into the child's
   carve before `instantiate` and the child reads them at low offsets. (The
@@ -53,10 +54,11 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
 
 ## Slice plan
 
-> **Retiring:** slices 1–6 spawn commands into carves (op 5/13, argv seeded into the child's carve,
-> parent-as-pager output read back from it), and the carve path is being deleted (INVARIANTS #13,
-> 2026-09-29; #1289). The detached equivalent is op 15: argv in its spawn-time args payload, output
-> through inherited stdio or a `SharedRegion` pre-mapped by op 15's `(region, child_off)`, status
+> **Retired (#1867):** slices 1–6 spawn commands into carves (op 5/13, argv seeded into the child's
+> carve, parent-as-pager output read back from it), and the carve path is deleted (INVARIANTS #13,
+> 2026-09-29; #1289; #1867). The detached equivalent is the op-17 spawn record: argv in its spawn-time args
+> payload, output through inherited stdio or a `SharedRegion` pre-mapped by its `region` and
+> `child_off`, status
 > through `join`. Slice 6's ring already runs between detached stages.
 
 0. **Unmodified `main(argc, argv)` on chibicc** *(done —
@@ -112,6 +114,8 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
      argument at runtime* (`codegen_ir.c` §7) and cannot emit `self.resolve`,
      so `applet(inst, addrspace, stdout_h)` writing through `stdout_h` is the
      natural form. Proven with a seeded-argv echo, differential interp==JIT.
+     *(Retired with op 8, #2065: chibicc has since gained `__vm_resolve`, so a
+     C child finds its `stdout` by name.)*
 4. **exec a compiled-C command (pure status)** *(done —
    `stage1_exec_command.rs`)* — a "shell" parent spawns a *separate*, unmodified
    `int main(int argc, char **argv)` C program via `instantiate_module` (op 5),
@@ -189,7 +193,7 @@ keystone of self-similarity. It is **not built**. Until it lands:
 - **`cmd > file`, `cmd | cmd2`** (shell-side interception): needs `Endpoint`
   (Power 2). The stopgap is the parent-as-pager model (`stage1_foreign_command.rs`
   — the command writes to its carve, the parent forwards; with the carve retired, INVARIANTS #13
-  2026-09-29, that memory becomes a `SharedRegion` pre-mapped by op 15), which requires a
+  2026-09-29, that memory becomes a `SharedRegion` pre-mapped by the spawn record), which requires a
   command written to output to memory rather than an ambient fd, so it is **not**
   a drop-in for unmodified compiled commands. Real redirection/pipelines of
   external commands wait on the endpoint work.
@@ -251,7 +255,7 @@ keystone of self-similarity. It is **not built**. Until it lands:
    and waking each other — the shape sequential spawn/wait deadlocks on
    outright. Regressions surface loudly (30 s wait timeouts fold into the
    result ×1000), and the run completes in well under a second — real wakes.
-   Also pinned: the same ring between two **detached** stages (op-15 spawns —
+   Also pinned: the same ring between two **detached** stages (op-17 record spawns —
    private windows + the explicit shared channel compose, the §5 model
    sentence as a test) and bytecode-entry equality via the standing oracle
    fallback.
@@ -315,12 +319,11 @@ Stage 1 only *composes* existing, fuzzed primitives.
 
 ## Resolved — `poll` is WNOHANG; its terminal status is backend-portable
 
-A crashing command must not crash the shell, which needs `poll` (op 9:
-`0` running / `1` returned / `2` trapped) to detect a trapped child and
-`detach` instead of `join` (a `join` propagates the child's trap to the
-parent). A caller that would rather block uses `wait` (op 18, #2053): it parks
-until the child ends and answers `0` (returned; `join` takes the value) or the
-trap's wire code (the child reaped). The original concern was that an *immediate* `poll` after a
+A crashing command must not crash the shell, and it does not: `join` (op 1)
+parks until the child ends and answers how it ended — `(0, value)` if it
+returned, else `(trap code, 0)` — reaping it either way, and never traps the
+parent (#2066). A caller that must not block probes with `poll` (op 9: `0`
+running / `1` returned / `2` trapped). The original concern was that an *immediate* `poll` after a
 synchronous spawn reads differently across backends: the interpreter's M:N
 scheduler defers a child (so an immediate `poll` reads `0` running); the JIT
 runs it eagerly on its own OS thread (so an immediate `poll` may already read
@@ -451,7 +454,7 @@ already running); the ~20% that gates everything is **`fork` + R8**.
 
 > **Retired:** the spawn ops this plan brings to bytecode parity (0, 5, 11, 13) are carve spawns.
 > Every engine now traps them `CapFault` (INVARIANTS #13; #1867), so the text below is history, and
-> the tests and ops it names are deleted. The detached spawn, op 15 and its op-17 record, runs on the
+> the tests and ops it names are deleted. The detached spawn, the op-17 record, runs on the
 > bytecode engine (`VcpuEvent::InstantiateDetached`; DETACHED_JIT.md §1).
 
 Running bash *in the playground* is **not** just "native bash + compile for wasm": the playground is
@@ -461,7 +464,7 @@ cooperative, single-thread driver (`compile_and_run_with_host`, the exact entry 
 on) **already lowers and drives the core §14 ops, wasm-safely:**
 
 - **The spawn and `join` (op 1) already work on bytecode, single-thread.** The detached spawn
-  (op 15, and its op-17 record) — the "exec a command" primitive, a *separate-module* child — is
+  (the op-17 record) — the "exec a command" primitive, a *separate-module* child — is
   pinned matching the tree-walk oracle by `spawn_every_driver.rs`. (This plan started from the carve
   spawns, ops 0 and 5, which every engine now refuses.) No OS threads, no clock. So **sequential spawn/wait is already a
   browser capability**, not a missing one.

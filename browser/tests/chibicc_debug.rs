@@ -1018,6 +1018,63 @@ fn inspect_struct_array_and_pointer_locals() {
 /// used to be skipped by both engines, so the DAP refused the line as unverified. A terminator is a
 /// stop position now: the breakpoint binds, the run stops on line 9 with `sum` readable, and a `next`
 /// from line 8 lands on line 9 rather than running off the end.
+/// **Real `-g` locals say their structured shape (#2341).** `p`, `arr` and `pp` each carry a
+/// `typeInfo` from chibicc's own type table, so a front end renders them without parsing a C spelling:
+/// the struct is an aggregate, the array names its element and count, the pointer its pointee.
+#[test]
+fn real_locals_say_their_type_shape() {
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
+    let ir = compile_g(&chibicc, RICH_SRC);
+    let mut s = DapServer::new();
+    launch_at(&mut s, &ir, RICH_BP, false);
+    s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    let vref = locals_ref(&mut s, 5);
+    let out = s.handle(&req(
+        7,
+        "variables",
+        Json::obj(vec![("variablesReference", Json::i(vref))]),
+    ));
+    let vars = response(&out)
+        .get("body")
+        .and_then(|b| b.get("variables"))
+        .and_then(|v| v.as_array())
+        .expect("variables")
+        .to_vec();
+    let info = |name: &str| {
+        vars.iter()
+            .find(|v| v.get("name").and_then(|n| n.as_str()) == Some(name))
+            .and_then(|v| v.get("typeInfo"))
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} has a typeInfo"))
+    };
+    let field = |j: &Json, key: &str| j.get(key).and_then(|k| k.as_str()).map(str::to_owned);
+
+    assert_eq!(field(&info("p"), "kind").as_deref(), Some("aggregate"));
+
+    let arr = info("arr");
+    assert_eq!(field(&arr, "kind").as_deref(), Some("array"));
+    assert_eq!(arr.get("count").and_then(|c| c.as_i64()), Some(3));
+    let elem = arr.get("target").expect("arr's element");
+    assert_eq!(
+        (field(elem, "kind"), field(elem, "encoding")),
+        (Some("scalar".into()), Some("signed".into())),
+        "arr is of int"
+    );
+
+    let pp = info("pp");
+    assert_eq!(field(&pp, "kind").as_deref(), Some("pointer"));
+    let pointee = pp.get("target").expect("pp's pointee");
+    assert_eq!(
+        (field(pointee, "kind"), field(pointee, "name")),
+        (Some("aggregate".into()), Some("struct Point".into())),
+        "pp points at a struct Point"
+    );
+}
+
 #[test]
 fn breakpoint_on_bare_return_line_stops_there() {
     let Some(bytes) = chibicc_temen() else {
@@ -1302,6 +1359,115 @@ fn thread_top(s: &mut DapServer, seq: i64, tid: i64) -> Option<(i64, String)> {
         f.get("line")?.as_i64()?,
         name.split_once(' ').map_or(name, |(_, n)| n).to_string(),
     ))
+}
+
+/// **A system header's code is library code, end to end (#2401).** The playground's `<pthread.h>`
+/// compiles its thread trampoline `__pthread_entry` into the program's own unit. chibicc marks the
+/// header library code because it found it on the include path; the program's `in.c` stays its own.
+/// So a new thread's first frame, the trampoline, is `subtle`, and under `justMyCode` one step on
+/// that thread goes straight to the thread function's first line, where without it the step stays
+/// in the trampoline.
+#[test]
+fn a_system_headers_code_is_library_code() {
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
+    let ir = compile_g(&chibicc, TWO_THREADS_SRC);
+    let m = temen_text::parse_module(&ir).expect("the linked text parses");
+    let di = m.debug_info.as_ref().expect("the link keeps the -g info");
+    let lib: Vec<&str> = di
+        .lib_files
+        .iter()
+        .map(|&f| di.files[f as usize].as_str())
+        .collect();
+    assert!(
+        lib.iter().any(|f| f.ends_with("include/pthread.h")),
+        "pthread.h is library code: {lib:?}"
+    );
+    assert!(
+        !lib.iter().any(|f| f.ends_with("in.c")),
+        "the program's own file is not: {lib:?}"
+    );
+
+    for just_my_code in [false, true] {
+        let mut s = DapServer::new();
+        s.handle(&req(1, "initialize", Json::obj(vec![])));
+        s.handle(&req(
+            2,
+            "launch",
+            Json::obj(vec![
+                ("programText", Json::s(ir.as_str())),
+                ("function", Json::i(0)),
+                ("args", Json::Arr(vec![])),
+                ("engine", Json::s("bytecode")),
+                ("powerbox", Json::s("onramp")),
+                ("justMyCode", Json::Bool(just_my_code)),
+            ]),
+        ));
+        s.handle(&req(
+            3,
+            "setBreakpoints",
+            Json::obj(vec![
+                ("source", Json::obj(vec![("path", Json::s("/in.c"))])),
+                (
+                    "breakpoints",
+                    Json::Arr(vec![Json::obj(vec![("line", Json::i(13))])]),
+                ),
+            ]),
+        ));
+        let out = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+        assert_eq!(stopped_reason(&out).as_deref(), Some("breakpoint"));
+
+        // Thread 2 is spawned and waits at the trampoline's first op, which has no line; one step on
+        // it alone.
+        s.handle(&req(
+            5,
+            "stepIn",
+            Json::obj(vec![
+                ("threadId", Json::i(2)),
+                ("singleThread", Json::Bool(true)),
+            ]),
+        ));
+        let out = s.handle(&req(
+            6,
+            "stackTrace",
+            Json::obj(vec![("threadId", Json::i(2))]),
+        ));
+        let top = response(&out)
+            .get("body")
+            .and_then(|b| b.get("stackFrames"))
+            .and_then(|f| f.as_array())
+            .and_then(|f| f.first())
+            .cloned()
+            .expect("thread 2 is live");
+        let at = |key: &str| top.get(key).cloned();
+        let path = top
+            .get("source")
+            .and_then(|src| src.get("path"))
+            .and_then(|p| p.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if just_my_code {
+            assert_eq!(
+                (at("name"), at("line")),
+                (Some(Json::s("#0 count_a")), Some(Json::i(5))),
+                "straight to the thread function's first line: {top:?}"
+            );
+            assert_eq!(at("presentationHint"), None, "the program's own frame");
+        } else {
+            assert!(
+                path.ends_with("include/pthread.h"),
+                "the step stays in the trampoline: {top:?}"
+            );
+            assert_eq!(
+                at("presentationHint"),
+                Some(Json::s("subtle")),
+                "and the trampoline's frame is library code"
+            );
+        }
+    }
 }
 
 /// **Split-view stepping on a chosen thread, and a Step Back that undoes the last step.** A step
@@ -1960,5 +2126,61 @@ fn the_release_session_serves_declared_caps_as_the_debug_session_does() {
         release_host_caps_run(&module, 1_000),
         want,
         "release, sliced"
+    );
+}
+
+/// #1722 — a program that calls, as an ordinary C function with an `int` reply, a capability its
+/// embedder grants as a host cap.
+const ASK_SRC: &str = r#"
+int ask(int x);
+int main() { return ask(5); }
+"#;
+
+/// #1722 — the debug session's messages after `continue` on [`ASK_SRC`] with `ask` granted as a host
+/// cap, on its own thread for at most 30 s: a call waiting on an answer nothing could give would hang
+/// the test rather than fail it (the single-threaded wasm build panicked in that wait).
+fn ask_session(ir: String) -> Vec<Json> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = DapServer::new();
+        s.handle(&req(1, "initialize", Json::obj(vec![])));
+        let out = s.handle(&req(
+            2,
+            "launch",
+            Json::obj(vec![
+                ("programText", Json::s(&ir)),
+                ("function", Json::i(0)),
+                ("args", Json::Arr(vec![])),
+                ("engine", Json::s("bytecode")),
+                ("powerbox", Json::s("onramp")),
+                ("hostCaps", Json::Arr(vec![Json::s("ask")])),
+            ]),
+        ));
+        assert_eq!(response(&out).get("success"), Some(&Json::Bool(true)));
+        s.handle(&req(3, "configurationDone", Json::obj(vec![])));
+        let _ = tx.send(s.handle(&req(4, "continue", Json::obj(vec![]))));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the session waited on a host cap call that cannot park")
+}
+
+/// **A host cap called as an `int` function ends the run with `CapFault`** (#1722): a parked call is
+/// delivered into one `i64` slot, so this one cannot park, and only the embedder could answer it.
+#[test]
+fn a_host_cap_called_as_an_int_function_ends_the_run_with_cap_fault() {
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: browser/web/assets/chibicc.temen absent");
+        return;
+    };
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode chibicc.temen");
+    let out = ask_session(compile_g(&chibicc, ASK_SRC));
+    let exited = out
+        .iter()
+        .find(|m| m.get("event").and_then(|e| e.as_str()) == Some("exited"))
+        .and_then(|m| m.get("body"))
+        .expect("the run exited");
+    assert_eq!(
+        exited.get("trap").and_then(|t| t.as_str()),
+        Some("CapFault")
     );
 }

@@ -4201,9 +4201,9 @@ const HOST_PROC_TYPE_ID: u32 = 13;
 /// numerically like [`HOST_PROC_TYPE_ID`]; `temen-run`'s `shared_region_type_id_matches` test locks them.
 const SHARED_REGION_TYPE_ID: u32 = 4;
 /// The `Instantiator` interface id (`temen_interp::cap_id::INSTANTIATOR`) — the §14 VM-in-VM spawner,
-/// reached from a guest via `__vm_instantiate_rec` (op 17, the v1 spawn record),
-/// `__vm_instantiate_detached` (op 15) and `__vm_join` (op 1). Pinned numerically like [`HOST_PROC_TYPE_ID`]; `temen-run`'s `instantiator_type_id_matches`
-/// test locks the two together.
+/// reached from a guest via `__vm_instantiate_rec` (op 17, the spawn record) and `__vm_join`
+/// (op 1). Pinned numerically like [`HOST_PROC_TYPE_ID`]; `temen-run`'s
+/// `instantiator_type_id_matches` test locks the two together.
 const INSTANTIATOR_TYPE_ID: u32 = 6;
 /// The `ModuleLoader` interface id (`temen_interp::cap_id::MODULE_LOADER`) — the §14 authority to
 /// promote guest bytes to a spawnable `Module`, reached from a guest via `__vm_module_from_bytes`
@@ -13269,8 +13269,8 @@ fn lower_vm_builtin(
             Ok(true)
         }
         // §14 spawn: `long __vm_instantiate_rec(int inst, long rec)` → `call.cap INSTANTIATOR 17 inst
-        // (rec)` — the one spawn form (INVARIANTS #13, #1863): `rec` points at an op-17 **v1** record
-        // (`temen_ir::SpawnRec`, 88 bytes) in the guest window naming the module (a `Module` handle
+        // (rec)` — the one spawn form (INVARIANTS #13, #1863): `rec` points at an op-17 record
+        // (`temen_ir::SpawnRec`, 64 bytes) in the guest window naming the module (a `Module` handle
         // the host granted, started at its function 0, #2219), the `Budget` that pays for the child's
         // window of its own, the by-name grant list,
         // the spawn-time args payload and an optional pre-mapped region. The same builtin chibicc
@@ -13290,37 +13290,6 @@ fn lower_vm_builtin(
                 sig,
                 handle,
                 args: vec![rec],
-            });
-            ctx.bind_dest(&c.dest, r);
-            Ok(true)
-        }
-        // §14 detached spawn: `long __vm_instantiate_detached(int inst, long budget, long module,
-        // long grants_ptr, long grants_n, long entry, long size_log2, long args_ptr, long args_len)` →
-        // `call.cap INSTANTIATOR 15 inst (budget, module, grants_ptr, grants_n, entry, size_log2, 0,
-        // args_ptr, args_len)` — `instantiate_detached` (PROCESS.md §5): the child runs the
-        // host-granted `module` in a window **of its own** (`size_log2` must equal the module's
-        // declared memory), not a carve of the spawner's, with the same named-grant records as
-        // `__vm_instantiate_rec` and a spawn-time args payload copied to its `module_args_base()`
-        // (length 0 seeds nothing). `budget` is a `Budget` handle the child's resources are drawn
-        // from, its fuel included: op 15's retired `quota` slot is always 0 (#1944 slice 3). Returns
-        // the child handle, joined with `__vm_join` (`-EINVAL` on a refused spawn).
-        "__vm_instantiate_detached" => {
-            let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Instantiator handle
-            let mut args = (1..9)
-                .map(|i| ctx.operand_i64(vm_arg(c, i)?))
-                .collect::<Result<Vec<_>, _>>()?;
-            args.insert(6, ctx.push(Inst::ConstI64(0))); // the retired `quota`
-            let sig = temen_ir::FuncType {
-                params: vec![ValType::I64; 9],
-                results: vec![ValType::I64],
-            };
-            let sig = ctx.intern_sig(sig); // #922
-            let r = ctx.push(Inst::CapCall {
-                type_id: INSTANTIATOR_TYPE_ID,
-                op: 15,
-                sig,
-                handle,
-                args,
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -13352,31 +13321,41 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
-        // §14 join: `long __vm_join(int inst, long child)` → `call.cap INSTANTIATOR 1 inst (child)` — the
-        // happens-before that publishes the child's window writes and returns its result. `inst` is the
-        // Instantiator handle, `child` the handle a spawn returned.
+        // §14 join: `long __vm_join(int inst, long child, long *status)` → `status, value = call.cap
+        // INSTANTIATOR 1 inst (child)` — park until the child ends, then answer how it ended: `*status`
+        // 0 and its first result returned, or `*status` its trap's wire code (`temen_ir::trap_code`)
+        // and 0 returned. A child's end is never the caller's trap (#2066), so a spawner outlives a
+        // child that crashed, ran out of fuel, was killed or exited. The join is the happens-before
+        // that publishes the child's window writes. `inst` is the Instantiator handle, `child` the
+        // handle a spawn returned, `status` a writable `long` (as `__vm_fiber_resume`'s `done`).
         "__vm_join" => {
             let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Instantiator handle
             let child = ctx.operand_i64(vm_arg(c, 1)?)?;
+            let status = ctx.operand_i64(vm_arg(c, 2)?)?; // `long *status`
             let sig = temen_ir::FuncType {
                 params: vec![ValType::I64],
-                results: vec![ValType::I64],
+                results: vec![ValType::I64, ValType::I64],
             };
             let sig = ctx.intern_sig(sig); // #922
-            let r = ctx.push(Inst::CapCall {
-                type_id: INSTANTIATOR_TYPE_ID,
-                op: 1,
-                sig,
-                handle,
-                args: vec![child],
+            let rs = ctx.push_multi(
+                Inst::CapCall {
+                    type_id: INSTANTIATOR_TYPE_ID,
+                    op: 1,
+                    sig,
+                    handle,
+                    args: vec![child],
+                },
+                2,
+            ); // (status, value)
+            ctx.push_effect(Inst::Store {
+                op: StoreOp::I64,
+                addr: status,
+                value: rs[0],
+                offset: 0,
             });
-            ctx.bind_dest(&c.dest, r);
+            ctx.bind_dest(&c.dest, rs[1]);
             Ok(true)
         }
-        // `long __vm_wait(int inst, long child)` → `call.cap INSTANTIATOR 18 inst (child)`: join's
-        // park, answering how the child ended — 0 if it returned (it stays for `__vm_join`), else its
-        // trap's wire code (`temen_ir::trap_code`), the child reaped. A spawner's way to outlive a
-        // child that crashed or ran out of fuel.
         // PROCESS.md S3 (#1706): `long __vm_poll(int inst, long child)` → `call.cap INSTANTIATOR 9`
         // (0 running, 1 returned, 2 trapped; never parks), `__vm_detach` → op 10 (drop the join
         // claim), `__vm_kill` → op 12 (end the child and its subtree, running or parked: #2074). A
@@ -13384,7 +13363,7 @@ fn lower_vm_builtin(
         // #2220: `long __vm_grant(int inst, long child, long handle)` → op 19 (grant `handle` into
         // the running child, answering the child's handle of it, which the spawner hands the child
         // itself, or `-errno`).
-        "__vm_wait" | "__vm_poll" | "__vm_detach" | "__vm_kill" | "__vm_grant" => {
+        "__vm_poll" | "__vm_detach" | "__vm_kill" | "__vm_grant" => {
             let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Instantiator handle
             let n = if name == "__vm_grant" { 2 } else { 1 }; // the child, then what is granted
             let args = (1..=n)
@@ -13401,8 +13380,7 @@ fn lower_vm_builtin(
                     "__vm_poll" => 9,
                     "__vm_detach" => 10,
                     "__vm_kill" => 12,
-                    "__vm_grant" => 19,
-                    _ => 18,
+                    _ => 19, // `__vm_grant`
                 },
                 sig,
                 handle,
@@ -13414,12 +13392,16 @@ fn lower_vm_builtin(
         // `Budget` (PROCESS.md S5): `long __vm_budget_split(int budget, long fuel, long mem, long
         // spawn)` → `call.cap BUDGET 0` mints a node under `budget` with those ceilings (`-1`:
         // only its ancestors cap it), returning its handle or `-errno`; `long __vm_budget_read(int
-        // budget, long field)` → `call.cap BUDGET 1` answers the room left along its chain. The
-        // split is how a spawner bounds what one child may spend, by handing it the node.
-        "__vm_budget_split" | "__vm_budget_read" => {
-            let split = name == "__vm_budget_split";
+        // budget, long field)` → `call.cap BUDGET 1` answers the room left along its chain;
+        // `long __vm_budget_close(int budget)` → `call.cap BUDGET 3` gives the handle up (#2384).
+        // The split is how a spawner bounds what one child may spend, by handing it the node.
+        "__vm_budget_split" | "__vm_budget_read" | "__vm_budget_close" => {
+            let (op, n) = match name {
+                "__vm_budget_split" => (0, 3),
+                "__vm_budget_read" => (1, 1),
+                _ => (3, 0),
+            };
             let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Budget handle
-            let n = if split { 3 } else { 1 };
             let args = (1..=n)
                 .map(|i| ctx.operand_i64(vm_arg(c, i)?))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -13430,7 +13412,7 @@ fn lower_vm_builtin(
             let sig = ctx.intern_sig(sig); // #922
             let r = ctx.push(Inst::CapCall {
                 type_id: temen_ir::cap_id::BUDGET,
-                op: if split { 0 } else { 1 },
+                op,
                 sig,
                 handle,
                 args,
@@ -16080,7 +16062,7 @@ fn lower_mem_intrinsic(ctx: &mut BlockCtx, c: &crate::ll::ast::Call) -> Result<b
 
 /// Lower a float math intrinsic call to inline float ops, returning its result index. `llvm.fma`
 /// (IEEE-required fused) lowers to the shared fused-FMA op (`Inst::Fma`/`VFma`, the same op the wasm
-/// `relaxed_madd` emits — interp `mul_add` == JIT `fma`, and bit-equal to native libm `fma()`);
+/// `relaxed_madd` emits — interp `libm` `fma` == JIT `fma`, and bit-equal to native libm `fma()`);
 /// `llvm.fmuladd` (contractible) stays unfused `fmul`+`fadd`, bit-equal to baseline native (no HW FMA).
 /// Returns `Ok(None)` if the call is not a recognized float intrinsic.
 fn lower_float_intrinsic(
@@ -16142,7 +16124,7 @@ fn lower_float_intrinsic(
             "llvm.minnum" | "llvm.minimum" => bin(ctx, VB::Min)?,
             "llvm.maxnum" | "llvm.maximum" => bin(ctx, VB::Max)?,
             // `llvm.fma` is IEEE-required fused → the shared fused-FMA primitive (`Inst::VFma`; the
-            // same op the wasm frontend's `relaxed_madd` emits, interp `mul_add` == JIT `fma`). This
+            // same op the wasm frontend's `relaxed_madd` emits, interp `libm` `fma` == JIT `fma`). This
             // also matches native's libm `fma()`. `llvm.fmuladd` is *contractible*: on a baseline
             // target (no hardware FMA) native lowers it to mul+add, so we keep it unfused to stay
             // bit-equal to the native oracle.

@@ -1,4 +1,4 @@
-// ---- §14 spawn: the op-17 v1 record (#1863, #1864) ----
+// ---- §14 spawn: the op-17 record (#1863, #1864) ----
 // Appended to the source of every Rust-on-Temen guest that spawns, by its test, so there is one
 // guest-side spawn to keep right. Not a module of the test crate: it is guest code, built
 // by `rustc --emit=llvm-ir` with the guest. A pointer in a guest is a window offset, so a record,
@@ -13,13 +13,13 @@ const VM_ARGS_ROOM: usize = 16256;
 
 #[repr(C, align(8))]
 struct VmSpawnScratch {
-    rec: [u32; 22],
+    rec: [u32; 16],
     grants: [u32; 64],
     args: [u8; VM_ARGS_ROOM],
 }
 
 static mut VM_SPAWN: VmSpawnScratch = VmSpawnScratch {
-    rec: [0; 22],
+    rec: [0; 16],
     grants: [0; 64],
     args: [0; VM_ARGS_ROOM],
 };
@@ -64,17 +64,16 @@ unsafe fn vm_spawn(inst: i32, budget: i32, module: i32, grants: &[(&[u8], i32)],
         g.add(4 * i + 3).write(0);
         i += 1;
     }
-    // `temen_ir::SpawnRec` v1, in u32 words: version 1 | entry 0, offset 0 (reserved), size_log2 0 (the
-    // declared window) | no pager, module | budget, quota 0, grants, args, region -1 (none) | reserved
-    // 0, child_off 0.
+    // `temen_ir::SpawnRec`, in u32 words: size_log2 0 (the declared window) | no pager, module |
+    // budget, grants, args, region -1 (none) | padding 0, child_off 0.
     let r = core::ptr::addr_of_mut!((*s).rec) as *mut u32;
-    let words: [u32; 22] = [
-        1, 0, 0, 0, 0, u32::MAX, module as u32, budget as u32, 0, 0,
+    let words: [u32; 16] = [
+        0, u32::MAX, module as u32, budget as u32,
         g as u32, 0, grants.len() as u32, 0, a as u32, 0, p as u32, 0,
         u32::MAX, 0, 0, 0,
     ];
     let mut k = 0;
-    while k < 22 {
+    while k < 16 {
         r.add(k).write(words[k]);
         k += 1;
     }

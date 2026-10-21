@@ -11,6 +11,7 @@ import {
   runJitModule, runWarmCoop, runJitCompiler, runJitSelfhost, nimToolchain, nimCompileRun,
 } from './wasmjit-module.js';
 import { SnapshotClient } from './snapshot-client.js';
+import { NIM_PROGRAMS } from './nim-programs.js';
 import { createDapClient } from './dap.js';
 import { initWebGPU, teardownWebGPU, webgpuAvailable } from './webgpu.js';
 import { createEditor, setVimAll, refreshAll } from './editor.js';
@@ -325,7 +326,7 @@ block 0 (vsp: i64, vp: i64) {
     desc: '§14 sandboxing: the root spawns 8 **detached** copies of itself — each on its OWN Web Worker, ' +
       'in a fresh 64 KiB window of its own `WebAssembly.Memory`, paid from the budget the root was ' +
       'granted — joins them and sums 8 × 5 = 40. A copy starts at the program’s `_child` export: the ' +
-      'host grants the program its **child image** as `child`, and one op-17 v1 spawn record serves all eight.',
+      'host grants the program its **child image** as `child`, and one op-17 spawn record serves all eight.',
     src: `memory 16
 data 16384 "child"
 export 0 func "_child" 1   ; where a copy of this program starts: the host grants its image as "child"
@@ -335,22 +336,19 @@ block 0 (v0: i32, vbud: i32) {
   vcn = i64.const 16384
   vcl = i64.const 5
   vchild = self.resolve vcn vcl         ; this program's child image, by name
-  ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | entry
-  ; 0, size_log2 0 (the declared window) | pager none, the child image | budget, region -1 (none).
-  ; Everything else — offset, quota, grants, args, child_off — stays zero.
+  ; the op-17 spawn record at 17408 (temen_ir::SpawnRec, 64 bytes): size_log2 0 (the declared
+  ; window) | pager none, the child image | budget, region -1 (none). Everything else — grants, args,
+  ; child_off — stays zero.
   vr0 = i64.const 17408
-  vf0 = i64.const 1                     ; version 1, entry 0
+  vf0 = i64.const -4294967296           ; size_log2 0, pager u32::MAX
   i64.store vr0 vf0
-  vr2 = i64.const 17424
-  vf2 = i64.const -4294967296           ; size_log2 0, pager u32::MAX
-  i64.store vr2 vf2
-  vr3 = i64.const 17432
-  i32.store vr3 vchild                  ; module: the child image
-  vr3b = i64.const 17436
-  i32.store vr3b vbud                   ; budget
-  vr9 = i64.const 17480
+  vr1 = i64.const 17416
+  i32.store vr1 vchild                  ; module: the child image
+  vr1b = i64.const 17420
+  i32.store vr1b vbud                   ; budget
+  vr6 = i64.const 17456
   vnone = i32.const -1
-  i32.store vr9 vnone                   ; region -1 (none)
+  i32.store vr6 vnone                   ; region -1 (none)
   vi0 = i64.const 0
   br 1(vi0, v0)
 }
@@ -387,7 +385,7 @@ block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v16b = i64.const 16400
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
-  vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst5 (vhh)
   vsn = i64.add vs2 vr
   v1b = i64.const 1
   vjn = i64.add vj2 v1b
@@ -456,35 +454,32 @@ block 0 () {
   i32.store vg1 vln
   vg2 = i64.const 17544
   i32.store vg2 vout
-  ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | entry
-  ; 0, size_log2 20 (the declared window) | pager none, the child image | budget, grants_ptr,
-  ; grants_n, region -1 (none). Everything else — offset, quota, args, child_off — stays zero.
+  ; the op-17 spawn record at 17408 (temen_ir::SpawnRec, 64 bytes): size_log2 20 (the declared
+  ; window) | pager none, the child image | budget, grants_ptr, grants_n, region -1 (none).
+  ; Everything else — args, child_off — stays zero.
   vr0 = i64.const 17408
-  vf0 = i64.const 1                     ; version 1, entry 0
+  vf0 = i64.const -4294967276           ; size_log2 20, pager u32::MAX
   i64.store vr0 vf0
+  vr1 = i64.const 17416
+  i32.store vr1 vchild                  ; module: the child image
+  vr1b = i64.const 17420
+  i32.store vr1b vbud                   ; budget
   vr2 = i64.const 17424
-  vf2 = i64.const -4294967276           ; size_log2 20, pager u32::MAX
-  i64.store vr2 vf2
-  vr3 = i64.const 17432
-  i32.store vr3 vchild                  ; module: the child image
-  vr3b = i64.const 17436
-  i32.store vr3b vbud                   ; budget
-  vr5 = i64.const 17448
-  i64.store vr5 vg0                     ; grants_ptr
-  vr9 = i64.const 17480
-  vnone = i32.const -1
-  i32.store vr9 vnone                   ; region -1 (none)
-  ; child A: one grant
+  i64.store vr2 vg0                     ; grants_ptr
   vr6 = i64.const 17456
+  vnone = i32.const -1
+  i32.store vr6 vnone                   ; region -1 (none)
+  ; child A: one grant
+  vr3 = i64.const 17432
   vn1 = i64.const 1
-  i64.store vr6 vn1
+  i64.store vr3 vn1
   vha = call.cap 6 17 (i64) -> (i32) vinst (vr0)
-  vra = call.cap 6 1 (i32) -> (i64) vinst (vha)
+  vra_st, vra = call.cap 6 1 (i32) -> (i64, i64) vinst (vha)
   ; child B: no grants — A's window went back to the budget when A ended, so B fits
   vn0 = i64.const 0
-  i64.store vr6 vn0
+  i64.store vr3 vn0
   vhb = call.cap 6 17 (i64) -> (i32) vinst (vr0)
-  vrb = call.cap 6 1 (i32) -> (i64) vinst (vhb)
+  vrb_st, vrb = call.cap 6 1 (i32) -> (i64, i64) vinst (vhb)
   vten = i64.const 10
   vm = i64.mul vra vten
   vsum = i64.add vm vrb
@@ -520,13 +515,15 @@ block 2 (vh2: i32) {
 
   detached: {
     mode: 'onramp',
-    debug: true, // steppable: the debug scheduler services op 15 (#1528), under the on-ramp powerbox
-    bp: 38, // a breakpoint just past the join, where `vj` holds what the detached child returned
-    desc: '§5 detached child + a **pre-mapped SharedRegion** (op 15, 11-arg form): the parent mints a ' +
+    debug: true, // steppable: the debug scheduler services the spawn (#1528), under the on-ramp powerbox
+    bp: 42, // a breakpoint just past the join, where `vj` holds what the detached child returned
+    desc: '§5 detached child + a **pre-mapped SharedRegion**: the parent mints a ' +
       '64 KiB region, maps it at 65536 in its own window and stores 41 there, then spawns **a copy of itself** ' +
       '(its child image, which starts at its `_child` export) as a DETACHED child — a fresh 128 KiB window ' +
       'of its own, nothing of the parent addressable — with ' +
-      'the region pre-mapped at 65536 of the child’s window before it starts. The child needs no ' +
+      'the region pre-mapped at 65536 of the child’s window before it starts. The spawn is an op-17 ' +
+      '**spawn record** the parent lays in its own window: the child’s module, its window size, the ' +
+      '`Budget` that pays for it, the region and where it maps; no pager, grants or args. The child needs no ' +
       'handle, no `map`, no page-size query: it reads 41 at 65536, stores 82 at 65544, returns 42. After ' +
       '`join` the parent reads 82 back through its own mapping and returns 1000 × 42 + 82 = **42082**. ' +
       'The parent finds its `instantiator`, `addrspace`, `budget` (the detached-window allowance) and ' +
@@ -562,14 +559,18 @@ block 0 () {
   vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
   vin = i64.const 41
   i64.store vwo vin
-  vb = i64.extend_i32_u vbud
-  vmh = i64.extend_i32_u vchild
-  vz = i64.const 0
-  vent = i64.const 0
-  vlog = i64.const 17
-  vreg = i64.extend_i32_u vrh
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vmh, vz, vz, vent, vlog, vz, vz, vz, vreg, vwo)
-  vj = call.cap 6 1 (i32) -> (i64) vinst (vc)
+  ; the spawn record (op 17), 64 bytes at 20544; a field left 0 is none
+  vrec = i64.const 20544
+  vlog = i32.const 17
+  i32.store vrec vlog ; @0 a 128 KiB window
+  vnone = i32.const -1
+  i32.store vrec vnone offset=4 ; @4 no pager
+  i32.store vrec vchild offset=8 ; @8 the module: this program's child image
+  i32.store vrec vbud offset=12 ; @12 the Budget its window spends
+  i32.store vrec vrh offset=48 ; @48 the region, pre-mapped ...
+  i64.store vrec vwo offset=56 ; @56 ... at 65536 of the child's window
+  vc = call.cap 6 17 (i64) -> (i32) vinst (vrec)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vc)
   vk = i64.const 1000
   vm = i64.mul vj vk
   vob = i64.const 65544
@@ -1245,10 +1246,11 @@ int main(void) {
   vm_grant g[1];
   g[0].name = "stdout";
   g[0].handle = out;
+  long st;                                              /* how a child ended: 0 = it returned */
   long a = vm_spawn(worker, 0, g, 1, 0, 0, scratch);    /* A: stdout re-granted */
-  long ra = vm_join(a);
+  long ra = vm_join(a, &st);
   long b = vm_spawn(worker, 0, g, 0, 0, 0, scratch);    /* B: empty grant list */
-  long rb = vm_join(b);
+  long rb = vm_join(b, &st);
   printf("child A (granted stdout) returned %ld\\n", ra);
   printf("child B (no grants)      returned %ld\\n", rb);
   return (int)(ra * 10 + rb);
@@ -1279,15 +1281,15 @@ int main(void) {
     mode: 'io',
     desc: 'The **IR card above, in C**: `main` mints a SharedRegion, maps it into its own window, fills it ' +
       'with 1…8, and spawns `square.c` — a program of its own, below the `//// child:` line, which the page ' +
-      'compiles separately and grants as `square` — as a **detached** child (`Instantiator` op 15, the ' +
-      '11-arg form) with the region **pre-mapped** into the child’s fresh window. The child squares the ' +
+      'compiles separately and grants as `square` — as a **detached** child (`Instantiator` op 17, a ' +
+      '`struct vm_spawn_rec` from `<temen.h>`) with the region **pre-mapped** into the child’s fresh window. The child squares the ' +
       'numbers in place through plain pointer access — it holds no handle and calls no capability — and ' +
       'after `join` the parent prints the results it reads back through its own mapping. Everything the ' +
       'parent needs comes by name from the powerbox (`__vm_resolve`: `instantiator`, `budget`, `square`) ' +
       'plus the `<temen.h>` builtins — the region ops, `__vm_budget_read`, and the spawn/join themselves, ' +
       'each a static `call.cap` on the handle it names. Compiled by chibicc in your browser, linked against ' +
       'the prebuilt libc, run on the bytecode engine.',
-    src: `// A detached child that shares memory with its parent: the op-15 pre-mapped SharedRegion.
+    src: `// A detached child that shares memory with its parent: a pre-mapped SharedRegion.
 //
 // The parent mints a SharedRegion, maps it into its own window, fills it with numbers, and spawns
 // square.c (below, a program of its own) as a DETACHED child: a fresh window of its own, with nothing
@@ -1312,13 +1314,24 @@ int main(void) {
   long *p = (long *)(win - REGION_LEN); // the parent's view: its top 64 KiB, above all its data
   __vm_region_map(region, (long)p, 0, REGION_LEN, 3);
   for (int i = 0; i < N; i++) p[i] = i + 1;
-  // Entry 0 (square.c's own start), size 0 (its declared window), the region at CHILD_OFF.
-  long h = __vm_instantiate_detached(inst, budget, square, 0, 0, 0, 0, 0, 0, region, CHILD_OFF);
+  // The spawn record: square.c, run from its own start in its declared window (size 0), paid from
+  // budget, with the region at CHILD_OFF. Every field VM_SPAWN_REC_INIT leaves is none.
+  struct vm_spawn_rec rec = VM_SPAWN_REC_INIT;
+  rec.module = square;
+  rec.budget = budget;
+  rec.region = region;
+  rec.child_off = CHILD_OFF;
+  long h = __vm_instantiate_rec(inst, (long)&rec);
   if (h < 0) {
     printf("spawn refused: %ld\\n", h);
     return 1;
   }
-  long r = __vm_instantiate_join(inst, h);
+  long st; // how the child ended: 0 if it returned, else its trap's code
+  long r = __vm_instantiate_join(inst, h, &st);
+  if (st != 0) {
+    printf("child trapped: %ld\\n", st);
+    return 1;
+  }
   printf("child returned %ld; the region now holds:", r);
   for (int i = 0; i < N; i++) printf(" %ld", p[i]);
   printf("\\n");
@@ -1391,56 +1404,31 @@ int main(void) {
       '(gated in CI). On the wasm-JIT even the 3400-line giants compile in a few hundred milliseconds; ' +
       '“Prove interp ≡ JIT” recompiles on both engines and checks the objects match to the byte.',
   },
-  'nim (Nim → Temen, runs)': {
-    kind: 'module',
-    url: './assets/nim_hello.temen',
-    mode: 'io',
-    desc: "A **real Nim program** — `import std/syncio` / `write(stdout, \"hello, temen\\n\")` — compiled " +
-      "all the way to a runnable Temen module and **run client-side in the sandbox**. The full nimony " +
-      "toolchain (nifler → nimony → hexer) lowered the Nim to Leng, `temen-leng` translated + linked it " +
-      "against the real compiled `system` module on Nim's **capability edge**, which gives the program " +
-      "the sandbox's streams and exit and nothing else (nimony's `write(1, buf, len)` → the powerbox " +
-      "stdout stream). Click Run: the " +
-      "output below is the guest's **real stdout** — a Nim program printing on the Temen. (The Nim→Leng " +
-      "front end runs at build time for now, unlike the `temen-leng` card below, which runs the translator " +
-      "itself in your browser; committed `nim_hello.temen`, gated by `nim_hello_asset.rs`.)",
-  },
-  'nim: compile & run a whole Nim program → Temen (the full toolchain, in your browser)': {
+  'nim: compile & run a Nim program (nimony, in your browser)': {
     kind: 'nimc',
     editable: true,
     lang: 'nim',
     mode: 'io',
     // nimony's own toolchain, each tool built by nimony with no C compiler (`scripts/nim-toolchain.sh`),
-    // with nimony's library and that library prebuilt: one gzipped registry blob (`nimbuild --bundle`).
+    // with nimony's library and that library prebuilt: one gzipped registry blob (temen-run's
+    // `nim_card_bundle`).
     url: './assets/nimony.blob.gz',
-    desc: "**Compile a whole Nim program in your browser, with nimony's own driver** (#958, #763). Click " +
-      "Run and `nimony t -r --isMain prog.nim` builds your program the way it does on a host, then runs " +
-      "it: nimony plans the build and nifmake runs every step through `/bin/sh` — `nifler2` parses each " +
-      "module, `nimsem` checks it (and builds and runs a program of its own for anything evaluated at " +
-      "compile time), `hexer` lowers it, and `temen-link` links the whole program into one Temen module. " +
-      "Every tool is a verified Temen module that **nimony built from its own source, " +
-      "with no C compiler**; they fork, exec and wait on each other in one sandboxed process tree over " +
-      "an in-memory filesystem. The tree runs on the interpreter, while the processes that only compute " +
-      "(the parser, the lowering, your program) run on emitted wasm — suspended by JSPI where one waits " +
-      "on a pipe. Most of the standard library comes prebuilt (`strutils`, `sequtils`, `tables`, `sets`, " +
-      "`math`, `options`, …), so a build compiles only your own modules. The output below is your " +
-      "program's real stdout. (The toolchain ships as one ~5 MB gzipped asset and inflates in-browser.)",
-    src: `# Edit this Nim, then Run. nimony's own toolchain compiles it in your browser —
-# nifler2 (parse) -> nimsem (check) -> hexer (lower) -> temen-link — and the
-# result runs on the Temen. The text below is your program's real stdout.
-import std/[syncio, strutils]
-
-proc greet(name: string): string =
-  "hello, " & name
-
-var words = 0
-for word in "the quick brown fox jumps over the lazy dog".split(' '):
-  inc words
-
-echo greet("Nim")
-echo "words: ", words
-echo toUpperAscii("temen")
-`,
+    // The dropdown (`nim-programs.js`): picking one loads it into the editor (#2374).
+    programs: NIM_PROGRAMS,
+    desc: "**Compile a whole Nim program in your browser, with nimony's own driver** (#958, #763). Pick " +
+      "a program, or write your own, and click Run: `nimony t -r --novalidate --isMain prog.nim` builds it the way it " +
+      "does on a host, then runs it. nimony plans the build and nifmake runs every step through " +
+      "`/bin/sh`: `nifler2` parses each module, `nimsem` checks it (and builds and runs a program of its " +
+      "own for a macro, or for anything evaluated at compile time), `shoggoth` lowers it, and `temen-link` " +
+      "links the whole program into one Temen module. Every tool is a verified Temen module that " +
+      "**nimony built from its own source, with no C compiler**; they fork, exec and wait on each other " +
+      "in one sandboxed process tree over an in-memory filesystem. The tree runs on the interpreter, " +
+      "while the processes that only compute (the parser, the lowering, and your program unless it " +
+      "starts threads) run on emitted wasm, suspended by JSPI where one waits on a pipe. Your program " +
+      "can start threads and processes of its own: all of them run on this card's one Worker, taking " +
+      "turns. Most of the standard library comes prebuilt (`strutils`, `tables`, `json`, `macros`, " +
+      "`osproc`, `rawthreads`, …), so a build compiles only your own modules. The output below is your " +
+      "program's real stdout. (The toolchain ships as one gzipped asset and inflates in-browser.)",
   },
   'temen-leng: translate real nimony Leng → Temen IR (self-host)': {
     kind: 'module',
@@ -1984,12 +1972,14 @@ SELECT count(*), sum(x), avg(x) FROM t;
   },
 };
 
-// Size the run's shared window from the source's `memory N` declaration (64 KiB minimum — the wasm
-// page granularity §14 carves align to; 16 MiB cap keeps a typo from asking for the whole memory).
+// The threaded runner's window, from the source's `memory N` declaration: at least 64 KiB (one wasm
+// page). A module never runs over less than it declares (#2414: emitted code checks its accesses
+// against the declaration, and the engine refuses a smaller window), so a declaration past 16 MiB, the
+// most this page allocates (a typo shouldn't ask for the whole memory), is refused, not shrunk: `null`.
 function winSizeOf(src) {
   const m = /^\s*memory\s+(\d+)/m.exec(src);
-  const log2 = Math.min(Math.max(m ? Number(m[1]) : 16, 16), 24);
-  return 1 << log2;
+  const log2 = Math.max(m ? Number(m[1]) : 16, 16);
+  return log2 <= 24 ? 1 << log2 : null;
 }
 
 // ---- per-card run machinery ----------------------------------------------------------------------
@@ -3218,8 +3208,8 @@ async function runSelfhost(c) {
 
 // Compile a **whole Nim program** in the browser with nimony's own driver, and run it (#958, #763). The
 // card's one asset is nimony's toolchain (`nimony.blob.gz`, `nimToolchain`); `nimCompileRun` runs
-// `nimony t -r --isMain prog.nim` over it, one POSIX process tree: the tree on the interpreter, each
-// leaf process (nifler2, hexer, the program) on emitted wasm, and temen-link natively. It runs on the
+// `nimony t -r --novalidate --isMain prog.nim` over it, one POSIX process tree: the tree on the
+// interpreter, each leaf process (nifler2, shoggoth, the program) on emitted wasm, and temen-link natively. It runs on the
 // nim worker, so a build (or a program that never returns) stalls only that worker; a page without one
 // runs it on the main thread.
 let nimMainToolchain = null; // the main thread's `nimToolchain`, when there is no nim worker
@@ -4702,7 +4692,7 @@ async function startDebug(c) {
   dapClient.send('initialize', {});
   // A chibicc C program runs under the on-ramp I/O powerbox, so a `printf` (a `write` cap) runs and its
   // output streams back as `output` events instead of trapping; so does an `onramp`-recipe Temen card,
-  // which resolves its powerbox by name (`instantiator`/`module`/`budget`, #1528) exactly as its Run
+  // which resolves its powerbox by name (`instantiator`/`budget`/`child`, #1528) exactly as its Run
   // does. Every other hand-written Temen card stays deny-all.
   const launchArgs = { programText, function: 0, args: [], engine: 'bytecode' };
   if (c.ex.kind === 'chibicc' || c.ex.mode === 'onramp') launchArgs.powerbox = 'onramp';
@@ -4853,7 +4843,7 @@ async function runText(c) {
 
   // The `onramp` recipe: the same single-threaded host the pre-built C/C++ cards run on
   // (`temen_run_onramp`) — a `_start` that resolves its powerbox **by name** (`self.resolve`), the
-  // named `instantiator`/`module`/`budget` grants a detached spawn needs, and a stdout pane. No
+  // named `instantiator`/`budget`/`child` grants a detached spawn needs, and a stdout pane. No
   // Workers: a pre-mapped SharedRegion aliases the parent's pages into the child's window, which
   // has no analogue across separate `WebAssembly.Memory`s (the par driver refuses it, by design).
   if (mode === 'onramp') {
@@ -4874,6 +4864,14 @@ async function runText(c) {
     return;
   }
 
+  const winSize = winSizeOf(src);
+  if (winSize === null) {
+    const msg = 'run refused: the threaded runner allocates at most 16 MiB (memory 24)';
+    setState(c, 'error', msg);
+    logTo(c, msg);
+    runEnd(rec, { ok: false });
+    return;
+  }
   aborter = new AbortController();
   c.el.run.disabled = true;
   c.el.stop.disabled = false;
@@ -4889,7 +4887,7 @@ async function runText(c) {
     // (fail-closed per-function; validated interp≡tier-up in `browser-tierup-mainline-test.mjs`). The
     // §22-`jit`/§14-`inst` recipes have their own JIT; `io` stays on the interpreter for now.
     tierup: mode === 'plain',
-    winSize: winSizeOf(src),
+    winSize,
     signal: aborter.signal,
   };
   const t0 = performance.now();
@@ -4907,7 +4905,7 @@ async function runText(c) {
     runEnd(rec, { ok: true, result: value });
   } catch (e) {
     if (e.message === 'stopped') {
-      // Workers were torn down mid-run; shared state (locks, the live-vCPU counter) may be wedged.
+      // Workers were torn down mid-run; shared state (locks) may be wedged.
       broken = true;
       setState(c, 'stopped', 'stopped — reload the page to run again');
       logTo(c, 'stopped by user');
@@ -5068,7 +5066,11 @@ function buildCard(name, ex) {
   // Temen text (no `kind`) and editable modules (Lua/SQL/Postgres) get an editor; a fixed C guest or a
   // reactor gets a lightweight read-only note (its "source" is a pre-built binary).
   const editable = !ex.kind || !!ex.editable;
-  const dflt = ex.src || '';
+  // A card with a dropdown of programs (`ex.programs`, the Nim card's): the picked program is the
+  // editor's default source, so Reset restores it, and the pick persists as an edit does.
+  const programs = ex.programs || null;
+  let program = programs && (programs.find((p) => p.name === loadSaved(id + ':program')) || programs[0]);
+  let dflt = program ? program.src : (ex.src || '');
   let editor = null;
   if (editable) {
     const ta = el('textarea');
@@ -5143,6 +5145,15 @@ function buildCard(name, ex) {
     }
     const l = el('label', null, 'translation unit ');
     l.appendChild(tuSel);
+    controls.appendChild(l);
+  }
+  let progSel = null;
+  if (programs) {
+    progSel = el('select', 'program');
+    for (const p of programs) progSel.appendChild(el('option', null, p.name));
+    progSel.value = program.name;
+    const l = el('label', null, 'program ');
+    l.appendChild(progSel);
     controls.appendChild(l);
   }
   const runBtn = el('button', 'run', 'Run');
@@ -5447,6 +5458,16 @@ function buildCard(name, ex) {
     const prove = c.ex.kind === 'chibicc' ? proveChibiccParity : c.ex.kind === 'selfhost' ? proveSelfhostParity : c.ex.kind === 'module' ? proveModuleParity : proveParity;
     proveBtn.addEventListener('click', () => prove(c));
   }
+  // Picking a program replaces the editor's contents with it, as Reset would.
+  if (progSel) progSel.addEventListener('change', () => {
+    program = programs.find((p) => p.name === progSel.value);
+    dflt = program.src;
+    editor.setValue(dflt);
+    clearSaved(id);
+    saveSrc(id + ':program', program.name, programs[0].name);
+    editor.clearError();
+    setState(c, 'ready', `loaded the ${program.name} program`);
+  });
   if (resetBtn) resetBtn.addEventListener('click', () => {
     editor.setValue(dflt);
     clearSaved(id);

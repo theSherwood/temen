@@ -84,17 +84,17 @@ fn grant_io_powerbox(
     // #1528 — the §14 **by-name spawn set**, the same frontier the two reference powerboxes present
     // (`temen-run`'s `grant_powerbox_prefix` caller and the browser's `grant_onramp_caps`): an
     // `Instantiator` over the guest's own window under `"instantiator"`, and — only for a guest
-    // that can spawn detached (`temen_ir::spawns_detached`; the `"module"` grant is non-durable) —
-    // `"module"` (itself, spawnable) and `"budget"` (the detached-window allowance). Without these
+    // that can spawn detached (`temen_ir::spawns_detached`) — `"budget"` (the detached-window
+    // allowance) and `"child"` (its child image, for a program exporting `_child`). Without these
     // a §5/§14 guest resolved nothing under the debugger and could not be stepped at all, while the
     // same source ran on both Run paths — the INVARIANTS #14 frontier gap, not a policy difference.
     // Granted **last**, so every handle above keeps its value (a reverse-`seek` rebuild replays the
     // recorded cap tape against the same numbering) — the browser on-ramp orders it the same way.
     host.set_self_module(&std::sync::Arc::new(m.clone()));
-    let inst = host.grant_instantiator(0, win);
+    let inst = host.grant_instantiator();
     host.register_cap_name("instantiator", inst);
     if temen_ir::spawns_detached(m) {
-        host.grant_detached_spawn_caps(win, temen_ir::spawns_by_module_handle(m));
+        host.grant_detached_spawn_caps(win);
     }
     // The one shared powerbox binder (#1524): the `#912` name→cap table plus this session's raw
     // `HostProc` seams — the #1366 slice (c) host-completed caps declared above, and the #1323
@@ -138,7 +138,7 @@ fn build_run(
         let mut host = Host::new();
         grant_io_powerbox(&mut host, module, stdin, fs_seed, host_caps, parked);
         if let Some(limit) = mem_limit {
-            let mem = RootWindow::fresh(module, temen_ir::DEFAULT_RESERVED_LOG2)
+            let mem = RootWindow::fresh(module, temen_ir::default_reserved_log2())
                 .declared
                 .saturating_add(limit);
             host.set_grant(
@@ -1555,16 +1555,15 @@ impl Debuggee for BytecodeBackend {
         self.run.provide_stdin(bytes);
         true
     }
-    /// #1366 — deliver the value for the host-completed cap call the session is parked on.
+    /// #1366 — answer the host-answered cap call `id` the session filed: the next resume takes the
+    /// answer. `false` if no such call is outstanding.
     fn provide_cap(&mut self, id: u64, value: i64) -> bool {
-        let ok = self.run.deliver_cap(id, value);
-        if ok {
-            self.parked_cap
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
-        }
-        ok
+        let request = self
+            .parked_cap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+        request.map(|r| r.completer.complete(value)).is_some()
     }
     fn cap_park_request(&self) -> Option<(String, Vec<i64>)> {
         let parked = self.run.cap_parked()?;

@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use temen_interp::{
     cap_id, CapState, ForkedProc, GuestMem, Host, HostBuffer, HostCharge, HostProc, HostProcFork,
-    NamedCapGrant, NodeRef, OpParks, SignalSource, Trap, TABLE_ENTRY,
+    NamedCapGrant, NodeRef, OpParks, ProcHandler, SignalSource, Trap, TABLE_ENTRY,
 };
 use temen_ir::ResolvedCap;
 
@@ -611,6 +611,11 @@ struct MemFile {
 /// descriptor numbers never size the host's table.
 const FD_MAX: usize = 1024;
 
+/// #2345 — the most processes the personality's table holds, live and unreaped together: Linux's
+/// default `pid_max`. A zombie stays until its parent reaps it, so a `fork` or `posix_spawn` past it
+/// is `-EAGAIN`, as one past a user's process limit is.
+const PID_MAX: usize = 32768;
+
 /// #2306 — the most connections a listener holds unaccepted: Linux's `SOMAXCONN`. A loopback
 /// `connect` past them is refused (`-ECONNREFUSED`).
 const SOMAXCONN: usize = 4096;
@@ -946,6 +951,85 @@ impl FdEntry {
     }
 }
 
+/// #2345 — a process's environment. POSIX `fork` copies it, so a twin shares its parent's until
+/// either writes, and the writer's own copy is made then: a fork copies nothing. Each copy is
+/// charged to the personality's payer as `channel`, a [`TABLE_ENTRY`] and its bytes per variable, so
+/// a `setenv` past the ceiling, or a write needing a copy there is no room for, is `-ENOMEM`.
+#[derive(Default)]
+struct Env {
+    vars: HashMap<String, String>,
+    room: HostCharge,
+}
+
+impl Env {
+    /// What `name=value` costs.
+    fn cost(name: &str, value: &str) -> u64 {
+        TABLE_ENTRY + (name.len() + value.len()) as u64
+    }
+
+    /// `env` to write, its own copy charged to `payer` when a fork still shares it: `None`, with
+    /// nothing changed, when the payer has no room for the copy. `force` charges past any ceiling:
+    /// what the embedder sets.
+    fn own(env: &mut Arc<Env>, payer: Option<NodeRef>, force: bool) -> Option<&mut Env> {
+        if Arc::get_mut(env).is_none() {
+            let mut room = HostCharge::new(payer);
+            match force {
+                true => room.force(env.room.bytes()),
+                false if !room.resize(env.room.bytes()) => return None,
+                false => {}
+            }
+            *env = Arc::new(Env {
+                vars: env.vars.clone(),
+                room,
+            });
+        }
+        Arc::get_mut(env)
+    }
+
+    /// Set `name` to `value` in `env`: `false`, its variables unchanged, when `payer` has no room.
+    fn set(
+        env: &mut Arc<Env>,
+        payer: Option<NodeRef>,
+        force: bool,
+        name: String,
+        value: String,
+    ) -> bool {
+        let Some(e) = Env::own(env, payer, force) else {
+            return false;
+        };
+        let old = e.vars.get(&name).map_or(0, |v| Env::cost(&name, v));
+        let held = e.room.bytes() - old + Env::cost(&name, &value);
+        match force {
+            true => e.room.force(held),
+            false if !e.room.resize(held) => return false,
+            false => {}
+        }
+        e.vars.insert(name, value);
+        true
+    }
+
+    /// Unset `name` in `env`: `false` when it must be copied first and `payer` has no room.
+    fn remove(env: &mut Arc<Env>, payer: Option<NodeRef>, name: &str) -> bool {
+        if !env.vars.contains_key(name) {
+            return true;
+        }
+        let Some(e) = Env::own(env, payer, false) else {
+            return false;
+        };
+        if let Some(value) = e.vars.remove(name) {
+            e.room.resize(e.room.bytes() - Env::cost(name, &value));
+        }
+        true
+    }
+
+    /// An environment of `vars`, charged to `payer` past any ceiling: what a restore rebuilt.
+    fn forced(vars: HashMap<String, String>, payer: Option<NodeRef>) -> Env {
+        let mut room = HostCharge::new(payer);
+        room.force(vars.iter().map(|(n, v)| Env::cost(n, v)).sum());
+        Env { vars, room }
+    }
+}
+
 /// One open directory stream: the immediate child names under the opened path, snapshotted at
 /// `opendir` (so a concurrent `open`/`unlink` during iteration doesn't perturb it — POSIX permits
 /// either), plus the `readdir` cursor. #2306: the snapshot is charged to the personality's payer,
@@ -958,7 +1042,7 @@ struct DirStream {
 
 impl DirStream {
     /// A stream over `entries`, charged to `payer` past any ceiling: one that existed before (a
-    /// restore's, a fork twin's copy of its parent's).
+    /// restore's).
     fn forced(entries: Vec<String>, pos: usize, payer: Option<&NodeRef>) -> DirStream {
         let mut held = HostCharge::new(payer.cloned());
         held.force(TABLE_ENTRY + names_cost(&entries));
@@ -966,9 +1050,16 @@ impl DirStream {
     }
 }
 
-impl Clone for DirStream {
-    fn clone(&self) -> DirStream {
-        DirStream::forced(self.entries.clone(), self.pos, self.held.payer())
+impl DirStream {
+    /// #2428 — a fork twin's copy of this stream, charged to the same payer within every limit:
+    /// `None`, charging nothing, when it has no room.
+    fn copied(&self) -> Option<DirStream> {
+        let mut held = HostCharge::new(self.held.payer().cloned());
+        held.resize(self.held.bytes()).then(|| DirStream {
+            entries: self.entries.clone(),
+            pos: self.pos,
+            held,
+        })
     }
 }
 
@@ -1281,10 +1372,23 @@ impl World {
         names_cost(self.files.keys()) + names_cost(&self.explicit_dirs)
     }
 
+    /// The process-table entry the guest's `pid` names (#2353). A pid past `i32` names none: cut
+    /// down, it would name another process, the caller's own among them, whose `Proc` its op holds,
+    /// so locking that would deadlock the host.
+    fn proc_at(&self, pid: i64) -> Option<&ProcEntry> {
+        self.procs.get(&i32::try_from(pid).ok()?)
+    }
+
     /// `path`'s length, or 0 when it does not exist — the read half, which never stamps.
     fn file_len(&self, path: &str) -> usize {
         self.files.get(path).map_or(0, |f| f.bytes.len())
     }
+}
+
+/// The process group a negative pid names: `-pid` in `kill(-pgid)` and `waitpid(-pgid)` (#2353).
+/// A group is named by a pid, an `i32`, so a pid whose negation is past that names none.
+fn named_group(pid: i64) -> Option<i32> {
+    i32::try_from(pid.checked_neg()?).ok()
 }
 
 /// #863 slice 2 — a [`World::procs`] process-table entry.
@@ -1349,6 +1453,18 @@ struct Proc {
     /// frees stay separate (a fragmentation follow-up, POSIX.md §6); reuse of a same-or-larger block
     /// works regardless.
     free_list: Vec<(u64, u64)>,
+    /// #2373 — what this process's host-side tables cost ([`Proc::tables_cost`]), kept as they
+    /// change: a [`TABLE_ENTRY`] for each heap block `allocated` and `free_list` record and each
+    /// descriptor slot, its arguments (a [`TABLE_ENTRY`] and the bytes of each), its working
+    /// directory, the `getenv` copies it caches (a [`TABLE_ENTRY`] and the name of each), and an exec
+    /// staged on it.
+    held: u64,
+    /// #2373 — the room [`Proc::held`] is charged as, to the personality's payer. It grows by
+    /// doubling and shrinks below a quarter ([`HostCharge::grow_to`]), as a buffer's does, so most
+    /// changes never reach the budget tree. Past a ceiling a change is refused: a `malloc` or a
+    /// `getenv` answers `NULL`, a new descriptor slot `-EMFILE`, a `chdir` or an `execve` `-ENOMEM`,
+    /// and a fork `-EAGAIN`.
+    tables: HostCharge,
     /// The host-side fd **table** (indexed by fd) — per-process, POSIX: a fork copies the table, a
     /// child's `close`/`dup2` never disturbs its parent's numbering. Entries point at **shared**
     /// descriptions (an [`OpenFile`] `Arc`, a pipe buffer, a socket), so offsets and liveness are
@@ -1370,8 +1486,9 @@ struct Proc {
     cwd: String,
     /// The environment: `name → value` — per-process (POSIX fork copies it; a child's `setenv` is
     /// invisible to the parent). `getenv`/`setenv` read and update it; host-side, out of the guest's
-    /// reach, like the rest of the bookkeeping (POSIX.md §3).
-    env: HashMap<String, String>,
+    /// reach, like the rest of the bookkeeping (POSIX.md §3). #2345: shared with a fork twin until
+    /// either writes, and charged ([`Env`]).
+    env: Arc<Env>,
     /// Cache of `getenv` results already materialized into the window: `name → ptr`. C's `getenv`
     /// returns a stable `char*` into libc-owned storage, so a repeated `getenv("X")` must return the
     /// **same** pointer; we allocate a NUL-terminated copy in the arena once and reuse it. `setenv`
@@ -1624,6 +1741,10 @@ impl Posix {
         for d in p.dirs.iter_mut().flatten() {
             d.held.bind(payer);
         }
+        p.tables.bind(payer);
+        if let Some(env) = Arc::get_mut(&mut p.env) {
+            env.room.bind(payer);
+        }
     }
 
     /// The signal whose default action terminated this personality's root process, if one did
@@ -1769,9 +1890,17 @@ impl Posix {
     /// Seed (or overwrite) an environment variable — how an embedder/test stages the environment a
     /// guest `getenv`s. Invalidates any cached `getenv` pointer for the name.
     pub fn set_env(&self, name: &str, value: &str) {
+        let payer = self.world.lock().unwrap_or_else(|e| e.into_inner()).payer();
         let mut st = self.root.lock().unwrap_or_else(|e| e.into_inner());
-        st.env_ptrs.remove(name);
-        st.env.insert(name.to_string(), value.to_string());
+        st.uncache_env(name);
+        // The embedder's, charged past any ceiling (#2345).
+        Env::set(
+            &mut st.env,
+            payer,
+            true,
+            name.to_string(),
+            value.to_string(),
+        );
     }
 
     /// Pin the clock to a fixed `nanos` value (all `clock(_)` calls return it) — how a test makes
@@ -1795,15 +1924,18 @@ impl Posix {
     /// Set the working directory the program starts in — how an embedder/test stages where its
     /// relative paths resolve, the `cd` before a command. [`rooted`], as the file seeds are.
     pub fn set_cwd(&self, dir: &str) {
-        self.root.lock().unwrap_or_else(|e| e.into_inner()).cwd = rooted(dir);
+        let mut p = self.root.lock().unwrap_or_else(|e| e.into_inner());
+        p.cwd = rooted(dir);
+        p.recharge_tables();
     }
 
     /// Set the program's argument vector (`args[0]` is conventionally the program name) — how an
     /// embedder hands a personality program its `argv` (e.g. `["sh", "-c", "echo hi"]`), read back by
     /// the guest through the `argc`/`argv` ops.
     pub fn set_args(&self, args: &[&str]) {
-        self.root.lock().unwrap_or_else(|e| e.into_inner()).args =
-            args.iter().map(|s| s.to_string()).collect();
+        let mut p = self.root.lock().unwrap_or_else(|e| e.into_inner());
+        p.args = args.iter().map(|s| s.to_string()).collect();
+        p.recharge_tables();
     }
 
     /// Route fd-1 (`stdout`) writes to a **shared sink** instead of the personality's own buffer, so a
@@ -2479,6 +2611,7 @@ impl SignalSource for SignalDoor {
         p.pending_exec_image = None;
         let (blob, argv) = p.pending_exec.take()?;
         p.args = argv;
+        p.recharge_tables();
         Some(blob)
     }
 
@@ -2516,6 +2649,9 @@ impl SignalSource for SignalDoor {
         p.pending_exec = staged.pending_exec;
         p.pending_exec_image = staged.pending_exec_image;
         p.pending_exec_heap = staged.pending_exec_heap;
+        // #2373 — what the staged process held was charged to it, which hands it back as it goes:
+        // this one holds it from now on.
+        p.recharge_tables();
     }
 
     /// The pipe ends this process reaches: through its descriptors, and its terminal input end.
@@ -2748,7 +2884,12 @@ fn exec_remap_hook(proc_: Arc<Mutex<Proc>>) -> temen_interp::ExecRemapHook {
             p.allocated.clear();
             // The copies `getenv` handed out lived in that heap.
             p.env_ptrs.clear();
+            p.recharge_tables();
         }
+        // #2345 — the old image's handler frames are gone with it, so none can return to restore
+        // the mask it saved: an exec from inside a handler left its entry behind for good. The mask
+        // itself survives the exec, as POSIX keeps it.
+        p.handler_mask_stack.clear();
         // Every adopted pipe end re-points to its new handle — and so does the terminal input end
         // (#797 interactive rung 2), which rides the same exec carry as a PipeEnd binding, so an
         // exec'd child's `read(0)` still taps the terminal. Each token moves **once, from the
@@ -2796,17 +2937,20 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
                 .map(|(_, c)| Arc::clone(c))
             {
                 drop(w);
-                return ForkedProc {
-                    handler: handler(Arc::clone(&world), Arc::clone(&existing)),
+                return Some(ForkedProc {
+                    handler: ProcHandler::Sync(handler(Arc::clone(&world), Arc::clone(&existing))),
                     signal: None,
                     refork: Some(fork_factory(Arc::clone(&world), existing)),
                     exit: None,
                     exec_remap: None,
                     state: CapState::Uncaptured,
-                };
+                    abandon: None,
+                });
             }
         }
-        let mut child = proc_.lock().unwrap_or_else(|e| e.into_inner()).fork();
+        // #2373, #2428 — the twin's copies are charged before anything registers it: refused, the
+        // fork fails with nothing to undo here.
+        let mut child = proc_.lock().unwrap_or_else(|e| e.into_inner()).fork()?;
         // #799 — a non-zero pid IS the twin's scheduler TaskId: exactly the processes the core's
         // twin-completion wake covers, so exactly the ones blocking `waitpid` may bench on.
         child.core_task = pid != 0;
@@ -2863,8 +3007,18 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
                     .deliver_signal(SIGCHLD);
             }
         });
-        ForkedProc {
-            handler: handler(Arc::clone(&world), Arc::clone(&child)),
+        // #2373 — a fork refused after this mint (another provider had no room) never runs the
+        // twin: it leaves the table, as if never registered, rather than as a zombie to reap.
+        let abandon_world = Arc::clone(&world);
+        let abandon: Box<dyn FnOnce() + Send> = Box::new(move || {
+            let mut w = abandon_world.lock().unwrap_or_else(|e| e.into_inner());
+            w.procs.remove(&pid);
+            if w.last_fork_mint.as_ref().is_some_and(|(p, _)| *p == pid) {
+                w.last_fork_mint = None;
+            }
+        });
+        Some(ForkedProc {
+            handler: ProcHandler::Sync(handler(Arc::clone(&world), Arc::clone(&child))),
             signal: Some((
                 Arc::new(SignalDoor(Arc::clone(&child), Arc::clone(&world))),
                 armed,
@@ -2874,7 +3028,8 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
             exec_remap: Some(exec_remap_hook(child)),
             // A twin's process does not ride yet: the capture carries the root's (#1688).
             state: CapState::Uncaptured,
-        }
+            abandon: Some(abandon),
+        })
     })
 }
 
@@ -3032,7 +3187,7 @@ fn new_world(stdin: Vec<u8>) -> World {
 /// A fresh [`Proc`]: the window-heap arena bounded by `[heap_base, heap_end)`, the three stdio
 /// sentinels seeded in the fd table, default signal state.
 fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
-    Proc {
+    let mut p = Proc {
         pid: 1,  // the root process — init-like; fork twins get their TaskId stamped by the factory
         ppid: 0, // no recorded parent (#800 getppid)
         pgid: 1, // the root leads process group 1
@@ -3041,6 +3196,8 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         heap_end,
         allocated: HashMap::new(),
         free_list: Vec::new(),
+        held: 0,
+        tables: HostCharge::default(),
         fds: vec![
             Some(FdEntry::Stdin),
             Some(FdEntry::Stdout),
@@ -3049,7 +3206,7 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         dirs: Vec::new(),
         args: Vec::new(),
         cwd: "/".to_string(),
-        env: HashMap::new(),
+        env: Arc::default(),
         env_ptrs: HashMap::new(),
         sig_pending: 0,
         sig_handler: HashMap::new(),
@@ -3078,7 +3235,10 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         pending_spawn: None,
         core_task: false,
         term_in: None,
-    }
+    };
+    // Unbound until the personality is: what it holds is charged at its grant ([`Posix::bind`]).
+    p.recharge_tables();
+    p
 }
 
 /// Build the POSIX [`HostProc`] handler for one process: the shared [`World`] + this process's
@@ -3437,8 +3597,16 @@ impl Proc {
     /// copy equally), signal dispositions / mask / `sigaction` extras / the signal stack are copied,
     /// and **pending signals are cleared** (POSIX: a child starts with none). The twin gets a fresh
     /// `armed` flag (its door is its own) and no wake (each run installs its own).
-    fn fork(&self) -> Proc {
-        Proc {
+    ///
+    /// #2373, #2428 — the twin's copies of its tables and directory streams are charged to the
+    /// personality's payer as it is made: `None`, with nothing charged, when the payer has no room.
+    fn fork(&self) -> Option<Proc> {
+        let dirs = self
+            .dirs
+            .iter()
+            .map(|d| d.as_ref().map_or(Some(None), |d| d.copied().map(Some)))
+            .collect::<Option<Vec<_>>>()?;
+        let mut twin = Proc {
             pid: 0, // stamped by [`fork_factory`]: the twin's TaskId, or an allocated pid (re-grant)
             ppid: self.pid, // #800 getppid — the forking process is the parent
             pgid: self.pgid, // POSIX: a fork twin inherits its parent's process group
@@ -3447,6 +3615,8 @@ impl Proc {
             heap_end: self.heap_end,
             allocated: self.allocated.clone(),
             free_list: self.free_list.clone(),
+            held: 0,
+            tables: HostCharge::new(self.tables.payer().cloned()),
             fds: {
                 // #972 — entry-wise copy over shared descriptions, EXCEPT CorePipe tokens, which
                 // re-split per process: the twin's duplicated powerbox has its own end-counts, so
@@ -3467,10 +3637,10 @@ impl Proc {
                     })
                     .collect()
             },
-            dirs: self.dirs.clone(),
+            dirs,
             args: self.args.clone(),
             cwd: self.cwd.clone(),
-            env: self.env.clone(),
+            env: Arc::clone(&self.env), // shared until either writes (#2345)
             env_ptrs: self.env_ptrs.clone(),
             sig_pending: 0,
             sig_handler: self.sig_handler.clone(),
@@ -3501,8 +3671,79 @@ impl Proc {
             // #797 — the twin's own terminal token: same handle value (the twin's cloned
             // powerbox table keeps it valid), its own cell (an exec re-points per-process).
             term_in: self.term_in.as_ref().map(|t| CorePipeToken::new(t.get())),
+        };
+        twin.held = twin.tables_cost();
+        twin.tables.resize(twin.held).then_some(twin)
+    }
+
+    /// #2373 — what this process's tables cost the host ([`Proc::tables`]).
+    fn tables_cost(&self) -> u64 {
+        let entries = self.allocated.len() + self.free_list.len() + self.fds.len();
+        entries as u64 * TABLE_ENTRY
+            + args_cost(&self.args)
+            + staged_cost(self.pending_exec.as_ref())
+            + self.cwd.len() as u64
+            + names_cost(self.env_ptrs.keys())
+    }
+
+    /// #2373 — the tables hold `n` more: `false`, charging nothing, when the payer has no room.
+    fn grow_tables(&mut self, n: u64) -> bool {
+        let fits = self.tables.grow_to(self.held + n);
+        if fits {
+            self.held += n;
+        }
+        fits
+    }
+
+    /// #2373 — the tables hold `n` less.
+    fn shrink_tables(&mut self, n: u64) {
+        self.held -= n;
+        self.tables.shrink_to(self.held);
+    }
+
+    /// #2373 — part of the tables that cost `was` costs `now`: `false`, charging nothing, when it grew
+    /// and the payer has no room.
+    fn retable(&mut self, was: u64, now: u64) -> bool {
+        if now > was {
+            return self.grow_tables(now - was);
+        }
+        self.shrink_tables(was - now);
+        true
+    }
+
+    /// #2373 — move to `cwd`, its bytes charged first: `false`, unchanged, when the payer has no
+    /// room.
+    fn chdir(&mut self, cwd: String) -> bool {
+        let moved = self.retable(self.cwd.len() as u64, cwd.len() as u64);
+        if moved {
+            self.cwd = cwd;
+        }
+        moved
+    }
+
+    /// #2373 — drop the `getenv` copy of `name` cached here, handing its entry back.
+    fn uncache_env(&mut self, name: &str) {
+        if self.env_ptrs.remove(name).is_some() {
+            self.shrink_tables(TABLE_ENTRY + name.len() as u64);
         }
     }
+
+    /// #2373 — charge what the tables cost now, past any ceiling: after a change its embedder made or
+    /// its engine committed, or one that only shrank them.
+    fn recharge_tables(&mut self) {
+        self.held = self.tables_cost();
+        self.tables.force(self.held);
+    }
+}
+
+/// #2373 — what an argument vector costs the host: a [`TABLE_ENTRY`] and the bytes of each.
+fn args_cost(args: &[String]) -> u64 {
+    args.iter().map(|a| TABLE_ENTRY + a.len() as u64).sum()
+}
+
+/// #2373 — what an exec staged on a process costs the host: its packed arguments and its vector.
+fn staged_cost(staged: Option<&(Vec<u8>, Vec<String>)>) -> u64 {
+    staged.map_or(0, |(blob, argv)| blob.len() as u64 + args_cost(argv))
 }
 
 impl Ctx<'_> {
@@ -3740,7 +3981,7 @@ impl Ctx<'_> {
         if !exists && flags & O_CREAT == 0 {
             return Ok(vec![ENOENT]);
         }
-        if self.free_fd(0).is_none() {
+        if !self.fd_room() {
             return Ok(vec![EMFILE]); // before the open creates or truncates anything
         }
         // Creating a file and truncating one are both writes, and only those two: opening an
@@ -4011,8 +4252,8 @@ impl Ctx<'_> {
         }
         let dup = entry.dup_clone();
         let n = newfd as usize;
-        if self.p.fds.len() <= n {
-            self.p.fds.resize_with(n + 1, || None);
+        if !self.fd_slots(n) {
+            return EMFILE;
         }
         self.p.fds[n] = Some(dup);
         newfd
@@ -4070,6 +4311,7 @@ impl Ctx<'_> {
         // The zombie carries the `ppid` it exited with; a wildcard/`-pgid` reap that ignored it would let
         // a bash pipeline stage steal the reap the shell is blocked waiting for (the `echo | cat` wedge).
         let self_pid = self.p.pid;
+        let group = named_group(pid);
         let reaped = if pid == -1 {
             self.w
                 .procs
@@ -4082,16 +4324,15 @@ impl Ctx<'_> {
             // #799 — `waitpid(-pgid)`: group-reap the lowest OWN zombie whose pgid (retained on the
             // zombie entry) matches. Non-blocking like `-1` — the park door benches only
             // specific-pid waits this rung.
-            let g = (-pid) as i32;
             self.w
                 .procs
                 .iter()
                 .filter_map(|(p, e)| {
-                    matches!(e, ProcEntry::Zombie { pgid, ppid, .. } if *pgid == g && *ppid == self_pid)
+                    matches!(e, ProcEntry::Zombie { pgid, ppid, .. } if group == Some(*pgid) && *ppid == self_pid)
                         .then_some(*p)
                 })
                 .min()
-        } else if is_zombie(self.w.procs.get(&(pid as i32))) {
+        } else if is_zombie(self.w.proc_at(pid)) {
             Some(pid as i32)
         } else {
             None
@@ -4114,11 +4355,8 @@ impl Ctx<'_> {
                 if pid > 0 && pid != tpid as i64 {
                     continue;
                 }
-                if pid < -1 {
-                    let g = (-pid) as i32;
-                    if t.lock().unwrap_or_else(|e| e.into_inner()).pgid != g {
-                        continue;
-                    }
+                if pid < -1 && group != Some(t.lock().unwrap_or_else(|e| e.into_inner()).pgid) {
+                    continue;
                 }
                 let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
                 if (opts & WUNTRACED) != 0 && tp.stop_fresh {
@@ -4154,7 +4392,7 @@ impl Ctx<'_> {
                     tp.ppid == self_pid
                         && (pid == -1
                             || (pid > 0 && tpid as i64 == pid)
-                            || (pid < -1 && tp.pgid == (-pid) as i32))
+                            || (pid < -1 && group == Some(tp.pgid)))
                 });
                 if running {
                     return Ok(vec![0]);
@@ -4175,8 +4413,9 @@ impl Ctx<'_> {
             // STOP (the `Blocked::Stopped` insert drain), and the re-executed op reports.
             if (opts & WNOHANG) == 0 {
                 if let Some(req) = self.p.park_req.clone() {
+                    // A process is never its own child, and its `Proc` is the one this op holds.
                     let target: Option<temen_interp::ParkEvent> = if pid > 0 {
-                        match self.w.procs.get(&(pid as i32)) {
+                        match self.w.proc_at(pid).filter(|_| pid != self.p.pid as i64) {
                             Some(ProcEntry::Live(t)) => t
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
@@ -4272,7 +4511,8 @@ impl Ctx<'_> {
             return EINVAL;
         }
         if pid < 0 {
-            return self.kill_pgroup((-pid) as i32, sig); // kill(-pgid): the group sweep (#798)
+            // kill(-pgid): the group sweep (#798).
+            return named_group(pid).map_or(ESRCH, |g| self.kill_pgroup(g, sig));
         }
         // Self — pid 0 (the pre-table calling convention) or the caller's own pid. Never a table
         // lock: the caller's own `Proc` is already held by this dispatch.
@@ -4294,7 +4534,7 @@ impl Ctx<'_> {
             return 0;
         }
         // #863 slice 2 — any other pid is a process-table lookup.
-        let transitioned: Option<i32> = match self.w.procs.get(&(pid as i32)) {
+        let transitioned: Option<i32> = match self.w.proc_at(pid) {
             Some(ProcEntry::Live(t)) => {
                 // Not self (guarded above), so this is a different mutex — World → Proc, the
                 // canonical order, serialized against other multi-`Proc` paths by the world lock.
@@ -4384,18 +4624,19 @@ impl Ctx<'_> {
     /// a live table process. `-EINVAL` on a negative `pgid`, `-ESRCH` on an unknown/zombie pid.
     fn setpgid(&mut self, args: &[i64]) -> i64 {
         let pid = *args.first().unwrap_or(&0);
-        let pgid = *args.get(1).unwrap_or(&0);
+        // A group is named by a pid, an `i32`: one past that is as invalid as a negative one.
+        let pgid = i32::try_from(*args.get(1).unwrap_or(&0)).unwrap_or(-1);
         if pgid < 0 || pid < 0 {
             return EINVAL;
         }
         if pid == 0 || pid == self.p.pid as i64 {
-            self.p.pgid = if pgid == 0 { self.p.pid } else { pgid as i32 };
+            self.p.pgid = if pgid == 0 { self.p.pid } else { pgid };
             return 0;
         }
-        match self.w.procs.get(&(pid as i32)) {
+        match self.w.proc_at(pid) {
             Some(ProcEntry::Live(t)) => {
                 let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
-                tp.pgid = if pgid == 0 { tp.pid } else { pgid as i32 };
+                tp.pgid = if pgid == 0 { tp.pid } else { pgid };
                 0
             }
             _ => ESRCH,
@@ -4408,7 +4649,7 @@ impl Ctx<'_> {
         if pid == 0 || pid == self.p.pid as i64 {
             return self.p.pgid as i64;
         }
-        match self.w.procs.get(&(pid as i32)) {
+        match self.w.proc_at(pid) {
             Some(ProcEntry::Live(t)) => t.lock().unwrap_or_else(|e| e.into_inner()).pgid as i64,
             _ => ESRCH,
         }
@@ -4465,6 +4706,10 @@ impl Ctx<'_> {
     /// return the no-door placeholder; see [`OP_FORK`] for the full contract. Policy lives in the
     /// fork factory (table registration, inherited signal state/pgid/`ppid`) — this op only asks.
     fn fork_request(&mut self) -> i64 {
+        // #2345 — the twin's entry would pass the table's bound, which zombies hold until reaped.
+        if self.w.procs.len() >= PID_MAX {
+            return EAGAIN;
+        }
         if let Some(req) = self.p.park_req.clone() {
             req(temen_interp::ParkEvent::ForkSelf);
         }
@@ -5026,7 +5271,7 @@ impl Ctx<'_> {
             Some(_) => return Ok(vec![ENOTSOCK]),
             None => return Ok(vec![EBADF]),
         };
-        if self.free_fd(0).is_none() {
+        if !self.fd_room() {
             return Ok(vec![EMFILE]); // the connection stays queued, as Linux leaves it
         }
         let Some(sock) = q.lock().unwrap_or_else(|e| e.into_inner()).pop_front() else {
@@ -5551,7 +5796,13 @@ impl Ctx<'_> {
         // #1768 — both are STAGED, not applied: the engine collects them when it commits the
         // image-replace ([`SignalDoor::exec_commit`]), so an exec the engine refuses leaves the
         // caller's args region and argv exactly as they were.
-        self.p.pending_exec = Some((blob, lossy_strings(&argv)));
+        // #2373 — what is staged is charged as it is staged: `-ENOMEM` when the payer has no room.
+        let staged = Some((blob, lossy_strings(&argv)));
+        let was = staged_cost(self.p.pending_exec.as_ref());
+        if !self.p.retable(was, staged_cost(staged.as_ref())) {
+            return Err(ENOMEM);
+        }
+        self.p.pending_exec = staged;
         Ok(Staged::Image(match target {
             ExecTarget::Command(h) => temen_interp::ExecCmd::Granted(h),
             ExecTarget::Image(bytes) => {
@@ -5574,6 +5825,10 @@ impl Ctx<'_> {
         let Some(req) = self.p.park_req.clone() else {
             return Ok(vec![ENOSYS]);
         };
+        // #2345 — as `fork`: no room in the table for the new process's entry.
+        if self.w.procs.len() >= PID_MAX {
+            return Ok(vec![EAGAIN]);
+        }
         let at = *args.first().ok_or(Trap::Malformed)? as u64;
         let Some(&[path_ptr, argv_ptr, envp_ptr, acts_ptr, nacts]) =
             read_guest_words(mem, at, 5).as_deref()
@@ -5590,7 +5845,9 @@ impl Ctx<'_> {
             Ok(p) => p,
             Err(e) => return Ok(vec![e]),
         };
-        let mut child = self.p.fork();
+        let Some(mut child) = self.p.fork() else {
+            return Ok(vec![EAGAIN]);
+        };
         let mut cx = Ctx {
             w: &mut *self.w,
             p: &mut child,
@@ -5609,7 +5866,12 @@ impl Ctx<'_> {
                     }
                 }
                 PSPAWN_CHDIR => match read_guest_path(mem, a[3]) {
-                    Ok(dir) => cx.p.cwd = cx.join_cwd(&dir),
+                    Ok(dir) => {
+                        let cwd = cx.join_cwd(&dir);
+                        if !cx.p.chdir(cwd) {
+                            return Ok(vec![ENOMEM]);
+                        }
+                    }
                     Err(e) => return Ok(vec![e]),
                 },
                 _ => return Ok(vec![EINVAL]),
@@ -5700,11 +5962,30 @@ impl Ctx<'_> {
         let Some(i) = self.free_fd(min) else {
             return EMFILE;
         };
-        if self.p.fds.len() <= i {
-            self.p.fds.resize_with(i + 1, || None);
+        if !self.fd_slots(i) {
+            return EMFILE;
         }
         self.p.fds[i] = Some(entry);
         i as i64
+    }
+
+    /// #2373 — make the descriptor table reach slot `i`, charging each slot it adds: `false`, adding
+    /// none, when the payer has no room.
+    fn fd_slots(&mut self, i: usize) -> bool {
+        let more = (i + 1).saturating_sub(self.p.fds.len()) as u64;
+        if more > 0 && !self.p.grow_tables(more * TABLE_ENTRY) {
+            return false;
+        }
+        if self.p.fds.len() <= i {
+            self.p.fds.resize_with(i + 1, || None);
+        }
+        true
+    }
+
+    /// Whether a descriptor is free for an op that makes something before it takes one: #2373 — its
+    /// slot charged first, so a refusal comes before the op has made anything.
+    fn fd_room(&mut self) -> bool {
+        self.free_fd(0).is_some_and(|i| self.fd_slots(i))
     }
 
     /// The lowest free fd `>= min` below [`FD_MAX`], if there is one (#2306).
@@ -5766,21 +6047,33 @@ impl Ctx<'_> {
             .div_ceil(ALIGN)
             * ALIGN;
         // First-fit over the free list: reuse the first block that fits, splitting off any remainder.
+        // #2373 — a split adds a record, charged first: `NULL` when the payer has no room for it.
         if let Some(i) = self.p.free_list.iter().position(|&(_, sz)| sz >= want) {
-            let (off, sz) = self.p.free_list.swap_remove(i);
+            let (off, sz) = self.p.free_list[i];
+            if sz > want && !self.p.grow_tables(TABLE_ENTRY) {
+                return 0;
+            }
+            self.p.free_list.swap_remove(i);
             if sz > want {
                 self.p.free_list.push((off + want, sz - want));
             }
             self.p.allocated.insert(off, want);
             return off as i64;
         }
-        // Bump a fresh block from the high-water mark and record it as a live allocation.
+        // Bump a fresh block from the high-water mark and record it as a live allocation, its record
+        // charged first (#2373).
+        if !self.p.grow_tables(TABLE_ENTRY) {
+            return 0;
+        }
         match self.arena_bump(want) {
             Some(ptr) => {
                 self.p.allocated.insert(ptr, want);
                 ptr as i64
             }
-            None => 0, // out of heap → NULL
+            None => {
+                self.p.shrink_tables(TABLE_ENTRY);
+                0 // out of heap → NULL
+            }
         }
     }
 
@@ -5829,8 +6122,8 @@ impl Ctx<'_> {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
-        self.p.cwd = self.join_cwd(&path);
-        Ok(vec![0])
+        let cwd = self.join_cwd(&path);
+        Ok(vec![if self.p.chdir(cwd) { 0 } else { ENOMEM }])
     }
 
     /// `getenv(name, len) -> ptr | 0`: look up an environment variable and return a **stable** window
@@ -5849,15 +6142,25 @@ impl Ctx<'_> {
         if let Some(&cached) = self.p.env_ptrs.get(&name) {
             return Ok(vec![cached as i64]);
         }
-        let Some(value) = self.p.env.get(&name).cloned() else {
+        let Some(value) = self.p.env.vars.get(&name).cloned() else {
             return Ok(vec![0]); // unset → NULL
         };
         let mut vb = value.into_bytes();
         vb.push(0); // NUL terminator
+                    // #2373 — the cache's entry is charged first: with no room for it the copy is not made, as
+                    // with no room in the arena.
+        let entry = TABLE_ENTRY + name.len() as u64;
+        if !self.p.grow_tables(entry) {
+            return Ok(vec![0]);
+        }
         let Some(dst) = self.arena_bump(vb.len() as u64) else {
+            self.p.shrink_tables(entry);
             return Ok(vec![0]); // no room → behave as if unset (best effort)
         };
-        mem.write_bytes(dst, &vb).ok_or(Trap::Malformed)?;
+        if mem.write_bytes(dst, &vb).is_none() {
+            self.p.shrink_tables(entry);
+            return Err(Trap::Malformed);
+        }
         self.p.env_ptrs.insert(name, dst);
         Ok(vec![dst as i64])
     }
@@ -5879,11 +6182,13 @@ impl Ctx<'_> {
         let (Ok(name), Ok(value)) = (String::from_utf8(nb), String::from_utf8(vb)) else {
             return Ok(vec![EINVAL]);
         };
-        if overwrite == 0 && self.p.env.contains_key(&name) {
+        if overwrite == 0 && self.p.env.vars.contains_key(&name) {
             return Ok(vec![0]); // keep the existing value
         }
-        self.p.env_ptrs.remove(&name); // stale cached pointer no longer reflects the value
-        self.p.env.insert(name, value);
+        if !Env::set(&mut self.p.env, self.w.payer(), false, name.clone(), value) {
+            return Ok(vec![ENOMEM]); // #2345: no room for it
+        }
+        self.p.uncache_env(&name); // stale cached pointer no longer reflects the value
         Ok(vec![0])
     }
 
@@ -5901,7 +6206,7 @@ impl Ctx<'_> {
         let Ok(name) = String::from_utf8(nb) else {
             return Ok(vec![-1]);
         };
-        let Some(value) = self.p.env.get(&name) else {
+        let Some(value) = self.p.env.vars.get(&name) else {
             return Ok(vec![-1]); // unset
         };
         let vb = value.as_bytes();
@@ -5920,8 +6225,10 @@ impl Ctx<'_> {
         let Ok(name) = String::from_utf8(nb) else {
             return Ok(vec![EINVAL]);
         };
-        self.p.env_ptrs.remove(&name);
-        self.p.env.remove(&name);
+        if !Env::remove(&mut self.p.env, self.w.payer(), &name) {
+            return Ok(vec![ENOMEM]); // #2345: a shared environment's copy has no room
+        }
+        self.p.uncache_env(&name);
         Ok(vec![0])
     }
 
@@ -5936,12 +6243,12 @@ impl Ctx<'_> {
         if index < 0 {
             return Ok(vec![-1]);
         }
-        let mut keys: Vec<&String> = self.p.env.keys().collect();
+        let mut keys: Vec<&String> = self.p.env.vars.keys().collect();
         keys.sort();
         let Some(key) = keys.get(index as usize) else {
             return Ok(vec![-1]); // past the end
         };
-        let entry = format!("{key}={}", self.p.env[*key]).into_bytes();
+        let entry = format!("{key}={}", self.p.env.vars[*key]).into_bytes();
         if buf != 0 && (entry.len() as u64) <= cap {
             mem.write_bytes(buf, &entry).ok_or(Trap::Malformed)?;
         }
@@ -6001,6 +6308,7 @@ impl Ctx<'_> {
                 let (o, s) = self.p.free_list.swap_remove(i);
                 off = off.min(o);
                 sz += s;
+                self.p.shrink_tables(TABLE_ENTRY); // #2373 — the merged record goes back
             }
             self.p.free_list.push((off, sz));
         }
@@ -6013,6 +6321,14 @@ mod tests {
     use temen_interp::{run_capture_reserved_with_host, Host, Value};
     use temen_jit::{compile_and_run_capture_reserved_with_host, JitOutcome};
     use temen_text::parse_module;
+
+    /// A forked process's handler, which this personality always mints synchronous.
+    fn sync(h: &mut ProcHandler) -> &mut HostProc {
+        match h {
+            ProcHandler::Sync(f) => f,
+            ProcHandler::Offloadable(_) => panic!("posix mints a synchronous handler"),
+        }
+    }
 
     /// Lock the personality's world + root proc (canonical order — see [`World`]) and build the
     /// [`Ctx`] dispatch view a test drives op methods through, as [`handler`] does.
@@ -6066,8 +6382,8 @@ mod tests {
         // nim lane did exactly that: one for the imports, one for the run driver's own entry). The
         // memo is personality-wide (`World::last_fork_mint`) precisely so this case dedupes; a
         // per-closure memo would not, and the cross-call-form parity table catches that.
-        let mut first = cap_fork_factory(&posix)(7);
-        let mut second = cap_fork_factory(&posix)(7);
+        let mut first = cap_fork_factory(&posix)(7).expect("the twin fits");
+        let mut second = cap_fork_factory(&posix)(7).expect("the twin fits");
         // The per-process extras are installed exactly once — a second door would be the one the
         // core wires the park cell onto, and a second exit hook would retire the pid twice.
         assert!(
@@ -6096,12 +6412,12 @@ mod tests {
         win[0..4].copy_from_slice(b"/sub");
         let mut mem = temen_interp::WindowMem::new(&mut win, 256);
         assert_eq!(
-            (first.handler)(OP_CHDIR, &[0, 4], Some(&mut mem), None).unwrap()[0],
+            sync(&mut first.handler)(OP_CHDIR, &[0, 4], Some(&mut mem), None).unwrap()[0],
             0,
             "chdir through the first entry"
         );
         assert!(
-            (second.handler)(OP_GETCWD, &[64, 64], Some(&mut mem), None).unwrap()[0] > 0,
+            sync(&mut second.handler)(OP_GETCWD, &[64, 64], Some(&mut mem), None).unwrap()[0] > 0,
             "getcwd through the second entry"
         );
         let got = &win[64..][..win[64..].iter().position(|&b| b == 0).unwrap_or(0)];
@@ -6136,12 +6452,12 @@ mod tests {
             fd
         };
         p.cwd = "/parent".to_string();
-        p.env.insert("K".to_string(), "v".to_string());
+        Env::set(&mut p.env, None, true, "K".into(), "v".into());
         p.sig_handler.insert(2, 0x1234);
         p.sig_pending = 1 << 2;
         p.sig_mask = 1 << 10;
 
-        let mut twin = p.fork();
+        let mut twin = p.fork().expect("an unbound process forks");
         assert_eq!(
             twin.sig_pending, 0,
             "POSIX: a fork twin starts with no pending signals"
@@ -6159,13 +6475,13 @@ mod tests {
 
         // cwd/env are copies: the twin's mutations never reach the parent.
         twin.cwd = "/child".to_string();
-        twin.env.insert("K".to_string(), "child".to_string());
+        Env::set(&mut twin.env, None, true, "K".into(), "child".into());
         assert_eq!(
             p.cwd, "/parent",
             "a subshell's chdir must not move its parent"
         );
         assert_eq!(
-            p.env["K"], "v",
+            p.env.vars["K"], "v",
             "a child's setenv is invisible to the parent"
         );
 
@@ -6245,10 +6561,10 @@ mod tests {
     fn kill_targets_a_fork_twin_through_the_process_table() {
         let mut host = Host::new();
         let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
-        let mut forked = cap_fork_factory(&posix)(7);
+        let mut forked = cap_fork_factory(&posix)(7).expect("the twin fits");
         // The twin installs a handler for signal 10 through its own dispatch.
         assert_eq!(
-            (forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
             vec![0]
         );
         {
@@ -6267,7 +6583,7 @@ mod tests {
             );
         }
         assert_eq!(
-            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
             vec![0x77],
             "the twin's own sigcheck delivers the pid-targeted signal"
         );
@@ -6286,24 +6602,24 @@ mod tests {
             vec![1],
             "the root is pid 1"
         );
-        let mut forked = cap_fork_factory(&posix)(9);
+        let mut forked = cap_fork_factory(&posix)(9).expect("the twin fits");
         assert_eq!(
-            (forked.handler)(OP_GETPID, &[], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_GETPID, &[], None, None).unwrap(),
             vec![9],
             "a twin's getpid is the pid fork() returned to its parent"
         );
         // Self-kill by own pid: handler + raise + sigcheck, all through the twin's dispatch.
         assert_eq!(
-            (forked.handler)(OP_SIGNAL, &[12, 0x99], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGNAL, &[12, 0x99], None, None).unwrap(),
             vec![0]
         );
         assert_eq!(
-            (forked.handler)(OP_KILL, &[9, 12], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_KILL, &[9, 12], None, None).unwrap(),
             vec![0],
             "kill(own pid) short-circuits to self — no deadlock on the table entry"
         );
         assert_eq!(
-            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
             vec![0x99]
         );
     }
@@ -6320,7 +6636,7 @@ mod tests {
         let (door, _armed) = cap_signal_source(&posix);
         door.set_park_request(Arc::new(|_| {}));
         // A twin squatting on pid 1000 — exactly where the allocator starts.
-        let _forked = cap_fork_factory(&posix)(1000);
+        let _forked = cap_fork_factory(&posix)(1000).expect("the twin fits");
         let mut win = vec![0u8; 256];
         win[64..74].copy_from_slice(b"/bin/prog\0");
         win[128..136].copy_from_slice(&64u64.to_le_bytes()); // {path, argv, envp, actions, 0}
@@ -6352,14 +6668,14 @@ mod tests {
         let mut host = Host::new();
         let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
         let mut root_handler = handler(Arc::clone(&posix.world), Arc::clone(&posix.root));
-        let mut forked = cap_fork_factory(&posix)(7);
+        let mut forked = cap_fork_factory(&posix)(7).expect("the twin fits");
         // Deliverability on the twin: caught handler + registered signal stack.
         assert_eq!(
-            (forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
             vec![0]
         );
         assert_eq!(
-            (forked.handler)(OP_SIGALTSTACK, &[0x500, 0x100], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGALTSTACK, &[0x500, 0x100], None, None).unwrap(),
             vec![0]
         );
         let (door, _armed) = forked.signal.as_ref().expect("the twin has its own door");
@@ -6403,7 +6719,7 @@ mod tests {
     fn a_twins_exit_hook_makes_it_reapable_by_waitpid() {
         let mut host = Host::new();
         let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
-        let forked = cap_fork_factory(&posix)(7);
+        let forked = cap_fork_factory(&posix)(7).expect("the twin fits");
         let mut win = vec![0u8; 256];
         let mut mem = temen_interp::WindowMem::new(&mut win, 256);
         {
@@ -6448,8 +6764,8 @@ mod tests {
         let mut host = Host::new();
         let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
         // Twins 7 and 8; 8 forks 9 AFTER being moved into group 5 — 9 must inherit 5.
-        let mut t7 = cap_fork_factory(&posix)(7);
-        let f8 = cap_fork_factory(&posix)(8);
+        let mut t7 = cap_fork_factory(&posix)(7).expect("the twin fits");
+        let f8 = cap_fork_factory(&posix)(8).expect("the twin fits");
         {
             ctx!(posix, w_g, p_g, st);
             assert_eq!(st.getpgid(&[0]), 1, "the root leads group 1");
@@ -6460,7 +6776,7 @@ mod tests {
             assert_eq!(st.setpgid(&[99, 5]), ESRCH, "unknown pid");
         }
         // Twin 8 forks twin 9: the child inherits group 5 (POSIX), not the root's 1.
-        let _t9 = (f8.refork.expect("self-replicating factory"))(9);
+        let _t9 = (f8.refork.expect("self-replicating factory"))(9).expect("the twin fits");
         {
             ctx!(posix, w_g, p_g, st);
             assert_eq!(
@@ -6472,7 +6788,7 @@ mod tests {
             // (Install handlers through the table procs directly — unit-level.)
         }
         assert_eq!(
-            (t7.handler)(OP_SIGNAL, &[10, 0x71], None, None).unwrap(),
+            sync(&mut t7.handler)(OP_SIGNAL, &[10, 0x71], None, None).unwrap(),
             vec![0]
         );
         {
@@ -6485,7 +6801,7 @@ mod tests {
             assert_eq!(st.kill(&[-77, 10]), ESRCH, "an empty group");
         }
         assert_eq!(
-            (t7.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            sync(&mut t7.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
             vec![0x71],
             "group member 7's own doorbell rang"
         );
@@ -6500,7 +6816,7 @@ mod tests {
     fn the_proto_terminal_foreground_group_gates_with_ttou_ttin_doorbells() {
         let mut host = Host::new();
         let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, b"input".to_vec());
-        let _twin = cap_fork_factory(&posix)(7); // occupies group 1 alongside the root
+        let _twin = cap_fork_factory(&posix)(7).expect("the twin fits"); // occupies group 1 alongside the root
         let mut win = vec![0u8; 256];
         win[0..2].copy_from_slice(b"/f");
         let mut mem = temen_interp::WindowMem::new(&mut win, 256);
@@ -6621,7 +6937,7 @@ mod tests {
         let mut host = Host::new();
         let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
         let mut root_handler = handler(Arc::clone(&posix.world), Arc::clone(&posix.root));
-        let mut forked = cap_fork_factory(&posix)(7);
+        let mut forked = cap_fork_factory(&posix)(7).expect("the twin fits");
         let kills = Arc::new(AtomicI32::new(0));
         let k2 = Arc::clone(&kills);
         let (door, _armed) = forked.signal.as_ref().expect("the twin has a door");
@@ -6638,7 +6954,7 @@ mod tests {
         );
         // SIG_IGN'd SIGUSR2 (12): discarded at generation — a reset to SIG_DFL finds nothing.
         assert_eq!(
-            (forked.handler)(OP_SIGNAL, &[12, SIG_IGN], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGNAL, &[12, SIG_IGN], None, None).unwrap(),
             vec![SIG_DFL]
         );
         assert_eq!(
@@ -6646,7 +6962,7 @@ mod tests {
             vec![0]
         );
         assert_eq!(
-            (forked.handler)(OP_SIGNAL, &[12, SIG_DFL], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGNAL, &[12, SIG_DFL], None, None).unwrap(),
             vec![SIG_IGN]
         );
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -6659,7 +6975,8 @@ mod tests {
         // Masked SIGTERM (15): held pending; the unblock runs the default action.
         mem.write_bytes(64, &(1u64 << 15).to_le_bytes()).unwrap();
         assert_eq!(
-            (forked.handler)(OP_SIGPROCMASK, &[SIG_BLOCK, 64, 0], Some(&mut mem), None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGPROCMASK, &[SIG_BLOCK, 64, 0], Some(&mut mem), None)
+                .unwrap(),
             vec![0]
         );
         assert_eq!(
@@ -6673,7 +6990,8 @@ mod tests {
             "a masked fatal signal is held"
         );
         assert_eq!(
-            (forked.handler)(OP_SIGPROCMASK, &[SIG_UNBLOCK, 64, 0], Some(&mut mem), None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGPROCMASK, &[SIG_UNBLOCK, 64, 0], Some(&mut mem), None)
+                .unwrap(),
             vec![0]
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -6694,7 +7012,7 @@ mod tests {
         assert_eq!((status >> 8) & 0xff, 0, "not an exit-code encode");
 
         // A second twin: a stop holds SIGTERM; SIGCONT's fire is the death, not the continue.
-        let forked2 = cap_fork_factory(&posix)(8);
+        let forked2 = cap_fork_factory(&posix)(8).expect("the twin fits");
         let kills2 = Arc::new(AtomicI32::new(0));
         let stops2 = Arc::new(AtomicI32::new(0));
         let (door2, _armed2) = forked2.signal.as_ref().expect("door");
@@ -6744,7 +7062,7 @@ mod tests {
         );
 
         // A third twin: SIGKILL cuts straight through a stop.
-        let mut forked3 = cap_fork_factory(&posix)(9);
+        let mut forked3 = cap_fork_factory(&posix)(9).expect("the twin fits");
         let kills3 = Arc::new(AtomicI32::new(0));
         let (door3, _armed3) = forked3.signal.as_ref().expect("door");
         let k = Arc::clone(&kills3);
@@ -6770,12 +7088,12 @@ mod tests {
 
         // SIGKILL/SIGSTOP dispositions are immutable.
         assert_eq!(
-            (forked3.handler)(OP_SIGNAL, &[SIGKILL as i64, 0x77], None, None).unwrap(),
+            sync(&mut forked3.handler)(OP_SIGNAL, &[SIGKILL as i64, 0x77], None, None).unwrap(),
             vec![EINVAL]
         );
         mem.write_bytes(128, &[0u8; 24]).unwrap();
         assert_eq!(
-            (forked3.handler)(
+            sync(&mut forked3.handler)(
                 OP_SIGACTION,
                 &[SIGSTOP as i64, 128, 0],
                 Some(&mut mem),
@@ -6785,7 +7103,7 @@ mod tests {
             vec![EINVAL]
         );
         assert_eq!(
-            (forked3.handler)(
+            sync(&mut forked3.handler)(
                 OP_SIGACTION,
                 &[SIGKILL as i64, 0, 128],
                 Some(&mut mem),
@@ -6808,7 +7126,7 @@ mod tests {
         let mut host = Host::new();
         let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
         let mut root_handler = handler(Arc::clone(&posix.world), Arc::clone(&posix.root));
-        let mut forked = cap_fork_factory(&posix)(7);
+        let mut forked = cap_fork_factory(&posix)(7).expect("the twin fits");
         // A mock core stop closure on the twin's door: records the last direction.
         let dir = Arc::new(AtomicI32::new(0));
         let d2 = Arc::clone(&dir);
@@ -6849,7 +7167,7 @@ mod tests {
         );
         // While stopped: an ordinary signal is HELD — the twin's sigcheck stays empty.
         assert_eq!(
-            (forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
             vec![0]
         );
         assert_eq!(
@@ -6857,7 +7175,7 @@ mod tests {
             vec![0]
         );
         assert_eq!(
-            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
             vec![0],
             "a stopped process delivers nothing"
         );
@@ -6884,13 +7202,13 @@ mod tests {
             "report-once"
         );
         assert_eq!(
-            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
             vec![0x77],
             "the held signal delivers after the continue"
         );
         // A CAUGHT SIGTSTP never stops: ordinary pending.
         assert_eq!(
-            (forked.handler)(OP_SIGNAL, &[SIGTSTP as i64, 0x99], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGNAL, &[SIGTSTP as i64, 0x99], None, None).unwrap(),
             vec![0]
         );
         dir.store(0, Ordering::SeqCst);
@@ -6899,7 +7217,7 @@ mod tests {
             vec![0]
         );
         assert_eq!(
-            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
             vec![0x99],
             "caught TSTP takes the pending path"
         );
@@ -7678,7 +7996,8 @@ block 0 (vph: i32) {\n\
 
         // The engine mints the process (the fork factory, as `Host::fork_powerbox` runs it) and
         // commits the plan to it.
-        let forked = fork_factory(Arc::clone(&posix.world), Arc::clone(&posix.root))(7);
+        let forked = fork_factory(Arc::clone(&posix.world), Arc::clone(&posix.root))(7)
+            .expect("the twin fits");
         let (child, _) = forked.signal.expect("the child's door");
         child.spawn_commit(plan);
         assert_eq!(
@@ -8183,7 +8502,7 @@ block 0 (vph: i32) {\n\
         win[9] = b'2';
         let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
         // setenv("K", "v1", overwrite=1): name@0 len 1, value staged separately — reuse offset 8 with "v1".
-        st.p.env.insert("K".to_string(), "v1".to_string());
+        Env::set(&mut st.p.env, None, true, "K".into(), "v1".into());
         // getenv("K") materializes "v1\0" and caches the pointer.
         let p1 = st.getenv(&[0, 1], Some(&mut mem)).unwrap()[0];
         assert!(p1 > 0, "getenv returns a non-null arena pointer");
@@ -8199,7 +8518,7 @@ block 0 (vph: i32) {\n\
         let r0 = st.setenv(&[0, 1, 8, 2, 0], Some(&mut mem)).unwrap()[0];
         assert_eq!(r0, 0, "setenv(overwrite=0) on existing name returns 0");
         assert_eq!(
-            st.p.env.get("K").map(String::as_str),
+            st.p.env.vars.get("K").map(String::as_str),
             Some("v2"),
             "overwrite=0 kept the existing value"
         );
@@ -9001,6 +9320,236 @@ block 0 () {\n\
     /// #2306 — a process's descriptors stay below [`FD_MAX`]: a `dup2` or `F_DUPFD` past it is
     /// refused, so a guest's fd number never sizes the host's table, and an op that needs a
     /// descriptor when none is left is `-EMFILE`, having made nothing (a pipe both ends or none).
+    /// #2345 — what a process keeps for its guest is bounded. Its environment is charged to the
+    /// personality's payer (`-ENOMEM` past the ceiling), shared with a fork twin until either writes
+    /// (a fork copies nothing; the writer's copy is charged then). The process table holds `PID_MAX`,
+    /// live and unreaped together (`-EAGAIN` for a `fork` past it), and an exec drops the mask entries
+    /// of handlers that will never return.
+    #[test]
+    fn a_processes_tables_are_bounded() {
+        let (posix, host) = bound(64 << 10);
+        let mut win = vec![b'v'; 64 << 10];
+        win[..4].copy_from_slice(b"NAME");
+        win[8..12].copy_from_slice(b"NAM2");
+        let mut mem = temen_interp::WindowMem::new(&mut win, 64 << 10);
+        {
+            ctx!(posix, w_g, p_g, st);
+            let mut set = |st: &mut Ctx, name: i64, len: i64| {
+                st.setenv(&[name, 4, 64, len, 1], Some(&mut mem)).unwrap()[0]
+            };
+            assert_eq!(set(&mut st, 0, 20 << 10), 0, "a variable that fits");
+            let held = host.channel_used();
+            assert!(
+                held >= (20 << 10) + TABLE_ENTRY as i64,
+                "is charged: {held}"
+            );
+            assert_eq!(set(&mut st, 8, 50 << 10), ENOMEM, "one past the ceiling");
+            assert_eq!(host.channel_used(), held, "charges nothing");
+            // A fork shares the environment; the twin's write copies it, and the copy is charged.
+            let mut twin = st.p.fork().expect("the twin fits");
+            assert_eq!(
+                host.channel_used(),
+                held + twin.tables.bytes() as i64,
+                "a fork copies its tables, not the environment"
+            );
+            let held = host.channel_used();
+            let mut cx = Ctx {
+                w: &mut *st.w,
+                p: &mut twin,
+                wake_after: Vec::new(),
+            };
+            assert_eq!(set(&mut cx, 0, 4), 0, "the twin's write");
+            assert!(host.channel_used() > held, "charges its copy");
+            assert_eq!(
+                st.p.env.vars["NAME"].len(),
+                20 << 10,
+                "the parent's is its own"
+            );
+            for pid in 0..PID_MAX as i32 {
+                let zombie = ProcEntry::Zombie {
+                    status: 0,
+                    pgid: 1,
+                    ppid: 1,
+                };
+                st.w.procs.insert(pid + 10_000, zombie);
+            }
+            assert_eq!(st.fork_request(), EAGAIN, "the table holds PID_MAX");
+            st.p.handler_mask_stack = vec![1, 2, 3];
+        }
+        exec_remap_hook(Arc::clone(&posix.root))(&[]);
+        assert!(
+            posix.root.lock().unwrap().handler_mask_stack.is_empty(),
+            "an exec drops what no handler will return to restore"
+        );
+    }
+
+    /// #2373 — what a process keeps for its guest outside its window is charged to the personality's
+    /// payer as it changes: a record for each heap block, a slot for each descriptor, its working
+    /// directory, the `getenv` copies it caches and an exec staged on it. Past the ceiling each is
+    /// refused, having changed nothing: `malloc` and `getenv` answer `NULL`, a new descriptor
+    /// `-EMFILE` (before an `open` makes its file), `chdir` `-ENOMEM`. A merge of freed blocks hands
+    /// a record back.
+    #[test]
+    fn a_processes_host_tables_are_charged() {
+        let (posix, host) = bound(8 << 10);
+        posix.set_env("V", "x");
+        let mut win = vec![b'd'; WIN];
+        (win[0], win[255]) = (b'/', b'V');
+        let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+        {
+            ctx!(posix, w_g, p_g, st);
+            let blocks: Vec<i64> = std::iter::repeat_with(|| st.malloc(&[16]))
+                .take_while(|&b| b != 0)
+                .collect();
+            assert!(
+                (32..64).contains(&blocks.len()),
+                "a record each: {} blocks fit",
+                blocks.len()
+            );
+            let (full, held) = (host.channel_used(), st.p.held);
+            assert_eq!(st.dup(&[1]), EMFILE, "no room for a descriptor's slot");
+            let open = st.open(&[0, 2, O_CREAT | O_RDWR], Some(&mut mem)).unwrap()[0];
+            assert_eq!(open, EMFILE, "an open refused for one");
+            assert!(!st.w.files.contains_key("/d"), "makes no file");
+            let chdir = st.chdir(&[0, 200], Some(&mut mem)).unwrap()[0];
+            assert_eq!(chdir, ENOMEM, "nor for a longer directory");
+            assert_eq!(st.p.cwd, "/");
+            let getenv = |st: &mut Ctx, mem: &mut temen_interp::WindowMem| {
+                st.getenv(&[255, 1], Some(mem)).unwrap()[0]
+            };
+            assert_eq!(getenv(&mut st, &mut mem), 0, "nor for a getenv's copy");
+            assert_eq!(host.channel_used(), full, "a refusal charges nothing");
+            st.free(&[blocks[0]]);
+            assert_eq!(st.p.held, held, "a freed block keeps its record");
+            st.free(&[blocks[1]]);
+            let merged = held - TABLE_ENTRY;
+            assert_eq!(st.p.held, merged, "two neighbours merge into one record");
+            st.free(&[blocks[2]]);
+            st.free(&[blocks[3]]);
+            assert!(st.dup(&[1]) >= 0, "the records handed back hold a slot");
+            assert_ne!(getenv(&mut st, &mut mem), 0, "and a getenv's copy");
+            assert_eq!(st.p.held, st.p.tables_cost(), "kept as the tables change");
+            assert!(st.p.tables.bytes() >= st.p.held, "and charged");
+        }
+        drop(posix);
+        assert_eq!(
+            host.channel_used(),
+            0,
+            "gone, the personality holds nothing"
+        );
+    }
+
+    /// #2373 — an exec is charged as it is staged, its packed arguments and its vector: with no room
+    /// for them `execve` is `-ENOMEM`, staging nothing. A commit hands back the packed copy and the
+    /// vector the new one replaces.
+    #[test]
+    fn an_exec_is_charged_as_it_is_staged() {
+        let (posix, mut host) = bound(-1);
+        posix.register_executable("/bin/c", 5, 16);
+        let mut win = vec![0u8; WIN];
+        win[100_000..100_007].copy_from_slice(b"/bin/c\0");
+        win[100_100..104_196].fill(b'a'); // argv = [a 4 KiB argument, NULL]
+        win[105_000..105_008].copy_from_slice(&100_100u64.to_le_bytes());
+        let call = [100_000, 105_000, 0];
+        let (door, _armed) = cap_signal_source(&posix);
+        door.set_park_request(Arc::new(|_| {}));
+        let held = host.channel_used();
+        let execve = |posix: &Posix, win: &mut Vec<u8>| {
+            ctx!(posix, w_g, p_g, st);
+            let mut mem = temen_interp::WindowMem::new(win, WIN as u64);
+            st.execve(&call, Some(&mut mem)).unwrap()[0]
+        };
+        host.set_grant(-1, held + (6 << 10), -1, -1);
+        assert_eq!(execve(&posix, &mut win), ENOMEM, "no room for both copies");
+        assert!(posix.root.lock().unwrap().pending_exec.is_none());
+        assert_eq!(host.channel_used(), held, "staging nothing");
+        host.set_grant(-1, -1, -1, -1);
+        assert_eq!(execve(&posix, &mut win), ENOSYS, "the request goes out");
+        assert!(
+            host.channel_used() >= held + (8 << 10),
+            "both copies are charged"
+        );
+        door.exec_commit().expect("staged");
+        let p = posix.root.lock().unwrap();
+        assert_eq!(p.held, p.tables_cost(), "kept as the tables change");
+        assert_eq!(
+            host.channel_used(),
+            held + args_cost(&p.args) as i64,
+            "the vector the process now runs with, alone"
+        );
+    }
+
+    /// #2373, #2428 — a fork charges the twin's copies of its parent's tables and directory streams
+    /// within the payer's limits, and with no room for them it is refused, charging nothing and
+    /// registering no process. A twin minted for a fork another provider then refused is abandoned:
+    /// it leaves the process table, rather than linger there as a zombie, and hands its copies back.
+    #[test]
+    fn a_fork_charges_its_copies_or_is_refused() {
+        let (posix, mut host) = bound(64 << 10);
+        let mut win = vec![0u8; 64];
+        win[..2].copy_from_slice(b"/d");
+        let mut mem = temen_interp::WindowMem::new(&mut win, 64);
+        let fork = cap_fork_factory(&posix);
+        {
+            ctx!(posix, w_g, p_g, st);
+            assert_eq!(st.mkdir(&[0, 2, 0], Some(&mut mem)).unwrap()[0], 0);
+            for n in 0..20 {
+                let name = format!("/d/{n:0>40}");
+                assert!(st.w.table(&name));
+                st.w.files.insert(name, MemFile::default());
+            }
+            assert!(st.opendir(&[0, 2], Some(&mut mem)).unwrap()[0] >= 0);
+        }
+        let held = host.channel_used();
+        let mut twin = fork(7).expect("room for its copies");
+        let copy = host.channel_used() - held;
+        assert!(
+            copy > 20 * TABLE_ENTRY as i64,
+            "the stream's copy is charged: {copy}"
+        );
+        assert!(posix.world.lock().unwrap().procs.contains_key(&7));
+        (twin.abandon.take().expect("a twin to abandon"))();
+        drop(twin);
+        {
+            let w = posix.world.lock().unwrap();
+            assert!(
+                !w.procs.contains_key(&7),
+                "an abandoned twin leaves the table"
+            );
+            assert!(w.last_fork_mint.is_none());
+        }
+        assert_eq!(host.channel_used(), held, "and hands its copies back");
+        host.set_grant(-1, held + copy - 1, -1, -1);
+        assert!(fork(8).is_none(), "no room for the copies refuses the fork");
+        assert_eq!(host.channel_used(), held, "charging nothing");
+        assert!(
+            !posix.world.lock().unwrap().procs.contains_key(&8),
+            "and registering no process"
+        );
+    }
+
+    /// #2353 — a group past `i32` names none. Negating `i64::MIN` panicked the host, and a group
+    /// cut down to `i32` named another one, the caller's own among them.
+    #[test]
+    fn a_group_past_i32_names_none() {
+        let posix = new_posix(HEAP_BASE, HEAP_END, Vec::new());
+        let mut win = vec![0u8; 64];
+        let mut mem = temen_interp::WindowMem::new(&mut win, 64);
+        ctx!(posix, w_g, p_g, st);
+        assert_eq!(st.kill(&[i64::MIN, 0]), ESRCH);
+        assert_eq!(
+            st.waitpid(&[i64::MIN, 0, 0], Some(&mut mem)).unwrap()[0],
+            ECHILD
+        );
+        let own = i64::from(st.p.pgid);
+        assert_eq!(
+            st.kill(&[-own - (1 << 32), 0]),
+            ESRCH,
+            "not the caller's own"
+        );
+        assert_eq!(st.setpgid(&[0, own + (1 << 32)]), EINVAL);
+    }
+
     #[test]
     fn descriptor_numbers_are_bounded() {
         let posix = new_posix(HEAP_BASE, HEAP_END, Vec::new());
@@ -9036,7 +9585,15 @@ block 0 () {\n\
     /// a name it has no room for.
     #[test]
     fn names_are_charged_as_they_change() {
-        let (posix, host) = bound(5 * TABLE_ENTRY as i64);
+        let (posix, mut host) = bound(-1);
+        {
+            // #2373 — the descriptor slots its opens take are the process's, charged before the
+            // ceiling, which leaves room for five entries of names.
+            ctx!(posix, w_g, p_g, st);
+            let (a, b) = (st.dup(&[1]), st.dup(&[1]));
+            assert_eq!((st.close(&[a]), st.close(&[b])), (0, 0));
+        }
+        host.set_grant(-1, host.channel_used() + 5 * TABLE_ENTRY as i64, -1, -1);
         let mut win = vec![0u8; 256];
         win[..24].copy_from_slice(b"/d/d/a/d/bb/e/d/zzzzzzzz");
         let mut mem = temen_interp::WindowMem::new(&mut win, 256);

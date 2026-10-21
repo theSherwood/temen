@@ -1,6 +1,5 @@
 
-int __vm_cap_count(void);
-int __vm_cap_at(int i, int *type_id_out);
+#include <temen.h> /* the `__vm_*` builtins and `struct vm_spawn_rec` */
 
 /* Discover the handle of interface `want` from the domain's own capability table
    (cap.self reflection — the discovery tier IMPORTS.md keeps). */
@@ -38,15 +37,32 @@ long __px_closedir(int cap, long dir);
 long __px_argc(int cap);
 long __px_argv(int cap, long i, long buf, long cap2);
 /* Personality `exec` surface (STAGE1.md §5): PATH lookup + the forwardable stdout handle. The spawn
-   itself is the shell's own `Instantiator` call.cap — `__spawn_rec` (op 17, a v1 detached record) /
-   `__join` (op 1) — dispatched on the reflection-discovered `Instantiator` handle (`__inst()`), like
-   every import here; each child's window is paid from the reflection-discovered `Budget`. */
+   itself is the shell's own `Instantiator` call.cap — `__spawn_rec` (op 17, a detached spawn record) /
+   `join_status` (op 1, below) — dispatched on the reflection-discovered `Instantiator` handle
+   (`__inst()`), like every import here; each child's window is paid from the reflection-discovered
+   `Budget`. */
 long __px_exec_lookup(int cap, long name, long len);
 long __px_exec_win(int cap, long module);
 long __px_exec_stdout(int cap);
 long __px_exec_stdin(int cap, long buf, long len);
 long __spawn_rec(int inst, long rec);
-long __join(int inst, long child);
+/* chibicc's builtin for the join (op 1): it answers two results, which no linked import can (#2066). */
+long __vm_instantiate_join(int inst, long child, long *status);
+/* A command's exit status from its join: what its `main` returned, `n` for an `exit(n)`, or 128 for
+   any other trap — the crash status the POSIX build's `waitpid` reaps (FORK.md §8.6). The command's
+   end is never the shell's own. Only the spawn build joins (`TEMEN_SHELL_SPAWN`, defined in
+   shell_main.c), and only it may call the `Instantiator`: a module that does needs a runtime of its
+   own, so the JIT cannot share its code and compiles the POSIX `/bin/sh` again for every process
+   (#2442). */
+#if !defined(TEMEN_SHELL_SEQUENTIAL) && !defined(TEMEN_SHELL_POSIX)
+static long join_status(long child) {
+  long st;
+  long r = __vm_instantiate_join(__inst(), child, &st);
+  if (st == 0) return r;
+  if ((st & 0xffffffff) == 7) return (st >> 32) & 0xff; /* `trap_code::EXIT`, the status in the high half */
+  return 128;
+}
+#endif
 /* Ring pipelines (STAGE1.md item 6): mint a shareable region (`AddressSpace` op 5) and alias it into
    this window (`SharedRegion` ops 0/1/3), dispatched on the reflection-discovered handles below. */
 long __as_region(int cap, long len);
@@ -58,10 +74,32 @@ static int __as(void) { if (__h_as < 0) __h_as = __capof(5); return __h_as; }   
 
 static long slen(char *s) { long n = 0; while (s[n]) n = n + 1; return n; }
 
-long write(long fd, void *buf, long n) { return __px_write(__px(), fd, (long)buf, n); }
-long read(long fd, void *buf, long n) { return __px_read(__px(), fd, (long)buf, n); }
+/* #972 tag protocol (the shape of `posix_utils/util.c`): an op that lands on a core pipe end returns
+   PX_TAG_BASE - handle (<= -(1<<20)), and the transfer belongs on that handle, where an empty pipe
+   with writers parks and one with none is EOF. Real errnos stay > -4096 and pass through. A shell
+   whose stdout is the pipe a program's `startProcess` made writes there (#2371). */
+long __vm_read(int h, void *buf, long len);
+long __vm_write(int h, void *buf, long len);
+long __vm_close(int h);
+static long __tag_handle(long r) { return r <= -1048576 ? -(r + 1048576) : -1; }
+long write(long fd, void *buf, long n) {
+  long r = __px_write(__px(), fd, (long)buf, n);
+  long h = __tag_handle(r);
+  return h < 0 ? r : __vm_write((int)h, buf, n);
+}
+long read(long fd, void *buf, long n) {
+  long r = __px_read(__px(), fd, (long)buf, n);
+  long h = __tag_handle(r);
+  return h < 0 ? r : __vm_read((int)h, buf, n);
+}
 long open(char *path, long flags) { return __px_open(__px(), (long)path, slen(path), flags); }
-long close(long fd) { return __px_close(__px(), fd); }
+long close(long fd) {
+  long r = __px_close(__px(), fd);
+  long h = __tag_handle(r);
+  if (h < 0) return r;
+  __vm_close((int)h);
+  return 0;
+}
 long unlink(char *path) { return __px_unlink(__px(), (long)path, slen(path)); }
 char *getcwd(char *buf, long size) { return __px_getcwd(__px(), (long)buf, size) > 0 ? buf : 0; }
 long chdir(char *path) { return __px_chdir(__px(), (long)path, slen(path)); }

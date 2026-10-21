@@ -53,7 +53,7 @@ The fix is not new machinery. The design below is built almost entirely from
 pieces already in the tree: the powerbox prefix ("instantiation fills the first
 N entries", §3b), the host-owned handle table with type/generation checks
 (§3c), `self.*` reflection incl. by-name resolve (D46/F7), and the
-`spawn_named_child` grant flow.
+spawn's by-name grant flow (`Host::spawn_detached_child`).
 
 ### The bake/parameterize rule (context)
 
@@ -113,12 +113,12 @@ guest→instantiator upcall channel); see §5.2.
   `grant_caps` grants in import order on a fresh `Host` whose allocator is
   first-free-slot, so slots `0..N` are guaranteed. This design formalizes
   existing behavior rather than introducing new mechanism.
-- **Child modules: a reserved prefix.** `spawn_granted_child` /
-  `spawn_named_child` auto-grant `Instantiator` into slot 0 and
-  `AddressSpace` into slot 1 before any named grants (temen-interp
-  lib.rs:11294-11300, 11356-11367) — the same order the child entry already
-  receives them as args. A child manifest therefore treats these as
-  **implicit leading imports**: its named imports start at slot 2. This is
+- **Child modules: a reserved prefix.** The child powerbox a spawn builds
+  (`Host::spawn_detached_child`) grants `Instantiator` into slot 0,
+  `AddressSpace` into slot 1 and the child's `"budget"` into slot 2 before any
+  named grants — the starter caps in the order the child entry receives them
+  as args. A child manifest therefore treats these as **implicit leading
+  imports**: its named imports start at slot 3. This is
   documented ABI, checked at wiring; "import i = slot i" is never applied
   naively to child modules.
 - **Mem-hooks instrumentation is exclusive with manifest binding.** The
@@ -563,7 +563,7 @@ and the JIT's child builders. Forwarding of platform caps is the existing re-gra
 (zero-marginal-cost aliasing); a forwarded offer keeps its entry and gains a depth hop.*
 
 A parent instantiating a child supplies `name → binding` for the child's
-manifest (the existing `spawn_named_child` flow, given a manifest to bind
+manifest (the spawn's by-name grant list, given a manifest to bind
 against). The four policies are one act with different right-hand sides:
 
 | Policy | Binding | Per-op cost | Child's provenance view |
@@ -773,12 +773,12 @@ holder is the domain that implements them:
   harvests it: a parent holding a child's `Instantiator` cannot
   enumerate-and-wire the child's *live* offers. A hostile parent can always
   run your code; it can never reach into your service.
-- **Honest limit:** this controls who can *call through* your offers. In
-  window-exposed tiers a §14 parent already reads and writes the child's
-  entire carve — export protection cannot create confidentiality the memory
-  model doesn't provide. (Retiring with the carve placement, INVARIANTS #13
-  ruling 2026-09-29: a detached child is window-exposed only over a region it
-  was granted, so this limit narrows to pre-mapped `SharedRegion`s.) That is `attest`'s job: a child that finds itself
+- **Honest limit:** this controls who can *call through* your offers. Where a
+  child's memory is exposed to its parent — a pre-mapped `SharedRegion` it
+  was granted, or every page of a paged child (#2095) — export protection
+  cannot create confidentiality the memory model doesn't provide. (A carve
+  child's whole window was exposed this way until the carve went, #1867.)
+  That is `attest`'s job: a child that finds itself
   window-exposed to an untrusted parent should refuse to hold secrets at
   all; distrust means separate processes (§1a). The two compose: attest
   tells you which world you are in; `export.handle` keeps offer wiring

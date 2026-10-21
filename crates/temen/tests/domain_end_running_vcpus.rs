@@ -69,11 +69,11 @@ fn thread_guest(body: &str, tail: &str) -> String {
 }
 
 /// The root spawns a §14 child that spins (its func 1's child image, #2219), detached and paid from
-/// its `Budget` (a v1 record at 17408), then runs `tail`.
+/// its `Budget` (a spawn record at 17408), then runs `tail`.
 fn child_guest(tail: &str) -> String {
     format!(
-        "memory 19\nfunc (i64, i64, i64) -> (i64) {{\nblock 0 (v0: i64, vb: i64, vm: i64) {{\n  vi = i32.wrap_i64 v0\n  vbb = i32.wrap_i64 vb\n  vab = i64.const 17436\n  i32.store vab vbb\n  vmm = i32.wrap_i64 vm\n  vam = i64.const 17432\n  i32.store vam vmm\n  vp = i64.const 17408\n  vc = call.cap 6 17 (i64) -> (i32) vi (vp)\n{tail}\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n{SPIN}{}",
-        rec::segment(17408, &SpawnRec::v1(0))
+        "memory 19\nfunc (i64, i64, i64) -> (i64) {{\nblock 0 (v0: i64, vb: i64, vm: i64) {{\n  vi = i32.wrap_i64 v0\n  vbb = i32.wrap_i64 vb\n  vab = i64.const 17420\n  i32.store vab vbb\n  vmm = i32.wrap_i64 vm\n  vam = i64.const 17416\n  i32.store vam vmm\n  vp = i64.const 17408\n  vc = call.cap 6 17 (i64) -> (i32) vi (vp)\n{tail}\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n{SPIN}{}",
+        rec::segment(17408, &SpawnRec::default())
     )
 }
 
@@ -90,7 +90,7 @@ fn module(src: &str) -> temen_ir::Module {
 /// and the child, func 1's child image (all three unused by the thread guests).
 fn host(m: &temen_ir::Module) -> (Host, [i64; 3]) {
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1 << 19);
+    let ih = host.grant_instantiator();
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let child = host.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
     (host, [ih, budget, child].map(i64::from))

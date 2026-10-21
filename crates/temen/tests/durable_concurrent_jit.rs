@@ -191,7 +191,6 @@ fn thaw(
                 fibers: fibers.to_vec(),
                 vcpus: vcpus.to_vec(),
                 root_sp: Some(root_sp),
-                ..Default::default()
             },
             ..Default::default()
         },

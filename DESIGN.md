@@ -128,9 +128,8 @@ wasm?" answer lives in one place:
   page supply, and lending sub-ranges out. Large or sparse programs that fight
   wasm's flat linear memory are the target.
 - **Nested sandboxes (VM-in-VM) + composition (VM-beside-VM)** — a guest can use an
-  `Instantiator` capability to spawn a child domain in its own window (the power-of-two
-  **sub-window** placement is retiring, 2026-09-29) with an **attenuated** subset of its own
-  capabilities (§13/§14); confinement
+  `Instantiator` capability to spawn a child domain in a window of its own with an
+  **attenuated** subset of its own capabilities (§13/§14); confinement
   composes to any depth at depth-independent per-access cost. wasm has no native
   *runtime* nesting (only interpreter-in-wasm or link-time component composition),
   so multi-tenant hosts and plugin-in-plugin fall out for free.
@@ -191,7 +190,9 @@ and the smallest. The true statement:
 
 The dominant escape-TCB component is the **JIT** (Cranelift + our trap-confinement lowering +
 our CLIF generation), not the verifier. Stating this is the point: it puts the risk
-where it actually lives (§18).
+where it actually lives (§18). Cranelift's verifier checks our CLIF, and the CLIF Cranelift's
+passes hand its backend, on every compile (D68); nothing yet checks the machine code the backend
+emits (#2481).
 
 ### What "escape-free" buys — the load-bearing theorem
 Even a guest with **arbitrary write access to its entire window** (conceded — §1
@@ -520,8 +521,9 @@ security — UB in a sandbox IR would void the escape guarantee.
 - **Float arithmetic** (f32/f64, IEEE 754, no traps): `add sub mul div sqrt min max
   abs neg ceil floor trunc nearest copysign fma` (`min`/`max` are wasm-identical:
   NaN-propagating, with `-0 < +0` — *not* IEEE minNum; `nearest` rounds ties to
-  even; `fma` is the correctly-rounded fused multiply-add; `abs`/`neg`/`copysign`
-  are pure sign-bit ops, defined on NaN too — all pinned by `temen-spec`).
+  even; `fma` is the correctly-rounded fused multiply-add, which the interpreters compute with the
+  `libm` crate's function, the one temen-opt folds with, never the C library's (#2519);
+  `abs`/`neg`/`copysign` are pure sign-bit ops, defined on NaN too — all pinned by `temen-spec`).
 - **Float compare** (→ i32): `eq ne lt le gt ge`.
 - **Conversions:** `i64.extend_i32_s/u`, `i32.wrap_i64`, `extend8_s/extend16_s/
   extend32_s` (the narrow sign-extends — *defined here + in `temen-ir`, the interpreter, **and the JIT**
@@ -760,7 +762,8 @@ Consequences:
   - **Update — D45 now implemented (opt-in), and it cleared the TCB concern above.** An optional
     `temen_jit::FastCapResolver` lets the embedder hand the JIT a *specialized* host fn for a
     statically-known `(type_id, op)`; the JIT emits a register-to-register direct call to it
-    (resolved at compile time, baked), falling back to the generic thunk for any unclaimed op. The
+    (resolved at compile time, and bound when the code is linked, D70), falling back to the generic
+    thunk for any unclaimed op. The
     authority-TCB worry is sidestepped **by construction**: the specialized fns *delegate to the same
     `Host::cap_dispatch_slots`* the generic thunk uses, so the I2 `resolve` (mask + `type_id` +
     `generation`) is unchanged — devirtualization moves only the *boundary* (register args, no
@@ -1055,7 +1058,7 @@ every tier reserves `[0, POWERBOX_NULL_GUARD)`: the interpreter seeds those
 pages `Unmapped` (a guard fault is fatal, never the §14 recoverable kind), the
 native JIT `mprotect`s them inaccessible, and the wasm tier emits a one-compare
 first-byte guard (measured free). The reservation is **permanent** — page ops
-and `instantiate` carves below the guard are refused (the `mmap_min_addr`
+below the guard are refused (the `mmap_min_addr`
 analogue), which is what keeps the baked per-tier guard constants sound. The
 guard is **unconditional** (#1094 — the one canonical layout): every producer
 (temen-llvm, temen-leng, chibicc) shifts its scratch up, and the host seeds
@@ -1063,14 +1066,19 @@ guard is **unconditional** (#1094 — the one canonical layout): every producer
 NULL semantics. The `__null_guard` marker export that once gated the layout is
 **retired** (#1094), and `temen-llvm-translate --null-guard` is a redundant
 no-op. The host seeds args at `temen_ir::module_args_base` (`guard + 128`).
-The guard holds for **every window**, not just the root's (#1206): a §14
-confined child's carve (retiring, 2026-09-29 — a detached child seeds it as a root does) and a
-spawned thread's view of its window seed it too
-(`Mem::nested_view` — the chokepoint every engine's nested arm shares — and the
-resumable `Vcpu`'s child start, `PendingChild::start`, and thread-spawn constructors), so a child
-storing at NULL traps identically on the interpreter and the emitted tier. A
-carve smaller than the guard skips the seed (it would unmap the whole window),
-so a sub-guard grandchild stays fully usable and its own carves may sit low.
+The guard holds for **every window**, not just the root's (#1206): a §14 child's own
+window seeds it as a root's does, and a spawned thread shares its domain's, so a child
+storing at NULL traps identically on the interpreter and the emitted tier. A window
+smaller than the guard skips the seed on every tier (it would unmap the whole window).
+
+**A durable module's runtime pages are fenced the same way (#2426).** A module that
+declares a shadow arena (DURABILITY.md, INVARIANTS #16) keeps runtime words in its
+window that the host reads and writes outside the guest's guarded code: the control
+words at `[guard, guard+64)`, which a freeze request rings, and the arena, into which
+a freeze flattens each parked fiber. A protection the guest gave one of their pages
+would fault in the host, so every engine refuses a page op over any page they touch,
+as over the guard (`ShadowArena::fences`): `-EINVAL`, nothing changed. A module that
+declares no arena is not freezable and fences nothing past the guard.
 
 ### Deferred
 `File`/`Directory`/`openAt`, `Connector`/networking (§7), async submit/complete
@@ -1082,10 +1090,16 @@ the Phase-1 core loop.
 ## 4. Memory model  [SETTLED] (some details PARKED)
 
 - Each domain gets a large **reserved virtual-address window** (2^37 = 128 GiB
-  by default, host-configurable). Guest pointers are **offsets into the window**.
+  by default). Guest pointers are **offsets into the window**. The embedder may
+  choose smaller windows for its process (`temen_ir::set_default_reserved_log2`,
+  #2517), before its first window: a phone whose kernel gives a process 39 bits
+  of address space does. The process's choice is what every window takes when
+  whatever builds it names no reservation, on every engine: an entry point's root
+  and every detached child, each raised to its own size.
   A window spends the process's address space whatever it commits, so every
-  domain's window is held against a **process-wide pool** of it (64 TiB, half a
-  47-bit host's: 512 default windows) at its admission, on every engine alike, as
+  domain's window is held against a **process-wide pool** of it (half of what
+  the host gives a process: 64 TiB on a 47-bit host, 512 default windows; 256 GiB
+  on a 39-bit one) at its admission, on every engine alike, as
   its mappings are held against the pool of those (#2268). One the pool cannot
   hold is **refused there, never a host panic** (#2305): a run ends with
   `ThreadFault` before it starts, a detached spawn answers `-EINVAL`, a fork or
@@ -1137,11 +1151,10 @@ the Phase-1 core loop.
     `matmul`/`matmul_eb` (`confine` harness). Branchless cmov-to-guard reaches
     **0.94×/0.97×** (parity/faster). (A `trapnz`-keeping cmov variant — clamp only,
     branch kept — *regressed* to 1.23×/1.55×, confirming the branch removal is the
-    win, not the cmov.) **Nested §14 sub-windows take the same branchless path** — an
-    out-of-child access redirects to the *parent's* guard page (`round_up(parent
-    reserved, page)`), the only guaranteed fault site since the child slice has
-    committed parent memory on both sides, so it faults out-of-child instead of
-    aliasing the parent — no nesting penalty. A per-domain unhardened mode (no spectre
+    win, not the cmov.) **A §14 child takes the same path**: its window is a
+    reservation of its own with its own trailing guard (one window shape, #1867), so an
+    out-of-child access faults on the child's guard — no nesting penalty, and no nested
+    form of the check. A per-domain unhardened mode (no spectre
     guard) is deliberately NOT offered: one fuzzed configuration, no deployment has justified
     trading the hardening.
 - **Confinement is one isolated lowering pass.** The bounds-check/clamp/guard logic is
@@ -1321,10 +1334,9 @@ and differential enforce that for the confinement + codegen surface).
   `StackBase`/`StackLimit`/`DeallocationStack` swaps per switch, but expose one uniform
   `Fiber`/`Yielder` API.
 
-A window may itself be a power-of-two-aligned **sub-region of a parent window**
-(see §14); confinement is then `base + (offset & (size−1))` with `base`/`size`
-as instantiation constants, so a sub-window is indistinguishable from a
-top-level window to the code inside it, at identical per-access cost.
+Every window starts at 0 of its own reservation. A §14 child gets a window of its own,
+not a sub-region of its parent's (one window shape, #1867), so the code inside a child
+cannot tell its window from a root's, and pays the same per-access cost.
 
 **[PARKED]** 64-bit host is assumed; `mmap` churn from chatty `map`/`unmap` is
 mitigated by batching and/or a software page-table layer. Exact window size
@@ -1416,6 +1428,13 @@ instances of this mechanism. A capability interface is just **data + host code**
   types; a result may be `handle<…>`/`funcref<…>` for attenuation). It lives in the
   **guest module's own type section** (§3a), so the verifier statically type-checks
   every `call.cap` with zero host knowledge — self-contained and verifiable.
+  The verifier checks a call only against the signature it *declares*, so a call can declare a
+  shape the op doesn't have. Every engine answers it one way (#2361):
+  - An op an engine serves itself (the Instantiator's, `Jit.install`/`uninstall`, the self ops
+    it runs) is held to its contract (`temen_ir::served_contract`): any other shape traps
+    `CapFault` before the op runs.
+  - A call the host serves defines each result it declares: the host's results in order, then
+    zero.
 - **Implementation** — a method table (vtable, §3c) of handler pointers registered
   **host-side**, entirely outside the guest/verifier/TCB.
 
@@ -1461,7 +1480,7 @@ something new is a capability**:
   could already invoke every one of those handles), adds no edge to the grant graph, and
   reveals exactly the leaves of the egress closure — never anything the host did not grant.
   It reads **live generation state** (revoked handles drop out) and is a per-domain view, so
-  a nested child (§14) reflects only its *attenuated* carve — discovery attenuates for free,
+  a §14 child reflects only its *attenuated* grants — discovery attenuates for free,
   like `AddressSpace.sub`. It earns its keep precisely under **late binding**, where the
   guest may no longer statically know its full set. *Consequence (accepted):* there are **no
   deniable grants** — a guest can always audit its exact authority. We treat that as a
@@ -1864,7 +1883,10 @@ hang, and the mirror: a server parked in `svc.wait` whose **client** child domai
 no-progress `0` — the timed form's answer — so it can return and be joined instead of
 waiting forever for a request that can never come (#1217); a nested child's exit/trap ends
 the *child* domain only, surfacing to its owner as
-an outcome (supervision: `poll` → trapped → detach + respawn, per I37). Before this rule
+an outcome (supervision: `join` or `poll` reads how it ended, then respawn, per I37; #2066).
+What an owner keeps for a child goes when its claim ends — a `join` or a `detach` — once the
+child has ended (#2359), so an owner that respawns children for its whole life does not grow
+with them. Before this rule
 the engines had divergent incidental residues (interpreter: join-all + a 10 s wait clamp;
 JIT: trap flag no parked waiter ever observed) — the jacl timed-wait regression report
 (2026-07-24) is the consumer that forced the decision.
@@ -1897,15 +1919,88 @@ numbers:
    (invariant 8). The test-only `Blocking` cap is the exerciser.
 2. *Dispatch gains a third outcome* behind an out-param face (`cap_dispatch_slots_pending` →
    `Pending(completion_id)`, job handed to the offload pool, result posted to `Completions`);
-   every other call site keeps the sync face and runs punts inline — decline-never-diverge
+   a call site that cannot park keeps the sync face and runs punts inline — decline-never-diverge
    (invariant 9). Under a W1 tape punts are forced inline so the tape records real results.
 3. *Eval loops release the lock before waiting*: the interp tiers drop the host lock then
    `Completions::wait` (single-fiber degenerate wait); the tree-walk scheduler parks the **vCPU**
    (`Blocked::CapPending`, freeing its M:N worker; completions re-queue via `Pending::CapResult`,
-   drained smallest-id-first = submission order — the §18 determinism pin); `cap_thunk_locked`
+   each as it arrives, #2477); `cap_thunk_locked`
    (the JIT threaded tier) releases the domain lock before its completion wait. Root-context
    parks are whole-vCPU and guest-invisible; a punt **inside a fiber** parks the *fiber* — see
    fiber-park promotion below.
+
+**A parked caller holds nothing its run needs (#2047, 2026-10-14).** A blocking call may wait on
+the world, or on what another vCPU, thread or child of the run does, so its caller parks as the
+oracle's vCPU does, on every engine: the cooperative pump and the parallel driver park the *task*
+(`BlockedHostCap`, the state a host-completed call already used) and run the others, and each
+round's drain wakes it (`drain_task_completions`); the debug scheduler parks the thread and takes
+the pool's answer only once nothing else can run, so its schedule stays deterministic; the JIT's
+vCPU, under either thunk, waits outside the run with its D66 lane given back and the §5 kill
+re-checked (`temen_jit::wait_outside`) — the generic `cap_thunk` takes the pending face at root
+context too. A cooperative scheduler with nothing to run fires its next timer **before** it blocks
+on an outstanding call, so a call waiting on the world never holds back a timed waiter. Pinned on
+every engine in `temen-run/tests/cap_park.rs`.
+
+**A child's call parks the child alone (#2424, 2026-10-16).** A provider that gives an offloadable
+procedure a fork factory (`grant_host_proc_offloadable`'s `fork`, minting `ForkedProc::offloadable`)
+lets a spawn re-grant it to a §14 child and a fork twin carry it, as a synchronous one's. Each
+domain's calls stay in its own `Completions`, ids unique in the process (#2495), and each answer is
+delivered as it arrives (#2477), so no outstanding call holds back another's answer, in its domain or another. The
+oracle keys its waiters by `(domain, id)` and drains domain by domain; the wake hook is the store's
+(`Completions::set_notify`), installed at each park and holding the scheduler weakly. The pump and the
+parallel driver park a child's task or fiber as the root's, their drains cover every domain, and the
+idle pump waits on all the stores at once (`Completions::wait_any`). The debug scheduler takes the
+first answer to come, lowest index first among those in: with two threads waiting, which runs on
+first is the world's order, where lowest index first held a thread behind a call that might never
+answer, or wait on that thread. On the JIT a detached child is a task: one
+parked on an answer is not counted blocked (`ParkOn::Outside`, as an OS vCPU in `wait_outside` is
+not), and the answer re-offers it (`outside_waker`). Nor is a `cont.resume.block` of a fiber parked
+on one, on a task or an OS vCPU: a JIT root blocking on such a fiber read as deadlocked once the
+answer took longer than two 20 ms re-checks. A domain that has punted still forks: the offload
+pool's jobs never touch the window and answer into their own domain's store.
+
+**A call its embedder answers (#2495, 2026-10-20).** An offloadable procedure's call may be answered
+by the embedder instead of a pool thread (`OffloadOutcome::Host`): its submit hook gets the call's
+`Completer`, which answers it from any thread, at any time, into the domain's store with the wake a
+pool answer rings. So the caller parks and wakes as on a pool call, on every engine and in every
+domain, and a call that waits on the world (a bell rung by outside input) holds no host thread while
+it waits — the pool keeps genuinely blocking host work. A completer dropped unanswered answers
+`CAP_REVOKED`, so a call its host can no longer answer never hangs; one whose domain is gone answers
+nothing. Where its caller cannot park the call declines with `CapFault`: before the embedder sees it
+on the sync face and in a durable run, else withdrawn (`Completions::withdraw`, so its completer
+answers nothing) — a reply that is not one `i64`, a tier-up region, a `Jit.invoke` unit, the
+explorer. A driver its embedder pumps (`Vcpu`, `CoopRun`, the debug scheduler) hands control back
+while such a call waits, the earliest in any domain, so a single-threaded embedder (the browser)
+answers between pumps; a driver nothing pumps (the tree-walker, the native pump, the parallel
+driver, the JIT) waits on the store as on the pool, and its embedder answers from a thread of its
+own. Ids are unique in the process, so one embedder serving several domains keys its requests by
+id. Under a recording host (W1) the bytecode drivers tape the delivered value where they deliver it
+(`Completions::take_record`); the tree-walker and the JIT tape none, so they offer no parking face
+there and the call declines. The completer is the one way to answer: `deliver_cap` is gone, and the
+browser's `temen_coop_deliver_cap` and the DAP's `provideCap` answer through the request's
+completer.
+
+**An idle pump lets a wait's time pass (#1979, 2026-10-15).** The cooperative pump's clock is
+logical, for determinism (#2224): it moves with the work done, one ns per op, and when nothing can
+run, to the earliest deadline. On the native `drive` that time now passes first, in real time, as
+the other engines' waits take theirs (`wait_out`). The answer to an outstanding punted call or a ring
+of the embedder's bell ends the wait early, and the clock moves by the time that passed, so the
+schedule is the clock's as before. A run with no outside input keeps its
+schedule exactly, and only now takes as long as it asked to wait. Without it a 10 ms wait ended
+after ~80 µs, and while a root waited on the world its threads' timed waits fired back to back. The
+debug scheduler keeps the jump, so a replay stays exact; a `CoopRun`'s embedder (the browser) does
+too, as wasm has no clock to wait on (#2439). Pinned in `temen-interp/tests/timed_waits.rs`.
+
+**One bell for an idle pump (#2480, 2026-10-20).** With nothing to run, the pump waited either on the
+answers to its outstanding calls or on the embedder's bell, never both, so a feed, a signal or a
+kill went unseen until a call answered — and a call may wait on the world. Now every store a parked
+caller waits on rings the embedder's bell (a bell of the wait's own when none is armed), and the
+pump waits on that one bell, past the round's `bell_gen` snapshot (`Completions::wait_any`): each wake
+source ends the one wait, and the next round sees which. A call counts only while its answer would
+wake a task — a task's own, or that of a fiber a task resumes blocking — as the parallel driver
+already counted, so a fiber no one resumes holds no wait and no deadlock verdict; the tree-walker
+drops a domain's fiber waiters when the domain ends, as its teardown does a dying one's. Pinned in
+`bytecode_pump_kill.rs` and `cap_park.rs`.
 
 Pinned constraints (tests in `temen/tests/host_park.rs`, `temen-run/tests/fast_cap.rs`): a parkable
 registration is **never** `fast_cap_resolver`-claimed; **sync ops never pay for parkable ops'
@@ -1935,32 +2030,32 @@ the async-first paragraph above, delivered. Identical on all three engines (inva
 — ISSUES.md I73, opened and closed on the arc):
 
 - *Oracle (F1):* the park predicate's fiber arm rides `fiber_park!` filing a `Waiter::Fiber` in
-  `completion_waiters`; the recheck is `completion_drain` itself (insert-then-drain), so
-  delivery stays submission-ordered even on the register race, and an animated offer handler's
+  `completion_waiters`; the recheck is `completion_drain` itself (insert-then-drain), so an
+  answer that raced the park is delivered, and an animated offer handler's
   punt rides the CALLS-4b promotion branch by construction (its wake key IS `OfferPark`'s
   resume key). Gates: exactly-one-`i64` reply (the wake pushes one reg — invariant 8),
   non-durable, `SchedRef::Real`.
 - *Bytecode (F2):* the punt surfaces as `Outcome::CapPending` (the `MemoryWait` channel) so
   each driver states its posture; the cooperative `drive` parks `FiberState::CapParked` with
-  ONE ordered drain (`drain_cap_parked` — smallest-outstanding-id-first, stop at the first
-  not-yet-arrived) at both wake sites, and driver idle with unwoken cap parks **blocks on the
-  store** (pending pool work is never a deadlock and never jumps the logical clock). GC root
-  scans cover cap-parked frames.
+  ONE drain per domain (`drain_cap_parked`, each answer as it arrives) at both wake sites, and
+  driver idle with unwoken cap parks **blocks on
+  the stores** once no timer is left (pending pool work is never a deadlock; #2047 put the timers
+  first). GC root scans cover cap-parked frames.
 - *Cranelift JIT (F3):* per-fiber completion cells live on `Completions` itself (one lock with
-  the store, drain at registration + every pool-side `complete` — no notify hook; resumption is
-  poll-driven), and the thunks (`cap_thunk`, `cap_thunk_locked`) route a fiber's punt through
+  the store, drain at registration + every pool-side `complete`; resumption is poll-driven, and a
+  §14 child's task is re-offered by the store's wake hook, #2424), and the thunks (`cap_thunk`, `cap_thunk_locked`) route a fiber's punt through
   the pending face and park via the `fiber_rt` event-park seam the futex thunk already used.
-  Root context keeps the sync/blocking faces — "sync ops never pay" holds.
+  Root context takes the pending face too since #2047 — "sync ops never pay" holds, as nothing is
+  minted until a handler punts.
 
 *Measured (F4, `fiber_overlap_bench.rs`, n=8 × block=2 ms, K=4):* fiber lane ~4.8–5.3 ms/batch
 on all three engines (JIT net of its per-run compile floor) vs ~19 ms serialized root — the
 ring's own overlap range, restored on one vCPU. **Inline-by-design postures (enumerated, not
 debt):** the browser-`Vcpu` driver (I45 — fiber delivery through the real cross-thread futex is
 its own slice; the native parallel driver takes the cooperative driver's postures since #1414 3e),
-the debug drivers (sanctioned whole-vCPU tiering; checkpointing excludes cap-parked fibers like
-futex-parked ones), the §22 invoke leaves
-(seam-free atomic), confined `instantiate` children on the cooperative driver (their
-completions live on their own host), durable runs everywhere (a punted completion has no freeze
+the debug drivers' fibers (sanctioned whole-vCPU tiering; checkpointing excludes cap-parked fibers
+and pool-parked threads like futex-parked ones), the §22 invoke leaves
+(seam-free atomic), durable runs everywhere (a punted completion has no freeze
 rule yet, #1902), and zero/multi-result punts (the degenerate wait). Residue: the
 animated-offer punt is exercised only by construction (`wire_offer_proc` seals the provider
 `Host`; pin it when a public wiring can grant a provider an offloadable cap). I48 (a blocking
@@ -2248,82 +2343,71 @@ default above still stands for every handle-gated capability.
 
 ### VM-in-VM (nesting), transparent & zero-overhead
 
-> **Retiring (owner, 2026-09-29 — INVARIANTS.md #13 ruling; #1814, #1289):** the sub-window placement
-> described here is being deleted. Every child gets a **detached** window (its own reservation, op 15;
-> PROCESS.md §5): the child still sees a zero-based `[0, size)` and cannot learn it is nested, but the
-> parent no longer sees child memory as a superset. Lending memory is a pre-mapped `SharedRegion` (§13);
-> lazy page supply becomes a pager that *supplies* bytes rather than writing through the parent's
-> window. The two placements had diverged into two mechanisms (a live alias on the interpreters and the
-> wasm-JIT, a private copy on the Cranelift JIT — #1814); R3's escape hatch deletes one.
-- A child's **window is a power-of-two sub-region of the parent's window** (§4).
-  Confinement `child_base + (offset & (size−1))` is one AND + ADD with constant
-  base/size, so the child sees a zero-based space `[0, size)` and **cannot learn
-  it is nested**. Composes to any depth — a grandchild's base is still a single
-  resolved constant — so **per-access cost is depth-independent**.
-- The parent intrinsically sees all child memory (superset); the child sees only
-  its slice (masking). One-way transparency in the correct privilege direction.
-- **Lending memory to inner VMs** (the explicit ask): carve a sub-window, or
-  share a region into it (§13). For *lazy* page supply, the parent registers as
-  the **fault handler** for the child's sub-window (userfaultfd-style): mapped
-  access stays zero-overhead; the parent is trapped only on faults it chose to
-  virtualize.
-- **Instantiation primitive:** an **`Instantiator`** capability lets a holder
-  spawn a child domain with (a) a sub-window, (b) an attenuated subset of its own
-  capabilities, and (c) a resource/core quota. A parent can only sub-allocate
-  what it holds (attenuation), so **a child's isolation tier can never exceed the
-  parent's** — a tier-3 child requires the *host* to grant a real process; a
-  guest cannot manufacture isolation it lacks.
+- A child's **window is its own**: a fresh, zero-based reservation of its module's declared size
+  that a `Budget` pays for (op 17; PROCESS.md §5). The child sees `[0, size)` and **cannot learn
+  it is nested**: it is confined as a root is, at depth-independent per-access cost.
+- The parent sees none of the child's memory. Data flows through the module's own segments, the
+  spawn's named grants and args payload, a pre-mapped `SharedRegion` (§13) and the join. (Until
+  #1867 a child could instead sit in a power-of-two sub-window of its parent's window, which the
+  parent saw as a superset. The two placements had diverged into two mechanisms — a live alias on
+  the interpreters and the wasm-JIT, a private copy on the Cranelift JIT, #1814 — so the sub-window
+  was deleted: INVARIANTS.md #13's 2026-09-29 ruling.)
+- **Lending memory to inner VMs** (the explicit ask): share a region into the child (§13). For
+  *lazy* page supply the parent registers as the child's **pager** (userfaultfd-style): it supplies
+  each page's bytes at first touch, and the parent is trapped only on faults it chose to
+  virtualize. On the Cranelift JIT a paged child's code tests a per-page access table before each
+  access, and calls into its pager on a miss (#2164): the paged child pays that check, and nothing
+  else does.
+- **Instantiation primitive:** an **`Instantiator`** capability lets a holder spawn a child domain
+  with (a) a window paid from a `Budget` it holds, (b) an attenuated subset of its own
+  capabilities, and (c) a resource/core quota from that budget. A parent can only sub-allocate
+  what it holds (attenuation), so **a child's isolation tier can never exceed the parent's** — a
+  tier-3 child requires the *host* to grant a real process; a guest cannot manufacture isolation it
+  lacks.
 
 ### New primitives introduced here
 - **`SharedRegion`** (§13): create / map / unmap / grant.
 - **`AddressSpace`** (memory-management) capability, attenuable to a window
   sub-range: `map` / `unmap` / `protect` within scope; can mint a sub-range
-  capability for a child.
-- **`Instantiator`**: spawn child domain (sub-window + attenuated caps + quota) — its own detached
-  window once the carve placement is retired (2026-09-29).
+  capability.
+- **`Instantiator`**: spawn a child domain in a window of its own (attenuated caps, a budget's
+  quota). `join` answers how the child ended — `(0, value)` if it returned, else `(trap code, 0)` —
+  and never traps the parent (#2066): a child's trap ends its own domain only.
 
 ### Honest bounds on "zero overhead"
-- Power-of-two, aligned sub-windows → a buddy-style carve of the parent window. *(The carve and the
-  VA-subdivision tradeoff below go with the sub-window placement — retiring, 2026-09-29.)*
-- Deep nesting subdivides VA: a real **window-size vs. nesting-depth** tradeoff
-  (a 2^37 window nests many levels, but it is finite).
+- Each child's window is its own reservation, so nesting depth costs address space per child
+  rather than subdividing one window (the sub-window placement's window-size vs. nesting-depth
+  tradeoff went with it, #1867).
 - "Zero slowdown" = zero *marginal, steady-state* cost for pass-through caps and
   already-mapped memory at any depth. You pay one crossing per *interposed*
   capability op and per *virtualized* fault — the best achievable, and the same
   shape as hardware nested virtualization (cheap steady state, cost on exits).
 
-### wasm-JIT tier coverage (the `compile_nested` front door)  [SETTLED — built]
-VM-in-VM runs correctly on **every** tier: fed to the general `compile_jit` front door a §14 unit
-runs interpreter-driven, the interpreter servicing the spawn and `join` via
-`VcpuStop::InstantiateDetached`. The wasm-JIT tier (`temen-wasm-jit`; `BROWSER.md` "wasm-JIT tier") is
-a *performance* path that lowers a nesting parent's spawn (op 17)/`join`/`thread`/futex ops to host
-bounces (`env.instantiate_rec` / `env.join` / `env.thread_*`) so the parent runs on emitted wasm. (The
-carve spawns it once lowered, ops 0 and 13, are retired, #1867.) `compile_nested`
-is its single front door — the nesting analogue of `compile_jit` — deriving the drive mode from the
-IR, so a verified unit always yields a runnable artifact:
+### wasm-JIT tier coverage  [SETTLED — built]
+VM-in-VM runs correctly on **every** tier. On the wasm-JIT tier (`temen-wasm-jit`; `BROWSER.md`
+"wasm-JIT tier") a §14 unit is a region tier-up like any other program: the interpreter drives the
+spawn (op 17), `join`, `thread.*` and futex ops (`VcpuStop::InstantiateDetached` and its siblings),
+and a function that reaches none of them, by any call edge, tiers up onto emitted wasm
+(`bounce_serviceable` keeps every op a bounce cannot serve out of an emitted function's callee
+closure). A function that spawns, joins or waits therefore interprets; #2443 serves those ops from
+emitted code through the region emit's bounce on executor 2, whose bounces may block. Fibers are
+**never** emitted: a wasm frame cannot unwind for a stack switch. The emitted-function bitmap is a
+sound "safe to call `f{i}` directly" signal, and no emitted-code or window-access surface is added
+(INVARIANTS.md #2 untouched).
 
-- **No reachable fiber** → the nested emit: the host calls `f{entry}` directly and the §14/§11 ops
-  bounce to their imports (`WasmDriven`). Threads and the futex stay on this fast path — a spawned
-  vCPU runs on its own worker, so it never has to unwind the emitted frame.
-- **A reachable fiber** (`cont.*`/`suspend`) → an interpreter-driven, nested-cap-aware tier-up
-  (`InterpDriven`): the interpreter owns the top frame (a wasm frame can't unwind for a stack switch),
-  servicing the fibers and `instantiate`/`join` natively, while hot in-subset compute — including
-  instantiate/join/thread functions — still tiers up with its bounces intact. Fibers are **never**
-  emitted; a fiber reachable from the entry by call edges drops it from the emitted set, and a
-  `thread.spawn`ed fiber runs in its own spawned interpreter vCPU. Either way the emitted-function
-  bitmap is a sound "safe to call `f{i}` directly" signal (the browser's per-instance
-  `temen_par_inst_eligible` gate reads it), and no new emitted-code or window-access surface is added
-  (INVARIANTS.md #2 untouched). This is the wasm-tier counterpart of the §22 "fibers in a submitted
-  unit" allowance.
+Until #1414 B6-4b the tier had a second emit family for nesting parents, `compile_nested`, which
+lowered those ops to host-bounce imports (`env.instantiate_rec`, `env.join`, `env.thread_*`) so a
+spawning entry ran emitted. Only the browser's per-Worker driver used it, under an option no shipped
+card passed, and it went with that driver (B6-4a).
 
 **Cross-tier ABI.** A non-emittable function runs as a cross-tier interpreter leaf over the shared
 window via `env.call_interp`, which marshals each arg/result through the `env` cell's scratch slots at
 a **running offset** computed from the callee's signature: scalars take one 8-byte slot (`i32` widened,
 `f32`/`f64` written narrow, `i64` as-is), a `v128` takes **two** (16 raw little-endian bytes — the
 two-slot encoding, #749). Every servicer computes the same layout from the signature; only `ref`/`cap`
-values stay unmarshallable. The §22 slot-trampoline transport (`emit_slot_trampoline` → the vCPU's
-`bounce_call`) still carries scalars only — its `&[i64]` decode and JS-crossing entry argv were not
-widened — so a `v128`-signature function in a *nested* unit still fails closed to whole-interpreter.
+values stay unmarshallable. The §22 slot-trampoline transport (`emit_slot_trampoline` →
+`CoopRun::bounce`) still carries scalars only — its `&[i64]` decode and JS-crossing entry argv were
+not widened.
 
 **Window-remapping ops fall to the interpreter (decision: fail-closed + scope-out).** The wasm tier's
 confinement is a mask plus **one live bound** — an emitted access is admitted in `[0, live_mapped)`
@@ -2344,7 +2428,7 @@ accesses confine against the live `mapped` read from the module's exported `mapp
 (self-initialized to the emit-time `1 << size_log2`) rather than a baked constant, and every tier-up
 event carries the window's **scalar committed extent** (`Mem::scalar_extent` — `Some(H)` iff the
 admitted set is exactly `[0, H)`) which the driver writes to that global before each emitted call
-(native `VcpuReactor::frame` service and the browser Worker's TIERUP handler alike — and the §22
+(every pump host, native or in the browser, and the browser Worker's TIERUP handler alike — and the §22
 `Jit.invoke` codegen seam identically: `VcpuEvent::JitInvoke` carries the same snapshot, the Worker
 writes the unit instance's global before `f0`). A window state the scalar cannot represent — a
 sparse grow, a non-RW mapping, pages committed past a fixed backing — **declines** emitted execution
@@ -2388,24 +2472,12 @@ escape.
 straddle, unsynced-table divergence pin). The cost is ~1.5–3×+ on the random-access tail, paid only
 by the modules the flip selects.
 
-**Nested units (#1151).** `compile_nested_paged` is the paged §14 front door: `unmap`/`protect`
-`call.cap`s are outlined into `env.call_interp` wrappers (`outline_nested_cap_calls`, so the op runs
-interp-serviced and the driver re-syncs the table on return) and every emitted access carries the page
-check; `SharedRegion` aliasing and fiber-bearing units still fail closed to whole-interpreter. The
-nested emit's `env.call_interp` contract is a **powerbox-carrying servicer over the live window** —
-a leaf may store and `call.cap` (the op-13 grant seeder, a `map`-calling allocator helper). A host
-must never service these leaves on a throwaway window (the browser's `temen_wasmjit_call_interp`,
-which is faithful only for the tier-up analysis's pure leaves) — an impure helper run on the empty
-powerbox `CapFault`s / writes a fresh window where the interpreter succeeds.
-The browser's §14 codegen entry
-(`temen_par_enable_inst_codegen`) routes a unit that reaches any ADDRESS_SPACE page op through
-`compile_nested_paged` and services its `env.call_interp` leaves on the **child's own vCPU over its
-carve** (over its own detached `Memory` once the carve placement is retired, 2026-09-29) (`temen_par_inst_call_interp` → `bounce_call`, the child's attenuated powerbox — the shape
-the `nested_paged` fuzz harness uses), re-syncing the page-state table + `"mapped"` from that vCPU
-after each bounce; the helper that `map`s/`unmap`s/`protect`s is bounced whole (no outlining — a
-wrapper would index a function the child's domain doesn't hold), and an entry that page-ops directly
-still falls to the interpreter. `map` (grow) is admitted on the nested paged path by the same
-refresh (`is_nested_leaf_cap` admits ops 0–4). Pinned in real Chromium by `browser-test`'s `instpaged` item. (Read-only D40 const segments are host-applied at instantiation, not a guest op; on the wasm
+**Nested units (#1151).** A paged child on executor 2 runs its root task on its granted module's
+region emit, with the page-state table in the child memory's header (#1414 ED-2); `browser-test`'s
+`instpaged` item pins it in real Chromium. The page ops themselves are `call.cap`s, which no emit
+takes: they run interpreted, and the table is rebuilt from the task's page map when it moves. (Until
+#1414 B6-4b a second, nested emit, `compile_nested_paged`, outlined them into `env.call_interp`
+wrappers serviced on the child's own vCPU; it went with the per-Worker driver.) (Read-only D40 const segments are host-applied at instantiation, not a guest op; on the wasm
 tier they remain a defense-in-depth-only gap — a write to "const" data succeeds instead of faulting,
 losing §5 self-corruption detection, but the guest still cannot escape.)
 
@@ -2452,8 +2524,9 @@ durable, or when emitted code can't address the root window flat. A third kind o
 joins stream calls and children: a **declared host-completed cap** (`Host::grant_declared_host_caps`,
 answered by the embedder — a browser game's `fb_present`), `OpParks::OnHost`. In a bounce out of a
 leaf whose host suspends its frames, such a call parks its task in `BlockedHostCap` with the rest of
-the call, the pump surfaces `CoopEvent::CapPark` once nothing else can run, and `CoopRun::deliver_cap`
-writes the answer into that continuation; the pump runs it and `Resume` hands the frames its results.
+the call, the pump surfaces `CoopEvent::CapPark` once nothing else can run, and the next pump after
+the call's `Completer` answers writes the answer into that continuation; the pump runs it and
+`Resume` hands the frames its results.
 Anywhere nothing holds the frames (a tier-up region, a `Jit.invoke` unit) the call declines with
 `CapFault`: no one could ever complete it there.
 
@@ -2467,8 +2540,22 @@ live window (`compile_module_tierup_live`), with two differences. It emits again
 declared window, because every window a child of the module runs in is at least that. And it
 dispatches through a table of the module's own functions, because the driver's shared table mirrors
 only the run's own dispatch table (#2273): a `call.dyn` site emits only when the whole module does.
-The parallel driver's tier (`ThreadTier`, #1414 B6-3a) emits the run's own program only, so there a
-child of a granted module interprets until its tier takes the module emitter too (#1414 ED-1).
+A fork twin of the root runs the run's own program over a table of its own, forked from the root's,
+so it and its threads tier up only while its powerbox holds no `Jit`, without which neither table
+can change (`child_runs_emit`).
+The parallel driver's tier (`ThreadTier`, #1414 B6-3a) takes the module emitter too (#1414 ED-2).
+There a detached child's window is a memory of its own, which the child's root task runs its
+module's emit over: the call names the memory, and the host keeps the call's context (env cell and
+page-state table) in the memory's header, past the guest's reach. The header holds one context, so
+the child's threads interpret.
+
+**A task the run starts tiers up at its entry (#1414 ED-1).** A thread, or a detached child, whose
+entry its program's emit makes eligible runs the entry emitted, as a call to it would: the task's
+first resume surfaces the entry (`Vm::jit_entry`), and the results end the task, as a leaf image's
+do. It is as safe as the call: region eligibility already keeps every op a bounce cannot serve out of
+an emitted function's whole callee closure. The root's entry keeps its own rule, the root leaf, whose
+slicing and suspension a region lacks; a durable run's tasks enter interpreted, since a thaw replays
+their entries.
 
 ---
 
@@ -2501,17 +2588,26 @@ child's grants is exactly the party positioned to observe their use.
   makes. No code can use more than the grant above it (INVARIANTS #3).
 - **What a capability holds for its guest is metered too (#2306).** Host memory a
   guest grows through a capability (a file's bytes; a pipe's, socket's or captured
-  stream's queue; a job's output; a table of names, descriptors, listings or
+  stream's queue; a job's output; a process's environment, which a fork twin
+  shares until either writes (#2345); a table of names, descriptors, listings or
   mappings) is `channel` of the node of the domain the capability's state was
   granted to, and each buffer of 128 KiB or more is one `maps` too, the mapping
   the allocator gives it (`temen_interp::HostCharge`, `HostBuffer`). A child
-  re-granted the capability spends its grantor's. It is charged before it is
+  re-granted the capability spends its grantor's. A POSIX process's heap records,
+  descriptor slots, arguments, working directory and `getenv` copies count too
+  (#2373). What a
+  fork twin or a spawned child copies of it is charged with the fork, within every
+  limit, so a guest cannot fork past its grant (#2428). It is charged before it is
   allocated, refused past a ceiling with the errno a full device gives
   (`-ENOSPC` from a filesystem, `-ENOMEM` elsewhere), never an abort, and handed
   back as it shrinks or goes. File descriptors are the process's to share, as its
   mappings and address space are: each one a guest causes holds a slot of a pool
   over the soft `RLIMIT_NOFILE`, less a host reserve, while it is open, and one
-  past it is `-EMFILE`.
+  past it is `-EMFILE`. A stack an engine keeps in host memory (the bytecode
+  engine's register file) is `mem` past the `FIBER_STACK` its vCPU's charge pays
+  for (#2336). The `cap_abi` fuzz target holds the whole surface to this: random
+  capability calls against a default powerbox under small budgets, where a host
+  panic, an abort or an outsized allocation is a find (#2353).
 
 ### Per-resource readouts (all read off structures the parent already owns)
 vCPU/core-time + scheduling stats vs quota; resident/mapped memory vs window +
@@ -2989,7 +3085,7 @@ host/guest (and guest/guest-as-host) boundary is.**
 is real or parent-emulated" (§14). Only the *realized cost* differs, gated by **isolation
 tier**, not by the interface:
 
-- **Same process (tiers 0/1 — cooperating / nested sub-window):** trampoline + table lookup,
+- **Same process (tiers 0/1 — cooperating / nested child):** trampoline + table lookup,
   **inline-able to ~free, no flush** (§9 path 1). Virtualized hops add one trampoline each;
   pass-through hops add nothing → the zero-overhead-nesting steady state.
 - **Across distrust (tier 3 — separate process):** the interface stays synchronous in
@@ -3232,27 +3328,20 @@ module 0 — fixed to the spawning frame's module). All tiers now claim this sup
   nested-caps emit; the JS drivers service them (the PR #587/#590 bounce pattern). Pinned by the
   browser harness's `instthreads` item and `nested_vm.rs::threaded_unit_matches_oracle`.
 
-**The `Instantiator` in a submitted unit (#1726, #2143, #1578).** Same split as threads, same reason.
-*Installed*, a unit's `instantiate` is an ordinary module-aware spawn: a same-module child runs the
-**spawning frame's** module — the unit's function, not module 0's of the same index — on every engine
-(the tree-walker builds the child from the frame's module; the bytecode drivers share one
-`spawner_module`; Cranelift bakes the unit's program into its spawn sites as `self_prog`, and a module
-with an install table stands up the nursery an installed unit spawns through). A detached spawn
-follows the same rule: from a unit's frame, `module = -1` names the unit's own program as a module —
-its functions over the table's memory, with no data, no shadow arena and no durable attestation
-(`Host::resolve_spawn_module`, the one rule every engine asks). The child runs that program as its
-own, so its `-1` names it in turn, and a durable domain refuses the spawn, as it refuses its root
-program's `-1`. Each engine reports the unit the spawning frame runs, as its `(table, unit)` on the
-spawning domain's host: the tree-walker's and the bytecode drivers' dispatch tables record it per
-installed module, and Cranelift carries it on `self_prog` into the host callbacks. *Invoked*, the whole
+**The `Instantiator` in a submitted unit (#1578, #2219).** Same split as threads, same reason.
+*Installed*, a unit's spawn is an ordinary spawn: it names a `Module` the domain holds, and the child
+starts at that module's function 0, as from the program's own frames (a module with an install table
+stands up the nursery an installed unit spawns through on Cranelift). `-1` names no module from a
+unit's frame either: it once named the spawning frame's program, the unit's own (#1726, #2143), and
+went with every other self-spawn (#2219). *Invoked*, the whole
 `Instantiator` is unavailable: a child would outlive the synchronous call over code nothing keeps (an
 invoked unit is never installed), and its handle would name the transient invoke vCPU's child, which
 nobody can join — so every `Instantiator` op `CapFault`s inside a `Jit.invoke` (the tree-walker when
 the op runs; the nested bytecode drive by name; the native tier before it trampolines, through the same
 `invoke_refuses` gate as threads — coarser by the one case of an op on a path that never runs). Pinned
 by `crates/temen/tests/unit_instantiator.rs` (the oracle, the four bytecode drivers and Cranelift; both
-routes, and a unit's child spawning in turn) and the frontier matrix's code-origin column, which drives
-both routes.
+routes, and an installed unit's `-1`) and the frontier matrix's code-origin column, which drives both
+routes.
 
 **Unit-own funcrefs (2026-07-30; every engine 2026-10-13, #2314).** A unit can also name its **own**
 functions — not just a parent (module-0) one. A unit's `ref.func N` used to lower to the bare index `N`,
@@ -3644,7 +3733,7 @@ domain, set once; a child uses its *parent's* futex table), the `child_code` cac
 impossible by construction — a park never holds a worker — so the only deadlocks left are the guest's
 own, which `run_deadlocked` turns into a `ThreadFault` rather than a hang. #1361's freeze harvest
 ("run the driver until every vCPU finished, then claim `Outcome.mem`") becomes **one** implementation
-across all three engines instead of two-plus-a-different-shape, and the op-15 gate lift becomes a
+across all three engines instead of two-plus-a-different-shape, and the detached-spawn gate lift becomes a
 single change. #1584 closes by construction: every park is scheduler-owned, so the 4c-bis `dstate`
 poke reaches all of them and no child can veto its parent's freeze by parking. And child-domain
 scheduling becomes **deterministic under the interpreter's seeded policy** — the win D56 recorded
@@ -3679,9 +3768,8 @@ until their children become scheduler tasks (slices 2–3), which is when their 
 as a value with the budget un-spent (#1587).
 
 *The child-domain executor on the JIT* (#1600 slices 2 and 5, `temen-jit/src/child_exec.rs`): every
-non-durable §14 child — the **carve** children of ops 0/5/8/11/13 (retiring with the carve
-placement, 2026-09-29; the copy-in/`copy_back` below goes with them) and the **detached** children of
-op 15 — is a task — a platform-owned `FiberSlot` (in no guest table, spends no fiber quota)
+non-durable §14 child — the **detached** children of op 17 (and, until #1867, the **carve** children
+of ops 0/5/8/11/13, with the copy-in/`copy_back` below) — is a task — a platform-owned `FiberSlot` (in no guest table, spends no fiber quota)
 carrying the child's own window, trap cell and fiber execution context — on a pool of workers spawned
 on demand; any worker may resume it under the same single-owner claim guest fibers use (the D57
 migration unsafe, no new one), each resume its own guard bracket over the *task's* fault range (R1),
@@ -3721,15 +3809,15 @@ infinite wait see quiescence and call a queue a deadlock. A lane of `0` is unsat
 slow, and answers `ThreadFault` on both engines (INVARIANTS #5 — never a hang). Cross-engine pins in
 `temen-run/tests/vcpu_lanes_jit.rs`.
 
-*One filing for every child* (slice 5, INVARIANTS #15): `spawn_child_on_thread`,
-`spawn_granted_child` and `spawn_detached_child` — three near-copies of reserve-§15 / spawn-thread /
-file-join-slot / release-on-failure — collapse into one `file_task`, parameterised by what actually
-differs: how the window is seeded (a carve image, or data segments plus payload), whether a
-`copy_back` writes it back at finish (a carve child: the parent is the superset), and the lane chain.
+*One filing for every child* (slice 5, INVARIANTS #15): `spawn_child_on_thread`, the carve child's
+spawn and `spawn_detached_child` — three near-copies of reserve-§15 / spawn-thread /
+file-join-slot / release-on-failure — collapsed into one `file_task`, parameterised by what actually
+differed: how the window is seeded, whether a `copy_back` wrote it back at finish (the carve child,
+gone with #1867), and the lane chain.
 `run_child_code`, `run_child_code_then` and `run_detached_child_then` are gone with the OS threads
 they drove, and so is `Nursery::child_threads` — run teardown is the executor's quiescence alone.
-A carve child has no lane of its own to be granted, so it runs in its parent's: the hook family
-carries the parent's `(domain, lane cap)`, read once when the family is built. What was three
+The hook family carries the parent's `(domain, lane cap)`, read once when the family is built, which
+a child's lane chain starts from. What was three
 propagation sites for every future scheduling change (invariant 14's burden) is one.
 
 *A child task's own fibers and threads* (#1469): a task carries a fiber runtime of its own — its own
@@ -3763,7 +3851,7 @@ The child's powerbox is the host its `Instantiator` resolves against and the par
 through the family the embedder's `GrantChildHooks::as_parent` builds over it (a child powerbox is
 always the shared form). The executor, the futex domain and the kill cell stay the run's. A
 grandchild's task is gated on every lane up to the root's, as the oracle gates a vCPU on its whole
-chain. The child joins from a task, so its `join` (and `wait`) parks the task, as `thread.join` does
+chain. The child joins from a task, so its `join` parks the task, as `thread.join` does
 there; a vCPU blocked in `join` gives back its own domain's lanes, not the run's. A join from a guest
 fiber parks the task too (#2322). A join blocks its whole vCPU on every engine — the oracle parks the
 vCPU, the bytecode drivers the task — and counts it blocked for the deadlock verdict, so the fiber's
@@ -3806,8 +3894,8 @@ not confinement — and all eight are fixed:
 
 **Checked and found sound (no action):** the verifier (fail-closed, `forbid(unsafe_code)`,
 every bound checked); `temen-mask` `confine` (in-window for all inputs incl. `u64::MAX`;
-`Window::sub` can't wrap past its sub-range); the `temen-mem` unsafe contracts; JIT mask
-elision (`ub_of`/`in_window` upper-bound-sound, saturating, width-accounted); the call.cap
+`Window::sub` — since deleted, #1867 — can't wrap past its sub-range); the `temen-mem` unsafe
+contracts; JIT mask elision (`ub_of`/`in_window` upper-bound-sound, saturating, width-accounted); the call.cap
 ABI (buffers sized from the compile-time verified sig); trap propagation (re-checked after
 every call/thunk); `call.dyn` (Spectre-safe masked dispatch + type-id check); the
 `temen-fiber` switches (register/alignment-complete on all three ABIs; body panic → abort);
@@ -3894,7 +3982,7 @@ team has **no expert safety net**.
   `wait`/`notify` futex + C11 atomics, in IR/interp/JIT across the parity matrix
   (interp everywhere; JIT on x86-64 unix, aarch64 unix, x86-64 Windows) — **no VM
   scheduler**, M:N is guest-built (D56/§12). **§14 nesting** has also landed on both
-  backends (sub-windows, the attenuable `AddressSpace`, the `Instantiator` incl.
+  backends (detached windows, the attenuable `AddressSpace`, the `Instantiator` incl.
   recursion + co-fibers + fault-driven yield, separate-module "plugin" children, and
   cross-domain `SharedRegion` `create`/`grant`), as has the **§5 fuel/epoch kill-path**
   (the lowering polls a host-owned interrupt cell, so a watchdog stops a runaway guest
@@ -3973,8 +4061,8 @@ as open-ended, not a byproduct of the build.
 | D15 | Revocation model | **Parked** | Host-mediated + generation counters vs. live-until-close |
 | D16 | Module ⊥ domain ⊥ thread; mapping to OS process/thread is invisible host policy | Settled | Enables transparent, zero-overhead nesting; domain↔one process |
 | D17 | Shared memory = `SharedRegion` mapped into multiple windows; region-relative offsets | Settled | One mechanism for all sharing; zero-overhead masked access; data plane for composition |
-| D18 | Nesting cost paid at setup not runtime; pass-through caps + sub-window memory are depth-independent | Settled | Transparent + zero steady-state overhead; cost only where parent interposes |
-| D19 | Child window = power-of-two sub-region of parent; `Instantiator` grants sub-window + attenuated caps + quota | **Amended 2026-09-29 — retiring** (INVARIANTS #13 ruling; #1289): every child gets a detached window of its own; the sub-region placement is deleted. Attenuation (caps, quota, tier ≤ parent's) is unchanged | Child can't tell it's nested; tier can't exceed parent's |
+| D18 | Nesting cost paid at setup not runtime; pass-through caps + child-window memory are depth-independent | Settled | Transparent + zero steady-state overhead; cost only where parent interposes |
+| D19 | Child window = power-of-two sub-region of parent; `Instantiator` grants sub-window + attenuated caps + quota | **Superseded** (INVARIANTS #13 ruling 2026-09-29; deleted in #1867): every child gets a detached window of its own, and the `Instantiator` names no range (#2433). Attenuation (caps, quota, tier ≤ parent's) is unchanged | Child can't tell it's nested; tier can't exceed parent's |
 | D20 | Split host: secret-less in-process fast runtime + out-of-process privileged supervisor | Settled | Fast where it's safe to be fast; flush tax only at distrust boundaries, amortized per quantum |
 | D21 | Direct confined syscalls by default; broker (gVisor-style) only when distrusting the kernel | Settled | Native syscall speed for granted resources; surface-reduction is an opt-in dial |
 | D22 | Mechanism-only concurrency: free uncapped fibers + capped vCPU capabilities; runtime builds the model | Settled | Sane target for every threading model; no built-in scheduler / no double-scheduling |
@@ -3993,7 +4081,7 @@ as open-ended, not a byproduct of the build.
 | D35 | Phase-1 IR spec pinned: instruction set, trap/wrap/saturate semantics, little-endian + IEEE FP, complete verifier rules, entry/instantiation contract | Settled | The concrete spec the verifier+interpreter are built from (§3b) |
 | D36 | Goal = relative to wasm: as secure as wasm (host), faster on interface/64-bit/startup with **compute pegged at Wasmtime parity** (shared Cranelift), simpler+more flexible interface | Settled | Absolute "escape impossible" not certifiable by this team; relative bar is reachable and measurable (§1a) |
 | D37 | Capabilities are **inert typed table indices**, not a sealed value class; a forged index traps or re-selects an own grant (authority binds to the table entry) | Settled | Removes §3a/§7 contradiction; lets handle/funcref live in registers/memory and lets C function pointers lower to function-table indices |
-| D38 | Confinement = **guard-when-bounded, check-and-clamp-when-not** (trap-confinement): bounds-check the **final effective address** against `[0, reserved)` with a cold `MemoryFault` trap, and clamp the address feeding the access with `& (reserved−1)` (architecturally a no-op past the check; on the speculative path it confines Spectre-v1 exactly as the old mask did). One isolated separately-fuzzable lowering pass; ONE configuration — no unhardened check-only tier | Settled; **the per-access shape is revised by D63** (branchless `select_spectre_guard` for top-level windows; this row's `trapnz` + AND is retained for nested §14 sub-windows) | Matches wasm32 hot path (zero instructions when elided); final-address checking closes the large-immediate escape; trap-at-the-access matches wasm UX and keeps the §18 escape oracle; isolation makes it fuzzable as the security hinge. (The original "1-op AND beats Wasmtime's cmp→cmov" claim was refuted by measurement — the 40-bit mask is a RIP-relative load, not an immediate — and is corrected in D63.) |
+| D38 | Confinement = **guard-when-bounded, check-and-clamp-when-not** (trap-confinement): bounds-check the **final effective address** against `[0, reserved)` with a cold `MemoryFault` trap, and clamp the address feeding the access with `& (reserved−1)` (architecturally a no-op past the check; on the speculative path it confines Spectre-v1 exactly as the old mask did). One isolated separately-fuzzable lowering pass; ONE configuration — no unhardened check-only tier | Settled; **the per-access shape is revised by D63** (branchless `select_spectre_guard` for every window; the bulk-span check keeps this row's `trapnz` + AND) | Matches wasm32 hot path (zero instructions when elided); final-address checking closes the large-immediate escape; trap-at-the-access matches wasm UX and keeps the §18 escape oracle; isolation makes it fuzzable as the security hinge. (The original "1-op AND beats Wasmtime's cmp→cmov" claim was refuted by measurement — the 40-bit mask is a RIP-relative load, not an immediate — and is corrected in D63.) |
 | D39 | C ABI: forced **two-stack split** (out-of-band control stack + in-window guard-paged data stack); address-taken→data stack, scalar non-address-taken→SSA; LP64/little-endian; **by-value aggregates by hidden pointer** (sret); clang-wasm-style vararg buffer | Settled | Window+trap-confinement (§4) and out-of-band control stack (§5) force the split; by-pointer is simplest-correct and ~wasm parity; whole-program MVP needs no external-ABI match (§3d) |
 | D40 | Const globals + string literals in a **read-only data segment** (`protect` at instantiation) | Settled | One extra protect call → writes to const data fault → §5 detect-and-kill; cheap self-corruption detection |
 | D41 | A fiber owns a **stack pair** (in-window data stack + out-of-band control stack); stacks are **per-fiber**; the control stack is unreachable by guest masking (CFI) but **charged to the guest's memory quota** (so a fiber-bomb self-OOMs, not the host) | Settled | Reconciles the §3d two-stack split with §12 fibers; keeps both CFI (§5) and "fibers metered/sandbox-safe" (§12/§15); switch swaps both SPs, ~ns |
@@ -4017,9 +4105,14 @@ as open-ended, not a byproduct of the build.
 | D59 | **Guest-driven JIT = the `Jit` capability (§22): a guest submits verified IR and gets native code in its *own* domain.** Verification, not isolation, is the trust boundary — a JIT'd unit is exactly as powerful as its submitter (same window/handles), with one new authority-TCB precondition (declared memory ≡ parent window, which a link unit's must fit; a runnable unit carries no data and a link unit's is placed in a room the guest names, #2167; concurrency ops gated) keeping "no escape-TCB change" true. Model A (call.cap trampoline, default) sidesteps the baked function-table mask; Model B2 (`install` into a pre-reserved table) neutralizes it by pre-sizing — both ship, all four cross-call directions differentially pinned. Type identity is an append-only intern (id-equality ≡ structural equality), never read at runtime. Code reclaim is whole-module recompaction (no per-function free in cranelift-jit), driven by `recompact_jit`/`JitSession` on a byte watermark. Threaded `install` + threaded `compile` work with full platform parity (atomic `DomainTable`/`FnEntry`; `cap_thunk_locked` serializes compiles while execution stays parallel; no aarch64 `isb` needed). | Settled (built, differentially tested) | The "JIT inside the sandbox" wasm handles poorly; the submit-a-blob boundary + verifier-as-hinge already existed, so it was authority-TCB-mostly. Model A's worst case is perf/ergonomics (announced by a benchmark), B2's is a host-writes-into-live-table primitive — both earned their place; the sharded-module throughput optimization stays deferred until measured. Full design + security argument + reclaim/concurrency in §22 |
 | D60 | **Durable domains via an IR→IR freeze/thaw transform + a backend-independent snapshot codec (§21).** A domain is quiesced and serialized to `(window image + per-page prots, in-window shadow control state, host-side handle table)` and restored to bytewise-equivalent execution across recompiles/backends/hosts. The freeze/thaw transform (`temen-durable`) is pure IR — *no new instruction* (state word + per-fiber shadow stack in the window; unwind spills the live set, rewind `br_table`s on a resume id); the snapshot codec (`temen-snapshot`) is a canonical versioned-TLV container bound to the instrumented-module digest (restore refuses on mismatch). Both are tooling-tier, **+0 escape-TCB**. | Settled (built — single + multi-vCPU freeze/thaw on both backends, snapshot v4) | Durability falls out of total IR (D34), the out-of-band control stack (D5), and block-local-SSA liveness (D1) with no escape-TCB cost; the artifact's recompile-survival is the durability boundary. Full design + phase tracker in `DURABILITY.md` |
 | D61 | **Guard-relying base-hoist elision to claw back trap-confinement's load-dense-loop cost (§4).** Hoist one check+clamp of a loop-invariant unbounded base into the preheader, then elide the per-access check+clamp for accesses of proven reach `B`. Architecturally sound with the existing guard; the risk is the **speculative overshoot** `base_clamped + off_i ∈ [0, reserved + B)`, which binds the JIT elision analysis to the allocator by the invariant **`trusted_reach ≤ guard_size`** (a wrong bound = *speculative* escape). Blocker found: `mem.rs` reserves only **one** trailing guard page, capping safe reach at 4 KiB (Scope A, zero allocator change — captures the C stack-locals case) unless the guard is enlarged (Scope B — captures `dot`/`matmult`/`cache`, changes escape-TCB allocation). | **Proposed — design only; no escape-TCB code until the invariant is signed off.** Its straight-line Scope A slice is built as D67 (#2147): one-page reach, no allocator change, the guard and the reach one definition. The loop-hoisting form remains design only. | The one measured trap-confinement regression is load-dense loops over an unbounded base (§1a `matmult +5%`, `cache +6.7%`); this is the staged wasm32-style guard-relying win (§4), deferred not on value but because its speculative-overshoot correctness turns on a coupled security-hinge invariant with no expert reviewer (§18). Verification: escape oracle (architectural) + a new `trusted_reach ≤ guard_size` fuzz probe (speculative) |
-| D62 | **Bulk-memory IR ops (`mem.copy`/`mem.move`/`mem.fill`) confined once per span, not per byte (§4).** New no-result ops lower `llvm.memcpy`/`memmove`/`memset` to a *single* whole-span range check (`[ptr, ptr+len) ⊆ [0, reserved)`, computed overflow-free via the `len > reserved` sub-check that guards the `reserved − len` subtraction, gated by `len != 0`) plus a base Spectre-clamp, then the platform `memcpy`/`memmove`/`memset` **libcall** (Cranelift `call_memcpy`/…, resolved by the JIT's `default_libcall_names`). Replaces temen-llvm's old lowering — a per-8-byte-chunk *masked* load/store unroll (≤ 4 KiB) or a byte-at-a-time `__temen_memcpy`/`memset`/`memmove` helper (larger/variable) — which paid one confinement check per chunk/byte. The tree-walk interpreter (the differential oracle) mirrors it with a scalar checked span copy/fill (overlap-safe snapshot); the **bytecode interpreter** takes a fast path — the same whole-span confinement + prot scan, then a single bulk `Region::copy_within`/`fill` (`memmove`/`memset` on the backing) instead of the scalar loop, under the same single-threaded-cooperative contract as its `read_word`/`write_word` — leaving the tree-walker as the independent scalar reference. **The wasm on-ramp also lowers `memory.copy`→`MemMove`/`memory.fill`→`MemFill`** (previously a per-chunk masked unroll ≤ 64 KiB / a scalar byte loop), so wasm-sourced bulk ops now take the same fast path as the LLVM on-ramp. **`table.copy` also lowers to `MemMove`** (`count*4` bytes — the table is window memory, so it is a guest span like `memory.copy`); only `memory.init`/`table.init` keep their const-store unroll, because their source is compile-time **host data** (data-segment bytes / element indices), not a guest span a `memmove` could copy. **A per-span guard-read probe (`probe_span`, ISSUES.md I21) closes the `mapped` vs `reserved` gap:** the range check bounds against `reserved`, but the interpreter faults on any byte past the *backed* `mapped` extent — so before each libcall the JIT reads the span's last byte through the guard (faulting up front, honoring guest `grow`, and independent of libc's `dst == src` short-circuit), making the JIT byte-identical to the interpreters on faulting bulk ops too (no partial write, no lost trap). | **Settled (built — temen-ir/verify/interp/bytecode/encode/text/peval/jit/llvm/wasm; bytecode interp + wasm on-ramp on the fast path, tree-walker the scalar oracle; `temen-mem` `Region::fill`/`copy_within` bulk primitives; `memcpy` helper retained only for realloc/snprintf/`__vm_fmt`; JIT `probe_span` per I21)** | Isolated as the dominant array-copy gap to Wasmtime-w64 (`confine` harness: the faithful `matmul_eb` kernel's memcpy was the whole difference from parity `matmul`); the bulk primitive is the `memory.copy`-class lowering Wasmtime uses — same confinement guarantee (whole span proven in-bounds before any access), checked once. Same "as secure as wasm" speculative posture as a bounds-checked `memory.copy` (§1a): the length is checked, the base clamped, the copy a non-speculated libcall — so no per-byte clamp. Measured: `matmul_eb` temen÷wt64 **1.264→1.202** (control `matmul` flat), all 19 embench kernels `verify=1`. Verification: a JIT↔both-interpreters differential (`temen-jit/tests/bulk_mem.rs` — fill/copy, overlapping move, zero-length-wild-pointer no-op, OOB + oversized-length fault) + the span-OOB-formula fuzz probe in `fuzz/mask` (JIT formula vs a `u128` oracle) |
+| D62 | **Bulk-memory IR ops (`mem.copy`/`mem.move`/`mem.fill`) confined once per span, not per byte (§4).** New no-result ops lower `llvm.memcpy`/`memmove`/`memset` to a *single* whole-span range check (`[ptr, ptr+len) ⊆ [0, reserved)`, computed overflow-free via the `len > reserved` sub-check that guards the `reserved − len` subtraction, gated by `len != 0`) plus a base Spectre-clamp, then the platform `memcpy`/`memmove`/`memset` **libcall** (Cranelift `call_memcpy`/…, named by the JIT's `default_libcall_names` and bound to the C runtime's functions, D70). Replaces temen-llvm's old lowering — a per-8-byte-chunk *masked* load/store unroll (≤ 4 KiB) or a byte-at-a-time `__temen_memcpy`/`memset`/`memmove` helper (larger/variable) — which paid one confinement check per chunk/byte. The tree-walk interpreter (the differential oracle) mirrors it with a scalar checked span copy/fill (overlap-safe snapshot); the **bytecode interpreter** takes a fast path — the same whole-span confinement + prot scan, then a single bulk `Region::copy_within`/`fill` (`memmove`/`memset` on the backing) instead of the scalar loop, under the same single-threaded-cooperative contract as its `read_word`/`write_word` — leaving the tree-walker as the independent scalar reference. **The wasm on-ramp also lowers `memory.copy`→`MemMove`/`memory.fill`→`MemFill`** (previously a per-chunk masked unroll ≤ 64 KiB / a scalar byte loop), so wasm-sourced bulk ops now take the same fast path as the LLVM on-ramp. **`table.copy` also lowers to `MemMove`** (`count*4` bytes — the table is window memory, so it is a guest span like `memory.copy`); only `memory.init`/`table.init` keep their const-store unroll, because their source is compile-time **host data** (data-segment bytes / element indices), not a guest span a `memmove` could copy. **A per-span guard-read probe (`probe_span`, ISSUES.md I21) closes the `mapped` vs `reserved` gap:** the range check bounds against `reserved`, but the interpreter faults on any byte past the *backed* `mapped` extent — so before each libcall the JIT reads the span's last byte through the guard (faulting up front, honoring guest `grow`, and independent of libc's `dst == src` short-circuit), making the JIT byte-identical to the interpreters on faulting bulk ops too (no partial write, no lost trap). | **Settled (built — temen-ir/verify/interp/bytecode/encode/text/peval/jit/llvm/wasm; bytecode interp + wasm on-ramp on the fast path, tree-walker the scalar oracle; `temen-mem` `Region::fill`/`copy_within` bulk primitives; `memcpy` helper retained only for realloc/snprintf/`__vm_fmt`; JIT `probe_span` per I21)** | Isolated as the dominant array-copy gap to Wasmtime-w64 (`confine` harness: the faithful `matmul_eb` kernel's memcpy was the whole difference from parity `matmul`); the bulk primitive is the `memory.copy`-class lowering Wasmtime uses — same confinement guarantee (whole span proven in-bounds before any access), checked once. Same "as secure as wasm" speculative posture as a bounds-checked `memory.copy` (§1a): the length is checked, the base clamped, the copy a non-speculated libcall — so no per-byte clamp. Measured: `matmul_eb` temen÷wt64 **1.264→1.202** (control `matmul` flat), all 19 embench kernels `verify=1`. Verification: a JIT↔both-interpreters differential (`temen-jit/tests/bulk_mem.rs` — fill/copy, overlapping move, zero-length-wild-pointer no-op, OOB + oversized-length fault) + the span-OOB-formula fuzz probe in `fuzz/mask` (JIT formula vs a `u128` oracle) |
 | D64 | **On-ramp SIMD target: compile guest C for a rich-128-bit profile (`-march=x86-64-v3 -mprefer-vector-width=128` on x86; NEON on ARM), not the `x86-64` baseline.** The LLVM on-ramp consumes **host** LP64 bitcode, so — unlike wasm, which is capped at the portable `simd128` op set for portability — temen-jit can target the *actual* CPU's richer 128-bit SIMD. The `x86-64` baseline (SSE2) is **poorer** than `simd128` (no `i32x4.mul`/`pmulld`, no wide widening muls), which under-vectorized guest code and made temen-jit look behind on array kernels; `x86-64-v3` (AVX2 — universal on x86 since ~2013) gives LLVM the ops `simd128` has, and `-mprefer-vector-width=128` keeps LLVM at 128-bit so **Cranelift never has to split a 256/512-bit vector** (it has no YMM/ZMM register class — D58). This is the axis where the host on-ramp *should* beat wasm (§1a's 64-bit/host-native advantage); the two frontend flags realize it. **+0 escape-TCB:** richer auto-vectorization only emits more **value-only** `v128` ops (verifier re-checks; D58); the confinement path is untouched. Cranelift still feature-detects the running CPU, so `x86-64-v3` bitcode **runs and verifies on any x64 host** (a rarer non-AVX2 host lowers the 128-bit ops via baseline encodings — correct, just slower). Also landed alongside: **fuse `sext(narrow load)` → a signed load** (`movsx (mem)` instead of `movzx`+register `movsx`) in temen-llvm's §3b load discipline — a correct scalar-signed-`short`/`char` win, +0 escape-TCB. | Settled (built — `bench/confine` temen lane + `embench` temen build on the target; signed-load fusion in temen-llvm) | The `confine` "parity/faster" reads (D63) were partly an artifact of the harness building the **wasm lanes without `-msimd128`** — comparing temen-jit-vectorized against Wasmtime-*scalar*. With SIMD on both sides the honest gap appeared (matmul 1.42×, edn 1.37×). Root-caused via A/B: the temen lane was under-targeting (SSE2), not a backend-codegen deficit — retargeting to `x86-64-v3` (128-wide) flips the vectorizable kernels to **parity-or-faster** (matmul 1.42→**0.91×**, matmul_eb 1.15→**1.04×**, fir 0.56→0.38×) and pulls the **embench geomean ahead of Wasmtime-w64 for the first time: temen-jit 1.96× vs wt64 2.00×** (was 2.12× vs 2.04×), all 19 kernels still `verify=1`. **Residual — `edn` stays ~1.43× at every frontend target** (not vectorization-availability): its codegen is **534 lane insert/extract ops (`vpinsr`/`vpextr`) vs 40 real `vpmulld`** — temen-jit lowers vector **integer width-conversions** (`<8×i16>`→`<8×i32>`→i64, edn's short→int→long DSP) by exploding to scalar lanes + repacking (`vec_explode`/`vec_implode`) instead of native SIMD widen/narrow (`vpmovsxwd`/`vpackssdw`). **Native widen/narrow landed (D65a) — but it revised this diagnosis.** Wiring the on-ramp's full-128 `sext`/`zext`→`swiden`/`uwiden` and 256→128 wrapping `trunc`→byte-`shuffle` cut edn's lane insert/extract ops **93% (563→39)** yet moved wall-clock only **~1.8% (temen÷wt64 1.478→1.452, clean same-machine A/B)** — so the scalarized width-conversions were **not** edn's dominant cost. **Per-kernel profiling (D65b) then root-caused the residual:** edn's gap is concentrated in the **dot-product MAC kernels** (`fir` 14.3×, `fir_no_red_ld` 8.0×, `mac` 8.0× temen÷native — ~75% of temen's edn time; the scalar/recursive kernels `latsynth`/`iir1`/`jpegdct` are 2–4×, i.e. fine). Their `long sum += (short)a*(short)b` vectorizes at **VF=2** (a `<2×i64>` accumulator — forced by the 128-bit cap on the `i64` accumulate), and temen **scalarizes the whole 2-lane sub-128 chain**: per-element `movswq` widening loads + `vpinsr` lane packs + shuffles (fir: 18 scalar-widen + 14 `vpinsr` + 14 shuffle + 48 `movq`) where native uses 4 `vpmovsxwq` + 2 `vpmuldq`. **The widening multiply is *not* the lever** (A/B-validated: replacing the `vpmullq` `mul <2×i64>` with a cheap `add` moved `fir` only ~6%, 5275→4938 ns — so `VExtMul` recognition was not built). The real cost is the pervasive **2-lane widening-load/pack scalarization**; closing it needs native sub-128 2-lane widen loads (`<2×i16>`→`<2×i64>` via one `pmovsxwq`), the fiddly packed-representation case D65a deliberately skipped, for an uncertain partial win — deferred. Native widen/narrow is kept as the **correct** lowering (matches wasm's `i32x4.extend_*`, +0 escape-TCB, smaller codegen) with a modest win, not the parity-closer this row implied. Caveat: baking a target into bitcode trades that artifact's portability (AVX2-compiled bitcode assumes AVX2) — wasm's portability/perf tradeoff, inverted in our favor for a JIT-per-host system (compile for the deployment baseline, or per-host). |
-| D63 | **Branchless per-access confinement (`select_spectre_guard`), superseding D38's `trapnz` + AND clamp — uniform for top-level *and* §14 nested windows.** A non-elided access lowers to `cmp; select_spectre_guard(oob, guard_offset, sub_base + addr+offset); load` — an out-of-bounds address is redirected (branchlessly, via cmov) to `guard_offset = round_up(win_reserved, page)`, the offset of the enclosing window's trailing guard page, so the access itself faults there (`MemoryFault`). Same architectural fault and same clear-fault-at-the-offending-access property as D38; same Spectre-v1 confinement (`select_spectre_guard` is a speculation barrier — a misspeculated OOB access also lands on the guard), via the **identical Cranelift primitive Wasmtime uses**. A **nested** sub-window redirects to the *parent's* guard (its own slice has committed parent memory on both sides, so redirecting to the child's `reserved` could alias the parent — a child→parent escape); redirecting the whole physical offset past `+ sub_base` lands an out-of-child access on the parent guard, never in the parent. In-process nesting is defense-in-depth, not a promised Spectre boundary (§2a). | Settled (supersedes D38's per-access shape; D38's escape-oracle contract unchanged) | The A/B (`confine` harness) refuted D38's "1-op AND beats Wasmtime's cmp→cmov" claim: the 40-bit reservation mask is not an x86 immediate, so the AND was a **RIP-relative load per access**, and the `trapnz` added a per-access **branch** — together ~1.06×/1.34× behind Wasmtime-w64 on `matmul`/`matmul_eb`. Branchless cmov-to-guard hoists the guard offset into a register and removes the branch, reaching **0.94×/0.97×** (parity/faster), with **nested windows on the same fast path** (no penalty). A `trapnz`-keeping cmov variant (clamp only) regressed (1.23×/1.55×) — the branch removal, not the cmov, is the win. **Guard target = `round_up(win_reserved, page)`, not `reserved`**: a sub-page window commits its prefix page-granularly, so only the page-aligned offset is `PROT_NONE` (caught by the escape oracle). Verification: OOB→`MemoryFault` + sub-window escape oracle (out-of-child faults, parent untouched) + `fuzz/mask` (the OOB predicate is unchanged) + escape oracle (§18) |
+| D63 | **Branchless per-access confinement (`select_spectre_guard`), superseding D38's `trapnz` + AND clamp — uniform for every window.** A non-elided access lowers to `cmp; select_spectre_guard(oob, guard_offset, addr+offset); load` — an out-of-bounds address is redirected (branchlessly, via cmov) to `guard_offset = round_up(win_reserved, page)`, the offset of the window's trailing guard page, so the access itself faults there (`MemoryFault`). Same architectural fault and same clear-fault-at-the-offending-access property as D38; same Spectre-v1 confinement (`select_spectre_guard` is a speculation barrier — a misspeculated OOB access also lands on the guard), via the **identical Cranelift primitive Wasmtime uses**. A §14 child's window is a reservation of its own with its own guard (one window shape, #1867 — the carve's sub-window, which redirected to the *parent's* guard past a `sub_base` term, is deleted), so the redirect has no nested form. In-process nesting is defense-in-depth, not a promised Spectre boundary (§2a). | Settled (supersedes D38's per-access shape; D38's escape-oracle contract unchanged) | The A/B (`confine` harness) refuted D38's "1-op AND beats Wasmtime's cmp→cmov" claim: the 40-bit reservation mask is not an x86 immediate, so the AND was a **RIP-relative load per access**, and the `trapnz` added a per-access **branch** — together ~1.06×/1.34× behind Wasmtime-w64 on `matmul`/`matmul_eb`. Branchless cmov-to-guard hoists the guard offset into a register and removes the branch, reaching **0.94×/0.97×** (parity/faster), with **every window on the same fast path** (no nesting penalty). A `trapnz`-keeping cmov variant (clamp only) regressed (1.23×/1.55×) — the branch removal, not the cmov, is the win. **Guard target = `round_up(win_reserved, page)`, not `reserved`**: a sub-page window commits its prefix page-granularly, so only the page-aligned offset is `PROT_NONE` (caught by the escape oracle). Verification: OOB→`MemoryFault` + the escape oracle's detached-child placement (out-of-child faults, root untouched, #2159) + `fuzz/mask` (the OOB predicate is unchanged) + escape oracle (§18) |
 | D65 | **The `rustbench` call-heavy gap to Wasmtime-w64 (`parse`/`bfs`, ~1.22× temen÷wt64) is diffuse — no single lever — after two hypotheses were measured and *rejected*.** On the six real-program `rustbench` workloads, temen-jit is **at parity-or-faster than wt64 on four** (hashmap 0.94×, vm 0.93×, sort 0.82×, base64 0.86×) and trails only on the two most **call/recursion-dense** (`parse` 14 call sites, `bfs` 13; the gap tracks call count). Two cheap env-gated A/Bs (throwaway, reverted) tested the obvious causes: **(1) the threaded-context ABI** — temen's natural CLIF ABI threads `(mem_base, fn_table_base, trap_out, stack_limit)` as explicit args through every call (vs Wasmtime's single pinned `vmctx` register), so a vmctx consolidation was the candidate fix. *Rejected*: doubling the threaded context to 8 args (`TEMEN_JIT_EXTRA_CTX`, verified in CLIF — 10-arg sigs, extras spilling to stack) produced **no systematic slowdown** on the call-heavy workloads (parse/bfs flat-to-faster, sign inconsistent = register-allocation noise), so arg marshalling is not the cost and a vmctx rewrite of the JIT ABI would not pay off. **(2) the per-entry checks** — temen emits `emit_epoch_check` (kill-poll) + `emit_stack_check` (`get_stack_pointer`+cmp+branch software stack guard) at every function entry, which wasm gets free via guard pages. *Minor*: skipping them (`TEMEN_JIT_SKIP_ENTRY_CHECKS`, measurement-only, drops a safety guard) recovered only **~6% on `parse`** (deepest recursion), ~3% on `vm`, and **~0% on `bfs`** — against a ±2% noise floor, a small diffuse cost, not the ~22% gap. | Settled (investigated; both fixes rejected on measurement — do not re-run without a new hypothesis) | The value is the **two negative results**: they cheaply pre-empted a risky JIT-ABI rewrite (vmctx) and a guard-disabling change, each of which measurement showed would deliver little. The residual gap is a handful of small per-call overheads (entry checks, call/ret, sp-threading) with no single dominant term — so per the prime directive (don't optimize the trusted core without a concrete measured win) the perf dig stops here. temen-jit is already "as fast as wasm" on real programs where it counts (4/6 workloads ahead). Method: `bench/rustbench` temen-jit ×native A/B under the two env flags; correctness cross-check stayed green throughout (the ABI perturbation was sound). |
 | D66 | **§14 child domains are platform-scheduled, M:N, migrating, over a bounded worker pool; threads *within* a domain stay 1:1; parallelism is a granted resource bounded at dispatch, ceiling with per-child lanes (§23 "Child-domain scheduling").** Amends D22/D56/D57 in *scope*, not direction: the no-scheduler rule is about a domain's own `thread.spawn` units (where the double-scheduler objection is real); where a *domain* runs is placement, like `Attestation.tier`, and no guest observes a sibling's. D57's guest-built M:N cannot reach a detached child (a fiber is in-window; a detached child owns its window), so on the JIT N detached children were N OS threads bounded by the OS (#1586/#1587) — a #3 break in the direction "a parent consumes what it was never granted". The migration unsafe is the one D57 already paid: same switch, same happens-before, plus an env swap of `Send` data; nothing a child owns is thread-affine. Migrating over affine because naive migrating is *one queue* (the oracle's shape, reproducible by `explore_all`) while affine is per-worker queues plus placement, a third scheduler shape, and cannot share the interpreter's scheduler. Sound under five rules (§23 R1–R5): every resume its own guard bracket over the child's fault range (a stale range misclassifies faults both ways); #1466 extended to task-level TLS; a dead domain never resumed; trap attribution by task identity; `mem_base` at first entry only. Buys, at once: conserved concurrency, no pool-starvation deadlock (a park never holds a worker), #1361's harvest as one implementation on all three engines, #1584 closed by construction, deterministic child-domain scheduling under the interp's seeded policy. Owner rulings 2026-09-21: C over B; dispatch-time parallelism over spawn-time count; ceiling with lanes over transfer (stranded capacity declined; a parent may absorb a child's lane). | Adopted (amends D22/D56/D57 in scope; staged) | The resource fix, the freeze fix (#1361) and the parked-child fix (#1584) were one decision; making them three would have built the JIT's harvest as a different shape and left "granted N threads" unrepresentable. Cost recorded in §23; slices in #1600 |
-| D67 | **Accesses near a checked base share its bounds check, within one CLIF block (D61 Scope A, straight-line; #2147).** A non-elided top-level access tests its own address against `reserved` alone (`a ≥ reserved` → `select_spectre_guard` to the guard, D63) and becomes its block's **check point** for its *root*, the value its address adds constants to. A later access through the same root at a constant `d ≥ 0` past the check point, with `d + offset + width ≤ trailing_guard`, takes the checked base plus a constant and tests nothing. **Exact:** if the check point's `a < reserved`, the later address is `a + d` with no wrap, and whatever of the access lies past `reserved` faults on the guard page at that access, where `checked_reserved` faults it; if `a ≥ reserved`, the check point faulted first. **Speculative overshoot ≤ the guard:** a misspeculated check point's base is the guard's, so `trusted_reach ≤ guard_size` (D61) holds by construction, since the JIT's reach and the allocator's guard are one definition (`mem::trailing_guard`). **Stores share too:** a store that straddles `reserved` writes nothing before it faults only on hardware that never tears a faulting store (x86-64 guarantees it, Arm and RISC-V don't), the reliance D63 already has at `mapped` and at protected pages (#2162). A loads-only variant, stores keeping D63's exact check, was measured and rejected: a store's address is then a different value from a load's at the same address, which defeats Cranelift's store-to-load forwarding (`hexer d`: 5.34 G JIT instructions, against 5.08 G with no sharing at all). Applies only to top-level windows with a page-aligned reservation whose guard starts at `reserved`; §14 sub-windows, unaligned reservations and spans past the guard keep D63's exact check. Within one CLIF block only: a base computed before a call's trap check or a resume entry need not dominate the code after it. | Built (#2147) | The `confine` C kernels (temen-jit, median of 3 rounds): `edn` −30%, `fir` −12%, `bytes` −5%, `matmul`/`matmul_eb` unchanged. On nimony's `hexer d` (Cranelift), 33% of loads and stores share a check (static); clamp instructions −19% (0.53→0.43 G), all instructions −2.7%, execution −1.5%. Verification: an escape-oracle sweep in which each access in turn crosses the window's end and bases wrap below zero (it crashes or fails if negative distances share, or if the reach exceeds the guard), plus the §18 differential suites and the self-hosted lane. |
+| D67 | **Accesses near a checked base share its bounds check, within one CLIF block (D61 Scope A, straight-line; #2147).** A non-elided access tests its own address against `reserved` alone (`a ≥ reserved` → `select_spectre_guard` to the guard, D63) and becomes its block's **check point** for its *root*, the value its address adds constants to. A later access through the same root at a constant `d ≥ 0` past the check point, with `d + offset + width ≤ trailing_guard`, takes the checked base plus a constant and tests nothing. **Exact:** if the check point's `a < reserved`, the later address is `a + d` with no wrap, and whatever of the access lies past `reserved` faults on the guard page at that access, where `checked_reserved` faults it; if `a ≥ reserved`, the check point faulted first. **Speculative overshoot ≤ the guard:** a misspeculated check point's base is the guard's, so `trusted_reach ≤ guard_size` (D61) holds by construction, since the JIT's reach and the allocator's guard are one definition (`mem::trailing_guard`). **Stores share too:** a store that straddles `reserved` writes nothing before it faults only on hardware that never tears a faulting store (x86-64 guarantees it, Arm and RISC-V don't), the reliance D63 already has at `mapped` and at protected pages (#2162). A loads-only variant, stores keeping D63's exact check, was measured and rejected: a store's address is then a different value from a load's at the same address, which defeats Cranelift's store-to-load forwarding (`hexer d`: 5.34 G JIT instructions, against 5.08 G with no sharing at all). Applies only to windows with a page-aligned reservation whose guard starts at `reserved`; unaligned reservations and spans past the guard keep D63's exact check. Within one CLIF block only: a base computed before a call's trap check or a resume entry need not dominate the code after it. | Built (#2147) | The `confine` C kernels (temen-jit, median of 3 rounds): `edn` −30%, `fir` −12%, `bytes` −5%, `matmul`/`matmul_eb` unchanged. On nimony's `hexer d` (Cranelift), 33% of loads and stores share a check (static); clamp instructions −19% (0.53→0.43 G), all instructions −2.7%, execution −1.5%. Verification: an escape-oracle sweep in which each access in turn crosses the window's end and bases wrap below zero (it crashes or fails if negative distances share, or if the reach exceeds the guard), plus the §18 differential suites and the self-hosted lane. |
+| D68 | **Cranelift's verifier runs on every compile at two points: on the CLIF temen lowers, before Cranelift's passes, and on the CLIF those passes hand the backend. After each pass too, with debug assertions and under the fuzzers (#2449).** The verifier checks that CLIF is well formed (types, SSA dominance, arity, signatures), not confinement. The first point keeps Cranelift's passes from running on malformed CLIF, which they can turn into well-formed wrong code; the second keeps a pass that breaks the CLIF from reaching the backend. The checks between passes add only which pass broke it, a diagnosis the debug and fuzz builds keep. Wasmtime turns its verifier off by default (`Config::cranelift_debug_verifier`); temen keeps two points in release because its CLIF generation is escape-TCB. | Settled (owner, #2449) | On unir's store unit (2,192 functions, 4-vCPU VM), the verifier after every pass took 1.49 s of a 5.2 s one-thread compile, 0.27–0.32 s a run; the two points take 0.58 s. On four threads Cranelift's part drops from 1.42 to 1.15 s and the full compile from 1.86 to 1.56 s. Neither point sees the machine code the backend emits, where Cranelift's published escapes were (CVE-2021-32629, CVE-2023-26489): #2481. |
+| D69 | **Each instance of shared code stands up the runtimes its code runs on (temen#2389).** `SharedCode::instance` makes, for the instance and charged to its run's budget node, each runtime the compile made: the thread domain, the fiber table and the root vCPU's fiber runtime, the §14 nursery its `Instantiator` sites spawn through, and the `setjmp` table. The `SetJmp`/`LongJmp` sites now load the table from the `vmctx` (`VmCtx::setjmp`) instead of baking its address, so no compile names a per-instance object. A root that spawns, runs fibers or threads, or uses `setjmp` is shared like any other: a fork twin, an `execve` and a run handed a kept `JitCodeCache` instantiate one compile. Only a module a §22 hosting entry stood a runtime up on after its compile (`hosted`) or defined a unit into stays unshared. temen-run keys a program over the locked powerbox apart from a raw one's, since the code bakes the thunk for the powerbox's shape, and forks only a program over the raw powerbox. | Settled (#2389) | A thread domain, a fiber table, a nursery and a `setjmp` table are allocations; a nursery's executor starts its workers on the first spawn. The kept instance in `SharedCode` stands its own up, and never runs. |
+| D70 | **Compiled code calls the host by symbol, never by address (temen#2452).** Each host function the code calls (temen-jit's thunks, libc `_setjmp`/`_longjmp`, the stack-limit and trap-capture helpers, and the compile's own: the embedder's `call.cap` thunk, its signal-delivery thunks, a demand-paged child's page-miss thunk (#2164), and the D45 fast-path targets its resolver claims) the code names by a symbol (`HostFn`), through a relocation. Linking the code binds each symbol to the function's address in the process (`new_jit_module`): temen-jit's from a fixed table, the compile's from its `Imports`, a fast-path target by asking the resolver again. Cranelift's libcalls (`memcpy`, `fma`, …) are bound the same way, to the C runtime's functions from a fixed table (`libcalls`), so no name is looked up in the process's dynamic symbol table, which a statically linked host doesn't have (#2514). With the per-instance addresses in the `vmctx` (#1768, D69), the code a compile emits names no address in its process, so it links into any other: what an on-disk code cache stores. The symbols are not C identifiers, so no lookup in the process's own symbol table binds one. A submitted unit that uses `setjmp` is refused by a module with no `setjmp` table, where its sites used to call address 0. | Settled (#2452) | None at run time: Cranelift lowers a call to an imported symbol to the `movabs` and indirect `call` a baked address lowered to (a literal load and `blr` on AArch64). Linking patches one 8-byte address per call site. |
+| D71 | **A compile's code can be kept on disk, and a later process defines it instead of compiling (temen#2452).** A `CodeDir` keeps, per compile, each guest function's code as Cranelift emitted it with its relocations by name: a function of the module by index, a host function by its D70 symbol, a Cranelift libcall by name. A compile handed one (`CompiledModule::compile_kept`, `ChildCodeCache::kept_in`, temen-run's `JitCodeCache::kept_in`) looks for its key first: the module's content digest and every other input its code depends on (entry, kill-path and fuel checks, the D45 fast path, window and table geometry; for a §14 child, which cells it has and whether it is demand-paged, but not its `call.cap` or page-miss thunk, which only the link binds). A hit is defined through the same `define_function_bytes` and relocation step as fresh code, and its trampolines compile as ever. The code is input to the escape-TCB, so it is kept only where its owner alone can write: the directory and each file read must be this user's and writable by no one else, read without following a symlink, and each file carries its key, a stamp of this build of temen (the executable, by device, inode, size and modification time), the CPU (ISA and flags) and the host page size, and a checksum; any mismatch is a miss, and the compile that follows replaces the file. Before any function is defined, every relocation must name something the compile's link binds. An image that extends its own code (a root driving a `Jit`, a §14 child holding one) shares no compile, but starts from the code kept for it like any other; the units it adds are not kept. Not kept: a module with debug info, a signal-armed compile, a §22 unit. | Settled (#2452) | Unix only (`CodeDir::open` refuses elsewhere). A temen linked into a shared library would stamp the host executable's build, not its own, so it must not keep code. Identity is the module digest the in-memory caches already trust (`digest256`, not cryptographic), now across processes. One file per image and compile shape, so a new build overwrites rather than accumulates; what else the directory holds is its owner's to clear. |
+| D72 | **The embedder chooses its process's default window reservation, and the address-space pool is half the address space the host really gives the process (temen#2517).** A window whose builder names no reservation (an entry point's root, and every detached child, on every engine) reserves `temen_ir::default_reserved_log2()`, raised to the window's own size (`window_reserved_log2`). That is `DEFAULT_RESERVED_LOG2` (128 GiB) unless the embedder lowered it with `set_default_reserved_log2` before anything read it; the first read fixes it, so every window and every charge to the pool sees one value. The pool (`temen_interp::reserved_pool`) is half the host's address space: on Linux and Android its size is read from where the kernel put the initial stack (`AT_RANDOM`, `temen_mem::user_address_bits`), and other hosts are taken to give 47 bits. The browser and the wasm-JIT keep the constant, since their windows share it with the mask the wasm-JIT emits. | Settled (#2517) | Many Android arm64 kernels give a process 39 bits (512 GiB). The fixed 64 TiB pool admitted 512 default windows where three fit, so the fourth split the engines: the interpreter falls back to a heap-backed window, and the JIT cannot. The host owns its address-space budget (§4), so the embedder owns the setting, and the setting is process-wide because the address space is. Rejected: a default that follows the host (`min(37, va_bits − 10)`), because a guest's room to grow would then differ by device (invariant 14's host axis). |

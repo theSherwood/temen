@@ -36,7 +36,7 @@ use temen_text::parse_module;
 /// A caller `_start` that spawns a serving child (its `"child"`, func 1's child image, #2219), mints
 /// a live offer over its `adder` export (op 14), then calls `add(i, 1)` through the offer `n` times —
 /// parking on each call until the child serves it — accumulating the replies, joins the child, and
-/// exits with the low 32 bits of the sum. The spawn is detached, through a v1 record paid from the
+/// exits with the low 32 bits of the sum. The spawn is detached, through a spawn record paid from the
 /// caller's `"budget"`, and leaves the child's `exit` import empty, which it never calls. The
 /// child serves exactly `n` requests in a `svc.wait` loop, then returns. The sum is
 /// `Σ_{i=0}^{n-1} (i + 1) = n(n+1)/2` (wrapped to i32 at exit) — deterministic across backends.
@@ -63,9 +63,9 @@ block 0 () {{
   vcp = i64.const 16416
   vcl = i64.const 5
   vcm = self.resolve vcp vcl
-  q0m = i64.const 17560
+  q0m = i64.const 17544
   i32.store q0m vcm
-  q0b = i64.const 17564
+  q0b = i64.const 17548
   i32.store q0b vb
   q0a0 = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vh (q0a0)
@@ -85,7 +85,7 @@ block 1 (vh1: i32, vch1: i32, voffer1: i32, vi: i64, vacc: i64) {{
   br_if vcmp 1(vh1, vch1, voffer1, vi2, vacc2) 2(vh1, vch1, vacc2)
 }}
 block 2 (vh2: i32, vch2: i32, vaccf: i64) {{
-  vj = call.cap 6 1 (i32) -> (i64) vh2 (vch2)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh2 (vch2)
   vc = i32.wrap_i64 vaccf
   call.import 0 (vc)
   unreachable
@@ -122,7 +122,7 @@ block 0 (va: i64, vb: i64) {{
             &SpawnRec {
                 grants_ptr: 16448,
                 grants_n: 1,
-                ..SpawnRec::v1(0)
+                ..SpawnRec::default()
             }
         ),
         exit = rec::empty_grant(16448, 16432, "exit"),
@@ -149,10 +149,7 @@ fn run(backend: Backend, src: &str) -> i32 {
             backend,
             &RunConfig::default(),
             &[
-                (
-                    "vm",
-                    HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
-                ),
+                ("vm", HostCap::custom(6, 0, |h, _| h.grant_instantiator())),
                 ("budget", HostCap::detached_budget(1 << 20)),
                 (
                     "child",

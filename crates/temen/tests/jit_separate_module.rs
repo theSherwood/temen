@@ -1,11 +1,11 @@
 //! §14 **separate-module children on the JIT**, differentially vs. the interpreter — the
 //! "plugin-in-plugin" story end to end. The host verifies a *different* module, grants both backends
 //! an identical `Module` capability (iface 8), and the parent guest spawns a child domain running
-//! that module through a v1 record (op 17). On the JIT the child module is resolved through
+//! that module through a spawn record (op 17). On the JIT the child module is resolved through
 //! `temen_run::module_resolver` (a host callback, never guest-reachable) and **compiled at the
 //! spawn** — §14's "nesting cost paid at setup" for foreign code. Both backends must agree on the
-//! child's result (its data segments seeded into its own window), the entry a parent addresses by
-//! export name, a forged module handle's `CapFault`, and the final parent window bytes.
+//! child's result (its data segments seeded into its own window), a forged module handle's
+//! `CapFault`, and the final parent window bytes.
 
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
@@ -58,7 +58,7 @@ fn both_with(parent_src: &str, child_src: &str) -> BothOut {
     let grant = |h: &mut Host| {
         let budget = h.grant_budget(-1, 1 << 20, -1);
         h.register_cap_name("budget", budget);
-        (h.grant_instantiator(0, 128 << 10), h.grant_module(&child))
+        (h.grant_instantiator(), h.grant_module(&child))
     };
 
     let mut hi = Host::new();
@@ -91,83 +91,6 @@ fn both_with(parent_src: &str, child_src: &str) -> BothOut {
     (ir, imem, jo, jmem.bytes().to_vec())
 }
 
-/// A child ("plugin") with two exported entries — `"alpha"` (func 0) → `byte+1000`, `"beta"` (func 1)
-/// → `byte+2000` — to prove name→funcidx resolution selects the non-default entry identically on both
-/// backends (see `separate_module.rs`).
-fn named_child_src() -> &'static str {
-    "memory 16
-data 16484 \"VM\"
-export 0 func \"alpha\" 0
-export 1 func \"beta\" 1
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i64.const 16484
-  v2 = i32.load8_u v1
-  v3 = i64.extend_i32_u v2
-  v4 = i64.const 1000
-  v5 = i64.add v3 v4
-  return v5
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i64.const 16484
-  v2 = i32.load8_u v1
-  v3 = i64.extend_i32_u v2
-  v4 = i64.const 2000
-  v5 = i64.add v3 v4
-  return v5
-  }
-}
-"
-}
-
-#[test]
-fn jit_module_child_by_export_name_matches_interp() {
-    if !temen_jit::fiber_supported() {
-        return; // no JIT nesting runtime on this target
-    }
-    // The parent resolves "beta" (func 1) via Module op 0 — routed through `cap_thunk` →
-    // `cap_dispatch_slots` on the JIT, same as the interpreter — writes it into the entry of a v1
-    // record with the module and its `"budget"`, and spawns the child detached → join.
-    let parent = format!(
-        "memory 17
-data 16584 \"beta\"
-data 16640 \"budget\"
-func (i32, i32) -> (i64) {{
-block 0 (v0: i32, v1: i32) {{
-  v2 = i64.const 16584
-  v3 = i64.const 4
-  v4 = call.cap 8 0 (i64, i64) -> (i64) v1 (v2, v3)
-  ve = i32.wrap_i64 v4
-  rea = i64.const 17412
-  i32.store rea ve
-  rma = i64.const 17432
-  i32.store rma v1
-  vnp = i64.const 16640
-  vnl = i64.const 6
-  vb = self.resolve vnp vnl
-  rba = i64.const 17436
-  i32.store rba vb
-  rp = i64.const 17408
-  v9 = call.cap 6 17 (i64) -> (i32) v0 (rp)
-  v10 = call.cap 6 1 (i32) -> (i64) v0 (v9)
-  return v10
-  }}
-}}
-{}",
-        rec::segment(17408, &SpawnRec::v1(0))
-    );
-    let (ir, imem, jo, jmem) = both_with(&parent, named_child_src());
-    let ival = ir.expect("interp ran ok").pop().expect("one result");
-    assert_eq!(ival, Value::I64(86 + 2000), "interp name-addressed child");
-    assert!(
-        matches!(jo, JitOutcome::Returned(ref s) if s == &[86 + 2000]),
-        "jit name-addressed child: {jo:?}"
-    );
-    assert_eq!(imem, jmem, "interp/JIT parent windows diverge");
-}
-
 /// #1720 — a module nests **as built**: a powerbox `_start` (no params — how every program is built
 /// to start) is a module child on the JIT exactly as on the interpreter. An `i32` status joins
 /// sign-extended (the JIT's trampoline stores it as an interpreter `Reg` holds it), and an empty
@@ -177,28 +100,28 @@ fn jit_powerbox_entry_child_matches_interp() {
     if !temen_jit::fiber_supported() {
         return; // no JIT nesting runtime on this target
     }
-    // Spawn the module's entry 0 detached, through a v1 record paid from its `"budget"` → join →
+    // Spawn the module's entry 0 detached, through a spawn record paid from its `"budget"` → join →
     // the child's result.
     let parent = format!(
         "memory 17
 data 16640 \"budget\"
 func (i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32) {{
-  rma = i64.const 17432
+  rma = i64.const 17416
   i32.store rma v1
   vnp = i64.const 16640
   vnl = i64.const 6
   vb = self.resolve vnp vnl
-  rba = i64.const 17436
+  rba = i64.const 17420
   i32.store rba vb
   rp = i64.const 17408
   v6 = call.cap 6 17 (i64) -> (i32) v0 (rp)
-  v7 = call.cap 6 1 (i32) -> (i64) v0 (v6)
+  v7_st, v7 = call.cap 6 1 (i32) -> (i64, i64) v0 (v6)
   return v7
   }}
 }}
 {}",
-        rec::segment(17408, &SpawnRec::v1(0))
+        rec::segment(17408, &SpawnRec::default())
     );
     let status = "memory 16
 export 0 func \"_start\" 0
@@ -244,12 +167,12 @@ fn a_forged_module_handle_faults_on_both_backends() {
 data 16640 \"budget\"
 func (i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32) {{
-  rma = i64.const 17432
+  rma = i64.const 17416
   i32.store rma v0
   vnp = i64.const 16640
   vnl = i64.const 6
   vb = self.resolve vnp vnl
-  rba = i64.const 17436
+  rba = i64.const 17420
   i32.store rba vb
   rp = i64.const 17408
   v6 = call.cap 6 17 (i64) -> (i32) v0 (rp)
@@ -258,7 +181,7 @@ block 0 (v0: i32, v1: i32) {{
   }}
 }}
 {}",
-        rec::segment(17408, &SpawnRec::v1(0))
+        rec::segment(17408, &SpawnRec::default())
     );
     let (ir, _i, jo, _j) = both(&parent);
     assert_eq!(ir, Err(Trap::CapFault), "interp: a forged module handle");

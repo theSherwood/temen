@@ -30,7 +30,7 @@ use temen_interp::{bytecode, Host, PreparedModule, StreamRole, Trap, Value, DEFA
 // The `webgpu` capability's host import (browser: `navigator.gpu` via `webgpu_op`). Wasm-only — native
 // builds (the Rust reactor tests) have no such import, so the cap is simply not granted there.
 mod nimony;
-pub use nimony::{library_pack, nim_build, NimBuild};
+pub use nimony::{module_suffix, nim_build, NimBuild};
 pub mod plan;
 #[cfg(target_arch = "wasm32")]
 mod webgpu;
@@ -212,11 +212,10 @@ pub extern "C" fn run_threads() -> i64 {
 /// **duplicated powerbox** (`Host::fork_powerbox`), and the parent `wait`s it (`reap`). Confirms the
 /// **browser fork story**: fork rides the portable bytecode cooperative `drive` (the path this crate
 /// runs every multi-domain guest on), over primitives already exercised on wasm32 — the wasm-JIT
-/// tier-up is orthogonal (a per-Worker compute accelerator; cap/serve/fork ops leaf-fold to the
-/// interp). Returns `100` (the original's reply) **iff** both replies (`100` + `200`) reached the
+/// tier-up is orthogonal (a compute accelerator; cap/serve/fork ops leaf-fold to the interp). Returns `100` (the original's reply) **iff** both replies (`100` + `200`) reached the
 /// shared stdout — i.e. the twin genuinely ran; `i64::MIN` on any failure. The three are three
 /// programs (#2219): the manager spawns the server and the guest — modules the host grants it — through
-/// op-17 v1 records (#1864), each at its function 0 in a **detached 2^18 window of its own** paid from
+/// op-17 records (#1864), each at its function 0 in a **detached 2^18 window of its own** paid from
 /// the `Budget` arg, so each starts with its own data segments — the guest reads its "svc"/"o" names
 /// there, and every scratch cell sits above the #1094 NULL guard.
 const FORK_MANAGER: &str = r#"
@@ -227,21 +226,18 @@ data 16694 "o"
 ; our stdout as "o", and return the guest's status
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vout: i32, vbud: i32, vsrv: i32, vgst: i32) {
-  ; the op-17 v1 record for the server at 17600: version 1 | entry 0, size_log2 18 | no pager,
-  ; the server module | budget, no grants, no args, region -1 (none); the rest is zero
+  ; the op-17 record for the server at 17600: size_log2 18 | no pager, the server module | budget,
+  ; no grants, no args, region -1 (none); the rest is zero
   q1a0 = i64.const 17600
-  q1v0 = i64.const 1
+  q1v0 = i64.const -4294967278
   i64.store q1a0 q1v0
-  q1a2 = i64.const 17616
-  q1v2 = i64.const -4294967278
-  i64.store q1a2 q1v2
-  q1a3 = i64.const 17624
-  i32.store q1a3 vsrv
-  q1a3b = i64.const 17628
-  i32.store q1a3b vbud
-  q1a9 = i64.const 17672
+  q1a1 = i64.const 17608
+  i32.store q1a1 vsrv
+  q1a1b = i64.const 17612
+  i32.store q1a1b vbud
+  q1a6 = i64.const 17648
   vnone = i32.const -1
-  i32.store q1a9 vnone
+  i32.store q1a6 vnone
   vs = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
   vz0 = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
@@ -261,26 +257,23 @@ block 0 (v0: i32, vout: i32, vbud: i32, vsrv: i32, vgst: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  ; the guest's record at 17696: version 1 | entry 0, the guest module, the two grants above,
-  ; otherwise as the server's
+  ; the guest's record at 17696: the guest module, the two grants above, otherwise as the server's
   q2a0 = i64.const 17696
   i64.store q2a0 q1v0
+  q2a1 = i64.const 17704
+  i32.store q2a1 vgst
+  q2a1b = i64.const 17708
+  i32.store q2a1b vbud
   q2a2 = i64.const 17712
-  i64.store q2a2 q1v2
+  q2v2 = i64.const 16640
+  i64.store q2a2 q2v2
   q2a3 = i64.const 17720
-  i32.store q2a3 vgst
-  q2a3b = i64.const 17724
-  i32.store q2a3b vbud
-  q2a5 = i64.const 17736
-  q2v5 = i64.const 16640
-  i64.store q2a5 q2v5
+  q2v3 = i64.const 2
+  i64.store q2a3 q2v3
   q2a6 = i64.const 17744
-  q2v6 = i64.const 2
-  i64.store q2a6 q2v6
-  q2a9 = i64.const 17768
-  i32.store q2a9 vnone
+  i32.store q2a6 vnone
   vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
-  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vjc
   }
 }
@@ -376,7 +369,7 @@ pub extern "C" fn run_fork() -> i64 {
         return i64::MIN;
     };
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1u64 << 18);
+    let inst = host.grant_instantiator();
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
     // The server's and the guest's windows, and the twin's copy of the guest's (#2106).
@@ -694,23 +687,16 @@ pub extern "C" fn temen_run_shared(
     }
 }
 
-// ==== THREADS.md step 4c-wasm — the host-orchestrated parallel driver =============================
+// ==== A parallel run's recipe: what the page publishes before the run =============================
 //
-// wasm32 has no `thread::spawn`, so one guest's `thread.spawn`ed vCPUs are distributed across **Web
-// Workers** by the JS host: each Worker runs **one** vCPU via the engine's resumable `Vcpu` API
-// (`temen_par_run` → an event the host services → deliver the result → run again) over the **one** shared
-// linear-memory window. The host services the events with real cross-Worker primitives: `thread.spawn`
-// → start a Worker, `thread.join` → `Atomics.wait` on the child's completion slot, `memory.wait`/
-// `notify` → `Atomics.wait`/`notify` on the futex word — so this is genuinely parallel, the native
-// `bytecode_vcpu_orchestration.rs` test being its differential oracle.
-//
-// `VcpuProgram` is compiled once and shared **read-only** across Workers by pointer (it is `Sync`, and
-// under `--shared-memory` every Worker's instance sees the same linear memory, so a `Box::leak`ed
-// program built by one Worker is valid in all). Each `Vcpu` is `'static` here: the program outlives the
-// run (never freed), so the borrow is sound — the `unsafe` of asserting that lives in this embedder.
+// A parallel run is executor 2 across Web Workers ([`temen_x2_start`], #1414 B6): one in-Rust call on
+// the root's Worker, each thread of the run on a Worker of its own, all over the one shared linear
+// memory. Before the run the page publishes its recipe here: the powerbox the root is granted
+// (`temen_par_powerbox*`) and how many Workers can run at once. A recipe is leaked into the shared
+// memory and its pointer published in a `static`, which every Worker's instance reads alike.
 
-/// Allocate `len` bytes **16-aligned** (so windows / futex words / completion slots are naturally
-/// aligned for `Atomics` / the engine's hardware atomics, which `temen_alloc`'s align-1 does not
+/// Allocate `len` bytes **16-aligned** (so windows and the cells Workers touch with `Atomics` are
+/// naturally aligned for the engine's hardware atomics, which `temen_alloc`'s align-1 does not
 /// guarantee). Leaked for the run (the parallel demo never frees; the process exits). Null on `len==0`.
 #[no_mangle]
 pub extern "C" fn temen_par_alloc(len: usize) -> *mut u8 {
@@ -718,84 +704,6 @@ pub extern "C" fn temen_par_alloc(len: usize) -> *mut u8 {
         Ok(layout) if len != 0 => unsafe { std::alloc::alloc_zeroed(layout) },
         _ => core::ptr::null_mut(),
     }
-}
-
-/// Event codes returned by [`temen_par_run`] — the host switches on these (operands via `temen_par_ev_*`).
-pub const PAR_DONE: i32 = 0;
-pub const PAR_TRAP: i32 = 1;
-pub const PAR_SPAWN: i32 = 2;
-/// `thread.join` (or a §14 `join`) of a live child: `temen_par_ev_a` = the token the host gave for it
-/// ([`temen_par_deliver_child`] — the JS hosts give its completion slot). The engine resolved the
-/// guest's handle, so a bad one never reaches the host: the vCPU traps instead.
-pub const PAR_JOIN: i32 = 3;
-pub const PAR_WAIT: i32 = 4;
-pub const PAR_NOTIFY: i32 = 5;
-/// wasm-JIT tier-up (browser wasm-JIT threads slice): the vCPU reached a `Call` to a JIT-eligible
-/// function. `temen_par_ev_a` = the func index; `temen_par_ev_b` = the window's committed extent, which
-/// the Worker MUST write to the emitted module's `"mapped"` global before the call (#717 host sync —
-/// over today's fully-mapped par window it equals the emit-time default, so the write is idempotent;
-/// over a grown window it is what keeps the emitted bounds check in lockstep with the interpreter).
-/// `temen_par_tierup_argv_ptr`/`_len` give the marshalled i64 args. The Worker runs the emitted
-/// `f{func}` and calls `temen_par_deliver_tierup`/`_trap`.
-pub const PAR_TIERUP: i32 = 7;
-/// §22 guest-JIT **real codegen** (BROWSER.md § "wasm-JIT tier", slice 5): a guest's `Jit.invoke`
-/// surfaces here (codegen mode on — [`temen_par_powerbox_jit_codegen`]) so the Worker runs the
-/// submitted unit on **emitted wasm** (`temen_par_jit_unit_wasm_ptr`/`_len` — one immutable module per
-/// run) instead of the interpreter. `temen_par_jit_code` keys the Worker's per-unit instance cache;
-/// `temen_par_jit_argv_ptr`/`_len` give the args as i64 slots, `temen_par_jit_param_types_ptr` their wasm
-/// types (i32/i64) so the Worker marshals each to a JS `Number`/`BigInt`. `temen_par_ev_b` = the
-/// window's committed extent, which the Worker MUST write to the unit instance's `"mapped"` global
-/// before the call (#717 host sync, same contract as [`PAR_TIERUP`] — an invoke whose window state
-/// the scalar cannot represent never surfaces here; it is serviced on the interpreter instead). The
-/// Worker runs the emitted `f{entry}(win, env, …args)` and calls `temen_par_deliver_jit_invoke`/`_trap`.
-pub const PAR_JIT_INVOKE: i32 = 8;
-/// §5 `instantiate_detached` (op 15, #1286 slice 3b): the vCPU spawned a **detached** child — a
-/// separate-module child in its OWN `WebAssembly.Memory`, not a carve of this window. The engine
-/// admitted it (the `Instantiator` resolved, the `WindowMinter` quota taken, the module compiled and
-/// pushed, its powerbox built) and hands it over as a ticket (`temen_par_ev_a`); `_b` = `size_log2`.
-/// The Worker mints the child a fresh shared `Memory` (one host header page + the declared window,
-/// growable to `temen_detached_max_bytes()`) and posts it and the ticket to a new Worker, which starts
-/// the child over it through `Region::Foreign` ([`temen_par_child_detached`] — the engine seeds the
-/// window). `_d` = `(module << 32) | entry` (`detached_operands`): `module` is non-zero only for a
-/// child that runs the run's granted unit, which the Worker may run on the wasm tier. Joined through
-/// the same completion-slot protocol as [`PAR_SPAWN`]. Children run **concurrently**, each in its
-/// own Worker over its own memory — the reason this is a Worker event and not an in-Rust one.
-pub const PAR_INSTANTIATE_DETACHED: i32 = 9;
-
-/// A boxed resumable vCPU plus the operands of its last [`temen_par_run`] event (flattened to four
-/// `i64`s the host reads via [`temen_par_ev_a`]–[`temen_par_ev_d`]).
-pub struct ParVcpu {
-    inner: bytecode::Vcpu<'static>,
-    a: i64,
-    b: i64,
-    c: i64,
-    d: i64,
-    /// The marshalled arguments of a pending [`PAR_TIERUP`] event (raw i64 slots) — read by the
-    /// Worker via [`temen_par_tierup_argv_ptr`]/[`temen_par_tierup_argv_len`] to call the emitted region.
-    tierup_argv: Vec<i64>,
-    /// The marshalled arguments of a pending [`PAR_JIT_INVOKE`] event (raw i64 slots) — read by the
-    /// Worker via [`temen_par_jit_argv_ptr`]/[`temen_par_jit_argv_len`] to call the emitted §22 unit.
-    jit_argv: Vec<i64>,
-    /// The code handle of a pending [`PAR_JIT_INVOKE`] (the Worker caches one emitted instance per unit).
-    jit_code: i32,
-    /// Per-arg / per-result **scalar type codes** of a pending [`PAR_JIT_INVOKE`] (`0` = i32, `1` =
-    /// i64, `2` = f32, `3` = f64) so the Worker marshals each i64 slot to/from the wasm type the
-    /// emitted `f{entry}` uses: an i32 arg is a JS `Number`, an i64 a `BigInt`, a float the *value*
-    /// the slot's bits reinterpret to. Read via [`temen_par_jit_param_types_ptr`] /
-    /// [`temen_par_jit_result_types_ptr`] — a §22 unit need not be all-i64.
-    jit_param_types: Vec<u8>,
-    jit_result_types: Vec<u8>,
-    /// The emitted wasm of a pending [`PAR_JIT_INVOKE`]'s **runtime-compiled** unit (the shared-host
-    /// path, [`temen_par_powerbox_jit_runtime`]): the JS host reads its bytes via
-    /// [`temen_par_jit_code_wasm_ptr`]/[`temen_par_jit_code_wasm_len`] to instantiate the unit once,
-    /// caching the instance by [`jit_code`](ParVcpu::jit_code). `None` for the fixed-unit codegen path
-    /// (that reads the run-wide [`JIT_UNIT_WASM`] stash). The `Arc` keeps the bytes alive for the read.
-    jit_wasm: Option<std::sync::Arc<[u8]>>,
-    /// #750 paged runs: the page-state table for a pending [`PAR_TIERUP`], rebuilt from the live
-    /// page map at each event ([`bytecode::build_pagestate_table`]). Its bytes live in this
-    /// module's linear memory, so [`temen_par_tierup_pagestate_ptr`] IS the address the Worker
-    /// writes to the emitted module's `"pagestate"` global. Empty on unpaged runs.
-    pagestate: Vec<u8>,
 }
 
 /// Temen scalar `ValType` → the Worker's marshalling type code (`0` = i32, `1` = i64, `2` = f32, `3` =
@@ -810,329 +718,29 @@ fn scalar_type_code(t: temen_ir::ValType) -> Option<u8> {
     }
 }
 
-/// #2251 — how many of a run's vCPUs run at once under this driver, which gives each its own Worker:
-/// the page's core count (`navigator.hardwareConcurrency`), set by [`temen_par_set_workers`] before
+/// #2251 — how many of a run's threads run at once, each on a Worker of its own: the page's core count (`navigator.hardwareConcurrency`), set by [`temen_par_set_workers`] before
 /// the run. `0` until the page sets it, which leaves each host's default (1 on wasm).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 static PAR_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// #2251 — the page tells the per-Worker driver how many Workers can run at once, what a guest's
+/// #2251 — the page tells the run how many Workers can run at once, what a guest's
 /// `self.parallelism` answers (bounded by its lane cap). `navigator.hardwareConcurrency`; call it
 /// before starting the run. Linear memory is shared, so every Worker's engine sees it.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_set_workers(n: usize) {
     PAR_WORKERS.store(n, std::sync::atomic::Ordering::Release);
 }
 
-/// Box a freshly-built vCPU as a [`ParVcpu`] (event operands zeroed, no pending tier-up args). Every
-/// vCPU of the run passes through here, so it is where the page's worker count reaches the host the
-/// vCPU's `call.cap`s go through.
-fn par_box(inner: bytecode::Vcpu<'static>) -> *mut ParVcpu {
-    let inner = match PAR_WORKERS.load(std::sync::atomic::Ordering::Acquire) {
-        0 => inner,
-        n => inner.with_workers(n),
-    };
-    Box::into_raw(Box::new(ParVcpu {
-        inner,
-        a: 0,
-        b: 0,
-        c: 0,
-        d: 0,
-        tierup_argv: Vec::new(),
-        jit_argv: Vec::new(),
-        jit_code: 0,
-        jit_param_types: Vec::new(),
-        jit_result_types: Vec::new(),
-        jit_wasm: None,
-        pagestate: Vec::new(),
-    }))
-}
-
-/// Attach the tier-up bitmap (if published) to a vCPU of the run: the plain compute paths (root /
-/// `thread.spawn` child) and the §14/§22 orchestration roots. The routing is per-vCPU on this driver:
-/// a [`PAR_TIERUP`]'s `mapped`/page-state come from that vCPU's own `Mem`, and the Worker calls the
-/// emitted `f{func}` with its own `win`. The engine's `module == 0` dispatch gate keeps the bitmap
-/// inert on any other module — a detached child (and its threads) runs its program as a module of
-/// its own, never the primary's emitted set.
-fn with_tierup(inner: bytecode::Vcpu<'static>) -> bytecode::Vcpu<'static> {
-    match par_jit_eligible() {
-        Some(e) => {
-            let inner = inner.with_jit_eligible(e);
-            // #750: a paged eligible set needs the dispatch to skip the scalar decline (the
-            // per-event page-state table carries the fidelity the scalar cannot).
-            if par_jit_paged() {
-                inner.with_jit_page_checked()
-            } else {
-                inner
-            }
-        }
-        None => inner,
-    }
-}
-
-/// The JIT tier-up eligibility bitmap for this instance's guest (per-Worker: each computes its own
-/// from the module bytes via [`temen_par_enable_jit`], since an `Arc` can't cross Worker instances).
-static mut PAR_JIT_ELIGIBLE: Option<std::sync::Arc<[bool]>> = None;
-
-/// Clone the published tier-up bitmap, if any.
-fn par_jit_eligible() -> Option<std::sync::Arc<[bool]>> {
-    // SAFETY: single-threaded per instance (the page, or one Worker) — same access model as `WASMJIT_MOD`.
-    unsafe { (*core::ptr::addr_of!(PAR_JIT_ELIGIBLE)).clone() }
-}
-
-/// #750: whether this instance's tier-up module was emitted **paged**
-/// ([`temen_par_enable_jit_paged`]) — the vCPUs then skip the scalar decline and every `PAR_TIERUP`
-/// carries a freshly built page-state table (operand `b` = its coverage).
-static mut PAR_JIT_PAGED: bool = false;
-
-fn par_jit_paged() -> bool {
-    // SAFETY: single-threaded per instance — same access model as `PAR_JIT_ELIGIBLE`.
-    unsafe { *core::ptr::addr_of!(PAR_JIT_PAGED) }
-}
-
-// ==== I22 fix: emit each per-Worker codegen unit exactly ONCE per run ============================
-// `temen_par_enable_jit` / `_jit_codegen` / `_inst_codegen` each emit wasm and `stash()` it into a
-// `static mut`. JS instantiates every Worker against ONE shared linear memory, so those statics are a
-// SINGLE shared copy — NOT "per instance" as the older SAFETY comments claimed. So N Workers each
-// calling `enable_*` in their own setup, concurrently, raced on `stash()`'s `dealloc(old_ptr)`: two
-// Workers read the same `old_ptr` and both freed it → double-free / use-after-free → heap corruption →
-// a later `memory access out of bounds` or a panic=abort `unreachable` (ISSUES.md I22).
-//
-// Fix: emit exactly once per run. Every run's page-side powerbox publisher bumps `PAR_RUN_GEN` (always
-// single-threaded — the previous run's Workers are terminated before the next run publishes). Each
-// `enable_*` runs its emit under `CODEGEN_LOCK` and only if it hasn't already run for the current
-// generation; later Workers skip the emit and reuse the shared stash (identical bytes either way). The
-// stash is thus written once per run and never freed mid-run, so the Workers' reads of the emitted
-// bytes are stable. A SPIN-lock (not a `Mutex`) so the page's own `enable_*` call — which happens on
-// the main thread inside `temen_par_powerbox_jit_codegen` — can never hit a forbidden `Atomics.wait`; it
-// is always uncontended (no Worker is alive yet), so it acquires without spinning.
-//
-// The emit runs while the lock is held, so under `panic = "abort"` a compile panic would leave the
-// lock stuck and the run's other Workers spinning — but (i) the emitters are pure and only ever see
-// fixed corpus/constant modules that compile cleanly, and (ii) the panicking Worker reports `fail`
-// (worker.js's setup backstop), so its run fails and its spinning Workers are terminated instead of
-// hanging (the lock stays held for the rest of that engine's life). (The pre-fix double-free is what
-// actually produced the panics; this removes it.)
-static PAR_RUN_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static CODEGEN_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Bump the run generation. Call once, page-side, at the start of every powerbox publisher.
-fn par_run_gen_bump() {
-    PAR_RUN_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-}
-
-/// RAII spin-lock over the codegen stashes: `Acquire` on lock, `Release` on unlock, so a stash the
-/// first Worker writes under the lock is visible to a later Worker that acquires it.
-struct CodegenGuard;
-impl CodegenGuard {
-    fn acquire() -> Self {
-        use std::sync::atomic::Ordering;
-        while CODEGEN_LOCK
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        CodegenGuard
-    }
-    /// Current run generation (read while the guard is held).
-    fn generation(&self) -> u32 {
-        PAR_RUN_GEN.load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
-impl Drop for CodegenGuard {
-    fn drop(&mut self) {
-        CODEGEN_LOCK.store(false, std::sync::atomic::Ordering::Release);
-    }
-}
-
-// Per-stash "already emitted for this run generation" + the result to hand back to a Worker that
-// arrives after the first has emitted (init `u32::MAX` = "no run yet"; every real gen is < that).
-static TIERUP_DONE_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
-static TIERUP_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-static JIT_CG_DONE_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
-static JIT_CG_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-static INST_CG_DONE_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
-static INST_CG_RESULT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-
-/// Enable wasm-JIT **tier-up** for the module at `[mod_ptr, mod_len)` (`BROWSER.md` § "wasm-JIT
-/// tier", per-Worker JIT): emit the tier-up module and compute which functions the interpreter
-/// should surface as [`PAR_TIERUP`] (the browser then runs the emitted `f{func}` on the Worker
-/// instead of interpreting). Unlike the whole-module `temen_wasmjit_compile`, this does **not** need
-/// the guest's func 0 to be JITtable — the guest keeps running on the resumable interpreter (which
-/// drives `thread.spawn`/`join`, atomics, `memory.wait`), and only a direct `Call` to an emitted
-/// pure region tiers up. So a compute leaf reachable **only** through `thread.spawn` still tiers up,
-/// which is the whole point of the threads tier ([`temen_wasm_jit::compile_jit`] with
-/// [`temen_wasm_jit::Shape::Threaded`]).
-///
-/// A function is eligible iff it is **emitted** (in-subset, all its calls route) **and** has an
-/// **all-i64** signature — so the Worker passes every arg / reads every result as a plain `BigInt`
-/// i64 slot with no per-param type info (which the emitted `WebAssembly.Module` doesn't expose to
-/// JS). Non-i64 scalar params (i32, floats) are a later refinement. On success this stashes the
-/// emitted wasm (read via [`temen_wasmjit_ptr`]/[`temen_wasmjit_len`]) and the decoded module (for the
-/// cross-tier [`temen_wasmjit_call_interp`]), so the Worker needs only this one call — no separate
-/// `temen_wasmjit_compile`. Returns `1` when at least one function tier-ups, else `0` (everything
-/// interprets). Call on **every** instance (page + each Worker) before building vCPUs, same bytes.
-#[no_mangle]
-pub extern "C" fn temen_par_enable_jit(mod_ptr: *const u8, mod_len: usize) -> i32 {
-    use std::sync::atomic::Ordering;
-    par_install_panic_capture(); // I22: capture a setup-time engine panic's FILE:LINE (not a bare `unreachable`)
-                                 // I22: emit once per run under CODEGEN_LOCK; a later Worker reuses the shared stash (see the
-                                 // CodegenGuard note above). The shared statics `WASMJIT`/`WASMJIT_MOD`/`PAR_JIT_ELIGIBLE` are a
-                                 // single copy across Workers, so a concurrent re-emit double-freed the stash.
-    let guard = CodegenGuard::acquire();
-    let generation = guard.generation();
-    if TIERUP_DONE_GEN.load(Ordering::Relaxed) == generation {
-        return TIERUP_RESULT.load(Ordering::Relaxed);
-    }
-    let result = (|| {
-        // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
-        let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-        let Ok(m) = temen_encode::decode_module(bytes) else {
-            return 0;
-        };
-        // Emit the tier-up module against the shared linear memory (the browser threads build) and take
-        // its per-function emit set. The `Threaded` shape is interpreter-driven by construction (no
-        // single top-level frame — vCPUs enter via `thread.spawn`), so `compile_jit` picks tier-up. `Err`
-        // only if the assembler itself rejects the set — treat as "no tier-up" (fail-closed: the guest
-        // keeps interpreting).
-        let Some((wasm, eligible)) = threads_tierup(&m) else {
-            return 0; // nothing safely tier-up-able → leave everything on the interpreter
-        };
-        // SAFETY: written once per run while CODEGEN_LOCK is held (this closure runs only on the
-        // first Worker of the run); Workers then read it stable for the run.
-        unsafe {
-            stash(&mut *core::ptr::addr_of_mut!(WASMJIT), wasm);
-            *core::ptr::addr_of_mut!(WASMJIT_MOD) = Some(m);
-            *core::ptr::addr_of_mut!(PAR_JIT_ELIGIBLE) = Some(std::sync::Arc::from(eligible));
-            *core::ptr::addr_of_mut!(PAR_JIT_PAGED) = false;
-        }
-        1
-    })();
-    TIERUP_RESULT.store(result, Ordering::Relaxed);
-    TIERUP_DONE_GEN.store(generation, Ordering::Relaxed);
-    result
-}
-
-/// A threaded guest's tier-up emit: the module `compile_jit`'s `Threaded` shape emits for `m`, and
-/// for each function whether a direct call to it tiers up — it was emitted, with an all-i64
-/// signature (the i64-slot transport the host marshals by). `None` when no call can tier up, or
-/// the assembler refused the set (fail-closed: the guest interprets).
-fn threads_tierup(m: &temen_ir::Module) -> Option<(Vec<u8>, Vec<bool>)> {
-    let temen_wasm_jit::Artifact { wasm, emitted, .. } =
-        temen_wasm_jit::compile_jit(m, temen_wasm_jit::Shape::Threaded, true).ok()?;
-    let all_i64 = |ts: &[temen_ir::ValType]| ts.iter().all(|t| *t == temen_ir::ValType::I64);
-    let eligible: Vec<bool> = m
-        .funcs
-        .iter()
-        .enumerate()
-        .map(|(i, f)| emitted[i] && all_i64(&f.params) && all_i64(&f.results))
-        .collect();
-    eligible.iter().any(|&e| e).then_some((wasm, eligible))
-}
-
-/// [`temen_par_enable_jit`], but the tier-up module is emitted **paged** (#750,
-/// `compile_module_tierup_paged` with this instance's software page size): `unmap`/`protect`
-/// guests keep their pure leaves eligible, and every emitted access consults the per-event
-/// page-state table (see [`temen_par_tierup_pagestate_ptr`]; the Worker writes its base to the
-/// emitted `"pagestate"` global and event operand `b` — the table's coverage — to `"mapped"`).
-/// A run calls exactly ONE of the two enable entries (they share the once-per-run stash).
-/// Same contract otherwise: call on every instance before building vCPUs, same bytes.
-#[no_mangle]
-pub extern "C" fn temen_par_enable_jit_paged(mod_ptr: *const u8, mod_len: usize) -> i32 {
-    use std::sync::atomic::Ordering;
-    par_install_panic_capture();
-    let guard = CodegenGuard::acquire();
-    let generation = guard.generation();
-    if TIERUP_DONE_GEN.load(Ordering::Relaxed) == generation {
-        return TIERUP_RESULT.load(Ordering::Relaxed);
-    }
-    let result = (|| {
-        // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
-        let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-        let Ok(m) = temen_encode::decode_module(bytes) else {
-            return 0;
-        };
-        let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
-        let Ok((wasm, emit)) = temen_wasm_jit::compile_module_tierup_paged(&m, true, page_log2)
-        else {
-            return 0;
-        };
-        let all_i64 = |ts: &[temen_ir::ValType]| ts.iter().all(|t| *t == temen_ir::ValType::I64);
-        let eligible: Vec<bool> = m
-            .funcs
-            .iter()
-            .enumerate()
-            .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results))
-            .collect();
-        if !eligible.iter().any(|&e| e) {
-            return 0; // nothing safely tier-up-able → leave everything on the interpreter
-        }
-        // SAFETY: written once per run while CODEGEN_LOCK is held; Workers read it stable.
-        unsafe {
-            stash(&mut *core::ptr::addr_of_mut!(WASMJIT), wasm);
-            *core::ptr::addr_of_mut!(WASMJIT_MOD) = Some(m);
-            *core::ptr::addr_of_mut!(PAR_JIT_ELIGIBLE) = Some(std::sync::Arc::from(eligible));
-            *core::ptr::addr_of_mut!(PAR_JIT_PAGED) = true;
-        }
-        1
-    })();
-    TIERUP_RESULT.store(result, Ordering::Relaxed);
-    TIERUP_DONE_GEN.store(generation, Ordering::Relaxed);
-    result
-}
-
-fn first_i64(vals: &[Value]) -> i64 {
-    match vals.first() {
-        Some(Value::I64(x)) => *x,
-        Some(Value::I32(x)) => *x as i64,
-        _ => 0,
-    }
-}
-
-/// Compile the module at `[mod_ptr, mod_len)` into a shareable [`bytecode::VcpuProgram`], returned as a
-/// leaked pointer (lives for the run; shared read-only across Workers). Null on decode/unsupported.
-#[no_mangle]
-pub extern "C" fn temen_par_compile(
-    mod_ptr: *const u8,
-    mod_len: usize,
-) -> *mut bytecode::VcpuProgram {
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
-    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let Ok(m) = temen_encode::decode_module(bytes) else {
-        return core::ptr::null_mut();
-    };
-    match bytecode::VcpuProgram::compile(&m) {
-        Some(p) => Box::into_raw(Box::new(p)),
-        None => core::ptr::null_mut(),
-    }
-}
-
-/// Borrow a `*mut VcpuProgram` as `&'static` (the program outlives the run). SAFETY: the host keeps it
-/// alive for the whole run and never frees it before the last `Vcpu` over it.
-unsafe fn prog_ref(prog: *mut bytecode::VcpuProgram) -> &'static bytecode::VcpuProgram {
-    &*prog
-}
-
-/// The run's shared fiber registry (#1761), owned by its program: attached to the root and every
-/// `thread.spawn` child of a run — never to a §14 confined or detached child, each its own process.
-fn par_fibers(prog: *mut bytecode::VcpuProgram) -> &'static bytecode::SharedFibers {
-    // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
-    unsafe { prog_ref(prog) }.fibers()
-}
-
-// ---- §22 guest-JIT across Workers: a Rust-side shared powerbox (THREADS.md 4c-domain C2) ---------
-// The powerbox (a `Host` with the `Jit` cap + the host-compiled unit) is built once and **leaked** into
-// the shared linear memory; its pointer is published in a process-wide `static` which — under
-// `--shared-memory` — lives in that shared memory, so every Worker's instance reads the same value
-// (the same mechanism the `Box::leak`ed `VcpuProgram` uses, but a `static` instead of a JS-threaded
-// pointer). A worker vCPU's `Jit.install`/`uninstall`/`invoke` is then serviced **inside**
-// [`temen_par_run`] against this powerbox + the shared `Domain` — so the JS host services no new events
-// (it never sees a JIT op, needs no new glue). During the run the powerbox is read-only (the unit is
-// compiled at setup, before any spawn), so the concurrent `&Host` reads need no lock; the install/
-// dispatch mutation lives in the `Domain`, which is already interior-mutable + thread-safe.
+// ---- §22 guest-JIT: a Rust-side powerbox with a host-compiled unit (THREADS.md 4c-domain C2) ----
+// The powerbox (a `Host` with the `Jit` cap + the host-compiled unit) is built once on the page and
+// **leaked** into the shared linear memory, its pointer published in a `static`. The run takes it
+// ([`temen_x2_start`]), so a task's `Jit.install`/`uninstall`/`invoke` goes through the run's host
+// like any other `call.cap`, and the JS host services no JIT op.
 
 /// The shared §22 powerbox: a `Host` with the `Jit` cap granted + [`JIT_SERVICE`] host-compiled, plus
 /// the handles the root guest receives as `(jit, code)`.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 struct ParPowerbox {
     host: Host,
     jit: i32,
@@ -1140,10 +748,12 @@ struct ParPowerbox {
 }
 
 /// The leaked [`ParPowerbox`] pointer (or `0`), shared across Workers via shared linear memory.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 static PAR_PB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// `2^4 = 16` dispatch-table slots — the `Jit` table reservation matched by [`temen_par_compile_jit`]
-/// and the powerbox grant so guest `install` lands in range (mirrors [`jit_exec`]).
+/// `2^4 = 16` dispatch-table slots — the `Jit` table reservation of the §22 powerboxes, so a guest
+/// `install` lands in range (mirrors [`jit_exec`]).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 const PAR_JIT_TABLE_LOG2: u8 = 4;
 
 /// `2^10 = 1024` dispatch-table slots for the on-ramp `Jit` grant — matches temen-run's
@@ -1172,10 +782,10 @@ fn tierup_table_log2(n_funcs: usize) -> u8 {
 /// `guest`'s declared memory sizes the domain (the validator's memory-match precondition). Returns `1`
 /// on success, `0` on decode / parse / compile failure. Call **once** (on the main thread) before the
 /// run; the published pointer outlives it.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_powerbox(guest_ptr: *const u8, guest_len: usize) -> i32 {
-    par_run_gen_bump(); // I22: one bump per run — gates the once-per-run codegen emit (see CodegenGuard)
-                        // SAFETY: the host guarantees `[guest_ptr, guest_len)` is a live allocation it just filled.
+    // SAFETY: the host guarantees `[guest_ptr, guest_len)` is a live allocation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(guest_ptr, guest_len) };
     let Ok(m) = temen_encode::decode_module(bytes) else {
         return 0;
@@ -1201,13 +811,11 @@ pub extern "C" fn temen_par_powerbox(guest_ptr: *const u8, guest_len: usize) -> 
     1
 }
 
-/// Codegen mode: when set, a guest's `Jit.invoke` of the emitted unit surfaces as [`PAR_JIT_INVOKE`]
-/// so the Worker runs it on wasm; else the invoke is serviced in-Rust on the interpreter (as before).
+/// Codegen mode: when set, a guest's `Jit.invoke` of a unit with emitted wasm runs it on the invoking
+/// thread's Worker ([`temen_x2_start`]); else the interpreter runs it.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 static PAR_JIT_CODEGEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// The emitted wasm of the run's single §22 unit (stashed once at [`temen_par_powerbox_jit_codegen`]
-/// setup; immutable + shared across Workers, each instantiates its own instance). `(null, 0)` ⇒ none.
-static mut JIT_UNIT_WASM: (*mut u8, usize) = (core::ptr::null_mut(), 0);
-
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 fn par_jit_codegen() -> bool {
     PAR_JIT_CODEGEN.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -1215,6 +823,7 @@ fn par_jit_codegen() -> bool {
 /// A **float** §22 unit for the real-codegen proof: `fservice(a, b) = a*b + 100.0`, all `f64` — so
 /// the Worker marshals args from the slot bits to JS `Number`s and the `f64` result back to its bits
 /// (the ABI generalization to floats). `fservice(6.0, 7.0) = 142.0`.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 const JIT_SERVICE_FLOAT: &str = r#"memory 16
 func (f64, f64) -> (f64) {
 block 0 (v0: f64, v1: f64) {
@@ -1229,15 +838,18 @@ block 0 (v0: f64, v1: f64) {
 /// Which §22 unit the codegen powerbox host-compiles + emits: `0` = the i32 [`JIT_SERVICE`] (the
 /// default, matching the interp `#jit` item), `1` = the f64 [`JIT_SERVICE_FLOAT`]. The JS host sets
 /// this (via [`temen_par_jit_codegen_service`]) before the run to exercise int vs float marshalling.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 static PAR_JIT_SERVICE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
-/// Select the codegen unit for the next run (`0` = i32 service, `1` = f64 service). Set on every
-/// instance (page + each Worker) before enabling codegen, with the same value.
+/// Select the unit [`temen_par_powerbox_jit_codegen`] host-compiles for the next run (`0` = i32
+/// service, `1` = f64 service).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_jit_codegen_service(kind: i32) {
     PAR_JIT_SERVICE.store(kind, std::sync::atomic::Ordering::Release);
 }
 
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 fn codegen_service_src() -> &'static str {
     if PAR_JIT_SERVICE.load(std::sync::atomic::Ordering::Acquire) == 1 {
         JIT_SERVICE_FLOAT
@@ -1250,66 +862,21 @@ fn codegen_service_src() -> &'static str {
 /// `0` ⇒ the interpreter services it in-Rust). Lets a host run the **same** guest + unit both ways
 /// for a differential (the emitted region must match the interpreter). Set by
 /// [`temen_par_powerbox_jit_codegen`]; a host that wants the interpreter path flips it off.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_jit_set_codegen(on: i32) {
     PAR_JIT_CODEGEN.store(on != 0, std::sync::atomic::Ordering::Release);
 }
 
-/// Enable §22 real codegen for the run: emit the run's unit (the scalar service selected by
-/// [`codegen_service_src`] — i32 [`JIT_SERVICE`] or f64 [`JIT_SERVICE_FLOAT`]) into the shared
-/// [`JIT_UNIT_WASM`] stash and set codegen mode. Every Worker calls this in its setup (like
-/// [`temen_par_enable_jit`] for tier-up), but — since the stash is a single shared copy across Workers
-/// (I22) — only the **first** caller of the run actually emits (under `CODEGEN_LOCK`); the rest reuse
-/// it. Returns `1` on success, `0` if the unit is outside the emitter subset.
-#[no_mangle]
-pub extern "C" fn temen_par_enable_jit_codegen() -> i32 {
-    use std::sync::atomic::Ordering;
-    par_install_panic_capture(); // I22: capture a setup-time engine panic's FILE:LINE (not a bare `unreachable`)
-    let guard = CodegenGuard::acquire();
-    let generation = guard.generation();
-    if JIT_CG_DONE_GEN.load(Ordering::Relaxed) == generation {
-        return JIT_CG_RESULT.load(Ordering::Relaxed);
-    }
-    let result = (|| {
-        let Ok(service_m) = temen_text::parse_module(codegen_service_src()) else {
-            return 0;
-        };
-        // The §22 codegen service unit is a fixed, fully-in-subset scalar function, so `compile_jit`
-        // emits it whole and wasm-driven (rooted at func 0). Defensively require that — the §22 path
-        // runs the unit as emitted `f0`, so an interpreter-driven fallback would be a bug; fail closed.
-        let Ok(temen_wasm_jit::Artifact {
-            wasm,
-            drive: temen_wasm_jit::DriveMode::WasmDriven { .. },
-            ..
-        }) = temen_wasm_jit::compile_jit(
-            &service_m,
-            temen_wasm_jit::Shape::Batch { entry: 0 },
-            true,
-        )
-        else {
-            return 0;
-        };
-        // SAFETY: written once per run while CODEGEN_LOCK is held; Workers then read it stable.
-        unsafe { stash(&mut *core::ptr::addr_of_mut!(JIT_UNIT_WASM), wasm) };
-        PAR_JIT_CODEGEN.store(true, Ordering::Release);
-        1
-    })();
-    JIT_CG_RESULT.store(result, Ordering::Relaxed);
-    JIT_CG_DONE_GEN.store(generation, Ordering::Relaxed);
-    result
-}
-
 /// Build the **shared powerbox** for a §22 **real-codegen** run: like [`temen_par_powerbox`] but the
 /// host-compiled unit is the scalar service selected by [`codegen_service_src`] (i32 [`JIT_SERVICE`]
-/// or f64 [`JIT_SERVICE_FLOAT`]), and its wasm is emitted (via
-/// [`temen_wasm_jit::compile_jit`] with [`temen_wasm_jit::Shape::Batch`], shared memory) + stashed so a guest `Jit.invoke`
-/// runs the emitted region on the Worker instead of the interpreter. Returns `1` on success, `0` on
-/// decode/parse/compile/emit failure (fail-closed: the caller keeps the interpreter). Call **once**
-/// (on the main thread) before the run.
+/// or f64 [`JIT_SERVICE_FLOAT`]), and codegen mode is on ([`PAR_JIT_CODEGEN`]), so a guest's
+/// `Jit.invoke` runs it on emitted wasm. Returns `1`, or `0` on a decode, parse or compile failure.
+/// Call **once** (on the main thread) before the run.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_powerbox_jit_codegen(guest_ptr: *const u8, guest_len: usize) -> i32 {
-    par_run_gen_bump(); // I22: one bump per run — gates the once-per-run codegen emit (see CodegenGuard)
-                        // SAFETY: the host guarantees `[guest_ptr, guest_len)` is a live allocation it just filled.
+    // SAFETY: the host guarantees `[guest_ptr, guest_len)` is a live allocation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(guest_ptr, guest_len) };
     let Ok(m) = temen_encode::decode_module(bytes) else {
         return 0;
@@ -1325,71 +892,45 @@ pub extern "C" fn temen_par_powerbox_jit_codegen(guest_ptr: *const u8, guest_len
         Ok(Ok(c)) => c.handle,
         _ => return 0,
     };
-    // Emit the unit wasm on **this** (page) instance too, so a single-vCPU run driven on the page
-    // works; each Worker emits its own copy via [`temen_par_enable_jit_codegen`] (per-instance stash).
-    // Fail-closed if the unit is outside the emitter subset — then there is nothing to run on wasm.
-    if temen_par_enable_jit_codegen() != 1 {
-        return 0;
-    }
     let pb = Box::into_raw(Box::new(ParPowerbox { host, jit, code }));
     PAR_PB.store(pb as usize, std::sync::atomic::Ordering::Release);
     PAR_INST.store(0, std::sync::atomic::Ordering::Release);
     PAR_IO.store(0, std::sync::atomic::Ordering::Release);
     PAR_JIT.store(0, std::sync::atomic::Ordering::Release);
+    PAR_JIT_CODEGEN.store(true, std::sync::atomic::Ordering::Release);
     1
 }
 
-/// Pointer / length of the run's emitted §22 unit wasm (see [`temen_par_powerbox_jit_codegen`]).
-#[no_mangle]
-pub extern "C" fn temen_par_jit_unit_wasm_ptr() -> *const u8 {
-    unsafe { (*core::ptr::addr_of!(JIT_UNIT_WASM)).0 }
-}
-#[no_mangle]
-pub extern "C" fn temen_par_jit_unit_wasm_len() -> usize {
-    unsafe { (*core::ptr::addr_of!(JIT_UNIT_WASM)).1 }
-}
+// ---- §14 instantiate: the root's recipe (THREADS.md 4c-domain §14-D2) ----------------------------
+// This static carries only the *recipe* — the optional granted module and the window budget —
+// published once by the main thread; the run builds the root's powerbox from it
+// ([`par_inst_powerbox`]). Children never touch it: the engine admits each one and builds its
+// powerbox, so no authority crosses JS.
 
-/// Borrow the published powerbox (`None` until [`temen_par_powerbox`] ran). The pointer is published with
-/// `Release`; this `Acquire` load pairs with it so the `Host` it built is visible to this Worker.
-fn par_pb() -> Option<&'static ParPowerbox> {
-    let p = PAR_PB.load(std::sync::atomic::Ordering::Acquire) as *const ParPowerbox;
-    // SAFETY: once published the powerbox is leaked (never freed) and read-only for the run, so the
-    // shared `&'static` is sound (concurrent `&self` reads only).
-    unsafe { p.as_ref() }
-}
-
-// ---- §14 instantiate across Workers (THREADS.md 4c-domain §14-D2) -------------------------------
-// The §14 root powerbox lives **in the root vCPU** (unlike the §22 JIT powerbox, which the vCPU asks
-// the host to resolve against): §14 resolves its `Instantiator` authority in-Vm during `resume`, so
-// the grant must be in the vCPU's own `Host`. This static only carries the *recipe* — the authority
-// range and the optional granted module — published once by the main thread so the root Worker can
-// build its powerbox deterministically. Children never touch it: the engine admits each one and
-// builds its powerbox, and the JS host relays it as an opaque ticket, so no authority crosses JS.
-
-/// The §14 run recipe: `Instantiator` authority over `[0, win_size)` + an optional `Module` grant +
-/// an optional `WindowMinter` (#1286: `minter_quota > 0` bytes of detached-window admission).
+/// The §14 run recipe: `Instantiator` authority + an optional `Module` grant + an optional `Budget`
+/// (#1286: `minter_quota > 0` bytes of detached-window admission).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 struct ParInstCfg {
-    win_size: u64,
     module: Option<temen_ir::Module>,
     minter_quota: u64,
 }
 
 /// The leaked [`ParInstCfg`] pointer (or `0`), shared across Workers via shared linear memory.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 static PAR_INST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Publish the §14 run recipe: the root's `Instantiator` will span `[0, win_size)`; a non-empty
-/// `[mod_ptr, mod_len)` is decoded as the **granted module** for `instantiate_module` (`0` len ⇒ no
-/// grant); a non-zero `minter_quota` grants the root a `WindowMinter` of that many bytes (#1286 — the
-/// admission for `instantiate_detached`; its handle follows the module's in the root's args). Returns
-/// `1`, or `0` on a bad module. Call once (on the main thread) before the run.
+/// Publish the §14 run recipe: the root gets an `Instantiator`; a non-empty `[mod_ptr, mod_len)` is
+/// decoded as the **granted module** it spawns (`0` len ⇒ no grant); a non-zero `minter_quota` grants
+/// the root a `Budget` of that many bytes of `mem` (#1286 — the admission for a detached spawn; its
+/// handle follows the module's in the root's args). Returns `1`, or `0` on a bad module. Call once
+/// (on the main thread) before the run.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_powerbox_inst(
-    win_size: u64,
     mod_ptr: *const u8,
     mod_len: usize,
     minter_quota: u64,
 ) -> i32 {
-    par_run_gen_bump(); // I22: one bump per run — gates the once-per-run codegen emit (see CodegenGuard)
     let module = if mod_len == 0 {
         None
     } else {
@@ -1401,7 +942,6 @@ pub extern "C" fn temen_par_powerbox_inst(
         }
     };
     let cfg = Box::into_raw(Box::new(ParInstCfg {
-        win_size,
         module,
         minter_quota,
     }));
@@ -1413,27 +953,36 @@ pub extern "C" fn temen_par_powerbox_inst(
     1
 }
 
-/// Borrow the published §14 recipe (`None` until [`temen_par_powerbox_inst`] ran). Leaked + read-only,
-/// as [`par_pb`].
+/// Borrow the published §14 recipe (`None` until [`temen_par_powerbox_inst`] ran). Leaked, and
+/// read-only for the run.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 fn par_inst() -> Option<&'static ParInstCfg> {
     let p = PAR_INST.load(std::sync::atomic::Ordering::Acquire) as *const ParInstCfg;
     // SAFETY: once published the recipe is leaked (never freed) and read-only for the run.
     unsafe { p.as_ref() }
 }
 
-/// The §14 recipe's root powerbox for a run of `module`: an `Instantiator` over `[0, win_size)`,
-/// the granted module and a `WindowMinter` budget when the recipe has them, and the root's args
-/// (their handles, in that order).
+/// The §14 recipe's root powerbox for a run of `module`: an `Instantiator`, the granted module and a
+/// `Budget` when the recipe has them, and the root's args
+/// (their handles, in that order). A run whose children tier up through their module's emit
+/// (`outline`, #1414 ED-2) grants that module outlined, as the run's own program is, so a child's
+/// spawn, join and wait sit in wrappers its emitted entry bounces to (#2443).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 fn par_inst_powerbox(
     cfg: &ParInstCfg,
     module: &std::sync::Arc<temen_ir::Module>,
+    outline: bool,
 ) -> (Host, Vec<Value>) {
     let mut host = Host::new();
-    host.set_self_module(module); // a record's `module = -1`
-    let inst = host.grant_instantiator(0, cfg.win_size);
+    host.set_self_module(module);
+    let inst = host.grant_instantiator();
     let mut args = vec![Value::I32(inst)];
     if let Some(m) = &cfg.module {
-        args.push(Value::I32(host.grant_module(m)));
+        let mut m = m.clone();
+        if outline {
+            temen_wasm_jit::outline_cap_calls(&mut m);
+        }
+        args.push(Value::I32(host.grant_module(&m)));
     }
     if cfg.minter_quota > 0 {
         args.push(Value::I32(host.grant_budget(
@@ -1448,230 +997,19 @@ fn par_inst_powerbox(
     (host, args)
 }
 
-// ---- §14 instantiate_module **real codegen** (BROWSER.md § "wasm-JIT tier", slice 5) -------------
-// A detached child of the granted module whose entry is in-subset runs it on **emitted wasm** on its
-// own Worker, bound to its own `WebAssembly.Memory` (the module "compiles on push"), instead of the
-// bytecode interpreter — the child fills the same completion slot the parent `join`s. The granted
-// module is emitted once per run (a single stash shared across Workers, I22); an entry outside the
-// subset stays on the interpreter (fail-closed).
-
-/// The emitted wasm of the run's granted §14 unit (per-instance stash; `(null, 0)` ⇒ none).
-static mut INST_UNIT_WASM: (*mut u8, usize) = (core::ptr::null_mut(), 0);
-/// The granted unit's per-function eligibility ([`temen_wasm_jit::compile_nested`]'s `emitted` bitmap):
-/// `f{i}` is emitted + safe to call directly. A child of the unit whose entry is eligible runs on
-/// wasm; else it interprets.
-static mut INST_ELIGIBLE: Option<Vec<bool>> = None;
-/// Whether [`INST_UNIT_WASM`] was emitted **paged** (the unit reaches an ADDRESS_SPACE page op) — the
-/// Worker then seeds + re-syncs its `"pagestate"`/`"mapped"` globals from the child vCPU (#1151).
-static mut INST_PAGED: bool = false;
-
-/// Enable §14 real codegen for the run: emit the granted unit ([`ParInstCfg::module`]) to wasm and
-/// stash it + the per-function eligibility. Called by each Worker before it builds a detached child
-/// (like [`temen_par_enable_jit_codegen`]), but — the stash is a single shared copy across Workers (I22)
-/// — only the **first** caller of the run emits (under `CODEGEN_LOCK`); the rest reuse it. Returns
-/// `1` on success, `0` if there is no granted module or it is outside the emitter subset.
-#[no_mangle]
-pub extern "C" fn temen_par_enable_inst_codegen() -> i32 {
-    use std::sync::atomic::Ordering;
-    par_install_panic_capture(); // I22: capture a setup-time engine panic's FILE:LINE (not a bare `unreachable`)
-    let guard = CodegenGuard::acquire();
-    let generation = guard.generation();
-    if INST_CG_DONE_GEN.load(Ordering::Relaxed) == generation {
-        return INST_CG_RESULT.load(Ordering::Relaxed);
-    }
-    let result = (|| {
-        let Some(cfg) = par_inst() else {
-            return 0;
-        };
-        let Some(m) = &cfg.module else {
-            return 0;
-        };
-        // §14 VM-in-VM codegen via the library's single nested front door ([`compile_nested`]): it
-        // picks the drive mode from the IR and always yields a runnable artifact. A cap-using entry
-        // (`call.cap 6 17/1` instantiate_rec/join, or a `thread.spawn`) emits, its bounce arriving at
-        // the Worker via the `env.instantiate_rec`/`env.join`/`env.thread_*` imports (serviced through
-        // the same completion-slot protocol as the interpreter path); a fiber-bearing unit falls
-        // to an interpreter-driven tier-up. Either way `emitted[i]` is the sound "safe to call `f{i}`
-        // directly" signal the Worker gates on (`temen_par_inst_eligible`): a fiber reachable from the
-        // entry drops it from `emitted` (the tier-up fixpoint), and a `thread.spawn`ed fiber runs in its
-        // own spawned interpreter vCPU — never across the emitted frame. The Worker offers the whole
-        // nested import set unconditionally, so the uniform layout `compile_nested` emits just works.
-        // #1151 Slice 2c: the emitted unit's `env.call_interp` leaves run on the CHILD's OWN vCPU over
-        // its window (`temen_par_inst_call_interp` → `bounce_call`: the live powerbox, the interpreter's
-        // `Mem`), so a leaf may store and `call.cap` — an allocator helper that `map`s, a page-managing
-        // helper that `unmap`s/`protect`s. A unit reaching any ADDRESS_SPACE page op emits **paged**
-        // (`compile_nested_paged`): every emitted access consults the page-state table the Worker
-        // re-syncs from the child vCPU after each bounce. No outlining here: an entry that page-ops
-        // directly is out of subset and falls to the interpreter (an outlined wrapper would index a
-        // function the child's domain doesn't hold); helpers are bounced whole. A `sub`/`page_size`
-        // entry likewise stays interpreter-driven.
-        let paged = temen_wasm_jit::module_uses_addr_space_page_ops(m);
-        let artifact = if paged {
-            let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
-            temen_wasm_jit::compile_nested_paged(m, true, page_log2)
-        } else {
-            temen_wasm_jit::compile_nested(m, true)
-        };
-        let Ok(temen_wasm_jit::Artifact {
-            wasm,
-            emitted: eligible,
-            ..
-        }) = artifact
-        else {
-            return 0;
-        };
-        // SAFETY: written once per run while CODEGEN_LOCK is held; Workers then read it stable.
-        unsafe {
-            stash(&mut *core::ptr::addr_of_mut!(INST_UNIT_WASM), wasm);
-            *core::ptr::addr_of_mut!(INST_ELIGIBLE) = Some(eligible);
-            *core::ptr::addr_of_mut!(INST_PAGED) = paged;
-        }
-        1
-    })();
-    INST_CG_RESULT.store(result, Ordering::Relaxed);
-    INST_CG_DONE_GEN.store(generation, Ordering::Relaxed);
-    result
-}
-
-/// Pointer / length of this instance's emitted §14 unit wasm (see [`temen_par_enable_inst_codegen`]).
-#[no_mangle]
-pub extern "C" fn temen_par_inst_unit_wasm_ptr() -> *const u8 {
-    unsafe { (*core::ptr::addr_of!(INST_UNIT_WASM)).0 }
-}
-#[no_mangle]
-pub extern "C" fn temen_par_inst_unit_wasm_len() -> usize {
-    unsafe { (*core::ptr::addr_of!(INST_UNIT_WASM)).1 }
-}
-
-/// Whether the granted unit's function `entry` is emitted (safe to run `f{entry}` on wasm). `0` when
-/// codegen isn't enabled, `entry` is out of range, or that function is out of the emitter subset.
-#[no_mangle]
-pub extern "C" fn temen_par_inst_eligible(entry: u32) -> i32 {
-    // SAFETY: single-reader per instance; set by `temen_par_enable_inst_codegen`.
-    let e = unsafe { (*core::ptr::addr_of!(INST_ELIGIBLE)).as_ref() };
-    e.and_then(|v| v.get(entry as usize))
-        .copied()
-        .map_or(0, |b| b as i32)
-}
-
-/// Whether the run's emitted §14 unit is **paged** (see [`INST_PAGED`]): the Worker must then call
-/// [`temen_par_inst_pagestate_sync`] before the entry and re-point the unit instance's
-/// `"pagestate"`/`"mapped"` globals from the child vCPU after it and after every bounce.
-#[no_mangle]
-pub extern "C" fn temen_par_inst_paged() -> i32 {
-    // SAFETY: single-reader per instance; set by `temen_par_enable_inst_codegen`.
-    unsafe { *core::ptr::addr_of!(INST_PAGED) as i32 }
-}
-
-/// #1151 Slice 2c — rebuild a child vCPU's page-state table from its live map and stage it exactly
-/// as a paged [`PAR_TIERUP`] does: the table bytes via [`temen_par_tierup_pagestate_ptr`]/`_len` (the
-/// value for the unit instance's `"pagestate"` global) and its coverage via [`temen_par_ev_b`] (the
-/// value for `"mapped"`).
-fn inst_sync_pagestate(v: &mut ParVcpu) {
-    let info = v.inner.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
-    let (table, cover) = bytecode::build_pagestate_table(&info, v.inner.win_flat_len());
-    v.pagestate = table;
-    v.b = cover as i64;
-}
-
-/// Seed the child's page-state table before its emitted entry runs (see [`inst_sync_pagestate`]).
-#[no_mangle]
-pub extern "C" fn temen_par_inst_pagestate_sync(v: *mut ParVcpu) {
-    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
-    inst_sync_pagestate(unsafe { &mut *v });
-}
-
-/// #1151 Slice 2c — service one `env.call_interp(func, args_ptr)` bounce of the emitted §14 unit on
-/// the **child's own vCPU** ([`temen_par_child_detached`]): the leaf runs interpreted over the child's
-/// window with the child's attenuated powerbox ([`bytecode::Vcpu::bounce_call`]) — so a leaf may
-/// store, `map`/`unmap`/`protect`, or otherwise `call.cap`, exactly as the interpreter path would run
-/// it. `args_ptr` is the env scratch (i64 slots, args → results in place). On a paged unit the
-/// page-state table is then re-synced ([`inst_sync_pagestate`]) so the emitted accesses that follow
-/// admit exactly what the interpreter would. Returns `0` on success, `1` on a trap (the Worker
-/// throws, unwinding the emitted entry; the child's slot reads trapped).
-#[no_mangle]
-pub extern "C" fn temen_par_inst_call_interp(v: *mut ParVcpu, func: u32, args_ptr: *mut u8) -> i32 {
-    // SAFETY: `v` is a live `ParVcpu` owned by this Worker; the host passes the env scratch, at least
-    // `XCALL_MAX_SLOTS` 8-aligned i64 slots wide (`temen_wasmjit_env_bytes`).
-    let v = unsafe { &mut *v };
-    let io = unsafe {
-        core::slice::from_raw_parts_mut(args_ptr as *mut i64, temen_wasm_jit::XCALL_MAX_SLOTS)
-    };
-    match v.inner.bounce_call(func, io) {
-        Ok(_) => {
-            if temen_par_inst_paged() == 1 {
-                inst_sync_pagestate(v);
-            }
-            0
-        }
-        Err(_) => 1,
-    }
-}
-
-/// #1865 — an op-17 spawn from **emitted** code: the child `v` runs its entry on the wasm tier, and
-/// its `instantiate_rec` arrived as the Worker's `env.instantiate_rec` bounce. The engine admits it as
-/// the interpreted op ([`bytecode::Vcpu::admit_record`]: `inst` resolved in `v`'s powerbox, the record
-/// read from `v`'s window, a v1 record through the one detached admission) and returns the admitted
-/// child's ticket for its Worker, with `size_log2` in `temen_par_ev_b(v)` and `(module << 32) | entry`
-/// in `temen_par_ev_d(v)`, the operands of a [`PAR_INSTANTIATE_DETACHED`] event. `-EINVAL` for a
-/// refusal, which the emitted parent reads as the spawn's result; `0` for a trap, which the Worker
-/// raises. Once the child's Worker is started, file it with [`temen_par_inst_file_child`].
-#[no_mangle]
-pub extern "C" fn temen_par_inst_instantiate_rec(v: *mut ParVcpu, inst: i32, rec: i64) -> i64 {
-    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
-    let v = unsafe { &mut *v };
-    match v.inner.admit_record(inst, rec as u64) {
-        Ok(Some((child, size_log2))) => {
-            v.b = size_log2 as i64;
-            v.d = detached_operands(&child);
-            ticket(child)
-        }
-        Ok(None) => temen_ir::errno::EINVAL,
-        Err(_) => 0,
-    }
-}
-
-/// #1865 — file the Worker's `token` (the child's completion slot) for the child an emitted spawn
-/// just admitted, in `v`'s own child table, and return the handle the emitted code joins it by —
-/// the table and rule the interpreted spawn and join use ([`bytecode::Vcpu::file_child`]).
-#[no_mangle]
-pub extern "C" fn temen_par_inst_file_child(v: *mut ParVcpu, token: i64) -> i32 {
-    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
-    unsafe { (*v).inner.file_child(token as u64) }
-}
-
-/// #1865 — an emitted `join`: resolve `handle` in `v`'s child table by the oracle's rule
-/// ([`bytecode::Vcpu::join_child`]) and return the child's token (its completion slot) for the
-/// Worker to wait on, then [`temen_par_inst_end_join`]. `0` (no slot is at address 0) for the trap
-/// the interpreted join raises on a spent, negative or unissued handle.
-#[no_mangle]
-pub extern "C" fn temen_par_inst_join(v: *mut ParVcpu, handle: i32) -> i64 {
-    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
-    unsafe { (*v).inner.join_child(handle) }.map_or(0, |t| t as i64)
-}
-
-/// #1865 — the child an emitted join waited on has ended: its window's bytes go back to the budget
-/// that paid for them ([`bytecode::Vcpu::end_join`]).
-#[no_mangle]
-pub extern "C" fn temen_par_inst_end_join(v: *mut ParVcpu) {
-    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
-    unsafe { (*v).inner.end_join() }
-}
-
 // ---- 4d: host I/O across Workers — the run's shared powerbox ------------------------------------
-// THREADS.md 4d: one `Mutex<Host>`, leaked into the shared linear memory (the same cross-Worker
-// sharing as `PAR_PB`/`PAR_INST`), attached to **every** vCPU of the run
-// ([`bytecode::Vcpu::with_shared_host`]) — so a worker vCPU's `call.cap` (host I/O) dispatches
-// in-engine under the lock, the native parallel driver's 4c-host model, with no JS in the loop at all: the
-// `Host` is fully virtual (stdout is an in-memory buffer the page reads back after the run).
+// THREADS.md 4d: one `Mutex<Host>`, leaked into the shared linear memory (as `PAR_PB`/`PAR_INST`),
+// which the run takes as its host — so a task's `call.cap` (host I/O) dispatches in-engine under the
+// run's lock, with no JS in the loop at all: the `Host` is fully virtual (stdout is an in-memory
+// buffer the page reads back after the run).
 
-/// The shared I/O powerbox: the `Mutex<Host>` every vCPU dispatches through, plus the handles the
-/// root guest receives as its args.
+/// The shared I/O powerbox: the `Mutex<Host>` the run dispatches through, plus the handles the root
+/// guest receives as its args.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 struct ParIoCfg {
     host: std::sync::Mutex<Host>,
     /// The `Stream(Out)` handle — the root's single entry arg. `None` for the **on-ramp** recipe
-    /// ([`temen_par_powerbox_onramp`]): its entry is the paramless manifest `_start`, and its root's
-    /// reservation is the window itself (see [`temen_par_root`]).
+    /// ([`temen_par_powerbox_onramp`]): its entry is the paramless manifest `_start`.
     out: Option<i32>,
     /// The root window's seed prefix — the on-ramp recipe's environment ([`onramp_env_init`] of
     /// [`RUN_ENV`]), seeded before the data segments exactly as the single-threaded on-ramp seeds it.
@@ -1680,24 +1018,26 @@ struct ParIoCfg {
 }
 
 /// The leaked [`ParIoCfg`] pointer (or `0`), shared across Workers via shared linear memory.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 static PAR_IO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Publish the run's **shared I/O powerbox**: a fresh `Host` granted a `Stream(Out)`, wrapped in the
-/// `Mutex` every vCPU will dispatch `call.cap` through. The root is seeded with `[out_handle]`
-/// (`temen_par_root`); read the accumulated stdout back after the run via [`temen_par_stdout_len`] +
+/// `Mutex` the run will dispatch `call.cap` through. The root is seeded with `[out_handle]`; read the
+/// accumulated stdout back after the run via [`temen_par_stdout_len`] +
 /// [`temen_par_stdout_ptr`]. Call once (on the main thread) before the run; last-published run recipe
 /// wins (the §22/§14 recipes are cleared, and vice versa).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_powerbox_io() -> i32 {
-    par_run_gen_bump(); // I22: one bump per run — gates the once-per-run codegen emit (see CodegenGuard)
     let mut host = Host::new();
     let out = host.grant_stream(StreamRole::Out);
     par_publish_io(host, Some(out), Vec::new());
     1
 }
 
-/// Publish `host` as the run's shared I/O powerbox (clearing the other recipes). Leaked: Workers
-/// hold `&'static` borrows of it for the rest of the run, and the next publish replaces the pointer.
+/// Publish `host` as the run's shared I/O powerbox (clearing the other recipes). Leaked: the run
+/// holds a `&'static` borrow of it, and the next publish replaces the pointer.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 fn par_publish_io(host: Host, out: Option<i32>, init: Vec<u8>) {
     let cfg = Box::into_raw(Box::new(ParIoCfg {
         host: std::sync::Mutex::new(host),
@@ -1712,15 +1052,16 @@ fn par_publish_io(host: Host, out: Option<i32>, init: Vec<u8>) {
 
 /// Publish the **on-ramp powerbox** as the run's shared I/O powerbox (#152): the same grants a
 /// single-threaded on-ramp run gets ([`grant_onramp_caps`] — the §3e prefix, the by-name caps, the
-/// manifest import bindings), in one `Mutex<Host>` every vCPU of the run dispatches through. So a
+/// manifest import bindings), in one `Mutex<Host>` every task of the run dispatches through. So a
 /// `.temen` off the on-ramp toolchain whose runtime `thread.spawn`s (JACL's worker pool, a pthreads
 /// C program) runs each thread on its own Worker instead of multiplexing them on one. `stdin`
 /// (`[stdin_ptr, stdin_len)`, null/empty ⇒ none) is seeded as the on-ramp run seeds it. Read the
 /// streams back after the run via [`temen_par_stdout_len`] / [`temen_par_stderr_len`]; an `exit`
-/// surfaces as the root's [`PAR_TRAP`] with the code in its operands (see [`temen_par_run`]).
+/// ends the run with its code ([`temen_exit_code`]).
 ///
 /// Returns `1`, or `0` — nothing published — for undecodable bytes or a module the on-ramp refuses
 /// ([`onramp_check`]). Call on the main thread before the run, like [`temen_par_powerbox_io`].
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_powerbox_onramp(
     guest_ptr: *const u8,
@@ -1741,7 +1082,6 @@ pub extern "C" fn temen_par_powerbox_onramp(
     if onramp_check(&m).is_err() {
         return 0;
     }
-    par_run_gen_bump(); // I22: one bump per run — gates the once-per-run codegen emit (see CodegenGuard)
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
     grant_onramp_caps(&mut host, &m, None, None);
@@ -1753,9 +1093,9 @@ pub extern "C" fn temen_par_powerbox_onramp(
 /// recipes are last-published-wins for back-to-back runs of *different* kinds; a plain run after a
 /// powerbox run (the playground can run modes in any order) needs this explicit "none" publish, or
 /// the stale recipe would seed the new root with args its entry doesn't take.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_powerbox_none() {
-    par_run_gen_bump(); // I22: one bump per run — gates the once-per-run codegen emit (see CodegenGuard)
     PAR_PB.store(0, std::sync::atomic::Ordering::Release);
     PAR_INST.store(0, std::sync::atomic::Ordering::Release);
     PAR_IO.store(0, std::sync::atomic::Ordering::Release);
@@ -1765,47 +1105,44 @@ pub extern "C" fn temen_par_powerbox_none() {
 
 /// Borrow the published I/O powerbox (`None` until [`temen_par_powerbox_io`] ran). Leaked; interior
 /// mutability is the `Mutex` (cross-Worker-safe on wasm atomics, like the `Domain`'s `ModuleSource`).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 fn par_io() -> Option<&'static ParIoCfg> {
     let p = PAR_IO.load(std::sync::atomic::Ordering::Acquire) as *const ParIoCfg;
     // SAFETY: once published the powerbox is leaked (never freed); all access is via the `Mutex`.
     unsafe { p.as_ref() }
 }
 
-// ---- §22 runtime `Jit.compile` on the wasm tier (single-Worker) ----------------------------------
+// ---- §22 runtime `Jit.compile` on the wasm tier --------------------------------------------------
 // Unlike `ParPowerbox` (a *fixed* unit host-compiled at setup, its code handle handed to the guest),
-// this powerbox lets the guest build an IR blob **at runtime**, `compile` it — minting a unit **and
-// emitting its wasm** in this host, because the `Jit` grant carries the browser validator + emitter and
-// the vCPU dispatches its `call.cap`s through this shared `Mutex<Host>` (`with_shared_host`) — then
-// `invoke` it on that emitted wasm. The shared `Mutex` is also the seam threaded compile will serialize
-// on (DESIGN.md §22), so this is the single-Worker step of the same design, not a throwaway.
+// this powerbox lets the guest build an IR blob **at runtime**, `compile` it — minting a unit in this
+// host, whose `Jit` grant carries the browser validator — then `invoke` it. The run dispatches its
+// tasks' `call.cap`s through this shared `Mutex<Host>`, which serializes concurrent compiles
+// (DESIGN.md §22).
 
 /// The runtime-`Jit.compile` powerbox recipe: the shared host (grant + validator + emitter) and the
 /// `Jit` domain handle the root is seeded with.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 struct ParJitCfg {
     host: std::sync::Mutex<Host>,
     /// The `Jit` domain handle (the root's single entry arg).
     jit: i32,
-    /// #1347: the run program's function signatures — the dispatch table's **natural prefix**
-    /// (`slot i` = program function `i`), the source for [`temen_par_nfuncs`] and the per-slot
-    /// bounce shims ([`temen_par_shim_wasm_len`]) a Worker fills its B2 table mirror with.
-    sigs: Vec<(Vec<temen_ir::ValType>, Vec<temen_ir::ValType>)>,
 }
 
 /// The leaked [`ParJitCfg`] pointer (or `0`), shared across Workers via shared linear memory.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 static PAR_JIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Publish the runtime-`Jit.compile` powerbox: a fresh `Host` granted `Jit` (memory-match precondition
 /// from the guest's declared memory) with the `Jit` gate ([`temen_interp::jit_blob_validator`]) and
-/// [`browser_jit_wasm_emitter`] installed, wrapped in the shared `Mutex` the vCPU dispatches `call.cap`
-/// through. The root is seeded `[jit]` ([`temen_par_root`]); the guest builds an IR blob, `compile`s
-/// it (emitting wasm), and `invoke`s it on the emitted region. Codegen on by default (flip with
+/// [`browser_jit_wasm_emitter`] installed, wrapped in the shared `Mutex` the run dispatches `call.cap`
+/// through. The root is seeded `[jit]`; the guest builds an IR blob, `compile`s it, and `invoke`s it. Codegen on by default (flip with
 /// [`temen_par_jit_set_codegen`] to run the interpreter path for a differential). Call once (on the
 /// main thread) before the run; the other run recipes are cleared (last-published-wins). Returns `1`,
 /// or `0` on a bad guest module.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_powerbox_jit_runtime(guest_ptr: *const u8, guest_len: usize) -> i32 {
-    par_run_gen_bump(); // I22: one bump per run
-                        // SAFETY: the host guarantees `[guest_ptr, guest_len)` is a live allocation it just filled.
+    // SAFETY: the host guarantees `[guest_ptr, guest_len)` is a live allocation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(guest_ptr, guest_len) };
     let Ok(m) = temen_encode::decode_module(bytes) else {
         return 0;
@@ -1817,13 +1154,7 @@ pub extern "C" fn temen_par_powerbox_jit_runtime(guest_ptr: *const u8, guest_len
     let cfg = Box::into_raw(Box::new(ParJitCfg {
         host: std::sync::Mutex::new(host),
         jit,
-        sigs: m
-            .funcs
-            .iter()
-            .map(|f| (f.params.clone(), f.results.clone()))
-            .collect(),
     }));
-    PAR_SHIMS.lock().unwrap_or_else(|e| e.into_inner()).clear(); // a new program: new prefix shims
     PAR_JIT.store(cfg as usize, std::sync::atomic::Ordering::Release);
     PAR_PB.store(0, std::sync::atomic::Ordering::Release);
     PAR_INST.store(0, std::sync::atomic::Ordering::Release);
@@ -1833,504 +1164,18 @@ pub extern "C" fn temen_par_powerbox_jit_runtime(guest_ptr: *const u8, guest_len
 }
 
 /// Borrow the published runtime-`Jit.compile` powerbox (`None` until [`temen_par_powerbox_jit_runtime`]).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 fn par_jit_rt() -> Option<&'static ParJitCfg> {
     let p = PAR_JIT.load(std::sync::atomic::Ordering::Acquire) as *const ParJitCfg;
     // SAFETY: once published the powerbox is leaked (never freed); all access is via the `Mutex`.
     unsafe { p.as_ref() }
 }
 
-/// Resolve a `JitInvoke` event's authority against the shared runtime-compile host (mirrors
-/// [`par_resolve_unit`]) and hand back the unit's funcs + its emitted wasm.
-#[allow(clippy::type_complexity)]
-fn par_resolve_unit_rt(
-    h: &mut Host,
-    handle: i32,
-    code: i32,
-) -> Result<
-    (
-        std::sync::Arc<[temen_ir::Func]>,
-        std::sync::Arc<[temen_ir::TypeEntry]>,
-        Option<std::sync::Arc<[u8]>>,
-        (u32, u32),
-    ),
-    Trap,
-> {
-    // FuncType interning (#922): carry the unit's type section beside its funcs and emitted wasm.
-    let (funcs, types, (cd, cu)) = h.resolve_jit_unit(handle, code)?;
-    // #1339: `(cd, cu)` rides back for an install, which records it in the table (the handle is
-    // revocable, the unit is not).
-    Ok((funcs, types, h.jit_unit_wasm_or_emit(cd, cu), (cd, cu))) // #1301: a thawed unit re-emits here
-}
-
-/// When on, the runtime-`Jit.compile` emitter emits **Model B2** units (importing the shared reserved
-/// funcref table) instead of local-table units — so an installed unit's `call.dyn` dispatches to
-/// other installed units through the per-Worker table mirror. Off by default (the emitted-unit shape
-/// changes, so the JS host must provide `env.__indirect_function_table`).
-static PAR_JIT_B2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn par_jit_b2() -> bool {
-    PAR_JIT_B2.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Toggle Model-B2 emission for the runtime-compile tier (see [`PAR_JIT_B2`]). The JS host sets this
-/// on iff it provides each Worker a shared `WebAssembly.Table` import.
-#[no_mangle]
-pub extern "C" fn temen_par_jit_set_b2(on: i32) {
-    PAR_JIT_B2.store(on != 0, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The §22 `Jit` dispatch-table reservation (`log2` of the slot count) — the size the JS host makes
-/// each per-Worker `WebAssembly.Table`, matching the emitted `call.dyn` mask `idx & (2^n - 1)`.
-#[no_mangle]
-pub extern "C" fn temen_par_jit_table_log2() -> u32 {
-    PAR_JIT_TABLE_LOG2 as u32
-}
-
-/// #1339 — the `(domain, unit)` installed at `slot` of `v`'s dispatch table, packed
-/// `domain << 32 | unit` (`-1` empty): what a Worker reads to rebuild its per-Worker
-/// `WebAssembly.Table` (§22 B2 cross-Worker), and the key it fetches the slot's emitted wasm by
-/// ([`temen_par_jit_unit_wasm_by_id_len`]). The `temen_coop_slot_unit` twin: it names the unit
-/// rather than the guest-revocable code handle, so a released-after-install unit still rebuilds.
-#[no_mangle]
-pub extern "C" fn temen_par_jit_slot_unit(v: *mut ParVcpu, slot: u32) -> i64 {
-    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
-    unsafe { (*v).inner.slot_unit(slot) }.map_or(-1, |(d, u)| ((d as i64) << 32) | u as i64)
-}
-
-/// #1339 — the generation of `v`'s dispatch table, which moves with every §22 install and uninstall
-/// (the coop driver's `temen_coop_table_gen` twin). A Worker caches the generation it last rebuilt
-/// its `WebAssembly.Table` at and rebuilds only when this moves — including after a bounce, whose
-/// callback may have installed from an emitted frame.
-#[no_mangle]
-pub extern "C" fn temen_par_jit_table_gen(v: *mut ParVcpu) -> u32 {
-    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
-    unsafe { (*v).inner.table_gen() }
-}
-
-/// #1347: the run program's function count — the dispatch table's **natural prefix** (`slot i <
-/// nfuncs` dispatches program function `i`; the coop driver's `temen_coop_nfuncs` twin). A Worker
-/// fills those slots of its B2 table mirror with the tier-up module's emitted `f{i}` or a bounce shim
-/// ([`temen_par_shim_wasm_len`]), so a runtime unit's `call.dyn` — a `compile_linked` unit's Slot
-/// import — reaches program code exactly as it does on the interpreter. `0` until
-/// [`temen_par_powerbox_jit_runtime`].
-#[no_mangle]
-pub extern "C" fn temen_par_nfuncs() -> usize {
-    par_jit_rt().map_or(0, |cfg| cfg.sigs.len())
-}
-
-/// #1347: the natural-prefix bounce shims, built once per run and held for the process so every
-/// Worker reads stable bytes through [`temen_par_shim_wasm_ptr`] (a `Box` never moves while stored);
-/// cleared by the next [`temen_par_powerbox_jit_runtime`].
-static PAR_SHIMS: std::sync::Mutex<Vec<Option<Box<[u8]>>>> = std::sync::Mutex::new(Vec::new());
-
-/// #1347: the bounce-shim module for natural-prefix `slot` — one function (`export "t"`,
-/// [`temen_wasm_jit::emit_slot_trampoline`]) with program function `slot`'s env-prepended signature,
-/// whose body bounces to `env.call_interp(slot, …)`. The Worker binds that import to
-/// [`temen_par_inst_call_interp`] on ITS vCPU, so an emitted `call.dyn` to an interpreter-resident
-/// program function runs over the live window and powerbox (`Vcpu::bounce_call`) — the
-/// `temen_coop_shim_wasm` twin. Returns the byte length; `0` for a slot outside the prefix or a
-/// signature the i64-slot transport can't carry (the slot then stays a null funcref, as before).
-#[no_mangle]
-pub extern "C" fn temen_par_shim_wasm_len(slot: u32) -> usize {
-    let Some(cfg) = par_jit_rt() else {
-        return 0;
-    };
-    let Some((params, results)) = cfg.sigs.get(slot as usize) else {
-        return 0;
-    };
-    let mut shims = PAR_SHIMS.lock().unwrap_or_else(|e| e.into_inner());
-    let i = slot as usize;
-    if shims.len() <= i {
-        shims.resize_with(i + 1, || None);
-    }
-    if shims[i].is_none() {
-        // The browser threads build: every emitted module imports the ONE shared linear memory.
-        let Ok(w) = temen_wasm_jit::emit_slot_trampoline(params, results, slot, true) else {
-            return 0;
-        };
-        shims[i] = Some(w.into_boxed_slice());
-    }
-    shims[i].as_ref().map_or(0, |w| w.len())
-}
-
-/// Pointer to the shim module [`temen_par_shim_wasm_len`] built for `slot` (null if none).
-#[no_mangle]
-pub extern "C" fn temen_par_shim_wasm_ptr(slot: u32) -> *const u8 {
-    let shims = PAR_SHIMS.lock().unwrap_or_else(|e| e.into_inner());
-    shims
-        .get(slot as usize)
-        .and_then(|w| w.as_ref())
-        .map_or(core::ptr::null(), |w| w.as_ptr())
-}
-
-/// #1339 — emitted-wasm for the unit `id` ([`temen_par_jit_slot_unit`]'s packed `(domain, unit)`),
-/// so a Worker can instantiate a slot's unit it hasn't itself invoked. `0` if there is no such unit
-/// or it is interpreter-only. The bytes (via [`temen_par_jit_unit_wasm_by_id_ptr`]) live in the
-/// shared host's heap = shared linear memory, held for the process, so the returned pointer stays
-/// valid.
-///
-/// Keyed by the unit rather than the guest's (revocable) code handle: the ordinary
-/// `compile → install → release` leaves the unit installed with no live handle, and a by-handle
-/// fetch then came back empty and nulled the slot (`IndirectCallToNull`). And by the unit rather
-/// than its slot (#2259): another Worker can install into the slot between the Worker's reads, and
-/// a by-slot length and pointer then named two units. The `temen_coop_jit_wasm_by_slot_len` twin,
-/// which needs no such guard on its one thread.
-#[no_mangle]
-pub extern "C" fn temen_par_jit_unit_wasm_by_id_len(id: i64) -> usize {
-    par_jit_unit_wasm_by_id(id).map_or(0, |w| w.len())
-}
-
-/// Pointer to the emitted-wasm for unit `id` (see [`temen_par_jit_unit_wasm_by_id_len`]).
-#[no_mangle]
-pub extern "C" fn temen_par_jit_unit_wasm_by_id_ptr(id: i64) -> *const u8 {
-    par_jit_unit_wasm_by_id(id).map_or(core::ptr::null(), |w| w.as_ptr())
-}
-
-fn par_jit_unit_wasm_by_id(id: i64) -> Option<std::sync::Arc<[u8]>> {
-    let cfg = par_jit_rt()?;
-    let mut g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
-    g.jit_unit_wasm_or_emit((id >> 32) as u32, id as u32) // #1301: a thawed unit re-emits here
-}
-
-/// Live-vCPU counter across Workers — the browser path's anti-bomb **backstop** (the native drivers
-/// give the spawner a clean `ThreadFault`; here a construction past the cap returns null and the JS
-/// host fails the run — cruder, but it bounds Worker creation). Incremented by the `temen_par_*` vCPU
-/// constructors, decremented by [`temen_par_free`].
-static PAR_LIVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// Far above any legitimate fan-out (a tab with 256 live Workers is already pathological), far below
-/// a Worker bomb's ambition.
-const PAR_MAX_VCPUS: u32 = 256;
-
-/// Admit one vCPU under the live cap (decrementing back out on refusal).
-fn par_vcpu_admit() -> bool {
-    use std::sync::atomic::Ordering;
-    if PAR_LIVE.fetch_add(1, Ordering::AcqRel) >= PAR_MAX_VCPUS {
-        PAR_LIVE.fetch_sub(1, Ordering::AcqRel);
-        return false;
-    }
-    true
-}
-
-/// Un-admit a vCPU that failed to construct (the success path decrements via [`temen_par_free`]).
-fn par_vcpu_retire() {
-    PAR_LIVE.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-}
-
-/// Like [`temen_par_compile`], but reserve the `Jit` dispatch table (matching the powerbox grant) so a
-/// guest `install` lands in range. Use this (not [`temen_par_compile`]) for a §22-JIT run.
-#[no_mangle]
-pub extern "C" fn temen_par_compile_jit(
-    mod_ptr: *const u8,
-    mod_len: usize,
-) -> *mut bytecode::VcpuProgram {
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
-    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let Ok(m) = temen_encode::decode_module(bytes) else {
-        return core::ptr::null_mut();
-    };
-    match bytecode::VcpuProgram::compile_with_jit_table(&m, PAR_JIT_TABLE_LOG2) {
-        Some(p) => Box::into_raw(Box::new(p)),
-        None => core::ptr::null_mut(),
-    }
-}
-
-/// Build the **root** vCPU (function `func`) over the shared window `[win_ptr, win_size)`; it seeds +
-/// data-initialises the window (the once). Returns a boxed [`ParVcpu`] pointer, null on a bad func.
-#[no_mangle]
-pub extern "C" fn temen_par_root(
-    prog: *mut bytecode::VcpuProgram,
-    win_ptr: *mut u8,
-    win_size: usize,
-    func: u32,
-) -> *mut ParVcpu {
-    if !par_vcpu_admit() {
-        return core::ptr::null_mut();
-    }
-    // SAFETY: the host guarantees `[win_ptr, win_size)` is a live shared window for the run.
-    let back =
-        std::sync::Arc::new(unsafe { temen_interp::Region::shared(win_ptr, win_size as u64) });
-    // A §14 run builds the root's **own** powerbox from the published recipe (`Instantiator` +
-    // optional `Module` grant; §14 resolves authority in-Vm, so the grants must live in the vCPU's
-    // host) and seeds the root with the handles. A §22-JIT run seeds `(jit, code)` from the shared
-    // powerbox; a 4d I/O run attaches the shared `Mutex<Host>` and seeds `[out]`; a plain run gets
-    // no args. Signatures unchanged either way — the JS host just calls the matching
-    // `temen_par_powerbox*` first.
-    if let Some(cfg) = par_inst() {
-        // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
-        let (host, args) = par_inst_powerbox(cfg, unsafe { prog_ref(prog) }.module());
-        // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
-        return match bytecode::Vcpu::new_root_with_powerbox(
-            unsafe { prog_ref(prog) },
-            func,
-            &args,
-            back,
-            &[],
-            host,
-        ) {
-            // #816 item 5: a §14 orchestration root's compute leaves tier up too (module-0 root
-            // over the full run window — the same shape as the plain root below).
-            Ok(inner) => par_box(with_tierup(inner.with_shared_fibers(par_fibers(prog)))),
-            Err(_) => {
-                par_vcpu_retire();
-                core::ptr::null_mut()
-            }
-        };
-    }
-    // A §22 **runtime-compile** run: the guest's `Jit` authority + validator + emitter live in the
-    // shared `Mutex<Host>` it dispatches `call.cap`s through (`with_shared_host`), so its runtime
-    // `compile` mints + emits into that host. Seed `[jit]` only — the guest compiles its own unit.
-    if let Some(cfg) = par_jit_rt() {
-        // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
-        return match bytecode::Vcpu::new_root(
-            unsafe { prog_ref(prog) },
-            func,
-            &[Value::I32(cfg.jit)],
-            back,
-            &[],
-        ) {
-            // #816 item 5: the §22 runtime-compile root's compute leaves tier up too (the JACL
-            // shape — its `Jit.compile`d units already ran emitted; now so do its own hot leaves).
-            Ok(inner) => par_box(with_tierup(
-                inner
-                    .with_shared_host(&cfg.host)
-                    .with_shared_fibers(par_fibers(prog)),
-            )),
-            Err(_) => {
-                par_vcpu_retire();
-                core::ptr::null_mut()
-            }
-        };
-    }
-    let (args, io): (Vec<Value>, Option<&'static ParIoCfg>) = match (par_io(), par_pb()) {
-        (Some(io), _) => (io.out.map(Value::I32).into_iter().collect(), Some(io)),
-        (None, Some(pb)) => (vec![Value::I32(pb.jit), Value::I32(pb.code)], None),
-        (None, None) => (Vec::new(), None),
-    };
-    // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
-    let prog = unsafe { prog_ref(prog) };
-    // An on-ramp root reserves exactly the window, as every child does (`temen_par_child`): a
-    // `vm_map` past it is refused, rather than succeeding into a tail the shared window drops writes
-    // to. The other recipes keep the default reservation over the window.
-    let root = match io {
-        Some(cfg @ ParIoCfg { out: None, .. }) => {
-            if !win_size.is_power_of_two() {
-                par_vcpu_retire();
-                return core::ptr::null_mut();
-            }
-            bytecode::Vcpu::new_root_reserved_over_with_powerbox(
-                prog,
-                func,
-                &args,
-                &cfg.init,
-                Host::new(),
-                win_size.trailing_zeros() as u8,
-                back,
-            )
-        }
-        _ => bytecode::Vcpu::new_root(prog, func, &args, back, &[]),
-    };
-    match root {
-        Ok(inner) => {
-            let inner = match io {
-                Some(io) => inner.with_shared_host(&io.host),
-                None => inner,
-            };
-            par_box(with_tierup(inner.with_shared_fibers(prog.fibers())))
-        }
-        Err(_) => {
-            par_vcpu_retire();
-            core::ptr::null_mut()
-        }
-    }
-}
-
-/// Build a `thread.spawn`ed **child** vCPU (`func(sp, arg)`) over the **same** shared window — it does
-/// not re-seed (the window is already live). Called on the child's Worker. Null on a bad func.
-/// `module` is the spawning frame's module from the `PAR_SPAWN` event (`ev_a >> 32`) — `func`
-/// resolves there and the child's root frame starts there (module-0 for plain guests). `vcpu` is
-/// the event's `ev_d`: the child's dense vCPU id, which seeds its `vcpu.tls` (a language runtime's
-/// worker index — JACL's pool reads it to find its own queue).
-#[no_mangle]
-pub extern "C" fn temen_par_child(
-    prog: *mut bytecode::VcpuProgram,
-    win_ptr: *mut u8,
-    win_size: usize,
-    module: u32,
-    func: u32,
-    sp: i64,
-    arg: i64,
-    vcpu: i64,
-) -> *mut ParVcpu {
-    if !win_size.is_power_of_two() {
-        return core::ptr::null_mut();
-    }
-    // SAFETY: the host guarantees `[win_ptr, win_size)` is the same live shared window.
-    let back =
-        std::sync::Arc::new(unsafe { temen_interp::Region::shared(win_ptr, win_size as u64) });
-    par_thread(prog, back, win_size, module, func, sp, arg, vcpu)
-}
-
-/// #1865 — [`temen_par_child`] for a thread of a §5 **detached** child: its spawner's window is the
-/// child's own `WebAssembly.Memory`, registered in this Worker's foreign registry as `mem_id` (one
-/// header page in, as [`temen_par_child_detached`] registers it), `win_size` bytes of it. Its futex
-/// words are there too, where the spawner's are.
-#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
-#[no_mangle]
-#[allow(clippy::too_many_arguments)]
-pub extern "C" fn temen_par_thread_detached(
-    prog: *mut bytecode::VcpuProgram,
-    mem_id: u32,
-    win_size: usize,
-    module: u32,
-    func: u32,
-    sp: i64,
-    arg: i64,
-    vcpu: i64,
-) -> *mut ParVcpu {
-    if !win_size.is_power_of_two() {
-        return core::ptr::null_mut();
-    }
-    let back = std::sync::Arc::new(foreign_region(mem_id, win_size as u64));
-    par_thread(prog, back, win_size, module, func, sp, arg, vcpu)
-}
-
-/// A `thread.spawn`ed vCPU over its spawner's window `back` (`win_size` bytes).
-#[allow(clippy::too_many_arguments)]
-fn par_thread(
-    prog: *mut bytecode::VcpuProgram,
-    back: std::sync::Arc<temen_interp::Region>,
-    win_size: usize,
-    module: u32,
-    func: u32,
-    sp: i64,
-    arg: i64,
-    vcpu: i64,
-) -> *mut ParVcpu {
-    if !par_vcpu_admit() {
-        return core::ptr::null_mut();
-    }
-    // A thread shares its SPAWNER's window — a detached child's own memory, or the root window — so
-    // the mask derives from the passed window size (a power of two by construction), not the guest
-    // module's declared memory (CONSOLIDATION.md §11 slice 3).
-    let sl = win_size.trailing_zeros() as u8;
-    let args = [Value::I64(sp), Value::I64(arg)];
-    // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
-    match bytecode::Vcpu::new_child_sized(unsafe { prog_ref(prog) }, module, func, &args, back, sl)
-    {
-        Ok(inner) => {
-            // #1761: a thread shares its run's fiber registry, so a fiber created on one Worker
-            // can be resumed on another (a runtime's worker pool pins jobs to workers).
-            let inner = inner
-                .with_shared_fibers(par_fibers(prog))
-                .with_vcpu_id(vcpu as u64);
-            // A §22 **runtime-compile** run shares the JIT `Mutex<Host>` across every vCPU (mirroring
-            // the root, `temen_par_root`), so a worker `thread.spawn`ed onto this Worker can `compile` /
-            // `invoke` against the *same* domain: a unit compiled on any Worker is invokable here, and
-            // its emitted bytes (in the shared host's heap = shared linear memory) are read locally and
-            // instantiated per-Worker. Concurrent `compile`s serialize on the `Mutex` (DESIGN.md §22).
-            if let Some(cfg) = par_jit_rt() {
-                return par_box(inner.with_shared_host(&cfg.host));
-            }
-            // A 4d I/O run shares one powerbox across every vCPU (worker `call.cap` = host I/O).
-            let inner = match par_io() {
-                Some(io) => inner.with_shared_host(&io.host),
-                None => inner,
-            };
-            par_box(with_tierup(inner))
-        }
-        Err(_) => {
-            par_vcpu_retire();
-            core::ptr::null_mut()
-        }
-    }
-}
-
-/// A child the engine admitted, boxed as a **ticket**: an opaque `i64` the JS host relays verbatim
-/// from the spawning Worker to the child's, which starts it ([`temen_par_child_detached`]). The whole
-/// admitted child crosses — its powerbox, re-grants and pre-mapped region included — through the one
-/// linear memory every Worker shares, so nothing is rebuilt from integers on the other side.
-fn ticket(child: bytecode::PendingChild) -> i64 {
-    Box::into_raw(Box::new(child)) as usize as i64
-}
-
-/// A detached child's `(module << 32) | entry`, the `_d` operand of [`PAR_INSTANTIATE_DETACHED`].
-/// `module`, the child's index in its spawner's program source, is kept only when the child runs the
-/// run's granted unit — the one module the Workers emit — and is `0` otherwise, so a Worker runs the
-/// emitted unit for exactly the children whose program it is. A child of the root's own module (a
-/// spawn record's `module = -1`) stays interpreted.
-fn detached_operands(child: &bytecode::PendingChild) -> i64 {
-    let (module, entry) = child.module_entry();
-    let unit = par_inst().and_then(|c| c.module.as_ref());
-    let runs_unit = unit.is_some() && unit == child.self_module().map(|m| &**m);
-    (if runs_unit { (module as i64) << 32 } else { 0 }) | entry as i64
-}
-
-/// Start a §5 **detached child** (#1286 slice 3b) from its ticket over its own `WebAssembly.Memory`,
-/// registered in this Worker's foreign registry as `mem_id` (`registerForeign(childMem, header)` —
-/// region offset 0 is one host header page in, DETACHED_JIT.md §3.1): a [`PAR_INSTANTIATE_DETACHED`]
-/// event's operands, relayed by the JS host with the memory it minted. The engine seeds the window —
-/// its data segments under the NULL guard, the args payload, a pre-mapped region — which starts at
-/// the declared `1 << size_log2` and `vm_map`-grows in place (`Mem::map` → `Region::grow_to` →
-/// `foreign_grow`). No leaf tier-up (that module binds the ONE engine memory, and this window is not
-/// in it); a child of the granted unit may instead run the unit's emit bound to its own memory. Called
-/// on the child's Worker. Null past the live cap or if the child fails to start (the ticket is spent
-/// either way).
-#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
-#[no_mangle]
-pub extern "C" fn temen_par_child_detached(
-    prog: *mut bytecode::VcpuProgram,
-    ticket: i64,
-    mem_id: u32,
-    size_log2: u32,
-) -> *mut ParVcpu {
-    // SAFETY: the host relays each ticket to exactly one child Worker.
-    let child = unsafe { *Box::from_raw(ticket as usize as *mut bytecode::PendingChild) };
-    if size_log2 >= 64 || !par_vcpu_admit() {
-        return core::ptr::null_mut();
-    }
-    let back = std::sync::Arc::new(foreign_region(mem_id, 1u64 << size_log2));
-    // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
-    match child.start(unsafe { prog_ref(prog) }, back) {
-        Ok(inner) => {
-            // #1865: the child's starter cap handles (its entry args), staged for a Worker that runs
-            // the entry on the emitted tier.
-            let entry_args: Vec<i64> = inner
-                .entry_args()
-                .iter()
-                .map(|a| first_i64(std::slice::from_ref(a)))
-                .collect();
-            let v = par_box(inner);
-            // SAFETY: freshly boxed, exclusively ours until returned to the Worker.
-            unsafe { (*v).tierup_argv = entry_args };
-            v
-        }
-        Err(_) => {
-            par_vcpu_retire();
-            core::ptr::null_mut()
-        }
-    }
-}
-
-/// #1865 — the bytes a child vCPU's window holds ([`bytecode::Vcpu::win_flat_len`]): the `"mapped"`
-/// bound a Worker gives a detached child's emitted unit, re-read after each bounce, since a bounced
-/// leaf's `vm_map` grows the child's memory.
-#[no_mangle]
-pub extern "C" fn temen_par_win_len(v: *mut ParVcpu) -> u64 {
-    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
-    unsafe { (*v).inner.win_flat_len() }
-}
-
-/// The ceiling a detached child's minted memory may grow to (bytes, header excluded) — the Worker
-/// sizes the `WebAssembly.Memory`'s `maximum` from it.
-#[no_mangle]
-pub extern "C" fn temen_detached_max_bytes() -> u64 {
-    DETACHED_DEFAULT_MAX_BYTES
-}
-
 /// Pointer / length of the accumulated stdout in the run's shared I/O powerbox (4d). Call `len`
 /// **first** — it snapshots the buffer under the powerbox lock into a stable stash `ptr` then reads —
-/// after the run completes (the root's `done`; a mid-run call sees a prefix). `0` when no
+/// after the run completes (a mid-run call sees a prefix). `0` when no
 /// [`temen_par_powerbox_io`] was published.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_stdout_len() -> usize {
     let Some(io) = par_io() else { return 0 };
@@ -2343,15 +1188,18 @@ pub extern "C" fn temen_par_stdout_len() -> usize {
     unsafe { stash(&mut *core::ptr::addr_of_mut!(PAR_OUT), bytes) };
     unsafe { (*core::ptr::addr_of!(PAR_OUT)).1 }
 }
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_stdout_ptr() -> *const u8 {
     // SAFETY: as above — main-thread single-reader stash.
     unsafe { (*core::ptr::addr_of!(PAR_OUT)).0 }
 }
 /// The stashed 4d stdout snapshot (`temen_par_stdout_len` fills it; `_ptr` reads it).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 static mut PAR_OUT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
 /// [`temen_par_stdout_len`]'s stderr twin — the shared host's stderr, as [`onramp_exec`] returns it.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_stderr_len() -> usize {
     let Some(io) = par_io() else { return 0 };
@@ -2363,20 +1211,22 @@ pub extern "C" fn temen_par_stderr_len() -> usize {
     unsafe { stash(&mut *core::ptr::addr_of_mut!(PAR_ERR), bytes) };
     unsafe { (*core::ptr::addr_of!(PAR_ERR)).1 }
 }
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_stderr_ptr() -> *const u8 {
     // SAFETY: as above — main-thread single-reader stash.
     unsafe { (*core::ptr::addr_of!(PAR_ERR)).0 }
 }
 /// The stashed stderr snapshot (`temen_par_stderr_len` fills it; `_ptr` reads it).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 static mut PAR_ERR: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
 // ---- I22 diagnostics: capture a Rust panic's location+message ----------------------------------
 // `panic = "abort"` lowers a Rust panic to a wasm `unreachable`, which reaches the JS host as a bare
 // `[pageerror] unreachable` with no location — the exact signature of the Jul 12 nightly `real-browser`
 // flake (ISSUES.md I22). A `unreachable` trap unwinds to the host but leaves the instance's memory
-// intact, so a panic hook can stash the message here and the worker.js trap handler reads it back
-// AFTER the trap via the accessors below. No new wasm import needed (the threads build instantiates
+// intact, so a panic hook can stash the message here and worker.js reads it back AFTER the trap via
+// the accessors below. No new wasm import needed (the threads build instantiates
 // with only `env.memory`). Alloc-free in the hook (formats into a stack buffer); the one heap alloc is
 // the `Box`ed closure at install, once.
 const PAR_PANIC_CAP: usize = 512;
@@ -2421,450 +1271,12 @@ pub extern "C" fn temen_par_last_panic_len() -> usize {
     PAR_PANIC_LEN.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// Advance the vCPU until it finishes, traps, or hits a host-serviced event; returns a `PAR_*` code.
-/// The host reads operands via `temen_par_ev_a`–`d`, services the event, calls the matching `deliver`,
-/// then calls `temen_par_run` again.
-#[no_mangle]
-pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
-    par_install_panic_capture(); // I22: so a mid-run engine panic self-identifies (FILE:LINE) not a bare `unreachable`
-                                 // SAFETY: `v` is a live `ParVcpu` from `temen_par_root`/`temen_par_child`, owned by this Worker.
-    let v = unsafe { &mut *v };
-    // Loop so §22 JIT events (serviced in-Rust against the shared powerbox) never surface to the JS
-    // host — it only ever sees the multi-vCPU events `spawn`/`join`/`wait`/`notify` (+ `done`/`trap`).
-    loop {
-        match v.inner.run() {
-            bytecode::VcpuEvent::Done(vals) => {
-                v.a = first_i64(&vals);
-                return PAR_DONE;
-            }
-            bytecode::VcpuEvent::Trapped(t) => return par_trap(v, &t),
-            // wasm-JIT tier-up: hand the func index + marshalled args to the Worker, which runs the
-            // emitted `f{func}` and delivers the results (`temen_par_deliver_tierup`) or a trap.
-            // Operand `b` carries the window's scalar committed extent — the Worker writes it to the
-            // emitted module's `"mapped"` global before the call, so the emitted bounds check admits
-            // exactly what the interpreter would over a `vm_map`-grown window (#717 host sync).
-            bytecode::VcpuEvent::TierUp { func, argv, mapped } => {
-                v.a = func as i64;
-                if par_jit_paged() {
-                    // #750: rebuild the page-state table from the live map (frozen while emitted
-                    // code runs); operand `b` becomes the table's COVERAGE — the value the Worker
-                    // writes to the emitted `"mapped"` global — and the table bytes are read via
-                    // `temen_par_tierup_pagestate_ptr`/`_len` (their address in this module's linear
-                    // memory IS the `"pagestate"` global's value: one shared memory, zero copies).
-                    let info = v.inner.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
-                    let (table, cover) =
-                        bytecode::build_pagestate_table(&info, v.inner.win_flat_len());
-                    v.pagestate = table;
-                    v.b = cover as i64;
-                } else {
-                    v.b = mapped as i64;
-                }
-                v.tierup_argv = argv.into_vec();
-                return PAR_TIERUP;
-            }
-            bytecode::VcpuEvent::Spawn {
-                func,
-                sp,
-                arg,
-                module,
-                vcpu,
-            } => {
-                // A detached vCPU's sibling runs over the same child memory
-                // ([`temen_par_thread_detached`], #1865): the Worker posts it with the thread.
-                // Pack `(module << 32) | func` exactly as the INSTANTIATE event does: the spawning
-                // frame's module rides to the child Worker so the child resolves `func` there (an
-                // installed §22 unit spawning its own functions — CONSOLIDATION.md §11).
-                v.a = ((module as i64) << 32) | func as i64;
-                v.b = sp;
-                v.c = arg;
-                // The child's dense vCPU id, for `temen_par_child` to seed its `vcpu.tls` with.
-                v.d = vcpu as i64;
-                return PAR_SPAWN;
-            }
-            bytecode::VcpuEvent::Join { child } => {
-                v.a = child as i64;
-                return PAR_JOIN;
-            }
-            bytecode::VcpuEvent::Wait {
-                addr,
-                expected,
-                width,
-                timeout,
-            } => {
-                v.a = addr as i64;
-                v.b = expected as i64;
-                v.c = width as i64;
-                // #1638 — an infinite wait crosses as the guest's own `-1`, not a `MAX_WAIT`
-                // stand-in. `worker.js` already reads a non-positive `d` as `Infinity`; that
-                // branch was simply unreachable while the engine clamped every infinite wait
-                // to 10 s here.
-                v.d = timeout.map_or(-1, |t| t as i64);
-                return PAR_WAIT;
-            }
-            bytecode::VcpuEvent::Notify { addr, count } => {
-                v.a = addr as i64;
-                v.b = count as i64;
-                return PAR_NOTIFY;
-            }
-            // §22 guest-JIT serviced in-Rust against the shared powerbox + `Domain` (THREADS.md
-            // 4c-domain C2): resolve the unit (the powerbox holds authority) and deliver it; the vCPU
-            // installs / invokes against the shared `Domain`, then we loop. Without a powerbox (a
-            // non-JIT run) a JIT op is fail-closed, exactly as before this seam existed.
-            bytecode::VcpuEvent::JitInstall { handle, code } => {
-                // Resolve the unit via whichever powerbox this run holds — fixed-unit (`par_pb`) or
-                // runtime-compile (`par_jit_rt`). Both surface a `JitInstall` event; the runtime path
-                // was previously unwired here (it would trap). Each Worker mirrors the shared
-                // `Domain`'s table into its own `WebAssembly.Table` (§22 Model B2 cross-Worker —
-                // funcrefs can't cross Workers), from `temen_par_jit_slot_unit`.
-                let resolved = if let Some(pb) = par_pb() {
-                    pb.host.resolve_jit_unit(handle, code)
-                } else if let Some(cfg) = par_jit_rt() {
-                    let mut g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
-                    par_resolve_unit_rt(&mut g, handle, code).map(|(f, t, _, id)| (f, t, id))
-                } else {
-                    return PAR_TRAP;
-                };
-                v.inner.deliver_jit_install(resolved);
-            }
-            bytecode::VcpuEvent::JitUninstall { handle, .. } => {
-                let authorized = if let Some(pb) = par_pb() {
-                    pb.host.resolve_jit_domain(handle).map(|_| ())
-                } else if let Some(cfg) = par_jit_rt() {
-                    let g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
-                    g.resolve_jit_domain(handle).map(|_| ())
-                } else {
-                    return PAR_TRAP;
-                };
-                v.inner.deliver_jit_uninstall(authorized);
-            }
-            bytecode::VcpuEvent::JitInvoke {
-                handle,
-                code,
-                argv,
-                params,
-                results,
-                mapped,
-            } => {
-                // Scalar arg/result type codes (i32/i64/f32/f64) the JS host marshals each i64 slot
-                // by; `None` if any operand is v128 (no lane marshalling — the unit stays on interp).
-                let codes = |ts: &[temen_ir::ValType]| {
-                    ts.iter()
-                        .map(|t| scalar_type_code(*t))
-                        .collect::<Option<Vec<u8>>>()
-                };
-                let (ptypes, rtypes) = (codes(&params), codes(&results));
-                // #717 host sync: operand `b` carries the committed extent for the Worker to write
-                // to the emitted unit's `"mapped"` global before `f0`. An unrepresentable window
-                // state (`None`) declines codegen below — the interpreted delivery honors the full
-                // page map (fail-closed, same contract as PAR_TIERUP).
-                // #1347: with the natural prefix mirrored, the unit's `call.dyn` can reach an emitted
-                // program `f{i}`, whose page check reads this vCPU's table on a paged run — rebuild it
-                // here exactly as the TierUp arm does (`b` = the table's coverage; the #1334 coop twin).
-                if let Some(h) = mapped {
-                    if par_jit_paged() {
-                        let info = v.inner.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
-                        let (table, cover) =
-                            bytecode::build_pagestate_table(&info, v.inner.win_flat_len());
-                        v.pagestate = table;
-                        v.b = cover as i64;
-                    } else {
-                        v.b = h as i64;
-                    }
-                }
-                if let Some(cfg) = par_jit_rt() {
-                    // §22 **runtime-compile** path: the guest compiled its *own* unit into the shared
-                    // host, its wasm emitted there; run it on that per-unit wasm (JS instantiates it
-                    // keyed by the code handle, reading `temen_par_jit_code_wasm_ptr`/`_len`). Authority
-                    // resolves through the same host — a forged / cross-domain handle traps identically.
-                    // Codegen off / v128 / a unit outside the emitter subset ⇒ the interpreter services it.
-                    let resolved = {
-                        let mut g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
-                        par_resolve_unit_rt(&mut g, handle, code)
-                    };
-                    match resolved {
-                        Err(t) => v.inner.deliver_jit_invoke(Err(t)),
-                        Ok((funcs, types, wasm, id)) => {
-                            let codegen = par_jit_codegen()
-                                && wasm.is_some()
-                                && ptypes.is_some()
-                                && rtypes.is_some()
-                                && mapped.is_some();
-                            if codegen {
-                                v.jit_argv = argv.into_vec();
-                                v.jit_code = code;
-                                v.jit_param_types = ptypes.unwrap();
-                                v.jit_result_types = rtypes.unwrap();
-                                v.jit_wasm = wasm;
-                                return PAR_JIT_INVOKE;
-                            }
-                            v.inner.deliver_jit_invoke(Ok((funcs, types, id)));
-                        }
-                    }
-                } else {
-                    // Fixed-unit codegen path (slice 5): the run's single unit was host-compiled at
-                    // setup and emitted to the run-wide `JIT_UNIT_WASM` stash. Authority still resolves
-                    // through the powerbox — a forged / cross-domain handle must trap identically.
-                    match par_pb() {
-                        None => return PAR_TRAP,
-                        Some(pb) => {
-                            let codegen = par_jit_codegen()
-                                && temen_par_jit_unit_wasm_len() > 0
-                                && ptypes.is_some()
-                                && rtypes.is_some()
-                                && mapped.is_some();
-                            if codegen {
-                                match pb.host.resolve_jit_unit(handle, code) {
-                                    Ok(_) => {
-                                        v.jit_argv = argv.into_vec();
-                                        v.jit_code = code;
-                                        v.jit_param_types = ptypes.unwrap();
-                                        v.jit_result_types = rtypes.unwrap();
-                                        return PAR_JIT_INVOKE;
-                                    }
-                                    Err(t) => v.inner.deliver_jit_invoke(Err(t)),
-                                }
-                            } else {
-                                v.inner
-                                    .deliver_jit_invoke(pb.host.resolve_jit_unit(handle, code));
-                            }
-                        }
-                    }
-                }
-            }
-            // Blocking stdin is a single-threaded interactive-session feature (the Postgres console
-            // runs on its own owned-host `Vcpu`, not the parallel driver); a worker vCPU never sets it.
-            bytecode::VcpuEvent::StdinPark => return par_trap(v, &Trap::CapFault),
-            // #1366: a host-completed cap park has no completer on this driver — fail closed.
-            bytecode::VcpuEvent::CapPending { .. } => return par_trap(v, &Trap::CapFault),
-            // #1286 slice 3b: a detached child — its window is a fresh `WebAssembly.Memory` the Worker
-            // mints and posts, with the ticket, to a new Worker (see [`PAR_INSTANTIATE_DETACHED`]).
-            bytecode::VcpuEvent::InstantiateDetached { size_log2 } => {
-                let Some(child) = v.inner.take_child() else {
-                    return PAR_TRAP;
-                };
-                v.d = detached_operands(&child);
-                v.a = ticket(child);
-                v.b = size_log2 as i64;
-                return PAR_INSTANTIATE_DETACHED;
-            }
-        }
-    }
-}
-
-/// Stage `t` as a [`PAR_TRAP`]'s operands: `a` = the exit code and `b` = 1 when the guest called
-/// `exit` (an on-ramp program's normal way out), else `b` = 0; `c`/`d` = pointer/length of the
-/// trap's name.
-fn par_trap(v: &mut ParVcpu, t: &Trap) -> i32 {
-    let (code, exited) = match t {
-        Trap::Exit(code) => (*code as i64, 1),
-        _ => (0, 0),
-    };
-    let name = t.name();
-    v.a = code;
-    v.b = exited;
-    v.c = name.as_ptr() as i64;
-    v.d = name.len() as i64;
-    PAR_TRAP
-}
-
-macro_rules! par_ev_getter {
-    ($name:ident, $field:ident) => {
-        /// Read an operand of the last [`temen_par_run`] event.
-        #[no_mangle]
-        pub extern "C" fn $name(v: *mut ParVcpu) -> i64 {
-            // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
-            unsafe { (*v).$field }
-        }
-    };
-}
-par_ev_getter!(temen_par_ev_a, a);
-par_ev_getter!(temen_par_ev_b, b);
-par_ev_getter!(temen_par_ev_c, c);
-par_ev_getter!(temen_par_ev_d, d);
-
-/// Deliver the host's token for the child a `PAR_SPAWN` or `PAR_INSTANTIATE_DETACHED` announced, once
-/// its Worker is started: the engine issues the guest's handle, and a join of it hands the token back
-/// ([`PAR_JOIN`]).
-#[no_mangle]
-pub extern "C" fn temen_par_deliver_child(v: *mut ParVcpu, token: i64) {
-    // SAFETY: `v` is a live `ParVcpu` awaiting a delivery.
-    unsafe { (*v).inner.deliver_child(token as u64) };
-}
-
-/// Deliver a `memory.wait` code / `memory.notify` count (after `PAR_WAIT` / `PAR_NOTIFY`).
-#[no_mangle]
-pub extern "C" fn temen_par_deliver_code(v: *mut ParVcpu, code: i32) {
-    // SAFETY: `v` is a live `ParVcpu` awaiting a delivery.
-    unsafe { (*v).inner.deliver_code(code) };
-}
-
-/// Deliver a joined child's result (after `PAR_JOIN`): `val` is its first return value, or — if
-/// `is_trap != 0` — the child trapped and the joiner traps on its next `temen_par_run`.
-#[no_mangle]
-pub extern "C" fn temen_par_deliver_join(v: *mut ParVcpu, val: i64, is_trap: i32) {
-    // SAFETY: `v` is a live `ParVcpu` awaiting a delivery.
-    let v = unsafe { &mut *v };
-    if is_trap != 0 {
-        v.inner.deliver_join(Err(Trap::ThreadFault));
-    } else {
-        v.inner.deliver_join(Ok(vec![Value::I64(val)]));
-    }
-}
-
-/// Pointer to the marshalled tier-up args (raw i64 slots) after a [`PAR_TIERUP`] event — the Worker
-/// reads `temen_par_tierup_argv_len` of them to call the emitted `f{func}`.
-#[no_mangle]
-pub extern "C" fn temen_par_tierup_argv_ptr(v: *mut ParVcpu) -> *const i64 {
-    // SAFETY: `v` is a live `ParVcpu`; the buffer lives until the next event overwrites it.
-    unsafe { (*v).tierup_argv.as_ptr() }
-}
-
-/// #750: the pending [`PAR_TIERUP`]'s page-state table base (paged runs only — see
-/// [`temen_par_enable_jit_paged`]). The bytes live in this module's linear memory, so this pointer
-/// is exactly the value the Worker writes to the emitted module's `"pagestate"` global.
-#[no_mangle]
-pub extern "C" fn temen_par_tierup_pagestate_ptr(v: *mut ParVcpu) -> *const u8 {
-    // SAFETY: `v` is a live `ParVcpu`; the buffer lives until the next event overwrites it.
-    unsafe { (*v).pagestate.as_ptr() }
-}
-
-/// Byte length of the pending tier-up's page-state table (`0` on an unpaged run — the Worker
-/// skips the `"pagestate"` write, which the unpaged module doesn't export anyway).
-#[no_mangle]
-pub extern "C" fn temen_par_tierup_pagestate_len(v: *mut ParVcpu) -> usize {
-    // SAFETY: `v` is a live `ParVcpu`.
-    unsafe { (*v).pagestate.len() }
-}
-
-/// Number of tier-up args (see [`temen_par_tierup_argv_ptr`]).
-#[no_mangle]
-pub extern "C" fn temen_par_tierup_argv_len(v: *mut ParVcpu) -> usize {
-    // SAFETY: `v` is a live `ParVcpu`.
-    unsafe { (*v).tierup_argv.len() }
-}
-
-/// Deliver the results of a tier-up region (after `PAR_TIERUP`): `[results_ptr, n)` are the emitted
-/// `f{func}`'s i64 result slots. The vCPU resumes with them in the awaiting call's dst.
-#[no_mangle]
-pub extern "C" fn temen_par_deliver_tierup(v: *mut ParVcpu, results_ptr: *const i64, n: usize) {
-    // SAFETY: `v` is a live `ParVcpu` awaiting a delivery; `[results_ptr, n)` is a live host buffer.
-    let v = unsafe { &mut *v };
-    let results = unsafe { core::slice::from_raw_parts(results_ptr, n) };
-    v.inner.deliver_tierup(results);
-}
-
-/// Deliver a **trap** from a tier-up region (the emitted `f{func}` threw — memory fault / fuel /
-/// div-by-zero / `unreachable`). The vCPU traps on its next `temen_par_run`, as if interp had trapped.
-/// `code` names the trap: see [`emitted_trap`].
-#[no_mangle]
-pub extern "C" fn temen_par_deliver_tierup_trap(v: *mut ParVcpu, code: i32) {
-    // SAFETY: `v` is a live `ParVcpu` awaiting a delivery.
-    unsafe { (*v).inner.deliver_tierup_trap(emitted_trap(code)) };
-}
-
 /// #1822 — the trap emitted code threw, from the code its last `env.trap(code)` call reported
 /// (`temen_ir::trap_code`: a memory fault, spent fuel, a spill-stack overflow). The host records that
-/// code and passes it with the deliver; `0` means the frames called no `env.trap` — a native wasm trap
-/// (division by zero, an `unreachable`), which carries no kind, and is delivered as `Unreachable`.
+/// code and returns it with the call; `0` means the frames called no `env.trap` — a native wasm trap
+/// (division by zero, an `unreachable`), which carries no kind, and is reported as `Unreachable`.
 fn emitted_trap(code: i32) -> Trap {
     Trap::from_code(i64::from(code)).unwrap_or(Trap::Unreachable)
-}
-
-/// The code handle of a pending [`PAR_JIT_INVOKE`] — the Worker keys its per-unit emitted-instance
-/// cache by this (one wasm instance per submitted unit; args differ per invoke).
-#[no_mangle]
-pub extern "C" fn temen_par_jit_code(v: *mut ParVcpu) -> i32 {
-    // SAFETY: `v` is a live `ParVcpu`.
-    unsafe { (*v).jit_code }
-}
-
-/// Pointer to the marshalled §22 invoke args (raw i64 slots) after a [`PAR_JIT_INVOKE`] event — the
-/// Worker reads `temen_par_jit_argv_len` of them to call the emitted unit's `f{entry}`.
-#[no_mangle]
-pub extern "C" fn temen_par_jit_argv_ptr(v: *mut ParVcpu) -> *const i64 {
-    // SAFETY: `v` is a live `ParVcpu`; the buffer lives until the next event overwrites it.
-    unsafe { (*v).jit_argv.as_ptr() }
-}
-
-/// Number of §22 invoke args (see [`temen_par_jit_argv_ptr`]).
-#[no_mangle]
-pub extern "C" fn temen_par_jit_argv_len(v: *mut ParVcpu) -> usize {
-    // SAFETY: `v` is a live `ParVcpu`.
-    unsafe { (*v).jit_argv.len() }
-}
-
-/// Per-arg **scalar type codes** of a pending [`PAR_JIT_INVOKE`] (`0` = i32, `1` = i64, `2` = f32,
-/// `3` = f64), one byte per arg — the Worker reads them to marshal each i64 slot to the wasm type the
-/// emitted `f{entry}` uses. Length equals [`temen_par_jit_argv_len`].
-#[no_mangle]
-pub extern "C" fn temen_par_jit_param_types_ptr(v: *mut ParVcpu) -> *const u8 {
-    // SAFETY: `v` is a live `ParVcpu`; the buffer lives until the next event overwrites it.
-    unsafe { (*v).jit_param_types.as_ptr() }
-}
-
-/// Per-result **scalar type codes** of a pending [`PAR_JIT_INVOKE`] (same encoding as
-/// [`temen_par_jit_param_types_ptr`]) — the Worker marshals each emitted-`f{entry}` result back to its
-/// i64 result slot (a float's *bits*, an integer's value) for [`temen_par_deliver_jit_invoke`].
-#[no_mangle]
-pub extern "C" fn temen_par_jit_result_types_ptr(v: *mut ParVcpu) -> *const u8 {
-    // SAFETY: `v` is a live `ParVcpu`; the buffer lives until the next event overwrites it.
-    unsafe { (*v).jit_result_types.as_ptr() }
-}
-
-/// Number of §22 invoke results (see [`temen_par_jit_result_types_ptr`]).
-#[no_mangle]
-pub extern "C" fn temen_par_jit_result_types_len(v: *mut ParVcpu) -> usize {
-    // SAFETY: `v` is a live `ParVcpu`.
-    unsafe { (*v).jit_result_types.len() }
-}
-
-/// Pointer / length of a pending [`PAR_JIT_INVOKE`]'s **runtime-compiled** unit wasm (the shared-host
-/// path, [`temen_par_powerbox_jit_runtime`]): the JS host instantiates it once and caches the instance by
-/// [`jit_code`](ParVcpu::jit_code). `(null, 0)` for the fixed-unit codegen path (that reads the run-wide
-/// [`temen_par_jit_unit_wasm_ptr`] stash instead). The bytes stay valid until the next `temen_par_run`.
-#[no_mangle]
-pub extern "C" fn temen_par_jit_code_wasm_ptr(v: *mut ParVcpu) -> *const u8 {
-    // SAFETY: `v` is a live `ParVcpu`.
-    unsafe {
-        (*v).jit_wasm
-            .as_ref()
-            .map_or(core::ptr::null(), |w| w.as_ptr())
-    }
-}
-#[no_mangle]
-pub extern "C" fn temen_par_jit_code_wasm_len(v: *mut ParVcpu) -> usize {
-    // SAFETY: `v` is a live `ParVcpu`.
-    unsafe { (*v).jit_wasm.as_ref().map_or(0, |w| w.len()) }
-}
-
-/// Deliver the results of a §22 unit run on emitted wasm (after `PAR_JIT_INVOKE`): `[results_ptr, n)`
-/// are the emitted `f{entry}`'s i64 result slots. The vCPU resumes with them in the invoke's dst —
-/// identical to the interpreter having run the unit.
-#[no_mangle]
-pub extern "C" fn temen_par_deliver_jit_invoke(v: *mut ParVcpu, results_ptr: *const i64, n: usize) {
-    // SAFETY: `v` is a live `ParVcpu` awaiting a delivery; `[results_ptr, n)` is a live host buffer.
-    let v = unsafe { &mut *v };
-    let results = unsafe { core::slice::from_raw_parts(results_ptr, n) };
-    v.inner.deliver_jit_invoke_vals(results);
-}
-
-/// Deliver a **trap** from a §22 unit run on emitted wasm (the emitted region threw). The vCPU traps
-/// on its next `temen_par_run`, as if the interpreted invoke had trapped. `code` names the trap: see
-/// [`emitted_trap`].
-#[no_mangle]
-pub extern "C" fn temen_par_deliver_jit_invoke_trap(v: *mut ParVcpu, code: i32) {
-    // SAFETY: `v` is a live `ParVcpu` awaiting a delivery.
-    unsafe { (*v).inner.deliver_jit_invoke_trap(emitted_trap(code)) };
-}
-
-/// Free a finished vCPU.
-#[no_mangle]
-pub extern "C" fn temen_par_free(v: *mut ParVcpu) {
-    if !v.is_null() {
-        // SAFETY: `v` came from `Box::into_raw` in `temen_par_root`/`temen_par_child` and is freed once.
-        drop(unsafe { Box::from_raw(v) });
-        par_vcpu_retire(); // the live-cap admit from this vCPU's constructor
-    }
 }
 
 // ---- #1414 B6: the parallel driver across Workers --------------------------------------------------
@@ -2876,15 +1288,20 @@ pub extern "C" fn temen_par_free(v: *mut ParVcpu) {
 
 // The imports the parallel driver's platform needs (`X2_PLATFORM`). (Plain `//`: rustdoc rejects
 // `///` on an extern block.)
-// - `x2_spawn(start)`: ask the page to start a Worker that runs `temen_x2_thread(start)`. 0 when the
-//   request is posted; nonzero when this agent cannot start Workers.
+// - `x2_spawn(start, mem)`: ask the page to start a Worker that runs `temen_x2_thread(start)`. `mem`
+//   is the foreign memory the thread's window lives in (a detached child's own, [`x2_child_window`]),
+//   or -1: the page hands it to the Worker, which registers it under the same id before it runs the
+//   thread. 0 when the request is posted; nonzero when this agent cannot start Workers.
 // - `x2_now_ms()`: milliseconds since the epoch, below a millisecond, on a clock every Worker reads
 //   alike (`performance.timeOrigin + performance.now()`).
-// - `x2_tierup(func, argv, argc, win, mapped, over, out)`: run `f{func}(win, env, ...argv)` of the
-//   run's tier-up module ([`temen_x2_wasm_ptr`]) on this Worker's emitted tier, with `"mapped"` set,
-//   and write its results at `out`. Returns how many, or `-(1 + code)` when it trapped with `code`.
-//   The emitted code's fuel checks look at the byte at `over`, and once it is set the next one ends
-//   the call ([`bytecode::EmittedCall::over`]).
+// - `x2_tierup(module, func, argv, argc, win, mapped, over, out, mem)`: run `f{func}(win, env,
+//   ...argv)` of program `module`'s emit on this Worker's emitted tier, with `"mapped"` set, and write
+//   its results at `out`. Returns how many, or `-(1 + code)` when it trapped with `code`. The emitted
+//   code's fuel checks look at the byte at `over`, and once it is set the next one ends the call
+//   ([`bytecode::EmittedCall::over`]). With `mem` -1 the program is the run's own
+//   ([`temen_x2_wasm_ptr`]), over the engine's memory at `win`. Otherwise `mem` is a detached child's
+//   memory, which the Worker registered, and the program a granted module ([`temen_x2_program_len`]):
+//   the window starts past the child's header and the call's context is in it (#1414 ED-2).
 // - `x2_invoke(code, wasm, wasm_len, types, nparams, nresults, argv, win, mapped, over, out)`: as
 //   `x2_tierup`, for the entry `f0` of the §22 unit the guest invoked with code handle `code`, whose
 //   emitted module is `[wasm, wasm + wasm_len)`. The unit's parameter and then result types are the
@@ -2892,9 +1309,10 @@ pub extern "C" fn temen_par_free(v: *mut ParVcpu) {
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[link(wasm_import_module = "temen_host")]
 extern "C" {
-    fn x2_spawn(start: *mut core::ffi::c_void) -> i32;
+    fn x2_spawn(start: *mut core::ffi::c_void, mem: i32) -> i32;
     fn x2_now_ms() -> f64;
     fn x2_tierup(
+        module: u32,
         func: u32,
         argv: *const i64,
         argc: u32,
@@ -2902,6 +1320,8 @@ extern "C" {
         mapped: u64,
         over: u32,
         out: *mut i64,
+        mem: i32,
+        work: *mut u64,
     ) -> i32;
     fn x2_invoke(
         code: i32,
@@ -2921,20 +1341,40 @@ extern "C" {
 /// The run's tier-up module, which each Worker instantiates when it first runs emitted code. Empty
 /// when no function of the run tiers up.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
-static X2_WASM: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+static X2_WASM: std::sync::Mutex<Option<std::sync::Arc<[u8]>>> = std::sync::Mutex::new(None);
+
+/// The granted modules the run's children tier up into (#1414 ED-2), by program index: what the
+/// tier's module emitter emitted for them ([`module_emitter`]).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+static X2_PROGRAMS: std::sync::Mutex<Option<Programs>> = std::sync::Mutex::new(None);
+
+/// Program `module`'s emit ([`X2_PROGRAMS`]), for the Worker to copy ([`temen_x2_bytes_ptr`]): its
+/// length, `0` when the run emitted none for it.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_program_len(module: u32) -> usize {
+    let programs = X2_PROGRAMS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let wasm = programs.and_then(|p| {
+        let p = p.lock().unwrap_or_else(|e| e.into_inner());
+        p.get(&module).cloned().flatten().map(|e| e.wasm)
+    });
+    x2_keep(wasm)
+}
 
 /// The run's tier-up module ([`X2_WASM`]): its bytes.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_x2_wasm_ptr() -> *const u8 {
-    X2_WASM.lock().unwrap_or_else(|e| e.into_inner()).as_ptr()
+    let wasm = X2_WASM.lock().unwrap_or_else(|e| e.into_inner());
+    wasm.as_deref().map_or(core::ptr::null(), <[u8]>::as_ptr)
 }
 
 /// The run's tier-up module ([`X2_WASM`]): its length.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_x2_wasm_len() -> usize {
-    X2_WASM.lock().unwrap_or_else(|e| e.into_inner()).len()
+    let wasm = X2_WASM.lock().unwrap_or_else(|e| e.into_inner());
+    wasm.as_deref().map_or(0, <[u8]>::len)
 }
 
 /// The run's program's signatures: its dispatch table's natural prefix, whose slots a Worker fills
@@ -2975,8 +1415,9 @@ fn x2_run(call: &mut bytecode::EmittedCall<'_>) -> Result<(), Trap> {
     let (argv, argc) = (call.argv.as_ptr(), call.argv.len() as u32);
     let (win, mapped) = (call.win as usize as u32, call.mapped);
     let over = call.over.as_ptr() as usize as u32;
+    let mem = call.memory.map_or(-1, |id| id as i32);
     let unit = match call.target {
-        bytecode::EmittedTarget::Region(func) => Err(func),
+        bytecode::EmittedTarget::Region { module, func } => Err((module, func)),
         bytecode::EmittedTarget::Unit {
             code,
             wasm,
@@ -3005,11 +1446,24 @@ fn x2_run(call: &mut bytecode::EmittedCall<'_>) -> Result<(), Trap> {
     let ptr: X2Call = unsafe { std::mem::transmute(ptr) };
     let outer = X2_CALL.with(|c| c.replace(Some(ptr)));
     X2_BOUNCE_TRAP.with(|t| t.set(None));
-    // SAFETY: `argv`, `out`, the unit's bytes and types are live for the call; `win` and `over` are
-    // this run's.
+    // #2474: the fuel the emitted code burns, which the Worker counts.
+    let mut work = 0u64;
+    // SAFETY: `argv`, `out`, `work`, the unit's bytes and types are live for the call; `win` and
+    // `over` are this run's.
     let n = unsafe {
         match &unit {
-            Err(func) => x2_tierup(*func, argv, argc, win, mapped, over, out.as_mut_ptr()),
+            Err((module, func)) => x2_tierup(
+                *module,
+                *func,
+                argv,
+                argc,
+                win,
+                mapped,
+                over,
+                out.as_mut_ptr(),
+                mem,
+                &mut work,
+            ),
             Ok((code, wasm, types, nparams, nresults)) => x2_invoke(
                 *code,
                 wasm.as_ptr(),
@@ -3031,6 +1485,7 @@ fn x2_run(call: &mut bytecode::EmittedCall<'_>) -> Result<(), Trap> {
         return Err(bounced.unwrap_or_else(|| emitted_trap(-(n + 1))));
     }
     call.results = out[..n as usize].to_vec();
+    call.work = work;
     Ok(())
 }
 
@@ -3055,15 +1510,17 @@ fn x2_keep(bytes: Option<std::sync::Arc<[u8]>>) -> usize {
 
 /// The emitted code's call back into the interpreter (`env.call_interp`): function `target`, with
 /// its arguments at `args_ptr` (the call scratch, `XCALL_MAX_SLOTS` i64s) and its results written
-/// back there, over the running call's task. `0` on success; `1` when it trapped.
+/// back there, over the running call's task. `spill_len` is how many words the emitted frames beneath
+/// it pushed to the thread's spill stack ([`temen_x2_spill_ptr`]). `0` on success; `1` when it
+/// trapped.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
-pub extern "C" fn temen_x2_call_interp(target: u32, args_ptr: *mut u8) -> i32 {
+pub extern "C" fn temen_x2_call_interp(target: u32, args_ptr: *mut u8, spill_len: usize) -> i32 {
     // SAFETY: the emitted code passes its env cell's call scratch, `XCALL_MAX_SLOTS` i64s wide.
     let io = unsafe {
         core::slice::from_raw_parts_mut(args_ptr as *mut i64, temen_wasm_jit::XCALL_MAX_SLOTS)
     };
-    match x2_call(|c| (c.bounce)(target, io)) {
+    match x2_call(|c| (c.bounce)(target, io, spill_len)) {
         Some(Ok(_)) => 0,
         Some(Err(t)) => {
             X2_BOUNCE_TRAP.with(|c| c.set(Some(t)));
@@ -3071,6 +1528,16 @@ pub extern "C" fn temen_x2_call_interp(target: u32, args_ptr: *mut u8) -> i32 {
         }
         None => 1,
     }
+}
+
+/// #2275 — where a memory fault in the running call's emitted code faulted: the address its guard
+/// left in the env cell at [`temen_wasmjit_fault_off`], window-relative (`-1` there means none). The
+/// Worker hands it over before the call returns its trap, and the task's window records it
+/// ([`bytecode::EmittedCall::fault`]), so the run reports it as it reports an interpreted fault.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_deliver_fault_addr(addr: i64) {
+    x2_call(|c| c.fault = u64::try_from(addr).ok());
 }
 
 /// The `log2` size of the run's dispatch table ([`X2_TABLE_LOG2`]).
@@ -3153,18 +1620,59 @@ pub extern "C" fn temen_x2_mapped_now() -> u64 {
     x2_call(|c| c.mapped_now()).unwrap_or(0)
 }
 
-/// A thread of a parallel-driver run, boxed for the Worker that runs it ([`temen_x2_thread`]).
+/// Whether the running call is page-checked ([`bytecode::EmittedCall::pagestate`]): 1 or 0.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
-type X2Thread = Box<dyn FnOnce() + Send>;
+#[no_mangle]
+pub extern "C" fn temen_x2_paged() -> i32 {
+    x2_call(|c| c.pagestate().is_some() as i32).unwrap_or(0)
+}
 
-/// The parallel driver's [`bytecode::ThreadPlatform`] in a browser: each thread a Worker, and the
-/// page's clock.
+/// The base of the running thread's spill stack ([`bytecode::EmittedCall::spill`]), which lives as
+/// long as the thread: null when its tier does not spill.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_spill_ptr() -> *mut u64 {
+    x2_call(|c| c.spill().map(|(base, _)| base))
+        .flatten()
+        .unwrap_or(core::ptr::null_mut())
+}
+
+/// The size of the running thread's spill stack in bytes ([`bytecode::EmittedCall::spill`]): `0`
+/// when its tier does not spill.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_spill_bytes() -> usize {
+    x2_call(|c| c.spill().map_or(0, |(_, words)| words * 8)).unwrap_or(0)
+}
+
+/// The running call's page-state table ([`bytecode::EmittedCall::pagestate`]): what a Worker gives
+/// its instances' `"pagestate"` at the call and after each bounce. Null when the call is not
+/// page-checked.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_pagestate_ptr() -> *const u8 {
+    x2_call(|c| c.pagestate().map(|(base, _)| base))
+        .flatten()
+        .unwrap_or(core::ptr::null())
+}
+
+/// The length of the running call's page-state table ([`temen_x2_pagestate_ptr`]), which a Worker
+/// copies into a detached child's header (#1414 ED-2): `0` when the call is not page-checked.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_pagestate_len() -> usize {
+    x2_call(|c| c.pagestate().map_or(0, |(_, len)| len)).unwrap_or(0)
+}
+
+/// The parallel driver's [`bytecode::ThreadPlatform`] in a browser: each thread a Worker, the
+/// page's clock, and each detached child's window in a `WebAssembly.Memory` of its own.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 const X2_PLATFORM: bytecode::ThreadPlatform = bytecode::ThreadPlatform {
-    spawn: |f| {
+    spawn: |f, window| {
         let start = Box::into_raw(Box::new(f));
+        let mem = window.map_or(-1, |id| id as i32);
         // SAFETY: on success the page hands `start` to exactly one Worker, which takes it back.
-        if unsafe { x2_spawn(start.cast()) } == 0 {
+        if unsafe { x2_spawn(start.cast(), mem) } == 0 {
             return Ok(());
         }
         // SAFETY: no Worker will run it, so it is still ours.
@@ -3174,13 +1682,27 @@ const X2_PLATFORM: bytecode::ThreadPlatform = bytecode::ThreadPlatform {
     // SAFETY: a pure import.
     now_ns: || (unsafe { x2_now_ms() } * 1e6) as u64,
     tier: None,
+    child_window: Some(x2_child_window),
 };
+
+/// A detached child's window on the parallel driver (#1414 B6-3c): a `WebAssembly.Memory` of its own
+/// (a header page, then the window, growable to the detached ceiling), minted on the spawner's Worker and handed to each Worker that runs one of the child's
+/// threads ([`x2_spawn`]'s `mem`).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+fn x2_child_window(size_log2: u8) -> Option<std::sync::Arc<temen_interp::Region>> {
+    let size = 1u64 << size_log2;
+    let id = foreign_mem::mint(
+        DETACHED_HEADER_BYTES + size,
+        DETACHED_HEADER_BYTES + DETACHED_DEFAULT_MAX_BYTES,
+    )?;
+    Some(std::sync::Arc::new(foreign_region(id, size)))
+}
 
 /// Run the parallel-driver thread the page started this Worker for: `start` is what `x2_spawn`
 /// passed it. The Worker is the thread's alone, and closes once the thread returns.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
-pub extern "C" fn temen_x2_thread(start: *mut X2Thread) {
+pub extern "C" fn temen_x2_thread(start: *mut bytecode::ThreadStart) {
     // I22: a panic on this thread names its FILE:LINE.
     par_install_panic_capture();
     // SAFETY: `start` came from `X2_PLATFORM.spawn`, and the page handed it to this Worker alone.
@@ -3189,8 +1711,7 @@ pub extern "C" fn temen_x2_thread(start: *mut X2Thread) {
 }
 
 /// Run the guest at `[guest_ptr, guest_len)` on the parallel driver from this Worker, each of its
-/// threads on a Worker of its own. It runs under the published recipe's powerbox, as the per-Worker
-/// driver's root would: the shared I/O or on-ramp host ([`temen_par_powerbox_io`],
+/// threads on a Worker of its own. It runs under the published recipe's powerbox: the shared I/O or on-ramp host ([`temen_par_powerbox_io`],
 /// [`temen_par_powerbox_onramp`]), the §14 root's ([`temen_par_powerbox_inst`]), the §22 host with
 /// its compiled unit ([`temen_par_powerbox`], [`temen_par_powerbox_jit_codegen`]) or the one that
 /// compiles the guest's own units ([`temen_par_powerbox_jit_runtime`]), or none
@@ -3198,13 +1719,14 @@ pub extern "C" fn temen_x2_thread(start: *mut X2Thread) {
 /// so [`temen_par_stdout_len`] reads the run's output. `[seed_ptr, seed_len)` is written into the
 /// window from offset 0 before the data segments: the unit blobs a runtime-compile guest reads.
 ///
-/// With `tierup` set, a module-0 task's calls to the functions the threads tier-up emit takes
-/// ([`threads_tierup`]) run on it, each on its thread's Worker. With §22 codegen on
+/// With `tierup` set, a module-0 task's calls to the functions the coop driver's region emit takes
+/// ([`coop_emit_for`], when [`temen_coop_set_hotness`] says) run on it, each on its thread's
+/// Worker, and the run is of the module that emit outlined. With §22 codegen on
 /// ([`temen_par_jit_set_codegen`]), a guest's `Jit.invoke` of a unit with emitted wasm runs it there
 /// too, its `call.dyn`s reaching the run's dispatch table through each Worker's mirror of it. The
 /// emitted code addresses the root's window as one span, so then the window is a flat one of the
-/// declared size or `win_size`, whichever is larger, and it cannot grow past that; otherwise it is
-/// the driver's own, which grows on demand.
+/// declared size or `win_size`, whichever is larger, rounded up to a power of two, and it cannot
+/// grow past that; otherwise it is the driver's own, which grows on demand.
 ///
 /// Returns the guest's `i64` result; [`temen_status`], [`temen_exit_code`] and [`temen_trap_ptr`]
 /// tell the rest, as for [`temen_run_onramp`].
@@ -3227,7 +1749,33 @@ pub extern "C" fn temen_x2_start(
         set(STATUS_DECODE_ERR);
         return 0;
     };
-    let m = std::sync::Arc::new(m);
+    // Emitted code addresses the window as one flat span masked to `1 << win_log2`, so a run with an
+    // emitted tier gets a flat window of exactly that size: the declared size or `win_size`,
+    // whichever is larger, rounded up to a power of two.
+    let win_log2 = m
+        .memory
+        .map_or(0, |mc| mc.size_log2)
+        .max(win_size.next_power_of_two().trailing_zeros() as u8);
+    // With `tierup`, regions run on the coop driver's emit, which outlines the guest's cap calls into
+    // the module both tiers then run. A paged emit checks each access against its thread's page-state
+    // table, and a spilling one pushes its frames' live words to its thread's spill stack.
+    let emit = (tierup != 0)
+        .then(|| coop_emit_for(&m, true, win_log2, true).ok())
+        .flatten();
+    let (m, regions) = match emit {
+        Some(e) => {
+            // A local-table emit leaves the run's table as it is.
+            let table_log2 = if e.all_shimmable { e.table_log2 } else { 0 };
+            let regions = (
+                std::sync::Arc::clone(&e.wasm),
+                e.program_emit(),
+                table_log2,
+                e.spill,
+            );
+            (std::sync::Arc::clone(&e.m), Some(regions))
+        }
+        None => (std::sync::Arc::new(m), None),
+    };
     let io = par_io();
     let rt = par_jit_rt();
     // A §22 host whose units run on emitted wasm: codegen asked for, and a unit to run.
@@ -3239,7 +1787,7 @@ pub extern "C" fn temen_x2_start(
             io.init.clone(),
         )
     } else if let Some(cfg) = par_inst() {
-        let (host, args) = par_inst_powerbox(cfg, &m);
+        let (host, args) = par_inst_powerbox(cfg, &m, tierup != 0);
         (host, args, Vec::new())
     } else if let Some(cfg) = rt {
         codegen = par_jit_codegen();
@@ -3256,12 +1804,8 @@ pub extern "C" fn temen_x2_start(
             pb => {
                 // SAFETY: published by `temen_par_powerbox` and taken out of `PAR_PB` above, so
                 // this run owns it: no Worker of another run reads it.
-                let mut pb = unsafe { Box::from_raw(pb as *mut ParPowerbox) };
+                let pb = unsafe { Box::from_raw(pb as *mut ParPowerbox) };
                 codegen = par_jit_codegen();
-                if codegen {
-                    // The per-Worker driver emits the host's unit itself; here the host does.
-                    pb.host.set_jit_wasm_emitter(browser_jit_wasm_emitter);
-                }
                 (
                     pb.host,
                     vec![Value::I32(pb.jit), Value::I32(pb.code)],
@@ -3270,38 +1814,60 @@ pub extern "C" fn temen_x2_start(
             }
         }
     };
-    let regions = if tierup != 0 {
-        threads_tierup(&m)
-    } else {
-        None
-    };
+    // §22 units run emitted when codegen asks and the run's table can fill every slot their
+    // `call.dyn`s may reach, as on the coop driver.
+    let codegen = codegen && all_shimmable(&m);
     let mut back = None;
     let mut platform = X2_PLATFORM;
-    if regions.is_some() || codegen {
-        let declared = m.memory.map_or(0, |mc| 1usize << mc.size_log2);
+    // With `tierup`, a detached child tiers up through its granted module's emit, over its own
+    // memory, whether or not the run's own program has regions (#1414 ED-2).
+    if tierup != 0 || codegen {
         let page = temen_interp::host_page_size();
-        let Some(flat) = temen_interp::Region::owned_zeroed(declared.max(win_size) as u64, page)
-        else {
+        let Some(flat) = temen_interp::Region::owned_zeroed(1u64 << win_log2, page) else {
             set(STATUS_UNSUPPORTED);
             return 0;
         };
         back = Some(std::sync::Arc::new(flat));
-        let (wasm, eligible) = regions.unwrap_or_else(|| (Vec::new(), vec![false; m.funcs.len()]));
-        *X2_WASM.lock().unwrap_or_else(|e| e.into_inner()) = wasm;
+        let (wasm, emit, table_log2, spill) = regions.unwrap_or_else(|| {
+            (
+                std::sync::Arc::from([]),
+                bytecode::ProgramEmit::default(),
+                0,
+                false,
+            )
+        });
+        // A B2 emit masks `call.dyn` by its table's size, so the run's dispatch table is that size.
+        host.set_jit_table_log2(table_log2);
+        // The units emit as the coop driver's do, over this run's window and table, or none does
+        // and every invoke interprets.
+        if codegen {
+            TIERUP_UNIT_SHARED.store(true, Ordering::Relaxed);
+            TIERUP_UNIT_WIN_LOG2.store(win_log2, Ordering::Relaxed);
+            TIERUP_UNIT_TABLE_LOG2.store(host.jit_table_log2(), Ordering::Relaxed);
+            host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
+        } else {
+            host.set_jit_wasm_emitter(|_| None);
+        }
+        *X2_WASM.lock().unwrap_or_else(|e| e.into_inner()) = Some(wasm);
         *X2_SIGS.lock().unwrap_or_else(|e| e.into_inner()) = m
             .funcs
             .iter()
             .map(|f| (f.params.clone(), f.results.clone()))
             .collect();
         X2_TABLE_LOG2.store(host.jit_table_log2(), Ordering::Relaxed);
+        let programs = (tierup != 0).then(Programs::default);
+        *X2_PROGRAMS.lock().unwrap_or_else(|e| e.into_inner()) = programs.clone();
         platform.tier = Some(bytecode::ThreadTier {
-            eligible: eligible.into(),
+            root: emit,
+            // Each thread's spill stack is the size of the coop run's.
+            spill: if spill { COOP_SPILL_BYTES / 8 } else { 0 },
+            modules: programs.map(|p| module_emitter(p, true, true)),
             run: x2_run,
         });
     }
     host.set_thread_platform(platform);
-    // #2251: a guest's `self.parallelism` answers the page's core count, as on the per-Worker driver:
-    // each of the run's threads gets a Worker of its own.
+    // #2251: a guest's `self.parallelism` answers the page's core count: each of the run's threads
+    // gets a Worker of its own.
     if let n @ 1.. = PAR_WORKERS.load(Ordering::Acquire) {
         host.set_workers(n);
     }
@@ -3314,19 +1880,10 @@ pub extern "C" fn temen_x2_start(
     } else if let Some(cfg) = rt {
         *cfg.host.lock().unwrap_or_else(|e| e.into_inner()) = host;
     }
-    let (status, value, exit_code, trap) = match ran.map(|(r, _)| r) {
-        None => (STATUS_UNSUPPORTED, 0, 0, None),
-        Some(Err(Trap::Exit(code))) => (STATUS_EXIT, 0, code, None),
-        Some(Err(t)) => (STATUS_TRAP, 0, 0, Some(t)),
-        Some(Ok(vals)) => (STATUS_OK, first_i64(&vals), 0, None),
-    };
-    set(status);
-    // SAFETY: one run at a time per engine; the page reads these after the run, through this Worker.
-    unsafe {
-        EXIT_CODE = exit_code;
-        LAST_TRAP = trap.as_ref().map_or("", Trap::name);
-    }
-    value
+    // The run reports as every browser run does (#1414 S4-1), a memory fault's address included
+    // (#2275): the driver records the first fault of any of the run's threads, interpreted or
+    // emitted. Its output went out through the powerbox as it ran, so the report carries none.
+    PbOutcome::ended(ran.map(|(r, _)| r), Vec::new(), Vec::new()).publish()
 }
 
 // ---- host powerbox: console + clock, marshalled through host-allocated memory ----------------
@@ -3815,11 +2372,11 @@ impl OnrampCaps {
             // `grant` and `registrar` build a factory only for a name `handler` served, over cells
             // that never change which names they serve — so the fallback is never reached. It traps
             // rather than answers if it ever is.
-            temen_interp::ForkedProc::shared(
+            Some(temen_interp::ForkedProc::shared(
                 caps.handler(&name)
                     .unwrap_or_else(|| Box::new(|_op, _args, _mem, _| Err(Trap::CapFault))),
                 caps.cap_state(&name),
-            )
+            ))
         })
     }
 
@@ -3966,37 +2523,27 @@ pub use temen_interp::moment::{
 // named-capability section (#1455). `Moment::capture` takes both halves at one instant, so
 // they always describe the same one.
 
-/// Drive an [`OnrampReactor`]-shaped reactor through the shared [`MomentReactor`] surface. Both
-/// reactors present the identical frame/input/moment API over different window backings,
-/// so the two impls are the same six forwarders and are written with one macro rather than twice.
-macro_rules! impl_moment_reactor {
-    ($t:ty) => {
-        impl SteppableReactor for $t {
-            fn step(&mut self) -> i32 {
-                let (status, _stdout) = self.frame();
-                status
-            }
-        }
-
-        impl MomentReactor for $t {
-            fn push_key(&self, keycode: i32, pressed: i32) {
-                <$t>::push_key(self, keycode, pressed);
-            }
-            fn push_mouse(&self, kind: i32, payload: i32) {
-                <$t>::push_mouse(self, kind, payload);
-            }
-            fn moment(&self) -> Result<Moment, Refusal> {
-                <$t>::moment(self)
-            }
-            fn restore(&mut self, m: &Moment) -> bool {
-                <$t>::restore(self, m)
-            }
-        }
-    };
+impl SteppableReactor for OnrampReactor {
+    fn step(&mut self) -> i32 {
+        let (status, _stdout) = self.frame();
+        status
+    }
 }
 
-impl_moment_reactor!(OnrampReactor);
-impl_moment_reactor!(SharedOnrampReactor);
+impl MomentReactor for OnrampReactor {
+    fn push_key(&self, keycode: i32, pressed: i32) {
+        OnrampReactor::push_key(self, keycode, pressed);
+    }
+    fn push_mouse(&self, kind: i32, payload: i32) {
+        OnrampReactor::push_mouse(self, kind, payload);
+    }
+    fn moment(&self) -> Result<Moment, Refusal> {
+        OnrampReactor::moment(self)
+    }
+    fn restore(&mut self, m: &Moment) -> bool {
+        OnrampReactor::restore(self, m)
+    }
+}
 
 /// Grant the **on-ramp powerbox** onto `host` for module `m`: the §3e prefix
 /// (`stdout, stdin, exit, memory, addrspace`), each registered under its `self.resolve` name,
@@ -4075,22 +2622,21 @@ fn grant_onramp_caps(
     }
     // #816/#1234: a §14 `Instantiator` over the guest's own window, named `"instantiator"` — **on by
     // default**, matching `temen-run`'s reference powerbox (`grant_powerbox_prefix`), so a guest that
-    // nests a confined copy of itself (the Forth kernel's `sandbox` word) behaves identically on both
+    // spawns a sandboxed child (the Forth kernel's `sandbox` word) behaves identically on both
     // reference hosts — one frontier, INVARIANTS #14. Spawn authority is a strict subset of the
-    // guest's own reach: a child is a sub-carve of *this* window with fuel sub-allocated from this
-    // guest's own quota, its powerbox attenuated to what the parent re-grants by name, and it can
-    // reach nothing the parent could not already reach directly. The knob stays for an embedder that
+    // guest's own reach: a child's window is paid from a `Budget` the guest holds, its powerbox
+    // attenuated to what the parent re-grants by name, and it can reach nothing the parent could not
+    // already reach directly. The knob stays for an embedder that
     // wants the narrower set (and for the differential harness, whose env-routed child tier-up
     // (#1117) toggles it); granted last so every other handle keeps its value.
     if ONRAMP_GRANT_INSTANTIATOR.load(std::sync::atomic::Ordering::Relaxed) {
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-        let handle = host.grant_instantiator(0, win);
+        let handle = host.grant_instantiator();
         host.register_cap_name("instantiator", handle);
-        // The by-name spawn set, only for a guest that spawns detached: the `"module"` grant is
-        // non-durable, so granting it everywhere would make every reactor that saves a warm
-        // snapshot unfreezable.
+        // The by-name spawn set (`"budget"`, and `"child"` for a program exporting `_child`), only
+        // for a guest that spawns detached: least authority.
         if temen_ir::spawns_detached(m) {
-            host.grant_detached_spawn_caps(win, temen_ir::spawns_by_module_handle(m));
+            host.grant_detached_spawn_caps(win);
         }
     }
     // The manifest binding comes last so it can name every grant above (the by-name Instantiator
@@ -4132,7 +2678,7 @@ static ONRAMP_GRANT_INSTANTIATOR: std::sync::atomic::AtomicBool =
 
 /// #816: opt subsequent on-ramp opens (plain, coop, JIT alike — every path through
 /// [`grant_onramp_caps`]) in or out of the `"instantiator"` grant. A test/embedder knob, exactly
-/// like [`temen_coop_set_tierup_floor`]; the playground leaves it at its default.
+/// like [`temen_coop_set_hotness`]; the playground leaves it at its default.
 #[no_mangle]
 pub extern "C" fn temen_onramp_set_grant_instantiator(on: i32) {
     ONRAMP_GRANT_INSTANTIATOR.store(on != 0, std::sync::atomic::Ordering::Relaxed);
@@ -4319,6 +2865,8 @@ fn onramp_run(
     // software page size is 4 KiB on wasm (see `host_page_size`) — no per-guest window bump needed.
     let ran =
         bytecode::compile_and_run_seeded_with_host(entry, 0, args, &mut fuel, &init, &mut host);
+    // A nested card's root answers how the card ended; the run's outcome is the card's (#2066).
+    let ran = ran.map(|r| if nest.is_some() { plan::outcome(r) } else { r });
     set_last_notes(host.take_notes());
     let framebuffer = frame.lock().unwrap().take();
     PbOutcome {
@@ -4825,9 +3373,9 @@ pub fn posix_shell_exec_with(
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
     let (in_h, in_fifo) = host.grant_input_pipe();
-    let _inst = host.grant_instantiator(0, win);
+    let _inst = host.grant_instantiator();
     let _as = host.grant_address_space(0, win);
-    // The `Budget` every spawned command / ring stage's detached window is paid from (op 17 v1),
+    // The `Budget` every spawned command / ring stage's detached window is paid from (op 17),
     // returned when the child ends: room for the widest pipeline's three concurrent stages.
     let _budget_h = host.grant_budget(-1, 4 << 20, -1);
     let cmd_handles: Vec<(&str, i32, u8)> = cmds
@@ -4871,7 +3419,7 @@ pub(crate) fn args_init_mem(argv: &[&[u8]]) -> Vec<u8> {
     init_mem
 }
 
-/// [`args_init_mem`] for an already-built args blob (the op-15 spawn-time payload, #1286, and an
+/// [`args_init_mem`] for an already-built args blob (a spawn record's args payload, #1286, and an
 /// on-ramp run's environment, [`onramp_env_init`]): zeros up to `module_args_base()`, then the blob
 /// verbatim. An empty payload seeds nothing.
 pub(crate) fn args_init_mem_raw(blob: &[u8]) -> Vec<u8> {
@@ -5826,7 +4374,7 @@ impl OnrampReactor {
             .map_err(|_| STATUS_UNSUPPORTED)?;
 
         let (mut inst, back) =
-            reactor_instance(&module, layout.byte_len() as u64).ok_or(STATUS_UNSUPPORTED)?;
+            reactor_instance(&module, layout.span()).ok_or(STATUS_UNSUPPORTED)?;
         if !inst.restore_window(&layout, &host) {
             return Err(STATUS_UNSUPPORTED);
         }
@@ -5966,195 +4514,6 @@ impl OnrampReactor {
     }
 }
 
-/// Like [`OnrampReactor`], but the guest window lives in a **caller-provided region of this module's
-/// own linear memory** (a [`Region::shared`](temen_interp::Region::shared) over `[win_ptr, win_size)`)
-/// rather than a window the engine backs internally. That relocation is the substrate the wasm-JIT
-/// **reactor** tier needs (BROWSER.md § "wasm-JIT tier", slice 5b): the emitted `tick` — a JS-compiled
-/// wasm module that imports `env.memory` = *this* cdylib's linear memory — must read and write the same
-/// bytes the interpreter seeds, so `_start` (interpreter), the per-frame `tick`, and any cross-tier
-/// interpreter bounce all operate over **one** window. Backed by the resumable, tier-up-capable
-/// [`bytecode::VcpuReactor`]; with no eligibility set (this slice) every `tick` interprets, so it is a
-/// faithful, **byte-identical** substitute for [`OnrampReactor`] — the differential the reactor tests
-/// assert — with the window merely relocated into shared linear memory. The emitted-`tick` path (slice
-/// 5c) rides the same window and shared host.
-pub struct SharedOnrampReactor {
-    reactor: bytecode::VcpuReactor,
-    /// The powerbox (granted caps + stashed `_start` handles), shared across `open` and every `frame`
-    /// so the `display`/`keyboard`/`fs` caps and their state persist frame-to-frame.
-    host: std::sync::Mutex<Host>,
-    /// Keep-alive for an **owned** backing (the native/test path allocates it here); `None` when the
-    /// window is caller-owned (the FFI path hands in a pointer into this module's linear memory). The
-    /// `Region::shared` in `reactor`/`_back` addresses these bytes, so this must outlive the reactor —
-    /// a `Box<[u8]>`'s heap allocation is stable across moves of the struct.
-    _backing: Option<Box<[u8]>>,
-    /// The shared backing region (kept so its lifetime is tied to the reactor's).
-    _back: std::sync::Arc<temen_interp::Region>,
-    entry_sp: u64,
-    tick: temen_ir::FuncIdx,
-    /// The stateful host capabilities this reactor granted — the half of its state that is not the
-    /// window (see [`OnrampCaps`]).
-    caps: OnrampCaps,
-    last_trap: Option<String>,
-}
-
-impl SharedOnrampReactor {
-    /// Open a shared-window reactor over `m` with an **owned** backing of `1 << win_log2` bytes
-    /// (allocated + kept alive here) — the native/test entry. `win_log2` must be ≥ the module's mapped
-    /// size and large enough for the guest's grown heap. See [`open_shared`](Self::open_shared) for the
-    /// FFI entry that borrows a caller-owned window.
-    pub fn open_owned(m: &temen_ir::Module, win_log2: u8) -> Result<SharedOnrampReactor, i32> {
-        Self::open_owned_inner(m, win_log2, None)
-    }
-
-    /// Like [`open_owned`](Self::open_owned) but also grant an `fs` capability serving one read-only
-    /// file `data` under `name` (the WAD read path — see [`OnrampReactor::open_with_fs`]).
-    pub fn open_owned_with_fs(
-        m: &temen_ir::Module,
-        win_log2: u8,
-        name: String,
-        data: Vec<u8>,
-    ) -> Result<SharedOnrampReactor, i32> {
-        Self::open_owned_inner(m, win_log2, Some((name, data)))
-    }
-
-    fn open_owned_inner(
-        m: &temen_ir::Module,
-        win_log2: u8,
-        fs: Option<(String, Vec<u8>)>,
-    ) -> Result<SharedOnrampReactor, i32> {
-        let win_size = 1u64 << win_log2;
-        let mut backing = vec![0u8; win_size as usize].into_boxed_slice();
-        let ptr = backing.as_mut_ptr();
-        // SAFETY: `backing` (a `Box<[u8]>` of `win_size` bytes) is owned by the returned struct and its
-        // heap allocation is pointer-stable across the struct's moves, so `[ptr, win_size)` stays valid
-        // and exclusively this reactor's window for its whole lifetime.
-        let back = std::sync::Arc::new(unsafe { temen_interp::Region::shared(ptr, win_size) });
-        Self::open_over(m, back, Some(backing), fs)
-    }
-
-    /// Open a shared-window reactor over a **caller-owned** window `[win_ptr, win_ptr+win_size)` of this
-    /// module's linear memory — the FFI entry (the host `temen_alloc`s the window and keeps it live for
-    /// the reactor's lifetime).
-    ///
-    /// # Safety
-    /// `[win_ptr, win_size)` must be a live region of this module's linear memory, used solely as this
-    /// reactor's window and kept valid (not freed, not reused) until the reactor is dropped.
-    pub unsafe fn open_shared(
-        m: &temen_ir::Module,
-        win_ptr: *mut u8,
-        win_size: u64,
-        fs: Option<(String, Vec<u8>)>,
-    ) -> Result<SharedOnrampReactor, i32> {
-        let back = std::sync::Arc::new(temen_interp::Region::shared(win_ptr, win_size));
-        Self::open_over(m, back, None, fs)
-    }
-
-    fn open_over(
-        m: &temen_ir::Module,
-        back: std::sync::Arc<temen_interp::Region>,
-        backing: Option<Box<[u8]>>,
-        fs: Option<(String, Vec<u8>)>,
-    ) -> Result<SharedOnrampReactor, i32> {
-        onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
-        let tick = m.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
-        let entry_sp = temen_ir::powerbox_entry_sp(m);
-        let mut host = Host::new();
-        let caps = grant_onramp_caps(&mut host, m, fs, None);
-        // Run the entry (func 0) once over the shared window with no args (phase 4: the manifest
-        // slot bindings deliver the capabilities) to run the C initializer, seeding +
-        // data-initialising the window (the once). The window then persists in the shared backing
-        // for every `tick`.
-        let host = std::sync::Mutex::new(host);
-        let reactor =
-            bytecode::VcpuReactor::open(m, back.clone(), &host, &[]).map_err(|_| STATUS_TRAP)?;
-        Ok(SharedOnrampReactor {
-            reactor,
-            host,
-            _backing: backing,
-            _back: back,
-            entry_sp,
-            tick,
-            caps,
-            last_trap: None,
-        })
-    }
-
-    /// Run one frame: call the guest's `tick` on the **live** shared window (all prior-frame state
-    /// intact), returning `(status, stdout-delta)`. `STATUS_OK` = keep going; `STATUS_EXIT` = the guest
-    /// called `Exit`; `STATUS_TRAP` = a trap. This slice interprets `tick` (no eligibility set), so the
-    /// `service` closure is never invoked. The presented frame (if any) is read via
-    /// [`take_frame`](Self::take_frame).
-    pub fn frame(&mut self) -> (i32, Vec<u8>) {
-        let stdout_before = self.host.lock().unwrap().stdout.len();
-        let args = [Value::I64(self.entry_sp as i64)];
-        // No JIT eligibility set → `service` is unreachable; propagate a trap if one ever surfaced.
-        let result = self.reactor.frame(
-            self.tick,
-            &args,
-            &self.host,
-            |_func, _argv, _mapped, _info| Err(Trap::Malformed),
-        );
-        let status = match result {
-            Ok(_) => STATUS_OK,
-            Err(Trap::Exit(_)) => STATUS_EXIT,
-            Err(t) => {
-                self.last_trap = Some(format!("{t:?}"));
-                STATUS_TRAP
-            }
-        };
-        let delta = self.host.lock().unwrap().stdout[stdout_before..].to_vec();
-        (status, delta)
-    }
-
-    /// The `Debug` string of the last frame's trap (diagnostic), or `""` if none.
-    pub fn last_trap(&self) -> &str {
-        self.last_trap.as_deref().unwrap_or("")
-    }
-
-    /// Take the frame the last `tick` presented through `display` (`None` if it presented none).
-    pub fn take_frame(&self) -> Option<Frame> {
-        self.caps.take_frame()
-    }
-
-    /// Enqueue a key event for the guest to `poll` through the `keyboard` capability next frame.
-    pub fn push_key(&self, keycode: i32, pressed: i32) {
-        self.caps.push_key(keycode, pressed);
-    }
-
-    /// Enqueue a mouse event for the guest to `poll` through the `mouse` capability next frame:
-    /// `kind` 0 = pointer, 1 = wheel; `payload` per [`MouseQueue`] (taken as an unsigned 32-bit word).
-    pub fn push_mouse(&self, kind: i32, payload: i32) {
-        self.caps.push_mouse(kind, payload);
-    }
-
-    /// Capture a [`Moment`] — this reactor's whole state at the current frame boundary, so a
-    /// later [`restore`](Self::restore) puts the guest back here. Refused when the window cannot be
-    /// faithfully imaged (none, or a §13 region alias — the capture refuses rather than handing back a
-    /// fiction).
-    pub fn moment(&self) -> Result<Moment, Refusal> {
-        Moment::capture(
-            self.reactor.window_layout().ok_or(Refusal::NoWindow)?,
-            &self.host.lock().unwrap(),
-        )
-    }
-
-    /// Put the guest back at `moment`: the window image and the capability state are reinstated, so the
-    /// next [`frame`](Self::frame) runs as the frame that followed the one the moment was taken at.
-    /// `false` if this reactor has no window to restore into (a memory-less module).
-    ///
-    /// Restoring **abandons** the timeline the reactor was on: input enqueued since the moment is
-    /// dropped with the queues it sat in. A driver that wants the frames between two moments re-runs
-    /// the guest forward over the input it recorded, rather than keeping a moment per frame.
-    pub fn restore(&mut self, moment: &Moment) -> bool {
-        let mut host = self.host.lock().unwrap();
-        if !self.reactor.restore_window(&moment.layout(), &host) {
-            return false;
-        }
-        moment.restore_host(&mut host);
-        true
-    }
-}
-
 /// A **single-shot** wasm-JIT run of an on-ramp module. The whole program *is* func 0
 /// (`_start`), so we emit **that** and run it once: the paramless `_start` reads its capabilities
 /// through the manifest slot bindings / `self.resolve` (phase 4 — no handle params), seeds the
@@ -6181,7 +4540,6 @@ pub struct JitOnrampRun {
     /// The compiled interpreter program for cross-tier bounces.
     program: std::sync::Arc<bytecode::SharedProgram>,
     host: Host,
-    _backing: Option<Box<[u8]>>,
     back: std::sync::Arc<temen_interp::Region>,
     win_base: usize,
     /// The emitted `_start` wasm.
@@ -6247,7 +4605,7 @@ pub struct JitOnrampRun {
 /// [`onramp_fs_exec`] (a seeded memfs + argv). `Stdin` grants the plain on-ramp powerbox
 /// ([`grant_onramp_caps`]); `Fs` grants the headless powerbox with a mounted `fs` image and seeds
 /// `argv` at `POWERBOX_ARGS_BASE` (the chibicc-in-the-browser card: `/in.c` + `/include/*.h`).
-enum RunInput {
+pub enum RunInput {
     Stdin(Vec<u8>),
     Fs {
         image: Vec<u8>,
@@ -6255,30 +4613,26 @@ enum RunInput {
         stdin: Vec<u8>,
     },
     /// A **detached child** run (#1285, DETACHED_JIT.md §3): the on-ramp powerbox (as `Stdin`) plus
-    /// `argv` seeded at `module_args_base()` — the spawn-time args payload a detached child needs because
-    /// the op-13 convention (a parent data segment landing inside the child's carve) has no analogue
-    /// across memories. The window is the child's own foreign memory (`open_detached_run`). Constructed
-    /// only by the wasm32 threads-build FFI (`temen_detached_jit_run_open`); dead on native.
-    #[allow(dead_code)]
+    /// `argv` seeded at `module_args_base()`, the spawn-time args payload. The window is the child's
+    /// own foreign memory (`open_detached_run`). Constructed only by the wasm32 threads-build FFI
+    /// (`temen_detached_jit_run_open`).
     Detached {
         stdin: Vec<u8>,
         argv: Vec<Vec<u8>>,
     },
-    /// A **caller-provided granted powerbox** (#1025 Path 1) — the run executes its emitted `_start` over
-    /// `host` verbatim instead of building the on-ramp powerbox from stdin/an fs image. This is what an
-    /// op-13 nested phase child uses: its `host` is the powerbox the parent marshaled across the
-    /// `env.instantiate_module` bounce ([`Host::spawn_named_child_from_window`]), so the child's `call.cap`
-    /// leaves (an `fs`/`stdout`) resolve over that granted host on the reactor-path cross-tier bounce
-    /// ([`JitOnrampRun::run_cross_tier`] → `run_over(&mut self.host)`), exactly as a top-level phase's `fs`
-    /// resolves today. `init_mem` is the window prefix to seed (argv at `POWERBOX_ARGS_BASE`, or empty).
+    /// A **caller-provided granted powerbox** (#1025 Path 1): the run executes its emitted entry over
+    /// `host` verbatim instead of building the on-ramp powerbox from stdin or an fs image. A detached
+    /// child's is the powerbox its spawn's admission built ([`bytecode::PendingChild::into_powerbox`]),
+    /// so its `call.cap` leaves resolve over the caps it was granted, on the reactor-path cross-tier
+    /// bounce ([`JitOnrampRun::run_cross_tier`] → `run_over(&mut self.host)`). `init_mem` is the window
+    /// prefix to seed (the spawn's args payload, or empty).
     PreGranted {
         host: Box<Host>,
         init_mem: Vec<u8>,
-        /// The child entry's data-stack pointer, passed as its first `i64` param for a §14 child-entry
-        /// module (`child_entry_ok`: `[I64]->[I64]`). `0` for a paramless `_start` child (the param is
-        /// then not emitted, so the value is unused). The emitted `f{entry}` is called with the module's
-        /// declared params filled from this (`sp`, then `entry_as` for a second).
-        entry_sp: u64,
+        /// The child entry's first `i64` param, its starter `Instantiator` handle (`[I64]->[I64]`). The
+        /// emitted `f{entry}` is called with the module's declared params filled from this, then
+        /// `entry_as`; a paramless entry takes neither.
+        entry_inst: u64,
         /// #1201 — the child entry's second `i64` param, its starter `AddressSpace` handle for the
         /// `[I64,I64]->[I64]` shape (a page-op child's outlined leaf `call.cap`s on it). `0` otherwise.
         entry_as: u64,
@@ -6305,7 +4659,6 @@ impl JitOnrampRun {
         Self::open_over_run(
             m,
             back,
-            None,
             win_size,
             win_base,
             win_log2,
@@ -6315,42 +4668,15 @@ impl JitOnrampRun {
         )
     }
 
-    /// Open a single-shot JIT run over an **owned** (heap-backed) window with a **caller-provided granted
-    /// `Host`** (#1025 Path 1 — the owned-window twin of [`open_shared_run_over_host`]). The run executes
-    /// its emitted `_start` over `host` verbatim (an op-13 phase child's marshaled powerbox); `init_mem`
-    /// seeds the window prefix (argv).
-    /// The child's `call.cap` leaves resolve over `host` on the reactor cross-tier bounce, exactly as a
-    /// top-level phase's `fs` resolves. Used by the browser op-13-child-on-JIT servicer.
-    pub fn open_owned_run_over_host(
-        m: &temen_ir::Module,
-        win_log2: u8,
-        shared_memory: bool,
-        host: Host,
-        init_mem: Vec<u8>,
-    ) -> Result<JitOnrampRun, i32> {
-        Self::open_owned_run_with(
-            m,
-            win_log2,
-            shared_memory,
-            RunInput::PreGranted {
-                host: Box::new(host),
-                init_mem,
-                entry_sp: 0,
-                entry_as: 0,
-            },
-            None,
-        )
-    }
-
     /// Open a single-shot JIT run over a **detached child's own window** (#1285, DETACHED_JIT.md §3.1):
-    /// `back`, from [`mint_detached_backing`] — in the browser the page-registered foreign memory
+    /// `back`, from `mint_detached_backing` — in the browser the page-registered foreign memory
     /// (`web/foreign-mem.js`), addressed through `Region::Foreign`. The child's window starts one host
     /// header page into that memory (`win` = [`DETACHED_HEADER_BYTES`]; the header holds the emitted
     /// tier's `env` cell and `pagestate`, unreachable by the guest since every span is checked against
     /// `"mapped"` before `win` is added). The backing is grown here to the module's declared window and
-    /// later by each `vm_map` bounce ([`run_cross_tier`](Self::run_cross_tier)). No `Shared` alias, no
-    /// carve: the parent cannot address a byte of it.
-    pub(crate) fn open_detached_run(
+    /// later by each `vm_map` bounce ([`run_cross_tier`](Self::run_cross_tier)). The parent cannot
+    /// address a byte of it.
+    pub fn open_detached_run(
         m: &temen_ir::Module,
         back: std::sync::Arc<temen_interp::Region>,
         shared_memory: bool,
@@ -6365,55 +4691,11 @@ impl JitOnrampRun {
         Self::open_over_run(
             m,
             back,
-            None,
             declared,
             DETACHED_HEADER_BYTES as usize,
             size_log2,
             shared_memory,
             input,
-            cached,
-        )
-    }
-
-    /// Open a single-shot JIT run over a **caller-owned** window with a **caller-provided granted
-    /// `Host`** (#1025 Path 1 — the emitted nested phase child). The run executes its emitted `_start`
-    /// over `host` verbatim: the parent already marshaled exactly the caps the child holds (a shared
-    /// `fs`/`stdout`) across the op-13 bounce, so the child's `call.cap` leaves resolve over this granted
-    /// powerbox on the reactor cross-tier bounce — no on-ramp caps are added. `init_mem` seeds the window
-    /// prefix (argv at `POWERBOX_ARGS_BASE`, or empty).
-    ///
-    /// # Safety
-    /// As [`open_shared_run`](Self::open_shared_run): `[win_ptr, win_size)` must be a live region of this
-    /// module's linear memory (the carve), used solely as this run's window, valid until the run is dropped.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn open_shared_run_over_host(
-        m: &temen_ir::Module,
-        win_ptr: *mut u8,
-        win_size: u64,
-        win_log2: u8,
-        shared_memory: bool,
-        host: Host,
-        init_mem: Vec<u8>,
-        entry_sp: u64,
-        entry_as: u64,
-        cached: Option<CachedEmit>,
-    ) -> Result<JitOnrampRun, i32> {
-        let win_base = win_ptr as usize;
-        let back = std::sync::Arc::new(temen_interp::Region::shared(win_ptr, win_size));
-        Self::open_over_run(
-            m,
-            back,
-            None,
-            win_size,
-            win_base,
-            win_log2,
-            shared_memory,
-            RunInput::PreGranted {
-                host: Box::new(host),
-                init_mem,
-                entry_sp,
-                entry_as,
-            },
             cached,
         )
     }
@@ -6440,7 +4722,6 @@ impl JitOnrampRun {
         Self::open_over_run(
             m,
             back,
-            None,
             win_size,
             win_base,
             win_log2,
@@ -6451,36 +4732,6 @@ impl JitOnrampRun {
                 stdin,
             },
             None,
-        )
-    }
-
-    fn open_owned_run_with(
-        m: &temen_ir::Module,
-        win_log2: u8,
-        shared_memory: bool,
-        input: RunInput,
-        cached: Option<CachedEmit>,
-    ) -> Result<JitOnrampRun, i32> {
-        // The owned backing must equal the size the emitter masks: the module's declared window is the
-        // floor.
-        let win_log2 = win_log2.max(m.memory.map_or(0, |mc| mc.size_log2));
-        let win_size = 1u64 << win_log2;
-        let mut backing = vec![0u8; win_size as usize].into_boxed_slice();
-        let ptr = backing.as_mut_ptr();
-        let win_base = ptr as usize;
-        // SAFETY: `backing` is owned by the returned struct and pointer-stable across its moves, so
-        // `[ptr, win_size)` stays valid + exclusive for the run.
-        let back = std::sync::Arc::new(unsafe { temen_interp::Region::shared(ptr, win_size) });
-        Self::open_over_run(
-            m,
-            back,
-            Some(backing),
-            win_size,
-            win_base,
-            win_log2,
-            shared_memory,
-            input,
-            cached,
         )
     }
 
@@ -6551,7 +4802,6 @@ impl JitOnrampRun {
     fn open_over_run(
         m: &temen_ir::Module,
         back: std::sync::Arc<temen_interp::Region>,
-        backing: Option<Box<[u8]>>,
         win_size: u64,
         win_base: usize,
         win_log2: u8,
@@ -6576,7 +4826,7 @@ impl JitOnrampRun {
         // Build the powerbox + the window-prefix seed (`init_mem`, the argv blob for the `Fs` path)
         // from the input shape. `frame` is only ever populated by a `display.present` — kept for
         // struct parity; a compiler/compute guest never presents.
-        let (mut host, init_mem, frame, entry_sp, entry_as) = match input {
+        let (mut host, init_mem, frame, entry_inst, entry_as) = match input {
             RunInput::Stdin(stdin) => {
                 let mut host = Host::new();
                 host.stdin = stdin;
@@ -6607,24 +4857,24 @@ impl JitOnrampRun {
             RunInput::PreGranted {
                 host,
                 init_mem,
-                entry_sp,
+                entry_inst,
                 entry_as,
             } => {
                 // Run over the caller's marshaled granted powerbox verbatim — no on-ramp caps are added
                 // here; the parent granted exactly what the child holds (the confinement default).
                 let frame = std::sync::Arc::new(std::sync::Mutex::new(None));
-                (*host, init_mem, frame, entry_sp, entry_as)
+                (*host, init_mem, frame, entry_inst, entry_as)
             }
         };
         // The emitted `f{entry}` is called `f{entry}(win, env, ...declared params)`. A paramless `_start`
         // adds no trailing slots; a §14 child-entry (`[I64]->[I64]` / `[I64,I64]->[I64]`) takes its
-        // starter `Instantiator` as the first param (`entry_sp`) and its `AddressSpace` as the second
+        // starter `Instantiator` as the first param (`entry_inst`) and its `AddressSpace` as the second
         // (`entry_as`) — the handles the interpreter passes (#1025 Path 1; #1201 for the second).
         let n_params = module.funcs.first().map_or(0, |f| f.params.len());
         let entry_slots: Vec<Value> = (0..n_params)
             .map(|i| {
                 Value::I64(match i {
-                    0 => entry_sp as i64,
+                    0 => entry_inst as i64,
                     1 => entry_as as i64,
                     _ => 0,
                 })
@@ -6671,7 +4921,6 @@ impl JitOnrampRun {
             module,
             program,
             host,
-            _backing: backing,
             back,
             win_base,
             emitted_wasm,
@@ -6904,7 +5153,7 @@ pub fn capture_exec(m: &temen_ir::Module, init: &[u8], arg: i64) -> CapOutcome {
 /// by the wasm [`temen_run_nested`] export and the native `gencorpus` ground truth.
 pub fn instantiate_exec(m: &temen_ir::Module) -> (i32, i64) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 128 << 10);
+    let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 1 << 20, -1);
     host.register_cap_name("budget", budget);
     for e in &m.exports {
@@ -7246,20 +5495,7 @@ struct WarmCoop {
     /// eval's powerbox, which every eval of the session shares, so it is not made again.
     leaf_declined: bool,
     /// The region emit, made on the first eval whose root does not run whole.
-    regions: Option<WarmRegions>,
-}
-
-/// A warm session's region emit ([`WarmCoop::regions`]): the [`coop_emit_for`] outputs, with the
-/// wasm and eligibility in shared form (cloned per Run as cheap `Arc`s).
-struct WarmRegions {
-    wasm: std::sync::Arc<[u8]>,
-    eligible: std::sync::Arc<[bool]>,
-    paged: bool,
-    all_shimmable: bool,
-    table_log2: u8,
-    jit_importer: bool,
-    /// #1627: the emit is spill-instrumented (see [`CoopEmit::spill`]).
-    spill: bool,
+    regions: Option<std::sync::Arc<CoopEmit>>,
 }
 
 /// The one live warm session (single-threaded wasm ⇒ a plain static). `None` until [`temen_warm_open`].
@@ -7648,18 +5884,8 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         // reservation must agree on it (the coop driver convention, with `WARM_MAPPED_LOG2`
         // playing `JIT_RUN_WIN_LOG2.max(declared)`; `temen_warm_open` already gated declared ≤
         // mapped). The emit outlines the same module the same way, so its functions are `wc.m`'s.
-        match coop_emit_for(&s.module, wc.shared, WARM_MAPPED_LOG2) {
-            Ok(e) => {
-                wc.regions = Some(WarmRegions {
-                    wasm: e.wasm.into(),
-                    eligible: e.eligible.into(),
-                    paged: e.paged,
-                    all_shimmable: e.all_shimmable,
-                    table_log2: e.table_log2,
-                    jit_importer: e.jit_importer,
-                    spill: e.spill,
-                })
-            }
+        match coop_emit_for(&s.module, wc.shared, WARM_MAPPED_LOG2, false) {
+            Ok(e) => wc.regions = Some(e),
             Err(status) => {
                 set(status);
                 return -status;
@@ -7680,10 +5906,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
     }
     let tierup = bytecode::TierUpConfig {
-        root: bytecode::ProgramEmit {
-            eligible: std::sync::Arc::clone(&r.eligible),
-            page_checked: r.paged,
-        },
+        root: r.program_emit(),
         leaf: None,
         modules: None,
     };
@@ -8389,7 +6612,9 @@ const LINK_SETS_MAX: usize = 4;
 /// module-scoped globals are implementation internals: their debug vars are dropped here (#1806).
 /// Otherwise every frame's Locals and the shared-state `globals` list would carry them beside the
 /// program's own (a playground libc's `__pg_std`, `__pg_rng`, …). The library's line table and its
-/// functions' locals stay, so a step into it still shows where it is.
+/// functions' locals stay, so a step into it still shows where it is — and every one of its files is
+/// marked library code (`lib_files`, #2341), so a debugger shows its frames as library frames and
+/// steps past them under just-my-code. `link` carries the mark into every program linked against it.
 #[no_mangle]
 pub extern "C" fn temen_link_lib_open(lib_ptr: *const u8, lib_len: usize) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
@@ -8400,9 +6625,7 @@ pub extern "C" fn temen_link_lib_open(lib_ptr: *const u8, lib_len: usize) -> i32
             return -1;
         }
     };
-    if let Some(debug) = module.debug_info.as_mut() {
-        debug.vars.retain(|v| v.func != temen_ir::GLOBAL_SCOPE);
-    }
+    make_resident(&mut module);
     let exports = link_lib_exports(&module);
     // SAFETY: single-threaded wasm; exclusive access to the resident table.
     let libs = unsafe { &mut *core::ptr::addr_of_mut!(LINK_LIBS) };
@@ -8419,6 +6642,15 @@ pub extern "C" fn temen_link_lib_open(lib_ptr: *const u8, lib_len: usize) -> i32
     };
     set(STATUS_OK);
     h as i32
+}
+
+/// What a library unit becomes as it goes resident ([`temen_link_lib_open`]): its module-scoped
+/// globals' debug vars dropped (#1806), and every one of its files marked library code (#2341).
+pub fn make_resident(module: &mut temen_ir::Module) {
+    if let Some(debug) = module.debug_info.as_mut() {
+        debug.vars.retain(|v| v.func != temen_ir::GLOBAL_SCOPE);
+        debug.lib_files = (0..debug.files.len() as u32).collect();
+    }
 }
 
 /// Drop the resident library `handle` ([`temen_link_lib_open`]). Unknown / already-closed handles are
@@ -10352,13 +8584,15 @@ static mut OP13_JIT: Option<Op13JitDriver> = None;
 
 /// A minimal op-13 driver (`memory 16`, entry `(Instantiator, Module, Budget)`): it resolves its
 /// `"fs"` by name, writes one grant record re-granting it as `"fs"` (at 17536, the name at 18432 — both
-/// above the NULL guard), spawns the child module detached through an op-17 v1 record at 17408 (its
-/// declared window, paid from the budget) and returns the child's join result.
+/// above the NULL guard), spawns the child module detached through an op-17 record at 17408 (its
+/// declared window, paid from the budget) and returns the value its join answers — or traps if the
+/// child ended in a trap, which its join answers as a status (#2066), so the driver still reports
+/// `OP13JIT_TRAP` for a child that trapped.
 fn op13_mini_driver() -> String {
     let rec = temen_ir::SpawnRec {
         grants_ptr: 17536,
         grants_n: 1,
-        ..temen_ir::SpawnRec::v1(0)
+        ..temen_ir::SpawnRec::default()
     };
     let (seg, stores) = plan::spawn_rec_ir(17408, &rec, "v1", "v2");
     format!(
@@ -10376,8 +8610,16 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   i32.store vgh vfs
 {stores}  vr = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) v0 (vr)
-  vres = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vres
+  vres_st, vres = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
+  vz = i64.const 0
+  vok = i64.eq vres_st vz
+  br_if vok 1(vres) 2()
+}}
+block 1 (vret: i64) {{
+  return vret
+}}
+block 2 () {{
+  unreachable
   }}
 }}
 "#
@@ -10503,19 +8745,19 @@ fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module) -> i32
     let c2 = std::sync::Arc::clone(&counter);
     let fork: temen_interp::HostProcFork = std::sync::Arc::new(move |_pid| {
         let c = std::sync::Arc::clone(&c2);
-        temen_interp::ForkedProc::shared(
+        Some(temen_interp::ForkedProc::shared(
             Box::new(move |_op, _a, _m, _| {
                 let mut c = c.lock().unwrap();
                 *c += 1;
                 Ok(vec![*c])
             }),
             temen_interp::CapState::Uncaptured,
-        )
+        ))
     });
 
     let mut host = Host::new();
     let win = 1u64 << driver.memory.map_or(16, |mc| mc.size_log2); // the built-in driver: `memory 16`
-    let inst = host.grant_instantiator(0, win);
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(&child);
     // A counter the guest reads back, which nothing serializes (#1699).
     let fs_h = host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Uncaptured);
@@ -10534,7 +8776,7 @@ fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module) -> i32
     let budget = host.grant_budget(-1, DETACHED_DEFAULT_MAX_BYTES as i64, -1);
     // #1527: a driver whose entry takes a fourth arg gets an `AddressSpace` over its window — so a
     // detached driver can mint a region (`create_region`), map it for itself and pre-map it into
-    // the child (the op-15 11-arg form). The three-arg drivers are unchanged.
+    // the child (the spawn record's `region`). The three-arg drivers are unchanged.
     let mut args = vec![Value::I32(inst), Value::I32(modh), Value::I32(budget)];
     if driver.funcs.first().is_some_and(|f| f.params.len() == 4) {
         args.push(Value::I32(host.grant_address_space(0, win)));
@@ -10610,7 +8852,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 return OP13JIT_DONE;
             }
             bytecode::VcpuEvent::Trapped(_) => return OP13JIT_TRAP,
-            // #1286 — a DETACHED child (op 17 v1 / op 15): its window is its own backing
+            // #1286 — a DETACHED child (an op-17 record): its window is its own backing
             // ([`mint_detached_backing`] — in the browser a fresh `WebAssembly.Memory`, reached only
             // through `Region::Foreign`), and the emitted `_start` runs bound to it (`driveDetachedRun`).
             // No carve, no alias — the driver cannot address a byte of it. The engine admitted the child through the one admission every driver uses: its
@@ -10650,7 +8892,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 let back = std::sync::Arc::new(back);
                 // The child's entry gets the starter handles the interpreter passes.
                 let (mut host, cinst, cas) = child.into_powerbox();
-                // #1527: an op-15 pre-mapped region on the emitted tier. Two `WebAssembly.Memory`s
+                // #1527: a spawn's pre-mapped region on the emitted tier. Two `WebAssembly.Memory`s
                 // cannot alias, but a detached child runs to completion before its parent resumes
                 // (the handle is delivered only after `driveDetachedRun`; `join` reads the banked
                 // result), so with no interleaving an alias is observationally **copy-in before
@@ -10666,7 +8908,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                     RunInput::PreGranted {
                         host: Box::new(host),
                         init_mem,
-                        entry_sp: cinst,
+                        entry_inst: cinst,
                         entry_as: cas,
                     },
                     Some(emit),
@@ -10694,11 +8936,10 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 // continue: the driver's own join is serviced without yielding to JS
             }
             // The op-13 driver is a root that only spawns detached children and joins them: no carve
-            // child (#1289), no threads, no tier-up of its own, no §22 units, no cap or stdin park.
+            // child (#1289), no threads, no §22 units, no cap or stdin park.
             // Named rather than `_` (see `VcpuEvent`) so a new event fails to build here instead of
             // trapping the driver.
-            bytecode::VcpuEvent::TierUp { .. }
-            | bytecode::VcpuEvent::Spawn { .. }
+            bytecode::VcpuEvent::Spawn { .. }
             | bytecode::VcpuEvent::Wait { .. }
             | bytecode::VcpuEvent::Notify { .. }
             | bytecode::VcpuEvent::JitInstall { .. }
@@ -10712,14 +8953,15 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
 
 /// **A child the driver cannot service is a value at the parent's `join`, never a trap.** The
 /// result a leaf runner banks when the child reaches an event that runner does not service
-/// (threads, tier-up, a cap or stdin park inside a leaf). `Vcpu::deliver_join(Err(t))` sets the
-/// *parent's* trap, so returning `Err(Trap::Malformed)` here — as every leaf did — killed the parent
-/// domain for a limitation of the host, not for anything either guest did. INVARIANTS #5: a
-/// lifecycle event from another party is never a domain-killing surprise. A child's *own* trap still
-/// propagates (`deliver_join`'s documented contract); this is only the driver's decline.
+/// (threads, tier-up, a cap or stdin park inside a leaf). Every leaf used to bank
+/// `Err(Trap::Malformed)`, which the parent's join then raised, killing the parent domain for a
+/// limitation of the host, not for anything either guest did. INVARIANTS #5: a lifecycle event from
+/// another party is never a domain-killing surprise. A child's *own* trap reaches the parent's join
+/// as its code (#2066); this is only the driver's decline, which the join reads as the child
+/// returning `-EINVAL`.
 ///
 /// The value is `-EINVAL`, the same answer a driver gives a declined op (#1415; every bytecode
-/// driver services op 15 since #1528, but the shape stands) —
+/// driver services the detached spawn since #1528, but the shape stands) —
 /// one mechanism for "this tier does not do that", at both the op and the child level. `Malformed`
 /// was the wrong trap twice over: its definition is "structurally invalid in a way a verified
 /// module never is", and a verified module that `thread.spawn`s inside a leaf is not that.
@@ -11518,12 +9760,6 @@ pub fn reflect_exec(m: &temen_ir::Module, arg: i64) -> (i32, i64) {
 /// guard never yields `WasmDriven` for one, so its invoke runs on the interpreter.
 fn browser_jit_wasm_emitter(blob: &[u8]) -> Option<Vec<u8>> {
     let m = temen_encode::decode_module(blob).ok()?;
-    if par_jit_b2() {
-        // §22 Model B2 cross-Worker: emit a unit that imports the shared reserved funcref table, so its
-        // `call.dyn` dispatches (at native wasm speed) to units installed in the per-Worker table
-        // mirror. Whole-module in-subset only; otherwise fail-closed to the interpreter (`.ok()`).
-        return temen_wasm_jit::compile_module_b2(&m, true, PAR_JIT_TABLE_LOG2 as u32).ok();
-    }
     match temen_wasm_jit::compile_jit(&m, temen_wasm_jit::Shape::Batch { entry: 0 }, true) {
         Ok(temen_wasm_jit::Artifact {
             wasm,
@@ -12471,61 +10707,6 @@ block 0 (vsp: i64, varg: i64) {
     }
 }
 
-/// Self-contained coroutine probe (`wasmtime --invoke run_coroutine`): a §14 coroutine confined to a
-/// sub-window is resumed three times, yielding 100, 210, then returning 1019. Returns
-/// `100 + 210 + 1019 + RETURNED*1_000_000 = 1001329` iff `spawn_coroutine`/`resume`/`yield` work on
-/// this target, else `-1`.
-#[no_mangle]
-pub extern "C" fn run_coroutine() -> i64 {
-    const CORO: &str = r#"memory 17
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  v1 = i64.const 1
-  v2 = i64.const 65536
-  v3 = i64.const 16
-  v4 = i64.const 0
-  v5 = call.cap 6 2 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = i64.const 0
-  v7, v8 = call.cap 6 3 (i32, i64) -> (i32, i64) v0 (v5, v6)
-  v9 = i64.const 10
-  v10, v11 = call.cap 6 3 (i32, i64) -> (i32, i64) v0 (v5, v9)
-  v12 = i64.const 20
-  v13, v14 = call.cap 6 3 (i32, i64) -> (i32, i64) v0 (v5, v12)
-  v15 = i64.add v8 v11
-  v16 = i64.add v15 v14
-  v17 = i64.extend_i32_s v13
-  v18 = i64.const 1000000
-  v19 = i64.mul v17 v18
-  v20 = i64.add v16 v19
-  return v20
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i32.wrap_i64 v0
-  v2 = i64.const 0
-  v3 = i32.const 7
-  i32.store8 v2 v3
-  v4 = i64.const 100
-  v5 = call.cap 7 0 (i64) -> (i64) v1 (v4)
-  v6 = i64.const 200
-  v7 = i64.add v6 v5
-  v8 = call.cap 7 0 (i64) -> (i64) v1 (v7)
-  v9 = i64.const 999
-  v10 = i64.add v9 v8
-  return v10
-  }
-}
-"#;
-    let Ok(m) = temen_text::parse_module(CORO) else {
-        return -1;
-    };
-    match instantiate_exec(&m) {
-        (STATUS_OK, v) => v,
-        _ => -1,
-    }
-}
-
 /// Self-contained scalar-float probe (`wasmtime --invoke run_float`): reinterpret the f64 bits of
 /// `4.0`, take `sqrt(|·|)`, and return the result's i64 bits — `4611686018427387904` (the bits of
 /// `2.0`) iff f64 reinterpret/abs/sqrt round-trip bit-exactly on this target, else `-1`.
@@ -12566,7 +10747,8 @@ block 0 (v0: i64) {
 
 /// The tier-up run's §22 unit-emit parameters (#835), read by [`onramp_tierup_unit_emitter`]
 /// (a bare `fn` — [`Host::set_jit_wasm_emitter`] stores no closure state): the run's memory-share
-/// flag and its window log2. Stored at [`temen_coop_open`]; single-threaded wasm.
+/// flag and its window log2. Stored when a run opens ([`temen_coop_open`], and the parallel
+/// driver's `temen_x2_start`); one such run at a time.
 static TIERUP_UNIT_SHARED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static TIERUP_UNIT_WIN_LOG2: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -12576,17 +10758,28 @@ static TIERUP_UNIT_WIN_LOG2: std::sync::atomic::AtomicU8 = std::sync::atomic::At
 static TIERUP_UNIT_TABLE_LOG2: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(ONRAMP_JIT_TABLE_LOG2);
 
-/// #1026 slice 4 — the **leaf tier-up size floor** (estimated emitted bytes): a leaf below it stays
-/// on the interpreter rather than tiering up, because the interp↔wasm crossing per call outweighs
-/// what so small an emitted body saves (measured net loss on every dispatch-heavy card, #1026). The
-/// production default is [`temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES`]; [`temen_coop_open`] reads
-/// this when building its eligibility bitmap. Overridable via [`temen_coop_set_tierup_floor`] so the
-/// differential harness can exercise the emitted **mechanism** with tiny guests (floor 0) separately
-/// from this size **policy**, and `bench_tierup_cards.mjs` can sweep the floor in one build.
-static COOP_TIERUP_FLOOR: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES);
+/// #2474 — when a coop run's calls tier up ([`bytecode::Hotness`]): a crossing into emitted code costs
+/// about 2 µs whatever the callee does (#1026), so only a call doing enough work repays it. Every
+/// emit an open makes reads it ([`coop_emit_for`], [`emit_module`]). [`temen_coop_set_hotness`] sets
+/// it, so the harness can exercise the emitted **mechanism** with tiny guests (`0, 0`: every
+/// eligible call) apart from this **policy**, and `bench_tierup_cards.mjs` can sweep it in one
+/// build.
+static COOP_HOTNESS: std::sync::Mutex<bytecode::Hotness> = std::sync::Mutex::new(COOP_HOT);
 
-/// The wasm emitter the tier-up driver installs for a `vm_jit_*`-importing guest (#835/#846):
+/// The production [`COOP_HOTNESS`], calibrated with `bench_tierup_cards.mjs`, #2443's fork-join pair
+/// and the loop helper (#2474).
+const COOP_HOT: bytecode::Hotness = bytecode::Hotness {
+    per_call: 16,
+    window: 8,
+};
+
+/// [`COOP_HOTNESS`] now.
+fn coop_hotness() -> bytecode::Hotness {
+    *COOP_HOTNESS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The wasm emitter the tier-up driver installs for a `vm_jit_*`-importing guest (#835/#846), and
+/// the parallel driver for a run whose §22 units run emitted (`temen_x2_start`):
 /// emit a validated unit whole-module in **Model B2** shape (`compile_module_b2` — its
 /// `call.dyn` dispatches through the driver's shared funcref table, so a **linked** unit's
 /// Slot callbacks reach installed units / eligible program `f{i}`s natively and everything else
@@ -12663,14 +10856,11 @@ fn cap_park_words(
     requests: &temen_interp::CapRequests,
     id: u64,
 ) -> Option<Vec<i64>> {
-    let req = requests
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&id)
-        .cloned()?;
+    let requests = requests.lock().unwrap_or_else(|e| e.into_inner());
+    let req = requests.get(&id)?;
     let index = caps.iter().position(|n| *n == req.name).unwrap_or(0) as i64;
     let mut words = vec![id as i64, index];
-    words.extend(req.args);
+    words.extend(&req.args);
     Some(words)
 }
 
@@ -12993,7 +11183,7 @@ impl CoopTierupRun {
     /// #1009 paged tier-up: refresh the page-state table iff the pending window's page map changed
     /// — the [`TierupRun::sync_pagestate`] twin over the cooperative run — then stage its coverage
     /// for `"mapped"`. #816: the engine routes `mem_map_info`/`mem_map_version` to the pending
-    /// round-trip's task env (a §14 confined child serves over its own carve), so the cache is
+    /// round-trip's task env (a §14 child serves over its own window), so the cache is
     /// keyed (env, version) and the staged coverage is the pending window's own bound.
     fn sync_pagestate(&mut self) {
         let env = self.run.pending_env();
@@ -13013,11 +11203,6 @@ impl CoopTierupRun {
 
 static mut COOP_RUN: Option<CoopTierupRun> = None;
 
-/// #1026 slice 4 — override the leaf tier-up size floor (estimated emitted bytes) for subsequent
-/// [`temen_coop_open`]s; takes effect at the next open. `bytes == 0` disables the floor entirely (any
-/// emittable leaf tiers up), which the differential harness uses to exercise the emitted **mechanism**
-/// with its tiny synthetic guests; `bench_tierup_cards.mjs` sweeps it to calibrate the default. The
-/// production default ([`temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES`]) applies until this is called.
 /// Host policy (#1384): override the emitter's per-function size cap
 /// (`temen_wasm_jit::MAX_EST_EMITTED_FN_BYTES`, estimated emitted bytes above which a function stays
 /// on the interpreter) for subsequent opens; `0` restores the default. The default guards the engine's
@@ -13028,23 +11213,49 @@ pub extern "C" fn temen_coop_set_emit_cap(bytes: usize) {
     temen_wasm_jit::set_max_est_emitted_fn_bytes(bytes);
 }
 
+/// #2474 — set when the calls of subsequent opens' runs tier up ([`COOP_HOTNESS`]): a function's
+/// calls tier up from the first, until `window` of them in a row average under `per_call` work, on
+/// either tier, and again once `window` of them average that. Work is the fuel a call burns: one
+/// unit per taken back edge and per call, its callees' included. `per_call` 0 tiers up every
+/// eligible call. [`temen_coop_reset_hotness`] restores the default.
 #[no_mangle]
-pub extern "C" fn temen_coop_set_tierup_floor(bytes: usize) {
-    COOP_TIERUP_FLOOR.store(bytes, std::sync::atomic::Ordering::Relaxed);
+pub extern "C" fn temen_coop_set_hotness(per_call: u32, window: u32) {
+    *COOP_HOTNESS.lock().unwrap_or_else(|e| e.into_inner()) = bytecode::Hotness {
+        per_call: per_call.into(),
+        window,
+    };
+}
+
+/// #2474 — the work the pending TIERUP's emitted call did, the fuel its code burned: call before
+/// [`temen_coop_deliver`].
+#[no_mangle]
+pub extern "C" fn temen_coop_set_emitted_work(work: u64) {
+    // SAFETY: single-threaded wasm; exclusive access to the session for this call.
+    if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() } {
+        s.run.set_emitted_work(work);
+    }
+}
+
+/// #2474 — restore the production [`COOP_HOTNESS`] after [`temen_coop_set_hotness`].
+#[no_mangle]
+pub extern "C" fn temen_coop_reset_hotness() {
+    *COOP_HOTNESS.lock().unwrap_or_else(|e| e.into_inner()) = COOP_HOT;
 }
 
 /// The cooperative tier-up **emit decision** for a guest module — everything [`temen_coop_open`]
 /// and the warm-coop open ([`temen_warm_coop_open`]) share before a run exists: the outlining, the
-/// B2/paged mode gates, the wasm emit, and the eligibility bitmap. Returned as one bundle so both
+/// B2/paged mode gates, the wasm emit, and what its tasks tier up into. Returned as one bundle so both
 /// opens use the SAME outlined module for both tiers (slot numbering must stay consistent between
 /// the emitted mask, the engine table, and the driver's shims). `Err(status)` on an unsupported
 /// shape (the caller falls back to its interpreter path).
 struct CoopEmit {
     /// The **outlined** module (#889) — the one BOTH tiers run: `CoopRun` interprets it, the
     /// emitted wasm's masks/table were built from it, the shim generator reads its `sigs`.
-    m: temen_ir::Module,
-    wasm: Vec<u8>,
-    eligible: Vec<bool>,
+    m: std::sync::Arc<temen_ir::Module>,
+    wasm: std::sync::Arc<[u8]>,
+    /// The functions the run's tasks tier up into ([`CoopEmit::program_emit`]).
+    eligible: std::sync::Arc<[bool]>,
+    /// The emit checks each access against the page-state table (#1009).
     paged: bool,
     all_shimmable: bool,
     table_log2: u8,
@@ -13055,7 +11266,94 @@ struct CoopEmit {
     spill: bool,
 }
 
-fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<CoopEmit, i32> {
+impl CoopEmit {
+    /// What the run's tasks tier up into, and when: [`COOP_HOTNESS`] as it is now, not as it was when
+    /// the emit was made.
+    fn program_emit(&self) -> bytecode::ProgramEmit {
+        program_emit(std::sync::Arc::clone(&self.eligible), self.paged)
+    }
+}
+
+/// #2503 — what a region emit ([`coop_emit_for`]) is made from: equal keys emit the same.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RegionKey {
+    /// The guest module's content digest ([`temen_interp::module_digest`]).
+    digest: [u8; 32],
+    shared: bool,
+    win_log2: u8,
+    parks: bool,
+    /// The emitter's function-size cap ([`temen_coop_set_emit_cap`]).
+    cap: usize,
+}
+
+/// The region emit the last open made or refused, by its key: a card's next Run opens the same
+/// program (#2503).
+type LastRegions = Option<(RegionKey, Result<std::sync::Arc<CoopEmit>, i32>)>;
+
+/// This engine's [`LastRegions`].
+static LAST_REGIONS: std::sync::Mutex<LastRegions> = std::sync::Mutex::new(None);
+
+/// How many region emits this engine has made rather than reused ([`temen_coop_region_emits`]).
+static REGION_EMITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether every function of `m` can take a bounce shim (scalar operands, arity ≤ the env
+/// scratch's slot count): what a B2 dispatch table needs to fill each slot an emitted `call.dyn`
+/// may reach.
+fn all_shimmable(m: &temen_ir::Module) -> bool {
+    let scalar = |t: &temen_ir::ValType| {
+        matches!(
+            t,
+            temen_ir::ValType::I32
+                | temen_ir::ValType::I64
+                | temen_ir::ValType::F32
+                | temen_ir::ValType::F64
+        )
+    };
+    // The cross-tier call scratch capacity (NOT the whole env cell — #1120 Slice 3 enlarged the cell
+    // with a separate group-edge region; the shimmable-arity gate stays tied to the call scratch).
+    let max_slots = temen_wasm_jit::XCALL_MAX_SLOTS;
+    m.funcs.iter().all(|f| {
+        f.params.iter().all(scalar)
+            && f.results.iter().all(scalar)
+            && f.params.len().max(f.results.len()) <= max_slots
+    })
+}
+
+/// What a coop run of `m0` tiers up into ([`emit_regions`]): the last open's, when that open made
+/// it from the same key ([`LAST_REGIONS`]).
+fn coop_emit_for(
+    m0: &temen_ir::Module,
+    shared: bool,
+    win_log2: u8,
+    parks: bool,
+) -> Result<std::sync::Arc<CoopEmit>, i32> {
+    let key = RegionKey {
+        digest: temen_interp::module_digest(m0),
+        shared,
+        win_log2,
+        parks,
+        cap: temen_wasm_jit::max_est_emitted_fn_bytes(),
+    };
+    let mut last = LAST_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, e)) = last.as_ref().filter(|(k, _)| *k == key) {
+        return e.clone();
+    }
+    // The last program goes before this one is made: the wasm heap never shrinks, so holding both
+    // would raise its high-water mark.
+    *last = None;
+    REGION_EMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let e = emit_regions(m0, shared, win_log2, parks).map(std::sync::Arc::new);
+    *last = Some((key, e.clone()));
+    e
+}
+
+/// [`coop_emit_for`] made anew.
+fn emit_regions(
+    m0: &temen_ir::Module,
+    shared: bool,
+    win_log2: u8,
+    parks: bool,
+) -> Result<CoopEmit, i32> {
     if onramp_check(m0).is_err() || m0.memory.is_none() {
         return Err(STATUS_UNSUPPORTED);
     }
@@ -13077,29 +11375,13 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
         mc.size_log2 = win_log2;
     }
     // #926 slice 2f — B2 vs non-B2 emit (#880's parity gate for the shared-table world).
-    // A guest whose every function has a shimmable signature (scalar operands, arity ≤ the env
-    // scratch's slot count) emits over the **shared reserved table** (Model B2): `call.dyn`-bearing
-    // functions tier up (the language-runtime dispatch-loop shape), their indirect calls reaching
-    // installed §22 units natively (old→new) and interpreter-resident targets through the live bounce.
-    // A non-shimmable guest (v128 / over-arity) emits in the old local-table mode, where a null
-    // shared-table slot can never diverge from the interpreter's dispatch. An unsupported shape declines.
-    let scalar = |t: &temen_ir::ValType| {
-        matches!(
-            t,
-            temen_ir::ValType::I32
-                | temen_ir::ValType::I64
-                | temen_ir::ValType::F32
-                | temen_ir::ValType::F64
-        )
-    };
-    // The cross-tier call scratch capacity (NOT the whole env cell — #1120 Slice 3 enlarged the cell
-    // with a separate group-edge region; the shimmable-arity gate stays tied to the call scratch).
-    let max_slots = temen_wasm_jit::XCALL_MAX_SLOTS;
-    let all_shimmable = m.funcs.iter().all(|f| {
-        f.params.iter().all(scalar)
-            && f.results.iter().all(scalar)
-            && f.params.len().max(f.results.len()) <= max_slots
-    });
+    // A guest whose every function has a shimmable signature emits over the **shared reserved
+    // table** (Model B2): `call.dyn`-bearing functions tier up (the language-runtime dispatch-loop
+    // shape), their indirect calls reaching installed §22 units natively (old→new) and
+    // interpreter-resident targets through the live bounce. A non-shimmable guest (v128 /
+    // over-arity) emits in the old local-table mode, where a null shared-table slot can never
+    // diverge from the interpreter's dispatch. An unsupported shape declines.
+    let all_shimmable = all_shimmable(&m);
     // #1009 M1: size the shared table to the guest (see `tierup_table_log2`), consistently across
     // the emit, the host's domain table, the slot mirror, the unit emitter, and the driver.
     let table_log2 = tierup_table_log2(m.funcs.len());
@@ -13121,6 +11403,9 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
     // #1627: a collecting guest emits over the shared table in spill mode instead of not at all.
     // The local-table fallback has no spill path, so it keeps #1546's veto.
     let spill = all_shimmable && m.funcs.iter().any(temen_ir::Func::uses_gc_roots);
+    // #2443: `parks` — the run's bounces can wait for their task (executor 2's), so a function that
+    // spawns, joins or waits can sit beneath one.
+    let host = temen_wasm_jit::BounceHost { spill, parks };
     let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
     let emitted_res = if paged {
         temen_wasm_jit::compile_module_tierup_b2_paged(
@@ -13128,40 +11413,32 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
             shared,
             table_log2 as u32,
             page_log2,
-            spill,
+            host,
         )
     } else if all_shimmable {
-        temen_wasm_jit::compile_module_tierup_b2(&emit_m, shared, table_log2 as u32, spill)
+        temen_wasm_jit::compile_module_tierup_b2(&emit_m, shared, table_log2 as u32, host)
     } else {
         temen_wasm_jit::compile_module_tierup(&emit_m, shared)
     };
     let Ok((wasm, emit)) = emitted_res else {
         return Err(STATUS_UNSUPPORTED);
     };
-    // A function is an **emittable leaf** iff the emitter emitted it with an all-i64 signature (the
-    // i64-slot transport the host marshals by) — exactly the single-vCPU gate. It actually **tiers
-    // up** only if it *also* clears the #1026 leaf tier-up size floor: below it, the interp↔wasm
-    // crossing per call costs more than so small an emitted body saves over interpreting it inline —
-    // a net loss on every dispatch-heavy card. A sub-floor leaf stays *emitted* (an emitted sibling
-    // still calls it natively, no crossing) — only the interpreter's decision to tier *up* into it is
-    // suppressed. Whole-program (no per-leaf crossing) and the `vm_jit_*` unit path (`jit_importer`
-    // below) are untouched.
-    let (emittable_leaf, eligible) = tierup_eligible(&m, &emit);
-    // #835/#926: a `vm_jit_*` importer stays worth opening even with no emittable leaf — its win is
-    // the runtime-compiled §22 units running emitted (the JACL macro-staging shape). A guest with
-    // neither an emittable leaf nor a jit importer has nothing for the emitted tier to ever run →
-    // decline (the plain interpreter serves it), exactly as before #1026 slice 4. A guest *with* an
-    // emittable leaf that the size floor gated still opens: coop runs it on its cooperative
-    // interpreter (measured faster than the plain fallback) with zero tier-ups — the "leaves off,
-    // same open" the #1026 bench compares, not a decline to the slower plain path.
+    // What the run's calls tier up into, and when: the hotness rule weighs each call's crossing
+    // against the work it does (#2474). Emitted code calls its emitted callees natively, whatever the
+    // rule says.
+    let eligible = tierup_eligible(&emit_m, &emit);
+    // #835/#926: a `vm_jit_*` importer stays worth opening even with no eligible function — its win
+    // is the runtime-compiled §22 units running emitted (the JACL macro-staging shape). A guest with
+    // neither has nothing for the emitted tier to ever run → decline (the plain interpreter serves
+    // it).
     let jit_importer = m.imports.iter().any(|im| im.name.starts_with("vm_jit_"));
-    if !emittable_leaf.iter().any(|&e| e) && !jit_importer {
+    if !eligible.contains(&true) && !jit_importer {
         return Err(STATUS_UNSUPPORTED);
     }
     Ok(CoopEmit {
-        m,
-        wasm,
-        eligible,
+        m: m.into(),
+        wasm: wasm.into(),
+        eligible: eligible.into(),
         paged,
         all_shimmable,
         table_log2,
@@ -13170,39 +11447,44 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
     })
 }
 
-/// The functions of `m` a coop run tiers up into, given what its emit emitted (`emit`): first those
-/// emitted with an all-`i64` signature, the emittable leaves; then those of them over the tier-up
-/// size floor (#1026), the eligible ones.
-fn tierup_eligible(m: &temen_ir::Module, emit: &[bool]) -> (Vec<bool>, Vec<bool>) {
+/// The functions of emitted module `m` a coop run tiers up into, given what its emit emitted
+/// (`emit`): those emitted with an all-`i64` signature, the slots a tier-up's operands and results
+/// travel in.
+fn tierup_eligible(m: &temen_ir::Module, emit: &[bool]) -> Vec<bool> {
     let all_i64 = |ts: &[temen_ir::ValType]| ts.iter().all(|t| *t == temen_ir::ValType::I64);
-    let floor = COOP_TIERUP_FLOOR.load(std::sync::atomic::Ordering::Relaxed);
-    let emittable_leaf: Vec<bool> = m
-        .funcs
+    m.funcs
         .iter()
-        .enumerate()
-        .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results))
-        .collect();
-    let eligible = m
-        .funcs
-        .iter()
-        .zip(&emittable_leaf)
-        .map(|(f, &leaf)| leaf && temen_wasm_jit::est_emitted_size(f) >= floor)
-        .collect();
-    (emittable_leaf, eligible)
+        .zip(emit)
+        .map(|(f, &e)| e && all_i64(&f.params) && all_i64(&f.results))
+        .collect()
+}
+
+/// What a coop run's tasks tier up into: the functions `eligible` makes so, when [`COOP_HOTNESS`]
+/// says, over a page-checked emit if `paged`.
+fn program_emit(eligible: std::sync::Arc<[bool]>, paged: bool) -> bytecode::ProgramEmit {
+    bytecode::ProgramEmit {
+        eligible,
+        page_checked: paged,
+        hot: coop_hotness(),
+    }
 }
 
 /// #2248 — a session's emitter for the granted modules its children run: it emits a module's
 /// functions for its children to tier up into ([`emit_module`]), and keeps the wasm under the
 /// module's program index in `programs`, where the driver finds it
-/// ([`temen_coop_program_wasm_ptr`]).
-pub(crate) fn module_emitter(programs: Programs, shared: bool) -> bytecode::ModuleEmitter {
+/// ([`temen_coop_program_wasm_ptr`]). `parks`: the run's bounces can wait for their task (#2443).
+pub(crate) fn module_emitter(
+    programs: Programs,
+    shared: bool,
+    parks: bool,
+) -> bytecode::ModuleEmitter {
     std::sync::Arc::new(move |o: &bytecode::ModuleOffer| {
-        let (wasm, emit) = emit_module(o.image, shared)?;
+        let (wasm, emit) = emit_module(o.image, shared, parks)?;
         let key = EmitKey {
             digest: o.digest,
             entry: 0,
             leaf: false,
-            parks: false,
+            parks,
             paged: emit.page_checked,
             shared,
         };
@@ -13225,21 +11507,19 @@ pub(crate) fn module_emitter(programs: Programs, shared: bool) -> bytecode::Modu
 fn emit_module(
     m: &temen_ir::Module,
     shared: bool,
+    parks: bool,
 ) -> Option<(std::sync::Arc<[u8]>, bytecode::ProgramEmit)> {
     m.memory?;
-    let paged = m.data.iter().any(|d| d.readonly)
-        || temen_wasm_jit::module_uses_addr_space_page_ops(m);
+    let paged =
+        m.data.iter().any(|d| d.readonly) || temen_wasm_jit::module_uses_addr_space_page_ops(m);
     let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
+    let page_log2 = paged.then_some(page_log2);
     let (wasm, emit) =
-        temen_wasm_jit::compile_module_tierup_live(m, shared, paged.then_some(page_log2)).ok()?;
-    let (_, eligible) = tierup_eligible(m, &emit);
-    eligible.contains(&true).then(|| {
-        let emit = bytecode::ProgramEmit {
-            eligible: eligible.into(),
-            page_checked: paged,
-        };
-        (wasm.into(), emit)
-    })
+        temen_wasm_jit::compile_module_tierup_live(m, shared, page_log2, parks).ok()?;
+    let eligible = tierup_eligible(m, &emit);
+    eligible
+        .contains(&true)
+        .then(|| (wasm.into(), program_emit(eligible.into(), paged)))
 }
 
 /// `temen_coop_open`'s `leaf`: no root leaf — the run tiers up regions of its own emit only.
@@ -13424,31 +11704,22 @@ pub extern "C" fn temen_coop_open(
             }
         };
     }
-    let CoopEmit {
-        m,
-        wasm,
-        eligible,
-        paged,
-        all_shimmable,
-        table_log2,
-        jit_importer,
-        spill,
-    } = match coop_emit_for(&m0, shared != 0, win_log2) {
+    let e = match coop_emit_for(&m0, shared != 0, win_log2, false) {
         Ok(e) => e,
         Err(status) => {
             set(status);
             return -status;
         }
     };
-    let (mut host, frame) = host_for(&m);
+    let (mut host, frame) = host_for(&e.m);
     // #926 slice 2f: a B2 main module masks `call.dyn` against `1 << table_log2` (#1009 M1: the
     // guest's effective size), so the engine's dispatch table must be the same size — a natural-size
     // table would number install slots and wrap wild indices differently (#846/#880). `CoopRun` builds
     // the domain with `host.jit_table_log2()`, so force it here (a `vm_jit_*` importer's
     // `grant_onramp_caps` already set it to the floor; `set_jit_table_log2` takes the max, so this
     // raises it to the guest's size).
-    if all_shimmable {
-        host.set_jit_table_log2(table_log2);
+    if e.all_shimmable {
+        host.set_jit_table_log2(e.table_log2);
     }
     // #926 slice 2e/2f: arm the §22 unit wasm-emitter for a `vm_jit_*` importer so its runtime-compiled
     // units run emitted (the pump then surfaces a `CoopEvent::JitInvoke` when a unit has emitted wasm;
@@ -13459,24 +11730,18 @@ pub extern "C" fn temen_coop_open(
     // Reuses the single-vCPU emitter and its shared parameters — only one driver runs at a time.
     TIERUP_UNIT_SHARED.store(shared != 0, std::sync::atomic::Ordering::Relaxed);
     TIERUP_UNIT_WIN_LOG2.store(win_log2, std::sync::atomic::Ordering::Relaxed);
-    TIERUP_UNIT_TABLE_LOG2.store(table_log2, std::sync::atomic::Ordering::Relaxed);
-    if jit_importer && all_shimmable {
+    TIERUP_UNIT_TABLE_LOG2.store(e.table_log2, std::sync::atomic::Ordering::Relaxed);
+    if e.jit_importer && e.all_shimmable {
         host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
     }
     // #2248: the granted modules this run's children run are emitted as it meets them.
     let programs = Programs::default();
     let tierup = bytecode::TierUpConfig {
-        root: bytecode::ProgramEmit {
-            eligible: std::sync::Arc::from(eligible.into_boxed_slice()),
-            // #1009 paged: the vCPUs skip the scalar decline — the per-event page-state table
-            // carries the fidelity `scalar_extent` cannot (matching the pump's
-            // `with_jit_page_checked`).
-            page_checked: paged,
-        },
+        root: e.program_emit(),
         leaf: None,
-        modules: Some(module_emitter(programs.clone(), shared != 0)),
+        modules: Some(module_emitter(programs.clone(), shared != 0, false)),
     };
-    let run = match open_run(&m, host, Some(tierup)) {
+    let run = match open_run(&e.m, host, Some(tierup)) {
         Some(Ok(r)) => r,
         Some(Err(_)) => {
             set(STATUS_TRAP);
@@ -13492,15 +11757,18 @@ pub extern "C" fn temen_coop_open(
         programs,
         caps: caps.clone(),
         requests: requests.clone(),
-        emitted_wasm: wasm.into(),
-        sigs: m
+        emitted_wasm: std::sync::Arc::clone(&e.wasm),
+        sigs: e
+            .m
             .funcs
             .iter()
             .map(|f| (f.params.clone(), f.results.clone()))
             .collect(),
         frame,
-        paged,
-        spill: spill_region(spill),
+        // #1009 paged: the vCPUs skip the scalar decline — the per-event page-state table carries
+        // the fidelity `scalar_extent` cannot, as on the pump.
+        paged: e.paged,
+        spill: spill_region(e.spill),
         ..CoopTierupRun::over(run)
     })
 }
@@ -13683,7 +11951,7 @@ pub extern "C" fn temen_coop_cap_ptr() -> *const i64 {
     unsafe { (*core::ptr::addr_of!(CAP_REQUEST)).as_ptr() }
 }
 
-/// #1954: answer the host-completed cap call the run is parked on: `value` is the call's result.
+/// #1954: answer the host-answered cap call `id` the run filed: `value` is the call's result.
 /// Returns `1`, or `0` if no call is outstanding on `id` (or no session is open). Then pump again —
 /// a leaf whose call parked comes back as [`COOP_RUN_RESUME`].
 #[no_mangle]
@@ -13692,13 +11960,15 @@ pub extern "C" fn temen_coop_deliver_cap(id: u64, value: i64) -> i32 {
     let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }) else {
         return 0;
     };
-    if !s.run.deliver_cap(id, value) {
-        return 0;
-    }
-    s.requests
+    let request = s
+        .requests
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&id);
+    let Some(request) = request else {
+        return 0;
+    };
+    request.completer.complete(value);
     // SAFETY: as above.
     unsafe { (*core::ptr::addr_of_mut!(CAP_REQUEST)).clear() };
     1
@@ -13846,6 +12116,13 @@ pub extern "C" fn temen_coop_leaf_emits() -> u32 {
     EMITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// #2503: how many region emits ([`coop_emit_for`]) this engine has made rather than reused: what a
+/// driver's tests count to see a Run of the same program reuse its emit.
+#[no_mangle]
+pub extern "C" fn temen_coop_region_emits() -> u32 {
+    REGION_EMITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod emitted_cache_tests {
     use super::*;
@@ -13982,8 +12259,8 @@ pub extern "C" fn temen_coop_win_len() -> usize {
 
 /// #816 env-routed tier-up: the **pending event's** window base — the emitted `f{i}`s' `win` arg
 /// for the tier-up / JIT_INVOKE currently being serviced. For a root-env task this equals
-/// [`temen_coop_win_ptr`]; for a §14 confined child it is the backing plus the child's carve
-/// offset, so the emitted accesses land exactly where the interpreter's confined accesses do.
+/// [`temen_coop_win_ptr`]; for a §14 child it is the base of the child's own window, so the emitted
+/// accesses land exactly where the interpreter's do.
 /// Read it **per event** (the JS driver's per-call `win`), never cached across events. Falls back
 /// to the root window if no round-trip is pending (defensive; the driver only reads it inside one).
 #[no_mangle]
@@ -13996,7 +12273,7 @@ pub extern "C" fn temen_coop_tierup_win_ptr() -> *const u8 {
 }
 
 /// #816: the pending event's window byte length (the span [`temen_coop_tierup_win_ptr`] addresses —
-/// the child carve size for a confined child's event, the run window otherwise).
+/// a child's own window for a child's event, the run window otherwise).
 #[no_mangle]
 pub extern "C" fn temen_coop_tierup_win_len() -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| {
@@ -14358,41 +12635,14 @@ pub extern "C" fn temen_coop_close() {
 
 #[cfg(test)]
 mod path1_jit_over_host_tests {
-    //! #1025 Path 1 — the engine primitive for an **emitted nested child**:
-    //! [`JitOnrampRun::open_shared_run_over_host`] runs a guest's emitted `_start` over a
-    //! **caller-provided granted powerbox** (the host an op-13 parent marshals across the
-    //! `env.instantiate_module` bounce). This proves the caller's host is wired into the reactor
-    //! cross-tier bounce ([`JitOnrampRun::run_cross_tier`] → `run_over(&mut self.host)`), so a child's
-    //! `call.cap` leaf (an `fs`) resolves over the granted host — without needing the JS emitted driver
-    //! (the bounce seam is exercised directly, exactly what an emitted `f0` reaching a cross-tier leaf does).
+    //! #1025 Path 1 — a detached child's run over the powerbox its spawn built: the op-13 servicer
+    //! opens the child's run with [`RunInput::PreGranted`], and the child's `call.cap` leaves resolve
+    //! over that host on the reactor cross-tier bounce ([`JitOnrampRun::run_cross_tier`] →
+    //! `run_over(&mut self.host)`). The bounce seam is driven directly, without the JS emitted
+    //! driver: exactly what an emitted `f0` reaching a cross-tier leaf does.
     use super::*;
     use std::sync::{Arc, Mutex};
-    use temen_interp::{ForkedProc, HostProc};
-
-    // f0 (emitted) = 40 + f1(); f1 (cross-tier leaf) seeds "fs" (0x7366 LE), resolves it, calls the
-    // granted HOST_PROC counter, returns its post-increment result.
-    const CHILD: &str = r#"memory 12
-func () -> (i64) {
-block 0 () {
-  v40 = i64.const 40
-  vcap = call 1 ()
-  vr = i64.add v40 vcap
-  return vr
-  }
-}
-func () -> (i64) {
-block 0 () {
-  vname = i64.const 29542
-  vzero = i64.const 0
-  i64.store vzero vname
-  vp0 = i64.const 0
-  vl2 = i64.const 2
-  vh = self.resolve vp0 vl2
-  vr = call.cap 13 0 (i64) -> (i64) vh (vp0)
-  return vr
-  }
-}
-"#;
+    use temen_interp::{ForkedProc, HostProc, Lease, WINDOW_RUNS};
 
     // Two distinct caps marshaled together (two forkable counters "fs" + "ax"). f0 = f1() + f2(); f1
     // resolves "fs" (0x7366), f2 resolves "ax" (0x7861), each calls its granted HOST_PROC — proving
@@ -14444,14 +12694,14 @@ block 0 () {
         let c2 = Arc::clone(&counter);
         let fork = Arc::new(move |_pid: u64| {
             let c = Arc::clone(&c2);
-            ForkedProc::shared(
+            Some(ForkedProc::shared(
                 Box::new(move |_op, _a, _m, _| {
                     let mut c = c.lock().unwrap();
                     *c += 1;
                     Ok(vec![*c])
                 }),
                 temen_interp::CapState::Uncaptured,
-            )
+            ))
         });
         // A counter the guest reads back, which nothing serializes (#1699).
         let h = host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Uncaptured);
@@ -14459,146 +12709,12 @@ block 0 () {
         counter
     }
 
-    fn granted_fs_host() -> (Host, Arc<Mutex<i64>>) {
-        let counter = Arc::new(Mutex::new(0i64));
-        let mut host = Host::new();
-        let c1 = Arc::clone(&counter);
-        let handler: HostProc = Box::new(move |_op, _a, _m, _| {
-            let mut c = c1.lock().unwrap();
-            *c += 1;
-            Ok(vec![*c])
-        });
-        let c2 = Arc::clone(&counter);
-        let fork = Arc::new(move |_pid: u64| {
-            let c = Arc::clone(&c2);
-            ForkedProc::shared(
-                Box::new(move |_op, _a, _m, _| {
-                    let mut c = c.lock().unwrap();
-                    *c += 1;
-                    Ok(vec![*c])
-                }),
-                temen_interp::CapState::Uncaptured,
-            )
-        });
-        // A counter the guest reads back, which nothing serializes (#1699).
-        let h = host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Uncaptured);
-        host.register_cap_name("fs", h);
-        (host, counter)
-    }
-
     #[test]
-    fn jit_run_over_a_marshaled_granted_host_resolves_the_cap() {
-        let m = temen_text::parse_module(CHILD).expect("parse");
-        temen_verify::verify_module(&m).expect("verify");
-        let (host, counter) = granted_fs_host();
-
-        let win_log2 = 12u8;
-        let win_size = 1u64 << win_log2;
-        let mut backing = vec![0u8; win_size as usize];
-        let win_ptr = backing.as_mut_ptr();
-        // SAFETY: `backing` outlives `run` (dropped first, reverse declaration order); it is this run's
-        // sole window and never moves.
-        let mut run = unsafe {
-            JitOnrampRun::open_shared_run_over_host(
-                &m,
-                win_ptr,
-                win_size,
-                win_log2,
-                false,
-                host,
-                Vec::new(),
-                0,
-                0,
-                None,
-            )
-        }
-        .expect("open a JIT run over the caller-provided granted host");
-        // The emitted `f0` reaches its `call.cap` leaf `f1` via `run_cross_tier` — drive that seam
-        // directly (no JS emitted driver needed to prove the host is carried into the bounce).
-        let r = run
-            .run_cross_tier(1, &[])
-            .expect("the cross-tier leaf runs over the granted host");
-        assert_eq!(
-            r.first(),
-            Some(&Value::I64(1)),
-            "the granted `fs` returned its post-increment count (1)"
-        );
-        assert_eq!(
-            *counter.lock().unwrap(),
-            1,
-            "the marshaled `fs` cap resolved + ran inside the JIT run's cross-tier bounce"
-        );
-        drop(run);
-    }
-
-    #[test]
-    fn owned_window_jit_run_over_a_granted_host_runs_the_whole_child() {
-        // The owned-window twin (`open_owned_run_over_host`, the browser op-13 servicer's constructor).
-        // Drive the whole child `f0` (not just the leaf) as the interpreter oracle over the granted host —
-        // `40 + fs()` = 41, the exact value the JS-driven emitted `f0` returns (tier parity, INVARIANTS §9).
-        let m = temen_text::parse_module(CHILD).expect("parse");
-        temen_verify::verify_module(&m).expect("verify");
-        let (host, counter) = granted_fs_host();
-        let mut run = JitOnrampRun::open_owned_run_over_host(&m, 12, false, host, Vec::new())
-            .expect("open an owned JIT run over the granted host");
-        let r = run
-            .run_cross_tier(0, &[])
-            .expect("child f0 runs over the granted host");
-        assert_eq!(
-            r.first(),
-            Some(&Value::I64(41)),
-            "child f0 = 40 + granted fs() = 41 over the caller-provided powerbox"
-        );
-        assert_eq!(
-            *counter.lock().unwrap(),
-            1,
-            "the granted fs ran exactly once"
-        );
-    }
-
-    #[test]
-    fn primitive_consumes_a_host_from_the_op13_marshal() {
-        // The composition the browser op-13 servicer performs: the child's powerbox is **marshaled** from a
-        // parent's grant records (`spawn_named_child_from_window`, #1025 slice 3a), then handed to the JIT
-        // run primitive — not a hand-built host. The child resolves the marshaled `fs` and computes 41.
-        let m = temen_text::parse_module(CHILD).expect("parse");
-        temen_verify::verify_module(&m).expect("verify");
-
-        // A parent powerbox holding the grantable `fs`, and a window with one grant record naming it.
-        let (mut parent, counter) = granted_fs_host();
-        let fs_handle = parent.resolve_cap_name("fs").expect("parent holds fs");
-        let mut window = vec![0u8; 256];
-        // record at 32: {name_off=64, name_len=2, handle=fs_handle, flags=0}; name "fs" at 64.
-        window[32..36].copy_from_slice(&64u32.to_le_bytes());
-        window[36..40].copy_from_slice(&2u32.to_le_bytes());
-        window[40..44].copy_from_slice(&fs_handle.to_le_bytes());
-        window[64..66].copy_from_slice(b"fs");
-        let (child_host, _inst, _as) = parent
-            .spawn_named_child_from_window(&window, 32, 1, 1 << 12)
-            .expect("marshal the grant list into a child powerbox");
-
-        let mut run = JitOnrampRun::open_owned_run_over_host(&m, 12, false, child_host, Vec::new())
-            .expect("open a JIT run over the *marshaled* granted host");
-        let r = run
-            .run_cross_tier(0, &[])
-            .expect("child f0 runs over the marshaled host");
-        assert_eq!(
-            r.first(),
-            Some(&Value::I64(41)),
-            "child resolved the *marshaled* fs (marshal -> primitive -> resolve, the op-13 servicer flow)"
-        );
-        assert_eq!(
-            *counter.lock().unwrap(),
-            1,
-            "the marshaled fs shares the parent's provider state (ticked once)"
-        );
-    }
-
-    #[test]
-    fn primitive_resolves_multiple_marshaled_caps() {
-        // A child can hold several caps; prove the primitive resolves **multiple distinct**
-        // marshaled caps. A parent grants two ("fs", "ax"); a two-record grant list marshals both into the
-        // child powerbox; the child resolves each and calls it — f0 = fs() + ax() = 2, both counters tick.
+    fn a_detached_childs_run_resolves_each_marshaled_cap() {
+        // The composition the op-13 servicer performs: the child's powerbox is marshaled from the
+        // parent's grant records (`read_grant_records`, every spawn's reader) by the detached builder
+        // (`Host::spawn_detached_child`), then handed to the child's run over its own window. The child
+        // resolves each cap and calls it: f0 = fs() + ax() = 2, and both counters tick.
         let m = temen_text::parse_module(CHILD_TWO_CAPS).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
 
@@ -14620,11 +12736,31 @@ block 0 () {
         rec(0, 96, b"fs", h_fs);
         rec(1, 100, b"ax", h_ax);
 
+        let grants =
+            temen_interp::read_grant_records(32, 2, |o, l| temen_interp::read_slice(&window, o, l))
+                .expect("both records are in the window");
+        let lease = Lease {
+            budget: parent.grant_budget(-1, 1 << 20, -1),
+            bytes: 1 << 12,
+            runs: WINDOW_RUNS,
+        };
         let (child_host, _i, _a) = parent
-            .spawn_named_child_from_window(&window, 32, 2, 1 << 12)
+            .spawn_detached_child(&grants, 1 << 12, lease, -1, false)
             .expect("marshal a two-cap grant list");
-        let mut run = JitOnrampRun::open_owned_run_over_host(&m, 12, false, child_host, Vec::new())
-            .expect("open over the two-cap marshaled host");
+        let (back, _) = mint_detached_backing(1 << 12).expect("a native child window");
+        let mut run = JitOnrampRun::open_detached_run(
+            &m,
+            Arc::new(back),
+            false,
+            RunInput::PreGranted {
+                host: Box::new(child_host),
+                init_mem: Vec::new(),
+                entry_inst: 0,
+                entry_as: 0,
+            },
+            None,
+        )
+        .expect("open the child's run over its marshaled host");
         let r = run
             .run_cross_tier(0, &[])
             .expect("child f0 runs over the marshaled host");
@@ -14689,10 +12825,13 @@ block 0 () {
 // A detached child's window on the wasm-JIT tier is its own `WebAssembly.Memory`, which this cdylib
 // cannot address (its pointers are offsets into ITS one linear memory). `temen_mem::Region::Foreign`
 // reaches such a memory through a `ForeignOps` table; here the table is the page's
-// `temen_host.foreign_*` imports (`web/foreign-mem.js`), all-`u32` (offsets are bounded by `Region`
-// first, and a child memory is < 4 GiB by wasm32 construction; atomics pass operands through a 16-byte
-// cell in this memory so no `i64`/BigInt crosses the import). Threads build only (the plain build has
-// no Workers and no detached children, and stays import-free for its Node harnesses).
+// `temen_host.foreign_*` imports (`web/foreign-mem.js`), with `u32` offsets (they are bounded by
+// `Region` first, and a child memory is < 4 GiB by wasm32 construction). A byte or word access
+// (`foreign_load`/`foreign_store`) is bound to wasm, an accessor instance over the child's memory
+// (#2416), so it calls no JavaScript and its value comes back in a register. The span copies, fill,
+// copy, atomics and grow are JS functions; atomics pass their operands through a 16-byte cell in this
+// memory, so no `i64` (a BigInt) crosses into JavaScript. Threads build only (the plain build has no
+// Workers and no detached children, and stays import-free for its Node harnesses).
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 mod foreign_mem {
     use temen_mem::ForeignOps;
@@ -14701,6 +12840,8 @@ mod foreign_mem {
     extern "C" {
         fn foreign_read(id: u32, off: u32, dst: *mut u8, len: u32);
         fn foreign_write(id: u32, off: u32, src: *const u8, len: u32);
+        fn foreign_load(id: u32, off: u32, width: u32) -> i64;
+        fn foreign_store(id: u32, off: u32, width: u32, val: i64);
         fn foreign_fill(id: u32, off: u32, len: u32, b: u32);
         fn foreign_copy(id: u32, dst: u32, src: u32, len: u32);
         fn foreign_atomic(id: u32, kind: u32, off: u32, width: u32, ab: *mut u8);
@@ -14727,6 +12868,14 @@ mod foreign_mem {
     fn write(id: u32, off: u64, data: &[u8]) {
         // SAFETY: `data` is a live cdylib buffer; JS reads exactly `data.len()` bytes from it.
         unsafe { foreign_write(id, off as u32, data.as_ptr(), data.len() as u32) }
+    }
+    fn load(id: u32, off: u64, width: u32) -> u64 {
+        // SAFETY: no cdylib memory is touched; the word comes back in a register.
+        unsafe { foreign_load(id, off as u32, width) as u64 }
+    }
+    fn store(id: u32, off: u64, width: u32, val: u64) {
+        // SAFETY: no cdylib memory is touched.
+        unsafe { foreign_store(id, off as u32, width, val as i64) }
     }
     fn fill(id: u32, off: u64, len: u64, b: u8) {
         // SAFETY: no cdylib memory is touched.
@@ -14755,6 +12904,8 @@ mod foreign_mem {
     pub static OPS: ForeignOps = ForeignOps {
         read,
         write,
+        load,
+        store,
         fill,
         copy_within,
         atomic,
@@ -14763,12 +12914,20 @@ mod foreign_mem {
 }
 
 /// The host header at the bottom of a detached child's memory (#1285): one wasm page holding the
-/// emitted tier's `env` bounce cell (at 0) and, for a paged run, its `pagestate` table (at
-/// [`DETACHED_PAGESTATE_OFF`]). The guest window starts here (`win`), so the header is unreachable by
-/// the guest (spans are bounded by `"mapped"` before `win` is added) and never moves on `memory.grow`.
+/// contexts its emitted code runs in ([`DETACHED_CONTEXTS`], from 0) and, for a paged run, its
+/// `pagestate` table (at [`DETACHED_PAGESTATE_OFF`]). The guest window starts here (`win`), so the
+/// header is unreachable by the guest (spans are bounded by `"mapped"` before `win` is added) and
+/// never moves on `memory.grow`.
 pub const DETACHED_HEADER_BYTES: u64 = 65536;
-/// Where the paged run's page-state table lives inside the header (after the `env` cell).
-pub const DETACHED_PAGESTATE_OFF: u64 = 4096;
+/// The bytes of a context in a detached child's header: an env cell and its call scratch
+/// (`temen_wasmjit_env_bytes`), which a task running emitted code over the child's memory uses. The
+/// header holds [`DETACHED_CONTEXTS`] of them, from its start, then its page-state table (#1414 ED-2).
+pub const DETACHED_CONTEXT_BYTES: u64 = 4096;
+/// How many tasks of a detached child can run emitted code at once: its root task. Its threads
+/// interpret (#1414 ED-2).
+pub const DETACHED_CONTEXTS: u64 = 1;
+/// Where the paged run's page-state table lives inside the header: after the contexts.
+pub const DETACHED_PAGESTATE_OFF: u64 = DETACHED_CONTEXTS * DETACHED_CONTEXT_BYTES;
 /// The default `maximum` of a minted detached child memory (its guest window, excluding the header),
 /// and the byte quota the op-13 loop's `WindowMinter` carries: 1 GiB, the engine's own ceiling. V8
 /// reserves a shared memory's `maximum` as address space, so this bounds per-child reservation; the
@@ -15084,7 +13243,7 @@ int main(void) {
                 bytecode::CoopEvent::CapPark { id } => {
                     parks += 1;
                     let req = requests.lock().unwrap().remove(&id).expect("filed");
-                    assert!(run.deliver_cap(id, 2 * req.args[0] + 1));
+                    req.completer.complete(2 * req.args[0] + 1);
                 }
                 bytecode::CoopEvent::Done(v) => break Ok(v),
                 bytecode::CoopEvent::Trapped(t) => break Err(t),

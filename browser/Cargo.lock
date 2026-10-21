@@ -196,6 +196,7 @@ dependencies = [
  "temen-verify",
  "temen-wasm-jit",
  "wasmi",
+ "wat",
 ]
 
 [[package]]
@@ -235,6 +236,7 @@ dependencies = [
 name = "temen-interp"
 version = "0.0.0"
 dependencies = [
+ "libm",
  "page_size",
  "temen-encode",
  "temen-ir",

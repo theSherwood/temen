@@ -432,7 +432,8 @@ fn source_location_and_named_vars_at_a_breakpoint() {
         Some(SourceLoc {
             file: "sum.c".into(),
             line: 7,
-            col: 5
+            col: 5,
+            library: false,
         })
     );
     // The backtrace frame carries the source location too.

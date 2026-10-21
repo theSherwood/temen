@@ -237,7 +237,7 @@ impl WebGpuState {
 /// The `webgpu` capability: grant it under a name (e.g. `"webgpu"`) and the guest reaches it via
 /// `__vm_cap_resolve("webgpu")` + `__vm_host_call`. Each host builds a fresh GPU context on first use.
 pub fn webgpu_cap() -> HostCap {
-    HostCap::host_proc(0, |_| {
+    HostCap::host_proc(0, |_, _| {
         let mut st = WebGpuState::default();
         let h: temen_interp::HostProc = Box::new(
             move |op: u32,
@@ -247,7 +247,7 @@ pub fn webgpu_cap() -> HostCap {
                   -> Result<Vec<i64>, Trap> { Ok(vec![st.handle(op, args, mem)]) },
         );
         // The guest's buffers and pipelines live on the GPU, which nothing here serializes (#1699).
-        (h, temen_interp::CapState::Uncaptured)
+        Some((h, temen_interp::CapState::Uncaptured))
     })
 }
 

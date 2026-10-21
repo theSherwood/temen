@@ -769,7 +769,7 @@ them to a `temen_posix` personality: files, processes, pipes and a working direc
 host. nimony's own build links there (`temen-link`). The **capability edge** gives a program the host's
 streams for fd 0, 1 and 2 and its `exit`, and nothing ambient: files, processes and the environment
 fail closed on the shim's stubs, so nim raises `IOError` or `OSError`. It is for a host with no
-POSIX, such as a capability OS, and `temen-link --edge:caps` builds for it; `nim_hello` is its demo.
+POSIX, such as a capability OS, and `temen-link --edge:caps` builds for it.
 The two share the compute shim, the heap hook and the guest libc, whose streams and exit each edge
 serves. The corpus runs every case on both.
 
@@ -955,8 +955,8 @@ start a thread?** A nim program gets a second vCPU in its window only through th
 
 **It cannot: a `tvar` is a plain global.** A program with one thread has one instance of each
 thread-local, so a global *is* it. This is every program that does not import `std/rawthreads`,
-directly or through `std/threadpool` or `std/parfor`: nimony's own tools and the nim card's programs
-among them. They pay nothing for threads.
+directly or through `std/threadpool` or `std/parfor`: nimony's own tools among them, and every program
+in the nim card's dropdown but Threads. They pay nothing for threads.
 
 **It can: a `tvar` is a thread-local in the IR's sense** (#1715), the class C's `_Thread_local`
 uses:
@@ -985,14 +985,14 @@ condition variable over `syscall(SYS_futex, …)`. The shim's `syscall` (row 58)
 **The CPU count.** `sysconf(_SC_NPROCESSORS_ONLN)` (and `_CONF`) answers `self.parallelism`: how
 many vCPUs the driver running the domain can run at once, bounded by its lane cap (D66). That is the
 host's worker count on the tree-walker and the JIT, 1 on the bytecode engine, whose driver runs every
-vCPU on one thread, and the page's core count under the browser's per-Worker driver (#2254).
+vCPU on one thread, and the page's core count under the browser's parallel driver (#2254).
 `std/cpuinfo` asks `sched_getaffinity` first, which reports nothing here, and falls back to it, so
 `initPool()` starts `max(1, n - 1)` workers.
 
 **Sleeping.** `nanosleep` is a timed wait (the shim's row 47), so an idle pool worker naps between
 polls rather than spins. The threaded engines sleep in real time. The bytecode engine's cooperative
-scheduler sleeps on its logical clock, which moves with the other threads' work, one ns per op, and
-jumps ahead when none can run (#2224).
+scheduler sleeps on its logical clock, which moves with the other threads' work, one ns per op
+(#2224), and in real time when none can run (#1979).
 
 **What is not served.**
 - CPU affinity is a no-op.

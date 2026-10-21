@@ -4,7 +4,7 @@
  * Per-child attenuation is the grant list: a parent narrows handles in its own table first
  * (`AddressSpace.sub`, `Budget.split`, an exported wrapper) and lists a different subset for each
  * child — the child's powerbox is exactly what it is handed here (DESIGN.md §3c "Attenuation needs
- * no new IR"). This file only removes the byte-laying: the 88-byte record (`temen_ir::SpawnRec`) and
+ * no new IR"). This file only removes the byte-laying: the 64-byte record (`temen_ir::SpawnRec`) and
  * the `{name_off, name_len, handle, flags}` grant records that every C consumer used to write by hand.
  *
  * Reaches the Instantiator through two frontend builtins (`__vm_instantiate_rec` = op 17,
@@ -12,23 +12,15 @@
  * reaches its seam only through a static `call.cap`) on the handle the guest discovers itself via
  * `cap.self` reflection — no new IR op.
  *
- * Record contract (little-endian, window-relative pointers; fails closed on any other layout) — the
- * v1 **detached** record (#1863): the child gets a window of its own, funded by a `Budget`:
- *   { version: u32 = 1, entry: u32 = 0, off: u64 = 0 (reserved), size_log2: u32, pager: u32 = MAX,
- *     module: i32 (a granted Module), budget: i32 (Budget handle), quota: i64,
- *     grants_ptr: u64, grants_n: u64, args_ptr: u64, args_len: u64,
- *     region: i32 = -1 (none), reserved: u32 = 0, child_off: u64 = 0 }
- * followed here by `n` × 16-byte grant records. `scratch` must be 8-byte aligned and hold
- * `88 + 16 * n` bytes; the names are referenced in place (window pointers), not copied.
+ * The record is `<temen.h>`'s `struct vm_spawn_rec` (the **detached** spawn record, #1863: the child
+ * gets a window of its own, funded by a `Budget`), followed here by `n` × 16-byte grant records.
+ * `scratch` must be 8-byte aligned and hold `88 + 16 * n` bytes; the names are referenced in place
+ * (window pointers), not copied.
  *
- * Self-contained (freestanding, own externs) for the chibicc harnesses; every helper is
- * `static inline` so the frontend's dead-code pass drops what a program never calls.
+ * Freestanding (no libc headers) for the chibicc harnesses; every helper is `static inline` so the
+ * frontend's dead-code pass drops what a program never calls.
  */
-
-long __vm_instantiate_rec(int inst, long rec);    /* Instantiator op 17 -> child handle | -errno */
-long __vm_instantiate_join(int inst, long child); /* Instantiator op 1 -> the child's entry result */
-int __vm_cap_count(void);
-int __vm_cap_at(int i, int *type_id_out);
+#include <temen.h>
 
 /* One named grant: the child resolves `name` (`self.resolve` / a named import) to a re-grant of the
  * parent's `handle`. The handle must be one this domain holds and that the host can re-grant
@@ -40,9 +32,6 @@ int __vm_cap_at(int i, int *type_id_out);
  * parent leaves out on purpose. `name` may also be `*` (every import nothing else satisfies) or a
  * prefix ending in `*`, and only an empty grant may use one (#2219). A child built against the
  * playground libc that uses stdio imports `vm_fs` and `stderr`: grant them, or leave them empty. */
-#ifndef VM_EMPTY
-#define VM_EMPTY (-0x40000000) /* 0xC000_0000, temen_interp::GRANT_EMPTY */
-#endif
 typedef struct {
   char *name;
   int handle;
@@ -89,34 +78,30 @@ static inline int vm_budget_of_(void) {
  * The child starts immediately; `vm_join` collects it. */
 static inline long vm_spawn(long module, long size_log2, vm_grant *grants, long n, void *args,
                             long args_len, void *scratch) {
-  int *w = (int *)scratch;
-  long *q = (long *)scratch;
-  w[0] = 1;                /* version: the detached record */
-  w[1] = 0;                /* @4 entry: the child's function 0 */
-  q[1] = 0;                /* @8 off: reserved */
-  w[4] = (int)size_log2;   /* @16 */
-  w[5] = -1;               /* @20 pager: u32::MAX = none */
-  w[6] = (int)module;      /* @24 */
-  w[7] = vm_budget_of_();  /* @28 the Budget the window spends */
-  q[4] = 0;                /* @32 quota: retired, must be 0 */
-  int *g = (int *)((char *)scratch + 88);
+  struct vm_spawn_rec init = VM_SPAWN_REC_INIT;
+  struct vm_spawn_rec *r = (struct vm_spawn_rec *)scratch;
+  *r = init;
+  r->size_log2 = (unsigned int)size_log2;
+  r->module = (int)module;
+  r->budget = vm_budget_of_(); /* the Budget the window spends */
+  int *g = (int *)((char *)scratch + sizeof(struct vm_spawn_rec));
   for (long i = 0; i < n; i = i + 1) {
     g[i * 4 + 0] = (int)(long)grants[i].name;
     g[i * 4 + 1] = (int)vm_strlen_(grants[i].name);
     g[i * 4 + 2] = grants[i].handle;
     g[i * 4 + 3] = 0; /* flags: reserved */
   }
-  q[5] = (long)g;          /* @40 */
-  q[6] = n;                /* @48 */
-  q[7] = (long)args;       /* @56 */
-  q[8] = args_len;         /* @64 */
-  w[18] = -1;              /* @72 region: none */
-  w[19] = 0;               /* @76 reserved */
-  q[10] = 0;               /* @80 child_off */
-  return __vm_instantiate_rec(vm_instantiator_(), (long)scratch);
+  r->grants_ptr = (long)g;
+  r->grants_n = n;
+  r->args_ptr = (long)args;
+  r->args_len = args_len;
+  return __vm_instantiate_rec(vm_instantiator_(), (long)r);
 }
 
-/* vm_join(child) -> the child's entry result (its `main` return), or -errno. */
-static inline long vm_join(long child) {
-  return __vm_instantiate_join(vm_instantiator_(), child);
+/* vm_join(child, &status) -> the child's entry result (its `main` return), with `status` 0; or 0, with
+ * `status` the wire code of the trap the child ended in (`temen_ir::trap_code`: out of fuel, a fault,
+ * `kill`, or `exit(n)` with `n` in the high 32 bits). The child's end is never the caller's (#2066),
+ * and either way it is reaped. */
+static inline long vm_join(long child, long *status) {
+  return __vm_instantiate_join(vm_instantiator_(), child, status);
 }

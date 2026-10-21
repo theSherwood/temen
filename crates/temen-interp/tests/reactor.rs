@@ -94,12 +94,14 @@ fn a_dense_page_map_restores_into_the_reactor_window_in_its_own_page_unit() {
     let mut r = bytecode::Reactor::open(&m).expect("open");
 
     // 128 KiB image over a 64 KiB window, in 16 KiB runs so it is representable on either host page:
-    // [0,16K) Ro (the null guard's shape), [16K,64K) Rw prefix, [64K,112K) an uncommitted hole under
-    // the high-water, [112K,128K) a grown Rw page carrying a marker.
+    // [0,16K) the NULL guard, Unmapped as every capture records it (a restore keeps the window's own,
+    // #2441), [16K,32K) Ro, [32K,64K) Rw prefix, [64K,112K) an uncommitted hole under the high-water,
+    // [112K,128K) a grown Rw page carrying a marker.
     let mut bytes = vec![0u8; 8 * K16 as usize];
     bytes[7 * K16 as usize..7 * K16 as usize + 8].copy_from_slice(&0x5eed_u64.to_le_bytes());
     let mut dense = vec![CapturedProt::Rw; 32];
-    dense[0..4].fill(CapturedProt::Ro);
+    dense[0..4].fill(CapturedProt::Unmapped);
+    dense[4..8].fill(CapturedProt::Ro);
     dense[16..28].fill(CapturedProt::Unmapped);
     let layout = MemLayout::from_dense(bytes, &dense, 1 << 16);
     assert_eq!(
@@ -110,13 +112,13 @@ fn a_dense_page_map_restores_into_the_reactor_window_in_its_own_page_unit() {
 
     assert!(r.restore_window(&layout, &Host::new()));
     let back = r.window_layout().expect("capturable");
+    let (bytes, prots) = back.to_dense();
     assert_eq!(
-        back.dense_prots(),
-        dense,
+        prots, dense,
         "the live window's map, read back in the codec's unit, is the map that was restored"
     );
     assert_eq!(
-        back.bytes(),
+        bytes,
         layout.bytes(),
         "the image round-trips, hole included"
     );

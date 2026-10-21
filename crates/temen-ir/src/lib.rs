@@ -97,20 +97,16 @@ pub mod cap_id {
     /// 1 `unmap(off,len)`, 2 `protect(off,len,prot)`, 3 `page_size() -> i64`, and 4
     /// **`sub(off, size_log2) -> handle`** — the **attenuation** primitive: mint a child `AddressSpace`
     /// over the power-of-two-aligned sub-range `[base+off, base+off + 2^size_log2)`, which must lie
-    /// within the holder's range (a parent can only sub-allocate what it holds, §14). This is the
-    /// memory half of the `Instantiator`: a guest carves a child's window from its own.
+    /// within the holder's range (a parent can only sub-allocate what it holds, §14).
     pub const ADDRESS_SPACE: u32 = 5;
-    /// `Instantiator` — the §14 nesting primitive: spawn a **child domain** confined to a
-    /// power-of-two sub-window `[base, base+size)` of the holder's window (VM-in-VM). op 0
-    /// `instantiate(entry, off, size_log2, fuel) -> child_handle` enqueues a child vCPU running the
-    /// same module's `entry` (which returns one `i64` and takes one or two — its starter caps)
-    /// confined to `[base+off, base+off+2^size_log2)` with an **attenuated** powerbox over the child's
-    /// own window: an `Instantiator` (so it can recurse — confinement composes to any depth) and an
-    /// `AddressSpace` (so it can manage its own pages), passed as the entry's arguments. A fuel quota
-    /// caps it; returns immediately (non-blocking). op 1 `join(child_handle) -> result` parks **only
-    /// the calling fiber** until that child finishes, then yields its result (siblings keep running —
-    /// the child rides the same §12 executor). Holding the handle is the authority to nest (D19: a
-    /// child can only get what the parent sub-allocates).
+    /// `Instantiator` — the §14 nesting primitive: spawn a **child domain**, a module running in a
+    /// window of its own (VM-in-VM), and manage it. The live ops ([`super::served_contract`]
+    /// gives their shapes): 17 `instantiate_rec(record) -> child` spawns from a [`super::SpawnRec`];
+    /// 1 `join(child) -> (status, value)` parks only
+    /// the calling fiber until the child ends, then answers how it ended, never as a trap of the
+    /// joiner's (#2066); 9 `poll`, 10 `detach` and 12 `kill` supervise it (PROCESS.md S3); 14
+    /// `child_offer` and 19 `grant` reach into it while it runs. Every other op is retired and traps
+    /// `CapFault`. Holding the handle is the authority to nest.
     pub const INSTANTIATOR: u32 = 6;
     /// `ModuleLoader` — the authority to **promote guest bytes to a spawnable `Module`** (§14 slice:
     /// run-in-guest). op 0 `from_bytes(ptr, len) -> module_handle | -errno` reads a wire-encoded module
@@ -121,16 +117,15 @@ pub mod cap_id {
     /// module ops. Fail-closed: a malformed or unverifiable module is `-EINVAL`, nothing is minted. It
     /// is the missing input side of the nesting primitive — a guest that *produces* a module (a linker,
     /// a JIT-driver) can now run it, without the host pre-granting every module it might build. Emitting
-    /// bytes confers no new authority over the host: the minted module can only be *spawned* into a carve
-    /// of the holder's own window (which it already controls), and the verifier gates it unconditionally.
+    /// bytes confers no new authority over the host: the minted module can only be *spawned* into a window
+    /// of its own, paid from the holder's budget, and the verifier gates it unconditionally.
     /// Host-granted (non-ambient), like `exec`/`fs`.
     pub const MODULE_LOADER: u32 = 7;
     /// `Module` — a host-granted, host-**verified** module a guest may instantiate (§14). The handle
-    /// confers only the authority to pass it to the `Instantiator`'s module ops (5/6/7 —
-    /// `instantiate_module` / `spawn_coroutine_module` / `spawn_demand_coroutine_module`), which
-    /// spawn a child domain running *that* module's code confined to a carve of the holder's window
-    /// — the "plugin-in-plugin" story: a guest can only instantiate modules it was given (no ambient
-    /// authority). It has no directly callable ops (`call.cap` on it is an inert `CapFault`).
+    /// confers only the authority to name it in an `Instantiator` spawn (op 17's record), which runs
+    /// *that* module's code as a child domain in a window of its own — the "plugin-in-plugin" story:
+    /// a guest can only instantiate modules it was given (no ambient authority). It has no directly
+    /// callable ops (`call.cap` on it is an inert `CapFault`).
     pub const MODULE: u32 = 8;
     // id 9 was `IoRing` (the submit/complete ring), retired 2026-08-07 by the §12
     // parking-on-blocking re-measure: batching measured 13× negative, overlap subsumed by
@@ -180,10 +175,12 @@ pub mod cap_id {
     /// sub_handle | -errno`: mint a child node, each ceiling clamped to the holder's (`-1` =
     /// unbounded on its own), deducting nothing. op 1 `read(field) -> room | -EINVAL`: the room left
     /// along the chain — the §15 monitoring readout. op 2 `transfer(dst, fuel, mem, spawn) -> 0 |
-    /// -errno`: raise the ceilings of a node under the holder, clamped to the holder's.
+    /// -errno`: raise the ceilings of a node under the holder, clamped to the holder's. op 3
+    /// `close() -> 0` (#2384): give the handle up; the node stays in the tree, so a child spawned
+    /// from it is still capped and charged.
     pub const BUDGET: u32 = 14;
     /// PROCESS.md §5 **window minter** — the authority to mint **detached** windows: a child
-    /// spawned through it (`Instantiator.instantiate_detached`, op 15) gets a fresh platform
+    /// spawned through it (a detached spawn) gets a fresh platform
     /// window *outside* the parent's — no ancestor below the minter holds read authority, and
     /// the child attests `window_exposed = false` (the jacl distrust-spawner trust anchor).
     /// The capability carries a **byte quota**, deducted at each mint (host-enforced); an
@@ -198,7 +195,7 @@ pub mod cap_id {
     /// not: authority was implicit in nesting, so the bit reported a *placement* and the report was
     /// conservative rather than true. Holding it as a `(base, size)` sub-range grant makes it
     /// attenuate down the grant graph like every other authority (#3), survive freeze/thaw through the
-    /// value-typed re-grant path, and be *askable* — which is what the op-15 gate needs before it can
+    /// value-typed re-grant path, and be *askable* — which is what the detached-spawn gate needs before it can
     /// become "refuse unless a freeze-authority holder is registered" instead of refusing outright.
     ///
     /// Confers no operations: like `Module`, it is pure authority that other paths consult, so a
@@ -211,6 +208,76 @@ pub mod cap_id {
     /// the structural op-signature list, the D59 rule applied to capability interfaces). Far above
     /// the fixed built-ins and far below the reserved `u32::MAX`-family dispatch sentinels.
     pub const GUEST_IMPL_BASE: u32 = 0x1000_0000;
+}
+
+/// The shape of each op an engine serves in its own arm rather than through the host's dispatch:
+/// the scalar-int argument prefix it reads and the results it answers. The verifier checks a
+/// `call.cap` against its *declared* signature only, so a verified module can call these ops with
+/// any shape. Every engine checks the declared one against this table before running the op
+/// ([`served_shape_ok`]), and a call that doesn't match traps `CapFault`, as a call on an
+/// Instantiator op that isn't live does. One table, so no engine numbers a result that another
+/// doesn't deliver (#2066, #2361).
+///
+/// | type | op | | args | results |
+/// |---|---|---|---|---|
+/// | Instantiator | 1 | `join` | child | status, value: `(0, its first result)` if it returned, `(its trap's [`trap_code`], 0)` if not |
+/// | Instantiator | 9, 10, 12 | `poll`, `detach`, `kill` | child | i32 |
+/// | Instantiator | 14, 19 | `child_offer`, `grant` | child, export or handle | the child's handle or `-errno` |
+/// | Instantiator | 17 | `instantiate_rec` | record pointer ([`SpawnRec`]) | child or `-errno` |
+/// | Jit | 3, 4 | `install`, `uninstall` | code handle, or slot | slot or `-errno`, or `0` or `-EINVAL` |
+/// | self | 9, 10 | `svc.poll`, `svc.wait` | | dispatches served |
+/// | self | 11, 12 | `clone_caller`, `reap` | | the served caller or `-errno`, or the twin's exit status |
+/// | self | 13 | `fuel.remaining` | | fuel |
+/// | self | 14 | `exec_module` | module, grants ptr and count, entry, size_log2 | `-errno` of a refused exec |
+/// | self | 16 | `pipe` | | `0` or `-errno` |
+///
+/// Args an op reads only when present (`svc.wait`'s timeout, `clone_caller`'s replies, `reap`'s
+/// pid, `pipe`'s fds pointer) are past the prefix.
+pub fn served_contract(type_id: u32, op: u32) -> Option<(&'static [ValType], &'static [ValType])> {
+    use ValType::{I32, I64};
+    match (type_id, op) {
+        (cap_id::INSTANTIATOR, 1) => Some((&[I32], &[I64, I64])),
+        (cap_id::INSTANTIATOR, 9 | 10 | 12) => Some((&[I32], &[I32])),
+        (cap_id::INSTANTIATOR, 14 | 19) => Some((&[I32, I64], &[I32])),
+        (cap_id::INSTANTIATOR, 17) => Some((&[I64], &[I32])),
+        (cap_id::JIT, 3 | 4) => Some((&[I64], &[I64])),
+        (CAP_SELF_TYPE_ID, 9..=13 | 16) => Some((&[], &[I64])),
+        (CAP_SELF_TYPE_ID, 14) => Some((&[I64; 5], &[I64])),
+        _ => None,
+    }
+}
+
+/// Whether every engine lets a `call.cap` of `(type_id, op)` declared as `sig` run. One of an op
+/// [`served_contract`] names must match its contract. Any other runs on the host's dispatch, which
+/// takes any shape, save an Instantiator op: none but the named ones is live. Width-tolerant: an
+/// `i32` or an `i64` matches either, since every engine reads an arg as an `i64` and coerces a
+/// result to its declared type (a chibicc guest widens every scalar to `i64`). Args past the
+/// contract's prefix are tolerated: an op reads some only when present.
+pub fn served_shape_ok(type_id: u32, op: u32, sig: &FuncType) -> bool {
+    let int = |t: &ValType| matches!(t, ValType::I32 | ValType::I64);
+    match served_contract(type_id, op) {
+        Some((args, results)) => {
+            sig.params.len() >= args.len()
+                && sig.params[..args.len()].iter().all(int)
+                && sig.results.len() == results.len()
+                && sig.results.iter().all(int)
+        }
+        None => type_id != cap_id::INSTANTIATOR,
+    }
+}
+
+/// The slot a §12 thread or §14 child handle names in a table of `len` slots, by the one rule every
+/// engine resolves one by (#2378). A negative handle names none: it is a forgery, or a failed
+/// spawn's `-errno` passed on unchecked (#773), and folding it onto a live slot would wedge a join on
+/// a child that never ends. Any other is masked into the table padded to a power of two, so a handle
+/// past the table names a slot only where the mask folds it onto one. Whether that slot is live
+/// (issued and neither joined nor detached) is the caller's table's to say.
+pub fn handle_slot(len: usize, handle: i32) -> Option<usize> {
+    if handle < 0 || len == 0 {
+        return None;
+    }
+    let slot = (handle as u32 as usize) & (len.next_power_of_two() - 1);
+    (slot < len).then_some(slot)
 }
 
 /// Guest-facing **errno values** — the negative `-errno` a fallible capability op returns on its
@@ -287,7 +354,7 @@ pub mod errno {
 /// state, absent ⇒ the region default (read-write in the backed prefix, unmapped in the reserved
 /// tail). One definition for the readers: the flat-window backend that writes them
 /// (`temen_run::MprotectWindow`), the durable capture that turns them into a snapshot's page map
-/// (`temen_interp::Host::capture_window_prots`), and the JIT's fork copy (`temen_jit`).
+/// (`temen_interp::Host::capture_window_layout`), and the JIT's fork copy (`temen_jit`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PageState {
     /// Committed read-write.
@@ -308,6 +375,28 @@ pub enum PageState {
         writable: bool,
     },
 }
+
+impl PageState {
+    /// The page's entry in a demand-paged JIT child's access table (#2164): [`PAGE_READ`] when
+    /// guest code may load from the page, with [`PAGE_WRITE`] when it may store to it too.
+    pub fn access(self) -> u8 {
+        match self {
+            PageState::Rw | PageState::Backed { writable: true, .. } => PAGE_READ | PAGE_WRITE,
+            PageState::Ro
+            | PageState::Backed {
+                writable: false, ..
+            } => PAGE_READ,
+            PageState::Unmapped => 0,
+        }
+    }
+}
+
+/// #2164 — a demand-paged Cranelift JIT child's **access table**: one byte per page of its declared
+/// window, which its code tests before each access, and which mirrors the window's page map. The
+/// bit a load needs.
+pub const PAGE_READ: u8 = 1;
+/// The bit a store needs (see [`PAGE_READ`]).
+pub const PAGE_WRITE: u8 = 2;
 
 /// The **trap wire code** (#1735): how every engine, thunk and embedder status says *which* trap
 /// ended a run. One numbering, here — the wire-IR crate every engine already depends on — as
@@ -554,6 +643,19 @@ pub mod durable_abi {
         pub const fn ctx_of_sp(self, sp: u64) -> usize {
             ((sp - self.base) / self.stride) as usize
         }
+
+        /// #2426 — whether a page op over the host pages `first..=last` (of `page` bytes) would
+        /// change the protection of a page holding this window's runtime-private words: the control
+        /// words, `[STATE_OFF, DURABLE_CONTROL_END)`, and the arena. A durable run's host reads and
+        /// writes them outside the guest's guarded code (a freeze request rings the state word, and a
+        /// freeze flattens each parked fiber into its region), so a page the guest made read-only or
+        /// inaccessible there would fault in the host. Every engine refuses such an op, as it refuses
+        /// the NULL guard. A module that declared no arena is not freezable, and fences nothing.
+        pub fn fences(self, first: u64, last: u64, page: u64) -> bool {
+            let touches = |lo: u64, hi: u64| lo / page <= last && first <= (hi - 1) / page;
+            self.size() > 0
+                && (touches(STATE_OFF, DURABLE_CONTROL_END) || touches(self.base, self.end))
+        }
     }
 }
 
@@ -564,114 +666,87 @@ pub mod durable_abi {
 /// layout has **one** definition instead of three hand-decoded copies (#911). Only the *field
 /// extraction* is shared: each tier keeps its own pager / budget / grant handling and error order.
 ///
-/// A record is op 15 (`instantiate_detached`) as data: every tier routes it to its op-15 path.
-/// The version word is a fixed tag (#1867 decision 2): it must be 1, so a record written for the
-/// retired carve placement (version 0) fails closed; #2091 retires the tag.
+/// The record is the one spawn form (INVARIANTS #13). It carries no version word: the layout
+/// changes only with every producer, in one change (#2091). A child runs a module the spawner holds,
+/// from its function 0, the module's child bootstrap (#2219).
 ///
 /// | off | field | |
 /// |---|---|---|
-/// | 0 | `u32` version | 1 |
-/// | 4 | `u32` entry | the child's entry function |
-/// | 8 | `u64` | reserved, must be 0 |
-/// | 16 | `u32` size_log2 | the child's own window |
-/// | 20 | `u32` pager | impl export / `u32::MAX` |
-/// | 24 | `i32` module | handle / `-1` self |
-/// | 28 | `i32` budget | `Budget` handle whose `mem` the window spends (op 15's arg 0) |
-/// | 32 | `i64` quota | retired, must be 0 (#1944 slice 3: the budget caps the child's fuel) |
-/// | 40, 48 | `u64` grants ptr, count | named-grant list |
-/// | 56, 64 | `u64` args ptr, len | spawn-time args payload (len 0 = none) |
-/// | 72 | `i32` region | pre-mapped `SharedRegion` (−1 = none) |
-/// | 76 | `u32` | reserved, must be 0 |
-/// | 80 | `u64` child_off | where the region maps in the child |
+/// | 0 | `u32` size_log2 | the child's own window |
+/// | 4 | `u32` pager | impl export / `u32::MAX` |
+/// | 8 | `i32` module | the `Module` handle the child runs |
+/// | 12 | `i32` budget | `Budget` handle whose `mem` the window spends |
+/// | 16, 24 | `u64` grants ptr, count | named-grant list |
+/// | 32, 40 | `u64` args ptr, len | spawn-time args payload (len 0 = none) |
+/// | 48 | `i32` region | pre-mapped `SharedRegion` (−1 = none) |
+/// | 52 | `u32` | padding, must be 0 |
+/// | 56 | `u64` child_off | where the region maps in the child |
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SpawnRec {
-    /// Child entry function index (record offset 4).
-    pub entry: u32,
-    /// Window size as a power-of-two shift count; the driver validates it against `0..64` (offset 16).
+    /// Window size as a power-of-two shift count; the driver validates it against `0..64` (offset 0).
     pub size_log2: i64,
-    /// Pager impl-export index, or `u32::MAX` for none (offset 20).
+    /// Pager impl-export index, or `u32::MAX` for none (offset 4).
     pub pager: u32,
-    /// `Module` handle, or `-1` for self (offset 24).
+    /// The `Module` handle the child runs ([`Self::MODULE_AT`]).
     pub modh: i32,
-    /// `Budget` handle, or `0` for none (offset 28).
+    /// `Budget` handle, or `0` for none ([`Self::BUDGET_AT`]).
     pub budget: i32,
-    /// Raw fuel quota (offset 32) — retired: it must be 0, and a spawn naming any other value traps
-    /// `CapFault` (#1944 slice 3: the budget caps the child's fuel).
-    pub quota: i64,
-    /// Named-grant list pointer (offset 40).
+    /// Named-grant list pointer (offset 16).
     pub grants_ptr: u64,
-    /// Named-grant list count (offset 48).
+    /// Named-grant list count (offset 24).
     pub grants_n: u64,
-    /// The spawn-time args payload `(ptr, len)` (offsets 56, 64).
+    /// The spawn-time args payload `(ptr, len)` (offsets 32, 40).
     pub args: (u64, u64),
-    /// The pre-mapped region handle (offset 72), `-1` for none.
+    /// The pre-mapped region handle ([`Self::REGION_AT`]), `-1` for none.
     pub region: i32,
-    /// The region's offset in the child's window (offset 80).
+    /// The region's offset in the child's window (offset 56).
     pub child_off: u64,
 }
 
 /// The byte length of a [`SpawnRec`].
-pub const SPAWN_REC_LEN: usize = 88;
+pub const SPAWN_REC_LEN: usize = 64;
 
 impl SpawnRec {
-    /// Decode a record of exactly [`SPAWN_REC_LEN`] bytes. `None` on any other length, a version
-    /// word other than 1, or a nonzero reserved field (offsets 8, 76) — every driver fails that
-    /// closed. Pure layout decode: no handle/window/geometry validation, all of which stays
-    /// tier-local.
+    /// Where the `module` handle sits in the record. A spawner learns its handles at run time, so
+    /// it lays the rest of the record as data and stores these three fields before the spawn.
+    pub const MODULE_AT: u64 = 8;
+    /// Where the `budget` handle sits in the record.
+    pub const BUDGET_AT: u64 = 12;
+    /// Where the pre-mapped `region` handle sits in the record.
+    pub const REGION_AT: u64 = 48;
+
+    /// Decode a record of exactly [`SPAWN_REC_LEN`] bytes. `None` on any other length or a nonzero
+    /// padding word (offset 52) — every driver fails that closed. Pure layout decode: no
+    /// handle/window/geometry validation, all of which stays tier-local.
     pub fn parse(rec: &[u8]) -> Option<SpawnRec> {
         if rec.len() != SPAWN_REC_LEN {
             return None;
         }
         let u32_at = |o: usize| u32::from_le_bytes([rec[o], rec[o + 1], rec[o + 2], rec[o + 3]]);
         let u64_at = |o: usize| u64::from_le_bytes(rec[o..o + 8].try_into().unwrap());
-        if u32_at(0) != 1 || u64_at(8) != 0 || u32_at(76) != 0 {
+        if u32_at(52) != 0 {
             return None;
         }
         Some(SpawnRec {
-            entry: u32_at(4),
-            size_log2: u32_at(16) as i64,
-            pager: u32_at(20),
-            modh: u32_at(24) as i32,
-            budget: u32_at(28) as i32,
-            quota: u64_at(32) as i64,
-            grants_ptr: u64_at(40),
-            grants_n: u64_at(48),
-            args: (u64_at(56), u64_at(64)),
-            region: u32_at(72) as i32,
-            child_off: u64_at(80),
+            size_log2: u32_at(0) as i64,
+            pager: u32_at(4),
+            modh: u32_at(8) as i32,
+            budget: u32_at(12) as i32,
+            grants_ptr: u64_at(16),
+            grants_n: u64_at(24),
+            args: (u64_at(32), u64_at(40)),
+            region: u32_at(48) as i32,
+            child_off: u64_at(56),
         })
-    }
-
-    /// A record for `entry` with every other field at its "none" value: the module's declared
-    /// window (`size_log2` 0), no pager, the spawner's own module, no budget, the retired `quota`
-    /// 0, no grants, no args, no region. Producers set the fields they use.
-    pub fn v1(entry: u32) -> SpawnRec {
-        SpawnRec {
-            entry,
-            size_log2: 0,
-            pager: u32::MAX,
-            modh: -1,
-            budget: 0,
-            quota: 0,
-            grants_ptr: 0,
-            grants_n: 0,
-            args: (0, 0),
-            region: -1,
-            child_off: 0,
-        }
     }
 
     /// The record's [`SPAWN_REC_LEN`] bytes, the inverse of [`Self::parse`].
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(SPAWN_REC_LEN);
-        b.extend_from_slice(&1u32.to_le_bytes());
-        b.extend_from_slice(&self.entry.to_le_bytes());
-        b.extend_from_slice(&0u64.to_le_bytes());
         b.extend_from_slice(&(self.size_log2 as u32).to_le_bytes());
         b.extend_from_slice(&self.pager.to_le_bytes());
         b.extend_from_slice(&self.modh.to_le_bytes());
         b.extend_from_slice(&self.budget.to_le_bytes());
-        b.extend_from_slice(&self.quota.to_le_bytes());
         b.extend_from_slice(&self.grants_ptr.to_le_bytes());
         b.extend_from_slice(&self.grants_n.to_le_bytes());
         b.extend_from_slice(&self.args.0.to_le_bytes());
@@ -680,6 +755,25 @@ impl SpawnRec {
         b.extend_from_slice(&0u32.to_le_bytes());
         b.extend_from_slice(&self.child_off.to_le_bytes());
         b
+    }
+}
+
+/// A record with every field at its "none" value: the module's declared window (`size_log2` 0),
+/// no pager, no module (`0` names none, so a spawner sets `modh`), no budget, no grants, no args,
+/// no region. Producers set the fields they use.
+impl Default for SpawnRec {
+    fn default() -> SpawnRec {
+        SpawnRec {
+            size_log2: 0,
+            pager: u32::MAX,
+            modh: 0,
+            budget: 0,
+            grants_ptr: 0,
+            grants_n: 0,
+            args: (0, 0),
+            region: -1,
+            child_off: 0,
+        }
     }
 }
 
@@ -2186,8 +2280,9 @@ pub enum Inst {
         a: ValIdx,
     },
     /// Scalar **fused multiply-add** `a·b + c` with a single rounding (IEEE-754 FMA) — the scalar
-    /// sibling of [`Inst::VFma`], emitted for `llvm.fma`/`fmuladd`. Cranelift `fma` / Rust
-    /// `f*::mul_add` are both correctly-rounded, so interp and JIT agree. Operands/result are `ty`.
+    /// sibling of [`Inst::VFma`], emitted for `llvm.fma`/`fmuladd`. Cranelift `fma` and the `libm`
+    /// crate's, which the interpreters compute with (#2519), are both correctly-rounded, so interp
+    /// and JIT agree. Operands/result are `ty`.
     Fma {
         ty: FloatTy,
         a: ValIdx,
@@ -2859,7 +2954,8 @@ pub enum Inst {
     /// is `a·b + c` (`neg == false`) or `−a·b + c` (`neg == true`), computed with a **single rounding**
     /// (IEEE-754 FMA). Float shapes (`f32x4`/`f64x2`); `a`/`b`/`c`/result are `v128`. Temen picks the
     /// fused behavior (one of the two the relaxed proposal permits) consistently in both backends —
-    /// Cranelift `fma` and Rust `f*::mul_add` are both correctly-rounded, so the differential holds.
+    /// Cranelift `fma` and the interpreters' `libm` `fma` are both correctly-rounded, so the
+    /// differential holds.
     VFma {
         shape: VShape,
         neg: bool,
@@ -3691,17 +3787,10 @@ impl Func {
         })
     }
 
-    /// Whether this function issues a static `Instantiator.instantiate_detached` (`call.cap 6 15`)
-    /// or `instantiate_rec` (`call.cap 6 17` — the one spawn form, placed detached, #1863).
-    /// See [`Module::spawns_detached`].
+    /// Whether this function issues a static `Instantiator.instantiate_rec` (`call.cap 6 17` — the
+    /// one spawn form, placed detached, #1863). See [`Module::spawns_detached`].
     pub fn spawns_detached(&self) -> bool {
-        self.issues_instantiator(&[15, 17])
-    }
-
-    /// Whether this function issues op 15, whose module operand must be a `Module` handle. See
-    /// [`spawns_by_module_handle`].
-    pub fn spawns_by_module_handle(&self) -> bool {
-        self.issues_instantiator(&[15])
+        self.issues_instantiator(&[17])
     }
 
     /// Whether this function issues a static `Instantiator` op among `ops`.
@@ -3780,6 +3869,183 @@ impl Func {
     }
 }
 
+/// The block params of a function that only forward a value (#2448).
+///
+/// Block-local SSA (D1, D32) makes every value live across a block one of its params, so most of a
+/// large function's params only pass on a value that a block dominating theirs defined: every edge
+/// into such a param passes it that value, or the param itself. A backend may take the param as the
+/// value, with no phi and no copy. That is sound for the reason trivial-phi removal is: the value's
+/// block dominates the param's. Cranelift's `remove_constant_phis` finds the same set. Only edges
+/// from reachable blocks count. A param of the entry block, or of a block nothing reaches, is its own.
+pub struct Forwards {
+    /// Each block's first param's place in `src`, then one past the last block's last.
+    first: Vec<u32>,
+    /// Per param, the value it forwards (`block << 32 | index`), or [`Forwards::OWN`].
+    src: Vec<u64>,
+}
+
+impl Forwards {
+    /// A param that is its own value.
+    const OWN: u64 = u64::MAX;
+    /// A param no edge has spoken for yet (only while [`Func::forwards`] runs).
+    const UNKNOWN: u64 = u64::MAX - 1;
+    /// Passes over a function before the analysis gives up and calls every param its own. A pass
+    /// costs one look at each edge argument; real code settles in a few.
+    const PASSES: usize = 32;
+
+    /// The value block `b`'s param `i` forwards, as its block and its index there (a param of
+    /// that block that is its own, or a result in it), or `None` for a param that is its own or
+    /// that the block does not have (an edge's extra argument stays an argument).
+    pub fn source(&self, b: usize, i: usize) -> Option<(BlockIdx, ValIdx)> {
+        let (lo, hi) = (
+            *self.first.get(b)? as usize,
+            *self.first.get(b + 1)? as usize,
+        );
+        match *self.src[lo..hi].get(i)? {
+            Self::OWN => None,
+            v => Some(((v >> 32) as BlockIdx, v as ValIdx)),
+        }
+    }
+}
+
+impl Func {
+    /// This function's block params that only forward a value ([`Forwards`]).
+    ///
+    /// A fixpoint over the edges from reachable blocks, in reverse postorder. A value is
+    /// `block << 32 | index`. An argument that names a param stands for what that param forwards,
+    /// or for the param once it is its own. A param whose arguments, its own aside, all stand for
+    /// one value forwards it; two values make it its own.
+    pub fn forwards(&self) -> Forwards {
+        let n = self.blocks.len();
+        let mut first = Vec::with_capacity(n + 1);
+        let mut total = 0usize;
+        for b in &self.blocks {
+            first.push(total as u32);
+            total += b.params.len();
+        }
+        first.push(total as u32);
+        let edges: Vec<Vec<(BlockIdx, &[ValIdx])>> =
+            self.blocks.iter().map(|b| b.term.edges()).collect();
+        // The blocks reachable from the entry, in reverse postorder.
+        let mut reach = vec![false; n];
+        let mut post = Vec::with_capacity(n);
+        let mut stack: Vec<(usize, usize)> = Vec::new();
+        if n > 0 {
+            reach[0] = true;
+            stack.push((0, 0));
+        }
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            match edges[b].get(k) {
+                Some(&(t, _)) => {
+                    top.1 += 1;
+                    let t = t as usize;
+                    if t < n && !reach[t] {
+                        reach[t] = true;
+                        stack.push((t, 0));
+                    }
+                }
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        let order: Vec<usize> = post.into_iter().rev().filter(|&b| b != 0).collect();
+        // An edge into a block from a reachable one: its source block (a value's high half), where
+        // that block's params start in `src`, how many it has, and the arguments.
+        #[derive(Clone, Copy)]
+        struct In<'a> {
+            from: u64,
+            at: usize,
+            np: usize,
+            args: &'a [ValIdx],
+        }
+        let mut into: Vec<Vec<In>> = vec![Vec::new(); n];
+        for (u, es) in edges.iter().enumerate().filter(|&(u, _)| reach[u]) {
+            for &(t, args) in es {
+                if let Some(e) = into.get_mut(t as usize) {
+                    e.push(In {
+                        from: (u as u64) << 32,
+                        at: first[u] as usize,
+                        np: self.blocks[u].params.len(),
+                        args,
+                    });
+                }
+            }
+        }
+        let mut src = vec![Forwards::UNKNOWN; total];
+        for (b, blk) in self.blocks.iter().enumerate() {
+            if b == 0 || !reach[b] {
+                let at = first[b] as usize;
+                src[at..at + blk.params.len()].fill(Forwards::OWN);
+            }
+        }
+        let mut settled = false;
+        for _ in 0..Forwards::PASSES {
+            let mut changed = false;
+            for &t in &order {
+                for i in 0..self.blocks[t].params.len() {
+                    let at = first[t] as usize + i;
+                    if src[at] == Forwards::OWN {
+                        continue;
+                    }
+                    let me = (t as u64) << 32 | i as u64;
+                    let mut val = Forwards::UNKNOWN;
+                    for e in &into[t] {
+                        let Some(&a) = e.args.get(i) else {
+                            val = Forwards::OWN;
+                            break;
+                        };
+                        let mut v = e.from | a as u64;
+                        if (a as usize) < e.np {
+                            v = match src[e.at + a as usize] {
+                                Forwards::OWN => v,
+                                Forwards::UNKNOWN => continue,
+                                w => w,
+                            };
+                        }
+                        if v == me || v == val {
+                            continue;
+                        }
+                        if val != Forwards::UNKNOWN {
+                            val = Forwards::OWN;
+                            break;
+                        }
+                        val = v;
+                    }
+                    if val != src[at] {
+                        src[at] = val;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                // A param no edge spoke for (a cycle of params that never meets a value) is its
+                // own, and whatever counted on it looks again.
+                let mut forced = false;
+                for &t in &order {
+                    let at = first[t] as usize;
+                    for s in &mut src[at..at + self.blocks[t].params.len()] {
+                        if *s == Forwards::UNKNOWN {
+                            *s = Forwards::OWN;
+                            forced = true;
+                        }
+                    }
+                }
+                if !forced {
+                    settled = true;
+                    break;
+                }
+            }
+        }
+        if !settled {
+            src.fill(Forwards::OWN);
+        }
+        Forwards { first, src }
+    }
+}
+
 /// A linear-memory window declaration (§4). The window is `1 << size_log2` bytes —
 /// a power of two, so confinement is a single `addr & (size − 1)` mask. The window
 /// is a reserved virtual range; guest pointers are offsets into it.
@@ -3806,15 +4072,59 @@ impl Memory {
 }
 
 /// The reference host's **default reservation policy** (§4): the size (`log2`) of the reserved
-/// virtual range a window's `mapped` bytes live inside, 128 GiB. DESIGN §4 makes this
-/// host-configurable; this is the default the reference `run`/`compile_and_run` entries apply when a
-/// caller doesn't pass one. It is *policy*, not verified semantics — both backends share this one
-/// constant so they stay in differential lockstep, and the masking unit (`temen-mask`) never
-/// hard-codes a reservation. The reserved range is `PROT_NONE` + lazily paged, so a large value
-/// costs virtual address space, not committed memory, but every window spends it: the process's
-/// pool of it (`temen_interp::RESERVED_POOL`, 64 TiB) holds 512 windows of this size (#2305). A
-/// guest maps nothing past it.
+/// virtual range a window's `mapped` bytes live inside, 128 GiB, unless the embedder chooses
+/// smaller windows for its process ([`set_default_reserved_log2`]). It is *policy*, not verified
+/// semantics — every engine reads the one [`default_reserved_log2`] so they stay in differential
+/// lockstep, and the masking unit (`temen-mask`) never hard-codes a reservation. The reserved range
+/// is `PROT_NONE` + lazily paged, so a large value costs virtual address space, not committed
+/// memory, but every window spends it: the process's pool of it (`temen_interp::reserved_pool`,
+/// half the host's address space) holds 512 windows of this size on a 47-bit host (#2305). A guest
+/// maps nothing past it.
 pub const DEFAULT_RESERVED_LOG2: u8 = 37;
+
+/// #2517 — the log2 of the mask domain each window of this process reserves when what builds it
+/// names none: the root of every entry point that takes no reservation, and every detached child,
+/// on every engine (raised to the window's size, [`window_reserved_log2`]). The embedder's choice
+/// ([`set_default_reserved_log2`]), else [`DEFAULT_RESERVED_LOG2`]. The first read fixes it, so
+/// every window and every charge to the process's pool of address space sees one value.
+pub fn default_reserved_log2() -> u8 {
+    use core::sync::atomic::Ordering::Relaxed;
+    match CHOSEN_RESERVED_LOG2.load(Relaxed) {
+        UNCHOSEN => match CHOSEN_RESERVED_LOG2.compare_exchange(
+            UNCHOSEN,
+            DEFAULT_RESERVED_LOG2,
+            Relaxed,
+            Relaxed,
+        ) {
+            Ok(_) => DEFAULT_RESERVED_LOG2,
+            Err(chosen) => chosen,
+        },
+        chosen => chosen,
+    }
+}
+
+/// #2517 — choose [`default_reserved_log2`] for a host with less address space than the default
+/// spends: a 39-bit phone's pool of it holds two windows of 128 GiB, and 64 of 4 GiB (`32`). It only
+/// lowers the default, and only before anything has read it: `false`, changing nothing, otherwise.
+#[must_use]
+pub fn set_default_reserved_log2(log2: u8) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    log2 <= DEFAULT_RESERVED_LOG2
+        && CHOSEN_RESERVED_LOG2
+            .compare_exchange(UNCHOSEN, log2, Relaxed, Relaxed)
+            .is_ok()
+}
+
+/// #2517 — the log2 of the mask domain a window of `1 << mapped_log2` bytes reserves when what
+/// builds it names none: [`default_reserved_log2`], raised to the window as every engine raises it.
+pub fn window_reserved_log2(mapped_log2: u8) -> u8 {
+    default_reserved_log2().max(mapped_log2)
+}
+
+/// No choice read or made yet: larger than any reservation's log2.
+const UNCHOSEN: u8 = u8::MAX;
+static CHOSEN_RESERVED_LOG2: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(UNCHOSEN);
 
 /// The §3e powerbox **args-buffer** window offset: where a host seeds the program-arguments blob so
 /// the frontend's `_start` can hand `argc`/`argv` to a C `main(int, char**)`. This is the
@@ -3885,12 +4195,11 @@ pub const POWERBOX_STACK_PAGE: u64 = POWERBOX_ARGS_END; // 16384
 /// definition every host shares — `temen-run`'s front door, the browser on-ramp, and the DAP backend
 /// all key off the identical predicate so a module accepted as an entry by one host is by all
 /// (guest-ABI shape must not drift per host — #912).
-/// Whether `module` can spawn a §5 **detached** child: a static `call.cap 6 15` in any function
+/// Whether `module` can spawn a §5 **detached** child: a static `call.cap 6 17` in any function
 /// (the only spelling — an executor op reaches its seam through a static `call.cap`, never a
-/// manifest-bound `call.sym`; chibicc's `__vm_instantiate_detached` emits exactly that). The two
-/// reference powerboxes grant the by-name spawn set (`"module"`, `"budget"`) **only** to such a
-/// guest — least authority, and the `"module"` grant is non-durable, so a guest that never spawns
-/// keeps a powerbox a warm snapshot can freeze.
+/// manifest-bound `call.sym`; chibicc's and temen-llvm's `__vm_instantiate_rec` emit exactly that). The two
+/// reference powerboxes grant the by-name spawn set (`"budget"`, and `"child"` for a program that
+/// exports `_child`) **only** to such a guest: least authority.
 pub fn spawns_detached(module: &Module) -> bool {
     module.funcs.iter().any(Func::spawns_detached)
 }
@@ -3904,14 +4213,6 @@ pub fn detached_size_log2(requested: i64, declared: Option<u8>) -> i64 {
         (0, Some(d)) => d as i64,
         _ => requested,
     }
-}
-
-/// Whether `module` issues op 15 (`instantiate_detached`), whose module operand must be a `Module`
-/// handle — the one spawn a by-name `"module"` grant serves. The op-17 record names the spawner's own
-/// program as `-1`, so an op-17-only guest is granted its `"budget"` alone, and keeps a powerbox a
-/// warm snapshot can freeze (the `"module"` grant is non-durable).
-pub fn spawns_by_module_handle(module: &Module) -> bool {
-    module.funcs.iter().any(Func::spawns_by_module_handle)
 }
 
 /// A §14 child module's **entry signature** must be `(i64) -> (i64)` (an instantiator handle),
@@ -4009,16 +4310,6 @@ pub const POWERBOX_STACK_ALIGN: u64 = 65536;
 /// The data-stack reserve a frontend's `_start` layout leaves above the globals when sizing the
 /// window (`temen-llvm`'s `STACK_RESERVE`): a faulting guard region lies beyond the mapped window (§5).
 pub const POWERBOX_STACK_RESERVE: u64 = 1 << 20;
-/// The **guest-heap reserve** the linker leaves above the data stack when sizing a powerbox window
-/// (a program carrying a `data.top` stack): the heap a program has in its window before its allocator
-/// must commit the reserved tail with `vm_map`, as the nim compute-shim `mmap` does. Without it that
-/// in-window heap would depend on whatever `memory N` some runtime unit happened to declare (the
-/// compute shim's `memory 24`), which is incidental, not designed (#1060). Reserving heap here
-/// makes the window sizing explicit: the window always covers `data + stack reserve + heap reserve`,
-/// growing past a runtime unit's declaration when a program's static data is large. This is a
-/// **floor** on heap room, not a cap — the actual heap ceiling a frontend seeds is the full window
-/// top (`1 << size_log2`), which pow2 rounding often lifts above `entry_sp + STACK + HEAP` reserves.
-pub const POWERBOX_HEAP_RESERVE: u64 = 8 << 20;
 /// Hard anti-bomb ceiling on the fibers (`cont.new`) a single run may create (§12/§15). Bounds the
 /// fiber table so a fiber-bomb yields a clean `FiberFault` instead of unbounded host allocation. A
 /// domain's `Budget.mem` bounds its live fibers below this ([`FIBER_STACK`] each, #2112). `1 << 24`
@@ -4043,7 +4334,7 @@ const MIN_HOST_PAGE: u64 = 1 << 12;
 
 /// #2268 — the most runs of page state a fresh window of a module whose data is `data` starts with:
 /// [`WINDOW_RUNS`], and two more for each run of read-only pages, which splits the declared prefix
-/// around it, and for an op-15 pre-map (`premap`), which aliases a region into it. A `readonly`
+/// around it, and for a spawn record's pre-map (`premap`), which aliases a region into it. A `readonly`
 /// segment is protected over every host page it touches, so segments that share or adjoin pages make
 /// one run (#2355): a unit translated from LLVM, a segment per constant, makes one or a few, not two
 /// per segment. A detached child's admission reserves its window's mappings by it before the window
@@ -4690,11 +4981,19 @@ pub struct DebugInfo {
     /// (the [`TLS_ROOT_SYM`] address it placed) or by a whole-program frontend that laid the block out
     /// itself; `None` for a module with no thread-locals. See [`DebugInfo::tls_addr`].
     pub tls_root: Option<u64>,
+    /// The [`files`](Self::files) (indices, ascending) that hold a **library's** code rather than the
+    /// program's own: a unit linked *into* a program, never debugged as one (#2341). A debugger marks
+    /// their frames as library frames, and steps past them under just-my-code. Set where a unit
+    /// becomes a library (the cdylib's resident libraries) and relocated by [`link`] like every file
+    /// reference, so it holds per module — a child's own libraries included. A header compiled into
+    /// the program's own unit is the program's code, not a library's.
+    pub lib_files: Vec<u32>,
 }
 
 impl DebugInfo {
     /// True when every table is empty. Such a `DebugInfo` says nothing: [`tls_root`](Self::tls_root)
-    /// only locates [`VarLoc::Tls`] variables, so on its own nothing reads it. The decoder, the text
+    /// only locates [`VarLoc::Tls`] variables and [`lib_files`](Self::lib_files) only classifies
+    /// files, so on their own nothing reads them. The decoder, the text
     /// printer and parser, and the linker all treat a vacuous `DebugInfo` as none, so "no debug info"
     /// has one form (`None`) and every round trip keeps it.
     pub fn is_vacuous(&self) -> bool {
@@ -4709,6 +5008,7 @@ impl DebugInfo {
             blobs,
             func_names,
             tls_root: _,
+            lib_files: _,
         } = self;
         files.is_empty()
             && locs.is_empty()
@@ -4729,6 +5029,11 @@ impl DebugInfo {
             self.tls_root?
         };
         Some(block.wrapping_add(off))
+    }
+
+    /// Whether file `file` holds a library's code ([`lib_files`](Self::lib_files)).
+    pub fn is_lib_file(&self, file: u32) -> bool {
+        self.lib_files.contains(&file)
     }
 }
 
@@ -5882,13 +6187,14 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
         // The merged window (one shared linear memory) must (a) be at least as large as any unit
         // declared, (b) cover every relocated data segment — the units' data is **stacked** into
         // non-overlapping windows, so the top (`dtotal`) can exceed any single unit's 64 KiB — and
-        // (c) when the program has a `data.top` data stack, reserve [`POWERBOX_STACK_RESERVE`] +
-        // [`POWERBOX_HEAP_RESERVE`] above `entry_sp` for the stack and the in-window guest heap (as
-        // [`synth_manifest_start`] does for the on-ramp entry, plus the heap floor #1060 wants), since
+        // (c) when the program has a `data.top` data stack, reserve [`POWERBOX_STACK_RESERVE`] above
+        // `entry_sp` for the stack (as [`synth_manifest_start`] does for the on-ramp entry), since
         // the entry unit sized its own window for a stack that has since been pushed up by the other
         // units' data. Grow to the smallest power-of-two window that holds the max of these — never
-        // shrinking a unit's request. No unit declaring memory ⇒ no data segments, so `None` stays
-        // `None`.
+        // shrinking a unit's request. No heap is reserved: a program's allocator starts in what the
+        // rounding leaves above the stack and commits the window's reserved tail with `vm_map` as it
+        // grows, so a heap floor here would only be window an exec'd process zeroes and never touches
+        // (#2346). No unit declaring memory ⇒ no data segments, so `None` stays `None`.
         memory: units
             .iter()
             .filter_map(|u| u.module.memory)
@@ -5896,7 +6202,7 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
             .max()
             .map(|declared| {
                 let cover = if has_data_top {
-                    entry_sp + POWERBOX_STACK_RESERVE + POWERBOX_HEAP_RESERVE
+                    entry_sp + POWERBOX_STACK_RESERVE
                 } else {
                     dtotal
                 };
@@ -6008,6 +6314,8 @@ fn merge_debug_info(
                 func: n.func + fbase,
                 name: n.name.clone(),
             }));
+        out.lib_files
+            .extend(di.lib_files.iter().map(|f| f + file_base));
         out.blobs.extend(di.blobs.iter().cloned());
     }
     // Vacuous in ⇒ nothing out.
@@ -7342,6 +7650,29 @@ mod page0_tests {
             }
         }
     }
+
+    /// #2426: a declared arena fences the pages its runtime's words lie on, the control words' and
+    /// its own, at any host page size, and nothing else; an undeclared one fences nothing.
+    #[test]
+    fn an_arena_fences_its_runtimes_pages() {
+        let arena = d::ShadowArena::new(1 << 17, 1 << 18);
+        let fenced =
+            |page: u64, at: u64, len: u64| arena.fences(at / page, (at + len - 1) / page, page);
+        let g = POWERBOX_NULL_GUARD;
+        for page in [1 << 12, 1 << 14] {
+            assert!(fenced(page, g, page), "the control words' page, at {page}");
+            assert!(!fenced(page, g + page, page), "the page above them");
+            assert!(fenced(page, 1 << 17, page) && fenced(page, (1 << 18) - page, page));
+            assert!(
+                fenced(page, (1 << 17) - page, 2 * page),
+                "a span straddling into the arena"
+            );
+            assert!(!fenced(page, (1 << 17) - page, page) && !fenced(page, 1 << 18, page));
+            assert!(!d::ShadowArena::EMPTY.fences(g / page, g / page, page));
+        }
+        // On a 64 KiB-page host the control words share page 0 with the NULL guard.
+        assert!(fenced(1 << 16, 0, 1 << 16) && !fenced(1 << 16, 1 << 16, 1 << 16));
+    }
 }
 
 #[cfg(test)]
@@ -7628,26 +7959,28 @@ mod link_layout_tests {
         }
     }
 
-    /// #1060: a powerbox program's merged window must cover `data + stack reserve + heap reserve`, so
-    /// an in-window bump allocator (the nim compute-shim `mmap`) has guaranteed heap room above the
-    /// data stack — independent of whatever `memory N` a runtime unit declared. Before the fix the
-    /// window only covered `entry_sp + STACK_RESERVE`, so the heap's headroom was incidental.
+    /// A powerbox program's merged window is the smallest power of two that covers its data and the
+    /// data stack above it, whatever window its units declared. It reserves no heap (#2346): the
+    /// heap grows past the window's top with `vm_map`, so room for it here is window an exec'd
+    /// process zeroes for nothing.
     #[test]
-    fn powerbox_window_reserves_heap_above_the_stack() {
+    fn powerbox_window_covers_the_stack_and_no_more() {
         let linked = link(&[data_top_unit(4096)]).expect("link data.top unit");
         let mem = linked.memory.expect("has a window");
         let win = 1u64 << mem.size_log2;
-        let entry_sp = powerbox_entry_sp(&linked);
+        let cover = powerbox_entry_sp(&linked) + POWERBOX_STACK_RESERVE;
         assert!(
-            win >= entry_sp + POWERBOX_STACK_RESERVE + POWERBOX_HEAP_RESERVE,
-            "window {win:#x} must cover entry_sp {entry_sp:#x} + stack {:#x} + heap {:#x} reserves",
-            POWERBOX_STACK_RESERVE,
-            POWERBOX_HEAP_RESERVE,
+            win >= cover,
+            "window {win:#x} must cover the stack's top {cover:#x}"
         );
-        // And it grew past the unit's small declared window to do so (the reserve is load-bearing).
+        assert!(
+            win / 2 < cover,
+            "window {win:#x} is the smallest that covers the stack's top {cover:#x}"
+        );
+        // And it grew past the unit's small declared window to do so (the stack is load-bearing).
         assert!(
             mem.size_log2 > 16,
-            "window grew past the declared 64 KiB to hold the reserves (got 2^{})",
+            "window grew past the declared 64 KiB to hold the stack (got 2^{})",
             mem.size_log2
         );
     }
@@ -8032,48 +8365,380 @@ mod effects_tests {
 mod spawn_rec_tests {
     use super::*;
 
-    #[test]
-    fn encode_is_the_inverse_of_parse() {
-        let mut v1 = SpawnRec::v1(3);
-        v1.modh = 5;
-        v1.budget = 9;
-        v1.quota = 1 << 40;
-        v1.grants_ptr = 17536;
-        v1.grants_n = 2;
-        v1.args = (18432, 24);
-        v1.region = 7;
-        v1.child_off = 65536;
-        let b = v1.encode();
-        assert_eq!(b.len(), SPAWN_REC_LEN);
-        assert_eq!(SpawnRec::parse(&b), Some(v1));
+    fn every_field() -> SpawnRec {
+        SpawnRec {
+            size_log2: 17,
+            pager: 3,
+            modh: 5,
+            budget: 9,
+            grants_ptr: 17536,
+            grants_n: 2,
+            args: (18432, 24),
+            region: 7,
+            child_off: 65536,
+        }
     }
 
-    /// The version word is a fixed tag (#1867 decision 2): a version-0 record — the retired carve
-    /// placement — and any other version fail closed, as do the reserved words, a short record
-    /// (a v0 record was 56 bytes) and a long one.
     #[test]
-    fn only_a_version_1_record_parses() {
-        let b = SpawnRec::v1(1).encode();
-        let with = |o: usize, v: u32| {
-            let mut r = b.clone();
-            r[o..o + 4].copy_from_slice(&v.to_le_bytes());
-            r
-        };
-        for v in [0, 2, u32::MAX] {
-            assert_eq!(SpawnRec::parse(&with(0, v)), None, "version {v}");
-        }
-        assert_eq!(SpawnRec::parse(&with(8, 1)), None, "the word at 8");
+    fn encode_is_the_inverse_of_parse() {
+        let rec = every_field();
+        let b = rec.encode();
+        assert_eq!(b.len(), SPAWN_REC_LEN);
+        assert_eq!(SpawnRec::parse(&b), Some(rec));
         assert_eq!(
-            SpawnRec::parse(&with(12, 1)),
-            None,
-            "the word at 8, high half"
+            SpawnRec::parse(&SpawnRec::default().encode()),
+            Some(SpawnRec::default())
         );
-        assert_eq!(SpawnRec::parse(&with(76, 1)), None, "the word at 76");
-        assert_eq!(SpawnRec::parse(&b[..56]), None, "a v0-length record");
+    }
+
+    /// The handles a spawner stores at run time sit where the constants say.
+    #[test]
+    fn the_run_time_handles_sit_at_their_offsets() {
+        let b = every_field().encode();
+        let at = |o: u64| i32::from_le_bytes(b[o as usize..o as usize + 4].try_into().unwrap());
+        assert_eq!(at(SpawnRec::MODULE_AT), 5);
+        assert_eq!(at(SpawnRec::BUDGET_AT), 9);
+        assert_eq!(at(SpawnRec::REGION_AT), 7);
+    }
+
+    /// The padding word fails closed, as does a record of any other length: a short one (a
+    /// retired 56-byte carve record) or a long one (a retired 88-byte versioned record).
+    #[test]
+    fn only_a_whole_record_with_zero_padding_parses() {
+        let b = SpawnRec::default().encode();
+        let mut padded = b.clone();
+        padded[52] = 1;
+        assert_eq!(SpawnRec::parse(&padded), None, "the padding word");
+        assert_eq!(SpawnRec::parse(&b[..56]), None, "a 56-byte record");
+        assert_eq!(
+            SpawnRec::parse(&[b.as_slice(), &[0; 24]].concat()),
+            None,
+            "an 88-byte record"
+        );
         assert_eq!(
             SpawnRec::parse(&[b.as_slice(), &[0]].concat()),
             None,
             "one byte long"
+        );
+    }
+}
+
+#[cfg(test)]
+mod forwards_tests {
+    use super::*;
+
+    fn blk(params: usize, consts: usize, term: Terminator) -> Block {
+        Block {
+            params: vec![ValType::I32; params],
+            insts: (0..consts).map(|_| Inst::ConstI32(0)).collect(),
+            term,
+        }
+    }
+
+    fn br(target: BlockIdx, args: &[ValIdx]) -> Terminator {
+        Terminator::Br {
+            target,
+            args: args.to_vec(),
+        }
+    }
+
+    fn br_if(cond: ValIdx, t: (BlockIdx, &[ValIdx]), e: (BlockIdx, &[ValIdx])) -> Terminator {
+        Terminator::BrIf {
+            cond,
+            then_blk: t.0,
+            then_args: t.1.to_vec(),
+            else_blk: e.0,
+            else_args: e.1.to_vec(),
+        }
+    }
+
+    fn func(blocks: Vec<Block>) -> Func {
+        Func {
+            params: blocks[0].params.clone(),
+            results: Vec::new(),
+            blocks,
+        }
+    }
+
+    #[test]
+    fn a_chain_forwards_to_the_value_and_the_entry_param() {
+        // b0(x): c; br b1(c, x) — b1(p, q): br b2(p, q) — b2(r, s): return
+        let f = func(vec![
+            blk(1, 1, br(1, &[1, 0])),
+            blk(2, 0, br(2, &[0, 1])),
+            blk(2, 0, Terminator::Return(Vec::new())),
+        ]);
+        let w = f.forwards();
+        assert_eq!(w.source(0, 0), None, "an entry param is its own");
+        assert_eq!(w.source(1, 0), Some((0, 1)));
+        assert_eq!(w.source(1, 1), Some((0, 0)));
+        assert_eq!(w.source(2, 0), Some((0, 1)));
+        assert_eq!(w.source(2, 1), Some((0, 0)));
+        assert_eq!(w.source(1, 2), None, "a param the block does not have");
+        assert_eq!(w.source(3, 0), None, "a block the function does not have");
+    }
+
+    #[test]
+    fn a_loop_forwards_its_invariant_and_keeps_its_counter() {
+        // b0(x): c; br b1(c, x)
+        // b1(inv, n): br_if n b2(inv, n) b3(inv)
+        // b2(inv, n): m; br b1(inv, m)
+        // b3(inv): return inv
+        let f = func(vec![
+            blk(1, 1, br(1, &[1, 0])),
+            blk(2, 0, br_if(1, (2, &[0, 1]), (3, &[0]))),
+            blk(2, 1, br(1, &[0, 2])),
+            blk(1, 0, Terminator::Return(vec![0])),
+        ]);
+        let w = f.forwards();
+        assert_eq!(w.source(1, 0), Some((0, 1)));
+        assert_eq!(w.source(1, 1), None, "the counter is a phi");
+        assert_eq!(w.source(2, 0), Some((0, 1)));
+        assert_eq!(w.source(2, 1), Some((1, 1)), "the counter forwards the phi");
+        assert_eq!(w.source(3, 0), Some((0, 1)));
+    }
+
+    #[test]
+    fn a_join_of_two_values_is_its_own_and_is_forwarded_on() {
+        // b0(x): c1 c2; br_if x b1(c1) b2(c2) — b1(a): br b3(a) — b2(b): br b3(b)
+        // b3(m): br b4(m) — b4(k): return k
+        let f = func(vec![
+            blk(1, 2, br_if(0, (1, &[1]), (2, &[2]))),
+            blk(1, 0, br(3, &[0])),
+            blk(1, 0, br(3, &[0])),
+            blk(1, 0, br(4, &[0])),
+            blk(1, 0, Terminator::Return(vec![0])),
+        ]);
+        let w = f.forwards();
+        assert_eq!(w.source(1, 0), Some((0, 1)));
+        assert_eq!(w.source(2, 0), Some((0, 2)));
+        assert_eq!(w.source(3, 0), None);
+        assert_eq!(w.source(4, 0), Some((3, 0)));
+    }
+
+    #[test]
+    fn edges_from_unreachable_blocks_do_not_count() {
+        // b0(x): br b1(x) — b1(y): return y — b2(z) (unreachable): c; br b1(c)
+        let f = func(vec![
+            blk(1, 0, br(1, &[0])),
+            blk(1, 0, Terminator::Return(vec![0])),
+            blk(1, 1, br(1, &[1])),
+        ]);
+        let w = f.forwards();
+        assert_eq!(w.source(1, 0), Some((0, 0)));
+        assert_eq!(
+            w.source(2, 0),
+            None,
+            "a param of an unreachable block is its own"
+        );
+    }
+
+    #[test]
+    fn self_loops_and_cycles_of_params_forward_what_enters_them() {
+        // b0(x): br b1(x)
+        // b1(p): br_if p b1(p) b2(p) — b2(q): br_if q b1(q) b3(q) — b3(r): return r
+        let f = func(vec![
+            blk(1, 0, br(1, &[0])),
+            blk(1, 0, br_if(0, (1, &[0]), (2, &[0]))),
+            blk(1, 0, br_if(0, (1, &[0]), (3, &[0]))),
+            blk(1, 0, Terminator::Return(vec![0])),
+        ]);
+        let w = f.forwards();
+        for b in 1..4 {
+            assert_eq!(w.source(b, 0), Some((0, 0)), "block {b}");
+        }
+    }
+
+    #[test]
+    fn a_branch_back_to_the_entry_keeps_its_params() {
+        // b0(x): c; br_if x b0(c) b1(x) — b1(y): return y
+        let f = func(vec![
+            blk(1, 1, br_if(0, (0, &[1]), (1, &[0]))),
+            blk(1, 0, Terminator::Return(vec![0])),
+        ]);
+        let w = f.forwards();
+        assert_eq!(w.source(0, 0), None);
+        assert_eq!(w.source(1, 0), Some((0, 0)));
+    }
+
+    /// A small deterministic generator (xorshift), so the test needs no crate.
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    /// A random function: blocks with random params and constants, each ending in a branch to
+    /// random blocks with random arguments from its own values, or a return.
+    fn random_func(r: &mut Rng) -> Func {
+        let n = 2 + r.below(10);
+        let params: Vec<usize> = (0..n)
+            .map(|b| if b == 0 { 1 } else { r.below(5) })
+            .collect();
+        let blocks = (0..n)
+            .map(|b| {
+                let consts = r.below(3);
+                let locals = params[b] + consts;
+                let args = |r: &mut Rng, t: usize| -> Vec<ValIdx> {
+                    (0..params[t])
+                        .map(|_| {
+                            if locals == 0 {
+                                0
+                            } else {
+                                r.below(locals) as ValIdx
+                            }
+                        })
+                        .collect()
+                };
+                // A block with no values has nothing to pass or test: it returns.
+                let term = match (locals, r.below(4)) {
+                    (0, _) | (_, 0) => Terminator::Return(Vec::new()),
+                    (_, 1) => {
+                        let t = r.below(n);
+                        let a = args(r, t);
+                        Terminator::Br {
+                            target: t as BlockIdx,
+                            args: a,
+                        }
+                    }
+                    _ => {
+                        let (t, e) = (r.below(n), r.below(n));
+                        let (ta, ea) = (args(r, t), args(r, e));
+                        Terminator::BrIf {
+                            cond: 0,
+                            then_blk: t as BlockIdx,
+                            then_args: ta,
+                            else_blk: e as BlockIdx,
+                            else_args: ea,
+                        }
+                    }
+                };
+                // A target with params needs a block that has values to pass.
+                let term = match &term {
+                    Terminator::Br { target, .. }
+                        if locals == 0 && params[*target as usize] > 0 =>
+                    {
+                        Terminator::Return(Vec::new())
+                    }
+                    _ => term,
+                };
+                blk(params[b], consts, term)
+            })
+            .collect();
+        func(blocks)
+    }
+
+    /// Each block's dominators among the reachable blocks (the iterative definition).
+    fn dominators(f: &Func) -> Vec<Option<Vec<bool>>> {
+        let n = f.blocks.len();
+        let mut reach = vec![false; n];
+        let mut stack = vec![0];
+        reach[0] = true;
+        while let Some(b) = stack.pop() {
+            for (t, _) in f.blocks[b].term.edges() {
+                if !reach[t as usize] {
+                    reach[t as usize] = true;
+                    stack.push(t as usize);
+                }
+            }
+        }
+        let mut dom: Vec<Option<Vec<bool>>> = (0..n)
+            .map(|b| reach[b].then(|| (0..n).map(|d| b != 0 || d == 0).collect()))
+            .collect();
+        loop {
+            let mut changed = false;
+            for b in 1..n {
+                if !reach[b] {
+                    continue;
+                }
+                let mut meet = vec![true; n];
+                for (u, blk) in f.blocks.iter().enumerate() {
+                    if reach[u] && blk.term.edges().iter().any(|&(t, _)| t as usize == b) {
+                        let du = dom[u].as_ref().unwrap();
+                        for d in 0..n {
+                            meet[d] &= du[d];
+                        }
+                    }
+                }
+                meet[b] = true;
+                if dom[b].as_ref() != Some(&meet) {
+                    dom[b] = Some(meet);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return dom;
+            }
+        }
+    }
+
+    #[test]
+    fn a_forwarded_value_dominates_its_param_and_is_its_value_on_every_path() {
+        let mut r = Rng(0x2448_5eed);
+        let (mut forwarded, mut checked) = (0, 0);
+        for _ in 0..3000 {
+            let f = random_func(&mut r);
+            let w = f.forwards();
+            let dom = dominators(&f);
+            for (b, blk) in f.blocks.iter().enumerate() {
+                for i in 0..blk.params.len() {
+                    let Some((sb, si)) = w.source(b, i) else {
+                        continue;
+                    };
+                    let (sb, si) = (sb as usize, si as usize);
+                    forwarded += 1;
+                    assert!(dom[b].as_ref().is_some_and(|d| d[sb]), "{f:?}: ({b}, {i})");
+                    assert!(sb != b, "{f:?}: ({b}, {i}) forwards its own block's value");
+                    let own = si >= f.blocks[sb].params.len() || w.source(sb, si).is_none();
+                    assert!(own, "{f:?}: ({b}, {i}) forwards a param that forwards");
+                }
+            }
+            // Walk random paths: every value an instruction defines is fresh each time it runs, a
+            // param takes its argument's value, and a forwarded param must hold its value's
+            // latest definition whenever its block is entered.
+            let mut next = 0u64;
+            for _ in 0..8 {
+                let mut cur: Vec<Vec<Option<u64>>> = f
+                    .blocks
+                    .iter()
+                    .map(|b| vec![None; b.params.len() + b.insts.len()])
+                    .collect();
+                let (mut b, mut incoming) = (0usize, vec![Some(u64::MAX)]);
+                for _ in 0..64 {
+                    let blk = &f.blocks[b];
+                    for (i, v) in incoming.iter().enumerate() {
+                        cur[b][i] = *v;
+                    }
+                    for i in 0..blk.params.len() {
+                        if let Some((sb, si)) = w.source(b, i) {
+                            checked += 1;
+                            assert_eq!(
+                                cur[b][i], cur[sb as usize][si as usize],
+                                "{f:?}: ({b}, {i})"
+                            );
+                        }
+                    }
+                    for k in 0..blk.insts.len() {
+                        next += 1;
+                        cur[b][blk.params.len() + k] = Some(next);
+                    }
+                    let edges = blk.term.edges();
+                    if edges.is_empty() {
+                        break;
+                    }
+                    let (t, args) = edges[r.below(edges.len())];
+                    incoming = args.iter().map(|a| cur[b][*a as usize]).collect();
+                    b = t as usize;
+                }
+            }
+        }
+        assert!(
+            forwarded > 1000 && checked > 1000,
+            "{forwarded} forwarded, {checked} checked"
         );
     }
 }

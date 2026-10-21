@@ -1,5 +1,5 @@
 // Real-browser (V8) end-to-end for a **guest-issued detached spawn on the JS-orchestrated op-13 loop**
-// (#1286): the resumable driver guest calls `Instantiator.instantiate_detached` (op 15, 9-arg form with the
+// (#1286): the resumable driver guest spawns through an `Instantiator` spawn record (op 17, with a
 // spawn-time args payload), the engine surfaces `VcpuEvent::InstantiateDetached`, the cdylib mints the child
 // a fresh `WebAssembly.Memory` (`foreign_mint`) and stages it as OP13JIT_CHILD_DETACHED, JS drives the
 // child's emitted `_start` bound to THAT memory (`driveDetachedRun`), and the joined result flows back to
@@ -8,7 +8,7 @@
 // grown page, and returns `word + attest`. Expected value is fully determined; non-vacuity: the child
 // emitted, its memory grew, the driver's own window never held the argv word at the child's address.
 //
-// Second case (#1527): the same loop with an op-15 **pre-mapped SharedRegion** (the 11-arg form). Two
+// Second case (#1527): the same loop with a **pre-mapped SharedRegion** named in the record. Two
 // `WebAssembly.Memory`s cannot alias, so the servicer copies the region's bytes into the child memory at
 // the offset before the emitted child starts and copies the span back into the region at deliver — a
 // detached child runs to completion before its parent resumes, so that is observationally the alias.
@@ -44,7 +44,8 @@ await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 const ARGV_WORD = 7306014452085450088n; // "hello-de" little-endian
 // The driver (memory 16; entry `(Instantiator, Module, WindowMinter) -> i64`): stores the args blob
 // `{argc 1, envc 0} "hello-detached\0"` as three words at 18432 (above its NULL guard), spawns the child
-// DETACHED with the payload `(18432, 24)`, no grants, entry 0, window 2^16, then joins it.
+// DETACHED through the record it lays at 17408 (the payload `(18432, 24)`, no grants, a 2^16 window, no
+// pager or region; every field left 0 is none), then joins it.
 const DRIVER = `memory 16
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
@@ -57,16 +58,20 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vb2 = i64.const 18448
   vw2 = i64.const 110386705817972
   i64.store vb2 vw2
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 16
-  vq = i64.const 0
+  vra = i64.const 17408
+  vrl = i32.const 16
+  i32.store vra vrl
+  vrn = i32.const -1
+  i32.store vra vrn offset=4
+  i32.store vra v1 offset=8
+  i32.store vra v2 offset=12
+  i32.store vra vrn offset=48
   vap = i64.const 18432
+  i64.store vra vap offset=32
   val = i64.const 24
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq, vap, val)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  i64.store vra val offset=40
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vra)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vr
   }
 }
@@ -96,7 +101,8 @@ block 0 (v0: i64) {
 
 // #1527 — the pre-mapped driver (memory 17; entry `(Instantiator, Module, WindowMinter, AddressSpace)
 // -> i64`: the fourth arg is what lets it mint a region): create 64 KiB, map at 65536, store 41, spawn
-// the child detached with the region pre-mapped at 65536 of its `memory 17` window, join, read 82 back.
+// the child detached through a record at 17408 that pre-maps the region at 65536 of its `memory 17`
+// window, join, read 82 back.
 const DRIVER_PREMAP = `memory 17
 func (i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
@@ -109,13 +115,17 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
   vin = i64.const 41
   i64.store vwo vin
-  vb = i64.extend_i32_u v2
-  vmh = i64.extend_i32_u v1
-  vz = i64.const 0
-  vlog = i64.const 17
-  vreg = i64.extend_i32_u vrh
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz, vreg, vwo)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vra = i64.const 17408
+  vrl = i32.const 17
+  i32.store vra vrl
+  vrn = i32.const -1
+  i32.store vra vrn offset=4
+  i32.store vra v1 offset=8
+  i32.store vra v2 offset=12
+  i32.store vra vrh offset=48
+  i64.store vra vwo offset=56
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vra)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vk = i64.const 1000
   vm = i64.mul vj vk
   vob = i64.const 65544
@@ -229,5 +239,5 @@ const premapOk = !premap.err
 const ok = errors.length === 0 && growOk && premapOk;
 console.log(`  op13jit detached: result=${grow.result} (want ${WANT}) steps=${JSON.stringify(grow.steps)} childMem#${grow.memId} pages ${grow.pagesAtStage}→${grow.pagesAfter} storedInChild=${grow.probed && grow.probed[0] === String(ARGV_WORD)} emitted=${grow.compiles}${grow.err ? ` · ERR ${grow.err}` : ''}`);
 console.log(`  op13jit detached pre-mapped: result=${premap.result} (want 42082) steps=${JSON.stringify(premap.steps)} childMem#${premap.memId} child[65536]=${premap.probed && premap.probed[0]} child[65544]=${premap.probed && premap.probed[1]} emitted=${premap.compiles}${premap.err ? ` · ERR ${premap.err}` : ''}`);
-console.log(ok ? 'PASS — a guest-issued op 15 on the op-13 loop ran its child on the emitted tier in a freshly minted WebAssembly.Memory (args payload + vm_map growth; a pre-mapped region by copy-in/copy-out)' : 'FAIL');
+console.log(ok ? 'PASS — a guest-issued spawn record on the op-13 loop ran its child on the emitted tier in a freshly minted WebAssembly.Memory (args payload + vm_map growth; a pre-mapped region by copy-in/copy-out)' : 'FAIL');
 process.exit(ok ? 0 : 1);

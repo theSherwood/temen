@@ -7,15 +7,15 @@
 #   nifmake     spawns every step of the plan, in dependency order, through /bin/sh
 #   nifler      every module parsed (nimsem also spawns it for each file a module includes)
 #   nimsem      system, each dependency, then the program (--isMain)
-#   hexer       every module lowered to Leng (.x.nif), then dead-code eliminated (.c.nif)
+#   shoggoth    every module lowered to Leng (.x.nif) by its hexer, then dead-code eliminated (.c.nif)
 #   temen-link  the whole program linked into one Temen module (demos/temen_link)
 #
 # All of it in-guest: the host seeds the sources and reads the linked module, which then runs.
 #
 # On the engines: the JIT runs the build — it serves pspawn, execve and waitpid, and a run
 # compiles each program once, for every process that runs it (#1825) — then the bytecode engine reruns
-# hexer, held to the JIT's bytes, and both run the program. The tree-walker — the oracle, 4x slower
-# here — is `--engine tree`, for a local run. On every PR, the spawn is differentialled across all
+# hexer (`shoggoth c`), held to the JIT's bytes, and both run the program. The tree-walker — the
+# oracle, 4x slower here — is `--engine tree`, for a local run. On every PR, the spawn is differentialled across all
 # three engines by `caller_request_parity.rs`, and the fork + exec a program not built for Temen
 # takes by nim_e2e's `nim_shells_out_through_the_posix_sh`.
 #
@@ -28,7 +28,7 @@
 # With NIM_LANE_SELF=1 the lane also builds a program with a macro in-guest (#2046): nimsem builds
 # the macro's plugin for Temen, in the program's cache (#2049), and runs it there, and the program
 # must print what native nimony's build of it prints. And it has nimony build each of its own tools
-# in-guest (#763): the driver, nifmake, nifler2, nimsem and hexer. Each must be byte for byte the
+# in-guest (#763): the driver, nifmake, nifler2, nimsem and shoggoth. Each must be byte for byte the
 # tool that ran in the build (`--fixed-point`), and nimsem's artifacts must also match native
 # nimony's. nifler2 takes its plugins, parsegen and regex, which nimsem builds for Temen and runs
 # in-guest. The nightly run (and a manual dispatch) sets it; a PR run leaves it out.
@@ -62,7 +62,7 @@ N="$W/nimony"
 lane() {
   "$B/nim_selfhost_lane" \
     --sh "$W/sh.ir" --nimony "$W/nimony.temen" --nifmake "$W/nifmake.temen" \
-    --nimsem "$W/nimsem.temen" --nifler "$W/nifler2.temen" --hexer "$W/hexer.temen" \
+    --nimsem "$W/nimsem.temen" --nifler "$W/nifler2.temen" --shoggoth "$W/shoggoth.temen" \
     --temen-link "$W/temen-link.temen" "$@"
 }
 
@@ -85,7 +85,7 @@ let parts = "a,bb,ccc".split(",")
 echo "parts=", parts.len, " total=", lengths("a,bb,ccc"), " ctfe=", atCompileTime, " up=", toUpperAscii("temen")
 NIM
 (cd "$P" && ./bin/nimony c -d:temen --isMain prog.nim >/dev/null)
-"$(ls "$P"/nimcache/*/prog | head -1)" >"$W/native.out"
+"$(ls "$P"/nimcache/c/*/prog | head -1)" >"$W/native.out"
 lane --engine jit,bytecode --expect "$P" prog.nim "$W/cache" >"$W/temen.out"
 if ! diff -u "$W/native.out" "$W/temen.out"; then
   echo "the program built on Temen does not print what the native build prints (diff above)" >&2
@@ -111,7 +111,7 @@ macro hello(): untyped =
 hello()
 NIM
 (cd "$M" && ./bin/nimony c -d:temen --isMain prog.nim >/dev/null)
-"$(ls "$M"/nimcache/*/prog | head -1)" >"$W/macro-native.out"
+"$(ls "$M"/nimcache/c/*/prog | head -1)" >"$W/macro-native.out"
 lane --engine jit "$M" prog.nim "$W/cache-macro" >"$W/macro-temen.out"
 if ! diff -u "$W/macro-native.out" "$W/macro-temen.out"; then
   echo "the macro program built on Temen does not print what the native build prints (diff above)" >&2
@@ -131,6 +131,6 @@ echo "[5/5] nimony builds each of its tools on Temen, and each is the tool that 
 # Each against the .temen the toolchain linked (`--fixed-point`); nimsem also against the
 # toolchain's native build of it, in the tree's nimcache (`--expect`).
 lane --engine jit --expect --fixed-point "$N" src/nimony/nimsem.nim "$W/cache-nimsem"
-for p in nifler2/nifler2 hexer/hexer nimony/nimony nifmake/nifmake; do
+for p in nifler2/nifler2 lengc/shoggoth/shoggoth nimony/nimony nifmake/nifmake; do
   lane --engine jit --fixed-point "$N" "src/$p.nim" "$W/cache-$(basename "$p")"
 done

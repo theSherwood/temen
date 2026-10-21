@@ -1,7 +1,8 @@
 // nimony's own driver in a real browser (#958): the wasm export `temen_nim_open` opens a build of a nim
-// program the way `scripts/ci/nim-selfhost-lane.sh`'s step 4 builds it natively — `nimony t --isMain
-// prog.nim`, which forks and execs nifmake, `/bin/sh`, nifler2, nimsem, hexer and temen-link, and a
-// compile-time evaluation's own build — and the cooperative driver (`driveCoopTierupRun`) runs it inside
+// program the way `scripts/ci/nim-selfhost-lane.sh`'s step 4 builds it natively — `nimony t
+// --novalidate --isMain prog.nim` (no plugin validator ships with the toolchain), which forks and
+// execs nifmake, `/bin/sh`, nifler2, nimsem, shoggoth and temen-link, and a compile-time evaluation's
+// own build — and the cooperative driver (`driveCoopTierupRun`) runs it inside
 // Chromium: the process tree on the interpreter tier, each leaf process that cannot park whole on the
 // emitted tier (#1896), and temen-link natively. Reports the build's wall-clock and the engine's linear
 // memory after it (a wasm memory only grows, so that is its peak). A measurement, not a gate; it fails
@@ -12,7 +13,7 @@
 //
 // `NIM_LANE_DIR` holds the toolchain as `scripts/nim-toolchain.sh` writes it and `src/nimbuild.rs`
 // reads it (`nimony.temen`, …, `sh.ir`, `libc.temeno`); `NIM_TREE` is a lane program tree, seeded and
-// built at `NIM_AT` (by default its host path). `NIM_LIB` is a library pack (`nimbuild --pack`, from a
+// built at `NIM_AT` (by default its host path). `NIM_LIB` is a library pack (`nim_card_bundle --pack`, from a
 // build at the same `NIM_AT`), seeded after the tree so the build compiles only the program's own
 // modules. The page receives them over routed URLs.
 import { startServer } from './serve.mjs';
@@ -28,7 +29,7 @@ if (!LANE || !NIM_TREE || !NIM_PROG || !existsSync(WASM)) {
   console.log('SKIP: set NIM_LANE_DIR, NIM_TREE and NIM_PROG, and build the threads wasm');
   process.exit(0);
 }
-const TOOLS = ['nimony', 'nifmake', 'nimsem', 'nifler2', 'hexer'];
+const TOOLS = ['nimony', 'nifmake', 'nimsem', 'nifler2', 'shoggoth'];
 const tree = realpathSync(NIM_TREE);
 const dir = NIM_AT || tree;
 
@@ -131,7 +132,7 @@ const res = await page.evaluate(async ({ maxPages }) => {
   const tools = await Promise.all(m.tools.map(async (t) => [t, await fetchB(`./nimbench/tool/${t.name}`)]));
   const cmds = blob([['/bin/sh', shMod], ...tools.map(([t, b]) => [t.paths.join('\n'), b])]);
   const tree = blob(await Promise.all(m.files.map(async (p, i) => [p, await fetchB(`./nimbench/file/${i}`)])));
-  const argv = enc.encode(['bin/nimony', 't', '--isMain', m.prog].map((a) => `${a}\0`).join(''));
+  const argv = enc.encode(['bin/nimony', 't', '--novalidate', '--isMain', m.prog].map((a) => `${a}\0`).join(''));
   const driver = tools[0][1];
   const args = [put(driver), put(cmds), put(tree), put(argv), put(enc.encode(m.dir))].flat();
   // #1896: a leaf process that parks on its pipes runs emitted too where JSPI suspends its frames.
@@ -148,13 +149,13 @@ const res = await page.evaluate(async ({ maxPages }) => {
   const text = (p, n) => new TextDecoder().decode(new Uint8Array(memory.buffer, p, n).slice());
   const stdout = text(ex.temen_stdout_ptr(), ex.temen_stdout_len());
   const stderr = text(ex.temen_stderr_ptr(), ex.temen_stderr_len());
-  // The linked program, `nimcache/<main>.temen/<prog>.temen`, where `<main>` is nimony's stem for the
+  // The linked program, `nimcache/t/<main>/<prog>.temen`, where `<main>` is nimony's stem for the
   // path it was given; read back from the build's memfs.
   const [qp, ql] = put(enc.encode(m.prog));
   const ml = ex.temen_nim_module_suffix(qp, ql); // onto the stdout slot, read above
   const main = text(ex.temen_stdout_ptr(), ml);
   const prog = m.prog.replace(/^.*\//, '').replace(/\.nim$/, '');
-  const [pp, pl] = put(enc.encode(`${m.dir}/nimcache/${main}.temen/${prog}.temen`));
+  const [pp, pl] = put(enc.encode(`${m.dir}/nimcache/t/${main}/${prog}.temen`));
   const n = Number(ex.temen_nim_file(pp, pl));
   const built = n >= 0 ? new Uint8Array(memory.buffer, ex.temen_nim_file_ptr(), n).slice() : null;
   const digest = built && [...new Uint8Array(await crypto.subtle.digest('SHA-256', built))]

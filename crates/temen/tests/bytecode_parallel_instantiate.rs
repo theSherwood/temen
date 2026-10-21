@@ -15,13 +15,13 @@ use temen_ir::{Module, SpawnRec};
 use temen_text::parse_module;
 
 /// The root `(i32 inst, i32 child, i32 budget) -> i64`: spawns `child` (func 1's child image, #2219)
-/// by the v1 record at 17408, paid from `budget`, then waits on a word nothing notifies, five times.
+/// by the spawn record at 17408, paid from `budget`, then waits on a word nothing notifies, five times.
 const TRAP_UNJOINED: &str = r#"memory 17
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vc: i32, vb: i32) {
-  vrm = i64.const 17432
+  vrm = i64.const 17416
   i32.store vrm vc
-  vrb = i64.const 17436
+  vrb = i64.const 17420
   i32.store vrb vb
   vrp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -58,14 +58,17 @@ block 0 (v0: i64) {
 "#;
 
 fn module() -> Module {
-    let src = format!("{TRAP_UNJOINED}{}", rec::segment(17408, &SpawnRec::v1(0)));
+    let src = format!(
+        "{TRAP_UNJOINED}{}",
+        rec::segment(17408, &SpawnRec::default())
+    );
     parse_module(&src).expect("parse")
 }
 
 /// The root's powerbox and args: its `Instantiator`, the child image, and a `Budget` for its window.
 fn host(m: &Module) -> (Host, [Value; 3]) {
     let mut h = Host::new();
-    let inst = h.grant_instantiator(0, 128 << 10);
+    let inst = h.grant_instantiator();
     let child = h.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
     let budget = h.grant_budget(-1, 1 << 20, -1);
     (h, [inst, child, budget].map(Value::I32))

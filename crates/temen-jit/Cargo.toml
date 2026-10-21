@@ -34,6 +34,8 @@ cranelift-jit = "0.132.0"
 cranelift-module = "0.132.0"
 cranelift-native = "0.132.0"
 temen-ir.workspace = true
+# `digest256`: the kept code's keys and checksums (`code_dir`).
+temen-encode.workspace = true
 # The native stack-switch substrate for JIT fibers/green threads (§12). Real impl on x86-64 unix;
 # elsewhere `supported()` is false and the JIT keeps bailing `Unsupported` on fiber ops.
 temen-fiber.workspace = true
@@ -70,4 +72,4 @@ loom = "0.7"
 
 [lints.rust]
 # `--cfg loom` is set manually for loom model-checking runs; tell rustc it's expected.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(fuzzing)'] }

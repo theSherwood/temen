@@ -4,7 +4,7 @@
 //! the shell reads its own `argv` through the personality (`argc`/`argv`), writes its own output through
 //! the personality (`write`), looks a command up in the personality's **PATH registry** (`exec_lookup`),
 //! and re-grants the personality's forwardable stdout (`exec_stdout`) to the child — but the spawn
-//! itself is the shell's own `Instantiator.instantiate_rec` (op 17, a v1 detached record) + `join`, driven through
+//! itself is the shell's own `Instantiator.instantiate_rec` (op 17, a detached spawn record) + `join`, driven through
 //! capability imports (`Resolved::Cap`, link-time symbol resolution; the guest discovers the
 //! `Instantiator`/personality handles itself via `cap.self` reflection).
 //!
@@ -76,6 +76,7 @@ int main(int argc, char **argv){
 /// detached record: the command's own window, paid from the `Budget`) + `join`. Its argv travels as the
 /// spawn's args payload.
 const SHELL: &str = r#"
+#include <temen.h>
 long __px_write(int h, long fd, void *buf, long n);
 long __px_exec_lookup(int h, void *name, long len);
 long __px_exec_stdout(int h);
@@ -83,9 +84,6 @@ int  __px_argc(int h);
 long __px_argv(int h, long i, void *buf, long cap);
 long __px_exec_win(int h, long module);
 long __spawn_rec(int inst, long rec);
-long __join(int inst, long child);
-int __vm_cap_count(void);
-int __vm_cap_at(int i, int *type_id_out);
 static long slen(char *s){ long n=0; while(s[n]) n++; return n; }
 /* Discover the handle of interface `want` from the domain's own capability table
    (cap.self reflection — the discovery tier IMPORTS.md keeps). */
@@ -109,7 +107,7 @@ static int __budget(void) { if (__h_budget < 0) __h_budget = __capof(14); return
 static int  seq(char *a, char *b){ long i=0; for(;;){ if(a[i]!=b[i]) return 0; if(!a[i]) return 1; i++; } }
 static int rec[4];
 static char nm[8];
-static long spawn[11];      /* the 88-byte op-17 v1 record */
+static struct vm_spawn_rec spawn; /* the op-17 record */
 static char args[4096];
 int main(void){
   int n = __px_argc(__px());
@@ -141,26 +139,27 @@ int main(void){
     for (long k = 0; k < L; k++) *p++ = tmp[k];
     *p++ = 0;
   }
-  int *w = (int *)spawn;
-  w[0] = 1;                                   /* version 1: detached; entry 0 */
-  w[4] = (int)__px_exec_win(__px(), mod);     /* size_log2 = the command's declared window */
-  w[5] = -1;                                  /* no pager */
-  w[6] = (int)mod;
-  w[7] = __budget();
-  spawn[5] = (long)rec;                       /* grants */
-  spawn[6] = 1;
-  spawn[7] = (long)args;                      /* args payload */
-  spawn[8] = p - args;
-  w[18] = -1;                                 /* no pre-mapped region */
-  long child = __spawn_rec(__inst(), (long)spawn);
+  struct vm_spawn_rec init = VM_SPAWN_REC_INIT;
+  spawn = init;
+  spawn.size_log2 = (unsigned int)__px_exec_win(__px(), mod); /* the command's declared window */
+  spawn.module = (int)mod;
+  spawn.budget = __budget();
+  spawn.grants_ptr = (long)rec;
+  spawn.grants_n = 1;
+  spawn.args_ptr = (long)args;
+  spawn.args_len = p - args;
+  long child = __spawn_rec(__inst(), (long)&spawn);
   if (child < 0) return 126;
-  return __join(__inst(), child);
+  long st;
+  long r = __vm_instantiate_join(__inst(), child, &st);
+  return st == 0 ? r : 128;                    /* a command's trap is a crash status, not ours */
 }
 "#;
 
 /// Link the shim's import names — the shell demo's one resolver ([`temen_run::shell_demo_resolver`]):
-/// `__px_*` through [`temen_posix::resolve`], `__spawn_rec`/`__join` the shell's own `Instantiator`
-/// ops (17 / 1). No handle is baked at link: each lowered `call.cap` dispatches on the guest's own
+/// `__px_*` through [`temen_posix::resolve`], `__spawn_rec` the shell's own `Instantiator` op 17 (its
+/// join is chibicc's `__vm_instantiate_join` builtin, op 1). No handle is baked at link: each lowered
+/// `call.cap` dispatches on the guest's own
 /// handle operand, discovered at run time via `__vm_cap_count`/`__vm_cap_at` reflection (§3c
 /// protection at the boundary, IMPORTS.md §2.3 dynamic mode).
 fn link_shim(name: &str) -> Option<Resolved> {
@@ -180,7 +179,7 @@ fn run(
     let mut host = Host::new();
     let sink = host.shared_stdout(); // the child's re-granted Stream writes here…
     let out_h = host.grant_stream(StreamRole::Out);
-    let _inst_h = host.grant_instantiator(0, win as u64);
+    let _inst_h = host.grant_instantiator();
     let echo_h = host.grant_module(cmd);
     let _budget_h = host.grant_budget(-1, 1 << 20, -1); // the command's window is paid from this
                                                         // The personality's heap sits in the top 64 KiB, clear of the shell's data/stack (a lean shell

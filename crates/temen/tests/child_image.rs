@@ -11,9 +11,12 @@
     all(windows, target_arch = "x86_64")
 ))]
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use temen_interp::bytecode::{CoopEvent, CoopRun, Footprint};
 use temen_interp::{bytecode, run_capture_reserved_with_host, Host, MemLayout, Value};
-use temen_ir::{child_image, Module};
+use temen_ir::{child_image, Module, SpawnRec};
 use temen_jit::JitOutcome;
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -113,37 +116,44 @@ fn an_unfit_child_entry_is_refused() {
     }
 }
 
-/// A parent `(inst, module, budget) -> i64` that spawns `module` detached `n` times at function 0,
-/// joins each child, and returns the sum of their statuses.
+/// A parent `(inst, module, budget) -> i64` that spawns `module` detached `n` times, each through the
+/// spawn record at 17408 (a child starts at its module's function 0), joins each child, and returns the
+/// sum of their statuses.
 fn parent(n: usize) -> Module {
     let mut body = String::new();
     for i in 0..n {
         body += &format!(
-            "  c{i} = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)\n  \
-             r{i} = call.cap 6 1 (i32) -> (i64) vinst (c{i})\n  \
+            "  c{i} = call.cap 6 17 (i64) -> (i32) vinst (rp)\n  \
+             r{i}_st, r{i} = call.cap 6 1 (i32) -> (i64, i64) vinst (c{i})\n  \
              s{} = i64.add s{i} r{i}\n",
             i + 1
         );
     }
+    let spawn = SpawnRec {
+        size_log2: 16,
+        ..SpawnRec::default()
+    };
     parse(&format!(
         "memory {PARENT_LOG2}
 func (i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vmod: i32, vbud: i32) {{
-  me = i64.extend_i32_s vmod
-  vb = i64.extend_i32_s vbud
-  gz = i64.const 0
-  sl = i64.const 16
+  rm = i64.const 17416
+  i32.store rm vmod
+  rb = i64.const 17420
+  i32.store rb vbud
+  rp = i64.const 17408
   s0 = i64.const 0
 {body}  return s{n}
   }}
 }}
-"
+{rec}",
+        rec = rec::segment(17408, &spawn)
     ))
 }
 
 fn powerbox() -> (Host, [i32; 3]) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(&image());
     let budget = host.grant_budget(-1, -1, -1);
     (host, [inst, modh, budget])

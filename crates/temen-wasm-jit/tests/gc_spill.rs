@@ -13,7 +13,7 @@
 //! no dead ones, so the cost stays what #1627 measured.
 
 use temen_wasm_jit::{
-    compile_module_tierup_b2, ENV_SPILL_END_OFF, ENV_SPILL_SP_OFF, TRAP_SPILL_OVERFLOW,
+    compile_module_tierup_b2, BounceHost, ENV_SPILL_END_OFF, ENV_SPILL_SP_OFF, TRAP_SPILL_OVERFLOW,
 };
 use wasmi::{
     Caller, Engine, FuncRef, Linker, Memory, MemoryType, Module as WModule, Store, Table,
@@ -118,8 +118,16 @@ fn read_u32(mem: &Memory, ctx: impl wasmi::AsContext, at: u32) -> u32 {
 /// Returns the result (or the `env.trap` code) and every bounce, and checks the cursor is back at
 /// the base after a clean return.
 fn run(name: &str, arg: i64, end: u32) -> (Result<i64, i32>, Vec<Bounce>) {
-    let (wasm, emitted) =
-        compile_module_tierup_b2(&module(SRC), false, TABLE_LOG2, true).expect("emit");
+    let (wasm, emitted) = compile_module_tierup_b2(
+        &module(SRC),
+        false,
+        TABLE_LOG2,
+        BounceHost {
+            spill: true,
+            parks: false,
+        },
+    )
+    .expect("emit");
     assert_eq!(
         emitted,
         [true, false, false, true, true, true],
@@ -261,7 +269,8 @@ fn a_push_past_the_region_traps_instead_of_writing() {
 #[test]
 fn spill_mode_is_opt_in_and_inert_without_gc_roots() {
     let m = module(SRC);
-    let (_, vetoed) = compile_module_tierup_b2(&m, false, TABLE_LOG2, false).unwrap();
+    let (_, vetoed) =
+        compile_module_tierup_b2(&m, false, TABLE_LOG2, BounceHost::default()).unwrap();
     assert!(vetoed.iter().all(|&e| !e), "#1546 still holds: {vetoed:?}");
 
     let plain = module(
@@ -277,8 +286,17 @@ block 0 (v0: i64) {
 "#,
     );
     assert_eq!(
-        compile_module_tierup_b2(&plain, false, TABLE_LOG2, true).unwrap(),
-        compile_module_tierup_b2(&plain, false, TABLE_LOG2, false).unwrap(),
+        compile_module_tierup_b2(
+            &plain,
+            false,
+            TABLE_LOG2,
+            BounceHost {
+                spill: true,
+                parks: false
+            }
+        )
+        .unwrap(),
+        compile_module_tierup_b2(&plain, false, TABLE_LOG2, BounceHost::default()).unwrap(),
         "no gc.roots, no spill code"
     );
 }

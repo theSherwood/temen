@@ -14,6 +14,13 @@
 //! ([`arm_freeze_after`]), which the rows that fire the freeze in a sibling use; the oracle and the
 //! bytecode engine keep freeze-on-quiesce ([`arm_freeze_on_quiesce`]), which the one-vCPU rows use.
 
+#[path = "support/detached_thaw.rs"]
+mod detached_thaw;
+#[path = "support/paged_detached.rs"]
+mod paged_detached;
+
+use detached_thaw::rec;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use temen_durable::{
@@ -21,10 +28,10 @@ use temen_durable::{
     transform_module_assume_confined, ARM_QUIESCE_OFF,
 };
 use temen_interp::{
-    run_capture_reserved_with_host, CapState, FreezeRule, FreezeScope, Host, ParkSite,
-    SignalSource, StreamRole, Value,
+    run_capture_reserved_with_host, CapState, FreezeRule, Host, ParkSite, SignalSource, StreamRole,
+    Value,
 };
-use temen_ir::{Memory, Module};
+use temen_ir::{Memory, Module, SpawnRec};
 use temen_jit::JitOutcome;
 
 const TEST_ARENA: temen_ir::durable_abi::ShadowArena =
@@ -75,7 +82,7 @@ fn interp_row(site: ParkSite) -> Row {
                   when it parks, so no lane is ever full",
         },
         ParkSite::Reply => Row::Case(reply),
-        ParkSite::PageFault => PAGE_FAULT_PENDING,
+        ParkSite::PageFault => Row::Case(page_fault),
         ParkSite::Completion => COMPLETION_PENDING,
         ParkSite::ReapAny => Row::Unreachable {
             why: "`wait(-1)` needs a live fork twin, which declines the freeze first (#1688)",
@@ -117,16 +124,16 @@ fn jit_row(site: ParkSite) -> Row {
                 "the JIT's `live_impl_call` reply park: its re-park on thaw, and the re-link of a \
                   `LiveImpl` onto a re-launched detached child",
         },
-        ParkSite::PageFault => PAGE_FAULT_PENDING,
+        ParkSite::PageFault => Row::Pending {
+            issue: 2489,
+            why:
+                "a durable run refuses a pager record: its freeze cannot hold for a paged child's \
+                  page request yet, nor its thaw re-link the pager",
+        },
         ParkSite::Completion => COMPLETION_PENDING,
         ParkSite::Admit => ADMIT_UNREACHABLE,
     }
 }
-
-const PAGE_FAULT_PENDING: Row = Row::Pending {
-    issue: 1940,
-    why: "a faulting access is no call to re-issue, and cannot unwind until its page arrives",
-};
 
 const COMPLETION_PENDING: Row = Row::Pending {
     issue: 1902,
@@ -163,7 +170,11 @@ fn bytecode_row(site: ParkSite) -> Row {
             issue: 1904,
             why: "a live call's reply park: its re-park on thaw (#1901)",
         },
-        ParkSite::PageFault => PAGE_FAULT_PENDING,
+        ParkSite::PageFault => Row::Pending {
+            issue: 1893,
+            why: "only a detached child pages (#2164), and a durable run on this engine refuses a \
+                  detached spawn: its freeze cannot capture one",
+        },
         ParkSite::Completion => COMPLETION_PENDING,
         ParkSite::Admit => ADMIT_UNREACHABLE,
     }
@@ -509,6 +520,19 @@ block 2 (va2: i64) {{
     );
 }
 
+/// #1940 — a page fault. Only a demand-paged child faults, so this row is not the shared shape: the
+/// child parks on its page while its pager computes, the trigger fires in the pager, and the freeze
+/// holds the pager to serve the fault (#2455). The scenario is `support/paged_detached.rs`'s.
+fn page_fault(site: ParkSite, engine: Engine) {
+    assert_eq!(site.freeze_rule(), FreezeRule::Phase);
+    assert_eq!(
+        engine,
+        Engine::Interp,
+        "only the tree-walker freezes a paged child (#1893, #2164)"
+    );
+    paged_detached::fault_parked_at_the_trigger_thaws();
+}
+
 /// A pipe read — the root reads one byte from an empty pipe whose write end the sibling holds and
 /// writes `x` to after its loop: `1000·1 + 'x' + 7`.
 fn pipe_read(site: ParkSite, engine: Engine) {
@@ -820,7 +844,7 @@ block 0 (vx: i64) {
 }
 
 /// A live call's reply — thread `T` calls `bump(41)` on a detached child `C` that serves one
-/// dispatch (op 15 spawning func 2's child image (#2219), then `child_offer`), while the root
+/// dispatch (a spawn record spawning func 2's child image (#2219), then `child_offer`), while the root
 /// resumes a fiber, where the countdown fires. The root unwinds and rings `C`, which unwinds in its
 /// `svc.wait` without serving; `T` then enqueues its call and parks on the reply, and the freeze
 /// re-admits it: its wait is abandoned, its dispatch stays queued on `C`, and the ticket rides the
@@ -891,11 +915,13 @@ type 1 interface { bump: 0 }
 export 0 interface "counter" 1 { bump: 3 }
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
   vz = i64.const 0
-  vlog = i64.const 17
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
+  vrm = i64.const 65544
+  i32.store vrm v1
+  vrb = i64.const 65548
+  i32.store vrb v2
+  vrp = i64.const 65536
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vex = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vc, vex)
   vcap64 = i64.extend_i32_u vcap
@@ -915,7 +941,7 @@ block 1 (vi0: i32, vc1: i32, vt1: i32, vk1: i64, vi: i64) {
 }
 block 2 (vi3: i32, vc2: i32, vt2: i32) {
   vr = thread.join vt2
-  vn = call.cap 6 1 (i32) -> (i64) vi3 (vc2)
+  vn_st, vn = call.cap 6 1 (i32) -> (i64, i64) vi3 (vc2)
   vth = i64.const 1000
   vm = i64.mul vn vth
   vres = i64.add vm vr
@@ -939,15 +965,24 @@ block 0 (vx: i64) {
   }
 }
 "#;
-    let src = format!("{src}{t}{server}{FIBER}{CALLING_FIBER}");
+    // The root's spawn record, above the shadow arena: `C`'s 128 KiB window, the module and budget
+    // stored there.
+    let spawn = SpawnRec {
+        size_log2: 17,
+        ..SpawnRec::default()
+    };
+    let src = format!(
+        "{src}{t}{server}{FIBER}{CALLING_FIBER}{}",
+        rec::segment(65536, &spawn)
+    );
     let inst = instrumented(&src);
     let c = instrumented_image(&src, 2);
     let powerbox = || {
         let mut h = durable_host(&inst);
-        let i = h.grant_instantiator(0, WINDOW as u64);
+        let i = h.grant_instantiator();
         let m = h.grant_durable_module(&c);
         let b = h.grant_budget(-1, 1 << 20, -1);
-        h.grant_freeze_authority(FreezeScope::DetachedProgeny);
+        h.grant_freeze_authority();
         (h, vec![Value::I32(i), Value::I32(m), Value::I32(b)])
     };
 

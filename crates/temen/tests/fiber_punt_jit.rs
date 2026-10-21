@@ -2,7 +2,7 @@
 //! that closes ISSUES.md I73. The JIT's `cap_thunk`/`cap_thunk_locked` now route a fiber's punt
 //! through the pending face and park the FIBER (`fiber_cap_wait` over the `Completions` fiber
 //! cells + the `fiber_rt` event-park seam), so every F1 kernel produces the identical composite
-//! on all three engines — statuses, values, and delivery order alike (all-integer kernels, so
+//! on all three engines — statuses, values, and delivery alike (all-integer kernels, so
 //! the NaN-insensitive JIT contract is bit-exact here). Kernels duplicated verbatim from
 //! `temen-interp/tests/fiber_punt_diff.rs` (no fixture crate — the `host_park.rs` precedent).
 //!
@@ -134,8 +134,11 @@ fn a_punt_in_a_fiber_parks_identically_on_all_three_engines() {
         &m,
         &|| {
             let mut h = Host::new();
-            let hh =
-                h.grant_host_proc_offloadable(punting_handler(), temen_interp::CapState::Stateless);
+            let hh = h.grant_host_proc_offloadable(
+                punting_handler(),
+                None,
+                temen_interp::CapState::Stateless,
+            );
             (h, hh)
         },
         30_105,
@@ -217,7 +220,10 @@ fn the_single_vcpu_overlap_holds_identically_on_all_three_engines() {
     );
 }
 
-const ORDERED_FIBER_DELIVERY: &str = r#"
+/// `fiber_parks.rs::LATER_ANSWER_FIRST` — a later call's answer reaches its fiber while an
+/// earlier call is still held (#2477), identically on all three engines: fiber 2 returns within its
+/// 1,000 polls, fiber 1 is still parked, then both deliver — 13_111_222.
+const LATER_ANSWER_FIRST: &str = r#"
 memory 16
 func (i32) -> (i64) {
 block 0 (v0: i32) {
@@ -229,50 +235,52 @@ block 0 (v0: i32) {
   vk2 = cont.new vf2 vz
   vsa, vva = cont.resume vk1 vh64
   vsb, vvb = cont.resume vk2 vh64
-  vcnt0 = i64.const 0
   vi0 = i64.const 0
-  br 1(vk1, vk2, vh64, vcnt0, vi0)
+  br 1(vk1, vk2, vh64, vi0)
 }
-block 1 (ka: i64, kb: i64, h1: i64, cnt: i64, vi: i64) {
-  vlim = i64.const 50
+block 1 (ka: i64, kb: i64, h1: i64, vi: i64) {
+  vlim = i64.const 1000
   vlt = i64.lt_s vi vlim
-  br_if vlt 2(ka, kb, h1, cnt, vi) 3(ka, kb, h1, cnt)
+  vno = i64.const 0
+  br_if vlt 2(ka, kb, h1, vi) 3(ka, h1, vno, vno)
 }
-block 2 (ka2: i64, kb2: i64, h2: i64, cnt2: i64, vi2: i64) {
+block 2 (ka2: i64, kb2: i64, h2: i64, vi2: i64) {
+  vpa = i64.const 16384
+  vpe = i32.const 0
+  vpt = i64.const 1000000
+  vps = i32.atomic.wait vpa vpe vpt
   vs, vv = cont.resume kb2 h2
-  vthree = i32.const 3
-  veq = i32.eq vs vthree
-  veq64 = i64.extend_i32_u veq
-  vcnt3 = i64.add cnt2 veq64
-  vone = i64.const 1
-  vi3 = i64.add vi2 vone
-  br 1(ka2, kb2, h2, vcnt3, vi3)
+  vone = i32.const 1
+  vdone = i32.eq vs vone
+  vstep = i64.const 1
+  vi3 = i64.add vi2 vstep
+  vyes = i64.const 1
+  br_if vdone 3(ka2, h2, vyes, vv) 1(ka2, kb2, h2, vi3)
 }
-block 3 (ka4: i64, kb4: i64, h4: i64, cnt4: i64) {
-  vh = i32.wrap_i64 h4
-  vz4 = i64.const 0
-  vrel = call.cap 13 1 (i64) -> (i64) vh (vz4)
-  br 4(ka4, kb4, h4, cnt4)
+block 3 (ka3: i64, h3: i64, vok: i64, v2: i64) {
+  vs1, vv1 = cont.resume ka3 h3
+  vheld = i64.extend_i32_u vs1
+  vh = i32.wrap_i64 h3
+  vz3 = i64.const 0
+  vrel = call.cap 13 1 (i64) -> (i64) vh (vz3)
+  br 4(ka3, h3, vok, v2, vheld)
 }
-block 4 (ka5: i64, kb5: i64, h5: i64, cnt5: i64) {
-  vs5, vv5 = cont.resume ka5 h5
+block 4 (ka4: i64, h4: i64, vok4: i64, v24: i64, vheld4: i64) {
+  vs5, vv5 = cont.resume ka4 h4
   vone5 = i32.const 1
   vdone5 = i32.eq vs5 vone5
-  br_if vdone5 5(kb5, h5, cnt5, vv5) 4(ka5, kb5, h5, cnt5)
+  br_if vdone5 5(vok4, v24, vheld4, vv5) 4(ka4, h4, vok4, v24, vheld4)
 }
-block 5 (kb6: i64, h6: i64, cnt6: i64, v1: i64) {
-  vs6, vv6 = cont.resume kb6 h6
-  vone6 = i32.const 1
-  vdone6 = i32.eq vs6 vone6
-  br_if vdone6 6(cnt6, v1, vv6) 5(kb6, h6, cnt6, v1)
-}
-block 6 (cnt7: i64, v1b: i64, v2: i64) {
-  vm = i64.const 1000000
-  vp = i64.mul cnt7 vm
+block 5 (vok5: i64, v25: i64, vheld5: i64, v1: i64) {
+  vm7 = i64.const 10000000
+  va = i64.mul vok5 vm7
+  vm6 = i64.const 1000000
+  vb = i64.mul vheld5 vm6
   vk = i64.const 1000
-  vq = i64.mul v1b vk
-  vpq = i64.add vp vq
-  vr = i64.add vpq v2
+  vc = i64.mul v1 vk
+  vab = i64.add va vb
+  vabc = i64.add vab vc
+  vr = i64.add vabc v25
   return vr
   }
 }
@@ -321,18 +329,21 @@ fn gated_handler() -> OffloadHostProc {
 }
 
 #[test]
-fn ordered_delivery_holds_identically_on_all_three_engines() {
-    let m = module(ORDERED_FIBER_DELIVERY);
+fn a_later_answer_reaches_its_fiber_first_on_all_three_engines() {
+    let m = module(LATER_ANSWER_FIRST);
     pin_three(
         &m,
         &|| {
             let mut h = Host::new();
-            let hh =
-                h.grant_host_proc_offloadable(gated_handler(), temen_interp::CapState::Stateless);
+            let hh = h.grant_host_proc_offloadable(
+                gated_handler(),
+                None,
+                temen_interp::CapState::Stateless,
+            );
             (h, hh)
         },
-        50_111_222,
-        "ordered delivery",
+        13_111_222,
+        "a later answer first",
     );
 }
 
@@ -375,6 +386,7 @@ fn root_return_abandons_a_cap_parked_fiber_identically_on_all_three() {
                     a + 100
                 }))
             }),
+            None,
             temen_interp::CapState::Stateless,
         );
         (h, hh)

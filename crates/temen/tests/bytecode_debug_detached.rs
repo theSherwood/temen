@@ -6,18 +6,23 @@
 //! journal records none of a detached child's writes, so each of its anchors carries the child's
 //! window the same way (#2058); and stdio a child's re-grant promoted into a shared cell is
 //! captured and rewound there (#2055). A line breakpoint in the debuggee's program binds in a child
-//! image of it too, whose frames read against the image's own §6 debug info (#2239); a child of a
-//! child's own program runs that child's unit (#2076). A debugger edit while a child is focused
+//! image of it too, whose frames read against the image's own §6 debug info (#2239); a grandchild's
+//! env is rebuilt under its spawner's (#2076). A debugger edit while a child is focused
 //! lands in the child's window, live and on every replay (#2072).
+
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
 
 use temen_interp::bytecode::{SchedStop, ScheduledDebugRun, ScheduledWrite};
 use temen_interp::{Host, IrPc, StreamRole, Value, VarValue, WatchKind};
+use temen_ir::SpawnRec;
 use temen_text::parse_module;
 
-/// Root `(instantiator, module, budget, stdout) -> i64`: spawns the child (op 15, entry 0, a 64 KiB
-/// window its budget pays for) with its stdout re-granted as `"stdout"`. Then 8 times it stores in
-/// its window the budget's `mem` room, which the child's window charges; then it joins the child and
-/// returns what it returns.
+/// Root `(instantiator, module, budget, stdout) -> i64`: spawns the child through the spawn record at
+/// 17536 ([`session`] lays it: a 64 KiB window its budget pays for), its module and budget stored
+/// there, with its stdout re-granted as `"stdout"`. Then 8 times it stores in its window the
+/// budget's `mem` room, which the child's window charges; then it joins the child and returns
+/// `status * 1000 + value`: what the child returned, or its trap's wire code times 1000 (#2066).
 const ROOT: &str = r#"memory 17
 data 17472 "stdout"
 func (i32, i32, i32, i32) -> (i64) {
@@ -28,13 +33,12 @@ block 0 (v0: i32, v1: i32, v2: i32, vout: i32) {
   vgh = i64.const 17416
   vout64 = i64.extend_i32_u vout
   i64.store vgh vout64
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
-  vgn = i64.const 1
-  ve = i64.const 0
-  vlog = i64.const 16
-  vq = i64.const 0
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vg, vgn, ve, vlog, vq)
+  vrm = i64.const 17544
+  i32.store vrm v1
+  vrb = i64.const 17548
+  i32.store vrb v2
+  vrp = i64.const 17536
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vz = i64.const 0
   br 1(v0, v2, vh, vz)
 }
@@ -50,8 +54,11 @@ block 1 (vi: i32, vbu: i32, vch: i32, vn: i64) {
   br_if vmore 1(vi, vbu, vch, vn2) 2(vi, vch)
 }
 block 2 (vi2: i32, vch2: i32) {
-  vj = call.cap 6 1 (i32) -> (i64) vi2 (vch2)
-  return vj
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi2 (vch2)
+  vk = i64.const 1000
+  vs = i64.mul vj_st vk
+  vt = i64.add vs vj
+  return vt
   }
 }
 "#;
@@ -124,12 +131,21 @@ block 6 () {
 
 const FUEL: u64 = 50_000_000;
 
-/// A run of `root` granting `child` as the module it spawns, with the journal armed or not.
+/// A run of `root` granting `child` as the module it spawns, with the journal armed or not. The root
+/// spawns through the spawn record at 17536, laid here: the child's 64 KiB window, and the one grant
+/// the root writes at 17408.
 fn session(root: &str, child: &str, journal: bool) -> ScheduledDebugRun {
-    let root = parse_module(root).expect("parse the root");
+    let spawn = SpawnRec {
+        size_log2: 16,
+        grants_ptr: 17408,
+        grants_n: 1,
+        ..SpawnRec::default()
+    };
+    let root = format!("{root}{}", rec::segment(17536, &spawn));
+    let root = parse_module(&root).expect("parse the root");
     let child = parse_module(child).expect("parse the child");
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << 17);
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(&child);
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let out = host.grant_stream(StreamRole::Out);
@@ -184,20 +200,20 @@ fn finish(run: &mut ScheduledDebugRun) -> (String, String) {
 /// promoted stdout (#2055).
 #[test]
 fn a_live_detached_child_rides_every_checkpoint() {
-    let (result, out) = rides_every_checkpoint(CHILD);
+    let (result, out) = rides_every_checkpoint(|| session(ROOT, CHILD, false));
     assert_eq!(
         (result.as_str(), out.as_str()),
-        ("Err(MemoryFault)", "0123"),
+        ("Ok([I64(8000)])", "0123"),
         "the uninterrupted run: the child's last load faults on the page it unmapped, and its join \
-         re-raises the fault"
+         answers `MEMORY_FAULT`"
     );
 }
 
-/// Checkpoint a run of [`ROOT`] spawning `child` at every turn, restore each checkpoint into a fresh
-/// run, and check the restore lands where the uninterrupted run stood and replays forward exactly as
-/// it did. Returns the uninterrupted run's result and output.
-fn rides_every_checkpoint(child: &str) -> (String, String) {
-    let mut refr = session(ROOT, child, false);
+/// Checkpoint a run `session` makes at every turn, restore each checkpoint into a fresh one, and
+/// check the restore lands where the uninterrupted run stood and replays forward exactly as it did.
+/// Returns the uninterrupted run's result and output.
+fn rides_every_checkpoint(session: impl Fn() -> ScheduledDebugRun) -> (String, String) {
+    let mut refr = session();
     let mut fuel = FUEL;
     let mut want = vec![observe(&mut refr)];
     let mut snaps = vec![refr.snapshot()];
@@ -213,7 +229,7 @@ fn rides_every_checkpoint(child: &str) -> (String, String) {
             wrong.push(format!("turn {c}: no checkpoint"));
             continue;
         };
-        let mut warm = session(ROOT, child, false);
+        let mut warm = session();
         warm.restore(c as u64, snap);
         let mut i = c;
         if observe(&mut warm) != want[i] {
@@ -293,9 +309,10 @@ fn an_undo_with_a_live_detached_child_matches_a_fresh_run() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// The root of [`an_undo_truncates_output_a_child_promoted`]: it spawns a child that writes `X` to
-/// the stdout it re-grants it, which promotes the root's stdout into a shared cell, joins it, spins
-/// long enough for the journal to lay anchors, and writes `Y` to that stdout itself.
+/// The root of [`an_undo_truncates_output_a_child_promoted`]: it spawns a child, through the record
+/// at 17536 as [`ROOT`] does, that writes `X` to the stdout it re-grants it, which promotes the
+/// root's stdout into a shared cell, joins it, spins long enough for the journal to lay anchors, and
+/// writes `Y` to that stdout itself.
 const PROMOTING_ROOT: &str = r#"memory 17
 data 17472 "stdout"
 func (i32, i32, i32, i32) -> (i64) {
@@ -306,14 +323,13 @@ block 0 (v0: i32, v1: i32, v2: i32, vout: i32) {
   vgh = i64.const 17416
   vout64 = i64.extend_i32_u vout
   i64.store vgh vout64
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
-  vgn = i64.const 1
-  ve = i64.const 0
-  vlog = i64.const 16
-  vq = i64.const 0
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vg, vgn, ve, vlog, vq)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vrm = i64.const 17544
+  i32.store vrm v1
+  vrb = i64.const 17548
+  i32.store vrb v2
+  vrp = i64.const 17536
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   vz = i64.const 0
   br 1(vout, vz)
 }
@@ -375,7 +391,7 @@ fn an_undo_truncates_output_a_child_promoted() {
 }
 
 /// A root `(instantiator, budget, module) -> i64` that spawns `module`, a child image of its own
-/// program (an op-17 v1 record at the image's entry, 0), and joins it. The image runs the program's
+/// program (an op-17 record at the image's entry, 0), and joins it. The image runs the program's
 /// func 1, which adds 1 to a word of its own window 3000 times and returns it, as [`LONG_CHILD`]
 /// does. The program's §6 debug info names that word `count`, a global, so a variable write
 /// resolves to it in whichever task is focused; it puts the root's return, past the join, at line 3
@@ -384,38 +400,31 @@ const SELF_ROOT: &str = r#"memory 17
 func (i32, i32, i32) -> (i64) {
 block 0 (vi: i32, vbud: i32, vmod: i32) {
   vz = i64.const 0
-  r0 = i64.const 1
+  r0 = i64.const -4294967296
   a0 = i64.const 17536
   i64.store a0 r0
-  a1 = i64.const 17544
-  i64.store a1 vz
-  r2 = i64.const -4294967296
-  a2 = i64.const 17552
-  i64.store a2 r2
   vb64 = i64.extend_i32_u vbud
   v32 = i64.const 32
   vbs = i64.shl vb64 v32
   vm64 = i64.extend_i32_u vmod
-  r3 = i64.or vbs vm64
+  r1 = i64.or vbs vm64
+  a1 = i64.const 17544
+  i64.store a1 r1
+  a2 = i64.const 17552
+  i64.store a2 vz
   a3 = i64.const 17560
-  i64.store a3 r3
+  i64.store a3 vz
   a4 = i64.const 17568
   i64.store a4 vz
   a5 = i64.const 17576
   i64.store a5 vz
+  vnone = i64.const 4294967295
   a6 = i64.const 17584
-  i64.store a6 vz
+  i64.store a6 vnone
   a7 = i64.const 17592
   i64.store a7 vz
-  a8 = i64.const 17600
-  i64.store a8 vz
-  vnone = i64.const 4294967295
-  a9 = i64.const 17608
-  i64.store a9 vnone
-  a10 = i64.const 17616
-  i64.store a10 vz
   vh = call.cap 6 17 (i64) -> (i32) vi (a0)
-  vj = call.cap 6 1 (i32) -> (i64) vi (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vh)
   return vj
   }
 }
@@ -443,7 +452,7 @@ block 2 () {
 }
 
 debug.file 0 "count.c"
-debug.loc 0 0 33 0 3 3
+debug.loc 0 0 26 0 3 3
 debug.loc 1 1 0 0 7 3
 debug.loc 1 1 7 0 9 5
 debug.fname 0 "main"
@@ -456,7 +465,7 @@ fn self_session(journal: bool) -> ScheduledDebugRun {
     let m = parse_module(SELF_ROOT).expect("parse the root");
     let image = temen_ir::child_image_at(&m, 1).expect("func 1 starts a child");
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << 17);
+    let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let modh = host.grant_module(&image);
     let args = [inst, budget, modh].map(Value::I32);
@@ -555,7 +564,7 @@ fn a_line_of_the_roots_own_code_never_stops_the_child() {
         module: 0,
         func: 0,
         block: 0,
-        inst: 33,
+        inst: 26,
     };
     match r.run_until_stop(&mut fuel) {
         SchedStop::Break { pc, .. } => assert_eq!((pc, r.stopped_task()), (past_join, Some(0))),
@@ -674,54 +683,55 @@ fn the_journal_records_only_the_root_windows_writes() {
     for r in [ticked, driven] {
         assert_eq!(
             r.journal_stats().appended,
-            11,
+            8,
             "the root's stores of the spawn record"
         );
     }
 }
 
-/// A child `(instantiator, address space) -> i64` that spawns a copy of its own program with the
-/// budget its spawn paid with, `"budget"` (an op-17 v1 record, `module = -1`), and returns what the
-/// copy returns. The copy, func 1, adds 1 to a word of its own window 20 times and returns it.
-const SPAWNING_CHILD: &str = r#"memory 16
-data 16400 "budget"
+/// A root `(instantiator, budget, child, grand) -> i64` that spawns `child`, its func 1's image,
+/// through the spawn record at 17536, granting it `grand`, its func 2's image, as `"grand"`, and joins
+/// it. The child spawns `"grand"` through the record at 17632 with the budget its spawn paid with,
+/// `"budget"`, and returns what the grandchild returns; the grandchild adds 1 to a word of its own
+/// window 20 times and returns it. [`nested_session`] lays both records, which each image carries
+/// with the program's data.
+const NESTED: &str = r#"memory 17
+data 17472 "grand"
+data 17480 "budget"
+func (i32, i32, i32, i32) -> (i64) {
+block 0 (vi: i32, vbud: i32, vchild: i32, vgrand: i32) {
+  vg = i64.const 17408
+  vw = i64.const 21474853952
+  i64.store vg vw
+  vgh = i64.const 17416
+  vgr = i64.extend_i32_u vgrand
+  i64.store vgh vgr
+  vrm = i64.const 17544
+  i32.store vrm vchild
+  vrb = i64.const 17548
+  i32.store vrb vbud
+  vrp = i64.const 17536
+  vh = call.cap 6 17 (i64) -> (i32) vi (vrp)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vh)
+  return vj
+  }
+}
 func (i64, i64) -> (i64) {
-block 0 (vi: i64, vas: i64) {
-  vp = i64.const 16400
-  vl = i64.const 6
-  vbud = self.resolve vp vl
-  vz = i64.const 0
-  r0 = i64.const 4294967297
-  a0 = i64.const 17536
-  i64.store a0 r0
-  a1 = i64.const 17544
-  i64.store a1 vz
-  r2 = i64.const -4294967296
-  a2 = i64.const 17552
-  i64.store a2 r2
-  vb64 = i64.extend_i32_u vbud
-  v32 = i64.const 32
-  vbs = i64.shl vb64 v32
-  vself = i64.const 4294967295
-  r3 = i64.or vbs vself
-  a3 = i64.const 17560
-  i64.store a3 r3
-  a4 = i64.const 17568
-  i64.store a4 vz
-  a5 = i64.const 17576
-  i64.store a5 vz
-  a6 = i64.const 17584
-  i64.store a6 vz
-  a7 = i64.const 17592
-  i64.store a7 vz
-  a8 = i64.const 17600
-  i64.store a8 vz
-  a9 = i64.const 17608
-  i64.store a9 vself
-  a10 = i64.const 17616
-  i64.store a10 vz
-  vh = call.cap 6 17 (i64) -> (i32) vi (a0)
-  vj = call.cap 6 1 (i32) -> (i64) vi (vh)
+block 0 (v0: i64, v1: i64) {
+  vbp = i64.const 17480
+  vbl = i64.const 6
+  vbud = self.resolve vbp vbl
+  vgp = i64.const 17472
+  vgl = i64.const 5
+  vgrand = self.resolve vgp vgl
+  vrm = i64.const 17640
+  i32.store vrm vgrand
+  vrb = i64.const 17644
+  i32.store vrb vbud
+  vrp = i64.const 17632
+  vi = i32.wrap_i64 v0
+  vh = call.cap 6 17 (i64) -> (i32) vi (vrp)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vh)
   return vj
   }
 }
@@ -749,14 +759,43 @@ block 2 () {
 }
 "#;
 
-/// #2076 — a child of a child's own program runs that child's unit, not the root's: the grandchild
-/// runs the child's func 1 and returns its count. And the run checkpoints at every turn, each env
-/// rebuilt under the one that spawned it — the grandchild's powerbox under the child's, the child's
-/// under the root's — with the unit it runs.
+/// A run of [`NESTED`] granting its child's and grandchild's images, with its spawn records: the
+/// root's at 17536 (a 128 KiB window and the `"grand"` grant it writes at 17408) and the child's at
+/// 17632 (a 128 KiB window).
+fn nested_session() -> ScheduledDebugRun {
+    let child = SpawnRec {
+        size_log2: 17,
+        grants_ptr: 17408,
+        grants_n: 1,
+        ..SpawnRec::default()
+    };
+    let grand = SpawnRec {
+        size_log2: 17,
+        ..SpawnRec::default()
+    };
+    let src = format!(
+        "{NESTED}{}{}",
+        rec::segment(17536, &child),
+        rec::segment(17632, &grand)
+    );
+    let m = parse_module(&src).expect("parse the root");
+    let image = |f| temen_ir::child_image_at(&m, f).expect("a child entry");
+    let mut host = Host::new();
+    let inst = host.grant_instantiator();
+    let budget = host.grant_budget(-1, 1 << 20, -1);
+    let child = host.grant_module(&image(1));
+    let grand = host.grant_module(&image(2));
+    let args = [inst, budget, child, grand].map(Value::I32);
+    ScheduledDebugRun::new_with_host(&m, 0, &args, host).expect("in subset")
+}
+
+/// #2076 — a grandchild rides every checkpoint: the run checkpoints at every turn, each env rebuilt
+/// under the one that spawned it — the grandchild's powerbox under the child's, the child's under
+/// the root's — with the unit it runs, and the grandchild returns its count.
 #[test]
-fn a_child_of_a_childs_own_program_rides_every_checkpoint() {
+fn a_grandchild_rides_every_checkpoint() {
     assert_eq!(
-        rides_every_checkpoint(SPAWNING_CHILD),
+        rides_every_checkpoint(nested_session),
         ("Ok([I64(20)])".to_string(), String::new())
     );
 }

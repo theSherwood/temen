@@ -1,7 +1,7 @@
 // THREADS/BROWSER step 4c-wasm — the real-browser proof. Starts the COOP/COEP server, launches the
 // preinstalled Chromium via Playwright, loads the page, and asserts the on-page results: the browser
 // is cross-origin isolated (SharedArrayBuffer available), the powerbox guest printed "hello,
-// powerbox!", and one guest's vCPUs ran across real Web Workers to 4000. This closes the gap between
+// powerbox!", and one guest's threads ran across real Web Workers to 4000. This closes the gap between
 // "runs on Node worker_threads" and "runs in an actual browser" — the thesis BROWSER.md rests on.
 // Also drives the **playground** (`web/play.html`) end to end: Temen text typed into the editor,
 // parsed/verified in-browser (`temen_parse`), run across Workers in every powerbox mode, plus a
@@ -45,7 +45,7 @@ const browser = await chromium.launch({ args: process.env.CI ? ['--no-sandbox'] 
 let failed = false;
 try {
   const page = await browser.newPage();
-  // Keep the pageerror texts (not just print them): a worker vCPU whose setup traps reports `fail`
+  // Keep the pageerror texts (not just print them): a Worker whose setup traps reports `fail`
   // (worker.js's backstop), but a trap that still escapes never reaches the page's run promise, so its
   // item would sit `pending` until the wait below times out. On timeout we dump both the still-`pending`
   // items and these captured messages, so a recurrence names its cause.
@@ -54,7 +54,7 @@ try {
   page.on('pageerror', (e) => { pageErrors.push(e.message); console.log(`  [pageerror] ${e.message}`); });
   await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'load' });
 
-  const WORK_IDS = ['powerbox', 'threads', 'jit', 'capio', 'x2', 'wasmjit', 'tierup', 'jitcodegen', 'instcodegen', 'instnested', 'instpaged', 'jitruntime', 'jitb2', 'instthreads'];
+  const WORK_IDS = ['powerbox', 'x2', 'wasmjit', 'instcodegen', 'instnested', 'instpaged', 'instthreads'];
   const read = (id) => page.$eval(`#${id}`, (e) => ({ status: e.dataset.status, text: e.textContent }));
 
   // One load, no retry: the page's old flake (#1996, a Worker handed the engine memory with a stale
@@ -76,41 +76,24 @@ try {
 
   const isolated = await read('isolated');
   const powerbox = await read('powerbox');
-  const threads = await read('threads');
-  const jit = await read('jit');
-  const capio = await read('capio');
   const x2 = await read('x2');
   const wasmjit = await read('wasmjit');
-  const tierup = await read('tierup');
-  const jitcodegen = await read('jitcodegen');
   const instcodegen = await read('instcodegen');
   const instnested = await read('instnested');
   const instpaged = await read('instpaged');
-  const jitruntime = await read('jitruntime');
-  const jitb2 = await read('jitb2');
   const instthreads = await read('instthreads');
 
   const pageOk = isolated.status === 'true' && powerbox.status === 'pass' &&
-    threads.status === 'pass' && jit.status === 'pass' &&
-    capio.status === 'pass' && x2.status === 'pass' && wasmjit.status === 'pass' && tierup.status === 'pass' &&
-    jitcodegen.status === 'pass' && instcodegen.status === 'pass' &&
-    instnested.status === 'pass' && instpaged.status === 'pass' && jitruntime.status === 'pass' && jitb2.status === 'pass' &&
-    instthreads.status === 'pass';
+    x2.status === 'pass' && wasmjit.status === 'pass' && instcodegen.status === 'pass' &&
+    instnested.status === 'pass' && instpaged.status === 'pass' && instthreads.status === 'pass';
 
   console.log(`\n  ${isolated.text}`);
   console.log(`  ${powerbox.text}`);
-  console.log(`  ${threads.text}`);
-  console.log(`  ${jit.text}`);
-  console.log(`  ${capio.text}`);
   console.log(`  ${x2.text}`);
   console.log(`  ${wasmjit.text}`);
-  console.log(`  ${tierup.text}`);
-  console.log(`  ${jitcodegen.text}`);
   console.log(`  ${instcodegen.text}`);
   console.log(`  ${instnested.text}`);
   console.log(`  ${instpaged.text}`);
-  console.log(`  ${jitruntime.text}`);
-  console.log(`  ${jitb2.text}`);
   console.log(`  ${instthreads.text}\n`);
 
   // #1996 pin: a Worker handed a shared memory while another thread grows it must see that grow. V8 can
@@ -224,6 +207,16 @@ try {
   console.log(`  play/parse-reject: state=${bad.state} msg=${JSON.stringify(bad.status)} ` +
     `${badOk ? 'PASS' : 'FAIL'}`);
 
+  // #2414: a card that declares more memory than the threaded runner allocates (16 MiB) is refused,
+  // not run over a smaller window. Run on the `threads` card.
+  await play.evaluate((s) => document.querySelector(`${s} .CodeMirror`).CodeMirror.setValue(
+    'memory 25\nfunc () -> (i64) {\nblock 0 () {\n  v = i64.const 7\n  return v\n  }\n}\n'), card('threads'));
+  const big = await runPlay('threads');
+  const bigOk = big.state === 'error' && big.status.includes('run refused');
+  checks.push(bigOk);
+  console.log(`  play/declared-past-window: state=${big.state} msg=${JSON.stringify(big.status)} ` +
+    `${bigOk ? 'PASS' : 'FAIL'}`);
+
   // An on-ramp module: a real C guest (`hello.c`) compiled through the LLVM on-ramp and run via
   // `temen_run_onramp` (not the text/`temen_parse` path). Uses the committed `web/assets/hello_c.temen`.
   const helloC = await runPlay('hello (C → Temen)');
@@ -233,20 +226,6 @@ try {
   const jitStreamed = helloC.status.includes('wasm-JIT (streamed)');
   checks.push(jitStreamed);
   console.log(`  play/jit-streamed: status=${JSON.stringify(helloC.status)} ${jitStreamed ? 'PASS' : 'FAIL'}`);
-
-  // A real **Nim** program (`web/assets/nim_hello.temen`, gated headlessly by `nim_hello_asset.rs`) —
-  // the full nimony toolchain → temen-leng → nim→powerbox bridge, run in-browser via `temen_run_onramp`.
-  // This is the first real-browser assertion of any nim card: the guest's `write(stdout, "hello, temen\n")`
-  // must land in the stdout pane, returning 0. (Without this, a browser-only break in the run/capture
-  // path is invisible — the headless gate can't see the JS boundary.)
-  const nim = await runPlay('nim (Nim → Temen, runs)');
-  check('nim (Nim → Temen, runs)', nim, '0', 'hello, temen\n');
-  // …and it ran through the **streamed** off-main-thread path (temen_run_onramp_stream on a worker,
-  // stdout teed to the page live) — not the synchronous main-thread fallback. The status chip names the
-  // tier; a fallback would read plain "interpreter".
-  const nimStreamed = nim.status.includes('streamed');
-  checks.push(nimStreamed);
-  console.log(`  play/nim-streamed: status=${JSON.stringify(nim.status)} ${nimStreamed ? 'PASS' : 'FAIL'}`);
 
   // A **warm-snapshot** card (Lua): the eval runs on its snapshot worker over the restored warm image,
   // and now streams stdout live to the pane as it writes (#1142). Type a `print`, Run, and require the
@@ -276,6 +255,12 @@ try {
     checks.push(gradOk);
     console.log(`  play/gradient-canvas: state=${grad.state} canvas=${JSON.stringify(canvas)} ` +
       `${gradOk ? 'PASS' : 'FAIL'}`);
+    // …and it ran through the **streamed** interpreter path (`runStream` on a worker, the frame and
+    // stdout relayed to the page), not the synchronous main-thread fallback. The status chip names the
+    // tier; a fallback would read plain "interpreter".
+    const gradStreamed = grad.status.includes('streamed');
+    checks.push(gradStreamed);
+    console.log(`  play/interp-streamed: status=${JSON.stringify(grad.status)} ${gradStreamed ? 'PASS' : 'FAIL'}`);
   }
 
   // The reactor run model + `keyboard` capability (Doom slice 2): the bounce guest's exported tick()
@@ -403,16 +388,15 @@ try {
   const ok = pageOk && birthsOk && checks.every(Boolean);
   failed = !ok;
   console.log(`${ok ? 'PASS' : 'FAIL'}: Temen runs in a real browser — powerbox + genuine multi-Worker ` +
-    `parallelism (incl. §22 guest-JIT on a shared Domain, §14 detached children on their ` +
-    `own Workers, and 4d host I/O from worker vCPUs through one shared powerbox) over a shared ` +
-    `WebAssembly.Memory under cross-origin isolation, on the per-Worker driver and on the parallel ` +
-    `driver (a whole run in-Rust, each of its threads a Worker) — plus the playground (Temen text parsed ` +
-    `in-browser via temen_parse, run across Workers in every powerbox mode) and the wasm-JIT tier ` +
-    `(Temen IR compiled to wasm in-browser, f0 called directly, matching the interpreter) — including ` +
-    `per-Worker JIT tier-up (a threaded guest's compute leaves run on emitted wasm on their own ` +
-    `Workers), §22 guest-JIT real codegen (a guest's Jit.invoke runs the submitted unit on ` +
-    `emitted wasm per-Worker), and §14 instantiate real codegen (a detached child runs its ` +
-    `granted unit on emitted wasm — the unit compiles on push), all byte-identical to the interpreter`);
+    `parallelism on the parallel driver (a whole run in-Rust, each of its threads a Worker; incl. §22 ` +
+    `guest-JIT on a shared Domain, §14 detached children on their own memories, and 4d host I/O from ` +
+    `every thread through one shared powerbox) over a shared WebAssembly.Memory under cross-origin ` +
+    `isolation — plus the playground (Temen text parsed in-browser via temen_parse, run across Workers ` +
+    `in every powerbox mode) and the wasm-JIT tier (Temen IR compiled to wasm in-browser, f0 called ` +
+    `directly, matching the interpreter) — including tier-up on each thread's Worker (a threaded ` +
+    `guest's compute leaves run on emitted wasm), §22 guest-JIT real codegen (a guest's Jit.invoke ` +
+    `runs the submitted unit on emitted wasm), and §14 children on emitted wasm (a detached child ` +
+    `runs its granted module's emit over its own memory), all byte-identical to the interpreter`);
 } catch (e) {
   failed = true;
   console.log(`FAIL: ${e.message}`);
