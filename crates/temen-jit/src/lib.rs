@@ -1875,6 +1875,9 @@ pub struct CapturedSeed {
     /// #2247 — its program's impl exports, whose handlers it serves.
     pub impl_exports: Vec<temen_ir::ImplExport>,
     pub shadow: temen_ir::durable_abi::ShadowArena,
+    /// temen#2168 — that digest, which names its code to the run's [`ChildCodeCache`], as a
+    /// spawn's grant does.
+    pub digest: [u8; 32],
     /// Its restored window image.
     pub image: Vec<u8>,
     /// Its restored page map over `image`, one entry per [`DURABLE_SNAPSHOT_PAGE`] (#1733); empty

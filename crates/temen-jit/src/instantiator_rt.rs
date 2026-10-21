@@ -610,6 +610,23 @@ impl Nursery {
             .clone()
     }
 
+    /// temen#2168 — the code the detached child `cc` describes runs, spawned or thawed: an
+    /// instance of the run's one compile of it, which its module's `digest` names. A child holding
+    /// a `Jit` ([`crate::GrantChild::holds_jit`]) extends its code with the units it compiles, so
+    /// it has a compile of its own.
+    fn code_for(
+        &self,
+        gc: &crate::GrantChild,
+        digest: [u8; 32],
+        cc: &crate::ChildCompile<'_>,
+    ) -> Result<crate::CompiledModule, crate::JitError> {
+        if gc.holds_jit {
+            self.child_code().own(digest, cc)
+        } else {
+            self.child_code().instance(digest, cc)
+        }
+    }
+
     /// PROCESS.md S2 (JIT parity): install the child host callbacks — build a detached child's
     /// powerbox and release it after the run. Called once at run entry (like [`Self::set_durable`]),
     /// before any spawn site can fire. `None` leaves them `0` (a spawn is an inert `CapFault`).
@@ -1059,6 +1076,7 @@ impl Nursery {
             types,
             impl_exports,
             shadow,
+            digest,
             image,
             prots,
             tail,
@@ -1093,8 +1111,10 @@ impl Nursery {
         let child_fuel_addr = child_fuel
             .as_deref()
             .map_or(0, |c| c as *const crate::FuelCell as usize);
-        // Its program is the artifact's, which names no digest here, so the thaw compiles its own.
-        let Ok(code) = crate::compile_child_windowed(
+        // Its code is found as at its spawn (temen#2168).
+        let Ok(code) = self.code_for(
+            &gc,
+            digest,
             &crate::ChildCompile {
                 funcs: &funcs,
                 types: &types,
@@ -1109,7 +1129,6 @@ impl Nursery {
                 // A thaw never re-launches a demand-paged child on this engine (#2438).
                 page_miss: None,
             },
-            None,
         ) else {
             release(gc.ctx);
             release(gc.retained_ctx);
@@ -1718,32 +1737,29 @@ unsafe fn spawn_detached(
     // #1956 — a child that spawns gets a nursery of its own; a durable child's is durable, and a
     // freeze reaches its children through it (#2010).
     let kid = rt.for_child(&gc, child_funcs);
-    let cc = crate::ChildCompile {
-        funcs: child_funcs,
-        types: child_types,
-        entry: 0,
-        mapped_log2: size_log2 as u8,
-        reserved_log2,
-        thunk: child_thunk,
-        addrs: rt.child_addrs(&gc, child_fuel_addr, kid.as_deref()),
-        impl_exports: &child.impl_exports,
-        // #1296: slots for the units a `Jit`-holding child installs.
-        table_reserve_log2: gc.jit_table_log2,
-        shadow: child_shadow,
-        // #2164 — a demand-paged child's code checks the access table its builder made.
-        page_miss: (!gc.pages.is_null()).then(|| {
-            core::mem::transmute::<usize, crate::PageMissThunk>(
-                rt.grant_page_miss.load(Ordering::Acquire),
-            )
-        }),
-    };
-    // temen#2168 — an instance of the run's one compile of this child, unless the child holds a
-    // `Jit`: it extends its own code, so it has a compile of its own.
-    let compiled = if gc.holds_jit {
-        rt.child_code().own(digest, &cc)
-    } else {
-        rt.child_code().instance(digest, &cc)
-    };
+    let compiled = rt.code_for(
+        &gc,
+        digest,
+        &crate::ChildCompile {
+            funcs: child_funcs,
+            types: child_types,
+            entry: 0,
+            mapped_log2: size_log2 as u8,
+            reserved_log2,
+            thunk: child_thunk,
+            addrs: rt.child_addrs(&gc, child_fuel_addr, kid.as_deref()),
+            impl_exports: &child.impl_exports,
+            // #1296: slots for the units a `Jit`-holding child installs.
+            table_reserve_log2: gc.jit_table_log2,
+            shadow: child_shadow,
+            // #2164 — a demand-paged child's code checks the access table its builder made.
+            page_miss: (!gc.pages.is_null()).then(|| {
+                core::mem::transmute::<usize, crate::PageMissThunk>(
+                    rt.grant_page_miss.load(Ordering::Acquire),
+                )
+            }),
+        },
+    );
     let code = match compiled {
         Ok(code) => code,
         Err(_) => {
