@@ -64,9 +64,9 @@ use cranelift_codegen::ir::types::{
     F32, F32X4, F64, F64X2, I16, I16X8, I32, I32X4, I64, I64X2, I8, I8X16,
 };
 use cranelift_codegen::ir::{
-    AbiParam, AtomicRmwOp as ClifRmwOp, BlockArg, BlockCall, ConstantData, Endianness, FuncRef,
-    Function, InstBuilder, JumpTableData, MemFlags, Signature, SourceLoc, StackSlotData,
-    StackSlotKind, Type, UserFuncName, Value, ValueLabel,
+    AbiParam, AtomicRmwOp as ClifRmwOp, BlockArg, BlockCall, ConstantData, Endianness, ExtFuncData,
+    ExternalName, FuncRef, Function, InstBuilder, JumpTableData, MemFlags, Signature, SourceLoc,
+    StackSlotData, StackSlotKind, Type, UserExternalName, UserFuncName, Value, ValueLabel,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::CompiledCode;
@@ -3451,8 +3451,10 @@ impl CompiledModule {
         };
         let mut module = new_jit_module(imports)?;
 
-        // Declare every function (natural ABI) up front so calls can reference any of them.
+        // Declare every function (natural ABI) up front so calls can reference any of them, and
+        // everything else the code calls (#2482).
         let ids: Vec<FuncId> = declare_all_funcs(&mut module, &m.funcs)?;
+        let callees = Callees::new(&mut module, &ids, &m.funcs, &m.types, fast_resolver)?;
 
         // temen#2452 — the code a `CodeDir` kept for this compile, defined in place of compiling,
         // or else a record of the code the compile emits, to keep. A module's debug info or a signal
@@ -3712,7 +3714,7 @@ impl CompiledModule {
             &mut module,
             &ids,
             &mut codegen,
-            |module, ctx, fi| {
+            |ctx, fi| {
                 // Stage 3a: enable Cranelift's value-label tracking so `set_val_label` (in
                 // `lower_block`) takes effect and `value_labels_ranges` is populated. Gated on `-g`
                 // vars ⇒ no effect on an ordinary build. Must be set on the fresh `ctx.func` before
@@ -3721,12 +3723,11 @@ impl CompiledModule {
                     ctx.func.collect_debug_info();
                 }
                 build_clif(
-                    module,
+                    &callees,
                     &ids,
                     &m.funcs,
                     &distinct,
                     &m.types,
-                    fast_resolver,
                     nesting,
                     signals, // #932 async signal delivery (off unless a `SignalArm` was supplied)
                     PageEnv::NONE, // #2164 — only a §14 child is demand-paged
@@ -3810,7 +3811,7 @@ impl CompiledModule {
         let mut ctx = module.make_context();
 
         // The buffer-ABI trampoline for the entry, exported so Rust can call it.
-        build_trampoline(&mut module, &mut ctx.func, ids[func as usize], entry, false)?;
+        build_trampoline(&callees, &mut ctx.func, ids[func as usize], entry, false)?;
         let tramp = module
             .declare_function("trampoline", Linkage::Export, &ctx.func.signature)
             .map_err(|e| JitError::Backend(e.to_string()))?;
@@ -3828,7 +3829,7 @@ impl CompiledModule {
                 for &f in &e.ops {
                     if (f as usize) < m.funcs.len() && seen.insert(f) {
                         build_trampoline(
-                            &mut module,
+                            &callees,
                             &mut ctx.func,
                             ids[f as usize],
                             &m.funcs[f as usize],
@@ -3853,7 +3854,7 @@ impl CompiledModule {
         // Rust). Needed by both the fiber runtime (`cont.*`) and the thread scheduler (vCPU entries).
         #[cfg(fiber_rt)]
         let fiber_tramp = if uses_fibers || uses_threads {
-            build_fiber_call_trampoline(&mut module, &mut ctx.func);
+            build_fiber_call_trampoline(&mut ctx.func);
             let id = module
                 .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
                 .map_err(|e| JitError::Backend(e.to_string()))?;
@@ -5336,7 +5337,7 @@ impl CompiledModule {
             .map(|f| {
                 let name = format!("x{}", self.next_extra);
                 self.next_extra += 1;
-                let sig = natural_sig(&mut *module, f);
+                let sig = natural_sig(f);
                 module
                     .declare_function(&name, Linkage::Local, &sig)
                     .map_err(|e| JitError::Backend(e.to_string()))
@@ -5375,19 +5376,19 @@ impl CompiledModule {
         };
 
         let nesting = self.nesting;
+        let callees = Callees::new(&mut *module, &ids, funcs, types, self.fast_resolver)?;
         // Byte-accurate occupancy: each function's emitted code size. A unit's code is not kept.
         let extra_bytes = define_funcs(
             &mut *module,
             &ids,
             &mut Codegen::Compile(None),
-            |module, ctx, fi| {
+            |ctx, fi| {
                 build_clif(
-                    module,
+                    &callees,
                     &ids,
                     funcs,
                     &self.distinct,
                     types,
-                    self.fast_resolver,
                     nesting,
                     false, // #932 — define_extra units are not signal-delivery armed (slice 1b)
                     self.page, // #2164 — a paged child's units check its access table, as its own code does
@@ -5415,7 +5416,7 @@ impl CompiledModule {
             .iter()
             .zip(&ids)
             .map(|(f, id)| {
-                build_trampoline(&mut *module, &mut ctx.func, *id, f, false)?;
+                build_trampoline(&callees, &mut ctx.func, *id, f, false)?;
                 let name = format!("xt{}", self.next_extra);
                 self.next_extra += 1;
                 let t = module
@@ -5540,7 +5541,7 @@ impl CompiledModule {
             None => {
                 let module = arena_mut(&mut self.module)?;
                 let mut ctx = module.make_context();
-                build_fiber_call_trampoline(&mut *module, &mut ctx.func);
+                build_fiber_call_trampoline(&mut ctx.func);
                 let id = module
                     .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
                     .map_err(|e| JitError::Backend(e.to_string()))?;
@@ -5622,7 +5623,7 @@ impl CompiledModule {
             None => {
                 let module = arena_mut(&mut self.module)?;
                 let mut ctx = module.make_context();
-                build_fiber_call_trampoline(&mut *module, &mut ctx.func);
+                build_fiber_call_trampoline(&mut ctx.func);
                 let id = module
                     .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
                     .map_err(|e| JitError::Backend(e.to_string()))?;
@@ -6019,6 +6020,21 @@ impl HostFn {
         HostFn::PageMiss,
     ];
 
+    /// Its position in [`Self::ALL`], where [`Callees`] keeps its id.
+    fn index(self) -> usize {
+        const {
+            let mut i = 0;
+            while i < HostFn::ALL.len() {
+                assert!(
+                    HostFn::ALL[i] as usize == i,
+                    "HostFn::ALL lists every variant in order"
+                );
+                i += 1;
+            }
+        }
+        self as usize
+    }
+
     /// The symbol compiled code calls it by.
     fn symbol(self) -> &'static str {
         match self {
@@ -6217,56 +6233,155 @@ fn c_signature(
     sig
 }
 
+/// The functions a compile's code calls, each declared in its module before any of the code is
+/// built (#2482): the unit's own functions, every [`HostFn`], and each fast-path `call.cap` target
+/// the compile's [`FastCapResolver`] claims. Building CLIF reads this, never the module, so
+/// [`define_funcs`]' workers lower functions while the calling thread defines code into it.
+struct Callees {
+    /// Each callee's signature, and whether the module defines it (an import is not colocated).
+    decls: HashMap<FuncId, (Signature, bool)>,
+    /// Each [`HostFn`]'s id, at its position in [`HostFn::ALL`].
+    host: [FuncId; HostFn::ALL.len()],
+    /// Each fast-path target's id, by [`fast_cap_key_of`]; `None` where the resolver claims none.
+    fast: HashMap<[u32; 4], Option<FuncId>>,
+    /// The target's pointer width and default calling convention, for the Cranelift
+    /// `call_memcpy`/`call_memmove`/`call_memset` helpers that lower the bulk-memory ops (D62).
+    frontend: cranelift_codegen::isa::TargetFrontendConfig,
+}
+
+impl Callees {
+    /// Declare in `module` what code built from `funcs`, which `module` declared as `ids`, calls.
+    /// `resolver` is asked here once for each fast-path key the functions' `call.cap`s carry, on
+    /// the calling thread, and never while a worker lowers.
+    fn new(
+        module: &mut JITModule,
+        ids: &[FuncId],
+        funcs: &[Func],
+        types: &[temen_ir::TypeEntry],
+        resolver: Option<FastCapResolver>,
+    ) -> Result<Callees, JitError> {
+        let frontend = module.target_config();
+        let cc = frontend.default_call_conv;
+        let mut decls = HashMap::new();
+        for &id in ids {
+            let decl = module.declarations().get_function_decl(id);
+            decls.insert(id, (decl.signature.clone(), decl.linkage.is_final()));
+        }
+        let mut import = |name: &str, sig: Signature| {
+            let id = module
+                .declare_function(name, Linkage::Import, &sig)
+                .map_err(|e| JitError::Backend(e.to_string()))?;
+            decls.insert(id, (sig, false));
+            Ok::<_, JitError>(id)
+        };
+        let mut host = [FuncId::from_u32(0); HostFn::ALL.len()];
+        for (id, f) in host.iter_mut().zip(HostFn::ALL) {
+            *id = import(f.symbol(), f.signature(cc))?;
+        }
+        let mut fast = HashMap::new();
+        if let Some(resolver) = resolver {
+            for inst in funcs.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.insts) {
+                let Inst::CapCall {
+                    type_id, op, sig, ..
+                } = inst
+                else {
+                    continue;
+                };
+                let key = fast_cap_key_of(*type_id, *op, sig_of(types, *sig));
+                if let std::collections::hash_map::Entry::Vacant(slot) = fast.entry(key) {
+                    slot.insert(
+                        fast_cap_claimed(resolver, key)
+                            .then(|| import(&fast_cap_symbol(key), fast_cap_signature(cc, key)))
+                            .transpose()?,
+                    );
+                }
+            }
+        }
+        Ok(Callees {
+            decls,
+            host,
+            fast,
+            frontend,
+        })
+    }
+
+    /// Import the callee `id` into `func`, as [`Module::declare_func_in_func`] does.
+    fn import(&self, func: &mut Function, id: FuncId) -> Result<FuncRef, JitError> {
+        let (sig, colocated) = self.decls.get(&id).ok_or(JitError::Malformed)?;
+        let signature = func.import_signature(sig.clone());
+        let name = func.declare_imported_user_function(UserExternalName {
+            namespace: 0,
+            index: id.as_u32(),
+        });
+        Ok(func.import_function(ExtFuncData {
+            name: ExternalName::user(name),
+            signature,
+            colocated: *colocated,
+            patchable: false,
+        }))
+    }
+
+    /// Import the host function `f` into `func`.
+    fn host(&self, func: &mut Function, f: HostFn) -> Result<FuncRef, JitError> {
+        self.import(func, self.host[f.index()])
+    }
+
+    /// Import into `func` the fast-path target the resolver claimed for `key`; `None` when it
+    /// claimed none, and the `call.cap` takes the generic thunk.
+    fn fast_cap(&self, func: &mut Function, key: [u32; 4]) -> Option<Result<FuncRef, JitError>> {
+        let id = (*self.fast.get(&key)?)?;
+        Some(self.import(func, id))
+    }
+}
+
 /// Call the host function `f`: a call to the symbol the code names it by.
 fn call_host(
-    module: &mut JITModule,
+    callees: &Callees,
     b: &mut FunctionBuilder,
     f: HostFn,
     args: &[Value],
 ) -> Result<cranelift_codegen::ir::Inst, JitError> {
-    let callee = import_host(module, b.func, f)?;
+    let callee = callees.host(b.func, f)?;
     Ok(b.ins().call(callee, args))
 }
 
-/// Import the host function `f` into `func`.
-fn import_host(
-    module: &mut JITModule,
-    func: &mut Function,
-    f: HostFn,
-) -> Result<FuncRef, JitError> {
-    let sig = f.signature(module.isa().default_call_conv());
-    import_symbol(module, func, f.symbol(), &sig)
+/// The key a `call.cap` of `(type_id, op)` with signature `sig` takes the §9/D45 fast path by:
+/// `(type_id, op, n_args, n_res)`, what the resolver is asked.
+fn fast_cap_key_of(type_id: u32, op: u32, sig: &FuncType) -> [u32; 4] {
+    [
+        type_id,
+        op,
+        sig.params.len() as u32,
+        sig.results.len() as u32,
+    ]
 }
 
-/// Import the host symbol `name`, whose C signature is `sig`, into `func`.
-fn import_symbol(
-    module: &mut JITModule,
-    func: &mut Function,
-    name: &str,
-    sig: &Signature,
-) -> Result<FuncRef, JitError> {
-    let id = module
-        .declare_function(name, Linkage::Import, sig)
-        .map_err(|e| JitError::Backend(e.to_string()))?;
-    Ok(module.declare_func_in_func(id, func))
+/// Whether `resolver` claims the §9/D45 fast path for `key`: the op has at most one result (the
+/// register ABI returns a single i64; a multi-result op takes the generic thunk), and the resolver
+/// returns a specialized fn for it. The resolver gates on the arity it is passed, so it claims an op
+/// only when its fn's arity matches the `call.cap`'s.
+fn fast_cap_claimed(resolver: FastCapResolver, [type_id, op, n_args, n_res]: [u32; 4]) -> bool {
+    // SAFETY: `resolver` honours the `FastCapResolver` contract (the compile's caller guarantees
+    // it): a pure `(type_id, op, n_args, n_res) -> *const fn` lookup with no side effects.
+    n_res <= 1 && !unsafe { resolver(type_id, op, n_args, n_res) }.is_null()
 }
 
 /// The symbol a §9/D45 fast-path `call.cap` calls its target by: the `(type_id, op, n_args,
 /// n_res)` the compile's resolver claimed, which [`fast_cap_addr`] asks it again at link time.
-fn fast_cap_symbol(type_id: u32, op: u32, n_args: usize, n_res: usize) -> String {
+fn fast_cap_symbol([type_id, op, n_args, n_res]: [u32; 4]) -> String {
     format!("temen.fast_cap.{type_id}.{op}.{n_args}.{n_res}")
 }
 
-/// A fast-path target's C signature: `(ctx, mem_base, mem_size, handle, vmctx, args…) ->
-/// [result]`, each arg and the result in its `i64` register slot.
+/// The C signature of the fast-path target for `key` ([`fast_cap_key_of`]): `(ctx, mem_base,
+/// mem_size, handle, vmctx, args…) -> [result]`, each arg and the result in its `i64` register
+/// slot.
 fn fast_cap_signature(
     cc: cranelift_codegen::isa::CallConv,
-    n_args: usize,
-    n_res: usize,
+    [_, _, n_args, n_res]: [u32; 4],
 ) -> Signature {
     let mut params = vec![I64, I64, I64, I32, I64];
-    params.resize(5 + n_args, I64);
-    c_signature(cc, &params, &[I64][..n_res])
+    params.resize(5 + n_args as usize, I64);
+    c_signature(cc, &params, &[I64][..n_res as usize])
 }
 
 /// The `(type_id, op, n_args, n_res)` a [`fast_cap_symbol`] names; `None` for any other symbol.
@@ -6283,7 +6398,7 @@ fn fast_cap_key(name: &str) -> Option<[u32; 4]> {
 fn fast_cap_addr(resolver: FastCapResolver, name: &str) -> Option<*const u8> {
     let [type_id, op, n_args, n_res] = fast_cap_key(name)?;
     // SAFETY: `resolver` honours the `FastCapResolver` contract, which the compile's caller
-    // guaranteed: a pure lookup, which the compile already made for this key (`fast_cap_target`).
+    // guaranteed: a pure lookup, which the compile already made for this key (`Callees::new`).
     let target = unsafe { resolver(type_id, op, n_args, n_res) };
     (!target.is_null()).then_some(target as *const u8)
 }
@@ -6299,9 +6414,8 @@ fn host_import(
     if let Some(f) = HostFn::ALL.into_iter().find(|f| f.symbol() == name) {
         return f.addr(imports).map(|_| f.signature(cc));
     }
-    let [_, _, n_args, n_res] = fast_cap_key(name)?;
-    let bound = fast_cap_addr(imports.fast_resolver?, name).is_some();
-    (bound && n_res <= 1).then(|| fast_cap_signature(cc, n_args as usize, n_res as usize))
+    let key = fast_cap_key(name)?;
+    fast_cap_claimed(imports.fast_resolver?, key).then(|| fast_cap_signature(cc, key))
 }
 
 /// Build a fresh `JITModule` with the escape-TCB ISA configuration **every** compile path shares
@@ -6413,27 +6527,24 @@ fn jit_isa() -> Result<cranelift_codegen::isa::OwnedTargetIsa, JitError> {
         .map_err(|e| JitError::Backend(e.to_string()))
 }
 
-/// What a worker hands back for one function: its code and relocations, the compile's error, or
-/// the payload of a panic in the compile.
-type CompiledFn = std::thread::Result<Result<(CompiledCode, Vec<ModuleReloc>), String>>;
+/// What a worker hands back for one function: its code and relocations, the error of its lowering
+/// or compile, or the payload of a panic in either.
+type CompiledFn = std::thread::Result<Result<(CompiledCode, Vec<ModuleReloc>), JitError>>;
 
-/// Lower and define functions `0..ids.len()` (#2450), every compile path's one loop. `lower` builds
-/// function `i`'s CLIF on this thread, where the module's declarations are. Worker threads compile
-/// the CLIF, each function in a context of its own, and this thread defines the code in function
-/// order, `defined` seeing each function's as it goes. A function's code depends on its CLIF and the
-/// ISA alone, so the module's code is the same on any number of threads; a compile that fails or
-/// panics fails or panics here, at its function, as it would on one thread. `code` says where the
-/// code comes from: the compile, which keeps it while its record holds code, or code a [`CodeDir`]
-/// kept, defined as is (temen#2452). Returns the bytes of code defined.
+/// Lower and define functions `0..ids.len()` (#2450, #2482), every compile path's one loop. Worker
+/// threads build function `i`'s CLIF with `lower` and compile it, each function in a context of its
+/// own, and this thread defines the code in function order, `defined` seeing each function's as it
+/// goes. `lower` reads what the code calls from the [`Callees`] declared before the loop, never the
+/// module, which only this thread writes. A function's code depends on its IR, its callees and the
+/// ISA alone, so the module's code is the same on any number of threads; a function whose lowering
+/// or compile fails or panics fails or panics here, at its function, as it would on one thread.
+/// `code` says where the code comes from: the compile, which keeps it while its record holds code,
+/// or code a [`CodeDir`] kept, defined as is (temen#2452). Returns the bytes of code defined.
 fn define_funcs(
     module: &mut JITModule,
     ids: &[FuncId],
     code: &mut Codegen<'_>,
-    mut lower: impl FnMut(
-        &mut JITModule,
-        &mut cranelift_codegen::Context,
-        usize,
-    ) -> Result<(), JitError>,
+    lower: impl Fn(&mut cranelift_codegen::Context, usize) -> Result<(), JitError> + Sync,
     mut defined: impl FnMut(&JITModule, &CompiledCode, usize),
 ) -> Result<usize, JitError> {
     let keep = match code {
@@ -6444,18 +6555,20 @@ fn define_funcs(
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .clamp(1, ids.len().max(1));
-    let (work_tx, work_rx) =
-        std::sync::mpsc::sync_channel::<(usize, cranelift_codegen::Context)>(2 * workers);
+    let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<usize>(2 * workers);
     let work_rx = std::sync::Mutex::new(work_rx);
     let (done_tx, done_rx) = std::sync::mpsc::channel::<(usize, CompiledFn)>();
     std::thread::scope(|scope| {
         for _ in 0..workers {
-            let (work_rx, done_tx, isa) = (&work_rx, done_tx.clone(), &*isa);
+            let (work_rx, done_tx, isa, lower) = (&work_rx, done_tx.clone(), &*isa, &lower);
             scope.spawn(move || loop {
                 let job = work_rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
-                let Ok((i, mut ctx)) = job else { break };
+                let Ok(i) = job else { break };
                 let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let code = compile_verified(isa, &mut ctx)?;
+                    let mut ctx = cranelift_codegen::Context::new();
+                    ctx.func.signature.call_conv = isa.default_call_conv();
+                    lower(&mut ctx, i)?;
+                    let code = compile_verified(isa, &mut ctx).map_err(JitError::Backend)?;
                     let relocs = code
                         .buffer
                         .relocs()
@@ -6477,7 +6590,7 @@ fn define_funcs(
         let mut define = |module: &mut JITModule, done: &mut [Option<CompiledFn>]| {
             while let Some(out) = done.get_mut(next).and_then(Option::take) {
                 let (code, relocs) = match out {
-                    Ok(compiled) => compiled.map_err(JitError::Backend)?,
+                    Ok(compiled) => compiled?,
                     Err(panic) => std::panic::resume_unwind(panic),
                 };
                 let align = code.buffer.alignment as u64;
@@ -6501,10 +6614,8 @@ fn define_funcs(
             Ok::<(), JitError>(())
         };
         for i in 0..ids.len() {
-            let mut ctx = module.make_context();
-            lower(module, &mut ctx, i)?;
             work_tx
-                .send((i, ctx))
+                .send(i)
                 .map_err(|_| JitError::Backend("no compile worker".into()))?;
             for (j, out) in done_rx.try_iter() {
                 done[j] = Some(out);
@@ -6603,6 +6714,81 @@ fn record_emitted(module: &JITModule, code: &[u8], relocs: &[ModuleReloc]) {
             out.extend_from_slice(line.as_bytes());
         }
     });
+}
+
+/// #2482 — a compile asks its D45 fast-path resolver while it declares its [`Callees`], once for
+/// each key, on the thread that compiles: the embedder's resolver never runs on a worker.
+#[cfg(test)]
+mod callees_tests {
+    use super::*;
+    use core::ffi::c_void;
+
+    /// Each ask of [`resolver`]: the thread it ran on, and its `(type_id, op, n_args, n_res)`.
+    static ASKED: std::sync::Mutex<Vec<(std::thread::ThreadId, [u32; 4])>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// The fast path of `call.cap 3 8 (i64) -> (i64)`: its argument plus one.
+    unsafe extern "C" fn plus_one(
+        _: *mut c_void,
+        _: *mut u8,
+        _: u64,
+        _: i32,
+        _: *mut i64,
+        a: i64,
+    ) -> i64 {
+        a + 1
+    }
+
+    /// Claims `call.cap 3 8 (i64) -> (i64)` alone.
+    unsafe extern "C" fn resolver(type_id: u32, op: u32, n_args: u32, n_res: u32) -> *const c_void {
+        let key = [type_id, op, n_args, n_res];
+        ASKED
+            .lock()
+            .unwrap()
+            .push((std::thread::current().id(), key));
+        match key {
+            [3, 8, 1, 1] => plus_one as *const c_void,
+            _ => core::ptr::null(),
+        }
+    }
+
+    #[test]
+    fn the_resolver_is_asked_once_per_key_on_the_compiling_thread() {
+        // Function 0 calls function 1, whose `call.cap` takes the fast path. Each of the other 62
+        // makes the same claimed and unclaimed `call.cap`s, so every worker lowers some of them.
+        let mut src = String::from(
+            "func (i32, i64) -> (i64) {\nblock 0 (vh: i32, vx: i64) {\n  vr = call 1 (vh, vx)\n  \
+             return vr\n  }\n}\n\
+             func (i32, i64) -> (i64) {\nblock 0 (vh: i32, vx: i64) {\n  \
+             vr = call.cap 3 8 (i64) -> (i64) vh (vx)\n  return vr\n  }\n}\n",
+        );
+        for _ in 2..64 {
+            src += "func (i32, i64) -> (i64) {\nblock 0 (vh: i32, vx: i64) {\n  \
+                    va = call.cap 3 8 (i64) -> (i64) vh (vx)\n  \
+                    vb = call.cap 4 0 (i64) -> (i64) vh (va)\n  return vb\n  }\n}\n";
+        }
+        let m = temen_text::parse_module(&src).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let out = compile_and_run_with_host_fast(
+            &m,
+            0,
+            &[0, 41],
+            empty_cap_thunk,
+            core::ptr::null_mut(),
+            resolver,
+            None,
+        )
+        .expect("compile");
+        assert_eq!(out, JitOutcome::Returned(vec![42]), "the fast path ran");
+        let asked = ASKED.lock().unwrap();
+        let here = std::thread::current().id();
+        assert!(
+            asked.iter().all(|(thread, _)| *thread == here),
+            "a worker asked the resolver"
+        );
+        let unclaimed = asked.iter().filter(|(_, key)| *key == [4, 0, 1, 1]);
+        assert_eq!(unclaimed.count(), 1, "62 functions' key asked once");
+    }
 }
 
 /// temen#2452 — the code a compile emits names no address in its process: two processes emit the
@@ -6892,7 +7078,7 @@ block 2 (v7: i32) {
                 assert!(!held, "the code holds the address of {}", f.symbol());
             }
         }
-        let fast = fast_cap_symbol(3, 8, 1, 1);
+        let fast = fast_cap_symbol([3, 8, 1, 1]);
         assert!(a.windows(fast.len()).any(|w| w == fast.as_bytes()));
         assert!(
             a == b,
@@ -7019,7 +7205,7 @@ fn declare_all_funcs(module: &mut JITModule, funcs: &[Func]) -> Result<Vec<FuncI
         .iter()
         .enumerate()
         .map(|(i, f)| {
-            let sig = natural_sig(module, f);
+            let sig = natural_sig(f);
             module
                 .declare_function(&format!("f{i}"), Linkage::Local, &sig)
                 .map_err(|e| JitError::Backend(e.to_string()))
@@ -7183,6 +7369,8 @@ fn compile_child_windowed(
     };
     let mut module = new_jit_module(imports)?;
     let ids: Vec<FuncId> = declare_all_funcs(&mut module, funcs)?;
+    // Nested child: its `call.cap`s go to the coroutine thunk, never a fast path.
+    let callees = Callees::new(&mut module, &ids, funcs, types, None)?;
     // temen#2452 — the code kept for this compile, defined in place of compiling, or else a record
     // of the code it emits, to keep.
     let replay = kept
@@ -7216,14 +7404,13 @@ fn compile_child_windowed(
         &mut module,
         &ids,
         &mut codegen,
-        |module, ctx, fi| {
+        |ctx, fi| {
             build_clif(
-                module,
+                &callees,
                 &ids,
                 funcs,
                 &distinct,
                 types,
-                None,    // nested child: `call.cap`s go to the coroutine thunk, not a fast path
                 nesting, // a child that spawns loads its own nursery from its vmctx (temen#2168)
                 false,   // #932 — a §14 child is not signal-delivery armed (slice 1b)
                 page,    // #2164 — its access table's check, when it is demand-paged
@@ -7246,7 +7433,7 @@ fn compile_child_windowed(
     )?;
     let mut ctx = module.make_context();
     build_trampoline(
-        &mut module,
+        &callees,
         &mut ctx.func,
         ids[child_entry as usize],
         &entry,
@@ -7261,7 +7448,7 @@ fn compile_child_windowed(
     // child resumed on a platform fiber by the executor, `child_exec`): its body passes the fiber's
     // stack low bound so the guest's prologue checks guard the fiber stack, not an inert `0`.
     build_trampoline(
-        &mut module,
+        &callees,
         &mut ctx.func,
         ids[child_entry as usize],
         &entry,
@@ -7285,7 +7472,7 @@ fn compile_child_windowed(
         for &f in impl_exports.iter().flat_map(|e| &e.ops) {
             if (f as usize) < funcs.len() && seen.insert(f) {
                 build_trampoline(
-                    &mut module,
+                    &callees,
                     &mut ctx.func,
                     ids[f as usize],
                     &funcs[f as usize],
@@ -7308,7 +7495,7 @@ fn compile_child_windowed(
     // a root's.
     #[cfg(fiber_rt)]
     let fiber_tramp = if uses_fibers || uses_threads {
-        build_fiber_call_trampoline(&mut module, &mut ctx.func);
+        build_fiber_call_trampoline(&mut ctx.func);
         let id = module
             .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
             .map_err(|e| JitError::Backend(e.to_string()))?;
@@ -7634,8 +7821,8 @@ pub fn child_compiles() -> u64 {
 /// The natural CLIF signature for an IR function: `(mem_base, fn_table_base, params…)
 /// -> (results…)`. Both context pointers are threaded through every call so loads/
 /// stores reach the window and `call.dyn` reaches the function table.
-fn natural_sig(module: &mut JITModule, f: &Func) -> cranelift_codegen::ir::Signature {
-    sig_from(module, &f.params, &f.results)
+fn natural_sig(f: &Func) -> cranelift_codegen::ir::Signature {
+    sig_from(&f.params, &f.results)
 }
 
 /// Max function results returned **in registers**. Above this the JIT spills results to a
@@ -7666,15 +7853,10 @@ fn sret_blocked_by_v128(results: &[ValType]) -> bool {
 
 /// The natural signature for an explicit param/result list (shared by `natural_sig`
 /// and the `call.dyn` signature import).
-fn sig_from(
-    module: &mut JITModule,
-    params: &[ValType],
-    results: &[ValType],
-) -> cranelift_codegen::ir::Signature {
-    let mut sig = module.make_signature();
+fn sig_from(params: &[ValType], results: &[ValType]) -> cranelift_codegen::ir::Signature {
     // The `tail` calling convention so `return_call` (guaranteed tail calls, §3b) is
     // available; a normal `call` from the trampoline works against it too.
-    sig.call_conv = cranelift_codegen::isa::CallConv::Tail;
+    let mut sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
     sig.params.push(AbiParam::new(I64)); // mem_base
     sig.params.push(AbiParam::new(I64)); // fn_table_base
     sig.params.push(AbiParam::new(I64)); // vmctx (the instance's context; field 0 its trap cell)
@@ -7953,9 +8135,6 @@ struct Lower<'a> {
     /// page)`. Always `PROT_NONE`, so the D63 branchless lowering redirects an out-of-bounds access
     /// here to fault it. `0` when the module has no memory (the branchless path isn't taken).
     guard_offset: u64,
-    /// The target's frontend config (pointer width + default call conv), for the Cranelift
-    /// `call_memcpy`/`call_memmove`/`call_memset` helpers that lower the bulk-memory ops (D62).
-    frontend_config: cranelift_codegen::isa::TargetFrontendConfig,
     /// The function-table index mask (`next_pow2(nfuncs) - 1`) for `call.dyn`.
     fn_table_mask: u64,
     /// **Submitted-unit `ref.func` remap** (DESIGN.md §22 "unit-own funcref"). For a top-level
@@ -7967,9 +8146,10 @@ struct Lower<'a> {
     /// lets a unit `cont.new`/`thread.spawn`/`call.dyn` over its OWN function; it changes only
     /// *which constant* `ref.func` emits, never the masked-dispatch lowering (invariant I2).
     ref_slots: Option<&'a [u32]>,
-    /// The optional D45 devirtualize-to-direct-call resolver (top-level compile only; `None` for
-    /// nested children, whose `call.cap`s go to the coroutine thunk). Invoked at compile time.
-    fast_resolver: Option<FastCapResolver>,
+    /// The functions this code calls, declared before it is built (#2482): direct callees, host
+    /// functions, and the D45 fast-path `call.cap` targets (none for a nested child, whose
+    /// `call.cap`s go to the coroutine thunk).
+    callees: &'a Callees,
     /// Lower `Instantiator` `call.cap`s to the §14 nesting runtime (`false` ⇒ they take the
     /// ordinary `call.cap` path — an inert `CapFault`).
     nesting: bool,
@@ -8071,12 +8251,11 @@ fn trap_capture_addr() -> Option<*const ()> {
 /// constant into every call site — DESIGN.md §22 "the baked function-table mask").
 #[allow(clippy::too_many_arguments)]
 fn build_clif(
-    module: &mut JITModule,
+    callees: &Callees,
     ids: &[FuncId],
     funcs: &[Func],
     distinct: &[FuncType],
     type_section: &[temen_ir::TypeEntry],
-    fast_resolver: Option<FastCapResolver>,
     nesting: bool,
     signals: bool,
     page: PageEnv,
@@ -8097,7 +8276,7 @@ fn build_clif(
     if f.blocks.is_empty() {
         return Err(JitError::Malformed);
     }
-    clif.signature = natural_sig(module, f);
+    clif.signature = natural_sig(f);
     clif.name = UserFuncName::user(0, 0);
 
     let mut fbctx = FunctionBuilderContext::new();
@@ -8163,7 +8342,7 @@ fn build_clif(
     // takes the trapping frame pointer), so `emit_trap` can record an explicit trap's source
     // backtrace before unwinding. Disabled without `-g` or where the helper isn't linked.
     let trap_capture = match trap_capture_addr() {
-        Some(_) if srclocs.is_some() => Some(import_host(module, b.func, HostFn::TrapCapture)?),
+        Some(_) if srclocs.is_some() => Some(callees.host(b.func, HostFn::TrapCapture)?),
         _ => None,
     };
     // #2164 — a paged compile loads its instance's access table once, here, and imports the miss
@@ -8172,7 +8351,7 @@ fn build_clif(
         let table = b.declare_var(I64);
         let t = b.ins().load(I64, MemFlags::trusted(), vmctx, vmctx::PAGES);
         b.def_var(table, t);
-        Some((page, import_host(module, b.func, HostFn::PageMiss)?, table))
+        Some((page, callees.host(b.func, HostFn::PageMiss)?, table))
     } else {
         None
     };
@@ -8187,10 +8366,9 @@ fn build_clif(
         mask,
         mapped,
         guard_offset,
-        frontend_config: module.target_config(),
         fn_table_mask,
         ref_slots,
-        fast_resolver,
+        callees,
         nesting,
         signals,
         epoch,
@@ -8227,13 +8405,13 @@ fn build_clif(
     }) {
         emit_domain_poll(&mut b, &lower);
     }
-    emit_signal_check(module, &mut b, &lower)?; // #932 async signal delivery (no-op when disarmed)
+    emit_signal_check(&mut b, &lower)?; // #932 async signal delivery (no-op when disarmed)
     emit_fuel_check(&mut b, &lower);
     emit_stack_check(&mut b, &lower);
     b.ins().jump(blocks.clif[0], &entry_args);
 
     for (i, blk) in f.blocks.iter().enumerate() {
-        lower_block(module, &mut b, blk, i, &mut blocks, &lower)?;
+        lower_block(&mut b, blk, i, &mut blocks, &lower)?;
     }
 
     b.seal_all_blocks();
@@ -8252,7 +8430,7 @@ fn build_clif(
 /// executor knows at resume time (the fiber's own `stack_low`), exactly as a guest fiber's entry does
 /// via the fiber call-trampoline. One flag on the one builder, not a second trampoline family.
 fn build_trampoline(
-    module: &mut JITModule,
+    callees: &Callees,
     clif: &mut Function,
     entry_id: FuncId,
     entry: &Func,
@@ -8292,7 +8470,7 @@ fn build_trampoline(
     let limit = if with_limit {
         b.block_params(blk)[5]
     } else {
-        let call = call_host(module, &mut b, HostFn::StackLimit, &[])?;
+        let call = call_host(callees, &mut b, HostFn::StackLimit, &[])?;
         b.inst_results(call)[0]
     };
     call_args.push(limit);
@@ -8305,7 +8483,7 @@ fn build_trampoline(
             .load(I64, MemFlags::trusted(), args_ptr, (i * 8) as i32);
         call_args.push(decode_slot(&mut b, slot, *p));
     }
-    let callee = module.declare_func_in_func(entry_id, b.func);
+    let callee = callees.import(b.func, entry_id)?;
     let call = b.ins().call(callee, &call_args);
     if !sret {
         let rets: Vec<Value> = b.inst_results(call).to_vec();
@@ -8415,7 +8593,7 @@ fn funcs_use_instantiator(funcs: &[Func]) -> bool {
 /// cannot call a `Tail`-convention function directly, so the fiber runtime calls this (default C ABI)
 /// instead; one trampoline serves all fibers since every entry is `(i64 sp, i64 arg) -> i64`.
 #[cfg(fiber_rt)]
-fn build_fiber_call_trampoline(module: &mut JITModule, clif: &mut Function) {
+fn build_fiber_call_trampoline(clif: &mut Function) {
     // Params: `code`, then the guest entry's Tail args in order — mem_base, fn_table_base, vmctx,
     // stack_limit (§2b path B, always present), sp, arg -> i64. `stack_limit` sits in the same relative
     // slot as in `sig_from`, so the entry call args are exactly `p[1..]` (see [`FiberCallTramp`]).
@@ -8437,11 +8615,7 @@ fn build_fiber_call_trampoline(module: &mut JITModule, clif: &mut Function) {
     let p = b.block_params(blk).to_vec();
     let code = p[0];
     let call_args = p[1..].to_vec(); // (mem_base, fn_table_base, vmctx, [stack_limit], sp, arg)
-    let sig = b.import_signature(sig_from(
-        module,
-        &[ValType::I64, ValType::I64],
-        &[ValType::I64],
-    ));
+    let sig = b.import_signature(sig_from(&[ValType::I64, ValType::I64], &[ValType::I64]));
     let call = b.ins().call_indirect(sig, code, &call_args);
     let r = b.inst_results(call)[0];
     b.ins().return_(&[r]);
@@ -8513,7 +8687,6 @@ fn launder_across_setjmp(
 
 /// Lower one IR block's body + terminator into its CLIF block.
 fn lower_block(
-    module: &mut JITModule,
     b: &mut FunctionBuilder,
     blk: &Block,
     block_idx: usize,
@@ -8563,7 +8736,7 @@ fn lower_block(
         // match (which produces exactly one value).
         if let Inst::Call { func, args } = inst {
             let callee_id = *lower.ids.get(*func as usize).ok_or(JitError::Malformed)?;
-            let callee = module.declare_func_in_func(callee_id, b.func);
+            let callee = lower.callees.import(b.func, callee_id)?;
             let results = &lower
                 .funcs
                 .get(*func as usize)
@@ -8586,7 +8759,7 @@ fn lower_block(
         if let Inst::CallIndirect { ty, idx, args } = inst {
             let ty = sig_of(lower.type_section, *ty); // #922: resolve interned call type index
             let code = indirect_dispatch(b, lower, get(&vals, *idx)?, ty);
-            let sig = b.import_signature(sig_from(module, &ty.params, &ty.results));
+            let sig = b.import_signature(sig_from(&ty.params, &ty.results));
             let mut cargs = ctx_args(b, lower);
             let sret = sret_call_slot(b, &mut cargs, &ty.results);
             for a in args {
@@ -8641,7 +8814,7 @@ fn lower_block(
                     // budget chain's room, asked of the cell (word 2).
                     let addr = vmctx_load(b, lower, vmctx::FUEL);
                     let rsig = {
-                        let mut s = Signature::new(lower.frontend_config.default_call_conv);
+                        let mut s = Signature::new(lower.callees.frontend.default_call_conv);
                         s.params.push(AbiParam::new(I64)); // the cell
                         s.returns.push(AbiParam::new(I64)); // the remaining fuel
                         b.import_signature(s)
@@ -8671,14 +8844,17 @@ fn lower_block(
             // needs the host compiler, which the flat `call.cap` thunk can't reach. Otherwise (a child
             // compile, or no nesting runtime) it falls through to the ordinary path (an inert CapFault).
             if *type_id == cap_id::INSTANTIATOR && lower.nesting {
-                lower_instantiator(module, b, lower, *op, sig, *handle, args, &mut vals)?;
-            } else if let Some(target) = fast_cap_target(lower, *type_id, *op, sig) {
+                lower_instantiator(b, lower, *op, sig, *handle, args, &mut vals)?;
+            } else if let Some(callee) = lower
+                .callees
+                .fast_cap(b.func, fast_cap_key_of(*type_id, *op, sig))
+            {
                 // D45 devirtualized fast path: a register-to-register direct call to the specialized
                 // host fn the resolver claimed for this `(type_id, op)`.
-                lower_cap_call_fast(module, b, lower, &target, sig, *handle, args, &mut vals)?;
+                lower_cap_call_fast(b, lower, callee?, sig, *handle, args, &mut vals)?;
             } else {
                 let h = get(&vals, *handle)?;
-                lower_cap_call(module, b, lower, *type_id, *op, sig, h, args, &mut vals)?;
+                lower_cap_call(b, lower, *type_id, *op, sig, h, args, &mut vals)?;
             }
             continue;
         }
@@ -8705,7 +8881,7 @@ fn lower_block(
                 Inst::CallImportDyn { handle, .. } => get(&vals, *handle)?,
                 _ => b.ins().iconst(I32, 0),
             };
-            lower_cap_call(module, b, lower, type_id, op, sig, h, args, &mut vals)?;
+            lower_cap_call(b, lower, type_id, op, sig, h, args, &mut vals)?;
             continue;
         }
         // §3.5 self-namespace extensions — the shared dispatch entry with `CAP_SELF_TYPE_ID` and
@@ -8734,7 +8910,6 @@ fn lower_block(
                 _ => unreachable!(),
             };
             lower_cap_call(
-                module,
                 b,
                 lower,
                 temen_ir::CAP_SELF_TYPE_ID,
@@ -8757,7 +8932,6 @@ fn lower_block(
             };
             let call_args = [*handle];
             lower_cap_call(
-                module,
                 b,
                 lower,
                 temen_ir::CAP_IMPORT_ATTACH_TYPE_ID,
@@ -8791,7 +8965,7 @@ fn lower_block(
                 b.ins().iconst(I64, 0)
             };
             let call = call_host(
-                module,
+                lower.callees,
                 b,
                 HostFn::FiberNew,
                 &[mem_base, fnt, vmctx, funcref, spv, fuel],
@@ -8824,14 +8998,19 @@ fn lower_block(
                 // fiber_resume_block(sched, handle, arg, status_out, vmctx) -> value:i64.
                 let sched = vmctx_load(b, lower, vmctx::SCHED);
                 call_host(
-                    module,
+                    lower.callees,
                     b,
                     HostFn::FiberResumeBlock,
                     &[sched, kh, av, status_ptr, vmctx],
                 )?
             } else {
                 // fiber_resume(handle, arg, status_out, vmctx) -> value:i64.
-                call_host(module, b, HostFn::FiberResume, &[kh, av, status_ptr, vmctx])?
+                call_host(
+                    lower.callees,
+                    b,
+                    HostFn::FiberResume,
+                    &[kh, av, status_ptr, vmctx],
+                )?
             };
             emit_trap_propagate(b, lower);
             let value = b.inst_results(call)[0];
@@ -8845,7 +9024,7 @@ fn lower_block(
             // fiber_suspend(value:i64, vmctx:i64) -> next-resume arg:i64
             let v = get(&vals, *value)?;
             let vmctx = b.use_var(lower.vmctx_var);
-            let call = call_host(module, b, HostFn::FiberSuspend, &[v, vmctx])?;
+            let call = call_host(lower.callees, b, HostFn::FiberSuspend, &[v, vmctx])?;
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             continue;
@@ -8866,10 +9045,10 @@ fn lower_block(
             let laundered = launder_across_setjmp(b, blk, inst_idx, &vals);
             // slot = rt_setjmp_slot(rt_addr, buf) -> *mut jmp_buf
             let rt_addr = vmctx_load(b, lower, vmctx::SETJMP);
-            let c1 = call_host(module, b, HostFn::SetjmpSlot, &[rt_addr, bufv])?;
+            let c1 = call_host(lower.callees, b, HostFn::SetjmpSlot, &[rt_addr, bufv])?;
             let slot = b.inst_results(c1)[0];
             // r = _setjmp(slot) -> i32 — emitted inline in this JIT frame.
-            let c2 = call_host(module, b, HostFn::Setjmp, &[slot])?;
+            let c2 = call_host(lower.callees, b, HostFn::Setjmp, &[slot])?;
             let r = b.inst_results(c2)[0];
             // #2537: reload the saved values and rewrite the value map to the reloaded copies, so every
             // later use in this block — and every successor's forwarded use (which reads this block's
@@ -8895,18 +9074,23 @@ fn lower_block(
             let vmctx = b.use_var(lower.vmctx_var);
             // slot = rt_setjmp_lookup(rt_addr, buf, vmctx) -> *mut jmp_buf (null + trap on miss)
             let rt_addr = vmctx_load(b, lower, vmctx::SETJMP);
-            let c1 = call_host(module, b, HostFn::SetjmpLookup, &[rt_addr, bufv, vmctx])?;
+            let c1 = call_host(
+                lower.callees,
+                b,
+                HostFn::SetjmpLookup,
+                &[rt_addr, bufv, vmctx],
+            )?;
             let slot = b.inst_results(c1)[0];
             emit_trap_propagate(b, lower); // bail on a miss (forged/stale token) before `_longjmp`
                                            // _longjmp(slot, val) — inline, noreturn.
-            call_host(module, b, HostFn::Longjmp, &[slot, valv])?;
+            call_host(lower.callees, b, HostFn::Longjmp, &[slot, valv])?;
             continue;
         }
         // §12 per-vCPU TLS register: thunks over a per-OS-thread word (no window/trap context —
         // a pure thread-local access that cannot fault). `get` reads the *current* vCPU's word, so it
         // is correct after a fiber migrates here.
         if let Inst::VcpuTlsGet = inst {
-            let call = call_host(module, b, HostFn::VcpuTlsGet, &[])?;
+            let call = call_host(lower.callees, b, HostFn::VcpuTlsGet, &[])?;
             vals.push(b.inst_results(call)[0]);
             continue;
         }
@@ -8914,13 +9098,13 @@ fn lower_block(
         // per-OS-thread register (a thunk, like `vcpu.tls.get`; cannot fault, no window/trap
         // context). The durable transform emits this to address this context's own shadow-SP word.
         if let Inst::DurableShadowBase = inst {
-            let call = call_host(module, b, HostFn::DurableShadowBase, &[])?;
+            let call = call_host(lower.callees, b, HostFn::DurableShadowBase, &[])?;
             vals.push(b.inst_results(call)[0]);
             continue;
         }
         if let Inst::VcpuTlsSet { val } = inst {
             let v = get(&vals, *val)?;
-            call_host(module, b, HostFn::VcpuTlsSet, &[v])?;
+            call_host(lower.callees, b, HostFn::VcpuTlsSet, &[v])?;
             continue;
         }
         if let Inst::GcRoots {
@@ -8984,7 +9168,7 @@ fn lower_block(
                 b.ins().stack_store(v, slot, (i * 8) as i32);
             }
             let args_ptr = b.ins().stack_addr(I64, slot, 0);
-            let call = call_host(module, b, HostFn::GcRoots, &[args_ptr])?;
+            let call = call_host(lower.callees, b, HostFn::GcRoots, &[args_ptr])?;
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             continue;
@@ -9012,7 +9196,7 @@ fn lower_block(
             let spv = get(&vals, *sp)?;
             let av = get(&vals, *arg)?;
             let call = call_host(
-                module,
+                lower.callees,
                 b,
                 HostFn::ThreadSpawn,
                 &[sched, mem_base, fnt, vmctx, func_idx, spv, av],
@@ -9026,7 +9210,7 @@ fn lower_block(
             let sched = vmctx_load(b, lower, vmctx::SCHED);
             let h = get(&vals, *handle)?;
             let vmctx = b.use_var(lower.vmctx_var);
-            let call = call_host(module, b, HostFn::ThreadJoin, &[sched, h, vmctx])?;
+            let call = call_host(lower.callees, b, HostFn::ThreadJoin, &[sched, h, vmctx])?;
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             continue;
@@ -9058,7 +9242,7 @@ fn lower_block(
             let to = get(&vals, *timeout)?;
             let vmctx = b.use_var(lower.vmctx_var);
             let call = call_host(
-                module,
+                lower.callees,
                 b,
                 HostFn::ThreadWait,
                 &[sched, phys, exp, width, to, vmctx],
@@ -9073,7 +9257,7 @@ fn lower_block(
             let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false, 4);
             let sched = vmctx_load(b, lower, vmctx::SCHED);
             let cnt = get(&vals, *count)?;
-            let call = call_host(module, b, HostFn::ThreadNotify, &[sched, phys, cnt])?;
+            let call = call_host(lower.callees, b, HostFn::ThreadNotify, &[sched, phys, cnt])?;
             vals.push(b.inst_results(call)[0]);
             continue;
         }
@@ -9788,9 +9972,9 @@ fn lower_block(
                 probe_span(b, dphys, n);
                 probe_span(b, sphys, n);
                 if matches!(inst, Inst::MemCopy { .. }) {
-                    b.call_memcpy(lower.frontend_config, dphys, sphys, n);
+                    b.call_memcpy(lower.callees.frontend, dphys, sphys, n);
                 } else {
-                    b.call_memmove(lower.frontend_config, dphys, sphys, n);
+                    b.call_memmove(lower.callees.frontend, dphys, sphys, n);
                 }
                 continue;
             }
@@ -9801,7 +9985,7 @@ fn lower_block(
                 probe_span(b, dphys, n);
                 // `call_memset` uextends the fill byte to i32, so hand it the low byte (i8).
                 let v8 = b.ins().ireduce(I8, get(&vals, *val)?);
-                b.call_memset(lower.frontend_config, dphys, v8, n);
+                b.call_memset(lower.callees.frontend, dphys, v8, n);
                 continue;
             }
             // §12 atomics. Confine like a normal access, then a natural-alignment guard (a misaligned
@@ -9953,10 +10137,10 @@ fn lower_block(
             if *target as usize <= block_idx {
                 emit_domain_poll(b, lower);
             }
-            emit_signal_check(module, b, lower)?; // #932 async signal delivery (no-op when disarmed)
-                                                  // Fuel unification: an unconditional branch charges one fuel iff it is a back-edge — the
-                                                  // target block index is at-or-before this block's, matching the interpreters' `backedge!`
-                                                  // (`$t <= pc`). Back-edge-ness is fully static here (one target).
+            emit_signal_check(b, lower)?; // #932 async signal delivery (no-op when disarmed)
+                                          // Fuel unification: an unconditional branch charges one fuel iff it is a back-edge — the
+                                          // target block index is at-or-before this block's, matching the interpreters' `backedge!`
+                                          // (`$t <= pc`). Back-edge-ness is fully static here (one target).
             if *target as usize <= block_idx {
                 emit_fuel_check(b, lower);
             }
@@ -9984,12 +10168,12 @@ fn lower_block(
             if *then_blk as usize <= block_idx || *else_blk as usize <= block_idx {
                 emit_domain_poll(b, lower); // (see `Br`)
             }
-            emit_signal_check(module, b, lower)?; // #932 async signal delivery (no-op when disarmed)
-                                                  // Fuel unification: charge one fuel iff the *taken* edge is a back-edge (target block index
-                                                  // <= this block's), matching the interpreters' per-edge `backedge!`. Back-edge-ness is
-                                                  // static per edge, but which edge is taken is a runtime value — so an edge that is a
-                                                  // back-edge *alone* is charged via a trampoline block entered only when that edge is taken.
-                                                  // Gated on `fuel_addr != 0` so an un-armed compile emits the identical plain `brif`.
+            emit_signal_check(b, lower)?; // #932 async signal delivery (no-op when disarmed)
+                                          // Fuel unification: charge one fuel iff the *taken* edge is a back-edge (target block index
+                                          // <= this block's), matching the interpreters' per-edge `backedge!`. Back-edge-ness is
+                                          // static per edge, but which edge is taken is a runtime value — so an edge that is a
+                                          // back-edge *alone* is charged via a trampoline block entered only when that edge is taken.
+                                          // Gated on `fuel_addr != 0` so an un-armed compile emits the identical plain `brif`.
             let then_be = lower.fuel && *then_blk as usize <= block_idx;
             let else_be = lower.fuel && *else_blk as usize <= block_idx;
             match (then_be, else_be) {
@@ -10034,13 +10218,13 @@ fn lower_block(
             {
                 emit_domain_poll(b, lower); // (see `Br`)
             }
-            emit_signal_check(module, b, lower)?; // #932 async signal delivery (no-op when disarmed)
-                                                  // Fuel unification: charge one fuel iff the *selected* target is a back-edge (target block
-                                                  // index <= this block's), matching the interpreters' `backedge!` on the arm actually taken.
-                                                  // Back-edge-ness is static per arm; which arm is selected is runtime. So: no arm a back-edge
-                                                  // ⇒ no charge; every arm a back-edge ⇒ charge once up front; mixed ⇒ route each back-edge arm
-                                                  // through a trampoline that charges then jumps, leaving forward arms direct. Gated on
-                                                  // `fuel_addr != 0` so an un-armed compile builds the identical table.
+            emit_signal_check(b, lower)?; // #932 async signal delivery (no-op when disarmed)
+                                          // Fuel unification: charge one fuel iff the *selected* target is a back-edge (target block
+                                          // index <= this block's), matching the interpreters' `backedge!` on the arm actually taken.
+                                          // Back-edge-ness is static per arm; which arm is selected is runtime. So: no arm a back-edge
+                                          // ⇒ no charge; every arm a back-edge ⇒ charge once up front; mixed ⇒ route each back-edge arm
+                                          // through a trampoline that charges then jumps, leaving forward arms direct. Gated on
+                                          // `fuel_addr != 0` so an un-armed compile builds the identical table.
             let is_be = |t: u32| lower.fuel && t as usize <= block_idx;
             let all_be = is_be(default.0) && targets.iter().all(|(t, _)| is_be(*t));
             let any_be = is_be(default.0) || targets.iter().any(|(t, _)| is_be(*t));
@@ -10124,7 +10308,7 @@ fn lower_block(
         Terminator::ReturnCall { func, args } => {
             // Tail call (§3b): replace this frame with the callee, threading the context.
             let callee_id = *lower.ids.get(*func as usize).ok_or(JitError::Malformed)?;
-            let callee = module.declare_func_in_func(callee_id, b.func);
+            let callee = lower.callees.import(b.func, callee_id)?;
             let mut cargs = ctx_args(b, lower);
             // The tail callee shares this function's result type (verifier-enforced), so its sret-ness
             // matches ours: when we return via sret, forward our own return-area pointer.
@@ -10140,7 +10324,7 @@ fn lower_block(
             // Indirect tail call: table dispatch (§3c) then a guaranteed tail call.
             let ty = sig_of(lower.type_section, *ty); // #922: resolve interned call type index
             let code = indirect_dispatch(b, lower, get(&vals, *idx)?, ty);
-            let sig = b.import_signature(sig_from(module, &ty.params, &ty.results));
+            let sig = b.import_signature(sig_from(&ty.params, &ty.results));
             let mut cargs = ctx_args(b, lower);
             // `ty.results` equals this function's results (tail-call contract), so sret-ness matches:
             // forward our return-area pointer when we return via sret.
@@ -10350,11 +10534,7 @@ fn emit_domain_poll(b: &mut FunctionBuilder, lower: &Lower) {
 /// caller emits the real terminator / next check there. The armed flag is loaded **atomically** (as
 /// [`emit_epoch_check`] does) so Cranelift's alias analysis cannot hoist the poll out of a loop — the
 /// host sets it from another thread and the guest never stores it.
-fn emit_signal_check(
-    module: &mut JITModule,
-    b: &mut FunctionBuilder,
-    lower: &Lower,
-) -> Result<(), JitError> {
+fn emit_signal_check(b: &mut FunctionBuilder, lower: &Lower) -> Result<(), JitError> {
     if !lower.signals {
         return Ok(()); // no signal delivery armed for this compile — emit nothing
     }
@@ -10374,7 +10554,7 @@ fn emit_signal_check(
     let out_ss = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 24, 3)); // [fref,signum,sp]
     let out = b.ins().stack_addr(I64, out_ss, 0);
     let ctx = vmctx_load(b, lower, vmctx::SIG_CTX);
-    let got = call_host(module, b, HostFn::SigTake, &[ctx, out])?;
+    let got = call_host(lower.callees, b, HostFn::SigTake, &[ctx, out])?;
     let got = b.inst_results(got)[0];
     let deliver = b.create_block();
     b.ins().brif(got, deliver, &[], cont, &[]);
@@ -10394,7 +10574,7 @@ fn emit_signal_check(
         results: vec![],
     };
     let code = indirect_dispatch(b, lower, fref, &handler_ty);
-    let hsig = b.import_signature(sig_from(module, &handler_ty.params, &handler_ty.results));
+    let hsig = b.import_signature(sig_from(&handler_ty.params, &handler_ty.results));
     let mut cargs = ctx_args(b, lower);
     cargs.push(sp);
     cargs.push(signum);
@@ -10404,7 +10584,7 @@ fn emit_signal_check(
     emit_trap_propagate(b, lower);
     // Handler returned normally: notify the host (restore the block-during-handler mask, pop nesting).
     let ctx2 = vmctx_load(b, lower, vmctx::SIG_CTX);
-    call_host(module, b, HostFn::SigReturn, &[ctx2])?;
+    call_host(lower.callees, b, HostFn::SigReturn, &[ctx2])?;
     b.ins().jump(poll, &[]); // re-poll: deliver a nested/queued signal before resuming
     b.switch_to_block(cont);
     // `poll`/`maybe`/`deliver`/`cont` are sealed by the caller's `seal_all_blocks`.
@@ -10671,44 +10851,17 @@ fn emit_trap_propagate(b: &mut FunctionBuilder, lower: &Lower) {
     b.seal_block(cont);
 }
 
-/// Resolve the §9/D45 fast-path target for a `call.cap`, if one applies: there is a
-/// [`FastCapResolver`] (top-level compile), the op has **at most one result** (the register ABI
-/// returns a single i64), and the resolver claims this `(type_id, op)` (returns a non-null
-/// specialized fn). Returns the symbol the call names the target by ([`fast_cap_symbol`]).
-/// Resolution is a **compile-time** call into the embedder's resolver, which the code's link makes
-/// again to bind the symbol.
-fn fast_cap_target(lower: &Lower, type_id: u32, op: u32, sig: &FuncType) -> Option<String> {
-    let resolver = lower.fast_resolver?;
-    if sig.results.len() > 1 {
-        return None; // the fast ABI returns a single register; multi-result falls back to the thunk
-    }
-    // SAFETY: `resolver` honours the `FastCapResolver` contract (caller guarantee); it's a pure
-    // `(type_id, op, n_args, n_res) -> *const fn` lookup with no side effects, safe to call during
-    // codegen. The arity is passed so the resolver only claims an op when its specialized fn's arity
-    // matches the IR `call.cap`'s — else it returns null and the generic slot-based path is used.
-    let target = unsafe {
-        resolver(
-            type_id,
-            op,
-            sig.params.len() as u32,
-            sig.results.len() as u32,
-        )
-    };
-    (!target.is_null()).then(|| fast_cap_symbol(type_id, op, sig.params.len(), sig.results.len()))
-}
-
 /// Lower a `call.cap` via the **devirtualized fast path** (§9 / D45): a direct register-to-register
-/// call to the specialized host fn the symbol `target` names, passing
+/// call to the specialized host fn `callee` ([`Callees::fast_cap`]), passing
 /// `ctx`/`mem_base`/`mem_size`/`handle`/`vmctx` then each argument **in a register** (widened to
 /// its i64 slot), and reading the single result back from a register — no stack-slot marshalling,
 /// no `n_args`/`n_res`/`type_id`/`op` dispatch. The trap cell is checked exactly as in
 /// [`lower_cap_call`].
 #[allow(clippy::too_many_arguments)]
 fn lower_cap_call_fast(
-    module: &mut JITModule,
     b: &mut FunctionBuilder,
     lower: &Lower,
-    target: &str,
+    callee: FuncRef,
     sig: &FuncType,
     handle: u32,
     args: &[u32],
@@ -10726,13 +10879,11 @@ fn lower_cap_call_fast(
     let h = get(vals, handle)?;
     let vmctx = b.use_var(lower.vmctx_var);
 
-    let tsig = fast_cap_signature(module.isa().default_call_conv(), args.len(), n_res);
     let mut call_args = vec![ctx, mem_base, mem_size, h, vmctx];
     for a in args {
         let v = get(vals, *a)?;
         call_args.push(encode_slot(b, v)); // each arg widened to its i64 register slot
     }
-    let callee = import_symbol(module, b.func, target, &tsig)?;
     let call = b.ins().call(callee, &call_args);
 
     // If the specialized fn set the trap cell, propagate (the cell already holds the kind / exit code).
@@ -10751,7 +10902,6 @@ fn lower_cap_call_fast(
 /// (CapFault / Exit) propagates like any other (return early; the cell is already set).
 #[allow(clippy::too_many_arguments)]
 fn lower_cap_call(
-    module: &mut JITModule,
     b: &mut FunctionBuilder,
     lower: &Lower,
     type_id: u32,
@@ -10839,7 +10989,7 @@ fn lower_cap_call(
         nr,
         vmctx,
     ];
-    call_host(module, b, HostFn::CapThunk, &call_args)?;
+    call_host(lower.callees, b, HostFn::CapThunk, &call_args)?;
 
     // If the thunk set the trap cell, propagate (return early; the cell already holds
     // the kind / exit code).
@@ -10863,7 +11013,6 @@ fn lower_cap_call(
 /// here like any `call.cap`.
 #[allow(clippy::too_many_arguments)] // mirrors the CapCall fields + the shared lowering context
 fn lower_instantiator(
-    module: &mut JITModule,
     b: &mut FunctionBuilder,
     lower: &Lower,
     op: u32,
@@ -10893,7 +11042,7 @@ fn lower_instantiator(
                 b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
             let status_ptr = b.ins().stack_addr(I64, ss, 0);
             let call = call_host(
-                module,
+                lower.callees,
                 b,
                 HostFn::InstJoin,
                 &[nursery, mem_base, h, child, status_ptr, vmctx],
@@ -10914,7 +11063,12 @@ fn lower_instantiator(
                 10 => HostFn::InstDetach,
                 _ => HostFn::InstKill,
             };
-            let call = call_host(module, b, thunk, &[nursery, mem_base, h, child, vmctx])?;
+            let call = call_host(
+                lower.callees,
+                b,
+                thunk,
+                &[nursery, mem_base, h, child, vmctx],
+            )?;
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
@@ -10936,7 +11090,7 @@ fn lower_instantiator(
             let mem_size = b.ins().iconst(I64, win_reserved as i64);
             let record_ptr = slot_i64(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let call = call_host(
-                module,
+                lower.callees,
                 b,
                 HostFn::InstSpawn,
                 &[nursery, mem_base, mem_size, h, record_ptr, vmctx],
@@ -10959,7 +11113,12 @@ fn lower_instantiator(
                 14 => HostFn::ChildOffer,
                 _ => HostFn::ChildGrant,
             };
-            let call = call_host(module, b, thunk, &[nursery, mem_base, h, child, arg, vmctx])?;
+            let call = call_host(
+                lower.callees,
+                b,
+                thunk,
+                &[nursery, mem_base, h, child, arg, vmctx],
+            )?;
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);

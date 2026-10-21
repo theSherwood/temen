@@ -195,7 +195,8 @@ fn compile_refill_trampoline() -> Result<(crate::OwnedJit, usize), crate::JitErr
     b.switch_to_block(entry);
     b.seal_block(entry);
     let cell = b.block_params(entry)[0];
-    crate::call_host(&mut module, &mut b, crate::HostFn::FuelRefill, &[cell])?;
+    let callees = crate::Callees::new(&mut module, &[], &[], &[], None)?;
+    crate::call_host(&callees, &mut b, crate::HostFn::FuelRefill, &[cell])?;
     b.ins().return_(&[]);
     b.finalize();
     crate::define_verified(&mut module, id, &mut ctx)?;
