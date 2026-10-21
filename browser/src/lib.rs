@@ -1695,6 +1695,8 @@ const X2_PLATFORM: bytecode::ThreadPlatform = bytecode::ThreadPlatform {
     now_ns: || (unsafe { x2_now_ms() } * 1e6) as u64,
     tier: None,
     child_window: Some(x2_child_window),
+    // The run opens on the root's Worker (`temen_x2_start`): another Worker would cost it ~11 ms.
+    root_on_opener: true,
 };
 
 /// A detached child's window on the parallel driver (#1414 B6-3c): a `WebAssembly.Memory` of its own
@@ -4142,7 +4144,7 @@ pub extern "C" fn temen_pg_open(
         Err(status) => return refuse(status),
     };
     host.set_stdin_blocking(true); // the read at the prompt parks instead of returning EOF
-    let mut run = match bytecode::CoopRun::new_reserved(
+    let run = match bytecode::CoopRun::new_reserved(
         &m,
         0,
         &[],
@@ -4156,7 +4158,6 @@ pub extern "C" fn temen_pg_open(
         Some(Err(t)) => return pg_report(PbOutcome::ended(Some(Err(t)), Vec::new(), Vec::new())),
         None => return refuse(STATUS_UNSUPPORTED),
     };
-    run.set_suspend_on_idle(true);
     let mut session = PgSession {
         run,
         stdout_pos: 0,
@@ -5819,7 +5820,7 @@ pub extern "C" fn temen_bash_coop_open(
         return -1;
     };
     posix.enable_transcript();
-    let mut run = match bytecode::CoopRun::new_reserved_over_compiled(
+    let run = match bytecode::CoopRun::new_reserved_over_compiled(
         m,
         compiled,
         0,
@@ -5834,7 +5835,6 @@ pub extern "C" fn temen_bash_coop_open(
         Ok(r) => r,
         Err(_) => return -2,
     };
-    run.set_suspend_on_idle(true);
     // SAFETY: single-threaded access to the session statics (one Worker owns this driver).
     unsafe {
         *core::ptr::addr_of_mut!(BASH_COOP) = Some(BashCoopSession {
@@ -10569,9 +10569,9 @@ fn coop_pump(budget: Option<u64>) -> i32 {
             unsafe { *core::ptr::addr_of_mut!(CAP_REQUEST) = words };
             return COOP_RUN_CAP_PARK;
         }
-        // Never surfaced here: the tier-up driver does not arm `set_suspend_on_idle` (#1122 route (a)
-        // is the bash coop session's driver, below). Fail closed rather than spin, as a run with
-        // nothing left to wake it does.
+        // Not surfaced here: the page answers each call before it pumps again, and this driver
+        // feeds no input (#1122 route (a) is the bash coop session's driver, below). Fail closed
+        // rather than spin, as a run with nothing left to wake it does.
         bytecode::CoopEvent::Idle => (Err(Trap::ThreadFault), COOP_RUN_TRAP),
     };
     // #816 item 4: a warm-coop eval ended — advance the warm session's heap high-water so the next

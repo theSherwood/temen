@@ -114,7 +114,7 @@ fn grant_io_powerbox(
 /// `memory`/`write` caps instead of `CapFault`ing, and `main`'s return becomes an `exit` code), else
 /// deny-all. The `seed` is the slice-7 schedule variation. `None` if the module is outside the
 /// engine's subset. `block_stdin` (W4) arms the blocking-stdin park on the powerbox host: a thread's
-/// `read` on an exhausted buffer parks it (`SchedStop::StdinPark`) instead of returning EOF, re-armed
+/// `read` on an exhausted buffer parks it (`SchedStop::Idle`) instead of returning EOF, re-armed
 /// on every `seek` rebuild so a read past the replay frontier parks again. `mem_limit` (slice 5) is
 /// the memory the root may hold past its declared window — its `mem` grant past the window (#2113):
 /// a `vm_map` past it returns -ENOMEM, so a guest malloc observes NULL (the OOM-teaching knob) —
@@ -1041,12 +1041,14 @@ impl BytecodeBackend {
     fn resume(&mut self, verb: impl FnOnce(&mut ScheduledDebugRun, &mut u64) -> SchedStop) -> Stop {
         let mut fuel = self.fuel;
         self.run.set_breakpoints(self.breakpoints.clone());
-        let stop = Self::sched_stop(verb(&mut self.run, &mut fuel));
+        let stop = verb(&mut self.run, &mut fuel);
+        let stop = Self::sched_stop(stop, self.run.cap_parked());
         self.capture_tape();
         stop
     }
 
-    fn sched_stop(s: SchedStop) -> Stop {
+    /// `cap` is the host-answered call a thread waits on, if any ([`ScheduledDebugRun::cap_parked`]).
+    fn sched_stop(s: SchedStop, cap: Option<u64>) -> Stop {
         match s {
             SchedStop::Break { pc, reason } => {
                 let reason = match reason {
@@ -1060,10 +1062,15 @@ impl BytecodeBackend {
                 Stop::Break { reason, pc }
             }
             SchedStop::Finished(r) => Stop::Finished(r),
-            // W4 (#1146 deeper): every thread parked and one of them in a blocking-stdin read — a live
-            // stop at that read, resumable after `provideStdin`.
-            SchedStop::StdinPark { pc } => Stop::Break {
-                reason: StopReason::StdinPark,
+            // W4 (#1146 deeper), #1414 D4: every thread parked, and one waits on what only the
+            // embedder gives it: the answer to a host-answered call, resumable once `provideCap`
+            // delivers it, or else a blocking-stdin read, resumable after `provideStdin`. A live
+            // stop at that call or read.
+            SchedStop::Idle { pc } => Stop::Break {
+                reason: match cap {
+                    Some(id) => StopReason::CapPark { id },
+                    None => StopReason::StdinPark,
+                },
                 pc,
             },
             // No runnable thread (deadlock/`wait`), or an op outside the scheduler's subset.

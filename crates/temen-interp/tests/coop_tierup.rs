@@ -106,7 +106,7 @@ fn coop_tierup_run(
             bytecode::CoopEvent::Idle
             | bytecode::CoopEvent::Paused
             | bytecode::CoopEvent::CapPark { .. } => {
-                panic!("unexpected Idle (suspend_on_idle is never armed here)")
+                panic!("unexpected Idle (nothing here waits on the embedder)")
             }
             bytecode::CoopEvent::Resume { .. } => {
                 panic!("unexpected Resume (no leaf image here)")
@@ -418,7 +418,7 @@ fn coop_tierup_bounce_matches_pure_interp() {
             bytecode::CoopEvent::Idle
             | bytecode::CoopEvent::Paused
             | bytecode::CoopEvent::CapPark { .. } => {
-                panic!("unexpected Idle (suspend_on_idle is never armed here)")
+                panic!("unexpected Idle (nothing here waits on the embedder)")
             }
             bytecode::CoopEvent::Resume { .. } => {
                 panic!("unexpected Resume (no leaf image here)")
@@ -848,7 +848,7 @@ fn run_spawner(
             bytecode::CoopEvent::Idle
             | bytecode::CoopEvent::Paused
             | bytecode::CoopEvent::CapPark { .. } => {
-                panic!("unexpected Idle (suspend_on_idle is never armed here)")
+                panic!("unexpected Idle (nothing here waits on the embedder)")
             }
             bytecode::CoopEvent::Resume { .. } => {
                 panic!("unexpected Resume (no leaf image here)")
@@ -1248,7 +1248,7 @@ fn fork_twin_run(
             bytecode::CoopEvent::Idle
             | bytecode::CoopEvent::Paused
             | bytecode::CoopEvent::CapPark { .. } => {
-                panic!("unexpected Idle (suspend_on_idle is never armed here)")
+                panic!("unexpected Idle (nothing here waits on the embedder)")
             }
             bytecode::CoopEvent::Resume { .. } => {
                 panic!("unexpected Resume (no leaf image here)")
@@ -1537,7 +1537,7 @@ block 0 (vx: i64) {
                 bytecode::CoopEvent::Idle
                 | bytecode::CoopEvent::Paused
                 | bytecode::CoopEvent::CapPark { .. } => {
-                    panic!("unexpected Idle (suspend_on_idle is never armed here)")
+                    panic!("unexpected Idle (nothing here waits on the embedder)")
                 }
                 bytecode::CoopEvent::Resume { .. } => {
                     panic!("unexpected Resume (no leaf image here)")

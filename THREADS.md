@@ -145,6 +145,17 @@ property, so in practice:
   native `Futex` of 4c-futex are gone; the same public entries run it. A futex wait parks through the
   shared rules, so a run whose tasks all park with nothing to wake one ends with the pump's deadlock
   `ThreadFault`, not a 10 s `MAX_WAIT` timeout (#1652).
+  *Since #1414 5b:* natively, the root runs on a thread of its own like every other task, and the
+  thread that opened the run watches it, settling the run on each ring of its bell. An answer to a
+  punted call rings it too, so a task waiting on one sleeps until its answer comes instead of polling
+  for it (#2423). An embedder can also hold the run and pump it as it pumps the cooperative driver
+  (`CoopRun::new_parallel`): `run` returns at a host-answered call as soon as the call is made, each
+  call once, while the run's other tasks go on; at the run's idle point, when nothing can run until
+  the embedder acts (an answer it owes, or input it feeds), with `Idle` instead of waiting; and at its
+  end. The pump and the debug scheduler follow the same rule (#1414 D4, #2531), so `run` never waits
+  on its embedder. Both executors reach their idle verdict through one function (`stalled`), and both
+  count a runnable task of a stopped process as waiting, as the pump's pick skips it (#2529 tracks
+  the tree-walker, which waits forever there).
 - [x] **Step 4c-futex — the cross-thread `memory.wait`/`notify`.** The parallel driver now services the
   **full threads model**, not just spawn/join: a native `Futex` (a per-address parked-token queue under
   one bucket lock — the std-sync analogue of a kernel futex bucket, with the compare-and-park done under

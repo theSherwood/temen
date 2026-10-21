@@ -13513,6 +13513,9 @@ fn bash_temen_transcript_session(
             loop {
                 match session.pump().expect("session pump") {
                     temen_run::SessionStep::Done(outcome) => return outcome,
+                    temen_run::SessionStep::CapPark { id } => {
+                        panic!("bash's session has no host-answered cap, yet call {id} waits")
+                    }
                     temen_run::SessionStep::Idle => {
                         let t = px.transcript();
                         assert!(
