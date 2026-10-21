@@ -21622,6 +21622,20 @@ pub(crate) fn ring_on_answer(bell: &Bell) -> Arc<dyn Fn() + Send + Sync> {
     })
 }
 
+/// [`ring`] `bell`, unless its lock is busy: whether it rang. It never waits, so a thread that
+/// cannot block rings through it ([`bytecode::RunDoor::wake`]).
+pub(crate) fn try_ring(bell: &Bell) -> bool {
+    let mut rung = match bell.0.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(g)) => g.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+    };
+    *rung += 1;
+    drop(rung);
+    bell.1.notify_all();
+    true
+}
+
 /// Wait on `bell` until it rings past count `seen`, or for at most `within`: whether it rang.
 pub(crate) fn wait_for_ring(bell: &Bell, seen: u64, within: Option<std::time::Duration>) -> bool {
     let (rung, cv) = &**bell;
@@ -23751,9 +23765,9 @@ pub struct Host {
     /// `feed_terminal` — from another OS thread, or another wasm-thread instantiation in the
     /// browser — unblocks the pump. `None` (the default) leaves deadlock detection untouched.
     external_wake: Option<Arc<(Mutex<u64>, Condvar)>>,
-    /// #1414 S5a — the embedder's way to stop this host's run on executor 2 from outside it
-    /// ([`Host::set_run_stop`]). `None` (the default): only the run itself ends it.
-    run_stop: Option<Arc<bytecode::RunStop>>,
+    /// #1414 S5a — the embedder's door into this host's run on executor 2 from outside it
+    /// ([`Host::set_run_door`]). `None` (the default): only the run itself ends it.
+    run_door: Option<Arc<bytecode::RunDoor>>,
     /// #1414 B6 — how the parallel driver starts this run's threads and reads its clock
     /// ([`Host::set_thread_platform`]); the OS's unless an embedder hands it another.
     thread_platform: bytecode::ThreadPlatform,
@@ -24490,7 +24504,7 @@ impl Host {
             term_flag: Arc::new(AtomicBool::new(false)),
             park_request: Arc::new(AtomicU64::new(0)),
             external_wake: None,
-            run_stop: None,
+            run_door: None,
             thread_platform: bytecode::ThreadPlatform::OS,
             exec_replace: None,
             cap_pages: None,
@@ -25381,10 +25395,11 @@ impl Host {
 
     /// #1146 (deeper) — blocking-stdin readiness for the bytecode scheduler drivers: a task parked in a
     /// `Stream{In}` read under [`Self::set_stdin_blocking`] ([`TaskState::BlockedStdin`]) re-admits once
-    /// the stdin buffer has unconsumed bytes. The stdin twin of [`Self::pipe_read_ready`]; a root-host
-    /// resource (never per-`env`).
+    /// the stdin buffer has unconsumed bytes, or once the embedder ends stdin by turning blocking off:
+    /// the re-run read then sees EOF (#1414 5b-2). The stdin twin of [`Self::pipe_read_ready`]; a
+    /// root-host resource (never per-`env`).
     pub(crate) fn stdin_ready(&self) -> bool {
-        self.stdin_pos < self.stdin.len()
+        self.stdin_pos < self.stdin.len() || !self.stdin_block
     }
 
     /// #1080 rung 4 — pipe-write readiness (backpressure) for the bytecode cooperative driver: ready
@@ -31441,14 +31456,15 @@ impl Host {
         self.thread_platform.clone()
     }
 
-    /// #1414 S5a — let `stop` end this host's run on executor 2 ([`bytecode::RunStop`]).
-    pub fn set_run_stop(&mut self, stop: Arc<bytecode::RunStop>) {
-        self.run_stop = Some(stop);
+    /// #1414 S5a — let `door` stop this host's run on executor 2, or wake the thread that pumps it
+    /// ([`bytecode::RunDoor`]).
+    pub fn set_run_door(&mut self, door: Arc<bytecode::RunDoor>) {
+        self.run_door = Some(door);
     }
 
-    /// The run's stop, if its embedder set one ([`Host::set_run_stop`]).
-    pub(crate) fn run_stop(&self) -> Option<Arc<bytecode::RunStop>> {
-        self.run_stop.clone()
+    /// The run's door, if its embedder set one ([`Host::set_run_door`]).
+    pub(crate) fn run_door(&self) -> Option<Arc<bytecode::RunDoor>> {
+        self.run_door.clone()
     }
 
     pub(crate) fn wire_park_door(&self) {

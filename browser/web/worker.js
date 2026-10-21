@@ -1,6 +1,6 @@
-// The Web Worker of a parallel run (executor 2, #1414 B6). The run itself is one in-Rust call on the
-// root's Worker (`x2root`, `temen_x2_start`), and each thread of the run gets a Worker of its own
-// (`x2thread`, `temen_x2_thread`), all over the ONE shared linear memory. The page creates every
+// The Web Worker of a parallel run (executor 2, #1414 B6). The root's Worker (`x2root`) opens the
+// run and pumps it (`temen_x2_open`, `temen_x2_run`), and each thread of the run gets a Worker of its
+// own (`x2thread`, `temen_x2_thread`), all over the ONE shared linear memory. The page creates every
 // Worker (no nested Workers) and never blocks: a browser permits a blocking `Atomics.wait` only off
 // the main thread, so the Workers do all the blocking.
 
@@ -237,15 +237,32 @@ self.onmessage = async (e) => {
   ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stream_chunk, js_cap_call: () => -38n, x2_spawn, x2_now_ms, x2_tierup, x2_invoke } }));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
-  // #1414 B6 — the parallel driver: its run is one in-Rust call on the root's Worker, and each of its
-  // threads a call on a Worker of its own (`x2_spawn` above). The root reports how the run ended.
+  // #1414 B6 — the parallel driver: the root's Worker pumps the run, and each of its threads is a call
+  // on a Worker of its own (`x2_spawn` above). The root reports how the run ended.
   if (role === 'x2root') {
     // A runtime-compile guest reads its unit blobs from the window: the page staged them in `win`.
-    const value = ex.temen_x2_start(gptr, glen, winSize, tierup ? 1 : 0, win, seedLen);
+    if (ex.temen_x2_open(gptr, glen, winSize, tierup ? 1 : 0, win, seedLen) === 0) {
+      // #1414 5b-2: a run the page has a part in tells this Worker of each call the page answers and
+      // of each idle, as the pump's driver hears of them. The page leaves its answers and input in
+      // the engine's memory, where each pump takes them, and wakes this Worker for them.
+      for (;;) {
+        const ev = ex.temen_x2_run();
+        if (ev === 6 /* COOP_RUN_CAP_PARK */) {
+          const n = ex.temen_coop_cap_len();
+          const words = new BigInt64Array(memory.buffer, Number(ex.temen_coop_cap_ptr()), n).slice();
+          self.postMessage({ kind: 'cap', id: words[0], index: Number(words[1]), args: Array.from(words.slice(2)) });
+        } else if (ev === 7 /* COOP_RUN_IDLE */) {
+          self.postMessage({ kind: 'idle' });
+          ex.temen_x2_wait(); // until the page acts, a task makes a call, or the run ends
+        } else {
+          break; // 0 = done, 2 = trapped: the run's report is published
+        }
+      }
+    }
     if (x2Tier !== null) x2Tier.free(); // the root's thread ran its task here
     const status = ex.temen_status(); // lib.rs STATUS_*: 0 ok · 3 trap · 5 exit
     if (status === 0) {
-      self.postMessage({ kind: 'done', value: value.toString() });
+      self.postMessage({ kind: 'done', value: ex.temen_run_value().toString() });
     } else if (status === 5) {
       self.postMessage({ kind: 'exit', code: ex.temen_exit_code() });
     } else if (status === 3) {

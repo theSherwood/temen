@@ -270,3 +270,178 @@ export async function runCases({ ex, memory, drive, suspends }) {
   results.faultsDecline = await run().then(() => 'returned', (e) => String(e.message));
   return results;
 }
+
+// #2531's shape on an on-ramp root: the root spins on a flag that its thread sets once its `ping(7)`
+// returns, then joins the thread and returns its answer, `pong(7)`.
+const THREAD_PING = `memory 16
+import 0 "ping" (i64) -> (i64)
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  br 1(vt)
+}
+block 1 (vt1: i32) {
+  vaddr = i64.const 40960
+  vflag = i64.load vaddr
+  vzero = i64.const 0
+  vwait = i64.eq vflag vzero
+  br_if vwait 1(vt1) 2(vt1)
+}
+block 2 (vt2: i32) {
+  vr = thread.join vt2
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vseven = i64.const 7
+  vr = call.import 0 (vseven)
+  vaddr = i64.const 40960
+  vone = i64.const 1
+  i64.store vaddr vone
+  return vr
+  }
+}
+export 0 func "_start" 0
+`;
+
+// A guest that copies stdin to stdout until stdin ends, and returns how many bytes it copied.
+const ECHO = `memory 16
+import 0 "read" (i64, i64) -> (i64)
+import 1 "write" (i64, i64) -> (i64)
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vtot: i64) {
+  vbuf = i64.const 40960
+  vcap = i64.const 256
+  vn = call.import 0 (vbuf, vcap)
+  vzero = i64.const 0
+  vmore = i64.gt_s vn vzero
+  br_if vmore 2(vtot, vn) 3(vtot)
+}
+block 2 (vt2: i64, vn2: i64) {
+  vbuf2 = i64.const 40960
+  vw = call.import 1 (vbuf2, vn2)
+  vt3 = i64.add vt2 vn2
+  br 1(vt3)
+}
+block 3 (vr: i64) {
+  return vr
+  }
+}
+export 0 func "_start" 0
+`;
+
+// #1414 5b-2 — the x2 row: the same embedder's runs on executor 2, each task on a Worker of its own
+// (`par.js`'s `makeRunner`, so Chromium only). The page answers each call it is told of, and feeds
+// input, while the run's other tasks go on: it leaves both in the engine's memory and wakes the
+// Worker that pumps the run. `runX2Cases` reports what each run did; the caller checks it.
+export async function runX2Cases({ par, eng }) {
+  const { ex, memory } = eng;
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  const run = par.makeRunner(eng);
+  const parsed = (src) => {
+    const text = enc.encode(src);
+    const sp = Number(ex.temen_alloc(text.length));
+    new Uint8Array(memory.buffer).set(text, sp);
+    const ok = ex.temen_parse(sp, text.length);
+    ex.temen_dealloc(sp, text.length);
+    const p = Number(ex.temen_parse_ptr());
+    const bytes = new Uint8Array(memory.buffer).slice(p, p + Number(ex.temen_parse_len()));
+    if (ok !== 1) throw new Error(`parse: ${dec.decode(bytes)}`);
+    return bytes;
+  };
+  // Run `src` on executor 2 under the on-ramp powerbox with `caps` declared, recording what the
+  // page saw. `fed` makes its stdin fed later: `onIdle(r)` gets each idle, and `start(r)` the run
+  // as it starts. A run still going after `X2_HANG_MS` is stopped, and the cases end there with
+  // what the page saw of it: the harness fails rather than hangs.
+  const go = async (src, { caps = [], stopAtPark, answerAfter = 0, fed = false, onIdle, start } = {}) => {
+    const seen = { out: '', parks: 0, idles: 0 };
+    const abort = new AbortController();
+    const r = run(parsed(src), {
+      onramp: true,
+      caps,
+      stdinLater: fed,
+      signal: abort.signal,
+      onOutput: (o) => { seen.out += dec.decode(o); },
+      onCapPark: async ({ index, args }) => {
+        seen.parks++;
+        if (stopAtPark === seen.parks) return null;
+        if (index !== 0) throw new Error(`unexpected cap ${index}`);
+        await new Promise((res) => setTimeout(res, answerAfter)); // answered asynchronously, as a UI would
+        return pong(args[0]);
+      },
+      onIdle: () => {
+        seen.idles++;
+        if (onIdle) onIdle(r, seen.idles);
+      },
+    });
+    if (start) start(r);
+    let timer;
+    const hung = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        abort.abort();
+        const saw = `${seen.parks} parks, ${seen.idles} idles, ${seen.out.length} bytes out`;
+        reject(Object.assign(new Error(`no end after ${X2_HANG_MS} ms (${saw})`), { hung: true }));
+      }, X2_HANG_MS);
+    });
+    try {
+      return { value: (await Promise.race([r, hung])).value, ...seen };
+    } catch (e) {
+      if (e.hung) throw e;
+      return { error: e.message, faultAddr: e.faultAddr, ...seen };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const results = {};
+  results.pings = await go(pingGuest(PINGS), { caps: ['ping'] });
+  results.stopAtPark = await go(pingGuest(PINGS), { caps: ['ping'], stopAtPark: 3 });
+  results.threadPing = await go(THREAD_PING, { caps: ['ping'] });
+  // #2557's case: the root's 1 ms timer fires while its thread's answer is owed, 50 ms away.
+  results.timerWhileOwed = await go(TIMER_WHILE_OWED, { caps: ['ping'], answerAfter: 50 });
+  // Fed as the run idles on its reads: a part at the first, the rest and the end at the second.
+  results.echoLater = await go(ECHO, {
+    fed: true,
+    onIdle: (r, n) => {
+      if (n === 1) r.feed(enc.encode('hello '));
+      if (n === 2) {
+        r.feed(enc.encode('world\n'));
+        r.end();
+      }
+    },
+  });
+  // Fed as the run starts, before its Worker opens it.
+  results.echoEarly = await go(ECHO, {
+    fed: true,
+    start: (r) => {
+      r.feed(enc.encode('early\n'));
+      r.end();
+    },
+  });
+  // Fed more at once than the engine's inbox holds, as the run idles: the page wakes the Worker to
+  // take what fits, then leaves the rest.
+  results.echoBig = await go(ECHO, {
+    fed: true,
+    onIdle: (r, n) => {
+      if (n === 1) {
+        r.feed(enc.encode(bigFeed()));
+        r.end();
+      }
+    },
+  });
+  results.faults = await go(FAULTS);
+  return results;
+}
+
+// How long an x2 case may run before the harness stops it and fails.
+const X2_HANG_MS = 60_000;
+
+// Input fed at once past what the engine's inbox holds (64 KiB), for `echoBig`: enough that the
+// page's retries fill the inbox again after the Worker has taken the first of it.
+export const bigFeed = () => Array.from({ length: 256 * 1024 }, (_, i) => String.fromCharCode(97 + (i % 26))).join('');

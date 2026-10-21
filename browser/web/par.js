@@ -117,17 +117,68 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
 //   was told has its Workers torn down; that error carries `broken`, as the engine's locks may then be
 //   left held;
 //   `onOutput(stdout, stderr)` (`Uint8Array`s) gets the run's output as its threads write it, in the
-//   order its buffers hold it, as the coop driver's does.
+//   order its buffers hold it, as the coop driver's does;
+//   `caps` (names) ⇒ with `onramp`, the host-answered caps the page answers (#1414 5b-2): a call to
+//   one comes to `onCapPark({ id, index, args })`, which resolves to the call's result (a Number or
+//   BigInt) while the run's other tasks go on, or to `null` to stop the run, as the pump's driver's
+//   does;
+//   `stdinLater` ⇒ with `onramp`, the page feeds stdin as the run goes, through `feed(bytes)` and
+//   `end()` on the run this returns: a read of empty stdin waits for more until `end()`. `onIdle()`
+//   is called each time no task can run until the page acts, by answering or feeding.
 // A run that ends in a trap rejects with an Error whose `faultAddr` is where a memory fault faulted,
 // window-relative (`-1n` for none, #2275). The page services no authority: the powerboxes are
-// in-Rust, and a Worker only hosts a thread the engine started.
+// in-Rust, and a Worker only hosts a thread the engine started. The page's main thread cannot wait
+// on the engine's locks, so what it gives a run as it goes (answers, input) it leaves in the engine's
+// memory with atomics alone (`temen_x2_answer`, `temen_x2_feed`), and wakes the Worker that pumps the
+// run to take it (`temen_x2_wake`).
 export function makeRunner({ module, memory, ex }) {
   const u8 = () => new Uint8Array(memory.buffer);
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 
-  return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, io = false, onramp = false, stdin = null, env = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, onOutput = null, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [] } = {}) {
-    // A stop asked for a run before this one is withdrawn before this one starts.
+  // `ctl` gets what the run's caller feeds it with while it goes (`stdinLater`).
+  const runOn = async (guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, io = false, onramp = false, stdin = null, env = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, onOutput = null, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [], caps = [], onCapPark = null, stdinLater = false, onIdle = null } = {}, ctl) => {
+    if ((caps.length || stdinLater) && !onramp) throw new Error('`caps` and `stdinLater` need the on-ramp powerbox (`onramp`)');
+    // A stop asked for a run before this one is withdrawn before this one starts, and what the page
+    // left for an earlier run is dropped.
     ex.temen_x2_stop(0);
+    // Once the run is over, neither its `signal` nor a stop it is still asking reaches the next run,
+    // and nothing more is left for it.
+    let finished = false, unlisten = null;
+    // #1414 5b-2: what the page leaves for the run, in order. Each `put` leaves one message in the
+    // engine's inbox, or answers `false` while the inbox is full. Then the Worker is woken to take
+    // what is there, and the put is asked again a moment later. Once everything is left, the Worker
+    // is woken to take it.
+    const pending = [];
+    const wake = () => {
+      if (!finished && !ex.temen_x2_wake()) setTimeout(wake, 1);
+    };
+    const flush = () => {
+      for (; pending.length && !finished; pending.shift()) {
+        if (!pending[0]()) {
+          wake();
+          return void setTimeout(flush, 1);
+        }
+      }
+      wake();
+    };
+    const give = (put) => {
+      if (finished) return;
+      pending.push(put);
+      if (pending.length === 1) flush();
+    };
+    if (stdinLater) {
+      const feedCap = ex.temen_x2_feed_cap();
+      ctl.feed = (bytes) => {
+        for (let at = 0; at < bytes.length; at += feedCap) {
+          const chunk = bytes.slice(at, at + feedCap);
+          give(() => {
+            u8().set(chunk, Number(ex.temen_x2_feed_ptr()));
+            return ex.temen_x2_feed(chunk.length) === 1;
+          });
+        }
+      };
+      ctl.end = () => give(() => ex.temen_x2_feed_end() === 1);
+    }
     const gptr = ex.temen_par_alloc(guest.length);
     u8().set(guest, gptr);
     // #2251: every thread gets its own Worker, so a guest's `self.parallelism` is the page's core count.
@@ -151,7 +202,12 @@ export function makeRunner({ module, memory, ex }) {
       const eptr = envb.length ? ex.temen_par_alloc(envb.length) : 0;
       if (envb.length) u8().set(envb, eptr);
       if (ex.temen_set_run_env(eptr, envb.length) !== 0) throw new Error('temen_set_run_env refused the environment (an entry without `=`, or too large)');
-      if (ex.temen_par_powerbox_onramp(gptr, guest.length, sptr, sin.length) !== 1) throw new Error('temen_par_powerbox_onramp failed (not an on-ramp module)');
+      const names = new TextEncoder().encode(caps.join('\n'));
+      const nptr = names.length ? ex.temen_par_alloc(names.length) : 0;
+      if (names.length) u8().set(names, nptr);
+      if (ex.temen_par_powerbox_onramp(gptr, guest.length, sptr, sin.length, nptr, names.length, stdinLater ? 1 : 0) !== 1) {
+        throw new Error('temen_par_powerbox_onramp failed (not an on-ramp module, or a cap name that is not UTF-8)');
+      }
     }
     if (inst) {
       let uptr = 0, ulen = 0;
@@ -190,11 +246,10 @@ export function makeRunner({ module, memory, ex }) {
     // The run's output as its Workers post it, handed on in `seq` order (see `stream_chunk`).
     const output = onOutput && outputInOrder(onOutput);
     let tornDown = false;
-    // Once the run is over, neither its `signal` nor a stop it is still asking reaches the next run.
-    let finished = false, unlisten = null;
     try {
       const { value = null, exit = null } = await new Promise((resolve, reject) => {
-        let stopped = false, grace = null;
+        // `failed`: why the page stopped the run, when an `onCapPark` threw.
+        let stopped = false, grace = null, failed = null;
         const stop = () => {
           stopped = true;
           // Asked until the run's lock was free to be told: it never waits on the page.
@@ -216,7 +271,7 @@ export function makeRunner({ module, memory, ex }) {
         const end = (settle) => {
           clearTimeout(grace);
           if (output) output.end(readParStdoutBytes({ memory, ex }), readParStderrBytes({ memory, ex }));
-          if (stopped) reject(new Error('stopped'));
+          if (stopped) reject(failed ?? new Error('stopped'));
           else settle();
         };
         const startWorker = (cfg) => {
@@ -233,6 +288,23 @@ export function makeRunner({ module, memory, ex }) {
               startWorker({ role: 'x2thread', start: m.start, stackTop: m.stackTop, tlsBase: m.tlsBase, x2Mem: m.x2Mem, x2MemId: m.x2MemId });
             } else if (m.kind === 'out') {
               if (output) output.chunk(m.fd, m.seq, m.bytes);
+            } else if (m.kind === 'cap') {
+              // #1414 5b-2: a call to a declared host-answered cap, which the page answers when it
+              // can while the run goes on. An answer of `null` stops the run, and so does one that
+              // is not an integer, with its error.
+              Promise.resolve()
+                .then(() => (onCapPark ? onCapPark({ id: m.id, index: m.index, args: m.args }) : null))
+                .then((value) => {
+                  if (value === null || value === undefined) return stop();
+                  const answer = BigInt(value);
+                  give(() => ex.temen_x2_answer(m.id, answer) === 1);
+                })
+                .catch((e) => {
+                  failed = e;
+                  stop();
+                });
+            } else if (m.kind === 'idle') {
+              if (onIdle) onIdle();
             } else if (m.kind === 'done') {
               end(() => resolve({ value: BigInt(m.value) }));
             } else if (m.kind === 'exit') {
@@ -257,6 +329,18 @@ export function makeRunner({ module, memory, ex }) {
       if (root) root.terminate();
       if (tornDown) for (const w of threads) w.terminate();
     }
+  };
+  // The run, which resolves as above, with `feed(bytes)` and `end()` for a run fed later.
+  const fedLater = (f) => {
+    if (!f) throw new Error('`feed` and `end` need a run fed later (`stdinLater`)');
+    return f;
+  };
+  return function runAcrossWorkers(guest, opts) {
+    const ctl = {};
+    return Object.assign(runOn(guest, opts, ctl), {
+      feed: (bytes) => fedLater(ctl.feed)(bytes),
+      end: () => fedLater(ctl.end)(),
+    });
   };
 }
 

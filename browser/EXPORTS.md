@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**275 exports** in 38 families — 230 referenced from JS, 45 referenced by nothing, 42 behind a `cfg`.
+**283 exports** in 38 families — 238 referenced from JS, 45 referenced by nothing, 50 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -43,7 +43,7 @@
 | `trap` | 2 | 2 | 0 |
 | `warm` | 5 | 5 | 0 |
 | `wasmjit` | 10 | 10 | 0 |
-| `x2` | 21 | 21 | 21 |
+| `x2` | 29 | 29 | 29 |
 
 ## Exports by family
 
@@ -416,25 +416,33 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 
 ### `x2`
 
+- `temen_x2_answer` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_bytes_ptr` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_call_interp` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_deliver_fault_addr` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_feed` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_feed_cap` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_feed_end` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_feed_ptr` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_mapped_now` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_nfuncs` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_open` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_paged` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_pagestate_len` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_pagestate_ptr` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_program_len` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_run` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_shim_len` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_slot_unit` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_slot_wasm_len` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_spill_bytes` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_spill_ptr` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
-- `temen_x2_start` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_stop` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_table_gen` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_table_log2` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_thread` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_wait` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_wake` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_wasm_len` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_wasm_ptr` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 
