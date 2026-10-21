@@ -308,11 +308,15 @@ fn an_exited_unreaped_twin_rides_as_the_personalitys_zombie() {
 /// §8's manager topology: the twin is live at the cut, waiting out a futex, and its parent waits on
 /// it, by pid (`join_waiters`) or for any child (`reap_any_waiters`). The twin's unwind wakes the
 /// parent, which abandons its wait; the thaw re-creates the twin under its pid, and the re-issued
-/// wait reaps it.
+/// wait reaps it. A twin with a live detached child of its own carries it, and the thaw gives the
+/// child a task id of its own: the twin's pid stays reserved until the whole tree is seeded (a thaw
+/// once released it as it re-created the twin, and minted it again for the child).
 #[test]
 fn a_servicers_live_twin_rides_and_its_parents_wait_reissues() {
-    for wait in [Wait::Pid, Wait::Any] {
-        servicer_twin_rides(TwinAtCut::Live, wait);
+    for at in [TwinAtCut::Live, TwinAtCut::LiveWithChild] {
+        for wait in [Wait::Pid, Wait::Any] {
+            servicer_twin_rides(at, wait);
+        }
     }
 }
 

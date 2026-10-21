@@ -198,6 +198,9 @@ pub fn waitpid_parked_at_the_trigger_thaws() {
 pub enum TwinAtCut {
     /// Live: it waits out a timed futex nothing notifies, and its parent waits on it.
     Live,
+    /// Live as [`Self::Live`], with a live detached child of its own, `D`, which it spawned before
+    /// its nap and joins after it. The twin exits with `D`'s `5` plus `2`.
+    LiveWithChild,
     /// Exited before the cut, unreaped: its parent waits out the futex before it waits on it.
     Exited,
     /// Crashed before the cut, unreaped, as [`Self::Exited`]: it traps where it would exit, and
@@ -215,7 +218,10 @@ pub enum Wait {
 }
 
 /// FORK.md §8's manager topology, durable. The manager (func 0) spawns the server `S` (func 1) and
-/// the caller `C` (func 5), both detached, and grants `C` its `child_offer` over `S` as `"svc"`. `S`
+/// the caller `C` (func 5), both detached, and grants `C` its `child_offer` over `S` as `"svc"`, and
+/// what a spawn of a durable detached child of its own takes beyond its starter `"instantiator"` and
+/// `"budget"`: `D`'s image (func 7, which naps and returns `5`) and freeze authority, as `"m"` and
+/// `"f"`. `S`
 /// serves `fork` (func 2, pid-mode `clone_caller`), `wait` (func 3, `reap`) and `status` (func 4),
 /// and counts each fork or wait it serves without an errno. `C` forks, waits on its twin and answers
 /// `pid · 1000 + status`. The manager asks `S`'s count until it reaches `sync`,
@@ -230,8 +236,11 @@ type 0 func (i64) -> (i64)
 type 1 interface {{ fork: 0, wait: 0, status: 0 }}
 export 0 interface "svc" 1 {{ fork: 2, wait: 3, status: 4 }}
 data 66048 "svc"
-func (i32, i32, i32, i32) -> (i64) {{
-block 0 (v0: i32, vb: i32, vsi: i32, vci: i32) {{
+data 66060 "mf"
+data 66070 "instantiator"
+data 66090 "budget"
+func (i32, i32, i32, i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, vb: i32, vsi: i32, vci: i32, vdi: i32, vfa: i32) {{
   qs = i64.const 65536
   qsv = i64.const -4294967296
   i64.store qs qsv
@@ -242,19 +251,28 @@ block 0 (v0: i32, vb: i32, vsi: i32, vci: i32) {{
   vs = call.cap 6 17 (i64) -> (i32) v0 (qs)
   vz = i64.const 0
   vsvc = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz)
-  ql = i64.const 66000
+  ql = i64.const 66100
   vnp = i32.const 66048
   i32.store ql vnp
   vthree = i32.const 3
   i32.store ql vthree offset=4
   i32.store ql vsvc offset=8
+  vone32 = i32.const 1
+  vnm = i32.const 66060
+  i32.store ql vnm offset=16
+  i32.store ql vone32 offset=20
+  i32.store ql vdi offset=24
+  vnf = i32.const 66061
+  i32.store ql vnf offset=32
+  i32.store ql vone32 offset=36
+  i32.store ql vfa offset=40
   qc = i64.const 65600
   i64.store qc qsv
   i32.store qc vci offset=8
   i32.store qc vb offset=12
   i64.store qc ql offset=16
-  vone = i64.const 1
-  i64.store qc vone offset=24
+  vgn = i64.const 3
+  i64.store qc vgn offset=24
   i64.store qc qneg offset=48
   vc = call.cap 6 17 (i64) -> (i32) v0 (qc)
   br 1(v0, vc, vsvc)
@@ -391,9 +409,44 @@ block 1 (va: i64) {{
   br 1(vn)
   }}
 }}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+{NAP}
+  vfive = i64.const 5
+  return vfive
+  }}
+}}
 "#
     )
 }
+
+/// The twin's spawn of `D`, through the caps `C` holds, which its powerbox copied, with a spawn
+/// record at 65700 in its own window: `D`'s declared window, no pager or pre-mapped region.
+const SPAWN_D: &str = r#"
+  vpi = i64.const 66070
+  vli = i64.const 12
+  vti = self.resolve vpi vli
+  vpm = i64.const 66060
+  vl1 = i64.const 1
+  vtm = self.resolve vpm vl1
+  vpb = i64.const 66090
+  vlb = i64.const 6
+  vtb = self.resolve vpb vlb
+  qd = i64.const 65700
+  qdv = i64.const -4294967296
+  i64.store qd qdv
+  i32.store qd vtm offset=8
+  i32.store qd vtb offset=12
+  qdn = i64.const 4294967295
+  i64.store qd qdn offset=48
+  vd = call.cap 6 17 (i64) -> (i32) vti (qd)"#;
+
+/// The twin's join of `D`, and its exit with `D`'s `5` plus `2`.
+const JOIN_D: &str = r#"
+  vdst, vdv = call.cap 6 1 (i32) -> (i64, i64) vti (vd)
+  vtwo = i64.const 2
+  vr7 = i64.add vdv vtwo
+  return vr7"#;
 
 /// A timed futex wait nothing notifies, `0.2 s`, in the domain's own window.
 const NAP: &str = r#"
@@ -402,11 +455,11 @@ const NAP: &str = r#"
   vnt = i64.const 200000000
   vnr = i32.atomic.wait vna vnw vnt"#;
 
-/// `S` and `C`'s child images of `src` (#2219), each instrumented as [`instrumented`] instruments
-/// `src`, so its bootstrap is too (#2245).
-fn servicer_images(src: &str) -> [Arc<temen_ir::Module>; 2] {
+/// `S`, `C` and `D`'s child images of `src` (#2219), each instrumented as [`instrumented`]
+/// instruments `src`, so its bootstrap is too (#2245).
+fn servicer_images(src: &str) -> [Arc<temen_ir::Module>; 3] {
     let m = temen_text::parse_module(src).expect("parse");
-    [1, 5].map(|f| {
+    [1, 5, 7].map(|f| {
         let mut image = temen_ir::child_image_at(&m, f).expect("child image");
         image.memory = Some(Memory {
             size_log2: SIZE_LOG2,
@@ -418,9 +471,10 @@ fn servicer_images(src: &str) -> [Arc<temen_ir::Module>; 2] {
     })
 }
 
-/// A durable host granting the manager's arguments: the instantiator, a budget, and `S`'s and `C`'s
-/// images. One lane when `one_lane`, so the freeze run's order is the scheduler's, not the OS's.
-fn servicer_host(images: &[Arc<temen_ir::Module>; 2], one_lane: bool) -> (Host, Vec<Value>) {
+/// A durable host granting the manager's arguments: the instantiator, a budget, `S`'s, `C`'s and
+/// `D`'s images, and freeze authority. One lane when `one_lane`, so the freeze run's order is the
+/// scheduler's, not the OS's.
+fn servicer_host(images: &[Arc<temen_ir::Module>; 3], one_lane: bool) -> (Host, Vec<Value>) {
     let mut h = Host::new();
     h.set_durable(true);
     if one_lane {
@@ -428,9 +482,9 @@ fn servicer_host(images: &[Arc<temen_ir::Module>; 2], one_lane: bool) -> (Host, 
     }
     let inst = h.grant_instantiator();
     let budget = h.grant_budget(-1, 1 << 22, -1);
-    let [s, c] = images.each_ref().map(|m| h.grant_durable_module(m));
-    h.grant_freeze_authority();
-    (h, [inst, budget, s, c].map(Value::I32).to_vec())
+    let [s, c, d] = images.each_ref().map(|m| h.grant_durable_module(m));
+    let freeze = h.grant_freeze_authority();
+    (h, [inst, budget, s, c, d, freeze].map(Value::I32).to_vec())
 }
 
 /// Run the manager on `h` over `win`: what it answers, and the window it leaves.
@@ -457,6 +511,7 @@ pub fn servicer_twin_rides(at: TwinAtCut, wait: Wait) {
     let exits = "  vseven = i64.const 7\n  return vseven";
     let (sync, twin, orig, status) = match at {
         TwinAtCut::Live => (2, format!("{NAP}\n{exits}"), "", 7),
+        TwinAtCut::LiveWithChild => (2, format!("{SPAWN_D}\n{NAP}\n{JOIN_D}"), "", 7),
         TwinAtCut::Exited => (1, exits.to_string(), NAP, 7),
         // A trapped twin reaps as the crash status, 128 (`temen_interp::reap_status`).
         TwinAtCut::Crashed => (1, "  unreachable".to_string(), NAP, 128),
@@ -481,7 +536,7 @@ pub fn servicer_twin_rides(at: TwinAtCut, wait: Wait) {
 
     let exited = |outcome| (vec![], vec![temen_interp::FrozenTwin { pid: 3, outcome }]);
     let expect = match at {
-        TwinAtCut::Live => (vec![3], vec![]),
+        TwinAtCut::Live | TwinAtCut::LiveWithChild => (vec![3], vec![]),
         TwinAtCut::Exited => exited(Ok(7)),
         TwinAtCut::Crashed => exited(Err(temen_interp::Trap::Unreachable)),
     };
@@ -498,20 +553,32 @@ pub fn servicer_twin_rides(at: TwinAtCut, wait: Wait) {
             "{ctx}, round {round}: the manager unwinds for the freeze"
         );
         // `C` is the child that forked: the one with a twin on its powerbox.
-        let carried = h
+        let (carried, children) = h
             .captured_detached()
             .iter()
             .map(|c| {
                 let ch = c.host.lock().unwrap();
                 let live: Vec<u64> = ch.captured_twins().iter().map(|t| t.pid).collect();
-                (live, ch.frozen_twins().to_vec())
+                let children: Vec<usize> = ch
+                    .captured_twins()
+                    .iter()
+                    .map(|t| t.host.lock().unwrap().captured_detached().len())
+                    .collect();
+                ((live, ch.frozen_twins().to_vec()), children)
             })
-            .find(|(live, exited)| !live.is_empty() || !exited.is_empty())
+            .find(|((live, exited), _)| !live.is_empty() || !exited.is_empty())
             .expect("C rides with its twin");
         assert_eq!(
             carried, expect,
             "{ctx}, round {round}: what rides of the twin"
         );
+        if at == TwinAtCut::LiveWithChild {
+            assert_eq!(
+                children,
+                [1],
+                "{ctx}, round {round}: D rides under the twin"
+            );
+        }
         let art = temen_snapshot::freeze(&inst, &snap, &h).expect("the twin rides");
         h = servicer_host(&images, round == 1).0;
         win = temen_snapshot::restore(&art, &inst, &mut h).expect("restore");
