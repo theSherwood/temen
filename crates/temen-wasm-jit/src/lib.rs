@@ -1215,31 +1215,6 @@ fn func_uses_region_ops(f: &Func) -> bool {
     })
 }
 
-/// Whether any function reaches an `ADDRESS_SPACE` `unmap`/`protect` (iface 5 ops 1–2) — the
-/// paged-carryable subset of [`module_uses_page_ops`]: the #750 per-access page check traps
-/// `Ro`/`Unmapped` exactly where the interpreter's `check_prot` does, so a self-page-managing guest
-/// can tier up **paged** instead of module-gating to emit-nothing. Deliberately excludes the
-/// `SharedRegion` aliasing ops, which even paged mode cannot carry ([`func_uses_region_ops`]) —
-/// flipping such a guest paged would gate identically while paying the page-check emit for nothing.
-/// Public for the tier-up opens (the browser's `temen_coop_open`) to key their paged flip on actual
-/// page-op usage, not only on a `readonly` data segment (#1009's original heuristic).
-pub fn module_uses_unmap_protect(m: &Module) -> bool {
-    m.funcs.iter().any(|f| {
-        f.blocks.iter().any(|b| {
-            b.insts.iter().any(|i| {
-                matches!(
-                    i,
-                    Inst::CapCall {
-                        type_id: cap_id::ADDRESS_SPACE,
-                        op: 1..=2,
-                        ..
-                    }
-                )
-            })
-        })
-    })
-}
-
 /// Whether any function reaches an `ADDRESS_SPACE` page op at all — `map`/`unmap`/`protect` (iface 5
 /// ops 0–2). The browser's §14 codegen entry and its cooperative tier-up key their **paged** routing
 /// on this (#1151 Slice 2c; the coop tier since #1919): a unit whose leaves can
@@ -2355,7 +2330,7 @@ pub fn compile_module_reactor_budgeted(
 /// contract is [`compile_module_tierup_paged`]'s (refresh the table from the live map after each
 /// bounce, `"mapped"` = its coverage); the page-op cap calls themselves ride the outlined cross-tier
 /// wrappers (`outline_cap_calls`), interp-serviced. `SharedRegion` aliasing (iface 4) stays gated —
-/// the caller ([`compile_jit_paged`]) checks it, as the paged tier-up entry does.
+/// the caller ([`compile_jit_page_checked`]) checks it, as the paged tier-up entry does.
 pub fn compile_module_reactor_paged(
     m: &Module,
     entry: u32,
@@ -2383,7 +2358,7 @@ fn compile_module_reactor_inner(
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     // #1546: no wasm emit of a module that can reach `gc.roots`, from any entry — a rooted emit is
     // all emitted frames, the worst case for the op's scan (see [`module_uses_gc_roots`]). The
-    // shape-deriving front doors ([`compile_jit`], [`compile_jit_paged`]) decline to the interpreter
+    // shape-deriving front doors ([`compile_jit`], [`compile_jit_page_checked`]) decline to the interpreter
     // before reaching here; this refuses the direct `compile_module_reactor*` callers too, so the
     // property is the crate's rather than each front door's.
     if module_uses_gc_roots(m) {
@@ -3111,32 +3086,15 @@ pub fn compile_jit(m: &Module, shape: Shape, shared_memory: bool) -> Result<Arti
 
 /// #1201 — [`compile_jit`] for a host whose driver carries the **paged** contract (#750: it refreshes the
 /// page-state table from the live map after each cross-tier bounce and points `"pagestate"`/`"mapped"`
-/// at it). A module that `unmap`s/`protect`s its own pages ([`module_uses_unmap_protect`]) then emits
-/// **paged** instead of `compile_jit`'s emit-nothing decline — wasm-driven when rooted and
-/// suspension-free (`compile_module_reactor_paged`), else interpreter-driven paged tier-up
-/// (`compile_module_tierup_paged`). Everything else is exactly `compile_jit` (a `map`-only guest keeps
-/// the mask-only emit + the live `"mapped"` bound, #1153), so a non-page-op guest emits byte-identical
-/// code. `SharedRegion` aliasing (iface 4) still fails closed to the whole interpreter — a `Backed`
-/// page's bytes live outside the window, which no trap check can honor.
-pub fn compile_jit_paged(
-    m: &Module,
-    shape: Shape,
-    shared_memory: bool,
-    page_log2: u8,
-) -> Result<Artifact, Error> {
-    if !module_uses_unmap_protect(m) {
-        return compile_jit(m, shape, shared_memory);
-    }
-    compile_jit_page_checked(m, shape, shared_memory, page_log2)
-}
-
-/// [`compile_jit_paged`]'s paged emit, for a host that knows the guest's page state can change
-/// where the module does not show it (#1896): a process image that `map`s, `unmap`s or `protect`s
-/// through an **import** (`vm_map`, bound by the engine), which [`module_uses_unmap_protect`] cannot
-/// see. An image that runs whole cannot decline when its window stops being one bound — a `map` that
-/// leaves a hole would take the mask-only tier's `"mapped"` to deny-everything — so it checks every
-/// access against the page state the host keeps instead. The same driver contract, gates and
-/// fallbacks as [`compile_jit_paged`].
+/// at it): every access is checked against the page state the host keeps — wasm-driven when rooted
+/// and suspension-free (`compile_module_reactor_paged`), else interpreter-driven paged tier-up
+/// (`compile_module_tierup_paged`). For a guest whose page state can change, including where the
+/// module does not show it (#1896): a process image that `map`s, `unmap`s or `protect`s through an
+/// **import** (`vm_map`, bound by the engine). An image that runs whole cannot decline when its
+/// window stops being one bound — a `map` that leaves a hole would take the mask-only tier's
+/// `"mapped"` to deny-everything — so it checks every access instead. `SharedRegion` aliasing
+/// (iface 4) and `gc.roots` still fail closed to the whole interpreter — a `Backed` page's bytes live
+/// outside the window, which no trap check can honor.
 pub fn compile_jit_page_checked(
     m: &Module,
     shape: Shape,

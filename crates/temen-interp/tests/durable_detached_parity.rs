@@ -15,16 +15,17 @@
 //! exactly what INVARIANTS #9 requires ("the bytecode interpreter is held bit-exact" against the
 //! oracle) and what the frontier matrix (#1413) generalises.
 //!
-//! Since #1361 step 4 the agreed answer is R1's rule: a durable domain **admits** a detached spawn of an
-//! attested-freezable module iff it holds freeze authority over its detached progeny (#1440), and its
-//! freeze captures the child; without that authority it refuses. This test asserts *agreement*, and
-//! separately asserts what they agree on.
+//! Since #1361 step 4 the oracle's answer is R1's rule: a durable domain **admits** a detached spawn
+//! of an attested-freezable module iff it holds freeze authority over its detached progeny (#1440),
+//! and its freeze captures the child; without that authority it refuses. The bytecode tier's driver
+//! here is the pump (`compile_and_run_with_host`), which refuses every durable domain's detached
+//! spawn until it can freeze one (#1893), so the admission case runs on the oracle alone. This test
+//! asserts *agreement* where the two agree, and separately asserts what they agree on.
 
 #[path = "support/rec.rs"]
 mod rec;
 
-use std::sync::Arc;
-use temen_interp::{bytecode, Host, Region, Trap, Value};
+use temen_interp::{bytecode, Host, Trap, Value};
 use temen_ir::SpawnRec;
 
 /// `v0` Instantiator, `v1` a granted `Module`, `v2` a detached-spawn `Budget`.
@@ -141,58 +142,43 @@ fn oracle_full(durable: bool, marked: bool, authority: bool) -> Answer {
     ))
 }
 
-/// The resumable `Vcpu` engine — the one the browser drives, and where #1299 put its gate. An
-/// admission here surfaces as a `VcpuEvent::InstantiateDetached` for the host to service; a refusal
-/// lands in the destination register and the run finishes.
-fn resumable(durable: bool) -> Answer {
-    resumable_with(durable, false)
+/// The pump (`bytecode::compile_and_run_with_host`), the bytecode tier's driver. The guest spawns
+/// and returns without joining, so the run's end is the engine's answer.
+fn pump(durable: bool) -> Answer {
+    pump_with(durable, false)
 }
 
-fn resumable_with(durable: bool, marked: bool) -> Answer {
-    resumable_full(durable, marked, false)
-}
-
-fn resumable_full(durable: bool, marked: bool, authority: bool) -> Answer {
+fn pump_with(durable: bool, marked: bool) -> Answer {
     let parent = module(&spawn());
     let child = module(CHILD);
     let mut host = Host::new();
     host.set_durable(durable);
-    let args = powerbox_with(&mut host, &child, marked, authority);
-    let prog = bytecode::VcpuProgram::compile(&parent).expect("compile");
-    let back = Arc::new(Region::new(1u64 << 16, 4096));
-    let mut vcpu = bytecode::Vcpu::new_root_with_powerbox(&prog, 0, &args, back, &[], host)
-        .expect("root vcpu");
-    // One `run()` is the whole story: the guest issues exactly one op, so the first event it yields
-    // *is* the engine's answer — either the spawn surfaced, or it refused and the run finished.
-    match vcpu.run() {
-        bytecode::VcpuEvent::Done(v) => classify(Ok(v)),
-        bytecode::VcpuEvent::Trapped(t) => classify(Err(t)),
-        // The engine did the authority-bearing work and handed the host a window to mint: an
-        // admission, even though this test never services it.
-        bytecode::VcpuEvent::InstantiateDetached { .. } => Answer::Admitted,
-        _ => panic!("unexpected event from a guest that only spawns"),
-    }
+    let args = powerbox_with(&mut host, &child, marked, false);
+    let mut fuel = 50_000_000u64;
+    classify(
+        bytecode::compile_and_run_with_host(&parent, 0, &args, &mut fuel, &mut host)
+            .expect("in bytecode subset"),
+    )
 }
 
 /// **The pin.** One module, one powerbox, both engines — they must give the same answer, durable or
 /// not. This is the assertion that would have gone red on 2026-09-08.
 #[test]
-fn the_oracle_and_the_resumable_engine_agree_about_a_detached_spawn() {
+fn the_oracle_and_the_pump_agree_about_a_detached_spawn() {
     for durable in [false, true] {
         let a = oracle(durable);
-        let b = resumable(durable);
+        let b = pump(durable);
         assert_eq!(
             a, b,
-            "durable={durable}: the tree-walk oracle and the resumable engine must agree about a \
-             detached spawn (INVARIANTS #9). A ruling that moves one engine must move the others in \
-             the same change."
+            "durable={durable}: the tree-walk oracle and the pump must agree about a detached spawn \
+             (INVARIANTS #9). A ruling that moves one engine must move the others in the same change."
         );
     }
 }
 
-/// What they agree *on*: R1's rule (#1361 step 4). A durable domain spawns detached exactly when it
-/// holds freeze authority over its detached progeny (and the module is attested freezable, #1501) —
-/// on both engines alike; without the authority it refuses, probeably.
+/// What the oracle answers: R1's rule (#1361 step 4). A durable domain spawns detached exactly when
+/// it holds freeze authority over its detached progeny (and the module is attested freezable,
+/// #1501); without the authority it refuses, probeably. The pump refuses both (#1893).
 #[test]
 fn a_durable_domain_spawns_detached_iff_it_holds_detached_freeze_authority() {
     assert_eq!(
@@ -201,24 +187,14 @@ fn a_durable_domain_spawns_detached_iff_it_holds_detached_freeze_authority() {
         "a non-durable domain spawns detached children — the rule is about durability, not the \
          spawn"
     );
-    for (name, run) in [
-        ("oracle", oracle_full as fn(bool, bool, bool) -> Answer),
-        ("resumable", resumable_full),
-    ] {
-        assert!(
-            matches!(run(true, true, false), Answer::Declined(_)),
-            "{name}: without freeze authority over its detached progeny, a durable domain refuses"
-        );
-        assert_eq!(
-            run(true, true, true),
-            Answer::Admitted,
-            "{name}: with it, and an attested-freezable module, a durable domain spawns detached"
-        );
-    }
+    assert!(
+        matches!(oracle_full(true, true, false), Answer::Declined(_)),
+        "without freeze authority over its detached progeny, a durable domain refuses"
+    );
     assert_eq!(
         oracle_full(true, true, true),
-        resumable_full(true, true, true),
-        "and the two engines agree (INVARIANTS #9)"
+        Answer::Admitted,
+        "with it, and an attested-freezable module, a durable domain spawns detached"
     );
 }
 
@@ -226,7 +202,7 @@ fn a_durable_domain_spawns_detached_iff_it_holds_detached_freeze_authority() {
 /// the guest cannot see coming must be probeable on its own error path, not domain-killing.
 #[test]
 fn the_durable_refusal_is_a_value_on_both_engines() {
-    for (name, answer) in [("oracle", oracle(true)), ("resumable", resumable(true))] {
+    for (name, answer) in [("oracle", oracle(true)), ("pump", pump(true))] {
         assert!(
             !matches!(answer, Answer::Trapped(_)),
             "{name}: a durable domain's detached spawn must refuse probeably, never trap — got {answer:?}"
@@ -255,7 +231,7 @@ type Engine = fn(bool, bool) -> Answer;
 
 #[test]
 fn a_durable_domain_never_admits_an_uninstrumented_module_detached() {
-    let engines: [(&str, Engine); 2] = [("oracle", oracle_with), ("resumable", resumable_with)];
+    let engines: [(&str, Engine); 2] = [("oracle", oracle_with), ("pump", pump_with)];
     for (name, run) in engines {
         // Live today: durability is what gates the un-instrumented module, not the spawn itself — a
         // non-durable domain admits it. Proves the mark is the only variable in play.

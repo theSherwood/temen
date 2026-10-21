@@ -117,7 +117,7 @@ fn record_spawn_is_native_and_matches_the_oracle() {
     let m = parse_module(&src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     assert!(
-        bytecode::VcpuProgram::compile(&m).is_some(),
+        bytecode::admits(&m),
         "op-17 module must compile natively (no impl exports)"
     );
     let image = temen_ir::child_image_at(&m, 1).expect("image");
@@ -137,9 +137,8 @@ fn record_spawn_is_native_and_matches_the_oracle() {
 }
 
 /// #2164 — the pager admission: a driver that serves its children pages them, so it admits a
-/// pager-capable module. `Vcpu` and the debug scheduler serve none, so they decline the module whole
-/// to the oracle: `Vcpu` at its compile, the debug scheduler when a session opens. The same module
-/// without its `pager` export opens a session. What the paging does is pinned on every driver by
+/// pager-capable module. The debug scheduler serves none, so it declines the module whole to the
+/// oracle when a session opens. The same module without its `pager` export opens a session. What the paging does is pinned on every driver by
 /// `temen`'s `instantiate_record.rs`.
 #[test]
 fn a_pager_capable_record_module_runs_where_children_are_served() {
@@ -149,10 +148,6 @@ fn a_pager_capable_record_module_runs_where_children_are_served() {
     assert!(
         bytecode::admits(&m),
         "the cooperative driver pages its children itself"
-    );
-    assert!(
-        bytecode::VcpuProgram::compile(&m).is_none(),
-        "a `Vcpu` serves no children, so it declines a module that could page one"
     );
     let args = [Value::I32(0)];
     assert!(

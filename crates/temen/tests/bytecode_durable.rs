@@ -197,11 +197,9 @@ fn single_fiber_multi_live_freeze_thaw() {
     check(MULTI_LIVE);
 }
 
-/// #1694 — no bytecode driver runs a durable host silently non-durable. The resumable `Vcpu` runs it
-/// durable, and since it has no freeze driver, a run that ends frozen with a parked fiber traps
-/// `FiberFault` rather than hand back an artifact missing that fiber. The cooperative engine freezes
-/// the same module whole. The parallel entry, which keeps no durability at all, answers `None`
-/// (outside it), so its caller falls back.
+/// #1694 — no bytecode driver runs a durable host silently non-durable. The cooperative engine
+/// freezes a run that ends frozen with a parked fiber whole, that fiber included. The parallel entry,
+/// which keeps no durability at all, answers `None` (outside it), so its caller falls back.
 #[test]
 fn no_bytecode_driver_runs_a_durable_host_non_durable() {
     // The root resumes a fiber that suspends once, then resumes it again: frozen from the start, the
@@ -239,30 +237,6 @@ block 0 (v0: i64, v1: i64) {
     };
     let back =
         || std::sync::Arc::new(temen_interp::Region::owned_zeroed(1 << 20, 4096).expect("backing"));
-    let prog = bytecode::VcpuProgram::compile(&inst).expect("compiles");
-    let resumable = |state: i32| {
-        let mut v = bytecode::Vcpu::new_root_with_powerbox(
-            &prog,
-            0,
-            &[],
-            back(),
-            &window_with(state),
-            durable(),
-        )
-        .expect("builds");
-        v.run()
-    };
-    assert!(
-        matches!(resumable(STATE_NORMAL), bytecode::VcpuEvent::Done(ref v) if v == &[Value::I64(7)]),
-        "the resumable driver runs a durable host"
-    );
-    assert!(
-        matches!(
-            resumable(STATE_UNWINDING),
-            bytecode::VcpuEvent::Trapped(Trap::FiberFault)
-        ),
-        "frozen with a parked fiber it cannot flatten, it fails closed"
-    );
     let mut h = durable();
     let mut fuel = 1_000_000u64;
     let (r, _) = bytecode::compile_and_run_capture_reserved_with_host(

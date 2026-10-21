@@ -5,114 +5,15 @@
 // root isn't emittable or the run traps (the caller falls back to the interpreter). The run's stdout,
 // stderr and exit code land in the shared slots, read through the usual `temen_stdout_*` /
 // `temen_exit_code` accessors exactly as after the interpreter's `temen_run_onramp`.
-//
-// `driveDetachedRun` still drives a **single-shot** run: the cdylib emits one entry and this module
-// calls `f0(win, env, ...slots)` once against the child's memory, servicing the cross-tier helpers
-// through `env.call_interp`, then `temen_onramp_jit_run_finish` captures the outcome.
 
 import {
-  cacheGet, cachePut, jitCacheStats, moduleCacheClear, driveCoopTierupRun, suspendsLeaves,
+  jitCacheStats, moduleCacheClear, driveCoopTierupRun, suspendsLeaves,
 } from './coop-driver.js';
 
 export { jitCacheStats, driveCoopTierupRun, suspendsLeaves };
 
 export function jitCacheClear() {
   moduleCacheClear();
-}
-
-// Compile the emitted module for `cacheKey` (reusing the compiled Module across Runs), then instantiate
-// it over `memory` with `callInterp` as its `env.call_interp`. `readEmitted` is invoked **only on a
-// compile miss**, so a hit skips the byte copy. The instance is never reused: an Instance is bound to
-// its imported memory, and each detached child has its own (#1285). Returns the emitted `f0`.
-async function instantiateF0(memory, cacheKey, readEmitted, callInterp) {
-  let module = cacheGet(cacheKey);
-  if (module === undefined) {
-    module = await WebAssembly.compile(readEmitted());
-    cachePut(cacheKey, module);
-    jitCacheStats.compiles++;
-  }
-  const instance = await WebAssembly.instantiate(module, {
-    env: { memory, trap: () => {}, call_interp: callInterp },
-  });
-  if (typeof instance.exports.f0 !== 'function') throw new Error('emitted module has no f0 export');
-  return { f0: instance.exports.f0, instance };
-}
-
-// Drive an opened **detached** single-shot run (#1285, DETACHED_JIT.md §3.1): the emitted `_start`
-// instance is bound to the CHILD's own `WebAssembly.Memory` (`childMemory`, registered as the run's foreign
-// memory), not the engine's. `win` is the host header page the cdylib reports; the `env` bounce cell lives
-// at child offset 0 (the emitted code stores its scratch slots through ITS memory), so each `call_interp`
-// mirrors the cell into an engine-side scratch for the bounce and back after. A paged run's `pagestate`
-// table is copied into the header at `temen_detached_pagestate_off()` on every sync. Everything else —
-// `"mapped"` re-sync, report/finish/close, trap ⇒ decline — is the single-shot run's contract.
-export async function driveDetachedRun(ex, memory, childMemory, cacheKey) {
-  const eu8 = () => new Uint8Array(memory.buffer);
-  const cu8 = () => new Uint8Array(childMemory.buffer);
-  const win = Number(ex.temen_onramp_jit_run_win_ptr()); // = temen_detached_header_bytes()
-  const envBytes = ex.temen_onramp_jit_run_env_bytes();
-  const pagestateOff = ex.temen_detached_pagestate_off();
-  if (envBytes > pagestateOff) throw new Error('env cell does not fit the detached header');
-  const slots = [];
-  for (let i = 0, n = ex.temen_onramp_jit_run_slot_count(); i < n; i++) slots.push(ex.temen_onramp_jit_run_slot(i));
-  const env = 0; // the header page starts the child memory; the cell sits at its bottom
-  const scratch = Number(ex.temen_alloc(envBytes)); // engine-side mirror of the cell for bounces
-  let mappedGlobal = null, pagestateGlobal = null;
-  const syncGlobals = () => {
-    if (pagestateGlobal) {
-      const p = Number(ex.temen_onramp_jit_run_pagestate_ptr()), n = ex.temen_onramp_jit_run_pagestate_len();
-      if (pagestateOff + n > win) throw new Error('pagestate table does not fit the detached header');
-      cu8().set(eu8().subarray(p, p + n), pagestateOff);
-      pagestateGlobal.value = pagestateOff;
-    }
-    if (mappedGlobal) mappedGlobal.value = ex.temen_onramp_jit_run_mapped();
-  };
-  let f0, instance;
-  try {
-    ({ f0, instance } = await instantiateF0(
-      childMemory,
-      cacheKey,
-      () => {
-        const wptr = Number(ex.temen_onramp_jit_run_wasm_ptr());
-        const wlen = ex.temen_onramp_jit_run_wasm_len();
-        return eu8().slice(wptr, wptr + wlen);
-      },
-      (func, argsPtr) => {
-        eu8().set(cu8().subarray(env, env + envBytes), scratch);
-        const st = ex.temen_onramp_jit_run_call_interp(func, scratch + (argsPtr - env));
-        // Copy back even on a stop: the cell is the child's, and a later read must see the results.
-        cu8().set(eu8().subarray(scratch, scratch + envBytes), env);
-        if (st !== 0) throw new Error('cross-tier stop');
-        syncGlobals();
-      },
-    ));
-  } catch (e) {
-    ex.temen_dealloc(scratch, envBytes);
-    ex.temen_onramp_jit_run_close();
-    throw e;
-  }
-  mappedGlobal = instance.exports.mapped ?? null;
-  pagestateGlobal = instance.exports.pagestate ?? null;
-  syncGlobals();
-  new DataView(childMemory.buffer).setBigInt64(env, 1n << 60n, true); // dispatcher-fuel budget
-  let threw = 0, value = 0n, unwound = '';
-  try {
-    const r = f0(win, env, ...slots);
-    value = r === undefined || r === null ? 0n : BigInt(r);
-  } catch (e) {
-    threw = 1;
-    unwound = String(e && e.message || e); // a wasm trap, a bounce stop, or a host-import exception
-  }
-  ex.temen_dealloc(scratch, envBytes);
-  ex.temen_onramp_jit_run_report(threw, value);
-  const status = ex.temen_onramp_jit_run_finish();
-  let trapMsg = '';
-  if (status === 3) {
-    const tl = ex.temen_onramp_jit_run_trap_len();
-    trapMsg = tl ? new TextDecoder().decode(eu8().slice(Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + tl)) : '';
-  }
-  ex.temen_onramp_jit_run_close();
-  if (status === 3 /* STATUS_TRAP */) throw new Error(`emitted detached run trapped (declined to the interpreter): ${trapMsg || unwound}`);
-  return status;
 }
 
 // A **registry blob** (the cdylib's `registry_blob`): all integers little-endian, a u32 entry count,

@@ -1179,7 +1179,8 @@ print("squares:", table.concat(sq, " "))
     kind: 'chibicc',
     debug: true, // source-level C debugging: tick "debug info (-g)", then Debug (see the debugger below)
     jit: true, // chibicc's _start emits to wasm (333 funcs; cap-call/float helpers bounce cross-tier) —
-    //          toggle "wasm-JIT" to run the compile several× faster (byte-identical IR, gated by chibicc_jit.rs)
+    //          toggle "wasm-JIT" to run the compile several× faster (byte-identical IR, gated by
+    //          coop_tierup_driver.rs's `coop_open_fs_compiles_c_with_chibicc_as_a_root_leaf`)
     editable: true,
     lang: 'c',
     url: './assets/chibicc.temen',
@@ -2960,8 +2961,9 @@ function stageChildren(handles, kids) {
 // `_start` emits to wasm (333 funcs; the cap-call/float helpers bounce cross-tier), running the compile
 // several× faster than the bytecode interpreter — with a fallback to `temen_run_onramp_fs` if the emit is
 // ever unavailable. Both tiers share the fixed powerbox + the same seeded memfs, so the emitted IR is
-// byte-identical (gated by `chibicc_jit.rs`). Header-free sources compile with an empty header image;
-// the demo corpus is return-value programs whose result is the value shown.
+// byte-identical (gated by `coop_open_fs_compiles_c_with_chibicc_as_a_root_leaf`). Header-free sources
+// compile with an empty header image; the demo corpus is return-value programs whose result is the
+// value shown.
 async function runChibicc(c) {
   const ex = c.ex;
   setState(c, 'running', 'fetching compiler…');
@@ -4339,7 +4341,8 @@ async function proveModuleParity(c) {
 
 // The chibicc-card twin of `proveModuleParity`: run **pass 1** (chibicc compiling the editor's C) on both
 // tiers and assert the emitted TEMEN-IR text is byte-identical — the compiler is the run-to-completion
-// guest, its stdout is the IR. This is exactly what `chibicc_jit.rs` asserts natively.
+// guest, its stdout is the IR. This is what `coop_open_fs_compiles_c_with_chibicc_as_a_root_leaf` asserts
+// natively.
 async function proveChibiccParity(c) {
   if (broken) return;
   await stopReactor();
@@ -4407,7 +4410,8 @@ async function proveChibiccParity(c) {
 
 // The self-host twin of `proveChibiccParity`: compile the selected chibicc TU to an object on both the
 // bytecode interpreter and the wasm-JIT and assert the emitted object IR is byte-identical — the same
-// interp≡JIT guarantee `chibicc_jit.rs` proves natively, now over chibicc's own source.
+// interp≡JIT guarantee `coop_open_fs_compiles_c_with_chibicc_as_a_root_leaf` proves natively, now over
+// chibicc's own source.
 async function proveSelfhostParity(c) {
   if (broken) return;
   await stopReactor();

@@ -23,6 +23,13 @@ note was written while op 15 was the detached spawn: where it says op 15 or name
 or 11-arg forms, read the record (`size_log2`, `budget`, `module`, the grant list, the args payload,
 `region` and `child_off`). The mechanism it designs is the one the record takes.
 
+**The browser's op-13 servicer and single-shot JIT run are deleted (#1414 S4-5b, 2026-10-20).**
+`temen_op13jit_*`, `JitOnrampRun`, `driveDetachedRun` and the single-shot detached exports this note
+describes no longer exist. Detached children run on the pump and on the parallel driver, each over a
+window of its own: the parallel driver's run their program's emit over their own
+`WebAssembly.Memory` (#1414 ED-2), the pump's over the engine's memory. Read the servicer passages
+below as history.
+
 **One-line summary.** The isolated, independently-growable, concurrency-safe child that
 #1253 and the playground need **already exists in the design and the reference
 interpreter** — it is the **detached window** (`Instantiator.instantiate_detached`, op 15,
@@ -67,7 +74,7 @@ child in its own address space.** In temen that structure already has a name.
 | Detached window size must equal the module's declared (`mod_ok = memory_log2 == size_log2`, §14 transparency) | `lib.rs` ~11889 | **Built** |
 | Detached child's starter `Instantiator`/`AddressSpace` span its **reservation** (a root's shape; since #2433 only the `AddressSpace` has a span), so `vm_map` grows the window. **Corrected in #1286**: the built arm bounded them to the declared size, which refused every `vm_map` past it — a detached interpreter child could not actually grow | `lib.rs` ~11940; `detached_windows::a_detached_child_grows_past_its_declared_window` | **Fixed** |
 | op 15 optional trailing `(args_ptr, args_len)` — the spawn-time args payload copied to the child's `module_args_base()` (#1286) | `lib.rs` op-15 arm; `bytecode.rs` `Op::InstantiateDetached` | **Built** (both engines) |
-| Resumable-engine op 15: `VcpuEvent::InstantiateDetached { size_log2 }` — the host mints the window and starts the admitted child over it (#1286, #1414) | `bytecode.rs`; browser `temen_op13jit_step` + `foreign_mint` | **Built** |
+| Resumable-engine op 15: `VcpuEvent::InstantiateDetached { size_log2 }` — the host mints the window and starts the admitted child over it (#1286, #1414) | `bytecode.rs`; browser `temen_op13jit_step` + `foreign_mint` | **Deleted** with the resumable `Vcpu` and its browser servicer (#1414 S4-5b); the pump and executor 2 run op 15 themselves |
 | `self.attest` → `tier \| window_exposed<<8 \| freeze_exposed<<9`; detached attests `window_exposed = false` | `lib.rs` 16358–16385, 19496 | **Built** (PROCESS.md §6) |
 | Spawner keeps kill/join/fuel; detachment severs **read**, not lifecycle; live offers work (`child_offer`, op 14) | PROCESS.md §5; `detached_windows.rs` | **Built** |
 | Durable domain **refuses** detached (multi-window freeze = O6, deferred) | `lib.rs` 19593–19651 | **Built (fail-closed)** |
@@ -576,8 +583,7 @@ contact**, #3, #4, #8, #12); **4 unchanged** (#5, #6, #10, #11); **4 renegotiate
 detached children in Workers with independent growth; a `Region::Foreign` micro-benchmark
 (the §3.3 gate); a **futex-collision regression** (two detached siblings, same guest offset,
 must not rendezvous — fails today on the interpreter). Existing nested suites, `fuzz/mask`,
-`confined_child_null_guard.rs`, `parallel_instantiate_miri.rs`, `vcpu_instantiate_miri.rs`,
-the escape oracle: untouched — they remain the alias grant's evidence. Decision B adds isolated
+`confined_child_null_guard.rs`, `parallel_instantiate_miri.rs`, the escape oracle: untouched — they remain the alias grant's evidence. Decision B adds isolated
 twins of `pagestate`/`live_mapped`/`paged_walk` and re-plumbs
 `grant_marshal_fuzz`'s source window (authority half verbatim).
 

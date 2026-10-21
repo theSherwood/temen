@@ -6,17 +6,18 @@
 //! the bulk data plane between a parent and a child whose memory it cannot otherwise address
 //! (DESIGN.md §13 / DETACHED_JIT.md §3.4), minus the ceremony.
 //!
-//! Pinned on both interpreter engines (the tree-walk oracle and the resumable bytecode engine, driven
-//! through its `VcpuEvent::InstantiateDetached` protocol): the alias round-trip, the probeable `-EINVAL`
-//! refusals (an offset inside the NULL guard, a region overrunning the declared window — charging
-//! nothing, no child spawned), and the `CapFault` a wrong-kind handle raises (invariant 5: forgery
-//! traps, geometry refuses).
+//! Pinned on every driver (`support/drivers.rs`), each giving the tree-walk oracle's answer: the
+//! alias round-trip, the probeable `-EINVAL` refusals (an offset inside the NULL guard, a region
+//! overrunning the declared window), and the `CapFault` a wrong-kind handle raises (invariant 5:
+//! forgery traps, geometry refuses).
 
+#[path = "support/drivers.rs"]
+mod drivers;
 #[path = "support/rec.rs"]
 mod rec;
 
-use std::sync::Arc;
-use temen_interp::{bytecode, run_with_host, Host, Region, Trap, Value};
+use drivers::{agree_on_every_driver, Ran};
+use temen_interp::{Host, Trap, Value};
 use temen_ir::SpawnRec;
 
 fn module(text: &str) -> temen_ir::Module {
@@ -99,146 +100,66 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
 /// `1000 × (41 + 1) + 2 × 41`.
 const ROUND_TRIP: i64 = 42_082;
 
-fn host(child: &temen_ir::Module) -> (Host, [i32; 4]) {
-    let mut host = Host::new();
-    let inst = host.grant_instantiator();
-    let aspace = host.grant_address_space(0, 1u64 << 17);
-    let modh = host.grant_module(child);
-    let budget = host.grant_budget(-1, 1i64 << 17, -1); // exactly one 2^17 window
-    (host, [inst, aspace, modh, budget])
-}
-
-/// The tree-walk oracle.
-fn run_interp(parent_src: &str) -> Result<Vec<Value>, Trap> {
-    let parent = module(parent_src);
-    let child = module(CHILD);
-    let (mut host, h) = host(&child);
-    let mut fuel = 50_000_000u64;
-    run_with_host(
-        &parent,
-        0,
-        &[
-            Value::I32(h[0]),
-            Value::I32(h[1]),
-            Value::I32(h[2]),
-            Value::I32(h[3]),
-        ],
-        &mut fuel,
-        &mut host,
-    )
-}
-
-/// The resumable bytecode engine, driven through its detached-spawn protocol: the host mints a
-/// backing for the child's window and starts the admitted child over it, which seeds the segments
-/// and the payload and aliases in the pre-map its powerbox carries. Records how many spawns surfaced.
-fn drive(
-    prog: &bytecode::VcpuProgram,
-    mut vcpu: bytecode::Vcpu<'_>,
-    spawns: &mut usize,
-) -> Result<Vec<Value>, Trap> {
-    let mut children: Vec<Result<Vec<Value>, Trap>> = Vec::new();
-    loop {
-        match vcpu.run() {
-            bytecode::VcpuEvent::Done(v) => return Ok(v),
-            bytecode::VcpuEvent::Trapped(t) => return Err(t),
-            bytecode::VcpuEvent::InstantiateDetached { size_log2, .. } => {
-                *spawns += 1;
-                let back = Arc::new(Region::new(1u64 << size_log2, 4096));
-                let child = vcpu
-                    .take_child()
-                    .expect("an InstantiateDetached carries its admitted child")
-                    .start(prog, back)
-                    .expect("detached child builds");
-                let r = drive(prog, child, spawns);
-                let token = children.len() as u64;
-                children.push(r);
-                vcpu.deliver_child(token);
-            }
-            bytecode::VcpuEvent::Join { child } => {
-                vcpu.deliver_join(children[child as usize].clone());
-            }
-            _ => panic!("unexpected event in the detached kernel"),
-        }
+/// The parent's powerbox: its `Instantiator`, an `AddressSpace`, `child` as a `Module`, and a
+/// detached-spawn `Budget` that holds exactly one 2^17 window.
+fn setup(child: &temen_ir::Module) -> impl Fn() -> (Host, Vec<Value>) + '_ {
+    move || {
+        let mut host = Host::new();
+        let inst = host.grant_instantiator();
+        let aspace = host.grant_address_space(0, 1u64 << 17);
+        let modh = host.grant_module(child);
+        let budget = host.grant_budget(-1, 1i64 << 17, -1);
+        let args = [inst, aspace, modh, budget].map(Value::I32).to_vec();
+        (host, args)
     }
 }
 
-fn run_bytecode(parent_src: &str) -> (Result<Vec<Value>, Trap>, usize) {
-    let parent = module(parent_src);
+/// `parent_src` gives `want` on every driver.
+fn agree(what: &str, parent_src: &str, want: Result<Vec<Value>, Trap>) {
     let child = module(CHILD);
-    let prog = bytecode::VcpuProgram::compile(&parent).expect("compile parent");
-    let (host, h) = host(&child);
-    let back = Arc::new(Region::new(1u64 << 17, 4096));
-    let root = bytecode::Vcpu::new_root_with_powerbox(
-        &prog,
-        0,
-        &[
-            Value::I32(h[0]),
-            Value::I32(h[1]),
-            Value::I32(h[2]),
-            Value::I32(h[3]),
-        ],
-        Arc::clone(&back),
-        &[],
-        host,
-    )
-    .expect("root vcpu");
-    let mut spawns = 0;
-    let r = drive(&prog, root, &mut spawns);
-    (r, spawns)
+    let want = Ran {
+        result: want,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    agree_on_every_driver(what, &module(parent_src), &setup(&child), &want);
 }
 
 #[test]
-fn a_pre_mapped_region_carries_bulk_data_both_ways_on_the_tree_walker() {
-    assert_eq!(
-        run_interp(&parent(CHILD_OFF, "vrh", true)),
+fn a_pre_mapped_region_carries_bulk_data_both_ways() {
+    // The child read the parent's word through the alias and the parent read the child's back.
+    agree(
+        "the round trip",
+        &parent(CHILD_OFF, "vrh", true),
         Ok(vec![Value::I64(ROUND_TRIP)]),
-        "the child read the parent's word through the alias and the parent read the child's back"
     );
 }
 
 #[test]
-fn a_pre_mapped_region_carries_bulk_data_both_ways_on_the_bytecode_engine() {
-    let (r, spawns) = run_bytecode(&parent(CHILD_OFF, "vrh", true));
-    assert_eq!(
-        r,
-        Ok(vec![Value::I64(ROUND_TRIP)]),
-        "identical to the oracle"
-    );
-    assert_eq!(spawns, 1);
-}
-
-#[test]
-fn an_offset_inside_the_null_guard_refuses_probeably_on_both_engines() {
-    assert_eq!(
-        run_interp(&parent(0, "vrh", false)),
+fn an_offset_inside_the_null_guard_refuses_probeably() {
+    agree(
+        "an offset inside the NULL guard",
+        &parent(0, "vrh", false),
         Ok(vec![Value::I64(-22)]),
-        "EINVAL, not a trap"
     );
-    let (r, spawns) = run_bytecode(&parent(0, "vrh", false));
-    assert_eq!(r, Ok(vec![Value::I64(-22)]));
-    assert_eq!(spawns, 0, "a refused spawn never reaches the host");
 }
 
 #[test]
-fn a_region_overrunning_the_child_window_refuses_probeably_on_both_engines() {
+fn a_region_overrunning_the_child_window_refuses_probeably() {
     // 128 KiB + 64 KiB > the child's 128 KiB declared window.
-    assert_eq!(
-        run_interp(&parent(1 << 17, "vrh", false)),
-        Ok(vec![Value::I64(-22)])
+    agree(
+        "a region overrunning the window",
+        &parent(1 << 17, "vrh", false),
+        Ok(vec![Value::I64(-22)]),
     );
-    let (r, spawns) = run_bytecode(&parent(1 << 17, "vrh", false));
-    assert_eq!(r, Ok(vec![Value::I64(-22)]));
-    assert_eq!(spawns, 0);
 }
 
 #[test]
-fn a_wrong_kind_handle_traps_on_both_engines() {
+fn a_wrong_kind_handle_traps() {
     // The AddressSpace handle where a SharedRegion is expected: a typing violation on a live handle.
-    assert_eq!(
-        run_interp(&parent(CHILD_OFF, "v1", false)),
-        Err(Trap::CapFault)
+    agree(
+        "a wrong-kind handle",
+        &parent(CHILD_OFF, "v1", false),
+        Err(Trap::CapFault),
     );
-    let (r, spawns) = run_bytecode(&parent(CHILD_OFF, "v1", false));
-    assert_eq!(r, Err(Trap::CapFault));
-    assert_eq!(spawns, 0);
 }

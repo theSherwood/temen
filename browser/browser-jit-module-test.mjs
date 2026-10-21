@@ -1,4 +1,5 @@
-// Real-browser (V8) differential + measurement for the **single-shot module wasm-JIT**: for each
+// Real-browser (V8) differential + measurement for **module runs on the wasm-JIT** (the pump's root
+// leaf, #1414 S4-3): for each
 // on-ramp module (hello_c / Lua / SQLite), run the SAME guest through the interpreter (`temen_run_onramp`)
 // and the emitted-wasm tier (`runJitModule`), assert stdout is BYTE-IDENTICAL, and print interp-vs-JIT
 // timing. V8 (unlike wasmi) compiles Lua/SQLite's huge functions, so this is where the module JIT is

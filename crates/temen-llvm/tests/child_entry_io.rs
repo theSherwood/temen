@@ -5,7 +5,7 @@
 //! …)` is spawned (`temen_run::conductor`, its own window) with `stdout` re-granted, and its bytes land in the
 //! parent's stdout — the exact hand-off a JIT'd `nifler` uses to reach its `fs`. It runs on the
 //! tree-walk oracle and every bytecode driver ([`drivers::ALL`]): each binds the child manifest at the
-//! one admission they share, the resumable `Vcpu` (the engine a phase tiers up on) among them.
+//! one admission they share.
 
 #![cfg(target_os = "linux")]
 

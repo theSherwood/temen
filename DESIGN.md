@@ -1969,7 +1969,7 @@ it waits — the pool keeps genuinely blocking host work. A completer dropped un
 nothing. Where its caller cannot park the call declines with `CapFault`: before the embedder sees it
 on the sync face and in a durable run, else withdrawn (`Completions::withdraw`, so its completer
 answers nothing) — a reply that is not one `i64`, a tier-up region, a `Jit.invoke` unit, the
-explorer. A driver its embedder pumps (`Vcpu`, `CoopRun`, the debug scheduler) hands control back
+explorer. A driver its embedder pumps (`CoopRun`, the debug scheduler) hands control back
 while such a call waits, the earliest in any domain, so a single-threaded embedder (the browser)
 answers between pumps; a driver nothing pumps (the tree-walker, the native pump, the parallel
 driver, the JIT) waits on the store as on the pool, and its embedder answers from a thread of its
@@ -2051,9 +2051,7 @@ the async-first paragraph above, delivered. Identical on all three engines (inva
 *Measured (F4, `fiber_overlap_bench.rs`, n=8 × block=2 ms, K=4):* fiber lane ~4.8–5.3 ms/batch
 on all three engines (JIT net of its per-run compile floor) vs ~19 ms serialized root — the
 ring's own overlap range, restored on one vCPU. **Inline-by-design postures (enumerated, not
-debt):** the browser-`Vcpu` driver (I45 — fiber delivery through the real cross-thread futex is
-its own slice; the native parallel driver takes the cooperative driver's postures since #1414 3e),
-the debug drivers' fibers (sanctioned whole-vCPU tiering; checkpointing excludes cap-parked fibers
+debt):** the debug drivers' fibers (sanctioned whole-vCPU tiering; checkpointing excludes cap-parked fibers
 and pool-parked threads like futex-parked ones), the §22 invoke leaves
 (seam-free atomic), durable runs everywhere (a punted completion has no freeze
 rule yet, #1902), and zero/multi-result punts (the degenerate wait). Residue: the
@@ -2429,7 +2427,7 @@ accesses confine against the live `mapped` read from the module's exported `mapp
 event carries the window's **scalar committed extent** (`Mem::scalar_extent` — `Some(H)` iff the
 admitted set is exactly `[0, H)`) which the driver writes to that global before each emitted call
 (every pump host, native or in the browser, and the browser Worker's TIERUP handler alike — and the §22
-`Jit.invoke` codegen seam identically: `VcpuEvent::JitInvoke` carries the same snapshot, the Worker
+`Jit.invoke` codegen seam identically: `CoopEvent::JitInvoke` carries the same snapshot, the host
 writes the unit instance's global before `f0`). A window state the scalar cannot represent — a
 sparse grow, a non-RW mapping, pages committed past a fixed backing — **declines** emitted execution
 for that call and interprets it instead (tier-up falls through at the dispatch; an invoke uses the
@@ -2448,13 +2446,12 @@ value a host writes to `"mapped"` (`mapped < offset + width` traps; nothing wrap
 writes more than the window's backing holds — a wrong but backed live size is then a trap-parity
 divergence, never an escape. The escalation past emit-nothing — a per-access **software page-check** in emitted code — has
 **landed** as the paged entry (#750, `compile_module_tierup_paged`), which the browser's cooperative
-tier-up selects whenever the module carries a `readonly` data segment or reaches `unmap`/`protect`
-(`module_uses_unmap_protect`; #1009 — every real card write-protects its rodata, so this is the
-shipped default for them, not an opt-in), and which the **single-shot** run selects for a guest that
-reaches `unmap`/`protect` (#1201: `compile_jit_paged` → the wasm-driven `compile_module_reactor_paged`;
-`JitOnrampRun` rebuilds the table from each bounce's live map and the driver re-points
-`"pagestate"`/`"mapped"` — so a root on-ramp guest and an op-13 separate-module child run emitted
-instead of declining, invariant 14's runtime-backend × nesting cells): every
+tier-up selects whenever the module carries a `readonly` data segment or reaches a page op
+(`map`/`unmap`/`protect`, `module_uses_addr_space_page_ops`; #1009 — every real card write-protects its rodata, so this is the
+shipped default for them, not an opt-in), and which a root run whole as a leaf selects too when its
+image has read-only data or page ops (`image_pages`; #2302, #1414 S4-3: the leaf's page ops bounce, and
+the driver re-points `"pagestate"`/`"mapped"` after each bounce, so a root on-ramp guest and a detached
+child run emitted instead of declining, invariant 14's runtime-backend × nesting cells): every
 confined access in a paged module also consults a host-maintained byte-per-page state table
 (`Unmapped`/`Rw`/`Ro`; base in the exported `"pagestate"` global, refreshed per emitted call from
 `Mem::map_info` — page state is frozen while emitted code runs, since page ops are `call.cap`s
@@ -3307,8 +3304,7 @@ spawns/parks still fails at runtime (the nested run is seam-free — anything bu
 inert `CapFault`). The supported path is **`install` + `call.dyn`**: installed code executes in
 the calling vCPU's own frames, where `thread.spawn` is an ordinary **module-aware** spawn — the func
 index resolves in the spawning frame's module and the spawned vCPU's root frame starts there
-(`VcpuEvent::Spawn` carries the module; every driver constructs the child from
-`source.get(module)`, as for a confined `Instantiate`). `wait`/`notify`/atomics are window-global and
+(every driver constructs the child from `source.get(module)`, as for a confined `Instantiate`). `wait`/`notify`/atomics are window-global and
 module-agnostic. Pinned by `bytecode_parallel_jit.rs::installed_unit_spawns_its_own_module`
 (cooperative ≡ parallel, 8 dispatches each spawning the unit's own worker) and, on the tree-walker
 oracle, by the `jit_cap.rs` native differentials below (its `run_inner` spawn started the child in

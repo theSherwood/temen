@@ -292,8 +292,7 @@ fn on_every_engine(what: &str, fiber: &str, drivers: &[Driver], lanes: i64, want
 /// `(value * 1000 + status) * 1000 + value`, the second join's status beside both values (#2066).
 /// Under a run lane cap of 1 a grandchild cannot start until its parent's join gives the one lane
 /// back, so each join finds its child running, on every engine: the park must block the child's
-/// whole vCPU, its root seeing no `FIBER_PARKED`, and hold no lane while it waits. No `poll`, so the
-/// `Vcpu` driver runs it too.
+/// whole vCPU, its root seeing no `FIBER_PARKED`, and hold no lane while it waits.
 #[test]
 fn a_childs_fiber_joins_running_children_on_every_engine() {
     let fiber = format!(
@@ -350,7 +349,7 @@ block 3 (i3: i32, g3: i32, p3: i32) {{
 }
 
 /// The fiber joins a child whose outcome is already in (`poll` reports it returned):
-/// `(poll * 1000 + status) * 1000 + value`. The `Vcpu` driver's host answers no `poll` (temen#2083).
+/// `(poll * 1000 + status) * 1000 + value`.
 #[test]
 fn a_childs_fiber_joins_a_child_that_returned_on_every_engine() {
     let fiber = poll_then(
@@ -365,7 +364,7 @@ fn a_childs_fiber_joins_a_child_that_returned_on_every_engine() {
     on_every_engine(
         "a fiber joins a child that returned",
         &fiber,
-        &drivers::SCHEDULING,
+        &drivers::ALL,
         -1,
         (1000 * 1000) + 5,
     );
@@ -385,7 +384,7 @@ fn a_childs_fiber_joins_a_child_that_trapped_on_every_engine() {
     on_every_engine(
         "a fiber joins a child that trapped",
         &fiber,
-        &drivers::SCHEDULING,
+        &drivers::ALL,
         -1,
         2 * 1000 + trap_code::UNREACHABLE,
     );

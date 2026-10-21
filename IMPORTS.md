@@ -807,8 +807,8 @@ holder is the domain that implements them:
   runs via the reference interpreter, so a single translation covers all three
   backends. `Instantiator.join` has no such shared seam — its result is delivered
   by each executor's **private child-lifecycle scheduler** (the tree-walker's
-  `run_inner`, the four bytecode schedulers — cooperative `drive`, true-parallel,
-  the `Vcpu` reactor, the debug run — and the JIT's `instantiator_rt`). Translating
+  `run_inner`, the three bytecode schedulers — cooperative `drive`, true-parallel,
+  the debug run — and the JIT's `instantiator_rt`). Translating
   there would need per-scheduler child-`Host` **retention past completion** (the
   child powerbox is torn down when the child finishes — `drop(v)` in the
   tree-walker, the closure return in the parallel path, `release(gc.ctx)` at

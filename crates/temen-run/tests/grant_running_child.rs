@@ -6,9 +6,7 @@
 //! already sanctions the transfer: the granter holds both ends.
 //!
 //! Every case runs on the tree-walk oracle, the cooperative, parallel and debug bytecode drivers
-//! ([`drivers::SCHEDULING`]) and the Cranelift JIT, and each must give the oracle's answer. The
-//! resumable `Vcpu`, whose host runs the children, traps `ThreadFault` when op 19 runs, as it does
-//! for `poll`/`detach`/`kill` (#2083).
+//! ([`drivers::ALL`]) and the Cranelift JIT, and each must give the oracle's answer.
 //!
 //! A granted index depends on what the child minted meanwhile (a grant takes the lowest free slot of
 //! the child's table), so no case pins one: each child learns its index from its parent.
@@ -24,7 +22,7 @@ mod drivers;
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 
-use drivers::{agree_on, run_on, Driver, Ran, SCHEDULING};
+use drivers::{agree_on_every_driver, Ran};
 
 /// Where the first spawn record sits, and the second's: above the durable control words (rec.rs).
 const REC_A: u64 = 17408;
@@ -117,9 +115,9 @@ fn on_the_jit(m: &Module) -> Result<Vec<Value>, Trap> {
     }
 }
 
-/// `m` gives `want` on the oracle, every scheduling bytecode driver and the Cranelift JIT.
+/// `m` gives `want` on the oracle, every bytecode driver and the Cranelift JIT.
 fn agree_everywhere(what: &str, m: &Module, want: &Ran) {
-    agree_on(&SCHEDULING, what, m, &setup(m), want);
+    agree_on_every_driver(what, m, &setup(m), want);
     assert_eq!(on_the_jit(m), want.result, "{what}: the Cranelift JIT");
 }
 
@@ -544,12 +542,6 @@ fn a_grant_to_an_ended_child_fails() {
         "a grant after the child was killed",
         &killed,
         &ok(-22 * 1000 + temen_ir::trap_code::THREAD_FAULT),
-    );
-    // The resumable `Vcpu`'s host runs its children: op 19 fails closed there when it runs (#2083).
-    assert_eq!(
-        run_on(Driver::Vcpu, &returned, &setup(&returned)),
-        Some(trapped(Trap::ThreadFault)),
-        "the Vcpu fails closed"
     );
 }
 

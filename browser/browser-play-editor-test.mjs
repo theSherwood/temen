@@ -616,7 +616,7 @@ try {
     : fail(`jit cards: ${JSON.stringify(jitCards)}`);
 
   // The hello module card runs end-to-end via runModule (JIT toggle default-on): this exercises the
-  // streamed module fetch (download-progress path) and the single-shot module JIT in CI, since
+  // streamed module fetch (download-progress path) and the module run on the wasm-JIT in CI, since
   // hello_c.temen is committed. Runs before the module parity check so the asset streams fresh (uncached).
   await runCard(page, 'hello (C → Temen)');
   const helloMod = await page.evaluate((sel) => ({

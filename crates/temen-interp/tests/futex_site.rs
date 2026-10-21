@@ -6,7 +6,7 @@
 #[path = "support/drivers.rs"]
 mod drivers;
 
-use drivers::{agree_on, Ran, SCHEDULING};
+use drivers::{agree_on_every_driver, Ran};
 use temen_interp::{Host, Value};
 
 /// func 0 (the region handle `v0`): map the region at `65536` (above the NULL guard at any host
@@ -95,7 +95,7 @@ fn a_waiter_whose_page_is_remapped_keeps_the_key_it_parked_on() {
         stdout: Vec::new(),
         stderr: Vec::new(),
     };
-    agree_on(&SCHEDULING, "a remapped waiter", &m, &setup, &want);
+    agree_on_every_driver("a remapped waiter", &m, &setup, &want);
 }
 
 /// func 0 (the region handle `v0`): map the region at `A = 65536` and again at `B`, the next page, and
@@ -186,7 +186,7 @@ fn a_thread_parked_on_an_anonymous_word_and_a_region_byte_is_woken() {
         stdout: Vec::new(),
         stderr: Vec::new(),
     };
-    agree_on(&SCHEDULING, "parked waiters", &m, &region_powerbox, &want);
+    agree_on_every_driver("parked waiters", &m, &region_powerbox, &want);
 }
 
 /// A debug checkpoint taken while the thread is parked, restored into a freshly built run, still

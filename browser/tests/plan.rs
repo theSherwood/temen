@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 use temen_browser::plan::{run, Node, Pipe, Plan};
-use temen_interp::{ForkedProc, Host, HostProc, HostProcFork, Trap, Value};
+use temen_interp::{ForkedProc, Host, HostProc, HostProcFork, Value};
 use temen_ir::Module;
 
 /// A one-node plan is the nim phase driver, byte for byte: grant records for the node's caps, its argv
@@ -172,8 +172,8 @@ fn a_plan_the_root_cannot_honour_is_refused() {
 }
 
 /// A node the spawn refuses (here: an entry of no admitted shape — three params — so op 17 answers
-/// `-EINVAL`) ends the run with a trap when the root joins the refused handle. It used to panic the
-/// driver (`drive_op13` indexed its child list with the negative handle).
+/// `-EINVAL`) ends the run with a trap when the root joins the refused handle, never a host panic
+/// (a driver once indexed its child list with the negative handle).
 #[test]
 fn a_refused_node_ends_the_run_with_a_trap_not_a_host_panic() {
     let m = temen_text::parse_module(
@@ -302,23 +302,12 @@ fn a_pipe_edge_carries_one_nodes_stdout_to_anothers_stdin() {
     let mut host = Host::new();
     let sink = host.shared_stdout();
     let stdout = host.grant_stream(temen_interp::StreamRole::Out);
-    let args = plan.root_args(&mut host, &[&cat, &echo], &[stdout]);
-    let mut fuel = u64::MAX;
-    let out =
-        temen_interp::bytecode::compile_and_run_with_host(&root, 0, &args, &mut fuel, &mut host)
-            .expect("the bytecode engine runs the root");
-
     assert_eq!(
-        temen_browser::plan::outcome(out),
+        run(&plan, &[&cat, &echo], host, &[stdout]),
         Ok(vec![Value::I64(12)]),
         "echo wrote its whole line"
     );
     assert_eq!(&sink.lock().unwrap()[..], b"hello, pipe\n", "cat echoed it");
-    // The same plan cannot run on the spawn-to-completion driver: it is refused, not half-run.
-    assert_eq!(
-        run(&plan, &[&cat, &echo], Host::new(), &[stdout]),
-        Err(Trap::Malformed)
-    );
 }
 
 #[test]

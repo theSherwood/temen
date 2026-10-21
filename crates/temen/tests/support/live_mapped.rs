@@ -142,7 +142,7 @@ fn build(src: &str) -> temen_ir::Module {
 }
 
 /// The emit input: the guest with `size_log2` bumped to the reservation, so the emitted mask covers
-/// the guest's upper address range (the browser drivers' convention — `JitOnrampRun::open_owned_run`).
+/// the guest's upper address range (the browser drivers' convention).
 /// The emitted `"mapped"` global then *defaults* to the full reservation, which is exactly why the
 /// per-call sync is mandatory over a reserved window.
 fn bumped_for_emit(m: &temen_ir::Module) -> temen_ir::Module {

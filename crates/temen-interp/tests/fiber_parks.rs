@@ -162,8 +162,7 @@ const PARK_THEN_MIGRATE: &str = include_str!("fixtures/fiber_park_then_migrate.t
 
 /// #2215 — the fiber park routing above on every driver that has it: a wait inside a fiber parks
 /// the fiber and its thread runs on, and a notify from that thread or another, the park-time
-/// recheck, the idle timer and a poll past the deadline each wake it. `Vcpu` still parks the whole
-/// thread there. The guests are fixtures, so the browser runs them on its parallel driver too.
+/// recheck, the idle timer and a poll past the deadline each wake it. The guests are fixtures, so the browser runs them on its parallel driver too.
 #[test]
 fn a_fiber_futex_park_parks_the_fiber_on_every_driver() {
     const DRIVERS: [Driver; 4] = [

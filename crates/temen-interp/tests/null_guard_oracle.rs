@@ -5,9 +5,7 @@
 //! page ops (`unmap` below the guard returns a negative errno — the `mmap_min_addr` analogue that
 //! keeps the JIT tiers' baked guard constant sound), and legal page ops above the guard still work.
 
-use std::sync::Arc;
-
-use temen_interp::{bytecode, Host, Region, Trap, Value};
+use temen_interp::{bytecode, Host, Trap, Value};
 
 const GUARD: i64 = temen_ir::POWERBOX_NULL_GUARD as i64;
 
@@ -87,42 +85,24 @@ fn null_access_traps_on_both_engines() {
 }
 
 /// The reserved region is refused to the page ops: `unmap` below the guard returns a negative
-/// errno; an `unmap` at/above the guard stays legal. Runs on the bytecode powerbox harness (the cap
-/// needs a granted handle).
+/// errno; an `unmap` at/above the guard stays legal. Runs on the pump with a powerbox (the cap needs
+/// a granted handle).
 #[test]
 fn page_ops_below_the_guard_are_refused() {
-    let win = 1usize << 17;
     let unmap = |m: &temen_ir::Module, off: i64, len: i64| -> i64 {
-        let prog = bytecode::VcpuProgram::compile(m).expect("compile");
-        let layout = std::alloc::Layout::from_size_align(win, 8).unwrap();
-        // SAFETY: a fresh zeroed window buffer, exclusively this run's, freed after the vCPU drops.
-        let base = unsafe { std::alloc::alloc_zeroed(layout) };
-        assert!(!base.is_null());
-        // SAFETY: `base` is `win` valid bytes owned here; the Region aliases it only for this run.
-        let back = Arc::new(unsafe { Region::shared(base, win as u64) });
         let mut host = Host::new();
         let asl = host.grant_memory(); // the AddressSpace handle the guest's call.cap names
-        let mut vcpu = bytecode::Vcpu::new_root_with_powerbox(
-            &prog,
-            2,
-            &[Value::I32(asl), Value::I64(off), Value::I64(len)],
-            back,
-            &[],
-            host,
-        )
-        .expect("vcpu");
-        let r = match vcpu.run() {
-            bytecode::VcpuEvent::Done(vals) => match vals.first() {
+        let mut fuel = 1_000_000u64;
+        let args = [Value::I32(asl), Value::I64(off), Value::I64(len)];
+        match bytecode::compile_and_run_with_host(m, 2, &args, &mut fuel, &mut host)
+            .expect("in bytecode subset")
+        {
+            Ok(vals) => match vals.first() {
                 Some(Value::I64(x)) => *x,
                 other => panic!("result {other:?}"),
             },
-            bytecode::VcpuEvent::Trapped(t) => panic!("unmap probe trapped: {t:?}"),
-            _ => panic!("unmap probe did not finish"),
-        };
-        drop(vcpu);
-        // SAFETY: the vCPU (and its Mem aliasing the region) is dropped; free the buffer.
-        unsafe { std::alloc::dealloc(base, layout) };
-        r
+            Err(t) => panic!("unmap probe trapped: {t:?}"),
+        }
     };
 
     let m = module();
