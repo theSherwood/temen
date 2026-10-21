@@ -32,6 +32,10 @@
 //! `wait` answered by the embedder, through each call's [`Completer`], from a thread of its own.
 //! A host-answered call parks and wakes exactly as a pool call does, on every engine and in every
 //! domain.
+//!
+//! **A host procedure may answer a call itself** (#2522): one thread's procedure answers another
+//! thread's host-answered call while it holds the domain's host, and its caller wakes on every
+//! engine.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -483,15 +487,14 @@ fn setup<'a>(
     }
 }
 
-/// What the root returned on `driver`, or why there is nothing to compare.
+/// What the root returned on `driver`, given the powerbox and arguments `setup` makes, or why there
+/// is nothing to compare.
 fn on_driver(
     driver: Driver,
     m: &Module,
-    lanes: i64,
-    kids: &[u32],
-    answer: Answer,
+    setup: &dyn Fn() -> (Host, Vec<Value>),
 ) -> Result<i64, String> {
-    let ran = run_on(driver, m, &setup(m, lanes, kids, answer)).ok_or("declined the module")?;
+    let ran = run_on(driver, m, setup).ok_or("declined the module")?;
     match ran.result {
         Ok(v) if v.len() == 1 => match v[0] {
             Value::I64(r) => Ok(r),
@@ -501,9 +504,9 @@ fn on_driver(
     }
 }
 
-/// What the root returned on the Cranelift JIT.
-fn on_the_jit(m: &Module, lanes: i64, kids: &[u32], answer: Answer) -> Result<i64, String> {
-    let (mut host, args) = setup(m, lanes, kids, answer)();
+/// What the root returned on the Cranelift JIT, given the powerbox and arguments `setup` makes.
+fn on_the_jit(m: &Module, setup: &dyn Fn() -> (Host, Vec<Value>)) -> Result<i64, String> {
+    let (mut host, args) = setup();
     let args: Vec<i64> = args
         .iter()
         .map(|v| match v {
@@ -531,10 +534,10 @@ fn check_on_every_engine(what: &str, m: &Module, kids: &[u32], want: i64, paced:
     };
     for answer in [Answer::Pool, Answer::Host] {
         for driver in drivers::ALL {
-            let got = on_driver(driver, m, lanes, kids, answer);
+            let got = on_driver(driver, m, &setup(m, lanes, kids, answer));
             each(format!("{driver:?}, {answer:?}-answered"), got);
         }
-        let got = on_the_jit(m, lanes, kids, answer);
+        let got = on_the_jit(m, &setup(m, lanes, kids, answer));
         each(format!("JIT, {answer:?}-answered"), got);
     }
     assert!(
@@ -567,10 +570,12 @@ fn check_prompt(what: &str, m: &Module, kids: &[u32], want: Result<i64, &str>, d
     for answer in [Answer::Pool, Answer::Host] {
         for &driver in drivers {
             let engine = format!("{driver:?}, {answer:?}-answered");
-            each(engine, &|| on_driver(driver, m, -1, kids, answer));
+            each(engine, &|| {
+                on_driver(driver, m, &setup(m, -1, kids, answer))
+            });
         }
         each(format!("JIT, {answer:?}-answered"), &|| {
-            on_the_jit(m, -1, kids, answer)
+            on_the_jit(m, &setup(m, -1, kids, answer))
         });
     }
     assert!(
@@ -932,4 +937,140 @@ block 0 (vh: i32) {
     let_go.1.notify_all();
     assert_eq!(outcome, JitOutcome::Trapped(TrapKind::OutOfFuel));
     assert!(took < GIVE_UP / 2, "the wait outlived the kill: {took:?}");
+}
+
+/// How long a call stays filed before `answer` answers it: time for its caller to park on it.
+const PARKING: Duration = Duration::from_millis(20);
+
+/// How long `answer` then holds its domain's host before it answers: time for the root, which saw
+/// the flag `answer` raised, to park and come to wait for that host.
+const SETTLE: Duration = Duration::from_millis(100);
+
+/// The powerbox [`a_host_procedure_answers_another_threads_call`] runs over: `call`, whose submit
+/// hook files the call's completer, and `answer`, a synchronous procedure that answers a call filed
+/// [`PARKING`] ago with its argument + 100 and returns `1`, or returns `0` while there is none.
+/// Before it answers it raises the flag at 16388 and holds the domain's host for [`SETTLE`].
+fn answering_inside() -> (Host, Vec<Value>) {
+    type Filed = Arc<Mutex<Option<(Completer, i64, Instant)>>>;
+    let filed: Filed = Arc::default();
+    let mut h = Host::new();
+    let to_file = Arc::clone(&filed);
+    let call = h.grant_host_proc_offloadable(
+        Box::new(move |_op, args| {
+            let (filed, a) = (Arc::clone(&to_file), args[0]);
+            OffloadOutcome::Host(Box::new(move |c: Completer| {
+                *filed.lock().unwrap() = Some((c, a, Instant::now()));
+            }))
+        }),
+        None,
+        CapState::Stateless,
+    );
+    let answer = h.grant_host_proc(
+        Box::new(move |_op, _args, mem, _minter| {
+            let parked = filed
+                .lock()
+                .unwrap()
+                .take_if(|(_, _, at)| at.elapsed() >= PARKING);
+            let Some((c, a, _)) = parked else {
+                return Ok(vec![0]);
+            };
+            mem.expect("a window")
+                .write_bytes(16388, &1u32.to_le_bytes())
+                .expect("in the window");
+            std::thread::sleep(SETTLE);
+            c.complete(a + 100);
+            Ok(vec![1])
+        }),
+        CapState::Stateless,
+    );
+    (h, vec![Value::I32(call), Value::I32(answer)])
+}
+
+/// What `run` returns, run on a thread of its own for at most [`GIVE_UP`]: a deadlocked engine fails
+/// its case instead of hanging the test.
+fn bounded(run: impl FnOnce() -> Result<i64, String> + Send + 'static) -> Result<i64, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(run());
+    });
+    rx.recv_timeout(GIVE_UP)
+        .unwrap_or_else(|_| Err(format!("still running after {GIVE_UP:?}")))
+}
+
+/// #2522 — a host procedure answers another thread's host-answered call. Thread 1 makes the call
+/// (arg 7). Thread 2 calls `answer` until it has answered that call, and returns its `1`. The root
+/// waits for the flag `answer` raises while it holds the domain's host, then joins thread 1, then
+/// thread 2: `107 * 1000 + 1`. The tree-walker woke the caller under the host lock the procedure ran
+/// under, and its wake takes the scheduler lock, which the root's join park held while it waited
+/// for that host: the run deadlocked.
+#[test]
+fn a_host_procedure_answers_another_threads_call() {
+    let m = module_of(
+        "memory 17
+func (i32, i32) -> (i64) {
+block 0 (vcall: i32, vanswer: i32) {
+  vz = i64.const 0
+  vcall64 = i64.extend_i32_u vcall
+  vcaller = thread.spawn 1 vz vcall64
+  vanswer64 = i64.extend_i32_u vanswer
+  vanswerer = thread.spawn 2 vz vanswer64
+  br 1(vcaller, vanswerer)
+}
+block 1 (vcaller: i32, vanswerer: i32) {
+  vheld = i64.const 16388
+  vup = i32.atomic.load vheld
+  vzero = i32.const 0
+  vgo = i32.ne vup vzero
+  br_if vgo 2(vcaller, vanswerer) 1(vcaller, vanswerer)
+}
+block 2 (vcaller: i32, vanswerer: i32) {
+  vr0 = thread.join vcaller
+  vr1 = thread.join vanswerer
+  vk = i64.const 1000
+  vm = i64.mul vr0 vk
+  vsum = i64.add vm vr1
+  return vsum
+}
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vh = i32.wrap_i64 varg
+  vseven = i64.const 7
+  vr = call.cap 13 0 (i64) -> (i64) vh (vseven)
+  return vr
+}
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vh = i32.wrap_i64 varg
+  br 1(vh)
+}
+block 1 (vh: i32) {
+  vz = i64.const 0
+  vr = call.cap 13 0 (i64) -> (i64) vh (vz)
+  vnone = i64.eq vr vz
+  br_if vnone 1(vh) 2(vr)
+}
+block 2 (vr: i64) {
+  return vr
+}
+}",
+    );
+    let mut wrong = Vec::new();
+    for driver in drivers::ALL {
+        let m = m.clone();
+        let got = bounded(move || on_driver(driver, &m, &answering_inside));
+        if got != Ok(107_001) {
+            wrong.push(format!("  {driver:?}: {got:?}"));
+        }
+    }
+    let got = bounded(move || on_the_jit(&m, &answering_inside));
+    if got != Ok(107_001) {
+        wrong.push(format!("  JIT: {got:?}"));
+    }
+    assert!(
+        wrong.is_empty(),
+        "want 107001 on every engine, but\n{}",
+        wrong.join("\n")
+    );
 }

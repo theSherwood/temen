@@ -1182,6 +1182,9 @@ impl GuestMem for RecordingMem<'_> {
     fn region_page_size(&self) -> i64 {
         self.inner.region_page_size()
     }
+    fn shadow(&self) -> ShadowArena {
+        self.inner.shadow()
+    }
 }
 
 impl Inspector {
@@ -5580,6 +5583,123 @@ struct Scheduler {
     handoff: bool,
 }
 
+/// #2522 — a domain's host, locked for a capability call of a vCPU in `run`. A host procedure the
+/// call runs may answer another call ([`Completer::complete`]), whose wake drains the run's
+/// scheduler ([`Scheduler::wake_on`]). The drain takes the scheduler lock, which a park holds while
+/// it takes a host of the run ([`park_gate`]), so a drain under this lock could deadlock against a
+/// park: one asked for while a thread holds a host of the run for a call runs once it holds none
+/// ([`Scheduler::drain_when_free`]). Another run's drain need not wait: its parks take only its
+/// own hosts.
+struct HostCall<'a> {
+    host: Option<std::sync::MutexGuard<'a, Host>>,
+    run: Option<&'a Arc<Scheduler>>,
+}
+
+/// #2522 — a thread's [`HostCall`]s: the run of each host it holds for a call, and the runs whose
+/// drains wait until it holds none of theirs.
+struct HostCalls {
+    held: Vec<*const Scheduler>,
+    owed: Vec<Arc<Scheduler>>,
+}
+
+thread_local! {
+    static HOST_CALLS: std::cell::RefCell<HostCalls> = const {
+        std::cell::RefCell::new(HostCalls {
+            held: Vec::new(),
+            owed: Vec::new(),
+        })
+    };
+}
+
+impl<'a> HostCall<'a> {
+    /// A call in the deterministic explorer's run holds no drain back: its waits hang none on a store.
+    fn lock(host: &'a Mutex<Host>, sched: &'a SchedRef) -> Self {
+        let host = host.lock_unpoisoned();
+        let run = match sched {
+            SchedRef::Real(s) => Some(s),
+            SchedRef::Det(_) => None,
+        };
+        if let Some(s) = run {
+            HOST_CALLS.with_borrow_mut(|c| c.held.push(Arc::as_ptr(s)));
+        }
+        HostCall {
+            host: Some(host),
+            run,
+        }
+    }
+}
+
+impl std::ops::Deref for HostCall<'_> {
+    type Target = Host;
+    fn deref(&self) -> &Host {
+        self.host.as_ref().expect("held until dropped")
+    }
+}
+
+impl std::ops::DerefMut for HostCall<'_> {
+    fn deref_mut(&mut self) -> &mut Host {
+        self.host.as_mut().expect("held until dropped")
+    }
+}
+
+impl Drop for HostCall<'_> {
+    fn drop(&mut self) {
+        self.host = None;
+        let Some(run) = self.run else {
+            return;
+        };
+        let held = Arc::as_ptr(run);
+        let owed = HOST_CALLS.with_borrow_mut(|c| {
+            let at = c.held.iter().position(|&s| s == held);
+            c.held.swap_remove(at.expect("pushed by its lock"));
+            if c.held.contains(&held) {
+                return None;
+            }
+            let at = c.owed.iter().position(|s| Arc::ptr_eq(s, run))?;
+            Some(c.owed.swap_remove(at))
+        });
+        if let Some(run) = owed {
+            run.completion_drain();
+        }
+    }
+}
+
+#[cfg(test)]
+mod host_call_tests {
+    use super::*;
+
+    /// #2522 — a run's drain asked for while this thread holds hosts of the run for calls waits
+    /// until it holds none, and runs once however many answers asked for it. Another run's drain
+    /// does not wait: a nested run's own answers wake its callers while its caller's call goes on.
+    #[test]
+    fn a_drain_waits_until_its_thread_holds_no_host_of_its_run() {
+        let (a, b) = (
+            Arc::new(Scheduler::new(4, 1)),
+            Arc::new(Scheduler::new(4, 1)),
+        );
+        let (run, other) = (
+            SchedRef::Real(Arc::clone(&a)),
+            SchedRef::Real(Arc::clone(&b)),
+        );
+        let hosts: Vec<Mutex<Host>> = (0..3).map(|_| Mutex::new(Host::new())).collect();
+        let owed = || HOST_CALLS.with_borrow(|c| c.owed.len());
+        let outer = HostCall::lock(&hosts[0], &run);
+        let inner = HostCall::lock(&hosts[1], &run);
+        let nested = HostCall::lock(&hosts[2], &other);
+        Arc::clone(&a).drain_when_free();
+        Arc::clone(&a).drain_when_free();
+        assert_eq!(owed(), 1, "owed once");
+        Arc::clone(&b).drain_when_free();
+        assert_eq!(owed(), 2, "the nested run's drain waits for its own host");
+        drop(nested);
+        assert_eq!(owed(), 1, "the nested run's drain ran");
+        drop(inner);
+        assert_eq!(owed(), 1, "the thread still holds a host of the run");
+        drop(outer);
+        assert_eq!(owed(), 0, "drained once it held none");
+    }
+}
+
 /// §3.6 slice 5a — one parked entity in a scheduler waiter map: a whole **vCPU** (the fiberless
 /// / root-level park, as always) or a single **fiber** (a fiber-level park — the vCPU moved on;
 /// only the fiber's continuation waits, in the registry's `ParkedOn` slot). A fiber wake flips
@@ -6350,7 +6470,7 @@ struct Sched {
     /// `svc.wait`, it promotes each parked vCPU's window to `UNWINDING` and re-admits it: the
     /// re-executed `svc.wait` observes the freeze and takes the 4b sentinel, so the domain unwinds
     /// and quiesces instead of the run hanging. One-shot (cleared on fire). Set at run setup from
-    /// the window's arm-quiesce flag ([`ARM_QUIESCE_OFF`]). Holds the run root's powerbox while armed:
+    /// the window's arm-quiesce flag ([`ShadowArena::quiesce_flag`]). Holds the run root's powerbox while armed:
     /// the census runs before the freeze fires, and a decline is recorded there (#1918).
     freeze_on_quiesce: Option<Arc<Mutex<Host>>>,
     /// #1584 — some vCPU of this run has finished by **unwinding for a freeze**. From then on the
@@ -6917,9 +7037,24 @@ impl Scheduler {
         let sched = Arc::downgrade(self);
         comps.set_notify(Some(Arc::new(move || {
             if let Some(s) = sched.upgrade() {
-                s.completion_drain();
+                s.drain_when_free();
             }
         })));
+    }
+
+    /// #2522 — [`completion_drain`](Scheduler::completion_drain) now, or, on a thread that holds a
+    /// host of this run for a call ([`HostCall`]), once it holds none.
+    fn drain_when_free(self: Arc<Self>) {
+        let now = HOST_CALLS.with_borrow_mut(|c| {
+            let holds = c.held.contains(&Arc::as_ptr(&self));
+            if holds && !c.owed.iter().any(|s| Arc::ptr_eq(s, &self)) {
+                c.owed.push(Arc::clone(&self));
+            }
+            !holds
+        });
+        if now {
+            self.completion_drain();
+        }
     }
 
     /// #1677 — where fiber `slot` of `reg` is parked ([`Sched::fiber_park`]). Probe only.
@@ -8754,8 +8889,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             }
         }
         // Durable multi-vCPU (DURABILITY.md §12.8 slice 3.2.1): swap THIS vCPU's per-context durable words
-        // into the **shared** window before it runs — the state word ([`STATE_OFF`]) and the active
-        // shadow-SP ([`SHADOW_SP_OFF`]). The freeze/thaw runs single-worker, so the one shared pair is each
+        // into the **shared** window before it runs — the arena's freeze word and the active
+        // shadow-SP word. The freeze/thaw runs single-worker, so the one shared pair is each
         // vCPU's own context, swapped per dispatch: the shadow-SP points unwind/rewind at this vCPU's region
         // (`context = task id`), and the state word is this vCPU's own freeze phase — vital because a
         // rewinding vCPU flips the word to `NORMAL` after reloading, which must not disturb a sibling still
@@ -10559,61 +10694,43 @@ impl SchedDriver {
 // declaration (`Memory::shadow`, carried by this window's `Mem`). The root computation is context 0; a `cont.new`-created
 // fiber in registry slot `s` is context `s + 1`.
 
-/// Freeze **armed**: the deterministic mid-run freeze trigger. The runtime counts down
-/// [`ARM_COUNTDOWN_OFF`] at each safepoint and promotes the word to `UNWINDING` at 0; transparent to
-/// the instrumented IR (which tests only `UNWINDING`/`REWINDING`). Must equal `temen_durable::STATE_ARMED`.
+/// Freeze **armed**: the deterministic mid-run freeze trigger. The runtime counts down one of the
+/// arena's two arm countdowns ([`ShadowArena::fiber_countdown`], [`ShadowArena::backedge_countdown`])
+/// and promotes the freeze word to `UNWINDING` at 0; transparent to the instrumented IR (which tests
+/// only `UNWINDING`/`REWINDING`). Must equal `temen_durable::STATE_ARMED`.
 pub use temen_ir::durable_abi::STATE_ARMED;
-/// State-word values (must equal `temen_durable::STATE_*`). Only `UNWINDING` is read by the runtime
-/// today (the freeze-driver trigger); the others are maintained entirely by the instrumented IR.
+/// State-word values (must equal `temen_durable::STATE_*`): the arena's freeze word
+/// ([`ShadowArena::freeze_word`]) holds `NORMAL`/`UNWINDING`/`ARMED`, each context's thaw word
+/// `NORMAL`/`REWINDING`.
 pub use temen_ir::durable_abi::STATE_NORMAL;
-/// Window byte offset of the `i32` durable **state word** (`NORMAL | UNWINDING | REWINDING`).
-/// The freeze driver reads it to tell a freeze (UNWINDING) run from an ordinary one. Must equal
-/// `temen_durable::STATE_OFF`.
-pub use temen_ir::durable_abi::STATE_OFF;
 pub use temen_ir::durable_abi::STATE_REWINDING;
 pub use temen_ir::durable_abi::STATE_UNWINDING;
 
-/// §12.8 4A.7 (parked-vCPU / `Blocking.work` latency). Reads the global durable **freeze** word at
-/// [`STATE_OFF`] from the live window image: `true` iff an async stop-the-world freeze has already
-/// landed ([`STATE_UNWINDING`]). A durable vCPU about to enter a host `Blocking` call consults this and
-/// fails **closed** rather than starting an un-checkpointable, latency-unbounded offload (R6); cancelling
-/// an *already in-flight* call is deferred (R2). `false` for a non-durable / malformed window (no word),
-/// so the caller also gates on [`Host::is_durable`].
+/// §12.8 4A.7 (parked-vCPU / `Blocking.work` latency). Reads the window's freeze word
+/// ([`ShadowArena::freeze_word`]) from the live window image: `true` iff an async stop-the-world
+/// freeze has already landed ([`STATE_UNWINDING`]). A durable vCPU about to enter a host `Blocking`
+/// call consults this and fails **closed** rather than starting an un-checkpointable,
+/// latency-unbounded offload (R6); cancelling an *already in-flight* call is deferred (R2). `false`
+/// for a window whose module declared no arena, which has no freeze word (#2518), and for a
+/// malformed one, so the caller also gates on [`Host::is_durable`].
 fn freeze_has_landed(mem: Option<&dyn GuestMem>) -> bool {
-    mem.and_then(|m| m.read_bytes(STATE_OFF, 4))
+    mem.and_then(|m| m.read_bytes(m.shadow().freeze_word()?, 4))
         .and_then(|b| <[u8; 4]>::try_from(b.as_slice()).ok())
         .map(|b| i32::from_le_bytes(b) == STATE_UNWINDING)
         .unwrap_or(false)
 }
-/// Window byte offset of the `i64` **back-edge arm countdown** (loop back-edges left before an
-/// `ARMED` run promotes to `UNWINDING`, so a loop-header poll begins the freeze). Decremented at each
-/// branch terminator; inert unless `ARMED` and the slot is positive. Must equal
-/// `temen_durable::ARM_BACKEDGE_OFF`.
-pub use temen_ir::durable_abi::ARM_BACKEDGE_OFF;
-/// Window byte offset of the `i64` **arm countdown** (safepoints left before an `ARMED` run promotes
-/// to `UNWINDING`). Decremented by the runtime at each safepoint; inert unless `ARMED`. Must equal
-/// `temen_durable::ARM_COUNTDOWN_OFF`.
-pub use temen_ir::durable_abi::ARM_COUNTDOWN_OFF;
-/// Window byte offset of the `i8` **freeze-on-quiesce** flag (DURABILITY.md §13.4 slice 4c-bis):
-/// non-zero arms the runtime to freeze the instant the run would otherwise block on
-/// `svc.wait`-parked consumers only. Read once at run setup into [`Sched::freeze_on_quiesce`].
-/// Must equal `temen_durable::ARM_QUIESCE_OFF`.
-pub use temen_ir::durable_abi::ARM_QUIESCE_OFF;
+/// The shadow arena: where every durable-runtime word sits — the per-context regions, and the
+/// arena's control words in context 0's region header (one definition of placement).
+pub use temen_ir::durable_abi::ShadowArena;
 /// The region stride an arena declares unless it names its own: context `i` occupies
 /// `[ShadowArena::region_base(i), +stride)`, 4 KiB by default. The transform's shadow-overflow
 /// guard bounds each push by the arena's stride (#1683), so a context recursed deeper than one
 /// region traps the freeze instead of writing its neighbour's frames; a module whose chains run
 /// deeper declares a wider stride (#1872).
 pub use temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE;
-/// The legacy global shadow-SP word's slot in the fixed control block — **unused since §12.8
-/// 4A.5** (each context's SP word is the first 8 bytes of its own region); kept as a reserved ABI
-/// offset. Must equal `temen_durable::SHADOW_SP_OFF`.
-pub use temen_ir::durable_abi::SHADOW_SP_OFF;
-/// The shadow arena: where the per-context shadow regions sit (one definition of placement).
-pub use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END};
 
-/// §12.8 concurrent-thaw stage 1: bytes reserved at a region's base before its frames — the SP word
-/// plus the 4-byte thaw word, padded to 8 to keep frames 8-aligned. Must equal
+/// §12.8 concurrent-thaw stage 1: bytes reserved at a region's base before its frames — the SP word,
+/// the thaw and re-issue words, and in context 0's the arena's control words (#2518). Must equal
 /// `temen_durable::REGION_HEADER_LEN`.
 pub use temen_ir::durable_abi::REGION_HEADER_LEN;
 use temen_ir::durable_abi::REISSUE_IN_REGION_OFF;
@@ -10623,8 +10740,8 @@ use temen_ir::durable_abi::REISSUE_IN_REGION_OFF;
 pub use temen_ir::durable_abi::SHADOW_SP_WORD_LEN;
 /// §12.8 concurrent-thaw stage 1: byte offset of a context's **thaw** state word (`REWINDING`/`NORMAL`)
 /// within its region — just past the [`SHADOW_SP_WORD_LEN`]-byte SP word, addressed via
-/// `durable.shadow_base` (like the SP word). The **freeze** word (`UNWINDING`) stays at the global
-/// [`STATE_OFF`]. Must equal `temen_durable::STATE_IN_REGION_OFF`.
+/// `durable.shadow_base` (like the SP word). The **freeze** word (`UNWINDING`) is the arena's one
+/// ([`ShadowArena::freeze_word`]). Must equal `temen_durable::STATE_IN_REGION_OFF`.
 pub use temen_ir::durable_abi::STATE_IN_REGION_OFF;
 
 /// Bits a fiber **guest handle** reserves for the registry slot; the rest carry a **generation**
@@ -11709,7 +11826,7 @@ struct VCpu {
     /// active fibers without walking the shared registry on every call.
     parked_frames: usize,
     /// This run executes a **durable** (freeze/thaw-instrumented) module, so the runtime keeps the
-    /// active shadow-SP word ([`SHADOW_SP_OFF`]) pointing at the running context's per-fiber shadow
+    /// active shadow-SP word (its context's, at its region base) pointing at the running context's per-fiber shadow
     /// region, swapping it on every fiber switch (D-fiber-cont option A, DURABILITY.md §12.8). A
     /// non-durable run leaves this `false` and never touches the reserve. Set from
     /// [`Host::is_durable`] by `drive`, inherited by `thread.spawn` children.
@@ -11739,7 +11856,7 @@ struct VCpu {
     /// recycling). 0 for the root and every non-durable vCPU (nothing to free).
     vcpu_ctx: usize,
     /// This vCPU's **saved durable state word** (`NORMAL | UNWINDING | REWINDING`), swapped into the
-    /// shared window word ([`STATE_OFF`]) by the runtime when this vCPU runs and saved back when it
+    /// arena's freeze word ([`ShadowArena::freeze_word`]) by the runtime when this vCPU runs and saved back when it
     /// parks (slice 3.2.1). Multi-vCPU freeze/thaw run single-worker, so the one shared state word is
     /// each vCPU's *own* context, swapped per dispatch — essential because a rewinding vCPU flips the
     /// word to `NORMAL` after reloading, which must not disturb siblings still rewinding. A non-durable
@@ -11986,13 +12103,16 @@ struct ServeRun {
     replied: bool,
 }
 
+/// The module-declared shadow arena of the window `mem` ([`ShadowArena::EMPTY`] before a window
+/// exists or when the module declared none) — every placement question a vCPU asks goes through here.
+fn arena_of(mem: Option<&Mem>) -> ShadowArena {
+    mem.map_or(ShadowArena::EMPTY, Mem::shadow_arena)
+}
+
 impl VCpu {
-    /// This domain's module-declared shadow arena ([`ShadowArena::EMPTY`] before a window exists or
-    /// when the module declared none) — every placement question a vCPU asks goes through here.
+    /// This domain's arena ([`arena_of`] its window).
     fn arena(&self) -> ShadowArena {
-        self.mem
-            .as_ref()
-            .map_or(ShadowArena::EMPTY, |m| m.shadow_arena())
+        arena_of(self.mem.as_ref())
     }
     /// A fresh vCPU whose root frame is `funcs[entry](args)`. A bad `entry` is caught by the driver's
     /// first block lookup ([`Trap::Malformed`]), so construction is infallible.
@@ -12010,6 +12130,9 @@ impl VCpu {
         sched: SchedRef,
         dt: Arc<DomainTable>,
     ) -> VCpu {
+        // A fresh root starts at its window's empty root extent; a run that resumes a frozen root
+        // re-seeds it from the artifact.
+        let root_shadow_sp = arena_of(mem.as_ref()).frame_base(0);
         VCpu {
             funcs,
             types,
@@ -12028,7 +12151,7 @@ impl VCpu {
             below: Vec::new(),
             parked_frames: 0,
             durable: false,
-            root_shadow_sp: ShadowArena::EMPTY.frame_base(0), // re-seeded from the window at run setup
+            root_shadow_sp,
             durable_sp_ctx: 0,
             frozen: Vec::new(),
             spawn_residue: None,
@@ -12187,6 +12310,9 @@ impl VCpu {
         depth: u32,
         sched: SchedRef,
     ) -> VCpu {
+        // A fresh root starts at its window's empty root extent; a run that resumes a frozen root
+        // re-seeds it from the artifact.
+        let root_shadow_sp = arena_of(mem.as_ref()).frame_base(0);
         VCpu {
             funcs: parent,
             types: parent_types,
@@ -12205,7 +12331,7 @@ impl VCpu {
             below: Vec::new(),
             parked_frames: 0,
             durable: false,
-            root_shadow_sp: ShadowArena::EMPTY.frame_base(0), // re-seeded from the window at run setup
+            root_shadow_sp,
             durable_sp_ctx: 0,
             frozen: Vec::new(),
             spawn_residue: None,
@@ -15423,7 +15549,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     // Lock the shared powerbox for the duration of this one call.cap (brief; no nested
                     // host locking). Threads of a domain serialize their capability calls here.
-                    let mut hg = host.lock_unpoisoned();
+                    let mut hg = HostCall::lock(host, sched);
                     let mut pending_id = None;
                     // #2495 — under a recording host this engine offers no parking face: it tapes
                     // no delivered value, so a host-answered call declines before its embedder
@@ -15762,7 +15888,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         return Err(Trap::CapFault);
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let mut hg = host.lock_unpoisoned();
+                    let mut hg = HostCall::lock(host, sched);
                     // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
                     let packed = *import | (*op << 16);
                     let results =
@@ -15928,7 +16054,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         return Err(Trap::CapFault);
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let mut hg = host.lock_unpoisoned();
+                    let mut hg = HostCall::lock(host, sched);
                     let results =
                         hg.cap_dispatch_slots(temen_ir::CAP_IMPORT_TYPE_ID, *import, 0, &argv, gm)?;
                     // FORK.md §8.6 — pipe blocking rides this dispatch (a command's `write`/`read`
@@ -16017,7 +16143,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         return Err(Trap::CapFault);
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let mut hg = host.lock_unpoisoned();
+                    let mut hg = HostCall::lock(host, sched);
                     let packed = *ty | (*op << 16);
                     let results =
                         hg.cap_dispatch_slots(temen_ir::CAP_DYN_TYPE_ID, packed, h, &argv, gm)?;
@@ -16969,7 +17095,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             return Err(Trap::ThreadFault);
         }
         // Back-edge freeze trigger (DURABILITY.md Phase-4 Slice A): on a durable run armed for
-        // back-edges (`ARM_BACKEDGE_OFF`), count down at each branch terminator and promote to
+        // back-edges (the arena's back-edge countdown), count down at each branch terminator and promote to
         // `UNWINDING` at 0 so the next loop-header poll begins the freeze — reaching a poll-free
         // compute loop that the fiber-safepoint countdown cannot. Inert unless armed; gated on
         // `durable` so an ordinary run is untouched (byte-identical).
@@ -19352,6 +19478,13 @@ pub trait GuestMem {
     fn region_page_size(&self) -> i64 {
         host_region_granularity() as i64
     }
+
+    /// #2518 — the shadow arena the module in this window declared (INVARIANTS.md #16), which holds
+    /// every word the durable runtime keeps there, the freeze word a host op checks included.
+    /// [`ShadowArena::EMPTY`], holding none, for a window without one (the default).
+    fn shadow(&self) -> ShadowArena {
+        ShadowArena::EMPTY
+    }
 }
 
 /// §4/§7 a JIT cap-path window **page map**: host page index → its state (absent ⇒ region default).
@@ -21525,11 +21658,6 @@ struct CompletionState {
     in_flight: usize,
     /// How many ids this store has minted ([`Completions::minted`]).
     minted: u64,
-    /// #2495 — the host-answered call whose submit hook is running, under its dispatcher's host
-    /// lock (one at a time: the store is its domain's). An answer it gets meanwhile posts without
-    /// ringing the wake hook, which may take a scheduler lock the dispatcher must not nest under
-    /// its host lock; no one waits on the call yet, and its caller's park finds the answer.
-    submitting: Option<u64>,
     /// F3 (FIBER_PARK.md) — Cranelift-JIT fiber-park cells, keyed by completion id: a punting
     /// fiber registers here and its resumer's polls read the cell. Each cell takes its answer as
     /// it comes (#2477): [`complete`](Completions::complete) fills a registered cell, and a
@@ -21560,7 +21688,6 @@ impl Completions {
                 host_pending: BTreeMap::new(),
                 in_flight: 0,
                 minted: 0,
-                submitting: None,
                 fiber_cells: BTreeMap::new(),
             }),
             cv: Condvar::new(),
@@ -21570,7 +21697,10 @@ impl Completions {
 
     /// §12 — install (`Some`) or remove the hook each posted result calls
     /// ([`Completions::notify`]). Called before the caller parks: a result posted before it was
-    /// installed is found by the driver's recheck after the park, one posted after rings it.
+    /// installed is found by the driver's recheck after the park, one posted after rings it. The hook
+    /// runs on the thread that posts: a pool worker, an embedder's thread, or one inside a host
+    /// procedure, holding its domain's host lock (#2522). A hook that takes a lock taken before a
+    /// host's waits until the thread lets go of it, as the tree-walker's drain does.
     pub fn set_notify(&self, f: Option<Arc<dyn Fn() + Send + Sync>>) {
         *self.notify.lock_unpoisoned() = f;
     }
@@ -21624,14 +21754,11 @@ impl Completions {
                 g.ready.insert(id, result);
             }
         }
-        let quiet = g.submitting == Some(id);
         drop(g);
         self.cv.notify_all();
-        if quiet {
-            return;
-        }
         // The result post happens-before the wake hook, so a drain the hook runs always finds the
-        // result it is delivering (no lost wakeup). Called with no lock held: the hook drains.
+        // result it is delivering (no lost wakeup). Called with the store's lock released: the hook
+        // drains.
         let hook = self.notify.lock_unpoisoned().clone();
         if let Some(h) = hook {
             h();
@@ -21640,8 +21767,7 @@ impl Completions {
 
     /// #1366 — mint an id for a host-answered punt ([`OffloadOutcome::Host`]) and run its submit
     /// hook with the call's [`Completer`]: minted + marked host-owned under the one lock, with the
-    /// call's tape prefix when its host records. An answer the hook gives at once posts quietly
-    /// ([`CompletionState::submitting`]).
+    /// call's tape prefix when its host records.
     fn submit_host_owned(
         self: &Arc<Self>,
         record: Option<(u32, u32, i32, Vec<i64>)>,
@@ -21654,14 +21780,12 @@ impl Completions {
             if let Some(prefix) = record {
                 g.host_pending.insert(id, prefix);
             }
-            g.submitting = Some(id);
             id
         };
         submit(Completer {
             store: Arc::downgrade(self),
             id,
         });
-        self.mx.lock_unpoisoned().submitting = None;
         id
     }
 
@@ -21965,9 +22089,9 @@ pub type HostCompletion = Box<dyn FnOnce(Completer) + Send>;
 
 /// #2495 — the right to answer one host-answered call ([`OffloadOutcome::Host`]), handed to its
 /// submit hook: the embedder answers it with [`complete`](Completer::complete), from any thread, at
-/// any time. A completer dropped unanswered answers `CAP_REVOKED` (`-9`), so a call its host can no
-/// longer answer never hangs (INVARIANTS.md 9). It holds its domain's store weakly: once the domain
-/// is gone, answering does nothing.
+/// any time, from inside a host procedure too (#2522). A completer dropped unanswered answers
+/// `CAP_REVOKED` (`-9`), so a call its host can no longer answer never hangs (INVARIANTS.md 9). It
+/// holds its domain's store weakly: once the domain is gone, answering does nothing.
 #[derive(Debug)]
 pub struct Completer {
     store: std::sync::Weak<Completions>,
@@ -35182,27 +35306,34 @@ impl Mem {
         let _ = self.write_bytes_impl(sp_word, &sp.to_le_bytes());
     }
 
-    /// The durable state word at [`STATE_OFF`] (the freeze driver's trigger). `STATE_NORMAL` if the
-    /// word's page is somehow uncommitted (a non-durable / malformed window).
+    /// The arena's freeze word ([`ShadowArena::freeze_word`], the freeze driver's trigger).
+    /// `STATE_NORMAL` for a window whose module declared no arena, which has none (#2518), or if the
+    /// word's page is somehow uncommitted (a malformed window).
     fn durable_state(&self) -> i32 {
-        self.read_bytes_impl(STATE_OFF, 4)
+        self.shadow
+            .freeze_word()
+            .and_then(|at| self.read_bytes_impl(at, 4))
             .and_then(|b| b.try_into().ok())
             .map(i32::from_le_bytes)
             .unwrap_or(STATE_NORMAL)
     }
 
     /// DURABILITY.md §13.4 slice 4c-bis — the `i8` **freeze-on-quiesce** arm flag at
-    /// [`ARM_QUIESCE_OFF`] (non-zero ⇒ armed). Read once at run setup.
+    /// [`ShadowArena::quiesce_flag`] (non-zero ⇒ armed). Read once at run setup.
     fn durable_freeze_on_quiesce(&self) -> bool {
-        self.read_bytes_impl(ARM_QUIESCE_OFF, 1)
+        self.shadow
+            .quiesce_flag()
+            .and_then(|at| self.read_bytes_impl(at, 1))
             .map(|b| b[0] != 0)
             .unwrap_or(false)
     }
 
-    /// Set the global durable **freeze** word at [`STATE_OFF`] (`UNWINDING`/`ARMED`/`NORMAL`) — the
-    /// stop-the-world trigger every poll reads.
+    /// Set the arena's **freeze** word (`UNWINDING`/`ARMED`/`NORMAL`) — the stop-the-world trigger
+    /// every poll reads. A no-op for a window with no arena, which nothing in can poll.
     fn durable_set_state(&mut self, state: i32) {
-        let _ = self.write_bytes_impl(STATE_OFF, &state.to_le_bytes());
+        if let Some(at) = self.shadow.freeze_word() {
+            let _ = self.write_bytes_impl(at, &state.to_le_bytes());
+        }
     }
 
     /// Read context `ctx`'s per-context **thaw** state word (`REWINDING`/`NORMAL`) at
@@ -35233,7 +35364,7 @@ impl Mem {
 
     /// Load a vCPU's unified durable phase from the two words it is split across (§12.8 concurrent-thaw
     /// stage 1): context `ctx`'s per-context **thaw** word while it is `REWINDING` — a rewind is the
-    /// context's own — else the global **freeze** word ([`STATE_OFF`]: `UNWINDING`/`ARMED`/`NORMAL`),
+    /// context's own — else the arena's **freeze** word (`UNWINDING`/`ARMED`/`NORMAL`),
     /// the run's. So a thawed run armed for a second freeze rewinds first, its arm intact (#2044).
     /// Mirror of [`Self::durable_store_dstate`].
     fn durable_load_dstate(&self, ctx: usize) -> i32 {
@@ -35258,20 +35389,20 @@ impl Mem {
     }
 
     /// Tick the **mid-run freeze trigger** at a fiber safepoint (`cont.resume`/`suspend`): if the run
-    /// is `STATE_ARMED`, decrement the arm countdown at [`ARM_COUNTDOWN_OFF`] and, when it reaches 0,
+    /// is `STATE_ARMED`, decrement the arena's fiber-safepoint countdown and, when it reaches 0,
     /// promote the state word to `UNWINDING` — so the safepoint's trailing poll begins the freeze. A
     /// no-op unless armed (the common case: one `i32` read per safepoint, no write), so an unarmed run
     /// is byte-identical. Call once per fiber safepoint — see the `run_inner` dispatch.
     fn durable_tick_arm(&mut self) -> bool {
-        self.durable_tick_countdown(ARM_COUNTDOWN_OFF)
+        self.durable_tick_countdown(self.shadow.fiber_countdown())
     }
 
-    /// Back-edge variant (Phase-4 Slice A): on an `ARMED` run, count down [`ARM_BACKEDGE_OFF`] at
+    /// Back-edge variant (Phase-4 Slice A): on an `ARMED` run, count down the arena's back-edge one at
     /// each branch terminator and promote to `UNWINDING` at 0, so the next loop-header poll begins
     /// the freeze — reaching a poll-free compute loop. Inert unless armed for back-edges (the slot
     /// is positive), so a fiber-armed or ordinary run is byte-identical. Call at branch terminators.
     fn durable_tick_arm_backedge(&mut self) -> bool {
-        self.durable_tick_countdown(ARM_BACKEDGE_OFF)
+        self.durable_tick_countdown(self.shadow.backedge_countdown())
     }
 
     /// Decrement the countdown at `off` on an `ARMED` run and promote to `UNWINDING` at 0. Guarded
@@ -35279,7 +35410,10 @@ impl Mem {
     /// interfere: arming one leaves the other at 0, where this is a no-op. An unarmed run is one
     /// `i32` state read, no write. `true` exactly when this tick fired the trigger — the moment the
     /// freeze census (#1671) runs.
-    fn durable_tick_countdown(&mut self, off: u64) -> bool {
+    fn durable_tick_countdown(&mut self, countdown: Option<u64>) -> bool {
+        let Some(off) = countdown else {
+            return false; // no arena: nothing armed it
+        };
         if self.durable_state() != STATE_ARMED {
             return false;
         }
@@ -35943,6 +36077,9 @@ impl GuestMem for Mem {
     fn page_size(&self) -> i64 {
         self.page as i64
     }
+    fn shadow(&self) -> ShadowArena {
+        self.shadow
+    }
 }
 
 /// The bytecode engine's view of its [`Mem`], which it hands to every host call (#2109). The call's
@@ -36007,6 +36144,9 @@ impl GuestMem for SoleMem<'_> {
     }
     fn region_page_size(&self) -> i64 {
         self.0.region_page_size()
+    }
+    fn shadow(&self) -> ShadowArena {
+        self.0.shadow()
     }
 }
 
@@ -40438,18 +40578,14 @@ mod completer_tests {
         assert_eq!(comps.outstanding(), 0);
     }
 
-    /// An answer given inside its submit hook, under its dispatcher's host lock, posts without
-    /// ringing: the hook may take a scheduler lock the dispatcher must not nest under its host
-    /// lock (the tree-walker's pipe park takes them the other way round). Its caller's park finds
-    /// the answer.
+    /// An answer given inside its submit hook posts and rings like any other (#2522): a hook that
+    /// must not run under its dispatcher's host lock waits for it itself
+    /// ([`Scheduler::drain_when_free`]).
     #[test]
-    fn an_answer_inside_its_submit_hook_does_not_ring() {
+    fn an_answer_inside_its_submit_hook_rings() {
         let (comps, rings) = store();
         let id = comps.submit_host_owned(None, Box::new(|c| c.complete(7)));
         assert_eq!(comps.try_take(id), Some(7));
-        assert_eq!(rings.load(Ordering::SeqCst), 0);
-        // The next call's answer rings again.
-        submit(&comps).complete(8);
         assert_eq!(rings.load(Ordering::SeqCst), 1);
     }
 

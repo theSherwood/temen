@@ -2446,14 +2446,14 @@ fn main() {
             .expect("write durable module");
         let clock_v = 1000i64;
         let mut normal = init_durable_window(1 << 17, arena);
-        write_state(&mut normal, STATE_NORMAL);
+        write_state(&mut normal, arena, STATE_NORMAL);
         let mut unwind = init_durable_window(1 << 17, arena);
-        write_state(&mut unwind, STATE_UNWINDING);
+        write_state(&mut unwind, arena, STATE_UNWINDING);
         let (sn, vn, snap_n, _) = durable_run(&inst, &normal, clock_v);
         let (su, vu, snap_frozen, clk_after) = durable_run(&inst, &unwind, clock_v);
         // Thaw: feed the freeze snapshot back as the window, flipped to REWINDING; clock continues.
         let mut rewind = snap_frozen.clone();
-        write_state(&mut rewind, STATE_REWINDING);
+        write_state(&mut rewind, arena, STATE_REWINDING);
         let (sr, vr, snap_r, _) = durable_run(&inst, &rewind, clk_after);
         let cases = [
             ("dur_normal", &normal, clock_v, sn, vn, &snap_n),

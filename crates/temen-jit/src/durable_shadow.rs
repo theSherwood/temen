@@ -4,7 +4,7 @@
 //! One `u64` window byte offset per OS thread (a vCPU): the base of the shadow region the running
 //! durable context spills into. The durable transform reads it (via the `durable.shadow_base` IR op)
 //! to address *this* context's per-context shadow-SP word, so concurrent vCPUs each unwind into their
-//! own region with **no shared SP word** — retiring the single `SHADOW_SP_OFF` word (and its
+//! own region with **no shared SP word** — retiring the single global SP word (and its
 //! `workers > 1` lock).
 //!
 //! Like [`crate::vcpu_tls`] it is a baked thunk over a thread-local — substrate-independent and unable
@@ -14,9 +14,10 @@
 
 use std::cell::Cell;
 
-/// Default: the root context's region base (`ShadowArena::region_base(0)`). The runtime
-/// re-seeds at every root entry / inline child / fiber switch before any instrumented code runs, so
-/// this default is only a never-stale fallback.
+/// Default: the empty arena's base, `0`. No constant can name a durable domain's regions, which its
+/// module declares (INVARIANTS.md #16), so the runtime seeds the register at every entry that runs a
+/// durable domain's code — the root entry, each spawned or inline child, both edges of a fiber switch —
+/// and a durable run never reads this.
 const ROOT_SHADOW_BASE: u64 = temen_ir::durable_abi::ShadowArena::EMPTY.region_base(0);
 
 thread_local! {

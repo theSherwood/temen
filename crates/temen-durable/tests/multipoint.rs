@@ -29,7 +29,11 @@ const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
 
 fn instrument(src: &str) -> Module {
-    let mut m = temen_text::parse_module(src).expect("parse");
+    let freeze = TEST_ARENA
+        .freeze_word()
+        .expect("the arena holds the freeze word");
+    let src = src.replace("FREEZE_WORD", &freeze.to_string());
+    let mut m = temen_text::parse_module(&src).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
         shadow: Some(TEST_ARENA),
@@ -78,7 +82,7 @@ fn assert_resume_at_point(oracle: &str, freezable: &str, expected: i64) {
     // the chosen point and unwinds there. Record how far the clock advanced.
     let (_, snapshot, clock_after) = run(&freezable, 42, &init_durable_window(WINDOW, TEST_ARENA));
     assert_ne!(
-        read_state(&snapshot),
+        read_state(&snapshot, TEST_ARENA),
         STATE_NORMAL,
         "the guest flipped the state word and unwound (did not complete normally)"
     );
@@ -113,12 +117,12 @@ block 0 (v0: i32) {
 "#;
 
 // Freeze at point 0: flip UNWINDING before the *first* call.cap. (`v_a`/`v_u` are the
-// state-word address and the UNWINDING constant.)
+// freeze word's address in the arena and the UNWINDING constant.)
 const FREEZE_AT_0: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
-  v_a = i64.const 16384
+  v_a = i64.const FREEZE_WORD
   v_u = i32.const 1
   i32.store v_a v_u
   v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
@@ -135,7 +139,7 @@ func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
-  v_a = i64.const 16384
+  v_a = i64.const FREEZE_WORD
   v_u = i32.const 1
   i32.store v_a v_u
   v3 = call.cap 2 0 (i32) -> (i64) v0 (v1)
@@ -185,7 +189,7 @@ block 0 (v0: i32) {
   v1 = i32.const 0
   v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
   v3 = call.cap 2 0 (i32) -> (i64) v0 (v1)
-  v_a = i64.const 16384
+  v_a = i64.const FREEZE_WORD
   v_u = i32.const 1
   i32.store v_a v_u
   v4 = call.cap 2 0 (i32) -> (i64) v0 (v1)
@@ -243,7 +247,7 @@ const FREEZE_PROP_AT_1: &str = r#"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = call 1 (v0)
-  v_a = i64.const 16384
+  v_a = i64.const FREEZE_WORD
   v_u = i32.const 1
   i32.store v_a v_u
   v2 = call 2 (v0)

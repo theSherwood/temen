@@ -9872,7 +9872,7 @@ struct VTask {
     /// Parked resumers: `(fiber id, its Vm, the `cont.resume` result slot awaiting (status, value))`.
     chain: Vec<(usize, Vm, u32)>,
     /// DURABILITY.md §12.8 (D-fiber-cont option A): the root computation's (context 0's) saved durable
-    /// shadow-stack pointer, swapped with the in-window active word ([`super::SHADOW_SP_OFF`]) on each
+    /// shadow-stack pointer, swapped with the in-window active SP word on each
     /// fiber switch so a freeze poll spills into the *running* context's region. Only meaningful on a
     /// durable run; `ShadowArena::region_base(0)` (context 0's region base) otherwise.
     root_shadow_sp: u64,

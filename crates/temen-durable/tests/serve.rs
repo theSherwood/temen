@@ -92,12 +92,16 @@ fn a_mid_handler_freeze_thaws_and_the_handler_replies() {
     h.set_self_module(&inst);
     let t = h.svc_enqueue(0, 0, vec![41]).expect("enqueue");
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after(&mut win, 1);
+    arm_freeze_after(&mut win, TEST_ARENA, 1);
     let mut fuel = 1_000_000u64;
     let (r, snap) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
     assert!(r.is_ok(), "the freeze returns a placeholder: {r:?}");
-    assert_eq!(read_state(&snap), STATE_UNWINDING, "the cut was taken");
+    assert_eq!(
+        read_state(&snap, TEST_ARENA),
+        STATE_UNWINDING,
+        "the cut was taken"
+    );
     assert_eq!(h.take_freeze_declined(), None, "not declined");
     assert_eq!(h.svc_result(t), None, "no bogus reply settled");
     assert_eq!(
@@ -201,7 +205,7 @@ fn a_domain_frozen_at_its_serve_point_thaws_and_drains_the_restored_queue() {
         let t = h.svc_enqueue(0, 0, vec![41]).expect("enqueue");
         assert_eq!(t, 0);
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        write_state(&mut win, STATE_UNWINDING);
+        write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) =
             run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
@@ -295,7 +299,7 @@ fn an_idle_server_freezes_on_quiesce_and_thaws_still_serving() {
         h.set_durable(true);
         h.set_self_module(&inst);
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        arm_freeze_on_quiesce(&mut win);
+        arm_freeze_on_quiesce(&mut win, TEST_ARENA);
         let mut fuel = 1_000_000u64;
         let (r, snap) =
             run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
@@ -424,10 +428,14 @@ fn a_parked_handler_freezes_and_its_thaw_replies() {
     let mut h = host();
     let t_hold = h.svc_enqueue(0, 0, vec![0]).expect("enqueue");
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_on_quiesce(&mut win);
+    arm_freeze_on_quiesce(&mut win, TEST_ARENA);
     let (r, snap) = run(&mut h, &win);
     assert!(r.is_ok(), "the freeze returns a placeholder: {r:?}");
-    assert_eq!(read_state(&snap), STATE_UNWINDING, "the cut was taken");
+    assert_eq!(
+        read_state(&snap, TEST_ARENA),
+        STATE_UNWINDING,
+        "the cut was taken"
+    );
     assert_eq!(h.take_freeze_declined(), None, "not declined");
     assert_eq!(
         h.frozen_handlers(),

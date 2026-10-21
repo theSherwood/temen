@@ -12,11 +12,15 @@
 //! controller against a real OS thread.
 
 use std::time::Duration;
-use temen_interp::{cap_id, GuestMem, Host, Trap, STATE_NORMAL, STATE_OFF, STATE_UNWINDING};
+use temen_interp::{cap_id, GuestMem, Host, ShadowArena, Trap, STATE_NORMAL, STATE_UNWINDING};
 
-/// A trivial flat window: the gate only reads the 4-byte freeze word at `STATE_OFF`, and a `Blocking`
-/// op is window-independent, so a `Vec` backing is all the dispatch needs.
-struct VecMem(Vec<u8>);
+/// The arena the windows below declare: one 4 KiB region in an 8 KiB window (#2518).
+const ARENA: ShadowArena = ShadowArena::new(4096, 8192);
+
+/// A trivial flat window with the arena its module declared: the gate only reads the 4-byte freeze
+/// word in it, and a `Blocking` op is window-independent, so a `Vec` backing is all the dispatch
+/// needs.
+struct VecMem(Vec<u8>, ShadowArena);
 
 impl GuestMem for VecMem {
     fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
@@ -28,11 +32,16 @@ impl GuestMem for VecMem {
         self.0.get_mut(p..p + data.len())?.copy_from_slice(data);
         Some(())
     }
+    fn shadow(&self) -> ShadowArena {
+        self.1
+    }
 }
 
+/// Write `state` where `ARENA`'s freeze word is, whatever arena `mem` says it has.
 fn set_state(mem: &mut VecMem, state: i32) {
-    mem.write_bytes(STATE_OFF, &state.to_le_bytes())
-        .expect("state word fits the window");
+    let word = ARENA.freeze_word().expect("the arena holds a freeze word");
+    mem.write_bytes(word, &state.to_le_bytes())
+        .expect("the word fits the window");
 }
 
 /// A direct `Blocking.work` call.cap fails **closed** the moment an async freeze has landed, and runs
@@ -42,7 +51,7 @@ fn blocking_call_fails_closed_once_a_freeze_has_landed() {
     let mut host = Host::new();
     host.set_durable(true);
     let h = host.grant_blocking(Duration::ZERO, None);
-    let mut mem = VecMem(vec![0u8; STATE_OFF as usize + 4096]);
+    let mut mem = VecMem(vec![0u8; 8192], ARENA);
 
     // Freeze landed (UNWINDING): entering a new blocking offload would stall the STW, so refuse.
     set_state(&mut mem, STATE_UNWINDING);
@@ -61,19 +70,36 @@ fn blocking_call_fails_closed_once_a_freeze_has_landed() {
     );
 }
 
-/// The gate is conditioned on a **durable** domain: a non-durable run's byte at the `STATE_OFF`
-/// freeze-word slot is ordinary guest data, not a freeze word, and must never spuriously refuse a
-/// blocking call.
+/// The gate is conditioned on a **durable** domain: a non-durable run's bytes where a freeze word
+/// would be are ordinary guest data, not a freeze word, and must never spuriously refuse a blocking
+/// call.
 #[test]
-fn blocking_call_runs_when_not_durable_even_if_offset_zero_looks_like_unwinding() {
+fn blocking_call_runs_when_not_durable_even_if_the_freeze_word_looks_like_unwinding() {
     let mut host = Host::new(); // NOT durable
     let h = host.grant_blocking(Duration::ZERO, None);
-    let mut mem = VecMem(vec![0u8; STATE_OFF as usize + 4096]);
+    let mut mem = VecMem(vec![0u8; 8192], ARENA);
     set_state(&mut mem, STATE_UNWINDING); // a coincidental guest byte pattern, not a freeze word
 
     let ran = host.cap_dispatch_slots(cap_id::BLOCKING, 0, h, &[7], Some(&mut mem));
     assert!(
         matches!(&ran, Ok(v) if v.len() == 1),
-        "non-durable: offset-0 byte is guest data, the blocking call must run, got {ran:?}",
+        "non-durable: the bytes are guest data, the blocking call must run, got {ran:?}",
+    );
+}
+
+/// #2518: nor in a durable domain whose module declared no arena — it has no freeze word, so the
+/// gate reads nothing, whatever the window holds where one would be.
+#[test]
+fn blocking_call_runs_in_a_window_without_an_arena() {
+    let mut host = Host::new();
+    host.set_durable(true);
+    let h = host.grant_blocking(Duration::ZERO, None);
+    let mut mem = VecMem(vec![0u8; 8192], ShadowArena::EMPTY);
+    set_state(&mut mem, STATE_UNWINDING);
+
+    let ran = host.cap_dispatch_slots(cap_id::BLOCKING, 0, h, &[7], Some(&mut mem));
+    assert!(
+        matches!(&ran, Ok(v) if v.len() == 1),
+        "no arena: no freeze word, the blocking call must run, got {ran:?}",
     );
 }

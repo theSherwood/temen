@@ -70,10 +70,10 @@ fn a_call_import_suspend_point_reloads_its_result_on_thaw() {
     assert_eq!(baseline, vec![Value::I64(52)], "baseline: clock + 10");
 
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let (frozen, snapshot) = run(&inst, 42, &win);
     assert!(frozen.is_ok(), "freeze returns a placeholder, not a trap");
-    assert_eq!(read_state(&snapshot), STATE_UNWINDING);
+    assert_eq!(read_state(&snapshot, TEST_ARENA), STATE_UNWINDING);
 
     // Thaw on a fresh host whose clock reads 0: the imported call's result (42) reloads from
     // the frame — it is not re-issued.

@@ -21,9 +21,7 @@ use temen_durable::{
 use temen_interp::{
     cap_id, run_capture_reserved_with_host, BoundImport, Host, MemLayout, StreamRole,
 };
-use temen_ir::durable_abi::{
-    ShadowArena, DEFAULT_SHADOW_STRIDE, DURABLE_CONTROL_END, MAX_SHADOW_CONTEXTS,
-};
+use temen_ir::durable_abi::{ShadowArena, DEFAULT_SHADOW_STRIDE, MAX_SHADOW_CONTEXTS};
 use temen_ir::Module;
 
 /// The probe's five lines, the uninterrupted run's stdout.
@@ -79,9 +77,8 @@ fn without_the_flag_a_c_guest_is_not_freezable() {
     );
 }
 
-/// With the flag the arena is where the verifier and every backend need it: above the always-live
-/// control words, 8-aligned, `contexts` whole regions, inside the window — and clear of the guest's
-/// own data (R9). `verify_module` in `translated()` has already rejected a violation of any of
+/// With the flag the arena is where the verifier and every backend need it: clear of the NULL guard,
+/// 8-aligned, `contexts` whole regions, inside the window — and clear of the guest's own data (R9). `verify_module` in `translated()` has already rejected a violation of any of
 /// these; the assertions name them so a regression says which one moved.
 #[test]
 fn the_flag_declares_a_verified_arena_clear_of_the_guest_image() {
@@ -89,8 +86,8 @@ fn the_flag_declares_a_verified_arena_clear_of_the_guest_image() {
     let a = arena_of(&m);
     let win = m.memory.expect("window").size();
     assert!(
-        a.base >= DURABLE_CONTROL_END,
-        "arena under the control words"
+        a.base >= temen_ir::module_null_guard(),
+        "arena on the NULL guard"
     );
     assert_eq!(a.base % 8, 0, "arena base must be 8-aligned");
     assert_eq!(a.contexts(), 4, "four regions were asked for");
@@ -293,10 +290,10 @@ fn freeze_and_thaw(freeze_on: Engine, thaw_on: Engine) {
     // through the third: two lines are out, the loop counter is live, and the next poll unwinds.
     let (mut fh, out) = durable_host();
     let mut win = init_durable_window(1usize << size_log2, arena);
-    arm_freeze_after_backedges(&mut win, 7);
+    arm_freeze_after_backedges(&mut win, arena, 7);
     let snap = run_on(freeze_on, &inst, &win, size_log2, &mut fh);
     assert_eq!(
-        read_state(&snap),
+        read_state(&snap, arena),
         STATE_UNWINDING,
         "the armed run on {freeze_on:?} must have unwound (frozen), not run to completion"
     );
@@ -350,10 +347,10 @@ fn the_backedge_countdown_oracle_is_interpreter_only() {
     let size_log2 = m.memory.expect("window").size_log2;
     let (mut h, _) = durable_host();
     let mut win = init_durable_window(1usize << size_log2, arena);
-    arm_freeze_after_backedges(&mut win, 7);
+    arm_freeze_after_backedges(&mut win, arena, 7);
     let snap = run_on(Engine::Jit, &inst, &win, size_log2, &mut h);
     assert_eq!(
-        read_state(&snap),
+        read_state(&snap, arena),
         temen_durable::STATE_ARMED,
         "the JIT does not tick the deterministic countdown; the arm stays pending"
     );

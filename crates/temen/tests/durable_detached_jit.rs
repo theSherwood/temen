@@ -211,7 +211,7 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
     // scheduled; the harvest carries its window + powerbox onto the Host.
     let (mut fhost, fargs) = powerbox(&child);
     let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, ARENA, STATE_UNWINDING);
     let (_, fsnap) = temen_run::jit_cap_run(
         &parent,
         0,
@@ -224,7 +224,7 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
     )
     .expect("JIT freeze");
     assert_eq!(
-        read_state(fsnap.bytes()),
+        read_state(fsnap.bytes(), ARENA),
         STATE_UNWINDING,
         "the parent froze"
     );
@@ -239,7 +239,7 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
     );
     assert_eq!(fhost.captured_detached()[0].slot, 0);
     assert_eq!(
-        read_state(fhost.captured_detached()[0].window.bytes()),
+        read_state(fhost.captured_detached()[0].window.bytes(), ARENA),
         STATE_UNWINDING,
         "the doorbell set the child's own freeze word, and it unwound"
     );
@@ -298,7 +298,11 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
         vec![4950],
         "JIT thaw: the re-launched child finished its loop"
     );
-    assert_eq!(read_state(tsnap.bytes()), STATE_NORMAL, "back to NORMAL");
+    assert_eq!(
+        read_state(tsnap.bytes(), ARENA),
+        STATE_NORMAL,
+        "back to NORMAL"
+    );
 
     // The same artifact thaws on the interpreter — one form for both engines.
     let (mut ihost, iwin) = restore();
@@ -329,7 +333,7 @@ fn an_interpreter_frozen_detached_child_thaws_on_the_jit() {
     let (mut fhost, fargs) = powerbox(&child);
     let iargs: Vec<Value> = fargs.iter().map(|&a| Value::I32(a as i32)).collect();
     let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, ARENA, STATE_UNWINDING);
     let mut fuel = 50_000_000u64;
     let (fr, fsnap) = run_capture_reserved_with_host(
         &parent,
@@ -1134,7 +1138,7 @@ fn rides_every_engine(
         for settle_ms in [0, 100] {
             let (mut fhost, args) = nest_powerbox(&child, settle_ms, live);
             let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
-            arm_freeze_after(&mut win, 1);
+            arm_freeze_after(&mut win, ARENA, 1);
             let Some((r, out, fsnap)) = nest_run(froze, &root, &args, &win, &mut fhost, None)
             else {
                 wrong.push(format!("freeze on {froze:?} after {settle_ms} ms: refused"));
@@ -1253,7 +1257,7 @@ fn a_jit_thaw_refuses_two_detached_children_at_one_join_slot() {
     let (root, nest) = nest_modules(&nest());
     let (mut fhost, args) = nest_powerbox(&nest, 0, 2);
     let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
-    arm_freeze_after(&mut win, 1);
+    arm_freeze_after(&mut win, ARENA, 1);
     let (_, _, fsnap) =
         nest_run(Engine::Interp, &root, &args, &win, &mut fhost, None).expect("oracle");
     let art = temen_snapshot::freeze(&root, &fsnap, &fhost).expect("serialize");
@@ -1434,7 +1438,7 @@ fn refreezes_every_engine(child: &str, answer: Answer) {
     for &first in &runs {
         let (mut fhost, args) = nest_powerbox(&child, 0, 1);
         let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
-        arm_freeze_after(&mut win, 1);
+        arm_freeze_after(&mut win, ARENA, 1);
         let (r, _, fsnap) = nest_run(first, &root, &args, &win, &mut fhost, None).expect("runs");
         if (r, fhost.frozen_detached().len()) != (Ok(0), 1) {
             wrong.push(format!(
@@ -1446,7 +1450,7 @@ fn refreezes_every_engine(child: &str, answer: Answer) {
         let art = temen_snapshot::freeze(&root, &fsnap, &fhost).expect("serialize");
         for &second in &runs {
             let (mut shost, mut swin) = nest_restore(&art, &root, &child);
-            arm_freeze_after(&mut swin, 1);
+            arm_freeze_after(&mut swin, ARENA, 1);
             let Some((r, _, ssnap)) = nest_run(second, &root, &args, &swin, &mut shost, None)
             else {
                 wrong.push(format!("{first:?} → second freeze on {second:?}: refused"));

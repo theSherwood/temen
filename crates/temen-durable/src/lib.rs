@@ -92,8 +92,9 @@ pub use temen_ir::durable_abi::SVC_WAIT_OP;
 // ---- State word values (the §2 state machine) ----
 
 /// Freeze **armed** (the deterministic mid-run trigger): the run executes normally, but the runtime
-/// counts down [`ARM_COUNTDOWN_OFF`] at each **fiber safepoint** (`cont.resume`/`suspend`) and, on
-/// reaching 0, promotes the word to [`STATE_UNWINDING`] so that op's trailing poll begins the freeze.
+/// counts down the arena's fiber-safepoint countdown ([`ShadowArena::fiber_countdown`]) at each
+/// **fiber safepoint** (`cont.resume`/`suspend`) and, on reaching 0, promotes the word to
+/// [`STATE_UNWINDING`] so that op's trailing poll begins the freeze.
 /// Transparent to the instrumented IR — every emitted poll/prologue tests only `UNWINDING`/`REWINDING`,
 /// so an `ARMED` run reads as `NORMAL` until the runtime promotes it. Lets a single-threaded test
 /// freeze *after N fiber safepoints of forward progress* (e.g. after a fiber has been recycled), which
@@ -112,13 +113,14 @@ pub use temen_ir::durable_abi::STATE_UNWINDING;
 
 // ---- Durable runtime region layout ----
 //
-// The control words + shadow arena occupy a **reserved low slice** `[0, arena.end)` of the
-// domain's *own* window (the arena is the module's own declaration, `Memory::shadow`, one
-// definition of placement — #1503 / INVARIANTS.md #16); the guest's memory is `[arena.end, window)`. This is the wasm shadow-stack
-// convention (runtime metadata + call stack below `__heap_base`, the program's heap above it):
-// the reserve is part of the guest's memory allotment, and a cooperating toolchain bases the
-// guest's data/heap at the arena `end` so the two never overlap (see
-// `transform_module_assume_confined`).
+// Every word the durable runtime keeps lives in the shadow arena, a slice `[arena.base, arena.end)`
+// of the domain's *own* window that the module declares (`Memory::shadow`, one definition of
+// placement — #1503 / INVARIANTS.md #16): each context's region, and in context 0's region header the
+// arena's control words — the freeze word every poll reads, the quiesce flag and the two arm
+// countdowns (#2518). A module that declares none has none, and nothing to instrument. This is the
+// wasm shadow-stack convention (runtime metadata + call stack beside the program's data and heap):
+// the reserve is part of the guest's memory allotment, and a cooperating toolchain keeps the
+// guest's data/heap clear of it so the two never overlap (see `transform_module_assume_confined`).
 //
 // This is *placement*, not an isolation boundary: the window is per-domain and the runtime
 // masks every access into it, so a guest that writes the reserve can only corrupt its own
@@ -128,57 +130,32 @@ pub use temen_ir::durable_abi::STATE_UNWINDING;
 // guest (a guard-paged, per-fiber placement, DURABILITY.md §12.7) is optional
 // defense-in-depth, not required for a cooperating toolchain.
 
-/// Window byte offset of the `i64` **back-edge arm countdown** — the number of loop back-edges
-/// (branch terminators) still to pass before an [`STATE_ARMED`] run promotes itself to
-/// [`STATE_UNWINDING`], so a loop-header poll begins the freeze. The deterministic trigger for the
-/// Phase-4 Slice A back-edge polls, separate from [`ARM_COUNTDOWN_OFF`] (which counts only fiber
-/// safepoints) so an ordinary or fiber-armed run is byte-identical (this slot stays 0). Lives in the
-/// reserve's `[24, 64)` gap.
-pub use temen_ir::durable_abi::ARM_BACKEDGE_OFF;
-/// Window byte offset of the `i64` **arm countdown** — the number of fiber safepoints still to pass
-/// before an [`STATE_ARMED`] run promotes itself to [`STATE_UNWINDING`]. Decremented by the runtime at
-/// each fiber safepoint (`cont.resume`/`suspend`); inert unless the state word is `ARMED`. Lives in the
-/// reserve's previously-unused `[16, 64)` gap, so it is byte-identical to before for any run that never
-/// arms (countdown stays 0).
-pub use temen_ir::durable_abi::ARM_COUNTDOWN_OFF;
-/// Window byte offset of the `i8` **freeze-on-quiesce** flag (DURABILITY.md §13.4 slice 4c-bis):
-/// non-zero arms the runtime to freeze the instant the run would otherwise block on
-/// `svc.wait`-parked consumers only — a server idle in its accept loop, which no safepoint or
-/// back-edge countdown can reach (a parked vCPU runs no ops). Distinct from the two countdown
-/// slots (which trigger mid-execution); this triggers at quiescence. Lives in the reserve's
-/// `[32, 64)` gap, so an unarmed run stays byte-identical. Must equal `temen-interp`'s copy.
-pub use temen_ir::durable_abi::ARM_QUIESCE_OFF;
 /// §12.8 concurrent-thaw stage 1: bytes reserved at a context region's base before its shadow frames —
-/// the 8-byte shadow-SP word, the 4-byte thaw state word at [`STATE_IN_REGION_OFF`] and the 4-byte
-/// re-issue word at [`REISSUE_IN_REGION_OFF`]. [`shadow_frame_base`]-equivalents in every backend start here. Must equal
-/// `temen-interp`/`temen-jit`'s copy.
+/// the 8-byte shadow-SP word, the 4-byte thaw state word at [`STATE_IN_REGION_OFF`], the 4-byte
+/// re-issue word at [`REISSUE_IN_REGION_OFF`], and in context 0's the arena's control words (#2518).
+/// [`ShadowArena::frame_base`] in every backend starts here.
 pub use temen_ir::durable_abi::REGION_HEADER_LEN;
 /// #1672: byte offset of the per-context **re-issue** word within a context's region — set by the
 /// runtime when it abandons a host call that would have parked under a landing freeze, and moved into
 /// that call's shadow frame by its unwind, so the thaw re-issues the call instead of reloading a result.
 pub use temen_ir::durable_abi::REISSUE_IN_REGION_OFF;
-/// Window byte offset of the `i64` shadow-stack pointer (a window byte offset itself).
-pub use temen_ir::durable_abi::SHADOW_SP_OFF;
 /// §12.8 concurrent-thaw stage 1: byte offset of the per-context **thaw** state word
 /// (`REWINDING`/`NORMAL`) **within a context's region** — just past the 8-byte in-region shadow-SP word
 /// at the region base, addressed via the `durable.shadow_base` register (like the SP word). Each frozen
 /// vCPU rewinds against its *own* thaw word, so the thaw can run them as concurrent OS threads with no
 /// shared word: one vCPU finishing its rewind (flipping its word to `NORMAL`) can't disturb a sibling
 /// still `REWINDING`, and a forward vCPU's callee prologue can't read another's `REWINDING`. The
-/// **freeze** state (`UNWINDING`) stays at the global [`STATE_OFF`] — a freeze is stop-the-world, so the
-/// single word is the natural broadcast every poll reads. Must equal `temen-interp`/`temen-jit`'s copy.
+/// **freeze** state (`UNWINDING`) stays in the arena's one freeze word ([`ShadowArena::freeze_word`]) —
+/// a freeze is stop-the-world, so the single word is the natural broadcast every poll reads.
 pub use temen_ir::durable_abi::STATE_IN_REGION_OFF;
-/// Window byte offset of the `i32` state word.
-pub use temen_ir::durable_abi::STATE_OFF;
 
 /// The region stride an arena declares unless it names its own: context `i` owns
 /// `[arena.region_base(i), +arena.stride)` (§12.8 4A.5, #1872). The transform never addresses a
 /// region (it emits `durable.shadow_base`-relative loads the runtime resolves); it bounds each
 /// push by the stride.
 pub use temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE;
-/// The shadow arena — one definition of placement (see the region-layout note above) — and the end
-/// of the always-live control words below it.
-pub use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END, FIBER_FROZEN, WAIT_FROZEN};
+/// The shadow arena — one definition of placement (see the region-layout note above).
+pub use temen_ir::durable_abi::{ShadowArena, FIBER_FROZEN, WAIT_FROZEN};
 
 /// `cont.resume`'s status for a fiber that returned ([`Inst::ContResume`]).
 const FIBER_RETURNED: i32 = 1;
@@ -214,9 +191,8 @@ pub enum TransformError {
     UnsupportedInst,
     /// The module is being instrumented via the strict [`transform_module`] path but a
     /// function uses a guest linear-memory instruction (load/store/atomic), which could
-    /// alias the reserved durable region `[0, arena.end)` (R9). The strict path fails
-    /// closed for *untrusted* modules. A durable module from a cooperating toolchain that
-    /// reserves `[0, arena.end)` (basing the guest's data/heap at the arena `end`)
+    /// alias its declared arena (R9). The strict path fails closed for *untrusted* modules. A
+    /// durable module from a cooperating toolchain that keeps its data and heap out of the arena
     /// should instead use [`transform_module_assume_confined`]. (Cap-mediated window effects
     /// — e.g. a Memory capability's map/unmap — are a separate facet the embedder withholds.)
     GuestUsesMemory,
@@ -275,10 +251,11 @@ pub enum IndirectReach {
 }
 
 /// The shadow-SP a barrier ([`IndirectReach::AddressTaken`]) holds while its body runs: `0`, below
-/// every arena (which starts at or above [`DURABLE_CONTROL_END`]), so it never reads as a context's
-/// empty frame base — and a push at it would fault on the NULL guard rather than land anywhere.
+/// every context's frames (which start [`REGION_HEADER_LEN`] into its region), so it never reads as a
+/// context's empty frame base — and the unwind check refuses a push at it, as at any SP below the
+/// running context's frames, so a freeze reaching it traps rather than writes anywhere.
 pub const BARRIER_SP: u64 = 0;
-const _: () = assert!(BARRIER_SP < DURABLE_CONTROL_END);
+const _: () = assert!(BARRIER_SP < REGION_HEADER_LEN);
 
 /// A module [`transform`] instrumented.
 #[derive(Clone, Debug)]
@@ -350,13 +327,13 @@ pub fn transform_module(m: &Module) -> Result<Module, TransformError> {
 }
 
 /// Like [`transform_module`], but **allows the guest to use linear memory**, on the caller's
-/// guarantee that the guest is confined to its usable region `[arena.end, window)` and
-/// never touches the reserved durable slice `[0, arena.end)` (its own declared arena's end).
+/// guarantee that the guest never touches its declared arena `[arena.base, arena.end)`, which holds
+/// every word the durable runtime keeps in its window (#2518).
 ///
 /// This is the intended path for durable modules produced by a **cooperating toolchain**:
-/// just as a wasm toolchain reserves low memory for the shadow stack and bases the heap at
-/// `__heap_base`, the producer reserves `[0, arena.end)` and bases the guest's data/heap at
-/// the arena `end`. The reserve is budget-accounted (the declared window must be ≥ `arena.end`).
+/// just as a wasm toolchain reserves memory for the shadow stack and bases the heap at
+/// `__heap_base`, the producer places the arena where its guest's data and heap are not. The arena
+/// is budget-accounted (it lies inside the declared window).
 /// The contract is *not* statically enforced here — a guest that
 /// violates it can corrupt only its own durability, and fails safe (see the region notes) —
 /// so prefer [`transform_module`] (fails closed, no memory) for *untrusted* modules.
@@ -381,11 +358,11 @@ pub fn transform(m: &Module, opts: &TransformOpts) -> Result<Instrumented, Trans
     let tainted_sigs = tainted_signatures(&m.funcs, &may_suspend, &targets);
     let any_instrumented = may_suspend.iter().any(|&s| s);
 
-    // R9 enforcement: the durable region shares the window with guest memory at fixed low
-    // addresses, with nothing confining the guest away from it. Rather than risk silent
-    // mutual corruption, refuse to instrument a module any of whose functions touch linear
-    // memory. (The generated/tested durable guests are pure SSA + `call.cap`, so they pass;
-    // the relocation that would lift this restriction is §12.7 future work.)
+    // R9 enforcement: the arena shares the window with guest memory, with nothing confining the
+    // guest away from it. Rather than risk silent mutual corruption, refuse to instrument a module
+    // any of whose functions touch linear memory. (The generated/tested durable guests are pure
+    // SSA + `call.cap`, so they pass; the confinement that would lift this restriction is §12.7
+    // future work.)
     if enforce_r9
         && any_instrumented
         && m.funcs
@@ -415,7 +392,7 @@ pub fn transform(m: &Module, opts: &TransformOpts) -> Result<Instrumented, Trans
                 &may_suspend,
                 &tainted_sigs,
                 &m.types,
-                arena.stride,
+                arena,
                 opts,
             )?;
             out.funcs[i] = nf;
@@ -425,9 +402,9 @@ pub fn transform(m: &Module, opts: &TransformOpts) -> Result<Instrumented, Trans
 
     if any_instrumented {
         let mem = out.memory.ok_or(TransformError::NoMemory)?;
-        // The reserved region `[0, arena.end)` must fit in the declared window (it is part of
-        // the guest's allotment; guest memory is the remainder `[arena.end, window)`), and a
-        // single shadow frame must fit in one context's region.
+        // The arena must fit in the declared window (it is part of the guest's allotment; guest
+        // memory is the rest of the window), and a single shadow frame must fit in one context's
+        // region.
         // A live call chain stacks one frame per suspended activation; the region bounds the
         // total depth, and the UNWIND check traps a chain deeper than that (#1683).
         if mem.size() < arena.end || REGION_HEADER_LEN + max_frame > arena.stride {
@@ -1030,9 +1007,13 @@ fn transform_func(
     may_suspend: &[bool],
     tainted_sigs: &[temen_ir::FuncType],
     type_section: &[TypeEntry],
-    stride: u64,
+    arena: ShadowArena,
     opts: &TransformOpts,
 ) -> Result<(Func, u64), TransformError> {
+    let stride = arena.stride;
+    // Every poll reads the arena's freeze word, at a constant (#2518): an instrumented module
+    // declares its arena, and the word is in it.
+    let freeze = arena.freeze_word().ok_or(TransformError::NoShadowArena)?;
     // Whether a `call.dyn` of this signature could reach a may-suspend target (R8) — the same
     // by-signature rule `compute_may_suspend` used to mark this function may-suspend in the first
     // place. Kept identical to that rule so the instrumentation set == the taint set (re-issue
@@ -1230,7 +1211,7 @@ fn transform_func(
             let mut psb = Bb::new(slot_types);
             let live: Vec<ValIdx> = (0..plen as u32).collect();
             // On to the header body (the point's continuation) unless a freeze is unwinding.
-            let term = poll(&mut psb, unwind_base + 2 * gid, seg(b, 0), live);
+            let term = poll(&mut psb, freeze, unwind_base + 2 * gid, seg(b, 0), live);
             seg_blocks.push(psb.finish(term));
         }
         for k in 0..=m {
@@ -1244,7 +1225,7 @@ fn transform_func(
                 sb.next = out as u32;
                 let gid = points.len() as u32;
                 let live: Vec<ValIdx> = (0..out as u32).collect();
-                let term = poll(&mut sb, unwind_base + 2 * gid, seg(b, k + 1), live);
+                let term = poll(&mut sb, freeze, unwind_base + 2 * gid, seg(b, k + 1), live);
                 seg_blocks.push(sb.finish(term));
 
                 // resume plan for this point
@@ -1450,7 +1431,7 @@ fn transform_func(
     // ---- DISPATCH — read the resume id at SP-4 and br_table to the matching arm ----
     // `sp_a` is the **active context's shadow-SP word address** from the runtime-private register
     // (`durable.shadow_base`, §12.8 4A.5) — per-context, so concurrent vCPUs each address their own SP
-    // word with no shared location (vs. the former fixed global `SHADOW_SP_OFF`). The runtime seeds the
+    // word with no shared location (vs. the former single global SP word). The runtime seeds the
     // register; a guest cannot redirect it. Used identically at every SP site (dispatch/unwind/arm).
     let mut db = Bb::new(vec![]);
     let sp_a = db.one(Inst::DurableShadowBase);
@@ -1481,12 +1462,14 @@ fn transform_func(
         // The point's UNWIND check block — where its polls send an unwinding frame.
         let unwind_blk = unwind_base + 2 * gid as u32;
 
-        // UNWIND check: a push of this frame must not run past the running context's own region
-        // `[region base, +stride)` — past it lies the next context's shadow frames, or
-        // guest memory for the last region (R9 / DURABILITY.md §12.7, #1683). The shadow stack
-        // mirrors the call stack, so this only trips for a chain deeper than a region holds — a
-        // clean trap, never silent corruption. It lives on the (cold) freeze path, not the
-        // per-call path.
+        // UNWIND check: a push of this frame must lie in the running context's own frames
+        // `[region base + REGION_HEADER_LEN, +stride)` — past them lies the next context's shadow
+        // frames, or guest memory for the last region (R9 / DURABILITY.md §12.7, #1683); below them,
+        // the region's header, the arena's control words among them in context 0's (#2518). The
+        // shadow stack mirrors the call stack, so this only trips for a chain deeper than a region
+        // holds, or an SP a barrier holds below every frame ([`BARRIER_SP`]) — a clean trap, never
+        // silent corruption, with or without a NULL guard under it. It lives on the (cold) freeze
+        // path, not the per-call path.
         let mut cb = Bb::new(pt.slot_types.clone());
         let sp_a = cb.one(Inst::DurableShadowBase);
         let sp = cb.one(load(LoadOp::I64, sp_a, 0));
@@ -1495,9 +1478,13 @@ fn transform_func(
         let stride = cb.one(Inst::ConstI64(stride as i64));
         let region_end = cb.one(ibin(IntTy::I64, BinOp::Add, sp_a, stride));
         let over = cb.one(icmp(IntTy::I64, CmpOp::GtU, newsp, region_end));
+        let header = cb.one(Inst::ConstI64(REGION_HEADER_LEN as i64));
+        let frames = cb.one(ibin(IntTy::I64, BinOp::Add, sp_a, header));
+        let under = cb.one(icmp(IntTy::I64, CmpOp::LtU, sp, frames));
+        let outside = cb.one(ibin(IntTy::I32, BinOp::Or, over, under));
         let live: Vec<ValIdx> = (0..pt.out as u32).collect();
         unwind_blocks.push(cb.finish(Terminator::BrIf {
-            cond: over,
+            cond: outside,
             then_blk: trap_blk,
             then_args: vec![],
             else_blk: unwind_blk + 1, // the spill block
@@ -1674,6 +1661,7 @@ fn transform_func(
                 reissue_branch(
                     &mut extra_blocks,
                     trap_blk + 1,
+                    freeze,
                     unwind_blk,
                     pt,
                     cont_args,
@@ -1698,6 +1686,7 @@ fn transform_func(
                 reissue_branch(
                     &mut extra_blocks,
                     trap_blk + 1,
+                    freeze,
                     unwind_blk,
                     pt,
                     cont_args,
@@ -1716,6 +1705,7 @@ fn transform_func(
                 reissue_branch(
                     &mut extra_blocks,
                     trap_blk + 1,
+                    freeze,
                     unwind_blk,
                     pt,
                     cont_args,
@@ -1745,6 +1735,7 @@ fn transform_func(
                 match reissue_branch(
                     &mut extra_blocks,
                     trap_blk + 1,
+                    freeze,
                     unwind_blk,
                     pt,
                     cont_args,
@@ -1782,7 +1773,7 @@ fn transform_func(
             // polls as the forward path does: an unwind that starts beneath it later (the next
             // freeze, the next fork) must find this frame unwinding too, not running on with the
             // placeholder its callee returned.
-            _ => poll(&mut ab, unwind_blk, pt.cont_seg, cont_args),
+            _ => poll(&mut ab, freeze, unwind_blk, pt.cont_seg, cont_args),
         };
         arm_blocks.push(ab.finish(term));
     }
@@ -1815,13 +1806,13 @@ fn transform_func(
 
 // ---- window helpers for freeze/thaw drivers and tests ----
 
-/// A fresh durable window of `size` bytes: state = `NORMAL`, and the root context's per-context
-/// shadow-SP word (§12.8 4A.5) — the first 8 bytes of its region at `arena.region_base(0)` — set to
-/// its empty frame base (`arena.frame_base(0)`, just past the SP + thaw words). The legacy global
-/// `SHADOW_SP_OFF` is unused; the per-context thaw words default to `NORMAL` (zero).
+/// A fresh durable window of `size` bytes: the arena's freeze word `NORMAL`, and the root context's
+/// per-context shadow-SP word (§12.8 4A.5) — the first 8 bytes of its region at `arena.region_base(0)`
+/// — set to its empty frame base (`arena.frame_base(0)`, just past the region header). The per-context
+/// thaw words default to `NORMAL` (zero).
 pub fn init_durable_window(size: usize, a: ShadowArena) -> Vec<u8> {
     let mut w = vec![0u8; size];
-    write_state(&mut w, STATE_NORMAL);
+    write_state(&mut w, a, STATE_NORMAL);
     let b = a.region_base(0) as usize;
     w[b..b + 8].copy_from_slice(&a.frame_base(0).to_le_bytes());
     w
@@ -1829,15 +1820,22 @@ pub fn init_durable_window(size: usize, a: ShadowArena) -> Vec<u8> {
 
 /// Window byte offset of context `ctx`'s **thaw** state word (§12.8 concurrent-thaw stage 1) — its
 /// region base plus [`STATE_IN_REGION_OFF`]. Per-context, so a thaw can set each frozen vCPU rewinding
-/// independently (vs. the global [`STATE_OFF`] freeze word).
+/// independently (vs. the arena's one freeze word).
 pub fn thaw_state_off(arena: ShadowArena, ctx: usize) -> u64 {
     arena.thaw_state_off(ctx)
 }
 
-/// Overwrite the global **freeze** state word (`UNWINDING`/`ARMED`/`NORMAL`) in a window image — the
+/// Overwrite the arena's **freeze** word (`UNWINDING`/`ARMED`/`NORMAL`) in a window image — the
 /// stop-the-world trigger every poll reads. Thaw (`REWINDING`) goes through [`write_thaw_state`].
-pub fn write_state(window: &mut [u8], state: i32) {
-    window[STATE_OFF as usize..STATE_OFF as usize + 4].copy_from_slice(&state.to_le_bytes());
+pub fn write_state(window: &mut [u8], arena: ShadowArena, state: i32) {
+    let at = control_word(arena.freeze_word());
+    window[at..at + 4].copy_from_slice(&state.to_le_bytes());
+}
+
+/// A control word's window offset, which only a window whose module declared an arena has: these
+/// helpers drive a durable window, and a module with nothing to instrument has none (#2518).
+fn control_word(at: Option<u64>) -> usize {
+    at.expect("a durable window's module declares its shadow arena") as usize
 }
 
 /// Overwrite context `ctx`'s per-context **thaw** state word (`REWINDING`/`NORMAL`) — used to drive a
@@ -1853,7 +1851,7 @@ pub fn write_thaw_state(window: &mut [u8], arena: ShadowArena, ctx: usize, state
 /// **thaw** word to `REWINDING`. Mirrors what the runtime does on a real snapshot-restore thaw (the
 /// interp's `drive` clear + per-context `REWINDING`; the JIT thaw driver).
 pub fn begin_thaw(window: &mut [u8], arena: ShadowArena, ctx: usize) {
-    write_state(window, STATE_NORMAL);
+    write_state(window, arena, STATE_NORMAL);
     write_thaw_state(window, arena, ctx, STATE_REWINDING);
 }
 
@@ -1882,11 +1880,11 @@ pub fn read_thaw_state(window: &[u8], arena: ShadowArena, ctx: usize) -> i32 {
 /// `safepoints`-th fiber safepoint (`cont.resume`/`suspend`) so that op's trailing poll begins the
 /// freeze. `safepoints == 1` freezes at the first fiber safepoint; larger values let the run make
 /// forward progress first (e.g. past a fiber recycle). A non-positive count is clamped to 1.
-pub fn arm_freeze_after(window: &mut [u8], safepoints: i64) {
+pub fn arm_freeze_after(window: &mut [u8], arena: ShadowArena, safepoints: i64) {
     let n = safepoints.max(1);
-    window[ARM_COUNTDOWN_OFF as usize..ARM_COUNTDOWN_OFF as usize + 8]
-        .copy_from_slice(&n.to_le_bytes());
-    write_state(window, STATE_ARMED);
+    let at = control_word(arena.fiber_countdown());
+    window[at..at + 8].copy_from_slice(&n.to_le_bytes());
+    write_state(window, arena, STATE_ARMED);
 }
 
 /// Arm a window to **freeze on quiesce** (DURABILITY.md §13.4 slice 4c-bis): the deterministic
@@ -1894,30 +1892,32 @@ pub fn arm_freeze_after(window: &mut [u8], safepoints: i64) {
 /// otherwise block with only `svc.wait`-parked consumers left (no runnable work, no futex/svc
 /// timers pending), the runtime promotes each parked domain's window to `UNWINDING` and re-admits
 /// it — the re-executed `svc.wait` takes the trailing-poll sentinel, so the domain unwinds and the
-/// freeze completes instead of the run hanging. Sets the quiesce flag ([`ARM_QUIESCE_OFF`]); the
-/// two countdown slots stay 0 so the triggers never interfere. Unlike the countdown arms, the
-/// state word stays `NORMAL` — the trigger is quiescence, detected scheduler-side, not a poll.
-pub fn arm_freeze_on_quiesce(window: &mut [u8]) {
-    window[ARM_QUIESCE_OFF as usize] = 1;
+/// freeze completes instead of the run hanging. Sets the quiesce flag
+/// ([`ShadowArena::quiesce_flag`]); the two countdown slots stay 0 so the triggers never interfere.
+/// Unlike the countdown arms, the freeze word stays `NORMAL` — the trigger is quiescence, detected
+/// scheduler-side, not a poll.
+pub fn arm_freeze_on_quiesce(window: &mut [u8], arena: ShadowArena) {
+    window[control_word(arena.quiesce_flag())] = 1;
 }
 
 /// Arm a window to **freeze after `backedges` further loop back-edges** (the deterministic Phase-4
 /// Slice A trigger for back-edge polls): the run proceeds normally, and the runtime promotes the
 /// state word to `UNWINDING` at the `backedges`-th branch terminator so the next loop-header poll
 /// begins the freeze — reaching a poll-free compute loop that no fiber-safepoint countdown can. Sets
-/// the back-edge countdown ([`ARM_BACKEDGE_OFF`]); the fiber-safepoint countdown stays 0 so the two
-/// triggers never interfere. A non-positive count is clamped to 1.
-pub fn arm_freeze_after_backedges(window: &mut [u8], backedges: i64) {
+/// the back-edge countdown ([`ShadowArena::backedge_countdown`]); the fiber-safepoint countdown stays
+/// 0 so the two triggers never interfere. A non-positive count is clamped to 1.
+pub fn arm_freeze_after_backedges(window: &mut [u8], arena: ShadowArena, backedges: i64) {
     let n = backedges.max(1);
-    window[ARM_BACKEDGE_OFF as usize..ARM_BACKEDGE_OFF as usize + 8]
-        .copy_from_slice(&n.to_le_bytes());
-    write_state(window, STATE_ARMED);
+    let at = control_word(arena.backedge_countdown());
+    window[at..at + 8].copy_from_slice(&n.to_le_bytes());
+    write_state(window, arena, STATE_ARMED);
 }
 
-/// Read the state word from a window image.
-pub fn read_state(window: &[u8]) -> i32 {
+/// Read the arena's freeze word from a window image.
+pub fn read_state(window: &[u8], arena: ShadowArena) -> i32 {
+    let at = control_word(arena.freeze_word());
     let mut b = [0u8; 4];
-    b.copy_from_slice(&window[STATE_OFF as usize..STATE_OFF as usize + 4]);
+    b.copy_from_slice(&window[at..at + 4]);
     i32::from_le_bytes(b)
 }
 
@@ -1956,13 +1956,6 @@ impl Bb {
     /// Push a zero-result instruction (a store).
     fn zero(&mut self, i: Inst) {
         self.insts.push(i);
-    }
-    /// §12.8 concurrent-thaw stage 1: the **freeze** state word's address (`UNWINDING`), as
-    /// `(base, offset)` for a `load`. **Always global** ([`STATE_OFF`]) — a freeze is genuinely
-    /// stop-the-world, so the single word is the natural broadcast every context's poll reads (the arm
-    /// trigger / `request_freeze` set it). Read by the loop-header and in-block `UNWINDING` polls.
-    fn freeze_word_addr(&mut self) -> (ValIdx, u64) {
-        (self.one(Inst::ConstI64(STATE_OFF as i64)), 0)
     }
     /// §12.8 concurrent-thaw stage 1: the **thaw** state word's address (`REWINDING`/`NORMAL`), as
     /// `(base, offset)` for a `load`/`store` — the running context's own region word
@@ -2003,13 +1996,21 @@ fn icmp(ty: IntTy, op: CmpOp, a: ValIdx, b: ValIdx) -> Inst {
 }
 
 /// The **poll** that follows a suspend op, ending the block that ran it: while a freeze or fork is
-/// unwinding (the state word reads `UNWINDING`), on to the point's UNWIND check block `unwind_blk`,
-/// which spills `live` and returns; otherwise on to the continuation `cont` with the same values. The
-/// forward path polls after the op, and so does an arm that ran the op again on a thaw — a re-issued
-/// call is as live as the original, and an unwind can start beneath it later.
-fn poll(b: &mut Bb, unwind_blk: BlockIdx, cont: BlockIdx, live: Vec<ValIdx>) -> Terminator {
-    let (st_a, st_off) = b.freeze_word_addr();
-    let st = b.one(load(LoadOp::I32, st_a, st_off));
+/// unwinding (the arena's freeze word at `freeze` reads `UNWINDING`), on to the point's UNWIND check
+/// block `unwind_blk`, which spills `live` and returns; otherwise on to the continuation `cont` with
+/// the same values. The forward path polls after the op, and so does an arm that ran the op again on a
+/// thaw — a re-issued call is as live as the original, and an unwind can start beneath it later. The
+/// word is global — a freeze is stop-the-world, so every context's poll reads the one broadcast (the
+/// arm trigger and a freeze request set it).
+fn poll(
+    b: &mut Bb,
+    freeze: u64,
+    unwind_blk: BlockIdx,
+    cont: BlockIdx,
+    live: Vec<ValIdx>,
+) -> Terminator {
+    let st_a = b.one(Inst::ConstI64(freeze as i64));
+    let st = b.one(load(LoadOp::I32, st_a, 0));
     let unw = b.one(Inst::ConstI32(STATE_UNWINDING));
     let is_unw = b.one(icmp(IntTy::I32, CmpOp::Eq, st, unw));
     Terminator::BrIf {
@@ -2030,6 +2031,7 @@ fn poll(b: &mut Bb, unwind_blk: BlockIdx, cont: BlockIdx, live: Vec<ValIdx>) -> 
 fn reissue_branch(
     extra_blocks: &mut Vec<Block>,
     first_extra: u32,
+    freeze: u64,
     unwind_blk: BlockIdx,
     pt: &PointPlan,
     cont_args: Vec<ValIdx>,
@@ -2053,7 +2055,7 @@ fn reissue_branch(
     let mut args: Vec<ValIdx> = (0..n).collect();
     args.extend(r);
     let blk = first_extra + extra_blocks.len() as u32;
-    let term = poll(&mut rb, unwind_blk, pt.cont_seg, args);
+    let term = poll(&mut rb, freeze, unwind_blk, pt.cont_seg, args);
     extra_blocks.push(rb.finish(term));
     let mut then_args = cont_args[..kept].to_vec();
     then_args.extend(operands.iter().map(|&v| reloaded[slot(v)]));

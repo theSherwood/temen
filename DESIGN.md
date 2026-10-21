@@ -1072,13 +1072,13 @@ storing at NULL traps identically on the interpreter and the emitted tier. A win
 smaller than the guard skips the seed on every tier (it would unmap the whole window).
 
 **A durable module's runtime pages are fenced the same way (#2426).** A module that
-declares a shadow arena (DURABILITY.md, INVARIANTS #16) keeps runtime words in its
-window that the host reads and writes outside the guest's guarded code: the control
-words at `[guard, guard+64)`, which a freeze request rings, and the arena, into which
-a freeze flattens each parked fiber. A protection the guest gave one of their pages
-would fault in the host, so every engine refuses a page op over any page they touch,
-as over the guard (`ShadowArena::fences`): `-EINVAL`, nothing changed. A module that
-declares no arena is not freezable and fences nothing past the guard.
+declares a shadow arena (DURABILITY.md, INVARIANTS #16) keeps runtime words in it that
+the host reads and writes outside the guest's guarded code: the control words in its
+first region's header (#2518), which a freeze request rings, and the regions, into
+which a freeze flattens each parked fiber. A protection the guest gave one of the
+arena's pages would fault in the host, so every engine refuses a page op over any page
+it touches, as over the guard (`ShadowArena::fences`): `-EINVAL`, nothing changed. A
+module that declares no arena is not freezable and fences nothing past the guard.
 
 ### Deferred
 `File`/`Directory`/`openAt`, `Connector`/networking (§7), async submit/complete
@@ -1979,6 +1979,18 @@ id. Under a recording host (W1) the bytecode drivers tape the delivered value wh
 there and the call declines. The completer is the one way to answer: `deliver_cap` is gone, and the
 browser's `temen_coop_deliver_cap` and the DAP's `provideCap` answer through the request's
 completer.
+
+**An answer from inside a host procedure (#2522, 2026-10-21).** A host procedure may answer another
+call: a read that takes an event answers whoever waits on that input. The wake runs on the thread
+that answers, here under the domain's host lock. The tree-walker's wake drains its scheduler, under
+the scheduler lock, which a park holds while it takes a host of the run (`park_gate`): drained under
+the host lock, it deadlocked against a park. Its dispatch now holds the host as a `HostCall`, and a
+drain its run's wake asks for meanwhile runs once the thread holds no host of that run
+(`Scheduler::drain_when_free`). Another run's drain, a nested sub-run's, runs at once. The other
+engines' wakes take no lock that is taken before a host's (the bytecode drivers ring a bell, the JIT
+re-offers its tasks), so they run at once. An answer given inside its own call's submit hook no
+longer posts without ringing: that special case is gone. Pinned on every engine in
+`temen-run/tests/cap_park.rs`.
 
 **An idle pump lets a wait's time pass (#1979, 2026-10-15).** The cooperative pump's clock is
 logical, for determinism (#2224): it moves with the work done, one ns per op, and when nothing can

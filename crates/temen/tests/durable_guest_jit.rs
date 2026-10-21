@@ -210,7 +210,7 @@ fn durable_run_compiles_and_invokes_agrees() {
     let inst = transform_module(&guest).expect("guest must be in transform scope");
     verify_module(&inst).expect("instrumented guest verifies");
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_NORMAL);
+    write_state(&mut win, TEST_ARENA, STATE_NORMAL);
     win[BLOB_OFF..BLOB_OFF + unit.len()].copy_from_slice(&unit);
     let mut hd = Host::new();
     hd.set_durable(true);
@@ -269,7 +269,7 @@ fn durable_jit_domain_survives_freeze_and_invokes() {
     // Slice 2 this refused (`JitCode`/`JitTable` were non-durable); now the units ride Section 5.
     let win = {
         let mut w = init_durable_window(WINDOW, TEST_ARENA);
-        write_state(&mut w, STATE_NORMAL);
+        write_state(&mut w, TEST_ARENA, STATE_NORMAL);
         w
     };
     let artifact = freeze(&inst, &win, &hd).expect("freeze admits the durable JIT domain");
@@ -326,7 +326,7 @@ fn durable_jit_domain_reconstructs_and_invokes_native() {
     // Freeze (NORMAL) + serialize.
     let win = {
         let mut w = init_durable_window(WINDOW, TEST_ARENA);
-        write_state(&mut w, STATE_NORMAL);
+        write_state(&mut w, TEST_ARENA, STATE_NORMAL);
         w
     };
     let artifact = freeze(&invoker, &win, &hd).expect("freeze admits the durable JIT domain");
@@ -653,7 +653,7 @@ fn durable_jit_install_call_indirect_freezes_in_flight_continuation() {
     // runs and rides the freeze). Grant Clock (durable) + a durable JIT domain with table room.
     let install = |h: &mut Host, jd: i32| -> i32 {
         let mut w = init_durable_window(WINDOW, TEST_ARENA);
-        write_state(&mut w, STATE_NORMAL);
+        write_state(&mut w, TEST_ARENA, STATE_NORMAL);
         w[BLOB_OFF..BLOB_OFF + unit.len()].copy_from_slice(&unit);
         let mut fuel = 5_000_000u64;
         let (r, _) = run_capture_reserved_with_host(
@@ -682,7 +682,7 @@ fn durable_jit_install_call_indirect_freezes_in_flight_continuation() {
     let jd_b = grant_jit_durable(&mut hb, &m, TABLE_LOG2);
     let slot_b = install(&mut hb, jd_b);
     let mut wb = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut wb, STATE_NORMAL);
+    write_state(&mut wb, TEST_ARENA, STATE_NORMAL);
     let mut fuel = 5_000_000u64;
     let (rb, _) = run_capture_reserved_with_host(
         &inst,
@@ -708,7 +708,7 @@ fn durable_jit_install_call_indirect_freezes_in_flight_continuation() {
     let slot = install(&mut hf, jd);
     assert_eq!(slot, slot_b, "install is deterministic across hosts");
     let mut wf = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut wf, STATE_UNWINDING);
+    write_state(&mut wf, TEST_ARENA, STATE_UNWINDING);
     let mut fuel = 5_000_000u64;
     let (rf, snap) = run_capture_reserved_with_host(
         &inst,

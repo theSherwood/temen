@@ -97,7 +97,7 @@ fn freeze_inside_a_poll_free_loop_round_trips() {
     // pre-loop call.cap). The 3rd branch terminator promotes the word to UNWINDING; the next
     // header poll then unwinds, spilling the loop-carried (counter, accumulator).
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after_backedges(&mut win, 3);
+    arm_freeze_after_backedges(&mut win, TEST_ARENA, 3);
     let (frozen, snapshot) = run(&inst, 42, &win);
     assert_eq!(
         frozen,
@@ -105,7 +105,7 @@ fn freeze_inside_a_poll_free_loop_round_trips() {
         "freeze returns a placeholder (the loop unwound, did not finish)"
     );
     assert_eq!(
-        read_state(&snapshot),
+        read_state(&snapshot, TEST_ARENA),
         STATE_UNWINDING,
         "froze inside the loop — the back-edge poll observed UNWINDING"
     );
@@ -130,7 +130,7 @@ fn unarmed_run_of_the_loop_is_inert() {
     let (r, snap) = run(&inst, 7, &init_durable_window(WINDOW, TEST_ARENA));
     assert_eq!(r, Ok(vec![Value::I64(12)]), "7 + 5, instrumentation inert");
     assert_ne!(
-        read_state(&snap),
+        read_state(&snap, TEST_ARENA),
         STATE_UNWINDING,
         "never entered UNWINDING"
     );
@@ -145,12 +145,12 @@ fn freeze_at_a_later_back_edge_lands_deeper_in_the_loop() {
 
     for backedges in 1..=5 {
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        arm_freeze_after_backedges(&mut win, backedges);
+        arm_freeze_after_backedges(&mut win, TEST_ARENA, backedges);
         let (_, snapshot) = run(&inst, 42, &win);
         // Whether or not this count lands a freeze (a high count may exit the loop first), a thaw
         // of the resulting image must reproduce the oracle.
         let mut win = snapshot.clone();
-        if read_state(&win) == STATE_UNWINDING {
+        if read_state(&win, TEST_ARENA) == STATE_UNWINDING {
             begin_thaw(&mut win, TEST_ARENA, 0);
             let (thawed, _) = run(&inst, 0, &win);
             assert_eq!(

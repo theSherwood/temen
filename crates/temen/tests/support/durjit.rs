@@ -72,7 +72,7 @@ fn read_sp(w: &[u8]) -> usize {
 
 fn window_with(state: i32) -> Vec<u8> {
     let mut w = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut w, state);
+    write_state(&mut w, TEST_ARENA, state);
     w
 }
 
@@ -182,7 +182,7 @@ pub fn check_xbackend(m: &Module, clock_v: i64) {
     let (fr_i, snap_i, clock_after, host_i) =
         interp_run(&inst, clock_v, &window_with(STATE_UNWINDING));
     assert!(fr_i.is_ok(), "interp freeze returns a placeholder");
-    assert_eq!(read_state(&snap_i), STATE_UNWINDING);
+    assert_eq!(read_state(&snap_i, TEST_ARENA), STATE_UNWINDING);
 
     // (1) NORMAL: the JIT agrees with the interpreter's value.
     let Some((j_base, _, _, _)) = jit_run(&inst, clock_v, &window_with(STATE_NORMAL)) else {
@@ -200,7 +200,7 @@ pub fn check_xbackend(m: &Module, clock_v: i64) {
         "JIT freeze returns a placeholder, not a trap\n{inst:#?}"
     );
     assert_eq!(
-        read_state(&snap_j),
+        read_state(&snap_j, TEST_ARENA),
         STATE_UNWINDING,
         "JIT leaves the artifact UNWINDING\n{inst:#?}"
     );
@@ -243,7 +243,7 @@ pub fn check_xbackend(m: &Module, clock_v: i64) {
     };
     assert_returned_eq(&inst, &base, j_thaw, "thaw");
     assert_eq!(
-        read_state(&final_j),
+        read_state(&final_j, TEST_ARENA),
         STATE_NORMAL,
         "JIT thaw must flip the state word back to NORMAL\n{inst:#?}"
     );
@@ -284,7 +284,7 @@ pub fn fuzz_recycle_fiber_one_xbackend(g: &mut Gen) {
         let mut h = Host::new();
         h.set_durable(true);
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        arm_freeze_after(&mut win, arm);
+        arm_freeze_after(&mut win, TEST_ARENA, arm);
         let mut fuel = 1_000_000u64;
         let (r, snap) =
             run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
@@ -304,7 +304,7 @@ pub fn fuzz_recycle_fiber_one_xbackend(g: &mut Gen) {
     // JIT armed freeze (skip on Unsupported / host allocation pressure, like `jit_run`).
     let mut jhost = Host::new();
     let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after(&mut jwin, arm);
+    arm_freeze_after(&mut jwin, TEST_ARENA, arm);
     let (
         jout,
         jsnap,

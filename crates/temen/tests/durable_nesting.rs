@@ -198,7 +198,7 @@ fn freeze_after_detached_child_joined_thaws_and_reloads_the_join_result() {
     // shadow frame) and the fiber parked (rides as Section-2 residue).
     let (mut fhost, fargs) = detached_powerbox();
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after(&mut win, 2);
+    arm_freeze_after(&mut win, TEST_ARENA, 2);
     let mut fuel = 5_000_000u64;
     let (fr, fsnap) =
         run_capture_reserved_with_host(&parent, 0, &fargs, &mut fuel, &win, SIZE_LOG2, &mut fhost);
@@ -207,7 +207,7 @@ fn freeze_after_detached_child_joined_thaws_and_reloads_the_join_result() {
         "freeze-after-join returns a placeholder: {fr:?}"
     );
     assert_eq!(
-        read_state(&fsnap),
+        read_state(&fsnap, TEST_ARENA),
         STATE_UNWINDING,
         "the armed freeze landed (joined child does not refuse it)"
     );
@@ -230,7 +230,11 @@ fn freeze_after_detached_child_joined_thaws_and_reloads_the_join_result() {
         Ok(vec![Value::I64(4321 + 55)]),
         "thaw reproduces the total — the §14 join result reloaded, the child never re-ran"
     );
-    assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(
+        read_state(&tsnap, TEST_ARENA),
+        STATE_NORMAL,
+        "thaw back to NORMAL"
+    );
 }
 
 /// The bytecode engine's durable-capture entry must **decline** a §14 module (fall back to the
@@ -302,7 +306,7 @@ fn a_durable_freeze_is_never_killed_by_a_detached_child() {
     let mh = host.grant_module(&child_mod);
     let bh = host.grant_budget(-1, (1u64 << 17) as i64, -1); // one detached window
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING); // freeze from the start
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING); // freeze from the start
     let mut fuel = 50_000_000u64;
     let (r, _snap) = run_capture_reserved_with_host(
         &parent,

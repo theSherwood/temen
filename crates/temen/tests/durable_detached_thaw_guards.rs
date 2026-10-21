@@ -357,7 +357,7 @@ fn a_detached_child_its_parent_is_joining_rides_the_freeze() {
     for froze in [Interp, Jit] {
         let (mut fhost, args) = powerbox(&child);
         let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
-        arm_freeze_after(&mut win, 3);
+        arm_freeze_after(&mut win, ARENA, 3);
         let Some((o, fsnap)) = run(froze, &parent, &args, &win, &mut fhost) else {
             continue;
         };
