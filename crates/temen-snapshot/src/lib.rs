@@ -290,7 +290,10 @@ use temen_ir::Module;
 /// launch record and its own root-shaped artifact, bound to its parent's program, since a durable
 /// domain never execs. Elided when the domain forked none that lives, so such an artifact is
 /// byte-identical to v48 but for the version field.
-const FORMAT_VERSION: u16 = 49;
+/// v50 (#1681): `B_LIVE_IMPL` (7) names its callee by the callee's task id in the frozen run, where it
+/// named the callee's join slot in the holder's table. A task id names the callee from every domain
+/// the offer reaches: one it was re-granted into, or a fork twin's copy.
+const FORMAT_VERSION: u16 = 50;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -2458,9 +2461,9 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
         }
         DurableBinding::Instantiator => b.push(B_INSTANTIATOR),
         DurableBinding::FreezeAuthority => b.push(B_FREEZE_DETACHED),
-        DurableBinding::LiveImpl { slot, export } => {
+        DurableBinding::LiveImpl { task, export } => {
             b.push(B_LIVE_IMPL);
-            write_uleb(b, slot as u64);
+            write_uleb(b, task);
             write_uleb(b, export as u64);
         }
         DurableBinding::PipeEnd { pipe, write } => {
@@ -2520,7 +2523,7 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
         B_FREEZE_DETACHED => DurableBinding::FreezeAuthority,
         B_INSTANTIATOR => DurableBinding::Instantiator,
         B_LIVE_IMPL => DurableBinding::LiveImpl {
-            slot: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+            task: r.uleb()?,
             export: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
         },
         B_MODULE => DurableBinding::Module {

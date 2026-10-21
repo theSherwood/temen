@@ -2595,6 +2595,41 @@ impl ThawResidue {
     }
 }
 
+/// §13.4 slice 4d — a restored live impl awaiting its callee: its `live_impls` index, the callee's
+/// task id in the frozen run, and the offer export.
+type PendingLiveImpl = (u32, TaskId, u32);
+
+/// #1681 — what a thaw re-links its restored live impls with once it has seeded the whole tree: the
+/// detached children it re-launched, by the task id each had in the frozen run, and each domain's
+/// unlinked live impls. A live impl names its callee by task id, and a re-grant or a fork copies it
+/// into domains a long way from the callee's spawner, so no one domain's seeding can resolve its own.
+#[derive(Default)]
+struct ThawLinks {
+    /// A re-launched child's task id in the frozen run → its task id now, and its powerbox.
+    callees: BTreeMap<TaskId, (TaskId, Arc<Mutex<Host>>)>,
+    /// Each seeded domain's powerbox, with the live impls it restored unlinked.
+    holders: Vec<(Arc<Mutex<Host>>, Vec<PendingLiveImpl>)>,
+}
+
+impl ThawLinks {
+    /// Re-link each holder's live impls to the children they name, re-stamped with the children's
+    /// task ids now. One whose callee was not re-launched stays unlinked.
+    fn relink(self) {
+        let ThawLinks { callees, holders } = self;
+        for (holder, pending) in holders {
+            for (idx, task, export) in pending {
+                if let Some((now, callee)) = callees.get(&task) {
+                    // The shape first: the two powerbox locks are never held together.
+                    let shape = callee.lock_unpoisoned().offer_shape(export);
+                    holder
+                        .lock_unpoisoned()
+                        .relink_live_impl(idx, Arc::clone(callee), *now, shape);
+                }
+            }
+        }
+    }
+}
+
 /// Seed a domain's root vCPU for this run — its durable phase and shadow-SP extent — and re-create
 /// every vCPU its thaw residue names (fibers, spawned vCPUs, detached children), enqueueing all but
 /// the root, which the caller enqueues. `root` is the domain's root:
@@ -2685,9 +2720,6 @@ fn seed_domain(
     let mut vseed: Vec<FrozenVCpu> = thaw_vcpus;
     vseed.sort_by_key(|f| f.task);
     {
-        // The re-launched detached children's host Arcs by their `(spawner task, join slot)` edge,
-        // so the root's restored `LiveImpl` handles re-link to their callees (§13.4 slice 4d).
-        let mut child_hosts_by_edge: BTreeMap<(TaskId, usize), Arc<Mutex<Host>>> = BTreeMap::new();
         for ff in vseed {
             seed_thread(
                 s,
@@ -2744,10 +2776,11 @@ fn seed_domain(
                 },
                 None => continue, // not re-created ⇒ its own rewound join already fails closed
             };
-            let edge = (spawner.id, td.slot);
+            let task = td.launch.task as TaskId;
             if let Some(child) = relaunch_detached(s, sched, spawner, host_shared, td) {
-                // A detached child is a callee (#1901).
-                child_hosts_by_edge.insert(edge, Arc::clone(&child.host));
+                // A detached child is a callee (#1901), named by the task it was (#1681).
+                let callee = (child.id, Arc::clone(&child.host));
+                s.thaw_links.callees.insert(task, callee);
                 s.runnable.push_back(child);
             }
         }
@@ -2760,17 +2793,13 @@ fn seed_domain(
                 s.runnable.push_back(twin);
             }
         }
-        // §13.4 slice 4d: re-link the root's restored `LiveImpl` handles to their re-launched
-        // callees now that they exist — the root's rewound call then dispatches to the live callee
-        // exactly as before the freeze. A re-launched child re-links its own as the root of its
-        // window ([`relaunch_detached`] seeds it through this function).
+        // §13.4 slice 4d, #1681: this domain's restored `LiveImpl` handles wait for the whole tree,
+        // since one may name a child that any domain re-launches ([`ThawLinks`]).
         let pending = host_shared.lock_unpoisoned().take_pending_live_impls();
-        for (idx, cslot, export) in pending {
-            if let Some(chost) = child_hosts_by_edge.get(&(id, cslot)) {
-                host_shared
-                    .lock_unpoisoned()
-                    .relink_live_impl(idx, Arc::clone(chost), export);
-            }
+        if !pending.is_empty() {
+            s.thaw_links
+                .holders
+                .push((Arc::clone(host_shared), pending));
         }
         // Enqueue every re-created child, parents first (ascending cid).
         for (_, child) in children {
@@ -3398,6 +3427,7 @@ fn drive_over_cell(
             s.next_task = s.next_task.max(last + 1);
         }
         s.reserved_pids.clear();
+        std::mem::take(&mut s.thaw_links).relink();
         let (registry, arena) = (Arc::clone(&root.registry), root.arena());
         s.runnable.push_back(root);
         (id, registry, arena)
@@ -6601,6 +6631,9 @@ struct Sched {
     /// #1688 — while a thaw seeds the run, the pids its twins take back: no other task it re-creates
     /// may take one ([`mint_task`], [`claim_task`]).
     reserved_pids: BTreeSet<TaskId>,
+    /// #1681 — while a thaw seeds the run, what it re-links the restored live impls with once the
+    /// whole tree exists.
+    thaw_links: ThawLinks,
     /// FORK.md §8.6 — callers parked on a servicer-side `wait(-1)` / `waitpid(-pgid)` (reap **any**
     /// matching child), each tagged with its target: `None` = any of the caller's children,
     /// `Some(pgid)` = any child in that process group. Unlike `join_waiters` these are not keyed by a
@@ -15003,11 +15036,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     as u32;
                             let cap = resolve_thread(threads, ch).ok().and_then(|slot| {
                                 let callee = child_hosts.get(&slot).cloned()?;
+                                let task = threads[slot]?;
                                 let (names, sigs) = callee.lock_unpoisoned().offer_shape(export)?;
                                 let mut hg = host.lock_unpoisoned();
-                                // §13.4 4d: record the child's join `slot` — the live impl's
-                                // durable structural name, re-linked to the re-created child on thaw.
-                                Some(hg.wire_live_impl_child(&callee, export, &names, &sigs, slot))
+                                // §13.4 4d, #1681: record the child's task id — the live impl's
+                                // durable name, re-linked to the re-launched child on thaw.
+                                Some(hg.wire_live_impl_child(&callee, export, &names, &sigs, task))
                             });
                             frames[top]
                                 .vals
@@ -21473,12 +21507,13 @@ pub enum DurableBinding {
     /// authority over its thawed child that it held before the freeze — without this, a round trip
     /// would launder a domain's exposure away and `attest` would start lying.
     FreezeAuthority,
-    /// §13.4 slice 4d — a live-callee offer (`child_offer`) over a §14 child, named
-    /// **structurally** by the callee's join `slot` in the holder's own table + the offer
-    /// `export` (a `DomainId`/`Arc` is process-local and never rides the artifact). The thaw
-    /// re-links it to the re-created child at `slot` (its host + re-fetched offer shape).
+    /// §13.4 slice 4d, #1681 — a live-callee offer (`child_offer`) over a §14 child, minted by the
+    /// holder or re-granted or forked into it, named by the callee's **task id** in the frozen run
+    /// and the offer `export` (a `DomainId`/`Arc` is process-local and never rides the artifact).
+    /// The thaw re-links it to the child it re-launches from that task: its host, and the offer's
+    /// shape fetched again.
     LiveImpl {
-        slot: u32,
+        task: u64,
         export: u32,
     },
     /// §22 guest-JIT **domain** handle (DESIGN.md §22, DURABILITY.md §12.5 Slice 2). The domain's
@@ -23135,7 +23170,7 @@ pub fn read_slice(window: &[u8], off: u64, len: usize) -> Result<Vec<u8>, Trap> 
 /// ([`Host::into_cell`]: a JIT root that can mint the grant runs locked,
 /// `temen_run::jit_proc::locked`, and so does every JIT child and every domain of the cooperative
 /// bytecode driver). `exec_module` and every other admission see a negative handle and refuse it
-/// fail-closed through `can_regrant`, as does a spawner in no cell. Non-durable (`callee_slot: None`
+/// fail-closed through `can_regrant`, as does a spawner in no cell. Non-durable (`callee_task: None`
 /// — freeze refuses), the deferred durability story.
 pub const GRANT_SERVE_LIVE_TAG: u32 = 0x8000_0000;
 
@@ -23196,12 +23231,14 @@ struct LiveImplEntry {
     /// re-grant re-interns under the same `(names, sigs)` pair).
     names: Arc<[String]>,
     sigs: Arc<[FuncType]>,
-    /// DURABILITY.md §13.4 slice 4d — the callee's **join slot** in the minting domain (its
-    /// structural durable name: `child_hosts`/`threads` are keyed by it). `Some` for a
-    /// `child_offer` (op 14) mint over a §14 child — the only durably-capturable live impl,
-    /// since a thaw re-links it to the re-created child at this slot. `None` for a wire /
-    /// child-regrant mint (no §14 child behind it), which stays non-durable (freeze refuses).
-    callee_slot: Option<usize>,
+    /// DURABILITY.md §13.4 slice 4d, #1681 — the callee's durable name: the task id of the §14
+    /// child behind a `child_offer` (op 14) mint, as its spawner's join table holds it. A task id
+    /// is the run's, not a domain's, so it names the same callee from every powerbox the entry is
+    /// copied into: the minting domain, a child it re-grants the offer to, a fork twin. The thaw
+    /// re-links the entry to the child it re-launches under that id. `None` for an embedder wire, a
+    /// JIT mint or a self-serve grant, which have no §14 child behind them and stay non-durable
+    /// (freeze refuses), and for an entry whose callee did not ride a thaw.
+    callee_task: Option<TaskId>,
 }
 
 /// An instanced offer's **provider domain** (IMPORTS.md §3.2 v2): the persistent window (built
@@ -24173,12 +24210,12 @@ pub struct Host {
     handoff_trap: i64,
     /// §3.6 slice 3 — live-callee offer entries ([`Binding::LiveImpl`] indexes here).
     live_impls: Vec<LiveImplEntry>,
-    /// §13.4 slice 4d — restored `LiveImpl` handles awaiting **re-link** to their re-created §14
-    /// child: `(live_impls index, callee join slot, offer export)`. Populated by
-    /// [`Host::restore_durable_handles`] (the callee host doesn't exist yet at restore); drained
-    /// by the thaw's nested re-creation, which patches each entry's `callee`/`sigs` once the
-    /// child at `callee_slot` is built. Empty on any run that restored no durable live impls.
-    pending_live_impls: Vec<(u32, usize, u32)>,
+    /// §13.4 slice 4d — restored `LiveImpl` handles awaiting **re-link** to their re-launched §14
+    /// child ([`PendingLiveImpl`]). Populated by [`Host::restore_durable_handles`] (the callee host
+    /// doesn't exist yet at restore); drained
+    /// by the thaw's seeding, which patches each entry once every domain is re-launched
+    /// ([`ThawLinks`]). Empty on any run that restored no durable live impls.
+    pending_live_impls: Vec<PendingLiveImpl>,
     /// #2054 — restored stdio streams its spawner had re-granted, `(slot, role)`: re-pinned by
     /// [`Host::restore_durable_handles`] on this domain's own buffer until the relaunch aliases each
     /// to the spawner's cell ([`Host::prepare_detached_relaunch`]).
@@ -27171,19 +27208,16 @@ impl Host {
                 },
                 Binding::Offer(_) => return Err(self.non_durable(slot, NonDurableKind::Offer)),
                 Binding::LiveImpl(idx) => {
-                    // §13.4 slice 4d: a `child_offer` mint over a §14 child (a recorded join
-                    // slot) is durably capturable — named structurally so the thaw re-links it.
-                    // A wire / child-regrant mint (no §14 child behind it) stays non-durable.
-                    match self
-                        .live_impls
-                        .get(idx as usize)
-                        .and_then(|e| e.callee_slot)
-                    {
-                        Some(cslot) => DurableBinding::LiveImpl {
-                            slot: cslot as u32,
-                            export: self.live_impls[idx as usize].export,
-                        },
-                        None => return Err(self.non_durable(slot, NonDurableKind::LiveImpl)),
+                    // §13.4 slice 4d, #1681: a live impl over a §14 child, minted here or copied in,
+                    // is named by the child's task id, which the thaw re-links it by. Any other
+                    // stays non-durable.
+                    match self.live_impls.get(idx as usize) {
+                        Some(&LiveImplEntry {
+                            callee_task: Some(task),
+                            export,
+                            ..
+                        }) => DurableBinding::LiveImpl { task, export },
+                        _ => return Err(self.non_durable(slot, NonDurableKind::LiveImpl)),
                     }
                 }
                 // #1502, #1944: a Budget names its node; the nodes ride beside the handles
@@ -27307,21 +27341,21 @@ impl Host {
                 DurableBinding::AddressSpace { base, size } => Binding::AddressSpace { base, size },
                 DurableBinding::Instantiator => Binding::Instantiator,
                 DurableBinding::FreezeAuthority => Binding::FreezeAuthority,
-                DurableBinding::LiveImpl { slot, export } => {
+                DurableBinding::LiveImpl { task, export } => {
                     // §13.4 slice 4d: install a placeholder entry (its `callee`/`sigs` are
-                    // patched once the §14 child at `slot` is re-created — see
+                    // patched once the §14 child that was task `task` is re-launched — see
                     // [`Host::take_pending_live_impls`]) and record the pending re-link. The
-                    // placeholder is never dispatched to: the thaw patches it before the holder
-                    // re-enters guest code.
+                    // thaw patches it before the holder re-enters guest code. Unlinked, it names
+                    // no callee, so a later freeze refuses it.
                     let idx = self.live_impls.len() as u32;
                     self.live_impls.push(LiveImplEntry {
                         callee: Arc::new(Mutex::new(Host::new())),
                         export,
                         names: Vec::<String>::new().into(),
                         sigs: Vec::<FuncType>::new().into(),
-                        callee_slot: Some(slot as usize),
+                        callee_task: None,
                     });
-                    self.pending_live_impls.push((idx, slot as usize, export));
+                    self.pending_live_impls.push((idx, task, export));
                     Binding::LiveImpl(idx)
                 }
                 // Slice 2: re-pin the guest-JIT handle at its captured index. The domain's units are
@@ -27972,22 +28006,29 @@ impl Host {
         Ok(())
     }
 
-    /// §13.4 slice 4d — take the restored-but-unlinked live impls (`(index, callee slot,
-    /// export)`), for the thaw to patch once the §14 children exist. Cleared on take.
-    pub fn take_pending_live_impls(&mut self) -> Vec<(u32, usize, u32)> {
+    /// §13.4 slice 4d — take the restored-but-unlinked live impls, for the thaw to patch once the
+    /// §14 children exist. Cleared on take.
+    fn take_pending_live_impls(&mut self) -> Vec<PendingLiveImpl> {
         std::mem::take(&mut self.pending_live_impls)
     }
 
-    /// §13.4 slice 4d — patch a restored live impl (index `idx`) to point at its re-created §14
-    /// child `callee`, re-fetching the offer's shape from the child's registered module (the
-    /// structural `type_id` was already reinstated at restore, so the handle keeps resolving).
-    /// A missing offer leaves the placeholder (the holder's re-issued call then faults probeably).
-    pub fn relink_live_impl(&mut self, idx: u32, callee: Arc<Mutex<Host>>, export: u32) {
-        let shape = callee.lock_unpoisoned().offer_shape(export);
+    /// §13.4 slice 4d — patch a restored live impl (index `idx`) to point at its re-launched §14
+    /// child `callee`, now task `task`, given the offer's shape the child's module answers for
+    /// `export` (the structural `type_id` was already reinstated at restore, so the handle keeps
+    /// resolving). A missing offer leaves the placeholder: the holder's re-issued call then answers
+    /// `-EAGAIN`, and a later freeze refuses it.
+    fn relink_live_impl(
+        &mut self,
+        idx: u32,
+        callee: Arc<Mutex<Host>>,
+        task: TaskId,
+        shape: Option<(Vec<String>, Vec<FuncType>)>,
+    ) {
         if let (Some(e), Some((names, sigs))) = (self.live_impls.get_mut(idx as usize), shape) {
             e.callee = callee;
             e.names = names.into();
             e.sigs = sigs.into();
+            e.callee_task = Some(task);
         }
     }
 
@@ -29658,7 +29699,7 @@ impl Host {
     /// before this table is touched — the two powerbox locks are never held together), then
     /// install the live-impl entry and grant the handle. `None` on any miss (no `self_module`,
     /// bad export, unknown interface) — the caller answers the op-14 probeable `-EINVAL`.
-    /// `callee_slot: None`: not an interp §14 join slot, so non-durable (freeze refuses, the
+    /// `callee_task: None`: not an interp §14 child, so non-durable (freeze refuses, the
     /// [`Host::wire_live_impl`] rule).
     pub fn mint_child_offer(&mut self, callee: &Arc<Mutex<Host>>, export: u32) -> Option<i32> {
         let (names, sigs) = callee.lock_unpoisoned().offer_shape(export)?;
@@ -29666,22 +29707,22 @@ impl Host {
     }
 
     /// §13.4 slice 4d — `child_offer` (op 14) mint over a §14 child: like [`Self::wire_live_impl`]
-    /// but records the callee's **join slot** so the live impl is durably capturable (a thaw
-    /// re-links it to the re-created child at this slot).
+    /// but records the callee's **task id** so the live impl is durably capturable (a thaw
+    /// re-links it to the child it re-launches under that id).
     fn wire_live_impl_child(
         &mut self,
         callee: &Arc<Mutex<Host>>,
         export: u32,
         names: &[String],
         sigs: &[FuncType],
-        callee_slot: usize,
+        callee_task: TaskId,
     ) -> i32 {
         self.install_live_impl(
             Arc::clone(callee),
             export,
             names.into(),
             sigs.into(),
-            Some(callee_slot),
+            Some(callee_task),
         )
     }
 
@@ -29694,7 +29735,7 @@ impl Host {
         export: u32,
         names: Arc<[String]>,
         sigs: Arc<[FuncType]>,
-        callee_slot: Option<usize>,
+        callee_task: Option<TaskId>,
     ) -> i32 {
         let type_id = self.intern_interface(&names, &sigs);
         let idx = self.live_impls.len() as u32;
@@ -29703,7 +29744,7 @@ impl Host {
             export,
             names,
             sigs,
-            callee_slot,
+            callee_task,
         });
         self.grant(type_id, Binding::LiveImpl(idx))
     }
@@ -31334,7 +31375,7 @@ impl Host {
     /// callee is this domain's own running cell `cell`, over its impl-export. The child's calls
     /// enqueue on this domain's inbound queue and park until its `svc.wait` serve loop replies. Only
     /// the child's table holds the entry (granter → grantee, down the grant graph), so the granter
-    /// never holds a self-referential `Arc`: no cycle, nothing for it to mis-call. `callee_slot:
+    /// never holds a self-referential `Arc`: no cycle, nothing for it to mis-call. `callee_task:
     /// None` — non-durable (freeze refuses), the deferred durability story (#1681).
     fn grant_into_child(
         &mut self,
@@ -31475,10 +31516,9 @@ impl Host {
                 Arc::clone(&e.names),
                 Arc::clone(&e.sigs),
             );
-            // The callee's join slot is the *parent's* structural name, meaningless in the
-            // child's namespace — a re-granted live impl stays non-durable (§13.4 4d follow-up:
-            // a re-grant's durable name would be the sibling's provenance path).
-            return Some(child.install_live_impl(callee, export, names, sigs, None));
+            // #1681 — the callee's task id names it from the child's powerbox too, so a re-granted
+            // live impl is as durable as the one it copies.
+            return Some(child.install_live_impl(callee, export, names, sigs, e.callee_task));
         }
         // Concurrent stages (STAGE1.md item 6): re-granting a §13 `SharedRegion` aliases the
         // SAME backing into the child's powerbox — the explicit parent↔child / sibling↔sibling

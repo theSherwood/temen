@@ -2969,7 +2969,7 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
 > the nested variant of 4c-bis, and the 4d / nested-holder `LiveImpl` re-link by join slot) rode the
 > carve path, deleted in #1867 (INVARIANTS #13, 2026-09-29). A detached child's serve trio rides its
 > own root-shaped artifact (§4, v29), and the thaw re-links a restored `LiveImpl` to its re-launched
-> detached callee by the spawner's join slot (`Host::relink_live_impl`, the thaw's re-launch pass).
+> detached callee by the callee's task id (v50, #1681; by the spawner's join slot before).
 
 1. **Stable domain keys** (13.3) — behavior-neutral, unblocks everything.
    **BUILT 2026-07-24:** `Host::domain_id` (process-unique, minted at construction from a
@@ -3225,6 +3225,24 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
      `fwd(7) → C1 forwards leaf(7)` through the re-linked grandchild cap → **107** (fails with
      `-11`/`EAGAIN` without the generalization). **Still open:** the wire/child-regrant
      **sibling-provenance** durable name (a live cap with no §14 child behind it).
+   * **Re-granted live caps — BUILT (v50, #1681).** A live impl names its callee by the callee's
+     **task id**, the id its spawner's join table holds, not by a join slot in the holder's table.
+     Task ids are the run's, so one id names the callee from every powerbox the entry reaches: the
+     domain that minted it (op 14 records `threads[slot]`), a child it re-grants the offer into
+     (`regrant_into_child`, at a spawn or by op 19), and a fork twin's copy. `B_LIVE_IMPL` carries
+     the id. The thaw collects every re-launched detached child under its frozen task id, and every
+     domain's restored live impls, and re-links them all in one pass once the whole tree is seeded
+     (`ThawLinks`): an offer may name a child that a domain far from it re-launches. Each re-linked
+     entry takes its callee's new id, so a re-freeze names the current run; one whose callee did not
+     ride stays unlinked, and a later freeze refuses it rather than bind it to whatever task takes
+     that id next. The per-domain re-link this replaces looked an edge up under `(root id, slot)`, so
+     an offer a *thread* minted over its own child could bind to the root's child at that slot.
+     Pinned by `temen-snapshot/tests/roundtrip.rs`'s
+     `a_regranted_live_cap_rides_the_freeze_and_thaws_relinked` (a manager re-grants its offer to a
+     guest, which rides holding it) and `a_live_cap_a_thread_mints_thaws_onto_its_own_child` (which
+     deadlocked before). **Still open (#1681):** an embedder wire, the JIT's `mint_child_offer`, a
+     self-serve grant (`GRANT_SERVE_LIVE_TAG`) and a wired `Offer` name no §14 child, and stay
+     non-durable.
    * **In-cut parked callers (the ticket question, step-5-adjacent):** a caller parked in
      `CapReply` rewound its frame, so thaw re-execution would *re-issue* the call — a
      double dispatch when the original survives in the callee's restored queue. Two options

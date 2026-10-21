@@ -1488,6 +1488,321 @@ fn a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked() {
     );
 }
 
+/// #1681 — a live cap a manager **re-grants** rides the freeze in the child it was granted to. The
+/// manager (func 0) spawns a server `S` (func 1, which serves until its clients are gone and returns
+/// how many calls it served), mints a `child_offer` over its `bump` export, and spawns a guest `G`
+/// (func 3) granted that offer as `"svc"`. `G` calls `bump(41)` through it. The manager polls `G`
+/// in a loop, where its back-edge countdown fires, then joins both: `served·1000 + reply`, `1042`.
+///
+/// One lane runs the freeze run, so the countdown fires before either child runs; each unwinds at
+/// its first suspend point, `G` holding the re-granted offer. The offer names `S` by its task id, so
+/// `G`'s powerbox captures it, and the thaw re-links it to the re-launched `S`. Before #1681 a
+/// re-grant named no callee, and the freeze refused `G`'s powerbox.
+const SRC_REGRANTED_OFFER: &str = r#"
+memory 18
+type 0 func (i64) -> (i64)
+type 1 interface { bump: 0 }
+export 0 interface "counter" 1 { bump: 2 }
+data 66048 "svc"
+func (i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vsi: i32, vgi: i32, vb: i32) {
+  ; S's spawn record at 65536: its image's declared window, no pager or pre-mapped region
+  qs = i64.const 65536
+  qsv = i64.const -4294967296
+  i64.store qs qsv
+  i32.store qs vsi offset=8
+  i32.store qs vb offset=12
+  qneg = i64.const 4294967295
+  i64.store qs qneg offset=48
+  vs = call.cap 6 17 (i64) -> (i32) v0 (qs)
+  vz = i64.const 0
+  vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz)
+  ; G's grant list at 66000: "svc" -> the offer
+  ql = i64.const 66000
+  vnp = i32.const 66048
+  i32.store ql vnp
+  vthree = i32.const 3
+  i32.store ql vthree offset=4
+  i32.store ql vcap offset=8
+  ; G's spawn record at 65600, granted that list
+  qg = i64.const 65600
+  i64.store qg qsv
+  i32.store qg vgi offset=8
+  i32.store qg vb offset=12
+  i64.store qg ql offset=16
+  vone = i64.const 1
+  i64.store qg vone offset=24
+  i64.store qg qneg offset=48
+  vg = call.cap 6 17 (i64) -> (i32) v0 (qg)
+  br 1(v0, vs, vg, vz)
+}
+block 1 (vi0: i32, vs1: i32, vg1: i32, vi: i64) {
+  vpoll = call.cap 6 9 (i32) -> (i32) vi0 (vg1)
+  vone1 = i64.const 1
+  vi2 = i64.add vi vone1
+  vlim = i64.const 32
+  vmore = i64.ne vi2 vlim
+  br_if vmore 1(vi0, vs1, vg1, vi2) 2(vi0, vs1, vg1)
+}
+block 2 (vi3: i32, vs2: i32, vg2: i32) {
+  vg_st, vgr = call.cap 6 1 (i32) -> (i64, i64) vi3 (vg2)
+  vs_st, vsn = call.cap 6 1 (i32) -> (i64, i64) vi3 (vs2)
+  vk = i64.const 1000
+  vm = i64.mul vsn vk
+  vres = i64.add vm vgr
+  return vres
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vt: i64) {
+  vz32 = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vz32 ()
+  vt2 = i64.add vt vn
+  vzero = i64.const 0
+  vdone = i64.eq vn vzero
+  br_if vdone 2(vt2) 1(vt2)
+}
+block 2 (vr: i64) {
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vone = i64.const 1
+  vr = i64.add vx vone
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vp = i64.const 66048
+  vl = i64.const 3
+  vh = self.resolve vp vl
+  vx = i64.const 41
+  vr = call.cap 268435456 0 (i64) -> (i64) vh (vx)
+  return vr
+  }
+}
+"#;
+
+/// `src` instrumented confined, and its child images of `funcs`, each instrumented in turn so its
+/// bootstrap is too (#2245).
+fn with_images(src: &str, funcs: &[u32]) -> (std::sync::Arc<Module>, Vec<Module>) {
+    let mut m = temen_text::parse_module(src).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
+    });
+    let inst = std::sync::Arc::new(transform_module_assume_confined(&m).expect("transform"));
+    temen_verify::verify_module(&inst).expect("verify");
+    let images = funcs
+        .iter()
+        .map(|&f| {
+            let image = temen_ir::child_image_at(&m, f).expect("child image");
+            let image = transform_module_assume_confined(&image).expect("transform the image");
+            temen_verify::verify_module(&image).expect("verify the image");
+            image
+        })
+        .collect();
+    (inst, images)
+}
+
+/// A durable host granting the instantiator, each of `images` and a budget, in that order (the
+/// root's arguments), plus freeze authority over detached progeny. One lane when `one_lane`.
+fn durable_spawner(images: &[Module], one_lane: bool) -> (Host, Vec<Value>) {
+    let mut h = Host::new();
+    h.set_durable(true);
+    if one_lane {
+        h.set_lane_cap(1);
+    }
+    let mut args = vec![Value::I32(h.grant_instantiator())];
+    args.extend(images.iter().map(|m| Value::I32(h.grant_durable_module(m))));
+    args.push(Value::I32(h.grant_budget(-1, 1 << 20, -1)));
+    h.grant_freeze_authority();
+    (h, args)
+}
+
+/// Run `inst` uninterrupted, then frozen by a back-edge countdown at 16 on one lane, through the
+/// codec into a fresh host, and thawed: what each answers, and how many detached children rode.
+fn freeze_thaw_spawner(inst: &Module, images: &[Module]) -> (Vec<Value>, Vec<Value>, usize) {
+    use temen_durable::arm_freeze_after_backedges;
+
+    let (mut h, args) = durable_spawner(images, false);
+    let mut fuel = 5_000_000u64;
+    let win = init_durable_window(WINDOW, TEST_ARENA);
+    let (r, _) = run_capture_reserved_with_host(inst, 0, &args, &mut fuel, &win, SIZE_LOG2, &mut h);
+    let whole = r.expect("the uninterrupted run");
+
+    let (mut h, args) = durable_spawner(images, true);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    arm_freeze_after_backedges(&mut win, TEST_ARENA, 16);
+    let mut fuel = 5_000_000u64;
+    let (r, snap) =
+        run_capture_reserved_with_host(inst, 0, &args, &mut fuel, &win, SIZE_LOG2, &mut h);
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(0)]),
+        "the root unwinds for the freeze"
+    );
+    assert_eq!(h.take_freeze_declined(), None, "the freeze is not declined");
+    let rode = h.captured_detached().len();
+    let art = freeze(inst, &snap, &h).expect("freeze");
+
+    let (mut th, args) = durable_spawner(images, false);
+    let mut back = restore(&art, inst, &mut th).expect("restore");
+    begin_thaw(&mut back, TEST_ARENA, 0);
+    let mut fuel = 5_000_000u64;
+    let (r, _) =
+        run_capture_reserved_with_host(inst, 0, &args, &mut fuel, &back, SIZE_LOG2, &mut th);
+    (whole, r.expect("the thawed run"), rode)
+}
+
+#[test]
+fn a_regranted_live_cap_rides_the_freeze_and_thaws_relinked() {
+    let (inst, images) = with_images(SRC_REGRANTED_OFFER, &[1, 3]);
+    let (whole, thawed, rode) = freeze_thaw_spawner(&inst, &images);
+    assert_eq!(
+        whole,
+        vec![Value::I64(1042)],
+        "uninterrupted: S served G's one call"
+    );
+    assert_eq!(rode, 2, "S and G both ride, G holding the re-granted offer");
+    assert_eq!(
+        thawed,
+        vec![Value::I64(1042)],
+        "the thawed G's call reaches the re-launched S through the re-linked offer"
+    );
+}
+
+/// #1681 — a live cap a **thread** mints over its own detached child is re-linked to that child,
+/// not to the child its domain's root holds at the same join slot. The root (func 0) spawns `A`
+/// (func 1) at its join slot 0, mints an offer over it, and starts thread `T` (func 4), which spawns
+/// `B` (func 3) at *its* join slot 0, mints an offer over `B`, polls `B` in a loop, where its
+/// back-edge countdown fires, and calls `bump(41)` through its offer. Each child serves one call:
+/// `bump` adds the child's own word, `1` in `A`, `2` in `B`. The root then calls `bump(0)` on `A`
+/// and answers `T's reply · 1000 + A's`: `43001`.
+///
+/// One lane runs the freeze run: the root parks in its join on `T`, `A` parks serving, and `T`'s
+/// countdown fires before `B` runs. The thaw used to re-link each offer by its join slot under the
+/// root's id, so `T`'s offer found `A`. Named by task id, it finds `B`.
+const SRC_THREAD_MINTED_OFFER: &str = r#"
+memory 18
+type 0 func (i64) -> (i64)
+type 1 interface { bump: 0 }
+export 0 interface "counter" 1 { bump: 2 }
+func (i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vai: i32, vbi: i32, vb: i32) {
+  ; A's spawn record at 65536: its image's declared window, no pager or pre-mapped region
+  qa = i64.const 65536
+  qsv = i64.const -4294967296
+  i64.store qa qsv
+  i32.store qa vai offset=8
+  i32.store qa vb offset=12
+  qneg = i64.const 4294967295
+  i64.store qa qneg offset=48
+  va = call.cap 6 17 (i64) -> (i32) v0 (qa)
+  vz = i64.const 0
+  vcapa = call.cap 6 14 (i32, i64) -> (i32) v0 (va, vz)
+  ; what T spawns B with, at 70100: the instantiator, B's image, the budget
+  pt = i64.const 70100
+  i32.store pt v0
+  i32.store pt vbi offset=4
+  i32.store pt vb offset=8
+  vt = thread.spawn 4 vz vz
+  vtr = thread.join vt
+  vx = i64.const 0
+  vra = call.cap 268435456 0 (i64) -> (i64) vcapa (vx)
+  va_st, va_n = call.cap 6 1 (i32) -> (i64, i64) v0 (va)
+  vk = i64.const 1000
+  vm = i64.mul vtr vk
+  vres = i64.add vm vra
+  return vres
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  pw = i64.const 70000
+  vw = i64.const 1
+  i64.store pw vw
+  vz32 = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vz32 ()
+  return vn
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  pw = i64.const 70000
+  vw = i64.load pw
+  vr = i64.add vx vw
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  pw = i64.const 70000
+  vw = i64.const 2
+  i64.store pw vw
+  vz32 = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vz32 ()
+  return vn
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  pt = i64.const 70100
+  vi = i32.load pt
+  vbi = i32.load pt offset=4
+  vbb = i32.load pt offset=8
+  qb = i64.const 66560
+  qsv = i64.const -4294967296
+  i64.store qb qsv
+  i32.store qb vbi offset=8
+  i32.store qb vbb offset=12
+  qneg = i64.const 4294967295
+  i64.store qb qneg offset=48
+  vbh = call.cap 6 17 (i64) -> (i32) vi (qb)
+  vz = i64.const 0
+  vcap = call.cap 6 14 (i32, i64) -> (i32) vi (vbh, vz)
+  br 1(vi, vbh, vcap, vz)
+}
+block 1 (vi1: i32, vb1: i32, vc1: i32, vk: i64) {
+  vpoll = call.cap 6 9 (i32) -> (i32) vi1 (vb1)
+  vone = i64.const 1
+  vk2 = i64.add vk vone
+  vlim = i64.const 32
+  vmore = i64.ne vk2 vlim
+  br_if vmore 1(vi1, vb1, vc1, vk2) 2(vi1, vb1, vc1)
+}
+block 2 (vi2: i32, vb2: i32, vc2: i32) {
+  vx = i64.const 41
+  vr = call.cap 268435456 0 (i64) -> (i64) vc2 (vx)
+  vb_st, vb_n = call.cap 6 1 (i32) -> (i64, i64) vi2 (vb2)
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn a_live_cap_a_thread_mints_thaws_onto_its_own_child() {
+    let (inst, images) = with_images(SRC_THREAD_MINTED_OFFER, &[1, 3]);
+    let (whole, thawed, rode) = freeze_thaw_spawner(&inst, &images);
+    assert_eq!(
+        whole,
+        vec![Value::I64(43001)],
+        "uninterrupted: B answers T, A the root"
+    );
+    assert_eq!(rode, 2, "A and B both ride");
+    assert_eq!(
+        thawed,
+        vec![Value::I64(43001)],
+        "T's re-linked offer reaches B, not the root's child at the same join slot"
+    );
+}
+
 // ---- #1455: named host capabilities through the real artifact -------------------------------
 //
 // Before this, a live `HostProc` refused the freeze outright — so a playground reactor, or any other
