@@ -8398,6 +8398,68 @@ fn build_fiber_call_trampoline(module: &mut JITModule, clif: &mut Function) {
     b.finalize();
 }
 
+/// #2537 — per-value stride of the setjmp save area. 16 bytes so one slot holds any scalar *or* a
+/// `v128` (SIMD) crossing value; a scalar uses the low bytes. setjmp is rare, so the slack is free.
+const SETJMP_SAVE_STRIDE: usize = 16;
+
+/// #2537 — save the guest values **live across a `setjmp`** to a reuse-immune explicit stackslot,
+/// returning the slot and the `(value-index, type)` list to reload after the call (or `None` when
+/// nothing crosses). The caller stores before the libc `_setjmp` call and reloads after it.
+///
+/// Why this is needed. `_setjmp` lowers to an ordinary CLIF `call`, and neither Cranelift nor
+/// regalloc2 has a returns-twice concept. A value live across the call gets a spill slot; the
+/// first-return (`longjmp`) path, which the explicit CFG shows dead-ending in `_longjmp` +
+/// `unreachable`, is free to reuse that slot. But `_longjmp` re-enters the setjmp frame — a hidden
+/// edge back to just after `_setjmp` — restoring callee-saved registers and `rsp` yet **not** the
+/// frame's spill slots, so re-entry would reload data the longjmp path clobbered (#2537: a verified
+/// module miscompiled, and — via an elided bounds check over a clobbered index — an I1/I2 escape).
+/// An **explicit** stackslot is never reused by regalloc and no guest op writes it, so it holds the
+/// pre-`setjmp` value on both returns.
+///
+/// The set saved is exactly the IR values referenced at or after the `setjmp` (the rest of this
+/// block's insts and its terminator's edge args) that were defined before it. The terminator's edge
+/// args are the load-bearing case: a value forwarded to a successor block crosses the `setjmp`, and
+/// the IR still carries it as an edge arg even where the CLIF lowering drops it (#2448). `ubs` is
+/// deliberately left untouched — a laundered value keeps its IR identity and proven bound, so an
+/// elided access reads the reuse-immune copy and cannot be driven out of window by a clobbered
+/// reload.
+fn launder_across_setjmp(
+    b: &mut FunctionBuilder,
+    blk: &Block,
+    inst_idx: usize,
+    vals: &[Value],
+) -> Option<(cranelift_codegen::ir::StackSlot, Vec<(usize, Type)>)> {
+    let defined = vals.len();
+    let mut live = std::collections::BTreeSet::new();
+    let mut note = |v: &u32| {
+        let i = *v as usize;
+        if i < defined {
+            live.insert(i);
+        }
+    };
+    for inst in &blk.insts[inst_idx + 1..] {
+        inst.for_each_operand(&mut note);
+    }
+    blk.term.for_each_operand(&mut note);
+    if live.is_empty() {
+        return None;
+    }
+    let saved: Vec<(usize, Type)> = live
+        .into_iter()
+        .map(|i| (i, b.func.dfg.value_type(vals[i])))
+        .collect();
+    let save = b.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        (saved.len() * SETJMP_SAVE_STRIDE) as u32,
+        4, // align 2^4 = 16, so a v128 slot is aligned
+    ));
+    for (k, &(i, _)) in saved.iter().enumerate() {
+        b.ins()
+            .stack_store(vals[i], save, (k * SETJMP_SAVE_STRIDE) as i32);
+    }
+    Some((save, saved))
+}
+
 /// Lower one IR block's body + terminator into its CLIF block.
 fn lower_block(
     module: &mut JITModule,
@@ -8751,13 +8813,29 @@ fn lower_block(
         // trap-propagate.
         if let Inst::SetJmp { buf } = inst {
             let bufv = get(&vals, *buf)?; // i64 guest jmp_buf window address (the table key)
-                                          // slot = rt_setjmp_slot(rt_addr, buf) -> *mut jmp_buf
+                                          // #2537: save every guest value live across this setjmp to a
+                                          // reuse-immune explicit stackslot *before* the call; reloaded
+                                          // after it, so both returns (direct and via longjmp) read the
+                                          // saved copy, not a spill slot the longjmp path may clobber.
+            let laundered = launder_across_setjmp(b, blk, inst_idx, &vals);
+            // slot = rt_setjmp_slot(rt_addr, buf) -> *mut jmp_buf
             let rt_addr = vmctx_load(b, lower, vmctx::SETJMP);
             let c1 = call_host(module, b, HostFn::SetjmpSlot, &[rt_addr, bufv])?;
             let slot = b.inst_results(c1)[0];
             // r = _setjmp(slot) -> i32 — emitted inline in this JIT frame.
             let c2 = call_host(module, b, HostFn::Setjmp, &[slot])?;
-            vals.push(b.inst_results(c2)[0]);
+            let r = b.inst_results(c2)[0];
+            // #2537: reload the saved values and rewrite the value map to the reloaded copies, so every
+            // later use in this block — and every successor's forwarded use (which reads this block's
+            // final value map, #2448) — sources the value from the reuse-immune slot.
+            if let Some((save, saved)) = laundered {
+                for (k, &(i, ty)) in saved.iter().enumerate() {
+                    vals[i] = b
+                        .ins()
+                        .stack_load(ty, save, (k * SETJMP_SAVE_STRIDE) as i32);
+                }
+            }
+            vals.push(r);
             continue;
         }
         // `longjmp` (LLVM.md §"JIT `longjmp`"): look up the host `jmp_buf` slot for this `buf` (set by a
