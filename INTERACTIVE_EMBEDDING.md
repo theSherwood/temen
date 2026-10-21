@@ -21,7 +21,7 @@ prospective interactive embedder (c_interpret) that the W1–W6 scope does not y
 | **W1** interactive debug on the bytecode engine (browser) | **Built** — DAP-over-wasm (`temen_dap_*` cdylib exports, `web/dap.js`, `browser-dap-test.mjs` gates CI); incl. step-back / reverse time-travel, watchpoints, multithreaded debug | `DEBUGGING.md` browser slices |
 | **W2** machine-state view | **Partial** — named locals/frames read back over DAP; the finite-register-file *mode* (v2) unbuilt | `temen-dap`, `DEBUGGING.md` |
 | **W3** memory-access scoring | **Substrate built** (`Instance::with_mem_hooks`, the `temen-opt` instrumentation pass, C ABI `temen_instance_with_mem_hooks`, 3-backend parity gate); **not** wired into the browser cdylib | `HOOKS.md` |
-| **W4** blocking-input suspend/resume | **Built 2026-07-30** — the engine seam (`VcpuEvent::StdinPark`, `temen_pg_*` console path), `CapTape` replay, **and the debug-session verb**: a `blockStdin` launch flag parks an exhausted `read` as a `stopped` event (reason `"stdin"`, no clock advance), the custom `provideStdin` request appends bytes and a resume re-issues the read, and a reverse `seek` replays provided inputs from the tape with **no re-park**. Fail-closed launch gate (bytecode + powerbox + single-vCPU only); parked placeholder reads never tape. Gated by `browser/tests/chibicc_debug.rs` (round-trip + replay + inertness pin) and `dap_bytecode.rs` (gate) | `bytecode.rs` `DebugRun`, `temen-dap`, this doc |
+| **W4** blocking-input suspend/resume | **Built 2026-07-30** — the engine seam (`Outcome::StdinPark`, which the pump's suspend/resume session reports as `CoopEvent::Idle`; the `temen_pg_*` console path), `CapTape` replay, **and the debug-session verb**: a `blockStdin` launch flag parks an exhausted `read` as a `stopped` event (reason `"stdin"`, no clock advance), the custom `provideStdin` request appends bytes and a resume re-issues the read, and a reverse `seek` replays provided inputs from the tape with **no re-park**. Fail-closed launch gate (bytecode + powerbox + single-vCPU only); parked placeholder reads never tape. Gated by `browser/tests/chibicc_debug.rs` (round-trip + replay + inertness pin) and `dap_bytecode.rs` (gate) | `bytecode.rs` `DebugRun`, `temen-dap`, this doc |
 | **W5** in-browser C→module compile | **Built** — chibicc compiles C client-side today (`chibicc.temen` asset + `temen_run_onramp_fs` + `temen_parse`) | `SELFHOST_C.md`, `TODO.md`, `BROWSER.md` |
 | **W6** small host/tooling items | **Mostly remaining** — only the *native* seeded scheduler (`attach_scheduled_seeded`) exists; the four browser/tooling items (seed-via-ABI, `display` frame-query, memory-map JSON, compile metrics) are unbuilt | mixed |
 | **—** consumer-surfaced needs not yet scoped | **Not scoped** — telemetry stream, cache-coherence view, adversarial+replayable scheduling, paging counters, state writes, sem/barrier libc | new section below |
@@ -60,7 +60,7 @@ escape; the interpreter tier is the debug engine.
 | Bytecode values inspectable: stable, unique slot per SSA value (`regs[base + i]`, typed by `func_value_types`; no reuse/coalescing), parity-proven vs the tree-walker | Built | `DEBUGGING.md` §1b G2, `crates/temen/tests/debug_parity.rs` |
 | Single-op stepping bit-identical to run-to-completion (`budget = 1`) | Built | `bytecode.rs:1391/:2997` |
 | Deterministic, self-contained browser `Host` (streams accumulate, stdin is a buffer, `Clock` is a counter) | Built | `BROWSER.md` § Decisions |
-| Host-serviced vCPU events (spill frame → host services → `deliver_*` resumes) | Built (pattern) | `bytecode.rs:1842ff` (`VcpuEvent`, tier-up path) |
+| Host-serviced vCPU events (spill frame → host services → `deliver_*` resumes) | Built (pattern) | `bytecode.rs` (`CoopEvent`, tier-up path) |
 | Cooperative multi-vCPU `drive` + deterministic timeout selection | Built | `bytecode.rs:4623` |
 | Memory-access instrumentation pass (observe/veto every guest memory op, zero-cost-when-off, all backends) | Built natively | `HOOKS.md`, `Instance::with_mem_hooks` (`crates/temen-run/src/lib.rs:4110`) |
 | Source-level debug info waist (`debug.loc`/`debug.var`/types), chibicc `-g` | Built | `temen-ir` `DebugInfo`, W4 in `DEBUGGING.md` |
@@ -181,8 +181,8 @@ ordering, and browser counters match the native run of the same hook stream.
 ## W4 — Blocking-input suspend/resume
 
 > **Status (2026-07-28): PARTIAL — the suspend/resume seam shipped, in the browser.** A `read` on
-> an exhausted stdin buffer suspends the vCPU instead of returning EOF, via `VcpuEvent::StdinPark`
-> (`crates/temen-interp/src/bytecode.rs`), with `Vcpu::set_stdin_blocking` / `push_stdin` to arm and
+> an exhausted stdin buffer suspends the reader instead of returning EOF (`Outcome::StdinPark` in
+> `crates/temen-interp/src/bytecode.rs`), with `Host::set_stdin_blocking` / `push_stdin` to arm and
 > resume. It is wired into the browser cdylib as the console path: `temen_pg_open` boots a guest
 > suspended at the first stdin read, `pg_pump` returns on the park, and the query entry pushes bytes
 > and resumes (`browser/src/lib.rs`). Since #1414 S4-2 the console runs on the pump's suspend/resume

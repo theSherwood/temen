@@ -533,7 +533,7 @@ program with `-g`:
 so the engine keeps it in one slot that the C and self-host cards share (`ProgramCache`, the bash
 card's cache generalized). It decodes and verifies the compiler on the first Run, compiles its
 bytecode program on the first interpreter Run, and emits it for the wasm-JIT on the first wasm-JIT Run
-(`JitOnrampRun::emit_for_run`). Later Runs start at the run itself, and a rebuilt asset changes the
+(the pump's root-leaf emit, kept by its digest, #2087). Later Runs start at the run itself, and a rebuilt asset changes the
 slot's key and fills it again. The card's interpreter tier links and runs the program in one call
 (`temen_link_run_libs`), against the libraries laid out once and through their compile memo (#1373,
 above). Measured in the wasm engine under Node on a `printf`/`snprintf`/`puts` program:
@@ -918,7 +918,9 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
 > `outline_nested_cap_calls`, the `env.join`/`env.instantiate_rec`/`env.thread_*` bounces) and the
 > `Vcpu` lanes only it used (`with_jit_eligible`, `VcpuEvent::TierUp`, `bounce_call`,
 > `with_shared_fibers`) are deleted too: a function that spawns, joins or waits interprets on executor
-> 2 until #2443.
+> 2 until #2443. Since #1414 S4-5b-2 the resumable `Vcpu` API itself is deleted, with the native
+> tests that drove it; the slices below that name it are history. The pump (`CoopRun`) is the seam
+> they describe now.
 
 1. **[landed] Emitter core, proven natively first.** Compute ops + dispatcher control flow +
    masking + traps + fuel back-edges → wasm bytes; the whole differential gate works before any
@@ -1039,7 +1041,8 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    table, so the Spectre-safe table mask never moves — DESIGN.md §22). Authority still resolves
    through the powerbox before the invoke surfaces (a forged/cross-domain handle traps identically).
    Proofs: `crates/temen/tests/vcpu_jit_codegen.rs` (the external-result seam on the resumable `Vcpu`,
-   value + trap parity vs the interpreter), `browser/jitcodegen.mjs` (single-vCPU FFI + emitted-unit
+   value + trap parity vs the interpreter; deleted with `Vcpu` — `jit_wasm_codegen.rs` pins the same
+   seam on the pump), `browser/jitcodegen.mjs` (single-vCPU FFI + emitted-unit
    path, interp vs codegen both 142 for i32 **and** f64), the Node twin `threads-spawn.mjs
    TEMEN_JIT_CODEGEN=1` (`TEMEN_JIT_SERVICE=1` for the f64 kernel) (8 Workers
    each `Jit.invoke` on emitted wasm → 1136, = interp, non-vacuity-counted), and the **Chromium**
@@ -1074,8 +1077,8 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    unit's wasm emitted and cached on the `JitUnit` at its first driver read (`Host::jit_unit_wasm_or_emit`,
    the one emit path for `compile`, `compile_linked`, thawed and forked units alike, #1346); a later
    `invoke` runs that guest-own unit's `f0(win, env, args…)` instead of a fixed setup unit. The mechanism is pinned by
-   `crates/temen/tests/jit_wasm_codegen.rs`: a resumable `Vcpu` guest `compile`s a unit at runtime then
-   `invoke`s it, serviced on emitted wasm under `wasmi`, **byte-identical** to the interpreter oracle
+   `crates/temen/tests/jit_wasm_codegen.rs`: a guest on the pump (`CoopRun`) `compile`s a unit at
+   runtime then `invoke`s it, serviced on emitted wasm under `wasmi`, **byte-identical** to the interpreter oracle
    (value + trap, i32/i64 sigs; the `emitted_ran` guard rejects a silent interp fallback). Zero cost
    when unset — every non-browser run leaves the emitter `None`.
    **[landed — the browser wiring, single-Worker *and* cross-Worker]** A `Jit` grant (+ validator +
@@ -1090,7 +1093,7 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    `HostCell::Shared` uses, DESIGN.md §22). Pinned natively by
    `bytecode_parallel_jit.rs::parallel_runtime_compile_invoke_is_sound` (8 worker vCPUs each
    runtime-compile their own unit on the shared host → schedule-independent 56 over 50 runs) +
-   `jit_wasm_codegen.rs` (owned- and shared-host runtime compile → emitted wasm ≡ interp). The
+   `jit_wasm_codegen.rs` (runtime compile on the pump → emitted wasm ≡ interp). The
    single-vCPU JS driver is `browser/jitcodegen_runtime.mjs`; the **multi-Worker Chromium twin landed**
    as the CI-gated `jitruntime` work item (`browser-test.mjs`): 8 worker vCPUs each runtime-compile
    their own unit through the shared powerbox and invoke it on per-Worker emitted wasm — interp ≡
@@ -1189,16 +1192,11 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    the unmapped page faults on both tiers). *Superseded (#1865):* these items run **detached**
    children now — the spawn is an op-17 record, serviced from emitted code as `env.instantiate_rec`
    (`temen_par_inst_instantiate_rec`, admitted by the child's own vCPU) — and
-   `temen_par_inst_instantiate` is gone. The JS-orchestrated **op-13** loop (`temen_op13jit_*`,
-   #1025 Path 1) runs its separate-module child on the single-shot emit, which since #1201 emits a
-   page-op child **paged** (`compile_jit_paged` → `compile_module_reactor_paged`; `JitOnrampRun`
-   rebuilds the page-state table after each bounce and `driveDetachedRun` re-points
-   `"pagestate"`/`"mapped"`, the child's real starter `AddressSpace` handle reaching the emitted entry) —
-   the same paged emit serves a root on-ramp guest that `unmap`s/`protect`s
-   (`browser/tests/jit_paged_onramp.rs`, the wasmi twin of that single-shot driver;
-   `browser-op13jit-e2e-test.mjs` in real Chromium). A child the emit still
-   declines (`SharedRegion` aliasing, fibers) runs on the interpreter over the same carve and marshaled
-   powerbox instead of trapping the driver (`op13jit_paged.rs`). *(All scalar unit signatures — i32/i64/f32/f64 — now
+   `temen_par_inst_instantiate` is gone. *(The JS-orchestrated **op-13** loop, #1025 Path 1, which also
+   ran a page-op child **paged** on the single-shot emit, #1201, was deleted in #1414 S4-5b. A detached
+   child now runs its program's region emit, paged on the same rule, on the pump and on the parallel
+   driver; the pump's page-op children are pinned by `coop_tierup_driver.rs`'s
+   `coop_tierup_child_paged_traps_over_its_own_window`.)* *(All scalar unit signatures — i32/i64/f32/f64 — now
    marshal by type; **v128** unit sigs stay on the interpreter — the cap ABI is scalar-only by design,
    §17.)*
 6. **Long tail + measurement.** **Measurement landed early:** the `temen-wasmjit` cross-engine bench
@@ -1294,21 +1292,23 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    `browser/browser-jit-reactor-test.mjs` (each reactor guest renders byte-identically on both tiers in
    real Chromium). *(This does **not** bring `call.cap` into the emitted subset — the note at slice 3's
    deopt still holds; it makes cap-call-bearing **functions** emittable by outlining the cap op.)*
-8. **[landed — capability] Single-shot module wasm-JIT (Lua/SQLite run-to-completion).** The
+8. **[retired — #1414 S4-3, S4-5b] Single-shot module wasm-JIT (Lua/SQLite run-to-completion).** The
    run-to-completion twin of the reactor: a `.temen` module's whole program *is* func 0 (`_start`), so
-   [`JitOnrampRun`] emits **that** and runs `f0(win, env, ...slots)` **once** (`_start` takes the granted
+   `JitOnrampRun` emitted **that** and ran `f0(win, env, ...slots)` **once** (`_start` takes the granted
    capability handles as params, stashes them, seeds the heap, and calls `main(sp)`), with the ~7%
    cross-tier helpers relaying to the interpreter through `env.call_interp` over the shared window. Unlike
    the reactor, `_start` is **not** pre-run on the interpreter; the `.data`/`.rodata` are materialized up
    front (emitted `_start` seeds only the heap), and the window is sized to the module's **declared**
    `size_log2` (Lua declares 64 MiB — a smaller allocation faults any access into its upper range). FFI:
    `temen_onramp_jit_run_open` + the `temen_onramp_jit_run_*` accessors; JS: `web/wasmjit-module.js`.
-   *(Retired for module runs by #1414 S4-3a: `runJitModule` opens on the pump, which runs the root whole
-   as a leaf — `temen_coop_open` with `COOP_LEAF_ROOT` — and checks read-only data, #2302.)* Proven
-   **byte-identical** to the interpreter (`temen_run_onramp`) for hello_c / Lua / SQLite by the native
-   `tests/jit_module.rs` (hello_c; Lua/SQLite `#[ignore]`d — `wasmi`'s register allocator rejects their
-   giant hot functions, which V8 runs fine) and the committed `browser/browser-jit-module-test.mjs` (V8
-   differential + timing). **Finding — the speedup here is modest** (Lua ~3×, SQLite ~1.3×, vs the
+   *(Retired: #1414 S4-3a moved module runs onto the pump, which runs the root whole as a leaf —
+   `temen_coop_open` with `COOP_LEAF_ROOT` — and checks read-only data, #2302; S4-5b deleted
+   `JitOnrampRun`, its exports and its native differential `tests/jit_module.rs`, whose hello_c case
+   is now `coop_tierup_driver.rs`'s `coop_root_leaf_runs_hello_c_as_the_interpreter_does`.)* It was
+   proven **byte-identical** to the interpreter (`temen_run_onramp`) for hello_c / Lua / SQLite by that
+   differential (Lua/SQLite `#[ignore]`d — `wasmi`'s register allocator rejects their giant hot
+   functions, which V8 runs fine) and by `browser/browser-jit-module-test.mjs` (V8 differential +
+   timing), which now runs the pump's root leaf. **Finding — the speedup here is modest** (Lua ~3×, SQLite ~1.3×, vs the
    reactor demos' 24–34×), and it is **not** a compile cost (V8 compiles the emitted 3 MB Lua module in
    ~6 ms). The reactor demos win big because their hot loops are *small* functions; Lua/SQLite's hot
    functions (`luaV_execute`, `sqlite3VdbeExec`) are *giant*, and giant emitted functions run slowly.

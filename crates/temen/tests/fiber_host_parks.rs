@@ -24,8 +24,6 @@ enum Engine {
     /// The bytecode engine's cooperative pump (also the browser session's, and the wasm-jit's
     /// interp-driven fold's).
     Bytecode,
-    /// The bytecode engine's single-vCPU driver an embedder steps (the browser's per-Worker vCPU).
-    BytecodeVcpu,
     /// The bytecode engine's OS-thread-parallel driver.
     BytecodeParallel,
     Jit,
@@ -73,17 +71,6 @@ fn run(engine: Engine, src: &str, grant: fn(&mut Host) -> Vec<i32>) -> Answer {
             )
             .expect("the bytecode engine runs the module")
             .0),
-            Engine::BytecodeVcpu => {
-                let prog = bytecode::VcpuProgram::compile(&m).expect("compile");
-                let mut vcpu =
-                    bytecode::Vcpu::new_root_with_powerbox(&prog, 0, &vals, backing(), &win, h)
-                        .expect("root");
-                match vcpu.run() {
-                    bytecode::VcpuEvent::Done(v) => of(Ok(v)),
-                    bytecode::VcpuEvent::Trapped(t) => of(Err(t)),
-                    _ => panic!("an event this guest cannot raise"),
-                }
-            }
             Engine::BytecodeParallel => {
                 of(bytecode::compile_and_run_capture_over_parallel_with_host(
                     &m,
@@ -128,7 +115,6 @@ fn check(src: &str, grant: fn(&mut Host) -> Vec<i32>, want: i64) {
     let got: Vec<(Engine, Answer)> = [
         Engine::Interp,
         Engine::Bytecode,
-        Engine::BytecodeVcpu,
         Engine::BytecodeParallel,
         Engine::Jit,
     ]

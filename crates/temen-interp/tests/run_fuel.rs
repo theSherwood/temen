@@ -1,16 +1,13 @@
-//! #2113 — the resumable `Vcpu` engine meters the run's fuel as every other driver does.
-//!
-//! A `Vcpu` root opens its run's activation at its first `run`, which grants the powerbox's own node
-//! [`DEFAULT_FUEL`], and draws from that node; a `thread.spawn`ed `Vcpu` draws from the node of the
-//! powerbox it shares. What a run burns there is what the cooperative driver burns for the same
-//! program, the threads' share included, and it is read back on the root powerbox once the run's
-//! vCPUs have handed back what they did not burn.
+//! #2113 — every metered driver burns the oracle's fuel for a program. The cooperative and parallel
+//! drivers draw from the run's node as the tree-walker does, a `thread.spawn`ed vCPU's share
+//! included, and the root powerbox reads back what the run burned once its vCPUs have handed back
+//! what they did not burn.
 
 #[path = "support/drivers.rs"]
 mod drivers;
 
 use drivers::{run_on_then, Driver, FUEL};
-use temen_interp::{Host, Value, DEFAULT_FUEL};
+use temen_interp::{Host, Value};
 use temen_ir::Module;
 
 /// A loop of 1000 back-edges in the root, returning 42.
@@ -83,24 +80,19 @@ fn burned(driver: Driver, src: &str) -> (Vec<Value>, u64) {
     let setup = || (Host::new(), Vec::new());
     let (ran, left) = run_on_then(driver, &m, &setup, &|h: &Host| h.fuel_left())
         .unwrap_or_else(|| panic!("{driver:?} declined the module"));
-    let granted = if driver == Driver::Vcpu {
-        DEFAULT_FUEL
-    } else {
-        FUEL
-    };
     let result = ran
         .result
         .unwrap_or_else(|t| panic!("{driver:?} trapped: {t:?}"));
-    (result, granted - left)
+    (result, FUEL - left)
 }
 
-/// Every metered driver burns the same fuel for `src` and returns the same result: the oracle, the
-/// cooperative and parallel drivers, and the resumable `Vcpu` engine. (The debug scheduler lends a
-/// fixed allowance per resume instead of drawing from the run's node, so it has no readout here.)
+/// Every metered driver burns the same fuel for `src` and returns the same result: the oracle and the
+/// cooperative and parallel drivers. (The debug scheduler lends a fixed allowance per resume instead
+/// of drawing from the run's node, so it has no readout here.)
 fn burns_alike(src: &str) -> u64 {
     let (want, oracle) = burned(Driver::Oracle, src);
     assert!(oracle >= 1000, "the loop burns fuel: {oracle}");
-    for d in [Driver::Coop, Driver::Parallel, Driver::Vcpu] {
+    for d in [Driver::Coop, Driver::Parallel] {
         let (got, b) = burned(d, src);
         assert_eq!(got, want, "{d:?}: the result");
         assert_eq!(b, oracle, "{d:?}: the fuel the run burned on its node");
@@ -108,15 +100,15 @@ fn burns_alike(src: &str) -> u64 {
     oracle
 }
 
-/// A `Vcpu` root draws from the node its run's activation opens, and pays the entry's one fuel as
-/// every driver does.
+/// A root draws from the node its run's activation opens, and pays the entry's one fuel, on every
+/// driver.
 #[test]
-fn a_vcpu_root_burns_its_runs_fuel_as_every_driver_does() {
+fn a_root_burns_its_runs_fuel_as_the_oracle_does() {
     burns_alike(LOOP);
 }
 
-/// A `thread.spawn`ed `Vcpu` draws from the same node as its root.
+/// A `thread.spawn`ed vCPU draws from the same node as its root.
 #[test]
-fn a_vcpu_thread_burns_the_same_runs_fuel() {
+fn a_thread_burns_the_same_runs_fuel() {
     burns_alike(THREADED);
 }

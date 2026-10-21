@@ -521,7 +521,7 @@ fn on_the_jit(m: &Module, lanes: i64, kids: &[u32], answer: Answer) -> Result<i6
 }
 
 /// `m` on every engine, `wait` answered each way, and each that returned anything but `want`.
-/// `paced` leaves out the `Vcpu` harness, which orchestrates no futex `Wait`.
+/// `paced` only names the case.
 fn check_on_every_engine(what: &str, m: &Module, kids: &[u32], want: i64, paced: bool, lanes: i64) {
     let mut wrong = Vec::new();
     let mut each = |engine: String, got: Result<i64, String>| {
@@ -531,9 +531,6 @@ fn check_on_every_engine(what: &str, m: &Module, kids: &[u32], want: i64, paced:
     };
     for answer in [Answer::Pool, Answer::Host] {
         for driver in drivers::ALL {
-            if paced && driver == Driver::Vcpu {
-                continue;
-            }
             let got = on_driver(driver, m, lanes, kids, answer);
             each(format!("{driver:?}, {answer:?}-answered"), got);
         }
@@ -750,7 +747,7 @@ block 0 (vsp: i64, varg: i64) {
 /// A root kills a child that waits on a host call nobody will answer, and joins it (#2493). The
 /// root first waits, in `wait`'s op 1, until the child's wait has begun, and returns what that
 /// returned. The child's teardown used to wait for its call, through its pool, so the join did too.
-/// On every driver that schedules its children (the `Vcpu` harness cannot kill one yet, #2083).
+/// On every driver.
 #[test]
 fn a_killed_child_joins_while_its_call_still_waits() {
     let child = SpawnRec {
@@ -787,13 +784,13 @@ block 0 (v0: i64) {{
         rec = rec::segment(17408, &child),
     ));
     let what = "a killed child waiting on the host";
-    check_prompt(what, &m, &[1], Ok(1), &drivers::SCHEDULING);
+    check_prompt(what, &m, &[1], Ok(1), &drivers::ALL);
 }
 
 /// A root returns over a fiber of its own still waiting on a host call nobody will answer
 /// (#2493): the run ends at once, with the resume's `FIBER_PARKED` (3). The run's end used to wait
 /// for the call. On every driver that parks the fiber alone: the debugger parks its thread, to keep
-/// its schedule its own (#2047), and the `Vcpu` harness waits inline (I45).
+/// its schedule its own (#2047).
 #[test]
 fn a_run_ends_while_its_fiber_waits_on_the_host() {
     let m = module_of(&format!(

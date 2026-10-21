@@ -1,21 +1,18 @@
-//! #1366 — the **host-answered cap posture** on the resumable [`bytecode::Vcpu`]: a cap call the
-//! *embedder* answers later while the guest sees a plain synchronous `call.cap`.
+//! #1366 — the **host-answered cap posture**: a cap call the *embedder* answers later while the
+//! guest sees a plain synchronous `call.cap`.
 //!
 //! An offloadable handler returns [`OffloadOutcome::Host`] for the slow case; the dispatch mints a
-//! completion id, hands the call's [`Completer`] to the submit hook (the host records the request),
-//! and the vCPU parks, surfacing [`VcpuEvent::CapPending`]. The host answers it with the completer
-//! and `run`s again — the W4 `StdinPark`/`push_stdin` shape generalized to any cap. This is how a
-//! single-threaded embedder (the `wasm32` cdylib, where no offload pool can exist) composes an
-//! asynchronous I/O powerbox. Pinned here: the park/answer round-trip, byte-parity with the pool
-//! posture (decline-never-diverge, INVARIANTS 9), the sync face's fail-closed decline (no caller
-//! there can park — it must not hang), and the §12 "sync ops never pay" pin.
-//!
-//! #1953 carries the posture to the cooperative multiplex driver ([`bytecode::CoopRun`], the engine
-//! behind the browser's release session): a task or fiber parks on the call, the pump surfaces
-//! [`CoopEvent::CapPark`] once nothing else can run, and the next pump after the answer resumes it
-//! — pinned below against the same pool-completed twin, unsliced and sliced, on the root, a spawned
-//! thread, and a fiber. #2495 carries it to the drivers no embedder pumps — the tree-walker and the
-//! native cooperative driver — where the embedder answers from a thread of its own.
+//! completion id and hands the call's [`Completer`] to the submit hook (the host records the
+//! request). On the cooperative multiplex driver ([`bytecode::CoopRun`], the engine behind the
+//! browser's release session, #1953), a task or fiber parks on the call, the pump surfaces
+//! [`CoopEvent::CapPark`] once nothing else can run, and the next pump after the answer resumes it.
+//! This is how a single-threaded embedder (the `wasm32` cdylib, where no offload pool can exist)
+//! composes an asynchronous I/O powerbox. Pinned here: the park/answer round-trip on the root, a
+//! spawned thread and a fiber, unsliced and sliced; byte-parity with the pool posture
+//! (decline-never-diverge, INVARIANTS 9); the fail-closed decline where no caller can park (it must
+//! not hang); and the §12 "sync ops never pay" pin. #2495 carries the posture to the drivers no
+//! embedder pumps — the tree-walker and the native cooperative driver — where the embedder answers
+//! from a thread of its own.
 //!
 //! #1954 runs the **root program as an emitted leaf**: a root that parks only in declared
 //! host-completed caps is offered to the host's leaf emitter, and each call parks in a bounce out of
@@ -24,7 +21,7 @@
 //! calls bounce into.
 
 use std::sync::{Arc, Mutex};
-use temen_interp::bytecode::{self, CoopEvent, LeafOffer, ProgramEmit, TierUpConfig, VcpuEvent};
+use temen_interp::bytecode::{self, CoopEvent, LeafOffer, ProgramEmit, TierUpConfig};
 use temen_interp::{
     run_with_host, BoundImport, CapRequests, Completer, Host, OffloadOutcome, Trap, Value,
 };
@@ -131,132 +128,6 @@ fn pool_completed() -> (Host, i32) {
     (host, h)
 }
 
-fn program(m: &temen_ir::Module) -> bytecode::VcpuProgram {
-    bytecode::VcpuProgram::compile(m).expect("compile")
-}
-
-/// A root vCPU over `prog` (borrowed — the test body owns the program) with `host` as its powerbox.
-fn vcpu<'p>(prog: &'p bytecode::VcpuProgram, host: Host, h: i32) -> bytecode::Vcpu<'p> {
-    bytecode::Vcpu::new_root_reserved_with_powerbox(prog, 0, &[Value::I32(h)], &[], host, 20)
-        .expect("build root vcpu")
-}
-
-/// Drive a vCPU to completion, answering every surfaced host-answered request from what the
-/// submit hook filed (`arg + 100`). Returns the results and the argument of each call it answered.
-fn drive(vcpu: &mut bytecode::Vcpu, recorded: &Recorded) -> (Vec<Value>, Vec<i64>) {
-    let mut answered = Vec::new();
-    loop {
-        match vcpu.run() {
-            VcpuEvent::Done(v) => return (v, answered),
-            VcpuEvent::Trapped(t) => panic!("guest trapped: {t:?}"),
-            VcpuEvent::CapPending { id, .. } => {
-                let a = answer(recorded, id)
-                    .expect("the submit hook filed this id before the park surfaced");
-                answered.push(a);
-            }
-            _ => panic!("unexpected vcpu event"),
-        }
-    }
-}
-
-/// The round-trip: op 1 parks the vCPU with a surfaced id that the submit hook had already
-/// filed; answering it and `run` resumes it with the value in the right slot; the completion
-/// store settles (nothing outstanding).
-#[test]
-fn host_completed_cap_parks_and_resumes() {
-    let m = module();
-    let prog = program(&m);
-    let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
-    let (host, h) = host_completed(&recorded);
-    let comps = host.completions();
-    let mut v = vcpu(&prog, host, h);
-    let (r, answered) = drive(&mut v, &recorded);
-    assert_eq!(r, vec![Value::I64(WANT)], "both results landed, in order");
-    assert_eq!(
-        answered,
-        vec![7],
-        "exactly the host-answered op parked, with op 1's argument"
-    );
-    assert_eq!(
-        comps.minted(),
-        1,
-        "one completion id minted (the Done op paid nothing)"
-    );
-    assert_eq!(comps.outstanding(), 0, "the delivered completion settled");
-}
-
-/// A host that answers *inside* its submit hook (the request was serviceable synchronously after
-/// all) never parks: the driver finds the result already posted and continues.
-#[test]
-fn host_completing_inside_submit_does_not_park() {
-    let m = module();
-    let prog = program(&m);
-    let mut host = Host::new();
-    let comps = host.completions();
-    let h = host.grant_host_proc_offloadable(
-        Box::new(move |op, args| {
-            let a = *args.first().unwrap_or(&0);
-            if op == 0 {
-                return OffloadOutcome::Done(Ok(vec![a + 100]));
-            }
-            OffloadOutcome::Host(Box::new(move |c: Completer| c.complete(a + 100)))
-        }),
-        None,
-        temen_interp::CapState::Stateless,
-    );
-    let mut v = vcpu(&prog, host, h);
-    match v.run() {
-        VcpuEvent::Done(r) => assert_eq!(r, vec![Value::I64(WANT)]),
-        VcpuEvent::CapPending { .. } => panic!("an already-completed request must not park"),
-        _ => panic!("unexpected vcpu event"),
-    }
-    assert_eq!(comps.outstanding(), 0);
-}
-
-/// **Host-answered ≡ pool-completed** (decline-never-diverge): the same guest and semantics
-/// produce the identical composite whether the slow op is answered by the embedder (surfaced
-/// park + completer) or by the offload pool (the inline wait) — on the `Vcpu`, on the one-shot
-/// bytecode face, and on the tree-walk oracle.
-#[test]
-fn host_completed_matches_pool_completed() {
-    let m = module();
-    let prog = program(&m);
-
-    // Host-completed on the resumable driver.
-    let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
-    let (host, h) = host_completed(&recorded);
-    let mut v = vcpu(&prog, host, h);
-    let (hosted, _) = drive(&mut v, &recorded);
-
-    // Pool-completed on the same driver (inline wait, the pre-#1366 posture).
-    let (host, h) = pool_completed();
-    let mut v = vcpu(&prog, host, h);
-    let pooled = match v.run() {
-        VcpuEvent::Done(r) => r,
-        _ => panic!("pool posture never parks the session driver"),
-    };
-
-    // Pool-completed on the one-shot bytecode face (the job runs inline) and the oracle.
-    let (mut host, h) = pool_completed();
-    let mut fuel = 2_000_000_000u64;
-    let oneshot =
-        bytecode::compile_and_run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host)
-            .expect("in subset")
-            .expect("no trap");
-    let (mut host, h) = pool_completed();
-    let mut fuel = 2_000_000_000u64;
-    let oracle = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host).expect("no trap");
-    host.quiesce_pool();
-
-    assert_eq!(hosted, vec![Value::I64(WANT)]);
-    assert_eq!(
-        hosted, pooled,
-        "host-completed ≡ pool-completed on the Vcpu"
-    );
-    assert_eq!(hosted, oneshot, "≡ the one-shot bytecode face");
-    assert_eq!(hosted, oracle, "≡ the tree-walk oracle");
-}
-
 /// #2495 — where its caller could never park on it, a host-answered call **declines** with
 /// `CapFault` before its embedder sees it, fail-closed — never blocking forever: in a durable run,
 /// whose freeze has no cap park to re-derive, and on the tree-walker under a recording host, which
@@ -303,28 +174,6 @@ fn declines(what: &str, prepare: fn(&mut Host), oracle: bool) {
     );
 }
 
-/// §12 pin, host-completed form: a handler that always answers inline touches none of the
-/// parking machinery — no id minted, nothing outstanding.
-#[test]
-fn sync_ops_never_pay_for_the_host_posture() {
-    let m = module();
-    let prog = program(&m);
-    let mut host = Host::new();
-    let comps = host.completions();
-    let h = host.grant_host_proc_offloadable(
-        Box::new(|_op, args| OffloadOutcome::Done(Ok(vec![*args.first().unwrap_or(&0) + 100]))),
-        None,
-        temen_interp::CapState::Stateless,
-    );
-    let mut v = vcpu(&prog, host, h);
-    match v.run() {
-        VcpuEvent::Done(r) => assert_eq!(r, vec![Value::I64(WANT)]),
-        _ => panic!("an all-inline handler never parks"),
-    }
-    assert_eq!(comps.minted(), 0, "no completion id was ever minted");
-    assert_eq!(comps.outstanding(), 0);
-}
-
 /// #2495 — the tree-walk oracle, which no embedder pumps, parks the caller of a host-answered call
 /// as it parks a pool call's, and the embedder answers from a thread of its own.
 #[test]
@@ -341,24 +190,6 @@ fn the_oracle_parks_a_host_answered_call_until_its_embedder_answers() {
     answering.join().unwrap();
     assert_eq!(r, Ok(vec![Value::I64(WANT)]));
     assert_eq!(comps.outstanding(), 0, "the answered call settled");
-}
-
-/// #2495 — a completer dropped unanswered answers its call `CAP_REVOKED` (`-9`): a call its host
-/// can no longer answer never hangs. The Vcpu surfaces the park; dropping the request
-/// lets the run end, the call having answered `-9` (`105 * 1000 - 9`).
-#[test]
-fn a_completer_dropped_unanswered_answers_cap_revoked() {
-    let m = module();
-    let prog = program(&m);
-    let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
-    let (host, h) = host_completed(&recorded);
-    let mut v = vcpu(&prog, host, h);
-    assert!(matches!(v.run(), VcpuEvent::CapPending { .. }));
-    recorded.lock().unwrap().clear();
-    match v.run() {
-        VcpuEvent::Done(r) => assert_eq!(r, vec![Value::I64(105 * 1000 - 9)]),
-        _ => panic!("the revoked call answers"),
-    }
 }
 
 // --- #1953: the cooperative multiplex driver (`CoopRun`) -----------------------------------------
@@ -480,7 +311,75 @@ fn coop_run_parks_on_a_host_completed_cap_and_resumes() {
     );
     answer(&recorded, id);
     assert!(matches!(run.run(), CoopEvent::Done(ref v) if *v == vec![Value::I64(WANT)]));
+    assert_eq!(
+        comps.minted(),
+        1,
+        "one completion id minted (the Done op paid nothing)"
+    );
     assert_eq!(comps.outstanding(), 0, "the answered completion settled");
+}
+
+/// A host that answers *inside* its submit hook (the request was serviceable synchronously after
+/// all) never parks: the driver finds the result already posted and continues.
+#[test]
+fn host_completing_inside_submit_does_not_park() {
+    let m = module();
+    let mut host = Host::new();
+    let comps = host.completions();
+    let h = host.grant_host_proc_offloadable(
+        Box::new(move |op, args| {
+            let a = *args.first().unwrap_or(&0);
+            if op == 0 {
+                return OffloadOutcome::Done(Ok(vec![a + 100]));
+            }
+            OffloadOutcome::Host(Box::new(move |c: Completer| c.complete(a + 100)))
+        }),
+        None,
+        temen_interp::CapState::Stateless,
+    );
+    match coop(&m, host, h).run() {
+        CoopEvent::Done(r) => assert_eq!(r, vec![Value::I64(WANT)]),
+        CoopEvent::CapPark { .. } => panic!("an already-completed request must not park"),
+        _ => panic!("unexpected coop event"),
+    }
+    assert_eq!(comps.outstanding(), 0);
+}
+
+/// §12 pin, host-completed form: a handler that always answers inline touches none of the
+/// parking machinery — no id minted, nothing outstanding.
+#[test]
+fn sync_ops_never_pay_for_the_host_posture() {
+    let m = module();
+    let mut host = Host::new();
+    let comps = host.completions();
+    let h = host.grant_host_proc_offloadable(
+        Box::new(|_op, args| OffloadOutcome::Done(Ok(vec![*args.first().unwrap_or(&0) + 100]))),
+        None,
+        temen_interp::CapState::Stateless,
+    );
+    match coop(&m, host, h).run() {
+        CoopEvent::Done(r) => assert_eq!(r, vec![Value::I64(WANT)]),
+        _ => panic!("an all-inline handler never parks"),
+    }
+    assert_eq!(comps.minted(), 0, "no completion id was ever minted");
+    assert_eq!(comps.outstanding(), 0);
+}
+
+/// #2495 — a completer dropped unanswered answers its call `CAP_REVOKED` (`-9`): a call its host
+/// can no longer answer never hangs. The pump surfaces the park; dropping the request lets the run
+/// end, the call having answered `-9` (`105 * 1000 - 9`).
+#[test]
+fn a_completer_dropped_unanswered_answers_cap_revoked() {
+    let m = module();
+    let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+    let (host, h) = host_completed(&recorded);
+    let mut run = coop(&m, host, h);
+    assert!(matches!(run.run(), CoopEvent::CapPark { .. }));
+    recorded.lock().unwrap().clear();
+    match run.run() {
+        CoopEvent::Done(r) => assert_eq!(r, vec![Value::I64(105 * 1000 - 9)]),
+        _ => panic!("the revoked call answers"),
+    }
 }
 
 /// **Host-completed ≡ pool-completed on `CoopRun`**, for each shape of parked caller — the root, a
@@ -1000,7 +899,7 @@ fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
 
 /// The trap each driver that parks host-answered calls ends a run of `m` with.
 fn on_each_parking_driver(m: &temen_ir::Module) -> Vec<(&'static str, Option<Trap>)> {
-    ["vcpu", "coop", "debug", "oracle"]
+    ["coop", "debug", "oracle"]
         .into_iter()
         .map(|driver| {
             let m = m.clone();
@@ -1011,10 +910,6 @@ fn on_each_parking_driver(m: &temen_ir::Module) -> Vec<(&'static str, Option<Tra
                     "oracle" => {
                         run_with_host(&m, 0, &[Value::I32(h)], &mut 2_000_000, &mut host).err()
                     }
-                    "vcpu" => match vcpu(&program(&m), host, h).run() {
-                        VcpuEvent::Trapped(t) => Some(t),
-                        _ => None,
-                    },
                     "coop" => match coop(&m, host, h).run() {
                         CoopEvent::Trapped(t) => Some(t),
                         _ => None,

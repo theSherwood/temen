@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**299 exports** in 39 families — 252 referenced from JS, 47 referenced by nothing, 42 behind a `cfg`.
+**274 exports** in 38 families — 227 referenced from JS, 47 referenced by nothing, 41 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -15,7 +15,7 @@
 | `coop` | 65 | 54 | 0 |
 | `dap` | 4 | 4 | 0 |
 | `dealloc` | 1 | 1 | 0 |
-| `detached` | 4 | 4 | 1 |
+| `detached` | 2 | 2 | 0 |
 | `durable` | 4 | 4 | 0 |
 | `exit` | 1 | 1 | 0 |
 | `fault` | 1 | 1 | 0 |
@@ -27,8 +27,7 @@
 | `module` | 3 | 0 | 0 |
 | `nim` | 5 | 5 | 0 |
 | `notes` | 2 | 2 | 0 |
-| `onramp` | 46 | 37 | 0 |
-| `op13jit` | 9 | 9 | 0 |
+| `onramp` | 32 | 23 | 0 |
 | `par` | 17 | 17 | 14 |
 | `parse` | 3 | 3 | 0 |
 | `pg` | 6 | 6 | 0 |
@@ -183,8 +182,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 ### `detached`
 
 - `temen_detached_header_bytes`
-- `temen_detached_jit_run_open` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
-- `temen_detached_oracle_run`
 - `temen_detached_pagestate_off`
 
 ### `durable`
@@ -271,20 +268,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_onramp_close`
 - `temen_onramp_frame_begin`
 - `temen_onramp_freeze`
-- `temen_onramp_jit_run_call_interp`
-- `temen_onramp_jit_run_close`
-- `temen_onramp_jit_run_env_bytes`
-- `temen_onramp_jit_run_finish`
-- `temen_onramp_jit_run_mapped`
-- `temen_onramp_jit_run_pagestate_len`
-- `temen_onramp_jit_run_pagestate_ptr`
-- `temen_onramp_jit_run_report`
-- `temen_onramp_jit_run_slot`
-- `temen_onramp_jit_run_slot_count`
-- `temen_onramp_jit_run_trap_len`
-- `temen_onramp_jit_run_wasm_len`
-- `temen_onramp_jit_run_wasm_ptr`
-- `temen_onramp_jit_run_win_ptr`
 - `temen_onramp_key`
 - `temen_onramp_moment_bytes` — *unreferenced*
 - `temen_onramp_moment_clear` — *unreferenced*
@@ -312,18 +295,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_onramp_timeline_tick`
 - `temen_onramp_timeline_truncate`
 - `temen_onramp_trap_len`
-
-### `op13jit`
-
-- `temen_op13jit_child_mem_id`
-- `temen_op13jit_close`
-- `temen_op13jit_counter`
-- `temen_op13jit_deliver`
-- `temen_op13jit_open`
-- `temen_op13jit_open_child`
-- `temen_op13jit_open_detached`
-- `temen_op13jit_result`
-- `temen_op13jit_step`
 
 ### `par`
 

@@ -104,8 +104,7 @@ the caller's held past it goes back (#2106, #2110, #2332). A thaw re-charges wha
 threads it re-creates, a relaunched child's lease, its regions and stores. That is past any ceiling,
 since the artifact's use was granted, but never past the process's pools: one they have no room for
 is not rebuilt (a thread or a detached child ends with `ThreadFault`; a region or a store refuses the
-thaw), and what the thaw charged for it goes back (#2318). On the resumable `Vcpu` engine a
-thread's charge goes back at its join, where that engine learns it ended. The run's own node holds
+thaw), and what the thaw charged for it goes back (#2318). The run's own node holds
 the embedder's grant (#2113): `Limits` sets its `mem`, `channel`, `spawn` and `maps` ceilings
 (`Host::set_grant`), and a run whose embedder names none holds modest defaults, since a default must
 not let a guest crash its host (owner, #2268): 4 GiB of `mem` and of `channel`, and no `maps` ceiling
@@ -147,9 +146,8 @@ exec its way out of its budget.
 
 *No code exceeds its grant (owner, 2026-10-06):* every resource a domain uses is charged to a grant
 from above, so no code can use more than it was granted, and the root is a domain like any other,
-its grant the embedder's. The gaps are tracked, not exceptions: a `Vcpu` child its
-parent never joins (#2119), the pipe ends a spawn refused after its admission re-granted (#2120), and
-the wasm-JIT's emitted `thread.spawn` (#2007) and fuel (#1997).
+its grant the embedder's. The gaps are tracked, not exceptions: the pipe ends a spawn refused after
+its admission re-granted (#2120), and the wasm-JIT's emitted `thread.spawn` (#2007) and fuel (#1997).
 
 **Ruling — parallelism is a granted resource, bounded at dispatch, ceiling with per-child lanes
 (2026-09-21, D66 / #1586):** how many of a domain's subtree may be *running at once* is authority,

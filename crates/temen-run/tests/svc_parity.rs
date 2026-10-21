@@ -293,9 +293,8 @@ fn separate_setup(kid: &Module) -> impl Fn() -> (Host, Vec<Value>) + '_ {
 
 /// **#2247: a child serves its own module's offer, at its own handler index.** The Cranelift JIT
 /// compiled every child with its parent's handler indices, so this child had no serve trampoline
-/// for its func 2, and the call answered `-EBADF`. The tree-walker and the scheduling bytecode
-/// drivers serve it; the debug driver declines `child_offer` and the resumable `Vcpu` has no child
-/// to offer over (#1732), so neither is asked.
+/// for its func 2, and the call answered `-EBADF`. The tree-walker and the cooperative and parallel
+/// bytecode drivers serve it; the debug driver declines `child_offer`, so it is not asked.
 #[test]
 fn a_child_of_another_module_serves_its_own_offer_on_every_engine() {
     let parent = verified(SEPARATE_PARENT);

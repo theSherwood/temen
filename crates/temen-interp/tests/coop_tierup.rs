@@ -3,7 +3,7 @@
 //! [`CoopRun`](temen_interp::bytecode::CoopRun) is the single-thread, no-Worker analogue of the parallel
 //! `temen_par_*` driver: it multiplexes every vCPU of a run (the root and its `thread.spawn` descendants)
 //! on one host thread, and — when armed with a JIT-eligibility bitmap — pauses to the host on each
-//! direct module-0 `Call` to an eligible function, exactly as the single-vCPU [`Vcpu`] does. This test
+//! direct module-0 `Call` to an eligible function. This test
 //! stands in for the browser host **without any wasm**: it services each `CoopEvent::TierUp` by running
 //! the callee on a standalone bytecode run (what the emitted `f{func}` region computes) and asserts the
 //! whole-run result is **identical** to a pure-interpreter cooperative run of the same guest — so the

@@ -101,8 +101,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
   # Two parts on two runners, one definition. The self-hosted lane is ~11 min (release build, then
   # nimony's own phases on the interpreters) and the test binaries ~4; run one after the other they
-  # made this the PR run's critical path. Their setup is identical, so the split is a matrix row, as
-  # in `browser-real-nim`, rather than a second job repeating these steps.
+  # made this the PR run's critical path. Their setup is identical, so the split is a matrix row
+  # rather than a second job repeating these steps.
   #
   # #2034 — the nightly (and a manual dispatch) adds a third part, `upstream`: both parts' checks,
   # lane step 4 included, against nimony's master instead of the pinned submodule. The pin does not
@@ -837,25 +837,6 @@ jobs:
         working-directory: browser
         run: node browser-jspb-test.mjs target/wasm32-unknown-unknown/release/temen_browser.wasm
 
-  browser-jit-host-gates:
-    # The browser crate's Rust **host** tests (built for the runner, not wasm) run a real compiler
-    # phase on the **wasm-JIT** via `wasmi` — playing the browser's JS host — and assert the emitted
-    # output is byte-identical to the interpreter oracle: the compiler-tier JIT correctness contract.
-    # These were previously only local/dev gates (no `cargo test` ran them in CI). Both run committed
-    # assets (`chibicc.temen`, `hello_c.temen`) and need no staging; a test whose asset is absent SKIPs.
-    name: browser wasm-JIT host gates (compiler tier)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with: { toolchain: "${{ env.RUST_STABLE }}" }
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with: { workspaces: browser }
-      - name: chibicc / jit_module on the wasm-JIT (differential)
-        working-directory: browser
-        run: cargo test --test chibicc_jit --test jit_module -- --test-threads=1 --nocapture
-
   browser-host-guests:
     # The browser crate is its OWN cargo workspace, so the gating `check` job's
     # `cargo test --workspace` never builds or runs it. Its Rust host tests were
@@ -976,7 +957,7 @@ jobs:
     # #1175: the multi-Worker Chromium threads/atomics battery (step "Build threads module + run in
     # Chromium (powerbox + multi-Worker → 4000)") is a lost-wakeup/deadlock flake source; with no
     # job-level cap a hang runs to GitHub's 6-hour default instead of failing fast. The step was ~11 min
-    # before the nim/op-13 family moved out to `browser-real-nim` and is ~5 min now, so 30 reds a hang in
+    # before the nim family moved out to `browser-real-nim` and is ~5 min now, so 30 reds a hang in
     # minutes with generous margin (same class of fix as #906).
     timeout-minutes: 30
     # The Pages deploy rides this required job (ISSUES.md I75): it already builds the whole deployable
@@ -1091,9 +1072,6 @@ jobs:
           # temen_host.foreign_* imports — 20k-op differential vs the safe Paged reference + the per-access
           # cost ratio the detached-window decline path is gated on.
           node browser-foreign-mem-test.mjs
-          # A detached child on the wasm-JIT tier (#1285): its own WebAssembly.Memory, argv payload, attest,
-          # vm_map growth of the child memory — byte-identical to the interpreter oracle.
-          node browser-detached-jit-test.mjs
           # #1312 the cooperative window grows: a guest whose allocator `vm_map`s past the 32 MiB coop
           # run window runs on the emitted tier through the REAL JS driver (the native wasmi
           # differential plays the driver's role; this is the shipped `driveCoopTierupRun`, the only
@@ -1115,9 +1093,6 @@ jobs:
           # install + the by-slot unit fetch), byte-identical to the interpreter; thread words pin the
           # declared decline. The native wasmi pin is `coop_forth_kernel_tiers_up_and_matches_the_oracle`.
           node browser-forth-coop-test.mjs
-          # A guest-issued detached spawn (op 17) on the op-13 loop (#1286): the driver's child is minted its own Memory by
-          # the servicer and driven emitted; args payload, attest, growth.
-          node browser-op13jit-detached-test.mjs
           # Concurrent detached children on the parallel Worker driver (#1286 slice 3b): three op-17
           # children, each on its own Worker in its own minted WebAssembly.Memory, grown on vm_map;
           # the exhausted WindowMinter refuses a fourth.
@@ -1204,7 +1179,8 @@ jobs:
           # 511 KB → 2.7 KB). SKIPs without the wasm build or either asset.
           node browser-pg-libc-test.mjs
           # chibicc compile-time on V8 (bytecode vs wasm-JIT) — prints the speedup and asserts the two
-          # tiers emit byte-identical IR (a second guard alongside chibicc_jit.rs). Uses the committed/
+          # tiers emit byte-identical IR (a second guard alongside coop_tierup_driver.rs's chibicc root
+          # leaf). Uses the committed/
           # staged chibicc.temen; SKIPs if it's absent. Timing is informational — it only FAILs on IR
           # divergence. See SELFHOST_C.md §7 (wasm-JIT tier) / PR #483.
           node bench_chibicc_jit.mjs
@@ -1317,27 +1293,20 @@ jobs:
         if: steps.pages_site.outputs.ok == 'true'
         with: { path: _site }
 
-  # The nim card battery and the op-13 loop, split out of `browser-real`, whose critical path they used
-  # to be. Every script here needs only the *committed* `web/assets` (`nimony.blob`) plus the
-  # threads wasm module. So this job *drops* the LLVM install and the Postgres / bash / chibicc /
-  # self-host staging rather than duplicating them — sharding here removes work instead of copying it.
+  # The nim card battery, split out of `browser-real`, whose critical path it used to be. Every script
+  # here needs only the *committed* `web/assets` (`nimony.blob`) plus the threads wasm module. So this
+  # job *drops* the LLVM install and the Postgres / bash / chibicc / self-host staging rather than
+  # duplicating them — splitting it out removes work instead of copying it.
   #
-  # `browser-real` keeps the site assembly and the `site_ok` deploy output. This job has no site
-  # responsibility, which is what lets it be a matrix at all: matrix job `outputs` are last-writer-wins,
-  # so a sharded job cannot carry the deploy gate.
-  #
-  # `shard` splits the family by cost. As the battery grows, add a row here rather than lengthening one
-  # of the existing two.
+  # `browser-real` keeps the site assembly and the `site_ok` deploy output; this job has no site
+  # responsibility. If the battery outgrows one runner, shard it with a matrix: matrix job `outputs`
+  # are last-writer-wins, which is fine here because it carries no deploy gate.
   browser-real-nim:
-    name: real-browser nim/op-13 cards (shard ${{ matrix.shard }})
+    name: real-browser nim cards
     runs-on: ubuntu-latest
     # Same #1175 backstop as `browser-real`: these are the multi-Worker batteries, and a lost wakeup
-    # must red in minutes rather than run to GitHub's 6-hour default. A shard is ~8 min cold.
+    # must red in minutes rather than run to GitHub's 6-hour default. The job is ~8 min cold.
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [a, b]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
@@ -1356,27 +1325,13 @@ jobs:
       - name: Build threads module
         working-directory: browser
         run: |
-          # Only `browser-op13jit-e2e-test.mjs` reads `corpus.json`, but generating it is a native
-          # `cargo run` over an already-built workspace, so both shards just do it.
-          cargo run --bin gencorpus
           RUSTFLAGS="-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals \
             -Clink-arg=--shared-memory -Clink-arg=--import-memory -Clink-arg=--max-memory=4294967296 \
             -Clink-arg=--export=__stack_pointer -Clink-arg=--export=__tls_base \
             -Clink-arg=--export=__tls_size -Clink-arg=--export=__tls_align \
             -Clink-arg=--export=__wasm_init_tls" \
             cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
-      - name: shard a — op-13 loop
-        if: matrix.shard == 'a'
-        working-directory: browser
-        run: |
-          # #1025 Path 1: the JS-orchestrated §14 op-13 loop — a resumable driver marshals an `fs` grant to
-          # a confined child, and JS runs that child's `_start` on emitted wasm over its carve. The child's
-          # `call.cap` leaf resolves the marshaled `fs` on the reactor cross-tier bounce and returns 41; the
-          # driver joins it. The browser realization of `plan::drive_op13` with the child tiered up. No
-          # assets (parses in-page); reuses the threads module built above.
-          node browser-op13jit-e2e-test.mjs
-      - name: shard b — nim card · worker reuse · prewarm gate
-        if: matrix.shard == 'b'
+      - name: nim card · worker reuse · prewarm gate
         working-directory: browser
         run: |
           # #958 (the shipped card): drive the playground's own `snapshotClient.nimCompile` — the exact path

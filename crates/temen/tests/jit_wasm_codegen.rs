@@ -1,23 +1,25 @@
 //! §22 **guest-compiled units on the wasm-JIT tier** — the native differential for the browser's
 //! runtime-`Jit.compile` dynamic loop (BROWSER.md § "wasm-JIT tier", DESIGN.md §22).
 //!
-//! Today the browser only runs a *fixed* §22 unit host-compiled at setup on emitted wasm. The dynamic
-//! loop is: a guest builds an IR blob **at runtime**, `Jit.compile`s it, and a later `Jit.invoke` runs
-//! that guest's own unit on emitted wasm. This test proves that loop end-to-end **without a browser**:
-//! a resumable [`Vcpu`] guest issues `call.cap 11 0` (compile) then `call.cap 11 1` (invoke); compile
-//! runs the real [`Host::jit_compile`] gate (decode → verify → memory-match precondition) and the
-//! host-injected wasm emitter ([`Host::set_jit_wasm_emitter`]) stashes the unit's wasm; the invoke is
-//! serviced by running that emitted `f0(win, env, args…)` under `wasmi` and delivering the result
-//! slots ([`Vcpu::deliver_jit_invoke_vals`]) — exactly the seam the browser Worker drives.
+//! The dynamic loop: a guest builds an IR blob **at runtime**, `Jit.compile`s it, and a later
+//! `Jit.invoke` runs that guest's own unit on emitted wasm. This test proves that loop end-to-end
+//! **without a browser**: a guest on the pump ([`CoopRun`], the browser's cooperative driver) issues
+//! `call.cap 11 0` (compile) then `call.cap 11 1` (invoke); compile runs the real
+//! [`Host::jit_compile`] gate (decode → verify → memory-match precondition) and the host-injected wasm
+//! emitter ([`Host::set_jit_wasm_emitter`]) stashes the unit's wasm; the pump surfaces the invoke
+//! ([`CoopEvent::JitInvoke`]), which this host serves by running that emitted `f0(win, env, args…)`
+//! under `wasmi` and delivering the result slots ([`CoopRun::deliver_jit_invoke_vals`]) — exactly
+//! the seam the browser drives.
 //!
-//! The oracle (INVARIANTS.md #9) is the same guest with the invoke serviced by the **interpreter**
-//! ([`Vcpu::deliver_jit_invoke`]). A codegen run must be byte-identical to it — value *and* trap. The
+//! The oracle (INVARIANTS.md #9) is the same guest without the emitter, so the pump runs the invoke
+//! on the **interpreter**. A codegen run must be byte-identical to it — value *and* trap. The
 //! `emitted_ran` guard is the non-vacuity check (as the browser's tier-up counter is): a codegen run
 //! that silently fell back to the interpreter fails the test.
 
 use std::sync::Arc;
-use temen_interp::{bytecode, Host, Region, Trap, Value};
-use temen_ir::{Module, ValType};
+use temen_interp::bytecode::{CoopEvent, CoopRun, ProgramEmit, TierUpConfig};
+use temen_interp::{Host, Region, Trap, Value};
+use temen_ir::{Module, ValType, DEFAULT_RESERVED_LOG2};
 use temen_run::grant_jit;
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -201,7 +203,8 @@ fn run_unit_on_wasm(unit: &Module, wasm: &[u8], argv: &[i64]) -> Result<Vec<i64>
 
 // ---- shared plumbing -----------------------------------------------------------------------------
 
-/// A fresh 64 KiB window (= `memory 16`) for a root vCPU. Leaked for the test's lifetime.
+/// A fresh 64 KiB window (= `memory 16`) for the run, flat, as emitted code addresses it. Leaked for
+/// the test's lifetime.
 fn window() -> Arc<Region> {
     let size = 1usize << 16;
     let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
@@ -212,29 +215,17 @@ fn window() -> Arc<Region> {
     Arc::new(unsafe { Region::shared(base, size as u64) })
 }
 
-/// A resolved unit and (when the wasm emitter fired) its emitted wasm.
-type ResolvedUnit = (temen_interp::ResolvedJitUnit, Option<Arc<[u8]>>);
-
-/// Resolve a `JitInvoke` event's authority against the vCPU's own host (compile minted the handle
-/// there) and hand back the unit + its emitted wasm.
-fn resolve(h: &mut Host, handle: i32, code: i32) -> Result<ResolvedUnit, Trap> {
-    let unit = h.resolve_jit_unit(handle, code)?;
-    let (cd, cu) = unit.2;
-    let wasm = h.jit_unit_wasm_or_emit(cd, cu); // the one (lazy) emit site, #1346
-    Ok((unit, wasm))
-}
-
-/// How a `JitInvoke` is serviced.
+/// Who runs the invoked unit.
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
-    /// The engine runs the unit on the bytecode interpreter — the oracle.
+    /// The pump, on the bytecode interpreter: the host emits nothing — the oracle.
     Interp,
-    /// The host runs the unit on emitted wasm (`wasmi`) and delivers the result slots — the tier.
+    /// The host, on the unit's emitted wasm (`wasmi`), delivering the result slots — the tier.
     Wasm,
 }
 
-/// Drive the single-vCPU guest to completion: it runtime-`compile`s `unit_src` (staged in its window),
-/// then `invoke`s it once, serviced in `mode`.
+/// Run the guest to completion on the pump: it runtime-`compile`s `unit_src` (staged in its window),
+/// then `invoke`s it once, run as `mode` says.
 fn run_guest(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
     let unit_m = parse_module(unit_src).unwrap();
     verify_module(&unit_m).expect("verify unit");
@@ -266,52 +257,50 @@ fn run_guest(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
     let mut init_mem = vec![0u8; BLOB_OFF as usize];
     init_mem.extend_from_slice(&blob);
 
-    let prog = bytecode::VcpuProgram::compile_with_jit_table(&guest_m, 4).unwrap();
-    let back = window();
-    let mut vcpu =
-        bytecode::Vcpu::new_root_with_powerbox(&prog, 0, &[Value::I32(jit)], back, &init_mem, host)
-            .expect("root");
+    // A root emit with no function eligible: no tier-ups, but the run's units may surface to the
+    // emitted tier.
+    let tierup = TierUpConfig {
+        root: ProgramEmit::default(),
+        leaf: None,
+        modules: None,
+    };
+    let mut run = CoopRun::new_over(
+        &guest_m,
+        0,
+        &[Value::I32(jit)],
+        50_000_000,
+        host,
+        Some(tierup),
+        &init_mem,
+        DEFAULT_RESERVED_LOG2,
+        window(),
+    )
+    .expect("in bytecode subset")
+    .expect("root");
 
     let mut emitted_ran = false;
     loop {
-        match vcpu.run() {
-            bytecode::VcpuEvent::Done(vals) => {
-                if mode == Mode::Wasm {
-                    assert!(
-                        emitted_ran,
-                        "codegen run never executed emitted wasm (silent interp fallback)"
-                    );
-                }
+        match run.run() {
+            CoopEvent::Done(vals) => {
+                assert_eq!(
+                    emitted_ran,
+                    mode == Mode::Wasm,
+                    "a codegen run executes emitted wasm, and only a codegen run does"
+                );
                 return Ok(vals);
             }
-            bytecode::VcpuEvent::Trapped(t) => return Err(t),
-            bytecode::VcpuEvent::JitInvoke {
-                handle,
-                code,
-                argv,
-                params: _,
-                results: _,
-                mapped,
+            CoopEvent::Trapped(t) => return Err(t),
+            CoopEvent::JitInvoke {
+                wasm, argv, mapped, ..
             } => {
                 // #717 host sync: a fully-mapped guest window reports its declared size as the
                 // committed extent (the emitted unit's `"mapped"` default — the sync is a no-op
                 // here, but a codegen host must still receive the representable value).
-                assert_eq!(mapped, Some(1u64 << 16), "fully-mapped guest window extent");
-                let resolved = resolve(vcpu.host_mut(), handle, code);
-                match mode {
-                    Mode::Interp => vcpu.deliver_jit_invoke(resolved.map(|(unit, _)| unit)),
-                    Mode::Wasm => match resolved {
-                        Err(t) => vcpu.deliver_jit_invoke_trap(t),
-                        Ok((_unit, wasm)) => {
-                            let wasm =
-                                wasm.expect("emitter must produce wasm for an in-subset unit");
-                            emitted_ran = true;
-                            match run_unit_on_wasm(&unit_m, &wasm, &argv) {
-                                Ok(slots) => vcpu.deliver_jit_invoke_vals(&slots),
-                                Err(t) => vcpu.deliver_jit_invoke_trap(t),
-                            }
-                        }
-                    },
+                assert_eq!(mapped, 1u64 << 16, "fully-mapped guest window extent");
+                emitted_ran = true;
+                match run_unit_on_wasm(&unit_m, &wasm, &argv) {
+                    Ok(slots) => run.deliver_jit_invoke_vals(&slots),
+                    Err(t) => run.deliver_jit_invoke_trap(t),
                 }
             }
             _ => panic!("unexpected event (this guest only compiles + invokes)"),
@@ -442,122 +431,5 @@ fn runtime_compile_invoke_trap_parity() {
     assert_eq!(
         got, want,
         "codegen trap diverged from interp (want {want:?})"
-    );
-}
-
-// ---- the shared-`Mutex<Host>` runtime-compile flow (the browser's `ParJitCfg` path) --------------
-// The browser's runtime-`Jit.compile` powerbox grants `Jit` (+ validator + emitter) on a shared
-// `Mutex<Host>` that the root vCPU dispatches its `call.cap`s through (`with_shared_host`) — so the
-// guest's runtime `compile` mints + emits into that shared host and a later `invoke` resolves the same
-// host. `run_guest` above uses the vCPU's *own* host; this exercises the shared-host dispatch the
-// browser actually uses (also the seam threaded compile will serialize on, DESIGN.md §22).
-
-/// Like [`run_guest`], but the `Jit` grant + emitter live in a shared `Mutex<Host>` the vCPU
-/// dispatches through (`with_shared_host`), and the invoke resolves against that shared host —
-/// mirroring the browser's `temen_par_powerbox_jit_runtime`.
-fn run_guest_shared(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
-    let unit_m = parse_module(unit_src).unwrap();
-    verify_module(&unit_m).expect("verify unit");
-    let blob = temen_encode::encode_module(&unit_m);
-
-    let entry = &unit_m.funcs[0];
-    let ret = tyname(entry.results[0]);
-    let (arg_setup, arg_ops, invoke_sig) = invoke_shape(&entry.params);
-    let guest_src = guest_src(
-        ret,
-        &invoke_sig,
-        &arg_setup,
-        &arg_ops,
-        BLOB_OFF,
-        blob.len() as u64,
-    );
-    let guest_m = parse_module(&guest_src).unwrap_or_else(|e| panic!("guest parse: {e}"));
-    verify_module(&guest_m).expect("verify guest");
-
-    // The shared powerbox host (the browser's `ParJitCfg.host`): `Jit` granted, validator + emitter set.
-    let mut host = Host::new();
-    let jit = grant_jit(&mut host, &guest_m, 4);
-    if mode == Mode::Wasm {
-        host.set_jit_wasm_emitter(emit_unit);
-    }
-    let shared = std::sync::Mutex::new(host);
-
-    let mut init_mem = vec![0u8; BLOB_OFF as usize];
-    init_mem.extend_from_slice(&blob);
-
-    let prog = bytecode::VcpuProgram::compile_with_jit_table(&guest_m, 4).unwrap();
-    let back = window();
-    // `new_root` builds an empty *own* host; the shared host services generic `call.cap`s — including
-    // the guest's runtime `compile` (op 0), which mints + emits into it.
-    let mut vcpu = bytecode::Vcpu::new_root(&prog, 0, &[Value::I32(jit)], back, &init_mem)
-        .expect("root")
-        .with_shared_host(&shared);
-
-    let mut emitted_ran = false;
-    loop {
-        match vcpu.run() {
-            bytecode::VcpuEvent::Done(vals) => {
-                if mode == Mode::Wasm {
-                    assert!(
-                        emitted_ran,
-                        "codegen run never executed emitted wasm (silent interp fallback)"
-                    );
-                }
-                return Ok(vals);
-            }
-            bytecode::VcpuEvent::Trapped(t) => return Err(t),
-            bytecode::VcpuEvent::JitInvoke {
-                handle, code, argv, ..
-            } => {
-                // Resolve against the shared host; drop the lock before
-                // delivering — the interpreter path re-locks it to run the unit.
-                let resolved = {
-                    let mut g = shared.lock().unwrap();
-                    resolve(&mut g, handle, code)
-                };
-                match mode {
-                    Mode::Interp => vcpu.deliver_jit_invoke(resolved.map(|(unit, _)| unit)),
-                    Mode::Wasm => match resolved {
-                        Err(t) => vcpu.deliver_jit_invoke_trap(t),
-                        Ok((_unit, wasm)) => {
-                            let wasm =
-                                wasm.expect("emitter must produce wasm for an in-subset unit");
-                            emitted_ran = true;
-                            match run_unit_on_wasm(&unit_m, &wasm, &argv) {
-                                Ok(slots) => vcpu.deliver_jit_invoke_vals(&slots),
-                                Err(t) => vcpu.deliver_jit_invoke_trap(t),
-                            }
-                        }
-                    },
-                }
-            }
-            _ => panic!("unexpected event (this guest only compiles + invokes)"),
-        }
-    }
-}
-
-#[test]
-fn shared_host_runtime_compile_matches_interp() {
-    let want = run_guest_shared(UNIT_I64, Mode::Interp);
-    let got = run_guest_shared(UNIT_I64, Mode::Wasm);
-    assert_eq!(
-        want,
-        Ok(vec![Value::I64(17)]),
-        "interp reference: unit(4,5)=17"
-    );
-    assert_eq!(
-        got, want,
-        "shared-host wasm-emitted runtime-compiled unit diverged from interp"
-    );
-}
-
-#[test]
-fn shared_host_runtime_compile_trap_parity() {
-    let want = run_guest_shared(UNIT_TRAP, Mode::Interp);
-    let got = run_guest_shared(UNIT_TRAP, Mode::Wasm);
-    assert!(want.is_err(), "interp invoke must trap");
-    assert_eq!(
-        got, want,
-        "shared-host codegen trap diverged from interp (want {want:?})"
     );
 }

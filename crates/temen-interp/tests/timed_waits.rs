@@ -16,7 +16,7 @@ mod rec;
 
 use std::time::{Duration, Instant};
 
-use drivers::{agree_on, Driver, Ran, SCHEDULING};
+use drivers::{agree_on_every_driver, Driver, Ran};
 use temen_interp::{CapState, Host, OffloadOutcome, Value};
 use temen_ir::SpawnRec;
 
@@ -67,8 +67,7 @@ fn a_thread_that_naps_wakes_while_another_spins_on_it() {
         stdout: Vec::new(),
         stderr: Vec::new(),
     };
-    agree_on(
-        &SCHEDULING,
+    agree_on_every_driver(
         "a nap beside a spinner",
         &m,
         &|| (Host::new(), Vec::new()),

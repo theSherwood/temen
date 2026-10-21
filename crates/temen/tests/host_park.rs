@@ -11,13 +11,10 @@
 //! - the shared-host parallel tier genuinely overlaps punted blocking ops (the §5b
 //!   `max_active = 1` serialization fix), proven by rendezvous, not timing.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
-use temen_interp::{
-    bytecode, run_with_host, Host, OffloadHostProc, OffloadOutcome, Region, Trap, Value,
-};
+use temen_interp::{bytecode, run_with_host, Host, OffloadHostProc, OffloadOutcome, Value};
 use temen_jit::JitOutcome;
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -110,20 +107,17 @@ fn run_all_tiers(n: u64, handler: fn() -> OffloadHostProc) -> [(i64, u64); 3] {
         "interp: all completions delivered"
     );
 
-    // Bytecode interpreter — parking-aware.
-    let prog = bytecode::VcpuProgram::compile(&m).expect("compile");
+    // Bytecode interpreter (the pump) — parking-aware.
     let mut hb = Host::new();
     let hbh = hb.grant_host_proc_offloadable(handler(), None, temen_interp::CapState::Stateless);
     let comps_b = hb.completions();
-    let mut vcpu =
-        bytecode::Vcpu::new_root_reserved_with_powerbox(&prog, 0, &[Value::I32(hbh)], &[], hb, 20)
-            .expect("vcpu");
-    let bv = match vcpu.run() {
-        bytecode::VcpuEvent::Done(vals) => match vals.as_slice() {
-            [Value::I64(x)] => *x,
-            o => panic!("unexpected bytecode result {o:?}"),
-        },
-        _ => panic!("unexpected bytecode event (not Done)"),
+    let mut fuel = 1_000_000u64;
+    let bv = bytecode::compile_and_run_with_host(&m, 0, &[Value::I32(hbh)], &mut fuel, &mut hb)
+        .expect("in bytecode subset")
+        .expect("bytecode ok");
+    let bv = match bv.as_slice() {
+        [Value::I64(x)] => *x,
+        o => panic!("unexpected bytecode result {o:?}"),
     };
     assert_eq!(
         comps_b.outstanding(),
@@ -284,122 +278,44 @@ block 0 (vsp: i64, vharg: i64) {{
     )
 }
 
-/// The `vcpu_shared_host_miri.rs` driver, duplicated verbatim (test targets cannot share code
-/// without a fixture crate): spawn/join orchestration over the scoped-thread parallel tier.
-struct Orch {
-    next_id: Mutex<u64>,
-    done: Mutex<HashMap<u64, Result<Vec<Value>, Trap>>>,
-    cv: Condvar,
+/// Run `f` on its own thread, for at most 60 s: a punted op that waits inside the host lock would
+/// deadlock the rendezvous, and the test must fail on that, not hang.
+fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(Duration::from_secs(60))
+        .expect("the two punted ops never met: one waited inside the host lock")
 }
 
-impl Orch {
-    fn new() -> Orch {
-        Orch {
-            next_id: Mutex::new(0),
-            done: Mutex::new(HashMap::new()),
-            cv: Condvar::new(),
-        }
-    }
-    fn fresh_id(&self) -> u64 {
-        let mut n = self.next_id.lock().unwrap();
-        let id = *n;
-        *n += 1;
-        id
-    }
-    fn publish(&self, id: u64, r: Result<Vec<Value>, Trap>) {
-        self.done.lock().unwrap().insert(id, r);
-        self.cv.notify_all();
-    }
-    fn join(&self, id: u64) -> Result<Vec<Value>, Trap> {
-        let mut g = self.done.lock().unwrap();
-        loop {
-            if let Some(r) = g.remove(&id) {
-                return r;
-            }
-            g = self.cv.wait(g).unwrap();
-        }
-    }
-}
-
-fn drive<'s, 'e>(
-    scope: &'s std::thread::Scope<'s, 'e>,
-    prog: &'e bytecode::VcpuProgram,
-    back: &'e Arc<Region>,
-    pb: &'e Mutex<Host>,
-    orch: &'e Orch,
-    mut vcpu: bytecode::Vcpu<'e>,
-) -> Result<Vec<Value>, Trap> {
-    loop {
-        match vcpu.run() {
-            bytecode::VcpuEvent::Done(vals) => return Ok(vals),
-            bytecode::VcpuEvent::Trapped(t) => return Err(t),
-            bytecode::VcpuEvent::Spawn {
-                func,
-                sp,
-                arg,
-                module,
-                vcpu: vid,
-            } => {
-                let id = orch.fresh_id();
-                let child = bytecode::Vcpu::new_child_in(
-                    prog,
-                    module,
-                    func,
-                    &[Value::I64(sp), Value::I64(arg)],
-                    Arc::clone(back),
-                )
-                .expect("child vcpu")
-                .with_vcpu_id(vid)
-                .with_shared_host(pb);
-                scope.spawn(move || {
-                    let r = drive(scope, prog, back, pb, orch, child);
-                    orch.publish(id, r);
-                });
-                vcpu.deliver_child(id);
-            }
-            bytecode::VcpuEvent::Join { child } => {
-                vcpu.deliver_join(orch.join(child));
-            }
-            _ => panic!("unexpected event in the parallel parking test"),
-        }
-    }
-}
-
-/// **The §5b serialization fix, pinned without timing.** Two parallel vCPUs each make one
-/// blocking `call.cap` on a rendezvous-2 `Blocking` handle: each punts to the offload pool and
-/// waits *outside* the shared host lock, so both jobs co-reside on the pool and meet the width-2
-/// barrier. Under the old hold-the-lock-across-dispatch regime this deadlocks (the first caller
-/// blocks on the barrier inside the lock; the second can never dispatch), so completing at all —
-/// plus `max_active == 2` — proves the overlap.
+/// **The §5b serialization fix, pinned without timing.** Two parallel vCPUs (executor 2, an OS
+/// thread each) each make one blocking `call.cap` on a rendezvous-2 `Blocking` handle: each punts to
+/// the offload pool and waits *outside* the shared host lock, so both jobs co-reside on the pool and
+/// meet the width-2 barrier. Under the old hold-the-lock-across-dispatch regime this deadlocks (the
+/// first caller blocks on the barrier inside the lock; the second can never dispatch), so
+/// completing at all — plus `max_active == 2` — proves the overlap.
 #[test]
 fn parallel_punted_blocking_ops_overlap_on_the_pool() {
-    let m = parse_module(&threaded_src(2)).expect("parse threaded");
-    let prog = bytecode::VcpuProgram::compile(&m).expect("compile threaded");
-
+    let m = parse(&threaded_src(2));
     let mut host = Host::new();
     let h = host.grant_blocking(Duration::ZERO, Some(2));
     let state = host.blocking_state(h).expect("blocking state");
     let comps = host.completions();
-    let pb = Mutex::new(host);
-
-    let size = 1usize << 16;
-    let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
-    // SAFETY: non-zero layout; `size` valid 8-aligned bytes owned here until freed below.
-    let base = unsafe { std::alloc::alloc_zeroed(layout) };
-    assert!(!base.is_null());
-    // SAFETY: `base` is `size` valid 8-aligned bytes, exclusively this run's, freed only after.
-    let back = Arc::new(unsafe { Region::shared(base, size as u64) });
-
-    let orch = Orch::new();
-    let root = bytecode::Vcpu::new_root(&prog, 0, &[Value::I32(h)], Arc::clone(&back), &[])
-        .expect("root vcpu")
-        .with_shared_host(&pb);
-    let r = std::thread::scope(|scope| drive(scope, &prog, &back, &pb, &orch, root));
-
-    drop(back);
-    // SAFETY: same layout; the region (and all borrows) are gone (the scope joined every vCPU).
-    unsafe { std::alloc::dealloc(base, layout) };
-
+    let r = bounded(move || {
+        let mut fuel = 50_000_000u64;
+        bytecode::compile_and_run_capture_over_parallel_with_host(
+            &m,
+            0,
+            &[Value::I32(h)],
+            &mut fuel,
+            &[],
+            None,
+            &mut host,
+        )
+        .expect("in bytecode subset")
+        .0
+    });
     let got = match r.expect("parallel run ok").pop().expect("one result") {
         Value::I64(x) => x,
         o => panic!("unexpected result {o:?}"),

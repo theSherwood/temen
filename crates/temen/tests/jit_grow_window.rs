@@ -1,21 +1,23 @@
 //! **Grow-then-`Jit.invoke` host sync** (#717, the §22 arm) — the differential proof that a
 //! `vm_map`-growing guest and a §22 unit run on the **wasm-JIT codegen tier** agree once the host
-//! syncs the emitted unit's `"mapped"` global from the [`VcpuEvent::JitInvoke`] extent snapshot.
+//! syncs the emitted unit's `"mapped"` global from the [`CoopEvent::JitInvoke`] extent snapshot.
 //!
 //! The tier-up arm of the same contract is `temen-wasm-jit/tests/tierup_grow_window.rs`; this test
 //! covers the other seam that runs emitted code over the guest window: the guest grows a
 //! **reserved-tail** window through `ADDRESS_SPACE.map` (`call.cap 5 0`), then `Jit.invoke`s a
-//! memory-touching unit. The codegen host (the browser Worker's JIT_INVOKE, stood in for by wasmi
-//! here) must be observably identical to the interpreted invoke (INVARIANTS.md #9):
+//! memory-touching unit on the pump ([`CoopRun`]). The codegen host (the browser's JIT_INVOKE,
+//! stood in for by wasmi here) must be observably identical to the interpreted invoke
+//! (INVARIANTS.md #9):
 //!  - a probe **inside** the grown region round-trips on both tiers (the synced global admits it);
 //!  - a probe **above** the committed high-water faults on both (the emitted default after the
 //!    reserved-mask bump is the full reservation, so an *unsynced* host would sail through —
 //!    pinned as the negative test);
-//!  - a **sparse** grow is unrepresentable by the single bound: the event carries `mapped: None`
-//!    and the host must decline codegen for that invoke (interpreted delivery), staying correct.
+//!  - a **sparse** grow is unrepresentable by the single bound: the pump declines codegen for
+//!    that invoke and runs it interpreted, staying correct.
 
 use std::sync::Arc;
-use temen_interp::{bytecode, Host, Region, Trap, Value};
+use temen_interp::bytecode::{CoopEvent, CoopRun, ProgramEmit, TierUpConfig};
+use temen_interp::{Host, Region, Trap, Value};
 use temen_run::grant_jit;
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -81,15 +83,14 @@ const PROBE_GROWN: i64 = 65536 + 16;
 /// reservation — uncommitted on every host page size.
 const PROBE_UNCOMMITTED: i64 = 98304 + 16;
 
-/// How the one `JitInvoke` is serviced.
+/// How the one `Jit.invoke` runs.
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
-    /// Interpreted invoke (`deliver_jit_invoke`) — the oracle: the vCPU runs the unit over its own
+    /// Interpreted — the oracle: the host emits nothing, so the pump runs the unit over its own
     /// window, honoring the full page map.
     Interp,
     /// Emitted-wasm invoke with the #717 sync: write the event's `mapped` to the unit instance's
-    /// `"mapped"` global, run `f0` over the live window, deliver the slots. `mapped: None` declines
-    /// to the interpreted delivery (the browser flattening's `codegen` gate).
+    /// `"mapped"` global, run `f0` over the live window, deliver the slots.
     WasmSynced,
     /// Emitted-wasm invoke WITHOUT the sync — the pre-fix host, kept as the divergence pin.
     WasmUnsynced,
@@ -112,11 +113,12 @@ fn shared_window(size: usize) -> (Arc<Region>, *mut u8, std::alloc::Layout) {
     (back, base, layout)
 }
 
-/// Emit the unit for the codegen tier: `size_log2` bumped to the reservation first, so the emitted
-/// mask covers the guest's upper address range (the driver convention everywhere) — which also makes
-/// the emitted `"mapped"` default the full reservation, exactly why the sync is mandatory here.
-fn emit_unit(unit: &temen_ir::Module) -> Vec<u8> {
-    let mut e = unit.clone();
+/// The host's [`temen_interp::JitWasmEmitter`] for the codegen tier: the unit with `size_log2`
+/// bumped to the reservation first, so the emitted mask covers the guest's upper address range (the
+/// driver convention everywhere) — which also makes the emitted `"mapped"` default the full
+/// reservation, exactly why the sync is mandatory here.
+fn emit_unit(blob: &[u8]) -> Option<Vec<u8>> {
+    let mut e = temen_encode::decode_module(blob).ok()?;
     if let Some(mc) = e.memory.as_mut() {
         assert!(mc.size_log2 < RESERVED_LOG2, "test wants a real tail");
         mc.size_log2 = RESERVED_LOG2;
@@ -124,15 +126,15 @@ fn emit_unit(unit: &temen_ir::Module) -> Vec<u8> {
     let a = temen_wasm_jit::compile_jit(&e, temen_wasm_jit::Shape::Batch { entry: 0 }, false)
         .expect("unit emits");
     assert!(a.emitted[0], "the memory-touching unit must be in-subset");
-    a.wasm
+    Some(a.wasm)
 }
 
 /// Run the emitted unit's `f0(win, env, probe)` under wasmi over a memory **mirrored from the live
 /// window**, optionally syncing the `"mapped"` global first, then copy writes back. The native
 /// stand-in for the browser Worker's JIT_INVOKE handler.
 ///
-/// SAFETY: `base` is the live window buffer, read/written only while the vCPU is paused inside the
-/// invoke service (single-threaded), so no aliasing with the interpreter's own access.
+/// SAFETY: `base` is the live window buffer, read/written only while the run is paused on the
+/// invoke (single-threaded), so no aliasing with the interpreter's own access.
 fn run_unit_over_live_window(
     wasm: &[u8],
     argv: &[i64],
@@ -209,18 +211,19 @@ fn run_unit_over_live_window(
     out
 }
 
-/// Drive `guest(jit, code, as, probe)` over a reserved live window, servicing its one `JitInvoke`
-/// in `mode`. Returns the frame outcome, how many invokes ran on emitted wasm, and how many were
-/// declined to the interpreter by an unrepresentable extent.
-fn run_guest(guest_src: &str, probe: i64, mode: Mode) -> (Result<Vec<Value>, Trap>, u32, u32) {
+/// Run `guest(jit, code, as, probe)` on the pump over a reserved live window, its one `Jit.invoke`
+/// run as `mode` says. Returns the frame outcome and how many invokes ran on emitted wasm.
+fn run_guest(guest_src: &str, probe: i64, mode: Mode) -> (Result<Vec<Value>, Trap>, u32) {
     let m = build(guest_src);
     let unit_m = build(UNIT);
-    let unit_wasm = emit_unit(&unit_m);
     let win_size = 1usize << RESERVED_LOG2;
     let (back, base, layout) = shared_window(win_size);
 
     let mut host = Host::new();
     let jit = grant_jit(&mut host, &m, 4);
+    if mode != Mode::Interp {
+        host.set_jit_wasm_emitter(emit_unit);
+    }
     let asl = host.grant_memory();
     let blob = temen_encode::encode_module(&unit_m);
     let code = host
@@ -229,73 +232,55 @@ fn run_guest(guest_src: &str, probe: i64, mode: Mode) -> (Result<Vec<Value>, Tra
         .expect("compile ok")
         .handle;
 
-    let prog = bytecode::VcpuProgram::compile_with_jit_table(&m, 4).expect("compile guest");
     let args = [
         Value::I32(jit),
         Value::I32(code),
         Value::I32(asl),
         Value::I64(probe),
     ];
-    let mut vcpu = bytecode::Vcpu::new_root_reserved_over_with_powerbox(
-        &prog,
+    // A root emit with no function eligible: no tier-ups, but the run's units may surface to the
+    // emitted tier.
+    let tierup = TierUpConfig {
+        root: ProgramEmit::default(),
+        leaf: None,
+        modules: None,
+    };
+    let mut run = CoopRun::new_over(
+        &m,
         0,
         &args,
-        &[],
+        FUEL,
         host,
+        Some(tierup),
+        &[],
         RESERVED_LOG2,
         back,
     )
-    .expect("root vcpu");
+    .expect("in bytecode subset")
+    .expect("root");
 
-    let (mut emitted_ran, mut declined) = (0u32, 0u32);
+    let mut emitted_ran = 0u32;
     let out = loop {
-        match vcpu.run() {
-            bytecode::VcpuEvent::Done(vals) => break Ok(vals),
-            bytecode::VcpuEvent::Trapped(t) => break Err(t),
-            bytecode::VcpuEvent::JitInvoke {
-                handle,
-                code,
-                argv,
-                params: _,
-                results: _,
-                mapped,
+        match run.run() {
+            CoopEvent::Done(vals) => break Ok(vals),
+            CoopEvent::Trapped(t) => break Err(t),
+            CoopEvent::JitInvoke {
+                wasm, argv, mapped, ..
             } => {
-                let resolved = vcpu.host_mut().resolve_jit_unit(handle, code);
-                let sync = match mode {
-                    Mode::Interp => None,
-                    // The browser flattening's `codegen` gate: an unrepresentable extent declines
-                    // emitted execution for this invoke (interpreted delivery below).
-                    Mode::WasmSynced => mapped,
-                    Mode::WasmUnsynced => mapped.map(|_| 1u64 << RESERVED_LOG2), // emit default
-                };
-                match (mode, sync) {
-                    (Mode::Interp, _) | (_, None) => {
-                        if mode != Mode::Interp {
-                            declined += 1;
-                        }
-                        vcpu.deliver_jit_invoke(resolved);
-                    }
-                    (_, Some(s)) => match resolved {
-                        Err(t) => vcpu.deliver_jit_invoke_trap(t),
-                        Ok(_unit) => {
-                            emitted_ran += 1;
-                            let sync = (mode == Mode::WasmSynced).then_some(s);
-                            match run_unit_over_live_window(&unit_wasm, &argv, base, win_size, sync)
-                            {
-                                Ok(slots) => vcpu.deliver_jit_invoke_vals(&slots),
-                                Err(t) => vcpu.deliver_jit_invoke_trap(t),
-                            }
-                        }
-                    },
+                emitted_ran += 1;
+                let sync = (mode == Mode::WasmSynced).then_some(mapped);
+                match run_unit_over_live_window(&wasm, &argv, base, win_size, sync) {
+                    Ok(slots) => run.deliver_jit_invoke_vals(&slots),
+                    Err(t) => run.deliver_jit_invoke_trap(t),
                 }
             }
             _ => panic!("unexpected event (this guest only maps + invokes)"),
         }
     };
-    drop(vcpu);
-    // SAFETY: the vCPU (and its `Mem` aliasing the region) is dropped; free the window buffer.
+    drop(run);
+    // SAFETY: the run (and its `Mem` aliasing the region) is dropped; free the window buffer.
     unsafe { std::alloc::dealloc(base, layout) };
-    (out, emitted_ran, declined)
+    (out, emitted_ran)
 }
 
 fn as_i64(vals: &[Value]) -> Vec<i64> {
@@ -312,14 +297,13 @@ fn as_i64(vals: &[Value]) -> Vec<i64> {
 fn grown_region_invoke_matches_interpreter() {
     // The §22 arm of the #717 symptom: the codegen-run unit round-trips a store/load through the
     // `vm_map`-grown region and must agree with the interpreted invoke (both succeed).
-    let (want, _, _) = run_guest(GUEST_GROW, PROBE_GROWN, Mode::Interp);
+    let (want, _) = run_guest(GUEST_GROW, PROBE_GROWN, Mode::Interp);
     assert_eq!(as_i64(&want.expect("oracle ok")), vec![PROBE_GROWN]);
-    let (got, emitted_ran, declined) = run_guest(GUEST_GROW, PROBE_GROWN, Mode::WasmSynced);
+    let (got, emitted_ran) = run_guest(GUEST_GROW, PROBE_GROWN, Mode::WasmSynced);
     assert_eq!(
         emitted_ran, 1,
         "the invoke must actually run on emitted wasm"
     );
-    assert_eq!(declined, 0);
     assert_eq!(as_i64(&got.expect("codegen ok")), vec![PROBE_GROWN]);
 }
 
@@ -327,9 +311,9 @@ fn grown_region_invoke_matches_interpreter() {
 fn uncommitted_invoke_traps_on_both_tiers() {
     // Above the committed high-water both tiers fault: the interpreted unit by the page map, the
     // emitted unit by its synced live-`mapped` bound (80 KiB < probe).
-    let (want, _, _) = run_guest(GUEST_GROW, PROBE_UNCOMMITTED, Mode::Interp);
+    let (want, _) = run_guest(GUEST_GROW, PROBE_UNCOMMITTED, Mode::Interp);
     assert_eq!(want, Err(Trap::MemoryFault), "oracle sanity");
-    let (got, emitted_ran, _) = run_guest(GUEST_GROW, PROBE_UNCOMMITTED, Mode::WasmSynced);
+    let (got, emitted_ran) = run_guest(GUEST_GROW, PROBE_UNCOMMITTED, Mode::WasmSynced);
     assert_eq!(
         emitted_ran, 1,
         "the invoke must actually run on emitted wasm"
@@ -345,8 +329,8 @@ fn uncommitted_invoke_traps_on_both_tiers() {
 fn unsynced_codegen_diverges_without_host_sync() {
     // The negative pin — the pre-fix host: the emitted unit's `"mapped"` stays at its emit-time
     // default (the full reservation), so it admits the uncommitted probe the interpreter faults
-    // on. This divergence is what the JitInvoke `mapped` snapshot exists to close.
-    let (got, emitted_ran, _) = run_guest(GUEST_GROW, PROBE_UNCOMMITTED, Mode::WasmUnsynced);
+    // on. This divergence is what the `JitInvoke` `mapped` snapshot exists to close.
+    let (got, emitted_ran) = run_guest(GUEST_GROW, PROBE_UNCOMMITTED, Mode::WasmUnsynced);
     assert_eq!(
         emitted_ran, 1,
         "the invoke must actually run on emitted wasm"
@@ -360,16 +344,15 @@ fn unsynced_codegen_diverges_without_host_sync() {
 #[test]
 fn sparse_map_declines_codegen_and_stays_correct() {
     // The fail-closed arm: a sparse grow (a hole below the mapped island) makes the extent
-    // unrepresentable — the event carries `mapped: None`, the host declines codegen for the
-    // invoke (interpreted delivery), and the frame still matches the oracle exactly.
+    // unrepresentable — the pump declines codegen for the invoke and runs it interpreted, though
+    // the unit has emitted wasm, and the frame still matches the oracle exactly.
     let probe = 98304 + 16; // inside the sparse-mapped island: the interpreter admits it
-    let (want, _, _) = run_guest(GUEST_SPARSE, probe, Mode::Interp);
+    let (want, _) = run_guest(GUEST_SPARSE, probe, Mode::Interp);
     assert_eq!(as_i64(&want.expect("oracle ok")), vec![probe]);
-    let (got, emitted_ran, declined) = run_guest(GUEST_SPARSE, probe, Mode::WasmSynced);
+    let (got, emitted_ran) = run_guest(GUEST_SPARSE, probe, Mode::WasmSynced);
     assert_eq!(
         emitted_ran, 0,
         "an unrepresentable extent must never reach emitted wasm"
     );
-    assert_eq!(declined, 1, "the decline path must actually fire");
     assert_eq!(as_i64(&got.expect("declined invoke ok")), vec![probe]);
 }

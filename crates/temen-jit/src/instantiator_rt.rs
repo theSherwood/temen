@@ -1912,7 +1912,7 @@ pub(crate) unsafe extern "C" fn join(
         return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
     }
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
-    // A forged or spent child handle: `ThreadFault`, as the oracle's `take_child` answers — a child
+    // A forged or spent child handle: `ThreadFault`, as the oracle's join rule answers — a child
     // rides the §12 executor as a vCPU, so this is a thread-handle forgery, not a capability one
     // (#1573). The `Instantiator` operand itself was checked above and is the `CapFault` case.
     let Some(slot) = Nursery::live_slot(&children, handle) else {

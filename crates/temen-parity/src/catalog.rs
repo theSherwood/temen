@@ -1166,7 +1166,7 @@ fn fibers_threads(ops: &mut Vec<Op>) {
             },
         ),
         // I48 advisory blocking resume (`block: true`): same parity shape as `cont.resume`; the
-        // idling backends park while the single-vCPU `Vcpu::run` takes the FIBER_PARKED
+        // idling backends park while the bytecode debug scheduler takes the FIBER_PARKED
         // downgrade (DESIGN §12).
         (
             "cont.resume.block",
