@@ -252,7 +252,7 @@ fn debugged(
 
 /// Hold `m` as a `CoopRun` on `exec` and pump it to its end. A run idle on what the embedder feeds
 /// gets the probe's bytes once; idle otherwise, it waits on an answer the probe gives itself, and
-/// is pumped again shortly.
+/// is pumped again shortly, the time it waited passed.
 fn pumped(
     exec: Pumped,
     m: &Module,
@@ -277,9 +277,13 @@ fn pumped(
             CoopEvent::Done(v) => return judge(Ok(v), want),
             CoopEvent::Trapped(t) => return judge(Err(t), want),
             CoopEvent::CapPark { .. } | CoopEvent::Paused => {}
-            CoopEvent::Idle => match feed.take() {
+            CoopEvent::Idle { .. } => match feed.take() {
                 Some(bytes) => run.host_mut().push_stdin(bytes),
-                None => std::thread::sleep(ANSWER_POLL),
+                None => {
+                    std::thread::sleep(ANSWER_POLL);
+                    // The run's timers see the time it waited, as an embedder's do (#2557).
+                    run.pass_time(ANSWER_POLL.as_nanos() as u64);
+                }
             },
             _ => return Verdict::Other("a round-trip only the browser's tier makes".into()),
         }
