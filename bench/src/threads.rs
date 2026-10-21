@@ -17,9 +17,11 @@ use std::time::{Duration, Instant};
 use wasmtime::{Engine, Linker, Module, Store};
 
 /// A wasi-threads parallel atomic counter: spawn `nworkers`, each does `steps` atomic increments of
-/// the shared counter (mem[0]); `run` futex-waits on a remaining-count (mem[4]) the workers decrement,
-/// and returns the total (`nworkers * steps`, interleaving-invariant). The memory is **imported**
-/// (the wasi-threads shape — the host owns the one shared memory).
+/// the shared counter (mem[16384]); `run` futex-waits on a remaining-count (mem[16388]) the workers
+/// decrement, and returns the total (`nworkers * steps`, interleaving-invariant). The memory is
+/// **imported** (the wasi-threads shape — the host owns the one shared memory). Both words sit one
+/// guard up: Temen's JIT unmaps `[0, 16384)` as a NULL guard (#1094), so words at 0 and 4 faulted
+/// (#2563).
 fn parallel_wat(nworkers: u32, steps: u32) -> String {
     format!(
         r#"
@@ -30,15 +32,15 @@ fn parallel_wat(nworkers: u32, steps: u32) -> String {
     (local $j i32)
     (block $done (loop $lp
       (br_if $done (i32.ge_u (local.get $j) (i32.const {steps})))
-      (drop (i32.atomic.rmw.add (i32.const 0) (i32.const 1)))
+      (drop (i32.atomic.rmw.add (i32.const 16384) (i32.const 1)))
       (local.set $j (i32.add (local.get $j) (i32.const 1)))
       (br $lp)))
-    (drop (i32.atomic.rmw.sub (i32.const 4) (i32.const 1)))
-    (drop (memory.atomic.notify (i32.const 4) (i32.const -1))))
+    (drop (i32.atomic.rmw.sub (i32.const 16388) (i32.const 1)))
+    (drop (memory.atomic.notify (i32.const 16388) (i32.const -1))))
   (func (export "run") (result i32)
     (local $i i32) (local $r i32)
-    (i32.atomic.store (i32.const 0) (i32.const 0))           ;; reset total (the window persists across reps)
-    (i32.atomic.store (i32.const 4) (i32.const {nworkers}))  ;; remaining = nworkers
+    (i32.atomic.store (i32.const 16384) (i32.const 0))           ;; reset total (the window persists across reps)
+    (i32.atomic.store (i32.const 16388) (i32.const {nworkers}))  ;; remaining = nworkers
     (block $spawned (loop $sp
       (br_if $spawned (i32.ge_u (local.get $i) (i32.const {nworkers})))
       (drop (call $spawn (local.get $i)))
@@ -48,11 +50,11 @@ fn parallel_wat(nworkers: u32, steps: u32) -> String {
     ;; worker that drives remaining to 0 (and notifies) in the gap makes the wait return immediately
     ;; (value != expected) instead of blocking on a stale value with no further notify (a lost wakeup).
     (block $finished (loop $wait
-      (local.set $r (i32.atomic.load (i32.const 4)))
+      (local.set $r (i32.atomic.load (i32.const 16388)))
       (br_if $finished (i32.eqz (local.get $r)))
-      (drop (memory.atomic.wait32 (i32.const 4) (local.get $r) (i64.const 5000000000)))
+      (drop (memory.atomic.wait32 (i32.const 16388) (local.get $r) (i64.const 5000000000)))
       (br $wait)))
-    (i32.atomic.load (i32.const 0))))
+    (i32.atomic.load (i32.const 16384))))
 "#
     )
 }
