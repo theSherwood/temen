@@ -88,6 +88,7 @@ use temen_ir::{
 mod dwarf;
 pub mod gdb; // W5 JIT/DWARF tier (Stage 2c): in-memory ELF wrapper + the GDB JIT registration interface
 mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler // W5 JIT/DWARF tier: synthesize DWARF from the Stage 1 machine-address → source map
+mod validate; // #2481 — machine-code validator over the emitted bytes (slice 1: x86-64, shadow mode)
 
 // JIT fiber runtime (§12): host-side fiber table + `extern "C"` thunks for `cont.new`/`resume`/
 // `suspend`, on top of the `temen-fiber` stack-switch substrate. Available where `temen_fiber::supported()`.
@@ -1226,6 +1227,14 @@ fn float_clif_ty(t: FloatTy) -> Type {
 pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<JitOutcome, JitError> {
     // No host: an empty powerbox, so any `call.cap` is an inert CapFault (like `run`).
     compile_and_run_with_host(m, func, args, empty_cap_thunk, core::ptr::null_mut())
+}
+
+/// #2481 — the running count of shadow-mode machine-code-validator disagreements this process, so a
+/// test or the fuzz lane can assert the compiled corpus stays clean against the policy. `0` when the
+/// validator is disabled (a production build, or a target slice 1 does not cover). See `validate`.
+#[doc(hidden)]
+pub fn jit_validate_disagreements() -> u64 {
+    validate::disagreement_count()
 }
 
 /// Compile `func` of `m` to a reusable [`CompiledModule`] with the default no-host policy (an empty
@@ -6390,6 +6399,14 @@ fn jit_isa() -> Result<cranelift_codegen::isa::OwnedTargetIsa, JitError> {
     // each pass, which names the pass that broke the CLIF.
     let per_pass = cfg!(any(debug_assertions, fuzzing));
     let _ = flags.set("enable_verifier", if per_pass { "true" } else { "false" });
+    // #2481 — when the machine-code validator runs, ask Cranelift to record each function's basic
+    // block start offsets (`CompiledCode::bb_starts`), the hints the validator checks control-flow
+    // targets against instead of recovering the CFG itself. Off otherwise, so a production compile
+    // that does not validate pays nothing. The flag adds metadata only; it does not change the code.
+    // Also on under `cfg(test)`, so the decoder/validator cross-check tests see real block layout.
+    if validate::enabled() || cfg!(test) {
+        let _ = flags.set("machine_code_cfg_info", "true");
+    }
     cranelift_native::builder()
         .map_err(|e| JitError::Backend(e.to_string()))?
         .finish(settings::Flags::new(flags))
@@ -6469,6 +6486,8 @@ fn define_funcs(
                     .map_err(|e| JitError::Backend(e.to_string()))?;
                 #[cfg(test)]
                 record_emitted(module, code.code_buffer(), &relocs);
+                #[cfg(all(test, target_arch = "x86_64"))]
+                validate::capture_code(code.code_buffer(), &code.bb_starts);
                 let kept = keep
                     .as_mut()
                     .is_some_and(|k| k.push(module, ids, align, code.code_buffer(), &relocs));
@@ -6521,7 +6540,14 @@ fn compile_verified(
     let code = isa
         .compile_function(&ctx.func, &ctx.domtree, ctx.want_disasm, &mut ctrl)
         .map_err(|e| cranelift_module::ModuleError::from(e).to_string())?;
-    Ok(code.apply_params(&ctx.func.params))
+    let code = code.apply_params(&ctx.func.params);
+    // #2481 — shadow-mode machine-code validation: check the emitted bytes against the policy and
+    // log any disagreement, but never reject (slice 1). `enabled()` is false on a production compile,
+    // so this is inert there; `jit_isa` only records `bb_starts` when it is true.
+    if validate::enabled() {
+        validate::shadow_check(code.code_buffer(), &code.bb_starts);
+    }
+    Ok(code)
 }
 
 /// Define `id` in `module` from `ctx`'s CLIF, compiled by [`compile_verified`], and return its code.

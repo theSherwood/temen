@@ -26,6 +26,11 @@ temen-text = { path = "../temen-text" }
 # the verifier. None of these depend on temen-jit, so there is no cycle.
 temen-interp = { path = "../temen-interp" }
 temen-verify = { path = "../temen-verify" }
+# #2481 — the **second decoder** the hand-rolled machine-code validator (`validate`) is cross-checked
+# against: a test compiles real modules and asserts our decoder's instruction boundaries and
+# control-flow classification agree with iced-x86's. Pure Rust and **dev-only**, so it is never in
+# the product or the escape-TCB (the product decoder stays dependency-free and patchable in-tree).
+iced-x86 = "1.21.0"
 
 [dependencies]
 cranelift-codegen = "0.132.0"
