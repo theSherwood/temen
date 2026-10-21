@@ -40,10 +40,10 @@ use temen_browser::{
 };
 use temen_browser::{
     stage_child_program, temen_alloc, temen_coop_cap_len, temen_coop_cap_ptr,
-    temen_coop_deliver_cap, temen_coop_module, temen_coop_program_wasm_len,
-    temen_coop_program_wasm_ptr, temen_coop_read, temen_coop_read_ptr, temen_coop_run_for,
-    COOP_LEAF_OFF, COOP_LEAF_ROOT, COOP_LEAF_SUSPENDS, COOP_NO_REGIONS, COOP_RUN_CAP_PARK,
-    COOP_RUN_PAUSED, COOP_RUN_RESUME,
+    temen_coop_deliver_cap, temen_coop_idle_timer, temen_coop_module, temen_coop_pass_time,
+    temen_coop_program_wasm_len, temen_coop_program_wasm_ptr, temen_coop_read,
+    temen_coop_read_ptr, temen_coop_run_for, COOP_LEAF_OFF, COOP_LEAF_ROOT, COOP_LEAF_SUSPENDS,
+    COOP_NO_REGIONS, COOP_RUN_CAP_PARK, COOP_RUN_IDLE, COOP_RUN_PAUSED, COOP_RUN_RESUME,
 };
 use temen_interp::{Host, StreamRole};
 use wasmi::{
@@ -6427,6 +6427,89 @@ fn coop_root_leaf_parks_on_declared_caps_and_matches_interpreted() {
         (temen_coop_wasm_len() > 0, temen_coop_program_wasm_len(0)),
         (true, 0)
     );
+    temen_coop_close();
+}
+
+/// #2557 — the root waits 1 ms on a word nobody notifies while its thread asks the page `ping(7)`,
+/// reads the flag the thread raises once answered, and joins it: `2` (timed out) * 10_000 + the
+/// flag * 1000 + `pong(7)`.
+const TIMER_WHILE_OWED: &str = r#"memory 16
+import 0 "ping" (i64) -> (i64)
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vaddr = i64.const 36864
+  vexp = i32.const 0
+  vto = i64.const 1000000
+  vst = i32.atomic.wait vaddr vexp vto
+  vflagat = i64.const 40960
+  vflag = i64.load vflagat
+  vr = thread.join vt
+  vst64 = i64.extend_i32_s vst
+  vk = i64.const 10000
+  vs = i64.mul vst64 vk
+  vk2 = i64.const 1000
+  vf = i64.mul vflag vk2
+  vsf = i64.add vs vf
+  vsum = i64.add vsf vr
+  return vsum
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vseven = i64.const 7
+  vr = call.import 0 (vseven)
+  vaddr = i64.const 40960
+  vone = i64.const 1
+  i64.store vaddr vone
+  return vr
+  }
+}
+export 0 func "_start" 0
+"#;
+
+/// **While the page owes an answer, the run hands it the time to its next timer** (#2557). The
+/// thread's `ping` is told (`COOP_RUN_CAP_PARK`) and left unanswered; the run is then
+/// `COOP_RUN_IDLE` with the root's 1 ms timer (`temen_coop_idle_timer`), the same until the page lets
+/// time pass (`temen_coop_pass_time`), and with none once it has: the root's wait timed out, and it
+/// waits on the thread. The answer then ends the run, the flag still down when the root read it.
+#[test]
+fn coop_run_idles_with_its_timer_while_an_answer_is_owed() {
+    let _g = ffi_guard();
+    let m = temen_text::parse_module(TIMER_WHILE_OWED).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+    let cp = temen_alloc(4);
+    // SAFETY: `temen_alloc` returned a live allocation at least that long.
+    unsafe { core::ptr::copy_nonoverlapping(b"ping".as_ptr(), cp, 4) };
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        cp,
+        4,
+        COOP_NO_REGIONS,
+    );
+    assert_eq!(opened, 0, "opens");
+    assert_eq!(temen_coop_run(), COOP_RUN_CAP_PARK, "the thread's call is told");
+    // SAFETY: the request words stay live until the next deliver/run/close.
+    let words =
+        unsafe { std::slice::from_raw_parts(temen_coop_cap_ptr(), temen_coop_cap_len()) }.to_vec();
+    assert_eq!(words[1..], [0, 7], "ping(7)");
+    let idle = || {
+        assert_eq!(temen_coop_run(), COOP_RUN_IDLE, "the run waits on the page");
+        temen_coop_idle_timer()
+    };
+    assert_eq!(idle(), 1_000_000, "the root's timer");
+    assert_eq!(idle(), 1_000_000, "no time has passed");
+    temen_coop_pass_time(1_000_000);
+    assert_eq!(idle(), -1, "the root's wait timed out: it waits on the thread");
+    assert_eq!(temen_coop_deliver_cap(words[0] as u64, pong(7)), 1);
+    assert_eq!(temen_coop_run(), COOP_RUN_DONE, "status {}", temen_status());
+    assert_eq!(temen_coop_value(), 20_000 + pong(7));
     temen_coop_close();
 }
 

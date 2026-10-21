@@ -63,7 +63,7 @@ fn echo_session(exec: drivers::Pumped) {
 
     // Echoes "abc", then the next read finds the buffer empty and parks: not EOF, not an exit.
     assert!(
-        matches!(run.run(), CoopEvent::Idle),
+        matches!(run.run(), CoopEvent::Idle { timer: None }),
         "{exec:?}: an exhausted blocking stdin must idle the run, not return EOF",
     );
     assert_eq!(
@@ -72,13 +72,16 @@ fn echo_session(exec: drivers::Pumped) {
         "{exec:?}: the preloaded chunk was echoed"
     );
     assert!(
-        matches!(run.run(), CoopEvent::Idle),
+        matches!(run.run(), CoopEvent::Idle { timer: None }),
         "{exec:?}: pumped again with nothing fed, the run is still idle"
     );
 
     // Push more and pump: the parked read re-issues, echoes "de", and parks again.
     run.host_mut().push_stdin(b"de");
-    assert!(matches!(run.run(), CoopEvent::Idle), "{exec:?}");
+    assert!(
+        matches!(run.run(), CoopEvent::Idle { timer: None }),
+        "{exec:?}"
+    );
     assert_eq!(
         run.host_mut().stdout,
         b"abcde",
@@ -87,7 +90,10 @@ fn echo_session(exec: drivers::Pumped) {
 
     // And again: a REPL parks after every prompt.
     run.host_mut().push_stdin(b"f");
-    assert!(matches!(run.run(), CoopEvent::Idle), "{exec:?}");
+    assert!(
+        matches!(run.run(), CoopEvent::Idle { timer: None }),
+        "{exec:?}"
+    );
     assert_eq!(run.host_mut().stdout, b"abcdef", "{exec:?}");
 }
 

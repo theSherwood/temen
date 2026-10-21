@@ -4091,7 +4091,7 @@ fn pg_pump(s: &mut PgSession) -> i32 {
     s.stdout_pos = host.stdout.len();
     drop(host);
     let ran = match ev {
-        bytecode::CoopEvent::Idle => {
+        bytecode::CoopEvent::Idle { .. } => {
             return pg_report(PbOutcome {
                 stdout,
                 ..PbOutcome::refused(STATUS_OK)
@@ -5860,7 +5860,7 @@ pub extern "C" fn temen_bash_coop_pump() -> i32 {
         return BASH_COOP_DONE;
     }
     match s.run.run() {
-        bytecode::CoopEvent::Idle => BASH_COOP_IDLE,
+        bytecode::CoopEvent::Idle { .. } => BASH_COOP_IDLE,
         bytecode::CoopEvent::Done(_) => {
             s.exit = Some(0);
             BASH_COOP_DONE
@@ -9530,6 +9530,8 @@ fn onramp_tierup_unit_emitter(blob: &[u8]) -> Option<Vec<u8>> {
 /// #1953/#1954: the request a [`COOP_RUN_CAP_PARK`] reports — `[id, cap
 /// index, args…]` (see [`cap_park_words`]). Empty when no run is parked.
 static mut CAP_REQUEST: Vec<i64> = Vec::new();
+/// #2557: the timer the last [`COOP_RUN_IDLE`] reported, in ns, or `-1` for none.
+static mut IDLE_TIMER: i64 = -1;
 /// #1953/#1954: the bytes the last [`temen_coop_read`] copied out of the
 /// window.
 static mut WINDOW_READ: (*mut u8, usize) = (core::ptr::null_mut(), 0);
@@ -9584,10 +9586,14 @@ pub const COOP_RUN_JIT_INVOKE: i32 = 3;
 pub const COOP_RUN_RESUME: i32 = 4;
 /// #1954: [`temen_coop_run_for`]'s slice was spent and the program is still running; pump again.
 pub const COOP_RUN_PAUSED: i32 = 5;
-/// #1954: the program is waiting on a declared host-completed cap call. Read the request
-/// ([`temen_coop_cap_len`]/[`temen_coop_cap_ptr`]), answer it with [`temen_coop_deliver_cap`], and
-/// pump again.
+/// #1954: a task made a declared host-completed cap call, and waits for its answer. Read the request
+/// ([`temen_coop_cap_len`]/[`temen_coop_cap_ptr`]) and pump again: the run's other tasks go on
+/// (#2557). Answer it with [`temen_coop_deliver_cap`] when the answer comes.
 pub const COOP_RUN_CAP_PARK: i32 = 6;
+/// #2557: nothing can run until the page answers a call it was told of ([`COOP_RUN_CAP_PARK`]), or
+/// until the run's next timer, [`temen_coop_idle_timer`] ns away. Answer it, or wait out the timer,
+/// let the time that passed pass ([`temen_coop_pass_time`]), and pump again.
+pub const COOP_RUN_IDLE: i32 = 7;
 
 /// The live cooperative tier-up session — the `CoopRun` plus the host-facing operand/capture state
 /// (mirrors the relevant fields of `TierupRun`). The window `Region` is shared with `CoopRun`'s
@@ -9824,6 +9830,16 @@ fn emit_leaf(o: &bytecode::LeafOffer, shared: bool) -> Option<std::sync::Arc<[u8
 }
 
 impl CoopTierupRun {
+    /// #2557: whether the page owes the answer to a call it was told of: one filed, not yet
+    /// delivered ([`temen_coop_deliver_cap`]).
+    fn owes(&self) -> bool {
+        !self
+            .requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
     /// A session over `run` with nothing of its own: no window, no emit, no leaves, no caps. The
     /// opens fill in what they have over it.
     fn over(run: bytecode::CoopRun) -> Self {
@@ -10569,10 +10585,16 @@ fn coop_pump(budget: Option<u64>) -> i32 {
             unsafe { *core::ptr::addr_of_mut!(CAP_REQUEST) = words };
             return COOP_RUN_CAP_PARK;
         }
-        // Not surfaced here: the page answers each call before it pumps again, and this driver
-        // feeds no input (#1122 route (a) is the bash coop session's driver, below). Fail closed
-        // rather than spin, as a run with nothing left to wake it does.
-        bytecode::CoopEvent::Idle => (Err(Trap::ThreadFault), COOP_RUN_TRAP),
+        // #2557: the page's answer to a call it owes, or the run's next timer, wakes the run.
+        bytecode::CoopEvent::Idle { timer } if timer.is_some() || s.owes() => {
+            let timer = timer.map_or(-1, |ns| i64::try_from(ns).unwrap_or(i64::MAX));
+            // SAFETY: single-threaded access to the read-back slot.
+            unsafe { *core::ptr::addr_of_mut!(IDLE_TIMER) = timer };
+            return COOP_RUN_IDLE;
+        }
+        // Nothing can wake the run: this driver feeds no input (#1122 route (a) is the bash coop
+        // session's driver, below). Fail closed rather than spin.
+        bytecode::CoopEvent::Idle { .. } => (Err(Trap::ThreadFault), COOP_RUN_TRAP),
     };
     // #816 item 4: a warm-coop eval ended — advance the warm session's heap high-water so the next
     // restore zeroes exactly what this eval dirtied: the brk it advanced plus any page it left
@@ -10656,6 +10678,25 @@ pub extern "C" fn temen_coop_deliver_cap(id: u64, value: i64) -> i32 {
     // SAFETY: as above.
     unsafe { (*core::ptr::addr_of_mut!(CAP_REQUEST)).clear() };
     1
+}
+
+/// #2557: the time, in ns, to the run's next timer the last [`COOP_RUN_IDLE`] reported, or `-1`
+/// when no wait has a deadline.
+#[no_mangle]
+pub extern "C" fn temen_coop_idle_timer() -> i64 {
+    // SAFETY: single-threaded wasm.
+    unsafe { *core::ptr::addr_of!(IDLE_TIMER) }
+}
+
+/// #2557: `ns` of the page's time has passed since the run went [`COOP_RUN_IDLE`]: the run's waits
+/// that time reaches time out at the next pump ([`bytecode::CoopRun::pass_time`]). Nothing with no
+/// session open.
+#[no_mangle]
+pub extern "C" fn temen_coop_pass_time(ns: u64) {
+    // SAFETY: single-threaded access to the session statics.
+    if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() } {
+        s.run.pass_time(ns);
+    }
 }
 
 /// #1954: copy `len` bytes of the run's root window at `addr` (bounded: an out-of-window range copies

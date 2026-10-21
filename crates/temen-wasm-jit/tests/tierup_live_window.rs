@@ -216,7 +216,7 @@ fn tiered_frame(
             }
             // One task over one window, serviced only for tier-up.
             CoopEvent::Paused
-            | CoopEvent::Idle
+            | CoopEvent::Idle { .. }
             | CoopEvent::CapPark { .. }
             | CoopEvent::Resume { .. }
             | CoopEvent::JitInvoke { .. } => panic!("unexpected event on a one-task run"),

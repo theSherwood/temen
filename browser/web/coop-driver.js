@@ -410,9 +410,12 @@ export function endSession(session) {
 //   stop the run here (the session is closed and the driver returns `null`). This is where an embedder
 //   yields to its event loop, and where it waits out a Pause.
 // - `onCapPark({ id, index, args })`: a call to a declared host-completed cap (`temen_coop_open`'s
-//   caps) parked the run: `index` names the cap, `args` are its arguments. Resolve to the call's
-//   result (a Number or BigInt) and the run goes on; resolve to `null` to stop it, as `onSlice` can.
-//   The run's window is readable meanwhile through `temen_coop_read`.
+//   caps) parked its task: `index` names the cap, `args` are its arguments. Resolve to the call's
+//   result (a Number or BigInt) and the driver delivers it before its next pump; resolve to `null`
+//   to stop the run, as `onSlice` can. The run goes on meanwhile (#2557): its other tasks run, and
+//   its timers fire in the page's time. With nothing left to run, the driver waits for an answer
+//   or the run's next timer, whichever comes first. The run's window is readable meanwhile
+//   through `temen_coop_read`.
 // - `trapDeclines` (default `true`): a trapped run throws ("declined to the interpreter"), for a host
 //   that then re-runs the program interpreted. `false` returns the trap status (3) instead, with the
 //   trap's name and fault address in the `temen_trap_*`/`temen_fault_addr` slots. That is exact for a
@@ -631,9 +634,26 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
     });
     onOutput(out, err);
   };
+  // #2557: the answers `onCapPark` gave, in the order they came, each delivered before the next
+  // pump; `answered` ends an idle wait when one comes.
+  const answers = [];
+  let answered = () => {};
+  const deliverAnswers = () => {
+    while (answers.length) {
+      const a = answers.shift();
+      if (!a.ok) throw a.error;
+      if (a.value === null || a.value === undefined) return false;
+      ex.temen_coop_deliver_cap(a.id, BigInt(a.value));
+    }
+    return true;
+  };
   let stopped = false;
   try {
     for (;;) {
+      if (!deliverAnswers()) {
+        stopped = true;
+        break;
+      }
       const ev = budget === undefined ? ex.temen_coop_run() : ex.temen_coop_run_for(BigInt(budget));
       handOutput();
       if (ev === 5 /* COOP_RUN_PAUSED */) {
@@ -645,17 +665,37 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
         continue;
       }
       if (ev === 6 /* COOP_RUN_CAP_PARK */) {
-        // #1954: a declared cap call parked the run — `[id, cap index, args…]` — until it is answered.
-        const n = ex.temen_coop_cap_len();
-        const words = new BigInt64Array(memory.buffer, Number(ex.temen_coop_cap_ptr()), n).slice();
-        const value = onCapPark
-          ? await onCapPark({ id: words[0], index: Number(words[1]), args: Array.from(words.slice(2)) })
-          : null;
-        if (value === null || value === undefined) {
+        // #1954: a declared cap call parked its task — `[id, cap index, args…]` — until it is
+        // answered. #2557: the run goes on meanwhile, and the answer is delivered once it comes.
+        if (!onCapPark) {
           stopped = true;
           break;
         }
-        ex.temen_coop_deliver_cap(words[0], BigInt(value));
+        const n = ex.temen_coop_cap_len();
+        const words = new BigInt64Array(memory.buffer, Number(ex.temen_coop_cap_ptr()), n).slice();
+        const id = words[0];
+        Promise.resolve(onCapPark({ id, index: Number(words[1]), args: Array.from(words.slice(2)) }))
+          .then((value) => ({ id, ok: true, value }), (error) => ({ id, ok: false, error }))
+          .then((a) => {
+            answers.push(a);
+            answered();
+          });
+        continue;
+      }
+      if (ev === 7 /* COOP_RUN_IDLE */) {
+        // #2557: nothing can run until an answer comes, or until the run's next timer (`-1`: none).
+        // Wait for whichever comes first, then let the time that passed pass in the run.
+        if (answers.length === 0) {
+          const timer = ex.temen_coop_idle_timer();
+          const began = performance.now();
+          await new Promise((wake) => {
+            answered = wake;
+            // A delay past 2^31 - 1 ms would fire at once: wait that long, and look again.
+            if (timer >= 0n) setTimeout(wake, Math.min(Number(timer) / 1e6, 0x7fffffff));
+          });
+          answered = () => {};
+          ex.temen_coop_pass_time(BigInt(Math.round((performance.now() - began) * 1e6)));
+        }
         continue;
       }
       if (ev === 4 /* COOP_RUN_RESUME */) {

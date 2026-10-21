@@ -2021,6 +2021,21 @@ debug scheduler keeps the jump, so a replay stays exact, and waits in real time 
 (#2538); a `CoopRun`'s embedder (the browser) keeps it too, as wasm has no clock to wait on (#2439).
 Pinned in `temen-interp/tests/timed_waits.rs`.
 
+**A `CoopRun`'s timers run on its embedder's clock while an answer is owed (#2557, 2026-10-21).** A
+`CoopRun` hands control back when nothing can run until its embedder acts (#1414 D4). With an answer
+owed, it did so before any timer fired, since its clock jumps (#2439) and must not run ahead of the
+answer. So its timers stopped until the answer came, and an answer that waited on one of them never
+came. Now `Idle` carries the time to the run's next timer, and the embedder, which has a clock,
+waits for whichever comes first, its own event or that time. It then lets the time that passed pass
+(`CoopRun::pass_time`): the clock moves by it, as by a quantum's ops, and the waits it reaches time
+out. The clock still never runs ahead of the embedder's. The browser's driver pumps on while the
+page answers (`COOP_RUN_IDLE`, `temen_coop_idle_timer`, `temen_coop_pass_time`); before, it awaited
+each answer before it pumped again, and the whole run stood still meanwhile. Executor 2's `Idle`
+reports its next deadline too, though its timers fire on their own. With no answer owed, a
+`CoopRun` still jumps (#2439). Pinned in `temen-interp/tests/host_completed_cap.rs` (both
+executors), `browser/tests/coop_tierup_driver.rs` (the page's exports) and
+`browser/browser-coop-embedder-test.mjs` (the JS driver).
+
 **One bell for an idle pump (#2480, 2026-10-20).** With nothing to run, the pump waited either on the
 answers to its outstanding calls or on the embedder's bell, never both, so a feed, a signal or a
 kill went unseen until a call answered — and a call may wait on the world. Now every store a parked
