@@ -1626,9 +1626,10 @@ fn durable_spawner(images: &[Module], one_lane: bool) -> (Host, Vec<Value>) {
     (h, args)
 }
 
-/// Run `inst` uninterrupted, then frozen by a back-edge countdown at 16 on one lane, through the
-/// codec into a fresh host, and thawed: what each answers, and how many detached children rode.
-fn freeze_thaw_spawner(inst: &Module, images: &[Module]) -> (Vec<Value>, Vec<Value>, usize) {
+/// Run `inst` uninterrupted, then frozen twice on one lane, through the codec into a fresh host each
+/// time, and thawed: from a fresh run by a back-edge countdown at 16, then from its thaw at 8 more.
+/// What each answers, and how many detached children rode each freeze.
+fn freeze_thaw_spawner(inst: &Module, images: &[Module]) -> (Vec<Value>, Vec<Value>, [usize; 2]) {
     use temen_durable::arm_freeze_after_backedges;
 
     let (mut h, args) = durable_spawner(images, false);
@@ -1639,25 +1640,30 @@ fn freeze_thaw_spawner(inst: &Module, images: &[Module]) -> (Vec<Value>, Vec<Val
 
     let (mut h, args) = durable_spawner(images, true);
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after_backedges(&mut win, TEST_ARENA, 16);
+    let mut rode = [0; 2];
+    for (round, backedges) in [(0, 16), (1, 8)] {
+        arm_freeze_after_backedges(&mut win, TEST_ARENA, backedges);
+        let mut fuel = 5_000_000u64;
+        let (r, snap) =
+            run_capture_reserved_with_host(inst, 0, &args, &mut fuel, &win, SIZE_LOG2, &mut h);
+        assert_eq!(
+            r,
+            Ok(vec![Value::I64(0)]),
+            "the root unwinds for freeze {round}"
+        );
+        assert_eq!(
+            h.take_freeze_declined(),
+            None,
+            "freeze {round} is not declined"
+        );
+        rode[round] = h.captured_detached().len();
+        let art = freeze(inst, &snap, &h).expect("freeze");
+        h = durable_spawner(images, round == 0).0;
+        win = restore(&art, inst, &mut h).expect("restore");
+        begin_thaw(&mut win, TEST_ARENA, 0);
+    }
     let mut fuel = 5_000_000u64;
-    let (r, snap) =
-        run_capture_reserved_with_host(inst, 0, &args, &mut fuel, &win, SIZE_LOG2, &mut h);
-    assert_eq!(
-        r,
-        Ok(vec![Value::I64(0)]),
-        "the root unwinds for the freeze"
-    );
-    assert_eq!(h.take_freeze_declined(), None, "the freeze is not declined");
-    let rode = h.captured_detached().len();
-    let art = freeze(inst, &snap, &h).expect("freeze");
-
-    let (mut th, args) = durable_spawner(images, false);
-    let mut back = restore(&art, inst, &mut th).expect("restore");
-    begin_thaw(&mut back, TEST_ARENA, 0);
-    let mut fuel = 5_000_000u64;
-    let (r, _) =
-        run_capture_reserved_with_host(inst, 0, &args, &mut fuel, &back, SIZE_LOG2, &mut th);
+    let (r, _) = run_capture_reserved_with_host(inst, 0, &args, &mut fuel, &win, SIZE_LOG2, &mut h);
     (whole, r.expect("the thawed run"), rode)
 }
 
@@ -1670,11 +1676,15 @@ fn a_regranted_live_cap_rides_the_freeze_and_thaws_relinked() {
         vec![Value::I64(1042)],
         "uninterrupted: S served G's one call"
     );
-    assert_eq!(rode, 2, "S and G both ride, G holding the re-granted offer");
+    assert_eq!(
+        rode,
+        [2, 2],
+        "S and G both ride, G holding the re-granted offer"
+    );
     assert_eq!(
         thawed,
         vec![Value::I64(1042)],
-        "the thawed G's call reaches the re-launched S through the re-linked offer"
+        "the twice-thawed G's call reaches the re-launched S through the re-linked offer"
     );
 }
 
@@ -1795,7 +1805,7 @@ fn a_live_cap_a_thread_mints_thaws_onto_its_own_child() {
         vec![Value::I64(43001)],
         "uninterrupted: B answers T, A the root"
     );
-    assert_eq!(rode, 2, "A and B both ride");
+    assert_eq!(rode, [2, 2], "A and B both ride");
     assert_eq!(
         thawed,
         vec![Value::I64(43001)],

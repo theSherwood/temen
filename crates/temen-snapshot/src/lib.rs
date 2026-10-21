@@ -62,8 +62,9 @@ use temen_interp::{
     capture_cut_regions, Attestation, BudgetState, BudgetThawRefused, CapturedDetached,
     CapturedTwin, DetachedLaunch, DurableBinding, DurableBudget, DurableHandle, DurableJitTable,
     DurableJitUnit, DurableNamedCap, DurablePipe, DurableRegion, FrozenDetached, FrozenFiber,
-    FrozenVCpu, Host, MemLayout, NonDurableHandle, RegionBacking, RegionNotCaptured, RegionRefusal,
-    ShadowArena, StreamRole, SvcDispatch, ThawedDetached, ThawedTwin, Trap, TwinLaunch,
+    FrozenTwin, FrozenVCpu, Host, MemLayout, NonDurableHandle, RegionBacking, RegionNotCaptured,
+    RegionRefusal, ShadowArena, StreamRole, SvcDispatch, ThawedDetached, ThawedTwin, Trap,
+    TwinLaunch,
 };
 use temen_ir::Module;
 
@@ -290,9 +291,11 @@ use temen_ir::Module;
 /// launch record and its own root-shaped artifact, bound to its parent's program, since a durable
 /// domain never execs. Elided when the domain forked none that lives, so such an artifact is
 /// byte-identical to v48 but for the version field.
-/// v50 (#1681): `B_LIVE_IMPL` (7) names its callee by the callee's task id in the frozen run, where it
-/// named the callee's join slot in the holder's table. A task id names the callee from every domain
-/// the offer reaches: one it was re-granted into, or a fork twin's copy.
+/// v50 (#1681, #2571): `B_LIVE_IMPL` (7) names its callee by the callee's task id in the frozen run,
+/// where it named the callee's join slot in the holder's table. A task id names the callee from every
+/// domain the offer reaches: one it was re-granted into, or a fork twin's copy. A Section 12 record
+/// gains its kind after the pid: a live twin a personality forked, a live one a servicer forked, or a
+/// servicer's twin that exited unreaped, which holds its outcome.
 const FORMAT_VERSION: u16 = 50;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
@@ -332,9 +335,15 @@ const TAG_BUDGETS: u64 = 10;
 /// Section 11 (v39, #2025): the §13 regions inside the cut, by artifact number — each one's bytes.
 /// Emitted only when a region rides.
 const TAG_REGIONS: u64 = 11;
-/// Section 12 (v49, #1688): the live fork twins a domain forked, each a nested artifact. See
+/// Section 12 (v49, #1688): the fork twins a domain forked, each live one a nested artifact. See
 /// [`write_twins`].
 const TAG_TWINS: u64 = 12;
+/// A Section 12 record's kind: a live twin a personality forked, which its own table reaps.
+const TWIN_LIVE: u8 = 0;
+/// A live twin a servicer's `clone_caller` forked, which the servicer's `wait` reaps (v50, #2571).
+const TWIN_LIVE_SERVICER: u8 = 1;
+/// A servicer's twin that exited, awaiting that `wait` (v50, #2571).
+const TWIN_EXITED: u8 = 2;
 /// How deep detached children may nest inside one artifact. Restore recurses once per level, so an
 /// untrusted artifact must not choose the depth; freeze refuses past the same bound, so it never emits
 /// an artifact restore would reject.
@@ -446,9 +455,9 @@ pub enum FreezeError {
     DetachedUnreached { parent_task: usize, slot: usize },
     /// Detached children nest deeper than [`MAX_DETACHED_DEPTH`].
     DetachedTooDeep,
-    /// #1688 — a live fork twin the freeze could not carry ([`Host::unreached_twins`]): it never
-    /// unwound, it is a servicer's (#2571), or its parent did not ride. The artifact would be missing
-    /// a process, so freeze refuses it whole.
+    /// #1688 — a fork twin the freeze could not carry ([`Host::unreached_twins`]): it never
+    /// unwound, it ended after the freeze rang it otherwise than by returning (#2571), or its parent
+    /// did not ride. The artifact would be missing a process, so freeze refuses it whole.
     TwinUnreached { pid: u64 },
     /// #1680 — a pipe has an end outside the cut (held by a domain the freeze does not carry, such
     /// as a fork twin or a detached child). The cut's boundary is not yet carried (#1680 slice 2).
@@ -982,8 +991,8 @@ fn freeze_at(
 
     // Section 12 — the domain's fork twins (#1688, v49). Each live twin's artifact is frozen first,
     // as a detached child's is, so a twin that can't be frozen fails this freeze whole. Elided when
-    // none rides.
-    if !host.captured_twins().is_empty() {
+    // none rides, live or exited (#2571).
+    if !host.captured_twins().is_empty() || !host.frozen_twins().is_empty() {
         if depth >= MAX_DETACHED_DEPTH {
             return Err(FreezeError::DetachedTooDeep);
         }
@@ -994,38 +1003,58 @@ fn freeze_at(
     Ok(out)
 }
 
-/// Serialize Section 12 (v49): the domain's live fork twins, ascending pid. Each record is the pid,
-/// the launch record, and the twin's own artifact, length-prefixed. That artifact is this format,
-/// frozen from its own powerbox over its parent's program, which it runs (a durable domain never
-/// execs).
+/// Serialize Section 12 (v49): the domain's fork twins, ascending pid. Each record is the pid and its
+/// kind ([`TWIN_LIVE`], [`TWIN_LIVE_SERVICER`], [`TWIN_EXITED`]). A live twin's then holds its launch
+/// record and its own artifact, length-prefixed. That artifact is this format, frozen from its own
+/// powerbox over its parent's program, which it runs (a durable domain never execs). An exited
+/// servicer twin's holds its outcome (v50, #2571).
 fn write_twins(
     module: &Module,
     host: &Host,
     depth: usize,
     cut: &Cut,
 ) -> Result<Vec<u8>, FreezeError> {
-    let mut twins: Vec<&CapturedTwin> = host.captured_twins().iter().collect();
-    twins.sort_by_key(|t| t.pid);
+    enum Twin<'a> {
+        Live(&'a CapturedTwin),
+        Exited(&'a FrozenTwin),
+    }
+    let live = host.captured_twins().iter().map(|t| (t.pid, Twin::Live(t)));
+    let exited = host.frozen_twins().iter().map(|t| (t.pid, Twin::Exited(t)));
+    let mut twins: Vec<(u64, Twin)> = live.chain(exited).collect();
+    twins.sort_by_key(|&(pid, _)| pid);
     let mut b = Vec::new();
     write_uleb(&mut b, twins.len() as u64);
-    for t in twins {
-        let art = {
-            let h = t.host.lock().unwrap_or_else(|e| e.into_inner());
-            freeze_at(
-                module,
-                Image::of(&t.window),
-                t.reserved_log2,
-                &h,
-                depth + 1,
-                cut,
-            )?
-        };
-        write_uleb(&mut b, t.pid);
-        write_uleb(&mut b, u64::from(t.launch.entry));
-        write_uleb(&mut b, u64::from(t.launch.ctx));
-        write_names(&mut b, &t.launch.names);
-        write_uleb(&mut b, art.len() as u64);
-        b.extend_from_slice(&art);
+    for (pid, twin) in twins {
+        write_uleb(&mut b, pid);
+        match twin {
+            Twin::Live(t) => {
+                let art = {
+                    let h = t.host.lock().unwrap_or_else(|e| e.into_inner());
+                    freeze_at(
+                        module,
+                        Image::of(&t.window),
+                        t.reserved_log2,
+                        &h,
+                        depth + 1,
+                        cut,
+                    )?
+                };
+                b.push(if t.launch.servicer {
+                    TWIN_LIVE_SERVICER
+                } else {
+                    TWIN_LIVE
+                });
+                write_uleb(&mut b, u64::from(t.launch.entry));
+                write_uleb(&mut b, u64::from(t.launch.ctx));
+                write_names(&mut b, &t.launch.names);
+                write_uleb(&mut b, art.len() as u64);
+                b.extend_from_slice(&art);
+            }
+            Twin::Exited(t) => {
+                b.push(TWIN_EXITED);
+                write_join_outcome(&mut b, Some(t.outcome));
+            }
+        }
     }
     Ok(b)
 }
@@ -1984,8 +2013,9 @@ fn restore_at(
     // ---- Fork twins (#1688, v49): each live one restored from its own nested artifact into its own
     // powerbox, against its parent's program, as a detached child is. ----
     if let Some(body) = twins_body {
-        let twins = decode_twins(body, module, host, depth, cut)?;
+        let (twins, exited) = decode_twins(body, module, host, depth, cut)?;
         host.set_thawed_twins(twins);
+        host.set_frozen_twins(exited);
     }
     // #1944: every carried budget node is one some domain of the cut named, or an ancestor of one
     // (canonical), known only now that every detached child's handles are in.
@@ -2011,14 +2041,14 @@ fn restore_at(
 
 /// Decode Section 12 ([`write_twins`]) and restore each live twin's artifact into a fresh powerbox
 /// holding the restoring host's thaw seams ([`Host::detached_thaw_host`]), against `module`, its
-/// parent's program.
+/// parent's program: the live twins, then the exited ones.
 fn decode_twins(
     body: &[u8],
     module: &Module,
     host: &mut Host,
     depth: usize,
     cut: &mut ThawCut,
-) -> Result<Vec<ThawedTwin>, RestoreError> {
+) -> Result<(Vec<ThawedTwin>, Vec<FrozenTwin>), RestoreError> {
     if depth >= MAX_DETACHED_DEPTH {
         return Err(RestoreError::Malformed);
     }
@@ -2027,7 +2057,7 @@ fn decode_twins(
     if n == 0 {
         return Err(RestoreError::Malformed); // canonical: an empty list elides the section
     }
-    let mut twins = Vec::new();
+    let (mut twins, mut exited) = (Vec::new(), Vec::new());
     let mut last: Option<u64> = None;
     for _ in 0..n {
         let pid = r.uleb()?;
@@ -2035,6 +2065,16 @@ fn decode_twins(
             return Err(RestoreError::Malformed); // canonical: strictly ascending pid
         }
         last = Some(pid);
+        let servicer = match r.u8()? {
+            TWIN_LIVE => false,
+            TWIN_LIVE_SERVICER => true,
+            TWIN_EXITED => {
+                let outcome = read_join_outcome(&mut r)?.ok_or(RestoreError::Malformed)?;
+                exited.push(FrozenTwin { pid, outcome });
+                continue;
+            }
+            _ => return Err(RestoreError::Malformed),
+        };
         let entry = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
         let ctx = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
         let names = read_names(&mut r)?;
@@ -2049,13 +2089,18 @@ fn decode_twins(
             window,
             reserved_log2,
             host: twin,
-            launch: TwinLaunch { entry, ctx, names },
+            launch: TwinLaunch {
+                entry,
+                ctx,
+                servicer,
+                names,
+            },
         });
     }
     if !r.at_end() {
         return Err(RestoreError::Malformed);
     }
-    Ok(twins)
+    Ok((twins, exited))
 }
 
 /// Decode Section 8 ([`write_detached`]) and restore each child's artifact into a fresh powerbox that

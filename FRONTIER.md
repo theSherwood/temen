@@ -87,5 +87,5 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 - *durability* ⛔ — NonDurableKind::Offer — an out-of-line reference to the offering domain
 
 **`LiveImpl`**
-- *durability* ⛔ — NonDurableKind::LiveImpl — points at a *running* domain's powerbox
+- *durability* ⛔ — NonDurableKind::LiveImpl — an embedder wire, a JIT mint or a self-serve grant names no §14 child; a `child_offer`, minted, re-granted or forked, rides by its callee's task id (#1681)
 

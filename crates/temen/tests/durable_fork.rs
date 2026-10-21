@@ -12,7 +12,10 @@
 #[path = "support/fork_twin.rs"]
 mod fork_twin;
 
-use fork_twin::{freeze_and_thaw, granted, instrumented, run, thaw, ANSWER, ARENA, WINDOW};
+use fork_twin::{
+    freeze_and_thaw, granted, instrumented, run, servicer_twin_rides, thaw, TwinAtCut, Wait,
+    ANSWER, ARENA, WINDOW,
+};
 use temen_durable::{arm_freeze_after_backedges, init_durable_window, read_state, STATE_UNWINDING};
 
 /// `op(args)` on the personality: `call.cap HOST_PROC op`. `51` is `fork`, `44` `getpid`, `28`
@@ -299,4 +302,28 @@ fn an_exited_unreaped_twin_rides_as_the_personalitys_zombie() {
         thawed, ANSWER,
         "the thawed parent reaps the zombie that rode"
     );
+}
+
+/// #2571 — a servicer's `clone_caller` twin rides the freeze as a personality's does, under FORK.md
+/// §8's manager topology: the twin is live at the cut, waiting out a futex, and its parent waits on
+/// it, by pid (`join_waiters`) or for any child (`reap_any_waiters`). The twin's unwind wakes the
+/// parent, which abandons its wait; the thaw re-creates the twin under its pid, and the re-issued
+/// wait reaps it.
+#[test]
+fn a_servicers_live_twin_rides_and_its_parents_wait_reissues() {
+    for wait in [Wait::Pid, Wait::Any] {
+        servicer_twin_rides(TwinAtCut::Live, wait);
+    }
+}
+
+/// #2571 — a servicer's twin that exited before the cut waits in the core for its parent's `wait`,
+/// so it rides as its outcome, a return or a crash, and the thaw files it again for that `wait` to
+/// reap. The freeze rings only live twins, so it knows a crash before the cut from its own end.
+#[test]
+fn a_servicers_exited_twin_rides_as_its_outcome() {
+    for at in [TwinAtCut::Exited, TwinAtCut::Crashed] {
+        for wait in [Wait::Pid, Wait::Any] {
+            servicer_twin_rides(at, wait);
+        }
+    }
 }

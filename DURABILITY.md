@@ -334,8 +334,8 @@ it), or **decline** (no rule yet: the census refuses the freeze up front,
 parked vCPUs (teardown, the census, a freeze's re-admission) is a loop over `ParkSite::ALL`, so a
 new collection cannot be missed by one of them. Re-issue: `svc.wait`, futex, pipe read and write,
 `waitpid`, a job-control stop, a stream read, and a live call's reply. Phase: `thread.join`, a lane,
-and a demand-paged child's page fault, whose pager the freeze holds to serve it (#1940, #2455,
-below). Decline: a servicer's `wait(-1)`, whose `clone_caller` twin does not ride (#2571), a
+a demand-paged child's page fault, whose pager the freeze holds to serve it (#1940, #2455,
+below), and a servicer's `wait(pid)` or `wait(-1)`, which its twin's unwind ends (#2571). Decline: a
 punted completion, which is a host call outside the cut (#1902), and an offer admission, which a
 durable caller never reaches (#1681). A fiber
 parked at a site follows the same rule: the freeze drive of whichever vCPU finishes first gives an
@@ -644,11 +644,26 @@ artifact carries is reserved before the thaw mints any id. The thaw's registrar
 (`temen_posix::Thaw`) re-binds each personality entry to its process and grants that process's doors
 (signal, exit hook, exec remap), which the restore installs as a fork installs them. The census
 declines while a twin no freeze can carry lives: a `posix_spawn`ed process, whose uninstrumented
-command image has no doorbell, and any twin a servicer's `clone_caller` forked, whose reap the
-artifact does not carry yet (#2571). A `fork` or `posix_spawn` under a landed freeze is abandoned
+command image has no doorbell. A `fork` or `posix_spawn` under a landed freeze is abandoned
 for the thaw to re-issue. The tree-walker carries twins; the bytecode tier carries none and declines
 a freeze while one lives (#1904), and a durable Cranelift run never serves `fork`. Pinned by
 `temen`'s `durable_fork.rs` and the park matrix's `waitpid` row.
+
+**A servicer's twins too (v50, #2571).** A twin a servicer's `clone_caller` forked (FORK.md §8's
+manager topology) rides as a personality's does, with two differences, both from who reaps it.
+- **Its exit waits in the core.** The servicer's `wait` reaps it from the scheduler's records, so
+  one that exited unreaped rides its parent's Section 12 as its outcome (`FrozenTwin`), and the thaw
+  files it again for that `wait`. The freeze rings only live twins, so one that ended before the
+  ring is never rung, and its end is its own. One that ended after the ring, otherwise than by
+  returning, may have been reaped by the run's own teardown, so it is unreached.
+- **Its parent's waits park in the core.** A `wait(pid)` parks in `join_waiters` and a `wait(-1)`
+  in `reap_any_waiters`, both phase sites: the twin's unwind wakes the waiter, which abandons its
+  wait (`Pending::ReapPid`), so the thaw re-issues it against the re-created twin.
+
+Its launch record says which reaper it has, so the thaw re-files it as the servicer's. The twin holds
+its parent's `fork` offer, a re-granted `child_offer`, which rides by its callee's task id (§13.4
+4d). Pinned by `durable_fork.rs`'s servicer tests (live, exited and crashed twins, each waited on by
+pid and by `wait(-1)`, through two freeze rounds) and the park matrix's `wait(-1)` row.
 
 **A demand-paged child is durable too (#2438).** A child whose spawn record named a pager
 (§2.2, #1862) freezes like any detached child, and its pager rides its launch record: the
