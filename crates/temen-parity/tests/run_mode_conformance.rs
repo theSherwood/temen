@@ -277,7 +277,7 @@ fn pumped(
             CoopEvent::Done(v) => return judge(Ok(v), want),
             CoopEvent::Trapped(t) => return judge(Err(t), want),
             CoopEvent::CapPark { .. } | CoopEvent::Paused => {}
-            CoopEvent::Idle => match feed.take() {
+            CoopEvent::Idle { .. } => match feed.take() {
                 Some(bytes) => run.host_mut().push_stdin(bytes),
                 None => std::thread::sleep(ANSWER_POLL),
             },
