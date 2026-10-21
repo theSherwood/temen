@@ -273,11 +273,12 @@ fn pumped(
     };
     let mut feed = feed;
     loop {
-        match run.run() {
+        // The probe keeps no clock: a timer the pump hands back fires at once (#2439).
+        match run.run_clockless() {
             CoopEvent::Done(v) => return judge(Ok(v), want),
             CoopEvent::Trapped(t) => return judge(Err(t), want),
             CoopEvent::CapPark { .. } | CoopEvent::Paused => {}
-            CoopEvent::Idle => match feed.take() {
+            CoopEvent::Idle { .. } => match feed.take() {
                 Some(bytes) => run.host_mut().push_stdin(bytes),
                 None => std::thread::sleep(ANSWER_POLL),
             },
