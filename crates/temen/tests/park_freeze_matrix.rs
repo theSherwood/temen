@@ -16,6 +16,8 @@
 
 #[path = "support/detached_thaw.rs"]
 mod detached_thaw;
+#[path = "support/fork_twin.rs"]
+mod fork_twin;
 #[path = "support/paged_detached.rs"]
 mod paged_detached;
 
@@ -72,11 +74,7 @@ fn interp_row(site: ParkSite) -> Row {
         ParkSite::StreamRead => Row::Case(stream_read),
         ParkSite::Stopped => Row::Case(stopped),
         ParkSite::Svc => Row::Case(svc),
-        ParkSite::Reap => Row::Unreachable {
-            why: "a blocking `waitpid` waits on a fork twin or a `pspawn`ed process, which declines \
-                  the freeze first (#1688); the delegate `spawn` runs its child through the embedder \
-                  and never parks",
-        },
+        ParkSite::Reap => Row::Case(reap),
         ParkSite::Lane => Row::Unreachable {
             why: "a run that can freeze is serialized onto one worker, and a task gives its lane back \
                   when it parks, so no lane is ever full",
@@ -85,7 +83,8 @@ fn interp_row(site: ParkSite) -> Row {
         ParkSite::PageFault => Row::Case(page_fault),
         ParkSite::Completion => COMPLETION_PENDING,
         ParkSite::ReapAny => Row::Unreachable {
-            why: "`wait(-1)` needs a live fork twin, which declines the freeze first (#1688)",
+            why: "a servicer's `wait(-1)` waits on a `clone_caller` twin, which declines the freeze \
+                  first (#2571)",
         },
         ParkSite::Admit => ADMIT_UNREACHABLE,
     }
@@ -526,6 +525,18 @@ block 2 (va2: i64) {{
         |_| {},
         Ok(1007),
     );
+}
+
+/// #1688 — a blocking `waitpid` on a live fork twin. Only the tree-walker carries a twin, and through
+/// the codec, so this row is not the shared shape: the scenario is `support/fork_twin.rs`'s.
+fn reap(site: ParkSite, engine: Engine) {
+    assert_eq!(site.freeze_rule(), FreezeRule::Reissue);
+    assert_eq!(
+        engine,
+        Engine::Interp,
+        "only the tree-walker carries a fork twin (#1688)"
+    );
+    fork_twin::waitpid_parked_at_the_trigger_thaws();
 }
 
 /// #1940 — a page fault. Only a demand-paged child faults, so this row is not the shared shape: the

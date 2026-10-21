@@ -2558,6 +2558,8 @@ struct ThawResidue {
     detached: Vec<FrozenDetached>,
     /// #1361 step 4 — live detached children, each a domain with its own window and residue.
     live_detached: Vec<ThawedDetached>,
+    /// #1688 — the live twins this domain forked, each a domain of its own.
+    twins: Vec<ThawedTwin>,
 }
 
 impl ThawResidue {
@@ -2571,7 +2573,25 @@ impl ThawResidue {
             vcpus: std::mem::take(&mut host.frozen_vcpus),
             detached: std::mem::take(&mut host.frozen_detached),
             live_detached: std::mem::take(&mut host.thawed_detached),
+            twins: std::mem::take(&mut host.thawed_twins),
         }
+    }
+
+    /// #1688 — every pid this residue's twins take back, at any depth: its own twins', and those of
+    /// its twins and detached children, whose residue is still on their restored powerboxes.
+    fn twin_pids(&self) -> BTreeSet<TaskId> {
+        fn of(twins: &[ThawedTwin], live: &[ThawedDetached], out: &mut BTreeSet<TaskId>) {
+            for t in twins {
+                out.insert(t.pid as TaskId);
+                of(&t.host.thawed_twins, &t.host.thawed_detached, out);
+            }
+            for d in live {
+                of(&d.host.thawed_twins, &d.host.thawed_detached, out);
+            }
+        }
+        let mut out = BTreeSet::new();
+        of(&self.twins, &self.live_detached, &mut out);
+        out
     }
 }
 
@@ -2608,6 +2628,7 @@ fn seed_domain(
         vcpus: thaw_vcpus,
         detached: thaw_detached,
         live_detached: thaw_live_detached,
+        twins: thaw_twins,
     } = residue;
     // Only a durable window has control words at the guard base; any other run keeps its own data
     // there, and starts in no freeze phase whatever it holds (#2101).
@@ -2701,8 +2722,7 @@ fn seed_domain(
                 match spawner {
                     Some(p) => deliver_detached(s, p, fd.slot, result),
                     None => {
-                        let cid = s.next_task;
-                        s.next_task += 1;
+                        let cid = mint_task(s);
                         s.results.insert(cid, Outcome::ended(result));
                     }
                 }
@@ -2729,6 +2749,15 @@ fn seed_domain(
                 // A detached child is a callee (#1901).
                 child_hosts_by_edge.insert(edge, Arc::clone(&child.host));
                 s.runnable.push_back(child);
+            }
+        }
+        // #1688 — the twins this domain forked, each re-created under the pid its `fork()` returned,
+        // as a domain of its own window ([`relaunch_twin`]).
+        let mut tseed = thaw_twins;
+        tseed.sort_by_key(|t| t.pid);
+        for tt in tseed {
+            if let Some(twin) = relaunch_twin(s, sched, root, funcs, types, tt) {
+                s.runnable.push_back(twin);
             }
         }
         // §13.4 slice 4d: re-link the root's restored `LiveImpl` handles to their re-launched
@@ -2759,8 +2788,7 @@ fn deliver_detached(
     slot: usize,
     result: Result<Vec<Value>, Trap>,
 ) {
-    let cid = s.next_task;
-    s.next_task += 1;
+    let cid = mint_task(s);
     s.results.insert(cid, Outcome::ended(result));
     while spawner.threads.len() <= slot {
         spawner.threads.push(None);
@@ -2770,11 +2798,21 @@ fn deliver_detached(
 }
 
 /// A re-created task keeps its frozen id when still free, so the §12.6 canonical re-freeze is
-/// byte-identical; a fresh id otherwise, never a collision.
+/// byte-identical; a fresh id otherwise, never a collision — nor a pid a thawed twin takes back
+/// (#1688).
 fn claim_task(s: &mut Sched, want: usize) -> TaskId {
-    let cid = (want as TaskId).max(s.next_task);
+    let mut cid = (want as TaskId).max(s.next_task);
+    while s.reserved_pids.contains(&cid) {
+        cid += 1;
+    }
     s.next_task = cid + 1;
     cid
+}
+
+/// A fresh task id for a task the thaw creates with no frozen id to keep: never a pid a thawed twin
+/// takes back (#1688).
+fn mint_task(s: &mut Sched) -> TaskId {
+    claim_task(s, 0)
 }
 
 /// Thaw: re-create one spawned vCPU a freeze recorded ([`seed_domain`]), under the parent that spawned
@@ -2865,6 +2903,138 @@ fn seed_thread(
     children.insert(cid, child);
 }
 
+/// #1688 — re-create a fork twin a thaw carries, under `parent`, the root vCPU of the domain that
+/// forked it. Its window is its own image over its parent's window geometry, as the fork copied it
+/// ([`thaw_window`]); its powerbox is made the parent's twin again ([`Host::rejoin_twin`]); its own
+/// residue is seeded through [`seed_domain`], since it is a root of its own window; and it is filed
+/// in the run's twins under the pid its parent's `fork()` returned, with a doorbell. It runs its
+/// parent's program. `None` when it cannot be: the process's pools have no room for it, or its pages
+/// name a region its powerbox does not hold. It then ends with `ThreadFault`, which its parent's
+/// `wait` reaps as a crash.
+fn relaunch_twin(
+    s: &mut Sched,
+    sched: &Arc<Scheduler>,
+    parent: &VCpu,
+    funcs: &Arc<[Func]>,
+    types: &Arc<[temen_ir::TypeEntry]>,
+    tt: ThawedTwin,
+) -> Option<Box<VCpu>> {
+    let ThawedTwin {
+        pid,
+        window,
+        reserved_log2,
+        mut host,
+        launch,
+    } = tt;
+    let pid = pid as TaskId;
+    s.reserved_pids.remove(&pid);
+    let residue = ThawResidue::take(&mut host, pid);
+    let (entry, ctx) = (launch.entry as FuncIdx, launch.ctx as usize);
+    let parent_key = domain_key_of(parent);
+    let built = parent.mem.as_ref().and_then(|pm| {
+        let declared = pm.window.mapped();
+        let grown = window.page_map().grown_bytes();
+        let rejoined =
+            parent
+                .host
+                .lock_unpoisoned()
+                .rejoin_twin(&mut host, &launch.names, declared, grown);
+        let spec = WindowSpec {
+            reserved_log2,
+            mapped_log2: declared.trailing_zeros() as u8,
+            shadow: Some(pm.shadow),
+            null_guard: pm.null_guard,
+            ..WindowSpec::default()
+        };
+        let mem = rejoined
+            .then(|| thaw_window(spec, &window, &mut host, ctx))
+            .flatten();
+        let live = mem
+            .as_ref()
+            .and_then(|_| LiveVcpu::rebuild(host.own_node()));
+        match (mem, live) {
+            (Some(mem), Some(live)) => Some((mem, live)),
+            _ => {
+                if rejoined {
+                    host.release_memory();
+                }
+                None
+            }
+        }
+    });
+    let Some((mem, live)) = built else {
+        // It ends as it is born: its exit hooks make its process the personality's zombie.
+        for h in &host.exit_hooks {
+            h(reap_status(&Err(Trap::ThreadFault)));
+        }
+        return None;
+    };
+    s.live += 1;
+    let twin_host = Arc::new(Mutex::new(host));
+    sched.wire_signal_doors(&twin_host);
+    // Its own dispatch table, with the units it had installed put back, as a thawed root's is.
+    let dt = Arc::new(DomainTable::new(
+        funcs,
+        twin_host.lock_unpoisoned().jit_table_log2(),
+    ));
+    for (slot, unit_funcs, unit_types) in twin_host.lock_unpoisoned().jit_reapply() {
+        dt.install(unit_funcs, unit_types, Some(slot));
+    }
+    // Entry args are inert under a rewind (the prologue reloads spilled values).
+    let arity = funcs.get(entry as usize).map_or(0, |f| f.params.len());
+    let args = bytecode::child_entry_args(arity, 0, 0);
+    let bell = Arc::new(AtomicBool::new(s.twins_rung));
+    let mut twin = Box::new(VCpu::new(
+        Arc::clone(funcs),
+        Arc::clone(types),
+        entry,
+        &args,
+        Some(mem),
+        Arc::clone(&twin_host),
+        parent.fuel.for_thread(),
+        parent.depth,
+        pid,
+        SchedRef::Real(Arc::clone(sched)),
+        Arc::clone(&dt),
+    ));
+    twin.durable = true;
+    (twin.vcpu_ctx, twin.durable_sp_ctx) = (ctx, ctx);
+    twin.parent_task = parent.parent_task;
+    twin.live = live;
+    twin.freeze_bell = Some(Arc::clone(&bell));
+    seed_domain(s, sched, &mut twin, funcs, types, &dt, &twin_host, residue);
+    s.forked_twins.insert(
+        pid,
+        Twin {
+            parent: parent_key,
+            reaper: TwinReaper::Personality,
+            bell: Some(bell),
+            entry,
+            ctx,
+            host: twin_host,
+        },
+    );
+    Some(twin)
+}
+
+/// #1361 step 4, #1688 — the window a thaw re-launches a domain over, a detached child's or a fork
+/// twin's: `spec`'s fresh window with the domain's restored `image` laid over it, its §13 pages
+/// aliased back onto the regions its restored powerbox holds (#2025), started with the runs its
+/// artifact gave it (#2268), its freeze word cleared and context `ctx`'s thaw word set —
+/// `begin_thaw`, on its own window. `None` when a page names a region `host` does not hold.
+fn thaw_window(spec: WindowSpec, image: &MemLayout, host: &mut Host, ctx: usize) -> Option<Mem> {
+    let mut mem = Mem::from_spec(spec);
+    mem.restore_layout(image);
+    let started = host.realias_regions(&mut mem, image.page_map()) && {
+        host.start_window(mem.window_runs());
+        mem.durable_set_state(STATE_NORMAL);
+        let thaw_off = mem.thaw_state_off(ctx);
+        mem.write_bytes(thaw_off, &STATE_REWINDING.to_le_bytes())
+            .is_some()
+    };
+    started.then_some(mem)
+}
+
 /// #1361 step 4 — re-launch a live detached child a thaw carries: rebuild its window from its own
 /// image, restore it to `REWINDING`, rebuild its powerbox bounds from the spawner-held
 /// [`DetachedLaunch`], seed its own residue through [`seed_domain`] (it is a root of its own window),
@@ -2914,28 +3084,17 @@ fn relaunch_detached(
         return None;
     };
     let lease = lease.map(|lease| (Arc::clone(&spawner.host), lease));
-    // The window: built as op 17 builds it (its NULL guard included, #1733), then the child's image
-    // and page map laid over it, its freeze word cleared and its context-0 thaw word set —
-    // `begin_thaw`, on the child's own window.
-    let mut mem = Mem::from_spec(WindowSpec {
+    // The window: built as op 17 builds it (its NULL guard included, #1733), its runs paid for by
+    // its lease.
+    let spec = WindowSpec {
         reserved_log2,
         mapped_log2: memory_log2,
         shadow,
         data: &module.data,
         null_guard: temen_ir::module_null_guard(),
         ..WindowSpec::default()
-    });
-    mem.restore_layout(&window);
-    // #2025 — and its §13 pages aliased back onto the regions its restored powerbox holds. #2268 —
-    // then the window has started, with the runs its artifact gave it, which its lease paid for.
-    let started = host.realias_regions(&mut mem, window.page_map()) && {
-        host.start_window(mem.window_runs());
-        mem.durable_set_state(STATE_NORMAL);
-        let thaw_off = mem.thaw_state_off(0);
-        mem.write_bytes(thaw_off, &STATE_REWINDING.to_le_bytes())
-            .is_some()
     };
-    if !started {
+    let Some(mem) = thaw_window(spec, &window, &mut host, 0) else {
         // #2318 — a relaunch refused once its lease is filed hands the child's window back, as its
         // end would: it never runs, and ends with `ThreadFault`.
         host.release_memory();
@@ -2944,7 +3103,7 @@ fn relaunch_detached(
         }
         deliver_detached(s, spawner, slot, Err(Trap::ThreadFault));
         return None;
-    }
+    };
     let dom = host.domain_id() as usize;
     let child_host = Arc::new(Mutex::new(host));
     sched.wire_signal_doors(&child_host);
@@ -2952,8 +3111,7 @@ fn relaunch_detached(
     // placeholders of the entry's shape, as the nested re-attach does.
     let arity = funcs.first().map_or(0, |f| f.params.len());
     let args = bytecode::child_entry_args(arity, 0, 0);
-    let cid = s.next_task;
-    s.next_task += 1;
+    let cid = mint_task(s);
     s.live += 1;
     let cdt = Arc::new(DomainTable::new(
         &funcs,
@@ -3222,6 +3380,10 @@ fn drive_over_cell(
         // REWINDING thaw); the runtime swaps it per vCPU from here (slice 3.2.1). §12.8 concurrent-thaw
         // stage 1: combine the global freeze word with the root's per-context thaw word (a thaw seeds
         // `REWINDING` into the latter).
+        // #1688 — each twin the thaw re-creates takes back the pid its parent's `fork()` returned, so
+        // no other task the seeding mints may take one, and the run's counter passes them all.
+        let pids = thaw.twin_pids();
+        s.reserved_pids = pids.clone();
         seed_domain(
             &mut s,
             &sched,
@@ -3232,6 +3394,10 @@ fn drive_over_cell(
             &host_shared,
             thaw,
         );
+        if let Some(&last) = pids.last() {
+            s.next_task = s.next_task.max(last + 1);
+        }
+        s.reserved_pids.clear();
         let (registry, arena) = (Arc::clone(&root.registry), root.arena());
         s.runnable.push_back(root);
         (id, registry, arena)
@@ -3258,8 +3424,21 @@ fn drive_over_cell(
     // in turn and its captures land on it: the artifacts nest the way the domains do. Unreached
     // records anywhere in the tree are flattened into the root's list, so one
     // [`Host::unreached_detached`] check answers for the whole tree (#1689).
+    //
+    // #1688 — and each fork twin of a domain that rides, under its pid, the same way: a twin that
+    // unwound brings its window and powerbox, and so its own twins and children. Any other, or one
+    // whose parent did not ride, is unreached: the codec refuses rather than lose a process.
     {
         let mut unreached = Vec::new();
+        let mut unreached_twins = Vec::new();
+        let mut twins = {
+            let mut s = sched.lock();
+            if s.unwound.contains(&root_id) {
+                std::mem::take(&mut s.forked_twins)
+            } else {
+                BTreeMap::new()
+            }
+        };
         let mut owners = vec![Arc::clone(&host_shared)];
         while let Some(owner) = owners.pop() {
             let pending = std::mem::take(&mut owner.lock_unpoisoned().pending_detached);
@@ -3272,16 +3451,34 @@ fn drive_over_cell(
                 // reaped before it reached its poll, keeps its window but has nothing to resume: it is
                 // unreached, never written as if it had unwound. So is one that ran to its end while
                 // its domain was held for its own paged children (#2455): it did not unwind.
-                let out = {
+                // #1688 — one rung between its last poll and its return returned: its result rides as
+                // a completed child's does. Never a trap: that may be the run's end reaping it where it
+                // parked.
+                let (unwound, withheld, out) = {
                     let mut s = sched.lock();
-                    let unwound = s.unwound.contains(&p.child_task);
-                    s.withheld
-                        .remove(&p.child_task)
-                        .map(|w| w.outcome)
-                        .or_else(|| s.results.remove(&p.child_task))
-                        .filter(|_| unwound)
+                    let withheld = s.withheld.remove(&p.child_task).map(|w| w.outcome);
+                    (
+                        s.unwound.contains(&p.child_task),
+                        withheld.is_some(),
+                        withheld.or_else(|| s.results.remove(&p.child_task)),
+                    )
                 };
-                let Some(m) = out.filter(|o| o.result.is_ok()).and_then(|o| o.mem) else {
+                let m = match out {
+                    Some(o) if unwound => o.mem.filter(|_| o.result.is_ok()),
+                    Some(o) if !withheld && o.result.is_ok() => {
+                        owner
+                            .lock_unpoisoned()
+                            .frozen_detached
+                            .push(FrozenDetached {
+                                parent_task: p.parent_task,
+                                slot: p.slot,
+                                completed_result: join_outcome(o.result),
+                            });
+                        continue;
+                    }
+                    _ => None,
+                };
+                let Some(m) = m else {
                     unreached.push(p);
                     continue;
                 };
@@ -3306,9 +3503,54 @@ fn drive_over_cell(
                     module: p.spawn.module,
                 });
             }
-            owner.lock_unpoisoned().set_captured_detached(captured);
+            let domain = owner.lock_unpoisoned().domain_id() as usize;
+            let mine: Vec<TaskId> = twins
+                .iter()
+                .filter(|(_, t)| t.parent == domain)
+                .map(|(&pid, _)| pid)
+                .collect();
+            let mut captured_twins = Vec::new();
+            for pid in mine {
+                let t = twins.remove(&pid).expect("listed just above");
+                // A personality's twin that exited retired then ([`retire_personality_twin`]), so
+                // one still here was alive at the cut: it unwound, or it is unreached. So is a
+                // servicer's, whose reap the artifact does not carry (#2571).
+                let out = {
+                    let mut s = sched.lock();
+                    let unwound = s.unwound.contains(&pid);
+                    s.results.remove(&pid).filter(|_| unwound)
+                };
+                let carried = out
+                    .filter(|o| o.result.is_ok() && t.reaper == TwinReaper::Personality)
+                    .and_then(|o| o.mem);
+                let Some(m) = carried else {
+                    unreached_twins.push(pid);
+                    continue;
+                };
+                let host = t.host;
+                let names = host.lock_unpoisoned().cap_names.clone();
+                owners.push(Arc::clone(&host));
+                captured_twins.push(CapturedTwin {
+                    pid,
+                    reserved_log2: m.reserved_size().trailing_zeros() as u8,
+                    window: m.layout_snapshot(),
+                    host,
+                    launch: TwinLaunch {
+                        entry: t.entry as u32,
+                        ctx: t.ctx as u32,
+                        names,
+                    },
+                });
+            }
+            let mut h = owner.lock_unpoisoned();
+            h.set_captured_detached(captured);
+            h.captured_twins = captured_twins;
         }
-        host_shared.lock_unpoisoned().pending_detached = unreached;
+        // A twin whose parent did not ride is lost with it.
+        unreached_twins.extend(twins.into_keys());
+        let mut h = host_shared.lock_unpoisoned();
+        h.pending_detached = unreached;
+        h.unreached_twins = unreached_twins;
     }
     let (out, trap_origin, twin_traps) = {
         let mut s = sched.lock();
@@ -5982,9 +6224,9 @@ impl ParkSite {
             // A faulting access is no call to re-issue, and cannot unwind until its page arrives
             // (#1940); a freeze holds its pager to serve it (#2455), so it waits, then unwinds.
             ParkSite::Join | ParkSite::Lane | ParkSite::PageFault => FreezeRule::Phase,
-            // A `wait(-1)` needs a live fork twin (#1688). A completion is a host operation outside
-            // the cut (#1902). A durable caller never animates an offer, so never waits to enter one
-            // (#1681).
+            // A `wait(-1)` waits on a servicer's twin, which the census declines for anyway: its
+            // reap does not ride (#2571). A completion is a host operation outside the cut (#1902).
+            // A durable caller never animates an offer, so never waits to enter one (#1681).
             ParkSite::ReapAny | ParkSite::Completion | ParkSite::Admit => FreezeRule::Decline,
         }
     }
@@ -6273,12 +6515,48 @@ fn wake_pipe_writers_locked(s: &mut Sched, pipe: u32) -> u32 {
 }
 
 /// FORK.md §8.6 — a live fork twin's bookkeeping: the **parent domain** that forked it (`wait`
-/// scoping — only the parent may reap it). (#973 retired the per-twin process group `pgid` from the
-/// core; POSIX process groups / `waitpid(-pgid)` now live solely on the personality, which keeps its
-/// own pgid on `Proc`.)
-#[derive(Clone, Copy)]
+/// scoping — only the parent may reap it), who reaps it, and (#1688) how a freeze reaches it and a
+/// thaw re-enters it. (#973 retired the per-twin process group `pgid` from the core; POSIX process
+/// groups / `waitpid(-pgid)` now live solely on the personality, which keeps its own pgid on `Proc`.)
+#[derive(Clone)]
 struct Twin {
     parent: usize,
+    reaper: TwinReaper,
+    /// #1688 — the twin's freeze doorbell ([`VCpu::freeze_bell`]), on a twin a freeze can carry: a
+    /// personality's durable fork. A `posix_spawn` child runs an uninstrumented command image that
+    /// nothing can unwind, and a servicer's twin waits on a reap the artifact does not carry (#2571),
+    /// so neither has one, and a freeze declines while one lives ([`DeclineCause::ForkTwin`]).
+    bell: Option<Arc<AtomicBool>>,
+    /// Where a thaw re-enters the twin: the forking vCPU's entry function and shadow context, which
+    /// the twin's copied continuation and window share.
+    entry: FuncIdx,
+    ctx: usize,
+    /// Its powerbox, which a freeze's harvest carries beside its window: the linkage that outlives
+    /// its vCPU, as a detached child's does ([`PendingDetached::host`]).
+    host: Arc<Mutex<Host>>,
+}
+
+impl Twin {
+    /// Whether a freeze rang it while it lived ([`ring_twins`]), or forked it rung. Its end after that
+    /// may be the freeze's own: the run ends with every vCPU still parked reaped where it waits.
+    fn rung(&self) -> bool {
+        self.bell
+            .as_ref()
+            .is_some_and(|b| b.load(Ordering::Relaxed))
+    }
+}
+
+/// Who reaps a fork twin, which decides what the scheduler keeps once it ends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TwinReaper {
+    /// A servicer's `wait` ([`Scheduler::reap_parked_caller`]): a `clone_caller` twin's outcome
+    /// stays in `results` until it is reaped there.
+    Servicer,
+    /// The personality that forked or spawned it (`fork()`, `posix_spawn()`): its exit hook turns
+    /// the process into a zombie in the personality's own table, which the personality's `waitpid`
+    /// reaps. The scheduler retires the twin as it ends, so nothing of it outlives its exit here
+    /// (#1688: it used to linger in `results`, window and all, until the run ended).
+    Personality,
 }
 
 /// Where a finished, unjoined `thread.spawn` child's completed residue goes on a freeze (#1685).
@@ -6307,15 +6585,22 @@ struct Sched {
     /// hangs instead of the server returning and its `join` raising the outcome (INVARIANTS.md
     /// #9). See [`client_gone_locked`].
     client_gone: BTreeSet<usize>,
-    /// FORK.md §8.6 — twin `TaskId`s minted by pid-mode `clone_caller`, each mapped to its [`Twin`]
-    /// record (forking parent domain + POSIX process group). The only ids `reap` (servicer-side
-    /// `wait()`) will act on, *scoped to the parent*: a `wait(pid)` / `wait(-1)` / `wait(-pgid)` only
-    /// reaps a twin whose recorded parent is the calling domain — so one shell cannot reap another's
-    /// child even though the servicer/offer is shared. Inserted when a twin is forked, removed when
-    /// it is reaped; a `pid` not present (or present under a different parent) is `-ECHILD`.
-    /// Confinement is capability-shaped *and* parent-shaped: a domain holding the fork/wait offer can
-    /// drive `reap`, but only over its own real twins.
+    /// FORK.md §8.6 — the live processes a fork or `posix_spawn` minted, by `TaskId` (their pid), each
+    /// mapped to its [`Twin`] record. A servicer twin ([`TwinReaper::Servicer`]) is one of the only ids
+    /// `reap` (servicer-side `wait()`) will act on, *scoped to the parent*: a `wait(pid)` / `wait(-1)`
+    /// only reaps a twin whose recorded parent is the calling domain — so one shell cannot reap
+    /// another's child even though the servicer/offer is shared. Inserted when a twin is forked,
+    /// removed when it is reaped, or as it ends for a personality's twin; a `pid` not present (or
+    /// present under a different parent) is `-ECHILD`. Confinement is capability-shaped *and*
+    /// parent-shaped: a domain holding the fork/wait offer can drive `reap`, but only over its own
+    /// real twins.
     forked_twins: BTreeMap<TaskId, Twin>,
+    /// #1688 — a freeze was admitted and rang every live twin's doorbell, so a twin forked from here
+    /// on is born rung: a domain the freeze has not reached yet can still fork.
+    twins_rung: bool,
+    /// #1688 — while a thaw seeds the run, the pids its twins take back: no other task it re-creates
+    /// may take one ([`mint_task`], [`claim_task`]).
+    reserved_pids: BTreeSet<TaskId>,
     /// FORK.md §8.6 — callers parked on a servicer-side `wait(-1)` / `waitpid(-pgid)` (reap **any**
     /// matching child), each tagged with its target: `None` = any of the caller's children,
     /// `Some(pgid)` = any child in that process group. Unlike `join_waiters` these are not keyed by a
@@ -7154,7 +7439,7 @@ impl Scheduler {
                 None => return None,
             }
         };
-        match self.fork_vcpu(v, reply_orig, reply_twin) {
+        match self.fork_vcpu(v, reply_orig, reply_twin, TwinReaper::Servicer) {
             Ok(twin_id) => Some(twin_id),
             Err(v) => {
                 // Fork refused: re-park the caller exactly where it was (it falls back to the
@@ -7250,6 +7535,7 @@ impl Scheduler {
         mut v: Box<VCpu>,
         reply_orig: Option<i64>,
         reply_twin: i64,
+        reaper: TwinReaper,
     ) -> Result<i64, Box<VCpu>> {
         let mut s = self.lock();
         if s.live >= self.cap || s.shutdown {
@@ -7336,10 +7622,41 @@ impl Scheduler {
         let mut twin = v.fork_twin(twin_id, twin_mem, twin_host);
         twin.live = live;
         twin.pending = Some(Pending::CapResult(reply_twin));
-        // FORK.md §8.6: mark the twin reapable so a later servicer-side `wait()` (`reap`) can
-        // deliver its exit status to the parent; removed when reaped (or swept at teardown). The
-        // recorded parent scopes the reap — only `parent_key` may `wait` on this twin.
-        s.forked_twins.insert(twin_id, Twin { parent: parent_key });
+        // #1688 — the run's freeze reaches a twin through its doorbell, as it reaches a child. The
+        // countdown an embedder armed in the parent's window, which the copy brought along, is the
+        // parent's trigger, not the twin's: disarmed, so the twin never freezes on its own.
+        if twin.durable && twin.dstate == STATE_ARMED {
+            twin.dstate = STATE_NORMAL;
+            if let Some(m) = twin.mem.as_mut() {
+                m.durable_set_state(STATE_NORMAL);
+            }
+        }
+        // #1688 — a personality's durable twin gets a freeze doorbell, as a detached child does, rung
+        // at birth when the run's freeze has already rung the others. A thaw re-enters it at its
+        // bottom frame, which must be its program's (an `Jit.invoke` unit's frame has no thaw entry).
+        let entry = twin
+            .frames
+            .first()
+            .filter(|f| f.module == 0)
+            .map(|f| f.func);
+        let bell = entry
+            .filter(|_| twin.durable && reaper == TwinReaper::Personality)
+            .map(|_| Arc::new(AtomicBool::new(s.twins_rung)));
+        twin.freeze_bell = bell.clone();
+        // FORK.md §8.6: mark the twin reapable so a later `wait()` can deliver its exit status to
+        // the parent; removed when reaped (or swept at teardown). The recorded parent scopes the
+        // reap — only `parent_key` may `wait` on this twin.
+        s.forked_twins.insert(
+            twin_id,
+            Twin {
+                parent: parent_key,
+                reaper,
+                bell,
+                entry: entry.unwrap_or(0),
+                ctx: twin.vcpu_ctx,
+                host: Arc::clone(&twin.host),
+            },
+        );
         s.runnable.push_back(twin);
         // Deliver the original's reply and re-admit it (the increment-2 injection, now paired).
         // Pid mode: the original sees the twin's TaskId — POSIX parent-sees-pid.
@@ -7393,7 +7710,19 @@ impl Scheduler {
                             s.live += 1;
                             self.wire_signal_doors(&child.host);
                             let parent = domain_key_of(&v);
-                            s.forked_twins.insert(pid, Twin { parent });
+                            // A command image is not instrumented: nothing can unwind it,
+                            // so it has no doorbell (#1688).
+                            s.forked_twins.insert(
+                                pid,
+                                Twin {
+                                    parent,
+                                    reaper: TwinReaper::Personality,
+                                    bell: None,
+                                    entry: 0,
+                                    ctx: 0,
+                                    host: Arc::clone(&child.host),
+                                },
+                            );
                             s.runnable.push_back(Box::new(child));
                         }
                         Err(_) => zeroed = twin.lock_unpoisoned().spawn_failed(SPAWN_EXEC_FAILED),
@@ -7439,7 +7768,13 @@ impl Scheduler {
         nohang: bool,
     ) -> ReapOutcome {
         let mut s = self.lock();
-        let Some(parent) = s.forked_twins.get(&pid).map(|t| t.parent) else {
+        // #1688 — a personality's twin is the personality's to reap, from its own table.
+        let Some(parent) = s
+            .forked_twins
+            .get(&pid)
+            .filter(|t| t.reaper == TwinReaper::Servicer)
+            .map(|t| t.parent)
+        else {
             return ReapOutcome::NoChild; // unknown/foreign pid — a genuine -ECHILD.
         };
         // Per-parent scope: the twin exists, but only its **own parent** may reap it. Peek the parked
@@ -7516,7 +7851,7 @@ impl Scheduler {
             Some(Waiter::VCpu(v)) => domain_key_of(v),
             _ => return ReapOutcome::Retry,
         };
-        let matches = |t: &Twin| t.parent == parent;
+        let matches = |t: &Twin| t.parent == parent && t.reaper == TwinReaper::Servicer;
         if !s.forked_twins.values().any(matches) {
             return ReapOutcome::NoChild; // no child of this parent — `-ECHILD`.
         }
@@ -7620,14 +7955,14 @@ pub fn reap_status(result: &Result<Vec<Value>, Trap>) -> i64 {
 /// lands in `results` (the woken caller only runs after the lock releases, by which point the result
 /// is present — the same ordering the named path uses).
 fn wake_reap_any(s: &mut Sched, id: TaskId) -> bool {
-    let Some(twin) = s.forked_twins.get(&id).copied() else {
+    let Some(parent) = s.forked_twins.get(&id).map(|t| t.parent) else {
         return false;
     };
     // The oldest parked `wait(-1)` waiter of this twin's parent.
     let pos = s
         .reap_any_waiters
         .iter()
-        .position(|w| domain_key_of(w) == twin.parent);
+        .position(|w| domain_key_of(w) == parent);
     if let Some(pos) = pos {
         let mut waiter = s.reap_any_waiters.remove(pos).expect("position just found");
         waiter.pending = Some(Pending::ReapPid { pid: id });
@@ -7651,9 +7986,11 @@ fn wake_posix_reap_any_locked(s: &mut Sched, parent: usize) -> bool {
 
 /// #1340 — the other half of [`wake_posix_reap_locked`]: whether a `waitpid` about to bench under
 /// `key` already missed what it waits for — a stop/continue mark, or (`exits`) that child's exit —
-/// and must re-admit instead. Consumes the mark.
+/// and must re-admit instead. Consumes the mark. The personality benches only on a live twin, so
+/// one no longer in `forked_twins` has exited (#1688: a personality's twin retires as it ends).
 fn reap_bench_missed(s: &mut Sched, key: TaskId, exits: Option<TaskId>) -> bool {
-    s.reap_pending.remove(&key) || exits.is_some_and(|c| s.results.contains_key(&c))
+    s.reap_pending.remove(&key)
+        || exits.is_some_and(|c| s.results.contains_key(&c) || !s.forked_twins.contains_key(&c))
 }
 
 /// Everything a blocking `waitpid` about to bench under `key` may have missed since its op ran:
@@ -7681,9 +8018,26 @@ mod reap_bench_tests {
     //! child SIGTTIN-stops (its stop-park wake finds no bencher yet), then the parent benches.
     use super::*;
 
+    /// A run whose live personality twins are `ids` — the children a bench can wait on.
+    fn live_twins(ids: &[TaskId]) -> Sched {
+        let mut s = Sched::default();
+        for &id in ids {
+            let twin = Twin {
+                parent: 0,
+                reaper: TwinReaper::Personality,
+                bell: None,
+                entry: 0,
+                ctx: 0,
+                host: Arc::new(Mutex::new(Host::new())),
+            };
+            s.forked_twins.insert(id, twin);
+        }
+        s
+    }
+
     #[test]
     fn a_stop_that_beats_the_bench_readmits_it_once() {
-        let mut s = Sched::default();
+        let mut s = live_twins(&[7]);
         assert!(!wake_posix_reap_locked(&mut s, 7), "no parent benched yet");
         assert!(
             reap_bench_missed(&mut s, 7, Some(7)),
@@ -7708,7 +8062,7 @@ mod reap_bench_tests {
                 self.0.swap(false, Ordering::SeqCst)
             }
         }
-        let mut s = Sched::default();
+        let mut s = live_twins(&[7]);
         let mut h = Host::new();
         h.set_signal_source(
             Arc::new(Edge(AtomicBool::new(true))),
@@ -7720,12 +8074,25 @@ mod reap_bench_tests {
 
     #[test]
     fn a_mark_is_per_child() {
-        let mut s = Sched::default();
+        let mut s = live_twins(&[7, 8]);
         assert!(!wake_posix_reap_locked(&mut s, 7));
         assert!(
             !reap_bench_missed(&mut s, 8, Some(8)),
             "another child's stop is not ours"
         );
+        assert!(reap_bench_missed(&mut s, 7, Some(7)));
+    }
+
+    /// #1688 — a personality's twin retires as it ends, so a bench filed after its exit finds it
+    /// gone from the run's twins and re-runs its `waitpid`, which reaps the zombie.
+    #[test]
+    fn a_twin_that_exited_before_the_bench_readmits_it() {
+        let mut s = live_twins(&[7]);
+        assert!(
+            !reap_bench_missed(&mut s, 7, Some(7)),
+            "live: the bench sleeps"
+        );
+        s.forked_twins.remove(&7); // it exited
         assert!(reap_bench_missed(&mut s, 7, Some(7)));
     }
 }
@@ -7935,6 +8302,10 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     // #1816 — a fork twin's main vCPU killed here has finished as surely as one reaching `Done`:
     // its personalities and its `waitpid` benchers hear it the same way.
     twin_finished_locked(s, id, &v.host, &outcome.result);
+    // A twin a freeze rang stays for the harvest, which refuses to carry it: this may be the run's
+    // own end reaping it where it parked, and it did not die.
+    let retired =
+        !s.forked_twins.get(&id).is_some_and(Twin::rung) && retire_personality_twin(s, id);
     // #1217 — a reaped client child releases its services' parked `svc.wait` too.
     let gone = client_gone_targets(&v);
     drop(v);
@@ -7946,7 +8317,9 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     } else {
         wake_reap_any(s, id); // a `wait(-1)` caller reaps this twin if no named waiter claimed it
     }
-    s.results.insert(id, outcome);
+    if !retired {
+        s.results.insert(id, outcome);
+    }
     end_hold_member(s, id); // #2455
     s.live -= 1;
     if s.live == 0 {
@@ -8358,6 +8731,29 @@ fn reach(s: &mut Sched, domain: usize) {
     }
 }
 
+/// #1688 — a freeze was admitted: ring every live twin's doorbell, as a parent rings its detached
+/// children, and have a twin forked from here on born rung. The cut is the whole run, so each twin's
+/// parent is in it too; the harvest files each twin under its parent.
+fn ring_twins(s: &mut Sched) {
+    s.twins_rung = true;
+    for bell in s.forked_twins.values().filter_map(|t| t.bell.as_ref()) {
+        bell.store(true, Ordering::Relaxed);
+    }
+}
+
+/// #1688 — `id` has ended: a personality's twin is its zombie now, in the personality's table, where
+/// its `waitpid` reaps it, so nothing of it stays here, its window least of all. Whether it retired.
+fn retire_personality_twin(s: &mut Sched, id: TaskId) -> bool {
+    let retire = s
+        .forked_twins
+        .get(&id)
+        .is_some_and(|t| t.reaper == TwinReaper::Personality);
+    if retire {
+        s.forked_twins.remove(&id);
+    }
+    retire
+}
+
 /// #2455 — `id` has ended (unwound, returned, trapped or been killed): the hold that waits on it, if
 /// any, no longer does, and is released once it waits on nothing.
 fn end_hold_member(s: &mut Sched, id: TaskId) {
@@ -8582,7 +8978,10 @@ fn freeze_census(
     let mut registries: Vec<(TaskId, Arc<FiberRegistry>)> = Vec::new();
     {
         let s = rs.lock();
-        if let Some(&twin) = s.forked_twins.keys().next() {
+        // #1688 — a twin rides when its doorbell can reach it, and one that cannot ride has none
+        // ([`Twin::bell`]): a `posix_spawn`'s command image, or a servicer's twin, live or exited.
+        // A personality's twin that ended is gone from here ([`retire_personality_twin`]).
+        if let Some((&twin, _)) = s.forked_twins.iter().find(|(_, t)| t.bell.is_none()) {
             return declined(DeclineCause::ForkTwin, twin, None);
         }
         // #1898 — a vCPU parked where a freeze has no rule would hold it until its event came.
@@ -8701,6 +9100,7 @@ fn freeze_step<'a>(
             }
             s = sched.lock();
             if quiesced(&s) {
+                ring_twins(&mut s);
                 admit_parks_for_freeze(&mut s);
             } else {
                 s.freeze_on_quiesce = Some(root);
@@ -8960,11 +9360,14 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // A spawned vCPU that ran to a genuine finish under an `UNWINDING` window left its own
                 // region empty: it completed, it did not freeze, and re-running it on thaw would
                 // repeat its effects (#1685).
+                // The same holds for a vCPU a doorbell reaches, a detached child's or a fork twin's
+                // (#1688): rung between its last poll and its return, it returns, and its empty
+                // region says it finished. Only the run's root keeps the window's word as its answer.
                 let froze = v.durable
                     && result.is_ok()
                     && v.mem.as_ref().is_some_and(|m| {
                         m.durable_state() == STATE_UNWINDING
-                            && (v.spawn_residue.is_none()
+                            && ((v.spawn_residue.is_none() && v.freeze_bell.is_none())
                                 || m.durable_get_sp(m.shadow_region_base(v.vcpu_ctx))
                                     .is_some_and(|sp| sp > v.arena().frame_base(v.vcpu_ctx)))
                     });
@@ -9202,11 +9605,6 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         s.freeze_fault.get_or_insert(*t);
                     }
                 }
-                // #1688 — nothing records a fork twin, so a freeze that unwinds while one is
-                // unreaped would lose it: fail the freeze (the census declines it when it can).
-                if froze && !s.forked_twins.is_empty() {
-                    s.freeze_fault.get_or_insert(Trap::ThreadFault);
-                }
                 // (Never during a freeze unwind: servers are quiesced by freeze-on-quiesce, not run.)
                 if !froze {
                     for service in gone {
@@ -9254,10 +9652,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         fault: outcome.trap_fault,
                     });
                 }
-                // (The host lock is free: this very thread just dropped the vCPU.)
-                if twin_finished_locked(&mut s, id, &dying_host, &outcome.result) {
+                // (The host lock is free: this very thread just dropped the vCPU.) A twin that unwound
+                // has not exited: it rides the cut, and its parent's waits re-issue on the thaw.
+                if !froze && twin_finished_locked(&mut s, id, &dying_host, &outcome.result) {
                     sched.work.notify_all();
                 }
+                let retired = !froze && retire_personality_twin(&mut s, id);
                 // §12 domain lifetime: a member of an already-dead domain finishing *after* the
                 // teardown sweep (it was running — teardown is non-preemptive) observes the domain's
                 // end, not its own late Ok: post-teardown sibling effects are unspecified, but the
@@ -9289,7 +9689,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         lease: frozen_lease,
                     };
                     s.withheld.insert(id, w);
-                } else {
+                } else if !retired {
                     s.results.insert(id, outcome);
                 }
                 end_hold_member(&mut s, id);
@@ -9417,7 +9817,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // replies inside `fork_vcpu`; a refusal (capacity, non-bare shape, unforkable
                 // window/powerbox, dead domain) re-admits the caller with `-EAGAIN` as the
                 // call's result — a value, never a hang (the `while ((pid = fork()) < 0)` idiom).
-                if let Err(v) = sched.fork_vcpu(v, None, 0) {
+                if let Err(v) = sched.fork_vcpu(v, None, 0, TwinReaper::Personality) {
                     let mut s = sched.lock();
                     let Some(mut v) = park_gate(&mut s, v) else {
                         sched.work.notify_all();
@@ -9974,6 +10374,12 @@ impl SchedRef {
         match self {
             SchedRef::Real(s) => s.lock().results.contains_key(&id),
             SchedRef::Det(d) => d.lock().results.contains_key(&id),
+        }
+    }
+    /// #1688 — a freeze was admitted: ring the run's twins ([`ring_twins`]). The explorer cannot fork.
+    fn ring_twins(&self) {
+        if let SchedRef::Real(s) = self {
+            ring_twins(&mut s.lock());
         }
     }
     /// #2455 — a freeze reached `domain` at `me`: hold the domain if it pages live children
@@ -11178,6 +11584,44 @@ pub struct ThawedDetached {
     pub host: Host,
     /// How to launch it.
     pub launch: DetachedLaunch,
+}
+
+/// #1688 — a **fork twin** a freeze carried: its unwound window and powerbox, for the codec to freeze
+/// as its own root-shaped artifact inside its parent's, keyed by its pid (as a [`CapturedDetached`]
+/// is keyed by its join slot). It runs its parent's program, since a durable domain never execs, so
+/// the parent's artifact binds it.
+pub struct CapturedTwin {
+    /// Its pid: the `TaskId` its parent's `fork()` returned, which a thaw gives it again.
+    pub pid: u64,
+    /// Its window at the instant it finished unwinding, in the one image form ([`MemLayout`]).
+    pub window: MemLayout,
+    /// `log2` of its reservation.
+    pub reserved_log2: u8,
+    /// Its powerbox — and, recursively, its own carried twins and detached children.
+    pub host: Arc<Mutex<Host>>,
+    /// How a thaw re-enters it.
+    pub launch: TwinLaunch,
+}
+
+/// #1688 — what a thaw needs to re-enter a twin that its own artifact does not hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TwinLaunch {
+    /// The program function its continuation re-enters: the forking vCPU's entry.
+    pub entry: u32,
+    /// The shadow context it runs in: the forking vCPU's, which its copied window shares.
+    pub ctx: u32,
+    /// The names its caps were registered under, `(name, handle)`.
+    pub names: Vec<(String, i32)>,
+}
+
+/// #1688 — a carried twin as a thaw receives it: its restored window and powerbox (its own residue
+/// seeded on the powerbox, as a restored root's is) and its [`TwinLaunch`].
+pub struct ThawedTwin {
+    pub pid: u64,
+    pub window: MemLayout,
+    pub reserved_log2: u8,
+    pub host: Host,
+    pub launch: TwinLaunch,
 }
 
 /// A §12 fiber as the run-shared registry holds it: a first-class suspendable computation whose
@@ -12946,7 +13390,9 @@ fn decide(
         return Decision::None;
     }
     match ev {
-        ParkEvent::ForkSelf => Decision::Fork,
+        // #1688 — nor does it fork or spawn under one: the process would be born after the cut, and
+        // the thaw re-issues the call instead.
+        ParkEvent::ForkSelf => park(Decision::Fork),
         // The pipe-park discipline exactly: rewind so the op re-executes on wake and reaps the
         // retired entry; a consumed interrupt completes `-EINTR` instead (SA_RESTART re-parks via
         // the re-executed op's re-request).
@@ -12973,10 +13419,11 @@ fn decide(
         }
         // Nothing of the caller is copied or replaced, but a spawn keeps exec's gate: a clean root
         // context, whose vCPU the drive loop re-admits with the new pid. (A durable domain may
-        // spawn, as it may fork: its freeze declines while the child lives.) A source that asked
-        // without staging has nothing to start, and its op's placeholder stands.
+        // spawn, as it may fork: its freeze declines while the child lives, since a command image
+        // cannot unwind.) A source that asked without staging has nothing to start, and its op's
+        // placeholder stands.
         ParkEvent::SpawnSelf { cmd } => match t.spawn.take() {
-            Some(plan) if clean_root => Decision::Spawn(Box::new(SpawnReq { cmd, plan })),
+            Some(plan) if clean_root => park(Decision::Spawn(Box::new(SpawnReq { cmd, plan }))),
             Some(_) => Decision::Refused(EINVAL),
             None => Decision::None,
         },
@@ -13296,8 +13743,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             if let Some(d) = freeze_census(Some(&seat), sched, host) {
                 $m.durable_set_state(STATE_NORMAL);
                 host.lock_unpoisoned().freeze_declined = Some(d);
-            } else if sched.hold_for_paged(sig_domain, &seat) {
-                $m.durable_set_state(STATE_NORMAL);
+            } else {
+                sched.ring_twins();
+                if sched.hold_for_paged(sig_domain, &seat) {
+                    $m.durable_set_state(STATE_NORMAL);
+                }
             }
         }};
     }
@@ -21200,8 +21650,10 @@ pub enum DeclineCause {
     DetachedUnreachable,
     /// A fiber is parked where no scheduler waiter records it, so no rule applies (#1677).
     FiberParkedOnCall,
-    /// A fork twin has not been reaped: it runs in a window and powerbox of its own that no artifact
-    /// records yet, and its exit status would be lost to its parent's `wait` (#1688).
+    /// A process no freeze can carry: a `posix_spawn` started it on an uninstrumented command
+    /// image, which nothing can unwind, or a servicer's `clone_caller` forked it, whose reap the
+    /// artifact does not carry (#2571). A personality's fork twin rides the artifact instead
+    /// (#1688), except on the bytecode tier, which carries none and declines for any (#1904).
     ForkTwin,
     /// A vCPU is parked at a site whose [`FreezeRule`] is still `Decline` (#1898).
     Parked(ParkSite),
@@ -22287,6 +22739,58 @@ pub struct NamedCapGrant {
     pub handler: HostProc,
     pub fork: Option<HostProcFork>,
     pub state: CapState,
+    /// #1688 — the doors of the process the capability is the personality of, for a fork twin's
+    /// entry, which the restore installs as the fork did. `None` for any other capability, and for
+    /// a run root's personality, whose embedder installs its doors itself.
+    pub process: Option<ProcessDoors>,
+}
+
+/// #1688 — what a fork factory mints for a new process beside its handler ([`ForkedProc`]), and a
+/// thaw's registrar returns for a fork twin's ([`NamedCapGrant::process`]): its signal door (at most
+/// one per powerbox, #1648), the hook that retires the process when it ends, its exec remap, and the
+/// op vtable its grant publishes (#801), which a fork copies from the parent's entry.
+#[derive(Default)]
+pub struct ProcessDoors {
+    pub signal: Option<(Arc<dyn SignalSource + Send + Sync>, Arc<AtomicBool>)>,
+    pub exit: Option<Arc<dyn Fn(i64) + Send + Sync>>,
+    pub exec_remap: Option<ExecRemapHook>,
+    pub vtable: Option<(Vec<String>, Vec<FuncType>)>,
+}
+
+/// The [`ProcessDoors`] a powerbox's capabilities bring, gathered across its entries and installed
+/// once, so a fork and a thaw install them the same way.
+#[derive(Default)]
+struct DoorSet {
+    signal: Option<(Arc<dyn SignalSource + Send + Sync>, Arc<AtomicBool>)>,
+    exit: Vec<Arc<dyn Fn(i64) + Send + Sync>>,
+    exec_remap: Vec<ExecRemapHook>,
+}
+
+impl DoorSet {
+    /// Add one entry's doors. `false` when a second entry claims the signal door (#1648): a domain
+    /// has one, so the powerbox cannot be built faithfully.
+    fn add(&mut self, doors: ProcessDoors) -> bool {
+        if let Some(door) = doors.signal {
+            if self.signal.is_some() {
+                return false;
+            }
+            self.signal = Some(door);
+        }
+        self.exit.extend(doors.exit);
+        self.exec_remap.extend(doors.exec_remap);
+        true
+    }
+
+    /// Install them on `host`: the signal door when one was claimed, and every exit hook and exec
+    /// remap after the ones it holds.
+    fn install(self, host: &mut Host) {
+        if let Some((source, armed)) = self.signal {
+            host.sig_source = Some(source);
+            host.sig_armed = armed;
+        }
+        host.exit_hooks.extend(self.exit);
+        host.exec_remap_hooks.extend(self.exec_remap);
+    }
 }
 
 /// Why a thaw could not re-grant a named host capability (#1455): the restoring embedder's registrar
@@ -23888,6 +24392,15 @@ pub struct Host {
     /// #1361 step 4 — the live detached children a **thaw** re-launches (see [`ThawedDetached`]),
     /// seeded by restore alongside the rest of the residue and taken by the run driver.
     thawed_detached: Vec<ThawedDetached>,
+    /// #1688 — this domain's fork twins a freeze carried, each a domain of its own (see
+    /// [`CapturedTwin`]), for the codec to embed under their pids.
+    captured_twins: Vec<CapturedTwin>,
+    /// #1688 — the twins a **thaw** re-creates under this domain (see [`ThawedTwin`]), seeded by
+    /// restore and taken by the run driver.
+    thawed_twins: Vec<ThawedTwin>,
+    /// #1688 — the pids of the live twins a freeze could not carry, across the whole tree, on the
+    /// run root's powerbox: the codec refuses the artifact rather than leave them out.
+    unreached_twins: Vec<u64>,
     /// #1671 — the last freeze this run declined, if any (see [`FreezeDeclined`]).
     freeze_declined: Option<FreezeDeclined>,
     /// #1680 — the pipes a restore rebuilt ([`Host::restore_durable_pipes`]), by their new global id,
@@ -24516,6 +25029,9 @@ impl Host {
             pending_detached: Vec::new(),
             captured_detached: Vec::new(),
             thawed_detached: Vec::new(),
+            captured_twins: Vec::new(),
+            thawed_twins: Vec::new(),
+            unreached_twins: Vec::new(),
             freeze_declined: None,
             thaw_pipes: BTreeMap::new(),
             thaw_names: Vec::new(),
@@ -24591,6 +25107,67 @@ impl Host {
         (twin.runs, twin.maps, twin.domain_maps) = (runs, maps, MAPS_PER_DOMAIN);
         twin.reserved = reserved;
         Some(twin)
+    }
+
+    /// FORK.md §8.6, #1688 — what a twin shares with the domain that forked it and no artifact holds:
+    /// its program, with its interfaces and import bindings; its stdout and stderr; its budget node,
+    /// as a forked process stays in its cgroup (#1944), so its copied `Budget` handles name the
+    /// parent's nodes and both charge the same chains; and its embedder's region hook. A fork copies
+    /// it ([`Self::powerbox_copy`]), and a thaw copies it again from the thawed parent.
+    fn share_program_surface(&self, twin: &mut Host) {
+        twin.out_sink = self.out_sink.clone();
+        twin.err_sink = self.err_sink.clone();
+        twin.sinks = self.sinks.clone();
+        twin.budgets = Arc::clone(&self.budgets);
+        twin.own_budget = self.own_budget;
+        twin.iface_intern = self.iface_intern.clone();
+        twin.import_remaps = self.import_remaps.clone();
+        twin.import_reqs = self.import_reqs.clone();
+        twin.import_bindings = self.import_bindings.clone();
+        twin.set_self_module_opt(self.self_module.clone());
+        twin.region_hook = self.region_hook.clone();
+    }
+
+    /// #1688 — a thawed fork twin's powerbox, made this domain's twin again: the program surface the
+    /// fork shared ([`Self::share_program_surface`]), the names its caps were registered under, and
+    /// the charges the fork made for its window of `declared` bytes and `grown` past them
+    /// ([`Self::process_powerbox`]), which the freeze kept. Its window's bytes ride its node's charge
+    /// when the node rode the artifact; on the run's own node, which no artifact carries, they are
+    /// charged again. Its mappings and address space are charged again either way. Past any ceiling,
+    /// since the twin lived before the freeze, but never past the process's pools: `false`, with
+    /// nothing charged, when they have no room.
+    fn rejoin_twin(
+        &self,
+        twin: &mut Host,
+        names: &[(String, i32)],
+        declared: u64,
+        grown: u64,
+    ) -> bool {
+        self.share_program_surface(twin);
+        twin.set_durable(true);
+        for (name, h) in names {
+            twin.register_cap_name(name, *h);
+        }
+        let reserved = match self.reserved {
+            0 => reservation(declared, default_reserved_log2()),
+            own => own,
+        };
+        let mem = if self.own_budget == BudgetTree::RUN_NODE {
+            declared + grown
+        } else {
+            0
+        };
+        let cost = [
+            (BUDGET_MEM, mem),
+            (BUDGET_MAPS, MAPS_PER_DOMAIN),
+            (RESERVED, reserved),
+        ];
+        if !self.budgets.add(self.own_budget, &cost, Fits::Pool) {
+            return false;
+        }
+        (twin.own_window, twin.grown) = (declared, grown);
+        (twin.domain_maps, twin.reserved) = (MAPS_PER_DOMAIN, reserved);
+        true
     }
 
     /// [`Self::process_powerbox`]'s powerbox duplicate, before the window it rides with is known: a
@@ -24701,7 +25278,6 @@ impl Host {
                 }
             }
         }
-        twin.region_hook = self.region_hook.clone();
         // Live-callee offers ride along, sharing the same callee `Arc` (fork shares the offer/fd) — the
         // forking caller is always parked inside a call through one, so it holds at least this.
         twin.live_impls = self.live_impls.clone();
@@ -24718,9 +25294,7 @@ impl Host {
         // level up — the failure that took a long chase to find from the symptom — so it fails
         // closed (invariant 9) rather than picking a winner by iteration order. A `for` loop, not
         // `map`/`collect`, so the second claim can bail before minting the rest.
-        let mut twin_sig: Option<(Arc<dyn SignalSource + Send + Sync>, Arc<AtomicBool>)> = None;
-        let mut twin_exit: Vec<Arc<dyn Fn(i64) + Send + Sync>> = Vec::new();
-        let mut twin_exec_remap: Vec<ExecRemapHook> = Vec::new();
+        let mut doors = DoorSet::default();
         twin.host_procs = Vec::with_capacity(self.host_procs.len());
         for e in self.host_procs.iter() {
             let factory = e.fork.as_ref().unwrap();
@@ -24730,22 +25304,19 @@ impl Host {
                 return None;
             };
             twin.abandon_hooks.extend(forked.abandon);
-            if let Some(door) = forked.signal {
-                if twin_sig.is_some() {
-                    // Latch it: this powerbox cannot be forked faithfully, and every later attempt
-                    // now refuses before any factory runs (see [`Host::multi_door`]). The caller
-                    // sees the same probeable `-EAGAIN` every other unforkable powerbox gives.
-                    self.multi_door.store(true, Ordering::SeqCst);
-                    twin.abandon();
-                    return None;
-                }
-                twin_sig = Some(door);
-            }
-            if let Some(x) = forked.exit {
-                twin_exit.push(x);
-            }
-            if let Some(x) = forked.exec_remap {
-                twin_exec_remap.push(x);
+            let process = ProcessDoors {
+                signal: forked.signal,
+                exit: forked.exit,
+                exec_remap: forked.exec_remap,
+                vtable: None,
+            };
+            if !doors.add(process) {
+                // Latch it: this powerbox cannot be forked faithfully, and every later attempt
+                // now refuses before any factory runs (see [`Host::multi_door`]). The caller
+                // sees the same probeable `-EAGAIN` every other unforkable powerbox gives.
+                self.multi_door.store(true, Ordering::SeqCst);
+                twin.abandon();
+                return None;
             }
             twin.host_procs.push(HostProcEntry {
                 handler: forked.handler,
@@ -24765,39 +25336,19 @@ impl Host {
         // still resolve/`execve` them (the twin's copied handle table carries the `Binding::Module`
         // bindings; the entries they index must exist in the twin too).
         twin.modules = self.modules.clone();
-        // Shared stdout/stderr sinks — fork shares stdout/stderr.
-        twin.out_sink = self.out_sink.clone();
-        twin.err_sink = self.err_sink.clone();
-        twin.sinks = self.sinks.clone();
+        self.share_program_surface(&mut twin);
         // #796 L2 / #863 — the twin's async-signal source: a personality that minted a per-process
         // door above gets it installed (the twin polls its OWN pending/mask/dispositions — POSIX
         // fork copies signal state); otherwise fall back to sharing the parent's source + armed
         // flag (the pre-split behavior, right when the provider's state is fully shared).
-        match twin_sig {
-            Some((source, armed)) => {
-                twin.sig_source = Some(source);
-                twin.sig_armed = armed;
-            }
-            None => {
-                twin.sig_source = self.sig_source.clone();
-                twin.sig_armed = Arc::clone(&self.sig_armed);
-            }
+        if doors.signal.is_none() {
+            twin.sig_source = self.sig_source.clone();
+            twin.sig_armed = Arc::clone(&self.sig_armed);
         }
         // #863 hygiene — the personalities' exit hooks ride the twin's host; the scheduler fires
         // them with the twin's exit status at completion (Live → Zombie in each process table).
-        twin.exit_hooks = twin_exit;
-        twin.exec_remap_hooks = twin_exec_remap;
-        // #1944: the twin shares the budget tree, so its copied `Budget` handles name the parent's
-        // nodes and both charge the same chains, as a forked process stays in its cgroup.
-        twin.budgets = Arc::clone(&self.budgets);
-        twin.own_budget = self.own_budget;
-        // Structural intern / import binding tables ride along (same program surface).
-        twin.iface_intern = self.iface_intern.clone();
-        twin.import_remaps = self.import_remaps.clone();
-        twin.import_reqs = self.import_reqs.clone();
-        twin.import_bindings = self.import_bindings.clone();
+        doors.install(&mut twin);
         twin.cap_names = self.cap_names.clone();
-        twin.set_self_module_opt(self.self_module.clone());
         twin.self_reified = self.self_reified.clone(); // empty (self_instance is None)
         twin.attestation = self.attestation;
         twin.durable = self.durable;
@@ -25618,6 +26169,27 @@ impl Host {
     /// Seed the completed detached children a **thaw** must deliver, alongside the restored window.
     pub fn set_frozen_detached(&mut self, frozen: Vec<FrozenDetached>) {
         self.frozen_detached = frozen;
+    }
+
+    /// #1688 — the fork twins this domain's freeze carried (see [`CapturedTwin`]).
+    pub fn captured_twins(&self) -> &[CapturedTwin] {
+        &self.captured_twins
+    }
+
+    /// #1688 — seed the twins a **thaw** re-creates under this domain, as restore does.
+    pub fn set_thawed_twins(&mut self, thawed: Vec<ThawedTwin>) {
+        self.thawed_twins = thawed;
+    }
+
+    /// #1688 — the twins this domain's thaw re-creates (see [`Host::set_thawed_twins`]).
+    pub fn thawed_twins(&self) -> &[ThawedTwin] {
+        &self.thawed_twins
+    }
+
+    /// #1688 — the pids of the live twins a freeze could not carry, across the whole tree. Non-empty
+    /// means the artifact would be missing a process: the codec refuses it.
+    pub fn unreached_twins(&self) -> &[u64] {
+        &self.unreached_twins
     }
 
     /// The durable-JIT admission fns the embedder set on this (restoring) host, copied onto `child` so
@@ -27184,6 +27756,7 @@ impl Host {
         let mut registrar = self.named_cap_registrar.take();
         let mut out = Vec::with_capacity(caps.len());
         let mut refused = None;
+        let mut doors = DoorSet::default();
         for cap in caps {
             let grant = match cap {
                 // An index no live handle named: keep the slot so later indices line up, but install
@@ -27200,10 +27773,20 @@ impl Host {
                     }
                 },
             };
-            let (handler, fork, state) = match grant {
-                Some(g) => (Some(g.handler), g.fork, g.state),
-                None => (None, None, CapState::Stateless),
+            let (handler, fork, state, process) = match grant {
+                Some(g) => (Some(g.handler), g.fork, g.state, g.process),
+                None => (None, None, CapState::Stateless, None),
             };
+            let mut vtable = None;
+            if let Some(mut p) = process {
+                vtable = p.vtable.take().map(Arc::new);
+                // #1648 — one signal door per powerbox, as at the fork.
+                if !doors.add(p) {
+                    refused.get_or_insert_with(|| {
+                        cap.as_ref().map_or_else(String::new, |c| c.name.clone())
+                    });
+                }
+            }
             out.push(HostProcEntry {
                 handler: ProcHandler::Sync(
                     handler.unwrap_or_else(|| {
@@ -27212,7 +27795,7 @@ impl Host {
                 ),
                 fork,
                 mints: false,
-                vtable: None,
+                vtable,
                 state,
                 on_host: false,
             });
@@ -27221,6 +27804,7 @@ impl Host {
         match refused {
             Some(name) => Err(NamedCapRestoreError { name }),
             None => {
+                doors.install(self);
                 self.host_procs = out;
                 self.thaw_names = caps
                     .iter()

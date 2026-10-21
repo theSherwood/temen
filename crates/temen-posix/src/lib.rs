@@ -2825,7 +2825,138 @@ pub fn named_grant(posix: &Posix) -> NamedCapGrant {
             Arc::clone(&posix.root),
         )),
         state: captured(posix),
+        process: None,
     }
+}
+
+/// #1688 — a thaw's registrar for the personality. The root's entry rebuilds it from its state
+/// ([`Posix::from_state`]), every live process in it; then each fork twin's entry, restored after
+/// the root's, re-binds to its process there, with the process's doors, as its fork minted them.
+/// An embedder answers its personality's name with [`Thaw::grant`] and installs the root's doors on
+/// the thawed host with [`install`], over [`Thaw::posix`].
+#[derive(Default)]
+pub struct Thaw {
+    posix: Option<Posix>,
+}
+
+impl Thaw {
+    /// Re-grant one entry of the personality from its carried `state`, paid for by `payer`'s node.
+    /// `None` refuses the restore: the bytes are not the personality's, or a twin's entry names a
+    /// process the root's state does not hold.
+    pub fn grant(&mut self, state: &[u8], payer: &NodeRef) -> Option<NamedCapGrant> {
+        if let Some(pid) = state::twin_of(state) {
+            return twin_grant(self.posix.as_ref()?, pid);
+        }
+        let posix = Posix::from_state(state).ok()?;
+        posix.bind(payer);
+        let g = named_grant(&posix);
+        self.posix = Some(posix);
+        Some(g)
+    }
+
+    /// The personality the root's entry rebuilt, once it has.
+    pub fn posix(&self) -> Option<Posix> {
+        self.posix.clone()
+    }
+}
+
+/// #1688 — a thawed fork twin's personality entry, over its restored process `pid` in `posix`'s
+/// world: what [`fork_factory`] minted at the fork, but over the process the thaw put back.
+fn twin_grant(posix: &Posix, pid: i32) -> Option<NamedCapGrant> {
+    let proc_ = match posix
+        .world
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .procs
+        .get(&pid)
+    {
+        Some(ProcEntry::Live(p)) => Arc::clone(p),
+        _ => return None,
+    };
+    let (signal, exit, exec_remap) = process_doors(&posix.world, &proc_, pid);
+    Some(NamedCapGrant {
+        handler: handler(Arc::clone(&posix.world), Arc::clone(&proc_)),
+        fork: Some(fork_factory(Arc::clone(&posix.world), Arc::clone(&proc_))),
+        state: twin_state(pid),
+        process: Some(temen_interp::ProcessDoors {
+            signal: Some(signal),
+            exit: Some(exit),
+            exec_remap: Some(exec_remap),
+            vtable: Some(px_vtable()),
+        }),
+    })
+}
+
+/// #1688 — a fork twin's entry state: which process it is. Its process rides with the world, in the
+/// root's entry, so there is nothing to put back here on a rewind.
+fn twin_state(pid: i32) -> CapState {
+    CapState::Captured {
+        capture: Box::new(move || state::twin_marker(pid)),
+        restore: Box::new(|_| {}),
+    }
+}
+
+/// #863, #1688 — the doors of process `child`, `pid` in `world`'s table: its signal door, the hook
+/// that retires it into a zombie when it ends, and its exec remap. A fork mints them with the new
+/// process, and a thaw again for the process it puts back.
+#[allow(clippy::type_complexity)]
+fn process_doors(
+    world: &Arc<Mutex<World>>,
+    child: &Arc<Mutex<Proc>>,
+    pid: i32,
+) -> (
+    (Arc<dyn SignalSource + Send + Sync>, Arc<AtomicBool>),
+    Arc<dyn Fn(i64) + Send + Sync>,
+    temen_interp::ExecRemapHook,
+) {
+    let armed = child
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .sig_armed
+        .clone();
+    // #863 hygiene — the twin's exit retires its table entry: the core fires this with the
+    // raw exit status when the twin's task completes, and the process becomes a reapable
+    // zombie (`waitpid` then serves fork twins exactly like spawn children). Wait-encoding is
+    // OUR policy — WEXITSTATUS in bits 8–15; a crashed
+    // twin arrives as the core's crash status (128, already shell-`$?`-shaped) and encodes
+    // like any exit code. #796 default actions: a twin the delivery gate terminated
+    // (`term_sig` set — the core's kill is signal-blind, only this bookkeeping knows why)
+    // retires in the `WIFSIGNALED` shape instead: the signal in the low 7 bits.
+    let exit_world = Arc::clone(world);
+    let exit_child = Arc::clone(child);
+    let exit = Arc::new(move |status: i64| {
+        let (term, pgid, ppid) = {
+            let c = exit_child.lock().unwrap_or_else(|e| e.into_inner());
+            (c.term_sig, c.pgid, c.ppid)
+        };
+        let encoded = match term {
+            Some(sig) => sig & 0x7f,
+            None => ((status & 0xff) << 8) as i32,
+        };
+        let mut w = exit_world.lock().unwrap_or_else(|e| e.into_inner());
+        w.procs.insert(
+            pid,
+            ProcEntry::Zombie {
+                status: encoded,
+                pgid,
+                ppid,
+            },
+        );
+        // #802 rung 3 — the exit is a child transition: pend SIGCHLD in the parent, ARM
+        // ONLY (the returned fire is deliberately dropped — this hook runs under the core's
+        // scheduler lock, and the parent's run-wake would re-take it). A parent benched in
+        // a blocking `waitpid` is woken by the core's own twin-completion drain; a parent
+        // parked elsewhere consumes the pending signal at its next delivery point.
+        if let Some(ProcEntry::Live(t)) = w.procs.get(&ppid) {
+            let _ = t
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .deliver_signal(SIGCHLD);
+        }
+    });
+    let signal: Arc<dyn SignalSource + Send + Sync> =
+        Arc::new(SignalDoor(Arc::clone(child), Arc::clone(world)));
+    ((signal, armed), exit, exec_remap_hook(Arc::clone(child)))
 }
 
 /// #1894 — the personality's [`CapState`]: a capture and a restore over its root process and world.
@@ -2943,7 +3074,7 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
                     refork: Some(fork_factory(Arc::clone(&world), existing)),
                     exit: None,
                     exec_remap: None,
-                    state: CapState::Uncaptured,
+                    state: twin_state(pid as i32),
                     abandon: None,
                 });
             }
@@ -2956,7 +3087,6 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
         child.core_task = pid != 0;
         let pid = if pid != 0 { pid as i32 } else { w.mint_pid() };
         child.pid = pid;
-        let armed = child.sig_armed.clone();
         let child = Arc::new(Mutex::new(child));
         w.procs.insert(pid, ProcEntry::Live(Arc::clone(&child)));
         // #1644 — remember it for a repeat ask from a sibling powerbox entry. Only a **named** ask
@@ -2967,46 +3097,7 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
             w.last_fork_mint = Some((pid, Arc::clone(&child)));
         }
         drop(w);
-        // #863 hygiene — the twin's exit retires its table entry: the core fires this with the
-        // raw exit status when the twin's task completes, and the process becomes a reapable
-        // zombie (`waitpid` then serves fork twins exactly like spawn children). Wait-encoding is
-        // OUR policy — WEXITSTATUS in bits 8–15; a crashed
-        // twin arrives as the core's crash status (128, already shell-`$?`-shaped) and encodes
-        // like any exit code. #796 default actions: a twin the delivery gate terminated
-        // (`term_sig` set — the core's kill is signal-blind, only this bookkeeping knows why)
-        // retires in the `WIFSIGNALED` shape instead: the signal in the low 7 bits.
-        let exit_world = Arc::clone(&world);
-        let exit_child = Arc::clone(&child);
-        let exit = Arc::new(move |status: i64| {
-            let (term, pgid, ppid) = {
-                let c = exit_child.lock().unwrap_or_else(|e| e.into_inner());
-                (c.term_sig, c.pgid, c.ppid)
-            };
-            let encoded = match term {
-                Some(sig) => sig & 0x7f,
-                None => ((status & 0xff) << 8) as i32,
-            };
-            let mut w = exit_world.lock().unwrap_or_else(|e| e.into_inner());
-            w.procs.insert(
-                pid,
-                ProcEntry::Zombie {
-                    status: encoded,
-                    pgid,
-                    ppid,
-                },
-            );
-            // #802 rung 3 — the exit is a child transition: pend SIGCHLD in the parent, ARM
-            // ONLY (the returned fire is deliberately dropped — this hook runs under the core's
-            // scheduler lock, and the parent's run-wake would re-take it). A parent benched in
-            // a blocking `waitpid` is woken by the core's own twin-completion drain; a parent
-            // parked elsewhere consumes the pending signal at its next delivery point.
-            if let Some(ProcEntry::Live(t)) = w.procs.get(&ppid) {
-                let _ = t
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .deliver_signal(SIGCHLD);
-            }
-        });
+        let (signal, exit, exec_remap) = process_doors(&world, &child, pid);
         // #2373 — a fork refused after this mint (another provider had no room) never runs the
         // twin: it leaves the table, as if never registered, rather than as a zombie to reap.
         let abandon_world = Arc::clone(&world);
@@ -3019,15 +3110,17 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
         });
         Some(ForkedProc {
             handler: ProcHandler::Sync(handler(Arc::clone(&world), Arc::clone(&child))),
-            signal: Some((
-                Arc::new(SignalDoor(Arc::clone(&child), Arc::clone(&world))),
-                armed,
-            )),
+            signal: Some(signal),
             refork: Some(fork_factory(Arc::clone(&world), Arc::clone(&child))),
             exit: Some(exit),
-            exec_remap: Some(exec_remap_hook(child)),
-            // A twin's process does not ride yet: the capture carries the root's (#1688).
-            state: CapState::Uncaptured,
+            exec_remap: Some(exec_remap),
+            // #1688 — a fork twin's process rides the root's capture, and its own entry names it.
+            // An anonymous mint, a detached child's own process, does not ride yet (#1894).
+            state: if asked != 0 {
+                twin_state(pid)
+            } else {
+                CapState::Uncaptured
+            },
             abandon: Some(abandon),
         })
     })

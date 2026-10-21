@@ -1523,6 +1523,7 @@ fn a_named_host_cap_round_trips_through_the_codec() {
             handler: Box::new(|_op, _args, _mem, _| Ok(vec![99])),
             fork: None,
             state: temen_interp::CapState::Stateless,
+            process: None,
         })
     }));
     restore(&artifact, &inst, &mut thost).expect("restore with a registrar that serves `fs`");
