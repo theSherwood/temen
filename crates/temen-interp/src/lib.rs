@@ -5580,6 +5580,123 @@ struct Scheduler {
     handoff: bool,
 }
 
+/// #2522 — a domain's host, locked for a capability call of a vCPU in `run`. A host procedure the
+/// call runs may answer another call ([`Completer::complete`]), whose wake drains the run's
+/// scheduler ([`Scheduler::wake_on`]). The drain takes the scheduler lock, which a park holds while
+/// it takes a host of the run ([`park_gate`]), so a drain under this lock could deadlock against a
+/// park: one asked for while a thread holds a host of the run for a call runs once it holds none
+/// ([`Scheduler::drain_when_free`]). Another run's drain need not wait: its parks take only its
+/// own hosts.
+struct HostCall<'a> {
+    host: Option<std::sync::MutexGuard<'a, Host>>,
+    run: Option<&'a Arc<Scheduler>>,
+}
+
+/// #2522 — a thread's [`HostCall`]s: the run of each host it holds for a call, and the runs whose
+/// drains wait until it holds none of theirs.
+struct HostCalls {
+    held: Vec<*const Scheduler>,
+    owed: Vec<Arc<Scheduler>>,
+}
+
+thread_local! {
+    static HOST_CALLS: std::cell::RefCell<HostCalls> = const {
+        std::cell::RefCell::new(HostCalls {
+            held: Vec::new(),
+            owed: Vec::new(),
+        })
+    };
+}
+
+impl<'a> HostCall<'a> {
+    /// A call in the deterministic explorer's run holds no drain back: its waits hang none on a store.
+    fn lock(host: &'a Mutex<Host>, sched: &'a SchedRef) -> Self {
+        let host = host.lock_unpoisoned();
+        let run = match sched {
+            SchedRef::Real(s) => Some(s),
+            SchedRef::Det(_) => None,
+        };
+        if let Some(s) = run {
+            HOST_CALLS.with_borrow_mut(|c| c.held.push(Arc::as_ptr(s)));
+        }
+        HostCall {
+            host: Some(host),
+            run,
+        }
+    }
+}
+
+impl std::ops::Deref for HostCall<'_> {
+    type Target = Host;
+    fn deref(&self) -> &Host {
+        self.host.as_ref().expect("held until dropped")
+    }
+}
+
+impl std::ops::DerefMut for HostCall<'_> {
+    fn deref_mut(&mut self) -> &mut Host {
+        self.host.as_mut().expect("held until dropped")
+    }
+}
+
+impl Drop for HostCall<'_> {
+    fn drop(&mut self) {
+        self.host = None;
+        let Some(run) = self.run else {
+            return;
+        };
+        let held = Arc::as_ptr(run);
+        let owed = HOST_CALLS.with_borrow_mut(|c| {
+            let at = c.held.iter().position(|&s| s == held);
+            c.held.swap_remove(at.expect("pushed by its lock"));
+            if c.held.contains(&held) {
+                return None;
+            }
+            let at = c.owed.iter().position(|s| Arc::ptr_eq(s, run))?;
+            Some(c.owed.swap_remove(at))
+        });
+        if let Some(run) = owed {
+            run.completion_drain();
+        }
+    }
+}
+
+#[cfg(test)]
+mod host_call_tests {
+    use super::*;
+
+    /// #2522 — a run's drain asked for while this thread holds hosts of the run for calls waits
+    /// until it holds none, and runs once however many answers asked for it. Another run's drain
+    /// does not wait: a nested run's own answers wake its callers while its caller's call goes on.
+    #[test]
+    fn a_drain_waits_until_its_thread_holds_no_host_of_its_run() {
+        let (a, b) = (
+            Arc::new(Scheduler::new(4, 1)),
+            Arc::new(Scheduler::new(4, 1)),
+        );
+        let (run, other) = (
+            SchedRef::Real(Arc::clone(&a)),
+            SchedRef::Real(Arc::clone(&b)),
+        );
+        let hosts: Vec<Mutex<Host>> = (0..3).map(|_| Mutex::new(Host::new())).collect();
+        let owed = || HOST_CALLS.with_borrow(|c| c.owed.len());
+        let outer = HostCall::lock(&hosts[0], &run);
+        let inner = HostCall::lock(&hosts[1], &run);
+        let nested = HostCall::lock(&hosts[2], &other);
+        Arc::clone(&a).drain_when_free();
+        Arc::clone(&a).drain_when_free();
+        assert_eq!(owed(), 1, "owed once");
+        Arc::clone(&b).drain_when_free();
+        assert_eq!(owed(), 2, "the nested run's drain waits for its own host");
+        drop(nested);
+        assert_eq!(owed(), 1, "the nested run's drain ran");
+        drop(inner);
+        assert_eq!(owed(), 1, "the thread still holds a host of the run");
+        drop(outer);
+        assert_eq!(owed(), 0, "drained once it held none");
+    }
+}
+
 /// §3.6 slice 5a — one parked entity in a scheduler waiter map: a whole **vCPU** (the fiberless
 /// / root-level park, as always) or a single **fiber** (a fiber-level park — the vCPU moved on;
 /// only the fiber's continuation waits, in the registry's `ParkedOn` slot). A fiber wake flips
@@ -6917,9 +7034,24 @@ impl Scheduler {
         let sched = Arc::downgrade(self);
         comps.set_notify(Some(Arc::new(move || {
             if let Some(s) = sched.upgrade() {
-                s.completion_drain();
+                s.drain_when_free();
             }
         })));
+    }
+
+    /// #2522 — [`completion_drain`](Scheduler::completion_drain) now, or, on a thread that holds a
+    /// host of this run for a call ([`HostCall`]), once it holds none.
+    fn drain_when_free(self: Arc<Self>) {
+        let now = HOST_CALLS.with_borrow_mut(|c| {
+            let holds = c.held.contains(&Arc::as_ptr(&self));
+            if holds && !c.owed.iter().any(|s| Arc::ptr_eq(s, &self)) {
+                c.owed.push(Arc::clone(&self));
+            }
+            !holds
+        });
+        if now {
+            self.completion_drain();
+        }
     }
 
     /// #1677 — where fiber `slot` of `reg` is parked ([`Sched::fiber_park`]). Probe only.
@@ -15423,7 +15555,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     // Lock the shared powerbox for the duration of this one call.cap (brief; no nested
                     // host locking). Threads of a domain serialize their capability calls here.
-                    let mut hg = host.lock_unpoisoned();
+                    let mut hg = HostCall::lock(host, sched);
                     let mut pending_id = None;
                     // #2495 — under a recording host this engine offers no parking face: it tapes
                     // no delivered value, so a host-answered call declines before its embedder
@@ -15762,7 +15894,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         return Err(Trap::CapFault);
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let mut hg = host.lock_unpoisoned();
+                    let mut hg = HostCall::lock(host, sched);
                     // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
                     let packed = *import | (*op << 16);
                     let results =
@@ -15928,7 +16060,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         return Err(Trap::CapFault);
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let mut hg = host.lock_unpoisoned();
+                    let mut hg = HostCall::lock(host, sched);
                     let results =
                         hg.cap_dispatch_slots(temen_ir::CAP_IMPORT_TYPE_ID, *import, 0, &argv, gm)?;
                     // FORK.md §8.6 — pipe blocking rides this dispatch (a command's `write`/`read`
@@ -16017,7 +16149,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         return Err(Trap::CapFault);
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
-                    let mut hg = host.lock_unpoisoned();
+                    let mut hg = HostCall::lock(host, sched);
                     let packed = *ty | (*op << 16);
                     let results =
                         hg.cap_dispatch_slots(temen_ir::CAP_DYN_TYPE_ID, packed, h, &argv, gm)?;
@@ -21516,11 +21648,6 @@ struct CompletionState {
     in_flight: usize,
     /// How many ids this store has minted ([`Completions::minted`]).
     minted: u64,
-    /// #2495 — the host-answered call whose submit hook is running, under its dispatcher's host
-    /// lock (one at a time: the store is its domain's). An answer it gets meanwhile posts without
-    /// ringing the wake hook, which may take a scheduler lock the dispatcher must not nest under
-    /// its host lock; no one waits on the call yet, and its caller's park finds the answer.
-    submitting: Option<u64>,
     /// F3 (FIBER_PARK.md) — Cranelift-JIT fiber-park cells, keyed by completion id: a punting
     /// fiber registers here and its resumer's polls read the cell. Each cell takes its answer as
     /// it comes (#2477): [`complete`](Completions::complete) fills a registered cell, and a
@@ -21551,7 +21678,6 @@ impl Completions {
                 host_pending: BTreeMap::new(),
                 in_flight: 0,
                 minted: 0,
-                submitting: None,
                 fiber_cells: BTreeMap::new(),
             }),
             cv: Condvar::new(),
@@ -21561,7 +21687,10 @@ impl Completions {
 
     /// §12 — install (`Some`) or remove the hook each posted result calls
     /// ([`Completions::notify`]). Called before the caller parks: a result posted before it was
-    /// installed is found by the driver's recheck after the park, one posted after rings it.
+    /// installed is found by the driver's recheck after the park, one posted after rings it. The hook
+    /// runs on the thread that posts: a pool worker, an embedder's thread, or one inside a host
+    /// procedure, holding its domain's host lock (#2522). A hook that takes a lock taken before a
+    /// host's waits until the thread lets go of it, as the tree-walker's drain does.
     pub fn set_notify(&self, f: Option<Arc<dyn Fn() + Send + Sync>>) {
         *self.notify.lock_unpoisoned() = f;
     }
@@ -21615,14 +21744,11 @@ impl Completions {
                 g.ready.insert(id, result);
             }
         }
-        let quiet = g.submitting == Some(id);
         drop(g);
         self.cv.notify_all();
-        if quiet {
-            return;
-        }
         // The result post happens-before the wake hook, so a drain the hook runs always finds the
-        // result it is delivering (no lost wakeup). Called with no lock held: the hook drains.
+        // result it is delivering (no lost wakeup). Called with the store's lock released: the hook
+        // drains.
         let hook = self.notify.lock_unpoisoned().clone();
         if let Some(h) = hook {
             h();
@@ -21631,8 +21757,7 @@ impl Completions {
 
     /// #1366 — mint an id for a host-answered punt ([`OffloadOutcome::Host`]) and run its submit
     /// hook with the call's [`Completer`]: minted + marked host-owned under the one lock, with the
-    /// call's tape prefix when its host records. An answer the hook gives at once posts quietly
-    /// ([`CompletionState::submitting`]).
+    /// call's tape prefix when its host records.
     fn submit_host_owned(
         self: &Arc<Self>,
         record: Option<(u32, u32, i32, Vec<i64>)>,
@@ -21645,14 +21770,12 @@ impl Completions {
             if let Some(prefix) = record {
                 g.host_pending.insert(id, prefix);
             }
-            g.submitting = Some(id);
             id
         };
         submit(Completer {
             store: Arc::downgrade(self),
             id,
         });
-        self.mx.lock_unpoisoned().submitting = None;
         id
     }
 
@@ -21956,9 +22079,9 @@ pub type HostCompletion = Box<dyn FnOnce(Completer) + Send>;
 
 /// #2495 — the right to answer one host-answered call ([`OffloadOutcome::Host`]), handed to its
 /// submit hook: the embedder answers it with [`complete`](Completer::complete), from any thread, at
-/// any time. A completer dropped unanswered answers `CAP_REVOKED` (`-9`), so a call its host can no
-/// longer answer never hangs (INVARIANTS.md 9). It holds its domain's store weakly: once the domain
-/// is gone, answering does nothing.
+/// any time, from inside a host procedure too (#2522). A completer dropped unanswered answers
+/// `CAP_REVOKED` (`-9`), so a call its host can no longer answer never hangs (INVARIANTS.md 9). It
+/// holds its domain's store weakly: once the domain is gone, answering does nothing.
 #[derive(Debug)]
 pub struct Completer {
     store: std::sync::Weak<Completions>,
@@ -40408,18 +40531,14 @@ mod completer_tests {
         assert_eq!(comps.outstanding(), 0);
     }
 
-    /// An answer given inside its submit hook, under its dispatcher's host lock, posts without
-    /// ringing: the hook may take a scheduler lock the dispatcher must not nest under its host
-    /// lock (the tree-walker's pipe park takes them the other way round). Its caller's park finds
-    /// the answer.
+    /// An answer given inside its submit hook posts and rings like any other (#2522): a hook that
+    /// must not run under its dispatcher's host lock waits for it itself
+    /// ([`Scheduler::drain_when_free`]).
     #[test]
-    fn an_answer_inside_its_submit_hook_does_not_ring() {
+    fn an_answer_inside_its_submit_hook_rings() {
         let (comps, rings) = store();
         let id = comps.submit_host_owned(None, Box::new(|c| c.complete(7)));
         assert_eq!(comps.try_take(id), Some(7));
-        assert_eq!(rings.load(Ordering::SeqCst), 0);
-        // The next call's answer rings again.
-        submit(&comps).complete(8);
         assert_eq!(rings.load(Ordering::SeqCst), 1);
     }
 
