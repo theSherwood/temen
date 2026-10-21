@@ -15,6 +15,11 @@ asan = ["temen-jit/asan"]
 # + powerbox + JIT) through this one umbrella crate. **Off by default** — the default build stays the
 # dependency-free, auditable pipeline core (see the comment above). Opt in with `--features run`.
 run = ["dep:temen-run"]
+# A gated repro for the setjmp returns-twice miscompile (#2537): the `setjmp_repro` differential test
+# runs only under this feature, so CI stays green while the bug is open. It asserts the *desired*
+# invariant (JIT == interpreter oracle), so it fails today (reproducing the bug) and will pass once
+# #2537 is fixed — at which point the gate (and this feature) should be removed and the test kept.
+repro-2537 = []
 
 [dependencies]
 temen-ir.workspace = true
