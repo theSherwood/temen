@@ -541,17 +541,19 @@ fn memory() -> (Host, Vec<Value>) {
     (host, vec![Value::I32(a)])
 }
 
-/// The root maps one 16 KiB shared region at two window offsets, stores 41 through the first and
-/// loads it through the second: `0 * 1000 + 0 * 100 + 41` when both maps succeed.
-const REGION: &str = r#"memory 17
+/// The root maps a shared region one map page long at two window offsets, stores 41 through the
+/// first and loads it through the second: `0 * 1000 + 0 * 100 + 41` when both maps succeed. The map
+/// page is the region's `page_size` (op 3), which a portable guest aligns its maps to (#1241): the
+/// host page on unix, the 64 KiB allocation granularity on Windows, which the JIT maps by (#2565).
+const REGION: &str = r#"memory 18
 func (i32) -> (i64) {
 block 0 (vrh: i32) {
-  vlen = i64.const 16384
+  vlen = call.cap 4 3 () -> (i64) vrh ()
   vro = i64.const 0
   vprot = i32.const 3
   va = i64.const 65536
   vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (va, vro, vlen, vprot)
-  vb = i64.const 98304
+  vb = i64.add va vlen
   vm1 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vb, vro, vlen, vprot)
   vin = i64.const 41
   i64.store va vin
@@ -567,11 +569,12 @@ block 0 (vrh: i32) {
 }
 "#;
 
-/// A powerbox holding one 16 KiB shared region over an OS shared-memory object
+/// A powerbox holding one shared region, a map page long, over an OS shared-memory object
 /// (`temen_run::new_shared_region`), which every engine can alias: the JIT maps its descriptor.
 fn region() -> (Host, Vec<Value>) {
     let mut host = Host::new();
-    let backing = temen_run::new_shared_region(16384).expect("an OS shared-memory object");
+    let page = temen_interp::host_region_granularity() as usize;
+    let backing = temen_run::new_shared_region(page).expect("an OS shared-memory object");
     let r = host.grant_shared_region_backed(backing);
     (host, vec![Value::I32(r)])
 }
