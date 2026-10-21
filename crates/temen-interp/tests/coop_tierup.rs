@@ -103,7 +103,7 @@ fn coop_tierup_run(
         match run.run() {
             bytecode::CoopEvent::Done(vals) => return (Ok(vals), tierups),
             bytecode::CoopEvent::Trapped(t) => return (Err(t), tierups),
-            bytecode::CoopEvent::Idle
+            bytecode::CoopEvent::Idle { .. }
             | bytecode::CoopEvent::Paused
             | bytecode::CoopEvent::CapPark { .. } => {
                 panic!("unexpected Idle (nothing here waits on the embedder)")
@@ -415,7 +415,7 @@ fn coop_tierup_bounce_matches_pure_interp() {
         match run.run() {
             bytecode::CoopEvent::Done(vals) => break Ok(vals),
             bytecode::CoopEvent::Trapped(t) => break Err(t),
-            bytecode::CoopEvent::Idle
+            bytecode::CoopEvent::Idle { .. }
             | bytecode::CoopEvent::Paused
             | bytecode::CoopEvent::CapPark { .. } => {
                 panic!("unexpected Idle (nothing here waits on the embedder)")
@@ -545,7 +545,7 @@ fn a_bounce_polls_a_fiber_the_pump_parked() {
                 }
                 bounces += 1;
             }
-            bytecode::CoopEvent::Idle
+            bytecode::CoopEvent::Idle { .. }
             | bytecode::CoopEvent::Paused
             | bytecode::CoopEvent::CapPark { .. }
             | bytecode::CoopEvent::Resume { .. }
@@ -845,7 +845,7 @@ fn run_spawner(
         match run.run() {
             bytecode::CoopEvent::Done(vals) => return (Ok(vals), named),
             bytecode::CoopEvent::Trapped(t) => return (Err(t), named),
-            bytecode::CoopEvent::Idle
+            bytecode::CoopEvent::Idle { .. }
             | bytecode::CoopEvent::Paused
             | bytecode::CoopEvent::CapPark { .. } => {
                 panic!("unexpected Idle (nothing here waits on the embedder)")
@@ -1245,7 +1245,7 @@ fn fork_twin_run(
         match run.run() {
             bytecode::CoopEvent::Done(vals) => break Ok(vals),
             bytecode::CoopEvent::Trapped(t) => break Err(t),
-            bytecode::CoopEvent::Idle
+            bytecode::CoopEvent::Idle { .. }
             | bytecode::CoopEvent::Paused
             | bytecode::CoopEvent::CapPark { .. } => {
                 panic!("unexpected Idle (nothing here waits on the embedder)")
@@ -1534,7 +1534,7 @@ block 0 (vx: i64) {
             match run.run() {
                 bytecode::CoopEvent::Done(vals) => return (Ok(vals), tierups),
                 bytecode::CoopEvent::Trapped(t) => return (Err(t), tierups),
-                bytecode::CoopEvent::Idle
+                bytecode::CoopEvent::Idle { .. }
                 | bytecode::CoopEvent::Paused
                 | bytecode::CoopEvent::CapPark { .. } => {
                     panic!("unexpected Idle (nothing here waits on the embedder)")

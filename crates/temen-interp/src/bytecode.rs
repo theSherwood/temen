@@ -12107,7 +12107,9 @@ fn drive(
         sched.wall = cfg!(not(target_family = "wasm"));
         match sched.pump(&dom, mem, &root, &mut root_fuel, budget)? {
             CoopStep::Done(vals) => Ok(vals),
-            CoopStep::Idle => unreachable!("idle suspension not enabled on the native driver"),
+            CoopStep::Idle { .. } => {
+                unreachable!("idle suspension not enabled on the native driver")
+            }
             CoopStep::Paused => unreachable!("slicing not enabled on the native driver"),
             CoopStep::CapPark { .. } => {
                 unreachable!("only a pump its embedder drives hands control back for a call")
@@ -12144,8 +12146,10 @@ enum CoopStep {
     /// stdin read) and nothing internal can wake one. A pump its embedder drives (a [`CoopRun`])
     /// RETURNS here instead of waiting, so the embedder answers or feeds and pumps again — the whole
     /// scheduler state stays inside the `CoopSched`. The native `drive` waits instead: on the call's
-    /// answer, or on the bell for a feed (or it is the deadlock it always was).
-    Idle,
+    /// answer, or on the bell for a feed (or it is the deadlock it always was). #2557 — `timer` is
+    /// the time to the run's next timer, which waits for the embedder's clock while an answer is
+    /// owed ([`CoopEvent::Idle`]).
+    Idle { timer: Option<u64> },
     /// A task paused to run `func` of program `module` emitted ([`CoopEvent::TierUp`]) with raw i64
     /// arg slots `argv`; `mapped` is the window's committed scalar extent for the emitted `"mapped"`
     /// global (#717 host sync).
@@ -12782,6 +12786,16 @@ impl SchedCore {
         self.tasks[0].vm.vt.active.tier_up(0, emit, false);
     }
 
+    /// `ns` of the run's time passes: the clock moves by it, and every wait it reaches times out.
+    /// The pump's quanta move it so (#2224), and so does its embedder's clock ([`CoopRun::pass_time`]).
+    fn pass_time(&mut self, ns: u64) {
+        self.clock = self.clock.saturating_add(ns);
+        let mut regs: Vec<&mut Vec<FiberState>> = std::iter::once(&mut self.fibers)
+            .chain(self.extra_envs.iter_mut().map(|e| &mut e.fibers.fibers))
+            .collect();
+        time_out_due(&mut self.tasks, &mut regs, self.clock);
+    }
+
     /// A run's initial scheduling state: the root task at `entry`, plus any fibers a durable freeze
     /// left to re-seed (taken from `host.frozen_fibers`), after the once-per-run entry-fuel charge.
     /// Both executors start a run here ([`CoopSched::new`], [`drive_threads`]).
@@ -13136,8 +13150,10 @@ impl CoopSched {
                 // (#2424): a fiber's `CapParked`, a task's `BlockedHostCap`. #1953, #2495, #1414 D4
                 // — one its embedder answers, in any domain, is the embedder's to answer, and it
                 // heard of each as the call was made: with one owed, a pump the embedder drives
-                // hands control back rather than wait. Before any timer fires, as the run's clock
-                // jumps (#2439) and must not run ahead of an answer that is owed.
+                // hands control back rather than wait. The run's clock jumps (#2439), and must not
+                // run ahead of an answer that is owed, so its next timer waits for the embedder's
+                // clock: the pump hands back the time to it, and fires it once its embedder has
+                // let that time pass ([`CoopRun::pass_time`], #2557).
                 let calls: Vec<_> = outstanding_calls(tasks, fibers, extra_envs)
                     .into_iter()
                     .map(|(env, id)| {
@@ -13146,7 +13162,12 @@ impl CoopSched {
                     })
                     .collect();
                 if *embedder_pumps && calls.iter().any(|(c, id)| c.is_host_owned(*id)) {
-                    return Ok(CoopStep::Idle);
+                    let next = run_deadline(tasks, fibers, extra_envs);
+                    if !next.is_some_and(|d| d <= *clock) {
+                        return Ok(CoopStep::Idle {
+                            timer: next.map(|d| d - *clock),
+                        });
+                    }
                 }
                 // #1979 — on the native driver the time to the earliest deadline passes first.
                 if *wall && wait_out(tasks, fibers, extra_envs, clock, root, &calls, bell_gen) {
@@ -13172,7 +13193,7 @@ impl CoopSched {
                     let bell = root.lock_unpoisoned().external_wake();
                     if calls.is_empty() {
                         match stalled(tasks, *embedder_pumps, bell.is_some()) {
-                            Stalled::Idle => return Ok(CoopStep::Idle),
+                            Stalled::Idle => return Ok(CoopStep::Idle { timer: None }),
                             Stalled::Deadlock => return Err(Trap::ThreadFault),
                             Stalled::Bell => {}
                         }
@@ -13411,11 +13432,7 @@ impl CoopSched {
             // another task keeps running, after as much of its work as the timeout names, and
             // deterministically, as the op count is.
             if preemptible && matches!(stop, Ok(VcpuStop::Preempted)) {
-                *clock = clock.saturating_add(quantum);
-                let mut regs: Vec<&mut Vec<FiberState>> = std::iter::once(&mut *fibers)
-                    .chain(extra_envs.iter_mut().map(|e| &mut e.fibers.fibers))
-                    .collect();
-                time_out_due(tasks, &mut regs, *clock);
+                core.pass_time(quantum);
             }
             // #1157 — the quantum expired: the task is still `Runnable` (its cursor persisted), so
             // just loop. The round-robin `last_pick` advance picks a sibling next, giving it the
@@ -14659,7 +14676,15 @@ pub enum CoopEvent {
     /// run can wake one. The run is live and resumable: answer the call, or feed input (e.g.
     /// `Posix::feed_terminal`, or a signal), and call [`run`](CoopRun::run) again. `run` returns
     /// this rather than wait on its embedder.
-    Idle,
+    ///
+    /// #2557 — `timer` is how long, in ns, until the run's next timer: the earliest deadline of a
+    /// timed wait, which can wake a task before the embedder acts. It is `None` when no wait has
+    /// one. The pump fires it only once its embedder has let that time pass
+    /// ([`CoopRun::pass_time`]), so that its clock cannot run ahead of an answer it owes. An
+    /// embedder with a clock waits for whichever comes first, its own event or the timer, lets
+    /// the time that passed pass, and pumps again. On executor 2 the timer fires on its own; pump
+    /// again after it to hear what follows.
+    Idle { timer: Option<u64> },
     /// #1953, #1414 D4 — a task has just made **host-answered cap call** `id` (a proc granted with
     /// [`crate::OffloadOutcome::Host`]), in any domain, whose request the proc's submit hook
     /// recorded, and it waits for the embedder's answer. Each call is told once, as it is made,
@@ -14750,7 +14775,7 @@ impl ThreadsRun {
             }
             match run.watch() {
                 Watched::CapPark(id) => return CoopEvent::CapPark { id },
-                Watched::Idle => return CoopEvent::Idle,
+                Watched::Idle { timer } => return CoopEvent::Idle { timer },
                 Watched::Over => {}
             }
         }
@@ -15209,6 +15234,15 @@ impl CoopRun {
         }
     }
 
+    /// #2557 — `ns` of the embedder's time has passed since the run went [`CoopEvent::Idle`]. The
+    /// pump's clock moves by it, as by a quantum's ops (#2224), and the waits it reaches time out:
+    /// they run at the next [`run`](Self::run). A no-op on executor 2, whose clock is the wall's.
+    pub fn pass_time(&mut self, ns: u64) {
+        if let Some(p) = self.pump_mut() {
+            p.sched.core.pass_time(ns);
+        }
+    }
+
     /// [`run`](Self::run), but return after about `ops` ops with [`CoopEvent::Paused`] if nothing else
     /// stopped the run first. The slice is counted in ops (fuel), so it is deterministic.
     pub fn run_for(&mut self, ops: u64) -> CoopEvent {
@@ -15238,7 +15272,7 @@ impl CoopRun {
             .pump(&p.dom, &mut p.mem, &p.host, &mut p.fuel, u64::MAX)
         {
             Ok(CoopStep::Done(vals)) => CoopEvent::Done(vals),
-            Ok(CoopStep::Idle) => CoopEvent::Idle,
+            Ok(CoopStep::Idle { timer }) => CoopEvent::Idle { timer },
             Ok(CoopStep::CapPark { id }) => CoopEvent::CapPark { id },
             Ok(CoopStep::Paused) => CoopEvent::Paused,
             Ok(CoopStep::TierUp {
@@ -17181,7 +17215,11 @@ impl ThreadRun {
             g.told.push(id);
             return Some(Watched::CapPark(id));
         }
-        g.stalled.then_some(Watched::Idle)
+        let core = &g.core;
+        g.stalled.then(|| Watched::Idle {
+            timer: run_deadline(&core.tasks, &core.fibers, &core.extra_envs)
+                .map(|d| d.saturating_sub(self.now())),
+        })
     }
 }
 
@@ -17192,8 +17230,8 @@ enum Watched {
     /// Host-answered call `id` waits for its embedder's answer ([`CoopEvent::CapPark`]).
     CapPark(u64),
     /// No task can run until the embedder acts: an answer it owes, or input it feeds
-    /// ([`CoopEvent::Idle`]).
-    Idle,
+    /// ([`CoopEvent::Idle`]). `timer` is the wall time to the run's next deadline, if a wait has one.
+    Idle { timer: Option<u64> },
 }
 
 /// Mark task `ti` finished with `res`, then wake any vCPU parked on a join of it: what the end gives
@@ -17505,6 +17543,13 @@ fn next_timeout<'a>(
         .min()
 }
 
+/// The earliest deadline among a run's timed waits: its tasks', and its event-parked fibers' in
+/// every domain (`fibers`, then `envs`').
+fn run_deadline(tasks: &[TaskSlot], fibers: &[FiberState], envs: &[ChildEnv]) -> Option<u64> {
+    let regs = std::iter::once(fibers).chain(envs.iter().map(|e| &e.fibers.fibers[..]));
+    next_timeout(tasks, regs.flat_map(|reg| reg.iter()))
+}
+
 /// #1979 — an idle native pump lets the time to its earliest deadline pass in real time, as the
 /// other engines' waits do, instead of jumping its `clock` there. The answer to any of the
 /// outstanding `calls` ends the wait early, or with none a ring of the embedder's bell past
@@ -17520,9 +17565,7 @@ fn wait_out(
     calls: &[(std::sync::Arc<super::Completions>, u64)],
     seen: u64,
 ) -> bool {
-    let regs = std::iter::once(&*fibers).chain(extra_envs.iter().map(|e| &e.fibers.fibers[..]));
-    let next = next_timeout(tasks, regs.flat_map(|reg| reg.iter()));
-    let Some(left) = next
+    let Some(left) = run_deadline(tasks, fibers, extra_envs)
         .and_then(|next| next.checked_sub(*clock))
         .filter(|&l| l > 0)
     else {

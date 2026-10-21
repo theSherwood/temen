@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**273 exports** in 38 families — 228 referenced from JS, 45 referenced by nothing, 42 behind a `cfg`.
+**275 exports** in 38 families — 230 referenced from JS, 45 referenced by nothing, 42 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -12,7 +12,7 @@
 | `bash` | 10 | 9 | 0 |
 | `callprof` | 4 | 4 | 4 |
 | `child` | 1 | 1 | 0 |
-| `coop` | 64 | 55 | 0 |
+| `coop` | 66 | 57 | 0 |
 | `dap` | 4 | 4 | 0 |
 | `dealloc` | 1 | 1 | 0 |
 | `detached` | 2 | 2 | 0 |
@@ -117,6 +117,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_coop_fs_image`
 - `temen_coop_fs_ptr`
 - `temen_coop_func`
+- `temen_coop_idle_timer`
 - `temen_coop_jit_code`
 - `temen_coop_jit_param_types_ptr`
 - `temen_coop_jit_result_types_len`
@@ -137,6 +138,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_coop_paged`
 - `temen_coop_pagestate_len` — *unreferenced*
 - `temen_coop_pagestate_ptr`
+- `temen_coop_pass_time`
 - `temen_coop_program_key`
 - `temen_coop_program_key_ptr`
 - `temen_coop_program_leaf`

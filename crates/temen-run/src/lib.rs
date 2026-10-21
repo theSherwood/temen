@@ -5320,8 +5320,10 @@ pub enum SessionStep {
     /// Nothing can run until the embedder acts (#1414 D4): every task is parked on input only the
     /// embedder can supply (a terminal read: feed the terminal), or on the answer to a call it was
     /// told of ([`SessionStep::CapPark`]: answer it), and pump again. The run is live and its whole
-    /// state retained in the session.
-    Idle,
+    /// state retained in the session. #2557 — `timer` is how long, in ns, until the run's next timer,
+    /// which fires once the embedder has let that time pass ([`CoopSession::pass_time`]); `None` when
+    /// no wait has a deadline ([`temen_interp::bytecode::CoopEvent::Idle`]).
+    Idle { timer: Option<u64> },
     /// #2528 — the guest has just made host-answered call `id`: a call to a capability whose proc
     /// answers with [`temen_interp::OffloadOutcome::Host`]. Answer it with the
     /// [`temen_interp::Completer`] the proc's submit hook was handed, now or later. Each call is
@@ -5344,7 +5346,7 @@ impl CoopSession {
     /// trap is the `Err` (§5 detect-and-kill).
     pub fn pump(&mut self) -> Result<SessionStep, String> {
         match self.run.run() {
-            temen_interp::bytecode::CoopEvent::Idle => Ok(SessionStep::Idle),
+            temen_interp::bytecode::CoopEvent::Idle { timer } => Ok(SessionStep::Idle { timer }),
             temen_interp::bytecode::CoopEvent::CapPark { id } => Ok(SessionStep::CapPark { id }),
             temen_interp::bytecode::CoopEvent::Done(v) => {
                 outcome_from_interp(Ok(v)).map(SessionStep::Done)
@@ -5355,6 +5357,13 @@ impl CoopSession {
             // Tier-up / `Jit.invoke` surfacing is never enabled on a session (no eligibility set).
             _ => Err("unexpected tier-up event on a cooperative session".to_string()),
         }
+    }
+
+    /// #2557 — `ns` of the embedder's time has passed since the session went
+    /// [`SessionStep::Idle`]: the run's waits that time reaches time out at the next
+    /// [`pump`](Self::pump) ([`temen_interp::bytecode::CoopRun::pass_time`]).
+    pub fn pass_time(&mut self, ns: u64) {
+        self.run.pass_time(ns);
     }
 }
 

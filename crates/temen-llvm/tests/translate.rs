@@ -13516,7 +13516,7 @@ fn bash_temen_transcript_session(
                     temen_run::SessionStep::CapPark { id } => {
                         panic!("bash's session has no host-answered cap, yet call {id} waits")
                     }
-                    temen_run::SessionStep::Idle => {
+                    temen_run::SessionStep::Idle { .. } => {
                         let t = px.transcript();
                         assert!(
                             t.len() > typed_at && t.ends_with(b"$ "),

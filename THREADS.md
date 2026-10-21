@@ -153,7 +153,9 @@ property, so in practice:
   call once, while the run's other tasks go on; at the run's idle point, when nothing can run until
   the embedder acts (an answer it owes, or input it feeds), with `Idle` instead of waiting; and at its
   end. The pump and the debug scheduler follow the same rule (#1414 D4, #2531), so `run` never waits
-  on its embedder. Both executors reach their idle verdict through one function (`stalled`), and both
+  on its embedder. `Idle` carries the time to the run's next timer (#2557): while an answer is owed,
+  the pump fires a timer only once its embedder has let that time pass (`CoopRun::pass_time`), and
+  executor 2's fire on their own. Both executors reach their idle verdict through one function (`stalled`), and both
   count a runnable task of a stopped process as waiting, as the pump's pick skips it (#2529 tracks
   the tree-walker, which waits forever there).
 - [x] **Step 4c-futex — the cross-thread `memory.wait`/`notify`.** The parallel driver now services the
