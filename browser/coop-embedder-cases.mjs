@@ -174,6 +174,22 @@ block 0 (vsp: i64, varg: i64) {
 export 0 func "_start" 0
 `;
 
+// #2439 — a guest that waits `ms` on a word nobody notifies, and returns what the wait answered.
+const loneWait = (ms) => `memory 16
+func () -> (i64) {
+block 0 () {
+  vaddr = i64.const 36864
+  vexp = i32.const 0
+  vto = i64.const ${ms * 1000000}
+  vst = i32.atomic.wait vaddr vexp vto
+  vst64 = i64.extend_i32_s vst
+  return vst64
+  }
+}
+export 0 func "_start" 0
+`;
+export const LONE_WAIT_MS = 30;
+
 export const pong = (x) => 2n * x + 1n;
 export const PINGS = 30;
 
@@ -239,6 +255,10 @@ export async function runCases({ ex, memory, drive, suspends }) {
   // #2557: the answer comes 50 ms after its call, and the root's 1 ms timer fires meanwhile.
   if (open(TIMER_WHILE_OWED, ['ping'], COOP_NO_REGIONS) !== 0) throw new Error('open timer while owed');
   results.timerWhileOwed = await run({ answerAfter: 50 });
+  // #2439: a lone wait takes its time: the driver waits the run's timer out.
+  if (open(loneWait(LONE_WAIT_MS), [], COOP_NO_REGIONS) !== 0) throw new Error('open lone wait');
+  const waitFrom = performance.now();
+  results.loneWait = { ...(await run()), ms: performance.now() - waitFrom };
   if (open(pingGuest(PINGS), ['ping'], leafMode) !== 0) throw new Error('open ping to stop');
   results.stopAtPark = await run({ stopAtPark: 3 });
   // Interpreted: emitted code is not sliced, so a root leaf that never parks would never come back

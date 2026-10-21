@@ -12146,9 +12146,9 @@ enum CoopStep {
     /// stdin read) and nothing internal can wake one. A pump its embedder drives (a [`CoopRun`])
     /// RETURNS here instead of waiting, so the embedder answers or feeds and pumps again — the whole
     /// scheduler state stays inside the `CoopSched`. The native `drive` waits instead: on the call's
-    /// answer, or on the bell for a feed (or it is the deadlock it always was). #2557 — `timer` is
-    /// the time to the run's next timer, which waits for the embedder's clock while an answer is
-    /// owed ([`CoopEvent::Idle`]).
+    /// answer, or on the bell for a feed (or it is the deadlock it always was). #2557, #2439 —
+    /// `timer` is the time to the run's next timer, which fires on the embedder's clock
+    /// ([`CoopEvent::Idle`]).
     Idle { timer: Option<u64> },
     /// A task paused to run `func` of program `module` emitted ([`CoopEvent::TierUp`]) with raw i64
     /// arg slots `argv`; `mapped` is the window's committed scalar extent for the emitted `"mapped"`
@@ -12454,8 +12454,8 @@ struct CoopSched {
     /// resumes exactly where this one stopped, as after a #1157 preemption.
     slice_left: Option<u64>,
     /// #1979 — an idle pump lets the time to its next deadline pass in real time ([`wait_out`])
-    /// instead of jumping its clock there. Set by the native `drive`; a [`CoopRun`]'s embedder
-    /// keeps the jump (a browser has no clock to wait on, #2439).
+    /// instead of jumping its clock there. Set by the native `drive`. A [`CoopRun`] hands that time
+    /// to its embedder instead, as wasm has no clock to wait on (#2439).
     wall: bool,
     /// #2495, #1414 D4 — set by a [`CoopRun`]: its embedder pumps it, and answers a host-answered
     /// call or feeds input only once it has control back. So the pump tells it of each call as the
@@ -13147,13 +13147,7 @@ impl CoopSched {
                     continue;
                 }
                 // The punted calls outstanding (F2, FIBER_PARK.md), each in its domain's store
-                // (#2424): a fiber's `CapParked`, a task's `BlockedHostCap`. #1953, #2495, #1414 D4
-                // — one its embedder answers, in any domain, is the embedder's to answer, and it
-                // heard of each as the call was made: with one owed, a pump the embedder drives
-                // hands control back rather than wait. The run's clock jumps (#2439), and must not
-                // run ahead of an answer that is owed, so its next timer waits for the embedder's
-                // clock: the pump hands back the time to it, and fires it once its embedder has
-                // let that time pass ([`CoopRun::pass_time`], #2557).
+                // (#2424): a fiber's `CapParked`, a task's `BlockedHostCap`.
                 let calls: Vec<_> = outstanding_calls(tasks, fibers, extra_envs)
                     .into_iter()
                     .map(|(env, id)| {
@@ -13161,12 +13155,22 @@ impl CoopSched {
                         (h.completions(), id)
                     })
                     .collect();
-                if *embedder_pumps && calls.iter().any(|(c, id)| c.is_host_owned(*id)) {
-                    let next = run_deadline(tasks, fibers, extra_envs);
-                    if !next.is_some_and(|d| d <= *clock) {
-                        return Ok(CoopStep::Idle {
-                            timer: next.map(|d| d - *clock),
-                        });
+                // #2439, #2557 — a pump its embedder drives keeps its embedder's time, as the native
+                // driver keeps the wall's (#1979): it hands back the time to its next timer, and
+                // fires the timer once its embedder has let that time pass
+                // ([`CoopRun::pass_time`]). With no timer, it hands back while it owes the answer
+                // to a call its embedder answers, in any domain (#1953, #2495), and heard of as the
+                // call was made (#1414 D4).
+                if *embedder_pumps {
+                    let owed = calls.iter().any(|(c, id)| c.is_host_owned(*id));
+                    match run_deadline(tasks, fibers, extra_envs) {
+                        Some(due) if due > *clock => {
+                            return Ok(CoopStep::Idle {
+                                timer: Some(due - *clock),
+                            })
+                        }
+                        None if owed => return Ok(CoopStep::Idle { timer: None }),
+                        _ => {}
                     }
                 }
                 // #1979 — on the native driver the time to the earliest deadline passes first.
@@ -14670,20 +14674,21 @@ pub enum CoopEvent {
     /// its thread (a browser Worker) runs a long program in slices, streaming its output and honoring
     /// a Pause between them. Never surfaced by an unsliced `run`.
     Paused,
-    /// #1122 route (a), #1414 D4 — the run is **idle**: no task can run until the embedder acts. It
-    /// owes the answer to a host-answered call it was told of ([`CoopEvent::CapPark`]), or a task
-    /// waits on what it feeds (a terminal or pipe read, a blocking stdin read) and nothing in the
-    /// run can wake one. The run is live and resumable: answer the call, or feed input (e.g.
-    /// `Posix::feed_terminal`, or a signal), and call [`run`](CoopRun::run) again. `run` returns
-    /// this rather than wait on its embedder.
+    /// #1122 route (a), #1414 D4 — the run is **idle**: no task can run until the embedder acts or
+    /// the run's next timer is due. It owes the answer to a host-answered call it was told of
+    /// ([`CoopEvent::CapPark`]), a task waits on what it feeds (a terminal or pipe read, a
+    /// blocking stdin read), or a timed wait is all that can wake a task. The run is live and
+    /// resumable: answer the call, or feed input (e.g. `Posix::feed_terminal`, or a signal), and
+    /// call [`run`](CoopRun::run) again. `run` returns this rather than wait on its embedder.
     ///
-    /// #2557 — `timer` is how long, in ns, until the run's next timer: the earliest deadline of a
-    /// timed wait, which can wake a task before the embedder acts. It is `None` when no wait has
-    /// one. The pump fires it only once its embedder has let that time pass
-    /// ([`CoopRun::pass_time`]), so that its clock cannot run ahead of an answer it owes. An
-    /// embedder with a clock waits for whichever comes first, its own event or the timer, lets
-    /// the time that passed pass, and pumps again. On executor 2 the timer fires on its own; pump
-    /// again after it to hear what follows.
+    /// #2557, #2439 — `timer` is how long, in ns, until the run's next timer: the earliest deadline
+    /// of a timed wait. It is `None` when no wait has one. The pump keeps its embedder's time: it
+    /// fires the timer only once its embedder has let that time pass ([`CoopRun::pass_time`]). An
+    /// embedder with a clock waits for whichever comes first, its own event or the timer, lets the
+    /// time that passed pass, and pumps again; one with no time to wait in lets it pass at once
+    /// ([`CoopRun::run_clockless`]). On executor 2 timers fire on their own, in real time: it
+    /// returns this only for what its embedder owes or feeds, with the time to a timer if one is
+    /// pending.
     Idle { timer: Option<u64> },
     /// #1953, #1414 D4 — a task has just made **host-answered cap call** `id` (a proc granted with
     /// [`crate::OffloadOutcome::Host`]), in any domain, whose request the proc's submit hook
@@ -15240,6 +15245,19 @@ impl CoopRun {
     pub fn pass_time(&mut self, ns: u64) {
         if let Some(p) = self.pump_mut() {
             p.sched.core.pass_time(ns);
+        }
+    }
+
+    /// #2439 — [`run`](Self::run) for an embedder with no time to wait in, such as one synchronous
+    /// call that must return the run's next stop: each timer the pump hands back fires at once, its
+    /// time let pass ([`pass_time`](Self::pass_time)). Executor 2's timers keep the wall's time, so
+    /// its `Idle` returns as from `run`.
+    pub fn run_clockless(&mut self) -> CoopEvent {
+        loop {
+            match self.run() {
+                CoopEvent::Idle { timer: Some(ns) } if self.pump().is_some() => self.pass_time(ns),
+                ev => return ev,
+            }
         }
     }
 

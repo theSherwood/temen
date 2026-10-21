@@ -6513,6 +6513,54 @@ fn coop_run_idles_with_its_timer_while_an_answer_is_owed() {
     temen_coop_close();
 }
 
+/// #2439 — a root that waits 1 ms on a word nobody notifies, and returns what the wait answered.
+const LONE_WAIT: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  vaddr = i64.const 36864
+  vexp = i32.const 0
+  vto = i64.const 1000000
+  vst = i32.atomic.wait vaddr vexp vto
+  vst64 = i64.extend_i32_s vst
+  return vst64
+  }
+}
+export 0 func "_start" 0
+"#;
+
+/// **A timed wait takes the page's time** (#2439). With the wait all that can wake the run, it is
+/// `COOP_RUN_IDLE` with the wait's 1 ms (`temen_coop_idle_timer`), the same until the page lets time
+/// pass (`temen_coop_pass_time`), and then times out: `WAIT_TIMED_OUT`. The run used to jump to the
+/// deadline and end at once.
+#[test]
+fn coop_run_hands_the_page_the_time_to_a_lone_wait() {
+    let _g = ffi_guard();
+    let m = temen_text::parse_module(LONE_WAIT).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        COOP_NO_REGIONS,
+    );
+    assert_eq!(opened, 0, "opens");
+    let idle = || {
+        assert_eq!(temen_coop_run(), COOP_RUN_IDLE, "the run waits on its timer");
+        temen_coop_idle_timer()
+    };
+    assert_eq!(idle(), 1_000_000, "the wait's timer");
+    assert_eq!(idle(), 1_000_000, "no time has passed");
+    temen_coop_pass_time(1_000_000);
+    assert_eq!(temen_coop_run(), COOP_RUN_DONE, "status {}", temen_status());
+    assert_eq!(temen_coop_value(), 2, "`WAIT_TIMED_OUT`");
+    temen_coop_close();
+}
+
 /// **A root with read-only data runs whole as a leaf, though it never touches its page state**
 /// (#2130). A `readonly` segment maps its pages `Ro` at instantiation, so the window starts past what
 /// one bound describes: the leaf must be emitted page-checked, or it has no bound to run under and

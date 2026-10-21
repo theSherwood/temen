@@ -4085,7 +4085,8 @@ fn pg_report(out: PbOutcome) -> i32 {
 /// an ended session never reads as ready. The report's stdout is what the backend wrote since the last
 /// call.
 fn pg_pump(s: &mut PgSession) -> i32 {
-    let ev = s.run.run();
+    // The console's open and each query are one synchronous call: the backend's timers fire at once.
+    let ev = s.run.run_clockless();
     let host = s.run.host_mut();
     let stdout = host.stdout.get(s.stdout_pos..).unwrap_or(&[]).to_vec();
     s.stdout_pos = host.stdout.len();
@@ -4428,7 +4429,7 @@ impl OnrampReactor {
         let mut run = self
             .inst
             .coop_call(func, args, DEFAULT_FUEL, host, None, None)?;
-        let ended = match run.run() {
+        let ended = match run.run_clockless() {
             bytecode::CoopEvent::Done(vals) => Ok(vals),
             bytecode::CoopEvent::Trapped(t) => Err(t),
             // No capability of the reactor's completes on the host, so nothing could answer a park:
@@ -5859,7 +5860,8 @@ pub extern "C" fn temen_bash_coop_pump() -> i32 {
     if s.exit.is_some() {
         return BASH_COOP_DONE;
     }
-    match s.run.run() {
+    // The page pumps again only on a keystroke: the shell's timers fire at once.
+    match s.run.run_clockless() {
         bytecode::CoopEvent::Idle { .. } => BASH_COOP_IDLE,
         bytecode::CoopEvent::Done(_) => {
             s.exit = Some(0);
