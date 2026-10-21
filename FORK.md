@@ -780,8 +780,9 @@ would never see EOF. The rule is exec's, and it is POSIX's: what crosses an exec
 `-ENOSYS`, and a serve handler is refused `-EINVAL`, as for exec. An image the engine cannot start once
 the process exists (bytes that do not verify, a built program with no `ModuleLoader`, an import nothing
 serves) makes a child that exits `127` as it is born (`Host::spawn_failed`), POSIX's status for a
-spawned child whose exec failed. A durable domain may spawn, as it may fork: its freeze declines while
-the child lives. `caller_request_parity.rs` pins all of it on the three engines.
+spawned child whose exec failed. A durable domain may spawn, as it may fork. A fork twin rides its
+freeze (DURABILITY.md, "Fork twins", #1688), but a spawned command image cannot unwind, so the freeze
+declines while the spawned child lives. `caller_request_parity.rs` pins all of it on the three engines.
 
 ## 9. Fast-backend fork parity — bytecode DONE; Cranelift: the personality fork DONE (§9.5), `clone_caller` next
 

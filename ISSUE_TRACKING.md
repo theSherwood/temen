@@ -40,7 +40,7 @@ Twelve. File every issue as a sub-issue of exactly one:
 | #707 | **IR/substrate** — binary format, text round-trip, op spec | DESIGN §3a/3b; SPEC.md; `temen-ir`, `temen-text` |
 | #708 | **Concurrency** — fibers, scheduling, migration, fork mechanism | THREADS.md, FORK.md; DESIGN §23; `temen-fiber` |
 | #709 | **Process** — domains, offers, serving, capabilities, nesting | PROCESS.md, IMPORTS.md, POWERBOX.md; DESIGN §12a |
-| #710 | **Durability** — freeze/thaw, snapshots, C-ABI embedding | DURABILITY.md, INTERACTIVE_EMBEDDING.md; DESIGN §21 |
+| #2570 (#710 is full) | **Durability** — freeze/thaw, snapshots, C-ABI embedding | DURABILITY.md, INTERACTIVE_EMBEDDING.md; DESIGN §21 |
 | #711 | **Debugging** — stepping, DAP, observability | DEBUGGING.md; DESIGN §19; `temen-dap` |
 | #2368 (#712 is full) | **Consumers** — fork/exec/POSIX shell + language on-ramps | FORK/EXEC/POSIX/STAGE1.md, SELFHOST_C.md, NIM/GO/TYPESCRIPT.md; DESIGN §20 |
 | #713 | **Web/Playground** — browser deploy, Pages, boot speed | FRONTEND.md, BROWSER.md, BOOTSPEED.md; `browser/` |

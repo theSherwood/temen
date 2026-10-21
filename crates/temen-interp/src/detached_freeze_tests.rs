@@ -38,10 +38,15 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 ";
 
 /// The child: sums `0..100` with a back-edge poll per iteration, so a freeze catches it mid-loop and
-/// its continuation is a real one — 4950 uninterrupted.
+/// its continuation is a real one — 4950 uninterrupted. The zero-length `unmap` through its
+/// `AddressSpace` (refused, its answer unused) is what gives the loop its poll: a function that
+/// cannot suspend gets none, and runs to its end under a freeze rather than unwinding (#1937).
 const CHILD: &str = "memory 17 shadow 16448 65536
-func (i64) -> (i64) {
-block 0 (v0: i64) {
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, va: i64) {
+  vas = i32.wrap_i64 va
+  vz = i64.const 0
+  vu = call.cap 5 1 (i64, i64) -> (i64) vas (vz, vz)
   v1 = i64.const 0
   v2 = i64.const 0
   br 1(v1, v2)
@@ -146,8 +151,11 @@ fn a_live_detached_child_is_captured_and_its_thaw_completes_the_join() {
 
     // Freeze from the start: the parent spawns the child, unwinds at its next poll, and rings the
     // child's doorbell rather than waiting for it; the child unwinds at its own first poll, and the
-    // driver harvests its window and powerbox.
+    // driver harvests its window and powerbox. One lane runs the two in turn, so the bell reaches
+    // the child before its loop does: on two, the child can return between its last poll and the
+    // bell, and it rides as completed instead ([`a_child_rung_after_its_last_poll_rides_completed`]).
     let (mut fhost, fargs) = powerbox(&child);
+    fhost.set_lane_cap(1);
     let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
     write_state(&mut win, ARENA, STATE_UNWINDING);
     let (fr, fsnap) = run(&parent, &mut fhost, &fargs, &win);
@@ -204,6 +212,51 @@ fn a_live_detached_child_is_captured_and_its_thaw_completes_the_join() {
         thost.captured_detached().is_empty() && thost.take_thawed_detached().is_empty(),
         "nothing left over for a later run"
     );
+}
+
+/// #1688 — a child the bell reaches after its last poll returns rather than unwinding, and what it
+/// returned is its answer: it rides as a completed child, and the thaw hands its result to the
+/// rewound join instead of running it again. This child has no poll at all, so one lane, which runs
+/// it only once its parent has unwound and rung, puts the whole child after the bell.
+#[test]
+fn a_child_rung_after_its_last_poll_rides_completed() {
+    const POLL_FREE: &str = "memory 17 shadow 16448 65536
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 4950
+  return v1
+  }
+}
+";
+    let parent = instrument(PARENT, spawn_rec());
+    let child = instrument(POLL_FREE, None);
+    let (mut fhost, fargs) = powerbox(&child);
+    fhost.set_lane_cap(1);
+    let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
+    write_state(&mut win, ARENA, STATE_UNWINDING);
+    let (fr, fsnap) = run(&parent, &mut fhost, &fargs, &win);
+    assert!(fr.is_ok(), "the parent froze: {fr:?}");
+    assert!(
+        fhost.unreached_detached().is_empty() && fhost.captured_detached().is_empty(),
+        "nothing to resume"
+    );
+    let frozen = fhost.frozen_detached().to_vec();
+    assert_eq!(frozen.len(), 1, "the child rides as completed");
+    assert_eq!(
+        (
+            frozen[0].parent_task,
+            frozen[0].slot,
+            frozen[0].completed_result
+        ),
+        (0, 0, Ok(4950)),
+    );
+
+    let mut twin = fsnap.clone();
+    begin_thaw(&mut twin, ARENA, 0);
+    let (mut thost, targs) = powerbox(&child);
+    thost.set_frozen_detached(frozen);
+    let (tr, _) = run(&parent, &mut thost, &targs, &twin);
+    assert_eq!(tr, Ok(vec![Value::I64(4950)]), "the join took the result");
 }
 
 /// The gate's other half: without freeze authority over its detached progeny, a durable parent's

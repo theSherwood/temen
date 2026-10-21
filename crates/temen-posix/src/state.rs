@@ -7,31 +7,119 @@
 //!
 //! - **The world:** the memfs (files, their write clock, empty directories), the unread stdin, the
 //!   process table's zombies, the pid counter, the foreground process group.
-//! - **The root process:** its pids, its heap allocator (its blocks live in the window, which rides),
-//!   its fd table, its directory streams, argv, cwd, environment, and signal and stop state.
+//! - **Every live process** (#1688: the root's, then each fork twin's in pid order): its pids, its
+//!   heap allocator (its blocks live in its window, which rides), its fd table, its directory
+//!   streams, argv, cwd, environment, and signal and stop state.
 //!
 //! The embedder's configuration (the command registry, the stdout sink, the spawn and net
 //! delegates, the terminal, a pinned clock) does not ride: the thawing embedder grants it again, as
 //! it did for the frozen run. Output already written does not ride either: the embedder has read it.
 //!
-//! Descriptions an fd table shares — an open file's offset, a pipe's buffer, an adopted core pipe
-//! end's dup group — are written once and named by index, so a restored `dup` still shares with its
-//! original. A socket is an edge the thaw does not re-bind: its fd comes back closed, the ordinary
-//! failure a guest already handles (DURABILITY §4, "Across the boundary"). A live fork twin's process
-//! is not carried here; the freeze declines while one is live (#1688).
+//! Descriptions the fd tables share — an open file's offset, a pipe's buffer, an adopted core pipe
+//! end's dup group — are written once and named by index, across every process, so a restored `dup`
+//! still shares with its original and a forked child with its parent. A socket is an edge the thaw
+//! does not re-bind: its fd comes back closed, the ordinary failure a guest already handles
+//! (DURABILITY §4, "Across the boundary").
+//!
+//! A twin's own entry in its powerbox captures only which process it is ([`twin_marker`]); the
+//! root's entry carries the world, twins and all, and a thaw re-binds each twin's entry to its
+//! process in it ([`crate::Thaw`]).
 //!
 //! Every map is written in key order, so the same state always writes the same bytes (§12.6).
 
 use super::*;
 
-/// The format's own version: bumped on any change, and a mismatch fails the restore.
-const VERSION: u8 = 1;
+/// The format's own version: bumped on any change, and a mismatch fails the restore. v2 (#1688):
+/// each live fork twin's process rides after the root's.
+const VERSION: u8 = 2;
+
+/// #1688 — the first byte of a fork twin's entry state, which no version takes.
+const TWIN: u8 = 0x80;
 
 /// Why a restore refused the bytes: they are not this format, or not well formed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct StateError;
 
-/// The personality's state as bytes: the world's and the root process's (see the module doc).
+/// #1688 — what a fork twin's personality entry captures: which process it is. Its process rides
+/// with the world, in the root's entry.
+pub(crate) fn twin_marker(pid: i32) -> Vec<u8> {
+    let mut b = Writer(vec![TWIN]);
+    b.ileb(pid as i64);
+    b.0
+}
+
+/// The pid a [`twin_marker`] names, or `None` for any other state.
+pub(crate) fn twin_of(bytes: &[u8]) -> Option<i32> {
+    let mut r = Reader(bytes);
+    if r.u8().ok()? != TWIN {
+        return None;
+    }
+    let pid = r.i32().ok()?;
+    r.0.is_empty().then_some(pid)
+}
+
+/// The descriptions the processes' fd tables share, in first-appearance order across them.
+#[derive(Default)]
+struct Descriptions {
+    files: Vec<Arc<Mutex<OpenFile>>>,
+    pipes: Vec<PipeBuf>,
+    tokens: Vec<Arc<CorePipeToken>>,
+}
+
+impl Descriptions {
+    /// `p`'s fd table as `(tag, description index)`, numbering the descriptions it is the first to
+    /// name.
+    fn fds(&mut self, p: &Proc) -> Vec<(u8, u64)> {
+        fn index<T: ?Sized>(table: &mut Vec<Arc<T>>, a: &Arc<T>) -> u64 {
+            match table.iter().position(|x| Arc::ptr_eq(x, a)) {
+                Some(i) => i as u64,
+                None => {
+                    table.push(Arc::clone(a));
+                    (table.len() - 1) as u64
+                }
+            }
+        }
+        p.fds
+            .iter()
+            .map(|e| match e {
+                None => (0, 0),
+                Some(FdEntry::Stdin) => (1, 0),
+                Some(FdEntry::Stdout) => (2, 0),
+                Some(FdEntry::Stderr) => (3, 0),
+                Some(FdEntry::File(f)) => (4, index(&mut self.files, f)),
+                Some(FdEntry::PipeRead(q)) => (5, index(&mut self.pipes, q)),
+                Some(FdEntry::PipeWrite(q)) => (6, index(&mut self.pipes, q)),
+                Some(FdEntry::CorePipe(t)) => (7, index(&mut self.tokens, t)),
+                // A socket's other end is outside the cut: it comes back closed.
+                Some(FdEntry::NetSock(_) | FdEntry::NetStream(_) | FdEntry::NetListener(_)) => {
+                    (0, 0)
+                }
+            })
+            .collect()
+    }
+
+    fn write(&self, b: &mut Writer) {
+        b.uleb(self.files.len() as u64);
+        for f in &self.files {
+            let f = f.lock().unwrap_or_else(|e| e.into_inner());
+            b.str(&f.path);
+            b.uleb(f.pos as u64);
+            b.bool(f.writable);
+        }
+        b.uleb(self.pipes.len() as u64);
+        for q in &self.pipes {
+            b.bytes(&q.lock().unwrap_or_else(|e| e.into_inner()));
+        }
+        b.uleb(self.tokens.len() as u64);
+        for t in &self.tokens {
+            b.ileb(t.get() as i64);
+        }
+    }
+}
+
+/// The personality's state as bytes: the world's and every live process's (see the module doc).
+/// `p` is the root process, locked by the caller after `w`; each twin's is locked after both, one
+/// at a time, the canonical world-before-process order.
 pub(crate) fn capture(w: &World, p: &Proc) -> Vec<u8> {
     let mut b = Writer(vec![VERSION]);
 
@@ -68,51 +156,36 @@ pub(crate) fn capture(w: &World, p: &Proc) -> Vec<u8> {
     b.ileb(w.next_pid as i64);
     b.ileb(w.fg_pgid as i64);
 
-    // The descriptions the fd table shares, in first-appearance order.
-    let mut files_d: Vec<&Arc<Mutex<OpenFile>>> = Vec::new();
-    let mut pipes_d: Vec<&PipeBuf> = Vec::new();
-    let mut tokens_d: Vec<&Arc<CorePipeToken>> = Vec::new();
-    fn index<'a, T: ?Sized>(table: &mut Vec<&'a Arc<T>>, a: &'a Arc<T>) -> u64 {
-        match table.iter().position(|x| Arc::ptr_eq(x, a)) {
-            Some(i) => i as u64,
-            None => {
-                table.push(a);
-                (table.len() - 1) as u64
-            }
-        }
-    }
-    let mut fds: Vec<(u8, u64)> = Vec::with_capacity(p.fds.len());
-    for e in &p.fds {
-        fds.push(match e {
-            None => (0, 0),
-            Some(FdEntry::Stdin) => (1, 0),
-            Some(FdEntry::Stdout) => (2, 0),
-            Some(FdEntry::Stderr) => (3, 0),
-            Some(FdEntry::File(f)) => (4, index(&mut files_d, f)),
-            Some(FdEntry::PipeRead(q)) => (5, index(&mut pipes_d, q)),
-            Some(FdEntry::PipeWrite(q)) => (6, index(&mut pipes_d, q)),
-            Some(FdEntry::CorePipe(t)) => (7, index(&mut tokens_d, t)),
-            // A socket's other end is outside the cut: it comes back closed.
-            Some(FdEntry::NetSock(_) | FdEntry::NetStream(_) | FdEntry::NetListener(_)) => (0, 0),
-        });
-    }
-    b.uleb(files_d.len() as u64);
-    for f in files_d {
-        let f = f.lock().unwrap_or_else(|e| e.into_inner());
-        b.str(&f.path);
-        b.uleb(f.pos as u64);
-        b.bool(f.writable);
-    }
-    b.uleb(pipes_d.len() as u64);
-    for q in pipes_d {
-        b.bytes(&q.lock().unwrap_or_else(|e| e.into_inner()));
-    }
-    b.uleb(tokens_d.len() as u64);
-    for t in tokens_d {
-        b.ileb(t.get() as i64);
+    // The live fork twins, in pid order (#1688).
+    let mut twins: Vec<(i32, Arc<Mutex<Proc>>)> = w
+        .procs
+        .iter()
+        .filter_map(|(&pid, e)| match e {
+            ProcEntry::Live(t) if pid != p.pid => Some((pid, Arc::clone(t))),
+            _ => None,
+        })
+        .collect();
+    twins.sort_by_key(|(pid, _)| *pid);
+    fn lock(t: &Mutex<Proc>) -> std::sync::MutexGuard<'_, Proc> {
+        t.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    // The root process.
+    // The descriptions every fd table shares, then each process.
+    let mut d = Descriptions::default();
+    let root_fds = d.fds(p);
+    let twin_fds: Vec<Vec<(u8, u64)>> = twins.iter().map(|(_, t)| d.fds(&lock(t))).collect();
+    d.write(&mut b);
+    write_proc(&mut b, p, &root_fds);
+    b.uleb(twins.len() as u64);
+    for ((pid, t), fds) in twins.iter().zip(&twin_fds) {
+        b.ileb(*pid as i64);
+        write_proc(&mut b, &lock(t), fds);
+    }
+    b.0
+}
+
+/// One process's state, its fd table as `fds` names the shared descriptions.
+fn write_proc(b: &mut Writer, p: &Proc, fds: &[(u8, u64)]) {
     for v in [p.pid, p.ppid, p.pgid] {
         b.ileb(v as i64);
     }
@@ -127,7 +200,7 @@ pub(crate) fn capture(w: &World, p: &Proc) -> Vec<u8> {
     b.pairs_u(&allocated);
     b.pairs_u(&p.free_list);
     b.uleb(fds.len() as u64);
-    for (tag, idx) in fds {
+    for &(tag, idx) in fds {
         b.0.push(tag);
         if tag >= 4 {
             b.uleb(idx);
@@ -184,12 +257,13 @@ pub(crate) fn capture(w: &World, p: &Proc) -> Vec<u8> {
     b.opt(p.pending_exec_image.as_ref(), |b, img| b.bytes(img));
     b.bool(p.core_task);
     b.opt(p.term_in.as_ref(), |b, t| b.ileb(t.get() as i64));
-    b.0
 }
 
 /// Put captured state back: into a fresh personality on a thaw, or into the live one on an
 /// in-session rewind. Only the state [`capture`] writes is replaced; the embedder's configuration and
-/// the run's doors (wake, stop, kill, park request) stay as they are.
+/// the run's doors (wake, stop, kill, park request) stay as they are. A twin's process goes back into
+/// the table: into its live `Proc` when it has one, so its handlers keep seeing it, or into a new one
+/// made as a fork makes it, from `p`.
 pub(crate) fn restore(w: &mut World, p: &mut Proc, bytes: &[u8]) -> Result<(), StateError> {
     let mut r = Reader(bytes);
     if r.u8()? != VERSION {
@@ -239,77 +313,18 @@ pub(crate) fn restore(w: &mut World, p: &mut Proc, bytes: &[u8]) -> Result<(), S
         tokens_d.push(Arc::new(CorePipeToken::new(r.i32()?)));
     }
 
-    let (pid, ppid, pgid) = (r.i32()?, r.i32()?, r.i32()?);
-    let pending_exec_heap = r.opt(|r| Ok((r.uleb()?, r.uleb()?)))?;
-    let heap_next = r.uleb()?;
-    let heap_end = r.uleb()?;
-    let allocated: HashMap<u64, u64> = r.pairs_u()?.into_iter().collect();
-    let free_list = r.pairs_u()?;
-    let mut fds = Vec::new();
+    let root = ProcState::read(&mut r, w, &files_d, &pipes_d, &tokens_d)?;
+    let mut twins = Vec::new();
     for _ in 0..r.len()? {
-        let tag = r.u8()?;
-        let idx = if tag >= 4 { r.uleb()? as usize } else { 0 };
-        let get = |i: usize, n: usize| (i < n).then_some(i).ok_or(StateError);
-        fds.push(match tag {
-            0 => None,
-            1 => Some(FdEntry::Stdin),
-            2 => Some(FdEntry::Stdout),
-            3 => Some(FdEntry::Stderr),
-            4 => Some(FdEntry::File(Arc::clone(
-                &files_d[get(idx, files_d.len())?],
-            ))),
-            5 => Some(FdEntry::PipeRead(Arc::clone(
-                &pipes_d[get(idx, pipes_d.len())?],
-            ))),
-            6 => Some(FdEntry::PipeWrite(Arc::clone(
-                &pipes_d[get(idx, pipes_d.len())?],
-            ))),
-            7 => Some(FdEntry::CorePipe(Arc::clone(
-                &tokens_d[get(idx, tokens_d.len())?],
-            ))),
-            _ => return Err(StateError),
-        });
+        let pid = r.i32()?;
+        if pid == root.pid || twins.last().is_some_and(|&(last, _)| last >= pid) {
+            return Err(StateError); // canonical: ascending pids, the root's not among them
+        }
+        twins.push((
+            pid,
+            ProcState::read(&mut r, w, &files_d, &pipes_d, &tokens_d)?,
+        ));
     }
-    let mut dirs = Vec::new();
-    for _ in 0..r.len()? {
-        dirs.push(r.opt(|r| {
-            let entries = r.strs()?;
-            let pos = r.uleb()? as usize;
-            Ok(DirStream::forced(entries, pos, w.tables.payer()))
-        })?);
-    }
-    let args = r.strs()?;
-    let cwd = r.str()?;
-    let mut env = HashMap::new();
-    for _ in 0..r.len()? {
-        let k = r.str()?;
-        env.insert(k, r.str()?);
-    }
-    let mut env_ptrs = HashMap::new();
-    for _ in 0..r.len()? {
-        let k = r.str()?;
-        env_ptrs.insert(k, r.uleb()?);
-    }
-    let sig_pending = r.uleb()?;
-    let sig_handler = r.map_i()?;
-    let sig_mask = r.uleb()?;
-    let sig_action_mask = r.map_i()?.into_iter().map(|(s, m)| (s, m as u64)).collect();
-    let sig_action_flags = r.map_i()?;
-    let sig_stack_base = r.uleb()?;
-    let stopped_sig = r.opt(|r| r.i32())?;
-    let stop_fresh = r.bool()?;
-    let cont_fresh = r.bool()?;
-    let reap_wake = r.bool()?;
-    let term_sig = r.opt(|r| r.i32())?;
-    let mut handler_mask_stack = Vec::new();
-    for _ in 0..r.len()? {
-        handler_mask_stack.push(r.uleb()?);
-    }
-    let restart_ok = r.bool()?;
-    let pending_exec = r.opt(|r| Ok((r.bytes()?, r.strs()?)))?;
-    let pending_exec_image = r.opt(|r| Ok(Arc::<[u8]>::from(r.bytes()?)))?;
-    let core_task = r.bool()?;
-    let term_in = r.opt(|r| Ok(CorePipeToken::new(r.i32()?)))?;
     if !r.0.is_empty() {
         return Err(StateError);
     }
@@ -330,47 +345,249 @@ pub(crate) fn restore(w: &mut World, p: &mut Proc, bytes: &[u8]) -> Result<(), S
     w.fg_pgid = fg_pgid;
     w.last_fork_mint = None;
 
-    // A stop the restore adds or ends reaches the engine's mirror when one is installed (an
-    // in-session rewind); a thaw's run publishes a carried stop when it installs one.
-    let was_stopped = p.stopped_sig.is_some();
-    p.pid = pid;
-    p.ppid = ppid;
-    p.pgid = pgid;
-    p.pending_exec_heap = pending_exec_heap;
-    p.heap_next = heap_next;
-    p.heap_end = heap_end;
-    p.allocated = allocated;
-    p.free_list = free_list;
-    p.fds = fds;
-    p.dirs = dirs;
-    p.args = args;
-    p.cwd = cwd;
-    p.env = Arc::new(super::Env::forced(env, w.payer()));
-    p.env_ptrs = env_ptrs;
-    p.sig_pending = sig_pending;
-    p.sig_handler = sig_handler;
-    p.sig_mask = sig_mask;
-    p.sig_action_mask = sig_action_mask;
-    p.sig_action_flags = sig_action_flags;
-    p.sig_stack_base = sig_stack_base;
-    p.stopped_sig = stopped_sig;
-    p.stop_fresh = stop_fresh;
-    p.cont_fresh = cont_fresh;
-    p.reap_wake = reap_wake;
-    p.term_sig = term_sig;
-    p.handler_mask_stack = handler_mask_stack;
-    p.restart_ok = restart_ok;
-    p.pending_exec = pending_exec;
-    p.pending_exec_image = pending_exec_image;
-    p.core_task = core_task;
-    p.term_in = term_in;
-    p.recharge_tables(); // #2373 — what the restored tables cost, past any ceiling
-                         // A pending caught signal is deliverable again at the next poll.
-    p.arm_signals();
-    if p.stopped_sig.is_some() != was_stopped {
-        p.fire_stop_apply(!was_stopped);
+    root.apply(p, w.payer());
+    for (pid, st) in twins {
+        match w.procs.get(&pid) {
+            Some(ProcEntry::Live(t)) => {
+                st.apply(&mut t.lock().unwrap_or_else(|e| e.into_inner()), w.payer())
+            }
+            _ => {
+                let mut twin = p.fork().ok_or(StateError)?;
+                st.apply(&mut twin, w.payer());
+                w.procs
+                    .insert(pid, ProcEntry::Live(Arc::new(Mutex::new(twin))));
+            }
+        }
     }
     Ok(())
+}
+
+/// One process's state as [`write_proc`] wrote it, decoded whole before anything changes.
+struct ProcState {
+    pid: i32,
+    ppid: i32,
+    pgid: i32,
+    pending_exec_heap: Option<(u64, u64)>,
+    heap_next: u64,
+    heap_end: u64,
+    allocated: HashMap<u64, u64>,
+    free_list: Vec<(u64, u64)>,
+    fds: Vec<Option<FdEntry>>,
+    dirs: Vec<Option<DirStream>>,
+    args: Vec<String>,
+    cwd: String,
+    env: HashMap<String, String>,
+    env_ptrs: HashMap<String, u64>,
+    sig_pending: u64,
+    sig_handler: HashMap<i32, i64>,
+    sig_mask: u64,
+    sig_action_mask: HashMap<i32, u64>,
+    sig_action_flags: HashMap<i32, i64>,
+    sig_stack_base: u64,
+    stopped_sig: Option<i32>,
+    stop_fresh: bool,
+    cont_fresh: bool,
+    reap_wake: bool,
+    term_sig: Option<i32>,
+    handler_mask_stack: Vec<u64>,
+    restart_ok: bool,
+    pending_exec: Option<(Vec<u8>, Vec<String>)>,
+    pending_exec_image: Option<Arc<[u8]>>,
+    core_task: bool,
+    term_in: Option<CorePipeToken>,
+}
+
+impl ProcState {
+    fn read(
+        r: &mut Reader<'_>,
+        w: &World,
+        files_d: &[Arc<Mutex<OpenFile>>],
+        pipes_d: &[PipeBuf],
+        tokens_d: &[Arc<CorePipeToken>],
+    ) -> Result<ProcState, StateError> {
+        let (pid, ppid, pgid) = (r.i32()?, r.i32()?, r.i32()?);
+        let pending_exec_heap = r.opt(|r| Ok((r.uleb()?, r.uleb()?)))?;
+        let heap_next = r.uleb()?;
+        let heap_end = r.uleb()?;
+        let allocated: HashMap<u64, u64> = r.pairs_u()?.into_iter().collect();
+        let free_list = r.pairs_u()?;
+        let mut fds = Vec::new();
+        for _ in 0..r.len()? {
+            let tag = r.u8()?;
+            let idx = if tag >= 4 { r.uleb()? as usize } else { 0 };
+            let get = |i: usize, n: usize| (i < n).then_some(i).ok_or(StateError);
+            fds.push(match tag {
+                0 => None,
+                1 => Some(FdEntry::Stdin),
+                2 => Some(FdEntry::Stdout),
+                3 => Some(FdEntry::Stderr),
+                4 => Some(FdEntry::File(Arc::clone(
+                    &files_d[get(idx, files_d.len())?],
+                ))),
+                5 => Some(FdEntry::PipeRead(Arc::clone(
+                    &pipes_d[get(idx, pipes_d.len())?],
+                ))),
+                6 => Some(FdEntry::PipeWrite(Arc::clone(
+                    &pipes_d[get(idx, pipes_d.len())?],
+                ))),
+                7 => Some(FdEntry::CorePipe(Arc::clone(
+                    &tokens_d[get(idx, tokens_d.len())?],
+                ))),
+                _ => return Err(StateError),
+            });
+        }
+        let mut dirs = Vec::new();
+        for _ in 0..r.len()? {
+            dirs.push(r.opt(|r| {
+                let entries = r.strs()?;
+                let pos = r.uleb()? as usize;
+                Ok(DirStream::forced(entries, pos, w.tables.payer()))
+            })?);
+        }
+        let args = r.strs()?;
+        let cwd = r.str()?;
+        let mut env = HashMap::new();
+        for _ in 0..r.len()? {
+            let k = r.str()?;
+            env.insert(k, r.str()?);
+        }
+        let mut env_ptrs = HashMap::new();
+        for _ in 0..r.len()? {
+            let k = r.str()?;
+            env_ptrs.insert(k, r.uleb()?);
+        }
+        let sig_pending = r.uleb()?;
+        let sig_handler = r.map_i()?;
+        let sig_mask = r.uleb()?;
+        let sig_action_mask = r.map_i()?.into_iter().map(|(s, m)| (s, m as u64)).collect();
+        let sig_action_flags = r.map_i()?;
+        let sig_stack_base = r.uleb()?;
+        let stopped_sig = r.opt(|r| r.i32())?;
+        let stop_fresh = r.bool()?;
+        let cont_fresh = r.bool()?;
+        let reap_wake = r.bool()?;
+        let term_sig = r.opt(|r| r.i32())?;
+        let mut handler_mask_stack = Vec::new();
+        for _ in 0..r.len()? {
+            handler_mask_stack.push(r.uleb()?);
+        }
+        let restart_ok = r.bool()?;
+        let pending_exec = r.opt(|r| Ok((r.bytes()?, r.strs()?)))?;
+        let pending_exec_image = r.opt(|r| Ok(Arc::<[u8]>::from(r.bytes()?)))?;
+        let core_task = r.bool()?;
+        let term_in = r.opt(|r| Ok(CorePipeToken::new(r.i32()?)))?;
+
+        Ok(ProcState {
+            pid,
+            ppid,
+            pgid,
+            pending_exec_heap,
+            heap_next,
+            heap_end,
+            allocated,
+            free_list,
+            fds,
+            dirs,
+            args,
+            cwd,
+            env,
+            env_ptrs,
+            sig_pending,
+            sig_handler,
+            sig_mask,
+            sig_action_mask,
+            sig_action_flags,
+            sig_stack_base,
+            stopped_sig,
+            stop_fresh,
+            cont_fresh,
+            reap_wake,
+            term_sig,
+            handler_mask_stack,
+            restart_ok,
+            pending_exec,
+            pending_exec_image,
+            core_task,
+            term_in,
+        })
+    }
+
+    /// Put this state into `p`, its environment paid for by `payer`, the world's.
+    fn apply(self, p: &mut Proc, payer: Option<NodeRef>) {
+        let ProcState {
+            pid,
+            ppid,
+            pgid,
+            pending_exec_heap,
+            heap_next,
+            heap_end,
+            allocated,
+            free_list,
+            fds,
+            dirs,
+            args,
+            cwd,
+            env,
+            env_ptrs,
+            sig_pending,
+            sig_handler,
+            sig_mask,
+            sig_action_mask,
+            sig_action_flags,
+            sig_stack_base,
+            stopped_sig,
+            stop_fresh,
+            cont_fresh,
+            reap_wake,
+            term_sig,
+            handler_mask_stack,
+            restart_ok,
+            pending_exec,
+            pending_exec_image,
+            core_task,
+            term_in,
+        } = self;
+        // A stop the restore adds or ends reaches the engine's mirror when one is installed (an
+        // in-session rewind); a thaw's run publishes a carried stop when it installs one.
+        let was_stopped = p.stopped_sig.is_some();
+        p.pid = pid;
+        p.ppid = ppid;
+        p.pgid = pgid;
+        p.pending_exec_heap = pending_exec_heap;
+        p.heap_next = heap_next;
+        p.heap_end = heap_end;
+        p.allocated = allocated;
+        p.free_list = free_list;
+        p.fds = fds;
+        p.dirs = dirs;
+        p.args = args;
+        p.cwd = cwd;
+        p.env = Arc::new(super::Env::forced(env, payer));
+        p.env_ptrs = env_ptrs;
+        p.sig_pending = sig_pending;
+        p.sig_handler = sig_handler;
+        p.sig_mask = sig_mask;
+        p.sig_action_mask = sig_action_mask;
+        p.sig_action_flags = sig_action_flags;
+        p.sig_stack_base = sig_stack_base;
+        p.stopped_sig = stopped_sig;
+        p.stop_fresh = stop_fresh;
+        p.cont_fresh = cont_fresh;
+        p.reap_wake = reap_wake;
+        p.term_sig = term_sig;
+        p.handler_mask_stack = handler_mask_stack;
+        p.restart_ok = restart_ok;
+        p.pending_exec = pending_exec;
+        p.pending_exec_image = pending_exec_image;
+        p.core_task = core_task;
+        p.term_in = term_in;
+        p.recharge_tables(); // #2373 — what the restored tables cost, past any ceiling
+                             // A pending caught signal is deliverable again at the next poll.
+        p.arm_signals();
+        if p.stopped_sig.is_some() != was_stopped {
+            p.fire_stop_apply(!was_stopped);
+        }
+    }
 }
 
 struct Writer(Vec<u8>);

@@ -1344,6 +1344,7 @@ pub fn regrant_vm_fs(
         handler: vm_fs_handler(&fs),
         fork: Some(vm_fs_fork(&fs)),
         state: fs.cap_state(),
+        process: None,
     })
 }
 

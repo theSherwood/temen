@@ -2449,6 +2449,7 @@ impl OnrampCaps {
                 handler,
                 fork: Some(caps.fork(name)),
                 state: caps.cap_state(name),
+                process: None,
             })
         })
     }

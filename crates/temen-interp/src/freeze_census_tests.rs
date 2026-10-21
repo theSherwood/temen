@@ -133,17 +133,43 @@ fn a_child_domain_holding_a_non_durable_handle_declines() {
     ));
 }
 
-/// #1688 — an unreaped fork twin runs in a window and powerbox of its own that no artifact records.
+/// #1688 — a twin rides when its doorbell can reach it. One with none cannot ride: a
+/// `posix_spawn`'s command image, which nothing can unwind, or a servicer's twin, whose reap does
+/// not ride (#2571). A freeze declines while one lives; a personality's twin retires at its exit,
+/// and holds nothing up.
 #[test]
-fn an_unreaped_fork_twin_declines() {
+fn a_twin_no_freeze_can_carry_declines() {
     let f = Fixture::new();
     let SchedRef::Real(rs) = &f.sched else {
         unreachable!()
     };
-    rs.lock().forked_twins.insert(9, Twin { parent: 0 });
+    let twin = |reaper, bell| Twin {
+        parent: 0,
+        reaper,
+        bell,
+        entry: 0,
+        ctx: 0,
+        host: Arc::new(Mutex::new(Host::new())),
+    };
+    let bell = Some(Arc::new(AtomicBool::new(false)));
+    rs.lock()
+        .forked_twins
+        .insert(9, twin(TwinReaper::Personality, bell));
+    assert_eq!(f.census(&f.root_seat()), None, "a durable twin rides");
+    rs.lock()
+        .forked_twins
+        .insert(10, twin(TwinReaper::Personality, None));
     assert_eq!(f.census(&f.root_seat()), Some(DeclineCause::ForkTwin));
-    rs.lock().forked_twins.remove(&9); // reaped
-    assert_eq!(f.census(&f.root_seat()), None);
+    assert!(retire_personality_twin(&mut rs.lock(), 10), "it exited");
+    assert_eq!(
+        f.census(&f.root_seat()),
+        None,
+        "an ended one holds nothing up"
+    );
+    rs.lock()
+        .forked_twins
+        .insert(11, twin(TwinReaper::Servicer, None));
+    assert_eq!(f.census(&f.root_seat()), Some(DeclineCause::ForkTwin));
 }
 
 /// A bare vCPU of the fixture's root domain, to park by hand.

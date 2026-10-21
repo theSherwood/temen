@@ -335,8 +335,9 @@ parked vCPUs (teardown, the census, a freeze's re-admission) is a loop over `Par
 new collection cannot be missed by one of them. Re-issue: `svc.wait`, futex, pipe read and write,
 `waitpid`, a job-control stop, a stream read, and a live call's reply. Phase: `thread.join`, a lane,
 and a demand-paged child's page fault, whose pager the freeze holds to serve it (#1940, #2455,
-below). Decline: a fork-twin `wait(-1)` (#1688), a punted completion, which is a host call outside
-the cut (#1902), and an offer admission, which a durable caller never reaches (#1681). A fiber
+below). Decline: a servicer's `wait(-1)`, whose `clone_caller` twin does not ride (#2571), a
+punted completion, which is a host call outside the cut (#1902), and an offer admission, which a
+durable caller never reaches (#1681). A fiber
 parked at a site follows the same rule: the freeze drive of whichever vCPU finishes first gives an
 unwoken fiber park the placeholder and re-issue word its site calls for, and a resumer that then
 claims the flattened fiber sees it still parked (#1677). A serve handler, parked or caught mid-run,
@@ -626,6 +627,29 @@ is bounded by the window's **reservation**, not its committed image: a detached 
 span its reservation (as a root's do, so `vm_map` can grow into it), and every host-side use is
 contained by the reservation, whose uncommitted tail faults inside the window.
 
+**Fork twins (v49, #1688).** A personality `fork()`'s twin is a domain of its own, a private copy of
+its parent's window and a duplicate of its powerbox, reaped by its parent's `waitpid`, so it rides
+as a live detached child does, keyed by its pid where a child is keyed by its join slot. A durable
+twin of the personality gets a doorbell at the fork. When a freeze's census passes, every twin's
+bell rings (`ring_twins`), and a twin forked after that is born rung. The harvest captures each twin
+that unwound (`CapturedTwin`) onto its parent domain's powerbox and recurses, so its own twins and
+children ride too; any other twin is unreached, and `freeze` refuses (`FreezeError::TwinUnreached`).
+A twin that exited is the personality's zombie by then, not the scheduler's (it retires from the
+core at its exit, after its exit hooks run), so the personality's state carries it. Each captured
+twin rides **Section 12** (`TAG_TWINS`), ascending pid, as its own root-shaped artifact bound to its
+parent's program (a durable domain never execs), behind its launch record: its entry function, its
+shadow context and its import names. The thaw re-creates each twin (`relaunch_twin`) under the pid
+its `fork()` returned, since guests hold pids and the personality's table names them: every pid the
+artifact carries is reserved before the thaw mints any id. The thaw's registrar
+(`temen_posix::Thaw`) re-binds each personality entry to its process and grants that process's doors
+(signal, exit hook, exec remap), which the restore installs as a fork installs them. The census
+declines while a twin no freeze can carry lives: a `posix_spawn`ed process, whose uninstrumented
+command image has no doorbell, and any twin a servicer's `clone_caller` forked, whose reap the
+artifact does not carry yet (#2571). A `fork` or `posix_spawn` under a landed freeze is abandoned
+for the thaw to re-issue. The tree-walker carries twins; the bytecode tier carries none and declines
+a freeze while one lives (#1904), and a durable Cranelift run never serves `fork`. Pinned by
+`temen`'s `durable_fork.rs` and the park matrix's `waitpid` row.
+
 **A demand-paged child is durable too (#2438).** A child whose spawn record named a pager
 (§2.2, #1862) freezes like any detached child, and its pager rides its launch record: the
 codec refuses a record naming anything but a `{ page: (i64) -> (i64) }` export of the
@@ -637,9 +661,11 @@ words are never demand-paged: the pages a durable module's page ops may not touc
 (`ShadowArena::fences`, #2426), its declared shadow arena, control words included, stay mapped,
 because the runtime reads and writes them at every safepoint, freeze and thaw, and the pager,
 which cannot see the child's window, could only supply a stale copy (the cause of #2438's
-silent wrong results). The harvest captures only a child whose run ended by unwinding; one
-that trapped, that ran to its end, or that a deadlock teardown reaped keeps a window but has
-nothing to resume, and the freeze is refused (`DetachedUnreached`). A durable run pages on the
+silent wrong results). The harvest captures only a child whose run ended by unwinding. One the
+bell reached after its last poll returned instead, and rides as a completed child, as one that
+ended before the bell does (#1688). One that trapped, that a deadlock teardown reaped where it
+parked, or that ran to its end while held for its own paged children (#2455, below) keeps a window
+but has nothing to resume, and the freeze is refused (`DetachedUnreached`). A durable run pages on the
 tree-walker only: the bytecode engine's durable entry declines a module that spawns (§4), so a
 routed run of a pager-capable program freezes and thaws there. The Cranelift JIT pages a child
 only in a run that is not durable: it refuses a pager record in a durable run, and refuses to thaw
@@ -1498,10 +1524,11 @@ Two halves make it honest:
   server's per-`open` cursors are read back by the guest's next `read`, so a thaw that forgot them
   resumes a guest whose open file silently rewound. `Captured { capture, restore }` serializes it;
   `Stateless` claims there is nothing (`display` is pure output); `Uncaptured` holds state nothing
-  serializes yet (a fork twin's personality, #1688), and refuses a freeze like an unnamed capability.
-  The POSIX personality is `Captured` since #1894: its memfs, unread stdin, zombies, and its root
-  process's fd table (shared descriptions written once), allocator, cwd, environment, and signal and
-  stop state ride; the embedder's configuration (commands, sinks, delegates, the terminal) does not,
+  serializes yet, and refuses a freeze like an unnamed capability.
+  The POSIX personality is `Captured` since #1894: its memfs, unread stdin, zombies, and every live
+  process's fd table (shared descriptions written once across them, #1688), allocator, cwd,
+  environment, and signal and stop state ride, the root's entry carrying them all and a fork twin's
+  naming its process; the embedder's configuration (commands, sinks, delegates, the terminal) does not,
   and a socket's fd comes back closed, an edge the thaw does not re-bind. A thaw's registrar rebuilds
   it with `Posix::from_state`, returns `named_grant`, and the embedder `install`s its doors.
   *A required answer since #1699, not an opt-in:* when "stateless" was the default, a provider that
