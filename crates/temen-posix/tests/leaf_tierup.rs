@@ -4,10 +4,16 @@
 //! browser host without any wasm, as `coop_tierup.rs` does: it serves the tier-up by bouncing the
 //! entry ([`CoopRun::bounce`], the nested interpretation an emitted image's own cap calls bounce
 //! into), and checks that the tree ends exactly as it does interpreted.
+//!
+//! #1414 5c — every tree runs on both executors. On executor 2 a leaf runs whole on its task's
+//! thread, where the same stand-in serves its entry ([`bounce_entry`]).
 
 use std::sync::{Arc, Mutex};
 
-use temen_interp::bytecode::{CoopEvent, CoopRun, LeafOffer, ProgramEmit, TierUpConfig};
+use temen_interp::bytecode::{
+    CoopEvent, CoopRun, EmittedCall, EmittedTarget, LeafOffer, ProgramEmit, ThreadPlatform,
+    ThreadTier, TierUpConfig,
+};
 use temen_interp::{BoundImport, Host, Trap};
 
 /// `/bin/leaf`: writes `leaf` to `out.txt`, then exits 5. Its ops are file ops, so it cannot park.
@@ -176,10 +182,54 @@ struct Leaves {
     resumes: usize,
 }
 
-/// Run the tree with `/bin/leaf` as `command`, emitting leaf images iff `leaf`. Serves each entry
-/// tier-up by bouncing the entry, the stand-in for running it emitted. When that bounce parks, the
-/// stand-in's suspended frames are the bounce itself, so a resume's results are the entry's.
-fn run_tree(guest_text: &str, command: &str, leaf: bool) -> (Ending, Leaves) {
+/// Where a tree runs.
+#[derive(Clone, Copy, Debug)]
+enum Exec {
+    /// The pump, whose embedder serves each leaf's entry.
+    Pump,
+    /// Executor 2, whose threads serve them ([`bounce_entry`]).
+    Threads,
+}
+
+const EXECS: [Exec; 2] = [Exec::Pump, Exec::Threads];
+
+impl Exec {
+    /// How many resumes a leaf's `n` parked calls take: the pump's host resumes the frames it holds
+    /// after each, where executor 2's thread holds them itself, and nothing resumes them from
+    /// outside.
+    fn resumes(self, n: usize) -> usize {
+        match self {
+            Exec::Pump => n,
+            Exec::Threads => 0,
+        }
+    }
+}
+
+/// The programs whose entries executor 2's threads served ([`bounce_entry`]).
+static THREAD_TIERUPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Executor 2's runs take turns, since they share [`THREAD_TIERUPS`].
+static THREAD_RUNS: Mutex<()> = Mutex::new(());
+
+/// Executor 2's stand-in for emitted code: a leaf's entry, served on its task's thread by bouncing
+/// it whole, as [`run_tree`]'s embedder serves it on the pump. A call in it that parks waits there,
+/// the thread holding the stand-in's frames as it would hold emitted ones.
+fn bounce_entry(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
+    let EmittedTarget::Region { module, func } = call.target else {
+        panic!("only a leaf's entry tiers up here");
+    };
+    THREAD_TIERUPS.lock().unwrap().push(module);
+    let mut io = call.argv.to_vec();
+    io.resize(io.len().max(1), 0);
+    let n = (call.bounce)(func, &mut io, 0)?;
+    call.results = io[..n].to_vec();
+    Ok(())
+}
+
+/// Run the tree on `exec` with `/bin/leaf` as `command`, emitting leaf images iff `leaf`. Serves each
+/// entry tier-up by bouncing the entry, the stand-in for running it emitted. When that bounce parks,
+/// the stand-in's suspended frames are the bounce itself, so a resume's results are the entry's.
+fn run_tree(exec: Exec, guest_text: &str, command: &str, leaf: bool) -> (Ending, Leaves) {
     let guest = module(guest_text);
     let mut host = Host::new();
     let (px, posix) = temen_posix::grant(&mut host, 0, 0, Vec::new());
@@ -204,26 +254,42 @@ fn run_tree(guest_text: &str, command: &str, leaf: bool) -> (Ending, Leaves) {
     posix.set_cwd("/w");
     let offered = Arc::new(Mutex::new(Vec::new()));
     let offers = Arc::clone(&offered);
-    let tierup = leaf.then(|| TierUpConfig {
-        root: ProgramEmit::default(),
-        leaf: Some(Arc::new(move |o: &LeafOffer| {
+    let emitter = leaf.then(|| -> temen_interp::bytecode::LeafEmitter {
+        Arc::new(move |o: &LeafOffer| {
             offers.lock().unwrap().push((o.paged, o.parks));
             true
-        })),
-        modules: None,
+        })
     });
-    let mut run = CoopRun::new_reserved(
-        &guest,
-        0,
-        &[],
-        u64::MAX,
-        host,
-        tierup,
-        &[],
-        temen_ir::DEFAULT_RESERVED_LOG2,
-    )
-    .expect("the bytecode engine runs it")
-    .expect("it starts");
+    let reserved = temen_ir::DEFAULT_RESERVED_LOG2;
+    let mut turn = None;
+    let run = match exec {
+        Exec::Pump => {
+            let tierup = emitter.map(|leaf| TierUpConfig {
+                root: ProgramEmit::default(),
+                leaf: Some(leaf),
+                modules: None,
+            });
+            CoopRun::new_reserved(&guest, 0, &[], u64::MAX, host, tierup, &[], reserved)
+        }
+        Exec::Threads => {
+            turn = Some(THREAD_RUNS.lock().unwrap_or_else(|e| e.into_inner()));
+            THREAD_TIERUPS.lock().unwrap().clear();
+            host.set_thread_platform(ThreadPlatform {
+                tier: emitter.map(|leaf| ThreadTier {
+                    root: ProgramEmit::default(),
+                    spill: 0,
+                    modules: None,
+                    leaf: Some(leaf),
+                    run: bounce_entry,
+                }),
+                ..ThreadPlatform::OS
+            });
+            CoopRun::new_parallel(&guest, 0, &[], u64::MAX, host, &[], reserved, None, true)
+        }
+    };
+    let mut run = run
+        .expect("the bytecode engine runs it")
+        .expect("it starts");
     let (mut tierups, mut resumes) = (Vec::new(), 0);
     let end = loop {
         match run.run() {
@@ -254,6 +320,9 @@ fn run_tree(guest_text: &str, command: &str, leaf: bool) -> (Ending, Leaves) {
     };
     let wrote = posix.read_file("/w/out.txt");
     let offered = offered.lock().unwrap().clone();
+    if turn.is_some() {
+        tierups = THREAD_TIERUPS.lock().unwrap().clone();
+    }
     let leaves = Leaves {
         offered,
         tierups,
@@ -264,8 +333,9 @@ fn run_tree(guest_text: &str, command: &str, leaf: bool) -> (Ending, Leaves) {
 
 #[test]
 fn a_leaf_process_runs_whole_where_it_tiers_up_and_ends_as_interpreted() {
-    let (interpreted, none) = run_tree(&guest(false), LEAF, false);
-    assert_eq!(
+    for exec in EXECS {
+        let (interpreted, none) = run_tree(exec, &guest(false), LEAF, false);
+        assert_eq!(
         interpreted,
         Ending {
             root: Ok(5),
@@ -273,38 +343,41 @@ fn a_leaf_process_runs_whole_where_it_tiers_up_and_ends_as_interpreted() {
         },
         "the tree, interpreted: the child wrote its file and exited 5, and the parent exited with it"
     );
-    assert!(none.offered.is_empty() && none.tierups.is_empty());
-    let (emitted, leaves) = run_tree(&guest(false), LEAF, true);
-    assert_eq!(
-        emitted, interpreted,
-        "the leaf ran at its entry and ended the same way"
-    );
-    assert_eq!(
-        leaves.offered,
-        [(false, false)],
-        "offered once, unpaged, not parking: it cannot change its pages or park"
-    );
-    assert!(
+        assert!(none.offered.is_empty() && none.tierups.is_empty());
+        let (emitted, leaves) = run_tree(exec, &guest(false), LEAF, true);
+        assert_eq!(
+            emitted, interpreted,
+            "the leaf ran at its entry and ended the same way"
+        );
+        assert_eq!(
+            leaves.offered,
+            [(false, false)],
+            "offered once, unpaged, not parking: it cannot change its pages or park"
+        );
+        assert!(
         matches!(leaves.tierups[..], [m] if m != 0),
         "one tier-up, at the exec'd image's entry, naming its program, not the root's: {leaves:?}"
     );
+    }
 }
 
 /// An image bound to an address-space op that changes page state (`vm_map`) is offered paged: a
 /// map that leaves a hole takes its window past one bound, where a whole run cannot decline.
 #[test]
 fn a_leaf_that_can_map_pages_is_offered_paged() {
-    let maps = LEAF.replacen(
-        "import 3 \"__px_exit\" (i64) -> ()\n",
-        "import 3 \"__px_exit\" (i64) -> ()\nimport 4 \"vm_map\" (i64, i64, i64) -> (i64)\n",
-        1,
-    );
-    let (interpreted, _) = run_tree(&guest(false), &maps, false);
-    let (emitted, leaves) = run_tree(&guest(false), &maps, true);
-    assert_eq!(emitted, interpreted);
-    assert_eq!(interpreted.root, Ok(5));
-    assert_eq!(leaves.offered, [(true, false)], "offered once, paged");
-    assert_eq!(leaves.tierups.len(), 1);
+    for exec in EXECS {
+        let maps = LEAF.replacen(
+            "import 3 \"__px_exit\" (i64) -> ()\n",
+            "import 3 \"__px_exit\" (i64) -> ()\nimport 4 \"vm_map\" (i64, i64, i64) -> (i64)\n",
+            1,
+        );
+        let (interpreted, _) = run_tree(exec, &guest(false), &maps, false);
+        let (emitted, leaves) = run_tree(exec, &guest(false), &maps, true);
+        assert_eq!(emitted, interpreted);
+        assert_eq!(interpreted.root, Ok(5));
+        assert_eq!(leaves.offered, [(true, false)], "offered once, paged");
+        assert_eq!(leaves.tierups.len(), 1);
+    }
 }
 
 /// Making a pipe does not park: the core's mint (self op 16) and adopting its ends into
@@ -312,16 +385,17 @@ fn a_leaf_that_can_map_pages_is_offered_paged() {
 /// is offered, as one that does not.
 #[test]
 fn a_leaf_that_makes_a_pipe_is_offered() {
-    let pipes = LEAF
-        .replacen(
-            "import 3 \"__px_exit\" (i64) -> ()\n",
-            "import 3 \"__px_exit\" (i64) -> ()\n\
+    for exec in EXECS {
+        let pipes = LEAF
+            .replacen(
+                "import 3 \"__px_exit\" (i64) -> ()\n",
+                "import 3 \"__px_exit\" (i64) -> ()\n\
              import 4 \"__px_pipe_adopt\" (i64, i64, i64) -> (i64)\n",
-            1,
-        )
-        .replacen(
-            "block 0 (vcap: i64) {\n",
-            "block 0 (vcap: i64) {\n\
+                1,
+            )
+            .replacen(
+                "block 0 (vcap: i64) {\n",
+                "block 0 (vcap: i64) {\n\
              \x20 vh0 = i32.const 0\n\
              \x20 vhs = i64.const 42000\n\
              \x20 vpm = call.cap 4294967295 16 (i64) -> (i64) vh0 (vhs)\n\
@@ -331,14 +405,15 @@ fn a_leaf_that_makes_a_pipe_is_offered() {
              \x20 vwh = i64.extend_i32_u vwh32\n\
              \x20 vfds = i64.const 42100\n\
              \x20 vad = call.import 4 (vrh, vwh, vfds)\n",
-            1,
-        );
-    let (interpreted, _) = run_tree(&guest(false), &pipes, false);
-    assert_eq!(interpreted.root, Ok(5));
-    let (emitted, leaves) = run_tree(&guest(false), &pipes, true);
-    assert_eq!(emitted, interpreted);
-    assert_eq!(leaves.offered, [(false, false)], "offered, not parking");
-    assert_eq!(leaves.tierups.len(), 1);
+                1,
+            );
+        let (interpreted, _) = run_tree(exec, &guest(false), &pipes, false);
+        assert_eq!(interpreted.root, Ok(5));
+        let (emitted, leaves) = run_tree(exec, &guest(false), &pipes, true);
+        assert_eq!(emitted, interpreted);
+        assert_eq!(leaves.offered, [(false, false)], "offered, not parking");
+        assert_eq!(leaves.tierups.len(), 1);
+    }
 }
 
 /// A leaf that holds one of the personality's own pipe ends may park on it, as the personality
@@ -347,23 +422,25 @@ fn a_leaf_that_makes_a_pipe_is_offered() {
 /// it: [`a_leaf_that_parks_on_a_pipe_pauses_and_resumes`].)
 #[test]
 fn an_image_that_can_park_runs_interpreted() {
-    let (interpreted, _) = run_tree(&guest(true), LEAF, false);
-    let (declined, leaves) = run_tree(&guest(true), LEAF, true);
-    assert_eq!(declined, interpreted);
-    assert!(
-        leaves.offered.is_empty() && leaves.tierups.is_empty(),
-        "a child holding a pipe end is not offered"
-    );
+    for exec in EXECS {
+        let (interpreted, _) = run_tree(exec, &guest(true), LEAF, false);
+        let (declined, leaves) = run_tree(exec, &guest(true), LEAF, true);
+        assert_eq!(declined, interpreted);
+        assert!(
+            leaves.offered.is_empty() && leaves.tierups.is_empty(),
+            "a child holding a pipe end is not offered"
+        );
 
-    let forks = forking(LEAF);
-    let (interpreted, _) = run_tree(&guest(false), &forks, false);
-    let (declined, leaves) = run_tree(&guest(false), &forks, true);
-    assert_eq!(declined, interpreted);
-    assert_eq!(interpreted.root, Ok(5));
-    assert!(
-        leaves.offered.is_empty() && leaves.tierups.is_empty(),
-        "an image that imports fork is not offered"
-    );
+        let forks = forking(LEAF);
+        let (interpreted, _) = run_tree(exec, &guest(false), &forks, false);
+        let (declined, leaves) = run_tree(exec, &guest(false), &forks, true);
+        assert_eq!(declined, interpreted);
+        assert_eq!(interpreted.root, Ok(5));
+        assert!(
+            leaves.offered.is_empty() && leaves.tierups.is_empty(),
+            "an image that imports fork is not offered"
+        );
+    }
 }
 
 /// An exec'd image starts behind the NULL guard, as a freshly loaded one does (#1094): a null
@@ -372,18 +449,20 @@ fn an_image_that_can_park_runs_interpreted() {
 /// emitted as interpreted.
 #[test]
 fn an_execd_image_starts_behind_the_null_guard() {
-    let (interpreted, _) = run_tree(&guest(false), NULL_LEAF, false);
-    assert_eq!(
-        interpreted,
-        Ending {
-            root: Ok(128),
-            wrote: None,
-        },
-        "the child crashed on the null load"
-    );
-    let (emitted, leaves) = run_tree(&guest(false), NULL_LEAF, true);
-    assert_eq!(emitted, interpreted);
-    assert_eq!(leaves.tierups.len(), 1);
+    for exec in EXECS {
+        let (interpreted, _) = run_tree(exec, &guest(false), NULL_LEAF, false);
+        assert_eq!(
+            interpreted,
+            Ending {
+                root: Ok(128),
+                wrote: None,
+            },
+            "the child crashed on the null load"
+        );
+        let (emitted, leaves) = run_tree(exec, &guest(false), NULL_LEAF, true);
+        assert_eq!(emitted, interpreted);
+        assert_eq!(leaves.tierups.len(), 1);
+    }
 }
 
 /// An exec'd image's `readonly` data is read-only, as a freshly loaded image's is (#1737): a store
@@ -391,15 +470,17 @@ fn an_execd_image_starts_behind_the_null_guard() {
 /// its segments RW and the store landed.
 #[test]
 fn an_execd_images_readonly_data_is_read_only() {
-    let (interpreted, _) = run_tree(&guest(false), RO_LEAF, false);
-    assert_eq!(
-        interpreted,
-        Ending {
-            root: Ok(128),
-            wrote: None,
-        },
-        "the child crashed on the store into its readonly segment"
-    );
+    for exec in EXECS {
+        let (interpreted, _) = run_tree(exec, &guest(false), RO_LEAF, false);
+        assert_eq!(
+            interpreted,
+            Ending {
+                root: Ok(128),
+                wrote: None,
+            },
+            "the child crashed on the store into its readonly segment"
+        );
+    }
 }
 
 /// The C shim's `read`/`write` over a core pipe end, as IR (`c_posix.rs`'s `PIPE_SHIM`): the
@@ -576,30 +657,32 @@ block 0 (vr: i64) {{\n\
 /// [`a_leaf_that_exits_after_a_parked_call_ends_there`] covers.)
 #[test]
 fn a_leaf_that_parks_on_a_pipe_pauses_and_resumes() {
-    let guest = ping_pong();
-    for fill in [0, 4] {
-        let leaf = ping_leaf(fill, false);
-        let (interpreted, _) = run_tree(&guest, &leaf, false);
-        assert_eq!(
-            interpreted,
-            Ending {
-                root: Ok(14),
-                wrote: Some(b"pong".to_vec()),
-            },
-            "interpreted (fill {fill}): the child read the parent's reply and exited 4 + 10"
-        );
-        let (emitted, leaves) = run_tree(&guest, &leaf, true);
-        assert_eq!(emitted, interpreted, "emitted (fill {fill})");
-        assert_eq!(
-            leaves.offered,
-            [(false, true)],
-            "offered once, unpaged, as parking (fill {fill})"
-        );
-        assert_eq!(
+    for exec in EXECS {
+        let guest = ping_pong();
+        for fill in [0, 4] {
+            let leaf = ping_leaf(fill, false);
+            let (interpreted, _) = run_tree(exec, &guest, &leaf, false);
+            assert_eq!(
+                interpreted,
+                Ending {
+                    root: Ok(14),
+                    wrote: Some(b"pong".to_vec()),
+                },
+                "interpreted (fill {fill}): the child read the parent's reply and exited 4 + 10"
+            );
+            let (emitted, leaves) = run_tree(exec, &guest, &leaf, true);
+            assert_eq!(emitted, interpreted, "emitted (fill {fill})");
+            assert_eq!(
+                leaves.offered,
+                [(false, true)],
+                "offered once, unpaged, as parking (fill {fill})"
+            );
+            assert_eq!(
             (leaves.tierups.len(), leaves.resumes),
-            (1, 1),
-            "the leaf tiered up at its entry, parked once, and was resumed (fill {fill}): {leaves:?}"
+            (1, exec.resumes(1)),
+            "the leaf tiered up at its entry, parked once, and was resumed (fill {fill}, {exec:?}): {leaves:?}"
         );
+        }
     }
 }
 
@@ -608,17 +691,19 @@ fn a_leaf_that_parks_on_a_pipe_pauses_and_resumes() {
 /// frames it holds; the tree ends as it does interpreted.
 #[test]
 fn a_leaf_that_exits_after_a_parked_call_ends_there() {
-    let guest = ping_pong();
-    let leaf = ping_leaf(0, true);
-    let (interpreted, _) = run_tree(&guest, &leaf, false);
-    assert_eq!(interpreted.root, Ok(14));
-    let (emitted, leaves) = run_tree(&guest, &leaf, true);
-    assert_eq!(emitted, interpreted);
-    assert_eq!(
-        (leaves.tierups.len(), leaves.resumes),
-        (1, 0),
-        "tiered up once, parked, and ended in the rest of the call: {leaves:?}"
-    );
+    for exec in EXECS {
+        let guest = ping_pong();
+        let leaf = ping_leaf(0, true);
+        let (interpreted, _) = run_tree(exec, &guest, &leaf, false);
+        assert_eq!(interpreted.root, Ok(14));
+        let (emitted, leaves) = run_tree(exec, &guest, &leaf, true);
+        assert_eq!(emitted, interpreted);
+        assert_eq!(
+            (leaves.tierups.len(), leaves.resumes),
+            (1, 0),
+            "tiered up once, parked, and ended in the rest of the call: {leaves:?}"
+        );
+    }
 }
 
 /// A leaf may spawn and wait: both park only on its children, which the engine serves beneath the
@@ -656,27 +741,31 @@ block 0 () {\n\
 /// and before, a nim tool that linked it (nimsem, through `osproc.waitForExit`) ran interpreted.
 #[test]
 fn a_leaf_that_sleeps_parks_and_resumes() {
-    let (interpreted, _) = run_tree(&guest(false), SLEEPING, false);
-    assert_eq!(
+    for exec in EXECS {
+        let (interpreted, _) = run_tree(exec, &guest(false), SLEEPING, false);
+        assert_eq!(
         interpreted.root,
         Ok(21),
         "the timed wait timed out, then the other answered not-equal, and the root exited with it"
     );
-    let (emitted, leaves) = run_tree(&guest(false), SLEEPING, true);
-    assert_eq!(emitted, interpreted);
-    assert_eq!(leaves.offered, [(false, true)], "offered once, parking");
-    assert_eq!(leaves.tierups.len(), 1, "it ran emitted: {leaves:?}");
-    assert_eq!(
-        leaves.resumes, 1,
-        "the timed wait parked and ran on; the not-equal one answered at once: {leaves:?}"
-    );
+        let (emitted, leaves) = run_tree(exec, &guest(false), SLEEPING, true);
+        assert_eq!(emitted, interpreted);
+        assert_eq!(leaves.offered, [(false, true)], "offered once, parking");
+        assert_eq!(leaves.tierups.len(), 1, "it ran emitted: {leaves:?}");
+        assert_eq!(
+            leaves.resumes,
+            exec.resumes(1),
+            "the timed wait parked and ran on; the not-equal one answered at once: {leaves:?}"
+        );
+    }
 }
 
 #[test]
 fn a_leaf_spawns_and_waits_and_ends_as_interpreted() {
-    let spawner = spawn_leaf("/bin/kid");
-    let (interpreted, _) = run_tree(&guest(false), &spawner, false);
-    assert_eq!(
+    for exec in EXECS {
+        let spawner = spawn_leaf("/bin/kid");
+        let (interpreted, _) = run_tree(exec, &guest(false), &spawner, false);
+        assert_eq!(
         interpreted,
         Ending {
             root: Ok(25),
@@ -684,30 +773,36 @@ fn a_leaf_spawns_and_waits_and_ends_as_interpreted() {
         },
         "the spawned child wrote its file and exited 5; its parent exited 25, and the root with it"
     );
-    let (emitted, leaves) = run_tree(&guest(false), &spawner, true);
-    assert_eq!(emitted, interpreted);
-    assert_eq!(
-        leaves.offered,
-        [(false, true), (false, false)],
-        "the spawner is offered parking, and the child it spawned is offered too"
-    );
-    assert_eq!(leaves.tierups.len(), 2, "both ran emitted: {leaves:?}");
-    assert_eq!(leaves.resumes, 1, "the spawner's call ran on: {leaves:?}");
+        let (emitted, leaves) = run_tree(exec, &guest(false), &spawner, true);
+        assert_eq!(emitted, interpreted);
+        assert_eq!(
+            leaves.offered,
+            [(false, true), (false, false)],
+            "the spawner is offered parking, and the child it spawned is offered too"
+        );
+        assert_eq!(leaves.tierups.len(), 2, "both ran emitted: {leaves:?}");
+        assert_eq!(
+            leaves.resumes,
+            exec.resumes(1),
+            "the spawner's call ran on: {leaves:?}"
+        );
 
-    // A child that runs interpreted has not ended when its parent waits: the wait parks.
-    let spawner = spawn_leaf("/bin/forkkid");
-    let (interpreted, _) = run_tree(&guest(false), &spawner, false);
-    assert_eq!(interpreted.root, Ok(25));
-    let (emitted, leaves) = run_tree(&guest(false), &spawner, true);
-    assert_eq!(emitted, interpreted);
-    assert_eq!(
-        leaves.offered,
-        [(false, true)],
-        "only the spawner is offered"
-    );
-    assert_eq!(leaves.tierups.len(), 1);
-    assert_eq!(
-        leaves.resumes, 1,
-        "the wait ran on once the child ended: {leaves:?}"
-    );
+        // A child that runs interpreted has not ended when its parent waits: the wait parks.
+        let spawner = spawn_leaf("/bin/forkkid");
+        let (interpreted, _) = run_tree(exec, &guest(false), &spawner, false);
+        assert_eq!(interpreted.root, Ok(25));
+        let (emitted, leaves) = run_tree(exec, &guest(false), &spawner, true);
+        assert_eq!(emitted, interpreted);
+        assert_eq!(
+            leaves.offered,
+            [(false, true)],
+            "only the spawner is offered"
+        );
+        assert_eq!(leaves.tierups.len(), 1);
+        assert_eq!(
+            leaves.resumes,
+            exec.resumes(1),
+            "the wait ran on once the child ended: {leaves:?}"
+        );
+    }
 }

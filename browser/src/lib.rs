@@ -1389,17 +1389,41 @@ static X2_WASM: std::sync::Mutex<Option<std::sync::Arc<[u8]>>> = std::sync::Mute
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 static X2_PROGRAMS: std::sync::Mutex<Option<Programs>> = std::sync::Mutex::new(None);
 
-/// Program `module`'s emit ([`X2_PROGRAMS`]), for the Worker to copy ([`temen_x2_bytes_ptr`]): its
-/// length, `0` when the run emitted none for it.
+/// The leaf images the run runs whole (#1414 5c), by program index: what the tier's leaf emitter
+/// emitted for them ([`leaf_emitter`]). The run's root is program 0, and an image a process execs
+/// or spawns has its own. A program a child also runs as a granted module has its module emit in
+/// [`X2_PROGRAMS`]: a leaf runs over the engine's memory, a child over its own.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
-#[no_mangle]
-pub extern "C" fn temen_x2_program_len(module: u32) -> usize {
-    let programs = X2_PROGRAMS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+static X2_LEAVES: std::sync::Mutex<Option<Programs>> = std::sync::Mutex::new(None);
+
+/// Program `module`'s emit in `programs` ([`X2_PROGRAMS`] or [`X2_LEAVES`]), for the Worker to copy
+/// ([`temen_x2_bytes_ptr`]): its length, `0` when the run emitted none for it.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+fn x2_emit_len(programs: &std::sync::Mutex<Option<Programs>>, module: u32) -> usize {
+    let programs = programs.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let wasm = programs.and_then(|p| {
         let p = p.lock().unwrap_or_else(|e| e.into_inner());
         p.get(&module).cloned().flatten().map(|e| e.wasm)
     });
     x2_keep(wasm)
+}
+
+/// Program `module`'s module emit ([`X2_PROGRAMS`]), for the Worker to copy
+/// ([`temen_x2_bytes_ptr`]): its length, `0` when the run emitted none for it.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_program_len(module: u32) -> usize {
+    x2_emit_len(&X2_PROGRAMS, module)
+}
+
+/// #1414 5c: program `module`'s leaf image ([`X2_LEAVES`]), for the Worker to copy
+/// ([`temen_x2_bytes_ptr`]): its length, `0` when the run runs none for it. A tier-up over the
+/// engine's memory runs its program's leaf when there is one; otherwise its program is the run's
+/// own, whose region emit it runs.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_leaf_len(module: u32) -> usize {
+    x2_emit_len(&X2_LEAVES, module)
 }
 
 /// The run's tier-up module ([`X2_WASM`]): its bytes.
@@ -1766,7 +1790,8 @@ pub extern "C" fn temen_x2_thread(start: *mut bytecode::ThreadStart) {
 ///
 /// With `tierup` set, a module-0 task's calls to the functions the coop driver's region emit takes
 /// ([`coop_emit_for`], when [`temen_coop_set_hotness`] says) run on it, each on its thread's
-/// Worker, and the run is of the module that emit outlined. With §22 codegen on
+/// Worker, and the run is of the module that emit outlined. A root the leaf emitter takes
+/// ([`leaf_emitter`]) runs whole from its entry instead, as the pump's root leaf does (#1414 5c). With §22 codegen on
 /// ([`temen_par_jit_set_codegen`]), a guest's `Jit.invoke` of a unit with emitted wasm runs it there
 /// too, its `call.dyn`s reaching the run's dispatch table through each Worker's mirror of it. The
 /// emitted code addresses the root's window as one span, so then the window is a flat one of the
@@ -1904,12 +1929,17 @@ pub extern "C" fn temen_x2_open(
             .collect();
         X2_TABLE_LOG2.store(host.jit_table_log2(), Ordering::Relaxed);
         let programs = (tierup != 0).then(Programs::default);
+        let leaves = (tierup != 0).then(Programs::default);
         *X2_PROGRAMS.lock().unwrap_or_else(|e| e.into_inner()) = programs.clone();
+        *X2_LEAVES.lock().unwrap_or_else(|e| e.into_inner()) = leaves.clone();
         platform.tier = Some(bytecode::ThreadTier {
             root: emit,
             // Each thread's spill stack is the size of the coop run's.
             spill: if spill { COOP_SPILL_BYTES / 8 } else { 0 },
             modules: programs.map(|p| module_emitter(p, true, true)),
+            // A leaf's thread holds its emitted frames while a call in them waits, so it may take
+            // one that parks (#1414 5c).
+            leaf: leaves.map(|p| leaf_emitter(p, true, true)),
             run: x2_run,
         });
     }

@@ -2563,8 +2563,10 @@ busy-waits on another process's effect through ops that do not park (polling for
 sees it and spins where the interpreter would complete: tracked debt on #2280.
 
 **The root as a leaf; parks on the embedder (#1954).** The run's own image is offered the same way,
-at its entry (`root_leaf`, module 0), under the same predicate. It isn't offered when the run is
-durable, or when emitted code can't address the root window flat. A third kind of suspendable park
+at its entry (`root_leaf`, module 0), under the same predicate, on both executors: the pump's
+`CoopRun::start` and executor 2's `CoopRun::new_parallel` ask it whenever they hold the image (#1414
+5c). It isn't offered when the run is durable, or when emitted code can't address the root window
+flat. A third kind of suspendable park
 joins stream calls and children: a **declared host-completed cap** (`Host::grant_declared_host_caps`,
 answered by the embedder — a browser game's `fb_present`), `OpParks::OnHost`. In a bounce out of a
 leaf whose host suspends its frames, such a call parks its task in `BlockedHostCap` with the rest of
@@ -2599,7 +2601,12 @@ first resume surfaces the entry (`Vm::jit_entry`), and the results end the task,
 do. It is as safe as the call: region eligibility already keeps every op a bounce cannot serve out of
 an emitted function's whole callee closure. The root's entry keeps its own rule, the root leaf, whose
 slicing and suspension a region lacks; a durable run's tasks enter interpreted, since a thaw replays
-their entries.
+their entries. Since #1414 5c a leaf starts the same way: the root leaf, and an image a process
+execs or spawns, arm their task's `Vm` to run the entry whole (`Vm::tier_up_leaf`), which carries
+the leaf's `parks`. Nothing else of the task tiers up, and over a window the emitted code cannot
+bound it interprets. So both executors start every emitted task alike: the pump surfaces the
+entry as `CoopEvent::TierUp`, and executor 2's thread runs it, holding the frames on its stack while a
+call in them waits (`BounceTask::park`).
 
 ---
 
