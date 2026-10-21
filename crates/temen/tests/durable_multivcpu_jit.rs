@@ -103,7 +103,7 @@ fn jit_freezes_a_spawned_vcpu_matching_interp() {
         h.clock_ns = 42;
         let clk = h.grant_clock();
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        write_state(&mut win, STATE_UNWINDING);
+        write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
             &inst,
@@ -127,7 +127,7 @@ fn jit_freezes_a_spawned_vcpu_matching_interp() {
     jhost.clock_ns = 42;
     let clk = jhost.grant_clock();
     let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut jwin, STATE_UNWINDING);
+    write_state(&mut jwin, TEST_ARENA, STATE_UNWINDING);
     let (
         jout,
         jsnap,
@@ -222,7 +222,7 @@ fn jit_thaws_its_own_multivcpu_freeze() {
     fhost.clock_ns = 42;
     let fclk = fhost.grant_clock();
     let mut fwin = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut fwin, STATE_UNWINDING);
+    write_state(&mut fwin, TEST_ARENA, STATE_UNWINDING);
     let (
         fout,
         fsnap,
@@ -319,7 +319,7 @@ fn interp_frozen_multivcpu_thaws_on_the_jit() {
         h.clock_ns = 42;
         let clk = h.grant_clock();
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        write_state(&mut win, STATE_UNWINDING);
+        write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
             &inst,
@@ -476,7 +476,7 @@ fn jit_freezes_and_thaws_a_child_owned_fiber_matching_interp() {
         h.clock_ns = 42;
         let clk = h.grant_clock();
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        write_state(&mut win, STATE_UNWINDING);
+        write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
             &inst,
@@ -504,7 +504,7 @@ fn jit_freezes_and_thaws_a_child_owned_fiber_matching_interp() {
     jhost.clock_ns = 42;
     let clk = jhost.grant_clock();
     let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut jwin, STATE_UNWINDING);
+    write_state(&mut jwin, TEST_ARENA, STATE_UNWINDING);
     let (
         jout,
         jsnap,
@@ -695,7 +695,7 @@ fn jit_freezes_and_thaws_a_nested_tree_matching_interp() {
         h.clock_ns = 42;
         let clk = h.grant_clock();
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        write_state(&mut win, STATE_UNWINDING);
+        write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
             &inst,
@@ -721,7 +721,7 @@ fn jit_freezes_and_thaws_a_nested_tree_matching_interp() {
     jhost.clock_ns = 42;
     let clk = jhost.grant_clock();
     let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut jwin, STATE_UNWINDING);
+    write_state(&mut jwin, TEST_ARENA, STATE_UNWINDING);
     let (
         jout,
         jsnap,
@@ -860,7 +860,7 @@ fn jit_and_interp_freeze_a_futex_parked_child_identically() {
     let inst = transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("instrumented IR verifies");
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
 
     let mut h = Host::new();
     h.set_durable(true);
@@ -1079,7 +1079,7 @@ fn interp_durable_run(
 fn an_armed_run_that_joins_before_its_trigger_completes_on_both_engines() {
     let inst = instrument_child_fiber();
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after(&mut win, 100);
+    arm_freeze_after(&mut win, TEST_ARENA, 100);
 
     let (ir, ..) = interp_durable_run(&inst, &win, 42, None);
     assert_eq!(
@@ -1106,7 +1106,7 @@ fn an_armed_run_that_joins_before_its_trigger_completes_on_both_engines() {
 fn a_trigger_that_fires_in_a_joined_child_freezes_identically_on_both_engines() {
     let inst = instrument_child_fiber();
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after(&mut win, 1);
+    arm_freeze_after(&mut win, TEST_ARENA, 1);
 
     let (ir, isnap, ifibers, ivcpus, iroot_sp) = interp_durable_run(&inst, &win, 42, None);
     assert_eq!(
@@ -1193,7 +1193,7 @@ fn a_trigger_that_fires_in_a_joined_child_freezes_identically_on_both_engines() 
 fn the_embedder_jit_path_carries_the_vcpu_residue_both_ways() {
     let inst = instrument();
     let mut fwin = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut fwin, STATE_UNWINDING);
+    write_state(&mut fwin, TEST_ARENA, STATE_UNWINDING);
     let (_, isnap, _, ivcpus, iroot) = interp_durable_run(&inst, &fwin, 42, None);
 
     // Freeze on the JIT through the embedder path: the residue lands on the Host.

@@ -53,7 +53,7 @@ fn instrument_in(arena: ShadowArena) -> Module {
 fn freeze_with_sp(inst: &Module, sp: u64) -> Result<Vec<Value>, Trap> {
     let arena = inst.memory.and_then(|m| m.shadow).expect("an arena");
     let mut win = init_durable_window(WINDOW, arena);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     // §12.8 4A.5: the root context's shadow-SP word is the first 8 bytes of its region (at
     // `ShadowArena::region_base(0)`), not the legacy global `SHADOW_SP_OFF`.
     win[arena.region_base(0) as usize..arena.region_base(0) as usize + 8]
@@ -85,9 +85,9 @@ fn shadow_overflow_traps_instead_of_corrupting() {
         "a push past the reserve traps, never writes guest memory"
     );
 
-    // From the base, the same freeze fits and returns its placeholder.
+    // From the frames' base (an empty stack), the same freeze fits and returns its placeholder.
     assert!(
-        freeze_with_sp(&inst, TEST_ARENA.region_base(0)).is_ok(),
+        freeze_with_sp(&inst, TEST_ARENA.frame_base(0)).is_ok(),
         "a freeze that fits within the reserve still works"
     );
 }

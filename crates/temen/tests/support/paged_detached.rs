@@ -509,7 +509,7 @@ pub fn artifact(
         None,
         "the freeze was not declined"
     );
-    assert_eq!(read_state(&snap), STATE_UNWINDING, "the root froze");
+    assert_eq!(read_state(&snap, ARENA), STATE_UNWINDING, "the root froze");
     assert_eq!(
         fh.captured_detached().len(),
         captured,
@@ -531,7 +531,7 @@ pub fn fault_parked_at_the_trigger_thaws() {
     // Past the parent's first quantum, by when the child has run and faulted, and before the round
     // that serves the fault ends.
     let (art, args) = artifact(&parent, &[&child], 1, |w| {
-        arm_freeze_after_backedges(w, 50_000)
+        arm_freeze_after_backedges(w, ARENA, 50_000)
     });
     assert_eq!(
         thaw_on(Engine::Interp, &art, &parent, &[&child], &args),

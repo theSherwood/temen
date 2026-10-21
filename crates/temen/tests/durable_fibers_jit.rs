@@ -211,7 +211,7 @@ fn jit_freeze_driver_flattens_a_fiber_matching_interp() {
     let mut ihost = Host::new();
     ihost.set_durable(true);
     let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut iwin, STATE_UNWINDING);
+    write_state(&mut iwin, TEST_ARENA, STATE_UNWINDING);
     let mut ifuel = 1_000_000u64;
     let (ires, isnap) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut ifuel, &iwin, WINDOW_LOG2, &mut ihost);
@@ -223,7 +223,7 @@ fn jit_freeze_driver_flattens_a_fiber_matching_interp() {
     // JIT freeze: the new JIT freeze driver must flatten the same fiber identically.
     let mut jhost = Host::new();
     let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut jwin, STATE_UNWINDING);
+    write_state(&mut jwin, TEST_ARENA, STATE_UNWINDING);
     let (jout, jsnap, DurableResidue { .. }) = compile_and_run_durable(
         &inst,
         0,
@@ -263,7 +263,7 @@ fn jit_and_interp_freeze_a_fiber_to_an_identical_artifact() {
     let mut ihost = Host::new();
     ihost.set_durable(true);
     let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut iwin, STATE_UNWINDING);
+    write_state(&mut iwin, TEST_ARENA, STATE_UNWINDING);
     let mut ifuel = 1_000_000u64;
     let (ires, isnap) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut ifuel, &iwin, WINDOW_LOG2, &mut ihost);
@@ -273,7 +273,7 @@ fn jit_and_interp_freeze_a_fiber_to_an_identical_artifact() {
     // JIT freeze → residue; serialize through the same codec (set the JIT residue on a host).
     let mut jhost = Host::new();
     let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut jwin, STATE_UNWINDING);
+    write_state(&mut jwin, TEST_ARENA, STATE_UNWINDING);
     let (
         _jout,
         jsnap,
@@ -347,7 +347,7 @@ fn interp_frozen_fiber_artifact_thaws_on_the_jit() {
     let mut ihost = Host::new();
     ihost.set_durable(true);
     let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut iwin, STATE_UNWINDING);
+    write_state(&mut iwin, TEST_ARENA, STATE_UNWINDING);
     let mut ifuel = 1_000_000u64;
     let (ires, isnap) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut ifuel, &iwin, WINDOW_LOG2, &mut ihost);
@@ -438,7 +438,7 @@ fn interp_frozen_active_chain_fiber_thaws_on_the_jit() {
     ihost.clock_ns = 42;
     let iclk = ihost.grant_clock();
     let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut iwin, STATE_UNWINDING);
+    write_state(&mut iwin, TEST_ARENA, STATE_UNWINDING);
     let mut ifuel = 1_000_000u64;
     let (ires, isnap) = run_capture_reserved_with_host(
         &inst,
@@ -558,7 +558,7 @@ fn jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit() {
     let mut ihost = Host::new();
     ihost.set_durable(true);
     let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after(&mut iwin, 3);
+    arm_freeze_after(&mut iwin, TEST_ARENA, 3);
     let mut ifuel = 1_000_000u64;
     let (ires, isnap) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut ifuel, &iwin, WINDOW_LOG2, &mut ihost);
@@ -574,7 +574,7 @@ fn jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit() {
     // JIT freeze, identically armed: the JIT's per-thunk trigger must promote at the same safepoint.
     let mut jhost = Host::new();
     let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after(&mut jwin, 3);
+    arm_freeze_after(&mut jwin, TEST_ARENA, 3);
     let (jout, jsnap, DurableResidue { fibers: jr, .. }) = compile_and_run_durable(
         &inst,
         0,
@@ -707,7 +707,7 @@ fn a_consumed_park_frozen_mid_delivery_redelivers_on_the_jit() {
     let mut ihost = Host::new();
     ihost.set_durable(true);
     let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after(&mut iwin, 3);
+    arm_freeze_after(&mut iwin, TEST_ARENA, 3);
     let mut ifuel = 1_000_000u64;
     let (ires, isnap) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut ifuel, &iwin, WINDOW_LOG2, &mut ihost);
@@ -734,7 +734,7 @@ fn a_consumed_park_frozen_mid_delivery_redelivers_on_the_jit() {
     // JIT freeze at the same safepoint → JIT thaw; the residue agrees with the interp's.
     let mut jhost = Host::new();
     let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after(&mut jwin, 3);
+    arm_freeze_after(&mut jwin, TEST_ARENA, 3);
     let (jout, mut jsnap, DurableResidue { fibers: jr, .. }) = compile_and_run_durable(
         &inst,
         0,

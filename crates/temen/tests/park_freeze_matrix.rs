@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use temen_durable::{
     arm_freeze_after, arm_freeze_on_quiesce, begin_thaw, init_durable_window,
-    transform_module_assume_confined, ARM_QUIESCE_OFF,
+    transform_module_assume_confined,
 };
 use temen_interp::{
     run_capture_reserved_with_host, CapState, FreezeRule, Host, ParkSite, SignalSource, StreamRole,
@@ -357,7 +357,10 @@ fn freeze_parked_then_thaw(
     let mut win2 = snap;
     // The arm rides the window: a quiesce-frozen run that goes idle again would freeze again. The
     // thaw runs disarmed, to give the uninterrupted answer.
-    win2[ARM_QUIESCE_OFF as usize] = 0;
+    let quiesce = TEST_ARENA
+        .quiesce_flag()
+        .expect("the arena holds the quiesce flag");
+    win2[quiesce as usize] = 0;
     begin_thaw(&mut win2, TEST_ARENA, 0);
     let (res2, _, h) = run(engine, &inst, &args, &win2, h);
     assert_eq!(
@@ -403,7 +406,12 @@ block 1 (va: i64) {
 "#;
 
 fn arm_in_sibling(win: &mut [u8]) {
-    arm_freeze_after(win, 5);
+    arm_freeze_after(win, TEST_ARENA, 5);
+}
+
+/// Arm `win` to freeze on quiesce.
+fn arm_on_quiesce(win: &mut [u8]) {
+    arm_freeze_on_quiesce(win, TEST_ARENA);
 }
 
 /// `atomic.wait` — the root waits on a word only its sibling sets. However the re-issued wait and
@@ -478,7 +486,7 @@ block 0 () {
         src,
         |_| vec![],
         Uninterrupted::Runs,
-        arm_freeze_on_quiesce,
+        arm_on_quiesce,
         |_| {},
         Err("ThreadFault".into()),
     );
@@ -685,7 +693,7 @@ block 0 (vsp: i64, varg: i64) {
             vec![Value::I32(vin)]
         },
         Uninterrupted::WaitsOnTheOutside,
-        arm_freeze_on_quiesce,
+        arm_on_quiesce,
         |h| h.push_stdin(b"x"),
         Ok(1000 + i64::from(b'x')),
     );
@@ -780,7 +788,7 @@ block 0 (vsp: i64, varg: i64) {
             vec![Value::I32(stop), Value::I32(out)]
         },
         Uninterrupted::WaitsOnTheOutside,
-        arm_freeze_on_quiesce,
+        arm_on_quiesce,
         |h| {
             assert!(
                 h.stdout.is_empty(),
@@ -832,7 +840,7 @@ block 0 (vx: i64) {
         src,
         |_| vec![],
         Uninterrupted::WaitsOnTheOutside,
-        arm_freeze_on_quiesce,
+        arm_on_quiesce,
         |h| {
             let t = h.svc_enqueue(0, 0, vec![41]).expect("enqueue");
             *ticket.lock().unwrap() = Some(t);
@@ -1079,7 +1087,7 @@ fn host_park_in_a_fiber(
 ) {
     let (polls, arm): (i64, fn(&mut [u8])) = match trigger {
         Trigger::Countdown => (20, arm_in_sibling),
-        Trigger::Quiesce => (1, arm_freeze_on_quiesce),
+        Trigger::Quiesce => (1, arm_on_quiesce),
     };
     let src = format!(
         r#"

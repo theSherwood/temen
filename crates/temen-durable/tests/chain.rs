@@ -64,11 +64,11 @@ fn assert_roundtrips(inst: &Module) -> Vec<Value> {
 
     // Freeze: same initial conditions, state UNWINDING.
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let (frozen, snapshot) = run(inst, 42, &win);
     assert!(frozen.is_ok(), "freeze returns a placeholder, not a trap");
     assert_eq!(
-        read_state(&snapshot),
+        read_state(&snapshot, TEST_ARENA),
         STATE_UNWINDING,
         "artifact is still UNWINDING (the whole chain unwound, none completed)"
     );

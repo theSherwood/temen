@@ -162,6 +162,12 @@ struct Env {
     /// progress), `thread.spawn` runs the child **inline** on the spawning thread (single-worker,
     /// mirroring the interp), so the shared durable control words are never raced (slice 3.3).
     durable: bool,
+    /// The shadow arena the module declared (INVARIANTS.md #16): where its contexts are placed, and
+    /// where its freeze word is (#2518). [`ShadowArena::EMPTY`] when it declared none, which no freeze
+    /// can stop mid-run.
+    ///
+    /// [`ShadowArena::EMPTY`]: temen_ir::durable_abi::ShadowArena::EMPTY
+    shadow: temen_ir::durable_abi::ShadowArena,
 }
 
 // SAFETY: `Env`'s raw pointers refer to the run's shared window / trap cell, valid for the whole run.
@@ -234,6 +240,44 @@ pub(crate) unsafe fn mark_reissue(mem_base: u64) {
     *((mem_base + word) as *mut i32) = 1;
 }
 
+/// #2518 — where a park watches for a freeze: a durable window's base, and the freeze word of the
+/// arena its module declared. A park that finds the word `UNWINDING` returns, its call marked for
+/// re-issue, so the caller's trailing poll unwinds. A park holds `None` where no freeze can land: a
+/// run that is not durable, or a module that declared no arena, which has no freeze word and nothing
+/// that polls one.
+#[derive(Clone, Copy, Debug)]
+pub struct FreezeWatch {
+    base: u64,
+    word: u64,
+}
+
+impl FreezeWatch {
+    /// The watch over the durable window at `base` whose module declared `arena`; `None` when it
+    /// declared none.
+    pub fn new(base: u64, arena: temen_ir::durable_abi::ShadowArena) -> Option<FreezeWatch> {
+        arena.freeze_word().map(|w| FreezeWatch {
+            base,
+            word: base + w,
+        })
+    }
+
+    /// Whether a freeze has landed: the freeze word reads `UNWINDING`.
+    ///
+    /// # Safety
+    /// The window is live.
+    unsafe fn landed(self) -> bool {
+        *(self.word as *const i32) == temen_ir::durable_abi::STATE_UNWINDING
+    }
+
+    /// [`mark_reissue`] on this window.
+    ///
+    /// # Safety
+    /// The window is live.
+    unsafe fn mark_reissue(self) {
+        mark_reissue(self.base)
+    }
+}
+
 /// #1826 — how a host call's park ([`park_host_call`]) ended.
 #[cfg(not(loom))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -272,18 +316,17 @@ pub enum Parks {
 /// them may be what ends the park. The caller holds no lock the run's other vCPUs need.
 ///
 /// # Safety
-/// `trap_out` is a live JIT call's trap cell (its `VmCtx`); `unwind_base` is a durable run's
-/// committed window base, or `0`.
+/// `trap_out` is a live JIT call's trap cell (its `VmCtx`); `freeze` watches the run's live window.
 #[cfg(not(loom))]
 pub unsafe fn park_host_call(
     trap_out: *mut i64,
-    unwind_base: u64,
+    freeze: Option<FreezeWatch>,
     key: u64,
     parks: Parks,
     still_parked: impl Fn() -> bool,
 ) -> HostPark {
     let vm = crate::vmctx::VmCtx::of_trap_out(trap_out);
-    let frozen = || unwind_base != 0 && fiber_rt::window_is_unwinding(unwind_base);
+    let frozen = || freeze.filter(|f| f.landed());
     // #1952 — a fiber's park takes the fiber alone: it yields `FIBER_PARKED` to its resumer, which
     // runs on, and re-checks each time a `cont.resume` polls it. It parks before the first re-check,
     // for the one transient `FIBER_PARKED` the oracle's register-then-recheck gives. A vCPU's park
@@ -297,23 +340,23 @@ pub unsafe fn park_host_call(
     if let Some(slot) = slot {
         let ended = || epoch_fired(vm.epoch as usize) || domain_ended(trap_out);
         loop {
-            if frozen() {
-                mark_reissue(unwind_base);
+            if let Some(f) = frozen() {
+                f.mark_reissue();
                 return HostPark::Frozen;
             }
             fiber_rt::fiber_event_park(&slot, None, on.clone());
             if ended() {
                 return HostPark::Ended;
             }
-            if !frozen() && !still_parked() {
+            if frozen().is_none() && !still_parked() {
                 return HostPark::Woken;
             }
         }
     }
     if vm.sched.is_null() {
         // No thread domain: the caller is the run's only vCPU, and nothing else could end it.
-        return if frozen() {
-            mark_reissue(unwind_base);
+        return if let Some(f) = frozen() {
+            f.mark_reissue();
             HostPark::Frozen
         } else if still_parked() {
             HostPark::Deadlock
@@ -333,7 +376,7 @@ pub unsafe fn park_host_call(
         still_parked,
         None,
         dom.env().epoch_addr,
-        unwind_base,
+        freeze,
         &hub.parked,
         || hub.peers_live(),
         || domain_ended(trap_out),
@@ -343,8 +386,11 @@ pub unsafe fn park_host_call(
         return HostPark::Ended;
     }
     match status {
+        // Only a watched window's freeze ends a wait so.
         temen_ir::durable_abi::WAIT_FROZEN => {
-            mark_reissue(unwind_base);
+            if let Some(f) = freeze {
+                f.mark_reissue();
+            }
             HostPark::Frozen
         }
         #[cfg(not(loom))]
@@ -516,13 +562,11 @@ pub(crate) struct Domain {
     /// async freeze. `quiesce` holds the count of vCPUs still to reach a quiescent (unwound) state;
     /// the coordinator waits on `quiesce_cv` until it hits 0, then runs the existing single-worker
     /// freeze-drive. The *same* `quiesce` lock guards the active shadow-SP scratch during each worker's
-    /// unwind, so that single shared word has one owner at a time (the R10 seam). Engaged only when
-    /// `concurrent_durable` is set — by the 4A.5 concurrent multi-vCPU entry alone. On every existing
-    /// path (single-worker freeze defer, thaw, ordinary runs) the lock is never taken and the flag is
-    /// false, so behavior is byte-identical. See [`Domain::quiesce_arrive`] / [`Domain::quiesce_wait_all`].
+    /// unwind, so that single shared word has one owner at a time (the R10 seam). Not on the live path:
+    /// a loom-verified primitive only (see [`Domain::arm_quiesce`]), so the lock is never taken in a
+    /// run. See [`Domain::quiesce_arrive`] / [`Domain::quiesce_wait_all`].
     quiesce: Mutex<usize>,
     quiesce_cv: Condvar,
-    concurrent_durable: AtomicBool,
     /// §12.8 concurrent-thaw stage 3: count of vCPUs currently **blocked** (parked in `atomic.wait` or
     /// `thread.join`). A `notify`/`join`-completer must be a *live, not-parked* vCPU, so an infinite wait
     /// can never be satisfied once every live vCPU is parked (`live == parked`): `futex_wait`'s
@@ -829,7 +873,6 @@ impl Domain {
             trap_capture: Mutex::new(None),
             quiesce: Mutex::new(0),
             quiesce_cv: Condvar::new(),
-            concurrent_durable: AtomicBool::new(false),
             parked: AtomicUsize::new(0),
             killing: AtomicUsize::new(0),
             child_exec: Mutex::new(None),
@@ -916,6 +959,7 @@ impl Domain {
         fiber_table: Option<std::sync::Arc<SharedFiberTable>>,
         epoch_addr: usize,
         durable: bool,
+        shadow: temen_ir::durable_abi::ShadowArena,
     ) {
         *lock(&self.env) = Some(Env {
             mem_base,
@@ -927,6 +971,7 @@ impl Domain {
             fiber_cfg,
             epoch_addr,
             durable,
+            shadow,
         });
         *lock(&self.fiber_table) = fiber_table;
     }
@@ -939,8 +984,16 @@ impl Domain {
     /// The module-declared shadow arena this domain places its contexts in (`EMPTY` when the module
     /// declared none — then nothing durable can be placed and a durable run is refused upstream).
     pub(crate) fn shadow(&self) -> temen_ir::durable_abi::ShadowArena {
-        self.fiber_table()
-            .map_or(temen_ir::durable_abi::ShadowArena::EMPTY, |t| t.shadow)
+        self.env().shadow
+    }
+
+    /// #2518 — where this domain's parks watch for a freeze: its window's freeze word, on a durable
+    /// run of a module that declared an arena; `None` otherwise, where no freeze can land mid-run.
+    pub(crate) fn freeze_watch(&self) -> Option<FreezeWatch> {
+        let env = self.env();
+        env.durable
+            .then(|| FreezeWatch::new(env.mem_base, env.shadow))
+            .flatten()
     }
 
     /// A §14 **child** (its own OS thread, sharing this domain's futex) started: count it live so the
@@ -1185,24 +1238,6 @@ impl Domain {
     #[cfg_attr(not(loom), allow(dead_code))]
     pub(crate) fn arm_quiesce(&self, runners: usize) {
         *lock(&self.quiesce) = runners;
-        self.concurrent_durable.store(true, Ordering::Release);
-    }
-
-    /// True on a concurrent multi-worker durable run (4A.5). `thread_spawn` reserves a per-context
-    /// shadow context for a child spawned during NORMAL (so a later freeze makes it self-unwind into its
-    /// own region); `run_child` seeds the durable shadow-base register and records freeze residue. Off
-    /// on every existing path, so they are byte-identical.
-    pub(crate) fn is_concurrent_durable(&self) -> bool {
-        self.concurrent_durable.load(Ordering::Acquire)
-    }
-
-    /// Engage the concurrent durable path (§12.8 4A.5 stage ii) for a freezable multi-vCPU run. Set once
-    /// at run setup, before any child is spawned. The coordinator joins concurrent children via the
-    /// existing `join_all` (each child's freeze-unwind into its own per-context region completes its OS
-    /// thread); no shared active-SP word and no quiesce lock — the per-context relocation (stage i)
-    /// made that serialization unnecessary.
-    pub(crate) fn engage_concurrent_durable(&self) {
-        self.concurrent_durable.store(true, Ordering::Release);
     }
 
     /// **Concurrent durable STW** (Phase-4 Slice A) — a worker reaches the quiesce barrier. §12.8 4A.5:
@@ -1554,14 +1589,21 @@ fn run_child(a: SpawnArgs) {
     // §12 seed this vCPU's per-vCPU TLS register to its dense id before any guest code runs.
     crate::vcpu_tls::seed(a.vcpu_id);
     crate::vcpu_tls::set_serve_handlers(0);
-    // §12.8 4A.5 stage (ii): a concurrent durable child points its durable shadow-base register at its
-    // own region AND initialises that region's shadow-SP word to the empty frame base, so if a freeze
-    // fires its instrumented code spills into *its* per-context region (concurrent with siblings, no
-    // shared word). Without the init the word would read 0 and the unwind would spill over the reserve
-    // header — corrupting the state word. SAFETY: durable run ⇒ the reserve is committed RW.
+    // Every vCPU addresses a region of its domain's arena through its durable shadow-base register: a
+    // durable child its own, a child of a run that is not durable (which nothing freezes) the root's,
+    // where an instrumented prologue reads the root's thaw word (#2518: it used to keep the register's
+    // default, a fixed offset its window need not hold).
+    crate::durable_shadow::seed(match &a.durable_child {
+        Some(dc) => dc.shadow.region_base(dc.ctx),
+        None => env.shadow.region_base(0),
+    });
+    // §12.8 4A.5 stage (ii): a durable child's register points at its own region, whose shadow-SP word
+    // it initialises to the empty frame base, so if a freeze fires its instrumented code spills into
+    // *its* per-context region (concurrent with siblings, no shared word). Without the init the word
+    // would read 0 and the unwind check would trap the spill. SAFETY: durable run ⇒ the arena is
+    // committed RW.
     if let Some(dc) = &a.durable_child {
         let region = dc.shadow.region_base(dc.ctx);
-        crate::durable_shadow::seed(region);
         match dc.thaw_extent {
             // §12.8 concurrent-thaw stage 2: a **thaw** re-spawn rewinds from its restored extent — set
             // its region's SP word to that extent and its own per-context thaw word `REWINDING`, so the
@@ -1658,7 +1700,7 @@ fn run_child(a: SpawnArgs) {
     // order-independent). SAFETY: durable run ⇒ committed reserve; live `Domain`.
     if a.durable_child.is_some()
         && !faulted
-        && unsafe { fiber_rt::window_is_unwinding(env.mem_base) }
+        && unsafe { fiber_rt::window_is_unwinding(env.mem_base, env.shadow) }
     {
         if let Some(b) = frt.as_mut() {
             let rt = &mut **b as *mut FiberRuntime;
@@ -1700,7 +1742,7 @@ fn run_child(a: SpawnArgs) {
         // A freeze-unwind iff the window is UNWINDING **and** the child actually spilled past its frame
         // base — a child that ran to a genuine finish under an UNWINDING window left its region empty.
         let froze = !faulted
-            && unsafe { fiber_rt::window_is_unwinding(env.mem_base) }
+            && unsafe { fiber_rt::window_is_unwinding(env.mem_base, env.shadow) }
             && extent > dc.shadow.frame_base(dc.ctx);
         if froze {
             unsafe {
@@ -1788,15 +1830,18 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     // #2010 — the run's own domain only: a durable §14 child's root is an executor task, which has no
     // stack to drive deferred children on, so its domain runs concurrently durable throughout
     // (`ChildExec::spawn`) and a child spawned under its freeze word unwinds at its first poll.
-    if env.durable && std::ptr::eq(hub, dom) && fiber_rt::window_is_durable_active(env.mem_base) {
+    if env.durable
+        && std::ptr::eq(hub, dom)
+        && fiber_rt::window_is_durable_active(env.mem_base, env.shadow)
+    {
         return defer_spawn(dom, code, func_idx, sp, arg, trap_out);
     }
-    // §12.8 4A.5 stage (ii): on a freezable (interruptible) durable run, a child spawned during NORMAL
-    // runs as a real OS thread but reserves its own top-down shadow context now, so a later freeze can
-    // make it self-unwind into its own per-context SP word (concurrent, lock-free — stage i). Its global
-    // task id matches the interp/deferred path (seeded into `vcpu.tls`). `None` on every existing path,
-    // so behavior is unchanged there.
-    let mut durable_child = if env.durable && dom.is_concurrent_durable() {
+    // §12.8 4A.5 stage (ii): a durable child spawned during NORMAL runs as a real OS thread with its own
+    // top-down shadow context, so a freeze that reaches it unwinds it into its own per-context SP word
+    // (concurrent, lock-free — stage i). The oracle gives every spawned vCPU of a durable domain a
+    // context, and refuses a spawn the arena has none free for; so does every path here (#2543). Its
+    // global task id matches the interp/deferred path (seeded into `vcpu.tls`).
+    let mut durable_child = if env.durable {
         // §12.8 4A.5 follow-up B.2: a **concurrent** child that spawns a grandchild attributes the
         // grandchild's `parent_task` to itself via the per-OS-thread spawning-task source (`run_child`
         // seeded it) — not the shared `cur_task`, which the concurrent path never maintains and which
@@ -2061,7 +2106,7 @@ impl Domain {
         // active shadow-SP restored to the child's region. Drain the child's residue into the domain
         // accumulator (`run_inner` merges it into the run's `frozen_out`; canonical sort-by-slot at
         // serialize keeps the artifact order-independent).
-        if !faulted && fiber_rt::window_is_unwinding(env.mem_base) {
+        if !faulted && fiber_rt::window_is_unwinding(env.mem_base, env.shadow) {
             if let Some(b) = frt.as_mut() {
                 let rt = &mut **b as *mut FiberRuntime;
                 fiber_rt::freeze_drive(rt, env.trap_out as u64);
@@ -2168,7 +2213,7 @@ impl Domain {
                 // completed, not frozen: re-running it on thaw would repeat its effects (#1685).
                 let child_sp = fiber_rt::read_shadow_sp(env.mem_base, child_region);
                 let froze = !faulted
-                    && fiber_rt::window_is_unwinding(env.mem_base)
+                    && fiber_rt::window_is_unwinding(env.mem_base, env.shadow)
                     && child_sp > self.shadow().frame_base(p.ctx);
 
                 // A child that unwound under the freeze records *itself* as residue (its continuation now
@@ -2460,13 +2505,8 @@ pub(crate) unsafe extern "C" fn thread_join(
     // §12.8 4A.5 (blocked-in-join freeze): a joiner parked here when a freeze begins must also return
     // so its instrumented caller can unwind at the re-issue safepoint the `temen-durable` transform now
     // emits after `thread.join`. On thaw the join is re-issued and re-parks on the (re-spawned) child.
-    // Gate on `durable` — only then is window offset 0 the reserved state word; a non-durable run's
-    // offset 0 is ordinary guest memory and could spuriously read `UNWINDING`.
-    let unwind_base = if dom.env().durable {
-        dom.env().mem_base
-    } else {
-        0
-    };
+    // Only a durable run's window has a freeze word, and only one whose module declared an arena.
+    let freeze = dom.freeze_watch();
     // #1655 — the joined child may not have started: run the deferred children before parking. The
     // wait below then takes what the child left: its real result if it finished, or — if it unwound
     // for a freeze — the placeholder, marked for re-issue.
@@ -2501,9 +2541,9 @@ pub(crate) unsafe extern "C" fn thread_join(
             if epoch_fired(epoch_addr) {
                 return 0; // killed — unwind to guest code, which traps OutOfFuel at its next poll
             }
-            // SAFETY: on a durable run `mem_base` is the committed window base, offset 0 RW for the run.
-            if unwind_base != 0 && unsafe { fiber_rt::window_is_unwinding(unwind_base) } {
-                unsafe { mark_reissue(unwind_base) };
+            // SAFETY: a watched window is the run's, live while it is.
+            if let Some(f) = freeze.filter(|f| unsafe { f.landed() }) {
+                unsafe { f.mark_reissue() };
                 return 0; // freeze in progress — return so the join's trailing safepoint unwinds
             }
             // Owner decision 2026-07-24 (domain teardown; DESIGN.md §12, D37 death-is-revocation): a
@@ -2515,10 +2555,10 @@ pub(crate) unsafe extern "C" fn thread_join(
             if unsafe { domain_ended(trap_out as *mut i64) } {
                 return 0;
             }
-            // A timeout wait so the kill (`epoch_addr`) and freeze (`unwind_base`) re-checks above run
+            // A timeout wait so the kill (`epoch_addr`) and freeze (`freeze`) re-checks above run
             // periodically even when no `notify` arrives; a plain `wait` only when neither is armed.
             #[cfg(not(loom))]
-            if epoch_addr != 0 || unwind_base != 0 {
+            if epoch_addr != 0 || freeze.is_some() {
                 st = done
                     .cv
                     .wait_timeout(st, KILL_RECHECK)
@@ -2559,7 +2599,7 @@ unsafe fn task_join(
     trap_out: u64,
 ) -> i64 {
     let env = dom.env();
-    let unwind_base = if env.durable { env.mem_base } else { 0 };
+    let freeze = dom.freeze_watch();
     let mut _pg = None;
     loop {
         {
@@ -2582,8 +2622,8 @@ unsafe fn task_join(
         if epoch_fired(env.epoch_addr) || domain_ended(trap_out as *mut i64) {
             return 0;
         }
-        if unwind_base != 0 && fiber_rt::window_is_unwinding(unwind_base) {
-            mark_reissue(unwind_base);
+        if let Some(f) = freeze.filter(|f| f.landed()) {
+            f.mark_reissue();
             return 0; // a freeze: the join's trailing safepoint unwinds
         }
         fiber_rt::fiber_event_park(slot, None, fiber_rt::ParkOn::Thread);
@@ -2645,13 +2685,9 @@ pub(crate) unsafe extern "C" fn thread_wait(
     } else {
         Some(Instant::now() + Duration::from_nanos(timeout as u64))
     };
-    // §12.8 parked-vCPU freeze: gate on `durable` so window offset 0 is the reserved state word (a
-    // non-durable run's offset 0 is ordinary guest memory that could spuriously read `UNWINDING`).
-    let unwind_base = if dom.env().durable {
-        dom.env().mem_base
-    } else {
-        0
-    };
+    // §12.8 parked-vCPU freeze: only a durable run's window has a freeze word, and only one whose
+    // module declared an arena (#2518).
+    let freeze = dom.freeze_watch();
     // §3.6 slice 5a: a wait issued INSIDE a fiber parks the FIBER, not this OS thread — the
     // resumer keeps running and sees `cont.resume` status `FIBER_PARKED`, exactly the tree-walk
     // oracle's fiber-park routing (`temen-interp/tests/fiber_parks.rs`; the timed-wait slice is
@@ -2664,7 +2700,7 @@ pub(crate) unsafe extern "C" fn thread_wait(
             expected & mask,
             width,
             deadline,
-            unwind_base,
+            freeze,
             trap_out,
         );
     }
@@ -2690,7 +2726,7 @@ pub(crate) unsafe extern "C" fn thread_wait(
         || read_phys(phys, width) & mask == expected & mask,
         deadline,
         dom.env().epoch_addr,
-        unwind_base,
+        freeze,
         &hub.parked,
         // §12.8 concurrent-thaw stage 3: a notifier must be a live vCPU that is **not** itself parked.
         // `live` counts the root + unfinished spawns (incl. this waiter); `parked` counts those blocked in
@@ -2736,7 +2772,7 @@ pub(crate) unsafe extern "C" fn thread_wait(
 ///
 /// # Safety
 /// Called from inside a running fiber (`slot` is its own slot, via
-/// [`fiber_rt::current_fiber_slot`]); `phys`/`trap_out`/`unwind_base` as [`thread_wait`].
+/// [`fiber_rt::current_fiber_slot`]); `phys`/`trap_out`/`freeze` as [`thread_wait`].
 #[allow(clippy::too_many_arguments)] // the same threaded park context as `futex_wait`
 unsafe fn fiber_futex_wait(
     dom: &Domain,
@@ -2745,7 +2781,7 @@ unsafe fn fiber_futex_wait(
     expected: u64,
     width: u32,
     deadline: Option<Instant>,
-    unwind_base: u64,
+    freeze: Option<FreezeWatch>,
     trap_out: u64,
 ) -> i32 {
     let mask = width_mask(width);
@@ -2762,7 +2798,7 @@ unsafe fn fiber_futex_wait(
             g.entry(key).or_default().waiters.push(cell.clone());
         }
     }
-    fiber_futex_wait_loop(dom, slot, key, &cell, deadline, unwind_base, trap_out)
+    fiber_futex_wait_loop(dom, slot, key, &cell, deadline, freeze, trap_out)
 }
 
 /// The park loop of [`fiber_futex_wait`]: park, re-enter on a poll (or an executor resume),
@@ -2773,7 +2809,7 @@ unsafe fn fiber_futex_wait_loop(
     key: FutexKey,
     cell: &std::sync::Arc<WaitCell>,
     deadline: Option<Instant>,
-    unwind_base: u64,
+    freeze: Option<FreezeWatch>,
     trap_out: u64,
 ) -> i32 {
     loop {
@@ -2803,7 +2839,7 @@ unsafe fn fiber_futex_wait_loop(
         // Mirror the OS park's exits (kill / teardown / freeze): consume the waiter entry and
         // return as if woken — the caller's trailing guards (the epoch poll, the trap
         // propagation, the durable re-issue safepoint) unwind before the guest observes it.
-        let frozen = unwind_base != 0 && fiber_rt::window_is_unwinding(unwind_base);
+        let frozen = freeze.is_some_and(|f| f.landed());
         if epoch_fired(dom.env().epoch_addr) || domain_ended(trap_out as *mut i64) || frozen {
             wait_deregister(&mut lock(&dom.hub().futex), key, cell);
             // A freeze ended this wait, not its event: the thaw re-issues it (#1769).
@@ -3085,7 +3121,7 @@ fn futex_wait(
     still_eq: impl Fn() -> bool,
     deadline: Option<Instant>,
     epoch_addr: usize,
-    unwind_base: u64,
+    freeze: Option<FreezeWatch>,
     // §12.8 concurrent-thaw stage 3: count of vCPUs currently blocked (wait/join). This waiter joins it
     // for its park (so `peers_live` sees it), via the `ParkGuard` below.
     parked: &AtomicUsize,
@@ -3141,10 +3177,10 @@ fn futex_wait(
         // §12.8 parked-vCPU freeze: a waiter parked here when a freeze begins must also return so its
         // instrumented caller can unwind at the re-issue safepoint the `temen-durable` transform now emits
         // after `atomic.wait`. The returned status is discarded (the safepoint unwinds before the guest
-        // observes it); on thaw the wait is re-issued. SAFETY: on a durable run `unwind_base` is the
-        // committed window base, offset 0 RW for the run.
+        // observes it); on thaw the wait is re-issued. SAFETY: a watched window is the run's, live
+        // while the run is.
         #[cfg(not(loom))]
-        if unwind_base != 0 && unsafe { fiber_rt::window_is_unwinding(unwind_base) } {
+        if freeze.is_some_and(|f| unsafe { f.landed() }) {
             // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
             break temen_ir::durable_abi::WAIT_FROZEN;
         }
@@ -3165,7 +3201,7 @@ fn futex_wait(
                 // a value, never a hang) rather than re-check forever.
                 //
                 // **Unconditional (#1623).** This check and the bounded re-check below used to sit
-                // inside an `epoch_addr != 0 || unwind_base != 0` guard, with a `#[cfg(loom)]` copy of
+                // inside an `epoch_addr != 0 || freeze.is_some()` guard, with a `#[cfg(loom)]` copy of
                 // the check for the model. So on an ordinary run with no kill path and no durable
                 // window — neither armed — control fell through to an *untimed* `cv.wait` that
                 // re-evaluated nothing, and the detector did not exist: a lone infinite wait hung the
@@ -3334,7 +3370,7 @@ mod loom_tests {
                 || word.load(Ordering::SeqCst) == 0,
                 None,
                 0,
-                0,
+                None,
                 &parked,
                 || true, // loom models the producer↔consumer rendezvous; a peer is always live
                 || false, // no domain teardown in this model
@@ -3387,7 +3423,7 @@ mod loom_tests {
                             || w.load(Ordering::SeqCst) == 0,
                             None,
                             0,
-                            0,
+                            None,
                             &pk,
                             || true,  // a notifier is always live in this model
                             || false, // no domain teardown
@@ -3458,7 +3494,7 @@ mod loom_tests {
                 || true, // the guest word never changes (always still equals `expected`)
                 None,
                 0,
-                0,
+                None,
                 &parked,
                 || peer_live.load(Ordering::SeqCst) > 0, // a live peer could still notify
                 || false,                                // no domain teardown in this model
@@ -3518,7 +3554,7 @@ mod loom_tests {
                             || true, // the word only the *other* waiter would store never changes
                             None,
                             0,
-                            0,
+                            None,
                             &parked,
                             // The production predicate, verbatim: a notifier must be a live vCPU
                             // that is not itself parked.

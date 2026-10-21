@@ -9,7 +9,7 @@
 // it in real V8, across the IndexedDB persistence boundary and a real reload (fresh linear memory).
 //
 // The guest: grow `[128 KiB, 192 KiB)` Rw, store marker 77 into a grown page (143367, above the
-// declared 128 KiB window), self-flip the state word to UNWINDING just before the clock read (the
+// declared 128 KiB window), self-flip its freeze word to UNWINDING just before the clock read (the
 // `multipoint.rs` freeze device), then reload the marker after the call and return clock + marker.
 // Baseline (clock 42): 42 + 77 = 119. A correct thaw REPLAYS the captured clock (42), so seeding the
 // thaw clock to 9999 and still getting 119 proves both the replay AND that the grown-page marker
@@ -36,7 +36,11 @@ const benign = (t) => /Failed to load resource|status of 404/i.test(t);
 page.on('pageerror', (e) => errors.push(String(e)));
 page.on('console', (m) => { if (m.type() === 'error' && !benign(m.text())) errors.push(m.text()); });
 
-const GUEST_SRC = `memory 17 shadow 16448 65536
+// The arena the guest declares, and its freeze word: context 0's region header, +16
+// (`ShadowArena::freeze_word`, #2518).
+const ARENA_BASE = 16448;
+const FREEZE_WORD = ARENA_BASE + 16;
+const GUEST_SRC = `memory 17 shadow ${ARENA_BASE} 65536
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
   voff = i64.const 131072
@@ -46,7 +50,7 @@ block 0 (v0: i32, v1: i32) {
   vaddr = i64.const 143367
   vmark = i64.const 77
   i64.store vaddr vmark
-  vsa = i64.const 16384
+  vsa = i64.const ${FREEZE_WORD}
   vsu = i32.const 1
   i32.store vsa vsu
   vz = i32.const 0

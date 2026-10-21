@@ -209,7 +209,7 @@ fn the_kernels_words_compile_under_a_durable_jit_grant() {
     for engine in [Engine::TreeWalk, Engine::Jit] {
         let (mut host, _) = durable_host(&kernel(), SESSION);
         let mut win = init_durable_window(WINDOW, arena());
-        write_state(&mut win, temen_durable::STATE_NORMAL);
+        write_state(&mut win, arena(), temen_durable::STATE_NORMAL);
         run_on(engine, &inst, &win, &mut host);
         assert_eq!(
             String::from_utf8(host.stdout_bytes()).unwrap(),
@@ -254,7 +254,7 @@ fn the_strict_durable_grant_refuses_a_line_unit_that_resumes_a_fiber() {
     let jit = temen_run::grant_jit_durable(&mut host, &kernel(), JIT_TABLE_LOG2);
     bind_imports(&mut host, out, inp, jit);
     let mut win = init_durable_window(WINDOW, arena());
-    write_state(&mut win, temen_durable::STATE_NORMAL);
+    write_state(&mut win, arena(), temen_durable::STATE_NORMAL);
     run_on(Engine::TreeWalk, &inst, &win, &mut host);
     let out = String::from_utf8(host.stdout_bytes()).unwrap();
     assert!(
@@ -292,11 +292,11 @@ fn freeze_and_thaw(freeze_on: Engine, thaw_on: Engine) {
     // unwinds *after* the resume delivered its value, and the thaw re-parks it instead.)
     let (mut fh, handles) = durable_host(&kernel(), SESSION);
     let mut win = init_durable_window(WINDOW, arena);
-    write_state(&mut win, temen_durable::STATE_NORMAL);
-    arm_freeze_after(&mut win, 4);
+    write_state(&mut win, arena, temen_durable::STATE_NORMAL);
+    arm_freeze_after(&mut win, arena, 4);
     let snap = run_on(freeze_on, &inst, &win, &mut fh);
     assert_eq!(
-        read_state(&snap),
+        read_state(&snap, arena),
         temen_durable::STATE_UNWINDING,
         "the armed run on {freeze_on:?} must have unwound (frozen), not run to completion"
     );

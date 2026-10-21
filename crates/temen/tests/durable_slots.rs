@@ -675,7 +675,7 @@ fn check_threads(root: &str, arm: fn(&mut [u8]), want: &[(usize, usize, Option<i
 fn a_finished_unjoined_thread_rides_as_completed_at_its_slot() {
     check_threads(
         UNJOINED,
-        |w| write_state(w, STATE_UNWINDING),
+        |w| write_state(w, TEST_ARENA, STATE_UNWINDING),
         &[(1, 0, Some(107)), (2, 1, None)],
     );
 }
@@ -683,7 +683,11 @@ fn a_finished_unjoined_thread_rides_as_completed_at_its_slot() {
 /// A was joined before the freeze, so only B rides, at slot 1; its handle still resolves on thaw.
 #[test]
 fn a_slot_joined_before_the_freeze_stays_empty() {
-    check_threads(JOINED_FIRST, |w| arm_freeze_after(w, 1), &[(2, 1, None)]);
+    check_threads(
+        JOINED_FIRST,
+        |w| arm_freeze_after(w, TEST_ARENA, 1),
+        &[(2, 1, None)],
+    );
 }
 
 /// Frozen from the start, the root unwinds at its join of A — after the join got A's real result, and
@@ -691,7 +695,11 @@ fn a_slot_joined_before_the_freeze_stays_empty() {
 /// finished and is not re-run (its bump is already in the image).
 #[test]
 fn a_join_that_got_its_result_reloads_it() {
-    check_threads(JOINED_FIRST, |w| write_state(w, STATE_UNWINDING), &[]);
+    check_threads(
+        JOINED_FIRST,
+        |w| write_state(w, TEST_ARENA, STATE_UNWINDING),
+        &[],
+    );
 }
 
 /// Slot 0 is free at generation 1 (k0 finished), slot 1 fresh (k1 never resumed), slot 2 frozen (k2
@@ -699,7 +707,9 @@ fn a_join_that_got_its_result_reloads_it() {
 #[test]
 fn a_fresh_fiber_and_a_free_slot_keep_their_places() {
     let fresh = TEST_ARENA.frame_base(2);
-    for (engine, r) in freeze_thaw(ARMED_ENGINES, FIBERS, |w| arm_freeze_after(w, 4)) {
+    for (engine, r) in freeze_thaw(ARMED_ENGINES, FIBERS, |w| {
+        arm_freeze_after(w, TEST_ARENA, 4)
+    }) {
         let mut fibers: Vec<_> = r
             .residue
             .fibers
@@ -724,7 +734,9 @@ fn a_fresh_fiber_and_a_free_slot_keep_their_places() {
 #[test]
 fn fresh_fibers_start_from_their_entries() {
     let frame_base = |slot| TEST_ARENA.frame_base(slot + 1);
-    for (engine, r) in freeze_thaw(ALL_ENGINES, FRESH, |w| write_state(w, STATE_UNWINDING)) {
+    for (engine, r) in freeze_thaw(ALL_ENGINES, FRESH, |w| {
+        write_state(w, TEST_ARENA, STATE_UNWINDING)
+    }) {
         let mut fibers: Vec<_> = r
             .residue
             .fibers
@@ -741,8 +753,12 @@ fn fresh_fibers_start_from_their_entries() {
 /// resume faults on the free slot.
 #[test]
 fn a_resume_whose_fiber_returned_reloads_its_result() {
-    freeze_thaw(ALL_ENGINES, RETURNS, |w| write_state(w, STATE_UNWINDING));
-    freeze_thaw(ARMED_ENGINES, RETURNS, |w| arm_freeze_after(w, 1));
+    freeze_thaw(ALL_ENGINES, RETURNS, |w| {
+        write_state(w, TEST_ARENA, STATE_UNWINDING)
+    });
+    freeze_thaw(ARMED_ENGINES, RETURNS, |w| {
+        arm_freeze_after(w, TEST_ARENA, 1)
+    });
 }
 
 /// And the case the re-issue is for: the fiber unwinds for the freeze inside the resume, so the thaw
@@ -750,7 +766,9 @@ fn a_resume_whose_fiber_returned_reloads_its_result() {
 /// fiber rides as residue there, not as a free slot.
 #[test]
 fn a_resume_whose_fiber_unwound_is_re_issued() {
-    freeze_thaw(ALL_ENGINES, UNWINDS, |w| write_state(w, STATE_UNWINDING));
+    freeze_thaw(ALL_ENGINES, UNWINDS, |w| {
+        write_state(w, TEST_ARENA, STATE_UNWINDING)
+    });
 }
 
 /// #1872: each context's chain is deeper than a default region, so with 4 KiB regions the freeze
@@ -766,14 +784,16 @@ fn chains_deeper_than_a_default_region_freeze_in_wider_regions() {
     );
     for &engine in ALL_ENGINES {
         let mut win = init_durable_window(WINDOW, arena(&inst));
-        write_state(&mut win, STATE_UNWINDING);
+        write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
         if let Some(frozen) = run(engine, &inst, &win, 42, None) {
             assert!(frozen.result.is_err(), "{engine:?}: {:?}", frozen.result);
         }
     }
 
     let a = arena(&instrument(DEEP));
-    for (engine, r) in freeze_thaw(ALL_ENGINES, DEEP, |w| write_state(w, STATE_UNWINDING)) {
+    for (engine, r) in freeze_thaw(ALL_ENGINES, DEEP, |w| {
+        write_state(w, TEST_ARENA, STATE_UNWINDING)
+    }) {
         // Both chains unwound whole, each past what a default region holds.
         let depth = |sp: u64, ctx: usize| sp - a.frame_base(ctx);
         let fiber = r
@@ -792,5 +812,54 @@ fn chains_deeper_than_a_default_region_freeze_in_wider_regions() {
             u64::from_le_bytes(r.window[at..at + 8].try_into().unwrap())
         });
         assert!(depth(root, 0) > DEFAULT_SHADOW_STRIDE, "{engine:?}: root");
+    }
+}
+
+/// The root stores its clock handle, spawns B (func 2: the clock + 10) and joins it, then adds its own
+/// clock read. `END` is the end of its arena.
+const SPAWNS_B: &str = r#"memory 17 shadow 16448 END
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 65536
+  i32.store v1 v0
+  v2 = i64.const 0
+  v3 = thread.spawn 2 v2 v2
+  v4 = thread.join v3
+  v5 = i32.const 0
+  v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
+  v7 = i64.add v4 v6
+  return v7
+  }
+}
+"#;
+
+/// #2543 — a spawned vCPU of a durable domain takes a shadow context of its own on every engine: an
+/// arena with room for the root alone refuses the spawn (`ThreadFault`), and one with a second region
+/// runs it. The JIT used to run such a spawn with no context of its own whenever its run had no freeze
+/// controller.
+#[test]
+fn a_durable_spawn_takes_a_context_of_its_own_on_every_engine() {
+    for (regions, want) in [(1, None), (2, Some(42 + 10 + 43))] {
+        let end = 16448 + regions * DEFAULT_SHADOW_STRIDE;
+        let inst = instrument(&format!(
+            "{}{THREADS}",
+            SPAWNS_B.replace("END", &end.to_string())
+        ));
+        for &engine in ARMED_ENGINES {
+            let fresh = init_durable_window(WINDOW, arena(&inst));
+            let Some(ran) = run(engine, &inst, &fresh, 42, None) else {
+                continue;
+            };
+            match want {
+                Some(v) => assert_eq!(ran.result, Ok(v), "{engine:?}: {regions} regions"),
+                None => assert!(
+                    ran.result
+                        .as_ref()
+                        .is_err_and(|e| e.contains("ThreadFault")),
+                    "{engine:?}: {regions} region: {:?}",
+                    ran.result
+                ),
+            }
+        }
     }
 }

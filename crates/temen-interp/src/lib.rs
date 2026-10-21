@@ -1182,6 +1182,9 @@ impl GuestMem for RecordingMem<'_> {
     fn region_page_size(&self) -> i64 {
         self.inner.region_page_size()
     }
+    fn shadow(&self) -> ShadowArena {
+        self.inner.shadow()
+    }
 }
 
 impl Inspector {
@@ -6467,7 +6470,7 @@ struct Sched {
     /// `svc.wait`, it promotes each parked vCPU's window to `UNWINDING` and re-admits it: the
     /// re-executed `svc.wait` observes the freeze and takes the 4b sentinel, so the domain unwinds
     /// and quiesces instead of the run hanging. One-shot (cleared on fire). Set at run setup from
-    /// the window's arm-quiesce flag ([`ARM_QUIESCE_OFF`]). Holds the run root's powerbox while armed:
+    /// the window's arm-quiesce flag ([`ShadowArena::quiesce_flag`]). Holds the run root's powerbox while armed:
     /// the census runs before the freeze fires, and a decline is recorded there (#1918).
     freeze_on_quiesce: Option<Arc<Mutex<Host>>>,
     /// #1584 — some vCPU of this run has finished by **unwinding for a freeze**. From then on the
@@ -8886,8 +8889,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             }
         }
         // Durable multi-vCPU (DURABILITY.md §12.8 slice 3.2.1): swap THIS vCPU's per-context durable words
-        // into the **shared** window before it runs — the state word ([`STATE_OFF`]) and the active
-        // shadow-SP ([`SHADOW_SP_OFF`]). The freeze/thaw runs single-worker, so the one shared pair is each
+        // into the **shared** window before it runs — the arena's freeze word and the active
+        // shadow-SP word. The freeze/thaw runs single-worker, so the one shared pair is each
         // vCPU's own context, swapped per dispatch: the shadow-SP points unwind/rewind at this vCPU's region
         // (`context = task id`), and the state word is this vCPU's own freeze phase — vital because a
         // rewinding vCPU flips the word to `NORMAL` after reloading, which must not disturb a sibling still
@@ -10691,61 +10694,43 @@ impl SchedDriver {
 // declaration (`Memory::shadow`, carried by this window's `Mem`). The root computation is context 0; a `cont.new`-created
 // fiber in registry slot `s` is context `s + 1`.
 
-/// Freeze **armed**: the deterministic mid-run freeze trigger. The runtime counts down
-/// [`ARM_COUNTDOWN_OFF`] at each safepoint and promotes the word to `UNWINDING` at 0; transparent to
-/// the instrumented IR (which tests only `UNWINDING`/`REWINDING`). Must equal `temen_durable::STATE_ARMED`.
+/// Freeze **armed**: the deterministic mid-run freeze trigger. The runtime counts down one of the
+/// arena's two arm countdowns ([`ShadowArena::fiber_countdown`], [`ShadowArena::backedge_countdown`])
+/// and promotes the freeze word to `UNWINDING` at 0; transparent to the instrumented IR (which tests
+/// only `UNWINDING`/`REWINDING`). Must equal `temen_durable::STATE_ARMED`.
 pub use temen_ir::durable_abi::STATE_ARMED;
-/// State-word values (must equal `temen_durable::STATE_*`). Only `UNWINDING` is read by the runtime
-/// today (the freeze-driver trigger); the others are maintained entirely by the instrumented IR.
+/// State-word values (must equal `temen_durable::STATE_*`): the arena's freeze word
+/// ([`ShadowArena::freeze_word`]) holds `NORMAL`/`UNWINDING`/`ARMED`, each context's thaw word
+/// `NORMAL`/`REWINDING`.
 pub use temen_ir::durable_abi::STATE_NORMAL;
-/// Window byte offset of the `i32` durable **state word** (`NORMAL | UNWINDING | REWINDING`).
-/// The freeze driver reads it to tell a freeze (UNWINDING) run from an ordinary one. Must equal
-/// `temen_durable::STATE_OFF`.
-pub use temen_ir::durable_abi::STATE_OFF;
 pub use temen_ir::durable_abi::STATE_REWINDING;
 pub use temen_ir::durable_abi::STATE_UNWINDING;
 
-/// §12.8 4A.7 (parked-vCPU / `Blocking.work` latency). Reads the global durable **freeze** word at
-/// [`STATE_OFF`] from the live window image: `true` iff an async stop-the-world freeze has already
-/// landed ([`STATE_UNWINDING`]). A durable vCPU about to enter a host `Blocking` call consults this and
-/// fails **closed** rather than starting an un-checkpointable, latency-unbounded offload (R6); cancelling
-/// an *already in-flight* call is deferred (R2). `false` for a non-durable / malformed window (no word),
-/// so the caller also gates on [`Host::is_durable`].
+/// §12.8 4A.7 (parked-vCPU / `Blocking.work` latency). Reads the window's freeze word
+/// ([`ShadowArena::freeze_word`]) from the live window image: `true` iff an async stop-the-world
+/// freeze has already landed ([`STATE_UNWINDING`]). A durable vCPU about to enter a host `Blocking`
+/// call consults this and fails **closed** rather than starting an un-checkpointable,
+/// latency-unbounded offload (R6); cancelling an *already in-flight* call is deferred (R2). `false`
+/// for a window whose module declared no arena, which has no freeze word (#2518), and for a
+/// malformed one, so the caller also gates on [`Host::is_durable`].
 fn freeze_has_landed(mem: Option<&dyn GuestMem>) -> bool {
-    mem.and_then(|m| m.read_bytes(STATE_OFF, 4))
+    mem.and_then(|m| m.read_bytes(m.shadow().freeze_word()?, 4))
         .and_then(|b| <[u8; 4]>::try_from(b.as_slice()).ok())
         .map(|b| i32::from_le_bytes(b) == STATE_UNWINDING)
         .unwrap_or(false)
 }
-/// Window byte offset of the `i64` **back-edge arm countdown** (loop back-edges left before an
-/// `ARMED` run promotes to `UNWINDING`, so a loop-header poll begins the freeze). Decremented at each
-/// branch terminator; inert unless `ARMED` and the slot is positive. Must equal
-/// `temen_durable::ARM_BACKEDGE_OFF`.
-pub use temen_ir::durable_abi::ARM_BACKEDGE_OFF;
-/// Window byte offset of the `i64` **arm countdown** (safepoints left before an `ARMED` run promotes
-/// to `UNWINDING`). Decremented by the runtime at each safepoint; inert unless `ARMED`. Must equal
-/// `temen_durable::ARM_COUNTDOWN_OFF`.
-pub use temen_ir::durable_abi::ARM_COUNTDOWN_OFF;
-/// Window byte offset of the `i8` **freeze-on-quiesce** flag (DURABILITY.md §13.4 slice 4c-bis):
-/// non-zero arms the runtime to freeze the instant the run would otherwise block on
-/// `svc.wait`-parked consumers only. Read once at run setup into [`Sched::freeze_on_quiesce`].
-/// Must equal `temen_durable::ARM_QUIESCE_OFF`.
-pub use temen_ir::durable_abi::ARM_QUIESCE_OFF;
+/// The shadow arena: where every durable-runtime word sits — the per-context regions, and the
+/// arena's control words in context 0's region header (one definition of placement).
+pub use temen_ir::durable_abi::ShadowArena;
 /// The region stride an arena declares unless it names its own: context `i` occupies
 /// `[ShadowArena::region_base(i), +stride)`, 4 KiB by default. The transform's shadow-overflow
 /// guard bounds each push by the arena's stride (#1683), so a context recursed deeper than one
 /// region traps the freeze instead of writing its neighbour's frames; a module whose chains run
 /// deeper declares a wider stride (#1872).
 pub use temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE;
-/// The legacy global shadow-SP word's slot in the fixed control block — **unused since §12.8
-/// 4A.5** (each context's SP word is the first 8 bytes of its own region); kept as a reserved ABI
-/// offset. Must equal `temen_durable::SHADOW_SP_OFF`.
-pub use temen_ir::durable_abi::SHADOW_SP_OFF;
-/// The shadow arena: where the per-context shadow regions sit (one definition of placement).
-pub use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END};
 
-/// §12.8 concurrent-thaw stage 1: bytes reserved at a region's base before its frames — the SP word
-/// plus the 4-byte thaw word, padded to 8 to keep frames 8-aligned. Must equal
+/// §12.8 concurrent-thaw stage 1: bytes reserved at a region's base before its frames — the SP word,
+/// the thaw and re-issue words, and in context 0's the arena's control words (#2518). Must equal
 /// `temen_durable::REGION_HEADER_LEN`.
 pub use temen_ir::durable_abi::REGION_HEADER_LEN;
 use temen_ir::durable_abi::REISSUE_IN_REGION_OFF;
@@ -10755,8 +10740,8 @@ use temen_ir::durable_abi::REISSUE_IN_REGION_OFF;
 pub use temen_ir::durable_abi::SHADOW_SP_WORD_LEN;
 /// §12.8 concurrent-thaw stage 1: byte offset of a context's **thaw** state word (`REWINDING`/`NORMAL`)
 /// within its region — just past the [`SHADOW_SP_WORD_LEN`]-byte SP word, addressed via
-/// `durable.shadow_base` (like the SP word). The **freeze** word (`UNWINDING`) stays at the global
-/// [`STATE_OFF`]. Must equal `temen_durable::STATE_IN_REGION_OFF`.
+/// `durable.shadow_base` (like the SP word). The **freeze** word (`UNWINDING`) is the arena's one
+/// ([`ShadowArena::freeze_word`]). Must equal `temen_durable::STATE_IN_REGION_OFF`.
 pub use temen_ir::durable_abi::STATE_IN_REGION_OFF;
 
 /// Bits a fiber **guest handle** reserves for the registry slot; the rest carry a **generation**
@@ -11841,7 +11826,7 @@ struct VCpu {
     /// active fibers without walking the shared registry on every call.
     parked_frames: usize,
     /// This run executes a **durable** (freeze/thaw-instrumented) module, so the runtime keeps the
-    /// active shadow-SP word ([`SHADOW_SP_OFF`]) pointing at the running context's per-fiber shadow
+    /// active shadow-SP word (its context's, at its region base) pointing at the running context's per-fiber shadow
     /// region, swapping it on every fiber switch (D-fiber-cont option A, DURABILITY.md §12.8). A
     /// non-durable run leaves this `false` and never touches the reserve. Set from
     /// [`Host::is_durable`] by `drive`, inherited by `thread.spawn` children.
@@ -11871,7 +11856,7 @@ struct VCpu {
     /// recycling). 0 for the root and every non-durable vCPU (nothing to free).
     vcpu_ctx: usize,
     /// This vCPU's **saved durable state word** (`NORMAL | UNWINDING | REWINDING`), swapped into the
-    /// shared window word ([`STATE_OFF`]) by the runtime when this vCPU runs and saved back when it
+    /// arena's freeze word ([`ShadowArena::freeze_word`]) by the runtime when this vCPU runs and saved back when it
     /// parks (slice 3.2.1). Multi-vCPU freeze/thaw run single-worker, so the one shared state word is
     /// each vCPU's *own* context, swapped per dispatch — essential because a rewinding vCPU flips the
     /// word to `NORMAL` after reloading, which must not disturb siblings still rewinding. A non-durable
@@ -12118,13 +12103,16 @@ struct ServeRun {
     replied: bool,
 }
 
+/// The module-declared shadow arena of the window `mem` ([`ShadowArena::EMPTY`] before a window
+/// exists or when the module declared none) — every placement question a vCPU asks goes through here.
+fn arena_of(mem: Option<&Mem>) -> ShadowArena {
+    mem.map_or(ShadowArena::EMPTY, Mem::shadow_arena)
+}
+
 impl VCpu {
-    /// This domain's module-declared shadow arena ([`ShadowArena::EMPTY`] before a window exists or
-    /// when the module declared none) — every placement question a vCPU asks goes through here.
+    /// This domain's arena ([`arena_of`] its window).
     fn arena(&self) -> ShadowArena {
-        self.mem
-            .as_ref()
-            .map_or(ShadowArena::EMPTY, |m| m.shadow_arena())
+        arena_of(self.mem.as_ref())
     }
     /// A fresh vCPU whose root frame is `funcs[entry](args)`. A bad `entry` is caught by the driver's
     /// first block lookup ([`Trap::Malformed`]), so construction is infallible.
@@ -12142,6 +12130,9 @@ impl VCpu {
         sched: SchedRef,
         dt: Arc<DomainTable>,
     ) -> VCpu {
+        // A fresh root starts at its window's empty root extent; a run that resumes a frozen root
+        // re-seeds it from the artifact.
+        let root_shadow_sp = arena_of(mem.as_ref()).frame_base(0);
         VCpu {
             funcs,
             types,
@@ -12160,7 +12151,7 @@ impl VCpu {
             below: Vec::new(),
             parked_frames: 0,
             durable: false,
-            root_shadow_sp: ShadowArena::EMPTY.frame_base(0), // re-seeded from the window at run setup
+            root_shadow_sp,
             durable_sp_ctx: 0,
             frozen: Vec::new(),
             spawn_residue: None,
@@ -12319,6 +12310,9 @@ impl VCpu {
         depth: u32,
         sched: SchedRef,
     ) -> VCpu {
+        // A fresh root starts at its window's empty root extent; a run that resumes a frozen root
+        // re-seeds it from the artifact.
+        let root_shadow_sp = arena_of(mem.as_ref()).frame_base(0);
         VCpu {
             funcs: parent,
             types: parent_types,
@@ -12337,7 +12331,7 @@ impl VCpu {
             below: Vec::new(),
             parked_frames: 0,
             durable: false,
-            root_shadow_sp: ShadowArena::EMPTY.frame_base(0), // re-seeded from the window at run setup
+            root_shadow_sp,
             durable_sp_ctx: 0,
             frozen: Vec::new(),
             spawn_residue: None,
@@ -17101,7 +17095,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             return Err(Trap::ThreadFault);
         }
         // Back-edge freeze trigger (DURABILITY.md Phase-4 Slice A): on a durable run armed for
-        // back-edges (`ARM_BACKEDGE_OFF`), count down at each branch terminator and promote to
+        // back-edges (the arena's back-edge countdown), count down at each branch terminator and promote to
         // `UNWINDING` at 0 so the next loop-header poll begins the freeze — reaching a poll-free
         // compute loop that the fiber-safepoint countdown cannot. Inert unless armed; gated on
         // `durable` so an ordinary run is untouched (byte-identical).
@@ -19484,6 +19478,13 @@ pub trait GuestMem {
     fn region_page_size(&self) -> i64 {
         host_region_granularity() as i64
     }
+
+    /// #2518 — the shadow arena the module in this window declared (INVARIANTS.md #16), which holds
+    /// every word the durable runtime keeps there, the freeze word a host op checks included.
+    /// [`ShadowArena::EMPTY`], holding none, for a window without one (the default).
+    fn shadow(&self) -> ShadowArena {
+        ShadowArena::EMPTY
+    }
 }
 
 /// §4/§7 a JIT cap-path window **page map**: host page index → its state (absent ⇒ region default).
@@ -21604,6 +21605,23 @@ impl PoolShared {
 /// it when an answer posts, while a driver waits on it ([`Completions::wait_any`]).
 pub(crate) type Bell = Arc<(Mutex<u64>, Condvar)>;
 
+/// Ring `bell` once: count the ring, and wake whoever waits on it.
+pub(crate) fn ring(bell: &Bell) {
+    *bell.0.lock_unpoisoned() += 1;
+    bell.1.notify_all();
+}
+
+/// The hook a store calls each time an answer posts ([`Completions::set_notify`]): ring `bell`, for
+/// as long as it lasts.
+pub(crate) fn ring_on_answer(bell: &Bell) -> Arc<dyn Fn() + Send + Sync> {
+    let bell = Arc::downgrade(bell);
+    Arc::new(move || {
+        if let Some(bell) = bell.upgrade() {
+            ring(&bell);
+        }
+    })
+}
+
 /// Wait on `bell` until it rings past count `seen`, or for at most `within`: whether it rang.
 pub(crate) fn wait_for_ring(bell: &Bell, seen: u64, within: Option<std::time::Duration>) -> bool {
     let (rung, cv) = &**bell;
@@ -21894,13 +21912,7 @@ impl Completions {
             }
         };
         for (comps, _) in calls {
-            let bell = Arc::downgrade(bell);
-            comps.set_notify(Some(Arc::new(move || {
-                if let Some(bell) = bell.upgrade() {
-                    *bell.0.lock_unpoisoned() += 1;
-                    bell.1.notify_all();
-                }
-            })));
+            comps.set_notify(Some(ring_on_answer(bell)));
         }
         let arrived = |(comps, id): &(Arc<Completions>, u64)| {
             comps.mx.lock_unpoisoned().ready.contains_key(id)
@@ -35305,27 +35317,34 @@ impl Mem {
         let _ = self.write_bytes_impl(sp_word, &sp.to_le_bytes());
     }
 
-    /// The durable state word at [`STATE_OFF`] (the freeze driver's trigger). `STATE_NORMAL` if the
-    /// word's page is somehow uncommitted (a non-durable / malformed window).
+    /// The arena's freeze word ([`ShadowArena::freeze_word`], the freeze driver's trigger).
+    /// `STATE_NORMAL` for a window whose module declared no arena, which has none (#2518), or if the
+    /// word's page is somehow uncommitted (a malformed window).
     fn durable_state(&self) -> i32 {
-        self.read_bytes_impl(STATE_OFF, 4)
+        self.shadow
+            .freeze_word()
+            .and_then(|at| self.read_bytes_impl(at, 4))
             .and_then(|b| b.try_into().ok())
             .map(i32::from_le_bytes)
             .unwrap_or(STATE_NORMAL)
     }
 
     /// DURABILITY.md §13.4 slice 4c-bis — the `i8` **freeze-on-quiesce** arm flag at
-    /// [`ARM_QUIESCE_OFF`] (non-zero ⇒ armed). Read once at run setup.
+    /// [`ShadowArena::quiesce_flag`] (non-zero ⇒ armed). Read once at run setup.
     fn durable_freeze_on_quiesce(&self) -> bool {
-        self.read_bytes_impl(ARM_QUIESCE_OFF, 1)
+        self.shadow
+            .quiesce_flag()
+            .and_then(|at| self.read_bytes_impl(at, 1))
             .map(|b| b[0] != 0)
             .unwrap_or(false)
     }
 
-    /// Set the global durable **freeze** word at [`STATE_OFF`] (`UNWINDING`/`ARMED`/`NORMAL`) — the
-    /// stop-the-world trigger every poll reads.
+    /// Set the arena's **freeze** word (`UNWINDING`/`ARMED`/`NORMAL`) — the stop-the-world trigger
+    /// every poll reads. A no-op for a window with no arena, which nothing in can poll.
     fn durable_set_state(&mut self, state: i32) {
-        let _ = self.write_bytes_impl(STATE_OFF, &state.to_le_bytes());
+        if let Some(at) = self.shadow.freeze_word() {
+            let _ = self.write_bytes_impl(at, &state.to_le_bytes());
+        }
     }
 
     /// Read context `ctx`'s per-context **thaw** state word (`REWINDING`/`NORMAL`) at
@@ -35356,7 +35375,7 @@ impl Mem {
 
     /// Load a vCPU's unified durable phase from the two words it is split across (§12.8 concurrent-thaw
     /// stage 1): context `ctx`'s per-context **thaw** word while it is `REWINDING` — a rewind is the
-    /// context's own — else the global **freeze** word ([`STATE_OFF`]: `UNWINDING`/`ARMED`/`NORMAL`),
+    /// context's own — else the arena's **freeze** word (`UNWINDING`/`ARMED`/`NORMAL`),
     /// the run's. So a thawed run armed for a second freeze rewinds first, its arm intact (#2044).
     /// Mirror of [`Self::durable_store_dstate`].
     fn durable_load_dstate(&self, ctx: usize) -> i32 {
@@ -35381,20 +35400,20 @@ impl Mem {
     }
 
     /// Tick the **mid-run freeze trigger** at a fiber safepoint (`cont.resume`/`suspend`): if the run
-    /// is `STATE_ARMED`, decrement the arm countdown at [`ARM_COUNTDOWN_OFF`] and, when it reaches 0,
+    /// is `STATE_ARMED`, decrement the arena's fiber-safepoint countdown and, when it reaches 0,
     /// promote the state word to `UNWINDING` — so the safepoint's trailing poll begins the freeze. A
     /// no-op unless armed (the common case: one `i32` read per safepoint, no write), so an unarmed run
     /// is byte-identical. Call once per fiber safepoint — see the `run_inner` dispatch.
     fn durable_tick_arm(&mut self) -> bool {
-        self.durable_tick_countdown(ARM_COUNTDOWN_OFF)
+        self.durable_tick_countdown(self.shadow.fiber_countdown())
     }
 
-    /// Back-edge variant (Phase-4 Slice A): on an `ARMED` run, count down [`ARM_BACKEDGE_OFF`] at
+    /// Back-edge variant (Phase-4 Slice A): on an `ARMED` run, count down the arena's back-edge one at
     /// each branch terminator and promote to `UNWINDING` at 0, so the next loop-header poll begins
     /// the freeze — reaching a poll-free compute loop. Inert unless armed for back-edges (the slot
     /// is positive), so a fiber-armed or ordinary run is byte-identical. Call at branch terminators.
     fn durable_tick_arm_backedge(&mut self) -> bool {
-        self.durable_tick_countdown(ARM_BACKEDGE_OFF)
+        self.durable_tick_countdown(self.shadow.backedge_countdown())
     }
 
     /// Decrement the countdown at `off` on an `ARMED` run and promote to `UNWINDING` at 0. Guarded
@@ -35402,7 +35421,10 @@ impl Mem {
     /// interfere: arming one leaves the other at 0, where this is a no-op. An unarmed run is one
     /// `i32` state read, no write. `true` exactly when this tick fired the trigger — the moment the
     /// freeze census (#1671) runs.
-    fn durable_tick_countdown(&mut self, off: u64) -> bool {
+    fn durable_tick_countdown(&mut self, countdown: Option<u64>) -> bool {
+        let Some(off) = countdown else {
+            return false; // no arena: nothing armed it
+        };
         if self.durable_state() != STATE_ARMED {
             return false;
         }
@@ -36066,6 +36088,9 @@ impl GuestMem for Mem {
     fn page_size(&self) -> i64 {
         self.page as i64
     }
+    fn shadow(&self) -> ShadowArena {
+        self.shadow
+    }
 }
 
 /// The bytecode engine's view of its [`Mem`], which it hands to every host call (#2109). The call's
@@ -36130,6 +36155,9 @@ impl GuestMem for SoleMem<'_> {
     }
     fn region_page_size(&self) -> i64 {
         self.0.region_page_size()
+    }
+    fn shadow(&self) -> ShadowArena {
+        self.0.shadow()
     }
 }
 

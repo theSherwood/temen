@@ -76,7 +76,7 @@ fn freeze_serialize_restore_thaw_equals_uninterrupted_run() {
     host.clock_ns = 42; // same initial conditions as the baseline
     let clk = host.grant_clock();
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let mut fuel = 100_000u64;
     let (frozen, snapshot) = run_capture_reserved_with_host(
         &inst,
@@ -94,7 +94,7 @@ fn freeze_serialize_restore_thaw_equals_uninterrupted_run() {
         "freeze returns a placeholder"
     );
     assert_eq!(
-        read_state(&snapshot),
+        read_state(&snapshot, TEST_ARENA),
         STATE_UNWINDING,
         "state word is still UNWINDING in the artifact (the stack unwound, not completed)"
     );

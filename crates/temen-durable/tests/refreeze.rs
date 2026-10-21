@@ -14,7 +14,7 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use temen_durable::{
-    begin_thaw, init_durable_window, read_state, transform_module, STATE_OFF, STATE_UNWINDING,
+    begin_thaw, init_durable_window, read_state, transform_module, STATE_UNWINDING,
 };
 use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
 use temen_ir::Memory;
@@ -72,7 +72,11 @@ fn run(
             let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
             if Some(n) == freeze_on {
                 let mem = mem.expect("a window");
-                mem.write_bytes(STATE_OFF, &STATE_UNWINDING.to_le_bytes())
+                let word = mem
+                    .shadow()
+                    .freeze_word()
+                    .expect("the module declares its arena");
+                mem.write_bytes(word, &STATE_UNWINDING.to_le_bytes())
                     .expect("the freeze word is mapped");
             }
             Ok(vec![made + n])
@@ -104,7 +108,7 @@ fn a_freeze_beneath_a_thaws_reissued_call_unwinds_the_caller_again() {
         Ok(vec![Value::I64(0)]),
         "the first freeze unwinds both frames"
     );
-    assert_eq!(read_state(&first), STATE_UNWINDING);
+    assert_eq!(read_state(&first, TEST_ARENA), STATE_UNWINDING);
 
     // Its thaw: `outer` re-issues its call, `inner` reloads its first answer and makes its second
     // call, which freezes — beneath `outer`'s re-issued call, which must unwind too.
@@ -116,7 +120,7 @@ fn a_freeze_beneath_a_thaws_reissued_call_unwinds_the_caller_again() {
         Ok(vec![Value::I64(0)]),
         "the second freeze unwinds `outer` again, not runs it on with `inner`'s placeholder"
     );
-    assert_eq!(read_state(&second), STATE_UNWINDING);
+    assert_eq!(read_state(&second, TEST_ARENA), STATE_UNWINDING);
 
     // The second artifact holds both frames: its thaw finishes the uninterrupted run.
     let mut win = second;

@@ -131,7 +131,7 @@ fn freeze_serialize_restore_thaw_through_the_codec() {
     fhost.clock_ns = 42;
     let clk = fhost.grant_clock();
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let mut fuel = 100_000u64;
     let (frozen, snapshot) = run_capture_reserved_with_host(
         &inst,
@@ -232,7 +232,7 @@ fn a_detached_shaped_domains_attestation_survives_freeze_serialize_thaw() {
     fhost.set_attestation(attest);
     let clk = fhost.grant_clock();
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let mut fuel = 100_000u64;
     let (frozen, snapshot) = run_capture_reserved_with_host(
         &inst,
@@ -312,7 +312,7 @@ fn fiber_freeze_serialize_restore_thaw_through_the_codec() {
     let mut fhost = Host::new();
     fhost.set_durable(true);
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let mut fuel = 100_000u64;
     let (frozen, snapshot) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut fhost);
@@ -545,7 +545,7 @@ fn multivcpu_freeze_serialize_restore_thaw_through_the_codec() {
     fhost.clock_ns = 42;
     let clk = fhost.grant_clock();
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let mut fuel = 100_000u64;
     let (frozen, snapshot) = run_capture_reserved_with_host(
         &inst,
@@ -691,7 +691,7 @@ fn vcpu_and_fiber_freeze_serialize_restore_thaw_through_the_codec() {
     fhost.clock_ns = 42;
     let clk = fhost.grant_clock();
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let mut fuel = 100_000u64;
     let (frozen, snapshot) = run_capture_reserved_with_host(
         &inst,
@@ -758,7 +758,7 @@ fn fiber_residue_generation_round_trips_through_the_codec() {
     let mut fhost = Host::new();
     fhost.set_durable(true);
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let mut fuel = 100_000u64;
     let (frozen, snapshot) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut fhost);
@@ -860,7 +860,7 @@ fn recycled_fiber_freeze_serialize_restore_thaw_through_the_codec() {
     let mut fhost = Host::new();
     fhost.set_durable(true);
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after(&mut win, 3);
+    arm_freeze_after(&mut win, TEST_ARENA, 3);
     let mut fuel = 100_000u64;
     let (frozen, snapshot) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut fhost);
@@ -989,7 +989,7 @@ fn nested_spawn_tree_freeze_serialize_restore_thaw_through_the_codec() {
     fhost.clock_ns = 42;
     let clk = fhost.grant_clock();
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let mut fuel = 100_000u64;
     let (frozen, snapshot) = run_capture_reserved_with_host(
         &inst,
@@ -1221,7 +1221,7 @@ block 0 (vx: i64) {
     host.set_self_module(&inst);
     let ticket = host.svc_enqueue(0, 0, vec![41]).expect("enqueue");
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let mut fuel = 1_000_000u64;
     let (r, snap) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut host);
@@ -1315,7 +1315,7 @@ block 0 (vx: i64) {
     host.set_self_module(&inst);
     let ticket = host.svc_enqueue(0, 0, vec![41]).expect("enqueue");
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let mut fuel = 1_000_000u64;
     let (r1, snap1) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut host);
@@ -1456,7 +1456,7 @@ fn a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked() {
     .map(Value::I32);
     h.grant_freeze_authority();
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_on_quiesce(&mut win);
+    arm_freeze_on_quiesce(&mut win, TEST_ARENA);
     let mut fuel = 5_000_000u64;
     let (r, snap) =
         run_capture_reserved_with_host(&inst, 0, &args, &mut fuel, &win, SIZE_LOG2, &mut h);

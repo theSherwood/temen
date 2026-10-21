@@ -114,7 +114,7 @@ mod os_thread_rt;
 pub use os_thread_rt::{
     outside_waker, park_host_call, region_canon_forget_window, region_canon_lookup,
     region_canon_new_owner, region_canon_record, wait_outside, wake_host_parks, wake_host_parks_in,
-    HostPark, Parks,
+    FreezeWatch, HostPark, Parks,
 };
 
 /// F3 (FIBER_PARK.md): whether a guest fiber is the current continuation on this OS thread —
@@ -1635,8 +1635,8 @@ pub fn compile_and_run_capture_reserved_with_host_prots(
 
 /// An async **freeze controller** (DURABILITY.md Phase-4 Slice A, 4A.3): a caller-owned handle a
 /// *controller thread* uses to request a stop-the-world freeze of an in-flight durable JIT run. The
-/// run publishes its live window base here once the window is mapped ([`CompiledModule::run`]);
-/// [`Self::request_freeze`] then stores `UNWINDING` into the window's state word, which the guest's
+/// run publishes its live window's freeze word here once the window is mapped ([`CompiledModule::run`]);
+/// [`Self::request_freeze`] then stores `UNWINDING` into it, which the guest's
 /// loop-header back-edge poll (4A.1) observes at its next iteration and begins unwinding — closing
 /// the R6 latency caveat for a poll-free compute loop with no deterministic countdown.
 ///
@@ -1646,85 +1646,85 @@ pub fn compile_and_run_capture_reserved_with_host_prots(
 ///
 /// # Lifetime
 /// [`Self::request_freeze`] may be called at any time; only the first call stores. Its store and the run's
-/// [`Self::retire`] exclude each other through `base` (a request holds [`STORING`] across its store;
+/// [`Self::retire`] exclude each other through `word` (a request holds [`STORING`] across its store;
 /// retire waits it out), so the store only ever lands in a live window, and a request after the run
-/// ended is a no-op. A request that lands after the guest's last poll but before retire freezes
-/// nothing: the run sees it at retire and treats it as never made (see [`CompiledModule::run`]).
+/// ended is a no-op. A run of a module with no arena has no freeze word (#2518): nothing in it polls,
+/// so nothing can stop it mid-run, and its controller is retired from the start. A request that lands
+/// after the guest's last poll but before retire freezes nothing: the run sees it at retire and treats
+/// it as never made (see [`CompiledModule::run`]).
 pub struct FreezeController {
-    /// `0` = window not live yet (spin); a live window base; [`STORING`] while a request writes;
-    /// [`LANDED`] once it wrote; [`RETIRED`] once the run ended.
-    base: AtomicUsize,
+    /// `0` = window not live yet (spin); the address of a live window's freeze word; [`STORING`]
+    /// while a request writes; [`LANDED`] once it wrote; [`RETIRED`] once the run ended.
+    word: AtomicUsize,
 }
 
-/// Store `UNWINDING` into the durable state word of the window at `base` — what a request does to the
-/// run's window.
+/// Store `UNWINDING` into the freeze word at `word` — what a request does to the run's window.
 ///
 /// # Safety
-/// `base` is a live durable window: `base + STATE_OFF` is in its committed RW control region.
-unsafe fn ring(base: usize) {
-    // The durable state word lives at `base + STATE_OFF` (STATE_OFF relocated above the #1094 NULL
-    // guard). STATE_UNWINDING = 1 (must match `temen-interp` / `temen-durable`). An aligned atomic i32
-    // store the guest's back-edge poll loads (defined under §12 races).
-    let state = base + temen_ir::durable_abi::STATE_OFF as usize;
-    (*(state as *const AtomicI32)).store(1, Ordering::Release);
+/// `word` is a live durable window's freeze word, in the arena its module declared and the verifier
+/// bounded into the window.
+unsafe fn ring(word: usize) {
+    // An aligned atomic i32 store the guest's back-edge poll loads (defined under §12 races).
+    (*(word as *const AtomicI32)).store(temen_ir::durable_abi::STATE_UNWINDING, Ordering::Release);
 }
 
-/// [`FreezeController::base`] while a request's store is in flight.
+/// [`FreezeController::word`] while a request's store is in flight.
 const STORING: usize = usize::MAX - 2;
-/// [`FreezeController::base`] once a request's store has landed.
+/// [`FreezeController::word`] once a request's store has landed.
 const LANDED: usize = usize::MAX - 1;
-/// [`FreezeController::base`] once the run has ended.
+/// [`FreezeController::word`] once the run has ended.
 const RETIRED: usize = usize::MAX;
 
 impl FreezeController {
     /// A fresh controller, shareable with a run and a controller thread.
     pub fn new() -> Arc<Self> {
         Arc::new(FreezeController {
-            base: AtomicUsize::new(0),
+            word: AtomicUsize::new(0),
         })
     }
 
-    /// Request a freeze: spin until the run publishes its window base, then store `UNWINDING` into the
-    /// state word. A no-op if the run already ended or another request got there first.
+    /// Request a freeze: spin until the run publishes its window's freeze word, then store
+    /// `UNWINDING` into it. A no-op if the run already ended or another request got there first.
     pub fn request_freeze(&self) {
         loop {
-            match self.base.load(Ordering::Acquire) {
+            match self.word.load(Ordering::Acquire) {
                 0 => std::hint::spin_loop(),          // window not mapped yet
                 STORING | LANDED | RETIRED => return, // another request has it, or the run ended
-                base => {
+                word => {
                     if self
-                        .base
-                        .compare_exchange(base, STORING, Ordering::AcqRel, Ordering::Acquire)
+                        .word
+                        .compare_exchange(word, STORING, Ordering::AcqRel, Ordering::Acquire)
                         .is_err()
                     {
                         continue; // retired meanwhile: the next load says so
                     }
-                    // SAFETY: `base` was the live window and `retire` cannot complete while this
+                    // SAFETY: `word` was the live window's and `retire` cannot complete while this
                     // request holds `STORING`, so the window is mapped.
-                    unsafe { ring(base) };
-                    self.base.store(LANDED, Ordering::Release);
+                    unsafe { ring(word) };
+                    self.word.store(LANDED, Ordering::Release);
                     return;
                 }
             }
         }
     }
 
-    /// Run-side: publish the live window base (the run is now blocked in the guest).
-    fn publish(&self, base: usize) {
-        self.base.store(base, Ordering::Release);
+    /// Run-side: publish the live window's freeze word (the run is now blocked in the guest), or
+    /// retire at once for a window with none, whose run no request can stop.
+    fn publish(&self, word: Option<usize>) {
+        self.word.store(word.unwrap_or(RETIRED), Ordering::Release);
     }
 
     /// Run-side: retire the base once the guest returns, so a later `request_freeze` is a no-op.
     /// Waits out a store in flight. `true` if a request's store landed.
     fn retire(&self) -> bool {
         loop {
-            let cur = self.base.load(Ordering::Acquire);
+            let cur = self.word.load(Ordering::Acquire);
             if cur == STORING {
                 std::hint::spin_loop();
                 continue;
             }
             if self
-                .base
+                .word
                 .compare_exchange(cur, RETIRED, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
@@ -1738,21 +1738,30 @@ impl FreezeController {
 mod freeze_controller_tests {
     use super::*;
 
-    const STATE: usize = temen_ir::durable_abi::STATE_OFF as usize;
-
-    fn window() -> Vec<AtomicI32> {
-        (0..STATE / 4 + 1).map(|_| AtomicI32::new(0)).collect()
+    /// A live window's freeze word, as a request reaches it.
+    fn word_of(w: &AtomicI32) -> Option<usize> {
+        Some(w as *const AtomicI32 as usize)
     }
 
     #[test]
     fn a_request_lands_in_the_live_window_and_retire_reports_it() {
-        let w = window();
+        let w = AtomicI32::new(0);
         let fc = FreezeController::new();
-        fc.publish(w.as_ptr() as usize);
+        fc.publish(word_of(&w));
         fc.request_freeze();
-        assert_eq!(w[STATE / 4].load(Ordering::Relaxed), 1, "UNWINDING stored");
+        assert_eq!(w.load(Ordering::Relaxed), 1, "UNWINDING stored");
         fc.request_freeze(); // a second request is a no-op
         assert!(fc.retire(), "retire reports the landed request");
+    }
+
+    /// #2518: a run whose window has no freeze word publishes none: a request returns at once and
+    /// lands nowhere.
+    #[test]
+    fn a_window_without_a_freeze_word_retires_its_controller_at_once() {
+        let fc = FreezeController::new();
+        fc.publish(None);
+        fc.request_freeze();
+        assert!(!fc.retire(), "nothing landed");
     }
 
     /// #1693: a run that fails before publishing its window (here a bad entry index) still retires
@@ -1792,13 +1801,13 @@ mod freeze_controller_tests {
 
     #[test]
     fn a_request_after_retire_stores_nothing() {
-        let w = window();
+        let w = AtomicI32::new(0);
         let fc = FreezeController::new();
-        fc.publish(w.as_ptr() as usize);
+        fc.publish(word_of(&w));
         assert!(!fc.retire(), "nothing landed");
         fc.request_freeze();
         assert_eq!(
-            w[STATE / 4].load(Ordering::Relaxed),
+            w.load(Ordering::Relaxed),
             0,
             "the retired window is untouched"
         );
@@ -2006,12 +2015,17 @@ impl ForkPoint<'_> {
     }
 }
 
-/// The window's global freeze word (`STATE_OFF`), read by the host between entries.
+/// The window's freeze word, read by the host between entries; `NORMAL` for a module with no arena,
+/// which has none (#2518).
 ///
 /// # Safety
-/// `base` is a live window whose backed prefix covers the durable control words.
-unsafe fn window_state(base: *mut u8) -> i32 {
-    (base.add(temen_ir::durable_abi::STATE_OFF as usize) as *const i32).read_unaligned()
+/// `base` is a live window of a module declaring `shadow`.
+unsafe fn window_state(base: *mut u8, shadow: temen_ir::durable_abi::ShadowArena) -> i32 {
+    shadow
+        .freeze_word()
+        .map_or(temen_ir::durable_abi::STATE_NORMAL, |w| {
+            (base.add(w as usize) as *const i32).read_unaligned()
+        })
 }
 
 /// #1768 — set a window frozen at a fork up to **rewind** its root with `reply` as the fork call's
@@ -2024,10 +2038,12 @@ unsafe fn window_state(base: *mut u8) -> i32 {
 /// `base` is a live window of a module declaring `shadow`, frozen at a fork (its root's deepest frame
 /// is the fork call's leaf), with nothing running on it.
 unsafe fn arm_fork_rewind(base: *mut u8, shadow: temen_ir::durable_abi::ShadowArena, reply: i64) {
-    use temen_ir::durable_abi::{STATE_NORMAL, STATE_OFF, STATE_REWINDING};
+    use temen_ir::durable_abi::{STATE_NORMAL, STATE_REWINDING};
     (base.add(shadow.leaf_reply(0) as usize) as *mut i64).write_unaligned(reply);
     (base.add(shadow.thaw_state_off(0) as usize) as *mut i32).write_unaligned(STATE_REWINDING);
-    (base.add(STATE_OFF as usize) as *mut i32).write_unaligned(STATE_NORMAL);
+    if let Some(w) = shadow.freeze_word() {
+        (base.add(w as usize) as *mut i32).write_unaligned(STATE_NORMAL);
+    }
 }
 
 /// How a durable JIT run is driven beyond its residue.
@@ -2038,10 +2054,9 @@ pub struct DurableRun {
     /// The thaw seed (empty on a freeze or an ordinary durable run).
     pub seed: DurableResidue,
     /// An async freeze controller (Phase-4 Slice A): a controller thread's
-    /// [`FreezeController::request_freeze`] lands mid-run. Its presence also engages the **concurrent**
-    /// durable path (§12.8 4A.5): a child spawned while `NORMAL` runs on its own OS thread with its own
-    /// reserved shadow context, so an async freeze reaches it in its own region — never the root's
-    /// (#1691: an async freeze without it unwound children into the root's region).
+    /// [`FreezeController::request_freeze`] lands mid-run. A child spawned while `NORMAL` runs on its
+    /// own OS thread with its own reserved shadow context, controller or not (#2543), so an async freeze
+    /// reaches it in its own region — never the root's (#1691).
     pub freeze: Option<Arc<FreezeController>>,
 }
 
@@ -2087,7 +2102,6 @@ pub fn compile_and_run_durable(
             tail: Vec::new(),
         });
         cm.set_durable(run.seed);
-        cm.concurrent_durable = run.freeze.is_some();
         cm.freeze_ctl = run.freeze;
         let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP))?;
         Ok((outcome, win, cm.take_durable_residue()))
@@ -2900,11 +2914,6 @@ pub struct CompiledModule {
     /// The module-declared shadow arena (INVARIANTS.md #16) — [`ShadowArena::EMPTY`] for a module
     /// that declared none, which a durable run refuses at entry rather than placing by default.
     shadow: temen_ir::durable_abi::ShadowArena,
-    /// §12.8 4A.5 stage (ii): engage the **concurrent** durable path — children spawned during NORMAL
-    /// run as real OS threads with their own reserved shadow contexts and self-unwind concurrently on a
-    /// freeze (vs. the single-worker deferred model). Set by the concurrent multi-vCPU interruptible
-    /// entry; `false` everywhere else, so those paths are byte-identical.
-    concurrent_durable: bool,
     /// Durable **thaw** seed (slice 3.3.3): frozen fibers to re-create in the table before a
     /// `REWINDING` run, so a thaw `cont.resume` re-enters them. Empty for a freeze / ordinary run.
     frozen_seed: Vec<FrozenFiber>,
@@ -3563,6 +3572,7 @@ impl CompiledModule {
                 epoch_addr as usize,
                 // Always stood up for a nesting module, above.
                 domain.as_deref(),
+                shadow,
             )
         });
         // temen#2168: the code loads the nursery from its instance's vmctx, as it loads the domain.
@@ -3984,7 +3994,6 @@ impl CompiledModule {
             tail_out: Vec::new(),
             durable: false,
             shadow,
-            concurrent_durable: false,
             frozen_seed: Vec::new(),
             frozen_out: Vec::new(),
             frozen_vcpus_out: Vec::new(),
@@ -4232,6 +4241,7 @@ impl CompiledModule {
                 self.resolve_module,
                 addrs.epoch as usize,
                 domain.as_deref(),
+                self.shadow,
             )
         });
         #[cfg(fiber_rt)]
@@ -4291,7 +4301,6 @@ impl CompiledModule {
             tail_out: Vec::new(),
             durable: false,
             shadow: self.shadow,
-            concurrent_durable: false,
             frozen_seed: Vec::new(),
             frozen_out: Vec::new(),
             frozen_vcpus_out: Vec::new(),
@@ -4780,6 +4789,7 @@ impl CompiledModule {
                     t.fiber_table.clone(), // the domain-shared table spawned vCPUs build over
                     t.instance.epoch as usize, // §5 kill-path: so parked vCPUs (futex/join) observe the interrupt
                     t.durable, // slice 3.3: run spawned children inline (single-worker) under a freeze/thaw
+                    t.shadow,  // #2518: where its freeze word is
                 );
             }
         }
@@ -4882,19 +4892,12 @@ impl CompiledModule {
         // `DURABLE_SHADOW_BASE`), so the root's instrumented code addresses its own per-context
         // shadow-SP word.
         durable_shadow::seed((*this).shadow.region_base(0));
-        // §12.8 4A.5 stage (ii): engage the concurrent durable path before the guarded call (where the
-        // root may `thread.spawn` children) so each child reserves its own shadow context.
-        #[cfg(fiber_rt)]
-        if (*this).concurrent_durable {
-            if let Some(d) = &(*this).domain {
-                d.engage_concurrent_durable();
-            }
-        }
         // Phase-4 Slice A (4A.3): publish the live window base for an async controller right before the
         // guarded call (the guest is about to block in its loop), and retire it right after — so a
         // `request_freeze` can only ever store into the window while it is mapped (freed below).
         if let Some(fc) = &(*this).freeze_ctl {
-            fc.publish(mem_base as usize);
+            let word = (*this).shadow.freeze_word();
+            fc.publish(word.map(|w| mem_base as usize + w as usize));
         }
         // D66 — the root vCPU takes a lane like any other task before it runs guest code, and gives
         // it back when its computation ends. Without this the root would be exempt from the cap its
@@ -4948,7 +4951,8 @@ impl CompiledModule {
                     && trap_cell.load(Ordering::Relaxed) == 0
                     && !(*this).durable
                     && (*this).fork_hook.is_some()
-                    && window_state(mem_base) == temen_ir::durable_abi::STATE_UNWINDING;
+                    && window_state(mem_base, (*this).shadow)
+                        == temen_ir::durable_abi::STATE_UNWINDING;
                 if !forked {
                     break faulted;
                 }
@@ -4992,9 +4996,11 @@ impl CompiledModule {
                     <= (*this).shadow.frame_base(0)
                 && (*this).domain.as_ref().is_none_or(|d| d.live_vcpus() == 1)
             {
-                let state = mem_base as usize + temen_ir::durable_abi::STATE_OFF as usize;
-                (*(state as *const AtomicI32))
-                    .store(temen_ir::durable_abi::STATE_NORMAL, Ordering::Release);
+                // A request landed, so the window has a freeze word: the published one.
+                if let Some(w) = (*this).shadow.freeze_word() {
+                    (*((mem_base as usize + w as usize) as *const AtomicI32))
+                        .store(temen_ir::durable_abi::STATE_NORMAL, Ordering::Release);
+                }
             }
             #[cfg(not(fiber_rt))]
             let _ = landed;
@@ -5018,7 +5024,10 @@ impl CompiledModule {
         // accumulated in the runtime by each fiber's `Complete` arm; drain it after driving — then the
         // deferred children run (`drive_frozen_spawns`).
         #[cfg(fiber_rt)]
-        if (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64) {
+        if (*this).durable
+            && !faulted
+            && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow)
+        {
             if let Some(rt) = (*this).fiber_rt.as_mut() {
                 let rt = &mut **rt as *mut fiber_rt::FiberRuntime;
                 fiber_rt::freeze_drive(rt, &vm as *const VmCtx as u64);
@@ -5069,8 +5078,9 @@ impl CompiledModule {
         // the parent window, so none may outlive it (mirrors the vCPU `join_all` just below).
         #[cfg(fiber_rt)]
         if let Some(n) = &(*this)._nursery {
-            let froze =
-                (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64);
+            let froze = (*this).durable
+                && !faulted
+                && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow);
             (*this).detached_out = n.join_children(froze);
         }
         // Join every spawned vCPU OS thread before freeing the window — no vCPU may outlive it.
@@ -5085,15 +5095,19 @@ impl CompiledModule {
             // returns promptly instead of hanging on a parked daemon. A durable **freeze** is not
             // teardown: the root unwound under `UNWINDING` and parked siblings return through the
             // freeze re-issue machinery (the sentinel is skipped so their residue is recorded).
-            let freezing =
-                (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64);
+            let freezing = (*this).durable
+                && !faulted
+                && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow);
             d.begin_teardown(freezing);
             d.join_all(true);
             // §12.8 4A.5 stage (ii): concurrent durable children self-unwound into their own regions
             // and recorded their `FrozenVCpu` residue before their OS threads ended; `join_all` is the
             // coordinator-wait (every child finished). Collect that residue now — after the join, so the
             // snapshot below captures a fully-quiesced window. No-op off the concurrent path.
-            if (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64) {
+            if (*this).durable
+                && !faulted
+                && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow)
+            {
                 (*this).frozen_vcpus_out.extend(d.take_frozen_vcpus());
                 // §12.8 4A.5 follow-up A: carry completed concurrent children's join results, so a
                 // `thread.join` of a child that finished before the freeze point resolves on thaw.
@@ -5108,7 +5122,10 @@ impl CompiledModule {
         // #1684 — every fiber slot nobody flattened rides too (a fresh one, a free one), so the thaw
         // rebuilds the table slot for slot. After `join_all`: no vCPU can still create a fiber.
         #[cfg(fiber_rt)]
-        if (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64) {
+        if (*this).durable
+            && !faulted
+            && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow)
+        {
             if let Some(rt) = (*this).fiber_rt.as_ref() {
                 let flattened: Vec<usize> = (*this).frozen_out.iter().map(|f| f.slot).collect();
                 let rest = rt.table().unflattened_for_freeze(&flattened);
@@ -7352,7 +7369,6 @@ fn compile_child_windowed(
         restore: None,
         tail_out: Vec::new(),
         durable: false,
-        concurrent_durable: false,
         frozen_seed: Vec::new(),
         frozen_out: Vec::new(),
         frozen_vcpus_out: Vec::new(),
@@ -8312,6 +8328,7 @@ fn nursery_over(
     resolve_module: Option<ModuleResolver>,
     epoch_addr: usize,
     domain: Option<&os_thread_rt::Domain>,
+    shadow: temen_ir::durable_abi::ShadowArena,
 ) -> Box<instantiator_rt::Nursery> {
     Box::new(instantiator_rt::Nursery::new(
         cap_thunk,
@@ -8320,6 +8337,7 @@ fn nursery_over(
         epoch_addr,
         domain.map_or(0, |d| d as *const os_thread_rt::Domain as usize),
         None, // the run's own child executor
+        shadow,
     ))
 }
 
@@ -8378,6 +8396,68 @@ fn build_fiber_call_trampoline(module: &mut JITModule, clif: &mut Function) {
     b.ins().return_(&[r]);
     b.seal_all_blocks();
     b.finalize();
+}
+
+/// #2537 — per-value stride of the setjmp save area. 16 bytes so one slot holds any scalar *or* a
+/// `v128` (SIMD) crossing value; a scalar uses the low bytes. setjmp is rare, so the slack is free.
+const SETJMP_SAVE_STRIDE: usize = 16;
+
+/// #2537 — save the guest values **live across a `setjmp`** to a reuse-immune explicit stackslot,
+/// returning the slot and the `(value-index, type)` list to reload after the call (or `None` when
+/// nothing crosses). The caller stores before the libc `_setjmp` call and reloads after it.
+///
+/// Why this is needed. `_setjmp` lowers to an ordinary CLIF `call`, and neither Cranelift nor
+/// regalloc2 has a returns-twice concept. A value live across the call gets a spill slot; the
+/// first-return (`longjmp`) path, which the explicit CFG shows dead-ending in `_longjmp` +
+/// `unreachable`, is free to reuse that slot. But `_longjmp` re-enters the setjmp frame — a hidden
+/// edge back to just after `_setjmp` — restoring callee-saved registers and `rsp` yet **not** the
+/// frame's spill slots, so re-entry would reload data the longjmp path clobbered (#2537: a verified
+/// module miscompiled, and — via an elided bounds check over a clobbered index — an I1/I2 escape).
+/// An **explicit** stackslot is never reused by regalloc and no guest op writes it, so it holds the
+/// pre-`setjmp` value on both returns.
+///
+/// The set saved is exactly the IR values referenced at or after the `setjmp` (the rest of this
+/// block's insts and its terminator's edge args) that were defined before it. The terminator's edge
+/// args are the load-bearing case: a value forwarded to a successor block crosses the `setjmp`, and
+/// the IR still carries it as an edge arg even where the CLIF lowering drops it (#2448). `ubs` is
+/// deliberately left untouched — a laundered value keeps its IR identity and proven bound, so an
+/// elided access reads the reuse-immune copy and cannot be driven out of window by a clobbered
+/// reload.
+fn launder_across_setjmp(
+    b: &mut FunctionBuilder,
+    blk: &Block,
+    inst_idx: usize,
+    vals: &[Value],
+) -> Option<(cranelift_codegen::ir::StackSlot, Vec<(usize, Type)>)> {
+    let defined = vals.len();
+    let mut live = std::collections::BTreeSet::new();
+    let mut note = |v: &u32| {
+        let i = *v as usize;
+        if i < defined {
+            live.insert(i);
+        }
+    };
+    for inst in &blk.insts[inst_idx + 1..] {
+        inst.for_each_operand(&mut note);
+    }
+    blk.term.for_each_operand(&mut note);
+    if live.is_empty() {
+        return None;
+    }
+    let saved: Vec<(usize, Type)> = live
+        .into_iter()
+        .map(|i| (i, b.func.dfg.value_type(vals[i])))
+        .collect();
+    let save = b.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        (saved.len() * SETJMP_SAVE_STRIDE) as u32,
+        4, // align 2^4 = 16, so a v128 slot is aligned
+    ));
+    for (k, &(i, _)) in saved.iter().enumerate() {
+        b.ins()
+            .stack_store(vals[i], save, (k * SETJMP_SAVE_STRIDE) as i32);
+    }
+    Some((save, saved))
 }
 
 /// Lower one IR block's body + terminator into its CLIF block.
@@ -8733,13 +8813,29 @@ fn lower_block(
         // trap-propagate.
         if let Inst::SetJmp { buf } = inst {
             let bufv = get(&vals, *buf)?; // i64 guest jmp_buf window address (the table key)
-                                          // slot = rt_setjmp_slot(rt_addr, buf) -> *mut jmp_buf
+                                          // #2537: save every guest value live across this setjmp to a
+                                          // reuse-immune explicit stackslot *before* the call; reloaded
+                                          // after it, so both returns (direct and via longjmp) read the
+                                          // saved copy, not a spill slot the longjmp path may clobber.
+            let laundered = launder_across_setjmp(b, blk, inst_idx, &vals);
+            // slot = rt_setjmp_slot(rt_addr, buf) -> *mut jmp_buf
             let rt_addr = vmctx_load(b, lower, vmctx::SETJMP);
             let c1 = call_host(module, b, HostFn::SetjmpSlot, &[rt_addr, bufv])?;
             let slot = b.inst_results(c1)[0];
             // r = _setjmp(slot) -> i32 — emitted inline in this JIT frame.
             let c2 = call_host(module, b, HostFn::Setjmp, &[slot])?;
-            vals.push(b.inst_results(c2)[0]);
+            let r = b.inst_results(c2)[0];
+            // #2537: reload the saved values and rewrite the value map to the reloaded copies, so every
+            // later use in this block — and every successor's forwarded use (which reads this block's
+            // final value map, #2448) — sources the value from the reuse-immune slot.
+            if let Some((save, saved)) = laundered {
+                for (k, &(i, ty)) in saved.iter().enumerate() {
+                    vals[i] = b
+                        .ins()
+                        .stack_load(ty, save, (k * SETJMP_SAVE_STRIDE) as i32);
+                }
+            }
+            vals.push(r);
             continue;
         }
         // `longjmp` (LLVM.md §"JIT `longjmp`"): look up the host `jmp_buf` slot for this `buf` (set by a

@@ -90,10 +90,10 @@ fn scheduled_run_parks_on_a_host_completed_cap_and_resumes() {
         "the submit hook filed the request under the surfaced id"
     );
 
-    // Advancing while parked refuses (nothing is runnable), and the park is stable.
+    // Advancing while parked idles (nothing can run until the answer), and the park is stable.
     assert!(matches!(
         run.run_until_stop(&mut fuel),
-        SchedStop::CapPark { .. }
+        SchedStop::Idle { .. }
     ));
     assert_eq!(run.cap_parked(), Some(id), "still parked on the same call");
     assert!(

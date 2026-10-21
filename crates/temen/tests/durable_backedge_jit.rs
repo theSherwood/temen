@@ -47,7 +47,7 @@ fn module(src: &str) -> Module {
 
 fn window_with(state: i32) -> Vec<u8> {
     let mut w = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut w, state);
+    write_state(&mut w, TEST_ARENA, state);
     w
 }
 
@@ -160,7 +160,7 @@ fn freeze_from_start_at_a_loop_header_is_byte_identical_across_backends() {
     // post-loop call.cap. The durable reserves must be byte-identical.
     let (fi, snap_i) = interp(&inst, clock, &window_with(STATE_UNWINDING), false);
     assert_eq!(fi, vec![Value::I64(0)], "interp froze (placeholder)");
-    assert_eq!(read_state(&snap_i), STATE_UNWINDING);
+    assert_eq!(read_state(&snap_i, TEST_ARENA), STATE_UNWINDING);
 
     let Some((fj, snap_j)) = jit(&inst, clock, &window_with(STATE_UNWINDING)) else {
         return;
@@ -169,7 +169,11 @@ fn freeze_from_start_at_a_loop_header_is_byte_identical_across_backends() {
         matches!(fj, JitOutcome::Returned(_)),
         "JIT froze, not trapped"
     );
-    assert_eq!(read_state(&snap_j), STATE_UNWINDING, "JIT left UNWINDING");
+    assert_eq!(
+        read_state(&snap_j, TEST_ARENA),
+        STATE_UNWINDING,
+        "JIT left UNWINDING"
+    );
     assert_eq!(
         &snap_i[..TEST_ARENA.end as usize],
         &snap_j[..TEST_ARENA.end as usize],
@@ -187,7 +191,7 @@ fn freeze_from_start_at_a_loop_header_is_byte_identical_across_backends() {
         "JIT thaw of the interp artifact reproduces the oracle"
     );
     assert_eq!(
-        read_state(&final_j),
+        read_state(&final_j, TEST_ARENA),
         STATE_NORMAL,
         "JIT thaw flips back to NORMAL"
     );
@@ -286,7 +290,7 @@ fn async_controller_freezes_a_running_compute_loop_on_the_jit() {
     let (out, snap) = jit_async_freeze(&inst, 42, freeze);
     controller.join().unwrap();
 
-    if read_state(&snap) == STATE_UNWINDING {
+    if read_state(&snap, TEST_ARENA) == STATE_UNWINDING {
         // Froze mid-loop (the expected path). The window holds the unwound loop-header continuation;
         // a thaw must reproduce the oracle — the loop state was reloaded and the post-loop call.cap
         // runs once on thaw. (The clock is folded in only after the loop, so use the baseline clock.)
@@ -301,7 +305,7 @@ fn async_controller_freezes_a_running_compute_loop_on_the_jit() {
             "thaw of an async-frozen compute loop reproduces the oracle"
         );
         assert_eq!(
-            read_state(&final_win),
+            read_state(&final_win, TEST_ARENA),
             STATE_NORMAL,
             "thaw flips back to NORMAL"
         );
@@ -327,10 +331,10 @@ fn interp_mid_loop_freeze_thaws_on_the_jit() {
     // Freeze mid-loop on the interpreter via the back-edge countdown: the clock (42) is already
     // baked into the spilled accumulator.
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after_backedges(&mut win, 3);
+    arm_freeze_after_backedges(&mut win, TEST_ARENA, 3);
     let (fi, snap) = interp(&inst, 42, &win, true);
     assert_eq!(fi, vec![Value::I64(0)], "interp froze mid-loop");
-    assert_eq!(read_state(&snap), STATE_UNWINDING);
+    assert_eq!(read_state(&snap, TEST_ARENA), STATE_UNWINDING);
 
     // Thaw on the JIT under a FRESH host (clock 0). The JIT must rewind the LoopHeader point with
     // the real mid-loop accumulator and reload the baked-in clock — not re-issue the call.cap
@@ -344,7 +348,7 @@ fn interp_mid_loop_freeze_thaws_on_the_jit() {
         "JIT thaw of an interp mid-loop freeze reproduces the oracle (reload, not re-issue)\n{inst:#?}"
     );
     assert_eq!(
-        read_state(&final_j),
+        read_state(&final_j, TEST_ARENA),
         STATE_NORMAL,
         "JIT thaw flips back to NORMAL"
     );
@@ -397,7 +401,7 @@ fn a_freeze_request_the_root_never_polled_leaves_the_run_unfrozen() {
         "the host fn's failure traps: {out:?}"
     );
     assert_eq!(
-        read_state(&snap),
+        read_state(&snap, TEST_ARENA),
         STATE_NORMAL,
         "a request nothing unwound for is undone"
     );
