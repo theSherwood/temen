@@ -544,7 +544,7 @@ fn two_interleaved_detached_spawns_each_get_their_own_lane_and_budget() {
             parent_lane_cap: -1,
             pages: std::ptr::null(),
         };
-        let mut trap = 0i64;
+        let vm = temen_jit::VmCtx::new(temen_jit::InstanceAddrs::NONE);
         let reservation = 1u64 << temen_ir::DEFAULT_RESERVED_LOG2;
         // SAFETY: `ctx` is the locked parent cell the hooks were made for; with no grant records,
         // nothing is read from the (null) window.
@@ -562,10 +562,10 @@ fn two_interleaved_detached_spawns_each_get_their_own_lane_and_budget() {
                 lane,
                 u32::MAX, // no pager
                 &mut gc,
-                &mut trap,
+                &vm,
             )
         };
-        assert_eq!(built, 1, "the build trapped {trap}");
+        assert_eq!(built, 1, "the build trapped {:?}", vm.ended());
         gc
     };
     // SAFETY: as above.
@@ -1335,10 +1335,10 @@ block 1 () {
 }
 "#;
 
-/// #2088 — a kill on the JIT survives the child's host calls: each successful `call.cap` resets the
-/// trap cell, which used to erase a kill that landed during (or before) one, so the child ran on and
-/// its parent's join hung. The parent kills each child as soon as it is spawned; both joins answer
-/// `THREAD_FAULT`, as on the interpreter.
+/// #2088 — a kill on the JIT survives the child's host calls: each successful `call.cap` used to
+/// reset the trap cell, which erased a kill that landed during (or before) one, so the child ran on
+/// and its parent's join hung (#2499 made the cell write-once). The parent kills each child as soon
+/// as it is spawned; both joins answer `THREAD_FAULT`, as on the interpreter.
 #[test]
 fn a_kill_survives_the_childs_host_calls_on_the_jit() {
     let p = module(&parent_then(

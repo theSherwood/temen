@@ -826,8 +826,8 @@ impl Nursery {
 
     /// S1c — join every child task. Called at run **teardown**, before the parent window is freed, so
     /// no child outlives the memory it copies to/from. A child still running ends with the run, as the
-    /// oracle ends a child domain (DESIGN §23, D66): unless the run froze, its stop word ends it at its
-    /// next poll, and the join waits for that.
+    /// oracle ends a child domain (DESIGN §23, D66): unless the run froze, the end raised on its
+    /// context stops it at its next poll, and the join waits for that.
     ///
     /// #1361 step 4 — a frozen run's teardown then takes the harvest: every unjoined durable detached
     /// child, with its powerbox handed over (see [`crate::DetachedHarvest`]). Empty unless `froze`.
@@ -1217,7 +1217,7 @@ impl Nursery {
     unsafe fn resolve_granted(
         &self,
         module: i64,
-        trap_out: *mut i64,
+        vm: &crate::VmCtx,
     ) -> Option<(
         &temen_ir::Module,
         Option<i32>,
@@ -1225,12 +1225,12 @@ impl Nursery {
         [u8; 32],
     )> {
         let Some(resolver) = self.resolve_module else {
-            *trap_out = TrapKind::CapFault as i64;
+            vm.raise(TrapKind::CapFault as i64);
             return None;
         };
         let mut rm = core::mem::MaybeUninit::<crate::ResolvedModule>::zeroed().assume_init();
         if resolver(self.cap_ctx, module as i32, &mut rm) == 0 || (*rm.module).funcs.is_empty() {
-            *trap_out = TrapKind::CapFault as i64;
+            vm.raise(TrapKind::CapFault as i64);
             return None;
         }
         Some((&*rm.module, Some(rm.memory_log2), rm.shadow, rm.digest))
@@ -1247,10 +1247,10 @@ impl Nursery {
     }
 
     /// Resolve `handle` as this domain's `Instantiator` via the run's `call.cap` thunk: `false` (and
-    /// `*trap_out` set) for a forged/closed/wrong handle.
-    unsafe fn resolve(&self, mem_base: u64, handle: i32, trap_out: *mut i64) -> bool {
+    /// a `CapFault` raised on `vm`) for a forged/closed/wrong handle.
+    unsafe fn resolve(&self, mem_base: u64, handle: i32, vm: &crate::VmCtx) -> bool {
         // op 0 on an `Instantiator` binding is the host's authority probe, answering nothing for a
-        // live handle (see `cap_dispatch_slots`); a bad handle sets `*trap_out` to a `CapFault`.
+        // live handle (see `cap_dispatch_slots`); a bad handle raises a `CapFault`.
         (self.cap_thunk)(
             self.cap_ctx,
             mem_base as *mut u8,
@@ -1263,9 +1263,9 @@ impl Nursery {
             0,
             core::ptr::null_mut(),
             0,
-            trap_out,
+            vm,
         );
-        unsafe { *trap_out == 0 }
+        vm.ended().is_none()
     }
 }
 
@@ -1291,14 +1291,14 @@ fn temen_ir_iface_instantiator() -> u32 {
 ///
 /// # Safety
 /// Called from JITted code on the spawning vCPU's thread with the run's live nursery, window
-/// base/size, and a writable `trap_out`.
+/// base/size, and a writable `vm`.
 pub(crate) unsafe extern "C" fn instantiate_rec(
     rt: *const Nursery,
     mem_base: u64,
     mem_size: u64,
     handle: i32,
     record_ptr: i64,
-    trap_out: *mut i64,
+    vm: &crate::VmCtx,
 ) -> i32 {
     let rp = record_ptr as u64;
     // #826: `mem_size` is the reserved span, so a record in a `map`-grown tail page is read where
@@ -1308,7 +1308,7 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
         .checked_add(temen_ir::SPAWN_REC_LEN as u64)
         .is_none_or(|e| e > mem_size)
     {
-        *trap_out = TrapKind::MemoryFault as i64;
+        vm.raise(TrapKind::MemoryFault as i64);
         return 0;
     }
     // Copy the record out of the guest window, then share the layout decode with the two
@@ -1320,32 +1320,32 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
         temen_ir::SPAWN_REC_LEN,
     );
     let Some(sr) = SpawnRec::parse(&buf) else {
-        *trap_out = TrapKind::CapFault as i64;
+        vm.raise(TrapKind::CapFault as i64);
         return 0;
     };
     // No paged child in a durable run on this tier (above).
     if sr.pager != u32::MAX && (*rt).durable.load(Ordering::Acquire) {
-        *trap_out = TrapKind::CapFault as i64;
+        vm.raise(TrapKind::CapFault as i64);
         return 0;
     }
-    spawn_detached(rt, mem_base, mem_size, handle, &sr, trap_out)
+    spawn_detached(rt, mem_base, mem_size, handle, &sr, vm)
 }
 
 /// `join(child_handle) -> result` — block on the child's completion (an async op-0/5/8/11/13 child
 /// runs on its own OS thread; a durable child is already done) and return its `i64` result,
-/// propagating a child trap as the parent's (`*trap_out`). A §5 host kill on the parent's interrupt
+/// propagating a child trap as the parent's (raised on `vm`). A §5 host kill on the parent's interrupt
 /// cell while parked here unwinds the waiter *as `OutOfFuel`* (see the loop below). A forged /
 /// already-joined handle is inert (a `CapFault`), matching the interpreter's once-only join.
 ///
 /// # Safety
-/// As [`instantiate_rec`]: `rt`/`trap_out` are the instance's nursery + run trap cell, valid for the call.
+/// As [`instantiate_rec`]: `rt`/`vm` are the instance's nursery + run trap cell, valid for the call.
 /// #1287 — spawn a detached child: a task ([`file_task`]) in a window that is its own (`mapped_log2`
 /// committed inside a `reserved_log2` reservation, seeded from `seeds`), with no copy-in or copy-back.
 /// Registered as a pending join-table entry like every async child; the powerbox is released by the
 /// teardown hook while the window lives.
 ///
 /// # Safety
-/// As [`instantiate_rec`]: `rt`/`trap_out` are valid for the call. `code` was compiled against
+/// As [`instantiate_rec`]: `rt`/`vm` are valid for the call. `code` was compiled against
 /// `gc_ctx` for exactly `(mapped_log2, reserved_log2)`; `args` matches the entry arity.
 #[allow(clippy::too_many_arguments)]
 unsafe fn spawn_detached_child(
@@ -1359,7 +1359,7 @@ unsafe fn spawn_detached_child(
     n_results: usize,
     release: crate::GrantChildReleaser,
     gc: &crate::GrantChild,
-    trap_out: *mut i64,
+    vm: &crate::VmCtx,
     // #1587 — the lease `spawn_detached` already took from the funding budget, `(budget, bytes,
     // runs)`, so a spawn that fails *after* that commit can hand it back.
     lease: (i32, u64, u64),
@@ -1477,7 +1477,7 @@ unsafe fn spawn_detached_child(
             slot
         }
         Filed::AtCeiling => {
-            *trap_out = TrapKind::ThreadFault as i64;
+            vm.raise(TrapKind::ThreadFault as i64);
             0
         }
         // The child never ran (a refused window, pre-map alias or task stack) — the one refusal on
@@ -1533,7 +1533,7 @@ fn init_durable_words(rw: &mut [u8], a: temen_ir::durable_abi::ShadowArena, free
 /// (#2164). Data segments + the payload are seeded into the child's own window before it starts.
 ///
 /// # Safety
-/// `rt`/`mem_base`/`mem_size`/`trap_out` are the instance's nursery, live parent window base,
+/// `rt`/`mem_base`/`mem_size`/`vm` are the instance's nursery, live parent window base,
 /// **reserved** span, and run trap cell, valid for the call.
 unsafe fn spawn_detached(
     rt: *const Nursery,
@@ -1541,7 +1541,7 @@ unsafe fn spawn_detached(
     mem_size: u64,
     handle: i32,
     sr: &SpawnRec,
-    trap_out: *mut i64,
+    vm: &crate::VmCtx,
 ) -> i32 {
     let rt = &*rt;
     let (budget, module) = (i64::from(sr.budget), i64::from(sr.modh));
@@ -1557,7 +1557,7 @@ unsafe fn spawn_detached(
     let release_addr = rt.grant_release.load(Ordering::Acquire);
     let take_addr = rt.grant_budget_mem_take.load(Ordering::Acquire);
     if build_addr == 0 || release_addr == 0 || take_addr == 0 {
-        *trap_out = TrapKind::CapFault as i64;
+        vm.raise(TrapKind::CapFault as i64);
         return 0;
     }
     let build: crate::GrantDetachedChildBuilder = core::mem::transmute(build_addr);
@@ -1570,7 +1570,7 @@ unsafe fn spawn_detached(
         rt.cap_thunk
     };
     // The Instantiator is the authority (a forged handle is a CapFault).
-    if !rt.resolve(mem_base, handle, trap_out) {
+    if !rt.resolve(mem_base, handle, vm) {
         return 0;
     }
     // §2.2 — a record's pager must be a `{ page: (i64) -> (i64) }` export of the spawner's own
@@ -1583,11 +1583,11 @@ unsafe fn spawn_detached(
             admit(rt.grant_ctx(), sr.pager) != 0
         };
         if !admitted || rt.grant_page_miss.load(Ordering::Acquire) == 0 {
-            *trap_out = TrapKind::CapFault as i64;
+            vm.raise(TrapKind::CapFault as i64);
             return 0;
         }
     }
-    let Some((child, mod_mem, child_shadow, digest)) = rt.resolve_granted(module, trap_out) else {
+    let Some((child, mod_mem, child_shadow, digest)) = rt.resolve_granted(module, vm) else {
         return 0;
     };
     let (child_funcs, child_types, child_data) = (&child.funcs[..], &child.types[..], &child.data);
@@ -1619,7 +1619,7 @@ unsafe fn spawn_detached(
                     .to_vec()
             }
             _ => {
-                *trap_out = TrapKind::MemoryFault as i64;
+                vm.raise(TrapKind::MemoryFault as i64);
                 return 0;
             }
         }
@@ -1650,14 +1650,14 @@ unsafe fn spawn_detached(
         let admit_addr = rt.grant_premap_admit.load(Ordering::Acquire);
         let stage_addr = rt.grant_premap_stage.load(Ordering::Acquire);
         if admit_addr == 0 || stage_addr == 0 || window_ready.is_none() {
-            *trap_out = TrapKind::CapFault as i64;
+            vm.raise(TrapKind::CapFault as i64);
             return 0;
         }
         let admit: crate::PremapAdmit = core::mem::transmute(admit_addr);
-        match admit(rt.grant_ctx(), r, o, child_size, trap_out) {
+        match admit(rt.grant_ctx(), r, o, child_size, vm) {
             1 => {}
             0 => return EINVAL as i32,
-            _ => return 0, // forged: `*trap_out` is set
+            _ => return 0, // forged: a `CapFault` is raised
         }
     }
     // Admission = the lane reserved and the budget's window charge (the commit; every refusal above
@@ -1703,7 +1703,7 @@ unsafe fn spawn_detached(
         lane,     // and the lane it reserved
         sr.pager, // §2.2 — and the pager its faults go to, if any (checked above)
         &mut gc,
-        trap_out,
+        vm,
     ) == 0
     {
         undo_admission(rt, lease, lane);
@@ -1715,7 +1715,7 @@ unsafe fn spawn_detached(
         release(gc.ctx);
         release(gc.retained_ctx);
         undo_admission(rt, lease, lane);
-        *trap_out = TrapKind::CapFault as i64;
+        vm.raise(TrapKind::CapFault as i64);
         return 0;
     }
     // #1975 — every exit from here that files no child hands back what the admission took, as the
@@ -1739,7 +1739,7 @@ unsafe fn spawn_detached(
             release(gc.ctx);
             release(gc.retained_ctx);
             undo_admission(rt, lease, lane);
-            *trap_out = TrapKind::CapFault as i64;
+            vm.raise(TrapKind::CapFault as i64);
             return 0;
         }
     }
@@ -1780,7 +1780,7 @@ unsafe fn spawn_detached(
             release(gc.ctx);
             release(gc.retained_ctx);
             undo_admission(rt, lease, lane);
-            *trap_out = TrapKind::CapFault as i64;
+            vm.raise(TrapKind::CapFault as i64);
             return 0;
         }
     };
@@ -1814,7 +1814,7 @@ unsafe fn spawn_detached(
         n_results,
         release,
         &gc,
-        trap_out,
+        vm,
         lease,
         child_fuel,
         node,
@@ -1832,7 +1832,7 @@ unsafe fn spawn_detached(
 /// until the 5c.1 transport lands; minting is the 5c.0 slice.)
 ///
 /// # Safety
-/// `rt` is the run's live nursery; `mem_base` its live window base; `trap_out` the live trap cell
+/// `rt` is the run's live nursery; `mem_base` its live window base; `vm` the live trap cell
 /// (written only for a forged `Instantiator`).
 pub(crate) unsafe extern "C" fn child_offer(
     rt: *const Nursery,
@@ -1840,12 +1840,12 @@ pub(crate) unsafe extern "C" fn child_offer(
     inst: i32,
     child: i32,
     export: i64,
-    trap_out: *mut i64,
+    vm: &crate::VmCtx,
 ) -> i32 {
     const EINVAL: i32 = -22;
     let rt = &*rt;
-    if !rt.resolve(mem_base, inst, trap_out) {
-        return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
+    if !rt.resolve(mem_base, inst, vm) {
+        return 0; // a forged `Instantiator` — its CapFault is raised (#1729)
     }
     let mint_addr = rt.grant_mint.load(Ordering::Acquire);
     if mint_addr == 0 {
@@ -1871,18 +1871,18 @@ pub(crate) unsafe extern "C" fn child_offer(
 /// no powerbox: `-EINVAL`, as op 14's misses. A run with no hook grants nothing: `-EINVAL`.
 ///
 /// # Safety
-/// As [`child_offer`]; `trap_out` is also written for a forged `handle`.
+/// As [`child_offer`]; `vm` is also written for a forged `handle`.
 pub(crate) unsafe extern "C" fn child_grant(
     rt: *const Nursery,
     mem_base: u64,
     inst: i32,
     child: i32,
     handle: i64,
-    trap_out: *mut i64,
+    vm: &crate::VmCtx,
 ) -> i32 {
     let rt = &*rt;
-    if !rt.resolve(mem_base, inst, trap_out) {
-        return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
+    if !rt.resolve(mem_base, inst, vm) {
+        return 0; // a forged `Instantiator` — its CapFault is raised (#1729)
     }
     let grant_addr = rt.grant_into.load(Ordering::Acquire);
     if grant_addr == 0 {
@@ -1898,19 +1898,19 @@ pub(crate) unsafe extern "C" fn child_grant(
         rt.grant_ctx(),
         retained as *mut core::ffi::c_void,
         handle,
-        trap_out,
+        vm,
     )
 }
 
 /// `join(child) -> (status, value)` (op 1, JIT): park until the child ends, then answer how it
 /// ended — `(0, its first result)` if it returned, `(its trap's wire code, 0)` if not — with the
 /// child reaped either way. The value is the return; the status goes through `status_out`, as
-/// `cont.resume`'s does. A child's end is never its joiner's trap (INVARIANTS #5, #2066): `trap_out`
+/// `cont.resume`'s does. A child's end is never its joiner's trap (INVARIANTS #5, #2066): `vm`
 /// is set only for what is the joiner's own — a forged handle, its kill, its domain's teardown or
 /// deadlock. The oracle's `join_delivery` rule.
 ///
 /// # Safety
-/// `rt` is the run's live nursery, `mem_base` the joiner's window, and `status_out` and `trap_out`
+/// `rt` is the run's live nursery, `mem_base` the joiner's window, and `status_out` and `vm`
 /// valid for writes.
 pub(crate) unsafe extern "C" fn join(
     rt: *const Nursery,
@@ -1918,19 +1918,19 @@ pub(crate) unsafe extern "C" fn join(
     inst: i32,
     handle: i32,
     status_out: *mut i64,
-    trap_out: *mut i64,
+    vm: &crate::VmCtx,
 ) -> i64 {
     *status_out = 0;
     let rt = &*rt;
-    if !rt.resolve(mem_base, inst, trap_out) {
-        return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
+    if !rt.resolve(mem_base, inst, vm) {
+        return 0; // a forged `Instantiator` — its CapFault is raised (#1729)
     }
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     // A forged or spent child handle: `ThreadFault`, as the oracle's join rule answers — a child
     // rides the §12 executor as a vCPU, so this is a thread-handle forgery, not a capability one
     // (#1573). The `Instantiator` operand itself was checked above and is the `CapFault` case.
     let Some(slot) = Nursery::live_slot(&children, handle) else {
-        *trap_out = TrapKind::ThreadFault as i64;
+        vm.raise(TrapKind::ThreadFault as i64);
         return 0;
     };
     let c = &mut children[slot];
@@ -1948,7 +1948,7 @@ pub(crate) unsafe extern "C" fn join(
             Some(s) => Some(s),
             // Unreachable: a task runs on its platform slot, the first of the resumes this reads.
             None => {
-                *trap_out = TrapKind::ThreadFault as i64;
+                vm.raise(TrapKind::ThreadFault as i64);
                 return 0;
             }
         }
@@ -2006,7 +2006,7 @@ pub(crate) unsafe extern "C" fn join(
             // the trap cell makes the outcome `Trapped(OutOfFuel)` regardless of a subsequent poll, matching
             // the child's own kill and the interpreter's runaway-nesting semantics.
             if epoch_fired(rt.epoch_addr) {
-                *trap_out = TrapKind::OutOfFuel as i64;
+                vm.raise(TrapKind::OutOfFuel as i64);
                 return 0;
             }
             // Owner decision 2026-07-24 (domain teardown; DESIGN.md §12, D37 death-is-revocation): a
@@ -2014,11 +2014,8 @@ pub(crate) unsafe extern "C" fn join(
             // DOMAIN_DONE sentinel) — ends the domain; a sibling vCPU parked here joining a nested
             // child returns so its trailing trap-propagation guard (which checks this same cell)
             // unwinds it. Observed on the same bounded re-check cadence as the kill-path above; the
-            // atomic load matches the cell's cross-thread contract (an `AtomicI64`'s storage).
-            if (*(trap_out as *const core::sync::atomic::AtomicI64))
-                .load(core::sync::atomic::Ordering::Relaxed)
-                != 0
-            {
+            // cell is atomic, written by other threads.
+            if vm.ended().is_some() {
                 return 0;
             }
             // #1820 — the deadlock verdict, decided here as a futex wait decides it: with this
@@ -2027,7 +2024,7 @@ pub(crate) unsafe extern "C" fn join(
             // than wait forever. A task's join leaves the verdict to an OS vCPU's park, as every
             // task park does; a freeze in flight is not a deadlock.
             if task.is_none() && !freezing && hub.is_some_and(|h| !h.peers_live()) {
-                *trap_out = TrapKind::ThreadFault as i64;
+                vm.raise(TrapKind::ThreadFault as i64);
                 return 0;
             }
             st = match &task {
@@ -2057,7 +2054,7 @@ pub(crate) unsafe extern "C" fn join(
         // too, so the joiner traps rather than reading the child's `OUT_OF_FUEL` as a status. A
         // joiner that returns right after its join has no other poll to see the kill at (I33).
         if epoch_fired(rt.epoch_addr) {
-            *trap_out = TrapKind::OutOfFuel as i64;
+            vm.raise(TrapKind::OutOfFuel as i64);
             return 0;
         }
         // How the child ended is its spawner's to read, not to inherit (#2066). The claim on it
@@ -2072,16 +2069,8 @@ pub(crate) unsafe extern "C" fn join(
     })();
     // Back from the park: re-take the lane before the parent's guest code runs again.
     if let Some(d) = dom {
-        if !d.lane_acquire(&lane, || {
-            // SAFETY: the run's live interrupt cell / trap cell.
-            epoch_fired(rt.epoch_addr)
-                || unsafe {
-                    (*(trap_out as *const core::sync::atomic::AtomicI64))
-                        .load(core::sync::atomic::Ordering::Relaxed)
-                        != 0
-                }
-        }) {
-            *trap_out = TrapKind::ThreadFault as i64;
+        if !d.lane_acquire(&lane, || epoch_fired(rt.epoch_addr) || vm.ended().is_some()) {
+            vm.raise(TrapKind::ThreadFault as i64);
             return 0;
         }
     }
@@ -2096,21 +2085,21 @@ pub(crate) unsafe extern "C" fn join(
 /// oracle's (#2378).
 ///
 /// # Safety
-/// As [`join`]: `rt`/`trap_out` are the instance's nursery + run trap cell, valid for the call.
+/// As [`join`]: `rt`/`vm` are the instance's nursery + run trap cell, valid for the call.
 pub(crate) unsafe extern "C" fn poll(
     rt: *const Nursery,
     mem_base: u64,
     inst: i32,
     handle: i32,
-    trap_out: *mut i64,
+    vm: &crate::VmCtx,
 ) -> i32 {
     let rt = &*rt;
-    if !rt.resolve(mem_base, inst, trap_out) {
-        return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
+    if !rt.resolve(mem_base, inst, vm) {
+        return 0; // a forged `Instantiator` — its CapFault is raised (#1729)
     }
     let children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let Some(slot) = Nursery::live_slot(&children, handle) else {
-        *trap_out = TrapKind::ThreadFault as i64;
+        vm.raise(TrapKind::ThreadFault as i64);
         return 0;
     };
     let st = children[slot]
@@ -2138,15 +2127,15 @@ pub(crate) unsafe extern "C" fn detach(
     mem_base: u64,
     inst: i32,
     handle: i32,
-    trap_out: *mut i64,
+    vm: &crate::VmCtx,
 ) -> i32 {
     let rt = &*rt;
-    if !rt.resolve(mem_base, inst, trap_out) {
-        return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
+    if !rt.resolve(mem_base, inst, vm) {
+        return 0; // a forged `Instantiator` — its CapFault is raised (#1729)
     }
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let Some(slot) = Nursery::live_slot(&children, handle) else {
-        *trap_out = TrapKind::ThreadFault as i64;
+        vm.raise(TrapKind::ThreadFault as i64);
         return 0;
     };
     children[slot].joined = true;
@@ -2167,15 +2156,15 @@ pub(crate) unsafe extern "C" fn kill(
     mem_base: u64,
     inst: i32,
     handle: i32,
-    trap_out: *mut i64,
+    vm: &crate::VmCtx,
 ) -> i32 {
     let rt = &*rt;
-    if !rt.resolve(mem_base, inst, trap_out) {
-        return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
+    if !rt.resolve(mem_base, inst, vm) {
+        return 0; // a forged `Instantiator` — its CapFault is raised (#1729)
     }
     let children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let Some(slot) = Nursery::live_slot(&children, handle) else {
-        *trap_out = TrapKind::ThreadFault as i64;
+        vm.raise(TrapKind::ThreadFault as i64);
         return 0;
     };
     drop(children);
