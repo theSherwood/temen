@@ -34,6 +34,7 @@ means adding it to a row.
 | `set[enum]`, sparse ordinals included | `sets_enum`, `sets_enum_sparse` | ✅ |
 | Tuples | `tuples` | ✅ |
 | Strings, `strutils` | `strings` | ✅ |
+| C strings: string literals as `cstring` values | `cstring_literals` | ✅ |
 | Slices and backward indexes | `slices` | ✅ |
 | Arrays | `arrays` | ✅ |
 | `seq` | `seqs`, `seq_of_strings` | ✅ |

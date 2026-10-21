@@ -228,7 +228,14 @@ fn importc_global_seed(cname: &str) -> Option<[u8; 8]> {
 
 /// True if a node is a NIF string literal (a quote-delimited atom, e.g. a `LongString`'s `data`).
 fn is_string_literal(node: &Node) -> bool {
-    matches!(node.as_atom(), Some(a) if a.starts_with('"') && a.ends_with('"') && a.len() >= 2)
+    node.as_atom().is_some_and(is_string_atom)
+}
+
+/// True if an atom is a NIF string literal, quotes included. No symbol starts with a quote, so a
+/// pointer in static data can name the C string literal it points at by its atom
+/// ([`Translator::resolve_data_ptrs`]).
+fn is_string_atom(a: &str) -> bool {
+    a.starts_with('"') && a.ends_with('"') && a.len() >= 2
 }
 
 /// Decode a NIF string-literal atom (quotes included) to its raw bytes. NIF escapes a byte as `\HH`
@@ -488,6 +495,11 @@ pub(crate) struct Translator {
     funcref_inits: Vec<(u64, String)>,
     /// End of the globals region (unit-local). The globals occupy `[16, globals_top)`.
     globals_top: u64,
+    /// **C string literals**: the bytes of each string literal a proc uses as a value (`var s:
+    /// cstring = "abc"`, `(call f "lit")`), NUL-terminated, at `[globals_top, globals_top + len)`.
+    /// Filled while proc bodies are translated, because only there is an atom known to be a value
+    /// rather than a pragma's or a suffix's spelling; nothing is placed after it, so no global moves.
+    cstr_pool: RefCell<Vec<u8>>,
     /// **Link-unit mode.** When true, the module is emitted as a relocatable link unit (`.temeno`
     /// shape): a global's address is a `data.self <off>` the linker rewrites, and one zero-filled
     /// `data` segment covers `[16, globals_top)` so the linker reserves and relocates the whole
@@ -651,6 +663,7 @@ impl Translator {
             data_ptrs: Vec::new(),
             funcref_inits: Vec::new(),
             globals_top: 16,
+            cstr_pool: RefCell::default(),
             link_mode: false,
             globals: HashMap::default(),
             unsigned_globals: HashSet::default(),
@@ -734,13 +747,32 @@ impl Translator {
         Ok(slot)
     }
 
+    /// Add a C string literal (its NIF atom, quotes included) to [`cstr_pool`](Self::cstr_pool) and
+    /// return its unit-local offset.
+    fn intern_cstr(&self, lit: &str) -> Result<u64, LengError> {
+        let mut pool = self.cstr_pool.borrow_mut();
+        let off = self.globals_top + pool.len() as u64;
+        pool.extend(nif_str_bytes(lit)?);
+        pool.push(0);
+        Ok(off)
+    }
+
     /// Assemble the final module text: `memory` (if used) + `import` declarations + the globals
     /// `data` segment (relocatable; addressed via `data.self`) + funcs. The emitted module is a
     /// **link unit** whenever it has globals — its `data.self`/imports resolve at `link` time (a
     /// single-unit link makes a globals-only module runnable).
     fn assemble(&self, used_memory: bool, funcs: String) -> String {
         let base = self.globals_base();
-        let has_globals = self.globals_top > base;
+        // The C string literals follow the globals: one more initialized range of the unit's data.
+        let pool = self.cstr_pool.borrow();
+        let inits: Vec<(u64, &[u8])> = self
+            .data_inits
+            .iter()
+            .map(|(off, bytes)| (*off, bytes.as_slice()))
+            .chain((!pool.is_empty()).then_some((self.globals_top, pool.as_slice())))
+            .collect();
+        let top = self.globals_top + pool.len() as u64;
+        let has_globals = top > base;
         let mut out = String::new();
         // Data segments (globals) and loads/stores write the window, so declare `memory`.
         if used_memory || has_globals || self.tls_top > 0 {
@@ -764,12 +796,12 @@ impl Translator {
             out.push('\n');
         }
         if self.link_mode && has_globals {
-            // Link unit: one `data` segment over the whole globals region `[16, globals_top)` —
-            // zero-filled, non-zero initializers patched in — referenced by `data.self`, so the
-            // linker relocates every global when it places this unit's data.
-            let mut image = vec![0u8; self.globals_top as usize];
-            for (off, bytes) in &self.data_inits {
-                let o = *off as usize;
+            // Link unit: one `data` segment over the whole globals region and the C string literals
+            // after it — zero-filled, non-zero initializers patched in — referenced by `data.self`,
+            // so the linker relocates every global when it places this unit's data.
+            let mut image = vec![0u8; top as usize];
+            for (off, bytes) in inits {
+                let o = off as usize;
                 image[o..o + bytes.len()].copy_from_slice(bytes);
             }
             out.push_str(&format!(
@@ -790,10 +822,10 @@ impl Translator {
         } else {
             // Runnable module: globals are fixed absolute offsets in the zeroed window, so only
             // non-zero initializers need a `data` segment.
-            for (off, bytes) in &self.data_inits {
+            for (off, bytes) in &inits {
                 out.push_str(&format!("data {off} \"{}\"\n", escape_bytes(bytes)));
             }
-            if !self.data_inits.is_empty() {
+            if !inits.is_empty() {
                 out.push('\n');
             }
         }
@@ -1046,15 +1078,23 @@ impl Translator {
 
     /// Resolve every pointer stored in static data ([`Self::data_ptrs`]) now that the unit's globals
     /// are all placed, so a const may point at one placed after it. A name this unit defines is its
-    /// own data. Any other names a sibling unit's: hexer's dead-code elimination keeps one copy of a
-    /// string literal (or a type's data) program-wide, in one module, and every other module points at
-    /// it by that module's name — for the linker to bind, or refuse. A runnable module has no
-    /// siblings, so there such a name is an error. Pointing at nothing is never silently a null.
+    /// own data, and so is a C string literal (a `cstring` field or element). Any other names a
+    /// sibling unit's: hexer's dead-code elimination keeps one copy of a string literal (or a type's
+    /// data) program-wide, in one module, and every other module points at it by that module's name
+    /// — for the linker to bind, or refuse. A runnable module has no siblings, so there such a name
+    /// is an error. Pointing at nothing is never silently a null.
     fn resolve_data_ptrs(&mut self) -> Result<(), LengError> {
         for (at, target) in std::mem::take(&mut self.data_ptrs) {
             let temen_ir::DataPtrTarget::Sym { name, .. } = &target else {
                 self.data_ptrs.push((at, target));
                 continue;
+            };
+            // A C string literal is this unit's data too, in its pool, which starts where the
+            // globals end, now known.
+            let goff = if is_string_atom(name) {
+                Some(self.intern_cstr(name)?)
+            } else {
+                self.globals.get(name).map(|(goff, _)| *goff)
             };
             // The data that holds the pointer. A blob records only pointers inside it, so one that
             // lies outside means a layout and the value laid out by it disagree.
@@ -1065,11 +1105,11 @@ impl Translator {
                 .ok_or_else(|| {
                     LengError::Malformed(format!("a pointer to `{name}` at {at} lies in no data"))
                 })?;
-            match (self.globals.get(name), self.link_mode) {
-                (Some((goff, _)), true) => self
+            match (goff, self.link_mode) {
+                (Some(goff), true) => self
                     .data_ptrs
-                    .push((at, temen_ir::DataPtrTarget::SelfOff(*goff))),
-                (Some((goff, _)), false) => {
+                    .push((at, temen_ir::DataPtrTarget::SelfOff(goff))),
+                (Some(goff), false) => {
                     let i = (at - *base) as usize;
                     bytes[i..i + 8].copy_from_slice(&goff.to_le_bytes());
                 }
@@ -1306,6 +1346,9 @@ impl Translator {
                     // A **funcref element** — a `(cast (ptr void) proc)` (or bare proc) in a vtable's
                     // `mt` table. Emit a funcref reloc at this slot; the linker writes its func index.
                     funcrelocs.push((off as u64, sym.to_string()));
+                } else if let Some(lit) = v.as_atom().filter(|a| is_string_atom(a)) {
+                    // A **C string element** (`array[2, cstring]`): a pointer to the literal's bytes.
+                    relocs.push((off as u64, lit.to_string()));
                 } else if let Some((ebytes, _, erelocs, efrelocs)) =
                     self.const_aggregate_bytes(v)?
                 {
@@ -1372,7 +1415,11 @@ impl Translator {
                     bytes.resize(off + w, 0);
                 }
                 bytes[off..off + w].copy_from_slice(&(v as u64).to_le_bytes()[..w]);
+            } else if is_string_literal(&ka[1]) && matches!(fdesc, TyDesc::Ptr(_)) {
+                // A **C string field** (`name: cstring`): a pointer to the literal's bytes.
+                relocs.push((off as u64, ka[1].as_atom().unwrap().to_string()));
             } else if is_string_literal(&ka[1]) {
+                // The characters themselves, inline: a `LongString`'s `data`.
                 let data = nif_str_bytes(ka[1].as_atom().unwrap())?;
                 if bytes.len() < off + data.len() {
                     bytes.resize(off + data.len(), 0);
@@ -3803,15 +3850,9 @@ impl<'a> FuncGen<'a> {
                     let addr = self.emit_data_sym(&cname, 0);
                     return Ok((addr, desc));
                 }
-                // A module global's address: a fixed absolute offset in a runnable module, or a
-                // relocatable `data.self <off>` in a link unit (the linker rewrites it on placement).
+                // A module global's address.
                 if let Some((off, desc)) = self.t.globals.get(name).cloned() {
-                    let base = if self.t.link_mode {
-                        self.emit_data_self(off)
-                    } else {
-                        self.emit_const(ValType::I64, off as i64).id
-                    };
-                    return Ok((base, desc));
+                    return Ok((self.emit_own_data(off), desc));
                 }
                 // An aggregate passed by address: its slot value *is* the address.
                 if let Some(desc @ TyDesc::Agg(_)) = self.local_desc.get(name).cloned() {
@@ -5131,6 +5172,17 @@ impl<'a> FuncGen<'a> {
                 if let Some(c) = char_literal(a) {
                     return Ok(self.emit_const(ValType::I32, c)); // char literal `'0'` / `'\0A'`
                 }
+                // A string literal as a value is a C string (`var s: cstring = ""`, `(call f "lit")`,
+                // an inlined `cstring` const): the address of its NUL-terminated bytes. (A nim
+                // `string` literal is an `oconstr`, and a long one's bytes a `const`, never this.)
+                if is_string_literal(e) {
+                    let off = self.t.intern_cstr(a)?;
+                    let id = self.emit_own_data(off);
+                    return Ok(Val {
+                        id,
+                        ty: ValType::I64,
+                    });
+                }
                 // A bare **proc name in value position** is a *funcref* — its `i32` function index
                 // (`ref.func`), not a data address. nimony passes proc addresses as arguments
                 // (`setExitFlush(flushStdStreams)` registers the at-exit stdout flush, `atexit`
@@ -6290,11 +6342,15 @@ impl<'a> FuncGen<'a> {
         id
     }
 
-    /// A relocatable address of this unit's own data at `off` (`data.self`). Resolved to a concrete
-    /// window address by `link`; touching the window, so it forces the `memory` declaration.
-    fn emit_data_self(&mut self, off: u64) -> u32 {
-        let id = self.fresh();
+    /// The address of this unit's own data at `off` (a global, a C string literal): a fixed absolute
+    /// offset in a runnable module, or a relocatable `data.self <off>` in a link unit, which the
+    /// linker rewrites on placement. Touching the window, so it forces the `memory` declaration.
+    fn emit_own_data(&mut self, off: u64) -> u32 {
         self.used_memory = true;
+        if !self.t.link_mode {
+            return self.emit_const(ValType::I64, off as i64).id;
+        }
+        let id = self.fresh();
         self.cur_buf
             .push_str(&format!("  v{id} = data.self {off}\n"));
         id
