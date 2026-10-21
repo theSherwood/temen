@@ -138,11 +138,12 @@ pub fn run_on_then<R>(
                     SchedStop::Declined => return None,
                     // #2495, #1414 D4 — a host-answered call: told as the thread makes it, and the
                     // run idles on it once nothing else can run. This harness answers none itself;
-                    // a thread of the embedder's answers it, so look again shortly.
+                    // a thread of the embedder's answers it, so look again shortly. It feeds no
+                    // input either, so a run idle on a read stopped early. Ask the run that, not
+                    // whether a call is still owed: its answer can land between the stop and the
+                    // question.
                     SchedStop::CapPark { .. } => continue,
-                    SchedStop::Idle { .. } if d.cap_parked().is_some() => {
-                        std::thread::sleep(ANSWER_POLL)
-                    }
+                    SchedStop::Idle { .. } if !d.stdin_parked() => std::thread::sleep(ANSWER_POLL),
                     other => panic!("the debug scheduler stopped early: {other:?}"),
                 }
             };
