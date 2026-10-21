@@ -6461,7 +6461,7 @@ fn define_funcs(
                     .map_err(|e| JitError::Backend(e.to_string()))?;
                 #[cfg(test)]
                 record_emitted(module, code.code_buffer(), &relocs);
-                #[cfg(test)]
+                #[cfg(all(test, target_arch = "x86_64"))]
                 validate::capture_code(code.code_buffer(), &code.bb_starts);
                 let kept = keep
                     .as_mut()

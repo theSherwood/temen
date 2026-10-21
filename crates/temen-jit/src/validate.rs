@@ -55,12 +55,16 @@ pub(crate) fn shadow_check(bytes: &[u8], bb_starts: &[u32]) {
 }
 
 // --- test-only capture of real compiled code, cross-checked against iced-x86 ---
+//
+// The whole subsystem exists only for the x86-64 decoder cross-check (`x86::tests`), and its one
+// caller in `lib.rs` is gated to match, so it is `all(test, target_arch = "x86_64")` — on another
+// target (the aarch64 clippy lane) it would be dead code under `-D warnings`.
 
 /// One captured function's machine code and its basic-block start offsets.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 type CapturedFn = (Vec<u8>, Vec<u32>);
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 thread_local! {
     /// When armed, each function the compile defines appends its `(code, bb_starts)` here, so a test
     /// can decode real Cranelift output and compare our decoder to iced-x86.
@@ -69,7 +73,7 @@ thread_local! {
 }
 
 /// Record one defined function's code + block starts, if a test armed the capture.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) fn capture_code(code: &[u8], bb_starts: &[u32]) {
     CAPTURE.with(|c| {
         if let Some(v) = c.borrow_mut().as_mut() {
@@ -79,13 +83,13 @@ pub(crate) fn capture_code(code: &[u8], bb_starts: &[u32]) {
 }
 
 /// Arm capture, clearing anything held.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) fn arm_capture() {
     CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
 }
 
 /// Take the captured functions.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) fn take_capture() -> Vec<CapturedFn> {
     CAPTURE.with(|c| c.borrow_mut().take().unwrap_or_default())
 }
