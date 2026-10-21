@@ -1097,6 +1097,10 @@ jobs:
           # children, each on its own Worker in its own minted WebAssembly.Memory, grown on vm_map;
           # the exhausted WindowMinter refuses a fourth.
           node browser-par-detached-test.mjs
+          # #1414 S5a: executor 2 at parity with the pump on what a page sees — its stdout streams as the
+          # threads write it (in buffer order, across Workers), a stop ends a spinning or sleeping run
+          # without a reload and the engine runs on, and its files and frame come back as the pump's do.
+          node browser-x2-parity-test.mjs
           # wasm-JIT reactor differential: each committed reactor guest (bounce/life/mandelzoom) must
           # render byte-identically on the interpreter and the emitted-wasm tier (cap-call outlining).
           # Reuses the threads module built above + the committed `.temen` assets — no extra toolchain.

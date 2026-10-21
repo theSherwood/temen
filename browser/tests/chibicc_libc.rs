@@ -64,18 +64,19 @@ fn compile(chibicc: &temen_ir::Module, src: &str) -> temen_ir::Module {
 }
 
 /// **A release run pumped in slices** — the tier-up session with no regions (`COOP_NO_REGIONS`,
-/// `temen_coop_run_for`): each slice hands back the output it produced, a program that never ends
-/// keeps reporting `COOP_RUN_PAUSED` (so the embedder can stream it and stop pumping on Pause), and a
-/// finite program pumped in small slices ends with exactly the one-shot run's output and exit code.
+/// `temen_coop_run_for`): the run's output streams as the guest writes it (the run's tee, heard here
+/// through [`set_stream_sink`]), a program that never ends keeps reporting `COOP_RUN_PAUSED` (so the
+/// embedder can stream it and stop pumping on Pause), and a finite program pumped in small slices ends
+/// with exactly the one-shot run's output and exit code in the stdout slot.
 /// A trap ends it with the one-shot run's trap name and fault address, and the files the program
 /// wrote stay readable (`temen_coop_fs_image`) after the session closes.
 #[test]
 fn a_release_run_pumps_in_slices() {
     use temen_browser::{
-        temen_alloc, temen_coop_close, temen_coop_fs_image, temen_coop_fs_ptr, temen_coop_open,
-        temen_coop_run_for, temen_exit_code, temen_fault_addr, temen_status, temen_stdout_len,
-        temen_stdout_ptr, temen_trap_len, temen_trap_ptr, COOP_NO_REGIONS, COOP_RUN_DONE,
-        COOP_RUN_PAUSED, COOP_RUN_TRAP,
+        set_stream_sink, temen_alloc, temen_coop_close, temen_coop_fs_image, temen_coop_fs_ptr,
+        temen_coop_open, temen_coop_run_for, temen_exit_code, temen_fault_addr, temen_status,
+        temen_stdout_len, temen_stdout_ptr, temen_trap_len, temen_trap_ptr, COOP_NO_REGIONS,
+        COOP_RUN_DONE, COOP_RUN_PAUSED, COOP_RUN_TRAP,
     };
     let Some(chibicc) = chibicc_temen() else {
         eprintln!("SKIP: chibicc.temen absent");
@@ -98,23 +99,23 @@ fn a_release_run_pumps_in_slices() {
         );
         assert_eq!(opened, STATUS_OK);
     };
-    let slice_out = || {
+    // The stdout slot: the whole run's output, once it has ended.
+    let run_out = || {
         let (p, n) = (temen_stdout_ptr(), temen_stdout_len());
         if p.is_null() || n == 0 {
-            return Vec::new(); // a slice that printed nothing
+            return Vec::new();
         }
         // SAFETY: the stash stays live until the next call that replaces it.
         unsafe { core::slice::from_raw_parts(p, n) }.to_vec()
     };
     // Pump to the end in `budget`-op slices: the output, and how many slices it took.
     let drain = |budget: u64| {
-        let (mut out, mut slices) = (Vec::new(), 0);
+        let mut slices = 0;
         loop {
             let r = temen_coop_run_for(budget);
-            out.extend(slice_out());
             slices += 1;
             if r == COOP_RUN_DONE || r == COOP_RUN_TRAP {
-                return (out, slices);
+                return (run_out(), slices);
             }
             assert_eq!(r, COOP_RUN_PAUSED);
         }
@@ -124,18 +125,24 @@ fn a_release_run_pumps_in_slices() {
         &chibicc,
         "#include <stdio.h>\nint main(void) {\n  for (int i = 0; i < 3; i++) printf(\"line %d\\n\", i);\n  for (;;) {}\n}\n",
     );
+    let streamed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = std::rc::Rc::clone(&streamed);
+    set_stream_sink(Some(Box::new(move |fd, _seq, bytes| {
+        if fd == 1 {
+            sink.borrow_mut().extend_from_slice(bytes);
+        }
+    })));
     open(&spin);
-    let mut out = Vec::new();
     for _ in 0..50 {
         assert_eq!(
             temen_coop_run_for(100_000),
             COOP_RUN_PAUSED,
             "an endless loop keeps running"
         );
-        out.extend(slice_out());
     }
+    set_stream_sink(None);
     assert_eq!(
-        String::from_utf8_lossy(&out),
+        String::from_utf8_lossy(&streamed.borrow()),
         "line 0\nline 1\nline 2\n",
         "streamed as it ran"
     );

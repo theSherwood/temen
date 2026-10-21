@@ -14,6 +14,9 @@
 //!
 //! #2480 — nor does the pump sleep through a kill while a host call is outstanding: its idle wait
 //! for the call's answer is a wait on the same bell, which the call's store rings too.
+//!
+//! #1414 S5a — an embedder's stop ([`bytecode::RunStop`]) ends a parallel run the same way, and asking
+//! never waits for the run: a browser page asks on its main thread, which cannot block.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -210,5 +213,116 @@ fn a_kill_is_not_slept_through_while_a_call_waits() {
     assert!(
         r.is_err(),
         "the killed root is finalized, not returned: {r:?}"
+    );
+}
+
+/// A thread that spins forever, which the root joins.
+const SPIN_THREAD: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  vsp = i64.const 0
+  varg = i64.const 0
+  vt = thread.spawn 1 vsp varg
+  vj = thread.join vt
+  return vj
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  br 1(vz)
+}
+block 1 (vi: i64) {
+  vone = i64.const 1
+  vi2 = i64.add vi vone
+  br 1(vi2)
+  }
+}
+"#;
+
+/// Run `src` on executor 2 with `stop`, on a thread of its own: its result arrives on the receiver.
+fn run_parallel_with_stop(
+    src: &str,
+    stop: &Arc<bytecode::RunStop>,
+) -> std::sync::mpsc::Receiver<Result<Vec<Value>, Trap>> {
+    let m = temen_text::parse_module(src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let stop = Arc::clone(stop);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut host = Host::new();
+        host.set_run_stop(stop);
+        let mut fuel = u64::MAX;
+        let r = bytecode::compile_and_run_capture_over_parallel_with_host(
+            &m,
+            0,
+            &[],
+            &mut fuel,
+            &[],
+            None,
+            &mut host,
+        );
+        let _ = tx.send(r.expect("the parallel driver runs this module").0);
+    });
+    rx
+}
+
+/// Ask until the run is told: a busy lock answers `false`, and asking again is the caller's part.
+fn stop_now(stop: &bytecode::RunStop) {
+    while !stop.request() {
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn a_stop_ends_a_parallel_run_whose_tasks_all_sleep() {
+    let stop = Arc::new(bytecode::RunStop::default());
+    let rx = run_parallel_with_stop(SLEEP_30S, &stop);
+    // The root is in its wait (or about to be: a stop asked earlier ends it there too).
+    std::thread::sleep(Duration::from_millis(50));
+    stop_now(&stop);
+    let r = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the stopped run slept on to its deadline");
+    assert_eq!(
+        r,
+        Err(Trap::OutOfFuel),
+        "a stopped run ends as one whose fuel ran out"
+    );
+}
+
+#[test]
+fn a_stop_ends_a_parallel_run_whose_thread_spins() {
+    let stop = Arc::new(bytecode::RunStop::default());
+    let rx = run_parallel_with_stop(SPIN_THREAD, &stop);
+    std::thread::sleep(Duration::from_millis(50));
+    stop_now(&stop);
+    let r = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the stopped run spun on");
+    assert_eq!(r, Err(Trap::OutOfFuel));
+}
+
+/// A stop asked for before the run starts ends it at once; once withdrawn, the next run is its own.
+#[test]
+fn a_stop_asked_before_the_run_ends_it_and_a_reset_one_does_not() {
+    let stop = Arc::new(bytecode::RunStop::default());
+    stop_now(&stop);
+    let r = run_parallel_with_stop(SPIN_THREAD, &stop)
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a run stopped before it started ran on");
+    assert_eq!(r, Err(Trap::OutOfFuel));
+
+    stop.reset();
+    const RETURNS: &str =
+        "memory 16\nfunc () -> (i64) {\nblock 0 () {\n  v = i64.const 7\n  return v\n  }\n}\n";
+    let r = run_parallel_with_stop(RETURNS, &stop)
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the run ends");
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(7)]),
+        "a withdrawn stop leaves the next run be"
     );
 }

@@ -232,10 +232,12 @@ fn try_main() -> Result<(), String> {
                 let _ = std::io::stdin().lock().read_until(b'\n', &mut line);
                 Some(line)
             }));
-            host.set_stdout_tee(Box::new(|bytes: &[u8]| {
-                let mut out = std::io::stdout().lock();
-                out.write_all(bytes).ok();
-                out.flush().ok();
+            host.set_stream_tee(Box::new(|role, bytes: &[u8]| {
+                if role == temen_interp::StreamRole::Out {
+                    let mut out = std::io::stdout().lock();
+                    out.write_all(bytes).ok();
+                    out.flush().ok();
+                }
             }));
         };
         let host_setup: Option<&mut dyn FnMut(&mut temen_interp::Host)> =

@@ -15372,6 +15372,49 @@ struct ThreadRun {
     /// Whether the run is over ([`Threads::over`]), for emitted code to read without the lock
     /// ([`EmittedCall::over`]).
     over: std::sync::atomic::AtomicBool,
+    /// The embedder's way to stop the run from outside it ([`Host::set_run_stop`]), if it has one.
+    stop: Option<std::sync::Arc<RunStop>>,
+}
+
+/// A request, from outside a run on executor 2, to stop it (#1414 S5a). Asking never waits for the
+/// run: a browser asks from its page's main thread, which cannot block. The run ends as one whose
+/// fuel ran out ([`Trap::OutOfFuel`]): the embedder that gave the run its fuel takes it back. Its
+/// threads leave at their next look, a parked one woken for it, and emitted code at its next fuel
+/// check. Hand it to the run's host ([`Host::set_run_stop`]), and [`reset`](Self::reset) it before
+/// the next run.
+#[derive(Default)]
+pub struct RunStop {
+    requested: std::sync::atomic::AtomicBool,
+    /// The run it stops, while one is live. A request reaches the run under this lock, which the run
+    /// takes to let go of it ([`drive_threads`]), so the asker never holds the run last: the page's
+    /// main thread must not run its teardown.
+    run: std::sync::Mutex<std::sync::Weak<ThreadRun>>,
+}
+
+impl RunStop {
+    /// Ask the run to stop: `true` once it has been told, or when none is live (a run that starts
+    /// later stops at once); `false` when its lock was busy, and the caller asks again.
+    pub fn request(&self) -> bool {
+        use std::sync::TryLockError;
+        self.requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let live = match self.run.try_lock() {
+            Ok(w) => w,
+            Err(TryLockError::Poisoned(w)) => w.into_inner(),
+            Err(TryLockError::WouldBlock) => return false,
+        };
+        live.upgrade().is_none_or(|run| run.try_stop())
+    }
+
+    /// Withdraw a request, so the next run starts unstopped.
+    pub fn reset(&self) {
+        self.requested
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn requested(&self) -> bool {
+        self.requested.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// How executor 2, the parallel driver, starts a run's threads, reads its clock, and runs its emitted
@@ -15607,7 +15650,7 @@ impl Drop for ThreadExit<'_> {
         let mut g = self.0.state.lock_unpoisoned();
         if std::thread::panicking() {
             g.panicked = true;
-            self.0.end(&mut g);
+            self.0.end(&mut g, Err(Trap::ThreadFault));
         }
         g.live -= 1;
         if g.live == 0 {
@@ -15677,6 +15720,7 @@ fn drive_threads(
         }
     };
     let bell = host.external_wake();
+    let stop = host.run_stop();
     let platform = host.thread_platform();
     // The platform's tier emits the run's own program, and each granted module a child runs
     // (#1414 ED-2).
@@ -15712,7 +15756,15 @@ fn drive_threads(
         bell,
         ended: std::sync::Condvar::new(),
         over: std::sync::atomic::AtomicBool::new(false),
+        stop,
     });
+    if let Some(stop) = &run.stop {
+        *stop.run.lock_unpoisoned() = std::sync::Arc::downgrade(&run);
+        // A stop asked for before the run was there to be told.
+        if stop.requested() {
+            run.end(&mut run.state.lock_unpoisoned(), Err(Trap::OutOfFuel));
+        }
+    }
     let (view, hand) = run.state.lock_unpoisoned().hand(None);
     if let Some(bell) = run.bell.clone() {
         // The ring count before the run starts, so the watcher misses no ring the run makes.
@@ -15722,7 +15774,12 @@ fn drive_threads(
         run.start_thread(move || r.watch(&bell, seen), None);
     }
     run_task_thread(std::sync::Arc::clone(&run), 0, view, hand);
-    // The run is over, and every thread leaves at its next look: wait for them all to go.
+    // The run is over, so a stop has nothing left to tell it: it lets go of the run now, while this
+    // thread still holds it ([`RunStop::run`]).
+    if let Some(stop) = &run.stop {
+        *stop.run.lock_unpoisoned() = std::sync::Weak::new();
+    }
+    // Every thread leaves at its next look: wait for them all to go.
     let mut g = run.state.lock_unpoisoned();
     while g.live > 0 {
         g = run.ended.wait(g).unwrap_or_else(|e| e.into_inner());
@@ -16200,10 +16257,25 @@ impl ThreadRun {
         }
     }
 
-    /// End the run with `ThreadFault` (if it is not over already) and wake every thread to see it.
-    fn end(&self, g: &mut Threads) {
-        self.conclude(g, Err(Trap::ThreadFault));
+    /// End the run with `res` (if it is not over already) and wake every thread to see it.
+    fn end(&self, g: &mut Threads, res: Result<Vec<Value>, Trap>) {
+        self.conclude(g, res);
         g.woken = g.parks.clone();
+    }
+
+    /// [`RunStop::request`]'s half: end the run as stopped and wake its threads, unless its lock is
+    /// busy (`false`, and the caller asks again). It never waits. The bell watcher leaves once a
+    /// woken thread does ([`ThreadExit`]).
+    fn try_stop(&self) -> bool {
+        use std::sync::TryLockError;
+        let mut g = match self.state.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(g)) => g.into_inner(),
+            Err(TryLockError::WouldBlock) => return false,
+        };
+        self.end(&mut g, Err(Trap::OutOfFuel));
+        release(g);
+        true
     }
 
     /// Start `f` on a thread of its own, one the run has counted in ([`Threads::live`]). A thread
@@ -16214,7 +16286,7 @@ impl ThreadRun {
         if (self.platform.spawn)(Box::new(f), window).is_err() {
             let mut g = self.state.lock_unpoisoned();
             g.live -= 1;
-            self.end(&mut g);
+            self.end(&mut g, Err(Trap::ThreadFault));
             release(g);
             self.ring();
         }
@@ -16324,6 +16396,10 @@ impl ThreadRun {
         );
         interrupt_parks(&mut core.tasks, &core.extra_envs, &self.root);
         if g.over.is_some() {
+            return;
+        }
+        if self.stop.as_ref().is_some_and(|s| s.requested()) {
+            self.end(g, Err(Trap::OutOfFuel));
             return;
         }
         let core = &g.core;

@@ -1015,6 +1015,9 @@ struct ParIoCfg {
     /// [`RUN_ENV`]), seeded before the data segments exactly as the single-threaded on-ramp seeds it.
     /// Empty for none.
     init: Vec<u8>,
+    /// The last frame the guest presented through `display` (the on-ramp recipe's), for the run's
+    /// report as the pump's carries it.
+    frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
 }
 
 /// The leaked [`ParIoCfg`] pointer (or `0`), shared across Workers via shared linear memory.
@@ -1031,18 +1034,24 @@ static PAR_IO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::
 pub extern "C" fn temen_par_powerbox_io() -> i32 {
     let mut host = Host::new();
     let out = host.grant_stream(StreamRole::Out);
-    par_publish_io(host, Some(out), Vec::new());
+    par_publish_io(host, Some(out), Vec::new(), Default::default());
     1
 }
 
 /// Publish `host` as the run's shared I/O powerbox (clearing the other recipes). Leaked: the run
 /// holds a `&'static` borrow of it, and the next publish replaces the pointer.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
-fn par_publish_io(host: Host, out: Option<i32>, init: Vec<u8>) {
+fn par_publish_io(
+    host: Host,
+    out: Option<i32>,
+    init: Vec<u8>,
+    frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
+) {
     let cfg = Box::into_raw(Box::new(ParIoCfg {
         host: std::sync::Mutex::new(host),
         out,
         init,
+        frame,
     }));
     PAR_IO.store(cfg as usize, std::sync::atomic::Ordering::Release);
     PAR_INST.store(0, std::sync::atomic::Ordering::Release);
@@ -1084,8 +1093,8 @@ pub extern "C" fn temen_par_powerbox_onramp(
     }
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
-    grant_onramp_caps(&mut host, &m, None, None);
-    par_publish_io(host, None, onramp_env_init(&run_env()));
+    let frame = grant_onramp_caps(&mut host, &m, None, None).frame;
+    par_publish_io(host, None, onramp_env_init(&run_env()), frame);
     1
 }
 
@@ -1173,16 +1182,18 @@ fn par_jit_rt() -> Option<&'static ParJitCfg> {
 
 /// Pointer / length of the accumulated stdout in the run's shared I/O powerbox (4d). Call `len`
 /// **first** — it snapshots the buffer under the powerbox lock into a stable stash `ptr` then reads —
-/// after the run completes (a mid-run call sees a prefix). `0` when no
+/// after the run completes: the run holds the powerbox's host while it runs, so a mid-run call reads
+/// none of its output, which streams through `stream_chunk` instead (#1414 S5a). `0` when no
 /// [`temen_par_powerbox_io`] was published.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_stdout_len() -> usize {
     let Some(io) = par_io() else { return 0 };
-    let bytes = {
-        let g = io.host.lock().unwrap_or_else(|e| e.into_inner());
-        g.stdout.clone()
-    };
+    let bytes = io
+        .host
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .stdout_bytes();
     // SAFETY: the stash slot is only touched from the main thread (the JS host reads results after
     // the run), matching the `temen_run_pb` accessors' single-reader contract.
     unsafe { stash(&mut *core::ptr::addr_of_mut!(PAR_OUT), bytes) };
@@ -1203,10 +1214,11 @@ static mut PAR_OUT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 #[no_mangle]
 pub extern "C" fn temen_par_stderr_len() -> usize {
     let Some(io) = par_io() else { return 0 };
-    let bytes = {
-        let g = io.host.lock().unwrap_or_else(|e| e.into_inner());
-        g.stderr.clone()
-    };
+    let bytes = io
+        .host
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .stderr_bytes();
     // SAFETY: as `temen_par_stdout_len` — main-thread single-reader stash.
     unsafe { stash(&mut *core::ptr::addr_of_mut!(PAR_ERR), bytes) };
     unsafe { (*core::ptr::addr_of!(PAR_ERR)).1 }
@@ -1814,6 +1826,10 @@ pub extern "C" fn temen_x2_start(
             }
         }
     };
+    // Whatever the recipe, the run's output streams as it is written (#1414 S5a), and the page can
+    // stop it ([`temen_x2_stop`]).
+    host.set_stream_tee(stream_tee());
+    host.set_run_stop(std::sync::Arc::clone(x2_stop()));
     // §22 units run emitted when codegen asks and the run's table can fill every slot their
     // `call.dyn`s may reach, as on the coop driver.
     let codegen = codegen && all_shimmable(&m);
@@ -1875,15 +1891,49 @@ pub extern "C" fn temen_x2_start(
     let ran = bytecode::compile_and_run_capture_over_parallel_with_host(
         &m, 0, &args, &mut fuel, &init, back, &mut host,
     );
+    // The files the run ended with, read as the pump's are ([`temen_coop_fs_image`]).
+    let fs = temen_fs::vm_fs_image(&host);
+    let framebuffer = io.and_then(|io| io.frame.lock().unwrap_or_else(|e| e.into_inner()).take());
     if let Some(io) = io {
         *io.host.lock().unwrap_or_else(|e| e.into_inner()) = host;
     } else if let Some(cfg) = rt {
         *cfg.host.lock().unwrap_or_else(|e| e.into_inner()) = host;
     }
+    // SAFETY: the page reads the image back only after the run's end message, as it does the
+    // report's slots.
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(FS_IMAGE), fs) };
     // The run reports as every browser run does (#1414 S4-1), a memory fault's address included
     // (#2275): the driver records the first fault of any of the run's threads, interpreted or
-    // emitted. Its output went out through the powerbox as it ran, so the report carries none.
-    PbOutcome::ended(ran.map(|(r, _)| r), Vec::new(), Vec::new()).publish()
+    // emitted. Its output stays in the powerbox for `temen_par_stdout_len` to read.
+    PbOutcome {
+        framebuffer,
+        ..PbOutcome::ended(ran.map(|(r, _)| r), Vec::new(), Vec::new())
+    }
+    .publish()
+}
+
+/// The stop every run on executor 2 takes ([`temen_x2_stop`]): one at a time runs, so one serves.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+fn x2_stop() -> &'static std::sync::Arc<bytecode::RunStop> {
+    static STOP: std::sync::OnceLock<std::sync::Arc<bytecode::RunStop>> =
+        std::sync::OnceLock::new();
+    STOP.get_or_init(Default::default)
+}
+
+/// #1414 S5a: stop the run on executor 2 (`ask` nonzero), or withdraw a stop before the next run
+/// starts (`ask` zero: the page calls it as it sets one up). Asking never blocks, so the page calls
+/// it on its main thread: `1` once the run has been told, or holds none; `0` when its lock was busy,
+/// and the page asks again. A stopped run ends as one whose fuel ran out, its threads leaving at
+/// their next look, and its Workers close as after any run, so the engine stays usable.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_stop(ask: i32) -> i32 {
+    let stop = x2_stop();
+    if ask == 0 {
+        stop.reset();
+        return 1;
+    }
+    i32::from(stop.request())
 }
 
 // ---- host powerbox: console + clock, marshalled through host-allocated memory ----------------
@@ -2566,6 +2616,8 @@ fn grant_onramp_caps(
     declared: Option<(&[String], &temen_interp::CapRequests)>,
 ) -> OnrampCaps {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    // Its stdout and stderr stream to the embedder as the guest writes them (#1141, #1414 S5a).
+    host.set_stream_tee(stream_tee());
     // §3.5: register the running module's self-referential surface, as `temen-run`'s `grant_caps`
     // does — "the one place every run path registers the running module". Without it `self.type_id`,
     // `self.covers`, `export.handle` and `call.import.dyn` fail closed here but not under the CLI,
@@ -2735,11 +2787,11 @@ fn nest_onramp(
 /// shape is fail-closed (`STATUS_UNSUPPORTED`). The `fs` capability (SQLite Phase B, Lua
 /// `files.lua`) is a `host_proc` resolved by name — a Stage-1 follow-on, not part of this prefix.
 pub fn onramp_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
-    onramp_exec_with_tee(m, stdin, &[], None)
+    onramp_exec_with_env(m, stdin, &[])
 }
 
 /// The §3e environment (`KEY=VALUE` entries) every on-ramp run the FFI starts is given —
-/// [`temen_run_onramp`], its streaming twin, the link-and-run entries, and the parallel Worker
+/// [`temen_run_onramp`], the link-and-run entries, and the parallel Worker
 /// driver's [`temen_par_powerbox_onramp`] — set by [`temen_set_run_env`]. Empty (the default) seeds
 /// nothing, so a run is byte-identical to one with no environment. This is how a language runtime is
 /// handed per-run configuration by its embedder (#1777; JACL's worker-pool size, jacl #152). The Rust
@@ -2791,19 +2843,10 @@ fn onramp_env_init(env: &[Vec<u8>]) -> Vec<u8> {
     args_init_mem_raw(&temen_ir::write_args_blob(&[], &refs))
 }
 
-/// [`onramp_exec`] with an environment and an optional **live stdout tee** ([`Host::set_stdout_tee`]).
-/// `env` (`KEY=VALUE` entries; empty for none) is seeded as the §3e blob a `getenv` or a language
-/// runtime reads. `tee` is called with each stdout chunk as the guest produces it (the browser
-/// playground relays it to the page for live streaming). The captured `stdout` in the returned
-/// [`PbOutcome`] is unchanged — the tee is additive — so callers that read the final bytes (and the
-/// interp≡JIT differential) are unaffected.
-pub fn onramp_exec_with_tee(
-    m: &temen_ir::Module,
-    stdin: &[u8],
-    env: &[Vec<u8>],
-    tee: Option<temen_interp::StdoutTee>,
-) -> PbOutcome {
-    onramp_run(m, stdin, env, tee, true, None)
+/// [`onramp_exec`] with an environment: `env` (`KEY=VALUE` entries; empty for none) is seeded as the
+/// §3e blob a `getenv` or a language runtime reads.
+pub fn onramp_exec_with_env(m: &temen_ir::Module, stdin: &[u8], env: &[Vec<u8>]) -> PbOutcome {
+    onramp_run(m, stdin, env, true, None)
 }
 
 /// [`onramp_exec`] at the **root** position — the oracle for a tier that still runs a card at the root
@@ -2811,16 +2854,15 @@ pub fn onramp_exec_with_tee(
 /// capabilities by name runs identically either way; one that hardcodes the §3e prefix's handle
 /// numbers (a driver fixture) only at the root.
 pub fn onramp_exec_root(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
-    onramp_run(m, stdin, &[], None, false, None)
+    onramp_run(m, stdin, &[], false, None)
 }
 
-/// The on-ramp run behind [`onramp_exec_with_tee`] and [`onramp_exec_root`]: `nested` runs `m` as a
+/// The on-ramp run behind [`onramp_exec_with_env`] and [`onramp_exec_root`]: `nested` runs `m` as a
 /// one-node plan's child where it can be one ([`nest_onramp`]), else at the root.
 fn onramp_run(
     m: &temen_ir::Module,
     stdin: &[u8],
     env: &[Vec<u8>],
-    tee: Option<temen_interp::StdoutTee>,
     nested: bool,
     memo: Option<std::sync::Arc<std::sync::Mutex<temen_interp::bytecode::FuncMemo>>>,
 ) -> PbOutcome {
@@ -2829,9 +2871,6 @@ fn onramp_run(
         return PbOutcome::refused(STATUS_UNSUPPORTED);
     }
     let mut host = Host::new();
-    if let Some(t) = tee {
-        host.set_stdout_tee(t);
-    }
     // #2168 — a program linked against resident libraries compiles through their memo: the root
     // grants it, so its compile as the nested child goes through this host.
     if let Some(memo) = memo {
@@ -4689,7 +4728,7 @@ pub extern "C" fn temen_run_pb(
 /// `temen_stdout_ptr`+`temen_stdout_len` / `temen_stderr_ptr`+`temen_stderr_len`, the exit code via
 /// [`temen_exit_code`], and the status via [`temen_status`]. Returns the guest's `i64` result. The
 /// captures share `OUT`/`ERR`/`EXIT_CODE` with `temen_run_pb` — read them before the next call either
-/// export makes.
+/// export makes. Its output also streams to the page as the guest writes it ([`stream_tee`]).
 #[no_mangle]
 pub extern "C" fn temen_run_onramp(
     mod_ptr: *const u8,
@@ -4708,58 +4747,59 @@ pub extern "C" fn temen_run_onramp(
         Ok(m) => m,
         Err(_) => return PbOutcome::refused(STATUS_DECODE_ERR).publish(),
     };
-    onramp_exec_with_tee(&m, stdin, &run_env(), None).publish()
+    onramp_exec_with_env(&m, stdin, &run_env()).publish()
 }
 
-// The **live host import** for streamed stdout: the page's `temen_host.stdout_chunk` — called once per
-// stdout write with the chunk's `[ptr, ptr+len)` in linear memory, so the page appends it to the card's
-// output pane as the guest produces it. Wasm-only (like `webgpu_op`); native builds have no such import
-// and the streaming FFI degrades to plain capture. (Plain `//`: rustdoc rejects `///` on an extern block.)
+// The **live host import** for streamed output: the embedder's `temen_host.stream_chunk` — called once
+// per write to a run's stdout (`fd` 1) or stderr (`fd` 2), with the chunk's `[ptr, ptr+len)` in linear
+// memory, so the page shows it as the guest produces it. `seq` numbers a run's chunks from 1 in the
+// order its buffers hold them, for an embedder that hears them from several Workers (#1414 S5a).
+// Wasm-only (like `webgpu_op`); native builds have no such import. (Plain `//`: rustdoc rejects `///`
+// on an extern block.)
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "temen_host")]
 extern "C" {
-    fn stdout_chunk(ptr: *const u8, len: usize);
+    fn stream_chunk(fd: u32, seq: u32, ptr: *const u8, len: usize);
 }
 
-/// The tee handed to [`onramp_exec_with_tee`] on the streaming path: relay each chunk to the host import
-/// (wasm), or no-op (native — the FFI is never called there, but the closure must type-check).
-fn stream_tee() -> Option<temen_interp::StdoutTee> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        Some(Box::new(|b: &[u8]| unsafe {
-            stdout_chunk(b.as_ptr(), b.len())
-        }))
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        None
-    }
+/// What a native build hands each chunk to in place of the wasm build's `stream_chunk` import:
+/// `(fd, seq, bytes)`, for a test to hear a run's output as the guest writes it ([`set_stream_sink`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub type StreamSink = Box<dyn FnMut(u32, u32, &[u8])>;
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    static STREAM_SINK: std::cell::RefCell<Option<StreamSink>> = const { std::cell::RefCell::new(None) };
 }
 
-/// **Streaming twin of [`temen_run_onramp`]**: identical (decode → `onramp_exec` → stash the captured
-/// streams + exit + value into the read-back slots), except stdout is **teed live** to the page's
-/// `temen_host.stdout_chunk` import as the guest writes it. The final captured `stdout` is still stashed
-/// into `OUT` (so `temen_stdout_ptr`/`_len` return the whole output too, and a non-streaming caller sees
-/// no change). The host provides the import; on a Worker it relays each chunk to the page mid-run.
-#[no_mangle]
-pub extern "C" fn temen_run_onramp_stream(
-    mod_ptr: *const u8,
-    mod_len: usize,
-    stdin_ptr: *const u8,
-    stdin_len: usize,
-) -> i64 {
-    // SAFETY: the host guarantees both ranges are live `temen_alloc`ations it just filled.
-    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
-        &[]
-    } else {
-        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
-    };
-    let m = match temen_encode::decode_module(bytes) {
-        Ok(m) => m,
-        Err(_) => return PbOutcome::refused(STATUS_DECODE_ERR).publish(),
-    };
-    onramp_exec_with_tee(&m, stdin, &run_env(), stream_tee()).publish()
+/// Install this thread's [`StreamSink`], or with `None` remove it: a native build's twin of a page
+/// setting `globalThis.__temen_stream_chunk`. It hears the writes made on this thread, which for a
+/// pump run is every write, since the pump runs on its caller's thread.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_stream_sink(sink: Option<StreamSink>) {
+    STREAM_SINK.with(|s| *s.borrow_mut() = sink);
+}
+
+/// The tee every browser run's stdout and stderr go through ([`Host::set_stream_tee`]): each write,
+/// numbered, to the [`stream_chunk`] import, or natively to this thread's [`StreamSink`]. A no-op
+/// until the embedder installs a sink.
+fn stream_tee() -> temen_interp::StreamTee {
+    let mut seq = 0u32;
+    Box::new(move |role, b: &[u8]| {
+        seq = seq.wrapping_add(1);
+        let fd = if role == StreamRole::Err { 2 } else { 1 };
+        #[cfg(target_arch = "wasm32")]
+        // SAFETY: the import reads `[ptr, ptr+len)` of linear memory during the call only.
+        unsafe {
+            stream_chunk(fd, seq, b.as_ptr(), b.len());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        STREAM_SINK.with(|s| {
+            if let Some(sink) = s.borrow_mut().as_mut() {
+                sink(fd, seq, b);
+            }
+        });
+    })
 }
 
 // ===== warm-runtime snapshot: init once, restore-per-Run for a two-phase on-ramp guest ============
@@ -5078,12 +5118,7 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
     s.restore_warm_window();
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
-    // Live-stream stdout as the eval writes it (#1142). The tee fires the `stdout_chunk` host import,
-    // which the page relays only while a streaming Run is active — a no-op otherwise, so the batch
-    // warm path is unaffected.
-    if let Some(t) = stream_tee() {
-        host.set_stdout_tee(t);
-    }
+    // The eval's output streams as it writes it (#1142), as every on-ramp powerbox's does.
     let _ = grant_onramp_caps(&mut host, &s.module, None, None);
     let mut fuel = DEFAULT_FUEL;
     // Re-establish the warmup image's page-state entries (no zeroing — the memcpy above restored
@@ -6774,7 +6809,7 @@ fn link_run_stash(
         }
     };
 
-    onramp_run(&module, stdin, &run_env(), None, true, memo).publish()
+    onramp_run(&module, stdin, &run_env(), true, memo).publish()
 }
 
 /// A [`LinkSet`]'s compile memo, as a run takes it.
@@ -9588,9 +9623,6 @@ struct CoopTierupRun {
     caps: Vec<String>,
     /// #1954: the calls parked on those caps, by completion id (filled by the procs' submit hooks).
     requests: temen_interp::CapRequests,
-    /// #1954: the run is pumped in slices ([`temen_coop_run_for`]), so each return hands back the
-    /// output produced since the last, not the whole run's at the end.
-    sliced: bool,
     /// #816 item 4: a warm-coop run — at DONE/TRAP the warm session's heap high-water advances (so
     /// the next restore zeroes what this eval dirtied), and [`temen_warm_close`] must drop this run
     /// before freeing the window it borrows.
@@ -9803,7 +9835,6 @@ impl CoopTierupRun {
             module: 0,
             caps: Vec::new(),
             requests: temen_interp::CapRequests::default(),
-            sliced: false,
             warm: false,
             reactor: false,
             emitted_wasm: std::sync::Arc::from([]),
@@ -10454,9 +10485,9 @@ pub extern "C" fn temen_coop_run() -> i32 {
 }
 
 /// #1954: [`temen_coop_run`] for at most about `budget` interpreted ops — [`COOP_RUN_PAUSED`] when the
-/// slice is spent. Emitted code is not counted: a leaf runs until it returns or parks. Once a run is
-/// pumped this way, every return leaves in the stdout/stderr slots the output produced since the
-/// last (the caller accumulates), where an unsliced run's are filled once, at the end.
+/// slice is spent. Emitted code is not counted: a leaf runs until it returns or parks. The output
+/// streams as the run makes it ([`stream_tee`]), and the stdout/stderr slots hold all of it at the end,
+/// sliced or not.
 #[no_mangle]
 pub extern "C" fn temen_coop_run_for(budget: u64) -> i32 {
     coop_pump(Some(budget))
@@ -10468,25 +10499,10 @@ fn coop_pump(budget: Option<u64>) -> i32 {
         unsafe { LAST_STATUS = STATUS_UNSUPPORTED };
         return COOP_RUN_TRAP;
     };
-    s.sliced |= budget.is_some();
     let ev = match budget {
         Some(ops) => s.run.run_for(ops),
         None => s.run.run(),
     };
-    if s.sliced
-        && !matches!(
-            ev,
-            bytecode::CoopEvent::Done(_) | bytecode::CoopEvent::Trapped(_)
-        )
-    {
-        let mut host = s.run.host_mut();
-        let (out, err) = (host.take_stdout(), host.take_stderr());
-        // SAFETY: single-threaded wasm; the capture slots are read back only via the accessors.
-        unsafe {
-            stash(&mut *core::ptr::addr_of_mut!(OUT), out);
-            stash(&mut *core::ptr::addr_of_mut!(ERR), err);
-        }
-    }
     let (ran, ev) = match ev {
         bytecode::CoopEvent::TierUp {
             module,
@@ -10579,10 +10595,7 @@ fn coop_pump(budget: Option<u64>) -> i32 {
         Some(nim) => nimony::finish(nim),
         None => {
             let mut host = s.run.host_mut();
-            (
-                std::mem::take(&mut host.stdout),
-                std::mem::take(&mut host.stderr),
-            )
+            (host.take_stdout(), host.take_stderr())
         }
     };
     let mut out = PbOutcome {
@@ -10663,28 +10676,6 @@ pub extern "C" fn temen_coop_read(addr: u64, len: usize) -> usize {
 pub extern "C" fn temen_coop_read_ptr() -> *const u8 {
     // SAFETY: single-threaded wasm.
     unsafe { (*core::ptr::addr_of!(WINDOW_READ)).0 }
-}
-
-/// #1954: put the output a sliced run produced since the last pump return in the stdout/stderr slots
-/// — for a driver at a budget checkpoint inside a leaf, which returns to the pump only when the leaf
-/// ends or parks, to stream what the leaf's calls printed meanwhile. A no-op for an unsliced run
-/// (its output is handed over once, at the end) or when no session is open.
-#[no_mangle]
-pub extern "C" fn temen_coop_take_output() {
-    // SAFETY: single-threaded wasm; no engine frame is live while a leaf's host import runs.
-    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }) else {
-        return;
-    };
-    if !s.sliced {
-        return;
-    }
-    let mut host = s.run.host_mut();
-    let (out, err) = (host.take_stdout(), host.take_stderr());
-    // SAFETY: as above; the capture slots are read back only via the accessors.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), out);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), err);
-    }
 }
 
 /// #1954: the run's `vm_fs` files as a Temen fs-image blob ([`temen_fs::encode_image`], the DAP
