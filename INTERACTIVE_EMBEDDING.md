@@ -186,7 +186,7 @@ ordering, and browser counters match the native run of the same hook stream.
 > resume. It is wired into the browser cdylib as the console path: `temen_pg_open` boots a guest
 > suspended at the first stdin read, `pg_pump` returns on the park, and the query entry pushes bytes
 > and resumes (`browser/src/lib.rs`). Since #1414 S4-2 the console runs on the pump's suspend/resume
-> session (`CoopRun::set_suspend_on_idle`: the park returns `CoopEvent::Idle`), as the bash card does. What's **remaining** vs. the sketch below: it is packaged as
+> session (a `CoopRun`: the park returns `CoopEvent::Idle`), as the bash card does. What's **remaining** vs. the sketch below: it is packaged as
 > the `temen_pg_*` REPL/Postgres path, **not** as a generic `temen_dbg_provide_stdin` on the **W1 debug
 > session**. **Update 2026-07-30:** the `CapTape`/`seek`-replay half **landed** — the `temen-dap`
 > backend records nondeterministic cap inputs (clock / stdin `read` / host-fn) and replays the tape

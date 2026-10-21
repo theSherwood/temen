@@ -21605,6 +21605,23 @@ impl PoolShared {
 /// it when an answer posts, while a driver waits on it ([`Completions::wait_any`]).
 pub(crate) type Bell = Arc<(Mutex<u64>, Condvar)>;
 
+/// Ring `bell` once: count the ring, and wake whoever waits on it.
+pub(crate) fn ring(bell: &Bell) {
+    *bell.0.lock_unpoisoned() += 1;
+    bell.1.notify_all();
+}
+
+/// The hook a store calls each time an answer posts ([`Completions::set_notify`]): ring `bell`, for
+/// as long as it lasts.
+pub(crate) fn ring_on_answer(bell: &Bell) -> Arc<dyn Fn() + Send + Sync> {
+    let bell = Arc::downgrade(bell);
+    Arc::new(move || {
+        if let Some(bell) = bell.upgrade() {
+            ring(&bell);
+        }
+    })
+}
+
 /// Wait on `bell` until it rings past count `seen`, or for at most `within`: whether it rang.
 pub(crate) fn wait_for_ring(bell: &Bell, seen: u64, within: Option<std::time::Duration>) -> bool {
     let (rung, cv) = &**bell;
@@ -21895,13 +21912,7 @@ impl Completions {
             }
         };
         for (comps, _) in calls {
-            let bell = Arc::downgrade(bell);
-            comps.set_notify(Some(Arc::new(move || {
-                if let Some(bell) = bell.upgrade() {
-                    *bell.0.lock_unpoisoned() += 1;
-                    bell.1.notify_all();
-                }
-            })));
+            comps.set_notify(Some(ring_on_answer(bell)));
         }
         let arrived = |(comps, id): &(Arc<Completions>, u64)| {
             comps.mx.lock_unpoisoned().ready.contains_key(id)

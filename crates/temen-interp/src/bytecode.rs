@@ -3795,27 +3795,45 @@ pub fn compile_and_run_capture_over_parallel_with_host(
     back: Option<std::sync::Arc<super::Region>>,
     host: &mut Host,
 ) -> Option<Capture> {
-    // #1694 — executor 2 has no freeze driver, so a durable host is outside it: `None`, and the
-    // caller runs it where durability is kept, rather than here silently non-durable.
-    if host.is_durable() {
-        return None;
-    }
-    let c = compile_module_for(m, true)?;
-    if func as usize >= c.progs.len() {
-        return Some((Err(Trap::Malformed), Vec::new()));
-    }
-    let dom = Domain::new(c, host.jit_table_log2());
-    // #748 — the root's park-request door: a personality's `fork()`/blocking `waitpid` fires
-    // `ParkEvent`s through it (the same wiring the cooperative entries install); without it the ops
-    // degrade to `-ENOSYS`/the ECHILD poll and the `ForkSelf`/`ReapWait` rules never apply.
-    host.wire_park_door();
-    let mem = Mem::root(m, default_reserved_log2(), back, init_mem);
+    let (dom, mem) = match parallel_domain(m, func, host, default_reserved_log2(), back, init_mem)?
+    {
+        Ok(start) => start,
+        Err(t) => return Some((Err(t), Vec::new())),
+    };
     let (r, mem) = drive_threads(dom, func, args, fuel, mem, host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
         .unwrap_or_default();
     Some((r, snap))
+}
+
+/// What a run on executor 2 starts over: `m` compiled into its domain, the root window
+/// (`2^reserved_log2` bytes reserved, over `back` if given, `init_mem` seeded under `m`'s data), and
+/// `host`'s park-request door wired (#748: a personality's `fork()`/blocking `waitpid` fires
+/// `ParkEvent`s through it, as on the cooperative entries; without it the ops degrade to
+/// `-ENOSYS`/the ECHILD poll and the `ForkSelf`/`ReapWait` rules never apply). `None` if `m` is
+/// outside the engine's subset, or `host` is durable (#1694): executor 2 has no freeze driver, so the
+/// caller runs it where durability is kept, rather than here silently non-durable. `Some(Err)` if
+/// `entry` is out of range.
+fn parallel_domain(
+    m: &Module,
+    entry: FuncIdx,
+    host: &Host,
+    reserved_log2: u8,
+    back: Option<std::sync::Arc<super::Region>>,
+    init_mem: &[u8],
+) -> Option<Result<(Domain, Option<Mem>), Trap>> {
+    if host.is_durable() {
+        return None;
+    }
+    let c = compile_module_for(m, true)?;
+    if entry as usize >= c.progs.len() {
+        return Some(Err(Trap::Malformed));
+    }
+    let dom = Domain::new(c, host.jit_table_log2());
+    host.wire_park_door();
+    Some(Ok((dom, Mem::root(m, reserved_log2, back, init_mem))))
 }
 
 /// A persistent, single-vCPU **reactor instance** — the "instantiate once, call exports many times"
@@ -3893,7 +3911,9 @@ impl Reactor {
     /// Take back the window [`coop_call`](Self::coop_call) lent `run`, and the run's powerbox, once
     /// the run has ended.
     pub fn end_coop_call(&mut self, run: &mut CoopRun) -> Host {
-        self.mem = run.mem.take();
+        if let Some(p) = run.pump_mut() {
+            self.mem = p.mem.take();
+        }
         std::mem::take(&mut *run.host_mut())
     }
 
@@ -5465,14 +5485,18 @@ pub enum SchedStop {
     /// No thread is runnable and the root hasn't finished: a `memory.wait`/deadlock the debug
     /// scheduler can't advance (it drives only `thread.spawn`/`join`).
     Blocked,
-    /// #1146 (deeper) — every live thread is parked and at least one of them in a **blocking-stdin
-    /// `read`** (W4): the run is live and resumable, that thread is now the stopped + focused one
-    /// (`pc` = its read), and [`provide_stdin`](ScheduledDebugRun::provide_stdin) + a resume
-    /// re-issues the read. Distinct from `Blocked` (a true deadlock) so the backend can show an
-    /// input prompt instead of a dead end.
-    StdinPark { pc: super::IrPc },
-    /// #1366 — a thread is parked on a host-answered cap call `id` (at `pc`): live, resumable once
-    /// the embedder answers it with its [`crate::Completer`]. The cap twin of `StdinPark`.
+    /// #1146 (deeper), #1414 D4 — every live thread is parked and no thread can run until the
+    /// embedder acts: one waits on the answer to a host-answered call ([`cap_parked`]
+    /// (ScheduledDebugRun::cap_parked) names it), or, with none, in a **blocking-stdin `read`** (W4).
+    /// The run is live and resumable: that thread is now the stopped + focused one (`pc` = its call
+    /// or read), and the call's [`crate::Completer`], or
+    /// [`provide_stdin`](ScheduledDebugRun::provide_stdin) and a resume that re-issues the read,
+    /// moves it on. Distinct from `Blocked` (a true deadlock) so the backend can show a prompt
+    /// instead of a dead end. The scheduled twin of [`CoopEvent::Idle`].
+    Idle { pc: super::IrPc },
+    /// #1366, #1414 D4 — a thread has just made host-answered cap call `id` (at `pc`), which the
+    /// embedder answers with its [`crate::Completer`]: told once, as the call is made. The thread
+    /// waits for the answer, and a resume runs the others meanwhile.
     CapPark { id: u64, pc: super::IrPc },
     /// A thread reached an op outside the debug scheduler's subset — only JIT tier-up (never enabled on
     /// this engine). Threads, `wait`/`notify`, fibers, `instantiate`/`instantiate_module`, and §14
@@ -5745,6 +5769,8 @@ pub struct ScheduledDebugRun {
     /// picks by the span over those turns. Sorted and disjoint; the DAP backend re-installs the list
     /// on every rebuild, like `forced`.
     step_spans: Vec<StepSpan>,
+    /// #2538 — when its threads took their parked calls' answers ([`Takes`]).
+    takes: Takes,
     /// The scheduler-event sink (#1987), if one is installed ([`set_sched_sink`]).
     ///
     /// [`set_sched_sink`]: Self::set_sched_sink
@@ -6106,9 +6132,11 @@ fn service_advance(
             *turn += 1;
             complete(tasks, ti, Err(t));
         }
-        // #1366 — a cap park: the call has no answer yet and the turn holds (as a stdin park). Once
-        // nothing else can run, `drive` takes its answer (#2047), reporting `SchedStop::CapPark`
-        // while it waits on its embedder (#2495); taking it re-admits the task and counts the turn.
+        // #1366 — a cap park: the call has no answer yet and the turn holds (as a stdin park).
+        // `drive` tells of the call as it is made (`SchedStop::CapPark`, #1414 D4); it takes the
+        // answer at the pick after it comes (#2538), stopping `SchedStop::Idle` while the embedder
+        // owes it and nothing else can run (#2495). Taking it re-admits the task and counts the
+        // turn.
         FiberStep::CapParked { id, dst, at } => {
             tasks[ti].state = TaskState::BlockedHostCap { id, dst, at };
         }
@@ -6214,9 +6242,9 @@ fn service_advance(
                     complete(tasks, ti, Err(t));
                 }
             }
-            // #1146 (deeper) — a blocking-stdin park (W4): the read did not run and the turn holds
-            // `drive` reports `SchedStop::StdinPark` once nothing
-            // else can run, and `provide_stdin` re-admits the task so the read re-issues.
+            // #1146 (deeper) — a blocking-stdin park (W4): the read did not run and the turn holds.
+            // `drive` reports `SchedStop::Idle` once nothing else can run, and `provide_stdin`
+            // re-admits the task so the read re-issues.
             Outcome::StdinPark => tasks[ti].state = TaskState::BlockedStdin,
             // Everything this engine does **not** dispatch, named rather than caught by a `_`
             // (#1414). The debugger path is the one native driver whose event match had a wildcard;
@@ -6642,70 +6670,163 @@ fn dbg_preview_pick(
 /// Pick the next thread to run under the session's **schedule policy** (slice 7) — the
 /// [`dbg_preview_pick`] order. First time out every wait whose deadline this engine's logical time
 /// has reached: `clock + turn`, so time moves by one ns per op as on the pump (#2224), and `clock`
-/// is only the offset the idle jumps add. If none is runnable, advance the offset to the earliest
-/// `memory.wait` deadline and wake every timed-out waiter (`WAIT_TIMED_OUT`), then retry. `None`
-/// only on a true deadlock (no runnable thread and no waiter) — mirrors `drive`. Every path is a
-/// pure function of `(seed, forced, pref, turn, task states)`, so replay reproduces it exactly —
-/// which is why the live `drive` and the replaying `tick` both pick through here.
-#[allow(clippy::too_many_arguments)] // the pick policy's inputs, plus the parks a clock advance wakes
+/// is only the offset the idle jumps add. A thread whose parked call's answer has come takes it
+/// first ([`dbg_take_answer`]). If none is runnable, wait for an answer until the next timer is due
+/// ([`dbg_await_answer`]); else advance the offset to the earliest `memory.wait` deadline and wake
+/// every timed-out waiter (`WAIT_TIMED_OUT`), then retry. [`Idle`] when no thread runs next —
+/// mirrors `drive`. Every pick is a pure function of `(seed, forced, pref, turn, task states)`, and
+/// a run that goes over its time again (`replay`) takes each answer where `takes` says, so replay
+/// reproduces it exactly — which is why the live `drive` and the replaying `tick` both pick through
+/// here.
+#[allow(clippy::too_many_arguments)] // the pick policy's inputs, plus the parks an idle run wakes
 fn dbg_pick_runnable(
     tasks: &mut [TaskSlot],
     fibers: &mut FiberTables,
     envs: &mut [DbgEnv],
+    host: &mut Host,
+    takes: &mut Takes,
+    replay: bool,
     clock: &mut u64,
     seed: Option<u64>,
     forced: &[(u64, usize)],
     pref: Option<(usize, bool)>,
-    turn: u64,
-) -> Option<usize> {
-    let mut regs: Vec<&mut Vec<FiberState>> = std::iter::once(&mut fibers.fibers)
-        .chain(envs.iter_mut().map(|e| &mut e.fibers.fibers))
-        .collect();
-    let mut now = clock.saturating_add(turn);
-    time_out_due(tasks, &mut regs, now);
+    turn: &mut u64,
+) -> Result<usize, Idle> {
+    let mut now = clock.saturating_add(*turn);
+    time_out_due(tasks, &mut registries(fibers, envs), now);
     loop {
-        if let Some(i) = dbg_preview_pick(tasks, seed, forced, pref, turn) {
-            return Some(i);
+        let parked = |t: &TaskSlot| matches!(t.state, TaskState::BlockedHostCap { .. });
+        if tasks.iter().any(parked) {
+            if let Some(idle) = dbg_take_answer(tasks, envs, host, takes, replay, now, turn) {
+                return Err(idle);
+            }
+        }
+        if let Some(i) = dbg_preview_pick(tasks, seed, forced, pref, *turn) {
+            return Ok(i);
+        }
+        let next = next_timeout(
+            tasks,
+            registries(fibers, envs).iter().flat_map(|r| r.iter()),
+        );
+        if dbg_await_answer(tasks, envs, host, takes, replay, now, next)? {
+            continue;
         }
         // #1638 — only a waiter with a REAL deadline is a clock-advance candidate, so "nothing
         // runnable and every remaining waiter is indefinite" is the deadlock exit, not a
         // `WAIT_TIMED_OUT` the guest never asked for.
-        if !fire_next_timeout(tasks, &mut regs, &mut now) {
-            return None;
+        if !fire_next_timeout(tasks, &mut registries(fibers, envs), &mut now) {
+            return Err(Idle::Stuck);
         }
-        *clock = now - turn;
+        *clock = now - *turn;
     }
 }
 
-/// #2047 — with nothing runnable and no timer left, a thread parked on a punted call takes its
-/// answer, counting the turn: the lowest-index one whose answer has come, or, with none come yet,
-/// the first to come (#2424 — one thread's answer never waits on another's call, which may wait on
-/// what that thread does). Taken only here, where nothing else could run meanwhile, so when it
-/// comes changes nothing a replay sees, and taped as it is taken ([`tape_answer`]).
-///
-/// `Ok` when a thread took its answer. Else, with no answer in, the lowest-index thread whose call
-/// waits on its embedder (#2495), as `(thread, id, at)`, for the run to stop on; or `None` when no
-/// thread is parked. The stop is the one found here: the embedder may answer the call from another
-/// thread before it sees the stop, and the next advance takes the answer. Looking for it again
-/// after this returned could find it answered, and the run, with its answer in, read as blocked.
-fn dbg_take_answer(
-    tasks: &mut [TaskSlot],
-    extra_envs: &mut [DbgEnv],
-    host: &mut Host,
-    turn: &mut u64,
-) -> Result<(), Option<(usize, u64, Option<super::IrPc>)>> {
-    let parked: Vec<_> = tasks
+/// Every domain's fiber registry: the root's, then each §14 child's.
+fn registries<'a>(
+    fibers: &'a mut FiberTables,
+    envs: &'a mut [DbgEnv],
+) -> Vec<&'a mut Vec<FiberState>> {
+    std::iter::once(&mut fibers.fibers)
+        .chain(envs.iter_mut().map(|e| &mut e.fibers.fibers))
+        .collect()
+}
+
+/// Why no thread runs next ([`dbg_pick_runnable`]).
+enum Idle {
+    /// A thread took its parked call's answer, which counts the turn.
+    Took,
+    /// Thread `p`'s call, made at `at`, waits on its embedder (#2495), which was told of it as it was
+    /// made and answers it once it has control back (#1414 D4), so the run stops `Idle` on it. The
+    /// stop is the one found here: the embedder may answer the call from another thread before it
+    /// sees the stop, and the next advance takes the answer. Looking for it again could find it
+    /// answered, and the run, with its answer in, read as blocked.
+    OnEmbedder(usize, Option<super::IrPc>),
+    /// Nothing can wake a thread.
+    Stuck,
+}
+
+/// #2538 — when a run's threads took their parked calls' answers, by the run's logical time
+/// (`clock + turn`), which each pick moves on. When an answer comes depends on the world, so a run
+/// that goes over its time again ([`ScheduledDebugRun::tick`], as an undo re-executes) takes each
+/// answer where the run took it, and nowhere else. A [`drive`](ScheduledDebugRun::drive) decides
+/// afresh from where it starts.
+#[derive(Clone, Debug, Default)]
+struct Takes {
+    /// `(time, thread)` for each take, in time order.
+    at: Vec<(u64, usize)>,
+    /// Every pick before this time with a call parked is decided: a take in `at`, or none.
+    decided: u64,
+}
+
+impl Takes {
+    /// The thread that took an answer at `time`, if one did.
+    fn taken_at(&self, time: u64) -> Option<usize> {
+        let i = self.at.partition_point(|&(t, _)| t < time);
+        self.at.get(i).filter(|&&(t, _)| t == time).map(|&(_, p)| p)
+    }
+
+    /// The decision at `time`: thread `took` took its answer, or (`None`) none did.
+    fn decide(&mut self, time: u64, took: Option<usize>) {
+        if let Some(p) = took {
+            self.at.push((time, p));
+        }
+        self.decided = time + 1;
+    }
+
+    /// Forget what was decided from `time` on: a run that goes on from there decides it afresh.
+    fn forget_from(&mut self, time: u64) {
+        self.at.retain(|&(t, _)| t < time);
+        self.decided = self.decided.min(time);
+    }
+
+    /// Whether a run going over its time again (`replay`) has decided the pick at `time` already.
+    fn replaying(&self, replay: bool, time: u64) -> bool {
+        replay && time < self.decided
+    }
+}
+
+/// A thread parked on a punted call: `(thread, domain, dst, call id, call site)`.
+type Parked = (usize, Option<usize>, u32, u64, Option<super::IrPc>);
+
+/// The threads parked on a punted call.
+fn dbg_parked(tasks: &[TaskSlot]) -> Vec<Parked> {
+    tasks
         .iter()
         .enumerate()
         .filter_map(|(i, t)| match t.state {
             TaskState::BlockedHostCap { id, dst, at } => Some((i, t.env, dst, id, at)),
             _ => None,
         })
-        .collect();
-    let calls: Vec<_> = parked
-        .iter()
-        .map(|&(_, env, _, id, _)| (dbg_completions(env, extra_envs, host), id))
-        .collect();
+        .collect()
+}
+
+/// #2047, #2538 — a thread parked on a punted call whose answer has come takes it at the pick at
+/// logical time `now`, counting the turn, and tapes it ([`tape_answer`]): the lowest-index one, as
+/// every engine delivers an answer as it arrives (#2477), and one thread's answer never waits on
+/// another's call, which may wait on what that thread does (#2424). The pick, take or none, joins
+/// `takes`. A run going over its time again takes an answer only where `takes` says, waiting for it
+/// if it is not in yet, or stopping on its embedder.
+///
+/// `Some(Idle::Took)` when a thread took its answer.
+#[allow(clippy::too_many_arguments)]
+fn dbg_take_answer(
+    tasks: &mut [TaskSlot],
+    extra_envs: &mut [DbgEnv],
+    host: &mut Host,
+    takes: &mut Takes,
+    replay: bool,
+    now: u64,
+    turn: &mut u64,
+) -> Option<Idle> {
+    let mut parked = dbg_parked(tasks);
+    if parked.is_empty() {
+        return None;
+    }
+    let replaying = takes.replaying(replay, now);
+    if replaying {
+        let p = takes.taken_at(now)?;
+        parked.retain(|&(i, ..)| i == p);
+    }
     loop {
         for &(p, env, dst, id, _) in &parked {
             let h = match env {
@@ -6715,22 +6836,63 @@ fn dbg_take_answer(
             if let Some(r) = take_answer(h, id) {
                 tasks[p].deliver(dst, Reg::from_i64(r));
                 tasks[p].state = TaskState::Runnable;
+                if !replaying {
+                    takes.decide(now, Some(p));
+                }
                 *turn += 1;
-                return Ok(());
+                return Some(Idle::Took);
             }
         }
+        if !replaying {
+            takes.decide(now, None);
+            return None;
+        }
+        // The thread the run took an answer on here, if it is parked here too, waits for it.
+        let &[(p, env, _, id, at)] = &parked[..] else {
+            return None;
+        };
+        let comps = dbg_completions(env, extra_envs, host);
+        if comps.is_host_owned(id) {
+            return Some(Idle::OnEmbedder(p, at));
+        }
+        super::Completions::wait_any(&[(comps, id)], None, None);
+    }
+}
+
+/// #2538 — nothing can run at logical time `now`, and no parked call's answer has come: wait for one
+/// in real time until the next timer is due (`next`), as the pump does (#1979), so a thread that
+/// keeps a timer going never starves another's answer; with no timer, until one comes, or stop on a
+/// call its embedder answers once it has control back. `Ok(true)` when an answer came, `Ok(false)`
+/// when the timer is to fire. A run going over its time again waits for none: it fires the timer
+/// wherever the run did.
+fn dbg_await_answer(
+    tasks: &[TaskSlot],
+    extra_envs: &[DbgEnv],
+    host: &Host,
+    takes: &Takes,
+    replay: bool,
+    now: u64,
+    next: Option<u64>,
+) -> Result<bool, Idle> {
+    let parked = dbg_parked(tasks);
+    if parked.is_empty() || (takes.replaying(replay, now) && next.is_some()) {
+        return Ok(false);
+    }
+    let calls: Vec<_> = parked
+        .iter()
+        .map(|&(_, env, _, id, _)| (dbg_completions(env, extra_envs, host), id))
+        .collect();
+    let within = next.map(|d| std::time::Duration::from_nanos(d.saturating_sub(now)));
+    if within.is_none() {
         let on_embedder = parked
             .iter()
             .zip(&calls)
             .find(|(_, (comps, id))| comps.is_host_owned(*id));
-        if let Some((&(p, _, _, id, at), _)) = on_embedder {
-            return Err(Some((p, id, at)));
+        if let Some((&(p, _, _, _, at), _)) = on_embedder {
+            return Err(Idle::OnEmbedder(p, at));
         }
-        if calls.is_empty() {
-            return Err(None);
-        }
-        super::Completions::wait_any(&calls, None, None);
     }
+    Ok(super::Completions::wait_any(&calls, None, within))
 }
 
 /// Whether a thread is parked on a punted call the offload pool answers (#2047): its answer comes
@@ -6824,6 +6986,7 @@ impl ScheduledDebugRun {
             sched_seed: None,
             forced: Vec::new(),
             step_spans: Vec::new(),
+            takes: Takes::default(),
             sched_sink: None,
             single_thread: false,
             last_watch: None,
@@ -7236,6 +7399,7 @@ impl ScheduledDebugRun {
             sched_seed,
             forced,
             step_spans,
+            takes,
             single_thread,
             scheduled_writes,
             write_cursor,
@@ -7249,6 +7413,8 @@ impl ScheduledDebugRun {
         } = self;
         let fn_block_base = &root_md.fn_block_base;
         *stopped = None;
+        // #2538 — a run driven on decides afresh when its threads take their answers.
+        takes.forget_from(clock.saturating_add(*turn));
         loop {
             if let TaskState::Done(res) = &tasks[0].state {
                 let res = res.clone();
@@ -7279,30 +7445,30 @@ impl ScheduledDebugRun {
                     tasks,
                     fibers,
                     extra_envs,
+                    host,
+                    takes,
+                    false,
                     clock,
                     *sched_seed,
                     forced,
                     pref,
-                    *turn,
+                    turn,
                 ) {
-                    Some(i) => i,
-                    // Nothing runnable and no timed waiter: a thread parked in a blocking-stdin
-                    // read (#1146 deeper) makes this a live `StdinPark` stop on that thread (the
-                    // lowest-index one), else a true deadlock.
-                    None => {
-                        let on_embedder = match dbg_take_answer(tasks, extra_envs, host, turn) {
-                            Ok(()) => continue,
-                            Err(on_embedder) => on_embedder,
-                        };
-                        // #1366: a thread parked on a host-answered cap is a live `CapPark` stop
-                        // on that thread (lowest-index), resumed once its embedder answers.
-                        if let Some((p, id, at)) = on_embedder {
+                    Ok(i) => i,
+                    Err(Idle::Took) => continue,
+                    // Nothing runnable and no timed waiter: a thread waiting on what only the
+                    // embedder can give it (#1146 deeper, #1414 D4) makes this a live `Idle` stop on
+                    // that thread (the lowest-index one), else a true deadlock.
+                    Err(idle) => {
+                        // #1366: a thread waits on a host-answered call its embedder was told of
+                        // when the thread made it; it moves on once the embedder answers.
+                        if let Idle::OnEmbedder(p, at) = idle {
                             // The stop location is the call itself, falling back to the live pc.
                             let pc = at.or_else(|| tasks[p].vm.vt.debug_active().cur_ir_pc(source));
                             if let Some(pc) = pc {
                                 *stopped = Some(p);
                                 *focus = p;
-                                return SchedStop::CapPark { id, pc };
+                                return SchedStop::Idle { pc };
                             }
                         }
                         let parked = tasks
@@ -7314,7 +7480,7 @@ impl ScheduledDebugRun {
                             (Some(p), Some(pc)) => {
                                 *stopped = Some(p);
                                 *focus = p;
-                                SchedStop::StdinPark { pc }
+                                SchedStop::Idle { pc }
                             }
                             _ => SchedStop::Blocked,
                         };
@@ -7477,6 +7643,19 @@ impl ScheduledDebugRun {
                 );
                 record_sched(sched_trace, sched_sink, events);
             }
+            // #1414 D4 — the thread just made a host-answered call: its embedder hears of it now,
+            // once, at the call. The thread waits for the answer, which is taken where the
+            // schedule says (`dbg_take_answer`).
+            if let TaskState::BlockedHostCap { id, at, .. } = tasks[ti].state {
+                if dbg_completions(tasks[ti].env, extra_envs, host).is_host_owned(id) {
+                    let pc = at.or_else(|| tasks[ti].vm.vt.debug_active().cur_ir_pc(source));
+                    if let Some(pc) = pc {
+                        *stopped = Some(ti);
+                        *focus = ti;
+                        return SchedStop::CapPark { id, pc };
+                    }
+                }
+            }
         }
     }
 
@@ -7598,6 +7777,7 @@ impl ScheduledDebugRun {
             sched_seed,
             forced,
             step_spans,
+            takes,
             scheduled_writes,
             write_cursor,
             ..
@@ -7605,26 +7785,34 @@ impl ScheduledDebugRun {
         let fn_block_base = &root_md.fn_block_base;
         // A task mid-coroutine is pinned (atomic resume — the same vCPU runs the whole body); the
         // same pin on replay reconstructs the coroutine's op sequence deterministically. The policy
-        // pick (seed + forced) matches `drive`'s, so a tick-replay reproduces the interactive
-        // schedule. A `CapParked` task is not runnable, so a parked run refuses to tick — as the
-        // single engine's.
+        // pick (seed + forced) matches `drive`'s, and so do the answers taken (#2538), so a
+        // tick-replay reproduces the interactive schedule. A `CapParked` task is not runnable, so a
+        // parked run refuses to tick — as the single engine's.
         let pre_pick = (sched_trace.is_some() || sched_sink.is_some()).then(|| trace_tags(tasks));
-        let Some(ti) = dbg_pinned_coro(tasks).or_else(|| {
-            let pref = span_at(step_spans, *turn); // #1942: replay a recorded step's thread
-            dbg_pick_runnable(
-                tasks,
-                fibers,
-                extra_envs,
-                clock,
-                *sched_seed,
-                forced,
-                pref,
-                *turn,
-            )
-        }) else {
+        let picked = match dbg_pinned_coro(tasks) {
+            Some(p) => Ok(p),
+            None => {
+                let pref = span_at(step_spans, *turn); // #1942: replay a recorded step's thread
+                dbg_pick_runnable(
+                    tasks,
+                    fibers,
+                    extra_envs,
+                    host,
+                    takes,
+                    true,
+                    clock,
+                    *sched_seed,
+                    forced,
+                    pref,
+                    turn,
+                )
+            }
+        };
+        let ti = match picked {
+            Ok(ti) => ti,
             // A parked thread's answer is this tick, as in `drive`; else no runnable thread and no
             // waiter (deadlock, or its embedder's to answer) — can't advance.
-            return dbg_take_answer(tasks, extra_envs, host, turn).is_ok();
+            Err(idle) => return matches!(idle, Idle::Took),
         };
         if let Some(before) = pre_pick.as_ref() {
             let mut events = Vec::new();
@@ -9085,8 +9273,9 @@ enum Outcome {
     /// **Blocking stdin park**: a `Stream{In}` `read` found the buffer exhausted under
     /// [`Host::set_stdin_blocking`]. The read did not complete and `pc` was *not* advanced, so the
     /// driver re-issues it after more input arrives. Only a host that opts into blocking stdin sees
-    /// it: the pump blocks the task until the host pushes more ([`CoopRun::set_suspend_on_idle`]),
-    /// and the debug scheduler stops with [`SchedStop::StdinPark`].
+    /// it: the pump parks the task until the host pushes more (a run its embedder pumps returns
+    /// [`CoopStep::Idle`] once nothing else can run), and so does the debug scheduler
+    /// ([`SchedStop::Idle`]).
     StdinPark,
 }
 
@@ -9833,7 +10022,15 @@ fn outstanding_calls(
     fibers: &[FiberState],
     extra_envs: &[ChildEnv],
 ) -> Vec<(Option<usize>, u64)> {
-    let parked = |t: &TaskSlot| match t.state {
+    tasks
+        .iter()
+        .filter_map(|t| call_awaited(t, fibers, extra_envs).map(|id| (t.env, id)))
+        .collect()
+}
+
+/// The punted call task `t` waits on, if it does ([`outstanding_calls`]).
+fn call_awaited(t: &TaskSlot, fibers: &[FiberState], extra_envs: &[ChildEnv]) -> Option<u64> {
+    match t.state {
         TaskState::BlockedHostCap { id, .. } => Some(id),
         TaskState::BlockedOnFiber { fiber } => {
             let reg = match t.env {
@@ -9848,11 +10045,50 @@ fn outstanding_calls(
             }
         }
         _ => None,
-    };
-    tasks
-        .iter()
-        .filter_map(|t| parked(t).map(|id| (t.env, id)))
-        .collect()
+    }
+}
+
+/// What only the world can end (#1122): the verdict on a run in which no task can run, no wait's
+/// deadline is pending and no punted call is outstanding. Both executors reach it at their idle
+/// point ([`stalled`]).
+enum Stalled {
+    /// A task waits on what its embedder feeds from outside the run (a pipe, stdin), and the
+    /// embedder pumps the run, so it hears of it ([`CoopEvent::Idle`]).
+    Idle,
+    /// A task waits on what its embedder feeds, which rings the armed external-wake bell.
+    Bell,
+    /// Nothing can wake the run: a deadlock (`ThreadFault`).
+    Deadlock,
+}
+
+/// The [`Stalled`] verdict on `tasks`, in a run its embedder pumps or not, with an external-wake
+/// bell armed or not.
+fn stalled(tasks: &[TaskSlot], embedder_pumps: bool, bell: bool) -> Stalled {
+    let fed = tasks.iter().any(|t| {
+        matches!(
+            t.state,
+            TaskState::BlockedPipeRead { .. }
+                | TaskState::BlockedPipeWrite { .. }
+                // #1146 (deeper) — a blocking stdin park is externally wakeable too (an embedder
+                // signal rings the bell): without it an all-parked stdin run would fault as a
+                // deadlock instead of blocking for the `^C`.
+                | TaskState::BlockedStdin
+        )
+    });
+    match (fed, embedder_pumps, bell) {
+        (true, true, _) => Stalled::Idle,
+        (true, false, true) => Stalled::Bell,
+        _ => Stalled::Deadlock,
+    }
+}
+
+/// #1198 — whether task `t`'s process is stopped (SIGTSTP/SIGTTIN/SIGTTOU, before its SIGCONT): a
+/// stopped process makes no progress, so neither executor steps its runnable tasks.
+fn process_stopped(root: &DomainCell, envs: &[ChildEnv], t: &TaskSlot) -> bool {
+    task_host(root, envs, t.env)
+        .lock_unpoisoned()
+        .signal_poll()
+        .is_some_and(|(_, s)| s.stopped())
 }
 
 /// The root activation's id in a vCPU's resume chain (it has no fiber handle).
@@ -11900,15 +12136,15 @@ enum CoopStep {
     Done(Vec<Value>),
     /// The slice of a [`CoopRun::run_for`] pump is spent; the run is live and resumable.
     Paused,
-    /// #1953 — nothing can run until the embedder answers host-answered cap call `id`
-    /// ([`CoopEvent::CapPark`]).
+    /// #1953, #1414 D4 — a task has just made host-answered cap call `id`, which the embedder
+    /// answers ([`CoopEvent::CapPark`]). Each call is told once, as it is made.
     CapPark { id: u64 },
-    /// #1122 route (a) — every task is parked, nothing internal can wake one, and at least one park is
-    /// externally wakeable (a terminal/pipe read or a blocking stdin read): with
-    /// [`CoopSched::suspend_on_idle`] set the pump RETURNS here instead of blocking on the doorbell,
-    /// so an embedder that owns the run (a [`CoopRun`]) can feed input and pump again — the whole
-    /// scheduler state stays inside the `CoopSched`. Without the flag this state blocks on the bell
-    /// (or is the deadlock it always was).
+    /// #1122 route (a), #1414 D4 — no task can run until the embedder acts: it owes the answer to a
+    /// host-answered call, or a task waits on what it feeds (a terminal or pipe read, a blocking
+    /// stdin read) and nothing internal can wake one. A pump its embedder drives (a [`CoopRun`])
+    /// RETURNS here instead of waiting, so the embedder answers or feeds and pumps again — the whole
+    /// scheduler state stays inside the `CoopSched`. The native `drive` waits instead: on the call's
+    /// answer, or on the bell for a feed (or it is the deadlock it always was).
     Idle,
     /// A task paused to run `func` of program `module` emitted ([`CoopEvent::TierUp`]) with raw i64
     /// arg slots `argv`; `mapped` is the window's committed scalar extent for the emitted `"mapped"`
@@ -12142,6 +12378,9 @@ struct EmitTier {
     /// #1954 — the root program's leaf start, when the host's emitter took the root image
     /// ([`root_leaf`]): the first pump tiers the root up at its entry instead of interpreting it.
     root_leaf: Option<LeafStart>,
+    /// #1414 D4 — the call a leaf made in its last bounce ([`CoopRun::bounce`]) and parked on,
+    /// `(task index, completion id)`: the pump that follows tells of it, before anything runs.
+    bounce_call: Option<(usize, u64)>,
 }
 
 /// Which programs of a run tier up, and into what (#926 slice 2, #2248): the run's own, and each
@@ -12206,10 +12445,6 @@ impl ProgramEmits {
 struct CoopSched {
     core: SchedCore,
     emit: EmitTier,
-    /// #1122 route (a) — when set, an all-parked, externally-wakeable settle yields
-    /// [`CoopStep::Idle`] to the driver instead of blocking on the #1122 doorbell (see
-    /// [`CoopRun::set_suspend_on_idle`]). Off on the native `drive` and the blocking browser session.
-    suspend_on_idle: bool,
     /// Ops left in this `pump` call's slice ([`CoopRun::run_for`]), or `None` for an unsliced pump.
     /// At zero the pump returns [`CoopStep::Paused`], every task's cursor persisted — the next pump
     /// resumes exactly where this one stopped, as after a #1157 preemption.
@@ -12218,9 +12453,11 @@ struct CoopSched {
     /// instead of jumping its clock there. Set by the native `drive`; a [`CoopRun`]'s embedder
     /// keeps the jump (a browser has no clock to wait on, #2439).
     wall: bool,
-    /// #2495 — set by a [`CoopRun`]: its embedder pumps it, and may answer a host-answered call
-    /// only once it has control back, so a pump idle while one waits hands control back
-    /// ([`CoopStep::CapPark`]). The native `drive` waits on such a call as on a pool job.
+    /// #2495, #1414 D4 — set by a [`CoopRun`]: its embedder pumps it, and answers a host-answered
+    /// call or feeds input only once it has control back. So the pump tells it of each call as the
+    /// call is made ([`CoopStep::CapPark`]), and hands control back when nothing can run until it
+    /// acts ([`CoopStep::Idle`]). The native `drive` waits on such a call as on a pool job, and on
+    /// its bell for a feed.
     embedder_pumps: bool,
     /// DURABILITY.md §13.4 slice 4c-bis — **freeze-on-quiesce**, one-shot: a durable run armed to
     /// freeze the moment it quiesces ([`freeze_step`]). Read once at run setup from the window's
@@ -12706,8 +12943,8 @@ impl CoopSched {
                 // bounces.
                 invoke_fibers: FiberTables::default(),
                 root_leaf: None,
+                bounce_call: None,
             },
-            suspend_on_idle: false,
             slice_left: None,
             wall: false,
             embedder_pumps: false,
@@ -12759,12 +12996,19 @@ impl CoopSched {
         let CoopSched {
             core,
             emit,
-            suspend_on_idle,
             slice_left,
             wall,
             embedder_pumps,
             freeze_on_quiesce,
         } = self;
+        // #1414 D4 — the embedder hears of a call it answers as the leaf makes it, once: one its
+        // last bounce made, before anything runs.
+        if let Some((ti, id)) = emit.bounce_call.take() {
+            let host = task_host(root, &core.extra_envs, core.tasks[ti].env).lock_unpoisoned();
+            if *embedder_pumps && host.completions().is_host_owned(id) {
+                return Ok(CoopStep::CapPark { id });
+            }
+        }
         // #1954 — a root the host emitted whole tiers up at its entry, once, before anything runs
         // (over a window one bound cannot describe it runs interpreted instead, as an exec'd leaf).
         if let Some(start) = emit.root_leaf.take() {
@@ -12868,13 +13112,8 @@ impl CoopSched {
             // #1904 — the oracle's see-through (#1672): under a landing freeze a stopped domain runs to
             // its next freeze point, and `Op::CapCall` abandons each host call on the way.
             let see_through = root.lock_unpoisoned().is_durable() && is_unwinding(mem);
-            let domain_stopped = |i: usize| -> bool {
-                !see_through
-                    && task_host(root, extra_envs, tasks[i].env)
-                        .lock_unpoisoned()
-                        .signal_poll()
-                        .is_some_and(|(_, s)| s.stopped())
-            };
+            let domain_stopped =
+                |i: usize| !see_through && process_stopped(root, extra_envs, &tasks[i]);
             // #1157 — round-robin from `last_pick + 1` (wrapping) rather than lowest-index-first.
             let n = tasks.len();
             let Some(ti) = (1..=n)
@@ -12894,9 +13133,11 @@ impl CoopSched {
                     continue;
                 }
                 // The punted calls outstanding (F2, FIBER_PARK.md), each in its domain's store
-                // (#2424): a fiber's `CapParked`, a task's `BlockedHostCap`. #1953, #2495 — one
-                // its embedder answers, in any domain, is the embedder's to answer: a pump the
-                // embedder drives hands control back for the earliest.
+                // (#2424): a fiber's `CapParked`, a task's `BlockedHostCap`. #1953, #2495, #1414 D4
+                // — one its embedder answers, in any domain, is the embedder's to answer, and it
+                // heard of each as the call was made: with one owed, a pump the embedder drives
+                // hands control back rather than wait. Before any timer fires, as the run's clock
+                // jumps (#2439) and must not run ahead of an answer that is owed.
                 let calls: Vec<_> = outstanding_calls(tasks, fibers, extra_envs)
                     .into_iter()
                     .map(|(env, id)| {
@@ -12904,11 +13145,8 @@ impl CoopSched {
                         (h.completions(), id)
                     })
                     .collect();
-                if *embedder_pumps {
-                    let on_embedder = calls.iter().filter(|(c, id)| c.is_host_owned(*id));
-                    if let Some(id) = on_embedder.map(|(_, id)| *id).min() {
-                        return Ok(CoopStep::CapPark { id });
-                    }
+                if *embedder_pumps && calls.iter().any(|(c, id)| c.is_host_owned(*id)) {
+                    return Ok(CoopStep::Idle);
                 }
                 // #1979 — on the native driver the time to the earliest deadline passes first.
                 if *wall && wait_out(tasks, fibers, extra_envs, clock, root, &calls, bell_gen) {
@@ -12925,27 +13163,19 @@ impl CoopSched {
                     if interrupt_parks(tasks, extra_envs, root) {
                         continue;
                     }
-                    // #1122 — every task is parked and no internal wake can come: only the world
-                    // can wake the run. A task parked on a PIPE is the state an embedder can feed
-                    // from outside the run (the interactive terminal); a punted call is work in
-                    // flight, never a deadlock (#2047), in any domain (#2424).
-                    let external = tasks.iter().any(|t| {
-                        matches!(
-                            t.state,
-                            TaskState::BlockedPipeRead { .. }
-                                | TaskState::BlockedPipeWrite { .. }
-                                // #1146 (deeper) — a blocking stdin park is externally wakeable
-                                // too (an embedder signal rings the bell); without this an
-                                // all-parked stdin run would fault as a deadlock instead of
-                                // blocking for the `^C`.
-                                | TaskState::BlockedStdin
-                        )
-                    });
-                    // #1122 route (a) — a suspend/resume session: hand the idle state back to the
-                    // driver (it feeds the terminal and pumps again; the loop-top settle then sees
-                    // the deposit / the signal) instead of sleeping this thread on the bell.
-                    if *suspend_on_idle && external && calls.is_empty() {
-                        return Ok(CoopStep::Idle);
+                    // #1122 — every task is parked and no internal wake can come. A punted call
+                    // is work in flight, never a deadlock (#2047), in any domain (#2424). With
+                    // none, only the world can wake the run ([`stalled`]): a pump its embedder
+                    // drives hands the idle state back to it (#1122 route (a): it feeds the
+                    // terminal and pumps again, and the loop-top settle sees the deposit or the
+                    // signal) instead of sleeping this thread on the bell.
+                    let bell = root.lock_unpoisoned().external_wake();
+                    if calls.is_empty() {
+                        match stalled(tasks, *embedder_pumps, bell.is_some()) {
+                            Stalled::Idle => return Ok(CoopStep::Idle),
+                            Stalled::Deadlock => return Err(Trap::ThreadFault),
+                            Stalled::Bell => {}
+                        }
                     }
                     // #2480 — BLOCK for whichever comes first, on one bell: an answer to an
                     // outstanding call, delivered by the next round (a fiber's by the drain
@@ -12953,14 +13183,7 @@ impl CoopSched {
                     // a kill — then re-settle (the readiness poll above sees the deposit). The
                     // snapshot predates that poll, so a feed racing this park is never lost. Only
                     // after the timers, as a call may wait on the world, or on what a timed
-                    // waiter will do: it must not hold the clock back. With no call outstanding
-                    // the doorbell counts only for a task parked on what an embedder feeds; with
-                    // neither (a join cycle), this is the deadlock it always was.
-                    let bell = root.lock_unpoisoned().external_wake();
-                    let bell = bell.filter(|_| external || !calls.is_empty());
-                    if calls.is_empty() && bell.is_none() {
-                        return Err(Trap::ThreadFault);
-                    }
+                    // waiter will do: it must not hold the clock back.
                     super::Completions::wait_any(
                         &calls,
                         bell.as_ref().map(|b| (b, bell_gen)),
@@ -13011,13 +13234,25 @@ impl CoopSched {
             // #2224 — and while a task waits with a deadline: the clock that times the wait out
             // moves with the quanta that run out (below), so a lone runnable task must still yield
             // at its quantum, or a thread that naps never wakes while another spins on it.
-            let (quantum, preemptible) = if next_wait_deadline(tasks).is_some()
-                || tasks
-                    .iter()
-                    .filter(|t| matches!(t.state, TaskState::Runnable))
-                    .count()
-                    >= 2
-            {
+            // #2538 — and while a task waits on a call: its answer is drained between quanta, so a
+            // lone runnable task must yield to let it through, or a thread that waits on the world
+            // never wakes while another spins on it.
+            let (quantum, preemptible) = if next_wait_deadline(tasks).is_some() || {
+                let (mut runnable, mut awaits_call) = (0, false);
+                for t in tasks.iter() {
+                    if matches!(t.state, TaskState::Runnable) {
+                        runnable += 1;
+                    } else if !awaits_call
+                        && matches!(
+                            t.state,
+                            TaskState::BlockedHostCap { .. } | TaskState::BlockedOnFiber { .. }
+                        )
+                    {
+                        awaits_call = call_awaited(t, fibers, extra_envs).is_some();
+                    }
+                }
+                runnable >= 2 || awaits_call
+            } {
                 (COOP_QUANTUM, true)
             } else {
                 (budget, false)
@@ -13110,10 +13345,15 @@ impl CoopSched {
                 )
                 .map(Nested::done);
                 charge_slice(slice_left, ctx.fuel.can_burn());
+                let mut made = None;
                 match (done, parked) {
                     (Err(trap), _) => complete(tasks, ti, Err(trap)),
                     (Ok(_), Some((vm, stop))) => {
                         let win = ctx.mem.as_ref();
+                        let call = match &stop {
+                            VcpuStop::CapPending { id, .. } => Some(*id),
+                            _ => None,
+                        };
                         match hand_off(tasks, forked_twins, hooked_twins, ti, stop, win, *clock) {
                             Ok(spawn) => {
                                 tasks[ti].vm.suspended = Some(Box::new(Suspended {
@@ -13123,7 +13363,8 @@ impl CoopSched {
                                         results,
                                         spawn,
                                     }),
-                                }))
+                                }));
+                                made = call;
                             }
                             Err(trap) => complete(tasks, ti, Err(trap)),
                         }
@@ -13133,6 +13374,11 @@ impl CoopSched {
                         let results = vals.iter().map(|v| val_to_slot(*v)).collect();
                         return Ok(CoopStep::Resume { results });
                     }
+                }
+                // #1414 D4 — the embedder hears of a call it answers as the leaf makes it, once.
+                let mut owned = |id| ctx.host.with(|h| h.completions().is_host_owned(id));
+                if let Some(id) = made.filter(|&id| *embedder_pumps && owned(id)) {
+                    return Ok(CoopStep::CapPark { id });
                 }
                 continue;
             }
@@ -13178,8 +13424,23 @@ impl CoopSched {
             if matches!(stop, Ok(VcpuStop::Preempted)) && *slice_left == Some(0) {
                 return Ok(CoopStep::Paused);
             }
+            let made = match &stop {
+                Ok(VcpuStop::CapPending { id, .. }) => Some(*id),
+                _ => None,
+            };
             if let Some(step) = core.on_stop(emit, dom, mem, root, fuel, ti, stop) {
                 return Ok(step);
+            }
+            // #1414 D4 — the embedder hears of a call it answers as the call is made, once, while
+            // the rest of the run waits for its next pump. A call answered inside its submit is
+            // not one it owes.
+            let owned = |id| {
+                let env = core.tasks[ti].env;
+                let host = task_host(root, &core.extra_envs, env).lock_unpoisoned();
+                host.completions().is_host_owned(id)
+            };
+            if let Some(id) = made.filter(|&id| *embedder_pumps && owned(id)) {
+                return Ok(CoopStep::CapPark { id });
             }
         }
     }
@@ -14371,26 +14632,40 @@ pub struct Footprint {
     pub units: usize,
 }
 
-/// A pause of the cooperative tier-up driver [`CoopRun`]. The cooperative driver services concurrency (`thread.spawn`, join, futex
-/// wait/notify) **internally** — multiplexing every vCPU on the one host thread — so, unlike the
-/// per-Worker parallel driver, those never surface; only the run's end and tier-up round-trips do.
+impl Footprint {
+    /// What a run over `dom` holds: its root window `mem`, its children's windows `envs`, and the
+    /// programs `dom` has compiled.
+    fn of(mem: Option<&Mem>, envs: &[ChildEnv], dom: &Domain) -> Footprint {
+        let children = envs.iter().filter(|e| e.mem.is_some());
+        Footprint {
+            windows: usize::from(mem.is_some()) + children.count(),
+            units: dom.source.len(),
+        }
+    }
+}
+
+/// A pause of a [`CoopRun`]. Its executor services concurrency (`thread.spawn`, join, futex
+/// wait/notify) **internally**, so those never surface: only the run's end, the pump's tier-up
+/// round-trips, and what its embedder must answer or feed do.
 pub enum CoopEvent {
     /// A [`CoopRun::run_for`] slice is spent: the run is live, every task's cursor persisted — call
     /// `run`/`run_for` again to continue exactly where it stopped. This is how an embedder that owns
     /// its thread (a browser Worker) runs a long program in slices, streaming its output and honoring
     /// a Pause between them. Never surfaced by an unsliced `run`.
     Paused,
-    /// #1122 route (a) — the run is **idle**: every task is parked on something only the embedder can
-    /// satisfy (a terminal/pipe read, a blocking stdin read) and [`CoopRun::set_suspend_on_idle`] is
-    /// on. The run is live and resumable: feed input (e.g. `Posix::feed_terminal`, or a signal) and
-    /// call [`run`](CoopRun::run) again. Never surfaced with the flag off (the pump blocks on the
-    /// doorbell instead, or faults as a deadlock).
+    /// #1122 route (a), #1414 D4 — the run is **idle**: no task can run until the embedder acts. It
+    /// owes the answer to a host-answered call it was told of ([`CoopEvent::CapPark`]), or a task
+    /// waits on what it feeds (a terminal or pipe read, a blocking stdin read) and nothing in the
+    /// run can wake one. The run is live and resumable: answer the call, or feed input (e.g.
+    /// `Posix::feed_terminal`, or a signal), and call [`run`](CoopRun::run) again. `run` returns
+    /// this rather than wait on its embedder.
     Idle,
-    /// #1953 — nothing can run until the embedder answers: completion `id` is a **host-answered
-    /// cap call** (a proc granted with [`crate::OffloadOutcome::Host`]), in any domain, whose
-    /// request the proc's submit hook recorded; the earliest such call, when there are several.
-    /// The run is live: answer it with its [`crate::Completer`] and pump again (pumping first
-    /// surfaces this again). The guest saw a plain synchronous call.
+    /// #1953, #1414 D4 — a task has just made **host-answered cap call** `id` (a proc granted with
+    /// [`crate::OffloadOutcome::Host`]), in any domain, whose request the proc's submit hook
+    /// recorded, and it waits for the embedder's answer. Each call is told once, as it is made,
+    /// while the run's other tasks wait for the next `run` (the pump) or go on (executor 2). The
+    /// run is live: answer the call with its [`crate::Completer`], now or later, and pump again.
+    /// The guest saw a plain synchronous call.
     CapPark { id: u64 },
     /// The run finished; these are the root task's results.
     Done(Vec<Value>),
@@ -14435,8 +14710,105 @@ pub enum CoopEvent {
 /// host on each wasm-JIT tier-up ([`run`](Self::run) → [`CoopEvent::TierUp`] → run the emitted region
 /// → [`deliver_tierup`](Self::deliver_tierup) → `run` again), exactly the loop the native tests and
 /// the browser cdylib drive it with. With no tier-up config it behaves as `drive`: `run` returns
-/// `Done`/`Trapped` in one call. (#926 slice 2.)
+/// `Done`/`Trapped` in one call. (#926 slice 2.) The same handle holds a run on executor 2, each
+/// task on a thread of its own ([`new_parallel`](Self::new_parallel), #1414 5b).
 pub struct CoopRun {
+    exec: CoopExec,
+}
+
+/// Which executor runs a [`CoopRun`] (#1414 5b).
+// One per run: boxing the pump would put every pump run behind a pointer to save an x2 run's bytes.
+#[allow(clippy::large_enum_variant)]
+enum CoopExec {
+    /// The pump: every task in turn on the caller's thread.
+    Pump(PumpRun),
+    /// Executor 2: every task on a thread of its own ([`CoopRun::new_parallel`]).
+    Threads(ThreadsRun),
+}
+
+/// Executor 2's [`CoopRun`] (#1414 5b). The root starts on a thread of its own at the embedder's
+/// first `run`, and each `run` watches the run until its next event ([`ThreadRun::watch`]). The
+/// run's tasks go on between the embedder's calls: only what a watch settles waits for the next
+/// one, an answer to a punted call or an embedder's feed.
+struct ThreadsRun {
+    /// The run, until it ends and its threads have gone.
+    run: Option<std::sync::Arc<ThreadRun>>,
+    /// The root's powerbox cell, which outlives the run.
+    root: DomainCell,
+    /// Whether the root has started.
+    started: bool,
+    /// What the run ended with, once its threads have gone.
+    end: Option<ThreadsEnd>,
+}
+
+impl ThreadsRun {
+    /// [`CoopRun::run`] on executor 2.
+    fn run(&mut self) -> CoopEvent {
+        if let Some(run) = &self.run {
+            if !std::mem::replace(&mut self.started, true) {
+                run.start_root();
+            }
+            match run.watch() {
+                Watched::CapPark(id) => return CoopEvent::CapPark { id },
+                Watched::Idle => return CoopEvent::Idle,
+                Watched::Over => {}
+            }
+        }
+        if let Some(run) = self.run.take() {
+            self.end = Some(ThreadRun::finish(run));
+        }
+        match &self.ended().result {
+            Ok(vals) => CoopEvent::Done(vals.clone()),
+            Err(t) => CoopEvent::Trapped(*t),
+        }
+    }
+
+    /// What the run ended with: it has, once its handle holds no run.
+    fn ended(&self) -> &ThreadsEnd {
+        self.end.as_ref().expect("a run with no thread has ended")
+    }
+
+    /// [`CoopRun::read_window`] on executor 2: the root window, live or as the run left it.
+    fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
+        let read = |m: Option<&Mem>| m.map_or(Err(Trap::Malformed), |m| m.read_window(addr, len));
+        match &self.run {
+            Some(run) => read(run.state.lock_unpoisoned().mem.as_ref()),
+            None => read(self.ended().mem.as_ref()),
+        }
+    }
+
+    /// [`CoopRun::footprint`] on executor 2.
+    fn footprint(&self) -> Footprint {
+        match &self.run {
+            Some(run) => run.footprint(),
+            None => self.ended().footprint,
+        }
+    }
+}
+
+/// A run dropped before its end ends as a stopped one does ([`RunStop`]), and waits for its threads
+/// to go, so none outlives the handle.
+impl Drop for ThreadsRun {
+    fn drop(&mut self) {
+        let Some(run) = self.run.take() else {
+            return;
+        };
+        let mut g = run.state.lock_unpoisoned();
+        run.end(&mut g, Err(Trap::OutOfFuel));
+        if !self.started {
+            // The root's thread was counted in when the run opened, and never ran to count out.
+            g.live -= 1;
+        }
+        release(g);
+        if !std::thread::panicking() {
+            ThreadRun::finish(run);
+        }
+    }
+}
+
+/// The pump's [`CoopRun`]: the run's `Domain`, window, powerbox and fuel, and the [`CoopSched`] that
+/// multiplexes its tasks on the caller's thread.
+struct PumpRun {
     dom: Domain,
     mem: Option<Mem>,
     /// The root's powerbox, in its cell ([`DomainCell`]).
@@ -14455,6 +14827,58 @@ fn clear_session_fault() {
 }
 
 impl CoopRun {
+    /// The pump's half of the run.
+    fn pump(&self) -> Option<&PumpRun> {
+        match &self.exec {
+            CoopExec::Pump(p) => Some(p),
+            CoopExec::Threads(_) => None,
+        }
+    }
+
+    fn pump_mut(&mut self) -> Option<&mut PumpRun> {
+        match &mut self.exec {
+            CoopExec::Pump(p) => Some(p),
+            CoopExec::Threads(_) => None,
+        }
+    }
+
+    /// The run on executor 2 (#1414 5b): the window [`new_reserved`](Self::new_reserved) builds
+    /// (an engine-backed `2^reserved_log2` reservation, seeded with `init_mem` under `m`'s data) and
+    /// its park-request door, with each task on a thread of the host's [`ThreadPlatform`]. Nothing
+    /// runs until the first [`run`](Self::run), which starts the root on a thread of its own and
+    /// returns at the run's next event while its tasks go on: a host-answered call, as soon as it is
+    /// filed ([`CoopEvent::CapPark`], each call once, so an embedder may answer it while it pumps
+    /// on); the point where no task can run until the embedder acts ([`CoopEvent::Idle`]); or its
+    /// end. Its emitted tier is the platform's, so it surfaces no tier-up and no §22 invoke, and a
+    /// [`run_for`](Self::run_for) slice runs to the next event. `None` if `m` is outside the
+    /// engine's subset, or its host is durable: executor 2 has no freeze driver (#1694).
+    pub fn new_parallel(
+        m: &Module,
+        entry: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        host: Host,
+        init_mem: &[u8],
+        reserved_log2: u8,
+    ) -> Option<Result<CoopRun, Trap>> {
+        let (dom, mem) = match parallel_domain(m, entry, &host, reserved_log2, None, init_mem)? {
+            Ok(start) => start,
+            Err(t) => return Some(Err(t)),
+        };
+        let run = match ThreadRun::open(dom, entry, args, fuel, mem, host, true) {
+            Ok(run) => run,
+            Err(refused) => return Some(Err(refused.0)),
+        };
+        Some(Ok(CoopRun {
+            exec: CoopExec::Threads(ThreadsRun {
+                root: std::sync::Arc::clone(&run.root),
+                run: Some(run),
+                started: false,
+                end: None,
+            }),
+        }))
+    }
+
     /// Build a run over module `m`, entering `entry(args)` with `fuel` and the granted `host` powerbox.
     /// `tierup` is the tier-up config ([`TierUpConfig`]); pass `None` for a pure-interpreter multiplex.
     /// `None` if `m` uses an op outside the bytecode engine's subset (the caller falls back to the
@@ -14530,8 +14954,8 @@ impl CoopRun {
     /// bytecode run uses, the `vm_map`-grown heap living in the reserved tail), seeded with the
     /// embedder's window image (`init_mem`: the powerbox argv/env blob) and the module's data, with
     /// the personality fork/`waitpid` park-request door wired (as the one-shot entries do) so a
-    /// `bash -i` session forks and waits. Pair with [`set_suspend_on_idle`](Self::set_suspend_on_idle).
-    /// `None` if `m` is outside the engine's subset.
+    /// `bash -i` session forks and waits. A run that waits on its terminal returns
+    /// [`CoopEvent::Idle`]. `None` if `m` is outside the engine's subset.
     #[allow(clippy::too_many_arguments)] // the window-seeding seam inherently threads more inputs
     pub fn new_reserved(
         m: &Module,
@@ -14639,11 +15063,13 @@ impl CoopRun {
         sched.emit.root_leaf = root_leaf;
         sched.embedder_pumps = true;
         Ok(CoopRun {
-            dom,
-            mem,
-            host: host.into_cell(),
-            fuel,
-            sched,
+            exec: CoopExec::Pump(PumpRun {
+                dom,
+                mem,
+                host: host.into_cell(),
+                fuel,
+                sched,
+            }),
         })
     }
 
@@ -14659,12 +15085,11 @@ impl CoopRun {
     }
 
     fn pending_ti(&self) -> Option<usize> {
-        self.sched
-            .emit
-            .pending_tierup
+        let emit = &self.pump()?.sched.emit;
+        emit.pending_tierup
             .as_ref()
             .map(|(ti, ..)| *ti)
-            .or_else(|| self.sched.emit.pending_jit.as_ref().map(|(ti, ..)| *ti))
+            .or_else(|| emit.pending_jit.as_ref().map(|(ti, ..)| *ti))
     }
 
     /// #816: the window the outstanding round-trip's task runs over — `extra_envs[k].mem` for an
@@ -14673,12 +15098,10 @@ impl CoopRun {
     /// [`bounce`](Self::bounce)'s env dispatch, so the driver's reads and the bounced cap calls
     /// always agree on which window is live.
     fn pending_mem(&self) -> Option<&Mem> {
-        match self
-            .pending_ti()
-            .and_then(|ti| self.sched.core.tasks[ti].env)
-        {
-            Some(k) => self.sched.core.extra_envs[k].mem.as_ref(),
-            None => self.mem.as_ref(),
+        let p = self.pump()?;
+        match self.pending_ti().and_then(|ti| p.sched.core.tasks[ti].env) {
+            Some(k) => p.sched.core.extra_envs[k].mem.as_ref(),
+            None => p.mem.as_ref(),
         }
     }
 
@@ -14687,8 +15110,11 @@ impl CoopRun {
     /// **own** `map_version` counters (each env's window is its own `Mem`), so a version compare is only
     /// meaningful within one env — the driver rebuilds whenever (env, version) changes.
     pub fn pending_env(&self) -> i64 {
+        let Some(p) = self.pump() else {
+            return -1;
+        };
         self.pending_ti()
-            .and_then(|ti| self.sched.core.tasks[ti].env)
+            .and_then(|ti| p.sched.core.tasks[ti].env)
             .map_or(-1, |k| k as i64)
     }
 
@@ -14723,15 +15149,21 @@ impl CoopRun {
     /// lands (stdout/stderr, the framebuffer). The cdylib drains it into its capture slots at the end
     /// of a run. (§14 confined children keep their own `host` in `extra_envs`, not exposed here.)
     pub fn host_mut(&mut self) -> std::sync::MutexGuard<'_, Host> {
-        self.host.lock_unpoisoned()
+        match &mut self.exec {
+            CoopExec::Pump(p) => p.host.lock_unpoisoned(),
+            CoopExec::Threads(t) => t.root.lock_unpoisoned(),
+        }
     }
 
     /// Read `len` bytes of the root window at `addr` (bounded — an out-of-window range is an error):
     /// e.g. the pixels a parked `present` call names. `Err(Malformed)` for a memory-less run.
     pub fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
-        match self.mem.as_ref() {
-            Some(m) => m.read_window(addr, len),
-            None => Err(Trap::Malformed),
+        match &self.exec {
+            CoopExec::Pump(p) => match p.mem.as_ref() {
+                Some(m) => m.read_window(addr, len),
+                None => Err(Trap::Malformed),
+            },
+            CoopExec::Threads(t) => t.read_window(addr, len),
         }
     }
 
@@ -14741,14 +15173,14 @@ impl CoopRun {
     /// holds an installed unit's `f0`). It names the unit rather than the §22 code handle, which the
     /// guest may release once the unit is installed.
     pub fn slot_unit(&self, slot: u32) -> Option<(u32, u32)> {
-        self.dom.table.slot_unit(slot as usize)
+        self.pump()?.dom.table.slot_unit(slot as usize)
     }
 
     /// #1009: the root's dispatch-table generation, which moves with every `Jit.install` and
     /// `Jit.uninstall` into it. The browser B2 driver caches the generation it last synced its
     /// `WebAssembly.Table` at and rebuilds only when this moves.
     pub fn table_gen(&self) -> u32 {
-        self.dom.table.gen()
+        self.pump().map_or(0, |p| p.dom.table.gen())
     }
 
     /// #1009 paged tier-up: the pending task's window memory-map introspection ([`MemMapInfo`]) — a
@@ -14769,53 +15201,42 @@ impl CoopRun {
         self.pending_mem().map_or(0, |m| m.map_version())
     }
 
-    /// #1122 route (a) — make an all-parked, externally-wakeable settle surface as
-    /// [`CoopEvent::Idle`] instead of blocking the calling thread on the #1122 doorbell. The
-    /// suspend/resume session shape: the embedder owns this `CoopRun`, pumps until `Idle`, feeds the
-    /// terminal (`Posix::feed_terminal` — the line discipline runs at feed time, host-side), and pumps
-    /// again; the loop-top settle re-admits the reader on the deposit. Works on any host (no threads,
-    /// no SharedArrayBuffer), keeps the deterministic cooperative schedule.
-    pub fn set_suspend_on_idle(&mut self, on: bool) {
-        self.sched.suspend_on_idle = on;
-    }
-
     /// What the run holds now ([`Footprint`]).
     pub fn footprint(&self) -> Footprint {
-        let children = self
-            .sched
-            .core
-            .extra_envs
-            .iter()
-            .filter(|e| e.mem.is_some());
-        Footprint {
-            windows: usize::from(self.mem.is_some()) + children.count(),
-            units: self.dom.source.snapshot().len(),
+        match &self.exec {
+            CoopExec::Pump(p) => Footprint::of(p.mem.as_ref(), &p.sched.core.extra_envs, &p.dom),
+            CoopExec::Threads(t) => t.footprint(),
         }
     }
 
     /// [`run`](Self::run), but return after about `ops` ops with [`CoopEvent::Paused`] if nothing else
     /// stopped the run first. The slice is counted in ops (fuel), so it is deterministic.
     pub fn run_for(&mut self, ops: u64) -> CoopEvent {
-        self.sched.slice_left = Some(ops.max(1));
+        if let Some(p) = self.pump_mut() {
+            p.sched.slice_left = Some(ops.max(1));
+        }
         let ev = self.run();
-        self.sched.slice_left = None;
+        if let Some(p) = self.pump_mut() {
+            p.sched.slice_left = None;
+        }
         ev
     }
 
     /// Pump the schedule to its next pause: [`CoopEvent::Done`]/[`CoopEvent::Trapped`] end the run,
     /// [`CoopEvent::TierUp`] hands an emitted region to the host (resume with `deliver_tierup*`).
     pub fn run(&mut self) -> CoopEvent {
+        let p = match &mut self.exec {
+            CoopExec::Pump(p) => p,
+            CoopExec::Threads(t) => return t.run(),
+        };
         // `budget` is the per-step op budget `step_vcpu` hands `Vm::resume` (a `0` would run zero ops
         // and spin on `Outcome::Suspended`); the native `drive` runs unsliced, so match it with
         // `u64::MAX` — run each vCPU to its next stop. It doubles as the §3d spawn record budget
         // (`u64::MAX` ⇒ the no-record default `take_spawn_budget` already uses for a normal run).
-        match self.sched.pump(
-            &self.dom,
-            &mut self.mem,
-            &self.host,
-            &mut self.fuel,
-            u64::MAX,
-        ) {
+        match p
+            .sched
+            .pump(&p.dom, &mut p.mem, &p.host, &mut p.fuel, u64::MAX)
+        {
             Ok(CoopStep::Done(vals)) => CoopEvent::Done(vals),
             Ok(CoopStep::Idle) => CoopEvent::Idle,
             Ok(CoopStep::CapPark { id }) => CoopEvent::CapPark { id },
@@ -14854,31 +15275,41 @@ impl CoopRun {
     /// Deliver the emitted tier-up region's raw i64 result slots and resume (see
     /// [`CoopSched::deliver_tierup`]). Call exactly once after a [`CoopEvent::TierUp`], before `run`.
     pub fn deliver_tierup(&mut self, vals: &[i64]) {
-        self.sched.deliver_tierup(vals);
+        if let Some(p) = self.pump_mut() {
+            p.sched.deliver_tierup(vals);
+        }
     }
 
     /// #2474 — the work the pending tier-up did on the emitted tier, as its host counted it: the
     /// fuel its code burned. Call before [`Self::deliver_tierup`]; a delivery without it counts none.
     pub fn set_emitted_work(&mut self, work: u64) {
-        self.sched.set_emitted_work(work);
+        if let Some(p) = self.pump_mut() {
+            p.sched.set_emitted_work(work);
+        }
     }
 
     /// Surface an emitted tier-up region's trap and resume (the paused task traps). Call once after a
     /// [`CoopEvent::TierUp`] in lieu of [`deliver_tierup`](Self::deliver_tierup).
     pub fn deliver_tierup_trap(&mut self, trap: Trap) {
-        self.sched.deliver_tierup_trap(trap);
+        if let Some(p) = self.pump_mut() {
+            p.sched.deliver_tierup_trap(trap);
+        }
     }
 
     /// Deliver a surfaced `Jit.invoke` unit's emitted `f0` result slots and resume (see
     /// [`CoopSched::deliver_jit_invoke_vals`]). Call once after a [`CoopEvent::JitInvoke`], before `run`.
     pub fn deliver_jit_invoke_vals(&mut self, vals: &[i64]) {
-        self.sched.deliver_jit_invoke_vals(vals);
+        if let Some(p) = self.pump_mut() {
+            p.sched.deliver_jit_invoke_vals(vals);
+        }
     }
 
     /// Surface a `Jit.invoke` unit's trap and resume (the invoking task traps). Call once after a
     /// [`CoopEvent::JitInvoke`] in lieu of [`deliver_jit_invoke_vals`](Self::deliver_jit_invoke_vals).
     pub fn deliver_jit_invoke_trap(&mut self, trap: Trap) {
-        self.sched.deliver_jit_invoke_trap(trap);
+        if let Some(p) = self.pump_mut() {
+            p.sched.deliver_jit_invoke_trap(trap);
+        }
     }
 
     /// #926 slice 2 — service an emitted tier-up region's **or** a surfaced `Jit.invoke` unit's cross-tier
@@ -14914,16 +15345,19 @@ impl CoopRun {
         // The paused task is whichever host round-trip is outstanding — a tier-up region or a
         // surfaced `Jit.invoke` unit; both bounce cross-tier the same way. (#926 slice 2e)
         let ti = self.pending_ti().ok_or(Trap::Malformed)?;
-        // Mid-invoke iff a `Jit.invoke` (not a tier-up) is the outstanding round-trip — never both at
-        // once (the one-round-trip discipline). Selects the invoke-confined registry below.
-        let in_invoke = self.sched.emit.pending_jit.is_some();
-        let CoopRun {
+        let Some(PumpRun {
             dom,
             mem,
             host,
             fuel,
             sched,
-        } = self;
+        }) = self.pump_mut()
+        else {
+            return Err(Trap::Malformed);
+        };
+        // Mid-invoke iff a `Jit.invoke` (not a tier-up) is the outstanding round-trip — never both at
+        // once (the one-round-trip discipline). Selects the invoke-confined registry below.
+        let in_invoke = sched.emit.pending_jit.is_some();
         let CoopSched {
             core:
                 SchedCore {
@@ -14941,6 +15375,7 @@ impl CoopRun {
                 EmitTier {
                     invoke_fibers,
                     pending_tierup,
+                    bounce_call,
                     ..
                 },
             ..
@@ -15021,7 +15456,12 @@ impl CoopRun {
             None => mem.as_ref(),
             Some(k) => extra_envs[k].mem.as_ref(),
         };
+        let call = match &stop {
+            VcpuStop::CapPending { id, .. } => Some(*id),
+            _ => None,
+        };
         let spawn = hand_off(tasks, forked_twins, hooked_twins, ti, stop, win, *clock)?;
+        *bounce_call = call.map(|id| (ti, id));
         let (ti, dst, results) = pending_tierup.take().expect("a leaf's call parked");
         tasks[ti].vm.suspended = Some(Box::new(Suspended {
             vm,
@@ -15314,7 +15754,7 @@ fn thaws(host: &Host, mem: Option<&Mem>) -> bool {
 // === #1414 3e — executor 2: one OS thread per task over the run's scheduling core ===============
 
 /// How long the thread of a task parked on what no rule wakes (a pipe, stdin, a fiber parked on the
-/// host or on a punted call) sleeps before it looks again.
+/// host, or a punted call on a run nothing watches) sleeps before it looks again.
 const THREADS_POLL: std::time::Duration = std::time::Duration::from_micros(50);
 
 /// Executor 2's shared state (#1414 3e): the run's scheduling core and what its threads keep beside
@@ -15335,14 +15775,24 @@ struct Threads {
     over: Option<Result<Vec<Value>, Trap>>,
     /// The first faulting address a step recorded (#1720), for the run's caller.
     fault: Option<u64>,
-    /// The run's threads still running: its tasks' and its bell watcher's. The run returns once it
-    /// is zero ([`ThreadRun::ended`]), so no thread outlives it holding a hand of its fuel.
+    /// The run's threads still running: its tasks', and its watcher's while it watches. The run
+    /// returns once it is zero ([`ThreadRun::ended`]), so no thread outlives it holding a hand of
+    /// its fuel.
     live: usize,
     /// Whether one of them panicked: the run then ends, and its caller panics.
     panicked: bool,
     /// The emitted tier's state the rules read ([`SchedCore::on_stop`]): the eligibility the
     /// spawns hand their children, when the platform has a tier ([`ThreadTier`]).
     emit: EmitTier,
+    /// Whether an embedder pumps the run ([`CoopRun::new_parallel`]): its watch then returns at
+    /// each host-answered call, and where no task can run until the embedder acts
+    /// ([`ThreadRun::event`]).
+    embedder_pumps: bool,
+    /// Whether the run's last settle found no task able to run until its embedder acts: an answer
+    /// it owes, or input it feeds ([`CoopEvent::Idle`]).
+    stalled: bool,
+    /// The host-answered calls its embedder has heard of and not yet answered.
+    told: Vec<u64>,
 }
 
 impl Threads {
@@ -15358,16 +15808,21 @@ impl Threads {
 }
 
 /// A run on executor 2: the domain its tasks run, the root's powerbox cell, the shared state, how
-/// it starts threads and reads the clock, when it started on that clock, the external-wake bell an
-/// embedder armed (#1122), and where the run waits for its threads to end. Every thread holds it
-/// (`Arc`), so a thread is started with a closure of its own rather than a borrow.
+/// it starts threads and reads the clock, when it started on that clock, its bell, and where the
+/// run waits for its threads to end. Every thread holds it (`Arc`), so a thread is started with a
+/// closure of its own rather than a borrow.
 struct ThreadRun {
     dom: std::sync::Arc<Domain>,
     root: DomainCell,
     state: std::sync::Mutex<Threads>,
     platform: ThreadPlatform,
     start: u64,
-    bell: Option<std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>>,
+    /// What its watcher waits on ([`Self::watch`]): the external-wake bell the embedder armed
+    /// (#1122), or one of the run's own. An embedder's input or signal rings it, as does an answer
+    /// to a punted call (#2423) and the run's end.
+    bell: super::Bell,
+    /// Whether the thread that opened the run watches it ([`ThreadPlatform::root_on_opener`]).
+    watched: bool,
     ended: std::sync::Condvar,
     /// Whether the run is over ([`Threads::over`]), for emitted code to read without the lock
     /// ([`EmittedCall::over`]).
@@ -15436,6 +15891,12 @@ pub struct ThreadPlatform {
     /// from the engine's memory, `2^size_log2` bytes to start with; `None` builds it in the engine's,
     /// as every other driver does. A backing the embedder cannot make refuses the spawn.
     pub child_window: Option<ChildBacking>,
+    /// Whether the thread that opens a run runs its root task too. Otherwise the root starts on a
+    /// thread of its own, like every other task, and the opener watches the run: it settles the run
+    /// on each ring of the run's bell. A browser opens a run on the Worker the page started for its
+    /// root, since another Worker costs a run about 11 ms to start, and its page cannot wait to
+    /// watch. Nothing watches such a run, so a task waiting on a punted call polls for its answer.
+    pub root_on_opener: bool,
 }
 
 /// A thread a run starts ([`ThreadPlatform::spawn`]), for the platform to run on a thread of its own.
@@ -15452,6 +15913,7 @@ impl ThreadPlatform {
         now_ns: sched_wall_now,
         tier: None,
         child_window: None,
+        root_on_opener: false,
     };
 }
 
@@ -15674,11 +16136,14 @@ fn awake(t: &TaskSlot) -> bool {
 enum ParkFor {
     /// Nothing else: only a rule wakes it.
     Wake,
+    /// The answer to punted call `id`, its own or the call of a fiber it resumes. The answer
+    /// rings the run's bell, and the watcher's settle wakes the task (#2423).
+    Answer(u64),
     /// Its wait's deadline, on the run's clock ([`ThreadRun::now`]).
     Until(u64),
-    /// The next poll, for what no rule wakes: a punted call's completion (`pending`), or a pipe,
-    /// stdin or the host, which another task or an embedder fills.
-    Poll { pending: bool },
+    /// The next poll, for what no rule wakes: a pipe, stdin or the host, which another task or an
+    /// embedder fills.
+    Poll,
 }
 
 /// Executor 2, the parallel driver (#1414 3e): a run's tasks, each on its own OS thread (D56), over
@@ -15690,8 +16155,9 @@ enum ParkFor {
 ///
 /// What is the executor's own: a parked task's thread waits on its own condvar; a wait times out
 /// on the wall clock (the core's `clock` reads nanoseconds since the run started, so the rules'
-/// deadline arithmetic is the pump's); a fiber op takes the core's lock ([`FiberCell::Core`]); an
-/// armed external-wake bell has a watcher that settles the run on each ring ([`ThreadRun::watch`]);
+/// deadline arithmetic is the pump's); a fiber op takes the core's lock ([`FiberCell::Core`]); the
+/// root runs on a thread of its own while this one watches the run, settling it on each ring of its
+/// bell ([`ThreadRun::watch`]), unless this thread runs the root ([`ThreadPlatform::root_on_opener`]);
 /// and the run ends when its root does, the other tasks stopping at their next look, or with the
 /// pump's deadlock verdict ([`ThreadRun::settle`]). It returns once every thread has gone
 /// ([`ThreadExit`]). A thread starts and the clock is read through the host's [`ThreadPlatform`],
@@ -15704,112 +16170,185 @@ fn drive_threads(
     mem: Option<Mem>,
     host: &mut Host,
 ) -> (Result<Vec<Value>, Trap>, Option<Mem>) {
-    super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
-    // #1944 slice 3 — an activation of `host`: every thread draws from the host's own node, and
-    // `fuel` reads back the room left once each has handed back what it did not burn.
-    let Some(node) = host.begin_activation(*fuel, RootWindow::of(mem.as_ref())) else {
-        return (Err(Trap::ThreadFault), mem);
-    };
-    let mut root_fuel = Fuel::drawn(node);
-    let mut core = match SchedCore::new(&dom, entry, args, &mut root_fuel, mem.as_ref(), host) {
-        Ok(core) => core,
-        Err(t) => {
-            drop(root_fuel);
+    let run = match ThreadRun::open(dom, entry, args, *fuel, mem, std::mem::take(host), false) {
+        Ok(run) => run,
+        Err(refused) => {
+            let (t, back, mem) = *refused;
+            *host = back;
             *fuel = host.fuel_left();
             return (Err(t), mem);
         }
     };
-    let bell = host.external_wake();
-    let stop = host.run_stop();
-    let platform = host.thread_platform();
-    // The platform's tier emits the run's own program, and each granted module a child runs
-    // (#1414 ED-2).
-    let programs = ProgramEmits {
-        root: platform.tier.as_ref().map(|t| t.root.clone()),
-        modules: platform.tier.as_ref().and_then(|t| t.modules.clone()),
-        granted: Vec::new(),
-    };
-    if let Some(e) = &programs.root {
-        core.arm_tierup(e);
+    if run.watched {
+        run.start_root();
+        // Nothing pumps this run, so its watch ends only with it.
+        run.watch();
+    } else {
+        run.run_root_here();
     }
-    core.child_window = platform.child_window;
-    let run = std::sync::Arc::new(ThreadRun {
-        dom: std::sync::Arc::new(dom),
-        root: std::mem::take(host).into_cell(),
-        state: std::sync::Mutex::new(Threads {
-            core,
-            mem,
-            fuel: root_fuel,
-            parks: vec![std::sync::Arc::default()],
-            woken: Vec::new(),
-            over: None,
-            fault: None,
-            live: 1, // the root's, on this thread
-            panicked: false,
-            emit: EmitTier {
-                programs,
-                ..EmitTier::default()
-            },
-        }),
-        start: (platform.now_ns)(),
-        platform,
-        bell,
-        ended: std::sync::Condvar::new(),
-        over: std::sync::atomic::AtomicBool::new(false),
-        stop,
-    });
-    if let Some(stop) = &run.stop {
-        *stop.run.lock_unpoisoned() = std::sync::Arc::downgrade(&run);
-        // A stop asked for before the run was there to be told.
-        if stop.requested() {
-            run.end(&mut run.state.lock_unpoisoned(), Err(Trap::OutOfFuel));
-        }
-    }
-    let (view, hand) = run.state.lock_unpoisoned().hand(None);
-    if let Some(bell) = run.bell.clone() {
-        // The ring count before the run starts, so the watcher misses no ring the run makes.
-        let seen = *bell.0.lock().unwrap_or_else(|e| e.into_inner());
-        run.state.lock_unpoisoned().live += 1;
-        let r = std::sync::Arc::clone(&run);
-        run.start_thread(move || r.watch(&bell, seen), None);
-    }
-    run_task_thread(std::sync::Arc::clone(&run), 0, view, hand);
-    // The run is over, so a stop has nothing left to tell it: it lets go of the run now, while this
-    // thread still holds it ([`RunStop::run`]).
-    if let Some(stop) = &run.stop {
-        *stop.run.lock_unpoisoned() = std::sync::Weak::new();
-    }
-    // Every thread leaves at its next look: wait for them all to go.
-    let mut g = run.state.lock_unpoisoned();
-    while g.live > 0 {
-        g = run.ended.wait(g).unwrap_or_else(|e| e.into_inner());
-    }
-    if g.panicked {
-        drop(g);
-        panic!("a thread of the parallel driver panicked");
-    }
-    let mut core = std::mem::take(&mut g.core);
-    let mem = g.mem.take();
-    let root_fuel = std::mem::replace(&mut g.fuel, Fuel::fixed(0));
-    let (over, fault) = (g.over.take(), g.fault);
-    drop(g);
     let root = std::sync::Arc::clone(&run.root);
-    drop(run);
-    // The run ended: every domain still live in it ends with it, as the pump's does.
-    refund_ended_windows(&mut core.tasks, &root, &mut core.extra_envs, true);
-    drop(core);
-    drop(root_fuel);
+    let end = ThreadRun::finish(run);
     // A thread that has counted itself out may still hold the run (and the cell) for a moment.
     *host = std::mem::take(&mut *root.lock_unpoisoned());
     *fuel = host.fuel_left();
-    let result = over.unwrap_or(Err(Trap::ThreadFault));
-    // #1720: the trap-origin fault address, first-wins, as the pump records it.
-    let fault = fault.or_else(|| match &result {
-        Err(Trap::MemoryFault) => mem.as_ref().and_then(|m| m.peek_fault_rel()),
-        _ => None,
-    });
-    super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = fault);
-    (result, mem)
+    (end.result, end.mem)
+}
+
+impl ThreadRun {
+    /// Open a run of `entry(args)` over `dom`, `mem` and `host`, with `fuel` for it to draw: the
+    /// host's activation (#1944 slice 3: every thread draws from the host's own node), the schedule,
+    /// and a stop asked for before the run was there to be told. No thread runs yet. A run its
+    /// `embedder` pumps ([`ThreadsRun`]) is watched whatever the platform says. `Err` gives the host
+    /// and window back with the trap that refused the run.
+    fn open(
+        dom: Domain,
+        entry: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        mem: Option<Mem>,
+        mut host: Host,
+        embedder: bool,
+    ) -> Result<std::sync::Arc<ThreadRun>, Refused> {
+        super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
+        let Some(node) = host.begin_activation(fuel, RootWindow::of(mem.as_ref())) else {
+            return Err(Box::new((Trap::ThreadFault, host, mem)));
+        };
+        let mut root_fuel = Fuel::drawn(node);
+        let mut core =
+            match SchedCore::new(&dom, entry, args, &mut root_fuel, mem.as_ref(), &mut host) {
+                Ok(core) => core,
+                Err(t) => {
+                    drop(root_fuel);
+                    return Err(Box::new((t, host, mem)));
+                }
+            };
+        let bell = host.external_wake().unwrap_or_default();
+        let stop = host.run_stop();
+        let platform = host.thread_platform();
+        let watched = embedder || !platform.root_on_opener;
+        // The platform's tier emits the run's own program, and each granted module a child runs
+        // (#1414 ED-2).
+        let programs = ProgramEmits {
+            root: platform.tier.as_ref().map(|t| t.root.clone()),
+            modules: platform.tier.as_ref().and_then(|t| t.modules.clone()),
+            granted: Vec::new(),
+        };
+        if let Some(e) = &programs.root {
+            core.arm_tierup(e);
+        }
+        core.child_window = platform.child_window;
+        let run = std::sync::Arc::new(ThreadRun {
+            dom: std::sync::Arc::new(dom),
+            root: host.into_cell(),
+            state: std::sync::Mutex::new(Threads {
+                core,
+                mem,
+                fuel: root_fuel,
+                parks: vec![std::sync::Arc::default()],
+                woken: Vec::new(),
+                over: None,
+                fault: None,
+                live: 1, // the root's
+                panicked: false,
+                emit: EmitTier {
+                    programs,
+                    ..EmitTier::default()
+                },
+                embedder_pumps: embedder,
+                stalled: false,
+                told: Vec::new(),
+            }),
+            start: (platform.now_ns)(),
+            platform,
+            bell,
+            watched,
+            ended: std::sync::Condvar::new(),
+            over: std::sync::atomic::AtomicBool::new(false),
+            stop,
+        });
+        if let Some(stop) = &run.stop {
+            *stop.run.lock_unpoisoned() = std::sync::Arc::downgrade(&run);
+            // A stop asked for before the run was there to be told.
+            if stop.requested() {
+                run.end(&mut run.state.lock_unpoisoned(), Err(Trap::OutOfFuel));
+            }
+        }
+        Ok(run)
+    }
+
+    /// Start the root on a thread of its own, for the opener to watch the run ([`Self::watch`]).
+    fn start_root(self: &std::sync::Arc<Self>) {
+        let (view, hand) = self.state.lock_unpoisoned().hand(None);
+        let r = std::sync::Arc::clone(self);
+        self.start_thread(move || run_task_thread(r, 0, view, hand), None);
+    }
+
+    /// Run the root on this thread, the opener's ([`ThreadPlatform::root_on_opener`]).
+    fn run_root_here(self: &std::sync::Arc<Self>) {
+        let (view, hand) = self.state.lock_unpoisoned().hand(None);
+        run_task_thread(std::sync::Arc::clone(self), 0, view, hand);
+    }
+
+    /// The run is over: wait for every thread to go, then end every domain still live in it, as the
+    /// pump's end does. Returns what the run ended with, and records the trap-origin fault address
+    /// for the caller (#1720).
+    fn finish(run: std::sync::Arc<ThreadRun>) -> ThreadsEnd {
+        // The run is over, so a stop has nothing left to tell it: it lets go of the run now, while
+        // this thread still holds it ([`RunStop::run`]).
+        if let Some(stop) = &run.stop {
+            *stop.run.lock_unpoisoned() = std::sync::Weak::new();
+        }
+        // Every thread leaves at its next look: wait for them all to go.
+        let mut g = run.state.lock_unpoisoned();
+        while g.live > 0 {
+            g = run.ended.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        if g.panicked {
+            drop(g);
+            panic!("a thread of the parallel driver panicked");
+        }
+        let mut core = std::mem::take(&mut g.core);
+        let mem = g.mem.take();
+        let root_fuel = std::mem::replace(&mut g.fuel, Fuel::fixed(0));
+        let (over, fault) = (g.over.take(), g.fault);
+        drop(g);
+        let footprint = Footprint::of(mem.as_ref(), &core.extra_envs, &run.dom);
+        let root = std::sync::Arc::clone(&run.root);
+        drop(run);
+        refund_ended_windows(&mut core.tasks, &root, &mut core.extra_envs, true);
+        drop(core);
+        drop(root_fuel);
+        let result = over.unwrap_or(Err(Trap::ThreadFault));
+        // #1720: the trap-origin fault address, first-wins, as the pump records it.
+        let fault = fault.or_else(|| match &result {
+            Err(Trap::MemoryFault) => mem.as_ref().and_then(|m| m.peek_fault_rel()),
+            _ => None,
+        });
+        super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = fault);
+        ThreadsEnd {
+            result,
+            mem,
+            footprint,
+        }
+    }
+
+    /// What the run holds now ([`CoopRun::footprint`]).
+    fn footprint(&self) -> Footprint {
+        let g = self.state.lock_unpoisoned();
+        Footprint::of(g.mem.as_ref(), &g.core.extra_envs, &self.dom)
+    }
+}
+
+/// A run executor 2 would not open ([`ThreadRun::open`]): why, and the host and window given back.
+type Refused = Box<(Trap, Host, Option<Mem>)>;
+
+/// What a run on executor 2 ended with ([`ThreadRun::finish`]).
+struct ThreadsEnd {
+    result: Result<Vec<Value>, Trap>,
+    /// The root window.
+    mem: Option<Mem>,
+    /// What the run held as it ended.
+    footprint: Footprint,
 }
 
 /// Task `ti`'s thread on executor 2: step it whenever it can run until it ends or the run is over,
@@ -16234,12 +16773,9 @@ impl ThreadRun {
         ran.map(|()| (results, work))
     }
 
-    /// Ring the run's external-wake bell, if it has one: its watcher looks at the run.
+    /// Ring the run's bell: its watcher looks at the run.
     fn ring(&self) {
-        if let Some(bell) = &self.bell {
-            *bell.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-            bell.1.notify_all();
-        }
+        super::ring(&self.bell);
     }
 
     /// The core's clock on this executor: nanoseconds since the run started, so a wait's deadline
@@ -16264,7 +16800,7 @@ impl ThreadRun {
     }
 
     /// [`RunStop::request`]'s half: end the run as stopped and wake its threads, unless its lock is
-    /// busy (`false`, and the caller asks again). It never waits. The bell watcher leaves once a
+    /// busy (`false`, and the caller asks again). It never waits. The run's watcher leaves once a
     /// woken thread does ([`ThreadExit`]).
     fn try_stop(&self) -> bool {
         use std::sync::TryLockError;
@@ -16403,24 +16939,32 @@ impl ThreadRun {
             return;
         }
         let core = &g.core;
+        let mut stalled_now = false;
         let over = if let TaskState::Done(res) = &core.tasks[0].state {
             Some(res.clone())
         } else if self.idle(core) {
-            let external = core.tasks.iter().any(|t| {
-                matches!(
-                    t.state,
-                    TaskState::BlockedPipeRead { .. }
-                        | TaskState::BlockedPipeWrite { .. }
-                        | TaskState::BlockedStdin
-                )
-            });
-            (!external || self.root.lock_unpoisoned().external_wake().is_none())
-                .then_some(Err(Trap::ThreadFault))
+            let bell = self.root.lock_unpoisoned().external_wake().is_some();
+            match stalled(&core.tasks, g.embedder_pumps, bell) {
+                Stalled::Deadlock => Some(Err(Trap::ThreadFault)),
+                Stalled::Idle => {
+                    stalled_now = true;
+                    None
+                }
+                Stalled::Bell => None,
+            }
         } else {
+            // #1414 D4 — no task can run now, and the embedder owes the answer to a call it heard of
+            // as the call was made: its watch hands control back rather than wait for the answer.
+            stalled_now = g.embedder_pumps && self.quiet(core) && self.owes(core);
             None
         };
         if let Some(res) = over {
             self.conclude(g, res);
+        }
+        // The embedder's watch looks once the run reaches its idle point ([`Self::event`]).
+        let was = std::mem::replace(&mut g.stalled, stalled_now);
+        if stalled_now && !was {
+            self.ring();
         }
     }
 
@@ -16457,10 +17001,7 @@ impl ThreadRun {
     /// SIGCONT): a stopped process makes no progress, so its runnable task is not stepped, as the
     /// pump's pick skips it.
     fn stopped(&self, core: &SchedCore, ti: usize) -> bool {
-        task_host(&self.root, &core.extra_envs, core.tasks[ti].env)
-            .lock_unpoisoned()
-            .signal_poll()
-            .is_some_and(|(_, s)| s.stopped())
+        process_stopped(&self.root, &core.extra_envs, &core.tasks[ti])
     }
 
     /// What task `ti`'s thread waits for while the task is parked, or runnable in a stopped process.
@@ -16468,14 +17009,14 @@ impl ThreadRun {
         let t = &core.tasks[ti];
         match t.state {
             // Its SIGCONT comes from another task's call or an embedder, with no rule to wake it.
-            TaskState::Runnable => ParkFor::Poll { pending: false },
+            TaskState::Runnable => ParkFor::Poll,
             TaskState::BlockedWait {
                 deadline: Some(d), ..
             } => ParkFor::Until(d),
             TaskState::BlockedPipeRead { .. }
             | TaskState::BlockedPipeWrite { .. }
-            | TaskState::BlockedStdin => ParkFor::Poll { pending: false },
-            TaskState::BlockedHostCap { .. } => ParkFor::Poll { pending: true },
+            | TaskState::BlockedStdin => ParkFor::Poll,
+            TaskState::BlockedHostCap { id, .. } => ParkFor::Answer(id),
             TaskState::BlockedOnFiber { fiber } => {
                 let reg = match t.env {
                     None => &core.fibers,
@@ -16487,10 +17028,10 @@ impl ThreadRun {
                         woken: None,
                         ..
                     }) => ParkFor::Until(*d),
-                    Some(FiberState::HostParked { .. }) => ParkFor::Poll { pending: false },
-                    Some(FiberState::CapParked { woken: None, .. }) => {
-                        ParkFor::Poll { pending: true }
-                    }
+                    Some(FiberState::HostParked { .. }) => ParkFor::Poll,
+                    Some(FiberState::CapParked {
+                        id, woken: None, ..
+                    }) => ParkFor::Answer(*id),
                     _ => ParkFor::Wake,
                 }
             }
@@ -16500,16 +17041,32 @@ impl ThreadRun {
 
     /// Whether nothing in the run can move on its own, the pump's idle point: no task can run, none
     /// waits out a deadline, and no punted call is outstanding. A park on a pipe, stdin or the host
-    /// still counts: only another task, or an embedder through the external-wake bell, wakes it.
+    /// still counts, as does a runnable task of a stopped process, which the pump's pick skips: only
+    /// another task, or an embedder through the external-wake bell, wakes it.
     fn idle(&self, core: &SchedCore) -> bool {
         (0..core.tasks.len()).all(|j| match core.tasks[j].state {
             TaskState::Done(_) => true,
-            TaskState::Runnable => false,
-            _ => matches!(
-                self.park_for(core, j),
-                ParkFor::Wake | ParkFor::Poll { pending: false }
-            ),
+            TaskState::Runnable => self.stopped(core, j),
+            _ => matches!(self.park_for(core, j), ParkFor::Wake | ParkFor::Poll),
         })
+    }
+
+    /// Whether no task can run now: each is done, parked, or a runnable task of a stopped process.
+    fn quiet(&self, core: &SchedCore) -> bool {
+        (0..core.tasks.len()).all(|j| match core.tasks[j].state {
+            TaskState::Runnable => self.stopped(core, j),
+            _ => true,
+        })
+    }
+
+    /// Whether a task waits on a host-answered call: one only the embedder answers (#1414 D4).
+    fn owes(&self, core: &SchedCore) -> bool {
+        outstanding_calls(&core.tasks, &core.fibers, &core.extra_envs)
+            .into_iter()
+            .any(|(env, id)| {
+                let h = task_host(&self.root, &core.extra_envs, env).lock_unpoisoned();
+                h.completions().is_host_owned(id)
+            })
     }
 
     /// Wait out task `ti`'s park on `park`. A park a deadline or a poll ends settles after it, as
@@ -16527,13 +17084,37 @@ impl ThreadRun {
         g = match self.park_for(&g.core, ti) {
             // Only a rule ends this park, and the rule's holder settled after it.
             ParkFor::Wake => return park.wait(g).unwrap_or_else(|e| e.into_inner()),
+            // The answer rings the run's bell once the call's store has the run's hook, and the
+            // watcher's settle wakes the task. One that posted before the hook rang nothing, so
+            // look once more first. An embedder that pumps the run hears of a call it answers
+            // as soon as the call is filed (#1414 D4), while the run's other tasks go on.
+            ParkFor::Answer(id) if self.watched => {
+                let env = g.core.tasks[ti].env;
+                let comps = task_host(&self.root, &g.core.extra_envs, env)
+                    .lock_unpoisoned()
+                    .completions();
+                comps.set_notify(Some(super::ring_on_answer(&self.bell)));
+                let was_awake: Vec<bool> = g.core.tasks.iter().map(awake).collect();
+                self.settle(&mut g);
+                self.wake(&mut g, &was_awake, Some(ti));
+                if awake(&g.core.tasks[ti]) || g.over.is_some() {
+                    return g;
+                }
+                if g.embedder_pumps && !g.told.contains(&id) && comps.is_host_owned(id) {
+                    self.ring();
+                }
+                for p in std::mem::take(&mut g.woken) {
+                    p.notify_one();
+                }
+                return park.wait(g).unwrap_or_else(|e| e.into_inner());
+            }
             ParkFor::Until(at) => {
                 let left = std::time::Duration::from_nanos(at.saturating_sub(self.now()));
                 park.wait_timeout(g, left)
                     .unwrap_or_else(|e| e.into_inner())
                     .0
             }
-            ParkFor::Poll { .. } => {
+            ParkFor::Answer(_) | ParkFor::Poll => {
                 park.wait_timeout(g, THREADS_POLL)
                     .unwrap_or_else(|e| e.into_inner())
                     .0
@@ -16545,31 +17126,74 @@ impl ThreadRun {
         g
     }
 
-    /// #1122/#1262 — settle the run on each ring of its external-wake `bell` after the `seen`th,
-    /// until the run is over. An embedder's input or signal rings it (a terminal `^C` while every
-    /// task waits on a rule or a deadline), and the parks it ends wake now, not at the next stop.
-    /// The bell's lock is let go before the run's is taken, so a ring from under the run's lock
-    /// cannot deadlock with it.
-    fn watch(&self, bell: &(std::sync::Mutex<u64>, std::sync::Condvar), mut seen: u64) {
+    /// #1122/#1262 — the watch of the thread that opened the run, or of the `run` of an embedder
+    /// that pumps it ([`ThreadsRun`]): settle the run, and again on each ring of its bell, until the
+    /// run is over or has something for its embedder to hear ([`Self::event`]). An embedder's input
+    /// or signal rings the bell (a terminal `^C` while every task waits on a rule or a deadline), and
+    /// so does an answer to a punted call a task waits on (#2423): the parks it ends wake now, not at
+    /// the next stop. The ring count is read before each settle, so a ring after it is not missed,
+    /// and the bell's lock is let go before the run's is taken, so a ring from under the run's lock
+    /// cannot deadlock with it. The watcher counts as one of the run's threads while it watches, so
+    /// a panic in a settle ends the run, as it does on any other.
+    fn watch(&self) -> Watched {
+        self.state.lock_unpoisoned().live += 1;
         let _exit = ThreadExit(self);
         loop {
-            {
-                let mut gen = bell.0.lock().unwrap_or_else(|e| e.into_inner());
-                while *gen == seen {
-                    gen = bell.1.wait(gen).unwrap_or_else(|e| e.into_inner());
-                }
-                seen = *gen;
-            }
+            let seen = *self.bell.0.lock_unpoisoned();
             let mut g = self.state.lock_unpoisoned();
-            if g.over.is_some() {
-                return;
+            if g.over.is_none() {
+                let was_awake: Vec<bool> = g.core.tasks.iter().map(awake).collect();
+                self.settle(&mut g);
+                self.wake(&mut g, &was_awake, None);
             }
-            let was_awake: Vec<bool> = g.core.tasks.iter().map(awake).collect();
-            self.settle(&mut g);
-            self.wake(&mut g, &was_awake, None);
+            let watched = match g.over {
+                Some(_) => Some(Watched::Over),
+                None => self.event(&mut g),
+            };
             release(g);
+            if let Some(w) = watched {
+                return w;
+            }
+            super::wait_for_ring(&self.bell, seen, None);
         }
     }
+
+    /// What an embedder that pumps the run must hear now ([`Threads::embedder_pumps`]): a
+    /// host-answered call it has not heard of, the earliest first, then that no task can run until
+    /// it acts ([`Threads::stalled`]). It hears of each call once, as soon as the call is filed
+    /// (#1414 D4).
+    fn event(&self, g: &mut Threads) -> Option<Watched> {
+        if !g.embedder_pumps {
+            return None;
+        }
+        let core = &g.core;
+        let waiting: Vec<u64> = outstanding_calls(&core.tasks, &core.fibers, &core.extra_envs)
+            .into_iter()
+            .filter(|&(env, id)| {
+                let h = task_host(&self.root, &core.extra_envs, env).lock_unpoisoned();
+                h.completions().is_host_owned(id)
+            })
+            .map(|(_, id)| id)
+            .collect();
+        g.told.retain(|id| waiting.contains(id));
+        let untold = waiting.into_iter().filter(|id| !g.told.contains(id)).min();
+        if let Some(id) = untold {
+            g.told.push(id);
+            return Some(Watched::CapPark(id));
+        }
+        g.stalled.then_some(Watched::Idle)
+    }
+}
+
+/// Why a watch of a run on executor 2 ended ([`ThreadRun::watch`]).
+enum Watched {
+    /// The run is over.
+    Over,
+    /// Host-answered call `id` waits for its embedder's answer ([`CoopEvent::CapPark`]).
+    CapPark(u64),
+    /// No task can run until the embedder acts: an answer it owes, or input it feeds
+    /// ([`CoopEvent::Idle`]).
+    Idle,
 }
 
 /// Mark task `ti` finished with `res`, then wake any vCPU parked on a join of it: what the end gives

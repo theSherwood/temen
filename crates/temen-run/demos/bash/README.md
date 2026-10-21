@@ -372,9 +372,10 @@ drivers (the rung-3 harness doubles as readline's acceptance).
 
 ## #1122 route (a) (DONE) — the cooperative suspend/resume session
 
-The interactive card's second driver. `CoopRun::set_suspend_on_idle` makes the cooperative pump hand
-an all-parked, externally-wakeable settle back to the embedder as `CoopEvent::Idle` instead of
-sleeping the thread on the #1122 doorbell — the whole scheduler state stays inside the `CoopRun`; the
+The interactive card's second driver. A `CoopRun` hands an all-parked, externally-wakeable settle
+back to the embedder as `CoopEvent::Idle` instead of sleeping the thread on the #1122 doorbell (every
+`CoopRun` does since #1414 D4; it was the opt-in `set_suspend_on_idle` before) — the whole scheduler
+state stays inside the `CoopRun`; the
 embedder feeds the terminal (`Posix::feed_terminal`, the line discipline running at feed time) and
 pumps again, and the loop-top settle re-admits the parked reader. No second thread, no doorbell, no
 SharedArrayBuffer needed by the driver, and the deterministic cooperative schedule is unchanged.

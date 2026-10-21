@@ -1934,7 +1934,7 @@ the world, or on what another vCPU, thread or child of the run does, so its call
 oracle's vCPU does, on every engine: the cooperative pump and the parallel driver park the *task*
 (`BlockedHostCap`, the state a host-completed call already used) and run the others, and each
 round's drain wakes it (`drain_task_completions`); the debug scheduler parks the thread and takes
-the pool's answer only once nothing else can run, so its schedule stays deterministic; the JIT's
+its answer at the next pick, recording where, so a replay takes it there (#2538); the JIT's
 vCPU, under either thunk, waits outside the run with its D66 lane given back and the §5 kill
 re-checked (`temen_jit::wait_outside`) — the generic `cap_thunk` takes the pending face at root
 context too. A cooperative scheduler with nothing to run fires its next timer **before** it blocks
@@ -1992,6 +1992,23 @@ re-offers its tasks), so they run at once. An answer given inside its own call's
 longer posts without ringing: that special case is gone. Pinned on every engine in
 `temen-run/tests/cap_park.rs`.
 
+**A debug run takes an answer as it comes (#2538, 2026-10-21).** The debug scheduler took a parked
+call's answer only when nothing could run and no timer was left, so a thread that kept a timer going
+(a poll) or kept running (a spin) held another thread's answer back for good, where every other
+engine delivers it as it arrives (#2477). Now a thread whose answer has come takes it at the next
+pick. With nothing to run and no answer in, the run waits in real time for one until the next timer
+is due, as the native pump does (#1979), and then the timer fires; the clock still jumps to the
+deadline, so a run with no outside input keeps its schedule. When an answer comes is the world's
+doing, so the run records where each was taken, by its logical time (`clock + turn`, which every
+pick moves on; `Takes`), and a run that goes over its time again (`tick`, as an undo re-executes)
+takes each answer there and nowhere else. A `drive` decides afresh from where it starts. A run that
+owes its embedder an answer, told of the call as it was made (#1414 D4), still stops `Idle` only once
+no timer is left, since the answer may wait on that timer. The cooperative pump had the spinning half of the bug: it drains answers between quanta, but
+armed its quantum only for two runnable tasks or a deadline, so a lone spinner ran on past an
+answer; it now arms it while a task waits on a call. Pinned in `temen-run/tests/cap_park.rs` (a
+polling root, paced and spinning, on every engine) and `temen-interp/tests/undo_journal.rs` (the
+replay).
+
 **An idle pump lets a wait's time pass (#1979, 2026-10-15).** The cooperative pump's clock is
 logical, for determinism (#2224): it moves with the work done, one ns per op, and when nothing can
 run, to the earliest deadline. On the native `drive` that time now passes first, in real time, as
@@ -2000,8 +2017,9 @@ of the embedder's bell ends the wait early, and the clock moves by the time that
 schedule is the clock's as before. A run with no outside input keeps its
 schedule exactly, and only now takes as long as it asked to wait. Without it a 10 ms wait ended
 after ~80 µs, and while a root waited on the world its threads' timed waits fired back to back. The
-debug scheduler keeps the jump, so a replay stays exact; a `CoopRun`'s embedder (the browser) does
-too, as wasm has no clock to wait on (#2439). Pinned in `temen-interp/tests/timed_waits.rs`.
+debug scheduler keeps the jump, so a replay stays exact, and waits in real time only for an answer
+(#2538); a `CoopRun`'s embedder (the browser) keeps it too, as wasm has no clock to wait on (#2439).
+Pinned in `temen-interp/tests/timed_waits.rs`.
 
 **One bell for an idle pump (#2480, 2026-10-20).** With nothing to run, the pump waited either on the
 answers to its outstanding calls or on the embedder's bell, never both, so a feed, a signal or a
@@ -2153,7 +2171,9 @@ fiber count or I/O concurrency**:
   shared-memory spin — a spinlock, `while (!flag) {}`) still yields to its siblings. This makes the
   cooperative tier a faithful model of **preemptive 1:1 threads** (D56), not run-to-completion; the
   quantum is op-count, not wall-clock, so the schedule stays reproducible (the differential oracle).
-  (#1157)
+  (#1157) It is armed too while a vCPU waits with a deadline (#2224) or on a call's answer (#2538):
+  the deadline's clock moves, and the answer is drained, between quanta, so a lone spinner must yield
+  for the waiter to wake.
 - **Fiber** preemption is guest policy via fuel-inserted yield points (Go-style
   async preemption); the VM supplies mechanism, not policy.
 - Nested (§14): a child's vCPUs are real OS threads the host scheduler runs within

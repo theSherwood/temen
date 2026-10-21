@@ -5317,25 +5317,35 @@ pub enum Outcome {
 /// #1122 route (a) — one pump step of a [`CoopSession`].
 #[derive(Debug)]
 pub enum SessionStep {
-    /// Every task is parked on input only the embedder can supply (a terminal read): feed the
-    /// terminal and pump again. The run is live and its whole state retained in the session.
+    /// Nothing can run until the embedder acts (#1414 D4): every task is parked on input only the
+    /// embedder can supply (a terminal read: feed the terminal), or on the answer to a call it was
+    /// told of ([`SessionStep::CapPark`]: answer it), and pump again. The run is live and its whole
+    /// state retained in the session.
     Idle,
+    /// #2528 — the guest has just made host-answered call `id`: a call to a capability whose proc
+    /// answers with [`temen_interp::OffloadOutcome::Host`]. Answer it with the
+    /// [`temen_interp::Completer`] the proc's submit hook was handed, now or later. Each call is
+    /// told once, as it is made; a pump runs the run's other tasks meanwhile, and returns
+    /// [`SessionStep::Idle`] once nothing can run until the answer.
+    CapPark { id: u64 },
     /// The run finished — the guest's exit code or returned values.
     Done(Outcome),
 }
 
-/// #1122 route (a) — a resumable cooperative bytecode run ([`Instance::open_coop_session`]): the
-/// embedder owns it and drives it with [`pump`](Self::pump) between input feeds.
+/// #1122 route (a) — a resumable bytecode run ([`Instance::open_coop_session`]): the embedder owns
+/// it and drives it with [`pump`](Self::pump) between input feeds and answers.
 pub struct CoopSession {
     run: temen_interp::bytecode::CoopRun,
 }
 
 impl CoopSession {
-    /// Run until the session idles on external input ([`SessionStep::Idle`]) or finishes
-    /// ([`SessionStep::Done`]); a fatal trap is the `Err` (§5 detect-and-kill).
+    /// Run until the session idles on external input ([`SessionStep::Idle`]), waits on a
+    /// host-answered call ([`SessionStep::CapPark`]) or finishes ([`SessionStep::Done`]); a fatal
+    /// trap is the `Err` (§5 detect-and-kill).
     pub fn pump(&mut self) -> Result<SessionStep, String> {
         match self.run.run() {
             temen_interp::bytecode::CoopEvent::Idle => Ok(SessionStep::Idle),
+            temen_interp::bytecode::CoopEvent::CapPark { id } => Ok(SessionStep::CapPark { id }),
             temen_interp::bytecode::CoopEvent::Done(v) => {
                 outcome_from_interp(Ok(v)).map(SessionStep::Done)
             }
@@ -6866,6 +6876,10 @@ pub struct RunConfig {
     /// #2145 — where the JIT keeps the programs this run compiles, when the embedder keeps them past
     /// it: every run handed the same cache compiles each program once. `None`: the run's own.
     pub jit_code: Option<JitCodeCache>,
+    /// #1414 5b — run on executor 2, each task on an OS thread of its own, rather than on the
+    /// pump. Only [`Instance::open_coop_session`] reads it: a one-shot run picks executor 2 with
+    /// [`Instance::run_with_caps_parallel`]. Off by default.
+    pub parallel: bool,
 }
 
 impl Default for RunConfig {
@@ -6878,6 +6892,7 @@ impl Default for RunConfig {
             env: Vec::new(),
             handoff: true,
             jit_code: None,
+            parallel: false,
         }
     }
 }
@@ -8157,35 +8172,38 @@ impl Instance {
     /// returns [`SessionStep::Idle`] instead of blocking a thread on the doorbell; the caller feeds
     /// the terminal (`Posix::feed_terminal`) and pumps again. No second thread, no doorbell, the
     /// deterministic cooperative schedule — the interactive-shell shape for a host without threads
-    /// or SharedArrayBuffer. `Err` if the module is outside the bytecode engine's subset (this
-    /// entry does not fall back to the tree-walker: a session needs the resumable driver).
+    /// or SharedArrayBuffer. With [`RunConfig::parallel`] the session runs on executor 2, each task
+    /// on an OS thread of its own, and pumps the same way. `Err` if the module is outside the
+    /// bytecode engine's subset (this entry does not fall back to the tree-walker: a session needs
+    /// the resumable driver), or, with `parallel`, its powerbox is durable: executor 2 has no freeze
+    /// driver.
     pub fn open_coop_session(
         &self,
         config: &RunConfig,
         extra_caps: &[(&str, HostCap)],
     ) -> Result<CoopSession, String> {
+        use temen_interp::bytecode::CoopRun;
         let owned = self.window_override(config);
         let m = owned.as_ref().unwrap_or(&self.module);
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
         let init_mem = config.init_mem()?;
+        let init_mem = init_mem.as_deref().unwrap_or(&[]);
         let mut host = self.powerbox_host(config, win, extra_caps);
-        host.set_workers(1); // #2254: the cooperative driver runs every vCPU on one thread
         let fuel = config.limits.fuel();
-        let mut run = temen_interp::bytecode::CoopRun::new_reserved(
-            m,
-            0,
-            &[],
-            fuel,
-            host,
-            None,
-            init_mem.as_deref().unwrap_or(&[]),
-            temen_ir::default_reserved_log2(),
-        )
-        .ok_or_else(|| {
-            "module outside the bytecode engine's subset (no session driver)".to_string()
-        })?
-        .map_err(|t| format!("guest trapped while scheduling ({t:?})"))?;
-        run.set_suspend_on_idle(true);
+        let reserved_log2 = temen_ir::default_reserved_log2();
+        let run = if config.parallel {
+            CoopRun::new_parallel(m, 0, &[], fuel, host, init_mem, reserved_log2)
+        } else {
+            host.set_workers(1); // #2254: the cooperative driver runs every vCPU on one thread
+            CoopRun::new_reserved(m, 0, &[], fuel, host, None, init_mem, reserved_log2)
+        };
+        let run = run
+            .ok_or_else(|| {
+                "module outside the session's executor (an op outside the bytecode engine's \
+                 subset, or a durable powerbox on executor 2)"
+                    .to_string()
+            })?
+            .map_err(|t| format!("guest trapped while scheduling ({t:?})"))?;
         Ok(CoopSession { run })
     }
 

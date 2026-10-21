@@ -4,15 +4,17 @@
 //! An offloadable handler returns [`OffloadOutcome::Host`] for the slow case; the dispatch mints a
 //! completion id and hands the call's [`Completer`] to the submit hook (the host records the
 //! request). On the cooperative multiplex driver ([`bytecode::CoopRun`], the engine behind the
-//! browser's release session, #1953), a task or fiber parks on the call, the pump surfaces
-//! [`CoopEvent::CapPark`] once nothing else can run, and the next pump after the answer resumes it.
+//! browser's release session, #1953), a task or fiber parks on the call, the run tells of the call
+//! once, as it is made ([`CoopEvent::CapPark`]), returns [`CoopEvent::Idle`] while nothing can run
+//! until its answer, and the next pump after the answer resumes it (#1414 D4).
 //! This is how a single-threaded embedder (the `wasm32` cdylib, where no offload pool can exist)
 //! composes an asynchronous I/O powerbox. Pinned here: the park/answer round-trip on the root, a
 //! spawned thread and a fiber, unsliced and sliced; byte-parity with the pool posture
 //! (decline-never-diverge, INVARIANTS 9); the fail-closed decline where no caller can park (it must
 //! not hang); and the §12 "sync ops never pay" pin. #2495 carries the posture to the drivers no
 //! embedder pumps — the tree-walker and the native cooperative driver — where the embedder answers
-//! from a thread of its own.
+//! from a thread of its own. #1414 5b runs the `CoopRun` cases on executor 2 too, where the run's
+//! other tasks go on while the embedder answers.
 //!
 //! #1954 runs the **root program as an emitted leaf**: a root that parks only in declared
 //! host-completed caps is offered to the host's leaf emitter, and each call parks in a bounce out of
@@ -20,8 +22,15 @@
 //! `leaf_tierup.rs` does, by bouncing the entry — the nested interpretation the emitted image's own
 //! calls bounce into.
 
+#[path = "support/drivers.rs"]
+mod drivers;
+
+use drivers::{Pumped, PUMPED};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use temen_interp::bytecode::{self, CoopEvent, LeafOffer, ProgramEmit, TierUpConfig};
+use temen_interp::bytecode::{
+    self, CoopEvent, LeafOffer, ProgramEmit, ThreadPlatform, TierUpConfig,
+};
 use temen_interp::{
     run_with_host, BoundImport, CapRequests, Completer, Host, OffloadOutcome, Trap, Value,
 };
@@ -258,10 +267,14 @@ fn parse(src: &str) -> temen_ir::Module {
     m
 }
 
-fn coop(m: &temen_ir::Module, host: Host, h: i32) -> bytecode::CoopRun {
-    bytecode::CoopRun::new(m, 0, &[Value::I32(h)], FUEL, host, None)
-        .expect("in subset")
-        .expect("entry in range")
+fn coop(exec: Pumped, m: &temen_ir::Module, host: Host, h: i32) -> bytecode::CoopRun {
+    exec.open(
+        m,
+        &[Value::I32(h)],
+        FUEL,
+        host,
+        temen_ir::default_reserved_log2(),
+    )
 }
 
 /// Pump a `CoopRun` to the end — unsliced, or in `slice`-op slices — answering every surfaced park
@@ -291,94 +304,235 @@ fn drive_coop(
     }
 }
 
-/// The cooperative round-trip: the root parks on op 1, the pump surfaces the id the submit hook
-/// filed, and the answered value lands in the call's slot.
+/// The round trip, on both executors (#1414 D4): the root parks on op 1, and the run tells of the
+/// call once, as it is made, under the id the submit hook filed. With its answer owed and nothing
+/// else to run, a pump hands back `Idle`, rather than tell of the call again or wait for it. The
+/// answered value lands in the call's slot.
 #[test]
-fn coop_run_parks_on_a_host_completed_cap_and_resumes() {
-    let m = module();
-    let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
-    let (host, h) = host_completed(&recorded);
-    let comps = host.completions();
-    let mut run = coop(&m, host, h);
-    let id = match run.run() {
-        CoopEvent::CapPark { id } => id,
-        _ => panic!("the host-answered call parks the run"),
-    };
-    assert_eq!(filed(&recorded), vec![(id, 7)]);
-    assert!(
-        matches!(run.run(), CoopEvent::CapPark { id: again } if again == id),
-        "pumping while parked surfaces the same call again"
-    );
-    answer(&recorded, id);
-    assert!(matches!(run.run(), CoopEvent::Done(ref v) if *v == vec![Value::I64(WANT)]));
-    assert_eq!(
-        comps.minted(),
-        1,
-        "one completion id minted (the Done op paid nothing)"
-    );
-    assert_eq!(comps.outstanding(), 0, "the answered completion settled");
+fn a_host_answered_call_is_told_once_and_the_run_idles_until_its_answer() {
+    for exec in PUMPED {
+        let m = module();
+        let (end, minted, outstanding) = bounded(move || {
+            let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+            let (host, h) = host_completed(&recorded);
+            let comps = host.completions();
+            let mut run = coop(exec, &m, host, h);
+            let id = match run.run() {
+                CoopEvent::CapPark { id } => id,
+                _ => panic!("{exec:?}: the host-answered call is told"),
+            };
+            assert_eq!(filed(&recorded), vec![(id, 7)], "{exec:?}");
+            for _ in 0..2 {
+                assert!(
+                    matches!(run.run(), CoopEvent::Idle),
+                    "{exec:?}: with the answer owed and nothing else to run, the run is idle"
+                );
+            }
+            answer(&recorded, id);
+            (run.run(), comps.minted(), comps.outstanding())
+        });
+        assert!(
+            matches!(end, CoopEvent::Done(ref v) if *v == vec![Value::I64(WANT)]),
+            "{exec:?}"
+        );
+        assert_eq!(
+            minted, 1,
+            "{exec:?}: one completion id minted (the Done op paid nothing)"
+        );
+        assert_eq!(outstanding, 0, "{exec:?}: the answered completion settled");
+    }
+}
+
+/// #2531 — the root spins on a flag that its thread sets once its host-answered call returns:
+/// `107`, the call's answer, through the join.
+const SPIN_ON_FLAG: &str = r#"memory 16
+func (i32) -> (i64) {
+block 0 (vh: i32) {
+  vz = i64.const 0
+  vh64 = i64.extend_i32_u vh
+  vt = thread.spawn 1 vz vh64
+  br 1(vt)
+}
+block 1 (vt1: i32) {
+  vaddr = i64.const 32768
+  vflag = i64.load vaddr
+  vzero = i64.const 0
+  vwait = i64.eq vflag vzero
+  br_if vwait 1(vt1) 2(vt1)
+}
+block 2 (vt2: i32) {
+  vr = thread.join vt2
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vh = i32.wrap_i64 varg
+  vseven = i64.const 7
+  vr = call.cap 13 1 (i64) -> (i64) vh (vseven)
+  vaddr = i64.const 32768
+  vone = i64.const 1
+  i64.store vaddr vone
+  return vr
+  }
+}
+"#;
+
+/// #2531, #1414 D4 — a call is told while another task keeps running. A run that told of a call only
+/// once nothing else could run never told of this one, as the root never stops spinning, and the
+/// run never ended.
+#[test]
+fn a_call_is_told_while_another_task_keeps_running() {
+    for exec in PUMPED {
+        let m = parse(SPIN_ON_FLAG);
+        let (v, parks) = bounded(move || {
+            let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+            let (host, h) = host_completed(&recorded);
+            let mut run = coop(exec, &m, host, h);
+            drive_coop(&mut run, &recorded, None)
+        });
+        assert_eq!(v, vec![Value::I64(107)], "{exec:?}");
+        assert_eq!(parks, 1, "{exec:?}: the call was told once");
+    }
+}
+
+/// The root and a thread it spawned each make a host-answered call (op 1, args 5 and 7), then the
+/// root joins the thread: `105 * 1000 + 107`.
+const TWO_PARKS: &str = r#"memory 16
+func (i32) -> (i64) {
+block 0 (vh: i32) {
+  vz = i64.const 0
+  vh64 = i64.extend_i32_u vh
+  vt = thread.spawn 1 vz vh64
+  vfive = i64.const 5
+  vr0 = call.cap 13 1 (i64) -> (i64) vh (vfive)
+  vr1 = thread.join vt
+  vk = i64.const 1000
+  vm = i64.mul vr0 vk
+  vsum = i64.add vm vr1
+  return vsum
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vh = i32.wrap_i64 varg
+  vseven = i64.const 7
+  vr = call.cap 13 1 (i64) -> (i64) vh (vseven)
+  return vr
+  }
+}
+"#;
+
+/// #1414 D4 — each host-answered call is told once, on both executors: with one call told and not
+/// yet answered, the next `run` tells of the other, and with both owed, the run is idle. The
+/// embedder then answers both.
+#[test]
+fn each_host_answered_call_is_told_once_while_another_waits() {
+    for exec in PUMPED {
+        let m = parse(TWO_PARKS);
+        let (r, told, filed_ids, idle) = bounded(move || {
+            let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+            let (host, h) = host_completed(&recorded);
+            let mut run = coop(exec, &m, host, h);
+            let mut told: Vec<u64> = (0..2)
+                .map(|_| match run.run() {
+                    CoopEvent::CapPark { id } => id,
+                    _ => panic!("{exec:?}: each host-answered call is told"),
+                })
+                .collect();
+            let idle = matches!(run.run(), CoopEvent::Idle);
+            let mut filed_ids: Vec<u64> = filed(&recorded).into_iter().map(|(id, _)| id).collect();
+            told.sort_unstable();
+            filed_ids.sort_unstable();
+            for &id in &told {
+                answer(&recorded, id);
+            }
+            (run.run(), told, filed_ids, idle)
+        });
+        assert_eq!(told, filed_ids, "{exec:?}: each filed call was told once");
+        assert!(idle, "{exec:?}: with both answers owed, the run is idle");
+        assert!(
+            matches!(r, CoopEvent::Done(ref v) if *v == vec![Value::I64(WANT)]),
+            "{exec:?}"
+        );
+    }
 }
 
 /// A host that answers *inside* its submit hook (the request was serviceable synchronously after
 /// all) never parks: the driver finds the result already posted and continues.
 #[test]
 fn host_completing_inside_submit_does_not_park() {
-    let m = module();
-    let mut host = Host::new();
-    let comps = host.completions();
-    let h = host.grant_host_proc_offloadable(
-        Box::new(move |op, args| {
-            let a = *args.first().unwrap_or(&0);
-            if op == 0 {
-                return OffloadOutcome::Done(Ok(vec![a + 100]));
+    for exec in PUMPED {
+        let m = module();
+        let mut host = Host::new();
+        let comps = host.completions();
+        let h = host.grant_host_proc_offloadable(
+            Box::new(move |op, args| {
+                let a = *args.first().unwrap_or(&0);
+                if op == 0 {
+                    return OffloadOutcome::Done(Ok(vec![a + 100]));
+                }
+                OffloadOutcome::Host(Box::new(move |c: Completer| c.complete(a + 100)))
+            }),
+            None,
+            temen_interp::CapState::Stateless,
+        );
+        match bounded(move || coop(exec, &m, host, h).run()) {
+            CoopEvent::Done(r) => assert_eq!(r, vec![Value::I64(WANT)], "{exec:?}"),
+            CoopEvent::CapPark { .. } => {
+                panic!("{exec:?}: an already-completed request must not park")
             }
-            OffloadOutcome::Host(Box::new(move |c: Completer| c.complete(a + 100)))
-        }),
-        None,
-        temen_interp::CapState::Stateless,
-    );
-    match coop(&m, host, h).run() {
-        CoopEvent::Done(r) => assert_eq!(r, vec![Value::I64(WANT)]),
-        CoopEvent::CapPark { .. } => panic!("an already-completed request must not park"),
-        _ => panic!("unexpected coop event"),
+            _ => panic!("{exec:?}: unexpected coop event"),
+        }
+        assert_eq!(comps.outstanding(), 0, "{exec:?}");
     }
-    assert_eq!(comps.outstanding(), 0);
 }
 
 /// §12 pin, host-completed form: a handler that always answers inline touches none of the
 /// parking machinery — no id minted, nothing outstanding.
 #[test]
 fn sync_ops_never_pay_for_the_host_posture() {
-    let m = module();
-    let mut host = Host::new();
-    let comps = host.completions();
-    let h = host.grant_host_proc_offloadable(
-        Box::new(|_op, args| OffloadOutcome::Done(Ok(vec![*args.first().unwrap_or(&0) + 100]))),
-        None,
-        temen_interp::CapState::Stateless,
-    );
-    match coop(&m, host, h).run() {
-        CoopEvent::Done(r) => assert_eq!(r, vec![Value::I64(WANT)]),
-        _ => panic!("an all-inline handler never parks"),
+    for exec in PUMPED {
+        let m = module();
+        let mut host = Host::new();
+        let comps = host.completions();
+        let h = host.grant_host_proc_offloadable(
+            Box::new(|_op, args| OffloadOutcome::Done(Ok(vec![*args.first().unwrap_or(&0) + 100]))),
+            None,
+            temen_interp::CapState::Stateless,
+        );
+        match bounded(move || coop(exec, &m, host, h).run()) {
+            CoopEvent::Done(r) => assert_eq!(r, vec![Value::I64(WANT)], "{exec:?}"),
+            _ => panic!("{exec:?}: an all-inline handler never parks"),
+        }
+        assert_eq!(
+            comps.minted(),
+            0,
+            "{exec:?}: no completion id was ever minted"
+        );
+        assert_eq!(comps.outstanding(), 0, "{exec:?}");
     }
-    assert_eq!(comps.minted(), 0, "no completion id was ever minted");
-    assert_eq!(comps.outstanding(), 0);
 }
 
 /// #2495 — a completer dropped unanswered answers its call `CAP_REVOKED` (`-9`): a call its host
-/// can no longer answer never hangs. The pump surfaces the park; dropping the request lets the run
+/// can no longer answer never hangs. The run tells of the park; dropping the request lets the run
 /// end, the call having answered `-9` (`105 * 1000 - 9`).
 #[test]
 fn a_completer_dropped_unanswered_answers_cap_revoked() {
-    let m = module();
-    let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
-    let (host, h) = host_completed(&recorded);
-    let mut run = coop(&m, host, h);
-    assert!(matches!(run.run(), CoopEvent::CapPark { .. }));
-    recorded.lock().unwrap().clear();
-    match run.run() {
-        CoopEvent::Done(r) => assert_eq!(r, vec![Value::I64(105 * 1000 - 9)]),
-        _ => panic!("the revoked call answers"),
+    for exec in PUMPED {
+        let m = module();
+        let end = bounded(move || {
+            let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+            let (host, h) = host_completed(&recorded);
+            let mut run = coop(exec, &m, host, h);
+            assert!(matches!(run.run(), CoopEvent::CapPark { .. }), "{exec:?}");
+            recorded.lock().unwrap().clear();
+            run.run()
+        });
+        match end {
+            CoopEvent::Done(r) => assert_eq!(r, vec![Value::I64(105 * 1000 - 9)], "{exec:?}"),
+            _ => panic!("{exec:?}: the revoked call answers"),
+        }
     }
 }
 
@@ -392,21 +546,24 @@ fn coop_host_completed_matches_pool_completed() {
         ("thread", parse(THREADED), WANT),
         ("fiber", parse(FIBER), 10_107),
     ] {
-        for slice in [None, Some(1)] {
+        for (exec, slice) in PUMPED.into_iter().flat_map(|e| [(e, None), (e, Some(1))]) {
             let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
             let (host, h) = host_completed(&recorded);
             let comps = host.completions();
-            let mut run = coop(&m, host, h);
-            let (hosted, parks) = drive_coop(&mut run, &recorded, slice);
-            assert_eq!(hosted, vec![Value::I64(want)], "{name} {slice:?}");
+            let m = m.clone();
+            let (hosted, parks) = bounded(move || {
+                let mut run = coop(exec, &m, host, h);
+                drive_coop(&mut run, &recorded, slice)
+            });
+            assert_eq!(hosted, vec![Value::I64(want)], "{name} {exec:?} {slice:?}");
             assert_eq!(
                 parks, 1,
-                "{name} {slice:?}: exactly the host-completed call parked"
+                "{name} {exec:?} {slice:?}: exactly the host-completed call parked"
             );
-            assert_eq!(comps.outstanding(), 0, "{name} {slice:?}");
+            assert_eq!(comps.outstanding(), 0, "{name} {exec:?} {slice:?}");
         }
         let (host, h) = pool_completed();
-        let mut run = coop(&m, host, h);
+        let mut run = coop(Pumped::Pump, &m, host, h);
         let pooled = match run.run() {
             CoopEvent::Done(r) => r,
             _ => panic!("{name}: the pool posture never parks the run"),
@@ -444,6 +601,71 @@ fn the_native_coop_driver_parks_a_host_answered_call_until_its_embedder_answers(
     });
     answering.join().unwrap();
     assert_eq!(r, Ok(vec![Value::I64(WANT)]));
+}
+
+/// How many times the run below has read its clock (`counting_clock`).
+static CLOCK_READS: AtomicUsize = AtomicUsize::new(0);
+
+fn counting_clock() -> u64 {
+    CLOCK_READS.fetch_add(1, Ordering::SeqCst);
+    (ThreadPlatform::OS.now_ns)()
+}
+
+/// #2423 — on executor 2, a task waiting on a host-answered call sleeps until its answer comes:
+/// the answer rings the run's bell, and the thread that opened the run settles the run, which wakes
+/// the task. Counted through the run's clock, which a parked thread reads each time it looks:
+/// meanwhile, while the answer is 100 ms away, its thread never looks. One that looked every
+/// 50 µs read the clock thousands of times.
+#[test]
+fn a_task_waiting_on_a_host_answered_call_sleeps_until_its_answer() {
+    let m = module();
+    let reads_meanwhile = Arc::new(AtomicUsize::new(usize::MAX));
+    let meanwhile = Arc::clone(&reads_meanwhile);
+    let mut host = Host::new();
+    let h = host.grant_host_proc_offloadable(
+        Box::new(move |op, args| {
+            let a = *args.first().unwrap_or(&0);
+            if op == 0 {
+                return OffloadOutcome::Done(Ok(vec![a + 100]));
+            }
+            let meanwhile = Arc::clone(&meanwhile);
+            OffloadOutcome::Host(Box::new(move |c| {
+                std::thread::spawn(move || {
+                    let before = CLOCK_READS.load(Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    let after = CLOCK_READS.load(Ordering::SeqCst);
+                    meanwhile.store(after - before, Ordering::SeqCst);
+                    c.complete(a + 100);
+                });
+            }))
+        }),
+        None,
+        temen_interp::CapState::Stateless,
+    );
+    host.set_thread_platform(ThreadPlatform {
+        now_ns: counting_clock,
+        ..ThreadPlatform::OS
+    });
+    let r = bounded(move || {
+        let mut fuel = FUEL;
+        bytecode::compile_and_run_capture_over_parallel_with_host(
+            &m,
+            0,
+            &[Value::I32(h)],
+            &mut fuel,
+            &[],
+            None,
+            &mut host,
+        )
+        .expect("in subset")
+        .0
+    });
+    assert_eq!(r, Ok(vec![Value::I64(WANT)]));
+    let reads = reads_meanwhile.load(Ordering::SeqCst);
+    assert!(
+        reads < 50,
+        "the waiting task's thread looked at the run {reads} times while its answer was 100 ms away"
+    );
 }
 
 // --- #1954: the root program as an emitted leaf ----------------------------------------------------
@@ -899,7 +1121,7 @@ fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
 
 /// The trap each driver that parks host-answered calls ends a run of `m` with.
 fn on_each_parking_driver(m: &temen_ir::Module) -> Vec<(&'static str, Option<Trap>)> {
-    ["coop", "debug", "oracle"]
+    ["coop", "x2", "debug", "oracle"]
         .into_iter()
         .map(|driver| {
             let m = m.clone();
@@ -910,10 +1132,17 @@ fn on_each_parking_driver(m: &temen_ir::Module) -> Vec<(&'static str, Option<Tra
                     "oracle" => {
                         run_with_host(&m, 0, &[Value::I32(h)], &mut 2_000_000, &mut host).err()
                     }
-                    "coop" => match coop(&m, host, h).run() {
-                        CoopEvent::Trapped(t) => Some(t),
-                        _ => None,
-                    },
+                    "coop" | "x2" => {
+                        let exec = if driver == "x2" {
+                            Pumped::Threads
+                        } else {
+                            Pumped::Pump
+                        };
+                        match coop(exec, &m, host, h).run() {
+                            CoopEvent::Trapped(t) => Some(t),
+                            _ => None,
+                        }
+                    }
                     _ => {
                         let args = [Value::I32(h)];
                         let mut run =
