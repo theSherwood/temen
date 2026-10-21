@@ -131,20 +131,16 @@ const FIBER_STACK: usize = temen_ir::FIBER_STACK as usize;
 // register the instrumented IR reads) points at the running context's region — no shared SP word.
 /// The shadow arena — one definition of placement (see the module note above).
 pub use temen_ir::durable_abi::ShadowArena;
-/// Window byte offset of the `i64` arm countdown (from `temen_ir::durable_abi`, shared with the interpreter).
-pub use temen_ir::durable_abi::ARM_COUNTDOWN_OFF;
 /// State-word value meaning "freeze armed" — the mid-run freeze trigger (must match
-/// `temen-interp`'s `STATE_ARMED`). On an armed durable run the runtime counts down
-/// [`ARM_COUNTDOWN_OFF`] at each fiber safepoint and promotes the word to `UNWINDING` at 0.
+/// `temen-interp`'s `STATE_ARMED`). On an armed durable run the runtime counts down the arena's
+/// fiber-safepoint countdown at each fiber safepoint and promotes the freeze word to `UNWINDING` at 0.
 pub use temen_ir::durable_abi::STATE_ARMED;
 /// §12.8 concurrent-thaw stage 1: byte offset of a context's **thaw** state word (`REWINDING`/`NORMAL`)
 /// within its region — just past the 8-byte in-region shadow-SP word. The **freeze** word (`UNWINDING`)
-/// stays at the global [`STATE_OFF`] (stop-the-world); only the thaw word is per-context, so concurrent
-/// rewinds don't race. Must match `temen-interp`/`temen_durable::STATE_IN_REGION_OFF`.
+/// is the arena's one ([`ShadowArena::freeze_word`], stop-the-world); only the thaw word is
+/// per-context, so concurrent rewinds don't race. Must match
+/// `temen-interp`/`temen_durable::STATE_IN_REGION_OFF`.
 pub use temen_ir::durable_abi::STATE_IN_REGION_OFF;
-/// Window byte offset of the durable state word (`NORMAL | UNWINDING | REWINDING`); the freeze
-/// driver reads it to confirm a freeze is in progress. Must match `temen-interp`'s `STATE_OFF`.
-pub use temen_ir::durable_abi::STATE_OFF;
 /// State-word value meaning "thaw in progress" — a restored vCPU rewinds from its shadow extent
 /// then flips to `NORMAL` and runs forward (from `temen_ir::durable_abi`, shared with the interpreter).
 pub use temen_ir::durable_abi::STATE_REWINDING;
@@ -159,17 +155,21 @@ pub use temen_ir::durable_abi::STATE_UNWINDING;
 /// runtime thunks) — so an armed freeze lands at the same safepoint on each (cross-backend parity).
 ///
 /// # Safety
-/// `mem_base` is a durable run's committed window base (`[STATE_OFF, ARM_COUNTDOWN_OFF + 8)` is RW
-/// reserve). Only called on a durable run (the caller gates on `FiberRuntime::durable`).
-unsafe fn window_tick_arm(mem_base: u64) {
-    if *((mem_base + STATE_OFF) as *const i32) != STATE_ARMED {
+/// `mem_base` is a durable run's committed window base, and `arena` its module's, which the verifier
+/// bounded into the window. Only called on a durable run (the caller gates on `FiberRuntime::durable`).
+unsafe fn window_tick_arm(mem_base: u64, arena: ShadowArena) {
+    let (Some(state), Some(countdown)) = (arena.freeze_word(), arena.fiber_countdown()) else {
+        return; // no arena (#2518): nothing armed the run
+    };
+    let state = (mem_base + state) as *mut i32;
+    if *state != STATE_ARMED {
         return;
     }
-    let cd = (mem_base + ARM_COUNTDOWN_OFF) as *mut i64;
+    let cd = (mem_base + countdown) as *mut i64;
     let n = *cd - 1;
     *cd = n;
     if n <= 0 {
-        *((mem_base + STATE_OFF) as *mut i32) = STATE_UNWINDING;
+        *state = STATE_UNWINDING;
     }
 }
 
@@ -237,12 +237,16 @@ pub(crate) unsafe fn write_shadow_sp(mem_base: u64, sp_word: u64, sp: u64) {
 }
 
 /// Whether a freeze or thaw is in progress — the gate for running spawned children **inline**
-/// (single-worker, slice 3.3): the global [`STATE_OFF`] freeze word is non-`NORMAL` (a freeze), or the
-/// **active** context's per-context thaw word is non-`NORMAL` (a thaw — §12.8 concurrent-thaw stage 1).
-/// The active context is the seeded `durable.shadow_base`. `STATE_NORMAL` is 0 (matching `temen-interp`).
-/// # Safety: `mem_base` is a durable run's committed window base.
-pub(crate) unsafe fn window_is_durable_active(mem_base: u64) -> bool {
-    if *((mem_base + STATE_OFF) as *const i32) != 0 {
+/// (single-worker, slice 3.3): the arena's freeze word is non-`NORMAL` (a freeze), or the **active**
+/// context's per-context thaw word is non-`NORMAL` (a thaw — §12.8 concurrent-thaw stage 1). The
+/// active context is the seeded `durable.shadow_base`. `STATE_NORMAL` is 0 (matching `temen-interp`).
+/// Neither, for a module with no arena (#2518): nothing in it can unwind or rewind.
+/// # Safety: `mem_base` is a durable run's committed window base, `arena` its module's.
+pub(crate) unsafe fn window_is_durable_active(mem_base: u64, arena: ShadowArena) -> bool {
+    let Some(freeze) = arena.freeze_word() else {
+        return false;
+    };
+    if *((mem_base + freeze) as *const i32) != 0 {
         return true; // a freeze (global, stop-the-world)
     }
     // a thaw: the running context's own thaw word (its region base is the seeded shadow-base register).
@@ -258,10 +262,14 @@ pub(crate) unsafe fn window_set_rewinding(mem_base: u64, arena: ShadowArena, ctx
     *((mem_base + arena.thaw_state_off(ctx)) as *mut i32) = STATE_REWINDING;
 }
 
-/// Whether the durable state word is `UNWINDING` (a freeze is in progress) — the entry path's gate
-/// for running the [`freeze_drive`]. # Safety: `mem_base` is a durable run's committed window base.
-pub(crate) unsafe fn window_is_unwinding(mem_base: u64) -> bool {
-    *((mem_base + STATE_OFF) as *const i32) == STATE_UNWINDING
+/// Whether the arena's freeze word is `UNWINDING` (a freeze is in progress) — the entry path's gate
+/// for running the [`freeze_drive`]. Never, for a module with no arena (#2518): it has no freeze word,
+/// and nothing in it polls one. # Safety: `mem_base` is a durable run's committed window base,
+/// `arena` its module's.
+pub(crate) unsafe fn window_is_unwinding(mem_base: u64, arena: ShadowArena) -> bool {
+    arena
+        .freeze_word()
+        .is_some_and(|w| *((mem_base + w) as *const i32) == STATE_UNWINDING)
 }
 
 /// The generated CLIF call-trampoline: `extern "C"` on the outside (callable from Rust), it
@@ -1171,7 +1179,8 @@ pub(crate) unsafe extern "C" fn fiber_resume(
     // interpreter's per-op tick) — on an armed durable run it may promote the window to UNWINDING, so
     // the resume's trailing poll begins the freeze.
     if (*rt).durable {
-        window_tick_arm((*rt).mem_base);
+        let table = &(*rt).table;
+        window_tick_arm((*rt).mem_base, table.shadow);
     }
     // Phase 1: resolve + **claim** (D57): the slot must be this vCPU's (affinity, 3b-ii) and
     // `OWNED` — the `begin_owned` claim takes it to `RUNNING`, so a re-entrant resume (the fiber is
@@ -1207,7 +1216,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             return 0;
         }
         if rt.durable {
-            let unwinding = window_is_unwinding(rt.mem_base);
+            let unwinding = window_is_unwinding(rt.mem_base, rt.table.shadow);
             if was_runnable {
                 // A guest claim under `UNWINDING` delivers into a park the freeze unwind drops: the park
                 // counts as consumed. The freeze driver's own flattening resumes are not guest claims.
@@ -1396,9 +1405,10 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             // §12.8 4A.5: an unwound fiber spilled *past* its frame base (the SP word is the region's
             // first 8 bytes); an empty stack sits exactly at the frame base.
             let flat_sp = slot.shadow_sp.load(Ordering::Relaxed);
+            let shadow = (&*current()).table.shadow;
             let frozen = durable
-                && flat_sp > (&*current()).table.shadow.frame_base(slot_idx + 1)
-                && window_is_unwinding(mem_base);
+                && flat_sp > shadow.frame_base(slot_idx + 1)
+                && window_is_unwinding(mem_base, shadow);
             if frozen {
                 (*current()).frozen.push(crate::FrozenFiber {
                     slot: slot_idx,
@@ -1451,7 +1461,8 @@ pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, trap_out: u64) -> i64 
         return 0;
     }
     if (*rt).durable {
-        window_tick_arm((*rt).mem_base);
+        let table = &(*rt).table;
+        window_tick_arm((*rt).mem_base, table.shadow);
     }
     // #1538: a thawed fiber whose park was already consumed re-executes its `suspend` in the `Yield`
     // rewind arm — return the argument its thaw claim queued and run on (no re-park: the resumer took
@@ -1467,8 +1478,11 @@ pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, trap_out: u64) -> i64 
             return arg;
         }
         if (*rt).durable {
-            slot.consumed
-                .store(!window_is_unwinding((*rt).mem_base), Ordering::Relaxed);
+            let table = &(*rt).table;
+            slot.consumed.store(
+                !window_is_unwinding((*rt).mem_base, table.shadow),
+                Ordering::Relaxed,
+            );
         }
     }
     // pop-before-switch / push-after keeps the yielder stack consistent so a resumer reached by the

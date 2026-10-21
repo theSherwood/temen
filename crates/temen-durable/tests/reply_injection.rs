@@ -123,14 +123,14 @@ fn a_frozen_call_thaws_twice_with_two_injected_replies() {
 
     // Freeze at the site: the helper's call runs (it is not a poll), the site's poll unwinds.
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let (r, frozen) = run(&m, &win, 42);
     assert_eq!(
         r,
         Ok(vec![Value::I64(0)]),
         "the unwind returns a placeholder"
     );
-    assert_eq!(read_state(&frozen), STATE_UNWINDING);
+    assert_eq!(read_state(&frozen, TEST_ARENA), STATE_UNWINDING);
 
     // Two copies of the one frozen window, each told a different answer. The clocks are different
     // again, so a thaw that re-issued the call instead of taking the injected reply would show it.
@@ -153,7 +153,7 @@ fn a_frozen_call_thaws_twice_with_two_injected_replies() {
 fn an_uninjected_thaw_reloads_the_calls_own_result() {
     let m = fork_instrumented();
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let (_, mut frozen) = run(&m, &win, 42);
     begin_thaw(&mut frozen, TEST_ARENA, 0);
     let (r, _) = run(&m, &frozen, 9);

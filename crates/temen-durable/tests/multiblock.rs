@@ -63,10 +63,10 @@ fn assert_roundtrips(src: &str, expected: i64) {
     assert_eq!(baseline, vec![Value::I64(expected)], "uninterrupted run");
 
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let (_, snapshot, clock_after) = run(&inst, 42, &win);
     assert_eq!(
-        read_state(&snapshot),
+        read_state(&snapshot, TEST_ARENA),
         STATE_UNWINDING,
         "froze, did not complete"
     );

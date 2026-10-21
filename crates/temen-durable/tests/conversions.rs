@@ -90,10 +90,10 @@ fn a_converting_prefix_survives_freeze_and_thaw() {
     );
 
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let (frozen, snapshot) = run(&inst, 42, &win);
     assert!(frozen.is_ok(), "freeze returns a placeholder, not a trap");
-    assert_eq!(read_state(&snapshot), STATE_UNWINDING);
+    assert_eq!(read_state(&snapshot, TEST_ARENA), STATE_UNWINDING);
 
     // Thaw on a fresh host with the clock at 0: the reloaded frame carries the converted i64s, and
     // the saved clock result (42) is reloaded rather than re-read.

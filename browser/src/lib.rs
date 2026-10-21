@@ -8791,7 +8791,7 @@ pub extern "C" fn temen_durable_freeze(
     // Read the committed (grown) window image out of the backing, and check it actually unwound.
     let mut win = vec![0u8; mapped as usize];
     back.read_into(0, &mut win);
-    if temen_durable::read_state(&win) != temen_durable::STATE_UNWINDING {
+    if temen_durable::read_state(&win, arena) != temen_durable::STATE_UNWINDING {
         // Ran to completion (or otherwise didn't unwind) — nothing to persist.
         set(STATUS_BAD_RESULT);
         return STATUS_BAD_RESULT;
@@ -9196,7 +9196,7 @@ block 0 (v0: i32) {
         return -1;
     };
     let mut win = temen_durable::init_durable_window(1 << 17, arena);
-    temen_durable::write_state(&mut win, temen_durable::STATE_NORMAL);
+    temen_durable::write_state(&mut win, arena, temen_durable::STATE_NORMAL);
     match durable_run(&inst, &win, 1000) {
         (STATUS_OK, v, _, _) => v,
         _ => -1,

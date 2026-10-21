@@ -1,8 +1,8 @@
 //! #2426 — a durable module's runtime keeps words in its window that the host reads and writes
-//! outside the guest's guarded code: the control words above the NULL guard (a freeze request rings
-//! the state word) and the shadow arena the module declared (a freeze flattens each parked fiber into
-//! its region). A guest that re-protected one of their pages made the host fault: a SIGSEGV in the
-//! embedder. So every engine refuses a page op over those pages, as it refuses the NULL guard
+//! outside the guest's guarded code, all in the shadow arena the module declared (#2518): its control
+//! words (a freeze request rings the freeze word) and its regions (a freeze flattens each parked fiber
+//! into its region). A guest that re-protected one of their pages made the host fault: a SIGSEGV in
+//! the embedder. So every engine refuses a page op over those pages, as it refuses the NULL guard
 //! (`temen_ir::durable_abi::ShadowArena::fences`).
 #![cfg(any(
     all(unix, target_arch = "x86_64"),
@@ -18,7 +18,7 @@ use temen_ir::errno::EINVAL;
 use temen_jit::JitOutcome;
 
 /// The arena the guests here declare: page-aligned on every host page size, past a gap above the
-/// control words.
+/// NULL guard.
 const ARENA: ShadowArena = ShadowArena::new(1 << 17, 1 << 18);
 
 /// `memory 19` with `ARENA` declared, or none.
@@ -30,17 +30,17 @@ fn memory(arena: bool) -> String {
 }
 
 /// The page ops below, as `(op, offset, len, prot)`, on a host of `page` bytes: three over the
-/// control words' page (the NULL guard's own page, on a host whose page holds both), one between it
-/// and the arena, three over the arena (its first page, its last, and one straddling into it from
-/// below) and one just past it.
-fn ops(page: u64) -> [(u32, u64, u64, i64); 8] {
-    let control = temen_ir::durable_abi::STATE_OFF / page * page;
+/// arena's first page, which holds its control words; one over the first page above the NULL guard,
+/// where the control words sat until #2518 and which is the guest's now; two more over the arena (its
+/// last page, and one straddling into it from below); and one just past it.
+fn ops(page: u64) -> [(u32, u64, u64, i64); 7] {
+    let words = ARENA.freeze_word().expect("the arena's control words") / page * page;
+    let above_guard = temen_ir::module_null_guard().next_multiple_of(page);
     [
-        (2, control, page, 1),
-        (0, control, page, 3),
-        (1, control, page, 0),
-        (2, control + page, page, 1),
-        (2, ARENA.base, page, 1),
+        (2, words, page, 1),
+        (0, words, page, 3),
+        (1, words, page, 0),
+        (2, above_guard, page, 1),
         (2, ARENA.end - page, page, 1),
         (2, ARENA.base - page, 2 * page, 1),
         (2, ARENA.end, page, 1),
@@ -115,19 +115,13 @@ fn on_every_engine(m: &temen_ir::Module) -> [Option<i64>; 3] {
     [Some(tree_walker), Some(bytecode), jit]
 }
 
-/// A module that declares an arena has its control words' page and its arena fenced, on every
-/// engine; a page between them, or past the arena, takes page ops as before. One that declares none
-/// fences nothing past the NULL guard.
+/// A module that declares an arena has its arena fenced, the page holding its control words with
+/// the rest, on every engine; a page below it, or past it, takes page ops as before, the one above
+/// the NULL guard included (#2518). One that declares none fences nothing past the NULL guard.
 #[test]
 fn every_engine_refuses_page_ops_over_a_durable_modules_runtime_pages() {
-    let fenced = 0b0111_0111;
+    let fenced = 0b0011_0111;
     for (arena, want) in [(true, fenced), (false, 0)] {
-        // Without an arena, a host whose page holds the NULL guard refuses the control page's ops
-        // as the guard's.
-        let want = match (arena, host_page_size() > temen_ir::module_null_guard()) {
-            (false, true) => return,
-            _ => want,
-        };
         for (engine, got) in ["tree-walker", "bytecode", "jit"]
             .into_iter()
             .zip(on_every_engine(&page_ops(arena)))
@@ -225,12 +219,13 @@ fn freeze_on_the_jit(m: &temen_ir::Module) -> Option<JitOutcome> {
     }
 }
 
-/// The freeze request rings the state word: it reaches a guest that tried to make its page
+/// The freeze request rings the freeze word: it reaches a guest that tried to make its page
 /// read-only, which the guest's own run freezes under.
 #[test]
-fn a_freeze_rings_the_state_word_of_a_guest_that_tried_to_protect_it() {
-    let control = temen_ir::durable_abi::STATE_OFF / host_page_size() * host_page_size();
-    let outcome = freeze_on_the_jit(&guest(control, 1));
+fn a_freeze_rings_the_freeze_word_of_a_guest_that_tried_to_protect_it() {
+    let page = host_page_size();
+    let words = ARENA.freeze_word().expect("the arena's control words") / page * page;
+    let outcome = freeze_on_the_jit(&guest(words, 1));
     assert!(
         matches!(outcome, None | Some(JitOutcome::Returned(_))),
         "{outcome:?}"

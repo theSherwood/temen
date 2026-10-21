@@ -32,7 +32,7 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 
 fn window_with(state: i32) -> Vec<u8> {
     let mut w = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut w, state);
+    write_state(&mut w, TEST_ARENA, state);
     w
 }
 
@@ -111,7 +111,7 @@ fn check(src: &str) {
         "freeze returns a placeholder\n{src}"
     );
     assert_eq!(
-        read_state(&snap_bc),
+        read_state(&snap_bc, TEST_ARENA),
         STATE_UNWINDING,
         "bytecode leaves the artifact UNWINDING\n{src}"
     );
@@ -148,7 +148,7 @@ fn check(src: &str) {
         "bytecode thaw must reproduce the uninterrupted result\n{src}"
     );
     assert_eq!(
-        read_state(&final_win),
+        read_state(&final_win, TEST_ARENA),
         STATE_NORMAL,
         "thaw must flip the state word back to NORMAL\n{src}"
     );

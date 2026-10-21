@@ -112,10 +112,14 @@ fn a_pipe_with_bytes_in_it_rides_the_codec() {
         "same handle values as the control"
     );
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after_backedges(&mut win, 3);
+    arm_freeze_after_backedges(&mut win, TEST_ARENA, 3);
     let (res, snap) = run(&m, &mut fhost, &args, &win);
     assert!(res.is_ok(), "a freeze, not a refusal: {res:?}");
-    assert_eq!(read_state(&snap), STATE_UNWINDING, "frozen in the loop");
+    assert_eq!(
+        read_state(&snap, TEST_ARENA),
+        STATE_UNWINDING,
+        "frozen in the loop"
+    );
     let ends = fhost
         .capture_durable_handles()
         .expect("both ends are inside the cut")

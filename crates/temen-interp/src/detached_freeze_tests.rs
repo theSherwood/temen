@@ -149,13 +149,17 @@ fn a_live_detached_child_is_captured_and_its_thaw_completes_the_join() {
     // driver harvests its window and powerbox.
     let (mut fhost, fargs) = powerbox(&child);
     let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, ARENA, STATE_UNWINDING);
     let (fr, fsnap) = run(&parent, &mut fhost, &fargs, &win);
     assert!(
         fr.is_ok(),
         "the freeze returns a placeholder, not a refusal: {fr:?}"
     );
-    assert_eq!(read_state(&fsnap), STATE_UNWINDING, "the parent froze");
+    assert_eq!(
+        read_state(&fsnap, ARENA),
+        STATE_UNWINDING,
+        "the parent froze"
+    );
     assert!(
         fhost.unreached_detached().is_empty(),
         "the child reached its poll"
@@ -174,7 +178,7 @@ fn a_live_detached_child_is_captured_and_its_thaw_completes_the_join() {
         "the child's own task id in the frozen run"
     );
     assert_eq!(
-        read_state(c.window.bytes()),
+        read_state(c.window.bytes(), ARENA),
         STATE_UNWINDING,
         "the doorbell set the child's own freeze word, and it unwound"
     );
@@ -192,7 +196,7 @@ fn a_live_detached_child_is_captured_and_its_thaw_completes_the_join() {
         "the re-launched child finished its loop and the join delivered it"
     );
     assert_eq!(
-        read_state(&tsnap),
+        read_state(&tsnap, ARENA),
         STATE_NORMAL,
         "the thaw ran back to NORMAL"
     );

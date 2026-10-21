@@ -118,10 +118,14 @@ fn a_posix_guest_freezes_mid_loop_and_thaws_through_the_codec() {
     // Frozen mid-loop, with `/f` open and part-written.
     let (mut h, _posix, lh) = granted();
     let mut win = init_durable_window(WINDOW, ARENA);
-    arm_freeze_after_backedges(&mut win, 16);
+    arm_freeze_after_backedges(&mut win, ARENA, 16);
     let (r, snap) = run(&inst, &mut h, lh, &win);
     assert_eq!(r, 0, "the root unwinds for the freeze");
-    assert_eq!(read_state(&snap), STATE_UNWINDING, "the cut was taken");
+    assert_eq!(
+        read_state(&snap, ARENA),
+        STATE_UNWINDING,
+        "the cut was taken"
+    );
     let art = temen_snapshot::freeze(&inst, &snap, &h).expect("the personality rides");
 
     // Thaw into a fresh host whose registrar rebuilds the personality from the carried state.

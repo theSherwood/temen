@@ -68,10 +68,10 @@ pub enum VerifyError {
     DataWithoutMemory { seg: u32 },
     /// A `data` segment's `[offset, offset+len)` does not fit within the declared window.
     DataOutOfWindow { seg: u32 },
-    /// The declared durable shadow arena `[base, end)` is ill-formed: it must start at or above
-    /// `DURABLE_CONTROL_END` (the always-live control words), be 8-aligned, have a power-of-two
-    /// region `stride` of at least `DEFAULT_SHADOW_STRIDE`, hold at least one region and at most
-    /// [`MAX_SHADOW_CONTEXTS`], and end inside the window.
+    /// The declared durable shadow arena `[base, end)` is ill-formed: it must clear the NULL guard
+    /// of a window large enough to hold one, be 8-aligned, have a power-of-two region `stride` of at
+    /// least `DEFAULT_SHADOW_STRIDE`, hold at least one region and at most [`MAX_SHADOW_CONTEXTS`],
+    /// and end inside the window.
     ShadowArenaInvalid { base: u64, end: u64, stride: u64 },
     /// A `data` segment overlaps the declared shadow arena (R9: guest bytes must never alias it).
     DataInShadowArena { seg: u32 },
@@ -203,10 +203,13 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
         // it to the geometry every backend assumes. Context `i` owns `[base + i*stride, +stride)`,
         // so the arena must hold a whole region, and a power-of-two stride keeps every region base
         // as aligned as the arena's; the context count is capped so an allocator's occupancy mask
-        // stays one machine word.
+        // stays one machine word. It holds every word the durable runtime keeps in the window, the
+        // control words a freeze polls included (#2518), so it must not lie on a NULL guard, which a
+        // window at least the guard's size has on every host whose page divides it.
         if let Some(a) = mem.shadow {
-            use temen_ir::durable_abi::{DEFAULT_SHADOW_STRIDE, DURABLE_CONTROL_END};
-            let ok = a.base >= DURABLE_CONTROL_END
+            use temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE;
+            let guard = temen_ir::module_null_guard();
+            let ok = (mem.size() < guard || a.base >= guard)
                 && a.base % 8 == 0
                 && a.stride.is_power_of_two()
                 && a.stride >= DEFAULT_SHADOW_STRIDE
@@ -1780,8 +1783,11 @@ impl Cx<'_> {
 #[cfg(test)]
 mod shadow_arena_tests {
     use super::*;
-    use temen_ir::durable_abi::{ShadowArena, DEFAULT_SHADOW_STRIDE, DURABLE_CONTROL_END};
+    use temen_ir::durable_abi::{ShadowArena, DEFAULT_SHADOW_STRIDE};
     use temen_ir::{Data, Memory};
+
+    /// The NULL guard a window at least its size holds: an arena starts at or above it.
+    const G: u64 = temen_ir::POWERBOX_NULL_GUARD;
 
     fn module(size_log2: u8, shadow: Option<ShadowArena>, data: Vec<Data>) -> Module {
         Module {
@@ -1854,22 +1860,19 @@ mod shadow_arena_tests {
                 "[{base:#x}, {end:#x}) must be rejected"
             );
         };
-        bad(DURABLE_CONTROL_END - 8, 65536); // below the always-live control words
-        bad(DURABLE_CONTROL_END + 4, 65536); // not 8-aligned
-        bad(DURABLE_CONTROL_END, DURABLE_CONTROL_END); // zero regions
+        bad(G - 8, 65536); // on the NULL guard
+        bad(G + 4, 65536); // not 8-aligned
+        bad(G, G); // zero regions
+        bad(G, G + DEFAULT_SHADOW_STRIDE - 8); // less than one region
+        bad(G, (1 << 17) + 8); // past the window
         bad(
-            DURABLE_CONTROL_END,
-            DURABLE_CONTROL_END + DEFAULT_SHADOW_STRIDE - 8,
-        ); // less than one region
-        bad(DURABLE_CONTROL_END, (1 << 17) + 8); // past the window
-        bad(
-            DURABLE_CONTROL_END,
-            DURABLE_CONTROL_END + (MAX_SHADOW_CONTEXTS as u64 + 1) * DEFAULT_SHADOW_STRIDE,
+            G,
+            G + (MAX_SHADOW_CONTEXTS as u64 + 1) * DEFAULT_SHADOW_STRIDE,
         ); // too many contexts (in a big window below)
         let bad_stride = |stride: u64| {
             let a = ShadowArena {
                 stride,
-                ..ShadowArena::new(DURABLE_CONTROL_END, DURABLE_CONTROL_END + 4 * stride)
+                ..ShadowArena::new(G, G + 4 * stride)
             };
             assert_eq!(
                 verify_module(&module(20, Some(a), vec![])),
@@ -1886,20 +1889,14 @@ mod shadow_arena_tests {
         bad_stride(0);
         let wide = ShadowArena {
             stride: 4 * DEFAULT_SHADOW_STRIDE,
-            ..ShadowArena::new(
-                DURABLE_CONTROL_END,
-                DURABLE_CONTROL_END + 8 * DEFAULT_SHADOW_STRIDE,
-            )
+            ..ShadowArena::new(G, G + 8 * DEFAULT_SHADOW_STRIDE)
         };
         assert_eq!(verify_module(&module(20, Some(wide), vec![])), Ok(()));
     }
 
     #[test]
     fn the_context_cap_is_the_occupancy_word() {
-        let exact = ShadowArena::new(
-            DURABLE_CONTROL_END,
-            DURABLE_CONTROL_END + MAX_SHADOW_CONTEXTS as u64 * DEFAULT_SHADOW_STRIDE,
-        );
+        let exact = ShadowArena::new(G, G + MAX_SHADOW_CONTEXTS as u64 * DEFAULT_SHADOW_STRIDE);
         assert_eq!(verify_module(&module(20, Some(exact), vec![])), Ok(()));
         let over = ShadowArena {
             end: exact.end + DEFAULT_SHADOW_STRIDE,
@@ -1909,5 +1906,29 @@ mod shadow_arena_tests {
             verify_module(&module(20, Some(over), vec![])),
             Err(VerifyError::ShadowArenaInvalid { .. })
         ));
+    }
+
+    /// #2518: a window smaller than the NULL guard has none, so its arena may sit anywhere in it,
+    /// down to its first byte; a window the guard's size or larger keeps its arena off the guard.
+    #[test]
+    fn an_arena_clears_the_null_guard_of_a_window_that_has_one() {
+        for a in [ShadowArena::new(4096, 8192), ShadowArena::new(0, 4096)] {
+            assert_eq!(verify_module(&module(13, Some(a), vec![])), Ok(()), "{a:?}");
+        }
+        for (log2, a) in [
+            (14, ShadowArena::new(8192, 16384)),
+            (16, ShadowArena::new(G - DEFAULT_SHADOW_STRIDE, G)),
+            (16, ShadowArena::new(G - 8, G + DEFAULT_SHADOW_STRIDE - 8)),
+        ] {
+            assert!(
+                matches!(
+                    verify_module(&module(log2, Some(a), vec![])),
+                    Err(VerifyError::ShadowArenaInvalid { .. })
+                ),
+                "{a:?} in a 2^{log2} window"
+            );
+        }
+        let above = ShadowArena::new(G, G + DEFAULT_SHADOW_STRIDE);
+        assert_eq!(verify_module(&module(15, Some(above), vec![])), Ok(()));
     }
 }

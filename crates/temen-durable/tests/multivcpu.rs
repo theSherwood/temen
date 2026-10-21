@@ -104,7 +104,7 @@ fn two_vcpu_domain_freezes_and_thaws() {
         h.clock_ns = 42;
         let clk = h.grant_clock();
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        write_state(&mut win, STATE_UNWINDING);
+        write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
             &inst,
@@ -253,7 +253,7 @@ fn vcpu_and_fiber_coexist_through_freeze_thaw() {
         h.clock_ns = 42;
         let clk = h.grant_clock();
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        write_state(&mut win, STATE_UNWINDING);
+        write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
             &inst,
@@ -393,7 +393,7 @@ fn child_owns_fiber_through_freeze_thaw() {
         h.clock_ns = 42;
         let clk = h.grant_clock();
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        write_state(&mut win, STATE_UNWINDING);
+        write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
             &inst,
@@ -536,7 +536,7 @@ fn nested_spawn_tree_freezes_and_thaws() {
         h.clock_ns = 42;
         let clk = h.grant_clock();
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        write_state(&mut win, STATE_UNWINDING);
+        write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
             &inst,
