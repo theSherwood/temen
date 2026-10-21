@@ -1,8 +1,9 @@
 //! Regenerate the checked-in parity views: `cargo run -p temen-parity`.
 //!
-//! Two outputs, one manifest (INVARIANTS #15) — `OPS_PARITY.md` at the repo root for reading in the
-//! tree, and `browser/web/assets/ops_parity.json` for the playground's parity page (#1418). Both are
-//! pinned by `tests/golden.rs`, so neither can go stale without CI saying so.
+//! Two views of each manifest (INVARIANTS #15): markdown at the repo root for reading in the tree
+//! (`OPS_PARITY.md`, `FRONTIER.md`, `RUN_MODES.md`), and JSON under `browser/web/assets/` for the
+//! playground's parity page (#1418). All are pinned by `tests/golden.rs`, so none can go stale
+//! without CI saying so.
 
 use std::path::PathBuf;
 
@@ -40,4 +41,19 @@ fn main() {
     std::fs::write(&frontier_json, temen_parity::render_frontier_json())
         .expect("write frontier.json");
     eprintln!("wrote {}", frontier_json.display());
+
+    // The feature × run-mode matrix (#2545): which guest features and run modes combine. The
+    // markdown in the tree, and the JSON the parity page's third view loads.
+    let modes_out = root.join("RUN_MODES.md");
+    std::fs::write(&modes_out, temen_parity::render_run_modes_markdown())
+        .expect("write RUN_MODES.md");
+    eprintln!("wrote {}", modes_out.display());
+    let modes_json = root
+        .join("browser")
+        .join("web")
+        .join("assets")
+        .join("run_modes.json");
+    std::fs::write(&modes_json, temen_parity::render_run_modes_json())
+        .expect("write run_modes.json");
+    eprintln!("wrote {}", modes_json.display());
 }

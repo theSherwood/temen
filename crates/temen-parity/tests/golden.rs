@@ -50,6 +50,29 @@ fn frontier_json_is_up_to_date() {
     );
 }
 
+/// The feature × run-mode matrix (#2545), both views.
+#[test]
+fn run_modes_md_is_up_to_date() {
+    assert_fresh(
+        repo_root().join("RUN_MODES.md"),
+        temen_parity::render_run_modes_markdown(),
+        "RUN_MODES.md",
+    );
+}
+
+#[test]
+fn run_modes_json_is_up_to_date() {
+    assert_fresh(
+        repo_root()
+            .join("browser")
+            .join("web")
+            .join("assets")
+            .join("run_modes.json"),
+        temen_parity::render_run_modes_json(),
+        "browser/web/assets/run_modes.json",
+    );
+}
+
 #[test]
 fn ops_parity_md_is_up_to_date() {
     assert_fresh(
