@@ -1980,6 +1980,18 @@ there and the call declines. The completer is the one way to answer: `deliver_ca
 browser's `temen_coop_deliver_cap` and the DAP's `provideCap` answer through the request's
 completer.
 
+**An answer from inside a host procedure (#2522, 2026-10-21).** A host procedure may answer another
+call: a read that takes an event answers whoever waits on that input. The wake runs on the thread
+that answers, here under the domain's host lock. The tree-walker's wake drains its scheduler, under
+the scheduler lock, which a park holds while it takes a host of the run (`park_gate`): drained under
+the host lock, it deadlocked against a park. Its dispatch now holds the host as a `HostCall`, and a
+drain its run's wake asks for meanwhile runs once the thread holds no host of that run
+(`Scheduler::drain_when_free`). Another run's drain, a nested sub-run's, runs at once. The other
+engines' wakes take no lock that is taken before a host's (the bytecode drivers ring a bell, the JIT
+re-offers its tasks), so they run at once. An answer given inside its own call's submit hook no
+longer posts without ringing: that special case is gone. Pinned on every engine in
+`temen-run/tests/cap_park.rs`.
+
 **An idle pump lets a wait's time pass (#1979, 2026-10-15).** The cooperative pump's clock is
 logical, for determinism (#2224): it moves with the work done, one ns per op, and when nothing can
 run, to the earliest deadline. On the native `drive` that time now passes first, in real time, as
