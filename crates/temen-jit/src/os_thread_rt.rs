@@ -522,13 +522,11 @@ pub(crate) struct Domain {
     /// async freeze. `quiesce` holds the count of vCPUs still to reach a quiescent (unwound) state;
     /// the coordinator waits on `quiesce_cv` until it hits 0, then runs the existing single-worker
     /// freeze-drive. The *same* `quiesce` lock guards the active shadow-SP scratch during each worker's
-    /// unwind, so that single shared word has one owner at a time (the R10 seam). Engaged only when
-    /// `concurrent_durable` is set — by the 4A.5 concurrent multi-vCPU entry alone. On every existing
-    /// path (single-worker freeze defer, thaw, ordinary runs) the lock is never taken and the flag is
-    /// false, so behavior is byte-identical. See [`Domain::quiesce_arrive`] / [`Domain::quiesce_wait_all`].
+    /// unwind, so that single shared word has one owner at a time (the R10 seam). Not on the live path:
+    /// a loom-verified primitive only (see [`Domain::arm_quiesce`]), so the lock is never taken in a
+    /// run. See [`Domain::quiesce_arrive`] / [`Domain::quiesce_wait_all`].
     quiesce: Mutex<usize>,
     quiesce_cv: Condvar,
-    concurrent_durable: AtomicBool,
     /// §12.8 concurrent-thaw stage 3: count of vCPUs currently **blocked** (parked in `atomic.wait` or
     /// `thread.join`). A `notify`/`join`-completer must be a *live, not-parked* vCPU, so an infinite wait
     /// can never be satisfied once every live vCPU is parked (`live == parked`): `futex_wait`'s
@@ -835,7 +833,6 @@ impl Domain {
             trap_capture: Mutex::new(None),
             quiesce: Mutex::new(0),
             quiesce_cv: Condvar::new(),
-            concurrent_durable: AtomicBool::new(false),
             parked: AtomicUsize::new(0),
             killing: AtomicUsize::new(0),
             child_exec: Mutex::new(None),
@@ -1202,24 +1199,6 @@ impl Domain {
     #[cfg_attr(not(loom), allow(dead_code))]
     pub(crate) fn arm_quiesce(&self, runners: usize) {
         *lock(&self.quiesce) = runners;
-        self.concurrent_durable.store(true, Ordering::Release);
-    }
-
-    /// True on a concurrent multi-worker durable run (4A.5). `thread_spawn` reserves a per-context
-    /// shadow context for a child spawned during NORMAL (so a later freeze makes it self-unwind into its
-    /// own region); `run_child` seeds the durable shadow-base register and records freeze residue. Off
-    /// on every existing path, so they are byte-identical.
-    pub(crate) fn is_concurrent_durable(&self) -> bool {
-        self.concurrent_durable.load(Ordering::Acquire)
-    }
-
-    /// Engage the concurrent durable path (§12.8 4A.5 stage ii) for a freezable multi-vCPU run. Set once
-    /// at run setup, before any child is spawned. The coordinator joins concurrent children via the
-    /// existing `join_all` (each child's freeze-unwind into its own per-context region completes its OS
-    /// thread); no shared active-SP word and no quiesce lock — the per-context relocation (stage i)
-    /// made that serialization unnecessary.
-    pub(crate) fn engage_concurrent_durable(&self) {
-        self.concurrent_durable.store(true, Ordering::Release);
     }
 
     /// **Concurrent durable STW** (Phase-4 Slice A) — a worker reaches the quiesce barrier. §12.8 4A.5:
@@ -1556,20 +1535,19 @@ fn run_child(a: SpawnArgs) {
     // §12 seed this vCPU's per-vCPU TLS register to its dense id before any guest code runs.
     crate::vcpu_tls::seed(a.vcpu_id);
     crate::vcpu_tls::set_serve_handlers(0);
-    // Every vCPU that runs a durable domain's code addresses a region of the domain's arena through its
-    // durable shadow-base register: a concurrent child its own, any other child the root's, where its
-    // prologue reads the root's thaw word (#2518: it used to keep the register's default, a fixed offset
-    // its window need not hold). No freeze reaches such a child live: a run without a controller defers
-    // every spawn while its freeze word is set, and a controller makes the run concurrent.
+    // Every vCPU addresses a region of its domain's arena through its durable shadow-base register: a
+    // durable child its own, a child of a run that is not durable (which nothing freezes) the root's,
+    // where an instrumented prologue reads the root's thaw word (#2518: it used to keep the register's
+    // default, a fixed offset its window need not hold).
     crate::durable_shadow::seed(match &a.durable_child {
         Some(dc) => dc.shadow.region_base(dc.ctx),
         None => env.shadow.region_base(0),
     });
-    // §12.8 4A.5 stage (ii): a concurrent durable child's register points at its own region, whose
-    // shadow-SP word it initialises to the empty frame base, so if a freeze fires its instrumented code
-    // spills into *its* per-context region (concurrent with siblings, no shared word). Without the init
-    // the word would read 0 and the unwind check would trap the spill. SAFETY: durable run ⇒ the arena
-    // is committed RW.
+    // §12.8 4A.5 stage (ii): a durable child's register points at its own region, whose shadow-SP word
+    // it initialises to the empty frame base, so if a freeze fires its instrumented code spills into
+    // *its* per-context region (concurrent with siblings, no shared word). Without the init the word
+    // would read 0 and the unwind check would trap the spill. SAFETY: durable run ⇒ the arena is
+    // committed RW.
     if let Some(dc) = &a.durable_child {
         let region = dc.shadow.region_base(dc.ctx);
         match dc.thaw_extent {
@@ -1797,12 +1775,12 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     {
         return defer_spawn(dom, code, func_idx, sp, arg, vm);
     }
-    // §12.8 4A.5 stage (ii): on a freezable (interruptible) durable run, a child spawned during NORMAL
-    // runs as a real OS thread but reserves its own top-down shadow context now, so a later freeze can
-    // make it self-unwind into its own per-context SP word (concurrent, lock-free — stage i). Its global
-    // task id matches the interp/deferred path (seeded into `vcpu.tls`). `None` on every existing path,
-    // so behavior is unchanged there.
-    let mut durable_child = if env.durable && dom.is_concurrent_durable() {
+    // §12.8 4A.5 stage (ii): a durable child spawned during NORMAL runs as a real OS thread with its own
+    // top-down shadow context, so a freeze that reaches it unwinds it into its own per-context SP word
+    // (concurrent, lock-free — stage i). The oracle gives every spawned vCPU of a durable domain a
+    // context, and refuses a spawn the arena has none free for; so does every path here (#2543). Its
+    // global task id matches the interp/deferred path (seeded into `vcpu.tls`).
+    let mut durable_child = if env.durable {
         // §12.8 4A.5 follow-up B.2: a **concurrent** child that spawns a grandchild attributes the
         // grandchild's `parent_task` to itself via the per-OS-thread spawning-task source (`run_child`
         // seeded it) — not the shared `cur_task`, which the concurrent path never maintains and which

@@ -1,24 +1,20 @@
-//! Gated repro for #2537 — the Cranelift JIT miscompiles a verified module through the inline
-//! `setjmp`/`longjmp` returns-twice path.
+//! Regression for #2537 — the Cranelift JIT must not miscompile a verified module through the inline
+//! `setjmp`/`longjmp` returns-twice path. Fixed by laundering values live across a `setjmp` through a
+//! reuse-immune explicit stackslot (`launder_across_setjmp` in temen-jit).
 //!
-//! Run with `cargo test -p temen --features repro-2537 --test setjmp_repro`. It is gated behind the
-//! `repro-2537` feature (off by default) so CI stays green while the bug is open; it compiles to
-//! nothing in a normal build. The test asserts the **desired** invariant — the JIT agrees with the
-//! tree-walk oracle (INVARIANTS #9) — so it fails today (reproducing the bug) and will pass once the
-//! fix lands, at which point the gate and the `repro-2537` feature should be removed and the test
-//! kept as an ordinary regression.
-//!
-//! ## The bug
+//! ## The bug this guards against
 //!
 //! A function holds `n` values live across an inline `setjmp`. Beyond the ~5 callee-saved GPRs they
 //! spill to frame slots before the `_setjmp` call. The first-return (`longjmp`) block cannot reach
 //! the re-entry block in the explicit CFG (it ends in `longjmp` + `unreachable`), so regalloc2 treats
 //! those slots as dead there and reuses them for its own spills. `_longjmp` restores `rsp` and the
-//! callee-saved registers but not the frame's stack slots, so re-entry reloads the crossing values
-//! from slots the `longjmp` path clobbered and computes stale results. Cranelift models `_setjmp` as
-//! an ordinary call and never sees the `longjmp` -> re-entry edge.
+//! callee-saved registers but not the frame's stack slots, so re-entry would reload the crossing
+//! values from slots the `longjmp` path clobbered and compute stale results. Cranelift models
+//! `_setjmp` as an ordinary call and never sees the `longjmp` -> re-entry edge. Before the fix the JIT
+//! diverged from the tree-walk oracle (INVARIANTS #9) from n=15 up (e.g. n=15, x=7: oracle 226, JIT
+//! 299); it now agrees.
 //!
-//! Boundaries the repro has to respect (why a naive version sees nothing):
+//! Boundaries the repro respects (why a naive version sees nothing):
 //! - Cranelift's egraph re-elaborates **pure** values at their use sites, so `v0 + k`-style crossing
 //!   values are recomputed after the second return rather than carried live. The crossing values here
 //!   are therefore non-rematerializable `i64.load`s, which forces genuine cross-`_setjmp` spills.
@@ -26,7 +22,7 @@
 //!   words) faults, and the interpreter's `setjmp` writes its token into the window at `buf`. So every
 //!   offset here, `buf` included, lives in the usable high window `[40000, 65528)`.
 
-#![cfg(all(unix, feature = "repro-2537"))]
+#![cfg(unix)]
 
 use temen_interp::{run, Value};
 use temen_jit::{compile_and_run, JitOutcome};

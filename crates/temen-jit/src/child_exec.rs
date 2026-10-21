@@ -532,18 +532,16 @@ impl ChildExec {
                     durable,
                     task.rt.table().shadow,
                 );
-                // #2010 — a durable child's vCPUs each reserve a shadow context of their own, so a
-                // freeze of its window unwinds each into its own region, wherever its root is. A
-                // thaw re-spawns the ones its capture carried, rewinding, before its root runs.
-                if durable {
-                    d.engage_concurrent_durable();
-                    if !thaw.vcpus.is_empty() {
-                        // An extent-less capture is an empty root's, as for a run's root.
-                        let root_sp = thaw.root_sp.unwrap_or(d.shadow().frame_base(0));
-                        // SAFETY: the env just set is the task's: its window (seeded with its image)
-                        // and code live until the task finishes, after its vCPUs are joined.
-                        unsafe { d.thaw_reattach_and_run(&thaw.vcpus, root_sp) };
-                    }
+                // #2010 — a durable child's vCPUs each reserve a shadow context of their own (as every
+                // durable spawn does, #2543), so a freeze of its window unwinds each into its own
+                // region, wherever its root is. A thaw re-spawns the ones its capture carried,
+                // rewinding, before its root runs.
+                if durable && !thaw.vcpus.is_empty() {
+                    // An extent-less capture is an empty root's, as for a run's root.
+                    let root_sp = thaw.root_sp.unwrap_or(d.shadow().frame_base(0));
+                    // SAFETY: the env just set is the task's: its window (seeded with its image)
+                    // and code live until the task finishes, after its vCPUs are joined.
+                    unsafe { d.thaw_reattach_and_run(&thaw.vcpus, root_sp) };
                 }
                 task.dom = Some(d);
             }

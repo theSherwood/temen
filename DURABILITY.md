@@ -2632,7 +2632,9 @@ Original 4A map:
 - **Concurrent-durable entry + arming.** A new multi-vCPU+interruptible entry (combining
   `..._durable_mv` and `..._interruptible`) calls `arm_quiesce(runners)` before any worker can observe a
   freeze, engaging `is_concurrent_durable()`. Single-worker paths stay byte-identical (`quiesce == 0`,
-  lock untouched).
+  lock untouched). *(2026-10-21, #2543: that flag is gone. Every durable spawn reserves a context of its
+  own, controller or not, as the oracle does, and is refused `ThreadFault` when the arena has none
+  free.)*
 - **Concurrent children get shadow contexts + seeding.** Today `thread_spawn` only reserves a shadow
   context on the *deferred* (single-worker) path (`defer_spawn` → `reserve_vcpu_context`); the concurrent
   `run_child` path reserves none (non-durable children never freeze). For a concurrent **durable** run,

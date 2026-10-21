@@ -2056,10 +2056,9 @@ pub struct DurableRun {
     /// The thaw seed (empty on a freeze or an ordinary durable run).
     pub seed: DurableResidue,
     /// An async freeze controller (Phase-4 Slice A): a controller thread's
-    /// [`FreezeController::request_freeze`] lands mid-run. Its presence also engages the **concurrent**
-    /// durable path (§12.8 4A.5): a child spawned while `NORMAL` runs on its own OS thread with its own
-    /// reserved shadow context, so an async freeze reaches it in its own region — never the root's
-    /// (#1691: an async freeze without it unwound children into the root's region).
+    /// [`FreezeController::request_freeze`] lands mid-run. A child spawned while `NORMAL` runs on its
+    /// own OS thread with its own reserved shadow context, controller or not (#2543), so an async freeze
+    /// reaches it in its own region — never the root's (#1691).
     pub freeze: Option<Arc<FreezeController>>,
 }
 
@@ -2105,7 +2104,6 @@ pub fn compile_and_run_durable(
             tail: Vec::new(),
         });
         cm.set_durable(run.seed);
-        cm.concurrent_durable = run.freeze.is_some();
         cm.freeze_ctl = run.freeze;
         let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP))?;
         Ok((outcome, win, cm.take_durable_residue()))
@@ -2949,11 +2947,6 @@ pub struct CompiledModule {
     /// The module-declared shadow arena (INVARIANTS.md #16) — [`ShadowArena::EMPTY`] for a module
     /// that declared none, which a durable run refuses at entry rather than placing by default.
     shadow: temen_ir::durable_abi::ShadowArena,
-    /// §12.8 4A.5 stage (ii): engage the **concurrent** durable path — children spawned during NORMAL
-    /// run as real OS threads with their own reserved shadow contexts and self-unwind concurrently on a
-    /// freeze (vs. the single-worker deferred model). Set by the concurrent multi-vCPU interruptible
-    /// entry; `false` everywhere else, so those paths are byte-identical.
-    concurrent_durable: bool,
     /// Durable **thaw** seed (slice 3.3.3): frozen fibers to re-create in the table before a
     /// `REWINDING` run, so a thaw `cont.resume` re-enters them. Empty for a freeze / ordinary run.
     frozen_seed: Vec<FrozenFiber>,
@@ -4034,7 +4027,6 @@ impl CompiledModule {
             tail_out: Vec::new(),
             durable: false,
             shadow,
-            concurrent_durable: false,
             frozen_seed: Vec::new(),
             frozen_out: Vec::new(),
             frozen_vcpus_out: Vec::new(),
@@ -4342,7 +4334,6 @@ impl CompiledModule {
             tail_out: Vec::new(),
             durable: false,
             shadow: self.shadow,
-            concurrent_durable: false,
             frozen_seed: Vec::new(),
             frozen_out: Vec::new(),
             frozen_vcpus_out: Vec::new(),
@@ -4932,14 +4923,6 @@ impl CompiledModule {
         // `DURABLE_SHADOW_BASE`), so the root's instrumented code addresses its own per-context
         // shadow-SP word.
         durable_shadow::seed((*this).shadow.region_base(0));
-        // §12.8 4A.5 stage (ii): engage the concurrent durable path before the guarded call (where the
-        // root may `thread.spawn` children) so each child reserves its own shadow context.
-        #[cfg(fiber_rt)]
-        if (*this).concurrent_durable {
-            if let Some(d) = &(*this).domain {
-                d.engage_concurrent_durable();
-            }
-        }
         // Phase-4 Slice A (4A.3): publish the live window base for an async controller right before the
         // guarded call (the guest is about to block in its loop), and retire it right after — so a
         // `request_freeze` can only ever store into the window while it is mapped (freed below).
@@ -7411,7 +7394,6 @@ fn compile_child_windowed(
         restore: None,
         tail_out: Vec::new(),
         durable: false,
-        concurrent_durable: false,
         frozen_seed: Vec::new(),
         frozen_out: Vec::new(),
         frozen_vcpus_out: Vec::new(),
@@ -8441,6 +8423,68 @@ fn build_fiber_call_trampoline(module: &mut JITModule, clif: &mut Function) {
     b.finalize();
 }
 
+/// #2537 — per-value stride of the setjmp save area. 16 bytes so one slot holds any scalar *or* a
+/// `v128` (SIMD) crossing value; a scalar uses the low bytes. setjmp is rare, so the slack is free.
+const SETJMP_SAVE_STRIDE: usize = 16;
+
+/// #2537 — save the guest values **live across a `setjmp`** to a reuse-immune explicit stackslot,
+/// returning the slot and the `(value-index, type)` list to reload after the call (or `None` when
+/// nothing crosses). The caller stores before the libc `_setjmp` call and reloads after it.
+///
+/// Why this is needed. `_setjmp` lowers to an ordinary CLIF `call`, and neither Cranelift nor
+/// regalloc2 has a returns-twice concept. A value live across the call gets a spill slot; the
+/// first-return (`longjmp`) path, which the explicit CFG shows dead-ending in `_longjmp` +
+/// `unreachable`, is free to reuse that slot. But `_longjmp` re-enters the setjmp frame — a hidden
+/// edge back to just after `_setjmp` — restoring callee-saved registers and `rsp` yet **not** the
+/// frame's spill slots, so re-entry would reload data the longjmp path clobbered (#2537: a verified
+/// module miscompiled, and — via an elided bounds check over a clobbered index — an I1/I2 escape).
+/// An **explicit** stackslot is never reused by regalloc and no guest op writes it, so it holds the
+/// pre-`setjmp` value on both returns.
+///
+/// The set saved is exactly the IR values referenced at or after the `setjmp` (the rest of this
+/// block's insts and its terminator's edge args) that were defined before it. The terminator's edge
+/// args are the load-bearing case: a value forwarded to a successor block crosses the `setjmp`, and
+/// the IR still carries it as an edge arg even where the CLIF lowering drops it (#2448). `ubs` is
+/// deliberately left untouched — a laundered value keeps its IR identity and proven bound, so an
+/// elided access reads the reuse-immune copy and cannot be driven out of window by a clobbered
+/// reload.
+fn launder_across_setjmp(
+    b: &mut FunctionBuilder,
+    blk: &Block,
+    inst_idx: usize,
+    vals: &[Value],
+) -> Option<(cranelift_codegen::ir::StackSlot, Vec<(usize, Type)>)> {
+    let defined = vals.len();
+    let mut live = std::collections::BTreeSet::new();
+    let mut note = |v: &u32| {
+        let i = *v as usize;
+        if i < defined {
+            live.insert(i);
+        }
+    };
+    for inst in &blk.insts[inst_idx + 1..] {
+        inst.for_each_operand(&mut note);
+    }
+    blk.term.for_each_operand(&mut note);
+    if live.is_empty() {
+        return None;
+    }
+    let saved: Vec<(usize, Type)> = live
+        .into_iter()
+        .map(|i| (i, b.func.dfg.value_type(vals[i])))
+        .collect();
+    let save = b.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        (saved.len() * SETJMP_SAVE_STRIDE) as u32,
+        4, // align 2^4 = 16, so a v128 slot is aligned
+    ));
+    for (k, &(i, _)) in saved.iter().enumerate() {
+        b.ins()
+            .stack_store(vals[i], save, (k * SETJMP_SAVE_STRIDE) as i32);
+    }
+    Some((save, saved))
+}
+
 /// Lower one IR block's body + terminator into its CLIF block.
 fn lower_block(
     module: &mut JITModule,
@@ -8789,13 +8833,29 @@ fn lower_block(
         // trap-propagate.
         if let Inst::SetJmp { buf } = inst {
             let bufv = get(&vals, *buf)?; // i64 guest jmp_buf window address (the table key)
-                                          // slot = rt_setjmp_slot(rt_addr, buf) -> *mut jmp_buf
+                                          // #2537: save every guest value live across this setjmp to a
+                                          // reuse-immune explicit stackslot *before* the call; reloaded
+                                          // after it, so both returns (direct and via longjmp) read the
+                                          // saved copy, not a spill slot the longjmp path may clobber.
+            let laundered = launder_across_setjmp(b, blk, inst_idx, &vals);
+            // slot = rt_setjmp_slot(rt_addr, buf) -> *mut jmp_buf
             let rt_addr = vmctx_load(b, lower, vmctx::SETJMP);
             let c1 = call_host(module, b, HostFn::SetjmpSlot, &[rt_addr, bufv])?;
             let slot = b.inst_results(c1)[0];
             // r = _setjmp(slot) -> i32 — emitted inline in this JIT frame.
             let c2 = call_host(module, b, HostFn::Setjmp, &[slot])?;
-            vals.push(b.inst_results(c2)[0]);
+            let r = b.inst_results(c2)[0];
+            // #2537: reload the saved values and rewrite the value map to the reloaded copies, so every
+            // later use in this block — and every successor's forwarded use (which reads this block's
+            // final value map, #2448) — sources the value from the reuse-immune slot.
+            if let Some((save, saved)) = laundered {
+                for (k, &(i, ty)) in saved.iter().enumerate() {
+                    vals[i] = b
+                        .ins()
+                        .stack_load(ty, save, (k * SETJMP_SAVE_STRIDE) as i32);
+                }
+            }
+            vals.push(r);
             continue;
         }
         // `longjmp` (LLVM.md §"JIT `longjmp`"): look up the host `jmp_buf` slot for this `buf` (set by a
