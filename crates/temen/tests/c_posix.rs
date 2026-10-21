@@ -7174,15 +7174,28 @@ fn c_a_sigkill_terminates_a_stopped_child_and_waitpid_reports_the_signal() {
     );
 }
 
-/// #1122 route (a) — the **cooperative suspend/resume session**: with `set_suspend_on_idle` the pump
-/// hands an all-parked, externally-wakeable settle back to the embedder as `CoopEvent::Idle` — no
+/// #1122 route (a) — the **cooperative suspend/resume session**: a run its embedder pumps hands an
+/// all-parked, externally-wakeable settle back to the embedder as `CoopEvent::Idle` — no
 /// doorbell armed, no second thread, the whole scheduler state retained inside the `CoopRun` — and a
 /// terminal feed between pumps re-admits the parked reader on the next pump's settle. A canonical
 /// partial line (no newline) deposits nothing, so the run idles again; the completed line wakes the
 /// read; `^D` gives the second read its EOF and the guest finishes. The `bash -i` session shape for a
-/// host without threads or SharedArrayBuffer.
+/// host without threads or SharedArrayBuffer. #1414 5b: the same session on executor 2, whose
+/// reader waits on a thread of its own while the embedder feeds.
 #[test]
 fn c_terminal_coop_session_suspends_on_idle_and_resumes_on_feed() {
+    for parallel in [false, true] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            terminal_session(parallel);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("parallel {parallel}: the session neither idled nor ended"));
+    }
+}
+
+fn terminal_session(parallel: bool) {
     use temen_interp::bytecode::{CoopEvent, CoopRun};
     let src = format!(
         "{PIPE_SHIM}\n\
@@ -7208,40 +7221,106 @@ int main(void) {{\n\
     posix.enable_terminal(&mut ih);
     // Deliberately NO `arm_external_wake`: the session shape needs no doorbell.
     bind_shim(&raw, &mut ih, px);
-    let mut run = CoopRun::new(&raw, 0, &[], 200_000_000, ih, None)
+    let fuel = 200_000_000;
+    let run = if parallel {
+        CoopRun::new_parallel(
+            &raw,
+            0,
+            &[],
+            fuel,
+            ih,
+            &[],
+            temen_ir::default_reserved_log2(),
+        )
+    } else {
+        CoopRun::new(&raw, 0, &[], fuel, ih, None)
+    };
+    let mut run = run
         .expect("the bytecode engine compiles this module")
         .expect("the run schedules");
-    run.set_suspend_on_idle(true);
     assert!(
         matches!(run.run(), CoopEvent::Idle),
-        "the first terminal read parks and the pump yields Idle"
+        "parallel {parallel}: the first terminal read parks and the run yields Idle"
     );
     posix.feed_terminal(b"h"); // canonical mode: buffered, nothing deposited
     assert!(
         matches!(run.run(), CoopEvent::Idle),
-        "a partial line deposits nothing — the re-settle finds the reader still parked, Idle again"
+        "parallel {parallel}: a partial line deposits nothing — the re-settle finds the reader \
+         still parked, Idle again"
     );
     posix.feed_terminal(b"i\n"); // the completed line is deposited (and echoed)
     assert!(
         matches!(run.run(), CoopEvent::Idle),
-        "the line was read (3 bytes); the second read parks — Idle"
+        "parallel {parallel}: the line was read (3 bytes); the second read parks — Idle"
     );
     posix.feed_terminal(b"\x04"); // ^D on an empty line: one-shot EOF
     match run.run() {
         CoopEvent::Done(v) => assert_eq!(
             v,
             vec![Value::I32(42)],
-            "both reads completed across the suspensions"
+            "parallel {parallel}: both reads completed across the suspensions"
         ),
-        CoopEvent::Idle => panic!("still idle after ^D"),
-        CoopEvent::Trapped(t) => panic!("trapped: {t:?}"),
-        _ => panic!("unexpected tier-up/invoke event on a plain run"),
+        CoopEvent::Idle => panic!("parallel {parallel}: still idle after ^D"),
+        CoopEvent::Trapped(t) => panic!("parallel {parallel}: trapped: {t:?}"),
+        _ => panic!("parallel {parallel}: unexpected tier-up/invoke event on a plain run"),
     }
     assert_eq!(
         posix.stdout(),
         b"hi\n",
-        "the line discipline echoed the typed line into the stdout sink at feed time"
+        "parallel {parallel}: the line discipline echoed the typed line into the stdout sink at \
+         feed time"
     );
+}
+
+/// #1414 5b — a run whose only process stopped itself (`SIGSTOP`, 19) has nothing left that could
+/// continue it: no task can run, and none waits on what an embedder feeds. The pump's verdict is a
+/// deadlock (`ThreadFault`), and executor 2 now reaches the same one: its idle point counted the
+/// stopped process's runnable task as able to run, so it polled that task forever. The tree-walker
+/// still waits forever here (#2529).
+#[test]
+fn c_a_run_whose_only_process_stopped_itself_is_a_deadlock_on_both_executors() {
+    let src = "long __px_kill(int cap, long pid, long sig);\n\
+int main(void) {\n\
+  long r = __px_kill(0, 0, 19); /* raise SIGSTOP */\n\
+  return (int)(7 + r);\n\
+}\n";
+    let ir = c_to_ir(src);
+    let raw = parse_module_raw(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n{ir}"));
+    let win = 1u64
+        << raw
+            .memory
+            .expect("the frontend declares a window")
+            .size_log2;
+    verify_module(&raw).unwrap_or_else(|e| panic!("verify failed: {e:?}\n{ir}"));
+    for parallel in [false, true] {
+        let raw = raw.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut ih = Host::new();
+            let (_posix, px) = setup(&mut ih, win);
+            bind_shim(&raw, &mut ih, px);
+            let mut fuel = 200_000_000u64;
+            let r = if parallel {
+                temen_interp::bytecode::compile_and_run_capture_over_parallel_with_host(
+                    &raw,
+                    0,
+                    &[],
+                    &mut fuel,
+                    &[],
+                    None,
+                    &mut ih,
+                )
+                .map(|(r, _)| r)
+            } else {
+                temen_interp::bytecode::compile_and_run_with_host(&raw, 0, &[], &mut fuel, &mut ih)
+            };
+            let _ = tx.send(r.expect("the bytecode engine compiles this module"));
+        });
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("parallel {parallel}: the stopped run never ended"));
+        assert_eq!(r, Err(Trap::ThreadFault), "parallel {parallel}");
+    }
 }
 
 /// #1816 — a fork child whose **sibling thread traps** while its main thread is parked in

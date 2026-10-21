@@ -30,6 +30,41 @@ pub const ALL: [Driver; 4] = [
     Driver::Debug,
 ];
 
+/// The executors a run its embedder pumps ([`bytecode::CoopRun`]) runs on (#1414 5b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pumped {
+    /// The pump: every task in turn on the embedder's thread (`CoopRun::new_reserved`).
+    Pump,
+    /// Executor 2: every task on a thread of its own (`CoopRun::new_parallel`).
+    Threads,
+}
+
+pub const PUMPED: [Pumped; 2] = [Pumped::Pump, Pumped::Threads];
+
+impl Pumped {
+    /// A run of `m`'s function 0 on `args`, with `fuel` and `host`, over a reservation of
+    /// `2^reserved_log2` bytes. Panics if the executor declines `m` or its entry.
+    pub fn open(
+        self,
+        m: &Module,
+        args: &[Value],
+        fuel: u64,
+        host: Host,
+        reserved_log2: u8,
+    ) -> bytecode::CoopRun {
+        let run = match self {
+            Pumped::Pump => {
+                bytecode::CoopRun::new_reserved(m, 0, args, fuel, host, None, &[], reserved_log2)
+            }
+            Pumped::Threads => {
+                bytecode::CoopRun::new_parallel(m, 0, args, fuel, host, &[], reserved_log2)
+            }
+        };
+        run.expect("the module is in the engine's subset")
+            .expect("the run starts")
+    }
+}
+
 /// What one run produced: the entry's result and what reached the root powerbox's streams.
 #[derive(Debug, PartialEq)]
 pub struct Ran {
@@ -101,9 +136,13 @@ pub fn run_on_then<R>(
                     SchedStop::Finished(r) => break r,
                     SchedStop::Break { .. } => continue,
                     SchedStop::Declined => return None,
-                    // #2495 — a host-answered call: this harness answers none itself; a thread of
-                    // the embedder's answers it, so look again shortly.
-                    SchedStop::CapPark { .. } => std::thread::sleep(ANSWER_POLL),
+                    // #2495, #1414 D4 — a host-answered call: told as the thread makes it, and the
+                    // run idles on it once nothing else can run. This harness answers none itself;
+                    // a thread of the embedder's answers it, so look again shortly.
+                    SchedStop::CapPark { .. } => continue,
+                    SchedStop::Idle { .. } if d.cap_parked().is_some() => {
+                        std::thread::sleep(ANSWER_POLL)
+                    }
                     other => panic!("the debug scheduler stopped early: {other:?}"),
                 }
             };

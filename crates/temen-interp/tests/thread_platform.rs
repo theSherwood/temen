@@ -102,8 +102,8 @@ fn every_thread_of_a_run_starts_through_its_hosts_platform() {
     assert_eq!(run(&module(SPAWN_THREE), platform), Ok(vec![Value::I64(3)]));
     assert_eq!(
         STARTED.load(Ordering::SeqCst),
-        3,
-        "one start per spawned task"
+        4,
+        "one start per task, the root's too: the thread that opened the run watches it"
     );
     assert!(
         CLOCK_READS.load(Ordering::SeqCst) > 0,
@@ -1147,11 +1147,11 @@ fn a_detached_childs_window_is_in_the_platforms_memory() {
     };
     assert_eq!(run_detached(platform, 1 << 20, CHILD_AND_THREAD), want);
     let spawned = SPAWNED_OVER.lock().unwrap().clone();
-    let id = spawned[0].expect("the child's task runs over its memory");
+    let id = spawned[1].expect("the child's task runs over its memory");
     assert_eq!(
         spawned,
-        [Some(id), Some(id)],
-        "the child's task and its thread were each spawned over its memory"
+        [None, Some(id), Some(id)],
+        "the root was spawned over the engine's window, the child's task and its thread over its memory"
     );
     let word = |at: usize| fake_word(id, at);
     assert_eq!(
