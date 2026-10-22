@@ -722,11 +722,18 @@ in session discussion; collected here so the next slice has a home to be picked 
   granting `Stream(Out)` + `Jit` + `Instantiator`, seeded by entry arity like `powerbox_exec`) would
   make the playground's modes composable instead of either/or.
 - [x] **Graceful stop / cooperative cancellation** (#1414 S5a). `temen_x2_stop` asks the run to end
-  without waiting for it, as the page's main thread cannot block (`bytecode::RunStop`). The run ends as
-  one whose fuel ran out: a parked thread is woken for it, a running one leaves at its next look, and
-  emitted code at its next fuel check. The Workers then close as after any run, and the instance stays
-  reusable (`browser-x2-parity-test.mjs`). Only a run that outlasts the stop by `STOP_GRACE_MS` has its
-  Workers terminated, the old way.
+  without waiting for it, as the page's main thread cannot block (`bytecode::RunDoor::stop`). The run
+  ends as one whose fuel ran out: a parked thread is woken for it, a running one leaves at its next
+  look, and emitted code at its next fuel check. The Workers then close as after any run, and the
+  instance stays reusable (`browser-x2-parity-test.mjs`). Only a run that outlasts the stop by
+  `STOP_GRACE_MS` has its Workers terminated, the old way.
+- [x] **The page answers calls and feeds stdin on executor 2** (#1414 5b-2). With `onramp`, a
+  parallel run declares host-answered `caps`, which come to `onCapPark` as on the pump's driver, and
+  can take stdin later (`stdinLater`), through `feed(bytes)` and `end()` on the run `makeRunner`
+  returns. The root's Worker pumps the run and tells the page of each call and idle. The page leaves
+  its answers and input in a ring in the engine's memory with atomics alone, and wakes the Worker
+  through the run's door, so a call is answered while the run's other tasks go on. The embedder cases
+  get an x2 row in Chromium (`browser-coop-embedder-test.mjs`).
 - [ ] **Run-wide fuel budget across Workers.** Fuel is per-vCPU today (a §14 spawn cuts the child's
   fuel from its parent's, up to a quota), but a run has no *aggregate* bound — 8 workers ×
   per-vCPU fuel is 8× the intended ceiling. A shared fuel pool (an atomic in shared linear memory,

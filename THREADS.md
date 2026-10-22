@@ -158,6 +158,12 @@ property, so in practice:
   executor 2's fire on their own. Both executors reach their idle verdict through one function (`stalled`), and both
   count a runnable task of a stopped process as waiting, as the pump's pick skips it (#2529 tracks
   the tree-walker, which waits forever there).
+  *Since #1414 5b-2:* the one-shot run is that handle with no embedder to tell, run to its end
+  (`drive_threads`). Another of the embedder's threads can wake the pumping thread through the run's
+  door (`RunDoor::wake`, beside its `stop`): `run` returns `Paused` while the run goes on. After
+  `Idle`, the pumping thread can wait for the run to change (`CoopRun::wait`): an answer, an input or
+  a wake reaching it, a call it files, or its end. A browser's page needs both, as its main thread
+  cannot wait on a lock (below).
 - [x] **Step 4c-futex — the cross-thread `memory.wait`/`notify`.** The parallel driver now services the
   **full threads model**, not just spawn/join: a native `Futex` (a per-address parked-token queue under
   one bucket lock — the std-sync analogue of a kernel futex bucket, with the compare-and-park done under
@@ -420,8 +426,8 @@ property, so in practice:
   it is the browser's only parallel driver. The page hands
   it a thread platform (`Host::set_thread_platform`): each thread of a run is a Worker the page
   starts, running a boxed closure out of the one shared memory (`temen_x2_thread`), and the clock is
-  `performance.timeOrigin + performance.now()`. The whole run is one in-Rust call on the root's Worker
-  (`temen_x2_start`) under the same recipes; `par.js` runs every guest this way. With `tierup`, a
+  `performance.timeOrigin + performance.now()`. The root's Worker opens the run under the same
+  recipes and pumps it (`temen_x2_open`, `temen_x2_run`); `par.js` runs every guest this way. With `tierup`, a
   thread runs its own task's tier-ups on its Worker's instance of the run's tier-up module
   (`ThreadTier`), over a flat window, without the lock. Emitted code runs on slices of fuel, and at
   the end of each it looks at the run's `over` flag, so the run's end stops emitted code still
@@ -443,6 +449,16 @@ property, so in practice:
   header; the header holds one, so the child's threads interpret (#1414 ED-2). Then it replaced the
   per-Worker `Vcpu` driver (B6-4a). A child entry that spawns or joins interprets on executor 2, since
   a region tier-up cannot serve a spawn; #2443 runs such entries emitted.
+
+  *Since #1414 5b-2:* the page can have a part in a run: answering a host-answered cap the on-ramp
+  recipe declares, or feeding stdin as the run goes (`temen_par_powerbox_onramp`'s `caps` and
+  `fed_later`). The root's Worker then pumps the run as an embedder does, and tells the page of each
+  call and each idle. The page's main thread cannot wait on a lock, so it leaves its answers and input
+  in a ring in the engine's memory, with atomics alone (`temen_x2_answer`, `temen_x2_feed`), and wakes
+  the Worker to take them (`temen_x2_wake`, the door's wake). The Worker delivers each answer through
+  its call's completer, as a native embedder does. The root of such a run starts on a Worker of its
+  own, since the root's Worker watches the run; a run the page has no part in still runs its root on
+  that Worker, to its end.
 
 ### Known wrinkles — all resolved in `4c-wasm`
 

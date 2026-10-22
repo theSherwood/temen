@@ -396,6 +396,51 @@ fn a_call_is_told_while_another_task_keeps_running() {
     }
 }
 
+/// #1414 5b-2 — an embedder whose answers come from another of its threads waits out an idle
+/// ([`bytecode::CoopRun::wait`]) rather than pump on at once: the answer's ring ends the wait, and
+/// the next pump resumes the call. A browser's Worker pumps a run this way while its page answers.
+#[test]
+fn after_an_idle_the_embedder_waits_for_an_answer_from_another_thread() {
+    let m = module();
+    let (end, waits) = bounded(move || {
+        let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let (host, h) = host_completed(&recorded);
+        let mut run = coop(Pumped::Threads, &m, host, h);
+        let id = match run.run() {
+            CoopEvent::CapPark { id } => id,
+            _ => panic!("the host-answered call is told"),
+        };
+        assert!(
+            matches!(run.run(), CoopEvent::Idle { .. }),
+            "with the answer owed, the run is idle"
+        );
+        let answerer = {
+            let recorded = Arc::clone(&recorded);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                answer(&recorded, id).expect("the call was filed");
+            })
+        };
+        let mut waits = 0;
+        let end = loop {
+            run.wait();
+            waits += 1;
+            match run.run() {
+                CoopEvent::Idle { .. } => {}
+                ev => break ev,
+            }
+        };
+        answerer.join().unwrap();
+        (end, waits)
+    });
+    assert!(matches!(end, CoopEvent::Done(ref v) if *v == vec![Value::I64(WANT)]));
+    // A wait that returned at once would have pumped thousands of times while the answer was due.
+    assert!(
+        waits <= 3,
+        "the embedder waited for the answer: {waits} waits"
+    );
+}
+
 /// The root and a thread it spawned each make a host-answered call (op 1, args 5 and 7), then the
 /// root joins the thread: `105 * 1000 + 107`.
 const TWO_PARKS: &str = r#"memory 16
