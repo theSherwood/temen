@@ -2560,6 +2560,8 @@ struct ThawResidue {
     live_detached: Vec<ThawedDetached>,
     /// #1688 — the live twins this domain forked, each a domain of its own.
     twins: Vec<ThawedTwin>,
+    /// #2571 — its servicer twins that exited unreaped.
+    exited_twins: Vec<FrozenTwin>,
 }
 
 impl ThawResidue {
@@ -2574,24 +2576,68 @@ impl ThawResidue {
             detached: std::mem::take(&mut host.frozen_detached),
             live_detached: std::mem::take(&mut host.thawed_detached),
             twins: std::mem::take(&mut host.thawed_twins),
+            exited_twins: std::mem::take(&mut host.frozen_twins),
         }
     }
 
-    /// #1688 — every pid this residue's twins take back, at any depth: its own twins', and those of
-    /// its twins and detached children, whose residue is still on their restored powerboxes.
+    /// #1688 — every pid this residue's twins take back, at any depth: its own twins', live or
+    /// exited, and those of its twins and detached children, whose residue is still on their
+    /// restored powerboxes.
     fn twin_pids(&self) -> BTreeSet<TaskId> {
-        fn of(twins: &[ThawedTwin], live: &[ThawedDetached], out: &mut BTreeSet<TaskId>) {
-            for t in twins {
+        fn of(host: &Host, out: &mut BTreeSet<TaskId>) {
+            out.extend(host.frozen_twins.iter().map(|t| t.pid as TaskId));
+            for t in &host.thawed_twins {
                 out.insert(t.pid as TaskId);
-                of(&t.host.thawed_twins, &t.host.thawed_detached, out);
+                of(&t.host, out);
             }
-            for d in live {
-                of(&d.host.thawed_twins, &d.host.thawed_detached, out);
+            for d in &host.thawed_detached {
+                of(&d.host, out);
             }
         }
-        let mut out = BTreeSet::new();
-        of(&self.twins, &self.live_detached, &mut out);
+        let mut out: BTreeSet<TaskId> = self.exited_twins.iter().map(|t| t.pid as TaskId).collect();
+        for t in &self.twins {
+            out.insert(t.pid as TaskId);
+            of(&t.host, &mut out);
+        }
+        for d in &self.live_detached {
+            of(&d.host, &mut out);
+        }
         out
+    }
+}
+
+/// §13.4 slice 4d — a restored live impl awaiting its callee: its `live_impls` index, the callee's
+/// task id in the frozen run, and the offer export.
+type PendingLiveImpl = (u32, TaskId, u32);
+
+/// #1681 — what a thaw re-links its restored live impls with once it has seeded the whole tree: the
+/// detached children it re-launched, by the task id each had in the frozen run, and each domain's
+/// unlinked live impls. A live impl names its callee by task id, and a re-grant or a fork copies it
+/// into domains a long way from the callee's spawner, so no one domain's seeding can resolve its own.
+#[derive(Default)]
+struct ThawLinks {
+    /// A re-launched child's task id in the frozen run → its task id now, and its powerbox.
+    callees: BTreeMap<TaskId, (TaskId, Arc<Mutex<Host>>)>,
+    /// Each seeded domain's powerbox, with the live impls it restored unlinked.
+    holders: Vec<(Arc<Mutex<Host>>, Vec<PendingLiveImpl>)>,
+}
+
+impl ThawLinks {
+    /// Re-link each holder's live impls to the children they name, re-stamped with the children's
+    /// task ids now. One whose callee was not re-launched stays unlinked.
+    fn relink(self) {
+        let ThawLinks { callees, holders } = self;
+        for (holder, pending) in holders {
+            for (idx, task, export) in pending {
+                if let Some((now, callee)) = callees.get(&task) {
+                    // The shape first: the two powerbox locks are never held together.
+                    let shape = callee.lock_unpoisoned().offer_shape(export);
+                    holder
+                        .lock_unpoisoned()
+                        .relink_live_impl(idx, Arc::clone(callee), *now, shape);
+                }
+            }
+        }
     }
 }
 
@@ -2629,6 +2675,7 @@ fn seed_domain(
         detached: thaw_detached,
         live_detached: thaw_live_detached,
         twins: thaw_twins,
+        exited_twins: thaw_exited_twins,
     } = residue;
     // Only a durable window has control words at the guard base; any other run keeps its own data
     // there, and starts in no freeze phase whatever it holds (#2101).
@@ -2685,9 +2732,6 @@ fn seed_domain(
     let mut vseed: Vec<FrozenVCpu> = thaw_vcpus;
     vseed.sort_by_key(|f| f.task);
     {
-        // The re-launched detached children's host Arcs by their `(spawner task, join slot)` edge,
-        // so the root's restored `LiveImpl` handles re-link to their callees (§13.4 slice 4d).
-        let mut child_hosts_by_edge: BTreeMap<(TaskId, usize), Arc<Mutex<Host>>> = BTreeMap::new();
         for ff in vseed {
             seed_thread(
                 s,
@@ -2744,10 +2788,11 @@ fn seed_domain(
                 },
                 None => continue, // not re-created ⇒ its own rewound join already fails closed
             };
-            let edge = (spawner.id, td.slot);
+            let task = td.launch.task as TaskId;
             if let Some(child) = relaunch_detached(s, sched, spawner, host_shared, td) {
-                // A detached child is a callee (#1901).
-                child_hosts_by_edge.insert(edge, Arc::clone(&child.host));
+                // A detached child is a callee (#1901), named by the task it was (#1681).
+                let callee = (child.id, Arc::clone(&child.host));
+                s.thaw_links.callees.insert(task, callee);
                 s.runnable.push_back(child);
             }
         }
@@ -2760,23 +2805,40 @@ fn seed_domain(
                 s.runnable.push_back(twin);
             }
         }
-        // §13.4 slice 4d: re-link the root's restored `LiveImpl` handles to their re-launched
-        // callees now that they exist — the root's rewound call then dispatches to the live callee
-        // exactly as before the freeze. A re-launched child re-links its own as the root of its
-        // window ([`relaunch_detached`] seeds it through this function).
+        // #2571 — and the servicer twins it forked that exited unreaped, filed again under their
+        // pids for its `wait` to reap.
+        for ft in thaw_exited_twins {
+            let result = ft.outcome.map(|x| vec![Value::I64(x)]);
+            file_exited_twin(s, ft.pid as TaskId, domain_key_of(root), result);
+        }
+        // §13.4 slice 4d, #1681: this domain's restored `LiveImpl` handles wait for the whole tree,
+        // since one may name a child that any domain re-launches ([`ThawLinks`]).
         let pending = host_shared.lock_unpoisoned().take_pending_live_impls();
-        for (idx, cslot, export) in pending {
-            if let Some(chost) = child_hosts_by_edge.get(&(id, cslot)) {
-                host_shared
-                    .lock_unpoisoned()
-                    .relink_live_impl(idx, Arc::clone(chost), export);
-            }
+        if !pending.is_empty() {
+            s.thaw_links
+                .holders
+                .push((Arc::clone(host_shared), pending));
         }
         // Enqueue every re-created child, parents first (ascending cid).
         for (_, child) in children {
             s.runnable.push_back(child);
         }
     }
+}
+
+/// #2571 — file the servicer twin `pid` of the domain `parent`, ended with `result`, for its parent's
+/// `wait` to reap: one that exited unreaped before the freeze, or one the thaw cannot relaunch.
+fn file_exited_twin(s: &mut Sched, pid: TaskId, parent: usize, result: Result<Vec<Value>, Trap>) {
+    s.results.insert(pid, Outcome::ended(result));
+    let twin = Twin {
+        parent,
+        reaper: TwinReaper::Servicer,
+        bell: None,
+        entry: 0,
+        ctx: 0,
+        host: None,
+    };
+    s.forked_twins.insert(pid, twin);
 }
 
 /// A detached child of `spawner`'s, at its join `slot`, that the thaw delivers ended with `result`
@@ -2927,9 +2989,13 @@ fn relaunch_twin(
         launch,
     } = tt;
     let pid = pid as TaskId;
-    s.reserved_pids.remove(&pid);
     let residue = ThawResidue::take(&mut host, pid);
     let (entry, ctx) = (launch.entry as FuncIdx, launch.ctx as usize);
+    let reaper = if launch.servicer {
+        TwinReaper::Servicer
+    } else {
+        TwinReaper::Personality
+    };
     let parent_key = domain_key_of(parent);
     let built = parent.mem.as_ref().and_then(|pm| {
         let declared = pm.window.mapped();
@@ -2963,9 +3029,13 @@ fn relaunch_twin(
         }
     });
     let Some((mem, live)) = built else {
-        // It ends as it is born: its exit hooks make its process the personality's zombie.
+        // It ends as it is born: a personality's exit hooks make its process the personality's
+        // zombie, and a servicer's twin waits in the core for its parent's `wait`.
         for h in &host.exit_hooks {
             h(reap_status(&Err(Trap::ThreadFault)));
+        }
+        if reaper == TwinReaper::Servicer {
+            file_exited_twin(s, pid, parent_key, Err(Trap::ThreadFault));
         }
         return None;
     };
@@ -3007,11 +3077,11 @@ fn relaunch_twin(
         pid,
         Twin {
             parent: parent_key,
-            reaper: TwinReaper::Personality,
+            reaper,
             bell: Some(bell),
             entry,
             ctx,
-            host: twin_host,
+            host: Some(twin_host),
         },
     );
     Some(twin)
@@ -3398,6 +3468,7 @@ fn drive_over_cell(
             s.next_task = s.next_task.max(last + 1);
         }
         s.reserved_pids.clear();
+        std::mem::take(&mut s.thaw_links).relink();
         let (registry, arena) = (Arc::clone(&root.registry), root.arena());
         s.runnable.push_back(root);
         (id, registry, arena)
@@ -3509,25 +3580,36 @@ fn drive_over_cell(
                 .filter(|(_, t)| t.parent == domain)
                 .map(|(&pid, _)| pid)
                 .collect();
-            let mut captured_twins = Vec::new();
+            let (mut captured_twins, mut exited_twins) = (Vec::new(), Vec::new());
             for pid in mine {
                 let t = twins.remove(&pid).expect("listed just above");
-                // A personality's twin that exited retired then ([`retire_personality_twin`]), so
-                // one still here was alive at the cut: it unwound, or it is unreached. So is a
-                // servicer's, whose reap the artifact does not carry (#2571).
-                let out = {
+                let servicer = t.reaper == TwinReaper::Servicer;
+                let (unwound, out) = {
                     let mut s = sched.lock();
-                    let unwound = s.unwound.contains(&pid);
-                    s.results.remove(&pid).filter(|_| unwound)
+                    (s.unwound.contains(&pid), s.results.remove(&pid))
                 };
+                // A personality's twin that exited retired then ([`retire_personality_twin`]), so
+                // one still here was alive at the cut. A servicer's that exited waits for its reap,
+                // so its outcome rides (#2571), unless it ended after the freeze rang it otherwise
+                // than by returning: that end may be the run's own teardown reaping it where it
+                // parked.
+                let out = match out {
+                    Some(o) if servicer && !unwound && (o.result.is_ok() || !t.rung()) => {
+                        let outcome = join_outcome(o.result);
+                        exited_twins.push(FrozenTwin { pid, outcome });
+                        continue;
+                    }
+                    out => out,
+                };
+                // A live one unwound, or it is unreached.
                 let carried = out
-                    .filter(|o| o.result.is_ok() && t.reaper == TwinReaper::Personality)
-                    .and_then(|o| o.mem);
-                let Some(m) = carried else {
+                    .filter(|o| unwound && o.result.is_ok())
+                    .and_then(|o| o.mem)
+                    .zip(t.host);
+                let Some((m, host)) = carried else {
                     unreached_twins.push(pid);
                     continue;
                 };
-                let host = t.host;
                 let names = host.lock_unpoisoned().cap_names.clone();
                 owners.push(Arc::clone(&host));
                 captured_twins.push(CapturedTwin {
@@ -3538,6 +3620,7 @@ fn drive_over_cell(
                     launch: TwinLaunch {
                         entry: t.entry as u32,
                         ctx: t.ctx as u32,
+                        servicer,
                         names,
                     },
                 });
@@ -3545,6 +3628,7 @@ fn drive_over_cell(
             let mut h = owner.lock_unpoisoned();
             h.set_captured_detached(captured);
             h.captured_twins = captured_twins;
+            h.frozen_twins = exited_twins;
         }
         // A twin whose parent did not ride is lost with it.
         unreached_twins.extend(twins.into_keys());
@@ -6223,11 +6307,14 @@ impl ParkSite {
             | ParkSite::Reply => FreezeRule::Reissue,
             // A faulting access is no call to re-issue, and cannot unwind until its page arrives
             // (#1940); a freeze holds its pager to serve it (#2455), so it waits, then unwinds.
-            ParkSite::Join | ParkSite::Lane | ParkSite::PageFault => FreezeRule::Phase,
-            // A `wait(-1)` waits on a servicer's twin, which the census declines for anyway: its
-            // reap does not ride (#2571). A completion is a host operation outside the cut (#1902).
-            // A durable caller never animates an offer, so never waits to enter one (#1681).
-            ParkSite::ReapAny | ParkSite::Completion | ParkSite::Admit => FreezeRule::Decline,
+            // A `wait(pid)` or `wait(-1)` waits on a servicer's twin, which the freeze rings: its
+            // unwind wakes the waiter, which abandons the wait for the thaw to re-issue (#2571).
+            ParkSite::Join | ParkSite::Lane | ParkSite::PageFault | ParkSite::ReapAny => {
+                FreezeRule::Phase
+            }
+            // A completion is a host operation outside the cut (#1902). A durable caller never
+            // animates an offer, so never waits to enter one (#1681).
+            ParkSite::Completion | ParkSite::Admit => FreezeRule::Decline,
         }
     }
 }
@@ -6523,22 +6610,25 @@ struct Twin {
     parent: usize,
     reaper: TwinReaper,
     /// #1688 — the twin's freeze doorbell ([`VCpu::freeze_bell`]), on a twin a freeze can carry: a
-    /// personality's durable fork. A `posix_spawn` child runs an uninstrumented command image that
-    /// nothing can unwind, and a servicer's twin waits on a reap the artifact does not carry (#2571),
-    /// so neither has one, and a freeze declines while one lives ([`DeclineCause::ForkTwin`]).
+    /// durable fork, a personality's or a servicer's (#2571). A `posix_spawn` child runs an
+    /// uninstrumented command image that nothing can unwind, so it has none, and a freeze declines
+    /// while it lives ([`DeclineCause::ForkTwin`]). Nor has a servicer's twin a thaw re-files as
+    /// exited, which never runs again.
     bell: Option<Arc<AtomicBool>>,
     /// Where a thaw re-enters the twin: the forking vCPU's entry function and shadow context, which
     /// the twin's copied continuation and window share.
     entry: FuncIdx,
     ctx: usize,
     /// Its powerbox, which a freeze's harvest carries beside its window: the linkage that outlives
-    /// its vCPU, as a detached child's does ([`PendingDetached::host`]).
-    host: Arc<Mutex<Host>>,
+    /// its vCPU, as a detached child's does ([`PendingDetached::host`]). `None` for a servicer's
+    /// twin a thaw re-files as exited ([`FrozenTwin`]).
+    host: Option<Arc<Mutex<Host>>>,
 }
 
 impl Twin {
     /// Whether a freeze rang it while it lived ([`ring_twins`]), or forked it rung. Its end after that
-    /// may be the freeze's own: the run ends with every vCPU still parked reaped where it waits.
+    /// may be the freeze's own: the run ends with every vCPU still parked reaped where it waits. A
+    /// twin that ended before the ring was never rung.
     fn rung(&self) -> bool {
         self.bell
             .as_ref()
@@ -6601,6 +6691,9 @@ struct Sched {
     /// #1688 — while a thaw seeds the run, the pids its twins take back: no other task it re-creates
     /// may take one ([`mint_task`], [`claim_task`]).
     reserved_pids: BTreeSet<TaskId>,
+    /// #1681 — while a thaw seeds the run, what it re-links the restored live impls with once the
+    /// whole tree exists.
+    thaw_links: ThawLinks,
     /// FORK.md §8.6 — callers parked on a servicer-side `wait(-1)` / `waitpid(-pgid)` (reap **any**
     /// matching child), each tagged with its target: `None` = any of the caller's children,
     /// `Some(pgid)` = any child in that process group. Unlike `join_waiters` these are not keyed by a
@@ -7631,16 +7724,16 @@ impl Scheduler {
                 m.durable_set_state(STATE_NORMAL);
             }
         }
-        // #1688 — a personality's durable twin gets a freeze doorbell, as a detached child does, rung
-        // at birth when the run's freeze has already rung the others. A thaw re-enters it at its
-        // bottom frame, which must be its program's (an `Jit.invoke` unit's frame has no thaw entry).
+        // #1688, #2571 — a durable twin gets a freeze doorbell, as a detached child does, rung at
+        // birth when the run's freeze has already rung the others. A thaw re-enters it at its bottom
+        // frame, which must be its program's (an `Jit.invoke` unit's frame has no thaw entry).
         let entry = twin
             .frames
             .first()
             .filter(|f| f.module == 0)
             .map(|f| f.func);
         let bell = entry
-            .filter(|_| twin.durable && reaper == TwinReaper::Personality)
+            .filter(|_| twin.durable)
             .map(|_| Arc::new(AtomicBool::new(s.twins_rung)));
         twin.freeze_bell = bell.clone();
         // FORK.md §8.6: mark the twin reapable so a later `wait()` can deliver its exit status to
@@ -7654,7 +7747,7 @@ impl Scheduler {
                 bell,
                 entry: entry.unwrap_or(0),
                 ctx: twin.vcpu_ctx,
-                host: Arc::clone(&twin.host),
+                host: Some(Arc::clone(&twin.host)),
             },
         );
         s.runnable.push_back(twin);
@@ -7720,7 +7813,7 @@ impl Scheduler {
                                     bell: None,
                                     entry: 0,
                                     ctx: 0,
-                                    host: Arc::clone(&child.host),
+                                    host: Some(Arc::clone(&child.host)),
                                 },
                             );
                             s.runnable.push_back(Box::new(child));
@@ -8028,7 +8121,7 @@ mod reap_bench_tests {
                 bell: None,
                 entry: 0,
                 ctx: 0,
-                host: Arc::new(Mutex::new(Host::new())),
+                host: None,
             };
             s.forked_twins.insert(id, twin);
         }
@@ -8736,7 +8829,13 @@ fn reach(s: &mut Sched, domain: usize) {
 /// parent is in it too; the harvest files each twin under its parent.
 fn ring_twins(s: &mut Sched) {
     s.twins_rung = true;
-    for bell in s.forked_twins.values().filter_map(|t| t.bell.as_ref()) {
+    // #2571 — a servicer's twin that exited waits in `results` for its reap: not rung, so the
+    // harvest knows its outcome is its own and not the freeze's.
+    let live = s
+        .forked_twins
+        .iter()
+        .filter(|(id, _)| !s.results.contains_key(id));
+    for bell in live.filter_map(|(_, t)| t.bell.as_ref()) {
         bell.store(true, Ordering::Relaxed);
     }
 }
@@ -8978,10 +9077,11 @@ fn freeze_census(
     let mut registries: Vec<(TaskId, Arc<FiberRegistry>)> = Vec::new();
     {
         let s = rs.lock();
-        // #1688 — a twin rides when its doorbell can reach it, and one that cannot ride has none
-        // ([`Twin::bell`]): a `posix_spawn`'s command image, or a servicer's twin, live or exited.
-        // A personality's twin that ended is gone from here ([`retire_personality_twin`]).
-        if let Some((&twin, _)) = s.forked_twins.iter().find(|(_, t)| t.bell.is_none()) {
+        // #1688 — a live twin rides when its doorbell can reach it, and one that cannot ride has none
+        // ([`Twin::bell`]): a `posix_spawn`'s command image. A personality's twin that ended is gone
+        // from here ([`retire_personality_twin`]); a servicer's rides as its outcome (#2571).
+        let unbelled = |(id, t): &(&TaskId, &Twin)| t.bell.is_none() && !s.results.contains_key(id);
+        if let Some((&twin, _)) = s.forked_twins.iter().find(unbelled) {
             return declined(DeclineCause::ForkTwin, twin, None);
         }
         // #1898 — a vCPU parked where a freeze has no rule would hold it until its event came.
@@ -11610,8 +11710,25 @@ pub struct TwinLaunch {
     pub entry: u32,
     /// The shadow context it runs in: the forking vCPU's, which its copied window shares.
     pub ctx: u32,
+    /// #2571 — a servicer's `clone_caller` forked it, so the servicer's `wait` reaps it, from the
+    /// core's records. Otherwise a personality forked it and reaps it from its own table.
+    pub servicer: bool,
     /// The names its caps were registered under, `(name, handle)`.
     pub names: Vec<(String, i32)>,
+}
+
+/// #2571 — a servicer's **fork twin that exited** before a freeze, its outcome waiting for its
+/// parent's `wait`. A personality's twin that exits is the personality's zombie, which its own state
+/// carries; a servicer's waits in the core, so its outcome rides its parent's artifact, and the thaw
+/// files it again for the servicer's `wait` to reap. The exited half of [`CapturedTwin`], as
+/// [`FrozenDetached`] is of [`CapturedDetached`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrozenTwin {
+    /// Its pid, which the parent's `wait` names.
+    pub pid: u64,
+    /// How it ended: its first result as an `i64` (an `i32` sign-extended), or its trap. Its
+    /// `wait` status follows from it ([`reap_status`]).
+    pub outcome: Result<i64, Trap>,
 }
 
 /// #1688 — a carried twin as a thaw receives it: its restored window and powerbox (its own residue
@@ -13592,10 +13709,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // The twin `pid` finished and the generic join-wake re-admitted us. Take its outcome
             // and push its **exit status** — a trapped twin becomes a crash status, never a
             // propagated trap (unlike `Join`), so a crashing command cannot crash the shell.
-            let out = v.sched.reap_twin(pid).ok_or(Trap::Malformed)?;
-            let status = reap_status(&out.result);
+            // #2571 — a twin the freeze unwound has not exited: it is not reaped, its window is left
+            // for the harvest, and the thaw re-issues the wait against the re-created twin.
             let top = v.frames.len() - 1;
-            v.frames[top].vals.push(Reg::from_i64(status));
+            if v.durable && v.sched.unwound(pid) {
+                abandon_for_freeze(&mut v.mem, v.durable_sp_ctx);
+                v.frames[top].vals.push(Reg::from_i64(0));
+            } else {
+                let out = v.sched.reap_twin(pid).ok_or(Trap::Malformed)?;
+                let status = reap_status(&out.result);
+                v.frames[top].vals.push(Reg::from_i64(status));
+            }
         }
         Some(Pending::Wait(status)) => {
             let top = v.frames.len() - 1;
@@ -15003,11 +15127,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     as u32;
                             let cap = resolve_thread(threads, ch).ok().and_then(|slot| {
                                 let callee = child_hosts.get(&slot).cloned()?;
+                                let task = threads[slot]?;
                                 let (names, sigs) = callee.lock_unpoisoned().offer_shape(export)?;
                                 let mut hg = host.lock_unpoisoned();
-                                // §13.4 4d: record the child's join `slot` — the live impl's
-                                // durable structural name, re-linked to the re-created child on thaw.
-                                Some(hg.wire_live_impl_child(&callee, export, &names, &sigs, slot))
+                                // §13.4 4d, #1681: record the child's task id — the live impl's
+                                // durable name, re-linked to the re-launched child on thaw.
+                                Some(hg.wire_live_impl_child(&callee, export, &names, &sigs, task))
                             });
                             frames[top]
                                 .vals
@@ -21473,12 +21598,13 @@ pub enum DurableBinding {
     /// authority over its thawed child that it held before the freeze — without this, a round trip
     /// would launder a domain's exposure away and `attest` would start lying.
     FreezeAuthority,
-    /// §13.4 slice 4d — a live-callee offer (`child_offer`) over a §14 child, named
-    /// **structurally** by the callee's join `slot` in the holder's own table + the offer
-    /// `export` (a `DomainId`/`Arc` is process-local and never rides the artifact). The thaw
-    /// re-links it to the re-created child at `slot` (its host + re-fetched offer shape).
+    /// §13.4 slice 4d, #1681 — a live-callee offer (`child_offer`) over a §14 child, minted by the
+    /// holder or re-granted or forked into it, named by the callee's **task id** in the frozen run
+    /// and the offer `export` (a `DomainId`/`Arc` is process-local and never rides the artifact).
+    /// The thaw re-links it to the child it re-launches from that task: its host, and the offer's
+    /// shape fetched again.
     LiveImpl {
-        slot: u32,
+        task: u64,
         export: u32,
     },
     /// §22 guest-JIT **domain** handle (DESIGN.md §22, DURABILITY.md §12.5 Slice 2). The domain's
@@ -21651,9 +21777,9 @@ pub enum DeclineCause {
     /// A fiber is parked where no scheduler waiter records it, so no rule applies (#1677).
     FiberParkedOnCall,
     /// A process no freeze can carry: a `posix_spawn` started it on an uninstrumented command
-    /// image, which nothing can unwind, or a servicer's `clone_caller` forked it, whose reap the
-    /// artifact does not carry (#2571). A personality's fork twin rides the artifact instead
-    /// (#1688), except on the bytecode tier, which carries none and declines for any (#1904).
+    /// image, which nothing can unwind. A fork twin rides the artifact instead, a personality's
+    /// (#1688) or a servicer's `clone_caller` (#2571), except on the bytecode tier, which carries
+    /// none and declines for any (#1904).
     ForkTwin,
     /// A vCPU is parked at a site whose [`FreezeRule`] is still `Decline` (#1898).
     Parked(ParkSite),
@@ -23149,7 +23275,7 @@ pub fn read_slice(window: &[u8], off: u64, len: usize) -> Result<Vec<u8>, Trap> 
 /// ([`Host::into_cell`]: a JIT root that can mint the grant runs locked,
 /// `temen_run::jit_proc::locked`, and so does every JIT child and every domain of the cooperative
 /// bytecode driver). `exec_module` and every other admission see a negative handle and refuse it
-/// fail-closed through `can_regrant`, as does a spawner in no cell. Non-durable (`callee_slot: None`
+/// fail-closed through `can_regrant`, as does a spawner in no cell. Non-durable (`callee_task: None`
 /// — freeze refuses), the deferred durability story.
 pub const GRANT_SERVE_LIVE_TAG: u32 = 0x8000_0000;
 
@@ -23210,12 +23336,14 @@ struct LiveImplEntry {
     /// re-grant re-interns under the same `(names, sigs)` pair).
     names: Arc<[String]>,
     sigs: Arc<[FuncType]>,
-    /// DURABILITY.md §13.4 slice 4d — the callee's **join slot** in the minting domain (its
-    /// structural durable name: `child_hosts`/`threads` are keyed by it). `Some` for a
-    /// `child_offer` (op 14) mint over a §14 child — the only durably-capturable live impl,
-    /// since a thaw re-links it to the re-created child at this slot. `None` for a wire /
-    /// child-regrant mint (no §14 child behind it), which stays non-durable (freeze refuses).
-    callee_slot: Option<usize>,
+    /// DURABILITY.md §13.4 slice 4d, #1681 — the callee's durable name: the task id of the §14
+    /// child behind a `child_offer` (op 14) mint, as its spawner's join table holds it. A task id
+    /// is the run's, not a domain's, so it names the same callee from every powerbox the entry is
+    /// copied into: the minting domain, a child it re-grants the offer to, a fork twin. The thaw
+    /// re-links the entry to the child it re-launches under that id. `None` for an embedder wire, a
+    /// JIT mint or a self-serve grant, which have no §14 child behind them and stay non-durable
+    /// (freeze refuses), and for an entry whose callee did not ride a thaw.
+    callee_task: Option<TaskId>,
 }
 
 /// An instanced offer's **provider domain** (IMPORTS.md §3.2 v2): the persistent window (built
@@ -24187,12 +24315,12 @@ pub struct Host {
     handoff_trap: i64,
     /// §3.6 slice 3 — live-callee offer entries ([`Binding::LiveImpl`] indexes here).
     live_impls: Vec<LiveImplEntry>,
-    /// §13.4 slice 4d — restored `LiveImpl` handles awaiting **re-link** to their re-created §14
-    /// child: `(live_impls index, callee join slot, offer export)`. Populated by
-    /// [`Host::restore_durable_handles`] (the callee host doesn't exist yet at restore); drained
-    /// by the thaw's nested re-creation, which patches each entry's `callee`/`sigs` once the
-    /// child at `callee_slot` is built. Empty on any run that restored no durable live impls.
-    pending_live_impls: Vec<(u32, usize, u32)>,
+    /// §13.4 slice 4d — restored `LiveImpl` handles awaiting **re-link** to their re-launched §14
+    /// child ([`PendingLiveImpl`]). Populated by [`Host::restore_durable_handles`] (the callee host
+    /// doesn't exist yet at restore); drained
+    /// by the thaw's seeding, which patches each entry once every domain is re-launched
+    /// ([`ThawLinks`]). Empty on any run that restored no durable live impls.
+    pending_live_impls: Vec<PendingLiveImpl>,
     /// #2054 — restored stdio streams its spawner had re-granted, `(slot, role)`: re-pinned by
     /// [`Host::restore_durable_handles`] on this domain's own buffer until the relaunch aliases each
     /// to the spawner's cell ([`Host::prepare_detached_relaunch`]).
@@ -24412,6 +24540,10 @@ pub struct Host {
     /// #1688 — the twins a **thaw** re-creates under this domain (see [`ThawedTwin`]), seeded by
     /// restore and taken by the run driver.
     thawed_twins: Vec<ThawedTwin>,
+    /// #2571 — this domain's servicer twins that exited unreaped (see [`FrozenTwin`]): a freeze's
+    /// capture for the codec, or a thaw's to file again, seeded by restore and taken by the run
+    /// driver.
+    frozen_twins: Vec<FrozenTwin>,
     /// #1688 — the pids of the live twins a freeze could not carry, across the whole tree, on the
     /// run root's powerbox: the codec refuses the artifact rather than leave them out.
     unreached_twins: Vec<u64>,
@@ -25045,6 +25177,7 @@ impl Host {
             thawed_detached: Vec::new(),
             captured_twins: Vec::new(),
             thawed_twins: Vec::new(),
+            frozen_twins: Vec::new(),
             unreached_twins: Vec::new(),
             freeze_declined: None,
             thaw_pipes: BTreeMap::new(),
@@ -26201,6 +26334,18 @@ impl Host {
         &self.thawed_twins
     }
 
+    /// #2571 — the servicer twins of this domain that exited unreaped (see [`FrozenTwin`]): those a
+    /// freeze captured, or those a thaw files again.
+    pub fn frozen_twins(&self) -> &[FrozenTwin] {
+        &self.frozen_twins
+    }
+
+    /// #2571 — seed the exited servicer twins a **thaw** files again under this domain, as restore
+    /// does.
+    pub fn set_frozen_twins(&mut self, frozen: Vec<FrozenTwin>) {
+        self.frozen_twins = frozen;
+    }
+
     /// #1688 — the pids of the live twins a freeze could not carry, across the whole tree. Non-empty
     /// means the artifact would be missing a process: the codec refuses it.
     pub fn unreached_twins(&self) -> &[u64] {
@@ -27186,19 +27331,16 @@ impl Host {
                 },
                 Binding::Offer(_) => return Err(self.non_durable(slot, NonDurableKind::Offer)),
                 Binding::LiveImpl(idx) => {
-                    // §13.4 slice 4d: a `child_offer` mint over a §14 child (a recorded join
-                    // slot) is durably capturable — named structurally so the thaw re-links it.
-                    // A wire / child-regrant mint (no §14 child behind it) stays non-durable.
-                    match self
-                        .live_impls
-                        .get(idx as usize)
-                        .and_then(|e| e.callee_slot)
-                    {
-                        Some(cslot) => DurableBinding::LiveImpl {
-                            slot: cslot as u32,
-                            export: self.live_impls[idx as usize].export,
-                        },
-                        None => return Err(self.non_durable(slot, NonDurableKind::LiveImpl)),
+                    // §13.4 slice 4d, #1681: a live impl over a §14 child, minted here or copied in,
+                    // is named by the child's task id, which the thaw re-links it by. Any other
+                    // stays non-durable.
+                    match self.live_impls.get(idx as usize) {
+                        Some(&LiveImplEntry {
+                            callee_task: Some(task),
+                            export,
+                            ..
+                        }) => DurableBinding::LiveImpl { task, export },
+                        _ => return Err(self.non_durable(slot, NonDurableKind::LiveImpl)),
                     }
                 }
                 // #1502, #1944: a Budget names its node; the nodes ride beside the handles
@@ -27322,21 +27464,21 @@ impl Host {
                 DurableBinding::AddressSpace { base, size } => Binding::AddressSpace { base, size },
                 DurableBinding::Instantiator => Binding::Instantiator,
                 DurableBinding::FreezeAuthority => Binding::FreezeAuthority,
-                DurableBinding::LiveImpl { slot, export } => {
+                DurableBinding::LiveImpl { task, export } => {
                     // §13.4 slice 4d: install a placeholder entry (its `callee`/`sigs` are
-                    // patched once the §14 child at `slot` is re-created — see
+                    // patched once the §14 child that was task `task` is re-launched — see
                     // [`Host::take_pending_live_impls`]) and record the pending re-link. The
-                    // placeholder is never dispatched to: the thaw patches it before the holder
-                    // re-enters guest code.
+                    // thaw patches it before the holder re-enters guest code. Unlinked, it names
+                    // no callee, so a later freeze refuses it.
                     let idx = self.live_impls.len() as u32;
                     self.live_impls.push(LiveImplEntry {
                         callee: Arc::new(Mutex::new(Host::new())),
                         export,
                         names: Vec::<String>::new().into(),
                         sigs: Vec::<FuncType>::new().into(),
-                        callee_slot: Some(slot as usize),
+                        callee_task: None,
                     });
-                    self.pending_live_impls.push((idx, slot as usize, export));
+                    self.pending_live_impls.push((idx, task, export));
                     Binding::LiveImpl(idx)
                 }
                 // Slice 2: re-pin the guest-JIT handle at its captured index. The domain's units are
@@ -27987,22 +28129,29 @@ impl Host {
         Ok(())
     }
 
-    /// §13.4 slice 4d — take the restored-but-unlinked live impls (`(index, callee slot,
-    /// export)`), for the thaw to patch once the §14 children exist. Cleared on take.
-    pub fn take_pending_live_impls(&mut self) -> Vec<(u32, usize, u32)> {
+    /// §13.4 slice 4d — take the restored-but-unlinked live impls, for the thaw to patch once the
+    /// §14 children exist. Cleared on take.
+    fn take_pending_live_impls(&mut self) -> Vec<PendingLiveImpl> {
         std::mem::take(&mut self.pending_live_impls)
     }
 
-    /// §13.4 slice 4d — patch a restored live impl (index `idx`) to point at its re-created §14
-    /// child `callee`, re-fetching the offer's shape from the child's registered module (the
-    /// structural `type_id` was already reinstated at restore, so the handle keeps resolving).
-    /// A missing offer leaves the placeholder (the holder's re-issued call then faults probeably).
-    pub fn relink_live_impl(&mut self, idx: u32, callee: Arc<Mutex<Host>>, export: u32) {
-        let shape = callee.lock_unpoisoned().offer_shape(export);
+    /// §13.4 slice 4d — patch a restored live impl (index `idx`) to point at its re-launched §14
+    /// child `callee`, now task `task`, given the offer's shape the child's module answers for
+    /// `export` (the structural `type_id` was already reinstated at restore, so the handle keeps
+    /// resolving). A missing offer leaves the placeholder: the holder's re-issued call then answers
+    /// `-EAGAIN`, and a later freeze refuses it.
+    fn relink_live_impl(
+        &mut self,
+        idx: u32,
+        callee: Arc<Mutex<Host>>,
+        task: TaskId,
+        shape: Option<(Vec<String>, Vec<FuncType>)>,
+    ) {
         if let (Some(e), Some((names, sigs))) = (self.live_impls.get_mut(idx as usize), shape) {
             e.callee = callee;
             e.names = names.into();
             e.sigs = sigs.into();
+            e.callee_task = Some(task);
         }
     }
 
@@ -29673,7 +29822,7 @@ impl Host {
     /// before this table is touched — the two powerbox locks are never held together), then
     /// install the live-impl entry and grant the handle. `None` on any miss (no `self_module`,
     /// bad export, unknown interface) — the caller answers the op-14 probeable `-EINVAL`.
-    /// `callee_slot: None`: not an interp §14 join slot, so non-durable (freeze refuses, the
+    /// `callee_task: None`: not an interp §14 child, so non-durable (freeze refuses, the
     /// [`Host::wire_live_impl`] rule).
     pub fn mint_child_offer(&mut self, callee: &Arc<Mutex<Host>>, export: u32) -> Option<i32> {
         let (names, sigs) = callee.lock_unpoisoned().offer_shape(export)?;
@@ -29681,22 +29830,22 @@ impl Host {
     }
 
     /// §13.4 slice 4d — `child_offer` (op 14) mint over a §14 child: like [`Self::wire_live_impl`]
-    /// but records the callee's **join slot** so the live impl is durably capturable (a thaw
-    /// re-links it to the re-created child at this slot).
+    /// but records the callee's **task id** so the live impl is durably capturable (a thaw
+    /// re-links it to the child it re-launches under that id).
     fn wire_live_impl_child(
         &mut self,
         callee: &Arc<Mutex<Host>>,
         export: u32,
         names: &[String],
         sigs: &[FuncType],
-        callee_slot: usize,
+        callee_task: TaskId,
     ) -> i32 {
         self.install_live_impl(
             Arc::clone(callee),
             export,
             names.into(),
             sigs.into(),
-            Some(callee_slot),
+            Some(callee_task),
         )
     }
 
@@ -29709,7 +29858,7 @@ impl Host {
         export: u32,
         names: Arc<[String]>,
         sigs: Arc<[FuncType]>,
-        callee_slot: Option<usize>,
+        callee_task: Option<TaskId>,
     ) -> i32 {
         let type_id = self.intern_interface(&names, &sigs);
         let idx = self.live_impls.len() as u32;
@@ -29718,7 +29867,7 @@ impl Host {
             export,
             names,
             sigs,
-            callee_slot,
+            callee_task,
         });
         self.grant(type_id, Binding::LiveImpl(idx))
     }
@@ -31349,7 +31498,7 @@ impl Host {
     /// callee is this domain's own running cell `cell`, over its impl-export. The child's calls
     /// enqueue on this domain's inbound queue and park until its `svc.wait` serve loop replies. Only
     /// the child's table holds the entry (granter → grantee, down the grant graph), so the granter
-    /// never holds a self-referential `Arc`: no cycle, nothing for it to mis-call. `callee_slot:
+    /// never holds a self-referential `Arc`: no cycle, nothing for it to mis-call. `callee_task:
     /// None` — non-durable (freeze refuses), the deferred durability story (#1681).
     fn grant_into_child(
         &mut self,
@@ -31490,10 +31639,9 @@ impl Host {
                 Arc::clone(&e.names),
                 Arc::clone(&e.sigs),
             );
-            // The callee's join slot is the *parent's* structural name, meaningless in the
-            // child's namespace — a re-granted live impl stays non-durable (§13.4 4d follow-up:
-            // a re-grant's durable name would be the sibling's provenance path).
-            return Some(child.install_live_impl(callee, export, names, sigs, None));
+            // #1681 — the callee's task id names it from the child's powerbox too, so a re-granted
+            // live impl is as durable as the one it copies.
+            return Some(child.install_live_impl(callee, export, names, sigs, e.callee_task));
         }
         // Concurrent stages (STAGE1.md item 6): re-granting a §13 `SharedRegion` aliases the
         // SAME backing into the child's powerbox — the explicit parent↔child / sibling↔sibling

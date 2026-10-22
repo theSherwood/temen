@@ -82,10 +82,7 @@ fn interp_row(site: ParkSite) -> Row {
         ParkSite::Reply => Row::Case(reply),
         ParkSite::PageFault => Row::Case(page_fault),
         ParkSite::Completion => COMPLETION_PENDING,
-        ParkSite::ReapAny => Row::Unreachable {
-            why: "a servicer's `wait(-1)` waits on a `clone_caller` twin, which declines the freeze \
-                  first (#2571)",
-        },
+        ParkSite::ReapAny => Row::Case(reap_any),
         ParkSite::Admit => ADMIT_UNREACHABLE,
     }
 }
@@ -537,6 +534,18 @@ fn reap(site: ParkSite, engine: Engine) {
         "only the tree-walker carries a fork twin (#1688)"
     );
     fork_twin::waitpid_parked_at_the_trigger_thaws();
+}
+
+/// #2571 — a servicer's `wait(-1)` on its live `clone_caller` twin. Only the tree-walker carries a
+/// twin, so this row is not the shared shape: the scenario is `support/fork_twin.rs`'s.
+fn reap_any(site: ParkSite, engine: Engine) {
+    assert_eq!(site.freeze_rule(), FreezeRule::Phase);
+    assert_eq!(
+        engine,
+        Engine::Interp,
+        "only the tree-walker carries a fork twin (#1688)"
+    );
+    fork_twin::servicer_wait_any_parked_at_the_trigger_thaws();
 }
 
 /// #1940 — a page fault. Only a demand-paged child faults, so this row is not the shared shape: the

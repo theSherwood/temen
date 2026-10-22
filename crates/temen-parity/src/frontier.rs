@@ -513,7 +513,11 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U],
         Capability::LiveImpl => [
             F,
-            declines("NonDurableKind::LiveImpl — points at a *running* domain's powerbox"),
+            declines(
+                "NonDurableKind::LiveImpl — an embedder wire, a JIT mint or a self-serve grant names \
+                 no §14 child; a `child_offer`, minted, re-granted or forked, rides by its callee's \
+                 task id (#1681)"
+            ),
             U,
             U,
             U,

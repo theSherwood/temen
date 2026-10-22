@@ -12008,15 +12008,18 @@ fn freeze_step(
     host.is_durable() && is_unwinding(mem) && admit_parks(tasks)
 }
 
-/// The rule this engine applies at `site`: the oracle's, but for a reply wait and a page fault. The
-/// oracle re-issues the wait and the thaw re-parks the call on its ticket (#1901); this engine has no
-/// re-park yet, so a re-admitted call would be issued twice, and it declines instead (#1904). The
-/// oracle holds a pager until its paged children have unwound (#2455), so a fault waits for its page;
-/// this engine has no hold, so it declines. No fault parks in a freeze yet: a durable run on this
-/// engine refuses a detached spawn (#1893), and only a detached child pages.
+/// The rule this engine applies at `site`: the oracle's, but for a reply wait, a page fault and a
+/// `wait(-1)`. The oracle re-issues the wait and the thaw re-parks the call on its ticket (#1901);
+/// this engine has no re-park yet, so a re-admitted call would be issued twice, and it declines
+/// instead (#1904). The oracle holds a pager until its paged children have unwound (#2455), so a
+/// fault waits for its page; this engine has no hold, so it declines. No fault parks in a freeze yet:
+/// a durable run on this engine refuses a detached spawn (#1893), and only a detached child pages.
+/// The oracle carries a fork twin, whose unwind ends a `wait(-1)` (#2571); this engine carries none.
 fn freeze_rule_here(site: super::ParkSite) -> super::FreezeRule {
     match site {
-        super::ParkSite::Reply | super::ParkSite::PageFault => super::FreezeRule::Decline,
+        super::ParkSite::Reply | super::ParkSite::PageFault | super::ParkSite::ReapAny => {
+            super::FreezeRule::Decline
+        }
         s => s.freeze_rule(),
     }
 }

@@ -334,8 +334,8 @@ it), or **decline** (no rule yet: the census refuses the freeze up front,
 parked vCPUs (teardown, the census, a freeze's re-admission) is a loop over `ParkSite::ALL`, so a
 new collection cannot be missed by one of them. Re-issue: `svc.wait`, futex, pipe read and write,
 `waitpid`, a job-control stop, a stream read, and a live call's reply. Phase: `thread.join`, a lane,
-and a demand-paged child's page fault, whose pager the freeze holds to serve it (#1940, #2455,
-below). Decline: a servicer's `wait(-1)`, whose `clone_caller` twin does not ride (#2571), a
+a demand-paged child's page fault, whose pager the freeze holds to serve it (#1940, #2455,
+below), and a servicer's `wait(pid)` or `wait(-1)`, which its twin's unwind ends (#2571). Decline: a
 punted completion, which is a host call outside the cut (#1902), and an offer admission, which a
 durable caller never reaches (#1681). A fiber
 parked at a site follows the same rule: the freeze drive of whichever vCPU finishes first gives an
@@ -644,11 +644,26 @@ artifact carries is reserved before the thaw mints any id. The thaw's registrar
 (`temen_posix::Thaw`) re-binds each personality entry to its process and grants that process's doors
 (signal, exit hook, exec remap), which the restore installs as a fork installs them. The census
 declines while a twin no freeze can carry lives: a `posix_spawn`ed process, whose uninstrumented
-command image has no doorbell, and any twin a servicer's `clone_caller` forked, whose reap the
-artifact does not carry yet (#2571). A `fork` or `posix_spawn` under a landed freeze is abandoned
+command image has no doorbell. A `fork` or `posix_spawn` under a landed freeze is abandoned
 for the thaw to re-issue. The tree-walker carries twins; the bytecode tier carries none and declines
 a freeze while one lives (#1904), and a durable Cranelift run never serves `fork`. Pinned by
 `temen`'s `durable_fork.rs` and the park matrix's `waitpid` row.
+
+**A servicer's twins too (v50, #2571).** A twin a servicer's `clone_caller` forked (FORK.md §8's
+manager topology) rides as a personality's does, with two differences, both from who reaps it.
+- **Its exit waits in the core.** The servicer's `wait` reaps it from the scheduler's records, so
+  one that exited unreaped rides its parent's Section 12 as its outcome (`FrozenTwin`), and the thaw
+  files it again for that `wait`. The freeze rings only live twins, so one that ended before the
+  ring is never rung, and its end is its own. One that ended after the ring, otherwise than by
+  returning, may have been reaped by the run's own teardown, so it is unreached.
+- **Its parent's waits park in the core.** A `wait(pid)` parks in `join_waiters` and a `wait(-1)`
+  in `reap_any_waiters`, both phase sites: the twin's unwind wakes the waiter, which abandons its
+  wait (`Pending::ReapPid`), so the thaw re-issues it against the re-created twin.
+
+Its launch record says which reaper it has, so the thaw re-files it as the servicer's. The twin holds
+its parent's `fork` offer, a re-granted `child_offer`, which rides by its callee's task id (§13.4
+4d). Pinned by `durable_fork.rs`'s servicer tests (live, exited and crashed twins, each waited on by
+pid and by `wait(-1)`, through two freeze rounds) and the park matrix's `wait(-1)` row.
 
 **A demand-paged child is durable too (#2438).** A child whose spawn record named a pager
 (§2.2, #1862) freezes like any detached child, and its pager rides its launch record: the
@@ -2969,7 +2984,7 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
 > the nested variant of 4c-bis, and the 4d / nested-holder `LiveImpl` re-link by join slot) rode the
 > carve path, deleted in #1867 (INVARIANTS #13, 2026-09-29). A detached child's serve trio rides its
 > own root-shaped artifact (§4, v29), and the thaw re-links a restored `LiveImpl` to its re-launched
-> detached callee by the spawner's join slot (`Host::relink_live_impl`, the thaw's re-launch pass).
+> detached callee by the callee's task id (v50, #1681; by the spawner's join slot before).
 
 1. **Stable domain keys** (13.3) — behavior-neutral, unblocks everything.
    **BUILT 2026-07-24:** `Host::domain_id` (process-unique, minted at construction from a
@@ -3225,6 +3240,24 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
      `fwd(7) → C1 forwards leaf(7)` through the re-linked grandchild cap → **107** (fails with
      `-11`/`EAGAIN` without the generalization). **Still open:** the wire/child-regrant
      **sibling-provenance** durable name (a live cap with no §14 child behind it).
+   * **Re-granted live caps — BUILT (v50, #1681).** A live impl names its callee by the callee's
+     **task id**, the id its spawner's join table holds, not by a join slot in the holder's table.
+     Task ids are the run's, so one id names the callee from every powerbox the entry reaches: the
+     domain that minted it (op 14 records `threads[slot]`), a child it re-grants the offer into
+     (`regrant_into_child`, at a spawn or by op 19), and a fork twin's copy. `B_LIVE_IMPL` carries
+     the id. The thaw collects every re-launched detached child under its frozen task id, and every
+     domain's restored live impls, and re-links them all in one pass once the whole tree is seeded
+     (`ThawLinks`): an offer may name a child that a domain far from it re-launches. Each re-linked
+     entry takes its callee's new id, so a re-freeze names the current run; one whose callee did not
+     ride stays unlinked, and a later freeze refuses it rather than bind it to whatever task takes
+     that id next. The per-domain re-link this replaces looked an edge up under `(root id, slot)`, so
+     an offer a *thread* minted over its own child could bind to the root's child at that slot.
+     Pinned by `temen-snapshot/tests/roundtrip.rs`'s
+     `a_regranted_live_cap_rides_the_freeze_and_thaws_relinked` (a manager re-grants its offer to a
+     guest, which rides holding it) and `a_live_cap_a_thread_mints_thaws_onto_its_own_child` (which
+     deadlocked before). **Still open (#1681):** an embedder wire, the JIT's `mint_child_offer`, a
+     self-serve grant (`GRANT_SERVE_LIVE_TAG`) and a wired `Offer` name no §14 child, and stay
+     non-durable.
    * **In-cut parked callers (the ticket question, step-5-adjacent):** a caller parked in
      `CapReply` rewound its frame, so thaw re-execution would *re-issue* the call — a
      double dispatch when the original survives in the callee's restored queue. Two options
