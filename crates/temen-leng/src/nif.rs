@@ -184,9 +184,11 @@ impl Parser<'_> {
                 b'\\' => self.i += 2, // NIF escapes are `\xx` / `\c`; skip the next byte
                 b'"' => {
                     self.i += 1;
+                    let end_lit = self.i;
+                    self.skip_lineinfo();
                     // Keep the quotes so the translator can distinguish a string atom.
                     return Ok(Node::Atom(
-                        String::from_utf8_lossy(&self.b[start..self.i]).into_owned(),
+                        String::from_utf8_lossy(&self.b[start..end_lit]).into_owned(),
                     ));
                 }
                 _ => self.i += 1,
@@ -198,8 +200,7 @@ impl Parser<'_> {
     /// A NIF **character literal** — `'0'`, `' '` (a literal space), `'\5C'` (a `\HH` hex escape).
     /// It must be lexed as a unit rather than via `atom()`, because a space char (`' '`) or any
     /// other delimiter inside the quotes would otherwise split the token. A char literal never
-    /// contains an unescaped `'`, so scanning to the next `'` finds the true close; any trailing
-    /// line-info suffix (`@…`/`~…`) after the close is then discarded like an atom's.
+    /// contains an unescaped `'`, so scanning to the next `'` finds the true close.
     fn char_lit(&mut self) -> Result<Node, String> {
         debug_assert_eq!(self.b[self.i], b'\'');
         let start = self.i;
@@ -212,7 +213,15 @@ impl Parser<'_> {
         }
         self.i += 1; // closing '
         let end_lit = self.i;
-        // Skip a trailing line-info suffix (`@…`/`~…`) up to the next delimiter.
+        self.skip_lineinfo();
+        Ok(Node::Atom(
+            String::from_utf8_lossy(&self.b[start..end_lit]).into_owned(),
+        ))
+    }
+
+    /// Skip the line-info suffix (`@…`/`~…`) after a string or char literal's closing quote, up to
+    /// the next delimiter, so it is discarded like an atom's rather than read as an atom of its own.
+    fn skip_lineinfo(&mut self) {
         while self.i < self.b.len() {
             let c = self.b[self.i];
             if c == b'(' || c == b')' || c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' {
@@ -220,9 +229,6 @@ impl Parser<'_> {
             }
             self.i += 1;
         }
-        Ok(Node::Atom(
-            String::from_utf8_lossy(&self.b[start..end_lit]).into_owned(),
-        ))
     }
 
     fn atom(&mut self) -> Result<Node, String> {
@@ -274,6 +280,17 @@ mod tests {
         let n = parse("(call f x ' ')").unwrap();
         assert_eq!(n.args().len(), 3);
         assert_eq!(n.args()[2].as_atom(), Some("' '"));
+    }
+
+    #[test]
+    fn string_literals_with_lineinfo() {
+        // nimony puts line info after a string literal too (`"tab\09here"@H,~B`); it used to come
+        // through as an atom of its own, one argument too many.
+        let n = parse("(call f \"lit\"@3,~4 \"a\\09b\"@H,~B \"\")").unwrap();
+        assert_eq!(n.args().len(), 4);
+        assert_eq!(n.args()[1].as_atom(), Some("\"lit\""));
+        assert_eq!(n.args()[2].as_atom(), Some("\"a\\09b\""));
+        assert_eq!(n.args()[3].as_atom(), Some("\"\""));
     }
 
     #[test]

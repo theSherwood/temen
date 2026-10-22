@@ -398,6 +398,25 @@ fn flexarray_data_indexing() {
 }
 
 #[test]
+fn cstring_literal_is_its_bytes_in_data() {
+    // A string literal used as a value is a C string, the address of its NUL-terminated bytes:
+    // nimony writes `var s: cstring = "h\ti"` with the literal in place, line info and all. The bytes
+    // sit after the globals, so reading the global `g` too shows neither overwrote the other.
+    let leng = "\
+(stmts
+ (gvar :g.0. . (i +64) 7)
+ (proc :at.0 (params (param :i.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :s.0 . (aptr (c 8)) \"h\\09i\"@3,~4)
+   (ret (add (i +64) (conv (i +64) (pat s.0 i.0)) g.0.)))))";
+    let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    let bytes = [b'h', b'\t', b'i', 0];
+    for (i, b) in bytes.into_iter().enumerate() {
+        assert_eq!(run(&m, 0, &[i as i64]), b as i64 + 7, "byte {i}");
+    }
+}
+
+#[test]
 fn unsigned_literal_over_i64_max() {
     // An SSO word can exceed i64::MAX; the `u` literal keeps the bit pattern.
     let leng = "\

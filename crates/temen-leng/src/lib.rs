@@ -1307,6 +1307,12 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     // (row 48), as it did before it asked for the affinity mask.
     ("chmod", sig(&[I64, I32], &[I32]), 29),
     ("schedGetaffinity", sig(&[I32, I64, I64], &[I32]), 83),
+    // `std/posix`'s `link(old, new) -> cint` and `symlink(target, path) -> cint`, which upstream
+    // nimony's `std/os` reaches (#2567). Both have `c_rename`'s shape and posture (row 37: two paths,
+    // no filesystem to change), and the memfs has no links, as `readlink` (row 34) assumes. **Pinned**
+    // (#1499).
+    ("link", sig(&[I64, I64], &[I32]), 37),
+    ("symlink", sig(&[I64, I64], &[I32]), 37),
 ];
 
 /// The C symbols the **prebuilt guest libc** ([`nim_libc_units`]) serves for a nim program — the
