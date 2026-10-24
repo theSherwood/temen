@@ -10,8 +10,9 @@
 //! One **probe** per feature (`support/run_probes.rs`): a small program that uses the feature, the
 //! powerbox it needs, and the answer the oracle gives. A **runner** is one configuration of the
 //! manifest, run the way its embedder runs it: the four executors one-shot, the DAP's two debug
-//! engines (the tree-walk `Inspector` and the bytecode debug scheduler), and `CoopRun` on the pump
-//! and on executor 2.
+//! engines (the tree-walk `Inspector` and the bytecode debug scheduler), `CoopRun` on the pump and
+//! on executor 2, and the durable entries of the tree-walker, the pump and the Cranelift JIT, each
+//! run frozen and thawed ([`durable`]).
 //!
 //! A probe's embedder may have to act from outside the run ([`Outside`]), and each runner acts as
 //! its embedder would. A run the embedder holds hands control back when it can only wait on the
@@ -47,12 +48,14 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use drivers::{run_on, Driver, Pumped};
-use probes::{module, probes, Embedder, Outside, Probe, Stopper};
+use probes::{module, probes, Embedder, Outside, Probe, Stopper, ARENA};
 use support::cites_an_issue;
+use temen_durable::{begin_thaw, init_durable_window, write_state};
 use temen_interp::bytecode::{
     module_spawns_threads, CoopEvent, CoopRun, SchedStop, ScheduledDebugRun,
 };
-use temen_interp::{Host, Inspector, Stop, Trap, Value};
+use temen_interp::{Host, Inspector, MemLayout, Stop, Trap, Value};
+use temen_ir::durable_abi::STATE_UNWINDING;
 use temen_ir::Module;
 use temen_parity::run_modes::{
     config_exception, exception, runner_for, Config, Executor, Feature, Property, Props, Row,
@@ -117,6 +120,8 @@ enum Way {
     DebugScheduler,
     /// `CoopRun`, held and resumed by this harness.
     Held(Pumped),
+    /// An executor's durable entry, run frozen and thawed ([`durable`]).
+    Durable(Executor),
 }
 
 /// The harness's runner for `c`, if it has one. [`RUNNERS`] lists the same configurations, which
@@ -134,6 +139,8 @@ fn way(c: Config) -> Option<Way> {
         Way::Held(Pumped::Pump)
     } else if c == Config::new(Parallel, &[Held]) {
         Way::Held(Pumped::Threads)
+    } else if c.props == Props::of(&[Durable]) && c.executor != Parallel {
+        Way::Durable(c.executor)
     } else {
         return None;
     })
@@ -164,7 +171,7 @@ fn run(c: Config, probe: &Probe) -> Verdict {
     let probe = *probe;
     bounded(format!("{:?} on {}", probe.feature, c.label()), move || {
         let m = module(&(probe.src)());
-        let unheld = matches!(way, Way::OneShot(_) | Way::Inspector);
+        let unheld = matches!(way, Way::OneShot(_) | Way::Inspector | Way::Durable(_));
         if probe.outside != Outside::Continue || !unheld {
             return judge(once(way, &m, &probe, false), probe.want);
         }
@@ -188,38 +195,57 @@ fn run(c: Config, probe: &Probe) -> Verdict {
 /// saying its embedder may act on it from outside, and has a thread continue the process once it
 /// asks to stop.
 fn once(way: Way, m: &Module, probe: &Probe, armed: bool) -> End {
+    if let Way::Durable(x) = way {
+        return durable(x, m, probe, armed);
+    }
     let e = Embedder::default();
-    // A run nobody holds gets what its embedder gives it from outside from a thread of its own.
-    let unheld = || {
-        let (mut host, args) = (probe.setup)(m, &e);
-        if let Outside::Feed(bytes) = probe.outside {
-            feed_later(&mut host, bytes);
-        }
-        if armed {
-            host.arm_external_wake();
-            let s = Arc::clone(&e.stopper);
-            std::thread::spawn(move || {
-                s.await_stop();
-                if s.is_stopped() {
-                    s.set(false);
-                }
-            });
-        }
-        (host, args)
-    };
+    let unheld = || unheld(m, probe, &e, armed);
     let one_shot = |d| run_on(d, m, &unheld).map_or(End::Declined, |ran| End::of(ran.result));
     let end = match way {
         Way::OneShot(Executor::TreeWalk) => one_shot(Driver::Oracle),
         Way::OneShot(Executor::Pump) => one_shot(Driver::Coop),
         Way::OneShot(Executor::Parallel) => one_shot(Driver::Parallel),
-        Way::OneShot(Executor::Cranelift) => on_cranelift(m, unheld()),
+        // Over a window seeded at its declared size in the default reservation, as
+        // `temen_run::Instance` runs it.
+        Way::OneShot(Executor::Cranelift) => {
+            let window = MemLayout::image(vec![0u8; 1 << m.memory.map_or(16, |w| w.size_log2)]);
+            on_cranelift(m, unheld(), &window, temen_ir::default_reserved_log2()).0
+        }
         Way::Inspector => inspected(m, unheld()),
         Way::DebugScheduler => debugged(m, (probe.setup)(m, &e), probe.outside, &e.stopper),
         Way::Held(exec) => held(exec, m, (probe.setup)(m, &e), probe.outside, &e.stopper),
+        Way::Durable(_) => unreachable!("driven by `durable` above"),
     };
     // The run is over: a continue thread still waiting has nothing to continue.
     e.stopper.close();
     end
+}
+
+/// The powerbox `e` gives a run of `m` that nobody holds, with what it gives the run from outside
+/// from a thread of its own: input fed from a source, and, when `armed`, the run's external-wake bell
+/// armed and the process continued once it asks to stop.
+fn unheld(m: &Module, probe: &Probe, e: &Embedder, armed: bool) -> (Host, Vec<Value>) {
+    let (mut host, args) = (probe.setup)(m, e);
+    if e.durable {
+        // An embedder that freezes the run holds the authority to freeze the children it spawns
+        // (#1440), without which a durable domain spawns none.
+        host.set_durable(true);
+        host.grant_freeze_authority();
+    }
+    if let Outside::Feed(bytes) = probe.outside {
+        feed_later(&mut host, bytes);
+    }
+    if armed {
+        host.arm_external_wake();
+        let s = Arc::clone(&e.stopper);
+        std::thread::spawn(move || {
+            s.await_stop();
+            if s.is_stopped() {
+                s.set(false);
+            }
+        });
+    }
+    (host, args)
 }
 
 /// Give `host` a stdin source that blocks until a thread supplies `bytes`, which it does only once
@@ -239,12 +265,17 @@ fn feed_later(host: &mut Host, bytes: &'static [u8]) {
     }));
 }
 
-/// Run `m` on the Cranelift JIT through `temen_run`, over a window seeded at its declared size in
-/// the default reservation, as `temen_run::Instance` runs it, with the `call.dyn` table the
-/// powerbox's `Jit` grant reserved (`temen_run::grant_jit` asks the compile for the same size).
-/// The JIT refuses a module outside its subset with `Unsupported`; any other error is an answer
-/// the oracle did not give.
-fn on_cranelift(m: &Module, (mut host, args): (Host, Vec<Value>)) -> End {
+/// Run `m` on the Cranelift JIT through `temen_run`, from `window` in a reservation of
+/// `2^reserved_log2` bytes, with the `call.dyn` table the powerbox's `Jit` grant reserved
+/// (`temen_run::grant_jit` asks the compile for the same size): how it ended, the window it left,
+/// and its host. The JIT refuses a module outside its subset with `Unsupported`; any other error is
+/// an answer the oracle did not give.
+fn on_cranelift(
+    m: &Module,
+    (mut host, args): (Host, Vec<Value>),
+    window: &MemLayout,
+    reserved_log2: u8,
+) -> (End, Option<MemLayout>, Host) {
     let args: Vec<i64> = args
         .iter()
         .map(|v| match v {
@@ -253,19 +284,19 @@ fn on_cranelift(m: &Module, (mut host, args): (Host, Vec<Value>)) -> End {
             other => panic!("unexpected argument {other:?}"),
         })
         .collect();
-    let size = 1usize << m.memory.map_or(16, |mem| mem.size_log2);
-    let window = temen_interp::MemLayout::image(vec![0u8; size]);
-    let reserved = temen_ir::default_reserved_log2();
     let table = host.jit_table_log2();
-    match temen_run::jit_cap_run(m, 0, &args, &window, reserved, table, &mut host, None) {
-        Ok((temen_jit::JitOutcome::Returned(v), _)) => match v[..] {
-            [x] => End::Value(x),
-            _ => End::Stuck(format!("returned {v:?}")),
+    let run = temen_run::jit_cap_run(m, 0, &args, window, reserved_log2, table, &mut host, None);
+    match run {
+        Ok((temen_jit::JitOutcome::Returned(v), snap)) => match v[..] {
+            [x] => (End::Value(x), Some(snap), host),
+            _ => (End::Stuck(format!("returned {v:?}")), None, host),
         },
-        Ok((temen_jit::JitOutcome::Trapped(t), _)) => End::Trap(format!("{t:?}")),
-        Ok((other, _)) => End::Stuck(format!("{other:?}")),
-        Err(temen_jit::JitError::Unsupported(_)) => End::Declined,
-        Err(e) => End::Stuck(format!("{e:?}")),
+        Ok((temen_jit::JitOutcome::Trapped(t), snap)) => {
+            (End::Trap(format!("{t:?}")), Some(snap), host)
+        }
+        Ok((other, _)) => (End::Stuck(format!("{other:?}")), None, host),
+        Err(temen_jit::JitError::Unsupported(_)) => (End::Declined, None, host),
+        Err(e) => (End::Stuck(format!("{e:?}")), None, host),
     }
 }
 
@@ -367,6 +398,135 @@ fn held(
             },
             _ => return End::Stuck("a round-trip only the browser's tier makes".into()),
         }
+    }
+}
+
+/// The reservation a durable run's window sits in: room for a probe that grows its window.
+const DURABLE_RESERVED_LOG2: u8 = 18;
+
+/// Run `probe` durably on `x`, as DURABILITY.md §7's equivalence says: uninterrupted, then frozen at
+/// its first safepoint (the poll after its first capability call), serialized by the §12 codec,
+/// restored into a fresh powerbox and thawed. Both must give the oracle's answer. The freeze's state
+/// word is set before the run starts, the one deterministic trigger every engine honours. The same
+/// embedder freezes and thaws the run: it gives the thaw the powerbox it gave the run, whose module
+/// grants the restore re-pins handles to, and re-grants its named procedures by name.
+///
+/// The uninterrupted run is continued if it stops itself, as its embedder continues it. The frozen
+/// run is not: a freeze lands through a stop (#1672), so a process that stopped itself is frozen
+/// stopped, and still is when it thaws. `armed` is then the thaw's, which the two-run rule of [`run`]
+/// holds: with nothing to continue it, the thaw must fault `ThreadFault`; continued, it must finish.
+fn durable(x: Executor, m: &Module, probe: &Probe, armed: bool) -> End {
+    let inst = match probes::instrumented(m) {
+        Ok(inst) => Arc::new(inst),
+        Err(why) => return End::Stuck(why),
+    };
+    let size = 1usize << inst.memory.expect("instrumented declares it").size_log2;
+    let fresh = init_durable_window(size, ARENA);
+
+    let e = Embedder::durable();
+    let seed = MemLayout::image(fresh.clone());
+    let continued = probe.outside == Outside::Continue;
+    let whole = durable_run(x, &inst, unheld(&inst, probe, &e, continued), &seed).0;
+    e.stopper.close();
+    if whole != End::Value(probe.want) {
+        return whole;
+    }
+
+    let e = Embedder::durable();
+    let mut cut = fresh;
+    write_state(&mut cut, ARENA, STATE_UNWINDING);
+    let (froze, snap, host) = durable_run(
+        x,
+        &inst,
+        unheld(&inst, probe, &e, false),
+        &MemLayout::image(cut),
+    );
+    let thawed = match (froze, snap) {
+        (End::Value(0), Some(snap)) => thaw(x, &inst, probe, &e, armed, &snap, host),
+        (End::Value(0), None) => End::Stuck("the frozen run left no window".into()),
+        (End::Declined, _) => End::Declined,
+        (other, _) => End::Stuck(format!("the freeze did not unwind the root: {other:?}")),
+    };
+    e.stopper.close();
+    match thawed {
+        End::Value(v) if v == probe.want => thawed,
+        // The two-run rule's first half: a stopped process its thaw cannot continue.
+        End::Trap(t) if t == "ThreadFault" && !armed && continued => End::Trap(t),
+        End::Declined => End::Declined,
+        other => End::Stuck(format!("frozen and thawed: {other:?}")),
+    }
+}
+
+/// Serialize the run `e` froze, leaving `snap` and `host`, restore it into the powerbox `e` gives a
+/// fresh run, and run it on: how the thaw ends.
+fn thaw(
+    x: Executor,
+    inst: &Arc<Module>,
+    probe: &Probe,
+    e: &Embedder,
+    armed: bool,
+    snap: &MemLayout,
+    mut host: Host,
+) -> End {
+    if let Some(why) = host.take_freeze_declined() {
+        return End::Stuck(format!("the freeze was declined: {why:?}"));
+    }
+    let art = match temen_snapshot::freeze_layout(inst, snap, DURABLE_RESERVED_LOG2, &host) {
+        Ok(art) => art,
+        Err(why) => return End::Stuck(format!("the codec refuses the freeze: {why:?}")),
+    };
+    let (mut thawing, args) = unheld(inst, probe, e, armed);
+    let registrar = e.clone();
+    thawing.set_named_cap_registrar(Box::new(move |name, _state, _payer| {
+        probes::regrant(name, &registrar)
+    }));
+    let twin = match temen_snapshot::restore_layout(&art, inst, &mut thawing) {
+        Ok((twin, _)) => twin,
+        Err(why) => return End::Stuck(format!("the codec refuses the restore: {why:?}")),
+    };
+    let (mut bytes, prots) = twin.to_dense();
+    begin_thaw(&mut bytes, ARENA, 0);
+    let twin = MemLayout::from_dense(bytes, &prots, twin.mapped());
+    durable_run(x, inst, (thawing, args), &twin).0
+}
+
+/// One run of `inst` on `e`'s durable entry, starting from `window` in a reservation of
+/// `2^DURABLE_RESERVED_LOG2` bytes: how it ended, the window it left, and its host. The bytecode
+/// engine's entry takes and leaves a flat window, so its window carries no page map (#2628).
+fn durable_run(
+    e: Executor,
+    inst: &Module,
+    (mut host, args): (Host, Vec<Value>),
+    window: &MemLayout,
+) -> (End, Option<MemLayout>, Host) {
+    let mut fuel = FUEL;
+    match e {
+        Executor::TreeWalk => {
+            let (r, snap) = temen_interp::run_capture_reserved_with_host_layout(
+                inst,
+                0,
+                &args,
+                &mut fuel,
+                window,
+                DURABLE_RESERVED_LOG2,
+                &mut host,
+            );
+            (End::of(r), snap, host)
+        }
+        Executor::Pump => match temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
+            inst,
+            0,
+            &args,
+            &mut fuel,
+            &window.to_dense().0,
+            DURABLE_RESERVED_LOG2,
+            &mut host,
+        ) {
+            Some((r, snap)) => (End::of(r), Some(MemLayout::image(snap)), host),
+            None => (End::Declined, None, host),
+        },
+        Executor::Cranelift => on_cranelift(inst, (host, args), window, DURABLE_RESERVED_LOG2),
+        Executor::Parallel => unreachable!("executor 2 has no durable runner (#2541)"),
     }
 }
 
@@ -547,8 +707,8 @@ fn audited_coverage_does_not_regress() {
         .filter(|c| c.status != Status::Unaudited)
         .count();
     assert!(
-        audited >= 85,
-        "audited cell count fell to {audited}; it was 85 when the job-control row got its probe \
-         (#2529)"
+        audited >= 102,
+        "audited cell count fell to {audited}; it was 102 when the frozen-and-thawed runners \
+         landed (#2545)"
     );
 }
