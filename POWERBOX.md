@@ -587,11 +587,14 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
   is the page-side sugar (`definePowerbox(eng, { 'js.log': (args, mem) => … }).run(module)`), and the
   playground's **"JS powerbox"** card is the demo: two editors, the guest and the JavaScript that
   implements its capabilities. Authority-neutral (iface-13 `HostProc`, masked handles, fail-closed on
-  an unbound import) and main-thread-only by construction — a JS capability is serviced where its
-  function lives. Gates: `browser/tests/jspb.rs`, `browser/browser-jspb-test.mjs`, and the card's own
-  assertions in `browser-play-editor-test.mjs`. Open: the seam is browser-only and run-once (a
-  reactor `Session` equivalent — bind once, call exports repeatedly from JS — is the obvious next
-  slice), and a JS capability returns exactly one `i64`.
+  an unbound import), and serviced where its function lives: on the thread whose engine reaches the
+  page's servicer. Gates: `browser/tests/jspb.rs`, `browser/browser-jspb-test.mjs`, and the card's own
+  assertions in `browser-play-editor-test.mjs`. #2579: the same capabilities join any on-ramp open's
+  powerbox when the embedder stages them (`temen_onramp_stage_js_cap`, with child images and a budget
+  beside them), so they are no longer run-once: a cooperative session answers them inside each call
+  (`onCap`), a §14 child it re-grants one to calls it with its own window, and a Worker that runs an
+  engine of its own serves them. Executor 2 refuses them. Open: the seam is browser-only, a JS
+  capability returns exactly one `i64`, and `definePowerbox` still runs on `temen_jspb_run` (#2579).
 
 ---
 

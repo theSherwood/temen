@@ -8,7 +8,7 @@
 // "rare shared-memory race (a double-free)" in the shared setup. This Worker instantiates the engine over
 // a fresh memory of its own and allocates only there, so its warm session can't race the main thread's
 // allocator. Main ↔ worker communicate only by messages (source string in; stdout/status/value out).
-import { foreignImports } from './foreign-mem.js';
+import { engineImports } from './engine-imports.js';
 import { engineMemory } from './engine-mem.js';
 import { runWarmCoop, primeWarmJit, jitCacheStats, runJitModule, nimToolchain, nimCompileRun } from './wasmjit-module.js';
 
@@ -111,27 +111,11 @@ self.onmessage = async (e) => {
       // The ceiling the spawning engine settled on (`web/engine-mem.js`). A client that sends none is
       // an older one: fall back to the historical 1 GiB, which every build declares at least.
       ({ memory } = engineMemory(null, { maxPages: msg.maxPages ?? 16384 }));
-      ({ exports: ex } = await WebAssembly.instantiate(msg.module, {
-        env: { memory },
-        temen_host: {
-          ...foreignImports(memory),
-          webgpu_op: () => -1n,
-          // No page-defined powerbox in a snapshot worker (`web/powerbox.js` runs on the main thread).
-          js_cap_call: () => -38n,
-          // No parallel-driver run here (#1414 B6): a refused `x2_spawn` ends one with `ThreadFault`.
-          x2_spawn: () => -1,
-          x2_now_ms: () => performance.timeOrigin + performance.now(),
-          x2_tierup: () => -1,
-          x2_invoke: () => -1,
-          // The live output tee (#1414 S5a): while a streaming Run is active, each write goes to the
-          // main thread (`relay`); the worker's run stays synchronous, so the main thread paints the
-          // chunks as they arrive (a Worker's postMessage delivers even while it computes).
-          stream_chunk: (fd, seq, ptr, len) => {
-            const h = globalThis.__temen_stream_chunk;
-            if (h) h(fd, seq >>> 0, new Uint8Array(memory.buffer, ptr >>> 0, len >>> 0).slice());
-          },
-        },
-      }));
+      // No GPU surface, no page-defined powerbox and no parallel-driver run here: no hook is installed,
+      // so those seams do nothing. The live output tee (#1414 S5a) reaches the sink a streaming Run
+      // installs (`relay`): the worker's run stays synchronous, so the main thread paints the chunks
+      // as they arrive (a Worker's postMessage delivers even while it computes).
+      ({ exports: ex } = await WebAssembly.instantiate(msg.module, engineImports(memory)));
       self.postMessage({ type: 'ready' });
       return;
     }

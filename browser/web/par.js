@@ -8,7 +8,7 @@
 // origin root (local `serve.mjs`) and under a subpath (GitHub Pages serves a project site at
 // `/<repo>/`). The deployed site keeps the same `web/` + `target/…` layout, so `../target/…`
 // resolves correctly under either base.
-import { foreignImports } from './foreign-mem.js';
+import { engineImports } from './engine-imports.js';
 import { engineMemory } from './engine-mem.js';
 const WASM = new URL('../target/wasm32-unknown-unknown/release/temen_browser.wasm', import.meta.url);
 const STACK = 1 << 20;
@@ -42,43 +42,7 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
   // for one (the default otherwise), clamped to the `--max-memory` this build declares, so asking for
   // more than an older build allows yields that build's ceiling instead of a `LinkError`.
   const { memory, maxPages } = engineMemory(bytes, { maxPages: askPages });
-  // The wasm imports `temen_host.webgpu_op` (the `webgpu` capability's host seam). It is a no-op unless a
-  // page installs a real servicer on `globalThis.__temen_webgpu_op` (play.js does, backed by the page's
-  // <canvas> + `navigator.gpu`). i64 args arrive as BigInt; the handler gets the shared `memory` so it
-  // can read the WGSL bytes at `ptr`/`len`. Returns a BigInt (the wasm import result is i64).
-  const importObj = {
-    env: { memory },
-    temen_host: {
-      ...foreignImports(memory), // #1284: detached children's own memories (Region::Foreign)
-      webgpu_op: (op, a, b, c, ptr, len) => {
-        const h = globalThis.__temen_webgpu_op;
-        return h ? BigInt(h(op, a, b, c, ptr, len, memory)) : -1n;
-      },
-      // The JS-defined powerbox's seam (`web/powerbox.js`, `src/jspb.rs`): one guest capability call —
-      // `slot` says which name the page bound, `mem` is the opaque handle to the calling guest's
-      // window. A no-op (-ENOSYS) unless a page installs a servicer on `globalThis.__temen_js_cap_call`
-      // (`definePowerbox` does, for the duration of its run). Returns a BigInt (the import is i64).
-      js_cap_call: (slot, op, argsPtr, nArgs, mem) => {
-        const h = globalThis.__temen_js_cap_call;
-        return h ? BigInt(h(Number(slot), Number(op), argsPtr, nArgs, mem)) : -38n;
-      },
-      // The live output tee (#1414 S5a): each write to a run's stdout (`fd` 1) or stderr (2), as
-      // `[ptr, ptr+len)` in linear memory, numbered by `seq`. A no-op unless something installs a sink
-      // on `globalThis.__temen_stream_chunk` (the coop driver does for an `onOutput`) — it gets a
-      // fresh copy of the chunk (the wasm memory may move after).
-      stream_chunk: (fd, seq, ptr, len) => {
-        const h = globalThis.__temen_stream_chunk;
-        if (h) h(fd, seq >>> 0, new Uint8Array(memory.buffer, ptr >>> 0, len >>> 0).slice());
-      },
-      // The parallel driver's platform (#1414 B6): it runs on a Worker (`worker.js`), never on the
-      // page, which cannot block — so the page starts no thread of its own.
-      x2_spawn: () => -1,
-      x2_now_ms: () => performance.timeOrigin + performance.now(),
-      x2_tierup: () => -1,
-      x2_invoke: () => -1,
-    },
-  };
-  const { exports: ex } = await WebAssembly.instantiate(module, importObj);
+  const { exports: ex } = await WebAssembly.instantiate(module, engineImports(memory));
   return { module, bytes, memory, ex, maxPages };
 }
 

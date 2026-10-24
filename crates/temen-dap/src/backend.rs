@@ -73,14 +73,14 @@ fn grant_io_powerbox(
         .iter()
         .any(|im| im.name == "vm_fs")
         .then(|| temen_fs::grant_vm_fs(host, fs_seed));
-    // #1366 slice (c): the launch's **declared host-completed caps** (`hostCaps`). Each name the
-    // module imports gets an offloadable proc that always punts to the host
+    // #1366 slice (c): the launch's **declared host-completed caps** (`hostCaps`). Each name gets
+    // an offloadable proc that always punts to the host
     // (`OffloadOutcome::Host`): the guest's flat `call.sym "<name>"` parks the run, the request
     // lands in `parked` (read by the DAP `stopped{reason:"cap"}` event), and `provideCap` resumes
     // it. Granted in launch order on every rebuild, so a reverse `seek`'s replay finds the same
     // handles the tape recorded. Nothing here is graphics- or embedder-specific: temen never
     // learns what a name means.
-    let declared = host.grant_declared_host_caps(&m.imports, host_caps, parked);
+    let declared = host.grant_declared_host_caps(host_caps, parked);
     // #1528 — the §14 **by-name spawn set**, the same frontier the two reference powerboxes present
     // (`temen-run`'s `grant_powerbox_prefix` caller and the browser's `grant_onramp_caps`): an
     // `Instantiator` over the guest's own window under `"instantiator"`, and — only for a guest

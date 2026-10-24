@@ -12,7 +12,15 @@ use temen_browser::jspb::{
     set_test_dispatch, temen_jspb_bind, temen_jspb_error_len, temen_jspb_error_ptr,
     temen_jspb_read, temen_jspb_reset, temen_jspb_run, temen_jspb_write, JsGuestMem,
 };
-use temen_browser::{temen_status, STATUS_OK, STATUS_UNSUPPORTED};
+use temen_browser::{
+    temen_coop_close, temen_coop_open, temen_coop_run, temen_onramp_stage_budget,
+    temen_onramp_stage_clear, temen_onramp_stage_js_cap, temen_onramp_stage_module,
+    temen_run_value, temen_status, temen_trap_len, temen_trap_ptr, COOP_LEAF_ROOT, COOP_NO_REGIONS,
+    COOP_RUN_DONE, COOP_RUN_TRAP, STATUS_OK, STATUS_UNSUPPORTED,
+};
+
+#[path = "../../crates/temen-interp/tests/support/rec.rs"]
+mod rec;
 
 /// The `temen_jspb_*` registry is process-global (single-threaded wasm by design), so the tests
 /// serialize on it — the same convention as `coop_tierup_driver.rs`.
@@ -311,4 +319,245 @@ fn the_playground_cards_guest_runs_under_its_three_capabilities() {
         ],
         "the second line came back uppercased — the host wrote into the guest's window"
     );
+}
+
+// ---- #2579: JS capabilities staged for an on-ramp open, on the cooperative session --------------
+
+/// Open `src` as a cooperative session in `mode` (no declared caps, no regions to emit) and pump it
+/// to its end: the run's value, or the trap's name. The modes these tests use run interpreted, so
+/// any other event fails the test.
+fn coop_run(src: &str, mode: i32) -> Result<i64, String> {
+    let m = temen_text::parse_module(src).expect("guest parses");
+    let bytes = temen_encode::encode_module(&m);
+    let null = core::ptr::null();
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), null, 0, 0, null, 0, mode);
+    assert_eq!(opened, 0, "open (status {})", temen_status());
+    let end = loop {
+        match temen_coop_run() {
+            COOP_RUN_DONE => break Ok(temen_run_value()),
+            COOP_RUN_TRAP => {
+                let (p, n) = (temen_trap_ptr(), temen_trap_len());
+                // SAFETY: the cdylib-managed trap name is live until the next run.
+                let name = unsafe { core::slice::from_raw_parts(p, n) };
+                break Err(String::from_utf8_lossy(name).into_owned());
+            }
+            ev => panic!("an interpreted run surfaced event {ev}"),
+        }
+    };
+    temen_coop_close();
+    end
+}
+
+fn stage_js_cap(name: &str) -> i32 {
+    temen_onramp_stage_js_cap(name.as_ptr(), name.len())
+}
+
+fn stage_module(name: &str, src: &str) -> i32 {
+    let m = temen_text::parse_module(src).expect("module parses");
+    let bytes = temen_encode::encode_module(&m);
+    temen_onramp_stage_module(name.as_ptr(), name.len(), bytes.as_ptr(), bytes.len())
+}
+
+/// The one-shot guest above, on the cooperative session: its imports bind to the staged JS
+/// capabilities by name, and each call is answered inside it, the window read through the seam.
+#[test]
+fn staged_js_capabilities_answer_a_coop_run_inside_the_call() {
+    let _g = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    LOG.lock().unwrap().clear();
+    set_test_dispatch(Some(two_caps_servicer));
+    assert_eq!(stage_js_cap("js.add"), 0, "the first staged cap is slot 0");
+    assert_eq!(stage_js_cap("js.log"), 1, "the second is slot 1");
+    assert_eq!(stage_js_cap("js.add"), -1, "a name is staged once");
+    assert_eq!(stage_js_cap(""), -1, "an empty name is refused");
+    let got = coop_run(TWO_CAPS, COOP_NO_REGIONS);
+    set_test_dispatch(None);
+    assert_eq!(got, Ok(20), "js.log returned 10, and js.add doubled it");
+    assert_eq!(
+        LOG.lock().unwrap().as_slice(),
+        ["hello, js!".to_string()],
+        "the JS side read the greeting out of the guest's window"
+    );
+}
+
+/// Where the spawn record and its one grant record sit in the root's window.
+const REC: u64 = 17408;
+const GRANTS: u64 = 17536;
+
+/// A root that tags its own bytes through `js.tag` (op 7), spawns the staged module `kid` with
+/// `js.tag` re-granted by name, paid from `budget`, and joins it. It answers
+/// `join status * 1_000_000 + its own tag * 1000 + the child's`, or `7777` if the spawn is refused.
+fn tagging_root() -> String {
+    let rec = temen_ir::SpawnRec {
+        size_log2: 16,
+        pager: u32::MAX,
+        modh: 0,
+        budget: 0,
+        grants_ptr: GRANTS,
+        grants_n: 1,
+        args: (0, 0),
+        region: -1,
+        child_off: 0,
+    };
+    format!(
+        r#"memory 16
+data 16384 "instantiator"
+data 16400 "js.tag"
+data 16416 "budget"
+data 16432 "kid"
+data 16448 "root!"
+{rec}export 0 func "_start" 0
+func () -> (i64) {{
+block 0 () {{
+  vnp = i64.const 16384
+  vnl = i64.const 12
+  vinst = self.resolve vnp vnl
+  vcp = i64.const 16400
+  vcl = i64.const 6
+  vcap = self.resolve vcp vcl
+  vbp = i64.const 16416
+  vbl = i64.const 6
+  vbud = self.resolve vbp vbl
+  vkp = i64.const 16432
+  vkl = i64.const 3
+  vkid = self.resolve vkp vkl
+  vtp = i64.const 16448
+  vtl = i64.const 5
+  vroot = call.cap 13 7 (i64, i64) -> (i64) vcap (vtp, vtl)
+{grant}  vr0 = i64.const {REC}
+  i32.store vr0 vkid offset=8
+  i32.store vr0 vbud offset=12
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vr0)
+  vz = i32.const 0
+  vbad = i32.lt_s vh vz
+  br_if vbad 1() 2(vinst, vh, vroot)
+}}
+block 1 () {{
+  vno = i64.const 7777
+  return vno
+}}
+block 2 (vi: i32, vh2: i32, vroot2: i64) {{
+  vst, vgot = call.cap 6 1 (i32) -> (i64, i64) vi (vh2)
+  vm = i64.const 1000000
+  vsm = i64.mul vst vm
+  vk = i64.const 1000
+  vrk = i64.mul vroot2 vk
+  vs1 = i64.add vsm vrk
+  vsum = i64.add vs1 vgot
+  return vsum
+  }}
+}}
+"#,
+        rec = rec::segment(REC, &rec),
+        grant = rec::grant("g", GRANTS, 16400, 6, "vcap"),
+    )
+}
+
+/// The child: its window holds its own module's data, so `js.tag`'s name is at 16400 there too, and
+/// other bytes than the root's at 16448. It answers what `js.tag` made of them.
+const KID: &str = r#"memory 16
+data 16400 "js.tag"
+data 16448 "kid!!"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vcp = i64.const 16400
+  vcl = i64.const 6
+  vcap = self.resolve vcp vcl
+  vp = i64.const 16448
+  vl = i64.const 5
+  vr = call.cap 13 7 (i64, i64) -> (i64) vcap (vp, vl)
+  return vr
+  }
+}
+"#;
+
+/// `js.tag` (op 7): `1` for the root's bytes, `2` for the child's, read through the calling guest's
+/// window.
+fn tag_servicer(_slot: u32, op: u32, args: &[i64], mem: *mut JsGuestMem) -> i64 {
+    match (op, read(mem, args[0], args[1]).as_deref()) {
+        (7, Some(b"root!")) => 1,
+        (7, Some(b"kid!!")) => 2,
+        _ => 99,
+    }
+}
+
+/// The staged module and JS capability serve the root and its child: the child resolves the module
+/// by name, holds the capability by re-grant, and its call reads the child's own window. A leaf mode
+/// whose leaf the engine declines (a spawning root cannot run whole) grants the run after it the
+/// same staged grants.
+#[test]
+fn a_child_calls_a_regranted_js_capability_in_its_own_window() {
+    let _g = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    set_test_dispatch(Some(tag_servicer));
+    let root = tagging_root();
+    for mode in [COOP_NO_REGIONS, COOP_LEAF_ROOT | COOP_NO_REGIONS] {
+        assert_eq!(stage_js_cap("js.tag"), 0);
+        assert_eq!(stage_module("kid", KID), 0);
+        assert_eq!(
+            coop_run(&root, mode),
+            Ok(1002),
+            "mode {mode}: the root's tag is 1, the child's 2, and the join succeeds"
+        );
+    }
+    set_test_dispatch(None);
+}
+
+/// A staged budget is the one a spawn pays from: one whose `mem` cannot hold the child's window
+/// refuses the spawn that the default budget (one window) admits, and an unbounded one admits it.
+#[test]
+fn a_staged_budget_is_what_a_spawn_pays_from() {
+    let _g = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    set_test_dispatch(Some(tag_servicer));
+    let root = tagging_root();
+    let run = |budget: Option<[i64; 3]>| {
+        stage_js_cap("js.tag");
+        stage_module("kid", KID);
+        if let Some([fuel, mem, spawn]) = budget {
+            temen_onramp_stage_budget(fuel, mem, spawn);
+        }
+        coop_run(&root, COOP_NO_REGIONS)
+    };
+    assert_eq!(run(None), Ok(1002), "the default budget holds one window");
+    assert_eq!(
+        run(Some([-1, 1000, -1])),
+        Ok(7777),
+        "1000 bytes hold no window"
+    );
+    assert_eq!(
+        run(Some([-1, -1, -1])),
+        Ok(1002),
+        "an unbounded budget holds it"
+    );
+    set_test_dispatch(None);
+}
+
+/// What is staged serves the next open alone, and a clear drops it: the root then resolves no
+/// `js.tag`, and its call on that handle traps.
+#[test]
+fn staged_grants_serve_one_open_and_a_clear_drops_them() {
+    let _g = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    set_test_dispatch(Some(tag_servicer));
+    let root = tagging_root();
+    let garbage = [0u8; 4];
+    let name = "kid";
+    assert!(
+        temen_onramp_stage_module(name.as_ptr(), name.len(), garbage.as_ptr(), garbage.len()) < 0,
+        "bytes that do not decode are refused"
+    );
+    stage_js_cap("js.tag");
+    stage_module("kid", KID);
+    temen_onramp_stage_clear();
+    let cleared = coop_run(&root, COOP_NO_REGIONS);
+    assert!(
+        cleared.is_err(),
+        "nothing staged, so no js.tag to call: {cleared:?}"
+    );
+    stage_js_cap("js.tag");
+    stage_module("kid", KID);
+    assert_eq!(coop_run(&root, COOP_NO_REGIONS), Ok(1002));
+    let again = coop_run(&root, COOP_NO_REGIONS);
+    assert!(
+        again.is_err(),
+        "the open before took what was staged: {again:?}"
+    );
+    set_test_dispatch(None);
 }
