@@ -74,6 +74,8 @@ fn coincident_br_if_becomes_unconditional_and_condition_dies() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // a
                 insts: vec![
                     Inst::ConstI32(1),
@@ -93,6 +95,8 @@ fn coincident_br_if_becomes_unconditional_and_condition_dies() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // x
                 insts: vec![],
                 term: Terminator::Return(vec![0]),
@@ -129,6 +133,8 @@ fn coincident_br_table_becomes_unconditional() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32], // a, idx
                 insts: vec![],
                 term: Terminator::BrTable {
@@ -138,6 +144,8 @@ fn coincident_br_table_becomes_unconditional() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],
                 insts: vec![],
                 term: Terminator::Return(vec![0]),
@@ -171,6 +179,8 @@ fn select_with_equal_arms_folds_to_a_copy() {
         params: vec![ValType::I32, ValType::I32], // cond, a
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32, ValType::I32],
             insts: vec![Inst::Select {
                 cond: 0,

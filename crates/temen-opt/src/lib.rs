@@ -81,7 +81,8 @@ use temen_ir::{
     VWidenOp, ValIdx,
 };
 
-pub mod cfg;
+/// The CFG utilities live in temen-ir, beside the passes that need dominators there (#2454).
+pub use temen_ir::cfg;
 pub mod gvn;
 pub mod instrument;
 pub mod interproc;
@@ -479,6 +480,8 @@ fn fold_block(
     }
 
     Block {
+        parent: 0,
+        captures: vec![],
         params: b.params.clone(),
         insts,
         term: resolve_term(&b.term, &known),
@@ -1848,6 +1851,8 @@ fn copy_propagate(b: &Block, fn_results: &[usize], types: &[temen_ir::TypeEntry]
     let mut term = b.term.clone();
     map_term_operands(&mut term, &mut |o| repl[o as usize]);
     Block {
+        parent: 0,
+        captures: vec![],
         params: b.params.clone(),
         insts,
         term,
@@ -1901,6 +1906,8 @@ fn local_cse(b: &Block, fn_results: &[usize], types: &[temen_ir::TypeEntry]) -> 
     let mut term = b.term.clone();
     map_term_operands(&mut term, &mut |o| repl[o as usize]);
     Block {
+        parent: 0,
+        captures: vec![],
         params: b.params.clone(),
         insts,
         term,
@@ -2089,6 +2096,8 @@ fn mem_forward(b: &Block, fn_results: &[usize], types: &[temen_ir::TypeEntry]) -
     let mut term = b.term.clone();
     map_term_operands(&mut term, &mut |o| map[o as usize]);
     Block {
+        parent: 0,
+        captures: vec![],
         params: b.params.clone(),
         insts,
         term,
@@ -2488,6 +2497,8 @@ fn dce_block(b: &Block, fn_results: &[usize], types: &[temen_ir::TypeEntry]) -> 
     map_term_operands(&mut term, &mut |v| lookup(v));
 
     Block {
+        parent: 0,
+        captures: vec![],
         params: b.params.clone(),
         insts,
         term,
@@ -2760,6 +2771,8 @@ fn jump_thread(
         .iter()
         .enumerate()
         .map(|(q, b)| Block {
+            parent: 0,
+            captures: vec![],
             params: b.params.clone(),
             insts: b.insts.clone(),
             term: redirect_edges(&b.term, blocks, &consts[q]),

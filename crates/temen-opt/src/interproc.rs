@@ -350,6 +350,8 @@ fn inline_single_block_call(
     });
 
     Block {
+        parent: 0,
+        captures: vec![],
         params: caller.params.clone(),
         insts: new_insts,
         term,
@@ -486,6 +488,8 @@ fn inline_multi_block_call(
     caller_block_types: &[ValType],
 ) {
     let placeholder = Block {
+        parent: 0,
+        captures: vec![],
         params: Vec::new(),
         insts: Vec::new(),
         term: Terminator::Unreachable,
@@ -538,12 +542,15 @@ fn inline_multi_block_call(
         params,
         insts: mut pre_insts,
         term,
+        ..
     } = b;
     let post_insts = pre_insts.split_off(call_idx + 1);
     pre_insts.truncate(call_idx);
     let mut pre_args = call_args;
     pre_args.extend(cap.iter().copied());
     blocks[bi] = Block {
+        parent: 0,
+        captures: vec![],
         params,
         insts: pre_insts,
         term: Terminator::Br {
@@ -564,6 +571,8 @@ fn inline_multi_block_call(
         let cap_params: Vec<u32> = (np..np + capc).collect();
         let term = transform_callee_term(&cb.term, np, capc, off, cont, &cap_params);
         blocks.push(Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts,
             term,
@@ -595,6 +604,8 @@ fn inline_multi_block_call(
     let mut cont_params = callee.results.clone();
     cont_params.extend(cap_types.iter().copied());
     blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: cont_params,
         insts: cont_insts,
         term: cont_term,
@@ -669,8 +680,7 @@ pub fn inline_calls_with(m: &Module, limits: InlineLimits) -> Module {
                     // Callee has internal control flow: splice its CFG in, threading captured values
                     // through. The block now ends at the call; the rest of it moved to the appended
                     // continuation.
-                    let block_types =
-                        block_value_types(&funcs[ci].blocks[bi], &funcs, types, has_memory);
+                    let block_types = block_value_types(&funcs[ci], bi, &funcs, types, has_memory);
                     let callee_fn = funcs[callee].clone();
                     inline_multi_block_call(
                         &mut funcs[ci].blocks,
@@ -752,6 +762,8 @@ fn substitute_params(entry: &Block, subs: &[(usize, Known)]) -> Block {
     let mut term = entry.term.clone();
     map_term_operands(&mut term, &mut |o| remap(o));
     Block {
+        parent: 0,
+        captures: vec![],
         params: entry.params.clone(),
         insts,
         term,

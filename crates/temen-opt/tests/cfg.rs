@@ -7,6 +7,8 @@ use temen_opt::cfg::{successors, Cfg};
 
 fn blk(term: Terminator) -> Block {
     Block {
+        parent: 0,
+        captures: vec![],
         params: vec![],
         insts: vec![],
         term,

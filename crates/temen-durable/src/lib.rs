@@ -1780,6 +1780,8 @@ fn transform_func(
 
     // ---- TRAP — br_table default / forged resume id ----
     let trap = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![],
         insts: vec![],
         term: Terminator::Unreachable,
@@ -1967,6 +1969,8 @@ impl Bb {
     }
     fn finish(self, term: Terminator) -> Block {
         Block {
+            parent: 0,
+            captures: vec![],
             params: self.params,
             insts: self.insts,
             term,

@@ -371,6 +371,8 @@ fn gen_func(g: &mut Gen, suspend: Suspend, split: bool) -> Func {
             params: vec![ValType::I32],
             results: vec![ValType::I64],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],
                 insts,
                 term: Terminator::Return(vec![acc]),
@@ -387,6 +389,8 @@ fn gen_func(g: &mut Gen, suspend: Suspend, split: bool) -> Func {
     gen_straightline(g, &mut b0, &mut i64_vals, &mut next, acc);
     acc = *i64_vals.last().unwrap();
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I32],
         insts: b0,
         term: Terminator::Br {
@@ -402,6 +406,8 @@ fn gen_func(g: &mut Gen, suspend: Suspend, split: bool) -> Func {
     let mut next = 2u32;
     let acc1 = emit_suspend_body(g, &suspend, &mut b1, &mut i64_vals, &mut next, 1);
     let body = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I32, ValType::I64],
         insts: b1,
         term: Terminator::Return(vec![acc1]),
@@ -478,6 +484,8 @@ pub fn gen_loop_module(g: &mut Gen) -> Module {
 
     // block0(v0: i32 handle): seed the accumulator + counter, enter the loop carrying the handle.
     let b0 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I32],
         insts: vec![
             Inst::ConstI64(seed), // v1 = acc
@@ -491,6 +499,8 @@ pub fn gen_loop_module(g: &mut Gen) -> Module {
 
     // block1(v0: i32, v1: i64 acc, v2: i64 i): poll-free body; back-edge to self or exit.
     let b1 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I32, ValType::I64, ValType::I64],
         insts: vec![
             Inst::ConstI64(step), // v3
@@ -526,6 +536,8 @@ pub fn gen_loop_module(g: &mut Gen) -> Module {
 
     // block2(v0: i32 handle, v1: i64 acc): the `call.cap` after the loop, folded into the result.
     let b2 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I32, ValType::I64],
         insts: vec![
             Inst::ConstI32(clock_arg), // v2 = the i32 clock arg
@@ -640,6 +652,8 @@ fn gen_fiber_func(g: &mut Gen, suspends: u32) -> Func {
         params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64, ValType::I64],
             insts,
             term: Terminator::Return(vec![ret]),
@@ -692,6 +706,8 @@ fn gen_fiber_root(g: &mut Gen, suspends: u32) -> Func {
         params: vec![],
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![],
             insts,
             term: Terminator::Return(vec![acc]),
@@ -893,6 +909,8 @@ fn gen_recycle_root(g: &mut Gen, throwaways: u32, suspends: u32) -> Func {
         params: vec![],
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![],
             insts,
             term: Terminator::Return(vec![acc]),

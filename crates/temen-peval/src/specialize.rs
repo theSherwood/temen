@@ -1393,6 +1393,8 @@ impl Spec<'_> {
                 self.write_back_cells(&mem, &mut out, &mut rnext)?;
                 let args = self.deopt_handler_args(&mut out, &mut rnext);
                 return Ok(temen_ir::Block {
+                    parent: 0,
+                    captures: vec![],
                     params,
                     insts: out,
                     term: Terminator::ReturnCall {
@@ -1463,6 +1465,8 @@ impl Spec<'_> {
         };
 
         Ok(temen_ir::Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts: out,
             term,
@@ -3430,6 +3434,8 @@ fn trap_stub(f: &Func) -> Func {
         params: f.params.clone(),
         results: f.results.clone(),
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: f.params.clone(),
             insts: Vec::new(),
             term: Terminator::Unreachable,
@@ -3486,6 +3492,8 @@ fn carry_func(f: &Func, cut: &BTreeMap<u32, u32>) -> Result<Func, SpecError> {
             other => other.clone(),
         };
         blocks.push(temen_ir::Block {
+            parent: 0,
+            captures: vec![],
             params: b.params.clone(),
             insts,
             term,

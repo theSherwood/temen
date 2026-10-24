@@ -164,6 +164,8 @@ fn with_readback(residual: &Module, read_addr: u64) -> (Module, u32) {
     let mut m = residual.clone();
     let wrapper = m.funcs.len() as u32;
     let block = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64], // x0, i0, c0
         insts: vec![
             Inst::ConstI64(read_addr as i64), // v3

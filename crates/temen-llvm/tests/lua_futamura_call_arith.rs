@@ -303,6 +303,8 @@ fn call_result_feeds_arithmetic() {
         params: vec![ValType::I64; 3],
         results: vec![],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64; 3],
             insts: vec![Inst::Call {
                 func: e,

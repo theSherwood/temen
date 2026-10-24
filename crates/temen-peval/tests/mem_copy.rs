@@ -22,6 +22,8 @@ fn tvalue_copy_module() -> Module {
         params: vec![ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64], // x = v0
             insts: vec![
                 Inst::ConstI64(16448), // v1: S (above the #1094 NULL guard)

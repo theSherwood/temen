@@ -367,6 +367,8 @@ mod tests {
                 params: vec![],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![],
                     insts,
                     term: Terminator::Return(vec![4]),

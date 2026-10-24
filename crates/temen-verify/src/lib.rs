@@ -19,6 +19,7 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use temen_ir::{Block, BlockIdx, Func, Inst, Module, Terminator, VShape, ValIdx, ValType};
@@ -31,6 +32,22 @@ pub enum VerifyError {
     EntryParamsMismatch { func: u32 },
     /// A branch/return references a block index that does not exist.
     BlockOutOfRange { func: u32, block: u32, target: u32 },
+    /// A block's dominance-certificate parent is not an earlier block (#2454), or the entry block
+    /// names one.
+    ParentNotEarlier { func: u32, block: u32, parent: u32 },
+    /// Rule 1 of the dominance certificate (#2454): an edge from `block` enters `target`, whose
+    /// parent is neither `block` nor an ancestor of it.
+    ParentNotDominating { func: u32, block: u32, target: u32 },
+    /// Rule 2 of the dominance certificate (#2454): a capture names a block that is not a proper
+    /// ancestor of the capturing block.
+    CaptureNotAncestor { func: u32, block: u32, captured: u32 },
+    /// A capture names a value its block does not have.
+    CaptureOutOfRange {
+        func: u32,
+        block: u32,
+        captured: u32,
+        value: ValIdx,
+    },
     /// An operand references a value index not yet defined in this block.
     ValueOutOfRange {
         func: u32,
@@ -475,14 +492,36 @@ fn verify_func(
         None => return Err(VerifyError::EntryParamsMismatch { func: fi }),
     }
 
-    let nblocks = f.blocks.len() as u32;
+    let tree = Tree::new(fi, f)?;
     // Per-function result arity, for `Inst::result_count` (used to trace a `gc.roots` constant mask
     // through the block's value numbering).
     let fn_results: Vec<usize> = funcs.iter().map(|f| f.results.len()).collect();
+    // Every checked block's value types, for the captures of the blocks after it.
+    let mut block_types: Vec<Vec<ValType>> = Vec::with_capacity(f.blocks.len());
     for (bi, b) in f.blocks.iter().enumerate() {
         let bi = bi as u32;
-        // Seed the local type vector with the block's declared parameter types.
+        // Seed the local type vector with the block's declared parameter types, then its captures'.
         let mut types: Vec<ValType> = b.params.clone();
+        for &(a, v) in &b.captures {
+            // Rule 2: a capture names a proper ancestor, which dominates this block by rule 1. An
+            // ancestor comes before its descendants, so its types are already checked.
+            if bi == 0 || !tree.is_ancestor(a, b.parent) {
+                return Err(VerifyError::CaptureNotAncestor {
+                    func: fi,
+                    block: bi,
+                    captured: a,
+                });
+            }
+            let t = block_types[a as usize].get(v as usize).copied().ok_or(
+                VerifyError::CaptureOutOfRange {
+                    func: fi,
+                    block: bi,
+                    captured: a,
+                    value: v,
+                },
+            )?;
+            types.push(t);
+        }
 
         for inst in &b.insts {
             // §GC security: a constant `gc.roots` payload mask may only clear the top byte — a
@@ -528,13 +567,62 @@ fn verify_func(
             );
         }
 
-        check_terminator(fi, bi, &b.term, &types, type_section, nblocks, f, funcs)?;
+        check_terminator(fi, bi, &b.term, &types, type_section, &tree, f, funcs)?;
+        block_types.push(types);
     }
     Ok(())
 }
 
-/// Per-block SSA value **types** for a function: each block's declared params followed by every
-/// instruction's result type(s) — exactly the assignment [`verify_func`] performs while checking.
+/// A function's dominance certificate (#2454, DESIGN.md §3a), numbered so that "is `a` an
+/// ancestor of `b`" costs O(1): each block's pre-order position and subtree size. Building it is two
+/// linear loops, and needs no recursion, because every parent comes before its children.
+struct Tree {
+    pre: Vec<u32>,
+    size: Vec<u32>,
+}
+
+impl Tree {
+    /// Check that the entry names no parent and every other block an earlier one, then number the
+    /// tree.
+    fn new(fi: u32, f: &Func) -> Result<Tree, VerifyError> {
+        let n = f.blocks.len();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            if b.parent as usize >= bi.max(1) {
+                return Err(VerifyError::ParentNotEarlier {
+                    func: fi,
+                    block: bi as u32,
+                    parent: b.parent,
+                });
+            }
+        }
+        let mut size = vec![1u32; n];
+        for b in (1..n).rev() {
+            size[f.blocks[b].parent as usize] += size[b];
+        }
+        // A block's children take consecutive runs of positions after its own, in index order.
+        let mut pre = vec![0u32; n];
+        let mut next = vec![1u32; n];
+        for b in 1..n {
+            let p = f.blocks[b].parent as usize;
+            pre[b] = next[p];
+            next[p] += size[b];
+            next[b] = pre[b] + 1;
+        }
+        Ok(Tree { pre, size })
+    }
+
+    /// Whether `a` is `b` or an ancestor of `b`.
+    fn is_ancestor(&self, a: BlockIdx, b: BlockIdx) -> bool {
+        match (self.pre.get(a as usize), self.pre.get(b as usize)) {
+            (Some(&pa), Some(&pb)) => pa <= pb && pb < pa + self.size[a as usize],
+            _ => false,
+        }
+    }
+}
+
+/// Per-block SSA value **types** for a function: each block's declared params, its captures' types,
+/// then every instruction's result type(s) — exactly the assignment [`verify_func`] performs while
+/// checking.
 /// Indexing `func_value_types(..)[block][value_idx]` gives the type of block-local value
 /// `value_idx`, which the interpreter's debugger uses to reconstruct a typed value from its
 /// (untyped) storage slot. Assumes `f` is **verified**: it derives every value's type from the
@@ -548,22 +636,46 @@ pub fn func_value_types(
     type_section: &[temen_ir::TypeEntry],
     has_memory: bool,
 ) -> Vec<Vec<ValType>> {
-    f.blocks
-        .iter()
-        .map(|b| block_value_types(b, funcs, type_section, has_memory))
-        .collect()
+    let mut out: Vec<Vec<ValType>> = Vec::with_capacity(f.blocks.len());
+    for b in &f.blocks {
+        // A capture has its ancestor's value's type; an ancestor comes first, so it is typed.
+        let mut types = b.params.clone();
+        types.extend(b.captures.iter().filter_map(|&(a, v)| {
+            out.get(a as usize)
+                .and_then(|t: &Vec<ValType>| t.get(v as usize))
+                .copied()
+        }));
+        out.push(type_insts(b, types, funcs, type_section, has_memory));
+    }
+    out
 }
 
-/// [`func_value_types`] for one block: its params, then every instruction's result type(s). For a
-/// caller that needs one block's types, without paying for the whole function's (temen-opt's inliner
-/// types the block it splits, once per splice).
+/// [`func_value_types`] for one block of `f`: its params, its captures', then every instruction's
+/// result type(s). For a caller that needs one block's types, without paying for the whole
+/// function's (temen-opt's inliner types the block it splits, once per splice), unless the block
+/// captures: a capture's type is its ancestor's.
 pub fn block_value_types(
-    b: &Block,
+    f: &Func,
+    bi: usize,
     funcs: &[Func],
     type_section: &[temen_ir::TypeEntry],
     has_memory: bool,
 ) -> Vec<ValType> {
-    let mut types: Vec<ValType> = b.params.clone();
+    let b = &f.blocks[bi];
+    if !b.captures.is_empty() {
+        return func_value_types(f, funcs, type_section, has_memory).swap_remove(bi);
+    }
+    type_insts(b, b.params.clone(), funcs, type_section, has_memory)
+}
+
+/// Extend a block's types (`types`: its params' and captures') with its instructions' results.
+fn type_insts(
+    b: &Block,
+    mut types: Vec<ValType>,
+    funcs: &[Func],
+    type_section: &[temen_ir::TypeEntry],
+    has_memory: bool,
+) -> Vec<ValType> {
     for inst in &b.insts {
         // The typing-only walk shares the one [`type_inst`] dispatch with `check = false`: operand
         // and structural checks short-circuit, so it derives result types from an unverified function
@@ -631,17 +743,18 @@ fn row_or_none(ft: Option<&temen_ir::FuncType>) -> InstResults<'_> {
 /// result type to append (`None` for `Store`). Operands must reference
 /// strictly-earlier indices.
 /// The constant `i64` an operand resolves to, if it's defined by an `i64.const` **earlier in this
-/// block** (the only place a value can be defined in this block-param SSA — see `verify_func`).
-/// Returns `None` for a block parameter or any non-constant definition. Mirrors the value
-/// numbering of `verify_func`: params occupy `0..params.len()`, then each instruction owns its
-/// `result_count` consecutive indices.
+/// block**. Returns `None` for a block parameter, a capture (a constant another block defines is
+/// not traced: every engine checks a mask it cannot see as a constant at run time), or any
+/// non-constant definition. Mirrors the value
+/// numbering of `verify_func`: params and captures occupy `0..inputs()`, then each instruction owns
+/// its `result_count` consecutive indices.
 fn const_i64_in_block(
     b: &temen_ir::Block,
     fn_results: &[usize],
     type_section: &[temen_ir::TypeEntry],
     v: ValIdx,
 ) -> Option<i64> {
-    let mut idx = b.params.len() as u32;
+    let mut idx = b.inputs() as u32;
     for inst in &b.insts {
         let n = inst.result_count(fn_results, type_section) as u32;
         if v >= idx && v < idx + n {
@@ -1569,7 +1682,7 @@ fn check_terminator(
     term: &Terminator,
     types: &[ValType],
     type_section: &[temen_ir::TypeEntry],
-    nblocks: u32,
+    tree: &Tree,
     f: &Func,
     funcs: &[Func],
 ) -> Result<(), VerifyError> {
@@ -1581,7 +1694,7 @@ fn check_terminator(
     };
     match term {
         Terminator::Br { target, args } => {
-            check_edge(&cx, *target, args, nblocks, f)?;
+            check_edge(&cx, *target, args, tree, f)?;
         }
         Terminator::BrIf {
             cond,
@@ -1591,8 +1704,8 @@ fn check_terminator(
             else_args,
         } => {
             cx.expect(*cond, ValType::I32)?;
-            check_edge(&cx, *then_blk, then_args, nblocks, f)?;
-            check_edge(&cx, *else_blk, else_args, nblocks, f)?;
+            check_edge(&cx, *then_blk, then_args, tree, f)?;
+            check_edge(&cx, *else_blk, else_args, tree, f)?;
         }
         Terminator::BrTable {
             idx,
@@ -1601,10 +1714,10 @@ fn check_terminator(
         } => {
             cx.expect(*idx, ValType::I32)?;
             for (t, args) in targets {
-                check_edge(&cx, *t, args, nblocks, f)?;
+                check_edge(&cx, *t, args, tree, f)?;
             }
             let (t, args) = default;
-            check_edge(&cx, *t, args, nblocks, f)?;
+            check_edge(&cx, *t, args, tree, f)?;
         }
         Terminator::Return(vals) => {
             if vals.len() != f.results.len() {
@@ -1669,23 +1782,32 @@ fn check_tail_call(
     Ok(())
 }
 
-/// Check a single branch edge: target in range, arg count + types match the target
-/// block's declared parameters exactly.
+/// Check a single branch edge: target in range, its parent this block or an ancestor of it (rule 1
+/// of the dominance certificate, #2454, which makes every ancestor of a block dominate it), and arg
+/// count + types match the target block's declared parameters exactly.
 fn check_edge(
     cx: &Cx,
     target: BlockIdx,
     args: &[ValIdx],
-    nblocks: u32,
+    tree: &Tree,
     f: &Func,
 ) -> Result<(), VerifyError> {
-    if target >= nblocks {
+    let Some(t) = f.blocks.get(target as usize) else {
         return Err(VerifyError::BlockOutOfRange {
             func: cx.fi,
             block: cx.bi,
             target,
         });
+    };
+    // The entry has no parent: whatever re-enters it, it is still the root of every path.
+    if target != 0 && !tree.is_ancestor(t.parent, cx.bi) {
+        return Err(VerifyError::ParentNotDominating {
+            func: cx.fi,
+            block: cx.bi,
+            target,
+        });
     }
-    let target_params = &f.blocks[target as usize].params;
+    let target_params = &t.params;
     if args.len() != target_params.len() {
         return Err(VerifyError::ArgCountMismatch {
             func: cx.fi,

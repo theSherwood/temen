@@ -75,6 +75,8 @@ fn loop_module(body: Inst) -> Module {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32, ValType::I32], // n, a, b
                 insts: vec![Inst::ConstI32(0)],                         // v3 = acc0
                 term: Terminator::Br {
@@ -83,6 +85,8 @@ fn loop_module(body: Inst) -> Module {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32], // i, acc, a', b'
                 insts: vec![
                     body,                  // v4 = body(...)
@@ -99,6 +103,8 @@ fn loop_module(body: Inst) -> Module {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // r
                 insts: vec![],
                 term: Terminator::Return(vec![0]),
@@ -185,6 +191,8 @@ fn an_invariant_op_over_a_constant_is_still_hoisted() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32], // n, a
                 insts: vec![Inst::ConstI32(0)],           // v2 = acc0
                 term: Terminator::Br {
@@ -193,6 +201,8 @@ fn an_invariant_op_over_a_constant_is_still_hoisted() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32, ValType::I32], // i, acc, a'
                 insts: vec![
                     Inst::ConstI32(100),   // v3 = k (loop-body constant)
@@ -210,6 +220,8 @@ fn an_invariant_op_over_a_constant_is_still_hoisted() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // r
                 insts: vec![],
                 term: Terminator::Return(vec![0]),

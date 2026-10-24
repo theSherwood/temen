@@ -349,6 +349,8 @@ fn guarded_stitch_takes_the_right_arm() {
             params: vec![],
             results: vec![],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![],
                 term: Terminator::Return(vec![]),
@@ -430,6 +432,8 @@ fn guarded_stitch_takes_the_right_arm() {
         results: vec![],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![
                     Inst::ConstI64(cf as i64),
@@ -455,6 +459,8 @@ fn guarded_stitch_takes_the_right_arm() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![],
                 term: Terminator::ReturnCall {
@@ -463,6 +469,8 @@ fn guarded_stitch_takes_the_right_arm() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![
                     Inst::ConstI64(sp),
@@ -481,6 +489,8 @@ fn guarded_stitch_takes_the_right_arm() {
         params: params.clone(),
         results: vec![],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts: vec![],
             term: Terminator::Return(vec![]),
@@ -490,6 +500,8 @@ fn guarded_stitch_takes_the_right_arm() {
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         results: vec![],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64, ValType::I64, ValType::I64],
             insts: vec![Inst::Call {
                 func: entry_b,

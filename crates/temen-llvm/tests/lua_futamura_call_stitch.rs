@@ -355,6 +355,8 @@ fn two_residuals_stitched_at_the_call_boundary() {
         params: vec![],
         results: vec![],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![],
             insts: vec![],
             term: Terminator::Return(vec![]),
@@ -436,6 +438,8 @@ fn two_residuals_stitched_at_the_call_boundary() {
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         results: vec![],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64, ValType::I64, ValType::I64],
             insts: vec![Inst::Call {
                 func: entry_b,

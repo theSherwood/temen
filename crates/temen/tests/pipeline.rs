@@ -541,6 +541,8 @@ fn verifier_rejects_forward_value_reference() {
             params: vec![],
             results: vec![ValType::I32],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![Inst::IntBin {
                     ty: IntTy::I32,
@@ -578,6 +580,8 @@ fn verifier_rejects_bad_branch_target() {
             params: vec![],
             results: vec![ValType::I32],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![Inst::ConstI32(1)],
                 term: Terminator::Br {
@@ -613,6 +617,8 @@ fn verifier_rejects_entry_param_mismatch() {
             params: vec![ValType::I32],
             results: vec![],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![], // entry params must equal func params
                 insts: vec![],
                 term: Terminator::Return(vec![]),
@@ -1116,6 +1122,8 @@ fn verifier_rejects_call_to_missing_function() {
             params: vec![ValType::I32],
             results: vec![ValType::I32],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],
                 insts: vec![Inst::Call {
                     func: 9, // does not exist

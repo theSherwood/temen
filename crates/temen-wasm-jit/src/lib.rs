@@ -2037,6 +2037,8 @@ pub fn outline_cap_calls(m: &mut Module) {
                     let ret: Vec<u32> = (nparams..nparams + ft.results.len() as u32).collect();
                     let results = ft.results.clone();
                     let block = Block {
+                        parent: 0,
+                        captures: vec![],
                         params: params.clone(),
                         insts: vec![Inst::CapCall {
                             type_id: *type_id,
@@ -2077,6 +2079,8 @@ pub fn outline_cap_calls(m: &mut Module) {
                     let ret: Vec<u32> = (nparams..nparams + ft.results.len() as u32).collect();
                     let results = ft.results.clone();
                     let block = Block {
+                        parent: 0,
+                        captures: vec![],
                         params: params.clone(),
                         insts: vec![Inst::CallImport {
                             import: *import,
@@ -2116,6 +2120,8 @@ pub fn outline_cap_calls(m: &mut Module) {
                     let ret: Vec<u32> = (nparams..nparams + ft.results.len() as u32).collect();
                     let results = ft.results.clone();
                     let block = Block {
+                        parent: 0,
+                        captures: vec![],
                         params: params.clone(),
                         insts: vec![Inst::CallSym {
                             import: *import,
@@ -2142,6 +2148,8 @@ pub fn outline_cap_calls(m: &mut Module) {
                     let g = base + wrappers.len() as u32;
                     let nparams = params.len() as u32;
                     let block = Block {
+                        parent: 0,
+                        captures: vec![],
                         params: params.clone(),
                         insts: vec![op],
                         term: Terminator::Return(vec![nparams]),
@@ -7128,6 +7136,8 @@ mod emit_cap_tests {
                 params: vec![],
                 results: vec![],
                 blocks: vec![temen_ir::Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![],
                     insts: (0..64).map(|_| Inst::ConstI64(1)).collect(),
                     term: Terminator::Return(vec![]),

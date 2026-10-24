@@ -353,6 +353,8 @@ fn split_site(
         }
     };
     f.blocks[bi] = Block {
+        parent: 0,
+        captures: vec![],
         params: b_params,
         insts: head_insts,
         term: head_term,
@@ -384,6 +386,8 @@ fn split_site(
             let mut params = live_types.clone();
             params.push(ValType::I32); // m
             new_blocks.push(Block {
+                parent: 0,
+                captures: vec![],
                 params,
                 insts,
                 term: Terminator::BrIf {
@@ -439,6 +443,8 @@ fn split_site(
             }
         };
         new_blocks.push(Block {
+            parent: 0,
+            captures: vec![],
             params: live_types.clone(),
             insts,
             term,
@@ -448,6 +454,8 @@ fn split_site(
     // --- default: no matching signature at the selected slot ⇒ the source's IndirectCallType trap
     // (raised here as `unreachable`; see the module-level trap-kind note). ---
     new_blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: Vec::new(),
         insts: Vec::new(),
         term: Terminator::Unreachable,
@@ -466,6 +474,8 @@ fn split_site(
         let mut cont_params = live_types;
         cont_params.extend_from_slice(&ty.results);
         new_blocks.push(Block {
+            parent: 0,
+            captures: vec![],
             params: cont_params,
             insts: cont_insts,
             term: cont_term,

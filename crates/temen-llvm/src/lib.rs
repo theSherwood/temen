@@ -3963,6 +3963,8 @@ fn synth_dispatcher(key: &DispatchKey, arms: &[DispatchArm], site_ty: u32) -> Fu
     let mut blocks: Vec<Block> = Vec::new();
     for (k, arm) in arms.iter().enumerate() {
         blocks.push(Block {
+            parent: 0,
+            captures: vec![],
             params: params.clone(),
             insts: vec![
                 Inst::RefFunc { func: arm.func },
@@ -4061,6 +4063,8 @@ fn synth_dispatcher(key: &DispatchKey, arms: &[DispatchArm], site_ty: u32) -> Fu
             vec![v]
         };
         blocks.push(Block {
+            parent: 0,
+            captures: vec![],
             params: params.clone(),
             insts,
             term: Terminator::Return(ret),
@@ -4140,6 +4144,8 @@ fn synth_dispatcher(key: &DispatchKey, arms: &[DispatchArm], site_ty: u32) -> Fu
             _ => vec![callv], // unreachable by the int-only arm filter
         };
         blocks.push(Block {
+            parent: 0,
+            captures: vec![],
             params: params.clone(),
             insts,
             term: Terminator::Return(ret),
@@ -4840,6 +4846,8 @@ fn synth_start(
     Func {
         results,
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: params.clone(),
             insts,
             term,
@@ -4962,6 +4970,8 @@ fn synth_start_argv(
     insts.push(Inst::ConstI64(0)); // i = 0
     let v_i0 = next;
     let b0 = Block {
+        parent: 0,
+        captures: vec![],
         params: params.clone(),
         insts,
         term: Terminator::Br {
@@ -4972,6 +4982,8 @@ fn synth_start_argv(
 
     // ---- block 1: loop_head(argc=0, i=1, p=2) — continue while i <u argc, else finish. ----
     let b1 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         insts: vec![Inst::IntCmp {
             ty: IntTy::I64,
@@ -4992,6 +5004,8 @@ fn synth_start_argv(
 
     // ---- block 2: body(argc=0, i=1, p=2) — argv[i] = p, then scan p to its NUL. ----
     let b2 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             Inst::ConstI64(entry_sp as i64), // v3 = argv base
@@ -5008,6 +5022,8 @@ fn synth_start_argv(
 
     // ---- block 3: scan(argc=0, i=1, p=2, q=3) — advance q to the byte past the NUL. ----
     let b3 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             Inst::Load {
@@ -5036,6 +5052,8 @@ fn synth_start_argv(
 
     // ---- block 4: next(argc=0, i=1, p_next=2) — i++ and loop. ----
     let b4 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             Inst::ConstI64(1), // v3
@@ -5106,6 +5124,8 @@ fn synth_start_argv(
             Terminator::Return(vec![15])
         };
         let b5 = Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64],
             insts: d,
             term,
@@ -5135,6 +5155,8 @@ fn synth_start_argv(
 
     // ---- block 5: argv_done(argc=0, p=1) — terminate argv[], compute envp_base, load envc, loop. ----
     let b5 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64], // argc, p (= &first env string)
         insts: vec![
             Inst::ConstI64(entry_sp as i64), // v2 = argv base
@@ -5163,6 +5185,8 @@ fn synth_start_argv(
 
     // ---- block 6: env_head(envc=0, j=1, q=2, envp_base=3) — continue while j <u envc, else done. ----
     let b6 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64],
         insts: vec![Inst::IntCmp {
             ty: IntTy::I64,
@@ -5181,6 +5205,8 @@ fn synth_start_argv(
 
     // ---- block 7: env_body(envc=0, j=1, q=2, envp_base=3) — envp[j] = q, then scan q. ----
     let b7 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             Inst::ConstI64(8), // v4
@@ -5196,6 +5222,8 @@ fn synth_start_argv(
 
     // ---- block 8: env_scan(envc=0, j=1, q=2, envp_base=3, r=4) — advance r to the byte past NUL. ----
     let b8 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![
             ValType::I64,
             ValType::I64,
@@ -5230,6 +5258,8 @@ fn synth_start_argv(
 
     // ---- block 9: env_next(envc=0, j=1, q_next=2, envp_base=3) — j++ and loop. ----
     let b9 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             Inst::ConstI64(1), // v4
@@ -5295,6 +5325,8 @@ fn synth_start_argv(
         Terminator::Return(vec![17])
     };
     let b10 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64],
         insts: e,
         term,
@@ -5356,6 +5388,8 @@ fn synth_sbrk(vm_map_import: u32, stack_page: u64, scratch: u64, map_sig: u32) -
 
     // entry(inc=0)
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64],
         insts: vec![
             Inst::ConstI64(brk_addr), // v1
@@ -5381,6 +5415,8 @@ fn synth_sbrk(vm_map_import: u32, stack_page: u64, scratch: u64, map_sig: u32) -
 
     // grow(brk=0, new=1, top=2): commit [top, page_up(new)).
     let grow = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             Inst::ConstI64(page - 1),    // v3
@@ -5414,6 +5450,8 @@ fn synth_sbrk(vm_map_import: u32, stack_page: u64, scratch: u64, map_sig: u32) -
 
     // commit(brk=0, new=1, top=2)
     let commit = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             Inst::ConstI64(top_addr), // v3
@@ -5425,6 +5463,8 @@ fn synth_sbrk(vm_map_import: u32, stack_page: u64, scratch: u64, map_sig: u32) -
     };
 
     let fail = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![],
         insts: vec![Inst::ConstI64(-1)], // v0 = MFAIL
         term: Terminator::Return(vec![0]),
@@ -5882,6 +5922,8 @@ fn synth_eh_destroy(dtor_sig: u32) -> Func {
     let params = vec![ValType::I64, ValType::I64, ValType::I64];
     // block0(sp=0, exn=1, dtor=2): have = dtor != 0; br_if have call(sp,exn,dtor) done()
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: params.clone(),
         insts: vec![
             Inst::ConstI64(0), // v3
@@ -5903,6 +5945,8 @@ fn synth_eh_destroy(dtor_sig: u32) -> Func {
     // call(sp=0, exn=1, dtor=2): the destructor's funcref index is the low 32 bits of `dtor`; call it
     // `dtor(sp, exn)` (void — the `(data-SP, this)` calling convention), then return.
     let call = Block {
+        parent: 0,
+        captures: vec![],
         params: params.clone(),
         insts: vec![
             Inst::Convert {
@@ -5918,6 +5962,8 @@ fn synth_eh_destroy(dtor_sig: u32) -> Func {
         term: Terminator::Return(vec![]),
     };
     let done = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![],
         insts: vec![],
         term: Terminator::Return(vec![]),
@@ -5938,6 +5984,8 @@ fn synth_eh_destroy(dtor_sig: u32) -> Func {
 fn synth_eh_unwind() -> Func {
     // block0(base=0): k = *(base+EH_HSP_O); if k == 0 -> terminate() else unwind(hsp_addr, k, base)
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64],
         insts: vec![
             Inst::ConstI64(EH_HSP_O as i64), // v1
@@ -5970,12 +6018,16 @@ fn synth_eh_unwind() -> Func {
     };
     // terminate(): an uncaught exception — trap (the on-ramp's `unreachable` is the clean fault).
     let terminate = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![],
         insts: vec![],
         term: Terminator::Unreachable,
     };
     // unwind(hsp_addr=0, k=1, base=2): *(hsp_addr) = k-1; longjmp(base+EH_BUFS_O + (k-1)*EH_SLOT, 1).
     let unwind = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             Inst::ConstI64(1), // v3
@@ -6030,6 +6082,8 @@ fn synth_memcpy() -> Func {
     let params = vec![ValType::I64, ValType::I64, ValType::I64];
     // block0(dst=0, src=1, len=2): i = 0; br loop(dst, src, len, i)
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: params.clone(),
         insts: vec![Inst::ConstI64(0)],
         term: Terminator::Br {
@@ -6040,6 +6094,8 @@ fn synth_memcpy() -> Func {
     let loop_params = vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64];
     // loop(dst=0, src=1, len=2, i=3): cond = i <u len; br_if cond body done
     let test = Block {
+        parent: 0,
+        captures: vec![],
         params: loop_params.clone(),
         insts: vec![Inst::IntCmp {
             ty: IntTy::I64,
@@ -6057,6 +6113,8 @@ fn synth_memcpy() -> Func {
     };
     // body(dst=0, src=1, len=2, i=3): dst[i] = src[i]; br loop(dst, src, len, i+1)
     let body = Block {
+        parent: 0,
+        captures: vec![],
         params: loop_params,
         insts: vec![
             Inst::IntBin {
@@ -6096,6 +6154,8 @@ fn synth_memcpy() -> Func {
         },
     };
     let done = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![],
         insts: vec![],
         term: Terminator::Return(vec![]),
@@ -6118,6 +6178,8 @@ fn synth_memcmp() -> Func {
     let params = vec![ValType::I64, ValType::I64, ValType::I64]; // a, b, len
                                                                  // block0(a=0, b=1, len=2): i = 0; br loop(a, b, len, i)
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: params.clone(),
         insts: vec![Inst::ConstI64(0)], // v3 = i
         term: Terminator::Br {
@@ -6128,6 +6190,8 @@ fn synth_memcmp() -> Func {
     let loop_params = vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64]; // a, b, len, i
                                                                                     // loop(a=0, b=1, len=2, i=3): cond = i <u len; br_if cond → body, else → equal
     let test = Block {
+        parent: 0,
+        captures: vec![],
         params: loop_params.clone(),
         insts: vec![Inst::IntCmp {
             ty: IntTy::I64,
@@ -6145,6 +6209,8 @@ fn synth_memcmp() -> Func {
     };
     // body(a=0, b=1, len=2, i=3): av = a[i]; bv = b[i]; if av != bv → diff(av,bv) else loop(.., i+1)
     let body = Block {
+        parent: 0,
+        captures: vec![],
         params: loop_params,
         insts: vec![
             Inst::IntBin {
@@ -6193,6 +6259,8 @@ fn synth_memcmp() -> Func {
     };
     // diff(av=0, bv=1): return av - bv (signed i32 difference of two unsigned bytes).
     let diff = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I32, ValType::I32],
         insts: vec![Inst::IntBin {
             ty: IntTy::I32,
@@ -6204,6 +6272,8 @@ fn synth_memcmp() -> Func {
     };
     // equal(): all bytes matched → 0.
     let equal = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![],
         insts: vec![Inst::ConstI32(0)], // v0
         term: Terminator::Return(vec![0]),
@@ -6229,6 +6299,8 @@ fn synth_memchr() -> Func {
     use temen_ir::LoadOp;
     let params = vec![ValType::I64, ValType::I32, ValType::I64]; // s, c, n (matches the call ABI)
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: params.clone(),
         insts: vec![Inst::IntBin {
             ty: IntTy::I64,
@@ -6243,6 +6315,8 @@ fn synth_memchr() -> Func {
     };
     let loop_params = vec![ValType::I64, ValType::I64, ValType::I32]; // cur, end, c
     let test = Block {
+        parent: 0,
+        captures: vec![],
         params: loop_params.clone(),
         insts: vec![Inst::IntCmp {
             ty: IntTy::I64,
@@ -6259,6 +6333,8 @@ fn synth_memchr() -> Func {
         },
     };
     let body = Block {
+        parent: 0,
+        captures: vec![],
         params: loop_params,
         insts: vec![
             Inst::Load {
@@ -6296,11 +6372,15 @@ fn synth_memchr() -> Func {
         },
     };
     let found = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64], // p
         insts: vec![],
         term: Terminator::Return(vec![0]),
     };
     let notfound = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![],
         insts: vec![Inst::ConstI64(0)], // v0
         term: Terminator::Return(vec![0]),
@@ -6328,6 +6408,8 @@ fn synth_utoa() -> Func {
     use temen_ir::StoreOp;
     let params = vec![ValType::I64, ValType::I64, ValType::I64]; // value, base, bufend
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: params.clone(),
         insts: vec![],
         term: Terminator::Br {
@@ -6343,6 +6425,8 @@ fn synth_utoa() -> Func {
         b,
     };
     let lp = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             i64bin(BinOp::RemU, 0, 1), // v3 = value % base
@@ -6403,6 +6487,8 @@ fn synth_utoa() -> Func {
         },
     };
     let done = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64], // start
         insts: vec![],
         term: Terminator::Return(vec![0]),
@@ -6525,6 +6611,8 @@ fn synth_udivmod128() -> Func {
     };
     // done(qlo, qhi, rlo, rhi): return the pair-of-pairs.
     let done = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t; 4],
         insts: vec![],
         term: Terminator::Return(vec![0, 1, 2, 3]),
@@ -6549,6 +6637,8 @@ fn synth_strlen() -> Func {
     use temen_ir::LoadOp;
     let params = vec![ValType::I64]; // p
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: params.clone(),
         insts: vec![],
         term: Terminator::Br {
@@ -6557,6 +6647,8 @@ fn synth_strlen() -> Func {
         },
     };
     let lp = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64], // cur, start
         insts: vec![
             Inst::Load {
@@ -6594,6 +6686,8 @@ fn synth_strlen() -> Func {
         },
     };
     let done = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64], // len
         insts: vec![],
         term: Terminator::Return(vec![0]),
@@ -6613,6 +6707,8 @@ fn synth_strcmp() -> Func {
     use temen_ir::LoadOp;
     let params = vec![ValType::I64, ValType::I64]; // a, b
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: params.clone(),
         insts: vec![],
         term: Terminator::Br {
@@ -6621,6 +6717,8 @@ fn synth_strcmp() -> Func {
         },
     };
     let lp = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64], // pa, pb
         insts: vec![
             Inst::Load {
@@ -6681,6 +6779,8 @@ fn synth_strcmp() -> Func {
         },
     };
     let done = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I32], // diff
         insts: vec![],
         term: Terminator::Return(vec![0]),
@@ -6700,6 +6800,8 @@ fn synth_strncmp() -> Func {
     use temen_ir::LoadOp;
     let params = vec![ValType::I64, ValType::I64, ValType::I64]; // a, b, n
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: params.clone(),
         insts: vec![Inst::ConstI64(0)], // v3 = i = 0
         term: Terminator::Br {
@@ -6710,6 +6812,8 @@ fn synth_strncmp() -> Func {
     // loop(a=0, b=1, n=2, i=3): while i < n
     let loop_params = vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64];
     let test = Block {
+        parent: 0,
+        captures: vec![],
         params: loop_params.clone(),
         insts: vec![Inst::IntCmp {
             ty: IntTy::I64,
@@ -6726,6 +6830,8 @@ fn synth_strncmp() -> Func {
         },
     };
     let body = Block {
+        parent: 0,
+        captures: vec![],
         params: loop_params,
         insts: vec![
             Inst::IntBin {
@@ -6792,11 +6898,15 @@ fn synth_strncmp() -> Func {
         },
     };
     let retz = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![],
         insts: vec![Inst::ConstI32(0)],
         term: Terminator::Return(vec![0]),
     };
     let done = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I32],
         insts: vec![],
         term: Terminator::Return(vec![0]),
@@ -6815,6 +6925,8 @@ fn synth_strchr() -> Func {
     use temen_ir::LoadOp;
     let params = vec![ValType::I64, ValType::I32]; // s, c
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: params.clone(),
         insts: vec![
             Inst::ConstI32(255), // v2
@@ -6831,6 +6943,8 @@ fn synth_strchr() -> Func {
         },
     };
     let lp = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I32], // p, cc
         insts: vec![
             Inst::Load {
@@ -6874,6 +6988,8 @@ fn synth_strchr() -> Func {
         },
     };
     let finish = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I32, ValType::I32], // p, cc, ch
         insts: vec![
             Inst::IntCmp {
@@ -6904,6 +7020,8 @@ fn synth_strcpy() -> Func {
     use temen_ir::{LoadOp, StoreOp};
     let params = vec![ValType::I64, ValType::I64]; // dst, src
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: params.clone(),
         insts: vec![],
         term: Terminator::Br {
@@ -6912,6 +7030,8 @@ fn synth_strcpy() -> Func {
         },
     };
     let lp = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64], // d, s, orig
         insts: vec![
             Inst::Load {
@@ -6955,6 +7075,8 @@ fn synth_strcpy() -> Func {
         },
     };
     let done = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64], // orig
         insts: vec![],
         term: Terminator::Return(vec![0]),
@@ -6979,6 +7101,8 @@ fn synth_strspn() -> Func {
     let params = vec![ValType::I64, ValType::I64]; // s, set
                                                    // block0 entry(s=0, set=1): outer(p=s, set, s0=s)
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: params.clone(),
         insts: vec![],
         term: Terminator::Br {
@@ -6988,6 +7112,8 @@ fn synth_strspn() -> Func {
     };
     // block1 outer(p=0, set=1, s0=2)
     let outer = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             l8(0),             // v3 = cp = *p
@@ -7009,6 +7135,8 @@ fn synth_strspn() -> Func {
     };
     // block2 inner(q=0, cp=1, p=2, set=3, s0=4)
     let inner = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![
             ValType::I64,
             ValType::I32,
@@ -7055,6 +7183,8 @@ fn synth_strspn() -> Func {
     };
     // block3 inner_done(cq=0, cp=1, p=2, set=3, s0=4)
     let inner_done = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![
             ValType::I32,
             ValType::I32,
@@ -7087,6 +7217,8 @@ fn synth_strspn() -> Func {
     };
     // block4 done(p=0, s0=1)
     let done = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64],
         insts: vec![Inst::IntBin {
             ty: IntTy::I64,
@@ -7116,6 +7248,8 @@ fn synth_strcspn() -> Func {
     let params = vec![ValType::I64, ValType::I64]; // s, set
                                                    // block0 entry(s=0, set=1): outer(p=s, set, s0=s)
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: params.clone(),
         insts: vec![],
         term: Terminator::Br {
@@ -7125,6 +7259,8 @@ fn synth_strcspn() -> Func {
     };
     // block1 outer(p=0, set=1, s0=2)
     let outer = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             l8(0),             // v3 = cp = *p
@@ -7146,6 +7282,8 @@ fn synth_strcspn() -> Func {
     };
     // block2 inner(q=0, cp=1, p=2, set=3, s0=4)
     let inner = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![
             ValType::I64,
             ValType::I32,
@@ -7193,6 +7331,8 @@ fn synth_strcspn() -> Func {
     // block3 inner_done(cq=0, cp=1, p=2, set=3, s0=4) — the inversion vs `strspn`: a match means
     // `cp` IS in `set`, which for strCspn ENDS the run; no match continues the outer scan.
     let inner_done = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![
             ValType::I32,
             ValType::I32,
@@ -7225,6 +7365,8 @@ fn synth_strcspn() -> Func {
     };
     // block4 done(p=0, s0=1)
     let done = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64],
         insts: vec![Inst::IntBin {
             ty: IntTy::I64,
@@ -7254,6 +7396,8 @@ fn synth_strrchr() -> Func {
     let params = vec![ValType::I64, ValType::I32]; // s, c
                                                    // block0 entry(s=0, c=1): loop(p=s, c8=c&255, best=NULL)
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: params.clone(),
         insts: vec![
             Inst::ConstI32(255), // v2
@@ -7272,6 +7416,8 @@ fn synth_strrchr() -> Func {
     };
     // block1 loop(p=0, c8=1, best=2)
     let scan = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I32, ValType::I64],
         insts: vec![
             l8(0), // v3 = cp = *p
@@ -7311,6 +7457,8 @@ fn synth_strrchr() -> Func {
     };
     // block2 done(best=0)
     let done = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64],
         insts: vec![],
         term: Terminator::Return(vec![0]),
@@ -7334,6 +7482,8 @@ fn synth_strpbrk() -> Func {
     let params = vec![ValType::I64, ValType::I64]; // s, set
                                                    // block0 entry(s=0, set=1): outer(p=s, set)
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: params.clone(),
         insts: vec![],
         term: Terminator::Br {
@@ -7343,6 +7493,8 @@ fn synth_strpbrk() -> Func {
     };
     // block1 outer(p=0, set=1)
     let outer = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64],
         insts: vec![
             l8(0),             // v2 = cp = *p
@@ -7364,6 +7516,8 @@ fn synth_strpbrk() -> Func {
     };
     // block2 inner(q=0, cp=1, p=2, set=3)
     let inner = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I32, ValType::I64, ValType::I64],
         insts: vec![
             l8(0),             // v4 = cq = *q
@@ -7404,6 +7558,8 @@ fn synth_strpbrk() -> Func {
     };
     // block3 inner_done(match=0, p=1, set=2)
     let inner_done = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I32, ValType::I64, ValType::I64],
         insts: vec![
             Inst::ConstI64(1), // v3
@@ -7424,12 +7580,16 @@ fn synth_strpbrk() -> Func {
     };
     // block4 found(p=0)
     let found = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64],
         insts: vec![],
         term: Terminator::Return(vec![0]),
     };
     // block5 retnull()
     let retnull = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![],
         insts: vec![Inst::ConstI64(0)], // v0
         term: Terminator::Return(vec![0]),
@@ -7452,6 +7612,8 @@ fn synth_trap_stub(params: Vec<ValType>, results: Vec<ValType>) -> Func {
         params: params.clone(),
         results,
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts: vec![],
             term: Terminator::Unreachable,
@@ -7468,6 +7630,8 @@ fn synth_const_i64(params: Vec<ValType>, val: i64) -> Func {
         params: params.clone(),
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts: vec![Inst::ConstI64(val)], // value index `nparams`
             term: Terminator::Return(vec![nparams]),
@@ -7496,6 +7660,8 @@ fn synth_ldexp() -> Func {
     let params = vec![ValType::F64, ValType::I32]; // x, n
                                                    // block0 entry(x=0, n=1): n>1023 → hi1; else chk_lo
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: params.clone(),
         insts: vec![
             Inst::ConstI32(1023), // v2
@@ -7516,6 +7682,8 @@ fn synth_ldexp() -> Func {
     };
     // block1 chk_lo(x=0, n=1): n < -1022 → lo1; else finish
     let chk_lo = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::F64, ValType::I32],
         insts: vec![
             Inst::ConstI32(-1022), // v2
@@ -7536,6 +7704,8 @@ fn synth_ldexp() -> Func {
     };
     // block2 hi1(x=0, n=1): y = x·2^1023; m = n-1023; m>1023 → hi2 else finish
     let hi1 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::F64, ValType::I32],
         insts: vec![
             Inst::ConstI64(TWO_P1023), // v2
@@ -7566,6 +7736,8 @@ fn synth_ldexp() -> Func {
     };
     // block3 hi2(y=0, m=1): y·2^1023; clamp m-1023 to 1023; → finish
     let hi2 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::F64, ValType::I32],
         insts: vec![
             Inst::ConstI64(TWO_P1023), // v2
@@ -7598,6 +7770,8 @@ fn synth_ldexp() -> Func {
     };
     // block4 lo1(x=0, n=1): y = x·2^-969; m = n+969; m<-1022 → lo2 else finish
     let lo1 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::F64, ValType::I32],
         insts: vec![
             Inst::ConstI64(TWO_M969), // v2
@@ -7628,6 +7802,8 @@ fn synth_ldexp() -> Func {
     };
     // block5 lo2(y=0, m=1): y·2^-969; clamp m+969 to -1022; → finish
     let lo2 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::F64, ValType::I32],
         insts: vec![
             Inst::ConstI64(TWO_M969), // v2
@@ -7660,6 +7836,8 @@ fn synth_ldexp() -> Func {
     };
     // block6 finish(y=0, m=1): return y · 2^m, 2^m built from the (0x3ff+m) exponent field
     let finish = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::F64, ValType::I32],
         insts: vec![
             Inst::ConstI32(1023), // v2
@@ -7735,6 +7913,8 @@ fn synth_frexp() -> Func {
 
     // block0 entry(x=v0:f64, eptr=v1:i64): classify finite-and-nonzero vs special (zero/inf/nan).
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::F64, ValType::I64],
         insts: vec![
             reinterp_to_i(0),      // v2 = ix (raw bits of x)
@@ -7776,6 +7956,8 @@ fn synth_frexp() -> Func {
 
     // block1 finite(x=v0:f64, ix=v1:i64, ex=v2:i64, eptr=v3:i64): subnormal → normalize; else pack.
     let finite = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::F64, ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             Inst::ConstI64(0), // v4
@@ -7799,6 +7981,8 @@ fn synth_frexp() -> Func {
 
     // block2 special(x=v0:f64, eptr=v1:i64): *eptr = 0; return x + x (quiets/signals NaN, ±0/±inf pass).
     let special = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::F64, ValType::I64],
         insts: vec![
             Inst::ConstI32(0), // v2
@@ -7820,6 +8004,8 @@ fn synth_frexp() -> Func {
 
     // block3 sub(x=v0:f64, eptr=v1:i64): scale by 2^54 into the normal range, recompute ex and e.
     let sub_blk = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::F64, ValType::I64],
         insts: vec![
             Inst::ConstI64(0x4350_0000_0000_0000), // v2 = bits(2^54)
@@ -7847,6 +8033,8 @@ fn synth_frexp() -> Func {
     // block4 pack(ix=v0:i64, e=v1:i64, eptr=v2:i64): set the biased exponent to 0x3fe (m ∈ [0.5,1)),
     // store e (as int), return the reconstructed mantissa.
     let pack = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             Inst::ConstI64(0x800f_ffff_ffff_ffffu64 as i64), // v3 = sign|mantissa mask
@@ -7962,6 +8150,8 @@ fn synth_fmod() -> Func {
 
     // 0 entry(x=v0:f64, y=v1:f64)
     let b0 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::F64, ValType::F64],
         insts: vec![
             to_i(0),                 // v2 = ux
@@ -7996,6 +8186,8 @@ fn synth_fmod() -> Func {
     };
     // 1 special(x=v0, y=v1): (x*y)/(x*y) → NaN
     let b1 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::F64, ValType::F64],
         insts: vec![
             fbin(FBinOp::Mul, 0, 1), // v2 = x*y
@@ -8005,6 +8197,8 @@ fn synth_fmod() -> Func {
     };
     // 2 magcmp(ux=v0, uy=v1, ex=v2, ey=v3, sx=v4)
     let b2 = Block {
+        parent: 0,
+        captures: vec![],
         params: p5(),
         insts: vec![
             ci(1),                 // v5
@@ -8022,6 +8216,8 @@ fn synth_fmod() -> Func {
     };
     // 3 lecase(ux=v0, uy=v1, sx=v2, ux1=v3, uy1=v4)
     let b3 = Block {
+        parent: 0,
+        captures: vec![],
         params: p5(),
         insts: vec![cmp(CmpOp::Eq, 3, 4)], // v5 = (|x| == |y|)
         term: Terminator::BrIf {
@@ -8034,18 +8230,24 @@ fn synth_fmod() -> Func {
     };
     // 4 retx(ux=v0): return reinterpret(ux)
     let b4 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64],
         insts: vec![to_f(0)], // v1
         term: Terminator::Return(vec![1]),
     };
     // 5 retzero(sx=v0): return reinterpret(sx<<63)  (±0)
     let b5 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64],
         insts: vec![ci(63), shl(0, 1), to_f(2)], // v1,v2,v3
         term: Terminator::Return(vec![3]),
     };
     // 6 normx_check(ux=v0, uy=v1, ex=v2, ey=v3, sx=v4)
     let b6 = Block {
+        parent: 0,
+        captures: vec![],
         params: p5(),
         insts: vec![
             ci(0),                // v5
@@ -8063,6 +8265,8 @@ fn synth_fmod() -> Func {
     };
     // 7 normx_normal(ux=v0, uy=v1, ex=v2, ey=v3, sx=v4): set the implicit bit
     let b7 = Block {
+        parent: 0,
+        captures: vec![],
         params: p5(),
         insts: vec![
             ci(MANT),     // v5
@@ -8077,6 +8281,8 @@ fn synth_fmod() -> Func {
     };
     // 8 normx_loop_head(ux=v0, i=v1, uy=v2, ex=v3, ey=v4, sx=v5)
     let b8 = Block {
+        parent: 0,
+        captures: vec![],
         params: p6(),
         insts: vec![
             ci(63),               // v6
@@ -8094,6 +8300,8 @@ fn synth_fmod() -> Func {
     };
     // 9 normx_loop_body(ux=v0, i=v1, uy=v2, ex=v3, ey=v4, sx=v5): ex--, i<<=1
     let b9 = Block {
+        parent: 0,
+        captures: vec![],
         params: p6(),
         insts: vec![
             ci(1),     // v6
@@ -8107,6 +8315,8 @@ fn synth_fmod() -> Func {
     };
     // 10 normx_loop_done(ux=v0, ex=v1, uy=v2, ey=v3, sx=v4): ux <<= 1-ex
     let b10 = Block {
+        parent: 0,
+        captures: vec![],
         params: p5(),
         insts: vec![
             ci(1),     // v5
@@ -8120,6 +8330,8 @@ fn synth_fmod() -> Func {
     };
     // 11 normy_check(ux=v0, uy=v1, ex=v2, ey=v3, sx=v4)
     let b11 = Block {
+        parent: 0,
+        captures: vec![],
         params: p5(),
         insts: vec![
             ci(0),                // v5
@@ -8137,6 +8349,8 @@ fn synth_fmod() -> Func {
     };
     // 12 normy_normal(ux=v0, uy=v1, ex=v2, ey=v3, sx=v4)
     let b12 = Block {
+        parent: 0,
+        captures: vec![],
         params: p5(),
         insts: vec![
             ci(MANT),     // v5
@@ -8151,6 +8365,8 @@ fn synth_fmod() -> Func {
     };
     // 13 normy_loop_head(ux=v0, uy=v1, i=v2, ex=v3, ey=v4, sx=v5)
     let b13 = Block {
+        parent: 0,
+        captures: vec![],
         params: p6(),
         insts: vec![
             ci(63),               // v6
@@ -8168,6 +8384,8 @@ fn synth_fmod() -> Func {
     };
     // 14 normy_loop_body(ux=v0, uy=v1, i=v2, ex=v3, ey=v4, sx=v5): ey--, i<<=1
     let b14 = Block {
+        parent: 0,
+        captures: vec![],
         params: p6(),
         insts: vec![
             ci(1),     // v6
@@ -8181,6 +8399,8 @@ fn synth_fmod() -> Func {
     };
     // 15 normy_loop_done(ux=v0, uy=v1, ey=v2, ex=v3, sx=v4): uy <<= 1-ey
     let b15 = Block {
+        parent: 0,
+        captures: vec![],
         params: p5(),
         insts: vec![
             ci(1),     // v5
@@ -8194,6 +8414,8 @@ fn synth_fmod() -> Func {
     };
     // 16 mainloop_head(ux=v0, uy=v1, ex=v2, ey=v3, sx=v4): while ex > ey
     let b16 = Block {
+        parent: 0,
+        captures: vec![],
         params: p5(),
         insts: vec![cmp(CmpOp::GtS, 2, 3)], // v5 = ex > ey
         term: Terminator::BrIf {
@@ -8206,6 +8428,8 @@ fn synth_fmod() -> Func {
     };
     // 17 mainloop_body(ux=v0, uy=v1, ex=v2, ey=v3, sx=v4): i = ux-uy; classify
     let b17 = Block {
+        parent: 0,
+        captures: vec![],
         params: p5(),
         insts: vec![
             sub(0, 1),            // v5 = i
@@ -8224,6 +8448,8 @@ fn synth_fmod() -> Func {
     };
     // 18 mb_nonneg(i=v0, uy=v1, ex=v2, ey=v3, sx=v4): if i==0 → ±0 else ux=i, shift
     let b18 = Block {
+        parent: 0,
+        captures: vec![],
         params: p5(),
         insts: vec![
             ci(0),                // v5
@@ -8239,6 +8465,8 @@ fn synth_fmod() -> Func {
     };
     // 19 mb_shift(ux=v0, uy=v1, ex=v2, ey=v3, sx=v4): ux<<=1; ex--
     let b19 = Block {
+        parent: 0,
+        captures: vec![],
         params: p5(),
         insts: vec![
             ci(1),     // v5
@@ -8252,6 +8480,8 @@ fn synth_fmod() -> Func {
     };
     // 20 postsub(ux=v0, uy=v1, ex=v2, ey=v3, sx=v4): the final subtract after the loop
     let b20 = Block {
+        parent: 0,
+        captures: vec![],
         params: p5(),
         insts: vec![
             sub(0, 1),            // v5 = i
@@ -8270,6 +8500,8 @@ fn synth_fmod() -> Func {
     };
     // 21 postsub_nonneg(i=v0, ex=v1, sx=v2): if i==0 → ±0 else ux=i
     let b21 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             ci(0),                // v3
@@ -8285,6 +8517,8 @@ fn synth_fmod() -> Func {
     };
     // 22 finalnorm_head(ux=v0, ex=v1, sx=v2): while ux>>52 == 0
     let b22 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             ci(52),               // v3
@@ -8302,6 +8536,8 @@ fn synth_fmod() -> Func {
     };
     // 23 finalnorm_body(ux=v0, ex=v1, sx=v2): ux<<=1; ex--
     let b23 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             ci(1),     // v3
@@ -8315,6 +8551,8 @@ fn synth_fmod() -> Func {
     };
     // 24 finalnorm_done(ux=v0, ex=v1, sx=v2): scale by ex
     let b24 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             ci(0),                 // v3
@@ -8330,6 +8568,8 @@ fn synth_fmod() -> Func {
     };
     // 25 scale_pos(ux=v0, ex=v1, sx=v2): ux = (ux - (1<<52)) | (ex<<52)
     let b25 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             ci(IMPLICIT), // v3
@@ -8345,6 +8585,8 @@ fn synth_fmod() -> Func {
     };
     // 26 scale_nonpos(ux=v0, ex=v1, sx=v2): ux >>= 1-ex (subnormal output)
     let b26 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             ci(1),      // v3
@@ -8358,6 +8600,8 @@ fn synth_fmod() -> Func {
     };
     // 27 finish(ux=v0, sx=v1): ux |= sx<<63; return reinterpret(ux)
     let b27 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64],
         insts: vec![
             ci(63),    // v2
@@ -8420,6 +8664,8 @@ fn synth_getenv(scratch: u64) -> Func {
 
     // block 0: entry(name=0) — load argc, jump into the argv-skip loop.
     let b0 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64], // name
         insts: vec![
             Inst::ConstI64(args_base), // v1
@@ -8439,6 +8685,8 @@ fn synth_getenv(scratch: u64) -> Func {
 
     // block 1: skip_head(name=0, argc=1, i=2, p=3) — while i <u argc skip a string, else env_setup.
     let b1 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64],
         insts: vec![ltu64(2, 1)], // v4 = i < argc
         term: Terminator::BrIf {
@@ -8452,6 +8700,8 @@ fn synth_getenv(scratch: u64) -> Func {
 
     // block 2: skip_scan(name=0, argc=1, i=2, p=3) — advance p past this string's NUL.
     let b2 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64],
         insts: vec![
             load8(3),          // v4 = *p
@@ -8471,6 +8721,8 @@ fn synth_getenv(scratch: u64) -> Func {
 
     // block 3: skip_next(name=0, argc=1, i=2, p=3) — i++ and loop.
     let b3 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64],
         insts: vec![Inst::ConstI64(1), add(2, 4)], // v4=1, v5 = i+1
         term: Terminator::Br {
@@ -8481,6 +8733,8 @@ fn synth_getenv(scratch: u64) -> Func {
 
     // block 4: env_setup(name=0, p=1) — load envc, enter the env-match loop.
     let b4 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64],
         insts: vec![
             Inst::ConstI64(args_base + 4), // v2
@@ -8499,6 +8753,8 @@ fn synth_getenv(scratch: u64) -> Func {
 
     // block 5: env_head(name=0, envc=1, j=2, p=3) — while j <u envc try a match, else return NULL.
     let b5 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64],
         insts: vec![ltu64(2, 1)], // v4 = j < envc
         term: Terminator::BrIf {
@@ -8512,6 +8768,8 @@ fn synth_getenv(scratch: u64) -> Func {
 
     // block 6: cmp(name=0, envc=1, j=2, p=3, a=4, b=5) — *a==0 ⇒ key ended, check '='; else compare.
     let b6 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64; 6],
         insts: vec![
             load8(4),          // v6 = *a (name char)
@@ -8530,6 +8788,8 @@ fn synth_getenv(scratch: u64) -> Func {
     // block 7: cmp2(name=0, envc=1, j=2, p=3, a=4, b=5, ca=6) — *a==*b ? advance : skip this entry.
     // `ca` (the just-read name byte) is an i32, the rest are pointers/counts.
     let b7 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![
             ValType::I64,
             ValType::I64,
@@ -8554,6 +8814,8 @@ fn synth_getenv(scratch: u64) -> Func {
 
     // block 8: cmp_adv(name=0, envc=1, j=2, p=3, a=4, b=5) — a++, b++ and re-compare.
     let b8 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64; 6],
         insts: vec![
             Inst::ConstI64(1), // v6
@@ -8568,6 +8830,8 @@ fn synth_getenv(scratch: u64) -> Func {
 
     // block 9: check_sep(name=0, envc=1, j=2, p=3, b=4) — key matched; is *b the '=' separator?
     let b9 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64; 5],
         insts: vec![
             load8(4),                    // v5 = *b
@@ -8585,6 +8849,8 @@ fn synth_getenv(scratch: u64) -> Func {
 
     // block 10: found(b=0) — the value is the byte just past the '='.
     let b10 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64],
         insts: vec![Inst::ConstI64(1), add(0, 1)], // v1=1, v2 = b+1
         term: Terminator::Return(vec![2]),
@@ -8592,6 +8858,8 @@ fn synth_getenv(scratch: u64) -> Func {
 
     // block 11: env_scan(name=0, envc=1, j=2, p=3, r=4) — advance r past this entry's NUL.
     let b11 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64; 5],
         insts: vec![
             load8(4),          // v5 = *r
@@ -8611,6 +8879,8 @@ fn synth_getenv(scratch: u64) -> Func {
 
     // block 12: env_next(name=0, envc=1, j=2, p_next=3) — j++ and loop.
     let b12 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64],
         insts: vec![Inst::ConstI64(1), add(2, 4)], // v4=1, v5 = j+1
         term: Terminator::Br {
@@ -8621,6 +8891,8 @@ fn synth_getenv(scratch: u64) -> Func {
 
     // block 13: not_found() — return NULL.
     let b13 = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![],
         insts: vec![Inst::ConstI64(0)], // v0
         term: Terminator::Return(vec![0]),
@@ -8797,6 +9069,8 @@ impl Bdr {
     }
     fn block(self, params: Vec<ValType>, term: Terminator) -> Block {
         Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts: self.insts,
             term,
@@ -18470,6 +18744,8 @@ fn translate_block(
         None => translate_term(&mut ctx, &bb.term, bi, f, s, block_params, aux_blocks)?,
     };
     Ok(Block {
+        parent: 0,
+        captures: vec![],
         params,
         insts: ctx.insts,
         term,
@@ -23459,6 +23735,8 @@ fn lower_invoke(
         .collect();
     let bcall_idx = (f.basic_blocks.len() + aux_blocks.len()) as u32;
     aux_blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: t_types,
         insts,
         term: Terminator::Br {
@@ -23858,6 +24136,8 @@ fn lower_sparse_switch(
             (default_blk as u32, remap(&default_args))
         };
         aux_blocks.push(Block {
+            parent: 0,
+            captures: vec![],
             params: t_types.clone(),
             insts,
             term: Terminator::BrIf {

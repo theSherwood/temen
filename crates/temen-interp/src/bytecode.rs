@@ -20123,6 +20123,8 @@ mod func_memo_tests {
             params: Vec::new(),
             results,
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: Vec::new(),
                 insts,
                 term,

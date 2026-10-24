@@ -367,6 +367,8 @@ fn embed_and_diff(mut residual: Module, src: &Module, luav: u32, entry: u32) {
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         results: vec![],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64, ValType::I64, ValType::I64],
             insts: vec![Inst::Call {
                 func: entry,

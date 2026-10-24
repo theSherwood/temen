@@ -48,6 +48,8 @@ fn func(params: Vec<ValType>, results: Vec<ValType>, insts: Vec<Inst>, term: Ter
         params: params.clone(),
         results,
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts,
             term,
@@ -188,6 +190,8 @@ fn directed_rule_rejects() {
         },
     );
     f.blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: vec![V::I32],
         insts: vec![],
         term: T::Return(vec![0]),
@@ -207,6 +211,8 @@ fn directed_rule_rejects() {
         },
     );
     f.blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: vec![V::I32],
         insts: vec![],
         term: T::Return(vec![0]),

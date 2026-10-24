@@ -1,4 +1,6 @@
-//! CFG analysis utilities over a function's block-local IR (see `OPT.md` Phase 1b).
+//! CFG analysis utilities over a function's blocks (see `OPT.md` Phase 1b). They live here rather
+//! than in temen-opt because the dominance passes below them need them too ([`crate::Func::raise`],
+//! #2454); temen-opt re-exports this module.
 //!
 //! The IR supports **irreducible** control flow natively (no relooper, §3), so nothing here may
 //! assume reducibility: [`Cfg::dominators`] is the iterative Cooper–Harvey–Kennedy solver (correct on
@@ -12,7 +14,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use temen_ir::{Block, Terminator};
+use crate::{Block, Terminator};
 
 /// The **distinct** successor block indices of a terminator, in first-seen order. `Return` / tail
 /// calls / `unreachable` have none. Deduplicated so CFG adjacency carries each edge once (a `br_if`
