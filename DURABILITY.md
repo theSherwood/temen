@@ -610,8 +610,12 @@ the tree is flattened into the root's `unreached_detached()`, which `freeze` ref
 **Section 8** (`TAG_DETACHED`) as its **own root-shaped artifact** — this same format, frozen from its
 own powerbox, so its fibers, vCPUs, nested and detached children ride its own sections — behind the
 spawner-held `DetachedLaunch`: the edge (`parent_task`, `slot`), the child's frozen `task` id, its
-module digest, its lane, its import names and, for a demand-paged child, its pager export
-(v47, #2438). A child starts at its module's function 0 and binds its manifest strictly, so the
+module digest, its lane, its import names, for a demand-paged child its pager export
+(v47, #2438), and whether the spawner still holds its join claim (v51, #2465). A child the spawner
+detached (`Instantiator.detach`, op 10) is in the cut as one a join slot names: the spawner rings
+and records it from its `unreaped` list at its unwind, the census checks it, and a paged one holds
+its pager's domain (#2455). One that already ended leaves nothing, since no one can join it. A
+child starts at its module's function 0 and binds its manifest strictly, so the
 record carried an entry and a same-module flag only until v43 (#2219). Its
 fuel, `spawn` and `channel` bounds are its budget node's (Section 10, #1944 slice 3; the launch record
 carried them itself until v38). A thaw
@@ -623,7 +627,13 @@ decides what the whole tree gets back; a child whose module it no longer grants 
 under `REWINDING`, seeds its residue through the same `seed_domain` as the run's root (resolving its
 residue's `parent_task`s through its frozen id), and re-links the spawner's join slot, doorbell, kill
 flag and lane — so the spawner's rewound `thread.join` parks on it exactly as before the cut — and the
-stdio the spawner had re-granted it, aliased to the spawner's streams again (#2054). Nesting
+stdio the spawner had re-granted it, aliased to the spawner's streams again (#2054). A child the
+spawner had detached gets no join slot or lane back: it goes back on `unreaped`, so the spawner's
+handle still reaches nothing and a later detach reaps it. A child the thaw does not re-launch (its
+grant gone, its imports no longer binding, or no room for it in the process's pools, #2318) is
+dropped, and what the freeze kept charged for it goes back with what it kept for the child's own
+captured children (`Host::drop_restored`, #2430). One its spawner can join ends with `ThreadFault`,
+which the rewound join answers, on both engines. Nesting
 depth inside one artifact is bounded (`MAX_DETACHED_DEPTH`, on both sides). A binding in an artifact
 is bounded by the window's **reservation**, not its committed image: a detached child's starter caps
 span its reservation (as a root's do, so `vm_map` can grow into it), and every host-side use is
@@ -714,7 +724,9 @@ its own window, with a freeze cell beside its join-table entry (`DurableCell`: i
 its image once it unwinds). A root freeze **rings** each live child — a store of `UNWINDING` into the
 child's *own* freeze word, which is all `FreezeController::request_freeze` does for the root — and the
 child unwinds at its next poll; its task deposits the image at finish, and the nursery keeps its
-powerbox. `temen_run::jit_cap_run` turns that harvest into the interpreter's `CapturedDetached`
+powerbox. That includes a child its spawner detached, whose entry the nursery marks claimed: a join
+never claims a child the freeze unwound, so a claimed child that unwound is a detached one, and it
+rides unjoinable (#2465). Its thaw re-files it claimed. `temen_run::jit_cap_run` turns that harvest into the interpreter's `CapturedDetached`
 (`Arc::from_raw` on the kept powerbox), so **one artifact serves both engines**. A thaw prepares each
 child through the same `Host::prepare_detached_relaunch` the interpreter uses, builds its powerbox as a
 spawn does, and re-files its task **at its recorded join slot** on a window holding its image, freeze
@@ -1474,9 +1486,17 @@ presence in a live, non-drainable state makes the subtree non-snapshottable, so
 **freeze refuses** unless they're closed/drained first (the drain is
 `Host::drain_non_durable`, below):
 
-`Blocking(u32)` (§5 + cancellation R2), and a `Module(u32)` grant the
-granting host did **not** attest freezable and that is not its program's child image (#1361,
-#2245, below). *(The §22 `JitTable`/`JitCode` handles were here until
+| `NonDurableKind` | Binding | Tracked |
+| --- | --- | --- |
+| `Blocking` | a `Blocking(u32)` handle (§5 + cancellation R2) | #1678 |
+| `Module` | a `Module(u32)` grant the granting host did **not** attest freezable and that is not its program's child image (#1361, #2245, below) | by design |
+| `ModuleLoader` | a §14 module loader, which mints `Module` grants | #1682 |
+| `HostProc` | a host capability with no name to re-grant it by (by design: its embedder names it or drains it), or one whose provider holds state it does not capture (#1699), as the POSIX personality's does. Named ones ride (#1455, below) | #1894 |
+| `Pipe` | an end of a pipe the embedder feeds, which no artifact can carry (one the tree minted rides, Section 9) | #1680 slice 2, #1902 |
+| `Offer` | a wired interface offer (IMPORTS.md §3.2) | #1681 |
+| `LiveImpl` | a live impl that names no child the cut carries, such as a wire live impl (one over a child rides by the child's task id, v50) | #1681 |
+
+*(The §22 `JitTable`/`JitCode` handles were here until
 **Slice 2**: their out-of-line unit state — instrumented+verified IR + quotas — now rides snapshot
 Section 5, so they are re-grantable; `drain_non_durable` keeps them. The native/wasm code pointers
 still don't ride — an interpreter thaw invokes the restored funcs directly, a native re-compile is

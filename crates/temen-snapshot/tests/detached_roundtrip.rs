@@ -109,6 +109,7 @@ fn launch(child: &Module) -> DetachedLaunch {
         lane: 2,
         names: vec![("fs".to_string(), 0x0103)],
         pager: None,
+        joinable: true,
     }
 }
 
@@ -314,6 +315,50 @@ fn a_paged_childs_pager_rides_its_launch_record() {
         restore(&paged(1)).map(|_| ()),
         Err(RestoreError::Malformed),
         "export 1 is no pager"
+    );
+}
+
+/// #2465 — whether the spawner still holds its join claim rides the launch record (v51): a child it
+/// detached (op 10) thaws unjoinable. The claim is one byte, and any other value is malformed.
+#[test]
+fn a_childs_join_claim_rides_its_launch_record() {
+    let (p, c) = (parent(), child());
+    let art = |joinable| {
+        let (win, host) = parent_with(
+            &c,
+            frozen_root(&c),
+            DetachedLaunch {
+                joinable,
+                ..launch(&c)
+            },
+        );
+        freeze(&p, &win, &host).expect("freeze the tree")
+    };
+    let restore = |art: &[u8]| {
+        let mut rhost = Host::new();
+        rhost.set_durable(true);
+        rhost.grant_durable_module(&c);
+        restore_with_prots(art, &p, &mut rhost).map(|_| rhost.take_thawed_detached())
+    };
+    for joinable in [true, false] {
+        let thawed = restore(&art(joinable)).expect("restore");
+        assert_eq!(thawed[0].launch.joinable, joinable, "the claim survives");
+    }
+    let (claimed, detached) = (art(true), art(false));
+    let at: Vec<usize> = (0..claimed.len())
+        .filter(|&i| claimed[i] != detached[i])
+        .collect();
+    assert_eq!(
+        (claimed.len(), at.len()),
+        (detached.len(), 1),
+        "one byte holds the claim"
+    );
+    let mut bad = claimed;
+    bad[at[0]] = 2;
+    assert_eq!(
+        restore(&bad).map(|_| ()),
+        Err(RestoreError::Malformed),
+        "a claim byte other than 0 or 1"
     );
 }
 

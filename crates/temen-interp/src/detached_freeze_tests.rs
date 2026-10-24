@@ -70,7 +70,7 @@ block 3 (v12: i64) {
 
 /// Parse `src`, add `data` to it, instrument it, and verify the result. Confined: the parent stores
 /// its spawn record's handles at [`REC_AT`], past the shadow arena (R9).
-fn instrument(src: &str, data: Option<Data>) -> Module {
+fn instrument(src: &str, data: impl IntoIterator<Item = Data>) -> Module {
     let mut m = temen_text::parse_module(src).expect("parse");
     m.data.extend(data);
     let inst = transform_module_assume_confined(&m).expect("transform");
@@ -81,15 +81,20 @@ fn instrument(src: &str, data: Option<Data>) -> Module {
 /// A parent's spawn record, at [`REC_AT`]: a `size_log2` 17 child, whose module and budget the
 /// parent stores in at run time.
 fn spawn_rec() -> Option<Data> {
-    Some(Data {
-        offset: REC_AT,
+    Some(spawn_rec_at(REC_AT))
+}
+
+/// A spawn record as [`spawn_rec`]'s, at `offset`.
+fn spawn_rec_at(offset: u64) -> Data {
+    Data {
+        offset,
         readonly: false,
         bytes: SpawnRec {
             size_log2: 17,
             ..SpawnRec::default()
         }
         .encode(),
-    })
+    }
 }
 
 /// A durable powerbox granting what the parent's spawn needs, in a fixed order so a thaw host minted
@@ -306,5 +311,111 @@ block 0 (v0: i32, v1: i32, v2: i32) {
         spawn(true),
         Ok(vec![Value::I64(0)]),
         "admitted at slot 0 with it"
+    );
+}
+
+/// Where [`TWO_PARENT`] lays its second child's spawn record, past its first ([`REC_AT`]).
+const REC_B: u64 = REC_AT + temen_ir::SPAWN_REC_LEN as u64;
+
+/// A parent of two children, `A` and then `B` (its args: the Instantiator, `A`'s module, the budget,
+/// `B`'s module). It joins `B`, then `A`, and returns `status_B·10¹² + status_A·10⁹ + B·10⁴ + A`.
+/// `FLIP` requests the freeze just before `B`'s spawn, so the parent unwinds once both are spawned.
+const TWO_PARENT: &str = "memory 18 shadow 16448 65536
+func (i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
+  vma = i64.const 65544
+  i32.store vma v1
+  vba = i64.const 65548
+  i32.store vba v2
+  vmb = i64.const 65608
+  i32.store vmb v3
+  vbb = i64.const 65612
+  i32.store vbb v2
+  vra = i64.const 65536
+  vca = call.cap 6 17 (i64) -> (i32) v0 (vra)
+FLIP
+  vrb = i64.const 65600
+  vcb = call.cap 6 17 (i64) -> (i32) v0 (vrb)
+  vsb, vb = call.cap 6 1 (i32) -> (i64, i64) v0 (vcb)
+  vsa, va = call.cap 6 1 (i32) -> (i64, i64) v0 (vca)
+  vk12 = i64.const 1000000000000
+  vk9 = i64.const 1000000000
+  vk4 = i64.const 10000
+  vx1 = i64.mul vsb vk12
+  vx2 = i64.mul vsa vk9
+  vx3 = i64.mul vb vk4
+  vy1 = i64.add vx1 vx2
+  vy2 = i64.add vy1 vx3
+  vy3 = i64.add vy2 va
+  return vy3
+  }
+}
+";
+
+/// #2430 — **a child the thaw does not relaunch ends with `ThreadFault`, whatever refused it.** The
+/// parent freezes with both children live; the thaw grants `A`'s program, and another in `B`'s
+/// place, so `B`'s relaunch finds its grant gone and drops it. `B`'s join answers `ThreadFault` and
+/// `A`'s answers `A`'s total, as had `B` ended so. `B`'s slot used to stay unfiled, past the end of
+/// the rebuilt table, where the join's mask folds `B`'s handle onto `A`'s: `B`'s join took `A`'s
+/// total, and `A`'s faulted.
+#[test]
+fn a_child_the_thaw_does_not_relaunch_ends_with_thread_fault() {
+    let flip = format!(
+        "  vfw = i64.const {}\n  vfs = i32.const {STATE_UNWINDING}\n  i32.store vfw vfs",
+        ARENA
+            .freeze_word()
+            .expect("the arena holds the freeze word")
+    );
+    let recs = || [spawn_rec_at(REC_AT), spawn_rec_at(REC_B)];
+    // `A` sums `0..100` and `B` `0..10`; a third program stands in for `B`'s at the thaw.
+    let summing = |n: u32| {
+        instrument(
+            &CHILD.replace("i64.const 100", &format!("i64.const {n}")),
+            None,
+        )
+    };
+    let (a, b) = (summing(100), summing(10));
+    let powerbox = |b: &Module| {
+        let mut host = Host::new();
+        host.set_durable(true);
+        let inst = host.grant_instantiator();
+        let ha = host.grant_durable_module(&a);
+        let budget = host.grant_budget(-1, 1 << 20, -1);
+        let hb = host.grant_durable_module(b);
+        host.grant_freeze_authority();
+        (host, [inst, ha, budget, hb].map(Value::I32))
+    };
+    let window = || init_durable_window(1 << PARENT_LOG2, ARENA);
+
+    let (mut host, args) = powerbox(&b);
+    let plain = instrument(&TWO_PARENT.replace("FLIP", ""), recs());
+    let (base, _) = run(&plain, &mut host, &args, &window());
+    assert_eq!(
+        base,
+        Ok(vec![Value::I64(45 * 10_000 + 4950)]),
+        "uninterrupted"
+    );
+
+    // One lane, so neither child runs before the parent has unwound and rung it: both ride live.
+    let parent = instrument(&TWO_PARENT.replace("FLIP", &flip), recs());
+    let (mut fhost, fargs) = powerbox(&b);
+    fhost.set_lane_cap(1);
+    let (fr, fsnap) = run(&parent, &mut fhost, &fargs, &window());
+    assert!(fr.is_ok(), "the freeze returns a placeholder: {fr:?}");
+    let captured = std::mem::take(&mut fhost.captured_detached);
+    let slots: Vec<usize> = captured.iter().map(|c| c.slot).collect();
+    assert_eq!(slots, [0, 1], "both children ride live");
+
+    let mut twin = fsnap.clone();
+    begin_thaw(&mut twin, ARENA, 0);
+    let (mut thost, targs) = powerbox(&summing(7));
+    thost.set_thawed_detached(captured.into_iter().map(thawed).collect());
+    let (tr, _) = run(&parent, &mut thost, &targs, &twin);
+    assert_eq!(
+        tr,
+        Ok(vec![Value::I64(
+            Trap::ThreadFault.code() * 1_000_000_000_000 + 4950
+        )]),
+        "B's join answers ThreadFault, A's its total"
     );
 }

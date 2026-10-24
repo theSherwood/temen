@@ -10039,26 +10039,62 @@ enum Stalled {
 }
 
 /// The [`Stalled`] verdict on `tasks`, in a run its embedder pumps or not, with an external-wake
-/// bell armed or not. `stopped` says whether a runnable task's process is stopped: once nothing
-/// in the run can continue it, only a continue from outside moves it (#2529), as only the
-/// embedder can feed a read.
-fn stalled(tasks: &[TaskSlot], stopped: bool, embedder_pumps: bool, bell: bool) -> Stalled {
-    let fed = stopped
-        || tasks.iter().any(|t| {
-            matches!(
-                t.state,
-                TaskState::BlockedPipeRead { .. }
-                    | TaskState::BlockedPipeWrite { .. }
-                    // #1146 (deeper) — a blocking stdin park is externally wakeable too (an
-                    // embedder signal rings the bell): without it an all-parked stdin run would
-                    // fault as a deadlock instead of blocking for the `^C`.
-                    | TaskState::BlockedStdin
-            )
-        });
+/// bell armed or not. No task can run, so a runnable one is a task of a stopped process, which the
+/// executor would not step: once nothing in the run can continue it, only a continue from outside
+/// moves it (#2529), as only the embedder can feed a read. Its stop is not read again here: a
+/// continue that lands after the executor looked is a wake its next round sees, never a deadlock.
+fn stalled(tasks: &[TaskSlot], embedder_pumps: bool, bell: bool) -> Stalled {
+    let fed = tasks.iter().any(|t| {
+        matches!(
+            t.state,
+            TaskState::Runnable
+                | TaskState::BlockedPipeRead { .. }
+                | TaskState::BlockedPipeWrite { .. }
+                // #1146 (deeper) — a blocking stdin park is externally wakeable too (an
+                // embedder signal rings the bell): without it an all-parked stdin run would
+                // fault as a deadlock instead of blocking for the `^C`.
+                | TaskState::BlockedStdin
+        )
+    });
     match (fed, embedder_pumps, bell) {
         (true, true, _) => Stalled::Idle,
         (true, false, true) => Stalled::Bell,
         _ => Stalled::Deadlock,
+    }
+}
+
+#[cfg(test)]
+mod stalled_tests {
+    use super::*;
+
+    fn runnable() -> TaskSlot {
+        let m = temen_text::parse_module("func () -> () {\nblock 0 () {\n  return\n  }\n}\n")
+            .expect("parse");
+        let unit = compile_module(&m.funcs, &m.types, None).expect("compile");
+        let vt = VTask::new(&unit, 0, &[], None).expect("task");
+        TaskSlot::new(vt, None, LiveVcpu::none())
+    }
+
+    /// #2529 — at an idle point a runnable task is one of a stopped process: a wait on the
+    /// outside, which its embedder hears of when it pumps the run and the armed bell rings for
+    /// when it does not, and a deadlock only with neither. The verdict takes no reading of the
+    /// stop: the executors used to read it again here, and a continue that landed between their
+    /// look and this one made the run a deadlock (`ThreadFault`), though it had just been
+    /// continued.
+    #[test]
+    fn a_stopped_processs_runnable_task_is_a_wait() {
+        let tasks = [runnable()];
+        assert!(matches!(stalled(&tasks, true, false), Stalled::Idle));
+        assert!(matches!(stalled(&tasks, false, true), Stalled::Bell));
+        assert!(matches!(stalled(&tasks, false, false), Stalled::Deadlock));
+        let done = [TaskSlot {
+            state: TaskState::Done(Ok(Vec::new())),
+            ..runnable()
+        }];
+        assert!(
+            matches!(stalled(&done, false, true), Stalled::Deadlock),
+            "a bell with nothing waiting on it wakes nothing"
+        );
     }
 }
 
@@ -13178,12 +13214,7 @@ impl CoopSched {
                     // signal) instead of sleeping this thread on the bell.
                     let bell = root.lock_unpoisoned().external_wake();
                     if calls.is_empty() {
-                        let stopped = !see_through
-                            && tasks.iter().any(|t| {
-                                matches!(t.state, TaskState::Runnable)
-                                    && process_stopped(root, extra_envs, t)
-                            });
-                        match stalled(tasks, stopped, *embedder_pumps, bell.is_some()) {
+                        match stalled(tasks, *embedder_pumps, bell.is_some()) {
                             Stalled::Idle => return Ok(CoopStep::Idle { timer: None }),
                             Stalled::Deadlock => return Err(Trap::ThreadFault),
                             Stalled::Bell => {}
@@ -17079,10 +17110,7 @@ impl ThreadRun {
             Some(res.clone())
         } else if self.idle(core) {
             let bell = self.root.lock_unpoisoned().external_wake().is_some();
-            let stopped = (0..core.tasks.len()).any(|j| {
-                matches!(core.tasks[j].state, TaskState::Runnable) && self.stopped(core, j)
-            });
-            match stalled(&core.tasks, stopped, g.embedder_pumps, bell) {
+            match stalled(&core.tasks, g.embedder_pumps, bell) {
                 Stalled::Deadlock => Some(Err(Trap::ThreadFault)),
                 Stalled::Idle => {
                     stalled_now = true;

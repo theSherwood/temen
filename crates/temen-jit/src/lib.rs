@@ -1860,6 +1860,9 @@ pub struct DetachedHarvest {
     pub outcome: Option<(i64, i64)>,
     /// #2010 — its own unjoined durable detached children, harvested the same way.
     pub children: Vec<DetachedHarvest>,
+    /// #2465 — whether its parent can still join it: `false` once the parent detached it (op 10),
+    /// which the harvest carries only when it unwound for the freeze.
+    pub joinable: bool,
 }
 
 /// #1361 step 4 — what a durable detached child that unwound for a freeze left for the harvest.
@@ -1917,6 +1920,9 @@ pub struct CapturedSeed {
     /// table (#2031), and its `thread.spawn` vCPUs re-spawned into its domain, each rewinding from its
     /// own extent (#2010).
     pub residue: DurableResidue,
+    /// #2465 — whether its parent can join it; `false` re-files it detached (op 10), as the cut
+    /// left it.
+    pub joinable: bool,
 }
 
 /// #1768 — the embedder's side of a **fork** on the JIT (FORK.md §9.5): fork is durable freeze →
