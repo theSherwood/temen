@@ -4,7 +4,8 @@
 // Worker (no nested Workers) and never blocks: a browser permits a blocking `Atomics.wait` only off
 // the main thread, so the Workers do all the blocking.
 
-import { foreignImports, foreignMemory, registerForeign, releaseForeign } from './foreign-mem.js';
+import { foreignMemory, registerForeign, releaseForeign } from './foreign-mem.js';
+import { engineImports } from './engine-imports.js';
 import { emittedTier, tierupJitArg, tierupJitRes } from './coop-driver.js';
 const STACK = 1 << 20; // per-Worker stack
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
@@ -40,7 +41,6 @@ self.onmessage = async (e) => {
     if (memId >= 0 && memId !== x2MemId) releaseForeign(memId);
     return 0;
   };
-  const x2_now_ms = () => performance.timeOrigin + performance.now();
   // The thread's emitted tier (#1414 B6-3): the coop driver's (`emittedTier`), over the run's
   // dispatch table as `temen_x2_*` reads it during a call — made at the thread's first call, with the
   // run's tier-up module as its program. A call runs `f(win, env, ...argv)` with `"mapped"` set (and,
@@ -234,7 +234,7 @@ self.onmessage = async (e) => {
     const bytes = new Uint8Array(memory.buffer, ptr >>> 0, len >>> 0).slice();
     self.postMessage({ kind: 'out', fd, seq: seq >>> 0, bytes }, [bytes.buffer]);
   };
-  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stream_chunk, js_cap_call: () => -38n, x2_spawn, x2_now_ms, x2_tierup, x2_invoke } }));
+  ({ exports: ex } = await WebAssembly.instantiate(module, engineImports(memory, { stream_chunk, x2_spawn, x2_tierup, x2_invoke })));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
   // #1414 B6 — the parallel driver: the root's Worker pumps the run, and each of its threads is a call

@@ -839,11 +839,11 @@ block 0 () {
 "#;
 
 /// A host granting `ping` as a declared host-completed cap, bound to import 0.
-fn declared_ping(m: &temen_ir::Module) -> (Host, CapRequests) {
+fn declared_ping() -> (Host, CapRequests) {
     let mut host = Host::new();
     let requests = CapRequests::default();
-    let seams = host.grant_declared_host_caps(&m.imports, &["ping".to_string()], &requests);
-    assert_eq!(seams.len(), 1, "ping is imported, so granted");
+    let seams = host.grant_declared_host_caps(&["ping".to_string()], &requests);
+    assert_eq!(seams.len(), 1, "ping is granted");
     host.set_import_bindings(vec![BoundImport::required(
         temen_ir::cap_id::HOST_PROC,
         0,
@@ -935,7 +935,7 @@ fn the_root_runs_as_an_emitted_leaf_and_parks_on_declared_caps() {
     let m = parse(ROOT_PINGS);
     let want = Ok(vec![Value::I64(WANT)]);
 
-    let (host, requests) = declared_ping(&m);
+    let (host, requests) = declared_ping();
     let interpreted = drive_leaf(coop_with(&m, host, None), &requests);
     assert_eq!(
         interpreted,
@@ -949,7 +949,7 @@ fn the_root_runs_as_an_emitted_leaf_and_parks_on_declared_caps() {
     );
 
     let offers: Offers = Arc::default();
-    let (host, requests) = declared_ping(&m);
+    let (host, requests) = declared_ping();
     let leaf = drive_leaf(
         coop_with(&m, host, Some(leaf_config(&offers, true))),
         &requests,
@@ -975,7 +975,7 @@ fn the_root_runs_as_an_emitted_leaf_and_parks_on_declared_caps() {
     #[cfg(unix)]
     {
         let offers: Offers = Arc::default();
-        let (host, requests) = declared_ping(&m);
+        let (host, requests) = declared_ping();
         let run = bytecode::CoopRun::new(&m, 0, &[], FUEL, host, Some(leaf_config(&offers, true)))
             .expect("in subset")
             .expect("entry in range");
@@ -999,7 +999,7 @@ fn the_root_runs_as_an_emitted_leaf_and_parks_on_declared_caps() {
 fn a_declined_root_leaf_runs_interpreted() {
     let m = parse(ROOT_PINGS);
     let offers: Offers = Arc::default();
-    let (host, requests) = declared_ping(&m);
+    let (host, requests) = declared_ping();
     let ran = drive_leaf(
         coop_with(&m, host, Some(leaf_config(&offers, false))),
         &requests,
@@ -1021,7 +1021,7 @@ fn a_declined_root_leaf_runs_interpreted() {
 #[test]
 fn a_host_completed_call_in_a_tierup_region_declines() {
     let m = parse(REGION_PING);
-    let (host, requests) = declared_ping(&m);
+    let (host, requests) = declared_ping();
     let tierup = TierUpConfig {
         root: ProgramEmit {
             eligible: Arc::from([false, true]),

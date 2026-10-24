@@ -190,6 +190,33 @@ export 0 func "_start" 0
 `;
 export const LONE_WAIT_MS = 30;
 
+// #2579 — a guest of the JS capabilities its embedder staged, each answered inside the call
+// (`onCap`): `js.upper(ptr, len)` uppercases "shout\n" in the guest's window and returns the length,
+// and `js.add` doubles it. The guest writes the line and returns 12.
+const JS_CAPS = `memory 16
+import 0 "js.upper" (i64, i64) -> (i64)
+import 1 "js.add" (i64, i64) -> (i64)
+import 2 "write" (i64, i64) -> (i64)
+data 34816 "shout\\n"
+func () -> (i64) {
+block 0 () {
+  vp = i64.const 34816
+  vl = i64.const 6
+  vn = call.import 0 (vp, vl)
+  vs = call.import 1 (vn, vn)
+  vw = call.import 2 (vp, vl)
+  return vs
+  }
+}
+export 0 func "_start" 0
+`;
+export const JS_CAPS_OUT = 'SHOUT\n';
+// The embedder's half: slot 0 is `js.upper`, through the call's window view; slot 1 `js.add`.
+const jsCaps = (slot, op, args, mem) => {
+  if (slot === 1) return args[0] + args[1];
+  return mem.write(args[0], mem.str(args[0], args[1]).toUpperCase()) ? args[1] : -1n;
+};
+
 export const pong = (x) => 2n * x + 1n;
 export const PINGS = 30;
 
@@ -204,13 +231,25 @@ export async function runCases({ ex, memory, drive, suspends }) {
   };
   const shared = typeof SharedArrayBuffer !== 'undefined' && memory.buffer instanceof SharedArrayBuffer;
   // Open `src` with `caps` declared in `mode`: the engine's status (0 = open).
-  const open = (src, caps, mode) => {
+  const encode = (src) => {
     const text = enc.encode(src);
     const sp = put(text);
     const ok = ex.temen_parse(sp, text.length);
     ex.temen_dealloc(sp, text.length || 1);
     const bytes = u8().slice(Number(ex.temen_parse_ptr()), Number(ex.temen_parse_ptr()) + Number(ex.temen_parse_len()));
     if (ok !== 1) throw new Error(`parse: ${dec.decode(bytes)}`);
+    return bytes;
+  };
+  // #2579: stage JS capabilities for the next open: their slots.
+  const stageJsCaps = (names) => names.map((name) => {
+    const b = enc.encode(name);
+    const p = put(b);
+    const slot = ex.temen_onramp_stage_js_cap(p, b.length);
+    ex.temen_dealloc(p, b.length || 1);
+    return slot;
+  });
+  const open = (src, caps, mode) => {
+    const bytes = encode(src);
     const mp = put(bytes);
     const names = enc.encode(caps.join('\n'));
     const cp = put(names);
@@ -221,7 +260,7 @@ export async function runCases({ ex, memory, drive, suspends }) {
   };
   // Drive the open session with the embedder hooks, recording what they saw.
   const run = async (opts = {}) => {
-    const seen = { out: '', err: '', chunks: 0, slices: 0, parks: 0, counts: {} };
+    const seen = { out: '', err: '', chunks: 0, slices: 0, parks: 0, capCalls: 0, counts: {} };
     const status = await drive(ex, memory, {
       counts: seen.counts,
       budget: 1000,
@@ -239,6 +278,10 @@ export async function runCases({ ex, memory, drive, suspends }) {
         await new Promise((r) => setTimeout(r, opts.answerAfter ?? 0));
         return pong(args[0]);
       },
+      onCap: opts.onCap && ((...call) => {
+        seen.capCalls++;
+        return opts.onCap(...call);
+      }),
       trapDeclines: opts.trapDeclines,
     });
     return { status, value: status === 0 ? ex.temen_run_value() : null, ...seen };
@@ -259,6 +302,22 @@ export async function runCases({ ex, memory, drive, suspends }) {
   if (open(loneWait(LONE_WAIT_MS), [], COOP_NO_REGIONS) !== 0) throw new Error('open lone wait');
   const waitFrom = performance.now();
   results.loneWait = { ...(await run()), ms: performance.now() - waitFrom };
+  // #2579: JS capabilities answered inside the call, interpreted and from a root leaf, whose calls
+  // bounce out of its emitted code (under JSPI, out of frames the host could suspend).
+  for (const [key, mode] of [['jsCaps', COOP_NO_REGIONS], ['jsCapsLeaf', leafMode]]) {
+    if (stageJsCaps(['js.upper', 'js.add']).join() !== '0,1') throw new Error('stage the JS caps');
+    if (open(JS_CAPS, [], mode) !== 0) throw new Error(`open ${key}: ${ex.temen_status()}`);
+    results[key] = await run({ onCap: jsCaps });
+  }
+  // Executor 2 refuses a run with a staged JS capability: its tasks' Workers cannot call it.
+  if (ex.temen_par_powerbox_onramp) {
+    stageJsCaps(['js.add']);
+    const bytes = encode(JS_CAPS);
+    const mp = put(bytes);
+    results.x2RefusesJsCaps = ex.temen_par_powerbox_onramp(mp, bytes.length, 0, 0, 0, 0, 0) === 0;
+    ex.temen_dealloc(mp, bytes.length);
+    ex.temen_onramp_stage_clear();
+  }
   if (open(pingGuest(PINGS), ['ping'], leafMode) !== 0) throw new Error('open ping to stop');
   results.stopAtPark = await run({ stopAtPark: 3 });
   // Interpreted: emitted code is not sliced, so a root leaf that never parks would never come back

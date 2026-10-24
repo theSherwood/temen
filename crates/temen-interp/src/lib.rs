@@ -29106,7 +29106,7 @@ impl Host {
     }
 
     /// #1366 / #1953 — grant the embedder's **declared host-answered caps**: for each of `names`
-    /// (in order) that `imports` imports, an offloadable proc that always punts to the embedder
+    /// (in order), an offloadable proc that always punts to the embedder
     /// ([`OffloadOutcome::Host`]). The guest's flat `call.sym "<name>"` (its own op in `args[0]`)
     /// parks its caller; the proc's submit hook files the call in `requests` under its completion
     /// id, and the embedder takes the request out and answers it with its [`Completer`]. Each is
@@ -29114,17 +29114,17 @@ impl Host {
     /// [`Host::bind_powerbox_manifest`]. Nothing here is embedder-specific: temen never learns what
     /// a name means. The one grant every session that serves declared caps uses (the DAP debug
     /// session, the browser release session).
+    ///
+    /// #2579 — a name is granted whether or not the module imports it: a guest may resolve it by
+    /// name instead (unir's `bell`). One the module never calls costs only where it makes an inline
+    /// host-capability call, which may then park on the embedder (`image_parks`).
     pub fn grant_declared_host_caps(
         &mut self,
-        imports: &[temen_ir::Import],
         names: &[String],
         requests: &CapRequests,
     ) -> Vec<(String, i32)> {
         let mut declared = Vec::new();
         for name in names {
-            if !imports.iter().any(|im| &im.name == name) {
-                continue;
-            }
             let requests = Arc::clone(requests);
             let cap = name.clone();
             let h = self.grant_host_proc_offloadable(

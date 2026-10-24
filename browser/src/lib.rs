@@ -1080,9 +1080,13 @@ fn par_publish_io(cfg: ParIoCfg) {
 /// the run idles on it ([`COOP_RUN_IDLE`]) until the page feeds it or ends it
 /// ([`temen_x2_feed_end`]). A JS host may leave the trailing three out (they read as zero).
 ///
-/// Returns `1`, or `0` — nothing published — for undecodable bytes or cap names, or a module the
-/// on-ramp refuses ([`onramp_check`]). Call on the main thread before the run, like
-/// [`temen_par_powerbox_io`].
+/// What the page staged for the next open ([`Staged`]) is granted here too, but a JS capability
+/// (#2579) refuses the run: it is answered inside the call, where its function lives, and this run's
+/// tasks run on Workers that cannot call the page's.
+///
+/// Returns `1`, or `0` — nothing published — for undecodable bytes or cap names, a module the
+/// on-ramp refuses ([`onramp_check`]), or a staged JS capability. Call on the main thread before the
+/// run, like [`temen_par_powerbox_io`].
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_powerbox_onramp(
@@ -1110,11 +1114,15 @@ pub extern "C" fn temen_par_powerbox_onramp(
     if onramp_check(&m).is_err() {
         return 0;
     }
+    let staged = take_staged();
+    if !staged.js.is_empty() {
+        return 0;
+    }
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
     host.set_stdin_blocking(fed_later != 0);
     let requests = temen_interp::CapRequests::default();
-    let frame = grant_onramp_caps(&mut host, &m, None, Some((&caps, &requests))).frame;
+    let frame = grant_onramp_caps(&mut host, &m, None, Some((&caps, &requests)), &staged).frame;
     par_publish_io(ParIoCfg {
         host: std::sync::Mutex::new(host),
         out: None,
@@ -2949,12 +2957,14 @@ impl MomentReactor for OnrampReactor {
 /// the full prefix is a harmless superset — one that resolves neither graphical cap is unaffected
 /// (the queue stays empty, the frame cell `None`). The entry receives **no** handle arguments (the
 /// positional slot-order delivery died in phase 4). Shared by [`onramp_exec`] and the per-frame
-/// [`OnrampReactor`], so both grant the identical powerbox.
+/// [`OnrampReactor`], so both grant the identical powerbox. What the embedder `staged` for the open
+/// ([`Staged`]) comes on top: its modules, its budget and its JS capabilities.
 fn grant_onramp_caps(
     host: &mut Host,
     m: &temen_ir::Module,
     fs: Option<(String, Vec<u8>)>,
     declared: Option<(&[String], &temen_interp::CapRequests)>,
+    staged: &Staged,
 ) -> OnrampCaps {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     // Its stdout and stderr stream to the embedder as the guest writes them (#1141, #1414 S5a).
@@ -3026,8 +3036,14 @@ fn grant_onramp_caps(
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
         let handle = host.grant_instantiator();
         host.register_cap_name("instantiator", handle);
-        // The by-name spawn set (`"budget"`, and `"child"` for a program exporting `_child`), only
-        // for a guest that spawns detached: least authority.
+        // #2579: the embedder's budget, if it staged one, is the one a spawn pays from, as a
+        // native host's `grant_budget` is.
+        if let Some([fuel, mem, spawn]) = staged.budget {
+            let budget = host.grant_budget(fuel, mem, spawn);
+            host.register_cap_name("budget", budget);
+        }
+        // The by-name spawn set (`"budget"`, unless staged, and `"child"` for a program exporting
+        // `_child`), only for a guest that spawns detached: least authority.
         if temen_ir::spawns_detached(m) {
             host.grant_detached_spawn_caps(win);
         }
@@ -3047,18 +3063,19 @@ fn grant_onramp_caps(
     // `fb_poll` for c_interpret), granted last so every handle above keeps its value — the same
     // shared grant the DAP debug session's `hostCaps` uses.
     let declared = declared
-        .map(|(names, requests)| host.grant_declared_host_caps(&m.imports, names, requests))
+        .map(|(names, requests)| host.grant_declared_host_caps(names, requests))
         .unwrap_or_default();
-    // #2219: a card's `//// child: NAME.c` programs, each a `Module` under its name — what its parent
-    // spawns. This run takes them, and they come after every grant above, whose handles keep their
-    // values.
-    let children = CHILD_PROGRAMS.with(|c| std::mem::take(&mut *c.borrow_mut()));
-    for (name, child) in &children {
+    // #2579: the embedder's JS capabilities, answered inside the call.
+    let js = jspb::grant_js_caps(host, &staged.js);
+    // #2219, #2579: the staged modules, each a `Module` under its name — what the guest spawns: a
+    // card's `//// child: NAME.c` programs, or an embedder's child images. They come after every
+    // grant above, whose handles keep their values.
+    for (name, child) in &staged.children {
         let h = host.grant_module(child);
         host.register_cap_name(name, h);
     }
     let mut seams: Vec<(&str, i32)> = vm_fs_h.map(|h| vec![("vm_fs", h)]).unwrap_or_default();
-    seams.extend(declared.iter().map(|(n, h)| (n.as_str(), *h)));
+    seams.extend(declared.iter().chain(&js).map(|(n, h)| (n.as_str(), *h)));
     host.bind_powerbox_manifest(&m.imports, &m.types, &granted, &seams);
     caps
 }
@@ -3221,7 +3238,7 @@ fn onramp_run(
     // Grant the powerbox prefix + the `display`/`keyboard` graphical caps (shared with the reactor). A
     // single-shot run drains no keys, and `frame` captures the last frame the guest presented (if any).
     // No `fs` file: a single-shot on-ramp guest reads its input from stdin, not a served file.
-    let frame = grant_onramp_caps(&mut host, m, None, None).frame;
+    let frame = grant_onramp_caps(&mut host, m, None, None, &take_staged()).frame;
     // #1720: the card runs **nested** where it can — a §14 child of a generated root (a one-node
     // [`plan::Plan`]), re-granted by name every on-ramp capability this powerbox holds that can cross
     // into a child. The module runs exactly as built (a powerbox `_start` is an admitted child entry),
@@ -4662,7 +4679,7 @@ impl OnrampReactor {
         let tick = module.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
         let entry_sp = temen_ir::powerbox_entry_sp(&module);
         let mut host = Host::new();
-        let caps = grant_onramp_caps(&mut host, &module, fs, None);
+        let caps = grant_onramp_caps(&mut host, &module, fs, None, &take_staged());
         let (inst, back) = reactor_instance(&module, 0).ok_or(STATUS_UNSUPPORTED)?;
         let mut r = OnrampReactor {
             module,
@@ -4734,7 +4751,7 @@ impl OnrampReactor {
         // which is what keeps a guest-held handle value valid across the save; a capability the guest
         // had dropped before the freeze is absent from the artifact and stays dropped.
         let mut host = Host::new();
-        let caps = grant_onramp_caps(&mut host, &module, fs, None);
+        let caps = grant_onramp_caps(&mut host, &module, fs, None, &take_staged());
         host.set_named_cap_registrar(caps.registrar());
 
         // Bound to `m`, the module the guest was frozen over, and not to the outlined copy the
@@ -5366,7 +5383,7 @@ pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
         w[t..t + 8].copy_from_slice(&hb);
     }
     let mut host = Host::new();
-    let _ = grant_onramp_caps(&mut host, &m, None, None);
+    let _ = grant_onramp_caps(&mut host, &m, None, None, &take_staged());
     let mut fuel = DEFAULT_FUEL;
     // The reservation is clamped to the backing (#816): a `map` past `win` fails with `-EINVAL`
     // instead of minting pages whose writes the backing silently drops.
@@ -5459,7 +5476,7 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
     // The eval's output streams as it writes it (#1142), as every on-ramp powerbox's does.
-    let _ = grant_onramp_caps(&mut host, &s.module, None, None);
+    let _ = grant_onramp_caps(&mut host, &s.module, None, None, &take_staged());
     let mut fuel = DEFAULT_FUEL;
     // Re-establish the warmup image's page-state entries (no zeroing — the memcpy above restored
     // the bytes), so a `vm_map`-grown warm heap is addressable again — and its `protect`ed rodata
@@ -5594,10 +5611,12 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
     };
     let wc = s.coop.as_deref_mut().expect("checked above");
     let args = [Value::I64(s.entry_sp as i64)];
+    // Taken once: a declined leaf's powerbox is granted again for the region run below.
+    let staged = take_staged();
     let host_for = |m: &temen_ir::Module| {
         let mut host = Host::new();
         host.stdin = stdin.clone();
-        let frame = grant_onramp_caps(&mut host, m, None, None).frame;
+        let frame = grant_onramp_caps(&mut host, m, None, None, &staged).frame;
         (host, frame)
     };
     // #1414 S4-3c: offer `eval_run` whole first, as `temen_coop_open` offers a cold root. When the
@@ -6712,19 +6731,92 @@ pub extern "C" fn temen_link_encode_libs(
     )
 }
 
+/// What an embedder grants the next on-ramp open on its thread beyond the on-ramp powerbox
+/// ([`grant_onramp_caps`]). The open takes it ([`take_staged`]), so it serves that run alone.
+#[derive(Default)]
+struct Staged {
+    /// #2219, #2579 — modules, each granted as a `Module` under its name: a card's
+    /// `//// child: NAME.c` programs ([`temen_link_child_libs`]), or an embedder's child images
+    /// ([`temen_onramp_stage_module`]).
+    children: Vec<(String, temen_ir::Module)>,
+    /// #2579 — the `"budget"` a spawn pays from, as `[fuel, mem, spawn]` ceilings
+    /// ([`temen_onramp_stage_budget`]). Without one, a guest that spawns detached gets one window
+    /// of `mem` ([`Host::grant_detached_spawn_caps`]).
+    budget: Option<[i64; 3]>,
+    /// #2579 — JS capabilities, answered inside the call ([`temen_onramp_stage_js_cap`]); slot `i`
+    /// is the `i`-th.
+    js: Vec<String>,
+}
+
 thread_local! {
-    /// #2219 — the `//// child: NAME.c` programs a playground card's page linked for its next run
-    /// ([`temen_link_child_libs`]), each under the name its parent finds it by. The next on-ramp run
-    /// on this thread grants and takes them ([`grant_onramp_caps`]), so they serve that run alone.
-    static CHILD_PROGRAMS: std::cell::RefCell<Vec<(String, temen_ir::Module)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static STAGED: std::cell::RefCell<Staged> = std::cell::RefCell::new(Staged::default());
+}
+
+/// Take what is staged for this open, leaving nothing for the next.
+fn take_staged() -> Staged {
+    STAGED.with(|s| std::mem::take(&mut *s.borrow_mut()))
 }
 
 /// Hold `module` for the next on-ramp run on this thread, which grants it as a `Module` named `name`
 /// (#2219): how a card's `//// child: NAME.c` program reaches its parent. Public so a native test
 /// stages a card's child as the page does.
 pub fn stage_child_program(name: &str, module: temen_ir::Module) {
-    CHILD_PROGRAMS.with(|c| c.borrow_mut().push((name.to_string(), module)));
+    STAGED.with(|s| s.borrow_mut().children.push((name.to_string(), module)));
+}
+
+/// #2579 — stage the encoded module at `[mod_ptr, mod_len)` for the next on-ramp open on this
+/// thread, which grants it as a `Module` named `[name_ptr, name_len)`: a child image the guest spawns
+/// by name, as a native host's `grant_module` + `register_cap_name` give it. Returns `0`, or a
+/// negative `STATUS_*` for a name that is not UTF-8 or a module that does not decode or verify.
+#[no_mangle]
+pub extern "C" fn temen_onramp_stage_module(
+    name_ptr: *const u8,
+    name_len: usize,
+    mod_ptr: *const u8,
+    mod_len: usize,
+) -> i32 {
+    let Ok(name) = core::str::from_utf8(link_slice(name_ptr, name_len)) else {
+        return -STATUS_DECODE_ERR;
+    };
+    let Ok(m) = temen_encode::decode_module(link_slice(mod_ptr, mod_len)) else {
+        return -STATUS_DECODE_ERR;
+    };
+    // A host grants only modules the verifier passed (`Host::grant_module`).
+    if temen_verify::verify_module(&m).is_err() {
+        return -STATUS_VERIFY_ERR;
+    }
+    stage_child_program(name, m);
+    0
+}
+
+/// #2579 — stage the `"budget"` the next on-ramp open on this thread grants: a node with these
+/// `fuel`, `mem` and `spawn` ceilings (`-1` = none of its own, [`Host::grant_budget`]), which a
+/// guest's spawn pays from. It replaces the one window of `mem` a detached spawner gets by default.
+#[no_mangle]
+pub extern "C" fn temen_onramp_stage_budget(fuel: i64, mem: i64, spawn: i64) {
+    STAGED.with(|s| s.borrow_mut().budget = Some([fuel, mem, spawn]));
+}
+
+/// #2579 — stage the JS capability `[name_ptr, name_len)` (UTF-8) for the next on-ramp open on this
+/// thread, and return its **slot**: the key the page's `js_cap_call(slot, op, args, n, mem)`
+/// dispatches on (the coop driver's `onCap`). It is answered inside the call, with the calling
+/// guest's window through [`jspb::temen_jspb_read`] / [`jspb::temen_jspb_write`], and re-granted to
+/// a child or fork twin like any forkable host capability. `-1` for an empty or non-UTF-8 name, or
+/// one already staged. Executor 2 refuses a run with one ([`temen_par_powerbox_onramp`]): its tasks
+/// run on Workers that cannot call the page's function.
+#[no_mangle]
+pub extern "C" fn temen_onramp_stage_js_cap(name_ptr: *const u8, name_len: usize) -> i32 {
+    let Ok(name) = core::str::from_utf8(link_slice(name_ptr, name_len)) else {
+        return -1;
+    };
+    STAGED.with(|s| {
+        let js = &mut s.borrow_mut().js;
+        if name.is_empty() || js.iter().any(|n| n == name) {
+            return -1;
+        }
+        js.push(name.to_string());
+        (js.len() - 1) as i32
+    })
 }
 
 thread_local! {
@@ -6764,10 +6856,10 @@ pub extern "C" fn temen_notes_ptr() -> *const u8 {
 
 static mut NOTES: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
-/// Drop the staged child programs, for a card run that stops before its parent runs.
+/// Drop what is staged for the next on-ramp open ([`Staged`]), for a run that stops before it opens.
 #[no_mangle]
-pub extern "C" fn temen_child_programs_clear() {
-    CHILD_PROGRAMS.with(|c| c.borrow_mut().clear());
+pub extern "C" fn temen_onramp_stage_clear() {
+    take_staged();
 }
 
 /// Link a card's `//// child: NAME.c` program unit against the resident libraries (see
@@ -10670,12 +10762,14 @@ pub extern "C" fn temen_coop_open(
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
     };
     let requests = temen_interp::CapRequests::default();
-    // The on-ramp powerbox and environment the plain run gives `m` — the release session's.
+    // The on-ramp powerbox and environment the plain run gives `m` — the release session's. What
+    // the page staged is taken once: a declined leaf's powerbox is granted again for the run after.
     let init = onramp_env_init(&run_env());
+    let staged = take_staged();
     let host_for = |m: &temen_ir::Module| {
         let mut host = Host::new();
         host.stdin = stdin.clone();
-        let frame = grant_onramp_caps(&mut host, m, None, Some((&caps, &requests))).frame;
+        let frame = grant_onramp_caps(&mut host, m, None, Some((&caps, &requests)), &staged).frame;
         (host, frame)
     };
     // `CoopRun` owns its `Domain`; the window is built over `back` with the **oracle's** reservation
@@ -11956,7 +12050,13 @@ int main(void) {
         let mut host = Host::new();
         let requests = temen_interp::CapRequests::default();
         let caps = vec!["ping".to_string()];
-        grant_onramp_caps(&mut host, m, None, Some((&caps, &requests)));
+        grant_onramp_caps(
+            &mut host,
+            m,
+            None,
+            Some((&caps, &requests)),
+            &Staged::default(),
+        );
         let tierup = leaf.map(|leaf| bytecode::TierUpConfig {
             root: bytecode::ProgramEmit::default(),
             leaf: Some(leaf),
