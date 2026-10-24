@@ -17413,28 +17413,34 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let svck = host.lock_unpoisoned().domain_id() as usize;
                             fiber_park!(|slot: usize| {
                                 let mut sg = sr.lock();
-                                let wid = sg.next_wid;
-                                sg.next_wid += 1;
-                                if let Some(w) = wait {
-                                    sg.timers.push(Reverse((Instant::now() + w, wid, key)));
-                                }
-                                sg.wait_waiters.entry(key).or_default().push((
-                                    wid,
-                                    Waiter::Fiber {
-                                        reg: Arc::clone(&regc),
-                                        slot,
-                                        svc: svck,
-                                        // #1639 — the guest asked for a wait with no end, so the
-                                        // deadline just pushed is only the `MAX_WAIT` backstop.
-                                        wait_indefinite: to_ns < 0,
-                                        rewound: None,
-                                    },
-                                ));
                                 // Compare-under-lock: a value that already changed wakes the
-                                // fiber immediately with the not-equal status.
-                                let curv = mem.as_ref().map_or(0, |mm| mm.atomic_value(a, width));
+                                // fiber immediately with the not-equal status, and queues
+                                // nothing. A queued entry would outlive the wait and spend a later
+                                // notify meant for a fiber asleep on the key (#2601).
+                                let changed =
+                                    mem.as_ref().map_or(0, |mm| mm.atomic_value(a, width)) != exp;
+                                if !changed {
+                                    let wid = sg.next_wid;
+                                    sg.next_wid += 1;
+                                    if let Some(w) = wait {
+                                        sg.timers.push(Reverse((Instant::now() + w, wid, key)));
+                                    }
+                                    sg.wait_waiters.entry(key).or_default().push((
+                                        wid,
+                                        Waiter::Fiber {
+                                            reg: Arc::clone(&regc),
+                                            slot,
+                                            svc: svck,
+                                            // #1639 — the guest asked for a wait with no end, so
+                                            // the deadline just pushed is only the `MAX_WAIT`
+                                            // backstop.
+                                            wait_indefinite: to_ns < 0,
+                                            rewound: None,
+                                        },
+                                    ));
+                                }
                                 drop(sg);
-                                if curv != exp {
+                                if changed {
                                     regc.wake_blocked(slot, Reg::from_i32(WAIT_NOT_EQUAL));
                                 }
                                 sr.work.notify_all(); // idle workers recompute timer deadlines
