@@ -41,18 +41,20 @@ self.onmessage = async (e) => {
     if (memId >= 0 && memId !== x2MemId) releaseForeign(memId);
     return 0;
   };
-  // The thread's emitted tier (#1414 B6-3): the coop driver's (`emittedTier`), over the run's
-  // dispatch table as `temen_x2_*` reads it during a call — made at the thread's first call, with the
-  // run's tier-up module as its program. A call runs `f(win, env, ...argv)` with `"mapped"` set (and,
-  // on a page-checked tier, `"pagestate"` at its thread's page-state table) and writes its results at
-  // `out`, returning how many, or -(1 + the code the emitted code trapped with). On a spilling tier
-  // its frames push to the thread's spill stack, which lives as long as the thread. The emitted code
-  // runs on a slice of fuel: each time it spends one it asks for another,
-  // which it gets unless the run's `over` byte is set, so a run that ends while this thread is in
-  // emitted code stops it within a slice. The emitted tier is not metered: the slice is only how
-  // often it looks.
+  // The thread's emitted tiers over the engine's memory: the coop driver's (`emittedTier`), each made
+  // at the thread's first call that needs it. The run's (#1414 B6-3) has the run's tier-up module as
+  // its program, over the run's dispatch table as `temen_x2_*` reads it during a call. A leaf's
+  // (#1414 5c) has each leaf image the thread runs whole as an instance on it, as the pump's driver
+  // runs one. A leaf calls its own functions, so its tier's table stays empty, as a child's does
+  // (below) and the pump's does for a root leaf. A call runs `f(win, env, ...argv)` with `"mapped"`
+  // set (and, on a page-checked tier, `"pagestate"` at its thread's page-state table) and writes its
+  // results at `out`, returning how many, or -(1 + the code the emitted code trapped with). On a
+  // spilling tier its frames push to the thread's spill stack, which lives as long as the thread. The
+  // emitted code runs on a slice of fuel: each time it spends one it asks for another, which it gets
+  // unless the run's `over` byte is set, so a run that ends while this thread is in emitted code
+  // stops it within a slice. The emitted tier is not metered: the slice is only how often it looks.
   const X2_SLICE = 1n << 20n;
-  let x2Tier = null, x2Over = 0, x2Win = 0, x2Mapped = 0n;
+  let x2Tier = null, x2LeafTier = null, x2Over = 0, x2Win = 0, x2Mapped = 0n;
   // #2474: how many slices the emitted code has spent, so a tier-up can report the work it did.
   let x2Slices = 0;
   const x2Fuel = () => {
@@ -65,45 +67,77 @@ self.onmessage = async (e) => {
     const p = Number(ex.temen_x2_bytes_ptr());
     return new Uint8Array(memory.buffer).slice(p, p + len);
   };
-  const x2Enter = (win, mapped, over) => {
-    x2Win = win;
-    x2Mapped = mapped;
-    x2Over = over;
+  // How a tier over the engine's memory reaches the run: the run's tier as it is, and a leaf's with an
+  // empty table.
+  const x2Opts = {
+    tableLog2: () => ex.temen_x2_table_log2(),
+    nfuncs: () => ex.temen_x2_nfuncs(),
+    tableGen: () => ex.temen_x2_table_gen(),
+    slotUnit: (slot) => ex.temen_x2_slot_unit(slot),
+    slotUnitBytes: (slot) => x2Bytes(ex.temen_x2_slot_wasm_len(slot)),
+    shimBytes: (slot) => x2Bytes(ex.temen_x2_shim_len(slot)),
+    callInterp: (target, argsPtr, spillLen) => ex.temen_x2_call_interp(target, argsPtr, spillLen),
+    paged: () => ex.temen_x2_paged(),
+    mapped: () => x2Mapped,
+    mappedNow: () => ex.temen_x2_mapped_now(),
+    pagestatePtr: () => ex.temen_x2_pagestate_ptr(),
+    winPtr: () => x2Win,
+    deliverFaultAddr: (addr) => ex.temen_x2_deliver_fault_addr(addr),
+    spillBytes: () => ex.temen_x2_spill_bytes(),
+    spillPtr: () => ex.temen_x2_spill_ptr(),
+    fuelOut: x2Fuel,
+  };
+  // What a tier-up of program `module` runs over the engine's memory, and the tier it runs on: its
+  // leaf image, which this Worker instantiates the first time (#1414 5c: the root's is program 0,
+  // and an image a process execs or spawns has its own), or else the run's own region emit. The run
+  // takes a program as a leaf before any of its tier-ups, so what a Worker finds first holds for
+  // the run. An invoke (`undefined`) runs a unit, on the run's tier.
+  const x2Leaves = new Map();
+  const x2Program = (module) => {
+    let p = module === undefined ? null : x2Leaves.get(module);
+    if (p === undefined) {
+      const bytes = x2Bytes(ex.temen_x2_leaf_len(module));
+      if (bytes) {
+        x2LeafTier ??= emittedTier(ex, memory, {
+          ...x2Opts,
+          tableLog2: () => 0,
+          nfuncs: () => 0,
+          slotUnit: () => -1n,
+          slotUnitBytes: () => null,
+          shimBytes: () => null,
+        });
+        p = new WebAssembly.Instance(new WebAssembly.Module(bytes), x2LeafTier.imports()).exports;
+        x2LeafTier.register(p);
+      }
+      x2Leaves.set(module, p);
+    }
+    if (p) return [x2LeafTier, p];
     if (x2Tier === null) {
-      x2Tier = emittedTier(ex, memory, {
-        tableLog2: () => ex.temen_x2_table_log2(),
-        nfuncs: () => ex.temen_x2_nfuncs(),
-        tableGen: () => ex.temen_x2_table_gen(),
-        slotUnit: (slot) => ex.temen_x2_slot_unit(slot),
-        slotUnitBytes: (slot) => x2Bytes(ex.temen_x2_slot_wasm_len(slot)),
-        shimBytes: (slot) => x2Bytes(ex.temen_x2_shim_len(slot)),
-        callInterp: (target, argsPtr, spillLen) => ex.temen_x2_call_interp(target, argsPtr, spillLen),
-        paged: () => ex.temen_x2_paged(),
-        mapped: () => x2Mapped,
-        mappedNow: () => ex.temen_x2_mapped_now(),
-        pagestatePtr: () => ex.temen_x2_pagestate_ptr(),
-        winPtr: () => x2Win,
-        deliverFaultAddr: (addr) => ex.temen_x2_deliver_fault_addr(addr),
-        spillBytes: () => ex.temen_x2_spill_bytes(),
-        spillPtr: () => ex.temen_x2_spill_ptr(),
-        fuelOut: x2Fuel,
-      });
-      const p = Number(ex.temen_x2_wasm_ptr()), n = Number(ex.temen_x2_wasm_len());
+      x2Tier = emittedTier(ex, memory, x2Opts);
+      const at = Number(ex.temen_x2_wasm_ptr()), n = Number(ex.temen_x2_wasm_len());
       if (n > 0) {
-        const bytes = new Uint8Array(memory.buffer).slice(p, p + n);
+        const bytes = new Uint8Array(memory.buffer).slice(at, at + n);
         x2Tier.setProgram(new WebAssembly.Instance(new WebAssembly.Module(bytes), x2Tier.imports()).exports);
       }
     }
-    x2Tier.syncTableSync();
-    for (const g of x2Tier.mappedGlobals) g.value = mapped;
+    return [x2Tier, x2Tier.program()];
+  };
+  const x2Enter = (module, win, mapped, over) => {
+    x2Win = win;
+    x2Mapped = mapped;
+    x2Over = over;
+    // Before the globals below are armed: they arm a leaf's instance made here too.
+    const [tier, program] = x2Program(module);
+    tier.syncTableSync();
+    for (const g of tier.mappedGlobals) g.value = mapped;
     if (ex.temen_x2_paged()) {
       const ps = Number(ex.temen_x2_pagestate_ptr());
-      for (const g of x2Tier.pagestateGlobals) g.value = ps;
+      for (const g of tier.pagestateGlobals) g.value = ps;
     }
-    for (const g of x2Tier.fuelGlobals) g.value = X2_SLICE;
-    x2Tier.armEnv();
+    for (const g of tier.fuelGlobals) g.value = X2_SLICE;
+    tier.armEnv();
     if (tierupCell) Atomics.add(new Int32Array(memory.buffer), tierupCell >> 2, 1); // the run's count
-    return [x2Tier, x2Win];
+    return [tier, x2Win, program];
   };
   // A detached child's tier (#1414 ED-2): its granted module's emit over the child's own memory,
   // which this Worker registered for the child's root task. The call's context is the first in the
@@ -172,7 +206,7 @@ self.onmessage = async (e) => {
     for (const g of x2Child.fuelGlobals) g.value = X2_SLICE;
     x2Child.armEnv();
     if (tierupCell) Atomics.add(new Int32Array(memory.buffer), tierupCell >> 2, 1); // the run's count
-    return [x2Child, ex.temen_detached_header_bytes()];
+    return [x2Child, ex.temen_detached_header_bytes(), x2Child.program()];
   };
   // Enter a tier (`enter` returns it, the window's base, the emitted function and its arguments),
   // call the function, and write its results at `out` (`res` makes each a slot). Whatever throws
@@ -196,16 +230,17 @@ self.onmessage = async (e) => {
     }
   };
   // A tier-up of the thread's task: `f{func}` of program `module`'s emit, its slots all i64. Over
-  // the engine's memory (`mem` -1) it is the run's own program; over a child's own memory, the
-  // child's granted module. The fuel the call spent goes to `work`, for the run's tier-up profile.
+  // the engine's memory (`mem` -1) it is a leaf image the run runs whole, or the run's own program;
+  // over a child's own memory, the child's granted module. The fuel the call spent goes to `work`,
+  // for the run's tier-up profile.
   const x2_tierup = (module, func, argv, argc, win, mapped, over, out, mem, work) => {
     let fuel, slices;
     const n = x2Call(() => {
-      const [tier, base] = mem < 0 ? x2Enter(win, mapped, over) : x2ChildEnter(mem, module, mapped, over);
+      const [tier, base, program] =
+        mem < 0 ? x2Enter(module, win, mapped, over) : x2ChildEnter(mem, module, mapped, over);
       const at = argv >>> 3, view = new BigInt64Array(memory.buffer);
       const args = [];
       for (let i = 0; i < argc; i++) args.push(view[at + i]);
-      const program = tier.program();
       fuel = program.fuel;
       slices = x2Slices;
       return [tier, base, program['f' + func], args];
@@ -221,7 +256,7 @@ self.onmessage = async (e) => {
   const x2_invoke = (code, wasm, wasmLen, types, nparams, nresults, argv, win, mapped, over, out) => {
     const tc = new Uint8Array(memory.buffer).slice(types, types + nparams + nresults);
     return x2Call(() => {
-      const [tier, base] = x2Enter(win, mapped, over);
+      const [tier, base] = x2Enter(undefined, win, mapped, over);
       const unit = tier.unitForSync(code, new Uint8Array(memory.buffer).slice(wasm, wasm + wasmLen));
       const at = argv >>> 3, view = new BigInt64Array(memory.buffer);
       const args = [];
@@ -259,7 +294,8 @@ self.onmessage = async (e) => {
         }
       }
     }
-    if (x2Tier !== null) x2Tier.free(); // the root's thread ran its task here
+    // The root's thread ran its task here.
+    for (const tier of [x2Tier, x2LeafTier]) tier?.free();
     const status = ex.temen_status(); // lib.rs STATUS_*: 0 ok · 3 trap · 5 exit
     if (status === 0) {
       self.postMessage({ kind: 'done', value: ex.temen_run_value().toString() });
@@ -277,7 +313,7 @@ self.onmessage = async (e) => {
   if (role === 'x2thread') {
     if (x2Mem) registerForeign(x2Mem, ex.temen_detached_header_bytes(), x2MemId);
     ex.temen_x2_thread(start);
-    if (x2Tier !== null) x2Tier.free();
+    for (const tier of [x2Tier, x2LeafTier]) tier?.free();
     if (x2Child !== null) ex.temen_dealloc(x2ChildScratch, ex.temen_wasmjit_env_bytes());
     self.close(); // the thread has counted itself out of its run: this Worker has nothing left to do
     return;

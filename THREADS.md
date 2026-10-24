@@ -460,6 +460,19 @@ property, so in practice:
   own, since the root's Worker watches the run; a run the page has no part in still runs its root on
   that Worker, to its end.
 
+  *Since #1414 5c:* executor 2 runs leaf images as the pump does. Its tier takes the host's leaf
+  emitter (`ThreadTier::leaf`). A run over a module offers its root whole (`root_leaf`), and an
+  image a process execs or spawns is offered as on the pump. Each task that starts at an emitted
+  entry, a leaf's included, starts through its `Vm` (`Vm::tier_up_leaf`): its first step surfaces
+  the entry, which its thread runs on its Worker. The thread holds the leaf's frames while a call in
+  them waits for an answer, stdin, a pipe or a child, so the browser takes a leaf that parks too. A
+  Worker runs a program's leaf over the engine's memory (`temen_x2_leaf_len`) on a tier of its own,
+  whose table stays empty as a child's does, since a leaf calls its own functions. Any other tier-up
+  there runs the run's region emit, on the run's tier. A run with `tierup` and no part for the page,
+  an on-ramp C program say, now runs its root whole, as the pump's root leaf does. No browser recipe
+  of executor 2 has the POSIX personality yet (#2376), so in the browser only the root is a leaf;
+  natively, exec'd and spawned leaves run on both executors (`leaf_tierup.rs`).
+
 ### Known wrinkles — all resolved in `4c-wasm`
 
 - **Main thread can't `atomic.wait`** (it traps in browsers) — *resolved*: every vCPU (including the
