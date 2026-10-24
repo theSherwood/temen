@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**287 exports** in 37 families — 240 referenced from JS, 47 referenced by nothing, 51 behind a `cfg`.
+**290 exports** in 37 families — 243 referenced from JS, 47 referenced by nothing, 54 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -18,7 +18,7 @@
 | `durable` | 4 | 4 | 0 |
 | `exit` | 1 | 1 | 0 |
 | `fault` | 1 | 1 | 0 |
-| `foreign` | 3 | 3 | 3 |
+| `foreign` | 6 | 6 | 6 |
 | `framebuffer` | 4 | 4 | 0 |
 | `jspb` | 7 | 7 | 0 |
 | `link` | 11 | 8 | 0 |
@@ -199,7 +199,10 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 
 - `temen_foreign_bench` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_foreign_poke` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_foreign_read_words` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_foreign_selftest` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_foreign_slots` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_foreign_write_words` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 
 ### `framebuffer`
 

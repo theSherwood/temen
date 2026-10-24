@@ -1,7 +1,8 @@
-//! #2416: the foreign-memory word path's two wasm modules, the dispatcher an agent binds the engine's
-//! `foreign_load`/`foreign_store` to and the accessor it instantiates over each registered memory, are
-//! embedded in `web/foreign-mem.js` as bytes beside the WAT they are assembled from. This pins the
-//! bytes to the WAT, so an edit to either alone fails here rather than in a browser.
+//! The foreign-memory modules (#2416, #1414 5d) the engine reaches a detached child's memory through:
+//! the accessor an agent instantiates over each registered memory, and the copier that moves spans
+//! between it and the engine's memory. Both are embedded in `web/foreign-mem.js` as bytes beside the WAT
+//! they are assembled from. This pins the bytes to the WAT, so an edit to either alone fails here rather
+//! than in a browser.
 
 /// The text of the `/* wasm:<tag>` block comment and the bytes of the `const <var> = new
 /// Uint8Array([...])` after it.
@@ -24,7 +25,7 @@ fn embedded<'a>(js: &'a str, tag: &str, var: &str) -> (&'a str, Vec<u8>) {
 fn the_embedded_foreign_memory_modules_are_their_wat() {
     let js = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/web/foreign-mem.js"))
         .expect("read web/foreign-mem.js");
-    for (tag, var) in [("dispatch", "DISPATCH_WASM"), ("accessor", "ACCESSOR_WASM")] {
+    for (tag, var) in [("accessor", "ACCESSOR_WASM"), ("copier", "COPIER_WASM")] {
         let (wat, bytes) = embedded(&js, tag, var);
         let want = wat::parse_str(wat).unwrap_or_else(|e| panic!("{tag}'s WAT: {e}"));
         assert_eq!(bytes, want, "`{var}` is not `wasm:{tag}`'s WAT assembled");

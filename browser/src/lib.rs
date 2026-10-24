@@ -11806,29 +11806,71 @@ pub extern "C" fn temen_coop_close() {
 // ===== Region::Foreign host seam (#1284, DETACHED_JIT.md §3.3) ====================================
 // A detached child's window on the wasm-JIT tier is its own `WebAssembly.Memory`, which this cdylib
 // cannot address (its pointers are offsets into ITS one linear memory). `temen_mem::Region::Foreign`
-// reaches such a memory through a `ForeignOps` table; here the table is the page's
-// `temen_host.foreign_*` imports (`web/foreign-mem.js`), with `u32` offsets (they are bounded by
-// `Region` first, and a child memory is < 4 GiB by wasm32 construction). A byte or word access
-// (`foreign_load`/`foreign_store`) is bound to wasm, an accessor instance over the child's memory
-// (#2416), so it calls no JavaScript and its value comes back in a register. The span copies, fill,
-// copy, atomics and grow are JS functions; atomics pass their operands through a 16-byte cell in this
-// memory, so no `i64` (a BigInt) crosses into JavaScript. Threads build only (the plain build has no
-// Workers and no detached children, and stays import-free for its Node harnesses).
+// reaches such a memory through a `ForeignOps` table, and here each memory's table is its own: every
+// field is a function of a small accessor instance over that memory, which `web/foreign-mem.js` puts
+// at `slot0 + id * FOREIGN_SLOTS` + the field's place in the function table of each engine instance its
+// agent adopted, telling it `slot0` (`temen_foreign_slots`). So an access is one wasm call, from
+// `Region` straight into the accessor; no JavaScript runs on any access (#1414 5d). Only minting a
+// memory needs JavaScript (`foreign_mint`). Threads build only (the plain build has no Workers and no
+// detached children, and stays import-free for its Node harnesses).
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 mod foreign_mem {
+    use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
     use temen_mem::ForeignOps;
 
     #[link(wasm_import_module = "temen_host")]
     extern "C" {
-        fn foreign_read(id: u32, off: u32, dst: *mut u8, len: u32);
-        fn foreign_write(id: u32, off: u32, src: *const u8, len: u32);
-        fn foreign_load(id: u32, off: u32, width: u32) -> i64;
-        fn foreign_store(id: u32, off: u32, width: u32, val: i64);
-        fn foreign_fill(id: u32, off: u32, len: u32, b: u32);
-        fn foreign_copy(id: u32, dst: u32, src: u32, len: u32);
-        fn foreign_atomic(id: u32, kind: u32, off: u32, width: u32, ab: *mut u8);
-        fn foreign_grow(id: u32, len: u32) -> u32;
         fn foreign_mint(base: u32, initial: u32, maximum: u32) -> i32;
+    }
+
+    /// The table slots each foreign memory's functions take: one per `ForeignOps` field, in field
+    /// order (see `web/foreign-mem.js`).
+    const FOREIGN_SLOTS: u32 = 8;
+    /// Where foreign memory 0's slots start in this instance's function table: the table's length when
+    /// the agent adopted the instance. The same for every instance of this build, so one value serves
+    /// every agent on this engine memory. Until it is set it is `UNSET`, from which every slot lies past
+    /// the end of any table, so an access then traps at the call rather than reaching another function.
+    static SLOT0: AtomicU32 = AtomicU32::new(UNSET);
+    const UNSET: u32 = 1 << 31;
+
+    /// Set where the foreign memories' slots start in this instance's table (`slot0`). 1 = taken, or
+    /// already this value; 0 = refused: another agent set a different one, which only a different
+    /// build on the same engine memory could do, or `slot0` is 0, the null function's index.
+    #[no_mangle]
+    pub extern "C" fn temen_foreign_slots(slot0: u32) -> u32 {
+        if slot0 == 0 {
+            return 0;
+        }
+        match SLOT0.compare_exchange(UNSET, slot0, Relaxed, Relaxed) {
+            Ok(_) => 1,
+            Err(held) => u32::from(held == slot0),
+        }
+    }
+
+    /// Foreign memory `id`'s table: its accessor's functions, by their slots in this instance's table.
+    pub fn ops(id: u32) -> ForeignOps {
+        // Never 0, the null function pointer: `SLOT0` is not, and a slot past `u32::MAX` saturates.
+        let slot = |k: u32| {
+            let at = u64::from(SLOT0.load(Relaxed)) + u64::from(id) * u64::from(FOREIGN_SLOTS);
+            u32::try_from(at + u64::from(k)).unwrap_or(u32::MAX) as usize
+        };
+        // SAFETY: a wasm32 function pointer is its index in this instance's table, and a call through
+        // one checks the callee's type. Before the engine names `id`, the agent fills memory `id`'s
+        // slots with its functions, each of exactly the type of the field it serves; a slot that holds
+        // anything else (an unregistered id's empty one, or one past the table's end) traps at the call
+        // rather than running it.
+        unsafe {
+            ForeignOps {
+                read: core::mem::transmute::<usize, _>(slot(0)),
+                write: core::mem::transmute::<usize, _>(slot(1)),
+                load: core::mem::transmute::<usize, _>(slot(2)),
+                store: core::mem::transmute::<usize, _>(slot(3)),
+                fill: core::mem::transmute::<usize, _>(slot(4)),
+                copy_within: core::mem::transmute::<usize, _>(slot(5)),
+                atomic: core::mem::transmute::<usize, _>(slot(6)),
+                grow: core::mem::transmute::<usize, _>(slot(7)),
+            }
+        }
     }
 
     /// Mint a fresh child memory on the page (#1286): `initial`/`maximum` bytes **including** the host
@@ -11843,56 +11885,49 @@ mod foreign_mem {
         u32::try_from(id).ok()
     }
 
-    fn read(id: u32, off: u64, out: &mut [u8]) {
-        // SAFETY: `out` is a live cdylib buffer of `out.len()` bytes; JS copies exactly that many in.
-        unsafe { foreign_read(id, off as u32, out.as_mut_ptr(), out.len() as u32) }
-    }
-    fn write(id: u32, off: u64, data: &[u8]) {
-        // SAFETY: `data` is a live cdylib buffer; JS reads exactly `data.len()` bytes from it.
-        unsafe { foreign_write(id, off as u32, data.as_ptr(), data.len() as u32) }
-    }
-    fn load(id: u32, off: u64, width: u32) -> u64 {
-        // SAFETY: no cdylib memory is touched; the word comes back in a register.
-        unsafe { foreign_load(id, off as u32, width) as u64 }
-    }
-    fn store(id: u32, off: u64, width: u32, val: u64) {
-        // SAFETY: no cdylib memory is touched.
-        unsafe { foreign_store(id, off as u32, width, val as i64) }
-    }
-    fn fill(id: u32, off: u64, len: u64, b: u8) {
-        // SAFETY: no cdylib memory is touched.
-        unsafe { foreign_fill(id, off as u32, len as u32, b as u32) }
-    }
-    fn copy_within(id: u32, dst: u64, src: u64, len: u64) {
-        // SAFETY: no cdylib memory is touched.
-        unsafe { foreign_copy(id, dst as u32, src as u32, len as u32) }
-    }
-    fn atomic(id: u32, kind: u32, off: u64, width: u32, a: u64, b: u64) -> u64 {
-        let mut ab = [0u8; 16];
-        ab[..8].copy_from_slice(&a.to_le_bytes());
-        ab[8..].copy_from_slice(&b.to_le_bytes());
-        // SAFETY: `ab` is a live 16-byte cdylib buffer; JS reads both operands and writes the old value
-        // into its first 8 bytes.
-        unsafe { foreign_atomic(id, kind, off as u32, width, ab.as_mut_ptr()) };
-        u64::from_le_bytes(ab[..8].try_into().unwrap())
+    /// The `read` slot where the agent has no multi-memory: a span out of foreign memory `id`, through
+    /// its 8-byte and 1-byte loads.
+    ///
+    /// # Safety
+    /// `dst` is valid for `len` bytes of writes (`ForeignOps::read`).
+    #[no_mangle]
+    pub unsafe extern "C" fn temen_foreign_read_words(id: u32, off: u64, dst: *mut u8, len: usize) {
+        let load = ops(id).load;
+        // SAFETY: the caller's contract.
+        let out = unsafe { core::slice::from_raw_parts_mut(dst, len) };
+        let mut at = off;
+        let mut words = out.chunks_exact_mut(8);
+        for w in &mut words {
+            w.copy_from_slice(&load(id, at, 8).to_le_bytes());
+            at += 8;
+        }
+        for b in words.into_remainder() {
+            *b = load(id, at, 1) as u8;
+            at += 1;
+        }
     }
 
-    fn grow(id: u32, len: u64) -> bool {
-        // SAFETY: no cdylib memory is touched. A child memory is < 4 GiB by wasm32 construction.
-        u32::try_from(len).is_ok_and(|l| unsafe { foreign_grow(id, l) } != 0)
+    /// The `write` slot where the agent has no multi-memory: a span into foreign memory `id`, through
+    /// its 8-byte and 1-byte stores.
+    ///
+    /// # Safety
+    /// `src` is valid for `len` bytes of reads (`ForeignOps::write`).
+    #[no_mangle]
+    pub unsafe extern "C" fn temen_foreign_write_words(id: u32, off: u64, src: *const u8, len: usize) {
+        let store = ops(id).store;
+        // SAFETY: the caller's contract.
+        let data = unsafe { core::slice::from_raw_parts(src, len) };
+        let (mut at, words) = (off, data.chunks_exact(8));
+        let rest = words.remainder();
+        for w in words {
+            store(id, at, 8, u64::from_le_bytes(w.try_into().unwrap()));
+            at += 8;
+        }
+        for &b in rest {
+            store(id, at, 1, u64::from(b));
+            at += 1;
+        }
     }
-
-    /// The one table every `Region::foreign` in this cdylib uses.
-    pub static OPS: ForeignOps = ForeignOps {
-        read,
-        write,
-        load,
-        store,
-        fill,
-        copy_within,
-        atomic,
-        grow,
-    };
 }
 
 /// The host header at the bottom of a detached child's memory (#1285): one wasm page holding the
@@ -11919,7 +11954,7 @@ pub const DETACHED_DEFAULT_MAX_BYTES: u64 = 1 << 30;
 /// A `Region::Foreign` over the page-registered memory `id` with `len` addressable bytes.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 pub fn foreign_region(id: u32, len: u64) -> temen_mem::Region {
-    temen_mem::Region::foreign(id, len, &foreign_mem::OPS)
+    temen_mem::Region::foreign(id, len, foreign_mem::ops(id))
 }
 
 /// **Self-test** of the Foreign seam over a real second `WebAssembly.Memory`: `temen_mem::differential`
@@ -11960,7 +11995,8 @@ pub extern "C" fn temen_foreign_poke(id: u32, off: u32, val: u32) {
 /// **Per-access cost probe** for the decline-path gate (#1284): `iters` seeded accesses, returning a
 /// checksum the page compares across backings. `kind` 0/1 = one `write_word` + one `read_word` (8-byte,
 /// aligned — the bytecode interpreter's path) over a flat `Shared` buffer / the Foreign memory `id`;
-/// 2/3 = one `set_byte` + one `byte` (the tree-walker's path) over the same two. The page times each.
+/// 2/3 = one `set_byte` + one `byte` (the tree-walker's path) over the same two; 4/5 = one 8-byte
+/// atomic fetch-add; 6/7 = one 64-byte `write_from` + one `read_into`. The page times each.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_foreign_bench(id: u32, size: u32, kind: u32, iters: u32) -> u64 {
@@ -11989,9 +12025,17 @@ pub extern "C" fn temen_foreign_bench(id: u32, size: u32, kind: u32, iters: u32)
         if kind < 2 {
             region.write_word(off, 8, s);
             sum = sum.wrapping_add(region.read_word((off + 64) % size, 8));
-        } else {
+        } else if kind < 4 {
             region.set_byte(off, s as u8);
             sum = sum.wrapping_add(u64::from(region.byte((off + 64) % size)));
+        } else if kind < 6 {
+            sum = sum.wrapping_add(region.atomic_rmw(off, 8, temen_mem::RmwOp::Add, s));
+        } else {
+            let at = off % (size - 128);
+            let mut span = [s as u8; 64];
+            region.write_from(at, &span);
+            region.read_into(at + 64, &mut span);
+            sum = sum.wrapping_add(u64::from(span[7]));
         }
     }
     drop(shared);

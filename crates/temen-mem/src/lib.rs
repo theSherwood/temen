@@ -49,8 +49,8 @@
 //! And one **proxied** backing: **`Foreign`** (#1284, `DETACHED_JIT.md` §3.3) — a region whose bytes
 //! live in memory this process cannot address (a detached child's own `WebAssembly.Memory` on
 //! wasm32, where the engine's pointers are offsets into *its* one linear memory). Every accessor
-//! calls through a caller-supplied [`ForeignOps`] table; the browser cdylib fills it with JS host
-//! imports, a native test fills it with a mock. Not flat-addressable (`raw_base` is `None`), so a
+//! calls through a caller-supplied [`ForeignOps`] table; the browser cdylib fills it with the
+//! functions of a small wasm instance over that memory, a native test with a mock. Not flat-addressable (`raw_base` is `None`), so a
 //! consumer that needs a `base + off` pointer view declines it, as for `Paged`.
 
 use std::collections::BTreeMap;
@@ -127,7 +127,9 @@ pub enum Region {
     Foreign(Foreign),
 }
 
-/// The accessor table behind [`Region::Foreign`]: how to reach the bytes of foreign backing `id`.
+/// The accessor table behind [`Region::Foreign`]: how to reach the bytes of a foreign backing. Every
+/// call passes the backing's `id`: an embedder that serves several backings with one table keys on
+/// it, and one whose table belongs to a single backing can ignore it (the browser's, #1414 5d).
 /// Offsets are region-relative and already bounded to `[0, len)` by `Region` before the call, so an
 /// implementation may trust them. `read`/`write` copy a span; `load`/`store` move one little-endian
 /// word of `width` 1, 2, 4 or 8 bytes, zero-extended on load and truncated on store, and serve every
@@ -136,16 +138,25 @@ pub enum Region {
 /// (`a` = value), 2..=7 = read-modify-write ([`RmwOp::code`], `a` = operand), 8 = compare-exchange
 /// (`a` = expected, `b` = replacement); it returns the **old** value (`width` 4 or 8, `off` aligned).
 /// `grow` asks the embedder to make at least `len` bytes addressable (a `memory.grow` of the foreign
-/// memory); `false` = refused, the region keeps its old length.
+/// memory); 0 = refused, the region keeps its old length.
+///
+/// The functions are `extern "C"`, so the embedder can fill the table with functions it did not
+/// compile: the browser's are another wasm instance's, called by their index in the engine's own
+/// function table. That is also why a span is a pointer and a length, and `grow` answers a `u32`
+/// where Rust would use a `bool`.
+#[derive(Clone, Copy)]
 pub struct ForeignOps {
-    pub read: fn(id: u32, off: u64, out: &mut [u8]),
-    pub write: fn(id: u32, off: u64, data: &[u8]),
-    pub load: fn(id: u32, off: u64, width: u32) -> u64,
-    pub store: fn(id: u32, off: u64, width: u32, val: u64),
-    pub fill: fn(id: u32, off: u64, len: u64, b: u8),
-    pub copy_within: fn(id: u32, dst: u64, src: u64, len: u64),
-    pub atomic: fn(id: u32, kind: u32, off: u64, width: u32, a: u64, b: u64) -> u64,
-    pub grow: fn(id: u32, len: u64) -> bool,
+    /// Copy `[off, off + len)` out to `dst`. SAFETY (caller): `dst` is valid for `len` bytes of writes.
+    pub read: unsafe extern "C" fn(id: u32, off: u64, dst: *mut u8, len: usize),
+    /// Copy `len` bytes from `src` into `[off, off + len)`. SAFETY (caller): `src` is valid for `len`
+    /// bytes of reads.
+    pub write: unsafe extern "C" fn(id: u32, off: u64, src: *const u8, len: usize),
+    pub load: extern "C" fn(id: u32, off: u64, width: u32) -> u64,
+    pub store: extern "C" fn(id: u32, off: u64, width: u32, val: u64),
+    pub fill: extern "C" fn(id: u32, off: u64, len: u64, b: u8),
+    pub copy_within: extern "C" fn(id: u32, dst: u64, src: u64, len: u64),
+    pub atomic: extern "C" fn(id: u32, kind: u32, off: u64, width: u32, a: u64, b: u64) -> u64,
+    pub grow: extern "C" fn(id: u32, len: u64) -> u32,
 }
 
 /// The [`ForeignOps::atomic`] kind for a plain load / store / compare-exchange.
@@ -155,11 +166,12 @@ pub const FOREIGN_ATOMIC_CMPXCHG: u32 = 8;
 
 /// A proxied backing (see [`Region::Foreign`]): the foreign memory's id in the embedder's registry,
 /// its current addressable length (the foreign memory can grow; the owner bumps it with
-/// [`Region::set_foreign_len`]), and the accessor table.
+/// [`Region::set_foreign_len`]), and the accessor table, held by value so an access reads its
+/// function straight from the region.
 pub struct Foreign {
     id: u32,
     len: AtomicU64,
-    ops: &'static ForeignOps,
+    ops: ForeignOps,
 }
 
 impl Foreign {
@@ -254,7 +266,7 @@ impl Region {
 
     /// A proxied region over foreign backing `id` with `len` addressable bytes, reached through `ops`
     /// (#1284). `len` may later grow ([`Region::set_foreign_len`]); it never shrinks.
-    pub fn foreign(id: u32, len: u64, ops: &'static ForeignOps) -> Region {
+    pub fn foreign(id: u32, len: u64, ops: ForeignOps) -> Region {
         Region::Foreign(Foreign {
             id,
             len: AtomicU64::new(len),
@@ -304,7 +316,7 @@ impl Region {
                 if len <= f.len.load(Ordering::Acquire) {
                     return true;
                 }
-                let ok = (f.ops.grow)(f.id, len);
+                let ok = (f.ops.grow)(f.id, len) != 0;
                 if ok {
                     f.len.fetch_max(len, Ordering::AcqRel);
                 }
@@ -482,7 +494,8 @@ impl Region {
                 let n = clamp_len(off, out.len() as u64, self.len()) as usize;
                 out[n..].fill(0);
                 if n != 0 {
-                    (f.ops.read)(f.id, off, &mut out[..n]);
+                    // SAFETY: `out` holds at least `n` writable bytes.
+                    unsafe { (f.ops.read)(f.id, off, out.as_mut_ptr(), n) };
                 }
             }
         }
@@ -501,7 +514,8 @@ impl Region {
             Backing::Foreign(f) => {
                 let n = clamp_len(off, data.len() as u64, self.len()) as usize;
                 if n != 0 {
-                    (f.ops.write)(f.id, off, &data[..n]);
+                    // SAFETY: `data` holds at least `n` readable bytes.
+                    unsafe { (f.ops.write)(f.id, off, data.as_ptr(), n) };
                 }
             }
         }
@@ -2254,35 +2268,43 @@ mod mock_foreign {
         (g.len() - 1) as u32
     }
 
-    fn read(id: u32, off: u64, out: &mut [u8]) {
+    fn read_span(id: u32, off: u64, out: &mut [u8]) {
         let g = MEMS.lock().unwrap();
         let o = off as usize;
         out.copy_from_slice(&g[id as usize][o..o + out.len()]);
     }
-    fn write(id: u32, off: u64, data: &[u8]) {
+    fn write_span(id: u32, off: u64, data: &[u8]) {
         let mut g = MEMS.lock().unwrap();
         let o = off as usize;
         g[id as usize][o..o + data.len()].copy_from_slice(data);
     }
-    fn load(id: u32, off: u64, width: u32) -> u64 {
+    unsafe extern "C" fn read(id: u32, off: u64, dst: *mut u8, len: usize) {
+        // SAFETY: the caller's contract (`ForeignOps::read`).
+        read_span(id, off, unsafe { std::slice::from_raw_parts_mut(dst, len) })
+    }
+    unsafe extern "C" fn write(id: u32, off: u64, src: *const u8, len: usize) {
+        // SAFETY: the caller's contract (`ForeignOps::write`).
+        write_span(id, off, unsafe { std::slice::from_raw_parts(src, len) })
+    }
+    extern "C" fn load(id: u32, off: u64, width: u32) -> u64 {
         let mut b = [0u8; 8];
-        read(id, off, &mut b[..width as usize]);
+        read_span(id, off, &mut b[..width as usize]);
         u64::from_le_bytes(b)
     }
-    fn store(id: u32, off: u64, width: u32, val: u64) {
-        write(id, off, &val.to_le_bytes()[..width as usize]);
+    extern "C" fn store(id: u32, off: u64, width: u32, val: u64) {
+        write_span(id, off, &val.to_le_bytes()[..width as usize]);
     }
-    fn fill(id: u32, off: u64, len: u64, b: u8) {
+    extern "C" fn fill(id: u32, off: u64, len: u64, b: u8) {
         let mut g = MEMS.lock().unwrap();
         let o = off as usize;
         g[id as usize][o..o + len as usize].fill(b);
     }
-    fn copy_within(id: u32, dst: u64, src: u64, len: u64) {
+    extern "C" fn copy_within(id: u32, dst: u64, src: u64, len: u64) {
         let mut g = MEMS.lock().unwrap();
         let (d, s, n) = (dst as usize, src as usize, len as usize);
         g[id as usize].copy_within(s..s + n, d);
     }
-    fn atomic(id: u32, kind: u32, off: u64, width: u32, a: u64, b: u64) -> u64 {
+    extern "C" fn atomic(id: u32, kind: u32, off: u64, width: u32, a: u64, b: u64) -> u64 {
         let mut g = MEMS.lock().unwrap();
         let m = &mut g[id as usize];
         let o = off as usize;
@@ -2316,13 +2338,13 @@ mod mock_foreign {
         old
     }
 
-    fn grow(id: u32, len: u64) -> bool {
+    extern "C" fn grow(id: u32, len: u64) -> u32 {
         let mut g = MEMS.lock().unwrap();
         let m = &mut g[id as usize];
         if m.len() < len as usize {
             m.resize(len as usize, 0);
         }
-        true
+        1
     }
 
     pub static OPS: ForeignOps = ForeignOps {
@@ -2348,7 +2370,7 @@ mod foreign_tests {
     fn differential_foreign_vs_paged_fuzz() {
         let (size, page) = (3 * 4096, 4096);
         let id = mock_foreign::new_mem(size);
-        let a = Region::foreign(id, size, &mock_foreign::OPS);
+        let a = Region::foreign(id, size, mock_foreign::OPS);
         super::tests::fuzz_against(
             &a,
             &Region::paged(size, page),
@@ -2363,7 +2385,7 @@ mod foreign_tests {
     #[test]
     fn foreign_length_grows_and_is_not_flat() {
         let id = mock_foreign::new_mem(8192);
-        let r = Region::foreign(id, 4096, &mock_foreign::OPS);
+        let r = Region::foreign(id, 4096, mock_foreign::OPS);
         assert!(r.raw_base().is_none());
         assert!(r.raw_base_at(0).is_none());
         r.set_byte(5000, 7);
