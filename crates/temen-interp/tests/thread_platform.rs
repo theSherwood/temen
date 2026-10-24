@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use temen_interp::bytecode::{
-    self, EmittedCall, EmittedTarget, Hotness, ModuleOffer, ProgramEmit, ThreadPlatform,
-    ThreadStart, ThreadTier,
+    self, CoopEvent, EmittedCall, EmittedTarget, Hotness, LeafOffer, ModuleOffer, ProgramEmit,
+    ThreadPlatform, ThreadStart, ThreadTier,
 };
 use temen_interp::{ForeignOps, Host, JitValidated, Region, Trap, Value};
 use temen_ir::{Module, SpawnRec, ValType};
@@ -208,6 +208,7 @@ fn tier(
                 ..Default::default()
             },
             spill: 0,
+            leaf: None,
             modules: None,
             run,
         }),
@@ -262,6 +263,114 @@ fn each_thread_runs_its_entry_on_its_emitted_tier() {
         ENTRIES.load(Ordering::SeqCst),
         4,
         "each thread's entry tiered up"
+    );
+}
+
+/// The root counts to 1000 in function 1, with no thread of its own: an image the leaf emitter is
+/// offered whole.
+const COUNT_ALONE: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vn = i64.const 1000
+  vc = call 1 (vn)
+  return vc
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 0
+  br 1(v0, v1)
+}
+block 1 (v2: i64, v3: i64) {
+  v4 = i64.lt_s v3 v2
+  br_if v4 2(v2, v3) 3(v3)
+}
+block 2 (v5: i64, v6: i64) {
+  v7 = i64.const 1
+  v8 = i64.add v6 v7
+  br 1(v5, v8)
+}
+block 3 (v9: i64) {
+  return v9
+  }
+}
+";
+
+/// The calls the leaf tier ran: `(program, function, the thread it ran on)`.
+static LEAF_CALLS: Mutex<Vec<(u32, u32, std::thread::ThreadId)>> = Mutex::new(Vec::new());
+
+fn recording_leaf_calls(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
+    let EmittedTarget::Region { module, func } = call.target else {
+        panic!("only tier-ups reach this tier");
+    };
+    let me = std::thread::current().id();
+    LEAF_CALLS.lock().unwrap().push((module, func, me));
+    bounce_whole_call(call)
+}
+
+/// What a leaf emitter was offered: `(module, entry, paged, parks)` per offer.
+type LeafOffers = Vec<(usize, u32, bool, bool)>;
+
+/// A run of `m` on executor 2 that its opener does not pump, as a browser's page that takes no part
+/// in it opens one, with a leaf emitter answering `take` (`None`: no tier). Its first `run` returns
+/// at its end. Returns that end, and the offers the emitter saw.
+fn run_leaf_root(m: &Module, take: Option<bool>) -> (Result<Vec<Value>, Trap>, LeafOffers) {
+    let offers = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&offers);
+    let mut host = Host::new();
+    host.set_thread_platform(ThreadPlatform {
+        tier: take.map(|take| ThreadTier {
+            root: ProgramEmit::default(),
+            spill: 0,
+            modules: None,
+            leaf: Some(Arc::new(move |o: &LeafOffer| {
+                seen.lock()
+                    .unwrap()
+                    .push((o.module, o.entry, o.paged, o.parks));
+                take
+            })),
+            run: recording_leaf_calls,
+        }),
+        root_on_opener: true,
+        ..ThreadPlatform::OS
+    });
+    let declared = m.memory.expect("a window").size_log2;
+    let mut run =
+        bytecode::CoopRun::new_parallel(m, 0, &[], 50_000_000, host, &[], declared, None, false)
+            .expect("in subset")
+            .expect("it starts");
+    let end = match run.run() {
+        CoopEvent::Done(vals) => Ok(vals),
+        CoopEvent::Trapped(t) => Err(t),
+        _ => panic!("a run nothing pumps returns at its end"),
+    };
+    let offers = offers.lock().unwrap().clone();
+    (end, offers)
+}
+
+/// #1414 5c — a root the tier's leaf emitter takes runs whole from its entry on executor 2, as on the
+/// pump: its entry is the run's one tier-up, and its results end the run. Where the opener runs the
+/// root, as a browser's Worker does, the opener's thread runs the leaf. A root the emitter declines
+/// runs interpreted, and ends the same.
+#[test]
+fn a_root_leaf_runs_whole_on_the_thread_that_opened_the_run() {
+    let m = module(COUNT_ALONE);
+    let (interpreted, offers) = run_leaf_root(&m, None);
+    assert_eq!(interpreted, Ok(vec![Value::I64(1000)]));
+    assert!(offers.is_empty());
+
+    let (declined, offers) = run_leaf_root(&m, Some(false));
+    assert_eq!(declined, interpreted);
+    assert_eq!(offers, [(0, 0, false, false)], "offered once, at its entry");
+    assert!(LEAF_CALLS.lock().unwrap().is_empty(), "nothing tiered up");
+
+    let (whole, offers) = run_leaf_root(&m, Some(true));
+    assert_eq!(whole, interpreted);
+    assert_eq!(offers, [(0, 0, false, false)]);
+    assert_eq!(
+        LEAF_CALLS.lock().unwrap().clone(),
+        [(0, 0, std::thread::current().id())],
+        "the entry alone tiered up, on the thread that opened the run"
     );
 }
 
@@ -632,6 +741,7 @@ fn invoke_tier(run: fn(&mut EmittedCall<'_>) -> Result<(), Trap>) -> ThreadPlatf
                 ..Default::default()
             },
             spill: 0,
+            leaf: None,
             modules: None,
             run,
         }),
@@ -721,6 +831,7 @@ fn run_paged(
                 ..Default::default()
             },
             spill: 0,
+            leaf: None,
             modules: None,
             run,
         }),
@@ -922,6 +1033,7 @@ fn a_collector_under_each_threads_emitted_frame_sees_its_spilled_words() {
                 ..Default::default()
             },
             spill: 64,
+            leaf: None,
             modules: None,
             run: spill_then_collect,
         }),
@@ -1255,6 +1367,7 @@ fn a_childs_root_task_tiers_up_over_its_own_memory() {
                 ..Default::default()
             },
             spill: 0,
+            leaf: None,
             modules: Some(Arc::new(|_: &ModuleOffer| {
                 Some(ProgramEmit {
                     eligible: Arc::from([false, false, true]),
@@ -1462,6 +1575,7 @@ fn a_bounce_spawns_and_joins_a_child_whose_entry_spawns_a_thread() {
                 ..Default::default()
             },
             spill: 0,
+            leaf: None,
             modules: Some(Arc::new(|_: &ModuleOffer| {
                 Some(ProgramEmit {
                     eligible: Arc::from([true, false]),

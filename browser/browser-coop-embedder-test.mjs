@@ -152,6 +152,18 @@ const checkX2 = (r) => {
   if (!/MemoryFault/.test(f.error ?? '') || f.faultAddr !== 8n || f.out !== 'before\n') {
     fail(`chromium x2: a reported trap: ${f.error}, addr ${f.faultAddr}, out ${JSON.stringify(f.out)}`);
   }
+  // #1414 5c: a root the leaf emitter takes runs whole from its entry, its one tier-up, on the
+  // Worker that runs it, which holds its frames while a call in them waits for the page.
+  const leaf = (name, x) => {
+    if (!x.leaf || x.tierups !== 1) {
+      fail(`chromium x2: ${name}: leaf ${x.leaf}, ${x.tierups} tier-ups (want the root as a leaf, 1)`);
+    }
+  };
+  ran('a root leaf\'s pings', r.leafPings, sum, PINGS);
+  if (r.leafPings.out !== le8(sum)) fail(`chromium x2: a root leaf's pings: stdout ${JSON.stringify(r.leafPings.out)}`);
+  leaf('pings', r.leafPings);
+  echoed('a root leaf\'s stdin fed as it idles', r.leafEcho, 'hello world\n');
+  leaf('stdin fed later', r.leafEcho);
 };
 
 const mod = await WebAssembly.compile(readFileSync(wasmPath));

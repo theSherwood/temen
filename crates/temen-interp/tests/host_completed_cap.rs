@@ -20,7 +20,8 @@
 //! host-completed caps is offered to the host's leaf emitter, and each call parks in a bounce out of
 //! the emitted frames, which the host holds until [`CoopEvent::Resume`]. Served here, as
 //! `leaf_tierup.rs` does, by bouncing the entry — the nested interpretation the emitted image's own
-//! calls bounce into.
+//! calls bounce into. #1414 5c runs the root leaf on executor 2 too, where the root's thread serves
+//! its entry and holds its frames while a call waits.
 
 #[path = "support/drivers.rs"]
 mod drivers;
@@ -29,7 +30,8 @@ use drivers::{Pumped, PUMPED};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use temen_interp::bytecode::{
-    self, CoopEvent, LeafOffer, ProgramEmit, ThreadPlatform, TierUpConfig,
+    self, CoopEvent, EmittedCall, EmittedTarget, LeafOffer, ProgramEmit, ThreadPlatform,
+    ThreadTier, TierUpConfig,
 };
 use temen_interp::{
     run_with_host, BoundImport, CapRequests, Completer, Host, OffloadOutcome, Trap, Value,
@@ -925,50 +927,121 @@ fn coop_with(m: &temen_ir::Module, host: Host, tierup: Option<TierUpConfig>) -> 
         .expect("entry in range")
 }
 
-/// **The root runs as an emitted leaf and parks in it.** A root whose only parking calls are declared
-/// host-completed caps is offered at its entry (module 0, parks = true), tiers up there, and each
-/// call parks in a bounce out of the emitted frames: the park surfaces, the answer is delivered, and
-/// `Resume` hands the frames the entry's results. The run ends exactly as the interpreted run does,
-/// with the same parks.
+/// The tier-ups executor 2's threads served ([`bounce_leaf`]).
+static THREAD_TIERUPS: AtomicUsize = AtomicUsize::new(0);
+
+/// Executor 2's leaf runs take turns, since they share [`THREAD_TIERUPS`].
+static THREAD_LEAVES: Mutex<()> = Mutex::new(());
+
+/// Executor 2's stand-in for emitted code: the call, served on its task's thread by bouncing it
+/// whole, as [`drive_leaf`] serves it on the pump. A call in it that parks waits there, the thread
+/// holding the stand-in's frames as it would hold emitted ones.
+fn bounce_leaf(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
+    let EmittedTarget::Region { func, .. } = call.target else {
+        panic!("only tier-ups reach this tier");
+    };
+    THREAD_TIERUPS.fetch_add(1, Ordering::SeqCst);
+    let mut io = call.argv.to_vec();
+    io.resize(io.len().max(1), 0);
+    let n = (call.bounce)(func, &mut io, 0)?;
+    call.results = io[..n].to_vec();
+    Ok(())
+}
+
+/// Run `m` on `exec` to its end, over a window reserved at its declared size ([`coop_with`]), with
+/// `tierup`'s emitters: on the pump, served by [`drive_leaf`]; on executor 2, as its platform's tier,
+/// whose threads serve each tier-up themselves ([`bounce_leaf`]), so nothing resumes their frames
+/// from outside.
+fn run_leaf(
+    exec: Pumped,
+    m: &temen_ir::Module,
+    host: Host,
+    tierup: Option<TierUpConfig>,
+    requests: &CapRequests,
+) -> Ran {
+    let mut host = host;
+    match exec {
+        Pumped::Pump => drive_leaf(coop_with(m, host, tierup), requests),
+        Pumped::Threads => {
+            let _turn = THREAD_LEAVES.lock().unwrap_or_else(|e| e.into_inner());
+            THREAD_TIERUPS.store(0, Ordering::SeqCst);
+            host.set_thread_platform(ThreadPlatform {
+                tier: tierup.map(|t| ThreadTier {
+                    root: t.root,
+                    spill: 0,
+                    modules: t.modules,
+                    leaf: t.leaf,
+                    run: bounce_leaf,
+                }),
+                ..ThreadPlatform::OS
+            });
+            let declared = m.memory.expect("a window").size_log2;
+            let run =
+                bytecode::CoopRun::new_parallel(m, 0, &[], FUEL, host, &[], declared, None, true)
+                    .expect("in subset")
+                    .expect("entry in range");
+            let ran = drive_leaf(run, requests);
+            Ran {
+                tierups: THREAD_TIERUPS.load(Ordering::SeqCst),
+                ..ran
+            }
+        }
+    }
+}
+
+/// How many resumes a leaf whose calls parked takes on `exec`: one, when the pump's host holds its
+/// frames; none on executor 2, whose thread holds them.
+fn resumes(exec: Pumped) -> usize {
+    match exec {
+        Pumped::Pump => 1,
+        Pumped::Threads => 0,
+    }
+}
+
+/// **The root runs as an emitted leaf and parks in it**, on both executors. A root whose only parking
+/// calls are declared host-completed caps is offered at its entry (module 0, parks = true), tiers up
+/// there, and each call parks in a bounce out of the emitted frames: the park surfaces, the answer is
+/// delivered, and on the pump `Resume` hands the frames the entry's results, where on executor 2 the
+/// root's thread runs on with them. The run ends exactly as the interpreted run does, with the same
+/// parks.
 #[test]
 fn the_root_runs_as_an_emitted_leaf_and_parks_on_declared_caps() {
     let m = parse(ROOT_PINGS);
     let want = Ok(vec![Value::I64(WANT)]);
 
-    let (host, requests) = declared_ping(&m);
-    let interpreted = drive_leaf(coop_with(&m, host, None), &requests);
-    assert_eq!(
-        interpreted,
-        Ran {
-            end: want.clone(),
-            parks: 2,
-            tierups: 0,
-            resumes: 0
-        },
-        "interpreted"
-    );
+    for exec in PUMPED {
+        let (host, requests) = declared_ping(&m);
+        let interpreted = run_leaf(exec, &m, host, None, &requests);
+        assert_eq!(
+            interpreted,
+            Ran {
+                end: want.clone(),
+                parks: 2,
+                tierups: 0,
+                resumes: 0
+            },
+            "interpreted ({exec:?})"
+        );
 
-    let offers: Offers = Arc::default();
-    let (host, requests) = declared_ping(&m);
-    let leaf = drive_leaf(
-        coop_with(&m, host, Some(leaf_config(&offers, true))),
-        &requests,
-    );
-    assert_eq!(
-        offers.lock().unwrap().clone(),
-        vec![(0, 0, true)],
-        "the root, at its entry"
-    );
-    assert_eq!(
-        leaf,
-        Ran {
-            end: want.clone(),
-            parks: 2,
-            tierups: 1,
-            resumes: 1
-        },
-        "one tier-up at the entry, two parks inside it, one resume of its frames"
-    );
+        let offers: Offers = Arc::default();
+        let (host, requests) = declared_ping(&m);
+        let leaf = run_leaf(exec, &m, host, Some(leaf_config(&offers, true)), &requests);
+        assert_eq!(
+            offers.lock().unwrap().clone(),
+            vec![(0, 0, true)],
+            "the root, at its entry ({exec:?})"
+        );
+        assert_eq!(
+            leaf,
+            Ran {
+                end: want.clone(),
+                parks: 2,
+                tierups: 1,
+                resumes: resumes(exec)
+            },
+            "one tier-up at the entry, two parks inside it ({exec:?})"
+        );
+    }
 
     // Every constructor that holds the image offers it: `CoopRun::new` too, whose default 128 GiB
     // reservation only unix's lazy `mmap` backs flat (elsewhere that root interprets, by design).
@@ -994,26 +1067,26 @@ fn the_root_runs_as_an_emitted_leaf_and_parks_on_declared_caps() {
 }
 
 /// An emitter that declines the root (a host that cannot suspend its frames) leaves it interpreted,
-/// with the same ending.
+/// with the same ending, on both executors.
 #[test]
 fn a_declined_root_leaf_runs_interpreted() {
     let m = parse(ROOT_PINGS);
-    let offers: Offers = Arc::default();
-    let (host, requests) = declared_ping(&m);
-    let ran = drive_leaf(
-        coop_with(&m, host, Some(leaf_config(&offers, false))),
-        &requests,
-    );
-    assert_eq!(offers.lock().unwrap().len(), 1, "offered once");
-    assert_eq!(
-        ran,
-        Ran {
-            end: Ok(vec![Value::I64(WANT)]),
-            parks: 2,
-            tierups: 0,
-            resumes: 0
-        }
-    );
+    for exec in PUMPED {
+        let offers: Offers = Arc::default();
+        let (host, requests) = declared_ping(&m);
+        let ran = run_leaf(exec, &m, host, Some(leaf_config(&offers, false)), &requests);
+        assert_eq!(offers.lock().unwrap().len(), 1, "offered once ({exec:?})");
+        assert_eq!(
+            ran,
+            Ran {
+                end: Ok(vec![Value::I64(WANT)]),
+                parks: 2,
+                tierups: 0,
+                resumes: 0
+            },
+            "{exec:?}"
+        );
+    }
 }
 
 /// A tier-up **region** (not a leaf: nothing holds its frames) that reaches a host-completed call
@@ -1096,13 +1169,17 @@ fn a_root_writing_and_exiting_through_its_imports_is_offered() {
     let m = parse(ROOT_IO);
     let none = CapRequests::default();
 
-    let offers: Offers = Arc::default();
-    let ran = drive_leaf(
-        coop_with(&m, io_host(false), Some(leaf_config(&offers, true))),
-        &none,
-    );
-    assert_eq!(offers.lock().unwrap().clone(), vec![(0, 0, false)]);
-    assert_eq!((ran.end, ran.tierups), (Err(Trap::Exit(7)), 1));
+    for exec in PUMPED {
+        let offers: Offers = Arc::default();
+        let tierup = Some(leaf_config(&offers, true));
+        let ran = run_leaf(exec, &m, io_host(false), tierup, &none);
+        assert_eq!(
+            offers.lock().unwrap().clone(),
+            vec![(0, 0, false)],
+            "{exec:?}"
+        );
+        assert_eq!((ran.end, ran.tierups), (Err(Trap::Exit(7)), 1), "{exec:?}");
+    }
 
     let offers: Offers = Arc::default();
     let _ = coop_with(&m, io_host(true), Some(leaf_config(&offers, false)));
@@ -1196,19 +1273,27 @@ block 0 () {{
 /// host holding one keeps the root off the emitted tier.
 #[test]
 fn a_root_calling_a_host_capability_inline_is_offered_when_none_can_park() {
-    let mut host = Host::new();
-    let h = host.grant_host_proc(
-        Box::new(|_op, args, _mem, _| Ok(vec![args[0] + 100])),
-        temen_interp::CapState::Stateless,
-    );
-    let m = root_host_call(h);
-    let offers: Offers = Arc::default();
-    let ran = drive_leaf(
-        coop_with(&m, host, Some(leaf_config(&offers, true))),
-        &CapRequests::default(),
-    );
-    assert_eq!(offers.lock().unwrap().clone(), vec![(0, 0, false)]);
-    assert_eq!((ran.end, ran.tierups), (Ok(vec![Value::I64(105)]), 1));
+    for exec in PUMPED {
+        let mut host = Host::new();
+        let h = host.grant_host_proc(
+            Box::new(|_op, args, _mem, _| Ok(vec![args[0] + 100])),
+            temen_interp::CapState::Stateless,
+        );
+        let m = root_host_call(h);
+        let offers: Offers = Arc::default();
+        let tierup = Some(leaf_config(&offers, true));
+        let ran = run_leaf(exec, &m, host, tierup, &CapRequests::default());
+        assert_eq!(
+            offers.lock().unwrap().clone(),
+            vec![(0, 0, false)],
+            "{exec:?}"
+        );
+        assert_eq!(
+            (ran.end, ran.tierups),
+            (Ok(vec![Value::I64(105)]), 1),
+            "{exec:?}"
+        );
+    }
 
     let (host, h) = pool_completed();
     let m = root_host_call(h);

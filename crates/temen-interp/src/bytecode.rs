@@ -8403,27 +8403,25 @@ pub fn compile_and_run_sliced(
 struct ExecBuilt {
     host: Host,
     table: SharedSlots,
+    /// The image's task at its entry: armed to run it whole when the host emitted it as a leaf
+    /// (#1896, [`Vm::tier_up_leaf`]), over a flat window, where emitted code can address it.
     vt: VTask,
     /// The window the image runs in, which replaces the caller's ([`Mem::exec_window`]).
     mem: Mem,
-    /// #1896 — how a leaf image the host emitted tiers up at its entry (its window is flat, where
-    /// emitted code can address it). `None`: the image runs interpreted.
-    leaf: Option<LeafStart>,
 }
 
 /// A personality `posix_spawn` (#1970) task `ti` asked for: mint a process as the fork arm mints a
 /// twin (its pid is its task index + 1, and its parent reaps it) and build its image as the exec arm
 /// builds one, in an env of its own: a fresh window of the image's declared memory, with nothing of
-/// the caller copied. Answers the caller's result, the pid or `-EAGAIN` when no process could be minted,
-/// and the step that starts the child when its image is a leaf. A process whose image cannot be
-/// built still takes its task, done before it ran, so the settle retires it as it retires any
-/// process and no later process is handed its pid.
+/// the caller copied. Answers the caller's result, the pid or `-EAGAIN` when no process could be
+/// minted. A child whose image is a leaf runs it whole from its first step ([`Vm::tier_up_leaf`]).
+/// A process whose image cannot be built still takes its task, done before it ran, so the settle
+/// retires it as it retires any process and no later process is handed its pid.
 #[allow(clippy::too_many_arguments)] // the pump's own state, borrowed field by field
 fn spawn_task(
     tasks: &mut Vec<TaskSlot>,
     extra_envs: &mut Vec<ChildEnv>,
     forked_twins: &mut std::collections::BTreeSet<usize>,
-    pending_tierup: &mut Option<(usize, TierUpDst, Box<[ValType]>)>,
     leaf: Option<&LeafEmitter>,
     dom: &Domain,
     mem: &Option<Mem>,
@@ -8432,12 +8430,12 @@ fn spawn_task(
     ti: usize,
     cmd: super::ExecCmd,
     plan: super::SpawnPlan,
-) -> (i64, Option<CoopStep>) {
+) -> i64 {
     let child_ti = tasks.len();
     let pid = child_ti as u64 + 1;
     // The run's live cap first, as the oracle's `spawn_vcpu` checks it (#2006).
     if live_tasks(tasks) >= super::MAX_VCPUS {
-        return (super::EAGAIN, None);
+        return super::EAGAIN;
     }
     // #2001 — the process is one `spawn` of the node it shares with its spawner while it lives: a full
     // ceiling refuses it as the live cap does.
@@ -8445,7 +8443,7 @@ fn spawn_task(
         .lock_unpoisoned()
         .own_node();
     let Some(live) = LiveVcpu::charge(node) else {
-        return (super::EAGAIN, None);
+        return super::EAGAIN;
     };
     let window = match tasks[ti].env {
         Some(k) => extra_envs[k].mem.as_ref(),
@@ -8462,35 +8460,27 @@ fn spawn_task(
         None => fuel.for_thread(),
     };
     let Some(mut twin) = twin else {
-        return (super::EAGAIN, None);
+        return super::EAGAIN;
     };
     let caller = match tasks[ti].env {
         Some(k) => extra_envs[k].mem.as_ref(),
         None => mem.as_ref(),
     };
     let built = exec_image_build(&mut twin, caller, dom, cmd, 0, 0, 0, 0, true, leaf);
-    let (child_mem, child_host, table, vt, state, start, live) = match built {
+    let (child_mem, child_host, table, vt, state, live) = match built {
         Ok(built) => {
             // Its own park door and pump bell, as the fork arm wires a twin's.
             wire_process(&built.host, root);
             let state = TaskState::Runnable;
             let (m, h) = (Some(built.mem), built.host);
-            (m, h, built.table, built.vt, state, built.leaf, live)
+            (m, h, built.table, built.vt, state, live)
         }
         Err(_) => {
             let mut vt = VTask::of(tasks[ti].vm.vt.active.clone(), 0);
             vt.release();
             let failed = Err(Trap::Exit(super::SPAWN_EXEC_FAILED as i32));
             let state = TaskState::Done(failed);
-            (
-                None,
-                twin,
-                dom.table.fork(),
-                vt,
-                state,
-                None,
-                LiveVcpu::none(),
-            )
+            (None, twin, dom.table.fork(), vt, state, LiveVcpu::none())
         }
     };
     let eidx = extra_envs.len();
@@ -8509,48 +8499,22 @@ fn spawn_task(
         ..TaskSlot::new(vt, Some(eidx), live)
     });
     forked_twins.insert(child_ti);
-    let win = extra_envs[eidx].mem.as_ref();
-    let step = start.and_then(|start| leaf_step(start, child_ti, win, pending_tierup));
-    (pid as i64, step)
-}
-
-/// #1896 — a leaf image tiers up at its entry: the host runs it whole, emitted, and its delivery ends
-/// the process. The step that starts task `ti`'s, over its window `win` — or `None` over a window one
-/// bound cannot describe, where an image emitted without the page check runs interpreted instead,
-/// over the same window.
-fn leaf_step(
-    start: LeafStart,
-    ti: usize,
-    win: Option<&Mem>,
-    pending_tierup: &mut Option<(usize, TierUpDst, Box<[ValType]>)>,
-) -> Option<CoopStep> {
-    let mapped = win.and_then(|m| match start.paged {
-        true => Some(m.reserved_size()),
-        false => m.scalar_extent(),
-    })?;
-    *pending_tierup = Some((ti, TierUpDst::Entry { parks: start.parks }, start.results));
-    Some(CoopStep::TierUp {
-        module: start.module,
-        func: start.entry,
-        argv: start.argv,
-        mapped,
-    })
+    pid as i64
 }
 
 /// #1954 — the **root program** as a leaf: the rule an exec'd image meets ([`exec_image_build`]),
 /// applied to the run's own image at its entry. Offered when it cannot park, or parks only where its
 /// host suspends the emitted frames ([`image_parks`]), and the host's emitter takes it; a durable run
 /// (whose freeze could not meet emitted frames) and a window emitted code cannot address flat run
-/// interpreted, as before. [`CoopRun::start`] asks it whenever its caller holds the image: a run over
-/// a module, a [`SharedProgram`] warm restore given its module (#1414 S4-3c), and a [`Reactor`] call
-/// given its module (#1414 S4-4).
-#[allow(clippy::too_many_arguments)]
+/// interpreted, as before. Both executors ask it whenever their caller holds the image: the pump's
+/// [`CoopRun::start`] for a run over a module, a [`SharedProgram`] warm restore given its module
+/// (#1414 S4-3c) and a [`Reactor`] call given its module (#1414 S4-4), and executor 2's
+/// [`CoopRun::new_parallel`] (#1414 5c).
 fn root_leaf(
     emit: &LeafEmitter,
     m: &Module,
     dom: &Domain,
     entry: FuncIdx,
-    args: &[Value],
     host: &Host,
     mem: Option<&Mem>,
 ) -> Option<LeafStart> {
@@ -8558,7 +8522,22 @@ fn root_leaf(
         return None;
     }
     let program = dom.source.primary();
-    let census = program.census(m);
+    let digest = program.module_digest(m);
+    offer_leaf(emit, host, m, program.census(m), 0, digest, entry)
+}
+
+/// #1896 — offer image `m`, program `module` of the run, to the host's leaf emitter, to run whole
+/// from `entry` under `host`: offered when it cannot park, or parks only where its host suspends the
+/// emitted frames ([`image_parks`]). `Some` when the emitter took it.
+fn offer_leaf(
+    emit: &LeafEmitter,
+    host: &Host,
+    m: &Module,
+    census: &ImageCensus,
+    module: usize,
+    digest: [u8; 32],
+    entry: u32,
+) -> Option<LeafStart> {
     let parks = match image_parks(host, m, census) {
         Parks::Never => false,
         Parks::Suspendably => true,
@@ -8566,31 +8545,19 @@ fn root_leaf(
     };
     let paged = image_pages(host, census);
     let offer = LeafOffer {
-        module: 0,
+        module,
         image: m,
-        digest: program.module_digest(m),
+        digest,
         entry,
         paged,
         parks,
     };
-    emit(&offer).then(|| LeafStart {
-        module: 0,
-        entry,
-        argv: args.iter().map(|v| val_to_slot(*v)).collect(),
-        results: dom.source.primary().result_types[entry as usize]
-            .clone()
-            .into(),
-        paged,
-        parks,
-    })
+    emit(&offer).then_some(LeafStart { paged, parks })
 }
 
-/// How a leaf image tiers up at its entry ([`CoopStep::TierUp`]).
+/// How a leaf image runs whole from its entry, as the host's emitter took it ([`Vm::tier_up_leaf`]).
+#[derive(Clone, Copy)]
 struct LeafStart {
-    module: u32,
-    entry: u32,
-    argv: Box<[i64]>,
-    results: Box<[ValType]>,
     /// The image was emitted with the per-access page check (#750), because it can change its page
     /// state ([`image_pages`]): its `"mapped"` is the window's reservation, and the host keeps the
     /// page-state table.
@@ -8923,21 +8890,15 @@ fn exec_image_build(
     let leaf = leaf.and_then(|emit| {
         let unit = dom.source.get(cm)?;
         let census = unit.census(&img.module);
-        let parks = match image_parks(&img.host, &img.module, census) {
-            Parks::Never => false,
-            Parks::Suspendably => true,
-            Parks::Otherwise => return None,
-        };
-        let paged = image_pages(&img.host, census);
-        let offer = LeafOffer {
-            module: cm,
-            image: &img.module,
-            digest: img.digest,
-            entry: entry as u32,
-            paged,
-            parks,
-        };
-        emit(&offer).then_some((paged, parks))
+        offer_leaf(
+            emit,
+            &img.host,
+            &img.module,
+            census,
+            cm,
+            img.digest,
+            entry as u32,
+        )
     });
     let flat = leaf.and_then(|l| Some((super::Region::growable(img.child_size, m.page)?, l)));
     let (back, leaf) = match flat {
@@ -8962,22 +8923,16 @@ fn exec_image_build(
     let cunit = dom.source.get(cm).ok_or(super::EINVAL)?;
     let child_table = build_table_for(cunit.progs.len(), child_host.jit_table_log2(), cm as u32);
     let payer = Some(child_host.own_node());
-    let new_vt =
+    let mut new_vt =
         entry_task(&cunit, cm, entry as usize, &child_args, payer).map_err(|_| super::EINVAL)?;
-    let leaf = leaf.map(|(paged, parks)| LeafStart {
-        module: cm as u32,
-        entry: entry as u32,
-        argv: img.entry_args.iter().copied().collect(),
-        results: cunit.result_types[entry as usize].clone().into(),
-        paged,
-        parks,
-    });
+    if let Some(leaf) = leaf {
+        new_vt.active.tier_up_leaf(leaf);
+    }
     Ok(ExecBuilt {
         host: child_host,
         table: child_table,
         vt: new_vt,
         mem: win,
-        leaf,
     })
 }
 
@@ -12186,9 +12141,9 @@ enum CoopStep {
 enum TierUpDst {
     /// The paused caller frame's result slots, from this one on.
     Frame(usize),
-    /// No frame: the task tiered up at its entry, a leaf image's (#1896) or one the run started
-    /// (#1414 ED-1), so its results end it. `parks`: its host suspends its emitted frames where a
-    /// call parks ([`LeafOffer::parks`]).
+    /// No frame: the task tiered up at its entry ([`Vm::jit_entry`]), a leaf image's (#1896) or
+    /// one the run started (#1414 ED-1), so its results end it. `parks`: its host suspends its
+    /// emitted frames where a call parks ([`LeafOffer::parks`]).
     Entry { parks: bool },
 }
 
@@ -12382,9 +12337,6 @@ struct EmitTier {
     /// parked fiber persists for the run to resume). Empty except during an outstanding invoke;
     /// always empty on the native `drive`.
     invoke_fibers: FiberTables,
-    /// #1954 — the root program's leaf start, when the host's emitter took the root image
-    /// ([`root_leaf`]): the first pump tiers the root up at its entry instead of interpreting it.
-    root_leaf: Option<LeafStart>,
     /// #1414 D4 — the call a leaf made in its last bounce ([`CoopRun::bounce`]) and parked on,
     /// `(task index, completion id)`: the pump that follows tells of it, before anything runs.
     bounce_call: Option<(usize, u64)>,
@@ -12789,6 +12741,11 @@ impl SchedCore {
         self.tasks[0].vm.vt.active.tier_up(0, emit, false);
     }
 
+    /// #1954 — run the root's entry whole, as the leaf the host's emitter took ([`root_leaf`]).
+    fn arm_leaf(&mut self, leaf: LeafStart) {
+        self.tasks[0].vm.vt.active.tier_up_leaf(leaf);
+    }
+
     /// `ns` of the run's time passes: the clock moves by it, and every wait it reaches times out.
     /// The pump's quanta move it so (#2224), and so does its embedder's clock ([`CoopRun::pass_time`]).
     fn pass_time(&mut self, ns: u64) {
@@ -12959,7 +12916,6 @@ impl CoopSched {
                 // Empty until a surfaced `Jit.invoke` bounces; populated only across that invoke's
                 // bounces.
                 invoke_fibers: FiberTables::default(),
-                root_leaf: None,
                 bounce_call: None,
             },
             slice_left: None,
@@ -13024,13 +12980,6 @@ impl CoopSched {
             let host = task_host(root, &core.extra_envs, core.tasks[ti].env).lock_unpoisoned();
             if *embedder_pumps && host.completions().is_host_owned(id) {
                 return Ok(CoopStep::CapPark { id });
-            }
-        }
-        // #1954 — a root the host emitted whole tiers up at its entry, once, before anything runs
-        // (over a window one bound cannot describe it runs interpreted instead, as an exec'd leaf).
-        if let Some(start) = emit.root_leaf.take() {
-            if let Some(step) = leaf_step(start, 0, mem.as_ref(), &mut emit.pending_tierup) {
-                return Ok(step);
             }
         }
         // #1157 — the round-robin pick cursor (the last task index run). Scanning from `last_pick + 1`
@@ -13231,11 +13180,10 @@ impl CoopSched {
                 .and_then(|s| s.leaf.as_mut());
             if let Some(ask) = leaf_call.and_then(|l| l.spawn.take()) {
                 let SpawnAsk { cmd, plan, dst } = *ask;
-                let (r, step) = spawn_task(
+                let r = spawn_task(
                     tasks,
                     extra_envs,
                     forked_twins,
-                    pending_tierup,
                     leaf.as_ref(),
                     dom,
                     mem,
@@ -13247,9 +13195,6 @@ impl CoopSched {
                 );
                 if let Some(s) = tasks[ti].vm.suspended.as_mut() {
                     s.vm.set(dst, Reg::from_i64(r));
-                }
-                if let Some(step) = step {
-                    return Ok(step);
                 }
             }
             // #1157 — arm the preemption quantum ONLY when ≥2 tasks are runnable (genuinely concurrent).
@@ -13562,8 +13507,8 @@ impl CoopSched {
 impl SchedCore {
     /// The stop half of a pump round (#1414 3e): what a task's step stopped on, applied to the run,
     /// one arm per stop (a park, a spawn, a fork, a live call, a futex op, a JIT op). `Some(step)`
-    /// pauses the pump for its host: a tier-up, a leaf start or an emitted `Jit.invoke`, recorded in
-    /// `emit`. A preempted task stays `Runnable`: who runs next is the executor's call.
+    /// pauses the pump for its host: a tier-up, a task's entry included, or an emitted `Jit.invoke`,
+    /// recorded in `emit`. A preempted task stays `Runnable`: who runs next is the executor's call.
     ///
     /// Inlined: the arms need an 8 KB frame, and set up on every stop it cost the pump's pingpong
     /// benchmark 3%. Inside the caller the frame is set up once per pump call, as before the move.
@@ -14035,8 +13980,9 @@ impl SchedCore {
                 // materialize) runs against the exec'ing task's own window + powerbox, then the
                 // rebuilt activation is installed where its `env` points.
                 // The rebuilt activation lands where the task's `env` points, with the window the
-                // image was built in, which replaces the caller's.
-                let start = match tasks[ti].env {
+                // image was built in, which replaces the caller's. A leaf image runs whole from the
+                // task's next step ([`Vm::tier_up_leaf`]).
+                match tasks[ti].env {
                     None => {
                         // Root: build against the driver window/host, then migrate the task into a
                         // confined env holding the command powerbox + its module table (the shared
@@ -14071,7 +14017,6 @@ impl SchedCore {
                                     program: tasks[ti].vm.vt.active.module as u32,
                                 });
                                 tasks[ti].env = Some(eidx);
-                                built.leaf
                             }
                         }
                     }
@@ -14103,15 +14048,8 @@ impl SchedCore {
                                 extra_envs[k].table = std::sync::Arc::new(built.table);
                                 extra_envs[k].mem = Some(built.mem);
                                 extra_envs[k].program = tasks[ti].vm.vt.active.module as u32;
-                                built.leaf
                             }
                         }
-                    }
-                };
-                if let Some(start) = start {
-                    let win = tasks[ti].env.and_then(|k| extra_envs[k].mem.as_ref());
-                    if let Some(step) = leaf_step(start, ti, win, pending_tierup) {
-                        return Some(step);
                     }
                 }
             }
@@ -14126,11 +14064,10 @@ impl SchedCore {
                     tasks[ti].deliver(dst, Reg::from_i64(super::EINVAL));
                     return None;
                 }
-                let (r, step) = spawn_task(
+                let r = spawn_task(
                     tasks,
                     extra_envs,
                     forked_twins,
-                    pending_tierup,
                     leaf.as_ref(),
                     dom,
                     mem,
@@ -14141,9 +14078,6 @@ impl SchedCore {
                     plan,
                 );
                 tasks[ti].deliver(dst, Reg::from_i64(r));
-                if let Some(step) = step {
-                    return Some(step);
-                }
             }
             Ok(VcpuStop::ForkSelf { dst }) => {
                 // #799/#1080 — personality `fork()`: duplicate THIS task into a twin (private window
@@ -14781,6 +14715,7 @@ struct ThreadsRun {
 impl ThreadsRun {
     /// Open a run of `entry(args)` over `dom`, `mem` and `host` ([`ThreadRun::open`]): one its
     /// `embedder` pumps, or one whose first `run` returns at its end.
+    #[allow(clippy::too_many_arguments)]
     fn open(
         dom: Domain,
         entry: FuncIdx,
@@ -14789,8 +14724,9 @@ impl ThreadsRun {
         mem: Option<Mem>,
         host: Host,
         embedder: bool,
+        leaf: Option<LeafStart>,
     ) -> Result<ThreadsRun, Refused> {
-        let run = ThreadRun::open(dom, entry, args, fuel, mem, host, embedder)?;
+        let run = ThreadRun::open(dom, entry, args, fuel, mem, host, embedder, leaf)?;
         Ok(ThreadsRun {
             root: std::sync::Arc::clone(&run.root),
             run: Some(run),
@@ -14949,7 +14885,9 @@ impl CoopRun {
             Ok(start) => start,
             Err(t) => return Some(Err(t)),
         };
-        match ThreadsRun::open(dom, entry, args, fuel, mem, host, pump) {
+        let leaf = host.thread_platform().tier.and_then(|t| t.leaf);
+        let leaf = leaf.and_then(|emit| root_leaf(&emit, m, &dom, entry, &host, mem.as_ref()));
+        match ThreadsRun::open(dom, entry, args, fuel, mem, host, pump, leaf) {
             Ok(t) => Some(Ok(CoopRun {
                 exec: CoopExec::Threads(t),
             })),
@@ -15134,11 +15072,13 @@ impl CoopRun {
             .as_ref()
             .and_then(|t| t.leaf.as_ref())
             .zip(image)
-            .and_then(|(emit, m)| root_leaf(emit, m, &dom, entry, args, &host, mem.as_ref()));
+            .and_then(|(emit, m)| root_leaf(emit, m, &dom, entry, &host, mem.as_ref()));
         let node = host.begin_activation(fuel, RootWindow::of(mem.as_ref()));
         let mut fuel = Fuel::drawn(node.ok_or(Trap::ThreadFault)?);
         let mut sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
-        sched.emit.root_leaf = root_leaf;
+        if let Some(leaf) = root_leaf {
+            sched.core.arm_leaf(leaf);
+        }
         sched.embedder_pumps = true;
         Ok(CoopRun {
             exec: CoopExec::Pump(PumpRun {
@@ -16069,6 +16009,12 @@ pub struct ThreadTier {
     /// detached child tiers up through its module's emit, over its own memory (#1414 ED-2). `None`
     /// leaves every child interpreted.
     pub modules: Option<ModuleEmitter>,
+    /// The host's emitter for leaf images, as the pump's ([`TierUpConfig::leaf`], #1414 5c): the
+    /// run's root, when [`CoopRun::new_parallel`] is given its module, and an image a process
+    /// execs or spawns run whole on their tasks' threads when it takes them. A thread holds a
+    /// leaf's emitted frames on its stack while a call in them waits ([`BounceTask::park`]), so
+    /// it may take one that parks. `None` interprets them.
+    pub leaf: Option<LeafEmitter>,
     /// Run one call on the emitted tier, on the calling thread. Once the run is over
     /// ([`EmittedCall::over`]) it returns by the emitted code's next fuel check, whatever it
     /// returns: the run waits for its thread.
@@ -16304,7 +16250,16 @@ fn drive_threads(
     mem: Option<Mem>,
     host: &mut Host,
 ) -> (Result<Vec<Value>, Trap>, Option<Mem>) {
-    let mut t = match ThreadsRun::open(dom, entry, args, *fuel, mem, std::mem::take(host), false) {
+    let mut t = match ThreadsRun::open(
+        dom,
+        entry,
+        args,
+        *fuel,
+        mem,
+        std::mem::take(host),
+        false,
+        None,
+    ) {
         Ok(t) => t,
         Err(refused) => {
             let (t, back, mem) = *refused;
@@ -16329,8 +16284,10 @@ impl ThreadRun {
     /// Open a run of `entry(args)` over `dom`, `mem` and `host`, with `fuel` for it to draw: the
     /// host's activation (#1944 slice 3: every thread draws from the host's own node), the schedule,
     /// and a stop asked for before the run was there to be told. No thread runs yet. A run its
-    /// `embedder` pumps ([`ThreadsRun`]) is watched whatever the platform says. `Err` gives the host
-    /// and window back with the trap that refused the run.
+    /// `embedder` pumps ([`ThreadsRun`]) is watched whatever the platform says. With `leaf`, the
+    /// root runs its entry whole, as the leaf the tier's emitter took ([`root_leaf`]). `Err` gives
+    /// the host and window back with the trap that refused the run.
+    #[allow(clippy::too_many_arguments)]
     fn open(
         dom: Domain,
         entry: FuncIdx,
@@ -16339,6 +16296,7 @@ impl ThreadRun {
         mem: Option<Mem>,
         mut host: Host,
         embedder: bool,
+        leaf: Option<LeafStart>,
     ) -> Result<std::sync::Arc<ThreadRun>, Refused> {
         super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
         let Some(node) = host.begin_activation(fuel, RootWindow::of(mem.as_ref())) else {
@@ -16357,8 +16315,8 @@ impl ThreadRun {
         let door = host.run_door();
         let platform = host.thread_platform();
         let watched = embedder || !platform.root_on_opener;
-        // The platform's tier emits the run's own program, and each granted module a child runs
-        // (#1414 ED-2).
+        // The platform's tier emits the run's own program, each granted module a child runs
+        // (#1414 ED-2), and the leaf images the run takes (#1414 5c).
         let programs = ProgramEmits {
             root: platform.tier.as_ref().map(|t| t.root.clone()),
             modules: platform.tier.as_ref().and_then(|t| t.modules.clone()),
@@ -16366,6 +16324,9 @@ impl ThreadRun {
         };
         if let Some(e) = &programs.root {
             core.arm_tierup(e);
+        }
+        if let Some(leaf) = leaf {
+            core.arm_leaf(leaf);
         }
         core.child_window = platform.child_window;
         let run = std::sync::Arc::new(ThreadRun {
@@ -16383,6 +16344,7 @@ impl ThreadRun {
                 panicked: false,
                 emit: EmitTier {
                     programs,
+                    leaf: platform.tier.as_ref().and_then(|t| t.leaf.clone()),
                     ..EmitTier::default()
                 },
                 embedder_pumps: embedder,
@@ -17014,7 +16976,8 @@ impl ThreadRun {
                     mapped,
                 })
             }
-            // Only a host with a leaf emitter surfaces anything else, and this executor's have none.
+            // Nothing else surfaces from the rules here: every tier-up, a task's entry included, runs
+            // on the task's thread.
             Some(_) => {
                 debug_assert!(false, "executor 2 surfaced a pause it cannot serve");
                 emit.pending_tierup = None;
@@ -17998,10 +17961,13 @@ struct Vm {
     /// #2248 — the program `jit_eligible` is for: `0`, the run's own, or a granted module a child
     /// runs.
     jit_module: usize,
-    /// #1414 ED-1 — the task tiers up at its entry, which `jit_eligible` makes eligible: its first
-    /// resume surfaces the entry as [`Outcome::TierUp`], as a call to it would, and the results end
-    /// the task. Set by [`Vm::tier_up`] for a task the run starts, and spent by that first resume.
-    jit_entry: bool,
+    /// #1414 ED-1 — the task tiers up at its entry: its first resume surfaces the entry as
+    /// [`Outcome::TierUp`], as a call to it would, and the results end the task. `Some(parks)`:
+    /// whether its host suspends the emitted frames where a call in them parks
+    /// ([`LeafOffer::parks`]). Set by [`Vm::tier_up`] for a task the run starts at an eligible
+    /// entry, and by [`Vm::tier_up_leaf`] for one that runs a leaf image whole; spent by that first
+    /// resume.
+    jit_entry: Option<bool>,
     /// #750 **paged tier-up**: the eligible functions were emitted with the software page-check
     /// (`compile_module_tierup_paged`), so the dispatch must NOT decline tier-up on a
     /// scalar-unrepresentable window — the host-maintained page table carries per-page fidelity,
@@ -18211,7 +18177,19 @@ impl Vm {
         self.jit_module = module as usize;
         self.profile =
             (emit.hot.per_call > 0).then(|| Box::new(Profile::new(emit.hot, emit.eligible.len())));
-        self.jit_entry = entry && self.module == self.jit_module && self.tiers_up(self.cur);
+        let entry = entry && self.module == self.jit_module && self.tiers_up(self.cur);
+        self.jit_entry = entry.then_some(false);
+    }
+
+    /// #1896, #1954 — run this task's entry whole, as a leaf image the host emitted ([`LeafOffer`]):
+    /// its first resume surfaces the entry ([`Vm::jit_entry`]), and no other call of it tiers up.
+    /// Over a window the emitted code cannot bound, it interprets, as any tier-up does.
+    fn tier_up_leaf(&mut self, leaf: LeafStart) {
+        self.jit_eligible = None;
+        self.jit_page_checked = leaf.paged;
+        self.jit_module = self.module;
+        self.profile = None;
+        self.jit_entry = Some(leaf.parks);
     }
 
     /// Undo [`Self::tier_up`]: every call interprets.
@@ -18344,7 +18322,7 @@ impl Vm {
             durable_region_base: c.shadow.unwrap_or(super::ShadowArena::EMPTY).region_base(0), // root context (overwritten for fibers)
             jit_eligible: None, // set by `Vm::tier_up`
             jit_module: 0,
-            jit_entry: false,
+            jit_entry: None,
             jit_page_checked: false,
             profile: None,
             work: 0,
@@ -18447,8 +18425,7 @@ impl Vm {
         host: &mut HostCell,
         budget: u64,
     ) -> Result<Outcome, Trap> {
-        if self.jit_entry {
-            self.jit_entry = false;
+        if let Some(parks) = self.jit_entry.take() {
             if let Some(mapped) = self.tierup_extent(mem.as_ref()) {
                 let c = source.get(self.module).ok_or(Trap::Malformed)?;
                 let (cur, base) = (self.cur, self.base);
@@ -18460,7 +18437,7 @@ impl Vm {
                         .iter()
                         .map(|r| r.i64())
                         .collect(),
-                    dst: TierUpDst::Entry { parks: false },
+                    dst: TierUpDst::Entry { parks },
                     results: c.result_types[cur].clone().into(),
                     mapped,
                 });
