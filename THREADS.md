@@ -153,9 +153,9 @@ property, so in practice:
   call once, while the run's other tasks go on; at the run's idle point, when nothing can run until
   the embedder acts (an answer it owes, or input it feeds), with `Idle` instead of waiting; and at its
   end. The pump and the debug scheduler follow the same rule (#1414 D4, #2531), so `run` never waits
-  on its embedder. `Idle` carries the time to the run's next timer (#2557): while an answer is owed,
-  the pump fires a timer only once its embedder has let that time pass (`CoopRun::pass_time`), and
-  executor 2's fire on their own. Both executors reach their idle verdict through one function (`stalled`), and both
+  on its embedder. `Idle` carries the time to the run's next timer (#2557, #2439): the pump fires a
+  timer only once its embedder has let that time pass (`CoopRun::pass_time`), and hands back `Idle`
+  whenever a timer is all that can wake the run; executor 2's timers fire on their own. Both executors reach their idle verdict through one function (`stalled`), and both
   count a runnable task of a stopped process as waiting, as the pump's pick skips it (#2529 tracks
   the tree-walker, which waits forever there).
   *Since #1414 5b-2:* the one-shot run is that handle with no embedder to tell, run to its end
@@ -459,6 +459,19 @@ property, so in practice:
   its call's completer, as a native embedder does. The root of such a run starts on a Worker of its
   own, since the root's Worker watches the run; a run the page has no part in still runs its root on
   that Worker, to its end.
+
+  *Since #1414 5c:* executor 2 runs leaf images as the pump does. Its tier takes the host's leaf
+  emitter (`ThreadTier::leaf`). A run over a module offers its root whole (`root_leaf`), and an
+  image a process execs or spawns is offered as on the pump. Each task that starts at an emitted
+  entry, a leaf's included, starts through its `Vm` (`Vm::tier_up_leaf`): its first step surfaces
+  the entry, which its thread runs on its Worker. The thread holds the leaf's frames while a call in
+  them waits for an answer, stdin, a pipe or a child, so the browser takes a leaf that parks too. A
+  Worker runs a program's leaf over the engine's memory (`temen_x2_leaf_len`) on a tier of its own,
+  whose table stays empty as a child's does, since a leaf calls its own functions. Any other tier-up
+  there runs the run's region emit, on the run's tier. A run with `tierup` and no part for the page,
+  an on-ramp C program say, now runs its root whole, as the pump's root leaf does. No browser recipe
+  of executor 2 has the POSIX personality yet (#2376), so in the browser only the root is a leaf;
+  natively, exec'd and spawned leaves run on both executors (`leaf_tierup.rs`).
 
 ### Known wrinkles — all resolved in `4c-wasm`
 

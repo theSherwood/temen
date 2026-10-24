@@ -2018,8 +2018,8 @@ schedule is the clock's as before. A run with no outside input keeps its
 schedule exactly, and only now takes as long as it asked to wait. Without it a 10 ms wait ended
 after ~80 µs, and while a root waited on the world its threads' timed waits fired back to back. The
 debug scheduler keeps the jump, so a replay stays exact, and waits in real time only for an answer
-(#2538); a `CoopRun`'s embedder (the browser) keeps it too, as wasm has no clock to wait on (#2439).
-Pinned in `temen-interp/tests/timed_waits.rs`.
+(#2538). A `CoopRun` hands the time to its embedder instead, as wasm has no clock to wait on
+(#2557, #2439, below). Pinned in `temen-interp/tests/timed_waits.rs`.
 
 **A `CoopRun`'s timers run on its embedder's clock while an answer is owed (#2557, 2026-10-21).** A
 `CoopRun` hands control back when nothing can run until its embedder acts (#1414 D4). With an answer
@@ -2031,10 +2031,21 @@ waits for whichever comes first, its own event or that time. It then lets the ti
 out. The clock still never runs ahead of the embedder's. The browser's driver pumps on while the
 page answers (`COOP_RUN_IDLE`, `temen_coop_idle_timer`, `temen_coop_pass_time`); before, it awaited
 each answer before it pumped again, and the whole run stood still meanwhile. Executor 2's `Idle`
-reports its next deadline too, though its timers fire on their own. With no answer owed, a
-`CoopRun` still jumps (#2439). Pinned in `temen-interp/tests/host_completed_cap.rs` (both
-executors), `browser/tests/coop_tierup_driver.rs` (the page's exports) and
-`browser/browser-coop-embedder-test.mjs` (the JS driver).
+reports its next deadline too, though its timers fire on their own. Pinned in
+`temen-interp/tests/host_completed_cap.rs` (both executors), `browser/tests/coop_tierup_driver.rs`
+(the page's exports) and `browser/browser-coop-embedder-test.mjs` (the JS driver).
+
+**A `CoopRun` never jumps its clock (#2439, 2026-10-21).** With no answer owed, an idle pump its
+embedder drives still jumped its clock to the next deadline, so in the browser a 10 ms wait ended
+after microseconds and a program pacing itself with `nanosleep` spun. Now it hands back `Idle` with
+the time to that timer whenever one is all that can wake the run, as it does while an answer is
+owed. The embedder lets the time pass, so the pump keeps the embedder's time as the native driver
+keeps the wall's (#1979). An embedder with no time to wait in, one synchronous call that must
+return the run's next stop, lets each timer's time pass at once (`CoopRun::run_clockless`): the
+playground's Postgres and bash sessions, a reactor's frame, a nimony build. Executor 2 waits its
+timers out on its own threads. Pinned in `temen-interp/tests/timed_waits.rs` (both executors, a
+root and a detached child), `browser/tests/coop_tierup_driver.rs` and
+`browser/browser-coop-embedder-test.mjs`.
 
 **One bell for an idle pump (#2480, 2026-10-20).** With nothing to run, the pump waited either on the
 answers to its outstanding calls or on the embedder's bell, never both, so a feed, a signal or a
@@ -2563,8 +2574,10 @@ busy-waits on another process's effect through ops that do not park (polling for
 sees it and spins where the interpreter would complete: tracked debt on #2280.
 
 **The root as a leaf; parks on the embedder (#1954).** The run's own image is offered the same way,
-at its entry (`root_leaf`, module 0), under the same predicate. It isn't offered when the run is
-durable, or when emitted code can't address the root window flat. A third kind of suspendable park
+at its entry (`root_leaf`, module 0), under the same predicate, on both executors: the pump's
+`CoopRun::start` and executor 2's `CoopRun::new_parallel` ask it whenever they hold the image (#1414
+5c). It isn't offered when the run is durable, or when emitted code can't address the root window
+flat. A third kind of suspendable park
 joins stream calls and children: a **declared host-completed cap** (`Host::grant_declared_host_caps`,
 answered by the embedder — a browser game's `fb_present`), `OpParks::OnHost`. In a bounce out of a
 leaf whose host suspends its frames, such a call parks its task in `BlockedHostCap` with the rest of
@@ -2599,7 +2612,12 @@ first resume surfaces the entry (`Vm::jit_entry`), and the results end the task,
 do. It is as safe as the call: region eligibility already keeps every op a bounce cannot serve out of
 an emitted function's whole callee closure. The root's entry keeps its own rule, the root leaf, whose
 slicing and suspension a region lacks; a durable run's tasks enter interpreted, since a thaw replays
-their entries.
+their entries. Since #1414 5c a leaf starts the same way: the root leaf, and an image a process
+execs or spawns, arm their task's `Vm` to run the entry whole (`Vm::tier_up_leaf`), which carries
+the leaf's `parks`. Nothing else of the task tiers up, and over a window the emitted code cannot
+bound it interprets. So both executors start every emitted task alike: the pump surfaces the
+entry as `CoopEvent::TierUp`, and executor 2's thread runs it, holding the frames on its stack while a
+call in them waits (`BounceTask::park`).
 
 ---
 

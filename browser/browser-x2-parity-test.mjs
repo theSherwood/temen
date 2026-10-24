@@ -6,6 +6,9 @@
 //   it: the bytes handed on are the run's stdout exactly, and some arrive while the run still runs.
 //   The pump's whole-program wasm-JIT run (`runJitModule`, the root leaf) and its interpreted
 //   one-shot stream too (#2523: the root leaf's open streamed nothing).
+// - **The root as a leaf (#1414 5c).** With its emitted tier, a run on executor 2 takes an on-ramp
+//   program's root whole, as the pump's root leaf does: its entry is the run's one tier-up, and it
+//   prints what the pump's prints.
 // - **A stop that needs no reload.** A run spinning forever, and one asleep in a 30 s wait, each end
 //   promptly on their `AbortSignal` (`stopped`, not `broken`), and the same engine then runs the
 //   output program again. A finished run's signal, aborted during a later run, leaves that run be.
@@ -259,6 +262,15 @@ const res = await page.evaluate(async ({ outputSrc, spinSrc, sleepSrc, fsSrc }) 
     out.oneShot = { streamed: chunks.join(''), chunks: chunks.length, final: stdoutSlot() };
   }
 
+  // x2: the root as a leaf (#1414 5c). A run that fails says why, and fails only its own check.
+  try {
+    const r = await run(hello, { onramp: true, tierup: true });
+    const leaf = ex.temen_x2_leaf_len(0) > 0;
+    out.x2Leaf = { value: r.value.toString(), tierups: r.tierups, leaf, final: dec(readParStdoutBytes(eng)) };
+  } catch (e) {
+    out.x2Leaf = { err: e.message };
+  }
+
   // x2: a stop ends a spinning run and a sleeping one, and the engine runs on.
   const stopped = async (src, ms) => {
     const ac = new AbortController();
@@ -334,6 +346,7 @@ const checks = {
   'x2 output streams in the run\'s order': outputOk(res.output),
   'the pump\'s root leaf streams (#2523)': res.rootLeaf.status === 0 && res.rootLeaf.chunks > 0 && res.rootLeaf.streamed === res.rootLeaf.final,
   'the pump\'s one-shot streams': res.oneShot.chunks > 0 && res.oneShot.streamed === res.oneShot.final,
+  'x2 runs the root whole as a leaf, as the pump does': res.x2Leaf.leaf && res.x2Leaf.tierups === 1 && res.x2Leaf.final === res.rootLeaf.final,
   'a stop ends a spinning run': res.stopSpin.err === 'stopped' && !res.stopSpin.broken && res.stopSpin.ms < 3000,
   'a stop ends a sleeping run': res.stopSleep.err === 'stopped' && !res.stopSleep.broken && res.stopSleep.ms < 3000,
   'the engine runs on after a stop': outputOk(res.afterStop),
@@ -343,5 +356,5 @@ const checks = {
 };
 for (const [name, ok] of Object.entries(checks)) console.log(`  ${ok ? 'ok  ' : 'FAIL'} ${name}`);
 const ok = errors.length === 0 && Object.values(checks).every(Boolean);
-console.log(ok ? 'PASS — executor 2 streams its output, stops without a reload, and reports its files and frame as the pump does' : 'FAIL');
+console.log(ok ? 'PASS — executor 2 streams its output, stops without a reload, runs its root whole as a leaf, and reports its files and frame as the pump does' : 'FAIL');
 process.exit(ok ? 0 : 1);

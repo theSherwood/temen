@@ -135,7 +135,7 @@ pub fn nim_build(
     let (mut run, posix) = nim_open(&prepare(driver), &commands, dir, files, argv, cwd, leaf)?;
     let (mut ran, mut resumes) = (0, 0);
     let end = loop {
-        match run.run() {
+        match run.run_clockless() {
             CoopEvent::TierUp { func, argv, .. } => {
                 ran += 1;
                 let mut io = argv.to_vec();
