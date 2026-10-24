@@ -1484,9 +1484,17 @@ presence in a live, non-drainable state makes the subtree non-snapshottable, so
 **freeze refuses** unless they're closed/drained first (the drain is
 `Host::drain_non_durable`, below):
 
-`Blocking(u32)` (§5 + cancellation R2), and a `Module(u32)` grant the
-granting host did **not** attest freezable and that is not its program's child image (#1361,
-#2245, below). *(The §22 `JitTable`/`JitCode` handles were here until
+| `NonDurableKind` | Binding | Tracked |
+| --- | --- | --- |
+| `Blocking` | a `Blocking(u32)` handle (§5 + cancellation R2) | #1678 |
+| `Module` | a `Module(u32)` grant the granting host did **not** attest freezable and that is not its program's child image (#1361, #2245, below) | by design |
+| `ModuleLoader` | a §14 module loader, which mints `Module` grants | #1682 |
+| `HostProc` | a host capability with no name to re-grant it by (by design: its embedder names it or drains it), or one whose provider holds state it does not capture (#1699), as the POSIX personality's does. Named ones ride (#1455, below) | #1894 |
+| `Pipe` | an end of a pipe the embedder feeds, which no artifact can carry (one the tree minted rides, Section 9) | #1680 slice 2, #1902 |
+| `Offer` | a wired interface offer (IMPORTS.md §3.2) | #1681 |
+| `LiveImpl` | a live impl that names no child the cut carries, such as a wire live impl (one over a child rides by the child's task id, v50) | #1681 |
+
+*(The §22 `JitTable`/`JitCode` handles were here until
 **Slice 2**: their out-of-line unit state — instrumented+verified IR + quotas — now rides snapshot
 Section 5, so they are re-grantable; `drain_non_durable` keeps them. The native/wasm code pointers
 still don't ride — an interpreter thaw invokes the restored funcs directly, a native re-compile is

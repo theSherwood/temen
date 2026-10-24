@@ -11,6 +11,9 @@
 //! shadow stack, spilled live values, and the state word are all guest-resident bytes, so
 //! they ride along in the window for free. What lives *host-side* and is captured separately
 //! is the **handle table** (authority, not the resources it names — §12.5 / D-scope). The
+//! artifact binds the **instrumented-module digest** (R5 / D-hash): restore refuses on a
+//! mismatch, which is the durability boundary from §1 (the shadow schema is a function of the
+//! instrumented module's structure).
 //!
 //! ## Relationship to [`moment::Moment`](temen_interp::moment) (#1517 slice 5)
 //!
@@ -26,10 +29,6 @@
 //! window-resident form directly and does **not** re-encode a host-side checkpoint moment. Bridging a
 //! non-durable checkpoint moment to an artifact would require the `temen-durable` shadow schema to
 //! exist for that run, an owner-level design question, not a codec change here.
-//!
-//! artifact binds the **instrumented-module digest** (R5 / D-hash): restore refuses on a
-//! mismatch, which is the durability boundary from §1 (the shadow schema is a function of the
-//! instrumented module's structure).
 //!
 //! # Container (§12.1)
 //!
