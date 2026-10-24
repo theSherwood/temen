@@ -6600,7 +6600,7 @@ fn define_funcs(
                 #[cfg(test)]
                 record_emitted(module, code.code_buffer(), &relocs);
                 #[cfg(all(test, target_arch = "x86_64"))]
-                validate::capture_code(code.code_buffer(), &code.bb_starts);
+                validate::capture_code(code.code_buffer(), &code.bb_starts, &code.bb_edges);
                 let kept = keep
                     .as_mut()
                     .is_some_and(|k| k.push(module, ids, align, code.code_buffer(), &relocs));
@@ -6656,7 +6656,7 @@ fn compile_verified(
     // log any disagreement, but never reject (slice 1). `enabled()` is false on a production compile,
     // so this is inert there; `jit_isa` only records `bb_starts` when it is true.
     if validate::enabled() {
-        validate::shadow_check(code.code_buffer(), &code.bb_starts);
+        validate::shadow_check(code.code_buffer(), &code.bb_starts, &code.bb_edges);
     }
     Ok(code)
 }
