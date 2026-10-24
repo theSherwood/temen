@@ -271,6 +271,131 @@ block 3 (v9: i64) {
 }
 "#;
 
+// #2608 — hardware atomics on emitted wasm under real contention: 8 threads whose entries run whole
+// on their Workers' emitted tier, each 50000× bumping three counters — an `atomic.rmw.add`, a
+// `cmpxchg` retry loop, and a plain load/store under a spinlock (a `cmpxchg` acquire, a fence, an
+// `xchg` release). The root returns their sum, 1200000 on every interleaving; a lost update anywhere
+// lowers it. So that the threads contend at all (each one's loop is shorter than a Worker's start),
+// they spin on a `go` flag the root raises once it has slept 100 ms. Nothing here can hang on a
+// broken atomic, only lose updates: the flag has one writer, and the lock is only ever taken by a
+// thread that saw it free, which then frees it.
+const THREADS_ATOMICS_TIERUP: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 0
+  br 1(v0)
+}
+block 1 (v1: i64) {
+  v2 = i64.const 8
+  v3 = i64.lt_u v1 v2
+  br_if v3 2(v1) 3()
+}
+block 2 (v4: i64) {
+  v5 = i64.const 50000
+  v6 = thread.spawn 1 v5 v5
+  v7 = i64.const 4
+  v8 = i64.mul v4 v7
+  v9 = i64.const 16400
+  v10 = i64.add v9 v8
+  i32.store v10 v6
+  v11 = i64.const 1
+  v12 = i64.add v4 v11
+  br 1(v12)
+}
+block 3 () {
+  vnap = i64.const 16460
+  vzero = i32.const 0
+  vns = i64.const 100000000
+  vslept = i32.atomic.wait vnap vzero vns
+  vgo = i64.const 16456
+  vone = i32.const 1
+  i32.atomic.store vgo vone
+  v13 = i64.const 0
+  br 4(v13)
+}
+block 4 (v14: i64) {
+  v15 = i64.const 8
+  v16 = i64.lt_u v14 v15
+  br_if v16 5(v14) 6()
+}
+block 5 (v17: i64) {
+  v18 = i64.const 4
+  v19 = i64.mul v17 v18
+  v20 = i64.const 16400
+  v21 = i64.add v20 v19
+  v22 = i32.load v21
+  v23 = thread.join v22
+  v24 = i64.const 1
+  v25 = i64.add v17 v24
+  br 4(v25)
+}
+block 6 () {
+  v26 = i64.const 16384
+  v27 = i64.atomic.load v26
+  v28 = i64.const 16392
+  v29 = i64.atomic.load v28
+  v30 = i64.const 16448
+  v31 = i64.load v30
+  v32 = i64.add v27 v29
+  v33 = i64.add v32 v31
+  return v33
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, vn: i64) {
+  vgo = i64.const 16456
+  vstart = i32.atomic.load vgo
+  vz = i64.const 0
+  br_if vstart 1(vn, vz) 0(vsp, vn)
+}
+block 1 (vn1: i64, vi: i64) {
+  vmore = i64.lt_s vi vn1
+  br_if vmore 2(vn1, vi) 6()
+}
+block 2 (vn2: i64, vi2: i64) {
+  va = i64.const 16384
+  vone = i64.const 1
+  vold = i64.atomic.rmw.add va vone
+  vc = i64.const 16392
+  vcur = i64.atomic.load vc
+  br 3(vn2, vi2, vcur)
+}
+block 3 (vn3: i64, vi3: i64, vexp: i64) {
+  vc3 = i64.const 16392
+  vone3 = i64.const 1
+  vnew = i64.add vexp vone3
+  vgot = i64.atomic.cmpxchg vc3 vexp vnew
+  vmiss = i64.ne vgot vexp
+  br_if vmiss 3(vn3, vi3, vgot) 4(vn3, vi3)
+}
+block 4 (vn4: i64, vi4: i64) {
+  vlk = i64.const 16440
+  vfree = i32.const 0
+  vheld = i32.const 1
+  vprev = i32.atomic.cmpxchg vlk vfree vheld
+  br_if vprev 4(vn4, vi4) 5(vn4, vi4)
+}
+block 5 (vn5: i64, vi5: i64) {
+  atomic.fence
+  vp = i64.const 16448
+  vv = i64.load vp
+  vone5 = i64.const 1
+  vv2 = i64.add vv vone5
+  i64.store vp vv2
+  vlk5 = i64.const 16440
+  vfree5 = i32.const 0
+  vwas = i32.atomic.rmw.xchg vlk5 vfree5
+  vnext = i64.add vi5 vone5
+  br 1(vn5, vnext)
+}
+block 6 () {
+  vr = i64.const 0
+  return vr
+  }
+}
+"#;
+
 const THREADS_TIERUP: &str = r#"
 memory 16
 func () -> (i64) {
@@ -2401,9 +2526,11 @@ fn main() {
         include_str!("../../crates/temen-interp/tests/fixtures/threads_gc_spill.temt"),
     );
     // wasm-JIT **tier-up** across Workers (BROWSER.md § "wasm-JIT tier", per-Worker JIT) — the 4000
-    // kernel whose worker compute leaf tiers up onto emitted wasm. Ground truth (4000) asserted in JS.
+    // kernel whose workers run on emitted wasm with their compute leaf (#2608: their atomic add
+    // emits). Ground truth (4000, and 1200000 for the contended atomics) asserted in JS.
     emit("threads_tierup", THREADS_TIERUP);
     emit("threads_entry_tierup", THREADS_ENTRY_TIERUP);
+    emit("threads_atomics_tierup", THREADS_ATOMICS_TIERUP);
     // Dynamic-linking corpus — §22 compile_linked: resolve the unit's "clock" import via the symbol
     // table (link=1 → 777) or leave it unresolved (link=0 → fail-closed trap). One guest, both cases.
     {

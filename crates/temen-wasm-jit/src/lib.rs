@@ -468,6 +468,38 @@ fn atomic_ops(ty: IntTy) -> (u8, u8, u64) {
     }
 }
 
+/// #2608 — a **hardware atomic** over a shared memory: the threads-proposal access `op` (its `i32`
+/// opcode after the `0xFE` prefix; every `i64` form is the next one) for `ty`, with the confined
+/// address and operands on the stack. Its memarg states the natural alignment, as an atomic's must.
+/// The confined address is aligned whenever the guest's is, since every window base is 8-aligned
+/// (a flat backing, a shared region by contract, a detached child's page-sized header), so the
+/// natural-align trap that precedes it is the one that fires, as on the interpreter.
+///
+/// Over a shared memory another agent (a thread, or a process on another Worker) can touch the bytes
+/// between a plain load and store, so only the hardware op is atomic. Over an unshared one nothing
+/// can, so the plain load/(rmw)/store sequence is observably identical. It is also what `wasmi`,
+/// which has no threads proposal, runs in the differentials. The memory import's type states which
+/// it is, so an emit that disagrees with the memory it is given fails to link.
+fn emit_atomic(code: &mut Vec<u8>, op: u8, ty: IntTy) {
+    let (wide, align) = match ty {
+        IntTy::I32 => (0, 2),
+        IntTy::I64 => (1, 3),
+    };
+    code.extend_from_slice(&[0xFE, op + wide, align, 0x00]); // memarg: align, offset 0
+}
+
+/// The threads-proposal `i32` opcode of an atomic RMW ([`emit_atomic`]).
+fn atomic_rmw_opcode(op: AtomicRmwOp) -> u8 {
+    match op {
+        AtomicRmwOp::Add => 0x1E,
+        AtomicRmwOp::Sub => 0x25,
+        AtomicRmwOp::And => 0x2C,
+        AtomicRmwOp::Or => 0x33,
+        AtomicRmwOp::Xor => 0x3A,
+        AtomicRmwOp::Xchg => 0x41,
+    }
+}
+
 /// The arithmetic/bitwise `BinOp` an atomic RMW applies (all but `Xchg`, handled separately).
 fn rmw_binop(op: AtomicRmwOp) -> BinOp {
     match op {
@@ -878,12 +910,10 @@ fn block_value_types_with(
             Inst::Fma { .. } => return Err(Error::Unsupported("scalar fma (no core-wasm op)")),
             Inst::Load { op, .. } => tys.push(load_op(*op)?.2),
             Inst::Store { .. } => {}
-            // §12 atomics lower to a plain load/(rmw)/store sequence plus the interpreter's
-            // natural-align trap — observably identical to a hardware atomic **when single-threaded**,
-            // and (unlike the core-wasm atomic opcodes, which `wasmi` can't run) differential-testable.
-            // The single-thread precondition is enforced module-wide by `func_in_subset`'s
-            // `atomics_ok` gate (no concurrency op anywhere ⇒ no contention); here we only type the
-            // results. Load/rmw/cmpxchg yield `ty`; store yields nothing.
+            // §12 atomics, after the interpreter's natural-align trap: a hardware atomic over a shared
+            // memory, where another agent can touch the same bytes, and the plain load/(rmw)/store
+            // sequence over an unshared one, where none can (#2608; see `emit_atomic`). Here we only
+            // type the results. Load/rmw/cmpxchg yield `ty`; store yields nothing.
             Inst::AtomicLoad { ty, .. }
             | Inst::AtomicRmw { ty, .. }
             | Inst::AtomicCmpxchg { ty, .. } => tys.push(ty.val()),
@@ -1073,42 +1103,11 @@ fn term_in_subset(t: &Terminator) -> bool {
 /// Whether every instruction, terminator, and value type of `f` is in the emitter's integer compute
 /// subset — reusing [`block_value_types`] (which errors on any out-of-subset instruction) as the
 /// single source of truth, plus a type check (all values i32/i64) and the terminator check.
-fn func_in_subset(m: &Module, f: &Func, atomics_ok: bool) -> bool {
-    // §12 atomics lower to a **single-threaded** load/(rmw)/store sequence (see the
-    // `block_value_types` note): correct only when no contention is possible. `atomics_ok` is the
-    // module-level guarantee of that (no reachable concurrency op ⇒ no second thread) — when it does
-    // not hold, an atomic-using function stays off the JIT tier so the interpreter runs it with true
-    // hardware atomicity (matching the tier-up model, which already routes concurrency to the interp).
-    if !atomics_ok && func_uses_atomics(f) {
-        return false;
-    }
+fn func_in_subset(m: &Module, f: &Func) -> bool {
     f.blocks.iter().all(|b| {
         block_value_types(m, b).is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
             && term_in_subset(&b.term)
     })
-}
-
-/// Whether `f` contains any §12 atomic op ([`Inst::AtomicLoad`]/`Store`/`Rmw`/`Cmpxchg`).
-fn func_uses_atomics(f: &Func) -> bool {
-    f.blocks.iter().any(|b| {
-        b.insts.iter().any(|i| {
-            matches!(
-                i,
-                Inst::AtomicLoad { .. }
-                    | Inst::AtomicStore { .. }
-                    | Inst::AtomicRmw { .. }
-                    | Inst::AtomicCmpxchg { .. }
-            )
-        })
-    })
-}
-
-/// The module-level single-thread guarantee that makes the atomics' single-threaded lowering sound:
-/// **no** function uses a concurrency op (`thread.spawn`/`cont.*`/`memory.wait/notify`), so no second
-/// vCPU can ever run and contend an atomic. A guest that spawns threads fails this, keeping its
-/// atomic-using functions on the interpreter (true atomicity) — see [`func_in_subset`].
-fn module_atomics_ok(m: &Module) -> bool {
-    !m.funcs.iter().any(|f| f.uses_concurrency())
 }
 
 /// Whether `f` invokes a **shrinking or aliasing** window-remapping op — one that can make a
@@ -1155,8 +1154,8 @@ fn func_uses_page_ops(f: &Func) -> bool {
 /// interpreter (which enforces `Mem`'s full page-protection + backing map) would trap on or back
 /// with different bytes. That divergence is possible for **any** emitted memory access — not just
 /// the op's own function — so a module that uses one must run **wholly on the interpreter** (emit
-/// nothing). Checked module-wide (like [`module_atomics_ok`]) so it is sound for the un-rooted
-/// tier-up path too, where an op reachable only via `thread.spawn` still forbids emitting.
+/// nothing). Checked module-wide so it is sound for the un-rooted tier-up path too, where an op
+/// reachable only via `thread.spawn` still forbids emitting.
 ///
 /// **Not** gated: `ADDRESS_SPACE.map` (5,0) — a guest *grow*. Growth only adds committed pages
 /// within the reservation the mask already clamps to, and the live `"mapped"` global carries it to
@@ -1553,9 +1552,9 @@ fn interp_leaf(f: &Func) -> bool {
                         | Inst::ImportAttach { .. }
                         // and `gc.roots` (#1546): it would run, and answer with the emitted
                         // caller's frame unscanned — see [`bounce_serviceable`]'s `gc.roots` seed.
-                        // `uses_concurrency` above does not cover it (that predicate is the
-                        // single-thread guarantee for the atomics lowering, a different question),
-                        // and neither does the memory rule above — the op writes its buffer through
+                        // `uses_concurrency` above does not cover it (that predicate asks about
+                        // fibers, threads and futexes, a different question), and neither does the
+                        // memory rule above — the op writes its buffer through
                         // itself, not a `Store`, so a *bare* wrapper (no load, no store, no call)
                         // satisfied this predicate on its own terms. Excluded explicitly rather than
                         // by accident of the call-free rule.
@@ -1609,12 +1608,7 @@ pub fn analyze(m: &Module) -> Analysis {
 /// necessarily func 0.
 pub fn analyze_from(m: &Module, entry: u32) -> Analysis {
     let n = m.funcs.len();
-    let atomics_ok = module_atomics_ok(m);
-    let mut in_subset: Vec<bool> = m
-        .funcs
-        .iter()
-        .map(|f| func_in_subset(m, f, atomics_ok))
-        .collect();
+    let mut in_subset: Vec<bool> = m.funcs.iter().map(|f| func_in_subset(m, f)).collect();
     // #1004: the bulk-memory span check carries the guard low bound ([`emit_span_check`]), so bulk-mem
     // functions stay in-subset and emit — the #964 exclusion is retired. (#1094: the guard is
     // unconditional now, so every module's span check carries it.)
@@ -2789,12 +2783,7 @@ fn compile_module_tierup_inner(
         )?;
         return Ok((wasm, vec![false; n]));
     }
-    let atomics_ok = module_atomics_ok(m);
-    let mut in_subset: Vec<bool> = m
-        .funcs
-        .iter()
-        .map(|f| func_in_subset(m, f, atomics_ok))
-        .collect();
+    let mut in_subset: Vec<bool> = m.funcs.iter().map(|f| func_in_subset(m, f)).collect();
     // #1081: paged mode now emits a per-page walk for bulk-memory spans ([`emit_span_page_check`]), so
     // bulk-mem functions (Lua's `luaV_execute` among them) tier up under paged instead of staying on the
     // interpreter. The former blanket exclusion here is gone — the walk traps `MemoryFault` exactly
@@ -3400,6 +3389,7 @@ fn emit_module(
                 table_size,
                 paged,
                 null_guard,
+                shared_memory,
                 cross_module,
                 gc_reach,
             )?);
@@ -3428,6 +3418,7 @@ fn emit_module(
                 table_size,
                 paged,
                 null_guard,
+                shared_memory,
                 gc_reach,
             )?);
             group_type_idx.push(fs.group_type);
@@ -4234,6 +4225,9 @@ struct FnCtx {
     /// `Some` when this function's blocks nest as structured control flow; `None` runs them under
     /// the `$next` dispatcher.
     structure: Option<Structure>,
+    /// Whether the module's memory is shared, so another agent can touch the bytes an atomic does
+    /// ([`emit_atomic`]).
+    shared: bool,
 }
 
 impl FnCtx {
@@ -4268,6 +4262,7 @@ fn emit_func(
     table_size: u32,
     paged: Option<u8>,
     null_guard: Option<u64>,
+    shared: bool,
     cross_module: &[bool],
     gc_reach: &[bool],
 ) -> Result<Vec<u8>, Error> {
@@ -4376,6 +4371,7 @@ fn emit_func(
         page_check: paged,
         null_guard,
         structure: None,
+        shared,
     };
 
     let mut code = Vec::new();
@@ -4507,6 +4503,7 @@ fn emit_split_group(
     table_size: u32,
     paged: Option<u8>,
     null_guard: Option<u64>,
+    shared: bool,
     gc_reach: &[bool],
 ) -> Result<Vec<u8>, Error> {
     let n_params = 3u32; // win, env, entry
@@ -4603,6 +4600,7 @@ fn emit_split_group(
         page_check: paged,
         null_guard,
         structure: None,
+        shared,
     };
 
     let mut code = Vec::new();
@@ -4755,6 +4753,7 @@ fn emit_split_wrapper(f: &Func, entry_ord0: u32, group0_widx: u32) -> Result<Vec
         page_check: None,
         null_guard: None,
         structure: None,
+        shared: false, // the wrapper only marshals params
     };
     let mut code = Vec::new();
     emit_fuel_check(&mut cx, &mut code); // the single function-entry safepoint
@@ -5013,6 +5012,7 @@ pub fn compile_split_fn(
                 1,
                 None,
                 null_guard,
+                shared_memory,
                 &[],
                 &[],
             )?);
@@ -5032,6 +5032,7 @@ pub fn compile_split_fn(
             1,
             None,
             null_guard,
+            shared_memory,
             &[],
         )?);
     }
@@ -6214,11 +6215,14 @@ fn emit_block_body(
                 code.push(OP_SELECT);
                 set_result(cx, code, k, &mut next_val);
             }
-            // Standalone fence: a pure ordering barrier with no data effect. The wasm-JIT only
-            // compiles single-threaded guests (concurrency folds to the interp), where a fence is
-            // observably a no-op — so emit nothing (matching the oracle, which honors it identically
-            // single-threaded).
-            Inst::AtomicFence { .. } => {}
+            // Standalone fence: a pure ordering barrier with no data effect. Over a shared memory it
+            // orders this agent's accesses against the others' (`atomic.fence`); over an unshared one
+            // there are no others, so it is observably a no-op and emits nothing (#2608).
+            Inst::AtomicFence { .. } => {
+                if cx.shared {
+                    code.extend_from_slice(&[0xFE, 0x03, 0x00]); // atomic.fence
+                }
+            }
             Inst::Load {
                 op, addr, offset, ..
             } => {
@@ -6255,10 +6259,10 @@ fn emit_block_body(
                 get(code, cx, *value);
                 code.extend_from_slice(&[opcode, 0x00, 0x00]); // align=1, offset=0
             }
-            // ---- §12 atomics (single-threaded lowering; see the `block_value_types` note) ---------
-            // Each confines + natural-align-traps the effective address, then runs the plain memory
-            // op. For a JIT-tier (single-threaded) guest this is observably identical to a hardware
-            // atomic, and stays differential-testable on `wasmi`.
+            // ---- §12 atomics ----------------------------------------------------------------------
+            // Each confines + natural-align-traps the effective address, then runs the hardware
+            // atomic over a shared memory and the plain memory op over an unshared one
+            // ([`emit_atomic`]).
             Inst::AtomicLoad {
                 ty, addr, offset, ..
             } => {
@@ -6273,7 +6277,10 @@ fn emit_block_body(
                     elide_access(&ubs, *addr, *offset, width, mapped),
                     false, // read
                 );
-                code.extend_from_slice(&[load, 0x00, 0x00]);
+                match cx.shared {
+                    true => emit_atomic(code, 0x10, *ty), // i32.atomic.load
+                    false => code.extend_from_slice(&[load, 0x00, 0x00]),
+                }
                 set_result(cx, code, k, &mut next_val);
             }
             Inst::AtomicStore {
@@ -6295,7 +6302,10 @@ fn emit_block_body(
                     true, // write
                 );
                 get(code, cx, *value);
-                code.extend_from_slice(&[store, 0x00, 0x00]);
+                match cx.shared {
+                    true => emit_atomic(code, 0x17, *ty), // i32.atomic.store
+                    false => code.extend_from_slice(&[store, 0x00, 0x00]),
+                }
             }
             Inst::AtomicRmw {
                 ty,
@@ -6317,27 +6327,34 @@ fn emit_block_body(
                     elide_access(&ubs, *addr, *offset, width, mapped),
                     true, // write (RMW/cmpxchg may store)
                 );
-                code.push(OP_LOCAL_SET);
-                uleb(code, cx.atomic_addr_l as u64); // save the confined address
-                code.push(OP_LOCAL_GET);
-                uleb(code, cx.atomic_addr_l as u64);
-                code.extend_from_slice(&[load, 0x00, 0x00]); // old = *addr
-                code.push(OP_LOCAL_SET);
-                uleb(code, res as u64); // res = old
-                                        // *addr = op(old, value)  (xchg ignores old — store `value` directly)
-                code.push(OP_LOCAL_GET);
-                uleb(code, cx.atomic_addr_l as u64);
-                match op {
-                    AtomicRmwOp::Xchg => get(code, cx, *value),
-                    _ => {
-                        code.push(OP_LOCAL_GET);
-                        uleb(code, res as u64); // old
-                        get(code, cx, *value);
-                        code.push(intbin_opcode(*ty, rmw_binop(*op)));
+                if cx.shared {
+                    get(code, cx, *value);
+                    emit_atomic(code, atomic_rmw_opcode(*op), *ty); // → the old value
+                    code.push(OP_LOCAL_SET);
+                    uleb(code, res as u64); // res = old
+                } else {
+                    code.push(OP_LOCAL_SET);
+                    uleb(code, cx.atomic_addr_l as u64); // save the confined address
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, cx.atomic_addr_l as u64);
+                    code.extend_from_slice(&[load, 0x00, 0x00]); // old = *addr
+                    code.push(OP_LOCAL_SET);
+                    uleb(code, res as u64); // res = old
+                                            // *addr = op(old, value)  (xchg ignores old — store `value` directly)
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, cx.atomic_addr_l as u64);
+                    match op {
+                        AtomicRmwOp::Xchg => get(code, cx, *value),
+                        _ => {
+                            code.push(OP_LOCAL_GET);
+                            uleb(code, res as u64); // old
+                            get(code, cx, *value);
+                            code.push(intbin_opcode(*ty, rmw_binop(*op)));
+                        }
                     }
+                    code.extend_from_slice(&[store, 0x00, 0x00]);
                 }
-                code.extend_from_slice(&[store, 0x00, 0x00]);
-                next_val += 1; // res already holds the old value
+                next_val += 1; // res holds the old value
             }
             Inst::AtomicCmpxchg {
                 ty,
@@ -6359,28 +6376,36 @@ fn emit_block_body(
                     elide_access(&ubs, *addr, *offset, width, mapped),
                     true, // write (RMW/cmpxchg may store)
                 );
-                code.push(OP_LOCAL_SET);
-                uleb(code, cx.atomic_addr_l as u64);
-                code.push(OP_LOCAL_GET);
-                uleb(code, cx.atomic_addr_l as u64);
-                code.extend_from_slice(&[load, 0x00, 0x00]); // old = *addr
-                code.push(OP_LOCAL_SET);
-                uleb(code, res as u64); // res = old
-                                        // if old == expected { *addr = replacement }  (value width == type width, no mask)
-                code.push(OP_LOCAL_GET);
-                uleb(code, res as u64);
-                get(code, cx, *expected);
-                code.push(intcmp_opcode(*ty, CmpOp::Eq));
-                code.push(OP_IF);
-                code.push(BLOCKTYPE_VOID);
-                cx.depth += 1;
-                code.push(OP_LOCAL_GET);
-                uleb(code, cx.atomic_addr_l as u64);
-                get(code, cx, *replacement);
-                code.extend_from_slice(&[store, 0x00, 0x00]);
-                code.push(OP_END);
-                cx.depth -= 1;
-                next_val += 1; // res already holds the old value
+                if cx.shared {
+                    get(code, cx, *expected);
+                    get(code, cx, *replacement);
+                    emit_atomic(code, 0x48, *ty); // i32.atomic.rmw.cmpxchg → the old value
+                    code.push(OP_LOCAL_SET);
+                    uleb(code, res as u64); // res = old
+                } else {
+                    code.push(OP_LOCAL_SET);
+                    uleb(code, cx.atomic_addr_l as u64);
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, cx.atomic_addr_l as u64);
+                    code.extend_from_slice(&[load, 0x00, 0x00]); // old = *addr
+                    code.push(OP_LOCAL_SET);
+                    uleb(code, res as u64); // res = old
+                                            // if old == expected { *addr = replacement }  (value width == type width, no mask)
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, res as u64);
+                    get(code, cx, *expected);
+                    code.push(intcmp_opcode(*ty, CmpOp::Eq));
+                    code.push(OP_IF);
+                    code.push(BLOCKTYPE_VOID);
+                    cx.depth += 1;
+                    code.push(OP_LOCAL_GET);
+                    uleb(code, cx.atomic_addr_l as u64);
+                    get(code, cx, *replacement);
+                    code.extend_from_slice(&[store, 0x00, 0x00]);
+                    code.push(OP_END);
+                    cx.depth -= 1;
+                }
+                next_val += 1; // res holds the old value
             }
             // ---- bulk memory (D62): whole-span confinement, then `memory.fill`/`memory.copy` ----
             // The security hinge. The whole op runs under `if len != 0`, mirroring the interpreter's
