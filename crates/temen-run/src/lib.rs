@@ -1204,7 +1204,11 @@ unsafe fn jit_native_op(
         }
         6 => {
             // unit_info(ir_ptr, ir_len, buf_ptr, cap) -> len | -errno (#2167): what a guest loader
-            // needs to place a link unit's data. No window, nothing to read (-EFAULT, like op 0).
+            // needs to place a link unit's data. No window, nothing to read (-EFAULT, like op 0) —
+            // once the handle resolves: a forged one faults first, as the interpreter's does.
+            if host.resolve_jit_domain(handle).is_err() {
+                return cap_fault();
+            }
             let Some(mem) = gm else {
                 return put(results, n_results, EFAULT);
             };
