@@ -1615,11 +1615,14 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
             .page_map()
             .window_runs(temen_ir::module_null_guard(), 1u64 << reserved_log2);
         let Ok(window_lease) = host.relaunch_lease(&mut r.host, r.memory_log2, runs) else {
-            out.push(temen_jit::DetachedSeed::Completed {
-                slot,
-                result: 0,
-                trap: temen_interp::Trap::ThreadFault.code(),
-            });
+            // #2465 — one its parent detached, which no one can join, just ends.
+            if launch.joinable {
+                out.push(temen_jit::DetachedSeed::Completed {
+                    slot,
+                    result: 0,
+                    trap: temen_interp::Trap::ThreadFault.code(),
+                });
+            }
             continue;
         };
         let children = detached_seeds(&mut r.host)?;
@@ -1666,6 +1669,7 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
                 window: window_lease.map(|l| (l.budget, l.bytes, l.runs)),
                 children,
                 residue,
+                joinable: launch.joinable,
             },
         )));
     }
@@ -1805,6 +1809,7 @@ fn detached_left(
                     child_task: 0,
                     host: child,
                     spawn,
+                    joinable: h.joinable,
                 }),
             }
             continue;
@@ -1836,6 +1841,7 @@ fn detached_left(
                 lane,
                 names,
                 pager: None,
+                joinable: h.joinable,
             },
         });
     }
@@ -1854,6 +1860,7 @@ fn pending_detached(c: temen_interp::CapturedDetached) -> temen_interp::PendingD
             module: c.module,
             pager: c.launch.pager,
         },
+        joinable: c.launch.joinable,
     }
 }
 

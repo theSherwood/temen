@@ -296,7 +296,10 @@ use temen_ir::Module;
 /// domain the offer reaches: one it was re-granted into, or a fork twin's copy. A Section 12 record
 /// gains its kind after the pid: a live twin a personality forked, a live one a servicer forked, or a
 /// servicer's twin that exited unreaped, which holds its outcome.
-const FORMAT_VERSION: u16 = 50;
+/// v51 (#2465): a Section 8 launch record ends with whether the spawner still holds its join claim
+/// (`1`), or detached the child (op 10) before the cut (`0`). Such a child rides, and thaws
+/// unjoinable, where it was left out and its end decided the freeze.
+const FORMAT_VERSION: u16 = 51;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -1364,6 +1367,8 @@ fn write_detached(
         write_names(&mut b, &l.names);
         // v47 (#2438): the spawner's pager export plus one, `0` for an unpaged child.
         write_uleb(&mut b, l.pager.map_or(0, |e| u64::from(e) + 1));
+        // v51 (#2465): whether the spawner can still join it.
+        b.push(u8::from(l.joinable));
         write_uleb(&mut b, art.len() as u64);
         b.extend_from_slice(&art);
     }
@@ -2150,6 +2155,11 @@ fn decode_detached(
                     .ok_or(RestoreError::Malformed)?,
             ),
         };
+        let joinable = match r.take(1)?[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(RestoreError::Malformed),
+        };
         let art_len = r.uleb()? as usize;
         let art = r.take(art_len)?;
         let module = host
@@ -2171,6 +2181,7 @@ fn decode_detached(
                 lane,
                 names,
                 pager,
+                joinable,
             },
         });
     }

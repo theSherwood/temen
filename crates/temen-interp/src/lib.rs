@@ -3156,7 +3156,9 @@ fn relaunch_detached(
         .lock_unpoisoned()
         .relaunch_lease(&mut host, memory_log2, runs);
     let Ok(lease) = filed else {
-        deliver_detached(s, spawner, slot, Err(Trap::ThreadFault));
+        if launch.joinable {
+            deliver_detached(s, spawner, slot, Err(Trap::ThreadFault));
+        }
         return;
     };
     let lease = lease.map(|lease| (Arc::clone(&spawner.host), lease));
@@ -3177,7 +3179,9 @@ fn relaunch_detached(
         if let Some((spawner_host, lease)) = lease {
             spawner_host.lock_unpoisoned().release_detached(lease);
         }
-        deliver_detached(s, spawner, slot, Err(Trap::ThreadFault));
+        if launch.joinable {
+            deliver_detached(s, spawner, slot, Err(Trap::ThreadFault));
+        }
         return;
     };
     let dom = host.domain_id() as usize;
@@ -3239,7 +3243,6 @@ fn relaunch_detached(
     while spawner.threads.len() <= slot {
         spawner.threads.push(None);
     }
-    spawner.threads[slot] = Some(cid);
     spawner.child_kill.insert(slot, kflag);
     spawner.child_freeze.insert(
         slot,
@@ -3252,11 +3255,18 @@ fn relaunch_detached(
             },
         ),
     );
-    // D66: re-reserve the child's lane against the spawner's Σ. The thawing host set the spawner's own
-    // cap, so a lane that no longer fits is not re-drawn (and so not credited back at reap) — the child
-    // keeps its own cap either way, which bounds its tasks.
-    if spawner.host.lock_unpoisoned().try_grant_lane(launch.lane) {
-        spawner.child_lane.insert(slot, launch.lane);
+    if launch.joinable {
+        spawner.threads[slot] = Some(cid);
+        // D66: re-reserve the child's lane against the spawner's Σ. The thawing host set the
+        // spawner's own cap, so a lane that no longer fits is not re-drawn (and so not credited back
+        // at reap) — the child keeps its own cap either way, which bounds its tasks.
+        if spawner.host.lock_unpoisoned().try_grant_lane(launch.lane) {
+            spawner.child_lane.insert(slot, launch.lane);
+        }
+    } else {
+        // #2465 — detached (op 10) before the cut: it runs on unjoinable, its lane given back, until
+        // a later detach reaps it.
+        spawner.unreaped.push((slot, cid));
     }
     spawner.child_hosts.insert(slot, child_host);
 }
@@ -3536,14 +3546,17 @@ fn drive_over_cell(
                 let m = match out {
                     Some(o) if unwound => o.mem.filter(|_| o.result.is_ok()),
                     Some(o) if !withheld && o.result.is_ok() => {
-                        owner
-                            .lock_unpoisoned()
-                            .frozen_detached
-                            .push(FrozenDetached {
-                                parent_task: p.parent_task,
-                                slot: p.slot,
-                                completed_result: join_outcome(o.result),
-                            });
+                        // #2465 — one its spawner detached leaves nothing anyone can join.
+                        if p.joinable {
+                            owner
+                                .lock_unpoisoned()
+                                .frozen_detached
+                                .push(FrozenDetached {
+                                    parent_task: p.parent_task,
+                                    slot: p.slot,
+                                    completed_result: join_outcome(o.result),
+                                });
+                        }
                         continue;
                     }
                     _ => None,
@@ -3569,6 +3582,7 @@ fn drive_over_cell(
                         lane,
                         names,
                         pager: p.spawn.pager,
+                        joinable: p.joinable,
                     },
                     module: p.spawn.module,
                 });
@@ -8787,14 +8801,14 @@ fn hold_for_paged(s: &mut Sched, domain: usize, me: Option<&Seat>) -> bool {
             .map(VCpu::seat)
             .collect();
         for seat in me.into_iter().chain(others.iter()) {
-            for (slot, (bell, spawn)) in seat.child_freeze {
-                let Some(&Some(cid)) = seat.threads.get(*slot) else {
+            for (slot, cid) in seat.children() {
+                let Some((bell, spawn)) = seat.child_freeze.get(&slot) else {
                     continue;
                 };
                 let live = spawn.pager.is_some()
                     && !s.results.contains_key(&cid)
                     && !s.unwound.contains(&cid);
-                if let (true, Some(h)) = (live, seat.child_hosts.get(slot)) {
+                if let (true, Some(h)) = (live, seat.child_hosts.get(&slot)) {
                     rung.push((
                         Arc::clone(bell),
                         cid,
@@ -9022,6 +9036,8 @@ fn admit_parks(s: &mut Sched, of: &dyn Fn(usize) -> bool) {
 struct Seat<'a> {
     id: TaskId,
     threads: &'a [Option<TaskId>],
+    /// #2465 — the children it detached (op 10) before they ended ([`VCpu::unreaped`]).
+    unreaped: &'a [(usize, TaskId)],
     child_hosts: &'a BTreeMap<usize, Arc<Mutex<Host>>>,
     child_freeze: &'a BTreeMap<usize, (Arc<AtomicBool>, DetachedSpawn)>,
     host: &'a Arc<Mutex<Host>>,
@@ -9033,11 +9049,26 @@ impl VCpu {
         Seat {
             id: self.id,
             threads: &self.threads,
+            unreaped: &self.unreaped,
             child_hosts: &self.child_hosts,
             child_freeze: &self.child_freeze,
             host: &self.host,
             registry: &self.registry,
         }
+    }
+}
+
+impl Seat<'_> {
+    /// The §14 children this vCPU spawned that may still run, as `(slot, task)`: each its join table
+    /// names (a `thread.spawn` sibling's slot has no `child_hosts` entry), and (#2465) each it
+    /// detached (op 10) before it ended. What a freeze must reach.
+    fn children(&self) -> impl Iterator<Item = (usize, TaskId)> + '_ {
+        self.threads
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, t)| t.map(|cid| (slot, cid)))
+            .filter(|(slot, _)| self.child_hosts.contains_key(slot))
+            .chain(self.unreaped.iter().copied())
     }
 }
 
@@ -9093,17 +9124,8 @@ fn freeze_census(
         }
         let others: Vec<Seat> = scheduled_vcpus(&s).into_iter().map(VCpu::seat).collect();
         for seat in me.into_iter().chain(others.iter()) {
-            // A §14 child's slot holds a `child_hosts` entry; a `thread.spawn` sibling's never does.
-            for (slot, cid) in seat
-                .threads
-                .iter()
-                .enumerate()
-                .filter_map(|(i, t)| t.map(|c| (i, c)))
-            {
-                if seat.child_hosts.contains_key(&slot)
-                    && !s.results.contains_key(&cid)
-                    && !seat.child_freeze.contains_key(&slot)
-                {
+            for (slot, cid) in seat.children() {
+                if !s.results.contains_key(&cid) && !seat.child_freeze.contains_key(&slot) {
                     return declined(DeclineCause::DetachedUnreachable, seat.id, Some(slot));
                 }
             }
@@ -9486,34 +9508,31 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // the same way (#1674). A completed-and-reaped child (its `threads` slot cleared)
                 // left nothing to capture.
                 let detached_live_refused = froze && {
-                    let detached: Vec<usize> = v
-                        .child_hosts
-                        .keys()
-                        .copied()
-                        .filter(|slot| v.threads.get(*slot).and_then(|t| *t).is_some())
-                        // #2044 — and each a thaw delivered as completed, still unjoined.
-                        .chain(
-                            v.delivered_detached
-                                .iter()
-                                .filter(|&&(slot, cid)| v.threads.get(slot) == Some(&Some(cid)))
-                                .map(|&(slot, _)| slot),
-                        )
-                        .collect();
+                    // A slot that still names the child: its spawner can join it.
+                    let claimed =
+                        |&(slot, cid): &(usize, TaskId)| v.threads.get(slot) == Some(&Some(cid));
+                    // #2465 — each child it may still have, one it detached (op 10) too, and
+                    // (#2044) each a thaw delivered as completed, still unjoined.
+                    let delivered = v.delivered_detached.iter().copied().filter(claimed);
+                    let detached: Vec<(usize, TaskId)> =
+                        v.seat().children().chain(delivered).collect();
                     let mut refuse = false;
-                    for slot in detached {
-                        let cid = v.threads[slot].expect("filtered to Some");
+                    for (slot, cid) in detached {
                         // A child that already unwound for this freeze (rung while its parent was
                         // parked, #1904) is harvested like a running one, not recorded as complete.
                         let finished = !v.sched.unwound(cid);
                         if let Some(o) = finished.then(|| v.sched.take_result(cid)).flatten() {
-                            v.host
-                                .lock_unpoisoned()
-                                .frozen_detached
-                                .push(FrozenDetached {
-                                    parent_task: v.id as usize,
-                                    slot,
-                                    completed_result: join_outcome(o.result),
-                                });
+                            // One no one can join leaves nothing a thaw needs.
+                            if claimed(&(slot, cid)) {
+                                v.host
+                                    .lock_unpoisoned()
+                                    .frozen_detached
+                                    .push(FrozenDetached {
+                                        parent_task: v.id as usize,
+                                        slot,
+                                        completed_result: join_outcome(o.result),
+                                    });
+                            }
                         } else {
                             // #1361 step 3 — **still running**: ring the freeze doorbell and record
                             // the child for harvest. We do not wait for it: this vCPU is itself
@@ -9539,6 +9558,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                                         child_task: cid,
                                         host,
                                         spawn: spawn.clone(),
+                                        joinable: claimed(&(slot, cid)),
                                     });
                             } else {
                                 // No doorbell: a child minted before this mechanism existed, or one
@@ -11593,6 +11613,8 @@ pub struct PendingDetached {
     pub host: Arc<Mutex<Host>>,
     /// What the spawn recorded for a re-launch (see [`DetachedSpawn`]).
     pub spawn: DetachedSpawn,
+    /// #2465 — whether its spawner can still join it ([`DetachedLaunch::joinable`]).
+    pub joinable: bool,
 }
 
 /// #1361 step 4 — what op 17 knew when it minted a detached child that a thaw needs to mint it again,
@@ -11629,6 +11651,10 @@ pub struct DetachedLaunch {
     /// #2438 — the spawner's pager export, if the child is demand-paged (v47). Its unsupplied pages
     /// stay unmapped in its image, so after a thaw they fault again and this pager serves them.
     pub pager: Option<u32>,
+    /// #2465 — whether its spawner still holds its join claim (v51): `false` once the spawner
+    /// detached it (op 10). It then runs on unjoinable, and a thaw re-links it so: its spawner
+    /// never joins it, and reaps it at a later detach once it has ended.
+    pub joinable: bool,
 }
 
 /// #1361 step 3 — a live detached child **after** the harvest: its unwound window plus its powerbox,
@@ -13853,6 +13879,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             Seat {
                 id: *id,
                 threads: threads.as_slice(),
+                unreaped: unreaped.as_slice(),
                 child_hosts: &*child_hosts,
                 child_freeze: &*child_freeze,
                 host: &*host,
