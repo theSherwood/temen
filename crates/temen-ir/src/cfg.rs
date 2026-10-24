@@ -12,9 +12,9 @@
 //! pathologically deep CFG cannot overflow the host stack — the same fuzz-safety discipline the rest
 //! of the pass holds.
 
+use crate::{Block, Terminator};
 use alloc::vec;
 use alloc::vec::Vec;
-use crate::{Block, Terminator};
 
 /// The **distinct** successor block indices of a terminator, in first-seen order. `Return` / tail
 /// calls / `unreachable` have none. Deduplicated so CFG adjacency carries each edge once (a `br_if`

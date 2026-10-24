@@ -40,7 +40,11 @@ pub enum VerifyError {
     ParentNotDominating { func: u32, block: u32, target: u32 },
     /// Rule 2 of the dominance certificate (#2454): a capture names a block that is not a proper
     /// ancestor of the capturing block.
-    CaptureNotAncestor { func: u32, block: u32, captured: u32 },
+    CaptureNotAncestor {
+        func: u32,
+        block: u32,
+        captured: u32,
+    },
     /// A capture names a value its block does not have.
     CaptureOutOfRange {
         func: u32,

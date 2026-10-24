@@ -83,6 +83,35 @@ use temen_ir::{
 
 /// The CFG utilities live in temen-ir, beside the passes that need dominators there (#2454).
 pub use temen_ir::cfg;
+
+/// `m` in block-local form (#2454), the form every pass here reads: each reasons one block at a
+/// time, and renumbers a block's values or reshapes the CFG without the blocks that would capture
+/// them. Borrowed when `m` already is (no block captures, every parent the entry). Debug info follows
+/// the values.
+pub fn block_local(m: &Module) -> alloc::borrow::Cow<'_, Module> {
+    let local = |f: &Func| {
+        f.blocks
+            .iter()
+            .all(|b| b.parent == 0 && b.captures.is_empty())
+    };
+    if m.funcs.iter().all(local) {
+        return alloc::borrow::Cow::Borrowed(m);
+    }
+    let mut out = m.clone();
+    let has_memory = out.memory.is_some();
+    for i in 0..out.funcs.len() {
+        let f = &out.funcs[i];
+        let types = match f.blocks.iter().any(|b| !b.captures.is_empty()) {
+            true => temen_verify::func_value_types(f, &out.funcs, &out.types, has_memory),
+            false => Vec::new(),
+        };
+        let moves = out.funcs[i].localize(&types);
+        if let Some(di) = &mut out.debug_info {
+            moves.remap_debug(di, i as u32);
+        }
+    }
+    alloc::borrow::Cow::Owned(out)
+}
 pub mod gvn;
 pub mod instrument;
 pub mod interproc;
@@ -269,6 +298,8 @@ pub fn optimize_module(m: &Module) -> Module {
 /// Optimize every function in a module, running only the passes enabled in `cfg`. [`optimize_module`]
 /// is this with [`OptConfig::all`]; the benchmark harness varies `cfg` to measure each pass.
 pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
+    let local = block_local(m);
+    let m: &Module = &local;
     // Interprocedural pre-passes (OPT.md Phase 3), at module scope. Devirtualization turns a constant
     // `call.dyn` into a direct `call`; interprocedural constant propagation substitutes a
     // parameter that is the same constant at every call site into the callee (so the per-function passes
@@ -2211,6 +2242,8 @@ fn remap_targets(t: &mut Terminator, map: &[u32]) {
 /// instructions. The budget, half the program, only bounds a pathological cycle; the size limit keeps
 /// real growth small.
 pub fn optimize_linked(m: &Module) -> Module {
+    let local = block_local(m);
+    let m: &Module = &local;
     let size: usize = m
         .funcs
         .iter()
@@ -2310,6 +2343,11 @@ fn order_func_blocks(f: &mut Func) -> Option<Vec<u32>> {
         .map(|&b| {
             let mut blk = old[b as usize].take().expect("each block is placed once");
             remap_targets(&mut blk.term, &new_of);
+            // An ancestor dominates its descendants (#2454), so it still comes first.
+            blk.parent = new_of[blk.parent as usize];
+            for (a, _) in &mut blk.captures {
+                *a = new_of[*a as usize];
+            }
             blk
         })
         .collect();

@@ -639,6 +639,10 @@ pub fn specialize_with_config(
     args: &[SpecArg],
     config: &SpecConfig,
 ) -> Result<Module, SpecError> {
+    // The abstract interpreter keeps one block's values at a time: it reads a function whose blocks
+    // capture (#2454) in block-local form.
+    let local = temen_opt::block_local(module);
+    let module: &Module = &local;
     // Approach A: optionally rewrite dynamic-index `call.dyn`s into bounded direct-call
     // dispatch before specializing, so the engine folds through them (see `lower_indirect`). The
     // rewrite preserves function signatures/indices, so `func` and `args` still refer to the same

@@ -181,6 +181,10 @@ fn carry_funcs(module: &Module, funcs: Vec<Func>) -> Module {
 /// indices — and every other reference — stay valid. Name-bearing link metadata is dropped (see
 /// [`carry_funcs`]); the residual is addressed by index, like the specializer's own output.
 pub fn lower_indirect_dispatch(module: &Module, cap: usize) -> Module {
+    // Splitting a block renumbers its values: it reads a module whose blocks capture (#2454) in
+    // block-local form.
+    let local = temen_opt::block_local(module);
+    let module: &Module = &local;
     if cap == 0 {
         return carry_funcs(module, module.funcs.clone());
     }

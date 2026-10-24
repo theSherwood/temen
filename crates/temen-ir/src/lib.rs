@@ -5652,10 +5652,10 @@ pub fn resolve_imports_with(
     let types = out.types.clone();
     for f in &mut out.funcs {
         for b in &mut f.blocks {
-            // Map each value index to its defining instruction (block params → `None`) — a `Slot`
-            // import patches the `ConstI32` that defines its handle operand, so we may need to reach
-            // a *different* instruction than the `CallSym` we're rewriting.
-            let mut def_of: Vec<Option<usize>> = vec![None; b.params.len()];
+            // Map each value index to its defining instruction (block params and captures → `None`)
+            // — a `Slot` import patches the `ConstI32` that defines its handle operand, so we may need
+            // to reach a *different* instruction than the `CallSym` we're rewriting.
+            let mut def_of: Vec<Option<usize>> = vec![None; b.inputs()];
             for (p, inst) in b.insts.iter().enumerate() {
                 for _ in 0..inst.result_count(&fn_results, &types) {
                     def_of.push(Some(p));

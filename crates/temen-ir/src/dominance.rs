@@ -203,7 +203,8 @@ impl Func {
             let inputs = blk.inputs() as ValIdx;
             let mut here = BTreeMap::new();
             for (j, o) in origin[b].iter().enumerate() {
-                here.entry(id[o]).or_insert(blk.params.len() as ValIdx + j as ValIdx);
+                here.entry(id[o])
+                    .or_insert(blk.params.len() as ValIdx + j as ValIdx);
             }
             let mut more = Vec::new();
             for k in 0..id.len() {
@@ -226,7 +227,10 @@ impl Func {
         let in_block = |b: usize, k: usize| -> ValIdx {
             let (db, dv) = def[k];
             if db as usize == b {
-                moves.value(db, dv).expect("a definition is never dropped").1
+                moves
+                    .value(db, dv)
+                    .expect("a definition is never dropped")
+                    .1
             } else {
                 local[b][&k]
             }
@@ -272,8 +276,11 @@ impl Func {
                 .map(|&(a, v)| types[a as usize][v as usize])
                 .collect();
             blk.params.extend(captured);
-            blk.params
-                .extend(added[b].iter().map(|&k| types[def[k].0 as usize][def[k].1 as usize]));
+            blk.params.extend(
+                added[b]
+                    .iter()
+                    .map(|&k| types[def[k].0 as usize][def[k].1 as usize]),
+            );
             blk.captures.clear();
         }
         moves

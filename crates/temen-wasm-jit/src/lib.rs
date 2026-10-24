@@ -1082,8 +1082,11 @@ fn func_in_subset(m: &Module, f: &Func, atomics_ok: bool) -> bool {
     if !atomics_ok && func_uses_atomics(f) {
         return false;
     }
+    // A block that captures a dominating block's value (#2454) is outside it: this tier types and
+    // pools each block's values on their own, so such a function runs on the interpreter tier.
     f.blocks.iter().all(|b| {
-        block_value_types(m, b).is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
+        b.captures.is_empty()
+            && block_value_types(m, b).is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
             && term_in_subset(&b.term)
     })
 }

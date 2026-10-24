@@ -2465,17 +2465,23 @@ impl FuncMemo {
     }
 }
 
-fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> {
-    // Global slot per value: each block's params then its value-producing insts, in order.
+/// The frame layout: one slot per value of the function, each block's params, then its captures,
+/// then its instructions' results, in order. Each block's first slot, and the slot count.
+fn slot_bases(f: &Func, results: impl Fn(&Inst) -> u32) -> (Vec<u32>, u32) {
     let mut base = Vec::with_capacity(f.blocks.len());
-    let mut nslots = 0u32;
+    let mut n = 0u32;
     for b in &f.blocks {
-        base.push(nslots);
-        nslots += b.params.len() as u32;
+        base.push(n);
+        n += b.inputs() as u32;
         for inst in &b.insts {
-            nslots += view.results(inst) as u32;
+            n += results(inst);
         }
     }
+    (base, n)
+}
+
+fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> {
+    let (base, mut nslots) = slot_bases(f, |inst| view.results(inst) as u32);
     // #2353 — one slot past every value's: the `dst` of an instruction that defines none. A driver
     // answering such a call later (a `fork`'s return-twice value, a parked call's result) writes it
     // here, where no value lives, not over the slot of the value defined next, nor past the frame.
@@ -2495,27 +2501,45 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
     // slot, and no edge copies into it. The unfused compile (stepping, tracing, a debug run's
     // frames, read by `(block, value)`) keeps every param in a slot of its own.
     let forwards = fuse.then(|| f.forwards());
-    let forwarded = |b: usize, i: usize| forwards.as_ref().and_then(|w| w.source(b, i));
-    // The slots a forwarding param reads: read outside their block with no edge copy, so their
-    // values must be written (the `IntCmp` fusion below checks this).
+    let forwarded = |b: usize, i: usize| {
+        let w = forwards.as_ref()?;
+        (i < f.blocks[b].params.len())
+            .then(|| w.source(b, i))
+            .flatten()
+    };
+    // The slot that holds value `v` of block `b`. In the fused compile a capture (#2454) reads the
+    // slot of the value it names, as a forwarding param reads its source's; the unfused compile keeps
+    // each in a slot of its own, which every edge into its block fills.
+    let slot = |mut b: usize, mut v: u32| -> u32 {
+        loop {
+            let blk = &f.blocks[b];
+            let np = blk.params.len() as u32;
+            if let Some((sb, si)) = forwarded(b, v as usize) {
+                (b, v) = (sb as usize, si);
+            } else if fuse && v >= np && v < blk.inputs() as u32 {
+                let (a, av) = blk.captures[(v - np) as usize];
+                (b, v) = (a as usize, av);
+            } else {
+                return base[b] + v;
+            }
+        }
+    };
+    // The slots forwarding params and captures read: read outside their block with no edge copy,
+    // so their values must be written (the `IntCmp` fusion below checks this).
     let mut read_forwarded = vec![false; nslots as usize];
     for (b, blk) in f.blocks.iter().enumerate() {
-        for i in 0..blk.params.len() {
-            if let Some((sb, si)) = forwarded(b, i) {
-                read_forwarded[(base[sb as usize] + si) as usize] = true;
+        for v in 0..blk.inputs() as u32 {
+            let s = slot(b, v);
+            if s != base[b] + v {
+                read_forwarded[s as usize] = true;
             }
         }
     }
     for (bi, b) in f.blocks.iter().enumerate() {
         block_pc[bi] = ops.len() as u32;
-        let params = b.params.len() as u32;
         // operand: block-local index -> frame slot
-        let g = |local: u32| match local < params {
-            true => forwarded(bi, local as usize)
-                .map_or(base[bi] + local, |(sb, si)| base[sb as usize] + si),
-            false => base[bi] + local,
-        };
-        let mut local = params;
+        let g = |local: u32| slot(bi, local);
+        let mut local = b.inputs() as u32;
         for (i, inst) in b.insts.iter().enumerate() {
             let dst = match view.results(inst) {
                 0 => discard,
@@ -2533,11 +2557,21 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
             // param every iteration. Safe and semantics-transparent: an `x -> x` move changes nothing,
             // and its removal can't affect the gather/scatter of the other (aliasing) copies. Applies
             // uniformly to every terminator's edges (Br/BrIf/BrIfCmp/BrTable), fused or not.
+            // In the unfused compile the target's captures ride every edge into it too, each copied
+            // from the slot of the value it names.
+            let target = &f.blocks[bidx];
+            let captured = target.captures.iter().filter(|_| !fuse);
             let pairs: Box<[(u32, u32)]> = args
                 .iter()
                 .enumerate()
                 .filter(|&(i, _)| forwarded(bidx, i).is_none())
                 .map(|(i, a)| (g(*a), base[bidx] + i as u32))
+                .chain(captured.enumerate().map(|(j, &(a, v))| {
+                    (
+                        slot(a as usize, v),
+                        base[bidx] + (target.params.len() + j) as u32,
+                    )
+                }))
                 .filter(|(src, dst)| src != dst)
                 .collect();
             (Copies::new(pairs), bidx as u32) // block index; patched to entry pc below
@@ -4308,15 +4342,7 @@ impl ModuleDebug {
         let mut fn_block_base = Vec::with_capacity(m.funcs.len());
         let mut fn_block_types = Vec::with_capacity(m.funcs.len());
         for g in &m.funcs {
-            let mut base = Vec::with_capacity(g.blocks.len());
-            let mut n = 0u32;
-            for b in &g.blocks {
-                base.push(n);
-                n += b.params.len() as u32;
-                for inst in &b.insts {
-                    n += inst.result_count(&arities, &m.types) as u32;
-                }
-            }
+            let (base, _) = slot_bases(g, |inst| inst.result_count(&arities, &m.types) as u32);
             fn_block_base.push(base);
             fn_block_types.push(temen_verify::func_value_types(
                 g,

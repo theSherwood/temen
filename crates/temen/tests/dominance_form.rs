@@ -5,8 +5,8 @@
 #[path = "support/irgen.rs"]
 mod irgen;
 
-use irgen::{gen_args, gen_module, Gen};
-use temen::interp::{run, Trap, Value};
+use irgen::{gen_args, gen_module, run_differential, Gen};
+use temen::interp::{bytecode, run, Trap, Value};
 use temen::ir::{Func, Module};
 use temen::verify::{func_value_types, verify_module, VerifyError};
 
@@ -58,8 +58,8 @@ fn same(a: &Result<Vec<Value>, Trap>, b: &Result<Vec<Value>, Trap>) -> bool {
     }
 }
 
-/// Raising a generated program verifies, survives the wire and text forms unchanged, and localizes
-/// back to a block-local program that computes what the original did.
+/// Raising a generated program verifies, survives the wire and text forms unchanged, computes what
+/// the original did on every engine, and localizes back to a block-local program that does too.
 #[test]
 fn raise_and_localize_generated_programs() {
     let (mut funcs_with_captures, mut params_before, mut params_after) = (0, 0, 0);
@@ -80,7 +80,11 @@ fn raise_and_localize_generated_programs() {
         params_before += m.funcs.iter().map(params).sum::<usize>();
         params_after += r.funcs.iter().map(params).sum::<usize>();
         let bytes = temen::encode::encode_module(&r);
-        assert_eq!(temen::encode::decode_module(&bytes).unwrap(), r, "seed {seed}: wire");
+        assert_eq!(
+            temen::encode::decode_module(&bytes).unwrap(),
+            r,
+            "seed {seed}: wire"
+        );
         // Text is compared printed: it does not spell everything a module can hold (an `i64x2`
         // lane extract's sign flag, which means nothing at that width).
         let text = temen::text::print_module(&r);
@@ -96,24 +100,43 @@ fn raise_and_localize_generated_programs() {
             )
         });
         // Renumbering moves which edges count as back edges, and so where fuel is charged: compare
-        // only runs that finish on both.
-        let (mut f0, mut f1) = (2_000_000u64, 2_000_000u64);
-        let before = run(&m, 0, &args, &mut f0);
-        let after = run(&l, 0, &args, &mut f1);
-        if matches!(before, Err(Trap::OutOfFuel)) || matches!(after, Err(Trap::OutOfFuel)) {
-            continue;
+        // the original only with runs that finish on both.
+        let fuel = || 2_000_000u64;
+        let before = run(&m, 0, &args, &mut fuel());
+        let native = run(&r, 0, &args, &mut fuel());
+        let back = run(&l, 0, &args, &mut fuel());
+        for (what, after) in [("raised", &native), ("localized", &back)] {
+            if matches!(before, Err(Trap::OutOfFuel)) || matches!(after, Err(Trap::OutOfFuel)) {
+                continue;
+            }
+            assert!(
+                same(&before, after),
+                "seed {seed}: {before:?} became {after:?} {what}\n{}\n{what}:\n{}",
+                temen::text::print_module(&m),
+                temen::text::print_module(if what == "raised" { &r } else { &l })
+            );
         }
-        assert!(
-            same(&before, &after),
-            "seed {seed}: {before:?} became {after:?}\n{}\nlocalized:\n{}",
-            temen::text::print_module(&m),
-            temen::text::print_module(&l)
-        );
+        // The raised program on the other engines: the bytecode engine bit-exact with the oracle
+        // (fuel included: the same IR charges the same safepoints), the Cranelift JIT through the
+        // shared differential and its escape oracle.
+        if let Some(bc) = bytecode::compile_and_run(&r, 0, &args, &mut fuel()) {
+            assert!(
+                same(&native, &bc),
+                "seed {seed}: bytecode {bc:?}, oracle {native:?}\n{}",
+                temen::text::print_module(&r)
+            );
+        }
+        if seed % 4 == 0 {
+            run_differential(&r, &args);
+        }
     }
     println!(
         "{funcs_with_captures} functions captured; block params {params_before} -> {params_after}"
     );
-    assert!(funcs_with_captures > 100, "raise rarely captured: the test is near-vacuous");
+    assert!(
+        funcs_with_captures > 100,
+        "raise rarely captured: the test is near-vacuous"
+    );
 }
 
 fn verify_text(src: &str) -> Result<(), VerifyError> {

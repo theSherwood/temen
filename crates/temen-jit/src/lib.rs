@@ -8301,6 +8301,26 @@ fn build_clif(
     if f.blocks.is_empty() {
         return Err(JitError::Malformed);
     }
+    // A value that crosses a `setjmp` reaches its later uses only through the `setjmp` block's own
+    // map, which reloads it after the second return (`launder_across_setjmp`). A forwarding param
+    // (#2448) or a capture (#2454) would read the value its own block defined, around the reload
+    // (#2600). So such a function is lowered block-local, taking no param as what it forwards.
+    let block_local;
+    let f = if f.uses_setjmp() && f.blocks.iter().any(|b| !b.captures.is_empty()) {
+        let mut g = f.clone();
+        // Typing reads `has_memory` only to reject a memory op in a module with no window, which a
+        // verified function has none of, so `true` types it exactly.
+        g.localize(&temen_verify::func_value_types(
+            f,
+            funcs,
+            type_section,
+            true,
+        ));
+        block_local = g;
+        &block_local
+    } else {
+        f
+    };
     clif.signature = natural_sig(f);
     clif.name = UserFuncName::user(0, 0);
 
@@ -8312,7 +8332,7 @@ fn build_clif(
     // native params and jumps into IR block 0.
     let mut blocks = Blocks {
         clif: f.blocks.iter().map(|_| b.create_block()).collect(),
-        fwd: f.forwards(),
+        fwd: (!f.uses_setjmp()).then(|| f.forwards()),
         vals: vec![Vec::new(); f.blocks.len()],
     };
     for (i, blk) in f.blocks.iter().enumerate() {
@@ -8730,7 +8750,18 @@ fn lower_block(
             None => own.next().ok_or(JitError::Malformed)?,
         });
     }
-    // Parallel upper-bound map (for mask elision); block params are unknown. Kept in lockstep
+    // Then its captures (#2454): each the value of the ancestor block it names, lowered before this
+    // one (an ancestor's index is lower) and dominating it (the verifier's rules), so the CLIF value
+    // is defined wherever this block uses it.
+    for &(a, v) in &blk.captures {
+        let held = blocks.vals[..block_idx].get(a as usize);
+        vals.push(
+            *held
+                .and_then(|h| h.get(v as usize))
+                .ok_or(JitError::Malformed)?,
+        );
+    }
+    // Parallel upper-bound map (for mask elision); block params and captures are unknown. Kept in lockstep
     // with `vals` so `ubs[i]` describes IR value `i` — a misalignment could mis-elide a mask (the
     // INVARIANTS #2 escape class). Rather than re-growing it by hand in every multi-result arm (a
     // 25th-arm slip away from a mis-elide), it is repaired to `vals.len()` at the **top of each
@@ -11997,7 +12028,8 @@ fn map_edge(
 /// once it is lowered, its values, which a later block's taken params read.
 struct Blocks {
     clif: Vec<cranelift_codegen::ir::Block>,
-    fwd: temen_ir::Forwards,
+    /// `None` in a function that calls `setjmp`, which takes no param as what it forwards (#2600).
+    fwd: Option<temen_ir::Forwards>,
     vals: Vec<Vec<Value>>,
 }
 
@@ -12008,6 +12040,7 @@ impl Blocks {
     /// the value is defined wherever the param is used.
     fn taken(&self, b: usize, i: usize) -> Option<(usize, usize)> {
         self.fwd
+            .as_ref()?
             .source(b, i)
             .map(|(sb, si)| (sb as usize, si as usize))
             .filter(|&(sb, _)| sb < b)

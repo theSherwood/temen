@@ -110,6 +110,8 @@ fn remap_func_indices(f: &mut Func, map: &[u32]) {
 /// removed (its `(func, …)` positions would be stale after renumbering; it is strippable and untrusted
 /// for escape, §3a).
 pub fn dead_func_elim(m: &Module) -> Module {
+    let local = crate::block_local(m);
+    let m: &Module = &local;
     let n = m.funcs.len();
     if n == 0 {
         return m.clone();
@@ -634,6 +636,8 @@ pub fn inline_calls(m: &Module) -> Module {
 /// survives for every function nothing was inlined into; a caller's own positions go stale, so its
 /// locations and variables are dropped ([`crate::drop_stale_debug`]).
 pub fn inline_calls_with(m: &Module, limits: InlineLimits) -> Module {
+    let local = crate::block_local(m);
+    let m: &Module = &local;
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
     let types = &m.types;
     let has_memory = m.memory.is_some();
@@ -832,6 +836,8 @@ fn block_knowns(
 /// bail, and if **any** indirect index is still `Top` at the fixpoint — an unknown funcref that could
 /// reach any function with arguments we never counted — the pass bails entirely. Output is re-verified.
 pub fn const_prop(m: &Module) -> Module {
+    let local = crate::block_local(m);
+    let m: &Module = &local;
     let n = m.funcs.len();
     if n == 0 {
         return m.clone();
@@ -1103,6 +1109,8 @@ fn resolve_devirt(
 /// the direct call does. A mismatched or out-of-range index is left as an indirect call so it still
 /// traps identically. Debug info is dropped on any rewrite (an instruction changed).
 pub fn devirtualize(m: &Module) -> Module {
+    let local = crate::block_local(m);
+    let m: &Module = &local;
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
     let types = &m.types;
     let num_funcs = m.funcs.len();

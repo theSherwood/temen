@@ -8,8 +8,9 @@ publish = false
 
 [dependencies]
 temen-ir.workspace = true
+# `func_value_types`: the types a function instrumented block-local needs for the params it gains.
+temen-verify.workspace = true
 
 [dev-dependencies]
 temen-text.workspace = true
-temen-verify.workspace = true
 temen-interp.workspace = true

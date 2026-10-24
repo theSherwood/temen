@@ -433,10 +433,10 @@ fn print_func_at(s: &mut String, f: &Func, fn_results: &[usize], m: &Module, idx
         let _ = writeln!(s, "  block {bi}{parent} ({}) {{", inputs.join(", "));
 
         let mut next = b.inputs() as u32; // next value index in this block
-                                              // The value index of the immediately-preceding instruction when it is an `i32.const 0` — the
-                                              // ignored dispatch handle a `self.*` sugar CapCall points at. Lets the printer spell the
-                                              // sugar only when its handle is that adjacent const (so parse re-pairs them exactly); any
-                                              // other CapCall CAP_SELF prints as the raw `call.cap`, which round-trips on its own.
+                                          // The value index of the immediately-preceding instruction when it is an `i32.const 0` — the
+                                          // ignored dispatch handle a `self.*` sugar CapCall points at. Lets the printer spell the
+                                          // sugar only when its handle is that adjacent const (so parse re-pairs them exactly); any
+                                          // other CapCall CAP_SELF prints as the raw `call.cap`, which round-trips on its own.
         let mut prev_const0: Option<u32> = None;
         for inst in &b.insts {
             let n = inst.result_count(fn_results, &m.types);
