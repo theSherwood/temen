@@ -46,7 +46,10 @@ cd "$ROOT"
 : "${NIM_BIN:?set NIM_BIN to the directory holding nim}"
 export PATH="$NIMONY_BIN:$NIM_BIN:$PATH"
 W="$(mktemp -d)"
-trap 'rm -rf "$W"' EXIT
+# `wait` first: temen-link builds into `$W` in the background (below), and a step that fails before
+# it is joined must not delete the directory under it, which then reports its own missing files
+# instead of the failure (#2613).
+trap 'wait; rm -rf "$W"' EXIT
 cargo build --release -q -p temen-run --example nim_selfhost_lane
 B=target/release/examples
 
