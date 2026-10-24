@@ -966,12 +966,15 @@ unsafe fn jit_native_op(
         }
     };
     let cap_fault = || vm.raise(TrapKind::CapFault as i64);
+    // Every op names a `Jit` table, so a forged handle faults before an op reads its arguments or the
+    // window, as the interpreter's dispatch resolves the binding before it reaches an op. One resolve
+    // for all of them: op 6 once checked the window first and answered a forged handle (#2610).
+    let Ok(domain) = host.resolve_jit_domain(handle) else {
+        return cap_fault();
+    };
     match op {
         0 => {
             // compile(ptr, len) -> code_handle | -errno.
-            let Ok(domain) = host.resolve_jit_domain(handle) else {
-                return cap_fault();
-            };
             let cm = host.jit_native_ctx(domain) as *mut CompiledModule;
             if cm.is_null() {
                 // No live module registered (host wiring bug) — fail closed, non-fatally.
@@ -1020,9 +1023,6 @@ unsafe fn jit_native_op(
         }
         1 => {
             // invoke(code_handle, args…) -> results.
-            let Ok(domain) = host.resolve_jit_domain(handle) else {
-                return cap_fault();
-            };
             let Some(&ch) = args.first() else {
                 return cap_fault();
             };
@@ -1083,9 +1083,6 @@ unsafe fn jit_native_op(
         2 => {
             // release(code_handle) -> 0 | -EINVAL (forged/double release is non-fatal: it is
             // guest-reachable in a loop and must not kill the domain).
-            if host.resolve_jit_domain(handle).is_err() {
-                return cap_fault();
-            }
             let ch = *args.first().unwrap_or(&0) as i32;
             let v = match host.jit_release(ch) {
                 Ok(()) => 0,
@@ -1097,9 +1094,6 @@ unsafe fn jit_native_op(
             // install(code_handle) -> slot_index | -errno (DESIGN.md §22): write the unit's
             // natural entry + interned type_id into the live fn_table's next padding slot. The
             // slot index agrees with the interpreter's (both fill from the parent's funcs count).
-            let Ok(domain) = host.resolve_jit_domain(handle) else {
-                return cap_fault();
-            };
             let Some(&ch) = args.first() else {
                 return cap_fault();
             };
@@ -1131,9 +1125,6 @@ unsafe fn jit_native_op(
         4 => {
             // uninstall(slot) -> 0 | -EINVAL (DESIGN.md §22 reclaim): clear an installed slot
             // so the index is reusable and a stale call.dyn of it traps.
-            let Ok(domain) = host.resolve_jit_domain(handle) else {
-                return cap_fault();
-            };
             let cm = host.jit_native_ctx(domain) as *mut CompiledModule;
             if cm.is_null() {
                 return put(results, n_results, EINVAL);
@@ -1154,9 +1145,6 @@ unsafe fn jit_native_op(
             // (DESIGN.md §22 host-assisted dynamic linking). Like op 0, but the unit may carry
             // unresolved §7 imports bound by name against the guest's symbol-table buffer before
             // verify+compile. Any failure leaves nothing installed.
-            let Ok(domain) = host.resolve_jit_domain(handle) else {
-                return cap_fault();
-            };
             let cm = host.jit_native_ctx(domain) as *mut CompiledModule;
             if cm.is_null() {
                 return put(results, n_results, EINVAL);
@@ -1204,11 +1192,7 @@ unsafe fn jit_native_op(
         }
         6 => {
             // unit_info(ir_ptr, ir_len, buf_ptr, cap) -> len | -errno (#2167): what a guest loader
-            // needs to place a link unit's data. No window, nothing to read (-EFAULT, like op 0) —
-            // once the handle resolves: a forged one faults first, as the interpreter's does.
-            if host.resolve_jit_domain(handle).is_err() {
-                return cap_fault();
-            }
+            // needs to place a link unit's data. No window, nothing to read (-EFAULT, like op 0).
             let Some(mem) = gm else {
                 return put(results, n_results, EFAULT);
             };
