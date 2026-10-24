@@ -38,13 +38,29 @@ pub(crate) fn disagreement_count() -> u64 {
     DISAGREEMENTS.load(Ordering::Relaxed)
 }
 
+/// The module's §4 window geometry (a per-compile hint, #2603): the confinement mask
+/// (`reserved − 1`) and the guard-page offset (`round_up(reserved, page)`, the D63 redirect target).
+/// `None` for a memoryless module. The window-access policy re-proves every access's physical offset
+/// stays within the reservation `[0, guard_offset + page)` against these — everything there is mapped
+/// or `PROT_NONE` guard, so an access that stays inside it can fault but never escape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WindowLayout {
+    pub mask: u64,
+    pub guard_offset: u64,
+}
+
 /// Validate one emitted function's `bytes` against its basic-block hints from
 /// `CompiledCode`: `bb_starts` (block start offsets) and `bb_edges` (block-to-block control-flow
-/// edges, each `(from_start, to_start)`). Shadow mode: every problem is logged and counted, never
-/// returned.
-pub(crate) fn shadow_check(bytes: &[u8], bb_starts: &[u32], bb_edges: &[(u32, u32)]) {
+/// edges, each `(from_start, to_start)`), with the module's `layout` (`None` if memoryless). Shadow
+/// mode: every problem is logged and counted, never returned.
+pub(crate) fn shadow_check(
+    bytes: &[u8],
+    bb_starts: &[u32],
+    bb_edges: &[(u32, u32)],
+    layout: Option<WindowLayout>,
+) {
     #[cfg(target_arch = "x86_64")]
-    for f in x86::check(bytes, bb_starts, bb_edges) {
+    for f in x86::check(bytes, bb_starts, bb_edges, layout) {
         // Count every disagreement (a fuzz run asserts the total), but cap the logging so a bad
         // decode on every module can't swamp a fuzzer's stderr.
         let n = DISAGREEMENTS.fetch_add(1, Ordering::Relaxed);
@@ -53,7 +69,7 @@ pub(crate) fn shadow_check(bytes: &[u8], bb_starts: &[u32], bb_edges: &[(u32, u3
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = (bytes, bb_starts, bb_edges);
+    let _ = (bytes, bb_starts, bb_edges, layout);
 }
 
 // --- test-only capture of real compiled code, cross-checked against iced-x86 ---
@@ -62,24 +78,30 @@ pub(crate) fn shadow_check(bytes: &[u8], bb_starts: &[u32], bb_edges: &[(u32, u3
 // caller in `lib.rs` is gated to match, so it is `all(test, target_arch = "x86_64")` — on another
 // target (the aarch64 clippy lane) it would be dead code under `-D warnings`.
 
-/// One captured function's machine code and its basic-block hints (`bb_starts`, `bb_edges`).
+/// One captured function's machine code, its basic-block hints (`bb_starts`, `bb_edges`), and the
+/// module's window layout.
 #[cfg(all(test, target_arch = "x86_64"))]
-type CapturedFn = (Vec<u8>, Vec<u32>, Vec<(u32, u32)>);
+type CapturedFn = (Vec<u8>, Vec<u32>, Vec<(u32, u32)>, Option<WindowLayout>);
 
 #[cfg(all(test, target_arch = "x86_64"))]
 thread_local! {
-    /// When armed, each function the compile defines appends its `(code, bb_starts, bb_edges)` here,
-    /// so a test can decode real Cranelift output and compare our decoder to iced-x86.
+    /// When armed, each function the compile defines appends its capture here, so a test can decode
+    /// real Cranelift output and compare our decoder to iced-x86 / run the policy.
     static CAPTURE: std::cell::RefCell<Option<Vec<CapturedFn>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Record one defined function's code + block hints, if a test armed the capture.
+/// Record one defined function's code + block hints + layout, if a test armed the capture.
 #[cfg(all(test, target_arch = "x86_64"))]
-pub(crate) fn capture_code(code: &[u8], bb_starts: &[u32], bb_edges: &[(u32, u32)]) {
+pub(crate) fn capture_code(
+    code: &[u8],
+    bb_starts: &[u32],
+    bb_edges: &[(u32, u32)],
+    layout: Option<WindowLayout>,
+) {
     CAPTURE.with(|c| {
         if let Some(v) = c.borrow_mut().as_mut() {
-            v.push((code.to_vec(), bb_starts.to_vec(), bb_edges.to_vec()));
+            v.push((code.to_vec(), bb_starts.to_vec(), bb_edges.to_vec(), layout));
         }
     });
 }
@@ -98,9 +120,11 @@ pub(crate) fn take_capture() -> Vec<CapturedFn> {
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86 {
-    //! The x86-64 instruction decoder (length + control-transfer + allowlist classification) and the
-    //! slice-1 policy check. Only enough operand decoding to compute each instruction's length and
-    //! find its control-flow destination; full operand decoding (the memory-access policy) is #2535.
+    //! The x86-64 instruction decoder (length + operands + control-transfer + allowlist
+    //! classification), the machine-CFG recovery and abstract dataflow (#2535), and the
+    //! memory-access confinement policy (#2535/#2603) they feed.
+
+    use super::WindowLayout;
 
     /// A machine-code policy disagreement: `why`, at byte offset `at` in the function.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,9 +163,11 @@ pub(crate) mod x86 {
         StackLimit,
         /// A known constant (e.g. the guard-offset materialization `mov r, imm`).
         Const(i64),
-        /// Confined by the D63 sequence (`cmp v, bound; cmovae v', guard`): safe as a window byte
-        /// index for a displacement within the trailing-guard slack.
-        Confined,
+        /// Confined by the D63 sequence (`cmp v, bound; cmovae v', guard`): either `< bound` or the
+        /// guard offset, so safe as a window byte index for a displacement within the trailing-guard
+        /// slack. Carries the guard constant the `cmov` redirected to, cross-checked against the
+        /// module's `guard_offset` when the layout hint is present (#2603).
+        Confined { guard: u64 },
         /// Proven in `[0, ub)` (e.g. `and r, (2^k − 1)`).
         Bounded(u64),
         /// A pointer into the stack frame, computed by `lea r, [rsp/rbp + disp]`.
@@ -163,40 +189,103 @@ pub(crate) mod x86 {
         }
     }
 
-    /// The abstract state at a program point: a fact per GP register. (Spill-slot tracking — a
-    /// context param reloaded from `[rbp-k]` — is a tracked follow-up; until then a reload reads
-    /// `Unknown`, which is sound and, for the small corpus here where the params stay in registers,
-    /// precise.)
+    /// How many spill slots the state tracks. Register allocation spills a context param (mem_base
+    /// and friends) to the stack in a high-pressure function; a handful of slots covers that.
+    /// Overflow simply stops tracking new slots — sound, since an untracked reload reads `Unknown`.
+    const SLOT_CAP: usize = 8;
+
+    /// One tracked stack spill slot: the value spilled to `[base + disp]`, `base` the literal rsp(4)
+    /// or rbp(5). Keyed by `(base, disp)` exactly as the instruction encodes it — when rsp shifts,
+    /// Cranelift addresses the same physical slot with a *different* disp, so a stale key never
+    /// aliases a live slot (#2603 item 3).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct Slot {
+        base: u8,
+        disp: i64,
+        fact: Fact,
+    }
+
+    /// The abstract state at a program point: a fact per GP register, plus the tracked spill slots.
     #[derive(Clone, Copy, PartialEq, Eq)]
     struct State {
         regs: [Fact; 16],
+        slots: [Option<Slot>; SLOT_CAP],
     }
 
     impl State {
         /// The entry ABI: the four context params in their argument registers, everything else
-        /// unknown. rsp/rbp are the stack and are recognized structurally, not tracked as facts.
+        /// unknown, no slots. rsp/rbp are the stack and are recognized structurally, not as facts.
         fn entry() -> State {
             let mut regs = [Fact::Unknown; 16];
             regs[reg::RDI as usize] = Fact::MemBase;
             regs[reg::RSI as usize] = Fact::FnTableBase;
             regs[reg::RDX as usize] = Fact::Vmctx;
             regs[reg::RCX as usize] = Fact::StackLimit;
-            State { regs }
+            State {
+                regs,
+                slots: [None; SLOT_CAP],
+            }
         }
         fn meet(&self, other: &State) -> State {
             let mut regs = self.regs;
             for (r, &o) in regs.iter_mut().zip(other.regs.iter()) {
                 *r = r.meet(o);
             }
-            State { regs }
+            // A slot fact survives the meet only if both paths agree on it exactly.
+            let mut slots = [None; SLOT_CAP];
+            let mut n = 0;
+            for s in self.slots.iter().flatten() {
+                if other.slot_get(s.base, s.disp) == s.fact && n < SLOT_CAP {
+                    slots[n] = Some(*s);
+                    n += 1;
+                }
+            }
+            State { regs, slots }
+        }
+        /// The fact spilled to `[base + disp]`, or `Unknown` if that slot is not tracked.
+        fn slot_get(&self, base: u8, disp: i64) -> Fact {
+            self.slots
+                .iter()
+                .flatten()
+                .find(|s| s.base == base && s.disp == disp)
+                .map_or(Fact::Unknown, |s| s.fact)
+        }
+        /// Record (or, for `Unknown`, forget) the fact spilled to `[base + disp]`.
+        fn slot_set(&mut self, base: u8, disp: i64, fact: Fact) {
+            if let Some(e) = self
+                .slots
+                .iter_mut()
+                .find(|s| matches!(s, Some(s) if s.base == base && s.disp == disp))
+            {
+                *e = (fact != Fact::Unknown).then_some(Slot { base, disp, fact });
+            } else if fact != Fact::Unknown {
+                if let Some(e) = self.slots.iter_mut().find(|s| s.is_none()) {
+                    *e = Some(Slot { base, disp, fact });
+                }
+                // full ⇒ drop (sound: the reload reads Unknown)
+            }
+        }
+        fn clear_slots(&mut self) {
+            self.slots = [None; SLOT_CAP];
         }
         /// Loop-header widening (#2535): a `Bounded` carried into a header could grow each iteration,
-        /// so drop it to `Unknown`. The context-param and `Confined` facts are loop-invariant and
-        /// survive, so nearly every loop still settles in one round.
+        /// so drop it to `Unknown` (in registers and slots). The context-param and `Confined` facts
+        /// are loop-invariant and survive, so nearly every loop still settles in one round.
         fn widen(&mut self) {
             for f in &mut self.regs {
                 if matches!(f, Fact::Bounded(_)) {
                     *f = Fact::Unknown;
+                }
+            }
+            for s in self.slots.iter_mut().flatten() {
+                if matches!(s.fact, Fact::Bounded(_)) {
+                    s.fact = Fact::Unknown;
+                }
+            }
+            // Drop the now-`Unknown` slots so equal states compare equal across rounds.
+            for s in self.slots.iter_mut() {
+                if matches!(s, Some(e) if e.fact == Fact::Unknown) {
+                    *s = None;
                 }
             }
         }
@@ -220,7 +309,12 @@ pub(crate) mod x86 {
     ///    tracks which register holds `mem_base` and which holds a D63-confined index across blocks
     ///    and loops, then checks every memory access goes to a known region (the window through a
     ///    confined/bounded index, the stack, vmctx, the fn-table, or rip-relative rodata).
-    pub(crate) fn check(bytes: &[u8], bb_starts: &[u32], bb_edges: &[(u32, u32)]) -> Vec<Finding> {
+    pub(crate) fn check(
+        bytes: &[u8],
+        bb_starts: &[u32],
+        bb_edges: &[(u32, u32)],
+        layout: Option<WindowLayout>,
+    ) -> Vec<Finding> {
         let mut findings = Vec::new();
         if bytes.is_empty() {
             return findings;
@@ -294,7 +388,7 @@ pub(crate) mod x86 {
                         in_st[i] = Some(s);
                         changed = true;
                     }
-                    let o = transfer_block(&blocks[i], s, None);
+                    let o = transfer_block(&blocks[i], s, None, layout);
                     if out_st[i] != Some(o) {
                         out_st[i] = Some(o);
                         changed = true;
@@ -309,7 +403,7 @@ pub(crate) mod x86 {
         // Final pass: replay each reachable block's transfer, collecting the memory-access findings.
         for i in 0..nb {
             if let Some(s) = in_st[i] {
-                transfer_block(&blocks[i], s, Some(&mut findings));
+                transfer_block(&blocks[i], s, Some(&mut findings), layout);
             }
         }
         findings
@@ -454,13 +548,14 @@ pub(crate) mod x86 {
         insns: &[(usize, Decoded)],
         mut state: State,
         mut findings: Option<&mut Vec<Finding>>,
+        layout: Option<WindowLayout>,
     ) -> State {
         // Registers that currently hold the value most recently compared (`cmp`), tracked through
         // `mov` copies so a `cmovcc` on a copy is still recognized. Block-local.
         let mut confinable: u16 = 0;
         for &(pos, d) in insns {
             if let Some(f) = findings.as_deref_mut() {
-                mem_policy(pos, &d, &state, f);
+                mem_policy(pos, &d, &state, layout, f);
             }
             let w = writes_of(d.eff, &d.operands);
             match d.eff {
@@ -488,15 +583,14 @@ pub(crate) mod x86 {
                 Eff::Cmov { dst } => {
                     // `cmovcc dst, src`: dst becomes either its old value or `src`. It is the D63
                     // confined value iff dst held the compared index and src is the guard constant.
-                    let src_is_guard = matches!(
-                        d.operands.rm_reg.map(|s| state.regs[s as usize & 15]),
-                        Some(Fact::Const(_))
-                    );
+                    let src_guard = match d.operands.rm_reg.map(|s| state.regs[s as usize & 15]) {
+                        Some(Fact::Const(g)) => Some(g as u64),
+                        _ => None,
+                    };
                     let was_compared = confinable & bit(dst) != 0;
-                    state.regs[dst as usize & 15] = if src_is_guard && was_compared {
-                        Fact::Confined
-                    } else {
-                        Fact::Unknown
+                    state.regs[dst as usize & 15] = match src_guard {
+                        Some(guard) if was_compared => Fact::Confined { guard },
+                        _ => Fact::Unknown,
                     };
                 }
                 Eff::Lea { dst } => {
@@ -512,9 +606,13 @@ pub(crate) mod x86 {
                         _ => Fact::Unknown,
                     };
                 }
-                // Loads and the opaque GP writes clobber their destinations (the value is not a
-                // tracked fact); the clobber mask `w` covers them below.
-                Eff::LoadReg { .. } | Eff::WrReg | Eff::WrRm | Eff::Wr(_) | Eff::NoGp => {}
+                Eff::LoadReg { dst } => {
+                    // A reload from a tracked spill slot restores its fact; any other load is unknown.
+                    state.regs[dst as usize & 15] = load_fact(&state, &d.operands);
+                }
+                // Stores write memory (handled by `slot_effect` below) and the opaque GP writes
+                // clobber their destinations (the value is not a tracked fact); `w` covers them below.
+                Eff::StoreReg { .. } | Eff::WrReg | Eff::WrRm | Eff::Wr(_) | Eff::NoGp => {}
             }
             // Clobber every GP register this instruction writes that the semantic above didn't set,
             // and drop them from the confinable set (their value changed).
@@ -526,6 +624,7 @@ pub(crate) mod x86 {
                             | Eff::AluImm { dst, .. }
                             | Eff::Cmov { dst }
                             | Eff::Lea { dst }
+                            | Eff::LoadReg { dst }
                             if dst == r
                     ) {
                         state.regs[r as usize] = Fact::Unknown;
@@ -533,8 +632,46 @@ pub(crate) mod x86 {
                     confinable &= !bit(r);
                 }
             }
+            slot_effect(&mut state, &d);
         }
         state
+    }
+
+    /// The fact a GP load `mov dst, [mem]` restores: the spill slot's fact when `mem` is a plain
+    /// `[rsp/rbp + disp]`, else `Unknown`.
+    fn load_fact(state: &State, ops: &Operands) -> Fact {
+        match ops.mem {
+            Some(m) if m.index.is_none() && matches!(m.base, Some(reg::RSP | reg::RBP)) => {
+                state.slot_get(m.base.unwrap(), m.disp)
+            }
+            _ => Fact::Unknown,
+        }
+    }
+
+    /// Update the tracked spill slots for one instruction's memory operand. A plain-`[rsp/rbp+disp]`
+    /// store records the slot; any **other** write to the stack frame (an RMW, a store of an
+    /// immediate, an SSE store, an indexed or lea'd-pointer frame write — recognized conservatively,
+    /// since this may also fire on a frame *read*) clears every slot. A memory operand based
+    /// anywhere but the frame cannot alias a slot (a write through a wild base is itself flagged by
+    /// the base-provenance policy), so it leaves the slots alone.
+    fn slot_effect(state: &mut State, d: &Decoded) {
+        let Some(m) = d.operands.mem else { return };
+        let on_frame = matches!(m.base, Some(reg::RSP | reg::RBP))
+            || matches!(
+                m.base.map(|b| state.regs[b as usize & 15]),
+                Some(Fact::StackPtr)
+            );
+        if !on_frame {
+            return;
+        }
+        let plain = m.index.is_none() && matches!(m.base, Some(reg::RSP | reg::RBP));
+        match d.eff {
+            Eff::StoreReg { src } if plain => {
+                state.slot_set(m.base.unwrap(), m.disp, state.regs[src as usize & 15]);
+            }
+            Eff::LoadReg { .. } if plain => {} // a reload; the slot is unchanged
+            _ => state.clear_slots(),
+        }
     }
 
     /// The GP register write mask of an instruction, from its effect and operands. A sound superset
@@ -542,7 +679,7 @@ pub(crate) mod x86 {
     /// is not) — cross-checked against iced-x86 in the tests.
     fn writes_of(eff: Eff, ops: &Operands) -> u16 {
         match eff {
-            Eff::NoGp | Eff::Cmp { .. } => 0,
+            Eff::NoGp | Eff::Cmp { .. } | Eff::StoreReg { .. } => 0,
             Eff::MovImm { dst, .. }
             | Eff::MovReg { dst, .. }
             | Eff::LoadReg { dst }
@@ -568,9 +705,18 @@ pub(crate) mod x86 {
         }
     }
 
-    /// The memory-access confinement policy (#2535): classify one access's base and index by their
-    /// abstract facts and flag an access that does not land in a known region.
-    fn mem_policy(pos: usize, d: &Decoded, state: &State, findings: &mut Vec<Finding>) {
+    /// The memory-access confinement policy (#2535/#2603): classify one access's base and index by
+    /// their abstract facts and flag an access that does not land in a known region. For a window
+    /// access, re-prove the physical offset from `mem_base` stays within the reservation
+    /// `[0, guard_offset + page)` — everything there is mapped or `PROT_NONE` guard, so it can fault
+    /// but never escape — using the module `layout` hint (when present) for the elided/bounded cases.
+    fn mem_policy(
+        pos: usize,
+        d: &Decoded,
+        state: &State,
+        layout: Option<WindowLayout>,
+        findings: &mut Vec<Finding>,
+    ) {
         let Some(mem) = d.operands.mem else { return };
         // `lea` computes an address but does not dereference it.
         if matches!(d.eff, Eff::Lea { .. }) {
@@ -588,40 +734,74 @@ pub(crate) mod x86 {
         if matches!(mem.base, Some(reg::RSP | reg::RBP)) {
             return;
         }
-        // Window: base (or index) is `mem_base`; the other operand is the offset.
+        // Window: base (or index) is `mem_base`; the other operand is the index/displacement.
         let is_membase = |f: Option<Fact>| matches!(f, Some(Fact::MemBase));
         if is_membase(base_f) || is_membase(index_f) {
             let offset_f = if is_membase(base_f) { index_f } else { base_f };
-            match offset_f {
-                // `[mem_base + disp]` — an elided constant access; the displacement-bound re-proof
-                // needs the module's reservation hint (tracked), so it is recognized, not re-proven.
-                None => {}
-                Some(Fact::Confined) => {
-                    if mem.scale != 1 {
-                        flag(format!(
-                            "confined window index with scale {} (expected a byte index, scale 1)",
-                            mem.scale
-                        ));
-                    } else if mem.disp < 0
-                        || (mem.disp as u64).saturating_add(MAX_ACCESS_WIDTH)
-                            > crate::mem::trailing_guard() as u64
-                    {
-                        flag(format!(
-                            "confined window access displacement +0x{:x} does not ride within the \
-                             trailing guard page",
-                            mem.disp
-                        ));
-                    }
-                }
-                // A bounded or constant index through `mem_base`: recognized; the arithmetic
-                // re-proof against the reservation is deferred (needs the hint), tracked.
-                Some(Fact::Bounded(_)) | Some(Fact::Const(_)) => {}
-                // An index of unknown provenance into the window — the escape-relevant case.
-                Some(_) => flag(
+            let page = crate::mem::trailing_guard() as u64;
+            let scale = u64::from(mem.scale);
+
+            // A negative displacement on a window access could underflow below `mem_base` — the
+            // lowering never emits one (guest offsets are non-negative), so treat it as a violation.
+            if mem.disp < 0 {
+                flag(format!(
+                    "window access with a negative displacement -0x{:x}",
+                    mem.disp.unsigned_abs()
+                ));
+                return;
+            }
+            let disp = mem.disp as u64;
+
+            // The largest byte offset the index can contribute, and (for a confined index) the guard
+            // the D63 `cmov` redirected to. `None` index_max ⇒ not provably bounded.
+            let (index_max, confined_guard): (Option<u64>, Option<u64>) = match offset_f {
+                None => (Some(0), None), // [mem_base + disp]
+                Some(Fact::Confined { guard }) => (Some(guard), Some(guard)),
+                Some(Fact::Bounded(ub)) => (Some(ub.saturating_sub(1).saturating_mul(scale)), None),
+                Some(Fact::Const(c)) if c >= 0 => (Some((c as u64).saturating_mul(scale)), None),
+                Some(_) => (None, None),
+            };
+            let Some(imax) = index_max else {
+                flag(
                     "window access [mem_base + <unconfined index>]: the index is not confined by \
-                     the D63 sequence nor proven bounded"
+                      the D63 sequence nor proven bounded"
                         .into(),
-                ),
+                );
+                return;
+            };
+            // A confined index is a byte offset (scale 1), and the guard it redirects to must be the
+            // module's real guard offset (when the layout hint is present — #2603).
+            if let Some(guard) = confined_guard {
+                if mem.scale != 1 {
+                    flag(format!(
+                        "confined window index with scale {} (expected a byte index, scale 1)",
+                        mem.scale
+                    ));
+                    return;
+                }
+                if let Some(l) = layout.filter(|l| l.guard_offset != guard) {
+                    flag(format!(
+                        "confined index redirects to +0x{guard:x}, not the module guard offset \
+                         +0x{:x}",
+                        l.guard_offset
+                    ));
+                    return;
+                }
+            }
+            // Re-prove: the largest physical offset the access can reach stays within the window
+            // reservation. The reservation top is `guard_offset + page`; a confined index supplies
+            // its own guard (cross-checked above), the elided/bounded cases need the layout hint —
+            // without it (a memoryless module) there is no reservation to prove against, so defer.
+            let reach = match (confined_guard, layout) {
+                (Some(guard), _) => guard.saturating_add(page),
+                (None, Some(l)) => l.guard_offset.saturating_add(page),
+                (None, None) => return,
+            };
+            let top = imax.saturating_add(disp).saturating_add(MAX_ACCESS_WIDTH);
+            if top > reach {
+                flag(format!(
+                    "window access reaches +0x{top:x}, past the reservation +0x{reach:x}"
+                ));
             }
             return;
         }
@@ -711,8 +891,12 @@ pub(crate) mod x86 {
         MovImm { dst: u8, imm: i64 },
         /// `mov dst, src` between GP registers — `dst := fact(src)`.
         MovReg { dst: u8, src: u8 },
-        /// A GP load `mov dst, [mem]` (mem in `operands.mem`) — `dst := loaded value`.
+        /// A GP load `mov dst, [mem]` (mem in `operands.mem`) — `dst := loaded value` (or the spill
+        /// slot's fact, when `mem` is a tracked `[rsp/rbp + disp]`).
         LoadReg { dst: u8 },
+        /// A GP store `mov [mem], src` (mem in `operands.mem`) — records `src`'s fact in the spill
+        /// slot when `mem` is a tracked `[rsp/rbp + disp]`. Writes no GP register.
+        StoreReg { src: u8 },
         /// `lea dst, [mem]` — computes an address into `dst` (does **not** dereference).
         Lea { dst: u8 },
         /// `add`/`sub`/`and dst, imm`, `dst` the r/m register — `dst := alu(fact(dst), imm)`.
@@ -938,7 +1122,8 @@ pub(crate) mod x86 {
                 _ => Eff::NoGp,
             },
             I::MovToRm => match (reg, rm, mem) {
-                (_, _, true) => Eff::NoGp, // store to memory (the access is checked separately)
+                (Some(src), _, true) => Eff::StoreReg { src }, // store to memory (slot-tracked)
+                (_, _, true) => Eff::NoGp,
                 (Some(src), Some(dst), false) if w64 => Eff::MovReg { dst, src },
                 (_, Some(_), false) => Eff::WrRm,
                 _ => Eff::NoGp,
@@ -1602,7 +1787,7 @@ pub(crate) mod x86 {
         /// The decoder's boundaries, validity, and memory-operand decode must match iced-x86 on real
         /// output, and `check` must find nothing on clean Cranelift code.
         fn cross_check(src: &str) {
-            for (bytes, bb_starts, bb_edges) in compiled(src) {
+            for (bytes, bb_starts, bb_edges, layout) in compiled(src) {
                 for (pos, d) in walk(&bytes, &bb_starts) {
                     assert_ne!(d.len, 0, "ours: undecodable at +0x{pos:x}\n{:02x?}", bytes);
                     let insn = iced_at(&bytes, pos).unwrap_or_else(|| {
@@ -1647,7 +1832,7 @@ pub(crate) mod x86 {
                         bytes
                     );
                 }
-                let findings = check(&bytes, &bb_starts, &bb_edges);
+                let findings = check(&bytes, &bb_starts, &bb_edges, layout);
                 assert!(
                     findings.is_empty(),
                     "clean Cranelift output flagged: {findings:?}\n{:02x?}",
@@ -1663,6 +1848,49 @@ pub(crate) mod x86 {
                  v2 = i64.add v0 v1\n  v3 = i64.mul v2 v0\n  v4 = i64.sub v3 v1\n  \
                  return v4\n  }\n}\n",
             );
+        }
+
+        #[test]
+        fn high_register_pressure_spills_membase() {
+            // #2603 item 3: enough live values that register allocation spills `mem_base` to the
+            // stack (`mov [rsp], rdi`) and reloads it (`mov rdi, [rsp]`) before a window access. The
+            // spill-slot tracking must carry the `MemBase` fact across that round-trip, so the policy
+            // sees `[mem_base + confined]` and finds nothing. (Before slot tracking the reload read
+            // `Unknown` and the access was flagged.) The pair-sum keeps the args live so the pressure
+            // is real; the load is late so `mem_base` is live under it.
+            use std::fmt::Write;
+            let n = 14usize;
+            let mut src = String::from("memory 16\nfunc (");
+            for i in 0..n {
+                src.push_str(if i > 0 { ", i64" } else { "i64" });
+            }
+            src.push_str(") -> (i64) {\nblock 0 (");
+            for i in 0..n {
+                if i > 0 {
+                    src.push_str(", ");
+                }
+                write!(src, "v{i}: i64").unwrap();
+            }
+            src.push_str(") {\n");
+            let mut next = n;
+            let mut partials = Vec::new();
+            for j in 0..n / 2 {
+                writeln!(src, "  v{next} = i64.add v{} v{}", 2 * j, 2 * j + 1).unwrap();
+                partials.push(next);
+                next += 1;
+            }
+            let load = next;
+            writeln!(src, "  v{load} = i64.load v0").unwrap();
+            next += 1;
+            let mut acc = partials[0];
+            for &p in &partials[1..] {
+                writeln!(src, "  v{next} = i64.add v{acc} v{p}").unwrap();
+                acc = next;
+                next += 1;
+            }
+            writeln!(src, "  v{next} = i64.add v{acc} v{load}").unwrap();
+            writeln!(src, "  return v{next}\n  }}\n}}").unwrap();
+            cross_check(&src);
         }
 
         #[test]
@@ -1758,10 +1986,14 @@ pub(crate) mod x86 {
         #[test]
         fn lattice_meet_and_widen() {
             use Fact::*;
+            let conf = Confined {
+                guard: 0x2000000000,
+            };
             assert_eq!(MemBase.meet(MemBase), MemBase);
             assert_eq!(MemBase.meet(Vmctx), Unknown);
-            assert_eq!(Confined.meet(Confined), Confined);
-            assert_eq!(Confined.meet(Unknown), Unknown);
+            assert_eq!(conf.meet(conf), conf);
+            assert_eq!(conf.meet(Confined { guard: 4096 }), Unknown); // different guard ⇒ no fact
+            assert_eq!(conf.meet(Unknown), Unknown);
             assert_eq!(Const(5).meet(Const(5)), Const(5));
             assert_eq!(Const(5).meet(Const(6)), Unknown);
             // A bound true on both paths is the looser (larger) of the two.
@@ -1772,10 +2004,10 @@ pub(crate) mod x86 {
             // the loop-invariant context-param and `Confined` facts, so the fixpoint terminates.
             let mut s = State::entry();
             s.regs[8] = Bounded(16);
-            s.regs[9] = Confined;
+            s.regs[9] = conf;
             s.widen();
             assert_eq!(s.regs[8], Unknown);
-            assert_eq!(s.regs[9], Confined);
+            assert_eq!(s.regs[9], conf);
             assert_eq!(s.regs[reg::RDI as usize], MemBase);
         }
 
@@ -1785,7 +2017,7 @@ pub(crate) mod x86 {
         #[test]
         fn policy_flags_unconfined_window_index() {
             let bytes = [0x4a, 0x8b, 0x04, 0x07, 0xc3]; // mov rax,[rdi+r8*1]; ret
-            let f = check(&bytes, &[], &[]);
+            let f = check(&bytes, &[], &[], None);
             assert!(
                 f.iter().any(|f| f.why.contains("unconfined index")),
                 "expected an unconfined-window-index finding, got {f:?}"
@@ -1797,7 +2029,7 @@ pub(crate) mod x86 {
         #[test]
         fn policy_flags_unknown_base() {
             let bytes = [0x49, 0x8b, 0x01, 0xc3]; // mov rax,[r9]; ret
-            let f = check(&bytes, &[], &[]);
+            let f = check(&bytes, &[], &[], None);
             assert!(
                 f.iter().any(|f| f.why.contains("unrecognized provenance")),
                 "expected an unknown-base finding, got {f:?}"
@@ -1816,8 +2048,75 @@ pub(crate) mod x86 {
                 0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
                 0xc3, // ret
             ];
-            let f = check(&bytes, &[], &[]);
+            let f = check(&bytes, &[], &[], None);
             assert!(f.is_empty(), "the confinement sequence was flagged: {f:?}");
+        }
+
+        /// An elided constant-displacement window access `[mem_base + 40000]` is re-proven against
+        /// the module reservation from the layout hint (#2603): clean when it fits, flagged when the
+        /// displacement reaches past the reservation.
+        #[test]
+        fn policy_reproves_elided_access_against_reservation() {
+            let bytes = [
+                0x48, 0x8b, 0x87, 0x40, 0x9c, 0x00, 0x00, // mov rax, [rdi + 0x9C40 (=40000)]
+                0xc3, // ret
+            ];
+            // A large reservation easily holds offset 40000 → no finding.
+            let big = Some(WindowLayout {
+                mask: (1u64 << 37) - 1,
+                guard_offset: 1u64 << 37,
+            });
+            assert!(check(&bytes, &[], &[], big).is_empty());
+            // A 32 KiB reservation does not → the access reaches past it.
+            let small = Some(WindowLayout {
+                mask: (1u64 << 15) - 1,
+                guard_offset: 1u64 << 15,
+            });
+            let f = check(&bytes, &[], &[], small);
+            assert!(
+                f.iter().any(|f| f.why.contains("past the reservation")),
+                "expected a reservation-overrun finding, got {f:?}"
+            );
+        }
+
+        /// Spill-slot tracking carries `mem_base` across a stack round-trip: spill rdi to `[rsp]`,
+        /// confine r8, reload rdi from `[rsp]`, then access `[mem_base + confined]` — clean.
+        #[test]
+        fn policy_tracks_membase_through_a_spill_slot() {
+            let bytes = [
+                0x48, 0x89, 0x3c, 0x24, // mov [rsp], rdi  (spill mem_base)
+                0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00,
+                0x00, // mov rax, 0x2000000000
+                0x4c, 0x3b, 0xc0, // cmp r8, rax
+                0x4c, 0x0f, 0x43, 0xc0, // cmovae r8, rax
+                0x48, 0x8b, 0x3c, 0x24, // mov rdi, [rsp]  (reload mem_base)
+                0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
+                0xc3, // ret
+            ];
+            let f = check(&bytes, &[], &[], None);
+            assert!(
+                f.is_empty(),
+                "spilled-then-reloaded mem_base was flagged: {f:?}"
+            );
+        }
+
+        /// Soundness of slot tracking: a store that overwrites the slot must drop the stale fact, so
+        /// the reload reads `Unknown` and the access is flagged — not silently admitted as the window.
+        #[test]
+        fn policy_slot_overwrite_drops_the_stale_fact() {
+            let bytes = [
+                0x48, 0x89, 0x3c, 0x24, // mov [rsp], rdi            (slot := mem_base)
+                0x48, 0xc7, 0x04, 0x24, 0x00, 0x00, 0x00,
+                0x00, // mov qword [rsp], 0  (overwrites it)
+                0x48, 0x8b, 0x3c, 0x24, // mov rdi, [rsp]            (reload ⇒ Unknown)
+                0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
+                0xc3, // ret
+            ];
+            let f = check(&bytes, &[], &[], None);
+            assert!(
+                f.iter().any(|f| f.why.contains("unrecognized provenance")),
+                "a stale slot fact survived an overwrite: {f:?}"
+            );
         }
     }
 }

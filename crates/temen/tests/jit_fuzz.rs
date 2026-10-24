@@ -48,6 +48,11 @@ use irgen::{fuzz_one, Gen};
 ///   unconditional layout invariant (INVARIANTS #13) that held on one tier and not the other. Fixed by
 ///   reading `module_null_guard()` — the single chokepoint — in the thunk, and deleting the host-side
 ///   copy that made it look like per-run state.
+/// - `[0x0a, 0x23, 0x0a, 0x3d]` (nightly `diff`, Oct 17): a `call.cap` to `Jit.unit_info` (type_id 11,
+///   op 6) on a forged handle, in a module with no memory. The interpreter faults (`CapFault`: the
+///   handle names no `Jit` table), but `jit_native_op` answered the missing window with `-EFAULT`
+///   before it resolved the handle, so the JIT *returned*. Fixed by resolving the handle first, as
+///   ops 0–5 do.
 const DIFF_REGRESSIONS: &[&[u8]] = &[
     &[0xad, 0xa9, 0xac],
     &[0xe8, 0x01, 0xde, 0xcd],
@@ -57,6 +62,7 @@ const DIFF_REGRESSIONS: &[&[u8]] = &[
     &[0x79, 0x7c, 0x00, 0x02],
     &[0x17, 0xa4, 0x17, 0x1b],
     &[0xc0, 0x8a, 0xbf, 0xcf],
+    &[0x0a, 0x23, 0x0a, 0x3d],
 ];
 
 #[test]

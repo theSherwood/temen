@@ -10,6 +10,9 @@ comparator, a nil `ptr`, raising table and OS calls outside `try`, globals with 
 synchronization). It also fixes a latent bug:
 `countProcessors()` is 0 when the count cannot be detected, and `-j` then scheduled nothing and
 reported the unbuilt graph as a success. Not fixed upstream as of nim-lang/nimony master 650bebb2 (2026-10-14).
+And nimony's borrow checker, which classic Nim does not have, rejects `visit` iterating
+`nodes[nodeId].deps` while it passes `nodes` on as `var` (upstream's borrow checking from 2026-10-16;
+#2613), so `visit` walks the deps by index.
 
 What: every change is either `when defined(nimony)` or shared code valid under both compilers,
 using upstream's own dual-compile idioms (`lib/compat2.nim`'s `onRaiseQuit` / `getOrQuit`).
@@ -21,7 +24,7 @@ Applied to a COPY of the pinned sources at build time (`scripts/nim-toolchain.sh
 vendored `nimony/` submodule is never modified. Against the submodule pin (650bebb2).
 Drop it when upstream nifmake builds with nimony.
 diff --git a/src/nifmake/nifmake.nim b/src/nifmake/nifmake.nim
-index 7b6e92cc..dfa08aca 100644
+index 7b6e92cc..e26f5197 100644
 --- a/src/nifmake/nifmake.nim
 +++ b/src/nifmake/nifmake.nim
 @@ -12,9 +12,39 @@ import std/[assertions, os, strutils, sequtils, tables, hashes, times, monotimes
@@ -125,7 +128,17 @@ index 7b6e92cc..dfa08aca 100644
    let exists = vfsExists(path)
    result = (exists, if exists: vfsMtime(path) else: low(int64))
    sc.entries[path] = result
-@@ -356,8 +391,12 @@ proc topologicalSort(dag: var Dag): seq[int] =
+@@ -330,7 +365,8 @@ proc visit(nodes: var seq[Node]; nodeId: int; sortedNodes: var seq[int]; maxDept
+   of nsUnvisited:
+     nodes[nodeId].state = nsInStack
+     var nodeDepth = 0
+-    for depId in nodes[nodeId].deps:
++    for i in 0 ..< nodes[nodeId].deps.len:
++      let depId = nodes[nodeId].deps[i]
+       if not visit(nodes, depId, sortedNodes, maxDepth):
+         result = false
+         return
+@@ -356,8 +392,12 @@ proc topologicalSort(dag: var Dag): seq[int] =
        if not visit(dag.nodes, i, result, dag.maxDepth):
          quit "Circular dependency detected in build graph"
  
@@ -140,7 +153,7 @@ index 7b6e92cc..dfa08aca 100644
  
  proc failed(command: string; exitCode = 0) =
    ## Name the command that failed. A build that fans out over many processes is
-@@ -490,7 +529,7 @@ proc commitAtomic(node: Node; tmpOutputs: seq[string]; success: bool) =
+@@ -490,7 +530,7 @@ proc commitAtomic(node: Node; tmpOutputs: seq[string]; success: bool) =
      if success and fileExists(tmp):
        try:
          moveFile(tmp, node.outputs[i])
@@ -149,7 +162,7 @@ index 7b6e92cc..dfa08aca 100644
          # Windows refuses to replace a file that is open, e.g. while another
          # build links it. That build produced the same output the same way,
          # so it is as good as ours.
-@@ -498,7 +537,7 @@ proc commitAtomic(node: Node; tmpOutputs: seq[string]; success: bool) =
+@@ -498,7 +538,7 @@ proc commitAtomic(node: Node; tmpOutputs: seq[string]; success: bool) =
            quit "nifmake: cannot move " & tmp & " to " & node.outputs[i]
      if fileExists(tmp):
        try: removeFile(tmp)
@@ -158,7 +171,7 @@ index 7b6e92cc..dfa08aca 100644
  
  proc initScheduler(dag: Dag; sortedNodes: seq[int]): Scheduler =
    result = Scheduler(
-@@ -582,6 +621,19 @@ proc waitForAnyJob(pool: seq[RunningJob]; exitCode, peakKiB: var int): int =
+@@ -582,6 +622,19 @@ proc waitForAnyJob(pool: seq[RunningJob]; exitCode, peakKiB: var int): int =
            exitCode = try: peekExitCode(pool[idx].process) except CatchableError: -1
            return idx
        sleep 1
@@ -178,7 +191,7 @@ index 7b6e92cc..dfa08aca 100644
    else:
      # Reaps with `wait4` rather than through osproc because only `wait4` hands
      # back the child's `ru_maxrss`, which covers the `sh -c` wrapper's own
-@@ -642,9 +694,11 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
+@@ -642,9 +695,11 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
    # dependencies have actually been written, so unchanged interface files keep
    # pruning their dependents exactly as before. A sequential run is this with
    # a single slot: `rank` dispatches in topological order.
@@ -191,7 +204,7 @@ index 7b6e92cc..dfa08aca 100644
    var sched = initScheduler(dag, sortedNodes)
    var pool: seq[RunningJob] = @[]
    var aborted = false
-@@ -666,8 +720,8 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
+@@ -666,8 +721,8 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
          if Verbose in opt:
            echo "Command: ", expandedCmd
          pool.add RunningJob(
@@ -202,7 +215,7 @@ index 7b6e92cc..dfa08aca 100644
            nodeId: nodeId,
            command: expandedCmd,
            cmdName: dag.commands[node.cmdIdx].name,
-@@ -689,7 +743,7 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
+@@ -689,7 +744,7 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
      let k = waitForAnyJob(pool, exitCode, peakKiB)
      let job = pool[k]
      pool.del k
@@ -211,7 +224,7 @@ index 7b6e92cc..dfa08aca 100644
      if profile != nil:
        profile[].recordCmd(job.cmdName, job.label, job.start, getMonoTime(),
                            peakKiB)
-@@ -765,7 +819,7 @@ proc generateMakefile(dag: Dag; filename: string) =
+@@ -765,7 +820,7 @@ proc generateMakefile(dag: Dag; filename: string) =
        content.add " " & mescape(output)
    content.add "\n"
  
@@ -220,7 +233,7 @@ index 7b6e92cc..dfa08aca 100644
  
  proc parseCommandDefinition(n: var Cursor; dag: var Dag) =
    if n.kind == SymbolDef:
-@@ -999,36 +1053,38 @@ proc concurrentPeak(profile: ProfileData): tuple[kib, jobs: int] =
+@@ -999,36 +1054,38 @@ proc concurrentPeak(profile: ProfileData): tuple[kib, jobs: int] =
      if cur > result.kib: result = (cur, live)
  
  proc fmtKiB(kib: int): string =
@@ -268,7 +281,7 @@ index 7b6e92cc..dfa08aca 100644
    stderr.writeLine "---"
  
  proc main() =
-@@ -1041,7 +1097,8 @@ proc main() =
+@@ -1041,7 +1098,8 @@ proc main() =
      progressLo = 0
      progressHi = 100
  
@@ -278,7 +291,7 @@ index 7b6e92cc..dfa08aca 100644
    for kind, key, val in p.getopt():
      case kind
      of cmdArgument:
-@@ -1069,7 +1126,7 @@ proc main() =
+@@ -1069,7 +1127,7 @@ proc main() =
          if val.len > 0:
            try:
              gMaxJobs = parseInt(val)
@@ -287,7 +300,7 @@ index 7b6e92cc..dfa08aca 100644
              quit "invalid value for --parallel: " & val
            if gMaxJobs < 1: quit "--parallel value must be >= 1"
        of "makefile": outputMakefile = val
-@@ -1089,7 +1146,7 @@ proc main() =
+@@ -1089,7 +1147,7 @@ proc main() =
              try:
                progressLo = parseInt(parts[0])
                progressHi = parseInt(parts[1])
@@ -296,7 +309,7 @@ index 7b6e92cc..dfa08aca 100644
                quit "invalid --progress range: " & val
            else:
              quit "invalid --progress range: " & val
-@@ -1106,19 +1163,16 @@ proc main() =
+@@ -1106,19 +1164,16 @@ proc main() =
      if inputFile == "":
        quit "Input file required for 'run' command"
  

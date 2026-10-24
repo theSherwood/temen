@@ -3716,6 +3716,12 @@ impl CompiledModule {
         // effect unless the env var is set; used to compare temen-jit's generated code against other
         // backends (e.g. the Embench cross-engine bench).
         let dump_codegen = std::env::var_os("TEMEN_JIT_DUMP_CLIF").is_some();
+        // #2603 — the §4 window geometry the machine-code validator re-proves window accesses
+        // against (memoryless module ⇒ `None`, no window to confine).
+        let win_layout = (mask != 0).then(|| validate::WindowLayout {
+            mask,
+            guard_offset: guard_offset_of(win_reserved as u64),
+        });
         let base_bytes = define_funcs(
             &mut module,
             &ids,
@@ -3813,6 +3819,7 @@ impl CompiledModule {
                     }
                 }
             },
+            win_layout,
         )?;
         let mut ctx = module.make_context();
 
@@ -5384,6 +5391,11 @@ impl CompiledModule {
         let nesting = self.nesting;
         let callees = Callees::new(&mut *module, &ids, funcs, types, self.fast_resolver)?;
         // Byte-accurate occupancy: each function's emitted code size. A unit's code is not kept.
+        // #2603 — the validator re-proves this unit's window accesses against the parent's geometry.
+        let win_layout = (self.mask != 0).then(|| validate::WindowLayout {
+            mask: self.mask,
+            guard_offset: guard_offset_of(self.win_reserved as u64),
+        });
         let extra_bytes = define_funcs(
             &mut *module,
             &ids,
@@ -5414,6 +5426,7 @@ impl CompiledModule {
                 )
             },
             |_, _, _| {},
+            win_layout,
         )?;
         self.extra_bytes += extra_bytes;
         let mut ctx = module.make_context();
@@ -6552,6 +6565,7 @@ fn define_funcs(
     code: &mut Codegen<'_>,
     lower: impl Fn(&mut cranelift_codegen::Context, usize) -> Result<(), JitError> + Sync,
     mut defined: impl FnMut(&JITModule, &CompiledCode, usize),
+    layout: Option<validate::WindowLayout>,
 ) -> Result<usize, JitError> {
     let keep = match code {
         Codegen::Replay(kept, imports) => return kept.replay(module, ids, imports),
@@ -6574,7 +6588,8 @@ fn define_funcs(
                     let mut ctx = cranelift_codegen::Context::new();
                     ctx.func.signature.call_conv = isa.default_call_conv();
                     lower(&mut ctx, i)?;
-                    let code = compile_verified(isa, &mut ctx).map_err(JitError::Backend)?;
+                    let code =
+                        compile_verified(isa, &mut ctx, layout).map_err(JitError::Backend)?;
                     let relocs = code
                         .buffer
                         .relocs()
@@ -6606,7 +6621,7 @@ fn define_funcs(
                 #[cfg(test)]
                 record_emitted(module, code.code_buffer(), &relocs);
                 #[cfg(all(test, target_arch = "x86_64"))]
-                validate::capture_code(code.code_buffer(), &code.bb_starts, &code.bb_edges);
+                validate::capture_code(code.code_buffer(), &code.bb_starts, &code.bb_edges, layout);
                 let kept = keep
                     .as_mut()
                     .is_some_and(|k| k.push(module, ids, align, code.code_buffer(), &relocs));
@@ -6646,6 +6661,7 @@ fn define_funcs(
 fn compile_verified(
     isa: &dyn cranelift_codegen::isa::TargetIsa,
     ctx: &mut cranelift_codegen::Context,
+    layout: Option<validate::WindowLayout>,
 ) -> Result<CompiledCode, String> {
     let mut ctrl = cranelift_codegen::control::ControlPlane::default();
     ctx.verify(isa)
@@ -6659,10 +6675,11 @@ fn compile_verified(
         .map_err(|e| cranelift_module::ModuleError::from(e).to_string())?;
     let code = code.apply_params(&ctx.func.params);
     // #2481 — shadow-mode machine-code validation: check the emitted bytes against the policy and
-    // log any disagreement, but never reject (slice 1). `enabled()` is false on a production compile,
-    // so this is inert there; `jit_isa` only records `bb_starts` when it is true.
+    // log any disagreement, but never reject. `enabled()` is false on a production compile, so this
+    // is inert there; `jit_isa` only records `bb_starts`/`bb_edges` when it is true. `layout` is the
+    // module's §4 window geometry, which the window-access policy re-proves against (#2603).
     if validate::enabled() {
-        validate::shadow_check(code.code_buffer(), &code.bb_starts, &code.bb_edges);
+        validate::shadow_check(code.code_buffer(), &code.bb_starts, &code.bb_edges, layout);
     }
     Ok(code)
 }
@@ -6675,7 +6692,9 @@ fn define_verified(
     id: FuncId,
     ctx: &mut cranelift_codegen::Context,
 ) -> Result<CompiledCode, JitError> {
-    let code = compile_verified(module.isa(), ctx).map_err(JitError::Backend)?;
+    // Trampolines (cap thunks, fuel refill) carry no guest window, so the policy has no window
+    // access to re-prove — the layout hint is `None`.
+    let code = compile_verified(module.isa(), ctx, None).map_err(JitError::Backend)?;
     let relocs: Vec<ModuleReloc> = code
         .buffer
         .relocs()
@@ -7148,7 +7167,7 @@ mod compile_verified_tests {
     fn malformed_clif_fails_the_compile_before_cranelifts_passes() {
         let isa = jit_isa().unwrap();
         let mut ctx = cranelift_codegen::Context::for_function(malformed(&*isa));
-        let err = compile_verified(&*isa, &mut ctx).unwrap_err();
+        let err = compile_verified(&*isa, &mut ctx, None).unwrap_err();
         assert!(
             err.starts_with("CLIF verifier, on the lowered CLIF"),
             "{err}"
@@ -7196,7 +7215,7 @@ mod compile_verified_tests {
     fn compile_verified_emits_what_cranelifts_compile_emits() {
         let isa = jit_isa().unwrap();
         let mut ours = cranelift_codegen::Context::for_function(summing(&*isa));
-        let code = compile_verified(&*isa, &mut ours).unwrap();
+        let code = compile_verified(&*isa, &mut ours, None).unwrap();
         let mut theirs = cranelift_codegen::Context::for_function(summing(&*isa));
         let want = theirs.compile(&*isa, &mut Default::default()).unwrap();
         assert_eq!(code.code_buffer(), want.code_buffer());
@@ -7406,6 +7425,11 @@ fn compile_child_windowed(
     // the child spawns only when it uses them. Neither when no domain was supplied.
     let threads = futex_sched != 0;
     let spawns = threads && uses_threads;
+    // #2603 — the §14 child's own window geometry, for the validator's window-access re-proof.
+    let win_layout = (mask != 0).then(|| validate::WindowLayout {
+        mask,
+        guard_offset: guard_offset_of(reserved),
+    });
     let base_bytes = define_funcs(
         &mut module,
         &ids,
@@ -7436,6 +7460,7 @@ fn compile_child_windowed(
             )
         },
         |_, _, _| {},
+        win_layout,
     )?;
     let mut ctx = module.make_context();
     build_trampoline(

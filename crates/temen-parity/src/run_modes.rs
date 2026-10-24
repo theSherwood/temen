@@ -274,7 +274,12 @@ impl Feature {
             Feature::StdinLater => {
                 "reads stdin before its input has arrived, and gets it when the embedder supplies it"
             }
-            Feature::Signals => "is stopped by job control and continued later",
+            Feature::Signals => {
+                "stops its own process, and its embedder continues it. A run the embedder holds \
+                 waits for it. A run nobody holds faults when its embedder may not act from \
+                 outside (its external-wake bell unarmed), and waits for the continue when it may \
+                 (#2529)"
+            }
             Feature::GrowingWindow => {
                 "maps pages past its declared window through its AddressSpace and uses them"
             }
@@ -290,7 +295,7 @@ impl Feature {
 }
 
 /// The features no probe drives yet. Every run of one is ❔, and its row says nothing else.
-pub const UNPROBED: &[Feature] = &[Feature::Signals];
+pub const UNPROBED: &[Feature] = &[];
 
 /// A set of properties.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -474,6 +479,9 @@ pub fn exception(f: Feature, c: Config) -> Option<Cell> {
              the JIT maps by its descriptor; a software-only one (Host::grant_shared_region) has \
              none, so its map answers -EINVAL there",
         ),
+        (Signals, Cranelift) => {
+            not_yet("serves no job control, so a stopped process runs on (#1826)")
+        }
         // The tree-walk Inspector runs less than the tree-walker it debugs (#2560).
         (Children, TreeWalk) if debugged => not_yet(
             "the tree-walk Inspector runs one vCPU over the powerbox, or every vCPU over none, so \
@@ -490,10 +498,17 @@ pub fn exception(f: Feature, c: Config) -> Option<Cell> {
             "the tree-walk Inspector traps IndirectCallType at the installed unit's call.dyn \
              (#2560)",
         ),
+        (Signals, TreeWalk) if debugged => {
+            not_yet("the tree-walk Inspector runs a stopped process on (#2560)")
+        }
         // The bytecode debug scheduler.
         (Fork | Exec, Pump) if debugged => not_yet(
             "the bytecode debug scheduler declines every process seam: fork, exec, spawn, wait \
              and pipes (#2554)",
+        ),
+        (Signals, Pump) if debugged => not_yet(
+            "the bytecode debug scheduler runs a stopped process on: its pick never asks whether \
+             the process is stopped (#2615)",
         ),
         _ => return None,
     })
