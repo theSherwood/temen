@@ -38,13 +38,29 @@ pub(crate) fn disagreement_count() -> u64 {
     DISAGREEMENTS.load(Ordering::Relaxed)
 }
 
+/// The module's §4 window geometry (a per-compile hint, #2603): the confinement mask
+/// (`reserved − 1`) and the guard-page offset (`round_up(reserved, page)`, the D63 redirect target).
+/// `None` for a memoryless module. The window-access policy re-proves every access's physical offset
+/// stays within the reservation `[0, guard_offset + page)` against these — everything there is mapped
+/// or `PROT_NONE` guard, so an access that stays inside it can fault but never escape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WindowLayout {
+    pub mask: u64,
+    pub guard_offset: u64,
+}
+
 /// Validate one emitted function's `bytes` against its basic-block hints from
 /// `CompiledCode`: `bb_starts` (block start offsets) and `bb_edges` (block-to-block control-flow
-/// edges, each `(from_start, to_start)`). Shadow mode: every problem is logged and counted, never
-/// returned.
-pub(crate) fn shadow_check(bytes: &[u8], bb_starts: &[u32], bb_edges: &[(u32, u32)]) {
+/// edges, each `(from_start, to_start)`), with the module's `layout` (`None` if memoryless). Shadow
+/// mode: every problem is logged and counted, never returned.
+pub(crate) fn shadow_check(
+    bytes: &[u8],
+    bb_starts: &[u32],
+    bb_edges: &[(u32, u32)],
+    layout: Option<WindowLayout>,
+) {
     #[cfg(target_arch = "x86_64")]
-    for f in x86::check(bytes, bb_starts, bb_edges) {
+    for f in x86::check(bytes, bb_starts, bb_edges, layout) {
         // Count every disagreement (a fuzz run asserts the total), but cap the logging so a bad
         // decode on every module can't swamp a fuzzer's stderr.
         let n = DISAGREEMENTS.fetch_add(1, Ordering::Relaxed);
@@ -53,7 +69,7 @@ pub(crate) fn shadow_check(bytes: &[u8], bb_starts: &[u32], bb_edges: &[(u32, u3
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = (bytes, bb_starts, bb_edges);
+    let _ = (bytes, bb_starts, bb_edges, layout);
 }
 
 // --- test-only capture of real compiled code, cross-checked against iced-x86 ---
@@ -62,24 +78,30 @@ pub(crate) fn shadow_check(bytes: &[u8], bb_starts: &[u32], bb_edges: &[(u32, u3
 // caller in `lib.rs` is gated to match, so it is `all(test, target_arch = "x86_64")` — on another
 // target (the aarch64 clippy lane) it would be dead code under `-D warnings`.
 
-/// One captured function's machine code and its basic-block hints (`bb_starts`, `bb_edges`).
+/// One captured function's machine code, its basic-block hints (`bb_starts`, `bb_edges`), and the
+/// module's window layout.
 #[cfg(all(test, target_arch = "x86_64"))]
-type CapturedFn = (Vec<u8>, Vec<u32>, Vec<(u32, u32)>);
+type CapturedFn = (Vec<u8>, Vec<u32>, Vec<(u32, u32)>, Option<WindowLayout>);
 
 #[cfg(all(test, target_arch = "x86_64"))]
 thread_local! {
-    /// When armed, each function the compile defines appends its `(code, bb_starts, bb_edges)` here,
-    /// so a test can decode real Cranelift output and compare our decoder to iced-x86.
+    /// When armed, each function the compile defines appends its capture here, so a test can decode
+    /// real Cranelift output and compare our decoder to iced-x86 / run the policy.
     static CAPTURE: std::cell::RefCell<Option<Vec<CapturedFn>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Record one defined function's code + block hints, if a test armed the capture.
+/// Record one defined function's code + block hints + layout, if a test armed the capture.
 #[cfg(all(test, target_arch = "x86_64"))]
-pub(crate) fn capture_code(code: &[u8], bb_starts: &[u32], bb_edges: &[(u32, u32)]) {
+pub(crate) fn capture_code(
+    code: &[u8],
+    bb_starts: &[u32],
+    bb_edges: &[(u32, u32)],
+    layout: Option<WindowLayout>,
+) {
     CAPTURE.with(|c| {
         if let Some(v) = c.borrow_mut().as_mut() {
-            v.push((code.to_vec(), bb_starts.to_vec(), bb_edges.to_vec()));
+            v.push((code.to_vec(), bb_starts.to_vec(), bb_edges.to_vec(), layout));
         }
     });
 }
@@ -98,9 +120,11 @@ pub(crate) fn take_capture() -> Vec<CapturedFn> {
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86 {
-    //! The x86-64 instruction decoder (length + control-transfer + allowlist classification) and the
-    //! slice-1 policy check. Only enough operand decoding to compute each instruction's length and
-    //! find its control-flow destination; full operand decoding (the memory-access policy) is #2535.
+    //! The x86-64 instruction decoder (length + operands + control-transfer + allowlist
+    //! classification), the machine-CFG recovery and abstract dataflow (#2535), and the
+    //! memory-access confinement policy (#2535/#2603) they feed.
+
+    use super::WindowLayout;
 
     /// A machine-code policy disagreement: `why`, at byte offset `at` in the function.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,9 +163,11 @@ pub(crate) mod x86 {
         StackLimit,
         /// A known constant (e.g. the guard-offset materialization `mov r, imm`).
         Const(i64),
-        /// Confined by the D63 sequence (`cmp v, bound; cmovae v', guard`): safe as a window byte
-        /// index for a displacement within the trailing-guard slack.
-        Confined,
+        /// Confined by the D63 sequence (`cmp v, bound; cmovae v', guard`): either `< bound` or the
+        /// guard offset, so safe as a window byte index for a displacement within the trailing-guard
+        /// slack. Carries the guard constant the `cmov` redirected to, cross-checked against the
+        /// module's `guard_offset` when the layout hint is present (#2603).
+        Confined { guard: u64 },
         /// Proven in `[0, ub)` (e.g. `and r, (2^k − 1)`).
         Bounded(u64),
         /// A pointer into the stack frame, computed by `lea r, [rsp/rbp + disp]`.
@@ -220,7 +246,12 @@ pub(crate) mod x86 {
     ///    tracks which register holds `mem_base` and which holds a D63-confined index across blocks
     ///    and loops, then checks every memory access goes to a known region (the window through a
     ///    confined/bounded index, the stack, vmctx, the fn-table, or rip-relative rodata).
-    pub(crate) fn check(bytes: &[u8], bb_starts: &[u32], bb_edges: &[(u32, u32)]) -> Vec<Finding> {
+    pub(crate) fn check(
+        bytes: &[u8],
+        bb_starts: &[u32],
+        bb_edges: &[(u32, u32)],
+        layout: Option<WindowLayout>,
+    ) -> Vec<Finding> {
         let mut findings = Vec::new();
         if bytes.is_empty() {
             return findings;
@@ -294,7 +325,7 @@ pub(crate) mod x86 {
                         in_st[i] = Some(s);
                         changed = true;
                     }
-                    let o = transfer_block(&blocks[i], s, None);
+                    let o = transfer_block(&blocks[i], s, None, layout);
                     if out_st[i] != Some(o) {
                         out_st[i] = Some(o);
                         changed = true;
@@ -309,7 +340,7 @@ pub(crate) mod x86 {
         // Final pass: replay each reachable block's transfer, collecting the memory-access findings.
         for i in 0..nb {
             if let Some(s) = in_st[i] {
-                transfer_block(&blocks[i], s, Some(&mut findings));
+                transfer_block(&blocks[i], s, Some(&mut findings), layout);
             }
         }
         findings
@@ -454,13 +485,14 @@ pub(crate) mod x86 {
         insns: &[(usize, Decoded)],
         mut state: State,
         mut findings: Option<&mut Vec<Finding>>,
+        layout: Option<WindowLayout>,
     ) -> State {
         // Registers that currently hold the value most recently compared (`cmp`), tracked through
         // `mov` copies so a `cmovcc` on a copy is still recognized. Block-local.
         let mut confinable: u16 = 0;
         for &(pos, d) in insns {
             if let Some(f) = findings.as_deref_mut() {
-                mem_policy(pos, &d, &state, f);
+                mem_policy(pos, &d, &state, layout, f);
             }
             let w = writes_of(d.eff, &d.operands);
             match d.eff {
@@ -488,15 +520,14 @@ pub(crate) mod x86 {
                 Eff::Cmov { dst } => {
                     // `cmovcc dst, src`: dst becomes either its old value or `src`. It is the D63
                     // confined value iff dst held the compared index and src is the guard constant.
-                    let src_is_guard = matches!(
-                        d.operands.rm_reg.map(|s| state.regs[s as usize & 15]),
-                        Some(Fact::Const(_))
-                    );
+                    let src_guard = match d.operands.rm_reg.map(|s| state.regs[s as usize & 15]) {
+                        Some(Fact::Const(g)) => Some(g as u64),
+                        _ => None,
+                    };
                     let was_compared = confinable & bit(dst) != 0;
-                    state.regs[dst as usize & 15] = if src_is_guard && was_compared {
-                        Fact::Confined
-                    } else {
-                        Fact::Unknown
+                    state.regs[dst as usize & 15] = match src_guard {
+                        Some(guard) if was_compared => Fact::Confined { guard },
+                        _ => Fact::Unknown,
                     };
                 }
                 Eff::Lea { dst } => {
@@ -568,9 +599,18 @@ pub(crate) mod x86 {
         }
     }
 
-    /// The memory-access confinement policy (#2535): classify one access's base and index by their
-    /// abstract facts and flag an access that does not land in a known region.
-    fn mem_policy(pos: usize, d: &Decoded, state: &State, findings: &mut Vec<Finding>) {
+    /// The memory-access confinement policy (#2535/#2603): classify one access's base and index by
+    /// their abstract facts and flag an access that does not land in a known region. For a window
+    /// access, re-prove the physical offset from `mem_base` stays within the reservation
+    /// `[0, guard_offset + page)` — everything there is mapped or `PROT_NONE` guard, so it can fault
+    /// but never escape — using the module `layout` hint (when present) for the elided/bounded cases.
+    fn mem_policy(
+        pos: usize,
+        d: &Decoded,
+        state: &State,
+        layout: Option<WindowLayout>,
+        findings: &mut Vec<Finding>,
+    ) {
         let Some(mem) = d.operands.mem else { return };
         // `lea` computes an address but does not dereference it.
         if matches!(d.eff, Eff::Lea { .. }) {
@@ -588,40 +628,74 @@ pub(crate) mod x86 {
         if matches!(mem.base, Some(reg::RSP | reg::RBP)) {
             return;
         }
-        // Window: base (or index) is `mem_base`; the other operand is the offset.
+        // Window: base (or index) is `mem_base`; the other operand is the index/displacement.
         let is_membase = |f: Option<Fact>| matches!(f, Some(Fact::MemBase));
         if is_membase(base_f) || is_membase(index_f) {
             let offset_f = if is_membase(base_f) { index_f } else { base_f };
-            match offset_f {
-                // `[mem_base + disp]` — an elided constant access; the displacement-bound re-proof
-                // needs the module's reservation hint (tracked), so it is recognized, not re-proven.
-                None => {}
-                Some(Fact::Confined) => {
-                    if mem.scale != 1 {
-                        flag(format!(
-                            "confined window index with scale {} (expected a byte index, scale 1)",
-                            mem.scale
-                        ));
-                    } else if mem.disp < 0
-                        || (mem.disp as u64).saturating_add(MAX_ACCESS_WIDTH)
-                            > crate::mem::trailing_guard() as u64
-                    {
-                        flag(format!(
-                            "confined window access displacement +0x{:x} does not ride within the \
-                             trailing guard page",
-                            mem.disp
-                        ));
-                    }
-                }
-                // A bounded or constant index through `mem_base`: recognized; the arithmetic
-                // re-proof against the reservation is deferred (needs the hint), tracked.
-                Some(Fact::Bounded(_)) | Some(Fact::Const(_)) => {}
-                // An index of unknown provenance into the window — the escape-relevant case.
-                Some(_) => flag(
+            let page = crate::mem::trailing_guard() as u64;
+            let scale = u64::from(mem.scale);
+
+            // A negative displacement on a window access could underflow below `mem_base` — the
+            // lowering never emits one (guest offsets are non-negative), so treat it as a violation.
+            if mem.disp < 0 {
+                flag(format!(
+                    "window access with a negative displacement -0x{:x}",
+                    mem.disp.unsigned_abs()
+                ));
+                return;
+            }
+            let disp = mem.disp as u64;
+
+            // The largest byte offset the index can contribute, and (for a confined index) the guard
+            // the D63 `cmov` redirected to. `None` index_max ⇒ not provably bounded.
+            let (index_max, confined_guard): (Option<u64>, Option<u64>) = match offset_f {
+                None => (Some(0), None), // [mem_base + disp]
+                Some(Fact::Confined { guard }) => (Some(guard), Some(guard)),
+                Some(Fact::Bounded(ub)) => (Some(ub.saturating_sub(1).saturating_mul(scale)), None),
+                Some(Fact::Const(c)) if c >= 0 => (Some((c as u64).saturating_mul(scale)), None),
+                Some(_) => (None, None),
+            };
+            let Some(imax) = index_max else {
+                flag(
                     "window access [mem_base + <unconfined index>]: the index is not confined by \
-                     the D63 sequence nor proven bounded"
+                      the D63 sequence nor proven bounded"
                         .into(),
-                ),
+                );
+                return;
+            };
+            // A confined index is a byte offset (scale 1), and the guard it redirects to must be the
+            // module's real guard offset (when the layout hint is present — #2603).
+            if let Some(guard) = confined_guard {
+                if mem.scale != 1 {
+                    flag(format!(
+                        "confined window index with scale {} (expected a byte index, scale 1)",
+                        mem.scale
+                    ));
+                    return;
+                }
+                if let Some(l) = layout.filter(|l| l.guard_offset != guard) {
+                    flag(format!(
+                        "confined index redirects to +0x{guard:x}, not the module guard offset \
+                         +0x{:x}",
+                        l.guard_offset
+                    ));
+                    return;
+                }
+            }
+            // Re-prove: the largest physical offset the access can reach stays within the window
+            // reservation. The reservation top is `guard_offset + page`; a confined index supplies
+            // its own guard (cross-checked above), the elided/bounded cases need the layout hint —
+            // without it (a memoryless module) there is no reservation to prove against, so defer.
+            let reach = match (confined_guard, layout) {
+                (Some(guard), _) => guard.saturating_add(page),
+                (None, Some(l)) => l.guard_offset.saturating_add(page),
+                (None, None) => return,
+            };
+            let top = imax.saturating_add(disp).saturating_add(MAX_ACCESS_WIDTH);
+            if top > reach {
+                flag(format!(
+                    "window access reaches +0x{top:x}, past the reservation +0x{reach:x}"
+                ));
             }
             return;
         }
@@ -1602,7 +1676,7 @@ pub(crate) mod x86 {
         /// The decoder's boundaries, validity, and memory-operand decode must match iced-x86 on real
         /// output, and `check` must find nothing on clean Cranelift code.
         fn cross_check(src: &str) {
-            for (bytes, bb_starts, bb_edges) in compiled(src) {
+            for (bytes, bb_starts, bb_edges, layout) in compiled(src) {
                 for (pos, d) in walk(&bytes, &bb_starts) {
                     assert_ne!(d.len, 0, "ours: undecodable at +0x{pos:x}\n{:02x?}", bytes);
                     let insn = iced_at(&bytes, pos).unwrap_or_else(|| {
@@ -1647,7 +1721,7 @@ pub(crate) mod x86 {
                         bytes
                     );
                 }
-                let findings = check(&bytes, &bb_starts, &bb_edges);
+                let findings = check(&bytes, &bb_starts, &bb_edges, layout);
                 assert!(
                     findings.is_empty(),
                     "clean Cranelift output flagged: {findings:?}\n{:02x?}",
@@ -1758,10 +1832,14 @@ pub(crate) mod x86 {
         #[test]
         fn lattice_meet_and_widen() {
             use Fact::*;
+            let conf = Confined {
+                guard: 0x2000000000,
+            };
             assert_eq!(MemBase.meet(MemBase), MemBase);
             assert_eq!(MemBase.meet(Vmctx), Unknown);
-            assert_eq!(Confined.meet(Confined), Confined);
-            assert_eq!(Confined.meet(Unknown), Unknown);
+            assert_eq!(conf.meet(conf), conf);
+            assert_eq!(conf.meet(Confined { guard: 4096 }), Unknown); // different guard ⇒ no fact
+            assert_eq!(conf.meet(Unknown), Unknown);
             assert_eq!(Const(5).meet(Const(5)), Const(5));
             assert_eq!(Const(5).meet(Const(6)), Unknown);
             // A bound true on both paths is the looser (larger) of the two.
@@ -1772,10 +1850,10 @@ pub(crate) mod x86 {
             // the loop-invariant context-param and `Confined` facts, so the fixpoint terminates.
             let mut s = State::entry();
             s.regs[8] = Bounded(16);
-            s.regs[9] = Confined;
+            s.regs[9] = conf;
             s.widen();
             assert_eq!(s.regs[8], Unknown);
-            assert_eq!(s.regs[9], Confined);
+            assert_eq!(s.regs[9], conf);
             assert_eq!(s.regs[reg::RDI as usize], MemBase);
         }
 
@@ -1785,7 +1863,7 @@ pub(crate) mod x86 {
         #[test]
         fn policy_flags_unconfined_window_index() {
             let bytes = [0x4a, 0x8b, 0x04, 0x07, 0xc3]; // mov rax,[rdi+r8*1]; ret
-            let f = check(&bytes, &[], &[]);
+            let f = check(&bytes, &[], &[], None);
             assert!(
                 f.iter().any(|f| f.why.contains("unconfined index")),
                 "expected an unconfined-window-index finding, got {f:?}"
@@ -1797,7 +1875,7 @@ pub(crate) mod x86 {
         #[test]
         fn policy_flags_unknown_base() {
             let bytes = [0x49, 0x8b, 0x01, 0xc3]; // mov rax,[r9]; ret
-            let f = check(&bytes, &[], &[]);
+            let f = check(&bytes, &[], &[], None);
             assert!(
                 f.iter().any(|f| f.why.contains("unrecognized provenance")),
                 "expected an unknown-base finding, got {f:?}"
@@ -1816,8 +1894,35 @@ pub(crate) mod x86 {
                 0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
                 0xc3, // ret
             ];
-            let f = check(&bytes, &[], &[]);
+            let f = check(&bytes, &[], &[], None);
             assert!(f.is_empty(), "the confinement sequence was flagged: {f:?}");
+        }
+
+        /// An elided constant-displacement window access `[mem_base + 40000]` is re-proven against
+        /// the module reservation from the layout hint (#2603): clean when it fits, flagged when the
+        /// displacement reaches past the reservation.
+        #[test]
+        fn policy_reproves_elided_access_against_reservation() {
+            let bytes = [
+                0x48, 0x8b, 0x87, 0x40, 0x9c, 0x00, 0x00, // mov rax, [rdi + 0x9C40 (=40000)]
+                0xc3, // ret
+            ];
+            // A large reservation easily holds offset 40000 → no finding.
+            let big = Some(WindowLayout {
+                mask: (1u64 << 37) - 1,
+                guard_offset: 1u64 << 37,
+            });
+            assert!(check(&bytes, &[], &[], big).is_empty());
+            // A 32 KiB reservation does not → the access reaches past it.
+            let small = Some(WindowLayout {
+                mask: (1u64 << 15) - 1,
+                guard_offset: 1u64 << 15,
+            });
+            let f = check(&bytes, &[], &[], small);
+            assert!(
+                f.iter().any(|f| f.why.contains("past the reservation")),
+                "expected a reservation-overrun finding, got {f:?}"
+            );
         }
     }
 }

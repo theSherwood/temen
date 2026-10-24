@@ -5,25 +5,123 @@
 //! The programs are the smallest each feature's own tests run on several engines, so a probe's
 //! answer is one those tests already pin on the oracle.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use temen_interp::{Host, OffloadOutcome, StreamRole, Value};
+use temen_interp::{CapState, Host, OffloadOutcome, SignalSource, StreamRole, Value};
 use temen_ir::{Module, SpawnRec};
 use temen_parity::run_modes::Feature;
 
 /// One feature's probe.
+#[derive(Clone, Copy)]
 pub struct Probe {
     pub feature: Feature,
     pub src: fn() -> String,
-    /// The powerbox and arguments, built fresh for each run from the run's module.
-    pub setup: fn(&Module) -> (Host, Vec<Value>),
-    /// Bytes the embedder supplies on stdin after the run has read, the way its runner's embedder
-    /// does: a run the embedder holds is fed when it waits on them, and any other run pulls them
-    /// from a source that blocks until they arrive.
-    pub feed: Option<&'static [u8]>,
+    /// The powerbox and arguments, built fresh for each run from the run's module and the embedder
+    /// that runs it.
+    pub setup: fn(&Module, &Embedder) -> (Host, Vec<Value>),
+    /// What the embedder does from outside the run, beside answering its calls.
+    pub outside: Outside,
     /// The oracle's answer: what the entry returns.
     pub want: i64,
+}
+
+/// What a probe's embedder does from outside the run. Each runner does it the way its embedder
+/// would.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Outside {
+    /// Nothing.
+    Nothing,
+    /// It supplies these bytes on stdin after the run has read: a run it holds is fed when it waits
+    /// on them, and any other run pulls them from a source that blocks until they arrive.
+    Feed(&'static [u8]),
+    /// It continues the process the probe stops ([`Embedder::stopper`]). A run it holds is
+    /// continued when it waits on that. A run nobody holds faults when its embedder has not said
+    /// it may act from outside, and waits for the continue when it has (#2529).
+    Continue,
+}
+
+/// One run's embedder, as far as a probe reaches it.
+#[derive(Default)]
+pub struct Embedder {
+    /// The job control it holds over the run's process.
+    pub stopper: Arc<Stopper>,
+}
+
+/// An embedder's job control with no personality behind it: the guest stops its own process
+/// through a host call ([`stop_self`]), and the embedder continues it. Each change reaches the
+/// engines through the doors they install, in the order the POSIX personality fires them: the
+/// inline mirror (`set_stop_apply`), then the wake (`set_stop`). The bytecode executors read
+/// [`SignalSource::stopped`].
+#[derive(Default)]
+pub struct Stopper {
+    apply: Mutex<Option<Door>>,
+    wake: Mutex<Option<Door>>,
+    stopped: AtomicBool,
+    /// Whether the embedder has continued the process: what the probe's second call reports.
+    continued: AtomicBool,
+    /// Whether the process asked to stop, or the run is over, for [`Self::await_stop`].
+    asked: (Mutex<bool>, Condvar),
+}
+
+type Door = Arc<dyn Fn(bool) + Send + Sync>;
+
+impl Stopper {
+    /// Stop the process (`true`) or continue it (`false`).
+    pub fn set(&self, stopped: bool) {
+        if !stopped {
+            self.continued.store(true, Ordering::SeqCst);
+        }
+        self.stopped.store(stopped, Ordering::SeqCst);
+        if let Some(apply) = self.apply.lock().unwrap().clone() {
+            apply(stopped);
+        }
+        if let Some(wake) = self.wake.lock().unwrap().clone() {
+            wake(stopped);
+        }
+        if stopped {
+            self.wake_waiter();
+        }
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Wait until the process has asked to stop, or [`Self::close`] says the run is over.
+    pub fn await_stop(&self) {
+        let (asked, cv) = &self.asked;
+        let mut asked = asked.lock().unwrap();
+        while !*asked {
+            asked = cv.wait(asked).unwrap();
+        }
+    }
+
+    /// The run is over: nothing waits for a stop any more.
+    pub fn close(&self) {
+        self.wake_waiter();
+    }
+
+    fn wake_waiter(&self) {
+        *self.asked.0.lock().unwrap() = true;
+        self.asked.1.notify_all();
+    }
+}
+
+impl SignalSource for Stopper {
+    fn take_deliverable(&self) -> Option<(i32, i32, u64)> {
+        None
+    }
+    fn set_stop_apply(&self, apply: Door) {
+        *self.apply.lock().unwrap() = Some(apply);
+    }
+    fn set_stop(&self, wake: Door) {
+        *self.wake.lock().unwrap() = Some(wake);
+    }
+    fn stopped(&self) -> bool {
+        self.is_stopped()
+    }
 }
 
 pub fn module(src: &str) -> Module {
@@ -37,85 +135,92 @@ pub fn probes() -> Vec<Probe> {
         Probe {
             feature: Feature::Threads,
             src: || THREADS.into(),
-            setup: |_| bare(),
-            feed: None,
+            setup: |_, _| bare(),
+            outside: Outside::Nothing,
             want: 212,
         },
         Probe {
             feature: Feature::Fibers,
             src: || FIBERS.into(),
-            setup: |_| bare(),
-            feed: None,
+            setup: |_, _| bare(),
+            outside: Outside::Nothing,
             want: 10,
         },
         Probe {
             feature: Feature::Children,
             src: children,
-            setup: |_| child_powerbox(),
-            feed: None,
+            setup: |_, _| child_powerbox(),
+            outside: Outside::Nothing,
             want: 42,
         },
         Probe {
             feature: Feature::Fork,
             src: fork,
-            setup: fork_powerbox,
-            feed: None,
+            setup: |m, _| fork_powerbox(m),
+            outside: Outside::Nothing,
             want: 100,
         },
         Probe {
             feature: Feature::Exec,
             src: || EXEC.into(),
-            setup: exec_powerbox,
-            feed: None,
+            setup: |m, _| exec_powerbox(m),
+            outside: Outside::Nothing,
             want: 42,
         },
         Probe {
             feature: Feature::HostAnswered,
             src: || TWO_CALLS.into(),
-            setup: |_| host_answered(),
-            feed: None,
+            setup: |_, _| host_answered(),
+            outside: Outside::Nothing,
             want: 105_107,
         },
         Probe {
             feature: Feature::Offloaded,
             src: || TWO_CALLS.into(),
-            setup: |_| offloaded(),
-            feed: None,
+            setup: |_, _| offloaded(),
+            outside: Outside::Nothing,
             want: 105_107,
         },
         Probe {
             feature: Feature::StdinLater,
             src: || READ_ONCE.into(),
-            setup: |_| stdin(),
-            feed: Some(b"abc"),
+            setup: |_, _| stdin(),
+            outside: Outside::Feed(b"abc"),
             want: 3,
+        },
+        Probe {
+            feature: Feature::Signals,
+            src: || STOP_SELF.into(),
+            setup: |_, e| stop_self(e),
+            outside: Outside::Continue,
+            want: 1001,
         },
         Probe {
             feature: Feature::GrowingWindow,
             src: || GROW.into(),
-            setup: |_| memory(),
-            feed: None,
+            setup: |_, _| memory(),
+            outside: Outside::Nothing,
             want: 424_242,
         },
         Probe {
             feature: Feature::SharedRegion,
             src: || REGION.into(),
-            setup: |_| region(),
-            feed: None,
+            setup: |_, _| region(),
+            outside: Outside::Nothing,
             want: 41,
         },
         Probe {
             feature: Feature::GuestJit,
             src: guest_jit,
-            setup: jit_powerbox,
-            feed: None,
+            setup: |m, _| jit_powerbox(m),
+            outside: Outside::Nothing,
             want: 105_107,
         },
         Probe {
             feature: Feature::Serving,
             src: || SERVER.into(),
-            setup: serve_powerbox,
-            feed: None,
+            setup: |m, _| serve_powerbox(m),
+            outside: Outside::Nothing,
             want: 2042,
         },
     ]
@@ -509,6 +614,47 @@ fn stdin() -> (Host, Vec<Value>) {
     let mut host = Host::new();
     let vin = host.grant_stream(StreamRole::In);
     (host, vec![Value::I32(vin)])
+}
+
+// ---- job control ----------------------------------------------------------------------------------
+
+/// The root stops its own process (`stop`), then asks whether its embedder has continued it
+/// (`continued`): `1000 + 1` when nothing ran while it was stopped.
+const STOP_SELF: &str = r#"memory 16
+func (i32, i32) -> (i64) {
+block 0 (vstop: i32, vcont: i32) {
+  vz = i64.const 0
+  vs = call.cap 13 0 (i64) -> (i64) vstop (vz)
+  vc = call.cap 13 0 (i64) -> (i64) vcont (vz)
+  vk = i64.const 1000
+  vr = i64.add vk vc
+  return vr
+  }
+}
+"#;
+
+/// The job-control probe's powerbox: the embedder's `stopper` as the process's signal source, a
+/// host call that stops the process through it, and one that says whether the embedder has
+/// continued it.
+fn stop_self(e: &Embedder) -> (Host, Vec<Value>) {
+    let mut host = Host::new();
+    host.set_signal_source(e.stopper.clone(), Default::default());
+    let s = Arc::clone(&e.stopper);
+    let stop = host.grant_host_proc(
+        Box::new(move |_op, _args, _mem, _minter| {
+            s.set(true);
+            Ok(vec![0])
+        }),
+        CapState::Stateless,
+    );
+    let s = Arc::clone(&e.stopper);
+    let cont = host.grant_host_proc(
+        Box::new(move |_op, _args, _mem, _minter| {
+            Ok(vec![i64::from(s.continued.load(Ordering::SeqCst))])
+        }),
+        CapState::Stateless,
+    );
+    (host, vec![Value::I32(stop), Value::I32(cont)])
 }
 
 // ---- memory ---------------------------------------------------------------------------------------

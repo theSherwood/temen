@@ -55,6 +55,28 @@ C="$ROOT/target/nim-toolchain/$KEY"
 # source path relative to its cwd, but writes a compile-time evaluation program's imports and output
 # file absolute.
 N="$C/nimony"
+# A step's builds run at once and quietly, and nimony prints a build's errors on its stdout. So each
+# build writes a log in the cache, and a step names any build that failed and shows its log: a failed
+# tool used to stop the script with nothing said (#2613).
+pids=() names=()
+build() { # <name> <command…>: start one build in the tree, in the background
+  local n="$1"
+  shift
+  (cd "$N" && "$@" >"$C/$n.log" 2>&1) &
+  pids+=($!) names+=("$n")
+}
+await_builds() {
+  local i failed=0
+  for i in "${!pids[@]}"; do
+    if ! wait "${pids[$i]}"; then
+      echo "nim-toolchain: building ${names[$i]} failed:" >&2
+      cat "$C/${names[$i]}.log" >&2
+      failed=1
+    fi
+  done
+  pids=() names=()
+  [ "$failed" -eq 0 ]
+}
 if [ ! -e "$C/built" ]; then
   # Another key's cache is a gigabyte that no build of this checkout uses again.
   find target/nim-toolchain -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
@@ -67,7 +89,10 @@ if [ ! -e "$C/built" ]; then
   # The cache is inside this repo's worktree, where `git apply` patches paths relative to the
   # repo's root and silently skips the tree's: the ceiling keeps git from finding the repo.
   for p in "$ROOT"/patches/nimony/*.patch; do
-    (cd "$N" && GIT_CEILING_DIRECTORIES="$C" git apply "$p")
+    (cd "$N" && GIT_CEILING_DIRECTORIES="$C" git apply "$p") || {
+      echo "nim-toolchain: $(basename "$p") does not apply to nimony $(git -C "$ROOT/nimony" rev-parse --short HEAD)" >&2
+      exit 1
+    }
   done
 
   echo "[toolchain 1/3] the phases and the driver, native: nimony builds nifler2, nimsem, shoggoth and itself"
@@ -76,13 +101,11 @@ if [ ! -e "$C/built" ]; then
   # they are the reference every artifact is held to, and the compiler of step 2. The driver is
   # rebuilt for its Temen backend, which step 2 plans with; nifmake only sequences work, so `bin/`'s
   # stays.
-  pids=()
   for p in nifler2/nifler2 nimony/nimsem lengc/shoggoth/shoggoth nimony/nimony; do
     n="$(basename "$p")"
-    (cd "$N" && nimony c --isMain --nimcache:"$C/native-$n" "src/$p.nim" >/dev/null) &
-    pids+=($!)
+    build "native-$n" nimony c --isMain --nimcache:"$C/native-$n" "src/$p.nim"
   done
-  for pid in "${pids[@]}"; do wait "$pid"; done
+  await_builds
   for n in nifler2 nimsem shoggoth nimony; do
     cp "$(ls "$C/native-$n"/c/*/"$n" | head -1)" "$N/bin/$n"
   done
@@ -96,16 +119,14 @@ echo "[toolchain 2/3] the tools, through the POSIX edge: nimony t builds each, a
 # each get their own, because the builds run at once and would otherwise all write it. Each build's
 # module goes first, so its link reruns over what the cache holds.
 cache() { if [ "$1" = nimsem ]; then echo "$N/nimcache"; else echo "$C/nimcache-$1"; fi; }
-pids=()
 for p in nimony/nimsem nifler2/nifler2 lengc/shoggoth/shoggoth nimony/nimony nifmake/nifmake; do
   n="$(basename "$p")"
   rm -f "$(cache "$n")"/t/*/"$n.temen"
   args=(t --isMain "src/$p.nim")
   [ "$n" = nimsem ] || args=(t --isMain --nimcache:"$(cache "$n")" "src/$p.nim")
-  (cd "$N" && PATH="$N/bin:$PATH" nimony "${args[@]}" >/dev/null) &
-  pids+=($!)
+  build "$n.temen" env PATH="$N/bin:$PATH" nimony "${args[@]}"
 done
-for pid in "${pids[@]}"; do wait "$pid"; done
+await_builds
 for n in nimsem nifler2 shoggoth nimony nifmake; do
   cp "$(ls "$(cache "$n")"/t/*/"$n.temen" | head -1)" "$W/$n.temen"
 done

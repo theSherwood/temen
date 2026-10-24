@@ -1318,6 +1318,13 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     // (#1499).
     ("link", sig(&[I64, I64], &[I32]), 37),
     ("symlink", sig(&[I64, I64], &[I32]), 37),
+    // `std/times`' `localtimeR(t, res) -> pointer` (`localtime_r`) and `tzsetImpl()` (`tzset`), which
+    // upstream nimony's time zones reach. The sandbox has no tz database: `localtime_r` answers NULL
+    // (`getcwd`'s `(ptr, ptr) -> 0`, row 33), which `std/times` reads as a platform that cannot
+    // answer and degrades local time to UTC, and `tzset` has nothing to load (row 87). **Pinned**
+    // (#1499).
+    ("localtimeR", sig(&[I64, I64], &[I64]), 33),
+    ("tzsetImpl", sig(&[], &[]), 87),
 ];
 
 /// The C symbols the **prebuilt guest libc** ([`nim_libc_units`]) serves for a nim program — the
