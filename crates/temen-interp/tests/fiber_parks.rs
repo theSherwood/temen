@@ -110,6 +110,15 @@ fn a_prechanged_cell_wakes_the_parking_fiber_immediately() {
     );
 }
 
+/// The park-time recheck leaves nothing behind: fiber A waits for a value the cell does not hold,
+/// so the recheck wakes it (`FIBER_PARKED` once); then fiber B sleeps on the same cell, and the
+/// root's notify of one waiter wakes B, whose resume returns `WAIT_WOKEN`; A's then returns
+/// `WAIT_NOT_EQUAL`. A recheck that queued A's wait and left it queued spent that notify on A,
+/// already woken, and B slept on, its resume answering `FIBER_PARKED` again: a wait with no bound
+/// then never ends (#2601). Composite: sa1*100_000 + sb1*10_000 + sb2*1_000 + vb2*100 + sa2*10 +
+/// va2 = 3*100_000 + 3*10_000 + 1*1_000 + 0*100 + 1*10 + 1 = 331_011.
+const NOTIFY_AFTER_RECHECK: &str = include_str!("fixtures/fiber_park_notify_after_recheck.temt");
+
 /// The TIMEOUT wake (the jacl timed-wait regression, 2026-07-24): the fiber parks on a 10ms
 /// **timed** wait on a never-notified cell; the root sees `FIBER_PARKED`, does its own 100ms
 /// timed wait (the scheduler fires the fiber's deadline meanwhile), and the re-resume completes
@@ -162,7 +171,9 @@ const PARK_THEN_MIGRATE: &str = include_str!("fixtures/fiber_park_then_migrate.t
 
 /// #2215 — the fiber park routing above on every driver that has it: a wait inside a fiber parks
 /// the fiber and its thread runs on, and a notify from that thread or another, the park-time
-/// recheck, the idle timer and a poll past the deadline each wake it. The guests are fixtures, so the browser runs them on its parallel driver too.
+/// recheck, the idle timer and a poll past the deadline each wake it; a recheck leaves nothing
+/// queued for a later notify to spend. The guests are fixtures, so the browser runs them on its
+/// parallel driver too.
 #[test]
 fn a_fiber_futex_park_parks_the_fiber_on_every_driver() {
     const DRIVERS: [Driver; 4] = [
@@ -182,6 +193,11 @@ fn a_fiber_futex_park_parks_the_fiber_on_every_driver() {
             "the park-time recheck wakes it",
             NOT_EQUAL_INSTA_WAKE,
             30_101,
+        ),
+        (
+            "a notify after another fiber's recheck wakes it",
+            NOTIFY_AFTER_RECHECK,
+            331_011,
         ),
         (
             "its deadline fires while the root waits",
