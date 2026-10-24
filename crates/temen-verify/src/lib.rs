@@ -19,7 +19,6 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use temen_ir::{Block, BlockIdx, Func, Inst, Module, Terminator, VShape, ValIdx, ValType};
@@ -327,6 +326,10 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
         }
     }
     let has_memory = m.memory.is_some();
+    let mut scratch = Scratch {
+        fn_results: m.funcs.iter().map(|f| f.results.len()).collect(),
+        ..Scratch::default()
+    };
     for (fi, f) in m.funcs.iter().enumerate() {
         verify_func(
             fi as u32,
@@ -336,6 +339,7 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
             &m.types,
             m.impl_exports.len(),
             has_memory,
+            &mut scratch,
         )?;
     }
     // Named exports must point at a real function and be uniquely addressable (backends ignore the
@@ -478,6 +482,22 @@ fn iface_well_formed(ts: &[temen_ir::TypeEntry], t: u32) -> bool {
     }
 }
 
+/// What [`verify_func`] keeps from one function of a module to the next, so the functions share one
+/// set of buffers.
+#[derive(Default)]
+struct Scratch {
+    /// Each function's result count, for `Inst::result_count` (used to trace a `gc.roots` constant
+    /// mask through the block's value numbering).
+    fn_results: Vec<usize>,
+    tree: Tree,
+    /// The value types of the function's checked blocks, end to end: each block's params, its
+    /// captures', then its results'. The block being checked is the tail, and a capture reads its
+    /// value's type from an earlier block's run.
+    types: Vec<ValType>,
+    /// Where each checked block's run starts in `types`.
+    start: Vec<usize>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn verify_func(
     fi: u32,
@@ -487,6 +507,7 @@ fn verify_func(
     type_section: &[temen_ir::TypeEntry],
     n_impl_exports: usize,
     has_memory: bool,
+    s: &mut Scratch,
 ) -> Result<(), VerifyError> {
     // Per function: the entry block's parameters are the function's parameters.
     match f.blocks.first() {
@@ -496,35 +517,36 @@ fn verify_func(
         None => return Err(VerifyError::EntryParamsMismatch { func: fi }),
     }
 
-    let tree = Tree::new(fi, f)?;
-    // Per-function result arity, for `Inst::result_count` (used to trace a `gc.roots` constant mask
-    // through the block's value numbering).
-    let fn_results: Vec<usize> = funcs.iter().map(|f| f.results.len()).collect();
-    // Every checked block's value types, for the captures of the blocks after it.
-    let mut block_types: Vec<Vec<ValType>> = Vec::with_capacity(f.blocks.len());
+    s.tree.build(fi, f)?;
+    s.types.clear();
+    s.start.clear();
     for (bi, b) in f.blocks.iter().enumerate() {
         let bi = bi as u32;
-        // Seed the local type vector with the block's declared parameter types, then its captures'.
-        let mut types: Vec<ValType> = b.params.clone();
+        // Seed the block's types with its declared parameter types, then its captures'.
+        let lo = s.types.len();
+        s.start.push(lo);
+        s.types.extend_from_slice(&b.params);
         for &(a, v) in &b.captures {
             // Rule 2: a capture names a proper ancestor, which dominates this block by rule 1. An
             // ancestor comes before its descendants, so its types are already checked.
-            if bi == 0 || !tree.is_ancestor(a, b.parent) {
+            if bi == 0 || !s.tree.is_ancestor(a, b.parent) {
                 return Err(VerifyError::CaptureNotAncestor {
                     func: fi,
                     block: bi,
                     captured: a,
                 });
             }
-            let t = block_types[a as usize].get(v as usize).copied().ok_or(
-                VerifyError::CaptureOutOfRange {
+            let ancestor = &s.types[s.start[a as usize]..s.start[a as usize + 1]];
+            let t = ancestor
+                .get(v as usize)
+                .copied()
+                .ok_or(VerifyError::CaptureOutOfRange {
                     func: fi,
                     block: bi,
                     captured: a,
                     value: v,
-                },
-            )?;
-            types.push(t);
+                })?;
+            s.types.push(t);
         }
 
         for inst in &b.insts {
@@ -534,7 +556,7 @@ fn verify_func(
             // operand to its defining `i64.const`), so it stays out of `type_inst`. `mask | 0xFF00..
             // == !0` ⇔ the low 56 bits are all 1.
             if let Inst::GcRoots { mask, .. } = inst {
-                if let Some(m) = const_i64_in_block(b, &fn_results, type_section, *mask) {
+                if let Some(m) = const_i64_in_block(b, &s.fn_results, type_section, *mask) {
                     if (m as u64) | 0xFF00_0000_0000_0000 != u64::MAX {
                         return Err(VerifyError::GcRootsMaskUnsafe {
                             func: fi,
@@ -546,12 +568,12 @@ fn verify_func(
             }
 
             // The single per-instruction dispatch (#895): check operands + append result types.
-            let before = types.len();
+            let before = s.types.len();
             type_inst(
                 fi,
                 bi,
                 inst,
-                &types,
+                &s.types[lo..],
                 has_memory,
                 funcs,
                 imports,
@@ -559,20 +581,28 @@ fn verify_func(
                 n_impl_exports,
                 true,
             )?
-            .append_to(&mut types);
+            .append_to(&mut s.types);
             // The appended arity is the value-numbering contract `const_i64_in_block` reads back
             // through `result_count`; a drift would mis-trace the `gc.roots` constant mask. One
             // dispatch now feeds both, so this asserts they agree (debug builds; the fuzz gates the
             // release contract).
             debug_assert_eq!(
-                types.len() - before,
-                inst.result_count(&fn_results, type_section),
+                s.types.len() - before,
+                inst.result_count(&s.fn_results, type_section),
                 "type_inst arity disagrees with Inst::result_count"
             );
         }
 
-        check_terminator(fi, bi, &b.term, &types, type_section, &tree, f, funcs)?;
-        block_types.push(types);
+        check_terminator(
+            fi,
+            bi,
+            &b.term,
+            &s.types[lo..],
+            type_section,
+            &s.tree,
+            f,
+            funcs,
+        )?;
     }
     Ok(())
 }
@@ -580,15 +610,16 @@ fn verify_func(
 /// A function's dominance certificate (#2454, DESIGN.md §3a), numbered so that "is `a` an
 /// ancestor of `b`" costs O(1): each block's pre-order position and subtree size. Building it is two
 /// linear loops, and needs no recursion, because every parent comes before its children.
+#[derive(Default)]
 struct Tree {
     pre: Vec<u32>,
     size: Vec<u32>,
 }
 
 impl Tree {
-    /// Check that the entry names no parent and every other block an earlier one, then number the
-    /// tree.
-    fn new(fi: u32, f: &Func) -> Result<Tree, VerifyError> {
+    /// Check that the entry names no parent and every other block an earlier one, then number
+    /// `f`'s tree into this one's buffers.
+    fn build(&mut self, fi: u32, f: &Func) -> Result<(), VerifyError> {
         let n = f.blocks.len();
         for (bi, b) in f.blocks.iter().enumerate() {
             if b.parent as usize >= bi.max(1) {
@@ -599,20 +630,23 @@ impl Tree {
                 });
             }
         }
-        let mut size = vec![1u32; n];
+        let (pre, size) = (&mut self.pre, &mut self.size);
+        size.clear();
+        size.resize(n, 1);
+        pre.clear();
+        pre.resize(n, 0);
+        // A block's subtree takes the positions after its own, its children's one after another,
+        // last child first. Walking back, a block's subtree is complete when it is reached, and its
+        // parent's size so far is its offset from its parent: one, plus its later siblings' sizes.
         for b in (1..n).rev() {
-            size[f.blocks[b].parent as usize] += size[b];
-        }
-        // A block's children take consecutive runs of positions after its own, in index order.
-        let mut pre = vec![0u32; n];
-        let mut next = vec![1u32; n];
-        for b in 1..n {
             let p = f.blocks[b].parent as usize;
-            pre[b] = next[p];
-            next[p] += size[b];
-            next[b] = pre[b] + 1;
+            pre[b] = size[p];
+            size[p] += size[b];
         }
-        Ok(Tree { pre, size })
+        for b in 1..n {
+            pre[b] += pre[f.blocks[b].parent as usize];
+        }
+        Ok(())
     }
 
     /// Whether `a` is `b` or an ancestor of `b`.

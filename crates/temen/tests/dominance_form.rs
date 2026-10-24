@@ -168,17 +168,24 @@ block 3 in 0 (r: i64, y3 = 0.y) {
 ";
     verify_text(src).unwrap();
     let m = temen::text::parse_module(src).unwrap();
-    let mut fuel = 1_000u64;
     let l = localized(&m);
     verify_module(&l).unwrap();
-    assert_eq!(
-        run(&l, 0, &[Value::I64(5), Value::I32(1)], &mut fuel),
-        Ok(vec![Value::I64(18)])
-    );
-    assert_eq!(
-        run(&l, 0, &[Value::I64(5), Value::I32(0)], &mut fuel),
-        Ok(vec![Value::I64(11)])
-    );
+    for (c, sum) in [(1, 18), (0, 11)] {
+        let args = [Value::I64(5), Value::I32(c)];
+        let want = Ok(vec![Value::I64(sum)]);
+        assert_eq!(run(&m, 0, &args, &mut 1_000), want, "tree-walker");
+        assert_eq!(
+            run(&l, 0, &args, &mut 1_000),
+            want,
+            "tree-walker, localized"
+        );
+        let bc = bytecode::compile_and_run(&m, 0, &args, &mut 1_000);
+        assert_eq!(bc, Some(want), "bytecode");
+        match temen_jit::compile_and_run(&m, 0, &[5, c as i64]) {
+            Ok(temen_jit::JitOutcome::Returned(r)) => assert_eq!(r, [sum], "Cranelift JIT"),
+            other => panic!("Cranelift JIT: {other:?}"),
+        }
+    }
 }
 
 #[test]
@@ -337,4 +344,65 @@ block 0 () {
             captured: 0
         })
     );
+}
+
+/// A `longjmp` back into a block resumes with the values its descendants capture as they were at the
+/// `setjmp`, though the frame re-ran their block since: block 3 captures block 1's `y`, which the loop
+/// redefines before block 4 jumps back. Every engine agrees with the block-local form.
+#[test]
+fn a_longjmp_restores_the_values_a_block_below_captures() {
+    let src = "\
+memory 16
+func (i64) -> (i64) {
+block 0 (x: i64) {
+  zero = i64.const 0
+  br 1(zero)
+}
+block 1 in 0 (i: i64, x1 = 0.x) {
+  y = i64.add x1 i
+  first = i64.eqz i
+  br_if first 2() 4()
+}
+block 2 in 1 () {
+  buf = i64.const 40000
+  sj = setjmp buf
+  none = i32.const 0
+  again = i32.ne sj none
+  br_if again 3() 5()
+}
+block 3 in 2 (y3 = 1.y) {
+  return y3
+}
+block 4 in 1 () {
+  buf2 = i64.const 40000
+  one = i32.const 1
+  longjmp buf2 one
+  unreachable
+}
+block 5 in 2 () {
+  next = i64.const 1
+  br 1(next)
+}
+}
+";
+    let m = temen::text::parse_module(src).unwrap();
+    verify_module(&m).unwrap();
+    let l = localized(&m);
+    verify_module(&l).unwrap();
+    let args = [Value::I64(10)];
+    let want = Ok(vec![Value::I64(10)]);
+    assert_eq!(
+        run(&l, 0, &args, &mut 1_000),
+        want,
+        "tree-walker, localized"
+    );
+    assert_eq!(run(&m, 0, &args, &mut 1_000), want, "tree-walker");
+    for (what, module) in [("localized", &l), ("raised", &m)] {
+        let bc = bytecode::compile_and_run(module, 0, &args, &mut 1_000);
+        assert_eq!(bc, Some(want.clone()), "bytecode, {what}");
+        match temen_jit::compile_and_run(module, 0, &[10]) {
+            Ok(temen_jit::JitOutcome::Returned(r)) => assert_eq!(r, [10], "Cranelift JIT, {what}"),
+            other => panic!("Cranelift JIT, {what}: {other:?}"),
+        }
+    }
 }

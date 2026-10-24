@@ -2501,36 +2501,32 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
     // slot, and no edge copies into it. The unfused compile (stepping, tracing, a debug run's
     // frames, read by `(block, value)`) keeps every param in a slot of its own.
     let forwards = fuse.then(|| f.forwards());
-    let forwarded = |b: usize, i: usize| {
-        let w = forwards.as_ref()?;
-        (i < f.blocks[b].params.len())
-            .then(|| w.source(b, i))
-            .flatten()
+    // Value `v` of block `b`, or the value it forwards: never another forwarding param.
+    let resolve = |b: usize, v: u32| match forwards.as_ref().and_then(|w| w.source(b, v as usize)) {
+        Some((sb, si)) => (sb as usize, si),
+        None => (b, v),
     };
     // The slot that holds value `v` of block `b`. In the fused compile a capture (#2454) reads the
     // slot of the value it names, as a forwarding param reads its source's; the unfused compile keeps
     // each in a slot of its own, which every edge into its block fills.
-    let slot = |mut b: usize, mut v: u32| -> u32 {
-        loop {
-            let blk = &f.blocks[b];
-            let np = blk.params.len() as u32;
-            if let Some((sb, si)) = forwarded(b, v as usize) {
-                (b, v) = (sb as usize, si);
-            } else if fuse && v >= np && v < blk.inputs() as u32 {
-                let (a, av) = blk.captures[(v - np) as usize];
-                (b, v) = (a as usize, av);
-            } else {
-                return base[b] + v;
-            }
+    let slot = |b: usize, v: u32| -> u32 {
+        let (mut b, mut v) = resolve(b, v);
+        while fuse && (f.blocks[b].params.len()..f.blocks[b].inputs()).contains(&(v as usize)) {
+            let (a, av) = f.blocks[b].captures[v as usize - f.blocks[b].params.len()];
+            (b, v) = resolve(a as usize, av);
         }
+        base[b] + v
     };
+    // Each value's slot, by the slot that is its own: what an operand naming it reads.
+    let mut read: Vec<u32> = (0..nslots).collect();
     // The slots forwarding params and captures read: read outside their block with no edge copy,
     // so their values must be written (the `IntCmp` fusion below checks this).
     let mut read_forwarded = vec![false; nslots as usize];
     for (b, blk) in f.blocks.iter().enumerate() {
         for v in 0..blk.inputs() as u32 {
-            let s = slot(b, v);
-            if s != base[b] + v {
+            let (own, s) = (base[b] + v, slot(b, v));
+            read[own as usize] = s;
+            if s != own {
                 read_forwarded[s as usize] = true;
             }
         }
@@ -2538,7 +2534,7 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
     for (bi, b) in f.blocks.iter().enumerate() {
         block_pc[bi] = ops.len() as u32;
         // operand: block-local index -> frame slot
-        let g = |local: u32| slot(bi, local);
+        let g = |local: u32| read[(base[bi] + local) as usize];
         let mut local = b.inputs() as u32;
         for (i, inst) in b.insts.iter().enumerate() {
             let dst = match view.results(inst) {
@@ -2551,30 +2547,29 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
         }
         // Terminator -> edge copies (block-local src in this block -> first slots of target) + jump.
         let edge = |bidx: usize, args: &[u32]| -> Edge {
+            // A param that forwards reads its source's slot, so no edge writes its own.
+            let mut pairs: Vec<(u32, u32)> = args
+                .iter()
+                .zip(base[bidx]..)
+                .filter(|&(_, dst)| read[dst as usize] == dst)
+                .map(|(a, dst)| (g(*a), dst))
+                .collect();
+            // In the unfused compile the target's captures ride every edge into it too, each copied
+            // from the slot of the value it names.
+            if !fuse {
+                let target = &f.blocks[bidx];
+                let first = base[bidx] + target.params.len() as u32;
+                let captures = target.captures.iter().zip(first..);
+                pairs.extend(captures.map(|(&(a, v), dst)| (slot(a as usize, v), dst)));
+            }
             // Slice 5b: drop **identity** self-copies (`src == dst`) at compile time. A loop-invariant
             // block param threaded unchanged across a back-edge lands in the same global slot it came
             // from, so the copy is a no-op — eliding it removes a real `scratch` push+write per such
             // param every iteration. Safe and semantics-transparent: an `x -> x` move changes nothing,
             // and its removal can't affect the gather/scatter of the other (aliasing) copies. Applies
             // uniformly to every terminator's edges (Br/BrIf/BrIfCmp/BrTable), fused or not.
-            // In the unfused compile the target's captures ride every edge into it too, each copied
-            // from the slot of the value it names.
-            let target = &f.blocks[bidx];
-            let captured = target.captures.iter().filter(|_| !fuse);
-            let pairs: Box<[(u32, u32)]> = args
-                .iter()
-                .enumerate()
-                .filter(|&(i, _)| forwarded(bidx, i).is_none())
-                .map(|(i, a)| (g(*a), base[bidx] + i as u32))
-                .chain(captured.enumerate().map(|(j, &(a, v))| {
-                    (
-                        slot(a as usize, v),
-                        base[bidx] + (target.params.len() + j) as u32,
-                    )
-                }))
-                .filter(|(src, dst)| src != dst)
-                .collect();
-            (Copies::new(pairs), bidx as u32) // block index; patched to entry pc below
+            pairs.retain(|(src, dst)| src != dst);
+            (Copies::new(pairs.into()), bidx as u32) // block index; patched to entry pc below
         };
         match &b.term {
             Terminator::Br { target, args } => {
@@ -17932,9 +17927,9 @@ static BYTE_SETJMP_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 /// A `<setjmp.h>` checkpoint (see [`Vm::setjmp_points`]): everything needed to re-enter a `setjmp`
 /// activation. `longjmp` truncates [`Vm::stack`] to `depth` (the intervening activations discarded —
-/// C has no cleanups), restores the `(module, cur, base, pc)` cursor, and sets the `dst` register to
-/// the long-jump value. The activation's register window survives in place, so it is not snapshotted.
-#[derive(Clone, Copy)]
+/// C has no cleanups), restores the `(module, cur, base, pc)` cursor and the activation's register
+/// window, and sets the `dst` register to the long-jump value.
+#[derive(Clone)]
 struct ByteSetJmp {
     /// `Vm::stack` length at `setjmp` (the `setjmp` activation is the current one, not yet pushed).
     depth: usize,
@@ -17945,6 +17940,11 @@ struct ByteSetJmp {
     pc: usize,
     /// The `setjmp` result's window slot (relative to `base`) — set to the long-jump value on re-entry.
     dst: u32,
+    /// The activation's register window at the `setjmp`. A block's slots are its own, but what it
+    /// reads need not be: a forwarding param (#2448) or a capture (#2454) reads the slot of a value
+    /// of a block that dominates it, which the activation may run again before it jumps back. The
+    /// oracle restores the value state of the `setjmp` point, and so does this.
+    window: Box<[Reg]>,
 }
 
 // `Clone` for time-travel checkpointing (DEBUGGING.md W1): a `ScheduledDebugRun` snapshots each task's
@@ -18041,9 +18041,8 @@ struct Vm {
 struct VmRare {
     /// `<setjmp.h>` checkpoints — `setjmp` records its activation's resume point here, keyed by a
     /// per-`setjmp` **token** it writes into the guest `jmp_buf`'s opaque first 8 bytes (#1062);
-    /// `longjmp` reads the token back from the (possibly-copied) buffer and looks it up. No register
-    /// snapshot is needed (unlike the tree-walker): the flat per-function register layout gives each
-    /// block its own slots, so the `setjmp` block's values survive a deeper call in place.
+    /// `longjmp` reads the token back from the (possibly-copied) buffer and looks it up, and
+    /// restores the activation's register window ([`ByteSetJmp::window`]).
     /// Token-keying (vs the old address key) is what lets a guest *copy* a `jmp_buf` — bash's
     /// `COPY_PROCENV` memcpy of `top_level` — carry the checkpoint identity with the bytes; bounded
     /// by pruning checkpoints whose `setjmp` activation has returned (`SetJmp` op).
@@ -18958,8 +18957,8 @@ impl Vm {
                     pc = *target as usize;
                 }
                 // `<setjmp.h>` `setjmp`: checkpoint the resume point (the op after this, in this
-                // activation) keyed by the guest `jmp_buf` address, and return 0. The register window
-                // survives in place (per-block slots are distinct), so no snapshot is taken.
+                // activation) and its register window, keyed by the guest `jmp_buf` address, and
+                // return 0.
                 Op::SetJmp { buf, dst } => {
                     // #1062 — key the checkpoint by a fresh TOKEN written into the guest `jmp_buf`'s
                     // opaque first 8 bytes (not the buffer address), so a guest that memcpy-copies
@@ -18980,6 +18979,7 @@ impl Vm {
                     // would trap regardless. A copied-but-live checkpoint sits at a still-live
                     // activation (`depth <= stack.len()`) and is retained.
                     let live = self.stack.len();
+                    let window = self.regs[base..base + c.progs[cur].nslots as usize].into();
                     let points = &mut self.rare().setjmp_points;
                     points.retain(|_, p| p.depth <= live);
                     points.insert(
@@ -18991,6 +18991,7 @@ impl Vm {
                             base,
                             pc: pc + 1,
                             dst: *dst,
+                            window,
                         },
                     );
                     r!(*dst) = Reg::from_i32(0);
@@ -19010,9 +19011,10 @@ impl Vm {
                         .ok_or(Trap::Malformed)?
                         .load_scalar(buf_addr, 0, LoadOp::I64)?
                         .i64() as u64;
-                    let point = *(self.rare.as_ref())
+                    let point = (self.rare.as_ref())
                         .and_then(|r| r.setjmp_points.get(&token))
-                        .ok_or(Trap::Malformed)?;
+                        .ok_or(Trap::Malformed)?
+                        .clone();
                     if point.depth > self.stack.len() {
                         return Err(Trap::Malformed); // the setjmp activation already returned
                     }
@@ -19042,6 +19044,7 @@ impl Vm {
                     base = point.base;
                     pc = point.pc;
                     c = resolve!(module);
+                    self.regs[base..base + point.window.len()].copy_from_slice(&point.window);
                     self.regs[base + point.dst as usize] = Reg::from_i32(resume);
                 }
                 Op::Call { callee, args, dst } => {
