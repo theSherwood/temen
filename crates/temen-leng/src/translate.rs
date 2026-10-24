@@ -437,6 +437,12 @@ pub(crate) enum Layout {
     Scalar(TyDesc),
 }
 
+/// Sibling units' layouts, under the stem-suffixed names a unit references them by: the table
+/// [`export_types_pooled`](Translator::export_types_pooled) pools across a link. A link builds it once
+/// per round, and each unit's translator reads that one table beneath its own
+/// ([`Translator::import_types`]), so no unit copies it.
+pub(crate) type TypePool = std::sync::Arc<HashMap<String, Layout>>;
+
 pub(crate) struct Translator {
     procs: HashMap<String, Sig>,
     /// Names of every proc **defined** in this module — populated at the top of [`collect_globals`],
@@ -445,7 +451,10 @@ pub(crate) struct Translator {
     /// (another global) while materializing an `Rtti` const's `mt` array. Without this, a `method`
     /// dispatch's vtable stayed a zeroed placeholder and dynamic dispatch silently called func 0 (#979).
     proc_names: HashSet<String>,
+    /// This unit's layouts. [`layout`](Self::layout) reads them over `ext_types`.
     types: HashMap<String, Layout>,
+    /// Sibling units' layouts ([`TypePool`], [`import_types`](Self::import_types)).
+    ext_types: TypePool,
     /// Names of locally-declared `object`/`array` aggregate types. A bare-symbol type is treated as
     /// an aggregate (held by address, indexed by `dot`/`at`) iff it is in this set; every other named
     /// type (`enum`, `distinct` int, `proctype`, opaque/external) is a scalar.
@@ -655,6 +664,7 @@ impl Translator {
             procs: HashMap::default(),
             proc_names: HashSet::default(),
             types: HashMap::default(),
+            ext_types: TypePool::default(),
             agg_names: HashSet::default(),
             packed_types: HashSet::default(),
             ty_aliases: HashMap::default(),
@@ -1297,7 +1307,7 @@ impl Translator {
             // `desc` is the const's registered type: the **named** array type for `(aconstr Named …)`
             // (unchanged), or a `FlexArray` for an **inline** `(flexarray|uarray ElemT)` (a vtable `mt`).
             let (elem_size, total, desc): (usize, usize, TyDesc) = match a.first() {
-                Some(t) if t.as_atom().is_some() => match self.types.get(t.as_atom().unwrap()) {
+                Some(t) if t.as_atom().is_some() => match self.layout(t.as_atom().unwrap()) {
                     Some(Layout::Array {
                         elem_size, size, ..
                     }) => (
@@ -1383,7 +1393,7 @@ impl Translator {
             Some(n) => n,
             None => return Ok(None),
         };
-        let (fields, base_size) = match self.types.get(tyname) {
+        let (fields, base_size) = match self.layout(tyname) {
             Some(Layout::Object { fields, size, .. }) => (fields.clone(), *size),
             _ => return Ok(None),
         };
@@ -1525,7 +1535,7 @@ impl Translator {
             TyDesc::Scalar { .. } | TyDesc::Ptr(_) | TyDesc::FnPtr(_) => 8,
             TyDesc::Narrow { bytes, .. } => *bytes as u64,
             TyDesc::FlexArray(elem) => self.alignof(elem),
-            TyDesc::Agg(name) => match self.types.get(name) {
+            TyDesc::Agg(name) => match self.layout(name) {
                 Some(Layout::Object { align, .. }) => *align,
                 Some(Layout::Array { elem, .. }) => self.alignof(elem),
                 Some(Layout::Scalar(d)) => self.alignof(d),
@@ -1546,7 +1556,7 @@ impl Translator {
             TyDesc::FnPtr(_) => 8, // a full pointer-word slot, though accessed as an i32 index
             TyDesc::FlexArray(_) => 0, // a size-0 inline tail
             TyDesc::Narrow { bytes, .. } => *bytes as u64,
-            TyDesc::Agg(name) => match self.types.get(name) {
+            TyDesc::Agg(name) => match self.layout(name) {
                 Some(Layout::Object { size, .. }) | Some(Layout::Array { size, .. }) => *size,
                 Some(Layout::Scalar(d)) => self.sizeof(d),
                 None => 8,
@@ -1739,14 +1749,14 @@ impl Translator {
                 // alias (`(type :RootRef … (ptr T))`), which carries a pointee so `deref` works. An
                 // enum or named integer is its base type ([`Layout::Scalar`]); anything else (an
                 // opaque external) is a word.
-                Some(name) if self.agg_names.contains(name) => Ok(TyDesc::Agg(name.to_string())),
+                Some(name) if self.is_agg(name) => Ok(TyDesc::Agg(name.to_string())),
                 Some(name) if self.proctypes.contains_key(name) => {
                     Ok(TyDesc::FnPtr(Box::new(self.proctypes[name].clone())))
                 }
                 Some(name) if self.ty_aliases.contains_key(name) => {
                     Ok(self.ty_aliases[name].clone())
                 }
-                Some(name) => match self.types.get(name) {
+                Some(name) => match self.layout(name) {
                     // A named scalar (an enum, a named integer) is as wide as its base type.
                     Some(Layout::Scalar(d)) => Ok(d.clone()),
                     _ => Ok(TyDesc::Scalar {
@@ -1819,7 +1829,7 @@ impl Translator {
     /// signature, local and conversion asks this, so a proc and a `proctype` naming the same type
     /// agree on it, which `call.dyn` checks.
     fn val_ty(&self, t: &Node) -> Result<ValType, LengError> {
-        match t.as_atom().and_then(|n| self.types.get(n)) {
+        match t.as_atom().and_then(|n| self.layout(n)) {
             Some(Layout::Scalar(d)) => Ok(d.scalar_ty().unwrap_or(ValType::I32)),
             _ => val_ty(t),
         }
@@ -1865,7 +1875,7 @@ impl Translator {
         loop {
             let mut progress = false;
             for (name, &body) in &raw {
-                if self.types.contains_key(name) {
+                if self.has_layout(name) {
                     continue;
                 }
                 let base = match body.tag() {
@@ -1873,7 +1883,7 @@ impl Translator {
                     Some("i" | "u" | "c" | "f" | "bool") => Some(body),
                     None => body
                         .as_atom()
-                        .filter(|s| matches!(self.types.get(*s), Some(Layout::Scalar(_))))
+                        .filter(|s| matches!(self.layout(s), Some(Layout::Scalar(_))))
                         .map(|_| body),
                     _ => None,
                 };
@@ -1920,7 +1930,7 @@ impl Translator {
         loop {
             let mut progress = false;
             for name in &names {
-                if self.agg_names.contains(name) || self.ty_aliases.contains_key(name) {
+                if self.is_agg(name) || self.ty_aliases.contains_key(name) {
                     continue;
                 }
                 let body = raw[name];
@@ -1995,7 +2005,7 @@ impl Translator {
     }
 
     fn resolve_type(&mut self, name: &str, raw: &HashMap<String, &Node>) -> Result<(), LengError> {
-        if self.types.contains_key(name) {
+        if self.has_layout(name) {
             return Ok(());
         }
         let body = match raw.get(name) {
@@ -2046,7 +2056,7 @@ impl Translator {
                 if let Some(base) = body.args().first().and_then(|n| n.as_atom()) {
                     if base != "." {
                         self.resolve_type(base, raw)?;
-                        match self.types.get(base).cloned() {
+                        match self.layout(base).cloned() {
                             // C embeds the base as the leading member, so the derived fields
                             // start past its padded size.
                             Some(Layout::Object {
@@ -2193,16 +2203,30 @@ impl Translator {
         Ok(())
     }
 
-    /// Pre-register **external** aggregate type layouts (another module's types, under the
-    /// stem-suffixed global names this module references them by — [`export_types_pooled`]). Must run
-    /// before `collect_types`, whose `resolve_type` skips already-registered names.
-    pub fn import_types(&mut self, ext: &[(String, Layout)]) {
-        for (name, layout) in ext {
-            if !matches!(layout, Layout::Scalar(_)) {
-                self.agg_names.insert(name.clone());
-            }
-            self.types.insert(name.clone(), layout.clone());
-        }
+    /// Register **external** type layouts: sibling modules' types, under the stem-suffixed global
+    /// names this module references them by ([`TypePool`]). Must run before `collect_types`, whose
+    /// `resolve_type` skips already-registered names.
+    pub fn import_types(&mut self, pool: &TypePool) {
+        self.ext_types = TypePool::clone(pool);
+    }
+
+    /// The layout of type `name`: this unit's, else a sibling's ([`TypePool`]).
+    fn layout(&self, name: &str) -> Option<&Layout> {
+        self.types.get(name).or_else(|| self.ext_types.get(name))
+    }
+
+    fn has_layout(&self, name: &str) -> bool {
+        self.layout(name).is_some()
+    }
+
+    /// Whether the bare-symbol type `name` is an aggregate: an `object`, `array` or `union` this unit
+    /// declares ([`agg_names`](Self::agg_names)), or a sibling's that is not a named scalar.
+    fn is_agg(&self, name: &str) -> bool {
+        self.agg_names.contains(name)
+            || self
+                .ext_types
+                .get(name)
+                .is_some_and(|l| !matches!(l, Layout::Scalar(_)))
     }
 
     /// Pre-register **external globals' descriptors** — another module's `gvar`s/`const`s of any
@@ -2300,7 +2324,7 @@ impl Translator {
     pub fn export_globals(
         root: &Node,
         stem: &str,
-        pooled: &[(String, Layout)],
+        pooled: &TypePool,
         tls: bool,
     ) -> Result<(GlobalDescs, GlobalDescs), LengError> {
         let mut t = Translator::new();
@@ -2313,7 +2337,6 @@ impl Translator {
                                // consumer then indexes `TagData.0.<tags>` as a `Scalar(I64)` and fails with "`at` on a
                                // non-array". The pool is complete before this runs (`link_selected_with_extra` drives it to a
                                // fixpoint first), so there is no ordering cost to using it.
-        let imported: HashSet<String> = pooled.iter().map(|(n, _)| n.clone()).collect();
         t.import_types(pooled);
         t.collect_types(root)?;
         t.collect_globals(root)?;
@@ -2321,7 +2344,7 @@ impl Translator {
         // stem-suffixed global form — the same rewrite `export_types_pooled` applies to a field or
         // element descriptor, and for the same reason: the consumer's table is keyed by the global
         // name, so an unsuffixed `Agg("`t.0.IAarray…`")` resolves to nothing there.
-        let local: HashSet<&String> = t.types.keys().filter(|n| !imported.contains(*n)).collect();
+        let local: HashSet<&String> = t.types.keys().collect();
         let mut out: Vec<(String, TyDesc)> = t
             .globals
             .iter()
@@ -2404,18 +2427,12 @@ impl Translator {
     pub fn export_sret_procs(
         root: &Node,
         stem: &str,
-        pooled: &[(String, Layout)],
+        pooled: &TypePool,
     ) -> Result<Vec<(String, TyDesc)>, LengError> {
         let mut t = Translator::new();
         t.import_types(pooled);
-        let imported: HashSet<String> = pooled.iter().map(|(n, _)| n.clone()).collect();
         t.collect_types(root)?;
-        let local: HashSet<String> = t
-            .types
-            .keys()
-            .filter(|n| !imported.contains(*n))
-            .cloned()
-            .collect();
+        let local: HashSet<&String> = t.types.keys().collect();
         let suffix = |d: &TyDesc| match d {
             TyDesc::Agg(n) if local.contains(n) => TyDesc::Agg(format!("{n}{stem}")),
             other => other.clone(),
@@ -2488,7 +2505,7 @@ impl Translator {
     pub fn export_proc_params(
         root: &Node,
         stem: &str,
-        pooled: &[(String, Layout)],
+        pooled: &TypePool,
     ) -> Result<Vec<ProcParamSig>, LengError> {
         // Resolve named types (proctypes, enums, distinct ints) exactly as the real per-unit
         // translation does, so `param_val_ty` classifies a funcref param as `i32` (not the `i64` a
@@ -2561,7 +2578,7 @@ impl Translator {
     pub fn proc_frame_nodes(
         root: &Node,
         stem: &str,
-        ext_types: &[(String, Layout)],
+        ext_types: &TypePool,
         ext_sret: &[(String, TyDesc)],
         ext_proc_params: &[ProcParamSig],
         pooled_funcrefs: &HashSet<String>,
@@ -2652,19 +2669,17 @@ impl Translator {
     /// lose every inherited field, exporting a layout with only the synthetic vtable slot.
     /// [`link_selected`] calls this to a **fixpoint** — each round feeds the prior round's pool back
     /// in — so a cross-module inheritance chain of any depth is fully inlined before any unit is
-    /// translated (#859). Only the unit's *own* types are returned; the pre-registered pool is
-    /// filtered back out. Pass `&[]` for the standalone (no-pool) export.
+    /// translated (#859). Only the unit's *own* types are returned, in no particular order: the pool
+    /// stays beneath them ([`layout`](Self::layout)), out of `types`.
     pub fn export_types_pooled(
         root: &Node,
         stem: &str,
-        pool: &[(String, Layout)],
+        pool: &TypePool,
     ) -> Result<Vec<(String, Layout)>, LengError> {
         let mut t = Translator::new();
         t.import_types(pool);
-        let imported: HashSet<String> = pool.iter().map(|(n, _)| n.clone()).collect();
         t.collect_types(root)?;
-        // This unit's own types = everything resolved that wasn't pre-registered from the pool.
-        let local: HashSet<&String> = t.types.keys().filter(|n| !imported.contains(*n)).collect();
+        let local: HashSet<&String> = t.types.keys().collect();
         // Rewrite every aggregate **type name** in a field/element descriptor to its stem-suffixed
         // global form — recursing through `Ptr`/`FlexArray` pointees, not just the top level. Missing
         // the nested case left a field like `vt: ptr Rtti` exporting `Ptr(Agg("Rtti.0."))` unsuffixed,
@@ -2672,10 +2687,9 @@ impl Translator {
         // walk) and a `dot` through it fail-closed. Only local names are suffixed; already-global
         // (cross-module) names pass through.
         let rewrite = |d: &TyDesc| rewrite_agg_names(d, &local, stem);
-        let mut out: Vec<(String, Layout)> = t
+        let out: Vec<(String, Layout)> = t
             .types
             .iter()
-            .filter(|(name, _)| !imported.contains(*name))
             .map(|(name, layout)| {
                 let l = match layout {
                     Layout::Object {
@@ -2704,7 +2718,6 @@ impl Translator {
                 (format!("{name}{stem}"), l)
             })
             .collect();
-        out.sort_by(|a, b| a.0.cmp(&b.0)); // HashMap order → deterministic output
         Ok(out)
     }
 
@@ -3222,7 +3235,7 @@ impl Translator {
         }
         let d = self.tydesc(node)?;
         if let TyDesc::Agg(n) = &d {
-            if self.types.contains_key(n) {
+            if self.has_layout(n) {
                 return Ok(Some(d));
             }
         }
@@ -4230,7 +4243,7 @@ impl<'a> FuncGen<'a> {
     /// Field `(offset, type)` in an object descriptor.
     fn field_of(&self, bdesc: &TyDesc, fname: &str) -> Result<(u64, TyDesc), LengError> {
         if let TyDesc::Agg(n) = bdesc {
-            if let Some(Layout::Object { fields, .. }) = self.t.types.get(n) {
+            if let Some(Layout::Object { fields, .. }) = self.t.layout(n) {
                 for (fnm, off, fd) in fields {
                     if fnm == fname {
                         return Ok((*off, fd.clone()));
@@ -4254,13 +4267,13 @@ impl<'a> FuncGen<'a> {
             TyDesc::Agg(n) => {
                 if let Some(Layout::Array {
                     elem, elem_size, ..
-                }) = self.t.types.get(n)
+                }) = self.t.layout(n)
                 {
                     return Ok((*elem_size, elem.clone()));
                 }
                 Err(LengError::Unsupported(format!(
                     "`at` on a non-array (`{n}` is {:?})",
-                    self.t.types.get(n)
+                    self.t.layout(n)
                 )))
             }
             // An inline flexible array (`LongString.data`): element size from the element type.
