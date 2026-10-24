@@ -12008,15 +12008,18 @@ fn freeze_step(
     host.is_durable() && is_unwinding(mem) && admit_parks(tasks)
 }
 
-/// The rule this engine applies at `site`: the oracle's, but for a reply wait and a page fault. The
-/// oracle re-issues the wait and the thaw re-parks the call on its ticket (#1901); this engine has no
-/// re-park yet, so a re-admitted call would be issued twice, and it declines instead (#1904). The
-/// oracle holds a pager until its paged children have unwound (#2455), so a fault waits for its page;
-/// this engine has no hold, so it declines. No fault parks in a freeze yet: a durable run on this
-/// engine refuses a detached spawn (#1893), and only a detached child pages.
+/// The rule this engine applies at `site`: the oracle's, but for a reply wait, a page fault and a
+/// `wait(-1)`. The oracle re-issues the wait and the thaw re-parks the call on its ticket (#1901);
+/// this engine has no re-park yet, so a re-admitted call would be issued twice, and it declines
+/// instead (#1904). The oracle holds a pager until its paged children have unwound (#2455), so a
+/// fault waits for its page; this engine has no hold, so it declines. No fault parks in a freeze yet:
+/// a durable run on this engine refuses a detached spawn (#1893), and only a detached child pages.
+/// The oracle carries a fork twin, whose unwind ends a `wait(-1)` (#2571); this engine carries none.
 fn freeze_rule_here(site: super::ParkSite) -> super::FreezeRule {
     match site {
-        super::ParkSite::Reply | super::ParkSite::PageFault => super::FreezeRule::Decline,
+        super::ParkSite::Reply | super::ParkSite::PageFault | super::ParkSite::ReapAny => {
+            super::FreezeRule::Decline
+        }
         s => s.freeze_rule(),
     }
 }
@@ -14688,7 +14691,8 @@ pub enum CoopEvent {
     /// time that passed pass, and pumps again; one with no time to wait in lets it pass at once
     /// ([`CoopRun::run_clockless`]). On executor 2 timers fire on their own, in real time: it
     /// returns this only for what its embedder owes or feeds, with the time to a timer if one is
-    /// pending.
+    /// pending. Pump again after the timer to hear what follows, or wait for the run to change
+    /// ([`CoopRun::wait`]).
     Idle { timer: Option<u64> },
     /// #1953, #1414 D4 — a task has just made **host-answered cap call** `id` (a proc granted with
     /// [`crate::OffloadOutcome::Host`]), in any domain, whose request the proc's submit hook
@@ -14756,10 +14760,11 @@ enum CoopExec {
     Threads(ThreadsRun),
 }
 
-/// Executor 2's [`CoopRun`] (#1414 5b). The root starts on a thread of its own at the embedder's
-/// first `run`, and each `run` watches the run until its next event ([`ThreadRun::watch`]). The
-/// run's tasks go on between the embedder's calls: only what a watch settles waits for the next
-/// one, an answer to a punted call or an embedder's feed.
+/// Executor 2's [`CoopRun`] (#1414 5b), and its one-shot run ([`drive_threads`]). The root starts
+/// at the first `run`. A watched run starts it on a thread of its own, and each `run` watches the run
+/// until its next event ([`ThreadRun::watch`]); otherwise the root runs on this thread, and that
+/// `run` returns at the run's end. The run's tasks go on between the embedder's calls: only what a
+/// watch settles waits for the next one, an answer to a punted call or an embedder's feed.
 struct ThreadsRun {
     /// The run, until it ends and its threads have gone.
     run: Option<std::sync::Arc<ThreadRun>>,
@@ -14767,20 +14772,50 @@ struct ThreadsRun {
     root: DomainCell,
     /// Whether the root has started.
     started: bool,
+    /// The ring count the last watch's last look began at ([`CoopRun::wait`]).
+    seen: u64,
     /// What the run ended with, once its threads have gone.
     end: Option<ThreadsEnd>,
 }
 
 impl ThreadsRun {
+    /// Open a run of `entry(args)` over `dom`, `mem` and `host` ([`ThreadRun::open`]): one its
+    /// `embedder` pumps, or one whose first `run` returns at its end.
+    fn open(
+        dom: Domain,
+        entry: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        mem: Option<Mem>,
+        host: Host,
+        embedder: bool,
+    ) -> Result<ThreadsRun, Refused> {
+        let run = ThreadRun::open(dom, entry, args, fuel, mem, host, embedder)?;
+        Ok(ThreadsRun {
+            root: std::sync::Arc::clone(&run.root),
+            run: Some(run),
+            started: false,
+            seen: 0,
+            end: None,
+        })
+    }
+
     /// [`CoopRun::run`] on executor 2.
     fn run(&mut self) -> CoopEvent {
         if let Some(run) = &self.run {
             if !std::mem::replace(&mut self.started, true) {
-                run.start_root();
+                if run.watched {
+                    run.start_root();
+                } else {
+                    run.run_root_here();
+                }
             }
-            match run.watch() {
+            let (watched, seen) = run.watch();
+            self.seen = seen;
+            match watched {
                 Watched::CapPark(id) => return CoopEvent::CapPark { id },
                 Watched::Idle { timer } => return CoopEvent::Idle { timer },
+                Watched::Woken => return CoopEvent::Paused,
                 Watched::Over => {}
             }
         }
@@ -14790,6 +14825,13 @@ impl ThreadsRun {
         match &self.ended().result {
             Ok(vals) => CoopEvent::Done(vals.clone()),
             Err(t) => CoopEvent::Trapped(*t),
+        }
+    }
+
+    /// [`CoopRun::wait`] on executor 2: until the run's bell rings past where the last watch looked.
+    fn wait(&self) {
+        if let Some(run) = &self.run {
+            super::wait_for_ring(&run.bell, self.seen, None);
         }
     }
 
@@ -14816,8 +14858,8 @@ impl ThreadsRun {
     }
 }
 
-/// A run dropped before its end ends as a stopped one does ([`RunStop`]), and waits for its threads
-/// to go, so none outlives the handle.
+/// A run dropped before its end ends as a stopped one does ([`RunDoor::stop`]), and waits for its
+/// threads to go, so none outlives the handle.
 impl Drop for ThreadsRun {
     fn drop(&mut self) {
         let Some(run) = self.run.take() else {
@@ -14872,16 +14914,26 @@ impl CoopRun {
         }
     }
 
-    /// The run on executor 2 (#1414 5b): the window [`new_reserved`](Self::new_reserved) builds
-    /// (an engine-backed `2^reserved_log2` reservation, seeded with `init_mem` under `m`'s data) and
-    /// its park-request door, with each task on a thread of the host's [`ThreadPlatform`]. Nothing
-    /// runs until the first [`run`](Self::run), which starts the root on a thread of its own and
-    /// returns at the run's next event while its tasks go on: a host-answered call, as soon as it is
-    /// filed ([`CoopEvent::CapPark`], each call once, so an embedder may answer it while it pumps
-    /// on); the point where no task can run until the embedder acts ([`CoopEvent::Idle`]); or its
-    /// end. Its emitted tier is the platform's, so it surfaces no tier-up and no §22 invoke, and a
-    /// [`run_for`](Self::run_for) slice runs to the next event. `None` if `m` is outside the
-    /// engine's subset, or its host is durable: executor 2 has no freeze driver (#1694).
+    /// A run on executor 2 (#1414 5b), over the window [`new_reserved`](Self::new_reserved) builds:
+    /// an engine-backed `2^reserved_log2` reservation, over `back` if given (as for
+    /// [`compile_and_run_capture_over_parallel`]), seeded with `init_mem` under `m`'s data. It has its
+    /// park-request door, and each task runs on a thread of the host's [`ThreadPlatform`]. Nothing
+    /// runs until the first [`run`](Self::run).
+    ///
+    /// When its embedder pumps it (`pump`), that `run` starts the root on a thread of its own, and
+    /// each `run` returns at the run's next event while its tasks go on: a host-answered call, as soon
+    /// as it is filed ([`CoopEvent::CapPark`], each call once, so an embedder may answer it while it
+    /// pumps on); the point where no task can run until the embedder acts ([`CoopEvent::Idle`]); a
+    /// wake from another of the embedder's threads ([`RunDoor::wake`], [`CoopEvent::Paused`]); or its
+    /// end. After an idle, the pumping thread may [`wait`](Self::wait) for the run to change.
+    /// Otherwise the run tells of nothing, and its first `run` returns at its end, with the root on
+    /// this thread where the platform says so ([`ThreadPlatform::root_on_opener`]). A browser's Worker
+    /// runs a program that declares no host-answered call and is fed no input so.
+    ///
+    /// Its emitted tier is the platform's, so it surfaces no tier-up and no §22 invoke, and a
+    /// [`run_for`](Self::run_for) slice runs to the next event. `None` if `m` is outside the engine's
+    /// subset, or its host is durable: executor 2 has no freeze driver (#1694).
+    #[allow(clippy::too_many_arguments)] // the window-seeding seam inherently threads more inputs
     pub fn new_parallel(
         m: &Module,
         entry: FuncIdx,
@@ -14890,23 +14942,19 @@ impl CoopRun {
         host: Host,
         init_mem: &[u8],
         reserved_log2: u8,
+        back: Option<std::sync::Arc<super::Region>>,
+        pump: bool,
     ) -> Option<Result<CoopRun, Trap>> {
-        let (dom, mem) = match parallel_domain(m, entry, &host, reserved_log2, None, init_mem)? {
+        let (dom, mem) = match parallel_domain(m, entry, &host, reserved_log2, back, init_mem)? {
             Ok(start) => start,
             Err(t) => return Some(Err(t)),
         };
-        let run = match ThreadRun::open(dom, entry, args, fuel, mem, host, true) {
-            Ok(run) => run,
-            Err(refused) => return Some(Err(refused.0)),
-        };
-        Some(Ok(CoopRun {
-            exec: CoopExec::Threads(ThreadsRun {
-                root: std::sync::Arc::clone(&run.root),
-                run: Some(run),
-                started: false,
-                end: None,
-            }),
-        }))
+        match ThreadsRun::open(dom, entry, args, fuel, mem, host, pump) {
+            Ok(t) => Some(Ok(CoopRun {
+                exec: CoopExec::Threads(t),
+            })),
+            Err(refused) => Some(Err(refused.0)),
+        }
     }
 
     /// Build a run over module `m`, entering `entry(args)` with `fuel` and the granted `host` powerbox.
@@ -15272,6 +15320,17 @@ impl CoopRun {
             p.sched.slice_left = None;
         }
         ev
+    }
+
+    /// Wait for the run to change since [`run`](Self::run) last looked at it: an answer, an input or
+    /// a wake ([`RunDoor::wake`]) reaching it, a call it files, or its end. An embedder whose answers
+    /// and input come from another of its threads waits here after [`CoopEvent::Idle`], then pumps
+    /// again: a browser's Worker, whose page answers when it can (#1414 5b-2). On the pump it returns
+    /// at once: nothing runs between its pumps.
+    pub fn wait(&self) {
+        if let CoopExec::Threads(t) = &self.exec {
+            t.wait();
+        }
     }
 
     /// Pump the schedule to its next pause: [`CoopEvent::Done`]/[`CoopEvent::Trapped`] end the run,
@@ -15879,48 +15938,71 @@ struct ThreadRun {
     /// Whether the run is over ([`Threads::over`]), for emitted code to read without the lock
     /// ([`EmittedCall::over`]).
     over: std::sync::atomic::AtomicBool,
-    /// The embedder's way to stop the run from outside it ([`Host::set_run_stop`]), if it has one.
-    stop: Option<std::sync::Arc<RunStop>>,
+    /// The embedder's door into the run from outside it ([`Host::set_run_door`]), if it has one.
+    door: Option<std::sync::Arc<RunDoor>>,
 }
 
-/// A request, from outside a run on executor 2, to stop it (#1414 S5a). Asking never waits for the
-/// run: a browser asks from its page's main thread, which cannot block. The run ends as one whose
-/// fuel ran out ([`Trap::OutOfFuel`]): the embedder that gave the run its fuel takes it back. Its
-/// threads leave at their next look, a parked one woken for it, and emitted code at its next fuel
-/// check. Hand it to the run's host ([`Host::set_run_stop`]), and [`reset`](Self::reset) it before
-/// the next run.
+/// The embedder's door into a run on executor 2 from outside it (#1414 S5a, 5b-2): it can
+/// [`stop`](Self::stop) the run, or [`wake`](Self::wake) the thread that pumps it. Asking never waits
+/// for the run: a browser asks from its page's main thread, which cannot block. Hand it to the run's
+/// host ([`Host::set_run_door`]), and [`reset`](Self::reset) it before the next run.
 #[derive(Default)]
-pub struct RunStop {
-    requested: std::sync::atomic::AtomicBool,
-    /// The run it stops, while one is live. A request reaches the run under this lock, which the run
-    /// takes to let go of it ([`drive_threads`]), so the asker never holds the run last: the page's
-    /// main thread must not run its teardown.
+pub struct RunDoor {
+    stopped: std::sync::atomic::AtomicBool,
+    woken: std::sync::atomic::AtomicBool,
+    /// The run it reaches, while one is live. A request reaches the run under this lock, which the
+    /// run takes to let go of it ([`ThreadRun::finish`]), so the asker never holds the run last: the
+    /// page's main thread must not run its teardown.
     run: std::sync::Mutex<std::sync::Weak<ThreadRun>>,
 }
 
-impl RunStop {
-    /// Ask the run to stop: `true` once it has been told, or when none is live (a run that starts
-    /// later stops at once); `false` when its lock was busy, and the caller asks again.
-    pub fn request(&self) -> bool {
-        use std::sync::TryLockError;
-        self.requested
+impl RunDoor {
+    /// Ask the run to stop. It ends as one whose fuel ran out ([`Trap::OutOfFuel`]): the embedder
+    /// that gave the run its fuel takes it back. Its threads leave at their next look, a parked one
+    /// woken for it, and emitted code at its next fuel check. `true` once the run has been told, or
+    /// when none is live (a run that starts later stops at once); `false` when its lock was busy, and
+    /// the caller asks again.
+    pub fn stop(&self) -> bool {
+        self.stopped
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.reach(ThreadRun::try_stop)
+    }
+
+    /// Wake the thread that pumps the run ([`CoopRun::new_parallel`]): its `run` returns
+    /// [`CoopEvent::Paused`] at its watch's next look, while the run goes on. A browser's page leaves
+    /// its answers and input where the Worker that pumps the run takes them between pumps, then wakes
+    /// it. `true` once the watch has been rung, or when no run is live; `false` when a lock was busy,
+    /// and the caller asks again.
+    pub fn wake(&self) -> bool {
+        self.woken.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.reach(ThreadRun::try_ring)
+    }
+
+    /// Withdraw a stop and a wake, so the next run starts without either.
+    pub fn reset(&self) {
+        self.stopped
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.woken.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Ask the live run, if any, without waiting: `ask` says whether the run's lock was free.
+    fn reach(&self, ask: fn(&ThreadRun) -> bool) -> bool {
+        use std::sync::TryLockError;
         let live = match self.run.try_lock() {
             Ok(w) => w,
             Err(TryLockError::Poisoned(w)) => w.into_inner(),
             Err(TryLockError::WouldBlock) => return false,
         };
-        live.upgrade().is_none_or(|run| run.try_stop())
+        live.upgrade().is_none_or(|run| ask(&run))
     }
 
-    /// Withdraw a request, so the next run starts unstopped.
-    pub fn reset(&self) {
-        self.requested
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+    fn stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn requested(&self) -> bool {
-        self.requested.load(std::sync::atomic::Ordering::SeqCst)
+    /// Take the wake asked for since the last one was taken, if any.
+    fn take_wake(&self) -> bool {
+        self.woken.swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -16222,8 +16304,8 @@ fn drive_threads(
     mem: Option<Mem>,
     host: &mut Host,
 ) -> (Result<Vec<Value>, Trap>, Option<Mem>) {
-    let run = match ThreadRun::open(dom, entry, args, *fuel, mem, std::mem::take(host), false) {
-        Ok(run) => run,
+    let mut t = match ThreadsRun::open(dom, entry, args, *fuel, mem, std::mem::take(host), false) {
+        Ok(t) => t,
         Err(refused) => {
             let (t, back, mem) = *refused;
             *host = back;
@@ -16231,18 +16313,15 @@ fn drive_threads(
             return (Err(t), mem);
         }
     };
-    if run.watched {
-        run.start_root();
-        // Nothing pumps this run, so its watch ends only with it.
-        run.watch();
-    } else {
-        run.run_root_here();
-    }
-    let root = std::sync::Arc::clone(&run.root);
-    let end = ThreadRun::finish(run);
+    // Nothing pumps this run, so its first `run` returns at its end.
+    t.run();
     // A thread that has counted itself out may still hold the run (and the cell) for a moment.
-    *host = std::mem::take(&mut *root.lock_unpoisoned());
+    *host = std::mem::take(&mut *t.root.lock_unpoisoned());
     *fuel = host.fuel_left();
+    let end = t
+        .end
+        .take()
+        .expect("a run nothing pumps returns at its end");
     (end.result, end.mem)
 }
 
@@ -16275,7 +16354,7 @@ impl ThreadRun {
                 }
             };
         let bell = host.external_wake().unwrap_or_default();
-        let stop = host.run_stop();
+        let door = host.run_door();
         let platform = host.thread_platform();
         let watched = embedder || !platform.root_on_opener;
         // The platform's tier emits the run's own program, and each granted module a child runs
@@ -16316,12 +16395,12 @@ impl ThreadRun {
             watched,
             ended: std::sync::Condvar::new(),
             over: std::sync::atomic::AtomicBool::new(false),
-            stop,
+            door,
         });
-        if let Some(stop) = &run.stop {
-            *stop.run.lock_unpoisoned() = std::sync::Arc::downgrade(&run);
+        if let Some(door) = &run.door {
+            *door.run.lock_unpoisoned() = std::sync::Arc::downgrade(&run);
             // A stop asked for before the run was there to be told.
-            if stop.requested() {
+            if door.stopped() {
                 run.end(&mut run.state.lock_unpoisoned(), Err(Trap::OutOfFuel));
             }
         }
@@ -16345,10 +16424,10 @@ impl ThreadRun {
     /// pump's end does. Returns what the run ended with, and records the trap-origin fault address
     /// for the caller (#1720).
     fn finish(run: std::sync::Arc<ThreadRun>) -> ThreadsEnd {
-        // The run is over, so a stop has nothing left to tell it: it lets go of the run now, while
-        // this thread still holds it ([`RunStop::run`]).
-        if let Some(stop) = &run.stop {
-            *stop.run.lock_unpoisoned() = std::sync::Weak::new();
+        // The run is over, so its door has nothing left to tell it: it lets go of the run now,
+        // while this thread still holds it ([`RunDoor::run`]).
+        if let Some(door) = &run.door {
+            *door.run.lock_unpoisoned() = std::sync::Weak::new();
         }
         // Every thread leaves at its next look: wait for them all to go.
         let mut g = run.state.lock_unpoisoned();
@@ -16851,7 +16930,13 @@ impl ThreadRun {
         g.woken = g.parks.clone();
     }
 
-    /// [`RunStop::request`]'s half: end the run as stopped and wake its threads, unless its lock is
+    /// [`RunDoor::wake`]'s half: ring the run's bell, unless its lock is busy (`false`, and the
+    /// caller asks again). It never waits.
+    fn try_ring(&self) -> bool {
+        super::try_ring(&self.bell)
+    }
+
+    /// [`RunDoor::stop`]'s half: end the run as stopped and wake its threads, unless its lock is
     /// busy (`false`, and the caller asks again). It never waits. The run's watcher leaves once a
     /// woken thread does ([`ThreadExit`]).
     fn try_stop(&self) -> bool {
@@ -16986,7 +17071,7 @@ impl ThreadRun {
         if g.over.is_some() {
             return;
         }
-        if self.stop.as_ref().is_some_and(|s| s.requested()) {
+        if self.door.as_ref().is_some_and(|d| d.stopped()) {
             self.end(g, Err(Trap::OutOfFuel));
             return;
         }
@@ -17186,8 +17271,9 @@ impl ThreadRun {
     /// the next stop. The ring count is read before each settle, so a ring after it is not missed,
     /// and the bell's lock is let go before the run's is taken, so a ring from under the run's lock
     /// cannot deadlock with it. The watcher counts as one of the run's threads while it watches, so
-    /// a panic in a settle ends the run, as it does on any other.
-    fn watch(&self) -> Watched {
+    /// a panic in a settle ends the run, as it does on any other. With what it ended on comes the
+    /// ring count its last look began at ([`CoopRun::wait`]).
+    fn watch(&self) -> (Watched, u64) {
         self.state.lock_unpoisoned().live += 1;
         let _exit = ThreadExit(self);
         loop {
@@ -17204,16 +17290,17 @@ impl ThreadRun {
             };
             release(g);
             if let Some(w) = watched {
-                return w;
+                return (w, seen);
             }
             super::wait_for_ring(&self.bell, seen, None);
         }
     }
 
     /// What an embedder that pumps the run must hear now ([`Threads::embedder_pumps`]): a
-    /// host-answered call it has not heard of, the earliest first, then that no task can run until
-    /// it acts ([`Threads::stalled`]). It hears of each call once, as soon as the call is filed
-    /// (#1414 D4).
+    /// host-answered call it has not heard of, the earliest first, then a wake it asked for
+    /// ([`RunDoor::wake`]), then that no task can run until it acts ([`Threads::stalled`]). It hears
+    /// of each call once, as soon as the call is filed (#1414 D4). A wake comes before an idle, which
+    /// the embedder waits out ([`CoopRun::wait`]): the wake has rung already.
     fn event(&self, g: &mut Threads) -> Option<Watched> {
         if !g.embedder_pumps {
             return None;
@@ -17233,6 +17320,9 @@ impl ThreadRun {
             g.told.push(id);
             return Some(Watched::CapPark(id));
         }
+        if self.door.as_ref().is_some_and(|d| d.take_wake()) {
+            return Some(Watched::Woken);
+        }
         let core = &g.core;
         g.stalled.then(|| Watched::Idle {
             timer: run_deadline(&core.tasks, &core.fibers, &core.extra_envs)
@@ -17247,6 +17337,8 @@ enum Watched {
     Over,
     /// Host-answered call `id` waits for its embedder's answer ([`CoopEvent::CapPark`]).
     CapPark(u64),
+    /// The embedder woke the watch through the run's door ([`RunDoor::wake`]).
+    Woken,
     /// No task can run until the embedder acts: an answer it owes, or input it feeds
     /// ([`CoopEvent::Idle`]). `timer` is the wall time to the run's next deadline, if a wait has one.
     Idle { timer: Option<u64> },

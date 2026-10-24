@@ -129,3 +129,30 @@ fn non_blocking_stdin_returns_eof_at_end() {
         });
     }
 }
+
+/// #1414 5b-2 — an embedder ends a blocking stdin by turning blocking off: a reader parked on it
+/// wakes and reads EOF, on each executor, and the guest returns `0`. A parked reader re-admitted
+/// only once bytes arrived slept through the end, and the run idled for good.
+#[test]
+fn ending_a_blocking_stdin_wakes_its_parked_reader_with_eof() {
+    for exec in PUMPED {
+        bounded(move || {
+            let m = parse_module(READ_ONCE).expect("parse read-once guest");
+            let mut host = Host::new();
+            let vin = host.grant_stream(StreamRole::In);
+            host.set_stdin_blocking(true);
+            let mut run: CoopRun = exec.open(&m, &[Value::I32(vin)], DEFAULT_FUEL, host, 20);
+            assert!(
+                matches!(run.run(), CoopEvent::Idle { .. }),
+                "{exec:?}: the read of an empty blocking stdin parks"
+            );
+            run.host_mut().set_stdin_blocking(false);
+            match run.run() {
+                CoopEvent::Done(vals) => {
+                    assert_eq!(vals.first(), Some(&Value::I64(0)), "{exec:?}: EOF = 0")
+                }
+                _ => panic!("{exec:?}: the parked reader slept through the end of stdin"),
+            }
+        });
+    }
+}

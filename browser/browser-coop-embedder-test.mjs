@@ -15,6 +15,13 @@
 // checkpoint when `onSlice` says so, and a long one hands its output over from inside, as it runs.
 // A fault in a leaf's emitted code reports the trap its `env.trap` named (#1822), as the interpreter's.
 //
+// #1414 5b-2 — in Chromium the cases get an x2 row: the same embedder's runs on executor 2, each task
+// on a Worker of its own, under the on-ramp powerbox. The page answers each call as it is told of it
+// while the run's other tasks go on, including the thread whose answer a spinning root waits for
+// (#2531's shape), and the root's timer fires while an answer is owed (#2557). It feeds stdin later:
+// as the run idles on its reads, before its Worker opens it, and more at once than the engine's inbox
+// holds. A park answered `null` stops the run, and a fault reports its address, as on the pump.
+//
 // Usage:  node browser-coop-embedder-test.mjs [module.wasm]   (build the threads cdylib first)
 
 import { readFileSync, existsSync } from 'node:fs';
@@ -22,7 +29,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { driveCoopTierupRun, suspendsLeaves } from './web/coop-driver.js';
 import { engineImports } from './engine-imports.mjs';
-import { runCases, pong, PINGS, LONE_WAIT_MS } from './coop-embedder-cases.mjs';
+import { runCases, runX2Cases, pong, PINGS, bigFeed, LONE_WAIT_MS } from './coop-embedder-cases.mjs';
 import { startServer } from './serve.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -115,6 +122,38 @@ const check = (host, r, suspends) => {
   }
 };
 
+// The x2 row (Chromium only): the same embedder's runs on executor 2.
+const checkX2 = (r) => {
+  const ran = (name, x, want, parks) => {
+    if (x.error !== undefined || x.value !== want) {
+      fail(`chromium x2: ${name}: value ${x.value}, error ${x.error} (want ${want})`);
+    }
+    if (x.parks !== parks) fail(`chromium x2: ${name}: ${x.parks} parks (want ${parks})`);
+  };
+  ran('pings', r.pings, sum, PINGS);
+  if (r.pings.out !== le8(sum)) fail(`chromium x2: pings: stdout ${JSON.stringify(r.pings.out)}`);
+  if (r.stopAtPark.error !== 'stopped' || r.stopAtPark.parks !== 3) {
+    fail(`chromium x2: a park answered null stops the run: ${r.stopAtPark.error}, ${r.stopAtPark.parks} parks`);
+  }
+  // The root never stops spinning until the answer reaches its thread: only an answer that reaches
+  // the run while its Worker watches it ends this run.
+  ran('a thread\'s call while the root spins (#2531)', r.threadPing, pong(7n), 1);
+  ran('a timer fires while an answer is owed (#2557)', r.timerWhileOwed, 20000n + pong(7n), 1);
+  const echoed = (name, x, out) => {
+    if (x.error !== undefined || x.value !== BigInt(out.length) || x.out !== out) {
+      fail(`chromium x2: ${name}: value ${x.value}, error ${x.error}, stdout ${JSON.stringify(x.out)}`);
+    }
+  };
+  echoed('stdin fed as the run idles', r.echoLater, 'hello world\n');
+  if (r.echoLater.idles < 2) fail(`chromium x2: the fed run idled ${r.echoLater.idles} times (want 2 or more)`);
+  echoed('stdin fed before the run opens', r.echoEarly, 'early\n');
+  echoed('stdin fed past what the inbox holds', r.echoBig, bigFeed());
+  const f = r.faults;
+  if (!/MemoryFault/.test(f.error ?? '') || f.faultAddr !== 8n || f.out !== 'before\n') {
+    fail(`chromium x2: a reported trap: ${f.error}, addr ${f.faultAddr}, out ${JSON.stringify(f.out)}`);
+  }
+};
+
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
 const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
 const { exports: ex } = await WebAssembly.instantiate(mod, engineImports(memory));
@@ -138,15 +177,17 @@ if (chromium === null) {
     const errors = [];
     page.on('pageerror', (e) => errors.push(String(e)));
     await page.goto(`http://127.0.0.1:${port}/web/play.html`);
-    const { results, suspends } = await page.evaluate(async () => {
+    const { results, suspends, x2 } = await page.evaluate(async () => {
       const par = await import('./par.js');
       const { driveCoopTierupRun: drive, suspendsLeaves: suspends } = await import('./coop-driver.js');
       const cases = await import('../coop-embedder-cases.mjs');
-      const { ex, memory } = await par.loadEngine(null);
-      return { results: await cases.runCases({ ex, memory, drive, suspends }), suspends };
+      const eng = await par.loadEngine(null);
+      const results = await cases.runCases({ ex: eng.ex, memory: eng.memory, drive, suspends });
+      return { results, suspends, x2: await cases.runX2Cases({ par, eng }) };
     });
     if (!suspends) fail('chromium: no JSPI (WebAssembly.Suspending / WebAssembly.promising)');
     check('chromium', results, suspends);
+    checkX2(x2);
     if (errors.length) fail(`chromium: page errors: ${errors}`);
   } finally {
     await browser.close();
@@ -157,4 +198,5 @@ if (process.exitCode) process.exit(process.exitCode);
 console.log('ok — an embedder\'s Release run: declared caps answered through onCapPark, output through '
   + 'onOutput, slices through onSlice, stops at a park and at a slice, and a trap reported or declined'
   + `${chromium ? '; in Chromium the parking root ran as one leaf, suspended and resumed, and a leaf '
-    + 'was sliced at its own budget checkpoints' : ''}`);
+    + 'was sliced at its own budget checkpoints; and on executor 2 the page answered each call while '
+    + 'the run went on, and fed stdin as it idled' : ''}`);

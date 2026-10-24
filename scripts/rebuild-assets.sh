@@ -80,8 +80,11 @@ if want leng; then
   if bash crates/temen-run/demos/leng_selfhost/build_leng_temen.sh; then
     cp "${TEMEN_LENG_CACHE:-/tmp/temen_leng_cache}/temen-leng.temen" \
        crates/temen-run/demos/leng_selfhost/temen-leng.temen
+    # The playground's leng card serves a copy. Refresh it here, not only in the onramp step, so a
+    # leng-only rebuild cannot leave the card on an older translator.
+    cp crates/temen-run/demos/leng_selfhost/temen-leng.temen browser/web/assets/temen-leng.temen
     validate crates/temen-run/demos/leng_selfhost/temen-leng.temen \
-      && note "leng ✓ (temen-leng.temen; browser copy is refreshed by onramp)" \
+      && note "leng ✓ (temen-leng.temen and its browser copy)" \
       || note "leng ✗ (rebuilt but failed re-validate)"
   else
     note "leng SKIP/✗ (see output above — rustc + rust-src + llvm?)"

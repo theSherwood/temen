@@ -2558,6 +2558,10 @@ struct ThawResidue {
     detached: Vec<FrozenDetached>,
     /// #1361 step 4 — live detached children, each a domain with its own window and residue.
     live_detached: Vec<ThawedDetached>,
+    /// #1688 — the live twins this domain forked, each a domain of its own.
+    twins: Vec<ThawedTwin>,
+    /// #2571 — its servicer twins that exited unreaped.
+    exited_twins: Vec<FrozenTwin>,
 }
 
 impl ThawResidue {
@@ -2571,6 +2575,68 @@ impl ThawResidue {
             vcpus: std::mem::take(&mut host.frozen_vcpus),
             detached: std::mem::take(&mut host.frozen_detached),
             live_detached: std::mem::take(&mut host.thawed_detached),
+            twins: std::mem::take(&mut host.thawed_twins),
+            exited_twins: std::mem::take(&mut host.frozen_twins),
+        }
+    }
+
+    /// #1688 — every pid this residue's twins take back, at any depth: its own twins', live or
+    /// exited, and those of its twins and detached children, whose residue is still on their
+    /// restored powerboxes.
+    fn twin_pids(&self) -> BTreeSet<TaskId> {
+        fn of(host: &Host, out: &mut BTreeSet<TaskId>) {
+            out.extend(host.frozen_twins.iter().map(|t| t.pid as TaskId));
+            for t in &host.thawed_twins {
+                out.insert(t.pid as TaskId);
+                of(&t.host, out);
+            }
+            for d in &host.thawed_detached {
+                of(&d.host, out);
+            }
+        }
+        let mut out: BTreeSet<TaskId> = self.exited_twins.iter().map(|t| t.pid as TaskId).collect();
+        for t in &self.twins {
+            out.insert(t.pid as TaskId);
+            of(&t.host, &mut out);
+        }
+        for d in &self.live_detached {
+            of(&d.host, &mut out);
+        }
+        out
+    }
+}
+
+/// §13.4 slice 4d — a restored live impl awaiting its callee: its `live_impls` index, the callee's
+/// task id in the frozen run, and the offer export.
+type PendingLiveImpl = (u32, TaskId, u32);
+
+/// #1681 — what a thaw re-links its restored live impls with once it has seeded the whole tree: the
+/// detached children it re-launched, by the task id each had in the frozen run, and each domain's
+/// unlinked live impls. A live impl names its callee by task id, and a re-grant or a fork copies it
+/// into domains a long way from the callee's spawner, so no one domain's seeding can resolve its own.
+#[derive(Default)]
+struct ThawLinks {
+    /// A re-launched child's task id in the frozen run → its task id now, and its powerbox.
+    callees: BTreeMap<TaskId, (TaskId, Arc<Mutex<Host>>)>,
+    /// Each seeded domain's powerbox, with the live impls it restored unlinked.
+    holders: Vec<(Arc<Mutex<Host>>, Vec<PendingLiveImpl>)>,
+}
+
+impl ThawLinks {
+    /// Re-link each holder's live impls to the children they name, re-stamped with the children's
+    /// task ids now. One whose callee was not re-launched stays unlinked.
+    fn relink(self) {
+        let ThawLinks { callees, holders } = self;
+        for (holder, pending) in holders {
+            for (idx, task, export) in pending {
+                if let Some((now, callee)) = callees.get(&task) {
+                    // The shape first: the two powerbox locks are never held together.
+                    let shape = callee.lock_unpoisoned().offer_shape(export);
+                    holder
+                        .lock_unpoisoned()
+                        .relink_live_impl(idx, Arc::clone(callee), *now, shape);
+                }
+            }
         }
     }
 }
@@ -2608,6 +2674,8 @@ fn seed_domain(
         vcpus: thaw_vcpus,
         detached: thaw_detached,
         live_detached: thaw_live_detached,
+        twins: thaw_twins,
+        exited_twins: thaw_exited_twins,
     } = residue;
     // Only a durable window has control words at the guard base; any other run keeps its own data
     // there, and starts in no freeze phase whatever it holds (#2101).
@@ -2664,9 +2732,6 @@ fn seed_domain(
     let mut vseed: Vec<FrozenVCpu> = thaw_vcpus;
     vseed.sort_by_key(|f| f.task);
     {
-        // The re-launched detached children's host Arcs by their `(spawner task, join slot)` edge,
-        // so the root's restored `LiveImpl` handles re-link to their callees (§13.4 slice 4d).
-        let mut child_hosts_by_edge: BTreeMap<(TaskId, usize), Arc<Mutex<Host>>> = BTreeMap::new();
         for ff in vseed {
             seed_thread(
                 s,
@@ -2701,8 +2766,7 @@ fn seed_domain(
                 match spawner {
                     Some(p) => deliver_detached(s, p, fd.slot, result),
                     None => {
-                        let cid = s.next_task;
-                        s.next_task += 1;
+                        let cid = mint_task(s);
                         s.results.insert(cid, Outcome::ended(result));
                     }
                 }
@@ -2724,30 +2788,57 @@ fn seed_domain(
                 },
                 None => continue, // not re-created ⇒ its own rewound join already fails closed
             };
-            let edge = (spawner.id, td.slot);
+            let task = td.launch.task as TaskId;
             if let Some(child) = relaunch_detached(s, sched, spawner, host_shared, td) {
-                // A detached child is a callee (#1901).
-                child_hosts_by_edge.insert(edge, Arc::clone(&child.host));
+                // A detached child is a callee (#1901), named by the task it was (#1681).
+                let callee = (child.id, Arc::clone(&child.host));
+                s.thaw_links.callees.insert(task, callee);
                 s.runnable.push_back(child);
             }
         }
-        // §13.4 slice 4d: re-link the root's restored `LiveImpl` handles to their re-launched
-        // callees now that they exist — the root's rewound call then dispatches to the live callee
-        // exactly as before the freeze. A re-launched child re-links its own as the root of its
-        // window ([`relaunch_detached`] seeds it through this function).
-        let pending = host_shared.lock_unpoisoned().take_pending_live_impls();
-        for (idx, cslot, export) in pending {
-            if let Some(chost) = child_hosts_by_edge.get(&(id, cslot)) {
-                host_shared
-                    .lock_unpoisoned()
-                    .relink_live_impl(idx, Arc::clone(chost), export);
+        // #1688 — the twins this domain forked, each re-created under the pid its `fork()` returned,
+        // as a domain of its own window ([`relaunch_twin`]).
+        let mut tseed = thaw_twins;
+        tseed.sort_by_key(|t| t.pid);
+        for tt in tseed {
+            if let Some(twin) = relaunch_twin(s, sched, root, funcs, types, tt) {
+                s.runnable.push_back(twin);
             }
+        }
+        // #2571 — and the servicer twins it forked that exited unreaped, filed again under their
+        // pids for its `wait` to reap.
+        for ft in thaw_exited_twins {
+            let result = ft.outcome.map(|x| vec![Value::I64(x)]);
+            file_exited_twin(s, ft.pid as TaskId, domain_key_of(root), result);
+        }
+        // §13.4 slice 4d, #1681: this domain's restored `LiveImpl` handles wait for the whole tree,
+        // since one may name a child that any domain re-launches ([`ThawLinks`]).
+        let pending = host_shared.lock_unpoisoned().take_pending_live_impls();
+        if !pending.is_empty() {
+            s.thaw_links
+                .holders
+                .push((Arc::clone(host_shared), pending));
         }
         // Enqueue every re-created child, parents first (ascending cid).
         for (_, child) in children {
             s.runnable.push_back(child);
         }
     }
+}
+
+/// #2571 — file the servicer twin `pid` of the domain `parent`, ended with `result`, for its parent's
+/// `wait` to reap: one that exited unreaped before the freeze, or one the thaw cannot relaunch.
+fn file_exited_twin(s: &mut Sched, pid: TaskId, parent: usize, result: Result<Vec<Value>, Trap>) {
+    s.results.insert(pid, Outcome::ended(result));
+    let twin = Twin {
+        parent,
+        reaper: TwinReaper::Servicer,
+        bell: None,
+        entry: 0,
+        ctx: 0,
+        host: None,
+    };
+    s.forked_twins.insert(pid, twin);
 }
 
 /// A detached child of `spawner`'s, at its join `slot`, that the thaw delivers ended with `result`
@@ -2759,8 +2850,7 @@ fn deliver_detached(
     slot: usize,
     result: Result<Vec<Value>, Trap>,
 ) {
-    let cid = s.next_task;
-    s.next_task += 1;
+    let cid = mint_task(s);
     s.results.insert(cid, Outcome::ended(result));
     while spawner.threads.len() <= slot {
         spawner.threads.push(None);
@@ -2770,11 +2860,21 @@ fn deliver_detached(
 }
 
 /// A re-created task keeps its frozen id when still free, so the §12.6 canonical re-freeze is
-/// byte-identical; a fresh id otherwise, never a collision.
+/// byte-identical; a fresh id otherwise, never a collision — nor a pid a thawed twin takes back
+/// (#1688).
 fn claim_task(s: &mut Sched, want: usize) -> TaskId {
-    let cid = (want as TaskId).max(s.next_task);
+    let mut cid = (want as TaskId).max(s.next_task);
+    while s.reserved_pids.contains(&cid) {
+        cid += 1;
+    }
     s.next_task = cid + 1;
     cid
+}
+
+/// A fresh task id for a task the thaw creates with no frozen id to keep: never a pid a thawed twin
+/// takes back (#1688).
+fn mint_task(s: &mut Sched) -> TaskId {
+    claim_task(s, 0)
 }
 
 /// Thaw: re-create one spawned vCPU a freeze recorded ([`seed_domain`]), under the parent that spawned
@@ -2865,6 +2965,146 @@ fn seed_thread(
     children.insert(cid, child);
 }
 
+/// #1688 — re-create a fork twin a thaw carries, under `parent`, the root vCPU of the domain that
+/// forked it. Its window is its own image over its parent's window geometry, as the fork copied it
+/// ([`thaw_window`]); its powerbox is made the parent's twin again ([`Host::rejoin_twin`]); its own
+/// residue is seeded through [`seed_domain`], since it is a root of its own window; and it is filed
+/// in the run's twins under the pid its parent's `fork()` returned, with a doorbell. It runs its
+/// parent's program. `None` when it cannot be: the process's pools have no room for it, or its pages
+/// name a region its powerbox does not hold. It then ends with `ThreadFault`, which its parent's
+/// `wait` reaps as a crash.
+fn relaunch_twin(
+    s: &mut Sched,
+    sched: &Arc<Scheduler>,
+    parent: &VCpu,
+    funcs: &Arc<[Func]>,
+    types: &Arc<[temen_ir::TypeEntry]>,
+    tt: ThawedTwin,
+) -> Option<Box<VCpu>> {
+    let ThawedTwin {
+        pid,
+        window,
+        reserved_log2,
+        mut host,
+        launch,
+    } = tt;
+    let pid = pid as TaskId;
+    let residue = ThawResidue::take(&mut host, pid);
+    let (entry, ctx) = (launch.entry as FuncIdx, launch.ctx as usize);
+    let reaper = if launch.servicer {
+        TwinReaper::Servicer
+    } else {
+        TwinReaper::Personality
+    };
+    let parent_key = domain_key_of(parent);
+    let built = parent.mem.as_ref().and_then(|pm| {
+        let declared = pm.window.mapped();
+        let grown = window.page_map().grown_bytes();
+        let rejoined =
+            parent
+                .host
+                .lock_unpoisoned()
+                .rejoin_twin(&mut host, &launch.names, declared, grown);
+        let spec = WindowSpec {
+            reserved_log2,
+            mapped_log2: declared.trailing_zeros() as u8,
+            shadow: Some(pm.shadow),
+            null_guard: pm.null_guard,
+            ..WindowSpec::default()
+        };
+        let mem = rejoined
+            .then(|| thaw_window(spec, &window, &mut host, ctx))
+            .flatten();
+        let live = mem
+            .as_ref()
+            .and_then(|_| LiveVcpu::rebuild(host.own_node()));
+        match (mem, live) {
+            (Some(mem), Some(live)) => Some((mem, live)),
+            _ => {
+                if rejoined {
+                    host.release_memory();
+                }
+                None
+            }
+        }
+    });
+    let Some((mem, live)) = built else {
+        // It ends as it is born: a personality's exit hooks make its process the personality's
+        // zombie, and a servicer's twin waits in the core for its parent's `wait`.
+        for h in &host.exit_hooks {
+            h(reap_status(&Err(Trap::ThreadFault)));
+        }
+        if reaper == TwinReaper::Servicer {
+            file_exited_twin(s, pid, parent_key, Err(Trap::ThreadFault));
+        }
+        return None;
+    };
+    s.live += 1;
+    let twin_host = Arc::new(Mutex::new(host));
+    sched.wire_signal_doors(&twin_host);
+    // Its own dispatch table, with the units it had installed put back, as a thawed root's is.
+    let dt = Arc::new(DomainTable::new(
+        funcs,
+        twin_host.lock_unpoisoned().jit_table_log2(),
+    ));
+    for (slot, unit_funcs, unit_types) in twin_host.lock_unpoisoned().jit_reapply() {
+        dt.install(unit_funcs, unit_types, Some(slot));
+    }
+    // Entry args are inert under a rewind (the prologue reloads spilled values).
+    let arity = funcs.get(entry as usize).map_or(0, |f| f.params.len());
+    let args = bytecode::child_entry_args(arity, 0, 0);
+    let bell = Arc::new(AtomicBool::new(s.twins_rung));
+    let mut twin = Box::new(VCpu::new(
+        Arc::clone(funcs),
+        Arc::clone(types),
+        entry,
+        &args,
+        Some(mem),
+        Arc::clone(&twin_host),
+        parent.fuel.for_thread(),
+        parent.depth,
+        pid,
+        SchedRef::Real(Arc::clone(sched)),
+        Arc::clone(&dt),
+    ));
+    twin.durable = true;
+    (twin.vcpu_ctx, twin.durable_sp_ctx) = (ctx, ctx);
+    twin.parent_task = parent.parent_task;
+    twin.live = live;
+    twin.freeze_bell = Some(Arc::clone(&bell));
+    seed_domain(s, sched, &mut twin, funcs, types, &dt, &twin_host, residue);
+    s.forked_twins.insert(
+        pid,
+        Twin {
+            parent: parent_key,
+            reaper,
+            bell: Some(bell),
+            entry,
+            ctx,
+            host: Some(twin_host),
+        },
+    );
+    Some(twin)
+}
+
+/// #1361 step 4, #1688 — the window a thaw re-launches a domain over, a detached child's or a fork
+/// twin's: `spec`'s fresh window with the domain's restored `image` laid over it, its §13 pages
+/// aliased back onto the regions its restored powerbox holds (#2025), started with the runs its
+/// artifact gave it (#2268), its freeze word cleared and context `ctx`'s thaw word set —
+/// `begin_thaw`, on its own window. `None` when a page names a region `host` does not hold.
+fn thaw_window(spec: WindowSpec, image: &MemLayout, host: &mut Host, ctx: usize) -> Option<Mem> {
+    let mut mem = Mem::from_spec(spec);
+    mem.restore_layout(image);
+    let started = host.realias_regions(&mut mem, image.page_map()) && {
+        host.start_window(mem.window_runs());
+        mem.durable_set_state(STATE_NORMAL);
+        let thaw_off = mem.thaw_state_off(ctx);
+        mem.write_bytes(thaw_off, &STATE_REWINDING.to_le_bytes())
+            .is_some()
+    };
+    started.then_some(mem)
+}
+
 /// #1361 step 4 — re-launch a live detached child a thaw carries: rebuild its window from its own
 /// image, restore it to `REWINDING`, rebuild its powerbox bounds from the spawner-held
 /// [`DetachedLaunch`], seed its own residue through [`seed_domain`] (it is a root of its own window),
@@ -2914,28 +3154,17 @@ fn relaunch_detached(
         return None;
     };
     let lease = lease.map(|lease| (Arc::clone(&spawner.host), lease));
-    // The window: built as op 17 builds it (its NULL guard included, #1733), then the child's image
-    // and page map laid over it, its freeze word cleared and its context-0 thaw word set —
-    // `begin_thaw`, on the child's own window.
-    let mut mem = Mem::from_spec(WindowSpec {
+    // The window: built as op 17 builds it (its NULL guard included, #1733), its runs paid for by
+    // its lease.
+    let spec = WindowSpec {
         reserved_log2,
         mapped_log2: memory_log2,
         shadow,
         data: &module.data,
         null_guard: temen_ir::module_null_guard(),
         ..WindowSpec::default()
-    });
-    mem.restore_layout(&window);
-    // #2025 — and its §13 pages aliased back onto the regions its restored powerbox holds. #2268 —
-    // then the window has started, with the runs its artifact gave it, which its lease paid for.
-    let started = host.realias_regions(&mut mem, window.page_map()) && {
-        host.start_window(mem.window_runs());
-        mem.durable_set_state(STATE_NORMAL);
-        let thaw_off = mem.thaw_state_off(0);
-        mem.write_bytes(thaw_off, &STATE_REWINDING.to_le_bytes())
-            .is_some()
     };
-    if !started {
+    let Some(mem) = thaw_window(spec, &window, &mut host, 0) else {
         // #2318 — a relaunch refused once its lease is filed hands the child's window back, as its
         // end would: it never runs, and ends with `ThreadFault`.
         host.release_memory();
@@ -2944,7 +3173,7 @@ fn relaunch_detached(
         }
         deliver_detached(s, spawner, slot, Err(Trap::ThreadFault));
         return None;
-    }
+    };
     let dom = host.domain_id() as usize;
     let child_host = Arc::new(Mutex::new(host));
     sched.wire_signal_doors(&child_host);
@@ -2952,8 +3181,7 @@ fn relaunch_detached(
     // placeholders of the entry's shape, as the nested re-attach does.
     let arity = funcs.first().map_or(0, |f| f.params.len());
     let args = bytecode::child_entry_args(arity, 0, 0);
-    let cid = s.next_task;
-    s.next_task += 1;
+    let cid = mint_task(s);
     s.live += 1;
     let cdt = Arc::new(DomainTable::new(
         &funcs,
@@ -3222,6 +3450,10 @@ fn drive_over_cell(
         // REWINDING thaw); the runtime swaps it per vCPU from here (slice 3.2.1). §12.8 concurrent-thaw
         // stage 1: combine the global freeze word with the root's per-context thaw word (a thaw seeds
         // `REWINDING` into the latter).
+        // #1688 — each twin the thaw re-creates takes back the pid its parent's `fork()` returned, so
+        // no other task the seeding mints may take one, and the run's counter passes them all.
+        let pids = thaw.twin_pids();
+        s.reserved_pids = pids.clone();
         seed_domain(
             &mut s,
             &sched,
@@ -3232,6 +3464,11 @@ fn drive_over_cell(
             &host_shared,
             thaw,
         );
+        if let Some(&last) = pids.last() {
+            s.next_task = s.next_task.max(last + 1);
+        }
+        s.reserved_pids.clear();
+        std::mem::take(&mut s.thaw_links).relink();
         let (registry, arena) = (Arc::clone(&root.registry), root.arena());
         s.runnable.push_back(root);
         (id, registry, arena)
@@ -3258,8 +3495,21 @@ fn drive_over_cell(
     // in turn and its captures land on it: the artifacts nest the way the domains do. Unreached
     // records anywhere in the tree are flattened into the root's list, so one
     // [`Host::unreached_detached`] check answers for the whole tree (#1689).
+    //
+    // #1688 — and each fork twin of a domain that rides, under its pid, the same way: a twin that
+    // unwound brings its window and powerbox, and so its own twins and children. Any other, or one
+    // whose parent did not ride, is unreached: the codec refuses rather than lose a process.
     {
         let mut unreached = Vec::new();
+        let mut unreached_twins = Vec::new();
+        let mut twins = {
+            let mut s = sched.lock();
+            if s.unwound.contains(&root_id) {
+                std::mem::take(&mut s.forked_twins)
+            } else {
+                BTreeMap::new()
+            }
+        };
         let mut owners = vec![Arc::clone(&host_shared)];
         while let Some(owner) = owners.pop() {
             let pending = std::mem::take(&mut owner.lock_unpoisoned().pending_detached);
@@ -3272,16 +3522,34 @@ fn drive_over_cell(
                 // reaped before it reached its poll, keeps its window but has nothing to resume: it is
                 // unreached, never written as if it had unwound. So is one that ran to its end while
                 // its domain was held for its own paged children (#2455): it did not unwind.
-                let out = {
+                // #1688 — one rung between its last poll and its return returned: its result rides as
+                // a completed child's does. Never a trap: that may be the run's end reaping it where it
+                // parked.
+                let (unwound, withheld, out) = {
                     let mut s = sched.lock();
-                    let unwound = s.unwound.contains(&p.child_task);
-                    s.withheld
-                        .remove(&p.child_task)
-                        .map(|w| w.outcome)
-                        .or_else(|| s.results.remove(&p.child_task))
-                        .filter(|_| unwound)
+                    let withheld = s.withheld.remove(&p.child_task).map(|w| w.outcome);
+                    (
+                        s.unwound.contains(&p.child_task),
+                        withheld.is_some(),
+                        withheld.or_else(|| s.results.remove(&p.child_task)),
+                    )
                 };
-                let Some(m) = out.filter(|o| o.result.is_ok()).and_then(|o| o.mem) else {
+                let m = match out {
+                    Some(o) if unwound => o.mem.filter(|_| o.result.is_ok()),
+                    Some(o) if !withheld && o.result.is_ok() => {
+                        owner
+                            .lock_unpoisoned()
+                            .frozen_detached
+                            .push(FrozenDetached {
+                                parent_task: p.parent_task,
+                                slot: p.slot,
+                                completed_result: join_outcome(o.result),
+                            });
+                        continue;
+                    }
+                    _ => None,
+                };
+                let Some(m) = m else {
                     unreached.push(p);
                     continue;
                 };
@@ -3306,9 +3574,67 @@ fn drive_over_cell(
                     module: p.spawn.module,
                 });
             }
-            owner.lock_unpoisoned().set_captured_detached(captured);
+            let domain = owner.lock_unpoisoned().domain_id() as usize;
+            let mine: Vec<TaskId> = twins
+                .iter()
+                .filter(|(_, t)| t.parent == domain)
+                .map(|(&pid, _)| pid)
+                .collect();
+            let (mut captured_twins, mut exited_twins) = (Vec::new(), Vec::new());
+            for pid in mine {
+                let t = twins.remove(&pid).expect("listed just above");
+                let servicer = t.reaper == TwinReaper::Servicer;
+                let (unwound, out) = {
+                    let mut s = sched.lock();
+                    (s.unwound.contains(&pid), s.results.remove(&pid))
+                };
+                // A personality's twin that exited retired then ([`retire_personality_twin`]), so
+                // one still here was alive at the cut. A servicer's that exited waits for its reap,
+                // so its outcome rides (#2571), unless it ended after the freeze rang it otherwise
+                // than by returning: that end may be the run's own teardown reaping it where it
+                // parked.
+                let out = match out {
+                    Some(o) if servicer && !unwound && (o.result.is_ok() || !t.rung()) => {
+                        let outcome = join_outcome(o.result);
+                        exited_twins.push(FrozenTwin { pid, outcome });
+                        continue;
+                    }
+                    out => out,
+                };
+                // A live one unwound, or it is unreached.
+                let carried = out
+                    .filter(|o| unwound && o.result.is_ok())
+                    .and_then(|o| o.mem)
+                    .zip(t.host);
+                let Some((m, host)) = carried else {
+                    unreached_twins.push(pid);
+                    continue;
+                };
+                let names = host.lock_unpoisoned().cap_names.clone();
+                owners.push(Arc::clone(&host));
+                captured_twins.push(CapturedTwin {
+                    pid,
+                    reserved_log2: m.reserved_size().trailing_zeros() as u8,
+                    window: m.layout_snapshot(),
+                    host,
+                    launch: TwinLaunch {
+                        entry: t.entry as u32,
+                        ctx: t.ctx as u32,
+                        servicer,
+                        names,
+                    },
+                });
+            }
+            let mut h = owner.lock_unpoisoned();
+            h.set_captured_detached(captured);
+            h.captured_twins = captured_twins;
+            h.frozen_twins = exited_twins;
         }
-        host_shared.lock_unpoisoned().pending_detached = unreached;
+        // A twin whose parent did not ride is lost with it.
+        unreached_twins.extend(twins.into_keys());
+        let mut h = host_shared.lock_unpoisoned();
+        h.pending_detached = unreached;
+        h.unreached_twins = unreached_twins;
     }
     let (out, trap_origin, twin_traps) = {
         let mut s = sched.lock();
@@ -5981,11 +6307,14 @@ impl ParkSite {
             | ParkSite::Reply => FreezeRule::Reissue,
             // A faulting access is no call to re-issue, and cannot unwind until its page arrives
             // (#1940); a freeze holds its pager to serve it (#2455), so it waits, then unwinds.
-            ParkSite::Join | ParkSite::Lane | ParkSite::PageFault => FreezeRule::Phase,
-            // A `wait(-1)` needs a live fork twin (#1688). A completion is a host operation outside
-            // the cut (#1902). A durable caller never animates an offer, so never waits to enter one
-            // (#1681).
-            ParkSite::ReapAny | ParkSite::Completion | ParkSite::Admit => FreezeRule::Decline,
+            // A `wait(pid)` or `wait(-1)` waits on a servicer's twin, which the freeze rings: its
+            // unwind wakes the waiter, which abandons the wait for the thaw to re-issue (#2571).
+            ParkSite::Join | ParkSite::Lane | ParkSite::PageFault | ParkSite::ReapAny => {
+                FreezeRule::Phase
+            }
+            // A completion is a host operation outside the cut (#1902). A durable caller never
+            // animates an offer, so never waits to enter one (#1681).
+            ParkSite::Completion | ParkSite::Admit => FreezeRule::Decline,
         }
     }
 }
@@ -6273,12 +6602,51 @@ fn wake_pipe_writers_locked(s: &mut Sched, pipe: u32) -> u32 {
 }
 
 /// FORK.md §8.6 — a live fork twin's bookkeeping: the **parent domain** that forked it (`wait`
-/// scoping — only the parent may reap it). (#973 retired the per-twin process group `pgid` from the
-/// core; POSIX process groups / `waitpid(-pgid)` now live solely on the personality, which keeps its
-/// own pgid on `Proc`.)
-#[derive(Clone, Copy)]
+/// scoping — only the parent may reap it), who reaps it, and (#1688) how a freeze reaches it and a
+/// thaw re-enters it. (#973 retired the per-twin process group `pgid` from the core; POSIX process
+/// groups / `waitpid(-pgid)` now live solely on the personality, which keeps its own pgid on `Proc`.)
+#[derive(Clone)]
 struct Twin {
     parent: usize,
+    reaper: TwinReaper,
+    /// #1688 — the twin's freeze doorbell ([`VCpu::freeze_bell`]), on a twin a freeze can carry: a
+    /// durable fork, a personality's or a servicer's (#2571). A `posix_spawn` child runs an
+    /// uninstrumented command image that nothing can unwind, so it has none, and a freeze declines
+    /// while it lives ([`DeclineCause::ForkTwin`]). Nor has a servicer's twin a thaw re-files as
+    /// exited, which never runs again.
+    bell: Option<Arc<AtomicBool>>,
+    /// Where a thaw re-enters the twin: the forking vCPU's entry function and shadow context, which
+    /// the twin's copied continuation and window share.
+    entry: FuncIdx,
+    ctx: usize,
+    /// Its powerbox, which a freeze's harvest carries beside its window: the linkage that outlives
+    /// its vCPU, as a detached child's does ([`PendingDetached::host`]). `None` for a servicer's
+    /// twin a thaw re-files as exited ([`FrozenTwin`]).
+    host: Option<Arc<Mutex<Host>>>,
+}
+
+impl Twin {
+    /// Whether a freeze rang it while it lived ([`ring_twins`]), or forked it rung. Its end after that
+    /// may be the freeze's own: the run ends with every vCPU still parked reaped where it waits. A
+    /// twin that ended before the ring was never rung.
+    fn rung(&self) -> bool {
+        self.bell
+            .as_ref()
+            .is_some_and(|b| b.load(Ordering::Relaxed))
+    }
+}
+
+/// Who reaps a fork twin, which decides what the scheduler keeps once it ends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TwinReaper {
+    /// A servicer's `wait` ([`Scheduler::reap_parked_caller`]): a `clone_caller` twin's outcome
+    /// stays in `results` until it is reaped there.
+    Servicer,
+    /// The personality that forked or spawned it (`fork()`, `posix_spawn()`): its exit hook turns
+    /// the process into a zombie in the personality's own table, which the personality's `waitpid`
+    /// reaps. The scheduler retires the twin as it ends, so nothing of it outlives its exit here
+    /// (#1688: it used to linger in `results`, window and all, until the run ended).
+    Personality,
 }
 
 /// Where a finished, unjoined `thread.spawn` child's completed residue goes on a freeze (#1685).
@@ -6307,15 +6675,25 @@ struct Sched {
     /// hangs instead of the server returning and its `join` raising the outcome (INVARIANTS.md
     /// #9). See [`client_gone_locked`].
     client_gone: BTreeSet<usize>,
-    /// FORK.md §8.6 — twin `TaskId`s minted by pid-mode `clone_caller`, each mapped to its [`Twin`]
-    /// record (forking parent domain + POSIX process group). The only ids `reap` (servicer-side
-    /// `wait()`) will act on, *scoped to the parent*: a `wait(pid)` / `wait(-1)` / `wait(-pgid)` only
-    /// reaps a twin whose recorded parent is the calling domain — so one shell cannot reap another's
-    /// child even though the servicer/offer is shared. Inserted when a twin is forked, removed when
-    /// it is reaped; a `pid` not present (or present under a different parent) is `-ECHILD`.
-    /// Confinement is capability-shaped *and* parent-shaped: a domain holding the fork/wait offer can
-    /// drive `reap`, but only over its own real twins.
+    /// FORK.md §8.6 — the live processes a fork or `posix_spawn` minted, by `TaskId` (their pid), each
+    /// mapped to its [`Twin`] record. A servicer twin ([`TwinReaper::Servicer`]) is one of the only ids
+    /// `reap` (servicer-side `wait()`) will act on, *scoped to the parent*: a `wait(pid)` / `wait(-1)`
+    /// only reaps a twin whose recorded parent is the calling domain — so one shell cannot reap
+    /// another's child even though the servicer/offer is shared. Inserted when a twin is forked,
+    /// removed when it is reaped, or as it ends for a personality's twin; a `pid` not present (or
+    /// present under a different parent) is `-ECHILD`. Confinement is capability-shaped *and*
+    /// parent-shaped: a domain holding the fork/wait offer can drive `reap`, but only over its own
+    /// real twins.
     forked_twins: BTreeMap<TaskId, Twin>,
+    /// #1688 — a freeze was admitted and rang every live twin's doorbell, so a twin forked from here
+    /// on is born rung: a domain the freeze has not reached yet can still fork.
+    twins_rung: bool,
+    /// #1688 — while a thaw seeds the run, the pids its twins take back: no other task it re-creates
+    /// may take one ([`mint_task`], [`claim_task`]).
+    reserved_pids: BTreeSet<TaskId>,
+    /// #1681 — while a thaw seeds the run, what it re-links the restored live impls with once the
+    /// whole tree exists.
+    thaw_links: ThawLinks,
     /// FORK.md §8.6 — callers parked on a servicer-side `wait(-1)` / `waitpid(-pgid)` (reap **any**
     /// matching child), each tagged with its target: `None` = any of the caller's children,
     /// `Some(pgid)` = any child in that process group. Unlike `join_waiters` these are not keyed by a
@@ -7154,7 +7532,7 @@ impl Scheduler {
                 None => return None,
             }
         };
-        match self.fork_vcpu(v, reply_orig, reply_twin) {
+        match self.fork_vcpu(v, reply_orig, reply_twin, TwinReaper::Servicer) {
             Ok(twin_id) => Some(twin_id),
             Err(v) => {
                 // Fork refused: re-park the caller exactly where it was (it falls back to the
@@ -7250,6 +7628,7 @@ impl Scheduler {
         mut v: Box<VCpu>,
         reply_orig: Option<i64>,
         reply_twin: i64,
+        reaper: TwinReaper,
     ) -> Result<i64, Box<VCpu>> {
         let mut s = self.lock();
         if s.live >= self.cap || s.shutdown {
@@ -7336,10 +7715,41 @@ impl Scheduler {
         let mut twin = v.fork_twin(twin_id, twin_mem, twin_host);
         twin.live = live;
         twin.pending = Some(Pending::CapResult(reply_twin));
-        // FORK.md §8.6: mark the twin reapable so a later servicer-side `wait()` (`reap`) can
-        // deliver its exit status to the parent; removed when reaped (or swept at teardown). The
-        // recorded parent scopes the reap — only `parent_key` may `wait` on this twin.
-        s.forked_twins.insert(twin_id, Twin { parent: parent_key });
+        // #1688 — the run's freeze reaches a twin through its doorbell, as it reaches a child. The
+        // countdown an embedder armed in the parent's window, which the copy brought along, is the
+        // parent's trigger, not the twin's: disarmed, so the twin never freezes on its own.
+        if twin.durable && twin.dstate == STATE_ARMED {
+            twin.dstate = STATE_NORMAL;
+            if let Some(m) = twin.mem.as_mut() {
+                m.durable_set_state(STATE_NORMAL);
+            }
+        }
+        // #1688, #2571 — a durable twin gets a freeze doorbell, as a detached child does, rung at
+        // birth when the run's freeze has already rung the others. A thaw re-enters it at its bottom
+        // frame, which must be its program's (an `Jit.invoke` unit's frame has no thaw entry).
+        let entry = twin
+            .frames
+            .first()
+            .filter(|f| f.module == 0)
+            .map(|f| f.func);
+        let bell = entry
+            .filter(|_| twin.durable)
+            .map(|_| Arc::new(AtomicBool::new(s.twins_rung)));
+        twin.freeze_bell = bell.clone();
+        // FORK.md §8.6: mark the twin reapable so a later `wait()` can deliver its exit status to
+        // the parent; removed when reaped (or swept at teardown). The recorded parent scopes the
+        // reap — only `parent_key` may `wait` on this twin.
+        s.forked_twins.insert(
+            twin_id,
+            Twin {
+                parent: parent_key,
+                reaper,
+                bell,
+                entry: entry.unwrap_or(0),
+                ctx: twin.vcpu_ctx,
+                host: Some(Arc::clone(&twin.host)),
+            },
+        );
         s.runnable.push_back(twin);
         // Deliver the original's reply and re-admit it (the increment-2 injection, now paired).
         // Pid mode: the original sees the twin's TaskId — POSIX parent-sees-pid.
@@ -7393,7 +7803,19 @@ impl Scheduler {
                             s.live += 1;
                             self.wire_signal_doors(&child.host);
                             let parent = domain_key_of(&v);
-                            s.forked_twins.insert(pid, Twin { parent });
+                            // A command image is not instrumented: nothing can unwind it,
+                            // so it has no doorbell (#1688).
+                            s.forked_twins.insert(
+                                pid,
+                                Twin {
+                                    parent,
+                                    reaper: TwinReaper::Personality,
+                                    bell: None,
+                                    entry: 0,
+                                    ctx: 0,
+                                    host: Some(Arc::clone(&child.host)),
+                                },
+                            );
                             s.runnable.push_back(Box::new(child));
                         }
                         Err(_) => zeroed = twin.lock_unpoisoned().spawn_failed(SPAWN_EXEC_FAILED),
@@ -7439,7 +7861,13 @@ impl Scheduler {
         nohang: bool,
     ) -> ReapOutcome {
         let mut s = self.lock();
-        let Some(parent) = s.forked_twins.get(&pid).map(|t| t.parent) else {
+        // #1688 — a personality's twin is the personality's to reap, from its own table.
+        let Some(parent) = s
+            .forked_twins
+            .get(&pid)
+            .filter(|t| t.reaper == TwinReaper::Servicer)
+            .map(|t| t.parent)
+        else {
             return ReapOutcome::NoChild; // unknown/foreign pid — a genuine -ECHILD.
         };
         // Per-parent scope: the twin exists, but only its **own parent** may reap it. Peek the parked
@@ -7516,7 +7944,7 @@ impl Scheduler {
             Some(Waiter::VCpu(v)) => domain_key_of(v),
             _ => return ReapOutcome::Retry,
         };
-        let matches = |t: &Twin| t.parent == parent;
+        let matches = |t: &Twin| t.parent == parent && t.reaper == TwinReaper::Servicer;
         if !s.forked_twins.values().any(matches) {
             return ReapOutcome::NoChild; // no child of this parent — `-ECHILD`.
         }
@@ -7620,14 +8048,14 @@ pub fn reap_status(result: &Result<Vec<Value>, Trap>) -> i64 {
 /// lands in `results` (the woken caller only runs after the lock releases, by which point the result
 /// is present — the same ordering the named path uses).
 fn wake_reap_any(s: &mut Sched, id: TaskId) -> bool {
-    let Some(twin) = s.forked_twins.get(&id).copied() else {
+    let Some(parent) = s.forked_twins.get(&id).map(|t| t.parent) else {
         return false;
     };
     // The oldest parked `wait(-1)` waiter of this twin's parent.
     let pos = s
         .reap_any_waiters
         .iter()
-        .position(|w| domain_key_of(w) == twin.parent);
+        .position(|w| domain_key_of(w) == parent);
     if let Some(pos) = pos {
         let mut waiter = s.reap_any_waiters.remove(pos).expect("position just found");
         waiter.pending = Some(Pending::ReapPid { pid: id });
@@ -7651,9 +8079,11 @@ fn wake_posix_reap_any_locked(s: &mut Sched, parent: usize) -> bool {
 
 /// #1340 — the other half of [`wake_posix_reap_locked`]: whether a `waitpid` about to bench under
 /// `key` already missed what it waits for — a stop/continue mark, or (`exits`) that child's exit —
-/// and must re-admit instead. Consumes the mark.
+/// and must re-admit instead. Consumes the mark. The personality benches only on a live twin, so
+/// one no longer in `forked_twins` has exited (#1688: a personality's twin retires as it ends).
 fn reap_bench_missed(s: &mut Sched, key: TaskId, exits: Option<TaskId>) -> bool {
-    s.reap_pending.remove(&key) || exits.is_some_and(|c| s.results.contains_key(&c))
+    s.reap_pending.remove(&key)
+        || exits.is_some_and(|c| s.results.contains_key(&c) || !s.forked_twins.contains_key(&c))
 }
 
 /// Everything a blocking `waitpid` about to bench under `key` may have missed since its op ran:
@@ -7681,9 +8111,26 @@ mod reap_bench_tests {
     //! child SIGTTIN-stops (its stop-park wake finds no bencher yet), then the parent benches.
     use super::*;
 
+    /// A run whose live personality twins are `ids` — the children a bench can wait on.
+    fn live_twins(ids: &[TaskId]) -> Sched {
+        let mut s = Sched::default();
+        for &id in ids {
+            let twin = Twin {
+                parent: 0,
+                reaper: TwinReaper::Personality,
+                bell: None,
+                entry: 0,
+                ctx: 0,
+                host: None,
+            };
+            s.forked_twins.insert(id, twin);
+        }
+        s
+    }
+
     #[test]
     fn a_stop_that_beats_the_bench_readmits_it_once() {
-        let mut s = Sched::default();
+        let mut s = live_twins(&[7]);
         assert!(!wake_posix_reap_locked(&mut s, 7), "no parent benched yet");
         assert!(
             reap_bench_missed(&mut s, 7, Some(7)),
@@ -7708,7 +8155,7 @@ mod reap_bench_tests {
                 self.0.swap(false, Ordering::SeqCst)
             }
         }
-        let mut s = Sched::default();
+        let mut s = live_twins(&[7]);
         let mut h = Host::new();
         h.set_signal_source(
             Arc::new(Edge(AtomicBool::new(true))),
@@ -7720,12 +8167,25 @@ mod reap_bench_tests {
 
     #[test]
     fn a_mark_is_per_child() {
-        let mut s = Sched::default();
+        let mut s = live_twins(&[7, 8]);
         assert!(!wake_posix_reap_locked(&mut s, 7));
         assert!(
             !reap_bench_missed(&mut s, 8, Some(8)),
             "another child's stop is not ours"
         );
+        assert!(reap_bench_missed(&mut s, 7, Some(7)));
+    }
+
+    /// #1688 — a personality's twin retires as it ends, so a bench filed after its exit finds it
+    /// gone from the run's twins and re-runs its `waitpid`, which reaps the zombie.
+    #[test]
+    fn a_twin_that_exited_before_the_bench_readmits_it() {
+        let mut s = live_twins(&[7]);
+        assert!(
+            !reap_bench_missed(&mut s, 7, Some(7)),
+            "live: the bench sleeps"
+        );
+        s.forked_twins.remove(&7); // it exited
         assert!(reap_bench_missed(&mut s, 7, Some(7)));
     }
 }
@@ -7935,6 +8395,10 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     // #1816 — a fork twin's main vCPU killed here has finished as surely as one reaching `Done`:
     // its personalities and its `waitpid` benchers hear it the same way.
     twin_finished_locked(s, id, &v.host, &outcome.result);
+    // A twin a freeze rang stays for the harvest, which refuses to carry it: this may be the run's
+    // own end reaping it where it parked, and it did not die.
+    let retired =
+        !s.forked_twins.get(&id).is_some_and(Twin::rung) && retire_personality_twin(s, id);
     // #1217 — a reaped client child releases its services' parked `svc.wait` too.
     let gone = client_gone_targets(&v);
     drop(v);
@@ -7946,7 +8410,9 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     } else {
         wake_reap_any(s, id); // a `wait(-1)` caller reaps this twin if no named waiter claimed it
     }
-    s.results.insert(id, outcome);
+    if !retired {
+        s.results.insert(id, outcome);
+    }
     end_hold_member(s, id); // #2455
     s.live -= 1;
     if s.live == 0 {
@@ -8358,6 +8824,35 @@ fn reach(s: &mut Sched, domain: usize) {
     }
 }
 
+/// #1688 — a freeze was admitted: ring every live twin's doorbell, as a parent rings its detached
+/// children, and have a twin forked from here on born rung. The cut is the whole run, so each twin's
+/// parent is in it too; the harvest files each twin under its parent.
+fn ring_twins(s: &mut Sched) {
+    s.twins_rung = true;
+    // #2571 — a servicer's twin that exited waits in `results` for its reap: not rung, so the
+    // harvest knows its outcome is its own and not the freeze's.
+    let live = s
+        .forked_twins
+        .iter()
+        .filter(|(id, _)| !s.results.contains_key(id));
+    for bell in live.filter_map(|(_, t)| t.bell.as_ref()) {
+        bell.store(true, Ordering::Relaxed);
+    }
+}
+
+/// #1688 — `id` has ended: a personality's twin is its zombie now, in the personality's table, where
+/// its `waitpid` reaps it, so nothing of it stays here, its window least of all. Whether it retired.
+fn retire_personality_twin(s: &mut Sched, id: TaskId) -> bool {
+    let retire = s
+        .forked_twins
+        .get(&id)
+        .is_some_and(|t| t.reaper == TwinReaper::Personality);
+    if retire {
+        s.forked_twins.remove(&id);
+    }
+    retire
+}
+
 /// #2455 — `id` has ended (unwound, returned, trapped or been killed): the hold that waits on it, if
 /// any, no longer does, and is released once it waits on nothing.
 fn end_hold_member(s: &mut Sched, id: TaskId) {
@@ -8582,7 +9077,11 @@ fn freeze_census(
     let mut registries: Vec<(TaskId, Arc<FiberRegistry>)> = Vec::new();
     {
         let s = rs.lock();
-        if let Some(&twin) = s.forked_twins.keys().next() {
+        // #1688 — a live twin rides when its doorbell can reach it, and one that cannot ride has none
+        // ([`Twin::bell`]): a `posix_spawn`'s command image. A personality's twin that ended is gone
+        // from here ([`retire_personality_twin`]); a servicer's rides as its outcome (#2571).
+        let unbelled = |(id, t): &(&TaskId, &Twin)| t.bell.is_none() && !s.results.contains_key(id);
+        if let Some((&twin, _)) = s.forked_twins.iter().find(unbelled) {
             return declined(DeclineCause::ForkTwin, twin, None);
         }
         // #1898 — a vCPU parked where a freeze has no rule would hold it until its event came.
@@ -8701,6 +9200,7 @@ fn freeze_step<'a>(
             }
             s = sched.lock();
             if quiesced(&s) {
+                ring_twins(&mut s);
                 admit_parks_for_freeze(&mut s);
             } else {
                 s.freeze_on_quiesce = Some(root);
@@ -8960,11 +9460,14 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // A spawned vCPU that ran to a genuine finish under an `UNWINDING` window left its own
                 // region empty: it completed, it did not freeze, and re-running it on thaw would
                 // repeat its effects (#1685).
+                // The same holds for a vCPU a doorbell reaches, a detached child's or a fork twin's
+                // (#1688): rung between its last poll and its return, it returns, and its empty
+                // region says it finished. Only the run's root keeps the window's word as its answer.
                 let froze = v.durable
                     && result.is_ok()
                     && v.mem.as_ref().is_some_and(|m| {
                         m.durable_state() == STATE_UNWINDING
-                            && (v.spawn_residue.is_none()
+                            && ((v.spawn_residue.is_none() && v.freeze_bell.is_none())
                                 || m.durable_get_sp(m.shadow_region_base(v.vcpu_ctx))
                                     .is_some_and(|sp| sp > v.arena().frame_base(v.vcpu_ctx)))
                     });
@@ -9202,11 +9705,6 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         s.freeze_fault.get_or_insert(*t);
                     }
                 }
-                // #1688 — nothing records a fork twin, so a freeze that unwinds while one is
-                // unreaped would lose it: fail the freeze (the census declines it when it can).
-                if froze && !s.forked_twins.is_empty() {
-                    s.freeze_fault.get_or_insert(Trap::ThreadFault);
-                }
                 // (Never during a freeze unwind: servers are quiesced by freeze-on-quiesce, not run.)
                 if !froze {
                     for service in gone {
@@ -9254,10 +9752,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         fault: outcome.trap_fault,
                     });
                 }
-                // (The host lock is free: this very thread just dropped the vCPU.)
-                if twin_finished_locked(&mut s, id, &dying_host, &outcome.result) {
+                // (The host lock is free: this very thread just dropped the vCPU.) A twin that unwound
+                // has not exited: it rides the cut, and its parent's waits re-issue on the thaw.
+                if !froze && twin_finished_locked(&mut s, id, &dying_host, &outcome.result) {
                     sched.work.notify_all();
                 }
+                let retired = !froze && retire_personality_twin(&mut s, id);
                 // §12 domain lifetime: a member of an already-dead domain finishing *after* the
                 // teardown sweep (it was running — teardown is non-preemptive) observes the domain's
                 // end, not its own late Ok: post-teardown sibling effects are unspecified, but the
@@ -9289,7 +9789,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         lease: frozen_lease,
                     };
                     s.withheld.insert(id, w);
-                } else {
+                } else if !retired {
                     s.results.insert(id, outcome);
                 }
                 end_hold_member(&mut s, id);
@@ -9417,7 +9917,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // replies inside `fork_vcpu`; a refusal (capacity, non-bare shape, unforkable
                 // window/powerbox, dead domain) re-admits the caller with `-EAGAIN` as the
                 // call's result — a value, never a hang (the `while ((pid = fork()) < 0)` idiom).
-                if let Err(v) = sched.fork_vcpu(v, None, 0) {
+                if let Err(v) = sched.fork_vcpu(v, None, 0, TwinReaper::Personality) {
                     let mut s = sched.lock();
                     let Some(mut v) = park_gate(&mut s, v) else {
                         sched.work.notify_all();
@@ -9974,6 +10474,12 @@ impl SchedRef {
         match self {
             SchedRef::Real(s) => s.lock().results.contains_key(&id),
             SchedRef::Det(d) => d.lock().results.contains_key(&id),
+        }
+    }
+    /// #1688 — a freeze was admitted: ring the run's twins ([`ring_twins`]). The explorer cannot fork.
+    fn ring_twins(&self) {
+        if let SchedRef::Real(s) = self {
+            ring_twins(&mut s.lock());
         }
     }
     /// #2455 — a freeze reached `domain` at `me`: hold the domain if it pages live children
@@ -11178,6 +11684,61 @@ pub struct ThawedDetached {
     pub host: Host,
     /// How to launch it.
     pub launch: DetachedLaunch,
+}
+
+/// #1688 — a **fork twin** a freeze carried: its unwound window and powerbox, for the codec to freeze
+/// as its own root-shaped artifact inside its parent's, keyed by its pid (as a [`CapturedDetached`]
+/// is keyed by its join slot). It runs its parent's program, since a durable domain never execs, so
+/// the parent's artifact binds it.
+pub struct CapturedTwin {
+    /// Its pid: the `TaskId` its parent's `fork()` returned, which a thaw gives it again.
+    pub pid: u64,
+    /// Its window at the instant it finished unwinding, in the one image form ([`MemLayout`]).
+    pub window: MemLayout,
+    /// `log2` of its reservation.
+    pub reserved_log2: u8,
+    /// Its powerbox — and, recursively, its own carried twins and detached children.
+    pub host: Arc<Mutex<Host>>,
+    /// How a thaw re-enters it.
+    pub launch: TwinLaunch,
+}
+
+/// #1688 — what a thaw needs to re-enter a twin that its own artifact does not hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TwinLaunch {
+    /// The program function its continuation re-enters: the forking vCPU's entry.
+    pub entry: u32,
+    /// The shadow context it runs in: the forking vCPU's, which its copied window shares.
+    pub ctx: u32,
+    /// #2571 — a servicer's `clone_caller` forked it, so the servicer's `wait` reaps it, from the
+    /// core's records. Otherwise a personality forked it and reaps it from its own table.
+    pub servicer: bool,
+    /// The names its caps were registered under, `(name, handle)`.
+    pub names: Vec<(String, i32)>,
+}
+
+/// #2571 — a servicer's **fork twin that exited** before a freeze, its outcome waiting for its
+/// parent's `wait`. A personality's twin that exits is the personality's zombie, which its own state
+/// carries; a servicer's waits in the core, so its outcome rides its parent's artifact, and the thaw
+/// files it again for the servicer's `wait` to reap. The exited half of [`CapturedTwin`], as
+/// [`FrozenDetached`] is of [`CapturedDetached`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrozenTwin {
+    /// Its pid, which the parent's `wait` names.
+    pub pid: u64,
+    /// How it ended: its first result as an `i64` (an `i32` sign-extended), or its trap. Its
+    /// `wait` status follows from it ([`reap_status`]).
+    pub outcome: Result<i64, Trap>,
+}
+
+/// #1688 — a carried twin as a thaw receives it: its restored window and powerbox (its own residue
+/// seeded on the powerbox, as a restored root's is) and its [`TwinLaunch`].
+pub struct ThawedTwin {
+    pub pid: u64,
+    pub window: MemLayout,
+    pub reserved_log2: u8,
+    pub host: Host,
+    pub launch: TwinLaunch,
 }
 
 /// A §12 fiber as the run-shared registry holds it: a first-class suspendable computation whose
@@ -12946,7 +13507,9 @@ fn decide(
         return Decision::None;
     }
     match ev {
-        ParkEvent::ForkSelf => Decision::Fork,
+        // #1688 — nor does it fork or spawn under one: the process would be born after the cut, and
+        // the thaw re-issues the call instead.
+        ParkEvent::ForkSelf => park(Decision::Fork),
         // The pipe-park discipline exactly: rewind so the op re-executes on wake and reaps the
         // retired entry; a consumed interrupt completes `-EINTR` instead (SA_RESTART re-parks via
         // the re-executed op's re-request).
@@ -12973,10 +13536,11 @@ fn decide(
         }
         // Nothing of the caller is copied or replaced, but a spawn keeps exec's gate: a clean root
         // context, whose vCPU the drive loop re-admits with the new pid. (A durable domain may
-        // spawn, as it may fork: its freeze declines while the child lives.) A source that asked
-        // without staging has nothing to start, and its op's placeholder stands.
+        // spawn, as it may fork: its freeze declines while the child lives, since a command image
+        // cannot unwind.) A source that asked without staging has nothing to start, and its op's
+        // placeholder stands.
         ParkEvent::SpawnSelf { cmd } => match t.spawn.take() {
-            Some(plan) if clean_root => Decision::Spawn(Box::new(SpawnReq { cmd, plan })),
+            Some(plan) if clean_root => park(Decision::Spawn(Box::new(SpawnReq { cmd, plan }))),
             Some(_) => Decision::Refused(EINVAL),
             None => Decision::None,
         },
@@ -13145,10 +13709,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // The twin `pid` finished and the generic join-wake re-admitted us. Take its outcome
             // and push its **exit status** — a trapped twin becomes a crash status, never a
             // propagated trap (unlike `Join`), so a crashing command cannot crash the shell.
-            let out = v.sched.reap_twin(pid).ok_or(Trap::Malformed)?;
-            let status = reap_status(&out.result);
+            // #2571 — a twin the freeze unwound has not exited: it is not reaped, its window is left
+            // for the harvest, and the thaw re-issues the wait against the re-created twin.
             let top = v.frames.len() - 1;
-            v.frames[top].vals.push(Reg::from_i64(status));
+            if v.durable && v.sched.unwound(pid) {
+                abandon_for_freeze(&mut v.mem, v.durable_sp_ctx);
+                v.frames[top].vals.push(Reg::from_i64(0));
+            } else {
+                let out = v.sched.reap_twin(pid).ok_or(Trap::Malformed)?;
+                let status = reap_status(&out.result);
+                v.frames[top].vals.push(Reg::from_i64(status));
+            }
         }
         Some(Pending::Wait(status)) => {
             let top = v.frames.len() - 1;
@@ -13296,8 +13867,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             if let Some(d) = freeze_census(Some(&seat), sched, host) {
                 $m.durable_set_state(STATE_NORMAL);
                 host.lock_unpoisoned().freeze_declined = Some(d);
-            } else if sched.hold_for_paged(sig_domain, &seat) {
-                $m.durable_set_state(STATE_NORMAL);
+            } else {
+                sched.ring_twins();
+                if sched.hold_for_paged(sig_domain, &seat) {
+                    $m.durable_set_state(STATE_NORMAL);
+                }
             }
         }};
     }
@@ -14553,11 +15127,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     as u32;
                             let cap = resolve_thread(threads, ch).ok().and_then(|slot| {
                                 let callee = child_hosts.get(&slot).cloned()?;
+                                let task = threads[slot]?;
                                 let (names, sigs) = callee.lock_unpoisoned().offer_shape(export)?;
                                 let mut hg = host.lock_unpoisoned();
-                                // §13.4 4d: record the child's join `slot` — the live impl's
-                                // durable structural name, re-linked to the re-created child on thaw.
-                                Some(hg.wire_live_impl_child(&callee, export, &names, &sigs, slot))
+                                // §13.4 4d, #1681: record the child's task id — the live impl's
+                                // durable name, re-linked to the re-launched child on thaw.
+                                Some(hg.wire_live_impl_child(&callee, export, &names, &sigs, task))
                             });
                             frames[top]
                                 .vals
@@ -21023,12 +21598,13 @@ pub enum DurableBinding {
     /// authority over its thawed child that it held before the freeze — without this, a round trip
     /// would launder a domain's exposure away and `attest` would start lying.
     FreezeAuthority,
-    /// §13.4 slice 4d — a live-callee offer (`child_offer`) over a §14 child, named
-    /// **structurally** by the callee's join `slot` in the holder's own table + the offer
-    /// `export` (a `DomainId`/`Arc` is process-local and never rides the artifact). The thaw
-    /// re-links it to the re-created child at `slot` (its host + re-fetched offer shape).
+    /// §13.4 slice 4d, #1681 — a live-callee offer (`child_offer`) over a §14 child, minted by the
+    /// holder or re-granted or forked into it, named by the callee's **task id** in the frozen run
+    /// and the offer `export` (a `DomainId`/`Arc` is process-local and never rides the artifact).
+    /// The thaw re-links it to the child it re-launches from that task: its host, and the offer's
+    /// shape fetched again.
     LiveImpl {
-        slot: u32,
+        task: u64,
         export: u32,
     },
     /// §22 guest-JIT **domain** handle (DESIGN.md §22, DURABILITY.md §12.5 Slice 2). The domain's
@@ -21200,8 +21776,10 @@ pub enum DeclineCause {
     DetachedUnreachable,
     /// A fiber is parked where no scheduler waiter records it, so no rule applies (#1677).
     FiberParkedOnCall,
-    /// A fork twin has not been reaped: it runs in a window and powerbox of its own that no artifact
-    /// records yet, and its exit status would be lost to its parent's `wait` (#1688).
+    /// A process no freeze can carry: a `posix_spawn` started it on an uninstrumented command
+    /// image, which nothing can unwind. A fork twin rides the artifact instead, a personality's
+    /// (#1688) or a servicer's `clone_caller` (#2571), except on the bytecode tier, which carries
+    /// none and declines for any (#1904).
     ForkTwin,
     /// A vCPU is parked at a site whose [`FreezeRule`] is still `Decline` (#1898).
     Parked(ParkSite),
@@ -21620,6 +22198,20 @@ pub(crate) fn ring_on_answer(bell: &Bell) -> Arc<dyn Fn() + Send + Sync> {
             ring(&bell);
         }
     })
+}
+
+/// [`ring`] `bell`, unless its lock is busy: whether it rang. It never waits, so a thread that
+/// cannot block rings through it ([`bytecode::RunDoor::wake`]).
+pub(crate) fn try_ring(bell: &Bell) -> bool {
+    let mut rung = match bell.0.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(g)) => g.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+    };
+    *rung += 1;
+    drop(rung);
+    bell.1.notify_all();
+    true
 }
 
 /// Wait on `bell` until it rings past count `seen`, or for at most `within`: whether it rang.
@@ -22287,6 +22879,58 @@ pub struct NamedCapGrant {
     pub handler: HostProc,
     pub fork: Option<HostProcFork>,
     pub state: CapState,
+    /// #1688 — the doors of the process the capability is the personality of, for a fork twin's
+    /// entry, which the restore installs as the fork did. `None` for any other capability, and for
+    /// a run root's personality, whose embedder installs its doors itself.
+    pub process: Option<ProcessDoors>,
+}
+
+/// #1688 — what a fork factory mints for a new process beside its handler ([`ForkedProc`]), and a
+/// thaw's registrar returns for a fork twin's ([`NamedCapGrant::process`]): its signal door (at most
+/// one per powerbox, #1648), the hook that retires the process when it ends, its exec remap, and the
+/// op vtable its grant publishes (#801), which a fork copies from the parent's entry.
+#[derive(Default)]
+pub struct ProcessDoors {
+    pub signal: Option<(Arc<dyn SignalSource + Send + Sync>, Arc<AtomicBool>)>,
+    pub exit: Option<Arc<dyn Fn(i64) + Send + Sync>>,
+    pub exec_remap: Option<ExecRemapHook>,
+    pub vtable: Option<(Vec<String>, Vec<FuncType>)>,
+}
+
+/// The [`ProcessDoors`] a powerbox's capabilities bring, gathered across its entries and installed
+/// once, so a fork and a thaw install them the same way.
+#[derive(Default)]
+struct DoorSet {
+    signal: Option<(Arc<dyn SignalSource + Send + Sync>, Arc<AtomicBool>)>,
+    exit: Vec<Arc<dyn Fn(i64) + Send + Sync>>,
+    exec_remap: Vec<ExecRemapHook>,
+}
+
+impl DoorSet {
+    /// Add one entry's doors. `false` when a second entry claims the signal door (#1648): a domain
+    /// has one, so the powerbox cannot be built faithfully.
+    fn add(&mut self, doors: ProcessDoors) -> bool {
+        if let Some(door) = doors.signal {
+            if self.signal.is_some() {
+                return false;
+            }
+            self.signal = Some(door);
+        }
+        self.exit.extend(doors.exit);
+        self.exec_remap.extend(doors.exec_remap);
+        true
+    }
+
+    /// Install them on `host`: the signal door when one was claimed, and every exit hook and exec
+    /// remap after the ones it holds.
+    fn install(self, host: &mut Host) {
+        if let Some((source, armed)) = self.signal {
+            host.sig_source = Some(source);
+            host.sig_armed = armed;
+        }
+        host.exit_hooks.extend(self.exit);
+        host.exec_remap_hooks.extend(self.exec_remap);
+    }
 }
 
 /// Why a thaw could not re-grant a named host capability (#1455): the restoring embedder's registrar
@@ -22631,7 +23275,7 @@ pub fn read_slice(window: &[u8], off: u64, len: usize) -> Result<Vec<u8>, Trap> 
 /// ([`Host::into_cell`]: a JIT root that can mint the grant runs locked,
 /// `temen_run::jit_proc::locked`, and so does every JIT child and every domain of the cooperative
 /// bytecode driver). `exec_module` and every other admission see a negative handle and refuse it
-/// fail-closed through `can_regrant`, as does a spawner in no cell. Non-durable (`callee_slot: None`
+/// fail-closed through `can_regrant`, as does a spawner in no cell. Non-durable (`callee_task: None`
 /// — freeze refuses), the deferred durability story.
 pub const GRANT_SERVE_LIVE_TAG: u32 = 0x8000_0000;
 
@@ -22692,12 +23336,14 @@ struct LiveImplEntry {
     /// re-grant re-interns under the same `(names, sigs)` pair).
     names: Arc<[String]>,
     sigs: Arc<[FuncType]>,
-    /// DURABILITY.md §13.4 slice 4d — the callee's **join slot** in the minting domain (its
-    /// structural durable name: `child_hosts`/`threads` are keyed by it). `Some` for a
-    /// `child_offer` (op 14) mint over a §14 child — the only durably-capturable live impl,
-    /// since a thaw re-links it to the re-created child at this slot. `None` for a wire /
-    /// child-regrant mint (no §14 child behind it), which stays non-durable (freeze refuses).
-    callee_slot: Option<usize>,
+    /// DURABILITY.md §13.4 slice 4d, #1681 — the callee's durable name: the task id of the §14
+    /// child behind a `child_offer` (op 14) mint, as its spawner's join table holds it. A task id
+    /// is the run's, not a domain's, so it names the same callee from every powerbox the entry is
+    /// copied into: the minting domain, a child it re-grants the offer to, a fork twin. The thaw
+    /// re-links the entry to the child it re-launches under that id. `None` for an embedder wire, a
+    /// JIT mint or a self-serve grant, which have no §14 child behind them and stay non-durable
+    /// (freeze refuses), and for an entry whose callee did not ride a thaw.
+    callee_task: Option<TaskId>,
 }
 
 /// An instanced offer's **provider domain** (IMPORTS.md §3.2 v2): the persistent window (built
@@ -23669,12 +24315,12 @@ pub struct Host {
     handoff_trap: i64,
     /// §3.6 slice 3 — live-callee offer entries ([`Binding::LiveImpl`] indexes here).
     live_impls: Vec<LiveImplEntry>,
-    /// §13.4 slice 4d — restored `LiveImpl` handles awaiting **re-link** to their re-created §14
-    /// child: `(live_impls index, callee join slot, offer export)`. Populated by
-    /// [`Host::restore_durable_handles`] (the callee host doesn't exist yet at restore); drained
-    /// by the thaw's nested re-creation, which patches each entry's `callee`/`sigs` once the
-    /// child at `callee_slot` is built. Empty on any run that restored no durable live impls.
-    pending_live_impls: Vec<(u32, usize, u32)>,
+    /// §13.4 slice 4d — restored `LiveImpl` handles awaiting **re-link** to their re-launched §14
+    /// child ([`PendingLiveImpl`]). Populated by [`Host::restore_durable_handles`] (the callee host
+    /// doesn't exist yet at restore); drained
+    /// by the thaw's seeding, which patches each entry once every domain is re-launched
+    /// ([`ThawLinks`]). Empty on any run that restored no durable live impls.
+    pending_live_impls: Vec<PendingLiveImpl>,
     /// #2054 — restored stdio streams its spawner had re-granted, `(slot, role)`: re-pinned by
     /// [`Host::restore_durable_handles`] on this domain's own buffer until the relaunch aliases each
     /// to the spawner's cell ([`Host::prepare_detached_relaunch`]).
@@ -23751,9 +24397,9 @@ pub struct Host {
     /// `feed_terminal` — from another OS thread, or another wasm-thread instantiation in the
     /// browser — unblocks the pump. `None` (the default) leaves deadlock detection untouched.
     external_wake: Option<Arc<(Mutex<u64>, Condvar)>>,
-    /// #1414 S5a — the embedder's way to stop this host's run on executor 2 from outside it
-    /// ([`Host::set_run_stop`]). `None` (the default): only the run itself ends it.
-    run_stop: Option<Arc<bytecode::RunStop>>,
+    /// #1414 S5a — the embedder's door into this host's run on executor 2 from outside it
+    /// ([`Host::set_run_door`]). `None` (the default): only the run itself ends it.
+    run_door: Option<Arc<bytecode::RunDoor>>,
     /// #1414 B6 — how the parallel driver starts this run's threads and reads its clock
     /// ([`Host::set_thread_platform`]); the OS's unless an embedder hands it another.
     thread_platform: bytecode::ThreadPlatform,
@@ -23888,6 +24534,19 @@ pub struct Host {
     /// #1361 step 4 — the live detached children a **thaw** re-launches (see [`ThawedDetached`]),
     /// seeded by restore alongside the rest of the residue and taken by the run driver.
     thawed_detached: Vec<ThawedDetached>,
+    /// #1688 — this domain's fork twins a freeze carried, each a domain of its own (see
+    /// [`CapturedTwin`]), for the codec to embed under their pids.
+    captured_twins: Vec<CapturedTwin>,
+    /// #1688 — the twins a **thaw** re-creates under this domain (see [`ThawedTwin`]), seeded by
+    /// restore and taken by the run driver.
+    thawed_twins: Vec<ThawedTwin>,
+    /// #2571 — this domain's servicer twins that exited unreaped (see [`FrozenTwin`]): a freeze's
+    /// capture for the codec, or a thaw's to file again, seeded by restore and taken by the run
+    /// driver.
+    frozen_twins: Vec<FrozenTwin>,
+    /// #1688 — the pids of the live twins a freeze could not carry, across the whole tree, on the
+    /// run root's powerbox: the codec refuses the artifact rather than leave them out.
+    unreached_twins: Vec<u64>,
     /// #1671 — the last freeze this run declined, if any (see [`FreezeDeclined`]).
     freeze_declined: Option<FreezeDeclined>,
     /// #1680 — the pipes a restore rebuilt ([`Host::restore_durable_pipes`]), by their new global id,
@@ -24490,7 +25149,7 @@ impl Host {
             term_flag: Arc::new(AtomicBool::new(false)),
             park_request: Arc::new(AtomicU64::new(0)),
             external_wake: None,
-            run_stop: None,
+            run_door: None,
             thread_platform: bytecode::ThreadPlatform::OS,
             exec_replace: None,
             cap_pages: None,
@@ -24516,6 +25175,10 @@ impl Host {
             pending_detached: Vec::new(),
             captured_detached: Vec::new(),
             thawed_detached: Vec::new(),
+            captured_twins: Vec::new(),
+            thawed_twins: Vec::new(),
+            frozen_twins: Vec::new(),
+            unreached_twins: Vec::new(),
             freeze_declined: None,
             thaw_pipes: BTreeMap::new(),
             thaw_names: Vec::new(),
@@ -24591,6 +25254,67 @@ impl Host {
         (twin.runs, twin.maps, twin.domain_maps) = (runs, maps, MAPS_PER_DOMAIN);
         twin.reserved = reserved;
         Some(twin)
+    }
+
+    /// FORK.md §8.6, #1688 — what a twin shares with the domain that forked it and no artifact holds:
+    /// its program, with its interfaces and import bindings; its stdout and stderr; its budget node,
+    /// as a forked process stays in its cgroup (#1944), so its copied `Budget` handles name the
+    /// parent's nodes and both charge the same chains; and its embedder's region hook. A fork copies
+    /// it ([`Self::powerbox_copy`]), and a thaw copies it again from the thawed parent.
+    fn share_program_surface(&self, twin: &mut Host) {
+        twin.out_sink = self.out_sink.clone();
+        twin.err_sink = self.err_sink.clone();
+        twin.sinks = self.sinks.clone();
+        twin.budgets = Arc::clone(&self.budgets);
+        twin.own_budget = self.own_budget;
+        twin.iface_intern = self.iface_intern.clone();
+        twin.import_remaps = self.import_remaps.clone();
+        twin.import_reqs = self.import_reqs.clone();
+        twin.import_bindings = self.import_bindings.clone();
+        twin.set_self_module_opt(self.self_module.clone());
+        twin.region_hook = self.region_hook.clone();
+    }
+
+    /// #1688 — a thawed fork twin's powerbox, made this domain's twin again: the program surface the
+    /// fork shared ([`Self::share_program_surface`]), the names its caps were registered under, and
+    /// the charges the fork made for its window of `declared` bytes and `grown` past them
+    /// ([`Self::process_powerbox`]), which the freeze kept. Its window's bytes ride its node's charge
+    /// when the node rode the artifact; on the run's own node, which no artifact carries, they are
+    /// charged again. Its mappings and address space are charged again either way. Past any ceiling,
+    /// since the twin lived before the freeze, but never past the process's pools: `false`, with
+    /// nothing charged, when they have no room.
+    fn rejoin_twin(
+        &self,
+        twin: &mut Host,
+        names: &[(String, i32)],
+        declared: u64,
+        grown: u64,
+    ) -> bool {
+        self.share_program_surface(twin);
+        twin.set_durable(true);
+        for (name, h) in names {
+            twin.register_cap_name(name, *h);
+        }
+        let reserved = match self.reserved {
+            0 => reservation(declared, default_reserved_log2()),
+            own => own,
+        };
+        let mem = if self.own_budget == BudgetTree::RUN_NODE {
+            declared + grown
+        } else {
+            0
+        };
+        let cost = [
+            (BUDGET_MEM, mem),
+            (BUDGET_MAPS, MAPS_PER_DOMAIN),
+            (RESERVED, reserved),
+        ];
+        if !self.budgets.add(self.own_budget, &cost, Fits::Pool) {
+            return false;
+        }
+        (twin.own_window, twin.grown) = (declared, grown);
+        (twin.domain_maps, twin.reserved) = (MAPS_PER_DOMAIN, reserved);
+        true
     }
 
     /// [`Self::process_powerbox`]'s powerbox duplicate, before the window it rides with is known: a
@@ -24701,7 +25425,6 @@ impl Host {
                 }
             }
         }
-        twin.region_hook = self.region_hook.clone();
         // Live-callee offers ride along, sharing the same callee `Arc` (fork shares the offer/fd) — the
         // forking caller is always parked inside a call through one, so it holds at least this.
         twin.live_impls = self.live_impls.clone();
@@ -24718,9 +25441,7 @@ impl Host {
         // level up — the failure that took a long chase to find from the symptom — so it fails
         // closed (invariant 9) rather than picking a winner by iteration order. A `for` loop, not
         // `map`/`collect`, so the second claim can bail before minting the rest.
-        let mut twin_sig: Option<(Arc<dyn SignalSource + Send + Sync>, Arc<AtomicBool>)> = None;
-        let mut twin_exit: Vec<Arc<dyn Fn(i64) + Send + Sync>> = Vec::new();
-        let mut twin_exec_remap: Vec<ExecRemapHook> = Vec::new();
+        let mut doors = DoorSet::default();
         twin.host_procs = Vec::with_capacity(self.host_procs.len());
         for e in self.host_procs.iter() {
             let factory = e.fork.as_ref().unwrap();
@@ -24730,22 +25451,19 @@ impl Host {
                 return None;
             };
             twin.abandon_hooks.extend(forked.abandon);
-            if let Some(door) = forked.signal {
-                if twin_sig.is_some() {
-                    // Latch it: this powerbox cannot be forked faithfully, and every later attempt
-                    // now refuses before any factory runs (see [`Host::multi_door`]). The caller
-                    // sees the same probeable `-EAGAIN` every other unforkable powerbox gives.
-                    self.multi_door.store(true, Ordering::SeqCst);
-                    twin.abandon();
-                    return None;
-                }
-                twin_sig = Some(door);
-            }
-            if let Some(x) = forked.exit {
-                twin_exit.push(x);
-            }
-            if let Some(x) = forked.exec_remap {
-                twin_exec_remap.push(x);
+            let process = ProcessDoors {
+                signal: forked.signal,
+                exit: forked.exit,
+                exec_remap: forked.exec_remap,
+                vtable: None,
+            };
+            if !doors.add(process) {
+                // Latch it: this powerbox cannot be forked faithfully, and every later attempt
+                // now refuses before any factory runs (see [`Host::multi_door`]). The caller
+                // sees the same probeable `-EAGAIN` every other unforkable powerbox gives.
+                self.multi_door.store(true, Ordering::SeqCst);
+                twin.abandon();
+                return None;
             }
             twin.host_procs.push(HostProcEntry {
                 handler: forked.handler,
@@ -24765,39 +25483,19 @@ impl Host {
         // still resolve/`execve` them (the twin's copied handle table carries the `Binding::Module`
         // bindings; the entries they index must exist in the twin too).
         twin.modules = self.modules.clone();
-        // Shared stdout/stderr sinks — fork shares stdout/stderr.
-        twin.out_sink = self.out_sink.clone();
-        twin.err_sink = self.err_sink.clone();
-        twin.sinks = self.sinks.clone();
+        self.share_program_surface(&mut twin);
         // #796 L2 / #863 — the twin's async-signal source: a personality that minted a per-process
         // door above gets it installed (the twin polls its OWN pending/mask/dispositions — POSIX
         // fork copies signal state); otherwise fall back to sharing the parent's source + armed
         // flag (the pre-split behavior, right when the provider's state is fully shared).
-        match twin_sig {
-            Some((source, armed)) => {
-                twin.sig_source = Some(source);
-                twin.sig_armed = armed;
-            }
-            None => {
-                twin.sig_source = self.sig_source.clone();
-                twin.sig_armed = Arc::clone(&self.sig_armed);
-            }
+        if doors.signal.is_none() {
+            twin.sig_source = self.sig_source.clone();
+            twin.sig_armed = Arc::clone(&self.sig_armed);
         }
         // #863 hygiene — the personalities' exit hooks ride the twin's host; the scheduler fires
         // them with the twin's exit status at completion (Live → Zombie in each process table).
-        twin.exit_hooks = twin_exit;
-        twin.exec_remap_hooks = twin_exec_remap;
-        // #1944: the twin shares the budget tree, so its copied `Budget` handles name the parent's
-        // nodes and both charge the same chains, as a forked process stays in its cgroup.
-        twin.budgets = Arc::clone(&self.budgets);
-        twin.own_budget = self.own_budget;
-        // Structural intern / import binding tables ride along (same program surface).
-        twin.iface_intern = self.iface_intern.clone();
-        twin.import_remaps = self.import_remaps.clone();
-        twin.import_reqs = self.import_reqs.clone();
-        twin.import_bindings = self.import_bindings.clone();
+        doors.install(&mut twin);
         twin.cap_names = self.cap_names.clone();
-        twin.set_self_module_opt(self.self_module.clone());
         twin.self_reified = self.self_reified.clone(); // empty (self_instance is None)
         twin.attestation = self.attestation;
         twin.durable = self.durable;
@@ -25381,10 +26079,11 @@ impl Host {
 
     /// #1146 (deeper) — blocking-stdin readiness for the bytecode scheduler drivers: a task parked in a
     /// `Stream{In}` read under [`Self::set_stdin_blocking`] ([`TaskState::BlockedStdin`]) re-admits once
-    /// the stdin buffer has unconsumed bytes. The stdin twin of [`Self::pipe_read_ready`]; a root-host
-    /// resource (never per-`env`).
+    /// the stdin buffer has unconsumed bytes, or once the embedder ends stdin by turning blocking off:
+    /// the re-run read then sees EOF (#1414 5b-2). The stdin twin of [`Self::pipe_read_ready`]; a
+    /// root-host resource (never per-`env`).
     pub(crate) fn stdin_ready(&self) -> bool {
-        self.stdin_pos < self.stdin.len()
+        self.stdin_pos < self.stdin.len() || !self.stdin_block
     }
 
     /// #1080 rung 4 — pipe-write readiness (backpressure) for the bytecode cooperative driver: ready
@@ -25618,6 +26317,39 @@ impl Host {
     /// Seed the completed detached children a **thaw** must deliver, alongside the restored window.
     pub fn set_frozen_detached(&mut self, frozen: Vec<FrozenDetached>) {
         self.frozen_detached = frozen;
+    }
+
+    /// #1688 — the fork twins this domain's freeze carried (see [`CapturedTwin`]).
+    pub fn captured_twins(&self) -> &[CapturedTwin] {
+        &self.captured_twins
+    }
+
+    /// #1688 — seed the twins a **thaw** re-creates under this domain, as restore does.
+    pub fn set_thawed_twins(&mut self, thawed: Vec<ThawedTwin>) {
+        self.thawed_twins = thawed;
+    }
+
+    /// #1688 — the twins this domain's thaw re-creates (see [`Host::set_thawed_twins`]).
+    pub fn thawed_twins(&self) -> &[ThawedTwin] {
+        &self.thawed_twins
+    }
+
+    /// #2571 — the servicer twins of this domain that exited unreaped (see [`FrozenTwin`]): those a
+    /// freeze captured, or those a thaw files again.
+    pub fn frozen_twins(&self) -> &[FrozenTwin] {
+        &self.frozen_twins
+    }
+
+    /// #2571 — seed the exited servicer twins a **thaw** files again under this domain, as restore
+    /// does.
+    pub fn set_frozen_twins(&mut self, frozen: Vec<FrozenTwin>) {
+        self.frozen_twins = frozen;
+    }
+
+    /// #1688 — the pids of the live twins a freeze could not carry, across the whole tree. Non-empty
+    /// means the artifact would be missing a process: the codec refuses it.
+    pub fn unreached_twins(&self) -> &[u64] {
+        &self.unreached_twins
     }
 
     /// The durable-JIT admission fns the embedder set on this (restoring) host, copied onto `child` so
@@ -26599,19 +27331,16 @@ impl Host {
                 },
                 Binding::Offer(_) => return Err(self.non_durable(slot, NonDurableKind::Offer)),
                 Binding::LiveImpl(idx) => {
-                    // §13.4 slice 4d: a `child_offer` mint over a §14 child (a recorded join
-                    // slot) is durably capturable — named structurally so the thaw re-links it.
-                    // A wire / child-regrant mint (no §14 child behind it) stays non-durable.
-                    match self
-                        .live_impls
-                        .get(idx as usize)
-                        .and_then(|e| e.callee_slot)
-                    {
-                        Some(cslot) => DurableBinding::LiveImpl {
-                            slot: cslot as u32,
-                            export: self.live_impls[idx as usize].export,
-                        },
-                        None => return Err(self.non_durable(slot, NonDurableKind::LiveImpl)),
+                    // §13.4 slice 4d, #1681: a live impl over a §14 child, minted here or copied in,
+                    // is named by the child's task id, which the thaw re-links it by. Any other
+                    // stays non-durable.
+                    match self.live_impls.get(idx as usize) {
+                        Some(&LiveImplEntry {
+                            callee_task: Some(task),
+                            export,
+                            ..
+                        }) => DurableBinding::LiveImpl { task, export },
+                        _ => return Err(self.non_durable(slot, NonDurableKind::LiveImpl)),
                     }
                 }
                 // #1502, #1944: a Budget names its node; the nodes ride beside the handles
@@ -26735,21 +27464,21 @@ impl Host {
                 DurableBinding::AddressSpace { base, size } => Binding::AddressSpace { base, size },
                 DurableBinding::Instantiator => Binding::Instantiator,
                 DurableBinding::FreezeAuthority => Binding::FreezeAuthority,
-                DurableBinding::LiveImpl { slot, export } => {
+                DurableBinding::LiveImpl { task, export } => {
                     // §13.4 slice 4d: install a placeholder entry (its `callee`/`sigs` are
-                    // patched once the §14 child at `slot` is re-created — see
+                    // patched once the §14 child that was task `task` is re-launched — see
                     // [`Host::take_pending_live_impls`]) and record the pending re-link. The
-                    // placeholder is never dispatched to: the thaw patches it before the holder
-                    // re-enters guest code.
+                    // thaw patches it before the holder re-enters guest code. Unlinked, it names
+                    // no callee, so a later freeze refuses it.
                     let idx = self.live_impls.len() as u32;
                     self.live_impls.push(LiveImplEntry {
                         callee: Arc::new(Mutex::new(Host::new())),
                         export,
                         names: Vec::<String>::new().into(),
                         sigs: Vec::<FuncType>::new().into(),
-                        callee_slot: Some(slot as usize),
+                        callee_task: None,
                     });
-                    self.pending_live_impls.push((idx, slot as usize, export));
+                    self.pending_live_impls.push((idx, task, export));
                     Binding::LiveImpl(idx)
                 }
                 // Slice 2: re-pin the guest-JIT handle at its captured index. The domain's units are
@@ -27184,6 +27913,7 @@ impl Host {
         let mut registrar = self.named_cap_registrar.take();
         let mut out = Vec::with_capacity(caps.len());
         let mut refused = None;
+        let mut doors = DoorSet::default();
         for cap in caps {
             let grant = match cap {
                 // An index no live handle named: keep the slot so later indices line up, but install
@@ -27200,10 +27930,20 @@ impl Host {
                     }
                 },
             };
-            let (handler, fork, state) = match grant {
-                Some(g) => (Some(g.handler), g.fork, g.state),
-                None => (None, None, CapState::Stateless),
+            let (handler, fork, state, process) = match grant {
+                Some(g) => (Some(g.handler), g.fork, g.state, g.process),
+                None => (None, None, CapState::Stateless, None),
             };
+            let mut vtable = None;
+            if let Some(mut p) = process {
+                vtable = p.vtable.take().map(Arc::new);
+                // #1648 — one signal door per powerbox, as at the fork.
+                if !doors.add(p) {
+                    refused.get_or_insert_with(|| {
+                        cap.as_ref().map_or_else(String::new, |c| c.name.clone())
+                    });
+                }
+            }
             out.push(HostProcEntry {
                 handler: ProcHandler::Sync(
                     handler.unwrap_or_else(|| {
@@ -27212,7 +27952,7 @@ impl Host {
                 ),
                 fork,
                 mints: false,
-                vtable: None,
+                vtable,
                 state,
                 on_host: false,
             });
@@ -27221,6 +27961,7 @@ impl Host {
         match refused {
             Some(name) => Err(NamedCapRestoreError { name }),
             None => {
+                doors.install(self);
                 self.host_procs = out;
                 self.thaw_names = caps
                     .iter()
@@ -27388,22 +28129,29 @@ impl Host {
         Ok(())
     }
 
-    /// §13.4 slice 4d — take the restored-but-unlinked live impls (`(index, callee slot,
-    /// export)`), for the thaw to patch once the §14 children exist. Cleared on take.
-    pub fn take_pending_live_impls(&mut self) -> Vec<(u32, usize, u32)> {
+    /// §13.4 slice 4d — take the restored-but-unlinked live impls, for the thaw to patch once the
+    /// §14 children exist. Cleared on take.
+    fn take_pending_live_impls(&mut self) -> Vec<PendingLiveImpl> {
         std::mem::take(&mut self.pending_live_impls)
     }
 
-    /// §13.4 slice 4d — patch a restored live impl (index `idx`) to point at its re-created §14
-    /// child `callee`, re-fetching the offer's shape from the child's registered module (the
-    /// structural `type_id` was already reinstated at restore, so the handle keeps resolving).
-    /// A missing offer leaves the placeholder (the holder's re-issued call then faults probeably).
-    pub fn relink_live_impl(&mut self, idx: u32, callee: Arc<Mutex<Host>>, export: u32) {
-        let shape = callee.lock_unpoisoned().offer_shape(export);
+    /// §13.4 slice 4d — patch a restored live impl (index `idx`) to point at its re-launched §14
+    /// child `callee`, now task `task`, given the offer's shape the child's module answers for
+    /// `export` (the structural `type_id` was already reinstated at restore, so the handle keeps
+    /// resolving). A missing offer leaves the placeholder: the holder's re-issued call then answers
+    /// `-EAGAIN`, and a later freeze refuses it.
+    fn relink_live_impl(
+        &mut self,
+        idx: u32,
+        callee: Arc<Mutex<Host>>,
+        task: TaskId,
+        shape: Option<(Vec<String>, Vec<FuncType>)>,
+    ) {
         if let (Some(e), Some((names, sigs))) = (self.live_impls.get_mut(idx as usize), shape) {
             e.callee = callee;
             e.names = names.into();
             e.sigs = sigs.into();
+            e.callee_task = Some(task);
         }
     }
 
@@ -29074,7 +29822,7 @@ impl Host {
     /// before this table is touched — the two powerbox locks are never held together), then
     /// install the live-impl entry and grant the handle. `None` on any miss (no `self_module`,
     /// bad export, unknown interface) — the caller answers the op-14 probeable `-EINVAL`.
-    /// `callee_slot: None`: not an interp §14 join slot, so non-durable (freeze refuses, the
+    /// `callee_task: None`: not an interp §14 child, so non-durable (freeze refuses, the
     /// [`Host::wire_live_impl`] rule).
     pub fn mint_child_offer(&mut self, callee: &Arc<Mutex<Host>>, export: u32) -> Option<i32> {
         let (names, sigs) = callee.lock_unpoisoned().offer_shape(export)?;
@@ -29082,22 +29830,22 @@ impl Host {
     }
 
     /// §13.4 slice 4d — `child_offer` (op 14) mint over a §14 child: like [`Self::wire_live_impl`]
-    /// but records the callee's **join slot** so the live impl is durably capturable (a thaw
-    /// re-links it to the re-created child at this slot).
+    /// but records the callee's **task id** so the live impl is durably capturable (a thaw
+    /// re-links it to the child it re-launches under that id).
     fn wire_live_impl_child(
         &mut self,
         callee: &Arc<Mutex<Host>>,
         export: u32,
         names: &[String],
         sigs: &[FuncType],
-        callee_slot: usize,
+        callee_task: TaskId,
     ) -> i32 {
         self.install_live_impl(
             Arc::clone(callee),
             export,
             names.into(),
             sigs.into(),
-            Some(callee_slot),
+            Some(callee_task),
         )
     }
 
@@ -29110,7 +29858,7 @@ impl Host {
         export: u32,
         names: Arc<[String]>,
         sigs: Arc<[FuncType]>,
-        callee_slot: Option<usize>,
+        callee_task: Option<TaskId>,
     ) -> i32 {
         let type_id = self.intern_interface(&names, &sigs);
         let idx = self.live_impls.len() as u32;
@@ -29119,7 +29867,7 @@ impl Host {
             export,
             names,
             sigs,
-            callee_slot,
+            callee_task,
         });
         self.grant(type_id, Binding::LiveImpl(idx))
     }
@@ -30750,7 +31498,7 @@ impl Host {
     /// callee is this domain's own running cell `cell`, over its impl-export. The child's calls
     /// enqueue on this domain's inbound queue and park until its `svc.wait` serve loop replies. Only
     /// the child's table holds the entry (granter → grantee, down the grant graph), so the granter
-    /// never holds a self-referential `Arc`: no cycle, nothing for it to mis-call. `callee_slot:
+    /// never holds a self-referential `Arc`: no cycle, nothing for it to mis-call. `callee_task:
     /// None` — non-durable (freeze refuses), the deferred durability story (#1681).
     fn grant_into_child(
         &mut self,
@@ -30891,10 +31639,9 @@ impl Host {
                 Arc::clone(&e.names),
                 Arc::clone(&e.sigs),
             );
-            // The callee's join slot is the *parent's* structural name, meaningless in the
-            // child's namespace — a re-granted live impl stays non-durable (§13.4 4d follow-up:
-            // a re-grant's durable name would be the sibling's provenance path).
-            return Some(child.install_live_impl(callee, export, names, sigs, None));
+            // #1681 — the callee's task id names it from the child's powerbox too, so a re-granted
+            // live impl is as durable as the one it copies.
+            return Some(child.install_live_impl(callee, export, names, sigs, e.callee_task));
         }
         // Concurrent stages (STAGE1.md item 6): re-granting a §13 `SharedRegion` aliases the
         // SAME backing into the child's powerbox — the explicit parent↔child / sibling↔sibling
@@ -31441,14 +32188,15 @@ impl Host {
         self.thread_platform.clone()
     }
 
-    /// #1414 S5a — let `stop` end this host's run on executor 2 ([`bytecode::RunStop`]).
-    pub fn set_run_stop(&mut self, stop: Arc<bytecode::RunStop>) {
-        self.run_stop = Some(stop);
+    /// #1414 S5a — let `door` stop this host's run on executor 2, or wake the thread that pumps it
+    /// ([`bytecode::RunDoor`]).
+    pub fn set_run_door(&mut self, door: Arc<bytecode::RunDoor>) {
+        self.run_door = Some(door);
     }
 
-    /// The run's stop, if its embedder set one ([`Host::set_run_stop`]).
-    pub(crate) fn run_stop(&self) -> Option<Arc<bytecode::RunStop>> {
-        self.run_stop.clone()
+    /// The run's door, if its embedder set one ([`Host::set_run_door`]).
+    pub(crate) fn run_door(&self) -> Option<Arc<bytecode::RunDoor>> {
+        self.run_door.clone()
     }
 
     pub(crate) fn wire_park_door(&self) {
@@ -33843,13 +34591,6 @@ struct Mem {
     /// overwhelmingly common case — the per-byte path skips the address-space lock entirely and goes
     /// straight to `back`, since no page can be `Backed`. Shared with forked vCPUs.
     has_regions: Arc<AtomicBool>,
-    /// Fast-path flag: set once the address space is **ever** mutated (`map`/`unmap`/`protect`, §13
-    /// region alias, demand/supply paging) — monotonic, dirtied at the [`Mem::space_write`] choke
-    /// point. While clear — the overwhelmingly common case (no syscalls, no demand children, no regions)
-    /// — [`Mem::check_prot`] knows every in-prefix page is plain RW and skips the address-space
-    /// `RwLock` read entirely. Shared with the same topology as `space` (cloned for a forked thread,
-    /// fresh for a §14 child, which has its own address space).
-    prot_dirty: Arc<AtomicBool>,
     /// #1009 paged tier-up: a monotonic **page-map version**, bumped at the [`Mem::space_write`] choke
     /// point on every address-space mutation. A page-checked driver rebuilds its page-state table
     /// ([`build_pagestate_table`], `O(pages)`) only when this changes — between two tier-ups with no
@@ -33858,6 +34599,13 @@ struct Mem {
     /// child with its own address space). Over-counts harmlessly (a write-lock taken without a real
     /// mutation just forces one extra rebuild — never a stale table).
     map_version: Arc<AtomicU64>,
+    /// #2577 — what an access may skip the page map for, a packed [`FastRun`]: the run of readable
+    /// pages from the NULL guard, and the span of its read-only ones. An access inside it needs
+    /// neither the map nor its lock ([`Mem::in_fast_run`]). [`Mem::space_write`] empties it once it
+    /// holds the lock, and its guard republishes it before releasing the lock, so it never covers a
+    /// page while that page changes. It may admit less than the map, never more. Shares `space`'s
+    /// topology (cloned for a forked thread, fresh for a §14 child, which has its own address space).
+    fast: Arc<AtomicU64>,
     /// §14 fault-driven-yield side-channel: the confined address of the most recent **recoverable**
     /// page fault (an in-window access to an unmapped/read-only page — `check_prot` sets it,
     /// `confine_checked` clears it to [`NO_FAULT`]). A demand child's fault seam reads it
@@ -33908,6 +34656,63 @@ struct AddrSpace {
     /// frame boundary counts holders as a freeze after a run does (#2051). A page whose region is
     /// gone reads zero and drops its stores, as one naming no region always has.
     regions: BTreeMap<u32, Weak<dyn SharedBacking>>,
+}
+
+/// The address space under its write lock ([`Mem::space_write`]). Dropping it republishes the
+/// window's [`FastRun`] ([`Mem::fast`]) for the map it leaves, before the lock is released (#2577).
+struct SpaceWrite<'a> {
+    mem: &'a Mem,
+    space: std::sync::RwLockWriteGuard<'a, AddrSpace>,
+}
+
+impl std::ops::Deref for SpaceWrite<'_> {
+    type Target = AddrSpace;
+    fn deref(&self) -> &AddrSpace {
+        &self.space
+    }
+}
+
+impl std::ops::DerefMut for SpaceWrite<'_> {
+    fn deref_mut(&mut self) -> &mut AddrSpace {
+        &mut self.space
+    }
+}
+
+impl Drop for SpaceWrite<'_> {
+    fn drop(&mut self) {
+        let run = self.mem.fast_run(&self.space.prot);
+        self.mem.fast.store(run.pack(), Ordering::Release);
+    }
+}
+
+/// #2577 — the pages an access may skip a window's page map for, in page units: every page in
+/// `[null_guard, top)` admits loads from `back` (the mapped prefix and the `Rw` or `Ro` pages that
+/// continue it), and every one outside `[ro_lo, ro_hi)`, the span of its `Ro` pages, admits stores
+/// too. Packed into one word ([`Mem::fast`]), so a reader never mixes two maps' worth.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FastRun {
+    top: u64,
+    ro_lo: u64,
+    ro_hi: u64,
+}
+
+impl FastRun {
+    /// Bits per field: three fit in a word. `2^21` pages is 8 GiB of 4 KiB pages; a run is cut
+    /// there, and an access past it takes the exact path.
+    const BITS: u32 = 21;
+    const MAX: u64 = (1 << Self::BITS) - 1;
+
+    fn pack(self) -> u64 {
+        self.top | self.ro_lo << Self::BITS | self.ro_hi << (2 * Self::BITS)
+    }
+
+    fn unpack(word: u64) -> FastRun {
+        FastRun {
+            top: word & Self::MAX,
+            ro_lo: word >> Self::BITS & Self::MAX,
+            ro_hi: word >> (2 * Self::BITS) & Self::MAX,
+        }
+    }
 }
 
 /// How a fresh window starts (#1737): its geometry, the backing it sits on, and what is laid into it,
@@ -33980,13 +34785,12 @@ impl Mem {
         let reserved_log2 = reserved_log2.max(mapped_log2);
         let window = Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63));
         let page = host_page_size();
-        Mem {
+        let mem = Mem {
             back: Arc::new(Self::reserved_backing(window.reserved(), page)),
             window,
             page,
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
-            prot_dirty: Arc::new(AtomicBool::new(false)),
             map_version: Arc::new(AtomicU64::new(0)),
             last_fault: AtomicU64::new(NO_FAULT),
             refused_at: AtomicU64::new(NO_FAULT),
@@ -33994,7 +34798,10 @@ impl Mem {
             writes: 0,
             null_guard: 0,
             shadow: shadow.unwrap_or(ShadowArena::EMPTY),
-        }
+            fast: Arc::new(AtomicU64::new(0)),
+        };
+        mem.refresh_fast();
+        mem
     }
 
     /// #1145 — the largest reservation [`Mem::with_reservation`] will eagerly allocate a **flat
@@ -34054,13 +34861,12 @@ impl Mem {
         let reserved_log2 = reserved_log2.max(mapped_log2);
         let window = Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63));
         let page = host_page_size();
-        Mem {
+        let mem = Mem {
             back,
             window,
             page,
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
-            prot_dirty: Arc::new(AtomicBool::new(false)),
             map_version: Arc::new(AtomicU64::new(0)),
             last_fault: AtomicU64::new(NO_FAULT),
             refused_at: AtomicU64::new(NO_FAULT),
@@ -34068,7 +34874,10 @@ impl Mem {
             writes: 0,
             null_guard: 0,
             shadow: shadow.unwrap_or(ShadowArena::EMPTY),
-        }
+            fast: Arc::new(AtomicU64::new(0)),
+        };
+        mem.refresh_fast();
+        mem
     }
 
     /// Read/write the shared address space, recovering from a poisoned lock (the interpreter never
@@ -34076,17 +34885,73 @@ impl Mem {
     fn space_read(&self) -> std::sync::RwLockReadGuard<'_, AddrSpace> {
         self.space.read_unpoisoned()
     }
-    fn space_write(&self) -> std::sync::RwLockWriteGuard<'_, AddrSpace> {
-        // Any address-space mutation (the only reason to take the write lock) disables the lock-free
-        // `check_prot` fast path, monotonically. Set *before* acquiring the lock so a concurrent
-        // reader never observes a clear flag after a mutation has begun (a false positive just makes
-        // it take the read lock — always safe; a false negative would not be).
-        self.prot_dirty.store(true, Ordering::Release);
+    fn space_write(&self) -> SpaceWrite<'_> {
         // #1009: bump the page-map version — a paged tier-up driver reuses its page-state table
         // across events while this is unchanged (see the field). Bumped once per write-lock take
-        // (per `map`/`unmap`/`protect` op), before the mutation, same discipline as `prot_dirty`.
+        // (per `map`/`unmap`/`protect` op), before the mutation and the lock, so a concurrent reader
+        // never sees the old version once a mutation has begun.
         self.map_version.fetch_add(1, Ordering::Release);
-        self.space.write_unpoisoned()
+        let space = self.space.write_unpoisoned();
+        // #2577: no access takes the lock-free path while the map changes. The guard republishes
+        // the run when it drops.
+        self.fast.store(0, Ordering::Release);
+        SpaceWrite { mem: self, space }
+    }
+
+    /// #2577 — the [`FastRun`] `prot` leaves: from the NULL guard, the mapped prefix and the `Rw` or
+    /// `Ro` pages that continue it, up to the first unmapped or aliased page, the first hole and the
+    /// backing's end, with the span of the `Ro` pages among them.
+    fn fast_run(&self, prot: &BTreeMap<u64, PageProt>) -> FastRun {
+        let mut top = self.window.mapped().div_ceil(self.page);
+        let mut ro: Option<(u64, u64)> = None;
+        for (&page, state) in prot.range(self.null_guard / self.page..) {
+            match state {
+                PageProt::Rw | PageProt::Ro if page <= top => {
+                    if page == top {
+                        top += 1;
+                    }
+                    if matches!(state, PageProt::Ro) {
+                        let (lo, hi) = ro.unwrap_or((page, page));
+                        ro = Some((lo.min(page), hi.max(page + 1)));
+                    }
+                }
+                _ => {
+                    top = top.min(page); // an unmapped or aliased page, or a hole
+                    break;
+                }
+            }
+        }
+        let top = top.min(self.win_flat_len() / self.page).min(FastRun::MAX);
+        let (ro_lo, ro_hi) = ro.map_or((top, top), |(lo, hi)| (lo.min(top), hi.min(top)));
+        FastRun { top, ro_lo, ro_hi }
+    }
+
+    /// Republish [`fast`](Mem::fast) after a change the page map does not record: a new window, its
+    /// mapped prefix or backing grew, or its NULL guard was set.
+    fn refresh_fast(&self) {
+        let space = self.space_read();
+        self.fast
+            .store(self.fast_run(&space.prot).pack(), Ordering::Release);
+    }
+
+    /// Whether the bytes `[base, last]` lie in the window's [`FastRun`] (#2577), so a load of them,
+    /// or a store when `write`, needs no page-state lookup.
+    #[inline]
+    fn in_fast_run(&self, base: u64, last: u64, write: bool) -> bool {
+        let run = FastRun::unpack(self.fast.load(Ordering::Acquire));
+        base >= self.null_guard
+            && last < run.top * self.page
+            && (!write || last < run.ro_lo * self.page || base >= run.ro_hi * self.page)
+    }
+
+    /// `addr + offset` when the whole `width`-byte access lies in the window's [`FastRun`]: it needs
+    /// neither the page map nor [`confine_checked`](Mem::confine_checked)'s `last_fault` reset. The
+    /// reserved bound is temen-mask's, as there.
+    #[inline]
+    fn fast_access(&self, addr: u64, offset: u64, width: u32, write: bool) -> Option<u64> {
+        let abs = self.window.checked_reserved(addr, offset, width)?;
+        self.in_fast_run(abs, abs + width as u64 - 1, write)
+            .then_some(abs)
     }
 
     /// #1009 paged tier-up: the current page-map version (see the [`map_version`](Mem::map_version)
@@ -34123,8 +34988,8 @@ impl Mem {
             back: Arc::clone(&self.back),
             space: Arc::clone(&self.space),
             has_regions: Arc::clone(&self.has_regions),
-            prot_dirty: Arc::clone(&self.prot_dirty),
             map_version: Arc::clone(&self.map_version),
+            fast: Arc::clone(&self.fast),
             last_fault: AtomicU64::new(NO_FAULT),
             refused_at: AtomicU64::new(NO_FAULT),
             fault_report: AtomicU64::new(NO_FAULT),
@@ -34149,34 +35014,31 @@ impl Mem {
         // original all-`Rw` restriction refused every personality-linked fork). An entry beyond
         // the mapped prefix stays fail-closed: its bytes are outside `window_snapshot`.
         let mapped_pages = self.window.mapped() / self.page;
+        if self.has_regions.load(Ordering::Relaxed) {
+            return None;
+        }
+        let space = self.space_read();
+        let ok = space.regions.is_empty()
+            && space
+                .prot
+                .iter()
+                .all(|(_, p)| !matches!(p, PageProt::Backed { .. }));
+        if !ok {
+            return None;
+        }
         // #802 slice 4 — pages the guest `vm_map`-committed in the **reserved tail** (the on-ramp
         // waist malloc grows its heap there, so every malloc-using on-ramp program has them) are
         // per-domain memory a POSIX fork must duplicate: collected here for the page-wise copy
         // below. Plain `Rw`/`Ro` only; `Backed` still fails the whole fork closed (shared §13
         // bytes), and an `Unmapped` tail entry carries no bytes.
-        let mut tail_pages: Vec<u64> = Vec::new();
-        let prot_copy: BTreeMap<u64, PageProt> = if self.has_regions.load(Ordering::Relaxed) {
-            return None;
-        } else if !self.prot_dirty.load(Ordering::Acquire) {
-            BTreeMap::new() // never mutated ⇒ plain Rw throughout, nothing to clone
-        } else {
-            let space = self.space_read();
-            let ok = space.regions.is_empty()
-                && space
-                    .prot
-                    .iter()
-                    .all(|(_, p)| !matches!(p, PageProt::Backed { .. }));
-            if !ok {
-                return None;
-            }
-            tail_pages = space
-                .prot
-                .iter()
-                .filter(|(&pg, p)| pg >= mapped_pages && matches!(p, PageProt::Rw | PageProt::Ro))
-                .map(|(&pg, _)| pg)
-                .collect();
-            space.prot.clone()
-        };
+        let tail_pages: Vec<u64> = space
+            .prot
+            .iter()
+            .filter(|(&pg, p)| pg >= mapped_pages && matches!(p, PageProt::Rw | PageProt::Ro))
+            .map(|(&pg, _)| pg)
+            .collect();
+        let prot_copy = space.prot.clone();
+        drop(space);
         let reserved = self.window.reserved();
         let mapped = self.window.mapped();
         if reserved == 0 || !reserved.is_power_of_two() || !mapped.is_power_of_two() {
@@ -34213,6 +35075,7 @@ impl Mem {
         // #964: the twin runs the same module — its NULL guard (already in `prot_copy` as pages,
         // and enforced by `prot_pages`' refusal via this field) carries over.
         twin.null_guard = self.null_guard;
+        twin.refresh_fast();
         Some(twin)
     }
 
@@ -34271,20 +35134,15 @@ impl Mem {
 
     /// Enforce the page state for a `width`-byte access at confined offset `base`: any access to an
     /// unmapped page, or a store to a read-only page, faults (§4/§5). Fast-pathed when the access
-    /// lies wholly in the committed prefix and no page has been re-protected (the common case), so
-    /// unprotected windows pay nothing.
+    /// lies wholly in the window's [`FastRun`] (the common case), so it reads no page map.
     fn check_prot(&self, base: u64, width: u32, write: bool) -> Result<(), Trap> {
         let last = base + width as u64 - 1;
-        // Lock-free fast path: the address space has never been mutated, so every page is in its
-        // region default — RW inside `[0, mapped)`. An in-prefix access is unconditionally fine and
-        // skips the `RwLock` read entirely (the hot, overwhelmingly common case).
-        if !self.prot_dirty.load(Ordering::Acquire) && last < self.window.mapped() {
+        // Lock-free fast path (#2577): the access lies in the window's [`FastRun`], so every page it
+        // touches admits it and the `RwLock` read is skipped (the hot, overwhelmingly common case).
+        if self.in_fast_run(base, last, write) {
             return Ok(());
         }
         let space = self.space_read();
-        if space.prot.is_empty() && last < self.window.mapped() {
-            return Ok(());
-        }
         for page in (base / self.page)..=(last / self.page) {
             match self.page_access(&space.prot, page) {
                 None => return Err(self.refused(base, page)), // unmapped
@@ -34336,11 +35194,6 @@ impl Mem {
     /// The admitted byte set as one bound `[0, H)`, whatever the backing holds
     /// ([`scalar_extent`](Mem::scalar_extent)'s shape test).
     fn admitted_prefix(&self) -> Option<u64> {
-        // Lock-free fast path: the address space has never been mutated, so the admitted set is
-        // the region default — exactly the mapped prefix.
-        if !self.prot_dirty.load(Ordering::Acquire) {
-            return Some(self.window.mapped());
-        }
         let space = self.space_read();
         let mut high = self.window.mapped();
         // BTreeMap iteration is ascending, so a contiguous grown tail is consumed page-by-page at
@@ -34401,6 +35254,7 @@ impl Mem {
         }
         if high > self.window.mapped() {
             self.window = Window::with_mapped(reserved.trailing_zeros() as u8, high);
+            self.refresh_fast();
         }
         if entries.is_empty() {
             return;
@@ -34418,8 +35272,6 @@ impl Mem {
             };
             space.prot.insert(off / self.page, prot);
         }
-        drop(space);
-        self.prot_dirty.store(true, Ordering::Release);
     }
 
     /// The module-declared shadow arena ([`ShadowArena::EMPTY`] when it declared none).
@@ -34474,8 +35326,6 @@ impl Mem {
         for p in 0..guard.div_ceil(self.page) {
             space.prot.insert(p, PageProt::Unmapped);
         }
-        drop(space);
-        self.prot_dirty.store(true, Ordering::Release);
     }
 
     /// Record a pending recoverable page fault of the access starting at `base`, refused at `at`, and
@@ -34735,13 +35585,10 @@ impl Mem {
     /// [`Self::check_prot`]. `len >= 1` (see [`Self::confine_span`]).
     fn check_prot_span(&self, base: u64, len: u64, write: bool) -> Result<(), Trap> {
         let last = base + (len - 1);
-        if !self.prot_dirty.load(Ordering::Acquire) && last < self.window.mapped() {
+        if self.in_fast_run(base, last, write) {
             return Ok(());
         }
         let space = self.space_read();
-        if space.prot.is_empty() && last < self.window.mapped() {
-            return Ok(());
-        }
         for page in (base / self.page)..=(last / self.page) {
             match self.page_access(&space.prot, page) {
                 None => return Err(self.refused(base, page)), // unmapped
@@ -34852,29 +35699,25 @@ impl Mem {
         Ok(())
     }
 
-    /// Bytecode-engine scalar load (Phase 2): the slot-returning fast path. When no protection has
-    /// ever been mutated (`!prot_dirty` — the common case: no syscalls / demand paging / §13 regions, so
-    /// every prefix page is plain committed RW and `!prot_dirty ⟹ !has_regions`) and the access lies
-    /// wholly in the backed prefix ([`Window::checked`]), read straight through — skipping the per-op
-    /// `last_fault` atomic store in `confine_checked` and the `check_prot` page scan. **Semantically
-    /// identical** to the cold [`Mem::load`] for this case (the escape-oracle byte-compares it); any
-    /// other case (RO/unmapped/reserved-tail/regions, or a recoverable demand fault) falls to the cold
-    /// path, which keeps the exact trap + `last_fault` semantics. Returns the [`Reg`] slot directly,
-    /// dropping the `Value` round-trip the bytecode engine paid via `Reg::from_value(load(..))`.
+    /// Bytecode-engine scalar load (Phase 2): the slot-returning fast path. When the access lies
+    /// wholly in the window's [`FastRun`] ([`Mem::fast_access`], #2577), read straight through — skipping the per-op `last_fault` atomic store in `confine_checked` and the
+    /// `check_prot` page scan. **Semantically identical** to the cold [`Mem::load`] for this case (the
+    /// escape-oracle byte-compares it); any other case (RO/unmapped/past the run/regions, or a
+    /// recoverable demand fault) falls to the cold path, which keeps the exact trap + `last_fault`
+    /// semantics. Returns the [`Reg`] slot directly, dropping the `Value` round-trip the bytecode
+    /// engine paid via `Reg::from_value(load(..))`.
     #[inline]
     fn load_scalar(&self, addr: u64, offset: u64, op: LoadOp) -> Result<Reg, Trap> {
         let (_, rty, width, signed) = op.info();
-        if !self.prot_dirty.load(Ordering::Acquire) {
-            if let Some(abs) = self.window.checked(addr, offset, width) {
-                // `!prot_dirty ⟹ !has_regions`, so the bytes live in `back` (no §13 redirect); the
-                // cooperative bytecode engine is the sole accessor, so a single non-atomic word read
-                // is sound (and one instruction, not `width` atomic byte loads).
-                let raw = self.back.read_word(abs, width);
-                return Ok(Reg::from_value(decode_loaded(rty, width, signed, raw)));
-            }
+        if let Some(abs) = self.fast_access(addr, offset, width, false) {
+            // The run holds no `Backed` page, so the bytes live in `back` (no §13 redirect); the
+            // cooperative bytecode engine is the sole accessor, so a single non-atomic word read is
+            // sound (and one instruction, not `width` atomic byte loads).
+            let raw = self.back.read_word(abs, width);
+            return Ok(Reg::from_value(decode_loaded(rty, width, signed, raw)));
         }
-        // Cold path — prot has been mutated (every rodata card sets `prot_dirty` once at init) or the
-        // access reaches the reserved tail. Run the *exact* confine + protection check the oracle
+        // Cold path — the access leaves the [`FastRun`] (an unmapped or aliased page, the NULL
+        // guard, the reserved tail). Run the *exact* confine + protection check the oracle
         // [`Mem::load`] does (identical trap / `last_fault` / demand-fault semantics), but when `back`
         // is contiguous (no §13 region redirect) still finish with **one** wide non-atomic read rather
         // than `load`'s per-byte atomic `read_le` — the same cooperative sole-accessor contract as the
@@ -34896,12 +35739,10 @@ impl Mem {
     #[inline]
     fn store_scalar(&mut self, addr: u64, offset: u64, op: StoreOp, lo: u64) -> Result<(), Trap> {
         let (_, _, width) = op.info();
-        if !self.prot_dirty.load(Ordering::Acquire) {
-            if let Some(abs) = self.window.checked(addr, offset, width) {
-                self.back.write_word(abs, width, lo);
-                self.writes += 1;
-                return Ok(());
-            }
+        if let Some(abs) = self.fast_access(addr, offset, width, true) {
+            self.back.write_word(abs, width, lo);
+            self.writes += 1;
+            return Ok(());
         }
         // Cold path, same reasoning as [`Mem::load_scalar`]: the exact confine + protection check the
         // oracle [`Mem::store`] does, then one wide non-atomic write when `back` is contiguous.
@@ -35597,9 +36438,6 @@ impl Mem {
         if self.has_regions.load(Ordering::Relaxed) {
             return false;
         }
-        if !self.prot_dirty.load(Ordering::Acquire) {
-            return true; // never mutated ⇒ the prefix is plain Rw throughout
-        }
         let mapped_pages = self.window.mapped() / self.page;
         // The #1094 NULL guard marks pages `[0, null_guard)` `Unmapped` and dirties the prot map, but
         // it is a *deterministic* overlay re-seeded on every fresh window (`seed_null_guard`): a
@@ -35769,54 +36607,48 @@ impl Mem {
     /// ([`Host::realias_regions`]).
     fn restore_layout(&mut self, layout: &MemLayout) {
         let first = (layout.bytes.len() as u64).div_ceil(self.page);
-        // Install the captured map first, *replacing* whatever this window carries. The guard is only
-        // the fast-path one: a window with no explicit protections restoring an image that has none
-        // stays off `prot_dirty` (the lock-free `check_prot` path). Whenever either side has entries
-        // the map is assigned outright — restoring into a **live** window (a reactor rewinding to an
-        // earlier moment) must drop the pages the guest has `map`-grown since, or they would survive
-        // as addressable memory the moment never had. A fresh window (the checkpoint ladder's target)
-        // has an empty map, so this is unchanged there. The layout may be in another page unit (a §12
-        // artifact's fixed 4 KiB, or a 16 KiB native capture); `rebased_to` is identity when they
-        // already agree. A `Backed` page is the host's to re-alias ([`Host::realias_regions`]), which
-        // installs its entry with the region it names.
-        if !layout.map.is_empty() || self.prot_dirty.load(Ordering::Acquire) {
-            // Marks prot_dirty, matching the captured window.
-            let mut space = self.space_write();
-            // #2427 — a page a live window holds past the image that the layout does not rewrite whole
-            // is zeroed first, in runs: the layout writes only the pages it holds with contents, so a
-            // page it holds zero, or not at all, must not keep what the guest wrote there since the
-            // moment was taken. A fresh window holds nothing there.
-            let mut stale: Vec<(u64, u64)> = Vec::new();
-            for (&page, _) in self
-                .held_map(&space)
-                .range(first..)
-                .filter(|&(&page, p)| held_tail(p) && !layout.rewrites(page * self.page, self.page))
-            {
-                match stale.last_mut() {
-                    Some((_, end)) if *end == page => *end += 1,
-                    _ => stale.push((page, page + 1)),
-                }
-            }
-            space.prot = layout.map.rebased_to(self.page);
-            space
-                .prot
-                .retain(|_, p| !matches!(p, PageProt::Backed { .. }));
-            // The NULL guard is this window's, not the layout's (#964): a layout captured where the
-            // guard disengaged, on a host whose page is larger than it, still faults here as a fresh
-            // window does, and as the JIT's restore re-seeds it.
-            let guard = self.null_guard / self.page;
-            space
-                .prot
-                .extend((0..guard).map(|p| (p, PageProt::Unmapped)));
-            drop(space);
-            for (lo, hi) in stale {
-                self.back.zero(lo * self.page, (hi - lo) * self.page);
+        // Install the captured map first, *replacing* whatever this window carries outright:
+        // restoring into a **live** window (a reactor rewinding to an earlier moment) must drop the
+        // pages the guest has `map`-grown since, or they would survive as addressable memory the
+        // moment never had. The layout may be in another page unit (a §12 artifact's fixed 4 KiB, or
+        // a 16 KiB native capture); `rebased_to` is identity when they already agree. A `Backed` page
+        // is the host's to re-alias ([`Host::realias_regions`]), which installs its entry with the
+        // region it names.
+        let mut space = self.space_write();
+        // #2427 — a page a live window holds past the image that the layout does not rewrite whole
+        // is zeroed first, in runs: the layout writes only the pages it holds with contents, so a
+        // page it holds zero, or not at all, must not keep what the guest wrote there since the
+        // moment was taken. A fresh window holds nothing there.
+        let mut stale: Vec<(u64, u64)> = Vec::new();
+        for (&page, _) in self
+            .held_map(&space)
+            .range(first..)
+            .filter(|&(&page, p)| held_tail(p) && !layout.rewrites(page * self.page, self.page))
+        {
+            match stale.last_mut() {
+                Some((_, end)) if *end == page => *end += 1,
+                _ => stale.push((page, page + 1)),
             }
         }
+        space.prot = layout.map.rebased_to(self.page);
+        space
+            .prot
+            .retain(|_, p| !matches!(p, PageProt::Backed { .. }));
+        // The NULL guard is this window's, not the layout's (#964): a layout captured where the
+        // guard disengaged, on a host whose page is larger than it, still faults here as a fresh
+        // window does, and as the JIT's restore re-seeds it.
+        let guard = self.null_guard / self.page;
+        space
+            .prot
+            .extend((0..guard).map(|p| (p, PageProt::Unmapped)));
+        drop(space);
+        for (lo, hi) in stale {
+            self.back.zero(lo * self.page, (hi - lo) * self.page);
+        }
         // Then the image, straight into `back` (the mirror of the capture above and of `seed`). No page
-        // is `Backed` now (an alias dirties the map, so the map above replaced it), so every byte is
-        // the window's own: a region the live window aliased since the moment was taken keeps its
-        // bytes out of the restore (#2059). The prefix last overwrites what a fresh window seeded.
+        // is `Backed` now (the map above replaced every alias), so every byte is the window's own: a
+        // region the live window aliased since the moment was taken keeps its bytes out of the
+        // restore (#2059). The prefix last overwrites what a fresh window seeded.
         self.back.write_from(0, &layout.bytes);
         for (&off, bytes) in &layout.tail {
             self.back.write_from(off, bytes);
@@ -39043,6 +39875,78 @@ mod prot_tests {
         assert_eq!(m.map(0, page(), PROT_READ | PROT_WRITE), 0);
         assert_eq!(m.load(0, 0, LoadOp::I64), Ok(Value::I64(0)));
         assert!(m.store(0, 0, StoreOp::I64, Value::I64(1)).is_ok());
+    }
+
+    /// #2577 — the lock-free run reaches past a window's read-only pages for loads, not stores, and
+    /// over its `vm_map`-grown tail: a nim tool's stack and heap sit above its libc's rodata. Below
+    /// the NULL guard nothing skips the map.
+    #[test]
+    fn the_fast_run_spans_read_only_pages_for_loads_and_the_grown_tail() {
+        let (p, top) = (page(), 1u64 << 20);
+        let guard = temen_ir::module_null_guard();
+        let mut m = Mem::from_spec(WindowSpec {
+            reserved_log2: 22,
+            mapped_log2: 20,
+            null_guard: guard,
+            ..WindowSpec::default()
+        });
+        let ro = 8 * p;
+        assert_eq!(m.protect(ro, p, PROT_READ), 0);
+        assert_eq!(m.map(top, 2 * p, PROT_READ | PROT_WRITE), 0);
+        let fast = |m: &Mem, at: u64, write| m.in_fast_run(at, at + 7, write);
+        assert!(fast(&m, ro, false), "a load from the read-only page");
+        assert!(!fast(&m, ro, true), "a store to it");
+        assert!(fast(&m, ro + p, true), "a store above it");
+        assert!(fast(&m, top + p, true), "a store to the grown tail");
+        assert!(!fast(&m, top + 2 * p, false), "past the tail");
+        if m.null_guard != 0 {
+            assert!(!fast(&m, 0, false), "the NULL guard");
+        }
+        assert_eq!(
+            m.store_scalar(ro, 0, StoreOp::I64, 1),
+            Err(Trap::MemoryFault)
+        );
+        assert_eq!(m.store_scalar(top + p, 0, StoreOp::I64, 9), Ok(()));
+        assert_eq!(
+            m.load_scalar(top + p, 0, LoadOp::I64),
+            Ok(Reg::from_value(Value::I64(9)))
+        );
+    }
+
+    /// #2577 — the run is the address space's, so a page one vCPU protects leaves it for every vCPU
+    /// sharing the space, and their stores to it fault.
+    #[test]
+    fn a_page_one_vcpu_protects_leaves_every_vcpus_run() {
+        let p = page();
+        let mut a = Mem::with_reservation(22, 20, None);
+        let mut b = a.fork_for_thread();
+        assert!(b.in_fast_run(p, p + 7, true));
+        assert_eq!(a.protect(p, p, PROT_READ), 0);
+        assert!(!b.in_fast_run(p, p + 7, true));
+        assert_eq!(
+            b.store_scalar(p, 0, StoreOp::I64, 1),
+            Err(Trap::MemoryFault)
+        );
+        assert_eq!(a.unmap(2 * p, p), 0);
+        assert!(
+            !b.in_fast_run(2 * p, 2 * p + 7, false),
+            "nor an unmapped one"
+        );
+        assert!(
+            !b.in_fast_run(3 * p, 3 * p + 7, false),
+            "nor what lies above the hole"
+        );
+    }
+
+    /// #2577 — a window re-seeded across a tier bounce folds its grown tail into the mapped prefix
+    /// ([`Mem::seed_pages`]), and the run follows it.
+    #[test]
+    fn a_reseeded_windows_run_covers_its_folded_tail() {
+        let (p, top) = (page(), 1u64 << 20);
+        let mut m = Mem::with_reservation(22, 20, None);
+        m.seed_pages(0, &[(top, 1), (top + p, 1)]);
+        assert!(m.in_fast_run(top + p, top + p + 7, true));
+        assert!(!m.in_fast_run(top + 2 * p, top + 2 * p + 7, false));
     }
 
     /// #2370 — the runs an op can change: the whole span when it grants access, else the declared

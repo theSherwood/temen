@@ -689,8 +689,8 @@ pub extern "C" fn temen_run_shared(
 
 // ==== A parallel run's recipe: what the page publishes before the run =============================
 //
-// A parallel run is executor 2 across Web Workers ([`temen_x2_start`], #1414 B6): one in-Rust call on
-// the root's Worker, each thread of the run on a Worker of its own, all over the one shared linear
+// A parallel run is executor 2 across Web Workers ([`temen_x2_open`], #1414 B6): the root's Worker
+// opens and pumps it, each thread of the run on a Worker of its own, all over the one shared linear
 // memory. Before the run the page publishes its recipe here: the powerbox the root is granted
 // (`temen_par_powerbox*`) and how many Workers can run at once. A recipe is leaked into the shared
 // memory and its pointer published in a `static`, which every Worker's instance reads alike.
@@ -735,7 +735,7 @@ pub extern "C" fn temen_par_set_workers(n: usize) {
 // ---- §22 guest-JIT: a Rust-side powerbox with a host-compiled unit (THREADS.md 4c-domain C2) ----
 // The powerbox (a `Host` with the `Jit` cap + the host-compiled unit) is built once on the page and
 // **leaked** into the shared linear memory, its pointer published in a `static`. The run takes it
-// ([`temen_x2_start`]), so a task's `Jit.install`/`uninstall`/`invoke` goes through the run's host
+// ([`temen_x2_open`]), so a task's `Jit.install`/`uninstall`/`invoke` goes through the run's host
 // like any other `call.cap`, and the JS host services no JIT op.
 
 /// The shared §22 powerbox: a `Host` with the `Jit` cap granted + [`JIT_SERVICE`] host-compiled, plus
@@ -812,7 +812,7 @@ pub extern "C" fn temen_par_powerbox(guest_ptr: *const u8, guest_len: usize) -> 
 }
 
 /// Codegen mode: when set, a guest's `Jit.invoke` of a unit with emitted wasm runs it on the invoking
-/// thread's Worker ([`temen_x2_start`]); else the interpreter runs it.
+/// thread's Worker ([`temen_x2_open`]); else the interpreter runs it.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 static PAR_JIT_CODEGEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
@@ -1018,6 +1018,13 @@ struct ParIoCfg {
     /// The last frame the guest presented through `display` (the on-ramp recipe's), for the run's
     /// report as the pump's carries it.
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
+    /// The host-answered caps the on-ramp recipe declares (#1414 5b-2), which the page answers, and
+    /// the calls on them it has yet to answer.
+    caps: Vec<String>,
+    requests: temen_interp::CapRequests,
+    /// Whether the page feeds the run's stdin as it runs (#1414 5b-2): a read of empty stdin then
+    /// waits for more ([`Host::set_stdin_blocking`]), until the page ends it.
+    fed_later: bool,
 }
 
 /// The leaked [`ParIoCfg`] pointer (or `0`), shared across Workers via shared linear memory.
@@ -1034,25 +1041,23 @@ static PAR_IO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::
 pub extern "C" fn temen_par_powerbox_io() -> i32 {
     let mut host = Host::new();
     let out = host.grant_stream(StreamRole::Out);
-    par_publish_io(host, Some(out), Vec::new(), Default::default());
+    par_publish_io(ParIoCfg {
+        host: std::sync::Mutex::new(host),
+        out: Some(out),
+        init: Vec::new(),
+        frame: Default::default(),
+        caps: Vec::new(),
+        requests: Default::default(),
+        fed_later: false,
+    });
     1
 }
 
-/// Publish `host` as the run's shared I/O powerbox (clearing the other recipes). Leaked: the run
+/// Publish `cfg` as the run's shared I/O powerbox (clearing the other recipes). Leaked: the run
 /// holds a `&'static` borrow of it, and the next publish replaces the pointer.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
-fn par_publish_io(
-    host: Host,
-    out: Option<i32>,
-    init: Vec<u8>,
-    frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
-) {
-    let cfg = Box::into_raw(Box::new(ParIoCfg {
-        host: std::sync::Mutex::new(host),
-        out,
-        init,
-        frame,
-    }));
+fn par_publish_io(cfg: ParIoCfg) {
+    let cfg = Box::into_raw(Box::new(cfg));
     PAR_IO.store(cfg as usize, std::sync::atomic::Ordering::Release);
     PAR_INST.store(0, std::sync::atomic::Ordering::Release);
     PAR_PB.store(0, std::sync::atomic::Ordering::Release);
@@ -1068,8 +1073,16 @@ fn par_publish_io(
 /// streams back after the run via [`temen_par_stdout_len`] / [`temen_par_stderr_len`]; an `exit`
 /// ends the run with its code ([`temen_exit_code`]).
 ///
-/// Returns `1`, or `0` — nothing published — for undecodable bytes or a module the on-ramp refuses
-/// ([`onramp_check`]). Call on the main thread before the run, like [`temen_par_powerbox_io`].
+/// #1414 5b-2: `[caps_ptr, caps_len)` names the host-answered caps the page answers, as
+/// [`temen_coop_open`]'s do: a call to one is told to the Worker that pumps the run
+/// ([`COOP_RUN_CAP_PARK`]), and the page answers it ([`temen_x2_answer`]). With `fed_later` set, the
+/// page feeds stdin as the run goes ([`temen_x2_feed`]): a read of empty stdin waits for more, and
+/// the run idles on it ([`COOP_RUN_IDLE`]) until the page feeds it or ends it
+/// ([`temen_x2_feed_end`]). A JS host may leave the trailing three out (they read as zero).
+///
+/// Returns `1`, or `0` — nothing published — for undecodable bytes or cap names, or a module the
+/// on-ramp refuses ([`onramp_check`]). Call on the main thread before the run, like
+/// [`temen_par_powerbox_io`].
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_powerbox_onramp(
@@ -1077,6 +1090,9 @@ pub extern "C" fn temen_par_powerbox_onramp(
     guest_len: usize,
     stdin_ptr: *const u8,
     stdin_len: usize,
+    caps_ptr: *const u8,
+    caps_len: usize,
+    fed_later: i32,
 ) -> i32 {
     // SAFETY: the host guarantees both ranges are live allocations it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(guest_ptr, guest_len) };
@@ -1085,7 +1101,10 @@ pub extern "C" fn temen_par_powerbox_onramp(
     } else {
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
     };
-    let Ok(m) = temen_encode::decode_module(bytes) else {
+    let (Ok(m), Some(caps)) = (
+        temen_encode::decode_module(bytes),
+        host_cap_names(caps_ptr, caps_len),
+    ) else {
         return 0;
     };
     if onramp_check(&m).is_err() {
@@ -1093,8 +1112,18 @@ pub extern "C" fn temen_par_powerbox_onramp(
     }
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
-    let frame = grant_onramp_caps(&mut host, &m, None, None).frame;
-    par_publish_io(host, None, onramp_env_init(&run_env()), frame);
+    host.set_stdin_blocking(fed_later != 0);
+    let requests = temen_interp::CapRequests::default();
+    let frame = grant_onramp_caps(&mut host, &m, None, Some((&caps, &requests))).frame;
+    par_publish_io(ParIoCfg {
+        host: std::sync::Mutex::new(host),
+        out: None,
+        init: onramp_env_init(&run_env()),
+        frame,
+        caps,
+        requests,
+        fed_later: fed_later != 0,
+    });
     1
 }
 
@@ -1695,7 +1724,8 @@ const X2_PLATFORM: bytecode::ThreadPlatform = bytecode::ThreadPlatform {
     now_ns: || (unsafe { x2_now_ms() } * 1e6) as u64,
     tier: None,
     child_window: Some(x2_child_window),
-    // The run opens on the root's Worker (`temen_x2_start`): another Worker would cost it ~11 ms.
+    // The root runs on the Worker that opens the run (`temen_x2_open`), unless that Worker pumps
+    // it: another Worker would cost the run ~11 ms.
     root_on_opener: true,
 };
 
@@ -1724,8 +1754,9 @@ pub extern "C" fn temen_x2_thread(start: *mut bytecode::ThreadStart) {
     f()
 }
 
-/// Run the guest at `[guest_ptr, guest_len)` on the parallel driver from this Worker, each of its
-/// threads on a Worker of its own. It runs under the published recipe's powerbox: the shared I/O or on-ramp host ([`temen_par_powerbox_io`],
+/// Open the guest at `[guest_ptr, guest_len)` on the parallel driver from this Worker, for it to pump
+/// ([`temen_x2_run`]), each of the run's threads on a Worker of its own. It runs under the published
+/// recipe's powerbox: the shared I/O or on-ramp host ([`temen_par_powerbox_io`],
 /// [`temen_par_powerbox_onramp`]), the §14 root's ([`temen_par_powerbox_inst`]), the §22 host with
 /// its compiled unit ([`temen_par_powerbox`], [`temen_par_powerbox_jit_codegen`]) or the one that
 /// compiles the guest's own units ([`temen_par_powerbox_jit_runtime`]), or none
@@ -1742,26 +1773,26 @@ pub extern "C" fn temen_x2_thread(start: *mut bytecode::ThreadStart) {
 /// declared size or `win_size`, whichever is larger, rounded up to a power of two, and it cannot
 /// grow past that; otherwise it is the driver's own, which grows on demand.
 ///
-/// Returns the guest's `i64` result; [`temen_status`], [`temen_exit_code`] and [`temen_trap_ptr`]
-/// tell the rest, as for [`temen_run_onramp`].
+/// Returns `0` once the run is open. Otherwise the run's report is published, as at a run's end
+/// ([`temen_x2_run`]), and the status returned.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
-pub extern "C" fn temen_x2_start(
+pub extern "C" fn temen_x2_open(
     guest_ptr: *const u8,
     guest_len: usize,
     win_size: usize,
     tierup: i32,
     seed_ptr: *const u8,
     seed_len: usize,
-) -> i64 {
+) -> i32 {
     use std::sync::atomic::Ordering;
     par_install_panic_capture();
-    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: only this Worker reaches the run, and the run before it is over.
+    unsafe { *core::ptr::addr_of_mut!(X2_RUN) = None };
     // SAFETY: the host guarantees `[guest_ptr, guest_len)` is a live allocation it just filled.
     let bytes = unsafe { host_slice(guest_ptr, guest_len) };
     let Ok(m) = temen_encode::decode_module(bytes) else {
-        set(STATUS_DECODE_ERR);
-        return 0;
+        return PbOutcome::refused(STATUS_DECODE_ERR).report();
     };
     // Emitted code addresses the window as one flat span masked to `1 << win_log2`, so a run with an
     // emitted tier gets a flat window of exactly that size: the declared size or `win_size`,
@@ -1829,9 +1860,9 @@ pub extern "C" fn temen_x2_start(
         }
     };
     // Whatever the recipe, the run's output streams as it is written (#1414 S5a), and the page can
-    // stop it ([`temen_x2_stop`]).
+    // stop it, or wake the Worker that pumps it ([`temen_x2_stop`], [`temen_x2_wake`]).
     host.set_stream_tee(stream_tee());
-    host.set_run_stop(std::sync::Arc::clone(x2_stop()));
+    host.set_run_door(std::sync::Arc::clone(x2_door()));
     // §22 units run emitted when codegen asks and the run's table can fill every slot their
     // `call.dyn`s may reach, as on the coop driver.
     let codegen = codegen && all_shimmable(&m);
@@ -1842,8 +1873,7 @@ pub extern "C" fn temen_x2_start(
     if tierup != 0 || codegen {
         let page = temen_interp::host_page_size();
         let Some(flat) = temen_interp::Region::owned_zeroed(1u64 << win_log2, page) else {
-            set(STATUS_UNSUPPORTED);
-            return 0;
+            return PbOutcome::refused(STATUS_UNSUPPORTED).report();
         };
         back = Some(std::sync::Arc::new(flat));
         let (wasm, emit, table_log2, spill) = regions.unwrap_or_else(|| {
@@ -1889,10 +1919,143 @@ pub extern "C" fn temen_x2_start(
     if let n @ 1.. = PAR_WORKERS.load(Ordering::Acquire) {
         host.set_workers(n);
     }
-    let mut fuel = DEFAULT_FUEL;
-    let ran = bytecode::compile_and_run_capture_over_parallel_with_host(
-        &m, 0, &args, &mut fuel, &init, back, &mut host,
+    // The page hears of the run's events only when it has a part in it: answering a declared
+    // host-answered call, or feeding stdin later. Otherwise the root runs on this Worker to the end:
+    // another Worker would cost the run about 11 ms.
+    let pump = io.is_some_and(|io| io.fed_later || !io.caps.is_empty());
+    let run = bytecode::CoopRun::new_parallel(
+        &m,
+        0,
+        &args,
+        DEFAULT_FUEL,
+        host,
+        &init,
+        temen_ir::default_reserved_log2(),
+        back,
+        pump,
     );
+    match run {
+        Some(Ok(run)) => {
+            // SAFETY: only this Worker reaches the run.
+            unsafe { *core::ptr::addr_of_mut!(X2_RUN) = Some(X2Run { run, io, rt }) };
+            0
+        }
+        Some(Err(t)) => PbOutcome::ended(Some(Err(t)), Vec::new(), Vec::new()).report(),
+        None => PbOutcome::ended(None, Vec::new(), Vec::new()).report(),
+    }
+}
+
+/// #1414 5b-2: the run on executor 2 its Worker pumps, from [`temen_x2_open`] to its end in
+/// [`temen_x2_run`]: one at a time, reached only from the Worker that opened it.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+struct X2Run {
+    run: bytecode::CoopRun,
+    /// The recipe whose powerbox the run took, which takes it back at the end.
+    io: Option<&'static ParIoCfg>,
+    rt: Option<&'static ParJitCfg>,
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+static mut X2_RUN: Option<X2Run> = None;
+
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+impl X2Run {
+    /// Take what the page left since the last pump, in the order it left it: answers to the calls
+    /// it was told of, each through its call's completer, and input for the run's stdin.
+    fn take_inbox(&mut self) {
+        let words = X2_INBOX.take();
+        let mut words = words.into_iter();
+        while let Some(tag) = words.next() {
+            match tag {
+                X2_ANSWER => {
+                    let (Some(id), Some(value)) = (words.next(), words.next()) else {
+                        return;
+                    };
+                    let request = self.io.and_then(|io| {
+                        io.requests
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&id)
+                    });
+                    // An answer to a call this run did not make, or answered already, is dropped.
+                    if let Some(request) = request {
+                        request.completer.complete(value as i64);
+                    }
+                }
+                X2_INPUT => {
+                    let Some(len) = words.next() else { return };
+                    let bytes: Vec<u8> = words
+                        .by_ref()
+                        .take((len as usize).div_ceil(8))
+                        .flat_map(u64::to_le_bytes)
+                        .take(len as usize)
+                        .collect();
+                    self.run.host_mut().push_stdin(&bytes);
+                }
+                X2_INPUT_END => self.run.host_mut().set_stdin_blocking(false),
+                // Only this crate's exports put words here.
+                _ => return,
+            }
+        }
+    }
+}
+
+/// #1414 5b-2: pump the run [`temen_x2_open`] opened, on its Worker, to its next event. What the page
+/// left for the run is taken first ([`temen_x2_answer`], [`temen_x2_feed`]), and again each time the
+/// page wakes the Worker for more ([`temen_x2_wake`]). Returns one of the pump's event codes:
+/// - [`COOP_RUN_CAP_PARK`]: a task called a declared host-answered cap. Read the request
+///   ([`temen_coop_cap_len`]/[`temen_coop_cap_ptr`]): the page answers it ([`temen_x2_answer`])
+///   while the Worker pumps on.
+/// - [`COOP_RUN_IDLE`]: no task can run until the page acts, by answering or feeding. Wait for it
+///   ([`temen_x2_wait`]), then pump again.
+/// - [`COOP_RUN_DONE`] or [`COOP_RUN_TRAP`]: the run is over. Its report is published as every
+///   browser run's is (#1414 S4-1): [`temen_status`], [`temen_run_value`], [`temen_exit_code`],
+///   [`temen_trap_ptr`], and a memory fault's address (#2275), which the driver records from the
+///   first fault of any of the run's threads, interpreted or emitted. Its output stays in the
+///   powerbox for [`temen_par_stdout_len`] to read.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_run() -> i32 {
+    // SAFETY: only the Worker that opened the run reaches it.
+    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(X2_RUN)).as_mut() }) else {
+        PbOutcome::refused(STATUS_UNSUPPORTED).publish();
+        return COOP_RUN_TRAP;
+    };
+    let ev = loop {
+        s.take_inbox();
+        match s.run.run() {
+            // The page woke the Worker to take what it left.
+            bytecode::CoopEvent::Paused => {}
+            ev => break ev,
+        }
+    };
+    let ran = match ev {
+        bytecode::CoopEvent::CapPark { id } => {
+            let words = s
+                .io
+                .and_then(|io| cap_park_words(&io.caps, &io.requests, id))
+                .unwrap_or_default();
+            // SAFETY: the read-back slot is this Worker's while it pumps the run.
+            unsafe { *core::ptr::addr_of_mut!(CAP_REQUEST) = words };
+            return COOP_RUN_CAP_PARK;
+        }
+        bytecode::CoopEvent::Idle { .. } => return COOP_RUN_IDLE,
+        bytecode::CoopEvent::Done(vals) => Ok(vals),
+        bytecode::CoopEvent::Trapped(t) => Err(t),
+        bytecode::CoopEvent::Paused
+        | bytecode::CoopEvent::TierUp { .. }
+        | bytecode::CoopEvent::Resume { .. }
+        | bytecode::CoopEvent::JitInvoke { .. } => {
+            unreachable!("executor 2 runs its emitted tier on its threads")
+        }
+    };
+    // SAFETY: as above; the run is over, so it goes.
+    let Some(X2Run { mut run, io, rt }) = (unsafe { (*core::ptr::addr_of_mut!(X2_RUN)).take() })
+    else {
+        unreachable!("the run pumped above")
+    };
+    let host = std::mem::take(&mut *run.host_mut());
+    drop(run);
     // The files the run ended with, read as the pump's are ([`temen_coop_fs_image`]).
     let fs = temen_fs::vm_fs_image(&host);
     let framebuffer = io.and_then(|io| io.frame.lock().unwrap_or_else(|e| e.into_inner()).take());
@@ -1904,38 +2067,206 @@ pub extern "C" fn temen_x2_start(
     // SAFETY: the page reads the image back only after the run's end message, as it does the
     // report's slots.
     unsafe { stash(&mut *core::ptr::addr_of_mut!(FS_IMAGE), fs) };
-    // The run reports as every browser run does (#1414 S4-1), a memory fault's address included
-    // (#2275): the driver records the first fault of any of the run's threads, interpreted or
-    // emitted. Its output stays in the powerbox for `temen_par_stdout_len` to read.
-    PbOutcome {
+    let out = PbOutcome {
         framebuffer,
-        ..PbOutcome::ended(ran.map(|(r, _)| r), Vec::new(), Vec::new())
+        ..PbOutcome::ended(Some(ran), Vec::new(), Vec::new())
+    };
+    match out.report() {
+        STATUS_OK | STATUS_EXIT => COOP_RUN_DONE,
+        _ => COOP_RUN_TRAP,
     }
-    .publish()
 }
 
-/// The stop every run on executor 2 takes ([`temen_x2_stop`]): one at a time runs, so one serves.
+/// #1414 5b-2: wait, on the run's Worker, for the run to change after [`COOP_RUN_IDLE`]: an answer
+/// or input its page left and woke it for ([`temen_x2_wake`]), a call a task files, a stop, or its
+/// end. Then pump again ([`temen_x2_run`]).
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
-fn x2_stop() -> &'static std::sync::Arc<bytecode::RunStop> {
-    static STOP: std::sync::OnceLock<std::sync::Arc<bytecode::RunStop>> =
-        std::sync::OnceLock::new();
-    STOP.get_or_init(Default::default)
+#[no_mangle]
+pub extern "C" fn temen_x2_wait() {
+    // SAFETY: only the Worker that opened the run reaches it.
+    if let Some(s) = unsafe { (*core::ptr::addr_of!(X2_RUN)).as_ref() } {
+        s.run.wait();
+    }
 }
 
-/// #1414 S5a: stop the run on executor 2 (`ask` nonzero), or withdraw a stop before the next run
-/// starts (`ask` zero: the page calls it as it sets one up). Asking never blocks, so the page calls
-/// it on its main thread: `1` once the run has been told, or holds none; `0` when its lock was busy,
-/// and the page asks again. A stopped run ends as one whose fuel ran out, its threads leaving at
-/// their next look, and its Workers close as after any run, so the engine stays usable.
+/// The door every run on executor 2 takes ([`temen_x2_stop`], [`temen_x2_wake`]): one at a time
+/// runs, so one serves.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+fn x2_door() -> &'static std::sync::Arc<bytecode::RunDoor> {
+    static DOOR: std::sync::OnceLock<std::sync::Arc<bytecode::RunDoor>> =
+        std::sync::OnceLock::new();
+    DOOR.get_or_init(Default::default)
+}
+
+/// #1414 S5a: stop the run on executor 2 (`ask` nonzero), or set up for the next run (`ask` zero:
+/// the page calls it as it sets one up, while none is live). Setting up withdraws a stop and a wake,
+/// and drops what the page left for an earlier run ([`temen_x2_answer`], [`temen_x2_feed`]), so the
+/// page may feed the next run before its Worker opens it. Asking never blocks, so the page calls it
+/// on its main thread: `1` once the run has been told, or holds none; `0` when its lock was busy, and
+/// the page asks again. A stopped run ends as one whose fuel ran out, its threads leaving at their
+/// next look, and its Workers close as after any run, so the engine stays usable.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_x2_stop(ask: i32) -> i32 {
-    let stop = x2_stop();
+    let door = x2_door();
     if ask == 0 {
-        stop.reset();
+        door.reset();
+        X2_INBOX.clear();
         return 1;
     }
-    i32::from(stop.request())
+    i32::from(door.stop())
+}
+
+/// #1414 5b-2: wake the Worker that pumps the run on executor 2, to take what the page left for it
+/// ([`temen_x2_answer`], [`temen_x2_feed`]). It never blocks, so the page calls it on its main
+/// thread: `1` once the Worker has been rung, or no run is live; `0` when a lock was busy, and the
+/// page asks again.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_wake() -> i32 {
+    i32::from(x2_door().wake())
+}
+
+/// What the page leaves for the run its Worker pumps (#1414 5b-2), in the order it left it: answers
+/// to the host-answered calls it was told of, input for the run's stdin, and that input's end. The
+/// page's main thread cannot wait on a lock, so it writes here with atomics alone, and the Worker
+/// takes what it finds before each pump ([`temen_x2_run`]): a ring of words with one writer, the
+/// page, and one reader, the Worker. A message is a tag and its words: [`X2_ANSWER`], the call's
+/// id and its answer; [`X2_INPUT`], the byte count and the bytes, eight to a word; [`X2_INPUT_END`].
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+struct X2Inbox {
+    words: [std::sync::atomic::AtomicU64; X2_INBOX_WORDS],
+    /// How many words the page has put, and how many the Worker has taken, each counted on from
+    /// the last. Only the page moves `put`, and only the Worker `took`, but for the page's
+    /// [`clear`](Self::clear) while no run is live.
+    put: std::sync::atomic::AtomicU32,
+    took: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+const X2_INBOX_WORDS: usize = 8192;
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+const X2_ANSWER: u64 = 1;
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+const X2_INPUT: u64 = 2;
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+const X2_INPUT_END: u64 = 3;
+
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+static X2_INBOX: X2Inbox = X2Inbox {
+    words: [const { std::sync::atomic::AtomicU64::new(0) }; X2_INBOX_WORDS],
+    put: std::sync::atomic::AtomicU32::new(0),
+    took: std::sync::atomic::AtomicU32::new(0),
+};
+
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+impl X2Inbox {
+    /// The page's side: put a message of `len` words, word `i` being `word(i)`, if it fits whole.
+    /// Whether it did. It takes no lock and allocates nothing: the page's main thread calls it.
+    fn put(&self, len: usize, word: impl Fn(usize) -> u64) -> bool {
+        use std::sync::atomic::Ordering;
+        let put = self.put.load(Ordering::Relaxed);
+        let free = X2_INBOX_WORDS - put.wrapping_sub(self.took.load(Ordering::Acquire)) as usize;
+        if len > free {
+            return false;
+        }
+        for i in 0..len {
+            self.words[put.wrapping_add(i as u32) as usize % X2_INBOX_WORDS]
+                .store(word(i), Ordering::Relaxed);
+        }
+        self.put
+            .store(put.wrapping_add(len as u32), Ordering::Release);
+        true
+    }
+
+    /// The Worker's side: take every word the page has put since the last take.
+    fn take(&self) -> Vec<u64> {
+        use std::sync::atomic::Ordering;
+        let took = self.took.load(Ordering::Relaxed);
+        let put = self.put.load(Ordering::Acquire);
+        let words = (0..put.wrapping_sub(took))
+            .map(|i| {
+                self.words[took.wrapping_add(i) as usize % X2_INBOX_WORDS].load(Ordering::Relaxed)
+            })
+            .collect();
+        self.took.store(put, Ordering::Release);
+        words
+    }
+
+    /// Drop what the page left for an earlier run: the page's side, as it sets up the next run and
+    /// none takes words.
+    fn clear(&self) {
+        use std::sync::atomic::Ordering;
+        self.took
+            .store(self.put.load(Ordering::Relaxed), Ordering::Release);
+    }
+}
+
+/// #1414 5b-2: leave `value` as the answer to host-answered call `id` (a [`COOP_RUN_CAP_PARK`] the
+/// page was told of), for the run's Worker to take once the page wakes it ([`temen_x2_wake`]). It
+/// never blocks, so the page calls it on its main thread: `1` once left; `0` while what the page left
+/// before fills the inbox, and the page wakes the Worker and asks again.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_answer(id: u64, value: i64) -> i32 {
+    let msg = [X2_ANSWER, id, value as u64];
+    i32::from(X2_INBOX.put(msg.len(), |i| msg[i]))
+}
+
+/// The page's own bytes for input it feeds ([`temen_x2_feed`]): only its main thread writes them.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+static mut X2_FEED: [u8; X2_FEED_BYTES] = [0; X2_FEED_BYTES];
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+const X2_FEED_BYTES: usize = 4096;
+
+/// #1414 5b-2: where the page writes up to [`temen_x2_feed_cap`] bytes of input before it feeds them
+/// ([`temen_x2_feed`]).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_feed_ptr() -> *mut u8 {
+    core::ptr::addr_of_mut!(X2_FEED).cast()
+}
+
+/// #1414 5b-2: how many bytes [`temen_x2_feed_ptr`] holds.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_feed_cap() -> usize {
+    X2_FEED_BYTES
+}
+
+/// #1414 5b-2: leave the first `len` bytes at [`temen_x2_feed_ptr`] as input to the run's stdin,
+/// for its Worker to take once the page wakes it ([`temen_x2_wake`]). A read the input arrives for
+/// goes on. It never blocks, so the page calls it on its main thread: `1` once left; `0` while what
+/// the page left before fills the inbox, and the page wakes the Worker and asks again, or for a `len`
+/// past [`temen_x2_feed_cap`].
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_feed(len: usize) -> i32 {
+    // SAFETY: only the page's main thread reaches these bytes.
+    let Some(bytes) = (unsafe { (*core::ptr::addr_of!(X2_FEED)).get(..len) }) else {
+        return 0;
+    };
+    let word = |i: usize| match i {
+        0 => X2_INPUT,
+        1 => len as u64,
+        _ => {
+            let mut w = [0u8; 8];
+            let c = &bytes[(i - 2) * 8..bytes.len().min((i - 1) * 8)];
+            w[..c.len()].copy_from_slice(c);
+            u64::from_le_bytes(w)
+        }
+    };
+    i32::from(X2_INBOX.put(2 + len.div_ceil(8), word))
+}
+
+/// #1414 5b-2: end the run's stdin, after any input left before, for its Worker to take once the
+/// page wakes it ([`temen_x2_wake`]): a read of empty stdin then sees its end. It never blocks: `1`
+/// once left; `0` while what the page left before fills the inbox, and the page wakes the Worker and
+/// asks again.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_feed_end() -> i32 {
+    i32::from(X2_INBOX.put(1, |_| X2_INPUT_END))
 }
 
 // ---- host powerbox: console + clock, marshalled through host-allocated memory ----------------
@@ -2028,6 +2359,13 @@ impl PbOutcome {
             }
         }
         out
+    }
+
+    /// [`publish`](Self::publish) the outcome, and return its status.
+    fn report(self) -> i32 {
+        let status = self.status;
+        self.publish();
+        status
     }
 
     /// Hand the report to the page (#1414 S4-1): `temen_status`, the stdout and stderr captures,
@@ -2449,6 +2787,7 @@ impl OnrampCaps {
                 handler,
                 fork: Some(caps.fork(name)),
                 state: caps.cap_state(name),
+                process: None,
             })
         })
     }
@@ -4070,8 +4409,7 @@ fn pg_close_session() {
 /// Publish a session call's report ([`PbOutcome::publish`]): `0` when the backend is ready for the
 /// next query, else the negative status.
 fn pg_report(out: PbOutcome) -> i32 {
-    let status = out.status;
-    out.publish();
+    let status = out.report();
     if status == STATUS_OK {
         0
     } else {
@@ -9456,7 +9794,7 @@ block 0 (v0: i64) {
 /// The tier-up run's §22 unit-emit parameters (#835), read by [`onramp_tierup_unit_emitter`]
 /// (a bare `fn` — [`Host::set_jit_wasm_emitter`] stores no closure state): the run's memory-share
 /// flag and its window log2. Stored when a run opens ([`temen_coop_open`], and the parallel
-/// driver's `temen_x2_start`); one such run at a time.
+/// driver's `temen_x2_open`); one such run at a time.
 static TIERUP_UNIT_SHARED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static TIERUP_UNIT_WIN_LOG2: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -9487,7 +9825,7 @@ fn coop_hotness() -> bytecode::Hotness {
 }
 
 /// The wasm emitter the tier-up driver installs for a `vm_jit_*`-importing guest (#835/#846), and
-/// the parallel driver for a run whose §22 units run emitted (`temen_x2_start`):
+/// the parallel driver for a run whose §22 units run emitted (`temen_x2_open`):
 /// emit a validated unit whole-module in **Model B2** shape (`compile_module_b2` — its
 /// `call.dyn` dispatches through the driver's shared funcref table, so a **linked** unit's
 /// Slot callbacks reach installed units / eligible program `f{i}`s natively and everything else
@@ -9594,7 +9932,10 @@ pub const COOP_RUN_PAUSED: i32 = 5;
 pub const COOP_RUN_CAP_PARK: i32 = 6;
 /// #2557: nothing can run until the page answers a call it was told of ([`COOP_RUN_CAP_PARK`]), or
 /// until the run's next timer, [`temen_coop_idle_timer`] ns away. Answer it, or wait out the timer,
-/// let the time that passed pass ([`temen_coop_pass_time`]), and pump again.
+/// let the time that passed pass ([`temen_coop_pass_time`]), and pump again. On executor 2
+/// ([`temen_x2_run`], #1414 5b-2) the run's timers fire on their own, and nothing else can run until
+/// the page answers a call or feeds input: the Worker waits for the run to change
+/// ([`temen_x2_wait`]), and pumps again.
 pub const COOP_RUN_IDLE: i32 = 7;
 
 /// The live cooperative tier-up session — the `CoopRun` plus the host-facing operand/capture state

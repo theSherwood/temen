@@ -8202,7 +8202,7 @@ impl Instance {
         let fuel = config.limits.fuel();
         let reserved_log2 = temen_ir::default_reserved_log2();
         let run = if config.parallel {
-            CoopRun::new_parallel(m, 0, &[], fuel, host, init_mem, reserved_log2)
+            CoopRun::new_parallel(m, 0, &[], fuel, host, init_mem, reserved_log2, None, true)
         } else {
             host.set_workers(1); // #2254: the cooperative driver runs every vCPU on one thread
             CoopRun::new_reserved(m, 0, &[], fuel, host, None, init_mem, reserved_log2)

@@ -56,9 +56,17 @@ impl Pumped {
             Pumped::Pump => {
                 bytecode::CoopRun::new_reserved(m, 0, args, fuel, host, None, &[], reserved_log2)
             }
-            Pumped::Threads => {
-                bytecode::CoopRun::new_parallel(m, 0, args, fuel, host, &[], reserved_log2)
-            }
+            Pumped::Threads => bytecode::CoopRun::new_parallel(
+                m,
+                0,
+                args,
+                fuel,
+                host,
+                &[],
+                reserved_log2,
+                None,
+                true,
+            ),
         };
         run.expect("the module is in the engine's subset")
             .expect("the run starts")

@@ -60,10 +60,11 @@ use std::sync::{Arc, Mutex};
 use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
     capture_cut_regions, Attestation, BudgetState, BudgetThawRefused, CapturedDetached,
-    DetachedLaunch, DurableBinding, DurableBudget, DurableHandle, DurableJitTable, DurableJitUnit,
-    DurableNamedCap, DurablePipe, DurableRegion, FrozenDetached, FrozenFiber, FrozenVCpu, Host,
-    MemLayout, NonDurableHandle, RegionBacking, RegionNotCaptured, RegionRefusal, ShadowArena,
-    StreamRole, SvcDispatch, ThawedDetached, Trap,
+    CapturedTwin, DetachedLaunch, DurableBinding, DurableBudget, DurableHandle, DurableJitTable,
+    DurableJitUnit, DurableNamedCap, DurablePipe, DurableRegion, FrozenDetached, FrozenFiber,
+    FrozenTwin, FrozenVCpu, Host, MemLayout, NonDurableHandle, RegionBacking, RegionNotCaptured,
+    RegionRefusal, ShadowArena, StreamRole, SvcDispatch, ThawedDetached, ThawedTwin, Trap,
+    TwinLaunch,
 };
 use temen_ir::Module;
 
@@ -286,7 +287,16 @@ use temen_ir::Module;
 /// fixed slot one NULL guard up for context 0's region header in the module's declared arena, and
 /// every region header grew from 16 bytes to 48 (`REGION_HEADER_LEN`), so frames start 32 bytes
 /// later. The window image layout changed, so a v47 artifact would mis-thaw and is refused.
-const FORMAT_VERSION: u16 = 48;
+/// v49 (#1688): Section 12 (`TAG_TWINS`) — each live fork twin the domain forked, ascending pid: its
+/// launch record and its own root-shaped artifact, bound to its parent's program, since a durable
+/// domain never execs. Elided when the domain forked none that lives, so such an artifact is
+/// byte-identical to v48 but for the version field.
+/// v50 (#1681, #2571): `B_LIVE_IMPL` (7) names its callee by the callee's task id in the frozen run,
+/// where it named the callee's join slot in the holder's table. A task id names the callee from every
+/// domain the offer reaches: one it was re-granted into, or a fork twin's copy. A Section 12 record
+/// gains its kind after the pid: a live twin a personality forked, a live one a servicer forked, or a
+/// servicer's twin that exited unreaped, which holds its outcome.
+const FORMAT_VERSION: u16 = 50;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -325,6 +335,15 @@ const TAG_BUDGETS: u64 = 10;
 /// Section 11 (v39, #2025): the §13 regions inside the cut, by artifact number — each one's bytes.
 /// Emitted only when a region rides.
 const TAG_REGIONS: u64 = 11;
+/// Section 12 (v49, #1688): the fork twins a domain forked, each live one a nested artifact. See
+/// [`write_twins`].
+const TAG_TWINS: u64 = 12;
+/// A Section 12 record's kind: a live twin a personality forked, which its own table reaps.
+const TWIN_LIVE: u8 = 0;
+/// A live twin a servicer's `clone_caller` forked, which the servicer's `wait` reaps (v50, #2571).
+const TWIN_LIVE_SERVICER: u8 = 1;
+/// A servicer's twin that exited, awaiting that `wait` (v50, #2571).
+const TWIN_EXITED: u8 = 2;
 /// How deep detached children may nest inside one artifact. Restore recurses once per level, so an
 /// untrusted artifact must not choose the depth; freeze refuses past the same bound, so it never emits
 /// an artifact restore would reject.
@@ -436,6 +455,10 @@ pub enum FreezeError {
     DetachedUnreached { parent_task: usize, slot: usize },
     /// Detached children nest deeper than [`MAX_DETACHED_DEPTH`].
     DetachedTooDeep,
+    /// #1688 — a fork twin the freeze could not carry ([`Host::unreached_twins`]): it never
+    /// unwound, it ended after the freeze rang it otherwise than by returning (#2571), or its parent
+    /// did not ride. The artifact would be missing a process, so freeze refuses it whole.
+    TwinUnreached { pid: u64 },
     /// #1680 — a pipe has an end outside the cut (held by a domain the freeze does not carry, such
     /// as a fork twin or a detached child). The cut's boundary is not yet carried (#1680 slice 2).
     PipeCrossesCut,
@@ -695,6 +718,9 @@ fn freeze_at(
             parent_task: p.parent_task,
             slot: p.slot,
         });
+    }
+    if let Some(&pid) = host.unreached_twins().first() {
+        return Err(FreezeError::TwinUnreached { pid });
     }
     // The head is page-granular, covers the declared window, and fits the mask domain it grew
     // within; each page held past it lies in that domain, apart, ascending — restore's own rule
@@ -963,7 +989,74 @@ fn freeze_at(
         });
     }
 
+    // Section 12 — the domain's fork twins (#1688, v49). Each live twin's artifact is frozen first,
+    // as a detached child's is, so a twin that can't be frozen fails this freeze whole. Elided when
+    // none rides, live or exited (#2571).
+    if !host.captured_twins().is_empty() || !host.frozen_twins().is_empty() {
+        if depth >= MAX_DETACHED_DEPTH {
+            return Err(FreezeError::DetachedTooDeep);
+        }
+        let body = write_twins(module, host, depth, cut)?;
+        section(&mut out, TAG_TWINS, |b| b.extend_from_slice(&body));
+    }
+
     Ok(out)
+}
+
+/// Serialize Section 12 (v49): the domain's fork twins, ascending pid. Each record is the pid and its
+/// kind ([`TWIN_LIVE`], [`TWIN_LIVE_SERVICER`], [`TWIN_EXITED`]). A live twin's then holds its launch
+/// record and its own artifact, length-prefixed. That artifact is this format, frozen from its own
+/// powerbox over its parent's program, which it runs (a durable domain never execs). An exited
+/// servicer twin's holds its outcome (v50, #2571).
+fn write_twins(
+    module: &Module,
+    host: &Host,
+    depth: usize,
+    cut: &Cut,
+) -> Result<Vec<u8>, FreezeError> {
+    enum Twin<'a> {
+        Live(&'a CapturedTwin),
+        Exited(&'a FrozenTwin),
+    }
+    let live = host.captured_twins().iter().map(|t| (t.pid, Twin::Live(t)));
+    let exited = host.frozen_twins().iter().map(|t| (t.pid, Twin::Exited(t)));
+    let mut twins: Vec<(u64, Twin)> = live.chain(exited).collect();
+    twins.sort_by_key(|&(pid, _)| pid);
+    let mut b = Vec::new();
+    write_uleb(&mut b, twins.len() as u64);
+    for (pid, twin) in twins {
+        write_uleb(&mut b, pid);
+        match twin {
+            Twin::Live(t) => {
+                let art = {
+                    let h = t.host.lock().unwrap_or_else(|e| e.into_inner());
+                    freeze_at(
+                        module,
+                        Image::of(&t.window),
+                        t.reserved_log2,
+                        &h,
+                        depth + 1,
+                        cut,
+                    )?
+                };
+                b.push(if t.launch.servicer {
+                    TWIN_LIVE_SERVICER
+                } else {
+                    TWIN_LIVE
+                });
+                write_uleb(&mut b, u64::from(t.launch.entry));
+                write_uleb(&mut b, u64::from(t.launch.ctx));
+                write_names(&mut b, &t.launch.names);
+                write_uleb(&mut b, art.len() as u64);
+                b.extend_from_slice(&art);
+            }
+            Twin::Exited(t) => {
+                b.push(TWIN_EXITED);
+                write_join_outcome(&mut b, Some(t.outcome));
+            }
+        }
+    }
+    Ok(b)
 }
 
 /// #2025 — the §13 regions a freeze's cut names, numbered by position ([`capture_cut_regions`], which
@@ -991,10 +1084,17 @@ fn number_cut_regions(host: &Host, image: &Image<'_>) -> Result<Vec<DurableRegio
     fn descendants(h: &Host, out: &mut Vec<Domain>) {
         let mut order: Vec<&CapturedDetached> = h.captured_detached().iter().collect();
         order.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
-        for c in order {
-            let prots = Image::of(&c.window).all_prots().collect();
-            out.push((Arc::clone(&c.host), prots));
-            descendants(&c.host.lock().unwrap_or_else(|e| e.into_inner()), out);
+        // #1688 — then its twins, in the pid order their artifacts nest in.
+        let mut twins: Vec<&CapturedTwin> = h.captured_twins().iter().collect();
+        twins.sort_by_key(|t| t.pid);
+        let domains = order
+            .into_iter()
+            .map(|c| (&c.host, &c.window))
+            .chain(twins.into_iter().map(|t| (&t.host, &t.window)));
+        for (host, window) in domains {
+            let prots = Image::of(window).all_prots().collect();
+            out.push((Arc::clone(host), prots));
+            descendants(&host.lock().unwrap_or_else(|e| e.into_inner()), out);
         }
     }
     let mut domains = Vec::new();
@@ -1062,6 +1162,12 @@ fn number_cut_budgets(host: &Host) -> Result<CutBudgets, FreezeError> {
             }
             out.extend(mine);
             held(root, &ch, out)?;
+        }
+        // #1688 — a twin shares its parent's tree, as a forked process stays in its cgroup.
+        for t in h.captured_twins() {
+            let th = t.host.lock().unwrap_or_else(|e| e.into_inner());
+            out.extend(th.budget_nodes_held());
+            held(root, &th, out)?;
         }
         Ok(())
     }
@@ -1255,18 +1361,40 @@ fn write_detached(
         write_uleb(&mut b, l.task);
         b.extend_from_slice(&l.digest);
         write_uleb(&mut b, l.lane as u64);
-        write_uleb(&mut b, l.names.len() as u64);
-        for (name, h) in &l.names {
-            write_uleb(&mut b, name.len() as u64);
-            b.extend_from_slice(name.as_bytes());
-            write_uleb(&mut b, *h as u32 as u64);
-        }
+        write_names(&mut b, &l.names);
         // v47 (#2438): the spawner's pager export plus one, `0` for an unpaged child.
         write_uleb(&mut b, l.pager.map_or(0, |e| u64::from(e) + 1));
         write_uleb(&mut b, art.len() as u64);
         b.extend_from_slice(&art);
     }
     Ok(b)
+}
+
+/// A launch record's cap names, `(name, handle)`: the count, then each name length-prefixed and its
+/// handle.
+fn write_names(b: &mut Vec<u8>, names: &[(String, i32)]) {
+    write_uleb(b, names.len() as u64);
+    for (name, h) in names {
+        write_uleb(b, name.len() as u64);
+        b.extend_from_slice(name.as_bytes());
+        write_uleb(b, *h as u32 as u64);
+    }
+}
+
+/// The inverse of [`write_names`]; a name that is not UTF-8, or a handle wider than 32 bits, is
+/// malformed.
+fn read_names(r: &mut Reader<'_>) -> Result<Vec<(String, i32)>, RestoreError> {
+    let n = r.uleb()? as usize;
+    let mut names = Vec::with_capacity(n.min(64));
+    for _ in 0..n {
+        let len = r.uleb()? as usize;
+        let name = core::str::from_utf8(r.take(len)?)
+            .map_err(|_| RestoreError::Malformed)?
+            .to_string();
+        let h = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)? as i32;
+        names.push((name, h));
+    }
+    Ok(names)
 }
 
 /// Serialize the named host capabilities (Section 7, v21). Canonical: the entry count, then one
@@ -1490,6 +1618,7 @@ fn restore_at(
     let mut pipes_body = None;
     let mut budgets_body = None;
     let mut regions_body = None;
+    let mut twins_body = None;
     while !r.at_end() {
         let tag = r.uleb()?;
         let len = r.uleb()? as usize;
@@ -1507,6 +1636,7 @@ fn restore_at(
             TAG_PIPES => pipes_body = Some(body),
             TAG_BUDGETS => budgets_body = Some(body),
             TAG_REGIONS => regions_body = Some(body),
+            TAG_TWINS => twins_body = Some(body),
             // Fail closed on an unknown tag (#915/§8). The version gate above already pins
             // `version == FORMAT_VERSION`, so no artifact this build emits can carry one — silently
             // skipping it was dead "forward-compat" that only opened a canonicality hole (a
@@ -1880,6 +2010,13 @@ fn restore_at(
         let children = decode_detached(body, module, host, depth, cut)?;
         host.set_thawed_detached(children);
     }
+    // ---- Fork twins (#1688, v49): each live one restored from its own nested artifact into its own
+    // powerbox, against its parent's program, as a detached child is. ----
+    if let Some(body) = twins_body {
+        let (twins, exited) = decode_twins(body, module, host, depth, cut)?;
+        host.set_thawed_twins(twins);
+        host.set_frozen_twins(exited);
+    }
     // #1944: every carried budget node is one some domain of the cut named, or an ancestor of one
     // (canonical), known only now that every detached child's handles are in.
     if depth == 0 {
@@ -1900,6 +2037,70 @@ fn restore_at(
         layout.hold(off, prot, bytes);
     }
     Ok((layout, reserved_log2))
+}
+
+/// Decode Section 12 ([`write_twins`]) and restore each live twin's artifact into a fresh powerbox
+/// holding the restoring host's thaw seams ([`Host::detached_thaw_host`]), against `module`, its
+/// parent's program: the live twins, then the exited ones.
+fn decode_twins(
+    body: &[u8],
+    module: &Module,
+    host: &mut Host,
+    depth: usize,
+    cut: &mut ThawCut,
+) -> Result<(Vec<ThawedTwin>, Vec<FrozenTwin>), RestoreError> {
+    if depth >= MAX_DETACHED_DEPTH {
+        return Err(RestoreError::Malformed);
+    }
+    let mut r = Reader::new(body);
+    let n = r.uleb()? as usize;
+    if n == 0 {
+        return Err(RestoreError::Malformed); // canonical: an empty list elides the section
+    }
+    let (mut twins, mut exited) = (Vec::new(), Vec::new());
+    let mut last: Option<u64> = None;
+    for _ in 0..n {
+        let pid = r.uleb()?;
+        if last.is_some_and(|p| p >= pid) {
+            return Err(RestoreError::Malformed); // canonical: strictly ascending pid
+        }
+        last = Some(pid);
+        let servicer = match r.u8()? {
+            TWIN_LIVE => false,
+            TWIN_LIVE_SERVICER => true,
+            TWIN_EXITED => {
+                let outcome = read_join_outcome(&mut r)?.ok_or(RestoreError::Malformed)?;
+                exited.push(FrozenTwin { pid, outcome });
+                continue;
+            }
+            _ => return Err(RestoreError::Malformed),
+        };
+        let entry = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
+        let ctx = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
+        let names = read_names(&mut r)?;
+        let art_len = r.uleb()? as usize;
+        let art = r.take(art_len)?;
+        let mut twin = host.detached_thaw_host();
+        let restored = restore_at(art, module, &mut twin, depth + 1, cut);
+        host.reclaim_thaw_seams(&mut twin);
+        let (window, reserved_log2) = restored?;
+        twins.push(ThawedTwin {
+            pid,
+            window,
+            reserved_log2,
+            host: twin,
+            launch: TwinLaunch {
+                entry,
+                ctx,
+                servicer,
+                names,
+            },
+        });
+    }
+    if !r.at_end() {
+        return Err(RestoreError::Malformed);
+    }
+    Ok((twins, exited))
 }
 
 /// Decode Section 8 ([`write_detached`]) and restore each child's artifact into a fresh powerbox that
@@ -1937,16 +2138,7 @@ fn decode_detached(
             .try_into()
             .expect("take(32) yields exactly 32 bytes");
         let lane = r.uleb()? as i64;
-        let n_names = r.uleb()? as usize;
-        let mut names = Vec::with_capacity(n_names.min(64));
-        for _ in 0..n_names {
-            let len = r.uleb()? as usize;
-            let name = core::str::from_utf8(r.take(len)?)
-                .map_err(|_| RestoreError::Malformed)?
-                .to_string();
-            let h = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)? as i32;
-            names.push((name, h));
-        }
+        let names = read_names(&mut r)?;
         // #2438 — op 17 admits only a `{ page: (i64) -> (i64) }` export of the spawner's program as a
         // pager (`Module::is_pager_export`), so an artifact naming anything else is malformed.
         let pager = match r.uleb()? {
@@ -2314,9 +2506,9 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
         }
         DurableBinding::Instantiator => b.push(B_INSTANTIATOR),
         DurableBinding::FreezeAuthority => b.push(B_FREEZE_DETACHED),
-        DurableBinding::LiveImpl { slot, export } => {
+        DurableBinding::LiveImpl { task, export } => {
             b.push(B_LIVE_IMPL);
-            write_uleb(b, slot as u64);
+            write_uleb(b, task);
             write_uleb(b, export as u64);
         }
         DurableBinding::PipeEnd { pipe, write } => {
@@ -2376,7 +2568,7 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
         B_FREEZE_DETACHED => DurableBinding::FreezeAuthority,
         B_INSTANTIATOR => DurableBinding::Instantiator,
         B_LIVE_IMPL => DurableBinding::LiveImpl {
-            slot: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+            task: r.uleb()?,
             export: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
         },
         B_MODULE => DurableBinding::Module {

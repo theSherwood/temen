@@ -339,6 +339,7 @@ fn a_registrar_re_grants_named_caps_and_the_handles_still_dispatch() {
             handler: Box::new(move |_op: u32, _args: &[i64], _mem, _| Ok(vec![answer])),
             fork: None,
             state: temen_interp::CapState::Stateless,
+            process: None,
         })
     }));
     b.restore_durable_named(&named)
@@ -388,6 +389,7 @@ fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
                 handler: answer(),
                 fork: forkable.then(factory),
                 state: temen_interp::CapState::Stateless,
+                process: None,
             })
         }));
         b.restore_durable_named(&named)
@@ -443,6 +445,7 @@ fn a_restore_refuses_a_name_the_embedder_does_not_serve() {
             handler: Box::new(|_op, _args, _mem, _| Ok(vec![0])),
             fork: None,
             state: temen_interp::CapState::Stateless,
+            process: None,
         })
     }));
     assert_eq!(picky.restore_durable_named(&named).unwrap_err().name, "fs");

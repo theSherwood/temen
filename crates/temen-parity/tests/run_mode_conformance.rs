@@ -264,7 +264,9 @@ fn pumped(
     let reserved = temen_ir::default_reserved_log2();
     let run = match exec {
         Pumped::Pump => CoopRun::new_reserved(m, 0, &args, FUEL, host, None, &[], reserved),
-        Pumped::Threads => CoopRun::new_parallel(m, 0, &args, FUEL, host, &[], reserved),
+        Pumped::Threads => {
+            CoopRun::new_parallel(m, 0, &args, FUEL, host, &[], reserved, None, true)
+        }
     };
     let mut run = match run {
         None => return Verdict::Declined,

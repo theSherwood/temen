@@ -15,8 +15,9 @@
 //! #2480 — nor does the pump sleep through a kill while a host call is outstanding: its idle wait
 //! for the call's answer is a wait on the same bell, which the call's store rings too.
 //!
-//! #1414 S5a — an embedder's stop ([`bytecode::RunStop`]) ends a parallel run the same way, and asking
-//! never waits for the run: a browser page asks on its main thread, which cannot block.
+//! #1414 S5a — an embedder's stop ([`bytecode::RunDoor::stop`]) ends a parallel run the same way,
+//! and asking never waits for the run: a browser page asks on its main thread, which cannot block.
+//! #1414 5b-2 — a wake through the same door hands the thread that pumps the run control back.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -244,7 +245,7 @@ block 1 (vi: i64) {
 /// Run `src` on executor 2 with `stop`, on a thread of its own: its result arrives on the receiver.
 fn run_parallel_with_stop(
     src: &str,
-    stop: &Arc<bytecode::RunStop>,
+    stop: &Arc<bytecode::RunDoor>,
 ) -> std::sync::mpsc::Receiver<Result<Vec<Value>, Trap>> {
     let m = temen_text::parse_module(src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
@@ -252,7 +253,7 @@ fn run_parallel_with_stop(
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut host = Host::new();
-        host.set_run_stop(stop);
+        host.set_run_door(stop);
         let mut fuel = u64::MAX;
         let r = bytecode::compile_and_run_capture_over_parallel_with_host(
             &m,
@@ -269,15 +270,15 @@ fn run_parallel_with_stop(
 }
 
 /// Ask until the run is told: a busy lock answers `false`, and asking again is the caller's part.
-fn stop_now(stop: &bytecode::RunStop) {
-    while !stop.request() {
+fn stop_now(stop: &bytecode::RunDoor) {
+    while !stop.stop() {
         std::thread::yield_now();
     }
 }
 
 #[test]
 fn a_stop_ends_a_parallel_run_whose_tasks_all_sleep() {
-    let stop = Arc::new(bytecode::RunStop::default());
+    let stop = Arc::new(bytecode::RunDoor::default());
     let rx = run_parallel_with_stop(SLEEP_30S, &stop);
     // The root is in its wait (or about to be: a stop asked earlier ends it there too).
     std::thread::sleep(Duration::from_millis(50));
@@ -294,7 +295,7 @@ fn a_stop_ends_a_parallel_run_whose_tasks_all_sleep() {
 
 #[test]
 fn a_stop_ends_a_parallel_run_whose_thread_spins() {
-    let stop = Arc::new(bytecode::RunStop::default());
+    let stop = Arc::new(bytecode::RunDoor::default());
     let rx = run_parallel_with_stop(SPIN_THREAD, &stop);
     std::thread::sleep(Duration::from_millis(50));
     stop_now(&stop);
@@ -307,7 +308,7 @@ fn a_stop_ends_a_parallel_run_whose_thread_spins() {
 /// A stop asked for before the run starts ends it at once; once withdrawn, the next run is its own.
 #[test]
 fn a_stop_asked_before_the_run_ends_it_and_a_reset_one_does_not() {
-    let stop = Arc::new(bytecode::RunStop::default());
+    let stop = Arc::new(bytecode::RunDoor::default());
     stop_now(&stop);
     let r = run_parallel_with_stop(SPIN_THREAD, &stop)
         .recv_timeout(Duration::from_secs(10))
@@ -324,5 +325,72 @@ fn a_stop_asked_before_the_run_ends_it_and_a_reset_one_does_not() {
         r,
         Ok(vec![Value::I64(7)]),
         "a withdrawn stop leaves the next run be"
+    );
+}
+
+/// From a thread of the test's own, ask `ask` of `door` until the run hears it.
+fn ask_from_a_thread(
+    door: &Arc<bytecode::RunDoor>,
+    ask: fn(&bytecode::RunDoor) -> bool,
+) -> std::thread::JoinHandle<()> {
+    let door = Arc::clone(door);
+    std::thread::spawn(move || {
+        // Most likely while the pumping thread sleeps in its watch, the case the wake is for.
+        std::thread::sleep(Duration::from_millis(20));
+        while !ask(&door) {
+            std::thread::yield_now();
+        }
+    })
+}
+
+/// #1414 5b-2 — a wake through the door hands the thread that pumps a parallel run control back
+/// (`Paused`) while the run's tasks go on: the root's thread still spins, so the stop that follows
+/// through the same door ends the run.
+#[test]
+fn a_wake_hands_the_pumping_thread_control_back_while_the_run_goes_on() {
+    let m = temen_text::parse_module(SPIN_THREAD).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let door = Arc::new(bytecode::RunDoor::default());
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let door = Arc::clone(&door);
+        std::thread::spawn(move || {
+            let mut host = Host::new();
+            host.set_run_door(door);
+            let mut run = bytecode::CoopRun::new_parallel(
+                &m,
+                0,
+                &[],
+                u64::MAX,
+                host,
+                &[],
+                temen_ir::default_reserved_log2(),
+                None,
+                true,
+            )
+            .expect("the parallel driver runs this module")
+            .expect("the run opens");
+            let woken = matches!(run.run(), bytecode::CoopEvent::Paused);
+            let _ = tx.send(woken);
+            let stopped = matches!(run.run(), bytecode::CoopEvent::Trapped(Trap::OutOfFuel));
+            let _ = tx.send(stopped);
+        });
+    }
+    ask_from_a_thread(&door, bytecode::RunDoor::wake)
+        .join()
+        .unwrap();
+    let woken = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the pumping thread slept through the wake");
+    assert!(woken, "a wake hands the pumping thread control back");
+    ask_from_a_thread(&door, bytecode::RunDoor::stop)
+        .join()
+        .unwrap();
+    let stopped = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the stopped run spun on");
+    assert!(
+        stopped,
+        "the run went on past the wake, and the stop ended it"
     );
 }
