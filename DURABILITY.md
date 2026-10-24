@@ -627,7 +627,11 @@ residue's `parent_task`s through its frozen id), and re-links the spawner's join
 flag and lane — so the spawner's rewound `thread.join` parks on it exactly as before the cut — and the
 stdio the spawner had re-granted it, aliased to the spawner's streams again (#2054). A child the
 spawner had detached gets no join slot or lane back: it goes back on `unreaped`, so the spawner's
-handle still reaches nothing and a later detach reaps it. Nesting
+handle still reaches nothing and a later detach reaps it. A child the thaw does not re-launch (its
+grant gone, its imports no longer binding, or no room for it in the process's pools, #2318) is
+dropped, and what the freeze kept charged for it goes back with what it kept for the child's own
+captured children (`Host::drop_restored`, #2430). One its spawner can join ends with `ThreadFault`,
+which the rewound join answers, on both engines. Nesting
 depth inside one artifact is bounded (`MAX_DETACHED_DEPTH`, on both sides). A binding in an artifact
 is bounded by the window's **reservation**, not its committed image: a detached child's starter caps
 span its reservation (as a root's do, so `vm_map` can grow into it), and every host-side use is

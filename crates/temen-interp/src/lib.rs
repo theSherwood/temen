@@ -2788,7 +2788,7 @@ fn seed_domain(
         lseed.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
         for td in lseed {
             let spawner: &mut VCpu = match live(&live_ids, td.parent_task) {
-                Some(p) if p == id => &mut *root,
+                Some(p) if p == id => &mut root,
                 Some(p) => match children.get_mut(&p) {
                     Some(p) => p,
                     None => continue,
@@ -3109,9 +3109,14 @@ fn thaw_window(spec: WindowSpec, image: &MemLayout, host: &mut Host, ctx: usize)
 /// image, restore it to `REWINDING`, rebuild its powerbox bounds from the spawner-held
 /// [`DetachedLaunch`], seed its own residue through [`seed_domain`] (it is a root of its own window),
 /// and re-link the spawner's per-slot state — join, doorbell, kill flag, lane, powerbox — exactly as op
-/// 15 minted them. `grants` is the spawner's domain powerbox, which holds the module grant the child
-/// runs. When the grant is gone or the child's imports no longer bind, it is not relaunched: the
-/// spawner's slot stays empty and its rewound join fails closed.
+/// 15 minted them, or (#2465) as a detach (op 10) left them. `grants` is the spawner's domain
+/// powerbox, which holds the module grant the child runs.
+///
+/// It is not relaunched when its grant is gone or its imports no longer bind, or (#2318) when the
+/// process's pools have no room for its lease or its regions. #2430 — whatever refuses it, it is
+/// dropped with what the freeze kept charged for it and for its own captured children
+/// ([`Host::drop_restored`]), and one its spawner can join ends with `ThreadFault`, which the
+/// spawner's rewound join answers. #2465 — one its spawner detached just ends.
 fn relaunch_detached(
     s: &mut Sched,
     sched: &Arc<Scheduler>,
@@ -3128,62 +3133,69 @@ fn relaunch_detached(
         ..
     } = td;
     let task = launch.task as TaskId;
-    let residue = ThawResidue::take(&mut host, task);
-    let relaunch =
-        grants
-            .lock_unpoisoned()
-            .prepare_detached_relaunch(&launch, host, window.page_map());
-    let Some(DetachedRelaunch {
+    // Each step that may refuse the relaunch, `Err(leased)` when one does: whether the child's lease
+    // was filed again (and has gone back on its own).
+    let ready = 'ready: {
+        let relaunch = grants.lock_unpoisoned().prepare_detached_relaunch(
+            &launch,
+            &mut host,
+            window.page_map(),
+        );
+        let Some(relaunch) = relaunch else {
+            break 'ready Err(false);
+        };
+        // #1971 — the lease op 17 filed at the spawn, filed again: the child's window goes back to
+        // the budget that paid for it when the child ends, on the spawner's handle, as an unfrozen
+        // child's does.
+        let runs = window
+            .page_map()
+            .window_runs(temen_ir::module_null_guard(), 1u64 << reserved_log2);
+        let filed =
+            spawner
+                .host
+                .lock_unpoisoned()
+                .relaunch_lease(&mut host, relaunch.memory_log2, runs);
+        let Ok(lease) = filed else {
+            break 'ready Err(false);
+        };
+        let lease = lease.map(|lease| (Arc::clone(&spawner.host), lease));
+        // The window: built as op 17 builds it (its NULL guard included, #1733), its runs paid for
+        // by its lease.
+        let spec = WindowSpec {
+            reserved_log2,
+            mapped_log2: relaunch.memory_log2,
+            shadow: relaunch.shadow,
+            data: &relaunch.module.data,
+            null_guard: temen_ir::module_null_guard(),
+            ..WindowSpec::default()
+        };
+        let Some(mem) = thaw_window(spec, &window, &mut host, 0) else {
+            // Its window goes back as its end would hand it back.
+            if let Some((spawner_host, lease)) = &lease {
+                spawner_host.lock_unpoisoned().release_detached(*lease);
+            }
+            break 'ready Err(lease.is_some());
+        };
+        Ok((relaunch, lease, mem))
+    };
+    let (relaunch, lease, mem) = match ready {
+        Ok(ready) => ready,
+        Err(leased) => {
+            host.drop_restored(&launch, &window, leased);
+            if launch.joinable {
+                deliver_detached(s, spawner, slot, Err(Trap::ThreadFault));
+            }
+            return;
+        }
+    };
+    let DetachedRelaunch {
         funcs,
         types,
-        shadow,
-        memory_log2,
         module,
-        mut host,
-    }) = relaunch
-    else {
-        return;
-    };
-    // #1971 — the lease op 17 filed at the spawn, filed again: the child's window goes back to the
-    // budget that paid for it when the child ends, on the spawner's handle, as an unfrozen child's does.
-    // #2318 — refused when the process's pools have no room for it: the child is not relaunched, and
-    // ends with `ThreadFault` (its window went back).
-    let runs = window
-        .page_map()
-        .window_runs(temen_ir::module_null_guard(), 1u64 << reserved_log2);
-    let filed = spawner
-        .host
-        .lock_unpoisoned()
-        .relaunch_lease(&mut host, memory_log2, runs);
-    let Ok(lease) = filed else {
-        if launch.joinable {
-            deliver_detached(s, spawner, slot, Err(Trap::ThreadFault));
-        }
-        return;
-    };
-    let lease = lease.map(|lease| (Arc::clone(&spawner.host), lease));
-    // The window: built as op 17 builds it (its NULL guard included, #1733), its runs paid for by
-    // its lease.
-    let spec = WindowSpec {
-        reserved_log2,
-        mapped_log2: memory_log2,
-        shadow,
-        data: &module.data,
-        null_guard: temen_ir::module_null_guard(),
-        ..WindowSpec::default()
-    };
-    let Some(mem) = thaw_window(spec, &window, &mut host, 0) else {
-        // #2318 — a relaunch refused once its lease is filed hands the child's window back, as its
-        // end would: it never runs, and ends with `ThreadFault`.
-        host.release_memory();
-        if let Some((spawner_host, lease)) = lease {
-            spawner_host.lock_unpoisoned().release_detached(lease);
-        }
-        if launch.joinable {
-            deliver_detached(s, spawner, slot, Err(Trap::ThreadFault));
-        }
-        return;
-    };
+        ..
+    } = relaunch;
+    // Its residue, now that it is relaunched: until here a refusal dropped it with the child.
+    let residue = ThawResidue::take(&mut host, task);
     let dom = host.domain_id() as usize;
     let child_host = Arc::new(Mutex::new(host));
     sched.wire_signal_doors(&child_host);
@@ -11680,8 +11692,8 @@ pub struct CapturedDetached {
     pub launch: DetachedLaunch,
 }
 
-/// #1361 step 4 — a thawed detached child ready to re-launch, on either engine: its own program
-/// (resolved by digest against the restoring host's durable grants) and its powerbox with the
+/// #1361 step 4 — a thawed detached child ready to re-launch, on either engine: its own program,
+/// resolved by digest against the restoring host's durable grants, once its powerbox has the
 /// spawner-held launch record re-applied. See [`Host::prepare_detached_relaunch`].
 pub struct DetachedRelaunch {
     pub funcs: Arc<[Func]>,
@@ -11689,7 +11701,6 @@ pub struct DetachedRelaunch {
     pub shadow: Option<ShadowArena>,
     pub memory_log2: u8,
     pub module: Arc<Module>,
-    pub host: Host,
 }
 
 /// #1361 step 4 — a captured detached child as a **thaw** receives it: its restored window and
@@ -26427,16 +26438,16 @@ impl Host {
     /// resolve its program by digest among this (spawner's) powerbox's durable grants, and re-apply to
     /// its restored powerbox what the spawner decided — durability, its lane cap, its program
     /// as self module, its grant names, the stdio it inherited (#2054), and its import bindings.
-    /// `None` if the grant is gone, it declares no memory, or its imports no longer bind. `window` is
-    /// its restored window's page map: what it had grown past its declared size stays charged, as the
-    /// artifact carries it (#1909).
+    /// `None` if the grant is gone, it declares no memory, or its imports no longer bind: the caller
+    /// drops the child ([`Host::drop_restored`]). `window` is its restored window's page map: what it
+    /// had grown past its declared size stays charged, as the artifact carries it (#1909).
     pub fn prepare_detached_relaunch(
         &mut self,
         launch: &DetachedLaunch,
-        mut host: Host,
+        host: &mut Host,
         window: &PageMap,
     ) -> Option<DetachedRelaunch> {
-        self.alias_inherited_stdio(&mut host);
+        self.alias_inherited_stdio(host);
         let (_, g) = self.grant_by_digest(&launch.digest)?;
         let memory_log2 = g.memory_log2()?;
         host.set_durable(true);
@@ -26464,7 +26475,6 @@ impl Host {
             shadow: g.shadow(),
             memory_log2,
             module: Arc::clone(&g.module),
-            host,
         })
     }
 
@@ -28335,9 +28345,9 @@ impl Host {
     /// which `child`'s window is paid for up to ([`Self::paid_runs`]), and (#2318) what its restored
     /// window holds past them, of its `runs` ([`PageMap::window_runs`]), its §13 pages among them.
     /// #2305 — nor any address space, so the lease's is charged again with them. #2318 — past any
-    /// ceiling, since the artifact's use was granted, but never past the process's pools: `-ENOMEM`
-    /// when they have no room, and then the window the freeze kept charged goes back, as the child's
-    /// end would hand it back. The relaunch is refused, and the child never runs.
+    /// ceiling, since the artifact's use was granted, but never past the process's pools: `-ENOMEM`,
+    /// charging nothing, when they have no room. The relaunch is refused, the child never runs, and
+    /// its caller drops it ([`Host::drop_restored`]).
     pub fn relaunch_lease(
         &self,
         child: &mut Host,
@@ -28367,9 +28377,6 @@ impl Host {
             (RESERVED, lease.reserved()),
         ];
         if !self.budgets.add(node, &held, Fits::Pool) {
-            let kept = [(BUDGET_MEM, lease.bytes), (BUDGET_SPAWN, 1)];
-            self.budgets.refund_set(node, &kept);
-            child.release_memory();
             return Err(ENOMEM);
         }
         (child.paid_runs, child.leased, child.maps) = (lease.runs, lease.bytes, past);
@@ -28504,6 +28511,31 @@ impl Host {
         if self.own_budget != BudgetTree::RUN_NODE {
             self.regions.clear();
         }
+    }
+
+    /// #2430 — this domain, a detached child a thaw restored over `window` to launch by `launch`, is
+    /// not relaunched: what the freeze kept charged for it goes back, as its end would hand it back.
+    /// That is its window's declared bytes and its first vCPU, unless `leased` (the thaw filed its
+    /// lease again, which goes back on its own), and what its window grew and its regions; and each
+    /// of its own captured children is dropped the same way. Nothing else would hand these back: the
+    /// freeze kept them for the relaunch to take over. Its budget is the one its launch names, since
+    /// a refused relaunch may not have registered its names yet.
+    pub fn drop_restored(mut self, launch: &DetachedLaunch, window: &MemLayout, leased: bool) {
+        let map = window.page_map();
+        let budget = launch.names.iter().find(|(name, _)| name == "budget");
+        if let Some(node) = budget.and_then(|&(_, h)| self.budget_node(h)) {
+            if !leased {
+                self.budgets
+                    .refund_set(node, &[(BUDGET_MEM, map.mapped()), (BUDGET_SPAWN, 1)]);
+            }
+            (self.own_budget, self.grown) = (node, map.grown_bytes());
+        }
+        for child in self.take_thawed_detached() {
+            child
+                .host
+                .drop_restored(&child.launch, &child.window, false);
+        }
+        self.release_memory();
     }
 
     /// #2268 — hand back what this domain holds of `maps` itself ([`Self::maps`],
