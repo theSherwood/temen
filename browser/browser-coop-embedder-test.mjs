@@ -7,9 +7,9 @@
 // asynchronously) and ends with the right value and stdout, handed over through `onOutput`. Where
 // the host suspends (Chromium's JSPI) its root runs whole as one leaf and each park resumes the
 // leaf's frames; where it cannot (Node), it runs interpreted. The run goes on while an answer is owed:
-// a root's timer fires in the page's time before an answer that comes later (#2557). Resolving a
-// park to `null` stops the run; so does `onSlice` resolving `false` on a program that never ends,
-// after its output has streamed.
+// a root's timer fires in the page's time before an answer that comes later (#2557), and a lone wait
+// takes its time (#2439). Resolving a park to `null` stops the run; so does `onSlice` resolving
+// `false` on a program that never ends, after its output has streamed.
 // A trap with `trapDeclines: false` returns its status, name and fault address; by default it throws.
 // Under JSPI a leaf is sliced at its own safepoints (step 4): a leaf that never ends stops at a budget
 // checkpoint when `onSlice` says so, and a long one hands its output over from inside, as it runs.
@@ -29,7 +29,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { driveCoopTierupRun, suspendsLeaves } from './web/coop-driver.js';
 import { engineImports } from './engine-imports.mjs';
-import { runCases, runX2Cases, pong, PINGS, bigFeed } from './coop-embedder-cases.mjs';
+import { runCases, runX2Cases, pong, PINGS, bigFeed, LONE_WAIT_MS } from './coop-embedder-cases.mjs';
 import { startServer } from './serve.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -67,6 +67,12 @@ const check = (host, r, suspends) => {
   if (t.status !== 0 || t.value !== timed || t.parks !== 1) {
     fail(`${host}: a timer fires while an answer is owed: status ${t.status}, value ${t.value}, `
       + `${t.parks} parks (want 0, ${timed}, 1)`);
+  }
+  // #2439: a lone wait timed out (2) after its time, not at once.
+  const w = r.loneWait;
+  if (w.status !== 0 || w.value !== 2n || w.ms < LONE_WAIT_MS) {
+    fail(`${host}: a lone ${LONE_WAIT_MS} ms wait: status ${w.status}, value ${w.value}, `
+      + `after ${w.ms.toFixed(1)} ms`);
   }
   if (r.stopAtPark.status !== null || r.stopAtPark.parks !== 3) {
     fail(`${host}: a park answered null stops the run: status ${r.stopAtPark.status}, ${r.stopAtPark.parks} parks`);

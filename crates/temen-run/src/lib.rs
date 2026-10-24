@@ -5317,12 +5317,13 @@ pub enum Outcome {
 /// #1122 route (a) — one pump step of a [`CoopSession`].
 #[derive(Debug)]
 pub enum SessionStep {
-    /// Nothing can run until the embedder acts (#1414 D4): every task is parked on input only the
-    /// embedder can supply (a terminal read: feed the terminal), or on the answer to a call it was
-    /// told of ([`SessionStep::CapPark`]: answer it), and pump again. The run is live and its whole
-    /// state retained in the session. #2557 — `timer` is how long, in ns, until the run's next timer,
-    /// which fires once the embedder has let that time pass ([`CoopSession::pass_time`]); `None` when
-    /// no wait has a deadline ([`temen_interp::bytecode::CoopEvent::Idle`]).
+    /// Nothing can run until the embedder acts or the run's next timer is due (#1414 D4, #2439):
+    /// every task is parked on input only the embedder can supply (a terminal read: feed the
+    /// terminal), on the answer to a call it was told of ([`SessionStep::CapPark`]: answer it), or
+    /// on a timed wait. The run is live and its whole state retained in the session. `timer` is how
+    /// long, in ns, until that timer, which fires once the embedder has let its time pass
+    /// ([`CoopSession::pass_time`]), and `None` when no wait has a deadline
+    /// ([`temen_interp::bytecode::CoopEvent::Idle`]).
     Idle { timer: Option<u64> },
     /// #2528 — the guest has just made host-answered call `id`: a call to a capability whose proc
     /// answers with [`temen_interp::OffloadOutcome::Host`]. Answer it with the

@@ -153,9 +153,9 @@ property, so in practice:
   call once, while the run's other tasks go on; at the run's idle point, when nothing can run until
   the embedder acts (an answer it owes, or input it feeds), with `Idle` instead of waiting; and at its
   end. The pump and the debug scheduler follow the same rule (#1414 D4, #2531), so `run` never waits
-  on its embedder. `Idle` carries the time to the run's next timer (#2557): while an answer is owed,
-  the pump fires a timer only once its embedder has let that time pass (`CoopRun::pass_time`), and
-  executor 2's fire on their own. Both executors reach their idle verdict through one function (`stalled`), and both
+  on its embedder. `Idle` carries the time to the run's next timer (#2557, #2439): the pump fires a
+  timer only once its embedder has let that time pass (`CoopRun::pass_time`), and hands back `Idle`
+  whenever a timer is all that can wake the run; executor 2's timers fire on their own. Both executors reach their idle verdict through one function (`stalled`), and both
   count a runnable task of a stopped process as waiting, as the pump's pick skips it (#2529 tracks
   the tree-walker, which waits forever there).
   *Since #1414 5b-2:* the one-shot run is that handle with no embedder to tell, run to its end

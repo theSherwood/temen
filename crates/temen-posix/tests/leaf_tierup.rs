@@ -226,7 +226,7 @@ fn run_tree(guest_text: &str, command: &str, leaf: bool) -> (Ending, Leaves) {
     .expect("it starts");
     let (mut tierups, mut resumes) = (Vec::new(), 0);
     let end = loop {
-        match run.run() {
+        match run.run_clockless() {
             CoopEvent::TierUp {
                 module, func, argv, ..
             } => {

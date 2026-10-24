@@ -16,7 +16,8 @@ mod rec;
 
 use std::time::{Duration, Instant};
 
-use drivers::{agree_on_every_driver, Driver, Ran};
+use drivers::{agree_on_every_driver, Driver, Pumped, Ran, PUMPED};
+use temen_interp::bytecode::CoopEvent;
 use temen_interp::{CapState, Host, OffloadOutcome, Value};
 use temen_ir::SpawnRec;
 
@@ -174,6 +175,66 @@ fn a_lone_wait_takes_its_timeout() {
         "a lone {WAIT:?} wait must time out after {WAIT:?}, but\n{}",
         wrong.join("\n")
     );
+}
+
+/// What a run is opened with: its host, and its entry's arguments.
+type Setup<'a> = dyn Fn() -> (Host, Vec<Value>) + 'a;
+
+/// #2439 — a run its embedder pumps (`CoopRun`) keeps the embedder's time. With a timer all that
+/// can wake the run, the pump hands back the time to it (`Idle { timer }`), the same again when
+/// pumped before any time has passed, and fires it once its embedder lets that time pass. Executor
+/// 2 waits it out on its own. The pump used to jump its clock to the deadline here, so the wait
+/// ended at once, as on the native driver before #1979.
+#[test]
+fn a_coop_run_hands_back_the_time_to_a_lone_wait() {
+    let root = temen_text::parse_module(&lone_wait()).expect("parse");
+    let child = temen_text::parse_module(&child_wait()).expect("parse");
+    for m in [&root, &child] {
+        temen_verify::verify_module(m).expect("verify");
+    }
+    let image = temen_ir::child_image_at(&child, 1).expect("child image");
+    let powerbox = || {
+        let mut h = Host::new();
+        let i = h.grant_instantiator();
+        let b = h.grant_budget(-1, -1, -1);
+        let c = h.grant_module(&image);
+        (h, vec![Value::I32(i), Value::I64(b as i64), Value::I32(c)])
+    };
+    let wait = WAIT.as_nanos() as u64;
+    let runs: [(&str, &temen_ir::Module, &Setup<'_>); 2] = [
+        ("a root", &root, &|| (Host::new(), Vec::new())),
+        ("a child", &child, &powerbox),
+    ];
+    for (who, m, setup) in runs {
+        for exec in PUMPED {
+            let (host, args) = setup();
+            let mut run = exec.open(m, &args, 1 << 40, host, temen_ir::default_reserved_log2());
+            let began = Instant::now();
+            let mut timers = Vec::new();
+            let end = loop {
+                match run.run() {
+                    CoopEvent::Idle { timer: Some(ns) } => {
+                        timers.push(ns);
+                        // The first time, pump again at once: no time has passed.
+                        if timers.len() > 1 {
+                            std::thread::sleep(Duration::from_nanos(ns));
+                            run.pass_time(ns);
+                        }
+                    }
+                    CoopEvent::Done(v) => break v,
+                    _ => panic!("{who} on {exec:?}: nothing but the timer wakes the run"),
+                }
+            };
+            let took = began.elapsed();
+            assert_eq!(end, [Value::I64(2)], "{who} on {exec:?}: `WAIT_TIMED_OUT`");
+            assert!(took >= WAIT, "{who} on {exec:?}: timed out after {took:?}");
+            let handed: &[u64] = match exec {
+                Pumped::Pump => &[wait, wait],
+                Pumped::Threads => &[],
+            };
+            assert_eq!(timers, handed, "{who} on {exec:?}");
+        }
+    }
 }
 
 /// How long the root's host call waits, and how long each of its thread's waits is.
