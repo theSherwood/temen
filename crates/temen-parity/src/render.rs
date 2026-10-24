@@ -424,47 +424,41 @@ fn write_frontier_legend(s: &mut String) {
 /// Same two-renderings-one-manifest shape as the other two: this reads
 /// [`crate::run_modes::Row::cells`] and owns no classification of its own.
 pub fn render_run_modes_markdown() -> String {
-    use crate::run_modes::{Mode, Row};
+    use crate::run_modes::{Mode, Row, RUNNERS};
     let mut s = String::new();
 
     s.push_str("# Feature × run-mode matrix\n\n");
     s.push_str(
         "**Generated — do not edit by hand.** Regenerate with `cargo run -p temen-parity`. The \
-         classification lives in `crates/temen-parity/src/run_modes.rs`; this file is its \
-         human-readable view.\n\n",
+         runners and the exceptions live in `crates/temen-parity/src/run_modes.rs`; this file is \
+         its human-readable view.\n\n",
     );
     s.push_str(
-        "Can a program that uses a feature run in a given mode, and which modes combine (#2545)? A \
-         run is one **executor** (tree-walk, pump, parallel, Cranelift) plus any **properties** it \
-         adds. The columns are both kinds; the rows are guest features, then the properties \
-         again. What a cell asks depends on its row and column:\n\n\
-         | row | column | the question |\n\
+        "Can a program that does something run in a given mode, and which modes combine (#2545)? A \
+         run is one **executor** plus any **properties** it adds. The columns are both kinds; the \
+         rows are what a program does, then the properties again.\n\n\
+         Every cell comes from **runs**: each feature's probe on each configuration that \
+         `crates/temen-parity/tests/run_mode_conformance.rs` has a runner for (listed below). A run \
+         gives the oracle's answer unless the manifest records an exception, and the test fails \
+         when a run and the manifest disagree. What a cell folds depends on its row and column:\n\n\
+         | row | column | the runs behind the cell |\n\
          |---|---|---|\n\
-         | feature | executor | does the executor run a guest that uses the feature, to the \
-         oracle's answer? |\n\
-         | feature | property | does the property hold for such a guest, on every executor that \
-         runs the property? |\n\
-         | property | executor | does the executor run with the property? |\n\
-         | property | property | do the two combine? |\n\n",
+         | feature | executor | the feature's probe on the executor alone |\n\
+         | feature | property | the probe on each executor that has a runner with the property |\n\
+         | property | executor | every probe on the executor's runner with the property |\n\
+         | property | property | every probe, on each executor that has a runner with both |\n\n\
+         On each executor a cell uses the runner that adds its properties and the fewest others. \
+         A cell is ✅ when every run gives the oracle's answer, 🚧 when any run is a known gap, ⛔ \
+         when every run declines by design, 🔶 for any other mix, and ❔ when no runner covers it. \
+         Each pair of properties appears once, in the earlier property's row.\n\n",
     );
 
-    let rows: Vec<Row> = Row::all().collect();
-    let (mut audited, mut total) = (0usize, 0usize);
-    for r in &rows {
-        for cell in r.cells() {
-            total += 1;
-            if cell.status != Status::Unaudited {
-                audited += 1;
-            }
-        }
-    }
+    let rows: Vec<(Row, Vec<_>)> = Row::all().map(|r| (r, r.cells())).collect();
+    let cells = || rows.iter().flat_map(|(_, c)| c.iter().flatten());
+    let audited = cells().filter(|c| c.status != Status::Unaudited).count();
     s.push_str(&format!(
-        "**{audited} of {total} cells audited** ({} rows × {} columns). A cell says anything but {} \
-         only where `crates/temen-parity/tests/run_mode_conformance.rs` runs the case and checks \
-         it, and every {} cell cites the issue tracking its gap.\n\n",
-        rows.len(),
-        Mode::ALL.len(),
-        Status::Unaudited.glyph(),
+        "**{audited} of {} cells audited.** Every {} cell cites the issue tracking its gap.\n\n",
+        cells().count(),
         Status::NotYet.glyph(),
     ));
 
@@ -473,24 +467,43 @@ pub fn render_run_modes_markdown() -> String {
 
     s.push_str("## Columns\n\n");
     for m in Mode::ALL {
-        s.push_str(&format!("- **{}** — {}\n", m.short(), m.question()));
+        s.push_str(&format!(
+            "- **{}** ({}) — {}\n",
+            m.label(),
+            m.kind(),
+            m.question()
+        ));
+    }
+    s.push_str("\n## Rows\n\n");
+    for (r, _) in rows.iter().filter(|(r, _)| r.group() == "feature") {
+        s.push_str(&format!("- **{}** — {}\n", r.label(), r.question()));
+    }
+    s.push_str("\nThe property rows are the columns' properties again.\n\n## Runners\n\n");
+    for r in RUNNERS {
+        s.push_str(&format!("- **{}** — {}\n", r.config.label(), r.what));
     }
     s.push('\n');
 
-    for (title, group) in [("Features", "feature"), ("Properties", "property")] {
-        s.push_str(&format!("## {title}\n\n| {group} |"));
+    for (title, group, head) in [
+        ("Features", "feature", "a program that…"),
+        ("Properties", "property", "a run…"),
+    ] {
+        s.push_str(&format!("## {title}\n\n| {head} |"));
         for m in Mode::ALL {
-            s.push_str(&format!(" {} |", m.short()));
+            s.push_str(&format!(" {} |", m.label()));
         }
         s.push_str("\n|----|");
         for _ in Mode::ALL {
             s.push_str(":----:|");
         }
         s.push('\n');
-        for r in rows.iter().filter(|r| r.group() == group) {
-            s.push_str(&format!("| {} |", r.name()));
-            for cell in r.cells() {
-                s.push_str(&format!(" {} |", cell.status.glyph()));
+        for (r, cells) in rows.iter().filter(|(r, _)| r.group() == group) {
+            s.push_str(&format!("| {} |", r.label()));
+            for cell in cells {
+                s.push_str(&format!(
+                    " {} |",
+                    cell.as_ref().map_or("·", |c| c.status.glyph())
+                ));
             }
             s.push('\n');
         }
@@ -498,25 +511,29 @@ pub fn render_run_modes_markdown() -> String {
     }
 
     s.push_str("## Notes\n\n");
-    for r in &rows {
-        let mut any = false;
-        for (m, cell) in Mode::ALL.iter().zip(r.cells()) {
-            if cell.note.is_empty() {
-                continue;
-            }
-            if !any {
-                s.push_str(&format!("**{}**\n", r.name()));
-                any = true;
-            }
-            s.push_str(&format!(
-                "- *{}* {} — {}\n",
-                m.short(),
-                cell.status.glyph(),
-                cell.note
-            ));
-        }
-        if any {
-            s.push('\n');
+    for (r, cells) in &rows {
+        let notes: Vec<String> = Mode::ALL
+            .iter()
+            .zip(cells)
+            .filter_map(|(m, c)| Some((m, c.as_ref()?)))
+            .flat_map(|(m, c)| {
+                c.notes.iter().map(move |n| {
+                    let runs = if n.runs.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}: ", n.runs)
+                    };
+                    format!(
+                        "- *{}* {} — {runs}{}\n",
+                        m.label(),
+                        n.status.glyph(),
+                        n.text
+                    )
+                })
+            })
+            .collect();
+        if !notes.is_empty() {
+            s.push_str(&format!("**{}**\n{}\n", r.label(), notes.concat()));
         }
     }
     s
@@ -525,8 +542,8 @@ pub fn render_run_modes_markdown() -> String {
 /// Render the feature × run-mode matrix as JSON for the playground's parity page (#2545).
 ///
 /// Shape: `columns` (each with its question and whether it is an executor or a property), and
-/// `rows` with a `group` (`feature` or `property`), one status id per column, and the non-empty
-/// notes keyed by column.
+/// `rows` with a `group` (`feature` or `property`), one status id per column (`null` where a
+/// property's row meets itself or an earlier property), and each cell's notes, keyed by column.
 pub fn render_run_modes_json() -> String {
     use crate::run_modes::{Mode, Row};
     let mut s = String::new();
@@ -534,18 +551,12 @@ pub fn render_run_modes_json() -> String {
     s.push_str("  \"_generated\": \"do not edit by hand — `cargo run -p temen-parity`\",\n");
     s.push_str("  \"columns\": [\n");
     for (i, m) in Mode::ALL.iter().enumerate() {
-        s.push_str("    { \"short\": ");
-        json_str(&mut s, m.short());
+        s.push_str("    { \"label\": ");
+        json_str(&mut s, m.label());
         s.push_str(", \"question\": ");
         json_str(&mut s, m.question());
         s.push_str(", \"kind\": ");
-        json_str(
-            &mut s,
-            match m {
-                Mode::Executor(_) => "executor",
-                Mode::Property(_) => "property",
-            },
-        );
+        json_str(&mut s, m.kind());
         s.push_str(" }");
         s.push_str(if i + 1 == Mode::ALL.len() {
             "\n"
@@ -560,7 +571,9 @@ pub fn render_run_modes_json() -> String {
     for (i, r) in rows.iter().enumerate() {
         let cells = r.cells();
         s.push_str("    { \"row\": ");
-        json_str(&mut s, r.name());
+        json_str(&mut s, r.label());
+        s.push_str(", \"question\": ");
+        json_str(&mut s, r.question());
         s.push_str(", \"group\": ");
         json_str(&mut s, r.group());
         s.push_str(", \"cells\": [");
@@ -568,23 +581,29 @@ pub fn render_run_modes_json() -> String {
             if j > 0 {
                 s.push_str(", ");
             }
-            s.push_str(&format!("\"{}\"", cell.status.id()));
+            match cell {
+                Some(c) => s.push_str(&format!("\"{}\"", c.status.id())),
+                None => s.push_str("null"),
+            }
         }
         s.push_str("], \"notes\": [");
         let mut first = true;
         for (m, cell) in Mode::ALL.iter().zip(cells.iter()) {
-            if cell.note.is_empty() {
-                continue;
+            for n in cell.iter().flat_map(|c| &c.notes) {
+                if !first {
+                    s.push_str(", ");
+                }
+                first = false;
+                s.push_str("{ \"column\": ");
+                json_str(&mut s, m.label());
+                s.push_str(", \"status\": ");
+                json_str(&mut s, n.status.id());
+                s.push_str(", \"runs\": ");
+                json_str(&mut s, &n.runs);
+                s.push_str(", \"text\": ");
+                json_str(&mut s, n.text);
+                s.push_str(" }");
             }
-            if !first {
-                s.push_str(", ");
-            }
-            first = false;
-            s.push_str("{ \"column\": ");
-            json_str(&mut s, m.short());
-            s.push_str(", \"text\": ");
-            json_str(&mut s, cell.note);
-            s.push_str(" }");
         }
         s.push_str("] }");
         s.push_str(if i + 1 == rows.len() { "\n" } else { ",\n" });

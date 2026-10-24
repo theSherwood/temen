@@ -1,7 +1,6 @@
 //! The run-mode matrix's **probes** (#2545): one small program per guest feature, the powerbox it
 //! runs with, and the answer the oracle gives. `run_mode_conformance.rs` runs each on every runner
-//! of every column its row claims anything in. Included there with
-//! `#[path = "support/run_probes.rs"] mod probes;`.
+//! the manifest lists. Included there with `#[path = "support/run_probes.rs"] mod probes;`.
 //!
 //! The programs are the smallest each feature's own tests run on several engines, so a probe's
 //! answer is one those tests already pin on the oracle.
@@ -19,8 +18,9 @@ pub struct Probe {
     pub src: fn() -> String,
     /// The powerbox and arguments, built fresh for each run from the run's module.
     pub setup: fn(&Module) -> (Host, Vec<Value>),
-    /// Bytes the embedder feeds stdin once the run idles on them. A probe that needs feeding runs
-    /// only where the embedder holds the run between steps: a pumped run, or the debugger.
+    /// Bytes the embedder supplies on stdin after the run has read, the way its runner's embedder
+    /// does: a run the embedder holds is fed when it waits on them, and any other run pulls them
+    /// from a source that blocks until they arrive.
     pub feed: Option<&'static [u8]>,
     /// The oracle's answer: what the entry returns.
     pub want: i64,
@@ -86,7 +86,7 @@ pub fn probes() -> Vec<Probe> {
         Probe {
             feature: Feature::StdinLater,
             src: || READ_ONCE.into(),
-            setup: |_| blocking_stdin(),
+            setup: |_| stdin(),
             feed: Some(b"abc"),
             want: 3,
         },
@@ -503,11 +503,11 @@ block 0 (vin: i32) {
 }
 "#;
 
-/// A powerbox whose stdin blocks: a read with nothing buffered waits for the embedder's feed.
-fn blocking_stdin() -> (Host, Vec<Value>) {
+/// A powerbox holding stdin with nothing on it yet: the read waits until the runner supplies the
+/// probe's `feed`.
+fn stdin() -> (Host, Vec<Value>) {
     let mut host = Host::new();
     let vin = host.grant_stream(StreamRole::In);
-    host.set_stdin_blocking(true);
     (host, vec![Value::I32(vin)])
 }
 
