@@ -4,7 +4,7 @@
 // Worker (no nested Workers) and never blocks: a browser permits a blocking `Atomics.wait` only off
 // the main thread, so the Workers do all the blocking.
 
-import { foreignMemory, registerForeign, releaseForeign } from './foreign-mem.js';
+import { adoptEngine, foreignMemory, registerForeign, releaseForeign } from './foreign-mem.js';
 import { engineImports } from './engine-imports.js';
 import { emittedTier, tierupJitArg, tierupJitRes } from './coop-driver.js';
 const STACK = 1 << 20; // per-Worker stack
@@ -272,6 +272,7 @@ self.onmessage = async (e) => {
   ({ exports: ex } = await WebAssembly.instantiate(module, engineImports(memory, { stream_chunk, x2_spawn, x2_tierup, x2_invoke })));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
+  adoptEngine(ex, memory); // after the stack: it calls into the engine
   // #1414 B6 — the parallel driver: the root's Worker pumps the run, and each of its threads is a call
   // on a Worker of its own (`x2_spawn` above). The root reports how the run ended.
   if (role === 'x2root') {

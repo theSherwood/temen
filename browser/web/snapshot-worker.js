@@ -9,6 +9,7 @@
 // a fresh memory of its own and allocates only there, so its warm session can't race the main thread's
 // allocator. Main ↔ worker communicate only by messages (source string in; stdout/status/value out).
 import { engineImports } from './engine-imports.js';
+import { adoptEngine } from './foreign-mem.js';
 import { engineMemory } from './engine-mem.js';
 import { runWarmCoop, primeWarmJit, jitCacheStats, runJitModule, nimToolchain, nimCompileRun } from './wasmjit-module.js';
 
@@ -116,6 +117,7 @@ self.onmessage = async (e) => {
       // installs (`relay`): the worker's run stays synchronous, so the main thread paints the chunks
       // as they arrive (a Worker's postMessage delivers even while it computes).
       ({ exports: ex } = await WebAssembly.instantiate(msg.module, engineImports(memory)));
+      adoptEngine(ex, memory);
       self.postMessage({ type: 'ready' });
       return;
     }

@@ -1158,37 +1158,47 @@ fn run_detached_root(
 /// vectors the engine reaches only through [`FAKE_OPS`].
 static FAKE_MEMS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
-fn fake_read(id: u32, off: u64, out: &mut [u8]) {
+fn fake_read_span(id: u32, off: u64, out: &mut [u8]) {
     let o = off as usize;
     out.copy_from_slice(&FAKE_MEMS.lock().unwrap()[id as usize][o..o + out.len()]);
 }
 
-fn fake_write(id: u32, off: u64, data: &[u8]) {
+fn fake_write_span(id: u32, off: u64, data: &[u8]) {
     let o = off as usize;
     FAKE_MEMS.lock().unwrap()[id as usize][o..o + data.len()].copy_from_slice(data);
 }
 
-fn fake_load(id: u32, off: u64, width: u32) -> u64 {
+unsafe extern "C" fn fake_read(id: u32, off: u64, dst: *mut u8, len: usize) {
+    // SAFETY: the caller's contract (`ForeignOps::read`).
+    fake_read_span(id, off, unsafe { std::slice::from_raw_parts_mut(dst, len) })
+}
+
+unsafe extern "C" fn fake_write(id: u32, off: u64, src: *const u8, len: usize) {
+    // SAFETY: the caller's contract (`ForeignOps::write`).
+    fake_write_span(id, off, unsafe { std::slice::from_raw_parts(src, len) })
+}
+
+extern "C" fn fake_load(id: u32, off: u64, width: u32) -> u64 {
     let mut b = [0u8; 8];
-    fake_read(id, off, &mut b[..width as usize]);
+    fake_read_span(id, off, &mut b[..width as usize]);
     u64::from_le_bytes(b)
 }
 
-fn fake_store(id: u32, off: u64, width: u32, val: u64) {
-    fake_write(id, off, &val.to_le_bytes()[..width as usize]);
+extern "C" fn fake_store(id: u32, off: u64, width: u32, val: u64) {
+    fake_write_span(id, off, &val.to_le_bytes()[..width as usize]);
 }
 
-fn fake_fill(id: u32, off: u64, len: u64, b: u8) {
+extern "C" fn fake_fill(id: u32, off: u64, len: u64, b: u8) {
     FAKE_MEMS.lock().unwrap()[id as usize][off as usize..(off + len) as usize].fill(b);
 }
 
-fn fake_copy(id: u32, dst: u64, src: u64, len: u64) {
+extern "C" fn fake_copy(id: u32, dst: u64, src: u64, len: u64) {
     let range = src as usize..(src + len) as usize;
     FAKE_MEMS.lock().unwrap()[id as usize].copy_within(range, dst as usize);
 }
 
 /// A load, a store or a compare-exchange: what these guests' runs perform.
-fn fake_atomic(id: u32, kind: u32, off: u64, width: u32, a: u64, b: u64) -> u64 {
+extern "C" fn fake_atomic(id: u32, kind: u32, off: u64, width: u32, a: u64, b: u64) -> u64 {
     let mut mems = FAKE_MEMS.lock().unwrap();
     let cell = &mut mems[id as usize][off as usize..(off + width as u64) as usize];
     let mut raw = [0u8; 8];
@@ -1206,13 +1216,13 @@ fn fake_atomic(id: u32, kind: u32, off: u64, width: u32, a: u64, b: u64) -> u64 
     old
 }
 
-fn fake_grow(id: u32, len: u64) -> bool {
+extern "C" fn fake_grow(id: u32, len: u64) -> u32 {
     let mut mems = FAKE_MEMS.lock().unwrap();
     let m = &mut mems[id as usize];
     if m.len() < len as usize {
         m.resize(len as usize, 0);
     }
-    true
+    1
 }
 
 static FAKE_OPS: ForeignOps = ForeignOps {
@@ -1232,7 +1242,7 @@ fn fake_child_window(size_log2: u8) -> Option<Arc<Region>> {
     let mut mems = FAKE_MEMS.lock().unwrap();
     mems.push(vec![0; len as usize]);
     let id = mems.len() as u32 - 1;
-    Some(Arc::new(Region::foreign(id, len, &FAKE_OPS)))
+    Some(Arc::new(Region::foreign(id, len, FAKE_OPS)))
 }
 
 /// The window each thread [`a_detached_childs_window_is_in_the_platforms_memory`]'s run starts was

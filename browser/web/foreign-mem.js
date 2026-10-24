@@ -1,19 +1,14 @@
 // Foreign memories (#1284, DETACHED_JIT.md §3.3): the engine cdylib addresses a detached child's own
-// `WebAssembly.Memory` through the `temen_host.foreign_*` imports below — `Region::Foreign` in
-// `temen-mem` calls one import per access, and the bytes never enter the engine's linear memory except
-// through the copy the call performs. This module is the registry (id → Memory) plus the import table.
-// Every instantiation of the THREADS engine build supplies `...foreignImports(memory)` in `temen_host`
-// (par.js, the Workers, engine-imports.mjs); the plain build imports none of these.
+// `WebAssembly.Memory`, which its pointers cannot reach, through a small accessor instance over that
+// memory, whose functions this module puts in the engine's function table. `Region::Foreign` in
+// `temen-mem` calls one per access, wasm to wasm: no JavaScript runs on any access, word, span, fill,
+// copy, atomic or grow (#1414 5d). This module is the registry (id → Memory), the accessor modules and
+// the one import that needs JavaScript, `foreign_mint`, which makes a memory. Every instantiation of the
+// THREADS engine build supplies `...foreignImports(memory)` in `temen_host` and then hands the instance
+// to `adoptEngine` (par.js, the Workers); the plain build imports none of this.
 //
-// ABI (u32 offsets, no BigInt in JavaScript): offsets are region-relative and already bounded by
-// the engine. A byte or word access (`foreign_load`/`foreign_store`, width 1, 2, 4 or 8) never calls
-// JavaScript: both imports are bound to this agent's dispatcher, a wasm instance that calls the
-// memory's own accessor instance through its table (#2416). For the atomics, `ab` points at 16 bytes
-// of ENGINE memory holding the operands `a` (0..8) and `b` (8..16) little-endian, and receives the old
-// value at 0..8. `kind`: 0 load · 1 store(a) · 2 add · 3 sub · 4 and · 5 or · 6 xor · 7 xchg
-// (operand a) · 8 cmpxchg(expected a, replacement b). Widths 4/8; `off` naturally aligned. A registry
-// is per agent (page or Worker): a Memory registered here is addressable by the engine instance(s) of
-// THIS agent.
+// A registry is per agent (page or Worker): a Memory registered here is addressable by the engine
+// instances this agent adopted, each through its own table.
 
 /**
  * Adopt a shared memory this agent was handed — a Worker's copy of the engine memory, or of a detached
@@ -33,94 +28,248 @@ export function adoptMemory(memory) {
   return memory;
 }
 
-const mems = []; // id -> { m: WebAssembly.Memory, base: byte offset of region offset 0 within it }
-// Views of each registered memory, by id, refreshed when stale (`foreignImports`).
-const u8s = [], i32s = [], i64s = [];
+const mems = []; // id -> { m: WebAssembly.Memory, base: byte offset of region offset 0, fns: accessor exports }
 
-// The word path (#2416). A JS import per access cost ~28 ns in Chromium; a wasm-to-wasm call costs ~3.
-// The engine's `foreign_load(id, off, width)` and `foreign_store(id, off, width, val)` are this agent's
-// dispatcher's exports, which call the accessor at slot `id * 8 + log2(width)` of its table, the
-// stores 4 slots on. `registerForeign` instantiates an accessor over each memory and puts its 8
-// functions in their slots; an unregistered id finds an empty slot and traps. Both modules are
+// Each registered memory's functions sit at `slot0 + id * SLOTS + k` in every adopted engine's table,
+// `slot0` being the table's length when it was adopted, which the engine is told (`temen_foreign_slots`):
+// one per field of `temen_mem::ForeignOps`, in its order, so the engine's `Region` calls each of them
+// directly, one call per access (`foreign_mem::ops` in `src/lib.rs`). The accessor serves the fields that
+// stay inside the window; `read` and `write` move a span between the window and the engine's memory.
+// Where this agent has multi-memory they are the copier's, one `memory.copy` across the two memories;
+// where it hasn't (Safari), the engine's own `temen_foreign_read_words`/`temen_foreign_write_words`,
+// which move the span through the loads and stores. Each agent fills its own table, so it never has to
+// agree with another on which. An unregistered id finds empty slots and traps. Both modules are
 // assembled from the WAT beside them, and `browser/tests/foreign_accessor.rs` pins the bytes to it.
-/* wasm:dispatch
-(module
-  (type (func (param i32) (result i64)))
-  (type (func (param i32 i64)))
-  (table (export "slots") 0 funcref)
-  ;; load(id, off, width): the accessor at slot id * 8 + log2(width)
-  (func (export "load") (param i32 i32 i32) (result i64)
-    local.get 1
-    local.get 0
-    i32.const 3
-    i32.shl
-    local.get 2
-    i32.ctz
-    i32.add
-    call_indirect (type 0))
-  ;; store(id, off, width, val): the accessor 4 slots later
-  (func (export "store") (param i32 i32 i32 i64)
-    local.get 1
-    local.get 3
-    local.get 0
-    i32.const 3
-    i32.shl
-    local.get 2
-    i32.ctz
-    i32.add
-    i32.const 4
-    i32.add
-    call_indirect (type 1)))
-*/
-const DISPATCH_WASM = new Uint8Array([
-  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x19, 0x04, 0x60, 0x01, 0x7f, 0x01, 0x7e,
-  0x60, 0x02, 0x7f, 0x7e, 0x00, 0x60, 0x03, 0x7f, 0x7f, 0x7f, 0x01, 0x7e, 0x60, 0x04, 0x7f, 0x7f,
-  0x7f, 0x7e, 0x00, 0x03, 0x03, 0x02, 0x02, 0x03, 0x04, 0x04, 0x01, 0x70, 0x00, 0x00, 0x07, 0x18,
-  0x03, 0x05, 0x73, 0x6c, 0x6f, 0x74, 0x73, 0x01, 0x00, 0x04, 0x6c, 0x6f, 0x61, 0x64, 0x00, 0x00,
-  0x05, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x00, 0x01, 0x0a, 0x28, 0x02, 0x10, 0x00, 0x20, 0x01, 0x20,
-  0x00, 0x41, 0x03, 0x74, 0x20, 0x02, 0x68, 0x6a, 0x11, 0x00, 0x00, 0x0b, 0x15, 0x00, 0x20, 0x01,
-  0x20, 0x03, 0x20, 0x00, 0x41, 0x03, 0x74, 0x20, 0x02, 0x68, 0x6a, 0x41, 0x04, 0x6a, 0x11, 0x01,
-  0x00, 0x0b,
-]);
+const FIELDS = ['read', 'write', 'load', 'store', 'fill', 'copy', 'atomic', 'grow'];
+const SLOTS = FIELDS.length;
 /* wasm:accessor
 (module
   (import "a" "m" (memory 0 65536 shared))
   (import "a" "base" (global i32))
-  ;; "0".."3": a 1-, 2-, 4- or 8-byte load at base + off, zero-extended
-  (func (export "0") (param i32) (result i64)
-    local.get 0 global.get 0 i32.add i64.load8_u)
-  (func (export "1") (param i32) (result i64)
-    local.get 0 global.get 0 i32.add i64.load16_u)
-  (func (export "2") (param i32) (result i64)
-    local.get 0 global.get 0 i32.add i64.load32_u)
-  (func (export "3") (param i32) (result i64)
-    local.get 0 global.get 0 i32.add i64.load)
-  ;; "4".."7": the matching stores, keeping the low bytes of the value
-  (func (export "4") (param i32 i64)
-    local.get 0 global.get 0 i32.add local.get 1 i64.store8)
-  (func (export "5") (param i32 i64)
-    local.get 0 global.get 0 i32.add local.get 1 i64.store16)
-  (func (export "6") (param i32 i64)
-    local.get 0 global.get 0 i32.add local.get 1 i64.store32)
-  (func (export "7") (param i32 i64)
-    local.get 0 global.get 0 i32.add local.get 1 i64.store))
+  ;; Each function takes its `temen_mem::ForeignOps` field's arguments: the id first, which a memory's
+  ;; own functions ignore, and region offsets and lengths as i64, which `Region` has bounded to the
+  ;; window, so they fit in 32 bits.
+  ;; load(id, off, width): the 1-, 2-, 4- or 8-byte word at base + off, zero-extended; any other
+  ;; width traps
+  (func (export "load") (param $id i32) (param $off i64) (param $width i32) (result i64)
+    (local $p i32)
+    local.get $off i32.wrap_i64 global.get 0 i32.add local.set $p
+    block $bad block $w8 block $w4 block $w2 block $w1
+      local.get $width br_table $bad $w1 $w2 $bad $w4 $bad $bad $bad $w8 $bad
+    end local.get $p i64.load8_u return
+    end local.get $p i64.load16_u return
+    end local.get $p i64.load32_u return
+    end local.get $p i64.load return
+    end unreachable)
+  ;; store(id, off, width, val): the low `width` bytes of val at base + off
+  (func (export "store") (param $id i32) (param $off i64) (param $width i32) (param $val i64)
+    (local $p i32)
+    local.get $off i32.wrap_i64 global.get 0 i32.add local.set $p
+    block $bad block $w8 block $w4 block $w2 block $w1
+      local.get $width br_table $bad $w1 $w2 $bad $w4 $bad $bad $bad $w8 $bad
+    end local.get $p local.get $val i64.store8 return
+    end local.get $p local.get $val i64.store16 return
+    end local.get $p local.get $val i64.store32 return
+    end local.get $p local.get $val i64.store return
+    end unreachable)
+  ;; fill(id, off, len, b)
+  (func (export "fill") (param $id i32) (param $off i64) (param $len i64) (param $b i32)
+    local.get $off i32.wrap_i64 global.get 0 i32.add
+    local.get $b local.get $len i32.wrap_i64 memory.fill)
+  ;; copy(id, dst, src, len), inside the window
+  (func (export "copy") (param $id i32) (param $dst i64) (param $src i64) (param $len i64)
+    local.get $dst i32.wrap_i64 global.get 0 i32.add
+    local.get $src i32.wrap_i64 global.get 0 i32.add
+    local.get $len i32.wrap_i64 memory.copy)
+  ;; atomic(id, kind, off, width, a, b) -> the old value, seq-cst, at base + off. kind: 0 load,
+  ;; 1 store a, 2 add, 3 sub, 4 and, 5 or, 6 xor, 7 exchange (operand a), 8 compare-exchange
+  ;; (expected a, replacement b). width 8 is the 64-bit form; any other is the 32-bit one, which
+  ;; zero-extends the old value. Stores return 0; a kind past 8 traps.
+  (func (export "atomic") (param $id i32) (param $kind i32) (param $off i64) (param $width i32)
+                          (param $a i64) (param $b i64) (result i64)
+    (local $p i32)
+    local.get $off i32.wrap_i64 global.get 0 i32.add local.set $p
+    block $bad
+    block $c8 block $c4 block $g8 block $g4 block $x8 block $x4 block $o8 block $o4 block $n8
+    block $n4 block $s8 block $s4 block $a8 block $a4 block $t8 block $t4 block $l8 block $l4
+      local.get $kind i32.const 1 i32.shl local.get $width i32.const 8 i32.eq i32.or
+      br_table $l4 $l8 $t4 $t8 $a4 $a8 $s4 $s8 $n4 $n8 $o4 $o8 $x4 $x8 $g4 $g8 $c4 $c8 $bad
+    end local.get $p i64.atomic.load32_u return
+    end local.get $p i64.atomic.load return
+    end local.get $p local.get $a i64.atomic.store32 i64.const 0 return
+    end local.get $p local.get $a i64.atomic.store i64.const 0 return
+    end local.get $p local.get $a i64.atomic.rmw32.add_u return
+    end local.get $p local.get $a i64.atomic.rmw.add return
+    end local.get $p local.get $a i64.atomic.rmw32.sub_u return
+    end local.get $p local.get $a i64.atomic.rmw.sub return
+    end local.get $p local.get $a i64.atomic.rmw32.and_u return
+    end local.get $p local.get $a i64.atomic.rmw.and return
+    end local.get $p local.get $a i64.atomic.rmw32.or_u return
+    end local.get $p local.get $a i64.atomic.rmw.or return
+    end local.get $p local.get $a i64.atomic.rmw32.xor_u return
+    end local.get $p local.get $a i64.atomic.rmw.xor return
+    end local.get $p local.get $a i64.atomic.rmw32.xchg_u return
+    end local.get $p local.get $a i64.atomic.rmw.xchg return
+    end local.get $p local.get $a local.get $b i64.atomic.rmw32.cmpxchg_u return
+    end local.get $p local.get $a local.get $b i64.atomic.rmw.cmpxchg return
+    end unreachable)
+  ;; grow(id, len) -> 1 once base + len bytes are addressable, growing the memory if need be, or 0
+  ;; past its maximum. A len past 4 GiB is refused first, so the page count cannot wrap.
+  (func (export "grow") (param $id i32) (param $len i64) (result i32)
+    (local $pages i64)
+    local.get $len i64.const 0x100000000 i64.gt_u
+    if
+      i32.const 0 return
+    end
+    local.get $len global.get 0 i64.extend_i32_u i64.add
+    i64.const 65535 i64.add i64.const 16 i64.shr_u local.tee $pages
+    memory.size i64.extend_i32_u i64.le_u
+    if (result i32)
+      i32.const 1
+    else
+      local.get $pages i64.const 65536 i64.gt_u
+      if (result i32)
+        i32.const 0
+      else
+        local.get $pages i32.wrap_i64 memory.size i32.sub memory.grow i32.const -1 i32.ne
+      end
+    end))
 */
 const ACCESSOR_WASM = new Uint8Array([
-  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0b, 0x02, 0x60, 0x01, 0x7f, 0x01, 0x7e,
-  0x60, 0x02, 0x7f, 0x7e, 0x00, 0x02, 0x15, 0x02, 0x01, 0x61, 0x01, 0x6d, 0x02, 0x03, 0x00, 0x80,
-  0x80, 0x04, 0x01, 0x61, 0x04, 0x62, 0x61, 0x73, 0x65, 0x03, 0x7f, 0x00, 0x03, 0x09, 0x08, 0x00,
-  0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x07, 0x21, 0x08, 0x01, 0x30, 0x00, 0x00, 0x01, 0x31,
-  0x00, 0x01, 0x01, 0x32, 0x00, 0x02, 0x01, 0x33, 0x00, 0x03, 0x01, 0x34, 0x00, 0x04, 0x01, 0x35,
-  0x00, 0x05, 0x01, 0x36, 0x00, 0x06, 0x01, 0x37, 0x00, 0x07, 0x0a, 0x61, 0x08, 0x0a, 0x00, 0x20,
-  0x00, 0x23, 0x00, 0x6a, 0x31, 0x00, 0x00, 0x0b, 0x0a, 0x00, 0x20, 0x00, 0x23, 0x00, 0x6a, 0x33,
-  0x01, 0x00, 0x0b, 0x0a, 0x00, 0x20, 0x00, 0x23, 0x00, 0x6a, 0x35, 0x02, 0x00, 0x0b, 0x0a, 0x00,
-  0x20, 0x00, 0x23, 0x00, 0x6a, 0x29, 0x03, 0x00, 0x0b, 0x0c, 0x00, 0x20, 0x00, 0x23, 0x00, 0x6a,
-  0x20, 0x01, 0x3c, 0x00, 0x00, 0x0b, 0x0c, 0x00, 0x20, 0x00, 0x23, 0x00, 0x6a, 0x20, 0x01, 0x3d,
-  0x01, 0x00, 0x0b, 0x0c, 0x00, 0x20, 0x00, 0x23, 0x00, 0x6a, 0x20, 0x01, 0x3e, 0x02, 0x00, 0x0b,
-  0x0c, 0x00, 0x20, 0x00, 0x23, 0x00, 0x6a, 0x20, 0x01, 0x37, 0x03, 0x00, 0x0b,
+  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x2d, 0x06, 0x60, 0x03, 0x7f, 0x7e, 0x7f,
+  0x01, 0x7e, 0x60, 0x04, 0x7f, 0x7e, 0x7f, 0x7e, 0x00, 0x60, 0x04, 0x7f, 0x7e, 0x7e, 0x7f, 0x00,
+  0x60, 0x04, 0x7f, 0x7e, 0x7e, 0x7e, 0x00, 0x60, 0x06, 0x7f, 0x7f, 0x7e, 0x7f, 0x7e, 0x7e, 0x01,
+  0x7e, 0x60, 0x02, 0x7f, 0x7e, 0x01, 0x7f, 0x02, 0x15, 0x02, 0x01, 0x61, 0x01, 0x6d, 0x02, 0x03,
+  0x00, 0x80, 0x80, 0x04, 0x01, 0x61, 0x04, 0x62, 0x61, 0x73, 0x65, 0x03, 0x7f, 0x00, 0x03, 0x07,
+  0x06, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x07, 0x2e, 0x06, 0x04, 0x6c, 0x6f, 0x61, 0x64, 0x00,
+  0x00, 0x05, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x00, 0x01, 0x04, 0x66, 0x69, 0x6c, 0x6c, 0x00, 0x02,
+  0x04, 0x63, 0x6f, 0x70, 0x79, 0x00, 0x03, 0x06, 0x61, 0x74, 0x6f, 0x6d, 0x69, 0x63, 0x00, 0x04,
+  0x04, 0x67, 0x72, 0x6f, 0x77, 0x00, 0x05, 0x0a, 0x8a, 0x04, 0x06, 0x42, 0x01, 0x01, 0x7f, 0x20,
+  0x01, 0xa7, 0x23, 0x00, 0x6a, 0x21, 0x03, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02,
+  0x40, 0x20, 0x02, 0x0e, 0x09, 0x04, 0x00, 0x01, 0x04, 0x02, 0x04, 0x04, 0x04, 0x03, 0x04, 0x0b,
+  0x20, 0x03, 0x31, 0x00, 0x00, 0x0f, 0x0b, 0x20, 0x03, 0x33, 0x01, 0x00, 0x0f, 0x0b, 0x20, 0x03,
+  0x35, 0x02, 0x00, 0x0f, 0x0b, 0x20, 0x03, 0x29, 0x03, 0x00, 0x0f, 0x0b, 0x00, 0x0b, 0x4a, 0x01,
+  0x01, 0x7f, 0x20, 0x01, 0xa7, 0x23, 0x00, 0x6a, 0x21, 0x04, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40,
+  0x02, 0x40, 0x02, 0x40, 0x20, 0x02, 0x0e, 0x09, 0x04, 0x00, 0x01, 0x04, 0x02, 0x04, 0x04, 0x04,
+  0x03, 0x04, 0x0b, 0x20, 0x04, 0x20, 0x03, 0x3c, 0x00, 0x00, 0x0f, 0x0b, 0x20, 0x04, 0x20, 0x03,
+  0x3d, 0x01, 0x00, 0x0f, 0x0b, 0x20, 0x04, 0x20, 0x03, 0x3e, 0x02, 0x00, 0x0f, 0x0b, 0x20, 0x04,
+  0x20, 0x03, 0x37, 0x03, 0x00, 0x0f, 0x0b, 0x00, 0x0b, 0x10, 0x00, 0x20, 0x01, 0xa7, 0x23, 0x00,
+  0x6a, 0x20, 0x03, 0x20, 0x02, 0xa7, 0xfc, 0x0b, 0x00, 0x0b, 0x15, 0x00, 0x20, 0x01, 0xa7, 0x23,
+  0x00, 0x6a, 0x20, 0x02, 0xa7, 0x23, 0x00, 0x6a, 0x20, 0x03, 0xa7, 0xfc, 0x0a, 0x00, 0x00, 0x0b,
+  0x8c, 0x02, 0x01, 0x01, 0x7f, 0x20, 0x02, 0xa7, 0x23, 0x00, 0x6a, 0x21, 0x06, 0x02, 0x40, 0x02,
+  0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02,
+  0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02, 0x40, 0x02,
+  0x40, 0x02, 0x40, 0x20, 0x01, 0x41, 0x01, 0x74, 0x20, 0x03, 0x41, 0x08, 0x46, 0x72, 0x0e, 0x12,
+  0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+  0x10, 0x11, 0x12, 0x0b, 0x20, 0x06, 0xfe, 0x16, 0x02, 0x00, 0x0f, 0x0b, 0x20, 0x06, 0xfe, 0x11,
+  0x03, 0x00, 0x0f, 0x0b, 0x20, 0x06, 0x20, 0x04, 0xfe, 0x1d, 0x02, 0x00, 0x42, 0x00, 0x0f, 0x0b,
+  0x20, 0x06, 0x20, 0x04, 0xfe, 0x18, 0x03, 0x00, 0x42, 0x00, 0x0f, 0x0b, 0x20, 0x06, 0x20, 0x04,
+  0xfe, 0x24, 0x02, 0x00, 0x0f, 0x0b, 0x20, 0x06, 0x20, 0x04, 0xfe, 0x1f, 0x03, 0x00, 0x0f, 0x0b,
+  0x20, 0x06, 0x20, 0x04, 0xfe, 0x2b, 0x02, 0x00, 0x0f, 0x0b, 0x20, 0x06, 0x20, 0x04, 0xfe, 0x26,
+  0x03, 0x00, 0x0f, 0x0b, 0x20, 0x06, 0x20, 0x04, 0xfe, 0x32, 0x02, 0x00, 0x0f, 0x0b, 0x20, 0x06,
+  0x20, 0x04, 0xfe, 0x2d, 0x03, 0x00, 0x0f, 0x0b, 0x20, 0x06, 0x20, 0x04, 0xfe, 0x39, 0x02, 0x00,
+  0x0f, 0x0b, 0x20, 0x06, 0x20, 0x04, 0xfe, 0x34, 0x03, 0x00, 0x0f, 0x0b, 0x20, 0x06, 0x20, 0x04,
+  0xfe, 0x40, 0x02, 0x00, 0x0f, 0x0b, 0x20, 0x06, 0x20, 0x04, 0xfe, 0x3b, 0x03, 0x00, 0x0f, 0x0b,
+  0x20, 0x06, 0x20, 0x04, 0xfe, 0x47, 0x02, 0x00, 0x0f, 0x0b, 0x20, 0x06, 0x20, 0x04, 0xfe, 0x42,
+  0x03, 0x00, 0x0f, 0x0b, 0x20, 0x06, 0x20, 0x04, 0x20, 0x05, 0xfe, 0x4e, 0x02, 0x00, 0x0f, 0x0b,
+  0x20, 0x06, 0x20, 0x04, 0x20, 0x05, 0xfe, 0x49, 0x03, 0x00, 0x0f, 0x0b, 0x00, 0x0b, 0x45, 0x01,
+  0x01, 0x7e, 0x20, 0x01, 0x42, 0x80, 0x80, 0x80, 0x80, 0x10, 0x56, 0x04, 0x40, 0x41, 0x00, 0x0f,
+  0x0b, 0x20, 0x01, 0x23, 0x00, 0xad, 0x7c, 0x42, 0xff, 0xff, 0x03, 0x7c, 0x42, 0x10, 0x88, 0x22,
+  0x02, 0x3f, 0x00, 0xad, 0x58, 0x04, 0x7f, 0x41, 0x01, 0x05, 0x20, 0x02, 0x42, 0x80, 0x80, 0x04,
+  0x56, 0x04, 0x7f, 0x41, 0x00, 0x05, 0x20, 0x02, 0xa7, 0x3f, 0x00, 0x6b, 0x40, 0x00, 0x41, 0x7f,
+  0x47, 0x0b, 0x0b, 0x0b, 0x00, 0x93, 0x02, 0x04, 0x6e, 0x61, 0x6d, 0x65, 0x02, 0x8b, 0x01, 0x06,
+  0x00, 0x04, 0x00, 0x02, 0x69, 0x64, 0x01, 0x03, 0x6f, 0x66, 0x66, 0x02, 0x05, 0x77, 0x69, 0x64,
+  0x74, 0x68, 0x03, 0x01, 0x70, 0x01, 0x05, 0x00, 0x02, 0x69, 0x64, 0x01, 0x03, 0x6f, 0x66, 0x66,
+  0x02, 0x05, 0x77, 0x69, 0x64, 0x74, 0x68, 0x03, 0x03, 0x76, 0x61, 0x6c, 0x04, 0x01, 0x70, 0x02,
+  0x04, 0x00, 0x02, 0x69, 0x64, 0x01, 0x03, 0x6f, 0x66, 0x66, 0x02, 0x03, 0x6c, 0x65, 0x6e, 0x03,
+  0x01, 0x62, 0x03, 0x04, 0x00, 0x02, 0x69, 0x64, 0x01, 0x03, 0x64, 0x73, 0x74, 0x02, 0x03, 0x73,
+  0x72, 0x63, 0x03, 0x03, 0x6c, 0x65, 0x6e, 0x04, 0x07, 0x00, 0x02, 0x69, 0x64, 0x01, 0x04, 0x6b,
+  0x69, 0x6e, 0x64, 0x02, 0x03, 0x6f, 0x66, 0x66, 0x03, 0x05, 0x77, 0x69, 0x64, 0x74, 0x68, 0x04,
+  0x01, 0x61, 0x05, 0x01, 0x62, 0x06, 0x01, 0x70, 0x05, 0x03, 0x00, 0x02, 0x69, 0x64, 0x01, 0x03,
+  0x6c, 0x65, 0x6e, 0x02, 0x05, 0x70, 0x61, 0x67, 0x65, 0x73, 0x03, 0x7e, 0x03, 0x00, 0x05, 0x00,
+  0x03, 0x62, 0x61, 0x64, 0x01, 0x02, 0x77, 0x38, 0x02, 0x02, 0x77, 0x34, 0x03, 0x02, 0x77, 0x32,
+  0x04, 0x02, 0x77, 0x31, 0x01, 0x05, 0x00, 0x03, 0x62, 0x61, 0x64, 0x01, 0x02, 0x77, 0x38, 0x02,
+  0x02, 0x77, 0x34, 0x03, 0x02, 0x77, 0x32, 0x04, 0x02, 0x77, 0x31, 0x04, 0x13, 0x00, 0x03, 0x62,
+  0x61, 0x64, 0x01, 0x02, 0x63, 0x38, 0x02, 0x02, 0x63, 0x34, 0x03, 0x02, 0x67, 0x38, 0x04, 0x02,
+  0x67, 0x34, 0x05, 0x02, 0x78, 0x38, 0x06, 0x02, 0x78, 0x34, 0x07, 0x02, 0x6f, 0x38, 0x08, 0x02,
+  0x6f, 0x34, 0x09, 0x02, 0x6e, 0x38, 0x0a, 0x02, 0x6e, 0x34, 0x0b, 0x02, 0x73, 0x38, 0x0c, 0x02,
+  0x73, 0x34, 0x0d, 0x02, 0x61, 0x38, 0x0e, 0x02, 0x61, 0x34, 0x0f, 0x02, 0x74, 0x38, 0x10, 0x02,
+  0x74, 0x34, 0x11, 0x02, 0x6c, 0x38, 0x12, 0x02, 0x6c, 0x34,
 ]);
-let dispatch = null, accessor = null;
-const dispatcher = () => (dispatch ??= new WebAssembly.Instance(new WebAssembly.Module(DISPATCH_WASM)).exports);
+/* wasm:copier
+(module
+  (import "a" "m" (memory 0 65536 shared))
+  (import "a" "e" (memory 0 65536 shared))
+  (import "a" "base" (global i32))
+  ;; read(id, off, dst, len): the window's [base + off, +len) into the engine's memory at dst
+  (func (export "read") (param $id i32) (param $off i64) (param $dst i32) (param $len i32)
+    local.get $dst local.get $off i32.wrap_i64 global.get 0 i32.add local.get $len memory.copy 1 0)
+  ;; write(id, off, src, len): the engine's [src, +len) into the window at base + off
+  (func (export "write") (param $id i32) (param $off i64) (param $src i32) (param $len i32)
+    local.get $off i32.wrap_i64 global.get 0 i32.add local.get $src local.get $len memory.copy 0 1))
+*/
+const COPIER_WASM = new Uint8Array([
+  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x01, 0x60, 0x04, 0x7f, 0x7e, 0x7f,
+  0x7f, 0x00, 0x02, 0x1f, 0x03, 0x01, 0x61, 0x01, 0x6d, 0x02, 0x03, 0x00, 0x80, 0x80, 0x04, 0x01,
+  0x61, 0x01, 0x65, 0x02, 0x03, 0x00, 0x80, 0x80, 0x04, 0x01, 0x61, 0x04, 0x62, 0x61, 0x73, 0x65,
+  0x03, 0x7f, 0x00, 0x03, 0x03, 0x02, 0x00, 0x00, 0x07, 0x10, 0x02, 0x04, 0x72, 0x65, 0x61, 0x64,
+  0x00, 0x00, 0x05, 0x77, 0x72, 0x69, 0x74, 0x65, 0x00, 0x01, 0x0a, 0x23, 0x02, 0x10, 0x00, 0x20,
+  0x02, 0x20, 0x01, 0xa7, 0x23, 0x00, 0x6a, 0x20, 0x03, 0xfc, 0x0a, 0x01, 0x00, 0x0b, 0x10, 0x00,
+  0x20, 0x01, 0xa7, 0x23, 0x00, 0x6a, 0x20, 0x02, 0x20, 0x03, 0xfc, 0x0a, 0x00, 0x01, 0x0b, 0x00,
+  0x32, 0x04, 0x6e, 0x61, 0x6d, 0x65, 0x02, 0x2b, 0x02, 0x00, 0x04, 0x00, 0x02, 0x69, 0x64, 0x01,
+  0x03, 0x6f, 0x66, 0x66, 0x02, 0x03, 0x64, 0x73, 0x74, 0x03, 0x03, 0x6c, 0x65, 0x6e, 0x01, 0x04,
+  0x00, 0x02, 0x69, 0x64, 0x01, 0x03, 0x6f, 0x66, 0x66, 0x02, 0x03, 0x73, 0x72, 0x63, 0x03, 0x03,
+  0x6c, 0x65, 0x6e,
+]);
+let accessor = null, copier = null;
+// A page can leave the copier out (`globalThis.__temenNoMultiMemory = true` before this module loads) and
+// move spans as a browser without multi-memory does; it changes this agent's tables only.
+const MULTI_MEMORY = !globalThis.__temenNoMultiMemory && WebAssembly.validate(COPIER_WASM);
+
+// The engine instances this agent adopted: each one's exports (its table and span fallbacks), its table's
+// `slot0`, and its memory, the copier's second memory. Weak, so an engine a host drops keeps no window alive.
+const engines = [];
+const adopted = new WeakSet();
+
+/** Put registered memory `id`'s functions into engine `e`'s table. */
+function install(e, ex, id) {
+  const { m, base, fns } = mems[id];
+  const table = ex.__indirect_function_table, lo = e.slot0 + SLOTS * id;
+  if (table.length < lo + SLOTS) table.grow(lo + SLOTS - table.length);
+  let spans = { read: ex.temen_foreign_read_words, write: ex.temen_foreign_write_words };
+  if (MULTI_MEMORY) {
+    copier ??= new WebAssembly.Module(COPIER_WASM);
+    spans = new WebAssembly.Instance(copier, { a: { m, e: e.memory.deref(), base } }).exports;
+  }
+  FIELDS.forEach((f, k) => table.set(lo + k, fns[f] ?? spans[f]));
+}
+
+/** Each adopted engine that is still alive, with its exports. */
+function* liveEngines() {
+  for (let i = engines.length - 1; i >= 0; i--) {
+    const ex = engines[i].ex.deref();
+    if (ex === undefined) engines.splice(i, 1);
+    else yield [engines[i], ex];
+  }
+}
+
+/**
+ * Let engine instance `ex` (the exports of a threads-build instance over `engineMemory`) address this
+ * agent's foreign memories: tell it where their slots start in its table, and fill the slots of every
+ * memory registered so far. Call it once per instance, right after instantiating; later registrations
+ * reach it on their own. A build without the seam (the plain build) is left alone.
+ */
+export function adoptEngine(ex, engineMemory) {
+  const table = ex.__indirect_function_table;
+  if (table === undefined || ex.temen_foreign_slots === undefined || adopted.has(table)) return;
+  adopted.add(table);
+  const e = { ex: new WeakRef(ex), slot0: table.length, memory: new WeakRef(engineMemory) };
+  // Every instance of one build starts with the same table, so every agent on one engine memory names
+  // the same slots; a mismatch would be a different build on the same memory.
+  if (!ex.temen_foreign_slots(e.slot0)) throw new Error(`engine table slot base ${e.slot0} disagrees`);
+  engines.push(e);
+  mems.forEach((r, id) => r !== undefined && install(e, ex, id));
+}
 
 /**
  * Register a child `WebAssembly.Memory`; returns the id the engine names it by. `base` is where the
@@ -132,20 +281,21 @@ const dispatcher = () => (dispatch ??= new WebAssembly.Instance(new WebAssembly.
  */
 export function registerForeign(memory, base = 0, id = mems.length) {
   if (mems[id] !== undefined) throw new Error(`foreign memory ${id} is already registered`);
-  mems[id] = { m: adoptMemory(memory), base }; // a detached child's memory, shared by its threads' Workers
   accessor ??= new WebAssembly.Module(ACCESSOR_WASM);
-  const words = new WebAssembly.Instance(accessor, { a: { m: memory, base } }).exports;
-  const slots = dispatcher().slots;
-  if (slots.length < 8 * (id + 1)) slots.grow(8 * (id + 1) - slots.length);
-  for (let k = 0; k < 8; k++) slots.set(8 * id + k, words[k]);
+  // a detached child's memory, shared by its threads' Workers
+  const fns = new WebAssembly.Instance(accessor, { a: { m: adoptMemory(memory), base } }).exports;
+  mems[id] = { m: memory, base, fns };
+  for (const [e, ex] of liveEngines()) install(e, ex, id);
   return id;
 }
 
-/** Let go of the memory registered as `id`, and of this agent's views of it. Its id is not reused. */
+/** Let go of the memory registered as `id`: its slots in every adopted engine empty. Its id is not reused. */
 export function releaseForeign(id) {
-  mems[id] = u8s[id] = i32s[id] = i64s[id] = undefined;
-  const slots = dispatcher().slots;
-  for (let k = 0; k < 8 && 8 * id + k < slots.length; k++) slots.set(8 * id + k, null);
+  mems[id] = undefined;
+  for (const [e, ex] of liveEngines()) {
+    const table = ex.__indirect_function_table, lo = e.slot0 + SLOTS * id;
+    for (let k = 0; k < SLOTS && lo + k < table.length; k++) table.set(lo + k, null);
+  }
 }
 
 /** The registered Memory for `id` (e.g. to read a result out). */
@@ -156,100 +306,24 @@ export function foreignMemory(id) {
 /** The `temen_host` import entries for an engine instance whose linear memory is `engineMemory`. */
 export function foreignImports(engineMemory) {
   // Every threads-engine instantiation comes through here, so this is where an agent handed the engine
-  // memory adopts it: before the views below and the instance built over these imports (#1996).
+  // memory adopts it: before the instance built over these imports (#1996).
   adoptMemory(engineMemory);
-  // Views are cached and NEVER refreshed through `.buffer` on the hot path: measured in Chromium, the
-  // `WebAssembly.Memory.buffer` getter costs ~90 ns, more than the whole wasm↔JS call. A view over
-  // SHARED memory is never detached by a grow — it just stays short — so "does this access fit in the
-  // cached view" is the staleness test, and only a miss (after a grow) pays `.buffer` + a new view.
-  // With this, one import call is ~30 ns (vs ~110 ns allocating views per call, ~180 ns re-reading
-  // `.buffer`), i.e. ×4 (byte) to ×7 (8-byte word) over a direct linear-memory access (#1284's gate).
-  let eu8 = new Uint8Array(engineMemory.buffer);
-  let edv = new DataView(engineMemory.buffer);
-  const eng = (end) => {
-    if (end > eu8.byteLength) {
-      eu8 = new Uint8Array(engineMemory.buffer);
-      edv = new DataView(engineMemory.buffer);
-    }
-    return eu8;
-  };
-  // `end` is the memory-absolute end of the access (region offset + base + length).
-  const child = (id, end) => {
-    const v = u8s[id];
-    if (v !== undefined && end <= v.byteLength) return v;
-    const buf = mems[id].m.buffer;
-    i32s[id] = new Int32Array(buf);
-    i64s[id] = new BigInt64Array(buf);
-    return (u8s[id] = new Uint8Array(buf));
-  };
-  const RMW = [null, null, 'add', 'sub', 'and', 'or', 'xor', 'exchange'];
-  const { load, store } = dispatcher();
   return {
-    foreign_load: load,
-    foreign_store: store,
-    foreign_read: (id, off, dst, len) => {
-      off += mems[id].base;
-      const e = eng(dst + len), c = child(id, off + len);
-      if (len <= 16) for (let i = 0; i < len; i++) e[dst + i] = c[off + i];
-      else e.set(c.subarray(off, off + len), dst);
-    },
-    foreign_write: (id, off, src, len) => {
-      off += mems[id].base;
-      const e = eng(src + len), c = child(id, off + len);
-      if (len <= 16) for (let i = 0; i < len; i++) c[off + i] = e[src + i];
-      else c.set(e.subarray(src, src + len), off);
-    },
-    foreign_fill: (id, off, len, b) => {
-      off += mems[id].base;
-      child(id, off + len).fill(b, off, off + len);
-    },
-    foreign_copy: (id, dst, src, len) => {
-      const base = mems[id].base;
-      dst += base; src += base;
-      child(id, Math.max(dst, src) + len).copyWithin(dst, src, src + len);
-    },
     // Mint a fresh shared child memory of `initial`..`maximum` bytes (header included) and register it
-    // with `base` as the region origin (#1286). Returns the id, or -1 if the constructor refused.
+    // with `base` as the region origin (#1286). Returns the id, or -1 if the constructor refused, or if
+    // this agent adopted no engine: then no table would hold the memory's functions, and every access
+    // to it would trap.
     foreign_mint: (base, initial, maximum) => {
+      if (engines.length === 0) {
+        console.error('foreign_mint: this agent adopted no engine instance (a host calls adoptEngine)');
+        return -1;
+      }
       try {
         const m = new WebAssembly.Memory({
           initial: Math.ceil(initial / 65536), maximum: Math.ceil(maximum / 65536), shared: true,
         });
         return registerForeign(m, base);
       } catch { return -1; }
-    },
-    // Make `len` region bytes addressable: grow the memory by whole pages. 1 = ok, 0 = refused (at the
-    // memory's `maximum`). The cached views go stale-short and refresh on their next miss.
-    foreign_grow: (id, len) => {
-      const { m, base } = mems[id];
-      const need = base + len, have = m.buffer.byteLength;
-      if (need <= have) return 1;
-      const pages = Math.ceil((need - have) / 65536);
-      try { m.grow(pages); return 1; } catch { return 0; }
-    },
-    foreign_atomic: (id, kind, off, width, ab) => {
-      off += mems[id].base;
-      eng(ab + 16);
-      child(id, off + width);
-      let old;
-      if (width === 8) {
-        const v = i64s[id], i = off / 8;
-        const a = edv.getBigInt64(ab, true), b = edv.getBigInt64(ab + 8, true);
-        if (kind === 0) old = Atomics.load(v, i);
-        else if (kind === 1) { old = 0n; Atomics.store(v, i, a); }
-        else if (kind === 8) old = Atomics.compareExchange(v, i, a, b);
-        else old = Atomics[RMW[kind]](v, i, a);
-        edv.setBigUint64(ab, BigInt.asUintN(64, old), true);
-      } else {
-        const v = i32s[id], i = off / 4;
-        const a = edv.getInt32(ab, true), b = edv.getInt32(ab + 8, true);
-        if (kind === 0) old = Atomics.load(v, i);
-        else if (kind === 1) { old = 0; Atomics.store(v, i, a); }
-        else if (kind === 8) old = Atomics.compareExchange(v, i, a, b);
-        else old = Atomics[RMW[kind]](v, i, a);
-        edv.setUint32(ab, old >>> 0, true);
-        edv.setUint32(ab + 4, 0, true);
-      }
     },
   };
 }

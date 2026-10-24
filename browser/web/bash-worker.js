@@ -23,6 +23,7 @@
 // fed on ready (the page enables its input the moment the Workers exist, so this race is real).
 
 import { engineImports } from './engine-imports.js';
+import { adoptEngine } from './foreign-mem.js';
 let ex = null;
 let memory = null;
 let drainBuf = 0;
@@ -70,6 +71,7 @@ async function init(cfg) {
     ({ exports } = await WebAssembly.instantiate(module, engineImports(memory)));
     exports.__stack_pointer.value = stackTop;
     if (exports.__tls_size.value > 0) exports.__wasm_init_tls(tlsBase);
+    adoptEngine(exports, memory);
   } catch (err) {
     postMessage({ kind: 'fail', why: String(err) });
     return;

@@ -251,15 +251,20 @@ mapping on native. So:
   (`read_bytes`) and unaffected. Acceptable for a fallback; slice 2's differential measures the
   end-to-end number on a real declined phase, and if that proves too slow for a real consumer
   the fourth answer is the escalation.
-  **Measured end to end, and cut (#2416).** On executor 2 a child's interpreted loop, one load
-  and one store per ~14 ops, ran 38% slower over its own memory than over a window in the
-  engine's (#2413). A byte or word access no longer calls JavaScript. The engine's
-  `foreign_load`/`foreign_store` imports are bound to a dispatcher instance per agent, which
-  calls a tiny accessor instance over the child's memory through its function table: a
-  wasm-to-wasm call, about 3 ns against the JS import's 28 (Chromium). In the cost gate
-  (`browser-foreign-mem-test.mjs`), a word write plus read went from ×5–7 the direct backing to
-  ×2, and a byte from ×3–4 to ×1.7. Spans, fill, copy, atomics and grow stay JS imports. Without
-  multi-memory, which the engine's Rust can't emit and Safari doesn't ship, the call between
+  **Measured end to end, and cut (#2416, #1414 5d).** On executor 2 a child's interpreted loop,
+  one load and one store per ~14 ops, ran 38% slower over its own memory than over a window in
+  the engine's (#2413). No access calls JavaScript now. Each registered memory gets a tiny
+  accessor instance over it, and `web/foreign-mem.js` puts its functions in the engine's own
+  function table, one slot per `ForeignOps` field. The region's `ForeignOps` holds those slots,
+  so `Region` calls the accessor directly: one wasm-to-wasm call per access, for words, bytes,
+  fill, copy, atomics and grow alike. A span (`read_into`/`write_from`) is one `memory.copy`
+  between the two memories, by a copier instance that imports both, where the browser has
+  multi-memory; Safari has not, and there a span moves through the word accessors. #2416 had
+  routed words and bytes through a dispatcher instance, two calls, and left the rest to
+  JavaScript. In the cost gate (`browser-foreign-mem-test.mjs`, Chromium 141), over the direct
+  backing, a word write plus read costs +4.4 ns where #2416's cost +8–10, a byte +0.9 (+7.5),
+  an atomic fetch-add +1 (+36) and a 64-byte span +4 (+84); without multi-memory the span costs
+  +40. Short of multi-memory inside the engine, which its Rust can't emit, the call between
   instances is the floor.
   `Region::Foreign` is not flat-addressable (`raw_base_at = None`), so `tierup_servable`'s
   flat-window arm declines it — correct, since tier-up *into* the child's memory is the
@@ -614,7 +619,7 @@ twins of `pagestate`/`live_mapped`/`paged_walk` and re-plumbs
    the event's segment blob (the event now carries the module's data segments, since the minting
    host has no view of the resolved module) and posts it to a new Worker, which runs
    `temen_par_child_detached` over `Region::Foreign`; `Mem::map` grows a Foreign backing in place
-   (`grow_to` → `foreign_grow`, `-ENOMEM` at the memory's `maximum`); futex waits/notifies address
+   (`grow_to` → `ForeignOps::grow`, `-ENOMEM` at the memory's `maximum`); futex waits/notifies address
    the child memory; N children run concurrently, one Worker + one memory each
    (`browser-par-detached-test.mjs`: three children + a refused fourth). Fail-closed on this
    driver: a detached vCPU's nested **carve** (op 13) or `thread.spawn` traps (the sibling Worker
