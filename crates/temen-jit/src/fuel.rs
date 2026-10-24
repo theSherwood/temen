@@ -309,6 +309,8 @@ mod tests {
             b0.push(Inst::ConstF64((f64::from(x) + 1.0).to_bits()));
         }
         let b0 = Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64],
             insts: b0,
             term: Terminator::Br {
@@ -318,6 +320,8 @@ mod tests {
         };
         // b1(i, a.., f..): i != 0 ? b2 : b3.
         let b1 = Block {
+            parent: 0,
+            captures: vec![],
             params: carried.clone(),
             insts: vec![
                 Inst::ConstI64(0),
@@ -363,6 +367,8 @@ mod tests {
             });
         }
         let b2 = Block {
+            parent: 0,
+            captures: vec![],
             params: carried.clone(),
             insts: b2,
             term: Terminator::Br {
@@ -389,6 +395,8 @@ mod tests {
             acc = k + j + j + n as u32; // the sum so far: the add just pushed
         }
         let b3 = Block {
+            parent: 0,
+            captures: vec![],
             params: carried[1..].to_vec(),
             insts: b3,
             term: Terminator::Return(vec![acc]),

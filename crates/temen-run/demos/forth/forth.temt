@@ -720,12 +720,16 @@ block 0 (idx: i64, np: i64) {
   }
 }
 
-; 15 close_block(): write the open block (params, inst count, scratch bytes) to the arena and
-; record its (offset, len) in the block table at BLKTAB[CUR_BLK].
+; 15 close_block(): write the open block (parent, params, captures, inst count, scratch bytes) to
+; the arena and record its (offset, len) in the block table at BLKTAB[CUR_BLK]. Its parent is the
+; entry, written as the distance back to it: the block's own index (wire v14).
 func () -> () {
 block 0 () {
   alp = i64.const 65744
   off = i64.load alp
+  cbp = i64.const 65600
+  cb = i64.load cbp
+  call 56 (cb)
   cpp = i64.const 65720
   np = i64.load cpp
   call 56 (np)
@@ -743,6 +747,9 @@ block 2 (off: i64, np: i64, i: i64) {
   br 1(off, np, i1)
   }
 block 3 (off: i64) {
+  ; no captures (wire v14)
+  z = i64.const 0
+  call 56 (z)
   cip = i64.const 65616
   ni = i64.load cip
   call 56 (ni)
@@ -1158,7 +1165,7 @@ block 0 (ni: i64, no: i64) {
   blp = i64.const 65736
   z = i64.const 0
   i64.store blp z
-  ; "TEMEN\0\0\0" kind=0 version=13 flags=0
+  ; "TEMEN\0\0\0" kind=0 version=14 flags=0
   c84 = i64.const 84
   call 30 (c84)
   c69 = i64.const 69
@@ -1173,8 +1180,8 @@ block 0 (ni: i64, no: i64) {
   call 30 (z)
   call 30 (z)
   call 30 (z)
-  thirteen = i64.const 13
-  call 30 (thirteen)
+  fourteen = i64.const 14
+  call 30 (fourteen)
   call 30 (z)
   call 30 (z)
   call 30 (z)

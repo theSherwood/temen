@@ -189,6 +189,8 @@ fn parked_vcpu(f: &Fixture, id: TaskId) -> Box<VCpu> {
         params: vec![],
         results: vec![],
         blocks: vec![temen_ir::Block {
+            parent: 0,
+            captures: vec![],
             params: vec![],
             insts: vec![],
             term: Terminator::Return(vec![]),

@@ -29,6 +29,8 @@ fn handler(op: BinOp, imm: i64) -> Func {
         params: vec![I64, I64],
         results: vec![I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![I64, I64],
             insts: vec![
                 Inst::ConstI64(imm),
@@ -61,6 +63,8 @@ fn dispatch_loop_module() -> Module {
         blocks: vec![
             // b0(n): acc=n, cnt=n → loop header
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![I64],
                 insts: vec![],
                 term: Terminator::Br {
@@ -70,6 +74,8 @@ fn dispatch_loop_module() -> Module {
             },
             // b1(acc, cnt): if cnt > 0 → body else return acc
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![I64, I64],
                 insts: vec![
                     Inst::ConstI64(0), // 2
@@ -90,6 +96,8 @@ fn dispatch_loop_module() -> Module {
             },
             // b2(acc, cnt): acc' = call.dyn[acc&3](acc,acc); cnt' = cnt - 1
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![I64, I64],
                 insts: vec![
                     Inst::Convert {
@@ -130,6 +138,8 @@ fn dispatch_loop_module() -> Module {
             },
             // b3(acc): return acc
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![I64],
                 insts: vec![],
                 term: Terminator::Return(vec![0]),

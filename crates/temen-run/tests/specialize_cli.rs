@@ -13,6 +13,8 @@ fn g() -> Module {
             params: vec![ValType::I64, ValType::I64],
             results: vec![ValType::I64],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64, ValType::I64], // 0: a, 1: b
                 insts: vec![
                     Inst::ConstI64(2), // 2

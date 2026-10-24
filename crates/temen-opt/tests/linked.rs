@@ -99,6 +99,8 @@ fn func(params: usize, blocks: Vec<Block>) -> Func {
 
 fn block(params: usize, insts: Vec<Inst>, term: Terminator) -> Block {
     Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I32; params],
         insts,
         term,
@@ -547,6 +549,8 @@ fn optimize_linked_folds_no_floats() {
         params: vec![],
         results: vec![ValType::F64, ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![],
             insts: vec![
                 Inst::ConstF64(1.5f64.to_bits()),

@@ -181,6 +181,10 @@ fn carry_funcs(module: &Module, funcs: Vec<Func>) -> Module {
 /// indices — and every other reference — stay valid. Name-bearing link metadata is dropped (see
 /// [`carry_funcs`]); the residual is addressed by index, like the specializer's own output.
 pub fn lower_indirect_dispatch(module: &Module, cap: usize) -> Module {
+    // Splitting a block renumbers its values: it reads a module whose blocks capture (#2454) in
+    // block-local form.
+    let local = temen_opt::block_local(module);
+    let module: &Module = &local;
     if cap == 0 {
         return carry_funcs(module, module.funcs.clone());
     }
@@ -353,6 +357,8 @@ fn split_site(
         }
     };
     f.blocks[bi] = Block {
+        parent: 0,
+        captures: vec![],
         params: b_params,
         insts: head_insts,
         term: head_term,
@@ -384,6 +390,8 @@ fn split_site(
             let mut params = live_types.clone();
             params.push(ValType::I32); // m
             new_blocks.push(Block {
+                parent: 0,
+                captures: vec![],
                 params,
                 insts,
                 term: Terminator::BrIf {
@@ -439,6 +447,8 @@ fn split_site(
             }
         };
         new_blocks.push(Block {
+            parent: 0,
+            captures: vec![],
             params: live_types.clone(),
             insts,
             term,
@@ -448,6 +458,8 @@ fn split_site(
     // --- default: no matching signature at the selected slot ⇒ the source's IndirectCallType trap
     // (raised here as `unreachable`; see the module-level trap-kind note). ---
     new_blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: Vec::new(),
         insts: Vec::new(),
         term: Terminator::Unreachable,
@@ -466,6 +478,8 @@ fn split_site(
         let mut cont_params = live_types;
         cont_params.extend_from_slice(&ty.results);
         new_blocks.push(Block {
+            parent: 0,
+            captures: vec![],
             params: cont_params,
             insts: cont_insts,
             term: cont_term,

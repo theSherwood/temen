@@ -441,6 +441,8 @@ fn tail_call_reuses_the_frame() {
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         results: vec![],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64, ValType::I64, ValType::I64],
             insts: vec![Inst::Call {
                 func: entry,

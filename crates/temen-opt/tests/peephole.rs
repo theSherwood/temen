@@ -56,6 +56,8 @@ fn self_cmp_module(op: CmpOp) -> Module {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32], // a
             insts: vec![Inst::IntCmp {
                 ty: IntTy::I32,
@@ -123,6 +125,8 @@ fn reassoc_module(op: BinOp, consts: &[i32]) -> Module {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts,
             term: Terminator::Return(vec![acc]),
@@ -164,6 +168,8 @@ fn reassociation_exposes_cse() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32], // v0 = x
             insts: vec![
                 Inst::ConstI32(4),     // v1
@@ -200,6 +206,8 @@ fn mixed_add_sub_constant_chain_collapses() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32], // v0 = x
             insts: vec![
                 Inst::ConstI32(16),

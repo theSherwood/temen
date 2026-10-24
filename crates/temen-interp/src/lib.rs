@@ -4823,8 +4823,152 @@ pub(crate) struct Frame {
     /// Index of the **next** instruction to execute within that block. Saved across a
     /// nested call so the caller resumes just past the `call` when the callee returns.
     inst: usize,
-    /// Block-local SSA values produced so far (entry = the call arguments), as raw [`Reg`]s.
-    vals: Vec<Reg>,
+    /// Block-local SSA values produced so far (entry = the call arguments), as raw [`Reg`]s, with
+    /// the values of the block's ancestors ([`Vals`]).
+    vals: Vals,
+}
+
+/// A frame's values: its current block's, and the values of that block's proper ancestors in its
+/// function's dominance certificate (#2454), each as the frame last left that ancestor. Reads, pushes
+/// and pops see the current block's only, by its block-local indices; [`Vals::enter`] keeps the
+/// ancestors' and copies a block's captures in when it is entered.
+#[derive(Clone, Default)]
+struct Vals {
+    /// The current block's values.
+    cur: Vec<Reg>,
+    /// The ancestors' values end to end, root first: the entry's, every other block's ancestor, then
+    /// those of the blocks in `chain`.
+    above: Vec<Reg>,
+    /// The ancestors other than the entry, root first, each with where its values start in `above`.
+    /// A parent comes before its children, so the list is sorted by block.
+    chain: Vec<(usize, usize)>,
+}
+
+impl Vals {
+    /// Every value the frame holds, its ancestors' included: what a root scan reads.
+    fn all(&self) -> impl Iterator<Item = &Reg> {
+        self.cur.iter().chain(&self.above)
+    }
+
+    #[inline]
+    fn push(&mut self, r: Reg) {
+        self.cur.push(r);
+    }
+
+    fn pop(&mut self) -> Option<Reg> {
+        self.cur.pop()
+    }
+
+    fn extend(&mut self, rs: impl IntoIterator<Item = Reg>) {
+        self.cur.extend(rs);
+    }
+
+    fn extend_from_slice(&mut self, rs: &[Reg]) {
+        self.cur.extend_from_slice(rs);
+    }
+
+    /// Leave block `from` for block `target` (`to`), whose params are `args`; `args` takes the left
+    /// block's buffer back. The target's captures, which name its ancestors' values (rule 2), follow
+    /// its params. The work beyond a buffer swap is out of line: a function that captures nothing
+    /// does it once per call, on leaving its entry.
+    #[inline]
+    fn enter(
+        &mut self,
+        from: usize,
+        target: usize,
+        to: &temen_ir::Block,
+        args: &mut Vec<Reg>,
+    ) -> Result<(), Trap> {
+        let parent = to.parent as usize;
+        if target == 0 || parent == from || !self.chain.is_empty() {
+            self.climb(from, target, parent);
+        }
+        std::mem::swap(&mut self.cur, args);
+        match to.captures.is_empty() {
+            true => Ok(()),
+            false => self.capture(&to.captures),
+        }
+    }
+
+    /// Keep the ancestors of block `target`, whose parent is `parent`, on leaving block `from`. By
+    /// rule 1 the parent is the block left or one of its ancestors, so the target's ancestors are the
+    /// ones up to that parent: the block left joins them, or the ones below the parent leave.
+    #[inline(never)]
+    fn climb(&mut self, from: usize, target: usize, parent: usize) {
+        if target == 0 {
+            // The entry has no ancestors.
+            self.above.clear();
+            self.chain.clear();
+        } else if parent == from {
+            if from != 0 {
+                self.chain.push((from, self.above.len()));
+            }
+            self.above.extend_from_slice(&self.cur);
+        } else {
+            while let Some(&(_, start)) = self.chain.last().filter(|&&(b, _)| b > parent) {
+                self.above.truncate(start);
+                self.chain.pop();
+            }
+        }
+    }
+
+    /// Append the captures of the block just entered to its values.
+    #[inline(never)]
+    fn capture(&mut self, captures: &[(temen_ir::BlockIdx, ValIdx)]) -> Result<(), Trap> {
+        for &(a, v) in captures {
+            let x = self.ancestor(a as usize, v)?;
+            self.cur.push(x);
+        }
+        Ok(())
+    }
+
+    /// Value `v` of ancestor block `a`.
+    fn ancestor(&self, a: usize, v: ValIdx) -> Result<Reg, Trap> {
+        let at = match a {
+            0 => None,
+            _ => Some(
+                self.chain
+                    .binary_search_by_key(&a, |&(b, _)| b)
+                    .map_err(|_| Trap::Malformed)?,
+            ),
+        };
+        let start = at.map_or(0, |i| self.chain[i].1);
+        let end = self
+            .chain
+            .get(at.map_or(0, |i| i + 1))
+            .map_or(self.above.len(), |&(_, s)| s);
+        get(self.above.get(start..end).ok_or(Trap::Malformed)?, v)
+    }
+}
+
+impl std::ops::Deref for Vals {
+    type Target = [Reg];
+    #[inline]
+    fn deref(&self) -> &[Reg] {
+        &self.cur
+    }
+}
+
+impl std::ops::DerefMut for Vals {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [Reg] {
+        &mut self.cur
+    }
+}
+
+impl From<Vec<Reg>> for Vals {
+    fn from(cur: Vec<Reg>) -> Vals {
+        Vals {
+            cur,
+            ..Vals::default()
+        }
+    }
+}
+
+impl FromIterator<Reg> for Vals {
+    fn from_iter<I: IntoIterator<Item = Reg>>(it: I) -> Vals {
+        Vals::from(it.into_iter().collect::<Vec<_>>())
+    }
 }
 
 /// A `<setjmp.h>` checkpoint: the resume point of a `setjmp` call (see [`VCpu::setjmp_points`]). Since
@@ -4841,8 +4985,9 @@ struct SetJmpPoint {
     /// The `setjmp` frame's block, and the instruction index just *after* the `setjmp`.
     block: usize,
     inst: usize,
-    /// The `setjmp` frame's value array at the `setjmp` point (its result slot included).
-    vals: Vec<Reg>,
+    /// The `setjmp` frame's value array at the `setjmp` point (its result slot included), with its
+    /// block's ancestors' (#2454).
+    vals: Vals,
     /// Index in `vals` of the `setjmp` result — overwritten with the long-jump value on re-entry.
     result_idx: usize,
 }
@@ -12979,6 +13124,9 @@ impl VCpu {
             for f in frames {
                 (f.func, f.module, f.block, f.inst).hash(h);
                 hash_vals(h, &f.vals);
+                // The ancestors' values (#2454) are state the frame will read.
+                hash_vals(h, &f.vals.above);
+                f.vals.chain.hash(h);
             }
         }
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -13887,12 +14035,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         }};
     }
 
-    // Reusable scratch for branch edge-args (block parameters). Each taken edge gathers its
-    // args here and swaps the buffer into the frame's value slot, so steady-state branching —
-    // notably a loop back-edge, run every iteration — allocates nothing (the displaced buffer
-    // becomes the next edge's scratch). Lives across the whole `run_inner` call, so the two
-    // buffers ping-pong for free once warmed.
+    // Reusable scratch for branch edge-args (block parameters): each taken edge gathers its args
+    // here before the frame's values move on to the target block's ([`Vals::enter`]), so
+    // steady-state branching — notably a loop back-edge, run every iteration — allocates nothing.
     let mut edge_buf: Vec<Reg> = Vec::new();
+    // Value buffers of returned frames, which calls reuse ([`callee_vals`]): a call then allocates
+    // nothing once warmed. A few suffice, as the pool only bridges a return to the next call.
+    let mut spare: Vec<Vals> = Vec::new();
     // Reusable scratch for `return` results. The common case (a callee returning to a caller in
     // the same fiber) gathers results here and copies them straight into the caller's value
     // file, so a call/return pair no longer allocates a results `Vec` per return. The rarer
@@ -14087,7 +14236,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     module: INVOKE_MODULE,
                                     block: 0,
                                     inst: 0,
-                                    vals: hvals_,
+                                    vals: hvals_.into(),
                                 });
                                 continue 'frames;
                             }
@@ -14395,7 +14544,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         module: INVOKE_MODULE,
                                         block: 0,
                                         inst: 0,
-                                        vals: hvals_,
+                                        vals: hvals_.into(),
                                     }];
                                     // CALLS.md 4b.2 — invalidate the `cur_funcs` cache: the handler
                                     // frame is `INVOKE_MODULE` but `invoked` just changed to the
@@ -14604,7 +14753,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     module: cmod,
                                     block: 0,
                                     inst: 0,
-                                    vals: vec![Reg::from_i64(sp as i64), Reg::from_i32(signum)],
+                                    vals: vec![Reg::from_i64(sp as i64), Reg::from_i32(signum)]
+                                        .into(),
                                 });
                                 sig_handler_stack.push(frames.len());
                                 continue 'frames;
@@ -14969,7 +15119,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // are appended to this frame's `vals` when it returns (see `Return`).
                 Inst::Call { func, args } => {
                     step(fuel, kill.as_deref())?; // fuel unification: function-entry safepoint
-                    let argv = collect(&frames[top].vals, args)?;
+                    let argv = callee_vals(&mut spare, &frames[top].vals, args)?;
                     if fs.get(*func as usize).is_none() {
                         return Err(Trap::Malformed);
                     }
@@ -14997,7 +15147,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         get_i32(&frames[top].vals, *idx)?,
                         call_sig(&cur_types, *ty),
                     )?;
-                    let argv = collect(&frames[top].vals, args)?;
+                    let argv = callee_vals(&mut spare, &frames[top].vals, args)?;
                     if depth as usize + *parked_frames + frames.len() > MAX_CALL_DEPTH as usize {
                         return Err(Trap::StackOverflow);
                     }
@@ -15777,7 +15927,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 module: 0,
                                 block: 0,
                                 inst: 0,
-                                vals: child_vals,
+                                vals: child_vals.into(),
                             }]
                         );
                     }
@@ -16987,7 +17137,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 module: cmod,
                                 block: 0,
                                 inst: 0,
-                                vals: vec![Reg::from_i64(sp), Reg::from_i64(av)],
+                                vals: vec![Reg::from_i64(sp), Reg::from_i64(av)].into(),
                             }]
                         }
                         Claimed::Live(mut f) => {
@@ -17708,10 +17858,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 if (*target as usize) <= frames[top].block {
                     step(fuel, kill.as_deref())?; // fuel unification: back-edge safepoint
                 }
-                collect_into(&mut edge_buf, &frames[top].vals, args)?;
-                std::mem::swap(&mut frames[top].vals, &mut edge_buf);
-                frames[top].block = *target as usize;
-                frames[top].inst = 0;
+                let blocks = &fs[frames[top].func as usize].blocks;
+                branch(
+                    &mut frames[top],
+                    blocks,
+                    *target as usize,
+                    args,
+                    &mut edge_buf,
+                )?;
             }
             Terminator::BrIf {
                 cond,
@@ -17728,10 +17882,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 if (target as usize) <= frames[top].block {
                     step(fuel, kill.as_deref())?; // fuel unification: back-edge safepoint
                 }
-                collect_into(&mut edge_buf, &frames[top].vals, edge_args)?;
-                std::mem::swap(&mut frames[top].vals, &mut edge_buf);
-                frames[top].block = target as usize;
-                frames[top].inst = 0;
+                let blocks = &fs[frames[top].func as usize].blocks;
+                branch(
+                    &mut frames[top],
+                    blocks,
+                    target as usize,
+                    edge_args,
+                    &mut edge_buf,
+                )?;
             }
             Terminator::BrTable {
                 idx,
@@ -17743,10 +17901,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 if (*target as usize) <= frames[top].block {
                     step(fuel, kill.as_deref())?; // fuel unification: back-edge safepoint
                 }
-                collect_into(&mut edge_buf, &frames[top].vals, edge_args)?;
-                std::mem::swap(&mut frames[top].vals, &mut edge_buf);
-                frames[top].block = *target as usize;
-                frames[top].inst = 0;
+                let blocks = &fs[frames[top].func as usize].blocks;
+                branch(
+                    &mut frames[top],
+                    blocks,
+                    *target as usize,
+                    edge_args,
+                    &mut edge_buf,
+                )?;
             }
             Terminator::Return(out) => {
                 collect_into(&mut ret_buf, &frames[top].vals, out)?;
@@ -17768,6 +17930,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Caller in the same fiber resumes past its `call` (`inst` already advanced).
                     // Copy results straight in — no per-return results `Vec`.
                     caller.vals.extend_from_slice(&ret_buf);
+                    if let Some(p) = popped {
+                        recycle(&mut spare, p.vals);
+                    }
                 } else if *cur == ROOT_FIBER {
                     // The root returned: this vCPU is done. Reconstruct typed result `Value`s from
                     // the returning function's result signature (the public boundary is `Value`).
@@ -17969,17 +18134,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // Tail calls replace the top frame in place — no depth growth.
             Terminator::ReturnCall { func, args } => {
                 step(fuel, kill.as_deref())?; // fuel unification: function-entry safepoint
-                let argv = collect(&frames[top].vals, args)?;
+                let argv = callee_vals(&mut spare, &frames[top].vals, args)?;
                 if fs.get(*func as usize).is_none() {
                     return Err(Trap::Malformed);
                 }
-                frames[top] = Frame {
+                let callee = Frame {
                     func: *func,
                     module: frames[top].module, // a direct tail call stays in the caller's module
                     block: 0,
                     inst: 0,
                     vals: argv,
                 };
+                recycle(&mut spare, std::mem::replace(&mut frames[top], callee).vals);
             }
             Terminator::ReturnCallIndirect { ty, idx, args } => {
                 step(fuel, kill.as_deref())?; // fuel unification: function-entry safepoint
@@ -17991,14 +18157,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     get_i32(&frames[top].vals, *idx)?,
                     call_sig(&cur_types, *ty),
                 )?;
-                let argv = collect(&frames[top].vals, args)?;
-                frames[top] = Frame {
+                let argv = callee_vals(&mut spare, &frames[top].vals, args)?;
+                let callee = Frame {
                     func: cfunc,
                     module: cmod,
                     block: 0,
                     inst: 0,
                     vals: argv,
                 };
+                recycle(&mut spare, std::mem::replace(&mut frames[top], callee).vals);
             }
         }
     }
@@ -37078,7 +37245,8 @@ fn gc_scan_frames(
         }
     };
     for f in frames {
-        for v in &f.vals {
+        // An ancestor block's values (#2454) are live while a block below it may capture them.
+        for v in f.vals.all() {
             // Untyped raw slots: scan both 64-bit words, like the JIT scans raw control-stack
             // words (a `v128` contributes both halves; a scalar's high half is 0, which the GC
             // heap range never contains, so `consider` filters it out). An `i32` slot is
@@ -37364,17 +37532,42 @@ fn get_f64(vals: &[Reg], v: ValIdx) -> Result<f64, Trap> {
     Ok(get(vals, v)?.f64())
 }
 
-fn collect(vals: &[Reg], idxs: &[ValIdx]) -> Result<Vec<Reg>, Trap> {
-    idxs.iter().map(|&v| get(vals, v)).collect()
+/// Take frame `f`'s edge into block `target` of `blocks`, gathering `args` in the reusable `buf`.
+fn branch(
+    f: &mut Frame,
+    blocks: &[temen_ir::Block],
+    target: usize,
+    args: &[ValIdx],
+    buf: &mut Vec<Reg>,
+) -> Result<(), Trap> {
+    collect_into(buf, &f.vals, args)?;
+    let to = blocks.get(target).ok_or(Trap::Malformed)?;
+    f.vals.enter(f.block, target, to, buf)?;
+    f.block = target;
+    f.inst = 0;
+    Ok(())
 }
 
-/// Like [`collect`], but gather into a caller-owned buffer instead of a fresh `Vec`. The
-/// hot-loop branch path (`Br`/`BrIf`/`BrTable`) fills a reusable scratch buffer and then
-/// **swaps** it into the frame's value slot, so a taken edge allocates nothing in steady
-/// state — the back-edge of a loop runs every iteration, where the per-branch `collect`
-/// alloc/free dominated. `dst` is cleared first; on a bad index it returns `Malformed`
-/// (leaving `dst` partially filled, which the caller discards as it traps), exactly as
-/// `collect` would have.
+/// A called frame's values: `args` of its caller's `vals`, in a buffer from `spare` when it has one.
+fn callee_vals(spare: &mut Vec<Vals>, vals: &[Reg], args: &[ValIdx]) -> Result<Vals, Trap> {
+    let mut callee = spare.pop().unwrap_or_default();
+    callee.above.clear();
+    callee.chain.clear();
+    collect_into(&mut callee.cur, vals, args)?;
+    Ok(callee)
+}
+
+/// Return a finished frame's value buffer to `spare` for a later call.
+fn recycle(spare: &mut Vec<Vals>, vals: Vals) {
+    if spare.len() < 16 {
+        spare.push(vals);
+    }
+}
+
+/// Gather the values `idxs` names from `vals` into the caller-owned `dst`, so a taken edge or a call
+/// allocates nothing in steady state — the back-edge of a loop runs every iteration, where a
+/// per-branch alloc/free dominated. `dst` is cleared first; on a bad index it returns `Malformed`
+/// (leaving `dst` partially filled, which the caller discards as it traps).
 fn collect_into(dst: &mut Vec<Reg>, vals: &[Reg], idxs: &[ValIdx]) -> Result<(), Trap> {
     dst.clear();
     dst.reserve(idxs.len());
@@ -37405,7 +37598,7 @@ fn val_to_slot(v: Value) -> i64 {
 /// result at that place converted to its declared type, or zero past the results the host returned.
 /// Results past the declared ones are dropped. Every engine defines the same: the Cranelift JIT's
 /// result slots start zeroed, and the bytecode engine zeroes its result registers.
-fn push_results(vals: &mut Vec<Reg>, results: &[i64], declared: &[ValType]) {
+fn push_results(vals: &mut Vals, results: &[i64], declared: &[ValType]) {
     vals.extend(
         declared
             .iter()

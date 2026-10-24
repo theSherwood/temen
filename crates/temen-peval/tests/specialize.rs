@@ -56,6 +56,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
 
     // Block 0 — entry(input): acc = 0, pc = 0; jump to the header.
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t()],                              // 0: input
         insts: vec![Inst::ConstI64(0), Inst::ConstI64(0)], // 1: acc, 2: pc
         term: Terminator::Br {
@@ -66,6 +68,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
 
     // Block 1 — header(acc, pc, input): decode at program+pc and dispatch on the opcode.
     let header = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t(), i64t(), i64t()], // 0: acc, 1: pc, 2: input
         insts: vec![
             Inst::ConstI64(16384), // 3: program base (offset 16384, above the #1094 NULL guard)
@@ -88,6 +92,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
 
     // Block 2 — halt(acc): return acc.
     let halt = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t()],
         insts: vec![],
         term: Terminator::Return(vec![0]),
@@ -95,6 +101,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
 
     // The three "pc += 9 then loop" bodies share a shape; only the accumulator update differs.
     let step_body = |acc_update: Vec<Inst>, nacc_idx: u32| Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t(), i64t(), i64t(), i64t()], // 0: acc, 1: pc, 2: imm, 3: input
         insts: {
             let mut v = acc_update; // computes the new accumulator at index `nacc_idx`
@@ -110,6 +118,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
 
     // Block 3 — set: nacc = imm (forward the immediate directly; no compute needed).
     let set = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t(), i64t(), i64t(), i64t()],
         insts: vec![Inst::ConstI64(9), add(1, 4)], // 4: step, 5: npc
         term: Terminator::Br {
@@ -232,6 +242,8 @@ fn branchy() -> Module {
             results: vec![ValType::I64],
             blocks: vec![
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: x
                     insts: vec![
                         Inst::ConstI64(0), // 1
@@ -251,6 +263,8 @@ fn branchy() -> Module {
                     },
                 },
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: y
                     insts: vec![
                         Inst::ConstI64(2), // 1
@@ -264,6 +278,8 @@ fn branchy() -> Module {
                     term: Terminator::Return(vec![2]),
                 },
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![],
                     insts: vec![Inst::ConstI64(99)], // 0
                     term: Terminator::Return(vec![0]),
@@ -356,7 +372,9 @@ fn build_stack_interpreter(program: &[(u8, i64)]) -> Module {
 
     // 0 — entry(input): pc = 0, sp = STACK_LO; jump to header.
     let entry = Block {
-        params: vec![i64t()],                                            // 0: input
+        parent: 0,
+        captures: vec![],
+        params: vec![i64t()], // 0: input
         insts: vec![Inst::ConstI64(0), Inst::ConstI64(STACK_LO as i64)], // 1: pc, 2: sp
         term: Terminator::Br {
             target: 1,
@@ -366,6 +384,8 @@ fn build_stack_interpreter(program: &[(u8, i64)]) -> Module {
 
     // 1 — header(pc, sp, input): decode at program+pc, dispatch.
     let header = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t(), i64t(), i64t()], // 0: pc, 1: sp, 2: input
         insts: vec![
             Inst::ConstI64(16384),      // 3: program base (above the #1094 NULL guard)
@@ -388,6 +408,8 @@ fn build_stack_interpreter(program: &[(u8, i64)]) -> Module {
 
     // 2 — halt(sp): pop the top slot and return it.
     let halt = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t()], // 0: sp
         insts: vec![
             Inst::ConstI64(8),       // 1
@@ -399,6 +421,8 @@ fn build_stack_interpreter(program: &[(u8, i64)]) -> Module {
 
     // A "push then loop" body: store `value_idx` at [sp], sp += 8, pc += 9.
     let push_body = |value_idx: u32| Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t(), i64t(), i64t(), i64t()], // 0: pc, 1: sp, 2: imm, 3: input
         insts: vec![
             store(1, value_idx),   // [sp] = value
@@ -419,6 +443,8 @@ fn build_stack_interpreter(program: &[(u8, i64)]) -> Module {
 
     // A binary-op body: pop b, pop a, push (a `op` b); nsp = sp - 8.
     let binop_body = |op: BinOp| Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t(), i64t(), i64t(), i64t()], // 0: pc, 1: sp, 2: imm, 3: input
         insts: vec![
             Inst::ConstI64(8),       // 4
@@ -532,6 +558,8 @@ fn renamed_cell_flows_across_a_dynamic_branch() {
             results: vec![ValType::I64],
             blocks: vec![
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: x
                     insts: vec![
                         Inst::ConstI64(STACK_LO as i64), // 1: R
@@ -553,6 +581,8 @@ fn renamed_cell_flows_across_a_dynamic_branch() {
                     },
                 },
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![], // then
                     insts: vec![
                         Inst::ConstI64(STACK_LO as i64), // 0: R
@@ -568,6 +598,8 @@ fn renamed_cell_flows_across_a_dynamic_branch() {
                     term: Terminator::Return(vec![3]),
                 },
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![], // else
                     insts: vec![
                         Inst::ConstI64(STACK_LO as i64), // 0: R
@@ -663,6 +695,8 @@ fn overlay_bytes_drive_folding() {
             params: vec![],
             results: vec![ValType::I64],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![
                     Inst::ConstI64(16400), // 0: addr (above the #1094 NULL guard)
@@ -740,6 +774,8 @@ fn build_float_interpreter(program: &[(u8, i64)]) -> Module {
 
     // 0 — entry(finput): facc = finput, pc = 0.
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![f64t()],           // 0: finput
         insts: vec![Inst::ConstI64(0)], // 1: pc
         term: Terminator::Br {
@@ -749,6 +785,8 @@ fn build_float_interpreter(program: &[(u8, i64)]) -> Module {
     };
     // 1 — header(facc, pc, finput): decode the opcode and dispatch.
     let header = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![f64t(), i64t(), f64t()], // 0: facc, 1: pc, 2: finput
         insts: vec![
             Inst::ConstI64(16384), // 3: base (above the #1094 NULL guard)
@@ -771,12 +809,16 @@ fn build_float_interpreter(program: &[(u8, i64)]) -> Module {
     };
     // 2 — halt(facc).
     let halt = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![f64t()],
         insts: vec![],
         term: Terminator::Return(vec![0]),
     };
     // A float op then pc += 9: params (facc, pc, finput).
     let fstep = |op: FBinOp| Block {
+        parent: 0,
+        captures: vec![],
         params: vec![f64t(), i64t(), f64t()],
         insts: vec![
             fbin(op, 0, 0),    // 3: nfacc = facc `op` facc
@@ -876,6 +918,8 @@ fn private_rename_allows_dynamic_heap_access() {
             params: vec![ValType::I64], // 0: ptr
             results: vec![ValType::I64],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64],
                 insts: vec![
                     Inst::ConstI64(STACK_LO as i64), // 1: stack slot addr
@@ -996,6 +1040,8 @@ fn inlines_direct_call_leaf_helper() {
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: x
                     insts: vec![
                         Inst::Call {
@@ -1015,6 +1061,8 @@ fn inlines_direct_call_leaf_helper() {
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: a
                     insts: vec![imul(0, 0)],    // 1: a*a
                     term: Terminator::Return(vec![1]),
@@ -1059,6 +1107,8 @@ fn inlines_static_recursion_unrolled() {
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: base
                     insts: vec![
                         Inst::ConstI64(3), // 1: e = 3
@@ -1077,6 +1127,8 @@ fn inlines_static_recursion_unrolled() {
                 blocks: vec![
                     // block 0(b, e): branch on e == 0
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64, ValType::I64], // 0: b, 1: e
                         insts: vec![
                             Inst::ConstI64(0), // 2
@@ -1097,12 +1149,16 @@ fn inlines_static_recursion_unrolled() {
                     },
                     // block 1(): base case -> 1
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![],
                         insts: vec![Inst::ConstI64(1)], // 0
                         term: Terminator::Return(vec![0]),
                     },
                     // block 2(b, e): b * pow(b, e - 1)
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64, ValType::I64], // 0: b, 1: e
                         insts: vec![
                             Inst::ConstI64(1), // 2
@@ -1156,6 +1212,8 @@ fn inlines_direct_tail_call() {
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: x
                     insts: vec![],
                     term: Terminator::ReturnCall {
@@ -1168,6 +1226,8 @@ fn inlines_direct_tail_call() {
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: a
                     insts: vec![Inst::IntBin {
                         ty: IntTy::I64,
@@ -1209,6 +1269,8 @@ fn dynamic_branch_in_callee_inlines_as_cfg() {
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: x
                     insts: vec![Inst::Call {
                         func: 1,
@@ -1222,6 +1284,8 @@ fn dynamic_branch_in_callee_inlines_as_cfg() {
                 results: vec![ValType::I64],
                 blocks: vec![
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64], // 0: a
                         insts: vec![
                             Inst::ConstI64(0), // 1
@@ -1241,11 +1305,15 @@ fn dynamic_branch_in_callee_inlines_as_cfg() {
                         },
                     },
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64],                 // 0: a
                         insts: vec![Inst::ConstI64(2), imul(0, 1)], // 1, 2: a * 2
                         term: Terminator::Return(vec![2]),
                     },
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64], // 0: a
                         insts: vec![
                             Inst::ConstI64(1), // 1
@@ -1313,6 +1381,8 @@ fn build_call_interpreter(program: &[(u8, i64)]) -> Module {
 
     // entry / header / halt / set are identical to `build_interpreter`.
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t()],
         insts: vec![Inst::ConstI64(0), Inst::ConstI64(0)], // 1: acc, 2: pc
         term: Terminator::Br {
@@ -1321,6 +1391,8 @@ fn build_call_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let header = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t(), i64t(), i64t()], // 0: acc, 1: pc, 2: input
         insts: vec![
             Inst::ConstI64(16384),      // 3: base (above the #1094 NULL guard)
@@ -1341,11 +1413,15 @@ fn build_call_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let halt = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t()],
         insts: vec![],
         term: Terminator::Return(vec![0]),
     };
     let set = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t(), i64t(), i64t(), i64t()],
         insts: vec![Inst::ConstI64(9), add(1, 4)], // 4, 5: npc
         term: Terminator::Br {
@@ -1357,6 +1433,8 @@ fn build_call_interpreter(program: &[(u8, i64)]) -> Module {
     // The three arithmetic bodies route the accumulator update through a helper `call`.
     // params: 0: acc, 1: pc, 2: imm, 3: input. The call result (nacc) lands at index 4.
     let call_step = |callee: u32, arg: u32| Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t(), i64t(), i64t(), i64t()],
         insts: vec![
             Inst::Call {
@@ -1379,6 +1457,8 @@ fn build_call_interpreter(program: &[(u8, i64)]) -> Module {
         params: vec![i64t(), i64t()],
         results: vec![i64t()],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![i64t(), i64t()], // 0: a, 1: b
             insts: vec![Inst::IntBin {
                 ty: IntTy::I64,
@@ -1523,6 +1603,8 @@ fn narrow_constant_cells_round_trip_with_extension() {
             params: vec![],
             results: vec![ValType::I64],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts,
                 term: Terminator::Return(vec![22]),
@@ -1570,6 +1652,8 @@ fn narrow_store_overwrites_overlapping_cell() {
             params: vec![],
             results: vec![ValType::I32],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![
                     Inst::ConstI64(STACK_LO as i64),       // 0
@@ -1621,6 +1705,8 @@ fn narrow_dynamic_cell_roundtrips_but_overlap_is_unsupported() {
             params: vec![ValType::I64],
             results: vec![ValType::I64],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64], // 0: x
                 insts: vec![
                     Inst::ConstI64(STACK_LO as i64), // 1
@@ -1660,6 +1746,8 @@ fn narrow_dynamic_cell_roundtrips_but_overlap_is_unsupported() {
             params: vec![ValType::I64],
             results: vec![ValType::I64],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64], // 0: x
                 insts: vec![
                     Inst::ConstI64(STACK_LO as i64), // 1
@@ -1704,6 +1792,8 @@ fn dynamic_cf_call_threads_caller_values() {
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: x
                     insts: vec![
                         Inst::ConstI64(100), // 1
@@ -1732,6 +1822,8 @@ fn dynamic_cf_call_threads_caller_values() {
                 results: vec![ValType::I64],
                 blocks: vec![
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64], // 0: a
                         insts: vec![
                             Inst::ConstI64(0), // 1
@@ -1751,11 +1843,15 @@ fn dynamic_cf_call_threads_caller_values() {
                         },
                     },
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64],                 // 0: a
                         insts: vec![Inst::ConstI64(2), imul(0, 1)], // a * 2
                         term: Terminator::Return(vec![2]),
                     },
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64], // 0: a
                         insts: vec![
                             Inst::ConstI64(1),
@@ -1811,6 +1907,8 @@ fn dynamic_loop_in_callee_survives_inlined() {
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: n
                     insts: vec![Inst::Call {
                         func: 1,
@@ -1825,6 +1923,8 @@ fn dynamic_loop_in_callee_survives_inlined() {
                 blocks: vec![
                     // 0 — entry(n): acc = 0; loop.
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64],     // 0: n
                         insts: vec![Inst::ConstI64(0)], // 1: acc
                         term: Terminator::Br {
@@ -1834,6 +1934,8 @@ fn dynamic_loop_in_callee_survives_inlined() {
                     },
                     // 1 — header(n, acc): if n == 0 done else step.
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64, ValType::I64], // 0: n, 1: acc
                         insts: vec![
                             Inst::ConstI64(0), // 2
@@ -1852,12 +1954,16 @@ fn dynamic_loop_in_callee_survives_inlined() {
                     },
                     // 2 — done(acc): return acc.
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64],
                         insts: vec![],
                         term: Terminator::Return(vec![0]),
                     },
                     // 3 — step(n, acc): acc += n; n -= 1; loop.
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64, ValType::I64], // 0: n, 1: acc
                         insts: vec![
                             Inst::IntBin {
@@ -1932,6 +2038,8 @@ fn nested_dynamic_cf_calls_inline() {
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64],
                     insts: vec![Inst::Call {
                         func: 1,
@@ -1946,7 +2054,9 @@ fn nested_dynamic_cf_calls_inline() {
                 results: vec![ValType::I64],
                 blocks: vec![
                     Block {
-                        params: vec![ValType::I64],                            // 0: a
+                        parent: 0,
+                        captures: vec![],
+                        params: vec![ValType::I64], // 0: a
                         insts: vec![Inst::ConstI64(0), cmp(CmpOp::GtS, 0, 1)], // 1, 2: a > 0
                         term: Terminator::BrIf {
                             cond: 2,
@@ -1957,6 +2067,8 @@ fn nested_dynamic_cf_calls_inline() {
                         },
                     },
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64], // 0: a  (then: inner(a) + 1)
                         insts: vec![
                             Inst::Call {
@@ -1974,6 +2086,8 @@ fn nested_dynamic_cf_calls_inline() {
                         term: Terminator::Return(vec![3]),
                     },
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64], // 0: a  (else: inner(a) - 1)
                         insts: vec![
                             Inst::Call {
@@ -1998,7 +2112,9 @@ fn nested_dynamic_cf_calls_inline() {
                 results: vec![ValType::I64],
                 blocks: vec![
                     Block {
-                        params: vec![ValType::I64],                           // 0: b
+                        parent: 0,
+                        captures: vec![],
+                        params: vec![ValType::I64], // 0: b
                         insts: vec![Inst::ConstI64(0), cmp(CmpOp::Ne, 0, 1)], // 1, 2: b != 0
                         term: Terminator::BrIf {
                             cond: 2,
@@ -2009,11 +2125,15 @@ fn nested_dynamic_cf_calls_inline() {
                         },
                     },
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64],                 // 0: b
                         insts: vec![Inst::ConstI64(2), imul(0, 1)], // b * 2
                         term: Terminator::Return(vec![2]),
                     },
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![],
                         insts: vec![Inst::ConstI64(7)],
                         term: Terminator::Return(vec![0]),
@@ -2088,6 +2208,8 @@ fn ret(results: Vec<ValType>, insts: Vec<Inst>, ret_idx: u32) -> Module {
             params: vec![],
             results,
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts,
                 term: Terminator::Return(vec![ret_idx]),
@@ -2494,6 +2616,8 @@ fn double_func() -> Func {
         params: vec![ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64],
             insts: vec![Inst::ConstI64(2), imul(0, 1)],
             term: Terminator::Return(vec![2]),
@@ -2510,6 +2634,8 @@ fn const_indirect_call_via_ref_func_inlines() {
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: x
                     insts: vec![
                         Inst::RefFunc { func: 1 }, // 1: funcref double (folds to const 1)
@@ -2558,6 +2684,8 @@ fn indirect_call_through_constant_memory_table_inlines() {
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: x
                     insts: vec![
                         Inst::ConstI64(16384), // 1: table address (above the #1094 NULL guard)
@@ -2619,6 +2747,8 @@ fn const_indirect_tail_call_inlines() {
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64],             // 0: x
                     insts: vec![Inst::RefFunc { func: 1 }], // 1
                     term: Terminator::ReturnCallIndirect {
@@ -2658,6 +2788,8 @@ fn indirect_call_to_dynamic_cf_callee_inlines_as_cfg() {
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: x
                     insts: vec![
                         Inst::RefFunc { func: 1 },
@@ -2675,6 +2807,8 @@ fn indirect_call_to_dynamic_cf_callee_inlines_as_cfg() {
                 results: vec![ValType::I64],
                 blocks: vec![
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64], // 0: a
                         insts: vec![
                             Inst::ConstI64(0),
@@ -2694,11 +2828,15 @@ fn indirect_call_to_dynamic_cf_callee_inlines_as_cfg() {
                         },
                     },
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64],
                         insts: vec![Inst::ConstI64(2), imul(0, 1)],
                         term: Terminator::Return(vec![2]),
                     },
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64],
                         insts: vec![
                             Inst::ConstI64(1),
@@ -2749,6 +2887,8 @@ fn unresolvable_indirect_calls_are_unsupported() {
                 params: vec![ValType::I64, ValType::I32], // 0: x, 1: sel (dynamic funcref)
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64, ValType::I32],
                     insts: vec![Inst::CallIndirect {
                         ty: 0,
@@ -2777,6 +2917,8 @@ fn unresolvable_indirect_calls_are_unsupported() {
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: x
                     insts: vec![
                         Inst::RefFunc { func: 1 }, // points at a (i64,i64)->i64 function
@@ -2793,6 +2935,8 @@ fn unresolvable_indirect_calls_are_unsupported() {
                 params: vec![ValType::I64, ValType::I64],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64, ValType::I64],
                     insts: vec![Inst::IntBin {
                         ty: IntTy::I64,
@@ -2856,6 +3000,8 @@ fn outlining_shares_a_callee_across_call_sites() {
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: x
                     insts: vec![
                         Inst::Call {
@@ -2880,6 +3026,8 @@ fn outlining_shares_a_callee_across_call_sites() {
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64],
                     insts: vec![Inst::ConstI64(2), imul(0, 1)],
                     term: Terminator::Return(vec![2]),
@@ -2943,6 +3091,8 @@ fn outlining_threads_a_renamed_cell_across_a_call() {
                 params: vec![ValType::I64],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: x
                     insts: vec![
                         Inst::ConstI64(STACK_LO as i64), // 1: R
@@ -2969,6 +3119,8 @@ fn outlining_threads_a_renamed_cell_across_a_call() {
                 params: vec![],
                 results: vec![],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![],
                     insts: vec![
                         Inst::ConstI64(STACK_LO as i64), // 0: R
@@ -3057,6 +3209,8 @@ fn outlining_specializes_dynamic_depth_recursion() {
             results: vec![ValType::I64],
             blocks: vec![
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: n
                     insts: vec![
                         Inst::ConstI64(0), // 1
@@ -3076,11 +3230,15 @@ fn outlining_specializes_dynamic_depth_recursion() {
                     },
                 },
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![],
                     insts: vec![Inst::ConstI64(0)],
                     term: Terminator::Return(vec![0]),
                 },
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: n
                     insts: vec![
                         Inst::ConstI64(1), // 1
@@ -3144,6 +3302,8 @@ fn outlining_makes_one_function_per_static_pattern() {
             results: vec![ValType::I64],
             blocks: vec![
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64, ValType::I64], // 0: b, 1: e
                     insts: vec![
                         Inst::ConstI64(0),
@@ -3163,11 +3323,15 @@ fn outlining_makes_one_function_per_static_pattern() {
                     },
                 },
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![],
                     insts: vec![Inst::ConstI64(1)],
                     term: Terminator::Return(vec![0]),
                 },
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64, ValType::I64], // 0: b, 1: e
                     insts: vec![
                         Inst::ConstI64(1),
@@ -3236,6 +3400,8 @@ fn selective_outlining_inlines_leaves_and_outlines_recursion() {
                 results: vec![ValType::I64],
                 blocks: vec![
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64], // 0: n
                         insts: vec![
                             Inst::ConstI64(0), // 1
@@ -3255,11 +3421,15 @@ fn selective_outlining_inlines_leaves_and_outlines_recursion() {
                         },
                     },
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![],
                         insts: vec![Inst::ConstI64(0)],
                         term: Terminator::Return(vec![0]),
                     },
                     Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![ValType::I64], // 0: n
                         insts: vec![
                             Inst::Call {
@@ -3292,6 +3462,8 @@ fn selective_outlining_inlines_leaves_and_outlines_recursion() {
                 params: vec![ValType::I64], // g(a) = a * a
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: a
                     insts: vec![Inst::IntBin {
                         ty: IntTy::I64,
@@ -3640,6 +3812,8 @@ fn dynamic_operand_v128_op_passes_through() {
             params: vec![ValType::V128],
             results: vec![ValType::V128],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::V128], // 0: x (dynamic)
                 insts: vec![
                     Inst::ConstV128(VB), // 1

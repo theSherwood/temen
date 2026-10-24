@@ -119,6 +119,8 @@ fn sequential_reload_is_forwarded() {
         results: vec![ValType::I64],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64], // v0 = addr
                 insts: vec![loadi(0)],      // v1 = x
                 term: Terminator::Br {
@@ -127,6 +129,8 @@ fn sequential_reload_is_forwarded() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64, ValType::I64], // v0 = addr2, v1 = x2
                 insts: vec![loadi(0), addi(1, 2)],        // v2 = y, v3 = x2 + y
                 term: Terminator::Return(vec![3]),
@@ -147,6 +151,8 @@ fn diamond_join_reload_is_forwarded() {
     // b1 / b2: pass through to b3
     // b3(addr3, x3): y = mem[addr3]; return x3 + y     // y redundant — b0 dominates b3, no clobber
     let thru = |t: u32| Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64],
         insts: vec![],
         term: Terminator::Br {
@@ -159,6 +165,8 @@ fn diamond_join_reload_is_forwarded() {
         results: vec![ValType::I64],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64, ValType::I32], // v0=addr, v1=sel
                 insts: vec![loadi(0)],                    // v2 = x
                 term: Terminator::BrIf {
@@ -172,6 +180,8 @@ fn diamond_join_reload_is_forwarded() {
             thru(3), // b1 -> b3
             thru(3), // b2 -> b3
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64, ValType::I64], // v0=addr3, v1=x3
                 insts: vec![loadi(0), addi(1, 2)],        // v2 = y, v3 = x3 + y
                 term: Terminator::Return(vec![3]),
@@ -206,6 +216,8 @@ fn a_store_between_blocks_forwarding() {
         results: vec![ValType::I64],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64, ValType::I64], // v0=addr, v1=other
                 insts: vec![loadi(0)],                    // v2 = x
                 term: Terminator::Br {
@@ -214,6 +226,8 @@ fn a_store_between_blocks_forwarding() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64, ValType::I64, ValType::I64], // addr2, other2, x2
                 insts: vec![Inst::ConstI64(99), storei(1, 3)],          // mem[other2] = 99
                 term: Terminator::Br {
@@ -222,6 +236,8 @@ fn a_store_between_blocks_forwarding() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64, ValType::I64], // addr3, x3
                 insts: vec![loadi(0), addi(1, 2)],        // v2 = y, v3 = x3 + y
                 term: Terminator::Return(vec![3]),
@@ -259,6 +275,8 @@ fn load_in_a_loop_with_a_store_is_not_forwarded() {
         results: vec![ValType::I64],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64, ValType::I64], // v0=n, v1=addr
                 insts: vec![loadi(1)],                    // v2 = x0
                 term: Terminator::Br {
@@ -267,6 +285,8 @@ fn load_in_a_loop_with_a_store_is_not_forwarded() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64, ValType::I64, ValType::I64], // i, addr2, prev
                 insts: vec![
                     loadi(1),          // v3 = y = mem[addr2]
@@ -290,6 +310,8 @@ fn load_in_a_loop_with_a_store_is_not_forwarded() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64], // r
                 insts: vec![],
                 term: Terminator::Return(vec![0]),
@@ -318,6 +340,8 @@ fn load_in_a_loop_with_a_store_is_not_forwarded() {
 /// i64 value), materialized at v2 before the store.
 fn diamond_with_arm_store(op: StoreOp, offset: u64) -> Module {
     let thru = |t: u32| Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64],
         insts: vec![],
         term: Terminator::Br {
@@ -335,6 +359,8 @@ fn diamond_with_arm_store(op: StoreOp, offset: u64) -> Module {
         results: vec![ValType::I64],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64, ValType::I32],
                 insts: vec![loadi(0)], // v2 = a = mem[p+0]
                 term: Terminator::BrIf {
@@ -347,7 +373,9 @@ fn diamond_with_arm_store(op: StoreOp, offset: u64) -> Module {
             },
             // b1: the arm carrying the store.
             Block {
-                params: vec![ValType::I64, ValType::I64],        // p, a
+                parent: 0,
+                captures: vec![],
+                params: vec![ValType::I64, ValType::I64], // p, a
                 insts: vec![konst, store_off(op, 0, 2, offset)], // value v2, store addr = p = v0
                 term: Terminator::Br {
                     target: 3,
@@ -356,6 +384,8 @@ fn diamond_with_arm_store(op: StoreOp, offset: u64) -> Module {
             },
             thru(3), // b2: no store
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64, ValType::I64], // p3, a3
                 insts: vec![loadi(0), addi(1, 2)],        // v2 = d = mem[p3+0], v3 = a3 + d
                 term: Terminator::Return(vec![3]),

@@ -13,10 +13,12 @@
 //! This closes the verifier's accept-direction gap: an accept-direction bug in
 //! `temen-verify` now needs the same bug, independently written, in the reference.
 
-#[path = "support/irgen.rs"]
-mod irgen;
+// The structural mutations the coverage-guided `spec_verify` target applies, shared, and the program
+// generator they ride on.
+#[path = "support/specfuzz.rs"]
+mod specfuzz;
 
-use irgen::Gen;
+use specfuzz::irgen::{self, Gen};
 use temen::verify::{verify_module, VerifyError};
 use temen_ir::*;
 use temen_spec::{all_rows, mem_rows, module_for, module_for_mem, vectors_for, Shape};
@@ -48,6 +50,8 @@ fn func(params: Vec<ValType>, results: Vec<ValType>, insts: Vec<Inst>, term: Ter
         params: params.clone(),
         results,
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts,
             term,
@@ -188,6 +192,8 @@ fn directed_rule_rejects() {
         },
     );
     f.blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: vec![V::I32],
         insts: vec![],
         term: T::Return(vec![0]),
@@ -207,6 +213,8 @@ fn directed_rule_rejects() {
         },
     );
     f.blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: vec![V::I32],
         insts: vec![],
         term: T::Return(vec![0]),
@@ -641,97 +649,33 @@ fn directed_rule_rejects() {
     });
 }
 
-/// Deterministic structural mutations for the agreement sweep. A mutation may leave
-/// the module valid — the assertion is *agreement*, not rejection.
-fn mutate(m: &mut Module, kind: u64) {
-    match kind % 6 {
-        // Retarget the first unconditional branch far out of range.
-        0 => {
-            for f in &mut m.funcs {
-                for b in &mut f.blocks {
-                    if let Terminator::Br { target, .. } = &mut b.term {
-                        *target = 999;
-                        return;
-                    }
-                }
-            }
-        }
-        // Empty the first return's argument list.
-        1 => {
-            for f in &mut m.funcs {
-                for b in &mut f.blocks {
-                    if let Terminator::Return(vals) = &mut b.term {
-                        if !vals.is_empty() {
-                            vals.clear();
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-        // Rotate the first block parameter's type (leaves the func signature alone,
-        // so this usually trips the entry rule or an operand type).
-        2 => {
-            for f in &mut m.funcs {
-                for b in &mut f.blocks {
-                    if let Some(p) = b.params.first_mut() {
-                        *p = match *p {
-                            ValType::I32 => ValType::I64,
-                            ValType::I64 => ValType::F32,
-                            ValType::F32 => ValType::F64,
-                            ValType::F64 => ValType::V128,
-                            ValType::V128 => ValType::Ref,
-                            ValType::Ref | ValType::Cap => ValType::I32,
-                        };
-                        return;
-                    }
-                }
-            }
-        }
-        // Drop the memory declaration (any load/store must then be rejected).
-        3 => m.memory = None,
-        // Grow the entry function's result arity.
-        4 => {
-            if let Some(f) = m.funcs.first_mut() {
-                f.results.push(ValType::I32);
-            }
-        }
-        // Prepend a const to a nonempty block: shifts the value numbering under every
-        // later operand index.
-        5 => {
-            for f in &mut m.funcs {
-                for b in &mut f.blocks {
-                    if !b.insts.is_empty() {
-                        b.insts.insert(0, Inst::ConstI32(0));
-                        return;
-                    }
-                }
-            }
-        }
-        _ => unreachable!(),
-    }
-}
-
-/// Part 3 — the agreement sweep: `irgen` modules are accepted by both verifiers, and
-/// structural mutations of them keep the two in accept/reject agreement.
+/// Part 3 — the agreement sweep: `irgen` modules, and the same modules raised into dominance form
+/// (#2454), are accepted by both verifiers, and structural mutations of them keep the two in
+/// accept/reject agreement.
 #[test]
 fn verifier_agreement_on_generated_modules() {
     for seed in 0..300u64 {
         let mut g = Gen::from_seed(seed);
-        let m = irgen::gen_module(&mut g);
-        accept(&m, &format!("irgen seed {seed}"));
-        for kind in 0..6u64 {
-            let mut mm = m.clone();
-            mutate(&mut mm, kind);
-            let prod = verify_module(&mm).is_ok();
-            let refv = temen_spec::verify::verify(&mm).is_ok();
-            assert_eq!(
-                prod,
-                refv,
-                "verifier disagreement (seed {seed}, mutation {kind}): production={prod}, \
+        let generated = irgen::gen_module(&mut g);
+        let mut raised = generated.clone();
+        for f in &mut raised.funcs {
+            f.raise();
+        }
+        for m in [generated, raised] {
+            accept(&m, &format!("irgen seed {seed}"));
+            for kind in 0..specfuzz::MUTATIONS {
+                let mut mm = m.clone();
+                specfuzz::mutate(&mut mm, kind);
+                let prod = verify_module(&mm).is_ok();
+                let refv = temen_spec::verify::verify(&mm).is_ok();
+                assert_eq!(
+                    prod,
+                    refv,
+                    "verifier disagreement (seed {seed}, mutation {kind}): production={prod}, \
                  reference={refv}\n{}",
-                temen::text::print_module(&mm)
-            );
+                    temen::text::print_module(&mm)
+                );
+            }
         }
     }
 }

@@ -59,6 +59,8 @@ fn add_const(k: i32) -> Func {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![Inst::ConstI32(k), add(0, 1)],
             term: Terminator::Return(vec![2]),
@@ -72,6 +74,8 @@ fn entry_calling(callee: u32) -> Func {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![Inst::Call {
                 func: callee,
@@ -143,6 +147,8 @@ fn drops_uncalled_function_and_renumbers() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![add(0, 0)], // a + a = a*2
             term: Terminator::Return(vec![1]),
@@ -223,6 +229,8 @@ fn keeps_all_functions_when_indirect_dispatch_present() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![
                 Inst::RefFunc { func: 2 }, // v1 = funcref(2)
@@ -275,6 +283,8 @@ fn keeps_functions_when_a_ref_func_value_is_observable() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![Inst::RefFunc { func: 2 }], // v1 = funcref(2), returned as a plain i32
             term: Terminator::Return(vec![1]),
@@ -323,6 +333,8 @@ fn keeps_functions_when_the_data_image_holds_an_index() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![
                 Inst::ConstI64(32768),
@@ -372,6 +384,8 @@ fn affine_helper() -> Func {
         params: vec![ValType::I32, ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32, ValType::I32],
             insts: vec![
                 Inst::ConstI32(3),
@@ -394,6 +408,8 @@ fn inlines_leaf_helper_then_dfe_removes_it() {
         params: vec![ValType::I32, ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32, ValType::I32],
             insts: vec![Inst::Call {
                 func: 1,
@@ -449,6 +465,8 @@ fn inlines_with_live_code_after_the_call() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![Inst::ConstI32(1), add(0, 1)],
             term: Terminator::Return(vec![2]),
@@ -458,6 +476,8 @@ fn inlines_with_live_code_after_the_call() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![
                 Inst::Call {
@@ -509,7 +529,9 @@ fn abs_callee() -> Func {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
-                params: vec![ValType::I32],                            // x = v0
+                parent: 0,
+                captures: vec![],
+                params: vec![ValType::I32], // x = v0
                 insts: vec![Inst::ConstI32(0), cmp(CmpOp::LtS, 0, 1)], // v1=0, v2 = x<0
                 term: Terminator::BrIf {
                     cond: 2,
@@ -520,6 +542,8 @@ fn abs_callee() -> Func {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // x = v0
                 insts: vec![
                     Inst::ConstI32(0),
@@ -534,6 +558,8 @@ fn abs_callee() -> Func {
                 term: Terminator::Return(vec![2]),
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // x = v0
                 insts: vec![],
                 term: Terminator::Return(vec![0]),
@@ -551,6 +577,8 @@ fn inlines_a_multiblock_callee_threading_a_captured_value() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32], // a = v0
             insts: vec![
                 Inst::ConstI32(10), // v1 = k
@@ -598,6 +626,8 @@ fn multiblock_inline_through_the_full_pipeline() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![Inst::Call {
                 func: 1,
@@ -635,6 +665,8 @@ fn inlines_a_callee_with_a_loop_threading_a_captured_value_around_the_back_edge(
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],     // n = v0
                 insts: vec![Inst::ConstI32(0)], // v1 = 0
                 term: Terminator::Br {
@@ -643,6 +675,8 @@ fn inlines_a_callee_with_a_loop_threading_a_captured_value_around_the_back_edge(
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32], // i=v0, acc=v1
                 insts: vec![Inst::ConstI32(0), cmp(CmpOp::Ne, 0, 2)], // v2=0, v3 = i!=0
                 term: Terminator::BrIf {
@@ -654,6 +688,8 @@ fn inlines_a_callee_with_a_loop_threading_a_captured_value_around_the_back_edge(
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32], // i=v0, acc=v1
                 insts: vec![
                     Inst::ConstI32(1), // v2 = 1
@@ -671,6 +707,8 @@ fn inlines_a_callee_with_a_loop_threading_a_captured_value_around_the_back_edge(
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // acc = v0
                 insts: vec![],
                 term: Terminator::Return(vec![0]),
@@ -682,6 +720,8 @@ fn inlines_a_callee_with_a_loop_threading_a_captured_value_around_the_back_edge(
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![
                 Inst::ConstI32(100),
@@ -730,6 +770,8 @@ fn devirtualizes_constant_funcref_then_inlines_and_dfes() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![
                 Inst::RefFunc { func: 1 }, // v1 = funcref(1)
@@ -795,6 +837,8 @@ fn does_not_devirtualize_on_signature_mismatch() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![
                 Inst::RefFunc { func: 1 }, // funcref to the 2-arg function
@@ -811,6 +855,8 @@ fn does_not_devirtualize_on_signature_mismatch() {
         params: vec![ValType::I32, ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32, ValType::I32],
             insts: vec![add(0, 1)],
             term: Terminator::Return(vec![2]),
@@ -855,6 +901,8 @@ fn sel_helper() -> Func {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32],
                 insts: vec![Inst::ConstI32(0), cmp(CmpOp::Ne, 0, 2)], // v3 = flag != 0
                 term: Terminator::BrIf {
@@ -866,11 +914,15 @@ fn sel_helper() -> Func {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // v
                 insts: vec![],
                 term: Terminator::Return(vec![0]),
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // v
                 insts: vec![
                     Inst::ConstI32(0),
@@ -905,6 +957,8 @@ fn const_arg_folds_a_branch_in_the_callee() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32], // x
             insts: vec![
                 Inst::ConstI32(1),
@@ -951,6 +1005,8 @@ fn a_parameter_with_differing_constants_is_not_specialized() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32], // x
             insts: vec![
                 Inst::ConstI32(1),
@@ -994,6 +1050,8 @@ fn an_exported_function_is_not_specialized() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![
                 Inst::ConstI32(1),
@@ -1047,6 +1105,8 @@ fn const_prop_bails_on_an_unresolvable_indirect_index() {
         params: vec![ValType::I32, ValType::I32], // fp (runtime funcref), x
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32, ValType::I32],
             insts: vec![
                 Inst::ConstI32(1),
@@ -1095,6 +1155,8 @@ fn const_funcref_argument_devirtualizes_through_the_callee() {
         params: vec![ValType::I32], // x
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![
                 Inst::ConstI32(2), // funcref g (== funcidx 2)
@@ -1110,6 +1172,8 @@ fn const_funcref_argument_devirtualizes_through_the_callee() {
         params: vec![ValType::I32, ValType::I32], // fp=v0, a=v1
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32, ValType::I32],
             insts: vec![Inst::CallIndirect {
                 ty: 0, // #922: sig interned at type-section index 0
@@ -1123,6 +1187,8 @@ fn const_funcref_argument_devirtualizes_through_the_callee() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![Inst::ConstI32(1), add(0, 1)], // a + 1
             term: Terminator::Return(vec![2]),
@@ -1166,6 +1232,8 @@ fn a_non_uniform_funcref_argument_is_not_devirtualized() {
         params: vec![ValType::I32, ValType::I32], // fp, a
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32, ValType::I32],
             insts: vec![Inst::CallIndirect {
                 ty: 0, // #922: sig interned at type-section index 0
@@ -1179,6 +1247,8 @@ fn a_non_uniform_funcref_argument_is_not_devirtualized() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![Inst::ConstI32(1), add(0, 1)],
             term: Terminator::Return(vec![2]),
@@ -1188,6 +1258,8 @@ fn a_non_uniform_funcref_argument_is_not_devirtualized() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![add(0, 0)],
             term: Terminator::Return(vec![1]),
@@ -1199,6 +1271,8 @@ fn a_non_uniform_funcref_argument_is_not_devirtualized() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32],
                 insts: vec![],
                 term: Terminator::BrIf {
@@ -1210,6 +1284,8 @@ fn a_non_uniform_funcref_argument_is_not_devirtualized() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // x
                 insts: vec![
                     Inst::ConstI32(2), // funcref plus1 (funcidx 2)
@@ -1221,6 +1297,8 @@ fn a_non_uniform_funcref_argument_is_not_devirtualized() {
                 term: Terminator::Return(vec![2]),
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // x
                 insts: vec![
                     Inst::ConstI32(3), // funcref times2 (funcidx 3)
@@ -1266,6 +1344,8 @@ fn an_indirect_call_with_a_runtime_arg_blocks_specialization() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],
                 insts: vec![Inst::ConstI32(0), cmp(CmpOp::Ne, 0, 1)], // flag != 0
                 term: Terminator::BrIf {
@@ -1277,11 +1357,15 @@ fn an_indirect_call_with_a_runtime_arg_blocks_specialization() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![Inst::ConstI32(10)],
                 term: Terminator::Return(vec![0]),
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![Inst::ConstI32(20)],
                 term: Terminator::Return(vec![0]),
@@ -1297,6 +1381,8 @@ fn an_indirect_call_with_a_runtime_arg_blocks_specialization() {
         params: vec![ValType::I32], // r (runtime)
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![
                 Inst::ConstI32(1),
@@ -1344,6 +1430,8 @@ fn a_block_parameter_is_not_read_as_a_function_parameter() {
         params: vec![],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![],
             insts: vec![
                 Inst::ConstI32(1),
@@ -1360,6 +1448,8 @@ fn a_block_parameter_is_not_read_as_a_function_parameter() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // p = v0
                 insts: vec![Inst::ConstI32(5), Inst::ConstI32(7)],
                 term: Terminator::BrIf {
@@ -1371,6 +1461,8 @@ fn a_block_parameter_is_not_read_as_a_function_parameter() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // q = v0 (a phi: 5 or 7)
                 insts: vec![Inst::Call {
                     func: 2,
@@ -1385,6 +1477,8 @@ fn a_block_parameter_is_not_read_as_a_function_parameter() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],
                 insts: vec![Inst::ConstI32(5), cmp(CmpOp::Eq, 0, 1)], // v == 5
                 term: Terminator::BrIf {
@@ -1396,11 +1490,15 @@ fn a_block_parameter_is_not_read_as_a_function_parameter() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![Inst::ConstI32(100)],
                 term: Terminator::Return(vec![0]),
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![Inst::ConstI32(200)],
                 term: Terminator::Return(vec![0]),

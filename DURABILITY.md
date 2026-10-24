@@ -51,7 +51,9 @@ Grounding the proposal in what already exists (verified against the tree):
   `Block { params, insts, term }`). So resume-point liveness is *free*: a
   continuation block's `params` already are the live set, and the verifier
   (`temen-verify`) does no liveness/dominance analysis — it is a single linear forward
-  type pass.
+  type pass. A function whose blocks capture values of their dominators (#2454) is
+  first converted to that block-local form (`Func::localize`), so the transform's
+  per-block liveness still holds; only the functions it instruments change.
 - **Dispatch primitive exists.** `Terminator::BrTable` (verifier-constrained: valid
   well-typed arm or trapping default, checks in `crates/temen-verify/src/lib.rs`) is
   exactly the rewind dispatch we need. No new instruction.

@@ -42,6 +42,8 @@ fn single_block_fn(
             params: params.clone(),
             results,
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params,
                 insts,
                 term: Terminator::Return(vec![ret]),
@@ -124,6 +126,8 @@ fn resolves_branch_and_prunes_dead_block() {
             results: vec![ValType::I64],
             blocks: vec![
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64],     // x = 0
                     insts: vec![Inst::ConstI32(1)], // 1
                     term: Terminator::BrIf {
@@ -135,6 +139,8 @@ fn resolves_branch_and_prunes_dead_block() {
                     },
                 },
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // y = 0
                     insts: vec![
                         Inst::ConstI64(10), // 1
@@ -148,6 +154,8 @@ fn resolves_branch_and_prunes_dead_block() {
                     term: Terminator::Return(vec![2]),
                 },
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64],
                     insts: vec![
                         Inst::ConstI64(20), // 1
@@ -177,6 +185,8 @@ fn resolves_branch_and_prunes_dead_block() {
 fn resolves_br_table_and_prunes() {
     // () -> i32 : br_table over const 1 -> selects targets[1] (block 2, returns 200)
     let blk = |c: i32| Block {
+        parent: 0,
+        captures: vec![],
         params: vec![],
         insts: vec![Inst::ConstI32(c)],
         term: Terminator::Return(vec![0]),
@@ -187,6 +197,8 @@ fn resolves_br_table_and_prunes() {
             results: vec![ValType::I32],
             blocks: vec![
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![],
                     insts: vec![Inst::ConstI32(1)], // 0
                     term: Terminator::BrTable {
@@ -281,6 +293,8 @@ fn preserves_loops_with_nonconstant_conditions() {
             blocks: vec![
                 // block 0: entry(n) -> header(acc=0, i=n)
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I32],     // n = 0
                     insts: vec![Inst::ConstI32(0)], // 1
                     term: Terminator::Br {
@@ -290,6 +304,8 @@ fn preserves_loops_with_nonconstant_conditions() {
                 },
                 // block 1: header(acc, i): if i == 0 -> exit(acc) else body(acc, i)
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I32, ValType::I32], // acc=0, i=1
                     insts: vec![
                         Inst::ConstI32(0), // 2
@@ -310,12 +326,16 @@ fn preserves_loops_with_nonconstant_conditions() {
                 },
                 // block 2: exit(acc) -> return acc
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I32],
                     insts: vec![],
                     term: Terminator::Return(vec![0]),
                 },
                 // block 3: body(acc, i): acc+=i; i-=1; -> header
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I32, ValType::I32], // acc=0, i=1
                     insts: vec![
                         Inst::IntBin {
@@ -367,6 +387,8 @@ fn merges_straight_line_chain() {
             results: vec![ValType::I64],
             blocks: vec![
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // x
                     insts: vec![],
                     term: Terminator::Br {
@@ -375,6 +397,8 @@ fn merges_straight_line_chain() {
                     },
                 },
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // a
                     insts: vec![
                         Inst::ConstI64(1), // 1
@@ -391,6 +415,8 @@ fn merges_straight_line_chain() {
                     },
                 },
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // b
                     insts: vec![],
                     term: Terminator::Return(vec![0]),
@@ -418,6 +444,8 @@ fn loop_threading_junk() -> Module {
             results: i64s(1),
             blocks: vec![
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: i64s(1), // 0: n
                     insts: vec![
                         Inst::ConstI64(0),   // 1: acc
@@ -429,6 +457,8 @@ fn loop_threading_junk() -> Module {
                     },
                 },
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: i64s(3), // 0: n, 1: acc, 2: junk
                     insts: vec![
                         Inst::ConstI64(0), // 3
@@ -448,6 +478,8 @@ fn loop_threading_junk() -> Module {
                     },
                 },
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: i64s(3), // 0: n, 1: acc, 2: junk
                     insts: vec![
                         Inst::IntBin {
@@ -470,6 +502,8 @@ fn loop_threading_junk() -> Module {
                     },
                 },
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: i64s(2), // 0: acc, 1: junk
                     insts: vec![],
                     term: Terminator::Return(vec![0]),
@@ -506,6 +540,8 @@ fn drops_dead_block_parameter_across_predecessors() {
             results: vec![ValType::I64],
             blocks: vec![
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // 0: x
                     insts: vec![
                         Inst::ConstI64(0), // 1
@@ -527,6 +563,8 @@ fn drops_dead_block_parameter_across_predecessors() {
                     },
                 },
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64, ValType::I64], // 0: v, 1: junk (unused)
                     insts: vec![],
                     term: Terminator::Return(vec![0]),
@@ -604,6 +642,8 @@ fn keeps_dead_load_but_drops_dead_arithmetic() {
             params: vec![],
             results: vec![ValType::I32],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![
                     Inst::ConstI64(16384), // 0 : addr (above the #1094 NULL guard)
@@ -659,6 +699,8 @@ fn keeps_store_effect_across_renumbering() {
             params: vec![],
             results: vec![ValType::I32],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![
                     Inst::ConstI64(16392), // 0 : addr (above the #1094 NULL guard)
@@ -712,6 +754,8 @@ fn dce_removes_dead_branch_condition() {
             results: vec![ValType::I64],
             blocks: vec![
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64], // x = 0
                     insts: vec![
                         Inst::ConstI32(5), // 1
@@ -732,11 +776,15 @@ fn dce_removes_dead_branch_condition() {
                     },
                 },
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64],
                     insts: vec![],
                     term: Terminator::Return(vec![0]),
                 },
                 Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![ValType::I64],
                     insts: vec![Inst::ConstI64(999)],
                     term: Terminator::Return(vec![1]),

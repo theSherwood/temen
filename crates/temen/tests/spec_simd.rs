@@ -245,6 +245,8 @@ fn spec_v128_load_store_boundary_lattice() {
                 params: vec![],
                 results: vec![ValType::I64, ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![],
                     insts,
                     term: Terminator::Return(vec![2, 3]),
@@ -284,6 +286,8 @@ fn spec_v128_load_store_boundary_lattice() {
                 params: vec![],
                 results: vec![],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![],
                     insts: vec![
                         Inst::ConstI64(addr as i64),

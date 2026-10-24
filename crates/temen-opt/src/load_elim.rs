@@ -215,6 +215,8 @@ fn remove_insts(
         map[o as usize].expect("terminator operand defined")
     });
     Block {
+        parent: 0,
+        captures: vec![],
         params: b.params.clone(),
         insts,
         term,
