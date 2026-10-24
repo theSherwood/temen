@@ -669,12 +669,14 @@ fn a_region_shared_with_a_detached_child_rides_and_stays_shared() {
 }
 
 /// #2233 — **a thawed child that spins on its parent lets the parent run**, with the run's lane
-/// unbounded and capped at 2. [`SHARING_PARENT`] sets the region's first word once it has mapped the
-/// region, after the cut, and [`SHARING_CHILD`] spins on that word before its tail. A thaw runs on one
-/// worker (DURABILITY.md §12.8), and the tree-walker's pool ran a vCPU until it parked, so the
+/// unbounded and capped at 1 and 2. [`SHARING_PARENT`] sets the region's first word once it has mapped
+/// the region, after the cut, and [`SHARING_CHILD`] spins on that word before its tail. A thaw runs on
+/// one worker (DURABILITY.md §12.8), and the tree-walker's pool ran a vCPU until it parked, so the
 /// re-launched child's spin kept that worker and the thaw ran out of fuel. A vCPU now yields at its
 /// quantum (#2228), and in a bounded lane it keeps its lane across the yield, so the worker
-/// time-slices between the two vCPUs the lane admits (#2237).
+/// time-slices between the two vCPUs the lane admits (#2237). A lane of 1 admits one: the thaw starts
+/// the parent first, as the uninterrupted run does, so it holds the lane until it parks at its join,
+/// by when the word is set (#2240).
 #[test]
 fn a_thawed_child_spinning_on_its_parent_lets_the_parent_run() {
     let map = "  vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vrh (vwin, gz, vlen, vprot)\n";
@@ -693,7 +695,7 @@ block 4 (vd: i64) {
     let parent = confined(&with_spawn_rec(&SHARING_PARENT.replace(map, &signal)));
     let child = confined(&SHARING_CHILD.replace(tail, spin));
     let want = Ok(vec![Value::I64(SHARED_WANT)]);
-    for cap in [-1, 2] {
+    for cap in [-1, 1, 2] {
         let (mut host, args) = sharing_host(&child, heap_region());
         host.set_lane_cap(cap);
         let win = init_durable_window(WINDOW, TEST_ARENA);

@@ -2641,15 +2641,20 @@ impl ThawLinks {
     }
 }
 
-/// Seed a domain's root vCPU for this run — its durable phase and shadow-SP extent — and re-create
-/// every vCPU its thaw residue names (fibers, spawned vCPUs, detached children), enqueueing all but
-/// the root, which the caller enqueues. `root` is the domain's root:
-/// the run's root, or a re-launched detached child, which is a root of its own window.
+/// Seed a domain's root vCPU for this run — its durable phase and shadow-SP extent — re-create every
+/// vCPU its thaw residue names (fibers, spawned vCPUs, detached children, fork twins), and enqueue
+/// the domain. `root` is the domain's root: the run's root, or a re-launched detached child or fork
+/// twin, each a root of its own window.
+///
+/// #2240 — the domain's own vCPUs go in ahead of the domains they spawned: the root, then its
+/// threads, parents first. A thaw so starts every spawner before its children, as an uninterrupted
+/// run does, where a child queues behind the spawner that is running it up. Under a lane cap of 1
+/// that order decides which vCPU holds the lane.
 #[allow(clippy::too_many_arguments)]
 fn seed_domain(
     s: &mut Sched,
     sched: &Arc<Scheduler>,
-    root: &mut VCpu,
+    mut root: Box<VCpu>,
     funcs: &Arc<[Func]>,
     types: &Arc<[temen_ir::TypeEntry]>,
     dt: &Arc<DomainTable>,
@@ -2657,6 +2662,8 @@ fn seed_domain(
     residue: ThawResidue,
 ) {
     let id = root.id;
+    // Each domain this seeding re-launches enqueues itself from here, already in order.
+    let at = s.runnable.len();
     // The residue names tasks by their ids in the **frozen** run; the thaw hands out its own. Every
     // re-created task enters this `freeze id → thaw id` map as it is created, and every `parent_task`
     // resolves through it (#1687), so a record re-attaches to the parent it names whatever order ids
@@ -2736,7 +2743,7 @@ fn seed_domain(
             seed_thread(
                 s,
                 sched,
-                root,
+                &mut root,
                 &mut children,
                 &mut live_ids,
                 funcs,
@@ -2788,28 +2795,20 @@ fn seed_domain(
                 },
                 None => continue, // not re-created ⇒ its own rewound join already fails closed
             };
-            let task = td.launch.task as TaskId;
-            if let Some(child) = relaunch_detached(s, sched, spawner, host_shared, td) {
-                // A detached child is a callee (#1901), named by the task it was (#1681).
-                let callee = (child.id, Arc::clone(&child.host));
-                s.thaw_links.callees.insert(task, callee);
-                s.runnable.push_back(child);
-            }
+            relaunch_detached(s, sched, spawner, host_shared, td);
         }
         // #1688 — the twins this domain forked, each re-created under the pid its `fork()` returned,
         // as a domain of its own window ([`relaunch_twin`]).
         let mut tseed = thaw_twins;
         tseed.sort_by_key(|t| t.pid);
         for tt in tseed {
-            if let Some(twin) = relaunch_twin(s, sched, root, funcs, types, tt) {
-                s.runnable.push_back(twin);
-            }
+            relaunch_twin(s, sched, &root, funcs, types, tt);
         }
         // #2571 — and the servicer twins it forked that exited unreaped, filed again under their
         // pids for its `wait` to reap.
         for ft in thaw_exited_twins {
             let result = ft.outcome.map(|x| vec![Value::I64(x)]);
-            file_exited_twin(s, ft.pid as TaskId, domain_key_of(root), result);
+            file_exited_twin(s, ft.pid as TaskId, domain_key_of(&root), result);
         }
         // §13.4 slice 4d, #1681: this domain's restored `LiveImpl` handles wait for the whole tree,
         // since one may name a child that any domain re-launches ([`ThawLinks`]).
@@ -2819,9 +2818,11 @@ fn seed_domain(
                 .holders
                 .push((Arc::clone(host_shared), pending));
         }
-        // Enqueue every re-created child, parents first (ascending cid).
-        for (_, child) in children {
-            s.runnable.push_back(child);
+        // The domain's own vCPUs, ahead of the domains they spawned: the root, then its threads,
+        // parents first (ascending cid).
+        let own = std::iter::once(root).chain(children.into_values());
+        for (i, v) in own.enumerate() {
+            s.runnable.insert(at + i, v);
         }
     }
 }
@@ -2970,9 +2971,9 @@ fn seed_thread(
 /// ([`thaw_window`]); its powerbox is made the parent's twin again ([`Host::rejoin_twin`]); its own
 /// residue is seeded through [`seed_domain`], since it is a root of its own window; and it is filed
 /// in the run's twins under the pid its parent's `fork()` returned, with a doorbell. It runs its
-/// parent's program. `None` when it cannot be: the process's pools have no room for it, or its pages
-/// name a region its powerbox does not hold. It then ends with `ThreadFault`, which its parent's
-/// `wait` reaps as a crash.
+/// parent's program. When it cannot be (the process's pools have no room for it, or its pages name
+/// a region its powerbox does not hold), it ends with `ThreadFault`, which its parent's `wait` reaps
+/// as a crash.
 fn relaunch_twin(
     s: &mut Sched,
     sched: &Arc<Scheduler>,
@@ -2980,7 +2981,7 @@ fn relaunch_twin(
     funcs: &Arc<[Func]>,
     types: &Arc<[temen_ir::TypeEntry]>,
     tt: ThawedTwin,
-) -> Option<Box<VCpu>> {
+) {
     let ThawedTwin {
         pid,
         window,
@@ -3037,7 +3038,7 @@ fn relaunch_twin(
         if reaper == TwinReaper::Servicer {
             file_exited_twin(s, pid, parent_key, Err(Trap::ThreadFault));
         }
-        return None;
+        return;
     };
     s.live += 1;
     let twin_host = Arc::new(Mutex::new(host));
@@ -3072,7 +3073,7 @@ fn relaunch_twin(
     twin.parent_task = parent.parent_task;
     twin.live = live;
     twin.freeze_bell = Some(Arc::clone(&bell));
-    seed_domain(s, sched, &mut twin, funcs, types, &dt, &twin_host, residue);
+    seed_domain(s, sched, twin, funcs, types, &dt, &twin_host, residue);
     s.forked_twins.insert(
         pid,
         Twin {
@@ -3084,7 +3085,6 @@ fn relaunch_twin(
             host: Some(twin_host),
         },
     );
-    Some(twin)
 }
 
 /// #1361 step 4, #1688 — the window a thaw re-launches a domain over, a detached child's or a fork
@@ -3110,15 +3110,15 @@ fn thaw_window(spec: WindowSpec, image: &MemLayout, host: &mut Host, ctx: usize)
 /// [`DetachedLaunch`], seed its own residue through [`seed_domain`] (it is a root of its own window),
 /// and re-link the spawner's per-slot state — join, doorbell, kill flag, lane, powerbox — exactly as op
 /// 15 minted them. `grants` is the spawner's domain powerbox, which holds the module grant the child
-/// runs. `None` if the grant is gone or the child's imports no longer bind; the spawner's slot then
-/// stays empty and its rewound join fails closed.
+/// runs. When the grant is gone or the child's imports no longer bind, it is not relaunched: the
+/// spawner's slot stays empty and its rewound join fails closed.
 fn relaunch_detached(
     s: &mut Sched,
     sched: &Arc<Scheduler>,
     spawner: &mut VCpu,
     grants: &Arc<Mutex<Host>>,
     td: ThawedDetached,
-) -> Option<Box<VCpu>> {
+) {
     let ThawedDetached {
         slot,
         window,
@@ -3127,17 +3127,23 @@ fn relaunch_detached(
         launch,
         ..
     } = td;
-    let residue = ThawResidue::take(&mut host, launch.task as TaskId);
-    let DetachedRelaunch {
+    let task = launch.task as TaskId;
+    let residue = ThawResidue::take(&mut host, task);
+    let relaunch =
+        grants
+            .lock_unpoisoned()
+            .prepare_detached_relaunch(&launch, host, window.page_map());
+    let Some(DetachedRelaunch {
         funcs,
         types,
         shadow,
         memory_log2,
         module,
         mut host,
-    } = grants
-        .lock_unpoisoned()
-        .prepare_detached_relaunch(&launch, host, window.page_map())?;
+    }) = relaunch
+    else {
+        return;
+    };
     // #1971 — the lease op 17 filed at the spawn, filed again: the child's window goes back to the
     // budget that paid for it when the child ends, on the spawner's handle, as an unfrozen child's does.
     // #2318 — refused when the process's pools have no room for it: the child is not relaunched, and
@@ -3151,7 +3157,7 @@ fn relaunch_detached(
         .relaunch_lease(&mut host, memory_log2, runs);
     let Ok(lease) = filed else {
         deliver_detached(s, spawner, slot, Err(Trap::ThreadFault));
-        return None;
+        return;
     };
     let lease = lease.map(|lease| (Arc::clone(&spawner.host), lease));
     // The window: built as op 17 builds it (its NULL guard included, #1733), its runs paid for by
@@ -3172,7 +3178,7 @@ fn relaunch_detached(
             spawner_host.lock_unpoisoned().release_detached(lease);
         }
         deliver_detached(s, spawner, slot, Err(Trap::ThreadFault));
-        return None;
+        return;
     };
     let dom = host.domain_id() as usize;
     let child_host = Arc::new(Mutex::new(host));
@@ -3224,16 +3230,11 @@ fn relaunch_detached(
     child.lane_chain = std::iter::once((dom, launch.lane))
         .chain(spawner.lane_chain.iter().copied())
         .collect();
-    seed_domain(
-        s,
-        sched,
-        &mut child,
-        &funcs,
-        &types,
-        &cdt,
-        &child_host,
-        residue,
-    );
+    seed_domain(s, sched, child, &funcs, &types, &cdt, &child_host, residue);
+    // A detached child is a callee (#1901), named by the task it was (#1681).
+    s.thaw_links
+        .callees
+        .insert(task, (cid, Arc::clone(&child_host)));
     // The spawner's side of the edge, at the recorded slot.
     while spawner.threads.len() <= slot {
         spawner.threads.push(None);
@@ -3258,7 +3259,6 @@ fn relaunch_detached(
         spawner.child_lane.insert(slot, launch.lane);
     }
     spawner.child_hosts.insert(slot, child_host);
-    Some(child)
 }
 
 /// The executor core shared by [`drive_arc`] (owned host, wrapped and unwrapped around the run)
@@ -3454,10 +3454,11 @@ fn drive_over_cell(
         // no other task the seeding mints may take one, and the run's counter passes them all.
         let pids = thaw.twin_pids();
         s.reserved_pids = pids.clone();
+        let (registry, arena) = (Arc::clone(&root.registry), root.arena());
         seed_domain(
             &mut s,
             &sched,
-            &mut root,
+            root,
             &funcs,
             &types,
             &dt,
@@ -3469,8 +3470,6 @@ fn drive_over_cell(
         }
         s.reserved_pids.clear();
         std::mem::take(&mut s.thaw_links).relink();
-        let (registry, arena) = (Arc::clone(&root.registry), root.arena());
-        s.runnable.push_back(root);
         (id, registry, arena)
     };
     // Run as worker 0 until the run shuts down (every vCPU finished), then join spawned workers.
