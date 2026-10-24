@@ -348,7 +348,7 @@ block 0 () {
 
 /// A `longjmp` back into a block resumes with the values its descendants capture as they were at the
 /// `setjmp`, though the frame re-ran their block since: block 3 captures block 1's `y`, which the loop
-/// redefines before block 4 jumps back. Every engine agrees with the block-local form.
+/// redefines before block 4 jumps back. Every engine that runs it agrees with the block-local form.
 #[test]
 fn a_longjmp_restores_the_values_a_block_below_captures() {
     let src = "\
@@ -402,6 +402,9 @@ block 5 in 2 () {
         assert_eq!(bc, Some(want.clone()), "bytecode, {what}");
         match temen_jit::compile_and_run(module, 0, &[10]) {
             Ok(temen_jit::JitOutcome::Returned(r)) => assert_eq!(r, [10], "Cranelift JIT, {what}"),
+            // The JIT runs `setjmp` on unix only (temen-jit's `setjmp_rt`). Elsewhere it declines,
+            // and the interpreters run the function.
+            Err(temen_jit::JitError::Unsupported(_)) if !cfg!(unix) => {}
             other => panic!("Cranelift JIT, {what}: {other:?}"),
         }
     }
