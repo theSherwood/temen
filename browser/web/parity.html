@@ -70,7 +70,11 @@
         border-radius: 4px; background: var(--bg); color: var(--fg);
       }
       input[type="search"] { min-width: 200px; flex: 1 1 220px; }
-      label { color: var(--muted); font-size: 13px; display: flex; align-items: center; gap: 6px; }
+      label { color: var(--muted); font-size: 13px; display: flex; align-items: center; gap: 6px;
+              min-width: 0; max-width: 100%; }
+      /* A column's option text is its whole question, so the select would otherwise size itself to
+         the longest one, past a phone's width. */
+      select { min-width: 0; max-width: 100%; }
       button.link {
         font: inherit; background: none; border: none; color: var(--accent);
         cursor: pointer; padding: 0; text-decoration: underline; text-underline-offset: 2px;
@@ -87,7 +91,10 @@
         font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted);
         font-weight: 600; white-space: nowrap;
       }
-      thead th.c { text-align: center; }
+      /* Column headers wrap rather than widen: the run-mode matrix's are short phrases
+         ("bytecode, thread per task"), and eleven of them on one line would need a wide screen. */
+      thead th.c { text-align: center; white-space: normal; min-width: 64px; max-width: 112px;
+                   vertical-align: bottom; }
       tbody tr:last-child td { border-bottom: none; }
       td.op { font-family: ui-monospace, monospace; white-space: nowrap; }
       td.fam { color: var(--muted); font-size: 12px; white-space: nowrap; }
@@ -100,6 +107,9 @@
       .cell.notyet { color: var(--st-notyet); }
       .cell.conditional { color: var(--st-conditional); }
       .cell.unaudited { color: var(--st-unaudited); }
+      /* A cell a matrix leaves out: the run-mode triangle's lower half, where a pair is already in
+         the earlier property's row. */
+      .cell.none { color: var(--border); cursor: default; }
       tr.has-note td.op::after { content: "*"; color: var(--muted); }
       tr.open { background: var(--accent-soft); }
       tr.notes td { background: var(--surface); color: var(--muted); font-size: 13px; padding: 8px 12px; }
@@ -204,20 +214,22 @@
         modes: {
           file: 'assets/run_modes.json',
           title: 'Feature × run mode',
-          sub: 'Can a program that uses a feature run in a given mode, and which modes combine (#2545)? ' +
-               'A run is one executor (tree-walk, pump, parallel, Cranelift) plus any properties it adds. ' +
-               'The rows are guest features, then the properties again, so a property’s row says which ' +
-               'executors and properties it combines with. A cell claims anything but unaudited only where ' +
-               'a conformance test runs the case, and every not-yet cell names the issue tracking its gap.',
+          sub: 'Can a program that does something run in a given mode, and which modes combine (#2545)? ' +
+               'A run is one executor plus any properties it adds. Every cell is folded from runs: each ' +
+               'feature’s probe on each configuration a conformance test has a runner for. A property’s ' +
+               'row says which executors it runs on and which later properties it combines with; each ' +
+               'pair appears once. Unaudited means no runner covers the cell yet, and every not-yet ' +
+               'cell names the issue tracking its gap.',
           source: 'RUN_MODES.md',
-          rowNoun: 'rows', colNoun: 'modes', rowHead: 'uses', groupHead: 'kind',
+          rowNoun: 'rows', colNoun: 'modes', rowHead: 'row', groupHead: 'kind',
           search: 'Search feature or property…',
           disagree: null,
           adapt: (d) => ({
-            columns: d.columns.map((c) => ({ label: c.short, title: `${c.kind}: ${c.question}` })),
+            columns: d.columns.map((c) => ({ label: c.label, title: `${c.kind}: ${c.question}` })),
             rows: d.rows.map((r) => ({
-              label: r.row, group: r.group, cells: r.cells,
-              notes: r.notes.map((n) => `${n.column}: ${n.text}`),
+              label: r.row, title: r.question, group: r.group, cells: r.cells,
+              notes: r.notes.map((n) => `${d.statuses[n.status].glyph} ${n.column}: ` +
+                                        `${n.runs ? `${n.runs} — ` : ''}${n.text}`),
             })),
           }),
         },
@@ -270,15 +282,18 @@
             d.textContent = text;
             return d;
           };
-          tr.append(td('op', row.label));
+          const label = td('op', row.label);
+          if (row.title) label.title = row.title;
+          tr.append(label);
           if (desc.groupHead) tr.append(td('fam', row.group));
           for (const id of row.cells) {
             const d = document.createElement('td');
             d.className = 'c';
             const span = document.createElement('span');
-            span.className = 'cell ' + id;
-            span.textContent = data.statuses[id].glyph;
-            span.title = data.statuses[id].label;
+            // `null` is a cell the matrix leaves out: a pair already shown in an earlier row.
+            span.className = 'cell ' + (id ?? 'none');
+            span.textContent = id ? data.statuses[id].glyph : '·';
+            span.title = id ? data.statuses[id].label : 'shown once, in the earlier property’s row';
             d.append(span);
             tr.append(d);
           }
@@ -327,7 +342,7 @@
         // Keyed off the JSON's own `statuses` map, not a literal list — a status added to the
         // manifest then shows up here without a second place to remember to edit.
         const counts = Object.fromEntries(Object.keys(data.statuses).map((k) => [k, 0]));
-        for (const row of m.rows) for (const c of row.cells) counts[c]++;
+        for (const row of m.rows) for (const c of row.cells) if (c) counts[c]++;
         const s = el('summary');
         s.textContent = '';
         const tile = (cls, n, k) => {

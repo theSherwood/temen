@@ -26,6 +26,9 @@
 //! ```
 //! and, from inside a capability call, the two window accessors. The page supplies one import:
 //! `temen_host.js_cap_call(slot, op, args_ptr, n_args, mem) -> i64` — the whole JS side of the seam.
+//!
+//! #2579 — the same capabilities join any on-ramp open's powerbox when the embedder stages them
+//! (`temen_onramp_stage_js_cap`): [`grant_js_caps`] is the one grant both paths use.
 
 use temen_interp::{bytecode, cap_id, BoundImport, GuestMem, Host, Trap, Value, DEFAULT_FUEL};
 
@@ -144,31 +147,7 @@ pub extern "C" fn temen_jspb_run(mod_ptr: *const u8, mod_len: usize) -> i64 {
     }
 
     let mut host = Host::new();
-    // One handle per registered name: the closure carries its slot, so the guest reaches the right
-    // JS function purely by which handle it dispatches through (object-capability, not by name).
-    // Forkable (#1718): the JS function's state lives on the page, so a §14 child or `fork()` twin
-    // the capability is re-granted to calls the same function through a fresh closure over the slot.
-    let handles: Vec<i32> = caps
-        .iter()
-        .enumerate()
-        .map(|(slot, name)| {
-            let mint = move || -> temen_interp::HostProc {
-                Box::new(move |op, args, mem, _| Ok(vec![dispatch(slot as u32, op, args, mem)]))
-            };
-            // The JS function's state lives on the page, which nothing here serializes (#1699).
-            let fork: temen_interp::HostProcFork = std::sync::Arc::new(move |_pid| {
-                Some(temen_interp::ForkedProc::shared(
-                    mint(),
-                    temen_interp::CapState::Uncaptured,
-                ))
-            });
-            let handle =
-                host.grant_host_proc_forkable(mint(), fork, temen_interp::CapState::Uncaptured);
-            // §7 F7/F9: the name is also the label, so a guest can `self.resolve` / `self.label` it.
-            host.register_cap_name(name, handle);
-            handle
-        })
-        .collect();
+    let handles = grant_js_caps(&mut host, caps);
     // IMPORTS.md §2.1 — the manifest binds import `i` to its named capability's handle. The module
     // bytes are never rewritten; `call.sym` dispatches through the binding.
     if !m.imports.is_empty() {
@@ -180,7 +159,7 @@ pub extern "C" fn temen_jspb_run(mod_ptr: *const u8, mod_len: usize) -> i64 {
                     .iter()
                     .position(|c| c == &im.name)
                     .expect("checked above");
-                BoundImport::required(cap_id::HOST_PROC, 0, handles[slot])
+                BoundImport::required(cap_id::HOST_PROC, 0, handles[slot].1)
             })
             .collect();
         host.set_import_bindings(bindings);
@@ -222,6 +201,38 @@ pub extern "C" fn temen_jspb_run(mod_ptr: *const u8, mod_len: usize) -> i64 {
             }
         },
     }
+}
+
+/// Grant `host` one capability per name in `names`, each served by the page's `js_cap_call` with its
+/// slot, the name's index: the guest reaches the right JS function purely by which handle it
+/// dispatches through (object-capability, not by name). Each is registered under its name. Returns
+/// the `(name, handle)` seams for [`Host::bind_powerbox_manifest`]. The one grant both a JS
+/// powerbox run and an on-ramp open with staged JS capabilities use (#2579).
+///
+/// Forkable (#1718): the JS function's state lives on the page, so a §14 child or `fork()` twin the
+/// capability is re-granted to calls the same function through a fresh closure over the slot, with
+/// its own window. Nothing here serializes that state, so a run holding one cannot freeze (#1699).
+pub(crate) fn grant_js_caps(host: &mut Host, names: &[String]) -> Vec<(String, i32)> {
+    names
+        .iter()
+        .enumerate()
+        .map(|(slot, name)| {
+            let mint = move || -> temen_interp::HostProc {
+                Box::new(move |op, args, mem, _| Ok(vec![dispatch(slot as u32, op, args, mem)]))
+            };
+            let fork: temen_interp::HostProcFork = std::sync::Arc::new(move |_pid| {
+                Some(temen_interp::ForkedProc::shared(
+                    mint(),
+                    temen_interp::CapState::Uncaptured,
+                ))
+            });
+            let handle =
+                host.grant_host_proc_forkable(mint(), fork, temen_interp::CapState::Uncaptured);
+            // §7 F7/F9: the name is also the label, so a guest can `self.resolve` / `self.label` it.
+            host.register_cap_name(name, handle);
+            (name.clone(), handle)
+        })
+        .collect()
 }
 
 /// Pointer / length of the last [`temen_jspb_run`] error message (UTF-8; empty on success).

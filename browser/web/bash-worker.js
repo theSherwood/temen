@@ -22,7 +22,7 @@
 // whole lifecycle: keystrokes that land while the instantiate is still in flight are BUFFERED and
 // fed on ready (the page enables its input the moment the Workers exist, so this race is real).
 
-import { foreignImports } from './foreign-mem.js';
+import { engineImports } from './engine-imports.js';
 let ex = null;
 let memory = null;
 let drainBuf = 0;
@@ -65,12 +65,9 @@ async function init(cfg) {
   memory = cfg.memory;
   let exports;
   try {
-    ({ exports } = await WebAssembly.instantiate(module, {
-      env: { memory },
-      // No GPU surface, no card-output streaming and no parallel-driver run in a bash Worker → those
-      // host seams stubbed (a refused `x2_spawn` ends such a run with `ThreadFault`).
-      temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stream_chunk: () => {}, js_cap_call: () => -38n, x2_spawn: () => -1, x2_now_ms: () => performance.timeOrigin + performance.now(), x2_tierup: () => -1, x2_invoke: () => -1 },
-    }));
+    // No GPU surface, no card-output streaming and no parallel-driver run in a bash Worker: no hook is
+    // installed, so those seams do nothing (a refused `x2_spawn` ends such a run with `ThreadFault`).
+    ({ exports } = await WebAssembly.instantiate(module, engineImports(memory)));
     exports.__stack_pointer.value = stackTop;
     if (exports.__tls_size.value > 0) exports.__wasm_init_tls(tlsBase);
   } catch (err) {

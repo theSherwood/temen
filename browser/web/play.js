@@ -2942,10 +2942,10 @@ function linkPgChild(handles, name, unit) {
 // Stage every child for the run about to start, which takes them (`grant_onramp_caps`), so each run
 // attempt stages them again. Returns an error message, or null.
 function stageChildren(handles, kids) {
-  eng.ex.temen_child_programs_clear();
+  eng.ex.temen_onramp_stage_clear();
   for (const k of kids) {
     if (linkPgChild(handles, k.name, k.unit) !== 0) {
-      eng.ex.temen_child_programs_clear();
+      eng.ex.temen_onramp_stage_clear();
       return `link of child ${k.name}.c failed: ${linkFailure()}`;
     }
   }
@@ -3099,7 +3099,7 @@ async function runChibicc(c) {
     // On a failure the stderr slot says why: the run's own stderr, or the link's reason (#2297).
     r = { rv, status: eng.ex.temen_status(), stdout: readModuleStdout(), stderr: readModuleStderr() };
   }
-  eng.ex.temen_child_programs_clear(); // what a run that never started left staged
+  eng.ex.temen_onramp_stage_clear(); // what a run that never started left staged
   // What the host noted about the run (#2219): a spawn refused for the import nothing satisfied.
   const notes = readRunNotes();
   if (notes) logTo(c, `host notes:\n${notes}`);

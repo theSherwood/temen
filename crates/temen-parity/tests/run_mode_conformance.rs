@@ -1,29 +1,32 @@
 //! **The honesty pin for the feature × run-mode matrix (#2545).**
 //!
-//! `crates/temen-parity/src/run_modes.rs` states, for each guest feature and each run property,
-//! what every executor and property does with it. This runs each case and fails when a claim and
-//! the run disagree, the same role `frontier_conformance.rs` plays for the frontier matrix.
+//! `crates/temen-parity/src/run_modes.rs` lists the runners this test has ([`RUNNERS`]) and the
+//! exceptions to "a run gives the oracle's answer" ([`exception`], [`config_exception`]). Every cell
+//! of the matrix is a fold of those runs. This runs every probe on every runner and fails when a run
+//! and the manifest disagree, the role `frontier_conformance.rs` plays for the frontier matrix.
 //!
 //! ## What is driven
 //!
 //! One **probe** per feature (`support/run_probes.rs`): a small program that uses the feature, the
-//! powerbox it needs, and the answer the oracle gives. Each way the harness can run a probe is a
-//! **runner**: the four native executors one-shot, the DAP's two debug engines for `debugger` (the
-//! tree-walk `Inspector` and the bytecode debug scheduler), and `CoopRun` on the pump and on
-//! executor 2 for `pumped`. A probe that needs its embedder to feed it
-//! between steps has no one-shot runner: an executor runs it only where the embedder can hold the
-//! run, pumped. A cell is checked against the verdict of every runner its column has:
+//! powerbox it needs, and the answer the oracle gives. A **runner** is one configuration of the
+//! manifest, run the way its embedder runs it: the four executors one-shot, the DAP's two debug
+//! engines (the tree-walk `Inspector` and the bytecode debug scheduler), and `CoopRun` on the pump
+//! and on executor 2. A probe that reads input it is fed later gets it as its runner's embedder
+//! gives it. A run the embedder holds hands control back when it waits on the input, and is fed and
+//! resumed. Any other run pulls it from a stdin source, which blocks until a thread supplies it, as
+//! the CLI's interactive mode does.
 //!
-//! - `Full`: every runner gives the oracle's answer;
-//! - `NotYet`: some runner does not;
-//! - `Declines`: every runner declines the module, by design;
-//! - `Conditional`: the runners give the answer where the note's condition holds, and decline
-//!   elsewhere ([`condition`] says which the probe meets);
-//! - `Unaudited`: not checked.
+//! A run is held to its exception:
 //!
-//! Two rules keep the matrix from claiming more than the harness drives. A cell with no runner, or
-//! in a feature's row with no probe, must be `Unaudited`. And a property × executor cell is `Full`
-//! exactly where the property has a runner on that executor.
+//! - none: the oracle's answer;
+//! - `Declines`: the runner declines the module;
+//! - `NotYet`: anything but the oracle's answer, so a gap that closes fails the test until its
+//!   exception goes;
+//! - `Conditional`: the oracle's answer where the condition holds ([`condition`]), a decline
+//!   elsewhere.
+//!
+//! The harness's runners are exactly the manifest's, both ways, so a cell can only come from a run
+//! this file makes.
 
 #[path = "../../temen-interp/tests/support/drivers.rs"]
 mod drivers;
@@ -42,10 +45,11 @@ use support::cites_an_issue;
 use temen_interp::bytecode::{
     module_spawns_threads, CoopEvent, CoopRun, SchedStop, ScheduledDebugRun,
 };
-use temen_interp::{Inspector, Stop, Trap, Value};
+use temen_interp::{Host, Inspector, Stop, Trap, Value};
 use temen_ir::Module;
 use temen_parity::run_modes::{
-    feature_cells, property_cells, Executor, Feature, Mode, Property, Row,
+    config_exception, exception, runner_for, Config, Executor, Feature, Property, Props, Row,
+    RUNNERS, UNPROBED,
 };
 use temen_parity::Status;
 
@@ -55,7 +59,7 @@ const FUEL: u64 = 50_000_000;
 /// How long one run may take before the harness calls it hung. A harness must fail, never hang.
 const BOUND: Duration = Duration::from_secs(30);
 
-/// How long a runner waits before pumping again a run idle on an answer the probe gives itself.
+/// How long a runner waits before resuming a run idle on an answer the probe gives itself.
 const ANSWER_POLL: Duration = Duration::from_millis(1);
 
 /// What one runner did with a probe.
@@ -70,55 +74,37 @@ enum Verdict {
     Other(String),
 }
 
-/// A way to run a probe.
+/// How the harness runs a configuration.
 #[derive(Clone, Copy, Debug)]
-enum Runner {
+enum Way {
     /// An executor, one-shot.
     OneShot(Executor),
-    /// The tree-walk debugger (`Inspector`, the DAP's default engine), for `debugger`.
-    Inspect,
-    /// The bytecode debug scheduler (`ScheduledDebugRun`, the DAP's `bytecode` engine), for
-    /// `debugger`.
-    Debug,
-    /// `CoopRun`, pumped by this harness (`pumped`).
-    Pumped(Pumped),
+    /// The tree-walk debugger (`Inspector`, the DAP's default engine).
+    Inspector,
+    /// The bytecode debug scheduler (`ScheduledDebugRun`, the DAP's `bytecode` engine).
+    DebugScheduler,
+    /// `CoopRun`, held and resumed by this harness.
+    Held(Pumped),
 }
 
-/// The runners column `m` has, for a probe that needs feeding between steps or not (`fed`). An
-/// executor is its own runner, or, for a fed probe, its pumped run where it has one. A property
-/// has one runner per executor it runs on, and none until its slice of #2545 drives it.
-fn runners(m: Mode, fed: bool) -> Vec<Runner> {
-    match m {
-        Mode::Executor(e) if !fed => vec![Runner::OneShot(e)],
-        Mode::Executor(Executor::Pump) => vec![Runner::Pumped(Pumped::Pump)],
-        Mode::Executor(Executor::Parallel) => vec![Runner::Pumped(Pumped::Threads)],
-        Mode::Executor(Executor::TreeWalk | Executor::Cranelift) => Vec::new(),
-        Mode::Property(Property::Debugger) => vec![Runner::Inspect, Runner::Debug],
-        Mode::Property(Property::Pumped) => {
-            vec![
-                Runner::Pumped(Pumped::Pump),
-                Runner::Pumped(Pumped::Threads),
-            ]
-        }
-        Mode::Property(
-            Property::Durable
-            | Property::Warm
-            | Property::Reactor
-            | Property::Browser
-            | Property::Emitted,
-        ) => Vec::new(),
-    }
-}
-
-/// The executor a runner runs on, for the property × executor half.
-fn executor_of(r: Runner) -> Executor {
-    match r {
-        Runner::OneShot(e) => e,
-        Runner::Inspect => Executor::TreeWalk,
-        Runner::Debug => Executor::Pump,
-        Runner::Pumped(Pumped::Pump) => Executor::Pump,
-        Runner::Pumped(Pumped::Threads) => Executor::Parallel,
-    }
+/// The harness's runner for `c`, if it has one. [`RUNNERS`] lists the same configurations, which
+/// [`the_harness_runs_exactly_the_manifests_runners`] holds.
+fn way(c: Config) -> Option<Way> {
+    use Executor::*;
+    use Property::*;
+    Some(if c.props.is_empty() {
+        Way::OneShot(c.executor)
+    } else if c == Config::new(TreeWalk, &[Debugger]) {
+        Way::Inspector
+    } else if c == Config::new(Pump, &[Debugger, Held]) {
+        Way::DebugScheduler
+    } else if c == Config::new(Pump, &[Held]) {
+        Way::Held(Pumped::Pump)
+    } else if c == Config::new(Parallel, &[Held]) {
+        Way::Held(Pumped::Threads)
+    } else {
+        return None;
+    })
 }
 
 /// Run `f` on a thread of its own, for at most [`BOUND`].
@@ -139,25 +125,52 @@ fn judge(r: Result<Vec<Value>, Trap>, want: i64) -> Verdict {
     }
 }
 
-/// Run `probe` on `runner`.
-fn run(runner: Runner, probe: &Probe) -> Verdict {
+/// Run `probe` on configuration `c`.
+fn run(c: Config, probe: &Probe) -> Verdict {
+    let way = way(c).expect("every runner of the manifest has a way to run it");
     let (src, setup, feed, want) = (probe.src, probe.setup, probe.feed, probe.want);
-    bounded(format!("{:?} on {runner:?}", probe.feature), move || {
+    bounded(format!("{:?} on {}", probe.feature, c.label()), move || {
         let m = module(&src());
-        let one_shot = |d| match run_on(d, &m, &|| setup(&m)) {
+        // A run nobody holds pulls its input from a source (`feed_later`); a held run is fed when
+        // it hands control back waiting on it.
+        let unheld = || {
+            let (mut host, args) = setup(&m);
+            if let Some(bytes) = feed {
+                feed_later(&mut host, bytes);
+            }
+            (host, args)
+        };
+        let one_shot = |d| match run_on(d, &m, &unheld) {
             Some(ran) => judge(ran.result, want),
             None => Verdict::Declined,
         };
-        match runner {
-            Runner::OneShot(Executor::TreeWalk) => one_shot(Driver::Oracle),
-            Runner::OneShot(Executor::Pump) => one_shot(Driver::Coop),
-            Runner::OneShot(Executor::Parallel) => one_shot(Driver::Parallel),
-            Runner::OneShot(Executor::Cranelift) => on_cranelift(&m, setup, want),
-            Runner::Inspect => inspected(&m, setup, feed, want),
-            Runner::Debug => debugged(&m, setup, feed, want),
-            Runner::Pumped(exec) => pumped(exec, &m, setup, feed, want),
+        match way {
+            Way::OneShot(Executor::TreeWalk) => one_shot(Driver::Oracle),
+            Way::OneShot(Executor::Pump) => one_shot(Driver::Coop),
+            Way::OneShot(Executor::Parallel) => one_shot(Driver::Parallel),
+            Way::OneShot(Executor::Cranelift) => on_cranelift(&m, unheld(), want),
+            Way::Inspector => inspected(&m, unheld(), want),
+            Way::DebugScheduler => debugged(&m, setup(&m), feed, want),
+            Way::Held(exec) => held(exec, &m, setup(&m), feed, want),
         }
     })
+}
+
+/// Give `host` a stdin source that blocks until a thread supplies `bytes`, which it does only once
+/// the read has asked: the read is always made before its input exists.
+fn feed_later(host: &mut Host, bytes: &'static [u8]) {
+    let (asked, on_ask) = mpsc::channel::<()>();
+    let (supply, input) = mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        if on_ask.recv().is_ok() {
+            let _ = supply.send(bytes.to_vec());
+        }
+    });
+    host.set_stdin_source(Box::new(move || {
+        let _ = asked.send(());
+        // Once the input is spent, the thread is gone and the source says end of input.
+        Some(input.recv().unwrap_or_default())
+    }));
 }
 
 /// Run `m` on the Cranelift JIT through `temen_run`, over a window seeded at its declared size in
@@ -165,12 +178,7 @@ fn run(runner: Runner, probe: &Probe) -> Verdict {
 /// powerbox's `Jit` grant reserved (`temen_run::grant_jit` asks the compile for the same size).
 /// The JIT refuses a module outside its subset with `Unsupported`; any other error is an answer
 /// the oracle did not give.
-fn on_cranelift(
-    m: &Module,
-    setup: fn(&Module) -> (temen_interp::Host, Vec<Value>),
-    want: i64,
-) -> Verdict {
-    let (mut host, args) = setup(m);
+fn on_cranelift(m: &Module, (mut host, args): (Host, Vec<Value>), want: i64) -> Verdict {
     let args: Vec<i64> = args
         .iter()
         .map(|v| match v {
@@ -194,17 +202,8 @@ fn on_cranelift(
 /// Run `m` under the tree-walk debugger to its end, as the best its API allows: scheduled, as the
 /// DAP debugs a threaded program, when `m` spawns threads, else on one vCPU over the probe's
 /// powerbox. The scheduled `Inspector` builds its own empty powerbox, so a threaded probe's handles
-/// name nothing there. It has no way to feed a read either.
-fn inspected(
-    m: &Module,
-    setup: fn(&Module) -> (temen_interp::Host, Vec<Value>),
-    feed: Option<&'static [u8]>,
-    want: i64,
-) -> Verdict {
-    if feed.is_some() {
-        return Verdict::Other("the Inspector has no way to feed a read".into());
-    }
-    let (host, args) = setup(m);
+/// name nothing there.
+fn inspected(m: &Module, (host, args): (Host, Vec<Value>), want: i64) -> Verdict {
     let mut insp = if module_spawns_threads(m) {
         Inspector::attach_scheduled(m, 0, &args, FUEL, Vec::new())
     } else {
@@ -226,11 +225,11 @@ fn inspected(
 /// is still owed can change between the stop and the question.
 fn debugged(
     m: &Module,
-    setup: fn(&Module) -> (temen_interp::Host, Vec<Value>),
+    (mut host, args): (Host, Vec<Value>),
     feed: Option<&'static [u8]>,
     want: i64,
 ) -> Verdict {
-    let (host, args) = setup(m);
+    host.set_stdin_blocking(feed.is_some());
     let Some(mut d) = ScheduledDebugRun::new_with_host(m, 0, &args, host) else {
         return Verdict::Declined;
     };
@@ -250,17 +249,17 @@ fn debugged(
     }
 }
 
-/// Hold `m` as a `CoopRun` on `exec` and pump it to its end. A run idle on what the embedder feeds
-/// gets the probe's bytes once; idle otherwise, it waits on an answer the probe gives itself, and
-/// is pumped again shortly, the time it waited passed.
-fn pumped(
+/// Hold `m` as a `CoopRun` on `exec` and resume it to its end. A run idle on what the embedder
+/// feeds gets the probe's bytes once; idle otherwise, it waits on an answer the probe gives itself,
+/// and is resumed shortly, the time it waited passed.
+fn held(
     exec: Pumped,
     m: &Module,
-    setup: fn(&Module) -> (temen_interp::Host, Vec<Value>),
+    (mut host, args): (Host, Vec<Value>),
     feed: Option<&'static [u8]>,
     want: i64,
 ) -> Verdict {
-    let (host, args) = setup(m);
+    host.set_stdin_blocking(feed.is_some());
     let reserved = temen_ir::default_reserved_log2();
     let run = match exec {
         Pumped::Pump => CoopRun::new_reserved(m, 0, &args, FUEL, host, None, &[], reserved),
@@ -292,158 +291,142 @@ fn pumped(
     }
 }
 
-/// Whether a `Conditional` cell's condition holds for the probe as this harness drives it: the
+/// Whether a `Conditional` exception's condition holds for the probe as this harness drives it: the
 /// JIT's fiber runtime for the features that need it, and an OS-backed region, which the probe
 /// uses, for a shared region on the JIT.
-fn condition(f: Feature, m: Mode) -> bool {
-    match (f, m) {
-        (
-            Feature::Threads | Feature::Fibers | Feature::Children,
-            Mode::Executor(Executor::Cranelift),
-        ) => temen_jit::fiber_supported(),
+fn condition(f: Feature, c: Config) -> bool {
+    match (f, c.executor) {
+        (Feature::Threads | Feature::Fibers | Feature::Children, Executor::Cranelift) => {
+            temen_jit::fiber_supported()
+        }
         _ => true,
     }
 }
 
-/// Whether `verdicts` (one per runner the column has) agree with the claimed `status`. `cond` is
-/// whether a `Conditional` cell's condition holds ([`condition`]).
-fn agrees(status: Status, verdicts: &[Verdict], cond: bool) -> bool {
-    let all_matched = verdicts.iter().all(|v| *v == Verdict::Matched);
-    let all_declined = verdicts.iter().all(|v| *v == Verdict::Declined);
-    match status {
-        Status::Full => all_matched,
-        Status::NotYet => !all_matched,
-        Status::Declines => all_declined,
-        Status::Conditional if cond => all_matched,
-        Status::Conditional => all_declined,
-        Status::Unaudited => true,
+/// What is wrong with `verdict` as the run of `f` on `c`, or `None` if the manifest says it.
+fn disagreement(f: Feature, c: Config, verdict: &Verdict) -> Option<String> {
+    let ok = match exception(f, c).map(|x| x.status) {
+        None => *verdict == Verdict::Matched,
+        Some(Status::Declines) => *verdict == Verdict::Declined,
+        Some(Status::NotYet) => *verdict != Verdict::Matched,
+        Some(Status::Conditional) if condition(f, c) => *verdict == Verdict::Matched,
+        Some(Status::Conditional) => *verdict == Verdict::Declined,
+        Some(s @ (Status::Full | Status::Unaudited)) => {
+            return Some(format!(
+                "its exception is {s:?}, which an exception cannot be"
+            ))
+        }
+    };
+    if ok {
+        return None;
     }
+    Some(match exception(f, c) {
+        None => format!(
+            "gave {verdict:?}, not the oracle's answer, and the manifest records no exception: \
+             fix the engine, or file an issue and add a NotYet exception citing it"
+        ),
+        Some(x) if x.status == Status::NotYet => format!(
+            "now gives the oracle's answer, so its NotYet exception is stale: delete it and close \
+             its issue ({})",
+            x.note
+        ),
+        Some(x) => format!("is {:?} in the manifest, but gave {verdict:?}", x.status),
+    })
 }
 
-/// **Every driven cell of a feature's row matches what its column's runners do.** A probe runs on
-/// every runner of every column its row claims anything in, and the verdicts must agree with the
-/// claim. A failure lists every disagreeing cell, not just the first.
+/// **Every run gives what the manifest says.** Each probe runs on every runner, and the verdicts
+/// must agree with the exceptions. A failure lists every disagreeing run, not just the first.
 #[test]
-fn every_driven_feature_cell_matches_what_its_runners_do() {
+fn every_run_matches_the_manifest() {
     let mut wrong = Vec::new();
     for probe in probes() {
-        let cells = feature_cells(probe.feature);
-        for m in Mode::ALL {
-            let cell = cells[m.index()];
-            if cell.status == Status::Unaudited {
-                continue;
-            }
-            let verdicts: Vec<Verdict> = runners(m, probe.feed.is_some())
-                .into_iter()
-                .map(|r| run(r, &probe))
-                .collect();
-            if !agrees(cell.status, &verdicts, condition(probe.feature, m)) {
+        for r in RUNNERS {
+            let verdict = run(r.config, &probe);
+            if let Some(why) = disagreement(probe.feature, r.config, &verdict) {
                 wrong.push(format!(
-                    "  {} / {}: claims {:?}, but the runners gave {verdicts:?}",
-                    probe.feature.name(),
-                    m.short(),
-                    cell.status,
+                    "  {} on {}: {why}",
+                    probe.feature.label(),
+                    r.config.label()
                 ));
             }
         }
     }
     assert!(
         wrong.is_empty(),
-        "the run-mode matrix disagrees with the runs — fix the manifest or the engine:\n{}",
+        "the run-mode matrix disagrees with the runs:\n{}",
         wrong.join("\n")
     );
 }
 
-/// **A cell claims nothing the harness cannot drive.** A feature with no probe, or a cell with no
-/// runner, is `Unaudited`. This is what makes "a cell is claimed only where a test drives it" a
-/// property of the tree rather than a promise.
+/// **The harness runs exactly the manifest's runners, and probes exactly its probed features.**
+/// This is what makes every cell a fold of runs this file makes: a configuration the manifest names
+/// has a runner here, a runner here is in the manifest, and a probed feature has one probe.
 #[test]
-fn nothing_is_claimed_where_nothing_drives_it() {
+fn the_harness_runs_exactly_the_manifests_runners() {
+    for e in Executor::ALL {
+        for props in Props::every() {
+            let c = Config { executor: e, props };
+            assert_eq!(
+                way(c).is_some(),
+                RUNNERS.iter().any(|r| r.config == c),
+                "{}: the harness and RUNNERS must agree on whether it runs",
+                c.label(),
+            );
+        }
+    }
     let all = probes();
-    for row in Row::all() {
-        let cells = row.cells();
-        for m in Mode::ALL {
-            let cell = cells[m.index()];
-            if cell.status == Status::Unaudited {
+    for f in Feature::ALL {
+        let n = all.iter().filter(|p| p.feature == f).count();
+        let want = usize::from(!UNPROBED.contains(&f));
+        assert_eq!(
+            n,
+            want,
+            "{}: {n} probes, but the manifest says {want}",
+            f.label()
+        );
+    }
+}
+
+/// **A cell's runner on each executor is unambiguous.** A cell uses, on each executor, the runner
+/// that adds its properties and the fewest others; two such runners would make the cell depend on
+/// the order of [`RUNNERS`].
+#[test]
+fn no_two_runners_tie() {
+    for e in Executor::ALL {
+        for need in Props::every().filter(|n| n.len() <= 2) {
+            let Some(best) = runner_for(e, need) else {
+                continue;
+            };
+            let ties = RUNNERS
+                .iter()
+                .filter(|r| {
+                    r.config.executor == e
+                        && r.config.props.contains(need)
+                        && r.config.props.len() == best.props.len()
+                })
+                .count();
+            assert_eq!(ties, 1, "{} for {need:?}: {ties} runners tie", e.label());
+        }
+    }
+}
+
+/// **A reason no run exists is never given where one does.** [`config_exception`] is consulted only
+/// where no runner covers the combination, so an entry a runner now covers is stale: delete it.
+#[test]
+fn no_reason_is_given_for_a_configuration_that_runs() {
+    for e in Executor::ALL {
+        for props in Props::every() {
+            if config_exception(e, props).is_none() {
                 continue;
             }
-            let driven = match row {
-                Row::Feature(f) => all
-                    .iter()
-                    .find(|p| p.feature == f)
-                    .is_some_and(|p| !runners(m, p.feed.is_some()).is_empty()),
-                // A property's row: its executors are checked against its runners below, so it
-                // needs some; a property combines with itself, and with another property only
-                // where both have runners.
-                Row::Property(p) => {
-                    let has = |q| !runners(Mode::Property(q), false).is_empty();
-                    match m {
-                        Mode::Executor(_) => has(p),
-                        Mode::Property(q) => p == q || (has(p) && has(q)),
-                    }
-                }
-            };
+            let covered = RUNNERS
+                .iter()
+                .any(|r| r.config.executor == e && r.config.props.contains(props));
             assert!(
-                driven,
-                "{} / {}: claims {:?}, but nothing in this test drives that cell",
-                row.name(),
-                m.short(),
-                cell.status,
-            );
-        }
-    }
-}
-
-/// **A property's row says where it runs.** A property × executor cell is `Full` exactly where the
-/// property has a runner on that executor, and says why not (`Declines`, or a `NotYet` with its
-/// issue) where it has none. A property with no runners at all is still `Unaudited`: slices 2 to 4
-/// of #2545 drive them.
-#[test]
-fn a_property_runs_exactly_on_the_executors_it_has_runners_for() {
-    for p in Property::ALL {
-        let mine = runners(Mode::Property(p), false);
-        if mine.is_empty() {
-            continue;
-        }
-        let cells = property_cells(p);
-        for e in Executor::ALL {
-            let cell = cells[Mode::Executor(e).index()];
-            let has = mine.iter().any(|&r| executor_of(r) == e);
-            let ok = match cell.status {
-                Status::Full | Status::Conditional => has,
-                Status::Declines | Status::NotYet | Status::Unaudited => !has,
-            };
-            assert!(
-                ok,
-                "{} / {}: claims {:?}, but the property {} a runner there",
-                p.short(),
-                Mode::Executor(e).short(),
-                cell.status,
-                if has { "has" } else { "has no" },
-            );
-        }
-    }
-}
-
-/// **The property × property half is symmetric, and a property combines with itself.**
-#[test]
-fn the_property_half_is_symmetric() {
-    for p in Property::ALL {
-        let mine = property_cells(p);
-        assert_eq!(
-            mine[Mode::Property(p).index()].status,
-            Status::Full,
-            "{}: a property combines with itself",
-            p.short(),
-        );
-        for q in Property::ALL {
-            let theirs = property_cells(q);
-            assert_eq!(
-                mine[Mode::Property(q).index()],
-                theirs[Mode::Property(p).index()],
-                "{} × {} must read the same from either row",
-                p.short(),
-                q.short(),
+                !covered,
+                "{} with {props:?}: config_exception says why it does not run, but a runner \
+                 covers it",
+                e.label(),
             );
         }
     }
@@ -451,21 +434,26 @@ fn the_property_half_is_symmetric() {
 
 /// A **known gap** must name the issue tracking it, as on the frontier matrix, with the same shape
 /// check (`support::cites_an_issue`): `NotYet` is only actionable if the reader can find out what is
-/// being done about it.
+/// being done about it. Checked over every configuration, not just the runners', since a rule
+/// applies to a configuration as soon as a runner has it.
 #[test]
 fn every_known_gap_names_its_issue() {
-    for row in Row::all() {
-        for (cell, m) in row.cells().into_iter().zip(Mode::ALL) {
-            if cell.status != Status::NotYet {
-                continue;
+    for e in Executor::ALL {
+        for props in Props::every() {
+            let c = Config { executor: e, props };
+            let reasons = Feature::ALL
+                .into_iter()
+                .filter_map(|f| exception(f, c))
+                .chain(config_exception(e, props));
+            for x in reasons {
+                assert!(
+                    x.status != Status::NotYet || cites_an_issue(x.note),
+                    "{}: a NotYet exception must cite the issue tracking the gap (`#1234`), got \
+                     {:?}",
+                    c.label(),
+                    x.note,
+                );
             }
-            assert!(
-                cites_an_issue(cell.note),
-                "{}/{}: a `NotYet` cell must cite the issue tracking the gap (`#1234`), got {:?}",
-                row.name(),
-                m.short(),
-                cell.note,
-            );
         }
     }
 }
@@ -476,10 +464,12 @@ fn every_known_gap_names_its_issue() {
 fn audited_coverage_does_not_regress() {
     let audited = Row::all()
         .flat_map(|r| r.cells())
+        .flatten()
         .filter(|c| c.status != Status::Unaudited)
         .count();
     assert!(
-        audited >= 85,
-        "audited cell count fell to {audited}; it was 85 when the matrix landed (#2545)"
+        audited >= 79,
+        "audited cell count fell to {audited}; it was 79 when cells came to be folded from runs \
+         (#2545)"
     );
 }

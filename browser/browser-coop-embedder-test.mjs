@@ -9,7 +9,9 @@
 // leaf's frames; where it cannot (Node), it runs interpreted. The run goes on while an answer is owed:
 // a root's timer fires in the page's time before an answer that comes later (#2557), and a lone wait
 // takes its time (#2439). Resolving a park to `null` stops the run; so does `onSlice` resolving
-// `false` on a program that never ends, after its output has streamed.
+// `false` on a program that never ends, after its output has streamed. JS capabilities the embedder
+// staged are answered inside the call through `onCap`, with the guest's window, interpreted and from
+// a leaf's bounce (#2579); executor 2 refuses a run that has one.
 // A trap with `trapDeclines: false` returns its status, name and fault address; by default it throws.
 // Under JSPI a leaf is sliced at its own safepoints (step 4): a leaf that never ends stops at a budget
 // checkpoint when `onSlice` says so, and a long one hands its output over from inside, as it runs.
@@ -29,7 +31,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { driveCoopTierupRun, suspendsLeaves } from './web/coop-driver.js';
 import { engineImports } from './engine-imports.mjs';
-import { runCases, runX2Cases, pong, PINGS, bigFeed, LONE_WAIT_MS } from './coop-embedder-cases.mjs';
+import { runCases, runX2Cases, pong, PINGS, bigFeed, LONE_WAIT_MS, JS_CAPS_OUT } from './coop-embedder-cases.mjs';
 import { startServer } from './serve.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -74,6 +76,19 @@ const check = (host, r, suspends) => {
     fail(`${host}: a lone ${LONE_WAIT_MS} ms wait: status ${w.status}, value ${w.value}, `
       + `after ${w.ms.toFixed(1)} ms`);
   }
+  // #2579: the staged JS capabilities answered inside each call, and the uppercasing landed in the
+  // guest's window: interpreted, and from the root's leaf.
+  const jsCapped = (name, x, leaves) => {
+    if (x.status !== 0 || x.value !== 12n || x.out !== JS_CAPS_OUT || x.capCalls !== 2
+      || x.parks !== 0 || x.counts.leaves !== leaves) {
+      fail(`${host}: ${name}: status ${x.status}, value ${x.value}, out ${JSON.stringify(x.out)}, `
+        + `${x.capCalls} cap calls, ${x.parks} parks, ${x.counts.leaves} leaves `
+        + `(want 0, 12, ${JSON.stringify(JS_CAPS_OUT)}, 2, 0, ${leaves})`);
+    }
+  };
+  jsCapped('JS capabilities, interpreted', r.jsCaps, 0);
+  jsCapped('JS capabilities from a leaf', r.jsCapsLeaf, 1);
+  if (r.x2RefusesJsCaps === false) fail(`${host}: executor 2 took a run with a staged JS capability`);
   if (r.stopAtPark.status !== null || r.stopAtPark.parks !== 3) {
     fail(`${host}: a park answered null stops the run: status ${r.stopAtPark.status}, ${r.stopAtPark.parks} parks`);
   }

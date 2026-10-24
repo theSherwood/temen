@@ -66,6 +66,57 @@ export const tierupJitRes = (ret, tc) => tc === 0 || tc === 1 ? BigInt(ret)
 // over the cdylib's shared memory, and deliver the results (or the trap) back to the parked vCPU;
 // `env.call_interp` is the live-state bounce. Proven observably identical to `onramp_exec` by
 // tests/coop_tierup_driver.rs (wasmi playing this file's role).
+// #1419, #2579 — the page's half of a JS capability, a call answered inside the call: the engine's
+// `temen_host.js_cap_call(slot, op, argsPtr, nArgs, mem)` import reaches `globalThis.__temen_js_cap_call`.
+// A handler never sees the guest's memory: `mem` is a bounds-checked view of the calling guest's
+// window (`temen_jspb_read`/`temen_jspb_write` in `src/jspb.rs`), live only for the call — in a child,
+// the child's window. `null` for a guest that declares no memory.
+const capEnc = new TextEncoder();
+const capDec = new TextDecoder();
+export function windowView(ex, memory, mem) {
+  if (!mem) return null;
+  const N = ex.temen_abi_is64() === 1 ? BigInt : Number; // usize params: i64 on wasm64, i32 on wasm32
+  return {
+    /** The guest's bytes at `[ptr, ptr+len)`, or `null` if that is not wholly inside its window. */
+    bytes(ptr, len) {
+      const p = ex.temen_jspb_read(mem, BigInt(ptr), N(len));
+      if (!p) return null;
+      return new Uint8Array(memory.buffer, Number(p), Number(len)).slice();
+    },
+    /** The same range decoded as UTF-8 (`''` when out of bounds). */
+    str(ptr, len) {
+      const b = this.bytes(ptr, len);
+      return b ? capDec.decode(b) : '';
+    },
+    /** Write bytes (or a string) into the guest's window at `ptr`. `true` iff it landed. */
+    write(ptr, data) {
+      const bytes = typeof data === 'string' ? capEnc.encode(data) : data;
+      const buf = ex.temen_alloc(N(bytes.length));
+      if (!buf) return false;
+      new Uint8Array(memory.buffer).set(bytes, Number(buf));
+      const r = ex.temen_jspb_write(mem, BigInt(ptr), buf, N(bytes.length));
+      ex.temen_dealloc(buf, N(bytes.length));
+      return r === 0;
+    },
+  };
+}
+
+// The `__temen_js_cap_call` servicer over `onCap(slot, op, args, mem)`: `args` are the call's i64
+// arguments as BigInts and `mem` its window view. It returns the call's one i64 (a Number or BigInt;
+// nothing is 0). A handler that throws answers -EIO (-5): it must not unwind through the engine.
+export function jsCapServicer(ex, memory, onCap) {
+  return (slot, op, argsPtr, nArgs, mem) => {
+    try {
+      const n = Number(nArgs);
+      const args = n ? Array.from(new BigInt64Array(memory.buffer, Number(argsPtr), n)) : [];
+      return BigInt(onCap(slot, op, args, windowView(ex, memory, mem)) ?? 0);
+    } catch (e) {
+      console.error(`JS capability ${slot} (op ${op}):`, e);
+      return -5n;
+    }
+  };
+}
+
 /// #1896 — whether this host can **suspend** a leaf's emitted frames where a call in it parks: JSPI
 /// (`WebAssembly.Suspending` / `WebAssembly.promising`). Pass it to `temen_nim_open`: without it the
 /// engine offers no leaf that can park, and such a process runs interpreted instead.
@@ -416,6 +467,12 @@ export function endSession(session) {
 //   its timers fire in the page's time. With nothing left to run, the driver waits for an answer
 //   or the run's next timer, whichever comes first. The run's window is readable meanwhile
 //   through `temen_coop_read`.
+// - `onCap(slot, op, args, mem)` (#2579): a call to a JS capability the embedder staged before the
+//   open (`temen_onramp_stage_js_cap`, which returned `slot`), answered inside the call: `op` is the
+//   guest's op, `args` its arguments (BigInts) and `mem` the calling guest's window, a child's
+//   included (`windowView`). Return its result (a Number or BigInt); throwing answers -EIO. It is
+//   installed for the run's duration, and runs synchronously: from the pump, or from a bounce out
+//   of emitted code.
 // - `trapDeclines` (default `true`): a trapped run throws ("declined to the interpreter"), for a host
 //   that then re-runs the program interpreted. `false` returns the trap status (3) instead, with the
 //   trap's name and fault address in the `temen_trap_*`/`temen_fault_addr` slots. That is exact for a
@@ -434,7 +491,7 @@ export function endSession(session) {
 // `temen_coop_fs_image`.
 export async function driveCoopTierupRun(ex, memory, opts = {}) {
   const {
-    cacheKey, counts = {}, budget, leafBudget = budget, onOutput, onSlice, onCapPark,
+    cacheKey, counts = {}, budget, leafBudget = budget, onOutput, onSlice, onCapPark, onCap,
     trapDeclines = true, session,
   } = opts;
   // #1896: how many processes ran whole on the emitted tier, and how many parked calls in them
@@ -624,6 +681,8 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
   const queued = [[], []];
   const sink = globalThis.__temen_stream_chunk;
   if (onOutput) globalThis.__temen_stream_chunk = (fd, seq, bytes) => queued[fd === 2 ? 1 : 0].push(bytes);
+  const capCall = globalThis.__temen_js_cap_call;
+  if (onCap) globalThis.__temen_js_cap_call = jsCapServicer(ex, memory, onCap);
   const handOutput = () => {
     if (!onOutput || !(queued[0].length || queued[1].length)) return;
     const [out, err] = queued.map((q) => {
@@ -814,6 +873,7 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
     ex.temen_coop_close();
     handOutput();
     if (onOutput) globalThis.__temen_stream_chunk = sink;
+    if (onCap) globalThis.__temen_js_cap_call = capCall;
   }
   if (stopped) return null;
   const status = ex.temen_status();
