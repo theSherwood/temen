@@ -189,40 +189,103 @@ pub(crate) mod x86 {
         }
     }
 
-    /// The abstract state at a program point: a fact per GP register. (Spill-slot tracking — a
-    /// context param reloaded from `[rbp-k]` — is a tracked follow-up; until then a reload reads
-    /// `Unknown`, which is sound and, for the small corpus here where the params stay in registers,
-    /// precise.)
+    /// How many spill slots the state tracks. Register allocation spills a context param (mem_base
+    /// and friends) to the stack in a high-pressure function; a handful of slots covers that.
+    /// Overflow simply stops tracking new slots — sound, since an untracked reload reads `Unknown`.
+    const SLOT_CAP: usize = 8;
+
+    /// One tracked stack spill slot: the value spilled to `[base + disp]`, `base` the literal rsp(4)
+    /// or rbp(5). Keyed by `(base, disp)` exactly as the instruction encodes it — when rsp shifts,
+    /// Cranelift addresses the same physical slot with a *different* disp, so a stale key never
+    /// aliases a live slot (#2603 item 3).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct Slot {
+        base: u8,
+        disp: i64,
+        fact: Fact,
+    }
+
+    /// The abstract state at a program point: a fact per GP register, plus the tracked spill slots.
     #[derive(Clone, Copy, PartialEq, Eq)]
     struct State {
         regs: [Fact; 16],
+        slots: [Option<Slot>; SLOT_CAP],
     }
 
     impl State {
         /// The entry ABI: the four context params in their argument registers, everything else
-        /// unknown. rsp/rbp are the stack and are recognized structurally, not tracked as facts.
+        /// unknown, no slots. rsp/rbp are the stack and are recognized structurally, not as facts.
         fn entry() -> State {
             let mut regs = [Fact::Unknown; 16];
             regs[reg::RDI as usize] = Fact::MemBase;
             regs[reg::RSI as usize] = Fact::FnTableBase;
             regs[reg::RDX as usize] = Fact::Vmctx;
             regs[reg::RCX as usize] = Fact::StackLimit;
-            State { regs }
+            State {
+                regs,
+                slots: [None; SLOT_CAP],
+            }
         }
         fn meet(&self, other: &State) -> State {
             let mut regs = self.regs;
             for (r, &o) in regs.iter_mut().zip(other.regs.iter()) {
                 *r = r.meet(o);
             }
-            State { regs }
+            // A slot fact survives the meet only if both paths agree on it exactly.
+            let mut slots = [None; SLOT_CAP];
+            let mut n = 0;
+            for s in self.slots.iter().flatten() {
+                if other.slot_get(s.base, s.disp) == s.fact && n < SLOT_CAP {
+                    slots[n] = Some(*s);
+                    n += 1;
+                }
+            }
+            State { regs, slots }
+        }
+        /// The fact spilled to `[base + disp]`, or `Unknown` if that slot is not tracked.
+        fn slot_get(&self, base: u8, disp: i64) -> Fact {
+            self.slots
+                .iter()
+                .flatten()
+                .find(|s| s.base == base && s.disp == disp)
+                .map_or(Fact::Unknown, |s| s.fact)
+        }
+        /// Record (or, for `Unknown`, forget) the fact spilled to `[base + disp]`.
+        fn slot_set(&mut self, base: u8, disp: i64, fact: Fact) {
+            if let Some(e) = self
+                .slots
+                .iter_mut()
+                .find(|s| matches!(s, Some(s) if s.base == base && s.disp == disp))
+            {
+                *e = (fact != Fact::Unknown).then_some(Slot { base, disp, fact });
+            } else if fact != Fact::Unknown {
+                if let Some(e) = self.slots.iter_mut().find(|s| s.is_none()) {
+                    *e = Some(Slot { base, disp, fact });
+                }
+                // full ⇒ drop (sound: the reload reads Unknown)
+            }
+        }
+        fn clear_slots(&mut self) {
+            self.slots = [None; SLOT_CAP];
         }
         /// Loop-header widening (#2535): a `Bounded` carried into a header could grow each iteration,
-        /// so drop it to `Unknown`. The context-param and `Confined` facts are loop-invariant and
-        /// survive, so nearly every loop still settles in one round.
+        /// so drop it to `Unknown` (in registers and slots). The context-param and `Confined` facts
+        /// are loop-invariant and survive, so nearly every loop still settles in one round.
         fn widen(&mut self) {
             for f in &mut self.regs {
                 if matches!(f, Fact::Bounded(_)) {
                     *f = Fact::Unknown;
+                }
+            }
+            for s in self.slots.iter_mut().flatten() {
+                if matches!(s.fact, Fact::Bounded(_)) {
+                    s.fact = Fact::Unknown;
+                }
+            }
+            // Drop the now-`Unknown` slots so equal states compare equal across rounds.
+            for s in self.slots.iter_mut() {
+                if matches!(s, Some(e) if e.fact == Fact::Unknown) {
+                    *s = None;
                 }
             }
         }
@@ -543,9 +606,13 @@ pub(crate) mod x86 {
                         _ => Fact::Unknown,
                     };
                 }
-                // Loads and the opaque GP writes clobber their destinations (the value is not a
-                // tracked fact); the clobber mask `w` covers them below.
-                Eff::LoadReg { .. } | Eff::WrReg | Eff::WrRm | Eff::Wr(_) | Eff::NoGp => {}
+                Eff::LoadReg { dst } => {
+                    // A reload from a tracked spill slot restores its fact; any other load is unknown.
+                    state.regs[dst as usize & 15] = load_fact(&state, &d.operands);
+                }
+                // Stores write memory (handled by `slot_effect` below) and the opaque GP writes
+                // clobber their destinations (the value is not a tracked fact); `w` covers them below.
+                Eff::StoreReg { .. } | Eff::WrReg | Eff::WrRm | Eff::Wr(_) | Eff::NoGp => {}
             }
             // Clobber every GP register this instruction writes that the semantic above didn't set,
             // and drop them from the confinable set (their value changed).
@@ -557,6 +624,7 @@ pub(crate) mod x86 {
                             | Eff::AluImm { dst, .. }
                             | Eff::Cmov { dst }
                             | Eff::Lea { dst }
+                            | Eff::LoadReg { dst }
                             if dst == r
                     ) {
                         state.regs[r as usize] = Fact::Unknown;
@@ -564,8 +632,46 @@ pub(crate) mod x86 {
                     confinable &= !bit(r);
                 }
             }
+            slot_effect(&mut state, &d);
         }
         state
+    }
+
+    /// The fact a GP load `mov dst, [mem]` restores: the spill slot's fact when `mem` is a plain
+    /// `[rsp/rbp + disp]`, else `Unknown`.
+    fn load_fact(state: &State, ops: &Operands) -> Fact {
+        match ops.mem {
+            Some(m) if m.index.is_none() && matches!(m.base, Some(reg::RSP | reg::RBP)) => {
+                state.slot_get(m.base.unwrap(), m.disp)
+            }
+            _ => Fact::Unknown,
+        }
+    }
+
+    /// Update the tracked spill slots for one instruction's memory operand. A plain-`[rsp/rbp+disp]`
+    /// store records the slot; any **other** write to the stack frame (an RMW, a store of an
+    /// immediate, an SSE store, an indexed or lea'd-pointer frame write — recognized conservatively,
+    /// since this may also fire on a frame *read*) clears every slot. A memory operand based
+    /// anywhere but the frame cannot alias a slot (a write through a wild base is itself flagged by
+    /// the base-provenance policy), so it leaves the slots alone.
+    fn slot_effect(state: &mut State, d: &Decoded) {
+        let Some(m) = d.operands.mem else { return };
+        let on_frame = matches!(m.base, Some(reg::RSP | reg::RBP))
+            || matches!(
+                m.base.map(|b| state.regs[b as usize & 15]),
+                Some(Fact::StackPtr)
+            );
+        if !on_frame {
+            return;
+        }
+        let plain = m.index.is_none() && matches!(m.base, Some(reg::RSP | reg::RBP));
+        match d.eff {
+            Eff::StoreReg { src } if plain => {
+                state.slot_set(m.base.unwrap(), m.disp, state.regs[src as usize & 15]);
+            }
+            Eff::LoadReg { .. } if plain => {} // a reload; the slot is unchanged
+            _ => state.clear_slots(),
+        }
     }
 
     /// The GP register write mask of an instruction, from its effect and operands. A sound superset
@@ -573,7 +679,7 @@ pub(crate) mod x86 {
     /// is not) — cross-checked against iced-x86 in the tests.
     fn writes_of(eff: Eff, ops: &Operands) -> u16 {
         match eff {
-            Eff::NoGp | Eff::Cmp { .. } => 0,
+            Eff::NoGp | Eff::Cmp { .. } | Eff::StoreReg { .. } => 0,
             Eff::MovImm { dst, .. }
             | Eff::MovReg { dst, .. }
             | Eff::LoadReg { dst }
@@ -785,8 +891,12 @@ pub(crate) mod x86 {
         MovImm { dst: u8, imm: i64 },
         /// `mov dst, src` between GP registers — `dst := fact(src)`.
         MovReg { dst: u8, src: u8 },
-        /// A GP load `mov dst, [mem]` (mem in `operands.mem`) — `dst := loaded value`.
+        /// A GP load `mov dst, [mem]` (mem in `operands.mem`) — `dst := loaded value` (or the spill
+        /// slot's fact, when `mem` is a tracked `[rsp/rbp + disp]`).
         LoadReg { dst: u8 },
+        /// A GP store `mov [mem], src` (mem in `operands.mem`) — records `src`'s fact in the spill
+        /// slot when `mem` is a tracked `[rsp/rbp + disp]`. Writes no GP register.
+        StoreReg { src: u8 },
         /// `lea dst, [mem]` — computes an address into `dst` (does **not** dereference).
         Lea { dst: u8 },
         /// `add`/`sub`/`and dst, imm`, `dst` the r/m register — `dst := alu(fact(dst), imm)`.
@@ -1012,7 +1122,8 @@ pub(crate) mod x86 {
                 _ => Eff::NoGp,
             },
             I::MovToRm => match (reg, rm, mem) {
-                (_, _, true) => Eff::NoGp, // store to memory (the access is checked separately)
+                (Some(src), _, true) => Eff::StoreReg { src }, // store to memory (slot-tracked)
+                (_, _, true) => Eff::NoGp,
                 (Some(src), Some(dst), false) if w64 => Eff::MovReg { dst, src },
                 (_, Some(_), false) => Eff::WrRm,
                 _ => Eff::NoGp,
@@ -1740,6 +1851,49 @@ pub(crate) mod x86 {
         }
 
         #[test]
+        fn high_register_pressure_spills_membase() {
+            // #2603 item 3: enough live values that register allocation spills `mem_base` to the
+            // stack (`mov [rsp], rdi`) and reloads it (`mov rdi, [rsp]`) before a window access. The
+            // spill-slot tracking must carry the `MemBase` fact across that round-trip, so the policy
+            // sees `[mem_base + confined]` and finds nothing. (Before slot tracking the reload read
+            // `Unknown` and the access was flagged.) The pair-sum keeps the args live so the pressure
+            // is real; the load is late so `mem_base` is live under it.
+            use std::fmt::Write;
+            let n = 14usize;
+            let mut src = String::from("memory 16\nfunc (");
+            for i in 0..n {
+                src.push_str(if i > 0 { ", i64" } else { "i64" });
+            }
+            src.push_str(") -> (i64) {\nblock 0 (");
+            for i in 0..n {
+                if i > 0 {
+                    src.push_str(", ");
+                }
+                write!(src, "v{i}: i64").unwrap();
+            }
+            src.push_str(") {\n");
+            let mut next = n;
+            let mut partials = Vec::new();
+            for j in 0..n / 2 {
+                writeln!(src, "  v{next} = i64.add v{} v{}", 2 * j, 2 * j + 1).unwrap();
+                partials.push(next);
+                next += 1;
+            }
+            let load = next;
+            writeln!(src, "  v{load} = i64.load v0").unwrap();
+            next += 1;
+            let mut acc = partials[0];
+            for &p in &partials[1..] {
+                writeln!(src, "  v{next} = i64.add v{acc} v{p}").unwrap();
+                acc = next;
+                next += 1;
+            }
+            writeln!(src, "  v{next} = i64.add v{acc} v{load}").unwrap();
+            writeln!(src, "  return v{next}\n  }}\n}}").unwrap();
+            cross_check(&src);
+        }
+
+        #[test]
         fn memory_access_mask_lowering() {
             // Loads/stores exercise the confinement lowering: cmp, select_spectre_guard (cmov),
             // branches — the bulk of the integer instruction set the decoder must size.
@@ -1922,6 +2076,46 @@ pub(crate) mod x86 {
             assert!(
                 f.iter().any(|f| f.why.contains("past the reservation")),
                 "expected a reservation-overrun finding, got {f:?}"
+            );
+        }
+
+        /// Spill-slot tracking carries `mem_base` across a stack round-trip: spill rdi to `[rsp]`,
+        /// confine r8, reload rdi from `[rsp]`, then access `[mem_base + confined]` — clean.
+        #[test]
+        fn policy_tracks_membase_through_a_spill_slot() {
+            let bytes = [
+                0x48, 0x89, 0x3c, 0x24, // mov [rsp], rdi  (spill mem_base)
+                0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00,
+                0x00, // mov rax, 0x2000000000
+                0x4c, 0x3b, 0xc0, // cmp r8, rax
+                0x4c, 0x0f, 0x43, 0xc0, // cmovae r8, rax
+                0x48, 0x8b, 0x3c, 0x24, // mov rdi, [rsp]  (reload mem_base)
+                0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
+                0xc3, // ret
+            ];
+            let f = check(&bytes, &[], &[], None);
+            assert!(
+                f.is_empty(),
+                "spilled-then-reloaded mem_base was flagged: {f:?}"
+            );
+        }
+
+        /// Soundness of slot tracking: a store that overwrites the slot must drop the stale fact, so
+        /// the reload reads `Unknown` and the access is flagged — not silently admitted as the window.
+        #[test]
+        fn policy_slot_overwrite_drops_the_stale_fact() {
+            let bytes = [
+                0x48, 0x89, 0x3c, 0x24, // mov [rsp], rdi            (slot := mem_base)
+                0x48, 0xc7, 0x04, 0x24, 0x00, 0x00, 0x00,
+                0x00, // mov qword [rsp], 0  (overwrites it)
+                0x48, 0x8b, 0x3c, 0x24, // mov rdi, [rsp]            (reload ⇒ Unknown)
+                0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
+                0xc3, // ret
+            ];
+            let f = check(&bytes, &[], &[], None);
+            assert!(
+                f.iter().any(|f| f.why.contains("unrecognized provenance")),
+                "a stale slot fact survived an overwrite: {f:?}"
             );
         }
     }
