@@ -8305,8 +8305,9 @@ fn build_clif(
     // map, which reloads it after the second return (`launder_across_setjmp`). A forwarding param
     // (#2448) or a capture (#2454) would read the value its own block defined, around the reload
     // (#2600). So such a function is lowered block-local, taking no param as what it forwards.
+    let setjmp = f.uses_setjmp();
     let block_local;
-    let f = if f.uses_setjmp() && f.blocks.iter().any(|b| !b.captures.is_empty()) {
+    let f = if setjmp && f.blocks.iter().any(|b| !b.captures.is_empty()) {
         let mut g = f.clone();
         // Typing reads `has_memory` only to reject a memory op in a module with no window, which a
         // verified function has none of, so `true` types it exactly.
@@ -8332,7 +8333,7 @@ fn build_clif(
     // native params and jumps into IR block 0.
     let mut blocks = Blocks {
         clif: f.blocks.iter().map(|_| b.create_block()).collect(),
-        fwd: (!f.uses_setjmp()).then(|| f.forwards()),
+        fwd: (!setjmp).then(|| f.forwards()),
         vals: vec![Vec::new(); f.blocks.len()],
     };
     for (i, blk) in f.blocks.iter().enumerate() {
@@ -8761,11 +8762,11 @@ fn lower_block(
                 .ok_or(JitError::Malformed)?,
         );
     }
-    // Parallel upper-bound map (for mask elision); block params and captures are unknown. Kept in lockstep
-    // with `vals` so `ubs[i]` describes IR value `i` — a misalignment could mis-elide a mask (the
-    // INVARIANTS #2 escape class). Rather than re-growing it by hand in every multi-result arm (a
-    // 25th-arm slip away from a mis-elide), it is repaired to `vals.len()` at the **top of each
-    // iteration** (below), before any bound is consulted. So a slip now pads with `UB_TOP`
+    // Parallel upper-bound map (for mask elision); block params and captures are unknown. Kept in
+    // lockstep with `vals` so `ubs[i]` describes IR value `i` — a misalignment could mis-elide a
+    // mask (the INVARIANTS #2 escape class). Rather than re-growing it by hand in every multi-result
+    // arm (a 25th-arm slip away from a mis-elide), it is repaired to `vals.len()` at the **top of
+    // each iteration** (below), before any bound is consulted. So a slip now pads with `UB_TOP`
     // ("unknown ⇒ emit the check") — degrading to a redundant mask (perf pennies), never a missing
     // one — and the single-value tail's `ubs.push` is the only hand-placed growth. `size` confines
     // via `mask` (= size−1).

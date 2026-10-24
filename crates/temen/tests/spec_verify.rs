@@ -13,10 +13,12 @@
 //! This closes the verifier's accept-direction gap: an accept-direction bug in
 //! `temen-verify` now needs the same bug, independently written, in the reference.
 
-#[path = "support/irgen.rs"]
-mod irgen;
+// The structural mutations the coverage-guided `spec_verify` target applies, shared, and the program
+// generator they ride on.
+#[path = "support/specfuzz.rs"]
+mod specfuzz;
 
-use irgen::Gen;
+use specfuzz::irgen::{self, Gen};
 use temen::verify::{verify_module, VerifyError};
 use temen_ir::*;
 use temen_spec::{all_rows, mem_rows, module_for, module_for_mem, vectors_for, Shape};
@@ -647,135 +649,6 @@ fn directed_rule_rejects() {
     });
 }
 
-/// Deterministic structural mutations for the agreement sweep. A mutation may leave
-/// the module valid — the assertion is *agreement*, not rejection.
-fn mutate(m: &mut Module, kind: u64) {
-    // The non-entry blocks, and the captures, of every function: the dominance certificate's
-    // mutations (#2454) pick from these.
-    let blocks = |m: &mut Module| -> Vec<(usize, usize)> {
-        let mut v = Vec::new();
-        for (fi, f) in m.funcs.iter().enumerate() {
-            for bi in 1..f.blocks.len() {
-                v.push((fi, bi));
-            }
-        }
-        v
-    };
-    let captures = |m: &mut Module| -> Vec<(usize, usize, usize)> {
-        let mut v = Vec::new();
-        for (fi, f) in m.funcs.iter().enumerate() {
-            for (bi, b) in f.blocks.iter().enumerate() {
-                for j in 0..b.captures.len() {
-                    v.push((fi, bi, j));
-                }
-            }
-        }
-        v
-    };
-    match kind % 12 {
-        // Retarget the first unconditional branch far out of range.
-        0 => {
-            for f in &mut m.funcs {
-                for b in &mut f.blocks {
-                    if let Terminator::Br { target, .. } = &mut b.term {
-                        *target = 999;
-                        return;
-                    }
-                }
-            }
-        }
-        // Empty the first return's argument list.
-        1 => {
-            for f in &mut m.funcs {
-                for b in &mut f.blocks {
-                    if let Terminator::Return(vals) = &mut b.term {
-                        if !vals.is_empty() {
-                            vals.clear();
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-        // Rotate the first block parameter's type (leaves the func signature alone,
-        // so this usually trips the entry rule or an operand type).
-        2 => {
-            for f in &mut m.funcs {
-                for b in &mut f.blocks {
-                    if let Some(p) = b.params.first_mut() {
-                        *p = match *p {
-                            ValType::I32 => ValType::I64,
-                            ValType::I64 => ValType::F32,
-                            ValType::F32 => ValType::F64,
-                            ValType::F64 => ValType::V128,
-                            ValType::V128 => ValType::Ref,
-                            ValType::Ref | ValType::Cap => ValType::I32,
-                        };
-                        return;
-                    }
-                }
-            }
-        }
-        // Drop the memory declaration (any load/store must then be rejected).
-        3 => m.memory = None,
-        // Grow the entry function's result arity.
-        4 => {
-            if let Some(f) = m.funcs.first_mut() {
-                f.results.push(ValType::I32);
-            }
-        }
-        // Prepend a const to a nonempty block: shifts the value numbering under every
-        // later operand index.
-        5 => {
-            for f in &mut m.funcs {
-                for b in &mut f.blocks {
-                    if !b.insts.is_empty() {
-                        b.insts.insert(0, Inst::ConstI32(0));
-                        return;
-                    }
-                }
-            }
-        }
-        // A block's parent made itself (not earlier).
-        6 => {
-            if let Some(&(fi, bi)) = blocks(m).last() {
-                m.funcs[fi].blocks[bi].parent = bi as u32;
-            }
-        }
-        // A block's parent moved to the block just before it (rule 1 may fail).
-        7 => {
-            if let Some(&(fi, bi)) = blocks(m).last() {
-                m.funcs[fi].blocks[bi].parent = bi as u32 - 1;
-            }
-        }
-        // A capture pointed at the block just before its own (rule 2 may fail).
-        8 => {
-            if let Some(&(fi, bi, j)) = captures(m).last() {
-                m.funcs[fi].blocks[bi].captures[j].0 = bi as u32 - 1;
-            }
-        }
-        // A capture's value moved one up (out of range, or another value's type).
-        9 => {
-            if let Some(&(fi, bi, j)) = captures(m).first() {
-                m.funcs[fi].blocks[bi].captures[j].1 += 1;
-            }
-        }
-        // A capture on the entry block, which has no ancestor.
-        10 => {
-            if let Some(f) = m.funcs.first_mut() {
-                f.blocks[0].captures.push((0, 0));
-            }
-        }
-        // A capture of the capturing block's own first value.
-        11 => {
-            if let Some(&(fi, bi, j)) = captures(m).first() {
-                m.funcs[fi].blocks[bi].captures[j] = (bi as u32, 0);
-            }
-        }
-        _ => unreachable!(),
-    }
-}
-
 /// Part 3 — the agreement sweep: `irgen` modules, and the same modules raised into dominance form
 /// (#2454), are accepted by both verifiers, and structural mutations of them keep the two in
 /// accept/reject agreement.
@@ -790,9 +663,9 @@ fn verifier_agreement_on_generated_modules() {
         }
         for m in [generated, raised] {
             accept(&m, &format!("irgen seed {seed}"));
-            for kind in 0..12u64 {
+            for kind in 0..specfuzz::MUTATIONS {
                 let mut mm = m.clone();
-                mutate(&mut mm, kind);
+                specfuzz::mutate(&mut mm, kind);
                 let prod = verify_module(&mm).is_ok();
                 let refv = temen_spec::verify::verify(&mm).is_ok();
                 assert_eq!(
