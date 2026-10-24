@@ -50,8 +50,12 @@ pub struct NimBuild {
 ///
 /// `temen-link` is served natively at both of its paths ([`native_link`]), so `commands` need not
 /// carry it.
+///
+/// The driver runs the program its preparation keeps ([`PreparedModule::program`]), as each command
+/// runs its grant's, so a caller that keeps them prepared across builds (the card's toolchain,
+/// #2087) compiles each of them once (#2366).
 pub fn nim_open(
-    driver: &Module,
+    driver: &PreparedModule,
     commands: &[(PreparedModule, Vec<&str>)],
     dir: Option<&temen_posix::Posix>,
     files: &[(&str, &[u8])],
@@ -68,7 +72,7 @@ pub fn nim_open(
         interactive: false,
         loader: true,
     };
-    let (host, posix, init_mem) = posix_host_build(driver, &run)?;
+    let (host, posix, init_mem) = posix_host_build(driver.module(), &run)?;
     if let Some(dir) = dir {
         posix.adopt_files(dir);
     }
@@ -91,8 +95,9 @@ pub fn nim_open(
         leaf: Some(leaf),
         modules: None,
     });
-    let run = CoopRun::new_reserved(
-        driver,
+    let run = CoopRun::new_reserved_over_compiled(
+        driver.module(),
+        driver.program()?,
         0,
         &[],
         temen_interp::DEFAULT_FUEL,
@@ -100,7 +105,8 @@ pub fn nim_open(
         tierup,
         &init_mem,
         temen_ir::DEFAULT_RESERVED_LOG2,
-    )?
+        None,
+    )
     .ok()?;
     Some((run, posix))
 }
@@ -126,7 +132,7 @@ pub fn nim_build(
         .iter()
         .map(|(m, paths)| (prepare(m), paths.clone()))
         .collect();
-    let (mut run, posix) = nim_open(driver, &commands, dir, files, argv, cwd, leaf)?;
+    let (mut run, posix) = nim_open(&prepare(driver), &commands, dir, files, argv, cwd, leaf)?;
     let (mut ran, mut resumes) = (0, 0);
     let end = loop {
         match run.run() {
@@ -186,6 +192,8 @@ fn native_link(argv: &[String], files: &mut dyn temen_posix::CommandFiles) -> i3
 /// ([`crate::Programs`]).
 pub(crate) struct NimSession {
     posix: temen_posix::Posix,
+    /// The toolchain it builds with ([`Toolchain::token`]).
+    token: u32,
 }
 
 // ---- nimony's module-stem hash (gear2/modnames.nim + lib/tinyhashes.nim), reproduced exactly -------
@@ -266,9 +274,11 @@ pub unsafe extern "C" fn temen_nim_module_suffix(path_ptr: *const u8, path_len: 
 
 /// #2087 — a build's toolchain, decoded and prepared: nimony, and its commands with their paths.
 struct Toolchain {
+    /// What [`temen_nim_toolchain`] named it by: no other toolchain has it.
+    token: u32,
     driver_bytes: Vec<u8>,
     cmds_bytes: Vec<u8>,
-    driver: Arc<Module>,
+    driver: PreparedModule,
     commands: Vec<(Vec<String>, PreparedModule)>,
     /// #2099 — the directory its builds share: the personality of the last one to end, whose memfs
     /// [`temen_nim_file`] reads and the next build continues in. A new toolchain starts from the
@@ -276,10 +286,13 @@ struct Toolchain {
     dir: Option<temen_posix::Posix>,
 }
 
-/// The toolchain the last build opened ([`toolchain`]).
+/// The toolchain [`temen_nim_toolchain`] made current ([`toolchain`]).
 static mut TOOLCHAIN: Option<Toolchain> = None;
 
-/// The toolchain of `driver` and `cmds` (a [`temen_nim_open`]'s), kept in [`TOOLCHAIN`].
+/// The next new toolchain's [`Toolchain::token`].
+static NEXT_TOKEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+/// The toolchain of `driver` and `cmds` (a [`temen_nim_toolchain`]'s), kept in [`TOOLCHAIN`].
 #[allow(static_mut_refs)]
 fn toolchain(driver: &[u8], cmds: &[u8]) -> Result<&'static mut Toolchain, i32> {
     // SAFETY: single-threaded wasm; the cache is touched only here, and a session holds what it
@@ -291,9 +304,9 @@ fn toolchain(driver: &[u8], cmds: &[u8]) -> Result<&'static mut Toolchain, i32> 
     )
 }
 
-/// The toolchain of `driver` and `cmds`: `slot`'s when its bytes are these, else decoded and prepared
-/// now and kept in `slot` for the next build. Every build of the nim card passes the same ones, so
-/// only its first decodes and prepares them (#2087).
+/// The toolchain of `driver` and `cmds`: `slot`'s when its bytes are these, else decoded and
+/// prepared now, under a new token, and kept in `slot` for the next build. A host that installs the
+/// same ones again keeps them, so only the first install decodes and prepares them (#2087).
 fn toolchain_in<'s>(
     slot: &'s mut Option<Toolchain>,
     driver: &[u8],
@@ -308,19 +321,21 @@ fn toolchain_in<'s>(
         let commands: Vec<(Vec<String>, PreparedModule)> = entries
             .iter()
             .map(|(paths, b)| {
-                let m = prepare(&decode(b)?);
+                let m = PreparedModule::new(decode(b)?);
                 Ok((paths.lines().map(String::from).collect(), m))
             })
             .collect::<Result<_, i32>>()?;
-        // nimony is one of its own commands: a driver that is one runs that command's module.
-        let module = match entries.iter().position(|(_, b)| *b == driver) {
-            Some(i) => Arc::clone(commands[i].1.module()),
-            None => Arc::new(decode(driver)?),
+        // nimony is one of its own commands: a driver that is one runs that command's grant, so it
+        // and its execs of itself share one program.
+        let prepared = match entries.iter().position(|(_, b)| *b == driver) {
+            Some(i) => commands[i].1.clone(),
+            None => PreparedModule::new(decode(driver)?),
         };
         *slot = Some(Toolchain {
+            token: NEXT_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             driver_bytes: driver.to_vec(),
             cmds_bytes: cmds.to_vec(),
-            driver: module,
+            driver: prepared,
             commands,
             dir: None,
         });
@@ -335,34 +350,67 @@ static mut FILE: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 pub(crate) fn finish(nim: NimSession) -> (Vec<u8>, Vec<u8>) {
     let out = (nim.posix.stdout(), nim.posix.stderr());
     // SAFETY: single-threaded wasm; the toolchain is touched only by the nim exports.
-    if let Some(tc) = unsafe { (*core::ptr::addr_of_mut!(TOOLCHAIN)).as_mut() } {
+    if let Some(tc) =
+        unsafe { (*core::ptr::addr_of_mut!(TOOLCHAIN)).as_mut() }.filter(|tc| tc.token == nim.token)
+    {
         tc.dir = Some(nim.posix);
     }
     out
 }
 
-/// Open nimony's driver ([`nim_open`]) as the cooperative tier-up session the `temen_coop_*` exports
-/// drive (`driveCoopTierupRun`): the process tree runs on the interpreter, and each leaf process
-/// pauses the run as a `COOP_RUN_TIERUP` of its own program ([`crate::temen_coop_module`]) to run whole
-/// on the emitted tier (#1896). `[driver)` is nimony's module; `[cmds)` the commands, a registry blob
-/// ([`blob_entries`]) whose entry names list a module's paths, one per line; `[files)` the tree it
-/// builds in, a blob of `path → bytes`, written over the directory the toolchain's last build left
-/// ([`nim_open`]); `[argv)` its arguments, each NUL-terminated; `[cwd)` the
-/// directory it runs in. `suspend` is non-zero when the driver can suspend a leaf's emitted frames
-/// where a call parks (JSPI): a leaf process that parks only on its pipes and its children then runs
-/// emitted too, and a parked call surfaces as [`crate::COOP_RUN_RESUME`] once it returns. Returns
-/// `0`, or a negative status. When the run is done the exit code, stdout and stderr read back as
-/// after any run, and [`temen_nim_file`] reads what the build wrote.
+/// Make nimony's toolchain the one [`temen_nim_open`] builds with: `[driver)`, nimony's module, and
+/// `[cmds)` the commands, a registry blob ([`blob_entries`]) whose entry names list a module's
+/// paths, one per line. Bytes that are the current toolchain's keep it, and the directory its
+/// builds left; other bytes are decoded and prepared, and their builds start in an empty directory
+/// (#2087). Returns the toolchain's token, which is positive, or a negative status. A host installs
+/// its toolchain once and opens each build by the token, so a build ships only what it changes
+/// (#2366).
+///
+/// # Safety
+/// Each `(ptr, len)` must be a live [`crate::temen_alloc`]ation the host filled, or `(null, 0)`.
+#[no_mangle]
+pub unsafe extern "C" fn temen_nim_toolchain(
+    driver_ptr: *const u8,
+    driver_len: usize,
+    cmds_ptr: *const u8,
+    cmds_len: usize,
+) -> i64 {
+    // SAFETY: the caller's contract.
+    let (driver, cmds) = unsafe {
+        (
+            crate::host_slice(driver_ptr, driver_len),
+            crate::host_slice(cmds_ptr, cmds_len),
+        )
+    };
+    let token = toolchain(driver, cmds).map(|tc| tc.token);
+    // SAFETY: single-threaded wasm.
+    unsafe { LAST_STATUS = token.err().unwrap_or(STATUS_OK) };
+    match token {
+        Ok(t) => i64::from(t),
+        Err(s) => -i64::from(s),
+    }
+}
+
+/// Open nimony's driver ([`nim_open`]) as the cooperative tier-up session the `temen_coop_*`
+/// exports drive (`driveCoopTierupRun`): the process tree runs on the interpreter, and each leaf
+/// process pauses the run as a `COOP_RUN_TIERUP` of its own program ([`crate::temen_coop_module`])
+/// to run whole on the emitted tier (#1896). `token` names the toolchain it builds with
+/// ([`temen_nim_toolchain`]), which must still be the current one; `[files)` is a blob of
+/// `path → bytes` written over the directory that toolchain's last build left ([`nim_open`]), so a
+/// toolchain's first build passes its whole tree and a later one only what it changes; `[argv)` its
+/// arguments, each NUL-terminated; `[cwd)` the directory it runs in. `suspend` is non-zero when the
+/// driver can suspend a leaf's emitted frames where a call parks (JSPI): a leaf process that parks
+/// only on its pipes and its children then runs emitted too, and a parked call surfaces as
+/// [`crate::COOP_RUN_RESUME`] once it returns. Returns `0`, or a negative status. When the run is
+/// done the exit code, stdout and stderr read back as after any run, and [`temen_nim_file`] reads
+/// what the build wrote.
 ///
 /// # Safety
 /// Each `(ptr, len)` must be a live [`crate::temen_alloc`]ation the host filled, or `(null, 0)`.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn temen_nim_open(
-    driver_ptr: *const u8,
-    driver_len: usize,
-    cmds_ptr: *const u8,
-    cmds_len: usize,
+    token: u32,
     files_ptr: *const u8,
     files_len: usize,
     argv_ptr: *const u8,
@@ -373,17 +421,18 @@ pub unsafe extern "C" fn temen_nim_open(
 ) -> i32 {
     crate::temen_coop_close();
     // SAFETY: the caller's contract.
-    let (driver, cmds, files, argv, cwd) = unsafe {
+    let (files, argv, cwd) = unsafe {
         (
-            crate::host_slice(driver_ptr, driver_len),
-            crate::host_slice(cmds_ptr, cmds_len),
             crate::host_slice(files_ptr, files_len),
             crate::host_slice(argv_ptr, argv_len),
             crate::host_slice(cwd_ptr, cwd_len),
         )
     };
     let status = (|| {
-        let tc = toolchain(driver, cmds)?;
+        // SAFETY: single-threaded wasm; the toolchain is touched only by the nim exports.
+        let tc = unsafe { (*core::ptr::addr_of_mut!(TOOLCHAIN)).as_mut() }
+            .filter(|tc| tc.token == token)
+            .ok_or(STATUS_UNSUPPORTED)?;
         let dir = tc.dir.take();
         let commands: Vec<(PreparedModule, Vec<&str>)> = tc
             .commands
@@ -410,8 +459,11 @@ pub unsafe extern "C" fn temen_nim_open(
         .ok_or(STATUS_UNSUPPORTED)?;
         // SAFETY: single-threaded wasm; the session is read back only via the coop exports.
         unsafe {
-            *core::ptr::addr_of_mut!(crate::COOP_RUN) =
-                Some(crate::CoopTierupRun::nim(run, NimSession { posix }, leaves));
+            *core::ptr::addr_of_mut!(crate::COOP_RUN) = Some(crate::CoopTierupRun::nim(
+                run,
+                NimSession { posix, token },
+                leaves,
+            ));
         }
         Ok(STATUS_OK)
     })()
@@ -498,22 +550,33 @@ mod toolchain_tests {
         let first = toolchain_in(&mut slot, &one, &cmds).expect("decodes");
         assert_eq!(first.commands[0].0, ["bin/one", "/bin/one"]);
         let kept = Arc::clone(first.commands[0].1.module());
+        let token = first.token;
         let again = toolchain_in(&mut slot, &one, &cmds).expect("decodes");
+        assert_eq!(again.token, token, "and its token");
         assert!(
             Arc::ptr_eq(again.commands[0].1.module(), &kept),
             "the same bytes keep it"
         );
         assert!(
-            Arc::ptr_eq(&again.driver, &kept),
+            Arc::ptr_eq(again.driver.module(), &kept),
             "a driver that is a command runs its module"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &again.driver.program().expect("compiles"),
+                &again.commands[0].1.program().expect("compiles")
+            ),
+            "and its program"
         );
         let changed = toolchain_in(&mut slot, &one, &other).expect("decodes");
         assert!(
             !Arc::ptr_eq(changed.commands[0].1.module(), &kept),
             "other bytes decode afresh"
         );
+        assert_ne!(changed.token, token, "under a token of their own");
         assert_eq!(
-            *changed.driver, *kept,
+            **changed.driver.module(),
+            *kept,
             "a driver that is no command decodes alone"
         );
         assert_eq!(

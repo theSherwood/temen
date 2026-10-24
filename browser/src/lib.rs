@@ -3620,9 +3620,8 @@ struct PosixRun<'a> {
 }
 
 /// A command for [`PosixRun::commands`] from a module only borrowed here, prepared as
-/// [`Host::grant_module`] would grant it: from a clone, whose vectors are exact where a decoded
-/// module's keep their growth slack. A caller that grants the same commands run after run keeps them
-/// prepared instead (a nim build's toolchain, #2087).
+/// [`Host::grant_module`] would grant it: from a clone. A caller that grants the same commands run
+/// after run keeps them prepared instead (a nim build's toolchain, #2087).
 fn prepare(m: &temen_ir::Module) -> PreparedModule {
     PreparedModule::new(std::sync::Arc::new(m.clone()))
 }

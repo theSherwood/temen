@@ -2303,6 +2303,7 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
     for _ in 0..nfuncs {
         funcs.push(decode_func(&mut c, object)?);
     }
+    let funcs = exact(funcs);
     // Optional strippable debug section (mirrors the encoder): present iff bytes remain after the
     // funcs. Strippable and untrusted-for-escape (§2a) — the verifier ignores it.
     let debug_info = if c.at_end() {
@@ -2523,7 +2524,7 @@ fn decode_func(c: &mut Cursor, object: bool) -> Result<Func, DecodeError> {
     Ok(Func {
         params,
         results,
-        blocks,
+        blocks: exact(blocks),
     })
 }
 
@@ -2537,9 +2538,18 @@ fn decode_block(c: &mut Cursor, object: bool) -> Result<Block, DecodeError> {
     let term = decode_term(c)?;
     Ok(Block {
         params,
-        insts,
+        insts: exact(insts),
         term,
     })
+}
+
+/// `v` without the room it grew by. The decoder grows each list as its elements decode, never by
+/// the count the input claims (audit #7), so a finished list can hold twice what it needs. Trimmed
+/// as it finishes (in place, where the allocator can), a decoded module is no larger than it needs
+/// to be, and a caller that keeps one (a toolchain's commands) need not copy it to shrink it.
+fn exact<T>(mut v: Vec<T>) -> Vec<T> {
+    v.shrink_to_fit();
+    v
 }
 
 fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
@@ -2890,7 +2900,7 @@ fn decode_term(c: &mut Cursor) -> Result<Terminator, DecodeError> {
             let default = decode_edge(c)?;
             Terminator::BrTable {
                 idx,
-                targets,
+                targets: exact(targets),
                 default,
             }
         }
@@ -2922,7 +2932,7 @@ fn decode_types(c: &mut Cursor) -> Result<Vec<ValType>, DecodeError> {
     for _ in 0..n {
         ts.push(decode_type(c)?);
     }
-    Ok(ts)
+    Ok(exact(ts))
 }
 
 fn decode_type(c: &mut Cursor) -> Result<ValType, DecodeError> {
@@ -2944,7 +2954,7 @@ fn decode_idxs(c: &mut Cursor) -> Result<Vec<u32>, DecodeError> {
     for _ in 0..n {
         v.push(c.idx()?);
     }
-    Ok(v)
+    Ok(exact(v))
 }
 
 /// A bounds-checked forward cursor. All reads return `Err` past the end.

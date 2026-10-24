@@ -946,7 +946,7 @@ impl ModuleSource {
     fn unit_of(
         &self,
         digest: &[u8; 32],
-        compile: impl FnOnce() -> Option<Compiled>,
+        compile: impl FnOnce() -> Option<std::sync::Arc<Compiled>>,
     ) -> Option<usize> {
         let find = |u: &Units| {
             u.by_digest
@@ -962,7 +962,7 @@ impl ModuleSource {
         if let Some(i) = find(&mods) {
             return Some(i);
         }
-        mods.code.push(std::sync::Arc::new(unit));
+        mods.code.push(unit);
         let i = mods.code.len() - 1;
         mods.by_digest.push((*digest, i));
         Some(i)
@@ -1120,7 +1120,7 @@ mod module_source_tests {
         let mut exec = |digest: [u8; 32]| {
             src.unit_of(&digest, || {
                 compiles += 1;
-                Some(unit())
+                Some(std::sync::Arc::new(unit()))
             })
             .expect("compiles")
         };
@@ -1201,13 +1201,15 @@ block 0 () {
     #[test]
     fn a_restore_forgets_which_module_each_unit_compiled() {
         let src = ModuleSource::new(unit());
-        let a = src.unit_of(&[1; 32], || Some(unit())).expect("compiles");
+        let a = src
+            .unit_of(&[1; 32], || Some(std::sync::Arc::new(unit())))
+            .expect("compiles");
         src.reset_extra(&[]);
         let mut compiled = false;
         let b = src
             .unit_of(&[1; 32], || {
                 compiled = true;
-                Some(unit())
+                Some(std::sync::Arc::new(unit()))
             })
             .expect("compiles");
         assert!(compiled, "the module is compiled again after a restore");
@@ -2225,7 +2227,9 @@ fn admit_detached_in_process(
 
 /// Compile module `g` that `host` granted, for a child or an exec in the run whose units `source`
 /// holds: through the host's memo when its embedder handed it one ([`Host::set_compile_memo`]), else
-/// afresh. The same program either way.
+/// afresh. The same program either way. A grant keeps what it compiled to
+/// ([`super::ModuleGrant::program`]), so a run over a grant an earlier run held finds it compiled
+/// (#2366).
 ///
 /// It is admitted as the run's own program was (#2284): on a driver that serves its children, a
 /// module that serves and spawns runs natively when its serve handlers cannot park
@@ -2234,11 +2238,43 @@ fn admit_detached_in_process(
 ///
 /// For a debug run it is unfused and carries its frame metadata, as the run's own program does
 /// (#2239).
-fn compile_granted(host: &Host, g: &super::ModuleGrant, source: &ModuleSource) -> Option<Compiled> {
-    let (m, fuse) = (&g.module, !source.debug);
+fn compile_granted(
+    host: &Host,
+    g: &super::ModuleGrant,
+    source: &ModuleSource,
+) -> Option<std::sync::Arc<Compiled>> {
     let serves_children = source.serves_children();
+    let memo = host.compile_memo().map(|m| &**m);
+    let compile = |debug: bool| {
+        let mut c = compile_grant(g, serves_children, !debug, memo)?;
+        c.debug = debug.then(|| std::sync::Arc::new(ModuleDebug::build(&g.module)));
+        Some(c)
+    };
+    // A debug run's program is its own. Every other run's is the grant's, compiled once (#2366).
+    match source.debug {
+        true => compile(true).map(std::sync::Arc::new),
+        false => g.program(serves_children, || compile(false)),
+    }
+}
+
+/// The program a root of a reserved-window run runs `g` as: [`compile_reserved`]'s program, kept
+/// with the grant ([`super::PreparedModule::program`]). A driver that serves its children compiles
+/// each module it execs this way, so this is also the program an exec of `g` in such a run runs.
+pub(crate) fn granted_root_program(g: &super::ModuleGrant) -> Option<std::sync::Arc<Compiled>> {
+    g.program(true, || compile_grant(g, true, true, None))
+}
+
+/// `g` compiled for a run whose driver does or does not serve its children, fused or not, through
+/// the host's memo when it has one: the same program either way.
+fn compile_grant(
+    g: &super::ModuleGrant,
+    serves_children: bool,
+    fuse: bool,
+    memo: Option<&std::sync::Mutex<FuncMemo>>,
+) -> Option<Compiled> {
+    let m = &g.module;
     let escape = serves_children && bytecode_serves_children(m);
-    let mut c = match host.compile_memo() {
+    let mut c = match memo {
         Some(memo) => compile_module_with(
             &m.funcs,
             &m.types,
@@ -2250,9 +2286,6 @@ fn compile_granted(host: &Host, g: &super::ModuleGrant, source: &ModuleSource) -
         None => compile_module_with(&m.funcs, &m.types, fuse, g.shadow(), escape, None),
     }?;
     c.serves_children = serves_children;
-    c.debug = source
-        .debug
-        .then(|| std::sync::Arc::new(ModuleDebug::build(m)));
     Some(c)
 }
 

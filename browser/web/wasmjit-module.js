@@ -55,8 +55,8 @@ export function registryBlob(entries) {
 
 // #958 — nimony's toolchain as the nim card ships it (`web/assets/nimony.blob.gz`, written by
 // temen-run's `nim_card_bundle`): a registry blob of `cwd`, the directory a build with it runs in (its library
-// pack names it); `commands`, as `temen_nim_open` takes them, nimony first; and `files`, what a build
-// seeds before its program — nimony's library, the library pack, the guest libc.
+// pack names it); `commands`, as `temen_nim_toolchain` takes them, nimony first; and `files`, what its
+// first build seeds before its program — nimony's library, the library pack, the guest libc.
 export function nimToolchain(bundle) {
   const e = new Map(blobEntries(bundle));
   return {
@@ -67,9 +67,14 @@ export function nimToolchain(bundle) {
   };
 }
 
+// The toolchain each engine holds (`temen_nim_toolchain`), by its exports: `{ toolchain, token }`.
+const installed = new WeakMap();
+
 // #958 — compile `source` as `prog.nim` with nimony's own driver and run what it builds:
 // `nimony t -r --novalidate --isMain prog.nim`, one `temen_nim_open` session over `toolchain`
-// ([`nimToolchain`]) that `driveCoopTierupRun` runs. No plugin validator ships with the toolchain, so
+// ([`nimToolchain`]) that `driveCoopTierupRun` runs. An engine is given the toolchain once
+// (`temen_nim_toolchain`): its first build with it ships the toolchain's files, a later one only
+// `prog.nim` (#2366). No plugin validator ships with the toolchain, so
 // `--novalidate` keeps nimony from warning about it at every plugin it builds. The process tree
 // (nimony, nifmake, nimsem, the shell) runs on the interpreter, each leaf process (nifler2, shoggoth,
 // the program itself) whole on the emitted tier
@@ -93,16 +98,29 @@ export async function nimCompileRun(ex, memory, toolchain, source) {
   // slot (read it only after the call: the slot moves).
   const stemLen = ex.temen_nim_module_suffix(...put(enc.encode('prog.nim')));
   const program = enc.encode(`${cwd}/nimcache/t/${text(Number(ex.temen_stdout_ptr()), stemLen)}/prog.temen`);
+  let inst = installed.get(ex);
+  let seed = [];
+  if (inst?.toolchain !== toolchain) {
+    const token = Number(ex.temen_nim_toolchain(...put(toolchain.nimony), ...put(toolchain.commands)));
+    if (token < 0) throw new Error(`temen_nim_toolchain: status ${ex.temen_status()}`);
+    inst = { toolchain, token };
+    installed.set(ex, inst);
+    seed = toolchain.files;
+  }
   // A build continues in the directory the last one left (#2099), so the program there may be the
   // last build's: remove it, and the program after this build is this build's.
   ex.temen_nim_remove(...put(program));
-  const files = registryBlob([...toolchain.files, [`${cwd}/prog.nim`, enc.encode(source)]]);
+  const files = registryBlob([...seed, [`${cwd}/prog.nim`, enc.encode(source)]]);
   const argv = enc.encode(['bin/nimony', 't', '-r', '--novalidate', '--isMain', 'prog.nim'].map((a) => `${a}\0`).join(''));
-  const args = [put(toolchain.nimony), put(toolchain.commands), put(files), put(argv), put(enc.encode(cwd))];
-  const opened = ex.temen_nim_open(...args.flat(), suspendsLeaves ? 1 : 0);
+  const args = [put(files), put(argv), put(enc.encode(cwd))];
+  const opened = ex.temen_nim_open(inst.token, ...args.flat(), suspendsLeaves ? 1 : 0);
   // The session holds its own copies of what it was opened with.
   for (const [p, n] of held.splice(0)) ex.temen_dealloc(p, n);
-  if (opened !== 0) throw new Error(`temen_nim_open: status ${ex.temen_status()}`);
+  if (opened !== 0) {
+    // The next build gives the engine the toolchain again.
+    installed.delete(ex);
+    throw new Error(`temen_nim_open: status ${ex.temen_status()}`);
+  }
   const counts = {};
   const status = await driveCoopTierupRun(ex, memory, { counts });
   const stdout = text(Number(ex.temen_stdout_ptr()), ex.temen_stdout_len());

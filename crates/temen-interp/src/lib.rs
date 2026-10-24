@@ -24946,7 +24946,16 @@ struct ModuleGrant {
     /// vCPU from ([`Self::tables`]): made the first time it is asked for, and shared by every copy of
     /// this grant.
     tables: Arc<std::sync::OnceLock<Tables>>,
+    /// The module's bytecode programs ([`Self::program`]), made and shared as `tables` are, so a
+    /// host that grants the same module run after run ([`PreparedModule`], a toolchain's commands)
+    /// compiles it once, not once a run (#2366).
+    programs: Arc<GrantPrograms>,
 }
+
+/// A grant's bytecode program for a run whose driver serves its children (`[1]`) and for one whose
+/// driver does not (`[0]`): the two ways a run admits a module ([`bytecode::compile_granted`]).
+/// `None` inside for a module the bytecode engine does not run.
+type GrantPrograms = [std::sync::OnceLock<Option<Arc<bytecode::Compiled>>>; 2];
 
 /// A function table and its type section, as a vCPU owns them.
 type Tables = (Arc<[Func]>, Arc<[temen_ir::TypeEntry]>);
@@ -24960,6 +24969,7 @@ impl ModuleGrant {
             module: m,
             durable,
             tables: Arc::default(),
+            programs: Arc::default(),
         }
     }
 
@@ -24985,6 +24995,18 @@ impl ModuleGrant {
         });
         (Arc::clone(funcs), Arc::clone(types))
     }
+
+    /// The module's bytecode program for a run whose driver does or does not `serve` its children:
+    /// `compile`d the first time it is asked for, and shared by every copy of this grant.
+    fn program(
+        &self,
+        serve: bool,
+        compile: impl FnOnce() -> Option<bytecode::Compiled>,
+    ) -> Option<Arc<bytecode::Compiled>> {
+        self.programs[serve as usize]
+            .get_or_init(|| compile().map(Arc::new))
+            .clone()
+    }
 }
 
 /// What an `execve` becomes, resolved ([`Host::exec_module`]): the module the new image runs.
@@ -25008,6 +25030,13 @@ impl PreparedModule {
     /// The module it grants.
     pub fn module(&self) -> &Arc<Module> {
         &self.0.module
+    }
+
+    /// Its bytecode program as the root of a reserved-window run runs it
+    /// ([`bytecode::compile_reserved`]), compiled once and kept with the grant: the program an exec
+    /// of it in such a run runs too (#2366). `None` for a module the bytecode engine does not run.
+    pub fn program(&self) -> Option<Arc<bytecode::Compiled>> {
+        bytecode::granted_root_program(&self.0)
     }
 }
 
