@@ -1541,8 +1541,14 @@ fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), tem
     if !host.is_durable() {
         return Ok(());
     }
-    let detached = detached_seeds(host)?;
-    cm.set_detached_seed(detached);
+    // Checked before anything is taken, so the refusal leaves the residue on the Host (as the other
+    // refusals here do) for a thaw that re-grants the program.
+    if !jit_relaunches(host) {
+        return Err(temen_jit::JitError::Unsupported(
+            "durable JIT thaw: a detached child the JIT cannot re-launch",
+        ));
+    }
+    cm.set_detached_seed(detached_seeds(host));
     cm.set_durable(take_residue(host));
     Ok(())
 }
@@ -1563,77 +1569,66 @@ fn take_residue(host: &mut Host) -> temen_jit::DurableResidue {
 /// #1361 step 4 — the captured detached children a restore seeded, as JIT re-launch seeds: each child's
 /// program resolved and its powerbox prepared by the same [`Host::prepare_detached_relaunch`] the
 /// interpreter's thaw uses, then built into a shared child powerbox exactly as a spawn builds one
-/// ([`finish_child_build`]). A child the JIT cannot re-launch, at any depth, refuses the thaw whole
-/// ([`jit_relaunches`]), leaving the residue in place. #2010 — each seed carries its own captured
-/// children, taken from its own powerbox.
-fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen_jit::JitError> {
-    // Checked before anything is taken, so the refusal leaves the residue on the Host (as the other
-    // refusals in `jit_durable_enter` do) for a thaw that re-grants the program.
-    if !jit_relaunches(host) {
-        return Err(temen_jit::JitError::Unsupported(
-            "durable JIT thaw: a detached child the JIT cannot re-launch",
-        ));
-    }
+/// ([`grant_child`]). #2010 — each seed carries its own captured children, taken from its own
+/// powerbox. #2430 — its caller has checked that the JIT re-launches every one ([`jit_relaunches`]),
+/// so nothing here refuses the thaw part-way, once leases are filed: a child it cannot relaunch is
+/// dropped, as the interpreter drops it ([`Host::drop_restored`]).
+fn detached_seeds(host: &mut Host) -> Vec<temen_jit::DetachedSeed> {
     let mut out = Vec::new();
     for td in host.take_thawed_detached() {
         let temen_interp::ThawedDetached {
             slot,
             window,
             reserved_log2,
-            host: child,
+            host: mut child,
             launch,
             ..
         } = td;
-        let Some(mut r) = host.prepare_detached_relaunch(&launch, child, window.page_map()) else {
-            return Err(temen_jit::JitError::Unsupported(
-                "durable JIT thaw: a detached child's imports no longer bind",
-            ));
+        // #1971 — the lease the spawn filed for its window, filed again for the thawed child's end.
+        let runs = window
+            .page_map()
+            .window_runs(temen_ir::module_null_guard(), 1u64 << reserved_log2);
+        let ready = host
+            .prepare_detached_relaunch(&launch, &mut child, window.page_map())
+            .and_then(|r| {
+                let lease = host.relaunch_lease(&mut child, r.memory_log2, runs).ok()?;
+                Some((r, lease))
+            });
+        let Some((r, window_lease)) = ready else {
+            // #2430 — not relaunched, as the interpreter's thaw drops one, whatever refused it (its
+            // program no longer binds, or #2318 the process's pools have no room for its lease):
+            // with what the freeze kept for it and its own captured children, and one its parent
+            // can join ends with `ThreadFault`. #2465 — one its parent detached just ends.
+            child.drop_restored(&launch, &window, false);
+            if launch.joinable {
+                out.push(temen_jit::DetachedSeed::Completed {
+                    slot,
+                    result: 0,
+                    trap: temen_interp::Trap::ThreadFault.code(),
+                });
+            }
+            continue;
         };
         // #1854 — its Memory capability sees the pages its window is restored with, as a thawed
         // root's does (`jit_cap_run`).
-        r.host.reset_cap_pages(window.page_map());
+        child.reset_cap_pages(window.page_map());
         if !host.try_grant_lane(launch.lane) {
             // As the interpreter's re-launch: a lane the thawing parent's cap no longer fits is not
             // re-drawn; the child keeps its own cap either way.
         }
-        // #1971 — the lease the spawn filed for its window, filed again for the thawed child's end.
-        // #2318 — refused when the process's pools have no room for it: the child is not relaunched,
-        // and ends with `ThreadFault` (its window went back), as the interpreter's thaw ends it.
-        let runs = window
-            .page_map()
-            .window_runs(temen_ir::module_null_guard(), 1u64 << reserved_log2);
-        let Ok(window_lease) = host.relaunch_lease(&mut r.host, r.memory_log2, runs) else {
-            out.push(temen_jit::DetachedSeed::Completed {
-                slot,
-                result: 0,
-                trap: temen_interp::Trap::ThreadFault.code(),
-            });
-            continue;
-        };
-        let children = detached_seeds(&mut r.host)?;
+        let children = detached_seeds(&mut child);
         // A thawed child's window is always a whole window, never a seed.
         let temen_jit::WindowRestore { prots, tail } = jit_restore(&window).unwrap_or_default();
         // Its root is task 0 in its domain, as in a JIT capture: re-parent the vCPUs it spawned
         // from the id an interpreter capture gave it.
-        let mut residue = take_residue(&mut r.host);
+        let mut residue = take_residue(&mut child);
         for v in &mut residue.vcpus {
             if v.parent_task == launch.task as usize {
                 v.parent_task = 0;
             }
         }
-        let mut gc = core::mem::MaybeUninit::<temen_jit::GrantChild>::zeroed();
-        // Outside any run: a context for the build to raise on, read by no one (its failure is the
-        // `0` it returns).
-        let vm = temen_jit::VmCtx::new(temen_jit::InstanceAddrs::NONE);
-        // SAFETY: `gc` is a live out-cell for the call.
         // A thaw never re-launches a demand-paged child on this engine (#2438).
-        if unsafe { finish_child_build(host, Some((r.host, 0, 0)), None, gc.as_mut_ptr(), &vm) }
-            == 0
-        {
-            return Err(temen_jit::JitError::Unsupported(
-                "durable JIT thaw: child powerbox",
-            ));
-        }
+        let child = grant_child(host, child, 0, 0, None);
         out.push(temen_jit::DetachedSeed::Captured(Box::new(
             temen_jit::CapturedSeed {
                 slot,
@@ -1649,11 +1644,11 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
                 image: window.bytes().to_vec(),
                 prots,
                 tail,
-                // SAFETY: `finish_child_build` returned 1, so it filled `gc`.
-                child: unsafe { gc.assume_init() },
+                child,
                 window: window_lease.map(|l| (l.budget, l.bytes, l.runs)),
                 children,
                 residue,
+                joinable: launch.joinable,
             },
         )));
     }
@@ -1673,7 +1668,7 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
             trap,
         });
     }
-    Ok(out)
+    out
 }
 
 /// #2010 — whether the JIT can re-create every detached child a restore seeded on `host`, at every
@@ -1793,6 +1788,7 @@ fn detached_left(
                     child_task: 0,
                     host: child,
                     spawn,
+                    joinable: h.joinable,
                 }),
             }
             continue;
@@ -1824,6 +1820,7 @@ fn detached_left(
                 lane,
                 names,
                 pager: None,
+                joinable: h.joinable,
             },
         });
     }
@@ -1842,6 +1839,7 @@ fn pending_detached(c: temen_interp::CapturedDetached) -> temen_interp::PendingD
             module: c.module,
             pager: c.launch.pager,
         },
+        joinable: c.launch.joinable,
     }
 }
 
@@ -3800,10 +3798,8 @@ unsafe fn read_grant_records(
         .ok()
 }
 
-/// Wrap a built child powerbox as the two counted shared refs the JIT expects: arm the wake signal,
-/// inherit the kill cell, fill `out`. `None` (a non-re-grantable handle) is the fail-closed
-/// `CapFault`. `paging` makes it a demand-paged child (#2164): its spawner's cell, the pager export
-/// there, and the declared window's length.
+/// Fill `out` with the child powerbox `built` ([`grant_child`]). `None` (a non-re-grantable handle)
+/// is the fail-closed `CapFault`.
 unsafe fn finish_child_build(
     parent: &Host,
     built: Option<(Host, i32, i32)>,
@@ -3811,70 +3807,78 @@ unsafe fn finish_child_build(
     out: *mut temen_jit::GrantChild,
     vm: &temen_jit::VmCtx,
 ) -> i32 {
-    match built {
-        Some((child, inst_handle, as_handle)) => {
-            // CALLS.md 5c.0 — the child powerbox is **shared**: one ref rides the child thread
-            // (compiled against the lock-taking thunk), one is retained by the nursery so
-            // `child_offer` can mint a live-impl over it. Each ref is released exactly once via
-            // `grant_child_release` (child exit / nursery teardown).
-            let mut child = child;
-            // CALLS.md 5c.1b, #2173 — inherit the run's park hub, so the parked transport's waits on
-            // this cell (its bell is armed with the cell, `Host::into_cell`) are parks of the run.
-            child.set_park_hub(parent.park_hub());
-            // #1296 — the table reservation a re-granted `Jit` carried into the child (0 ⇒ none),
-            // and whether it holds one at all.
-            let jit_table_log2 = child.jit_table_log2();
-            let holds_jit = child.has_jit_table();
-            // D66 — the lane chain the executor gates this child's dispatch on: the child's own
-            // `(domain, cap)` (the cap `admit_detached_spawn` reserved and `spawn_detached_child`
-            // stamped) under the parent's.
-            let (domain, lane_cap) = (child.domain_id(), child.lane_cap());
-            let (parent_domain, parent_lane_cap) = (parent.domain_id(), parent.lane_cap());
-            // §2.2 / #2164 — a demand-paged child's access table: every page of its declared window
-            // unmapped until its window starts (`window_aliases`), and the page past it admitting
-            // everything, as the code that tests it expects.
-            let pages = paging.map(|(spawner, export, mapped)| {
-                use std::sync::atomic::AtomicU8;
-                let n = mapped.div_ceil(host_page_size()).max(1);
-                let table: Arc<[AtomicU8]> = (0..=n)
-                    .map(|p| {
-                        AtomicU8::new(if p == n {
-                            temen_ir::PAGE_READ | temen_ir::PAGE_WRITE
-                        } else {
-                            0
-                        })
-                    })
-                    .collect();
-                let paging = temen_interp::JitPaging {
-                    table: Arc::clone(&table),
-                    mapped,
-                };
-                child.set_jit_pager(spawner, export, paging);
-                table.as_ptr()
-            });
-            let shared = child.into_cell();
-            let retained = std::sync::Arc::clone(&shared);
-            *out = temen_jit::GrantChild {
-                ctx: std::sync::Arc::into_raw(shared) as *mut c_void,
-                retained_ctx: std::sync::Arc::into_raw(retained) as *mut c_void,
-                inst_handle,
-                as_handle,
-                jit_table_log2,
-                holds_jit,
-                grant_handle: 0,
-                domain,
-                lane_cap,
-                parent_domain,
-                parent_lane_cap,
-                // The child's powerbox holds the table, so the pointer lives as long as its code.
-                pages: pages.unwrap_or(core::ptr::null()),
-            };
-            1
-        }
-        None => {
-            vm.raise(TrapKind::CapFault as i64);
-            0
-        }
+    let Some((child, inst_handle, as_handle)) = built else {
+        vm.raise(TrapKind::CapFault as i64);
+        return 0;
+    };
+    *out = grant_child(parent, child, inst_handle, as_handle, paging);
+    1
+}
+
+/// Wrap a built child powerbox as the two counted shared refs the JIT expects: arm the wake signal,
+/// inherit the kill cell. `paging` makes it a demand-paged child (#2164): its spawner's cell, the
+/// pager export there, and the declared window's length.
+fn grant_child(
+    parent: &Host,
+    mut child: Host,
+    inst_handle: i32,
+    as_handle: i32,
+    paging: Option<(Arc<Mutex<Host>>, u32, u64)>,
+) -> temen_jit::GrantChild {
+    // CALLS.md 5c.0 — the child powerbox is **shared**: one ref rides the child thread (compiled
+    // against the lock-taking thunk), one is retained by the nursery so `child_offer` can mint a
+    // live-impl over it. Each ref is released exactly once via `grant_child_release` (child exit /
+    // nursery teardown).
+    // CALLS.md 5c.1b, #2173 — inherit the run's park hub, so the parked transport's waits on this
+    // cell (its bell is armed with the cell, `Host::into_cell`) are parks of the run.
+    child.set_park_hub(parent.park_hub());
+    // #1296 — the table reservation a re-granted `Jit` carried into the child (0 ⇒ none), and
+    // whether it holds one at all.
+    let jit_table_log2 = child.jit_table_log2();
+    let holds_jit = child.has_jit_table();
+    // D66 — the lane chain the executor gates this child's dispatch on: the child's own `(domain,
+    // cap)` (the cap `admit_detached_spawn` reserved and `spawn_detached_child` stamped) under the
+    // parent's.
+    let (domain, lane_cap) = (child.domain_id(), child.lane_cap());
+    let (parent_domain, parent_lane_cap) = (parent.domain_id(), parent.lane_cap());
+    // §2.2 / #2164 — a demand-paged child's access table: every page of its declared window
+    // unmapped until its window starts (`window_aliases`), and the page past it admitting
+    // everything, as the code that tests it expects.
+    let pages = paging.map(|(spawner, export, mapped)| {
+        use std::sync::atomic::AtomicU8;
+        let n = mapped.div_ceil(host_page_size()).max(1);
+        let table: Arc<[AtomicU8]> = (0..=n)
+            .map(|p| {
+                AtomicU8::new(if p == n {
+                    temen_ir::PAGE_READ | temen_ir::PAGE_WRITE
+                } else {
+                    0
+                })
+            })
+            .collect();
+        let paging = temen_interp::JitPaging {
+            table: Arc::clone(&table),
+            mapped,
+        };
+        child.set_jit_pager(spawner, export, paging);
+        table.as_ptr()
+    });
+    let shared = child.into_cell();
+    let retained = std::sync::Arc::clone(&shared);
+    temen_jit::GrantChild {
+        ctx: std::sync::Arc::into_raw(shared) as *mut c_void,
+        retained_ctx: std::sync::Arc::into_raw(retained) as *mut c_void,
+        inst_handle,
+        as_handle,
+        jit_table_log2,
+        holds_jit,
+        grant_handle: 0,
+        domain,
+        lane_cap,
+        parent_domain,
+        parent_lane_cap,
+        // The child's powerbox holds the table, so the pointer lives as long as its code.
+        pages: pages.unwrap_or(core::ptr::null()),
     }
 }
 

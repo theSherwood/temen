@@ -50,6 +50,8 @@ fn straight_line_identity() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32], // v0 = a
             insts: vec![
                 Inst::ConstI32(7), // v1
@@ -80,6 +82,8 @@ fn block_params_and_brif_identity() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],     // v0 = a
                 insts: vec![Inst::ConstI32(0)], // v1
                 term: Terminator::BrIf {
@@ -91,6 +95,8 @@ fn block_params_and_brif_identity() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // v0 = the phi
                 insts: vec![],
                 term: Terminator::Return(vec![0]),
@@ -108,6 +114,8 @@ fn br_table_and_loop_identity() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],     // v0 = n
                 insts: vec![Inst::ConstI32(0)], // v1 = acc0
                 term: Terminator::Br {
@@ -116,6 +124,8 @@ fn br_table_and_loop_identity() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32], // v0 = i, v1 = acc
                 insts: vec![
                     Inst::IntBin {
@@ -139,6 +149,8 @@ fn br_table_and_loop_identity() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // v0 = result
                 insts: vec![],
                 term: Terminator::Return(vec![0]),
@@ -156,6 +168,8 @@ fn multi_result_call_identity_and_defs() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![],
             term: Terminator::Return(vec![0]),
@@ -165,6 +179,8 @@ fn multi_result_call_identity_and_defs() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32], // v0 = a
             insts: vec![
                 Inst::Call {
@@ -231,6 +247,8 @@ fn roundtrip_preserves_behavior_through_interp() {
         params: vec![ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32], // v0 = a
             insts: vec![
                 Inst::ConstI32(0), // v1 = addr
@@ -341,6 +359,8 @@ fn random_func(rng: &mut Lcg) -> Func {
             },
         };
         blocks.push(Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts,
             term,

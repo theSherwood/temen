@@ -87,6 +87,8 @@ fn diamond_join_redundancy_eliminated() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32], // a, b
                 insts: vec![add(0, 1)],                   // v2 = a + b
                 term: Terminator::BrIf {
@@ -98,6 +100,8 @@ fn diamond_join_redundancy_eliminated() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32],
                 insts: vec![],
                 term: Terminator::Br {
@@ -106,6 +110,8 @@ fn diamond_join_redundancy_eliminated() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32],
                 insts: vec![],
                 term: Terminator::Br {
@@ -114,6 +120,8 @@ fn diamond_join_redundancy_eliminated() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32], // x, y
                 insts: vec![add(0, 1)],                   // w = x + y  (== a + b)
                 term: Terminator::Return(vec![2]),
@@ -140,6 +148,8 @@ fn join_recomputation_of_a_derived_expression() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32], // a, b
                 insts: vec![add(0, 1), add(2, 0)],        // v2=a+b, v3=(a+b)+a
                 term: Terminator::BrIf {
@@ -151,6 +161,8 @@ fn join_recomputation_of_a_derived_expression() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32],
                 insts: vec![],
                 term: Terminator::Br {
@@ -159,6 +171,8 @@ fn join_recomputation_of_a_derived_expression() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32],
                 insts: vec![],
                 term: Terminator::Br {
@@ -167,6 +181,8 @@ fn join_recomputation_of_a_derived_expression() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32], // x, y
                 insts: vec![add(0, 1), add(2, 0)],        // x+y, (x+y)+x  (== a+b, (a+b)+a)
                 term: Terminator::Return(vec![3]),
@@ -203,6 +219,8 @@ fn a_redundant_constant_is_not_threaded() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],                // a
                 insts: vec![Inst::ConstI32(5), add(0, 1)], // v1=5, v2=a+5
                 term: Terminator::BrIf {
@@ -214,6 +232,8 @@ fn a_redundant_constant_is_not_threaded() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],
                 insts: vec![],
                 term: Terminator::Br {
@@ -222,6 +242,8 @@ fn a_redundant_constant_is_not_threaded() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],
                 insts: vec![],
                 term: Terminator::Br {
@@ -230,6 +252,8 @@ fn a_redundant_constant_is_not_threaded() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],                // x
                 insts: vec![Inst::ConstI32(5), add(0, 1)], // v1=5, v2=x+5
                 term: Terminator::Return(vec![2]),
@@ -269,6 +293,8 @@ fn a_dispatch_loop_is_de_relooped() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // n=v0
                 insts: vec![Inst::ConstI32(0), Inst::ConstI32(0), Inst::ConstI32(0)], // acc,i,disp
                 term: Terminator::Br {
@@ -278,6 +304,8 @@ fn a_dispatch_loop_is_de_relooped() {
             },
             // block1: the dispatch — empty, br_table on `disp` (v3).
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32], // n,acc,i,disp
                 insts: vec![],
                 term: Terminator::BrTable {
@@ -288,6 +316,8 @@ fn a_dispatch_loop_is_de_relooped() {
             },
             // block2 (state A): if i<n do work (-> block4) else exit (-> block5).
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32, ValType::I32], // n,acc,i
                 insts: vec![Inst::IntCmp {
                     ty: IntTy::I32,
@@ -305,6 +335,8 @@ fn a_dispatch_loop_is_de_relooped() {
             },
             // block3 (state B): acc+=2, i++, dispatch back to state A (disp=0, a local const).
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32, ValType::I32], // n,acc,i
                 insts: vec![
                     Inst::ConstI32(2),
@@ -320,6 +352,8 @@ fn a_dispatch_loop_is_de_relooped() {
             },
             // block4 (state A work): acc+=i, i++, dispatch to state B (disp=1, a local const).
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32, ValType::I32], // n,acc,i
                 insts: vec![
                     add(1, 2), // acc+i
@@ -334,6 +368,8 @@ fn a_dispatch_loop_is_de_relooped() {
             },
             // block5: exit.
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // acc
                 insts: vec![],
                 term: Terminator::Return(vec![0]),
@@ -379,6 +415,8 @@ fn impure_loads_at_a_join_are_not_deduped_by_gvn() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I64],
                 insts: vec![ld(1)], // v2 = load[addr]
                 term: Terminator::BrIf {
@@ -390,6 +428,8 @@ fn impure_loads_at_a_join_are_not_deduped_by_gvn() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64],
                 insts: vec![],
                 term: Terminator::Br {
@@ -398,6 +438,8 @@ fn impure_loads_at_a_join_are_not_deduped_by_gvn() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64],
                 insts: vec![],
                 term: Terminator::Br {
@@ -406,6 +448,8 @@ fn impure_loads_at_a_join_are_not_deduped_by_gvn() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64], // addr'
                 insts: vec![ld(0)],         // load[addr'] — must NOT be deduped
                 term: Terminator::Return(vec![1]),
@@ -515,6 +559,8 @@ fn random_dag(rng: &mut Lcg, nparams: u32, nblocks: u32) -> Func {
             }
         };
         blocks.push(Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts,
             term,

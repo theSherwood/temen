@@ -28,6 +28,8 @@ fn leaf(params: Vec<ValType>, results: Vec<ValType>) -> Func {
         params: params.clone(),
         results,
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts: vec![],
             term,
@@ -47,6 +49,8 @@ fn offer_funcs() -> Arc<[Func]> {
         params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64, ValType::I64],
             insts: vec![Inst::IntBin {
                 ty: IntTy::I64,
@@ -61,6 +65,8 @@ fn offer_funcs() -> Arc<[Func]> {
         params: vec![ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64],
             insts: vec![Inst::Load {
                 op: LoadOp::I64,

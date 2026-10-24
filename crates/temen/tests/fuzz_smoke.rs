@@ -177,6 +177,8 @@ block 0 () { v0 = i64.const 7
         params: vec![],
         results: vec![ir::ValType::I64],
         blocks: vec![ir::Block {
+            parent: 0,
+            captures: vec![],
             params: vec![],
             insts: vec![
                 ir::Inst::DataSelf {

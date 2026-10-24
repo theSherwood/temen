@@ -977,6 +977,8 @@ fn gen_loop_func(
         let c0 = e.push(Inst::ConstI32(0), ValType::I32);
         args.push(c0);
         Block {
+            parent: 0,
+            captures: vec![],
             params: params.clone(),
             insts: e.insts,
             term: Terminator::Br { target: 1, args },
@@ -995,6 +997,8 @@ fn gen_loop_func(
             ValType::I32,
         );
         Block {
+            parent: 0,
+            captures: vec![],
             params: hparams.clone(),
             insts: h.insts,
             // pass all header params (carry + counter) to the body; carry only to exit
@@ -1026,6 +1030,8 @@ fn gen_loop_func(
         );
         args.push(next);
         Block {
+            parent: 0,
+            captures: vec![],
             params: hparams.clone(),
             insts: b.insts,
             term: Terminator::Br { target: 1, args },
@@ -1039,6 +1045,8 @@ fn gen_loop_func(
         }
         let outs = x.edge_args(&results);
         Block {
+            parent: 0,
+            captures: vec![],
             params: carry.clone(),
             insts: x.insts,
             term: Terminator::Return(outs),
@@ -1074,6 +1082,8 @@ fn gen_func(g: &mut Gen, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
         }
         let term = gen_term(&mut bb, bi, nblocks, &bparams, &results);
         blocks.push(Block {
+            parent: 0,
+            captures: vec![],
             params: params_i,
             insts: bb.insts,
             term,

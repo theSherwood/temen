@@ -89,12 +89,16 @@ fn constant_through_multi_pred_block_param() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],     // v0 = a
                 insts: vec![Inst::ConstI32(5)], // v1
                 term: brif(0, 1, vec![1], 1, vec![1]),
             },
             Block {
-                params: vec![ValType::I32],                 // v0 = x (= 5 on every edge)
+                parent: 0,
+                captures: vec![],
+                params: vec![ValType::I32], // v0 = x (= 5 on every edge)
                 insts: vec![Inst::ConstI32(10), add(0, 1)], // v1=10, v2 = x + 10
                 term: Terminator::Return(vec![2]),
             },
@@ -124,21 +128,29 @@ fn conditional_branch_resolved_by_cross_block_constant() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],            // a
                 insts: vec![Inst::ConstI32(1)],        // v1 = 1
                 term: brif(0, 1, vec![1], 1, vec![1]), // both arms → b1 with 1
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // c (= 1)
                 insts: vec![],
                 term: brif(0, 2, vec![], 3, vec![]), // if c { b2 } else { b3 }
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![Inst::ConstI32(100)],
                 term: Terminator::Return(vec![0]),
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![Inst::ConstI32(200)], // dead once SCCP resolves the branch
                 term: Terminator::Return(vec![0]),
@@ -181,6 +193,8 @@ fn loop_invariant_constant_folds_inside_the_loop() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],     // n
                 insts: vec![Inst::ConstI32(7)], // v1 = 7
                 term: Terminator::Br {
@@ -189,6 +203,8 @@ fn loop_invariant_constant_folds_inside_the_loop() {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32], // v0=k, v1=i
                 insts: vec![
                     add(0, 0),         // v2 = k + k     (SCCP: 14)
@@ -198,6 +214,8 @@ fn loop_invariant_constant_folds_inside_the_loop() {
                 term: brif(4, 1, vec![0, 4], 2, vec![2]), // loop (k,i-1) else exit with d
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // r
                 insts: vec![],
                 term: Terminator::Return(vec![0]),
@@ -235,11 +253,15 @@ fn trapping_op_is_never_marked_constant() {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],                          // a
                 insts: vec![Inst::ConstI32(0), Inst::ConstI32(100)], // v1=0, v2=100
                 term: brif(0, 1, vec![2, 1], 1, vec![2, 1]),         // pass (100, 0)
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32], // v0=num(100), v1=den(0)
                 insts: vec![Inst::IntBin {
                     ty: IntTy::I32,

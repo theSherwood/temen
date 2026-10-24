@@ -1275,6 +1275,8 @@ pub fn module_for_simd_batch(row: &SimdRow, batch: &[Vec<SpecVal>]) -> Module {
             params: vec![],
             results: result_tys,
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts,
                 term: Terminator::Return(results),
@@ -1292,6 +1294,8 @@ pub fn encode_probe_module(inst: Inst) -> Module {
             params: vec![],
             results: vec![],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![inst],
                 term: Terminator::Return(vec![]),

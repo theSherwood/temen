@@ -41,6 +41,8 @@ fn with_readback(residual: &Module, entry: u32, read_addr: u64, nparams: usize) 
         params: params.clone(),
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts: vec![
                 Inst::ConstI64(read_addr as i64),

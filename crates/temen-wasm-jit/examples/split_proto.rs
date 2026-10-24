@@ -49,6 +49,8 @@ fn hot_loop(hot_blocks: usize, hot_block_len: usize) -> Func {
     let mut f = i64f();
     // block 0 (v0=n): v1 = 0; br 1(n, 0)
     f.blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64],
         insts: vec![Inst::ConstI64(0)],
         term: Terminator::Br {
@@ -58,6 +60,8 @@ fn hot_loop(hot_blocks: usize, hot_block_len: usize) -> Func {
     });
     // block 1 (v0=i, v1=acc): v2 = 0; v3 = (i == 0); br_if v3 -> 2(acc) : 3(i, acc)  [chain starts at 3]
     f.blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64],
         insts: vec![
             Inst::ConstI64(0),
@@ -78,6 +82,8 @@ fn hot_loop(hot_blocks: usize, hot_block_len: usize) -> Func {
     });
     // block 2 (v0=r): return r
     f.blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64],
         insts: vec![],
         term: Terminator::Return(vec![0]),
@@ -141,6 +147,8 @@ fn hot_loop(hot_blocks: usize, hot_block_len: usize) -> Func {
             }
         };
         f.blocks.push(Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64, ValType::I64],
             insts,
             term,
@@ -157,6 +165,8 @@ fn callfree_loop(hot_blocks: usize, hot_block_len: usize) -> Func {
     let ops = [BinOp::Add, BinOp::Xor, BinOp::Mul, BinOp::Sub, BinOp::Or];
     let mut f = i64f();
     f.blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64],
         insts: vec![Inst::ConstI64(0)],
         term: Terminator::Br {
@@ -165,6 +175,8 @@ fn callfree_loop(hot_blocks: usize, hot_block_len: usize) -> Func {
         },
     });
     f.blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64],
         insts: vec![
             Inst::ConstI64(0),
@@ -184,6 +196,8 @@ fn callfree_loop(hot_blocks: usize, hot_block_len: usize) -> Func {
         },
     });
     f.blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64],
         insts: vec![],
         term: Terminator::Return(vec![0]),
@@ -229,6 +243,8 @@ fn callfree_loop(hot_blocks: usize, hot_block_len: usize) -> Func {
             }
         };
         f.blocks.push(Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64, ValType::I64],
             insts,
             term,
@@ -241,6 +257,8 @@ fn callfree_loop(hot_blocks: usize, hot_block_len: usize) -> Func {
 fn helper() -> Func {
     let mut f = i64f();
     f.blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64],
         insts: vec![
             Inst::ConstI64(3),
@@ -289,6 +307,8 @@ fn filler(len: usize, seed: u64) -> Func {
         next += 1;
     }
     f.blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64],
         insts,
         term: Terminator::Return(vec![acc]),
@@ -345,6 +365,8 @@ fn chain(blocks: usize, block_len: usize, seed: u64) -> Func {
             Terminator::Return(vec![acc])
         };
         f.blocks.push(Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64],
             insts,
             term,
@@ -390,6 +412,8 @@ fn outlined_dispatcher(k: usize) -> Func {
     let mut f = i64f();
     // block 0 (v0=n): acc=0; br 1(n, 0)
     f.blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64],
         insts: vec![Inst::ConstI64(0)],
         term: Terminator::Br {
@@ -399,6 +423,8 @@ fn outlined_dispatcher(k: usize) -> Func {
     });
     // block 1 (v0=i, v1=acc): i==0 ? return acc : body
     f.blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64],
         insts: vec![
             Inst::ConstI64(0),
@@ -419,6 +445,8 @@ fn outlined_dispatcher(k: usize) -> Func {
     });
     // block 2 (v0=r): return r
     f.blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64],
         insts: vec![],
         term: Terminator::Return(vec![0]),
@@ -446,6 +474,8 @@ fn outlined_dispatcher(k: usize) -> Func {
     });
     let dec = next;
     f.blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64],
         insts,
         term: Terminator::Br {

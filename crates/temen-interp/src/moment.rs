@@ -20,8 +20,10 @@
 //! (#1460's second half). With `DebugRun` folded into `ScheduledDebugRun` (slice 4), the three shapes
 //! are now the three values of one [`Continuation`] enum on one moment type: `None` (a reactor, which
 //! resumes nothing between frames), `Bytecode` (the scheduled debug engine's task set + fibers + child
-//! envs), and `ShadowStack` (the tree-walk oracle's call stack + fuel). One `Moment`, one `Ladder`, one
-//! serialization ([`temen-snapshot`] writes a `ShadowStack` moment as a §12 artifact).
+//! envs), and `ShadowStack` (the tree-walk oracle's call stack + fuel). One `Moment`, one `Ladder`. A
+//! §12 artifact has the same two halves, but its continuation is a durable domain's window-resident
+//! shadow stack, which rides inside the image: `temen-snapshot` serializes that, never a moment's
+//! host-side continuation (its crate docs).
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -116,8 +118,8 @@ pub enum Refusal {
 /// determine the continuation. The window image and the host substate are the [`Moment`]'s own halves,
 /// shared with every other engine's checkpoint; the clock is the ladder's key, not the checkpoint's.
 ///
-/// This is [`temen-snapshot`]'s natural §12 artifact in all but name (slice 5): a quiesced tree-walk
-/// domain *is* a shadow-stack moment, so the crate serializes one directly.
+/// It is not a §12 artifact: it is a non-durable run's host-side call stack, and `temen-snapshot`
+/// carries only a durable domain's, which the window image holds.
 pub struct ShadowStack {
     pub(crate) frames: Vec<crate::Frame>,
     pub(crate) fuel: u64,

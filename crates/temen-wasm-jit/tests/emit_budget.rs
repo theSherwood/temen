@@ -28,6 +28,8 @@ fn wide_module(n_callees: usize, loads_each: usize) -> Module {
         params: vec![],
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![],
             insts,
             term: Terminator::Return(vec![n_callees as u32]),
@@ -46,6 +48,8 @@ fn wide_module(n_callees: usize, loads_each: usize) -> Module {
             params: vec![ValType::I64],
             results: vec![ValType::I64],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64],
                 insts,
                 term: Terminator::Return(vec![loads_each as u32]),

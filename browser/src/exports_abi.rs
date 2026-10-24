@@ -31,7 +31,8 @@ pub struct Export {
 }
 
 /// Every `#[no_mangle] pub extern "C" fn` under `src_dir`. Attribute lines between `#[no_mangle]`
-/// and the `fn` (`#[allow(...)]`, `#[cfg(...)]`) are tolerated and, for `cfg`, recorded.
+/// and the `fn` (`#[allow(...)]`, `#[cfg(...)]`) are tolerated and, for `cfg`, recorded. An export
+/// with no `cfg` of its own inside a top-level `mod` that has one is recorded with the module's.
 pub fn rust_exports(src_dir: &Path) -> BTreeMap<String, Export> {
     let mut out = BTreeMap::new();
     for file in rs_files(src_dir) {
@@ -39,15 +40,24 @@ pub fn rust_exports(src_dir: &Path) -> BTreeMap<String, Export> {
         // The contiguous run of `#[...]` lines above the current line. `#[cfg(...)]` conventionally
         // precedes `#[no_mangle]` and `#[allow(...)]` follows it, so the whole run is what decides.
         let mut attrs: Vec<String> = Vec::new();
+        // The `cfg` of the top-level `mod` the current line is in, which ends at the first `}` in
+        // column 0 (rustfmt indents everything inside it).
+        let mut mod_cfg: Option<String> = None;
         for line in text.lines() {
             let t = line.trim_start();
             if let Some(attr) = t.strip_prefix("#[") {
                 attrs.push(attr.trim_end_matches(']').to_string());
                 continue;
             }
+            let cfg = || attrs.iter().find(|a| a.starts_with("cfg(")).cloned();
+            if (line.starts_with("mod ") || line.starts_with("pub mod ")) && line.ends_with('{') {
+                mod_cfg = cfg();
+            } else if line == "}" {
+                mod_cfg = None;
+            }
             if attrs.iter().any(|a| a == "no_mangle") {
                 if let Some(name) = fn_name(t) {
-                    let cfg = attrs.iter().find(|a| a.starts_with("cfg(")).cloned();
+                    let cfg = cfg().or_else(|| mod_cfg.clone());
                     out.insert(
                         name.to_string(),
                         Export {

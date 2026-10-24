@@ -104,6 +104,8 @@ fn build_module(win_log2: u8) -> Module {
         params: i64x2(),
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: i64x2(),
             insts: vec![Inst::Call {
                 func: 1,
@@ -129,6 +131,8 @@ fn build_module(win_log2: u8) -> Module {
         params: i64x2(),
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: i64x2(),
             insts: vec![
                 Inst::ConstI64(3), // v2

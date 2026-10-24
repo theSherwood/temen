@@ -1009,11 +1009,16 @@ impl Nursery {
     /// #1361 step 4 — every unjoined durable detached child after a frozen run's teardown, with its
     /// powerbox handed over, and (#2010) its own harvest nested in it. #2044 — and every one a thaw
     /// delivered as completed, as its outcome alone: it has no powerbox, window or children.
+    ///
+    /// #2465 — and every one its parent detached (op 10) that unwound for the freeze, which rides
+    /// unjoinable. A join never claims a child the freeze unwound ([`join`]), so a claimed child
+    /// that unwound is one its parent detached.
     fn take_detached_harvest(&self) -> Vec<crate::DetachedHarvest> {
         let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
         for (slot, c) in children.iter_mut().enumerate() {
-            if c.joined {
+            let unwound = c.done.durable.as_ref().is_some_and(DurableCell::unwound);
+            if c.joined && !unwound {
                 continue;
             }
             if c.delivered {
@@ -1025,6 +1030,7 @@ impl Nursery {
                     capture: None,
                     outcome: *c.done.state.lock().unwrap_or_else(|e| e.into_inner()),
                     children: Vec::new(),
+                    joinable: true,
                 });
                 continue;
             }
@@ -1042,6 +1048,7 @@ impl Nursery {
                     .kid
                     .as_ref()
                     .map_or_else(Vec::new, |k| k.take_detached_harvest()),
+                joinable: !c.joined,
             });
         }
         out
@@ -1094,6 +1101,7 @@ impl Nursery {
             window,
             children,
             residue,
+            joinable,
         } = seed;
         let release_addr = self.grant_release.load(Ordering::Acquire);
         if release_addr == 0 {
@@ -1202,7 +1210,16 @@ impl Nursery {
             kid,
             residue,
         );
-        matches!(filed, Filed::Slot(_))
+        let Filed::Slot(_) = filed else {
+            return false;
+        };
+        // #2465 — detached (op 10) before the cut: no handle reaches it, and the nursery lets it go
+        // once it has ended, as at its detach.
+        if !joinable {
+            self.children.lock().unwrap_or_else(|e| e.into_inner())[slot].joined = true;
+            self.claim_ended(slot);
+        }
+        true
     }
 
     /// Mark the run durable (DURABILITY.md §4) — see the [`Nursery::durable`] field. Called at run

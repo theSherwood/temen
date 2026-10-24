@@ -39,6 +39,8 @@ fn calls_imports(slots: &[u32]) -> Func {
         params: vec![],
         results: vec![],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![],
             insts: slots
                 .iter()
@@ -60,6 +62,8 @@ fn stub() -> Func {
         params: vec![],
         results: vec![],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![],
             insts: vec![],
             term: Terminator::Unreachable,

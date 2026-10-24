@@ -639,6 +639,10 @@ pub fn specialize_with_config(
     args: &[SpecArg],
     config: &SpecConfig,
 ) -> Result<Module, SpecError> {
+    // The abstract interpreter keeps one block's values at a time: it reads a function whose blocks
+    // capture (#2454) in block-local form.
+    let local = temen_opt::block_local(module);
+    let module: &Module = &local;
     // Approach A: optionally rewrite dynamic-index `call.dyn`s into bounded direct-call
     // dispatch before specializing, so the engine folds through them (see `lower_indirect`). The
     // rewrite preserves function signatures/indices, so `func` and `args` still refer to the same
@@ -1393,6 +1397,8 @@ impl Spec<'_> {
                 self.write_back_cells(&mem, &mut out, &mut rnext)?;
                 let args = self.deopt_handler_args(&mut out, &mut rnext);
                 return Ok(temen_ir::Block {
+                    parent: 0,
+                    captures: vec![],
                     params,
                     insts: out,
                     term: Terminator::ReturnCall {
@@ -1463,6 +1469,8 @@ impl Spec<'_> {
         };
 
         Ok(temen_ir::Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts: out,
             term,
@@ -3430,6 +3438,8 @@ fn trap_stub(f: &Func) -> Func {
         params: f.params.clone(),
         results: f.results.clone(),
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: f.params.clone(),
             insts: Vec::new(),
             term: Terminator::Unreachable,
@@ -3486,6 +3496,8 @@ fn carry_func(f: &Func, cut: &BTreeMap<u32, u32>) -> Result<Func, SpecError> {
             other => other.clone(),
         };
         blocks.push(temen_ir::Block {
+            parent: 0,
+            captures: vec![],
             params: b.params.clone(),
             insts,
             term,

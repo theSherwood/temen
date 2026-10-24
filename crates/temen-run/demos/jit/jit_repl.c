@@ -95,7 +95,7 @@ static long emit_unit(char *buf) {
   eb(buf, 'T'); eb(buf, 'E'); eb(buf, 'M'); eb(buf, 'E'); eb(buf, 'N');
   eb(buf, 0); eb(buf, 0); eb(buf, 0);
   eb(buf, 0); eb(buf, 0);                 // kind = module
-  eb(buf, (13) & 0xff); eb(buf, (13) >> 8); // version (u16)
+  eb(buf, (14) & 0xff); eb(buf, (14) >> 8); // version (u16)
   eb(buf, 0); eb(buf, 0); eb(buf, 0); eb(buf, 0); // flags
   // Memory descriptor: present, size_log2 17 — must match this module's window (the validator's
   // memory-match precondition), which chibicc keeps at the 64 KiB default for a small program.
@@ -117,9 +117,11 @@ static long emit_unit(char *buf) {
   eb(buf, 1);
   // One block whose params mirror the function's.
   eb(buf, 1);
+  eb(buf, 0); // its parent: none, it is the entry (v14)
   eb(buf, 2);
   eb(buf, 1);
   eb(buf, 1);
+  eb(buf, 0); // no captures (v14)
   // 3 instructions: mul, const 10, add.
   uleb(buf, 3);
   // v2 = i64.mul v0 v1   (a * b)

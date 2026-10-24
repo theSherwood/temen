@@ -83,6 +83,8 @@ fn redundant_pure_expression_is_deduped() {
         params: vec![ValType::I32, ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32, ValType::I32], // v0=a, v1=b
             insts: vec![add(0, 1), add(0, 1), add(2, 3)],
             term: Terminator::Return(vec![4]),
@@ -103,6 +105,8 @@ fn equal_expressions_from_equal_subexpressions_are_deduped() {
         params: vec![ValType::I32, ValType::I32],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32, ValType::I32], // v0=a, v1=b
             insts: vec![
                 add(0, 1), // v2 = a+b
@@ -133,6 +137,8 @@ fn loads_across_a_may_alias_store_are_not_merged() {
         params: vec![ValType::I32, ValType::I64], // v0 = value, v1 = store address (runtime)
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32, ValType::I64],
             insts: vec![
                 Inst::ConstI64(16384), // v2 = load address (const 16384, above the #1094 NULL guard)
