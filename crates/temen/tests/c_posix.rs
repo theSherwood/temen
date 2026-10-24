@@ -7274,35 +7274,55 @@ int main(void) {{\n\
     );
 }
 
-/// #1414 5b — a run whose only process stopped itself (`SIGSTOP`, 19) has nothing left that could
-/// continue it: no task can run, and none waits on what an embedder feeds. The pump's verdict is a
-/// deadlock (`ThreadFault`), and executor 2 now reaches the same one: its idle point counted the
-/// stopped process's runnable task as able to run, so it polled that task forever. The tree-walker
-/// still waits forever here (#2529).
-#[test]
-fn c_a_run_whose_only_process_stopped_itself_is_a_deadlock_on_both_executors() {
-    let src = "long __px_kill(int cap, long pid, long sig);\n\
-int main(void) {\n\
-  long r = __px_kill(0, 0, 19); /* raise SIGSTOP */\n\
-  return (int)(7 + r);\n\
-}\n";
-    let ir = c_to_ir(src);
-    let raw = parse_module_raw(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n{ir}"));
+/// The three executors a stopped-process test runs on.
+#[derive(Clone, Copy, Debug)]
+enum Executor {
+    TreeWalk,
+    Pump,
+    Parallel,
+}
+
+/// What the embedder does while a stopped-process test runs: it gets the personality and a flag
+/// set once the run is over.
+type Embedder = fn(Posix, std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+/// Run `raw`'s `main` on `exec` over the personality, and return how the run ended. `arm` arms the
+/// run's external-wake bell (as a terminal grant does), saying its embedder may act on it from
+/// outside; `embedder`, if given, runs on a thread of its own until the run is over.
+fn run_stopping(
+    raw: &temen_ir::Module,
+    exec: Executor,
+    arm: bool,
+    embedder: Option<Embedder>,
+) -> Result<Vec<Value>, Trap> {
+    use std::sync::atomic::{AtomicBool, Ordering};
     let win = 1u64
         << raw
             .memory
             .expect("the frontend declares a window")
             .size_log2;
-    verify_module(&raw).unwrap_or_else(|e| panic!("verify failed: {e:?}\n{ir}"));
-    for parallel in [false, true] {
-        let raw = raw.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut ih = Host::new();
-            let (_posix, px) = setup(&mut ih, win);
-            bind_shim(&raw, &mut ih, px);
-            let mut fuel = 200_000_000u64;
-            let r = if parallel {
+    let raw = raw.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut ih = Host::new();
+        let (posix, px) = setup(&mut ih, win);
+        bind_shim(&raw, &mut ih, px);
+        if arm {
+            ih.arm_external_wake();
+        }
+        let over = std::sync::Arc::new(AtomicBool::new(false));
+        let embedder = embedder.map(|e| {
+            let (posix, over) = (posix.clone(), std::sync::Arc::clone(&over));
+            std::thread::spawn(move || e(posix, over))
+        });
+        let mut fuel = 200_000_000u64;
+        let r = match exec {
+            Executor::TreeWalk => run_with_host(&raw, 0, &[], &mut fuel, &mut ih),
+            Executor::Pump => {
+                temen_interp::bytecode::compile_and_run_with_host(&raw, 0, &[], &mut fuel, &mut ih)
+                    .expect("the bytecode engine compiles this module")
+            }
+            Executor::Parallel => {
                 temen_interp::bytecode::compile_and_run_capture_over_parallel_with_host(
                     &raw,
                     0,
@@ -7312,16 +7332,75 @@ int main(void) {\n\
                     None,
                     &mut ih,
                 )
-                .map(|(r, _)| r)
-            } else {
-                temen_interp::bytecode::compile_and_run_with_host(&raw, 0, &[], &mut fuel, &mut ih)
-            };
-            let _ = tx.send(r.expect("the bytecode engine compiles this module"));
-        });
-        let r = rx
-            .recv_timeout(std::time::Duration::from_secs(60))
-            .unwrap_or_else(|_| panic!("parallel {parallel}: the stopped run never ended"));
-        assert_eq!(r, Err(Trap::ThreadFault), "parallel {parallel}");
+                .expect("the bytecode engine compiles this module")
+                .0
+            }
+        };
+        over.store(true, Ordering::Relaxed);
+        if let Some(e) = embedder {
+            e.join().unwrap();
+        }
+        drop(posix);
+        let _ = tx.send(r);
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(60))
+        .unwrap_or_else(|_| panic!("{exec:?}: the stopped run never ended"))
+}
+
+/// `main` stops its own process (`SIGSTOP`, 19) and, once continued, returns `7 + r`: `7`.
+const SELF_STOP_SRC: &str = "long __px_kill(int cap, long pid, long sig);\n\
+int main(void) {\n\
+  long r = __px_kill(0, 0, 19); /* raise SIGSTOP */\n\
+  return (int)(7 + r);\n\
+}\n";
+
+fn self_stop() -> temen_ir::Module {
+    let ir = c_to_ir(SELF_STOP_SRC);
+    let raw = parse_module_raw(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n{ir}"));
+    verify_module(&raw).unwrap_or_else(|e| panic!("verify failed: {e:?}\n{ir}"));
+    raw
+}
+
+/// #1414 5b, #2529 — a run whose only process stopped itself (`SIGSTOP`, 19) has nothing left that
+/// could continue it: no task can run, none waits on what an embedder feeds, and its embedder has
+/// not said it may act from outside. Every executor's verdict is a deadlock (`ThreadFault`).
+/// Executor 2 used to count the stopped process's runnable task as able to run, and polled it
+/// forever; the tree-walker counted every stopped park as one the outside might continue, and
+/// waited forever (#2529).
+#[test]
+fn c_a_run_whose_only_process_stopped_itself_is_a_deadlock_on_every_executor() {
+    let raw = self_stop();
+    for exec in [Executor::TreeWalk, Executor::Pump, Executor::Parallel] {
+        assert_eq!(
+            run_stopping(&raw, exec, false, None),
+            Err(Trap::ThreadFault),
+            "{exec:?}"
+        );
+    }
+}
+
+/// #2529 — the other half of the rule: where the run's embedder may act on it from outside (its
+/// external-wake bell armed, as a terminal arms it), a process that stopped itself is a wait only
+/// the embedder can end, not a deadlock. The embedder's `SIGCONT` (`Posix::raise_signal`, 18) from
+/// another thread continues it, and `main` returns `7`, on every executor. On the bytecode
+/// executors the continue rings the bell the run waits on.
+#[test]
+fn c_a_stopped_process_its_embedder_continues_finishes_on_every_executor() {
+    let raw = self_stop();
+    for exec in [Executor::TreeWalk, Executor::Pump, Executor::Parallel] {
+        // A continue before the stop is a no-op, so the embedder keeps sending one until the run
+        // is over.
+        let cont: Embedder = |posix, over| {
+            while !over.load(std::sync::atomic::Ordering::Relaxed) {
+                posix.raise_signal(18);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        assert_eq!(
+            run_stopping(&raw, exec, true, Some(cont)),
+            Ok(vec![Value::I32(7)]),
+            "{exec:?}"
+        );
     }
 }
 

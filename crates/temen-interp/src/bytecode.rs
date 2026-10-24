@@ -10007,29 +10007,33 @@ fn call_awaited(t: &TaskSlot, fibers: &[FiberState], extra_envs: &[ChildEnv]) ->
 /// deadline is pending and no punted call is outstanding. Both executors reach it at their idle
 /// point ([`stalled`]).
 enum Stalled {
-    /// A task waits on what its embedder feeds from outside the run (a pipe, stdin), and the
-    /// embedder pumps the run, so it hears of it ([`CoopEvent::Idle`]).
+    /// A task waits on what only its embedder can end — input it feeds from outside the run (a
+    /// pipe, stdin), or the continue of a stopped process — and the embedder pumps the run, so it
+    /// hears of it ([`CoopEvent::Idle`]).
     Idle,
-    /// A task waits on what its embedder feeds, which rings the armed external-wake bell.
+    /// A task waits on what only its embedder can end, which rings the armed external-wake bell.
     Bell,
     /// Nothing can wake the run: a deadlock (`ThreadFault`).
     Deadlock,
 }
 
 /// The [`Stalled`] verdict on `tasks`, in a run its embedder pumps or not, with an external-wake
-/// bell armed or not.
-fn stalled(tasks: &[TaskSlot], embedder_pumps: bool, bell: bool) -> Stalled {
-    let fed = tasks.iter().any(|t| {
-        matches!(
-            t.state,
-            TaskState::BlockedPipeRead { .. }
-                | TaskState::BlockedPipeWrite { .. }
-                // #1146 (deeper) — a blocking stdin park is externally wakeable too (an embedder
-                // signal rings the bell): without it an all-parked stdin run would fault as a
-                // deadlock instead of blocking for the `^C`.
-                | TaskState::BlockedStdin
-        )
-    });
+/// bell armed or not. `stopped` says whether a runnable task's process is stopped: once nothing
+/// in the run can continue it, only a continue from outside moves it (#2529), as only the
+/// embedder can feed a read.
+fn stalled(tasks: &[TaskSlot], stopped: bool, embedder_pumps: bool, bell: bool) -> Stalled {
+    let fed = stopped
+        || tasks.iter().any(|t| {
+            matches!(
+                t.state,
+                TaskState::BlockedPipeRead { .. }
+                    | TaskState::BlockedPipeWrite { .. }
+                    // #1146 (deeper) — a blocking stdin park is externally wakeable too (an
+                    // embedder signal rings the bell): without it an all-parked stdin run would
+                    // fault as a deadlock instead of blocking for the `^C`.
+                    | TaskState::BlockedStdin
+            )
+        });
     match (fed, embedder_pumps, bell) {
         (true, true, _) => Stalled::Idle,
         (true, false, true) => Stalled::Bell,
@@ -12432,9 +12436,11 @@ struct CoopSched {
 /// poll, `reap_pending` re-admit, the `#1215` kill sweep). Two gaps this closes: (1) `set_kill` was
 /// never wired, so a default-action TERMINATE (`^C` of a job with no handler) set `term_sig` but
 /// woke nothing; (2) a fork twin's doors were never wired at all, so an embedder signal to a
-/// foreground/background *twin* (the shape of a real `cat`) could not ring the root bell. The
-/// tree-walker points these doors at `interrupt_interruptible_parks`/`wake_stopped`; the bytecode
-/// executors need only the ring.
+/// foreground/background *twin* (the shape of a real `cat`) could not ring the root bell. A stop
+/// door rings it too (#2529): a stopped process is a wait only the outside can end ([`stalled`]),
+/// so the continue that ends it must reach a run waiting on the bell. The tree-walker points these
+/// doors at `interrupt_interruptible_parks`/`wake_stopped`; the bytecode executors need only the
+/// ring.
 fn wire_run_bell(
     source: &std::sync::Arc<dyn super::SignalSource + Send + Sync>,
     bell: &std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
@@ -12452,6 +12458,8 @@ fn wire_run_bell(
     source.set_wake(ring(bell));
     source.set_kill(ring(bell));
     source.set_chld_wake(ring(bell));
+    let stop = ring(bell);
+    source.set_stop(std::sync::Arc::new(move |_| stop()));
     let bell_pw = std::sync::Arc::clone(bell);
     source.set_pipe_wake(std::sync::Arc::new(move |_pipe| {
         let (gen, cv) = &*bell_pw;
@@ -12786,10 +12794,11 @@ impl SchedCore {
         // #1122/#1146/#1262 — an armed external-wake doorbell: wire the root's personality doors to
         // ring it (pipe-wake for a `feed_terminal` byte arrival; `set_wake` for an EINTR-bearing
         // deliverable signal; `set_chld_wake` for a child stop/continue re-scan; `set_kill` for a
-        // default-action TERMINATE), the cooperative twin of the tree-walker's scheduler doors. An
-        // embedder (another OS thread, or another wasm-thread instantiation) is the source; each
-        // ring re-runs the settle, which does the work (pipe poll, `reap_pending`, the #1215 kill
-        // sweep), so a ring only says "something changed". See [`wire_run_bell`].
+        // default-action TERMINATE; `set_stop` for its own stop or continue, #2529), the
+        // cooperative twin of the tree-walker's scheduler doors. An embedder (another OS thread,
+        // or another wasm-thread instantiation) is the source; each ring re-runs the settle, which
+        // does the work (pipe poll, `reap_pending`, the #1215 kill sweep), so a ring only says
+        // "something changed". See [`wire_run_bell`].
         if let Some(bell) = host.external_wake() {
             if let Some((_, source)) = host.signal_poll() {
                 wire_run_bell(&source, &bell);
@@ -13148,7 +13157,12 @@ impl CoopSched {
                     // signal) instead of sleeping this thread on the bell.
                     let bell = root.lock_unpoisoned().external_wake();
                     if calls.is_empty() {
-                        match stalled(tasks, *embedder_pumps, bell.is_some()) {
+                        let stopped = !see_through
+                            && tasks.iter().any(|t| {
+                                matches!(t.state, TaskState::Runnable)
+                                    && process_stopped(root, extra_envs, t)
+                            });
+                        match stalled(tasks, stopped, *embedder_pumps, bell.is_some()) {
                             Stalled::Idle => return Ok(CoopStep::Idle { timer: None }),
                             Stalled::Deadlock => return Err(Trap::ThreadFault),
                             Stalled::Bell => {}
@@ -17044,7 +17058,10 @@ impl ThreadRun {
             Some(res.clone())
         } else if self.idle(core) {
             let bell = self.root.lock_unpoisoned().external_wake().is_some();
-            match stalled(&core.tasks, g.embedder_pumps, bell) {
+            let stopped = (0..core.tasks.len()).any(|j| {
+                matches!(core.tasks[j].state, TaskState::Runnable) && self.stopped(core, j)
+            });
+            match stalled(&core.tasks, stopped, g.embedder_pumps, bell) {
                 Stalled::Deadlock => Some(Err(Trap::ThreadFault)),
                 Stalled::Idle => {
                     stalled_now = true;

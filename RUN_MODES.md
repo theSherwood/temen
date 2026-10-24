@@ -15,7 +15,7 @@ Every cell comes from **runs**: each feature's probe on each configuration that 
 
 On each executor a cell uses the runner that adds its properties and the fewest others. A cell is ✅ when every run gives the oracle's answer, 🚧 when any run is a known gap, ⛔ when every run declines by design, 🔶 for any other mix, and ❔ when no runner covers it. Each pair of properties appears once, in the earlier property's row.
 
-**79 of 192 cells audited.** Every 🚧 cell cites the issue tracking its gap.
+**85 of 192 cells audited.** Every 🚧 cell cites the issue tracking its gap.
 
 ## Legend
 
@@ -49,7 +49,7 @@ On each executor a cell uses the runner that adds its properties and the fewest 
 - **makes a call the embedder answers** — makes capability calls the embedder answers later, from outside the run (OffloadOutcome::Host)
 - **makes a call a pool thread answers** — makes capability calls a runtime pool thread answers (OffloadOutcome::Offload)
 - **reads input that arrives later** — reads stdin before its input has arrived, and gets it when the embedder supplies it
-- **is stopped and continued (job control)** — is stopped by job control and continued later
+- **is stopped and continued (job control)** — stops its own process, and its embedder continues it. A run the embedder holds waits for it. A run nobody holds faults when its embedder may not act from outside (its external-wake bell unarmed), and waits for the continue when it may (#2529)
 - **grows its window** — maps pages past its declared window through its AddressSpace and uses them
 - **maps a shared region (§13)** — maps a §13 shared region at two offsets and sees a store through one in the other
 - **compiles code at runtime (§22)** — compiles a §22 unit, installs it and calls it through call.dyn, and invokes it
@@ -80,7 +80,7 @@ The property rows are the columns' properties again.
 | makes a call the embedder answers | ✅ | ✅ | ✅ | ✅ | 🚧 | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
 | makes a call a pool thread answers | ✅ | ✅ | ✅ | ✅ | ✅ | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
 | reads input that arrives later | ✅ | ✅ | ✅ | ✅ | ✅ | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
-| is stopped and continued (job control) | ❔ | ❔ | ❔ | ❔ | ❔ | ❔ | ❔ | ❔ | ❔ | ❔ | ❔ |
+| is stopped and continued (job control) | ✅ | ✅ | ✅ | 🚧 | 🚧 | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
 | grows its window | ✅ | ✅ | ✅ | ✅ | ✅ | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
 | maps a shared region (§13) | ✅ | ✅ | ✅ | 🔶 | ✅ | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
 | compiles code at runtime (§22) | ✅ | ✅ | ✅ | ✅ | 🚧 | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
@@ -123,6 +123,11 @@ The property rows are the columns' properties again.
 **makes a call the embedder answers**
 - *under a debugger* 🚧 — tree-walk interpreter: the tree-walk Inspector traps CapFault on a host-answered call (#2560)
 
+**is stopped and continued (job control)**
+- *Cranelift JIT* 🚧 — serves no job control, so a stopped process runs on (#1826)
+- *under a debugger* 🚧 — tree-walk interpreter: the tree-walk Inspector runs a stopped process on (#2560)
+- *under a debugger* 🚧 — bytecode, one thread: the bytecode debug scheduler runs a stopped process on: its pick never asks whether the process is stopped (#2615)
+
 **maps a shared region (§13)**
 - *Cranelift JIT* 🔶 — for a region over an OS shared-memory object (temen_run::new_shared_region), which the JIT maps by its descriptor; a software-only one (Host::grant_shared_region) has none, so its map answers -EINVAL there
 
@@ -134,10 +139,13 @@ The property rows are the columns' properties again.
 - *tree-walk interpreter* 🚧 — forks itself (clone_caller): the tree-walk Inspector blocks on a fork (#2560)
 - *tree-walk interpreter* 🚧 — execs another image (exec_module): the tree-walk Inspector traps FiberFault on an exec (#2560)
 - *tree-walk interpreter* 🚧 — makes a call the embedder answers: the tree-walk Inspector traps CapFault on a host-answered call (#2560)
+- *tree-walk interpreter* 🚧 — is stopped and continued (job control): the tree-walk Inspector runs a stopped process on (#2560)
 - *tree-walk interpreter* 🚧 — compiles code at runtime (§22): the tree-walk Inspector traps IndirectCallType at the installed unit's call.dyn (#2560)
 - *bytecode, one thread* 🚧 — forks itself (clone_caller); execs another image (exec_module): the bytecode debug scheduler declines every process seam: fork, exec, spawn, wait and pipes (#2554)
+- *bytecode, one thread* 🚧 — is stopped and continued (job control): the bytecode debug scheduler runs a stopped process on: its pick never asks whether the process is stopped (#2615)
 - *bytecode, thread per task* ⛔ — the debug scheduler owns the schedule, every task on one thread, which is what makes a replay see the same interleaving (DEBUGGING.md); executor 2 runs its tasks at once
 - *Cranelift JIT* ⛔ — the interpreter is the debug engine and the JIT the production engine, differential-checked against it (DEBUGGING.md)
 - *held by the embedder* 🚧 — tree-walk interpreter: the tree-walk Inspector hands its embedder no call to answer and no read to feed (#2560)
 - *held by the embedder* 🚧 — forks itself (clone_caller) on bytecode, one thread; execs another image (exec_module) on bytecode, one thread: the bytecode debug scheduler declines every process seam: fork, exec, spawn, wait and pipes (#2554)
+- *held by the embedder* 🚧 — is stopped and continued (job control) on bytecode, one thread: the bytecode debug scheduler runs a stopped process on: its pick never asks whether the process is stopped (#2615)
 

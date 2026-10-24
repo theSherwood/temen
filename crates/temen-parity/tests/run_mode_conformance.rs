@@ -11,10 +11,17 @@
 //! powerbox it needs, and the answer the oracle gives. A **runner** is one configuration of the
 //! manifest, run the way its embedder runs it: the four executors one-shot, the DAP's two debug
 //! engines (the tree-walk `Inspector` and the bytecode debug scheduler), and `CoopRun` on the pump
-//! and on executor 2. A probe that reads input it is fed later gets it as its runner's embedder
-//! gives it. A run the embedder holds hands control back when it waits on the input, and is fed and
-//! resumed. Any other run pulls it from a stdin source, which blocks until a thread supplies it, as
-//! the CLI's interactive mode does.
+//! and on executor 2.
+//!
+//! A probe's embedder may have to act from outside the run ([`Outside`]), and each runner acts as
+//! its embedder would. A run the embedder holds hands control back when it can only wait on the
+//! embedder, and is fed or continued, and resumed. Any other run pulls its input from a stdin
+//! source, which blocks until a thread supplies it, as the CLI's interactive mode does. A process
+//! that stops itself in a run nobody holds is run twice (#2529). With nothing to continue it, the
+//! run must fault `ThreadFault`. With its bell armed, saying the embedder may act from outside, it
+//! must wait for the continue a thread sends once it has asked to stop, and give the oracle's
+//! answer. The first run is what tells an engine that ignores the stop apart, and with no race:
+//! that engine never faults.
 //!
 //! A run is held to its exception:
 //!
@@ -36,11 +43,11 @@ mod probes;
 mod rec;
 mod support;
 
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use drivers::{run_on, Driver, Pumped};
-use probes::{module, probes, Probe};
+use probes::{module, probes, Embedder, Outside, Probe, Stopper};
 use support::cites_an_issue;
 use temen_interp::bytecode::{
     module_spawns_threads, CoopEvent, CoopRun, SchedStop, ScheduledDebugRun,
@@ -72,6 +79,31 @@ enum Verdict {
     /// Anything else: a different answer, a trap the oracle did not take, a stop it could not
     /// move on from.
     Other(String),
+}
+
+/// How one run ended, whatever engine ran it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum End {
+    /// The entry returned this.
+    Value(i64),
+    /// The run trapped, as its engine names the trap.
+    Trap(String),
+    /// The runner declined the module.
+    Declined,
+    /// Anything else: an answer of another shape, a stop the runner could not move on from.
+    Stuck(String),
+}
+
+impl End {
+    fn of(r: Result<Vec<Value>, Trap>) -> End {
+        match r {
+            Ok(v) => match v[..] {
+                [Value::I64(x)] => End::Value(x),
+                _ => End::Stuck(format!("returned {v:?}")),
+            },
+            Err(t) => End::Trap(format!("{t:?}")),
+        }
+    }
 }
 
 /// How the harness runs a configuration.
@@ -117,10 +149,11 @@ fn bounded<T: Send + 'static>(what: String, f: impl FnOnce() -> T + Send + 'stat
         .unwrap_or_else(|_| panic!("{what}: no end within {BOUND:?}"))
 }
 
-/// The verdict on a run that ended `r`, held to `want`.
-fn judge(r: Result<Vec<Value>, Trap>, want: i64) -> Verdict {
-    match r {
-        Ok(v) if v == vec![Value::I64(want)] => Verdict::Matched,
+/// The verdict on a run that ended `end`, held to the oracle's answer `want`.
+fn judge(end: End, want: i64) -> Verdict {
+    match end {
+        End::Value(x) if x == want => Verdict::Matched,
+        End::Declined => Verdict::Declined,
         other => Verdict::Other(format!("{other:?}")),
     }
 }
@@ -128,32 +161,65 @@ fn judge(r: Result<Vec<Value>, Trap>, want: i64) -> Verdict {
 /// Run `probe` on configuration `c`.
 fn run(c: Config, probe: &Probe) -> Verdict {
     let way = way(c).expect("every runner of the manifest has a way to run it");
-    let (src, setup, feed, want) = (probe.src, probe.setup, probe.feed, probe.want);
+    let probe = *probe;
     bounded(format!("{:?} on {}", probe.feature, c.label()), move || {
-        let m = module(&src());
-        // A run nobody holds pulls its input from a source (`feed_later`); a held run is fed when
-        // it hands control back waiting on it.
-        let unheld = || {
-            let (mut host, args) = setup(&m);
-            if let Some(bytes) = feed {
-                feed_later(&mut host, bytes);
+        let m = module(&(probe.src)());
+        let unheld = matches!(way, Way::OneShot(_) | Way::Inspector);
+        if probe.outside != Outside::Continue || !unheld {
+            return judge(once(way, &m, &probe, false), probe.want);
+        }
+        // A stop nobody can continue is a deadlock; one the embedder may continue from outside is
+        // a wait (#2529).
+        let alone = once(way, &m, &probe, false);
+        let continued = once(way, &m, &probe, true);
+        match (&alone, &continued) {
+            (End::Trap(t), End::Value(x)) if t == "ThreadFault" && *x == probe.want => {
+                Verdict::Matched
             }
-            (host, args)
-        };
-        let one_shot = |d| match run_on(d, &m, &unheld) {
-            Some(ran) => judge(ran.result, want),
-            None => Verdict::Declined,
-        };
-        match way {
-            Way::OneShot(Executor::TreeWalk) => one_shot(Driver::Oracle),
-            Way::OneShot(Executor::Pump) => one_shot(Driver::Coop),
-            Way::OneShot(Executor::Parallel) => one_shot(Driver::Parallel),
-            Way::OneShot(Executor::Cranelift) => on_cranelift(&m, unheld(), want),
-            Way::Inspector => inspected(&m, unheld(), want),
-            Way::DebugScheduler => debugged(&m, setup(&m), feed, want),
-            Way::Held(exec) => held(exec, &m, setup(&m), feed, want),
+            (End::Declined, End::Declined) => Verdict::Declined,
+            _ => Verdict::Other(format!(
+                "with nothing to continue it {alone:?}; continued from outside {continued:?}"
+            )),
         }
     })
+}
+
+/// Run `probe` once on `way`, over a fresh embedder. `armed` arms the run's external-wake bell,
+/// saying its embedder may act on it from outside, and has a thread continue the process once it
+/// asks to stop.
+fn once(way: Way, m: &Module, probe: &Probe, armed: bool) -> End {
+    let e = Embedder::default();
+    // A run nobody holds gets what its embedder gives it from outside from a thread of its own.
+    let unheld = || {
+        let (mut host, args) = (probe.setup)(m, &e);
+        if let Outside::Feed(bytes) = probe.outside {
+            feed_later(&mut host, bytes);
+        }
+        if armed {
+            host.arm_external_wake();
+            let s = Arc::clone(&e.stopper);
+            std::thread::spawn(move || {
+                s.await_stop();
+                if s.is_stopped() {
+                    s.set(false);
+                }
+            });
+        }
+        (host, args)
+    };
+    let one_shot = |d| run_on(d, m, &unheld).map_or(End::Declined, |ran| End::of(ran.result));
+    let end = match way {
+        Way::OneShot(Executor::TreeWalk) => one_shot(Driver::Oracle),
+        Way::OneShot(Executor::Pump) => one_shot(Driver::Coop),
+        Way::OneShot(Executor::Parallel) => one_shot(Driver::Parallel),
+        Way::OneShot(Executor::Cranelift) => on_cranelift(m, unheld()),
+        Way::Inspector => inspected(m, unheld()),
+        Way::DebugScheduler => debugged(m, (probe.setup)(m, &e), probe.outside, &e.stopper),
+        Way::Held(exec) => held(exec, m, (probe.setup)(m, &e), probe.outside, &e.stopper),
+    };
+    // The run is over: a continue thread still waiting has nothing to continue.
+    e.stopper.close();
+    end
 }
 
 /// Give `host` a stdin source that blocks until a thread supplies `bytes`, which it does only once
@@ -178,7 +244,7 @@ fn feed_later(host: &mut Host, bytes: &'static [u8]) {
 /// powerbox's `Jit` grant reserved (`temen_run::grant_jit` asks the compile for the same size).
 /// The JIT refuses a module outside its subset with `Unsupported`; any other error is an answer
 /// the oracle did not give.
-fn on_cranelift(m: &Module, (mut host, args): (Host, Vec<Value>), want: i64) -> Verdict {
+fn on_cranelift(m: &Module, (mut host, args): (Host, Vec<Value>)) -> End {
     let args: Vec<i64> = args
         .iter()
         .map(|v| match v {
@@ -192,10 +258,14 @@ fn on_cranelift(m: &Module, (mut host, args): (Host, Vec<Value>), want: i64) -> 
     let reserved = temen_ir::default_reserved_log2();
     let table = host.jit_table_log2();
     match temen_run::jit_cap_run(m, 0, &args, &window, reserved, table, &mut host, None) {
-        Ok((temen_jit::JitOutcome::Returned(v), _)) if v == vec![want] => Verdict::Matched,
-        Ok((other, _)) => Verdict::Other(format!("{other:?}")),
-        Err(temen_jit::JitError::Unsupported(_)) => Verdict::Declined,
-        Err(e) => Verdict::Other(format!("{e:?}")),
+        Ok((temen_jit::JitOutcome::Returned(v), _)) => match v[..] {
+            [x] => End::Value(x),
+            _ => End::Stuck(format!("returned {v:?}")),
+        },
+        Ok((temen_jit::JitOutcome::Trapped(t), _)) => End::Trap(format!("{t:?}")),
+        Ok((other, _)) => End::Stuck(format!("{other:?}")),
+        Err(temen_jit::JitError::Unsupported(_)) => End::Declined,
+        Err(e) => End::Stuck(format!("{e:?}")),
     }
 }
 
@@ -203,7 +273,7 @@ fn on_cranelift(m: &Module, (mut host, args): (Host, Vec<Value>), want: i64) -> 
 /// DAP debugs a threaded program, when `m` spawns threads, else on one vCPU over the probe's
 /// powerbox. The scheduled `Inspector` builds its own empty powerbox, so a threaded probe's handles
 /// name nothing there.
-fn inspected(m: &Module, (host, args): (Host, Vec<Value>), want: i64) -> Verdict {
+fn inspected(m: &Module, (host, args): (Host, Vec<Value>)) -> End {
     let mut insp = if module_spawns_threads(m) {
         Inspector::attach_scheduled(m, 0, &args, FUEL, Vec::new())
     } else {
@@ -211,54 +281,63 @@ fn inspected(m: &Module, (host, args): (Host, Vec<Value>), want: i64) -> Verdict
     };
     loop {
         match insp.run_until_stop() {
-            Stop::Finished(r) => return judge(r, want),
+            Stop::Finished(r) => return End::of(r),
             Stop::Break { .. } => {}
-            Stop::Blocked => return Verdict::Other("Blocked".into()),
+            Stop::Blocked => return End::Stuck("Blocked".into()),
         }
     }
 }
 
 /// Run `m` under the debug scheduler to its end, as the DAP's bytecode engine does. A stop that
-/// waits on the embedder is moved on: a read the probe feeds gets its bytes, and any other idle
-/// waits on a host-answered call the probe answers itself, so it is looked at again shortly. The
-/// run says whether it waits on a read (`stdin_parked`), which only the run changes; whether a call
-/// is still owed can change between the stop and the question.
+/// waits on the embedder is moved on: a stopped process is continued, a read the probe feeds gets
+/// its bytes, and any other idle waits on a host-answered call the probe answers itself, so it is
+/// looked at again shortly. The run says whether it waits on a read (`stdin_parked`), which only the
+/// run changes; whether a call is still owed can change between the stop and the question.
 fn debugged(
     m: &Module,
     (mut host, args): (Host, Vec<Value>),
-    feed: Option<&'static [u8]>,
-    want: i64,
-) -> Verdict {
+    outside: Outside,
+    stopper: &Stopper,
+) -> End {
+    let mut feed = match outside {
+        Outside::Feed(bytes) => Some(bytes),
+        Outside::Nothing | Outside::Continue => None,
+    };
     host.set_stdin_blocking(feed.is_some());
     let Some(mut d) = ScheduledDebugRun::new_with_host(m, 0, &args, host) else {
-        return Verdict::Declined;
+        return End::Declined;
     };
     let mut fuel = FUEL;
-    let mut feed = feed;
     loop {
         match d.run_until_stop(&mut fuel) {
-            SchedStop::Finished(r) => return judge(r, want),
-            SchedStop::Declined => return Verdict::Declined,
+            SchedStop::Finished(r) => return End::of(r),
+            SchedStop::Declined => return End::Declined,
             SchedStop::Break { .. } | SchedStop::CapPark { .. } => {}
+            SchedStop::Idle { .. } if stopper.is_stopped() => stopper.set(false),
             SchedStop::Idle { .. } if !d.stdin_parked() => std::thread::sleep(ANSWER_POLL),
             SchedStop::Idle { .. } if feed.is_some() => {
                 d.provide_stdin(feed.take().unwrap_or_default())
             }
-            other => return Verdict::Other(format!("{other:?}")),
+            other => return End::Stuck(format!("{other:?}")),
         }
     }
 }
 
-/// Hold `m` as a `CoopRun` on `exec` and resume it to its end. A run idle on what the embedder
-/// feeds gets the probe's bytes once; idle otherwise, it waits on an answer the probe gives itself,
-/// and is resumed shortly, the time it waited passed.
+/// Hold `m` as a `CoopRun` on `exec` and resume it to its end. A run idle on a stopped process gets
+/// it continued, and one idle on what the embedder feeds gets the probe's bytes once; idle
+/// otherwise, it waits on an answer the probe gives itself, and is resumed shortly, the time it
+/// waited passed.
 fn held(
     exec: Pumped,
     m: &Module,
     (mut host, args): (Host, Vec<Value>),
-    feed: Option<&'static [u8]>,
-    want: i64,
-) -> Verdict {
+    outside: Outside,
+    stopper: &Stopper,
+) -> End {
+    let mut feed = match outside {
+        Outside::Feed(bytes) => Some(bytes),
+        Outside::Nothing | Outside::Continue => None,
+    };
     host.set_stdin_blocking(feed.is_some());
     let reserved = temen_ir::default_reserved_log2();
     let run = match exec {
@@ -268,16 +347,16 @@ fn held(
         }
     };
     let mut run = match run {
-        None => return Verdict::Declined,
-        Some(Err(t)) => return Verdict::Other(format!("{t:?} at the start")),
+        None => return End::Declined,
+        Some(Err(t)) => return End::Stuck(format!("{t:?} at the start")),
         Some(Ok(run)) => run,
     };
-    let mut feed = feed;
     loop {
         match run.run() {
-            CoopEvent::Done(v) => return judge(Ok(v), want),
-            CoopEvent::Trapped(t) => return judge(Err(t), want),
+            CoopEvent::Done(v) => return End::of(Ok(v)),
+            CoopEvent::Trapped(t) => return End::of(Err(t)),
             CoopEvent::CapPark { .. } | CoopEvent::Paused => {}
+            CoopEvent::Idle { .. } if stopper.is_stopped() => stopper.set(false),
             CoopEvent::Idle { .. } => match feed.take() {
                 Some(bytes) => run.host_mut().push_stdin(bytes),
                 None => {
@@ -286,7 +365,7 @@ fn held(
                     run.pass_time(ANSWER_POLL.as_nanos() as u64);
                 }
             },
-            _ => return Verdict::Other("a round-trip only the browser's tier makes".into()),
+            _ => return End::Stuck("a round-trip only the browser's tier makes".into()),
         }
     }
 }
@@ -468,8 +547,8 @@ fn audited_coverage_does_not_regress() {
         .filter(|c| c.status != Status::Unaudited)
         .count();
     assert!(
-        audited >= 79,
-        "audited cell count fell to {audited}; it was 79 when cells came to be folded from runs \
-         (#2545)"
+        audited >= 85,
+        "audited cell count fell to {audited}; it was 85 when the job-control row got its probe \
+         (#2529)"
     );
 }

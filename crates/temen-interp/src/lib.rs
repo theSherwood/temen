@@ -3402,6 +3402,7 @@ fn drive_over_cell(
                        // trap/exit anywhere in the shared-powerbox domain ends the whole run, not
                        // just the trapping vCPU (the batch activation's owner is gone).
         s.root_domain = host_shared.lock_unpoisoned().domain_id() as usize;
+        s.outside_wakes = host_shared.lock_unpoisoned().external_wake().is_some();
         // §13.4 slice 4c-bis: read the freeze-on-quiesce arm from the seeded window once. Only a
         // durable run has the control words; any other keeps its own data there (#1851).
         let armed = durable
@@ -6716,6 +6717,10 @@ struct Sched {
     /// a vCPU observes its domain's stop flag; drained wholesale by [`Scheduler::wake_stopped`]
     /// (the personality's SIGCONT). Swept like every waiter map at teardown.
     stopped: BTreeMap<usize, VecDeque<Box<VCpu>>>,
+    /// #2529 — whether the run's embedder may act on it from outside: its #1122 external-wake bell
+    /// is armed ([`Host::arm_external_wake`]). Only then is a stopped process that nothing in the
+    /// run can continue a wait rather than a deadlock, as on the bytecode executors.
+    outside_wakes: bool,
     /// #799 — vCPUs benched by a personality park request on a child's exit
     /// ([`Blocked::ReapWait`]), keyed by the awaited child task. A `Vec` (not one-per-key like
     /// `join_waiters` — deliberately a separate map so the offer path's single-waiter slot is
@@ -8677,17 +8682,21 @@ fn park_gate(s: &mut Sched, v: Box<VCpu>) -> Option<Box<VCpu>> {
 ///   or a `feed_terminal` can satisfy — a pipe read/write (`pipe_waiters` / `pipe_write_waiters`),
 ///   a blocking stream read (`cap_waiters` — the interactive stdin `^C`), a blocking `waitpid`
 ///   (`posix_reap_waiters` / `reap_any_waiters`, and a `wait(pid)` filed in `join_waiters` under
-///   [`Pending::ReapPid`]); a job-control stop awaiting `SIGCONT` (`stopped`); and a punted
-///   dispatch a pool worker will post (`completion_waiters`). This is the executor's own copy of
-///   the set [`Scheduler::interrupt_interruptible_parks`] drains, plus the always-external pool
-///   and stop channels. Everything left — a `thread.join`, `svc.wait` (incl. an
+///   [`Pending::ReapPid`]); a job-control stop awaiting `SIGCONT` (`stopped`), where the run's
+///   embedder may act from outside it (#2529: its external-wake bell is armed, `outside_wakes`),
+///   since with nothing in the run left to continue it only the embedder can, as on the bytecode
+///   executors; and a punted dispatch a pool worker will post (`completion_waiters`). This is the
+///   executor's own copy of the set [`Scheduler::interrupt_interruptible_parks`] drains, plus the
+///   always-external pool channel and the stop channel. Everything left — a `thread.join`,
+///   `svc.wait` (incl. an
 ///   `OfferPark`/`cont.resume.block` resumer), a cap reply, an offer admission — is woken only by
 ///   another vCPU of the run, so with nothing runnable it can never make progress.
 ///
 /// This is the executor's counterpart of the cooperative driver's `external` check (a pipe park
 /// behind an armed doorbell): the same "is any outside wake possible?" test, over the executor's
 /// own waiter maps. Reactor resting states are preserved wholesale — an interactive terminal rests
-/// with its input reader parked (`pipe_waiters` / `cap_waiters`), a stopped job with `stopped`, and
+/// with its input reader parked (`pipe_waiters` / `cap_waiters`), a stopped job with `stopped`
+/// (its terminal arms the bell), and
 /// a durable freeze-on-quiesce run fires its freeze (re-admitting the parked consumers) before the
 /// worker ever reaches here. The `svc.wait`-parked daemon whose clients are gone (#1217) — a
 /// `loop { svc.wait }` server a *batch* root then `join`s — is the motivating shape: the
@@ -8701,7 +8710,9 @@ fn run_deadlocked(s: &Sched) -> bool {
         && s.pipe_write_waiters.is_empty()
         && s.cap_waiters.is_empty()
         && s.completion_waiters.is_empty()
-        && s.stopped.is_empty()
+        // #2529 — a stopped process is a wait only the outside can end: one the run's embedder
+        // can continue if it may act from outside, a deadlock if not.
+        && (s.stopped.is_empty() || !s.outside_wakes)
         && s.posix_reap_waiters.is_empty()
         && s.reap_any_waiters.is_empty()
         // A `wait(pid)` (POSIX) rides `join_waiters` under `Pending::ReapPid` and is interruptible;
