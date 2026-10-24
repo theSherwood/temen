@@ -17,8 +17,8 @@ use temen_interp::{PreparedModule, Trap};
 use temen_ir::Module;
 
 use crate::{
-    blob_entries, posix_host_build, prepare, stash, PosixRun, LAST_STATUS, STATUS_DECODE_ERR,
-    STATUS_EXIT, STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
+    blob_entries, posix_host_build, stash, PosixRun, LAST_STATUS, STATUS_DECODE_ERR, STATUS_EXIT,
+    STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
 };
 
 /// What a build left: how the driver ended, what it printed, what the run held at its end, and the
@@ -142,9 +142,10 @@ pub fn nim_build(
     };
     let commands: Vec<(PreparedModule, Vec<&str>)> = commands
         .iter()
-        .map(|(m, paths)| (prepare(m), paths.clone()))
+        .map(|(m, paths)| (prepare_tool((*m).clone()), paths.clone()))
         .collect();
-    let (mut run, posix) = nim_open(&prepare(driver), &commands, dir, files, argv, cwd, leaf)?;
+    let driver = prepare_tool(driver.clone());
+    let (mut run, posix) = nim_open(&driver, &commands, dir, files, argv, cwd, leaf)?;
     let (mut ran, mut resumes) = (0, 0);
     let end = loop {
         match run.run_clockless() {
@@ -298,6 +299,16 @@ struct Toolchain {
     dir: Option<temen_posix::Posix>,
 }
 
+/// A toolchain module as both tiers run it: its host calls and scheduler ops outlined into one-op
+/// wrappers ([`temen_wasm_jit::outline_cap_calls`]). A function whose only op outside the emitter's
+/// subset is such a call (a `call.import` of the POSIX layer, nim's futex wait) then emits, and only
+/// the wrapper runs on the interpreter when the leaf bounces (#2608). The interpreter runs the same
+/// module, so the two tiers agree on every function index.
+fn prepare_tool(mut m: Module) -> PreparedModule {
+    temen_wasm_jit::outline_cap_calls(&mut m);
+    PreparedModule::new(m)
+}
+
 /// The toolchain [`temen_nim_toolchain`] made current ([`toolchain`]).
 static mut TOOLCHAIN: Option<Toolchain> = None;
 
@@ -333,7 +344,7 @@ fn toolchain_in<'s>(
         let commands: Vec<(Vec<String>, PreparedModule)> = entries
             .iter()
             .map(|(paths, b)| {
-                let m = PreparedModule::new(decode(b)?);
+                let m = prepare_tool(decode(b)?);
                 Ok((paths.lines().map(String::from).collect(), m))
             })
             .collect::<Result<_, i32>>()?;
@@ -341,7 +352,7 @@ fn toolchain_in<'s>(
         // and its execs of itself share one program.
         let prepared = match entries.iter().position(|(_, b)| *b == driver) {
             Some(i) => commands[i].1.clone(),
-            None => PreparedModule::new(decode(driver)?),
+            None => prepare_tool(decode(driver)?),
         };
         *slot = Some(Toolchain {
             token: NEXT_TOKEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
@@ -594,6 +605,26 @@ mod toolchain_tests {
         assert_eq!(
             toolchain_in(&mut slot, b"not a module", &cmds).err(),
             Some(STATUS_DECODE_ERR)
+        );
+    }
+
+    /// #2608 — a tool function whose only op outside the emitter's subset is a `call.import` (a
+    /// POSIX call) is kept off the emitted tier as built. The toolchain outlines the call into a
+    /// one-op wrapper, so the function emits and only the wrapper runs interpreted.
+    #[test]
+    fn a_tool_function_that_calls_an_import_emits() {
+        let text = "import 0 \"__px_getpid\" () -> (i64)\nfunc () -> (i64) {\nblock 0 () {\n  \
+                    vr = call.import 0 ()\n  return vr\n  }\n}\n";
+        let built = temen_text::parse_module(text).expect("parse");
+        assert_eq!(temen_wasm_jit::analyze(&built).in_subset, [false]);
+        let tool = temen_encode::encode_module(&built);
+        let cmds = crate::registry_blob(&[("bin/tool\n/bin/tool", tool.as_slice())]);
+        let mut slot = None;
+        let tc = toolchain_in(&mut slot, &tool, &cmds).expect("decodes");
+        assert_eq!(
+            temen_wasm_jit::analyze(tc.commands[0].1.module()).in_subset,
+            [true, false],
+            "the function emits; its call's wrapper does not"
         );
     }
 }
