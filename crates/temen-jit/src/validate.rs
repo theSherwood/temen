@@ -38,11 +38,13 @@ pub(crate) fn disagreement_count() -> u64 {
     DISAGREEMENTS.load(Ordering::Relaxed)
 }
 
-/// Validate one emitted function's `bytes` against `bb_starts` (its basic-block start offsets, from
-/// `CompiledCode::bb_starts`). Shadow mode: every problem is logged and counted, never returned.
-pub(crate) fn shadow_check(bytes: &[u8], bb_starts: &[u32]) {
+/// Validate one emitted function's `bytes` against its basic-block hints from
+/// `CompiledCode`: `bb_starts` (block start offsets) and `bb_edges` (block-to-block control-flow
+/// edges, each `(from_start, to_start)`). Shadow mode: every problem is logged and counted, never
+/// returned.
+pub(crate) fn shadow_check(bytes: &[u8], bb_starts: &[u32], bb_edges: &[(u32, u32)]) {
     #[cfg(target_arch = "x86_64")]
-    for f in x86::check(bytes, bb_starts) {
+    for f in x86::check(bytes, bb_starts, bb_edges) {
         // Count every disagreement (a fuzz run asserts the total), but cap the logging so a bad
         // decode on every module can't swamp a fuzzer's stderr.
         let n = DISAGREEMENTS.fetch_add(1, Ordering::Relaxed);
@@ -51,7 +53,7 @@ pub(crate) fn shadow_check(bytes: &[u8], bb_starts: &[u32]) {
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = (bytes, bb_starts);
+    let _ = (bytes, bb_starts, bb_edges);
 }
 
 // --- test-only capture of real compiled code, cross-checked against iced-x86 ---
@@ -60,24 +62,24 @@ pub(crate) fn shadow_check(bytes: &[u8], bb_starts: &[u32]) {
 // caller in `lib.rs` is gated to match, so it is `all(test, target_arch = "x86_64")` — on another
 // target (the aarch64 clippy lane) it would be dead code under `-D warnings`.
 
-/// One captured function's machine code and its basic-block start offsets.
+/// One captured function's machine code and its basic-block hints (`bb_starts`, `bb_edges`).
 #[cfg(all(test, target_arch = "x86_64"))]
-type CapturedFn = (Vec<u8>, Vec<u32>);
+type CapturedFn = (Vec<u8>, Vec<u32>, Vec<(u32, u32)>);
 
 #[cfg(all(test, target_arch = "x86_64"))]
 thread_local! {
-    /// When armed, each function the compile defines appends its `(code, bb_starts)` here, so a test
-    /// can decode real Cranelift output and compare our decoder to iced-x86.
+    /// When armed, each function the compile defines appends its `(code, bb_starts, bb_edges)` here,
+    /// so a test can decode real Cranelift output and compare our decoder to iced-x86.
     static CAPTURE: std::cell::RefCell<Option<Vec<CapturedFn>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Record one defined function's code + block starts, if a test armed the capture.
+/// Record one defined function's code + block hints, if a test armed the capture.
 #[cfg(all(test, target_arch = "x86_64"))]
-pub(crate) fn capture_code(code: &[u8], bb_starts: &[u32]) {
+pub(crate) fn capture_code(code: &[u8], bb_starts: &[u32], bb_edges: &[(u32, u32)]) {
     CAPTURE.with(|c| {
         if let Some(v) = c.borrow_mut().as_mut() {
-            v.push((code.to_vec(), bb_starts.to_vec()));
+            v.push((code.to_vec(), bb_starts.to_vec(), bb_edges.to_vec()));
         }
     });
 }
@@ -107,80 +109,540 @@ pub(crate) mod x86 {
         pub why: String,
     }
 
-    /// Validate `bytes` against `bb_starts`, returning every finding (slice-1 policy). Pure, so tests
-    /// assert on the findings directly.
-    ///
-    /// Walk is **per basic block**: from each `bb_start`, decode forward until the block's
-    /// non-fall-through terminator (`jmp`/`ret`/`ud2`/indirect `jmp`) or the next block start. The
-    /// bytes between a terminator and the next block start are a constant island or a jump table that
-    /// Cranelift placed there — **data, not code** — so the walk stops at the terminator and never
-    /// decodes them. This is how the validator avoids mis-decoding embedded rodata without Cranelift
-    /// exposing the text/data split (`code_info` gives only `total_size`).
-    pub(crate) fn check(bytes: &[u8], bb_starts: &[u32]) -> Vec<Finding> {
-        let mut findings = Vec::new();
-        let mut starts: Vec<usize> = bb_starts.iter().map(|&o| o as usize).collect();
-        starts.sort_unstable();
-        starts.dedup();
-        if starts.first() != Some(&0) {
-            starts.insert(0, 0); // the entry is always a block start
-        }
-        let start_set = starts.clone();
-        let is_block_start = |o: usize| start_set.binary_search(&o).is_ok();
+    /// x86-64 GP register numbers the entry ABI and the policy refer to by name (Tail CC, §3b).
+    mod reg {
+        pub const RCX: u8 = 1; // stack_limit (arg 3)
+        pub const RDX: u8 = 2; // vmctx / trap_out (arg 2)
+        pub const RSP: u8 = 4; // stack pointer
+        pub const RBP: u8 = 5; // frame pointer
+        pub const RSI: u8 = 6; // fn_table_base (arg 1)
+        pub const RDI: u8 = 7; // mem_base (arg 0)
+    }
 
-        for (i, &block) in starts.iter().enumerate() {
-            // This block's instructions occupy [block, limit): the next block start, or end of code.
-            let limit = starts.get(i + 1).copied().unwrap_or(bytes.len());
-            let mut pos = block;
-            while pos < limit {
-                let d = decode(bytes, pos);
-                if d.len == 0 {
-                    findings.push(Finding {
-                        at: pos,
-                        why: "undecodable instruction (decoder does not model this encoding)"
-                            .into(),
-                    });
-                    break; // can't size it, so can't step past it within this block
-                }
-                match d.kind {
-                    Kind::Forbidden(name) => findings.push(Finding {
-                        at: pos,
-                        why: format!("forbidden instruction: {name}"),
-                    }),
-                    Kind::DirectJmp { target } | Kind::DirectJcc { target } => {
-                        if target >= bytes.len() {
-                            findings.push(Finding {
-                                at: pos,
-                                why: format!("direct branch to +0x{target:x} is outside the code"),
-                            });
-                        } else if !is_block_start(target) {
-                            findings.push(Finding {
-                                at: pos,
-                                why: format!("direct branch to +0x{target:x} is not a block start"),
-                            });
-                        }
-                    }
-                    // A direct `call rel32` to an external symbol is emitted with a relocation and a
-                    // placeholder displacement, so its decoded target is meaningless until linked;
-                    // checking call targets needs the relocation table (a later slice).
-                    _ => {}
-                }
-                let next = pos + d.len;
-                if next > limit {
-                    findings.push(Finding {
-                        at: pos,
-                        why: format!(
-                            "instruction overruns its block (ends +0x{next:x} > +0x{limit:x})"
-                        ),
-                    });
-                    break;
-                }
-                pos = next;
-                if !d.kind.falls_through() {
-                    break; // block's terminator reached; any bytes to `limit` are island/table data
+    /// The largest machine access width (AVX-512 zmm) — used as a sound over-estimate when checking
+    /// that a confined access's displacement rides within the guard slack. (Decoding the exact width
+    /// is a precision refinement; over-estimating only ever rejects, never admits, so it is sound.)
+    const MAX_ACCESS_WIDTH: u64 = 64;
+
+    /// What a GP register holds, for the #2535 window-access policy. A finite lattice: [`Fact::meet`]
+    /// is the fact true on *both* predecessors (`Unknown` when they disagree). `Bounded`'s upper
+    /// bound widens under meet and is dropped to `Unknown` at a loop header, bounding the fixpoint.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Fact {
+        /// The window base `mem_base` (rdi at entry) — the base of a confined window access.
+        MemBase,
+        /// `fn_table_base` (rsi) — the base of a `call.dyn` table access.
+        FnTableBase,
+        /// The `vmctx`/trap-out pointer (rdx).
+        Vmctx,
+        /// `stack_limit` (rcx).
+        StackLimit,
+        /// A known constant (e.g. the guard-offset materialization `mov r, imm`).
+        Const(i64),
+        /// Confined by the D63 sequence (`cmp v, bound; cmovae v', guard`): safe as a window byte
+        /// index for a displacement within the trailing-guard slack.
+        Confined,
+        /// Proven in `[0, ub)` (e.g. `and r, (2^k − 1)`).
+        Bounded(u64),
+        /// A pointer into the stack frame, computed by `lea r, [rsp/rbp + disp]`.
+        StackPtr,
+        /// A pointer into the function's own rodata / jump tables, computed by `lea r, [rip + disp]`.
+        RipRel,
+        /// No information.
+        Unknown,
+    }
+
+    impl Fact {
+        /// The fact true on both incoming paths.
+        fn meet(self, other: Fact) -> Fact {
+            match (self, other) {
+                (a, b) if a == b => a,
+                (Fact::Bounded(a), Fact::Bounded(b)) => Fact::Bounded(a.max(b)),
+                _ => Fact::Unknown,
+            }
+        }
+    }
+
+    /// The abstract state at a program point: a fact per GP register. (Spill-slot tracking — a
+    /// context param reloaded from `[rbp-k]` — is a tracked follow-up; until then a reload reads
+    /// `Unknown`, which is sound and, for the small corpus here where the params stay in registers,
+    /// precise.)
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct State {
+        regs: [Fact; 16],
+    }
+
+    impl State {
+        /// The entry ABI: the four context params in their argument registers, everything else
+        /// unknown. rsp/rbp are the stack and are recognized structurally, not tracked as facts.
+        fn entry() -> State {
+            let mut regs = [Fact::Unknown; 16];
+            regs[reg::RDI as usize] = Fact::MemBase;
+            regs[reg::RSI as usize] = Fact::FnTableBase;
+            regs[reg::RDX as usize] = Fact::Vmctx;
+            regs[reg::RCX as usize] = Fact::StackLimit;
+            State { regs }
+        }
+        fn meet(&self, other: &State) -> State {
+            let mut regs = self.regs;
+            for (r, &o) in regs.iter_mut().zip(other.regs.iter()) {
+                *r = r.meet(o);
+            }
+            State { regs }
+        }
+        /// Loop-header widening (#2535): a `Bounded` carried into a header could grow each iteration,
+        /// so drop it to `Unknown`. The context-param and `Confined` facts are loop-invariant and
+        /// survive, so nearly every loop still settles in one round.
+        fn widen(&mut self) {
+            for f in &mut self.regs {
+                if matches!(f, Fact::Bounded(_)) {
+                    *f = Fact::Unknown;
                 }
             }
         }
+    }
+
+    /// Validate one emitted function's `bytes` against its basic-block hints, returning every policy
+    /// finding. Pure, so tests assert on the findings directly.
+    ///
+    /// Three layers (#2481 slice 1 + #2535):
+    /// 1. **Decode + allowlist**, per machine basic block, flagging any instruction outside the
+    ///    allowlist, any undecodable encoding, any block overrun, and any direct branch out of code.
+    ///    The bytes between a non-fall-through terminator and the next block are a constant island or
+    ///    jump table Cranelift placed there (data, not code), so the walk stops at the terminator.
+    /// 2. **CFG recovery** ([`recover_leaders`]): the machine basic blocks are recovered by decoding
+    ///    forward from the entry and every direct-branch target. `bb_starts`/`bb_edges` are *hints*,
+    ///    not the machine CFG — they are Cranelift's CLIF-block CFG, so machine-lowered branches (the
+    ///    stack-limit check, fuel/epoch polls, a `select`'s local `jcc`) target offsets no hint lists.
+    ///    The one edge that cannot be decoded — an indirect `jmp`'s jump-table targets — is taken
+    ///    from `bb_edges` (this is what the hint saves: the expensive indirect-jump recovery, #2481).
+    /// 3. **Memory-access confinement** (#2535): an abstract interpretation over the recovered CFG
+    ///    tracks which register holds `mem_base` and which holds a D63-confined index across blocks
+    ///    and loops, then checks every memory access goes to a known region (the window through a
+    ///    confined/bounded index, the stack, vmctx, the fn-table, or rip-relative rodata).
+    pub(crate) fn check(bytes: &[u8], bb_starts: &[u32], bb_edges: &[(u32, u32)]) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        if bytes.is_empty() {
+            return findings;
+        }
+
+        // Layers 1–2: recover the machine basic blocks, decode each, and collect direct successors.
+        let leaders = recover_leaders(bytes, bb_starts, bb_edges);
+        let nb = leaders.len();
+        let index_of = |o: usize| leaders.binary_search(&o).ok();
+        let limit_of = |i: usize| leaders.get(i + 1).copied().unwrap_or(bytes.len());
+
+        let mut blocks: Vec<Vec<(usize, Decoded)>> = Vec::with_capacity(nb);
+        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
+        for i in 0..nb {
+            let (insns, direct) = decode_block(bytes, leaders[i], limit_of(i), &mut findings);
+            for s in direct {
+                if let Some(si) = index_of(s) {
+                    if !succs[i].contains(&si) {
+                        succs[i].push(si);
+                    }
+                }
+            }
+            blocks.push(insns);
+        }
+        // The one edge the decoder cannot read — an indirect `jmp`'s jump-table targets — comes from
+        // the `bb_edges` hint: attach each edge's target to the machine block containing its source.
+        for &(from, to) in bb_edges {
+            if let (Some(ti), Some(fi)) = (index_of(to as usize), block_of(from as usize, &leaders))
+            {
+                if !succs[fi].contains(&ti) {
+                    succs[fi].push(ti);
+                }
+            }
+        }
+
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
+        for (fi, ss) in succs.iter().enumerate() {
+            for &ti in ss {
+                preds[ti].push(fi);
+            }
+        }
+        // A loop header is the target of a back edge. Blocks are sorted by offset and Cranelift lays
+        // a loop out so its back edge comes from a higher offset, so `pred index >= own index`
+        // identifies headers (a rare forward edge from a later block only over-widens — still sound).
+        let is_header: Vec<bool> = (0..nb)
+            .map(|ti| preds[ti].iter().any(|&fi| fi >= ti))
+            .collect();
+
+        // Layer 3: forward dataflow to a fixpoint. `in[b]` is the meet of its computed predecessors'
+        // out-states (the entry keeps its seed); `out[b]` is the block's transfer of `in[b]`. Meet
+        // only moves up the lattice and headers widen `Bounded`, so this terminates; in practice the
+        // loop-carried facts are invariant and it settles in one or two rounds.
+        let entry = index_of(0).unwrap_or(0);
+        let mut in_st: Vec<Option<State>> = vec![None; nb];
+        let mut out_st: Vec<Option<State>> = vec![None; nb];
+        let cap = nb * 4 + 8;
+        for _ in 0..cap {
+            let mut changed = false;
+            for i in 0..nb {
+                let mut cur = (i == entry).then(State::entry);
+                for &p in &preds[i] {
+                    if let Some(po) = out_st[p] {
+                        cur = Some(cur.map_or(po, |s| s.meet(&po)));
+                    }
+                }
+                if let Some(mut s) = cur {
+                    if is_header[i] {
+                        s.widen();
+                    }
+                    if in_st[i] != Some(s) {
+                        in_st[i] = Some(s);
+                        changed = true;
+                    }
+                    let o = transfer_block(&blocks[i], s, None);
+                    if out_st[i] != Some(o) {
+                        out_st[i] = Some(o);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Final pass: replay each reachable block's transfer, collecting the memory-access findings.
+        for i in 0..nb {
+            if let Some(s) = in_st[i] {
+                transfer_block(&blocks[i], s, Some(&mut findings));
+            }
+        }
         findings
+    }
+
+    /// Recover the machine basic-block leaders: the entry, the hinted `bb_starts`/`bb_edge` targets,
+    /// and — the part Cranelift's CLIF-block hints miss — every direct-branch target and the
+    /// fall-through of every conditional branch. Decoding from the current leader set discovers more
+    /// targets; iterate to a fixpoint (the leader set only grows, bounded by the code size, so it
+    /// terminates). The walk stops at a non-fall-through terminator, so inter-block island/table
+    /// data is never decoded.
+    fn recover_leaders(bytes: &[u8], bb_starts: &[u32], bb_edges: &[(u32, u32)]) -> Vec<usize> {
+        let len = bytes.len();
+        let mut leaders: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        leaders.insert(0);
+        for &s in bb_starts {
+            if (s as usize) < len {
+                leaders.insert(s as usize);
+            }
+        }
+        for &(_, to) in bb_edges {
+            if (to as usize) < len {
+                leaders.insert(to as usize);
+            }
+        }
+        loop {
+            let before = leaders.len();
+            let cur: Vec<usize> = leaders.iter().copied().collect();
+            for (i, &ld) in cur.iter().enumerate() {
+                let limit = cur.get(i + 1).copied().unwrap_or(len);
+                let mut pos = ld;
+                while pos < limit {
+                    let d = decode(bytes, pos);
+                    if d.len == 0 {
+                        break; // undecodable (flagged in decode_block)
+                    }
+                    let next = pos + d.len;
+                    match d.kind {
+                        Kind::DirectJmp { target } => {
+                            if target < len {
+                                leaders.insert(target);
+                            }
+                            break;
+                        }
+                        Kind::DirectJcc { target } => {
+                            if target < len {
+                                leaders.insert(target);
+                            }
+                            if next < len {
+                                leaders.insert(next); // the fall-through is its own block
+                            }
+                            break;
+                        }
+                        Kind::Ret | Kind::Ud2 | Kind::IndirectJmp => break,
+                        _ => {}
+                    }
+                    if next > limit {
+                        break; // overrun (flagged in decode_block)
+                    }
+                    pos = next;
+                }
+            }
+            if leaders.len() == before {
+                break;
+            }
+        }
+        leaders.into_iter().collect()
+    }
+
+    /// The index of the machine block containing byte offset `off` (the largest leader `<= off`).
+    fn block_of(off: usize, leaders: &[usize]) -> Option<usize> {
+        leaders.partition_point(|&l| l <= off).checked_sub(1)
+    }
+
+    /// Decode block `[block, limit)` into `(offset, Decoded)` pairs (layer 1), stopping at the
+    /// block's non-fall-through terminator, and return the block's direct successor offsets (the
+    /// branch target(s) and, for a conditional branch or a fall-through into the next block, the
+    /// next offset). Pushes layer-1 findings: undecodable encodings, forbidden instructions, block
+    /// overruns, and direct branches out of the code.
+    fn decode_block(
+        bytes: &[u8],
+        block: usize,
+        limit: usize,
+        findings: &mut Vec<Finding>,
+    ) -> (Vec<(usize, Decoded)>, Vec<usize>) {
+        let mut insns = Vec::new();
+        let mut pos = block;
+        while pos < limit {
+            let d = decode(bytes, pos);
+            if d.len == 0 {
+                findings.push(Finding {
+                    at: pos,
+                    why: "undecodable instruction (decoder does not model this encoding)".into(),
+                });
+                return (insns, Vec::new());
+            }
+            match d.kind {
+                Kind::Forbidden(name) => findings.push(Finding {
+                    at: pos,
+                    why: format!("forbidden instruction: {name}"),
+                }),
+                Kind::DirectJmp { target } | Kind::DirectJcc { target }
+                    if target >= bytes.len() =>
+                {
+                    findings.push(Finding {
+                        at: pos,
+                        why: format!("direct branch to +0x{target:x} is outside the code"),
+                    });
+                }
+                _ => {}
+            }
+            let next = pos + d.len;
+            if next > limit {
+                findings.push(Finding {
+                    at: pos,
+                    why: format!(
+                        "instruction overruns its block (ends +0x{next:x} > +0x{limit:x})"
+                    ),
+                });
+                return (insns, Vec::new());
+            }
+            insns.push((pos, d));
+            match d.kind {
+                Kind::DirectJmp { target } => return (insns, vec![target]),
+                Kind::DirectJcc { target } => return (insns, vec![target, next]),
+                // `ret`/`ud2` leave the function; an indirect `jmp`'s successors come from `bb_edges`.
+                Kind::Ret | Kind::Ud2 | Kind::IndirectJmp => return (insns, Vec::new()),
+                _ => {}
+            }
+            pos = next;
+        }
+        (insns, vec![limit]) // fell through to the next leader
+    }
+
+    /// Run block `insns` from `state`, returning the out-state. With `findings = Some`, also apply
+    /// the memory-access policy (layer 3) at each access. The guard→cmp→cmov recognition that
+    /// produces a [`Fact::Confined`] is block-local (`confinable`): the compared value, tracked
+    /// through a `mov` copy, becomes `Confined` at a `cmov` whose source is a constant (the guard
+    /// offset). The resulting fact flows across blocks through the lattice, so a guard Cranelift
+    /// hoists out of a loop is still seen at the access.
+    fn transfer_block(
+        insns: &[(usize, Decoded)],
+        mut state: State,
+        mut findings: Option<&mut Vec<Finding>>,
+    ) -> State {
+        // Registers that currently hold the value most recently compared (`cmp`), tracked through
+        // `mov` copies so a `cmovcc` on a copy is still recognized. Block-local.
+        let mut confinable: u16 = 0;
+        for &(pos, d) in insns {
+            if let Some(f) = findings.as_deref_mut() {
+                mem_policy(pos, &d, &state, f);
+            }
+            let w = writes_of(d.eff, &d.operands);
+            match d.eff {
+                Eff::Cmp { reg, .. } => {
+                    confinable = reg.map_or(0, bit); // the compared value lives in `reg`
+                    continue; // writes no register
+                }
+                Eff::MovReg { dst, src } => {
+                    state.regs[dst as usize & 15] = state.regs[src as usize & 15];
+                    // The compared value, if copied, stays confinable in its new home.
+                    if confinable & bit(src) != 0 {
+                        confinable |= bit(dst);
+                    } else {
+                        confinable &= !bit(dst);
+                    }
+                    continue;
+                }
+                Eff::MovImm { dst, imm } => {
+                    state.regs[dst as usize & 15] = Fact::Const(imm);
+                }
+                Eff::AluImm { dst, alu, imm } => {
+                    state.regs[dst as usize & 15] =
+                        alu_fact(state.regs[dst as usize & 15], alu, imm);
+                }
+                Eff::Cmov { dst } => {
+                    // `cmovcc dst, src`: dst becomes either its old value or `src`. It is the D63
+                    // confined value iff dst held the compared index and src is the guard constant.
+                    let src_is_guard = matches!(
+                        d.operands.rm_reg.map(|s| state.regs[s as usize & 15]),
+                        Some(Fact::Const(_))
+                    );
+                    let was_compared = confinable & bit(dst) != 0;
+                    state.regs[dst as usize & 15] = if src_is_guard && was_compared {
+                        Fact::Confined
+                    } else {
+                        Fact::Unknown
+                    };
+                }
+                Eff::Lea { dst } => {
+                    // `lea` computes an address. A rip-relative one points into the function's own
+                    // rodata/jump tables; an rsp/rbp-relative one into the stack frame. Both are known
+                    // regions a later access may legitimately go through.
+                    state.regs[dst as usize & 15] = match d.operands.mem {
+                        Some(m) if m.rip => Fact::RipRel,
+                        Some(Mem {
+                            base: Some(reg::RSP | reg::RBP),
+                            ..
+                        }) => Fact::StackPtr,
+                        _ => Fact::Unknown,
+                    };
+                }
+                // Loads and the opaque GP writes clobber their destinations (the value is not a
+                // tracked fact); the clobber mask `w` covers them below.
+                Eff::LoadReg { .. } | Eff::WrReg | Eff::WrRm | Eff::Wr(_) | Eff::NoGp => {}
+            }
+            // Clobber every GP register this instruction writes that the semantic above didn't set,
+            // and drop them from the confinable set (their value changed).
+            for r in 0..16u8 {
+                if w & bit(r) != 0 {
+                    if !matches!(
+                        d.eff,
+                        Eff::MovImm { dst, .. }
+                            | Eff::AluImm { dst, .. }
+                            | Eff::Cmov { dst }
+                            | Eff::Lea { dst }
+                            if dst == r
+                    ) {
+                        state.regs[r as usize] = Fact::Unknown;
+                    }
+                    confinable &= !bit(r);
+                }
+            }
+        }
+        state
+    }
+
+    /// The GP register write mask of an instruction, from its effect and operands. A sound superset
+    /// of what the instruction actually writes (clearing extra facts is safe; missing a real write
+    /// is not) — cross-checked against iced-x86 in the tests.
+    fn writes_of(eff: Eff, ops: &Operands) -> u16 {
+        match eff {
+            Eff::NoGp | Eff::Cmp { .. } => 0,
+            Eff::MovImm { dst, .. }
+            | Eff::MovReg { dst, .. }
+            | Eff::LoadReg { dst }
+            | Eff::Lea { dst }
+            | Eff::AluImm { dst, .. }
+            | Eff::Cmov { dst } => bit(dst),
+            Eff::WrReg => ops.reg.map_or(0, bit),
+            Eff::WrRm => ops.rm_reg.map_or(0, bit),
+            Eff::Wr(m) => m,
+        }
+    }
+
+    /// `and`/`add`/`sub r, imm` on a tracked value. `and` with a low-bits mask bounds the result;
+    /// otherwise the value stops being tracked (bound/const arithmetic beyond this is deferred).
+    fn alu_fact(prev: Fact, alu: Alu, imm: i64) -> Fact {
+        match (alu, prev) {
+            (Alu::And, _) if imm >= 0 && (imm as u64).wrapping_add(1).is_power_of_two() => {
+                Fact::Bounded(imm as u64 + 1) // r & (2^k - 1) ∈ [0, 2^k)
+            }
+            (Alu::Add, Fact::Const(c)) => Fact::Const(c.wrapping_add(imm)),
+            (Alu::Sub, Fact::Const(c)) => Fact::Const(c.wrapping_sub(imm)),
+            _ => Fact::Unknown,
+        }
+    }
+
+    /// The memory-access confinement policy (#2535): classify one access's base and index by their
+    /// abstract facts and flag an access that does not land in a known region.
+    fn mem_policy(pos: usize, d: &Decoded, state: &State, findings: &mut Vec<Finding>) {
+        let Some(mem) = d.operands.mem else { return };
+        // `lea` computes an address but does not dereference it.
+        if matches!(d.eff, Eff::Lea { .. }) {
+            return;
+        }
+        // rip-relative: the function's own constant pool / jump tables (rodata).
+        if mem.rip {
+            return;
+        }
+        let fact = |r: Option<u8>| r.map(|x| state.regs[x as usize & 15]);
+        let (base_f, index_f) = (fact(mem.base), fact(mem.index));
+        let mut flag = |why: String| findings.push(Finding { at: pos, why });
+
+        // Stack: rsp/rbp-relative (frame-bound refinement is deferred).
+        if matches!(mem.base, Some(reg::RSP | reg::RBP)) {
+            return;
+        }
+        // Window: base (or index) is `mem_base`; the other operand is the offset.
+        let is_membase = |f: Option<Fact>| matches!(f, Some(Fact::MemBase));
+        if is_membase(base_f) || is_membase(index_f) {
+            let offset_f = if is_membase(base_f) { index_f } else { base_f };
+            match offset_f {
+                // `[mem_base + disp]` — an elided constant access; the displacement-bound re-proof
+                // needs the module's reservation hint (tracked), so it is recognized, not re-proven.
+                None => {}
+                Some(Fact::Confined) => {
+                    if mem.scale != 1 {
+                        flag(format!(
+                            "confined window index with scale {} (expected a byte index, scale 1)",
+                            mem.scale
+                        ));
+                    } else if mem.disp < 0
+                        || (mem.disp as u64).saturating_add(MAX_ACCESS_WIDTH)
+                            > crate::mem::trailing_guard() as u64
+                    {
+                        flag(format!(
+                            "confined window access displacement +0x{:x} does not ride within the \
+                             trailing guard page",
+                            mem.disp
+                        ));
+                    }
+                }
+                // A bounded or constant index through `mem_base`: recognized; the arithmetic
+                // re-proof against the reservation is deferred (needs the hint), tracked.
+                Some(Fact::Bounded(_)) | Some(Fact::Const(_)) => {}
+                // An index of unknown provenance into the window — the escape-relevant case.
+                Some(_) => flag(
+                    "window access [mem_base + <unconfined index>]: the index is not confined by \
+                     the D63 sequence nor proven bounded"
+                        .into(),
+                ),
+            }
+            return;
+        }
+        // Other known bases: the fn-table (call.dyn dispatch; its bounds are a later slice), vmctx
+        // (the trap-out cell and per-instance fields), a lea'd stack pointer, and a lea'd pointer
+        // into the function's own rodata / jump tables (the br_table dispatch's table read; its
+        // index-bounds re-proof is the control-flow-integrity slice).
+        if matches!(
+            base_f,
+            Some(Fact::FnTableBase | Fact::Vmctx | Fact::StackPtr | Fact::RipRel)
+        ) {
+            return;
+        }
+        // Anything else: an access through a base of unknown or non-pointer provenance.
+        match mem.base {
+            Some(b) => flag(format!(
+                "memory access through r{b} of unrecognized provenance ({:?})",
+                base_f.unwrap_or(Fact::Unknown)
+            )),
+            None => flag("absolute memory access (no base register)".into()),
+        }
     }
 
     /// What one decoded instruction is, for the slice-1 policy.
@@ -215,6 +677,9 @@ pub(crate) mod x86 {
         /// Whether control can continue to the next instruction after this one. `false` for the
         /// terminators that end a basic block without fall-through (`jmp`, `ret`, `ud2`, indirect
         /// `jmp`) — after which the next bytes may be a constant island or jump table, not code.
+        /// Used by the test-only [`walk`] (the policy decodes blocks via [`decode_block`], which
+        /// inspects `kind` directly).
+        #[cfg(test)]
         fn falls_through(self) -> bool {
             !matches!(
                 self,
@@ -223,15 +688,58 @@ pub(crate) mod x86 {
         }
     }
 
-    /// One decoded instruction: its length, its classification, and its operands (empty for
-    /// instructions without a ModRM byte — the control-flow and no-operand forms).
+    /// A small-integer ALU op the transfer models for bound/const tracking (#2535). Everything else
+    /// is an opaque GP write (the value becomes `Fact::Unknown`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Alu {
+        Add,
+        Sub,
+        And,
+    }
+
+    /// The data-flow **effect** of an instruction, for the abstract interpreter (#2535): which GP
+    /// register it writes and, for the handful of operations the window-access policy models, how.
+    /// The decoder — the one place that parses opcodes (invariant #15) — sets this; the transfer
+    /// derives the GP write-set from it (cross-checked against iced-x86 in the tests, so a missed
+    /// write is caught). `dst`/`src`/`reg` are GP register numbers (0..15).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Eff {
+        /// Writes no GP register the state tracks: flags-only (`cmp`/`test`), control flow, SSE/vector
+        /// ops (their operands are XMM, not GP), fences, nops, pushes/pops of the frame.
+        NoGp,
+        /// `mov dst, imm` — `dst := Const(imm)`.
+        MovImm { dst: u8, imm: i64 },
+        /// `mov dst, src` between GP registers — `dst := fact(src)`.
+        MovReg { dst: u8, src: u8 },
+        /// A GP load `mov dst, [mem]` (mem in `operands.mem`) — `dst := loaded value`.
+        LoadReg { dst: u8 },
+        /// `lea dst, [mem]` — computes an address into `dst` (does **not** dereference).
+        Lea { dst: u8 },
+        /// `add`/`sub`/`and dst, imm`, `dst` the r/m register — `dst := alu(fact(dst), imm)`.
+        AluImm { dst: u8, alu: Alu, imm: i64 },
+        /// The modeled compare before a confine `cmov`: `cmp reg, bound` (bound an immediate, or
+        /// `None` for a register/memory right-hand side). Writes only flags.
+        Cmp { reg: Option<u8>, bound: Option<u64> },
+        /// `cmovcc dst, src` — `dst := Confined` when `src` is the guard const and `dst` was just
+        /// compared; else `dst := Unknown`. (Conditional, so always a write of `dst`.)
+        Cmov { dst: u8 },
+        /// Writes `operands.reg` (a GP op whose destination is its reg field: `op reg, r/m`).
+        WrReg,
+        /// Writes `operands.rm_reg` when the r/m is a register (`op r/m, reg`); the memory form writes
+        /// memory, no GP register.
+        WrRm,
+        /// Writes a fixed implicit GP mask (e.g. `mul`/`div` → rax,rdx; `cpuid`; accumulator forms).
+        Wr(u16),
+    }
+
+    /// One decoded instruction: its length, its control-flow classification, its operands, and its
+    /// data-flow effect ([`Eff`], consumed by the #2535 abstract interpreter).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) struct Decoded {
         pub len: usize,
         pub kind: Kind,
-        // `operands` is consumed by the cross-check now and by the slice-2b policy next; see `Mem`.
-        #[allow(dead_code)]
         pub operands: Operands,
+        pub eff: Eff,
     }
 
     const NO_OPERANDS: Operands = Operands {
@@ -244,6 +752,7 @@ pub(crate) mod x86 {
         len: 0,
         kind: Kind::Undecodable,
         operands: NO_OPERANDS,
+        eff: Eff::NoGp,
     };
 
     /// Decode the instruction at `bytes[start..]`. Returns [`UNDECODABLE`] (length 0) for an encoding
@@ -344,13 +853,9 @@ pub(crate) mod x86 {
     }
 
     /// A memory operand `[base + index*scale + disp]`, or RIP-relative. Register numbers are the full
-    /// 0..15 (REX-extended). `base`/`index` are `None` when absent.
-    ///
-    /// `#[allow(dead_code)]`: the decoder exposes these now and the iced-x86 cross-check consumes
-    /// them, but the production reader — the slice-2b dataflow + memory-access policy — lands next.
-    /// Scaffolding with a scheduled removal of the allow when that policy arrives (INVARIANTS #13).
+    /// 0..15 (REX-extended). `base`/`index` are `None` when absent. Consumed by the window-access
+    /// policy ([`mem_policy`]) and cross-checked against iced-x86.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    #[allow(dead_code)]
     pub(crate) struct Mem {
         pub base: Option<u8>,
         pub index: Option<u8>,
@@ -360,34 +865,180 @@ pub(crate) mod x86 {
     }
 
     /// The operands a ModRM instruction carries, as the policy/dataflow needs them: the `reg`-field
-    /// register, and the r/m operand — either a register or a memory reference. (Operation class and
-    /// read/write direction come in slice 2b, where the dataflow needs them.)
-    ///
-    /// `#[allow(dead_code)]`: see [`Mem`] — consumed by the cross-check now, by the policy in 2b.
+    /// register, and the r/m operand — either a register or a memory reference.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    #[allow(dead_code)]
     pub(crate) struct Operands {
         pub reg: Option<u8>,
         pub rm_reg: Option<u8>,
         pub mem: Option<Mem>,
     }
 
+    /// How the decoder tells [`resolve_eff`] what an instruction does, before the operands and
+    /// immediate are read. `resolve_eff` turns it into the final [`Eff`] using the parsed operands,
+    /// the operand width (only 64-bit operations preserve a pointer/bound fact — a narrower write
+    /// truncates or zero-extends, so it clobbers), and the immediate.
+    #[derive(Clone, Copy)]
+    enum EffIntent {
+        /// Writes no GP register (flags-only, control flow, SSE/vector, fences, nops).
+        NoGp,
+        /// Writes `operands.reg` with an unmodeled value (`op reg, r/m`).
+        WrReg,
+        /// Writes `operands.rm_reg` (a register r/m) with an unmodeled value; a memory r/m writes
+        /// memory, no GP register.
+        WrRm,
+        /// Writes a fixed implicit GP mask (`mul`/`div` → rax,rdx; `pop r`/`xchg eax,r`; …).
+        Wr(u16),
+        /// `mov reg, r/m` — a GP-GP move (fact copy) or a load.
+        MovToReg,
+        /// `mov r/m, reg` — a GP-GP move or a store.
+        MovToRm,
+        /// `mov r/m, imm` — a const into the r/m register, or a store of an immediate.
+        MovImmToRm,
+        /// `lea reg, [mem]`.
+        Lea,
+        /// `cmp reg, r/m` — the compared value is `reg`.
+        CmpRegRm,
+        /// `cmp r/m, reg` — the compared value is the r/m register.
+        CmpRmReg,
+        /// `0x80/0x81/0x83 /digit` — the ModRM.reg field (`digit`) picks add/or/.../cmp with `imm`.
+        AluImmGroup(u8),
+        /// `0xF6/0xF7 /digit` — test (writes flags), not/neg (writes r/m), or mul/div (writes rax,rdx).
+        Group3(u8),
+        /// `0xFF /digit` — inc/dec (writes r/m), or call/jmp/push (no tracked GP write).
+        Group5(u8),
+        /// `cmovcc reg, r/m`.
+        Cmov,
+        /// `xchg reg, r/m` — writes both.
+        XchgRegRm,
+    }
+
+    /// A one-register GP write mask bit.
+    fn bit(r: u8) -> u16 {
+        1u16 << (r & 15)
+    }
+
+    /// Turn an [`EffIntent`] into the final [`Eff`] now that the operands, operand width (`w64`), and
+    /// immediate are known. The guiding rule for soundness: a fact (`MemBase`, `Confined`, …) is a
+    /// property of a full 64-bit register value, so only a **64-bit** operation may carry one; a
+    /// narrower write truncates/zero-extends and therefore *clobbers* the destination. (`MovImm` is
+    /// the exception — a narrower `mov` to a const is still a known, if zero-extended, value.)
+    fn resolve_eff(intent: EffIntent, ops: &Operands, w64: bool, immv: i64) -> Eff {
+        use EffIntent as I;
+        let (reg, rm, mem) = (ops.reg, ops.rm_reg, ops.mem.is_some());
+        match intent {
+            I::NoGp => Eff::NoGp,
+            I::WrReg => Eff::WrReg,
+            I::WrRm => Eff::WrRm,
+            I::Wr(m) => Eff::Wr(m),
+            I::Lea => reg.map_or(Eff::NoGp, |dst| Eff::Lea { dst }),
+            I::MovToReg => match (reg, rm, mem) {
+                (Some(dst), _, true) => Eff::LoadReg { dst },
+                (Some(dst), Some(src), false) if w64 => Eff::MovReg { dst, src },
+                (Some(_), _, false) => Eff::WrReg, // narrower reg-reg: truncates, so clobber
+                _ => Eff::NoGp,
+            },
+            I::MovToRm => match (reg, rm, mem) {
+                (_, _, true) => Eff::NoGp, // store to memory (the access is checked separately)
+                (Some(src), Some(dst), false) if w64 => Eff::MovReg { dst, src },
+                (_, Some(_), false) => Eff::WrRm,
+                _ => Eff::NoGp,
+            },
+            I::MovImmToRm => match (rm, mem) {
+                (_, true) => Eff::NoGp, // store of an immediate
+                (Some(dst), false) => Eff::MovImm {
+                    dst,
+                    imm: if w64 { immv } else { immv & 0xFFFF_FFFF },
+                },
+                _ => Eff::NoGp,
+            },
+            I::CmpRegRm if w64 => Eff::Cmp { reg, bound: None },
+            I::CmpRmReg if w64 => Eff::Cmp {
+                reg: rm,
+                bound: None,
+            },
+            I::CmpRegRm | I::CmpRmReg => Eff::NoGp,
+            I::AluImmGroup(digit) => {
+                if digit == 7 {
+                    // cmp r/m, imm
+                    return if w64 {
+                        Eff::Cmp {
+                            reg: rm,
+                            bound: Some(immv as u64),
+                        }
+                    } else {
+                        Eff::NoGp
+                    };
+                }
+                let alu = match digit {
+                    0 => Some(Alu::Add),
+                    4 => Some(Alu::And),
+                    5 => Some(Alu::Sub),
+                    _ => None, // or/adc/sbb/xor — not modeled for bounds
+                };
+                match (mem, w64, alu, rm) {
+                    (true, ..) => Eff::NoGp, // RMW on memory (access checked); no GP write
+                    (false, true, Some(alu), Some(dst)) => Eff::AluImm {
+                        dst,
+                        alu,
+                        imm: immv,
+                    },
+                    (false, ..) => Eff::WrRm, // narrower, or or/adc/sbb/xor: clobber r/m
+                }
+            }
+            I::Group3(digit) => match digit {
+                0 | 1 => Eff::NoGp,                // test r/m, imm — flags only
+                4..=7 => Eff::Wr(bit(0) | bit(2)), // mul/imul/div/idiv → rax, rdx
+                _ if mem => Eff::NoGp,             // not/neg [mem]
+                _ => Eff::WrRm,                    // not/neg r/m
+            },
+            I::Group5(digit) => match digit {
+                0 | 1 if !mem => Eff::WrRm, // inc/dec r/m register
+                _ => Eff::NoGp,             // inc/dec [mem]; call/jmp/push (kind already set)
+            },
+            I::Cmov => match reg {
+                Some(dst) if w64 => Eff::Cmov { dst },
+                Some(_) => Eff::WrReg, // narrower cmov: clobber
+                None => Eff::NoGp,
+            },
+            I::XchgRegRm => Eff::Wr(reg.map_or(0, bit) | rm.map_or(0, bit)),
+        }
+    }
+
     /// Consume a ModRM byte and whatever addressing bytes it implies (SIB, displacement) in 64-bit
-    /// mode, then `imm` immediate bytes; classify as `kind` and attach the decoded operands.
+    /// mode, then `imm_bytes` of immediate; classify control flow as `kind`, attach the decoded
+    /// operands, and resolve the data-flow effect from `intent`.
     fn finish_modrm(
         c: &mut Cursor,
         start: usize,
         p: &Pfx,
-        imm: usize,
+        imm_bytes: usize,
         kind: Kind,
+        intent: EffIntent,
     ) -> Option<Decoded> {
         let operands = read_modrm(c, p)?;
-        c.skip(imm)?;
+        let immv = read_imm(c, imm_bytes)?;
+        let eff = resolve_eff(intent, &operands, p.rex_w, immv);
         Some(Decoded {
             len: c.pos - start,
             kind,
             operands,
+            eff,
         })
+    }
+
+    /// Read a sign-extended immediate of `bytes` (0, 1, 2, 4, or 8) and advance the cursor.
+    fn read_imm(c: &mut Cursor, bytes: usize) -> Option<i64> {
+        let s = c.bytes.get(c.pos..c.pos + bytes)?;
+        let v = match bytes {
+            0 => 0,
+            1 => i64::from(s[0] as i8),
+            2 => i64::from(i16::from_le_bytes([s[0], s[1]])),
+            4 => i64::from(i32::from_le_bytes([s[0], s[1], s[2], s[3]])),
+            8 => i64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]),
+            _ => return None,
+        };
+        c.pos += bytes;
+        Some(v)
     }
 
     /// Read a ModRM byte and its SIB/displacement in 64-bit mode, returning the operands and leaving
@@ -475,23 +1126,24 @@ pub(crate) mod x86 {
     }
 
     fn decode_1byte(c: &mut Cursor, start: usize, p: &Pfx, op: u8) -> Option<Decoded> {
+        use EffIntent as E;
         use Kind::*;
         match op {
             // --- forbidden / privileged / system ---
-            0xF4 => return Some(one(c, start, Forbidden("hlt"))),
-            0xFA => return Some(one(c, start, Forbidden("cli"))),
-            0xFB => return Some(one(c, start, Forbidden("sti"))),
-            0xCC => return Some(one(c, start, Normal)), // int3 — debugtrap/padding, allowed
-            0xCD => return finish_imm(c, start, 1, Forbidden("int imm8")),
-            0xCE => return Some(one(c, start, Forbidden("into"))),
-            0xCF => return Some(one(c, start, Forbidden("iret"))),
-            0xE4 | 0xE5 => return finish_imm(c, start, 1, Forbidden("in imm8")),
-            0xE6 | 0xE7 => return finish_imm(c, start, 1, Forbidden("out imm8")),
-            0xEC..=0xEF => return Some(one(c, start, Forbidden("in/out dx"))),
-            0x6C..=0x6F => return Some(one(c, start, Forbidden("ins/outs"))),
-            0xCB | 0xCA => return Some(one(c, start, Forbidden("far ret"))),
-            0xEA => return Some(one(c, start, Forbidden("far jmp"))),
-            0x9A => return Some(one(c, start, Forbidden("far call"))),
+            0xF4 => return Some(one(c, start, Forbidden("hlt"), Eff::NoGp)),
+            0xFA => return Some(one(c, start, Forbidden("cli"), Eff::NoGp)),
+            0xFB => return Some(one(c, start, Forbidden("sti"), Eff::NoGp)),
+            0xCC => return Some(one(c, start, Normal, Eff::NoGp)), // int3 — debugtrap/padding, allowed
+            0xCD => return finish_imm(c, start, 1, Forbidden("int imm8"), Eff::NoGp),
+            0xCE => return Some(one(c, start, Forbidden("into"), Eff::NoGp)),
+            0xCF => return Some(one(c, start, Forbidden("iret"), Eff::NoGp)),
+            0xE4 | 0xE5 => return finish_imm(c, start, 1, Forbidden("in imm8"), Eff::NoGp),
+            0xE6 | 0xE7 => return finish_imm(c, start, 1, Forbidden("out imm8"), Eff::NoGp),
+            0xEC..=0xEF => return Some(one(c, start, Forbidden("in/out dx"), Eff::NoGp)),
+            0x6C..=0x6F => return Some(one(c, start, Forbidden("ins/outs"), Eff::NoGp)),
+            0xCB | 0xCA => return Some(one(c, start, Forbidden("far ret"), Eff::NoGp)),
+            0xEA => return Some(one(c, start, Forbidden("far jmp"), Eff::NoGp)),
+            0x9A => return Some(one(c, start, Forbidden("far call"), Eff::NoGp)),
             // --- control transfers ---
             0xE9 => {
                 let rel = c.rel(4)?; // jmp rel32
@@ -507,43 +1159,80 @@ pub(crate) mod x86 {
                     len: c.pos - start,
                     kind: DirectCall,
                     operands: NO_OPERANDS,
+                    eff: Eff::NoGp,
                 });
             }
             0x70..=0x7F => {
                 let rel = c.rel(1)?; // jcc rel8
                 return Some(rel_insn(start, c.pos, rel, Branch::Jcc));
             }
-            0xC3 => return Some(one(c, start, Ret)),
-            0xC2 => return finish_imm(c, start, 2, Ret), // ret imm16
+            0xC3 => return Some(one(c, start, Ret, Eff::NoGp)),
+            0xC2 => return finish_imm(c, start, 2, Ret, Eff::NoGp), // ret imm16
             _ => {}
+        }
+        // ALU r/m,reg forms (add/or/adc/sbb/and/sub/xor/cmp): columns rm8,r8 / rm,r / r8,rm8 / r,rm.
+        // Group 7 is `cmp` (flags only — the dataflow models it); the rest write their destination.
+        if matches!(op,
+            0x00..=0x03 | 0x08..=0x0B | 0x10..=0x13 | 0x18..=0x1B
+            | 0x20..=0x23 | 0x28..=0x2B | 0x30..=0x33 | 0x38..=0x3B)
+        {
+            let is_cmp = (op >> 3) & 0x07 == 0x07;
+            let intent = match (is_cmp, op & 0x07) {
+                (true, 0 | 1) => E::CmpRmReg,
+                (true, _) => E::CmpRegRm,
+                (false, 0 | 1) => E::WrRm,
+                (false, _) => E::WrReg,
+            };
+            return finish_modrm(c, start, p, 0, Normal, intent);
         }
         match op {
             // ModRM, no immediate.
-            0x00..=0x03
-            | 0x08..=0x0B
-            | 0x10..=0x13
-            | 0x18..=0x1B
-            | 0x20..=0x23
-            | 0x28..=0x2B
-            | 0x30..=0x33
-            | 0x38..=0x3B
-            | 0x84..=0x8B
-            | 0x62
-            | 0x63
-            | 0x8D
-            | 0x8F
-            | 0xD0..=0xD3
-            | 0xFE => finish_modrm(c, start, p, 0, Normal),
+            0x84 | 0x85 => finish_modrm(c, start, p, 0, Normal, E::NoGp), // test
+            0x86 | 0x87 => finish_modrm(c, start, p, 0, Normal, E::XchgRegRm), // xchg
+            0x88 => finish_modrm(c, start, p, 0, Normal, E::WrRm),        // mov rm8, r8
+            0x89 => finish_modrm(c, start, p, 0, Normal, E::MovToRm),     // mov rm, r
+            0x8A => finish_modrm(c, start, p, 0, Normal, E::WrReg),       // mov r8, rm8
+            0x8B => finish_modrm(c, start, p, 0, Normal, E::MovToReg),    // mov r, rm
+            0x63 => finish_modrm(c, start, p, 0, Normal, E::WrReg),       // movsxd r64, rm32
+            0x8D => finish_modrm(c, start, p, 0, Normal, E::Lea),
+            0x8F => finish_modrm(c, start, p, 0, Normal, E::WrRm), // pop r/m
+            0xD0..=0xD3 => finish_modrm(c, start, p, 0, Normal, E::WrRm), // shift r/m, 1|cl
+            0xFE => finish_modrm(c, start, p, 0, Normal, E::WrRm), // inc/dec r/m8
             // ModRM + imm8.
-            0x80 | 0x82 | 0x83 | 0x6B | 0xC0 | 0xC1 | 0xC6 => finish_modrm(c, start, p, 1, Normal),
+            0x80 | 0x82 | 0x83 => {
+                let digit = (c.peek()? >> 3) & 0x07;
+                finish_modrm(c, start, p, 1, Normal, E::AluImmGroup(digit))
+            }
+            0x6B => finish_modrm(c, start, p, 1, Normal, E::WrReg), // imul r, r/m, imm8
+            0xC0 | 0xC1 => finish_modrm(c, start, p, 1, Normal, E::WrRm), // shift r/m, imm8
+            0xC6 => finish_modrm(c, start, p, 1, Normal, E::WrRm),  // mov r/m8, imm8
             // ModRM + immZ.
-            0x81 | 0x69 | 0xC7 => finish_modrm(c, start, p, imm_z(p), Normal),
+            0x81 => {
+                let digit = (c.peek()? >> 3) & 0x07;
+                finish_modrm(c, start, p, imm_z(p), Normal, E::AluImmGroup(digit))
+            }
+            0x69 => finish_modrm(c, start, p, imm_z(p), Normal, E::WrReg), // imul r, r/m, immZ
+            0xC7 => finish_modrm(c, start, p, imm_z(p), Normal, E::MovImmToRm),
             // groups 3/5: immediate (if any) depends on the /reg field — peek at the ModRM.
             0xF6 => group3(c, start, p, 1),
             0xF7 => group3(c, start, p, imm_z(p)),
             0xFF => group5(c, start, p),
-            // No ModRM, no immediate.
-            0x06
+            // pop r — writes the opcode-encoded register.
+            0x58..=0x5F => {
+                let dst = (op & 0x07) | (u8::from(p.rex_b) << 3);
+                Some(one(c, start, Normal, Eff::Wr(bit(dst))))
+            }
+            // xchg eax, r — writes rax and r.
+            0x91..=0x97 => {
+                let r = (op & 0x07) | (u8::from(p.rex_b) << 3);
+                Some(one(c, start, Normal, Eff::Wr(bit(0) | bit(r))))
+            }
+            0x98 => Some(one(c, start, Normal, Eff::Wr(bit(0)))), // cwde/cdqe → rax
+            0x99 => Some(one(c, start, Normal, Eff::Wr(bit(2)))), // cwd/cdq/cqo → rdx
+            0xD7 => Some(one(c, start, Normal, Eff::Wr(bit(0)))), // xlat → al
+            // push r, nops, flag ops, invalid-in-64 legacy: no tracked GP write.
+            0x50..=0x57
+            | 0x06
             | 0x07
             | 0x0E
             | 0x16
@@ -554,25 +1243,42 @@ pub(crate) mod x86 {
             | 0x2F
             | 0x37
             | 0x3F
-            | 0x40..=0x5F
-            | 0x90..=0x99
+            | 0x90
             | 0x9B..=0x9F
-            | 0xD7
             | 0xF5
             | 0xF8
             | 0xF9
             | 0xFC
-            | 0xFD => Some(one(c, start, Normal)),
-            // Accumulator + immediate.
-            0x04 | 0x0C | 0x14 | 0x1C | 0x24 | 0x2C | 0x34 | 0x3C | 0xA8 | 0x6A => {
-                finish_imm(c, start, 1, Normal)
+            | 0xFD => Some(one(c, start, Normal, Eff::NoGp)),
+            // Accumulator ALU + immediate (writes rax); cmp/test/push imm write no GP register.
+            0x04 | 0x0C | 0x14 | 0x1C | 0x24 | 0x2C | 0x34 => {
+                finish_imm(c, start, 1, Normal, Eff::Wr(bit(0)))
             }
-            0x05 | 0x0D | 0x15 | 0x1D | 0x25 | 0x2D | 0x35 | 0x3D | 0xA9 | 0x68 => {
-                finish_imm(c, start, imm_z(p), Normal)
+            0x3C | 0xA8 | 0x6A => finish_imm(c, start, 1, Normal, Eff::NoGp),
+            0x05 | 0x0D | 0x15 | 0x1D | 0x25 | 0x2D | 0x35 => {
+                finish_imm(c, start, imm_z(p), Normal, Eff::Wr(bit(0)))
             }
-            // mov reg, imm.
-            0xB0..=0xB7 => finish_imm(c, start, 1, Normal),
-            0xB8..=0xBF => finish_imm(c, start, if p.rex_w { 8 } else { imm_z(p) }, Normal),
+            0x3D | 0xA9 | 0x68 => finish_imm(c, start, imm_z(p), Normal, Eff::NoGp),
+            // mov r8, imm8 — writes the opcode-encoded register (byte write → clobber).
+            0xB0..=0xB7 => {
+                let dst = (op & 0x07) | (u8::from(p.rex_b) << 3);
+                finish_imm(c, start, 1, Normal, Eff::Wr(bit(dst)))
+            }
+            // mov r32/r64, imm — writes a known constant into the opcode-encoded register.
+            0xB8..=0xBF => {
+                let dst = (op & 0x07) | (u8::from(p.rex_b) << 3);
+                let size = if p.rex_w { 8 } else { imm_z(p) };
+                let immv = read_imm(c, size)?;
+                Some(Decoded {
+                    len: c.pos - start,
+                    kind: Normal,
+                    operands: NO_OPERANDS,
+                    eff: Eff::MovImm {
+                        dst,
+                        imm: if p.rex_w { immv } else { immv & 0xFFFF_FFFF },
+                    },
+                })
+            }
             _ => Some(UNDECODABLE),
         }
     }
@@ -580,56 +1286,90 @@ pub(crate) mod x86 {
     /// Group 3 (`F6`/`F7`): `/0`,`/1` (test) carry an immediate; `/2..` (not/neg/mul/imul/div/idiv)
     /// do not.
     fn group3(c: &mut Cursor, start: usize, p: &Pfx, imm: usize) -> Option<Decoded> {
-        let reg = (c.peek()? >> 3) & 0x07;
-        finish_modrm(c, start, p, if reg <= 1 { imm } else { 0 }, Kind::Normal)
+        let digit = (c.peek()? >> 3) & 0x07;
+        let imm_bytes = if digit <= 1 { imm } else { 0 };
+        finish_modrm(
+            c,
+            start,
+            p,
+            imm_bytes,
+            Kind::Normal,
+            EffIntent::Group3(digit),
+        )
     }
 
     /// Group 5 (`FF`): `/2`,`/3` indirect call, `/4`,`/5` indirect jmp, others inc/dec/push r/m.
     fn group5(c: &mut Cursor, start: usize, p: &Pfx) -> Option<Decoded> {
-        let reg = (c.peek()? >> 3) & 0x07;
-        let kind = match reg {
+        let digit = (c.peek()? >> 3) & 0x07;
+        let kind = match digit {
             2 | 3 => Kind::IndirectCall,
             4 | 5 => Kind::IndirectJmp,
             _ => Kind::Normal,
         };
-        finish_modrm(c, start, p, 0, kind)
+        finish_modrm(c, start, p, 0, kind, EffIntent::Group5(digit))
     }
 
     fn decode_0f(c: &mut Cursor, start: usize, p: &Pfx, op2: u8) -> Option<Decoded> {
+        use EffIntent as E;
         use Kind::*;
         match op2 {
-            0x05 => return Some(one(c, start, Forbidden("syscall"))),
-            0x07 => return Some(one(c, start, Forbidden("sysret"))),
-            0x34 => return Some(one(c, start, Forbidden("sysenter"))),
-            0x35 => return Some(one(c, start, Forbidden("sysexit"))),
-            0x0B => return Some(one(c, start, Ud2)), // the trap Cranelift emits for `unreachable`
-            0x20..=0x23 => return finish_modrm(c, start, p, 0, Forbidden("mov cr/dr")),
+            0x05 => return Some(one(c, start, Forbidden("syscall"), Eff::NoGp)),
+            0x07 => return Some(one(c, start, Forbidden("sysret"), Eff::NoGp)),
+            0x34 => return Some(one(c, start, Forbidden("sysenter"), Eff::NoGp)),
+            0x35 => return Some(one(c, start, Forbidden("sysexit"), Eff::NoGp)),
+            0x0B => return Some(one(c, start, Ud2, Eff::NoGp)), // trap Cranelift emits for `unreachable`
+            0x20..=0x23 => return finish_modrm(c, start, p, 0, Forbidden("mov cr/dr"), E::NoGp),
             0x80..=0x8F => {
                 let rel = c.rel(4)?; // jcc rel32
                 return Some(rel_insn(start, c.pos, rel, Branch::Jcc));
             }
+            // cmovcc r, r/m — the D63 confinement redirect.
+            0x40..=0x4F => return finish_modrm(c, start, p, 0, Normal, E::Cmov),
+            // setcc r/m8 (byte write → clobber the r/m register).
+            0x90..=0x9F => return finish_modrm(c, start, p, 0, Normal, E::WrRm),
+            // movzx/movsx r, r/m — zero/sign-extended, not a tracked pointer value → clobber reg.
+            0xB6 | 0xB7 | 0xBE | 0xBF => return finish_modrm(c, start, p, 0, Normal, E::WrReg),
+            0xAF => return finish_modrm(c, start, p, 0, Normal, E::WrReg), // imul r, r/m
+            0xBC | 0xBD => return finish_modrm(c, start, p, 0, Normal, E::WrReg), // bsf/bsr r, r/m
+            // shld/shrd r/m, r, (imm8|cl) — write the r/m.
+            0xA4 | 0xAC => return finish_modrm(c, start, p, 1, Normal, E::WrRm),
+            0xA5 | 0xAD => return finish_modrm(c, start, p, 0, Normal, E::WrRm),
+            0xAB | 0xB3 | 0xBB => return finish_modrm(c, start, p, 0, Normal, E::WrRm), // bts/btr/btc r/m
+            0xA3 => return finish_modrm(c, start, p, 0, Normal, E::NoGp), // bt — flags only
+            0xC0 | 0xC1 => return finish_modrm(c, start, p, 0, Normal, E::XchgRegRm), // xadd — writes both
+            0xB0 | 0xB1 => return finish_modrm(c, start, p, 0, Normal, E::Wr(bit(0))), // cmpxchg → rax (+ r/m)
+            0xA2 => {
+                return Some(one(
+                    c,
+                    start,
+                    Normal,
+                    Eff::Wr(bit(0) | bit(1) | bit(2) | bit(3)),
+                ))
+            } // cpuid
+            0x31 => return Some(one(c, start, Normal, Eff::Wr(bit(0) | bit(2)))), // rdtsc → rax, rdx
+            0x77 => return Some(one(c, start, Normal, Eff::NoGp)),                // emms
             _ => {}
         }
         match op2 {
-            // ModRM + imm8 (pshuf, cmpps/sd, shufps, pinsrw/pextrw, the shift groups, shld/shrd imm8).
-            0x70..=0x73 | 0xC2 | 0xC4 | 0xC5 | 0xC6 | 0xA4 | 0xAC => {
-                finish_modrm(c, start, p, 1, Normal)
-            }
-            // The 0F opcodes with no ModRM byte Cranelift emits: emms, cpuid, rdtsc.
-            0x77 | 0xA2 | 0x31 => Some(one(c, start, Normal)),
-            // 0F AE (fence / clflush) and everything else in the 0F map: ModRM, no immediate.
-            _ => finish_modrm(c, start, p, 0, Normal),
+            // SSE/vector ModRM + imm8 (operands are XMM — no GP write) …
+            0x70..=0x73 | 0xC2 | 0xC4 | 0xC6 => finish_modrm(c, start, p, 1, Normal, E::NoGp),
+            // … except pextrw r32, xmm, imm8, which writes a GP register.
+            0xC5 => finish_modrm(c, start, p, 1, Normal, E::WrReg),
+            // Everything else in the 0F map (SSE/SSE2 float+int vector ops, fences): ModRM, no imm.
+            // A handful move a value into a GP register; those are cross-checked against iced and the
+            // ones the corpus exercises are classified above. The rest are XMM-only (no GP write).
+            _ => finish_modrm(c, start, p, 0, Normal, E::NoGp),
         }
     }
 
     fn decode_0f38(c: &mut Cursor, start: usize, p: &Pfx) -> Option<Decoded> {
-        c.next()?; // opcode in the 0F38 map — all have ModRM, no immediate
-        finish_modrm(c, start, p, 0, Kind::Normal)
+        c.next()?; // opcode in the 0F38 map — all have ModRM, no immediate; XMM-only (no GP write)
+        finish_modrm(c, start, p, 0, Kind::Normal, EffIntent::NoGp)
     }
 
     fn decode_0f3a(c: &mut Cursor, start: usize, p: &Pfx) -> Option<Decoded> {
-        c.next()?; // opcode in the 0F3A map — all have ModRM + imm8
-        finish_modrm(c, start, p, 1, Kind::Normal)
+        c.next()?; // opcode in the 0F3A map — all have ModRM + imm8; XMM-only (no GP write)
+        finish_modrm(c, start, p, 1, Kind::Normal, EffIntent::NoGp)
     }
 
     fn decode_vex2(c: &mut Cursor, start: usize) -> Option<Decoded> {
@@ -701,23 +1441,34 @@ pub(crate) mod x86 {
             Map::Of38 => 0,
             Map::Of => usize::from(matches!(op, 0x70..=0x73 | 0xC2 | 0xC4 | 0xC5 | 0xC6)),
         };
-        finish_modrm(c, start, p, imm, Kind::Normal)
+        // VEX/EVEX encode AVX vector ops: their operands are XMM/YMM/ZMM, so no GP register is
+        // written. (The BMI GP-writing VEX ops are not in the corpus; the iced write-set cross-check
+        // would flag one if it appeared, to be classified then.)
+        finish_modrm(c, start, p, imm, Kind::Normal, EffIntent::NoGp)
     }
 
-    fn one(c: &Cursor, start: usize, kind: Kind) -> Decoded {
+    fn one(c: &Cursor, start: usize, kind: Kind, eff: Eff) -> Decoded {
         Decoded {
             len: c.pos - start,
             kind,
             operands: NO_OPERANDS,
+            eff,
         }
     }
 
-    fn finish_imm(c: &mut Cursor, start: usize, imm: usize, kind: Kind) -> Option<Decoded> {
+    fn finish_imm(
+        c: &mut Cursor,
+        start: usize,
+        imm: usize,
+        kind: Kind,
+        eff: Eff,
+    ) -> Option<Decoded> {
         c.skip(imm)?;
         Some(Decoded {
             len: c.pos - start,
             kind,
             operands: NO_OPERANDS,
+            eff,
         })
     }
 
@@ -738,6 +1489,7 @@ pub(crate) mod x86 {
             len: end - start,
             kind,
             operands: NO_OPERANDS,
+            eff: Eff::NoGp,
         }
     }
 
@@ -775,11 +1527,15 @@ pub(crate) mod x86 {
     mod tests {
         use super::*;
         use crate::{compile, validate};
-        use iced_x86::{Decoder, DecoderOptions, Instruction, OpKind, Register};
+        use iced_x86::{
+            Decoder, DecoderOptions, Instruction, InstructionInfoFactory, OpAccess, OpKind,
+            Register,
+        };
         use temen_text::parse_module;
 
-        /// Compile `src` through the real JIT path and return each function's `(code, bb_starts)`.
-        fn compiled(src: &str) -> Vec<(Vec<u8>, Vec<u32>)> {
+        /// Compile `src` through the real JIT path and return each function's
+        /// `(code, bb_starts, bb_edges)`.
+        fn compiled(src: &str) -> Vec<crate::validate::CapturedFn> {
             let m = parse_module(src).expect("parse");
             validate::arm_capture();
             let _ = compile(&m, 0).expect("compile");
@@ -796,6 +1552,28 @@ pub(crate) mod x86 {
         /// A GP register's 0..15 encoding number, or `None` for a non-GP / absent register.
         fn gp(r: Register) -> Option<u8> {
             r.is_gpr64().then(|| r.number() as u8)
+        }
+
+        /// iced's GP-register write-set for one instruction, as our 16-bit mask: every register it
+        /// writes (unconditionally or conditionally), mapped to its 64-bit container's number.
+        fn iced_gp_writes(insn: &Instruction) -> u16 {
+            let mut f = InstructionInfoFactory::new();
+            let mut w = 0u16;
+            for ur in f.info(insn).used_registers() {
+                let writes = matches!(
+                    ur.access(),
+                    OpAccess::Write
+                        | OpAccess::ReadWrite
+                        | OpAccess::CondWrite
+                        | OpAccess::ReadCondWrite
+                );
+                if writes {
+                    if let Some(n) = gp(ur.register().full_register()) {
+                        w |= 1 << u16::from(n);
+                    }
+                }
+            }
+            w
         }
 
         /// iced's single explicit memory operand as `(base, index, scale, disp, rip)`, in our shape,
@@ -824,7 +1602,7 @@ pub(crate) mod x86 {
         /// The decoder's boundaries, validity, and memory-operand decode must match iced-x86 on real
         /// output, and `check` must find nothing on clean Cranelift code.
         fn cross_check(src: &str) {
-            for (bytes, bb_starts) in compiled(src) {
+            for (bytes, bb_starts, bb_edges) in compiled(src) {
                 for (pos, d) in walk(&bytes, &bb_starts) {
                     assert_ne!(d.len, 0, "ours: undecodable at +0x{pos:x}\n{:02x?}", bytes);
                     let insn = iced_at(&bytes, pos).unwrap_or_else(|| {
@@ -852,8 +1630,24 @@ pub(crate) mod x86 {
                             bytes
                         );
                     }
+                    // Soundness of the dataflow transfer: our GP write-set must cover iced's. A GP
+                    // register iced says the instruction writes but we don't would let a stale fact
+                    // (mem_base, a confined index) survive a real overwrite — the escape the #2535
+                    // clobber exists to prevent. rsp/rbp are excluded: they are the stack pointer and
+                    // frame pointer, recognized structurally, never carriers of a tracked fact.
+                    const SP_BP: u16 = (1 << reg::RSP) | (1 << reg::RBP);
+                    let ours = writes_of(d.eff, &d.operands);
+                    let iced_w = iced_gp_writes(&insn);
+                    assert_eq!(
+                        iced_w & !ours & !SP_BP,
+                        0,
+                        "GP write-set gap at +0x{pos:x}: iced writes {iced_w:#06x}, ours {ours:#06x}, \
+                         eff {:?}\n{:02x?}",
+                        d.eff,
+                        bytes
+                    );
                 }
-                let findings = check(&bytes, &bb_starts);
+                let findings = check(&bytes, &bb_starts, &bb_edges);
                 assert!(
                     findings.is_empty(),
                     "clean Cranelift output flagged: {findings:?}\n{:02x?}",
@@ -920,6 +1714,21 @@ pub(crate) mod x86 {
         }
 
         #[test]
+        fn memory_loop_carries_membase_across_blocks() {
+            // A load inside a loop body: `mem_base` (a context param) stays live across every block
+            // while the loop-carried index is confined per iteration — the cross-block dataflow the
+            // #2535 engine must get right (and find nothing to flag).
+            cross_check(
+                "memory 16\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i64.const 0\n  \
+                 br 1(v0, v1)\n  }\nblock 1 (v2: i64, v3: i64) {\n  v4 = i64.const 0\n  \
+                 v5 = i64.eq v2 v4\n  br_if v5 3(v3) 2(v2, v3)\n  }\n\
+                 block 2 (v6: i64, v7: i64) {\n  v8 = i64.load v6\n  v9 = i64.add v7 v8\n  \
+                 v10 = i64.const 8\n  v11 = i64.sub v6 v10\n  br 1(v11, v9)\n  }\n\
+                 block 3 (v12: i64) {\n  return v12\n  }\n}\n",
+            );
+        }
+
+        #[test]
         fn br_table_jump_table_island() {
             // `br_table` lowers to a bounds check + an indirect `jmp` through a jump table that
             // Cranelift embeds in the code buffer. The block-driven walk must stop at the indirect
@@ -942,6 +1751,73 @@ pub(crate) mod x86 {
             assert_eq!(decode(&bytes, 0).len, 5);
             assert!(matches!(decode(&bytes, 5).kind, Kind::Forbidden("syscall")));
             assert!(matches!(decode(&bytes, 7).kind, Kind::Ret));
+        }
+
+        /// The abstract lattice's `meet` (the fact true on both paths) and the loop-header widening
+        /// that bounds the fixpoint (#2535).
+        #[test]
+        fn lattice_meet_and_widen() {
+            use Fact::*;
+            assert_eq!(MemBase.meet(MemBase), MemBase);
+            assert_eq!(MemBase.meet(Vmctx), Unknown);
+            assert_eq!(Confined.meet(Confined), Confined);
+            assert_eq!(Confined.meet(Unknown), Unknown);
+            assert_eq!(Const(5).meet(Const(5)), Const(5));
+            assert_eq!(Const(5).meet(Const(6)), Unknown);
+            // A bound true on both paths is the looser (larger) of the two.
+            assert_eq!(Bounded(4).meet(Bounded(8)), Bounded(8));
+            assert_eq!(Bounded(4).meet(MemBase), Unknown);
+
+            // Widening at a loop header drops `Bounded` (which could grow each iteration) but keeps
+            // the loop-invariant context-param and `Confined` facts, so the fixpoint terminates.
+            let mut s = State::entry();
+            s.regs[8] = Bounded(16);
+            s.regs[9] = Confined;
+            s.widen();
+            assert_eq!(s.regs[8], Unknown);
+            assert_eq!(s.regs[9], Confined);
+            assert_eq!(s.regs[reg::RDI as usize], MemBase);
+        }
+
+        /// A window access through an index that was **not** confined by the D63 sequence is the
+        /// escape-relevant case the policy must flag: `mov rax, [rdi + r8]` with `r8` a guest
+        /// argument (unknown, unconfined) and `rdi` = `mem_base`.
+        #[test]
+        fn policy_flags_unconfined_window_index() {
+            let bytes = [0x4a, 0x8b, 0x04, 0x07, 0xc3]; // mov rax,[rdi+r8*1]; ret
+            let f = check(&bytes, &[], &[]);
+            assert!(
+                f.iter().any(|f| f.why.contains("unconfined index")),
+                "expected an unconfined-window-index finding, got {f:?}"
+            );
+        }
+
+        /// A memory access whose base register has no recognized provenance (here `r9`, a guest
+        /// argument) is flagged — it is neither the window, the stack, vmctx, the fn-table, nor rodata.
+        #[test]
+        fn policy_flags_unknown_base() {
+            let bytes = [0x49, 0x8b, 0x01, 0xc3]; // mov rax,[r9]; ret
+            let f = check(&bytes, &[], &[]);
+            assert!(
+                f.iter().any(|f| f.why.contains("unrecognized provenance")),
+                "expected an unknown-base finding, got {f:?}"
+            );
+        }
+
+        /// The full D63 confinement sequence is recognized and produces no finding: materialize the
+        /// guard, compare the index, `cmovae` it to the guard, then access `[mem_base + confined]`.
+        #[test]
+        fn policy_accepts_the_confinement_sequence() {
+            let bytes = [
+                0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00,
+                0x00, // mov rax, 0x2000000000
+                0x4c, 0x3b, 0xc0, // cmp r8, rax
+                0x4c, 0x0f, 0x43, 0xc0, // cmovae r8, rax
+                0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
+                0xc3, // ret
+            ];
+            let f = check(&bytes, &[], &[]);
+            assert!(f.is_empty(), "the confinement sequence was flagged: {f:?}");
         }
     }
 }
