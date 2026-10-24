@@ -159,6 +159,7 @@ jobs:
           # makes consequential. Exact key or rebuild.
           key: nimony-${{ runner.os }}-${{ steps.nimony-rev.outputs.sha }}-${{ hashFiles('scripts/ci/provision-nimony.sh') }}
       - name: Build nimony toolchain
+        id: toolchain
         env:
           NIMONY_REV: ${{ matrix.part == 'upstream' && 'master' || '' }}
         run: scripts/ci/provision-nimony.sh "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
@@ -174,11 +175,15 @@ jobs:
       # holds it to the nimsem that built it (`NIM_LANE_SELF`); a PR run leaves it out.
       # #1609: the lane builds `temen-link` through the LLVM on-ramp (rustc IR → llvm-link/opt →
       # temen-llvm-translate), so it needs the LLVM tools pinned to the stable rustc's major.
+      # #2613: in `upstream` the lane runs whenever the toolchain built, even when the tests above
+      # failed. It used to be skipped then, and a week of the lane's own failures went unseen behind
+      # the tests'.
       - name: install LLVM (the lane's temen-link build)
-        if: matrix.part != 'tests'
+        id: llvm
+        if: "!cancelled() && matrix.part != 'tests' && steps.toolchain.outcome == 'success'"
         uses: ./.github/actions/install-llvm
       - name: Self-hosted nimony lane (must match native)
-        if: matrix.part != 'tests'
+        if: "!cancelled() && matrix.part != 'tests' && steps.llvm.outcome == 'success'"
         env:
           NIM_LANE_SELF: ${{ matrix.part == 'selfhost' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '1' || '' }}
         run: bash scripts/ci/nim-selfhost-lane.sh
