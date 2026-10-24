@@ -25,6 +25,9 @@ temen-interp.workspace = true
 temen-jit.workspace = true
 temen-wasm-jit.workspace = true
 temen-run = { path = "../temen-run" }
+# #2545: the `frozen and thawed` runners instrument a probe and round-trip it through the §12 codec.
+temen-durable.workspace = true
+temen-snapshot.workspace = true
 
 [[bin]]
 # Regenerate the checked-in human-readable matrix (`OPS_PARITY.md`): `cargo run -p temen-parity`.

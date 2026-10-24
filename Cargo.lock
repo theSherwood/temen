@@ -804,11 +804,13 @@ dependencies = [
 name = "temen-parity"
 version = "0.0.0"
 dependencies = [
+ "temen-durable",
  "temen-encode",
  "temen-interp",
  "temen-ir",
  "temen-jit",
  "temen-run",
+ "temen-snapshot",
  "temen-text",
  "temen-verify",
  "temen-wasm-jit",
