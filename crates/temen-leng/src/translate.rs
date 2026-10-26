@@ -338,7 +338,14 @@ pub(crate) struct FnPtrSig {
     /// True if this proctype returns an aggregate by sret — `params[0]` is then the `$sret` pointer
     /// and `results` is empty. Such a call must flow to an aggregate destination (`call_sret`).
     sret: bool,
+    /// True if the last param is a closure's env ([`CLOSURE_ENV`]): this is a closure's function,
+    /// and a call through it goes through its dispatcher ([`Translator::closure_dispatch`]).
+    env: bool,
 }
+
+/// The env param nimony appends to a closure's function (`ClosureEnvParamName` in
+/// `hexer/closuretypes.nim`): a compiler-made name no program can declare.
+const CLOSURE_ENV: &str = "`ep.0";
 
 /// What a computed lvalue address points at — a scalar (with load/store width) or a named
 /// aggregate (whose fields/elements are reached by further `dot`/`at`).
@@ -500,6 +507,16 @@ pub(crate) struct Translator {
     /// Filled while proc bodies are translated, because only there is an atom known to be a value
     /// rather than a pragma's or a suffix's spelling; nothing is placed after it, so no global moves.
     cstr_pool: RefCell<Vec<u8>>,
+    /// **Closure-call dispatchers** (#2611): one per closure function type a call goes through, in
+    /// function-index order after the unit's procs, and [`assemble`](Self::assemble)d after them.
+    ///
+    /// A closure whose env is nil holds a plain proc, which takes no env: nimony converts a proc to
+    /// a closure by casting it beside a nil env, and compiles a closure that captures nothing as a
+    /// plain proc. Its own `env == nil` dispatch calls such a function without the env, but a call
+    /// through a closure-typed field or global passes the env whatever the function is, which C
+    /// ignores and `call.dyn` does not. So every call through a closure's function type calls its
+    /// dispatcher, which chooses as nimony's dispatch does: without the env when it is nil.
+    closure_dispatch: RefCell<Vec<FnPtrSig>>,
     /// **Link-unit mode.** When true, the module is emitted as a relocatable link unit (`.temeno`
     /// shape): a global's address is a `data.self <off>` the linker rewrites, and one zero-filled
     /// `data` segment covers `[16, globals_top)` so the linker reserves and relocates the whole
@@ -664,6 +681,7 @@ impl Translator {
             funcref_inits: Vec::new(),
             globals_top: 16,
             cstr_pool: RefCell::default(),
+            closure_dispatch: RefCell::default(),
             link_mode: false,
             globals: HashMap::default(),
             unsigned_globals: HashSet::default(),
@@ -757,6 +775,17 @@ impl Translator {
         Ok(off)
     }
 
+    /// The function index of the dispatcher for calls through closure function type `sig`
+    /// ([`closure_dispatch`](Self::closure_dispatch)).
+    fn closure_dispatcher(&self, sig: &FnPtrSig) -> u32 {
+        let mut d = self.closure_dispatch.borrow_mut();
+        let k = d.iter().position(|s| s == sig).unwrap_or_else(|| {
+            d.push(sig.clone());
+            d.len() - 1
+        });
+        (self.procs.len() + k) as u32
+    }
+
     /// Assemble the final module text: `memory` (if used) + `import` declarations + the globals
     /// `data` segment (relocatable; addressed via `data.self`) + funcs. The emitted module is a
     /// **link unit** whenever it has globals — its `data.self`/imports resolve at `link` time (a
@@ -838,6 +867,52 @@ impl Translator {
             ));
         }
         out.push_str(&funcs);
+        // The closure-call dispatchers, after the procs: `$sp`, the funcref, and the call's args
+        // with the env last. A nil env's function is a plain proc, called without it (block 1).
+        for sig in self.closure_dispatch.borrow().iter() {
+            let tys: Vec<&str> = ["i64", "i32"]
+                .into_iter()
+                .chain(sig.params.iter().map(|t| prefix(*t)))
+                .collect();
+            let n = tys.len();
+            let vs = |r: std::ops::Range<usize>| r.map(|i| format!("v{i}")).collect::<Vec<_>>();
+            let params: Vec<String> = tys
+                .iter()
+                .enumerate()
+                .map(|(i, t)| format!("v{i}: {t}"))
+                .collect();
+            let params = params.join(", ");
+            let all = vs(0..n).join(", ");
+            let rtys: Vec<&str> = sig.results.iter().map(|t| prefix(*t)).collect();
+            let (bind, ret) = match rtys.len() {
+                0 => (String::new(), "return".to_string()),
+                _ => (format!("v{n} = "), format!("return v{n}")),
+            };
+            // One arm: `call.dyn` through the funcref, passing `$sp` and the args below `upto`.
+            let arm = |upto: usize| {
+                let ptys: Vec<&str> = std::iter::once("i64")
+                    .chain(tys[2..upto].iter().copied())
+                    .collect();
+                let args: Vec<String> = std::iter::once("v0".to_string())
+                    .chain(vs(2..upto))
+                    .collect();
+                format!(
+                    "  {bind}call.dyn ({}) -> ({}) v1 ({})\n  {ret}\n  }}\n",
+                    ptys.join(", "),
+                    rtys.join(", "),
+                    args.join(", ")
+                )
+            };
+            out.push_str(&format!(
+                "func ({}) -> ({}) {{\nblock 0 ({params}) {{\n  v{n} = i64.const 0\n  v{c} = i64.eq v{e} v{n}\n  br_if v{c} 1({all}) 2({all})\n  }}\nblock 1 ({params}) {{\n{}block 2 ({params}) {{\n{}}}\n",
+                tys.join(", "),
+                rtys.join(", "),
+                arm(n - 1),
+                arm(n),
+                c = n + 1,
+                e = n - 1,
+            ));
+        }
         out
     }
 
@@ -1776,11 +1851,13 @@ impl Translator {
             .position(|n| n.tag() == Some("params"))
             .ok_or_else(|| LengError::Malformed("proctype needs (params …)".into()))?;
         let mut params = Vec::new();
+        let mut env = false;
         for prm in a[pi].args() {
             if prm.tag() == Some("param") {
                 let pa = prm.args();
                 if pa.len() >= 3 {
                     params.push(self.param_val_ty(&pa[2])?);
+                    env = sym_def(&pa[0]).is_ok_and(|n| n == CLOSURE_ENV);
                 }
             }
         }
@@ -1802,6 +1879,7 @@ impl Translator {
             params,
             results,
             sret,
+            env,
         })
     }
 
@@ -5936,13 +6014,39 @@ impl<'a> FuncGen<'a> {
         for (arg, want) in args.iter().zip(&sig.params) {
             argvals.push(self.call_arg(arg, *want)?);
         }
+        let head = self.indirect_head(idx, sig, &mut argvals);
         let arglist = argvals
             .iter()
             .map(|id| format!("v{id}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let plist = std::iter::once("i64".to_string())
-            .chain(sig.params.iter().map(|t| prefix(*t).to_string()))
+        match sig.results.first() {
+            Some(rt) => {
+                let id = self.fresh();
+                self.cur_buf
+                    .push_str(&format!("  v{id} = {head} ({arglist})\n"));
+                Ok(Val { id, ty: *rt })
+            }
+            None => {
+                self.cur_buf.push_str(&format!("  {head} ({arglist})\n"));
+                Ok(Val {
+                    id: u32::MAX,
+                    ty: ValType::I32,
+                })
+            }
+        }
+    }
+
+    /// The head of an indirect call through funcref `idx` of type `sig`, whose `argvals` start with
+    /// `$sp`: `call.dyn <type> v<idx>`, or, through a closure's function type, a call of the type's
+    /// dispatcher, which takes the funcref after `$sp` ([`Translator::closure_dispatch`]).
+    fn indirect_head(&self, idx: u32, sig: &FnPtrSig, argvals: &mut Vec<u32>) -> String {
+        if sig.env {
+            argvals.insert(1, idx);
+            return format!("call {}", self.t.closure_dispatcher(sig));
+        }
+        let plist = std::iter::once("i64")
+            .chain(sig.params.iter().map(|t| prefix(*t)))
             .collect::<Vec<_>>()
             .join(", ");
         let rlist = sig
@@ -5951,23 +6055,7 @@ impl<'a> FuncGen<'a> {
             .map(|t| prefix(*t))
             .collect::<Vec<_>>()
             .join(", ");
-        match sig.results.first() {
-            Some(rt) => {
-                let id = self.fresh();
-                self.cur_buf.push_str(&format!(
-                    "  v{id} = call.dyn ({plist}) -> ({rlist}) v{idx} ({arglist})\n"
-                ));
-                Ok(Val { id, ty: *rt })
-            }
-            None => {
-                self.cur_buf
-                    .push_str(&format!("  call.dyn ({plist}) -> () v{idx} ({arglist})\n"));
-                Ok(Val {
-                    id: u32::MAX,
-                    ty: ValType::I32,
-                })
-            }
-        }
+        format!("call.dyn ({plist}) -> ({rlist}) v{idx}")
     }
 
     /// Emit an aggregate-returning **`call.dyn`** through funcref `idx`: the `sret` pointer
@@ -5995,17 +6083,13 @@ impl<'a> FuncGen<'a> {
         for (arg, want) in args.iter().zip(visible) {
             argvals.push(self.call_arg(arg, *want)?);
         }
+        let head = self.indirect_head(idx, sig, &mut argvals);
         let arglist = argvals
             .iter()
             .map(|id| format!("v{id}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let plist = std::iter::once("i64".to_string())
-            .chain(sig.params.iter().map(|t| prefix(*t).to_string()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        self.cur_buf
-            .push_str(&format!("  call.dyn ({plist}) -> () v{idx} ({arglist})\n"));
+        self.cur_buf.push_str(&format!("  {head} ({arglist})\n"));
         Ok(())
     }
 
