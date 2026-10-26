@@ -1551,6 +1551,8 @@ fn build_spawn_shim(wts: u32) -> Func {
         params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64, ValType::I64],
             insts,
             term: Terminator::Return(vec![ret]),
@@ -1588,6 +1590,8 @@ fn build_start_wrapper(
         params: params.clone(),
         results,
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts,
             term: Terminator::Return(ret),
@@ -1730,6 +1734,8 @@ fn lower_func(
         .blocks
         .into_iter()
         .map(|b| Block {
+            parent: 0,
+            captures: vec![],
             params: b.params,
             insts: b.insts,
             // An un-terminated block is unreachable code wasm validation allows; make it explicit.

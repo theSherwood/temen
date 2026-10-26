@@ -12,6 +12,7 @@ struct Fixture {
     child: Arc<Mutex<Host>>,
     registry: Arc<FiberRegistry>,
     threads: Vec<Option<TaskId>>,
+    unreaped: Vec<(usize, TaskId)>,
     child_hosts: BTreeMap<usize, Arc<Mutex<Host>>>,
     child_freeze: BTreeMap<usize, (Arc<AtomicBool>, DetachedSpawn)>,
 }
@@ -24,6 +25,7 @@ impl Fixture {
             child: Arc::new(Mutex::new(Host::new())),
             registry: Arc::new(FiberRegistry::new()),
             threads: Vec::new(),
+            unreaped: Vec::new(),
             child_hosts: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
         }
@@ -34,6 +36,7 @@ impl Fixture {
         Seat {
             id: 0,
             threads: &self.threads,
+            unreaped: &self.unreaped,
             child_hosts: &self.child_hosts,
             child_freeze: &self.child_freeze,
             host: &self.root,
@@ -46,7 +49,12 @@ impl Fixture {
     }
 
     /// A live detached child at slot 0, task 7 — with a doorbell when `bell`.
-    fn with_detached_child(mut self, bell: bool) -> Fixture {
+    fn with_detached_child(self, bell: bool) -> Fixture {
+        self.with_child(bell, None)
+    }
+
+    /// [`Fixture::with_detached_child`], demand-paged by `pager` when it has one.
+    fn with_child(mut self, bell: bool, pager: Option<u32>) -> Fixture {
         self.threads = vec![Some(7)];
         self.child_hosts.insert(0, Arc::clone(&self.child));
         if bell {
@@ -58,11 +66,18 @@ impl Fixture {
                     DetachedSpawn {
                         digest: module_digest(&m),
                         module: m,
-                        pager: None,
+                        pager,
                     },
                 ),
             );
         }
+        self
+    }
+
+    /// #2465 — the child at slot 0, detached (op 10) while it runs: no join slot names it.
+    fn detached_by_op_10(mut self) -> Fixture {
+        self.threads = vec![None];
+        self.unreaped = vec![(0, 7)];
         self
     }
 }
@@ -90,6 +105,47 @@ fn a_live_detached_child_without_a_doorbell_declines() {
         f.census(&f.root_seat()),
         Some(DeclineCause::DetachedUnreachable)
     );
+}
+
+/// #2465 — a child its spawner detached (op 10) is in the cut as one its join slot names: it rides
+/// when its doorbell can reach it, and declines when nothing can.
+#[test]
+fn a_child_detached_by_op_10_is_censused_as_a_joinable_one() {
+    let f = Fixture::new().with_detached_child(true).detached_by_op_10();
+    assert_eq!(f.census(&f.root_seat()), None);
+    let f = Fixture::new()
+        .with_detached_child(false)
+        .detached_by_op_10();
+    assert_eq!(
+        f.census(&f.root_seat()),
+        Some(DeclineCause::DetachedUnreachable)
+    );
+}
+
+/// #2465, #2455 — a paged child its spawner detached (op 10) holds its pager's domain as one its join
+/// slot names does: the freeze rings it, and the domain serves it until it has unwound.
+#[test]
+fn a_paged_child_detached_by_op_10_holds_its_pager() {
+    for detached in [false, true] {
+        let mut f = Fixture::new().with_child(true, Some(0));
+        if detached {
+            f = f.detached_by_op_10();
+        }
+        let SchedRef::Real(rs) = &f.sched else {
+            unreachable!()
+        };
+        let domain = f.root.lock_unpoisoned().domain_id() as usize;
+        let seat = f.root_seat();
+        assert!(
+            hold_for_paged(&mut rs.lock(), domain, Some(&seat)),
+            "held, detached {detached}"
+        );
+        assert!(rs.lock().held[&domain].contains(&7), "for the child");
+        assert!(
+            f.child_freeze[&0].0.load(Ordering::Relaxed),
+            "the child is rung, detached {detached}"
+        );
+    }
 }
 
 /// #1674: a trap now rides the artifact, so a child that finished with one is no reason to decline.
@@ -189,6 +245,8 @@ fn parked_vcpu(f: &Fixture, id: TaskId) -> Box<VCpu> {
         params: vec![],
         results: vec![],
         blocks: vec![temen_ir::Block {
+            parent: 0,
+            captures: vec![],
             params: vec![],
             insts: vec![],
             term: Terminator::Return(vec![]),

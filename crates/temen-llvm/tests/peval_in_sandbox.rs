@@ -30,6 +30,8 @@ fn oracle_module() -> Module {
             params: vec![],
             results: vec![ValType::I32],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![
                     Inst::ConstI32(21),

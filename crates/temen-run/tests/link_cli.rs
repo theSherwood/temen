@@ -64,6 +64,8 @@ fn unit_b() -> Module {
             params: vec![],
             results: vec![ValType::I64],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![
                     Inst::DataSelf {

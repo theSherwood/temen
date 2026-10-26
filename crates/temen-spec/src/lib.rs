@@ -1246,6 +1246,8 @@ pub fn module_for(row: &OpRow, vector: &[SpecVal]) -> Module {
             params: params.clone(),
             results: vec![row.result],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params,
                 insts: vec![inst],
                 term: Terminator::Return(vec![ridx]),
@@ -1631,6 +1633,8 @@ pub fn module_for_mem(row: &MemRow, offset: u64) -> Module {
             params: params.clone(),
             results: row.result.into_iter().collect(),
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params,
                 insts: vec![inst],
                 term,

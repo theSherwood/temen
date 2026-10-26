@@ -9,7 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use temen_interp::{CapState, Host, OffloadOutcome, SignalSource, StreamRole, Value};
+use temen_durable::transform_module_assume_confined;
+use temen_interp::{
+    CapState, Host, HostProc, NamedCapGrant, OffloadOutcome, SignalSource, StreamRole, Value,
+};
+use temen_ir::durable_abi::ShadowArena;
 use temen_ir::{Module, SpawnRec};
 use temen_parity::run_modes::Feature;
 
@@ -43,19 +47,119 @@ pub enum Outside {
 }
 
 /// One run's embedder, as far as a probe reaches it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Embedder {
     /// The job control it holds over the run's process.
     pub stopper: Arc<Stopper>,
+    /// Whether it freezes and thaws the run. It then grants each capability in the form a thaw
+    /// can grant again: a module instrumented and attested freezable ([`Self::image`],
+    /// [`Self::grant_module`]), a host procedure under its name ([`named_proc`]).
+    pub durable: bool,
+}
+
+impl Embedder {
+    /// An embedder that freezes and thaws its run.
+    pub fn durable() -> Embedder {
+        Embedder {
+            durable: true,
+            ..Embedder::default()
+        }
+    }
+
+    /// `m` as this embedder runs it: [`instrumented`] when it freezes and thaws the run.
+    pub fn image(&self, m: Module) -> Module {
+        if self.durable {
+            instrumented(&m).expect("every probe's module instruments")
+        } else {
+            m
+        }
+    }
+
+    /// Grant `m`, an [`image`](Self::image), for a child to run: attested freezable when this
+    /// embedder freezes and thaws the run, since a durable domain spawns only that (DURABILITY.md
+    /// §4).
+    pub fn grant_module(&self, host: &mut Host, m: &Module) -> i32 {
+        if self.durable {
+            host.grant_durable_module(m)
+        } else {
+            host.grant_module(m)
+        }
+    }
+}
+
+/// The shadow arena a durable run's modules declare (INVARIANTS #16): four context regions, in a
+/// part of the window no probe uses.
+pub const ARENA: ShadowArena = ShadowArena::new(32768, 49152);
+
+/// `m` made durable: its window, at least 64 KiB, declares [`ARENA`], and the `temen-durable`
+/// transform instruments it on the guarantee that the guest leaves the arena alone, which every
+/// probe does.
+pub fn instrumented(m: &Module) -> Result<Module, String> {
+    let mut m = m.clone();
+    let size_log2 = m.memory.map_or(16, |w| w.size_log2.max(16));
+    m.memory = Some(temen_ir::Memory {
+        size_log2,
+        shadow: Some(ARENA),
+    });
+    let inst = transform_module_assume_confined(&m)
+        .map_err(|e| format!("the transform refuses the module: {e:?}"))?;
+    temen_verify::verify_module(&inst).map_err(|e| format!("{e:?}"))?;
+    Ok(inst)
+}
+
+/// The host procedures the probes' embedder serves, by the name it grants each under: what a
+/// setup grants ([`grant_named`]), and what its registrar grants again when it thaws the run
+/// (#1455). A registrar re-grants a synchronous procedure, so `"plus100"`, which two setups grant
+/// as an offloadable one, comes back synchronous: a durable run waits on a pool call inline anyway
+/// (#2504).
+pub fn named_proc(name: &str, e: &Embedder) -> Option<HostProc> {
+    let s = Arc::clone(&e.stopper);
+    Some(match name {
+        "plus100" => Box::new(|_op, args, _mem, _minter| Ok(vec![plus_100(args)])),
+        "stop" => Box::new(move |_op, _args, _mem, _minter| {
+            s.set(true);
+            Ok(vec![0])
+        }),
+        "continued" => Box::new(move |_op, _args, _mem, _minter| {
+            Ok(vec![i64::from(s.continued.load(Ordering::SeqCst))])
+        }),
+        _ => return None,
+    })
+}
+
+/// [`named_proc`] as a thaw's registrar re-grants it: stateless, with no fork factory.
+pub fn regrant(name: &str, e: &Embedder) -> Option<NamedCapGrant> {
+    named_proc(name, e).map(|handler| NamedCapGrant {
+        handler,
+        fork: None,
+        state: CapState::Stateless,
+        process: None,
+    })
+}
+
+/// Grant [`named_proc`] `name` under its name.
+fn grant_named(host: &mut Host, e: &Embedder, name: &str) -> i32 {
+    let proc = named_proc(name, e).expect("a probe grants only what its embedder serves");
+    let h = host.grant_host_proc(proc, CapState::Stateless);
+    host.register_cap_name(name, h);
+    h
+}
+
+/// `"plus100"`'s answer: its argument plus 100.
+fn plus_100(args: &[i64]) -> i64 {
+    args.first().copied().unwrap_or(0) + 100
 }
 
 /// An embedder's job control with no personality behind it: the guest stops its own process
 /// through a host call ([`stop_self`]), and the embedder continues it. Each change reaches the
 /// engines through the doors they install, in the order the POSIX personality fires them: the
-/// inline mirror (`set_stop_apply`), then the wake (`set_stop`). The bytecode executors read
-/// [`SignalSource::stopped`].
+/// inline mirror (`set_stop_apply`), then the wake (`set_stop`). A mirror installed while the
+/// process is stopped hears the stop at once, as the personality publishes it to a thawed run
+/// (#1900); the state and the mirror change under one lock, as under the personality's. The
+/// bytecode executors read [`SignalSource::stopped`].
 #[derive(Default)]
 pub struct Stopper {
+    /// The inline mirror door. Its lock also orders the changes to `stopped`.
     apply: Mutex<Option<Door>>,
     wake: Mutex<Option<Door>>,
     stopped: AtomicBool,
@@ -73,9 +177,12 @@ impl Stopper {
         if !stopped {
             self.continued.store(true, Ordering::SeqCst);
         }
-        self.stopped.store(stopped, Ordering::SeqCst);
-        if let Some(apply) = self.apply.lock().unwrap().clone() {
-            apply(stopped);
+        {
+            let apply = self.apply.lock().unwrap();
+            self.stopped.store(stopped, Ordering::SeqCst);
+            if let Some(apply) = apply.as_ref() {
+                apply(stopped);
+            }
         }
         if let Some(wake) = self.wake.lock().unwrap().clone() {
             wake(stopped);
@@ -114,7 +221,11 @@ impl SignalSource for Stopper {
         None
     }
     fn set_stop_apply(&self, apply: Door) {
-        *self.apply.lock().unwrap() = Some(apply);
+        let mut door = self.apply.lock().unwrap();
+        if self.is_stopped() {
+            apply(true);
+        }
+        *door = Some(apply);
     }
     fn set_stop(&self, wake: Door) {
         *self.wake.lock().unwrap() = Some(wake);
@@ -149,21 +260,21 @@ pub fn probes() -> Vec<Probe> {
         Probe {
             feature: Feature::Children,
             src: children,
-            setup: |_, _| child_powerbox(),
+            setup: |_, e| child_powerbox(e),
             outside: Outside::Nothing,
             want: 42,
         },
         Probe {
             feature: Feature::Fork,
             src: fork,
-            setup: |m, _| fork_powerbox(m),
+            setup: |m, e| fork_powerbox(m, e),
             outside: Outside::Nothing,
             want: 100,
         },
         Probe {
             feature: Feature::Exec,
             src: || EXEC.into(),
-            setup: |m, _| exec_powerbox(m),
+            setup: |m, e| exec_powerbox(m, e),
             outside: Outside::Nothing,
             want: 42,
         },
@@ -212,7 +323,7 @@ pub fn probes() -> Vec<Probe> {
         Probe {
             feature: Feature::GuestJit,
             src: guest_jit,
-            setup: |m, _| jit_powerbox(m),
+            setup: |m, e| jit_powerbox(m, e),
             outside: Outside::Nothing,
             want: 105_107,
         },
@@ -331,10 +442,10 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
 }
 
 /// The §14 probe's powerbox: the Instantiator, the child's module and a budget to pay for it.
-fn child_powerbox() -> (Host, Vec<Value>) {
+fn child_powerbox(e: &Embedder) -> (Host, Vec<Value>) {
     let mut host = Host::new();
     let i = host.grant_instantiator();
-    let c = host.grant_module(&module(CHILD_42));
+    let c = e.grant_module(&mut host, &e.image(module(CHILD_42)));
     let b = host.grant_budget(5_000_000, -1, -1);
     (host, [i, c, b].map(Value::I32).to_vec())
 }
@@ -466,14 +577,14 @@ block 4 (vr: i64, vho: i32) {
 
 /// The fork probe's powerbox: the Instantiator, `stdout`, a budget, and the server's and caller's
 /// child images (funcs 1 and 4).
-fn fork_powerbox(m: &Module) -> (Host, Vec<Value>) {
+fn fork_powerbox(m: &Module, e: &Embedder) -> (Host, Vec<Value>) {
     let mut host = Host::new();
     let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 8 << 20, -1);
     let _ = host.shared_stdout();
     let out = host.grant_stream(StreamRole::Out);
     let image = |host: &mut Host, f| {
-        host.grant_module(&temen_ir::child_image_at(m, f).expect("child image"))
+        e.grant_module(host, &temen_ir::child_image_at(m, f).expect("child image"))
     };
     let (s, c) = (image(&mut host, 1), image(&mut host, 4));
     (host, [inst, out, budget, s, c].map(Value::I32).to_vec())
@@ -481,25 +592,26 @@ fn fork_powerbox(m: &Module) -> (Host, Vec<Value>) {
 
 /// Exec (`execve.rs`'s `GUEST`): `main(inst, cmd, stream)` grants `"stdout"` and calls
 /// `exec_module`, which replaces its image with `cmd`; the command writes and returns 42. The
-/// trailing `return 99` runs only if the exec failed.
+/// trailing `return 99` runs only if the exec failed. Both programs keep their data above the NULL
+/// guard, in a 64 KiB window a durable run's arena fits in.
 const EXEC: &str = r#"
-memory 12
-data 300 "stdout"
+memory 16
+data 16684 "stdout"
 func (i32, i64, i32) -> (i64) {
 block 0 (vinst: i32, vcmd: i64, vstream: i32) {
-  va0 = i64.const 256
-  vnp = i32.const 300
+  va0 = i64.const 16640
+  vnp = i32.const 16684
   i32.store va0 vnp
-  va1 = i64.const 260
+  va1 = i64.const 16644
   vlen = i32.const 6
   i32.store va1 vlen
-  va2 = i64.const 264
+  va2 = i64.const 16648
   i32.store va2 vstream
   vz = i32.const 0
-  vgp = i64.const 256
+  vgp = i64.const 16640
   vgn = i64.const 1
   ventry = i64.const 0
-  vsl = i64.const 12
+  vsl = i64.const 16
   vr = call.cap 4294967295 14 (i64, i64, i64, i64, i64) -> (i64) vz (vcmd, vgp, vgn, ventry, vsl)
   v99 = i64.const 99
   return v99
@@ -509,15 +621,15 @@ block 0 (vinst: i32, vcmd: i64, vstream: i32) {
 
 /// The command `exec_module` runs: resolves `"stdout"`, writes `"EXEC"` to it and returns 42.
 const EXEC_CMD: &str = r#"
-memory 12
-data 100 "EXEC"
-data 200 "stdout"
+memory 16
+data 16484 "EXEC"
+data 16584 "stdout"
 func (i64) -> (i64) {
 block 0 (vinst: i64) {
-  vp = i64.const 200
+  vp = i64.const 16584
   vl = i64.const 6
   vh = self.resolve vp vl
-  vwp = i64.const 100
+  vwp = i64.const 16484
   vwl = i64.const 4
   vw = call.cap 0 1 (i64, i64) -> (i64) vh (vwp, vwl)
   v42 = i64.const 42
@@ -527,12 +639,12 @@ block 0 (vinst: i64) {
 "#;
 
 /// The exec probe's powerbox: the running module, the Instantiator, `stdout` and the command.
-fn exec_powerbox(m: &Module) -> (Host, Vec<Value>) {
+fn exec_powerbox(m: &Module, e: &Embedder) -> (Host, Vec<Value>) {
     let mut host = Host::new();
     host.set_self_module(&Arc::new(m.clone()));
     let inst = host.grant_instantiator();
     let stream = host.grant_stream(StreamRole::Out);
-    let cmd = host.grant_module(&module(EXEC_CMD));
+    let cmd = e.grant_module(&mut host, &e.image(module(EXEC_CMD)));
     (
         host,
         vec![
@@ -567,17 +679,18 @@ fn host_answered() -> (Host, Vec<Value>) {
     let mut host = Host::new();
     let h = host.grant_host_proc_offloadable(
         Box::new(|_op, args| {
-            let a = *args.first().unwrap_or(&0);
+            let a = plus_100(args);
             OffloadOutcome::Host(Box::new(move |c| {
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(1));
-                    c.complete(a + 100);
+                    c.complete(a);
                 });
             }))
         }),
         None,
-        temen_interp::CapState::Stateless,
+        CapState::Stateless,
     );
+    host.register_cap_name("plus100", h);
     (host, vec![Value::I32(h)])
 }
 
@@ -586,12 +699,13 @@ fn offloaded() -> (Host, Vec<Value>) {
     let mut host = Host::new();
     let h = host.grant_host_proc_offloadable(
         Box::new(|_op, args| {
-            let a = *args.first().unwrap_or(&0);
-            OffloadOutcome::Offload(Box::new(move || a + 100))
+            let a = plus_100(args);
+            OffloadOutcome::Offload(Box::new(move || a))
         }),
         None,
-        temen_interp::CapState::Stateless,
+        CapState::Stateless,
     );
+    host.register_cap_name("plus100", h);
     (host, vec![Value::I32(h)])
 }
 
@@ -639,21 +753,8 @@ block 0 (vstop: i32, vcont: i32) {
 fn stop_self(e: &Embedder) -> (Host, Vec<Value>) {
     let mut host = Host::new();
     host.set_signal_source(e.stopper.clone(), Default::default());
-    let s = Arc::clone(&e.stopper);
-    let stop = host.grant_host_proc(
-        Box::new(move |_op, _args, _mem, _minter| {
-            s.set(true);
-            Ok(vec![0])
-        }),
-        CapState::Stateless,
-    );
-    let s = Arc::clone(&e.stopper);
-    let cont = host.grant_host_proc(
-        Box::new(move |_op, _args, _mem, _minter| {
-            Ok(vec![i64::from(s.continued.load(Ordering::SeqCst))])
-        }),
-        CapState::Stateless,
-    );
+    let stop = grant_named(&mut host, e, "stop");
+    let cont = grant_named(&mut host, e, "continued");
     (host, vec![Value::I32(stop), Value::I32(cont)])
 }
 
@@ -716,9 +817,11 @@ block 0 (vrh: i32) {
 "#;
 
 /// A powerbox holding one shared region, a map page long, over an OS shared-memory object
-/// (`temen_run::new_shared_region`), which every engine can alias: the JIT maps its descriptor.
+/// (`temen_run::new_shared_region`), which every engine can alias: the JIT maps its descriptor. A
+/// region the host rebuilds, as a thaw does, is one too.
 fn region() -> (Host, Vec<Value>) {
     let mut host = Host::new();
+    host.set_region_factory(temen_run::new_shared_region);
     let page = temen_interp::host_region_granularity() as usize;
     let backing = temen_run::new_shared_region(page).expect("an OS shared-memory object");
     let r = host.grant_shared_region_backed(backing);
@@ -773,10 +876,15 @@ block 0 (vjit: i32) {{
 }
 
 /// The guest-JIT probe's powerbox: a `Jit` with an install table, as `temen_run::grant_jit` grants
-/// one to every engine.
-fn jit_powerbox(m: &Module) -> (Host, Vec<Value>) {
+/// one to every engine. An embedder that freezes and thaws the run grants the `Jit` that
+/// instruments each unit as its program was (DURABILITY.md §12.5).
+fn jit_powerbox(m: &Module, e: &Embedder) -> (Host, Vec<Value>) {
     let mut host = Host::new();
-    let jit = temen_run::grant_jit(&mut host, m, 4);
+    let jit = if e.durable {
+        temen_run::grant_jit_durable_confined(&mut host, m, 4)
+    } else {
+        temen_run::grant_jit(&mut host, m, 4)
+    };
     (host, vec![Value::I32(jit)])
 }
 

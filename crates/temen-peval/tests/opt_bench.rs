@@ -173,6 +173,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
     let load = |op, addr, offset| Inst::Load { op, addr, offset };
 
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t()],
         insts: vec![Inst::ConstI64(0), Inst::ConstI64(0), Inst::ConstI64(0)],
         term: Terminator::Br {
@@ -181,6 +183,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let header = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t()],
         insts: vec![
             Inst::ConstI64(0),
@@ -202,11 +206,15 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let halt = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t()],
         insts: vec![],
         term: Terminator::Return(vec![0]),
     };
     let setacc = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t(), t()],
         insts: vec![Inst::ConstI64(9), add(2, 5)],
         term: Terminator::Br {
@@ -215,6 +223,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let seti_input = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t(), t()],
         insts: vec![Inst::ConstI64(9), add(2, 5)],
         term: Terminator::Br {
@@ -223,6 +233,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let add_i = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t(), t()],
         insts: vec![add(0, 1), Inst::ConstI64(9), add(2, 6)],
         term: Terminator::Br {
@@ -231,6 +243,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let dec_i = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t(), t()],
         insts: vec![
             Inst::ConstI64(1),
@@ -249,6 +263,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let jnz = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t(), t()],
         insts: vec![
             Inst::ConstI64(0),
@@ -320,6 +336,8 @@ fn licm_cse_kernel() -> Module {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32, ValType::I32],
                 insts: vec![Inst::ConstI32(0)], // v3 = acc0
                 term: Terminator::Br {
@@ -328,6 +346,8 @@ fn licm_cse_kernel() -> Module {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32], // i,acc,a,b
                 insts: vec![
                     bin32(BinOp::Mul, 2, 3), // v4 = a*b
@@ -346,6 +366,8 @@ fn licm_cse_kernel() -> Module {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],
                 insts: vec![],
                 term: Terminator::Return(vec![0]),
@@ -367,6 +389,8 @@ fn sccp_const_loop() -> Module {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],
                 insts: vec![Inst::ConstI32(0)], // v1
                 term: Terminator::Br {
@@ -375,6 +399,8 @@ fn sccp_const_loop() -> Module {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32], // i, acc
                 insts: vec![
                     Inst::ConstI32(0), // v2
@@ -397,6 +423,8 @@ fn sccp_const_loop() -> Module {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],
                 insts: vec![],
                 term: Terminator::Return(vec![0]),
@@ -413,6 +441,8 @@ fn reassoc_chain() -> Module {
         params: vec![ValType::I32], // x = v0
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![
                 Inst::ConstI32(1),       // v1
@@ -441,6 +471,8 @@ fn correlated_branch() -> Module {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],
                 insts: vec![
                     Inst::ConstI32(5),
@@ -462,6 +494,8 @@ fn correlated_branch() -> Module {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32],
                 insts: vec![],
                 term: Terminator::BrIf {
@@ -473,11 +507,15 @@ fn correlated_branch() -> Module {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],
                 insts: vec![Inst::ConstI32(100), bin32(BinOp::Add, 0, 1)],
                 term: Terminator::Return(vec![2]),
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],
                 insts: vec![Inst::ConstI32(200), bin32(BinOp::Add, 0, 1)],
                 term: Terminator::Return(vec![2]),
@@ -514,6 +552,8 @@ fn mem_case() -> Module {
         b,
     };
     let thru = |t: u32| Block {
+        parent: 0,
+        captures: vec![],
         params: vec![ValType::I64, ValType::I64],
         insts: vec![],
         term: Terminator::Br {
@@ -526,6 +566,8 @@ fn mem_case() -> Module {
         results: vec![ValType::I64],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64, ValType::I32], // v0=p, v1=sel
                 insts: vec![
                     ld(0, 0),  // v2 = mem[p+0]
@@ -543,6 +585,8 @@ fn mem_case() -> Module {
             thru(3), // b1 -> b3
             thru(3), // b2 -> b3
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64, ValType::I64], // p3, s
                 insts: vec![
                     ld(0, 0),  // v2 = mem[p3+0]  (join reload → load_elim)
@@ -594,6 +638,8 @@ fn interproc_case() -> Module {
         params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64, ValType::I64],
             insts: vec![
                 Inst::RefFunc { func: 1 }, // v2 = funcref(1)
@@ -610,6 +656,8 @@ fn interproc_case() -> Module {
         params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64, ValType::I64],
             insts: vec![
                 Inst::ConstI64(3),
@@ -627,6 +675,8 @@ fn interproc_case() -> Module {
         params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64, ValType::I64],
             insts: vec![add(0, 1)],
             term: Terminator::Return(vec![2]),
@@ -654,6 +704,8 @@ fn multiblock_inline_case() -> Module {
         params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64, ValType::I64], // a, b
             insts: vec![
                 add(0, 1), // v2 = k = a + b  (captured across the call)
@@ -672,6 +724,8 @@ fn multiblock_inline_case() -> Module {
         results: vec![ValType::I64],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64, ValType::I64], // a, b
                 insts: vec![Inst::IntCmp {
                     ty: IntTy::I64,
@@ -688,11 +742,15 @@ fn multiblock_inline_case() -> Module {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64], // b
                 insts: vec![],
                 term: Terminator::Return(vec![0]),
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64], // a
                 insts: vec![],
                 term: Terminator::Return(vec![0]),
@@ -722,6 +780,8 @@ fn const_prop_case() -> Module {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32],
                 insts: vec![
                     Inst::ConstI32(0),
@@ -741,11 +801,15 @@ fn const_prop_case() -> Module {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // x
                 insts: vec![],
                 term: Terminator::Return(vec![0]),
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // r (dead arm once flag is known 1)
                 insts: arm,
                 term: Terminator::Return(vec![last]),
@@ -756,6 +820,8 @@ fn const_prop_case() -> Module {
         params: vec![ValType::I32], // x
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32],
             insts: vec![
                 Inst::ConstI32(1),
@@ -958,6 +1024,8 @@ fn heavy_invariant_loop() -> Module {
         results: vec![ValType::I64],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64, ValType::I64, ValType::I64],
                 insts: vec![Inst::ConstI64(0)], // v3 = acc0
                 term: Terminator::Br {
@@ -966,6 +1034,8 @@ fn heavy_invariant_loop() -> Module {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64, ValType::I64, ValType::I64, ValType::I64], // i,acc,a,b
                 insts: vec![
                     bin(BinOp::Mul, 2, 3),  // v4 = a*b
@@ -995,6 +1065,8 @@ fn heavy_invariant_loop() -> Module {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64],
                 insts: vec![],
                 term: Terminator::Return(vec![0]),

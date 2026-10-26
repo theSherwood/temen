@@ -25,6 +25,8 @@ fn unary(op: BinOp, imm: i64) -> Func {
         params: vec![I64],
         results: vec![I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![I64],
             insts: vec![
                 Inst::ConstI64(imm),
@@ -51,6 +53,8 @@ fn dispatch_module() -> Module {
         params: vec![I32, I64],
         results: vec![I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![I32, I64],
             insts: vec![
                 Inst::CallIndirect {
@@ -203,6 +207,8 @@ fn branchy_module() -> Module {
         results: vec![I64],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![I32, I64], // sel=0, x=1
                 insts: vec![
                     Inst::CallIndirect {
@@ -227,6 +233,8 @@ fn branchy_module() -> Module {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 // b1(r) = -r
                 params: vec![I64],
                 insts: vec![
@@ -241,6 +249,8 @@ fn branchy_module() -> Module {
                 term: Terminator::Return(vec![2]),
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 // b2(x) = x
                 params: vec![I64],
                 insts: vec![],
@@ -312,6 +322,8 @@ fn wide_span_uses_chain_fallback_and_stays_faithful() {
         params: vec![I32, I64],
         results: vec![I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![I32, I64],
             insts: vec![Inst::CallIndirect {
                 ty: 0, // #922: interned at type-section index 0
@@ -360,6 +372,8 @@ fn unary2(op: BinOp, imm: i64) -> Func {
         params: vec![I64, I64],
         results: vec![I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![I64, I64],
             insts: vec![
                 Inst::ConstI64(imm),
@@ -387,6 +401,8 @@ fn high_index_cluster_uses_offset_table() {
         params: vec![I32, I64],
         results: vec![I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![I32, I64],
             insts: vec![Inst::CallIndirect {
                 ty: 0, // #922: interned at type-section index 0
@@ -457,6 +473,8 @@ fn large_tail_uses_shared_continuation() {
         params: vec![I32, I64],
         results: vec![I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![I32, I64],
             insts,
             term: Terminator::Return(vec![last]),

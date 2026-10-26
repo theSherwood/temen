@@ -83,6 +83,8 @@ pub struct MemHookStats {
 /// described by `spec`. Pure `Module -> Module`; the input is untouched. Callers must re-verify
 /// the result before running it (fail-closed, like every pass in this crate).
 pub fn instrument_mem_hooks(m: &Module, spec: MemHookSpec) -> (Module, MemHookStats) {
+    let local = crate::block_local(m);
+    let m: &Module = &local;
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
     let mut out = m.clone();
     // Positions key on (func, block, inst) — stale after insertion, so drop rather than mislead.
@@ -367,6 +369,8 @@ mod tests {
                 params: vec![],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![],
                     insts,
                     term: Terminator::Return(vec![4]),

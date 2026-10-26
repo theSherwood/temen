@@ -513,6 +513,8 @@ pub fn with_readback(
         params: params.clone(),
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts: vec![
                 Inst::ConstI64(read_addr as i64),

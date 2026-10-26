@@ -302,6 +302,8 @@ fn wrap_with_heap(
         params: params.clone(),
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts: vec![
                 Inst::ConstI64(x_addr as i64),

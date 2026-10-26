@@ -44,6 +44,8 @@ fn inst_module(params: Vec<ValType>, op: Inst, needs_mem: bool, extra: Vec<Func>
         params: params.clone(),
         results: vec![],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts: vec![op],
             term: Terminator::Unreachable,
@@ -70,6 +72,8 @@ fn term_module(
     extra_funcs: Vec<Func>,
 ) -> Module {
     let mut blocks = vec![Block {
+        parent: 0,
+        captures: vec![],
         params: params.clone(),
         insts: vec![],
         term,
@@ -90,6 +94,8 @@ fn term_module(
 /// A trap-terminated `()->()` block, used as a branch target / call sink.
 fn sink_block(params: Vec<ValType>) -> Block {
     Block {
+        parent: 0,
+        captures: vec![],
         params,
         insts: vec![],
         term: Terminator::Unreachable,
@@ -468,6 +474,8 @@ pub fn struct_rows() -> Vec<StructRow> {
         params: vec![i64t, i64t],
         results: vec![i64t],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![i64t, i64t],
             insts: vec![],
             term: Terminator::Return(vec![0]),

@@ -2,9 +2,11 @@
 //!
 //! See `DESIGN.md` §3/§3a/§3b. Key disciplines encoded here:
 //! - Values are **block-local**: within a block, indices run `0..k` for the block
-//!   parameters, then one more per instruction result. Operands reference *earlier*
-//!   same-block indices only. Cross-block dataflow is *only* via block parameters,
-//!   so dominance analysis is impossible to need (verifier is a linear pass).
+//!   parameters, then one per capture, then one more per instruction result. Operands
+//!   reference *earlier* same-block indices only.
+//! - A value crosses blocks as a block parameter, or as a **capture**: a block names a value
+//!   of a block that dominates it. Each block names its parent in a dominator tree the
+//!   producer supplies, so the verifier checks dominance without computing it (#2454).
 //! - Every block ends in exactly one terminator.
 //!
 //! Phase-1 integer core: `i32`/`i64` constants, the full integer arithmetic /
@@ -3693,14 +3695,54 @@ impl Terminator {
     pub fn for_each_operand(&self, f: &mut impl FnMut(&ValIdx)) {
         term_operands!(self, f)
     }
+
+    /// Apply `f` to every branch target of this terminator, in place, in [`Terminator::edges`]
+    /// order. A return or tail call has none.
+    pub fn for_each_target_mut(&mut self, f: &mut impl FnMut(&mut BlockIdx)) {
+        match self {
+            Terminator::Br { target, .. } => f(target),
+            Terminator::BrIf {
+                then_blk, else_blk, ..
+            } => {
+                f(then_blk);
+                f(else_blk);
+            }
+            Terminator::BrTable {
+                targets, default, ..
+            } => {
+                for (t, _) in targets.iter_mut() {
+                    f(t);
+                }
+                f(&mut default.0);
+            }
+            Terminator::Return(_)
+            | Terminator::ReturnCall { .. }
+            | Terminator::ReturnCallIndirect { .. }
+            | Terminator::Unreachable => {}
+        }
+    }
 }
 
 /// A basic block: a typed parameter list, a straight-line body, one terminator.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Block {
+    /// This block's parent in the function's dominance certificate (DESIGN.md §3a): an earlier
+    /// block that dominates it. The entry block has none and holds `0`.
+    pub parent: BlockIdx,
     pub params: Vec<ValType>,
+    /// The values of ancestor blocks this block uses, each as `(block, value)`. They take the
+    /// block-local indices after the params, in order, before the instruction results.
+    pub captures: Vec<(BlockIdx, ValIdx)>,
     pub insts: Vec<Inst>,
     pub term: Terminator,
+}
+
+impl Block {
+    /// How many values the block has before its first instruction result: its params, then its
+    /// captures.
+    pub fn inputs(&self) -> usize {
+        self.params.len() + self.captures.len()
+    }
 }
 
 /// A function: signature plus its blocks (`blocks[0]` is the entry block, whose
@@ -4551,6 +4593,8 @@ pub fn child_image_at(program: &Module, entry: FuncIdx) -> Result<Module, String
         params: ef.params.clone(),
         results: ef.results.clone(),
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: ef.params.clone(),
             insts: vec![Inst::Call {
                 func: entry,
@@ -4711,6 +4755,8 @@ fn synth_start(
             params: params.clone(),
             results,
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params,
                 insts,
                 term,
@@ -5606,10 +5652,10 @@ pub fn resolve_imports_with(
     let types = out.types.clone();
     for f in &mut out.funcs {
         for b in &mut f.blocks {
-            // Map each value index to its defining instruction (block params → `None`) — a `Slot`
-            // import patches the `ConstI32` that defines its handle operand, so we may need to reach
-            // a *different* instruction than the `CallSym` we're rewriting.
-            let mut def_of: Vec<Option<usize>> = vec![None; b.params.len()];
+            // Map each value index to its defining instruction (block params and captures → `None`)
+            // — a `Slot` import patches the `ConstI32` that defines its handle operand, so we may need
+            // to reach a *different* instruction than the `CallSym` we're rewriting.
+            let mut def_of: Vec<Option<usize>> = vec![None; b.inputs()];
             for (p, inst) in b.insts.iter().enumerate() {
                 for _ in 0..inst.result_count(&fn_results, &types) {
                     def_of.push(Some(p));
@@ -7185,6 +7231,8 @@ pub fn stub_unreachable_funcs(
 /// a function a unit's `live` mask excludes ([`LinkUnitRef::live`]).
 fn trap_body(params: &[ValType]) -> Vec<Block> {
     alloc::vec![Block {
+        parent: 0,
+        captures: vec![],
         params: params.to_vec(),
         insts: Vec::new(),
         term: Terminator::Unreachable,
@@ -7324,9 +7372,10 @@ pub fn prune_block_params(m: &mut Module) {
         if live.iter().all(|l| l.iter().all(|&x| x)) {
             continue;
         }
+        let moves = dropped_params_moves(&f.blocks, &live);
         f.blocks = drop_block_params(core::mem::take(&mut f.blocks), &live);
         if let Some(di) = &mut m.debug_info {
-            remap_debug_values(di, i as FuncIdx, &live);
+            moves.remap_debug(di, i as FuncIdx);
         }
     }
 }
@@ -7343,6 +7392,14 @@ pub fn prune_dead_block_params(mut blocks: Vec<Block>) -> Vec<Block> {
 /// visitor ([`Inst::for_each_operand_mut`]); nothing is changed.
 fn live_block_params(blocks: &mut [Block]) -> Vec<Vec<bool>> {
     let mut live: Vec<Vec<bool>> = blocks.iter().map(|b| vec![false; b.params.len()]).collect();
+    // A param another block captures is read there.
+    for blk in blocks.iter() {
+        for &(a, v) in &blk.captures {
+            if let Some(l) = live.get_mut(a as usize).and_then(|l| l.get_mut(v as usize)) {
+                *l = true;
+            }
+        }
+    }
     for (b, blk) in blocks.iter_mut().enumerate() {
         let np = blk.params.len() as ValIdx;
         let mut mark = |v: &mut ValIdx| {
@@ -7391,6 +7448,10 @@ fn drop_block_params(blocks: Vec<Block>, live: &[Vec<bool>]) -> Vec<Block> {
             // Edge arguments first: one can be a dead parameter of this very block, passed on to a
             // dead one; once they are gone nothing references a dead parameter.
             blk.term.retain_edge_args(|succ, j| live[succ as usize][j]);
+            // A capture follows its value down past the dropped params of its block.
+            for (a, v) in &mut blk.captures {
+                *v = moved_value(&live[*a as usize], *v).expect("a captured parameter is live");
+            }
             if keep.iter().all(|&k| k) {
                 return blk;
             }
@@ -7424,40 +7485,24 @@ fn moved_value(keep: &[bool], v: ValIdx) -> Option<ValIdx> {
     }
 }
 
-/// Re-point function `func`'s value-keyed debug locations at the values [`drop_block_params`]
-/// renumbered, so a debugger reads the variable it read before — never a neighbour that slid into
-/// its index. A location-list entry follows its value, or goes with it when it was a dropped
-/// parameter (the variable was dead there). A function-wide [`VarLoc::Ssa`] names one index in every
-/// block (a φ-model slot), which no longer holds, so it becomes the list of where that slot now sits.
-fn remap_debug_values(di: &mut DebugInfo, func: FuncIdx, live: &[Vec<bool>]) {
-    let remap = |locs: &mut Vec<SsaLoc>| {
-        locs.retain_mut(|l| match live.get(l.block as usize) {
-            Some(keep) => moved_value(keep, l.value).map(|v| l.value = v).is_some(),
-            None => true,
-        });
-    };
-    for var in di.vars.iter_mut().filter(|v| v.func == func) {
-        match &mut var.loc {
-            VarLoc::Ssa { value } => {
-                let value = *value;
-                var.loc = VarLoc::SsaList(
-                    live.iter()
-                        .enumerate()
-                        .filter_map(|(b, keep)| {
-                            moved_value(keep, value).map(|v| SsaLoc {
-                                block: b as u32,
-                                inst: 0,
-                                value: v,
-                            })
-                        })
-                        .collect(),
-                );
-            }
-            VarLoc::SsaList(locs) => remap(locs),
-            VarLoc::WindowVia { base, .. } => remap(base),
-            _ => {}
-        }
-    }
+/// Where [`drop_block_params`] moves each block's values, so debug info can follow them
+/// ([`Moves::remap_debug`]): a kept parameter down past the dropped ones before it, a capture and
+/// an instruction result down by all of them.
+fn dropped_params_moves(blocks: &[Block], live: &[Vec<bool>]) -> Moves {
+    Moves::new(
+        blocks
+            .iter()
+            .zip(live)
+            .enumerate()
+            .map(|(b, (blk, keep))| {
+                let inputs = (0..blk.inputs() as ValIdx)
+                    .map(|v| moved_value(keep, v))
+                    .collect();
+                let kept = keep.iter().filter(|&&k| k).count() + blk.captures.len();
+                (Some(b as BlockIdx), inputs, kept as ValIdx)
+            })
+            .collect(),
+    )
 }
 
 /// An initialized data segment (§3a / D40). Placed in the window `[offset, offset+bytes.len())`
@@ -7468,6 +7513,10 @@ pub struct Data {
     pub readonly: bool,
     pub bytes: Vec<u8>,
 }
+
+pub mod cfg;
+pub mod dominance;
+pub use dominance::Moves;
 
 /// **Compile-time confinement bound analysis** (§1a "guard-when-bounded", D36–D38/D63) — the shared,
 /// single-definition proof both native and wasm JITs use to decide when a memory access is *provably*
@@ -7738,6 +7787,8 @@ mod import_tests {
             results: vec![],
         };
         let block = Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32], // v0 = a capability handle
             insts: vec![
                 Inst::ConstI64(0), // v1 = buf
@@ -7982,6 +8033,8 @@ mod link_layout_tests {
                     params: vec![],
                     results: vec![],
                     blocks: vec![Block {
+                        parent: 0,
+                        captures: vec![],
                         params: vec![],
                         insts: vec![Inst::DataTop], // v0 = data.top (dead; marks has_data_top)
                         term: Terminator::Return(vec![]),
@@ -8078,6 +8131,8 @@ mod load_unit_tests {
                 params: vec![],
                 results: vec![ValType::I64, ValType::I64, ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![],
                     insts: vec![
                         Inst::DataSelf {
@@ -8477,6 +8532,8 @@ mod forwards_tests {
 
     fn blk(params: usize, consts: usize, term: Terminator) -> Block {
         Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I32; params],
             insts: (0..consts).map(|_| Inst::ConstI32(0)).collect(),
             term,

@@ -2465,17 +2465,23 @@ impl FuncMemo {
     }
 }
 
-fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> {
-    // Global slot per value: each block's params then its value-producing insts, in order.
+/// The frame layout: one slot per value of the function, each block's params, then its captures,
+/// then its instructions' results, in order. Each block's first slot, and the slot count.
+fn slot_bases(f: &Func, results: impl Fn(&Inst) -> u32) -> (Vec<u32>, u32) {
     let mut base = Vec::with_capacity(f.blocks.len());
-    let mut nslots = 0u32;
+    let mut n = 0u32;
     for b in &f.blocks {
-        base.push(nslots);
-        nslots += b.params.len() as u32;
+        base.push(n);
+        n += b.inputs() as u32;
         for inst in &b.insts {
-            nslots += view.results(inst) as u32;
+            n += results(inst);
         }
     }
+    (base, n)
+}
+
+fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> {
+    let (base, mut nslots) = slot_bases(f, |inst| view.results(inst) as u32);
     // #2353 — one slot past every value's: the `dst` of an instruction that defines none. A driver
     // answering such a call later (a `fork`'s return-twice value, a parked call's result) writes it
     // here, where no value lives, not over the slot of the value defined next, nor past the frame.
@@ -2495,27 +2501,41 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
     // slot, and no edge copies into it. The unfused compile (stepping, tracing, a debug run's
     // frames, read by `(block, value)`) keeps every param in a slot of its own.
     let forwards = fuse.then(|| f.forwards());
-    let forwarded = |b: usize, i: usize| forwards.as_ref().and_then(|w| w.source(b, i));
-    // The slots a forwarding param reads: read outside their block with no edge copy, so their
-    // values must be written (the `IntCmp` fusion below checks this).
+    // Value `v` of block `b`, or the value it forwards: never another forwarding param.
+    let resolve = |b: usize, v: u32| match forwards.as_ref().and_then(|w| w.source(b, v as usize)) {
+        Some((sb, si)) => (sb as usize, si),
+        None => (b, v),
+    };
+    // The slot that holds value `v` of block `b`. In the fused compile a capture (#2454) reads the
+    // slot of the value it names, as a forwarding param reads its source's; the unfused compile keeps
+    // each in a slot of its own, which every edge into its block fills.
+    let slot = |b: usize, v: u32| -> u32 {
+        let (mut b, mut v) = resolve(b, v);
+        while fuse && (f.blocks[b].params.len()..f.blocks[b].inputs()).contains(&(v as usize)) {
+            let (a, av) = f.blocks[b].captures[v as usize - f.blocks[b].params.len()];
+            (b, v) = resolve(a as usize, av);
+        }
+        base[b] + v
+    };
+    // Each value's slot, by the slot that is its own: what an operand naming it reads.
+    let mut read: Vec<u32> = (0..nslots).collect();
+    // The slots forwarding params and captures read: read outside their block with no edge copy,
+    // so their values must be written (the `IntCmp` fusion below checks this).
     let mut read_forwarded = vec![false; nslots as usize];
     for (b, blk) in f.blocks.iter().enumerate() {
-        for i in 0..blk.params.len() {
-            if let Some((sb, si)) = forwarded(b, i) {
-                read_forwarded[(base[sb as usize] + si) as usize] = true;
+        for v in 0..blk.inputs() as u32 {
+            let (own, s) = (base[b] + v, slot(b, v));
+            read[own as usize] = s;
+            if s != own {
+                read_forwarded[s as usize] = true;
             }
         }
     }
     for (bi, b) in f.blocks.iter().enumerate() {
         block_pc[bi] = ops.len() as u32;
-        let params = b.params.len() as u32;
         // operand: block-local index -> frame slot
-        let g = |local: u32| match local < params {
-            true => forwarded(bi, local as usize)
-                .map_or(base[bi] + local, |(sb, si)| base[sb as usize] + si),
-            false => base[bi] + local,
-        };
-        let mut local = params;
+        let g = |local: u32| read[(base[bi] + local) as usize];
+        let mut local = b.inputs() as u32;
         for (i, inst) in b.insts.iter().enumerate() {
             let dst = match view.results(inst) {
                 0 => discard,
@@ -2527,20 +2547,29 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
         }
         // Terminator -> edge copies (block-local src in this block -> first slots of target) + jump.
         let edge = |bidx: usize, args: &[u32]| -> Edge {
+            // A param that forwards reads its source's slot, so no edge writes its own.
+            let mut pairs: Vec<(u32, u32)> = args
+                .iter()
+                .zip(base[bidx]..)
+                .filter(|&(_, dst)| read[dst as usize] == dst)
+                .map(|(a, dst)| (g(*a), dst))
+                .collect();
+            // In the unfused compile the target's captures ride every edge into it too, each copied
+            // from the slot of the value it names.
+            if !fuse {
+                let target = &f.blocks[bidx];
+                let first = base[bidx] + target.params.len() as u32;
+                let captures = target.captures.iter().zip(first..);
+                pairs.extend(captures.map(|(&(a, v), dst)| (slot(a as usize, v), dst)));
+            }
             // Slice 5b: drop **identity** self-copies (`src == dst`) at compile time. A loop-invariant
             // block param threaded unchanged across a back-edge lands in the same global slot it came
             // from, so the copy is a no-op — eliding it removes a real `scratch` push+write per such
             // param every iteration. Safe and semantics-transparent: an `x -> x` move changes nothing,
             // and its removal can't affect the gather/scatter of the other (aliasing) copies. Applies
             // uniformly to every terminator's edges (Br/BrIf/BrIfCmp/BrTable), fused or not.
-            let pairs: Box<[(u32, u32)]> = args
-                .iter()
-                .enumerate()
-                .filter(|&(i, _)| forwarded(bidx, i).is_none())
-                .map(|(i, a)| (g(*a), base[bidx] + i as u32))
-                .filter(|(src, dst)| src != dst)
-                .collect();
-            (Copies::new(pairs), bidx as u32) // block index; patched to entry pc below
+            pairs.retain(|(src, dst)| src != dst);
+            (Copies::new(pairs.into()), bidx as u32) // block index; patched to entry pc below
         };
         match &b.term {
             Terminator::Br { target, args } => {
@@ -4308,15 +4337,7 @@ impl ModuleDebug {
         let mut fn_block_base = Vec::with_capacity(m.funcs.len());
         let mut fn_block_types = Vec::with_capacity(m.funcs.len());
         for g in &m.funcs {
-            let mut base = Vec::with_capacity(g.blocks.len());
-            let mut n = 0u32;
-            for b in &g.blocks {
-                base.push(n);
-                n += b.params.len() as u32;
-                for inst in &b.insts {
-                    n += inst.result_count(&arities, &m.types) as u32;
-                }
-            }
+            let (base, _) = slot_bases(g, |inst| inst.result_count(&arities, &m.types) as u32);
             fn_block_base.push(base);
             fn_block_types.push(temen_verify::func_value_types(
                 g,
@@ -10018,26 +10039,62 @@ enum Stalled {
 }
 
 /// The [`Stalled`] verdict on `tasks`, in a run its embedder pumps or not, with an external-wake
-/// bell armed or not. `stopped` says whether a runnable task's process is stopped: once nothing
-/// in the run can continue it, only a continue from outside moves it (#2529), as only the
-/// embedder can feed a read.
-fn stalled(tasks: &[TaskSlot], stopped: bool, embedder_pumps: bool, bell: bool) -> Stalled {
-    let fed = stopped
-        || tasks.iter().any(|t| {
-            matches!(
-                t.state,
-                TaskState::BlockedPipeRead { .. }
-                    | TaskState::BlockedPipeWrite { .. }
-                    // #1146 (deeper) — a blocking stdin park is externally wakeable too (an
-                    // embedder signal rings the bell): without it an all-parked stdin run would
-                    // fault as a deadlock instead of blocking for the `^C`.
-                    | TaskState::BlockedStdin
-            )
-        });
+/// bell armed or not. No task can run, so a runnable one is a task of a stopped process, which the
+/// executor would not step: once nothing in the run can continue it, only a continue from outside
+/// moves it (#2529), as only the embedder can feed a read. Its stop is not read again here: a
+/// continue that lands after the executor looked is a wake its next round sees, never a deadlock.
+fn stalled(tasks: &[TaskSlot], embedder_pumps: bool, bell: bool) -> Stalled {
+    let fed = tasks.iter().any(|t| {
+        matches!(
+            t.state,
+            TaskState::Runnable
+                | TaskState::BlockedPipeRead { .. }
+                | TaskState::BlockedPipeWrite { .. }
+                // #1146 (deeper) — a blocking stdin park is externally wakeable too (an
+                // embedder signal rings the bell): without it an all-parked stdin run would
+                // fault as a deadlock instead of blocking for the `^C`.
+                | TaskState::BlockedStdin
+        )
+    });
     match (fed, embedder_pumps, bell) {
         (true, true, _) => Stalled::Idle,
         (true, false, true) => Stalled::Bell,
         _ => Stalled::Deadlock,
+    }
+}
+
+#[cfg(test)]
+mod stalled_tests {
+    use super::*;
+
+    fn runnable() -> TaskSlot {
+        let m = temen_text::parse_module("func () -> () {\nblock 0 () {\n  return\n  }\n}\n")
+            .expect("parse");
+        let unit = compile_module(&m.funcs, &m.types, None).expect("compile");
+        let vt = VTask::new(&unit, 0, &[], None).expect("task");
+        TaskSlot::new(vt, None, LiveVcpu::none())
+    }
+
+    /// #2529 — at an idle point a runnable task is one of a stopped process: a wait on the
+    /// outside, which its embedder hears of when it pumps the run and the armed bell rings for
+    /// when it does not, and a deadlock only with neither. The verdict takes no reading of the
+    /// stop: the executors used to read it again here, and a continue that landed between their
+    /// look and this one made the run a deadlock (`ThreadFault`), though it had just been
+    /// continued.
+    #[test]
+    fn a_stopped_processs_runnable_task_is_a_wait() {
+        let tasks = [runnable()];
+        assert!(matches!(stalled(&tasks, true, false), Stalled::Idle));
+        assert!(matches!(stalled(&tasks, false, true), Stalled::Bell));
+        assert!(matches!(stalled(&tasks, false, false), Stalled::Deadlock));
+        let done = [TaskSlot {
+            state: TaskState::Done(Ok(Vec::new())),
+            ..runnable()
+        }];
+        assert!(
+            matches!(stalled(&done, false, true), Stalled::Deadlock),
+            "a bell with nothing waiting on it wakes nothing"
+        );
     }
 }
 
@@ -13157,12 +13214,7 @@ impl CoopSched {
                     // signal) instead of sleeping this thread on the bell.
                     let bell = root.lock_unpoisoned().external_wake();
                     if calls.is_empty() {
-                        let stopped = !see_through
-                            && tasks.iter().any(|t| {
-                                matches!(t.state, TaskState::Runnable)
-                                    && process_stopped(root, extra_envs, t)
-                            });
-                        match stalled(tasks, stopped, *embedder_pumps, bell.is_some()) {
+                        match stalled(tasks, *embedder_pumps, bell.is_some()) {
                             Stalled::Idle => return Ok(CoopStep::Idle { timer: None }),
                             Stalled::Deadlock => return Err(Trap::ThreadFault),
                             Stalled::Bell => {}
@@ -17058,10 +17110,7 @@ impl ThreadRun {
             Some(res.clone())
         } else if self.idle(core) {
             let bell = self.root.lock_unpoisoned().external_wake().is_some();
-            let stopped = (0..core.tasks.len()).any(|j| {
-                matches!(core.tasks[j].state, TaskState::Runnable) && self.stopped(core, j)
-            });
-            match stalled(&core.tasks, stopped, g.embedder_pumps, bell) {
+            match stalled(&core.tasks, g.embedder_pumps, bell) {
                 Stalled::Deadlock => Some(Err(Trap::ThreadFault)),
                 Stalled::Idle => {
                     stalled_now = true;
@@ -17923,9 +17972,9 @@ static BYTE_SETJMP_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 /// A `<setjmp.h>` checkpoint (see [`Vm::setjmp_points`]): everything needed to re-enter a `setjmp`
 /// activation. `longjmp` truncates [`Vm::stack`] to `depth` (the intervening activations discarded —
-/// C has no cleanups), restores the `(module, cur, base, pc)` cursor, and sets the `dst` register to
-/// the long-jump value. The activation's register window survives in place, so it is not snapshotted.
-#[derive(Clone, Copy)]
+/// C has no cleanups), restores the `(module, cur, base, pc)` cursor and the activation's register
+/// window, and sets the `dst` register to the long-jump value.
+#[derive(Clone)]
 struct ByteSetJmp {
     /// `Vm::stack` length at `setjmp` (the `setjmp` activation is the current one, not yet pushed).
     depth: usize,
@@ -17936,6 +17985,11 @@ struct ByteSetJmp {
     pc: usize,
     /// The `setjmp` result's window slot (relative to `base`) — set to the long-jump value on re-entry.
     dst: u32,
+    /// The activation's register window at the `setjmp`. A block's slots are its own, but what it
+    /// reads need not be: a forwarding param (#2448) or a capture (#2454) reads the slot of a value
+    /// of a block that dominates it, which the activation may run again before it jumps back. The
+    /// oracle restores the value state of the `setjmp` point, and so does this.
+    window: Box<[Reg]>,
 }
 
 // `Clone` for time-travel checkpointing (DEBUGGING.md W1): a `ScheduledDebugRun` snapshots each task's
@@ -18032,9 +18086,8 @@ struct Vm {
 struct VmRare {
     /// `<setjmp.h>` checkpoints — `setjmp` records its activation's resume point here, keyed by a
     /// per-`setjmp` **token** it writes into the guest `jmp_buf`'s opaque first 8 bytes (#1062);
-    /// `longjmp` reads the token back from the (possibly-copied) buffer and looks it up. No register
-    /// snapshot is needed (unlike the tree-walker): the flat per-function register layout gives each
-    /// block its own slots, so the `setjmp` block's values survive a deeper call in place.
+    /// `longjmp` reads the token back from the (possibly-copied) buffer and looks it up, and
+    /// restores the activation's register window ([`ByteSetJmp::window`]).
     /// Token-keying (vs the old address key) is what lets a guest *copy* a `jmp_buf` — bash's
     /// `COPY_PROCENV` memcpy of `top_level` — carry the checkpoint identity with the bytes; bounded
     /// by pruning checkpoints whose `setjmp` activation has returned (`SetJmp` op).
@@ -18949,8 +19002,8 @@ impl Vm {
                     pc = *target as usize;
                 }
                 // `<setjmp.h>` `setjmp`: checkpoint the resume point (the op after this, in this
-                // activation) keyed by the guest `jmp_buf` address, and return 0. The register window
-                // survives in place (per-block slots are distinct), so no snapshot is taken.
+                // activation) and its register window, keyed by the guest `jmp_buf` address, and
+                // return 0.
                 Op::SetJmp { buf, dst } => {
                     // #1062 — key the checkpoint by a fresh TOKEN written into the guest `jmp_buf`'s
                     // opaque first 8 bytes (not the buffer address), so a guest that memcpy-copies
@@ -18971,6 +19024,7 @@ impl Vm {
                     // would trap regardless. A copied-but-live checkpoint sits at a still-live
                     // activation (`depth <= stack.len()`) and is retained.
                     let live = self.stack.len();
+                    let window = self.regs[base..base + c.progs[cur].nslots as usize].into();
                     let points = &mut self.rare().setjmp_points;
                     points.retain(|_, p| p.depth <= live);
                     points.insert(
@@ -18982,6 +19036,7 @@ impl Vm {
                             base,
                             pc: pc + 1,
                             dst: *dst,
+                            window,
                         },
                     );
                     r!(*dst) = Reg::from_i32(0);
@@ -19001,9 +19056,10 @@ impl Vm {
                         .ok_or(Trap::Malformed)?
                         .load_scalar(buf_addr, 0, LoadOp::I64)?
                         .i64() as u64;
-                    let point = *(self.rare.as_ref())
+                    let point = (self.rare.as_ref())
                         .and_then(|r| r.setjmp_points.get(&token))
-                        .ok_or(Trap::Malformed)?;
+                        .ok_or(Trap::Malformed)?
+                        .clone();
                     if point.depth > self.stack.len() {
                         return Err(Trap::Malformed); // the setjmp activation already returned
                     }
@@ -19033,6 +19089,7 @@ impl Vm {
                     base = point.base;
                     pc = point.pc;
                     c = resolve!(module);
+                    self.regs[base..base + point.window.len()].copy_from_slice(&point.window);
                     self.regs[base + point.dst as usize] = Reg::from_i32(resume);
                 }
                 Op::Call { callee, args, dst } => {
@@ -20140,6 +20197,8 @@ mod func_memo_tests {
             params: Vec::new(),
             results,
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: Vec::new(),
                 insts,
                 term,

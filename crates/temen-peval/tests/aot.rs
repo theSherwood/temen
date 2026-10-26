@@ -46,6 +46,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
     let load = |op, addr, offset| Inst::Load { op, addr, offset };
 
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t()],                              // 0: input
         insts: vec![Inst::ConstI64(0), Inst::ConstI64(0)], // 1: acc, 2: pc
         term: Terminator::Br {
@@ -54,6 +56,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let header = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t(), i64t(), i64t()], // acc, pc, input
         insts: vec![
             Inst::ConstI64(16384), // 3: base (program window above the #1094 NULL guard)
@@ -74,12 +78,16 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let halt = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t()],
         insts: vec![],
         term: Terminator::Return(vec![0]),
     };
     // pc += 9 then loop; new accumulator is at `nacc_idx`.
     let step = |acc_update: Vec<Inst>, nacc_idx: u32| Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t(), i64t(), i64t(), i64t()], // acc, pc, imm, input
         insts: {
             let mut v = acc_update;
@@ -93,6 +101,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let seti = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t(), i64t(), i64t(), i64t()],
         insts: vec![Inst::ConstI64(9), add(1, 4)],
         term: Terminator::Br {

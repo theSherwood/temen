@@ -95,7 +95,9 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
 
     // 0 — entry(input): acc = 0, i = 0, pc = 0.
     let entry = Block {
-        params: vec![t()],                                                    // 0: input
+        parent: 0,
+        captures: vec![],
+        params: vec![t()], // 0: input
         insts: vec![Inst::ConstI64(0), Inst::ConstI64(0), Inst::ConstI64(0)], // 1: acc, 2: i, 3: pc
         term: Terminator::Br {
             target: 1,
@@ -104,6 +106,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
     };
     // 1 — header(acc, i, pc, input): decode + dispatch. Op-blocks get (acc, i, pc, imm, input).
     let header = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t()], // 0: acc, 1: i, 2: pc, 3: input
         insts: vec![
             Inst::ConstI64(PROG_BASE as i64), // 4: base
@@ -126,6 +130,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
     };
     // 2 — halt(acc).
     let halt = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t()],
         insts: vec![],
         term: Terminator::Return(vec![0]),
@@ -133,6 +139,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
     // Op-block params are always (acc, i, pc, imm, input) = indices 0,1,2,3,4.
     // 3 — setacc: acc = imm; pc += 9.
     let setacc = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t(), t()],
         insts: vec![Inst::ConstI64(9), add(2, 5)], // 5: 9, 6: npc
         term: Terminator::Br {
@@ -142,6 +150,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
     };
     // 4 — seti_input: i = input; pc += 9.
     let seti_input = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t(), t()],
         insts: vec![Inst::ConstI64(9), add(2, 5)],
         term: Terminator::Br {
@@ -151,6 +161,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
     };
     // 5 — add_i: acc = acc + i; pc += 9.
     let add_i = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t(), t()],
         insts: vec![add(0, 1), Inst::ConstI64(9), add(2, 6)], // 5: nacc, 6: 9, 7: npc
         term: Terminator::Br {
@@ -160,6 +172,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
     };
     // 6 — dec_i: i = i - 1; pc += 9.
     let dec_i = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t(), t()],
         insts: vec![
             Inst::ConstI64(1),
@@ -179,6 +193,8 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
     };
     // 7 — jnz: if i != 0 then pc = imm else pc += 9.
     let jnz = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t(), t()],
         insts: vec![
             Inst::ConstI64(0),
@@ -262,6 +278,8 @@ fn build_calc_interpreter() -> Module {
 
     // 0 — entry(a, b): acc = a, pc = 0.
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t()],         // 0: a, 1: b
         insts: vec![Inst::ConstI64(0)], // 2: pc
         term: Terminator::Br {
@@ -271,6 +289,8 @@ fn build_calc_interpreter() -> Module {
     };
     // 1 — header(acc, b, pc): decode + dispatch. pc is advanced here; op-blocks pass it through.
     let header = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t()], // 0: acc, 1: b, 2: pc
         insts: vec![
             Inst::ConstI64(PROG_BASE as i64), // 3: base
@@ -292,6 +312,8 @@ fn build_calc_interpreter() -> Module {
         },
     };
     let addb = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t()],
         insts: vec![add(0, 1)], // 3 = acc + b
         term: Terminator::Br {
@@ -300,6 +322,8 @@ fn build_calc_interpreter() -> Module {
         },
     };
     let mulb = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t()],
         insts: vec![mul(0, 1)],
         term: Terminator::Br {
@@ -308,6 +332,8 @@ fn build_calc_interpreter() -> Module {
         },
     };
     let addk = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t()], // ..., 3: imm
         insts: vec![add(0, 3)],           // 4 = acc + imm
         term: Terminator::Br {
@@ -316,6 +342,8 @@ fn build_calc_interpreter() -> Module {
         },
     };
     let mulk = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t()],
         insts: vec![mul(0, 3)],
         term: Terminator::Br {
@@ -324,6 +352,8 @@ fn build_calc_interpreter() -> Module {
         },
     };
     let end = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t()],
         insts: vec![],
         term: Terminator::Return(vec![0]),
@@ -522,6 +552,8 @@ fn build_stack_interpreter(program: &[(u8, i64)]) -> Module {
     };
 
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t()],                                               // 0: input
         insts: vec![Inst::ConstI64(0), Inst::ConstI64(STACK_LO as i64)], // 1: pc, 2: sp
         term: Terminator::Br {
@@ -530,6 +562,8 @@ fn build_stack_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let header = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t()], // 0: pc, 1: sp, 2: input
         insts: vec![
             Inst::ConstI64(PROG_BASE as i64),
@@ -550,6 +584,8 @@ fn build_stack_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let halt = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t()], // 0: sp
         insts: vec![
             Inst::ConstI64(8),
@@ -559,6 +595,8 @@ fn build_stack_interpreter(program: &[(u8, i64)]) -> Module {
         term: Terminator::Return(vec![3]),
     };
     let push_body = |value_idx: u32| Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t()], // 0: pc, 1: sp, 2: imm, 3: input
         insts: vec![
             store(1, value_idx),
@@ -573,6 +611,8 @@ fn build_stack_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let binop_body = |op: BinOp| Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t()],
         insts: vec![
             Inst::ConstI64(8),
@@ -733,6 +773,8 @@ fn build_inline_demo() -> Module {
         params: vec![t(), t()],
         results: vec![t()],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![t(), t()],
             insts: vec![Inst::Call {
                 func: 1,
@@ -745,6 +787,8 @@ fn build_inline_demo() -> Module {
         params: vec![t(), t()],
         results: vec![t()],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![t(), t()],
             insts: vec![
                 Inst::ConstI64(3), // 2
@@ -884,6 +928,8 @@ fn build_stack_interpreter_calls(program: &[(u8, i64)]) -> Module {
     };
 
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t()],                                               // 0: input
         insts: vec![Inst::ConstI64(0), Inst::ConstI64(STACK_LO as i64)], // 1: pc, 2: sp
         term: Terminator::Br {
@@ -892,6 +938,8 @@ fn build_stack_interpreter_calls(program: &[(u8, i64)]) -> Module {
         },
     };
     let header = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t()], // 0: pc, 1: sp, 2: input
         insts: vec![
             Inst::ConstI64(PROG_BASE as i64),
@@ -911,6 +959,8 @@ fn build_stack_interpreter_calls(program: &[(u8, i64)]) -> Module {
         },
     };
     let halt = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t()], // 0: sp
         insts: vec![
             Inst::ConstI64(8),
@@ -920,6 +970,8 @@ fn build_stack_interpreter_calls(program: &[(u8, i64)]) -> Module {
         term: Terminator::Return(vec![3]),
     };
     let push_body = |value_idx: u32| Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t()], // 0: pc, 1: sp, 2: imm, 3: input
         insts: vec![
             store(1, value_idx),
@@ -936,6 +988,8 @@ fn build_stack_interpreter_calls(program: &[(u8, i64)]) -> Module {
     // COMBINE: b = stk[sp-8]; a = stk[sp-16]; stk[sp-16] = combine(a, b); sp -= 8. The CALL happens
     // while cells below the two operands are still live in the renamed region — those must thread.
     let combine_body = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t()], // 0: pc, 1: sp, 2: imm, 3: input
         insts: vec![
             Inst::ConstI64(8),
@@ -961,6 +1015,8 @@ fn build_stack_interpreter_calls(program: &[(u8, i64)]) -> Module {
         params: vec![t(), t()], // 0: a, 1: b
         results: vec![t()],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![t(), t()],
             insts: vec![
                 bin(BinOp::Add, 0, 1), // 2: a+b
@@ -1059,6 +1115,8 @@ fn build_heap_interpreter(program: &[(u8, i64)]) -> Module {
     };
 
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t()],                                 // 0: input
         insts: vec![Inst::ConstI64(0), Inst::ConstI64(0)], // 1: acc, 2: pc
         term: Terminator::Br {
@@ -1067,6 +1125,8 @@ fn build_heap_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let header = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t()], // 0: acc, 1: pc, 2: input
         insts: vec![
             Inst::ConstI64(PROG_BASE as i64),
@@ -1088,12 +1148,16 @@ fn build_heap_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let halt = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t()],
         insts: vec![],
         term: Terminator::Return(vec![0]),
     };
     // Op blocks: params (acc, pc, imm, input) = 0,1,2,3.
     let seti = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t()],
         insts: vec![Inst::ConstI64(9), bin(BinOp::Add, 1, 4)], // 5: npc
         term: Terminator::Br {
@@ -1102,6 +1166,8 @@ fn build_heap_interpreter(program: &[(u8, i64)]) -> Module {
         }, // acc=imm
     };
     let addin = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t()],
         insts: vec![
             bin(BinOp::Add, 0, 3), // 4: acc+input
@@ -1114,6 +1180,8 @@ fn build_heap_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let addk = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t(), t()],
         insts: vec![
             bin(BinOp::Add, 0, 2), // 4: acc+imm
@@ -1136,6 +1204,8 @@ fn build_heap_interpreter(program: &[(u8, i64)]) -> Module {
         insts.push(Inst::ConstI64(9));
         insts.push(bin(BinOp::Add, 1, 10)); // 11: npc
         Block {
+            parent: 0,
+            captures: vec![],
             params: vec![t(), t(), t(), t()],
             insts,
             term: Terminator::Br {
@@ -1150,6 +1220,8 @@ fn build_heap_interpreter(program: &[(u8, i64)]) -> Module {
         insts.push(Inst::ConstI64(9));
         insts.push(bin(BinOp::Add, 1, 11)); // 12: npc
         Block {
+            parent: 0,
+            captures: vec![],
             params: vec![t(), t(), t(), t()],
             insts,
             term: Terminator::Br {
@@ -1203,6 +1275,8 @@ fn build_threaded_interpreter(program: &[(u8, i64)]) -> Module {
 
     // Interpreter (func 0). acc starts at `input` (so a computed dispatch index is dynamic).
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t()],              // 0: input
         insts: vec![Inst::ConstI64(0)], // 1: pc
         term: Terminator::Br {
@@ -1211,6 +1285,8 @@ fn build_threaded_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let header = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t()], // 0: acc, 1: pc, 2: input
         insts: vec![
             Inst::ConstI64(PROG_BASE as i64),
@@ -1235,6 +1311,8 @@ fn build_threaded_interpreter(program: &[(u8, i64)]) -> Module {
         },
     };
     let halt = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t()],
         insts: vec![],
         term: Terminator::Return(vec![0]),
@@ -1242,6 +1320,8 @@ fn build_threaded_interpreter(program: &[(u8, i64)]) -> Module {
     // dispatch(acc, pc, op, input): call_indirect(op, [acc, input]); pc += 1. `op` is the constant
     // program byte (an i32 funcref index), so the indirect call resolves to a handler.
     let dispatch = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), ValType::I32, t()], // 0: acc, 1: pc, 2: op (funcref idx), 3: input
         insts: vec![
             Inst::CallIndirect {
@@ -1260,6 +1340,8 @@ fn build_threaded_interpreter(program: &[(u8, i64)]) -> Module {
     // dyn_dispatch(acc, pc, input): idx = wrap_i64(1 + (acc & 3)) — a dynamic i32 funcref index, so
     // call.dyn can't resolve it.
     let dyn_dispatch = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![t(), t(), t()], // 0: acc, 1: pc, 2: input
         insts: vec![
             Inst::ConstI64((T_NHANDLERS - 1) as i64),
@@ -1289,6 +1371,8 @@ fn build_threaded_interpreter(program: &[(u8, i64)]) -> Module {
         params: vec![t(), t()],
         results: vec![t()],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![t(), t()],
             insts,
             term: Terminator::Return(vec![ret]),

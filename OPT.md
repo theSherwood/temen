@@ -95,6 +95,9 @@ phis; flat structs-of-arrays, integer indices, arena-per-function per the DOD ru
 passes there, and lowers back to block-local form in one well-tested boundary pass (out-of-SSA
 param threading). The wire format and verifier never see it. Same shape as the JIT (Cranelift
 converts to its own form too); one boundary to fuzz instead of per-pass renumbering cleverness.
+Since #2454 the wire IR may also carry a block's **captures** (values of dominating blocks); every
+module-level pass here first takes the module to block-local form (`temen_opt::block_local`, over
+`Func::localize`), so the passes themselves still see only block params.
 The round-trip is differentially fuzzed as a **no-op** (convert → lower, no passes) before any
 pass uses it.
 

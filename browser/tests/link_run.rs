@@ -25,6 +25,8 @@ fn unit(val: i64) -> Module {
             params: vec![ValType::I64],
             results: vec![ValType::I64],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64],
                 insts: vec![Inst::ConstI64(val)],
                 term: Terminator::Return(vec![1]),

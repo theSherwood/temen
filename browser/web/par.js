@@ -9,6 +9,7 @@
 // `/<repo>/`). The deployed site keeps the same `web/` + `target/…` layout, so `../target/…`
 // resolves correctly under either base.
 import { engineImports } from './engine-imports.js';
+import { adoptEngine } from './foreign-mem.js';
 import { engineMemory } from './engine-mem.js';
 const WASM = new URL('../target/wasm32-unknown-unknown/release/temen_browser.wasm', import.meta.url);
 const STACK = 1 << 20;
@@ -43,6 +44,7 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
   // more than an older build allows yields that build's ceiling instead of a `LinkError`.
   const { memory, maxPages } = engineMemory(bytes, { maxPages: askPages });
   const { exports: ex } = await WebAssembly.instantiate(module, engineImports(memory));
+  adoptEngine(ex, memory); // detached children's own memories, through this instance's table
   return { module, bytes, memory, ex, maxPages };
 }
 

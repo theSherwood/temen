@@ -397,6 +397,8 @@ fn wrap_with_heap(residual: &Module, entry: u32, w: &[u8], x_addr: u64) -> (Modu
         params: vec![ValType::I64, ValType::I64, ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64, ValType::I64, ValType::I64],
             insts: vec![
                 Inst::ConstI64(x_addr as i64), // v3

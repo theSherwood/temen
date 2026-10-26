@@ -110,6 +110,8 @@ fn remap_func_indices(f: &mut Func, map: &[u32]) {
 /// removed (its `(func, …)` positions would be stale after renumbering; it is strippable and untrusted
 /// for escape, §3a).
 pub fn dead_func_elim(m: &Module) -> Module {
+    let local = crate::block_local(m);
+    let m: &Module = &local;
     let n = m.funcs.len();
     if n == 0 {
         return m.clone();
@@ -350,6 +352,8 @@ fn inline_single_block_call(
     });
 
     Block {
+        parent: 0,
+        captures: vec![],
         params: caller.params.clone(),
         insts: new_insts,
         term,
@@ -486,6 +490,8 @@ fn inline_multi_block_call(
     caller_block_types: &[ValType],
 ) {
     let placeholder = Block {
+        parent: 0,
+        captures: vec![],
         params: Vec::new(),
         insts: Vec::new(),
         term: Terminator::Unreachable,
@@ -538,12 +544,15 @@ fn inline_multi_block_call(
         params,
         insts: mut pre_insts,
         term,
+        ..
     } = b;
     let post_insts = pre_insts.split_off(call_idx + 1);
     pre_insts.truncate(call_idx);
     let mut pre_args = call_args;
     pre_args.extend(cap.iter().copied());
     blocks[bi] = Block {
+        parent: 0,
+        captures: vec![],
         params,
         insts: pre_insts,
         term: Terminator::Br {
@@ -564,6 +573,8 @@ fn inline_multi_block_call(
         let cap_params: Vec<u32> = (np..np + capc).collect();
         let term = transform_callee_term(&cb.term, np, capc, off, cont, &cap_params);
         blocks.push(Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts,
             term,
@@ -595,6 +606,8 @@ fn inline_multi_block_call(
     let mut cont_params = callee.results.clone();
     cont_params.extend(cap_types.iter().copied());
     blocks.push(Block {
+        parent: 0,
+        captures: vec![],
         params: cont_params,
         insts: cont_insts,
         term: cont_term,
@@ -623,6 +636,8 @@ pub fn inline_calls(m: &Module) -> Module {
 /// survives for every function nothing was inlined into; a caller's own positions go stale, so its
 /// locations and variables are dropped ([`crate::drop_stale_debug`]).
 pub fn inline_calls_with(m: &Module, limits: InlineLimits) -> Module {
+    let local = crate::block_local(m);
+    let m: &Module = &local;
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
     let types = &m.types;
     let has_memory = m.memory.is_some();
@@ -669,8 +684,7 @@ pub fn inline_calls_with(m: &Module, limits: InlineLimits) -> Module {
                     // Callee has internal control flow: splice its CFG in, threading captured values
                     // through. The block now ends at the call; the rest of it moved to the appended
                     // continuation.
-                    let block_types =
-                        block_value_types(&funcs[ci].blocks[bi], &funcs, types, has_memory);
+                    let block_types = block_value_types(&funcs[ci], bi, &funcs, types, has_memory);
                     let callee_fn = funcs[callee].clone();
                     inline_multi_block_call(
                         &mut funcs[ci].blocks,
@@ -752,6 +766,8 @@ fn substitute_params(entry: &Block, subs: &[(usize, Known)]) -> Block {
     let mut term = entry.term.clone();
     map_term_operands(&mut term, &mut |o| remap(o));
     Block {
+        parent: 0,
+        captures: vec![],
         params: entry.params.clone(),
         insts,
         term,
@@ -820,6 +836,8 @@ fn block_knowns(
 /// bail, and if **any** indirect index is still `Top` at the fixpoint — an unknown funcref that could
 /// reach any function with arguments we never counted — the pass bails entirely. Output is re-verified.
 pub fn const_prop(m: &Module) -> Module {
+    let local = crate::block_local(m);
+    let m: &Module = &local;
     let n = m.funcs.len();
     if n == 0 {
         return m.clone();
@@ -1091,6 +1109,8 @@ fn resolve_devirt(
 /// the direct call does. A mismatched or out-of-range index is left as an indirect call so it still
 /// traps identically. Debug info is dropped on any rewrite (an instruction changed).
 pub fn devirtualize(m: &Module) -> Module {
+    let local = crate::block_local(m);
+    let m: &Module = &local;
     let fn_results: Vec<usize> = m.funcs.iter().map(|f| f.results.len()).collect();
     let types = &m.types;
     let num_funcs = m.funcs.len();

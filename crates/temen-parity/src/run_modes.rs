@@ -374,7 +374,7 @@ pub struct Runner {
 /// **The runners**, the matrix's evidence: every configuration the conformance test runs each probe
 /// on. The test holds its own runners to this list exactly. A configuration missing here is ❔
 /// wherever a cell needs it, unless [`config_exception`] says why it does not exist.
-pub const RUNNERS: [Runner; 8] = {
+pub const RUNNERS: [Runner; 11] = {
     use Executor::*;
     use Property::*;
     [
@@ -409,6 +409,22 @@ pub const RUNNERS: [Runner; 8] = {
         Runner {
             config: Config::new(Parallel, &[Held]),
             what: "CoopRun on executor 2",
+        },
+        Runner {
+            config: Config::new(TreeWalk, &[Durable]),
+            what: "run_capture_reserved_with_host_layout over an instrumented module: frozen at \
+                   its first safepoint, serialized by the §12 codec, restored into a fresh \
+                   powerbox and thawed",
+        },
+        Runner {
+            config: Config::new(Pump, &[Durable]),
+            what:
+                "bytecode::compile_and_run_capture_reserved_with_host, frozen and thawed the same \
+                   way",
+        },
+        Runner {
+            config: Config::new(Cranelift, &[Durable]),
+            what: "temen_run::jit_cap_run over a durable host, frozen and thawed the same way",
         },
     ]
 };
@@ -463,6 +479,7 @@ pub fn exception(f: Feature, c: Config) -> Option<Cell> {
     use Executor::*;
     use Feature::*;
     let debugged = c.props.has(Property::Debugger);
+    let durable = c.props.has(Property::Durable);
     Some(match (f, c.executor) {
         // The Cranelift JIT, whatever the run adds.
         (Threads | Fibers | Children, Cranelift) => conditional(FIBER_RT),
@@ -510,6 +527,26 @@ pub fn exception(f: Feature, c: Config) -> Option<Cell> {
             "the bytecode debug scheduler runs a stopped process on: its pick never asks whether \
              the process is stopped (#2615)",
         ),
+        // A durable run, frozen and thawed.
+        (HostAnswered, _) if durable => not_yet(
+            "a durable run declines a host-answered call with CapFault before its embedder sees \
+             it: no caller in a durable run parks on a call (#2504)",
+        ),
+        (Exec, TreeWalk | Pump) if durable => {
+            not_yet("a durable domain refuses exec_module with -EINVAL (#1696)")
+        }
+        (Threads | Children | Fork, Pump) if durable => not_yet(
+            "the bytecode tier's durable entry declines a module with threads or §14 children, \
+             and the pump hands it to the tree-walker (#2533)",
+        ),
+        (GrowingWindow, Pump) if durable => not_yet(
+            "the bytecode tier's durable entry takes a flat window, so a thaw traps MemoryFault \
+             on a page the run mapped past its declared memory (#2628)",
+        ),
+        (Serving, Cranelift) if durable => not_yet(
+            "a serve op under a landed freeze drains its queue, so the thaw's re-issued poll \
+             answers 0 where the run served 2 (#2627)",
+        ),
         _ => return None,
     })
 }
@@ -520,6 +557,12 @@ pub fn exception(f: Feature, c: Config) -> Option<Cell> {
 pub fn config_exception(e: Executor, props: Props) -> Option<Cell> {
     use Executor::*;
     use Property::*;
+    if props.has(Durable) && e == Parallel {
+        return Some(not_yet(
+            "executor 2 has no freeze across its threads yet; a durable run asked to run on it \
+             runs on the pump (#2541)",
+        ));
+    }
     if props.has(Debugger) {
         match e {
             Parallel => {

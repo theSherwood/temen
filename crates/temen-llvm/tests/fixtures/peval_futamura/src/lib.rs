@@ -165,6 +165,8 @@ fn build_interpreter(win_log2: u8) -> Module {
 
     // Block 0 — entry(a=v0, b=v1): seed acc=a, i=0, jump to the loop.
     let entry = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t, i64t],
         insts: vec![Inst::ConstI64(0)], // v2 = 0 (the initial program counter)
         term: Terminator::Br {
@@ -175,6 +177,8 @@ fn build_interpreter(win_log2: u8) -> Module {
 
     // Block 1 — loop(acc=v0, b=v1, i=v2): decode the instruction at PROG_BASE + i*16 and dispatch.
     let loop_blk = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t, i64t, i64t],
         insts: vec![
             Inst::ConstI64(PROG_BASE as i64), // v3
@@ -213,6 +217,8 @@ fn build_interpreter(win_log2: u8) -> Module {
 
     // Blocks 2..5 — the ops. Each folds into acc, then loops back with the advanced counter.
     let addb = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t, i64t, i64t],
         insts: vec![add(0, 1)], // v3 = acc + b
         term: Terminator::Br {
@@ -221,6 +227,8 @@ fn build_interpreter(win_log2: u8) -> Module {
         },
     };
     let mulb = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t, i64t, i64t],
         insts: vec![mul(0, 1)], // v3 = acc * b
         term: Terminator::Br {
@@ -229,6 +237,8 @@ fn build_interpreter(win_log2: u8) -> Module {
         },
     };
     let addk = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t, i64t, i64t, i64t],
         insts: vec![add(0, 3)], // v4 = acc + k
         term: Terminator::Br {
@@ -237,6 +247,8 @@ fn build_interpreter(win_log2: u8) -> Module {
         },
     };
     let mulk = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t, i64t, i64t, i64t],
         insts: vec![mul(0, 3)], // v4 = acc * k
         term: Terminator::Br {
@@ -247,6 +259,8 @@ fn build_interpreter(win_log2: u8) -> Module {
 
     // Block 6 — end(acc=v0): return the accumulator.
     let end = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![i64t],
         insts: vec![],
         term: Terminator::Return(vec![0]),

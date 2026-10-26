@@ -669,12 +669,14 @@ fn a_region_shared_with_a_detached_child_rides_and_stays_shared() {
 }
 
 /// #2233 — **a thawed child that spins on its parent lets the parent run**, with the run's lane
-/// unbounded and capped at 2. [`SHARING_PARENT`] sets the region's first word once it has mapped the
-/// region, after the cut, and [`SHARING_CHILD`] spins on that word before its tail. A thaw runs on one
-/// worker (DURABILITY.md §12.8), and the tree-walker's pool ran a vCPU until it parked, so the
+/// unbounded and capped at 1 and 2. [`SHARING_PARENT`] sets the region's first word once it has mapped
+/// the region, after the cut, and [`SHARING_CHILD`] spins on that word before its tail. A thaw runs on
+/// one worker (DURABILITY.md §12.8), and the tree-walker's pool ran a vCPU until it parked, so the
 /// re-launched child's spin kept that worker and the thaw ran out of fuel. A vCPU now yields at its
 /// quantum (#2228), and in a bounded lane it keeps its lane across the yield, so the worker
-/// time-slices between the two vCPUs the lane admits (#2237).
+/// time-slices between the two vCPUs the lane admits (#2237). A lane of 1 admits one: the thaw starts
+/// the parent first, as the uninterrupted run does, so it holds the lane until it parks at its join,
+/// by when the word is set (#2240).
 #[test]
 fn a_thawed_child_spinning_on_its_parent_lets_the_parent_run() {
     let map = "  vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vrh (vwin, gz, vlen, vprot)\n";
@@ -693,7 +695,7 @@ block 4 (vd: i64) {
     let parent = confined(&with_spawn_rec(&SHARING_PARENT.replace(map, &signal)));
     let child = confined(&SHARING_CHILD.replace(tail, spin));
     let want = Ok(vec![Value::I64(SHARED_WANT)]);
-    for cap in [-1, 2] {
+    for cap in [-1, 1, 2] {
         let (mut host, args) = sharing_host(&child, heap_region());
         host.set_lane_cap(cap);
         let win = init_durable_window(WINDOW, TEST_ARENA);
@@ -718,6 +720,305 @@ block 4 (vd: i64) {
         let (thawed, ..) = run(&parent, 0, &mut thost, &args, &twin, Some(&rprots));
         assert_eq!(thawed, want, "the thaw, lane cap {cap}");
     }
+}
+
+/// #2465 — the parent of [`SHARING_PARENT`]'s spawn, which detaches the child (op 10) at once and
+/// maps the region. It raises the flag at 128 KiB, waits (at most 50,000,000 polls) for the child's
+/// answer at 128 KiB + 24, spins `DELAY` times, and returns the answer (`-1` if none came) after
+/// `FINISH`. A short loop comes before the flag and another after the spin, and the freeze lands at
+/// the header of the first after a `FLIP` the test places ([`Cut`]).
+const DETACHING_PARENT: &str = "memory 18 shadow 16448 65536
+func (i32, i32, i32, i32) -> (i64) {
+block 0 (vinst: i32, vmod: i32, vbud: i32, vrh: i32) {
+  vwin = i64.const 131072
+  gz = i64.const 0
+  vsm = i64.const 65544
+  i32.store vsm vmod
+  vsb = i64.const 65548
+  i32.store vsb vbud
+  vsr = i64.const 65584
+  i32.store vsr vrh
+  vsp = i64.const 65536
+  ch = call.cap 6 17 (i64) -> (i32) vinst (vsp)
+  vdt = call.cap 6 10 (i32) -> (i32) vinst (ch)
+  vlen = i64.const 65536
+  vprot = i64.const 3
+  vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vrh (vwin, gz, vlen, vprot)
+LIVE
+  br 1(gz, vinst, ch)
+}
+block 1 (vi: i64, vin1: i32, vch1: i32) {
+  vn = i64.const 10
+  vc = i64.lt_s vi vn
+  br_if vc 2(vi, vin1, vch1) 3(vin1, vch1)
+}
+block 2 (vj: i64, vin2: i32, vch2: i32) {
+  vo = i64.const 1
+  vk = i64.add vj vo
+  br 1(vk, vin2, vch2)
+}
+block 3 (vin3: i32, vch3: i32) {
+  vf = i64.const 131072
+  vone = i64.const 1
+  i64.atomic.store vf vone
+  vz = i64.const 0
+  br 4(vz, vin3, vch3)
+}
+block 4 (vp: i64, vin4: i32, vch4: i32) {
+  vw = i64.const 131096
+  vx = i64.atomic.load vw
+  vz = i64.const 0
+  vnone = i64.eq vx vz
+  br_if vnone 5(vp, vin4, vch4) 6(vx, vin4, vch4)
+}
+block 5 (vq: i64, vin5: i32, vch5: i32) {
+  vo = i64.const 1
+  vq1 = i64.add vq vo
+  vmax = i64.const 50000000
+  vc = i64.lt_s vq1 vmax
+  br_if vc 4(vq1, vin5, vch5) 9(vq1)
+}
+block 6 (vr: i64, vin6: i32, vch6: i32) {
+  vz = i64.const 0
+  br 7(vz, vr, vin6, vch6)
+}
+block 7 (vi7: i64, vr7: i64, vin7: i32, vch7: i32) {
+  vn = i64.const DELAY
+  vc = i64.lt_s vi7 vn
+  br_if vc 8(vi7, vr7, vin7, vch7) 11(vr7, vin7, vch7)
+}
+block 8 (vj8: i64, vr8: i64, vin8: i32, vch8: i32) {
+  vo = i64.const 1
+  vk = i64.add vj8 vo
+  br 7(vk, vr8, vin8, vch8)
+}
+block 9 (vgone: i64) {
+  vneg = i64.const -1
+  return vneg
+}
+block 10 (vr10: i64, vin10: i32, vch10: i32) {
+FINISH
+  return vr10
+}
+block 11 (vr11: i64, vin11: i32, vch11: i32) {
+ENDED
+  vz = i64.const 0
+  br 12(vz, vr11, vin11, vch11)
+}
+block 12 (vi12: i64, vr12: i64, vin12: i32, vch12: i32) {
+  vn = i64.const 10
+  vc = i64.lt_s vi12 vn
+  br_if vc 13(vi12, vr12, vin12, vch12) 10(vr12, vin12, vch12)
+}
+block 13 (vj13: i64, vr13: i64, vin13: i32, vch13: i32) {
+  vo = i64.const 1
+  vk = i64.add vj13 vo
+  br 12(vk, vr13, vin13, vch13)
+  }
+}
+";
+
+/// Where a test's freeze lands in [`DETACHING_PARENT`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Cut {
+    /// Before the flag: the child is live, waiting for it.
+    Live,
+    /// After the answer and a spin long enough for the child to have returned, unreaped. The
+    /// child runs on a worker of its own, so the spin is what lets its end reach the scheduler
+    /// first; were it slower, it would be rung and return, which the test answers the same.
+    Ended,
+}
+
+/// The detached child: it waits for the parent's flag, which the parent raises only after the cut,
+/// so the child is live and short of its answer whenever the freeze lands. Then it answers `3333`.
+/// The zero-length `unmap` makes the function may-suspend, so its loop header polls.
+const DETACHED_CHILD: &str = "memory 18 shadow 16448 65536
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vs0 = i32.wrap_i64 v1
+  vz = i64.const 0
+  vu = call.cap 5 1 (i64, i64) -> (i64) vs0 (vz, vz)
+  br 1(vz)
+}
+block 1 (vi: i64) {
+  vf = i64.const 131072
+  vh = i64.atomic.load vf
+  vz = i64.const 0
+  vw = i64.eq vh vz
+  br_if vw 2(vi) 3(vi)
+}
+block 2 (vj: i64) {
+  vo = i64.const 1
+  vk = i64.add vj vo
+  br 1(vk)
+}
+block 3 (vd: i64) {
+  vb = i64.const 131096
+  vt = i64.const 3333
+  i64.atomic.store vb vt
+  return vd
+  }
+}
+";
+
+/// A detached child with no poll: it answers at once and returns. Rung before it first runs, it
+/// returns without unwinding.
+const STRAIGHT_CHILD: &str = "memory 18 shadow 16448 65536
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vb = i64.const 131096
+  vt = i64.const 3333
+  i64.atomic.store vb vt
+  return v0
+  }
+}
+";
+
+/// [`DETACHING_PARENT`] with `finish` before its return, requesting the freeze at `cut`, as
+/// `confined` builds it.
+fn detaching_parent(finish: &str, cut: Option<Cut>) -> Module {
+    let at = |c| {
+        if cut == Some(c) {
+            flip()
+        } else {
+            String::new()
+        }
+    };
+    let delay = if cut == Some(Cut::Ended) { 100_000 } else { 0 };
+    let src = DETACHING_PARENT
+        .replace("FINISH", finish)
+        .replace("DELAY", &delay.to_string())
+        .replace("LIVE", &at(Cut::Live))
+        .replace("ENDED", &at(Cut::Ended));
+    confined(&with_spawn_rec(&src))
+}
+
+/// After the answer, the parent polls the child it detached, which faults: no handle reaches it.
+const POLL_DETACHED: &str = "  vpl = call.cap 6 9 (i32) -> (i32) vin10 (vch10)";
+
+/// #2465 — **a child its spawner detached (op 10) rides the freeze, and thaws unjoinable.** Cut
+/// while the child waits for its parent's flag, the freeze rings it as it rings one a join slot
+/// names, records it as detached, and the thaw relaunches it so: it answers its parent as before the
+/// cut, and the parent's handle still reaches nothing (`poll` faults). Before, the freeze neither
+/// rang nor recorded it: the run waited for the child, whose wait for the flag only the thawed
+/// parent raises ran the run out of fuel, and the freeze failed. A child that returned leaves
+/// nothing for the thaw, not even an outcome a slot would deliver: one that returned before the cut,
+/// and one the freeze rang that returned before it reached a poll ([`STRAIGHT_CHILD`]).
+#[test]
+fn a_child_its_spawner_detached_rides_the_freeze_unjoinable() {
+    let fault = Err(temen_interp::Trap::ThreadFault);
+    for (child, cut, finish, want, rides) in [
+        (DETACHED_CHILD, Cut::Live, "", Ok(vec![Value::I64(3333)]), 1),
+        (DETACHED_CHILD, Cut::Live, POLL_DETACHED, fault.clone(), 1),
+        (DETACHED_CHILD, Cut::Ended, POLL_DETACHED, fault.clone(), 0),
+        (STRAIGHT_CHILD, Cut::Live, POLL_DETACHED, fault, 0),
+    ] {
+        let child = confined(child);
+        let (mut host, args) = sharing_host(&child, heap_region());
+        let win = init_durable_window(WINDOW, TEST_ARENA);
+        let (base, ..) = run(
+            &detaching_parent(finish, None),
+            0,
+            &mut host,
+            &args,
+            &win,
+            None,
+        );
+        assert_eq!(base, want, "uninterrupted run, finishing {finish:?}");
+
+        let parent = detaching_parent(finish, Some(cut));
+        let (mut fhost, args) = sharing_host(&child, heap_region());
+        let (res, snap, prots) = run(&parent, 0, &mut fhost, &args, &win, None);
+        assert!(res.is_ok(), "a freeze, not a refusal: {res:?}");
+        assert_eq!(read_state(&snap, TEST_ARENA), STATE_UNWINDING, "frozen");
+        let captured = fhost.captured_detached();
+        let rode = (captured.len(), captured.iter().all(|c| !c.launch.joinable));
+        assert_eq!(rode, (rides, true), "{cut:?}: as its spawner left it");
+        assert!(
+            fhost.frozen_detached().is_empty(),
+            "{cut:?}: no outcome rides"
+        );
+        let artifact = freeze_with_prots(&parent, &snap, &prots, SIZE_LOG2, &fhost).expect("rides");
+
+        let mut thost = Host::new();
+        thost.set_durable(true);
+        thost.grant_durable_module(&child);
+        let (mut twin, rprots, _) =
+            restore_with_prots(&artifact, &parent, &mut thost).expect("restores");
+        begin_thaw(&mut twin, TEST_ARENA, 0);
+        let (thawed, ..) = run(&parent, 0, &mut thost, &args, &twin, Some(&rprots));
+        assert_eq!(thawed, want, "the thaw, {cut:?}, finishing {finish:?}");
+    }
+}
+
+/// #2465 on the JIT — **a child its spawner detached (op 10) rides a JIT freeze, and thaws unjoinable
+/// on either engine.** The JIT rang it with every child of the domain, and it unwound, but its
+/// harvest skipped a child no join slot claims: the artifact held no child, and the thawed parent
+/// waited for an answer no one would give.
+#[test]
+fn a_child_its_spawner_detached_rides_a_jit_freeze() {
+    let child = confined(DETACHED_CHILD);
+    let shm = || temen_run::new_shared_region(LEN).expect("a region");
+    let fresh = || MemLayout::image(init_durable_window(WINDOW, TEST_ARENA));
+    let (mut host, args) = sharing_host(&child, shm());
+    let base = run_jit(&detaching_parent("", None), 0, &mut host, &args, &fresh()).0;
+    assert_eq!(base, Some(3333), "uninterrupted run");
+
+    let freeze_on = |parent: &Module| {
+        let (mut fhost, _) = sharing_host(&child, shm());
+        let (res, snap) = run_jit(parent, 0, &mut fhost, &args, &fresh());
+        assert_eq!(res, None, "frozen");
+        let captured = fhost.captured_detached();
+        assert_eq!(captured.len(), 1, "the child rides live");
+        assert!(!captured[0].launch.joinable, "as its spawner left it");
+        freeze_layout(parent, &snap, SIZE_LOG2, &fhost).expect("rides")
+    };
+    let restored = |artifact: &[u8], parent: &Module| {
+        let mut thost = Host::new();
+        thost.set_durable(true);
+        thost.set_region_factory(temen_run::new_shared_region);
+        thost.grant_durable_module(&child);
+        let (rwin, rprots, _) = restore_with_prots(artifact, parent, &mut thost).expect("restores");
+        (thost, rwin, rprots)
+    };
+    let parent = detaching_parent("", Some(Cut::Live));
+    let artifact = freeze_on(&parent);
+    let (mut thost, rwin, rprots) = restored(&artifact, &parent);
+    assert_eq!(
+        run_jit(&parent, 0, &mut thost, &args, &thaw_layout(rwin, &rprots)).0,
+        Some(3333),
+        "the JIT thaw"
+    );
+    let (mut thost, mut rwin, rprots) = restored(&artifact, &parent);
+    begin_thaw(&mut rwin, TEST_ARENA, 0);
+    assert_eq!(
+        run(&parent, 0, &mut thost, &args, &rwin, Some(&rprots)).0,
+        Ok(vec![Value::I64(3333)]),
+        "the interpreter's thaw of the JIT's artifact"
+    );
+
+    // The thawed parent's handle reaches nothing: its `poll` faults, as it does uninterrupted.
+    let raw = |polling: &Module, host: &mut Host, layout: &MemLayout| {
+        let args: Vec<i64> = args
+            .iter()
+            .map(|a| match a {
+                Value::I32(x) => *x as i64,
+                other => panic!("unexpected arg {other:?}"),
+            })
+            .collect();
+        temen_run::jit_cap_run(polling, 0, &args, layout, SIZE_LOG2, 0, host, None)
+            .expect("JIT run")
+            .0
+    };
+    let fault = |o: &JitOutcome| matches!(o, JitOutcome::Trapped(temen_jit::TrapKind::ThreadFault));
+    let (mut host, _) = sharing_host(&child, shm());
+    let base = raw(&detaching_parent(POLL_DETACHED, None), &mut host, &fresh());
+    assert!(fault(&base), "uninterrupted: {base:?}");
+    let polling = detaching_parent(POLL_DETACHED, Some(Cut::Live));
+    let artifact = freeze_on(&polling);
+    let (mut thost, rwin, rprots) = restored(&artifact, &polling);
+    let thawed = raw(&polling, &mut thost, &thaw_layout(rwin, &rprots));
+    assert!(fault(&thawed), "the JIT thaw: {thawed:?}");
 }
 
 /// **Step 3 — a region a JIT parent shares with its detached child rides the cut.** The JIT freeze

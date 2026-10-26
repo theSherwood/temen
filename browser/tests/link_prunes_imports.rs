@@ -42,6 +42,8 @@ fn calls_import(slot: u32) -> Func {
         params: vec![ValType::I64],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64],
             insts: vec![Inst::CallImport {
                 import: slot,
@@ -140,6 +142,8 @@ fn a_capability_reached_through_a_library_survives_and_still_dispatches() {
             params: vec![ValType::I64],
             results: vec![ValType::I32],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I64],
                 insts: vec![Inst::CallSym {
                     import: 0,

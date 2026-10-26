@@ -21,6 +21,8 @@ fn leaf(val: i64) -> Func {
         params: vec![ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64],
             insts: vec![Inst::ConstI64(val)],
             term: Terminator::Return(vec![1]),
@@ -34,6 +36,8 @@ fn caller(callee: u32) -> Func {
         params: vec![ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64],
             insts: vec![Inst::Call {
                 func: callee,
@@ -116,6 +120,8 @@ fn a_computed_indirect_index_still_selects_the_same_slot() {
         params: vec![ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64],
             insts: vec![
                 Inst::ConstI32(3), // a *computed* index: no ref.func anywhere in the module
@@ -209,6 +215,8 @@ fn a_function_whose_address_is_taken_survives() {
         params: vec![ValType::I64],
         results: vec![ValType::Ref],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64],
             insts: vec![Inst::RefFunc { func: 2 }],
             term: Terminator::Return(vec![1]),

@@ -135,8 +135,41 @@ fn verify_func(
         _ => return Err("entry block params != function params (or no blocks)".into()),
     }
     let fn_results: Vec<usize> = funcs.iter().map(|f| f.results.len()).collect();
-    for b in &f.blocks {
+    // The dominance certificate (#2454): the entry names no parent, every other block an earlier
+    // one. Rule 1 is checked on each edge, rule 2 on each capture.
+    for (bi, b) in f.blocks.iter().enumerate() {
+        let earlier = (b.parent as usize) < bi || (bi == 0 && b.parent == 0);
+        if !earlier {
+            return Err(format!(
+                "block{bi}'s parent block{} is not earlier",
+                b.parent
+            ));
+        }
+    }
+    // Whether `a` is `b` or an ancestor of it: `b`'s parents, each earlier than its child, lead to
+    // the entry.
+    let ancestor = |a: usize, mut b: usize| loop {
+        if a == b {
+            return true;
+        }
+        if b == 0 {
+            return false;
+        }
+        b = f.blocks[b].parent as usize;
+    };
+    let mut block_types: Vec<Vec<ValType>> = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
         let mut types: Vec<ValType> = b.params.clone();
+        // Rule 2: a capture names a value of a proper ancestor, typed as that value.
+        for &(a, v) in &b.captures {
+            if bi == 0 || !ancestor(a as usize, b.parent as usize) {
+                return Err(format!("block{bi} captures block{a}, not an ancestor"));
+            }
+            let t = block_types[a as usize]
+                .get(v as usize)
+                .ok_or_else(|| format!("block{bi} captures v{v}, which block{a} lacks"))?;
+            types.push(*t);
+        }
         for inst in &b.insts {
             check_inst(
                 inst,
@@ -150,7 +183,11 @@ fn verify_func(
                 &fn_results,
             )?;
         }
-        check_term(&b.term, &types, f, funcs, tsec)?;
+        check_term(&b.term, &types, f, funcs, tsec, &|t| {
+            // Rule 1: a non-entry target's parent is this block or an ancestor of it.
+            t == 0 || ancestor(f.blocks[t].parent as usize, bi)
+        })?;
+        block_types.push(types);
     }
     Ok(())
 }
@@ -825,6 +862,7 @@ fn check_term(
     f: &Func,
     funcs: &[Func],
     tsec: &[temen_ir::TypeEntry],
+    dominated: &dyn Fn(usize) -> bool,
 ) -> R {
     use ValType as V;
     let edge = |target: BlockIdx, args: &[ValIdx]| -> R {
@@ -832,6 +870,11 @@ fn check_term(
             .blocks
             .get(target as usize)
             .ok_or_else(|| format!("branch to out-of-range block{target}"))?;
+        if !dominated(target as usize) {
+            return Err(format!(
+                "block{target}'s parent is not the branch's block or above it"
+            ));
+        }
         if args.len() != tb.params.len() {
             return Err(format!(
                 "branch to block{target}: {} args for {} params",
@@ -916,7 +959,7 @@ fn const_i64(
     tsec: &[temen_ir::TypeEntry],
     v: ValIdx,
 ) -> Option<i64> {
-    let mut idx = b.params.len() as u32;
+    let mut idx = (b.params.len() + b.captures.len()) as u32;
     for inst in &b.insts {
         let n = inst.result_count(fn_results, tsec) as u32;
         if v >= idx && v < idx + n {
