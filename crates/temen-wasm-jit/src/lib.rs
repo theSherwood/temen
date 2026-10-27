@@ -5605,8 +5605,8 @@ fn emit_confined_addr(cx: &FnCtx, code: &mut Vec<u8>) {
 /// page index below inside the table. The last byte's page is consulted first, then the first
 /// byte's, unless the access is `align`ed (of power-of-two `width` ≤ a page, it never crosses one).
 /// The second lookup is unconditional: when both bytes share a page it repeats the first, which
-/// costs less than an `if` to skip it, since V8 lays the skipped arm inline (#2099: 6% of a nim macro
-/// build). Never elided: page state is dynamic, and the bound is one compare.
+/// measured cheaper in V8 than an `if` to skip it (#2099: 4–6% of a nim macro build). Never
+/// elided: page state is dynamic, and the bound is one compare.
 ///
 /// **Wrapping.** `addr + offset`, or `last`, may wrap past `2^64`, which the interpreter faults. A
 /// wrapped `last` is below `offset + width`, and the NULL guard's pages are `Unmapped` in every table
