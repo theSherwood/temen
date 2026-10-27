@@ -21,7 +21,10 @@
 //! On executor 2 a Worker's import sends the call to the page and waits inside it (`web/worker.js`),
 //! and the page answers it with the same accessors over the calling task's window (`web/par.js`).
 
-use temen_interp::{GuestMem, Host};
+use std::cell::Cell;
+use std::sync::Arc;
+
+use temen_interp::{CapState, ForkedProc, GuestMem, Host, HostProcFork, UnlockedHostProc};
 
 use crate::stash;
 
@@ -44,8 +47,11 @@ extern "C" {
     ) -> i64;
 }
 
-/// The most recent [`temen_jspb_read`] result — valid until the next read, like the other stashes.
-static mut SCRATCH: (*mut u8, usize) = (core::ptr::null_mut(), 0);
+thread_local! {
+    /// The most recent [`temen_jspb_read`] result on this thread — valid until its next read, like
+    /// the other stashes. Per thread (#2645): on executor 2 each Worker serves its own task's calls.
+    static SCRATCH: Cell<(*mut u8, usize)> = const { Cell::new((core::ptr::null_mut(), 0)) };
+}
 
 /// Grant `host` one capability per name in `names`, each served by the page's `js_cap_call` with its
 /// slot, the name's index: the guest reaches the right JS function purely by which handle it
@@ -53,25 +59,27 @@ static mut SCRATCH: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 /// the `(name, handle)` seams for [`Host::bind_powerbox_manifest`]. Every on-ramp open grants the JS
 /// capabilities the embedder staged for it through this (#2579).
 ///
-/// Forkable (#1718): the JS function's state lives on the page, so a §14 child or `fork()` twin the
-/// capability is re-granted to calls the same function through a fresh closure over the slot, with
-/// its own window. Nothing here serializes that state, so a run holding one cannot freeze (#1699).
+/// Forkable (#1718): the JS function's state lives in JS, so a §14 child or `fork()` twin the
+/// capability is re-granted to calls the same function, with its own window. Nothing here
+/// serializes that state, so a run holding one cannot freeze (#1699).
+///
+/// Unlocked (#2645): the handler keeps nothing in the host, so where a domain's tasks share it under
+/// a lock a call that waits on JS (on the page, or in a Worker) holds back no other task's host call.
 pub(crate) fn grant_js_caps(host: &mut Host, names: &[String]) -> Vec<(String, i32)> {
     names
         .iter()
         .enumerate()
         .map(|(slot, name)| {
-            let mint = move || -> temen_interp::HostProc {
-                Box::new(move |op, args, mem, _| Ok(vec![dispatch(slot as u32, op, args, mem)]))
-            };
-            let fork: temen_interp::HostProcFork = std::sync::Arc::new(move |_pid| {
-                Some(temen_interp::ForkedProc::shared(
-                    mint(),
-                    temen_interp::CapState::Uncaptured,
+            let call: UnlockedHostProc =
+                Arc::new(move |op, args, mem| Ok(vec![dispatch(slot as u32, op, args, mem)]));
+            let twin = Arc::clone(&call);
+            let fork: HostProcFork = Arc::new(move |_pid| {
+                Some(ForkedProc::unlocked(
+                    Arc::clone(&twin),
+                    CapState::Uncaptured,
                 ))
             });
-            let handle =
-                host.grant_host_proc_forkable(mint(), fork, temen_interp::CapState::Uncaptured);
+            let handle = host.grant_host_proc_unlocked(call, Some(fork), CapState::Uncaptured);
             // §7 F7/F9: the name is also the label, so a guest can `self.resolve` / `self.label` it.
             host.register_cap_name(name, handle);
             (name.clone(), handle)
@@ -103,10 +111,12 @@ pub unsafe extern "C" fn temen_jspb_read(mem: *mut JsGuestMem, ptr: u64, len: us
     };
     let m = &*shim.mem;
     match m.read_bytes(ptr, len as u64) {
-        Some(bytes) => {
-            stash(&mut *core::ptr::addr_of_mut!(SCRATCH), bytes);
-            (*core::ptr::addr_of!(SCRATCH)).0
-        }
+        Some(bytes) => SCRATCH.with(|s| {
+            let mut slot = s.get();
+            stash(&mut slot, bytes);
+            s.set(slot);
+            slot.0.cast_const()
+        }),
         None => core::ptr::null(),
     }
 }

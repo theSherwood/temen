@@ -23,9 +23,10 @@
 // (#2531's shape), and the root's timer fires while an answer is owed (#2557). It feeds stdin later:
 // as the run idles on its reads, before its Worker opens it, and more at once than the engine's inbox
 // holds. A park answered `null` stops the run, and a fault reports its address, as on the pump. And
-// the page answers JS capabilities inside each call, the calling task's Worker waiting inside it
-// (#2579): the root's (interpreted and as a leaf), a thread's, and a detached child's, whose window
-// is a memory of its own.
+// JS capabilities are answered inside each call (#2579): the root's (interpreted and as a leaf), a
+// thread's, and a detached child's, whose window is a memory of its own. On the page, the calling
+// task's Worker waiting inside the call, or in that Worker itself, from the run's `capModule`
+// (#2645). Either way a call that waits holds back no other thread's host calls.
 //
 // Usage:  node browser-coop-embedder-test.mjs [module.wasm]   (build the threads cdylib first)
 
@@ -184,23 +185,32 @@ const checkX2 = (r) => {
   leaf('pings', r.leafPings);
   echoed('a root leaf\'s stdin fed as it idles', r.leafEcho, 'hello world\n');
   leaf('stdin fed later', r.leafEcho);
-  // #2579: JS capabilities answered inside each call, the calling task's Worker waiting inside it:
-  // the uppercasing landed in the window of the task that called, the root's, a thread's, or a
-  // detached child's own memory.
-  const jsCapped = (name, x, want, calls) => {
-    if (x.error !== undefined || x.value !== want || x.capCalls !== calls || x.parks !== 0) {
-      fail(`chromium x2: ${name}: value ${x.value}, error ${x.error}, ${x.capCalls} cap calls, `
-        + `${x.parks} parks (want ${want}, ${calls}, 0)`);
+  // #2579: JS capabilities answered inside each call, on the page (the calling task's Worker
+  // waiting inside it) or, with `capModule`, in the calling task's own Worker (#2645, where the page
+  // answers none): the uppercasing landed in the window of the task that called, the root's, a
+  // thread's, or a detached child's own memory.
+  for (const [at, where, page] of [['', 'on the page', true], ['InWorker', 'in the Worker', false]]) {
+    const jsCapped = (name, x, want, calls) => {
+      const pageCalls = page ? calls : 0;
+      if (x.error !== undefined || x.value !== want || x.capCalls !== pageCalls || x.parks !== 0) {
+        fail(`chromium x2: ${name}, answered ${where}: value ${x.value}, error ${x.error}, `
+          + `${x.capCalls} page calls, ${x.parks} parks (want ${want}, ${pageCalls}, 0)`);
+      }
+    };
+    jsCapped('the root\'s JS capabilities', r[`jsCaps${at}`], 12n, 2);
+    if (r[`jsCaps${at}`].out !== JS_CAPS_OUT) {
+      fail(`chromium x2: the root's JS capabilities, answered ${where}: stdout ${JSON.stringify(r[`jsCaps${at}`].out)}`);
     }
-  };
-  jsCapped('the root\'s JS capabilities', r.jsCaps, 12n, 2);
-  if (r.jsCaps.out !== JS_CAPS_OUT) fail(`chromium x2: the root's JS capabilities: stdout ${JSON.stringify(r.jsCaps.out)}`);
-  jsCapped('a root leaf\'s JS capabilities', r.jsCapsLeaf, 12n, 2);
-  leaf('JS capabilities', r.jsCapsLeaf);
-  jsCapped('a thread\'s JS capabilities', r.jsCapsThread, JS_CAPS_THREAD_VALUE, 2);
-  jsCapped('a detached child\'s JS capability', r.jsCapsChild, JS_CAPS_CHILD_VALUE, 1);
-  if (r.jsCapsChild.childMems !== 1) {
-    fail(`chromium x2: the child's call came from ${r.jsCapsChild.childMems} threads over a memory of their own (want 1)`);
+    jsCapped('a root leaf\'s JS capabilities', r[`jsCapsLeaf${at}`], 12n, 2);
+    leaf(`JS capabilities answered ${where}`, r[`jsCapsLeaf${at}`]);
+    jsCapped('a thread\'s JS capabilities', r[`jsCapsThread${at}`], JS_CAPS_THREAD_VALUE, 2);
+    jsCapped('a detached child\'s JS capability', r[`jsCapsChild${at}`], JS_CAPS_CHILD_VALUE, 1);
+    if (r[`jsCapsChild${at}`].childMems !== 1) {
+      fail(`chromium x2: the child's call, answered ${where}, came from ${r[`jsCapsChild${at}`].childMems} `
+        + 'threads over a memory of their own (want 1)');
+    }
+    // #2645: the waiting call held no other thread's host call: the other thread's writes went on.
+    jsCapped('a thread waiting in a JS call while another writes', r[`jsCapsWaits${at}`], 1n, 1);
   }
 };
 

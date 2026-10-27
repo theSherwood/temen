@@ -19413,14 +19413,16 @@ impl Vm {
                     // into its own `dst`. That is the `EINTR(42)` → `0` flake, at ~20% per attempt.
                     // Under one lock the flags are what they always meant to be: extra return values
                     // of this dispatch, unreachable by any other vCPU.
+                    let mut unlocked = None;
                     let (res, parks) = host.with(|p| {
-                        let r = p.cap_dispatch_slots_pending(
+                        let r = p.cap_dispatch_slots_deferring(
                             *type_id,
                             *op,
                             h,
                             &argv,
                             gm,
-                            &mut pending_id,
+                            Some(&mut pending_id),
+                            Some(&mut unlocked),
                         );
                         // Drain unconditionally (the tree-walker's park site does the same): a flag
                         // only ever means "the op *this* dispatch just ran wants to park", so one
@@ -19428,6 +19430,15 @@ impl Vm {
                         // action here — the drivers poll readiness at their settle.
                         (r, DispatchParks::take(p))
                     });
+                    // #2645 — an unlocked host procedure runs now, the domain's host let go: on the
+                    // parallel driver its other tasks make their host calls meanwhile. It raised no
+                    // park, so the rest of this arm only delivers its results.
+                    let res = match unlocked {
+                        Some(call) => {
+                            call.run(&argv, sole.as_mut().map(|m| m as &mut dyn GuestMem))
+                        }
+                        None => res,
+                    };
                     let res = res?;
                     // §12 parking-on-blocking: a punted offloadable dispatch. The `with` scope
                     // above already released the shared-host lock. The exactly-`i64` case is
