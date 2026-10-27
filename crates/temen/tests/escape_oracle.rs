@@ -447,9 +447,11 @@ block 0 (v0: i32) {
 
 /// #2147 — loads and stores through one base share a bounds check (`temen-jit`'s `CheckedBases`):
 /// the first access through `v0` tests its own address, and later ones at a constant non-negative
-/// distance from it, within the guard page past the window's end, reuse that base. Sweep the base `n`
-/// so each access in turn is the first to cross the end, and below zero so the adds wrap: the JIT must
-/// fault where the interpreter does, after the same stores, and return the same result.
+/// distance from it, within the guard page past the window's end, reuse that base — in its block and
+/// in the blocks it dominates (D74), across a call, but never in a block it does not dominate. Sweep
+/// the base `n` so each access in turn is the first to cross the end, and below zero so the adds
+/// wrap: the JIT must fault where the interpreter does, after the same stores, and return the same
+/// result.
 #[cfg(unix)]
 #[test]
 fn accesses_sharing_a_checked_base_fault_where_the_interpreter_does() {
@@ -496,10 +498,61 @@ block 0 (v0: i64) {
   }
 }
 ";
+    // Across blocks: the entry's check point at `n+16` serves `n+28` in one arm (after a call) and
+    // `n+48` at the join. The other arm checks `n+40` and `n` for itself; that arm does not dominate
+    // the join, so the join's `n` and `n+8` check again (`n` lies before the entry's check point).
+    let blocks = "\
+memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 16
+  v2 = i64.add v0 v1
+  v3 = i64.const 255
+  i64.store v2 v3
+  v4 = i64.const 1
+  v5 = i64.and v0 v4
+  v6 = i64.const 0
+  v7 = i64.eq v5 v6
+  br_if v7 1() 2()
+  }
+block 1 (p = 0.v0) {
+  v1 = call 1 ()
+  v2 = i64.const 24
+  v3 = i64.add p v2
+  v4 = i64.load v3 offset=4
+  v5 = i64.add v1 v4
+  br 3(v5)
+  }
+block 2 (p = 0.v0) {
+  v1 = i32.const 9
+  i32.store8 p v1 offset=40
+  v2 = i64.load p
+  br 3(v2)
+  }
+block 3 (r: i64, p = 0.v0) {
+  v1 = i64.const 48
+  v2 = i64.add p v1
+  v3 = i64.load v2
+  v4 = i64.load p offset=8
+  v5 = i64.load p
+  v6 = i64.add r v3
+  v7 = i64.add v6 v4
+  v8 = i64.add v7 v5
+  return v8
+  }
+}
+
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 3
+  return v0
+  }
+}
+";
     let top: i64 = 1 << 16;
     let mut ns: Vec<i64> = vec![0, 8, 4096, i64::MAX, i64::MIN, top, top + 4096];
-    ns.extend((0..=48).map(|k| top - k));
-    ns.extend((0..=48).map(|k| -k)); // the adds wrap around zero
+    ns.extend((0..=56).map(|k| top - k));
+    ns.extend((0..=56).map(|k| -k)); // the adds wrap around zero
     ns.extend([
         top - 20008,
         top - 28200,
@@ -509,7 +562,7 @@ block 0 (v0: i64) {
         -3616,
     ]);
     let init: Vec<u8> = (0..top).map(|i| (i % 251) as u8).collect();
-    for src in [shared, unshared] {
+    for src in [shared, unshared, blocks] {
         let m = temen::text::parse_module(src).expect("parse");
         temen::verify::verify_module(&m).expect("verify");
         for &n in &ns {
