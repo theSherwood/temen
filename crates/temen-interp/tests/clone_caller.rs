@@ -75,6 +75,8 @@ fn serve_qualifies_still_folds_fork_for_cranelift() {
         params: vec![],
         results: vec![ValType::I32],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![],
             insts: vec![self_cap(
                 temen_interp::CAP_SELF_SVC_POLL,
@@ -100,6 +102,8 @@ fn serve_qualifies_still_folds_fork_for_cranelift() {
             params: vec![],
             results: vec![],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![self_cap(fork_op, vec![])],
                 term: Terminator::Return(vec![]),

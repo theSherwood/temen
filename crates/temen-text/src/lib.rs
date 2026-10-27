@@ -411,20 +411,32 @@ fn print_func_at(s: &mut String, f: &Func, fn_results: &[usize], m: &Module, idx
         types(&f.results)
     );
     for (bi, b) in f.blocks.iter().enumerate() {
-        // Block header with named, typed parameters (params are indices 0..k).
-        let params: Vec<String> = b
+        // Block header: its parent in the dominance certificate when that is not the entry, then
+        // its named, typed params (indices 0..k) and its captures, each named for the value of an
+        // earlier block it takes (`v5 = 2.v3`, #2454).
+        let mut inputs: Vec<String> = b
             .params
             .iter()
             .enumerate()
             .map(|(i, t)| format!("v{}: {}", i, t.as_str()))
             .collect();
-        let _ = writeln!(s, "  block {} ({}) {{", bi, params.join(", "));
+        inputs.extend(
+            b.captures
+                .iter()
+                .enumerate()
+                .map(|(j, &(a, v))| format!("v{} = {a}.v{v}", b.params.len() + j)),
+        );
+        let parent = match b.parent {
+            0 => String::new(),
+            p => format!(" in {p}"),
+        };
+        let _ = writeln!(s, "  block {bi}{parent} ({}) {{", inputs.join(", "));
 
-        let mut next = b.params.len() as u32; // next value index in this block
-                                              // The value index of the immediately-preceding instruction when it is an `i32.const 0` — the
-                                              // ignored dispatch handle a `self.*` sugar CapCall points at. Lets the printer spell the
-                                              // sugar only when its handle is that adjacent const (so parse re-pairs them exactly); any
-                                              // other CapCall CAP_SELF prints as the raw `call.cap`, which round-trips on its own.
+        let mut next = b.inputs() as u32; // next value index in this block
+                                          // The value index of the immediately-preceding instruction when it is an `i32.const 0` — the
+                                          // ignored dispatch handle a `self.*` sugar CapCall points at. Lets the printer spell the
+                                          // sugar only when its handle is that adjacent const (so parse re-pairs them exactly); any
+                                          // other CapCall CAP_SELF prints as the raw `call.cap`, which round-trips on its own.
         let mut prev_const0: Option<u32> = None;
         for inst in &b.insts {
             let n = inst.result_count(fn_results, &m.types);
@@ -2050,7 +2062,9 @@ type PEdge = (String, Vec<u32>);
 /// Intermediate block whose terminator still refers to block labels by name.
 struct PBlock {
     label: String,
+    parent: u32,
     params: Vec<ValType>,
+    captures: Vec<(u32, u32)>,
     insts: Vec<Inst>,
     term: PTerm,
     /// Source positions for the auto debug line table (empty unless `auto_debug`).
@@ -2153,11 +2167,15 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::LBrace)?;
 
         let mut pblocks = Vec::new();
+        // Each parsed block's value names, so a later block's captures can name them.
+        let mut block_names: Vec<HashMap<String, u32>> = Vec::new();
         while self.peek() != Some(&Tok::RBrace) {
             if self.at_end() {
                 return err("unterminated function body");
             }
-            pblocks.push(self.parse_block(pblocks.len() as u32)?);
+            let (pb, names) = self.parse_block(pblocks.len() as u32, &block_names)?;
+            pblocks.push(pb);
+            block_names.push(names);
         }
         self.expect(&Tok::RBrace)?;
 
@@ -2243,7 +2261,9 @@ impl<'a> Parser<'a> {
                 PTerm::Unreachable => Terminator::Unreachable,
             };
             blocks.push(Block {
+                parent: b.parent,
                 params: b.params,
+                captures: b.captures,
                 insts: b.insts,
                 term,
             });
@@ -2430,10 +2450,16 @@ impl<'a> Parser<'a> {
         ValType::from_str(&s).ok_or_else(|| ParseError(format!("unknown type `{s}`")))
     }
 
-    fn parse_block(&mut self, block_idx: u32) -> Result<PBlock, ParseError> {
-        // The one block form (settled §3.5, legacy labels retired): `block N (name: type, ...)
-        // { insts… term }` — the index is a checked positional label and the body is braced
-        // (labels are the index's decimal string, so numeric branch targets resolve).
+    fn parse_block(
+        &mut self,
+        block_idx: u32,
+        earlier: &[HashMap<String, u32>],
+    ) -> Result<(PBlock, HashMap<String, u32>), ParseError> {
+        // The one block form (settled §3.5, legacy labels retired): `block N [in P] (name: type,
+        // ..., name = B.value, ...) { insts… term }` — the index is a checked positional label and
+        // the body is braced (labels are the index's decimal string, so numeric branch targets
+        // resolve). `in P` names the block's parent in the dominance certificate, the entry when
+        // absent; after the params come the captures, each naming a value of earlier block `B`.
         let header_line = self.cur_line();
         let label = self.ident()?;
         if label != "block" {
@@ -2448,35 +2474,61 @@ impl<'a> Parser<'a> {
             ));
         }
         let label = n.to_string();
-        // Per-block value-name table; parameters take indices 0..k.
+        let parent = if matches!(self.peek(), Some(Tok::Ident(s)) if s == "in") {
+            self.pos += 1;
+            let p = self.parse_int()?;
+            u32::try_from(p).map_err(|_| ParseError(format!("bad parent block {p}")))?
+        } else {
+            0
+        };
+        // Per-block value-name table; parameters take indices 0..k, then the captures.
         let mut names: HashMap<String, u32> = HashMap::default();
         let mut params = Vec::new();
+        let mut captures = Vec::new();
         // Auto debug positions (only filled when synthesizing debug info).
         let mut dbg = PBlockDbg::default();
 
         self.expect(&Tok::LParen)?;
         while self.peek() != Some(&Tok::RParen) {
-            if !params.is_empty() {
+            if !params.is_empty() || !captures.is_empty() {
                 self.expect(&Tok::Comma)?;
             }
             let n = self.ident()?;
-            self.expect(&Tok::Colon)?;
-            let t = self.parse_type()?;
-            let idx = params.len() as u32;
+            let idx = (params.len() + captures.len()) as u32;
+            if self.peek() == Some(&Tok::Equals) {
+                self.pos += 1;
+                let b = self.parse_int()?;
+                self.expect(&Tok::Dot)?;
+                let v = self.ident()?;
+                let Some(their) = usize::try_from(b).ok().and_then(|b| earlier.get(b)) else {
+                    return err(format!(
+                        "capture `{n}` names block {b}, which does not come before this one"
+                    ));
+                };
+                let Some(&vi) = their.get(&v) else {
+                    return err(format!("capture `{n}`: block {b} has no value `{v}`"));
+                };
+                captures.push((b as u32, vi));
+            } else {
+                if !captures.is_empty() {
+                    return err(format!("param `{n}` follows a capture: params come first"));
+                }
+                self.expect(&Tok::Colon)?;
+                params.push(self.parse_type()?);
+            }
             if names.insert(n.clone(), idx).is_some() {
                 return err(format!("duplicate value name `{n}`"));
             }
-            // A parameter is live from the block header.
+            // A parameter or capture is live from the block header.
             if self.auto_debug {
                 dbg.vars.push((n, idx, header_line));
             }
-            params.push(t);
         }
         self.expect(&Tok::RParen)?;
         self.expect(&Tok::LBrace)?;
 
         let mut insts = Vec::new();
-        let mut next_idx = params.len() as u32;
+        let mut next_idx = (params.len() + captures.len()) as u32;
 
         // Parse instruction lines until we hit a terminator keyword.
         loop {
@@ -2497,13 +2549,18 @@ impl<'a> Parser<'a> {
                 let term = self.parse_term(&names)?;
                 dbg.term_line = cur;
                 self.expect(&Tok::RBrace)?;
-                return Ok(PBlock {
-                    label,
-                    params,
-                    insts,
-                    term,
-                    dbg,
-                });
+                return Ok((
+                    PBlock {
+                        label,
+                        parent,
+                        params,
+                        captures,
+                        insts,
+                        term,
+                        dbg,
+                    },
+                    names,
+                ));
             }
 
             // A value-producing instruction is `name(, name)* = opcode operands`; a
@@ -4236,6 +4293,8 @@ block 0 (v0: i32) {
                 params: vec![],
                 results: vec![temen_ir::ValType::F64],
                 blocks: vec![temen_ir::Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![],
                     insts: vec![temen_ir::Inst::ConstF64(bits)],
                     term: temen_ir::Terminator::Return(vec![0]),
@@ -4251,6 +4310,8 @@ block 0 (v0: i32) {
                 params: vec![],
                 results: vec![temen_ir::ValType::F32],
                 blocks: vec![temen_ir::Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![],
                     insts: vec![temen_ir::Inst::ConstF32(bits)],
                     term: temen_ir::Terminator::Return(vec![0]),

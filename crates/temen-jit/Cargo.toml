@@ -22,10 +22,9 @@ stack-check = []
 [dev-dependencies]
 # Parse hand-written text IR in the `stack-check` guard test (temen-text → temen-ir; no dep cycle).
 temen-text = { path = "../temen-text" }
-# The bulk-memory differential test (`bulk_mem.rs`) cross-checks the JIT against both interpreters and
-# the verifier. None of these depend on temen-jit, so there is no cycle.
+# The bulk-memory differential test (`bulk_mem.rs`) cross-checks the JIT against both interpreters.
+# It does not depend on temen-jit, so there is no cycle.
 temen-interp = { path = "../temen-interp" }
-temen-verify = { path = "../temen-verify" }
 # #2481 — the **second decoder** the hand-rolled machine-code validator (`validate`) is cross-checked
 # against: a test compiles real modules and asserts our decoder's instruction boundaries and
 # control-flow classification agree with iced-x86's. Pure Rust and **dev-only**, so it is never in
@@ -39,6 +38,8 @@ cranelift-jit = "0.132.0"
 cranelift-module = "0.132.0"
 cranelift-native = "0.132.0"
 temen-ir.workspace = true
+# `func_value_types`: the types a function lowered block-local needs for the params it gains (#2600).
+temen-verify.workspace = true
 # `digest256`: the kept code's keys and checksums (`code_dir`).
 temen-encode.workspace = true
 # The native stack-switch substrate for JIT fibers/green threads (§12). Real impl on x86-64 unix;

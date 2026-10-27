@@ -281,10 +281,13 @@ review, fuzzing infra, audit), tracked as open-ended in §18.
 
 - Typed **SSA** over a **CFG of basic blocks**, with **explicit typed block
   parameters** (no phi nodes).
-- **Key discipline:** values never cross block boundaries except as block
-  parameters. This removes dominance analysis entirely — verification is a
-  single linear forward type-check pass (check operand types; check branch
-  arguments match the destination block's declared parameter types). Keeps the
+- **Key discipline:** a value crosses a block boundary only as a block
+  parameter, or as a **capture**: a block may name a value of a block that
+  dominates it (#2454). The producer supplies the dominator tree as a parent per
+  block, and the verifier checks that certificate instead of computing
+  dominance — verification stays a linear forward type-check pass (check operand
+  types; check branch arguments match the destination block's declared
+  parameter types; check each edge and capture against the parents). Keeps the
   verifier — which is security-critical TCB — simple.
 - **Irreducible control flow is supported natively.** No relooper, no
   structured-control-flow straitjacket. This is a direct target for LLVM-style
@@ -434,23 +437,34 @@ confinement pass (§4, §18). "Verified ⇒ cannot escape" is shorthand for "ver
 Design goal: **decode and verification fuse into one linear forward pass, no
 fixups.** Three choices deliver it:
 1. **Block-local value numbering.** Within a block, values index sequentially —
-   block parameters `0..k-1`, then each instruction's result takes the next index.
-   Operands reference *strictly earlier* same-block indices (no intra-block forward
-   refs, no fixups). Cross-block dataflow is *only* via block parameters, so a
-   value in block A cannot be named in block B — **dominance analysis is impossible
-   to need, by construction.**
-2. **Up-front block-signature table.** Each function header declares every block's
-   parameter types before the instruction streams, so the single pass can check any
-   branch (forward, back-edge, loop) against its target's already-known parameters.
+   block parameters `0..k-1`, then the block's captures, then each instruction's
+   result takes the next index. Operands reference *strictly earlier* same-block
+   indices (no intra-block forward refs, no fixups). A value of block A reaches
+   block B as a parameter of B, or as a **capture** B lists in its header: a
+   `(block, value)` pair naming a value of a block that dominates B (#2454).
+2. **A dominance certificate, checked, not computed.** Each block header names its
+   **parent** in a dominator tree the producer supplies; the entry names none and
+   every other block an earlier one. The verifier checks two rules, each O(1)
+   against the tree's pre-order intervals: every edge `u→v` into a non-entry block
+   leaves `v`'s parent or a descendant of it (rule 1, which makes every ancestor a
+   dominator), and every capture names a proper ancestor's value (rule 2). No
+   dominator algorithm enters the TCB. A producer that captures nothing may name
+   the entry as every block's parent: that is the block-local form, and it
+   verifies unchanged. (Owner decision, 2026-10-16/24, #2454; the wire records a
+   parent and a capture as distances back from the block, so a near one takes one
+   byte. The function decodes whole before it verifies, so a branch to a later
+   block sees that block's header — there is no separate up-front table.)
 3. **Inferred result types + typed opcodes.** `i32.add` vs `f64.mul` are distinct
    opcodes; the verifier computes result types from opcode + operand types and
    stores nothing per instruction. Types appear only where not inferable (block
    params, constants, polymorphic ops).
 
-**Verification per function (single fused pass):** read the block-signature table;
-per block, seed a local type vector with its parameter types, walk instructions
-(check operand types, append result types), check each terminator's branch args
-against the target's declared parameters. Linear, local, no dominance, no fixups.
+**Verification per function (one forward pass):** number the certificate's tree;
+per block, seed a local type vector with its parameter types and its captures'
+(each an ancestor's value, checked by rule 2), walk instructions (check operand
+types, append result types), check each terminator's branch args against the
+target's declared parameters and its parent against rule 1. Linear, no dominator
+computation, no fixups.
 **Decode and verify are fused** (one pass, one set of bounds/range/type checks) —
 minimizes TCB and the window for decoded-but-unchecked state. Every length and
 index is bounds-checked; nothing in the stream is trusted.
@@ -607,13 +621,15 @@ Single fused decode+verify forward pass, O(module size):
 1. **Structural:** valid magic/version; sections length-bounded; all indices
    (type/func/block/value/handle-op) in range; nothing in the stream trusted.
 2. **Per function:** entry block's params = the function signature's params; every
-   block ends in exactly one terminator (terminators only at block end); the
-   block-signature table covers all referenced blocks.
+   block ends in exactly one terminator (terminators only at block end); the entry
+   names no parent and every other block an earlier one; each capture names a
+   value of a proper ancestor and takes that value's type (rule 2, #2454).
 3. **Per instruction:** every operand value-index < current block-local count
    (defined-earlier, no forward refs); operand types match the opcode **exactly**
    (no implicit coercion); result type(s) appended per opcode.
 4. **Branches:** target in range; branch-arg count + types = target block's declared
-   parameter types, exactly.
+   parameter types, exactly; a non-entry target's parent is the branching block or
+   an ancestor of it (rule 1, #2454).
 5. **Calls:** arg count/types = callee signature; `call.dyn` funcref type
    matches; `call.cap` op-index in range and arg types = the operation signature.
 6. **Capability typing (not sealing):** `handle<I>`/`funcref<Sig>` are tracked as
@@ -1978,7 +1994,10 @@ id. Under a recording host (W1) the bytecode drivers tape the delivered value wh
 (`Completions::take_record`); the tree-walker and the JIT tape none, so they offer no parking face
 there and the call declines. The completer is the one way to answer: `deliver_cap` is gone, and the
 browser's `temen_coop_deliver_cap` and the DAP's `provideCap` answer through the request's
-completer.
+completer. A declared cap's request (`CapRequest`, #2579) carries the op the call dispatched with: a
+flat `call.sym` import binds at op 0, with the guest's own op in its first argument, and a call
+through a handle the guest resolved by name keeps its own. The cap is forkable: a §14 child or fork
+twin it is re-granted to files its calls in the same requests, and they stay `OpParks::OnHost`.
 
 **An answer from inside a host procedure (#2522, 2026-10-21).** A host procedure may answer another
 call: a read that takes an event answers whoever waits on that input. The wake runs on the thread
@@ -4105,7 +4124,7 @@ as open-ended, not a byproduct of the build.
 
 | # | Decision | Status | Why |
 |---|----------|--------|-----|
-| D1 | Block-local typed SSA, no phi, explicit block params | Settled | Linear verifier, no dominance analysis; great producer/consumer target |
+| D1 | Block-local typed SSA, no phi, explicit block params — **amended 2026-10-24 (#2454, owner):** a block may also capture a value of a block that dominates it, certified by a producer-supplied parent per block | Settled | Linear verifier, no dominator computation (it checks the certificate); a value no longer rides every block between its definition and its use; great producer/consumer target |
 | D2 | Native irreducible control flow | Settled | No relooper; direct LLVM target |
 | D3 | Reserved VA window + host MMU for virtual memory | Settled | Real paging, zero software translation, bounded → escape-proof |
 | D4 | ~~Mask (not branch) for confinement~~ **Superseded by trap-confinement (D38): bounds-check for the architectural trap + `& (reserved−1)` clamp on the access address for Spectre-v1** | Superseded | Wrap-confinement's silent aliasing was bad UX and diverged from wasm semantics; the clamp keeps the mask's Spectre-v1 robustness (a data dependency on the speculative path) while the check gives a clean `MemoryFault` at the offending access. Measured: clamp ≈ old-mask perf; the check-only variant's memory-bound win (edn −9%/picojpeg −8%) is spent on hardening — see §4 |
@@ -4136,7 +4155,7 @@ as open-ended, not a byproduct of the build.
 | D29 | CHERI used only for host-side TCB hardening, never the guest value model; guest pointers stay forgeable 64-bit offsets | Settled | CHERI breaks NaN-boxing/tagging (taxes dynamic-lang guests) for intra-guest safety we treat as a non-goal |
 | D30 | Resource monitoring = reading meters on granted capabilities; `Monitor` cap split from `Instantiator`; push thresholds via §12 | Settled | Monitoring tree = grant tree; recursive, authority-bounded; observation delegable without control |
 | D31 | Two-class value model: plain data forgeable (confined) + capabilities as **inert typed table indices** (superseded "sealed" framing, see D37) | Settled | The verifier's escape-impossibility theorem; C-compatible pointers; authority binds to the table, not the index |
-| D32 | Encoding fuses decode+verify in one forward pass: block-local indices + up-front block-signature table + inferred typed-opcode results | Settled | Cheapest possible verifier (no dominance, no fixups); minimal TCB |
+| D32 | Encoding: block-local indices + inferred typed-opcode results, and per block header a parent and its captures (wire v14, #2454; the function decodes whole before it verifies, so the up-front block-signature table this row once named is gone) | Settled | Cheapest possible verifier (no dominator computation, no fixups); minimal TCB |
 | D33 | Section-based module (decls before bodies); LEB128 + zstd, no bespoke compression; text format 1:1 with binary, text-first for the build | Settled | Independent/parallel function verify+JIT; agent-friendly debugging |
 | D34 | IR is total — no UB; every op gives a defined value or a defined trap (source UB resolved by the frontend) | Settled | UB in a sandbox IR would void the escape guarantee |
 | D35 | Phase-1 IR spec pinned: instruction set, trap/wrap/saturate semantics, little-endian + IEEE FP, complete verifier rules, entry/instantiation contract | Settled | The concrete spec the verifier+interpreter are built from (§3b) |

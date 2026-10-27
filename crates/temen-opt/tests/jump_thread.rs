@@ -51,6 +51,8 @@ fn correlated_branch() -> Module {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // x = v0
                 insts: vec![
                     Inst::ConstI32(5), // v1
@@ -72,6 +74,8 @@ fn correlated_branch() -> Module {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32, ValType::I32], // x' = v0, flag = v1
                 insts: vec![],
                 term: Terminator::BrIf {
@@ -83,6 +87,8 @@ fn correlated_branch() -> Module {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // y = v0
                 insts: vec![
                     Inst::ConstI32(100), // v1
@@ -96,6 +102,8 @@ fn correlated_branch() -> Module {
                 term: Terminator::Return(vec![2]),
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32], // y = v0
                 insts: vec![
                     Inst::ConstI32(200), // v1

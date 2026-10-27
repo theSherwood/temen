@@ -1175,6 +1175,47 @@ fn a_durable_childs_grandchild_rides_its_freeze_on_every_engine() {
     rides_every_engine(&nest(), 2, carried, &[1], (Ok(NEST_TOTAL), ""));
 }
 
+/// #2430 — **a thaw that drops a captured child hands back what the freeze kept for it and for its
+/// own captured children.** The depth-2 tree freezes on the interpreter once settled, the child
+/// parked joining the grandchild. Its artifact is restored on a host that grants the programs, so
+/// its budget holds the windows and first vCPUs of both. Its residue is then thawed on a host that
+/// grants none: the relaunch finds the child's grant gone and drops it, and the grandchild with it,
+/// leaving the budget holding nothing. Both used to stay charged.
+#[test]
+fn a_thaw_that_drops_a_child_hands_back_its_subtree() {
+    let (root, nest) = nest_modules(&nest());
+    let (mut fhost, args) = nest_powerbox(&nest, 100, 2);
+    let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
+    arm_freeze_after(&mut win, ARENA, 1);
+    let (r, _, fsnap) = nest_run(Engine::Interp, &root, &args, &win, &mut fhost, None)
+        .expect("the interpreter runs the tree");
+    assert_eq!((r, carried(&fhost)), (Ok(0), vec![1]), "both ride");
+    let art = temen_snapshot::freeze(&root, &fsnap, &fhost).expect("serialize");
+    let held = |h: &Host| -> Vec<(i64, i64)> {
+        h.capture_durable_budgets()
+            .iter()
+            .map(|n| (n.used.mem, n.used.spawn))
+            .filter(|&u| u != (0, 0))
+            .collect()
+    };
+    let (mut granted, twin) = nest_restore(&art, &root, &nest);
+    assert_eq!(
+        held(&granted),
+        [(2 << 17, 2)],
+        "the cut keeps both windows charged"
+    );
+    let mut bare = Host::new();
+    bare.set_durable(true);
+    bare.set_thawed_detached(granted.take_thawed_detached());
+    // The thaw on the bare host ends as it may: its root holds none of its own capabilities.
+    let _ = nest_run(Engine::Interp, &root, &args, &twin, &mut bare, None);
+    assert_eq!(
+        held(&granted),
+        [],
+        "the dropped child and grandchild hold nothing"
+    );
+}
+
 /// #2010 — **the JIT's freeze reaches a grandchild through the joins.** The embedder's
 /// [`temen_jit::FreezeController`] requests the freeze while the root is parked joining the child and
 /// the child is parked joining the grandchild. No teardown rings anyone yet: the root's join rings the

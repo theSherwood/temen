@@ -7851,7 +7851,9 @@ fn bind_powerbox_imports(h: &mut temen_interp::Host, m: &temen_ir::Module, grant
         stderr: None,
     };
     // The one shared powerbox binder (#1524).
-    h.bind_powerbox_manifest(&m.imports, &m.types, &granted, &[]);
+    let grant = temen_interp::powerbox_grant(&granted, &[]);
+    h.bind_powerbox_manifest(&m.imports, &m.types, &grant)
+        .expect("the translated module's manifest binds on the test powerbox");
 }
 
 /// `__vm_cap(i)` reaches the **tail** powerbox handles (`i ≥ 4`): `__vm_cap(5)` (the test

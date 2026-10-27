@@ -67,8 +67,8 @@ fn exports_md_is_up_to_date() {
     );
 }
 
-/// The parser's non-obvious case, pinned so a refactor of it cannot quietly drop exports: an
-/// attribute between `#[no_mangle]` and the `fn`.
+/// The parser's non-obvious cases, pinned so a refactor of it cannot quietly drop exports or their
+/// gates: an attribute between `#[no_mangle]` and the `fn`, and an export gated by its module's `cfg`.
 #[test]
 fn the_parser_sees_attribute_runs() {
     let exports = rust_exports(&root().join("src"));
@@ -76,6 +76,10 @@ fn the_parser_sees_attribute_runs() {
     assert!(
         gated > 0,
         "some exports are cfg-gated; the parser must record that"
+    );
+    assert!(
+        exports["temen_foreign_slots"].cfg.is_some(),
+        "`temen_foreign_slots` is gated by its module's cfg (`foreign_mem`)"
     );
     assert!(
         exports.len() >= 260,

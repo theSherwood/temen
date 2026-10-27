@@ -5,8 +5,8 @@
 // Worker (the spawning thread's Worker mints the memory, and the Worker that runs the child's thread
 // is handed it) — then a fourth the exhausted minter must refuse probeably (`-EINVAL`), then joins the
 // three. Each child reads the 8-byte payload the root passed at `module_args_base()`, `vm_map`s a page
-// PAST its declared 64 KiB window (the grow reaches the child memory through `Region::Foreign` →
-// `foreign_grow`), stores/loads the word on the grown page and returns it + 1.
+// PAST its declared 64 KiB window (the grow reaches the child memory through `Region::Foreign` → its
+// accessor's `grow`), stores/loads the word on the grown page and returns it + 1.
 //
 // The root returns Σ(word_i + 1) + h4 = (1001 + 2001 + 3001) - 22. Non-vacuity: `started === 4` — the
 // root's and three children's Workers were all created (the children are spawned before any join, so

@@ -1104,8 +1104,11 @@ fn term_in_subset(t: &Terminator) -> bool {
 /// subset — reusing [`block_value_types`] (which errors on any out-of-subset instruction) as the
 /// single source of truth, plus a type check (all values i32/i64) and the terminator check.
 fn func_in_subset(m: &Module, f: &Func) -> bool {
+    // A block that captures a dominating block's value (#2454) is outside it: this tier types and
+    // pools each block's values on their own, so such a function runs on the interpreter tier.
     f.blocks.iter().all(|b| {
-        block_value_types(m, b).is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
+        b.captures.is_empty()
+            && block_value_types(m, b).is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
             && term_in_subset(&b.term)
     })
 }
@@ -2031,6 +2034,8 @@ pub fn outline_cap_calls(m: &mut Module) {
                     let ret: Vec<u32> = (nparams..nparams + ft.results.len() as u32).collect();
                     let results = ft.results.clone();
                     let block = Block {
+                        parent: 0,
+                        captures: vec![],
                         params: params.clone(),
                         insts: vec![Inst::CapCall {
                             type_id: *type_id,
@@ -2071,6 +2076,8 @@ pub fn outline_cap_calls(m: &mut Module) {
                     let ret: Vec<u32> = (nparams..nparams + ft.results.len() as u32).collect();
                     let results = ft.results.clone();
                     let block = Block {
+                        parent: 0,
+                        captures: vec![],
                         params: params.clone(),
                         insts: vec![Inst::CallImport {
                             import: *import,
@@ -2110,6 +2117,8 @@ pub fn outline_cap_calls(m: &mut Module) {
                     let ret: Vec<u32> = (nparams..nparams + ft.results.len() as u32).collect();
                     let results = ft.results.clone();
                     let block = Block {
+                        parent: 0,
+                        captures: vec![],
                         params: params.clone(),
                         insts: vec![Inst::CallSym {
                             import: *import,
@@ -2136,6 +2145,8 @@ pub fn outline_cap_calls(m: &mut Module) {
                     let g = base + wrappers.len() as u32;
                     let nparams = params.len() as u32;
                     let block = Block {
+                        parent: 0,
+                        captures: vec![],
                         params: params.clone(),
                         insts: vec![op],
                         term: Terminator::Return(vec![nparams]),
@@ -7153,6 +7164,8 @@ mod emit_cap_tests {
                 params: vec![],
                 results: vec![],
                 blocks: vec![temen_ir::Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![],
                     insts: (0..64).map(|_| Inst::ConstI64(1)).collect(),
                     term: Terminator::Return(vec![]),

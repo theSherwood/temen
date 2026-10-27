@@ -2092,7 +2092,11 @@ fn exit_code_of(result: &Result<Vec<Value>, Trap>) -> i32 {
 /// A `stopped` event for `thread_id`.
 /// A `stopped` event for an engine break: the DAP reason plus, for a #1366 host-completed cap park,
 /// the completion id (`capId`) the client answers with `provideCap`.
-fn break_event(reason: StopReason, thread_id: i64, request: Option<(String, Vec<i64>)>) -> Event {
+fn break_event(
+    reason: StopReason,
+    thread_id: i64,
+    request: Option<(String, u32, Vec<i64>)>,
+) -> Event {
     let cap_id = if let StopReason::CapPark { id } = &reason {
         Some(*id)
     } else {
@@ -2106,8 +2110,9 @@ fn break_event(reason: StopReason, thread_id: i64, request: Option<(String, Vec<
     if let Some(id) = cap_id {
         body.push(("capId", Json::i(id as i64)));
     }
-    if let Some((name, args)) = request {
+    if let Some((name, op, args)) = request {
         body.push(("capName", Json::s(&name)));
+        body.push(("op", Json::i(i64::from(op))));
         body.push(("args", Json::Arr(args.into_iter().map(Json::i).collect())));
     }
     ("stopped", Json::obj(body))

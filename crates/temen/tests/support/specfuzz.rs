@@ -17,7 +17,7 @@
 #![allow(dead_code)] // each includer (fuzz target / smoke test) uses one driver
 
 #[path = "irgen.rs"]
-mod irgen;
+pub mod irgen;
 
 use temen_interp::{bytecode, run, Trap, Value};
 use temen_jit::{compile, JitOutcome, TrapKind};
@@ -253,10 +253,37 @@ pub fn ops_one(data: &[u8]) {
 use irgen::Gen;
 use temen_ir::{Inst, Module, Terminator, ValType};
 
-/// A deterministic structural mutation of a verifier-valid module. A mutation may leave the
-/// module valid — the assertion in [`verify_one`] is *agreement*, not rejection.
-fn mutate(m: &mut Module, kind: u64) {
-    match kind % 6 {
+/// How many kinds of mutation [`mutate`] has.
+pub const MUTATIONS: u64 = 12;
+
+/// A deterministic structural mutation of a verifier-valid module, of kind `kind % MUTATIONS`.
+/// A mutation may leave the module valid — the assertion is *agreement*, not rejection. Shared by
+/// [`verify_one`] and `spec_verify`'s sweep.
+pub fn mutate(m: &mut Module, kind: u64) {
+    // The non-entry blocks, and the captures, of every function: the dominance certificate's
+    // mutations (#2454) pick from these.
+    let blocks = |m: &mut Module| -> Vec<(usize, usize)> {
+        let mut v = Vec::new();
+        for (fi, f) in m.funcs.iter().enumerate() {
+            for bi in 1..f.blocks.len() {
+                v.push((fi, bi));
+            }
+        }
+        v
+    };
+    let captures = |m: &mut Module| -> Vec<(usize, usize, usize)> {
+        let mut v = Vec::new();
+        for (fi, f) in m.funcs.iter().enumerate() {
+            for (bi, b) in f.blocks.iter().enumerate() {
+                for j in 0..b.captures.len() {
+                    v.push((fi, bi, j));
+                }
+            }
+        }
+        v
+    };
+    match kind % MUTATIONS {
+        // Retarget the first unconditional branch far out of range.
         0 => {
             for f in &mut m.funcs {
                 for b in &mut f.blocks {
@@ -267,6 +294,7 @@ fn mutate(m: &mut Module, kind: u64) {
                 }
             }
         }
+        // Empty the first return's argument list.
         1 => {
             for f in &mut m.funcs {
                 for b in &mut f.blocks {
@@ -279,6 +307,8 @@ fn mutate(m: &mut Module, kind: u64) {
                 }
             }
         }
+        // Rotate the first block parameter's type (leaves the func signature alone,
+        // so this usually trips the entry rule or an operand type).
         2 => {
             for f in &mut m.funcs {
                 for b in &mut f.blocks {
@@ -296,12 +326,16 @@ fn mutate(m: &mut Module, kind: u64) {
                 }
             }
         }
+        // Drop the memory declaration (any load/store must then be rejected).
         3 => m.memory = None,
+        // Grow the entry function's result arity.
         4 => {
             if let Some(f) = m.funcs.first_mut() {
                 f.results.push(ValType::I32);
             }
         }
+        // Prepend a const to a nonempty block: shifts the value numbering under every
+        // later operand index.
         5 => {
             for f in &mut m.funcs {
                 for b in &mut f.blocks {
@@ -310,6 +344,42 @@ fn mutate(m: &mut Module, kind: u64) {
                         return;
                     }
                 }
+            }
+        }
+        // A block's parent made itself (not earlier).
+        6 => {
+            if let Some(&(fi, bi)) = blocks(m).last() {
+                m.funcs[fi].blocks[bi].parent = bi as u32;
+            }
+        }
+        // A block's parent moved to the block just before it (rule 1 may fail).
+        7 => {
+            if let Some(&(fi, bi)) = blocks(m).last() {
+                m.funcs[fi].blocks[bi].parent = bi as u32 - 1;
+            }
+        }
+        // A capture pointed at the block just before its own (rule 2 may fail).
+        8 => {
+            if let Some(&(fi, bi, j)) = captures(m).last() {
+                m.funcs[fi].blocks[bi].captures[j].0 = bi as u32 - 1;
+            }
+        }
+        // A capture's value moved one up (out of range, or another value's type).
+        9 => {
+            if let Some(&(fi, bi, j)) = captures(m).first() {
+                m.funcs[fi].blocks[bi].captures[j].1 += 1;
+            }
+        }
+        // A capture on the entry block, which has no ancestor.
+        10 => {
+            if let Some(f) = m.funcs.first_mut() {
+                f.blocks[0].captures.push((0, 0));
+            }
+        }
+        // A capture of the capturing block's own first value.
+        11 => {
+            if let Some(&(fi, bi, j)) = captures(m).first() {
+                m.funcs[fi].blocks[bi].captures[j] = (bi as u32, 0);
             }
         }
         _ => unreachable!(),
@@ -321,7 +391,15 @@ fn mutate(m: &mut Module, kind: u64) {
 /// disagreement panics — the accept-direction gap the reference verifier exists to close.
 pub fn verify_one(data: &[u8]) {
     let mut g = Gen::from_bytes(data);
-    let m = irgen::gen_module(&mut g);
+    let mut m = irgen::gen_module(&mut g);
+    // Half the inputs are raised into dominance form (#2454), so the mutations reach parents and
+    // captures.
+    let mut r = Reader::new(data);
+    if r.u64() % 2 == 1 {
+        for f in &mut m.funcs {
+            f.raise();
+        }
+    }
 
     // The generator's output is valid by construction: both verifiers must accept it.
     let prod_ok = temen::verify::verify_module(&m).is_ok();
@@ -334,7 +412,7 @@ pub fn verify_one(data: &[u8]) {
 
     // Mutate and require agreement (a mutation may leave it valid — that's fine).
     let mut mm = m.clone();
-    mutate(&mut mm, Reader::new(data).u64());
+    mutate(&mut mm, r.u64());
     let prod = temen::verify::verify_module(&mm).is_ok();
     let refv = temen_spec::verify::verify(&mm).is_ok();
     assert_eq!(

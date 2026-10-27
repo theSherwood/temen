@@ -386,6 +386,20 @@ pub fn transform(m: &Module, opts: &TransformOpts) -> Result<Instrumented, Trans
 
     for (i, f) in m.funcs.iter().enumerate() {
         if may_suspend[i] {
+            // A frame's live set is its block's values: a function whose blocks capture (#2454) is
+            // instrumented in block-local form, where every value a block reads is one of its own.
+            let block_local;
+            let f = if f.blocks.iter().any(|b| !b.captures.is_empty()) {
+                let mut g = f.clone();
+                let has_memory = m.memory.is_some();
+                g.localize(&temen_verify::func_value_types(
+                    f, &m.funcs, &m.types, has_memory,
+                ));
+                block_local = g;
+                &block_local
+            } else {
+                f
+            };
             let (nf, frame_size) = transform_func(
                 f,
                 &func_results,
@@ -1780,6 +1794,8 @@ fn transform_func(
 
     // ---- TRAP — br_table default / forged resume id ----
     let trap = Block {
+        parent: 0,
+        captures: vec![],
         params: vec![],
         insts: vec![],
         term: Terminator::Unreachable,
@@ -1967,6 +1983,8 @@ impl Bb {
     }
     fn finish(self, term: Terminator) -> Block {
         Block {
+            parent: 0,
+            captures: vec![],
             params: self.params,
             insts: self.insts,
             term,

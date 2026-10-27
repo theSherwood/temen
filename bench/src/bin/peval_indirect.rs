@@ -32,6 +32,8 @@ fn handler(op: BinOp, imm: i64) -> Func {
         params: vec![I64, I64],
         results: vec![I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![I64, I64],
             insts: vec![
                 Inst::ConstI64(imm),
@@ -59,6 +61,8 @@ fn dispatch_loop_module() -> Module {
         results: vec![I64],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![I64],
                 insts: vec![],
                 term: Terminator::Br {
@@ -67,6 +71,8 @@ fn dispatch_loop_module() -> Module {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![I64, I64],
                 insts: vec![
                     Inst::ConstI64(0),
@@ -86,6 +92,8 @@ fn dispatch_loop_module() -> Module {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![I64, I64],
                 insts: vec![
                     Inst::Convert {
@@ -125,6 +133,8 @@ fn dispatch_loop_module() -> Module {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![I64],
                 insts: vec![],
                 term: Terminator::Return(vec![0]),

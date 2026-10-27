@@ -40,7 +40,8 @@ fn entry_points_reject_unverified_modules_fail_closed() {
         "module must be genuinely invalid"
     );
 
-    let err = run_kernel(&m, &[]).expect_err("run_kernel must reject an unverified module");
+    let err = run_kernel(&m, &[], &Limits::default())
+        .expect_err("run_kernel must reject an unverified module");
     assert!(err.contains("verification failed"), "run_kernel: {err}");
 
     let err = run_powerbox(&m, b"").expect_err("run_powerbox must reject an unverified module");
@@ -185,8 +186,104 @@ fn bare_kernel_returns_value() {
          }\n",
     );
     assert!(!is_named_powerbox_entry(&m));
-    let out = run_kernel(&m, &[41]).expect("run kernel");
+    let out = run_kernel(&m, &[41], &Limits::default()).expect("run kernel");
     assert_eq!(out, vec![Value::I64(42)]);
+}
+
+/// A bare kernel that never returns: a counter around a back edge.
+const SPIN_KERNEL: &str = "func () -> (i64) {\n\
+                           block 0 () {\n\
+                           \x20 v0 = i64.const 0\n\
+                           \x20 br 1(v0)\n\
+                           }\n\
+                           block 1 (v1: i64) {\n\
+                           \x20 v2 = i64.const 1\n\
+                           \x20 v3 = i64.add v1 v2\n\
+                           \x20 br 1(v3)\n\
+                             }\n\
+                           }\n";
+
+/// Run the zero-argument `kernel` under `limits` on a thread of its own, waiting at most `bound`: a
+/// kernel its grant fails to stop fails the test instead of hanging it (the spinning thread is
+/// abandoned to the end of the test process).
+fn run_kernel_bounded(
+    kernel: &Module,
+    limits: Limits,
+    bound: Duration,
+) -> Result<Vec<Value>, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let kernel = kernel.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(run_kernel(&kernel, &[], &limits));
+    });
+    rx.recv_timeout(bound)
+        .unwrap_or_else(|_| panic!("the grant did not stop the kernel within {bound:?}"))
+}
+
+/// #2636 — a bare kernel is a run's root like any other: it runs under the root's grant, so a
+/// runaway kernel is stopped by its fuel or by the deadline instead of spinning forever.
+#[test]
+fn bare_kernel_runs_under_the_root_grant() {
+    let spin = load(SPIN_KERNEL);
+    let bound = Duration::from_secs(60);
+    let fuel = Limits {
+        fuel: Some(10_000),
+        ..Limits::default()
+    };
+    let err = run_kernel_bounded(&spin, fuel, bound)
+        .expect_err("a kernel that spends its fuel must trap");
+    assert!(err.contains("OutOfFuel"), "fuel: {err}");
+    // With no fuel limit, the deadline stops it.
+    let deadline = Limits {
+        fuel: Some(u64::MAX),
+        deadline: Some(Duration::from_millis(100)),
+        ..Limits::default()
+    };
+    let err = run_kernel_bounded(&spin, deadline, bound)
+        .expect_err("a runaway kernel must be killed at the deadline");
+    assert!(err.contains("OutOfFuel"), "deadline: {err}");
+}
+
+/// #2636 — the `temen-run` binary gives a bare kernel the same grant and deadline as a powerbox
+/// program: `TEMEN_FUEL` and `TEMEN_DEADLINE_MS` each stop a runaway kernel. The wait is bounded, so
+/// a kernel the CLI fails to stop fails the test instead of hanging it.
+#[test]
+fn cli_bare_kernel_honours_fuel_and_deadline() {
+    let path = std::env::temp_dir().join(format!("temen_spin_kernel_{}.temt", std::process::id()));
+    std::fs::write(&path, SPIN_KERNEL).expect("write temp kernel");
+    for (var, val) in [("TEMEN_FUEL", "10000"), ("TEMEN_DEADLINE_MS", "200")] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_temen-run"))
+            .arg(&path)
+            .env(var, val)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn temen-run");
+        let start = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait temen-run") {
+                break status;
+            }
+            if start.elapsed() > Duration::from_secs(60) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&path);
+                panic!("{var}={val}: the CLI did not stop a runaway kernel within 60 s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let mut err = String::new();
+        std::io::Read::read_to_string(&mut child.stderr.take().expect("stderr"), &mut err).ok();
+        assert!(
+            !status.success(),
+            "{var}={val}: a stopped kernel must exit non-zero; stderr: {err}"
+        );
+        assert!(
+            err.contains("OutOfFuel"),
+            "{var}={val}: expected OutOfFuel; stderr: {err}"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
 }
 
 fn demo(name: &str) -> PathBuf {
@@ -1189,7 +1286,7 @@ fn unknown_named_import_fails_closed() {
         Err(e) => e,
     };
     assert!(
-        err.contains("unresolved capability import") && err.contains("frobnicate"),
+        err.contains("no grant satisfies its import `frobnicate`"),
         "error names the bad import: {err}"
     );
 }

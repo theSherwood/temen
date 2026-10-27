@@ -60,6 +60,8 @@ fn func(params: Vec<ValType>, results: Vec<ValType>, insts: Vec<Inst>, term: Ter
         params: params.clone(),
         results,
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params,
             insts,
             term,
@@ -1237,6 +1239,8 @@ fn terminators(ops: &mut Vec<Op>) {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],
                 insts: vec![],
                 term: Terminator::Br {
@@ -1245,6 +1249,8 @@ fn terminators(ops: &mut Vec<Op>) {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],
                 insts: vec![],
                 term: Terminator::Return(vec![0]),
@@ -1268,6 +1274,8 @@ fn terminators(ops: &mut Vec<Op>) {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],
                 insts: vec![],
                 term: Terminator::BrIf {
@@ -1279,11 +1287,15 @@ fn terminators(ops: &mut Vec<Op>) {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![Inst::ConstI32(1)],
                 term: Terminator::Return(vec![0]),
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![Inst::ConstI32(0)],
                 term: Terminator::Return(vec![0]),
@@ -1310,6 +1322,8 @@ fn terminators(ops: &mut Vec<Op>) {
         results: vec![ValType::I32],
         blocks: vec![
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![ValType::I32],
                 insts: vec![],
                 term: Terminator::BrTable {
@@ -1319,11 +1333,15 @@ fn terminators(ops: &mut Vec<Op>) {
                 },
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![Inst::ConstI32(1)],
                 term: Terminator::Return(vec![0]),
             },
             Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![Inst::ConstI32(0)],
                 term: Terminator::Return(vec![0]),
@@ -1348,6 +1366,8 @@ fn terminators(ops: &mut Vec<Op>) {
         params: vec![],
         results: vec![],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![],
             insts: vec![],
             term: Terminator::ReturnCall {
@@ -1375,6 +1395,8 @@ fn terminators(ops: &mut Vec<Op>) {
         params: vec![],
         results: vec![],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![],
             insts: vec![Inst::ConstI32(1)],
             term: Terminator::ReturnCallIndirect {

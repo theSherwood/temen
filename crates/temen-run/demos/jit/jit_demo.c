@@ -78,7 +78,8 @@ static long interp(Ins *prog, long a, long b) {
 // The binary layout mirrors `crates/temen-encode` (LEB128 + one-byte opcodes): the 16-byte TEMEN wire header (WIRE.md: magic +
 // u16 kind/u16 version/u32 flags), a memory descriptor, a data-segment count, a §7 import count (0 here —
 // this unit is self-contained), a function count, then per function its
-// params/results/blocks, each block its params, instruction count, instructions, terminator.
+// params/results/blocks, each block its parent (v14), params, captures (v14), instruction count,
+// instructions, terminator.
 // Values are block-local indices (params first, then each instruction's result).
 
 static int n_out;
@@ -129,7 +130,7 @@ static long emit_unit(Ins *prog, char *buf, int abi_sp) {
   eb(buf, 'T'); eb(buf, 'E'); eb(buf, 'M'); eb(buf, 'E'); eb(buf, 'N');
   eb(buf, 0); eb(buf, 0); eb(buf, 0);
   eb(buf, 0); eb(buf, 0);                 // kind = module
-  eb(buf, (13) & 0xff); eb(buf, (13) >> 8); // version (u16)
+  eb(buf, (14) & 0xff); eb(buf, (14) >> 8); // version (u16)
   eb(buf, 0); eb(buf, 0); eb(buf, 0); eb(buf, 0); // flags
   // Memory descriptor: present, size_log2 17. The validator's memory-match precondition
   // requires the blob to declare the SAME window as this module — chibicc keeps a small
@@ -152,9 +153,11 @@ static long emit_unit(Ins *prog, char *buf, int abi_sp) {
   eb(buf, 1);
   // One block whose params mirror the function's.
   eb(buf, 1);
+  eb(buf, 0); // its parent: none, it is the entry (v14)
   eb(buf, nparams);
   for (int k = 0; k < nparams; k++)
     eb(buf, 1);
+  eb(buf, 0); // no captures (v14)
   // Instruction count: ADDB/MULB are one binop; ADDK/MULK are a const + a binop.
   long ni = 0;
   for (int i = 0; prog[i].op != OP_END; i++)

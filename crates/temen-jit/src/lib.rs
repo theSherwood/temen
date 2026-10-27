@@ -1860,6 +1860,9 @@ pub struct DetachedHarvest {
     pub outcome: Option<(i64, i64)>,
     /// #2010 — its own unjoined durable detached children, harvested the same way.
     pub children: Vec<DetachedHarvest>,
+    /// #2465 — whether its parent can still join it: `false` once the parent detached it (op 10),
+    /// which the harvest carries only when it unwound for the freeze.
+    pub joinable: bool,
 }
 
 /// #1361 step 4 — what a durable detached child that unwound for a freeze left for the harvest.
@@ -1917,6 +1920,9 @@ pub struct CapturedSeed {
     /// table (#2031), and its `thread.spawn` vCPUs re-spawned into its domain, each rewinding from its
     /// own extent (#2010).
     pub residue: DurableResidue,
+    /// #2465 — whether its parent can join it; `false` re-files it detached (op 10), as the cut
+    /// left it.
+    pub joinable: bool,
 }
 
 /// #1768 — the embedder's side of a **fork** on the JIT (FORK.md §9.5): fork is durable freeze →
@@ -8301,6 +8307,27 @@ fn build_clif(
     if f.blocks.is_empty() {
         return Err(JitError::Malformed);
     }
+    // A value that crosses a `setjmp` reaches its later uses only through the `setjmp` block's own
+    // map, which reloads it after the second return (`launder_across_setjmp`). A forwarding param
+    // (#2448) or a capture (#2454) would read the value its own block defined, around the reload
+    // (#2600). So such a function is lowered block-local, taking no param as what it forwards.
+    let setjmp = f.uses_setjmp();
+    let block_local;
+    let f = if setjmp && f.blocks.iter().any(|b| !b.captures.is_empty()) {
+        let mut g = f.clone();
+        // Typing reads `has_memory` only to reject a memory op in a module with no window, which a
+        // verified function has none of, so `true` types it exactly.
+        g.localize(&temen_verify::func_value_types(
+            f,
+            funcs,
+            type_section,
+            true,
+        ));
+        block_local = g;
+        &block_local
+    } else {
+        f
+    };
     clif.signature = natural_sig(f);
     clif.name = UserFuncName::user(0, 0);
 
@@ -8312,7 +8339,7 @@ fn build_clif(
     // native params and jumps into IR block 0.
     let mut blocks = Blocks {
         clif: f.blocks.iter().map(|_| b.create_block()).collect(),
-        fwd: f.forwards(),
+        fwd: (!setjmp).then(|| f.forwards()),
         vals: vec![Vec::new(); f.blocks.len()],
     };
     for (i, blk) in f.blocks.iter().enumerate() {
@@ -8730,11 +8757,22 @@ fn lower_block(
             None => own.next().ok_or(JitError::Malformed)?,
         });
     }
-    // Parallel upper-bound map (for mask elision); block params are unknown. Kept in lockstep
-    // with `vals` so `ubs[i]` describes IR value `i` — a misalignment could mis-elide a mask (the
-    // INVARIANTS #2 escape class). Rather than re-growing it by hand in every multi-result arm (a
-    // 25th-arm slip away from a mis-elide), it is repaired to `vals.len()` at the **top of each
-    // iteration** (below), before any bound is consulted. So a slip now pads with `UB_TOP`
+    // Then its captures (#2454): each the value of the ancestor block it names, lowered before this
+    // one (an ancestor's index is lower) and dominating it (the verifier's rules), so the CLIF value
+    // is defined wherever this block uses it.
+    for &(a, v) in &blk.captures {
+        let held = blocks.vals[..block_idx].get(a as usize);
+        vals.push(
+            *held
+                .and_then(|h| h.get(v as usize))
+                .ok_or(JitError::Malformed)?,
+        );
+    }
+    // Parallel upper-bound map (for mask elision); block params and captures are unknown. Kept in
+    // lockstep with `vals` so `ubs[i]` describes IR value `i` — a misalignment could mis-elide a
+    // mask (the INVARIANTS #2 escape class). Rather than re-growing it by hand in every multi-result
+    // arm (a 25th-arm slip away from a mis-elide), it is repaired to `vals.len()` at the **top of
+    // each iteration** (below), before any bound is consulted. So a slip now pads with `UB_TOP`
     // ("unknown ⇒ emit the check") — degrading to a redundant mask (perf pennies), never a missing
     // one — and the single-value tail's `ubs.push` is the only hand-placed growth. `size` confines
     // via `mask` (= size−1).
@@ -11997,7 +12035,8 @@ fn map_edge(
 /// once it is lowered, its values, which a later block's taken params read.
 struct Blocks {
     clif: Vec<cranelift_codegen::ir::Block>,
-    fwd: temen_ir::Forwards,
+    /// `None` in a function that calls `setjmp`, which takes no param as what it forwards (#2600).
+    fwd: Option<temen_ir::Forwards>,
     vals: Vec<Vec<Value>>,
 }
 
@@ -12008,6 +12047,7 @@ impl Blocks {
     /// the value is defined wherever the param is used.
     fn taken(&self, b: usize, i: usize) -> Option<(usize, usize)> {
         self.fwd
+            .as_ref()?
             .source(b, i)
             .map(|(sb, si)| (sb as usize, si as usize))
             .filter(|&(sb, _)| sb < b)

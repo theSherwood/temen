@@ -102,6 +102,8 @@ fn store_then_two_loads_forward_to_the_stored_value() {
         params: vec![ValType::I64], // a = v0
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64],
             insts: vec![
                 Inst::ConstI64(7), // v1
@@ -140,6 +142,8 @@ fn redundant_load_survives_a_pure_op_between() {
         params: vec![ValType::I64],
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64],
             insts: vec![
                 load(0),           // v1 = mem[a]
@@ -170,6 +174,8 @@ fn store_to_an_unknown_address_blocks_forwarding() {
         params: vec![ValType::I64, ValType::I64], // a = v0, b = v1
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64, ValType::I64],
             insts: vec![
                 load(0),            // v2 = mem[a]  (x)
@@ -211,6 +217,8 @@ fn disjoint_offset_store_does_not_block_forwarding() {
         params: vec![ValType::I64], // base = v0
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64],
             insts: vec![
                 load_off(0, 0),                   // v1 = mem[base+0]
@@ -244,6 +252,8 @@ fn overlapping_offset_store_blocks_forwarding() {
         params: vec![ValType::I64], // base = v0
         results: vec![ValType::I64],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64],
             insts: vec![
                 load_off(0, 0),                   // v1 = mem64[base+0]  reads [0,8)
@@ -273,6 +283,8 @@ fn v128_store_forwards_to_loads() {
         params: vec![ValType::I64], // base = v0
         results: vec![ValType::V128],
         blocks: vec![Block {
+            parent: 0,
+            captures: vec![],
             params: vec![ValType::I64],
             insts: vec![
                 Inst::ConstV128(c), // v1

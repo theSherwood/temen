@@ -15,7 +15,7 @@ Every cell comes from **runs**: each feature's probe on each configuration that 
 
 On each executor a cell uses the runner that adds its properties and the fewest others. A cell is ✅ when every run gives the oracle's answer, 🚧 when any run is a known gap, ⛔ when every run declines by design, 🔶 for any other mix, and ❔ when no runner covers it. Each pair of properties appears once, in the earlier property's row.
 
-**85 of 192 cells audited.** Every 🚧 cell cites the issue tracking its gap.
+**102 of 192 cells audited.** Every 🚧 cell cites the issue tracking its gap.
 
 ## Legend
 
@@ -67,31 +67,34 @@ The property rows are the columns' properties again.
 - **bytecode, one thread, under a debugger, held by the embedder** — the bytecode debug scheduler (ScheduledDebugRun), the DAP's bytecode engine
 - **bytecode, one thread, held by the embedder** — CoopRun on the pump
 - **bytecode, thread per task, held by the embedder** — CoopRun on executor 2
+- **tree-walk interpreter, frozen and thawed** — run_capture_reserved_with_host_layout over an instrumented module: frozen at its first safepoint, serialized by the §12 codec, restored into a fresh powerbox and thawed
+- **bytecode, one thread, frozen and thawed** — bytecode::compile_and_run_capture_reserved_with_host, frozen and thawed the same way
+- **Cranelift JIT, frozen and thawed** — temen_run::jit_cap_run over a durable host, frozen and thawed the same way
 
 ## Features
 
 | a program that… | tree-walk interpreter | bytecode, one thread | bytecode, thread per task | Cranelift JIT | under a debugger | frozen and thawed | held by the embedder | from a warm snapshot | re-entered per frame | in the browser | with the wasm-JIT |
 |----|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|
-| spawns threads | ✅ | ✅ | ✅ | 🔶 | ✅ | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
-| runs fibers | ✅ | ✅ | ✅ | 🔶 | ✅ | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
-| spawns a child domain (§14) | ✅ | ✅ | ✅ | 🔶 | 🚧 | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
-| forks itself (clone_caller) | ✅ | ✅ | ✅ | 🚧 | 🚧 | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
-| execs another image (exec_module) | ✅ | ✅ | ✅ | 🚧 | 🚧 | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
-| makes a call the embedder answers | ✅ | ✅ | ✅ | ✅ | 🚧 | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
-| makes a call a pool thread answers | ✅ | ✅ | ✅ | ✅ | ✅ | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
-| reads input that arrives later | ✅ | ✅ | ✅ | ✅ | ✅ | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
-| is stopped and continued (job control) | ✅ | ✅ | ✅ | 🚧 | 🚧 | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
-| grows its window | ✅ | ✅ | ✅ | ✅ | ✅ | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
-| maps a shared region (§13) | ✅ | ✅ | ✅ | 🔶 | ✅ | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
-| compiles code at runtime (§22) | ✅ | ✅ | ✅ | ✅ | 🚧 | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
-| serves calls on its offer | ✅ | ✅ | ✅ | ✅ | ✅ | ❔ | ✅ | ❔ | ❔ | ❔ | ❔ |
+| spawns threads | ✅ | ✅ | ✅ | 🔶 | ✅ | 🚧 | ✅ | ❔ | ❔ | ❔ | ❔ |
+| runs fibers | ✅ | ✅ | ✅ | 🔶 | ✅ | 🔶 | ✅ | ❔ | ❔ | ❔ | ❔ |
+| spawns a child domain (§14) | ✅ | ✅ | ✅ | 🔶 | 🚧 | 🚧 | ✅ | ❔ | ❔ | ❔ | ❔ |
+| forks itself (clone_caller) | ✅ | ✅ | ✅ | 🚧 | 🚧 | 🚧 | ✅ | ❔ | ❔ | ❔ | ❔ |
+| execs another image (exec_module) | ✅ | ✅ | ✅ | 🚧 | 🚧 | 🚧 | ✅ | ❔ | ❔ | ❔ | ❔ |
+| makes a call the embedder answers | ✅ | ✅ | ✅ | ✅ | 🚧 | 🚧 | ✅ | ❔ | ❔ | ❔ | ❔ |
+| makes a call a pool thread answers | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ |
+| reads input that arrives later | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ |
+| is stopped and continued (job control) | ✅ | ✅ | ✅ | 🚧 | 🚧 | 🚧 | ✅ | ❔ | ❔ | ❔ | ❔ |
+| grows its window | ✅ | ✅ | ✅ | ✅ | ✅ | 🚧 | ✅ | ❔ | ❔ | ❔ | ❔ |
+| maps a shared region (§13) | ✅ | ✅ | ✅ | 🔶 | ✅ | 🔶 | ✅ | ❔ | ❔ | ❔ | ❔ |
+| compiles code at runtime (§22) | ✅ | ✅ | ✅ | ✅ | 🚧 | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ |
+| serves calls on its offer | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ |
 
 ## Properties
 
 | a run… | tree-walk interpreter | bytecode, one thread | bytecode, thread per task | Cranelift JIT | under a debugger | frozen and thawed | held by the embedder | from a warm snapshot | re-entered per frame | in the browser | with the wasm-JIT |
 |----|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|
 | under a debugger | 🚧 | 🚧 | ⛔ | ⛔ | · | ❔ | 🚧 | ❔ | ❔ | ❔ | ❔ |
-| frozen and thawed | ❔ | ❔ | ❔ | ❔ | · | · | ❔ | ❔ | ❔ | ❔ | ❔ |
+| frozen and thawed | 🚧 | 🚧 | 🚧 | 🚧 | · | · | ❔ | ❔ | ❔ | ❔ | ❔ |
 | held by the embedder | ❔ | ✅ | ✅ | ❔ | · | · | · | ❔ | ❔ | ❔ | ❔ |
 | from a warm snapshot | ❔ | ❔ | ❔ | ❔ | · | · | · | · | ❔ | ❔ | ❔ |
 | re-entered per frame | ❔ | ❔ | ❔ | ❔ | · | · | · | · | · | ❔ | ❔ |
@@ -102,34 +105,49 @@ The property rows are the columns' properties again.
 
 **spawns threads**
 - *Cranelift JIT* 🔶 — on the fiber_rt targets (unix x86-64, unix aarch64, Windows x86-64); elsewhere the JIT declines the module
+- *frozen and thawed* 🚧 — bytecode, one thread: the bytecode tier's durable entry declines a module with threads or §14 children, and the pump hands it to the tree-walker (#2533)
+- *frozen and thawed* 🔶 — Cranelift JIT: on the fiber_rt targets (unix x86-64, unix aarch64, Windows x86-64); elsewhere the JIT declines the module
 
 **runs fibers**
 - *Cranelift JIT* 🔶 — on the fiber_rt targets (unix x86-64, unix aarch64, Windows x86-64); elsewhere the JIT declines the module
+- *frozen and thawed* 🔶 — Cranelift JIT: on the fiber_rt targets (unix x86-64, unix aarch64, Windows x86-64); elsewhere the JIT declines the module
 
 **spawns a child domain (§14)**
 - *Cranelift JIT* 🔶 — on the fiber_rt targets (unix x86-64, unix aarch64, Windows x86-64); elsewhere the JIT declines the module
 - *under a debugger* 🚧 — tree-walk interpreter: the tree-walk Inspector runs one vCPU over the powerbox, or every vCPU over none, so a child's join blocks (#2560)
+- *frozen and thawed* 🚧 — bytecode, one thread: the bytecode tier's durable entry declines a module with threads or §14 children, and the pump hands it to the tree-walker (#2533)
+- *frozen and thawed* 🔶 — Cranelift JIT: on the fiber_rt targets (unix x86-64, unix aarch64, Windows x86-64); elsewhere the JIT declines the module
 
 **forks itself (clone_caller)**
 - *Cranelift JIT* 🚧 — answers clone_caller and reap -EINVAL where the oracle forks (#2553); FORK.md §9.3 plans them natively. The POSIX personality's own fork runs there (§9.5)
 - *under a debugger* 🚧 — tree-walk interpreter: the tree-walk Inspector blocks on a fork (#2560)
 - *under a debugger* 🚧 — bytecode, one thread: the bytecode debug scheduler declines every process seam: fork, exec, spawn, wait and pipes (#2554)
+- *frozen and thawed* 🚧 — bytecode, one thread: the bytecode tier's durable entry declines a module with threads or §14 children, and the pump hands it to the tree-walker (#2533)
+- *frozen and thawed* 🚧 — Cranelift JIT: answers clone_caller and reap -EINVAL where the oracle forks (#2553); FORK.md §9.3 plans them natively. The POSIX personality's own fork runs there (§9.5)
 
 **execs another image (exec_module)**
 - *Cranelift JIT* 🚧 — declines exec_module, the op C's execve replaces its image with (#2555); the POSIX personality's OP_EXECVE runs there (FORK.md §9.4)
 - *under a debugger* 🚧 — tree-walk interpreter: the tree-walk Inspector traps FiberFault on an exec (#2560)
 - *under a debugger* 🚧 — bytecode, one thread: the bytecode debug scheduler declines every process seam: fork, exec, spawn, wait and pipes (#2554)
+- *frozen and thawed* 🚧 — tree-walk interpreter; bytecode, one thread: a durable domain refuses exec_module with -EINVAL (#1696)
+- *frozen and thawed* 🚧 — Cranelift JIT: declines exec_module, the op C's execve replaces its image with (#2555); the POSIX personality's OP_EXECVE runs there (FORK.md §9.4)
 
 **makes a call the embedder answers**
 - *under a debugger* 🚧 — tree-walk interpreter: the tree-walk Inspector traps CapFault on a host-answered call (#2560)
+- *frozen and thawed* 🚧 — tree-walk interpreter; bytecode, one thread; Cranelift JIT: a durable run declines a host-answered call with CapFault before its embedder sees it: no caller in a durable run parks on a call (#2504)
 
 **is stopped and continued (job control)**
 - *Cranelift JIT* 🚧 — serves no job control, so a stopped process runs on (#1826)
 - *under a debugger* 🚧 — tree-walk interpreter: the tree-walk Inspector runs a stopped process on (#2560)
 - *under a debugger* 🚧 — bytecode, one thread: the bytecode debug scheduler runs a stopped process on: its pick never asks whether the process is stopped (#2615)
+- *frozen and thawed* 🚧 — Cranelift JIT: serves no job control, so a stopped process runs on (#1826)
+
+**grows its window**
+- *frozen and thawed* 🚧 — bytecode, one thread: the bytecode tier's durable entry takes a flat window, so a thaw traps MemoryFault on a page the run mapped past its declared memory (#2628)
 
 **maps a shared region (§13)**
 - *Cranelift JIT* 🔶 — for a region over an OS shared-memory object (temen_run::new_shared_region), which the JIT maps by its descriptor; a software-only one (Host::grant_shared_region) has none, so its map answers -EINVAL there
+- *frozen and thawed* 🔶 — Cranelift JIT: for a region over an OS shared-memory object (temen_run::new_shared_region), which the JIT maps by its descriptor; a software-only one (Host::grant_shared_region) has none, so its map answers -EINVAL there
 
 **compiles code at runtime (§22)**
 - *under a debugger* 🚧 — tree-walk interpreter: the tree-walk Inspector traps IndirectCallType at the installed unit's call.dyn (#2560)
@@ -148,4 +166,19 @@ The property rows are the columns' properties again.
 - *held by the embedder* 🚧 — tree-walk interpreter: the tree-walk Inspector hands its embedder no call to answer and no read to feed (#2560)
 - *held by the embedder* 🚧 — forks itself (clone_caller) on bytecode, one thread; execs another image (exec_module) on bytecode, one thread: the bytecode debug scheduler declines every process seam: fork, exec, spawn, wait and pipes (#2554)
 - *held by the embedder* 🚧 — is stopped and continued (job control) on bytecode, one thread: the bytecode debug scheduler runs a stopped process on: its pick never asks whether the process is stopped (#2615)
+
+**frozen and thawed**
+- *tree-walk interpreter* 🚧 — execs another image (exec_module): a durable domain refuses exec_module with -EINVAL (#1696)
+- *tree-walk interpreter* 🚧 — makes a call the embedder answers: a durable run declines a host-answered call with CapFault before its embedder sees it: no caller in a durable run parks on a call (#2504)
+- *bytecode, one thread* 🚧 — spawns threads; spawns a child domain (§14); forks itself (clone_caller): the bytecode tier's durable entry declines a module with threads or §14 children, and the pump hands it to the tree-walker (#2533)
+- *bytecode, one thread* 🚧 — execs another image (exec_module): a durable domain refuses exec_module with -EINVAL (#1696)
+- *bytecode, one thread* 🚧 — makes a call the embedder answers: a durable run declines a host-answered call with CapFault before its embedder sees it: no caller in a durable run parks on a call (#2504)
+- *bytecode, one thread* 🚧 — grows its window: the bytecode tier's durable entry takes a flat window, so a thaw traps MemoryFault on a page the run mapped past its declared memory (#2628)
+- *bytecode, thread per task* 🚧 — executor 2 has no freeze across its threads yet; a durable run asked to run on it runs on the pump (#2541)
+- *Cranelift JIT* 🔶 — spawns threads; runs fibers; spawns a child domain (§14): on the fiber_rt targets (unix x86-64, unix aarch64, Windows x86-64); elsewhere the JIT declines the module
+- *Cranelift JIT* 🚧 — forks itself (clone_caller): answers clone_caller and reap -EINVAL where the oracle forks (#2553); FORK.md §9.3 plans them natively. The POSIX personality's own fork runs there (§9.5)
+- *Cranelift JIT* 🚧 — execs another image (exec_module): declines exec_module, the op C's execve replaces its image with (#2555); the POSIX personality's OP_EXECVE runs there (FORK.md §9.4)
+- *Cranelift JIT* 🚧 — makes a call the embedder answers: a durable run declines a host-answered call with CapFault before its embedder sees it: no caller in a durable run parks on a call (#2504)
+- *Cranelift JIT* 🚧 — is stopped and continued (job control): serves no job control, so a stopped process runs on (#1826)
+- *Cranelift JIT* 🔶 — maps a shared region (§13): for a region over an OS shared-memory object (temen_run::new_shared_region), which the JIT maps by its descriptor; a software-only one (Host::grant_shared_region) has none, so its map answers -EINVAL there
 

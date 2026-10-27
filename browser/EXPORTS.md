@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**288 exports** in 37 families — 241 referenced from JS, 47 referenced by nothing, 51 behind a `cfg`.
+**286 exports** in 37 families — 240 referenced from JS, 46 referenced by nothing, 54 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -18,15 +18,15 @@
 | `durable` | 4 | 4 | 0 |
 | `exit` | 1 | 1 | 0 |
 | `fault` | 1 | 1 | 0 |
-| `foreign` | 3 | 3 | 3 |
+| `foreign` | 6 | 6 | 6 |
 | `framebuffer` | 4 | 4 | 0 |
-| `jspb` | 7 | 7 | 0 |
+| `jspb` | 2 | 2 | 0 |
 | `link` | 11 | 8 | 0 |
 | `mem` | 3 | 0 | 0 |
 | `module` | 3 | 0 | 0 |
 | `nim` | 6 | 6 | 0 |
 | `notes` | 2 | 2 | 0 |
-| `onramp` | 36 | 25 | 0 |
+| `onramp` | 36 | 26 | 0 |
 | `par` | 17 | 17 | 14 |
 | `parse` | 3 | 3 | 0 |
 | `pg` | 6 | 6 | 0 |
@@ -199,7 +199,10 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 
 - `temen_foreign_bench` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_foreign_poke` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_foreign_read_words` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_foreign_selftest` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_foreign_slots` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_foreign_write_words` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 
 ### `framebuffer`
 
@@ -210,12 +213,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 
 ### `jspb`
 
-- `temen_jspb_bind`
-- `temen_jspb_error_len`
-- `temen_jspb_error_ptr`
 - `temen_jspb_read`
-- `temen_jspb_reset`
-- `temen_jspb_run`
 - `temen_jspb_write`
 
 ### `link`
@@ -278,7 +276,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_onramp_stage_budget` — *unreferenced*
 - `temen_onramp_stage_clear`
 - `temen_onramp_stage_js_cap`
-- `temen_onramp_stage_module` — *unreferenced*
+- `temen_onramp_stage_module`
 - `temen_onramp_thaw`
 - `temen_onramp_timeline_begin_tick`
 - `temen_onramp_timeline_close`

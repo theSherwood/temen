@@ -88,7 +88,7 @@ static void emit_header(char *buf) {
   eb(buf, 'T'); eb(buf, 'E'); eb(buf, 'M'); eb(buf, 'E'); eb(buf, 'N');
   eb(buf, 0); eb(buf, 0); eb(buf, 0);
   eb(buf, 0); eb(buf, 0);                 // kind = module
-  eb(buf, (13) & 0xff); eb(buf, (13) >> 8); // version (u16)
+  eb(buf, (14) & 0xff); eb(buf, (14) >> 8); // version (u16)
   eb(buf, 0); eb(buf, 0); eb(buf, 0); eb(buf, 0); // flags
   eb(buf, 1);  // memory present
   eb(buf, 17); // size_log2 = 17 (must match this module's 128 KiB window, #1059 NULL guard)
@@ -117,9 +117,11 @@ static long emit_service(char *buf) {
   eb(buf, 1); // 1 function
   emit_i64_pair_sig(buf);
   eb(buf, 1); // 1 block
+  eb(buf, 0); // its parent: none, it is the entry (v14)
   eb(buf, 2); // block params: (i64, i64)
   eb(buf, 1);
   eb(buf, 1);
+  eb(buf, 0); // no captures (v14)
   eb(buf, 2);     // 2 instructions
   eb(buf, 0x42);  // v2 = i64.mul v0 v0
   uleb(buf, 0);
@@ -154,9 +156,11 @@ static long emit_client(char *buf) {
   eb(buf, 1);             // 1 function
   emit_i64_pair_sig(buf);
   eb(buf, 1); // 1 block
+  eb(buf, 0); // its parent: none, it is the entry (v14)
   eb(buf, 2); // block params: (i64, i64)
   eb(buf, 1);
   eb(buf, 1);
+  eb(buf, 0); // no captures (v14)
   eb(buf, 4);    // 4 instructions
   eb(buf, 0x10); // v2 = i32.const 0  (import handle placeholder)
   sleb(buf, 0);

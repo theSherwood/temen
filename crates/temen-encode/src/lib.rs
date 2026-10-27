@@ -333,6 +333,11 @@ pub mod wire {
         matches!(sniff_kind(bytes), Some(KIND_MODULE | KIND_OBJECT))
     }
 }
+// v14 (#2454) lets a block use a value of a block that dominates it. Each block header gains its
+// **parent** in a dominator tree the producer supplies, written as a distance back (the entry writes
+// 0), and after its params a **capture list**: `(distance back to an ancestor, value index)` pairs,
+// which take the block-local indices after the params. A block-local module is the case where every
+// parent is the entry and no block captures. Every committed asset is re-encoded.
 // v13 (#1830) adds the **data-image funcref slots** to both dialects, directly after the data
 // segments: the offsets at which the image holds a function index, which `link` records as it bakes
 // each `data.funcref`. A linked module otherwise keeps no record of which of its data bytes are
@@ -385,7 +390,7 @@ pub mod wire {
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
 // for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
-const VERSION: u16 = 13;
+const VERSION: u16 = 14;
 
 // The object dialect is its own header `kind` (`wire::KIND_OBJECT`), not a flag bit.
 
@@ -411,6 +416,8 @@ pub enum DecodeError {
     BadOpcode(u8),
     /// A LEB128-encoded integer did not fit its target width.
     IntTooLarge,
+    /// A block header's parent or capture reached back past the entry block (v14, #2454).
+    BadBlockBack,
     /// A LEB128 sequence was longer than its target width allows.
     LebOverflow,
     /// A count exceeded the bytes that could possibly satisfy it (anti-OOM/DoS).
@@ -885,8 +892,17 @@ fn encode_func(out: &mut Vec<u8>, f: &Func, object: bool) {
     write_types(out, &f.params);
     write_types(out, &f.results);
     write_uleb(out, f.blocks.len() as u64);
-    for b in &f.blocks {
+    for (bi, b) in f.blocks.iter().enumerate() {
+        // v14 (#2454): a block header names its parent and each capture's block as a distance back
+        // from the block, so a near one takes one byte. The entry's parent is itself: 0.
+        let back = |of: u32| (bi as u32).wrapping_sub(of) as u64;
+        write_uleb(out, back(b.parent));
         write_types(out, &b.params);
+        write_uleb(out, b.captures.len() as u64);
+        for &(blk, v) in &b.captures {
+            write_uleb(out, back(blk));
+            write_uleb(out, v as u64);
+        }
         write_uleb(out, b.insts.len() as u64);
         for inst in &b.insts {
             encode_inst(out, inst, object);
@@ -2518,8 +2534,8 @@ fn decode_func(c: &mut Cursor, object: bool) -> Result<Func, DecodeError> {
     let results = decode_types(c)?;
     let nblocks = c.count()?;
     let mut blocks = Vec::new();
-    for _ in 0..nblocks {
-        blocks.push(decode_block(c, object)?);
+    for bi in 0..nblocks as u32 {
+        blocks.push(decode_block(c, bi, object)?);
     }
     Ok(Func {
         params,
@@ -2528,8 +2544,14 @@ fn decode_func(c: &mut Cursor, object: bool) -> Result<Func, DecodeError> {
     })
 }
 
-fn decode_block(c: &mut Cursor, object: bool) -> Result<Block, DecodeError> {
+fn decode_block(c: &mut Cursor, bi: u32, object: bool) -> Result<Block, DecodeError> {
+    let parent = c.block_back(bi)?;
     let params = decode_types(c)?;
+    let ncaptures = c.count()?;
+    let mut captures = Vec::new();
+    for _ in 0..ncaptures {
+        captures.push((c.block_back(bi)?, c.idx()?));
+    }
     let ninsts = c.count()?;
     let mut insts = Vec::new();
     for _ in 0..ninsts {
@@ -2537,7 +2559,9 @@ fn decode_block(c: &mut Cursor, object: bool) -> Result<Block, DecodeError> {
     }
     let term = decode_term(c)?;
     Ok(Block {
+        parent,
         params,
+        captures: exact(captures),
         insts: exact(insts),
         term,
     })
@@ -3076,6 +3100,12 @@ impl<'a> Cursor<'a> {
         u32::try_from(v).map_err(|_| DecodeError::IntTooLarge)
     }
 
+    /// Read a block reference written as a distance back from block `bi` (a parent or a capture's
+    /// block).
+    fn block_back(&mut self, bi: u32) -> Result<u32, DecodeError> {
+        bi.checked_sub(self.idx()?).ok_or(DecodeError::BadBlockBack)
+    }
+
     /// Read a collection count, rejecting counts that cannot fit in the remaining
     /// bytes (each item needs >= 1 byte). Prevents OOM/DoS from a forged length.
     fn count(&mut self) -> Result<usize, DecodeError> {
@@ -3201,6 +3231,8 @@ mod object_tests {
                 params: vec![],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![],
                     insts: vec![
                         Inst::DataSelf {
@@ -3669,6 +3701,8 @@ mod debug_tests {
             params: vec![],
             results: vec![],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![],
                 term: Terminator::Return(vec![]),
@@ -3713,6 +3747,8 @@ mod debug_tests {
             params: vec![],
             results: vec![],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![],
                 term: Terminator::Return(vec![]),
@@ -3743,6 +3779,8 @@ mod debug_tests {
                 params: vec![],
                 results: vec![],
                 blocks: vec![Block {
+                    parent: 0,
+                    captures: vec![],
                     params: vec![],
                     insts: vec![],
                     term: Terminator::Return(vec![]),
@@ -3795,6 +3833,8 @@ mod debug_tests {
             params: vec![],
             results: vec![],
             blocks: vec![Block {
+                parent: 0,
+                captures: vec![],
                 params: vec![],
                 insts: vec![],
                 term: Terminator::Return(vec![]),

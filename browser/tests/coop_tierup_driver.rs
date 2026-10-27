@@ -6325,9 +6325,10 @@ fn pump(
                     std::slice::from_raw_parts(temen_coop_cap_ptr(), temen_coop_cap_len())
                 }
                 .to_vec();
+                // `[id, cap index, op, args…]`
                 let (id, value) = (
                     words[0] as u64,
-                    answer(caps[words[1] as usize], &words[2..]),
+                    answer(caps[words[1] as usize], &words[3..]),
                 );
                 assert_eq!(temen_coop_deliver_cap(id, value), 1);
                 assert_eq!(temen_coop_deliver_cap(id, value), 0, "answered once");
@@ -6498,7 +6499,7 @@ fn coop_run_idles_with_its_timer_while_an_answer_is_owed() {
     // SAFETY: the request words stay live until the next deliver/run/close.
     let words =
         unsafe { std::slice::from_raw_parts(temen_coop_cap_ptr(), temen_coop_cap_len()) }.to_vec();
-    assert_eq!(words[1..], [0, 7], "ping(7)");
+    assert_eq!(words[1..], [0, 0, 7], "ping(7), a flat import at op 0");
     let idle = || {
         assert_eq!(temen_coop_run(), COOP_RUN_IDLE, "the run waits on the page");
         temen_coop_idle_timer()

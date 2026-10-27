@@ -183,3 +183,98 @@ fn jit_setjmp_matches_oracle_under_register_pressure() {
         }
     }
 }
+
+/// [`stress`] with the crossing values defined a block *before* the `setjmp`: they reach the
+/// `setjmp` block as params that only forward them, and the re-entry block as params that forward
+/// those (#2448). A forwarded param reads the value its source block defined, so it must not skip
+/// the stack-slot copy the `setjmp` block reloads after the second return.
+fn stress_forwarded(n: usize) -> String {
+    let mut s = String::from("memory 16\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n");
+    let mut idx = 1;
+    for k in 0..n {
+        s += &format!("  v{idx} = i64.const {}\n", (k as i64) + 1);
+        let kk = idx;
+        idx += 1;
+        s += &format!("  v{idx} = i64.add v0 v{kk}\n");
+        let val = idx;
+        idx += 1;
+        s += &format!("  v{idx} = i64.const {}\n", 41000 + (k as i64) * 8);
+        let off = idx;
+        idx += 1;
+        s += &format!("  i64.store v{off} v{val}\n");
+    }
+    let mut crossing = Vec::new();
+    for k in 0..n {
+        s += &format!("  v{idx} = i64.const {}\n", 41000 + (k as i64) * 8);
+        let off = idx;
+        idx += 1;
+        s += &format!("  v{idx} = i64.load v{off}\n");
+        crossing.push(idx);
+        idx += 1;
+    }
+    let args: Vec<String> = crossing.iter().map(|c| format!("v{c}")).collect();
+    s += &format!("  br 1({})\n  }}\n", args.join(", "));
+    // block 1: the setjmp block. Its params only forward block 0's loads.
+    let params: Vec<String> = (0..n).map(|k| format!("c{k}: i64")).collect();
+    s += &format!("block 1 ({}) {{\n", params.join(", "));
+    s += "  buf = i64.const 40000\n  sj = setjmp buf\n  zero = i32.const 0\n  first = i32.eq sj zero\n";
+    let fwd: Vec<String> = (0..n).map(|k| format!("c{k}")).collect();
+    s += &format!("  br_if first 2() 3({}, sj)\n  }}\n", fwd.join(", "));
+    // block 2: the longjmp path, with spill pressure from loads of a disjoint region.
+    s += "block 2 () {\n";
+    for k in 0..n {
+        s += &format!("  k{k} = i64.const {}\n", (k as i64) * 7 + 5);
+        s += &format!("  o{k} = i64.const {}\n", 43000 + (k as i64) * 8);
+        s += &format!("  i64.store o{k} k{k}\n");
+    }
+    for k in 0..n {
+        s += &format!("  p{k} = i64.const {}\n", 43000 + (k as i64) * 8);
+        s += &format!("  f{k} = i64.load p{k}\n");
+    }
+    let mut acc = "f0".to_string();
+    for k in 1..n {
+        s += &format!("  a{k} = i64.add {acc} f{k}\n");
+        acc = format!("a{k}");
+    }
+    s += &format!("  ao = i64.const 45000\n  i64.store ao {acc}\n");
+    s += "  one = i32.const 1\n  buf2 = i64.const 40000\n  longjmp buf2 one\n  unreachable\n  }\n";
+    // block 3: re-entry. Its params forward block 1's, which forward block 0's.
+    let params: Vec<String> = (0..n).map(|k| format!("d{k}: i64")).collect();
+    s += &format!("block 3 ({}, r: i32) {{\n", params.join(", "));
+    s += "  s0 = i64.extend_i32_u r\n";
+    for k in 0..n {
+        s += &format!("  s{} = i64.add s{k} d{k}\n", k + 1);
+    }
+    s += &format!("  fixed = i64.const 48000\n  i64.store fixed s{n}\n  back = i64.load fixed\n  return back\n  }}\n}}\n");
+    s
+}
+
+/// The JIT must equal the oracle when the crossing values reach the re-entry block through params
+/// that forward them past the `setjmp` block.
+#[test]
+fn jit_setjmp_matches_oracle_with_forwarded_crossing_values() {
+    let inputs: [i64; 3] = [7, 1000, -7];
+    for n in [1usize, 8, 15, 24, 48] {
+        let src = stress_forwarded(n);
+        let m = parse_module(&src).unwrap_or_else(|e| panic!("parse n={n}: {e:?}\n{src}"));
+        verify_module(&m).unwrap_or_else(|e| panic!("verify n={n}: {e:?}"));
+        for &x in &inputs {
+            let mut fuel = 100_000_000u64;
+            let want = match run(&m, 0, &[Value::I64(x)], &mut fuel) {
+                Ok(vs) => match vs.as_slice() {
+                    [Value::I64(v)] => *v,
+                    other => panic!("oracle result shape n={n} x={x}: {other:?}"),
+                },
+                Err(t) => panic!("oracle trapped n={n} x={x}: {t:?}"),
+            };
+            let got = match compile_and_run(&m, 0, &[x]) {
+                Ok(JitOutcome::Returned(s)) => s[0],
+                other => panic!("jit did not return n={n} x={x}: {other:?}"),
+            };
+            assert_eq!(
+                want, got,
+                "JIT disagrees with the oracle at n={n} x={x} (oracle={want}, jit={got})"
+            );
+        }
+    }
+}
