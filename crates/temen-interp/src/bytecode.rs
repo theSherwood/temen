@@ -3958,13 +3958,7 @@ impl Reactor {
         tierup: Option<TierUpConfig>,
         image: Option<&Module>,
     ) -> Result<CoopRun, Trap> {
-        if func as usize >= self.n_funcs {
-            return Err(Trap::Malformed);
-        }
-        let dom = Domain::child(
-            self.source.clone(),
-            build_table(self.n_funcs, host.jit_table_log2()),
-        );
+        let dom = self.frame(func, &host)?;
         CoopRun::start(dom, self.mem.take(), func, args, fuel, host, tierup, image)
     }
 
@@ -3987,18 +3981,24 @@ impl Reactor {
         fuel: &mut u64,
         host: &mut Host,
     ) -> Result<Vec<Value>, Trap> {
+        // `run` consumes the `Domain`; the persistent `mem` carries state across calls.
+        let dom = self.frame(func, host)?;
+        run(dom, func, args, fuel, &mut self.mem, host)
+    }
+
+    /// The `Domain` one frame of `func` runs in, for [`call`](Self::call) and
+    /// [`coop_call`](Self::coop_call) alike: a fresh dispatch table over the shared compiled source
+    /// (cheap: an `Arc` clone + the slot vector), with the install room the powerbox's `Jit` grant
+    /// sizes, as every run's table has (#1296, #2661). No §22 install state carries between frames.
+    /// `Trap::Malformed` if `func` is out of range.
+    fn frame(&self, func: FuncIdx, host: &Host) -> Result<Domain, Trap> {
         if func as usize >= self.n_funcs {
             return Err(Trap::Malformed);
         }
-        // A fresh dispatch table over the shared compiled source (cheap: an `Arc` clone + the slot
-        // vector), with the install room the powerbox's `Jit` grant sizes, as `coop_call` and every
-        // run's table have (#1296, #2661). No §22 install state carries between frames, so each call's
-        // table is fresh. `run` consumes the `Domain`; the persistent `mem` carries state across calls.
-        let dom = Domain::child(
+        Ok(Domain::child(
             self.source.clone(),
             build_table(self.n_funcs, host.jit_table_log2()),
-        );
-        run(dom, func, args, fuel, &mut self.mem, host)
+        ))
     }
 
     /// Capture the live window as a [`MemLayout`] — the memory half of a **moment** (a reactor
