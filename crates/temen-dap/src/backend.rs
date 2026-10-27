@@ -107,8 +107,7 @@ fn grant_io_powerbox(
         seams.push(("vm_fs", h));
     }
     let grant = temen_interp::powerbox_grant(&granted, &seams);
-    let bound = host.bind_powerbox_manifest(&m.imports, &m.types, &grant);
-    bound
+    host.bind_powerbox_manifest(&m.imports, &m.types, &grant)
 }
 
 /// Build a [`ScheduledDebugRun`] for `module`'s `func(args)`: under the on-ramp I/O powerbox when
