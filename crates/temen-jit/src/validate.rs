@@ -3,16 +3,16 @@
 //! selection, register allocation, or encoding — where Cranelift's published sandbox escapes came
 //! from). It decodes the bytes itself and never trusts Cranelift's view of them.
 //!
-//! **Slice 1: x86-64, shadow mode.** A hand-rolled decoder (owned in-tree so a codegen surprise is
-//! patched here, not upstream) walks each emitted function and the validator checks two things:
-//! 1. every byte decodes and nothing is outside an allowlist (no `syscall`, no privileged or
-//!    segment/control-register instructions, …) — the start of control-flow integrity (I2);
-//! 2. a direct near/short `jmp`/`jcc` lands on a basic-block start Cranelift reported
-//!    (`machine_code_cfg_info` → `bb_starts`), not mid-instruction or outside the function.
+//! **x86-64, shadow mode.** A hand-rolled decoder (owned in-tree so a codegen surprise is patched
+//! here, not upstream) walks each emitted function. The validator rejects anything outside an
+//! allowlist, recovers the machine CFG, and runs an abstract interpretation over it that re-proves
+//! every memory access lands in a known region — a window access through a D63-confined or bounded
+//! index stays within the reservation. Only a linear check of the state proposed for each block is
+//! trusted (`x86::check`); the claim it carries, and why it holds, are in DESIGN §2a.
 //!
-//! It is **shadow mode**: a disagreement is logged and counted, never fatal. The memory-access
-//! policy (#2535), host-call argument contracts (#2534), the replay/trampoline hooks (#2536),
-//! fail-closed, and aarch64 are later slices. The decoder is cross-checked against iced-x86 (a
+//! It is **shadow mode**: a disagreement is logged and counted, never fatal. #2603 is the plan to
+//! fail closed (the remaining regions and control-flow integrity, host-call contracts #2534, one gate
+//! for every code origin #2536); aarch64 is #2642. The decoder is cross-checked against iced-x86 (a
 //! dev-dependency, never in the product) on real compiled modules — see the `x86::tests` below.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,18 +49,64 @@ pub(crate) struct WindowLayout {
     pub guard_offset: u64,
 }
 
+/// The bytes one relocation patches in a function's code: `[at, at + len)` is rewritten when the
+/// module links, so what runs there is not what the validator reads. No fact — a constant, a compare
+/// bound read from the constant pool — is ever taken from patched bytes (#2603).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Patch {
+    pub at: u32,
+    pub len: u8,
+}
+
+/// The [`Patch`] of each of a function's relocations `(offset, kind)`. A kind this table doesn't
+/// size is taken as 8 bytes, the widest x86-64 relocation field: over-covering is sound.
+pub(crate) fn patches(
+    relocs: impl IntoIterator<Item = (u32, cranelift_codegen::binemit::Reloc)>,
+) -> Vec<Patch> {
+    use cranelift_codegen::binemit::Reloc;
+    relocs
+        .into_iter()
+        .map(|(at, kind)| Patch {
+            at,
+            len: match kind {
+                Reloc::Abs4
+                | Reloc::X86PCRel4
+                | Reloc::X86CallPCRel4
+                | Reloc::X86CallPLTRel4
+                | Reloc::X86GOTPCRel4
+                | Reloc::X86SecRel => 4,
+                _ => 8,
+            },
+        })
+        .collect()
+}
+
+/// What the validator knows of a function's entry (#2603). A guest function enters with its context
+/// params in `sig_from`'s registers and accesses its module's window (`None` for a memoryless
+/// module). A trampoline is called by the host, under the host's ABI with its own arguments; until
+/// #2603 PR 3 gives each one a contract, it gets the decode and control-flow layers but not the
+/// memory policy, which would otherwise read its arguments as a guest's context params.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Entry {
+    // Only the x86-64 validator reads the layout (aarch64's is #2642).
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    Guest(Option<WindowLayout>),
+    Host,
+}
+
 /// Validate one emitted function's `bytes` against its basic-block hints from
 /// `CompiledCode`: `bb_starts` (block start offsets) and `bb_edges` (block-to-block control-flow
-/// edges, each `(from_start, to_start)`), with the module's `layout` (`None` if memoryless). Shadow
-/// mode: every problem is logged and counted, never returned.
+/// edges, each `(from_start, to_start)`), the bytes its relocations patch, and what is known of its
+/// `entry`. Shadow mode: every problem is logged and counted, never returned.
 pub(crate) fn shadow_check(
     bytes: &[u8],
     bb_starts: &[u32],
     bb_edges: &[(u32, u32)],
-    layout: Option<WindowLayout>,
+    patches: &[Patch],
+    entry: Entry,
 ) {
     #[cfg(target_arch = "x86_64")]
-    for f in x86::check(bytes, bb_starts, bb_edges, layout) {
+    for f in x86::check(bytes, bb_starts, bb_edges, patches, entry) {
         // Count every disagreement (a fuzz run asserts the total), but cap the logging so a bad
         // decode on every module can't swamp a fuzzer's stderr.
         let n = DISAGREEMENTS.fetch_add(1, Ordering::Relaxed);
@@ -69,7 +115,7 @@ pub(crate) fn shadow_check(
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = (bytes, bb_starts, bb_edges, layout);
+    let _ = (bytes, bb_starts, bb_edges, patches, entry);
 }
 
 // --- test-only capture of real compiled code, cross-checked against iced-x86 ---
@@ -78,10 +124,16 @@ pub(crate) fn shadow_check(
 // caller in `lib.rs` is gated to match, so it is `all(test, target_arch = "x86_64")` — on another
 // target (the aarch64 clippy lane) it would be dead code under `-D warnings`.
 
-/// One captured function's machine code, its basic-block hints (`bb_starts`, `bb_edges`), and the
+/// One captured function: its machine code, basic-block hints, relocation patches, and the
 /// module's window layout.
 #[cfg(all(test, target_arch = "x86_64"))]
-type CapturedFn = (Vec<u8>, Vec<u32>, Vec<(u32, u32)>, Option<WindowLayout>);
+pub(crate) struct CapturedFn {
+    pub code: Vec<u8>,
+    pub bb_starts: Vec<u32>,
+    pub bb_edges: Vec<(u32, u32)>,
+    pub patches: Vec<Patch>,
+    pub layout: Option<WindowLayout>,
+}
 
 #[cfg(all(test, target_arch = "x86_64"))]
 thread_local! {
@@ -91,17 +143,25 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Record one defined function's code + block hints + layout, if a test armed the capture.
+/// Record one defined function's code, block hints, patches and layout, if a test armed the
+/// capture.
 #[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) fn capture_code(
     code: &[u8],
     bb_starts: &[u32],
     bb_edges: &[(u32, u32)],
+    patches: Vec<Patch>,
     layout: Option<WindowLayout>,
 ) {
     CAPTURE.with(|c| {
         if let Some(v) = c.borrow_mut().as_mut() {
-            v.push((code.to_vec(), bb_starts.to_vec(), bb_edges.to_vec(), layout));
+            v.push(CapturedFn {
+                code: code.to_vec(),
+                bb_starts: bb_starts.to_vec(),
+                bb_edges: bb_edges.to_vec(),
+                patches,
+                layout,
+            });
         }
     });
 }
@@ -124,7 +184,7 @@ pub(crate) mod x86 {
     //! classification), the machine-CFG recovery and abstract dataflow (#2535), and the
     //! memory-access confinement policy (#2535/#2603) they feed.
 
-    use super::WindowLayout;
+    use super::{Entry, Patch, WindowLayout};
 
     /// A machine-code policy disagreement: `why`, at byte offset `at` in the function.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,10 +198,14 @@ pub(crate) mod x86 {
         pub const RCX: u8 = 1; // stack_limit (arg 3)
         pub const RDX: u8 = 2; // vmctx / trap_out (arg 2)
         pub const RSP: u8 = 4; // stack pointer
-        pub const RBP: u8 = 5; // frame pointer
         pub const RSI: u8 = 6; // fn_table_base (arg 1)
         pub const RDI: u8 = 7; // mem_base (arg 0)
     }
+
+    /// The GP registers a call clobbers: Cranelift's `SYSV_CLOBBERS`, shared by a Tail-CC callee, a
+    /// host function and a libcall — rax, rcx, rdx, rsi, rdi and r8–r11. rbx, rbp and r12–r15 are
+    /// callee-saved and survive the call (#2603 hole 1).
+    const CALL_CLOBBERS: u16 = 0b0000_1111_1100_0111;
 
     /// The largest machine access width (AVX-512 zmm) — used as a sound over-estimate when checking
     /// that a confined access's displacement rides within the guard slack. (Decoding the exact width
@@ -163,15 +227,16 @@ pub(crate) mod x86 {
         StackLimit,
         /// A known constant (e.g. the guard-offset materialization `mov r, imm`).
         Const(i64),
-        /// Confined by the D63 sequence (`cmp v, bound; cmovae v', guard`): either `< bound` or the
-        /// guard offset, so safe as a window byte index for a displacement within the trailing-guard
-        /// slack. Carries the guard constant the `cmov` redirected to, cross-checked against the
-        /// module's `guard_offset` when the layout hint is present (#2603).
-        Confined { guard: u64 },
+        /// In `[0, bound) ∪ {guard}` (unsigned): what a `cmov` leaves when it keeps a compared value
+        /// only while it is below `bound` and otherwise takes the constant `guard`. D63's redirect
+        /// (`cmp idx, reserved; cmovae idx, guard_offset`) and br_table's index clamp
+        /// (`cmp idx, n; cmovb n, idx`) are both this shape (#2603).
+        Confined { bound: u64, guard: u64 },
         /// Proven in `[0, ub)` (e.g. `and r, (2^k − 1)`).
         Bounded(u64),
-        /// A pointer into the stack frame, computed by `lea r, [rsp/rbp + disp]`.
-        StackPtr,
+        /// A pointer into the stack, at entry-relative offset `Some(off)` (`rsp` is `Stack(Some(0))`
+        /// at entry, pointing at the return address), or somewhere in it at an unknown offset (`None`).
+        Stack(Option<i64>),
         /// A pointer into the function's own rodata / jump tables, computed by `lea r, [rip + disp]`.
         RipRel,
         /// No information.
@@ -179,11 +244,21 @@ pub(crate) mod x86 {
     }
 
     impl Fact {
-        /// The fact true on both incoming paths.
+        /// The fact true on both incoming paths. It is also the order the checker relies on: `a`
+        /// implies `b` exactly when `a.meet(b) == b`.
         fn meet(self, other: Fact) -> Fact {
             match (self, other) {
                 (a, b) if a == b => a,
                 (Fact::Bounded(a), Fact::Bounded(b)) => Fact::Bounded(a.max(b)),
+                (Fact::Confined { bound: a, guard: g }, Fact::Confined { bound: b, guard: h })
+                    if g == h =>
+                {
+                    Fact::Confined {
+                        bound: a.max(b),
+                        guard: g,
+                    }
+                }
+                (Fact::Stack(_), Fact::Stack(_)) => Fact::Stack(None),
                 _ => Fact::Unknown,
             }
         }
@@ -194,14 +269,12 @@ pub(crate) mod x86 {
     /// Overflow simply stops tracking new slots — sound, since an untracked reload reads `Unknown`.
     const SLOT_CAP: usize = 8;
 
-    /// One tracked stack spill slot: the value spilled to `[base + disp]`, `base` the literal rsp(4)
-    /// or rbp(5). Keyed by `(base, disp)` exactly as the instruction encodes it — when rsp shifts,
-    /// Cranelift addresses the same physical slot with a *different* disp, so a stale key never
-    /// aliases a live slot (#2603 item 3).
+    /// One tracked spill slot: the 8-byte value at entry-relative stack offset `off`. Keying by the
+    /// offset from the entry `rsp` (not by the instruction's `(base, disp)`) gives a slot one identity
+    /// however `rsp` moves and whichever stack pointer addresses it (#2603 hole 6).
     #[derive(Clone, Copy, PartialEq, Eq)]
     struct Slot {
-        base: u8,
-        disp: i64,
+        off: i64,
         fact: Fact,
     }
 
@@ -213,14 +286,15 @@ pub(crate) mod x86 {
     }
 
     impl State {
-        /// The entry ABI: the four context params in their argument registers, everything else
-        /// unknown, no slots. rsp/rbp are the stack and are recognized structurally, not as facts.
+        /// The entry ABI: the four context params in their argument registers, `rsp` at the return
+        /// address, everything else unknown, no slots.
         fn entry() -> State {
             let mut regs = [Fact::Unknown; 16];
             regs[reg::RDI as usize] = Fact::MemBase;
             regs[reg::RSI as usize] = Fact::FnTableBase;
             regs[reg::RDX as usize] = Fact::Vmctx;
             regs[reg::RCX as usize] = Fact::StackLimit;
+            regs[reg::RSP as usize] = Fact::Stack(Some(0));
             State {
                 regs,
                 slots: [None; SLOT_CAP],
@@ -231,38 +305,42 @@ pub(crate) mod x86 {
             for (r, &o) in regs.iter_mut().zip(other.regs.iter()) {
                 *r = r.meet(o);
             }
-            // A slot fact survives the meet only if both paths agree on it exactly.
+            // A slot survives the meet only with a fact both paths imply.
             let mut slots = [None; SLOT_CAP];
             let mut n = 0;
             for s in self.slots.iter().flatten() {
-                if other.slot_get(s.base, s.disp) == s.fact && n < SLOT_CAP {
-                    slots[n] = Some(*s);
+                let fact = s.fact.meet(other.slot_get(s.off));
+                if fact != Fact::Unknown && n < SLOT_CAP {
+                    slots[n] = Some(Slot { off: s.off, fact });
                     n += 1;
                 }
             }
             State { regs, slots }
         }
-        /// The fact spilled to `[base + disp]`, or `Unknown` if that slot is not tracked.
-        fn slot_get(&self, base: u8, disp: i64) -> Fact {
+        /// The fact spilled to the 8-byte slot at `off`, or `Unknown` if no slot is tracked there.
+        fn slot_get(&self, off: i64) -> Fact {
             self.slots
                 .iter()
                 .flatten()
-                .find(|s| s.base == base && s.disp == disp)
+                .find(|s| s.off == off)
                 .map_or(Fact::Unknown, |s| s.fact)
         }
-        /// Record (or, for `Unknown`, forget) the fact spilled to `[base + disp]`.
-        fn slot_set(&mut self, base: u8, disp: i64, fact: Fact) {
-            if let Some(e) = self
-                .slots
-                .iter_mut()
-                .find(|s| matches!(s, Some(s) if s.base == base && s.disp == disp))
-            {
-                *e = (fact != Fact::Unknown).then_some(Slot { base, disp, fact });
-            } else if fact != Fact::Unknown {
-                if let Some(e) = self.slots.iter_mut().find(|s| s.is_none()) {
-                    *e = Some(Slot { base, disp, fact });
+        /// Record `fact` in the 8-byte slot at `off`, whose bytes the caller has already clobbered.
+        fn slot_set(&mut self, off: i64, fact: Fact) {
+            if fact == Fact::Unknown {
+                return;
+            }
+            if let Some(e) = self.slots.iter_mut().find(|s| s.is_none()) {
+                *e = Some(Slot { off, fact });
+            }
+            // full ⇒ drop (sound: the reload reads Unknown)
+        }
+        /// Forget every slot that overlaps the bytes `[lo, hi)`.
+        fn clobber(&mut self, lo: i64, hi: i64) {
+            for s in self.slots.iter_mut() {
+                if matches!(s, Some(e) if e.off < hi && lo < e.off.saturating_add(8)) {
+                    *s = None;
                 }
-                // full ⇒ drop (sound: the reload reads Unknown)
             }
         }
         fn clear_slots(&mut self) {
@@ -277,81 +355,213 @@ pub(crate) mod x86 {
                     *f = Fact::Unknown;
                 }
             }
-            for s in self.slots.iter_mut().flatten() {
-                if matches!(s.fact, Fact::Bounded(_)) {
-                    s.fact = Fact::Unknown;
-                }
-            }
-            // Drop the now-`Unknown` slots so equal states compare equal across rounds.
             for s in self.slots.iter_mut() {
-                if matches!(s, Some(e) if e.fact == Fact::Unknown) {
+                if matches!(s, Some(e) if matches!(e.fact, Fact::Bounded(_))) {
                     *s = None;
                 }
             }
         }
     }
 
-    /// Validate one emitted function's `bytes` against its basic-block hints, returning every policy
-    /// finding. Pure, so tests assert on the findings directly.
+    /// The edge condition the checker requires of the proposed states (`out ⊑ inn`): every fact
+    /// `inn` asserts is implied by `out`, in the registers and the slots alike.
+    fn implies(out: &State, inn: &State) -> bool {
+        out.regs
+            .iter()
+            .zip(&inn.regs)
+            .all(|(&o, &i)| o.meet(i) == i)
+            && inn
+                .slots
+                .iter()
+                .flatten()
+                .all(|s| out.slot_get(s.off).meet(s.fact) == s.fact)
+    }
+
+    /// What the transfer reads besides the instruction: the function's bytes (a compare bound sits
+    /// in its own constant pool), the bytes its relocations patch, and the module's window layout.
+    #[derive(Clone, Copy)]
+    struct Ctx<'a> {
+        bytes: &'a [u8],
+        patches: &'a [Patch],
+        layout: Option<WindowLayout>,
+    }
+
+    /// Whether a relocation in `patches` patches any of the bytes `[at, at + len)`.
+    fn patched(patches: &[Patch], at: usize, len: usize) -> bool {
+        len != 0
+            && patches.iter().any(|p| {
+                let start = p.at as usize;
+                start < at + len && at < start + usize::from(p.len)
+            })
+    }
+
+    /// Whether the direct `jmp` `d` at `pos` is a tail call: a `jmp rel32` whose displacement the
+    /// linker patches leaves the function for the symbol it names, so it has no successor here.
+    fn tail_call(d: &Decoded, pos: usize, patches: &[Patch]) -> bool {
+        matches!(d.kind, Kind::DirectJmp { .. })
+            && d.len >= 5
+            && patched(patches, pos + d.len - 4, 4)
+    }
+
+    impl Ctx<'_> {
+        fn patched(&self, at: usize, len: usize) -> bool {
+            patched(self.patches, at, len)
+        }
+        /// The `w`-byte little-endian constant at function offset `at`, if the function holds all of
+        /// it and no relocation patches any of it.
+        fn constant(&self, at: i64, w: usize) -> Option<u64> {
+            let at = usize::try_from(at).ok()?;
+            let b = self.bytes.get(at..at.checked_add(w)?)?;
+            if self.patched(at, w) {
+                return None;
+            }
+            let mut v = [0u8; 8];
+            v[..w].copy_from_slice(b);
+            Some(u64::from_le_bytes(v))
+        }
+        /// The function offset an instruction's rip-relative operand points at — unless the linker
+        /// patches its displacement, which then names a symbol rather than the function's own bytes.
+        fn rip_target(&self, d: &Decoded, end: usize) -> Option<i64> {
+            let m = d.operands.mem.filter(|m| m.rip)?;
+            let disp_at = end.checked_sub(usize::from(d.imm_len) + 4)?;
+            (!self.patched(disp_at, 4)).then(|| end as i64 + m.disp)
+        }
+    }
+
+    /// A function's machine CFG: the block leaders, each block's decoded instructions, and each
+    /// block's successors (indices into `leaders`).
+    struct Cfg {
+        leaders: Vec<usize>,
+        blocks: Vec<Vec<(usize, Decoded)>>,
+        succs: Vec<Vec<usize>>,
+    }
+
+    impl Cfg {
+        /// Layers 1–2: recover the machine basic blocks, decode each (pushing the layer-1 findings),
+        /// and collect their successors.
+        fn build(
+            bytes: &[u8],
+            bb_starts: &[u32],
+            bb_edges: &[(u32, u32)],
+            patches: &[Patch],
+            findings: &mut Vec<Finding>,
+        ) -> Cfg {
+            let leaders = recover_leaders(bytes, bb_starts, bb_edges, patches);
+            let nb = leaders.len();
+            let index_of = |o: usize| leaders.binary_search(&o).ok();
+            let limit_of = |i: usize| leaders.get(i + 1).copied().unwrap_or(bytes.len());
+            let mut blocks = Vec::with_capacity(nb);
+            let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
+            for i in 0..nb {
+                let (insns, direct) =
+                    decode_block(bytes, leaders[i], limit_of(i), patches, findings);
+                for s in direct {
+                    if let Some(si) = index_of(s) {
+                        if !succs[i].contains(&si) {
+                            succs[i].push(si);
+                        }
+                    }
+                }
+                blocks.push(insns);
+            }
+            // The one edge the decoder cannot read — an indirect `jmp`'s jump-table targets — comes
+            // from the `bb_edges` hint. The hint is Cranelift's CLIF-block CFG: an edge `(from, to)`
+            // leaves the CLIF block that starts at `from` through its terminator, which may sit
+            // several machine blocks in. So it is attached only to the machine block inside that CLIF
+            // block that ends in an indirect `jmp`; every other hinted edge is a direct branch the
+            // decoder already follows, and attaching it at the CLIF block's start would invent an edge
+            // that carries one point's state to another (#2603 PR 2 reads the targets from the bytes).
+            let mut clif_starts: Vec<usize> = bb_starts.iter().map(|&s| s as usize).collect();
+            clif_starts.sort_unstable();
+            let jumps: Vec<usize> = (0..nb)
+                .filter(|&i| {
+                    blocks[i]
+                        .last()
+                        .is_some_and(|(_, d): &(usize, Decoded)| d.kind == Kind::IndirectJmp)
+                })
+                .collect();
+            for &(from, to) in bb_edges {
+                let (from, to) = (from as usize, to as usize);
+                let Some(ti) = index_of(to) else { continue };
+                let end = clif_starts
+                    .iter()
+                    .copied()
+                    .find(|&s| s > from)
+                    .unwrap_or(bytes.len());
+                for &fi in &jumps {
+                    if (from..end).contains(&leaders[fi]) && !succs[fi].contains(&ti) {
+                        succs[fi].push(ti);
+                    }
+                }
+            }
+            Cfg {
+                leaders,
+                blocks,
+                succs,
+            }
+        }
+    }
+
+    /// Validate one emitted function's `bytes` against its basic-block hints, the bytes its
+    /// relocations patch, and the module's window layout, returning every policy finding. Pure, so
+    /// tests assert on the findings directly.
     ///
     /// Three layers (#2481 slice 1 + #2535):
     /// 1. **Decode + allowlist**, per machine basic block, flagging any instruction outside the
-    ///    allowlist, any undecodable encoding, any block overrun, and any direct branch out of code.
-    ///    The bytes between a non-fall-through terminator and the next block are a constant island or
-    ///    jump table Cranelift placed there (data, not code), so the walk stops at the terminator.
+    ///    allowlist, any undecodable encoding, any block overrun, any direct branch out of code, and
+    ///    control falling off the end. The bytes between a non-fall-through terminator and the next
+    ///    block are a constant island or jump table Cranelift placed there (data, not code), so the
+    ///    walk stops at the terminator.
     /// 2. **CFG recovery** ([`recover_leaders`]): the machine basic blocks are recovered by decoding
     ///    forward from the entry and every direct-branch target. `bb_starts`/`bb_edges` are *hints*,
     ///    not the machine CFG — they are Cranelift's CLIF-block CFG, so machine-lowered branches (the
     ///    stack-limit check, fuel/epoch polls, a `select`'s local `jcc`) target offsets no hint lists.
     ///    The one edge that cannot be decoded — an indirect `jmp`'s jump-table targets — is taken
-    ///    from `bb_edges` (this is what the hint saves: the expensive indirect-jump recovery, #2481).
+    ///    from `bb_edges` (#2603 PR 2 derives it from the bytes instead).
     /// 3. **Memory-access confinement** (#2535): an abstract interpretation over the recovered CFG
     ///    tracks which register holds `mem_base` and which holds a D63-confined index across blocks
     ///    and loops, then checks every memory access goes to a known region (the window through a
     ///    confined/bounded index, the stack, vmctx, the fn-table, or rip-relative rodata).
+    ///
+    /// Layer 3 is split so that only a check is trusted (#2603): [`propose`] runs the fixpoint and
+    /// guesses a state per block — a heuristic, free to widen or give up — and [`verify`] checks the
+    /// guess in one linear pass. A wrong or unconverged guess fails the check; it never admits code.
+    /// It needs the guest entry contract, so a trampoline ([`Entry::Host`]) gets layers 1–2 only.
     pub(crate) fn check(
         bytes: &[u8],
         bb_starts: &[u32],
         bb_edges: &[(u32, u32)],
-        layout: Option<WindowLayout>,
+        patches: &[Patch],
+        entry: Entry,
     ) -> Vec<Finding> {
         let mut findings = Vec::new();
         if bytes.is_empty() {
             return findings;
         }
+        let cfg = Cfg::build(bytes, bb_starts, bb_edges, patches, &mut findings);
+        let Entry::Guest(layout) = entry else {
+            return findings;
+        };
+        let ctx = Ctx {
+            bytes,
+            patches,
+            layout,
+        };
+        let states = propose(&cfg, ctx);
+        verify(&cfg, &states, ctx, &mut findings);
+        findings
+    }
 
-        // Layers 1–2: recover the machine basic blocks, decode each, and collect direct successors.
-        let leaders = recover_leaders(bytes, bb_starts, bb_edges);
-        let nb = leaders.len();
-        let index_of = |o: usize| leaders.binary_search(&o).ok();
-        let limit_of = |i: usize| leaders.get(i + 1).copied().unwrap_or(bytes.len());
-
-        let mut blocks: Vec<Vec<(usize, Decoded)>> = Vec::with_capacity(nb);
-        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
-        for i in 0..nb {
-            let (insns, direct) = decode_block(bytes, leaders[i], limit_of(i), &mut findings);
-            for s in direct {
-                if let Some(si) = index_of(s) {
-                    if !succs[i].contains(&si) {
-                        succs[i].push(si);
-                    }
-                }
-            }
-            blocks.push(insns);
-        }
-        // The one edge the decoder cannot read — an indirect `jmp`'s jump-table targets — comes from
-        // the `bb_edges` hint: attach each edge's target to the machine block containing its source.
-        for &(from, to) in bb_edges {
-            if let (Some(ti), Some(fi)) = (index_of(to as usize), block_of(from as usize, &leaders))
-            {
-                if !succs[fi].contains(&ti) {
-                    succs[fi].push(ti);
-                }
-            }
-        }
-
+    /// The untrusted half of layer 3: forward dataflow toward a fixpoint, proposing an in-state for
+    /// every block the entry reaches. `in[b]` is the meet of its computed predecessors' out-states
+    /// (the entry also meets the contract); `out[b]` is the block's transfer of `in[b]`. Loop headers
+    /// widen `Bounded`, so this terminates; in practice the loop-carried facts are invariant and it
+    /// settles in one or two rounds. The round cap only bounds the cost: [`verify`] rejects a
+    /// proposal the cap cut short.
+    fn propose(cfg: &Cfg, ctx: Ctx) -> Vec<Option<State>> {
+        let nb = cfg.leaders.len();
         let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
-        for (fi, ss) in succs.iter().enumerate() {
+        for (fi, ss) in cfg.succs.iter().enumerate() {
             for &ti in ss {
                 preds[ti].push(fi);
             }
@@ -362,19 +572,12 @@ pub(crate) mod x86 {
         let is_header: Vec<bool> = (0..nb)
             .map(|ti| preds[ti].iter().any(|&fi| fi >= ti))
             .collect();
-
-        // Layer 3: forward dataflow to a fixpoint. `in[b]` is the meet of its computed predecessors'
-        // out-states (the entry keeps its seed); `out[b]` is the block's transfer of `in[b]`. Meet
-        // only moves up the lattice and headers widen `Bounded`, so this terminates; in practice the
-        // loop-carried facts are invariant and it settles in one or two rounds.
-        let entry = index_of(0).unwrap_or(0);
         let mut in_st: Vec<Option<State>> = vec![None; nb];
         let mut out_st: Vec<Option<State>> = vec![None; nb];
-        let cap = nb * 4 + 8;
-        for _ in 0..cap {
+        for _ in 0..nb * 4 + 8 {
             let mut changed = false;
             for i in 0..nb {
-                let mut cur = (i == entry).then(State::entry);
+                let mut cur = (i == 0).then(State::entry);
                 for &p in &preds[i] {
                     if let Some(po) = out_st[p] {
                         cur = Some(cur.map_or(po, |s| s.meet(&po)));
@@ -388,7 +591,7 @@ pub(crate) mod x86 {
                         in_st[i] = Some(s);
                         changed = true;
                     }
-                    let o = transfer_block(&blocks[i], s, None, layout);
+                    let o = transfer_block(&cfg.blocks[i], s, None, ctx);
                     if out_st[i] != Some(o) {
                         out_st[i] = Some(o);
                         changed = true;
@@ -399,14 +602,45 @@ pub(crate) mod x86 {
                 break;
             }
         }
+        in_st
+    }
 
-        // Final pass: replay each reachable block's transfer, collecting the memory-access findings.
-        for i in 0..nb {
-            if let Some(s) = in_st[i] {
-                transfer_block(&blocks[i], s, Some(&mut findings), layout);
+    /// The trusted half of layer 3: one linear pass over the proposed `states`. It runs each
+    /// proposed block's transfer once, applying the policy at every instruction, and requires the
+    /// proposal to be **inductive**: the entry contract implies the entry block's state, and every
+    /// edge's out-state implies its target's state. By induction every reachable block is then
+    /// covered by a state that over-approximates every execution reaching it, so the policy findings
+    /// hold for every run. A block whose successor has no state, or an edge the proposal doesn't
+    /// hold on, is a finding.
+    fn verify(cfg: &Cfg, states: &[Option<State>], ctx: Ctx, findings: &mut Vec<Finding>) {
+        if !states
+            .first()
+            .copied()
+            .flatten()
+            .is_some_and(|s| implies(&State::entry(), &s))
+        {
+            findings.push(Finding {
+                at: 0,
+                why: "the entry block's state is not implied by the entry contract".into(),
+            });
+            return;
+        }
+        for (i, insns) in cfg.blocks.iter().enumerate() {
+            let Some(s) = states[i] else { continue };
+            let out = transfer_block(insns, s, Some(findings), ctx);
+            for &j in &cfg.succs[i] {
+                if !states[j].is_some_and(|sj| implies(&out, &sj)) {
+                    findings.push(Finding {
+                        at: cfg.leaders[j],
+                        why: format!(
+                            "the state proposed for this block does not hold on the edge from \
+                             +0x{:x}",
+                            cfg.leaders[i]
+                        ),
+                    });
+                }
             }
         }
-        findings
     }
 
     /// Recover the machine basic-block leaders: the entry, the hinted `bb_starts`/`bb_edge` targets,
@@ -415,7 +649,12 @@ pub(crate) mod x86 {
     /// targets; iterate to a fixpoint (the leader set only grows, bounded by the code size, so it
     /// terminates). The walk stops at a non-fall-through terminator, so inter-block island/table
     /// data is never decoded.
-    fn recover_leaders(bytes: &[u8], bb_starts: &[u32], bb_edges: &[(u32, u32)]) -> Vec<usize> {
+    fn recover_leaders(
+        bytes: &[u8],
+        bb_starts: &[u32],
+        bb_edges: &[(u32, u32)],
+        patches: &[Patch],
+    ) -> Vec<usize> {
         let len = bytes.len();
         let mut leaders: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         leaders.insert(0);
@@ -443,7 +682,7 @@ pub(crate) mod x86 {
                     let next = pos + d.len;
                     match d.kind {
                         Kind::DirectJmp { target } => {
-                            if target < len {
+                            if target < len && !tail_call(&d, pos, patches) {
                                 leaders.insert(target);
                             }
                             break;
@@ -473,22 +712,22 @@ pub(crate) mod x86 {
         leaders.into_iter().collect()
     }
 
-    /// The index of the machine block containing byte offset `off` (the largest leader `<= off`).
-    fn block_of(off: usize, leaders: &[usize]) -> Option<usize> {
-        leaders.partition_point(|&l| l <= off).checked_sub(1)
-    }
-
     /// Decode block `[block, limit)` into `(offset, Decoded)` pairs (layer 1), stopping at the
     /// block's non-fall-through terminator, and return the block's direct successor offsets (the
     /// branch target(s) and, for a conditional branch or a fall-through into the next block, the
     /// next offset). Pushes layer-1 findings: undecodable encodings, forbidden instructions, block
-    /// overruns, and direct branches out of the code.
+    /// overruns, direct branches out of the code, and control falling off the end of the function.
     fn decode_block(
         bytes: &[u8],
         block: usize,
         limit: usize,
+        patches: &[Patch],
         findings: &mut Vec<Finding>,
     ) -> (Vec<(usize, Decoded)>, Vec<usize>) {
+        let off_the_end = |at: usize| Finding {
+            at,
+            why: "control falls off the end of the function".into(),
+        };
         let mut insns = Vec::new();
         let mut pos = block;
         while pos < limit {
@@ -506,7 +745,7 @@ pub(crate) mod x86 {
                     why: format!("forbidden instruction: {name}"),
                 }),
                 Kind::DirectJmp { target } | Kind::DirectJcc { target }
-                    if target >= bytes.len() =>
+                    if target >= bytes.len() && !tail_call(&d, pos, patches) =>
                 {
                     findings.push(Finding {
                         at: pos,
@@ -527,173 +766,432 @@ pub(crate) mod x86 {
             }
             insns.push((pos, d));
             match d.kind {
+                Kind::DirectJmp { .. } if tail_call(&d, pos, patches) => {
+                    return (insns, Vec::new())
+                }
                 Kind::DirectJmp { target } => return (insns, vec![target]),
-                Kind::DirectJcc { target } => return (insns, vec![target, next]),
+                Kind::DirectJcc { target } => {
+                    if next >= bytes.len() {
+                        findings.push(off_the_end(pos));
+                    }
+                    return (insns, vec![target, next]);
+                }
                 // `ret`/`ud2` leave the function; an indirect `jmp`'s successors come from `bb_edges`.
                 Kind::Ret | Kind::Ud2 | Kind::IndirectJmp => return (insns, Vec::new()),
                 _ => {}
             }
             pos = next;
         }
+        if limit >= bytes.len() {
+            findings.push(off_the_end(insns.last().map_or(block, |&(p, _)| p)));
+        }
         (insns, vec![limit]) // fell through to the next leader
     }
 
+    /// A block-local symbolic value: what a register holds, as the value some instruction produced
+    /// (`id`, unique within the block) plus a constant `off`. A 64-bit copy keeps it, a constant
+    /// `lea`/`add`/`sub` moves `off`, and any other write makes a fresh value — so two registers with
+    /// the same `id` hold values a known constant apart (#2603).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct Sym {
+        id: u32,
+        off: i64,
+    }
+
+    /// The flags a `cmp lhs, rhs` of width `w` leaves, for a `cmov` that tests them: each side as the
+    /// value it compared (a register operand's [`Sym`]) and its constant (`w` bytes wide), when known.
+    /// Block-local: a block starts with no compare known, and any instruction that writes the flags —
+    /// or a call — forgets it (#2603 hole 3).
+    #[derive(Clone, Copy)]
+    struct Cmp {
+        w: u8,
+        lhs: Side,
+        rhs: Side,
+    }
+
+    /// One side of a [`Cmp`].
+    #[derive(Clone, Copy)]
+    struct Side {
+        sym: Option<Sym>,
+        konst: Option<u64>,
+    }
+
+    /// The fact `cmovcc dst, src` (width `w`, condition `cc`) leaves in `dst`, given the compare whose
+    /// flags it tests (#2603 holes 2–4). The result is `dst`'s old value or `src`'s. It is `Confined`
+    /// when one of the two is a constant (the guard) and the other is the compared value `v` plus a
+    /// constant `c ≥ 0` — D63 compares an address and selects the address plus the access's offset —
+    /// and `cc` lets it through only while `v` is below the compare's constant side `k`: `v < k` keeps
+    /// it under `k + c`, `v ≤ k` under `k + c + 1`. With `cmp v, k` those conditions are `b` and `be`;
+    /// with `cmp k, v`, `a` and `ae`; a `cmov` that keeps its old value tests their negations (the
+    /// low bit flipped). A 32-bit `cmov` zero-extends what it selects, so the same holds of the 64-bit
+    /// result while `k + c` fits in 32 bits. Anything else — another condition, an unknown bound, a
+    /// side that isn't the compared value — is `Unknown`.
+    fn cmov_fact(
+        flags: Option<Cmp>,
+        w: u8,
+        cc: u8,
+        (dst, old): (Sym, Fact),
+        (src, src_fact): (Option<Sym>, Fact),
+    ) -> Fact {
+        let Some(f) = flags.filter(|f| f.w == w) else {
+            return Fact::Unknown;
+        };
+        let mask = if w == 8 {
+            u64::MAX
+        } else {
+            u64::from(u32::MAX)
+        };
+        let konst = |x: Fact| match x {
+            Fact::Const(c) => Some(c as u64 & mask),
+            _ => None,
+        };
+        // How far `s` sits above the compared value `v`: `Some(c)` when it is `v + c`, `c ≥ 0`.
+        let above = |s: Sym, v: Sym| {
+            (s.id == v.id)
+                .then(|| s.off.checked_sub(v.off))
+                .flatten()
+                .and_then(|c| u64::try_from(c).ok())
+        };
+        // The bound of `[0, k + c)` (`[0, k + c]` when `incl`), if it fits in `w` bits.
+        let limit = |k: u64, c: u64, incl: bool| {
+            let b = k.checked_add(c)?.checked_add(u64::from(incl))?;
+            (w == 8 || b <= 1 << 32).then_some(b)
+        };
+        // (the compared side, the constant side, the conditions meaning `v < k` and `v ≤ k`)
+        for (var, bound, lt, le) in [(f.lhs, f.rhs, 0x2u8, 0x6u8), (f.rhs, f.lhs, 0x7, 0x3)] {
+            let (Some(v), Some(k)) = (var.sym, bound.konst) else {
+                continue;
+            };
+            // Takes `src = v + c` while the condition holds, else keeps the constant old value.
+            let taken = [(lt, false), (le, true)];
+            if let (Some(c), Some(guard)) = (src.and_then(|s| above(s, v)), konst(old)) {
+                let incl = taken.iter().find(|&&(x, _)| x == cc).map(|&(_, i)| i);
+                if let Some(bound) = incl.and_then(|i| limit(k, c, i)) {
+                    return Fact::Confined { bound, guard };
+                }
+            }
+            // Keeps `dst = v + c` unless the negated condition holds, then takes the constant `src`.
+            if let (Some(c), Some(guard)) = (above(dst, v), konst(src_fact)) {
+                let incl = taken.iter().find(|&&(x, _)| x ^ 1 == cc).map(|&(_, i)| i);
+                if let Some(bound) = incl.and_then(|i| limit(k, c, i)) {
+                    return Fact::Confined { bound, guard };
+                }
+            }
+        }
+        Fact::Unknown
+    }
+
     /// Run block `insns` from `state`, returning the out-state. With `findings = Some`, also apply
-    /// the memory-access policy (layer 3) at each access. The guard→cmp→cmov recognition that
-    /// produces a [`Fact::Confined`] is block-local (`confinable`): the compared value, tracked
-    /// through a `mov` copy, becomes `Confined` at a `cmov` whose source is a constant (the guard
-    /// offset). The resulting fact flows across blocks through the lattice, so a guard Cranelift
-    /// hoists out of a loop is still seen at the access.
+    /// the memory-access policy (layer 3) at each access. A compare's flags and the symbolic values
+    /// are block-local, but the `Confined` fact a `cmov` derives from them flows across blocks through
+    /// the lattice, so a guard Cranelift hoists out of a loop is still seen at the access.
     fn transfer_block(
         insns: &[(usize, Decoded)],
         mut state: State,
         mut findings: Option<&mut Vec<Finding>>,
-        layout: Option<WindowLayout>,
+        ctx: Ctx,
     ) -> State {
-        // Registers that currently hold the value most recently compared (`cmp`), tracked through
-        // `mov` copies so a `cmovcc` on a copy is still recognized. Block-local.
-        let mut confinable: u16 = 0;
+        let mut sym: [Sym; 16] = std::array::from_fn(|r| Sym {
+            id: r as u32,
+            off: 0,
+        });
+        let mut next_id = 16u32;
+        let mut flags: Option<Cmp> = None;
         for &(pos, d) in insns {
             if let Some(f) = findings.as_deref_mut() {
-                mem_policy(pos, &d, &state, layout, f);
+                mem_policy(pos, &d, &state, ctx.layout, f);
             }
-            let w = writes_of(d.eff, &d.operands);
+            let end = pos + d.len;
+            // An immediate the linker patches is not the value that runs.
+            let imm_ok = !ctx.patched(end - usize::from(d.imm_len), usize::from(d.imm_len));
+            let written = writes_of(&d);
+            // The registers the semantic below sets precisely; every other register the instruction
+            // writes becomes `Unknown`.
+            let mut defined = 0u16;
+            slot_effect(&mut state, &d);
+            let fact = |state: &State, r: u8| state.regs[r as usize & 15];
+            let sym_of = |r: u8| sym[r as usize & 15];
+            let mut set = |state: &mut State, r: u8, f: Fact| {
+                state.regs[r as usize & 15] = f;
+                defined |= bit(r);
+            };
             match d.eff {
-                Eff::Cmp { reg, .. } => {
-                    confinable = reg.map_or(0, bit); // the compared value lives in `reg`
-                    continue; // writes no register
+                Eff::Cmp { w, lhs, rhs } => {
+                    let mask = if w == 8 {
+                        u64::MAX
+                    } else {
+                        u64::from(u32::MAX)
+                    };
+                    let side = |o: Opnd| match o {
+                        Opnd::Reg(r) => Side {
+                            sym: Some(sym_of(r)),
+                            konst: match fact(&state, r) {
+                                Fact::Const(c) => Some(c as u64 & mask),
+                                _ => None,
+                            },
+                        },
+                        Opnd::Imm(v) => Side {
+                            sym: None,
+                            konst: imm_ok.then_some(v & mask),
+                        },
+                        Opnd::Mem => Side {
+                            sym: None,
+                            konst: ctx
+                                .rip_target(&d, end)
+                                .and_then(|t| ctx.constant(t, usize::from(w))),
+                        },
+                    };
+                    flags = Some(Cmp {
+                        w,
+                        lhs: side(lhs),
+                        rhs: side(rhs),
+                    });
                 }
                 Eff::MovReg { dst, src } => {
-                    state.regs[dst as usize & 15] = state.regs[src as usize & 15];
-                    // The compared value, if copied, stays confinable in its new home.
-                    if confinable & bit(src) != 0 {
-                        confinable |= bit(dst);
-                    } else {
-                        confinable &= !bit(dst);
-                    }
-                    continue;
+                    let f = fact(&state, src);
+                    set(&mut state, dst, f);
                 }
                 Eff::MovImm { dst, imm } => {
-                    state.regs[dst as usize & 15] = Fact::Const(imm);
+                    let f = if imm_ok {
+                        Fact::Const(imm)
+                    } else {
+                        Fact::Unknown
+                    };
+                    set(&mut state, dst, f);
                 }
                 Eff::AluImm { dst, alu, imm } => {
-                    state.regs[dst as usize & 15] =
-                        alu_fact(state.regs[dst as usize & 15], alu, imm);
+                    let f = if imm_ok {
+                        alu_fact(fact(&state, dst), alu, imm)
+                    } else {
+                        Fact::Unknown
+                    };
+                    set(&mut state, dst, f);
                 }
-                Eff::Cmov { dst } => {
-                    // `cmovcc dst, src`: dst becomes either its old value or `src`. It is the D63
-                    // confined value iff dst held the compared index and src is the guard constant.
-                    let src_guard = match d.operands.rm_reg.map(|s| state.regs[s as usize & 15]) {
-                        Some(Fact::Const(g)) => Some(g as u64),
-                        _ => None,
-                    };
-                    let was_compared = confinable & bit(dst) != 0;
-                    state.regs[dst as usize & 15] = match src_guard {
-                        Some(guard) if was_compared => Fact::Confined { guard },
-                        _ => Fact::Unknown,
-                    };
+                Eff::Cmov { dst, cc, w } => {
+                    let src = d.operands.rm_reg;
+                    let f = cmov_fact(
+                        flags,
+                        w,
+                        cc,
+                        (sym_of(dst), fact(&state, dst)),
+                        (
+                            src.map(sym_of),
+                            src.map_or(Fact::Unknown, |s| fact(&state, s)),
+                        ),
+                    );
+                    set(&mut state, dst, f);
                 }
-                Eff::Lea { dst } => {
-                    // `lea` computes an address. A rip-relative one points into the function's own
-                    // rodata/jump tables; an rsp/rbp-relative one into the stack frame. Both are known
-                    // regions a later access may legitimately go through.
-                    state.regs[dst as usize & 15] = match d.operands.mem {
-                        Some(m) if m.rip => Fact::RipRel,
-                        Some(Mem {
-                            base: Some(reg::RSP | reg::RBP),
-                            ..
-                        }) => Fact::StackPtr,
-                        _ => Fact::Unknown,
+                Eff::Lea { dst, full: false } => set(&mut state, dst, Fact::Unknown),
+                Eff::Lea { dst, full: true } => {
+                    let f = match d.operands.mem {
+                        Some(m) if m.rip => match ctx.rip_target(&d, end) {
+                            Some(_) => Fact::RipRel,
+                            None => Fact::Unknown, // a symbol address, not the function's rodata
+                        },
+                        Some(m) => match frame_addr(&state, &m) {
+                            Some(Some(off)) => Fact::Stack(Some(off)),
+                            Some(None) if m.index.is_none() => Fact::Stack(None),
+                            _ => Fact::Unknown,
+                        },
+                        None => Fact::Unknown,
                     };
+                    set(&mut state, dst, f);
                 }
                 Eff::LoadReg { dst } => {
-                    // A reload from a tracked spill slot restores its fact; any other load is unknown.
-                    state.regs[dst as usize & 15] = load_fact(&state, &d.operands);
+                    // A full-width reload from a tracked slot restores its fact.
+                    let f = match d.operands.mem.and_then(|m| frame_addr(&state, &m)) {
+                        Some(Some(off)) => state.slot_get(off),
+                        _ => Fact::Unknown,
+                    };
+                    set(&mut state, dst, f);
                 }
-                // Stores write memory (handled by `slot_effect` below) and the opaque GP writes
-                // clobber their destinations (the value is not a tracked fact); `w` covers them below.
+                Eff::Push { src } => {
+                    // `[rsp − 8] := src; rsp −= 8` — the pushed fact is read before rsp moves.
+                    let f = src.map_or(Fact::Unknown, |s| fact(&state, s));
+                    let rsp = match fact(&state, reg::RSP) {
+                        Fact::Stack(Some(o)) => {
+                            state.clobber(o - 8, o);
+                            state.slot_set(o - 8, f);
+                            Fact::Stack(Some(o - 8))
+                        }
+                        Fact::Stack(None) => {
+                            state.clear_slots();
+                            Fact::Stack(None)
+                        }
+                        _ => Fact::Unknown,
+                    };
+                    set(&mut state, reg::RSP, rsp);
+                }
+                Eff::Pop { dst } => {
+                    // `dst := [rsp]; rsp += 8` (a `pop rsp` keeps the loaded value).
+                    let (f, rsp) = match fact(&state, reg::RSP) {
+                        Fact::Stack(Some(o)) => (state.slot_get(o), Fact::Stack(Some(o + 8))),
+                        Fact::Stack(None) => (Fact::Unknown, Fact::Stack(None)),
+                        _ => (Fact::Unknown, Fact::Unknown),
+                    };
+                    set(&mut state, reg::RSP, rsp);
+                    match dst {
+                        Some(r) => set(&mut state, r, f),
+                        None => state.clear_slots(), // `pop [mem]`: a frame store, address after the pop
+                    }
+                }
                 Eff::StoreReg { .. } | Eff::WrReg | Eff::WrRm | Eff::Wr(_) | Eff::NoGp => {}
             }
-            // Clobber every GP register this instruction writes that the semantic above didn't set,
-            // and drop them from the confinable set (their value changed).
+            if matches!(d.kind, Kind::DirectCall | Kind::IndirectCall) {
+                // A call returns with the clobbered registers and the flags unknown (below). The callee
+                // writes under the return address and, under Tail CC, pops its stack arguments, so
+                // neither rsp's offset nor any slot survives the call until #2603 PR 2 supplies each
+                // callee's stack effect.
+                state.clear_slots();
+                let rsp = match fact(&state, reg::RSP) {
+                    Fact::Stack(_) => Fact::Stack(None),
+                    _ => Fact::Unknown,
+                };
+                set(&mut state, reg::RSP, rsp);
+            }
             for r in 0..16u8 {
-                if w & bit(r) != 0 {
-                    if !matches!(
-                        d.eff,
-                        Eff::MovImm { dst, .. }
-                            | Eff::AluImm { dst, .. }
-                            | Eff::Cmov { dst }
-                            | Eff::Lea { dst }
-                            | Eff::LoadReg { dst }
-                            if dst == r
-                    ) {
-                        state.regs[r as usize] = Fact::Unknown;
-                    }
-                    confinable &= !bit(r);
+                if written & !defined & bit(r) != 0 {
+                    state.regs[r as usize] = Fact::Unknown;
                 }
             }
-            slot_effect(&mut state, &d);
+            // The symbolic values: a 64-bit copy keeps the source's, a constant offset moves it, and
+            // any other write makes a fresh one.
+            let offset = |r: u8, by: Option<i64>| {
+                let s = sym_of(r);
+                by.and_then(|b| s.off.checked_add(b))
+                    .map(|off| Sym { id: s.id, off })
+            };
+            let kept = match d.eff {
+                Eff::MovReg { dst, src } => Some((dst, Some(sym_of(src)))),
+                Eff::Lea { dst, full: true } => match d.operands.mem {
+                    Some(Mem {
+                        base: Some(b),
+                        index: None,
+                        disp,
+                        rip: false,
+                        ..
+                    }) => Some((dst, offset(b, Some(disp)))),
+                    _ => None,
+                },
+                Eff::AluImm { dst, alu, imm } if imm_ok => match alu {
+                    Alu::Add => Some((dst, offset(dst, Some(imm)))),
+                    Alu::Sub => Some((dst, offset(dst, imm.checked_neg()))),
+                    Alu::And => None,
+                },
+                _ => None,
+            };
+            for r in 0..16u8 {
+                if written & bit(r) != 0 {
+                    sym[r as usize] = Sym {
+                        id: next_id,
+                        off: 0,
+                    };
+                    next_id += 1;
+                }
+            }
+            if let Some((dst, Some(s))) = kept {
+                sym[dst as usize & 15] = s;
+            }
+            if !matches!(d.eff, Eff::Cmp { .. }) && !d.keeps_flags {
+                flags = None;
+            }
         }
         state
     }
 
-    /// The fact a GP load `mov dst, [mem]` restores: the spill slot's fact when `mem` is a plain
-    /// `[rsp/rbp + disp]`, else `Unknown`.
-    fn load_fact(state: &State, ops: &Operands) -> Fact {
-        match ops.mem {
-            Some(m) if m.index.is_none() && matches!(m.base, Some(reg::RSP | reg::RBP)) => {
-                state.slot_get(m.base.unwrap(), m.disp)
-            }
-            _ => Fact::Unknown,
+    /// Where an explicit memory operand points in the stack frame: `Some(Some(off))` for a plain
+    /// `[s + disp]` through a stack pointer `s` at a known entry-relative offset, `Some(None)` for any
+    /// other access the frame might hold (a stack pointer at an unknown offset, or indexed by one),
+    /// `None` for an access that cannot reach the stack.
+    fn frame_addr(state: &State, m: &Mem) -> Option<Option<i64>> {
+        if m.rip {
+            return None;
+        }
+        let fact = |r: Option<u8>| r.map(|x| state.regs[x as usize & 15]);
+        match (fact(m.base), fact(m.index)) {
+            (Some(Fact::Stack(Some(off))), None) => Some(off.checked_add(m.disp)),
+            (Some(Fact::Stack(_)), _) | (_, Some(Fact::Stack(_))) => Some(None),
+            _ => None,
         }
     }
 
-    /// Update the tracked spill slots for one instruction's memory operand. A plain-`[rsp/rbp+disp]`
-    /// store records the slot; any **other** write to the stack frame (an RMW, a store of an
-    /// immediate, an SSE store, an indexed or lea'd-pointer frame write — recognized conservatively,
-    /// since this may also fire on a frame *read*) clears every slot. A memory operand based
-    /// anywhere but the frame cannot alias a slot (a write through a wild base is itself flagged by
-    /// the base-provenance policy), so it leaves the slots alone.
+    /// Whether an instruction writes its explicit memory operand. Only the forms known to just read
+    /// it say no; every other form — each SSE/AVX one among them — is taken to write it, which can
+    /// only forget slots.
+    fn writes_memory(d: &Decoded) -> bool {
+        !matches!(
+            d.eff,
+            Eff::LoadReg { .. }
+                | Eff::WrReg
+                | Eff::Cmp { .. }
+                | Eff::Cmov { .. }
+                | Eff::Lea { .. }
+                | Eff::Push { .. }
+        ) && !matches!(d.kind, Kind::IndirectCall | Kind::IndirectJmp)
+    }
+
+    /// An explicit memory operand's effect on the tracked slots (#2603 holes 5–6): a 64-bit store to
+    /// a known frame offset records the stored register's fact there, after forgetting every slot it
+    /// overlaps; any other write to the frame only forgets — the slots it may overlap, or all of them
+    /// when its offset is unknown. An access that cannot reach the stack leaves the slots alone (one
+    /// through a wild base is itself a policy finding).
     fn slot_effect(state: &mut State, d: &Decoded) {
         let Some(m) = d.operands.mem else { return };
-        let on_frame = matches!(m.base, Some(reg::RSP | reg::RBP))
-            || matches!(
-                m.base.map(|b| state.regs[b as usize & 15]),
-                Some(Fact::StackPtr)
-            );
-        if !on_frame {
+        if !writes_memory(d) {
             return;
         }
-        let plain = m.index.is_none() && matches!(m.base, Some(reg::RSP | reg::RBP));
-        match d.eff {
-            Eff::StoreReg { src } if plain => {
-                state.slot_set(m.base.unwrap(), m.disp, state.regs[src as usize & 15]);
-            }
-            Eff::LoadReg { .. } if plain => {} // a reload; the slot is unchanged
-            _ => state.clear_slots(),
-        }
+        let Some(at) = frame_addr(state, &m) else {
+            return;
+        };
+        let Some(off) = at else {
+            state.clear_slots();
+            return;
+        };
+        let (w, fact) = match d.eff {
+            Eff::StoreReg { src, w } => (
+                i64::from(w),
+                if w == 8 {
+                    state.regs[src as usize & 15]
+                } else {
+                    Fact::Unknown
+                },
+            ),
+            _ => (MAX_ACCESS_WIDTH as i64, Fact::Unknown),
+        };
+        state.clobber(off, off.saturating_add(w));
+        state.slot_set(off, fact);
     }
 
-    /// The GP register write mask of an instruction, from its effect and operands. A sound superset
-    /// of what the instruction actually writes (clearing extra facts is safe; missing a real write
-    /// is not) — cross-checked against iced-x86 in the tests.
-    fn writes_of(eff: Eff, ops: &Operands) -> u16 {
-        match eff {
+    /// The GP registers an instruction writes: its effect's destinations plus a call's clobbers and
+    /// the `rsp` that `push`/`pop`/`call`/`ret` move. A sound superset of what it actually writes
+    /// (clearing extra facts is safe; missing a real write is not) — cross-checked against iced-x86 in
+    /// the tests.
+    fn writes_of(d: &Decoded) -> u16 {
+        let eff = match d.eff {
             Eff::NoGp | Eff::Cmp { .. } | Eff::StoreReg { .. } => 0,
             Eff::MovImm { dst, .. }
             | Eff::MovReg { dst, .. }
             | Eff::LoadReg { dst }
-            | Eff::Lea { dst }
+            | Eff::Lea { dst, .. }
             | Eff::AluImm { dst, .. }
-            | Eff::Cmov { dst } => bit(dst),
-            Eff::WrReg => ops.reg.map_or(0, bit),
-            Eff::WrRm => ops.rm_reg.map_or(0, bit),
+            | Eff::Cmov { dst, .. } => bit(dst),
+            Eff::Push { .. } => bit(reg::RSP),
+            Eff::Pop { dst } => bit(reg::RSP) | dst.map_or(0, bit),
+            Eff::WrReg => d.operands.reg.map_or(0, bit),
+            Eff::WrRm => d.operands.rm_reg.map_or(0, bit),
             Eff::Wr(m) => m,
-        }
+        };
+        let implicit = match d.kind {
+            Kind::DirectCall | Kind::IndirectCall => CALL_CLOBBERS | bit(reg::RSP),
+            Kind::Ret => bit(reg::RSP),
+            _ => 0,
+        };
+        eff | implicit
     }
 
-    /// `and`/`add`/`sub r, imm` on a tracked value. `and` with a low-bits mask bounds the result;
-    /// otherwise the value stops being tracked (bound/const arithmetic beyond this is deferred).
+    /// A 64-bit `and`/`add`/`sub r, imm` on a tracked value. `and` with a low-bits mask bounds the
+    /// result; `add`/`sub` move a constant or a stack pointer (the prologue's `sub rsp, frame`).
+    /// Anything else stops being tracked.
     fn alu_fact(prev: Fact, alu: Alu, imm: i64) -> Fact {
         match (alu, prev) {
             (Alu::And, _) if imm >= 0 && (imm as u64).wrapping_add(1).is_power_of_two() => {
@@ -701,6 +1199,8 @@ pub(crate) mod x86 {
             }
             (Alu::Add, Fact::Const(c)) => Fact::Const(c.wrapping_add(imm)),
             (Alu::Sub, Fact::Const(c)) => Fact::Const(c.wrapping_sub(imm)),
+            (Alu::Add, Fact::Stack(off)) => Fact::Stack(off.and_then(|o| o.checked_add(imm))),
+            (Alu::Sub, Fact::Stack(off)) => Fact::Stack(off.and_then(|o| o.checked_sub(imm))),
             _ => Fact::Unknown,
         }
     }
@@ -709,7 +1209,7 @@ pub(crate) mod x86 {
     /// their abstract facts and flag an access that does not land in a known region. For a window
     /// access, re-prove the physical offset from `mem_base` stays within the reservation
     /// `[0, guard_offset + page)` — everything there is mapped or `PROT_NONE` guard, so it can fault
-    /// but never escape — using the module `layout` hint (when present) for the elided/bounded cases.
+    /// but never escape. The stack's, vmctx's, the fn-table's and rodata's extents are #2603 PR 3.
     fn mem_policy(
         pos: usize,
         d: &Decoded,
@@ -717,6 +1217,13 @@ pub(crate) mod x86 {
         layout: Option<WindowLayout>,
         findings: &mut Vec<Finding>,
     ) {
+        let mut flag = |why: String| findings.push(Finding { at: pos, why });
+        // `push`/`pop`/`call`/`ret` read or write the stack at `rsp` implicitly.
+        let implicit_stack = matches!(d.eff, Eff::Push { .. } | Eff::Pop { .. })
+            || matches!(d.kind, Kind::DirectCall | Kind::IndirectCall | Kind::Ret);
+        if implicit_stack && !matches!(state.regs[reg::RSP as usize], Fact::Stack(_)) {
+            flag("stack access through an rsp that is not a stack pointer".into());
+        }
         let Some(mem) = d.operands.mem else { return };
         // `lea` computes an address but does not dereference it.
         if matches!(d.eff, Eff::Lea { .. }) {
@@ -728,15 +1235,20 @@ pub(crate) mod x86 {
         }
         let fact = |r: Option<u8>| r.map(|x| state.regs[x as usize & 15]);
         let (base_f, index_f) = (fact(mem.base), fact(mem.index));
-        let mut flag = |why: String| findings.push(Finding { at: pos, why });
 
-        // Stack: rsp/rbp-relative (frame-bound refinement is deferred).
-        if matches!(mem.base, Some(reg::RSP | reg::RBP)) {
+        // Stack: based on a stack pointer.
+        if matches!(base_f, Some(Fact::Stack(_))) {
             return;
         }
         // Window: base (or index) is `mem_base`; the other operand is the index/displacement.
         let is_membase = |f: Option<Fact>| matches!(f, Some(Fact::MemBase));
         if is_membase(base_f) || is_membase(index_f) {
+            // A module with no window has no window access to re-prove: one is a violation, never
+            // something to take the code's own word for.
+            let Some(l) = layout else {
+                flag("window access in a module with no window".into());
+                return;
+            };
             let offset_f = if is_membase(base_f) { index_f } else { base_f };
             let page = crate::mem::trailing_guard() as u64;
             let scale = u64::from(mem.scale);
@@ -756,7 +1268,9 @@ pub(crate) mod x86 {
             // the D63 `cmov` redirected to. `None` index_max ⇒ not provably bounded.
             let (index_max, confined_guard): (Option<u64>, Option<u64>) = match offset_f {
                 None => (Some(0), None), // [mem_base + disp]
-                Some(Fact::Confined { guard }) => (Some(guard), Some(guard)),
+                Some(Fact::Confined { bound, guard }) => {
+                    (Some(bound.saturating_sub(1).max(guard)), Some(guard))
+                }
                 Some(Fact::Bounded(ub)) => (Some(ub.saturating_sub(1).saturating_mul(scale)), None),
                 Some(Fact::Const(c)) if c >= 0 => (Some((c as u64).saturating_mul(scale)), None),
                 Some(_) => (None, None),
@@ -770,7 +1284,7 @@ pub(crate) mod x86 {
                 return;
             };
             // A confined index is a byte offset (scale 1), and the guard it redirects to must be the
-            // module's real guard offset (when the layout hint is present — #2603).
+            // module's real guard offset (#2603).
             if let Some(guard) = confined_guard {
                 if mem.scale != 1 {
                     flag(format!(
@@ -779,7 +1293,7 @@ pub(crate) mod x86 {
                     ));
                     return;
                 }
-                if let Some(l) = layout.filter(|l| l.guard_offset != guard) {
+                if guard != l.guard_offset {
                     flag(format!(
                         "confined index redirects to +0x{guard:x}, not the module guard offset \
                          +0x{:x}",
@@ -789,14 +1303,8 @@ pub(crate) mod x86 {
                 }
             }
             // Re-prove: the largest physical offset the access can reach stays within the window
-            // reservation. The reservation top is `guard_offset + page`; a confined index supplies
-            // its own guard (cross-checked above), the elided/bounded cases need the layout hint —
-            // without it (a memoryless module) there is no reservation to prove against, so defer.
-            let reach = match (confined_guard, layout) {
-                (Some(guard), _) => guard.saturating_add(page),
-                (None, Some(l)) => l.guard_offset.saturating_add(page),
-                (None, None) => return,
-            };
+            // reservation, whose top is `guard_offset + page`.
+            let reach = l.guard_offset.saturating_add(page);
             let top = imax.saturating_add(disp).saturating_add(MAX_ACCESS_WIDTH);
             if top > reach {
                 flag(format!(
@@ -805,14 +1313,10 @@ pub(crate) mod x86 {
             }
             return;
         }
-        // Other known bases: the fn-table (call.dyn dispatch; its bounds are a later slice), vmctx
-        // (the trap-out cell and per-instance fields), a lea'd stack pointer, and a lea'd pointer
-        // into the function's own rodata / jump tables (the br_table dispatch's table read; its
-        // index-bounds re-proof is the control-flow-integrity slice).
-        if matches!(
-            base_f,
-            Some(Fact::FnTableBase | Fact::Vmctx | Fact::StackPtr | Fact::RipRel)
-        ) {
+        // Other known bases: the fn-table (call.dyn dispatch), vmctx (the trap-out cell and
+        // per-instance fields), and a lea'd pointer into the function's own rodata / jump tables (the
+        // br_table dispatch's table read). Their extents are #2603 PR 3.
+        if matches!(base_f, Some(Fact::FnTableBase | Fact::Vmctx | Fact::RipRel)) {
             return;
         }
         // Anything else: an access through a base of unknown or non-pointer provenance.
@@ -884,29 +1388,34 @@ pub(crate) mod x86 {
     /// write is caught). `dst`/`src`/`reg` are GP register numbers (0..15).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum Eff {
-        /// Writes no GP register the state tracks: flags-only (`cmp`/`test`), control flow, SSE/vector
-        /// ops (their operands are XMM, not GP), fences, nops, pushes/pops of the frame.
+        /// Writes no GP register the state tracks: flags-only (`test`, a narrower `cmp`), control
+        /// flow, SSE/vector ops (their operands are XMM, not GP), fences, nops.
         NoGp,
-        /// `mov dst, imm` — `dst := Const(imm)`.
+        /// A 32- or 64-bit `mov dst, imm` — `dst := Const(imm)`, `imm` the value the full register
+        /// ends up holding (a 32-bit write zero-extends).
         MovImm { dst: u8, imm: i64 },
-        /// `mov dst, src` between GP registers — `dst := fact(src)`.
+        /// A 64-bit `mov dst, src` between GP registers — `dst := fact(src)`.
         MovReg { dst: u8, src: u8 },
-        /// A GP load `mov dst, [mem]` (mem in `operands.mem`) — `dst := loaded value` (or the spill
-        /// slot's fact, when `mem` is a tracked `[rsp/rbp + disp]`).
+        /// A 64-bit GP load `mov dst, [mem]` (mem in `operands.mem`) — `dst := loaded value`, or the
+        /// spill slot's fact when `mem` is a tracked frame slot. A narrower load is a `WrReg`.
         LoadReg { dst: u8 },
-        /// A GP store `mov [mem], src` (mem in `operands.mem`) — records `src`'s fact in the spill
-        /// slot when `mem` is a tracked `[rsp/rbp + disp]`. Writes no GP register.
-        StoreReg { src: u8 },
-        /// `lea dst, [mem]` — computes an address into `dst` (does **not** dereference).
-        Lea { dst: u8 },
-        /// `add`/`sub`/`and dst, imm`, `dst` the r/m register — `dst := alu(fact(dst), imm)`.
+        /// A GP store `mov [mem], src` of `w` bytes (mem in `operands.mem`). A 64-bit store records
+        /// `src`'s fact in the spill slot it writes. Writes no GP register.
+        StoreReg { src: u8, w: u8 },
+        /// `lea dst, [mem]` — computes an address into `dst` (does **not** dereference). Only a 64-bit
+        /// one (`full`) yields a pointer; a narrower one truncates, so `dst` holds an unknown value.
+        Lea { dst: u8, full: bool },
+        /// A 64-bit `add`/`sub`/`and dst, imm`, `dst` the r/m register — `dst := alu(fact(dst), imm)`.
         AluImm { dst: u8, alu: Alu, imm: i64 },
-        /// The modeled compare before a confine `cmov`: `cmp reg, bound` (bound an immediate, or
-        /// `None` for a register/memory right-hand side). Writes only flags.
-        Cmp { reg: Option<u8>, bound: Option<u64> },
-        /// `cmovcc dst, src` — `dst := Confined` when `src` is the guard const and `dst` was just
-        /// compared; else `dst := Unknown`. (Conditional, so always a write of `dst`.)
-        Cmov { dst: u8 },
+        /// A 32- or 64-bit `cmp lhs, rhs` (it computes `lhs − rhs`). Writes only the flags.
+        Cmp { w: u8, lhs: Opnd, rhs: Opnd },
+        /// A 32- or 64-bit `cmovcc dst, src` (`src` in `operands`), `cc` its condition (`0F 40+cc`).
+        /// Conditional, so always a write of `dst`.
+        Cmov { dst: u8, cc: u8, w: u8 },
+        /// `push src` — `[rsp − 8] := src; rsp −= 8` (`None` for an immediate or memory source).
+        Push { src: Option<u8> },
+        /// `pop dst` — `dst := [rsp]; rsp += 8` (`None` for `pop [mem]`).
+        Pop { dst: Option<u8> },
         /// Writes `operands.reg` (a GP op whose destination is its reg field: `op reg, r/m`).
         WrReg,
         /// Writes `operands.rm_reg` when the r/m is a register (`op r/m, reg`); the memory form writes
@@ -916,14 +1425,36 @@ pub(crate) mod x86 {
         Wr(u16),
     }
 
-    /// One decoded instruction: its length, its control-flow classification, its operands, and its
-    /// data-flow effect ([`Eff`], consumed by the #2535 abstract interpreter).
+    /// A `cmp` operand: a GP register, an immediate (sign-extended to 64 bits), or the memory
+    /// operand in `operands.mem`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Opnd {
+        Reg(u8),
+        Imm(u64),
+        Mem,
+    }
+
+    /// One decoded instruction: its length, its control-flow classification, its operands, its
+    /// data-flow effect ([`Eff`], consumed by the #2535 abstract interpreter), the length of the
+    /// immediate it ends with (a relocation may patch it), and whether it leaves the flags as they
+    /// were. That is `false` unless its decode arm says so, so a `cmp`'s flags never outlive an
+    /// instruction this decoder doesn't know to keep them (#2603).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) struct Decoded {
         pub len: usize,
         pub kind: Kind,
         pub operands: Operands,
         pub eff: Eff,
+        pub imm_len: u8,
+        pub keeps_flags: bool,
+    }
+
+    impl Decoded {
+        /// Mark an instruction that leaves the flags unchanged (cross-checked against iced-x86).
+        fn keep_flags(mut self) -> Decoded {
+            self.keeps_flags = true;
+            self
+        }
     }
 
     const NO_OPERANDS: Operands = Operands {
@@ -937,6 +1468,8 @@ pub(crate) mod x86 {
         kind: Kind::Undecodable,
         operands: NO_OPERANDS,
         eff: Eff::NoGp,
+        imm_len: 0,
+        keeps_flags: false,
     };
 
     /// Decode the instruction at `bytes[start..]`. Returns [`UNDECODABLE`] (length 0) for an encoding
@@ -991,49 +1524,72 @@ pub(crate) mod x86 {
         rex_b: bool, // ModRM.rm / SIB.base extension
     }
 
+    impl Pfx {
+        /// The operand size of a non-byte instruction: 8 under REX.W, else 2 under `0x66`, else 4.
+        fn osz(&self) -> u8 {
+            if self.rex_w {
+                8
+            } else if self.op66 {
+                2
+            } else {
+                4
+            }
+        }
+    }
+
     fn decode_inner(c: &mut Cursor, start: usize) -> Option<Decoded> {
         let mut p = Pfx::default();
+        // fs/gs add a segment base and `0x67` truncates the address to 32 bits: either makes a memory
+        // operand mean something other than `[base + index*scale + disp]`, the address the policy
+        // checks, and Cranelift emits neither for guest code (#2603 hole 8).
+        let mut addressing = None;
         // Legacy prefixes (any order/number in valid code; Cranelift emits at most a couple).
         loop {
             match c.peek()? {
-                0x66 => {
-                    p.op66 = true;
-                    c.pos += 1;
-                }
-                // rep/repne (also SSE mandatory prefixes), address-size, lock, segment overrides:
-                // consumed; none change our length model for the 64-bit encodings Cranelift emits.
-                0xF2 | 0xF3 | 0x67 | 0xF0 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65 => {
-                    c.pos += 1;
-                }
+                0x66 => p.op66 = true,
+                0x64 | 0x65 => addressing = Some("fs/gs segment override"),
+                0x67 => addressing = Some("address-size override"),
+                // rep/repne (also SSE mandatory prefixes), lock, and the cs/ss/ds/es overrides (a
+                // zero base in 64-bit mode): consumed; none changes the length or the address.
+                0xF2 | 0xF3 | 0xF0 | 0x2E | 0x36 | 0x3E | 0x26 => {}
                 _ => break,
             }
-        }
-        // VEX / EVEX (AVX): their prefix encodes the opcode map + ModRM-implied operands.
-        match c.peek()? {
-            0xC5 => return decode_vex2(c, start),
-            0xC4 => return decode_vex3(c, start),
-            0x62 => return decode_evex(c, start),
-            _ => {}
-        }
-        // REX (0x40..=0x4F) — the last prefix before the opcode in 64-bit mode.
-        if let Some(b @ 0x40..=0x4F) = c.peek() {
-            p.rex_w = b & 0x08 != 0;
-            p.rex_r = b & 0x04 != 0;
-            p.rex_x = b & 0x02 != 0;
-            p.rex_b = b & 0x01 != 0;
             c.pos += 1;
         }
-        let op = c.next()?;
-        if op == 0x0F {
-            let op2 = c.next()?;
-            match op2 {
-                0x38 => decode_0f38(c, start, &p),
-                0x3A => decode_0f3a(c, start, &p),
-                _ => decode_0f(c, start, &p, op2),
+        let d = match c.peek()? {
+            // VEX / EVEX (AVX): their prefix encodes the opcode map + ModRM-implied operands.
+            0xC5 => decode_vex2(c, start),
+            0xC4 => decode_vex3(c, start),
+            0x62 => decode_evex(c, start),
+            _ => {
+                // REX (0x40..=0x4F) — the last prefix before the opcode in 64-bit mode.
+                if let Some(b @ 0x40..=0x4F) = c.peek() {
+                    p.rex_w = b & 0x08 != 0;
+                    p.rex_r = b & 0x04 != 0;
+                    p.rex_x = b & 0x02 != 0;
+                    p.rex_b = b & 0x01 != 0;
+                    c.pos += 1;
+                }
+                let op = c.next()?;
+                if op == 0x0F {
+                    let op2 = c.next()?;
+                    match op2 {
+                        0x38 => decode_0f38(c, start, &p),
+                        0x3A => decode_0f3a(c, start, &p),
+                        _ => decode_0f(c, start, &p, op2),
+                    }
+                } else {
+                    decode_1byte(c, start, &p, op)
+                }
             }
-        } else {
-            decode_1byte(c, start, &p, op)
-        }
+        }?;
+        Some(match addressing {
+            Some(why) => Decoded {
+                kind: Kind::Forbidden(why),
+                ..d
+            },
+            None => d,
+        })
     }
 
     /// A memory operand `[base + index*scale + disp]`, or RIP-relative. Register numbers are the full
@@ -1059,8 +1615,9 @@ pub(crate) mod x86 {
 
     /// How the decoder tells [`resolve_eff`] what an instruction does, before the operands and
     /// immediate are read. `resolve_eff` turns it into the final [`Eff`] using the parsed operands,
-    /// the operand width (only 64-bit operations preserve a pointer/bound fact — a narrower write
-    /// truncates or zero-extends, so it clobbers), and the immediate.
+    /// the operand size (only a 64-bit operation preserves a pointer or bound fact — a narrower write
+    /// truncates, zero-extends or merges, so it clobbers; `cmp`/`cmov` are modeled at 32 bits too),
+    /// and the immediate.
     #[derive(Clone, Copy)]
     enum EffIntent {
         /// Writes no GP register (flags-only, control flow, SSE/vector, fences, nops).
@@ -1080,20 +1637,25 @@ pub(crate) mod x86 {
         MovImmToRm,
         /// `lea reg, [mem]`.
         Lea,
-        /// `cmp reg, r/m` — the compared value is `reg`.
+        /// `cmp reg, r/m` (`3B`).
         CmpRegRm,
-        /// `cmp r/m, reg` — the compared value is the r/m register.
+        /// `cmp r/m, reg` (`39`).
         CmpRmReg,
-        /// `0x80/0x81/0x83 /digit` — the ModRM.reg field (`digit`) picks add/or/.../cmp with `imm`.
+        /// `0x81/0x83 /digit` — the ModRM.reg field (`digit`) picks add/or/.../cmp with `imm`.
         AluImmGroup(u8),
+        /// `0x80/0x82 /digit` — the byte forms, 8-bit whatever the prefixes say (REX.W doesn't widen
+        /// a byte operation), so never a tracked value.
+        ByteAluImm,
         /// `0xF6/0xF7 /digit` — test (writes flags), not/neg (writes r/m), or mul/div (writes rax,rdx).
         Group3(u8),
-        /// `0xFF /digit` — inc/dec (writes r/m), or call/jmp/push (no tracked GP write).
+        /// `0xFF /digit` — inc/dec (writes r/m), push r/m, or call/jmp (no GP write of their own).
         Group5(u8),
-        /// `cmovcc reg, r/m`.
-        Cmov,
+        /// `cmovcc reg, r/m`, `cc` its condition.
+        Cmov(u8),
         /// `xchg reg, r/m` — writes both.
         XchgRegRm,
+        /// `pop r/m` (`8F /0`).
+        PopRm,
     }
 
     /// A one-register GP write mask bit.
@@ -1101,57 +1663,81 @@ pub(crate) mod x86 {
         1u16 << (r & 15)
     }
 
-    /// Turn an [`EffIntent`] into the final [`Eff`] now that the operands, operand width (`w64`), and
-    /// immediate are known. The guiding rule for soundness: a fact (`MemBase`, `Confined`, …) is a
-    /// property of a full 64-bit register value, so only a **64-bit** operation may carry one; a
-    /// narrower write truncates/zero-extends and therefore *clobbers* the destination. (`MovImm` is
-    /// the exception — a narrower `mov` to a const is still a known, if zero-extended, value.)
-    fn resolve_eff(intent: EffIntent, ops: &Operands, w64: bool, immv: i64) -> Eff {
+    /// Turn an [`EffIntent`] into the final [`Eff`] now that the operands, the operand size `osz`
+    /// (8/4/2 bytes), and the immediate are known. The guiding rule for soundness: a fact (`MemBase`,
+    /// `Confined`, …) is a property of a full 64-bit register value, so only a **64-bit** operation
+    /// may carry one; a narrower write truncates, zero-extends or merges, and therefore *clobbers* the
+    /// destination. Two exceptions, each exact: a 32-bit `mov r, imm` zero-extends to a known value,
+    /// and a 32-bit `cmp`/`cmov` pair confines what its zero-extending `cmov` selects (#2603).
+    fn resolve_eff(intent: EffIntent, ops: &Operands, osz: u8, immv: i64) -> Eff {
         use EffIntent as I;
         let (reg, rm, mem) = (ops.reg, ops.rm_reg, ops.mem.is_some());
+        let rm_opnd = if mem {
+            Some(Opnd::Mem)
+        } else {
+            rm.map(Opnd::Reg)
+        };
+        let modeled = matches!(osz, 4 | 8); // the widths a `cmp`/`cmov` is modeled at
         match intent {
             I::NoGp => Eff::NoGp,
             I::WrReg => Eff::WrReg,
             I::WrRm => Eff::WrRm,
             I::Wr(m) => Eff::Wr(m),
-            I::Lea => reg.map_or(Eff::NoGp, |dst| Eff::Lea { dst }),
+            // A narrower `lea` truncates the address, so it is no pointer (#2603 hole 7).
+            I::Lea => reg.map_or(Eff::NoGp, |dst| Eff::Lea {
+                dst,
+                full: osz == 8,
+            }),
+            // Only a full-width load can restore a tracked fact (#2603 hole 5).
             I::MovToReg => match (reg, rm, mem) {
-                (Some(dst), _, true) => Eff::LoadReg { dst },
-                (Some(dst), Some(src), false) if w64 => Eff::MovReg { dst, src },
-                (Some(_), _, false) => Eff::WrReg, // narrower reg-reg: truncates, so clobber
+                (Some(dst), _, true) if osz == 8 => Eff::LoadReg { dst },
+                (Some(dst), Some(src), false) if osz == 8 => Eff::MovReg { dst, src },
+                (Some(_), ..) => Eff::WrReg, // narrower: truncates or zero-extends, so clobber
                 _ => Eff::NoGp,
             },
             I::MovToRm => match (reg, rm, mem) {
-                (Some(src), _, true) => Eff::StoreReg { src }, // store to memory (slot-tracked)
-                (_, _, true) => Eff::NoGp,
-                (Some(src), Some(dst), false) if w64 => Eff::MovReg { dst, src },
+                (Some(src), _, true) => Eff::StoreReg { src, w: osz },
+                (Some(src), Some(dst), false) if osz == 8 => Eff::MovReg { dst, src },
                 (_, Some(_), false) => Eff::WrRm,
                 _ => Eff::NoGp,
             },
+            // A 16-bit write keeps the upper 48 bits, so its result is not known (#2603 hole 7).
             I::MovImmToRm => match (rm, mem) {
                 (_, true) => Eff::NoGp, // store of an immediate
-                (Some(dst), false) => Eff::MovImm {
+                (Some(dst), false) if osz == 8 => Eff::MovImm { dst, imm: immv },
+                (Some(dst), false) if osz == 4 => Eff::MovImm {
                     dst,
-                    imm: if w64 { immv } else { immv & 0xFFFF_FFFF },
+                    imm: immv & 0xFFFF_FFFF,
+                },
+                (Some(_), false) => Eff::WrRm,
+                _ => Eff::NoGp,
+            },
+            I::CmpRegRm => match (reg, rm_opnd) {
+                (Some(r), Some(rhs)) if modeled => Eff::Cmp {
+                    w: osz,
+                    lhs: Opnd::Reg(r),
+                    rhs,
                 },
                 _ => Eff::NoGp,
             },
-            I::CmpRegRm if w64 => Eff::Cmp { reg, bound: None },
-            I::CmpRmReg if w64 => Eff::Cmp {
-                reg: rm,
-                bound: None,
+            I::CmpRmReg => match (rm_opnd, reg) {
+                (Some(lhs), Some(r)) if modeled => Eff::Cmp {
+                    w: osz,
+                    lhs,
+                    rhs: Opnd::Reg(r),
+                },
+                _ => Eff::NoGp,
             },
-            I::CmpRegRm | I::CmpRmReg => Eff::NoGp,
             I::AluImmGroup(digit) => {
                 if digit == 7 {
                     // cmp r/m, imm
-                    return if w64 {
-                        Eff::Cmp {
-                            reg: rm,
-                            bound: Some(immv as u64),
-                        }
-                    } else {
-                        Eff::NoGp
+                    return match rm_opnd {
+                        Some(lhs) if modeled => Eff::Cmp {
+                            w: osz,
+                            lhs,
+                            rhs: Opnd::Imm(immv as u64),
+                        },
+                        _ => Eff::NoGp,
                     };
                 }
                 let alu = match digit {
@@ -1160,9 +1746,9 @@ pub(crate) mod x86 {
                     5 => Some(Alu::Sub),
                     _ => None, // or/adc/sbb/xor — not modeled for bounds
                 };
-                match (mem, w64, alu, rm) {
+                match (mem, osz, alu, rm) {
                     (true, ..) => Eff::NoGp, // RMW on memory (access checked); no GP write
-                    (false, true, Some(alu), Some(dst)) => Eff::AluImm {
+                    (false, 8, Some(alu), Some(dst)) => Eff::AluImm {
                         dst,
                         alu,
                         imm: immv,
@@ -1170,6 +1756,8 @@ pub(crate) mod x86 {
                     (false, ..) => Eff::WrRm, // narrower, or or/adc/sbb/xor: clobber r/m
                 }
             }
+            I::ByteAluImm if mem => Eff::NoGp,
+            I::ByteAluImm => Eff::WrRm,
             I::Group3(digit) => match digit {
                 0 | 1 => Eff::NoGp,                // test r/m, imm — flags only
                 4..=7 => Eff::Wr(bit(0) | bit(2)), // mul/imul/div/idiv → rax, rdx
@@ -1178,14 +1766,20 @@ pub(crate) mod x86 {
             },
             I::Group5(digit) => match digit {
                 0 | 1 if !mem => Eff::WrRm, // inc/dec r/m register
-                _ => Eff::NoGp,             // inc/dec [mem]; call/jmp/push (kind already set)
+                6 => Eff::Push {
+                    src: rm.filter(|_| !mem),
+                }, // push r/m
+                _ => Eff::NoGp,             // inc/dec [mem]; call/jmp (kind already set)
             },
-            I::Cmov => match reg {
-                Some(dst) if w64 => Eff::Cmov { dst },
-                Some(_) => Eff::WrReg, // narrower cmov: clobber
+            I::Cmov(cc) => match reg {
+                Some(dst) if modeled => Eff::Cmov { dst, cc, w: osz },
+                Some(_) => Eff::WrReg, // 16-bit cmov: merges, so clobber
                 None => Eff::NoGp,
             },
             I::XchgRegRm => Eff::Wr(reg.map_or(0, bit) | rm.map_or(0, bit)),
+            I::PopRm => Eff::Pop {
+                dst: rm.filter(|_| !mem),
+            },
         }
     }
 
@@ -1202,12 +1796,14 @@ pub(crate) mod x86 {
     ) -> Option<Decoded> {
         let operands = read_modrm(c, p)?;
         let immv = read_imm(c, imm_bytes)?;
-        let eff = resolve_eff(intent, &operands, p.rex_w, immv);
+        let eff = resolve_eff(intent, &operands, p.osz(), immv);
         Some(Decoded {
             len: c.pos - start,
             kind,
             operands,
             eff,
+            imm_len: imm_bytes as u8,
+            keeps_flags: false,
         })
     }
 
@@ -1329,6 +1925,15 @@ pub(crate) mod x86 {
             0xCB | 0xCA => return Some(one(c, start, Forbidden("far ret"), Eff::NoGp)),
             0xEA => return Some(one(c, start, Forbidden("far jmp"), Eff::NoGp)),
             0x9A => return Some(one(c, start, Forbidden("far call"), Eff::NoGp)),
+            // `xlat` reads `[rbx + al]`, a memory operand the ModRM doesn't name (#2603 hole 9).
+            0xD7 => {
+                return Some(one(
+                    c,
+                    start,
+                    Forbidden("xlat (implicit memory operand)"),
+                    Eff::NoGp,
+                ))
+            }
             // --- control transfers ---
             0xE9 => {
                 let rel = c.rel(4)?; // jmp rel32
@@ -1345,6 +1950,8 @@ pub(crate) mod x86 {
                     kind: DirectCall,
                     operands: NO_OPERANDS,
                     eff: Eff::NoGp,
+                    imm_len: 0,
+                    keeps_flags: false,
                 });
             }
             0x70..=0x7F => {
@@ -1362,7 +1969,9 @@ pub(crate) mod x86 {
             | 0x20..=0x23 | 0x28..=0x2B | 0x30..=0x33 | 0x38..=0x3B)
         {
             let is_cmp = (op >> 3) & 0x07 == 0x07;
+            let byte = op & 0x01 == 0; // the r/m8, r8 / r8, r/m8 columns: 8-bit whatever REX.W says
             let intent = match (is_cmp, op & 0x07) {
+                (true, _) if byte => E::NoGp, // an 8-bit compare: flags only, not modeled
                 (true, 0 | 1) => E::CmpRmReg,
                 (true, _) => E::CmpRegRm,
                 (false, 0 | 1) => E::WrRm,
@@ -1373,40 +1982,55 @@ pub(crate) mod x86 {
         match op {
             // ModRM, no immediate.
             0x84 | 0x85 => finish_modrm(c, start, p, 0, Normal, E::NoGp), // test
-            0x86 | 0x87 => finish_modrm(c, start, p, 0, Normal, E::XchgRegRm), // xchg
-            0x88 => finish_modrm(c, start, p, 0, Normal, E::WrRm),        // mov rm8, r8
-            0x89 => finish_modrm(c, start, p, 0, Normal, E::MovToRm),     // mov rm, r
-            0x8A => finish_modrm(c, start, p, 0, Normal, E::WrReg),       // mov r8, rm8
-            0x8B => finish_modrm(c, start, p, 0, Normal, E::MovToReg),    // mov r, rm
-            0x63 => finish_modrm(c, start, p, 0, Normal, E::WrReg),       // movsxd r64, rm32
-            0x8D => finish_modrm(c, start, p, 0, Normal, E::Lea),
-            0x8F => finish_modrm(c, start, p, 0, Normal, E::WrRm), // pop r/m
+            // The moves, `lea`, `xchg` and `pop` leave the flags (a register allocator's moves may sit
+            // between a `cmp` and the `cmov` that tests it).
+            0x86 | 0x87 => keep(finish_modrm(c, start, p, 0, Normal, E::XchgRegRm)), // xchg
+            0x88 => keep(finish_modrm(c, start, p, 0, Normal, E::WrRm)),             // mov rm8, r8
+            0x89 => keep(finish_modrm(c, start, p, 0, Normal, E::MovToRm)),          // mov rm, r
+            0x8A => keep(finish_modrm(c, start, p, 0, Normal, E::WrReg)),            // mov r8, rm8
+            0x8B => keep(finish_modrm(c, start, p, 0, Normal, E::MovToReg)),         // mov r, rm
+            0x63 => keep(finish_modrm(c, start, p, 0, Normal, E::WrReg)), // movsxd r64, rm32
+            0x8D => keep(finish_modrm(c, start, p, 0, Normal, E::Lea)),
+            0x8F => keep(finish_modrm(c, start, p, 0, Normal, E::PopRm)), // pop r/m
             0xD0..=0xD3 => finish_modrm(c, start, p, 0, Normal, E::WrRm), // shift r/m, 1|cl
-            0xFE => finish_modrm(c, start, p, 0, Normal, E::WrRm), // inc/dec r/m8
+            0xFE => finish_modrm(c, start, p, 0, Normal, E::WrRm),        // inc/dec r/m8
             // ModRM + imm8.
-            0x80 | 0x82 | 0x83 => {
+            0x80 | 0x82 => finish_modrm(c, start, p, 1, Normal, E::ByteAluImm),
+            0x83 => {
                 let digit = (c.peek()? >> 3) & 0x07;
                 finish_modrm(c, start, p, 1, Normal, E::AluImmGroup(digit))
             }
             0x6B => finish_modrm(c, start, p, 1, Normal, E::WrReg), // imul r, r/m, imm8
             0xC0 | 0xC1 => finish_modrm(c, start, p, 1, Normal, E::WrRm), // shift r/m, imm8
-            0xC6 => finish_modrm(c, start, p, 1, Normal, E::WrRm),  // mov r/m8, imm8
+            0xC6 => keep(finish_modrm(c, start, p, 1, Normal, E::WrRm)), // mov r/m8, imm8
             // ModRM + immZ.
             0x81 => {
                 let digit = (c.peek()? >> 3) & 0x07;
                 finish_modrm(c, start, p, imm_z(p), Normal, E::AluImmGroup(digit))
             }
             0x69 => finish_modrm(c, start, p, imm_z(p), Normal, E::WrReg), // imul r, r/m, immZ
-            0xC7 => finish_modrm(c, start, p, imm_z(p), Normal, E::MovImmToRm),
+            0xC7 => keep(finish_modrm(c, start, p, imm_z(p), Normal, E::MovImmToRm)),
             // groups 3/5: immediate (if any) depends on the /reg field — peek at the ModRM.
             0xF6 => group3(c, start, p, 1),
             0xF7 => group3(c, start, p, imm_z(p)),
             0xFF => group5(c, start, p),
-            // pop r — writes the opcode-encoded register.
-            0x58..=0x5F => {
-                let dst = (op & 0x07) | (u8::from(p.rex_b) << 3);
-                Some(one(c, start, Normal, Eff::Wr(bit(dst))))
+            // push r / pop r — the opcode-encoded register.
+            0x50..=0x57 => {
+                let src = Some((op & 0x07) | (u8::from(p.rex_b) << 3));
+                Some(one(c, start, Normal, Eff::Push { src }).keep_flags())
             }
+            0x58..=0x5F => {
+                let dst = Some((op & 0x07) | (u8::from(p.rex_b) << 3));
+                Some(one(c, start, Normal, Eff::Pop { dst }).keep_flags())
+            }
+            0x68 => keep(finish_imm(
+                c,
+                start,
+                imm_z(p),
+                Normal,
+                Eff::Push { src: None },
+            )),
+            0x6A => keep(finish_imm(c, start, 1, Normal, Eff::Push { src: None })),
             // xchg eax, r — writes rax and r.
             0x91..=0x97 => {
                 let r = (op & 0x07) | (u8::from(p.rex_b) << 3);
@@ -1414,10 +2038,8 @@ pub(crate) mod x86 {
             }
             0x98 => Some(one(c, start, Normal, Eff::Wr(bit(0)))), // cwde/cdqe → rax
             0x99 => Some(one(c, start, Normal, Eff::Wr(bit(2)))), // cwd/cdq/cqo → rdx
-            0xD7 => Some(one(c, start, Normal, Eff::Wr(bit(0)))), // xlat → al
-            // push r, nops, flag ops, invalid-in-64 legacy: no tracked GP write.
-            0x50..=0x57
-            | 0x06
+            // nops, flag ops, invalid-in-64 legacy: no tracked GP write.
+            0x06
             | 0x07
             | 0x0E
             | 0x16
@@ -1439,29 +2061,37 @@ pub(crate) mod x86 {
             0x04 | 0x0C | 0x14 | 0x1C | 0x24 | 0x2C | 0x34 => {
                 finish_imm(c, start, 1, Normal, Eff::Wr(bit(0)))
             }
-            0x3C | 0xA8 | 0x6A => finish_imm(c, start, 1, Normal, Eff::NoGp),
+            0x3C | 0xA8 => finish_imm(c, start, 1, Normal, Eff::NoGp),
             0x05 | 0x0D | 0x15 | 0x1D | 0x25 | 0x2D | 0x35 => {
                 finish_imm(c, start, imm_z(p), Normal, Eff::Wr(bit(0)))
             }
-            0x3D | 0xA9 | 0x68 => finish_imm(c, start, imm_z(p), Normal, Eff::NoGp),
+            0x3D | 0xA9 => finish_imm(c, start, imm_z(p), Normal, Eff::NoGp),
             // mov r8, imm8 — writes the opcode-encoded register (byte write → clobber).
             0xB0..=0xB7 => {
                 let dst = (op & 0x07) | (u8::from(p.rex_b) << 3);
-                finish_imm(c, start, 1, Normal, Eff::Wr(bit(dst)))
+                keep(finish_imm(c, start, 1, Normal, Eff::Wr(bit(dst))))
             }
-            // mov r32/r64, imm — writes a known constant into the opcode-encoded register.
+            // mov r32/r64, imm — writes a known constant into the opcode-encoded register; `mov r16,
+            // imm16` keeps the upper 48 bits, so it only clobbers (#2603 hole 7).
             0xB8..=0xBF => {
                 let dst = (op & 0x07) | (u8::from(p.rex_b) << 3);
                 let size = if p.rex_w { 8 } else { imm_z(p) };
                 let immv = read_imm(c, size)?;
+                let eff = match size {
+                    8 => Eff::MovImm { dst, imm: immv },
+                    4 => Eff::MovImm {
+                        dst,
+                        imm: immv & 0xFFFF_FFFF,
+                    },
+                    _ => Eff::Wr(bit(dst)),
+                };
                 Some(Decoded {
                     len: c.pos - start,
                     kind: Normal,
                     operands: NO_OPERANDS,
-                    eff: Eff::MovImm {
-                        dst,
-                        imm: if p.rex_w { immv } else { immv & 0xFFFF_FFFF },
-                    },
+                    eff,
+                    imm_len: size as u8,
+                    keeps_flags: true,
                 })
             }
             _ => Some(UNDECODABLE),
@@ -1483,15 +2113,24 @@ pub(crate) mod x86 {
         )
     }
 
-    /// Group 5 (`FF`): `/2`,`/3` indirect call, `/4`,`/5` indirect jmp, others inc/dec/push r/m.
+    /// Group 5 (`FF`): `/2` indirect call, `/4` indirect jmp, `/6` push r/m, `/0`,`/1` inc/dec. The far
+    /// forms `/3`,`/5` load a new `cs:rip` from memory, so they are forbidden like `9A`/`EA`.
     fn group5(c: &mut Cursor, start: usize, p: &Pfx) -> Option<Decoded> {
         let digit = (c.peek()? >> 3) & 0x07;
         let kind = match digit {
-            2 | 3 => Kind::IndirectCall,
-            4 | 5 => Kind::IndirectJmp,
+            2 => Kind::IndirectCall,
+            4 => Kind::IndirectJmp,
+            3 => Kind::Forbidden("far call"),
+            5 => Kind::Forbidden("far jmp"),
             _ => Kind::Normal,
         };
-        finish_modrm(c, start, p, 0, kind, EffIntent::Group5(digit))
+        let d = finish_modrm(c, start, p, 0, kind, EffIntent::Group5(digit))?;
+        // `jmp`/`push` leave the flags; `inc`/`dec` write them, and a call's callee clobbers them.
+        Some(if matches!(digit, 4 | 6) {
+            d.keep_flags()
+        } else {
+            d
+        })
     }
 
     fn decode_0f(c: &mut Cursor, start: usize, p: &Pfx, op2: u8) -> Option<Decoded> {
@@ -1509,18 +2148,33 @@ pub(crate) mod x86 {
                 return Some(rel_insn(start, c.pos, rel, Branch::Jcc));
             }
             // cmovcc r, r/m — the D63 confinement redirect.
-            0x40..=0x4F => return finish_modrm(c, start, p, 0, Normal, E::Cmov),
+            0x40..=0x4F => return keep(finish_modrm(c, start, p, 0, Normal, E::Cmov(op2 & 0x0F))),
             // setcc r/m8 (byte write → clobber the r/m register).
-            0x90..=0x9F => return finish_modrm(c, start, p, 0, Normal, E::WrRm),
+            0x90..=0x9F => return keep(finish_modrm(c, start, p, 0, Normal, E::WrRm)),
             // movzx/movsx r, r/m — zero/sign-extended, not a tracked pointer value → clobber reg.
-            0xB6 | 0xB7 | 0xBE | 0xBF => return finish_modrm(c, start, p, 0, Normal, E::WrReg),
+            0xB6 | 0xB7 | 0xBE | 0xBF => {
+                return keep(finish_modrm(c, start, p, 0, Normal, E::WrReg))
+            }
             0xAF => return finish_modrm(c, start, p, 0, Normal, E::WrReg), // imul r, r/m
             0xBC | 0xBD => return finish_modrm(c, start, p, 0, Normal, E::WrReg), // bsf/bsr r, r/m
             // shld/shrd r/m, r, (imm8|cl) — write the r/m.
             0xA4 | 0xAC => return finish_modrm(c, start, p, 1, Normal, E::WrRm),
             0xA5 | 0xAD => return finish_modrm(c, start, p, 0, Normal, E::WrRm),
-            0xAB | 0xB3 | 0xBB => return finish_modrm(c, start, p, 0, Normal, E::WrRm), // bts/btr/btc r/m
-            0xA3 => return finish_modrm(c, start, p, 0, Normal, E::NoGp), // bt — flags only
+            // bt/bts/btr/btc r/m, reg: with a memory operand the register is a *signed bit offset*
+            // into memory, reaching `[mem + (reg >> 3)]` far past the operand the policy checks
+            // (#2603 hole 9). Cranelift emits only the register forms.
+            0xA3 | 0xAB | 0xB3 | 0xBB => {
+                let intent = if op2 == 0xA3 { E::NoGp } else { E::WrRm };
+                let d = finish_modrm(c, start, p, 0, Normal, intent)?;
+                return Some(if d.operands.mem.is_some() {
+                    Decoded {
+                        kind: Forbidden("bt* with a register bit offset into memory"),
+                        ..d
+                    }
+                } else {
+                    d
+                });
+            }
             0xC0 | 0xC1 => return finish_modrm(c, start, p, 0, Normal, E::XchgRegRm), // xadd — writes both
             0xB0 | 0xB1 => return finish_modrm(c, start, p, 0, Normal, E::Wr(bit(0))), // cmpxchg → rax (+ r/m)
             0xA2 => {
@@ -1540,6 +2194,11 @@ pub(crate) mod x86 {
             0x70..=0x73 | 0xC2 | 0xC4 | 0xC6 => finish_modrm(c, start, p, 1, Normal, E::NoGp),
             // … except pextrw r32, xmm, imm8, which writes a GP register.
             0xC5 => finish_modrm(c, start, p, 1, Normal, E::WrReg),
+            // The SSE moves (movups/movss/movsd, movaps, movd/movq, movdqa/movdqu, movq) leave the
+            // flags: a register allocator's spills and moves.
+            0x10 | 0x11 | 0x28 | 0x29 | 0x6E | 0x6F | 0x7E | 0x7F | 0xD6 => {
+                keep(finish_modrm(c, start, p, 0, Normal, E::NoGp))
+            }
             // Everything else in the 0F map (SSE/SSE2 float+int vector ops, fences): ModRM, no imm.
             // A handful move a value into a GP register; those are cross-checked against iced and the
             // ones the corpus exercises are classified above. The rest are XMM-only (no GP write).
@@ -1629,7 +2288,14 @@ pub(crate) mod x86 {
         // VEX/EVEX encode AVX vector ops: their operands are XMM/YMM/ZMM, so no GP register is
         // written. (The BMI GP-writing VEX ops are not in the corpus; the iced write-set cross-check
         // would flag one if it appeared, to be classified then.)
-        finish_modrm(c, start, p, imm, Kind::Normal, EffIntent::NoGp)
+        let d = finish_modrm(c, start, p, imm, Kind::Normal, EffIntent::NoGp)?;
+        // The AVX moves (vmovups/vmovaps/vmovdqu/vmovq/…) leave the flags.
+        let moves = matches!(map, Map::Of)
+            && matches!(
+                op,
+                0x10 | 0x11 | 0x28 | 0x29 | 0x6E | 0x6F | 0x7E | 0x7F | 0xD6
+            );
+        Some(if moves { d.keep_flags() } else { d })
     }
 
     fn one(c: &Cursor, start: usize, kind: Kind, eff: Eff) -> Decoded {
@@ -1638,7 +2304,14 @@ pub(crate) mod x86 {
             kind,
             operands: NO_OPERANDS,
             eff,
+            imm_len: 0,
+            keeps_flags: false,
         }
+    }
+
+    /// Mark a decode arm's result as leaving the flags unchanged.
+    fn keep(d: Option<Decoded>) -> Option<Decoded> {
+        d.map(Decoded::keep_flags)
     }
 
     fn finish_imm(
@@ -1654,6 +2327,8 @@ pub(crate) mod x86 {
             kind,
             operands: NO_OPERANDS,
             eff,
+            imm_len: imm as u8,
+            keeps_flags: false,
         })
     }
 
@@ -1675,6 +2350,8 @@ pub(crate) mod x86 {
             kind,
             operands: NO_OPERANDS,
             eff: Eff::NoGp,
+            imm_len: 0,
+            keeps_flags: true, // a jmp/jcc leaves the flags
         }
     }
 
@@ -1718,8 +2395,7 @@ pub(crate) mod x86 {
         };
         use temen_text::parse_module;
 
-        /// Compile `src` through the real JIT path and return each function's
-        /// `(code, bb_starts, bb_edges)`.
+        /// Compile `src` through the real JIT path and return each function's capture.
         fn compiled(src: &str) -> Vec<crate::validate::CapturedFn> {
             let m = parse_module(src).expect("parse");
             validate::arm_capture();
@@ -1784,55 +2460,79 @@ pub(crate) mod x86 {
             })
         }
 
-        /// The decoder's boundaries, validity, and memory-operand decode must match iced-x86 on real
-        /// output, and `check` must find nothing on clean Cranelift code.
+        /// The decoder's boundaries, validity, memory-operand decode, and data-flow effect must match
+        /// iced-x86 on real output, and `check` must find nothing on clean Cranelift code. The effect
+        /// is compared wherever the transfer relies on it: the GP write-set (rsp/rbp included — they
+        /// carry stack facts), the flags an instruction claims to keep, a `cmov`'s condition, the value
+        /// a `mov r, imm` leaves, a `cmp`'s immediate, and a load's or store's width (#2603).
         fn cross_check(src: &str) {
-            for (bytes, bb_starts, bb_edges, layout) in compiled(src) {
-                for (pos, d) in walk(&bytes, &bb_starts) {
+            for f in compiled(src) {
+                let bytes = &f.code;
+                for (pos, d) in walk(bytes, &f.bb_starts) {
                     assert_ne!(d.len, 0, "ours: undecodable at +0x{pos:x}\n{:02x?}", bytes);
-                    let insn = iced_at(&bytes, pos).unwrap_or_else(|| {
+                    let insn = iced_at(bytes, pos).unwrap_or_else(|| {
                         panic!("iced rejects what we decoded at +0x{pos:x}\n{:02x?}", bytes)
                     });
-                    assert_eq!(
-                        d.len,
-                        insn.len(),
-                        "length mismatch at +0x{pos:x}: ours {} iced {}\n{:02x?}",
-                        d.len,
-                        insn.len(),
-                        bytes
-                    );
+                    let at = |what: &str| format!("{what} at +0x{pos:x} ({:?})\n{:02x?}", d, bytes);
+                    assert_eq!(d.len, insn.len(), "{}", at("length mismatch"));
                     // When our decoder reports a memory operand, iced must see the same one.
                     if let Some(mem) = d.operands.mem {
-                        let want = iced_mem(&insn);
                         // Compare the fields iced exposes identically (disp only when not rip-rel).
                         let ours = if mem.rip { Mem { disp: 0, ..mem } } else { mem };
                         assert_eq!(
                             Some(ours),
-                            want,
-                            "memory-operand mismatch at +0x{pos:x}: ours {:?} iced {:?}\n{:02x?}",
-                            mem,
-                            want,
-                            bytes
+                            iced_mem(&insn),
+                            "{}",
+                            at("memory-operand mismatch")
                         );
                     }
-                    // Soundness of the dataflow transfer: our GP write-set must cover iced's. A GP
-                    // register iced says the instruction writes but we don't would let a stale fact
-                    // (mem_base, a confined index) survive a real overwrite — the escape the #2535
-                    // clobber exists to prevent. rsp/rbp are excluded: they are the stack pointer and
-                    // frame pointer, recognized structurally, never carriers of a tracked fact.
-                    const SP_BP: u16 = (1 << reg::RSP) | (1 << reg::RBP);
-                    let ours = writes_of(d.eff, &d.operands);
-                    let iced_w = iced_gp_writes(&insn);
+                    // A GP register iced says the instruction writes but we don't would let a stale
+                    // fact (mem_base, a confined index, a stack offset) survive a real overwrite.
+                    let (ours, iced_w) = (writes_of(&d), iced_gp_writes(&insn));
                     assert_eq!(
-                        iced_w & !ours & !SP_BP,
+                        iced_w & !ours,
                         0,
-                        "GP write-set gap at +0x{pos:x}: iced writes {iced_w:#06x}, ours {ours:#06x}, \
-                         eff {:?}\n{:02x?}",
-                        d.eff,
-                        bytes
+                        "{}",
+                        at(&format!(
+                            "GP write-set gap: iced writes {iced_w:#06x}, ours {ours:#06x}"
+                        ))
                     );
+                    // An instruction that claims to keep the flags must not modify any.
+                    if d.keeps_flags {
+                        assert_eq!(insn.rflags_modified(), 0, "{}", at("modifies the flags"));
+                    }
+                    match d.eff {
+                        Eff::Cmov { cc, .. } => {
+                            // iced numbers the conditions from 1 (0 is "none").
+                            assert_eq!(insn.condition_code() as u8, cc + 1, "{}", at("cmov cc"));
+                        }
+                        Eff::MovImm { imm, .. } => {
+                            assert_eq!(imm as u64, insn.immediate(1), "{}", at("mov immediate"));
+                        }
+                        Eff::Cmp {
+                            w,
+                            rhs: Opnd::Imm(v),
+                            ..
+                        } => {
+                            let mask = if w == 8 {
+                                u64::MAX
+                            } else {
+                                u64::from(u32::MAX)
+                            };
+                            assert_eq!(v & mask, insn.immediate(1) & mask, "{}", at("cmp imm"));
+                        }
+                        Eff::LoadReg { .. } => {
+                            assert_eq!(insn.memory_size().size(), 8, "{}", at("load width"));
+                        }
+                        Eff::StoreReg { w, .. } => {
+                            let want = usize::from(w);
+                            assert_eq!(insn.memory_size().size(), want, "{}", at("store width"));
+                        }
+                        _ => {}
+                    }
                 }
-                let findings = check(&bytes, &bb_starts, &bb_edges, layout);
+                let entry = Entry::Guest(f.layout);
+                let findings = check(bytes, &f.bb_starts, &f.bb_edges, &f.patches, entry);
                 assert!(
                     findings.is_empty(),
                     "clean Cranelift output flagged: {findings:?}\n{:02x?}",
@@ -1901,6 +2601,22 @@ pub(crate) mod x86 {
                 "memory 16\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  \
                  v1 = i64.load v0\n  v2 = i64.const 8\n  v3 = i64.add v0 v2\n  \
                  i64.store v3 v1\n  return v1\n  }\n}\n",
+            );
+        }
+
+        #[test]
+        fn call_with_stack_arguments_then_a_window_access() {
+            // A call with five guest arguments (three on the stack: Tail CC passes only six integer
+            // arguments in registers, four of them the context params), then a window access. The
+            // caller parks mem_base in a callee-saved register across the call, and the D63 bound
+            // comes from the constant pool (`cmp idx, [rip + k]`) — the shapes #2603 PR 1 models.
+            cross_check(
+                "memory 16\nfunc (i64, i64, i64, i64, i64) -> (i64) {\n\
+                 block 0 (v0: i64, v1: i64, v2: i64, v3: i64, v4: i64) {\n  \
+                 v5 = i64.add v0 v4\n  return v5\n  }\n}\n\
+                 func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i64.const 1\n  \
+                 v2 = call 0 (v0, v1, v1, v1, v0)\n  v3 = i64.load v0\n  v4 = i64.add v2 v3\n  \
+                 return v4\n  }\n}\n",
             );
         }
 
@@ -1981,24 +2697,38 @@ pub(crate) mod x86 {
             assert!(matches!(decode(&bytes, 7).kind, Kind::Ret));
         }
 
-        /// The abstract lattice's `meet` (the fact true on both paths) and the loop-header widening
-        /// that bounds the fixpoint (#2535).
+        /// The abstract lattice's `meet` (the fact true on both paths, and the order the checker
+        /// relies on) and the loop-header widening that bounds the fixpoint (#2535).
         #[test]
         fn lattice_meet_and_widen() {
             use Fact::*;
             let conf = Confined {
-                guard: 0x2000000000,
+                bound: 0x20_0000_0000,
+                guard: 0x20_0000_0000,
             };
             assert_eq!(MemBase.meet(MemBase), MemBase);
             assert_eq!(MemBase.meet(Vmctx), Unknown);
             assert_eq!(conf.meet(conf), conf);
-            assert_eq!(conf.meet(Confined { guard: 4096 }), Unknown); // different guard ⇒ no fact
+            let other_guard = Confined {
+                bound: 0x20_0000_0000,
+                guard: 4096,
+            };
+            assert_eq!(conf.meet(other_guard), Unknown); // different guard ⇒ no fact
+                                                         // The same guard with a looser bound: the meet keeps the looser one.
+            let looser = Confined {
+                bound: 0x30_0000_0000,
+                guard: 0x20_0000_0000,
+            };
+            assert_eq!(conf.meet(looser), looser);
             assert_eq!(conf.meet(Unknown), Unknown);
             assert_eq!(Const(5).meet(Const(5)), Const(5));
             assert_eq!(Const(5).meet(Const(6)), Unknown);
             // A bound true on both paths is the looser (larger) of the two.
             assert_eq!(Bounded(4).meet(Bounded(8)), Bounded(8));
             assert_eq!(Bounded(4).meet(MemBase), Unknown);
+            // Two stack pointers at different offsets still point into the stack.
+            assert_eq!(Stack(Some(-8)).meet(Stack(Some(-16))), Stack(None));
+            assert_eq!(Stack(Some(-8)).meet(MemBase), Unknown);
 
             // Widening at a loop header drops `Bounded` (which could grow each iteration) but keeps
             // the loop-invariant context-param and `Confined` facts, so the fixpoint terminates.
@@ -2011,89 +2741,286 @@ pub(crate) mod x86 {
             assert_eq!(s.regs[reg::RDI as usize], MemBase);
         }
 
+        // --- the hand-assembled policy tests ---
+
+        /// The 128 GiB reservation of a real module (`guard_offset` 0x20_0000_0000), for the window
+        /// accesses the tests below assemble by hand.
+        const WIN: Option<WindowLayout> = Some(WindowLayout {
+            mask: 0x1F_FFFF_FFFF,
+            guard_offset: 0x20_0000_0000,
+        });
+
+        /// `mov rax, 0x20_0000_0000` — the guard offset, D63's redirect target (10 bytes).
+        const GUARD: [u8; 10] = [0x48, 0xb8, 0, 0, 0, 0, 0x20, 0, 0, 0];
+
+        fn findings(bytes: &[u8]) -> Vec<Finding> {
+            check(bytes, &[], &[], &[], Entry::Guest(WIN))
+        }
+
+        fn has(f: &[Finding], needle: &str) -> bool {
+            f.iter().any(|f| f.why.contains(needle))
+        }
+
+        /// `bytes` = `GUARD` followed by `rest`.
+        fn after_guard(rest: &[u8]) -> Vec<u8> {
+            [&GUARD[..], rest].concat()
+        }
+
+        /// Run `bytes`, one block, from the entry state.
+        fn run(bytes: &[u8]) -> State {
+            let mut fs = Vec::new();
+            let (insns, _) = decode_block(bytes, 0, bytes.len(), &[], &mut fs);
+            let ctx = Ctx {
+                bytes,
+                patches: &[],
+                layout: WIN,
+            };
+            transfer_block(&insns, State::entry(), None, ctx)
+        }
+
         /// A window access through an index that was **not** confined by the D63 sequence is the
         /// escape-relevant case the policy must flag: `mov rax, [rdi + r8]` with `r8` a guest
         /// argument (unknown, unconfined) and `rdi` = `mem_base`.
         #[test]
         fn policy_flags_unconfined_window_index() {
-            let bytes = [0x4a, 0x8b, 0x04, 0x07, 0xc3]; // mov rax,[rdi+r8*1]; ret
-            let f = check(&bytes, &[], &[], None);
-            assert!(
-                f.iter().any(|f| f.why.contains("unconfined index")),
-                "expected an unconfined-window-index finding, got {f:?}"
-            );
+            let f = findings(&[0x4a, 0x8b, 0x04, 0x07, 0xc3]); // mov rax,[rdi+r8*1]; ret
+            assert!(has(&f, "unconfined index"), "{f:?}");
         }
 
         /// A memory access whose base register has no recognized provenance (here `r9`, a guest
         /// argument) is flagged — it is neither the window, the stack, vmctx, the fn-table, nor rodata.
         #[test]
         fn policy_flags_unknown_base() {
-            let bytes = [0x49, 0x8b, 0x01, 0xc3]; // mov rax,[r9]; ret
-            let f = check(&bytes, &[], &[], None);
-            assert!(
-                f.iter().any(|f| f.why.contains("unrecognized provenance")),
-                "expected an unknown-base finding, got {f:?}"
-            );
+            let f = findings(&[0x49, 0x8b, 0x01, 0xc3]); // mov rax,[r9]; ret
+            assert!(has(&f, "unrecognized provenance"), "{f:?}");
+        }
+
+        /// A module without a window has no window access to re-prove: one is flagged rather than
+        /// checked against the guard the code itself chose.
+        #[test]
+        fn policy_flags_a_window_access_without_a_window() {
+            let bytes = after_guard(&[
+                0x4c, 0x3b, 0xc0, // cmp r8, rax
+                0x4c, 0x0f, 0x43, 0xc0, // cmovae r8, rax
+                0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
+                0xc3,
+            ]);
+            let f = check(&bytes, &[], &[], &[], Entry::Guest(None));
+            assert!(has(&f, "no window"), "{f:?}");
+            // A trampoline's arguments are the host's, so the memory policy waits for its contract.
+            assert!(check(&bytes, &[], &[], &[], Entry::Host).is_empty());
         }
 
         /// The full D63 confinement sequence is recognized and produces no finding: materialize the
         /// guard, compare the index, `cmovae` it to the guard, then access `[mem_base + confined]`.
         #[test]
         fn policy_accepts_the_confinement_sequence() {
-            let bytes = [
-                0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00,
-                0x00, // mov rax, 0x2000000000
+            let bytes = after_guard(&[
                 0x4c, 0x3b, 0xc0, // cmp r8, rax
                 0x4c, 0x0f, 0x43, 0xc0, // cmovae r8, rax
                 0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
                 0xc3, // ret
-            ];
-            let f = check(&bytes, &[], &[], None);
+            ]);
+            let f = findings(&bytes);
             assert!(f.is_empty(), "the confinement sequence was flagged: {f:?}");
         }
 
-        /// An elided constant-displacement window access `[mem_base + 40000]` is re-proven against
-        /// the module reservation from the layout hint (#2603): clean when it fits, flagged when the
-        /// displacement reaches past the reservation.
+        /// Real D63 code compares against a bound in the function's own constant pool, since the
+        /// reservation doesn't fit an `imm32` (`cmp idx, [rip + k]`). The bound is read from the bytes
+        /// — and only when no relocation patches them, so a patched constant confines nothing.
         #[test]
-        fn policy_reproves_elided_access_against_reservation() {
+        fn policy_reads_the_d63_bound_from_the_constant_pool() {
             let bytes = [
-                0x48, 0x8b, 0x87, 0x40, 0x9c, 0x00, 0x00, // mov rax, [rdi + 0x9C40 (=40000)]
-                0xc3, // ret
+                0x48, 0xb9, 0, 0, 0, 0, 0x20, 0, 0, 0, // [0]  mov rcx, guard
+                0x4c, 0x3b, 0x05, 0x09, 0, 0, 0, // [10] cmp r8, [rip + 9] → [26]
+                0x4c, 0x0f, 0x43, 0xc1, // [17] cmovae r8, rcx
+                0x4a, 0x8b, 0x04, 0x07, // [21] mov rax, [rdi + r8*1]
+                0xc3, // [25] ret
+                0, 0, 0, 0, 0x20, 0, 0, 0, // [26] the bound, 0x20_0000_0000
             ];
-            // A large reservation easily holds offset 40000 → no finding.
-            let big = Some(WindowLayout {
-                mask: (1u64 << 37) - 1,
-                guard_offset: 1u64 << 37,
-            });
-            assert!(check(&bytes, &[], &[], big).is_empty());
-            // A 32 KiB reservation does not → the access reaches past it.
-            let small = Some(WindowLayout {
-                mask: (1u64 << 15) - 1,
-                guard_offset: 1u64 << 15,
-            });
-            let f = check(&bytes, &[], &[], small);
+            let f = findings(&bytes);
             assert!(
-                f.iter().any(|f| f.why.contains("past the reservation")),
-                "expected a reservation-overrun finding, got {f:?}"
+                f.is_empty(),
+                "a constant-pool bound was not recognized: {f:?}"
             );
+            let patched = [Patch { at: 26, len: 8 }];
+            let f = check(&bytes, &[], &[], &patched, Entry::Guest(WIN));
+            assert!(
+                has(&f, "unconfined index"),
+                "a patched bound confined: {f:?}"
+            );
+        }
+
+        /// br_table's index clamp is the mirrored, 32-bit form of the same `cmov` shape: `mov eax, n;
+        /// cmp ecx, eax; cmovb eax, ecx` leaves `rax` in `[0, n]`.
+        #[test]
+        fn the_br_table_clamp_is_confined() {
+            let s = run(&[
+                0xb8, 0x02, 0, 0, 0, // mov eax, 2
+                0x44, 0x89, 0xc1, // mov ecx, r8d
+                0x39, 0xc1, // cmp ecx, eax
+                0x0f, 0x42, 0xc1, // cmovb eax, ecx
+            ]);
+            assert_eq!(s.regs[0], Fact::Confined { bound: 2, guard: 2 });
+        }
+
+        /// D63 with an access offset compares the address and selects the address *plus the
+        /// offset*: `lea r10, [rcx + 0x14]; cmp rcx, k; cmova r10, guard`. `r10` is the compared value
+        /// plus 0x14, so it is confined to `[0, k + 0x15) ∪ {guard}`. A negative offset could wrap below
+        /// zero, so it confines nothing.
+        #[test]
+        fn policy_d63_with_an_access_offset_is_confined() {
+            let form = |lea_disp: u8| {
+                let mut b = vec![0x4c, 0x8d, 0x51, lea_disp]; // lea r10, [rcx + disp8]
+                b.extend([0x48, 0xba, 0, 0, 0, 0, 0x20, 0, 0, 0]); // mov rdx, 0x20_0000_0000
+                b.extend([0x48, 0x81, 0xf9, 0xe8, 0xff, 0xff, 0x7f]); // cmp rcx, 0x7fff_ffe8
+                b.extend([0x4c, 0x0f, 0x47, 0xd2]); // cmova r10, rdx
+                b.extend([0x42, 0x89, 0x04, 0x17]); // mov [rdi + r10*1], eax
+                b.push(0xc3);
+                b
+            };
+            let f = findings(&form(0x14));
+            assert!(f.is_empty(), "D63 with an offset was flagged: {f:?}");
+            assert!(has(&findings(&form(0xf8)), "unconfined index")); // lea r10, [rcx − 8]
+        }
+
+        /// Hole 7's `lea` form: a 32-bit `lea` truncates the address, so `lea eax, [rsp + 8]` is no
+        /// stack pointer.
+        #[test]
+        fn policy_a_narrow_lea_is_no_pointer() {
+            let bytes = [
+                0x8d, 0x44, 0x24, 0x08, // lea eax, [rsp + 8]
+                0x48, 0x8b, 0x08, // mov rcx, [rax]
+                0xc3,
+            ];
+            let f = findings(&bytes);
+            assert!(has(&f, "unrecognized provenance"), "{f:?}");
+            // ... and the `lea` itself, which computes an address, is no access.
+            assert!(f.iter().all(|f| f.at != 0), "{f:?}");
+        }
+
+        /// A `jmp rel32` whose displacement a relocation patches is a tail call (Cranelift's
+        /// `return_call`): it leaves the function, so it is no edge into the bytes after it, which
+        /// would carry the torn-down frame into a live block.
+        #[test]
+        fn cfg_a_patched_jmp_is_a_tail_call() {
+            let bytes = [
+                0x55, // [00] push rbp
+                0x48, 0x89, 0xe5, // [01] mov rbp, rsp
+                0x45, 0x85, 0xc0, // [04] test r8d, r8d
+                0x0f, 0x84, 0x09, 0, 0, 0, // [07] je +9  (→ 0x16)
+                0x48, 0x89, 0xec, // [0d] mov rsp, rbp
+                0x5d, // [10] pop rbp
+                0xe9, 0, 0, 0, 0, // [11] jmp <callee>  (rel32 patched at 0x12)
+                0x48, 0x89, 0xec, // [16] mov rsp, rbp
+                0x5d, // [19] pop rbp
+                0xc3, // [1a] ret
+            ];
+            let patches = [Patch { at: 0x12, len: 4 }];
+            let f = check(&bytes, &[], &[], &patches, Entry::Guest(WIN));
+            assert!(
+                f.is_empty(),
+                "a tail call fell through into the next block: {f:?}"
+            );
+        }
+
+        /// A hinted CLIF edge is attached only to the machine block that ends in an indirect `jmp`.
+        /// Here CLIF block 0 is a lone `ret`, and a hint claiming it reaches block 1 must not invent
+        /// that edge — block 1 is unreachable, so its unknown-base access never runs.
+        #[test]
+        fn cfg_a_hinted_edge_is_not_invented() {
+            let bytes = [
+                0xc3, // [0] ret               (CLIF block 0)
+                0x49, 0x8b, 0x01, // [1] mov rax, [r9]   (CLIF block 1: no predecessor)
+                0xc3, // [4] ret
+            ];
+            let f = check(&bytes, &[0, 1], &[(0, 1)], &[], Entry::Guest(WIN));
+            assert!(f.is_empty(), "a hinted edge was invented: {f:?}");
+        }
+
+        /// Hole 1: a call clobbers the caller-saved registers. Here both `rdi` (mem_base) and the
+        /// confined `r8` are dead after it, so the access through them is flagged.
+        #[test]
+        fn policy_a_call_clobbers_the_caller_saved_registers() {
+            let bytes = after_guard(&[
+                0x4c, 0x3b, 0xc0, // cmp r8, rax
+                0x4c, 0x0f, 0x43, 0xc0, // cmovae r8, rax
+                0xe8, 0, 0, 0, 0, // call
+                0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
+                0xc3,
+            ]);
+            assert!(has(&findings(&bytes), "unrecognized provenance"));
+            // Callee-saved registers survive: mem_base parked in rbx is still mem_base.
+            let s = run(&[0x48, 0x89, 0xfb, 0xe8, 0, 0, 0, 0]); // mov rbx, rdi; call
+            assert_eq!(s.regs[3], Fact::MemBase);
+            assert_eq!(s.regs[reg::RDI as usize], Fact::Unknown);
+        }
+
+        /// Hole 2: the `cmov`'s condition matters. `cmovb` takes the guard when the index is in
+        /// bounds and keeps it when it is not — the opposite of a confinement.
+        #[test]
+        fn policy_an_inverted_cmov_does_not_confine() {
+            let bytes = after_guard(&[
+                0x4c, 0x3b, 0xc0, // cmp r8, rax
+                0x4c, 0x0f, 0x42, 0xc0, // cmovb r8, rax
+                0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
+                0xc3,
+            ]);
+            assert!(has(&findings(&bytes), "unconfined index"));
+        }
+
+        /// Hole 3: a flag write between the `cmp` and the `cmov` means the `cmov` tests other flags.
+        #[test]
+        fn policy_a_flag_write_between_cmp_and_cmov_breaks_the_confinement() {
+            let bytes = after_guard(&[
+                0x4c, 0x3b, 0xc0, // cmp r8, rax
+                0x48, 0x83, 0xc1, 0x01, // add rcx, 1   (writes CF)
+                0x4c, 0x0f, 0x43, 0xc0, // cmovae r8, rax
+                0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
+                0xc3,
+            ]);
+            assert!(has(&findings(&bytes), "unconfined index"));
+        }
+
+        /// Hole 4: the compare's bound is what bounds the index. An unknown bound confines nothing,
+        /// and a bound past the reservation confines to past the reservation.
+        #[test]
+        fn policy_the_cmp_bound_must_be_known_and_inside_the_reservation() {
+            let unknown = after_guard(&[
+                0x4d, 0x3b, 0xc1, // cmp r8, r9   (r9: a guest argument)
+                0x4c, 0x0f, 0x43, 0xc0, // cmovae r8, rax
+                0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
+                0xc3,
+            ]);
+            assert!(has(&findings(&unknown), "unconfined index"));
+            let huge = after_guard(&[
+                0x49, 0xb9, 0, 0, 0, 0, 0, 0, 0x10, 0, // mov r9, 2^52
+                0x4d, 0x3b, 0xc1, // cmp r8, r9
+                0x4c, 0x0f, 0x43, 0xc0, // cmovae r8, rax
+                0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
+                0xc3,
+            ]);
+            assert!(has(&findings(&huge), "past the reservation"));
         }
 
         /// Spill-slot tracking carries `mem_base` across a stack round-trip: spill rdi to `[rsp]`,
         /// confine r8, reload rdi from `[rsp]`, then access `[mem_base + confined]` — clean.
         #[test]
         fn policy_tracks_membase_through_a_spill_slot() {
-            let bytes = [
+            let mut bytes = vec![
+                0x48, 0x83, 0xec, 0x10, // sub rsp, 16
                 0x48, 0x89, 0x3c, 0x24, // mov [rsp], rdi  (spill mem_base)
-                0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00,
-                0x00, // mov rax, 0x2000000000
+            ];
+            bytes.extend(GUARD);
+            bytes.extend([
                 0x4c, 0x3b, 0xc0, // cmp r8, rax
                 0x4c, 0x0f, 0x43, 0xc0, // cmovae r8, rax
                 0x48, 0x8b, 0x3c, 0x24, // mov rdi, [rsp]  (reload mem_base)
                 0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
+                0x48, 0x83, 0xc4, 0x10, // add rsp, 16
                 0xc3, // ret
-            ];
-            let f = check(&bytes, &[], &[], None);
+            ]);
+            let f = findings(&bytes);
             assert!(
                 f.is_empty(),
                 "spilled-then-reloaded mem_base was flagged: {f:?}"
@@ -2112,11 +3039,157 @@ pub(crate) mod x86 {
                 0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
                 0xc3, // ret
             ];
-            let f = check(&bytes, &[], &[], None);
-            assert!(
-                f.iter().any(|f| f.why.contains("unrecognized provenance")),
-                "a stale slot fact survived an overwrite: {f:?}"
-            );
+            assert!(has(&findings(&bytes), "unrecognized provenance"));
+        }
+
+        /// Hole 5 — the CVE-2021-32629 class: a slot holds a 64-bit fact only if a 64-bit store wrote
+        /// it, and only a 64-bit load restores one.
+        #[test]
+        fn policy_a_narrow_spill_or_reload_restores_nothing() {
+            let narrow_store = [
+                0x48, 0x83, 0xec, 0x10, // sub rsp, 16
+                0x89, 0x3c, 0x24, // mov [rsp], edi   (the low half of mem_base)
+                0x48, 0x8b, 0x3c, 0x24, // mov rdi, [rsp]   (a 64-bit reload)
+                0x48, 0x8b, 0x07, // mov rax, [rdi]
+                0xc3,
+            ];
+            assert!(has(&findings(&narrow_store), "unrecognized provenance"));
+            let narrow_load = [
+                0x48, 0x83, 0xec, 0x10, // sub rsp, 16
+                0x48, 0x89, 0x3c, 0x24, // mov [rsp], rdi
+                0x8b, 0x3c, 0x24, // mov edi, [rsp]   (a 32-bit reload: zero-extends)
+                0x48, 0x8b, 0x07, // mov rax, [rdi]
+                0xc3,
+            ];
+            assert!(has(&findings(&narrow_load), "unrecognized provenance"));
+        }
+
+        /// Hole 6: slots are keyed by the offset from the entry rsp, so a `push` that moves rsp does
+        /// not make `[rsp]` read the old slot, and a store that overlaps half a slot forgets it.
+        #[test]
+        fn policy_slots_follow_rsp_and_forget_overlapping_stores() {
+            let push = [
+                0x48, 0x83, 0xec, 0x10, // sub rsp, 16
+                0x48, 0x89, 0x3c, 0x24, // mov [rsp], rdi   (slot −16 := mem_base)
+                0x50, // push rax          (rsp → −24)
+                0x48, 0x8b, 0x0c, 0x24, // mov rcx, [rsp]   (slot −24: rax, unknown)
+                0x48, 0x8b, 0x01, // mov rax, [rcx]
+                0xc3,
+            ];
+            assert!(has(&findings(&push), "unrecognized provenance"));
+            let overlap = [
+                0x48, 0x83, 0xec, 0x10, // sub rsp, 16
+                0x48, 0x89, 0x3c, 0x24, // mov [rsp], rdi            (slot −16 := mem_base)
+                0xc7, 0x44, 0x24, 0x04, 0, 0, 0, 0, // mov dword [rsp + 4], 0
+                0x48, 0x8b, 0x3c, 0x24, // mov rdi, [rsp]
+                0x48, 0x8b, 0x07, // mov rax, [rdi]
+                0xc3,
+            ];
+            assert!(has(&findings(&overlap), "unrecognized provenance"));
+            // `push rdi; pop rcx` moves mem_base through the stack.
+            let s = run(&[0x57, 0x59]);
+            assert_eq!(s.regs[1], Fact::MemBase);
+            assert_eq!(s.regs[reg::RSP as usize], Fact::Stack(Some(0)));
+        }
+
+        /// Hole 7: `mov ax, 5` keeps rax's upper 48 bits, so it is no constant.
+        #[test]
+        fn policy_a_16_bit_immediate_is_not_a_constant() {
+            let bytes = [
+                0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, // mov rax, -1
+                0x66, 0xb8, 0x05, 0x00, // mov ax, 5   (rax = 0xffff_ffff_ffff_0005)
+                0x48, 0x8b, 0x04, 0x07, // mov rax, [rdi + rax*1]
+                0xc3,
+            ];
+            assert!(has(&findings(&bytes), "unconfined index"));
+        }
+
+        /// Holes 8–9: forms whose address is not the `[base + index*scale + disp]` the policy checks,
+        /// and far transfers, are forbidden outright.
+        #[test]
+        fn decoder_forbids_forms_the_policy_cannot_check() {
+            let cases: [(&[u8], &str); 5] = [
+                (&[0x65, 0x48, 0x8b, 0x04, 0x07, 0xc3], "fs/gs"), // mov rax, gs:[rdi + rax]
+                (&[0x67, 0x48, 0x8b, 0x04, 0x07, 0xc3], "address-size"), // mov rax, [edi + eax]
+                (&[0xd7, 0xc3], "xlat"),                          // xlat: [rbx + al]
+                (&[0x48, 0x0f, 0xab, 0x07, 0xc3], "bit offset"),  // bts [rdi], rax
+                (&[0xff, 0x1f, 0xc3], "far call"),                // call far [rdi]
+            ];
+            for (bytes, why) in cases {
+                assert!(
+                    has(&findings(bytes), why),
+                    "{bytes:02x?} not forbidden as {why}"
+                );
+            }
+        }
+
+        /// Hole 13: control may not run past the function's last byte.
+        #[test]
+        fn policy_flags_falling_off_the_end() {
+            assert!(has(&findings(&[0x48, 0x8b, 0x07]), "off the end")); // mov rax, [rdi]
+        }
+
+        /// Hole 12 — the split: `verify` trusts no proposal. A state claiming `rdi` still holds
+        /// mem_base after `xor rdi, rdi` is rejected at the edge, whatever produced it; and an entry
+        /// state the contract doesn't imply is rejected at the entry.
+        #[test]
+        fn verify_rejects_a_proposal_that_is_not_inductive() {
+            let bytes = [
+                0x48, 0x31, 0xff, // xor rdi, rdi
+                0xeb, 0x00, // jmp +0   (to the next block)
+                0x48, 0x8b, 0x07, // mov rax, [rdi]
+                0xc3, // ret
+            ];
+            let ctx = Ctx {
+                bytes: &bytes,
+                patches: &[],
+                layout: WIN,
+            };
+            let mut fs = Vec::new();
+            let cfg = Cfg::build(&bytes, &[], &[], &[], &mut fs);
+            assert!(fs.is_empty());
+            let honest = propose(&cfg, ctx);
+            let mut f = Vec::new();
+            verify(&cfg, &honest, ctx, &mut f);
+            assert!(has(&f, "unrecognized provenance"), "{f:?}");
+
+            let mut lie = honest.clone();
+            lie[1] = Some(State::entry());
+            let mut f = Vec::new();
+            verify(&cfg, &lie, ctx, &mut f);
+            assert!(has(&f, "does not hold on the edge"), "{f:?}");
+
+            let mut bad_entry = honest;
+            let mut s = State::entry();
+            s.regs[0] = Fact::MemBase;
+            bad_entry[0] = Some(s);
+            let mut f = Vec::new();
+            verify(&cfg, &bad_entry, ctx, &mut f);
+            assert!(has(&f, "entry contract"), "{f:?}");
+        }
+
+        /// An elided constant-displacement window access `[mem_base + 40000]` is re-proven against
+        /// the module reservation from the layout hint (#2603): clean when it fits, flagged when the
+        /// displacement reaches past the reservation.
+        #[test]
+        fn policy_reproves_elided_access_against_reservation() {
+            let bytes = [
+                0x48, 0x8b, 0x87, 0x40, 0x9c, 0x00, 0x00, // mov rax, [rdi + 0x9C40 (=40000)]
+                0xc3, // ret
+            ];
+            // A large reservation easily holds offset 40000 → no finding.
+            let big = Some(WindowLayout {
+                mask: (1u64 << 37) - 1,
+                guard_offset: 1u64 << 37,
+            });
+            assert!(check(&bytes, &[], &[], &[], Entry::Guest(big)).is_empty());
+            // A 32 KiB reservation does not → the access reaches past it.
+            let small = Some(WindowLayout {
+                mask: (1u64 << 15) - 1,
+                guard_offset: 1u64 << 15,
+            });
+            let f = check(&bytes, &[], &[], &[], Entry::Guest(small));
+            assert!(has(&f, "past the reservation"), "{f:?}");
         }
     }
 }

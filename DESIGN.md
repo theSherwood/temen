@@ -191,8 +191,9 @@ and the smallest. The true statement:
 The dominant escape-TCB component is the **JIT** (Cranelift + our trap-confinement lowering +
 our CLIF generation), not the verifier. Stating this is the point: it puts the risk
 where it actually lives (§18). Cranelift's verifier checks our CLIF, and the CLIF Cranelift's
-passes hand its backend, on every compile (D68); nothing yet checks the machine code the backend
-emits (#2481).
+passes hand its backend, on every compile (D68). A machine-code validator checks what the backend
+emits (#2481, below), but until it fails closed (#2603) it only logs, so the backend is still
+escape-TCB.
 
 ### What "escape-free" buys — the load-bearing theorem
 Even a guest with **arbitrary write access to its entire window** (conceded — §1
@@ -236,6 +237,65 @@ Escape-freedom decomposes into five sub-invariants; their conjunction is the the
 | **I3 Capability integrity** — authority only via held handles; host-owned table; no opcode mints authority; fail-closed signature check | verifier (sealing-as-typing) + runtime | verifier fuzzing; forged-index tests |
 | **I4 IR totality** — no UB; every op = defined value or defined trap | IR semantics (JIT + interpreter) + verifier | differential JIT-vs-interpreter |
 | **I5 Stack integrity** — control stack unreachable by confinement; data overflow → guard fault | runtime (placement) + JIT (stack probes) | guard-page + stack-clash tests |
+
+### Checking what the backend emits — the machine-code validator (#2481)
+**Status:** shadow mode. It runs under the fuzzers and `TEMEN_JIT_VALIDATE` and logs what it finds.
+Today it checks fresh compiles for the allowlist, direct control flow and the window accesses of
+guest functions. #2603's PRs 2–4 add jump tables, calls, the other regions' extents, I5 and a
+default-deny decoder. At the flip (PR 5), a function runs only if its machine code passes, whether
+freshly compiled or replayed from a `CodeDir` (D71). `Correct(JIT)` then becomes Correct(our CLIF
+generation and lowering) ∧ Correct(validator). Cranelift's backend, the instruction selection,
+register allocation and encoding where its published escapes were (CVE-2021-32629, CVE-2023-26489),
+leaves the escape-TCB for I1, I2 and I5, and so does the code cache.
+
+**The claim.** Accepted ⟹ for every execution that enters the function in a state satisfying its
+entry contract:
+1. every memory access lies in a region the contract grants, within that region's extent (I1, I5);
+2. every control transfer lands on a decoded instruction boundary the check covers, or leaves through
+   a checked call, tail call or return whose callee contract holds at the transfer (I2);
+3. no instruction outside the allowlist executes;
+4. every exit restores the callee-saved registers and `rsp`.
+
+**Trusted:** the validator (decoder, transfer, policy, checker); the runtime, which builds the window,
+guards, fn table and vmctx and enters each function in its contract; the host functions; the
+hardware. **Not trusted:** Cranelift, the code cache, or any metadata stored with code. A hint is a
+claim the validator checks, never an input it believes.
+
+**Why it holds.** The validator decodes the bytes itself and recovers the machine CFG from them. It
+abstracts the machine state at each point as:
+- a fact per register (`mem_base`, an index `Confined` to `[0, bound) ∪ {guard}`, a stack pointer at
+  a known offset, …);
+- the flags of the last compare;
+- the spill slots, keyed by their offset from the entry `rsp`.
+
+Only a check is trusted. An untrusted fixpoint proposes a state for each block. One linear pass then
+verifies that the entry contract implies the entry block's state, that every edge's out-state implies
+its target's state, and that every instruction obeys the policy under the state before it. An
+inductive proposal over-approximates every execution, so a policy that holds under it holds for every
+run. A wrong or unconverged proposal fails the check and rejects; it never admits code.
+
+Across functions the argument is the same induction, over the steps of an execution. Each function is
+checked assuming its callees keep their contracts: the clobber set, callee-saved restoration and
+stack effect. An accepted function keeps its own contract, so the assumption holds of every guest
+callee; the runtime enters guest code only in its contract, and the host functions are trusted to
+keep theirs.
+
+**The rules the transfer must get exactly right**, each a published escape class or a hole a review
+found (#2603):
+- Only a 64-bit write carries a fact; a narrower one clobbers its destination. A 32-bit `mov r, imm`
+  and a 32-bit `cmp`/`cmov` pair are the exact exceptions. CVE-2021-32629 was a 32-bit spill
+  reloaded with sign extension into code that relied on the zero-extended upper half, so a narrow
+  spill or reload restores nothing.
+- A `cmov` confines only when it tests the flags of a `cmp` against a known bound, with no flag write
+  in between, and its condition takes the compared value only while it is below that bound.
+- No constant is read from bytes a relocation patches. D63's bound is a constant-pool operand, since
+  the reservation doesn't fit an `imm32`.
+- A call clobbers the caller-saved registers and the flags.
+- A form whose address isn't `[base + index·scale + disp]` (fs/gs, `0x67`, `xlat`, `bt* [mem], reg`)
+  is rejected, not modeled.
+
+**Spectre.** Window indices are confined only branchlessly (a `cmov`, a mask, a constant), so the
+validator also pins D63's Spectre-v1 hardening (§4).
 
 ### Scope
 - **In scope:** architectural escape; hostile/malformed/adversarial IR; **Spectre**
@@ -1155,7 +1215,10 @@ the Phase-1 core loop.
     (`MemoryFault`), keeping D38's clear-fault-at-the-offending-access property. This
     is the *identical primitive* default-config Wasmtime uses for bounds-checked
     heaps (`select_spectre_guard` → `cmp→cmov`); the `reserved` bound is hoisted into
-    a register, so per access it is one cmp + one cmov, no branch.
+    a register, so per access it is one cmp + one cmov, no branch. The machine-code
+    validator (§2a) recognizes exactly this shape in the emitted code
+    (`cmp idx, bound; cmovae idx, guard`, the bound usually a constant-pool operand) and
+    requires the guard to be the module's own.
   - *Spectre-v1: the guard-select IS the hardening.* `select_spectre_guard` is a
     speculation barrier — a data-dependent cmov, not a predicted branch — so a
     misspeculated out-of-bounds access **also** receives `reserved` and lands on the

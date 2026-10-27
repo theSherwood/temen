@@ -6588,8 +6588,8 @@ fn define_funcs(
                     let mut ctx = cranelift_codegen::Context::new();
                     ctx.func.signature.call_conv = isa.default_call_conv();
                     lower(&mut ctx, i)?;
-                    let code =
-                        compile_verified(isa, &mut ctx, layout).map_err(JitError::Backend)?;
+                    let code = compile_verified(isa, &mut ctx, validate::Entry::Guest(layout))
+                        .map_err(JitError::Backend)?;
                     let relocs = code
                         .buffer
                         .relocs()
@@ -6621,7 +6621,13 @@ fn define_funcs(
                 #[cfg(test)]
                 record_emitted(module, code.code_buffer(), &relocs);
                 #[cfg(all(test, target_arch = "x86_64"))]
-                validate::capture_code(code.code_buffer(), &code.bb_starts, &code.bb_edges, layout);
+                validate::capture_code(
+                    code.code_buffer(),
+                    &code.bb_starts,
+                    &code.bb_edges,
+                    validate::patches(relocs.iter().map(|r| (r.offset, r.kind))),
+                    layout,
+                );
                 let kept = keep
                     .as_mut()
                     .is_some_and(|k| k.push(module, ids, align, code.code_buffer(), &relocs));
@@ -6661,7 +6667,7 @@ fn define_funcs(
 fn compile_verified(
     isa: &dyn cranelift_codegen::isa::TargetIsa,
     ctx: &mut cranelift_codegen::Context,
-    layout: Option<validate::WindowLayout>,
+    entry: validate::Entry,
 ) -> Result<CompiledCode, String> {
     let mut ctrl = cranelift_codegen::control::ControlPlane::default();
     ctx.verify(isa)
@@ -6676,10 +6682,18 @@ fn compile_verified(
     let code = code.apply_params(&ctx.func.params);
     // #2481 — shadow-mode machine-code validation: check the emitted bytes against the policy and
     // log any disagreement, but never reject. `enabled()` is false on a production compile, so this
-    // is inert there; `jit_isa` only records `bb_starts`/`bb_edges` when it is true. `layout` is the
-    // module's §4 window geometry, which the window-access policy re-proves against (#2603).
+    // is inert there; `jit_isa` only records `bb_starts`/`bb_edges` when it is true. `entry` says what
+    // is known of the function's entry: a guest function's window geometry, which the window-access
+    // policy re-proves against, or a trampoline's host ABI (#2603).
     if validate::enabled() {
-        validate::shadow_check(code.code_buffer(), &code.bb_starts, &code.bb_edges, layout);
+        let patches = validate::patches(code.buffer.relocs().iter().map(|r| (r.offset, r.kind)));
+        validate::shadow_check(
+            code.code_buffer(),
+            &code.bb_starts,
+            &code.bb_edges,
+            &patches,
+            entry,
+        );
     }
     Ok(code)
 }
@@ -6692,9 +6706,10 @@ fn define_verified(
     id: FuncId,
     ctx: &mut cranelift_codegen::Context,
 ) -> Result<CompiledCode, JitError> {
-    // Trampolines (cap thunks, fuel refill) carry no guest window, so the policy has no window
-    // access to re-prove — the layout hint is `None`.
-    let code = compile_verified(module.isa(), ctx, None).map_err(JitError::Backend)?;
+    // Trampolines (cap thunks, fuel refill) are called under the host's ABI, not a guest function's
+    // entry contract, so they get the validator's decode and control-flow layers only (#2603 PR 3).
+    let code =
+        compile_verified(module.isa(), ctx, validate::Entry::Host).map_err(JitError::Backend)?;
     let relocs: Vec<ModuleReloc> = code
         .buffer
         .relocs()
@@ -7167,7 +7182,7 @@ mod compile_verified_tests {
     fn malformed_clif_fails_the_compile_before_cranelifts_passes() {
         let isa = jit_isa().unwrap();
         let mut ctx = cranelift_codegen::Context::for_function(malformed(&*isa));
-        let err = compile_verified(&*isa, &mut ctx, None).unwrap_err();
+        let err = compile_verified(&*isa, &mut ctx, validate::Entry::Host).unwrap_err();
         assert!(
             err.starts_with("CLIF verifier, on the lowered CLIF"),
             "{err}"
@@ -7215,7 +7230,7 @@ mod compile_verified_tests {
     fn compile_verified_emits_what_cranelifts_compile_emits() {
         let isa = jit_isa().unwrap();
         let mut ours = cranelift_codegen::Context::for_function(summing(&*isa));
-        let code = compile_verified(&*isa, &mut ours, None).unwrap();
+        let code = compile_verified(&*isa, &mut ours, validate::Entry::Host).unwrap();
         let mut theirs = cranelift_codegen::Context::for_function(summing(&*isa));
         let want = theirs.compile(&*isa, &mut Default::default()).unwrap();
         assert_eq!(code.code_buffer(), want.code_buffer());
