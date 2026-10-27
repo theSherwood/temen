@@ -57,8 +57,10 @@ mod rec;
 mod runners;
 mod support;
 
+use std::sync::mpsc;
+
 use probes::{Embedder, Outside};
-use runners::{bounded, once, way, End, Guest, Setup, Way};
+use runners::{once, way, End, Guest, Setup, Way, BOUND};
 use support::capability_probe::{probe_module_with, rows, Mint, Row, MAX_ARGC, PROBE_BEYOND};
 use temen_interp::{Host, Value};
 use temen_ir::Module;
@@ -120,10 +122,33 @@ fn ops(row: &Row) -> Vec<u32> {
     }
 }
 
+/// Sweep `cap`'s row on `runners`, on a thread of its own. A sweep makes thousands of runs, so the
+/// harness bounds each run rather than the whole: it fails once no run has ended for [`BOUND`].
+fn swept(cap: Capability, runners: Vec<Config>) -> Vec<Run> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let row = rows()
+            .into_iter()
+            .find(|r| r.cap == cap)
+            .expect("a drivable row");
+        let ran = tx.clone();
+        let runs = sweep(&row, &runners, &|| drop(ran.send(None)));
+        let _ = tx.send(Some(runs));
+    });
+    loop {
+        match rx.recv_timeout(BOUND) {
+            Ok(Some(runs)) => return runs,
+            Ok(None) => {}
+            Err(_) => panic!("{}'s sweep: no run ended within {BOUND:?}", cap.name()),
+        }
+    }
+}
+
 /// Run every call shape of every op of `row`, over each of its mints, on the oracle and on each of
 /// `runners`: the runs that had an answer to compare. Each run mints the row's powerbox afresh, in
-/// the same order, so a real handle baked into a shape names the same grant on every runner.
-fn sweep(row: &Row, runners: &[Config]) -> Vec<Run> {
+/// the same order, so a real handle baked into a shape names the same grant on every runner. `ran`
+/// hears each run end.
+fn sweep(row: &Row, runners: &[Config], ran: &dyn Fn()) -> Vec<Run> {
     let mut out = Vec::new();
     for mint in &row.mints {
         let setup = |_: &Module, _: &Embedder| -> (Host, Vec<Value>) {
@@ -141,7 +166,8 @@ fn sweep(row: &Row, runners: &[Config]) -> Vec<Run> {
                     .collect();
                 let m = probe_module_with(row.iface, op, argc, res, &real);
                 let shape = format!("argc {argc} -> {res}");
-                reached |= compare(&m, &setup, runners, &format!("op {op}"), &shape, &mut out);
+                let call = format!("op {op}");
+                reached |= compare(&m, &setup, runners, &call, &shape, ran, &mut out);
             }
             assert!(
                 row.ops.is_empty() || reached,
@@ -151,7 +177,7 @@ fn sweep(row: &Row, runners: &[Config]) -> Vec<Run> {
                 row.cap.name(),
             );
         }
-        hold(mint, runners, &mut out);
+        hold(mint, runners, ran, &mut out);
     }
     out
 }
@@ -160,7 +186,7 @@ fn sweep(row: &Row, runners: &[Config]) -> Vec<Run> {
 /// `runners`. A freeze lands at the first safepoint after a call, which a row's own ops may never
 /// reach: an empty interface's are all miscalled, and `Exit`'s ends the run. So the run calls a
 /// clock it is also granted, and freezes there with the handle in its powerbox.
-fn hold(mint: &Mint, runners: &[Config], out: &mut Vec<Run>) {
+fn hold(mint: &Mint, runners: &[Config], ran: &dyn Fn(), out: &mut Vec<Run>) {
     let setup = |_: &Module, _: &Embedder| -> (Host, Vec<Value>) {
         let (mut host, _, _) = mint();
         let clock = host.grant_clock();
@@ -172,17 +198,26 @@ fn hold(mint: &Mint, runners: &[Config], out: &mut Vec<Run>) {
         .filter(|c| c.props.has(Property::Durable))
         .collect();
     let m = probe_module_with(temen_ir::cap_id::CLOCK, 0, 0, "i64", &[]);
-    compare(&m, &setup, &durable, "held", "across a clock call", out);
+    compare(
+        &m,
+        &setup,
+        &durable,
+        "held",
+        "across a clock call",
+        ran,
+        out,
+    );
 }
 
 /// Run `m` over the powerbox `setup` builds on the oracle and on each of `runners`, and push the
-/// runs that had an answer to compare: whether any did.
+/// runs that had an answer to compare: whether any did. `ran` hears each run end.
 fn compare(
     m: &Module,
     setup: &Setup,
     runners: &[Config],
     call: &str,
     shape: &str,
+    ran: &dyn Fn(),
     out: &mut Vec<Run>,
 ) -> bool {
     let g = Guest {
@@ -191,10 +226,12 @@ fn compare(
         outside: Outside::Nothing,
     };
     let want = once(Way::OneShot(Executor::TreeWalk), &g, false, None);
+    ran();
     let mut reached = false;
     for &config in runners {
         let way = way(config).expect("an axis runs on the run-mode matrix's runners");
         let got = once(way, &g, false, Some(&want));
+        ran();
         if miscalled(&want) && miscalled(&got) {
             continue;
         }
@@ -261,14 +298,7 @@ fn every_run_driven_cell_matches_its_runs() {
     let runners = all_runners();
     let mut wrong = Vec::new();
     for cap in rows().iter().map(|r| r.cap) {
-        let mine = runners.clone();
-        let runs = bounded(format!("{}'s sweep", cap.name()), move || {
-            let row = rows()
-                .into_iter()
-                .find(|r| r.cap == cap)
-                .expect("a drivable row");
-            sweep(&row, &mine)
-        });
+        let runs = swept(cap, runners.clone());
         for axis in run_axes() {
             let on: Vec<Config> = axis.runners();
             let these: Vec<&Run> = runs.iter().filter(|r| on.contains(&r.config)).collect();
