@@ -374,7 +374,7 @@ pub struct Runner {
 /// **The runners**, the matrix's evidence: every configuration the conformance test runs each probe
 /// on. The test holds its own runners to this list exactly. A configuration missing here is ❔
 /// wherever a cell needs it, unless [`config_exception`] says why it does not exist.
-pub const RUNNERS: [Runner; 11] = {
+pub const RUNNERS: [Runner; 13] = {
     use Executor::*;
     use Property::*;
     [
@@ -425,6 +425,17 @@ pub const RUNNERS: [Runner; 11] = {
         Runner {
             config: Config::new(Cranelift, &[Durable]),
             what: "temen_run::jit_cap_run over a durable host, frozen and thawed the same way",
+        },
+        Runner {
+            config: Config::new(Pump, &[Reactor]),
+            what:
+                "bytecode::Reactor, the engine under the browser's reactors: the entry called as \
+                   two frames over one window and one powerbox, each run to its end, and held to \
+                   the tree-walker's capture entry called the same way",
+        },
+        Runner {
+            config: Config::new(Pump, &[Reactor, Held]),
+            what: "bytecode::Reactor::coop_call, each frame a CoopRun the embedder holds",
         },
     ]
 };
@@ -480,6 +491,8 @@ pub fn exception(f: Feature, c: Config) -> Option<Cell> {
     use Feature::*;
     let debugged = c.props.has(Property::Debugger);
     let durable = c.props.has(Property::Durable);
+    let reactor = c.props.has(Property::Reactor);
+    let held = c.props.has(Property::Held);
     Some(match (f, c.executor) {
         // The Cranelift JIT, whatever the run adds.
         (Threads | Fibers | Children, Cranelift) => conditional(FIBER_RT),
@@ -543,6 +556,15 @@ pub fn exception(f: Feature, c: Config) -> Option<Cell> {
             "the bytecode tier's durable entry takes a flat window, so a thaw traps MemoryFault \
              on a page the run mapped past its declared memory (#2628)",
         ),
+        // The pump's reactor, its entry called as frames.
+        (Exec, Pump) if reactor => not_yet(
+            "the frame that execs drops the reactor's window, so the next frame traps Malformed \
+             (#2660)",
+        ),
+        (GuestJit, Pump) if reactor && !held => not_yet(
+            "Reactor::call gives a frame no room for a §22 install, so the unit's call.dyn traps \
+             IndirectCallType; coop_call sizes it by the Jit grant (#2661)",
+        ),
         _ => return None,
     })
 }
@@ -574,13 +596,42 @@ pub fn config_exception(e: Executor, props: Props) -> Option<Cell> {
                      differential-checked against it (DEBUGGING.md)",
                 ))
             }
-            TreeWalk if props.has(Held) => {
+            TreeWalk | Pump if props.has(Durable) => {
                 return Some(not_yet(
-                    "the tree-walk Inspector hands its embedder no call to answer and no read to \
-                     feed (#2560)",
+                    "a debugger runs no durable run: its checkpoints refuse a durable host, and \
+                     nothing freezes a run under it (#2658)",
                 ))
             }
             TreeWalk | Pump => {}
+        }
+    }
+    if props.has(Reactor) && e != Pump {
+        return Some(not_yet(
+            "only the pump's reactor runs an embedder's powerbox: the tree-walker's and the JIT's \
+             are temen_run::Session, which runs a single-threaded on-ramp module, and executor 2 \
+             has none (#2662)",
+        ));
+    }
+    if props.has(Held) {
+        match e {
+            TreeWalk => {
+                return Some(declines(
+                    "the tree-walker runs every run to its end: the oracle's only run an embedder \
+                     holds is its debugger's, the Inspector",
+                ))
+            }
+            Cranelift => {
+                return Some(not_yet(
+                    "an embedder holds and resumes a run only on the bytecode tier; whether a \
+                     Cranelift run can be held, and at what cost, is #2561",
+                ))
+            }
+            Pump if props.has(Durable) => {
+                return Some(not_yet(
+                    "a held run cannot be frozen: CoopRun takes no freeze (#2659)",
+                ))
+            }
+            Pump | Parallel => {}
         }
     }
     None
