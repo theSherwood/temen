@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use temen_interp::{
     cap_id, run_capture_reserved_with_host, run_with_host, run_with_host_fast, CapPageMap,
     GuestMem, Host, HostProc, HostProcGrant, NodeRef, ProcHandler, RegionBacking, RootWindow,
-    StreamRole, Trap,
+    StreamRole, Trap, UnlockedCall,
 };
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
@@ -239,6 +239,7 @@ pub unsafe extern "C" fn cap_thunk(
             n_results,
             vm,
             pending_face.then_some(&mut pending_id),
+            None, // one caller at a time: an unlocked procedure runs inline
             &mut park,
         );
         if let Some(id) = pending_id {
@@ -445,7 +446,8 @@ pub unsafe extern "C" fn jit_sig_return(ctx: *mut c_void) {
 /// The shared [`cap_thunk`] body. `pending` is the §12 parking out-param: `Some` only from
 /// [`cap_thunk_locked`]'s generic tail, where a punted offloadable dispatch must not run (or
 /// wait) under the domain lock — the caller takes the completion id, releases the lock, and
-/// waits on [`Host::completions`].
+/// waits on [`Host::completions`]. `unlocked` (#2645) is the same for an unlocked host procedure:
+/// the caller takes the call, releases the lock, and runs it ([`Host::cap_dispatch_slots_deferring`]).
 ///
 /// # Safety
 /// Same contract as [`cap_thunk`].
@@ -464,6 +466,7 @@ unsafe fn cap_thunk_impl(
     n_results: u64,
     vm: &temen_jit::VmCtx,
     pending: Option<&mut Option<u64>>,
+    unlocked: Option<&mut Option<UnlockedCall>>,
     park: &mut Option<HostParkReq>,
 ) {
     let host = &mut *(ctx as *mut Host);
@@ -567,10 +570,10 @@ unsafe fn cap_thunk_impl(
     };
     let mut gm = gm;
     let view = gm.as_mut().map(|g| &mut **g as &mut dyn GuestMem);
-    let r = match pending {
-        Some(slot) => host.cap_dispatch_slots_pending(type_id, op, handle, arg_slots, view, slot),
-        None => host.cap_dispatch_slots(type_id, op, handle, arg_slots, view),
-    };
+    // A deferred call's placeholder results are empty, so nothing below writes them, and it raised
+    // no park.
+    let r =
+        host.cap_dispatch_slots_deferring(type_id, op, handle, arg_slots, view, pending, unlocked);
     match r {
         Ok(res) => {
             if n_results != 0 {
@@ -768,6 +771,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
         }
         let host_ptr = &mut *guard as *mut Host as *mut c_void;
         let mut pending_id = None;
+        let mut unlocked = None;
         let mut park = None;
         // #2495 — no parking face under a recording host, as in [`cap_thunk`].
         let face = (!guard.records_caps()).then_some(&mut pending_id);
@@ -785,8 +789,40 @@ pub unsafe extern "C" fn cap_thunk_locked(
             n_results,
             vm,
             face,
+            Some(&mut unlocked),
             &mut park,
         );
+        // #2645 — an unlocked host procedure runs with the domain lock released, so the run's other
+        // vCPUs make their host calls meanwhile. Its window copies each take the lock
+        // ([`LockedWindow`]). It raised no park.
+        if let Some(call) = unlocked {
+            #[cfg(any(unix, windows))]
+            let mut window = (!mem_base.is_null()).then(|| LockedWindow {
+                window: MprotectWindow::of(&mut guard, mem_base, mem_size, mem_reserved),
+                host: m,
+            });
+            drop(guard);
+            #[cfg(any(unix, windows))]
+            let view = window.as_mut().map(|w| w as &mut dyn GuestMem);
+            #[cfg(not(any(unix, windows)))]
+            let view = None;
+            let arg_slots = if n_args == 0 {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(args, n_args as usize)
+            };
+            match call.run(arg_slots, view) {
+                Ok(res) if n_results != 0 => {
+                    let out = std::slice::from_raw_parts_mut(results, n_results as usize);
+                    for (o, r) in out.iter_mut().zip(res) {
+                        *o = r;
+                    }
+                }
+                Ok(_) => {}
+                Err(t) => vm.raise(t.code()),
+            }
+            return;
+        }
         // #1826 — a would-block op parks with the domain lock released, so a sibling's write gets in,
         // then runs again.
         if let Some(p) = park {
@@ -3930,6 +3966,87 @@ fn host_page_size() -> u64 {
     match si.dwPageSize as u64 {
         0 => 4096,
         p => p,
+    }
+}
+
+/// #2645 — the window an unlocked host procedure's call ([`UnlockedCall`]) runs over on a JIT run
+/// whose vCPUs share the domain's host under a lock ([`cap_thunk_locked`]): the JIT's window, each
+/// access under that lock. The window's pages are hardware-protected, and every page-protection
+/// change runs under the lock, so a copy never meets a page another vCPU is unmapping or protecting:
+/// the call keeps, for its window accesses alone, the serialization it had when it ran under the lock.
+#[cfg(any(unix, windows))]
+struct LockedWindow<'a> {
+    window: MprotectWindow,
+    host: &'a Mutex<Host>,
+}
+
+#[cfg(any(unix, windows))]
+fn held(host: &Mutex<Host>) -> std::sync::MutexGuard<'_, Host> {
+    host.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(any(unix, windows))]
+impl GuestMem for LockedWindow<'_> {
+    fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
+        let _held = held(self.host);
+        self.window.read_bytes(ptr, len)
+    }
+    fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
+        let _held = held(self.host);
+        self.window.write_bytes(ptr, data)
+    }
+    fn window_size(&self) -> u64 {
+        self.window.window_size()
+    }
+    fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
+        let _held = held(self.host);
+        self.window.map(offset, len, prot)
+    }
+    fn unmap(&mut self, offset: u64, len: u64) -> i64 {
+        let _held = held(self.host);
+        self.window.unmap(offset, len)
+    }
+    fn protect(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
+        let _held = held(self.host);
+        self.window.protect(offset, len, prot)
+    }
+    fn tail_bytes(&self, offset: u64, len: u64) -> temen_interp::TailBytes {
+        let _held = held(self.host);
+        self.window.tail_bytes(offset, len)
+    }
+    fn page_runs(&self, offset: u64, len: u64, change: temen_interp::ClassChange) -> (u64, u64) {
+        let _held = held(self.host);
+        self.window.page_runs(offset, len, change)
+    }
+    fn window_runs(&self) -> u64 {
+        let _held = held(self.host);
+        self.window.window_runs()
+    }
+    fn map_region(
+        &mut self,
+        win_off: u64,
+        region_off: u64,
+        len: u64,
+        prot: i32,
+        region: u32,
+        backing: RegionBacking,
+    ) -> i64 {
+        let _held = held(self.host);
+        self.window
+            .map_region(win_off, region_off, len, prot, region, backing)
+    }
+    fn maps_region(&self, region: u32) -> bool {
+        let _held = held(self.host);
+        self.window.maps_region(region)
+    }
+    fn page_size(&self) -> i64 {
+        self.window.page_size()
+    }
+    fn region_page_size(&self) -> i64 {
+        self.window.region_page_size()
+    }
+    fn shadow(&self) -> temen_interp::ShadowArena {
+        self.window.shadow()
     }
 }
 
@@ -9265,7 +9382,7 @@ mod nim_module_suffix_tests {
     #[test]
     fn it_reproduces_the_build_directories_nimony_names_in_its_own_tree() {
         use super::NIMONY_TREE_PATHS;
-        // Observed verbatim: nimony 650bebb2, run at the root of its tree, built these programs in
+        // Observed verbatim: nimony 4a965c9b, run at the root of its tree, built these programs in
         // `nimcache/c/<stem>/`. `src/lib` is on its search path, so the stem is hashed from a `../`
         // walk, one character shorter than the spelling it was given.
         for (prog, stem) in [

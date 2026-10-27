@@ -1,12 +1,12 @@
-//! **The shared capability probe** — one fixture, three axis conformance tests (#1413).
+//! **The shared capability probe** — one fixture, both axis conformance tests (#1413).
 //!
-//! `debugger_conformance.rs` asks what the *debug tier* does with each powerbox capability's ops;
-//! `concurrency_conformance.rs` asks what the **OS-thread parallel driver** does with the same ops;
+//! `axis_conformance.rs` asks what each of the run-mode matrix's runners does with each powerbox
+//! capability's ops, held to the oracle (the `backend`, `concurrency` and `debugger` axes);
 //! `code_origin_conformance.rs` asks whether the same ops answer the same way when the caller is a
-//! §22 guest-JIT **unit** rather than the host-translated base module. All three need the identical
+//! §22 guest-JIT **unit** rather than the host-translated base module. Both need the identical
 //! scaffolding — how to mint a handle for each capability, which ops its ABI declares, and how to
 //! build a one-call module around them — so that scaffolding lives here once and each test supplies
-//! only its own driver and verdict vocabulary.
+//! only its own runs and verdict vocabulary.
 //!
 //! That is INVARIANTS #15 applied to the matrix's own machinery: the row set is a *parameter* of one
 //! structure, not a copy per column. A second copy would let the columns drift apart on what "the
@@ -21,7 +21,9 @@
 // call site; the compiler will not.
 #![allow(dead_code)]
 
-use temen_interp::{Host, HostProcGrant, ProcHandler, StreamRole};
+use temen_interp::{
+    CapState, Host, HostProc, HostProcGrant, ProcHandler, RegionBacking, SharedBacking, StreamRole,
+};
 use temen_parity::frontier::Capability;
 
 pub fn a_module() -> temen_ir::Module {
@@ -51,8 +53,13 @@ pub struct Row {
     pub cap: Capability,
     pub iface: u32,
     pub ops: &'static [u32],
-    /// Mint the powerbox and this row's handle, **plus** any real argument values its ops need —
-    /// `(op, argument index, value)`. Built by [`rows`]; most rows return an empty vec.
+    /// Each way an embedder grants this row's handle, and every axis runs each. Usually one. A row
+    /// whose durability turns on how its handle was granted has one for each side of the condition
+    /// its `durability` note states, so its runs show both sides rather than whichever one a single
+    /// grant happens to be.
+    ///
+    /// A mint builds the powerbox and this row's handle, **plus** any real argument values its ops
+    /// need — `(op, argument index, value)`. Built by [`rows`]; most rows return an empty vec.
     ///
     /// Real values have to come from the mint rather than a constant, because a handle's numeric
     /// value is whatever the grant table hands out. Hardcoding one produces a *forged* handle that
@@ -67,7 +74,7 @@ pub struct Row {
     /// exactly that trap: the retired op 13's drivers agreed on a forged module handle while
     /// disagreeing about a real one, so a zeros-only probe would have scored the cell green over a
     /// live divergence.
-    pub mint: Mint,
+    pub mints: Vec<Mint>,
 }
 
 /// Where the probe lays `instantiate_rec`'s (op 17's) record: above the durable control words at the
@@ -86,17 +93,60 @@ pub const RECORD_AT: u64 = 17408;
 /// reaches either gate.
 pub const PROBE_BEYOND: u32 = 4;
 
+/// The name the `HostProc` row's durable grant is under, which a thaw's registrar grants again
+/// (#1455): the probes' embedder serves it (`run_probes::named_proc`).
+pub const ZERO: &str = "zero";
+
+/// The `HostProc` row's procedure: it answers `0` to any call.
+pub fn zero() -> HostProc {
+    Box::new(|_, _, _, _| Ok(vec![0]))
+}
+
+/// A region backing something outside the VM writes, as a host file's is
+/// (`temen_run::new_file_region`), so no freeze carries its bytes (#2025, R4). Otherwise the OS
+/// shared-memory region it wraps.
+struct HostWritten(RegionBacking);
+
+impl SharedBacking for HostWritten {
+    fn size(&self) -> u64 {
+        self.0.size()
+    }
+    fn read_byte(&self, off: u64) -> u8 {
+        self.0.read_byte(off)
+    }
+    fn write_byte(&self, off: u64, b: u8) {
+        self.0.write_byte(off, b)
+    }
+    fn atomic(&self, off: u64, width: u32, f: &mut dyn FnMut(u64) -> Option<u64>) -> u64 {
+        self.0.atomic(off, width, f)
+    }
+    fn os_fd(&self) -> Option<i32> {
+        self.0.os_fd()
+    }
+    fn os_section(&self) -> Option<isize> {
+        self.0.os_section()
+    }
+    fn outside_writers(&self) -> bool {
+        true
+    }
+}
+
 pub fn rows() -> Vec<Row> {
-    // Most rows need no real argument values: wrap a plain `(Host, handle)` mint.
-    let row = |cap, iface, ops, mint: Box<dyn Fn() -> (Host, i32)>| -> Row {
+    // Most rows need no real argument values: wrap each plain `(Host, handle)` mint.
+    let row = |cap, iface, ops, mints: &[fn() -> (Host, i32)]| -> Row {
         Row {
             cap,
             iface,
             ops,
-            mint: Box::new(move || {
-                let (h, x) = mint();
-                (h, x, Vec::new())
-            }),
+            mints: mints
+                .iter()
+                .map(|&mint| -> Mint {
+                    Box::new(move || {
+                        let (h, x) = mint();
+                        (h, x, Vec::new())
+                    })
+                })
+                .collect(),
         }
     };
     use temen_ir::cap_id as c;
@@ -105,64 +155,82 @@ pub fn rows() -> Vec<Row> {
             Capability::Stream,
             c::STREAM,
             &[0, 1, 2],
-            Box::new(|| {
+            &[|| {
                 let mut h = Host::new();
                 let x = h.grant_stream(StreamRole::Out);
                 (h, x)
-            }),
+            }],
         ),
-        // A pipe end is `Stream`-typed: the same three ops over a shared FIFO backing.
+        // A pipe end is `Stream`-typed: the same three ops over a shared FIFO backing. One the
+        // domain minted, both ends in its powerbox, rides a freeze (#1680); one the embedder feeds
+        // is the cut's boundary.
         row(
             Capability::PipeEnd,
             c::STREAM,
             &[0, 1, 2],
-            Box::new(|| {
-                let mut h = Host::new();
-                let (r, _w) = h.grant_pipe();
-                (h, r)
-            }),
+            &[
+                || {
+                    let mut h = Host::new();
+                    let (r, _w) = h.grant_pipe();
+                    (h, r)
+                },
+                || {
+                    let mut h = Host::new();
+                    let (r, _fed) = h.grant_input_pipe();
+                    (h, r)
+                },
+            ],
         ),
         row(
             Capability::Exit,
             c::EXIT,
             &[0],
-            Box::new(|| {
+            &[|| {
                 let mut h = Host::new();
                 let x = h.grant_exit();
                 (h, x)
-            }),
+            }],
         ),
         row(
             Capability::Clock,
             c::CLOCK,
             &[0],
-            Box::new(|| {
+            &[|| {
                 let mut h = Host::new();
                 let x = h.grant_clock();
                 (h, x)
-            }),
+            }],
         ),
         // op 4 is #1511's runtime `grant`, unbuilt: every engine answers `-EINVAL`, and the bytecode
-        // lowering vetoes it by name. op 5 is `close` (#2358).
+        // lowering vetoes it by name. op 5 is `close` (#2358). A region only the domain holds rides
+        // a freeze (#2025); one something outside the VM writes is the cut's boundary.
         row(
             Capability::SharedRegion,
             c::SHARED_REGION,
             &[0, 1, 2, 3, 4, 5],
-            Box::new(|| {
-                let mut h = Host::new();
-                let x = h.grant_shared_region(4096);
-                (h, x)
-            }),
+            &[
+                || {
+                    let mut h = Host::new();
+                    let x = h.grant_shared_region(4096);
+                    (h, x)
+                },
+                || {
+                    let mut h = Host::new();
+                    let os = temen_run::new_shared_region(4096).expect("an OS region");
+                    let x = h.grant_shared_region_backed(std::sync::Arc::new(HostWritten(os)));
+                    (h, x)
+                },
+            ],
         ),
         row(
             Capability::AddressSpace,
             c::ADDRESS_SPACE,
             &[0, 1, 2, 3, 4],
-            Box::new(|| {
+            &[|| {
                 let mut h = Host::new();
                 let x = h.grant_address_space(0, 1 << 16);
                 (h, x)
-            }),
+            }],
         ),
         // The spawn family: join (1), child_offer (14) and instantiate_rec (17). The carve spawns
         // (0/5/13), the coroutine variants (6/7) and op 15's positional spawn are retired: every
@@ -172,70 +240,93 @@ pub fn rows() -> Vec<Row> {
             iface: c::INSTANTIATOR,
             ops: &[1, 14, 17],
             // Op 17's real value is the `Module` its record names ([`RECORD_AT`]); with the sweep's
-            // zero it never gets past reading its record, so admission would go untested.
-            mint: Box::new(|| {
+            // zero it never gets past reading its record, so admission would go untested. It is
+            // granted attested freezable, as a durable embedder grants one, so this row's freeze
+            // asks about the `Instantiator` alone: the `Module` row asks about the module.
+            mints: vec![Box::new(|| {
                 let mut h = Host::new();
                 let x = h.grant_instantiator();
-                let modh = h.grant_module(&a_module());
+                let modh = h.grant_durable_module(&a_module());
                 (h, x, vec![(17, 0, modh as i64)])
-            }),
+            })],
         },
         row(
             Capability::ModuleLoader,
             c::MODULE_LOADER,
             &[0],
-            Box::new(|| {
+            &[|| {
                 let mut h = Host::new();
                 let x = h.grant_module_loader();
                 (h, x)
-            }),
+            }],
         ),
         // No callable ops — a module handle confers only the authority to be named by the
         // `Instantiator`'s module spawns, so there is nothing for the debug tier to diverge about.
-        // Swept anyway (see `Row`): the claim is that nothing on it reaches either gate.
+        // Swept anyway (see `Row`): the claim is that nothing on it reaches either gate. A grant
+        // attested freezable rides a freeze (#1361); any other is refused.
         row(
             Capability::Module,
             c::MODULE,
             &[],
-            Box::new(|| {
-                let mut h = Host::new();
-                let x = h.grant_module(&a_module());
-                (h, x)
-            }),
+            &[
+                || {
+                    let mut h = Host::new();
+                    let x = h.grant_module(&a_module());
+                    (h, x)
+                },
+                || {
+                    let mut h = Host::new();
+                    let x = h.grant_durable_module(&a_module());
+                    (h, x)
+                },
+            ],
         ),
         row(
             Capability::Blocking,
             c::BLOCKING,
             &[0],
-            Box::new(|| {
+            &[|| {
                 let mut h = Host::new();
                 let x = h.grant_blocking(std::time::Duration::ZERO, None);
                 (h, x)
-            }),
+            }],
         ),
+        // A host procedure granted under a name rides a freeze, the thaw's registrar granting it
+        // again (#1455); an unnamed one is refused.
         row(
             Capability::HostProc,
             c::HOST_PROC,
             &[0],
-            Box::new(|| {
-                let mut h = Host::new();
-                let x = h.grant_host_proc(HostProcGrant::new(
-                    ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
-                    temen_interp::CapState::Stateless,
-                ));
-                (h, x)
-            }),
+            &[
+                || {
+                    let mut h = Host::new();
+                    let x = h.grant_host_proc(HostProcGrant::new(
+                        ProcHandler::Sync(zero()),
+                        CapState::Stateless,
+                    ));
+                    (h, x)
+                },
+                || {
+                    let mut h = Host::new();
+                    let x = h.grant_host_proc(HostProcGrant::new(
+                        ProcHandler::Sync(zero()),
+                        CapState::Stateless,
+                    ));
+                    h.register_cap_name(ZERO, x);
+                    (h, x)
+                },
+            ],
         ),
         // op 3 is `close` (#2384).
         row(
             Capability::Budget,
             c::BUDGET,
             &[0, 1, 3],
-            Box::new(|| {
+            &[|| {
                 let mut h = Host::new();
                 let x = h.grant_budget(-1, 1 << 16, 4);
                 (h, x)
-            }),
+            }],
         ),
     ]
 }

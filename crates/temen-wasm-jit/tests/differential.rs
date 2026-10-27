@@ -234,9 +234,9 @@ fn alu() {
     diff("alu", ALU, ARGS, FUEL);
 }
 
-/// A standalone `atomic.fence` is a pure ordering barrier — observably a no-op in a single-threaded
-/// guest. It must not perturb the surrounding computation (the result stays `arg + 1`), and the
-/// wasm-JIT emits nothing for it.
+/// A standalone `atomic.fence` is a pure ordering barrier — observably a no-op when no other agent
+/// shares the memory. It must not perturb the surrounding computation (the result stays `arg + 1`),
+/// and over an unshared memory the wasm-JIT emits nothing for it.
 const FENCE: &str = r#"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
@@ -1515,12 +1515,14 @@ fn fail_closed() {
     }
 }
 
-// ---- §12 atomics (single-threaded lowering) -----------------------------------------------------
-// A concurrency-free guest runs single-threaded, so an atomic op is observably identical to its plain
-// load/(rmw)/store sequence — which is exactly what the emitter lowers it to (with the interpreter's
-// natural-align trap). These differentials pin that: value semantics (old returned, new written) for
-// load/store/rmw/cmpxchg, and the confinement + alignment trap boundary (the security hinge — atomics
-// additionally trap on a misaligned effective address, which plain loads/stores do not).
+// ---- §12 atomics over an unshared memory ---------------------------------------------------------
+// No other agent can touch an unshared memory, so an atomic op is observably identical to its plain
+// load/(rmw)/store sequence — which is exactly what the emitter lowers it to there (with the
+// interpreter's natural-align trap). Over a shared memory it emits the hardware atomic, which `wasmi`
+// cannot run; `shared_memory_atomics_are_hardware_ops` pins that encoding. These differentials pin
+// the value semantics (old returned, new written) for load/store/rmw/cmpxchg, and the confinement +
+// alignment trap boundary (the security hinge — atomics additionally trap on a misaligned effective
+// address, which plain loads/stores do not).
 
 /// Atomic address probe: aligned and **misaligned** offsets (for both the 4- and 8-byte widths),
 /// exactly at / straddling / past the 64 KiB window edge, plus negative wraps. Both engines must trap
@@ -1648,6 +1650,72 @@ block 0 (v0: i64) {
 #[test]
 fn atomic_cmpxchg_value_semantics() {
     diff("atomic_cmpxchg", ATOMIC_CMPXCHG, ATOMIC_VAL_SWEEP, FUEL);
+}
+
+/// #2608 — over a **shared** memory each atomic is the threads proposal's own op, which `wasmi` cannot
+/// run, so this pins the encoding instead: the emit validates with threads on, and the atomic
+/// operators it holds are, in order, the ones the source names. Over an unshared memory it holds none.
+#[test]
+fn shared_memory_atomics_are_hardware_ops() {
+    // Each width's atomics at address `v0`, with a value of that width, then a fence.
+    let mut src = String::from(
+        "memory 16\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v32 = i32.wrap_i64 v0\n",
+    );
+    let mut want = Vec::new();
+    for (ty, val) in [("i32", "v32"), ("i64", "v0")] {
+        let wide = ty.to_uppercase();
+        let mut op = |text: String, name: &str| {
+            src += &format!("  {text}\n");
+            want.push(format!("{wide}Atomic{name}"));
+        };
+        op(format!("v{ty}l = {ty}.atomic.load v0"), "Load");
+        op(format!("{ty}.atomic.store v0 {val}"), "Store");
+        for (rmw, name) in [
+            ("add", "RmwAdd"),
+            ("sub", "RmwSub"),
+            ("and", "RmwAnd"),
+            ("or", "RmwOr"),
+            ("xor", "RmwXor"),
+            ("xchg", "RmwXchg"),
+        ] {
+            op(format!("v{ty}{rmw} = {ty}.atomic.rmw.{rmw} v0 {val}"), name);
+        }
+        op(
+            format!("v{ty}c = {ty}.atomic.cmpxchg v0 {val} {val}"),
+            "RmwCmpxchg",
+        );
+        src += "  atomic.fence\n";
+        want.push("AtomicFence".to_string());
+    }
+    src += "  return v0\n  }\n}\n";
+    let m = parse("shared_atomics", &src);
+    let atomics = |shared: bool| {
+        let wasm = temen_wasm_jit::compile_module_with(&m, shared).expect("emit");
+        let features = wasmparser::WasmFeatures::default() | wasmparser::WasmFeatures::THREADS;
+        wasmparser::Validator::new_with_features(features)
+            .validate_all(&wasm)
+            .unwrap_or_else(|e| panic!("shared {shared}: the emit validates: {e}"));
+        let mut ops = Vec::new();
+        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+            if let wasmparser::Payload::CodeSectionEntry(body) = payload.expect("parses") {
+                let mut r = body.get_operators_reader().expect("operators");
+                while !r.eof() {
+                    let op = format!("{:?}", r.read().expect("operator"));
+                    let name = op.split([' ', '{']).next().unwrap_or_default();
+                    if name.contains("Atomic") {
+                        ops.push(name.to_string());
+                    }
+                }
+            }
+        }
+        ops
+    };
+    assert_eq!(
+        atomics(true),
+        want,
+        "shared: each atomic is its hardware op"
+    );
+    assert!(atomics(false).is_empty(), "unshared: the plain sequence");
 }
 
 // ============================================================================================

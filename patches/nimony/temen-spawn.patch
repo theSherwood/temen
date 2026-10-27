@@ -23,19 +23,19 @@ the self-hosted lane holds Temen's build to. `temen_spawn.c` is `.compile`d into
 refuses with -ENOSYS. A Temen build (`nimony t`) compiles no C, so it never sees that file.
 
 Applied to a COPY of the pinned sources at build time (`scripts/nim-toolchain.sh`); the vendored
-`nimony/` submodule is never modified. Against the submodule pin (650bebb2). Temen-specific,
+`nimony/` submodule is never modified. Against the submodule pin (4a965c9b). Temen-specific,
 like temen-backend.patch, which it goes with.
 diff --git a/lib/std/os.nim b/lib/std/os.nim
-index 9d7eaf80..c85b18c6 100644
+index 638500ad..695ce280 100644
 --- a/lib/std/os.nim
 +++ b/lib/std/os.nim
-@@ -281,6 +281,12 @@ proc execShellCmd*(command: string): int {.tags: [ExecIOEffect].} =
-       let rc = posix_spawn(pid, sh.toCString, nil, nil,
+@@ -412,6 +412,12 @@ proc execShellCmd*(command: string): int {.tags: [ExecIOEffect].} =
+       let rc = posix_spawn(pid, shC, nil, nil,
                             cast[CCharArray](argv), cast[CCharArray](posix_environ))
        let launchFailed = rc != 0
 +    elif defined(temen):
 +      # Temen spawns the shell rather than forking to exec it (`posix.pspawn`).
-+      var req = SpawnRequest(path: sh.toCString, argv: cast[CCharArray](argv),
++      var req = SpawnRequest(path: shC, argv: cast[CCharArray](argv),
 +                             envp: cast[CCharArray](posix_environ))
 +      pid = pspawn(addr req)
 +      let launchFailed = pid.int < 0
@@ -43,7 +43,7 @@ index 9d7eaf80..c85b18c6 100644
        pid = fork()
        if pid == Pid(0):
 diff --git a/lib/std/osproc.nim b/lib/std/osproc.nim
-index 85206ca4..8918fc11 100644
+index b00f82f7..8cb1bb3b 100644
 --- a/lib/std/osproc.nim
 +++ b/lib/std/osproc.nim
 @@ -296,6 +296,39 @@ when not defined(windows):
@@ -86,7 +86,7 @@ index 85206ca4..8918fc11 100644
    else:
      proc forkProcess(s: var LaunchState; workingDir: string;
                       options: set[ProcessOption]): Pid {.raises.} =
-@@ -361,6 +394,8 @@ when not defined(windows):
+@@ -366,6 +399,8 @@ when not defined(windows):
          echo command, " ", joinArgs(args, " ")
        when defined(illumos):
          let pid = spawnProcess(s, workingDir, options)
@@ -96,10 +96,10 @@ index 85206ca4..8918fc11 100644
          let pid = forkProcess(s, workingDir, options)
  
 diff --git a/lib/std/posix/posix.nim b/lib/std/posix/posix.nim
-index ce0cd67d..86327d0a 100644
+index beaf04ce..1dc943ca 100644
 --- a/lib/std/posix/posix.nim
 +++ b/lib/std/posix/posix.nim
-@@ -215,6 +215,31 @@ when defined(posix):
+@@ -218,6 +218,31 @@ when defined(posix):
  
    when defined(illumos):
      include "illumos/spawn"

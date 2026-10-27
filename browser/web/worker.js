@@ -6,13 +6,13 @@
 
 import { adoptEngine, foreignMemory, registerForeign, releaseForeign } from './foreign-mem.js';
 import { engineImports } from './engine-imports.js';
-import { emittedTier, tierupJitArg, tierupJitRes } from './coop-driver.js';
+import { emittedTier, jsCapServicer, tierupJitArg, tierupJitRes } from './coop-driver.js';
 const STACK = 1 << 20; // per-Worker stack
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 
 self.onmessage = async (e) => {
   const { module, memory, win, winSize, role, stackTop, tlsBase, tierup, gptr, glen, tierupCell, start,
-    seedLen, x2Mem, x2MemId = -1, stream = false } = e.data;
+    seedLen, x2Mem, x2MemId = -1, stream = false, capModule = null } = e.data;
   // Liveness backstop: a trap here (the instantiate, or the engine past it) rejects this async
   // onmessage, and a Worker's unhandled rejection does NOT fire `Worker.onerror` on the page, so the
   // page would wait on a run that has ended. Wrap the entire body so ANY trap is reported as `fail`,
@@ -269,13 +269,17 @@ self.onmessage = async (e) => {
     const bytes = new Uint8Array(memory.buffer, ptr >>> 0, len >>> 0).slice();
     self.postMessage({ kind: 'out', fd, seq: seq >>> 0, bytes }, [bytes.buffer]);
   };
-  // A call this Worker's thread makes to a JS capability (#2579), whose function lives on the page:
-  // the call goes there, and the thread waits inside it until the page has answered in this
-  // Worker's cell (`[flag: i32, _, result: i64]`). Its arguments and its window view (`mem`) stay
-  // where they are, live while the call is, and the page reads and writes the window through that
-  // view alone (par.js).
-  let jsCell = 0;
+  // A call this Worker's thread makes to a JS capability (#2579). With the run's `capModule`
+  // (#2645), the module's `onCap`, imported into this Worker, answers it here, over the calling
+  // task's window. Otherwise its function lives on the page: the call goes there, and the thread
+  // waits inside it until the page has answered in this Worker's cell (`[flag: i32, _, result:
+  // i64]`). Its arguments and its window view (`mem`) stay where they are, live while the call is,
+  // and the page reads and writes the window through that view alone (par.js). Either way the call
+  // runs with its domain's host let go (an unlocked host procedure), so the run's other tasks make
+  // their host calls meanwhile.
+  let jsCell = 0, localCap = null;
   const js_cap_call = (slot, op, argsPtr, nArgs, mem) => {
+    if (localCap) return localCap(slot, op, argsPtr, nArgs, mem);
     jsCell ||= ex.temen_par_alloc(16);
     const flag = new Int32Array(memory.buffer, jsCell, 1);
     Atomics.store(flag, 0, 0);
@@ -287,6 +291,7 @@ self.onmessage = async (e) => {
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
   adoptEngine(ex, memory); // after the stack: it calls into the engine
+  if (capModule) localCap = jsCapServicer(ex, memory, (await import(capModule)).onCap);
   // #1414 B6 — the parallel driver: the root's Worker pumps the run, and each of its threads is a call
   // on a Worker of its own (`x2_spawn` above). The root reports how the run ended.
   if (role === 'x2root') {
