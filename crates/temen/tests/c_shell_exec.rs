@@ -31,7 +31,9 @@ use grant_hooks_mod::grant_hooks;
 use std::process::Command;
 
 use core::ffi::c_void;
-use temen_interp::{run_capture_reserved_with_host, GuestMem, Host, StreamRole, Trap};
+use temen_interp::{
+    run_capture_reserved_with_host, GuestMem, Host, HostProcGrant, ProcHandler, StreamRole, Trap,
+};
 use temen_ir::{Resolved, ResolvedCap};
 use temen_jit::{compile_and_run_capture_reserved_with_host_ex, JitOutcome};
 use temen_text::parse_module as parse_module_raw;
@@ -218,7 +220,10 @@ fn run(
     // The `Budget` each child's detached window spends (`vm_spawn` finds it by reflection).
     let _budget_h = host.grant_budget(-1, 1 << 20, -1);
     let echo_h = host.grant_module(cmd);
-    let _exec_h = host.grant_host_proc(exec_host(out_h, echo_h), temen_interp::CapState::Stateless);
+    let _exec_h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(exec_host(out_h, echo_h)),
+        temen_interp::CapState::Stateless,
+    ));
     // Link the shell's imports to their interfaces; the guest discovers the handles by reflection.
     let m = temen_ir::resolve_imports_with(shell, link_shim).expect("resolve");
     verify_module(&m).expect("verify shell");

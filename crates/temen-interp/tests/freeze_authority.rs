@@ -49,7 +49,7 @@ fn authority_round_trips_through_the_durable_handle_capture() {
     );
 
     let mut thawed = Host::new();
-    thawed.restore_durable_handles(&captured);
+    thawed.restore_durable_handles(&h.slot_generations(), &captured);
     assert!(
         thawed.holds_freeze_authority(),
         "a thawed holder holds what it held before the freeze"

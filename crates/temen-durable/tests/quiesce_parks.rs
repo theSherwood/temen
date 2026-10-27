@@ -19,7 +19,7 @@ use temen_durable::{
     arm_freeze_after_backedges, arm_freeze_on_quiesce, begin_thaw, init_durable_window,
     transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
+use temen_interp::{run_capture_reserved_with_host, Host, HostProcGrant, ProcHandler, Trap, Value};
 use temen_ir::Memory;
 
 const TEST_ARENA: temen_ir::durable_abi::ShadowArena =
@@ -722,13 +722,13 @@ fn a_vcpu_stopped_before_the_freeze_is_brought_through_it() {
     h.set_signal_source(stopper.clone(), Default::default());
     let stop = {
         let stopper = stopper.clone();
-        h.grant_host_proc(
-            Box::new(move |_op, _args, _mem, _minter| {
+        h.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Sync(Box::new(move |_op, _args, _mem, _minter| {
                 stopper.stop();
                 Ok(vec![0])
-            }),
+            })),
             temen_interp::CapState::Stateless,
-        )
+        ))
     };
     let out = h.grant_stream(temen_interp::StreamRole::Out);
     let args = [Value::I32(stop), Value::I32(out)];

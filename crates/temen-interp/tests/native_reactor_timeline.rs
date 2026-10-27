@@ -16,7 +16,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use temen_interp::moment::{Moment, MomentReactor, ReactorTimeline, Refusal, SteppableReactor};
-use temen_interp::{bytecode, Host, Value};
+use temen_interp::{bytecode, Host, HostProcGrant, ProcHandler, Value};
 use temen_text::parse_module;
 
 /// `tick()`: resolve the `kbd` capability by name (cap 13 is `HOST_PROC`), take **one** event from it (`-1` when the queue is
@@ -87,10 +87,10 @@ impl NativeReactor {
         // captures and a §12 freeze writes into its named-capability section (#1455). One definition,
         // read two ways.
         let (qc, qr) = (Arc::clone(&queue), Arc::clone(&queue));
-        let kbd = host.grant_host_proc(
-            Box::new(move |_op, _args, _mem, _minter| {
+        let kbd = host.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Sync(Box::new(move |_op, _args, _mem, _minter| {
                 Ok(vec![q.lock().unwrap().pop_front().unwrap_or(-1)])
-            }),
+            })),
             temen_interp::CapState::Captured {
                 capture: Box::new(move || {
                     qc.lock()
@@ -106,7 +106,7 @@ impl NativeReactor {
                         .collect();
                 }),
             },
-        );
+        ));
         host.register_cap_name("kbd", kbd);
 
         NativeReactor {

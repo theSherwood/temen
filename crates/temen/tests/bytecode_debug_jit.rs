@@ -12,7 +12,7 @@
 
 use temen_encode::encode_module;
 use temen_interp::bytecode::{SchedBreak, SchedStop, ScheduledDebugRun};
-use temen_interp::moment::Refusal;
+use temen_interp::{moment::Refusal, HostProcGrant, ProcHandler};
 use temen_interp::{run_with_host, Host, IrPc, Trap, Value};
 use temen_ir::Data;
 use temen_run::grant_jit;
@@ -600,14 +600,13 @@ block 0 (vh: i64) {
     let setup = move |m: &temen_ir::Module| {
         let (mut host, jit, codes) = compiled(m, &[unit]);
         let held = std::sync::Arc::clone(&held);
-        let proc = host.grant_host_proc_offloadable(
-            Box::new(move |_, _| {
+        let proc = host.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Offloadable(Box::new(move |_, _| {
                 let held = std::sync::Arc::clone(&held);
                 temen_interp::OffloadOutcome::Host(Box::new(move |c| held.lock().unwrap().push(c)))
-            }),
-            None,
+            })),
             temen_interp::CapState::Stateless,
-        );
+        ));
         let args = vec![Value::I32(jit), Value::I32(codes[0]), Value::I32(proc)];
         (host, args)
     };
