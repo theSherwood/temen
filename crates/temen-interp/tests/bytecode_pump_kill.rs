@@ -23,7 +23,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use temen_interp::{
-    bytecode, CapState, Host, OffloadOutcome, SignalSource, StreamRole, Trap, Value,
+    bytecode, CapState, Host, HostProcGrant, OffloadOutcome, ProcHandler, SignalSource, StreamRole,
+    Trap, Value,
 };
 
 /// Answers `killed()` truthfully, but on the `trigger`th query goes dead *after* answering and rings
@@ -177,8 +178,8 @@ fn a_kill_is_not_slept_through_while_a_call_waits() {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut host = Host::new();
-        let h = host.grant_host_proc_offloadable(
-            Box::new(move |_op, _args| {
+        let h = host.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Offloadable(Box::new(move |_op, _args| {
                 let gate = Arc::clone(&gate);
                 OffloadOutcome::Offload(Box::new(move || {
                     let (open, rung) = &*gate;
@@ -187,10 +188,9 @@ fn a_kill_is_not_slept_through_while_a_call_waits() {
                     drop(wait.unwrap());
                     7
                 }))
-            }),
-            None,
+            })),
             CapState::Stateless,
-        );
+        ));
         host.arm_external_wake();
         // Query 1: the root is still runnable. Query 2: the root is parked on its call — the kill
         // lands right after this sweep, and the pump's next move is the all-parked block.

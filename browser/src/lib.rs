@@ -25,7 +25,10 @@
 
 use std::alloc::Layout;
 
-use temen_interp::{bytecode, Host, PreparedModule, StreamRole, Trap, Value, DEFAULT_FUEL};
+use temen_interp::{
+    bytecode, Host, HostProcGrant, PreparedModule, ProcHandler, StreamRole, Trap, Value,
+    DEFAULT_FUEL,
+};
 
 // The `webgpu` capability's host import (browser: `navigator.gpu` via `webgpu_op`). Wasm-only — native
 // builds (the Rust reactor tests) have no such import, so the cap is simply not granted there.
@@ -2795,8 +2798,10 @@ impl OnrampCaps {
             // that never change which names they serve — so the fallback is never reached. It traps
             // rather than answers if it ever is.
             Some(temen_interp::ForkedProc::shared(
-                caps.handler(&name)
-                    .unwrap_or_else(|| Box::new(|_op, _args, _mem, _| Err(Trap::CapFault))),
+                ProcHandler::Sync(
+                    caps.handler(&name)
+                        .unwrap_or_else(|| Box::new(|_op, _args, _mem, _| Err(Trap::CapFault))),
+                ),
                 caps.cap_state(&name),
             ))
         })
@@ -2816,9 +2821,8 @@ impl OnrampCaps {
             let handler = caps.handler(name)?;
             caps.set_state(name, state); // re-seed before the guest can call it
             Some(temen_interp::NamedCapGrant {
-                handler,
-                fork: Some(caps.fork(name)),
-                state: caps.cap_state(name),
+                grant: HostProcGrant::new(ProcHandler::Sync(handler), caps.cap_state(name))
+                    .forkable(caps.fork(name)),
                 process: None,
             })
         })
@@ -2888,10 +2892,9 @@ impl OnrampCaps {
     /// Grant `name` onto `host` — handler, canonical name, and state — returning its handle.
     /// `None` for a name this powerbox does not serve (an `fs` with no file, say).
     fn grant(&self, host: &mut Host, name: &str) -> Option<i32> {
-        let handle = host.grant_host_proc_forkable(
-            self.handler(name)?,
-            self.fork(name),
-            self.cap_state(name),
+        let handle = host.grant_host_proc(
+            HostProcGrant::new(ProcHandler::Sync(self.handler(name)?), self.cap_state(name))
+                .forkable(self.fork(name)),
         );
         host.register_cap_name(name, handle);
         Some(handle)
@@ -3891,7 +3894,10 @@ fn pg_setup(
     let (files, dirs) = temen_fs::decode_image(image).map_err(|_| STATUS_DECODE_ERR)?;
     let (fs_hostfn, fs_handle) = temen_fs::mem_fs_seeded_shared(files, dirs);
     fs_handle.bind(&host.own_node()); // #2306 — the run pays for the data dir it is handed and grows
-    let fsh = host.grant_host_proc(fs_hostfn, fs_handle.cap_state());
+    let fsh = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(fs_hostfn),
+        fs_handle.cap_state(),
+    ));
     host.register_cap_name("fs", fsh);
     // IMPORTS.md phase 4: a manifest-carrying module executes its `call.import`s through
     // instantiation-time slot bindings — map each import name via the on-ramp policy onto the four
@@ -3914,10 +3920,12 @@ fn pg_setup(
         // (#1323), as the on-ramp and the debugger serve it: here over the same data dir, one store
         // behind both names, so it holds nothing the `fs` cap does not.
         let vm_fs = m.imports.iter().any(|im| im.name == "vm_fs").then(|| {
-            let h = host.grant_host_proc_forkable(
-                temen_fs::vm_fs_handler(&fs_handle),
-                temen_fs::vm_fs_fork(&fs_handle),
-                fs_handle.cap_state(),
+            let h = host.grant_host_proc(
+                HostProcGrant::new(
+                    ProcHandler::Sync(temen_fs::vm_fs_handler(&fs_handle)),
+                    fs_handle.cap_state(),
+                )
+                .forkable(temen_fs::vm_fs_fork(&fs_handle)),
             );
             host.register_cap_name("vm_fs", h);
             ("vm_fs", h)
@@ -8633,10 +8641,10 @@ pub extern "C" fn temen_mem_profile(
     // grants the hook first, so a scratch first-grant yields the exact baked-in value).
     let handle = {
         let mut scratch = run_host();
-        scratch.grant_host_proc(
-            Box::new(|_, _, _, _| Ok(vec![])),
+        scratch.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![]))),
             temen_interp::CapState::Stateless,
-        )
+        ))
     };
     let spec = temen_opt::instrument::MemHookSpec {
         type_id: temen_interp::cap_id::HOST_PROC,
@@ -8678,8 +8686,8 @@ pub extern "C" fn temen_mem_profile(
     let feed = Arc::clone(&model);
     let mut host = run_host();
     let mut n: u64 = 0; // the profile's event clock (hooks carry none; forward-only)
-    let h = host.grant_host_proc(
-        Box::new(move |op, args, _mem, _| {
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(move |op, args, _mem, _| {
             if let Some(ev) = decode_mem_event(op, args) {
                 n += 1;
                 feed.lock()
@@ -8687,10 +8695,10 @@ pub extern "C" fn temen_mem_profile(
                     .observe(n, 0, ev);
             }
             Ok(vec![])
-        }),
+        })),
         // The profile observes; the guest reads nothing back from it.
         temen_interp::CapState::Stateless,
-    );
+    ));
     debug_assert_eq!(h, handle, "the hook grant is the first grant");
     let mut fuel = u64::MAX;
     let res = bytecode::compile_and_run_with_host(&im, 0, &[], &mut fuel, &mut host);
@@ -8945,10 +8953,10 @@ pub fn reflect_exec(m: &temen_ir::Module, arg: i64) -> (i32, i64) {
     let _ = host.grant_stream(StreamRole::Out); // handle 0, type_id 0
     let _ = host.grant_exit(); // handle 1, type_id 1
                                // handle 2, type_id 13
-    let _ = host.grant_host_proc(
-        Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+    let _ = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
         temen_interp::CapState::Stateless,
-    );
+    ));
     let arity = m.funcs.first().map_or(0, |f| f.params.len());
     let args: Vec<Value> = if arity >= 1 {
         vec![Value::I32(arg as i32)]

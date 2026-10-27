@@ -13,7 +13,9 @@
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
-use temen_interp::{run_with_host, ForkedProc, Host, HostProcFork, StreamRole, Value};
+use temen_interp::{
+    run_with_host, ForkedProc, Host, HostProcFork, HostProcGrant, ProcHandler, StreamRole, Value,
+};
 use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
 
 /// What the child writes through the granted `fs`, and through the granted `stdout`.
@@ -85,10 +87,12 @@ fn spawn() -> Spawn {
         let f = Arc::clone(&factory);
         Arc::new(move |_pid| {
             let (h, s) = (*f)();
-            Some(ForkedProc::shared(h, s))
+            Some(ForkedProc::shared(ProcHandler::Sync(h), s))
         })
     };
-    let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork, fs_init_state);
+    let fs_h = host.grant_host_proc(
+        HostProcGrant::new(ProcHandler::Sync(fs_init), fs_init_state).forkable(fs_fork),
+    );
     let stdout = host.shared_stdout();
     let stdout_h = host.grant_stream(StreamRole::Out);
     let exit_h = host.grant_exit();

@@ -13,7 +13,8 @@
 //! restore→thaw run lands with the snapshot-codec slice that wires this to the window image.)
 
 use temen_interp::{
-    cap_id, DurableBinding, DurableHandle, Host, Lease, NonDurableKind, StreamRole, WINDOW_RUNS,
+    cap_id, DurableBinding, DurableHandle, Host, HostProcGrant, Lease, NonDurableKind, ProcHandler,
+    StreamRole, WINDOW_RUNS,
 };
 
 /// Grant a spread of durable bindings, capture, restore into a fresh table, and confirm the
@@ -57,7 +58,7 @@ fn durable_handles_round_trip_through_capture_restore() {
         }));
 
     let mut b = Host::new();
-    b.restore_durable_handles(&captured);
+    b.restore_durable_handles(&a.slot_generations(), &captured);
     assert_eq!(
         b.capture_durable_handles().unwrap(),
         captured,
@@ -89,7 +90,7 @@ fn restore_pins_generation_not_destination_default() {
     );
 
     let mut b = Host::new(); // slot 0 is generation 0 here
-    b.restore_durable_handles(&captured);
+    b.restore_durable_handles(&a.slot_generations(), &captured);
     let restored = b.capture_durable_handles().unwrap();
     assert_eq!(
         restored, captured,
@@ -128,10 +129,10 @@ fn drain_non_durable_makes_a_domain_snapshottable() {
     let mut a = Host::new();
     a.grant_clock(); // slot 0 — durable
     a.grant_blocking(std::time::Duration::ZERO, None); // slot 1 — non-durable
-    a.grant_host_proc(
-        Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+    a.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
         temen_interp::CapState::Stateless,
-    ); // slot 2 — non-durable
+    )); // slot 2 — non-durable
 
     assert!(
         a.capture_durable_handles().is_err(),
@@ -238,10 +239,10 @@ fn empty_table_captures_empty_and_capacity_is_table_size() {
 #[test]
 fn a_named_host_cap_is_durable_and_an_unnamed_one_is_not() {
     let mut named = Host::new();
-    let h = named.grant_host_proc(
-        Box::new(|_op, _args, _mem, _| Ok(vec![7])),
+    let h = named.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![7]))),
         temen_interp::CapState::Stateless,
-    );
+    ));
     named.register_cap_name("fs", h);
     let captured = named
         .capture_durable_handles()
@@ -250,10 +251,10 @@ fn a_named_host_cap_is_durable_and_an_unnamed_one_is_not() {
     assert_eq!(captured[0].binding, DurableBinding::Named { idx: 0 });
 
     let mut unnamed = Host::new();
-    unnamed.grant_host_proc(
-        Box::new(|_op, _args, _mem, _| Ok(vec![7])),
+    unnamed.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![7]))),
         temen_interp::CapState::Stateless,
-    );
+    ));
     let err = unnamed
         .capture_durable_handles()
         .expect_err("an unnamed host capability has no reconstruction rule");
@@ -265,10 +266,10 @@ fn a_named_host_cap_is_durable_and_an_unnamed_one_is_not() {
 #[test]
 fn a_named_host_cap_with_uncaptured_state_is_not_durable() {
     let mut host = Host::new();
-    let h = host.grant_host_proc(
-        Box::new(|_op, _args, _mem, _| Ok(vec![7])),
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![7]))),
         temen_interp::CapState::Uncaptured,
-    );
+    ));
     host.register_cap_name("posix", h);
     let err = host
         .capture_durable_handles()
@@ -283,20 +284,20 @@ fn capture_named_carries_the_providers_state() {
     let cursors = std::sync::Arc::new(std::sync::Mutex::new(vec![3u8, 1, 4]));
     let mut a = Host::new();
 
-    let stateless = a.grant_host_proc(
-        Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+    let stateless = a.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
         temen_interp::CapState::Stateless,
-    );
+    ));
     a.register_cap_name("display", stateless);
 
     let c = std::sync::Arc::clone(&cursors);
-    let stateful = a.grant_host_proc(
-        Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+    let stateful = a.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
         temen_interp::CapState::Captured {
             capture: Box::new(move || c.lock().unwrap().clone()),
             restore: Box::new(|_| {}),
         },
-    );
+    ));
     a.register_cap_name("fs", stateful);
 
     // State is read at capture time, not at registration time.
@@ -315,13 +316,13 @@ fn capture_named_carries_the_providers_state() {
 #[test]
 fn a_registrar_re_grants_named_caps_and_the_handles_still_dispatch() {
     let mut a = Host::new();
-    let h = a.grant_host_proc(
-        Box::new(|_op, _args, _mem, _| Ok(vec![1])),
+    let h = a.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![1]))),
         temen_interp::CapState::Captured {
             capture: Box::new(|| vec![42]),
             restore: Box::new(|_| {}),
         },
-    );
+    ));
     a.register_cap_name("fs", h);
 
     let handles = a.capture_durable_handles().expect("named ⇒ durable");
@@ -336,15 +337,18 @@ fn a_registrar_re_grants_named_caps_and_the_handles_still_dispatch() {
         // exactly the bytes it wrote at freeze.
         let answer = state.first().copied().unwrap_or(0) as i64;
         Some(temen_interp::NamedCapGrant {
-            handler: Box::new(move |_op: u32, _args: &[i64], _mem, _| Ok(vec![answer])),
-            fork: None,
-            state: temen_interp::CapState::Stateless,
+            grant: HostProcGrant::new(
+                ProcHandler::Sync(Box::new(move |_op: u32, _args: &[i64], _mem, _| {
+                    Ok(vec![answer])
+                })),
+                temen_interp::CapState::Stateless,
+            ),
             process: None,
         })
     }));
     b.restore_durable_named(&named)
         .expect("the registrar serves `fs`");
-    b.restore_durable_handles(&handles);
+    b.restore_durable_handles(&a.slot_generations(), &handles);
 
     assert_eq!(
         &*seen.lock().unwrap(),
@@ -371,13 +375,19 @@ fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
     fn factory() -> temen_interp::HostProcFork {
         std::sync::Arc::new(|_pid| {
             Some(temen_interp::ForkedProc::shared(
-                answer(),
+                ProcHandler::Sync(answer()),
                 temen_interp::CapState::Stateless,
             ))
         })
     }
     let mut a = Host::new();
-    let h = a.grant_host_proc_forkable(answer(), factory(), temen_interp::CapState::Stateless);
+    let h = a.grant_host_proc(
+        HostProcGrant::new(
+            ProcHandler::Sync(answer()),
+            temen_interp::CapState::Stateless,
+        )
+        .forkable(factory()),
+    );
     a.register_cap_name("display", h);
     let handles = a.capture_durable_handles().expect("named ⇒ durable");
     let named = a.capture_durable_named();
@@ -386,15 +396,19 @@ fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
         let mut b = Host::new();
         b.set_named_cap_registrar(Box::new(move |_name, _state, _payer| {
             Some(temen_interp::NamedCapGrant {
-                handler: answer(),
-                fork: forkable.then(factory),
-                state: temen_interp::CapState::Stateless,
+                grant: HostProcGrant {
+                    fork: forkable.then(factory),
+                    ..HostProcGrant::new(
+                        ProcHandler::Sync(answer()),
+                        temen_interp::CapState::Stateless,
+                    )
+                },
                 process: None,
             })
         }));
         b.restore_durable_named(&named)
             .expect("the registrar serves it");
-        b.restore_durable_handles(&handles);
+        b.restore_durable_handles(&a.slot_generations(), &handles);
         let lease = Lease {
             budget: b.grant_budget(-1, 1 << 20, -1),
             bytes: 1 << 16,
@@ -417,16 +431,81 @@ fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
     }
 }
 
+/// #2625 — **a thaw files a named capability in the shape it was granted.** The registrar returns the
+/// descriptor a grant takes, so an offloadable capability still punts after the thaw, a declared
+/// host-answered one still parks on the embedder, and a minting one is still handed the region
+/// minter. Before #2625 a registrar could return only a synchronous handler, and the thaw filed every
+/// named capability as one.
+#[test]
+fn a_restored_named_cap_keeps_the_shape_it_was_granted() {
+    use temen_interp::{CapRequests, CapState, NamedCapGrant, OffloadOutcome};
+    let requests = CapRequests::default();
+    let grant = move |name: &str| match name {
+        "pool" => HostProcGrant::new(
+            ProcHandler::Offloadable(Box::new(|_op, _args| {
+                OffloadOutcome::Offload(Box::new(|| 7))
+            })),
+            CapState::Stateless,
+        ),
+        "ui" => HostProcGrant::declared("ui", &requests),
+        "mmap" => HostProcGrant::new(
+            // Answers whether it was handed the minter.
+            ProcHandler::Minting(Box::new(|_op, _args, _mem, minter| {
+                Ok(vec![minter.is_some() as i64])
+            })),
+            CapState::Stateless,
+        ),
+        _ => unreachable!(),
+    };
+    let mut a = Host::new();
+    let mut held = Vec::new();
+    for name in ["pool", "ui", "mmap"] {
+        let h = a.grant_host_proc(grant(name));
+        a.register_cap_name(name, h);
+        held.push(h);
+    }
+    let [pool, ui, mmap] = held[..] else {
+        unreachable!()
+    };
+    let handles = a.capture_durable_handles().expect("named ⇒ durable");
+    let named = a.capture_durable_named();
+
+    let mut b = Host::new();
+    let registrar = grant.clone();
+    b.set_named_cap_registrar(Box::new(move |name, _state, _payer| {
+        Some(NamedCapGrant {
+            grant: registrar(name),
+            process: None,
+        })
+    }));
+    b.restore_durable_named(&named)
+        .expect("the registrar serves all three");
+    b.restore_durable_handles(&a.slot_generations(), &handles);
+    assert!(
+        !b.host_proc_is_sync(pool) && !b.parks_on_host(pool),
+        "the offloadable capability still punts"
+    );
+    assert!(
+        b.parks_on_host(ui),
+        "the declared one still parks on the embedder"
+    );
+    assert_eq!(
+        b.cap_dispatch_slots(cap_id::HOST_PROC, 0, mmap, &[], None),
+        Ok(vec![1]),
+        "the minting one is still handed the minter"
+    );
+}
+
 /// **The authority seam.** An artifact names a capability; it never carries one. A restoring host
 /// whose registrar does not serve the name grants nothing and says which name it refused — so a
 /// moment cannot smuggle authority into a host that would not have granted it fresh (INVARIANTS #3).
 #[test]
 fn a_restore_refuses_a_name_the_embedder_does_not_serve() {
     let mut a = Host::new();
-    let h = a.grant_host_proc(
-        Box::new(|_op, _args, _mem, _| Ok(vec![1])),
+    let h = a.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![1]))),
         temen_interp::CapState::Stateless,
-    );
+    ));
     a.register_cap_name("fs", h);
     let named = a.capture_durable_named();
 
@@ -442,9 +521,10 @@ fn a_restore_refuses_a_name_the_embedder_does_not_serve() {
     let mut picky = Host::new();
     picky.set_named_cap_registrar(Box::new(|name, _state, _payer| {
         (name == "display").then(|| temen_interp::NamedCapGrant {
-            handler: Box::new(|_op, _args, _mem, _| Ok(vec![0])),
-            fork: None,
-            state: temen_interp::CapState::Stateless,
+            grant: HostProcGrant::new(
+                ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
+                temen_interp::CapState::Stateless,
+            ),
             process: None,
         })
     }));
@@ -470,7 +550,7 @@ fn restore_closes_the_slots_the_capture_does_not_carry() {
     b.grant_clock();
     assert_eq!(b.grant_stream(StreamRole::Out), out);
     assert_eq!(b.grant_exit(), exit);
-    b.restore_durable_handles(&captured);
+    b.restore_durable_handles(&a.slot_generations(), &captured);
     assert_eq!(
         b.capture_durable_handles().unwrap(),
         captured,
@@ -481,6 +561,87 @@ fn restore_closes_the_slots_the_capture_does_not_carry() {
         "the dropped capability is not resurrected by the fresh grant"
     );
     assert!(b.handle_live(out));
+}
+
+/// #2360 — **a handle closed before the freeze stays closed after it**, restored into a host that
+/// granted nothing first. The slot's counter rides, so a use of the closed handle answers `-EBADF`
+/// as it did before the freeze; a generation the slot never issued is still a forgery. On main the
+/// slot came back at the fresh host's counter, `0`, and the closed handle trapped `CapFault`.
+#[test]
+fn a_handle_closed_before_the_freeze_answers_ebadf_after_it() {
+    let mut a = Host::new();
+    a.grant_stream(StreamRole::Out); // slot 0
+    let clk = a.grant_clock(); // slot 1
+    a.close(clk);
+    let generations = a.slot_generations();
+    assert_eq!(generations, [1, 1], "the closed slot keeps its counter");
+    let captured = a.capture_durable_handles().unwrap();
+    assert_eq!(captured.len(), 1, "only the live slot is an entry");
+
+    let mut b = Host::new();
+    b.restore_durable_handles(&generations, &captured);
+    assert_eq!(b.slot_generations(), generations, "the table rides whole");
+    assert_eq!(
+        b.cap_dispatch_slots(cap_id::CLOCK, 0, clk, &[], None),
+        Ok(vec![-9]),
+        "the closed handle answers -EBADF, as before the freeze"
+    );
+    let forged = clk + (1 << 10); // the next generation, which slot 1 never issued
+    assert_eq!(
+        b.cap_dispatch_slots(cap_id::CLOCK, 0, forged, &[], None),
+        Err(temen_interp::Trap::CapFault),
+        "a generation the slot never issued is still a forgery"
+    );
+}
+
+/// #2360 — **a grant after the thaw issues what the uninterrupted run's would.** The next grant into
+/// a closed slot counts on from the slot's carried counter, so it never re-issues the closed
+/// handle's value. On main it counted from the restoring host's `0`, and issued the closed value
+/// again.
+#[test]
+fn a_grant_after_the_thaw_issues_a_newer_generation() {
+    let mut a = Host::new();
+    let closed = a.grant_clock(); // slot 0, generation 1
+    a.close(closed);
+    let (generations, captured) = (a.slot_generations(), a.capture_durable_handles().unwrap());
+    let uninterrupted = a.grant_clock();
+    assert_ne!(uninterrupted, closed, "the slot's generation advanced");
+
+    let mut b = Host::new();
+    b.restore_durable_handles(&generations, &captured);
+    assert_eq!(
+        b.grant_clock(),
+        uninterrupted,
+        "the thawed grant issues the uninterrupted run's handle, not the closed one's value"
+    );
+    assert_eq!(
+        b.cap_dispatch_slots(cap_id::CLOCK, 0, closed, &[], None),
+        Ok(vec![-9]),
+        "and the closed handle is still closed"
+    );
+}
+
+/// #2360 — **the restored table is the artifact's, counters included.** A slot the thawing embedder
+/// granted before restoring, which the frozen run never granted, comes back never issued: its
+/// handle is a forgery there, and the next grant into it issues generation 1 as the frozen run's
+/// would.
+#[test]
+fn restore_resets_a_slot_the_frozen_run_never_granted() {
+    let mut a = Host::new();
+    a.grant_clock(); // slot 0
+    let (generations, captured) = (a.slot_generations(), a.capture_durable_handles().unwrap());
+
+    let mut b = Host::new();
+    b.grant_clock();
+    let stray = b.grant_clock(); // slot 1, which the frozen run never granted
+    b.restore_durable_handles(&generations, &captured);
+    assert_eq!(b.slot_generations(), [1], "slot 1 is back to never granted");
+    assert_eq!(
+        b.cap_dispatch_slots(cap_id::CLOCK, 0, stray, &[], None),
+        Err(temen_interp::Trap::CapFault),
+        "the embedder's own pre-restore handle names nothing the guest was granted"
+    );
+    assert_eq!(b.grant_clock(), a.grant_clock(), "slot 1's first grant");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -503,9 +664,14 @@ fn read(host: &mut Host, h: i32, field: i64) -> i64 {
         .expect("read")[0]
 }
 
-/// Restore `nodes` then `handles` into `host`, rewriting each handle's node key to its new id — what
-/// the snapshot codec does between its two steps.
-fn restore_budgets(host: &mut Host, nodes: &[DurableBudget], handles: &[DurableHandle]) {
+/// Restore `nodes` then `handles`, captured from `from`, into `host`, rewriting each handle's node key
+/// to its new id — what the snapshot codec does between its two steps.
+fn restore_budgets(
+    host: &mut Host,
+    from: &Host,
+    nodes: &[DurableBudget],
+    handles: &[DurableHandle],
+) {
     let ids = host
         .restore_durable_budgets(nodes)
         .expect("parents come first");
@@ -516,7 +682,7 @@ fn restore_budgets(host: &mut Host, nodes: &[DurableBudget], handles: &[DurableH
             *node = ids[at];
         }
     }
-    host.restore_durable_handles(&handles);
+    host.restore_durable_handles(&from.slot_generations(), &handles);
 }
 
 /// A root with a child node `b` that has charged a window round-trips through capture/restore: each
@@ -548,7 +714,7 @@ fn a_budget_node_round_trips_with_its_ceilings_charge_and_parent() {
     // An unbounded run, so a read reports the restored nodes alone: a guest sees the run's own
     // node's `channel` too (#2337).
     t.set_grant(-1, -1, -1, -1);
-    restore_budgets(&mut t, &nodes, &captured);
+    restore_budgets(&mut t, &a, &nodes, &captured);
     assert_eq!(read(&mut t, root, 1), (1 << 20) - 4096, "the root's room");
     assert_eq!(read(&mut t, b, 1), (1 << 19) - 4096, "b's room");
     assert_eq!(read(&mut t, root, 3), -1, "an unbounded field survives");
@@ -669,7 +835,7 @@ fn the_programs_child_image_rides_a_freeze() {
     b.grant_child_image();
     b.check_modules_for_thaw(&captured)
         .expect("the restoring powerbox derived the same image");
-    b.restore_durable_handles(&captured);
+    b.restore_durable_handles(&a.slot_generations(), &captured);
     assert_eq!(
         b.capture_durable_handles().unwrap(),
         captured,

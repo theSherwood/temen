@@ -3,7 +3,8 @@
 //! host-side `Inspector`. These pin the S4 per-op seam + S5 driver model end-to-end.
 
 use temen_interp::{
-    Host, Inspector, IrPc, SourceLoc, Stop, StopReason, StreamRole, Value, VarValue, WatchKind,
+    Host, HostProcGrant, Inspector, IrPc, ProcHandler, SourceLoc, Stop, StopReason, StreamRole,
+    Value, VarValue, WatchKind,
 };
 use temen_text::{parse_module, print_module};
 
@@ -835,14 +836,14 @@ fn captape_replays_host_proc_inputs_for_faithful_seek() {
     let mut host = Host::new();
     // A nondeterministic host capability: each call returns an incrementing counter.
     let mut n = 100i64;
-    let hf = host.grant_host_proc(
-        Box::new(move |_op, _args, _mem, _| {
+    let hf = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(move |_op, _args, _mem, _| {
             let v = n;
             n += 1;
             Ok(vec![v])
-        }),
+        })),
         temen_interp::CapState::Stateless,
-    );
+    ));
     let mut insp = Inspector::attach_with_host(&m, 0, &[Value::I32(hf)], 100_000, host);
 
     // Forward: 100 + 101 = 201; both crossings taped.

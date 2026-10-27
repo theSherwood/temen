@@ -664,7 +664,7 @@ Where each face runs:
     an engine lock, and a window read that finds the page map changing spins (`Mem::space_read` on
     the threads build).
 
-  Either way a JS capability is an **unlocked** host procedure (`Host::grant_host_proc_unlocked`,
+  Either way a JS capability is an **unlocked** host procedure (`ProcHandler::Unlocked`,
   #2645): its call runs with its domain's host let go, so a call that waits holds back no other
   task's host call.
 - **A Worker that runs an engine of its own** on the cooperative driver serves JS capabilities as

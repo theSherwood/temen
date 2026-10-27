@@ -18,7 +18,9 @@
 
 use core::ffi::c_void;
 use std::sync::{Arc, Mutex};
-use temen_interp::{run_capture_reserved_with_host, ForkedProc, Host, HostProc, Value};
+use temen_interp::{
+    run_capture_reserved_with_host, ForkedProc, Host, HostProc, HostProcGrant, ProcHandler, Value,
+};
 use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
 
 // The child: its `Instantiator` arrives as `v0` (unused). It seeds the name `"fs"` (`0x7366`
@@ -163,15 +165,21 @@ fn grant_fs(host: &mut Host, counter: &Arc<Mutex<i64>>) -> i32 {
     let fork = Arc::new(move |_pid: u64| {
         let c = Arc::clone(&c2);
         Some(ForkedProc::shared(
-            Box::new(move |_op, _args, _mem, _| {
+            ProcHandler::Sync(Box::new(move |_op, _args, _mem, _| {
                 let mut c = c.lock().unwrap();
                 *c += 1;
                 Ok(vec![*c])
-            }),
+            })),
             temen_interp::CapState::Stateless,
         ))
     });
-    host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Stateless)
+    host.grant_host_proc(
+        HostProcGrant::new(
+            ProcHandler::Sync(handler),
+            temen_interp::CapState::Stateless,
+        )
+        .forkable(fork),
+    )
 }
 
 /// `rustc --emit=llvm-ir` the guest to a textual `.ll` (single-crate `no_std`, no `llvm-link`/`opt`).

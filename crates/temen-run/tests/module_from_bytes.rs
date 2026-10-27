@@ -17,7 +17,9 @@
 
 use std::sync::Arc;
 
-use temen_interp::{run_with_host, ForkedProc, Host, HostProcFork, Value};
+use temen_interp::{
+    run_with_host, ForkedProc, Host, HostProcFork, HostProcGrant, ProcHandler, Value,
+};
 use temen_ir::{Data, Module};
 use temen_run::fs::MemFsHandle;
 use temen_text::parse_module;
@@ -125,10 +127,11 @@ fn run_parent(child_bytes: &[u8]) -> (Vec<Value>, MemFsHandle) {
         let factory = Arc::clone(&factory);
         Arc::new(move |_pid| {
             let (h, s) = (*factory)();
-            Some(ForkedProc::shared(h, s))
+            Some(ForkedProc::shared(ProcHandler::Sync(h), s))
         })
     };
-    let fs_h = host.grant_host_proc_forkable(init, fork, init_state);
+    let fs_h = host
+        .grant_host_proc(HostProcGrant::new(ProcHandler::Sync(init), init_state).forkable(fork));
     let inst = host.grant_instantiator();
     let loader = temen_run::grant_module_loader(&mut host);
     let budget = host.grant_budget(-1, 1 << 16, -1);

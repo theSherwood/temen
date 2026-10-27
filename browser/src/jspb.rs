@@ -25,7 +25,10 @@
 use std::cell::Cell;
 use std::sync::Arc;
 
-use temen_interp::{CapState, ForkedProc, GuestMem, Host, HostProcFork, UnlockedHostProc};
+use temen_interp::{
+    CapState, ForkedProc, GuestMem, Host, HostProcFork, HostProcGrant, ProcHandler,
+    UnlockedHostProc,
+};
 
 use crate::stash;
 
@@ -75,12 +78,15 @@ pub(crate) fn grant_js_caps(host: &mut Host, names: &[String]) -> Vec<(String, i
                 Arc::new(move |op, args, mem| Ok(vec![dispatch(slot as u32, op, args, mem)]));
             let twin = Arc::clone(&call);
             let fork: HostProcFork = Arc::new(move |_pid| {
-                Some(ForkedProc::unlocked(
-                    Arc::clone(&twin),
+                Some(ForkedProc::shared(
+                    ProcHandler::Unlocked(Arc::clone(&twin)),
                     CapState::Uncaptured,
                 ))
             });
-            let handle = host.grant_host_proc_unlocked(call, Some(fork), CapState::Uncaptured);
+            let handle = host.grant_host_proc(
+                HostProcGrant::new(ProcHandler::Unlocked(call), CapState::Uncaptured)
+                    .forkable(fork),
+            );
             // §7 F7/F9: the name is also the label, so a guest can `self.resolve` / `self.label` it.
             host.register_cap_name(name, handle);
             (name.clone(), handle)

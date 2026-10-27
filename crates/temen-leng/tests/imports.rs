@@ -2,7 +2,7 @@
 //! a declared Temen `import` + `call.import`, with its signature fixed from the call site. The runtime
 //! binds the import by name at instantiation (like `write`); here we bind a mock host fn and run.
 
-use temen_interp::{run_with_host, BoundImport, Host, Value};
+use temen_interp::{run_with_host, BoundImport, Host, HostProcGrant, ProcHandler, Value};
 
 const MOD: &str = "\
 (stmts
@@ -57,10 +57,10 @@ fn import_runs_when_bound() {
     let m = temen_leng::translate(MOD).unwrap();
     // Bind import slot 0 to a host fn `ext_double(x) = x * 2`, then use_ext(x) = x*2 + 1.
     let mut host = Host::new();
-    let handle = host.grant_host_proc(
-        Box::new(|_op, args, _mem, _| Ok(vec![args[0] * 2])),
+    let handle = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, args, _mem, _| Ok(vec![args[0] * 2]))),
         temen_interp::CapState::Stateless,
-    );
+    ));
     host.set_import_bindings(vec![BoundImport::required(
         temen_interp::cap_id::HOST_PROC,
         0,

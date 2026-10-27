@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 use temen_browser::plan::{run, Node, Pipe, Plan};
-use temen_interp::{ForkedProc, Host, HostProc, HostProcFork, Value};
+use temen_interp::{ForkedProc, Host, HostProc, HostProcFork, HostProcGrant, ProcHandler, Value};
 use temen_ir::Module;
 
 /// A one-node plan is the nim phase driver, byte for byte: grant records for the node's caps, its argv
@@ -113,12 +113,15 @@ fn run_two(grants_a: &[&str], grants_b: &[&str]) -> (i64, Vec<i64>) {
         let mint = mint.clone();
         Arc::new(move |_pid| {
             Some(ForkedProc::shared(
-                mint(),
+                ProcHandler::Sync(mint()),
                 temen_interp::CapState::Stateless,
             ))
         })
     };
-    let tally = host.grant_host_proc_forkable(mint(), fork, temen_interp::CapState::Stateless);
+    let tally = host.grant_host_proc(
+        HostProcGrant::new(ProcHandler::Sync(mint()), temen_interp::CapState::Stateless)
+            .forkable(fork),
+    );
     let (a, b) = (tally_node(1), tally_node(2));
     let out = run(&plan, &[&a, &b], host, &[tally]).expect("the plan runs");
     let got = match out.first() {
