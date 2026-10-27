@@ -187,9 +187,10 @@ fn diff_eligible(m: &temen_ir::Module, eligible: &[bool], wasm: &[u8], sweep: &[
 const SWEEP: &[i64] = &[0, 1, 2, 5, 64, 1000, -1, -1000, 100_000, i64::MIN, i64::MAX];
 
 /// The flagship shape: func 0 spawns worker vCPUs (concurrency — never JITs), the worker func 1
-/// increments a shared counter through an atomic (concurrency — never JITs) by an amount computed
-/// in the pure leaf func 2. Only func 2 is emitted + eligible, though it is reachable **only**
-/// through `thread.spawn` from func 0.
+/// increments a shared counter through an atomic by an amount computed in the pure leaf func 2.
+/// Funcs 1 and 2 are emitted + eligible, though they are reachable **only** through `thread.spawn`
+/// from func 0. Func 1's atomic is a hardware atomic over a shared memory and the plain sequence over
+/// this test's unshared one (#2608), which is what `wasmi` runs.
 const SPAWN: &str = r#"
 memory 16
 func () -> (i64) {
@@ -225,9 +226,9 @@ block 0 (v0: i64) {
 fn spawn_only_leaf_is_eligible_and_matches() {
     let m = build(SPAWN);
     let (wasm, eligible) = compile_module_tierup(&m, false).expect("tier-up emit");
-    // func 0 (thread.spawn) and func 1 (atomic.rmw) are concurrency → not in-subset → not emitted;
-    // func 2 is a pure i64 leaf reachable only via spawn → emitted + eligible.
-    assert_eq!(eligible, vec![false, false, true], "eligibility bitmap");
+    // func 0 (thread.spawn) is concurrency → not in-subset → not emitted; func 1 (atomic.rmw) and
+    // func 2 (a pure i64 leaf) are reachable only via spawn → emitted + eligible.
+    assert_eq!(eligible, vec![false, true, true], "eligibility bitmap");
     diff_eligible(&m, &eligible, &wasm, SWEEP);
 }
 
@@ -282,8 +283,8 @@ fn transitive_pure_leaves_both_emitted() {
 /// An in-subset function that calls a **non-leaf, non-subset** function (one using a concurrency op —
 /// `memory.notify` — which forces the interpreter and is not a leaf) must be dropped: its emitted body
 /// would carry an unroutable `Call`. The fixpoint removes it; the deeper pure leaf still emits.
-/// (`memory.notify` — not an atomic — is the out-of-subset vehicle: atomics are now emitted in a
-/// concurrency-free module, so a concurrency op is what a non-subset non-leaf needs here.)
+/// (`memory.notify` — not an atomic — is the out-of-subset vehicle: atomics are emitted, so a
+/// concurrency op is what a non-subset non-leaf needs here.)
 const UNROUTABLE_CALLER: &str = r#"
 memory 16
 func (i64) -> (i64) {

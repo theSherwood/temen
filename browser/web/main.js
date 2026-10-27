@@ -120,14 +120,19 @@ async function main() {
     // #2219: the live caller spawns func 1's child image, granted as the run's unit.
     const sv = await runPath('/corpus/live_caller.temenc', { inst: true, unitPath: '/corpus/live_caller_child.temenc', winSize: 1 << 17, minter: 1 << 20 });
     // #1414 B6-3: each thread runs its task's tier-ups on its own Worker — the `tierup` kernel's 8
-    // workers each call the emitted leaf once. Then a root that returns while its thread counts
-    // forever in an emitted leaf: the run's end stops the emitted code, so the run returns. The
-    // regions are the coop driver's emit (B6-3b-4).
+    // workers each run their entry there, which calls the leaf in emitted code (#2608: the entry's
+    // atomic add emits; the paged and collecting guests below keep interpreted tasks that call an
+    // emitted leaf). Then a root that returns while its thread counts forever in an emitted leaf:
+    // the run's end stops the emitted code, so the run returns. The regions are the coop driver's
+    // emit (B6-3b-4).
     const tu = await runPath('/corpus/threads_tierup.temenc', emit);
     const sp = await runPath('/corpus/root_leaves_a_spinner.temenc', emit);
     // #1414 ED-1: a thread whose entry is eligible runs it whole on its Worker's emitted tier, and
     // its results end the thread: each of the 8 counters' entries is one region.
     const te = await runPath('/corpus/threads_entry_tierup.temenc', emit);
+    // #2608: the entries contend on hardware atomics — an add, a cmpxchg loop, and a spinlock over a
+    // plain counter, 8 × 50000 each — and lose no update: 1200000.
+    const ta = await runPath('/corpus/threads_atomics_tierup.temenc', emit);
     // #2443: a fork-join whose spawner runs emitted. Its spawns, its wait for the first thread's
     // done flag and its joins each stop its task from inside a bounce, as each thread's notify
     // does: the spawner's call and the 4 threads' entries are 5 regions.
@@ -160,7 +165,8 @@ async function main() {
       r.exit === 7 && letters === 'abcd' && total === 8060n && fb.value === 13n && ct.includes('DivByZero') &&
       fibers.every((f) => f.ok) && dl.includes('ThreadFault') && sv.value === 142n &&
       tu.value === 4000n && tu.tierups === 8 && sp.value === 42n && sp.tierups === 1 &&
-      te.value === 4000n && te.tierups === 8 && fj.value === 1001500n && fj.tierups === 5 &&
+      te.value === 4000n && te.tierups === 8 && ta.value === 1200000n && ta.tierups === 8 &&
+      fj.value === 1001500n && fj.tierups === 5 &&
       pg.value === 35n && pg.tierups === 5 && pgt.why.includes('MemoryFault') && pgt.at === 65536n &&
       pgi.why.includes('MemoryFault') && pgi.at === 65536n &&
       gs.value === 55n && gs.tierups === 5 &&
@@ -176,6 +182,7 @@ async function main() {
       `· tier-up ${tu.value} (want 4000), ${tu.tierups} regions on emitted wasm (want 8) · ` +
       `stopped spinner ${sp.value} (want 42), ${sp.tierups} region (want 1) · ` +
       `thread entries ${te.value} (want 4000), ${te.tierups} on emitted wasm (want 8) · ` +
+      `contended atomics ${ta.value} (want 1200000), ${ta.tierups} entries on emitted wasm (want 8) · ` +
       `fork-join ${fj.value} (want 1001500), ${fj.tierups} regions with spawns, waits and joins in their ` +
       `bounces (want 5) · ` +
       `paged ${pg.value} (want 35), ${pg.tierups} regions (want 5), its store ${JSON.stringify(pgt.why)} ` +
@@ -316,6 +323,69 @@ block 0 (v0: i64) {
   return v14
   }
 }`;
+  // #2608: over the page's shared memory the emitted atomics are the threads proposal's own ops. Each
+  // one, at both widths, chained through one slot per width (each op's old value is the one before's
+  // new), returns the interpreter's sum of the old values and the final loads. 12345 also takes the
+  // second cmpxchg's compare-succeeds path.
+  const ATOMICS_SRC = `
+memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vw = i32.wrap_i64 v0
+  va = i64.const 16384
+  vs = i64.const 1000
+  i64.atomic.store va vs
+  vc3 = i64.const 3
+  vcm = i64.const 65295
+  vcx = i64.const 21845
+  vcr = i64.const 12345
+  va1 = i64.atomic.rmw.add va v0
+  va2 = i64.atomic.rmw.sub va vc3
+  va3 = i64.atomic.rmw.and va vcm
+  va4 = i64.atomic.rmw.or va v0
+  va5 = i64.atomic.rmw.xor va vcx
+  va6 = i64.atomic.rmw.xchg va v0
+  va7 = i64.atomic.cmpxchg va v0 vcr
+  va8 = i64.atomic.cmpxchg va v0 vs
+  atomic.fence
+  va9 = i64.atomic.load va
+  vb = i64.const 16400
+  vt = i32.const 77
+  i32.atomic.store vb vt
+  vd3 = i32.const 3
+  vdm = i32.const 65295
+  vdx = i32.const 21845
+  vdr = i32.const 12345
+  vb1 = i32.atomic.rmw.add vb vw
+  vb2 = i32.atomic.rmw.sub vb vd3
+  vb3 = i32.atomic.rmw.and vb vdm
+  vb4 = i32.atomic.rmw.or vb vw
+  vb5 = i32.atomic.rmw.xor vb vdx
+  vb6 = i32.atomic.rmw.xchg vb vw
+  vb7 = i32.atomic.cmpxchg vb vw vdr
+  vb8 = i32.atomic.cmpxchg vb vw vt
+  vb9 = i32.atomic.load vb
+  vp1 = i64.add va1 va2
+  vp2 = i64.add vp1 va3
+  vp3 = i64.add vp2 va4
+  vp4 = i64.add vp3 va5
+  vp5 = i64.add vp4 va6
+  vp6 = i64.add vp5 va7
+  vp7 = i64.add vp6 va8
+  vp8 = i64.add vp7 va9
+  vq1 = i32.add vb1 vb2
+  vq2 = i32.add vq1 vb3
+  vq3 = i32.add vq2 vb4
+  vq4 = i32.add vq3 vb5
+  vq5 = i32.add vq4 vb6
+  vq6 = i32.add vq5 vb7
+  vq7 = i32.add vq6 vb8
+  vq8 = i32.add vq7 vb9
+  vqx = i64.extend_i32_u vq8
+  vr = i64.add vp8 vqx
+  return vr
+  }
+}`;
   try {
     const bytes = await fetchBytes('/corpus/alu.temenc');
     const jit = await compileJit(ex, bytes, { memory });
@@ -356,15 +426,24 @@ block 0 (v0: i64) {
       if (sjit.call([arg], { winSize: 1 << 16 }).value !== interpBytes(sbytes, arg)) { simdEq = false; break; }
     }
 
-    const ok = eq && jv === iv && mixEq && ciEq && simdEq;
+    // Atomics: the emitted hardware atomics over the page's shared memory match the interpreter.
+    const abytes = encode(ATOMICS_SRC);
+    const ajit = await compileJit(ex, abytes, { memory });
+    let atomEq = ajit !== null;
+    if (ajit) for (const arg of [0n, 1n, 2n, 255n, 65535n, 12345n, -1n, 1n << 40n]) {
+      if (ajit.call([arg], { winSize: 1 << 16 }).value !== interpBytes(abytes, arg)) { atomEq = false; break; }
+    }
+
+    const ok = eq && jv === iv && mixEq && ciEq && simdEq && atomEq;
     set('wasmjit', ok ? 'pass' : 'fail',
       `wasmjit: alu f0 in-browser → ${jv} (interp ${iv}) ${eq && jv === iv ? 'ok' : 'FAIL'} · ` +
       `mixed-tier (JIT caller + interp SIMD leaf) ${mixEq ? 'ok' : 'FAIL'} · ` +
       `call_indirect dispatch ${ciEq ? 'ok' : 'FAIL'} · ` +
       `SIMD v128 ${simdEq ? 'ok' : 'FAIL'} · ` +
+      `atomics ${atomEq ? 'ok' : 'FAIL'} · ` +
       `alu n=${N}: jit ${jitMs.toFixed(1)}ms vs interp ${intMs.toFixed(1)}ms → ${(intMs / jitMs).toFixed(1)}× ` +
       `${ok ? 'PASS' : 'FAIL'}`);
-    log(`wasmjit → ${jv}, ${(intMs / jitMs).toFixed(1)}× over the interpreter; mixed-tier ${mixEq ? 'ok' : 'FAIL'}; call_indirect ${ciEq ? 'ok' : 'FAIL'}; SIMD ${simdEq ? 'ok' : 'FAIL'}`);
+    log(`wasmjit → ${jv}, ${(intMs / jitMs).toFixed(1)}× over the interpreter; mixed-tier ${mixEq ? 'ok' : 'FAIL'}; call_indirect ${ciEq ? 'ok' : 'FAIL'}; SIMD ${simdEq ? 'ok' : 'FAIL'}; atomics ${atomEq ? 'ok' : 'FAIL'}`);
   } catch (e) {
     set('wasmjit', 'fail', `wasmjit: error ${e}`);
   }

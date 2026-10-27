@@ -3677,9 +3677,8 @@ struct PosixRun<'a> {
 }
 
 /// A command for [`PosixRun::commands`] from a module only borrowed here, prepared as
-/// [`Host::grant_module`] would grant it: from a clone, whose vectors are exact where a decoded
-/// module's keep their growth slack. A caller that grants the same commands run after run keeps them
-/// prepared instead (a nim build's toolchain, #2087).
+/// [`Host::grant_module`] would grant it: from a clone. A caller that grants the same commands run
+/// after run keeps them prepared instead (a nim build's toolchain, #2087).
 fn prepare(m: &temen_ir::Module) -> PreparedModule {
     PreparedModule::new(std::sync::Arc::new(m.clone()))
 }
@@ -10131,8 +10130,9 @@ struct CoopTierupRun {
     /// [`temen_coop_tierup_win_ptr`] are for, and why the JS driver re-reads them after every
     /// cross-tier bounce (publishing the fresh base into the emitted `"win"` global).
     ///
-    /// `None` for a nimony build ([`nimony::temen_nim_open`]): its root window is the engine's own,
-    /// and each process it tiers up runs over a window of that process's.
+    /// `None` for a nimony build ([`nimony::temen_nim_open`]): the run holds its root's window (a
+    /// growable buffer when the root runs whole as a leaf, #2608), each process it tiers up runs over
+    /// a window of that process's, and the driver reads each event's ([`temen_coop_tierup_win_ptr`]).
     back: Option<std::sync::Arc<temen_interp::Region>>,
     /// #1896 — a nimony build's session: its personality. `None` for every other run.
     nim: Option<nimony::NimSession>,

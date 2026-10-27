@@ -259,8 +259,8 @@ block 0 (v0: i64) {
 /// guest or host — so the scan would answer with them omitted and a non-moving collector would free
 /// a live object. Every other leaf exclusion fails closed; this one would fail open.
 ///
-/// Note `Func::uses_concurrency` does not cover `gc.roots` (that predicate is the single-thread
-/// guarantee behind the atomics lowering), so the exclusion is explicit rather than incidental.
+/// Note `Func::uses_concurrency` does not cover `gc.roots` (that predicate asks about fibers, threads
+/// and futexes), so the exclusion is explicit rather than incidental.
 #[test]
 fn gc_roots_callee_is_not_an_interp_leaf() {
     let a = analyze(&m(r#"

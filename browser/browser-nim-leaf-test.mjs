@@ -16,8 +16,8 @@
 // or first writing to a full one — ends with exit 14 and the reply written: where the host suspends
 // (Chromium), after one tier-up and one resume; where it cannot (Node), interpreted. A leaf that
 // spawns a leaf and waits for it ends with exit 25 and the kid's file: where the host suspends, both
-// tier up, the kid while the spawner's frames wait, and the spawner resumes once; where it cannot,
-// only the kid tiers up.
+// tier up, and the spawner resumes at each of its two calls, the kid running while it waits; where
+// it cannot, only the kid tiers up.
 //
 // Usage:  node browser-nim-leaf-test.mjs [module.wasm]   (build the threads cdylib first)
 
@@ -71,10 +71,12 @@ const check = (host, r, suspends) => {
         + `(want ${tierups} and ${resumes})`);
     }
   }
-  // Where the host suspends, the spawner and its kid both run emitted, the kid while the spawner's
-  // frames wait, and the spawner's call runs on once: one resume. Where it cannot, only the kid does.
+  // Where the host suspends, the spawner and its kid both run emitted. The toolchain outlines each
+  // POSIX call into a one-op wrapper (#2608), so the spawner's own code is emitted and its frames
+  // wait at each of its two calls, the spawn and the wait: two resumes, the kid running while they
+  // wait. Where it cannot suspend, only the kid runs emitted.
   ended('spawns and waits', r.spawn, 25, 'leaf');
-  const [tierups, resumes] = suspends ? [2, 1] : [1, 0];
+  const [tierups, resumes] = suspends ? [2, 2] : [1, 0];
   if (r.spawn.leafTierups.length !== tierups || r.spawn.resumes !== resumes) {
     fail(`${host}: a leaf that spawns and waits: ${r.spawn.leafTierups.length} tier-ups and `
       + `${r.spawn.resumes} resumes (want ${tierups} and ${resumes})`);

@@ -23,3 +23,6 @@ temen-interp.workspace = true
 temen-jit.workspace = true
 temen-encode.workspace = true
 wasmi = { version = "0.47", features = ["simd"] }
+# Validates what `wasmi` cannot run: an emit over a shared memory, whose atomics are the threads
+# proposal's ops (#2608). The version `temen-wasm` already uses.
+wasmparser = "0.251"

@@ -195,6 +195,32 @@ enum Select<'a> {
     Whole,
 }
 
+/// A unit of a link, parsed: a link parses each unit's NIF once, and every pass over the units reads
+/// that tree (#2366).
+struct Parsed<'a> {
+    stem: &'a str,
+    root: Node,
+    sel: Select<'a>,
+}
+
+/// Parse each `(stem, src, sel)` ([`Parsed`]).
+fn parse_units<'a>(
+    units: impl IntoIterator<Item = (&'a str, &'a str, Select<'a>)>,
+) -> Result<Vec<Parsed<'a>>, LengError> {
+    units
+        .into_iter()
+        .map(|(stem, src, sel)| {
+            let root = nif::parse(src).map_err(LengError::Parse)?;
+            Ok(Parsed { stem, root, sel })
+        })
+        .collect()
+}
+
+/// Parse whole modules ([`parse_units`]).
+fn parse_whole<'a>(units: &[WholeModule<'a>]) -> Result<Vec<Parsed<'a>>, LengError> {
+    parse_units(units.iter().map(|u| (u.stem, u.src, Select::Whole)))
+}
+
 /// Translate one nimony module as a **relocatable link unit** and stamp its in-band export table.
 /// Link-unit mode: globals via `data.self` (so `link` relocates each unit's data into a disjoint
 /// window region — an absolute-offset unit would silently alias), and each proc exported under its
@@ -206,9 +232,9 @@ enum Select<'a> {
 #[allow(clippy::too_many_arguments)]
 fn translate_object_module(
     stem: &str,
-    src: &str,
+    root: &Node,
     sel: Select,
-    ext_types: &[(String, translate::Layout)],
+    ext_types: &translate::TypePool,
     ext_globals: &[(String, translate::TyDesc)],
     ext_frame_procs: &[String],
     ext_sret: &[(String, translate::TyDesc)],
@@ -219,7 +245,6 @@ fn translate_object_module(
     thread_locals: Option<&[(String, translate::TyDesc)]>,
     pooled_funcrefs: &crate::dethash::HashSet<String>,
 ) -> Result<Module, LengError> {
-    let root = nif::parse(src).map_err(LengError::Parse)?;
     let mut t = translate::Translator::new_for_link();
     t.import_types(ext_types);
     t.import_globals(ext_globals);
@@ -239,11 +264,11 @@ fn translate_object_module(
     // defines must carry the funcref ABI's leading `$sp` when **any** unit funcrefs it, and only the
     // pool can say so. `module_with_names` runs `compute_funcref_targets` (the locally-visible uses)
     // first, so this widens that set rather than replacing it.
-    t.import_funcref_targets(&root, stem, pooled_funcrefs);
+    t.import_funcref_targets(root, stem, pooled_funcrefs);
     let (text, export_names) = match sel {
-        Select::Whole => t.module_with_names(&root)?,
+        Select::Whole => t.module_with_names(root)?,
         Select::Names(names) => {
-            let text = t.some_procs(&root, names)?;
+            let text = t.some_procs(root, names)?;
             (text, names.iter().map(|s| s.to_string()).collect())
         }
     };
@@ -264,7 +289,7 @@ fn translate_object_module(
     module.data_funcrefs = t.funcref_relocs(stem);
     // Also expose `exportc` symbols under their C names (the conventional entry points — the C
     // `main`, `cmdCount`, …), so a host / `temen-run --link` can bind to them by name (Path A).
-    let (ec_procs, ec_data) = t.exportc_exports(&root)?;
+    let (ec_procs, ec_data) = t.exportc_exports(root)?;
     module.exports.extend(ec_procs);
     module.data_exports.extend(ec_data);
     Ok(module)
@@ -281,11 +306,12 @@ fn translate_object_module(
 /// defines (a `string` literal's `string.0.<stem>`) fail-closes here, because its layout is needed
 /// at translate time. [`link_units`] pools the linked units' type defs so those resolve.
 pub fn compile_object(unit: &LengModule) -> Result<Vec<u8>, LengError> {
+    let root = nif::parse(unit.src).map_err(LengError::Parse)?;
     Ok(temen_encode::encode_unit(&translate_object_module(
         unit.stem,
-        unit.src,
+        &root,
         Select::Names(unit.names),
-        &[],
+        &translate::TypePool::default(),
         &[],
         &[],
         &[],
@@ -304,11 +330,12 @@ pub fn compile_object(unit: &LengModule) -> Result<Vec<u8>, LengError> {
 /// [`compile_object`]; the same untrusted-producer discipline (the bytes re-enter through the
 /// hardened `decode_unit` firewall, and the linked result is re-verified).
 pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
+    let root = nif::parse(unit.src).map_err(LengError::Parse)?;
     Ok(temen_encode::encode_unit(&translate_object_module(
         unit.stem,
-        unit.src,
+        &root,
         Select::Whole,
-        &[],
+        &translate::TypePool::default(),
         &[],
         &[],
         &[],
@@ -335,7 +362,7 @@ pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
 /// global names ([`translate::Translator::export_types_pooled`]) and made available to all — a module
 /// constructing a `string.0.sysvq0asl` gets the system module's layout automatically, with no
 /// hand-supplied prelude.
-fn link_selected(units: &[(&str, &str, Select)]) -> Result<Module, LengError> {
+fn link_selected(units: &[Parsed]) -> Result<Module, LengError> {
     link_selected_with_extra(units, Vec::new(), false, false)
 }
 
@@ -502,7 +529,7 @@ fn synth_start_unit(entry: &str) -> Result<temen_ir::LinkUnit, LengError> {
 /// A program that can start a thread ([`starts_threads`]) gets its `tvar`s as thread-locals (#1715,
 /// NIM.md §3d); in any other, a `tvar` has one instance, and is a plain global.
 fn link_selected_with_extra(
-    units: &[(&str, &str, Select)],
+    units: &[Parsed],
     extra: Vec<temen_ir::LinkUnit>,
     manifest: bool,
     synth_start: bool,
@@ -525,7 +552,7 @@ fn link_selected_with_extra(
 /// which only discovers the system calls the compute shim leaves ([`nim_compute_exports`]), and its
 /// real link share one lowering.
 fn lower_selected(
-    units: &[(&str, &str, Select)],
+    units: &[Parsed],
     synth_start: bool,
 ) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
     // Cross-module aggregate type layouts. Unlike the other pools, an object type can *inherit* a
@@ -544,26 +571,22 @@ fn lower_selected(
     // agreed on that layout — it is not a cross-unit disagreement — which is why nothing downstream
     // could see it, and why nifler2 parsed into a `Parser` whose fields scribbled over each other.
     // Comparing the tables directly costs one extra round and cannot miss a change of either kind.
-    let roots: Vec<_> = units
-        .iter()
-        .map(|(_, src, _)| nif::parse(src).map_err(LengError::Parse))
-        .collect::<Result<_, _>>()?;
-    let mut pooled: Vec<(String, translate::Layout)> = Vec::new();
+    let mut pooled = translate::TypePool::default();
     let mut converged = false;
     // Each round resolves one more level of nesting/inheritance, so the bound is the depth of the
     // deepest chain — at most one link per unit, plus a round to observe the fixed point.
     for _ in 0..=units.len() + 1 {
-        let mut next: Vec<(String, translate::Layout)> = Vec::new();
-        for ((stem, _, _), root) in units.iter().zip(&roots) {
+        let mut next = crate::dethash::HashMap::default();
+        for u in units {
             next.extend(translate::Translator::export_types_pooled(
-                root, stem, &pooled,
+                &u.root, u.stem, &pooled,
             )?);
         }
-        if next == pooled {
+        if next == *pooled {
             converged = true;
             break;
         }
-        pooled = next;
+        pooled = translate::TypePool::new(next);
     }
     // Fail closed rather than compile against a layout table still in motion: every offset in the
     // program is read off this, and a stale one is silent memory corruption, not a link error.
@@ -581,9 +604,9 @@ fn lower_selected(
     let mut frame_nodes: Vec<(String, bool, Vec<String>)> = Vec::new();
     // Whether the program can start a thread, and if it can, every unit's thread-locals (stem-suffixed
     // name → descriptor), which a sibling reaches through `data.sym tls`.
-    let threads = roots
+    let threads = units
         .iter()
-        .map(starts_threads)
+        .map(|u| starts_threads(&u.root))
         .collect::<Result<Vec<_>, _>>()?
         .contains(&true);
     let mut pooled_tls: Vec<(String, translate::TyDesc)> = Vec::new();
@@ -611,26 +634,25 @@ fn lower_selected(
     // unit defines is absent here and keeps the local-global lowering — this can only link objects
     // that were already meant to be one, never fail a link that worked.
     let mut pooled_c_global_defs: Vec<String> = Vec::new();
-    for (stem, src, _) in units {
-        let root = nif::parse(src).map_err(LengError::Parse)?;
-        let (globals, tls) = translate::Translator::export_globals(&root, stem, &pooled, threads)?;
+    for Parsed { stem, root, .. } in units {
+        let (globals, tls) = translate::Translator::export_globals(root, stem, &pooled, threads)?;
         pooled_globals.extend(globals);
         pooled_tls.extend(tls);
         pooled_sret.extend(translate::Translator::export_sret_procs(
-            &root, stem, &pooled,
+            root, stem, &pooled,
         )?);
         pooled_proc_params.extend(translate::Translator::export_proc_params(
-            &root, stem, &pooled,
+            root, stem, &pooled,
         )?);
-        pooled_consts.extend(translate::Translator::export_consts(&root, stem)?);
-        pooled_c_global_defs.extend(translate::Translator::export_c_global_names(&root));
+        pooled_consts.extend(translate::Translator::export_consts(root, stem)?);
+        pooled_c_global_defs.extend(translate::Translator::export_c_global_names(root));
     }
     // The C-name alias pool, built **after** `pooled_c_global_defs` is complete: a unit that diverts
     // an `importc` declaration to its C name stops exporting that declaration's nim name, so every
     // other unit needs the same redirection for its own references. Second pass for the same reason
     // the frame fixpoint has one — the input must be whole before it is consumed.
     let mut pooled_c_global_aliases: Vec<(String, String)> = Vec::new();
-    for ((stem, _, _), root) in units.iter().zip(&roots) {
+    for Parsed { stem, root, .. } in units {
         pooled_c_global_aliases.extend(translate::Translator::export_c_global_aliases(
             root,
             stem,
@@ -644,7 +666,7 @@ fn lower_selected(
     // since it was written, but nothing pooled it. Feeds both the frame pre-scan below and the real
     // translation, which must agree on every proc's arity.
     let mut pooled_funcrefs: crate::dethash::HashSet<String> = crate::dethash::HashSet::default();
-    for ((stem, _, _), root) in units.iter().zip(&roots) {
+    for Parsed { stem, root, .. } in units {
         pooled_funcrefs.extend(translate::Translator::export_funcref_uses(
             root,
             stem,
@@ -653,10 +675,9 @@ fn lower_selected(
     }
     // Frame fixpoint input — computed now that every unit's sret-ness is pooled, so a proc that calls
     // an sret proc is correctly seen as frame-needing (its result temp lives in its own frame).
-    for (stem, src, _) in units {
-        let root = nif::parse(src).map_err(LengError::Parse)?;
+    for Parsed { stem, root, .. } in units {
         frame_nodes.extend(translate::Translator::proc_frame_nodes(
-            &root,
+            root,
             stem,
             &pooled,
             &pooled_sret,
@@ -679,7 +700,7 @@ fn lower_selected(
     // name) and, through the fixpoint below, makes every caller frame-needing so it owns an `$sp` to
     // hand down. A callee edge is recorded in its **globalized** form (`proc_frame_nodes` suffixes a
     // trailing-`.` name with the importer's stem), so seed both spellings.
-    for ((stem, _, _), root) in units.iter().zip(&roots) {
+    for Parsed { stem, root, .. } in units {
         for (sym, c) in translate::Translator::importc_procs(root)? {
             if libc_serves(&c) {
                 pooled_frame_procs.insert(format!("{sym}{stem}"));
@@ -704,11 +725,11 @@ fn lower_selected(
     let pooled_frame_procs: Vec<String> = pooled_frame_procs.into_iter().collect();
     let objects: Vec<Vec<u8>> = units
         .iter()
-        .map(|(stem, src, sel)| {
+        .map(|u| {
             Ok(temen_encode::encode_unit(&translate_object_module(
-                stem,
-                src,
-                *sel,
+                u.stem,
+                &u.root,
+                u.sel,
                 &pooled,
                 &pooled_globals,
                 &pooled_frame_procs,
@@ -860,11 +881,11 @@ fn seed_powerbox_heap(m: &mut Module) {
 /// selected subset of its procs ([`LengModule`]). See [`link_selected`] for the mechanism. Use
 /// [`link_whole_units`] to link modules *in full* (Path A).
 pub fn link_units(units: &[LengModule]) -> Result<Module, LengError> {
-    let sel: Vec<(&str, &str, Select)> = units
-        .iter()
-        .map(|u| (u.stem, u.src, Select::Names(u.names)))
-        .collect();
-    link_selected(&sel)
+    link_selected(&parse_units(
+        units
+            .iter()
+            .map(|u| (u.stem, u.src, Select::Names(u.names))),
+    )?)
 }
 
 /// **Link several nimony modules in full** into one temen-ir [`Module`] (NIM.md W2, Path A): every
@@ -872,11 +893,7 @@ pub fn link_units(units: &[LengModule]) -> Result<Module, LengError> {
 /// links, where each `.temeno` is a whole compiled module (the analog of `lld` over object files).
 /// See [`link_selected`] for the mechanism.
 pub fn link_whole_units(units: &[WholeModule]) -> Result<Module, LengError> {
-    let sel: Vec<(&str, &str, Select)> = units
-        .iter()
-        .map(|u| (u.stem, u.src, Select::Whole))
-        .collect();
-    link_selected(&sel)
+    link_selected(&parse_whole(units)?)
 }
 
 /// Link whole nimony modules **together with a host runtime** (NIM.md W3): the program and the
@@ -888,11 +905,7 @@ pub fn link_whole_with_runtime(
     units: &[WholeModule],
     runtime: Vec<temen_ir::LinkUnit>,
 ) -> Result<Module, LengError> {
-    let sel: Vec<(&str, &str, Select)> = units
-        .iter()
-        .map(|u| (u.stem, u.src, Select::Whole))
-        .collect();
-    link_selected_with_extra(&sel, runtime, false, false)
+    link_selected_with_extra(&parse_whole(units)?, runtime, false, false)
 }
 
 /// [`link_whole_with_runtime`], but **retaining the raw-syscall leaves** (`write`/`read`/`_exit`,
@@ -906,11 +919,7 @@ pub fn link_whole_with_runtime_manifest(
     units: &[WholeModule],
     runtime: Vec<temen_ir::LinkUnit>,
 ) -> Result<Module, LengError> {
-    let sel: Vec<(&str, &str, Select)> = units
-        .iter()
-        .map(|u| (u.stem, u.src, Select::Whole))
-        .collect();
-    link_selected_with_extra(&sel, runtime, true, false)
+    link_selected_with_extra(&parse_whole(units)?, runtime, true, false)
 }
 
 /// [`link_whole_with_runtime_manifest`] **plus a synthesized powerbox `_start`** (function 0): the
@@ -925,17 +934,13 @@ pub fn link_whole_powerbox_manifest(
     units: &[WholeModule],
     runtime: Vec<temen_ir::LinkUnit>,
 ) -> Result<Module, LengError> {
-    link_lowered(&lower_program(units)?, &runtime, true, true)
+    link_lowered(&lower_program(&parse_whole(units)?)?, &runtime, true, true)
 }
 
 /// A nim program's whole units, lowered for its link ([`lower_selected`]) after a powerbox `_start`:
 /// what [`link_whole_powerbox_manifest`] links, and what both of the nim link's passes share.
-fn lower_program(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
-    let sel: Vec<(&str, &str, Select)> = units
-        .iter()
-        .map(|u| (u.stem, u.src, Select::Whole))
-        .collect();
-    lower_selected(&sel, true)
+fn lower_program(units: &[Parsed]) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
+    lower_selected(units, true)
 }
 
 /// The **pure-compute C bottom edge** as TEMEN-text funcs — nimony's `memcpy`/`memcmp`/`memset`,
@@ -1421,7 +1426,7 @@ fn libc_serves(c_name: &str) -> bool {
 
 /// The **guest-libc leaves** a set of nim units imports, as `(import symbol, C name)` — the `importc`
 /// procs whose C name is in [`LIBC_SERVED`]. Drives both the frame seeding and [`nim_libc_units`].
-pub fn libc_leaves_of(units: &[WholeModule]) -> Result<Vec<(String, String)>, LengError> {
+fn libc_leaves_of(units: &[Parsed]) -> Result<Vec<(String, String)>, LengError> {
     let mut out = importc_leaves_of(units)?;
     out.retain(|(_, c)| libc_serves(c));
     Ok(out)
@@ -1436,7 +1441,7 @@ pub fn libc_leaves_of(units: &[WholeModule]) -> Result<Vec<(String, String)>, Le
 /// (`sin.2.mat7cnfv21`, how a *sibling* module calls a leaf `std/math` declares). A cross-module call
 /// resolves the callee to its global name, so binding only the bare form would leave every libm leaf
 /// an unbound manifest import.
-fn importc_leaves_of(units: &[WholeModule]) -> Result<Vec<(String, String)>, LengError> {
+fn importc_leaves_of(units: &[Parsed]) -> Result<Vec<(String, String)>, LengError> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut push = |name: String, c: &str| {
         if !out.iter().any(|(s, _)| *s == name) {
@@ -1444,8 +1449,7 @@ fn importc_leaves_of(units: &[WholeModule]) -> Result<Vec<(String, String)>, Len
         }
     };
     for u in units {
-        let root = nif::parse(u.src).map_err(LengError::Parse)?;
-        for (sym, c) in translate::Translator::importc_procs(&root)? {
+        for (sym, c) in translate::Translator::importc_procs(&u.root)? {
             push(format!("{sym}{}", u.stem), &c);
             push(sym, &c);
         }
@@ -1496,6 +1500,11 @@ pub fn nim_libc_units(
     libc: &[u8],
     units: &[WholeModule],
 ) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
+    libc_units(libc, &parse_whole(units)?)
+}
+
+/// [`nim_libc_units`] for parsed units.
+fn libc_units(libc: &[u8], units: &[Parsed]) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
     let module = temen_encode::decode_unit(libc)
         .map_err(|e| LengError::Malformed(format!("decode guest libc unit: {e:?}")))?;
     let mut exports: Vec<(String, u32)> = Vec::new();
@@ -1937,12 +1946,12 @@ pub fn link_nim(
     libc: Option<&[u8]>,
     debug: bool,
 ) -> Result<Module, LengError> {
-    let units = &link_order(units);
+    let units = &parse_whole(&link_order(units))?;
     // One lowering for both passes (#1790): the runtime's discovery link and this one.
     let program = lower_program(units)?;
     let mut runtime = runtime_for(units, &program, edge)?;
     if let Some(libc) = libc {
-        runtime.extend(nim_libc_units(libc, units)?);
+        runtime.extend(libc_units(libc, units)?);
     }
     let mut m = link_lowered(&program, &runtime, true, true)?;
     if !debug {
@@ -1997,13 +2006,14 @@ pub fn nim_runtime(
     units: &[WholeModule],
     edge: Edge,
 ) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
+    let units = &parse_whole(units)?;
     runtime_for(units, &lower_program(units)?, edge)
 }
 
 /// [`nim_runtime`] over `program`, the units already lowered ([`lower_program`]), so the link that
 /// follows lowers nothing again.
 fn runtime_for(
-    units: &[WholeModule],
+    units: &[Parsed],
     program: &[temen_ir::LinkUnit],
     edge: Edge,
 ) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
@@ -2076,6 +2086,7 @@ fn caps_runtime(
 /// system calls stay **retained imports**, for a caller to bind by name. Same discovery, same table
 /// as [`nim_runtime`]: one route through the compute bottom edge.
 pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit, LengError> {
+    let units = &parse_whole(units)?;
     let mut exports = nim_compute_exports(units, &lower_program(units)?)?.0;
     exports.push((HEAP_GROW_HOOK.to_string(), SHIM_HEAP_FIXED));
     let mut unit = compute_shim_unit(exports)?;
@@ -2143,7 +2154,7 @@ const POSIX_SERVED_LEAVES: &[&str] = &[
 /// `vm_map`, `vm_page_size`), which every host binds to the program's own window, as it does an
 /// on-ramp command's.
 fn posix_runtime(
-    units: &[WholeModule],
+    units: &[Parsed],
     mut compute_exports: Vec<(String, u32)>,
     m1: &Module,
     withheld: Vec<(String, temen_ir::FuncType)>,
@@ -2742,7 +2753,7 @@ fn compute_shim_unit(exports: Vec<(String, u32)>) -> Result<temen_ir::LinkUnit, 
 /// discovered against (whose surviving imports are the true syscalls — what the caller binds next).
 /// `program` is `units` lowered ([`lower_program`]): pass 1 links it, and the caller links it again.
 fn nim_compute_exports(
-    units: &[WholeModule],
+    units: &[Parsed],
     program: &[temen_ir::LinkUnit],
 ) -> Result<(Vec<(String, u32)>, Module), LengError> {
     // The compute shim must know which leaf names to export; discover them from the `system` unit's
