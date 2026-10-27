@@ -17,7 +17,7 @@ mod rec;
 use std::time::{Duration, Instant};
 
 use drivers::{agree_on_every_driver, Driver, Pumped, Ran, PUMPED};
-use temen_interp::bytecode::CoopEvent;
+use temen_interp::{bytecode::CoopEvent, HostProcGrant, ProcHandler};
 use temen_interp::{CapState, Host, OffloadOutcome, Value};
 use temen_ir::SpawnRec;
 
@@ -297,16 +297,15 @@ fn naps_keep_real_time_while_the_root_waits_on_the_world() {
     temen_verify::verify_module(&m).expect("verify");
     let setup = || {
         let mut h = Host::new();
-        let call = h.grant_host_proc_offloadable(
-            Box::new(|_op, _args| {
+        let call = h.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Offloadable(Box::new(|_op, _args| {
                 OffloadOutcome::Offload(Box::new(|| {
                     std::thread::sleep(CALL_TIME);
                     0
                 }))
-            }),
-            None,
+            })),
             CapState::Stateless,
-        );
+        ));
         (h, vec![Value::I32(call)])
     };
     let mut wrong = Vec::new();

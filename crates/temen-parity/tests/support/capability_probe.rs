@@ -21,7 +21,7 @@
 // call site; the compiler will not.
 #![allow(dead_code)]
 
-use temen_interp::{Host, StreamRole};
+use temen_interp::{Host, HostProcGrant, ProcHandler, StreamRole};
 use temen_parity::frontier::Capability;
 
 pub fn a_module() -> temen_ir::Module {
@@ -219,10 +219,10 @@ pub fn rows() -> Vec<Row> {
             &[0],
             Box::new(|| {
                 let mut h = Host::new();
-                let x = h.grant_host_proc(
-                    Box::new(|_, _, _, _| Ok(vec![0])),
+                let x = h.grant_host_proc(HostProcGrant::new(
+                    ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
                     temen_interp::CapState::Stateless,
-                );
+                ));
                 (h, x)
             }),
         ),

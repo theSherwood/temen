@@ -24,7 +24,9 @@
 
 #![cfg(target_os = "linux")]
 
-use temen_interp::{run_with_host, ForkedProc, Host, HostProcFork, Value};
+use temen_interp::{
+    run_with_host, ForkedProc, Host, HostProcFork, HostProcGrant, ProcHandler, Value,
+};
 
 // A child-entry `main(argc, argv)` mini-nifler: resolve `"fs"`, open `argv[1]` (O_READ), read up to 256
 // bytes, open `argv[2]` (O_WRITE|O_CREATE|O_TRUNC = 26), write them back, close both, return the byte
@@ -146,10 +148,11 @@ fn on_ramp_child_reads_argv_paths_and_copies_a_file_over_a_regranted_memfs() {
         let factory = std::sync::Arc::clone(&factory);
         std::sync::Arc::new(move |_pid| {
             let (h, s) = (*factory)();
-            Some(ForkedProc::shared(h, s))
+            Some(ForkedProc::shared(ProcHandler::Sync(h), s))
         })
     };
-    let fs_h = host.grant_host_proc_forkable(init, fork, init_state);
+    let fs_h = host
+        .grant_host_proc(HostProcGrant::new(ProcHandler::Sync(init), init_state).forkable(fork));
     let (inst, modh, budget) = temen_run::grant_conductor(&mut host, &child);
 
     let mut fuel = 200_000_000u64;

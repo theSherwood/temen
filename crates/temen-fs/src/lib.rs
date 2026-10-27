@@ -16,7 +16,9 @@
 use std::collections::HashMap;
 use std::path::{Component, Path};
 use std::sync::{Arc, Mutex};
-use temen_interp::{GuestMem, HostBuffer, HostCharge, HostProc, NodeRef};
+use temen_interp::{
+    GuestMem, HostBuffer, HostCharge, HostProc, HostProcGrant, NodeRef, ProcHandler,
+};
 use temen_ir::errno::*;
 
 pub const FS_OPEN: u32 = 0;
@@ -1313,7 +1315,10 @@ pub fn grant_vm_fs(host: &mut temen_interp::Host, seed: Option<&FsSeed>) -> i32 
         None => MemFsHandle::new(false),
     };
     fs.bind(&host.own_node());
-    let h = host.grant_host_proc_forkable(vm_fs_handler(&fs), vm_fs_fork(&fs), fs.cap_state());
+    let h = host.grant_host_proc(
+        HostProcGrant::new(ProcHandler::Sync(vm_fs_handler(&fs)), fs.cap_state())
+            .forkable(vm_fs_fork(&fs)),
+    );
     host.register_cap_name("vm_fs", h);
     h
 }
@@ -1341,9 +1346,8 @@ pub fn regrant_vm_fs(
         .then(|| MemFsHandle::rebuild(state, payer))
         .flatten()?;
     Some(temen_interp::NamedCapGrant {
-        handler: vm_fs_handler(&fs),
-        fork: Some(vm_fs_fork(&fs)),
-        state: fs.cap_state(),
+        grant: HostProcGrant::new(ProcHandler::Sync(vm_fs_handler(&fs)), fs.cap_state())
+            .forkable(vm_fs_fork(&fs)),
         process: None,
     })
 }
@@ -1357,7 +1361,7 @@ pub fn vm_fs_fork(fs: &MemFsHandle) -> temen_interp::HostProcFork {
     let fs = fs.clone();
     Arc::new(move |_pid| {
         Some(temen_interp::ForkedProc::shared(
-            vm_fs_handler(&fs),
+            ProcHandler::Sync(vm_fs_handler(&fs)),
             fs.cap_state(),
         ))
     })

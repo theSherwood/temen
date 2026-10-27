@@ -48,7 +48,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use temen_interp::bytecode::CoopEvent;
+use temen_interp::{bytecode::CoopEvent, HostProcGrant, ProcHandler};
 use temen_interp::{
     CapRequests, CapState, Completer, ForkedProc, Host, MemLayout, OffloadHostProc, OffloadOutcome,
     Value,
@@ -468,21 +468,28 @@ fn setup<'a>(
         h.set_lane_cap(lanes);
         let i = h.grant_instantiator();
         let forked = Arc::clone(&ticks);
-        let tick = h.grant_host_proc_forkable(
-            tick_proc(&ticks),
-            Arc::new(move |_pid| Some(ForkedProc::shared(tick_proc(&forked), CapState::Stateless))),
-            CapState::Stateless,
+        let tick = h.grant_host_proc(
+            HostProcGrant::new(ProcHandler::Sync(tick_proc(&ticks)), CapState::Stateless).forkable(
+                Arc::new(move |_pid| {
+                    Some(ForkedProc::shared(
+                        ProcHandler::Sync(tick_proc(&forked)),
+                        CapState::Stateless,
+                    ))
+                }),
+            ),
         );
         let forked = Arc::clone(&ticks);
-        let wait = h.grant_host_proc_offloadable(
-            wait_proc(&ticks, answer),
-            Some(Arc::new(move |_pid| {
-                Some(ForkedProc::offloadable(
-                    wait_proc(&forked, answer),
+        let wait = h.grant_host_proc(
+            HostProcGrant::new(
+                ProcHandler::Offloadable(wait_proc(&ticks, answer)),
+                CapState::Stateless,
+            )
+            .forkable(Arc::new(move |_pid| {
+                Some(ForkedProc::shared(
+                    ProcHandler::Offloadable(wait_proc(&forked, answer)),
                     CapState::Stateless,
                 ))
             })),
-            CapState::Stateless,
         );
         let b = h.grant_budget(-1, -1, -1);
         let images = kids
@@ -911,8 +918,8 @@ block 0 (vh: i32) {
     let let_go = Arc::new((Mutex::new(false), Condvar::new()));
     let mut host = Host::new();
     let gate = Arc::clone(&let_go);
-    let h = host.grant_host_proc_offloadable(
-        Box::new(move |_op, _args| {
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Offloadable(Box::new(move |_op, _args| {
             let gate = Arc::clone(&gate);
             OffloadOutcome::Offload(Box::new(move || {
                 let (open, rung) = &*gate;
@@ -920,10 +927,9 @@ block 0 (vh: i32) {
                 drop(rung.wait_timeout_while(open, GIVE_UP, |o| !*o).unwrap());
                 7
             }))
-        }),
-        None,
+        })),
         CapState::Stateless,
-    );
+    ));
     let interrupt = Arc::new(AtomicU64::new(0));
     let kill = Arc::clone(&interrupt);
     let watchdog = std::thread::spawn(move || {
@@ -964,18 +970,17 @@ fn answering_inside() -> (Host, Vec<Value>) {
     let filed: Filed = Arc::default();
     let mut h = Host::new();
     let to_file = Arc::clone(&filed);
-    let call = h.grant_host_proc_offloadable(
-        Box::new(move |_op, args| {
+    let call = h.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Offloadable(Box::new(move |_op, args| {
             let (filed, a) = (Arc::clone(&to_file), args[0]);
             OffloadOutcome::Host(Box::new(move |c: Completer| {
                 *filed.lock().unwrap() = Some((c, a, Instant::now()));
             }))
-        }),
-        None,
+        })),
         CapState::Stateless,
-    );
-    let answer = h.grant_host_proc(
-        Box::new(move |_op, _args, mem, _minter| {
+    ));
+    let answer = h.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(move |_op, _args, mem, _minter| {
             let parked = filed
                 .lock()
                 .unwrap()
@@ -989,9 +994,9 @@ fn answering_inside() -> (Host, Vec<Value>) {
             std::thread::sleep(SETTLE);
             c.complete(a + 100);
             Ok(vec![1])
-        }),
+        })),
         CapState::Stateless,
-    );
+    ));
     (h, vec![Value::I32(call), Value::I32(answer)])
 }
 

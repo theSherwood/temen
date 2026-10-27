@@ -20,7 +20,7 @@ use temen_durable::{
     arm_freeze_after_backedges, begin_thaw, init_durable_window, read_state, transform_module,
     write_state, STATE_NORMAL, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, Host, Value};
+use temen_interp::{run_capture_reserved_with_host, Host, HostProcGrant, ProcHandler, Value};
 use temen_ir::{Memory, Module};
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
@@ -375,13 +375,13 @@ fn a_freeze_request_the_root_never_polled_leaves_the_run_unfrozen() {
     let fc = Arc::clone(&freeze);
     let mut h = Host::new();
     h.set_durable(true);
-    let hf = h.grant_host_proc(
-        Box::new(move |_op, _args, _mem, _| {
+    let hf = h.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(move |_op, _args, _mem, _| {
             fc.request_freeze();
             Err(temen_interp::Trap::CapFault)
-        }),
+        })),
         temen_interp::CapState::Stateless,
-    );
+    ));
     let (out, snap, DurableResidue { .. }) = compile_and_run_durable(
         &inst,
         0,

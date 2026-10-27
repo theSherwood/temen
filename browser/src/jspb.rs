@@ -21,7 +21,7 @@
 //! On executor 2 a Worker's import sends the call to the page and waits inside it (`web/worker.js`),
 //! and the page answers it with the same accessors over the calling task's window (`web/par.js`).
 
-use temen_interp::{GuestMem, Host};
+use temen_interp::{GuestMem, Host, HostProcGrant, ProcHandler};
 
 use crate::stash;
 
@@ -66,12 +66,17 @@ pub(crate) fn grant_js_caps(host: &mut Host, names: &[String]) -> Vec<(String, i
             };
             let fork: temen_interp::HostProcFork = std::sync::Arc::new(move |_pid| {
                 Some(temen_interp::ForkedProc::shared(
-                    mint(),
+                    ProcHandler::Sync(mint()),
                     temen_interp::CapState::Uncaptured,
                 ))
             });
-            let handle =
-                host.grant_host_proc_forkable(mint(), fork, temen_interp::CapState::Uncaptured);
+            let handle = host.grant_host_proc(
+                HostProcGrant::new(
+                    ProcHandler::Sync(mint()),
+                    temen_interp::CapState::Uncaptured,
+                )
+                .forkable(fork),
+            );
             // §7 F7/F9: the name is also the label, so a guest can `self.resolve` / `self.label` it.
             host.register_cap_name(name, handle);
             (name.clone(), handle)

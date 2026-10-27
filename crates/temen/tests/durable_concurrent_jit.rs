@@ -16,7 +16,7 @@ use temen_durable::{
     begin_thaw, init_durable_window, read_state, transform_module_assume_confined, STATE_NORMAL,
     STATE_UNWINDING,
 };
-use temen_interp::Host;
+use temen_interp::{Host, HostProcGrant, ProcHandler};
 use temen_ir::{Memory, Module};
 use temen_jit::{
     compile_and_run_durable, DurableResidue, DurableRun, FreezeController, FrozenFiber, FrozenVCpu,
@@ -97,16 +97,16 @@ fn concurrent_freeze_from(inst: &Module, from: FreezeFrom) -> Option<FreezeOutco
     host.clock_ns = 42;
     let clk = host.grant_clock();
     // The root calls this once it has spawned its children; it flips the flag the controller waits on.
-    let hf = host.grant_host_proc(
-        Box::new(move |_op, _args, _mem, _| {
+    let hf = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(move |_op, _args, _mem, _| {
             match &at_signal {
                 Some(fc) => fc.request_freeze(),
                 None => sig.store(true, Ordering::SeqCst),
             }
             Ok(vec![0])
-        }),
+        })),
         temen_interp::CapState::Stateless,
-    );
+    ));
 
     // Set when the run returns. A run that ends without the signal (a child trapped, say) must not leave
     // the controller spinning: the test would hang instead of failing.
@@ -171,10 +171,10 @@ fn thaw(
     thost.clock_ns = 99;
     let tclk = thost.grant_clock();
     // The host fn is granted (handle order preserved) but never called on the thaw path.
-    let _ = thost.grant_host_proc(
-        Box::new(|_op: u32, _a: &[i64], _m, _| Ok(vec![0])),
+    let _ = thost.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op: u32, _a: &[i64], _m, _| Ok(vec![0]))),
         temen_interp::CapState::Stateless,
-    );
+    ));
     // Concurrent children `call.cap` from their own OS threads: the serialized thunk (#1166).
     let thost = Mutex::new(thost);
     let cc = CapCtx::Locked(&thost);
@@ -1191,10 +1191,10 @@ fn run_mv_fresh(inst: &Module) -> (JitOutcome, Vec<u8>) {
     let mut host = Host::new();
     host.clock_ns = 42;
     let clk = host.grant_clock();
-    let _ = host.grant_host_proc(
-        Box::new(|_op: u32, _a: &[i64], _m, _| Ok(vec![0])),
+    let _ = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op: u32, _a: &[i64], _m, _| Ok(vec![0]))),
         temen_interp::CapState::Stateless,
-    );
+    ));
     // Concurrent children `call.cap` from their own OS threads: the serialized thunk (#1166).
     let host = Mutex::new(host);
     let cc = CapCtx::Locked(&host);

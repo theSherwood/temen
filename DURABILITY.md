@@ -1563,8 +1563,8 @@ re-resolves. An **unnamed** one is unchanged: no reconstruction rule, so it stil
 Two halves make it honest:
 
 - **Provider state** — a `CapState`, which the provider gives wherever a handler is minted: at grant
-  (`Host::grant_host_proc*`), by a fork factory (`ForkedProc::state`), and by the thaw's registrar
-  (`NamedCapGrant::state`). It says what the *guest can observe* about the capability: an `fs`
+  (`HostProcGrant::state`), by a fork factory (`ForkedProc::state`), and by the thaw's registrar
+  (the `HostProcGrant` in its `NamedCapGrant`, #2625). It says what the *guest can observe* about the capability: an `fs`
   server's per-`open` cursors are read back by the guest's next `read`, so a thaw that forgot them
   resumes a guest whose open file silently rewound. `Captured { capture, restore }` serializes it;
   `Stateless` claims there is nothing (`display` is pure output); `Uncaptured` holds state nothing
