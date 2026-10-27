@@ -54,14 +54,30 @@
 //! As on the other driven columns, a row is scored only when the harness could mint its handle and
 //! drive its ops. `Jit`, `JitCode`, `Offer` and `LiveImpl` need a live unit or a live peer, so they
 //! stay `Unaudited` here exactly as they do on the debugger and concurrency columns.
+//!
+//! Both sides run on the pump's one-shot runner, the one every parity matrix runs on
+//! (`support/runners.rs`, #2545 D3a).
 
+#[path = "../../temen-interp/tests/support/drivers.rs"]
+mod drivers;
+#[path = "support/run_probes.rs"]
+mod probes;
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+#[path = "support/runners.rs"]
+mod runners;
 mod support;
+
+use probes::{Embedder, Outside};
+use runners::{once, End, Guest, Way};
 use support::capability_probe::{
     probe_module_with, rows, unit_module_with, Row, MAX_ARGC, PROBE_BEYOND,
 };
 use support::validate_unit;
-use temen_interp::{bytecode, Host, Trap, Value};
+use temen_interp::{Host, Value};
+use temen_ir::Module;
 use temen_parity::frontier::{capability_axes, Axis, Capability};
+use temen_parity::run_modes::Executor;
 use temen_parity::Status;
 
 /// The trampoline the unit side runs: `f0(jit, code, cap)` invokes the installed unit, handing it
@@ -116,16 +132,26 @@ enum Verdict {
     Answered(i64),
 }
 
-fn verdict(out: Option<Result<Vec<Value>, Trap>>) -> Verdict {
-    match out {
-        None | Some(Err(Trap::Malformed)) => Verdict::Unsupported,
-        Some(Err(Trap::CapFault)) => Verdict::CapFault,
-        Some(Err(t)) => Verdict::Trapped(format!("{t:?}")),
-        Some(Ok(v)) => Verdict::Answered(match v.first() {
-            Some(Value::I64(x)) => *x,
-            other => panic!("the probe entry returns i64, got {other:?}"),
-        }),
+fn verdict(end: End) -> Verdict {
+    match end {
+        End::Declined => Verdict::Unsupported,
+        End::Trap(t) if t == "Malformed" => Verdict::Unsupported,
+        End::Trap(t) if t == "CapFault" => Verdict::CapFault,
+        End::Trap(t) => Verdict::Trapped(t),
+        End::Value(x) => Verdict::Answered(x),
+        End::Stuck(why) => panic!("the probe entry returns one i64, got {why}"),
     }
+}
+
+/// Run `m` on the pump's one-shot runner over the powerbox and arguments `setup` builds.
+fn on_pump(m: &Module, setup: &dyn Fn() -> (Host, Vec<Value>)) -> Verdict {
+    let setup = |_: &Module, _: &Embedder| setup();
+    let g = Guest {
+        module: m,
+        setup: &setup,
+        outside: Outside::Nothing,
+    };
+    verdict(once(Way::OneShot(Executor::Pump), &g, false, None))
 }
 
 /// Grant the `Jit` and compile the probe's unit, returning `(jit handle, code handle)`. Run on
@@ -152,57 +178,41 @@ fn install_unit(
     }
 }
 
-/// The base module makes the cap call itself. The unit is still compiled (and never invoked) so the
-/// handle numbering matches the other side.
-fn from_base(
-    mut host: Host,
-    handle: i32,
-    iface: u32,
-    op: u32,
-    argc: usize,
-    res: &str,
-    real: &[(usize, i64)],
-) -> Verdict {
-    install_unit(&mut host, iface, op, argc, res, real).expect("the probe unit compiles");
-    let m = probe_module_with(iface, op, argc, res, real);
-    let mut fuel = 1_000_000u64;
-    verdict(bytecode::compile_and_run_with_host(
-        &m,
-        0,
-        &[Value::I32(handle)],
-        &mut fuel,
-        &mut host,
-    ))
+/// The base module makes the cap call itself, over `row`'s powerbox. The unit is still compiled (and
+/// never invoked) so the handle numbering matches the other side.
+fn from_base(row: &Row, op: u32, argc: usize, res: &str, real: &[(usize, i64)]) -> Verdict {
+    let m = probe_module_with(row.iface, op, argc, res, real);
+    on_pump(&m, &|| {
+        let (mut host, handle, _) = (row.mint)();
+        install_unit(&mut host, row.iface, op, argc, res, real).expect("the probe unit compiles");
+        (host, vec![Value::I32(handle)])
+    })
 }
 
 /// The unit makes the cap call, reached by `route` from the matching trampoline.
-#[allow(clippy::too_many_arguments)]
 fn from_unit(
     route: Route,
-    mut host: Host,
-    handle: i32,
-    iface: u32,
+    row: &Row,
     op: u32,
     argc: usize,
     res: &str,
     real: &[(usize, i64)],
 ) -> Verdict {
-    let (jit, code) =
-        install_unit(&mut host, iface, op, argc, res, real).expect("the unit compiles");
     let tramp = match route {
         Route::Invoke => INVOKE_TRAMPOLINE,
         Route::Install => INSTALL_TRAMPOLINE,
     };
     let base = temen_text::parse_module(tramp).expect("the trampoline parses");
     temen_verify::verify_module(&base).expect("the trampoline verifies");
-    let mut fuel = 1_000_000u64;
-    verdict(bytecode::compile_and_run_with_host(
-        &base,
-        0,
-        &[Value::I32(jit), Value::I32(code), Value::I32(handle)],
-        &mut fuel,
-        &mut host,
-    ))
+    on_pump(&base, &|| {
+        let (mut host, handle, _) = (row.mint)();
+        let (jit, code) =
+            install_unit(&mut host, row.iface, op, argc, res, real).expect("the unit compiles");
+        (
+            host,
+            vec![Value::I32(jit), Value::I32(code), Value::I32(handle)],
+        )
+    })
 }
 
 /// Every `(argc, result type)` shape the sweep tries.
@@ -215,15 +225,14 @@ fn shapes() -> impl Iterator<Item = (usize, &'static str)> {
 fn divergences(row: &Row, op: u32, route: Route) -> Vec<(String, Verdict, Verdict)> {
     let mut out = Vec::new();
     for (argc, res) in shapes() {
-        let (h, x, real) = (row.mint)();
+        let (_, _, real) = (row.mint)();
         let real: Vec<(usize, i64)> = real
             .iter()
             .filter(|(o, _, _)| *o == op)
             .map(|(_, idx, v)| (*idx, *v))
             .collect();
-        let b = from_base(h, x, row.iface, op, argc, res, &real);
-        let (h, x, _) = (row.mint)();
-        let u = from_unit(route, h, x, row.iface, op, argc, res, &real);
+        let b = from_base(row, op, argc, res, &real);
+        let u = from_unit(route, row, op, argc, res, &real);
         // Neither side found an arm: the harness miscalled this shape, so there is nothing to
         // compare. A cap fault on exactly one side *is* a divergence and is kept.
         if b == Verdict::CapFault && u == Verdict::CapFault {
@@ -336,21 +345,18 @@ fn the_instantiator_row_by_route() {
         (1, 1, Verdict::Trapped("ThreadFault".into())),
     ] {
         let args = real(op);
-        let (h, x, _) = (row.mint)();
         assert_eq!(
-            from_base(h, x, row.iface, op, argc, "i32", &args),
+            from_base(&row, op, argc, "i32", &args),
             base_says,
             "op {op} from the base module"
         );
-        let (h, x, _) = (row.mint)();
         assert_eq!(
-            from_unit(Route::Install, h, x, row.iface, op, argc, "i32", &args),
+            from_unit(Route::Install, &row, op, argc, "i32", &args),
             base_says,
             "op {op} from an installed §22 unit — the caller's own frames"
         );
-        let (h, x, _) = (row.mint)();
         assert_eq!(
-            from_unit(Route::Invoke, h, x, row.iface, op, argc, "i32", &args),
+            from_unit(Route::Invoke, &row, op, argc, "i32", &args),
             Verdict::CapFault,
             "op {op} from an invoked §22 unit — no Instantiator inside a seam-free leaf"
         );

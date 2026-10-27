@@ -18,11 +18,11 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 
 - **nesting** — can a §14 child hold it? (`Host::can_regrant`) *(conformance-tested)*
 - **durability** — does it survive a freeze? (`capture_durable_handles`) *(conformance-tested)*
-- **backend** — same on every engine? (see OPS_PARITY.md for op-level detail) *(conformance-tested)*
+- **backend** — the oracle's answer on the bytecode pump, the Cranelift JIT and the wasm-JIT? (see OPS_PARITY.md for op-level detail) *(conformance-tested)*
 - **target** — same on native / wasm32 / Windows?
-- **concurrency** — carried by both the coop and parallel drivers? *(conformance-tested)*
+- **concurrency** — the oracle's answer on the pump (every task on one thread) and on executor 2 (a thread per task)? *(conformance-tested)*
 - **code origin** — usable from a §22 guest-JIT unit as from the base module? *(conformance-tested)*
-- **debugger** — observable under the debug tier? *(conformance-tested)*
+- **debugger** — the oracle's answer under a debugger (the tree-walk Inspector, the bytecode debug scheduler)? *(conformance-tested)*
 
 ## Matrix
 
@@ -32,7 +32,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 | `Exit` | ✅ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `Clock` | ✅ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `PipeEnd` | ✅ | 🔶 | ✅ | ❔ | ✅ | ✅ | ✅ |
-| `SharedRegion` | ✅ | 🔶 | ✅ | ❔ | ✅ | ✅ | 🔶 |
+| `SharedRegion` | ✅ | 🔶 | 🔶 | ❔ | 🔶 | ✅ | 🔶 |
 | `AddressSpace` | ⛔ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `Instantiator` | ⛔ | ✅ | ✅ | ❔ | ✅ | ⛔ | 🔶 |
 | `Budget` | ⛔ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
@@ -52,7 +52,9 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 
 **`SharedRegion`**
 - *durability* 🔶 — a region the cut wholly holds rides with its aliases, across detached children, on the native JIT and in a bytecode reactor's save-state too (#2025, #2051); one held outside the cut or host-file-backed is the boundary
-- *debugger* 🔶 — map/unmap/len/page_size run; op 4 (the guest-minted-region grant) is vetoed by name in the bytecode lowering
+- *backend* 🔶 — map, unmap, len, page_size and close run; the bytecode lowering vetoes op 4, the guest-minted region's grant (#1511: unbuilt, -EINVAL where it runs), by name, so the bytecode tier declines a module that calls it to the oracle
+- *concurrency* 🔶 — map, unmap, len, page_size and close run; the bytecode lowering vetoes op 4, the guest-minted region's grant (#1511: unbuilt, -EINVAL where it runs), by name, so the bytecode tier declines a module that calls it to the oracle
+- *debugger* 🔶 — map, unmap, len, page_size and close run; the bytecode lowering vetoes op 4, the guest-minted region's grant (#1511: unbuilt, -EINVAL where it runs), by name, so the bytecode tier declines a module that calls it to the oracle
 
 **`AddressSpace`**
 - *nesting* ⛔ — the child is minted its own over its own window; the parent's names coordinates the child cannot use

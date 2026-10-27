@@ -1,12 +1,12 @@
-//! **The shared capability probe** — one fixture, three axis conformance tests (#1413).
+//! **The shared capability probe** — one fixture, both axis conformance tests (#1413).
 //!
-//! `debugger_conformance.rs` asks what the *debug tier* does with each powerbox capability's ops;
-//! `concurrency_conformance.rs` asks what the **OS-thread parallel driver** does with the same ops;
+//! `axis_conformance.rs` asks what each of the run-mode matrix's runners does with each powerbox
+//! capability's ops, held to the oracle (the `backend`, `concurrency` and `debugger` axes);
 //! `code_origin_conformance.rs` asks whether the same ops answer the same way when the caller is a
-//! §22 guest-JIT **unit** rather than the host-translated base module. All three need the identical
+//! §22 guest-JIT **unit** rather than the host-translated base module. Both need the identical
 //! scaffolding — how to mint a handle for each capability, which ops its ABI declares, and how to
 //! build a one-call module around them — so that scaffolding lives here once and each test supplies
-//! only its own driver and verdict vocabulary.
+//! only its own runs and verdict vocabulary.
 //!
 //! That is INVARIANTS #15 applied to the matrix's own machinery: the row set is a *parameter* of one
 //! structure, not a copy per column. A second copy would let the columns drift apart on what "the

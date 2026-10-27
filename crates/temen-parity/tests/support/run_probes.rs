@@ -4,6 +4,13 @@
 //!
 //! The programs are the smallest each feature's own tests run on several engines, so a probe's
 //! answer is one those tests already pin on the oracle.
+//!
+//! The embedder a runner plays ([`Embedder`], [`Stopper`], [`Outside`]) is here too, so
+//! `axis_conformance.rs`, which runs the frontier's capability probes on the same runners, includes
+//! this module for it.
+
+// Each including binary uses a subset: the frontier's runs use only the embedder.
+#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};

@@ -17,13 +17,12 @@
 //! | nesting | `Host::can_regrant` (via `Host::spawn_detached_child`, its public route) |
 //! | durability | the `NonDurableKind` match in `Host::capture_durable_handles` |
 //!
-//! Four more axes — `debugger`, `concurrency`, `backend`, `code origin` — have no single predicate
-//! to read, so they are driven by their own tests beside this one (`debugger_conformance.rs`,
-//! `concurrency_conformance.rs`, `backend_conformance.rs`, `code_origin_conformance.rs`). The
-//! remaining one states the
-//! manifest's belief and are rendered `Unaudited` until their predicate is locatable. That is
-//! deliberate: an unaudited cell is visible and countable, and this test asserts the count only
-//! moves in one direction.
+//! Four more axes — `backend`, `concurrency`, `debugger`, `code origin` — have no single predicate
+//! to read, so they are run by the tests beside this one: the first three on the run-mode matrix's
+//! runners (`axis_conformance.rs`), code origin from a unit and from the base module
+//! (`code_origin_conformance.rs`). The remaining one, `target`, has no runner yet, so its cells are
+//! rendered `Unaudited`. That is deliberate: an unaudited cell is visible and countable, and this
+//! test asserts the count only moves in one direction.
 
 mod support;
 use support::cites_an_issue;
@@ -213,10 +212,9 @@ fn the_uncheckable_rows_are_exactly_the_ones_that_need_a_live_peer_or_a_host_clo
 /// Coverage may only improve. A cell that was audited must not silently revert to `Unaudited`, and
 /// the two axes whose predicate classifies *every* row must stay fully audited.
 ///
-/// The four driven axes — `debugger`, `concurrency`, `backend`, `code origin` — are not in that
-/// loop on
-/// purpose: their predicates are reached by *running* the capability's ops, and four rows hold ops
-/// only a running guest or a live peer can reach. `tests/debugger_conformance.rs` pins which four,
+/// The four driven axes — `backend`, `concurrency`, `debugger`, `code origin` — are not in that
+/// loop on purpose: their answers are reached by *running* the capability's ops, and four rows hold
+/// ops only a running guest or a live peer can reach. `tests/axis_conformance.rs` pins which four,
 /// so those cells cannot quietly spread — the count floor below is what stops a column from
 /// emptying out.
 #[test]
