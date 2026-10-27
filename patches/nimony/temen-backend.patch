@@ -35,7 +35,7 @@ path with no extension. `nimsem e` (`buildGraphForEval`) still plans the C
 toolchain itself; no build uses it.
 
 Applied to a COPY of the pinned sources at build time (`scripts/nim-toolchain.sh`); the
-vendored `nimony/` submodule is never modified. Against the submodule pin (650bebb2).
+vendored `nimony/` submodule is never modified. Against the submodule pin (4a965c9b).
 Drop it when upstream nimony has a Temen backend — it is written to be upstreamed as is.
 diff --git a/src/gear2/modnames.nim b/src/gear2/modnames.nim
 index 580e27ea..cc1bd779 100644
@@ -50,7 +50,7 @@ index 580e27ea..cc1bd779 100644
  proc moduleSuffix*(path: string; searchPaths: openArray[string]): string =
    # `getCurrentDir`/`relativePath` are `.raises`, but the only reason they can
 diff --git a/src/nimony/deps.nim b/src/nimony/deps.nim
-index 09607460..6c73e743 100644
+index 32744dca..3afa63ee 100644
 --- a/src/nimony/deps.nim
 +++ b/src/nimony/deps.nim
 @@ -82,6 +82,7 @@ proc backendTag(config: NifConfig): string =
@@ -91,7 +91,7 @@ index 09607460..6c73e743 100644
  proc objFile(config: NifConfig; f: FilePair; backendDir: string = ""): string =
    let base = if backendDir.len > 0: config.nifcachePath / backendDir else: config.nifcachePath
    base / f.modname & ".o"
-@@ -1154,6 +1171,11 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
+@@ -1157,6 +1174,11 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
      let wholeProgTool = "jorogumo"
      var webRenderer = "j"
      if wasm: webRenderer = "w"
@@ -103,7 +103,7 @@ index 09607460..6c73e743 100644
      let useOptimizer = c.config.optLevel in {optSpeed, optSize}
      let native = c.config.backend == backendNative
      # A native program that uses the `.compile`/`{.build…}` pragma (in ANY module)
-@@ -1194,6 +1216,17 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
+@@ -1197,6 +1219,17 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
          b.withTree "input":
            b.addIntLit 0
            b.addIntLit 0
@@ -121,7 +121,7 @@ index 09607460..6c73e743 100644
      elif native:
        # Native backend: arkham (Leng -> typed asm-NIF) replaces lengc. Output is
        # passed as the single token `-o:<path>` (the colon form; `addFilename`
-@@ -1542,6 +1575,22 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
+@@ -1545,6 +1578,22 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
                b.addStrLit c.config.wasmFile(c.rootNode.files[0], backend)
              else:
                b.addStrLit c.config.jsFile(c.rootNode.files[0], backend)
@@ -144,7 +144,7 @@ index 09607460..6c73e743 100644
        elif customLinkerName.len > 0 or (not native and not nativeSysLink):
          # Manifest-based link. The plain C/LLVM backend links through the default
          # `link` command (== `niflink`); a `{.bundle.}` module overrides it with
-@@ -1679,7 +1728,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
+@@ -1682,7 +1731,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
        # source) don't depend on the user's project. A plain native build has no
        # such TUs (arkham/nifasm go straight to machine code); only a native build
        # that uses the `.compile` pragma (`nativeSysLink`) compiles them.
@@ -153,7 +153,7 @@ index 09607460..6c73e743 100644
          for cfile in c.toBuild:
            let obj = sharedObjFile(cfile, ccKey)
            if not objFiles.containsOrIncl(obj):
-@@ -1703,7 +1752,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
+@@ -1706,7 +1755,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
                  discard
  
        for i, v in pairs c.nodes:
@@ -162,7 +162,7 @@ index 09607460..6c73e743 100644
            let obj = c.config.objFile(v.files[0], backend)
            if not objFiles.containsOrIncl(obj):
              b.withTree "do":
-@@ -1741,7 +1790,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
+@@ -1744,7 +1793,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
          else:
            lengcInput = c.config.lengcFile(v.files[0], backend)
  
@@ -171,7 +171,7 @@ index 09607460..6c73e743 100644
            discard  # no per-module codegen: the single whole-program node
                     # (see "Link executable" above) consumes the .c.nif
          elif native:
-@@ -2043,7 +2092,12 @@ proc addBackendKey(b: var Builder; c: DepContext; passC, passL: string) =
+@@ -2052,7 +2101,12 @@ proc addBackendKey(b: var Builder; c: DepContext; passC, passL: string) =
        b.addStrLit c.config.linker
      b.withTree "passc":
        b.addStrLit passC
@@ -185,7 +185,7 @@ index 09607460..6c73e743 100644
      b.withTree "passl":
        b.addStrLit passL
      if c.config.layoutFile.len > 0:
-@@ -2424,13 +2478,23 @@ proc buildGraph*(config: sink NifConfig; project: string;
+@@ -2433,13 +2487,23 @@ proc buildGraph*(config: sink NifConfig; project: string;
        exeOutPath = c.config.wasmFile(c.rootNode.files[0], c.config.backendDirName(c.rootNode.files[0]))
      elif c.config.backend == backendJs:
        exeOutPath = c.config.jsFile(c.rootNode.files[0], c.config.backendDirName(c.rootNode.files[0]))
@@ -210,7 +210,7 @@ index 09607460..6c73e743 100644
          jobsArg(config) & " run " & progArg(flags, 50, 100) & quoteShell(buildFinalFilename),
        beMemoFile, beMemo, backendChanged
  
-@@ -2480,5 +2544,13 @@ proc buildGraph*(config: sink NifConfig; project: string;
+@@ -2490,5 +2554,13 @@ proc buildGraph*(config: sink NifConfig; project: string;
          # around it — node runs the file as it stands.
          exec "node " &
               quoteShell(c.config.jsFile(c.rootNode.files[0], backend)) & executableArgs
@@ -225,10 +225,10 @@ index 09607460..6c73e743 100644
        else:
          exec c.config.exeFile(c.rootNode.files[0], backend) & executableArgs
 diff --git a/src/nimony/macro_plugin.nim b/src/nimony/macro_plugin.nim
-index 12efa19a..7c3104b6 100644
+index 36ba3047..3156ae76 100644
 --- a/src/nimony/macro_plugin.nim
 +++ b/src/nimony/macro_plugin.nim
-@@ -12,11 +12,12 @@ import std/[syncio, os, osproc, tables, hashes, assertions, strutils]
+@@ -12,12 +12,12 @@ import std/[syncio, os, osproc, tables, hashes, assertions, strutils]
  import std/[dirs, paths]
  include ".." / lib / compat2
  
@@ -238,11 +238,12 @@ index 12efa19a..7c3104b6 100644
  from ".." / lib / nifcoreparse import parse
  import ".." / models / [tags]
  import nimony_model, decls, programs
-+from semos import hostBackend
+-from semos import shellArgs
++from semos import shellArgs, hostBackend
  
  type
    MacroPlugin* = object
-@@ -276,7 +277,9 @@ proc macroFileStem(macroSym: SymId): string =
+@@ -277,7 +277,9 @@ proc macroFileStem(macroSym: SymId): string =
        result.add '_'
  
  proc getMacroPluginPath*(nifcachePath: string; macroSym: SymId): string =
@@ -253,7 +254,7 @@ index 12efa19a..7c3104b6 100644
    when defined(windows):
      result.add ".exe"
  
-@@ -290,7 +293,7 @@ proc macroPluginExists*(nifcachePath: string; macroSym: SymId): bool =
+@@ -291,7 +293,7 @@ proc macroPluginExists*(nifcachePath: string; macroSym: SymId): bool =
  
  proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymId;
                           info: NifLineInfo;
@@ -262,7 +263,7 @@ index 12efa19a..7c3104b6 100644
    ## Build the plugin module straight from NIF (no Nim text round-trip), write
    ## it as a `.p.nif`, and have Nimony compile it through `s` (the NIF-input
    ## entry point — same one CTFE uses in `semos.runEval`).
-@@ -309,7 +312,16 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
+@@ -310,7 +312,16 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
    # target triple (`parseCommonOption` decides what a compile-time-eval
    # process may see). The `macro_*` prefix keeps it out of any target-side
    # artifact collection.
@@ -280,7 +281,7 @@ index 12efa19a..7c3104b6 100644
    try:
      createDir path(pluginCache)
    except:
-@@ -327,9 +339,15 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
+@@ -328,9 +339,15 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
    # `nimony s` opens `<progfile>.p.deps.nif` unconditionally — write an empty
    # `(stmts)` (the plugin module has no external NIF dependencies of its own,
    # only stdlib imports which Nimony discovers via its normal search path).
@@ -296,7 +297,7 @@ index 12efa19a..7c3104b6 100644
    deps.addParRi()
    try:
      writeFile(depsFile, toString(deps, true))
-@@ -337,7 +355,9 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
+@@ -338,7 +355,9 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
      echo "Macro plugin: failed to write ", depsFile
      return ""
  
@@ -307,7 +308,7 @@ index 12efa19a..7c3104b6 100644
    let srcLibPath = getAppDir().parentDir() / "src" / "lib"
  
    # Pre-populate the isolated plugin cache with a HOST-bits stdlib. `nimony s`
-@@ -348,21 +368,22 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
+@@ -349,21 +368,22 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
    # closure the plugin needs (incl. the NimNode/NIF-reader machinery). The
    # native link of this setup may fail (harmless — we only need the `.s.nif`/
    # `.c.nif`), and `nimony c` is incremental so repeat calls are cheap.
@@ -317,7 +318,7 @@ index 12efa19a..7c3104b6 100644
 -  except:
 -    echo "Macro plugin: failed to write ", setupFile
 -    return ""
--  let setupCmd = quoteShell(nimonyExe) & hostCommandLineArgs &
+-  let setupCmd = quoteShell(nimonyExe) & shellArgs(hostCommandLineArgs) &
 -                 " --path:" & quoteShell(srcLibPath) &
 -                 " --nimcache:" & quoteShell(pluginCache) &
 -                 " c " & quoteShell(setupFile)
@@ -333,7 +334,7 @@ index 12efa19a..7c3104b6 100644
 +    except:
 +      echo "Macro plugin: failed to write ", setupFile
 +      return ""
-+    let setupCmd = quoteShell(nimonyExe) & hostCommandLineArgs &
++    let setupCmd = quoteShell(nimonyExe) & shellArgs(hostCommandLineArgs) &
 +                   " --path:" & quoteShell(srcLibPath) &
 +                   " --nimcache:" & quoteShell(pluginCache) &
 +                   " " & hostBackend & " " & quoteShell(setupFile)
@@ -345,10 +346,10 @@ index 12efa19a..7c3104b6 100644
  
    # Forward `--nimcache:` so the sub-compile reads the `.p.deps.nif` from the
    # same per-worker directory we wrote it to. Without this, `nimony s` falls
-@@ -377,7 +398,7 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
+@@ -378,7 +398,7 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
    # nimsem (currently paused waiting on this exec) still has it mmap'd.
    # Same rationale as `semos.runProgram` / `semos.prepareEval`.
-   let cmd = quoteShell(nimonyExe) & hostCommandLineArgs &
+   let cmd = quoteShell(nimonyExe) & shellArgs(hostCommandLineArgs) &
 -            " --path:" & quoteShell(srcLibPath) &
 +            (if shared: "" else: " --path:" & quoteShell(srcLibPath)) &
              " --nimcache:" & quoteShell(pluginCache) &
@@ -367,7 +368,7 @@ index dfcc7c41..85046a23 100644
    OptLevel* = enum
      optDebug   # default: -O1 (debug-friendly but avoids dumb codegen)
 diff --git a/src/nimony/nimony.nim b/src/nimony/nimony.nim
-index 8c4253af..fe2a70a4 100644
+index 409d3f41..559b14a1 100644
 --- a/src/nimony/nimony.nim
 +++ b/src/nimony/nimony.nim
 @@ -171,9 +171,22 @@ proc dispatchBasicCommand(key: string; config: var NifConfig): Command =
@@ -408,10 +409,10 @@ index 8c4253af..fe2a70a4 100644
    if c.config.isDefined("illumos") and (nativeBackend or c.config.isDefined("nimNoLibc")):
      quit "illumos requires libc; use the C backend without -d:nimNoLibc"
 diff --git a/src/nimony/semdecls.nim b/src/nimony/semdecls.nim
-index c6110597..b36d9c3d 100644
+index 76a8ace4..d6da0fcf 100644
 --- a/src/nimony/semdecls.nim
 +++ b/src/nimony/semdecls.nim
-@@ -1329,7 +1329,7 @@ proc semProcImpl(c: var SemContext; dest: var TokenBuf; it: var Item; kind: SymK
+@@ -1387,7 +1387,7 @@ proc semProcImpl(c: var SemContext; dest: var TokenBuf; it: var Item; kind: SymK
    if kind == MacroY and pass == checkBody:
      let macroDecl = cursorAt(dest, declStart)
      let macroBinPath = compileMacroPlugin(c.g.config.nifcachePath, macroDecl, symId, info,
@@ -421,7 +422,7 @@ index c6110597..b36d9c3d 100644
        c.compiledMacros[symId] = macroBinPath
  
 diff --git a/src/nimony/semos.nim b/src/nimony/semos.nim
-index 9bbe4a6d..766dfad3 100644
+index 866c5d56..9c3b1a51 100644
 --- a/src/nimony/semos.nim
 +++ b/src/nimony/semos.nim
 @@ -28,6 +28,12 @@ import nimony_model, symtabs, builtintypes, decls, asthelpers,
@@ -437,7 +438,7 @@ index 9bbe4a6d..766dfad3 100644
  proc nimonyDir(): string =
    ## The project root for stdlib resolution. `bin*` (not just `bin`) is
    ## matched so the boot bootstrap can stage toolchains under sibling
-@@ -532,7 +538,7 @@ proc buildPluginInto(config: NifConfig; nf, exefile, scratch: string) =
+@@ -544,7 +550,7 @@ proc buildPluginInto(config: NifConfig; nf, exefile, scratch: string) =
    var cmd = pluginCompileCmd(config, cacheDir)
    cmd.add " -o:"
    cmd.add quoteShell(staging)
@@ -446,7 +447,7 @@ index 9bbe4a6d..766dfad3 100644
    cmd.add quoteShell(nf)
    exec cmd
    if not vfsMoveInto(staging, exefile):
-@@ -839,7 +845,11 @@ proc runProgram(file: string; nimcachePath: string; usedModules: HashSet[string]
+@@ -851,7 +857,11 @@ proc runProgram(file: string; nimcachePath: string; usedModules: HashSet[string]
    if result.exitCode != 0: return
  
    let modname = extractModuleSuffix(file)
@@ -459,9 +460,9 @@ index 9bbe4a6d..766dfad3 100644
    # The child may start in `sourceDir`; keep the exe path absolute so it
    # still resolves against the outer compile's cwd, not the module dir.
    var exeToRun = exe
-@@ -868,7 +878,7 @@ proc buildWriteNifModule(c: var SemContext): string =
+@@ -880,7 +890,7 @@ proc buildWriteNifModule(c: var SemContext): string =
    let nimonyExe = findTool("nimony")
-   let cmd = quoteShell(nimonyExe) & c.commandLineArgs &
+   let cmd = quoteShell(nimonyExe) & shellArgs(c.commandLineArgs) &
      " --nimcache:" & quoteShell(c.g.config.nifcachePath) &
 -    " c " & quoteShell(stdlibFile("std/writenif.nim"))
 +    " " & hostBackend & " " & quoteShell(stdlibFile("std/writenif.nim"))
