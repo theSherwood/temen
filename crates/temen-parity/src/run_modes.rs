@@ -543,10 +543,6 @@ pub fn exception(f: Feature, c: Config) -> Option<Cell> {
             "the bytecode tier's durable entry takes a flat window, so a thaw traps MemoryFault \
              on a page the run mapped past its declared memory (#2628)",
         ),
-        (Serving, Cranelift) if durable => not_yet(
-            "a serve op under a landed freeze drains its queue, so the thaw's re-issued poll \
-             answers 0 where the run served 2 (#2627)",
-        ),
         _ => return None,
     })
 }

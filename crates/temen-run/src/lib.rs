@@ -2940,7 +2940,8 @@ unsafe fn ring(g: &Host) {
 /// value read under the cell's lock together with the state that made the wait park. So it is
 /// counted for the run's deadlock verdict as every other park is, ends on a kill or the domain's
 /// teardown, and a task's wait parks the task rather than its worker thread. With no bell nothing
-/// can ring it: it ends only on the verdict, a kill or the teardown.
+/// can ring it: it ends only on the verdict, a kill or the teardown. A wait that `freeze` watches
+/// also ends when a freeze lands.
 ///
 /// # Safety
 /// `vm` is the live call's context, and the caller holds no lock.
@@ -2949,9 +2950,10 @@ unsafe fn park_on_bell(
     bell: Option<&Arc<std::sync::atomic::AtomicU64>>,
     seen: u64,
     parks: Parks,
+    freeze: Option<temen_jit::FreezeWatch>,
 ) -> temen_jit::HostPark {
     let key = bell.map_or(1 << 63, bell_key);
-    temen_jit::park_host_call(vm, None, key, parks, || {
+    temen_jit::park_host_call(vm, freeze, key, parks, || {
         bell.is_none_or(|b| b.load(std::sync::atomic::Ordering::Acquire) == seen)
     })
 }
@@ -2974,6 +2976,10 @@ fn bell_now(bell: Option<&Arc<std::sync::atomic::AtomicU64>>) -> u64 {
 /// parked — fails closed (`ThreadFault`), the oracle's answer (#2173, ISSUES.md I36). No serve
 /// context ⇒ the probeable `-EINVAL`; so is the timed `svc.wait` form (a timeout arg), and a
 /// **nested** serve under a handler, refused as the interp refuses it (#2160).
+///
+/// #2627 — under a landed freeze a serve op makes no progress, as on the oracle (DURABILITY.md
+/// §13.4): it serves nothing more, ends its wait, and answers `0`. Its trailing poll unwinds with
+/// the queue intact, and the thaw's re-issue serves it.
 #[allow(clippy::too_many_arguments)]
 unsafe fn serve_locked(
     m: &Mutex<Host>,
@@ -3002,6 +3008,12 @@ unsafe fn serve_locked(
         // No serve context (an embedder entry that registers none, or a child already released).
         return put(EINVAL);
     }
+    let freeze = guard
+        .is_durable()
+        .then(|| temen_jit::FreezeWatch::new(mem_base as u64, guard.cap_window_shadow()))
+        .flatten();
+    // SAFETY: the watched window is this domain's, live while its serve op runs.
+    let frozen = || freeze.is_some_and(|f| unsafe { f.landed() });
     let mut count: i64 = 0;
     loop {
         // CALLS.md 5c.2 — fold handoff settlements (§10.2: a handoff-served dispatch counts in
@@ -3022,13 +3034,17 @@ unsafe fn serve_locked(
             // sees the same kill and releases, so until then re-check on a short sleep.
             let seen = bell_now(bell.as_ref());
             drop(guard);
-            if park_on_bell(vm, bell.as_ref(), seen, Parks::Fiber) != temen_jit::HostPark::Woken {
+            let parked = park_on_bell(vm, bell.as_ref(), seen, Parks::Fiber, None);
+            if parked != temen_jit::HostPark::Woken {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             guard = m.lock().unwrap_or_else(|e| e.into_inner());
             continue;
         }
-        while let Some((export, dop, args, ticket)) = guard.svc_pop() {
+        while !frozen() {
+            let Some((export, dop, args, ticket)) = guard.svc_pop() else {
+                break;
+            };
             let Some(fidx) = guard.svc_handler(export, dop) else {
                 vm.raise(temen_jit::TrapKind::CapFault as i64);
                 return;
@@ -3077,6 +3093,10 @@ unsafe fn serve_locked(
             ring(&guard);
             count += 1;
         }
+        if frozen() {
+            count = 0;
+            break;
+        }
         if !wait || count != 0 {
             break;
         }
@@ -3094,11 +3114,17 @@ unsafe fn serve_locked(
         let seen = bell_now(bell.as_ref());
         guard.set_serve_activation(Some((serve_ctx, mem_base as usize, mem_reserved)));
         drop(guard);
-        let parked = park_on_bell(vm, bell.as_ref(), seen, Parks::Fiber);
+        let serving = freeze.map(temen_jit::FreezeWatch::serving);
+        let parked = park_on_bell(vm, bell.as_ref(), seen, Parks::Fiber, serving);
         guard = m.lock().unwrap_or_else(|e| e.into_inner());
         guard.set_serve_activation(None);
-        // A claim taken during the park holds this domain until its release (the arm above).
-        if parked == temen_jit::HostPark::Woken || guard.handoff_claimed() {
+        // A claim taken during the park holds this domain until its release (the arm above); a
+        // freeze that ended it is answered above.
+        if matches!(
+            parked,
+            temen_jit::HostPark::Woken | temen_jit::HostPark::Frozen
+        ) || guard.handoff_claimed()
+        {
             continue;
         }
         drop(guard);
@@ -3253,7 +3279,7 @@ unsafe fn park_until_rung(
     parks: Parks,
     vm: &temen_jit::VmCtx,
 ) -> bool {
-    match park_on_bell(vm, Some(bell), seen, parks) {
+    match park_on_bell(vm, Some(bell), seen, parks, None) {
         temen_jit::HostPark::Woken => true,
         temen_jit::HostPark::Deadlock => {
             vm.raise(temen_jit::TrapKind::ThreadFault as i64);

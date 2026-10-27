@@ -213,6 +213,9 @@ pub(crate) unsafe fn mark_reissue(mem_base: u64) {
 pub struct FreezeWatch {
     base: u64,
     word: u64,
+    /// Whether a freeze that ends the park marks its call for re-issue: a host call's does, a serve
+    /// op's does not ([`Self::serving`]).
+    reissue: bool,
 }
 
 impl FreezeWatch {
@@ -222,23 +225,37 @@ impl FreezeWatch {
         arena.freeze_word().map(|w| FreezeWatch {
             base,
             word: base + w,
+            reissue: true,
         })
+    }
+
+    /// #2627 — this watch for a serve op's park (`svc.wait`), which a freeze ends unmarked. The
+    /// transform re-issues every serve op on thaw and its unwind spills no re-issue word, so a mark
+    /// would stay in the context for the next call that unwinds there, which the thaw would then
+    /// run twice.
+    pub fn serving(self) -> FreezeWatch {
+        FreezeWatch {
+            reissue: false,
+            ..self
+        }
     }
 
     /// Whether a freeze has landed: the freeze word reads `UNWINDING`.
     ///
     /// # Safety
     /// The window is live.
-    unsafe fn landed(self) -> bool {
+    pub unsafe fn landed(self) -> bool {
         *(self.word as *const i32) == temen_ir::durable_abi::STATE_UNWINDING
     }
 
-    /// [`mark_reissue`] on this window.
+    /// [`mark_reissue`] on this window, for a park whose call the thaw re-issues by the mark.
     ///
     /// # Safety
     /// The window is live.
     unsafe fn mark_reissue(self) {
-        mark_reissue(self.base)
+        if self.reissue {
+            mark_reissue(self.base)
+        }
     }
 }
 
@@ -248,8 +265,9 @@ impl FreezeWatch {
 pub enum HostPark {
     /// The event came (or had already come): run the op again (invariant 7, the rewound park).
     Woken,
-    /// A landing freeze ended it: the call is marked for re-issue, and its placeholder answer stands
-    /// for the trailing poll to unwind past (#1672).
+    /// A landing freeze ended it: the call is marked for re-issue unless its watch is a serve op's
+    /// ([`FreezeWatch::serving`]), and its placeholder answer stands for the trailing poll to unwind
+    /// past (#1672).
     Frozen,
     /// No live vCPU could ever end it: the oracle's deadlock verdict, `ThreadFault`.
     Deadlock,
