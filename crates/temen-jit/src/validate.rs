@@ -18,9 +18,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-/// Whether the machine-code validator runs. False on a production compile (so it costs nothing, and
-/// `jit_isa` does not ask Cranelift for block-layout info), and false on targets slice 1 does not
-/// cover yet (only x86-64). True under the fuzzers and when `TEMEN_JIT_VALIDATE` is set. Cached.
+/// Whether the machine-code validator runs. False on a production compile (so it costs nothing) and
+/// on targets it does not cover yet (only x86-64; aarch64 is #2642). True under the fuzzers and when
+/// `TEMEN_JIT_VALIDATE` is set. Cached.
 pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -94,19 +94,11 @@ pub(crate) enum Entry {
     Host,
 }
 
-/// Validate one emitted function's `bytes` against its basic-block hints from
-/// `CompiledCode`: `bb_starts` (block start offsets) and `bb_edges` (block-to-block control-flow
-/// edges, each `(from_start, to_start)`), the bytes its relocations patch, and what is known of its
-/// `entry`. Shadow mode: every problem is logged and counted, never returned.
-pub(crate) fn shadow_check(
-    bytes: &[u8],
-    bb_starts: &[u32],
-    bb_edges: &[(u32, u32)],
-    patches: &[Patch],
-    entry: Entry,
-) {
+/// Validate one emitted function's `bytes` against the bytes its relocations patch and what is
+/// known of its `entry`. Shadow mode: every problem is logged and counted, never returned.
+pub(crate) fn shadow_check(bytes: &[u8], patches: &[Patch], entry: Entry) {
     #[cfg(target_arch = "x86_64")]
-    for f in x86::check(bytes, bb_starts, bb_edges, patches, entry) {
+    for f in x86::check(bytes, patches, entry) {
         // Count every disagreement (a fuzz run asserts the total), but cap the logging so a bad
         // decode on every module can't swamp a fuzzer's stderr.
         let n = DISAGREEMENTS.fetch_add(1, Ordering::Relaxed);
@@ -115,7 +107,7 @@ pub(crate) fn shadow_check(
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = (bytes, bb_starts, bb_edges, patches, entry);
+    let _ = (bytes, patches, entry);
 }
 
 // --- test-only capture of real compiled code, cross-checked against iced-x86 ---
@@ -124,13 +116,10 @@ pub(crate) fn shadow_check(
 // caller in `lib.rs` is gated to match, so it is `all(test, target_arch = "x86_64")` — on another
 // target (the aarch64 clippy lane) it would be dead code under `-D warnings`.
 
-/// One captured function: its machine code, basic-block hints, relocation patches, and the
-/// module's window layout.
+/// One captured function: its machine code, relocation patches, and the module's window layout.
 #[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) struct CapturedFn {
     pub code: Vec<u8>,
-    pub bb_starts: Vec<u32>,
-    pub bb_edges: Vec<(u32, u32)>,
     pub patches: Vec<Patch>,
     pub layout: Option<WindowLayout>,
 }
@@ -143,22 +132,13 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Record one defined function's code, block hints, patches and layout, if a test armed the
-/// capture.
+/// Record one defined function's code, patches and layout, if a test armed the capture.
 #[cfg(all(test, target_arch = "x86_64"))]
-pub(crate) fn capture_code(
-    code: &[u8],
-    bb_starts: &[u32],
-    bb_edges: &[(u32, u32)],
-    patches: Vec<Patch>,
-    layout: Option<WindowLayout>,
-) {
+pub(crate) fn capture_code(code: &[u8], patches: Vec<Patch>, layout: Option<WindowLayout>) {
     CAPTURE.with(|c| {
         if let Some(v) = c.borrow_mut().as_mut() {
             v.push(CapturedFn {
                 code: code.to_vec(),
-                bb_starts: bb_starts.to_vec(),
-                bb_edges: bb_edges.to_vec(),
                 patches,
                 layout,
             });
@@ -237,8 +217,15 @@ pub(crate) mod x86 {
         /// A pointer into the stack, at entry-relative offset `Some(off)` (`rsp` is `Stack(Some(0))`
         /// at entry, pointing at the return address), or somewhere in it at an unknown offset (`None`).
         Stack(Option<i64>),
-        /// A pointer into the function's own rodata / jump tables, computed by `lea r, [rip + disp]`.
-        RipRel,
+        /// The address of function offset `.0`, computed by `lea r, [rip + disp]` (its constant pool
+        /// or a jump table).
+        RipRel(i64),
+        /// One entry of the `n`-entry jump table at function offset `at`, sign-extended: what
+        /// `movsxd e, [t + idx*4]` reads with `t` the table's address and `idx < n`.
+        TableEntry { at: u32, n: u32 },
+        /// The jump table's address plus one of its entries: the `jmp` target Cranelift's
+        /// `JmpTableSeq` computes, one of the `n` targets the table at `at` lists.
+        TableTarget { at: u32, n: u32 },
         /// No information.
         Unknown,
     }
@@ -286,6 +273,14 @@ pub(crate) mod x86 {
     }
 
     impl State {
+        /// Nothing known: the state a block-local derivation starts from, which therefore holds of
+        /// every execution that reaches the block.
+        fn top() -> State {
+            State {
+                regs: [Fact::Unknown; 16],
+                slots: [None; SLOT_CAP],
+            }
+        }
         /// The entry ABI: the four context params in their argument registers, `rsp` at the return
         /// address, everything else unknown, no slots.
         fn entry() -> State {
@@ -438,15 +433,10 @@ pub(crate) mod x86 {
 
     impl Cfg {
         /// Layers 1–2: recover the machine basic blocks, decode each (pushing the layer-1 findings),
-        /// and collect their successors.
-        fn build(
-            bytes: &[u8],
-            bb_starts: &[u32],
-            bb_edges: &[(u32, u32)],
-            patches: &[Patch],
-            findings: &mut Vec<Finding>,
-        ) -> Cfg {
-            let leaders = recover_leaders(bytes, bb_starts, bb_edges, patches);
+        /// and collect their successors, an indirect `jmp`'s read from its jump table.
+        fn build(ctx: Ctx, findings: &mut Vec<Finding>) -> Cfg {
+            let bytes = ctx.bytes;
+            let leaders = recover_leaders(ctx);
             let nb = leaders.len();
             let index_of = |o: usize| leaders.binary_search(&o).ok();
             let limit_of = |i: usize| leaders.get(i + 1).copied().unwrap_or(bytes.len());
@@ -454,7 +444,7 @@ pub(crate) mod x86 {
             let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
             for i in 0..nb {
                 let (insns, direct) =
-                    decode_block(bytes, leaders[i], limit_of(i), patches, findings);
+                    decode_block(bytes, leaders[i], limit_of(i), ctx.patches, findings);
                 for s in direct {
                     if let Some(si) = index_of(s) {
                         if !succs[i].contains(&si) {
@@ -462,37 +452,26 @@ pub(crate) mod x86 {
                         }
                     }
                 }
-                blocks.push(insns);
-            }
-            // The one edge the decoder cannot read — an indirect `jmp`'s jump-table targets — comes
-            // from the `bb_edges` hint. The hint is Cranelift's CLIF-block CFG: an edge `(from, to)`
-            // leaves the CLIF block that starts at `from` through its terminator, which may sit
-            // several machine blocks in. So it is attached only to the machine block inside that CLIF
-            // block that ends in an indirect `jmp`; every other hinted edge is a direct branch the
-            // decoder already follows, and attaching it at the CLIF block's start would invent an edge
-            // that carries one point's state to another (#2603 PR 2 reads the targets from the bytes).
-            let mut clif_starts: Vec<usize> = bb_starts.iter().map(|&s| s as usize).collect();
-            clif_starts.sort_unstable();
-            let jumps: Vec<usize> = (0..nb)
-                .filter(|&i| {
-                    blocks[i]
-                        .last()
-                        .is_some_and(|(_, d): &(usize, Decoded)| d.kind == Kind::IndirectJmp)
-                })
-                .collect();
-            for &(from, to) in bb_edges {
-                let (from, to) = (from as usize, to as usize);
-                let Some(ti) = index_of(to) else { continue };
-                let end = clif_starts
-                    .iter()
-                    .copied()
-                    .find(|&s| s > from)
-                    .unwrap_or(bytes.len());
-                for &fi in &jumps {
-                    if (from..end).contains(&leaders[fi]) && !succs[fi].contains(&ti) {
-                        succs[fi].push(ti);
+                if let Some(&(at, _)) = insns.last().filter(|(_, d)| d.kind == Kind::IndirectJmp) {
+                    match table_targets(&insns, ctx) {
+                        Ok(targets) => {
+                            for t in targets {
+                                match index_of(t) {
+                                    Some(si) if !succs[i].contains(&si) => succs[i].push(si),
+                                    Some(_) => {}
+                                    None => findings.push(Finding {
+                                        at,
+                                        why: format!(
+                                            "jump-table target +0x{t:x} is not a block start"
+                                        ),
+                                    }),
+                                }
+                            }
+                        }
+                        Err(why) => findings.push(Finding { at, why }),
                     }
                 }
+                blocks.push(insns);
             }
             Cfg {
                 leaders,
@@ -502,9 +481,76 @@ pub(crate) mod x86 {
         }
     }
 
-    /// Validate one emitted function's `bytes` against its basic-block hints, the bytes its
-    /// relocations patch, and the module's window layout, returning every policy finding. Pure, so
-    /// tests assert on the findings directly.
+    /// The targets of the indirect `jmp` that ends `insns`: the entries of the jump table its register
+    /// was computed from — Cranelift's `JmpTableSeq` (`lea t, [rip + table]; movsxd e, [t + idx*4];
+    /// add t, e; jmp t`) behind br_table's index clamp, which the `cmov` rule confines (#2603 hole
+    /// 11). Derived in the block alone, from no assumption about its entry, so the targets hold on
+    /// every execution that reaches the `jmp`. `Err` says why it is not such a jump.
+    fn table_targets(insns: &[(usize, Decoded)], ctx: Ctx) -> Result<Vec<usize>, String> {
+        let Some(&(_, d)) = insns.last() else {
+            return Err("empty block".into());
+        };
+        let Some(r) = d.operands.rm_reg else {
+            return Err("indirect jmp through memory".into());
+        };
+        let out = transfer_block(insns, State::top(), None, ctx);
+        let Fact::TableTarget { at, n } = out.regs[r as usize & 15] else {
+            return Err(format!(
+                "indirect jmp through r{r}, which holds no jump-table target"
+            ));
+        };
+        (0..i64::from(n))
+            .map(|i| {
+                let entry = ctx.constant(i64::from(at) + 4 * i, 4)? as u32 as i32;
+                let t = i64::from(at) + i64::from(entry);
+                usize::try_from(t).ok().filter(|&t| t < ctx.bytes.len())
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| "a jump-table entry targets outside the function".into())
+    }
+
+    /// The fact `movsxd e, dword [m]` leaves: an entry of the function's own jump table when `m` is
+    /// `[t + idx*4]`, `t` a rip-relative address and `idx` bounded, and every entry the index can
+    /// select lies in the function's bytes, none of them patched by a relocation.
+    fn table_entry(state: &State, m: &Mem, ctx: Ctx) -> Fact {
+        let fact = |r: u8| state.regs[r as usize & 15];
+        let (Some(b), Some(i)) = (m.base, m.index) else {
+            return Fact::Unknown;
+        };
+        let (Fact::RipRel(at), Some(max)) = (fact(b), max_value(fact(i))) else {
+            return Fact::Unknown;
+        };
+        if m.scale != 4 || m.disp != 0 {
+            return Fact::Unknown;
+        }
+        let entries = max.checked_add(1).and_then(|n| u32::try_from(n).ok());
+        let (Some(n), Ok(at)) = (entries, u32::try_from(at)) else {
+            return Fact::Unknown;
+        };
+        let (start, len) = (at as usize, 4 * n as usize);
+        let inside = start
+            .checked_add(len)
+            .is_some_and(|end| end <= ctx.bytes.len());
+        if inside && !ctx.patched(start, len) {
+            Fact::TableEntry { at, n }
+        } else {
+            Fact::Unknown
+        }
+    }
+
+    /// The largest value a register holding `f` can have, when `f` bounds it.
+    fn max_value(f: Fact) -> Option<u64> {
+        match f {
+            Fact::Confined { bound, guard } => Some(bound.saturating_sub(1).max(guard)),
+            Fact::Bounded(ub) => ub.checked_sub(1),
+            Fact::Const(c) => u64::try_from(c).ok(),
+            _ => None,
+        }
+    }
+
+    /// Validate one emitted function's `bytes` against the bytes its relocations patch and what is
+    /// known of its entry, returning every policy finding. Pure, so tests assert on the findings
+    /// directly. Nothing Cranelift says about the code is an input (#2603 D3).
     ///
     /// Three layers (#2481 slice 1 + #2535):
     /// 1. **Decode + allowlist**, per machine basic block, flagging any instruction outside the
@@ -513,11 +559,8 @@ pub(crate) mod x86 {
     ///    block are a constant island or jump table Cranelift placed there (data, not code), so the
     ///    walk stops at the terminator.
     /// 2. **CFG recovery** ([`recover_leaders`]): the machine basic blocks are recovered by decoding
-    ///    forward from the entry and every direct-branch target. `bb_starts`/`bb_edges` are *hints*,
-    ///    not the machine CFG — they are Cranelift's CLIF-block CFG, so machine-lowered branches (the
-    ///    stack-limit check, fuel/epoch polls, a `select`'s local `jcc`) target offsets no hint lists.
-    ///    The one edge that cannot be decoded — an indirect `jmp`'s jump-table targets — is taken
-    ///    from `bb_edges` (#2603 PR 2 derives it from the bytes instead).
+    ///    forward from the entry, every direct-branch target, and every jump-table target, which
+    ///    [`table_targets`] reads from the table the bytes compute the `jmp`'s target from.
     /// 3. **Memory-access confinement** (#2535): an abstract interpretation over the recovered CFG
     ///    tracks which register holds `mem_base` and which holds a D63-confined index across blocks
     ///    and loops, then checks every memory access goes to a known region (the window through a
@@ -527,26 +570,24 @@ pub(crate) mod x86 {
     /// guesses a state per block — a heuristic, free to widen or give up — and [`verify`] checks the
     /// guess in one linear pass. A wrong or unconverged guess fails the check; it never admits code.
     /// It needs the guest entry contract, so a trampoline ([`Entry::Host`]) gets layers 1–2 only.
-    pub(crate) fn check(
-        bytes: &[u8],
-        bb_starts: &[u32],
-        bb_edges: &[(u32, u32)],
-        patches: &[Patch],
-        entry: Entry,
-    ) -> Vec<Finding> {
+    pub(crate) fn check(bytes: &[u8], patches: &[Patch], entry: Entry) -> Vec<Finding> {
         let mut findings = Vec::new();
         if bytes.is_empty() {
             return findings;
         }
-        let cfg = Cfg::build(bytes, bb_starts, bb_edges, patches, &mut findings);
-        let Entry::Guest(layout) = entry else {
-            return findings;
+        let layout = match entry {
+            Entry::Guest(layout) => layout,
+            Entry::Host => None,
         };
         let ctx = Ctx {
             bytes,
             patches,
             layout,
         };
+        let cfg = Cfg::build(ctx, &mut findings);
+        if let Entry::Host = entry {
+            return findings;
+        }
         let states = propose(&cfg, ctx);
         verify(&cfg, &states, ctx, &mut findings);
         findings
@@ -643,43 +684,30 @@ pub(crate) mod x86 {
         }
     }
 
-    /// Recover the machine basic-block leaders: the entry, the hinted `bb_starts`/`bb_edge` targets,
-    /// and — the part Cranelift's CLIF-block hints miss — every direct-branch target and the
-    /// fall-through of every conditional branch. Decoding from the current leader set discovers more
-    /// targets; iterate to a fixpoint (the leader set only grows, bounded by the code size, so it
-    /// terminates). The walk stops at a non-fall-through terminator, so inter-block island/table
-    /// data is never decoded.
-    fn recover_leaders(
-        bytes: &[u8],
-        bb_starts: &[u32],
-        bb_edges: &[(u32, u32)],
-        patches: &[Patch],
-    ) -> Vec<usize> {
+    /// Recover the machine basic-block leaders: the entry, every direct-branch target, the
+    /// fall-through of every conditional branch, and every jump-table target. Decoding from the
+    /// current leader set discovers more targets; iterate to a fixpoint (the leader set only grows,
+    /// bounded by the code size, so it terminates). The walk stops at a non-fall-through terminator,
+    /// so inter-block island/table data is never decoded.
+    fn recover_leaders(ctx: Ctx) -> Vec<usize> {
+        let (bytes, patches) = (ctx.bytes, ctx.patches);
         let len = bytes.len();
         let mut leaders: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         leaders.insert(0);
-        for &s in bb_starts {
-            if (s as usize) < len {
-                leaders.insert(s as usize);
-            }
-        }
-        for &(_, to) in bb_edges {
-            if (to as usize) < len {
-                leaders.insert(to as usize);
-            }
-        }
         loop {
             let before = leaders.len();
             let cur: Vec<usize> = leaders.iter().copied().collect();
             for (i, &ld) in cur.iter().enumerate() {
                 let limit = cur.get(i + 1).copied().unwrap_or(len);
                 let mut pos = ld;
+                let mut run = Vec::new();
                 while pos < limit {
                     let d = decode(bytes, pos);
                     if d.len == 0 {
                         break; // undecodable (flagged in decode_block)
                     }
                     let next = pos + d.len;
+                    run.push((pos, d));
                     match d.kind {
                         Kind::DirectJmp { target } => {
                             if target < len && !tail_call(&d, pos, patches) {
@@ -696,7 +724,13 @@ pub(crate) mod x86 {
                             }
                             break;
                         }
-                        Kind::Ret | Kind::Ud2 | Kind::IndirectJmp => break,
+                        // A table this run computes adds its targets; one that doesn't is flagged in
+                        // `Cfg::build`, from the block the leaders end up delimiting.
+                        Kind::IndirectJmp => {
+                            leaders.extend(table_targets(&run, ctx).unwrap_or_default());
+                            break;
+                        }
+                        Kind::Ret | Kind::Ud2 => break,
                         _ => {}
                     }
                     if next > limit {
@@ -776,7 +810,7 @@ pub(crate) mod x86 {
                     }
                     return (insns, vec![target, next]);
                 }
-                // `ret`/`ud2` leave the function; an indirect `jmp`'s successors come from `bb_edges`.
+                // `ret`/`ud2` leave the function; an indirect `jmp`'s successors are its jump table's.
                 Kind::Ret | Kind::Ud2 | Kind::IndirectJmp => return (insns, Vec::new()),
                 _ => {}
             }
@@ -985,7 +1019,7 @@ pub(crate) mod x86 {
                 Eff::Lea { dst, full: true } => {
                     let f = match d.operands.mem {
                         Some(m) if m.rip => match ctx.rip_target(&d, end) {
-                            Some(_) => Fact::RipRel,
+                            Some(t) => Fact::RipRel(t),
                             None => Fact::Unknown, // a symbol address, not the function's rodata
                         },
                         Some(m) => match frame_addr(&state, &m) {
@@ -1001,6 +1035,25 @@ pub(crate) mod x86 {
                     // A full-width reload from a tracked slot restores its fact.
                     let f = match d.operands.mem.and_then(|m| frame_addr(&state, &m)) {
                         Some(Some(off)) => state.slot_get(off),
+                        _ => Fact::Unknown,
+                    };
+                    set(&mut state, dst, f);
+                }
+                Eff::LoadSx32 { dst } => {
+                    let f = d
+                        .operands
+                        .mem
+                        .map_or(Fact::Unknown, |m| table_entry(&state, &m, ctx));
+                    set(&mut state, dst, f);
+                }
+                Eff::AddReg { dst, src } => {
+                    let f = match (fact(&state, dst), fact(&state, src)) {
+                        (Fact::RipRel(t), Fact::TableEntry { at, n })
+                        | (Fact::TableEntry { at, n }, Fact::RipRel(t))
+                            if t == i64::from(at) =>
+                        {
+                            Fact::TableTarget { at, n }
+                        }
                         _ => Fact::Unknown,
                     };
                     set(&mut state, dst, f);
@@ -1122,6 +1175,7 @@ pub(crate) mod x86 {
         !matches!(
             d.eff,
             Eff::LoadReg { .. }
+                | Eff::LoadSx32 { .. }
                 | Eff::WrReg
                 | Eff::Cmp { .. }
                 | Eff::Cmov { .. }
@@ -1172,6 +1226,8 @@ pub(crate) mod x86 {
             Eff::MovImm { dst, .. }
             | Eff::MovReg { dst, .. }
             | Eff::LoadReg { dst }
+            | Eff::LoadSx32 { dst }
+            | Eff::AddReg { dst, .. }
             | Eff::Lea { dst, .. }
             | Eff::AluImm { dst, .. }
             | Eff::Cmov { dst, .. } => bit(dst),
@@ -1316,7 +1372,10 @@ pub(crate) mod x86 {
         // Other known bases: the fn-table (call.dyn dispatch), vmctx (the trap-out cell and
         // per-instance fields), and a lea'd pointer into the function's own rodata / jump tables (the
         // br_table dispatch's table read). Their extents are #2603 PR 3.
-        if matches!(base_f, Some(Fact::FnTableBase | Fact::Vmctx | Fact::RipRel)) {
+        if matches!(
+            base_f,
+            Some(Fact::FnTableBase | Fact::Vmctx | Fact::RipRel(_))
+        ) {
             return;
         }
         // Anything else: an access through a base of unknown or non-pointer provenance.
@@ -1357,21 +1416,6 @@ pub(crate) mod x86 {
         Undecodable,
     }
 
-    impl Kind {
-        /// Whether control can continue to the next instruction after this one. `false` for the
-        /// terminators that end a basic block without fall-through (`jmp`, `ret`, `ud2`, indirect
-        /// `jmp`) — after which the next bytes may be a constant island or jump table, not code.
-        /// Used by the test-only [`walk`] (the policy decodes blocks via [`decode_block`], which
-        /// inspects `kind` directly).
-        #[cfg(test)]
-        fn falls_through(self) -> bool {
-            !matches!(
-                self,
-                Kind::DirectJmp { .. } | Kind::IndirectJmp | Kind::Ret | Kind::Ud2
-            )
-        }
-    }
-
     /// A small-integer ALU op the transfer models for bound/const tracking (#2535). Everything else
     /// is an opaque GP write (the value becomes `Fact::Unknown`).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1402,6 +1446,11 @@ pub(crate) mod x86 {
         /// A GP store `mov [mem], src` of `w` bytes (mem in `operands.mem`). A 64-bit store records
         /// `src`'s fact in the spill slot it writes. Writes no GP register.
         StoreReg { src: u8, w: u8 },
+        /// `movsxd dst, dword [mem]` (REX.W) — a sign-extending 32-bit load, the read of a jump-table
+        /// entry.
+        LoadSx32 { dst: u8 },
+        /// A 64-bit `add dst, src` between GP registers — the jump-table target `table + entry`.
+        AddReg { dst: u8, src: u8 },
         /// `lea dst, [mem]` — computes an address into `dst` (does **not** dereference). Only a 64-bit
         /// one (`full`) yields a pointer; a narrower one truncates, so `dst` holds an unknown value.
         Lea { dst: u8, full: bool },
@@ -1641,6 +1690,12 @@ pub(crate) mod x86 {
         CmpRegRm,
         /// `cmp r/m, reg` (`39`).
         CmpRmReg,
+        /// `add r/m, reg` (`01`).
+        AddRmReg,
+        /// `add reg, r/m` (`03`).
+        AddRegRm,
+        /// `movsxd reg, r/m32` (`63`).
+        Movsxd,
         /// `0x81/0x83 /digit` — the ModRM.reg field (`digit`) picks add/or/.../cmp with `imm`.
         AluImmGroup(u8),
         /// `0x80/0x82 /digit` — the byte forms, 8-bit whatever the prefixes say (REX.W doesn't widen
@@ -1711,6 +1766,18 @@ pub(crate) mod x86 {
                 },
                 (Some(_), false) => Eff::WrRm,
                 _ => Eff::NoGp,
+            },
+            I::AddRmReg => match (rm, reg) {
+                (Some(dst), Some(src)) if osz == 8 => Eff::AddReg { dst, src },
+                _ => Eff::WrRm, // narrower, or `add [mem], reg`
+            },
+            I::AddRegRm => match (reg, rm) {
+                (Some(dst), Some(src)) if osz == 8 => Eff::AddReg { dst, src },
+                _ => Eff::WrReg, // narrower, or `add reg, [mem]`
+            },
+            I::Movsxd => match (reg, mem) {
+                (Some(dst), true) if osz == 8 => Eff::LoadSx32 { dst },
+                _ => Eff::WrReg, // the register form, or without REX.W a plain 32-bit move
             },
             I::CmpRegRm => match (reg, rm_opnd) {
                 (Some(r), Some(rhs)) if modeled => Eff::Cmp {
@@ -1974,6 +2041,8 @@ pub(crate) mod x86 {
                 (true, _) if byte => E::NoGp, // an 8-bit compare: flags only, not modeled
                 (true, 0 | 1) => E::CmpRmReg,
                 (true, _) => E::CmpRegRm,
+                _ if op == 0x01 => E::AddRmReg,
+                _ if op == 0x03 => E::AddRegRm,
                 (false, 0 | 1) => E::WrRm,
                 (false, _) => E::WrReg,
             };
@@ -1989,7 +2058,7 @@ pub(crate) mod x86 {
             0x89 => keep(finish_modrm(c, start, p, 0, Normal, E::MovToRm)),          // mov rm, r
             0x8A => keep(finish_modrm(c, start, p, 0, Normal, E::WrReg)),            // mov r8, rm8
             0x8B => keep(finish_modrm(c, start, p, 0, Normal, E::MovToReg)),         // mov r, rm
-            0x63 => keep(finish_modrm(c, start, p, 0, Normal, E::WrReg)), // movsxd r64, rm32
+            0x63 => keep(finish_modrm(c, start, p, 0, Normal, E::Movsxd)), // movsxd r64, rm32
             0x8D => keep(finish_modrm(c, start, p, 0, Normal, E::Lea)),
             0x8F => keep(finish_modrm(c, start, p, 0, Normal, E::PopRm)), // pop r/m
             0xD0..=0xD3 => finish_modrm(c, start, p, 0, Normal, E::WrRm), // shift r/m, 1|cl
@@ -2355,34 +2424,21 @@ pub(crate) mod x86 {
         }
     }
 
-    /// Visit each decoded instruction in basic-block order (the same traversal [`check`] uses):
-    /// from each block start to its terminator, skipping inter-block islands/tables. Stops a block on
-    /// a zero-length decode. Test-only, for the iced-x86 cross-check.
+    /// Every instruction the validator decodes, block by block, as [`check`] visits them. Test-only,
+    /// for the iced-x86 cross-check.
     #[cfg(test)]
-    pub(crate) fn walk(bytes: &[u8], bb_starts: &[u32]) -> Vec<(usize, Decoded)> {
-        let mut starts: Vec<usize> = bb_starts.iter().map(|&o| o as usize).collect();
-        starts.sort_unstable();
-        starts.dedup();
-        if starts.first() != Some(&0) {
-            starts.insert(0, 0);
-        }
-        let mut out = Vec::new();
-        for (i, &block) in starts.iter().enumerate() {
-            let limit = starts.get(i + 1).copied().unwrap_or(bytes.len());
-            let mut pos = block;
-            while pos < limit {
-                let d = decode(bytes, pos);
-                out.push((pos, d));
-                if d.len == 0 || pos + d.len > limit {
-                    break;
-                }
-                pos += d.len;
-                if !d.kind.falls_through() {
-                    break;
-                }
-            }
-        }
-        out
+    pub(crate) fn walk(bytes: &[u8], patches: &[Patch]) -> Vec<(usize, Decoded)> {
+        let ctx = Ctx {
+            bytes,
+            patches,
+            layout: None,
+        };
+        let mut findings = Vec::new();
+        Cfg::build(ctx, &mut findings)
+            .blocks
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     #[cfg(test)]
@@ -2468,7 +2524,7 @@ pub(crate) mod x86 {
         fn cross_check(src: &str) {
             for f in compiled(src) {
                 let bytes = &f.code;
-                for (pos, d) in walk(bytes, &f.bb_starts) {
+                for (pos, d) in walk(bytes, &f.patches) {
                     assert_ne!(d.len, 0, "ours: undecodable at +0x{pos:x}\n{:02x?}", bytes);
                     let insn = iced_at(bytes, pos).unwrap_or_else(|| {
                         panic!("iced rejects what we decoded at +0x{pos:x}\n{:02x?}", bytes)
@@ -2532,7 +2588,7 @@ pub(crate) mod x86 {
                     }
                 }
                 let entry = Entry::Guest(f.layout);
-                let findings = check(bytes, &f.bb_starts, &f.bb_edges, &f.patches, entry);
+                let findings = check(bytes, &f.patches, entry);
                 assert!(
                     findings.is_empty(),
                     "clean Cranelift output flagged: {findings:?}\n{:02x?}",
@@ -2754,7 +2810,7 @@ pub(crate) mod x86 {
         const GUARD: [u8; 10] = [0x48, 0xb8, 0, 0, 0, 0, 0x20, 0, 0, 0];
 
         fn findings(bytes: &[u8]) -> Vec<Finding> {
-            check(bytes, &[], &[], &[], Entry::Guest(WIN))
+            check(bytes, &[], Entry::Guest(WIN))
         }
 
         fn has(f: &[Finding], needle: &str) -> bool {
@@ -2805,10 +2861,10 @@ pub(crate) mod x86 {
                 0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
                 0xc3,
             ]);
-            let f = check(&bytes, &[], &[], &[], Entry::Guest(None));
+            let f = check(&bytes, &[], Entry::Guest(None));
             assert!(has(&f, "no window"), "{f:?}");
             // A trampoline's arguments are the host's, so the memory policy waits for its contract.
-            assert!(check(&bytes, &[], &[], &[], Entry::Host).is_empty());
+            assert!(check(&bytes, &[], Entry::Host).is_empty());
         }
 
         /// The full D63 confinement sequence is recognized and produces no finding: materialize the
@@ -2844,7 +2900,7 @@ pub(crate) mod x86 {
                 "a constant-pool bound was not recognized: {f:?}"
             );
             let patched = [Patch { at: 26, len: 8 }];
-            let f = check(&bytes, &[], &[], &patched, Entry::Guest(WIN));
+            let f = check(&bytes, &patched, Entry::Guest(WIN));
             assert!(
                 has(&f, "unconfined index"),
                 "a patched bound confined: {f:?}"
@@ -2917,25 +2973,77 @@ pub(crate) mod x86 {
                 0xc3, // [1a] ret
             ];
             let patches = [Patch { at: 0x12, len: 4 }];
-            let f = check(&bytes, &[], &[], &patches, Entry::Guest(WIN));
+            let f = check(&bytes, &patches, Entry::Guest(WIN));
             assert!(
                 f.is_empty(),
                 "a tail call fell through into the next block: {f:?}"
             );
         }
 
-        /// A hinted CLIF edge is attached only to the machine block that ends in an indirect `jmp`.
-        /// Here CLIF block 0 is a lone `ret`, and a hint claiming it reaches block 1 must not invent
-        /// that edge — block 1 is unreachable, so its unknown-base access never runs.
-        #[test]
-        fn cfg_a_hinted_edge_is_not_invented() {
-            let bytes = [
-                0xc3, // [0] ret               (CLIF block 0)
-                0x49, 0x8b, 0x01, // [1] mov rax, [r9]   (CLIF block 1: no predecessor)
-                0xc3, // [4] ret
+        /// br_table's dispatch as Cranelift emits it (`JmpTableSeq` behind the index clamp), with
+        /// the table's four entries pointing at four `ret`s after it. `entries` overrides them and
+        /// `n` the clamp's bound, for the rejections below.
+        fn jump_table(n: u8, entries: [i32; 4]) -> Vec<u8> {
+            let mut bytes = vec![
+                0xb8, n, 0, 0, 0, // [00] mov eax, n
+                0x41, 0x8b, 0xc8, // [05] mov ecx, r8d
+                0x3b, 0xc8, // [08] cmp ecx, eax
+                0x0f, 0x42, 0xc1, // [0a] cmovb eax, ecx      (eax ∈ [0, n])
+                0x48, 0x8d, 0x0d, 0x09, 0, 0, 0, // [0d] lea rcx, [rip + 9]  (→ +1d)
+                0x48, 0x63, 0x04, 0x81, // [14] movsxd rax, [rcx + rax*4]
+                0x48, 0x03, 0xc8, // [18] add rcx, rax
+                0xff, 0xe1, // [1b] jmp rcx
             ];
-            let f = check(&bytes, &[0, 1], &[(0, 1)], &[], Entry::Guest(WIN));
-            assert!(f.is_empty(), "a hinted edge was invented: {f:?}");
+            for e in entries {
+                bytes.extend_from_slice(&e.to_le_bytes()); // [1d] the table
+            }
+            bytes.extend_from_slice(&[0xc3; 4]); // [2d] four `ret`s
+            bytes
+        }
+
+        /// Hole 11: a jump table's targets are read from the bytes. The clamp confines the index
+        /// to `[0, 3]`, so the `jmp` reaches exactly the four blocks the table lists.
+        #[test]
+        fn cfg_reads_the_jump_table_from_the_bytes() {
+            let bytes = jump_table(3, [0x10, 0x11, 0x12, 0x13]);
+            let f = findings(&bytes);
+            assert!(f.is_empty(), "a well-formed jump table was flagged: {f:?}");
+            let ctx = Ctx {
+                bytes: &bytes,
+                patches: &[],
+                layout: WIN,
+            };
+            let mut fs = Vec::new();
+            let cfg = Cfg::build(ctx, &mut fs);
+            let targets: Vec<usize> = cfg.succs[0].iter().map(|&s| cfg.leaders[s]).collect();
+            assert_eq!(targets, [0x2d, 0x2e, 0x2f, 0x30]);
+        }
+
+        /// Hole 11's rejections: a `jmp` through a register that holds no table target, one whose
+        /// index the clamp doesn't bound, a table that runs past the function, an entry that leaves
+        /// the function or splits an instruction, and an entry a relocation patches.
+        #[test]
+        fn cfg_flags_a_jump_it_cannot_read_a_table_for() {
+            let not_a_table = [0x48, 0x89, 0xf8, 0xff, 0xe0]; // mov rax, rdi; jmp rax
+            assert!(has(&findings(&not_a_table), "holds no jump-table target"));
+            let through_memory = [0xff, 0x20]; // jmp [rax]
+            assert!(has(
+                &findings(&through_memory),
+                "indirect jmp through memory"
+            ));
+            let mut unclamped = jump_table(3, [0x10, 0x11, 0x12, 0x13]);
+            unclamped[10..13].copy_from_slice(&[0x8b, 0xc1, 0x90]); // mov eax, ecx; nop
+            assert!(has(&findings(&unclamped), "holds no jump-table target"));
+            let past_the_end = jump_table(9, [0x10, 0x11, 0x12, 0x13]); // ten entries
+            assert!(has(&findings(&past_the_end), "holds no jump-table target"));
+            let outside = jump_table(3, [0x10, 0x11, 0x12, 0x400]);
+            assert!(has(&findings(&outside), "targets outside the function"));
+            let split = jump_table(3, [0x10, 0x11, 0x12, -0x0e]); // → +0f, inside the `lea`
+            assert!(has(&findings(&split), "overruns its block"));
+            let bytes = jump_table(3, [0x10, 0x11, 0x12, 0x13]);
+            let patched = [Patch { at: 0x21, len: 4 }];
+            let f = check(&bytes, &patched, Entry::Guest(WIN));
+            assert!(has(&f, "holds no jump-table target"), "{f:?}");
         }
 
         /// Hole 1: a call clobbers the caller-saved registers. Here both `rdi` (mem_base) and the
@@ -3146,7 +3254,7 @@ pub(crate) mod x86 {
                 layout: WIN,
             };
             let mut fs = Vec::new();
-            let cfg = Cfg::build(&bytes, &[], &[], &[], &mut fs);
+            let cfg = Cfg::build(ctx, &mut fs);
             assert!(fs.is_empty());
             let honest = propose(&cfg, ctx);
             let mut f = Vec::new();
@@ -3182,13 +3290,13 @@ pub(crate) mod x86 {
                 mask: (1u64 << 37) - 1,
                 guard_offset: 1u64 << 37,
             });
-            assert!(check(&bytes, &[], &[], &[], Entry::Guest(big)).is_empty());
+            assert!(check(&bytes, &[], Entry::Guest(big)).is_empty());
             // A 32 KiB reservation does not → the access reaches past it.
             let small = Some(WindowLayout {
                 mask: (1u64 << 15) - 1,
                 guard_offset: 1u64 << 15,
             });
-            let f = check(&bytes, &[], &[], &[], Entry::Guest(small));
+            let f = check(&bytes, &[], Entry::Guest(small));
             assert!(has(&f, "past the reservation"), "{f:?}");
         }
     }

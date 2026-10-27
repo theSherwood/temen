@@ -6532,14 +6532,6 @@ fn jit_isa() -> Result<cranelift_codegen::isa::OwnedTargetIsa, JitError> {
     // each pass, which names the pass that broke the CLIF.
     let per_pass = cfg!(any(debug_assertions, fuzzing));
     let _ = flags.set("enable_verifier", if per_pass { "true" } else { "false" });
-    // #2481 — when the machine-code validator runs, ask Cranelift to record each function's basic
-    // block start offsets (`CompiledCode::bb_starts`), the hints the validator checks control-flow
-    // targets against instead of recovering the CFG itself. Off otherwise, so a production compile
-    // that does not validate pays nothing. The flag adds metadata only; it does not change the code.
-    // Also on under `cfg(test)`, so the decoder/validator cross-check tests see real block layout.
-    if validate::enabled() || cfg!(test) {
-        let _ = flags.set("machine_code_cfg_info", "true");
-    }
     cranelift_native::builder()
         .map_err(|e| JitError::Backend(e.to_string()))?
         .finish(settings::Flags::new(flags))
@@ -6623,8 +6615,6 @@ fn define_funcs(
                 #[cfg(all(test, target_arch = "x86_64"))]
                 validate::capture_code(
                     code.code_buffer(),
-                    &code.bb_starts,
-                    &code.bb_edges,
                     validate::patches(relocs.iter().map(|r| (r.offset, r.kind))),
                     layout,
                 );
@@ -6682,18 +6672,11 @@ fn compile_verified(
     let code = code.apply_params(&ctx.func.params);
     // #2481 — shadow-mode machine-code validation: check the emitted bytes against the policy and
     // log any disagreement, but never reject. `enabled()` is false on a production compile, so this
-    // is inert there; `jit_isa` only records `bb_starts`/`bb_edges` when it is true. `entry` says what
-    // is known of the function's entry: a guest function's window geometry, which the window-access
-    // policy re-proves against, or a trampoline's host ABI (#2603).
+    // is inert there. `entry` says what is known of the function's entry: a guest function's window
+    // geometry, which the window-access policy re-proves against, or a trampoline's host ABI (#2603).
     if validate::enabled() {
         let patches = validate::patches(code.buffer.relocs().iter().map(|r| (r.offset, r.kind)));
-        validate::shadow_check(
-            code.code_buffer(),
-            &code.bb_starts,
-            &code.bb_edges,
-            &patches,
-            entry,
-        );
+        validate::shadow_check(code.code_buffer(), &patches, entry);
     }
     Ok(code)
 }
