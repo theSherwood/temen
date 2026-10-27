@@ -6,7 +6,10 @@ use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, transform_module,
     transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, Attestation, FrozenDetached, Host, Value};
+use temen_interp::{
+    run_capture_reserved_with_host, Attestation, FrozenDetached, Host, HostProcGrant, ProcHandler,
+    Value,
+};
 use temen_ir::{Memory, Module};
 use temen_snapshot::{freeze, restore, FreezeError, RestoreError};
 
@@ -1827,13 +1830,13 @@ fn a_named_host_cap_round_trips_through_the_codec() {
     let inst = instrument(SRC);
     let mut host = Host::new();
     host.grant_clock();
-    let h = host.grant_host_proc(
-        Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
         temen_interp::CapState::Captured {
             capture: Box::new(|| b"cursor=7".to_vec()),
             restore: Box::new(|_| {}),
         },
-    );
+    ));
     host.register_cap_name("fs", h);
 
     let win = init_durable_window(WINDOW, TEST_ARENA);
@@ -1845,9 +1848,10 @@ fn a_named_host_cap_round_trips_through_the_codec() {
     thost.set_named_cap_registrar(Box::new(move |name, state, _payer| {
         log.lock().unwrap().push((name.to_string(), state.to_vec()));
         Some(temen_interp::NamedCapGrant {
-            handler: Box::new(|_op, _args, _mem, _| Ok(vec![99])),
-            fork: None,
-            state: temen_interp::CapState::Stateless,
+            grant: HostProcGrant::new(
+                ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![99]))),
+                temen_interp::CapState::Stateless,
+            ),
             process: None,
         })
     }));
@@ -1949,10 +1953,10 @@ fn restore_refuses_an_artifact_naming_a_cap_the_embedder_does_not_serve() {
     let inst = instrument(SRC);
     let mut host = Host::new();
     host.grant_clock();
-    let h = host.grant_host_proc(
-        Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
         temen_interp::CapState::Stateless,
-    );
+    ));
     host.register_cap_name("fs", h);
     let win = init_durable_window(WINDOW, TEST_ARENA);
     let artifact = freeze(&inst, &win, &host).expect("freeze");
@@ -1971,10 +1975,10 @@ fn freeze_still_refuses_an_unnamed_host_cap() {
     let inst = instrument(SRC);
     let mut host = Host::new();
     host.grant_clock();
-    host.grant_host_proc(
-        Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+    host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
         temen_interp::CapState::Stateless,
-    ); // never named
+    )); // never named
     let win = init_durable_window(WINDOW, TEST_ARENA);
     match freeze(&inst, &win, &host) {
         Err(FreezeError::NonDurableHandle(h)) => assert_eq!(h.slot, 1),
@@ -1994,10 +1998,10 @@ fn a_cap_free_domain_elides_the_named_section() {
 
     let mut with = Host::new();
     with.grant_clock();
-    let h = with.grant_host_proc(
-        Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+    let h = with.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
         temen_interp::CapState::Stateless,
-    );
+    ));
     with.register_cap_name("fs", h);
     let named = freeze(&inst, &win, &with).expect("freeze");
 

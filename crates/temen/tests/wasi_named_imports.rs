@@ -12,7 +12,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use temen_interp::{cap_id, run_with_host, BoundImport, GuestMem, Host, HostProc, Trap};
+use temen_interp::{
+    cap_id, run_with_host, BoundImport, GuestMem, Host, HostProc, HostProcGrant, ProcHandler, Trap,
+};
 use temen_ir::ResolvedCap;
 
 /// Op numbers the [`handler`] dispatches on; [`resolve`] maps WASI names to these.
@@ -51,7 +53,10 @@ fn resolve(name: &str) -> Option<ResolvedCap> {
 /// the call.
 fn grant(host: &mut Host) -> (i32, WasiOut) {
     let out = WasiOut::default();
-    let handle = host.grant_host_proc(handler(out.clone()), temen_interp::CapState::Stateless);
+    let handle = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(handler(out.clone())),
+        temen_interp::CapState::Stateless,
+    ));
     (handle, out)
 }
 

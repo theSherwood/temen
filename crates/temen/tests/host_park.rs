@@ -1,5 +1,5 @@
 //! §12 **parking-on-blocking, slice 1** (the plan that retires the ring — DESIGN.md §12): an
-//! *offloadable* host-proc registration declares blockingness (`Host::grant_host_proc_offloadable`),
+//! *offloadable* host-proc registration declares blockingness (`ProcHandler::Offloadable`),
 //! the handler decides per call (`Done` inline / `Offload` punt — the io_uring try-nonblocking
 //! model), and a punting dispatch on the parking-aware face returns `Pending(completion_id)` so the
 //! eval loop waits **without the host lock** (the single-fiber degenerate wait). Pins:
@@ -14,7 +14,10 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use temen_interp::{bytecode, run_with_host, Host, OffloadHostProc, OffloadOutcome, Value};
+use temen_interp::{
+    bytecode, run_with_host, Host, HostProcGrant, OffloadHostProc, OffloadOutcome, ProcHandler,
+    Value,
+};
 use temen_jit::JitOutcome;
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -93,7 +96,10 @@ fn run_all_tiers(n: u64, handler: fn() -> OffloadHostProc) -> [(i64, u64); 3] {
 
     // Tree-walk oracle — parking-aware (the pending face; punts wait without the lock).
     let mut hi = Host::new();
-    let h = hi.grant_host_proc_offloadable(handler(), None, temen_interp::CapState::Stateless);
+    let h = hi.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Offloadable(handler()),
+        temen_interp::CapState::Stateless,
+    ));
     let comps_i = hi.completions();
     let mut fuel = 1_000_000u64;
     let iv = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut hi).expect("interp ok");
@@ -109,7 +115,10 @@ fn run_all_tiers(n: u64, handler: fn() -> OffloadHostProc) -> [(i64, u64); 3] {
 
     // Bytecode interpreter (the pump) — parking-aware.
     let mut hb = Host::new();
-    let hbh = hb.grant_host_proc_offloadable(handler(), None, temen_interp::CapState::Stateless);
+    let hbh = hb.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Offloadable(handler()),
+        temen_interp::CapState::Stateless,
+    ));
     let comps_b = hb.completions();
     let mut fuel = 1_000_000u64;
     let bv = bytecode::compile_and_run_with_host(&m, 0, &[Value::I32(hbh)], &mut fuel, &mut hb)
@@ -128,7 +137,10 @@ fn run_all_tiers(n: u64, handler: fn() -> OffloadHostProc) -> [(i64, u64); 3] {
     // Cranelift JIT — parking-aware too (#2047): the generic `cap_thunk` punts to the pool and
     // waits outside the run, as the locked thunk always did.
     let mut hj = Host::new();
-    let hjh = hj.grant_host_proc_offloadable(handler(), None, temen_interp::CapState::Stateless);
+    let hjh = hj.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Offloadable(handler()),
+        temen_interp::CapState::Stateless,
+    ));
     let comps_j = hj.completions();
     let jo = temen_jit::compile_and_run_with_host(
         &m,
@@ -186,10 +198,12 @@ fn sync_ops_never_touch_parking_machinery() {
     // A plain (synchronous) host proc through the same guest loop: the parking odometer must
     // read zero — no completion id, no table touch (the §12 pin).
     let mut host = Host::new();
-    let h = host.grant_host_proc(
-        Box::new(|_op, args, _mem, _minter| Ok(vec![mix(*args.first().unwrap_or(&0))])),
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, args, _mem, _minter| {
+            Ok(vec![mix(*args.first().unwrap_or(&0))])
+        })),
         temen_interp::CapState::Stateless,
-    );
+    ));
     let comps = host.completions();
     let mut fuel = 1_000_000u64;
     let r = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host).expect("interp ok");

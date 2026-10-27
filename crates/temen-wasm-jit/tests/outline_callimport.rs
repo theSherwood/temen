@@ -10,7 +10,7 @@
 //! (the manifest itself no longer blocks `emit_module`), and (2) **preserves semantics** (same
 //! bindings, same result) — and the rewritten module still **verifies**.
 
-use temen_interp::{bytecode, BoundImport, Host, Value};
+use temen_interp::{bytecode, BoundImport, Host, HostProcGrant, ProcHandler, Value};
 use temen_wasm_jit::{compile_module_reactor, outline_cap_calls};
 
 // The entry (`f0`) is otherwise-emittable integer compute, but drives import 0 (a host-fn interface,
@@ -42,13 +42,13 @@ fn parse(src: &str) -> temen_ir::Module {
 /// identically either way.
 fn run(m: &temen_ir::Module) -> Vec<Value> {
     let mut host = Host::new();
-    let handle = host.grant_host_proc(
-        Box::new(|op, args, _mem, _| {
+    let handle = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|op, args, _mem, _| {
             assert_eq!(op, 0, "the guest calls op 0");
             Ok(vec![args[0] + args[1]])
-        }),
+        })),
         temen_interp::CapState::Stateless,
-    );
+    ));
     host.set_import_bindings(vec![BoundImport::required(13, 0, handle)]);
     let mut r = bytecode::Reactor::open(m).expect("open reactor");
     let mut fuel = u64::MAX;

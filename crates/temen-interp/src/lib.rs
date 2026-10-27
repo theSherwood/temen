@@ -13872,6 +13872,20 @@ fn wake_zeroed_pipes(sched: &SchedRef, (zeroed_w, zeroed_r): ZeroedPipes) {
     }
 }
 
+/// #2645 — a tree-walker dispatch's results: its own, or, when it handed back an unlocked host
+/// procedure's call ([`UnlockedCall`]), what that call answers, run now that the vCPU holds no host.
+fn unlocked_results(
+    results: Vec<i64>,
+    unlocked: Option<UnlockedCall>,
+    args: &[i64],
+    mem: &mut Option<Mem>,
+) -> Result<Vec<i64>, Trap> {
+    match unlocked {
+        Some(call) => call.run(args, mem.as_mut().map(|m| m as &mut dyn GuestMem)),
+        None => Ok(results),
+    }
+}
+
 fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // This domain's shadow arena is a property of its window, fixed for the run — read once so the
     // placement calls below never re-borrow `v` while a frame or the registry is borrowed mutably.
@@ -16347,11 +16361,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // host locking). Threads of a domain serialize their capability calls here.
                     let mut hg = HostCall::lock(host, sched);
                     let mut pending_id = None;
+                    let mut unlocked = None;
                     // #2495 — under a recording host this engine offers no parking face: it tapes
                     // no delivered value, so a host-answered call declines before its embedder
                     // sees it. A pool job runs inline under a tape on either face.
                     let face = (!hg.records_caps()).then_some(&mut pending_id);
-                    let results = hg.cap_dispatch_slots_impl(*type_id, *op, h, &argv, gm, face)?;
+                    let results = hg.cap_dispatch_slots_deferring(
+                        *type_id,
+                        *op,
+                        h,
+                        &argv,
+                        gm,
+                        face,
+                        Some(&mut unlocked),
+                    )?;
                     // §12 parking-on-blocking: a punted offloadable dispatch — release the host
                     // lock **before** waiting (the §5b serialization fix), then take the scalar
                     // completion. The placeholder `results` is discarded.
@@ -16477,6 +16500,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let t = ParkTransients::drain(&mut hg);
                     let domain = hg.domain_id() as usize;
                     drop(hg);
+                    let results = unlocked_results(results, unlocked, &argv, mem)?;
                     if closed {
                         sched.cap_revoke(domain, h, CAP_REVOKED);
                     }
@@ -16687,8 +16711,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let mut hg = HostCall::lock(host, sched);
                     // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
                     let packed = *import | (*op << 16);
-                    let results =
-                        hg.cap_dispatch_slots(temen_ir::CAP_IMPORT_TYPE_ID, packed, 0, &argv, gm)?;
+                    let mut unlocked = None;
+                    let results = hg.cap_dispatch_slots_deferring(
+                        temen_ir::CAP_IMPORT_TYPE_ID,
+                        packed,
+                        0,
+                        &argv,
+                        gm,
+                        None,
+                        Some(&mut unlocked),
+                    )?;
                     // An import-routed blocking-stdin read doesn't park on this engine (the
                     // `set_stdin_blocking` park is `call.cap`'s); the flag is consumed so it can't
                     // leak into a later direct call's park decision.
@@ -16698,6 +16730,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // placeholder with nothing to say why, and dropping a pipe park is a false EOF.
                     let t = ParkTransients::drain(&mut hg);
                     drop(hg);
+                    let results = unlocked_results(results, unlocked, &argv, mem)?;
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
                     let mut refused = None;
@@ -16851,8 +16884,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let mut hg = HostCall::lock(host, sched);
-                    let results =
-                        hg.cap_dispatch_slots(temen_ir::CAP_IMPORT_TYPE_ID, *import, 0, &argv, gm)?;
+                    let mut unlocked = None;
+                    let results = hg.cap_dispatch_slots_deferring(
+                        temen_ir::CAP_IMPORT_TYPE_ID,
+                        *import,
+                        0,
+                        &argv,
+                        gm,
+                        None,
+                        Some(&mut unlocked),
+                    )?;
                     // FORK.md §8.6 — pipe blocking rides this dispatch (a command's `write`/`read`
                     // are `call.sym` imports bound to pipe ends): a `read` on an empty FIFO with
                     // writers open parks, a `write` to a full pipe parks the writer, and a write /
@@ -16865,6 +16906,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let _ = hg.take_stdin_parked(); // no stdin parking here (see call.import)
                     let t = ParkTransients::drain(&mut hg);
                     drop(hg);
+                    let results = unlocked_results(results, unlocked, &argv, mem)?;
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
                     let mut refused = None;
@@ -16941,8 +16983,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let mut hg = HostCall::lock(host, sched);
                     let packed = *ty | (*op << 16);
-                    let results =
-                        hg.cap_dispatch_slots(temen_ir::CAP_DYN_TYPE_ID, packed, h, &argv, gm)?;
+                    let mut unlocked = None;
+                    let results = hg.cap_dispatch_slots_deferring(
+                        temen_ir::CAP_DYN_TYPE_ID,
+                        packed,
+                        h,
+                        &argv,
+                        gm,
+                        None,
+                        Some(&mut unlocked),
+                    )?;
                     let _ = hg.take_stdin_parked(); // no stdin parking here (see call.import)
                                                     // #1621/#1647/#1826 — requests and pipe parks are honored here too. No consumer
                                                     // reaches a personality op through `call.import.dyn` today, but leaving this arm
@@ -16950,6 +17000,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                     // #1621 four rounds to find.
                     let t = ParkTransients::drain(&mut hg);
                     drop(hg);
+                    let results = unlocked_results(results, unlocked, &argv, mem)?;
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
                     let mut refused = None;
@@ -22070,7 +22121,8 @@ pub struct DurableNamedCap {
 /// §12.5 Section 3). The `(slot, generation)` pin is what keeps a **guest-held handle value**
 /// valid across restore: the guest names `(generation << CAP_LOG2) | slot`, so restore must
 /// reinstate the same pair. `type_id` is the interface the slot was granted under (the
-/// resolve check is `type_id` + `generation`).
+/// resolve check is `type_id` + `generation`). The slots no entry holds ride as generations
+/// alone ([`Host::slot_generations`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DurableHandle {
     pub slot: u32,
@@ -22596,7 +22648,7 @@ pub(crate) fn wait_for_ring(bell: &Bell, seen: u64, within: Option<std::time::Du
 
 /// §12 parking-on-blocking — the **completion store** behind a `Pending` dispatch. When an
 /// offloadable handler punts ([`OffloadOutcome::Offload`]) on the parking-aware dispatch face
-/// ([`Host::cap_dispatch_slots_pending`]), the dispatch mints an id here, hands the job to the
+/// ([`Host::cap_dispatch_slots_deferring`]), the dispatch mints an id here, hands the job to the
 /// offload pool, and returns `Pending(id)`; the pool worker posts the scalar result via
 /// [`Completions::complete`]. The eval loop then waits **without the host lock**
 /// ([`Completions::wait`] — the single-fiber degenerate path; fiber-level parking is the
@@ -22907,7 +22959,7 @@ impl Completions {
 /// live in the closure, reached only through a granted handle (the §3c masked/type-checked table).
 ///
 /// The last parameter is the §4b [`RegionMinter`] escape hatch — `Some` **only** for a handler
-/// registered mmap-capable ([`Host::grant_host_proc_region`]), `None` for a plain registration
+/// registered mmap-capable ([`ProcHandler::Minting`]), `None` for a plain one ([`ProcHandler::Sync`])
 /// (CONSOLIDATION §7: one closure shape, the *registration* decides the extra authority — a plain
 /// handler is never silently handed the minter).
 pub type HostProc = Box<
@@ -22949,8 +23001,8 @@ pub type HostProcFork = Arc<dyn Fn(u64) -> Option<ForkedProc> + Send + Sync>;
 pub type ExecRemapHook = Arc<dyn Fn(&[(i32, i32)]) + Send + Sync>;
 
 pub struct ForkedProc {
-    /// The new domain's handler over the provider's (duplicated or shared) state: synchronous, or
-    /// offloadable (#2424), as the provider mints it.
+    /// The new domain's handler over the provider's (duplicated or shared) state, in whichever shape
+    /// ([`ProcHandler`]) the provider mints it (#2424).
     pub handler: ProcHandler,
     /// A signal door over the **new process's own** signal state, installed on the new domain's
     /// `Host` ([`Host::set_signal_source`]). `None` = the twin shares its parent's source (the
@@ -22997,16 +23049,7 @@ impl ForkedProc {
     /// A shared-state mint: fresh closure over the same provider state, no per-process signal door,
     /// fork-of-fork through the same factory. The pre-#863 contract, right for providers whose
     /// state is deliberately global (a scripted table, a shared service shim).
-    pub fn shared(handler: HostProc, state: CapState) -> Self {
-        Self::of(ProcHandler::Sync(handler), state)
-    }
-
-    /// [`Self::shared`] for an offloadable handler ([`Host::grant_host_proc_offloadable`], #2424).
-    pub fn offloadable(handler: OffloadHostProc, state: CapState) -> Self {
-        Self::of(ProcHandler::Offloadable(handler), state)
-    }
-
-    fn of(handler: ProcHandler, state: CapState) -> Self {
+    pub fn shared(handler: ProcHandler, state: CapState) -> Self {
         Self {
             handler,
             signal: None,
@@ -23092,7 +23135,7 @@ impl Drop for Completer {
     }
 }
 
-/// §12 — the **offloadable** registration's handler shape ([`Host::grant_host_proc_offloadable`]):
+/// §12 — the **offloadable** registration's handler shape ([`ProcHandler::Offloadable`]):
 /// scalars in, [`OffloadOutcome`] out. Compared to a plain [`HostProc`] it *loses* powers — no
 /// guest window, no region minter — because a punted job outlives the dispatch and the pool must
 /// never touch the window (buffers are read at submit and written at completion on the vCPU
@@ -23124,14 +23167,123 @@ struct SharedStdin {
 /// its terminal and something else at once (#2019). The dual of [`StreamTee`].
 pub type StdinSource = Box<dyn FnMut() -> Option<Vec<u8>> + Send>;
 
-/// The two handler shapes one [`HostProcEntry`] can carry — the *registration* decides
-/// (CONSOLIDATION §7 per-entry powers, extended by §12 parking): `Sync` is today's full-powered
-/// synchronous closure; `Offloadable` declares blockingness and trades window/minter access for
-/// the right to punt to the offload pool. A fork factory mints either ([`ForkedProc::handler`]),
-/// so a spawned child or a fork twin inherits a handler of the shape its parent was granted (#2424).
+/// The shapes a host capability's handler takes. The shape is the *registration*, and it decides
+/// each call's powers (CONSOLIDATION §7 per-entry powers, extended by §12 parking): a synchronous
+/// handler sees the guest window, a minting one the region minter too, an offloadable one trades
+/// both for the right to punt, and an unlocked one (#2645) trades the minter for running outside the
+/// host lock. A grant ([`HostProcGrant`]), a fork factory ([`ForkedProc::handler`]) and a thaw's
+/// registrar ([`NamedCapGrant`]) each give one, so a spawned child, a fork twin and a thawed domain
+/// hold a handler of the shape its provider gives it (#2424, #2625).
 pub enum ProcHandler {
+    /// Answers each call on the caller's thread, through the guest window.
     Sync(HostProc),
+    /// §4b — [`Self::Sync`], handed the [`RegionMinter`] on each call: an mmap-capable handler mints
+    /// a file-backed `SharedRegion` and returns its handle, the zero-copy file-mmap bridge. The extra
+    /// authority is exactly region-minting (nothing else of the `Host` is reachable).
+    Minting(HostProc),
+    /// §12 parking-on-blocking — decides per call ([`OffloadOutcome`], the io_uring
+    /// try-nonblocking model): completes inline, or punts a self-contained job to the offload pool
+    /// or to the embedder. It sees no window and no minter, since a punted job outlives the dispatch,
+    /// and a punted call's declared signature carries at most one result (invariant 8).
     Offloadable(OffloadHostProc),
+    /// #1954 — [`Self::Offloadable`], declared to leave every call to the embedder
+    /// ([`OffloadOutcome::Host`]): a call parks without needing the caller's frames
+    /// ([`OpParks::OnHost`]). [`HostProcGrant::declared`] makes the standard one.
+    HostAnswered(OffloadHostProc),
+    /// #2645 — [`Self::Sync`] without the minter, keeping no state in the host
+    /// ([`UnlockedHostProc`]). Where a domain's tasks share its host under a lock (the tree-walker,
+    /// executor 2, the JIT's locked thunk), the dispatch hands the call back and its caller runs it
+    /// once it has let go of the host ([`Host::cap_dispatch_slots_deferring`]), so a call that waits
+    /// holds back no other task's host call. On the JIT, whose window pages are hardware-protected,
+    /// each of the call's window copies takes the host lock, which every page-protection change
+    /// holds, so a copy never meets a page another task is unmapping. A call runs under the host
+    /// where nothing else could use it meanwhile: on a single-threaded driver, and under a W1 tape,
+    /// which records each call where it runs.
+    Unlocked(UnlockedHostProc),
+}
+
+/// #2625 — a host capability as its provider grants it: its handler, in the shape that decides each
+/// call's powers ([`ProcHandler`]), its fork factory when it is forkable, and the state it holds
+/// ([`CapState`]). The one descriptor every grant takes ([`Host::grant_host_proc`]) and a thaw's
+/// registrar returns ([`NamedCapGrant`]), so a thaw files a capability exactly as its grant did.
+pub struct HostProcGrant {
+    pub handler: ProcHandler,
+    /// FORK.md PR 5 — the provider-supplied fork factory: `Some` = a spawn can re-grant the
+    /// capability to a §14 child and [`Host::fork_powerbox`] carries it into a twin, each minting a
+    /// fresh handler over the provider's own (shared or duplicated) state; `None` = it stays with
+    /// this domain (fail closed). The runtime never inspects the closure's state — forking it is the
+    /// provider's job, expressed by this factory (the Rust face of a C embedder's
+    /// `fork_ctx(parent_ctx) -> child_ctx`).
+    pub fork: Option<HostProcFork>,
+    pub state: CapState,
+}
+
+impl HostProcGrant {
+    /// A grant of `handler`, whose provider holds `state` (#1699), not forkable.
+    pub fn new(handler: ProcHandler, state: CapState) -> Self {
+        Self {
+            handler,
+            fork: None,
+            state,
+        }
+    }
+
+    /// This grant, forkable through `fork`.
+    pub fn forkable(self, fork: HostProcFork) -> Self {
+        Self {
+            fork: Some(fork),
+            ..self
+        }
+    }
+
+    /// #1366 / #1953 — the declared host-answered cap `name` ([`Host::grant_declared_host_caps`]):
+    /// each call parks its caller and is filed in `requests` under its completion id, and the
+    /// embedder takes the request out and answers it with its [`Completer`]. Forkable (#2579): a §14
+    /// child or `fork()` twin it is re-granted to files its calls in the same `requests`, under
+    /// completion ids unique in the process, so the embedder answers a child's call as it answers
+    /// the root's. A thaw's registrar returns this to re-grant one (#2625).
+    pub fn declared(name: &str, requests: &CapRequests) -> Self {
+        let fork: HostProcFork = {
+            let (name, requests) = (name.to_string(), Arc::clone(requests));
+            Arc::new(move |_pid| {
+                Some(ForkedProc::shared(
+                    ProcHandler::HostAnswered(declared_host_cap(&name, &requests)),
+                    CapState::Stateless,
+                ))
+            })
+        };
+        // Each call is answered afresh by the embedder; nothing is held between calls.
+        Self::new(
+            ProcHandler::HostAnswered(declared_host_cap(name, requests)),
+            CapState::Stateless,
+        )
+        .forkable(fork)
+    }
+}
+
+/// #2645 — an **unlocked** host procedure's handler ([`ProcHandler::Unlocked`]): scalars
+/// and the caller's window in, results out, like a [`HostProc`], but it keeps no state in the host
+/// and is handed no region minter. So a dispatch that holds the domain's host shared under a lock
+/// lets go of it first: the call runs while the domain's other tasks make their own host calls. A
+/// call that waits (a JS capability answered on a page, I/O) then holds nothing back but its own
+/// task. The provider makes its own state safe to share: the handler may run on several threads at
+/// once.
+pub type UnlockedHostProc =
+    Arc<dyn Fn(u32, &[i64], Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> + Send + Sync>;
+
+/// #2645 — a call to an unlocked host procedure that a dispatch handed back instead of running
+/// ([`Host::cap_dispatch_slots_deferring`]), for its caller to [`run`](Self::run) once it has let go
+/// of the host: with the call's arguments, and the window the dispatch was given.
+pub struct UnlockedCall {
+    handler: UnlockedHostProc,
+    op: u32,
+}
+
+impl UnlockedCall {
+    /// Run the call: `args` are the ones the dispatch was given, `mem` the caller's window.
+    pub fn run(self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        (self.handler)(self.op, args, mem)
+    }
 }
 
 /// The **one** extra authority an mmap-capable [`HostProcRegion`] handler gets over a plain [`HostProc`]:
@@ -23152,13 +23304,8 @@ pub trait RegionMinter {
 struct HostProcEntry {
     /// The handler closure ([`ProcHandler`]). A dispatch takes it out, runs it, and restores it.
     handler: ProcHandler,
-    /// FORK.md PR 5 — the provider-supplied fork factory ([`Host::grant_host_proc_forkable`]):
-    /// `Some` = [`Host::fork_powerbox`] carries this capability into a twin by minting a fresh
-    /// closure; `None` = non-forkable (fail closed).
+    /// The provider-supplied fork factory ([`HostProcGrant::fork`]).
     fork: Option<HostProcFork>,
-    /// §4b — whether the handler was registered mmap-capable
-    /// ([`Host::grant_host_proc_region`]) and so receives `Some(minter)` on each call.
-    mints: bool,
     /// #801 — the provider's published **op vtable** (`(names, sigs)`, the offer-entry shape for a
     /// host-served provider): what lets an image's named imports bind to this handler through the
     /// SAME §3.5 coverage walk offers use — name-keyed within this explicit grant, signatures
@@ -23168,15 +23315,33 @@ struct HostProcEntry {
     /// #1455 / #1699 — the provider's own answer to "what host-side state does this capability
     /// hold?", given wherever a handler is minted ([`CapState`]).
     state: CapState,
-    /// #1954 — a **declared host-completed cap** ([`Host::grant_declared_host_caps`]): every call is
-    /// finished by the embedder, so a call parks without needing the caller's frames
-    /// ([`OpParks::OnHost`]).
-    on_host: bool,
+}
+
+impl HostProcEntry {
+    /// The entry `grant` registers, publishing `vtable` (#801). A grant and a thaw both file one
+    /// this way (#2625).
+    fn new(grant: HostProcGrant, vtable: Option<HostFnVtable>) -> Self {
+        Self {
+            handler: grant.handler,
+            fork: grant.fork,
+            vtable,
+            state: grant.state,
+        }
+    }
+
+    /// Whether every call completes inside the call: a synchronous handler, minting or not, locked
+    /// or not (#2645), which cannot punt.
+    fn answers_in_call(&self) -> bool {
+        matches!(
+            self.handler,
+            ProcHandler::Sync(_) | ProcHandler::Minting(_) | ProcHandler::Unlocked(_)
+        )
+    }
 }
 
 /// #1699 — a host capability's **host-side state**, declared by its provider wherever a handler is
-/// minted: at grant (`Host::grant_host_proc*`), by a thaw's registrar ([`NamedCapGrant`]), and by a
-/// fork factory ([`ForkedProc`]). A required answer, not an opt-in: only the provider knows whether
+/// minted: at grant ([`HostProcGrant`]), by a thaw's registrar ([`NamedCapGrant`]), and by a fork
+/// factory ([`ForkedProc`]). A required answer, not an opt-in: only the provider knows whether
 /// the guest can observe state it holds, and the VM can't tell a stateless provider from one whose
 /// author forgot to say. When "stateless" was the default, a forgotten declaration froze with empty
 /// state and the thaw silently reset the guest's file cursors or buffers.
@@ -23237,13 +23402,12 @@ pub type HostProcStateRestore = Box<dyn Fn(&[u8]) + Send>;
 /// rebuilt state holds and the guest grows it by, as a fresh grant's state is paid for by its grantee.
 pub type NamedCapRegistrar = Box<dyn FnMut(&str, &[u8], &NodeRef) -> Option<NamedCapGrant> + Send>;
 
-/// What a [`NamedCapRegistrar`] re-grants: the handler, its fork factory when the capability is
-/// forkable (#1718), and its [`CapState`] (#1699) — so a thawed stateful capability is captured by
-/// the next freeze as the original was.
+/// What a [`NamedCapRegistrar`] re-grants: the capability as a grant takes it (#2625) — its handler
+/// in the shape it was granted (an offloadable, host-answered or minting one stays so across the
+/// thaw), its fork factory when it is forkable (#1718), and its [`CapState`] (#1699), so a thawed
+/// stateful capability is captured by the next freeze as the original was.
 pub struct NamedCapGrant {
-    pub handler: HostProc,
-    pub fork: Option<HostProcFork>,
-    pub state: CapState,
+    pub grant: HostProcGrant,
     /// #1688 — the doors of the process the capability is the personality of, for a fork twin's
     /// entry, which the restore installs as the fork did. `None` for any other capability, and for
     /// a run root's personality, whose embedder installs its doors itself.
@@ -23362,6 +23526,9 @@ type ImportReq = Arc<(Vec<String>, Vec<FuncType>)>;
 /// (#2219), and the checkpoint stays in the run, so nothing re-pins them by digest.
 #[derive(Clone)]
 pub(crate) struct ChildPowerbox {
+    /// Every slot's counter ([`Host::slot_generations`]), so a handle closed before the
+    /// checkpoint stays closed after it (#2360).
+    generations: Vec<u32>,
     handles: Vec<DurableHandle>,
     /// `(slot, generation, type_id, index into modules)` of each module handle.
     module_slots: Vec<(u32, u32, u32, u32)>,
@@ -25311,7 +25478,16 @@ struct ModuleGrant {
     /// vCPU from ([`Self::tables`]): made the first time it is asked for, and shared by every copy of
     /// this grant.
     tables: Arc<std::sync::OnceLock<Tables>>,
+    /// The module's bytecode programs ([`Self::program`]), made and shared as `tables` are, so a
+    /// host that grants the same module run after run ([`PreparedModule`], a toolchain's commands)
+    /// compiles it once, not once a run (#2366).
+    programs: Arc<GrantPrograms>,
 }
+
+/// A grant's bytecode program for a run whose driver serves its children (`[1]`) and for one whose
+/// driver does not (`[0]`): the two ways a run admits a module ([`bytecode::compile_granted`]).
+/// `None` inside for a module the bytecode engine does not run.
+type GrantPrograms = [std::sync::OnceLock<Option<Arc<bytecode::Compiled>>>; 2];
 
 /// A function table and its type section, as a vCPU owns them.
 type Tables = (Arc<[Func]>, Arc<[temen_ir::TypeEntry]>);
@@ -25325,6 +25501,7 @@ impl ModuleGrant {
             module: m,
             durable,
             tables: Arc::default(),
+            programs: Arc::default(),
         }
     }
 
@@ -25350,6 +25527,18 @@ impl ModuleGrant {
         });
         (Arc::clone(funcs), Arc::clone(types))
     }
+
+    /// The module's bytecode program for a run whose driver does or does not `serve` its children:
+    /// `compile`d the first time it is asked for, and shared by every copy of this grant.
+    fn program(
+        &self,
+        serve: bool,
+        compile: impl FnOnce() -> Option<bytecode::Compiled>,
+    ) -> Option<Arc<bytecode::Compiled>> {
+        self.programs[serve as usize]
+            .get_or_init(|| compile().map(Arc::new))
+            .clone()
+    }
 }
 
 /// What an `execve` becomes, resolved ([`Host::exec_module`]): the module the new image runs.
@@ -25373,6 +25562,13 @@ impl PreparedModule {
     /// The module it grants.
     pub fn module(&self) -> &Arc<Module> {
         &self.0.module
+    }
+
+    /// Its bytecode program as the root of a reserved-window run runs it
+    /// ([`bytecode::compile_reserved`]), compiled once and kept with the grant: the program an exec
+    /// of it in such a run runs too (#2366). `None` for a module the bytecode engine does not run.
+    pub fn program(&self) -> Option<Arc<bytecode::Compiled>> {
+        bytecode::granted_root_program(&self.0)
     }
 }
 
@@ -25687,7 +25883,7 @@ impl Host {
     /// way the copy holds nothing yet (#1909).
     fn powerbox_copy(&self, twin_pid: u64) -> Option<Host> {
         // FORK.md PR 5 — host procs are forkable iff **every** entry carries a provider-supplied
-        // fork factory ([`Host::grant_host_proc_forkable`]): the runtime cannot fork an opaque
+        // fork factory ([`HostProcGrant::fork`]): the runtime cannot fork an opaque
         // closure itself, and a partial carry would silently drop capabilities, so one factory-less
         // entry fails the whole fork closed (the pre-PR-5 behavior).
         let procs_forkable = self.host_procs.iter().all(|e| e.fork.is_some());
@@ -25833,14 +26029,12 @@ impl Host {
             twin.host_procs.push(HostProcEntry {
                 handler: forked.handler,
                 fork: Some(forked.refork.unwrap_or_else(|| Arc::clone(factory))),
-                mints: e.mints,
                 // #801 — the vtable rides the fork: a twin can exec a `__px_`-linked
                 // command and have its manifest bind against the twin's own personality.
                 vtable: e.vtable.clone(),
                 // #1455 — not the parent's serializer, which closes over the *parent's* state: the
                 // factory's answer for the handler it minted (#1699).
                 state: forked.state,
-                on_host: e.on_host,
             });
         }
         // FORK.md §8.6 — module grants ride along (their `funcs`/`data`/`module` are `Arc`s, so the
@@ -27115,7 +27309,7 @@ impl Host {
         // #1455: re-seed each capability's own state into the freshly granted handlers, so a guest
         // resumed at the checkpoint's logical time sees its capabilities as they were then rather than
         // as a fresh powerbox minted them. Under a replaying tape too: a replay re-runs such a
-        // capability (see `cap_dispatch_slots_impl`), so from here its state follows the replay
+        // capability (see `cap_dispatch_slots_deferring`), so from here its state follows the replay
         // forward, and a store rewound to the checkpoint shows the files the guest had written by then.
         self.restore_cap_states(&s.cap_states);
         for (d, &(units, bytes)) in self.jit_tables.iter_mut().zip(&s.jit_quota) {
@@ -27680,7 +27874,8 @@ impl Host {
     /// state or native pointers (`SharedRegion`/`Module`/`Blocking`/`HostProc`; the §22 `JitTable`/
     /// `JitCode` bindings ride Section 5 since Slice 2 and stay) — and leaves the durable handles untouched. Each close frees the slot but **keeps its
     /// generation** (D37), so a guest's stale handle value becomes a dead generation and any later
-    /// `call.cap` on it is an inert `CapFault`, never authority into a recycled slot. Returns the drained
+    /// `call.cap` on it answers `-EBADF` (I41), after a thaw too (#2360), never authority into a
+    /// recycled slot. Returns the drained
     /// handles in ascending slot order (for the embedder to audit the relinquished authority). The exact
     /// complement of [`Self::capture_durable_handles`]'s refusal set: after a drain, `capture` succeeds,
     /// so a subtree that held non-durable authority can now be frozen.
@@ -27747,18 +27942,35 @@ impl Host {
         }
     }
 
-    /// Reinstate a captured durable set into this table (DURABILITY.md §12.5), pinning each
-    /// `(slot, generation)` so guest-held handle values stay valid across restore. The table
-    /// becomes **exactly** the captured set: every other slot is closed first (a host that granted
+    /// #2360 — each slot's generation counter, in slot order up to the last slot ever granted: the
+    /// half of the table [`Host::capture_durable_handles`] does not carry. A closed slot keeps its
+    /// counter (D37), and a freeze must carry it too. Otherwise the thaw cannot tell a handle the
+    /// guest closed (`-EBADF`, [`Host::handle_revoked`]) from a forgery, and the next grant into the
+    /// slot could issue the closed handle's value again.
+    pub fn slot_generations(&self) -> Vec<u32> {
+        let len = self.table.iter().rposition(|s| s.generation != 0);
+        let len = len.map_or(0, |i| i + 1);
+        self.table[..len].iter().map(|s| s.generation).collect()
+    }
+
+    /// Reinstate a captured table (DURABILITY.md §12.5): every slot's counter from `generations`
+    /// ([`Host::slot_generations`]; `0` past its end), then each live entry of `handles` pinned at
+    /// its `(slot, generation)`, so guest-held handle values stay valid across restore. The table
+    /// becomes **exactly** the captured one: a slot the embedder granted before restoring and the
+    /// artifact holds closed, or never granted, ends as the artifact has it (a host that granted
     /// before restoring keeps only what the artifact carries). Slots must be in range (the snapshot
     /// codec validates that against [`Host::handle_capacity`] before calling).
-    pub fn restore_durable_handles(&mut self, handles: &[DurableHandle]) {
-        // The restored table is exactly the artifact's. A slot the artifact does not carry is closed
-        // (its generation kept, so a stale handle value stays a dead generation) — an embedder that
-        // grants its powerbox fresh and then restores over it must not resurrect a capability the
-        // guest had dropped before the freeze.
-        for s in &mut self.table {
-            s.entry = None;
+    pub fn restore_durable_handles(&mut self, generations: &[u32], handles: &[DurableHandle]) {
+        // The restored table is exactly the artifact's, counters included: a closed handle stays
+        // closed (`-EBADF`), a never-issued one stays a forgery, and the next grant into a slot issues
+        // the value the uninterrupted run would have (#2360). An embedder that grants its powerbox
+        // fresh and then restores over it must not resurrect a capability the guest had dropped
+        // before the freeze.
+        for (i, s) in self.table.iter_mut().enumerate() {
+            *s = Slot {
+                generation: generations.get(i).copied().unwrap_or(0),
+                ..Slot::default()
+            };
         }
         for h in handles {
             let binding = match h.binding {
@@ -28205,9 +28417,9 @@ impl Host {
     ///
     /// Each captured entry is handed to the embedder's registrar
     /// ([`Self::set_named_cap_registrar`]) as `(name, state)`; the registrar returns the handler to
-    /// install — a fresh closure of the embedder's own making, re-seeded from `state` if it cares —
-    /// and its fork factory, which the rebuilt entry keeps (#1718: a thaw never narrows a capability
-    /// to un-forkable). Entries are rebuilt **positionally** (a `None`, or a name the registrar
+    /// install — a fresh closure of the embedder's own making, re-seeded from `state` if it cares, in
+    /// the shape it was granted (#2625) — and its fork factory, which the rebuilt entry keeps (#1718:
+    /// a thaw never narrows a capability to un-forkable). Entries are rebuilt **positionally** (a `None`, or a name the registrar
     /// declines, leaves a placeholder that traps if ever dispatched), so indices re-resolve exactly.
     /// The names are kept for [`Self::restore_durable_handles`] to register at the handles it re-pins
     /// (#1859).
@@ -28240,9 +28452,17 @@ impl Host {
                     }
                 },
             };
-            let (handler, fork, state, process) = match grant {
-                Some(g) => (Some(g.handler), g.fork, g.state, g.process),
-                None => (None, None, CapState::Stateless, None),
+            let (grant, process) = match grant {
+                Some(g) => (g.grant, g.process),
+                None => (
+                    HostProcGrant::new(
+                        ProcHandler::Sync(Box::new(|_op, _args, _mem, _minter| {
+                            Err(Trap::CapFault)
+                        })),
+                        CapState::Stateless,
+                    ),
+                    None,
+                ),
             };
             let mut vtable = None;
             if let Some(mut p) = process {
@@ -28254,18 +28474,8 @@ impl Host {
                     });
                 }
             }
-            out.push(HostProcEntry {
-                handler: ProcHandler::Sync(
-                    handler.unwrap_or_else(|| {
-                        Box::new(|_op, _args, _mem, _minter| Err(Trap::CapFault))
-                    }),
-                ),
-                fork,
-                mints: false,
-                vtable,
-                state,
-                on_host: false,
-            });
+            // #2625 — as its grant filed it, so the capability keeps its shape across the thaw.
+            out.push(HostProcEntry::new(grant, vtable));
         }
         self.named_cap_registrar = registrar;
         match refused {
@@ -29390,51 +29600,21 @@ impl Host {
         }
     }
 
-    /// §7 Register an **embedder host-capability** handler and grant a handle to it (iface
+    /// §7 Register an **embedder host-capability** and grant a handle to it (iface
     /// [`cap_id::HOST_PROC`]). The guest reaches it with `call.cap HOST_PROC <op> <handle> (args)`; the
-    /// closure supplies the semantics, so a host adds a capability (e.g. a WASI shim) without
-    /// changing the VM. The handler is host code in the **authority** TCB — it sees the guest window
-    /// (masked `GuestMem`) but is reached only through this masked, type-checked handle. `state` is
-    /// the provider's answer for what host-side state it holds ([`CapState`], #1699).
-    pub fn grant_host_proc(&mut self, f: HostProc, state: CapState) -> i32 {
-        self.grant_host_proc_entry(HostProcEntry {
-            handler: ProcHandler::Sync(f),
-            fork: None,
-            mints: false,
-            vtable: None,
-            state,
-            on_host: false,
-        })
-    }
-
-    /// §12 parking-on-blocking — register an **offloadable** host-capability handler (also iface
-    /// [`cap_id::HOST_PROC`]): the registration declares blockingness. The handler decides per call
-    /// (the io_uring try-nonblocking model): [`OffloadOutcome::Done`] completes inline;
-    /// [`OffloadOutcome::Offload`] punts a self-contained scalar job to the offload pool. On a
-    /// parking-aware eval loop the punting call returns `Pending` and the caller waits **without
-    /// the host lock**; everywhere else the job runs inline, byte-identical to a synchronous
-    /// handler. Compared to [`Host::grant_host_proc`] this face *loses* powers — no window, no
-    /// minter — the pool must never touch the window (the ring's discipline, kept), and a punted
-    /// call's declared signature carries at most one result (invariant 8).
+    /// handler supplies the semantics, so a host adds a capability (e.g. a WASI shim) without
+    /// changing the VM. The handler is host code in the **authority** TCB — reached only through this
+    /// masked, type-checked handle — and its shape decides what each call sees ([`ProcHandler`]): the
+    /// guest window (masked `GuestMem`), the region minter, or the right to punt. #2625 — every
+    /// grant comes through here, as one [`HostProcGrant`], which a thaw's registrar returns too.
     ///
-    /// #2424 — with a `fork` factory, as [`Host::grant_host_proc_forkable`]'s, a spawn can re-grant
-    /// it to a §14 child and a fork twin carries it: the factory mints the new domain's handler
-    /// (typically [`ForkedProc::offloadable`]), whose punts park the new domain's caller as this
-    /// domain's park its own. Without one it stays with this domain, as before.
-    pub fn grant_host_proc_offloadable(
-        &mut self,
-        f: OffloadHostProc,
-        fork: Option<HostProcFork>,
-        state: CapState,
-    ) -> i32 {
-        self.grant_host_proc_entry(HostProcEntry {
-            handler: ProcHandler::Offloadable(f),
-            fork,
-            mints: false,
-            vtable: None,
-            state,
-            on_host: false,
-        })
+    /// §12 — an offloadable handler's punting call returns `Pending` on a parking-aware eval loop,
+    /// and the caller waits **without the host lock**; everywhere else the job runs inline,
+    /// byte-identical to a synchronous handler. #2424 — with a fork factory, a spawn can re-grant
+    /// the capability to a §14 child and a fork twin carries it: the factory mints the new domain's
+    /// handler, whose punts park the new domain's caller as this domain's park its own.
+    pub fn grant_host_proc(&mut self, grant: HostProcGrant) -> i32 {
+        self.grant_host_proc_entry(HostProcEntry::new(grant, None))
     }
 
     /// #1366 / #1953 — grant the embedder's **declared host-answered caps**: for each of `names`
@@ -29451,9 +29631,7 @@ impl Host {
     /// name instead (unir's `bell`). One the module never calls costs only where it makes an inline
     /// host-capability call, which may then park on the embedder (`image_parks`).
     ///
-    /// #2579 — each is forkable: a §14 child or `fork()` twin it is re-granted to files its calls in
-    /// the same `requests`, under completion ids unique in the process, so the embedder answers a
-    /// child's call as it answers the root's.
+    /// #2579 — each is forkable ([`HostProcGrant::declared`]).
     pub fn grant_declared_host_caps(
         &mut self,
         names: &[String],
@@ -29461,24 +29639,7 @@ impl Host {
     ) -> Vec<(String, i32)> {
         let mut declared = Vec::new();
         for name in names {
-            let fork: HostProcFork = {
-                let (name, requests) = (name.clone(), Arc::clone(requests));
-                Arc::new(move |_pid| {
-                    Some(ForkedProc::offloadable(
-                        declared_host_cap(&name, &requests),
-                        CapState::Stateless,
-                    ))
-                })
-            };
-            let h = self.grant_host_proc_offloadable(
-                declared_host_cap(name, requests),
-                Some(fork),
-                // Each call is answered afresh by the embedder; nothing is held between calls.
-                CapState::Stateless,
-            );
-            if let Ok(Binding::HostProc(idx)) = self.resolve(h, cap_id::HOST_PROC) {
-                self.host_procs[idx as usize].on_host = true;
-            }
+            let h = self.grant_host_proc(HostProcGrant::declared(name, requests));
             self.register_cap_name(name, h);
             declared.push((name.clone(), h));
         }
@@ -29486,27 +29647,28 @@ impl Host {
     }
 
     /// #1954 — whether `handle` names a host capability whose handler answers **synchronously**
-    /// ([`Host::grant_host_proc`]'s face, not an offloadable one): it cannot punt, so its call completes
-    /// inside the dispatch. Its only route to a park is a personality's park request, which the
-    /// bytecode engine's leaf predicate (`image_parks`) asks the personality about first.
+    /// ([`ProcHandler::Sync`], [`ProcHandler::Minting`] or [`ProcHandler::Unlocked`], #2645, not an
+    /// offloadable one): it cannot punt, so its call completes inside the call. Its only route to a
+    /// park is a personality's park request, which the bytecode engine's leaf predicate
+    /// (`image_parks`) asks the personality about first.
     pub fn host_proc_is_sync(&self, handle: i32) -> bool {
         matches!(
             self.resolve(handle, cap_id::HOST_PROC),
             Ok(Binding::HostProc(idx))
-                if matches!(
-                    self.host_procs.get(idx as usize).map(|e| &e.handler),
-                    Some(ProcHandler::Sync(_))
-                )
+                if self.host_procs.get(idx as usize).is_some_and(HostProcEntry::answers_in_call)
         )
     }
 
-    /// #1954 — whether `handle` names a declared host-completed cap ([`Host::grant_declared_host_caps`]),
+    /// #1954 — whether `handle` names a declared host-completed cap ([`ProcHandler::HostAnswered`]),
     /// whose calls the embedder finishes: one parks without the caller's frames ([`OpParks::OnHost`]).
     pub fn parks_on_host(&self, handle: i32) -> bool {
         matches!(
             self.resolve(handle, cap_id::HOST_PROC),
             Ok(Binding::HostProc(idx))
-                if self.host_procs.get(idx as usize).is_some_and(|e| e.on_host)
+                if matches!(
+                    self.host_procs.get(idx as usize).map(|e| &e.handler),
+                    Some(ProcHandler::HostAnswered(_))
+                )
         )
     }
 
@@ -29516,29 +29678,25 @@ impl Host {
     /// park one; [`OpParks::OnHost`] when one is a declared host-completed cap
     /// ([`parks_on_host`](Self::parks_on_host)); [`OpParks::Otherwise`] when one is offloadable.
     pub fn host_procs_park(&self) -> OpParks {
-        let offloads = |e: &HostProcEntry| !e.on_host && !matches!(e.handler, ProcHandler::Sync(_));
+        let offloads = |e: &HostProcEntry| matches!(e.handler, ProcHandler::Offloadable(_));
+        let on_host = |e: &HostProcEntry| matches!(e.handler, ProcHandler::HostAnswered(_));
         if self.host_procs.iter().any(offloads) {
             OpParks::Otherwise
-        } else if self.host_procs.iter().any(|e| e.on_host) {
+        } else if self.host_procs.iter().any(on_host) {
             OpParks::OnHost
         } else {
             OpParks::Never
         }
     }
 
-    /// Push one [`HostProcEntry`] and grant a handle to it — the single registration path the three
-    /// public `grant_host_proc*` faces share (CONSOLIDATION §7).
+    /// Push one [`HostProcEntry`] and grant a handle to it — the single registration path a grant
+    /// and a spawn's re-grant share (CONSOLIDATION §7).
     fn grant_host_proc_entry(&mut self, entry: HostProcEntry) -> i32 {
         let idx = self.host_procs.len() as u32;
         self.host_procs.push(entry);
         self.grant(cap_id::HOST_PROC, Binding::HostProc(idx))
     }
 
-    /// FORK.md PR 5 — like [`Host::grant_host_proc`], but **forkable**: the provider also supplies a
-    /// [`HostProcFork`] factory that mints a fresh handler closure over its own (shared or duplicated)
-    /// state, so [`Host::fork_powerbox`] can carry this capability into a `fork()` twin. The runtime
-    /// never inspects the closure's state — forking it is the provider's job, expressed by this
-    /// factory (the Rust face of the C embedder's `fork_ctx(parent_ctx) -> child_ctx`).
     /// #801 — publish a host-served provider's **op vtable** on an already-granted `HostProc`
     /// handle: parallel `names`/`sigs` indexed by op number (the offer-entry shape). With a vtable,
     /// an image's named imports bind to this handler through the same §3.5 coverage walk offers
@@ -29568,39 +29726,6 @@ impl Host {
                 .and_then(|e| e.vtable.clone()),
             _ => None,
         }
-    }
-
-    pub fn grant_host_proc_forkable(
-        &mut self,
-        f: HostProc,
-        fork: HostProcFork,
-        state: CapState,
-    ) -> i32 {
-        self.grant_host_proc_entry(HostProcEntry {
-            handler: ProcHandler::Sync(f),
-            fork: Some(fork),
-            mints: false,
-            vtable: None,
-            state,
-            on_host: false,
-        })
-    }
-
-    /// §4b Register an **mmap-capable** embedder host-capability handler and grant a handle to it
-    /// (also iface [`cap_id::HOST_PROC`], so a guest resolves it exactly like a plain [`grant_host_proc`]).
-    /// Identical to `grant_host_proc` except the handler receives `Some(minter)` on each call
-    /// (a plain registration gets `None`), so it can mint a file-backed `SharedRegion` and return
-    /// the handle — the delivery mechanism for the zero-copy file-mmap bridge. The extra authority
-    /// is exactly region-minting (nothing else of the `Host` is reachable).
-    pub fn grant_host_proc_region(&mut self, f: HostProc, state: CapState) -> i32 {
-        self.grant_host_proc_entry(HostProcEntry {
-            handler: ProcHandler::Sync(f),
-            fork: None,
-            mints: true,
-            vtable: None,
-            state,
-            on_host: false,
-        })
     }
 
     /// Intern an interface's named op list and return its id (IMPORTS.md §3.2, #1109): identical
@@ -31991,7 +32116,7 @@ impl Host {
             return Some(child.adopt_offer(entry));
         }
         // FORK.md §8.5 slice 3 / #863 — a **forkable host proc** (e.g. posix libc): re-mint the
-        // handler in the CHILD via its fork factory ([`Host::grant_host_proc_forkable`]), so the
+        // handler in the CHILD via its fork factory ([`HostProcGrant::fork`]), so the
         // child inherits the capability (the manager handing its libc to a spawned guest) and the
         // child's copy stays forkable itself (nesting / fork-of-child). The provider decides what a
         // new process inherits: temen-posix mints a per-process clone (own fd table/cwd/env/signals,
@@ -32001,10 +32126,10 @@ impl Host {
         // refuses (`None`, fail-closed); such a cap the parent keeps. This is the deep-copy path
         // `resolve_copyable` defers for `HostProc`.
         if let Ok(Binding::HostProc(idx)) = self.resolve(handle, cap_id::HOST_PROC) {
-            let (vt, on_host) = self
+            let vt = self
                 .host_procs
                 .get(idx as usize)
-                .map_or((None, false), |e| (e.vtable.clone(), e.on_host));
+                .and_then(|e| e.vtable.clone());
             return self
                 .host_procs
                 .get(idx as usize)
@@ -32032,10 +32157,8 @@ impl Host {
                     let h = child.grant_host_proc_entry(HostProcEntry {
                         handler: forked.handler,
                         fork: Some(forked.refork.unwrap_or_else(|| Arc::clone(&factory))),
-                        mints: false,
                         vtable: None,
                         state: forked.state,
-                        on_host,
                     });
                     // #801 — the vtable rides the re-grant, and its op names enter the child's
                     // directory: a spawned `__px_`-linked child binds its manifest in-loop, same
@@ -32196,6 +32319,7 @@ impl Host {
             })
             .collect();
         plain.then(|| ChildPowerbox {
+            generations: self.slot_generations(),
             handles,
             module_slots,
             modules: self.modules.clone(),
@@ -32224,7 +32348,7 @@ impl Host {
         // #1909, #2268 — what the checkpoint's window held, which the restored tree still charges.
         child.set_window_held(pb.held);
         child.lane_cap = pb.lane_cap;
-        child.restore_durable_handles(&pb.handles);
+        child.restore_durable_handles(&pb.generations, &pb.handles);
         child.modules = pb.modules.clone();
         for &(slot, generation, type_id, id) in &pb.module_slots {
             child.grant_at(slot, generation, type_id, Binding::Module(id));
@@ -32937,31 +33061,27 @@ impl Host {
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
     ) -> Result<Vec<i64>, Trap> {
-        self.cap_dispatch_slots_impl(type_id, op, handle, args, mem, None)
+        self.cap_dispatch_slots_deferring(type_id, op, handle, args, mem, None, None)
     }
 
-    /// §12 parking-on-blocking — the **parking-aware dispatch face**: identical to
-    /// [`Host::cap_dispatch_slots`] except an offloadable handler's punt returns immediately with
-    /// `*pending = Some(completion_id)` (the job already handed to the offload pool) instead of
-    /// running the job inline. The result slots are then a placeholder the caller must discard —
-    /// on `Some`, drop the host lock, then [`Completions::wait`] (via [`Host::completions`]) for
-    /// the scalar result and deliver it as the call's single result slot. Only eval loops that
-    /// implement that discipline may use this face; everything else stays on the sync face and
-    /// gets byte-identical inline semantics (decline-never-diverge, INVARIANTS.md 9). Under a W1
-    /// tape the punt is forced inline so the recorded crossing carries the real result.
-    pub fn cap_dispatch_slots_pending(
-        &mut self,
-        type_id: u32,
-        op: u32,
-        handle: i32,
-        args: &[i64],
-        mem: Option<&mut dyn GuestMem>,
-        pending: &mut Option<u64>,
-    ) -> Result<Vec<i64>, Trap> {
-        self.cap_dispatch_slots_impl(type_id, op, handle, args, mem, Some(pending))
-    }
-
-    fn cap_dispatch_slots_impl(
+    /// The **deferring dispatch face**: identical to [`Host::cap_dispatch_slots`] except for the
+    /// calls it can leave for its caller to finish once the caller has let go of the host, each on a
+    /// face the caller offers. On either, the result slots are a placeholder the caller discards.
+    ///
+    /// - `pending` (§12 parking-on-blocking): an offloadable handler's punt returns at once with
+    ///   `*pending = Some(completion_id)` (the job already handed to the offload pool) instead of
+    ///   running the job inline. Drop the host lock, then [`Completions::wait`] (via
+    ///   [`Host::completions`]) for the scalar result and deliver it as the call's single result
+    ///   slot.
+    /// - `unlocked` (#2645): a call to an unlocked host procedure ([`ProcHandler::Unlocked`])
+    ///   returns at once with `*unlocked = Some(call)` instead of running. Drop the host lock, then
+    ///   [`UnlockedCall::run`] with the same arguments and window: its results are the call's.
+    ///
+    /// A face the caller does not offer gets byte-identical inline semantics
+    /// (decline-never-diverge, INVARIANTS.md 9). Under a W1 tape a pool punt and an unlocked call
+    /// run inline, so the recorded crossing carries the real result.
+    #[allow(clippy::too_many_arguments)] // the call's own five, and the two faces a caller offers
+    pub fn cap_dispatch_slots_deferring(
         &mut self,
         type_id: u32,
         op: u32,
@@ -32969,6 +33089,7 @@ impl Host {
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
         pending: Option<&mut Option<u64>>,
+        unlocked: Option<&mut Option<UnlockedCall>>,
     ) -> Result<Vec<i64>, Trap> {
         // §12: under a W1 tape, force punts inline (`pending = None` downstream) — a `Pending`
         // placeholder on the tape would replay as a phantom result; the inline run records the
@@ -33041,7 +33162,11 @@ impl Host {
         }
         // W1 record/replay (DEBUGGING.md): only the nondeterministic *input* caps are taped —
         // deterministic / structural caps re-run faithfully on a fresh powerbox and are left live.
-        if is_recorded_input(type_id, op) {
+        // #2645: and only while a tape is active, so an untaped call runs on the faces its caller
+        // offers, and its window writes are not copied for a tape no one keeps.
+        if is_recorded_input(type_id, op)
+            && (self.cap_record.is_some() || self.cap_replay.is_some())
+        {
             // Replay: serve the next recorded crossing if it matches this call (a mismatch means the
             // re-execution diverged before this point — fall through to live as a best effort).
             let served = if let Some((tape, pos)) = &mut self.cap_replay {
@@ -33072,7 +33197,8 @@ impl Host {
                         Some(m) => Some(&mut **m),
                         None => None,
                     };
-                    let _ = self.cap_dispatch_slots_inner(type_id, op, handle, args, rerun, None);
+                    let _ =
+                        self.cap_dispatch_slots_inner(type_id, op, handle, args, rerun, None, None);
                 }
                 // Re-apply any guest-window writes the cap made (a buffer-filling `read`), then
                 // return the recorded result slots — no live host needed.
@@ -33100,6 +33226,7 @@ impl Host {
                         args,
                         Some(&mut rec_mem),
                         pending.as_deref_mut(),
+                        None,
                     );
                     (r, rec_mem.writes)
                 }
@@ -33111,6 +33238,7 @@ impl Host {
                         args,
                         None,
                         pending.as_deref_mut(),
+                        None,
                     ),
                     Vec::new(),
                 ),
@@ -33137,13 +33265,14 @@ impl Host {
             }
             return result;
         }
-        self.cap_dispatch_slots_inner(type_id, op, handle, args, mem, pending)
+        self.cap_dispatch_slots_inner(type_id, op, handle, args, mem, pending, unlocked)
     }
 
     /// The live capability dispatch (§3c) — resolve the handle in the host table and run the op. The
     /// public [`cap_dispatch_slots`](Host::cap_dispatch_slots) wraps this with W1 record/replay.
-    /// `pending` is the §12 parking out-param ([`Host::cap_dispatch_slots_pending`]); `None` = the
-    /// sync face, where an offloadable punt runs inline.
+    /// `pending` and `unlocked` are the faces [`Host::cap_dispatch_slots_deferring`] offers; `None`
+    /// is the sync face, where an offloadable punt and an unlocked call run inline.
+    #[allow(clippy::too_many_arguments)] // as `cap_dispatch_slots_deferring`
     fn cap_dispatch_slots_inner(
         &mut self,
         type_id: u32,
@@ -33152,6 +33281,7 @@ impl Host {
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
         pending: Option<&mut Option<u64>>,
+        unlocked: Option<&mut Option<UnlockedCall>>,
     ) -> Result<Vec<i64>, Trap> {
         // Phase-2 `import.attach` (IMPORTS.md): (re)bind rebindable import slot `op` to the handle
         // in `args[0]`. The new handle must resolve **live under the slot's declared interface
@@ -33663,17 +33793,31 @@ impl Host {
             // §7 embedder host-capability: hand `op`/args/window to the registered closure. Take it
             // out for the call so the closure can't alias `self.host_procs` (it doesn't need `Host`;
             // taking it out first also makes the §4b `&mut dyn RegionMinter` borrow of `self` sound),
-            // then restore it — a panic would only poison this one slot, never the host. An entry
-            // registered mmap-capable (`mints`) is handed `self` as the minter; a plain one gets
-            // `None` — the registration, not the call, decides the extra authority.
+            // then restore it — a panic would only poison this one slot, never the host. A handler
+            // registered mmap-capable ([`ProcHandler::Minting`]) is handed `self` as the minter; a
+            // plain one gets `None` — the registration, not the call, decides the extra authority.
             Binding::HostProc(idx) => {
-                let (mut f, mints) = match self.host_procs.get_mut(idx as usize) {
-                    Some(e) => (
-                        std::mem::replace(
-                            &mut e.handler,
-                            ProcHandler::Sync(Box::new(|_, _, _, _| Err(Trap::CapFault))),
-                        ),
-                        e.mints,
+                // #2645 — an unlocked handler keeps nothing in the host: it is shared, not taken out,
+                // and on a face that offers it the caller runs it once it has let go of the host.
+                if let Some(ProcHandler::Unlocked(f)) =
+                    self.host_procs.get(idx as usize).map(|e| &e.handler)
+                {
+                    let call = UnlockedCall {
+                        handler: Arc::clone(f),
+                        op,
+                    };
+                    return match unlocked {
+                        Some(slot) => {
+                            *slot = Some(call);
+                            Ok(Vec::new()) // the caller runs it
+                        }
+                        None => call.run(args, mem),
+                    };
+                }
+                let mut f = match self.host_procs.get_mut(idx as usize) {
+                    Some(e) => std::mem::replace(
+                        &mut e.handler,
+                        ProcHandler::Sync(Box::new(|_, _, _, _| Err(Trap::CapFault))),
                     ),
                     None => return Err(Trap::CapFault),
                 };
@@ -33684,8 +33828,11 @@ impl Host {
                 let mut punted: Option<OffloadWork> = None;
                 let mut hosted: Option<HostCompletion> = None;
                 let r = match &mut f {
-                    ProcHandler::Sync(f) => f(op, args, mem, if mints { Some(self) } else { None }),
-                    ProcHandler::Offloadable(f) => match f(op, args) {
+                    ProcHandler::Sync(f) => f(op, args, mem, None),
+                    ProcHandler::Minting(f) => f(op, args, mem, Some(self)),
+                    ProcHandler::Unlocked(f) => f(op, args, mem), // run above; never taken out
+                    ProcHandler::Offloadable(f) | ProcHandler::HostAnswered(f) => match f(op, args)
+                    {
                         OffloadOutcome::Done(r) => r,
                         OffloadOutcome::Offload(job) => {
                             punted = Some(job);
@@ -37860,8 +38007,8 @@ mod region_minter_tests {
     fn host_proc_region_handler_mints_a_region_and_returns_a_live_handle() {
         let mut host = Host::new();
         // Op 0: mint a 64-byte region and hand back its handle — the shape an mmap-capable fs uses.
-        let h = host.grant_host_proc_region(
-            Box::new(|op, _args, _mem, minter| {
+        let h = host.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Minting(Box::new(|op, _args, _mem, minter| {
                 if op == 0 {
                     let backing: RegionBacking = Arc::new(VecBacking(Mutex::new(vec![7u8; 64])));
                     let minter = minter.expect("a region-registered handler is handed the minter");
@@ -37869,12 +38016,12 @@ mod region_minter_tests {
                 } else {
                     Ok(vec![-22])
                 }
-            }),
+            })),
             CapState::Stateless,
-        );
+        ));
         assert!(
             h >= 0,
-            "grant_host_proc_region should yield a handle under iface HOST_PROC"
+            "a minting grant yields a handle under iface HOST_PROC"
         );
 
         // Dispatch op 0 → the handler mints via the `RegionMinter` and returns the region handle.
@@ -37904,9 +38051,14 @@ mod region_minter_tests {
     #[test]
     fn region_and_plain_host_proc_are_distinct_handles_under_the_same_iface() {
         let mut host = Host::new();
-        let plain = host.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless);
-        let region =
-            host.grant_host_proc_region(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless);
+        let plain = host.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+            CapState::Stateless,
+        ));
+        let region = host.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Minting(Box::new(|_, _, _, _| Ok(vec![0]))),
+            CapState::Stateless,
+        ));
         assert!(plain >= 0 && region >= 0 && plain != region);
     }
 }
@@ -38543,8 +38695,10 @@ mod full_table_tests {
         .expect("parse");
         let mh = host.grant_module(&cmd);
         let command = host.exec_module(ExecCmd::Granted(mh)).expect("resolves");
-        let personality =
-            host.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless);
+        let personality = host.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+            CapState::Stateless,
+        ));
         // A personality that keeps descriptors across exec, as temen-posix's does.
         host.exec_remap_hooks.push(Arc::new(|_: &[(i32, i32)]| {}));
         fill(&mut host);
@@ -39484,21 +39638,26 @@ mod fork_powerbox_tests {
     #[test]
     fn fork_refuses_a_domain_with_a_factory_less_host_proc() {
         let mut host = Host::new();
-        host.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless);
+        host.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+            CapState::Stateless,
+        ));
         assert!(
             host.fork_powerbox(7, 0).is_none(),
             "a host_proc granted WITHOUT a fork factory fails the fork closed (never a silent drop)"
         );
         // And a mixed table is all-or-nothing: one factory-less entry poisons the fork.
-        host.grant_host_proc_forkable(
-            Box::new(|_, _, _, _| Ok(vec![1])),
-            Arc::new(|_pid| {
+        host.grant_host_proc(
+            HostProcGrant::new(
+                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![1]))),
+                CapState::Stateless,
+            )
+            .forkable(Arc::new(|_pid| {
                 Some(ForkedProc::shared(
-                    Box::new(|_, _, _, _| Ok(vec![1])),
+                    ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![1]))),
                     CapState::Stateless,
                 ))
-            }),
-            CapState::Stateless,
+            })),
         );
         assert!(
             host.fork_powerbox(7, 0).is_none(),
@@ -39525,10 +39684,15 @@ mod fork_powerbox_tests {
             }
         };
         let mut host = Host::new();
-        let h = host.grant_host_proc_forkable(
-            make(),
-            Arc::new(move |_pid| Some(ForkedProc::shared(make(), CapState::Stateless))),
-            CapState::Stateless,
+        let h = host.grant_host_proc(
+            HostProcGrant::new(ProcHandler::Sync(make()), CapState::Stateless).forkable(Arc::new(
+                move |_pid| {
+                    Some(ForkedProc::shared(
+                        ProcHandler::Sync(make()),
+                        CapState::Stateless,
+                    ))
+                },
+            )),
         );
         let twin = host
             .fork_powerbox(7, 0)
@@ -39561,15 +39725,17 @@ mod fork_powerbox_tests {
             restore: Box::new(|_| {}),
         };
         let mut parent = Host::new();
-        parent.grant_host_proc_forkable(
-            Box::new(|_, _, _, _| Ok(vec![0])),
-            Arc::new(move |_pid| {
+        parent.grant_host_proc(
+            HostProcGrant::new(
+                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                captured(1),
+            )
+            .forkable(Arc::new(move |_pid| {
                 Some(ForkedProc::shared(
-                    Box::new(|_, _, _, _| Ok(vec![0])),
+                    ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
                     captured(9),
                 ))
-            }),
-            captured(1),
+            })),
         );
         let twin = parent.fork_powerbox(7, 0).expect("forkable");
         assert_eq!(parent.capture_cap_states(), vec![Some(vec![1])]);
@@ -39596,10 +39762,15 @@ mod fork_powerbox_tests {
             }
         };
         let mut parent = Host::new();
-        let h = parent.grant_host_proc_forkable(
-            make(),
-            Arc::new(move |_pid| Some(ForkedProc::shared(make(), CapState::Stateless))),
-            CapState::Stateless,
+        let h = parent.grant_host_proc(
+            HostProcGrant::new(ProcHandler::Sync(make()), CapState::Stateless).forkable(Arc::new(
+                move |_pid| {
+                    Some(ForkedProc::shared(
+                        ProcHandler::Sync(make()),
+                        CapState::Stateless,
+                    ))
+                },
+            )),
         );
         let mut child = Host::new();
         let ch = parent
@@ -39620,17 +39791,21 @@ mod fork_powerbox_tests {
             "the child's inherited libc is itself forkable — the guest can then fork"
         );
         // A factory-less host proc is an opaque closure that cannot be carried into a child.
-        let opaque =
-            parent.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless);
+        let opaque = parent.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+            CapState::Stateless,
+        ));
         assert!(
             parent.regrant_into_child(opaque, &mut child).is_none(),
             "a factory-less host proc fails the re-grant closed"
         );
         // #2373 — as does a provider with no room for the child's copy.
-        let full = parent.grant_host_proc_forkable(
-            Box::new(|_, _, _, _| Ok(vec![0])),
-            Arc::new(|_pid| None),
-            CapState::Stateless,
+        let full = parent.grant_host_proc(
+            HostProcGrant::new(
+                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                CapState::Stateless,
+            )
+            .forkable(Arc::new(|_pid| None)),
         );
         assert!(
             parent.regrant_into_child(full, &mut child).is_none(),
@@ -39650,17 +39825,27 @@ mod fork_powerbox_tests {
             })
         };
         let mut parent = Host::new();
-        let h = parent.grant_host_proc_offloadable(
-            offload(),
-            Some(Arc::new(move |_pid| {
-                Some(ForkedProc::offloadable(offload(), CapState::Stateless))
-            })),
-            CapState::Stateless,
+        let h = parent.grant_host_proc(
+            HostProcGrant::new(ProcHandler::Offloadable(offload()), CapState::Stateless).forkable(
+                Arc::new(move |_pid| {
+                    Some(ForkedProc::shared(
+                        ProcHandler::Offloadable(offload()),
+                        CapState::Stateless,
+                    ))
+                }),
+            ),
         );
         let call = |host: &mut Host, handle: i32, x: i64| {
             let mut id = None;
-            let r =
-                host.cap_dispatch_slots_pending(cap_id::HOST_PROC, 0, handle, &[x], None, &mut id);
+            let r = host.cap_dispatch_slots_deferring(
+                cap_id::HOST_PROC,
+                0,
+                handle,
+                &[x],
+                None,
+                Some(&mut id),
+                None,
+            );
             assert_eq!(r, Ok(vec![]), "a punted call answers later");
             host.completions().wait(id.expect("the call punts"))
         };
@@ -41597,10 +41782,12 @@ mod signal_door_claim_tests {
     fn host_with(doors: &[bool], calls: &Arc<AtomicUsize>) -> Host {
         let mut h = Host::new();
         for &d in doors {
-            h.grant_host_proc_forkable(
-                Box::new(|_op, _args, _mem, _reg| Ok(vec![0])),
-                factory(d, calls),
-                CapState::Stateless,
+            h.grant_host_proc(
+                HostProcGrant::new(
+                    ProcHandler::Sync(Box::new(|_op, _args, _mem, _reg| Ok(vec![0]))),
+                    CapState::Stateless,
+                )
+                .forkable(factory(d, calls)),
             );
         }
         h
@@ -41662,14 +41849,22 @@ mod signal_door_claim_tests {
     /// goes back. Unlike two claimants, the refusal does not latch: a later fork may find room.
     #[test]
     fn a_provider_with_no_room_refuses_the_fork_and_abandons_the_twins_before_it() {
-        let shared = || ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless);
+        let shared = || {
+            ForkedProc::shared(
+                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                CapState::Stateless,
+            )
+        };
         let (calls, abandoned) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let room = Arc::new(AtomicBool::new(false));
         let mut h = Host::new();
         let gone = Arc::clone(&abandoned);
-        h.grant_host_proc_forkable(
-            Box::new(|_, _, _, _| Ok(vec![0])),
-            Arc::new(move |_pid| {
+        h.grant_host_proc(
+            HostProcGrant::new(
+                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                CapState::Stateless,
+            )
+            .forkable(Arc::new(move |_pid| {
                 let gone = Arc::clone(&gone);
                 Some(ForkedProc {
                     abandon: Some(Box::new(move || {
@@ -41677,19 +41872,24 @@ mod signal_door_claim_tests {
                     })),
                     ..shared()
                 })
-            }),
-            CapState::Stateless,
+            })),
         );
         let fits = Arc::clone(&room);
-        h.grant_host_proc_forkable(
-            Box::new(|_, _, _, _| Ok(vec![0])),
-            Arc::new(move |_pid| fits.load(Ordering::SeqCst).then(shared)),
-            CapState::Stateless,
+        h.grant_host_proc(
+            HostProcGrant::new(
+                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                CapState::Stateless,
+            )
+            .forkable(Arc::new(move |_pid| {
+                fits.load(Ordering::SeqCst).then(shared)
+            })),
         );
-        h.grant_host_proc_forkable(
-            Box::new(|_, _, _, _| Ok(vec![0])),
-            factory(false, &calls),
-            CapState::Stateless,
+        h.grant_host_proc(
+            HostProcGrant::new(
+                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                CapState::Stateless,
+            )
+            .forkable(factory(false, &calls)),
         );
         let mem = h.budgets.used(h.own_budget, BUDGET_MEM);
         assert!(h.fork_powerbox(7, 1 << 16).is_none(), "no room refuses it");
@@ -41721,23 +41921,30 @@ mod signal_door_claim_tests {
         let abandoned = Arc::new(AtomicUsize::new(0));
         let mut h = Host::new();
         let gone = Arc::clone(&abandoned);
-        let first = h.grant_host_proc_forkable(
-            Box::new(|_, _, _, _| Ok(vec![0])),
-            Arc::new(move |_pid| {
+        let first = h.grant_host_proc(
+            HostProcGrant::new(
+                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                CapState::Stateless,
+            )
+            .forkable(Arc::new(move |_pid| {
                 let gone = Arc::clone(&gone);
                 Some(ForkedProc {
                     abandon: Some(Box::new(move || {
                         gone.fetch_add(1, Ordering::SeqCst);
                     })),
-                    ..ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless)
+                    ..ForkedProc::shared(
+                        ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                        CapState::Stateless,
+                    )
                 })
-            }),
-            CapState::Stateless,
+            })),
         );
-        let full = h.grant_host_proc_forkable(
-            Box::new(|_, _, _, _| Ok(vec![0])),
-            Arc::new(|_pid| None),
-            CapState::Stateless,
+        let full = h.grant_host_proc(
+            HostProcGrant::new(
+                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![0]))),
+                CapState::Stateless,
+            )
+            .forkable(Arc::new(|_pid| None)),
         );
         let lease = Lease {
             budget: h.grant_budget(-1, 1 << 20, -1),
@@ -41802,19 +42009,26 @@ mod offload_pool_tests {
         let (long, let_go) = held();
         let long = Mutex::new(Some(long));
         let mut host = Host::new();
-        let h = host.grant_host_proc_offloadable(
-            Box::new(move |_op, _args| {
+        let h = host.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Offloadable(Box::new(move |_op, _args| {
                 let long = long.lock().unwrap().take().expect("one call");
                 OffloadOutcome::Offload(Box::new(move || {
                     long();
                     0
                 }))
-            }),
-            None,
+            })),
             CapState::Stateless,
-        );
+        ));
         let mut id = None;
-        let r = host.cap_dispatch_slots_pending(cap_id::HOST_PROC, 0, h, &[0], None, &mut id);
+        let r = host.cap_dispatch_slots_deferring(
+            cap_id::HOST_PROC,
+            0,
+            h,
+            &[0],
+            None,
+            Some(&mut id),
+            None,
+        );
         assert_eq!(r, Ok(vec![]), "the call punts");
         assert!(id.is_some());
         let started = std::time::Instant::now();

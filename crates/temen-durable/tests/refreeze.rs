@@ -16,7 +16,7 @@ use std::sync::Arc;
 use temen_durable::{
     begin_thaw, init_durable_window, read_state, transform_module, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
+use temen_interp::{run_capture_reserved_with_host, Host, HostProcGrant, ProcHandler, Trap, Value};
 use temen_ir::Memory;
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
@@ -67,8 +67,8 @@ fn run(
     let mut host = Host::new();
     host.set_durable(true);
     let calls = Arc::new(AtomicI64::new(0));
-    let hf = host.grant_host_proc(
-        Box::new(move |_op, _args, mem, _| {
+    let hf = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(move |_op, _args, mem, _| {
             let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
             if Some(n) == freeze_on {
                 let mem = mem.expect("a window");
@@ -80,9 +80,9 @@ fn run(
                     .expect("the freeze word is mapped");
             }
             Ok(vec![made + n])
-        }),
+        })),
         temen_interp::CapState::Stateless,
-    );
+    ));
     let mut fuel = 100_000u64;
     run_capture_reserved_with_host(
         inst,

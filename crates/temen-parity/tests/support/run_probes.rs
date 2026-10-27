@@ -4,6 +4,13 @@
 //!
 //! The programs are the smallest each feature's own tests run on several engines, so a probe's
 //! answer is one those tests already pin on the oracle.
+//!
+//! The embedder a runner plays ([`Embedder`], [`Stopper`], [`Outside`]) is here too, so
+//! `axis_conformance.rs`, which runs the frontier's capability probes on the same runners, includes
+//! this module for it.
+
+// Each including binary uses a subset: the frontier's runs use only the embedder and its registrar.
+#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -11,11 +18,14 @@ use std::time::Duration;
 
 use temen_durable::transform_module_assume_confined;
 use temen_interp::{
-    CapState, Host, HostProc, NamedCapGrant, OffloadOutcome, SignalSource, StreamRole, Value,
+    CapState, Host, HostProc, HostProcGrant, NamedCapGrant, OffloadOutcome, ProcHandler,
+    SignalSource, StreamRole, Value,
 };
 use temen_ir::durable_abi::ShadowArena;
 use temen_ir::{Module, SpawnRec};
 use temen_parity::run_modes::Feature;
+
+use crate::support::capability_probe;
 
 /// One feature's probe.
 #[derive(Clone, Copy)]
@@ -111,10 +121,12 @@ pub fn instrumented(m: &Module) -> Result<Module, String> {
 /// setup grants ([`grant_named`]), and what its registrar grants again when it thaws the run
 /// (#1455). A registrar re-grants a synchronous procedure, so `"plus100"`, which two setups grant
 /// as an offloadable one, comes back synchronous: a durable run waits on a pool call inline anyway
-/// (#2504).
+/// (#2504). The frontier matrix's capability probes run on this embedder too, so it also serves
+/// their `HostProc` row's procedure.
 pub fn named_proc(name: &str, e: &Embedder) -> Option<HostProc> {
     let s = Arc::clone(&e.stopper);
     Some(match name {
+        capability_probe::ZERO => capability_probe::zero(),
         "plus100" => Box::new(|_op, args, _mem, _minter| Ok(vec![plus_100(args)])),
         "stop" => Box::new(move |_op, _args, _mem, _minter| {
             s.set(true);
@@ -130,9 +142,7 @@ pub fn named_proc(name: &str, e: &Embedder) -> Option<HostProc> {
 /// [`named_proc`] as a thaw's registrar re-grants it: stateless, with no fork factory.
 pub fn regrant(name: &str, e: &Embedder) -> Option<NamedCapGrant> {
     named_proc(name, e).map(|handler| NamedCapGrant {
-        handler,
-        fork: None,
-        state: CapState::Stateless,
+        grant: HostProcGrant::new(ProcHandler::Sync(handler), CapState::Stateless),
         process: None,
     })
 }
@@ -140,7 +150,10 @@ pub fn regrant(name: &str, e: &Embedder) -> Option<NamedCapGrant> {
 /// Grant [`named_proc`] `name` under its name.
 fn grant_named(host: &mut Host, e: &Embedder, name: &str) -> i32 {
     let proc = named_proc(name, e).expect("a probe grants only what its embedder serves");
-    let h = host.grant_host_proc(proc, CapState::Stateless);
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(proc),
+        CapState::Stateless,
+    ));
     host.register_cap_name(name, h);
     h
 }
@@ -677,8 +690,8 @@ block 0 (vh: i32) {
 /// millisecond: the call waits on the world while the run goes on.
 fn host_answered() -> (Host, Vec<Value>) {
     let mut host = Host::new();
-    let h = host.grant_host_proc_offloadable(
-        Box::new(|_op, args| {
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Offloadable(Box::new(|_op, args| {
             let a = plus_100(args);
             OffloadOutcome::Host(Box::new(move |c| {
                 std::thread::spawn(move || {
@@ -686,10 +699,9 @@ fn host_answered() -> (Host, Vec<Value>) {
                     c.complete(a);
                 });
             }))
-        }),
-        None,
+        })),
         CapState::Stateless,
-    );
+    ));
     host.register_cap_name("plus100", h);
     (host, vec![Value::I32(h)])
 }
@@ -697,14 +709,13 @@ fn host_answered() -> (Host, Vec<Value>) {
 /// A powerbox whose op 1 a pool thread answers, `argument + 100`.
 fn offloaded() -> (Host, Vec<Value>) {
     let mut host = Host::new();
-    let h = host.grant_host_proc_offloadable(
-        Box::new(|_op, args| {
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Offloadable(Box::new(|_op, args| {
             let a = plus_100(args);
             OffloadOutcome::Offload(Box::new(move || a))
-        }),
-        None,
+        })),
         CapState::Stateless,
-    );
+    ));
     host.register_cap_name("plus100", h);
     (host, vec![Value::I32(h)])
 }

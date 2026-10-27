@@ -10,7 +10,7 @@ use std::process::Command;
 #[path = "../../temen/tests/support/cache_lock.rs"]
 mod cache_lock;
 
-use temen_interp::Value;
+use temen_interp::{HostProcGrant, ProcHandler, Value};
 use temen_ir::ValType;
 use temen_jit::JitOutcome;
 
@@ -13915,7 +13915,7 @@ fn demo_bash_translates_and_verifies() {
             let cap =
                 temen_run::HostCap::custom(temen_interp::cap_id::HOST_PROC, 0, move |h, _win| {
                     let (f, state) = make();
-        let handle = h.grant_host_proc_forkable(f, std::sync::Arc::clone(&fork), state);
+        let handle = h.grant_host_proc(HostProcGrant::new(ProcHandler::Sync(f), state).forkable(std::sync::Arc::clone(&fork)));
                     let (door, armed) = temen_posix::cap_signal_source(&p);
                     h.set_signal_source(door, armed);
                     h.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(&p));
@@ -14158,7 +14158,10 @@ fn demo_bash_translates_and_verifies() {
         let cap2 =
             temen_run::HostCap::custom(temen_interp::cap_id::HOST_PROC, 0, move |h, _win| {
                 let (f, state) = make();
-                let handle = h.grant_host_proc_forkable(f, std::sync::Arc::clone(&fork), state);
+                let handle = h.grant_host_proc(
+                    HostProcGrant::new(ProcHandler::Sync(f), state)
+                        .forkable(std::sync::Arc::clone(&fork)),
+                );
                 let (door, armed) = temen_posix::cap_signal_source(&p);
                 h.set_signal_source(door, armed);
                 h.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(&p));
@@ -14245,7 +14248,10 @@ fn demo_bash_translates_and_verifies() {
         let cap3 =
             temen_run::HostCap::custom(temen_interp::cap_id::HOST_PROC, 0, move |h, _win| {
                 let (f, state) = make();
-                let handle = h.grant_host_proc_forkable(f, std::sync::Arc::clone(&fork), state);
+                let handle = h.grant_host_proc(
+                    HostProcGrant::new(ProcHandler::Sync(f), state)
+                        .forkable(std::sync::Arc::clone(&fork)),
+                );
                 let (door, armed) = temen_posix::cap_signal_source(&p);
                 h.set_signal_source(door, armed);
                 h.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(&p));
@@ -14325,7 +14331,10 @@ fn demo_bash_translates_and_verifies() {
         let cap4 =
             temen_run::HostCap::custom(temen_interp::cap_id::HOST_PROC, 0, move |h, _win| {
                 let (f, state) = make();
-                let handle = h.grant_host_proc_forkable(f, std::sync::Arc::clone(&fork), state);
+                let handle = h.grant_host_proc(
+                    HostProcGrant::new(ProcHandler::Sync(f), state)
+                        .forkable(std::sync::Arc::clone(&fork)),
+                );
                 let (door, armed) = temen_posix::cap_signal_source(&p);
                 h.set_signal_source(door, armed);
                 h.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(&p));

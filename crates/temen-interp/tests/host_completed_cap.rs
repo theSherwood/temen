@@ -34,7 +34,8 @@ use temen_interp::bytecode::{
     ThreadTier, TierUpConfig,
 };
 use temen_interp::{
-    run_with_host, BoundImport, CapRequests, Completer, Host, OffloadOutcome, Trap, Value,
+    run_with_host, BoundImport, CapRequests, Completer, Host, HostProcGrant, OffloadOutcome,
+    ProcHandler, Trap, Value,
 };
 
 /// Two `HOST_PROC` (iface 13) calls on one handle: op 0 with 5, op 1 with 7; the composite
@@ -106,18 +107,17 @@ fn answer_from_a_thread(recorded: &Recorded, n: usize) -> std::thread::JoinHandl
 fn host_completed(recorded: &Recorded) -> (Host, i32) {
     let mut host = Host::new();
     let rec = Arc::clone(recorded);
-    let h = host.grant_host_proc_offloadable(
-        Box::new(move |op, args| {
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Offloadable(Box::new(move |op, args| {
             let a = *args.first().unwrap_or(&0);
             if op == 0 {
                 return OffloadOutcome::Done(Ok(vec![a + 100]));
             }
             let rec = Arc::clone(&rec);
             OffloadOutcome::Host(Box::new(move |c| rec.lock().unwrap().push((c, a))))
-        }),
-        None,
+        })),
         temen_interp::CapState::Stateless,
-    );
+    ));
     (host, h)
 }
 
@@ -125,17 +125,16 @@ fn host_completed(recorded: &Recorded) -> (Host, i32) {
 /// offload pool (`Offload`) — the posture the parity test compares against.
 fn pool_completed() -> (Host, i32) {
     let mut host = Host::new();
-    let h = host.grant_host_proc_offloadable(
-        Box::new(move |op, args| {
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Offloadable(Box::new(move |op, args| {
             let a = *args.first().unwrap_or(&0);
             if op == 0 {
                 return OffloadOutcome::Done(Ok(vec![a + 100]));
             }
             OffloadOutcome::Offload(Box::new(move || a + 100))
-        }),
-        None,
+        })),
         temen_interp::CapState::Stateless,
-    );
+    ));
     (host, h)
 }
 
@@ -601,17 +600,16 @@ fn host_completing_inside_submit_does_not_park() {
         let m = module();
         let mut host = Host::new();
         let comps = host.completions();
-        let h = host.grant_host_proc_offloadable(
-            Box::new(move |op, args| {
+        let h = host.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Offloadable(Box::new(move |op, args| {
                 let a = *args.first().unwrap_or(&0);
                 if op == 0 {
                     return OffloadOutcome::Done(Ok(vec![a + 100]));
                 }
                 OffloadOutcome::Host(Box::new(move |c: Completer| c.complete(a + 100)))
-            }),
-            None,
+            })),
             temen_interp::CapState::Stateless,
-        );
+        ));
         match bounded(move || coop(exec, &m, host, h).run()) {
             CoopEvent::Done(r) => assert_eq!(r, vec![Value::I64(WANT)], "{exec:?}"),
             CoopEvent::CapPark { .. } => {
@@ -631,11 +629,12 @@ fn sync_ops_never_pay_for_the_host_posture() {
         let m = module();
         let mut host = Host::new();
         let comps = host.completions();
-        let h = host.grant_host_proc_offloadable(
-            Box::new(|_op, args| OffloadOutcome::Done(Ok(vec![*args.first().unwrap_or(&0) + 100]))),
-            None,
+        let h = host.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Offloadable(Box::new(|_op, args| {
+                OffloadOutcome::Done(Ok(vec![*args.first().unwrap_or(&0) + 100]))
+            })),
             temen_interp::CapState::Stateless,
-        );
+        ));
         match bounded(move || coop(exec, &m, host, h).run()) {
             CoopEvent::Done(r) => assert_eq!(r, vec![Value::I64(WANT)], "{exec:?}"),
             _ => panic!("{exec:?}: an all-inline handler never parks"),
@@ -757,8 +756,8 @@ fn a_task_waiting_on_a_host_answered_call_sleeps_until_its_answer() {
     let reads_meanwhile = Arc::new(AtomicUsize::new(usize::MAX));
     let meanwhile = Arc::clone(&reads_meanwhile);
     let mut host = Host::new();
-    let h = host.grant_host_proc_offloadable(
-        Box::new(move |op, args| {
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Offloadable(Box::new(move |op, args| {
             let a = *args.first().unwrap_or(&0);
             if op == 0 {
                 return OffloadOutcome::Done(Ok(vec![a + 100]));
@@ -773,10 +772,9 @@ fn a_task_waiting_on_a_host_answered_call_sleeps_until_its_answer() {
                     c.complete(a + 100);
                 });
             }))
-        }),
-        None,
+        })),
         temen_interp::CapState::Stateless,
-    );
+    ));
     host.set_thread_platform(ThreadPlatform {
         now_ns: counting_clock,
         ..ThreadPlatform::OS
@@ -1275,10 +1273,10 @@ block 0 () {{
 fn a_root_calling_a_host_capability_inline_is_offered_when_none_can_park() {
     for exec in PUMPED {
         let mut host = Host::new();
-        let h = host.grant_host_proc(
-            Box::new(|_op, args, _mem, _| Ok(vec![args[0] + 100])),
+        let h = host.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Sync(Box::new(|_op, args, _mem, _| Ok(vec![args[0] + 100]))),
             temen_interp::CapState::Stateless,
-        );
+        ));
         let m = root_host_call(h);
         let offers: Offers = Arc::default();
         let tierup = Some(leaf_config(&offers, true));
@@ -1393,4 +1391,63 @@ fn a_host_completed_call_with_no_reply_declines() {
     for (driver, end) in on_each_parking_driver(&narrow_call("none")) {
         assert_eq!(end, Some(Trap::CapFault), "{driver}");
     }
+}
+
+/// #2625 — **a host capability parks by its shape.** The leaf predicate reads it from the handler:
+/// a host whose host capabilities are all declared host-answered ones parks only on its embedder, one
+/// offloadable capability makes it park some other way, and synchronous ones never park.
+#[test]
+fn the_host_procs_park_by_their_shape() {
+    use temen_interp::{CapState, OpParks};
+    let sync = || {
+        HostProcGrant::new(
+            ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
+            CapState::Stateless,
+        )
+    };
+    let mut host = Host::new();
+    host.grant_host_proc(sync());
+    assert_eq!(
+        host.host_procs_park(),
+        OpParks::Never,
+        "synchronous ones never park"
+    );
+    host.grant_declared_host_caps(&["ui".to_string()], &CapRequests::default());
+    assert_eq!(
+        host.host_procs_park(),
+        OpParks::OnHost,
+        "a declared one parks on the host"
+    );
+    host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Offloadable(Box::new(|_op, _args| OffloadOutcome::Done(Ok(vec![0])))),
+        CapState::Stateless,
+    ));
+    assert_eq!(
+        host.host_procs_park(),
+        OpParks::Otherwise,
+        "an offloadable one parks otherwise"
+    );
+}
+
+/// #2579, #2625 — **a declared cap re-granted to a §14 child keeps its shape.** Its fork factory mints
+/// the child's handler, so the child's calls still park on the embedder. Before #2625 the shape rode
+/// as the parent entry's flag; now it is the handler the factory mints.
+#[test]
+fn a_declared_cap_re_granted_to_a_child_still_parks_on_the_host() {
+    use temen_interp::{Lease, WINDOW_RUNS};
+    let mut host = Host::new();
+    let declared = host.grant_declared_host_caps(&["ui".to_string()], &CapRequests::default());
+    let lease = Lease {
+        budget: host.grant_budget(-1, 1 << 20, -1),
+        bytes: 1 << 16,
+        runs: WINDOW_RUNS,
+    };
+    let (child, _inst, _as) = host
+        .spawn_detached_child(&declared, 1 << 16, lease, -1, false)
+        .expect("a declared cap is forkable, so the child is granted it");
+    let ui = child.resolve_cap_name("ui").expect("granted by name");
+    assert!(
+        child.parks_on_host(ui),
+        "the child's copy parks on the host"
+    );
 }

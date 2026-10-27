@@ -91,10 +91,14 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
 //   does;
 //   `onCap(slot, op, args, mem)` ⇒ with `onramp`, the JS capabilities the page staged for the run
 //   (`temen_onramp_stage_js_cap`, #2579), answered inside each call as the pump's driver answers
-//   them: the calling task's Worker sends the call here and waits inside it, holding the run's
-//   shared host as every capability call does, so the run's other capability calls wait meanwhile.
+//   them: the calling task's Worker sends the call here and waits inside it. The call runs with
+//   its domain's host let go (#2645), so the run's other tasks make their host calls meanwhile.
 //   `mem` is the calling task's window, a detached child's included. `onCap` reaches the engine
-//   only through `mem`, since the Worker that waits holds the run's host;
+//   only through `mem`, since the page may not wait on the engine's locks;
+//   `capModule` (a module URL) ⇒ instead of `onCap`, the same capabilities answered by the module's
+//   `onCap` export, which every Worker of the run imports: each call is answered in the calling
+//   task's own Worker, without a trip to the page (#2645). The module's JS state is each Worker's
+//   own, and it has a Worker's APIs, not the page's;
 //   `stdinLater` ⇒ with `onramp`, the page feeds stdin as the run goes, through `feed(bytes)` and
 //   `end()` on the run this returns: a read of empty stdin waits for more until `end()`. `onIdle()`
 //   is called each time no task can run until the page acts, by answering or feeding.
@@ -109,8 +113,11 @@ export function makeRunner({ module, memory, ex }) {
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 
   // `ctl` gets what the run's caller feeds it with while it goes (`stdinLater`).
-  const runOn = async (guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, io = false, onramp = false, stdin = null, env = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, onOutput = null, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [], caps = [], onCapPark = null, onCap = null, stdinLater = false, onIdle = null } = {}, ctl) => {
-    if ((caps.length || stdinLater || onCap) && !onramp) throw new Error('`caps`, `onCap` and `stdinLater` need the on-ramp powerbox (`onramp`)');
+  const runOn = async (guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, io = false, onramp = false, stdin = null, env = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, onOutput = null, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [], caps = [], onCapPark = null, onCap = null, capModule = null, stdinLater = false, onIdle = null } = {}, ctl) => {
+    if ((caps.length || stdinLater || onCap || capModule) && !onramp) {
+      throw new Error('`caps`, `onCap`, `capModule` and `stdinLater` need the on-ramp powerbox (`onramp`)');
+    }
+    if (onCap && capModule) throw new Error('JS capabilities are answered by `onCap` or by `capModule`, not both');
     // A stop asked for a run before this one is withdrawn before this one starts, and what the page
     // left for an earlier run is dropped.
     ex.temen_x2_stop(0);
@@ -315,7 +322,7 @@ export function makeRunner({ module, memory, ex }) {
             }
           };
           w.onerror = (e) => reject(new Error(e.message || 'worker error'));
-          w.postMessage({ module, memory, win, winSize, tierup, gptr, glen: guest.length, tierupCell, seedLen, stream: !!onOutput, ...cfg });
+          w.postMessage({ module, memory, win, winSize, tierup, gptr, glen: guest.length, tierupCell, seedLen, stream: !!onOutput, capModule, ...cfg });
         };
         // The run starts on a Worker of its own (the page can't Atomics.wait).
         const stackTop = ex.temen_par_alloc(STACK) + STACK;

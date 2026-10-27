@@ -3,6 +3,9 @@
 //! `posix_cap.rs` lane — bash's shim band 0 resolves it via `__vm_cap_resolve` and drives the op
 //! ABI through `__vm_host_call`), and print stdout/stderr — the gap-walk driver for slices 3-4.
 //! Like `try_translate`, a probe, not a test.
+
+use temen_interp::{HostProcGrant, ProcHandler};
+
 fn main() {
     let ll = std::env::args()
         .nth(1)
@@ -80,7 +83,9 @@ fn main() {
     let p = posix.clone();
     let cap = temen_run::HostCap::custom(temen_interp::cap_id::HOST_PROC, 0, move |h, _win| {
         let (f, state) = make();
-        let handle = h.grant_host_proc_forkable(f, std::sync::Arc::clone(&fork), state);
+        let handle = h.grant_host_proc(
+            HostProcGrant::new(ProcHandler::Sync(f), state).forkable(std::sync::Arc::clone(&fork)),
+        );
         let (door, armed) = temen_posix::cap_signal_source(&p);
         h.set_signal_source(door, armed);
         h.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(&p));
