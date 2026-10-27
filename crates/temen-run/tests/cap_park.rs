@@ -39,13 +39,24 @@
 //!
 //! **A timer never holds an answer back** (#2538): a root that polls on a timer while its thread
 //! waits on the host sees the thread's answer on every engine.
+//!
+//! **A declared host-answered cap reaches a child** (#2579): a root re-grants a cap its embedder
+//! declared ([`Host::grant_declared_host_caps`]) to a §14 child by name, and the child's call files a
+//! request carrying the op it dispatched with, which the embedder answers as it answers the root's.
+//!
+//! **An unlocked host procedure holds no other task's host call** (#2645): a thread's call to one
+//! ([`Host::grant_host_proc_unlocked`]) runs with its domain's host let go, so a thread that waits in
+//! it waits for nothing but what it waits on. And its window copies are the ones a locked call makes,
+//! on every engine.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use temen_interp::bytecode::CoopEvent;
 use temen_interp::{
-    CapState, Completer, ForkedProc, Host, MemLayout, OffloadHostProc, OffloadOutcome, Value,
+    CapRequests, CapState, Completer, ForkedProc, Host, MemLayout, OffloadHostProc, OffloadOutcome,
+    Value,
 };
 use temen_ir::{Module, SpawnRec};
 use temen_jit::{JitOutcome, TrapKind};
@@ -55,7 +66,7 @@ mod drivers;
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 
-use drivers::{run_on, Driver};
+use drivers::{run_on, Driver, PUMPED};
 
 /// How many ticks a wait waits for.
 const TICKS: u64 = 5;
@@ -90,6 +101,11 @@ impl Ticks {
         n.1 += 1;
         self.rung.notify_all();
         self.until(n, |n| n.0 >= want, |n| n.0)
+    }
+
+    /// The waits begun so far, at once.
+    fn begun(&self) -> i64 {
+        self.n.lock().unwrap().1 as i64
     }
 
     /// The waits begun once `want` have, or `-1` after [`GIVE_UP`].
@@ -1145,6 +1161,316 @@ block 0 (vsp: i64, varg: i64) {{
     assert!(
         wrong.is_empty(),
         "want 7 on every engine, but\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// A root `(inst, ping, budget, child) -> i64` that re-grants `ping` by name to a detached child
+/// (func 1's child image) and returns what the child returns. The child resolves `ping` by name and
+/// calls its op 3 with 35.
+fn declared_child_src() -> String {
+    let child = SpawnRec {
+        grants_ptr: 17600,
+        grants_n: 1,
+        ..SpawnRec::default()
+    };
+    format!(
+        "memory 17
+data 17700 \"ping\"
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vping: i32, vbud: i32, vmod: i32) {{
+{grant}{prelude}  vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vst, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  return vj
+}}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vp = i64.const 17700
+  vl = i64.const 4
+  vh = self.resolve vp vl
+  va = i64.const 35
+  vr = call.cap 13 3 (i64) -> (i64) vh (va)
+  return vr
+}}
+}}
+{rec}",
+        grant = rec::grant("g", 17600, 17700, 4, "vping"),
+        prelude = spawn_prelude(17408, "vmod", ""),
+        rec = rec::segment(17408, &child),
+    )
+}
+
+/// The embedder's answer to a call on `ping`: `op * 1000 + arg`, so the root's result shows the op
+/// and the argument the request carried. Anything else answers `-1`.
+fn answer_ping(requests: &CapRequests, id: u64) -> bool {
+    let Some(r) = requests.lock().unwrap().remove(&id) else {
+        return false;
+    };
+    let value = match (r.name.as_str(), r.args.as_slice()) {
+        ("ping", &[a]) => i64::from(r.op) * 1000 + a,
+        _ => -1,
+    };
+    r.completer.complete(value);
+    true
+}
+
+/// The root's powerbox for [`declared_child_src`]: `ping` declared over `requests`, an
+/// `Instantiator`, an unbounded `Budget` and func 1's child image.
+fn declared_child_powerbox(m: &Module, requests: &CapRequests) -> (Host, Vec<Value>) {
+    let mut h = Host::new();
+    let i = h.grant_instantiator();
+    let ping = h.grant_declared_host_caps(&["ping".to_string()], requests)[0].1;
+    let b = h.grant_budget(-1, -1, -1);
+    let image = h.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
+    (h, [i, ping, b, image].into_iter().map(Value::I32).collect())
+}
+
+/// #2579 — a child re-granted a declared host-answered cap files its call in the embedder's
+/// requests, op included, and gets the embedder's answer: on every driver and the JIT, answered from
+/// a thread of the embedder's own, and on both executors an embedder pumps, answered as the run
+/// tells of the call (the browser's posture). Before, the cap had no fork factory, so the spawn
+/// could not re-grant it, and a request kept no op.
+#[test]
+fn a_child_granted_a_declared_cap_files_its_call_with_its_op() {
+    let m = module_of(&declared_child_src());
+    let want = 3035;
+    let setup = {
+        let m = m.clone();
+        move || {
+            let requests = CapRequests::default();
+            let powerbox = declared_child_powerbox(&m, &requests);
+            // Answer the one call as soon as it is filed, or give up after `GIVE_UP`.
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + GIVE_UP;
+                while Instant::now() < deadline {
+                    let first = requests.lock().unwrap().keys().next().copied();
+                    if first.is_some_and(|id| answer_ping(&requests, id)) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            powerbox
+        }
+    };
+    let mut wrong = bounded_on_every_engine(&m, setup, want, "");
+    for exec in PUMPED {
+        let m = m.clone();
+        let got = bounded(move || {
+            let requests = CapRequests::default();
+            let (host, args) = declared_child_powerbox(&m, &requests);
+            let window = m.memory.expect("a window").size_log2;
+            let mut run = exec.open(&m, &args, drivers::FUEL, host, window);
+            loop {
+                match run.run() {
+                    CoopEvent::CapPark { id } if answer_ping(&requests, id) => {}
+                    CoopEvent::Done(v) => match v[..] {
+                        [Value::I64(r)] => break Ok(r),
+                        _ => break Err(format!("returned {v:?}")),
+                    },
+                    CoopEvent::Trapped(t) => break Err(format!("trapped {t:?}")),
+                    CoopEvent::CapPark { id } => break Err(format!("no request filed for {id}")),
+                    _ => break Err("an unexpected event".to_string()),
+                }
+            }
+        });
+        if got != Ok(want) {
+            wrong.push(format!("  {exec:?}: {got:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "want {want} on every engine, but\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// A root `(wait, probe) -> i64` whose thread 1 waits in the unlocked `wait` for one tick, while
+/// thread 2 asks `probe` (op 0) until that wait has begun, then ticks (op 1). It returns
+/// `r1 * 1000 + r2`: 1001 when the tick reached the wait, -999 when the tick could only come once the
+/// wait had given up.
+const UNLOCKED_WAIT: &str = "memory 17
+func (i32, i32) -> (i64) {
+block 0 (vwait: i32, vprobe: i32) {
+  vsp = i64.const 0
+  vwa = i64.extend_i32_u vwait
+  vt1 = thread.spawn 1 vsp vwa
+  vpa = i64.extend_i32_u vprobe
+  vt2 = thread.spawn 2 vsp vpa
+  vr1 = thread.join vt1
+  vr2 = thread.join vt2
+  vk = i64.const 1000
+  vm = i64.mul vr1 vk
+  vs = i64.add vm vr2
+  return vs
+}
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vh = i32.wrap_i64 varg
+  vone = i64.const 1
+  vr = call.cap 13 0 (i64) -> (i64) vh (vone)
+  return vr
+}
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vh = i32.wrap_i64 varg
+  br 1(vh)
+}
+block 1 (vh1: i32) {
+  vz = i64.const 0
+  vb = call.cap 13 0 (i64) -> (i64) vh1 (vz)
+  vnone = i64.eq vb vz
+  br_if vnone 1(vh1) 2(vh1)
+}
+block 2 (vh2: i32) {
+  vz2 = i64.const 0
+  vt = call.cap 13 1 (i64) -> (i64) vh2 (vz2)
+  return vt
+}
+}";
+
+/// [`UNLOCKED_WAIT`]'s powerbox: `wait`, unlocked, waits for `args[0]` ticks; `probe`, an ordinary
+/// host procedure, answers the waits begun (op 0) or ticks (op 1).
+fn unlocked_wait_powerbox() -> (Host, Vec<Value>) {
+    let ticks = Arc::new(Ticks::default());
+    let mut h = Host::new();
+    let waits = Arc::clone(&ticks);
+    let wait = h.grant_host_proc_unlocked(
+        Arc::new(move |_op, args, _mem| Ok(vec![waits.wait_for(args[0] as u64)])),
+        None,
+        CapState::Stateless,
+    );
+    let probe = h.grant_host_proc(
+        Box::new(move |op, _args, _mem, _minter| {
+            Ok(vec![if op == 0 { ticks.begun() } else { ticks.tick() }])
+        }),
+        CapState::Stateless,
+    );
+    (h, vec![Value::I32(wait), Value::I32(probe)])
+}
+
+/// What the root returned on `exec`, one of the executors an embedder pumps, given the powerbox and
+/// arguments `setup` makes.
+fn on_pumped(
+    exec: drivers::Pumped,
+    m: &Module,
+    setup: &dyn Fn() -> (Host, Vec<Value>),
+) -> Result<i64, String> {
+    let (host, args) = setup();
+    let window = m.memory.expect("a window").size_log2;
+    let mut run = exec.open(m, &args, drivers::FUEL, host, window);
+    match run.run() {
+        CoopEvent::Done(v) => match v[..] {
+            [Value::I64(r)] => Ok(r),
+            _ => Err(format!("returned {v:?}")),
+        },
+        CoopEvent::Trapped(t) => Err(format!("trapped {t:?}")),
+        _ => Err("an unexpected event".to_string()),
+    }
+}
+
+/// #2645 — a thread waiting in an unlocked host procedure holds back no other thread's host call:
+/// thread 2's calls reach the host while thread 1 waits in its call, and the tick ends the wait. On
+/// each engine whose tasks run on threads of their own — the tree-walker, the parallel driver,
+/// executor 2 and the JIT. (Where one thread runs every task, a call that waits for another task
+/// never returns, whatever holds the host.) A call that held the domain's host, as a synchronous
+/// procedure's does, kept thread 2 out until the wait gave up.
+#[test]
+fn a_thread_waiting_in_an_unlocked_call_holds_no_other_threads_host_call() {
+    let m = module_of(UNLOCKED_WAIT);
+    let want = 1001;
+    let mut wrong = Vec::new();
+    for driver in [Driver::Oracle, Driver::Parallel] {
+        let m = m.clone();
+        let got = bounded(move || on_driver(driver, &m, &unlocked_wait_powerbox));
+        if got != Ok(want) {
+            wrong.push(format!("  {driver:?}: {got:?}"));
+        }
+    }
+    let owned = m.clone();
+    let got = bounded(move || on_pumped(drivers::Pumped::Threads, &owned, &unlocked_wait_powerbox));
+    if got != Ok(want) {
+        wrong.push(format!("  executor 2: {got:?}"));
+    }
+    let owned = m.clone();
+    let got = bounded(move || on_the_jit(&owned, &unlocked_wait_powerbox));
+    if got != Ok(want) {
+        wrong.push(format!("  JIT: {got:?}"));
+    }
+    assert!(
+        wrong.is_empty(),
+        "want {want} on every engine, but\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// A root `(upper) -> i64` whose thread calls the unlocked `upper` on the six bytes "shout!" at 17408
+/// and returns 1000 * the first byte after the call + what the call returned.
+const UNLOCKED_UPPER: &str = "memory 17
+data 17408 \"shout!\"
+func (i32) -> (i64) {
+block 0 (vupper: i32) {
+  vsp = i64.const 0
+  vua = i64.extend_i32_u vupper
+  vt = thread.spawn 1 vsp vua
+  vr = thread.join vt
+  return vr
+}
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vh = i32.wrap_i64 varg
+  vp = i64.const 17408
+  vl = i64.const 6
+  vn = call.cap 13 0 (i64, i64) -> (i64) vh (vp, vl)
+  vb = i64.load8_u vp
+  vk = i64.const 1000
+  vm = i64.mul vb vk
+  vr = i64.add vm vn
+  return vr
+}
+}";
+
+/// #2645 — an unlocked host procedure's window copies are a locked call's, on every engine: one
+/// called from a thread uppercases its buffer in place (the JIT's locked thunk serves a concurrent
+/// guest, so its copies take the lock there), and the thread reads back 'S' (83): 83006.
+#[test]
+fn an_unlocked_call_reads_and_writes_its_window_on_every_engine() {
+    let m = module_of(UNLOCKED_UPPER);
+    let setup = || {
+        let mut h = Host::new();
+        let upper = h.grant_host_proc_unlocked(
+            Arc::new(|_op, args, mem| {
+                let mem = mem.ok_or(temen_interp::Trap::CapFault)?;
+                let (ptr, len) = (args[0] as u64, args[1] as u64);
+                let Some(mut bytes) = mem.read_bytes(ptr, len) else {
+                    return Ok(vec![-14]); // -EFAULT
+                };
+                bytes.make_ascii_uppercase();
+                Ok(vec![mem
+                    .write_bytes(ptr, &bytes)
+                    .map_or(-14, |()| len as i64)])
+            }),
+            None,
+            CapState::Stateless,
+        );
+        (h, vec![Value::I32(upper)])
+    };
+    let want = 83006;
+    let mut wrong = bounded_on_every_engine(&m, setup, want, "");
+    for exec in PUMPED {
+        let owned = m.clone();
+        let got = bounded(move || on_pumped(exec, &owned, &setup));
+        if got != Ok(want) {
+            wrong.push(format!("  {exec:?}: {got:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "want {want} on every engine, but\n{}",
         wrong.join("\n")
     );
 }

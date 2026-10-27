@@ -47,12 +47,22 @@ fn all_served(lines: &[String]) -> bool {
     lines.iter().all(|l| l.starts_with('1'))
 }
 
-/// A module declaring `imports` by name, each a flat one-op func import. No body needs to *call* them
-/// — the declaration is what an embedder binds, and what this query reports.
+/// A module declaring `imports` by name, each a flat one-op func import shaped as its capability's
+/// op is: `read`, `write` and `stderr` as the pinned `Stream` ops, `exit` as the pinned `Exit`, and
+/// any other a one-argument op. No body needs to *call* them — the declaration is what an embedder
+/// binds, and what this query reports.
 fn module_declaring(imports: &[&str]) -> String {
-    let mut s = String::from("memory 12\ntype 0 func (i64) -> (i64)\n");
+    let mut s = String::from(
+        "memory 12\ntype 0 func (i64) -> (i64)\ntype 1 func (i64, i64) -> (i64)\n\
+         type 2 func (i32) -> ()\n",
+    );
     for (i, name) in imports.iter().enumerate() {
-        s.push_str(&format!("import {i} func \"{name}\" 0\n"));
+        let ty = match *name {
+            "read" | "write" | "stderr" => 1,
+            "exit" => 2,
+            _ => 0,
+        };
+        s.push_str(&format!("import {i} func \"{name}\" {ty}\n"));
     }
     s.push_str("func () -> (i64) {\nblock 0 () {\n  v0 = i64.const 7\n  return v0\n  }\n}\n");
     s
@@ -62,9 +72,9 @@ fn module_declaring(imports: &[&str]) -> String {
 fn the_onramp_powerbox_names_are_served_and_an_embedder_name_is_not() {
     let _g = FFI_LOCK.lock().unwrap();
     // `read`/`write`/`exit`/`vm_map`/`vm_page_size` come from `onramp_cap_resolver`'s table and
-    // `vm_fs` from the memfs seam `grant_onramp_caps` special-cases — the two halves of
-    // `onramp_serves_import`. `fb_poll` is c_interpret's own host-completed cap: temen has never
-    // heard of it, which is exactly why it reports `0` rather than failing.
+    // `vm_fs` from the memfs seam `grant_onramp_caps` special-cases — the two halves of the grant
+    // the report asks the binder about. `fb_poll` is c_interpret's own host-completed cap: temen has
+    // never heard of it, which is exactly why it reports `0` rather than failing.
     let (rc, lines) = text(&module_declaring(&[
         "vm_fs",
         "read",
@@ -143,7 +153,8 @@ fn a_linked_module_reports_by_table_where_a_text_scrape_finds_nothing() {
     let src = r#"
 memory 12
 type 0 func (i64) -> (i64)
-import 0 func "write" 0
+type 1 func (i64, i64) -> (i64)
+import 0 func "write" 1
 import 1 func "fb_poll" 0
 func () -> (i64) {
 block 0 () {

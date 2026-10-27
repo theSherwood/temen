@@ -300,8 +300,9 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         | Inst::MemMove { .. }
         | Inst::MemFill { .. } => row(F, F),
 
-        // ---- §12 atomics. Cranelift emits hardware atomics; the wasm-JIT lowers them to the
-        // single-threaded load/rmw/store sequence (gated module-wide to concurrency-free guests). --
+        // ---- §12 atomics. Cranelift emits hardware atomics; so does the wasm-JIT over a shared
+        // memory, and over an unshared one, where no other agent can touch the bytes, the plain
+        // load/rmw/store sequence (#2608). ----------------------------------------------------------
         Inst::AtomicLoad { .. }
         | Inst::AtomicStore { .. }
         | Inst::AtomicRmw { .. }
@@ -309,11 +310,11 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
             F,
             cell(
                 Status::Full,
-                "single-threaded lowering (concurrency-free module)",
+                "hardware atomic over a shared memory, plain sequence over an unshared one",
             ),
         ),
-        // Standalone fence: both JITs handle it — Cranelift emits it; the wasm-JIT (single-threaded)
-        // treats it as an observable no-op.
+        // Standalone fence: both JITs handle it — Cranelift emits it; the wasm-JIT emits
+        // `atomic.fence` over a shared memory and nothing over an unshared one (an observable no-op).
         Inst::AtomicFence { .. } => row(F, F),
 
         // ---- Calls. Direct/indirect calls lower on both JITs. -----------------------------------

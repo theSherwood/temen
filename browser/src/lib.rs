@@ -1080,13 +1080,14 @@ fn par_publish_io(cfg: ParIoCfg) {
 /// the run idles on it ([`COOP_RUN_IDLE`]) until the page feeds it or ends it
 /// ([`temen_x2_feed_end`]). A JS host may leave the trailing three out (they read as zero).
 ///
-/// What the page staged for the next open ([`Staged`]) is granted here too, but a JS capability
-/// (#2579) refuses the run: it is answered inside the call, where its function lives, and this run's
-/// tasks run on Workers that cannot call the page's.
+/// What the page staged for the next open ([`Staged`]) is granted here too. A JS capability (#2579)
+/// is answered inside the call, by its function on the page: the calling task's Worker sends the
+/// call there and waits inside it (`web/worker.js`'s `js_cap_call`), holding the run's shared host
+/// as every capability call does, and the page answers over the task's window (`web/par.js`).
 ///
-/// Returns `1`, or `0` — nothing published — for undecodable bytes or cap names, a module the
-/// on-ramp refuses ([`onramp_check`]), or a staged JS capability. Call on the main thread before the
-/// run, like [`temen_par_powerbox_io`].
+/// Returns `1`, or `0` — nothing published — for undecodable bytes or cap names, or a module the
+/// on-ramp refuses ([`onramp_check`]) or whose required imports its powerbox does not grant (#2579,
+/// its notes published). Call on the main thread before the run, like [`temen_par_powerbox_io`].
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_powerbox_onramp(
@@ -1115,14 +1116,15 @@ pub extern "C" fn temen_par_powerbox_onramp(
         return 0;
     }
     let staged = take_staged();
-    if !staged.js.is_empty() {
-        return 0;
-    }
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
     host.set_stdin_blocking(fed_later != 0);
     let requests = temen_interp::CapRequests::default();
-    let frame = grant_onramp_caps(&mut host, &m, None, Some((&caps, &requests)), &staged).frame;
+    let Ok(granted) = grant_onramp_caps(&mut host, &m, None, Some((&caps, &requests)), &staged)
+    else {
+        return 0;
+    };
+    let frame = granted.frame;
     par_publish_io(ParIoCfg {
         host: std::sync::Mutex::new(host),
         out: None,
@@ -2487,30 +2489,8 @@ pub fn powerbox_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
     PbOutcome::ended(ran, host.take_stdout(), host.take_stderr())
 }
 
-/// Whether the **on-ramp powerbox** would bind a manifest import named `name`, given the handle set
-/// it granted for this module — the predicate behind [`temen_module_imports`].
-///
-/// It asks the one shared definition (#912): [`temen_ir::PowerboxHandles::bind`], the same call
-/// [`grant_onramp_caps`] makes to build its instantiation-time bindings, so the answer cannot drift
-/// from what actually happens at launch. Asking the *name table* instead would be wrong, and
-/// concretely so: `default_cap_resolver("stderr")` resolves (it is `Stream` write, like `write`),
-/// but the on-ramp never grants a `stderr` handle, so `bind` returns `None` and the slot stays
-/// unbound. Reporting such a name as served would hand the program to a runner that faults on its
-/// first write to it.
-///
-/// `vm_fs` is the one name outside that ABI: [`grant_onramp_caps`] grants a private memfs for it
-/// directly (#1323), binding the slot to a `HostProc` rather than through the powerbox prefix.
-///
-/// A name this returns `false` for is not an error — it is a **named host-completed cap** the
-/// embedder itself serves (#1366), which only the debug session can park for. That is the
-/// distinction an embedder needs before it picks a run path, and why it is worth asking up front
-/// instead of discovering it as a `CapFault`.
-pub(crate) fn onramp_serves_import(name: &str, granted: &temen_ir::PowerboxHandles) -> bool {
-    name == "vm_fs" || granted.bind(name).is_some()
-}
-
 /// The handle set [`grant_onramp_caps`] *would* grant for `m`, for answering
-/// [`onramp_serves_import`] before anything is launched. Handle **values** are irrelevant to "is
+/// [`temen_module_imports`] before anything is launched. Handle **values** are irrelevant to "is
 /// this name bound" — only which fields are populated is — so the prefix carries placeholders.
 ///
 /// The two grant decisions mirror `grant_onramp_caps` and must stay with it: the §3e prefix is
@@ -2989,13 +2969,17 @@ impl MomentReactor for OnrampReactor {
 /// positional slot-order delivery died in phase 4). Shared by [`onramp_exec`] and the per-frame
 /// [`OnrampReactor`], so both grant the identical powerbox. What the embedder `staged` for the open
 /// ([`Staged`]) comes on top: its modules, its budget and its JS capabilities.
+///
+/// `Err(STATUS_UNSUPPORTED)` refuses the open (IMPORTS.md §2.1, #2579): a `required` import of `m`
+/// that nothing granted here satisfies, as every other host refuses it. The notes that say which are
+/// published for the page ([`temen_notes_len`]).
 fn grant_onramp_caps(
     host: &mut Host,
     m: &temen_ir::Module,
     fs: Option<(String, Vec<u8>)>,
     declared: Option<(&[String], &temen_interp::CapRequests)>,
     staged: &Staged,
-) -> OnrampCaps {
+) -> Result<OnrampCaps, i32> {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     // Its stdout and stderr stream to the embedder as the guest writes them (#1141, #1414 S5a).
     host.set_stream_tee(stream_tee());
@@ -3043,8 +3027,7 @@ fn grant_onramp_caps(
         .then(|| temen_fs::grant_vm_fs(host, None));
     // IMPORTS.md phase 4: a manifest-carrying module executes its `call.import`s through
     // instantiation-time slot bindings — import `i`'s name maps to `(type_id, op)` via the
-    // on-ramp policy and to the granted handle by interface. A name outside the policy (or the
-    // dynamic-only SharedRegion ops) leaves its slot unbound — fail-closed at dispatch.
+    // on-ramp policy and to the granted handle by interface (bound below, the last grant).
     // The stateful capabilities are minted by `OnrampCaps` (below), which is also the **registrar**
     // a thaw re-grants through — one definition of what each on-ramp capability does, used by both.
     // `fs` is last in `NAMES` — a read-only in-memory file (Doom slice 4: the WAD read path), granted
@@ -3082,9 +3065,9 @@ fn grant_onramp_caps(
     // included); the grant order itself is unchanged, so every handle keeps its value.
     //
     // The one shared powerbox binder (#1524): the `#912` name→cap table plus this host's own
-    // raw-`HostProc` seams. A name this host did not grant (`stderr`, or `Jit` on a guest that
-    // declares no `vm_jit_*` import), a dynamic-only interface, or an import whose declared
-    // signature is not the capability op's leaves its slot unbound — fail-closed at dispatch.
+    // raw-`HostProc` seams. A required import this host did not grant (`stderr`, or `Jit` on a
+    // guest that declares no `vm_jit_*` import), a dynamic-only interface, or an import whose
+    // declared signature is not the capability op's refuses the open (#2579).
     //
     // #1323: the `vm_fs` file-I/O seam is a flat `call.sym` (base op 0) on the memfs HostProc
     // granted above; the guest's fs op rides in arg0. Absent (not imported) ⇒ not overridden,
@@ -3106,8 +3089,12 @@ fn grant_onramp_caps(
     }
     let mut seams: Vec<(&str, i32)> = vm_fs_h.map(|h| vec![("vm_fs", h)]).unwrap_or_default();
     seams.extend(declared.iter().chain(&js).map(|(n, h)| (n.as_str(), *h)));
-    host.bind_powerbox_manifest(&m.imports, &m.types, &granted, &seams);
-    caps
+    let grant = temen_interp::powerbox_grant(&granted, &seams);
+    let bound = host.bind_powerbox_manifest(&m.imports, &m.types, &grant);
+    bound.map(|()| caps).map_err(|_| {
+        set_last_notes(host.take_notes());
+        STATUS_UNSUPPORTED
+    })
 }
 
 /// #816/#1234: whether [`grant_onramp_caps`] grants the `"instantiator"` capability. Default
@@ -3133,9 +3120,10 @@ const ONRAMP_NESTED_CAPS: [&str; 11] = [
 ];
 
 /// Wrap `m` for a nested on-ramp run (#1720): the one-node plan that spawns it as a §14 child of a
-/// generated root, granting every [`ONRAMP_NESTED_CAPS`] entry `host` holds; `env` is seeded as the
-/// child's §3e environment, in its own window. Returns the root module and its args (the root's
-/// Instantiator, `m`'s `Module` and the budget are granted on `host` here).
+/// generated root, granting every [`ONRAMP_NESTED_CAPS`] entry `host` holds and each of the JS
+/// capabilities `js` the embedder staged for the open (#2579), which a child calls with its own
+/// window; `env` is seeded as the child's §3e environment, in its own window. Returns the root module
+/// and its args (the root's Instantiator, `m`'s `Module` and the budget are granted on `host` here).
 /// `None` for a module that cannot be a child yet — it runs at the root: one with no window, one whose
 /// func 0 is not an admitted child entry (`temen-llvm`'s bare `main(sp)` for an import-free C program,
 /// #1779), or one that spawns detached (its `"budget"` allowance cannot cross into a child).
@@ -3143,15 +3131,19 @@ fn nest_onramp(
     m: &temen_ir::Module,
     env: &[Vec<u8>],
     host: &mut Host,
+    js: &[String],
 ) -> Option<(temen_ir::Module, Vec<Value>)> {
     let window = m.memory.as_ref()?.size_log2;
     let entry = m.funcs.first()?;
     if !temen_ir::child_entry_ok(&entry.params, &entry.results) || temen_ir::spawns_detached(m) {
         return None;
     }
-    let held: Vec<(&str, i32)> = ONRAMP_NESTED_CAPS
-        .iter()
-        .filter_map(|n| host.resolve_cap_name(n).map(|h| (*n, h)))
+    let mut crossing: Vec<&str> = Vec::new();
+    crossing.extend(ONRAMP_NESTED_CAPS);
+    crossing.extend(js.iter().map(String::as_str));
+    let held: Vec<(&str, i32)> = crossing
+        .into_iter()
+        .filter_map(|n| host.resolve_cap_name(n).map(|h| (n, h)))
         .collect();
     let names: Vec<&str> = held.iter().map(|(n, _)| *n).collect();
     let handles: Vec<i32> = held.iter().map(|(_, h)| *h).collect();
@@ -3268,14 +3260,18 @@ fn onramp_run(
     // Grant the powerbox prefix + the `display`/`keyboard` graphical caps (shared with the reactor). A
     // single-shot run drains no keys, and `frame` captures the last frame the guest presented (if any).
     // No `fs` file: a single-shot on-ramp guest reads its input from stdin, not a served file.
-    let frame = grant_onramp_caps(&mut host, m, None, None, &take_staged()).frame;
+    let staged = take_staged();
+    let frame = match grant_onramp_caps(&mut host, m, None, None, &staged) {
+        Ok(caps) => caps.frame,
+        Err(status) => return PbOutcome::refused(status),
+    };
     // #1720: the card runs **nested** where it can — a §14 child of a generated root (a one-node
     // [`plan::Plan`]), re-granted by name every on-ramp capability this powerbox holds that can cross
     // into a child. The module runs exactly as built (a powerbox `_start` is an admitted child entry),
     // over its own window, finding its capabilities by name and through its manifest as at the root.
     // The environment rides the plan into the child's window; a root run seeds its own.
     let nest = if nested {
-        nest_onramp(m, env, &mut host)
+        nest_onramp(m, env, &mut host, &staged.js)
     } else {
         None
     };
@@ -3667,16 +3663,17 @@ struct PosixRun<'a> {
 }
 
 /// A command for [`PosixRun::commands`] from a module only borrowed here, prepared as
-/// [`Host::grant_module`] would grant it: from a clone, whose vectors are exact where a decoded
-/// module's keep their growth slack. A caller that grants the same commands run after run keeps them
-/// prepared instead (a nim build's toolchain, #2087).
+/// [`Host::grant_module`] would grant it: from a clone. A caller that grants the same commands run
+/// after run keeps them prepared instead (a nim build's toolchain, #2087).
 fn prepare(m: &temen_ir::Module) -> PreparedModule {
     PreparedModule::new(std::sync::Arc::new(m.clone()))
 }
 
 /// The powerbox of a POSIX process the browser runs — bash ([`bash_exec_with`], the #1122 sessions)
 /// and nimony's driver ([`nimony::nim_build`]): the on-ramp gate, the personality, the import
-/// bindings, the command registry, and the argv/env blob. `None` = not a `_start`-shaped module.
+/// bindings, the command registry, and the argv/env blob. `None` = not a `_start`-shaped module, or
+/// one with a required import neither the personality nor the memory ops serve (its notes published,
+/// [`temen_notes_len`]).
 ///
 /// The personality is the whole forkable POSIX surface (fork, signals, exec-remap, fd and process
 /// ops), `grant` wiring what the native `bash_probe` and the nim lane's runs do. It serves no heap
@@ -3702,24 +3699,22 @@ fn posix_host_build(
     }
     // A program's imports are the personality's ops (`__px_<op>`) and the core's memory ops, which
     // commit its heap into the reserved tail, all through one growable memory cap (`base 0, size
-    // u64::MAX`). Anything else stays unbound and fails closed at dispatch.
+    // u64::MAX`), bound by the one powerbox binder. A required import that is neither refuses the
+    // run (#2579), as `temen_posix::bind` refuses it natively.
     let mem_h = host.grant_memory();
-    let bindings = m
-        .imports
-        .iter()
-        .map(|im| {
-            let memory = temen_ir::default_cap_resolver(&im.name)
-                .filter(|c| c.type_id == cap_id::ADDRESS_SPACE);
-            if let Some(c) = memory {
-                temen_interp::BoundImport::required(c.type_id, c.op, mem_h)
-            } else if let Some(c) = temen_posix::resolve_import(&im.name) {
-                temen_interp::BoundImport::required(c.type_id, c.op, px_h)
-            } else {
-                temen_interp::BoundImport::rebindable(0, 0, None)
-            }
-        })
-        .collect();
-    host.set_import_bindings(bindings);
+    let grant = |name: &str| match temen_ir::default_cap_resolver(name)
+        .filter(|c| c.type_id == cap_id::ADDRESS_SPACE)
+    {
+        Some(c) => Some((c, mem_h)),
+        None => temen_posix::resolve_import(name).map(|c| (c, px_h)),
+    };
+    if host
+        .bind_powerbox_manifest(&m.imports, &m.types, &grant)
+        .is_err()
+    {
+        set_last_notes(host.take_notes());
+        return None;
+    }
     for (cm, paths) in run.commands {
         posix.grant_executable(&mut host, cm, paths);
     }
@@ -3876,15 +3871,22 @@ fn pg_setup(
     host.register_cap_name("exit", exit);
     let memory = host.grant_memory();
     host.register_cap_name("memory", memory);
+    // Mount the shipped data image as an in-memory `fs` cap (decode is fail-closed). The **shared**
+    // mount hands back a `MemFsHandle`, so a persistent session can snapshot the live data dir back out
+    // later ([`temen_pg_snapshot`]); the one-shot `pg_exec` simply drops it.
+    let (files, dirs) = temen_fs::decode_image(image).map_err(|_| STATUS_DECODE_ERR)?;
+    let (fs_hostfn, fs_handle) = temen_fs::mem_fs_seeded_shared(files, dirs);
+    fs_handle.bind(&host.own_node()); // #2306 — the run pays for the data dir it is handed and grows
+    let fsh = host.grant_host_proc(fs_hostfn, fs_handle.cap_state());
+    host.register_cap_name("fs", fsh);
     // IMPORTS.md phase 4: a manifest-carrying module executes its `call.import`s through
     // instantiation-time slot bindings — map each import name via the on-ramp policy onto the four
-    // granted handles (`Stream` disambiguated by op). A name outside this headless powerbox (e.g.
-    // the dynamic-only SharedRegion ops) leaves its slot unbound — fail-closed at dispatch.
+    // granted handles (`Stream` disambiguated by op). A required import outside this headless
+    // powerbox (e.g. the dynamic-only SharedRegion ops) refuses the run (#2579).
     if !m.imports.is_empty() {
         // The shared powerbox ABI (#912). This headless powerbox grants no *sized* address space, so
-        // the whole-window `memory` grant serves both address-space roles; `Jit` is not granted at
-        // all, and an import naming it leaves its slot unbound (fail-closed at dispatch). `stderr` is
-        // granted as every host running the playground libc grants it: iff imported.
+        // the whole-window `memory` grant serves both address-space roles, and it grants no `Jit`.
+        // `stderr` is granted as every host running the playground libc grants it: iff imported.
         let granted = temen_ir::PowerboxHandles {
             stdout: out,
             stdin: inp,
@@ -3894,17 +3896,29 @@ fn pg_setup(
             jit: None,
             stderr: host.grant_stderr_if_imported(&m.imports),
         };
+        // A program linked against the playground libc reaches its files through the `vm_fs` seam
+        // (#1323), as the on-ramp and the debugger serve it: here over the same data dir, one store
+        // behind both names, so it holds nothing the `fs` cap does not.
+        let vm_fs = m.imports.iter().any(|im| im.name == "vm_fs").then(|| {
+            let h = host.grant_host_proc_forkable(
+                temen_fs::vm_fs_handler(&fs_handle),
+                temen_fs::vm_fs_fork(&fs_handle),
+                fs_handle.cap_state(),
+            );
+            host.register_cap_name("vm_fs", h);
+            ("vm_fs", h)
+        });
         // The one shared powerbox binder (#1524).
-        host.bind_powerbox_manifest(&m.imports, &m.types, &granted, &[]);
+        let seams: Vec<(&str, i32)> = vm_fs.into_iter().collect();
+        let grant = temen_interp::powerbox_grant(&granted, &seams);
+        if host
+            .bind_powerbox_manifest(&m.imports, &m.types, &grant)
+            .is_err()
+        {
+            set_last_notes(host.take_notes());
+            return Err(STATUS_UNSUPPORTED);
+        }
     }
-    // Mount the shipped data image as an in-memory `fs` cap (decode is fail-closed). The **shared**
-    // mount hands back a `MemFsHandle`, so a persistent session can snapshot the live data dir back out
-    // later ([`temen_pg_snapshot`]); the one-shot `pg_exec` simply drops it.
-    let (files, dirs) = temen_fs::decode_image(image).map_err(|_| STATUS_DECODE_ERR)?;
-    let (fs_hostfn, fs_handle) = temen_fs::mem_fs_seeded_shared(files, dirs);
-    fs_handle.bind(&host.own_node()); // #2306 — the run pays for the data dir it is handed and grows
-    let fsh = host.grant_host_proc(fs_hostfn, fs_handle.cap_state());
-    host.register_cap_name("fs", fsh);
     // Seed the caller's `argv` at the powerbox args base (Postgres: a slashed `argv[0]` so
     // `find_my_exec` resolves; chibicc: `["chibicc", "/in.c"]`). #964/#1094: a module reads its args
     // one guard higher (the unconditional guarded layout) — place the blob where its `_start` looks.
@@ -4709,7 +4723,7 @@ impl OnrampReactor {
         let tick = module.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
         let entry_sp = temen_ir::powerbox_entry_sp(&module);
         let mut host = Host::new();
-        let caps = grant_onramp_caps(&mut host, &module, fs, None, &take_staged());
+        let caps = grant_onramp_caps(&mut host, &module, fs, None, &take_staged())?;
         let (inst, back) = reactor_instance(&module, 0).ok_or(STATUS_UNSUPPORTED)?;
         let mut r = OnrampReactor {
             module,
@@ -4781,7 +4795,7 @@ impl OnrampReactor {
         // which is what keeps a guest-held handle value valid across the save; a capability the guest
         // had dropped before the freeze is absent from the artifact and stays dropped.
         let mut host = Host::new();
-        let caps = grant_onramp_caps(&mut host, &module, fs, None, &take_staged());
+        let caps = grant_onramp_caps(&mut host, &module, fs, None, &take_staged())?;
         host.set_named_cap_registrar(caps.registrar());
 
         // Bound to `m`, the module the guest was frozen over, and not to the outlined copy the
@@ -5413,7 +5427,10 @@ pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
         w[t..t + 8].copy_from_slice(&hb);
     }
     let mut host = Host::new();
-    let _ = grant_onramp_caps(&mut host, &m, None, None, &take_staged());
+    if let Err(status) = grant_onramp_caps(&mut host, &m, None, None, &take_staged()) {
+        set(status);
+        return -1;
+    }
     let mut fuel = DEFAULT_FUEL;
     // The reservation is clamped to the backing (#816): a `map` past `win` fails with `-EINVAL`
     // instead of minting pages whose writes the backing silently drops.
@@ -5506,7 +5523,10 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
     // The eval's output streams as it writes it (#1142), as every on-ramp powerbox's does.
-    let _ = grant_onramp_caps(&mut host, &s.module, None, None, &take_staged());
+    if let Err(status) = grant_onramp_caps(&mut host, &s.module, None, None, &take_staged()) {
+        set(status);
+        return -1;
+    }
     let mut fuel = DEFAULT_FUEL;
     // Re-establish the warmup image's page-state entries (no zeroing — the memcpy above restored
     // the bytes), so a `vm_map`-grown warm heap is addressable again — and its `protect`ed rodata
@@ -5643,11 +5663,17 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
     let args = [Value::I64(s.entry_sp as i64)];
     // Taken once: a declined leaf's powerbox is granted again for the region run below.
     let staged = take_staged();
+    // `None` once the powerbox refused `m` (#2579), its status set.
     let host_for = |m: &temen_ir::Module| {
         let mut host = Host::new();
         host.stdin = stdin.clone();
-        let frame = grant_onramp_caps(&mut host, m, None, None, &staged).frame;
-        (host, frame)
+        match grant_onramp_caps(&mut host, m, None, None, &staged) {
+            Ok(granted) => Some((host, granted.frame)),
+            Err(status) => {
+                set(status);
+                None
+            }
+        }
     };
     // #1414 S4-3c: offer `eval_run` whole first, as `temen_coop_open` offers a cold root. When the
     // emitter takes it, the eval runs emitted from its entry and needs no region emit.
@@ -5663,7 +5689,9 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
             )),
             modules: None,
         };
-        let (host, frame) = host_for(&wc.m);
+        let Some((host, frame)) = host_for(&wc.m) else {
+            return -STATUS_UNSUPPORTED;
+        };
         match wc.prog.coop_run_over_grown(
             s.eval_fn,
             &args,
@@ -5715,7 +5743,9 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         }
     }
     let r = wc.regions.as_ref().expect("emitted above");
-    let (mut host, frame) = host_for(&wc.m);
+    let Some((mut host, frame)) = host_for(&wc.m) else {
+        return -STATUS_UNSUPPORTED;
+    };
     // The B2 table/unit-emitter arming, exactly as `temen_coop_open` (the emit was made with the
     // same `table_log2`/window, so the engine table and the emitted mask agree).
     if r.all_shimmable {
@@ -6832,8 +6862,8 @@ pub extern "C" fn temen_onramp_stage_budget(fuel: i64, mem: i64, spawn: i64) {
 /// dispatches on (the coop driver's `onCap`). It is answered inside the call, with the calling
 /// guest's window through [`jspb::temen_jspb_read`] / [`jspb::temen_jspb_write`], and re-granted to
 /// a child or fork twin like any forkable host capability. `-1` for an empty or non-UTF-8 name, or
-/// one already staged. Executor 2 refuses a run with one ([`temen_par_powerbox_onramp`]): its tasks
-/// run on Workers that cannot call the page's function.
+/// one already staged. On executor 2 ([`temen_par_powerbox_onramp`]) the calling task's Worker sends
+/// the call to the page and waits inside it.
 #[no_mangle]
 pub extern "C" fn temen_onramp_stage_js_cap(name_ptr: *const u8, name_len: usize) -> i32 {
     let Ok(name) = core::str::from_utf8(link_slice(name_ptr, name_len)) else {
@@ -6946,11 +6976,18 @@ pub extern "C" fn temen_link_child_libs(
 /// 0\tfb_poll
 /// ```
 ///
-/// `1` = the on-ramp powerbox binds this name ([`onramp_serves_import`], which asks the shared
-/// powerbox ABI the launch itself uses); `0` = the **embedder** must
-/// serve it. So "what do I grant" is the whole list, and "the release runner can run this as-is" is
-/// *every line begins with `1`*. An import-free module stashes nothing and still returns `1` — the
-/// empty list is a true answer, not a failure.
+/// `1` = the on-ramp powerbox binds this import: the one binder's rule
+/// ([`temen_interp::powerbox_manifest_bindings`], #1524), asked of each import over the grants the
+/// launch would make, so the answer cannot drift from what happens at launch. Asking the *name
+/// table* instead would be wrong, and concretely so: `default_cap_resolver("stderr")` resolves (it
+/// is `Stream` write, like `write`), but the on-ramp grants a `stderr` handle only to a module that
+/// imports it, and an import shaped unlike its capability's op binds nowhere. `vm_fs` is the one
+/// name outside the powerbox ABI: [`grant_onramp_caps`] grants a private memfs for it (#1323).
+///
+/// `0` = the **embedder** must serve it — a named host-answered cap (#1366), which it declares at
+/// the open, or the launch is refused (#2579). So "what do I grant" is the whole list, and "the
+/// release runner can run this as-is" is *every line begins with `1`*. An import-free module stashes
+/// nothing and still returns `1` — the empty list is a true answer, not a failure.
 ///
 /// Returns `0` and **clears** the stash if the bytes don't load ([`STATUS_DECODE_ERR`]), or if any
 /// import name contains a tab or newline ([`STATUS_UNSUPPORTED`]) — a refusal never leaves the previous
@@ -6984,13 +7021,13 @@ pub extern "C" fn temen_module_imports(ptr: *const u8, len: usize) -> i32 {
         return refuse(STATUS_UNSUPPORTED);
     }
     let granted = onramp_granted_shape(&m);
+    let grant = temen_interp::powerbox_grant(&granted, &[("vm_fs", 0)]);
     let mut out = Vec::new();
     for im in &m.imports {
-        out.push(if onramp_serves_import(&im.name, &granted) {
-            b'1'
-        } else {
-            b'0'
-        });
+        let served =
+            temen_interp::powerbox_manifest_bindings(core::slice::from_ref(im), &m.types, &grant)
+                .is_ok_and(|b| b.first().is_some_and(|b| b.bound));
+        out.push(if served { b'1' } else { b'0' });
         out.push(b'\t');
         out.extend_from_slice(im.name.as_bytes());
         out.push(b'\n');
@@ -9990,7 +10027,7 @@ fn onramp_tierup_unit_emitter(blob: &[u8]) -> Option<Vec<u8>> {
 // ---- #1953/#1954: declared host-completed caps, and what a run's host reads back -------------------
 
 /// #1953/#1954: the request a [`COOP_RUN_CAP_PARK`] reports — `[id, cap
-/// index, args…]` (see [`cap_park_words`]). Empty when no run is parked.
+/// index, op, args…]` (see [`cap_park_words`]). Empty when no run is parked.
 static mut CAP_REQUEST: Vec<i64> = Vec::new();
 /// #2557: the timer the last [`COOP_RUN_IDLE`] reported, in ns, or `-1` for none.
 static mut IDLE_TIMER: i64 = -1;
@@ -10019,8 +10056,10 @@ fn host_cap_names(ptr: *const u8, len: usize) -> Option<Vec<String>> {
 }
 
 /// #1953/#1954: the words a cap park reports for completion `id` — `[id, cap index (into `caps`),
-/// the guest's args…]` — from the request its proc filed; `None` if none was filed (impossible: only
-/// the declared procs punt to the host, and they file before the park surfaces).
+/// the op the call dispatched with, the guest's args…]` — from the request its proc filed; `None` if
+/// none was filed (impossible: only the declared procs punt to the host, and they file before the
+/// park surfaces). A flat `call.sym` import dispatches at op 0 with the guest's own op in its first
+/// arg; a call through a handle the guest resolved by name carries its op (#2579).
 fn cap_park_words(
     caps: &[String],
     requests: &temen_interp::CapRequests,
@@ -10029,7 +10068,7 @@ fn cap_park_words(
     let requests = requests.lock().unwrap_or_else(|e| e.into_inner());
     let req = requests.get(&id)?;
     let index = caps.iter().position(|n| *n == req.name).unwrap_or(0) as i64;
-    let mut words = vec![id as i64, index];
+    let mut words = vec![id as i64, index, i64::from(req.op)];
     words.extend(&req.args);
     Some(words)
 }
@@ -10077,8 +10116,9 @@ struct CoopTierupRun {
     /// [`temen_coop_tierup_win_ptr`] are for, and why the JS driver re-reads them after every
     /// cross-tier bounce (publishing the fresh base into the emitted `"win"` global).
     ///
-    /// `None` for a nimony build ([`nimony::temen_nim_open`]): its root window is the engine's own,
-    /// and each process it tiers up runs over a window of that process's.
+    /// `None` for a nimony build ([`nimony::temen_nim_open`]): the run holds its root's window (a
+    /// growable buffer when the root runs whole as a leaf, #2608), each process it tiers up runs over
+    /// a window of that process's, and the driver reads each event's ([`temen_coop_tierup_win_ptr`]).
     back: Option<std::sync::Arc<temen_interp::Region>>,
     /// #1896 — a nimony build's session: its personality. `None` for every other run.
     nim: Option<nimony::NimSession>,
@@ -10796,11 +10836,17 @@ pub extern "C" fn temen_coop_open(
     // the page staged is taken once: a declined leaf's powerbox is granted again for the run after.
     let init = onramp_env_init(&run_env());
     let staged = take_staged();
+    // `None` once the powerbox refused `m` (#2579), its status set.
     let host_for = |m: &temen_ir::Module| {
         let mut host = Host::new();
         host.stdin = stdin.clone();
-        let frame = grant_onramp_caps(&mut host, m, None, Some((&caps, &requests)), &staged).frame;
-        (host, frame)
+        match grant_onramp_caps(&mut host, m, None, Some((&caps, &requests)), &staged) {
+            Ok(granted) => Some((host, granted.frame)),
+            Err(status) => {
+                set(status);
+                None
+            }
+        }
     };
     // `CoopRun` owns its `Domain`; the window is built over `back` with the **oracle's** reservation
     // (#1312). It used to be clamped to `win_log2`, which made a `vm_map` past the declared window
@@ -10844,7 +10890,9 @@ pub extern "C" fn temen_coop_open(
             )),
             modules: None,
         };
-        let (host, frame) = host_for(&m);
+        let Some((host, frame)) = host_for(&m) else {
+            return -STATUS_UNSUPPORTED;
+        };
         match open_run(&m, host, Some(tierup)) {
             Some(Ok(run))
                 if leaves
@@ -10870,7 +10918,9 @@ pub extern "C" fn temen_coop_open(
     }
     // #1954: no regions — the interpreted run, the same `CoopRun` the emitted tier drives.
     if !regions {
-        let (host, frame) = host_for(&m0);
+        let Some((host, frame)) = host_for(&m0) else {
+            return -STATUS_UNSUPPORTED;
+        };
         return match open_run(&m0, host, None) {
             Some(Ok(run)) => install(CoopTierupRun {
                 back: Some(back.clone()),
@@ -10896,7 +10946,9 @@ pub extern "C" fn temen_coop_open(
             return -status;
         }
     };
-    let (mut host, frame) = host_for(&e.m);
+    let Some((mut host, frame)) = host_for(&e.m) else {
+        return -STATUS_UNSUPPORTED;
+    };
     // #926 slice 2f: a B2 main module masks `call.dyn` against `1 << table_log2` (#1009 M1: the
     // guest's effective size), so the engine's dispatch table must be the same size — a natural-size
     // table would number install slots and wrap wild indices differently (#846/#880). `CoopRun` builds
@@ -11111,7 +11163,7 @@ fn coop_pump(budget: Option<u64>) -> i32 {
 }
 
 /// #1954: the length, in `i64` words, of the request the last [`COOP_RUN_CAP_PARK`] reported (`0`
-/// when none): `[completion id, cap index (into the names given at open), the guest's args…]`.
+/// when none): `[completion id, cap index (into the names given at open), op, the guest's args…]`.
 #[no_mangle]
 pub extern "C" fn temen_coop_cap_len() -> usize {
     // SAFETY: single-threaded wasm.
@@ -12130,7 +12182,8 @@ int main(void) {
             None,
             Some((&caps, &requests)),
             &Staged::default(),
-        );
+        )
+        .expect("the powerbox binds the program");
         let tierup = leaf.map(|leaf| bytecode::TierUpConfig {
             root: bytecode::ProgramEmit::default(),
             leaf: Some(leaf),

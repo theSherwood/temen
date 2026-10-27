@@ -11,7 +11,7 @@
 // takes its time (#2439). Resolving a park to `null` stops the run; so does `onSlice` resolving
 // `false` on a program that never ends, after its output has streamed. JS capabilities the embedder
 // staged are answered inside the call through `onCap`, with the guest's window, interpreted and from
-// a leaf's bounce (#2579); executor 2 refuses a run that has one.
+// a leaf's bounce (#2579).
 // A trap with `trapDeclines: false` returns its status, name and fault address; by default it throws.
 // Under JSPI a leaf is sliced at its own safepoints (step 4): a leaf that never ends stops at a budget
 // checkpoint when `onSlice` says so, and a long one hands its output over from inside, as it runs.
@@ -22,7 +22,11 @@
 // while the run's other tasks go on, including the thread whose answer a spinning root waits for
 // (#2531's shape), and the root's timer fires while an answer is owed (#2557). It feeds stdin later:
 // as the run idles on its reads, before its Worker opens it, and more at once than the engine's inbox
-// holds. A park answered `null` stops the run, and a fault reports its address, as on the pump.
+// holds. A park answered `null` stops the run, and a fault reports its address, as on the pump. And
+// JS capabilities are answered inside each call (#2579): the root's (interpreted and as a leaf), a
+// thread's, and a detached child's, whose window is a memory of its own. On the page, the calling
+// task's Worker waiting inside the call, or in that Worker itself, from the run's `capModule`
+// (#2645). Either way a call that waits holds back no other thread's host calls.
 //
 // Usage:  node browser-coop-embedder-test.mjs [module.wasm]   (build the threads cdylib first)
 
@@ -31,7 +35,10 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { driveCoopTierupRun, suspendsLeaves } from './web/coop-driver.js';
 import { engineImports } from './engine-imports.mjs';
-import { runCases, runX2Cases, pong, PINGS, bigFeed, LONE_WAIT_MS, JS_CAPS_OUT } from './coop-embedder-cases.mjs';
+import {
+  runCases, runX2Cases, pong, PINGS, bigFeed, LONE_WAIT_MS, JS_CAPS_OUT, JS_CAPS_THREAD_VALUE,
+  JS_CAPS_CHILD_VALUE,
+} from './coop-embedder-cases.mjs';
 import { startServer } from './serve.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -88,7 +95,6 @@ const check = (host, r, suspends) => {
   };
   jsCapped('JS capabilities, interpreted', r.jsCaps, 0);
   jsCapped('JS capabilities from a leaf', r.jsCapsLeaf, 1);
-  if (r.x2RefusesJsCaps === false) fail(`${host}: executor 2 took a run with a staged JS capability`);
   if (r.stopAtPark.status !== null || r.stopAtPark.parks !== 3) {
     fail(`${host}: a park answered null stops the run: status ${r.stopAtPark.status}, ${r.stopAtPark.parks} parks`);
   }
@@ -179,6 +185,33 @@ const checkX2 = (r) => {
   leaf('pings', r.leafPings);
   echoed('a root leaf\'s stdin fed as it idles', r.leafEcho, 'hello world\n');
   leaf('stdin fed later', r.leafEcho);
+  // #2579: JS capabilities answered inside each call, on the page (the calling task's Worker
+  // waiting inside it) or, with `capModule`, in the calling task's own Worker (#2645, where the page
+  // answers none): the uppercasing landed in the window of the task that called, the root's, a
+  // thread's, or a detached child's own memory.
+  for (const [at, where, page] of [['', 'on the page', true], ['InWorker', 'in the Worker', false]]) {
+    const jsCapped = (name, x, want, calls) => {
+      const pageCalls = page ? calls : 0;
+      if (x.error !== undefined || x.value !== want || x.capCalls !== pageCalls || x.parks !== 0) {
+        fail(`chromium x2: ${name}, answered ${where}: value ${x.value}, error ${x.error}, `
+          + `${x.capCalls} page calls, ${x.parks} parks (want ${want}, ${pageCalls}, 0)`);
+      }
+    };
+    jsCapped('the root\'s JS capabilities', r[`jsCaps${at}`], 12n, 2);
+    if (r[`jsCaps${at}`].out !== JS_CAPS_OUT) {
+      fail(`chromium x2: the root's JS capabilities, answered ${where}: stdout ${JSON.stringify(r[`jsCaps${at}`].out)}`);
+    }
+    jsCapped('a root leaf\'s JS capabilities', r[`jsCapsLeaf${at}`], 12n, 2);
+    leaf(`JS capabilities answered ${where}`, r[`jsCapsLeaf${at}`]);
+    jsCapped('a thread\'s JS capabilities', r[`jsCapsThread${at}`], JS_CAPS_THREAD_VALUE, 2);
+    jsCapped('a detached child\'s JS capability', r[`jsCapsChild${at}`], JS_CAPS_CHILD_VALUE, 1);
+    if (r[`jsCapsChild${at}`].childMems !== 1) {
+      fail(`chromium x2: the child's call, answered ${where}, came from ${r[`jsCapsChild${at}`].childMems} `
+        + 'threads over a memory of their own (want 1)');
+    }
+    // #2645: the waiting call held no other thread's host call: the other thread's writes went on.
+    jsCapped('a thread waiting in a JS call while another writes', r[`jsCapsWaits${at}`], 1n, 1);
+  }
 };
 
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
@@ -226,4 +259,5 @@ console.log('ok — an embedder\'s Release run: declared caps answered through o
   + 'onOutput, slices through onSlice, stops at a park and at a slice, and a trap reported or declined'
   + `${chromium ? '; in Chromium the parking root ran as one leaf, suspended and resumed, and a leaf '
     + 'was sliced at its own budget checkpoints; and on executor 2 the page answered each call while '
-    + 'the run went on, and fed stdin as it idled' : ''}`);
+    + 'the run went on, fed stdin as it idled, and answered JS capabilities inside the calls of the '
+    + 'root, a thread and a detached child' : ''}`);

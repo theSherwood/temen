@@ -1994,7 +1994,10 @@ id. Under a recording host (W1) the bytecode drivers tape the delivered value wh
 (`Completions::take_record`); the tree-walker and the JIT tape none, so they offer no parking face
 there and the call declines. The completer is the one way to answer: `deliver_cap` is gone, and the
 browser's `temen_coop_deliver_cap` and the DAP's `provideCap` answer through the request's
-completer.
+completer. A declared cap's request (`CapRequest`, #2579) carries the op the call dispatched with: a
+flat `call.sym` import binds at op 0, with the guest's own op in its first argument, and a call
+through a handle the guest resolved by name keeps its own. The cap is forkable: a §14 child or fork
+twin it is re-granted to files its calls in the same requests, and they stay `OpParks::OnHost`.
 
 **An answer from inside a host procedure (#2522, 2026-10-21).** A host procedure may answer another
 call: a read that takes an event answers whoever waits on that input. The wake runs on the thread
@@ -2007,6 +2010,25 @@ engines' wakes take no lock that is taken before a host's (the bytecode drivers 
 re-offers its tasks), so they run at once. An answer given inside its own call's submit hook no
 longer posts without ringing: that special case is gone. Pinned on every engine in
 `temen-run/tests/cap_park.rs`.
+
+**A host procedure that runs unlocked (#2645, 2026-10-27).** A synchronous host procedure runs under
+the domain's host, so where a domain's tasks share it under a lock (the tree-walker, the parallel
+driver and executor 2, the JIT's `cap_thunk_locked`) a handler that waits holds back every other
+task's host call until it returns. An unlocked procedure (`ProcHandler::Unlocked`,
+`Host::grant_host_proc_unlocked`) keeps no state in the host and gets no region minter: the dispatch
+still resolves the handle and the op under the lock, then hands the call back
+(`UnlockedCall`, through `cap_dispatch_slots_deferring`'s `unlocked` face, beside the parking face),
+and the engine runs it once it has let go of the host. The call keeps the caller's window. An
+interpreter's window is one its vCPUs already share without the host (its page map has a lock of its
+own), so the call uses it as it is; the JIT's pages are hardware-protected and every protection
+change holds the host lock, so each window copy takes that lock (`LockedWindow`) and a handler that
+waits holds it only to copy. A driver that holds its host alone (the pump, the debug
+scheduler, the JIT's `cap_thunk`) runs the call in place, and so does every engine under a W1 tape,
+which records the call where it runs. The record wrapper now runs only while a tape is active, so an
+untaped host-procedure call no longer copies its window writes for a tape no one keeps. The browser
+grants its JS capabilities unlocked. Pinned in `temen-run/tests/cap_park.rs` (a call that waits
+holds no other thread's host call; window copies match a locked call's, on every engine) and the
+coop-embedder Chromium suite (a thread's JS call that waits sees another thread's writes go on).
 
 **A debug run takes an answer as it comes (#2538, 2026-10-21).** The debug scheduler took a parked
 call's answer only when nothing could run and no timer was left, so a thread that kept a timer going

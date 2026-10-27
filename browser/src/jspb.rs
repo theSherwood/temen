@@ -1,51 +1,44 @@
-//! **A powerbox defined in JavaScript** (`temen_jspb_*`, #1419) — the embedder names the capabilities and
-//! implements them *in JS*; the guest reaches them the ordinary §7 way.
+//! **JS capabilities** (#1419, #2579) — capabilities the embedder names and implements *in JS*,
+//! which the guest reaches the ordinary §7 way. The page stages each by name for the next on-ramp
+//! open ([`crate::temen_onramp_stage_js_cap`]), [`grant_js_caps`] grants them into that open's
+//! powerbox beside its others, and the module's §3.5 **import manifest** binds them by name with the
+//! rest (IMPORTS.md §2.1), so a guest's `call.sym "<name>"` dispatches to the JS function the page
+//! staged under that name. `web/powerbox.js`'s `definePowerbox` is exactly that: stage, then run.
 //!
-//! Every other run entry in this cdylib grants a powerbox whose semantics are **Rust-side**
-//! (`powerbox_exec`'s fixed §3e prefix, `grant_onramp_caps`' `display`/`keyboard`/`fs`/`webgpu`).
-//! `webgpu` already proved the shape a JS-implemented capability takes — a `HostProc` closure that
-//! marshals each op out through a wasm import — but it is one hard-coded capability with a fixed op
-//! vocabulary. This module generalizes exactly that into the general case: a page registers
-//! **arbitrary names** ([`temen_jspb_bind`]), each becomes its own handle, and the module's §3.5
-//! **import manifest** binds slot `i` ↔ import `i` by name at instantiation (IMPORTS.md §2.1), so a
-//! guest's `call.sym "<name>"` dispatches to the JS function the page bound to that name.
+//! `webgpu` first proved the shape a JS-implemented capability takes — a `HostProc` closure that
+//! marshals each op out through a wasm import — but as one hard-coded capability with a fixed op
+//! vocabulary. This module is the general case: arbitrary names, each its own handle.
 //!
 //! Nothing here widens guest authority. A JS capability is an ordinary `HostProc` (iface
 //! `HOST_PROC`): the guest names a masked, type-checked handle and passes scalars; guest memory is
 //! reachable only through the bounds-checked [`temen_jspb_read`] / [`temen_jspb_write`] accessors
 //! (the window pointer itself never crosses to JS), exactly the confinement the built-in
-//! `Stream`/`Memory` caps get. An imported name the page did **not** bind fails the run closed,
-//! before a single guest op executes.
+//! `Stream`/`Memory` caps get. An imported name the page did **not** stage refuses the open before a
+//! single guest op executes, as every import nothing grants does.
 //!
-//! ABI (all pointer/length values follow this build's `temen_abi_is64` convention):
-//! ```text
-//! temen_jspb_reset()                        -- drop every binding
-//! temen_jspb_bind(name_ptr, name_len) -> i32 -- register a name; returns its slot (JS dispatch key)
-//! temen_jspb_run(mod_ptr, mod_len)    -> i64 -- run the module under those capabilities
-//! temen_jspb_error_ptr() / _len()            -- why the last run failed (UTF-8), empty on success
-//! ```
-//! and, from inside a capability call, the two window accessors. The page supplies one import:
-//! `temen_host.js_cap_call(slot, op, args_ptr, n_args, mem) -> i64` — the whole JS side of the seam.
-//!
-//! #2579 — the same capabilities join any on-ramp open's powerbox when the embedder stages them
-//! (`temen_onramp_stage_js_cap`): [`grant_js_caps`] is the one grant both paths use.
+//! ABI: the page supplies one import, `temen_host.js_cap_call(slot, op, args_ptr, n_args, mem) ->
+//! i64` — the whole JS side of the seam — and, from inside a call, uses the two window accessors.
+//! On executor 2 a Worker's import sends the call to the page and waits inside it (`web/worker.js`),
+//! and the page answers it with the same accessors over the calling task's window (`web/par.js`);
+//! a run that names a `capModule` answers it in the Worker itself, from that module (#2645).
 
-use temen_interp::{bytecode, cap_id, BoundImport, GuestMem, Host, Trap, Value, DEFAULT_FUEL};
+use std::cell::Cell;
+use std::sync::Arc;
 
-use crate::{
-    stash, STATUS_BAD_RESULT, STATUS_DECODE_ERR, STATUS_EXIT, STATUS_OK, STATUS_TRAP,
-    STATUS_UNSUPPORTED, STATUS_VERIFY_ERR,
-};
+use temen_interp::{CapState, ForkedProc, GuestMem, Host, HostProcFork, UnlockedHostProc};
+
+use crate::stash;
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "temen_host")]
 extern "C" {
     /// The JS servicer for one capability call, supplied by the page as a wasm import. `slot` is the
-    /// index [`temen_jspb_bind`] returned (which capability), `op` the guest's op selector, and
-    /// `[args_ptr, n_args)` its `i64` arguments in this module's linear memory. `mem` is an opaque
-    /// handle to the calling guest's window for [`temen_jspb_read`] / [`temen_jspb_write`] — null
-    /// when the module declares no memory, and dangling after the call returns. Result: the
-    /// capability's single `i64` (negative = an errno the guest can branch on, by convention).
+    /// index [`crate::temen_onramp_stage_js_cap`] returned (which capability), `op` the guest's op
+    /// selector, and `[args_ptr, n_args)` its `i64` arguments in this module's linear memory. `mem`
+    /// is an opaque handle to the calling guest's window for [`temen_jspb_read`] /
+    /// [`temen_jspb_write`] — null when the module declares no memory, and dangling after the call
+    /// returns. Result: the capability's single `i64` (negative = an errno the guest can branch on,
+    /// by convention).
     fn js_cap_call(
         slot: u32,
         op: u32,
@@ -55,194 +48,44 @@ extern "C" {
     ) -> i64;
 }
 
-/// The names bound by [`temen_jspb_bind`], in slot order: slot `i` is the `i`-th registered name,
-/// and the key JS dispatches on. Single-threaded, like every other stash in this cdylib.
-static mut CAPS: Vec<String> = Vec::new();
-
-/// Why the last [`temen_jspb_run`] refused to run (UTF-8), or empty. Cdylib-managed, like `PARSE`.
-static mut ERR: (*mut u8, usize) = (core::ptr::null_mut(), 0);
-
-/// The most recent [`temen_jspb_read`] result — valid until the next read, like the other stashes.
-static mut SCRATCH: (*mut u8, usize) = (core::ptr::null_mut(), 0);
-
-fn set_err(msg: &str) {
-    // SAFETY: single-threaded main-thread state, read back only through the accessors below.
-    unsafe { stash(&mut *core::ptr::addr_of_mut!(ERR), msg.as_bytes().to_vec()) };
-}
-
-/// Drop every binding (and the last error). Call before a fresh series of [`temen_jspb_bind`]s so a
-/// run sees exactly the capabilities the page just declared.
-#[no_mangle]
-pub extern "C" fn temen_jspb_reset() {
-    // SAFETY: single-threaded main-thread state.
-    unsafe { (*core::ptr::addr_of_mut!(CAPS)).clear() };
-    set_err("");
-}
-
-/// Register the capability name at `[name_ptr, name_len)` (UTF-8) and return its **slot** — the
-/// index the page dispatches on in `js_cap_call`, and the handle order the manifest binds against.
-/// `-1` if the name is not UTF-8, is empty, or is already bound.
-#[no_mangle]
-pub extern "C" fn temen_jspb_bind(name_ptr: *const u8, name_len: usize) -> i32 {
-    if name_ptr.is_null() || name_len == 0 {
-        return -1;
-    }
-    // SAFETY: the host guarantees `[name_ptr, name_len)` is a live allocation it just filled.
-    let bytes = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
-    let Ok(name) = core::str::from_utf8(bytes) else {
-        return -1;
-    };
-    // SAFETY: single-threaded main-thread state.
-    let caps = unsafe { &mut *core::ptr::addr_of_mut!(CAPS) };
-    if caps.iter().any(|n| n == name) {
-        return -1; // a name is one capability; rebinding would silently shadow the first
-    }
-    caps.push(name.to_string());
-    (caps.len() - 1) as i32
-}
-
-/// Decode + verify the module at `[mod_ptr, mod_len)`, bind its imports to the registered JS
-/// capabilities **by name**, and run its entry (`_start` if exported, else function 0) on the
-/// bytecode engine. Returns the entry's first `i64` result (`0` on any non-`OK` status — read
-/// [`crate::temen_status`], and [`temen_jspb_error_ptr`] for the message).
-///
-/// Fail-closed: an import the page did not bind is named back as an error and **nothing runs**.
-#[no_mangle]
-pub extern "C" fn temen_jspb_run(mod_ptr: *const u8, mod_len: usize) -> i64 {
-    let set = |s: i32| unsafe { crate::LAST_STATUS = s };
-    set_err("");
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
-    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let m = match temen_encode::decode_module(bytes) {
-        Ok(m) => m,
-        Err(e) => {
-            set(STATUS_DECODE_ERR);
-            set_err(&format!("decode error: {e:?}"));
-            return 0;
-        }
-    };
-    if let Err(e) = temen_verify::verify_module(&m) {
-        set(STATUS_VERIFY_ERR);
-        set_err(&format!("verify error: {e:?}"));
-        return 0;
-    }
-    // SAFETY: single-threaded main-thread state.
-    let caps: &[String] = unsafe { &*core::ptr::addr_of!(CAPS) };
-    // Every import must name a bound capability — report *all* the misses at once, then refuse.
-    let missing: Vec<&str> = m
-        .imports
-        .iter()
-        .map(|im| im.name.as_str())
-        .filter(|n| !caps.iter().any(|c| c == n))
-        .collect();
-    if !missing.is_empty() {
-        set(STATUS_UNSUPPORTED);
-        set_err(&format!(
-            "unbound import{}: {} — the page defined [{}]",
-            if missing.len() == 1 { "" } else { "s" },
-            missing.join(", "),
-            caps.join(", ")
-        ));
-        return 0;
-    }
-
-    let mut host = Host::new();
-    let handles = grant_js_caps(&mut host, caps);
-    // IMPORTS.md §2.1 — the manifest binds import `i` to its named capability's handle. The module
-    // bytes are never rewritten; `call.sym` dispatches through the binding.
-    if !m.imports.is_empty() {
-        let bindings = m
-            .imports
-            .iter()
-            .map(|im| {
-                let slot = caps
-                    .iter()
-                    .position(|c| c == &im.name)
-                    .expect("checked above");
-                BoundImport::required(cap_id::HOST_PROC, 0, handles[slot].1)
-            })
-            .collect();
-        host.set_import_bindings(bindings);
-    }
-
-    // A JS-powerbox guest's entry is paramless: capabilities arrive through the manifest, never as
-    // positional handle arguments.
-    let entry = m.resolve_export("_start").unwrap_or(0);
-    let mut fuel = DEFAULT_FUEL;
-    match bytecode::compile_and_run_with_host(&m, entry, &[], &mut fuel, &mut host) {
-        None => {
-            set(STATUS_UNSUPPORTED);
-            set_err("the bytecode engine does not support this module");
-            0
-        }
-        Some(Err(Trap::Exit(code))) => {
-            set(STATUS_EXIT);
-            unsafe { crate::EXIT_CODE = code };
-            0
-        }
-        Some(Err(t)) => {
-            set(STATUS_TRAP);
-            set_err(&format!("trap: {t:?}"));
-            0
-        }
-        Some(Ok(vals)) => match vals.first() {
-            Some(Value::I64(x)) => {
-                set(STATUS_OK);
-                *x
-            }
-            Some(Value::I32(x)) => {
-                set(STATUS_OK);
-                *x as i64
-            }
-            _ => {
-                set(STATUS_BAD_RESULT);
-                set_err("the entry returned no i32/i64 result");
-                0
-            }
-        },
-    }
+thread_local! {
+    /// The most recent [`temen_jspb_read`] result on this thread — valid until its next read, like
+    /// the other stashes. Per thread (#2645): on executor 2 each Worker serves its own task's calls.
+    static SCRATCH: Cell<(*mut u8, usize)> = const { Cell::new((core::ptr::null_mut(), 0)) };
 }
 
 /// Grant `host` one capability per name in `names`, each served by the page's `js_cap_call` with its
 /// slot, the name's index: the guest reaches the right JS function purely by which handle it
 /// dispatches through (object-capability, not by name). Each is registered under its name. Returns
-/// the `(name, handle)` seams for [`Host::bind_powerbox_manifest`]. The one grant both a JS
-/// powerbox run and an on-ramp open with staged JS capabilities use (#2579).
+/// the `(name, handle)` seams for [`Host::bind_powerbox_manifest`]. Every on-ramp open grants the JS
+/// capabilities the embedder staged for it through this (#2579).
 ///
-/// Forkable (#1718): the JS function's state lives on the page, so a §14 child or `fork()` twin the
-/// capability is re-granted to calls the same function through a fresh closure over the slot, with
-/// its own window. Nothing here serializes that state, so a run holding one cannot freeze (#1699).
+/// Forkable (#1718): the JS function's state lives in JS, so a §14 child or `fork()` twin the
+/// capability is re-granted to calls the same function, with its own window. Nothing here
+/// serializes that state, so a run holding one cannot freeze (#1699).
+///
+/// Unlocked (#2645): the handler keeps nothing in the host, so where a domain's tasks share it under
+/// a lock a call that waits on JS (on the page, or in a Worker) holds back no other task's host call.
 pub(crate) fn grant_js_caps(host: &mut Host, names: &[String]) -> Vec<(String, i32)> {
     names
         .iter()
         .enumerate()
         .map(|(slot, name)| {
-            let mint = move || -> temen_interp::HostProc {
-                Box::new(move |op, args, mem, _| Ok(vec![dispatch(slot as u32, op, args, mem)]))
-            };
-            let fork: temen_interp::HostProcFork = std::sync::Arc::new(move |_pid| {
-                Some(temen_interp::ForkedProc::shared(
-                    mint(),
-                    temen_interp::CapState::Uncaptured,
+            let call: UnlockedHostProc =
+                Arc::new(move |op, args, mem| Ok(vec![dispatch(slot as u32, op, args, mem)]));
+            let twin = Arc::clone(&call);
+            let fork: HostProcFork = Arc::new(move |_pid| {
+                Some(ForkedProc::unlocked(
+                    Arc::clone(&twin),
+                    CapState::Uncaptured,
                 ))
             });
-            let handle =
-                host.grant_host_proc_forkable(mint(), fork, temen_interp::CapState::Uncaptured);
+            let handle = host.grant_host_proc_unlocked(call, Some(fork), CapState::Uncaptured);
             // §7 F7/F9: the name is also the label, so a guest can `self.resolve` / `self.label` it.
             host.register_cap_name(name, handle);
             (name.clone(), handle)
         })
         .collect()
-}
-
-/// Pointer / length of the last [`temen_jspb_run`] error message (UTF-8; empty on success).
-#[no_mangle]
-pub extern "C" fn temen_jspb_error_ptr() -> *const u8 {
-    unsafe { (*core::ptr::addr_of!(ERR)).0 }
-}
-#[no_mangle]
-pub extern "C" fn temen_jspb_error_len() -> usize {
-    unsafe { (*core::ptr::addr_of!(ERR)).1 }
 }
 
 // ---- the calling guest's window, as seen from JS ----------------------------------------------
@@ -269,10 +112,12 @@ pub unsafe extern "C" fn temen_jspb_read(mem: *mut JsGuestMem, ptr: u64, len: us
     };
     let m = &*shim.mem;
     match m.read_bytes(ptr, len as u64) {
-        Some(bytes) => {
-            stash(&mut *core::ptr::addr_of_mut!(SCRATCH), bytes);
-            (*core::ptr::addr_of!(SCRATCH)).0
-        }
+        Some(bytes) => SCRATCH.with(|s| {
+            let mut slot = s.get();
+            stash(&mut slot, bytes);
+            s.set(slot);
+            slot.0.cast_const()
+        }),
         None => core::ptr::null(),
     }
 }

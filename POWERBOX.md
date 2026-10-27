@@ -579,22 +579,27 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
   bounds-checked guest-memory accessors). The **browser** embedder had no equivalent: every powerbox a
   page could hand a guest was assembled Rust-side (`powerbox_exec`'s fixed §3e prefix,
   `grant_onramp_caps`' `display`/`keyboard`/`fs`), with `webgpu` the one JS-implemented capability —
-  hard-coded name, hard-coded ops. `browser/src/jspb.rs` generalizes that shape: a page registers
-  arbitrary **names** (`temen_jspb_bind`), each becomes its own `HostProc` handle, the module's import
+  hard-coded name, hard-coded ops. `browser/src/jspb.rs` generalizes that shape: a page stages
+  arbitrary **names** (`temen_onramp_stage_js_cap`), each becomes its own `HostProc` handle, the module's import
   manifest binds name → handle at instantiation (§2.1 — no rewriting), and every call is serviced
   through one wasm import (`temen_host.js_cap_call`) with the calling guest's window reachable only
   through the bounds-checked `temen_jspb_read`/`temen_jspb_write` — the JS twin of F5. `web/powerbox.js`
-  is the page-side sugar (`definePowerbox(eng, { 'js.log': (args, mem) => … }).run(module)`), and the
+  is the page-side sugar (`definePowerbox(eng, { 'js.log': (args, mem) => … }).run(module)`, a run on
+  the on-ramp), and the
   playground's **"JS powerbox"** card is the demo: two editors, the guest and the JavaScript that
   implements its capabilities. Authority-neutral (iface-13 `HostProc`, masked handles, fail-closed on
   an unbound import), and serviced where its function lives: on the thread whose engine reaches the
   page's servicer. Gates: `browser/tests/jspb.rs`, `browser/browser-jspb-test.mjs`, and the card's own
-  assertions in `browser-play-editor-test.mjs`. #2579: the same capabilities join any on-ramp open's
-  powerbox when the embedder stages them (`temen_onramp_stage_js_cap`, with child images and a budget
-  beside them), so they are no longer run-once: a cooperative session answers them inside each call
-  (`onCap`), a §14 child it re-grants one to calls it with its own window, and a Worker that runs an
-  engine of its own serves them. Executor 2 refuses them. Open: the seam is browser-only, a JS
-  capability returns exactly one `i64`, and `definePowerbox` still runs on `temen_jspb_run` (#2579).
+  assertions in `browser-play-editor-test.mjs`. #2579: the capabilities join any on-ramp open's
+  powerbox when the embedder stages them (with child images and a budget beside them), so they are
+  not run-once: a cooperative session answers them inside each call (`onCap`), a §14 child it
+  re-grants one to calls it with its own window, a Worker that runs an engine of its own serves them,
+  and on executor 2 the calling task's Worker sends each call to the page and waits inside it. #2645:
+  executor 2 can instead serve them in each Worker from a module the run names (`capModule`), with no
+  trip to the page, and the capabilities are granted unlocked, so a call that waits holds back no
+  other task's host call. An
+  import nothing grants refuses the run on every open (one binder, IMPORTS.md §2.1). Open: the seam
+  is browser-only, and a JS capability returns exactly one `i64`.
 
 ---
 

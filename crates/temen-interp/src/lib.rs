@@ -1065,12 +1065,14 @@ pub enum VarValue {
 }
 
 /// #1366 / #1953 — a call parked on a **declared host-answered cap**
-/// ([`Host::grant_declared_host_caps`]): the cap's name, the guest's flat call arguments (the
-/// guest's own op rides in `args[0]` by convention, like `vm_fs`), and the [`Completer`] that
-/// answers it.
+/// ([`Host::grant_declared_host_caps`]): the cap's name, the op and arguments the call dispatched
+/// with, and the [`Completer`] that answers it. A flat `call.sym "<name>"` import binds at op 0 with
+/// the guest's own op in `args[0]` by convention, like `vm_fs`; a call through a handle the guest
+/// resolved by name (`call.cap 13 <op>`) carries its op here (#2579).
 #[derive(Debug)]
 pub struct CapRequest {
     pub name: String,
+    pub op: u32,
     pub args: Vec<i64>,
     pub completer: Completer,
 }
@@ -1080,6 +1082,27 @@ pub struct CapRequest {
 /// rebuilt run's procs file into the same map. Dropping a request answers its call
 /// `CAP_REVOKED`.
 pub type CapRequests = Arc<Mutex<BTreeMap<u64, CapRequest>>>;
+
+/// The handler of declared host-answered cap `name` ([`Host::grant_declared_host_caps`]): every call
+/// punts to the embedder, filed in `requests` under its completion id.
+fn declared_host_cap(name: &str, requests: &CapRequests) -> OffloadHostProc {
+    let (name, requests) = (name.to_string(), Arc::clone(requests));
+    Box::new(move |op, args| {
+        let (name, requests, args) = (name.clone(), Arc::clone(&requests), args.to_vec());
+        OffloadOutcome::Host(Box::new(move |completer: Completer| {
+            let id = completer.id();
+            requests.lock_unpoisoned().insert(
+                id,
+                CapRequest {
+                    name,
+                    op,
+                    args,
+                    completer,
+                },
+            );
+        }))
+    })
+}
 
 /// One recorded crossing of the capability boundary (DEBUGGING.md W1 `CapTape`): the inputs the
 /// guest passed and the result slots the host returned, for a **nondeterministic input** capability
@@ -13863,6 +13886,20 @@ fn wake_zeroed_pipes(sched: &SchedRef, (zeroed_w, zeroed_r): ZeroedPipes) {
     }
 }
 
+/// #2645 — a tree-walker dispatch's results: its own, or, when it handed back an unlocked host
+/// procedure's call ([`UnlockedCall`]), what that call answers, run now that the vCPU holds no host.
+fn unlocked_results(
+    results: Vec<i64>,
+    unlocked: Option<UnlockedCall>,
+    args: &[i64],
+    mem: &mut Option<Mem>,
+) -> Result<Vec<i64>, Trap> {
+    match unlocked {
+        Some(call) => call.run(args, mem.as_mut().map(|m| m as &mut dyn GuestMem)),
+        None => Ok(results),
+    }
+}
+
 fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // This domain's shadow arena is a property of its window, fixed for the run — read once so the
     // placement calls below never re-borrow `v` while a frame or the registry is borrowed mutably.
@@ -16338,11 +16375,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // host locking). Threads of a domain serialize their capability calls here.
                     let mut hg = HostCall::lock(host, sched);
                     let mut pending_id = None;
+                    let mut unlocked = None;
                     // #2495 — under a recording host this engine offers no parking face: it tapes
                     // no delivered value, so a host-answered call declines before its embedder
                     // sees it. A pool job runs inline under a tape on either face.
                     let face = (!hg.records_caps()).then_some(&mut pending_id);
-                    let results = hg.cap_dispatch_slots_impl(*type_id, *op, h, &argv, gm, face)?;
+                    let results = hg.cap_dispatch_slots_deferring(
+                        *type_id,
+                        *op,
+                        h,
+                        &argv,
+                        gm,
+                        face,
+                        Some(&mut unlocked),
+                    )?;
                     // §12 parking-on-blocking: a punted offloadable dispatch — release the host
                     // lock **before** waiting (the §5b serialization fix), then take the scalar
                     // completion. The placeholder `results` is discarded.
@@ -16468,6 +16514,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let t = ParkTransients::drain(&mut hg);
                     let domain = hg.domain_id() as usize;
                     drop(hg);
+                    let results = unlocked_results(results, unlocked, &argv, mem)?;
                     if closed {
                         sched.cap_revoke(domain, h, CAP_REVOKED);
                     }
@@ -16678,8 +16725,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let mut hg = HostCall::lock(host, sched);
                     // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
                     let packed = *import | (*op << 16);
-                    let results =
-                        hg.cap_dispatch_slots(temen_ir::CAP_IMPORT_TYPE_ID, packed, 0, &argv, gm)?;
+                    let mut unlocked = None;
+                    let results = hg.cap_dispatch_slots_deferring(
+                        temen_ir::CAP_IMPORT_TYPE_ID,
+                        packed,
+                        0,
+                        &argv,
+                        gm,
+                        None,
+                        Some(&mut unlocked),
+                    )?;
                     // An import-routed blocking-stdin read doesn't park on this engine (the
                     // `set_stdin_blocking` park is `call.cap`'s); the flag is consumed so it can't
                     // leak into a later direct call's park decision.
@@ -16689,6 +16744,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // placeholder with nothing to say why, and dropping a pipe park is a false EOF.
                     let t = ParkTransients::drain(&mut hg);
                     drop(hg);
+                    let results = unlocked_results(results, unlocked, &argv, mem)?;
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
                     let mut refused = None;
@@ -16842,8 +16898,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let mut hg = HostCall::lock(host, sched);
-                    let results =
-                        hg.cap_dispatch_slots(temen_ir::CAP_IMPORT_TYPE_ID, *import, 0, &argv, gm)?;
+                    let mut unlocked = None;
+                    let results = hg.cap_dispatch_slots_deferring(
+                        temen_ir::CAP_IMPORT_TYPE_ID,
+                        *import,
+                        0,
+                        &argv,
+                        gm,
+                        None,
+                        Some(&mut unlocked),
+                    )?;
                     // FORK.md §8.6 — pipe blocking rides this dispatch (a command's `write`/`read`
                     // are `call.sym` imports bound to pipe ends): a `read` on an empty FIFO with
                     // writers open parks, a `write` to a full pipe parks the writer, and a write /
@@ -16856,6 +16920,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let _ = hg.take_stdin_parked(); // no stdin parking here (see call.import)
                     let t = ParkTransients::drain(&mut hg);
                     drop(hg);
+                    let results = unlocked_results(results, unlocked, &argv, mem)?;
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
                     let mut refused = None;
@@ -16932,8 +16997,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let mut hg = HostCall::lock(host, sched);
                     let packed = *ty | (*op << 16);
-                    let results =
-                        hg.cap_dispatch_slots(temen_ir::CAP_DYN_TYPE_ID, packed, h, &argv, gm)?;
+                    let mut unlocked = None;
+                    let results = hg.cap_dispatch_slots_deferring(
+                        temen_ir::CAP_DYN_TYPE_ID,
+                        packed,
+                        h,
+                        &argv,
+                        gm,
+                        None,
+                        Some(&mut unlocked),
+                    )?;
                     let _ = hg.take_stdin_parked(); // no stdin parking here (see call.import)
                                                     // #1621/#1647/#1826 — requests and pipe parks are honored here too. No consumer
                                                     // reaches a personality op through `call.import.dyn` today, but leaving this arm
@@ -16941,6 +17014,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                     // #1621 four rounds to find.
                     let t = ParkTransients::drain(&mut hg);
                     drop(hg);
+                    let results = unlocked_results(results, unlocked, &argv, mem)?;
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
                     let mut refused = None;
@@ -19584,21 +19658,142 @@ fn preseeded_iface_id(names: &[String], sigs: &[FuncType]) -> Option<u32> {
     })
 }
 
-/// One import the powerbox binder ([`Host::bind_powerbox_manifest`]) refused although its **name**
-/// resolved to a capability: the declared signature is not that capability op's, so binding it
-/// would dispatch with the wrong calling convention (#1524). The slot is left unbound (fail-closed
-/// `CapFault` at use); this record is returned so an embedder can say *why* rather than leaving a
-/// silent hole. Not an error type — a refusal is a legitimate outcome for a program whose extern
-/// merely collided with a capability name.
+/// One `required` import of a root's manifest the powerbox binder ([`Host::bind_powerbox_manifest`])
+/// cannot bind, which refuses the run before it starts (IMPORTS.md §2.1, #2579), as a child's spawn
+/// is refused (#2219). Either nothing the host grants answers to its name, or the name resolves to a
+/// capability whose op the import is not shaped like, so binding it would dispatch with the wrong
+/// calling convention (#1524).
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct ShapeRefusal {
+pub struct ImportRefusal {
     /// Index into the module's import table.
     pub import: u32,
     pub name: String,
-    /// What the module declared (a `TypeEntry::Func` behind [`temen_ir::ImportShape::Func`]).
-    pub declared: FuncType,
-    /// What the capability op's pinned shape says it must be.
-    pub expected: FuncType,
+    /// For an import shaped unlike its capability: what the module declared (a `TypeEntry::Func`
+    /// behind [`temen_ir::ImportShape::Func`]), and what the capability op's pinned shape says it
+    /// must be. `None` when no grant answers to the name.
+    pub shape: Option<(FuncType, FuncType)>,
+}
+
+impl std::fmt::Display for ImportRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.shape {
+            None => write!(f, "no grant satisfies its import `{}`", self.name),
+            Some((declared, expected)) => write!(
+                f,
+                "its import `{}` is declared {declared:?}, not as the capability's {expected:?}",
+                self.name
+            ),
+        }
+    }
+}
+
+/// What a root's manifest is bound against ([`Host::bind_powerbox_manifest`]): an import name to
+/// the capability it denotes and the handle the host granted for it, `None` for a name the host
+/// grants nothing for.
+pub type ImportGrant<'a> = &'a dyn Fn(&str) -> Option<(temen_ir::ResolvedCap, i32)>;
+
+/// The grant every powerbox host binds a manifest against: its raw [`cap_id::HOST_PROC`] seams
+/// first (the `vm_fs` memfs, declared host-answered caps, JS capabilities), each bound flat at op 0
+/// with the guest's own op riding in arg0, then the shared name→cap table
+/// ([`temen_ir::PowerboxHandles::bind`]).
+pub fn powerbox_grant<'a>(
+    granted: &'a temen_ir::PowerboxHandles,
+    seams: &'a [(&'a str, i32)],
+) -> impl Fn(&str) -> Option<(temen_ir::ResolvedCap, i32)> + 'a {
+    move |name| match seams.iter().find(|(n, _)| *n == name) {
+        Some(&(_, handle)) => Some((
+            temen_ir::ResolvedCap {
+                type_id: cap_id::HOST_PROC,
+                op: 0,
+            },
+            handle,
+        )),
+        None => granted.bind(name),
+    }
+}
+
+/// The bindings of a root's manifest on a host that grants what `grant` answers: each `required`
+/// import bound to its grant, each `rebindable` one to its grant or empty (IMPORTS.md §2.1). Every
+/// `required` import that does not bind is a refusal ([`ImportRefusal`]), and any refusal refuses
+/// the run. A host can ask before it launches anything: no `Host` is involved.
+///
+/// **The shape check (#1524).** A name resolving to a capability is *not* sufficient to bind it:
+/// the import must also be *shaped* like that capability's op. A frontend emits two different
+/// things through the same `call.sym` syntax —
+///
+/// * a **capability** import — the handle operand is a real granted handle, the args are the op's
+///   args (chibicc's `gen_builtin_import`, the `<temen.h>` §7 late-binding pattern);
+/// * a **function-symbol** import — a cross-TU call to a declared-but-undefined function, whose
+///   args are the C list *led by the data stack pointer* (chibicc `--emit-object`).
+///
+/// Both intern as [`temen_ir::ImportShape::Func`], so the shape *enum* cannot tell them apart — only
+/// the signature can. When the retained function-symbol import's name happens to be a powerbox row
+/// (`extern long vm_map(long, long)` in a program unit that no linked unit defines), binding it by
+/// name alone would dispatch the capability with every argument shifted by one: the data-SP arrives
+/// where the length belongs. So an import whose declared signature does not bind as the capability
+/// op's ([`sig_binds_as_capability`] — **arity**, since the data-SP is what changes it, and scalar
+/// width legitimately varies) does not bind.
+///
+/// This is only as strong as the *pinned* signatures: [`builtin_iface_shape`] is seeded for `Stream`
+/// and `Exit` (#1515 slice 1), so those two are checked. The other seven built-ins have no canonical
+/// signature yet — #1515's decision 1 is exactly that, and is the owner's to make — so a name
+/// resolving to one binds unchecked. The gap is narrowed here, not closed; #1524 records what closing
+/// it needs.
+pub fn powerbox_manifest_bindings(
+    imports: &[temen_ir::Import],
+    types: &[temen_ir::TypeEntry],
+    grant: ImportGrant,
+) -> Result<Vec<BoundImport>, Vec<ImportRefusal>> {
+    let mut bindings = Vec::with_capacity(imports.len());
+    let mut refusals = Vec::new();
+    for (i, im) in imports.iter().enumerate() {
+        let rebindable = im.mode == temen_ir::ImportMode::Rebindable;
+        let refusal = |shape| ImportRefusal {
+            import: i as u32,
+            name: im.name.clone(),
+            shape,
+        };
+        let Some((cap, handle)) = grant(&im.name) else {
+            match rebindable {
+                true => bindings.push(BoundImport::rebindable(0, 0, None)),
+                false => refusals.push(refusal(None)),
+            }
+            continue;
+        };
+        // Only a *flat* import can be a mis-shaped function-symbol import; a grouped (`Interface`)
+        // one is coverage-bound elsewhere and never carries the C list.
+        if let (temen_ir::ImportShape::Func(t), Some(expected)) =
+            (im.shape, canonical_op_sig(cap.type_id, cap.op))
+        {
+            let mismatch = match types.get(t as usize) {
+                Some(temen_ir::TypeEntry::Func(declared))
+                    if sig_binds_as_capability(declared, &expected) =>
+                {
+                    None
+                }
+                Some(temen_ir::TypeEntry::Func(declared)) => {
+                    Some(Some((declared.clone(), expected)))
+                }
+                // A malformed type reference (an unverified module): fail closed too.
+                _ => Some(None),
+            };
+            if let Some(shape) = mismatch {
+                match rebindable {
+                    true => bindings.push(BoundImport::rebindable(0, 0, None)),
+                    false => refusals.push(refusal(shape)),
+                }
+                continue;
+            }
+        }
+        bindings.push(match rebindable {
+            true => BoundImport::rebindable(cap.type_id, cap.op, Some(handle)),
+            false => BoundImport::required(cap.type_id, cap.op, handle),
+        });
+    }
+    match refusals.is_empty() {
+        true => Ok(bindings),
+        false => Err(refusals),
+    }
 }
 
 /// The pinned signature of one built-in capability op, or `None` when that built-in's convention is
@@ -22466,7 +22661,7 @@ pub(crate) fn wait_for_ring(bell: &Bell, seen: u64, within: Option<std::time::Du
 
 /// §12 parking-on-blocking — the **completion store** behind a `Pending` dispatch. When an
 /// offloadable handler punts ([`OffloadOutcome::Offload`]) on the parking-aware dispatch face
-/// ([`Host::cap_dispatch_slots_pending`]), the dispatch mints an id here, hands the job to the
+/// ([`Host::cap_dispatch_slots_deferring`]), the dispatch mints an id here, hands the job to the
 /// offload pool, and returns `Pending(id)`; the pool worker posts the scalar result via
 /// [`Completions::complete`]. The eval loop then waits **without the host lock**
 /// ([`Completions::wait`] — the single-fiber degenerate path; fiber-level parking is the
@@ -22876,6 +23071,11 @@ impl ForkedProc {
         Self::of(ProcHandler::Offloadable(handler), state)
     }
 
+    /// [`Self::shared`] for an unlocked handler ([`Host::grant_host_proc_unlocked`], #2645).
+    pub fn unlocked(handler: UnlockedHostProc, state: CapState) -> Self {
+        Self::of(ProcHandler::Unlocked(handler), state)
+    }
+
     fn of(handler: ProcHandler, state: CapState) -> Self {
         Self {
             handler,
@@ -22994,14 +23194,42 @@ struct SharedStdin {
 /// its terminal and something else at once (#2019). The dual of [`StreamTee`].
 pub type StdinSource = Box<dyn FnMut() -> Option<Vec<u8>> + Send>;
 
-/// The two handler shapes one [`HostProcEntry`] can carry — the *registration* decides
+/// The handler shapes one [`HostProcEntry`] can carry — the *registration* decides
 /// (CONSOLIDATION §7 per-entry powers, extended by §12 parking): `Sync` is today's full-powered
 /// synchronous closure; `Offloadable` declares blockingness and trades window/minter access for
-/// the right to punt to the offload pool. A fork factory mints either ([`ForkedProc::handler`]),
-/// so a spawned child or a fork twin inherits a handler of the shape its parent was granted (#2424).
+/// the right to punt to the offload pool; `Unlocked` (#2645) keeps no state in the host and trades
+/// the minter for running outside the host lock. A fork factory mints any of them
+/// ([`ForkedProc::handler`]), so a spawned child or a fork twin inherits a handler of the shape its
+/// parent was granted (#2424).
 pub enum ProcHandler {
     Sync(HostProc),
     Offloadable(OffloadHostProc),
+    Unlocked(UnlockedHostProc),
+}
+
+/// #2645 — an **unlocked** host procedure's handler ([`Host::grant_host_proc_unlocked`]): scalars
+/// and the caller's window in, results out, like a [`HostProc`], but it keeps no state in the host
+/// and is handed no region minter. So a dispatch that holds the domain's host shared under a lock
+/// lets go of it first: the call runs while the domain's other tasks make their own host calls. A
+/// call that waits (a JS capability answered on a page, I/O) then holds nothing back but its own
+/// task. The provider makes its own state safe to share: the handler may run on several threads at
+/// once.
+pub type UnlockedHostProc =
+    Arc<dyn Fn(u32, &[i64], Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> + Send + Sync>;
+
+/// #2645 — a call to an unlocked host procedure that a dispatch handed back instead of running
+/// ([`Host::cap_dispatch_slots_deferring`]), for its caller to [`run`](Self::run) once it has let go
+/// of the host: with the call's arguments, and the window the dispatch was given.
+pub struct UnlockedCall {
+    handler: UnlockedHostProc,
+    op: u32,
+}
+
+impl UnlockedCall {
+    /// Run the call: `args` are the ones the dispatch was given, `mem` the caller's window.
+    pub fn run(self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        (self.handler)(self.op, args, mem)
+    }
 }
 
 /// The **one** extra authority an mmap-capable [`HostProcRegion`] handler gets over a plain [`HostProc`]:
@@ -23042,6 +23270,17 @@ struct HostProcEntry {
     /// finished by the embedder, so a call parks without needing the caller's frames
     /// ([`OpParks::OnHost`]).
     on_host: bool,
+}
+
+impl HostProcEntry {
+    /// Whether every call completes inside the call: a synchronous handler, locked or not (#2645),
+    /// which cannot punt.
+    fn answers_in_call(&self) -> bool {
+        matches!(
+            self.handler,
+            ProcHandler::Sync(_) | ProcHandler::Unlocked(_)
+        )
+    }
 }
 
 /// #1699 — a host capability's **host-side state**, declared by its provider wherever a handler is
@@ -25181,7 +25420,16 @@ struct ModuleGrant {
     /// vCPU from ([`Self::tables`]): made the first time it is asked for, and shared by every copy of
     /// this grant.
     tables: Arc<std::sync::OnceLock<Tables>>,
+    /// The module's bytecode programs ([`Self::program`]), made and shared as `tables` are, so a
+    /// host that grants the same module run after run ([`PreparedModule`], a toolchain's commands)
+    /// compiles it once, not once a run (#2366).
+    programs: Arc<GrantPrograms>,
 }
+
+/// A grant's bytecode program for a run whose driver serves its children (`[1]`) and for one whose
+/// driver does not (`[0]`): the two ways a run admits a module ([`bytecode::compile_granted`]).
+/// `None` inside for a module the bytecode engine does not run.
+type GrantPrograms = [std::sync::OnceLock<Option<Arc<bytecode::Compiled>>>; 2];
 
 /// A function table and its type section, as a vCPU owns them.
 type Tables = (Arc<[Func]>, Arc<[temen_ir::TypeEntry]>);
@@ -25195,6 +25443,7 @@ impl ModuleGrant {
             module: m,
             durable,
             tables: Arc::default(),
+            programs: Arc::default(),
         }
     }
 
@@ -25220,6 +25469,18 @@ impl ModuleGrant {
         });
         (Arc::clone(funcs), Arc::clone(types))
     }
+
+    /// The module's bytecode program for a run whose driver does or does not `serve` its children:
+    /// `compile`d the first time it is asked for, and shared by every copy of this grant.
+    fn program(
+        &self,
+        serve: bool,
+        compile: impl FnOnce() -> Option<bytecode::Compiled>,
+    ) -> Option<Arc<bytecode::Compiled>> {
+        self.programs[serve as usize]
+            .get_or_init(|| compile().map(Arc::new))
+            .clone()
+    }
 }
 
 /// What an `execve` becomes, resolved ([`Host::exec_module`]): the module the new image runs.
@@ -25243,6 +25504,13 @@ impl PreparedModule {
     /// The module it grants.
     pub fn module(&self) -> &Arc<Module> {
         &self.0.module
+    }
+
+    /// Its bytecode program as the root of a reserved-window run runs it
+    /// ([`bytecode::compile_reserved`]), compiled once and kept with the grant: the program an exec
+    /// of it in such a run runs too (#2366). `None` for a module the bytecode engine does not run.
+    pub fn program(&self) -> Option<Arc<bytecode::Compiled>> {
+        bytecode::granted_root_program(&self.0)
     }
 }
 
@@ -26129,90 +26397,36 @@ impl Host {
     }
 
     /// Bind a **root module's manifest against the powerbox grants** — the one binder every
-    /// embedder uses (#1524). Import `i`'s name resolves through the shared name→cap table
-    /// ([`temen_ir::PowerboxHandles::bind`]) to a `(type_id, op)` and the handle this host granted
-    /// for it; a name outside the table, or a capability this host chose not to grant, leaves the
-    /// slot **unbound** — a dispatch through it is a fail-closed `CapFault`.
-    ///
-    /// `host_procs` is consulted first: names this host serves as a raw [`cap_id::HOST_PROC`]
-    /// (the `vm_fs` memfs seam, the debugger's host-completed caps), bound flat at op 0 with the
-    /// guest's own op riding in arg0. Passing a name here overrides the powerbox table for it.
+    /// embedder uses (#1524): [`powerbox_manifest_bindings`] over `grant`, usually
+    /// [`powerbox_grant`]. A `required` import that does not bind **refuses the run** (IMPORTS.md
+    /// §2.1, #2579), as a child's spawn is refused (#2219): nothing is installed, each refusal is
+    /// noted ([`Host::take_notes`]), since the guest never runs to see why, and the embedder ends
+    /// the run before it starts.
     ///
     /// **Why this is one function.** It replaced eight hand-copied
     /// `imports.iter().map(|im| granted.bind(&im.name))` blocks (browser ×3, temen-run, temen-dap,
     /// three tests) — INVARIANTS #15's "second route through a behaviour that already has one",
-    /// once per embedder. The shape check below had to land in all eight or none.
-    ///
-    /// **The shape check (#1524).** A name resolving to a capability is *not* sufficient to bind
-    /// it: the import must also be *shaped* like that capability's op. A frontend emits two
-    /// different things through the same `call.sym` syntax —
-    ///
-    /// * a **capability** import — the handle operand is a real granted handle, the args are the
-    ///   op's args (chibicc's `gen_builtin_import`, the `<temen.h>` §7 late-binding pattern);
-    /// * a **function-symbol** import — a cross-TU call to a declared-but-undefined function,
-    ///   whose args are the C list *led by the data stack pointer* (chibicc `--emit-object`).
-    ///
-    /// Both intern as [`temen_ir::ImportShape::Func`], so the shape *enum* cannot tell them apart —
-    /// only the signature can. When the retained function-symbol import's name happens to be a
-    /// powerbox row (`extern long vm_map(long, long)` in a program unit that no linked unit
-    /// defines), binding it by name alone dispatches the capability with every argument shifted by
-    /// one: the data-SP arrives where the length belongs. So an import whose declared signature does
-    /// not bind as the capability op's ([`sig_binds_as_capability`] — **arity**, since the data-SP
-    /// is what changes it, and scalar width legitimately varies) is refused here and left unbound,
-    /// and the refusal is returned for the embedder to surface.
-    ///
-    /// This is only as strong as the *pinned* signatures: [`builtin_iface_shape`] is seeded for
-    /// `Stream` and `Exit` (#1515 slice 1), so those two are checked. The other seven built-ins
-    /// have no canonical signature yet — #1515's decision 1 is exactly that, and is the owner's to
-    /// make — so a name resolving to one binds unchecked, as before. The gap is narrowed here, not
-    /// closed; #1524 records what closing it needs.
+    /// once per embedder. The shape check had to land in all eight or none, and so did the refusal.
     pub fn bind_powerbox_manifest(
         &mut self,
         imports: &[temen_ir::Import],
         types: &[temen_ir::TypeEntry],
-        granted: &temen_ir::PowerboxHandles,
-        host_procs: &[(&str, i32)],
-    ) -> Vec<ShapeRefusal> {
-        if imports.is_empty() {
-            return Vec::new();
+        grant: ImportGrant,
+    ) -> Result<(), Vec<ImportRefusal>> {
+        match powerbox_manifest_bindings(imports, types, grant) {
+            Ok(bindings) => {
+                if !bindings.is_empty() {
+                    self.set_import_bindings(bindings);
+                }
+                Ok(())
+            }
+            Err(refusals) => {
+                for r in &refusals {
+                    self.note(format!("refused the run: {r}"));
+                }
+                Err(refusals)
+            }
         }
-        let mut refusals = Vec::new();
-        let bindings = imports
-            .iter()
-            .enumerate()
-            .map(|(i, im)| {
-                if let Some((_, h)) = host_procs.iter().find(|(n, _)| *n == im.name) {
-                    return BoundImport::required(cap_id::HOST_PROC, 0, *h);
-                }
-                let Some((cap, handle)) = granted.bind(&im.name) else {
-                    return BoundImport::rebindable(0, 0, None);
-                };
-                // Only a *flat* import can be a mis-shaped function-symbol import; a grouped
-                // (`Interface`) one is coverage-bound elsewhere and never carries the C list.
-                if let (temen_ir::ImportShape::Func(t), Some(expected)) =
-                    (im.shape, canonical_op_sig(cap.type_id, cap.op))
-                {
-                    match types.get(t as usize) {
-                        Some(temen_ir::TypeEntry::Func(declared))
-                            if sig_binds_as_capability(declared, &expected) => {}
-                        Some(temen_ir::TypeEntry::Func(declared)) => {
-                            refusals.push(ShapeRefusal {
-                                import: i as u32,
-                                name: im.name.clone(),
-                                declared: declared.clone(),
-                                expected,
-                            });
-                            return BoundImport::rebindable(0, 0, None);
-                        }
-                        // A malformed type reference (an unverified module): fail closed too.
-                        _ => return BoundImport::rebindable(0, 0, None),
-                    }
-                }
-                BoundImport::required(cap.type_id, cap.op, handle)
-            })
-            .collect();
-        self.set_import_bindings(bindings);
-        refusals
     }
 
     /// Mark this domain **durable**: its module has been freeze/thaw-instrumented, so the runtime
@@ -27039,7 +27253,7 @@ impl Host {
         // #1455: re-seed each capability's own state into the freshly granted handlers, so a guest
         // resumed at the checkpoint's logical time sees its capabilities as they were then rather than
         // as a fresh powerbox minted them. Under a replaying tape too: a replay re-runs such a
-        // capability (see `cap_dispatch_slots_impl`), so from here its state follows the replay
+        // capability (see `cap_dispatch_slots_deferring`), so from here its state follows the replay
         // forward, and a store rewound to the checkpoint shows the files the guest had written by then.
         self.restore_cap_states(&s.cap_states);
         for (d, &(units, bytes)) in self.jit_tables.iter_mut().zip(&s.jit_quota) {
@@ -29361,6 +29575,32 @@ impl Host {
         })
     }
 
+    /// #2645 — register an **unlocked** host-capability handler ([`UnlockedHostProc`], also iface
+    /// [`cap_id::HOST_PROC`]): a synchronous handler with the caller's window, like
+    /// [`Host::grant_host_proc`]'s, that keeps no state in the host. Where a domain's tasks share its
+    /// host under a lock (the tree-walker, executor 2, the JIT's locked thunk), each call runs after
+    /// the dispatch has let go of it, so a call that waits holds back no other task's host call. On
+    /// the JIT, whose window pages are hardware-protected, each of the call's window copies takes the
+    /// host lock, which every page-protection change holds, so a copy never meets a page another task
+    /// is unmapping. A call runs under the host where nothing else could use it meanwhile: on a
+    /// single-threaded driver, and under a W1 tape, which records each call where it runs. `fork`
+    /// mints it for a §14 child or fork twin, as [`Host::grant_host_proc_forkable`]'s does.
+    pub fn grant_host_proc_unlocked(
+        &mut self,
+        f: UnlockedHostProc,
+        fork: Option<HostProcFork>,
+        state: CapState,
+    ) -> i32 {
+        self.grant_host_proc_entry(HostProcEntry {
+            handler: ProcHandler::Unlocked(f),
+            fork,
+            mints: false,
+            vtable: None,
+            state,
+            on_host: false,
+        })
+    }
+
     /// #1366 / #1953 — grant the embedder's **declared host-answered caps**: for each of `names`
     /// (in order), an offloadable proc that always punts to the embedder
     /// ([`OffloadOutcome::Host`]). The guest's flat `call.sym "<name>"` (its own op in `args[0]`)
@@ -29374,6 +29614,10 @@ impl Host {
     /// #2579 — a name is granted whether or not the module imports it: a guest may resolve it by
     /// name instead (unir's `bell`). One the module never calls costs only where it makes an inline
     /// host-capability call, which may then park on the embedder (`image_parks`).
+    ///
+    /// #2579 — each is forkable: a §14 child or `fork()` twin it is re-granted to files its calls in
+    /// the same `requests`, under completion ids unique in the process, so the embedder answers a
+    /// child's call as it answers the root's.
     pub fn grant_declared_host_caps(
         &mut self,
         names: &[String],
@@ -29381,24 +29625,18 @@ impl Host {
     ) -> Vec<(String, i32)> {
         let mut declared = Vec::new();
         for name in names {
-            let requests = Arc::clone(requests);
-            let cap = name.clone();
+            let fork: HostProcFork = {
+                let (name, requests) = (name.clone(), Arc::clone(requests));
+                Arc::new(move |_pid| {
+                    Some(ForkedProc::offloadable(
+                        declared_host_cap(&name, &requests),
+                        CapState::Stateless,
+                    ))
+                })
+            };
             let h = self.grant_host_proc_offloadable(
-                Box::new(move |_op: u32, args: &[i64]| {
-                    let requests = Arc::clone(&requests);
-                    let name = cap.clone();
-                    let args = args.to_vec();
-                    OffloadOutcome::Host(Box::new(move |completer: Completer| {
-                        let request = CapRequest {
-                            name,
-                            args,
-                            completer,
-                        };
-                        let id = request.completer.id();
-                        requests.lock_unpoisoned().insert(id, request);
-                    }))
-                }),
-                None,
+                declared_host_cap(name, requests),
+                Some(fork),
                 // Each call is answered afresh by the embedder; nothing is held between calls.
                 CapState::Stateless,
             );
@@ -29412,17 +29650,15 @@ impl Host {
     }
 
     /// #1954 — whether `handle` names a host capability whose handler answers **synchronously**
-    /// ([`Host::grant_host_proc`]'s face, not an offloadable one): it cannot punt, so its call completes
-    /// inside the dispatch. Its only route to a park is a personality's park request, which the
-    /// bytecode engine's leaf predicate (`image_parks`) asks the personality about first.
+    /// ([`Host::grant_host_proc`]'s face or an unlocked one, #2645, not an offloadable one): it cannot
+    /// punt, so its call completes inside the call. Its only route to a park is a personality's park
+    /// request, which the bytecode engine's leaf predicate (`image_parks`) asks the personality about
+    /// first.
     pub fn host_proc_is_sync(&self, handle: i32) -> bool {
         matches!(
             self.resolve(handle, cap_id::HOST_PROC),
             Ok(Binding::HostProc(idx))
-                if matches!(
-                    self.host_procs.get(idx as usize).map(|e| &e.handler),
-                    Some(ProcHandler::Sync(_))
-                )
+                if self.host_procs.get(idx as usize).is_some_and(HostProcEntry::answers_in_call)
         )
     }
 
@@ -29442,7 +29678,7 @@ impl Host {
     /// park one; [`OpParks::OnHost`] when one is a declared host-completed cap
     /// ([`parks_on_host`](Self::parks_on_host)); [`OpParks::Otherwise`] when one is offloadable.
     pub fn host_procs_park(&self) -> OpParks {
-        let offloads = |e: &HostProcEntry| !e.on_host && !matches!(e.handler, ProcHandler::Sync(_));
+        let offloads = |e: &HostProcEntry| !e.on_host && !e.answers_in_call();
         if self.host_procs.iter().any(offloads) {
             OpParks::Otherwise
         } else if self.host_procs.iter().any(|e| e.on_host) {
@@ -31927,10 +32163,10 @@ impl Host {
         // refuses (`None`, fail-closed); such a cap the parent keeps. This is the deep-copy path
         // `resolve_copyable` defers for `HostProc`.
         if let Ok(Binding::HostProc(idx)) = self.resolve(handle, cap_id::HOST_PROC) {
-            let vt = self
+            let (vt, on_host) = self
                 .host_procs
                 .get(idx as usize)
-                .and_then(|e| e.vtable.clone());
+                .map_or((None, false), |e| (e.vtable.clone(), e.on_host));
             return self
                 .host_procs
                 .get(idx as usize)
@@ -31952,14 +32188,16 @@ impl Host {
                         child.exec_remap_hooks.push(x);
                     }
                     // #2424 — the handler the factory minted, of whichever shape: an offloadable
-                    // one parks the child's caller as the parent's parks its own.
+                    // one parks the child's caller as the parent's parks its own, and a declared
+                    // host-answered one stays the embedder's to answer (#2579), as `fork_powerbox`
+                    // carries it into a twin.
                     let h = child.grant_host_proc_entry(HostProcEntry {
                         handler: forked.handler,
                         fork: Some(forked.refork.unwrap_or_else(|| Arc::clone(&factory))),
                         mints: false,
                         vtable: None,
                         state: forked.state,
-                        on_host: false,
+                        on_host,
                     });
                     // #801 — the vtable rides the re-grant, and its op names enter the child's
                     // directory: a spawned `__px_`-linked child binds its manifest in-loop, same
@@ -32861,31 +33099,27 @@ impl Host {
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
     ) -> Result<Vec<i64>, Trap> {
-        self.cap_dispatch_slots_impl(type_id, op, handle, args, mem, None)
+        self.cap_dispatch_slots_deferring(type_id, op, handle, args, mem, None, None)
     }
 
-    /// §12 parking-on-blocking — the **parking-aware dispatch face**: identical to
-    /// [`Host::cap_dispatch_slots`] except an offloadable handler's punt returns immediately with
-    /// `*pending = Some(completion_id)` (the job already handed to the offload pool) instead of
-    /// running the job inline. The result slots are then a placeholder the caller must discard —
-    /// on `Some`, drop the host lock, then [`Completions::wait`] (via [`Host::completions`]) for
-    /// the scalar result and deliver it as the call's single result slot. Only eval loops that
-    /// implement that discipline may use this face; everything else stays on the sync face and
-    /// gets byte-identical inline semantics (decline-never-diverge, INVARIANTS.md 9). Under a W1
-    /// tape the punt is forced inline so the recorded crossing carries the real result.
-    pub fn cap_dispatch_slots_pending(
-        &mut self,
-        type_id: u32,
-        op: u32,
-        handle: i32,
-        args: &[i64],
-        mem: Option<&mut dyn GuestMem>,
-        pending: &mut Option<u64>,
-    ) -> Result<Vec<i64>, Trap> {
-        self.cap_dispatch_slots_impl(type_id, op, handle, args, mem, Some(pending))
-    }
-
-    fn cap_dispatch_slots_impl(
+    /// The **deferring dispatch face**: identical to [`Host::cap_dispatch_slots`] except for the
+    /// calls it can leave for its caller to finish once the caller has let go of the host, each on a
+    /// face the caller offers. On either, the result slots are a placeholder the caller discards.
+    ///
+    /// - `pending` (§12 parking-on-blocking): an offloadable handler's punt returns at once with
+    ///   `*pending = Some(completion_id)` (the job already handed to the offload pool) instead of
+    ///   running the job inline. Drop the host lock, then [`Completions::wait`] (via
+    ///   [`Host::completions`]) for the scalar result and deliver it as the call's single result
+    ///   slot.
+    /// - `unlocked` (#2645): a call to an unlocked host procedure ([`Host::grant_host_proc_unlocked`])
+    ///   returns at once with `*unlocked = Some(call)` instead of running. Drop the host lock, then
+    ///   [`UnlockedCall::run`] with the same arguments and window: its results are the call's.
+    ///
+    /// A face the caller does not offer gets byte-identical inline semantics
+    /// (decline-never-diverge, INVARIANTS.md 9). Under a W1 tape a pool punt and an unlocked call
+    /// run inline, so the recorded crossing carries the real result.
+    #[allow(clippy::too_many_arguments)] // the call's own five, and the two faces a caller offers
+    pub fn cap_dispatch_slots_deferring(
         &mut self,
         type_id: u32,
         op: u32,
@@ -32893,6 +33127,7 @@ impl Host {
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
         pending: Option<&mut Option<u64>>,
+        unlocked: Option<&mut Option<UnlockedCall>>,
     ) -> Result<Vec<i64>, Trap> {
         // §12: under a W1 tape, force punts inline (`pending = None` downstream) — a `Pending`
         // placeholder on the tape would replay as a phantom result; the inline run records the
@@ -32965,7 +33200,11 @@ impl Host {
         }
         // W1 record/replay (DEBUGGING.md): only the nondeterministic *input* caps are taped —
         // deterministic / structural caps re-run faithfully on a fresh powerbox and are left live.
-        if is_recorded_input(type_id, op) {
+        // #2645: and only while a tape is active, so an untaped call runs on the faces its caller
+        // offers, and its window writes are not copied for a tape no one keeps.
+        if is_recorded_input(type_id, op)
+            && (self.cap_record.is_some() || self.cap_replay.is_some())
+        {
             // Replay: serve the next recorded crossing if it matches this call (a mismatch means the
             // re-execution diverged before this point — fall through to live as a best effort).
             let served = if let Some((tape, pos)) = &mut self.cap_replay {
@@ -32996,7 +33235,8 @@ impl Host {
                         Some(m) => Some(&mut **m),
                         None => None,
                     };
-                    let _ = self.cap_dispatch_slots_inner(type_id, op, handle, args, rerun, None);
+                    let _ =
+                        self.cap_dispatch_slots_inner(type_id, op, handle, args, rerun, None, None);
                 }
                 // Re-apply any guest-window writes the cap made (a buffer-filling `read`), then
                 // return the recorded result slots — no live host needed.
@@ -33024,6 +33264,7 @@ impl Host {
                         args,
                         Some(&mut rec_mem),
                         pending.as_deref_mut(),
+                        None,
                     );
                     (r, rec_mem.writes)
                 }
@@ -33035,6 +33276,7 @@ impl Host {
                         args,
                         None,
                         pending.as_deref_mut(),
+                        None,
                     ),
                     Vec::new(),
                 ),
@@ -33061,13 +33303,14 @@ impl Host {
             }
             return result;
         }
-        self.cap_dispatch_slots_inner(type_id, op, handle, args, mem, pending)
+        self.cap_dispatch_slots_inner(type_id, op, handle, args, mem, pending, unlocked)
     }
 
     /// The live capability dispatch (§3c) — resolve the handle in the host table and run the op. The
     /// public [`cap_dispatch_slots`](Host::cap_dispatch_slots) wraps this with W1 record/replay.
-    /// `pending` is the §12 parking out-param ([`Host::cap_dispatch_slots_pending`]); `None` = the
-    /// sync face, where an offloadable punt runs inline.
+    /// `pending` and `unlocked` are the faces [`Host::cap_dispatch_slots_deferring`] offers; `None`
+    /// is the sync face, where an offloadable punt and an unlocked call run inline.
+    #[allow(clippy::too_many_arguments)] // as `cap_dispatch_slots_deferring`
     fn cap_dispatch_slots_inner(
         &mut self,
         type_id: u32,
@@ -33076,6 +33319,7 @@ impl Host {
         args: &[i64],
         mem: Option<&mut dyn GuestMem>,
         pending: Option<&mut Option<u64>>,
+        unlocked: Option<&mut Option<UnlockedCall>>,
     ) -> Result<Vec<i64>, Trap> {
         // Phase-2 `import.attach` (IMPORTS.md): (re)bind rebindable import slot `op` to the handle
         // in `args[0]`. The new handle must resolve **live under the slot's declared interface
@@ -33591,6 +33835,23 @@ impl Host {
             // registered mmap-capable (`mints`) is handed `self` as the minter; a plain one gets
             // `None` — the registration, not the call, decides the extra authority.
             Binding::HostProc(idx) => {
+                // #2645 — an unlocked handler keeps nothing in the host: it is shared, not taken out,
+                // and on a face that offers it the caller runs it once it has let go of the host.
+                if let Some(ProcHandler::Unlocked(f)) =
+                    self.host_procs.get(idx as usize).map(|e| &e.handler)
+                {
+                    let call = UnlockedCall {
+                        handler: Arc::clone(f),
+                        op,
+                    };
+                    return match unlocked {
+                        Some(slot) => {
+                            *slot = Some(call);
+                            Ok(Vec::new()) // the caller runs it
+                        }
+                        None => call.run(args, mem),
+                    };
+                }
                 let (mut f, mints) = match self.host_procs.get_mut(idx as usize) {
                     Some(e) => (
                         std::mem::replace(
@@ -33609,6 +33870,7 @@ impl Host {
                 let mut hosted: Option<HostCompletion> = None;
                 let r = match &mut f {
                     ProcHandler::Sync(f) => f(op, args, mem, if mints { Some(self) } else { None }),
+                    ProcHandler::Unlocked(f) => f(op, args, mem), // run above; never taken out
                     ProcHandler::Offloadable(f) => match f(op, args) {
                         OffloadOutcome::Done(r) => r,
                         OffloadOutcome::Offload(job) => {
@@ -35138,7 +35400,21 @@ impl Mem {
 
     /// Read/write the shared address space, recovering from a poisoned lock (the interpreter never
     /// panics while holding it) rather than propagating the panic.
+    ///
+    /// #2579 — on the browser's threads build a contended read spins instead of waiting: the page
+    /// reads a task's window while it serves that task's JS capability call, and a browser's main
+    /// thread may not wait (`memory.atomic.wait32` traps there). A writer holds the lock only while
+    /// it changes the page map.
     fn space_read(&self) -> std::sync::RwLockReadGuard<'_, AddrSpace> {
+        #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+        loop {
+            match self.space.try_read() {
+                Ok(space) => return space,
+                Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => std::hint::spin_loop(),
+            }
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
         self.space.read_unpoisoned()
     }
     fn space_write(&self) -> SpaceWrite<'_> {
@@ -39569,8 +39845,15 @@ mod fork_powerbox_tests {
         );
         let call = |host: &mut Host, handle: i32, x: i64| {
             let mut id = None;
-            let r =
-                host.cap_dispatch_slots_pending(cap_id::HOST_PROC, 0, handle, &[x], None, &mut id);
+            let r = host.cap_dispatch_slots_deferring(
+                cap_id::HOST_PROC,
+                0,
+                handle,
+                &[x],
+                None,
+                Some(&mut id),
+                None,
+            );
             assert_eq!(r, Ok(vec![]), "a punted call answers later");
             host.completions().wait(id.expect("the call punts"))
         };
@@ -41724,7 +42007,15 @@ mod offload_pool_tests {
             CapState::Stateless,
         );
         let mut id = None;
-        let r = host.cap_dispatch_slots_pending(cap_id::HOST_PROC, 0, h, &[0], None, &mut id);
+        let r = host.cap_dispatch_slots_deferring(
+            cap_id::HOST_PROC,
+            0,
+            h,
+            &[0],
+            None,
+            Some(&mut id),
+            None,
+        );
         assert_eq!(r, Ok(vec![]), "the call punts");
         assert!(id.is_some());
         let started = std::time::Instant::now();

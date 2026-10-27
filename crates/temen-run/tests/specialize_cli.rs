@@ -4,7 +4,7 @@
 use std::process::Command;
 
 use temen_ir::{BinOp, Block, Func, Inst, IntTy, Module, Terminator, ValType};
-use temen_run::{run_kernel, specialize_module, SpecArg, SpecializeOpts, Value};
+use temen_run::{run_kernel, specialize_module, Limits, SpecArg, SpecializeOpts, Value};
 
 /// `g(a, b) = a * 2 + b`.
 fn g() -> Module {
@@ -48,8 +48,14 @@ fn specialize_module_binds_a_static_arg() {
     };
     let r = specialize_module(&g(), &opts).expect("specializes");
     assert_eq!(r.funcs[0].params.len(), 1, "only the dynamic arg remains");
-    assert_eq!(run_kernel(&r, &[3]).unwrap(), vec![Value::I64(13)]);
-    assert_eq!(run_kernel(&r, &[-10]).unwrap(), vec![Value::I64(0)]);
+    assert_eq!(
+        run_kernel(&r, &[3], &Limits::default()).unwrap(),
+        vec![Value::I64(13)]
+    );
+    assert_eq!(
+        run_kernel(&r, &[-10], &Limits::default()).unwrap(),
+        vec![Value::I64(0)]
+    );
 }
 
 #[test]
@@ -57,7 +63,10 @@ fn specialize_module_missing_bindings_default_to_dynamic() {
     // No --arg given: every parameter is dynamic, so the residual matches the original.
     let r = specialize_module(&g(), &SpecializeOpts::default()).expect("specializes");
     assert_eq!(r.funcs[0].params.len(), 2);
-    assert_eq!(run_kernel(&r, &[4, 1]).unwrap(), vec![Value::I64(9)]);
+    assert_eq!(
+        run_kernel(&r, &[4, 1], &Limits::default()).unwrap(),
+        vec![Value::I64(9)]
+    );
 }
 
 #[test]

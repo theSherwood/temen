@@ -933,6 +933,7 @@ dependencies = [
  "temen-text",
  "temen-verify",
  "wasmi",
+ "wasmparser 0.251.0",
 ]
 
 [[package]]

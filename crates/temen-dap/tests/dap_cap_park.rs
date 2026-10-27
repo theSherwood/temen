@@ -3,8 +3,9 @@
 //! `stopped { reason: "cap", capId, capName, args }`; the client answers with `provideCap { id,
 //! value }` and resumes; the delivered value lands in the call's result slot. A reverse `seek`
 //! replays the delivered value from the cap tape — no re-park, no second request (the W4
-//! `provideStdin` inertness pin generalized). Without `hostCaps` the import stays unbound and the
-//! program traps (fail-closed opt-in); with a non-bytecode/non-powerbox launch the arg is refused.
+//! `provideStdin` inertness pin generalized). Without `hostCaps` nothing grants the import, so the
+//! launch is refused (IMPORTS.md §2.1, fail-closed opt-in); with a non-bytecode/non-powerbox launch
+//! the arg is refused.
 
 mod support;
 use support::{req, response};
@@ -78,6 +79,11 @@ fn declared_cap_parks_with_the_request_and_provide_cap_resumes() {
     let body = stops[0].get("body").expect("stopped body");
     assert_eq!(body.get("reason"), Some(&Json::s("cap")));
     assert_eq!(body.get("capName"), Some(&Json::s("blink")));
+    assert_eq!(
+        body.get("op"),
+        Some(&Json::i(0)),
+        "a flat import dispatches at op 0 (#2579)"
+    );
     assert_eq!(
         body.get("args"),
         Some(&Json::Arr(vec![Json::i(7), Json::i(35)])),
@@ -194,27 +200,14 @@ fn reverse_step_replays_the_delivered_value_without_re_parking() {
     );
 }
 
-/// Opt-in, fail-closed: without `hostCaps` the `blink` import is unbound and the call traps.
+/// Opt-in, fail-closed: without `hostCaps` nothing grants the required `blink` import, so the
+/// launch is refused before the guest runs (IMPORTS.md §2.1) — it never reaches the call.
 #[test]
-fn an_undeclared_cap_import_stays_unbound_and_traps() {
+fn an_undeclared_cap_import_refuses_the_launch() {
     let mut s = DapServer::new();
-    assert!(launch(&mut s, None, "bytecode", true));
-    let out = s.handle(&req(
-        4,
-        "continue",
-        Json::obj(vec![("threadId", Json::i(1))]),
-    ));
     assert!(
-        events(&out, "stopped")
-            .iter()
-            .all(|st| st.get("body").and_then(|b| b.get("reason")) != Some(&Json::s("cap"))),
-        "no cap park without a declaration"
-    );
-    let exited = events(&out, "exited");
-    assert_eq!(exited.len(), 1, "the program terminated: {out:?}");
-    assert!(
-        exited[0].get("body").and_then(|b| b.get("trap")).is_some(),
-        "…by trapping on the unbound import: {out:?}"
+        !launch(&mut s, None, "bytecode", true),
+        "an unbound required import ⇒ refused"
     );
 }
 

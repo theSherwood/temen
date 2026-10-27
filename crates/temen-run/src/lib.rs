@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use temen_interp::{
     cap_id, run_capture_reserved_with_host, run_with_host, run_with_host_fast, CapPageMap,
-    GuestMem, Host, HostProc, NodeRef, RegionBacking, RootWindow, StreamRole, Trap,
+    GuestMem, Host, HostProc, NodeRef, RegionBacking, RootWindow, StreamRole, Trap, UnlockedCall,
 };
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
@@ -55,7 +55,7 @@ pub mod fs;
 mod jit_proc;
 pub use jit_proc::JitCodeCache;
 pub mod posix;
-use temen_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, Parks, TrapKind};
+use temen_jit::{CompiledModule, JitFrameLoc, JitOutcome, Parks, TrapKind};
 pub use temen_peval::{SpecArg, SpecConfig};
 
 /// Render a JIT trap-time backtrace (§5 W3) for a kill message — `\n    #i file:line:col in <name>`
@@ -238,6 +238,7 @@ pub unsafe extern "C" fn cap_thunk(
             n_results,
             vm,
             pending_face.then_some(&mut pending_id),
+            None, // one caller at a time: an unlocked procedure runs inline
             &mut park,
         );
         if let Some(id) = pending_id {
@@ -444,7 +445,8 @@ pub unsafe extern "C" fn jit_sig_return(ctx: *mut c_void) {
 /// The shared [`cap_thunk`] body. `pending` is the §12 parking out-param: `Some` only from
 /// [`cap_thunk_locked`]'s generic tail, where a punted offloadable dispatch must not run (or
 /// wait) under the domain lock — the caller takes the completion id, releases the lock, and
-/// waits on [`Host::completions`].
+/// waits on [`Host::completions`]. `unlocked` (#2645) is the same for an unlocked host procedure:
+/// the caller takes the call, releases the lock, and runs it ([`Host::cap_dispatch_slots_deferring`]).
 ///
 /// # Safety
 /// Same contract as [`cap_thunk`].
@@ -463,6 +465,7 @@ unsafe fn cap_thunk_impl(
     n_results: u64,
     vm: &temen_jit::VmCtx,
     pending: Option<&mut Option<u64>>,
+    unlocked: Option<&mut Option<UnlockedCall>>,
     park: &mut Option<HostParkReq>,
 ) {
     let host = &mut *(ctx as *mut Host);
@@ -566,10 +569,10 @@ unsafe fn cap_thunk_impl(
     };
     let mut gm = gm;
     let view = gm.as_mut().map(|g| &mut **g as &mut dyn GuestMem);
-    let r = match pending {
-        Some(slot) => host.cap_dispatch_slots_pending(type_id, op, handle, arg_slots, view, slot),
-        None => host.cap_dispatch_slots(type_id, op, handle, arg_slots, view),
-    };
+    // A deferred call's placeholder results are empty, so nothing below writes them, and it raised
+    // no park.
+    let r =
+        host.cap_dispatch_slots_deferring(type_id, op, handle, arg_slots, view, pending, unlocked);
     match r {
         Ok(res) => {
             if n_results != 0 {
@@ -767,6 +770,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
         }
         let host_ptr = &mut *guard as *mut Host as *mut c_void;
         let mut pending_id = None;
+        let mut unlocked = None;
         let mut park = None;
         // #2495 — no parking face under a recording host, as in [`cap_thunk`].
         let face = (!guard.records_caps()).then_some(&mut pending_id);
@@ -784,8 +788,40 @@ pub unsafe extern "C" fn cap_thunk_locked(
             n_results,
             vm,
             face,
+            Some(&mut unlocked),
             &mut park,
         );
+        // #2645 — an unlocked host procedure runs with the domain lock released, so the run's other
+        // vCPUs make their host calls meanwhile. Its window copies each take the lock
+        // ([`LockedWindow`]). It raised no park.
+        if let Some(call) = unlocked {
+            #[cfg(any(unix, windows))]
+            let mut window = (!mem_base.is_null()).then(|| LockedWindow {
+                window: MprotectWindow::of(&mut guard, mem_base, mem_size, mem_reserved),
+                host: m,
+            });
+            drop(guard);
+            #[cfg(any(unix, windows))]
+            let view = window.as_mut().map(|w| w as &mut dyn GuestMem);
+            #[cfg(not(any(unix, windows)))]
+            let view = None;
+            let arg_slots = if n_args == 0 {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(args, n_args as usize)
+            };
+            match call.run(arg_slots, view) {
+                Ok(res) if n_results != 0 => {
+                    let out = std::slice::from_raw_parts_mut(results, n_results as usize);
+                    for (o, r) in out.iter_mut().zip(res) {
+                        *o = r;
+                    }
+                }
+                Ok(_) => {}
+                Err(t) => vm.raise(t.code()),
+            }
+            return;
+        }
         // #1826 — a would-block op parks with the domain lock released, so a sibling's write gets in,
         // then runs again.
         if let Some(p) = park {
@@ -2940,7 +2976,8 @@ unsafe fn ring(g: &Host) {
 /// value read under the cell's lock together with the state that made the wait park. So it is
 /// counted for the run's deadlock verdict as every other park is, ends on a kill or the domain's
 /// teardown, and a task's wait parks the task rather than its worker thread. With no bell nothing
-/// can ring it: it ends only on the verdict, a kill or the teardown.
+/// can ring it: it ends only on the verdict, a kill or the teardown. A wait that `freeze` watches
+/// also ends when a freeze lands.
 ///
 /// # Safety
 /// `vm` is the live call's context, and the caller holds no lock.
@@ -2949,9 +2986,10 @@ unsafe fn park_on_bell(
     bell: Option<&Arc<std::sync::atomic::AtomicU64>>,
     seen: u64,
     parks: Parks,
+    freeze: Option<temen_jit::FreezeWatch>,
 ) -> temen_jit::HostPark {
     let key = bell.map_or(1 << 63, bell_key);
-    temen_jit::park_host_call(vm, None, key, parks, || {
+    temen_jit::park_host_call(vm, freeze, key, parks, || {
         bell.is_none_or(|b| b.load(std::sync::atomic::Ordering::Acquire) == seen)
     })
 }
@@ -2974,6 +3012,10 @@ fn bell_now(bell: Option<&Arc<std::sync::atomic::AtomicU64>>) -> u64 {
 /// parked — fails closed (`ThreadFault`), the oracle's answer (#2173, ISSUES.md I36). No serve
 /// context ⇒ the probeable `-EINVAL`; so is the timed `svc.wait` form (a timeout arg), and a
 /// **nested** serve under a handler, refused as the interp refuses it (#2160).
+///
+/// #2627 — under a landed freeze a serve op makes no progress, as on the oracle (DURABILITY.md
+/// §13.4): it serves nothing more, ends its wait, and answers `0`. Its trailing poll unwinds with
+/// the queue intact, and the thaw's re-issue serves it.
 #[allow(clippy::too_many_arguments)]
 unsafe fn serve_locked(
     m: &Mutex<Host>,
@@ -3002,6 +3044,12 @@ unsafe fn serve_locked(
         // No serve context (an embedder entry that registers none, or a child already released).
         return put(EINVAL);
     }
+    let freeze = guard
+        .is_durable()
+        .then(|| temen_jit::FreezeWatch::new(mem_base as u64, guard.cap_window_shadow()))
+        .flatten();
+    // SAFETY: the watched window is this domain's, live while its serve op runs.
+    let frozen = || freeze.is_some_and(|f| unsafe { f.landed() });
     let mut count: i64 = 0;
     loop {
         // CALLS.md 5c.2 — fold handoff settlements (§10.2: a handoff-served dispatch counts in
@@ -3022,13 +3070,17 @@ unsafe fn serve_locked(
             // sees the same kill and releases, so until then re-check on a short sleep.
             let seen = bell_now(bell.as_ref());
             drop(guard);
-            if park_on_bell(vm, bell.as_ref(), seen, Parks::Fiber) != temen_jit::HostPark::Woken {
+            let parked = park_on_bell(vm, bell.as_ref(), seen, Parks::Fiber, None);
+            if parked != temen_jit::HostPark::Woken {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             guard = m.lock().unwrap_or_else(|e| e.into_inner());
             continue;
         }
-        while let Some((export, dop, args, ticket)) = guard.svc_pop() {
+        while !frozen() {
+            let Some((export, dop, args, ticket)) = guard.svc_pop() else {
+                break;
+            };
             let Some(fidx) = guard.svc_handler(export, dop) else {
                 vm.raise(temen_jit::TrapKind::CapFault as i64);
                 return;
@@ -3077,6 +3129,10 @@ unsafe fn serve_locked(
             ring(&guard);
             count += 1;
         }
+        if frozen() {
+            count = 0;
+            break;
+        }
         if !wait || count != 0 {
             break;
         }
@@ -3094,11 +3150,17 @@ unsafe fn serve_locked(
         let seen = bell_now(bell.as_ref());
         guard.set_serve_activation(Some((serve_ctx, mem_base as usize, mem_reserved)));
         drop(guard);
-        let parked = park_on_bell(vm, bell.as_ref(), seen, Parks::Fiber);
+        let serving = freeze.map(temen_jit::FreezeWatch::serving);
+        let parked = park_on_bell(vm, bell.as_ref(), seen, Parks::Fiber, serving);
         guard = m.lock().unwrap_or_else(|e| e.into_inner());
         guard.set_serve_activation(None);
-        // A claim taken during the park holds this domain until its release (the arm above).
-        if parked == temen_jit::HostPark::Woken || guard.handoff_claimed() {
+        // A claim taken during the park holds this domain until its release (the arm above); a
+        // freeze that ended it is answered above.
+        if matches!(
+            parked,
+            temen_jit::HostPark::Woken | temen_jit::HostPark::Frozen
+        ) || guard.handoff_claimed()
+        {
             continue;
         }
         drop(guard);
@@ -3253,7 +3315,7 @@ unsafe fn park_until_rung(
     parks: Parks,
     vm: &temen_jit::VmCtx,
 ) -> bool {
-    match park_on_bell(vm, Some(bell), seen, parks) {
+    match park_on_bell(vm, Some(bell), seen, parks, None) {
         temen_jit::HostPark::Woken => true,
         temen_jit::HostPark::Deadlock => {
             vm.raise(temen_jit::TrapKind::ThreadFault as i64);
@@ -3903,6 +3965,87 @@ fn host_page_size() -> u64 {
     match si.dwPageSize as u64 {
         0 => 4096,
         p => p,
+    }
+}
+
+/// #2645 — the window an unlocked host procedure's call ([`UnlockedCall`]) runs over on a JIT run
+/// whose vCPUs share the domain's host under a lock ([`cap_thunk_locked`]): the JIT's window, each
+/// access under that lock. The window's pages are hardware-protected, and every page-protection
+/// change runs under the lock, so a copy never meets a page another vCPU is unmapping or protecting:
+/// the call keeps, for its window accesses alone, the serialization it had when it ran under the lock.
+#[cfg(any(unix, windows))]
+struct LockedWindow<'a> {
+    window: MprotectWindow,
+    host: &'a Mutex<Host>,
+}
+
+#[cfg(any(unix, windows))]
+fn held(host: &Mutex<Host>) -> std::sync::MutexGuard<'_, Host> {
+    host.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(any(unix, windows))]
+impl GuestMem for LockedWindow<'_> {
+    fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
+        let _held = held(self.host);
+        self.window.read_bytes(ptr, len)
+    }
+    fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
+        let _held = held(self.host);
+        self.window.write_bytes(ptr, data)
+    }
+    fn window_size(&self) -> u64 {
+        self.window.window_size()
+    }
+    fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
+        let _held = held(self.host);
+        self.window.map(offset, len, prot)
+    }
+    fn unmap(&mut self, offset: u64, len: u64) -> i64 {
+        let _held = held(self.host);
+        self.window.unmap(offset, len)
+    }
+    fn protect(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
+        let _held = held(self.host);
+        self.window.protect(offset, len, prot)
+    }
+    fn tail_bytes(&self, offset: u64, len: u64) -> temen_interp::TailBytes {
+        let _held = held(self.host);
+        self.window.tail_bytes(offset, len)
+    }
+    fn page_runs(&self, offset: u64, len: u64, change: temen_interp::ClassChange) -> (u64, u64) {
+        let _held = held(self.host);
+        self.window.page_runs(offset, len, change)
+    }
+    fn window_runs(&self) -> u64 {
+        let _held = held(self.host);
+        self.window.window_runs()
+    }
+    fn map_region(
+        &mut self,
+        win_off: u64,
+        region_off: u64,
+        len: u64,
+        prot: i32,
+        region: u32,
+        backing: RegionBacking,
+    ) -> i64 {
+        let _held = held(self.host);
+        self.window
+            .map_region(win_off, region_off, len, prot, region, backing)
+    }
+    fn maps_region(&self, region: u32) -> bool {
+        let _held = held(self.host);
+        self.window.maps_region(region)
+    }
+    fn page_size(&self) -> i64 {
+        self.window.page_size()
+    }
+    fn region_page_size(&self) -> i64 {
+        self.window.region_page_size()
+    }
+    fn shadow(&self) -> temen_interp::ShadowArena {
+        self.window.shadow()
     }
 }
 
@@ -5574,9 +5717,7 @@ pub fn run_powerbox_with_host(
         .map_err(|e| format!("verification failed (fail-closed): {e:?}"))?;
     // §2.1 fail-closed: a manifest module's required imports must all be bindable (same gate as
     // `instantiate` — an unknown name refuses to start, not CapFaults mid-run).
-    if is_named_powerbox_entry(module) {
-        validate_powerbox_manifest(module)?;
-    }
+    validate_powerbox_manifest(module)?;
     // The fixed §3e powerbox preset, expressed over the converged [`Instance`] core (F1): the
     // arity-based grant ([`grant_powerbox_prefix`]) and the JIT compile→run + §5 watchdog
     // ([`run_jit`]) now live in exactly one place, shared with the frontend-independent embedding
@@ -5649,9 +5790,7 @@ impl PowerboxProgram {
         // native code to be confinement-sound is that the module verified.
         temen_verify::verify_module(&module)
             .map_err(|e| format!("verification failed (fail-closed): {e:?}"))?;
-        if is_named_powerbox_entry(&module) {
-            validate_powerbox_manifest(&module)?;
-        }
+        validate_powerbox_manifest(&module)?;
         // Refuse the shapes the one-shot path routes away from the single-threaded non-locked JIT
         // arm — the only arm this cache implements. Mirrors `Instance::run_with_caps`'s TreeWalk
         // fallback predicate plus the concurrency (locked-thunk) case.
@@ -5889,23 +6028,22 @@ impl CompiledCache {
 }
 
 /// Run a bare (non-powerbox) kernel — `module`'s entry on the JIT with `args` and no host
-/// capabilities — returning its typed result values. For hand-written IR that is a pure
-/// function rather than a program (e.g. the benchmark kernels). `Err` on compile failure,
-/// a guest trap, or an `Exit` (a kernel should not call one).
-pub fn run_kernel(module: &Module, args: &[i64]) -> Result<Vec<Value>, String> {
+/// capabilities — under `limits`, returning its typed result values. For hand-written IR that is a
+/// pure function rather than a program. A kernel is a run's root like any other (#2636): it runs
+/// through `jit_run`, which charges it to the root's grant (the default grant where `limits`
+/// names none) and arms the deadline. `Err` on compile failure, a guest trap (`OutOfFuel`
+/// included), or an `Exit` (a kernel should not call one).
+pub fn run_kernel(module: &Module, args: &[i64], limits: &Limits) -> Result<Vec<Value>, String> {
     // Escape gate (fail-closed, §2a): like the powerbox entry point, verify before running so a
     // direct library caller can't skip the verifier. Idempotent vs an already-verified module.
     temen_verify::verify_module(module)
         .map_err(|e| format!("verification failed (fail-closed): {e:?}"))?;
-    match compile_and_run(module, 0, args).map_err(|e| format!("JIT compile failed: {e:?}"))? {
-        JitOutcome::Returned(s) => {
-            let results = &module.funcs[0].results;
-            Ok(s.iter().zip(results).map(|(&v, t)| typed(*t, v)).collect())
-        }
-        JitOutcome::Exited(code) => Err(format!("kernel called Exit({code})")),
-        JitOutcome::Trapped(kind) => Err(format!("kernel trapped ({kind:?})")),
-        // Only an exec-armed powerbox unwinds a run; a kernel's host never is.
-        JitOutcome::HostUnwound => Err("kernel run unwound by its host".into()),
+    let mut host = Host::new();
+    let (outcome, _, results) =
+        jit_run(module, 0, args, &mut host, limits, None, None, false, None)?;
+    match outcome_from_jit(&results, outcome)? {
+        Outcome::Returned(values) => Ok(values),
+        Outcome::Exited(code) => Err(format!("kernel called Exit({code})")),
     }
 }
 
@@ -7841,35 +7979,25 @@ fn decode_mem_event(op: u32, args: &[i64]) -> Option<MemEvent> {
 }
 
 /// §2.1 fail-closed instantiation check for a manifest (named-powerbox) module: every `required`
-/// import must resolve under the reference policy ([`default_cap_resolver`]) to an interface the
-/// powerbox binds ([`Instance::grant_caps`]'s by-interface map). An unknown name, or a
-/// dynamic-only interface (e.g. `SharedRegion`, whose objects are runtime-minted), refuses to
-/// start the module — the `ImportError::Unresolved` semantics IMPORTS.md §2.1 keeps.
+/// import must bind on the fixed powerbox ([`grant_powerbox_prefix`], which grants every row of the
+/// reference policy, [`default_cap_resolver`]), through the one binder's rule
+/// ([`temen_interp::powerbox_manifest_bindings`]). An unknown name, a dynamic-only interface (e.g.
+/// `SharedRegion`, whose objects are runtime-minted), or an import not shaped like its capability's
+/// op refuses to start the module — the `ImportError::Unresolved` semantics IMPORTS.md §2.1 keeps.
 fn validate_powerbox_manifest(module: &Module) -> Result<(), String> {
-    use temen_interp::cap_id;
-    for im in &module.imports {
-        if im.mode != temen_ir::ImportMode::Required {
-            continue; // a rebindable slot may legitimately start empty
-        }
-        let Some(cap) = default_cap_resolver(&im.name) else {
-            return Err(format!(
-                "unresolved capability import `{}` (no binding in the host policy)",
-                im.name
-            ));
-        };
-        let bindable = matches!(
-            cap.type_id,
-            cap_id::STREAM | cap_id::EXIT | cap_id::ADDRESS_SPACE | cap_id::JIT
-        );
-        if !bindable {
-            return Err(format!(
-                "capability import `{}` names a dynamic-only interface (use `call.cap` on a live \
-                 handle)",
-                im.name
-            ));
+    let granted = temen_ir::PowerboxHandles {
+        jit: Some(0),
+        stderr: Some(0),
+        ..temen_ir::PowerboxHandles::prefix([0; 5])
+    };
+    let grant = temen_interp::powerbox_grant(&granted, &[]);
+    match temen_interp::powerbox_manifest_bindings(&module.imports, &module.types, &grant) {
+        Ok(_) => Ok(()),
+        Err(refusals) => {
+            let why: Vec<String> = refusals.iter().map(ToString::to_string).collect();
+            Err(format!("refused to start: {}", why.join("; ")))
         }
     }
-    Ok(())
 }
 
 /// Verify `module` (the escape-freedom gate, §2a) and build an [`Instance`] over its manifest: a
@@ -8643,15 +8771,14 @@ impl Instance {
                         jit: Some(jit),
                         stderr: Some(stderr),
                     };
-                    // The one shared powerbox binder (#1524). An unknown name, a capability
-                    // this host did not grant, or a declared signature that is not the
-                    // capability op's: declared but unbound — fail-closed at dispatch.
+                    // The one shared powerbox binder (#1524), which refused at
+                    // instantiation every module whose imports this powerbox cannot bind.
                     h.bind_powerbox_manifest(
                         &self.module.imports,
                         &self.module.types,
-                        &granted,
-                        &[],
-                    );
+                        &temen_interp::powerbox_grant(&granted, &[]),
+                    )
+                    .expect("instantiate refused a manifest the fixed powerbox cannot bind");
                 }
             }
         }
@@ -8661,7 +8788,8 @@ impl Instance {
     /// the outcome (no host capabilities granted — the escape hatch for pure kernel functions).
     fn run_kernel_diff(&self, fidx: FuncIdx, args: &[Value]) -> Result<Run, String> {
         if self.hooks.is_some() {
-            // The bare-kernel JIT path runs hostless, so the hook capability has nowhere to live.
+            // A bare kernel export gets a fresh host with no capabilities, so the hook capability
+            // has nowhere to live.
             return Err(
                 "a mem-hooked instance runs through the powerbox entry (`run`/`run_with_caps`/\
                  `run_diff`/`call(\"_start\")`), not a bare kernel export"
@@ -8669,12 +8797,27 @@ impl Instance {
             );
         }
         let m = &self.module;
+        // #2636 — both lanes run under the same grant, so a kernel that runs out of fuel runs out
+        // on both, and the JIT's lane goes through `jit_run` like every other JIT run.
+        let limits = Limits {
+            fuel: Some(50_000_000),
+            ..Limits::default()
+        };
         let mut h = Host::new();
-        let mut fuel = 50_000_000u64;
+        let mut fuel = limits.fuel();
         let interp = run_with_host(m, fidx, args, &mut fuel, &mut h);
         let slots: Vec<i64> = args.iter().copied().map(value_slot).collect();
-        let jit =
-            compile_and_run(m, fidx, &slots).map_err(|e| format!("JIT compile failed: {e:?}"))?;
+        let (jit, _, _) = jit_run(
+            m,
+            fidx,
+            &slots,
+            &mut Host::new(),
+            &limits,
+            None,
+            None,
+            false,
+            None,
+        )?;
         let outcome = diff_outcome(&m.funcs[fidx as usize].results, interp, jit)?;
         Ok(Run {
             outcome,
@@ -9232,7 +9375,7 @@ mod nim_module_suffix_tests {
     #[test]
     fn it_reproduces_the_build_directories_nimony_names_in_its_own_tree() {
         use super::NIMONY_TREE_PATHS;
-        // Observed verbatim: nimony 650bebb2, run at the root of its tree, built these programs in
+        // Observed verbatim: nimony 4a965c9b, run at the root of its tree, built these programs in
         // `nimcache/c/<stem>/`. `src/lib` is on its search path, so the stem is hashed from a `../`
         // walk, one character shorter than the spelling it was given.
         for (prog, stem) in [

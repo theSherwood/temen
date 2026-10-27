@@ -102,11 +102,7 @@ fn jit_row(site: ParkSite) -> Row {
             issue: 1826,
             why: "the JIT serves no job control",
         },
-        ParkSite::Svc => Row::Unreachable {
-            why:
-                "the JIT's serve loop runs synchronously and never parks: an empty `svc.wait` has \
-                  nothing that could enqueue mid-run, and faults `ThreadFault`",
-        },
+        ParkSite::Svc => Row::Case(svc_beside_a_sibling),
         ParkSite::Reap | ParkSite::ReapAny => Row::Unreachable {
             why: "only a JIT process tree (`jit_proc`) serves `waitpid`, and it never runs durable",
         },
@@ -346,6 +342,14 @@ fn freeze_parked_then_thaw(
     let (res, snap, mut h) = run(engine, &inst, &args, &win, h);
     assert_eq!(res, Ok(0), "{site:?}: the root unwinds for the freeze");
     assert_eq!(h.take_freeze_declined(), None, "{site:?}: not declined");
+    // Every park the freeze ended marked a call whose unwind spilled the mark into its frame, and a
+    // serve op's park marks none (#2627): no re-issue mark stays behind for a later unwind to take.
+    let mark = (TEST_ARENA.region_base(0) + temen_ir::durable_abi::REISSUE_IN_REGION_OFF) as usize;
+    assert_eq!(
+        snap[mark..mark + 4],
+        [0; 4],
+        "{site:?}: the freeze left a re-issue mark in the root's context"
+    );
 
     release(&mut h);
     let fibers = h.frozen_fibers().to_vec();
@@ -866,6 +870,70 @@ block 0 (vx: i64) {
             *ticket.lock().unwrap() = Some(t);
         },
         Ok(1041),
+    );
+    let t = ticket.lock().unwrap().expect("enqueued");
+    assert_eq!(h.svc_result(t), Some(42), "{site:?}: the handler's reply");
+}
+
+/// `svc.wait` beside a sibling — [`svc`] with a sibling running beside the server, whose countdown
+/// fires the freeze while the server waits (the JIT has no freeze-on-quiesce, #1904). The freeze ends
+/// the wait without serving (#2627); the thawed server re-issues its `svc.wait` and serves the
+/// dispatch that arrived after the freeze: `served·1000 + stored`, plus the sibling's `7`, `1048`.
+fn svc_beside_a_sibling(site: ParkSite, engine: Engine) {
+    let src = format!(
+        r#"
+memory 17
+type 0 func (i64) -> (i64)
+type 1 interface {{ bump: 0 }}
+export 0 interface "counter" 1 {{ bump: 3 }}
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vz32 = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vz32 ()
+  vj = thread.join vt
+  vc = i64.const 65600
+  vafter = i64.load vc
+  vk = i64.const 1000
+  vm = i64.mul vn vk
+  vs = i64.add vm vafter
+  vr = i64.add vs vj
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+{SIBLING_LOOP}
+block 2 (va2: i64) {{
+  vr = i64.const 7
+  return vr
+  }}
+}}
+{FIBER}
+func (i64) -> (i64) {{
+block 0 (vx: i64) {{
+  vc = i64.const 65600
+  i64.store vc vx
+  vone = i64.const 1
+  vr = i64.add vx vone
+  return vr
+  }}
+}}
+"#
+    );
+    let ticket = Arc::new(Mutex::new(None));
+    let mut h = freeze_parked_then_thaw(
+        engine,
+        site,
+        &src,
+        |_| vec![],
+        Uninterrupted::WaitsOnTheOutside,
+        arm_in_sibling,
+        |h| {
+            let t = h.svc_enqueue(0, 0, vec![41]).expect("enqueue");
+            *ticket.lock().unwrap() = Some(t);
+        },
+        Ok(1048),
     );
     let t = ticket.lock().unwrap().expect("enqueued");
     assert_eq!(h.svc_result(t), Some(42), "{site:?}: the handler's reply");

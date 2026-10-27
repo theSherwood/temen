@@ -52,7 +52,7 @@ fn grant_io_powerbox(
     fs_seed: Option<&temen_fs::FsSeed>,
     host_caps: &[String],
     parked: &SharedCapRequest,
-) {
+) -> Result<(), Vec<temen_interp::ImportRefusal>> {
     host.stdin = stdin.to_vec();
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     // The §3e prefix + its canonical-name registration — the shared sequence every powerbox host
@@ -98,14 +98,16 @@ fn grant_io_powerbox(
     }
     // The one shared powerbox binder (#1524): the `#912` name→cap table plus this session's raw
     // `HostProc` seams — the #1366 slice (c) host-completed caps declared above, and the #1323
-    // `vm_fs` memfs. Each is a flat `call.sym` (base op 0) with the guest's own op in arg0. A name
-    // the session did not grant (the `Jit` cap, `stderr`), a dynamic-only interface, or an import
-    // whose declared signature is not the capability op's leaves its slot unbound.
+    // `vm_fs` memfs. Each is a flat `call.sym` (base op 0) with the guest's own op in arg0. A
+    // required import the session did not grant (the `Jit` cap, `stderr`), a dynamic-only
+    // interface, or an import whose declared signature is not the capability op's refuses the
+    // launch, as it refuses a run on every other host (#2579).
     let mut seams: Vec<(&str, i32)> = declared.iter().map(|(n, h)| (n.as_str(), *h)).collect();
     if let Some(h) = vm_fs_h {
         seams.push(("vm_fs", h));
     }
-    host.bind_powerbox_manifest(&m.imports, &m.types, &granted, &seams);
+    let grant = temen_interp::powerbox_grant(&granted, &seams);
+    host.bind_powerbox_manifest(&m.imports, &m.types, &grant)
 }
 
 /// Build a [`ScheduledDebugRun`] for `module`'s `func(args)`: under the on-ramp I/O powerbox when
@@ -136,7 +138,8 @@ fn build_run(
 ) -> Option<ScheduledDebugRun> {
     let mut run = if powerbox {
         let mut host = Host::new();
-        grant_io_powerbox(&mut host, module, stdin, fs_seed, host_caps, parked);
+        // A refused manifest fails the launch, as every other launch gate does.
+        grant_io_powerbox(&mut host, module, stdin, fs_seed, host_caps, parked).ok()?;
         if let Some(limit) = mem_limit {
             let mem = RootWindow::fresh(module, temen_ir::default_reserved_log2())
                 .declared
@@ -281,10 +284,10 @@ pub trait Debuggee {
         false
     }
 
-    /// #1366 slice (c) — the declared host-completed cap the session is parked on: `(name, args)`
-    /// for the `stopped{reason:"cap"}` event's `capName`/`args`. `None` when not parked on a
-    /// declared cap (or on a backend without declared caps). Default: none.
-    fn cap_park_request(&self) -> Option<(String, Vec<i64>)> {
+    /// #1366 slice (c) — the declared host-completed cap the session is parked on: `(name, op,
+    /// args)` for the `stopped{reason:"cap"}` event's `capName`/`op`/`args`. `None` when not parked
+    /// on a declared cap (or on a backend without declared caps). Default: none.
+    fn cap_park_request(&self) -> Option<(String, u32, Vec<i64>)> {
         None
     }
 
@@ -1572,10 +1575,11 @@ impl Debuggee for BytecodeBackend {
             .remove(&id);
         request.map(|r| r.completer.complete(value)).is_some()
     }
-    fn cap_park_request(&self) -> Option<(String, Vec<i64>)> {
+    fn cap_park_request(&self) -> Option<(String, u32, Vec<i64>)> {
         let parked = self.run.cap_parked()?;
         let g = self.parked_cap.lock().unwrap_or_else(|e| e.into_inner());
-        g.get(&parked).map(|r| (r.name.clone(), r.args.clone()))
+        g.get(&parked)
+            .map(|r| (r.name.clone(), r.op, r.args.clone()))
     }
     /// The guest's captured stdout at the current stop (the on-ramp powerbox's `write` output). On a
     /// reverse `seek` the run is rebuilt and replayed to the earlier point, so this reflects exactly the

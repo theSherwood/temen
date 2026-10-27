@@ -6,6 +6,11 @@
 // answered cap parks (`onCapPark`) and reported traps (`trapDeclines: false`). `runCases` reports what
 // each run did; the caller checks it.
 
+import { onCap as jsCaps } from './coop-embedder-jscaps.mjs';
+
+// Where executor 2's Workers import the same capabilities from (`capModule`, #2645).
+const JS_CAPS_MODULE = new URL('./coop-embedder-jscaps.mjs', import.meta.url).href;
+
 const COOP_LEAF_ROOT = 1;
 const COOP_LEAF_SUSPENDS = 2;
 const COOP_NO_REGIONS = 4;
@@ -211,11 +216,171 @@ block 0 () {
 export 0 func "_start" 0
 `;
 export const JS_CAPS_OUT = 'SHOUT\n';
-// The embedder's half: slot 0 is `js.upper`, through the call's window view; slot 1 `js.add`.
-const jsCaps = (slot, op, args, mem) => {
-  if (slot === 1) return args[0] + args[1];
-  return mem.write(args[0], mem.str(args[0], args[1]).toUpperCase()) ? args[1] : -1n;
-};
+
+// #2579 — on executor 2, `JS_CAPS`'s calls made by a thread of the root, on a Worker of its own: it
+// uppercases "shout\n" and doubles its length, and returns 1000 * the first byte of the window it
+// wrote + 12: 83012.
+const JS_CAPS_THREAD = `memory 16
+import 0 "js.upper" (i64, i64) -> (i64)
+import 1 "js.add" (i64, i64) -> (i64)
+data 34816 "shout\\n"
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vr = thread.join vt
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vp = i64.const 34816
+  vl = i64.const 6
+  vn = call.import 0 (vp, vl)
+  vs = call.import 1 (vn, vn)
+  vb = i64.load8_u vp
+  vk = i64.const 1000
+  vm = i64.mul vb vk
+  vr = i64.add vm vs
+  return vr
+  }
+}
+export 0 func "_start" 0
+`;
+export const JS_CAPS_THREAD_VALUE = 83012n;
+
+// #2579 — a detached child's call to a JS capability its root re-granted it by name: on executor 2
+// the child's window is a memory of its own, which the page reads and writes through the call's
+// view. The root spawns the staged module `kid` (an op-17 record at 35328 granting `js.upper` from
+// the record at 35072), joins it and returns what it returns: 1000 * the first byte of its window
+// after the call ('C') + the length the call returned, 67006.
+const JS_CAPS_KID = `memory 16
+import 0 "js.upper" (i64, i64) -> (i64)
+data 34816 "child\\n"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vp = i64.const 34816
+  vl = i64.const 6
+  vn = call.import 0 (vp, vl)
+  vb = i64.load8_u vp
+  vk = i64.const 1000
+  vm = i64.mul vb vk
+  vr = i64.add vm vn
+  return vr
+  }
+}
+`;
+const le = (v, n) => Array.from({ length: n }, (_, i) => `\\x${((v >>> (8 * i)) & 0xff).toString(16).padStart(2, '0')}`).join('');
+// The 64-byte spawn record: a 64 KiB window, no pager, the module and budget stored at run time,
+// one named grant at 35072, no args, no region.
+const KID_REC = le(16, 4) + le(-1, 4) + le(0, 8) + le(35072, 4) + le(0, 4) + le(1, 4) + le(0, 4)
+  + le(0, 16) + le(-1, 4) + le(0, 4) + le(0, 8);
+const JS_CAPS_CHILD = `memory 16
+data 34816 "instantiator"
+data 34832 "kid"
+data 34840 "budget"
+data 34848 "js.upper"
+data 35328 "${KID_REC}"
+func () -> (i64) {
+block 0 () {
+  vip = i64.const 34816
+  vil = i64.const 12
+  vinst = self.resolve vip vil
+  vkp = i64.const 34832
+  vkl = i64.const 3
+  vkid = self.resolve vkp vkl
+  vbp = i64.const 34840
+  vbl = i64.const 6
+  vbud = self.resolve vbp vbl
+  vjp = i64.const 34848
+  vjl = i64.const 8
+  vjs = self.resolve vjp vjl
+  vg = i64.const 35072
+  vgn = i32.const 34848
+  i32.store vg vgn
+  vgl = i32.const 8
+  i32.store vg vgl offset=4
+  i32.store vg vjs offset=8
+  vgf = i32.const 0
+  i32.store vg vgf offset=12
+  vrp = i64.const 35328
+  i32.store vrp vkid offset=8
+  i32.store vrp vbud offset=12
+  vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vst, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  return vj
+  }
+}
+export 0 func "_start" 0
+`;
+export const JS_CAPS_CHILD_VALUE = 67006n;
+
+// #2645 — a thread's JS call that waits for another thread's host calls: thread B writes a byte to
+// stdout, then counts it at 40960, until thread A is done (the word at 40968); A waits until B has
+// counted one, then calls `js.waitFor` (slot 2) on the counter. A call that held the domain's host
+// kept B's writes out until it gave up (0); one that lets it go sees them (1). A waits for B first
+// because a call answered on the page holds the page, which starts the run's Workers. The root
+// returns A's answer.
+const JS_CAPS_WAITS = `memory 16
+import 0 "js.waitFor" (i64, i64) -> (i64)
+import 1 "write" (i64, i64) -> (i64)
+data 34816 "."
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  va = thread.spawn 1 vz vz
+  vb = thread.spawn 2 vz vz
+  vra = thread.join va
+  vrb = thread.join vb
+  return vra
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  br 1(vsp)
+}
+block 1 (vs1: i64) {
+  vc = i64.const 40960
+  vn = i64.load vc
+  vz = i64.const 0
+  vnone = i64.eq vn vz
+  br_if vnone 1(vs1) 2(vs1)
+}
+block 2 (vs2: i64) {
+  vc2 = i64.const 40960
+  vmore = i64.const 100
+  vr = call.import 0 (vc2, vmore)
+  vd = i64.const 40968
+  vone = i64.const 1
+  i64.store vd vone
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz0 = i64.const 0
+  br 1(vz0)
+}
+block 1 (vn: i64) {
+  vp = i64.const 34816
+  vl = i64.const 1
+  vw = call.import 1 (vp, vl)
+  vone = i64.const 1
+  vn2 = i64.add vn vone
+  vc = i64.const 40960
+  i64.store vc vn2
+  vd = i64.const 40968
+  vdone = i64.load vd
+  vz1 = i64.const 0
+  vgo = i64.eq vdone vz1
+  br_if vgo 1(vn2) 2(vn2)
+}
+block 2 (vr: i64) {
+  return vr
+  }
+}
+export 0 func "_start" 0
+`;
 
 export const pong = (x) => 2n * x + 1n;
 export const PINGS = 30;
@@ -308,15 +473,6 @@ export async function runCases({ ex, memory, drive, suspends }) {
     if (stageJsCaps(['js.upper', 'js.add']).join() !== '0,1') throw new Error('stage the JS caps');
     if (open(JS_CAPS, [], mode) !== 0) throw new Error(`open ${key}: ${ex.temen_status()}`);
     results[key] = await run({ onCap: jsCaps });
-  }
-  // Executor 2 refuses a run with a staged JS capability: its tasks' Workers cannot call it.
-  if (ex.temen_par_powerbox_onramp) {
-    stageJsCaps(['js.add']);
-    const bytes = encode(JS_CAPS);
-    const mp = put(bytes);
-    results.x2RefusesJsCaps = ex.temen_par_powerbox_onramp(mp, bytes.length, 0, 0, 0, 0, 0) === 0;
-    ex.temen_dealloc(mp, bytes.length);
-    ex.temen_onramp_stage_clear();
   }
   if (open(pingGuest(PINGS), ['ping'], leafMode) !== 0) throw new Error('open ping to stop');
   results.stopAtPark = await run({ stopAtPark: 3 });
@@ -441,15 +597,43 @@ export async function runX2Cases({ par, eng }) {
   // ran there and whether the run took its root whole as a leaf (#1414 5c). A run still going after
   // `X2_HANG_MS` is stopped, and the cases end there with what the page saw of it: the harness
   // fails rather than hangs.
-  const go = async (src, { caps = [], stopAtPark, answerAfter = 0, fed = false, onIdle, start, tierup = false } = {}) => {
-    const seen = { out: '', parks: 0, idles: 0 };
+  // #2579: what the page stages for the next open, as the pump's cases stage it: JS capabilities
+  // (each takes the next slot) and child modules by name.
+  const put = (bytes) => {
+    const p = Number(ex.temen_alloc(bytes.length || 1));
+    new Uint8Array(memory.buffer).set(bytes, p);
+    return p;
+  };
+  const stage = (js, kids) => {
+    js.forEach((name, slot) => {
+      const b = enc.encode(name);
+      const p = put(b);
+      if (ex.temen_onramp_stage_js_cap(p, b.length) !== slot) throw new Error(`stage ${name}`);
+      ex.temen_dealloc(p, b.length || 1);
+    });
+    for (const [name, src] of kids) {
+      const n = enc.encode(name), m = parsed(src);
+      const np = put(n), mp = put(m);
+      if (ex.temen_onramp_stage_module(np, n.length, mp, m.length) !== 0) throw new Error(`stage ${name}`);
+      ex.temen_dealloc(np, n.length || 1);
+      ex.temen_dealloc(mp, m.length || 1);
+    }
+  };
+  const go = async (src, { caps = [], stopAtPark, answerAfter = 0, fed = false, onIdle, start, tierup = false, js = [], kids = [], onCap, capModule } = {}) => {
+    const seen = { out: '', parks: 0, idles: 0, capCalls: 0 };
     const abort = new AbortController();
+    stage(js, kids);
     const r = run(parsed(src), {
       onramp: true,
       caps,
       tierup,
       stdinLater: fed,
       signal: abort.signal,
+      onCap: onCap && ((...call) => {
+        seen.capCalls++;
+        return onCap(...call);
+      }),
+      capModule,
       onOutput: (o) => { seen.out += dec.decode(o); },
       onCapPark: async ({ index, args }) => {
         seen.parks++;
@@ -475,7 +659,7 @@ export async function runX2Cases({ par, eng }) {
     try {
       const done = await Promise.race([r, hung]);
       const leaf = ex.temen_x2_leaf_len(0) > 0;
-      return { value: done.value, tierups: done.tierups, leaf, ...seen };
+      return { value: done.value, tierups: done.tierups, childMems: done.childMems, leaf, ...seen };
     } catch (e) {
       if (e.hung) throw e;
       return { error: e.message, faultAddr: e.faultAddr, ...seen };
@@ -520,6 +704,20 @@ export async function runX2Cases({ par, eng }) {
     },
   });
   results.faults = await go(FAULTS);
+  // #2579: JS capabilities answered inside each call, each task's Worker waiting inside it while the
+  // page answers: the root's (interpreted, and run whole as a leaf), a thread's, and a detached
+  // child's over a memory of its own.
+  // #2645: the same, answered by the capabilities' module in each calling task's own Worker, and a
+  // thread's call that waits for another thread's host calls, which go on while it waits.
+  const caps3 = ['js.upper', 'js.add', 'js.waitFor'];
+  for (const [at, answered] of [['', { onCap: jsCaps }], ['InWorker', { capModule: JS_CAPS_MODULE }]]) {
+    const upperAdd = { js: ['js.upper', 'js.add'], ...answered };
+    results[`jsCaps${at}`] = await go(JS_CAPS, upperAdd);
+    results[`jsCapsLeaf${at}`] = await go(JS_CAPS, { ...upperAdd, tierup: true });
+    results[`jsCapsThread${at}`] = await go(JS_CAPS_THREAD, upperAdd);
+    results[`jsCapsChild${at}`] = await go(JS_CAPS_CHILD, { js: ['js.upper'], kids: [['kid', JS_CAPS_KID]], ...answered });
+    results[`jsCapsWaits${at}`] = await go(JS_CAPS_WAITS, { js: caps3, ...answered });
+  }
   // #1414 5c: the root as a leaf, which parks where the page answers its calls, and where it reads
   // stdin the page feeds as it idles.
   results.leafPings = await go(pingGuest(PINGS), { caps: ['ping'], tierup: true });

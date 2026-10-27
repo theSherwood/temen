@@ -56,3 +56,55 @@ fn hello_onramp_prints_through_the_powerbox() {
         "the guest's write(1, …) must reach the captured stdout stream",
     );
 }
+
+/// A manifest import no on-ramp grant answers to **refuses the run before it starts** (IMPORTS.md
+/// §2.1, #2579), as `temen-run` refuses it natively and a child's spawn refuses it (#2219): the
+/// guest never runs, so it never reaches the import that would have faulted, and the run's notes
+/// name the import (`temen_notes_len`). Until #2579 the on-ramp left the slot empty and ran the
+/// program until its first call through it.
+#[test]
+fn an_import_nothing_grants_refuses_the_run_and_the_notes_name_it() {
+    let src = r#"memory 16
+type 0 func (i64) -> (i64)
+import 0 func "frobnicate" 0
+export 0 func "_start" 0
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 7
+  return v0
+  }
+}
+"#;
+    let m = temen_text::parse_module(src).expect("parse");
+    let out = onramp_exec(&m, b"");
+    assert_eq!(out.status, STATUS_UNSUPPORTED, "refused before it starts");
+    assert_eq!(
+        temen_browser::last_notes(),
+        vec!["refused the run: no grant satisfies its import `frobnicate`".to_string()]
+    );
+}
+
+/// The POSIX open binds through the same binder (#2579): an import neither the personality's
+/// ops (`__px_<op>`) nor the core's memory ops serve refuses the run, as `temen_posix::bind`
+/// refuses it natively. It used to bind empty and fault at the call.
+#[test]
+fn a_posix_program_with_an_import_the_personality_lacks_is_refused() {
+    let src = r#"memory 16
+type 0 func (i64) -> (i64)
+import 0 func "__px_frobnicate" 0
+export 0 func "_start" 0
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 0
+  return v0
+  }
+}
+"#;
+    let m = temen_text::parse_module(src).expect("parse");
+    let out = temen_browser::bash_exec(&m, &[b"prog"], b"");
+    assert_eq!(out.status, STATUS_UNSUPPORTED, "refused before it starts");
+    assert_eq!(
+        temen_browser::last_notes(),
+        vec!["refused the run: no grant satisfies its import `__px_frobnicate`".to_string()]
+    );
+}

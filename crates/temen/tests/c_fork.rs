@@ -39,7 +39,7 @@ use temen_ir::SpawnRec;
 fn sync_handler(h: ProcHandler) -> HostProc {
     match h {
         ProcHandler::Sync(f) => f,
-        ProcHandler::Offloadable(_) => panic!("posix mints a synchronous handler"),
+        _ => panic!("posix mints a synchronous handler"),
     }
 }
 

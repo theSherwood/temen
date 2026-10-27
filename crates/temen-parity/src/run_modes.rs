@@ -543,10 +543,6 @@ pub fn exception(f: Feature, c: Config) -> Option<Cell> {
             "the bytecode tier's durable entry takes a flat window, so a thaw traps MemoryFault \
              on a page the run mapped past its declared memory (#2628)",
         ),
-        (Serving, Cranelift) if durable => not_yet(
-            "a serve op under a landed freeze drains its queue, so the thaw's re-issued poll \
-             answers 0 where the run served 2 (#2627)",
-        ),
         _ => return None,
     })
 }
@@ -792,20 +788,30 @@ fn pair_cell(p: Property, q: Property) -> Summary {
     fold(runs)
 }
 
-/// Fold a cell's runs, each named by what varies across the cell. No runs is ❔.
-fn fold(runs: Vec<(String, Cell)>) -> Summary {
-    if runs.is_empty() {
-        return UNAUDITED;
+/// **The fold rule**: the status of a cell whose runs have `statuses` — every run full ✅, any
+/// known gap 🚧, every run declined ⛔, any other mix 🔶 — or `None` for no runs. The frontier
+/// matrix folds its run-driven axes by it too (#2545 D3a).
+pub fn fold_status(statuses: &[Status]) -> Option<Status> {
+    if statuses.is_empty() {
+        return None;
     }
-    let all = |s| runs.iter().all(|(_, c)| c.status == s);
-    let status = if all(Status::Full) {
+    let all = |s| statuses.iter().all(|x| *x == s);
+    Some(if all(Status::Full) {
         Status::Full
-    } else if runs.iter().any(|(_, c)| c.status == Status::NotYet) {
+    } else if statuses.contains(&Status::NotYet) {
         Status::NotYet
     } else if all(Status::Declines) {
         Status::Declines
     } else {
         Status::Conditional
+    })
+}
+
+/// Fold a cell's runs, each named by what varies across the cell. No runs is ❔.
+fn fold(runs: Vec<(String, Cell)>) -> Summary {
+    let statuses: Vec<Status> = runs.iter().map(|(_, c)| c.status).collect();
+    let Some(status) = fold_status(&statuses) else {
+        return UNAUDITED;
     };
     let mut notes: Vec<Note> = Vec::new();
     for (who, c) in runs.into_iter().filter(|(_, c)| c.status != Status::Full) {

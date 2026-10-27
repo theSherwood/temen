@@ -460,8 +460,10 @@ export function endSession(session) {
 // - `onSlice()`: called, and awaited, when a slice is spent — interpreted or a leaf's. Resolve to carry on; resolve to `false` to
 //   stop the run here (the session is closed and the driver returns `null`). This is where an embedder
 //   yields to its event loop, and where it waits out a Pause.
-// - `onCapPark({ id, index, args })`: a call to a declared host-completed cap (`temen_coop_open`'s
-//   caps) parked its task: `index` names the cap, `args` are its arguments. Resolve to the call's
+// - `onCapPark({ id, index, op, args })`: a call to a declared host-completed cap (`temen_coop_open`'s
+//   caps) parked its task, in any domain of the run (a child the cap was re-granted to files its
+//   calls here too): `index` names the cap, `op` is the op the call dispatched with (0 for a flat
+//   `call.sym` import, whose own op rides in `args[0]`), `args` are its arguments. Resolve to the call's
 //   result (a Number or BigInt) and the driver delivers it before its next pump; resolve to `null`
 //   to stop the run, as `onSlice` can. The run goes on meanwhile (#2557): its other tasks run, and
 //   its timers fire in the page's time. With nothing left to run, the driver waits for an answer
@@ -724,8 +726,8 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
         continue;
       }
       if (ev === 6 /* COOP_RUN_CAP_PARK */) {
-        // #1954: a declared cap call parked its task — `[id, cap index, args…]` — until it is
-        // answered. #2557: the run goes on meanwhile, and the answer is delivered once it comes.
+        // #1954: a declared cap call parked its task — `[id, cap index, op, args…]` — until it
+        // is answered. #2557: the run goes on meanwhile, and the answer is delivered once it comes.
         if (!onCapPark) {
           stopped = true;
           break;
@@ -733,7 +735,8 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
         const n = ex.temen_coop_cap_len();
         const words = new BigInt64Array(memory.buffer, Number(ex.temen_coop_cap_ptr()), n).slice();
         const id = words[0];
-        Promise.resolve(onCapPark({ id, index: Number(words[1]), args: Array.from(words.slice(2)) }))
+        const call = { id, index: Number(words[1]), op: Number(words[2]), args: Array.from(words.slice(3)) };
+        Promise.resolve(onCapPark(call))
           .then((value) => ({ id, ok: true, value }), (error) => ({ id, ok: false, error }))
           .then((a) => {
             answers.push(a);

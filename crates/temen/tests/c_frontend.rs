@@ -65,7 +65,9 @@ fn bind_imports(h: &mut Host, m: &temen_ir::Module, handles: &[Value; 7]) {
         stderr: None,
     };
     // The one shared powerbox binder (#1524).
-    h.bind_powerbox_manifest(&m.imports, &m.types, &granted, &[]);
+    let grant = temen_interp::powerbox_grant(&granted, &[]);
+    h.bind_powerbox_manifest(&m.imports, &m.types, &grant)
+        .expect("the C program's manifest binds on the test powerbox");
 }
 
 /// The **7-handle test powerbox** — the product's six (stdout, stdin, exit, memory, addrspace

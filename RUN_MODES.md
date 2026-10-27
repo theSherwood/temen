@@ -87,7 +87,7 @@ The property rows are the columns' properties again.
 | grows its window | ✅ | ✅ | ✅ | ✅ | ✅ | 🚧 | ✅ | ❔ | ❔ | ❔ | ❔ |
 | maps a shared region (§13) | ✅ | ✅ | ✅ | 🔶 | ✅ | 🔶 | ✅ | ❔ | ❔ | ❔ | ❔ |
 | compiles code at runtime (§22) | ✅ | ✅ | ✅ | ✅ | 🚧 | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ |
-| serves calls on its offer | ✅ | ✅ | ✅ | ✅ | ✅ | 🚧 | ✅ | ❔ | ❔ | ❔ | ❔ |
+| serves calls on its offer | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ |
 
 ## Properties
 
@@ -152,9 +152,6 @@ The property rows are the columns' properties again.
 **compiles code at runtime (§22)**
 - *under a debugger* 🚧 — tree-walk interpreter: the tree-walk Inspector traps IndirectCallType at the installed unit's call.dyn (#2560)
 
-**serves calls on its offer**
-- *frozen and thawed* 🚧 — Cranelift JIT: a serve op under a landed freeze drains its queue, so the thaw's re-issued poll answers 0 where the run served 2 (#2627)
-
 **under a debugger**
 - *tree-walk interpreter* 🚧 — spawns a child domain (§14): the tree-walk Inspector runs one vCPU over the powerbox, or every vCPU over none, so a child's join blocks (#2560)
 - *tree-walk interpreter* 🚧 — forks itself (clone_caller): the tree-walk Inspector blocks on a fork (#2560)
@@ -184,5 +181,4 @@ The property rows are the columns' properties again.
 - *Cranelift JIT* 🚧 — makes a call the embedder answers: a durable run declines a host-answered call with CapFault before its embedder sees it: no caller in a durable run parks on a call (#2504)
 - *Cranelift JIT* 🚧 — is stopped and continued (job control): serves no job control, so a stopped process runs on (#1826)
 - *Cranelift JIT* 🔶 — maps a shared region (§13): for a region over an OS shared-memory object (temen_run::new_shared_region), which the JIT maps by its descriptor; a software-only one (Host::grant_shared_region) has none, so its map answers -EINVAL there
-- *Cranelift JIT* 🚧 — serves calls on its offer: a serve op under a landed freeze drains its queue, so the thaw's re-issued poll answers 0 where the run served 2 (#2627)
 

@@ -9,7 +9,9 @@
 //! then run on the Cranelift JIT under the MVP powerbox (§3e): bytes it writes to `stdout`/
 //! `stderr` go to the real streams, and it terminates with the guest's exit code (`Exit(code)`
 //! or `main`'s return value). A bare kernel (a non-powerbox entry) is run with zero args and its
-//! result printed. A guest that traps is detect-and-killed (§5) and reported on stderr.
+//! result printed. Every run, a bare kernel included, gets the same root grant and deadline from the
+//! environment (`TEMEN_FUEL`, …, `TEMEN_DEADLINE_MS`; see `--help`). A guest that traps is
+//! detect-and-killed (§5) and reported on stderr.
 //!
 //! `--interactive` (the default when stdin is a terminal) wires the process's real stdin to the
 //! guest's `read` a line at a time, and streams the guest's stdout as it is written — so a REPL
@@ -191,25 +193,7 @@ fn try_main() -> Result<(), String> {
     }
 
     if is_named_powerbox_entry(&module) {
-        // §5 kill-path: `TEMEN_DEADLINE_MS` (CLI policy) bounds a possibly-runaway guest so it is
-        // detect-and-killed after the deadline instead of hanging the process; unset ⇒ unbounded.
-        let deadline = std::env::var("TEMEN_DEADLINE_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|&ms| ms > 0)
-            .map(std::time::Duration::from_millis);
-        // #2113 — the root's grant (CLI policy): `TEMEN_FUEL`, `TEMEN_MEM`, `TEMEN_CHANNEL`,
-        // `TEMEN_SPAWN` and `TEMEN_MAPS` bound the run, a fiber or thread bomb included; each unset
-        // is the default grant.
-        let env_u64 = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<u64>().ok());
-        let limits = Limits {
-            fuel: env_u64("TEMEN_FUEL"),
-            deadline,
-            mem: env_u64("TEMEN_MEM"),
-            channel: env_u64("TEMEN_CHANNEL"),
-            spawn: env_u64("TEMEN_SPAWN"),
-            maps: env_u64("TEMEN_MAPS"),
-        };
+        let limits = cli_limits();
         // The guest's `argv`: when the user passes `-- <args>`, the input file name is `argv[0]`
         // and the post-`--` tokens follow. When *no* `--` args are given, pass an empty vector so the
         // runner seeds **no** args buffer (`init_mem` stays `None`, byte-identical to a bare run) —
@@ -260,9 +244,29 @@ fn try_main() -> Result<(), String> {
     } else {
         // A bare kernel: run entry 0 with zero args and print its result values.
         let args = vec![0i64; module.funcs[0].params.len()];
-        let results = run_kernel(&module, &args)?;
+        let results = run_kernel(&module, &args, &cli_limits())?;
         println!("{results:?}");
         Ok(())
+    }
+}
+
+/// The run's root grant and deadline (CLI policy), the same for every entry kind (#2636): a
+/// powerbox program, a bare kernel and a `--specialize` residual.
+/// - #2113 — `TEMEN_FUEL`, `TEMEN_MEM`, `TEMEN_CHANNEL`, `TEMEN_SPAWN` and `TEMEN_MAPS` bound the
+///   run, a fiber or thread bomb included; each unset is the default grant.
+/// - §5 kill-path: `TEMEN_DEADLINE_MS` bounds a possibly-runaway guest so it is detect-and-killed
+///   after the deadline instead of hanging the process; unset ⇒ unbounded.
+fn cli_limits() -> Limits {
+    let env_u64 = |k: &str| env::var(k).ok().and_then(|s| s.parse::<u64>().ok());
+    Limits {
+        fuel: env_u64("TEMEN_FUEL"),
+        deadline: env_u64("TEMEN_DEADLINE_MS")
+            .filter(|&ms| ms > 0)
+            .map(std::time::Duration::from_millis),
+        mem: env_u64("TEMEN_MEM"),
+        channel: env_u64("TEMEN_CHANNEL"),
+        spawn: env_u64("TEMEN_SPAWN"),
+        maps: env_u64("TEMEN_MAPS"),
     }
 }
 
@@ -321,7 +325,7 @@ fn run_specialize(
                 run_args.len()
             ));
         }
-        let results = run_kernel(&residual, &run_args)?;
+        let results = run_kernel(&residual, &run_args, &cli_limits())?;
         println!("{results:?}");
         Ok(())
     }

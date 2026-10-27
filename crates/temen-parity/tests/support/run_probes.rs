@@ -4,6 +4,13 @@
 //!
 //! The programs are the smallest each feature's own tests run on several engines, so a probe's
 //! answer is one those tests already pin on the oracle.
+//!
+//! The embedder a runner plays ([`Embedder`], [`Stopper`], [`Outside`]) is here too, so
+//! `axis_conformance.rs`, which runs the frontier's capability probes on the same runners, includes
+//! this module for it.
+
+// Each including binary uses a subset: the frontier's runs use only the embedder and its registrar.
+#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -16,6 +23,8 @@ use temen_interp::{
 use temen_ir::durable_abi::ShadowArena;
 use temen_ir::{Module, SpawnRec};
 use temen_parity::run_modes::Feature;
+
+use crate::support::capability_probe;
 
 /// One feature's probe.
 #[derive(Clone, Copy)]
@@ -111,10 +120,12 @@ pub fn instrumented(m: &Module) -> Result<Module, String> {
 /// setup grants ([`grant_named`]), and what its registrar grants again when it thaws the run
 /// (#1455). A registrar re-grants a synchronous procedure, so `"plus100"`, which two setups grant
 /// as an offloadable one, comes back synchronous: a durable run waits on a pool call inline anyway
-/// (#2504).
+/// (#2504). The frontier matrix's capability probes run on this embedder too, so it also serves
+/// their `HostProc` row's procedure.
 pub fn named_proc(name: &str, e: &Embedder) -> Option<HostProc> {
     let s = Arc::clone(&e.stopper);
     Some(match name {
+        capability_probe::ZERO => capability_probe::zero(),
         "plus100" => Box::new(|_op, args, _mem, _minter| Ok(vec![plus_100(args)])),
         "stop" => Box::new(move |_op, _args, _mem, _minter| {
             s.set(true);

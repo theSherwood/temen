@@ -207,24 +207,24 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 
 | op | temen-tree-walk | temen-bytecode | temen-jit | temen-wasm-jit | notes |
 |----|:----:|:----:|:----:|:----:|-------|
-| `i32.atomic.load` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
-| `i32.atomic.store` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
-| `i32.atomic.rmw.add` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
-| `i32.atomic.rmw.sub` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
-| `i32.atomic.rmw.and` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
-| `i32.atomic.rmw.or` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
-| `i32.atomic.rmw.xor` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
-| `i32.atomic.rmw.xchg` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
-| `i32.atomic.cmpxchg` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
-| `i64.atomic.load` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
-| `i64.atomic.store` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
-| `i64.atomic.rmw.add` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
-| `i64.atomic.rmw.sub` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
-| `i64.atomic.rmw.and` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
-| `i64.atomic.rmw.or` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
-| `i64.atomic.rmw.xor` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
-| `i64.atomic.rmw.xchg` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
-| `i64.atomic.cmpxchg` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
+| `i32.atomic.load` | ✅ | ✅ | ✅ | ✅ | hardware atomic over a shared memory, plain sequence over an unshared one |
+| `i32.atomic.store` | ✅ | ✅ | ✅ | ✅ | hardware atomic over a shared memory, plain sequence over an unshared one |
+| `i32.atomic.rmw.add` | ✅ | ✅ | ✅ | ✅ | hardware atomic over a shared memory, plain sequence over an unshared one |
+| `i32.atomic.rmw.sub` | ✅ | ✅ | ✅ | ✅ | hardware atomic over a shared memory, plain sequence over an unshared one |
+| `i32.atomic.rmw.and` | ✅ | ✅ | ✅ | ✅ | hardware atomic over a shared memory, plain sequence over an unshared one |
+| `i32.atomic.rmw.or` | ✅ | ✅ | ✅ | ✅ | hardware atomic over a shared memory, plain sequence over an unshared one |
+| `i32.atomic.rmw.xor` | ✅ | ✅ | ✅ | ✅ | hardware atomic over a shared memory, plain sequence over an unshared one |
+| `i32.atomic.rmw.xchg` | ✅ | ✅ | ✅ | ✅ | hardware atomic over a shared memory, plain sequence over an unshared one |
+| `i32.atomic.cmpxchg` | ✅ | ✅ | ✅ | ✅ | hardware atomic over a shared memory, plain sequence over an unshared one |
+| `i64.atomic.load` | ✅ | ✅ | ✅ | ✅ | hardware atomic over a shared memory, plain sequence over an unshared one |
+| `i64.atomic.store` | ✅ | ✅ | ✅ | ✅ | hardware atomic over a shared memory, plain sequence over an unshared one |
+| `i64.atomic.rmw.add` | ✅ | ✅ | ✅ | ✅ | hardware atomic over a shared memory, plain sequence over an unshared one |
+| `i64.atomic.rmw.sub` | ✅ | ✅ | ✅ | ✅ | hardware atomic over a shared memory, plain sequence over an unshared one |
+| `i64.atomic.rmw.and` | ✅ | ✅ | ✅ | ✅ | hardware atomic over a shared memory, plain sequence over an unshared one |
+| `i64.atomic.rmw.or` | ✅ | ✅ | ✅ | ✅ | hardware atomic over a shared memory, plain sequence over an unshared one |
+| `i64.atomic.rmw.xor` | ✅ | ✅ | ✅ | ✅ | hardware atomic over a shared memory, plain sequence over an unshared one |
+| `i64.atomic.rmw.xchg` | ✅ | ✅ | ✅ | ✅ | hardware atomic over a shared memory, plain sequence over an unshared one |
+| `i64.atomic.cmpxchg` | ✅ | ✅ | ✅ | ✅ | hardware atomic over a shared memory, plain sequence over an unshared one |
 | `atomic.fence` | ✅ | ✅ | ✅ | ✅ |  |
 | `i32.atomic.wait` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 / Windows x86-64 (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `atomic.notify` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 / Windows x86-64 (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
