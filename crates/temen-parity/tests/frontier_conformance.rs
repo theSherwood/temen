@@ -9,23 +9,22 @@
 //! #1412 found three times over — three tests, in three crates, each individually coherent and each
 //! asserting a divergence the invariants forbid, all green.
 //!
-//! Two axes are checked here because two axes are decided by an explicit, wildcard-free predicate in
-//! the tree:
+//! Two axes are checked here against an explicit, wildcard-free predicate in the tree:
 //!
 //! | axis | predicate |
 //! |---|---|
 //! | nesting | `Host::can_regrant` (via `Host::spawn_detached_child`, its public route) |
-//! | durability | the `NonDurableKind` match in `Host::capture_durable_handles` |
+//! | durability, for the rows no capability probe mints | the `NonDurableKind` match in `Host::capture_durable_handles` |
 //!
-//! Four more axes — `debugger`, `concurrency`, `backend`, `code origin` — have no single predicate
-//! to read, so they are driven by their own tests beside this one (`debugger_conformance.rs`,
-//! `concurrency_conformance.rs`, `backend_conformance.rs`, `code_origin_conformance.rs`). The
-//! remaining one states the
-//! manifest's belief and are rendered `Unaudited` until their predicate is locatable. That is
-//! deliberate: an unaudited cell is visible and countable, and this test asserts the count only
-//! moves in one direction.
+//! The rest are run by the tests beside this one. `backend`, `concurrency`, `debugger` and the
+//! durability of every row the capability probes mint run on the run-mode matrix's runners
+//! (`axis_conformance.rs`), and code origin from a unit and from the base module
+//! (`code_origin_conformance.rs`). The remaining axis, `target`, has no runner yet, so its cells
+//! are rendered `Unaudited`. That is deliberate: an unaudited cell is visible and countable, and
+//! this test asserts the count only moves in one direction.
 
 mod support;
+use support::capability_probe::rows;
 use support::cites_an_issue;
 use temen_interp::{DurableBinding, Host, Lease, NonDurableKind, StreamRole, WINDOW_RUNS};
 use temen_parity::frontier::{capability_axes, Axis, Capability};
@@ -115,9 +114,10 @@ fn the_nesting_column_matches_what_a_child_can_actually_be_granted() {
     }
 }
 
-/// **Durability.** The manifest's `durability` cell must match the `NonDurableKind` classifier: a
-/// `Full` cell means a freeze carries the handle, a `Declines` cell means `drain_non_durable` takes
-/// it.
+/// **Durability, where no run reaches.** The capability probes freeze and thaw every row they mint
+/// (`axis_conformance.rs`). For a row they cannot mint, the manifest's `durability` cell must match
+/// the `NonDurableKind` classifier: a `Full` cell means a freeze carries the handle, a `Declines`
+/// cell means `drain_non_durable` takes it. Of the rows minted here, that leaves `Jit`.
 ///
 /// Compared by *kind* rather than by slot: the kind is the classifier's own output, so a mismatch
 /// names the binding the classifier disagreed about rather than a table index.
@@ -133,7 +133,8 @@ fn the_durability_column_matches_the_durable_capture_classifier() {
         .map(|h| h.kind)
         .collect();
 
-    for (cap, _) in pairs {
+    let run: Vec<Capability> = rows().into_iter().map(|r| r.cap).collect();
+    for (cap, _) in pairs.into_iter().filter(|(c, _)| !run.contains(c)) {
         let claimed = capability_axes(cap)[d].status;
         let kind = non_durable_kind_of(cap);
         let was_drained = kind.is_some_and(|k| drained.contains(&k));
@@ -211,12 +212,12 @@ fn the_uncheckable_rows_are_exactly_the_ones_that_need_a_live_peer_or_a_host_clo
 }
 
 /// Coverage may only improve. A cell that was audited must not silently revert to `Unaudited`, and
-/// the two axes whose predicate classifies *every* row must stay fully audited.
+/// the two axes that classify *every* row must stay fully audited: nesting's predicate reaches each
+/// row, and durability runs each row a probe mints and classifies the rest.
 ///
-/// The four driven axes — `debugger`, `concurrency`, `backend`, `code origin` — are not in that
-/// loop on
-/// purpose: their predicates are reached by *running* the capability's ops, and four rows hold ops
-/// only a running guest or a live peer can reach. `tests/debugger_conformance.rs` pins which four,
+/// The other driven axes — `backend`, `concurrency`, `debugger`, `code origin` — are not in that
+/// loop on purpose: their answers are reached by *running* the capability's ops, and four rows hold
+/// ops only a running guest or a live peer can reach. `tests/axis_conformance.rs` pins which four,
 /// so those cells cannot quietly spread — the count floor below is what stops a column from
 /// emptying out.
 #[test]

@@ -3,7 +3,7 @@
 //! INVARIANTS #14 says an accepted capability must hold across **seven axes** — runtime backend,
 //! host target, concurrency model, code origin, nesting, debugger, durability. Exactly one of those
 //! had a machine-checked matrix ([`crate::catalog`], `op × backend`). This is the machine for the
-//! rest, and #1413 tracks filling it in; five of the seven are now driven.
+//! rest, and #1413 tracks filling it in; six of the seven are now checked.
 //!
 //! ## Why a second matrix rather than a second crate
 //!
@@ -15,8 +15,9 @@
 //! 2. **Code-derived** — rows are `temen_ir::cap_id` kinds, so the row set tracks the powerbox
 //!    rather than drifting from it.
 //! 3. **Honesty-pinned** — `tests/frontier_conformance.rs` drives the *real* predicates
-//!    (`Host::can_regrant`, the durable-capture classifier) and fails when this manifest disagrees
-//!    with them. A manifest nothing checks is a wish.
+//!    (`Host::can_regrant`, the durable-capture classifier), and `tests/axis_conformance.rs` and
+//!    `tests/code_origin_conformance.rs` the real engines, and each fails when this manifest
+//!    disagrees with what it saw. A manifest nothing checks is a wish.
 //!
 //! It shares [`crate::Status`] deliberately: one status vocabulary across both matrices means the
 //! renderer, the JSON view and the playground page work for either without a second set of glyphs,
@@ -29,46 +30,48 @@
 //! `capture_durable_handles`. So they can be derived and conformance-tested rather than asserted,
 //! which is the difference between a matrix and a wish-list.
 //!
-//! **Debugger** followed, and is a different shape. No single function classifies capabilities on
-//! it: two gates decide, the bytecode lowering's `(type_id, op)` table and `service_advance`'s
-//! decline set, and neither is keyed by capability — the first is over op pairs, the second over
-//! scheduler seams. So the column is derived by *running* each capability's ops under
-//! `ScheduledDebugRun` and folding the verdicts (`tests/debugger_conformance.rs`). It became
-//! derivable at all only once the debugger driver's declines were named rather than caught by a `_`
-//! (#1414): before that a new seam joined the declined set silently, so a column reading it would
-//! have gone stale with nothing going red.
+//! **Backend**, **concurrency** and **debugger** have no predicate to read: whether a capability
+//! answers the same on another engine, on another scheduler or under a debugger is only answerable
+//! by running it there. Since #2545 D3a each is a set of the run-mode matrix's columns
+//! ([`Axis::modes`]), run on that matrix's runners, held to the oracle's answer as every run-mode
+//! cell is, and folded by the run-mode rule (`tests/axis_conformance.rs`). One definition of each
+//! column means the two matrices cannot disagree about what a configuration does with the same
+//! program. The comparison is of *answers*, not of refusals: the op-15 gap #1531 closed was a driver
+//! returning a different value, not refusing, so a column that only asked "does it trap" would have
+//! scored it `Full`.
 //!
-//! Four rows on that column stay [`Status::Unaudited`] — `Jit` (its `invoke` needs a unit only a
-//! running guest can mint), `JitCode`, `Offer` and `LiveImpl` (a live peer). A row is scored only
-//! when *every* one of its ops was actually driven; scoring one on a partial sweep would be the
-//! wish the matrix exists to avoid. The same four stay unaudited on every driven column since, for
-//! the same reason.
+//! Each of the three first needed something named. The debugger's declines were caught by a `_`
+//! until #1414 named them: before that a new seam joined the declined set silently, so a column
+//! reading it would have gone stale with nothing going red. Concurrency's first rendering found two
+//! divergences, both on the `Instantiator` row and both since fixed: `child_offer` answered `-EINVAL`
+//! on the coop driver and trapped on the parallel one (#1566), and op 13 declined *every* spawn on
+//! the parallel driver with `Trap::Malformed` while never binding its child's import manifest
+//! (#1570). Since #1414 3e the parallel driver runs the pump's own scheduling rules, so that column
+//! compares two executors of one rule set; since #1414 B6-4a it is also the browser's only parallel
+//! driver, each thread on a Worker (#2230).
 //!
-//! **Concurrency** is the third shape again. There is no predicate to read at all: whether a
-//! capability is "carried by both drivers" is only answerable by running it on both, so the column
-//! is derived by driving each capability's ops on `bytecode::drive` and on the parallel driver
-//! and comparing the answers shape by shape (`tests/concurrency_conformance.rs`). Since #1414 3e
-//! the parallel driver runs the pump's own scheduling rules, so this compares two executors of one
-//! rule set; since #1414 B6-4a it is also the browser's only parallel driver, each thread on a
-//! Worker (#2230). The comparison is
-//! of *answers*, not of refusals: the op-15 gap #1531 closed was a driver returning a different
-//! value, not refusing, so a column that only asked "does it trap" would have scored it `Full`.
+//! Four rows stay [`Status::Unaudited`] on those three columns — `Jit` (its `invoke` needs a unit
+//! only a running guest can mint), `JitCode`, `Offer` and `LiveImpl` (a live peer). A row is scored
+//! only when *every* one of its ops was actually driven; scoring one on a partial sweep would be the
+//! wish the matrix exists to avoid.
 //!
-//! Its first rendering found two, both on the `Instantiator` row, and both are now fixed:
-//! `child_offer` answered `-EINVAL` on the coop driver and trapped on the parallel one (#1566), and
-//! op 13 declined *every* spawn on the parallel driver with `Trap::Malformed` while never binding
-//! its child's import manifest (#1570). Both drivers now share one child-host build, so the row is
-//! `Full`. The same four rows that need a live unit or peer stay `Unaudited` here as on the debugger
-//! column.
+//! **Durability** keeps its predicate for those four rows, and runs the rest (#2545 D3a). A
+//! predicate says whether the codec keeps a handle, not whether the thawed run still answers, so
+//! each row the capability probes mint is the run-mode matrix's frozen-and-thawed column too:
+//! frozen at its first safepoint on the tree-walker, the pump and the Cranelift JIT, thawed, and
+//! held to the oracle's answer. A conditional row is minted once for each side of its condition,
+//! and every row is also held across a freeze it is not called in, since an empty interface or
+//! `Exit`'s op never reaches one. The runs moved two cells to 🚧, where a ⛔ and a ✅ had hidden
+//! open issues: `Blocking` (#1678) and `Instantiator` (the bytecode tier's durable entry declines
+//! a module that spawns, #2533).
 //!
-//! **Code origin** is the fourth, and the cheapest of the driven columns to make honest, because
-//! both halves of its question are programs: it asks whether a capability answers the same from a
-//! §22 guest-JIT unit as from the host-translated base module, so
-//! `tests/code_origin_conformance.rs` makes the *identical* `call.cap` from each and compares. The
-//! axis has one variable, so the harness frees nothing else: same engine, same window, same fuel,
-//! and the same grant table — the base side compiles the very same unit and just never invokes it,
-//! because otherwise every handle-minting op "diverges" by returning a different (equally correct)
-//! handle number.
+//! **Code origin** is the cheapest of the driven columns to make honest, because both halves of its
+//! question are programs: it asks whether a capability answers the same from a §22 guest-JIT unit
+//! as from the host-translated base module, so `tests/code_origin_conformance.rs` makes the
+//! *identical* `call.cap` from each and compares. The axis has one variable, so the harness frees
+//! nothing else: same engine, same window, same fuel, and the same grant table — the base side
+//! compiles the very same unit and just never invokes it, because otherwise every handle-minting op
+//! "diverges" by returning a different (equally correct) handle number.
 //!
 //! A unit has two §22 routes with different contracts, so the column drives both. **Installed**
 //! (`call.dyn`), a unit runs in the caller's frames and must answer exactly as the base module does.
@@ -86,9 +89,9 @@
 //! the only point each path has — and which shapes the subset covers is `OPS_PARITY.md`'s question,
 //! not this column's.
 //!
-//! The remaining two axes — host target and runtime backend — are populated as their predicates
-//! become locatable; until then their cells read `Unaudited`, which is the point — an unaudited cell
-//! is visible, countable, and cannot be mistaken for a passing one.
+//! **Target** is the run-mode matrix's browser column, which has no runner yet, so its cells read
+//! `Unaudited` — which is the point: an unaudited cell is visible, countable, and cannot be mistaken
+//! for a passing one. Once its runner joins `run_modes::RUNNERS`, the column is run like the others.
 //!
 //! ## What the first rendering already showed
 //!
@@ -101,6 +104,7 @@
 //! the handle — #1502 made it durable, it was neither before). Nobody could see that before, because
 //! the two classifications live ~2,000 lines apart in two functions that never mention each other.
 
+use crate::run_modes::{runner_for, Config, Executor, Mode, Property, Props};
 use crate::{Cell, Status};
 
 /// A powerbox capability kind — one matrix row. Mirrors `temen_ir::cap_id`, which is the registry
@@ -252,37 +256,95 @@ impl Axis {
     pub fn question(self) -> &'static str {
         match self {
             Axis::Nesting => "can a §14 child hold it? (`Host::can_regrant`)",
-            Axis::Durability => "does it survive a freeze? (`capture_durable_handles`)",
-            Axis::RuntimeBackend => "same on every engine? (see OPS_PARITY.md for op-level detail)",
+            Axis::Durability => {
+                "the oracle's answer when frozen and thawed (the tree-walker, the pump, the \
+                 Cranelift JIT)? Rows no probe mints: `capture_durable_handles`"
+            }
+            Axis::RuntimeBackend => {
+                "the oracle's answer on the bytecode pump, the Cranelift JIT and the wasm-JIT? (see \
+                 OPS_PARITY.md for op-level detail)"
+            }
             Axis::HostTarget => "same on native / wasm32 / Windows?",
-            Axis::ConcurrencyModel => "carried by both the coop and parallel drivers?",
+            Axis::ConcurrencyModel => {
+                "the oracle's answer on the pump (every task on one thread) and on executor 2 (a \
+                 thread per task)?"
+            }
             Axis::CodeOrigin => "usable from a §22 guest-JIT unit as from the base module?",
-            Axis::Debugger => "observable under the debug tier?",
+            Axis::Debugger => {
+                "the oracle's answer under a debugger (the tree-walk Inspector, the bytecode debug \
+                 scheduler)?"
+            }
         }
     }
 
-    /// Whether this column's cells are checked against a live predicate — `nesting` and
-    /// `durability` by `tests/frontier_conformance.rs`, `debugger` by
-    /// `tests/debugger_conformance.rs`, `concurrency` by `tests/concurrency_conformance.rs`,
-    /// `code origin` by `tests/code_origin_conformance.rs`. An unconformed column states the manifest's belief and
-    /// nothing more — worth saying out loud in the rendered matrix.
+    /// #2545 D3a — the run-mode matrix's columns whose runs decide this axis, as that matrix defines
+    /// them. A capability's probe runs on each column's runners ([`Self::runners`]), and every run
+    /// is held to the oracle's answer, as every run-mode cell is (`tests/axis_conformance.rs`). So
+    /// the two matrices share their runners and their definition of each column, and cannot
+    /// disagree about what one configuration does with the same program.
     ///
-    /// A conformed column may still hold `Unaudited` cells (`debugger` holds four): the claim is
-    /// that the column is *checked*, not that every row in it could be reached.
+    /// A column with no runner yet is part of the definition all the same. `target`'s only column
+    /// is the browser's, so its cells stay unaudited. `backend`'s wasm-JIT column is answered
+    /// without one: the wasm-JIT emits no `call.cap` and leaves every capability call to the tier
+    /// beneath, which the axis runs; `tests/axis_conformance.rs` pins that it still emits none.
+    ///
+    /// `durability` runs only the rows the capability probes mint. The codec's classifier of handle
+    /// kinds decides the rest (`tests/frontier_conformance.rs`), which need a running guest or a
+    /// live peer to drive but only a handle to classify.
+    ///
+    /// Empty for an axis that no run-mode column answers: `nesting` and `code origin` ask about a
+    /// child and a unit, which no run mode varies.
+    pub fn modes(self) -> &'static [Mode] {
+        match self {
+            Axis::RuntimeBackend => &[
+                Mode::Executor(Executor::Pump),
+                Mode::Executor(Executor::Cranelift),
+                Mode::Property(Property::Emitted),
+            ],
+            Axis::ConcurrencyModel => &[
+                Mode::Executor(Executor::Pump),
+                Mode::Executor(Executor::Parallel),
+            ],
+            Axis::Debugger => &[Mode::Property(Property::Debugger)],
+            Axis::Durability => &[Mode::Property(Property::Durable)],
+            Axis::HostTarget => &[Mode::Property(Property::Browser)],
+            Axis::Nesting | Axis::CodeOrigin => &[],
+        }
+    }
+
+    /// The runner configurations behind [`Self::modes`]: an executor's one-shot run, and a
+    /// property's runner on every executor that has one. Empty where no column of the axis has a
+    /// runner yet (`target`: the browser's), which leaves its cells unaudited.
+    pub fn runners(self) -> Vec<Config> {
+        self.modes()
+            .iter()
+            .flat_map(|m| match *m {
+                Mode::Executor(e) => vec![Config::new(e, &[])],
+                Mode::Property(p) => Executor::ALL
+                    .into_iter()
+                    .filter_map(|e| runner_for(e, Props::of(&[p])))
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Whether this column's cells are checked against the tree — `nesting` against its predicate
+    /// by `tests/frontier_conformance.rs`, `code origin` by `tests/code_origin_conformance.rs`, and
+    /// every column with [`Self::runners`] against its runs by `tests/axis_conformance.rs`
+    /// (`durability`'s rows no probe mints against the codec's classifier, by
+    /// `frontier_conformance.rs`). An unconformed column states the manifest's belief and nothing
+    /// more — worth saying out loud in the rendered matrix.
+    ///
+    /// A conformed column may still hold `Unaudited` cells (`backend`, `concurrency` and `debugger`
+    /// hold four each): the claim is that the column is *checked*, not that every row in it could be
+    /// reached.
     pub fn is_conformed(self) -> bool {
-        matches!(
-            self,
-            Axis::Nesting
-                | Axis::Durability
-                | Axis::Debugger
-                | Axis::ConcurrencyModel
-                | Axis::RuntimeBackend
-                | Axis::CodeOrigin
-        )
+        matches!(self, Axis::Nesting | Axis::CodeOrigin) || !self.runners().is_empty()
     }
 }
 
-/// `Full`, no note.
+/// `Full`, no note. On a conformed column, the column's conformance test checks it
+/// ([`Axis::is_conformed`]).
 const F: Cell = Cell {
     status: Status::Full,
     note: "",
@@ -290,31 +352,6 @@ const F: Cell = Cell {
 /// Not audited on this axis yet — see the module docs. Distinct from `NotYet` (a *known* gap).
 const U: Cell = Cell {
     status: Status::Unaudited,
-    note: "",
-};
-/// `Full` on the **concurrency** axis: both drivers, given the same call, give the same answer.
-/// `tests/concurrency_conformance.rs` drives each of the row's ops on `bytecode::drive` and on
-/// the parallel driver and compares them shape by shape.
-const K: Cell = Cell {
-    status: Status::Full,
-    note: "",
-};
-/// `Full` on the **backend** axis: every engine that runs cap calls answers as the oracle does.
-/// `tests/backend_conformance.rs` drives each of the row's ops on the tree-walk oracle, the bytecode
-/// tier and Cranelift (through `temen_run::cap_thunk`, the reference host trampoline) and compares
-/// the answers shape by shape. The wasm-JIT is a leaf accelerator that does not emit `call.cap` at
-/// all, so it folds every capability to the interpreter underneath — a decline in invariant 9's
-/// sense, pinned by that test rather than restated per row.
-const B: Cell = Cell {
-    status: Status::Full,
-    note: "",
-};
-
-/// `Full` on the **code origin** axis: a §22 guest-JIT unit and the host-translated base module get
-/// the same answer out of every one of the row's ops. `tests/code_origin_conformance.rs` makes the
-/// identical `call.cap` from each and compares them shape by shape.
-const O: Cell = Cell {
-    status: Status::Full,
     note: "",
 };
 
@@ -332,6 +369,19 @@ const fn conditional(note: &'static str) -> Cell {
     }
 }
 
+const fn not_yet(note: &'static str) -> Cell {
+    Cell {
+        status: Status::NotYet,
+        note,
+    }
+}
+
+/// `SharedRegion` on every axis the bytecode tier runs on: a module that calls op 4 declines to
+/// the oracle there.
+const BYTECODE_VETOES_OP_4: &str = "map, unmap, len, page_size and close run; the bytecode \
+     lowering vetoes op 4, the guest-minted region's grant (#1511: unbuilt, -EINVAL where it runs), \
+     by name, so the bytecode tier declines a module that calls it to the oracle";
+
 /// **The classifier.** Exhaustive over [`Capability`], no wildcard arm — a new capability fails to
 /// compile until it is classified on all seven axes.
 ///
@@ -341,7 +391,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
     match c {
         // Coordinate-free value caps: copyable into a child (`resolve_copyable`) and value-typed, so
         // they ride a freeze. The only rows that are unconditionally `Full` on both audited axes.
-        Capability::Stream | Capability::Exit | Capability::Clock => [F, F, B, U, K, O, F],
+        Capability::Stream | Capability::Exit | Capability::Clock => [F, F, F, U, F, F, F],
 
         // A pipe end is `Stream`-typed but index-carrying: `regrant_into_child` aliases its shared
         // FIFO into the child (the cross-domain `cmd1 | cmd2` grant). A pipe whose every end is in
@@ -352,10 +402,10 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
                 "a pipe the tree minted rides the cut (#1680); an embedder-fed pipe, or one with an \
                  end outside the cut, is the boundary, not yet carried",
             ),
-            B,
+            F,
             U,
-            K,
-            O,
+            F,
+            F,
             F,
         ],
 
@@ -367,16 +417,15 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             conditional(
                 "a region the cut wholly holds rides with its aliases, across detached children, \
                  on the native JIT and in a bytecode reactor's save-state too (#2025, #2051); one \
-                 held outside the cut or host-file-backed is the boundary",
+                 held outside the cut or host-file-backed is the boundary. The bytecode tier also \
+                 declines a module that calls op 4 (#1511), as on every axis it runs",
             ),
-            B,
+            conditional(BYTECODE_VETOES_OP_4),
             U,
-            K,
-            O,
-            conditional(
-                "map/unmap/len/page_size run; op 4 (the guest-minted-region grant) is vetoed by \
-                 name in the bytecode lowering",
-            )],
+            conditional(BYTECODE_VETOES_OP_4),
+            F,
+            conditional(BYTECODE_VETOES_OP_4),
+        ],
 
         // Window-coordinate authority: a child is minted its OWN `AddressSpace`/`Instantiator` over
         // its own window, never handed the parent's — the parent's names coordinates meaningless in
@@ -385,21 +434,24 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
         Capability::AddressSpace => [
             declines("the child is minted its own over its own window; the parent's names coordinates the child cannot use"),
             F,
-            B,
+            F,
             U,
-            K,
-            O,
+            F,
+            F,
             F,
         ],
-        // Identical to `AddressSpace` on both predicate-audited axes, and deliberately its own arm
-        // because the **debugger** axis splits them: the memory half of the §14 pair compiles whole
-        // for the debug tier, the spawn half does not.
+        // Identical to `AddressSpace` on nesting, and deliberately its own arm because the
+        // **debugger** and **durability** axes split them: the memory half of the §14 pair compiles
+        // whole for the debug tier and the bytecode tier's durable entry, the spawn half does not.
         Capability::Instantiator => [
             declines("the child is minted its own over its own window; the parent's names coordinates the child cannot use"),
+            not_yet(
+                "rides a freeze on the tree-walker and the Cranelift JIT; the bytecode tier's \
+                 durable entry declines a module that calls it (#2533)",
+            ),
             F,
-            B,
             U,
-            K,
+            F,
             declines(
                 "an installed unit answers as the base module does (#1726); an invoked unit is a \
                  seam-free leaf with no Instantiator, so every op CapFaults there (§22, #1578)",
@@ -418,10 +470,10 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
         Capability::Budget => [
             declines("not re-grantable by name: a child's own budget is the node its spawn charged (#1944)"),
             F,
-            B,
+            F,
             U,
-            K,
-            O,
+            F,
+            F,
             F,
         ],
 
@@ -437,19 +489,19 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
                        (#1361) or the running program's child image (#2245). The artifact carries \
                        the §4 content digest. Any other grant is still NonDurableKind::Module",
             },
-            B,
+            F,
             U,
-            K,
-            O,
+            F,
+            F,
             F,
         ],
         Capability::ModuleLoader => [
             declines("not in `can_regrant`: a child that may mint modules must be granted one explicitly"),
             declines("NonDurableKind::ModuleLoader — a live loader makes the domain non-snapshottable"),
-            B,
+            F,
             U,
-            K,
-            O,
+            F,
+            F,
             F,
         ],
 
@@ -470,11 +522,14 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
 
         Capability::Blocking => [
             declines("not in `can_regrant`: index-carrying into the parent's blocking table"),
-            declines("NonDurableKind::Blocking"),
-            B,
+            not_yet(
+                "the codec refuses a live handle (NonDurableKind::Blocking), and a Blocking.work \
+                 entered after a freeze landed faults ThreadFault: both wait on #1678",
+            ),
+            F,
             U,
-            K,
-            O,
+            F,
+            F,
             F,
         ],
         // Only a *forkable* host proc crosses (one carrying a provider fork factory); a factory-less
@@ -492,10 +547,10 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
                        on, and the provider says what state crosses with it. Otherwise \
                        NonDurableKind::HostProc",
             },
-            B,
+            F,
             U,
-            K,
-            O,
+            F,
+            F,
             F,
         ],
 
