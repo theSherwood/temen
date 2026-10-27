@@ -71,7 +71,7 @@ mod support;
 use probes::{Embedder, Outside};
 use runners::{once, End, Guest, Way};
 use support::capability_probe::{
-    probe_module_with, rows, unit_module_with, Row, MAX_ARGC, PROBE_BEYOND,
+    probe_module_with, rows, unit_module_with, Mint, Row, MAX_ARGC, PROBE_BEYOND,
 };
 use support::validate_unit;
 use temen_interp::{Host, Value};
@@ -178,13 +178,20 @@ fn install_unit(
     }
 }
 
-/// The base module makes the cap call itself, over `row`'s powerbox. The unit is still compiled (and
-/// never invoked) so the handle numbering matches the other side.
-fn from_base(row: &Row, op: u32, argc: usize, res: &str, real: &[(usize, i64)]) -> Verdict {
-    let m = probe_module_with(row.iface, op, argc, res, real);
+/// The base module makes the cap call itself, over the powerbox `mint` grants. The unit is still
+/// compiled (and never invoked) so the handle numbering matches the other side.
+fn from_base(
+    iface: u32,
+    mint: &Mint,
+    op: u32,
+    argc: usize,
+    res: &str,
+    real: &[(usize, i64)],
+) -> Verdict {
+    let m = probe_module_with(iface, op, argc, res, real);
     on_pump(&m, &|| {
-        let (mut host, handle, _) = (row.mint)();
-        install_unit(&mut host, row.iface, op, argc, res, real).expect("the probe unit compiles");
+        let (mut host, handle, _) = mint();
+        install_unit(&mut host, iface, op, argc, res, real).expect("the probe unit compiles");
         (host, vec![Value::I32(handle)])
     })
 }
@@ -192,7 +199,8 @@ fn from_base(row: &Row, op: u32, argc: usize, res: &str, real: &[(usize, i64)]) 
 /// The unit makes the cap call, reached by `route` from the matching trampoline.
 fn from_unit(
     route: Route,
-    row: &Row,
+    iface: u32,
+    mint: &Mint,
     op: u32,
     argc: usize,
     res: &str,
@@ -205,9 +213,9 @@ fn from_unit(
     let base = temen_text::parse_module(tramp).expect("the trampoline parses");
     temen_verify::verify_module(&base).expect("the trampoline verifies");
     on_pump(&base, &|| {
-        let (mut host, handle, _) = (row.mint)();
+        let (mut host, handle, _) = mint();
         let (jit, code) =
-            install_unit(&mut host, row.iface, op, argc, res, real).expect("the unit compiles");
+            install_unit(&mut host, iface, op, argc, res, real).expect("the unit compiles");
         (
             host,
             vec![Value::I32(jit), Value::I32(code), Value::I32(handle)],
@@ -220,26 +228,32 @@ fn shapes() -> impl Iterator<Item = (usize, &'static str)> {
     (0..MAX_ARGC).flat_map(|a| ["i64", "i32"].map(move |r| (a, r)))
 }
 
-/// The call shapes of `op` on which the base module and a unit reached by `route` disagree, as
-/// `(shape, base, unit)`.
+/// The call shapes of `op`, over each of `row`'s mints, on which the base module and a unit reached
+/// by `route` disagree, as `(shape, base, unit)`.
 fn divergences(row: &Row, op: u32, route: Route) -> Vec<(String, Verdict, Verdict)> {
     let mut out = Vec::new();
-    for (argc, res) in shapes() {
-        let (_, _, real) = (row.mint)();
-        let real: Vec<(usize, i64)> = real
-            .iter()
-            .filter(|(o, _, _)| *o == op)
-            .map(|(_, idx, v)| (*idx, *v))
-            .collect();
-        let b = from_base(row, op, argc, res, &real);
-        let u = from_unit(route, row, op, argc, res, &real);
-        // Neither side found an arm: the harness miscalled this shape, so there is nothing to
-        // compare. A cap fault on exactly one side *is* a divergence and is kept.
-        if b == Verdict::CapFault && u == Verdict::CapFault {
-            continue;
-        }
-        if b != u {
-            out.push((format!("op {op}, argc {argc}, -> {res}"), b, u));
+    for (grant, mint) in row.mints.iter().enumerate() {
+        for (argc, res) in shapes() {
+            let (_, _, real) = mint();
+            let real: Vec<(usize, i64)> = real
+                .iter()
+                .filter(|(o, _, _)| *o == op)
+                .map(|(_, idx, v)| (*idx, *v))
+                .collect();
+            let b = from_base(row.iface, mint, op, argc, res, &real);
+            let u = from_unit(route, row.iface, mint, op, argc, res, &real);
+            // Neither side found an arm: the harness miscalled this shape, so there is nothing to
+            // compare. A cap fault on exactly one side *is* a divergence and is kept.
+            if b == Verdict::CapFault && u == Verdict::CapFault {
+                continue;
+            }
+            if b != u {
+                out.push((
+                    format!("grant {grant}: op {op}, argc {argc}, -> {res}"),
+                    b,
+                    u,
+                ));
+            }
         }
     }
     out
@@ -330,8 +344,11 @@ fn the_instantiator_row_by_route() {
         .into_iter()
         .find(|r| r.cap == Capability::Instantiator)
         .expect("the Instantiator row");
+    let [mint] = &row.mints[..] else {
+        panic!("the Instantiator row has one mint");
+    };
     let real = |op: u32| -> Vec<(usize, i64)> {
-        (row.mint)()
+        mint()
             .2
             .iter()
             .filter(|(o, _, _)| *o == op)
@@ -346,17 +363,17 @@ fn the_instantiator_row_by_route() {
     ] {
         let args = real(op);
         assert_eq!(
-            from_base(&row, op, argc, "i32", &args),
+            from_base(row.iface, mint, op, argc, "i32", &args),
             base_says,
             "op {op} from the base module"
         );
         assert_eq!(
-            from_unit(Route::Install, &row, op, argc, "i32", &args),
+            from_unit(Route::Install, row.iface, mint, op, argc, "i32", &args),
             base_says,
             "op {op} from an installed §22 unit — the caller's own frames"
         );
         assert_eq!(
-            from_unit(Route::Invoke, &row, op, argc, "i32", &args),
+            from_unit(Route::Invoke, row.iface, mint, op, argc, "i32", &args),
             Verdict::CapFault,
             "op {op} from an invoked §22 unit — no Instantiator inside a seam-free leaf"
         );

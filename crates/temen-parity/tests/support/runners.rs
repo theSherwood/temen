@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use crate::drivers::{run_on, Driver, Pumped};
 use crate::probes::{self, Embedder, Outside, Stopper, ARENA};
-use temen_durable::{begin_thaw, init_durable_window, write_state};
+use temen_durable::{begin_thaw, init_durable_window, read_state, write_state};
 use temen_interp::bytecode::{
     module_spawns_threads, CoopEvent, CoopRun, SchedStop, ScheduledDebugRun,
 };
@@ -23,6 +23,7 @@ use temen_interp::{Host, Inspector, MemLayout, Stop, Trap, Value};
 use temen_ir::durable_abi::STATE_UNWINDING;
 use temen_ir::Module;
 use temen_parity::run_modes::{Config, Executor, Property, Props};
+use temen_snapshot::FreezeError;
 
 /// The fuel every run gets.
 pub const FUEL: u64 = 50_000_000;
@@ -165,10 +166,13 @@ pub fn once(way: Way, g: &Guest, armed: bool, want: Option<&End>) -> End {
 fn unheld(m: &Module, g: &Guest, e: &Embedder, armed: bool) -> (Host, Vec<Value>) {
     let (mut host, args) = (g.setup)(m, e);
     if e.durable {
-        // An embedder that freezes the run holds the authority to freeze the children it spawns
-        // (#1440), without which a durable domain spawns none.
         host.set_durable(true);
-        host.grant_freeze_authority();
+        // An embedder that freezes a run that spawns holds the authority to freeze its children
+        // (#1440), without which a durable domain spawns none. Only such a run gets it: the grant
+        // takes a handle, which would number the run's own grants unlike the oracle's.
+        if temen_ir::spawns_detached(m) {
+            host.grant_freeze_authority();
+        }
     }
     if let Outside::Feed(bytes) = g.outside {
         feed_later(&mut host, bytes);
@@ -389,6 +393,11 @@ fn durable(x: Executor, g: &Guest, armed: bool, want: &End) -> End {
         &MemLayout::image(cut),
     );
     let thawed = match (froze, snap) {
+        // A root that unwound returns 0, as one that ran to its end may: the state word tells them
+        // apart.
+        (End::Value(0), Some(snap)) if read_state(&snap.to_dense().0, ARENA) != STATE_UNWINDING => {
+            End::Stuck("the run ended before its freeze landed".into())
+        }
         (End::Value(0), Some(snap)) => thaw(x, &inst, g, &e, armed, &snap, host),
         (End::Value(0), None) => End::Stuck("the frozen run left no window".into()),
         (End::Declined, _) => End::Declined,
@@ -420,6 +429,13 @@ fn thaw(
     }
     let art = match temen_snapshot::freeze_layout(inst, snap, DURABLE_RESERVED_LOG2, &host) {
         Ok(art) => art,
+        // The cut's boundary (DURABILITY.md §12.5, #1680, #2025): a handle no artifact carries, or
+        // a pipe or region something outside the cut shares. The run cannot be frozen, a decline.
+        Err(
+            FreezeError::NonDurableHandle(_)
+            | FreezeError::PipeCrossesCut
+            | FreezeError::RegionNotCaptured(_),
+        ) => return End::Declined,
         Err(why) => return End::Stuck(format!("the codec refuses the freeze: {why:?}")),
     };
     let (mut thawing, args) = unheld(inst, g, e, armed);

@@ -50,10 +50,20 @@
 //! compares two executors of one rule set; since #1414 B6-4a it is also the browser's only parallel
 //! driver, each thread on a Worker (#2230).
 //!
-//! Four rows stay [`Status::Unaudited`] on every driven column — `Jit` (its `invoke` needs a unit
+//! Four rows stay [`Status::Unaudited`] on those three columns — `Jit` (its `invoke` needs a unit
 //! only a running guest can mint), `JitCode`, `Offer` and `LiveImpl` (a live peer). A row is scored
 //! only when *every* one of its ops was actually driven; scoring one on a partial sweep would be the
 //! wish the matrix exists to avoid.
+//!
+//! **Durability** keeps its predicate for those four rows, and runs the rest (#2545 D3a). A
+//! predicate says whether the codec keeps a handle, not whether the thawed run still answers, so
+//! each row the capability probes mint is the run-mode matrix's frozen-and-thawed column too:
+//! frozen at its first safepoint on the tree-walker, the pump and the Cranelift JIT, thawed, and
+//! held to the oracle's answer. A conditional row is minted once for each side of its condition,
+//! and every row is also held across a freeze it is not called in, since an empty interface or
+//! `Exit`'s op never reaches one. The runs moved two cells to 🚧, where a ⛔ and a ✅ had hidden
+//! open issues: `Blocking` (#1678) and `Instantiator` (the bytecode tier's durable entry declines
+//! a module that spawns, #2533).
 //!
 //! **Code origin** is the cheapest of the driven columns to make honest, because both halves of its
 //! question are programs: it asks whether a capability answers the same from a §22 guest-JIT unit
@@ -246,7 +256,10 @@ impl Axis {
     pub fn question(self) -> &'static str {
         match self {
             Axis::Nesting => "can a §14 child hold it? (`Host::can_regrant`)",
-            Axis::Durability => "does it survive a freeze? (`capture_durable_handles`)",
+            Axis::Durability => {
+                "the oracle's answer when frozen and thawed (the tree-walker, the pump, the \
+                 Cranelift JIT)? Rows no probe mints: `capture_durable_handles`"
+            }
             Axis::RuntimeBackend => {
                 "the oracle's answer on the bytecode pump, the Cranelift JIT and the wasm-JIT? (see \
                  OPS_PARITY.md for op-level detail)"
@@ -275,9 +288,12 @@ impl Axis {
     /// without one: the wasm-JIT emits no `call.cap` and leaves every capability call to the tier
     /// beneath, which the axis runs; `tests/axis_conformance.rs` pins that it still emits none.
     ///
+    /// `durability` runs only the rows the capability probes mint. The codec's classifier of handle
+    /// kinds decides the rest (`tests/frontier_conformance.rs`), which need a running guest or a
+    /// live peer to drive but only a handle to classify.
+    ///
     /// Empty for an axis that no run-mode column answers: `nesting` and `code origin` ask about a
-    /// child and a unit, which no run mode varies, and `durability` is decided by the codec's
-    /// classifier of handle kinds.
+    /// child and a unit, which no run mode varies.
     pub fn modes(self) -> &'static [Mode] {
         match self {
             Axis::RuntimeBackend => &[
@@ -290,8 +306,9 @@ impl Axis {
                 Mode::Executor(Executor::Parallel),
             ],
             Axis::Debugger => &[Mode::Property(Property::Debugger)],
+            Axis::Durability => &[Mode::Property(Property::Durable)],
             Axis::HostTarget => &[Mode::Property(Property::Browser)],
-            Axis::Nesting | Axis::Durability | Axis::CodeOrigin => &[],
+            Axis::Nesting | Axis::CodeOrigin => &[],
         }
     }
 
@@ -311,17 +328,18 @@ impl Axis {
             .collect()
     }
 
-    /// Whether this column's cells are checked against the tree — `nesting` and `durability`
-    /// against their predicates by `tests/frontier_conformance.rs`, `code origin` by
-    /// `tests/code_origin_conformance.rs`, and every column with [`Self::runners`] against its runs
-    /// by `tests/axis_conformance.rs`. An unconformed column states the manifest's belief and
-    /// nothing more — worth saying out loud in the rendered matrix.
+    /// Whether this column's cells are checked against the tree — `nesting` against its predicate
+    /// by `tests/frontier_conformance.rs`, `code origin` by `tests/code_origin_conformance.rs`, and
+    /// every column with [`Self::runners`] against its runs by `tests/axis_conformance.rs`
+    /// (`durability`'s rows no probe mints against the codec's classifier, by
+    /// `frontier_conformance.rs`). An unconformed column states the manifest's belief and nothing
+    /// more — worth saying out loud in the rendered matrix.
     ///
-    /// A conformed column may still hold `Unaudited` cells (each driven one holds four): the claim
-    /// is that the column is *checked*, not that every row in it could be reached.
+    /// A conformed column may still hold `Unaudited` cells (`backend`, `concurrency` and `debugger`
+    /// hold four each): the claim is that the column is *checked*, not that every row in it could be
+    /// reached.
     pub fn is_conformed(self) -> bool {
-        matches!(self, Axis::Nesting | Axis::Durability | Axis::CodeOrigin)
-            || !self.runners().is_empty()
+        matches!(self, Axis::Nesting | Axis::CodeOrigin) || !self.runners().is_empty()
     }
 }
 
@@ -347,6 +365,13 @@ const fn declines(note: &'static str) -> Cell {
 const fn conditional(note: &'static str) -> Cell {
     Cell {
         status: Status::Conditional,
+        note,
+    }
+}
+
+const fn not_yet(note: &'static str) -> Cell {
+    Cell {
+        status: Status::NotYet,
         note,
     }
 }
@@ -392,7 +417,8 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             conditional(
                 "a region the cut wholly holds rides with its aliases, across detached children, \
                  on the native JIT and in a bytecode reactor's save-state too (#2025, #2051); one \
-                 held outside the cut or host-file-backed is the boundary",
+                 held outside the cut or host-file-backed is the boundary. The bytecode tier also \
+                 declines a module that calls op 4 (#1511), as on every axis it runs",
             ),
             conditional(BYTECODE_VETOES_OP_4),
             U,
@@ -414,12 +440,15 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             F,
             F,
         ],
-        // Identical to `AddressSpace` on both predicate-audited axes, and deliberately its own arm
-        // because the **debugger** axis splits them: the memory half of the §14 pair compiles whole
-        // for the debug tier, the spawn half does not.
+        // Identical to `AddressSpace` on nesting, and deliberately its own arm because the
+        // **debugger** and **durability** axes split them: the memory half of the §14 pair compiles
+        // whole for the debug tier and the bytecode tier's durable entry, the spawn half does not.
         Capability::Instantiator => [
             declines("the child is minted its own over its own window; the parent's names coordinates the child cannot use"),
-            F,
+            not_yet(
+                "rides a freeze on the tree-walker and the Cranelift JIT; the bytecode tier's \
+                 durable entry declines a module that calls it (#2533)",
+            ),
             F,
             U,
             F,
@@ -493,7 +522,10 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
 
         Capability::Blocking => [
             declines("not in `can_regrant`: index-carrying into the parent's blocking table"),
-            declines("NonDurableKind::Blocking"),
+            not_yet(
+                "the codec refuses a live handle (NonDurableKind::Blocking), and a Blocking.work \
+                 entered after a freeze landed faults ThreadFault: both wait on #1678",
+            ),
             F,
             U,
             F,

@@ -17,7 +17,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 ## Axes
 
 - **nesting** — can a §14 child hold it? (`Host::can_regrant`) *(conformance-tested)*
-- **durability** — does it survive a freeze? (`capture_durable_handles`) *(conformance-tested)*
+- **durability** — the oracle's answer when frozen and thawed (the tree-walker, the pump, the Cranelift JIT)? Rows no probe mints: `capture_durable_handles` *(conformance-tested)*
 - **backend** — the oracle's answer on the bytecode pump, the Cranelift JIT and the wasm-JIT? (see OPS_PARITY.md for op-level detail) *(conformance-tested)*
 - **target** — same on native / wasm32 / Windows?
 - **concurrency** — the oracle's answer on the pump (every task on one thread) and on executor 2 (a thread per task)? *(conformance-tested)*
@@ -34,13 +34,13 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 | `PipeEnd` | ✅ | 🔶 | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `SharedRegion` | ✅ | 🔶 | 🔶 | ❔ | 🔶 | ✅ | 🔶 |
 | `AddressSpace` | ⛔ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
-| `Instantiator` | ⛔ | ✅ | ✅ | ❔ | ✅ | ⛔ | 🔶 |
+| `Instantiator` | ⛔ | 🚧 | ✅ | ❔ | ✅ | ⛔ | 🔶 |
 | `Budget` | ⛔ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `Module` | ✅ | 🔶 | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `ModuleLoader` | ⛔ | ⛔ | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `Jit` | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ | ❔ |
 | `JitCode` | ⛔ | ✅ | ❔ | ❔ | ❔ | ❔ | ❔ |
-| `Blocking` | ⛔ | ⛔ | ✅ | ❔ | ✅ | ✅ | ✅ |
+| `Blocking` | ⛔ | 🚧 | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `HostProc` | 🔶 | 🔶 | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `Offer` | ✅ | ⛔ | ❔ | ❔ | ❔ | ❔ | ❔ |
 | `LiveImpl` | ✅ | ⛔ | ❔ | ❔ | ❔ | ❔ | ❔ |
@@ -51,7 +51,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 - *durability* 🔶 — a pipe the tree minted rides the cut (#1680); an embedder-fed pipe, or one with an end outside the cut, is the boundary, not yet carried
 
 **`SharedRegion`**
-- *durability* 🔶 — a region the cut wholly holds rides with its aliases, across detached children, on the native JIT and in a bytecode reactor's save-state too (#2025, #2051); one held outside the cut or host-file-backed is the boundary
+- *durability* 🔶 — a region the cut wholly holds rides with its aliases, across detached children, on the native JIT and in a bytecode reactor's save-state too (#2025, #2051); one held outside the cut or host-file-backed is the boundary. The bytecode tier also declines a module that calls op 4 (#1511), as on every axis it runs
 - *backend* 🔶 — map, unmap, len, page_size and close run; the bytecode lowering vetoes op 4, the guest-minted region's grant (#1511: unbuilt, -EINVAL where it runs), by name, so the bytecode tier declines a module that calls it to the oracle
 - *concurrency* 🔶 — map, unmap, len, page_size and close run; the bytecode lowering vetoes op 4, the guest-minted region's grant (#1511: unbuilt, -EINVAL where it runs), by name, so the bytecode tier declines a module that calls it to the oracle
 - *debugger* 🔶 — map, unmap, len, page_size and close run; the bytecode lowering vetoes op 4, the guest-minted region's grant (#1511: unbuilt, -EINVAL where it runs), by name, so the bytecode tier declines a module that calls it to the oracle
@@ -61,6 +61,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 
 **`Instantiator`**
 - *nesting* ⛔ — the child is minted its own over its own window; the parent's names coordinates the child cannot use
+- *durability* 🚧 — rides a freeze on the tree-walker and the Cranelift JIT; the bytecode tier's durable entry declines a module that calls it (#2533)
 - *code origin* ⛔ — an installed unit answers as the base module does (#1726); an invoked unit is a seam-free leaf with no Instantiator, so every op CapFaults there (§22, #1578)
 - *debugger* 🔶 — join/instantiate_rec run on the debug scheduler through the executor's admission (#1855), and so does grant (op 19, #2220); child_offer (op 14) reaches the debug scheduler and is declined
 
@@ -79,7 +80,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 
 **`Blocking`**
 - *nesting* ⛔ — not in `can_regrant`: index-carrying into the parent's blocking table
-- *durability* ⛔ — NonDurableKind::Blocking
+- *durability* 🚧 — the codec refuses a live handle (NonDurableKind::Blocking), and a Blocking.work entered after a freeze landed faults ThreadFault: both wait on #1678
 
 **`HostProc`**
 - *nesting* 🔶 — only a forkable host proc (one carrying a fork factory) crosses; a factory-less one cannot

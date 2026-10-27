@@ -1,12 +1,13 @@
 //! **The honesty pin for the frontier matrix's run-driven axes (#1413, #2545 D3a):** `backend`,
-//! `concurrency` and `debugger`.
+//! `concurrency`, `debugger` and `durability`.
 //!
 //! Each of these axes is a set of the run-mode matrix's columns ([`Axis::modes`]), and runs on that
 //! matrix's runners (`support/runners.rs`): the pump and the Cranelift JIT for `backend`, the pump and
 //! executor 2 for `concurrency`, the tree-walk `Inspector` and the bytecode debug scheduler for
-//! `debugger`. One harness and one definition of each column, so the two matrices cannot disagree
-//! about what a configuration does with the same program (INVARIANTS #15). `target` is the
-//! browser's column, which has no runner yet, so its cells stay unaudited.
+//! `debugger`, and the durable entries of the tree-walker, the pump and the Cranelift JIT, each run
+//! frozen and thawed, for `durability`. One harness and one definition of each column, so the two
+//! matrices cannot disagree about what a configuration does with the same program (INVARIANTS #15).
+//! `target` is the browser's column, which has no runner yet, so its cells stay unaudited.
 //!
 //! ## What is run
 //!
@@ -17,11 +18,15 @@
 //! across arities would compare an arity one runner reached against another one the oracle did,
 //! manufacturing divergences that are really the harness miscalling.
 //!
+//! A row whose durability turns on how its handle was granted is minted once for each side, and
+//! every axis runs each mint. A durable runner also holds each handle across a freeze it is not
+//! called in ([`hold`]), since an empty interface or `Exit`'s op never reaches a freeze.
+//!
 //! A run is held to the oracle's answer for the same shape, as every run-mode cell is:
 //!
 //! - the same answer, a value, an errno or a trap: **matched**;
-//! - the runner declines the module (outside its subset, or a debug engine's declined seam):
-//!   **declined**;
+//! - the runner declines the module (outside its subset, a debug engine's declined seam, or a freeze
+//!   the codec refuses at the cut's boundary): **declined**;
 //! - anything else: a **divergence**. A runner that answers a shape the oracle refuses diverges as
 //!   much as one that refuses a shape the oracle answers (#1531 was a driver answering differently,
 //!   not refusing).
@@ -31,14 +36,16 @@
 //!
 //! ## The cell
 //!
-//! A row's runs on an axis fold as a run-mode cell does: every run matched ✅, any divergence 🚧 (the
-//! manifest cites its issue), every run declined ⛔, a mix of matched and declined 🔶. The manifest's
-//! cell must say what the fold says. A capability that declares no ops has nothing to diverge about:
-//! a little past its empty interface is swept anyway, so that is checked rather than assumed.
+//! A row's runs on an axis fold as a run-mode cell does: every run matched ✅, any divergence 🚧, every
+//! run declined ⛔, a mix of matched and declined 🔶. The manifest's cell must say what the fold says,
+//! or 🚧, citing its issue, for a fold short of ✅: a known gap may decline rather than diverge, as a
+//! run-mode exception's `NotYet` allows. A capability that declares no ops has nothing to diverge
+//! about: a little past its empty interface is swept anyway, so that is checked rather than assumed.
 //!
 //! As on every column, a row is scored only when the harness can mint its handle and drive its ops.
 //! `Jit`, `JitCode`, `Offer` and `LiveImpl` need a live unit or a live peer, so they stay `Unaudited`
-//! on each axis this file runs.
+//! on each axis this file runs but `durability`, where the codec's classifier decides them
+//! (`frontier_conformance.rs`).
 
 #[path = "../../temen-interp/tests/support/drivers.rs"]
 mod drivers;
@@ -51,12 +58,12 @@ mod runners;
 mod support;
 
 use probes::{Embedder, Outside};
-use runners::{bounded, once, way, End, Guest, Way};
-use support::capability_probe::{probe_module_with, rows, Row, MAX_ARGC, PROBE_BEYOND};
+use runners::{bounded, once, way, End, Guest, Setup, Way};
+use support::capability_probe::{probe_module_with, rows, Mint, Row, MAX_ARGC, PROBE_BEYOND};
 use temen_interp::{Host, Value};
 use temen_ir::Module;
 use temen_parity::frontier::{capability_axes, Axis, Capability};
-use temen_parity::run_modes::{fold_status, Config, Executor};
+use temen_parity::run_modes::{fold_status, Config, Executor, Property};
 use temen_parity::Status;
 
 /// What one runner did with one call shape, held to the oracle's answer for it.
@@ -70,7 +77,8 @@ enum Verdict {
 
 /// One run that had an answer to compare.
 struct Run {
-    op: u32,
+    /// What the run called: an op of the row's interface, or none, the handle only held ([`hold`]).
+    call: String,
     shape: String,
     config: Config,
     verdict: Verdict,
@@ -112,60 +120,98 @@ fn ops(row: &Row) -> Vec<u32> {
     }
 }
 
-/// Run every call shape of every op of `row` on the oracle and on each of `runners`: the runs that
-/// had an answer to compare. Each run mints the row's powerbox afresh, in the same order, so a real
-/// handle baked into a shape names the same grant on every runner.
+/// Run every call shape of every op of `row`, over each of its mints, on the oracle and on each of
+/// `runners`: the runs that had an answer to compare. Each run mints the row's powerbox afresh, in
+/// the same order, so a real handle baked into a shape names the same grant on every runner.
 fn sweep(row: &Row, runners: &[Config]) -> Vec<Run> {
-    let setup = |_: &Module, _: &Embedder| -> (Host, Vec<Value>) {
-        let (host, handle, _) = (row.mint)();
-        (host, vec![Value::I32(handle)])
-    };
     let mut out = Vec::new();
-    for op in ops(row) {
-        let mut reached = false;
-        for (argc, res) in shapes() {
-            let (_, _, real) = (row.mint)();
-            let real: Vec<(usize, i64)> = real
-                .iter()
-                .filter(|(o, _, _)| *o == op)
-                .map(|(_, idx, v)| (*idx, *v))
-                .collect();
-            let m = probe_module_with(row.iface, op, argc, res, &real);
-            let g = Guest {
-                module: &m,
-                setup: &setup,
-                outside: Outside::Nothing,
-            };
-            let want = once(Way::OneShot(Executor::TreeWalk), &g, false, None);
-            for &config in runners {
-                let way = way(config).expect("an axis runs on the run-mode matrix's runners");
-                let got = once(way, &g, false, Some(&want));
-                if miscalled(&want) && miscalled(&got) {
-                    continue;
-                }
-                reached = true;
-                let verdict = match got {
-                    End::Declined => Verdict::Declined,
-                    _ if got == want => Verdict::Matched,
-                    _ => Verdict::Diverged(want.clone(), got),
-                };
-                out.push(Run {
-                    op,
-                    shape: format!("argc {argc} -> {res}"),
-                    config,
-                    verdict,
-                });
+    for mint in &row.mints {
+        let setup = |_: &Module, _: &Embedder| -> (Host, Vec<Value>) {
+            let (host, handle, _) = mint();
+            (host, vec![Value::I32(handle)])
+        };
+        for op in ops(row) {
+            let mut reached = false;
+            for (argc, res) in shapes() {
+                let (_, _, real) = mint();
+                let real: Vec<(usize, i64)> = real
+                    .iter()
+                    .filter(|(o, _, _)| *o == op)
+                    .map(|(_, idx, v)| (*idx, *v))
+                    .collect();
+                let m = probe_module_with(row.iface, op, argc, res, &real);
+                let shape = format!("argc {argc} -> {res}");
+                reached |= compare(&m, &setup, runners, &format!("op {op}"), &shape, &mut out);
             }
+            assert!(
+                row.ops.is_empty() || reached,
+                "{}: op {op} reaches no op at any arity up to {MAX_ARGC} on any runner. Either it \
+                 is not an op of this interface (drop it from the row) or it needs a handle this \
+                 harness cannot mint (move the row to the undrivable set).",
+                row.cap.name(),
+            );
         }
-        assert!(
-            row.ops.is_empty() || reached,
-            "{}: op {op} reaches no op at any arity up to {MAX_ARGC} on any runner. Either it is \
-             not an op of this interface (drop it from the row) or it needs a handle this harness \
-             cannot mint (move the row to the undrivable set).",
-            row.cap.name(),
-        );
+        hold(mint, runners, &mut out);
     }
     out
+}
+
+/// Hold `mint`'s handle across a freeze it is not called in, on each durable runner among
+/// `runners`. A freeze lands at the first safepoint after a call, which a row's own ops may never
+/// reach: an empty interface's are all miscalled, and `Exit`'s ends the run. So the run calls a
+/// clock it is also granted, and freezes there with the handle in its powerbox.
+fn hold(mint: &Mint, runners: &[Config], out: &mut Vec<Run>) {
+    let setup = |_: &Module, _: &Embedder| -> (Host, Vec<Value>) {
+        let (mut host, _, _) = mint();
+        let clock = host.grant_clock();
+        (host, vec![Value::I32(clock)])
+    };
+    let durable: Vec<Config> = runners
+        .iter()
+        .copied()
+        .filter(|c| c.props.has(Property::Durable))
+        .collect();
+    let m = probe_module_with(temen_ir::cap_id::CLOCK, 0, 0, "i64", &[]);
+    compare(&m, &setup, &durable, "held", "across a clock call", out);
+}
+
+/// Run `m` over the powerbox `setup` builds on the oracle and on each of `runners`, and push the
+/// runs that had an answer to compare: whether any did.
+fn compare(
+    m: &Module,
+    setup: &Setup,
+    runners: &[Config],
+    call: &str,
+    shape: &str,
+    out: &mut Vec<Run>,
+) -> bool {
+    let g = Guest {
+        module: m,
+        setup,
+        outside: Outside::Nothing,
+    };
+    let want = once(Way::OneShot(Executor::TreeWalk), &g, false, None);
+    let mut reached = false;
+    for &config in runners {
+        let way = way(config).expect("an axis runs on the run-mode matrix's runners");
+        let got = once(way, &g, false, Some(&want));
+        if miscalled(&want) && miscalled(&got) {
+            continue;
+        }
+        reached = true;
+        let verdict = match got {
+            End::Declined => Verdict::Declined,
+            _ if got == want => Verdict::Matched,
+            _ => Verdict::Diverged(want.clone(), got),
+        };
+        out.push(Run {
+            call: call.into(),
+            shape: shape.into(),
+            config,
+            verdict,
+        });
+    }
+    reached
 }
 
 /// The cell `runs` fold to, by the run-mode matrix's rule. A row with nothing to compare (no ops,
@@ -182,11 +228,19 @@ fn fold(runs: &[&Run]) -> Status {
     fold_status(&statuses).unwrap_or(Status::Full)
 }
 
-/// The runs that did not match, grouped by op, runner and verdict, each with the shapes it took.
+/// Whether the manifest's `claimed` cell says what runs that fold to `observed` show: the fold
+/// itself, or `NotYet` for any fold short of ✅. A known gap may decline or diverge, and its issue
+/// tracks it either way, as a run-mode exception's `NotYet` holds any run short of the oracle's
+/// answer. A gap that closes folds to ✅ and fails here until its cell says so.
+fn says(claimed: Status, observed: Status) -> bool {
+    claimed == observed || (claimed == Status::NotYet && observed != Status::Full)
+}
+
+/// The runs that did not match, grouped by call, runner and verdict, each with the shapes it took.
 fn unmatched(runs: &[&Run]) -> Vec<(String, Vec<String>)> {
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
     for r in runs.iter().filter(|r| r.verdict != Verdict::Matched) {
-        let what = format!("op {} on {}: {:?}", r.op, r.config.label(), r.verdict);
+        let what = format!("{} on {}: {:?}", r.call, r.config.label(), r.verdict);
         match groups.iter_mut().find(|(w, _)| *w == what) {
             Some((_, shapes)) => shapes.push(r.shape.clone()),
             None => groups.push((what, vec![r.shape.clone()])),
@@ -220,7 +274,7 @@ fn every_run_driven_cell_matches_its_runs() {
             let these: Vec<&Run> = runs.iter().filter(|r| on.contains(&r.config)).collect();
             let observed = fold(&these);
             let claimed = capability_axes(cap)[col(axis)].status;
-            if observed == claimed {
+            if says(claimed, observed) {
                 continue;
             }
             let odd: String = unmatched(&these)
@@ -244,7 +298,8 @@ fn every_run_driven_cell_matches_its_runs() {
 /// The rows this file cannot drive, stated rather than left implicit, so the covered set cannot
 /// quietly shrink while the axes keep claiming to be run: `JitCode` and `Jit`'s `invoke` need a unit
 /// only a running guest can mint, and `Offer` and `LiveImpl` a live peer. Each is `Unaudited` on
-/// every run-driven axis, and only they are.
+/// every run-driven axis but `durability`, and only they are. On `durability` the codec's classifier
+/// decides them instead (`frontier_conformance.rs`), which needs a handle, not a running guest.
 #[test]
 fn the_undrivable_rows_are_exactly_the_ones_needing_a_running_guest_or_a_live_peer() {
     let driven: Vec<Capability> = rows().into_iter().map(|r| r.cap).collect();
@@ -259,7 +314,7 @@ fn the_undrivable_rows_are_exactly_the_ones_needing_a_running_guest_or_a_live_pe
         "the set of rows this file cannot drive changed. If a row became drivable, add it to \
          `rows()` rather than leaving the axes claiming coverage they do not have."
     );
-    for axis in run_axes() {
+    for axis in run_axes().filter(|a| *a != Axis::Durability) {
         for c in Capability::ALL {
             let unaudited = capability_axes(c)[col(axis)].status == Status::Unaudited;
             assert_eq!(
@@ -285,7 +340,10 @@ fn the_spawn_sweep_reaches_admission() {
         .into_iter()
         .find(|r| r.cap == Capability::Instantiator)
         .expect("the Instantiator row");
-    let (_, _, real) = (row.mint)();
+    let [mint] = &row.mints[..] else {
+        panic!("the Instantiator row has one mint");
+    };
+    let (_, _, real) = mint();
     let real: Vec<(usize, i64)> = real
         .iter()
         .filter(|(o, _, _)| *o == 17)
@@ -293,7 +351,7 @@ fn the_spawn_sweep_reaches_admission() {
         .collect();
     let m = probe_module_with(row.iface, 17, 1, "i32", &real);
     let setup = |_: &Module, _: &Embedder| -> (Host, Vec<Value>) {
-        let (host, handle, _) = (row.mint)();
+        let (host, handle, _) = mint();
         (host, vec![Value::I32(handle)])
     };
     let g = Guest {
