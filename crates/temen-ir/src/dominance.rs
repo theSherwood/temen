@@ -17,7 +17,7 @@ use core::ops::Range;
 
 use crate::cfg::{successors, Cfg};
 use crate::{
-    Block, BlockIdx, DebugInfo, Func, FuncIdx, SsaLoc, Terminator, ValIdx, ValType, VarLoc,
+    Block, BlockIdx, DebugInfo, Func, FuncIdx, Module, SsaLoc, Terminator, ValIdx, ValType, VarLoc,
 };
 
 /// Where each block, and each value of each block, went when a pass renumbered a function: one
@@ -500,6 +500,19 @@ impl Func {
             self.blocks.push(blk);
         }
         moves
+    }
+}
+
+impl Module {
+    /// [`Func::raise`] every function, and re-point the debug info at where each moved its blocks
+    /// and values.
+    pub fn raise(&mut self) {
+        for (i, f) in self.funcs.iter_mut().enumerate() {
+            let moves = f.raise();
+            if let Some(di) = &mut self.debug_info {
+                moves.remap_debug(di, i as FuncIdx);
+            }
+        }
     }
 }
 

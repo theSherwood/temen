@@ -451,9 +451,12 @@ fn run_link(files: &[String], out_path: Option<String>, emit_text: bool) -> Resu
             data_exports,
         });
     }
-    let linked = temen_ir::link(&units).map_err(|e| format!("link failed: {e}"))?;
+    let mut linked = temen_ir::link(&units).map_err(|e| format!("link failed: {e}"))?;
     verify_module(&linked)
         .map_err(|e| format!("verification of linked module failed (fail-closed): {e:?}"))?;
+    // What it writes is in dominance form (#2454), whatever form its units came in; whoever loads it
+    // verifies it again.
+    linked.raise();
     match out_path {
         Some(p) => {
             if p.ends_with(".temt") || p.ends_with(".ir") || p.ends_with(".txt") {

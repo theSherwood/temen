@@ -2031,7 +2031,7 @@ Two interpreter shapes, plus a deferred JIT shape:
 
 ```
 enum VarLoc {
-    Window { off: i32 },     // addr = vals[0] (data-SP) + off; constant over the function
+    Window { off: i32 },     // addr = data-SP (the function's first param) + off; constant over the function
     Ssa(LocList),            // promoted: PC-keyed list of which SSA value holds the slot
     // Machine(CraneliftValueLocList)   // JIT-optimized; deferred to S6/W5
 }
@@ -2040,7 +2040,9 @@ struct LocList(Vec<(IrPcRange, ValueIdx)>);   // IrPcRange keys on S1's IrPc
 
 **Resolution at an `IrPc` is trivial on the interpreter**, which holds every block-local SSA
 value by index in `Frame::vals` (`lib.rs:938`):
-- `Window{off}` → read `Frame::vals[0]` (data-SP), add `off`, read `len` window bytes. Constant.
+- `Window{off}` → read the data-SP (the function's first param, `Frame::sp`: a raised block
+  captures it rather than taking it as its own param 0, #2454), add `off`, read `len` window bytes.
+  Constant.
 - `Ssa(loclist)` → find the range covering the `IrPc`, read `Frame::vals[value_idx]`. **No
   Cranelift machinery, even in optimized builds.**
 

@@ -2201,7 +2201,7 @@ Picking a target is really picking the *gap* it drives to completion. Current st
   pay nothing). **Tree-walker**: `setjmp` snapshots the frame's resume point (block/inst/value-state —
   the value state is captured because `Frame::vals` is *replaced per block*) keyed by the `jmp_buf`
   address in a per-vCPU table; `longjmp` truncates the call stack back to it (intervening frames
-  discarded, no cleanup — C has none), restores the frame + data-SP (which rides in `vals[0]`), and
+  discarded, no cleanup — C has none), restores the frame + data-SP (one of its values), and
   re-enters with the result set to the long-jump value. **Engine matrix** (kept in sync — never
   divergent): **both interpreters run it** — the tree-walker (snapshots the frame's value state, since
   `vals` is replaced per block) and the **bytecode** engine (no snapshot: its flat per-function register
