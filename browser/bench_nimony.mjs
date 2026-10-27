@@ -134,12 +134,14 @@ const res = await page.evaluate(async ({ maxPages }) => {
   const tree = blob(await Promise.all(m.files.map(async (p, i) => [p, await fetchB(`./nimbench/file/${i}`)])));
   const argv = enc.encode(['bin/nimony', 't', '--novalidate', '--isMain', m.prog].map((a) => `${a}\0`).join(''));
   const driver = tools[0][1];
-  const args = [put(driver), put(cmds), put(tree), put(argv), put(enc.encode(m.dir))].flat();
+  const token = Number(ex.temen_nim_toolchain(...put(driver), ...put(cmds)));
+  if (token < 0) throw new Error(`temen_nim_toolchain: status ${ex.temen_status()}`);
+  const args = [put(tree), put(argv), put(enc.encode(m.dir))].flat();
   // #1896: a leaf process that parks on its pipes runs emitted too where JSPI suspends its frames.
   args.push(suspendsLeaves ? 1 : 0);
   const before = memory.buffer.byteLength;
   const t0 = performance.now();
-  if (ex.temen_nim_open(...args) !== 0) throw new Error(`temen_nim_open: status ${ex.temen_status()}`);
+  if (ex.temen_nim_open(token, ...args) !== 0) throw new Error(`temen_nim_open: status ${ex.temen_status()}`);
   const status = await driveCoopTierupRun(ex, memory);
   const secs = (performance.now() - t0) / 1000;
   // Reported at once, so a failure reading the results back cannot lose the measurement.
