@@ -49,33 +49,117 @@ pub(crate) struct WindowLayout {
     pub guard_offset: u64,
 }
 
-/// The bytes one relocation patches in a function's code: `[at, at + len)` is rewritten when the
-/// module links, so what runs there is not what the validator reads. No fact — a constant, a compare
-/// bound read from the constant pool — is ever taken from patched bytes (#2603).
+/// The GP registers (x86-64 numbering, a bit each) a SysV-family call clobbers: Cranelift's
+/// `SYSV_CLOBBERS`, shared by a Tail-CC callee, a host function and a libcall — rax, rcx, rdx, rsi,
+/// rdi and r8–r11. rbx, rbp and r12–r15 are callee-saved (#2603 hole 1).
+pub(crate) const SYSV_CLOBBERS: u16 = 0b0000_1111_1100_0111;
+
+/// What a call does to its caller, as far as the validator models it (#2603): the GP registers the
+/// callee may leave changed, and the bytes of stack arguments it pops on return (`None` when that
+/// isn't known, so the caller's `rsp` is unknown after the call). PR 3 adds the argument tags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Patch {
-    pub at: u32,
-    pub len: u8,
+pub(crate) struct Contract {
+    pub clobbers: u16,
+    pub pops: Option<u32>,
 }
 
-/// The [`Patch`] of each of a function's relocations `(offset, kind)`. A kind this table doesn't
-/// size is taken as 8 bytes, the widest x86-64 relocation field: over-covering is sound.
-pub(crate) fn patches(
-    relocs: impl IntoIterator<Item = (u32, cranelift_codegen::binemit::Reloc)>,
-) -> Vec<Patch> {
-    use cranelift_codegen::binemit::Reloc;
+/// The contract of a callee with signature `sig`. Every convention temen calls clobbers the SysV
+/// caller-saved registers, except `PreserveAll`, which clobbers only the registers it returns in. A
+/// `Tail` callee pops its stack arguments; the others leave them to the caller. `None` for a
+/// convention temen never calls.
+pub(crate) fn contract(sig: &cranelift_codegen::ir::Signature) -> Option<Contract> {
+    use cranelift_codegen::isa::CallConv;
+    let (clobbers, pops) = match sig.call_conv {
+        CallConv::Tail => (SYSV_CLOBBERS, tail_stack_args(sig)),
+        CallConv::SystemV | CallConv::WindowsFastcall => (SYSV_CLOBBERS, Some(0)),
+        CallConv::PreserveAll if sig.returns.is_empty() => (0, Some(0)),
+        CallConv::PreserveAll => (0b0101, Some(0)), // rax, rdx
+        _ => return None,
+    };
+    Some(Contract { clobbers, pops })
+}
+
+/// The bytes of stack arguments a `Tail` callee with signature `sig` receives, and so pops: Cranelift
+/// x64's argument layout, which passes the first six integer arguments in registers and the first
+/// eight float and vector ones in xmm registers, the rest in stack slots of at least 8 bytes aligned
+/// to their size, the area rounded up to 16. `None` for a parameter this rule doesn't cover (an
+/// `i128`, a struct argument), so the caller's `rsp` is left unknown rather than guessed.
+fn tail_stack_args(sig: &cranelift_codegen::ir::Signature) -> Option<u32> {
+    use cranelift_codegen::ir::ArgumentPurpose;
+    let (mut ints, mut vecs, mut stack) = (0u32, 0u32, 0u32);
+    for p in &sig.params {
+        let ty = p.value_type;
+        if matches!(p.purpose, ArgumentPurpose::StructArgument(_)) || ty.bits() > 128 {
+            return None;
+        }
+        let (used, max) = if ty.is_vector() || ty.is_float() {
+            (&mut vecs, 8)
+        } else if ty.bits() <= 64 {
+            (&mut ints, 6)
+        } else {
+            return None; // i128
+        };
+        if *used < max {
+            *used += 1;
+        } else {
+            let size = ty.bytes().max(8);
+            stack = stack.next_multiple_of(size) + size;
+        }
+    }
+    Some(stack.next_multiple_of(16))
+}
+
+/// One relocation in a function's code: the bytes the linker rewrites at `at` (their width is
+/// `kind`'s) and the contract of the callee it names, `None` for anything the module doesn't allow
+/// code to name. What runs at patched bytes is not what the validator reads, so no fact is ever
+/// taken from them (#2603).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Reloc {
+    pub at: u32,
+    pub kind: cranelift_codegen::binemit::Reloc,
+    pub addend: i64,
+    pub callee: Option<Contract>,
+}
+
+impl Reloc {
+    /// How many bytes it patches. A kind this table doesn't size is taken as 8, the widest x86-64
+    /// relocation field: over-covering is sound.
+    pub(crate) fn len(&self) -> usize {
+        use cranelift_codegen::binemit::Reloc as R;
+        match self.kind {
+            R::Abs4
+            | R::X86PCRel4
+            | R::X86CallPCRel4
+            | R::X86CallPLTRel4
+            | R::X86GOTPCRel4
+            | R::X86SecRel => 4,
+            _ => 8,
+        }
+    }
+}
+
+/// The validator's view of a function's relocations: each one's patched bytes, and the contract of
+/// what it names — `callee(id)` for a function the module declares, a libcall's from its signature
+/// under `cc`, and `None` for anything else (data, a linker symbol, an offset in a function).
+pub(crate) fn relocs(
+    relocs: &[cranelift_module::ModuleReloc],
+    callee: &dyn Fn(u32) -> Option<Contract>,
+    cc: cranelift_codegen::isa::CallConv,
+) -> Vec<Reloc> {
+    use cranelift_module::ModuleRelocTarget as T;
     relocs
-        .into_iter()
-        .map(|(at, kind)| Patch {
-            at,
-            len: match kind {
-                Reloc::Abs4
-                | Reloc::X86PCRel4
-                | Reloc::X86CallPCRel4
-                | Reloc::X86CallPLTRel4
-                | Reloc::X86GOTPCRel4
-                | Reloc::X86SecRel => 4,
-                _ => 8,
+        .iter()
+        .map(|r| Reloc {
+            at: r.offset,
+            kind: r.kind,
+            addend: r.addend,
+            callee: match &r.name {
+                T::User {
+                    namespace: 0,
+                    index,
+                } => callee(*index),
+                T::LibCall(lc) => contract(&lc.signature(cc, cranelift_codegen::ir::types::I64)),
+                _ => None,
             },
         })
         .collect()
@@ -94,11 +178,11 @@ pub(crate) enum Entry {
     Host,
 }
 
-/// Validate one emitted function's `bytes` against the bytes its relocations patch and what is
-/// known of its `entry`. Shadow mode: every problem is logged and counted, never returned.
-pub(crate) fn shadow_check(bytes: &[u8], patches: &[Patch], entry: Entry) {
+/// Validate one emitted function's `bytes` against its relocations and what is known of its
+/// `entry`. Shadow mode: every problem is logged and counted, never returned.
+pub(crate) fn shadow_check(bytes: &[u8], relocs: &[Reloc], entry: Entry) {
     #[cfg(target_arch = "x86_64")]
-    for f in x86::check(bytes, patches, entry) {
+    for f in x86::check(bytes, relocs, entry) {
         // Count every disagreement (a fuzz run asserts the total), but cap the logging so a bad
         // decode on every module can't swamp a fuzzer's stderr.
         let n = DISAGREEMENTS.fetch_add(1, Ordering::Relaxed);
@@ -107,7 +191,7 @@ pub(crate) fn shadow_check(bytes: &[u8], patches: &[Patch], entry: Entry) {
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = (bytes, patches, entry);
+    let _ = (bytes, relocs, entry);
 }
 
 // --- test-only capture of real compiled code, cross-checked against iced-x86 ---
@@ -116,12 +200,14 @@ pub(crate) fn shadow_check(bytes: &[u8], patches: &[Patch], entry: Entry) {
 // caller in `lib.rs` is gated to match, so it is `all(test, target_arch = "x86_64")` — on another
 // target (the aarch64 clippy lane) it would be dead code under `-D warnings`.
 
-/// One captured function: its machine code, relocation patches, and the module's window layout.
+/// One captured function: its machine code, relocations, the module's window layout, and its own
+/// contract (what a caller expects its `ret` to pop).
 #[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) struct CapturedFn {
     pub code: Vec<u8>,
-    pub patches: Vec<Patch>,
+    pub relocs: Vec<Reloc>,
     pub layout: Option<WindowLayout>,
+    pub contract: Option<Contract>,
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -132,16 +218,12 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Record one defined function's code, patches and layout, if a test armed the capture.
+/// Record one defined function, if a test armed the capture.
 #[cfg(all(test, target_arch = "x86_64"))]
-pub(crate) fn capture_code(code: &[u8], patches: Vec<Patch>, layout: Option<WindowLayout>) {
+pub(crate) fn capture_code(f: CapturedFn) {
     CAPTURE.with(|c| {
         if let Some(v) = c.borrow_mut().as_mut() {
-            v.push(CapturedFn {
-                code: code.to_vec(),
-                patches,
-                layout,
-            });
+            v.push(f);
         }
     });
 }
@@ -164,7 +246,7 @@ pub(crate) mod x86 {
     //! classification), the machine-CFG recovery and abstract dataflow (#2535), and the
     //! memory-access confinement policy (#2535/#2603) they feed.
 
-    use super::{Entry, Patch, WindowLayout};
+    use super::{Contract, Entry, Reloc, WindowLayout, SYSV_CLOBBERS};
 
     /// A machine-code policy disagreement: `why`, at byte offset `at` in the function.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,11 +263,6 @@ pub(crate) mod x86 {
         pub const RSI: u8 = 6; // fn_table_base (arg 1)
         pub const RDI: u8 = 7; // mem_base (arg 0)
     }
-
-    /// The GP registers a call clobbers: Cranelift's `SYSV_CLOBBERS`, shared by a Tail-CC callee, a
-    /// host function and a libcall — rax, rcx, rdx, rsi, rdi and r8–r11. rbx, rbp and r12–r15 are
-    /// callee-saved and survive the call (#2603 hole 1).
-    const CALL_CLOBBERS: u16 = 0b0000_1111_1100_0111;
 
     /// The largest machine access width (AVX-512 zmm) — used as a sound over-estimate when checking
     /// that a confined access's displacement rides within the guard slack. (Decoding the exact width
@@ -226,6 +303,9 @@ pub(crate) mod x86 {
         /// The jump table's address plus one of its entries: the `jmp` target Cranelift's
         /// `JmpTableSeq` computes, one of the `n` targets the table at `at` lists.
         TableTarget { at: u32, n: u32 },
+        /// The address of a callee a relocation names (`movabs r, sym`), which a call through the
+        /// register calls under the callee's contract.
+        FnAddr(Contract),
         /// No information.
         Unknown,
     }
@@ -373,34 +453,51 @@ pub(crate) mod x86 {
     }
 
     /// What the transfer reads besides the instruction: the function's bytes (a compare bound sits
-    /// in its own constant pool), the bytes its relocations patch, and the module's window layout.
+    /// in its own constant pool), its relocations, and the module's window layout.
     #[derive(Clone, Copy)]
     struct Ctx<'a> {
         bytes: &'a [u8],
-        patches: &'a [Patch],
+        relocs: &'a [Reloc],
         layout: Option<WindowLayout>,
     }
 
-    /// Whether a relocation in `patches` patches any of the bytes `[at, at + len)`.
-    fn patched(patches: &[Patch], at: usize, len: usize) -> bool {
-        len != 0
-            && patches.iter().any(|p| {
-                let start = p.at as usize;
-                start < at + len && at < start + usize::from(p.len)
-            })
-    }
-
-    /// Whether the direct `jmp` `d` at `pos` is a tail call: a `jmp rel32` whose displacement the
-    /// linker patches leaves the function for the symbol it names, so it has no successor here.
-    fn tail_call(d: &Decoded, pos: usize, patches: &[Patch]) -> bool {
-        matches!(d.kind, Kind::DirectJmp { .. })
-            && d.len >= 5
-            && patched(patches, pos + d.len - 4, 4)
-    }
-
     impl Ctx<'_> {
+        /// Whether a relocation patches any of the bytes `[at, at + len)`.
         fn patched(&self, at: usize, len: usize) -> bool {
-            patched(self.patches, at, len)
+            len != 0
+                && self.relocs.iter().any(|r| {
+                    let start = r.at as usize;
+                    start < at + len && at < start + r.len()
+                })
+        }
+        /// The relocation on the `rel32` of the 5-byte `call`/`jmp` `d` at `pos`, if it is the one
+        /// a call or tail call carries (PC-relative to the field's end, addend −4).
+        fn call_reloc(&self, pos: usize, d: &Decoded) -> Option<&Reloc> {
+            use cranelift_codegen::binemit::Reloc as R;
+            (d.len == 5).then_some(())?;
+            self.relocs.iter().find(|r| {
+                r.at as usize == pos + 1
+                    && matches!(r.kind, R::X86CallPCRel4 | R::X86CallPLTRel4)
+                    && r.addend == -4
+            })
+        }
+        /// The relocation on the `imm64` of the `movabs` `d` at `pos`, if it is the absolute address
+        /// of a symbol (`Abs8`, addend 0).
+        fn abs_reloc(&self, pos: usize, d: &Decoded) -> Option<&Reloc> {
+            use cranelift_codegen::binemit::Reloc as R;
+            (matches!(d.eff, Eff::MovImm { .. }) && d.imm_len == 8).then_some(())?;
+            let at = pos + d.len - 8;
+            self.relocs
+                .iter()
+                .find(|r| r.at as usize == at && r.kind == R::Abs8 && r.addend == 0)
+        }
+        /// The relocation on an instruction's operand field the validator recognizes: a call's or tail
+        /// call's `rel32`, or a `movabs`'s `imm64`.
+        fn field_reloc(&self, pos: usize, d: &Decoded) -> Option<&Reloc> {
+            match d.kind {
+                Kind::DirectCall | Kind::DirectJmp { .. } => self.call_reloc(pos, d),
+                _ => self.abs_reloc(pos, d),
+            }
         }
         /// The `w`-byte little-endian constant at function offset `at`, if the function holds all of
         /// it and no relocation patches any of it.
@@ -423,6 +520,12 @@ pub(crate) mod x86 {
         }
     }
 
+    /// Whether the direct `jmp` `d` at `pos` is a tail call: a `jmp rel32` that carries a call
+    /// relocation leaves the function for the symbol it names, so it has no successor here.
+    fn tail_call(d: &Decoded, pos: usize, ctx: Ctx) -> bool {
+        matches!(d.kind, Kind::DirectJmp { .. }) && ctx.call_reloc(pos, d).is_some()
+    }
+
     /// A function's machine CFG: the block leaders, each block's decoded instructions, and each
     /// block's successors (indices into `leaders`).
     struct Cfg {
@@ -443,8 +546,7 @@ pub(crate) mod x86 {
             let mut blocks = Vec::with_capacity(nb);
             let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
             for i in 0..nb {
-                let (insns, direct) =
-                    decode_block(bytes, leaders[i], limit_of(i), ctx.patches, findings);
+                let (insns, direct) = decode_block(ctx, leaders[i], limit_of(i), findings);
                 for s in direct {
                     if let Some(si) = index_of(s) {
                         if !succs[i].contains(&si) {
@@ -473,11 +575,56 @@ pub(crate) mod x86 {
                 }
                 blocks.push(insns);
             }
+            classify_relocs(ctx, &blocks, findings);
             Cfg {
                 leaders,
                 blocks,
                 succs,
             }
+        }
+    }
+
+    /// Layer 1's relocation rule (#2603): every relocation must sit on an operand field the validator
+    /// recognizes — a call's or tail call's `rel32`, or a `movabs`'s `imm64` — of an instruction it
+    /// decodes, and name a callee the module allows. A `call rel32` must carry one: without it, the
+    /// call lands at an offset of the code's own choosing.
+    fn classify_relocs(ctx: Ctx, blocks: &[Vec<(usize, Decoded)>], findings: &mut Vec<Finding>) {
+        let mut claimed = vec![false; ctx.relocs.len()];
+        for &(pos, d) in blocks.iter().flatten() {
+            let field = ctx.field_reloc(pos, &d).map(|r| r.at);
+            for (i, r) in ctx.relocs.iter().enumerate() {
+                let start = r.at as usize;
+                if !(start < pos + d.len && pos < start + r.len()) {
+                    continue;
+                }
+                claimed[i] = true;
+                let why = if field != Some(r.at) {
+                    "patches this instruction outside a call target or a movabs immediate"
+                } else if r.callee.is_none() {
+                    "names a target the module does not allow code to call"
+                } else {
+                    continue;
+                };
+                findings.push(Finding {
+                    at: pos,
+                    why: format!("relocation at +0x{start:x} {why}"),
+                });
+            }
+            if d.kind == Kind::DirectCall && field.is_none() {
+                findings.push(Finding {
+                    at: pos,
+                    why: "direct call without a relocation".into(),
+                });
+            }
+        }
+        for (r, _) in ctx.relocs.iter().zip(&claimed).filter(|(_, &c)| !c) {
+            findings.push(Finding {
+                at: r.at as usize,
+                why: format!(
+                    "relocation at +0x{:x} patches no instruction the code runs",
+                    r.at
+                ),
+            });
         }
     }
 
@@ -548,8 +695,8 @@ pub(crate) mod x86 {
         }
     }
 
-    /// Validate one emitted function's `bytes` against the bytes its relocations patch and what is
-    /// known of its entry, returning every policy finding. Pure, so tests assert on the findings
+    /// Validate one emitted function's `bytes` against its relocations and what is known of its
+    /// entry, returning every policy finding. Pure, so tests assert on the findings
     /// directly. Nothing Cranelift says about the code is an input (#2603 D3).
     ///
     /// Three layers (#2481 slice 1 + #2535):
@@ -570,7 +717,7 @@ pub(crate) mod x86 {
     /// guesses a state per block — a heuristic, free to widen or give up — and [`verify`] checks the
     /// guess in one linear pass. A wrong or unconverged guess fails the check; it never admits code.
     /// It needs the guest entry contract, so a trampoline ([`Entry::Host`]) gets layers 1–2 only.
-    pub(crate) fn check(bytes: &[u8], patches: &[Patch], entry: Entry) -> Vec<Finding> {
+    pub(crate) fn check(bytes: &[u8], relocs: &[Reloc], entry: Entry) -> Vec<Finding> {
         let mut findings = Vec::new();
         if bytes.is_empty() {
             return findings;
@@ -581,7 +728,7 @@ pub(crate) mod x86 {
         };
         let ctx = Ctx {
             bytes,
-            patches,
+            relocs,
             layout,
         };
         let cfg = Cfg::build(ctx, &mut findings);
@@ -690,7 +837,7 @@ pub(crate) mod x86 {
     /// bounded by the code size, so it terminates). The walk stops at a non-fall-through terminator,
     /// so inter-block island/table data is never decoded.
     fn recover_leaders(ctx: Ctx) -> Vec<usize> {
-        let (bytes, patches) = (ctx.bytes, ctx.patches);
+        let bytes = ctx.bytes;
         let len = bytes.len();
         let mut leaders: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         leaders.insert(0);
@@ -710,7 +857,7 @@ pub(crate) mod x86 {
                     run.push((pos, d));
                     match d.kind {
                         Kind::DirectJmp { target } => {
-                            if target < len && !tail_call(&d, pos, patches) {
+                            if target < len && !tail_call(&d, pos, ctx) {
                                 leaders.insert(target);
                             }
                             break;
@@ -752,12 +899,12 @@ pub(crate) mod x86 {
     /// next offset). Pushes layer-1 findings: undecodable encodings, forbidden instructions, block
     /// overruns, direct branches out of the code, and control falling off the end of the function.
     fn decode_block(
-        bytes: &[u8],
+        ctx: Ctx,
         block: usize,
         limit: usize,
-        patches: &[Patch],
         findings: &mut Vec<Finding>,
     ) -> (Vec<(usize, Decoded)>, Vec<usize>) {
+        let bytes = ctx.bytes;
         let off_the_end = |at: usize| Finding {
             at,
             why: "control falls off the end of the function".into(),
@@ -779,7 +926,7 @@ pub(crate) mod x86 {
                     why: format!("forbidden instruction: {name}"),
                 }),
                 Kind::DirectJmp { target } | Kind::DirectJcc { target }
-                    if target >= bytes.len() && !tail_call(&d, pos, patches) =>
+                    if target >= bytes.len() && !tail_call(&d, pos, ctx) =>
                 {
                     findings.push(Finding {
                         at: pos,
@@ -800,9 +947,7 @@ pub(crate) mod x86 {
             }
             insns.push((pos, d));
             match d.kind {
-                Kind::DirectJmp { .. } if tail_call(&d, pos, patches) => {
-                    return (insns, Vec::new())
-                }
+                Kind::DirectJmp { .. } if tail_call(&d, pos, ctx) => return (insns, Vec::new()),
                 Kind::DirectJmp { target } => return (insns, vec![target]),
                 Kind::DirectJcc { target } => {
                     if next >= bytes.len() {
@@ -986,10 +1131,10 @@ pub(crate) mod x86 {
                     set(&mut state, dst, f);
                 }
                 Eff::MovImm { dst, imm } => {
-                    let f = if imm_ok {
-                        Fact::Const(imm)
-                    } else {
-                        Fact::Unknown
+                    let f = match ctx.abs_reloc(pos, &d) {
+                        Some(r) => r.callee.map_or(Fact::Unknown, Fact::FnAddr),
+                        None if imm_ok => Fact::Const(imm),
+                        None => Fact::Unknown,
                     };
                     set(&mut state, dst, f);
                 }
@@ -1091,16 +1236,35 @@ pub(crate) mod x86 {
                 Eff::StoreReg { .. } | Eff::WrReg | Eff::WrRm | Eff::Wr(_) | Eff::NoGp => {}
             }
             if matches!(d.kind, Kind::DirectCall | Kind::IndirectCall) {
-                // A call returns with the clobbered registers and the flags unknown (below). The callee
-                // writes under the return address and, under Tail CC, pops its stack arguments, so
-                // neither rsp's offset nor any slot survives the call until #2603 PR 2 supplies each
-                // callee's stack effect.
+                // A call runs its callee's contract: the registers it clobbers become unknown (below),
+                // the rest keep their facts, the flags are forgotten, and rsp moves by what the
+                // callee pops. An unidentified callee is a finding, and is taken to clobber the SysV
+                // set and pop an unknown amount. No slot survives a call until #2603 PR 3 checks that
+                // every callee writes only its own frame.
+                let callee = match d.kind {
+                    Kind::DirectCall => ctx.call_reloc(pos, &d).and_then(|r| r.callee),
+                    _ => indirect_callee(&state, &d),
+                };
+                if callee.is_none() && d.kind == Kind::IndirectCall {
+                    if let Some(f) = findings.as_deref_mut() {
+                        f.push(Finding {
+                            at: pos,
+                            why: "indirect call to an unidentified callee".into(),
+                        });
+                    }
+                }
+                let c = callee.unwrap_or(Contract {
+                    clobbers: SYSV_CLOBBERS,
+                    pops: None,
+                });
                 state.clear_slots();
-                let rsp = match fact(&state, reg::RSP) {
-                    Fact::Stack(_) => Fact::Stack(None),
+                let rsp = match (fact(&state, reg::RSP), c.pops) {
+                    (Fact::Stack(Some(h)), Some(p)) => Fact::Stack(h.checked_add(i64::from(p))),
+                    (Fact::Stack(_), _) => Fact::Stack(None),
                     _ => Fact::Unknown,
                 };
                 set(&mut state, reg::RSP, rsp);
+                defined |= !c.clobbers;
             }
             for r in 0..16u8 {
                 if written & !defined & bit(r) != 0 {
@@ -1150,6 +1314,18 @@ pub(crate) mod x86 {
             }
         }
         state
+    }
+
+    /// The contract of what an indirect `call` reaches: a callee whose address a relocation names
+    /// (`movabs r, sym; call r`). Anything else is unidentified.
+    fn indirect_callee(state: &State, d: &Decoded) -> Option<Contract> {
+        if d.operands.mem.is_some() {
+            return None;
+        }
+        match state.regs[d.operands.rm_reg? as usize & 15] {
+            Fact::FnAddr(c) => Some(c),
+            _ => None,
+        }
     }
 
     /// Where an explicit memory operand points in the stack frame: `Some(Some(off))` for a plain
@@ -1238,7 +1414,7 @@ pub(crate) mod x86 {
             Eff::Wr(m) => m,
         };
         let implicit = match d.kind {
-            Kind::DirectCall | Kind::IndirectCall => CALL_CLOBBERS | bit(reg::RSP),
+            Kind::DirectCall | Kind::IndirectCall => SYSV_CLOBBERS | bit(reg::RSP),
             Kind::Ret => bit(reg::RSP),
             _ => 0,
         };
@@ -2427,10 +2603,10 @@ pub(crate) mod x86 {
     /// Every instruction the validator decodes, block by block, as [`check`] visits them. Test-only,
     /// for the iced-x86 cross-check.
     #[cfg(test)]
-    pub(crate) fn walk(bytes: &[u8], patches: &[Patch]) -> Vec<(usize, Decoded)> {
+    pub(crate) fn walk(bytes: &[u8], relocs: &[Reloc]) -> Vec<(usize, Decoded)> {
         let ctx = Ctx {
             bytes,
-            patches,
+            relocs,
             layout: None,
         };
         let mut findings = Vec::new();
@@ -2445,6 +2621,7 @@ pub(crate) mod x86 {
     mod tests {
         use super::*;
         use crate::{compile, validate};
+        use cranelift_codegen::binemit::Reloc as R;
         use iced_x86::{
             Decoder, DecoderOptions, Instruction, InstructionInfoFactory, OpAccess, OpKind,
             Register,
@@ -2524,7 +2701,7 @@ pub(crate) mod x86 {
         fn cross_check(src: &str) {
             for f in compiled(src) {
                 let bytes = &f.code;
-                for (pos, d) in walk(bytes, &f.patches) {
+                for (pos, d) in walk(bytes, &f.relocs) {
                     assert_ne!(d.len, 0, "ours: undecodable at +0x{pos:x}\n{:02x?}", bytes);
                     let insn = iced_at(bytes, pos).unwrap_or_else(|| {
                         panic!("iced rejects what we decoded at +0x{pos:x}\n{:02x?}", bytes)
@@ -2557,6 +2734,19 @@ pub(crate) mod x86 {
                     if d.keeps_flags {
                         assert_eq!(insn.rflags_modified(), 0, "{}", at("modifies the flags"));
                     }
+                    // A `ret` pops what the function's own signature says its callers pass on the
+                    // stack, the stack effect each call to it is checked under (#2603). (No function
+                    // here tail-calls with more stack arguments than it takes, which would grow its
+                    // argument area and its `ret`.)
+                    if d.kind == Kind::Ret {
+                        let pops = if d.len == 3 {
+                            u32::from(u16::from_le_bytes([bytes[pos + 1], bytes[pos + 2]]))
+                        } else {
+                            0
+                        };
+                        let want = f.contract.and_then(|c| c.pops);
+                        assert_eq!(Some(pops), want, "{}", at("ret pops"));
+                    }
                     match d.eff {
                         Eff::Cmov { cc, .. } => {
                             // iced numbers the conditions from 1 (0 is "none").
@@ -2588,7 +2778,7 @@ pub(crate) mod x86 {
                     }
                 }
                 let entry = Entry::Guest(f.layout);
-                let findings = check(bytes, &f.patches, entry);
+                let findings = check(bytes, &f.relocs, entry);
                 assert!(
                     findings.is_empty(),
                     "clean Cranelift output flagged: {findings:?}\n{:02x?}",
@@ -2817,6 +3007,32 @@ pub(crate) mod x86 {
             f.iter().any(|f| f.why.contains(needle))
         }
 
+        /// What the hand-assembled calls below name: a Tail-CC callee that pops nothing.
+        const TAIL0: Contract = Contract {
+            clobbers: SYSV_CLOBBERS,
+            pops: Some(0),
+        };
+
+        /// The relocation a call or tail call to [`TAIL0`] carries on the `rel32` at `at`.
+        fn call_reloc(at: u32) -> Reloc {
+            Reloc {
+                at,
+                kind: R::X86CallPCRel4,
+                addend: -4,
+                callee: Some(TAIL0),
+            }
+        }
+
+        /// A relocation of kind `kind` on data at `at`, naming nothing a call may reach.
+        fn data_reloc(at: u32, kind: R) -> Reloc {
+            Reloc {
+                at,
+                kind,
+                addend: 0,
+                callee: None,
+            }
+        }
+
         /// `bytes` = `GUARD` followed by `rest`.
         fn after_guard(rest: &[u8]) -> Vec<u8> {
             [&GUARD[..], rest].concat()
@@ -2824,13 +3040,18 @@ pub(crate) mod x86 {
 
         /// Run `bytes`, one block, from the entry state.
         fn run(bytes: &[u8]) -> State {
+            run_with(bytes, &[])
+        }
+
+        /// [`run`], with `relocs`.
+        fn run_with(bytes: &[u8], relocs: &[Reloc]) -> State {
             let mut fs = Vec::new();
-            let (insns, _) = decode_block(bytes, 0, bytes.len(), &[], &mut fs);
             let ctx = Ctx {
                 bytes,
-                patches: &[],
+                relocs,
                 layout: WIN,
             };
+            let (insns, _) = decode_block(ctx, 0, bytes.len(), &mut fs);
             transfer_block(&insns, State::entry(), None, ctx)
         }
 
@@ -2899,7 +3120,7 @@ pub(crate) mod x86 {
                 f.is_empty(),
                 "a constant-pool bound was not recognized: {f:?}"
             );
-            let patched = [Patch { at: 26, len: 8 }];
+            let patched = [data_reloc(26, R::Abs8)];
             let f = check(&bytes, &patched, Entry::Guest(WIN));
             assert!(
                 has(&f, "unconfined index"),
@@ -2972,12 +3193,122 @@ pub(crate) mod x86 {
                 0x5d, // [19] pop rbp
                 0xc3, // [1a] ret
             ];
-            let patches = [Patch { at: 0x12, len: 4 }];
-            let f = check(&bytes, &patches, Entry::Guest(WIN));
+            let f = check(&bytes, &[call_reloc(0x12)], Entry::Guest(WIN));
             assert!(
                 f.is_empty(),
                 "a tail call fell through into the next block: {f:?}"
             );
+        }
+
+        /// A callee's stack effect follows Cranelift x64's `Tail` layout: six integer and eight
+        /// float or vector arguments in registers, the rest in 8-byte stack slots, the area rounded
+        /// up to 16. SysV-family callees pop nothing, and `PreserveAll` clobbers only its results.
+        #[test]
+        fn contracts_follow_the_calling_convention() {
+            use cranelift_codegen::ir::{types, AbiParam, Signature};
+            use cranelift_codegen::isa::CallConv;
+            let sig = |cc, params: &[types::Type], returns: &[types::Type]| {
+                let mut s = Signature::new(cc);
+                s.params = params.iter().map(|&t| AbiParam::new(t)).collect();
+                s.returns = returns.iter().map(|&t| AbiParam::new(t)).collect();
+                s
+            };
+            let pops = |params: &[types::Type]| {
+                super::super::contract(&sig(CallConv::Tail, params, &[])).and_then(|c| c.pops)
+            };
+            use types::{F64, I128, I32, I64, I8X16};
+            assert_eq!(pops(&[I64; 6]), Some(0));
+            assert_eq!(pops(&[I64; 7]), Some(16)); // one 8-byte slot, rounded up to 16
+            assert_eq!(pops(&[I64; 9]), Some(32)); // three slots
+            assert_eq!(pops(&[I32; 8]), Some(16)); // narrow integers take whole slots
+            assert_eq!(pops(&[F64; 9]), Some(16)); // the ninth float spills
+            assert_eq!(pops(&[I8X16; 9]), Some(16)); // a 16-byte vector slot
+            assert_eq!(pops(&[I64, F64, I64, F64]), Some(0));
+            assert_eq!(pops(&[I128]), None); // not modeled: the caller's rsp is left unknown
+            let sysv = super::super::contract(&sig(CallConv::SystemV, &[I64; 9], &[I64]));
+            assert_eq!(
+                sysv,
+                Some(Contract {
+                    clobbers: SYSV_CLOBBERS,
+                    pops: Some(0)
+                })
+            );
+            let preserve = |r: &[types::Type]| {
+                super::super::contract(&sig(CallConv::PreserveAll, &[I64], r)).map(|c| c.clobbers)
+            };
+            assert_eq!(preserve(&[]), Some(0));
+            assert_eq!(preserve(&[I64]), Some(0b0101));
+            assert_eq!(
+                super::super::contract(&sig(CallConv::Winch, &[], &[])),
+                None
+            );
+        }
+
+        /// Hole 14's relocation rule: every relocation sits on a call's `rel32` or a `movabs`'s
+        /// `imm64` and names an allowed callee, and every `call rel32` carries one.
+        #[test]
+        fn relocs_must_sit_on_a_recognized_field() {
+            let call = [0xe8, 0, 0, 0, 0, 0xc3]; // call <rel32>; ret
+            assert!(has(&findings(&call), "direct call without a relocation"));
+            let f = check(&call, &[call_reloc(1)], Entry::Guest(WIN));
+            assert!(f.is_empty(), "a relocated call was flagged: {f:?}");
+            let disallowed = Reloc {
+                callee: None,
+                ..call_reloc(1)
+            };
+            let f = check(&call, &[disallowed], Entry::Guest(WIN));
+            assert!(has(&f, "does not allow code to call"), "{f:?}");
+            let shifted = Reloc {
+                addend: 0,
+                ..call_reloc(1)
+            };
+            let f = check(&call, &[shifted], Entry::Guest(WIN));
+            assert!(has(&f, "outside a call target"), "{f:?}");
+            let misplaced = call_reloc(2);
+            let f = check(&call, &[misplaced], Entry::Guest(WIN));
+            assert!(has(&f, "outside a call target"), "{f:?}");
+            let data = [0xc3, 0, 0, 0, 0, 0, 0, 0, 0]; // ret; then 8 bytes no code reaches
+            let f = check(&data, &[data_reloc(1, R::Abs8)], Entry::Guest(WIN));
+            assert!(has(&f, "patches no instruction"), "{f:?}");
+        }
+
+        /// A call runs its callee's contract. Through a `movabs` of a relocated symbol, `call rax`
+        /// reaches that callee: a SysV one clobbers mem_base in rdi and pops nothing, a `Tail` one
+        /// pops its stack arguments, a `PreserveAll` one clobbers nothing. A call through a register
+        /// that names no callee is a finding.
+        #[test]
+        fn calls_run_their_callees_contract() {
+            let bytes = [
+                0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, // [0] movabs rax, <sym>   (Abs8 at 2)
+                0xff, 0xd0, // [10] call rax
+            ];
+            let with = |c: Contract| {
+                let r = Reloc {
+                    at: 2,
+                    kind: R::Abs8,
+                    addend: 0,
+                    callee: Some(c),
+                };
+                run_with(&bytes, &[r])
+            };
+            let sysv = with(Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(0),
+            });
+            assert_eq!(sysv.regs[reg::RDI as usize], Fact::Unknown);
+            assert_eq!(sysv.regs[reg::RSP as usize], Fact::Stack(Some(0)));
+            let tail = with(Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(16),
+            });
+            assert_eq!(tail.regs[reg::RSP as usize], Fact::Stack(Some(16)));
+            let preserve = with(Contract {
+                clobbers: 0,
+                pops: Some(0),
+            });
+            assert_eq!(preserve.regs[reg::RDI as usize], Fact::MemBase);
+            let unknown = [0x48, 0x89, 0xf0, 0xff, 0xd0, 0xc3]; // mov rax, rsi; call rax; ret
+            assert!(has(&findings(&unknown), "unidentified callee"));
         }
 
         /// br_table's dispatch as Cranelift emits it (`JmpTableSeq` behind the index clamp), with
@@ -3010,7 +3341,7 @@ pub(crate) mod x86 {
             assert!(f.is_empty(), "a well-formed jump table was flagged: {f:?}");
             let ctx = Ctx {
                 bytes: &bytes,
-                patches: &[],
+                relocs: &[],
                 layout: WIN,
             };
             let mut fs = Vec::new();
@@ -3041,7 +3372,7 @@ pub(crate) mod x86 {
             let split = jump_table(3, [0x10, 0x11, 0x12, -0x0e]); // → +0f, inside the `lea`
             assert!(has(&findings(&split), "overruns its block"));
             let bytes = jump_table(3, [0x10, 0x11, 0x12, 0x13]);
-            let patched = [Patch { at: 0x21, len: 4 }];
+            let patched = [data_reloc(0x21, R::Abs4)];
             let f = check(&bytes, &patched, Entry::Guest(WIN));
             assert!(has(&f, "holds no jump-table target"), "{f:?}");
         }
@@ -3250,7 +3581,7 @@ pub(crate) mod x86 {
             ];
             let ctx = Ctx {
                 bytes: &bytes,
-                patches: &[],
+                relocs: &[],
                 layout: WIN,
             };
             let mut fs = Vec::new();
