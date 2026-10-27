@@ -647,22 +647,35 @@ Where each face runs:
 
 - **The pump** (`driveCoopTierupRun`): `onCap` runs on the pump's thread, from the pump or from a
   bounce out of emitted code.
-- **Executor 2** (`par.js`'s `runAcrossWorkers` with `onCap`): the calling task's Worker sends the
-  call to the page (`worker.js`'s `js_cap_call`) and waits inside it; the page runs `onCap` over the
-  task's window and answers in the Worker's cell. A detached child's window is a memory of its own,
-  which the page registers for the call (`foreign-mem.js`). The waiting Worker holds the run's shared
-  host, as every capability call does, so the run's other capability calls wait meanwhile, and
-  `onCap` reaches the engine only through `mem`. The page never waits on an engine lock: a window
-  read that finds the page map changing spins (`Mem::space_read` on the threads build).
+- **Executor 2** (`par.js`'s `runAcrossWorkers`), in one of two places the run's options choose:
+  - **in the calling task's own Worker**, with `capModule`: a module URL whose `onCap` export every
+    Worker of the run imports (#2645). A call costs about what it costs on the pump (5.8 µs in
+    headless Chromium, against 1.76 µs on the pump). The module's JS state is each Worker's own, and
+    it has a Worker's APIs, not the page's: OPFS's synchronous access handles, but not the DOM;
+  - **on the page**, with `onCap`: the calling task's Worker sends the call there (`worker.js`'s
+    `js_cap_call`) and waits inside it; the page runs `onCap` over the task's window and answers in
+    the Worker's cell. A detached child's window is a memory of its own, which the page registers
+    for the call (`foreign-mem.js`). Each call is a round trip to the page's main thread (about
+    50 µs here, the browser's floor, not overhead), and a call that waits holds the page, which
+    starts the run's Workers. `onCap` reaches the engine only through `mem`: the page never waits on
+    an engine lock, and a window read that finds the page map changing spins (`Mem::space_read` on
+    the threads build).
+
+  Either way a JS capability is an **unlocked** host procedure (`Host::grant_host_proc_unlocked`,
+  #2645): its call runs with its domain's host let go, so a call that waits holds back no other
+  task's host call.
 - **A Worker that runs an engine of its own** on the cooperative driver serves JS capabilities as
-  the page does.
+  the page does. The module a run on executor 2 takes serves the pump too: pass its `onCap`.
 
 Gates: `browser/tests/jspb.rs` (native — staging, name binding, window read/write, children,
 fail-closed refusal, `-ENOSYS` with no servicer), `browser/browser-jspb-test.mjs` (headless node —
 the real wasm import, the ABI marshalling, and the shipped `web/powerbox.js`),
-`browser/browser-coop-embedder-test.mjs` (the pump in Node and Chromium; executor 2 in Chromium: the
-root's calls, a leaf's, a thread's and a detached child's), and the playground's **"JS powerbox"**
-card, whose guest program the native test mirrors.
+`browser/browser-coop-embedder-test.mjs` (the pump in Node and Chromium; executor 2 in Chromium:
+the root's calls, a leaf's, a thread's and a detached child's, answered on the page and in the
+Worker, and a thread's call that waits while another thread's host calls go on), and the
+playground's **"JS powerbox"** card, whose guest program the native test mirrors. The capabilities
+the embedder cases stage live in one module (`browser/coop-embedder-jscaps.mjs`), which the page
+and executor 2's Workers both load.
 
 ## Link-time dead-code elimination, and linking against several units (#1407 / #1408)
 
