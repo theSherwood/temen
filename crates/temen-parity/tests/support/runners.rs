@@ -17,7 +17,7 @@ use crate::drivers::{run_on, Driver, Pumped};
 use crate::probes::{self, Embedder, Outside, Stopper, ARENA};
 use temen_durable::{begin_thaw, init_durable_window, read_state, write_state};
 use temen_interp::bytecode::{
-    module_spawns_threads, CoopEvent, CoopRun, SchedStop, ScheduledDebugRun,
+    module_spawns_threads, CoopEvent, CoopRun, Reactor, SchedStop, ScheduledDebugRun,
 };
 use temen_interp::{Host, Inspector, MemLayout, Stop, Trap, Value};
 use temen_ir::durable_abi::STATE_UNWINDING;
@@ -73,13 +73,19 @@ pub enum Way {
     Held(Pumped),
     /// An executor's durable entry, run frozen and thawed ([`durable`]).
     Durable(Executor),
+    /// The pump's reactor (`bytecode::Reactor`), its entry called as frames ([`reactor`]): each run
+    /// to its end, or with `held`, each a `CoopRun` held and resumed by this harness.
+    Reactor { held: bool },
 }
 
 impl Way {
     /// Whether nobody holds a run this way: it gets what its embedder gives it from outside from a
     /// thread of its own, rather than when it hands control back.
     pub fn unheld(self) -> bool {
-        matches!(self, Way::OneShot(_) | Way::Inspector | Way::Durable(_))
+        matches!(
+            self,
+            Way::OneShot(_) | Way::Inspector | Way::Durable(_) | Way::Reactor { held: false }
+        )
     }
 }
 
@@ -100,6 +106,10 @@ pub fn way(c: Config) -> Option<Way> {
         Way::Held(Pumped::Threads)
     } else if c.props == Props::of(&[Durable]) && c.executor != Parallel {
         Way::Durable(c.executor)
+    } else if c == Config::new(Pump, &[Reactor]) {
+        Way::Reactor { held: false }
+    } else if c == Config::new(Pump, &[Reactor, Held]) {
+        Way::Reactor { held: true }
     } else {
         return None;
     })
@@ -127,13 +137,17 @@ pub struct Guest<'a> {
 }
 
 /// Run `g` once on `way`, over a fresh embedder. `armed` arms the run's external-wake bell, saying
-/// its embedder may act on it from outside, and has a thread continue the process once it asks to
-/// stop. `want` is the oracle's answer, which a durable run must keep across its freeze; no other
+/// its embedder may act on it from outside, and has a thread continue the process each time it
+/// stops. `want` is the oracle's answer, which a durable run must keep across its freeze; no other
 /// way reads it.
 pub fn once(way: Way, g: &Guest, armed: bool, want: Option<&End>) -> End {
-    if let Way::Durable(x) = way {
-        let want = want.expect("a durable run is held to the oracle's answer");
-        return durable(x, g, armed, want);
+    match way {
+        Way::Durable(x) => {
+            let want = want.expect("a durable run is held to the oracle's answer");
+            return durable(x, g, armed, want);
+        }
+        Way::Reactor { held } => return reactor(g, held, armed),
+        _ => {}
     }
     let m = g.module;
     let e = Embedder::default();
@@ -152,7 +166,7 @@ pub fn once(way: Way, g: &Guest, armed: bool, want: Option<&End>) -> End {
         Way::Inspector => inspected(m, unheld()),
         Way::DebugScheduler => debugged(m, (g.setup)(m, &e), g.outside, &e.stopper),
         Way::Held(exec) => held(exec, m, (g.setup)(m, &e), g.outside, &e.stopper),
-        Way::Durable(_) => unreachable!("driven by `durable` above"),
+        Way::Durable(_) | Way::Reactor { .. } => unreachable!("driven above"),
     };
     // The run is over: a continue thread still waiting has nothing to continue.
     e.stopper.close();
@@ -161,8 +175,8 @@ pub fn once(way: Way, g: &Guest, armed: bool, want: Option<&End>) -> End {
 
 /// The powerbox `e` gives a run of `m` (the guest's module, or its instrumented twin) that nobody
 /// holds, with what it gives the run from outside from a thread of its own: input fed from a
-/// source, and, when `armed`, the run's external-wake bell armed and the process continued once it
-/// asks to stop.
+/// source, and, when `armed`, the run's external-wake bell armed and the process continued each
+/// time it stops.
 fn unheld(m: &Module, g: &Guest, e: &Embedder, armed: bool) -> (Host, Vec<Value>) {
     let (mut host, args) = (g.setup)(m, e);
     if e.durable {
@@ -180,12 +194,7 @@ fn unheld(m: &Module, g: &Guest, e: &Embedder, armed: bool) -> (Host, Vec<Value>
     if armed {
         host.arm_external_wake();
         let s = Arc::clone(&e.stopper);
-        std::thread::spawn(move || {
-            s.await_stop();
-            if s.is_stopped() {
-                s.set(false);
-            }
-        });
+        std::thread::spawn(move || s.continue_each_stop());
     }
     (host, args)
 }
@@ -302,10 +311,7 @@ fn debugged(
     }
 }
 
-/// Hold `m` as a `CoopRun` on `exec` and resume it to its end. A run idle on a stopped process gets
-/// it continued, and one idle on what the embedder feeds gets the probe's bytes once; idle
-/// otherwise, it waits on an answer the probe gives itself, and is resumed shortly, the time it
-/// waited passed.
+/// Hold `m` as a `CoopRun` on `exec` and resume it to its end ([`pump`]).
 fn held(
     exec: Pumped,
     m: &Module,
@@ -313,11 +319,7 @@ fn held(
     outside: Outside,
     stopper: &Stopper,
 ) -> End {
-    let mut feed = match outside {
-        Outside::Feed(bytes) => Some(bytes),
-        Outside::Nothing | Outside::Continue => None,
-    };
-    host.set_stdin_blocking(feed.is_some());
+    host.set_stdin_blocking(matches!(outside, Outside::Feed(_)));
     let reserved = temen_ir::default_reserved_log2();
     let run = match exec {
         Pumped::Pump => CoopRun::new_reserved(m, 0, &args, FUEL, host, None, &[], reserved),
@@ -325,10 +327,20 @@ fn held(
             CoopRun::new_parallel(m, 0, &args, FUEL, host, &[], reserved, None, true)
         }
     };
-    let mut run = match run {
-        None => return End::Declined,
-        Some(Err(t)) => return End::Stuck(format!("{t:?} at the start")),
-        Some(Ok(run)) => run,
+    match run {
+        None => End::Declined,
+        Some(Err(t)) => End::Stuck(format!("{t:?} at the start")),
+        Some(Ok(mut run)) => pump(&mut run, outside, stopper),
+    }
+}
+
+/// Resume a held `run` to its end, as its embedder. A run idle on a stopped process gets it
+/// continued, and one idle on what the embedder feeds gets the probe's bytes once; idle otherwise,
+/// it waits on an answer the probe gives itself, and is resumed shortly, the time it waited passed.
+fn pump(run: &mut CoopRun, outside: Outside, stopper: &Stopper) -> End {
+    let mut feed = match outside {
+        Outside::Feed(bytes) => Some(bytes),
+        Outside::Nothing | Outside::Continue => None,
     };
     loop {
         match run.run() {
@@ -346,6 +358,99 @@ fn held(
             },
             _ => return End::Stuck("a round-trip only the browser's tier makes".into()),
         }
+    }
+}
+
+/// How many frames a reactor run calls its entry for: one, and one more over what it left.
+const FRAMES: usize = 2;
+
+/// Run `g` on the pump's reactor (`bytecode::Reactor`, the engine under the browser's reactors) as
+/// [`FRAMES`] frames: its entry called again over the window and the powerbox the frame before it
+/// left, each frame run to its end, or with `held`, each a `coop_call` this harness holds and
+/// resumes ([`pump`]). Each frame is fed afresh. The frames are held to the oracle's
+/// ([`oracle_frames`]): a first frame that does not give the oracle's answer is what the run gives,
+/// a later one leaves the run stuck, and a frame that does not return is the reactor's last.
+fn reactor(g: &Guest, held: bool, armed: bool) -> End {
+    let want = oracle_frames(g, armed || held);
+    let m = g.module;
+    let Some(mut r) = Reactor::open(m) else {
+        return End::Declined;
+    };
+    let e = Embedder::default();
+    let (mut host, args) = if held {
+        let (mut host, args) = (g.setup)(m, &e);
+        host.set_stdin_blocking(matches!(g.outside, Outside::Feed(_)));
+        (host, args)
+    } else {
+        unheld(m, g, &e, armed)
+    };
+    for (frame, want) in want.iter().enumerate() {
+        let got = if held {
+            match r.coop_call(0, &args, FUEL, std::mem::take(&mut host), None, None) {
+                Err(t) => End::Stuck(format!("{t:?} at the start of frame {frame}")),
+                Ok(mut run) => {
+                    let got = pump(&mut run, g.outside, &e.stopper);
+                    host = r.end_coop_call(&mut run);
+                    got
+                }
+            }
+        } else {
+            if frame > 0 {
+                feed_again(&mut host, g);
+            }
+            let mut fuel = FUEL;
+            End::of(r.call(0, &args, &mut fuel, &mut host))
+        };
+        if got != *want {
+            e.stopper.close();
+            return match frame {
+                0 => got,
+                _ => End::Stuck(format!("frame {frame} gave {got:?}, the oracle's {want:?}")),
+            };
+        }
+    }
+    e.stopper.close();
+    want[0].clone()
+}
+
+/// The oracle's frames for `g` as a reactor: the tree-walker's capture entry called again over the
+/// window and the powerbox the frame before it left, each frame fed afresh. Fewer than [`FRAMES`]
+/// when a frame does not return.
+fn oracle_frames(g: &Guest, armed: bool) -> Vec<End> {
+    let e = Embedder::default();
+    let (mut host, args) = unheld(g.module, g, &e, armed);
+    let mut window = MemLayout::image(Vec::new());
+    let mut frames = Vec::new();
+    for frame in 0..FRAMES {
+        if frame > 0 {
+            feed_again(&mut host, g);
+        }
+        let mut fuel = FUEL;
+        let (r, left) = temen_interp::run_capture_reserved_with_host_layout(
+            g.module,
+            0,
+            &args,
+            &mut fuel,
+            &window,
+            temen_ir::default_reserved_log2(),
+            &mut host,
+        );
+        let end = End::of(r);
+        let returned = matches!(end, End::Value(_));
+        frames.push(end);
+        if !returned {
+            break;
+        }
+        window = left.unwrap_or(window);
+    }
+    e.stopper.close();
+    frames
+}
+
+/// What the embedder feeds a reactor's frame after its first: the probe's bytes again.
+fn feed_again(host: &mut Host, g: &Guest) {
+    if let Outside::Feed(bytes) = g.outside {
+        feed_later(host, bytes);
     }
 }
 

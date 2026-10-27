@@ -178,8 +178,11 @@ pub struct Stopper {
     stopped: AtomicBool,
     /// Whether the embedder has continued the process: what the probe's second call reports.
     continued: AtomicBool,
-    /// Whether the process asked to stop, or the run is over, for [`Self::await_stop`].
+    /// Whether the process has asked to stop, or the run is over, since
+    /// [`Self::continue_each_stop`] last looked.
     asked: (Mutex<bool>, Condvar),
+    /// Whether the run is over.
+    closed: AtomicBool,
 }
 
 type Door = Arc<dyn Fn(bool) + Send + Sync>;
@@ -209,17 +212,30 @@ impl Stopper {
         self.stopped.load(Ordering::SeqCst)
     }
 
-    /// Wait until the process has asked to stop, or [`Self::close`] says the run is over.
-    pub fn await_stop(&self) {
+    /// Continue the process each time it is stopped, until [`Self::close`] says the run is over:
+    /// what an embedder that may act from outside does for a run that stops itself, however often
+    /// (a reactor's every frame), and for one that thaws stopped.
+    pub fn continue_each_stop(&self) {
         let (asked, cv) = &self.asked;
-        let mut asked = asked.lock().unwrap();
-        while !*asked {
-            asked = cv.wait(asked).unwrap();
+        loop {
+            let mut a = asked.lock().unwrap();
+            while !*a {
+                a = cv.wait(a).unwrap();
+            }
+            *a = false;
+            drop(a);
+            if self.closed.load(Ordering::SeqCst) {
+                return;
+            }
+            if self.is_stopped() {
+                self.set(false);
+            }
         }
     }
 
-    /// The run is over: nothing waits for a stop any more.
+    /// The run is over: nothing continues it any more.
     pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
         self.wake_waiter();
     }
 
