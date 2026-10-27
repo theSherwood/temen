@@ -33,7 +33,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { driveCoopTierupRun, suspendsLeaves } from './web/coop-driver.js';
-import { engineImports } from './engine-imports.mjs';
+import { instantiateEngine } from './engine-imports.mjs';
 import {
   runCases, runX2Cases, pong, PINGS, bigFeed, LONE_WAIT_MS, JS_CAPS_OUT, JS_CAPS_THREAD_VALUE,
   JS_CAPS_CHILD_VALUE,
@@ -198,6 +198,7 @@ const checkX2 = (r) => {
   jsCapped('a root leaf\'s JS capabilities', r.jsCapsLeaf, 12n, 2);
   leaf('JS capabilities', r.jsCapsLeaf);
   jsCapped('a thread\'s JS capabilities', r.jsCapsThread, JS_CAPS_THREAD_VALUE, 2);
+  if (r.pumpKid !== '7') fail(`chromium: the pump's detached child returned ${r.pumpKid} (want 7)`);
   jsCapped('a detached child\'s JS capability', r.jsCapsChild, JS_CAPS_CHILD_VALUE, 1);
   if (r.jsCapsChild.childMems !== 1) {
     fail(`chromium x2: the child's call came from ${r.jsCapsChild.childMems} threads over a memory of their own (want 1)`);
@@ -206,7 +207,7 @@ const checkX2 = (r) => {
 
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
 const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
-const { exports: ex } = await WebAssembly.instantiate(mod, engineImports(memory));
+const ex = await instantiateEngine(mod, memory);
 check('node', await runCases({ ex, memory, drive: driveCoopTierupRun, suspends: suspendsLeaves }),
   suspendsLeaves);
 

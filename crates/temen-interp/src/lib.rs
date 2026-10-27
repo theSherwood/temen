@@ -24526,6 +24526,9 @@ pub struct Host {
     /// installs an OS-shared-memory factory ([`Host::set_region_factory`], e.g.
     /// `temen_run::new_shared_region`) so a JIT guest can `map` what it mints for real aliasing.
     region_factory: Option<fn(usize) -> Result<RegionBacking, i64>>,
+    /// #1414 5d — where a detached child's window lives ([`Host::set_child_window`]): a backing the
+    /// embedder makes. `None` (the default) builds it in the engine's own memory.
+    child_window: Option<bytecode::ChildBacking>,
     /// §12 `Blocking` capability backings, indexed by the id a [`Binding::Blocking`] carries. Each is
     /// a `Send + Sync` [`AsyncState`] a `submit` batch can run on the offload pool.
     blockings: Vec<Arc<AsyncState>>,
@@ -25468,6 +25471,7 @@ impl Host {
             attestation: Attestation::default(),
             modules: Vec::new(),
             region_factory: None,
+            child_window: None,
             blockings: Vec::new(),
             host_procs: Vec::new(),
             offers: Vec::new(),
@@ -31638,12 +31642,14 @@ impl Host {
     /// once for the whole run. It mints `SharedRegion`s with this host's [`Host::set_region_factory`];
     /// without it a detached child's own `region_create` minted a [`VecBacking`], which has no OS
     /// handle, so the JIT's `map` of it failed with `-EINVAL` while a region its parent granted
-    /// mapped. It runs on this host's driver, so it has its workers ([`Host::set_workers`], #2254).
-    /// Every place that builds a child's or a twin's host starts from this, so no spawn path can drop
-    /// one of them again.
+    /// mapped. Its own detached children's windows live where this host's do
+    /// ([`Host::set_child_window`]). It runs on this host's driver, so it has its workers
+    /// ([`Host::set_workers`], #2254). Every place that builds a child's or a twin's host starts from
+    /// this, so no spawn path can drop one of them again.
     pub(crate) fn child_host(&self) -> Host {
         let mut child = Host::new();
         child.region_factory = self.region_factory;
+        child.child_window = self.child_window;
         child.notes = Arc::clone(&self.notes);
         child.workers = self.workers;
         child
@@ -31668,6 +31674,20 @@ impl Host {
     /// descriptors: a guest's mint reaches it, so it must never panic.
     pub fn set_region_factory(&mut self, f: fn(usize) -> Result<RegionBacking, i64>) {
         self.region_factory = Some(f);
+    }
+
+    /// #1414 5d — build each detached child's window over a backing `make` makes, `2^size_log2`
+    /// bytes to start with, apart from the engine's own memory: a browser's is a
+    /// `WebAssembly.Memory` of the child's own ([`Region::foreign`]). The run's children's children
+    /// follow ([`Host::child_host`]), on either executor. A backing `make` cannot make refuses the
+    /// spawn. Without it a child's window is built in the engine's memory.
+    pub fn set_child_window(&mut self, make: bytecode::ChildBacking) {
+        self.child_window = Some(make);
+    }
+
+    /// Where this host's detached children's windows live ([`Host::set_child_window`]).
+    pub(crate) fn child_window(&self) -> Option<bytecode::ChildBacking> {
+        self.child_window
     }
 
     /// Resolve a handle as a §13 `SharedRegion` and return its backing (an `Arc` clone — the same

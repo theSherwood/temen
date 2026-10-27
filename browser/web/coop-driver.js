@@ -1,12 +1,14 @@
 // The **cooperative tier-up driver** (`driveCoopTierupRun`) — the JS host loop over the cdylib's
 // `temen_coop_*` session, and the one driver every embedder runs it with (#1954): the playground's
 // runners (`wasmjit-module.js`), the nimony card, and an embedder such as c_interpret, which stages
-// this file beside the engine. It depends on nothing but the cdylib's exports and the platform, so it
-// can be copied as is.
+// this file beside the engine. It depends on nothing but the cdylib's exports, the platform and
+// `foreign-mem.js` (a detached child's memory of its own), so the two can be copied as they are.
 //
 // The session runs one program: on the interpreter, with hot regions or (#1954) the whole root program
 // running on emitted wasm. `driveCoopTierupRun(ex, memory, opts)` pumps it to the end and returns the
 // run's status; what the embedder adds is in `opts` (see the function).
+
+import { foreignMemory } from './foreign-mem.js';
 
 // Slice-1 browser cache (WASM_AOT.md): a cross-Run cache of the compiled `WebAssembly.Module`, keyed
 // by a caller-supplied **stable module identity** (a URL / asset name — the same content key the
@@ -434,6 +436,55 @@ export function emittedTier(ex, memory, x) {
   };
 }
 
+// The emitted tier over a detached child's own memory (#1414 ED-2, 5d), on either executor: the
+// emitted tier of `childMemory`, which runs the child's granted module's emit. The call's context is
+// the first in the child's header, and the window starts past the header (`win`). The module's emit
+// dispatches through a table of its own functions, so the tier's shared table stays empty. The engine
+// reads a bounce's slots from its own memory, so a bounce mirrors the context through engine scratch.
+// A page-checked emit's page-state table is copied into the header after the contexts:
+// `pagestateAt()` copies it and answers where. `x` reads the run, as `emittedTier`'s does: `tableGen`,
+// `callInterp`, `paged`, `mapped`, `mappedNow`, `deliverFaultAddr`, `fuelOut`, and `pagestate()`, the
+// `[ptr, len)` of the table in the engine's memory. `x.scratch` is the engine address of
+// `temen_wasmjit_env_bytes()` bytes the bounces mirror the context through, the caller's to free.
+export function childTier(ex, memory, childMemory, x) {
+  const envBytes = ex.temen_wasmjit_env_bytes();
+  const header = ex.temen_detached_header_bytes();
+  const tableOff = ex.temen_detached_pagestate_off();
+  if (envBytes > tableOff) throw new Error('env cell does not fit the detached header');
+  const pagestateAt = () => {
+    const [p, n] = x.pagestate();
+    if (tableOff + n > header) throw new Error('pagestate table does not fit the detached header');
+    new Uint8Array(childMemory.buffer).set(new Uint8Array(memory.buffer).subarray(p, p + n), tableOff);
+    return tableOff;
+  };
+  const { scratch } = x;
+  const tier = emittedTier(ex, childMemory, {
+    envCell: 0,
+    tableLog2: () => 0,
+    nfuncs: () => 0,
+    tableGen: x.tableGen,
+    slotUnit: () => -1n,
+    slotUnitBytes: () => null,
+    shimBytes: () => null,
+    callInterp: (target, argsPtr, spillLen) => {
+      new Uint8Array(memory.buffer).set(new Uint8Array(childMemory.buffer).subarray(0, envBytes), scratch);
+      const rc = x.callInterp(target, scratch + argsPtr, spillLen);
+      new Uint8Array(childMemory.buffer).set(new Uint8Array(memory.buffer).subarray(scratch, scratch + envBytes), 0);
+      return rc;
+    },
+    paged: x.paged,
+    mapped: x.mapped,
+    mappedNow: x.mappedNow,
+    pagestatePtr: pagestateAt,
+    winPtr: () => header,
+    deliverFaultAddr: x.deliverFaultAddr,
+    spillBytes: () => 0,
+    spillPtr: () => 0,
+    fuelOut: x.fuelOut,
+  });
+  return { ...tier, win: header, pagestateAt };
+}
+
 // Free what a driver `session` kept (see `driveCoopTierupRun`): its emitted-tier host's env cell, and
 // with it the leaves instantiated over that host.
 export function endSession(session) {
@@ -607,28 +658,32 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
   const isLeaf = (m) => ex.temen_coop_program_leaf(m) !== 0;
   const programs = new Map();
   if (ex.temen_coop_wasm_len() > 0) programs.set(0, emitted);
+  // Program `m`'s compiled module and its cache key. A program's index is the run's own, so the
+  // cross-Run cache keys it by the engine's key: its image's digest and how it was emitted (#2087). A
+  // later build's image of the same command is found without reading, hashing or compiling its
+  // bytes. Holding the compiled Module keeps its code for the next build in this page: V8 otherwise
+  // frees a Module nothing references, and the next build compiles it cold again.
+  const compiled = async (m) => {
+    const kn = ex.temen_coop_program_key(m);
+    const kp = Number(ex.temen_coop_program_key_ptr());
+    const key = `program:${Array.from(u8().subarray(kp, kp + kn), (b) => b.toString(16).padStart(2, '0')).join('')}`;
+    let module = cacheGet(key);
+    if (module === undefined) {
+      const ptr = Number(ex.temen_coop_program_wasm_ptr(m));
+      const bytes = u8().slice(ptr, ptr + ex.temen_coop_program_wasm_len(m));
+      module = await WebAssembly.compile(bytes);
+      cachePut(key, module);
+      jitCacheStats.compiles++;
+    } else {
+      jitCacheStats.hits++;
+    }
+    return [key, module];
+  };
   const programFor = async (m) => {
     let p = programs.get(m);
     if (p === undefined && ex.temen_coop_program_wasm_len(m) === 0) p = emitted;
     if (p === undefined) {
-      // A program's index is the run's own, so the cross-Run cache keys it by the engine's key: its
-      // image's digest and how it was emitted (#2087). A later build's image of the same command is
-      // found without reading, hashing or compiling its bytes. Holding the compiled Module keeps
-      // its code for the next build in this page: V8 otherwise frees a Module nothing references,
-      // and the next build compiles it cold again.
-      const kn = ex.temen_coop_program_key(m);
-      const kp = Number(ex.temen_coop_program_key_ptr());
-      const key = `program:${Array.from(u8().subarray(kp, kp + kn), (b) => b.toString(16).padStart(2, '0')).join('')}`;
-      let module = cacheGet(key);
-      if (module === undefined) {
-        const ptr = Number(ex.temen_coop_program_wasm_ptr(m));
-        const bytes = u8().slice(ptr, ptr + ex.temen_coop_program_wasm_len(m));
-        module = await WebAssembly.compile(bytes);
-        cachePut(key, module);
-        jitCacheStats.compiles++;
-      } else {
-        jitCacheStats.hits++;
-      }
+      const [key, module] = await compiled(m);
       const leaf = isLeaf(m);
       p = session && leaf ? session.leaves?.get(key) : undefined;
       if (p === undefined) {
@@ -641,6 +696,37 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
       programs.set(m, p);
     }
     return p;
+  };
+  // #1414 5d — a detached child's window is a memory of its own, and its tier-ups run its program's
+  // emit there: one tier per memory, made at the memory's first tier-up. A tier lives as long as its
+  // memory: the map lets go of it once the registry lets go of the memory, when the engine releases
+  // it. Only one runs at a time, so they share the scratch their bounces mirror the context through.
+  const childTiers = new WeakMap();
+  let childScratch = 0;
+  const childFor = async (mem, m) => {
+    const cm = foreignMemory(memory, mem);
+    let c = childTiers.get(cm);
+    if (c === undefined) {
+      childScratch ||= Number(ex.temen_alloc(ex.temen_wasmjit_env_bytes()));
+      const tier = childTier(ex, memory, cm, {
+        scratch: childScratch,
+        tableGen: () => ex.temen_coop_table_gen(),
+        callInterp: (target, argsPtr, spillLen) => ex.temen_coop_call_interp(target, argsPtr, spillLen),
+        paged: () => ex.temen_coop_paged(),
+        mapped: () => ex.temen_coop_mapped(),
+        mappedNow: () => ex.temen_coop_mapped_now(),
+        pagestate: () => [Number(ex.temen_coop_pagestate_ptr()), ex.temen_coop_pagestate_len()],
+        deliverFaultAddr: (addr) => ex.temen_coop_deliver_fault_addr(addr),
+      });
+      c = { tier, module: -1 };
+      childTiers.set(cm, c);
+    }
+    if (c.module !== m) {
+      const [, module] = await compiled(m);
+      c.tier.setProgram((await WebAssembly.instantiate(module, c.tier.imports())).exports);
+      c.module = m;
+    }
+    return c.tier;
   };
 
   const deliver = (ret) => {
@@ -831,9 +917,12 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
       const func = ex.temen_coop_func();
       // Before the per-event fan-out below, so a program instantiated now gets this event's sync.
       const m = ex.temen_coop_module();
-      const leaf = isLeaf(m);
+      // #1414 5d: a detached child's call runs on its memory's tier, the rest on the engine's.
+      const mem = ex.temen_coop_tierup_mem();
+      const tier = mem < 0 ? host : await childFor(mem, m);
+      const leaf = tier === host && isLeaf(m);
       if (leaf) counts.leaves++;
-      const program = await programFor(m);
+      const program = tier === host ? await programFor(m) : tier.program();
       const argvPtr = Number(ex.temen_coop_argv_ptr());
       const n = ex.temen_coop_argv_len();
       const args = [];
@@ -841,16 +930,17 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
       // #717 host sync: the event's committed extent → every live "mapped" global, so the emitted
       // bounds checks admit exactly what the interpreter's page map does for this call.
       const tmapped = ex.temen_coop_mapped();
-      for (const g of mappedGlobals) g.value = tmapped;
-      for (const g of fuelGlobals) g.value = 1n << 61n; // re-arm across events on the reused instance
+      for (const g of tier.mappedGlobals) g.value = tmapped;
+      for (const g of tier.fuelGlobals) g.value = 1n << 61n; // re-arm across events on the reused instance
       for (const g of leafFuelGlobals) g.value = leafFuel; // #1954: a sliced leaf's own slice
       // #1009 paged: point the emitted page check at the freshly rebuilt table (base can move as the
       // pump's Vec reallocates, so read it every event). Empty set / `_paged==0` on an unpaged run.
+      // A child's tier reads its copy in its header.
       if (ex.temen_coop_paged()) {
-        const ps = Number(ex.temen_coop_pagestate_ptr());
-        for (const g of pagestateGlobals) g.value = ps;
+        const ps = tier === host ? Number(ex.temen_coop_pagestate_ptr()) : tier.pagestateAt();
+        for (const g of tier.pagestateGlobals) g.value = ps;
       }
-      armEnv();
+      tier.armEnv();
       // #1896: a leaf program runs under JSPI where there is one, so that a call in it can park — but
       // not a session's, which cannot.
       if (suspendsLeaves && leaf && !session) {
@@ -863,16 +953,18 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
       }
       const fuel = program.fuel, armed = fuel?.value;
       try {
-        const ret = program['f' + func](eventWin(), envCell, ...args);
+        const win = tier === host ? eventWin() : tier.win;
+        const ret = program['f' + func](win, tier.envCell, ...args);
         // #2474: the work the call did, for the run's tier-up profile.
         if (fuel && armed > fuel.value) ex.temen_coop_set_emitted_work(armed - fuel.value);
         deliver(ret);
       } catch (e) {
-        ex.temen_coop_deliver_trap(trapOf(e));
+        ex.temen_coop_deliver_trap(tier.trapOf(e));
       }
     }
   } finally {
     if (!session) host.free();
+    if (childScratch) ex.temen_dealloc(childScratch, ex.temen_wasmjit_env_bytes());
     ex.temen_coop_close();
     handOutput();
     if (onOutput) globalThis.__temen_stream_chunk = sink;

@@ -2186,27 +2186,25 @@ fn admit_detached_child(
 }
 
 /// [`admit_detached_child`] for the in-process drivers, which hold the child's window themselves:
-/// built at once, over a reservation of the engine's own, or over a backing `backing` makes
-/// ([`ThreadPlatform::child_window`]). A backing it cannot make refuses the spawn, and hands the
-/// window's bytes back to the budget that paid for them. Returns the child, and the emit of the
+/// built at once, over a reservation of the engine's own, or over a backing of the embedder's
+/// ([`Host::set_child_window`]). A backing it cannot make refuses the spawn, and hands the window's
+/// bytes back to the budget that paid for them. Returns the child, and the emit of the
 /// program it runs, as `emit` answers for it ([`ProgramEmits::for_child`]): `None` on a driver with
 /// no emitted tier. Without a backing, a child with an emit gets its window over a
 /// [`FreshWindow::flat_backing`], so that it can tier up on every target (#2102): the cooperative
 /// pump is the single owner a backing that relocates needs. A backing's memory is the child's own,
 /// which its host runs the emit over (#1414 ED-2).
-#[allow(clippy::too_many_arguments)] // the spawn's inputs, its emit, and where its window can live
 fn admit_detached_in_process(
     host: &mut Host,
     pm: Option<&Mem>,
     s: DetachedSpawn,
     source: &ModuleSource,
     emit: impl FnOnce(&AdmittedChild) -> Option<ProgramEmit>,
-    backing: Option<ChildBacking>,
 ) -> Result<Option<(AdmittedChild, Option<ProgramEmit>)>, Trap> {
     let Some((mut child, window)) = admit_detached_child(host, pm, s, source)? else {
         return Ok(None);
     };
-    let (back, tierup) = match backing {
+    let (back, tierup) = match host.child_window() {
         Some(make) => match make(window.size_log2) {
             Some(back) => (Some(back), emit(&child)),
             None => {
@@ -6432,8 +6430,7 @@ fn dbg_instantiate_detached(
             (e.mem.as_ref(), &mut e.host)
         }
     };
-    let Some((child, _)) = admit_detached_in_process(owner, pm, spawn, source, |_| None, None)?
-    else {
+    let Some((child, _)) = admit_detached_in_process(owner, pm, spawn, source, |_| None)? else {
         tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
     };
@@ -12171,12 +12168,13 @@ enum CoopStep {
     Idle { timer: Option<u64> },
     /// A task paused to run `func` of program `module` emitted ([`CoopEvent::TierUp`]) with raw i64
     /// arg slots `argv`; `mapped` is the window's committed scalar extent for the emitted `"mapped"`
-    /// global (#717 host sync).
+    /// global (#717 host sync), and `memory` the memory of its own the window is in, if it is one.
     TierUp {
         module: u32,
         func: u32,
         argv: Box<[i64]>,
         mapped: u64,
+        memory: Option<u32>,
     },
     /// #1896 — a leaf's call that parked in a bounce returned these raw i64 result slots: the host
     /// resumes the leaf's suspended frames with them ([`CoopEvent::Resume`]).
@@ -12354,9 +12352,6 @@ struct SchedCore {
     /// The scheduler's logical clock, in ns: it moves by the ops of each quantum that runs out
     /// (#2224), and jumps to the earliest `wait` deadline when no task is runnable.
     clock: u64,
-    /// Where a detached child's window lives ([`ThreadPlatform::child_window`]): executor 2's
-    /// platform may give it a backing of its own; the pump builds it in the engine's.
-    child_window: Option<ChildBacking>,
 }
 
 /// The cooperative pump's state for the host's emitted tier (#926): which programs' calls tier up,
@@ -12935,7 +12930,6 @@ impl SchedCore {
             hooked_twins,
             released: Released::default(),
             clock,
-            child_window: None,
         })
     }
 }
@@ -13066,7 +13060,6 @@ impl CoopSched {
                 hooked_twins,
                 released,
                 clock,
-                child_window: _, // the pump builds every child's window in the engine's memory
             } = &mut *core;
             let EmitTier {
                 leaf,
@@ -13599,7 +13592,6 @@ impl SchedCore {
             forked_twins,
             hooked_twins,
             clock,
-            child_window,
             ..
         } = self;
         let EmitTier {
@@ -13637,11 +13629,16 @@ impl SchedCore {
                 );
                 *pending_tierup = Some((ti, dst, results));
                 *pending_call = Some((module, func));
+                let window = match tasks[ti].env {
+                    None => mem.as_ref(),
+                    Some(k) => extra_envs[k].mem.as_ref(),
+                };
                 return Some(CoopStep::TierUp {
                     module,
                     func,
                     argv,
                     mapped,
+                    memory: window.and_then(Mem::foreign_id),
                 });
             }
             // #1146 (deeper) — park this task on a blocking `Stream{In}` read (the op was rewound);
@@ -14335,7 +14332,6 @@ impl SchedCore {
                     spawn,
                     &dom.source,
                     |c| programs.for_child(&c.program, &c.host, &dom.source),
-                    *child_window,
                 );
                 let (child, tierup) = match admitted {
                     Ok(Some(c)) => c,
@@ -14709,14 +14705,19 @@ pub enum CoopEvent {
     /// task on an eligible call of the program it runs — the run's own (`0`), or a granted
     /// module a child runs ([`TierUpConfig::modules`]) — or a process whose exec'd image is a leaf
     /// the host emitted ([`TierUpConfig::leaf`]), at its entry. `mapped` is the committed scalar
-    /// window extent for the emitted `"mapped"` global. The host runs the emitted `f{func}` and
-    /// calls [`CoopRun::deliver_tierup`] / [`CoopRun::deliver_tierup_trap`]; for an entry, the
-    /// delivery ends the process as a return from its entry, or a trap in it, would.
+    /// window extent for the emitted `"mapped"` global. `memory` names the memory of its own the
+    /// task's window is in, a detached child's ([`Host::set_child_window`], `Region::foreign_id`):
+    /// the host runs the emit over that memory, as executor 2's tier does ([`EmittedCall::memory`]).
+    /// `None`: the window is in the engine's memory, at [`CoopRun::pending_win`]. The host runs the
+    /// emitted `f{func}` and calls [`CoopRun::deliver_tierup`] / [`CoopRun::deliver_tierup_trap`];
+    /// for an entry, the delivery ends the process as a return from its entry, or a trap in it,
+    /// would.
     TierUp {
         module: u32,
         func: u32,
         argv: Box<[i64]>,
         mapped: u64,
+        memory: Option<u32>,
     },
     /// #1896 — a call that parked in a bounce out of a leaf running emitted ([`LeafOffer::parks`],
     /// [`CoopRun::bounce`]) has returned these raw i64 result slots. The host resumes that leaf's
@@ -15218,6 +15219,13 @@ impl CoopRun {
         Some((m.flat_win_base()?, m.win_flat_len()))
     }
 
+    /// #1414 5d — the length of the span the pending task's window addresses ([`Self::pending_win`]),
+    /// wherever it lives: in the engine's memory, or in a memory of its own
+    /// ([`CoopEvent::TierUp`]'s `memory`). `0` without a window.
+    pub fn pending_win_len(&self) -> u64 {
+        self.pending_mem().map_or(0, Mem::win_flat_len)
+    }
+
     /// The pending task's window committed **scalar extent** right now — the #717 value the cdylib
     /// re-syncs to every emitted instance's `"mapped"` global after a [`bounce`](Self::bounce) (a
     /// bounced callback may have grown the window). `0` when there is no window or its state is not
@@ -15363,11 +15371,13 @@ impl CoopRun {
                 func,
                 argv,
                 mapped,
+                memory,
             }) => CoopEvent::TierUp {
                 module,
                 func,
                 argv,
                 mapped,
+                memory,
             },
             Ok(CoopStep::Resume { results }) => CoopEvent::Resume { results },
             Ok(CoopStep::JitInvoke {
@@ -16019,18 +16029,14 @@ impl RunDoor {
 #[derive(Clone)]
 pub struct ThreadPlatform {
     /// Start `f` on a thread of its own, which nothing joins. The second argument names the memory
-    /// the thread's window lives in when it is one of [`Self::child_window`]'s
-    /// ([`super::Region::foreign_id`]), which the thread must be able to reach. An error refuses the
+    /// the thread's window lives in when it is a detached child's own ([`Host::set_child_window`],
+    /// [`super::Region::foreign_id`]), which the thread must be able to reach. An error refuses the
     /// thread.
     pub spawn: fn(ThreadStart, Option<u32>) -> std::io::Result<()>,
     /// Nanoseconds of wall time on a monotonic clock that every thread of the run reads alike.
     pub now_ns: fn() -> u64,
     /// The emitted tier the run's tasks tier up to, if any ([`ThreadTier`]).
     pub tier: Option<ThreadTier>,
-    /// Where a detached child's window lives (#1414 B6-3c): a backing of the embedder's own, apart
-    /// from the engine's memory, `2^size_log2` bytes to start with; `None` builds it in the engine's,
-    /// as every other driver does. A backing the embedder cannot make refuses the spawn.
-    pub child_window: Option<ChildBacking>,
     /// Whether the thread that opens a run runs its root task too. Otherwise the root starts on a
     /// thread of its own, like every other task, and the opener watches the run: it settles the run
     /// on each ring of the run's bell. A browser opens a run on the Worker the page started for its
@@ -16042,7 +16048,7 @@ pub struct ThreadPlatform {
 /// A thread a run starts ([`ThreadPlatform::spawn`]), for the platform to run on a thread of its own.
 pub type ThreadStart = Box<dyn FnOnce() + Send>;
 
-/// Make a detached child's window backing of `2^size_log2` bytes ([`ThreadPlatform::child_window`]).
+/// Make a detached child's window backing of `2^size_log2` bytes ([`Host::set_child_window`]).
 pub type ChildBacking = fn(u8) -> Option<std::sync::Arc<super::Region>>;
 
 impl ThreadPlatform {
@@ -16052,7 +16058,6 @@ impl ThreadPlatform {
         spawn: |f, _| std::thread::Builder::new().spawn(f).map(drop),
         now_ns: sched_wall_now,
         tier: None,
-        child_window: None,
         root_on_opener: false,
     };
 }
@@ -16394,7 +16399,6 @@ impl ThreadRun {
         if let Some(leaf) = leaf {
             core.arm_leaf(leaf);
         }
-        core.child_window = platform.child_window;
         let run = std::sync::Arc::new(ThreadRun {
             dom: std::sync::Arc::new(dom),
             root: host.into_cell(),

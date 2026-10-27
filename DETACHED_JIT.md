@@ -26,8 +26,10 @@ or 11-arg forms, read the record (`size_log2`, `budget`, `module`, the grant lis
 **The browser's op-13 servicer and single-shot JIT run are deleted (#1414 S4-5b, 2026-10-20).**
 `temen_op13jit_*`, `JitOnrampRun`, `driveDetachedRun` and the single-shot detached exports this note
 describes no longer exist. Detached children run on the pump and on the parallel driver, each over a
-window of its own: the parallel driver's run their program's emit over their own
-`WebAssembly.Memory` (#1414 ED-2), the pump's over the engine's memory. Read the servicer passages
+window of its own: in the browser's threads build, a `WebAssembly.Memory` of the child's own on
+either executor (`Host::set_child_window`, #1414 ED-2 and 5d), which each runs its program's emit
+over. The engine gives the memory back when the child's window drops, and the agent that minted it
+keeps a small one, zeroed, for its next child (`web/foreign-mem.js`). Read the servicer passages
 below as history.
 
 **One-line summary.** The isolated, independently-growable, concurrency-safe child that

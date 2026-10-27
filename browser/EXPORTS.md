@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**285 exports** in 37 families — 239 referenced from JS, 46 referenced by nothing, 54 behind a `cfg`.
+**287 exports** in 37 families — 242 referenced from JS, 45 referenced by nothing, 55 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -11,14 +11,14 @@
 | `alloc` | 1 | 1 | 0 |
 | `bash` | 10 | 9 | 0 |
 | `callprof` | 4 | 4 | 4 |
-| `coop` | 66 | 57 | 0 |
+| `coop` | 67 | 59 | 0 |
 | `dap` | 4 | 4 | 0 |
 | `dealloc` | 1 | 1 | 0 |
 | `detached` | 2 | 2 | 0 |
 | `durable` | 4 | 4 | 0 |
 | `exit` | 1 | 1 | 0 |
 | `fault` | 1 | 1 | 0 |
-| `foreign` | 6 | 6 | 6 |
+| `foreign` | 7 | 7 | 7 |
 | `framebuffer` | 4 | 4 | 0 |
 | `jspb` | 2 | 2 | 0 |
 | `link` | 11 | 8 | 0 |
@@ -131,7 +131,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_coop_open_fs`
 - `temen_coop_open_selfhost_fs`
 - `temen_coop_paged`
-- `temen_coop_pagestate_len` — *unreferenced*
+- `temen_coop_pagestate_len`
 - `temen_coop_pagestate_ptr`
 - `temen_coop_pass_time`
 - `temen_coop_program_key`
@@ -156,6 +156,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_coop_table_gen`
 - `temen_coop_table_log2`
 - `temen_coop_task`
+- `temen_coop_tierup_mem`
 - `temen_coop_tierup_win_len` — *unreferenced*
 - `temen_coop_tierup_win_ptr`
 - `temen_coop_value` — *unreferenced*
@@ -198,6 +199,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 ### `foreign`
 
 - `temen_foreign_bench` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_foreign_next_id` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_foreign_poke` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_foreign_read_words` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_foreign_selftest` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`

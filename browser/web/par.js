@@ -8,8 +8,8 @@
 // origin root (local `serve.mjs`) and under a subpath (GitHub Pages serves a project site at
 // `/<repo>/`). The deployed site keeps the same `web/` + `target/…` layout, so `../target/…`
 // resolves correctly under either base.
-import { engineImports } from './engine-imports.js';
-import { adoptEngine, registerForeign, releaseForeign } from './foreign-mem.js';
+import { instantiateEngine } from './engine-imports.js';
+import { registerForeign, releaseForeign } from './foreign-mem.js';
 import { engineMemory } from './engine-mem.js';
 import { jsCapServicer } from './coop-driver.js';
 const WASM = new URL('../target/wasm32-unknown-unknown/release/temen_browser.wasm', import.meta.url);
@@ -44,8 +44,7 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
   // for one (the default otherwise), clamped to the `--max-memory` this build declares, so asking for
   // more than an older build allows yields that build's ceiling instead of a `LinkError`.
   const { memory, maxPages } = engineMemory(bytes, { maxPages: askPages });
-  const { exports: ex } = await WebAssembly.instantiate(module, engineImports(memory));
-  adoptEngine(ex, memory); // detached children's own memories, through this instance's table
+  const ex = await instantiateEngine(module, memory);
   return { module, bytes, memory, ex, maxPages };
 }
 
@@ -220,16 +219,15 @@ export function makeRunner({ module, memory, ex }) {
     const output = onOutput && outputInOrder(onOutput);
     // #2579: `onCap` over the calling task's window. A detached child's window is its own memory,
     // which the page addresses only once it has registered it under the id the child's Workers name
-    // it by. Ids are each minting Worker's own, so two children's may meet: the page holds one
-    // registration per id, the last caller's (`held`: id → its Worker), and lets them all go after.
+    // it by. An id names one memory across the engine memory's agents (`foreign-mem.js`), so the page
+    // registers each once (`held`) and lets them all go after.
     const jsCap = onCap && jsCapServicer(ex, memory, onCap);
-    const held = new Map();
-    const jsCall = (w, cfg, m) => {
+    const held = new Set();
+    const jsCall = (cfg, m) => {
       if (finished || !jsCap) return -38n; // -ENOSYS: no servicer, or the run is over
-      if (cfg.x2Mem && held.get(cfg.x2MemId) !== w) {
-        if (held.has(cfg.x2MemId)) releaseForeign(cfg.x2MemId);
-        registerForeign(cfg.x2Mem, ex.temen_detached_header_bytes(), cfg.x2MemId);
-        held.set(cfg.x2MemId, w);
+      if (cfg.x2Mem && !held.has(cfg.x2MemId)) {
+        registerForeign(memory, cfg.x2Mem, ex.temen_detached_header_bytes(), cfg.x2MemId);
+        held.add(cfg.x2MemId);
       }
       return jsCap(m.slot, m.op, m.argsPtr, m.nArgs, m.mem);
     };
@@ -281,7 +279,7 @@ export function makeRunner({ module, memory, ex }) {
               // Worker's cell (worker.js's `js_cap_call`), at once, and always, even with -EIO.
               let answer = -5n;
               try {
-                answer = BigInt(jsCall(w, cfg, m));
+                answer = BigInt(jsCall(cfg, m));
               } catch (e) {
                 console.error('JS capability call:', e);
               }
@@ -329,7 +327,7 @@ export function makeRunner({ module, memory, ex }) {
       if (unlisten) unlisten();
       if (root) root.terminate();
       if (tornDown) for (const w of threads) w.terminate();
-      for (const id of held.keys()) releaseForeign(id);
+      for (const id of held) releaseForeign(memory, id);
     }
   };
   // The run, which resolves as above, with `feed(bytes)` and `end()` for a run fed later.

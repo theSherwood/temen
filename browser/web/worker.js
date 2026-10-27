@@ -4,9 +4,9 @@
 // Worker (no nested Workers) and never blocks: a browser permits a blocking `Atomics.wait` only off
 // the main thread, so the Workers do all the blocking.
 
-import { adoptEngine, foreignMemory, registerForeign, releaseForeign } from './foreign-mem.js';
-import { engineImports } from './engine-imports.js';
-import { emittedTier, tierupJitArg, tierupJitRes } from './coop-driver.js';
+import { foreignMemory, registerForeign, releaseForeign } from './foreign-mem.js';
+import { instantiateEngine } from './engine-imports.js';
+import { childTier, emittedTier, tierupJitArg, tierupJitRes } from './coop-driver.js';
 const STACK = 1 << 20; // per-Worker stack
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 
@@ -36,9 +36,9 @@ self.onmessage = async (e) => {
     const stackTop = ex.temen_par_alloc(STACK) + STACK;
     const tlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
     const msg = { kind: 'x2spawn', start: threadStart, stackTop, tlsBase };
-    if (memId >= 0) Object.assign(msg, { x2Mem: foreignMemory(memId), x2MemId: memId });
+    if (memId >= 0) Object.assign(msg, { x2Mem: foreignMemory(memory, memId), x2MemId: memId });
     self.postMessage(msg);
-    if (memId >= 0 && memId !== x2MemId) releaseForeign(memId);
+    if (memId >= 0 && memId !== x2MemId) releaseForeign(memory, memId);
     return 0;
   };
   // The thread's emitted tiers over the engine's memory: the coop driver's (`emittedTier`), each made
@@ -140,55 +140,23 @@ self.onmessage = async (e) => {
     return [tier, x2Win, program];
   };
   // A detached child's tier (#1414 ED-2): its granted module's emit over the child's own memory,
-  // which this Worker registered for the child's root task. The call's context is the first in the
-  // child's header, and the window starts past the header. The module's emit dispatches through a
-  // table of its own functions, so the tier's shared table stays empty. The engine reads a bounce's
-  // slots from its own memory, so a bounce mirrors the context through engine scratch. A paged
-  // emit's page-state table is copied into the header after the contexts, at each call and after
-  // each bounce.
+  // which this Worker registered for the child's root task (`childTier`, the pump's too).
   let x2Child = null, x2ChildModule = -1, x2ChildScratch = 0;
-  const x2ChildTable = () => {
-    const off = ex.temen_detached_pagestate_off();
-    const p = Number(ex.temen_x2_pagestate_ptr()), n = ex.temen_x2_pagestate_len();
-    if (off + n > ex.temen_detached_header_bytes()) {
-      throw new Error('pagestate table does not fit the detached header');
-    }
-    new Uint8Array(x2Mem.buffer).set(new Uint8Array(memory.buffer).subarray(p, p + n), off);
-    return off;
-  };
   const x2ChildEnter = (mem, module, mapped, over) => {
     if (mem !== x2MemId) throw new Error(`memory ${mem} is not this Worker's`);
     x2Mapped = mapped;
     x2Over = over;
     if (x2Child === null) {
-      const envBytes = ex.temen_wasmjit_env_bytes();
-      if (envBytes > ex.temen_detached_pagestate_off()) {
-        throw new Error('env cell does not fit the detached header');
-      }
-      x2ChildScratch = Number(ex.temen_alloc(envBytes));
-      x2Child = emittedTier(ex, x2Mem, {
-        envCell: 0,
-        tableLog2: () => 0,
-        nfuncs: () => 0,
+      x2ChildScratch = Number(ex.temen_alloc(ex.temen_wasmjit_env_bytes()));
+      x2Child = childTier(ex, memory, x2Mem, {
+        scratch: x2ChildScratch,
         tableGen: () => ex.temen_x2_table_gen(),
-        slotUnit: () => -1n,
-        slotUnitBytes: () => null,
-        shimBytes: () => null,
-        callInterp: (target, argsPtr, spillLen) => {
-          const s = x2ChildScratch;
-          new Uint8Array(memory.buffer).set(new Uint8Array(x2Mem.buffer).subarray(0, envBytes), s);
-          const rc = ex.temen_x2_call_interp(target, s + argsPtr, spillLen);
-          new Uint8Array(x2Mem.buffer).set(new Uint8Array(memory.buffer).subarray(s, s + envBytes), 0);
-          return rc;
-        },
+        callInterp: (target, argsPtr, spillLen) => ex.temen_x2_call_interp(target, argsPtr, spillLen),
         paged: () => ex.temen_x2_paged(),
         mapped: () => x2Mapped,
         mappedNow: () => ex.temen_x2_mapped_now(),
-        pagestatePtr: x2ChildTable,
-        winPtr: () => ex.temen_detached_header_bytes(),
+        pagestate: () => [Number(ex.temen_x2_pagestate_ptr()), ex.temen_x2_pagestate_len()],
         deliverFaultAddr: (addr) => ex.temen_x2_deliver_fault_addr(addr),
-        spillBytes: () => 0,
-        spillPtr: () => 0,
         fuelOut: x2Fuel,
       });
     }
@@ -200,13 +168,13 @@ self.onmessage = async (e) => {
     }
     for (const g of x2Child.mappedGlobals) g.value = mapped;
     if (ex.temen_x2_paged()) {
-      const at = x2ChildTable();
+      const at = x2Child.pagestateAt();
       for (const g of x2Child.pagestateGlobals) g.value = at;
     }
     for (const g of x2Child.fuelGlobals) g.value = X2_SLICE;
     x2Child.armEnv();
     if (tierupCell) Atomics.add(new Int32Array(memory.buffer), tierupCell >> 2, 1); // the run's count
-    return [x2Child, ex.temen_detached_header_bytes(), x2Child.program()];
+    return [x2Child, x2Child.win, x2Child.program()];
   };
   // Enter a tier (`enter` returns it, the window's base, the emitted function and its arguments),
   // call the function, and write its results at `out` (`res` makes each a slot). Whatever throws
@@ -283,10 +251,10 @@ self.onmessage = async (e) => {
     while (Atomics.load(flag, 0) === 0) Atomics.wait(flag, 0, 0);
     return new BigInt64Array(memory.buffer, jsCell + 8, 1)[0];
   };
-  ({ exports: ex } = await WebAssembly.instantiate(module, engineImports(memory, { stream_chunk, x2_spawn, x2_tierup, x2_invoke, js_cap_call })));
-  ex.__stack_pointer.value = stackTop; // this Worker's private stack...
-  if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
-  adoptEngine(ex, memory); // after the stack: it calls into the engine
+  ex = await instantiateEngine(module, memory, { stream_chunk, x2_spawn, x2_tierup, x2_invoke, js_cap_call }, (e) => {
+    e.__stack_pointer.value = stackTop; // this Worker's private stack...
+    if (e.__tls_size.value > 0) e.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
+  });
   // #1414 B6 — the parallel driver: the root's Worker pumps the run, and each of its threads is a call
   // on a Worker of its own (`x2_spawn` above). The root reports how the run ended.
   if (role === 'x2root') {
@@ -326,7 +294,7 @@ self.onmessage = async (e) => {
     return;
   }
   if (role === 'x2thread') {
-    if (x2Mem) registerForeign(x2Mem, ex.temen_detached_header_bytes(), x2MemId);
+    if (x2Mem) registerForeign(memory, x2Mem, ex.temen_detached_header_bytes(), x2MemId);
     ex.temen_x2_thread(start);
     for (const tier of [x2Tier, x2LeafTier]) tier?.free();
     if (x2Child !== null) ex.temen_dealloc(x2ChildScratch, ex.temen_wasmjit_env_bytes());

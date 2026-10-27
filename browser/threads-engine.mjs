@@ -7,7 +7,7 @@
 //
 // Usage:  node threads-engine.mjs <module.wasm> [guest.temenc] [expected]
 import { readFileSync } from 'node:fs';
-import { engineImports } from './engine-imports.mjs';
+import { instantiateEngine } from './engine-imports.mjs';
 
 const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
 const guestPath = process.argv[3] ?? 'corpus/threads.temenc';
@@ -18,7 +18,7 @@ const sharedImport = WebAssembly.Module.imports(mod).some((i) => i.kind === 'mem
 const memory = sharedImport
   ? new WebAssembly.Memory({ initial: 512, maximum: 16384, shared: true })
   : undefined;
-const { exports: ex } = await WebAssembly.instantiate(mod, engineImports(memory));
+const ex = await instantiateEngine(mod, memory);
 const buf = () => (memory ?? ex.memory).buffer;
 const shared = buf() instanceof SharedArrayBuffer;
 

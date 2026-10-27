@@ -5,13 +5,13 @@
 // (and stdin), passes the `(ptr, len)` in, reads any captured streams, then `temen_dealloc`s — no
 // fixed scratch buffer, so module/stream sizes are unbounded (see the megabyte echo at the end).
 import { readFileSync } from 'node:fs';
-import { engineImports } from './engine-imports.mjs';
+import { instantiateEngine } from './engine-imports.mjs';
 
 const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
 const corpus = JSON.parse(readFileSync('corpus.json', 'utf8'));
 
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
-const ex = (await WebAssembly.instantiate(mod, engineImports())).exports;
+const ex = await instantiateEngine(mod);
 const is64 = ex.temen_abi_is64() === 1;
 const N = (x) => (is64 ? BigInt(x) : Number(x)); // usize ABI value
 const mem = () => new Uint8Array(ex.memory.buffer); // re-fetch (memory may grow under us)

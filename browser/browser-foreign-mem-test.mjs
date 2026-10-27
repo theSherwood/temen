@@ -7,8 +7,11 @@
 // second shared Memory, byte for byte; (2) a write from the engine lands in the child's memory, not the
 // engine's; (3) a span moves by the copier where the page has multi-memory and by the engine's own word
 // loops where it hasn't (the table's `read`/`write` slots); (4) of the foreign imports, the engine takes
-// only `foreign_mint`. Then the cost gate: per-access timings of words, bytes, atomics and 64-byte spans
-// over Foreign vs the flat `Shared` backing, on the multi-memory page, reported as a ratio.
+// only `foreign_mint` and `foreign_release`, which make a memory and give it back; (5) a memory given
+// back comes back zeroed from the next mint, and the page keeps no more of them than its spares hold:
+// none bigger than `SPARE_BYTES`, none past `SPARE_MEMORIES`, and none it did not mint itself. Then the
+// cost gate: per-access timings of words, bytes, atomics and 64-byte spans over Foreign vs the flat
+// `Shared` backing, on the multi-memory page, reported as a ratio.
 import { startServer } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -37,7 +40,8 @@ async function runPage({ noMultiMemory, bench }) {
   await page.goto(`http://127.0.0.1:${port}/web/play.html`);
   const res = await page.evaluate(async (bench) => {
     const par = await import('./par.js');
-    const { registerForeign } = await import('./foreign-mem.js');
+    const { registerForeign, foreignImports: importsFor, foreignMemory, SPARE_MEMORIES, SPARE_BYTES } =
+      await import('./foreign-mem.js');
     const eng = await par.loadEngine();
     const ex = eng.ex, memory = eng.memory;
     const readOut = () => new TextDecoder().decode(
@@ -49,13 +53,13 @@ async function runPage({ noMultiMemory, bench }) {
     // Paged reference's chunk boundary is exercised). 0 = agree; else the first divergence is in stdout.
     const size = 3 * 65536;
     const child = new WebAssembly.Memory({ initial: 3, maximum: 8, shared: true });
-    const id = registerForeign(child);
+    const id = registerForeign(memory, child);
     const diff = ex.temen_foreign_selftest(id, size, 20000);
     const diffMsg = diff === 0 ? '' : readOut();
     // (2) a write from the engine lands in the CHILD memory (a fresh one, untouched by the
     // differential), not the engine's: the isolation half.
     const fresh = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
-    const fid = registerForeign(fresh);
+    const fid = registerForeign(memory, fresh);
     const probe = new Uint32Array(fresh.buffer);
     const before = probe[0x2000 / 4];
     ex.temen_foreign_poke(fid, 0x2000, 0xC0FFEE);
@@ -65,6 +69,33 @@ async function runPage({ noMultiMemory, bench }) {
     const table = ex.__indirect_function_table, lo = table.length - 8;
     const wordSpans = table.get(lo) === ex.temen_foreign_read_words
       && table.get(lo + 1) === ex.temen_foreign_write_words;
+
+    // (5) spares, through the imports the engine calls: a child's 64 KiB window, header first.
+    const { foreign_mint, foreign_release } = importsFor(memory);
+    const header = ex.temen_detached_header_bytes(), maximum = header + (1 << 30);
+    const mint = (bytes) => foreign_mint(header, bytes, maximum);
+    const held = (id) => foreignMemory(memory, id);
+    const zeroed = (id) => new Uint8Array(held(id).buffer).every((b) => b === 0);
+    const a = mint(header + 65536);
+    new Uint8Array(held(a).buffer).fill(9, 0, header + 65536);
+    foreign_release(a);
+    const back = mint(header + 65536);
+    const reused = back === a && zeroed(back);
+    const big = mint(SPARE_BYTES + 65536);
+    foreign_release(big);
+    const elsewhere = registerForeign(memory, new WebAssembly.Memory({ initial: 2, maximum: 2, shared: true }));
+    foreign_release(elsewhere);
+    const burst = Array.from({ length: SPARE_MEMORIES + 2 }, () => mint(header + 65536));
+    burst.forEach(foreign_release);
+    foreign_release(back);
+    const spares = {
+      reused,
+      bigLetGo: held(big) === undefined,
+      elsewhereLetGo: held(elsewhere) === undefined,
+      burstKept: burst.filter((id) => held(id) !== undefined).length,
+      spareMemories: SPARE_MEMORIES,
+      aLetGo: held(a) === undefined,
+    };
 
     // The cost gate: kind 0/1 = write_word + read_word over Shared/Foreign, 2/3 = set_byte + byte, 4/5 =
     // an 8-byte atomic fetch-add, 6/7 = a 64-byte write_from + read_into. Same seeded offset stream and
@@ -82,7 +113,7 @@ async function runPage({ noMultiMemory, bench }) {
         cost[name] = { sharedNs: sh.ns, foreignNs: fo.ns, ratio: fo.ns / sh.ns, sumEq: sh.sum === fo.sum };
       }
     }
-    return { foreignImports, diff, diffMsg, landed, wordSpans, cost };
+    return { foreignImports, diff, diffMsg, landed, wordSpans, spares, cost };
   }, bench);
   await page.close();
   return res;
@@ -94,11 +125,14 @@ await browser.close(); server.close();
 console.log('RESULT', JSON.stringify({ mm, nomm }, null, 2));
 if (errors.length) console.log('ERRORS', errors.slice(0, 6));
 const f = (x) => x.toFixed(1);
-let ok = mm.foreignImports.join() === 'foreign_mint';
+let ok = mm.foreignImports.sort().join() === 'foreign_mint,foreign_release';
 console.log(`  foreign imports: ${mm.foreignImports.join(', ')}`);
 for (const [label, r, words] of [['multi-memory', mm, false], ['no multi-memory', nomm, true]]) {
-  ok &&= r.diff === 0 && r.landed && r.wordSpans === words;
+  const sp = r.spares;
+  const sparesOk = sp.reused && sp.bigLetGo && sp.elsewhereLetGo && sp.burstKept === sp.spareMemories && sp.aLetGo;
+  ok &&= r.diff === 0 && r.landed && r.wordSpans === words && sparesOk;
   console.log(`  ${label}: differential=${r.diff === 0 ? 'agree' : 'DIVERGE ' + r.diffMsg} landedInChild=${r.landed} spans=${r.wordSpans ? 'word loops' : 'copier'}`);
+  console.log(`  ${label} spares: given back and minted again zeroed ${sp.reused} · too big let go ${sp.bigLetGo} · minted elsewhere let go ${sp.elsewhereLetGo} · of a burst of ${sp.spareMemories + 2} kept ${sp.burstKept}/${sp.spareMemories} · one more let go ${sp.aLetGo}`);
 }
 for (const [name, c] of Object.entries(mm.cost)) {
   ok &&= c.sumEq;

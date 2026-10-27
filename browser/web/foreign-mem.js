@@ -3,12 +3,14 @@
 // memory, whose functions this module puts in the engine's function table. `Region::Foreign` in
 // `temen-mem` calls one per access, wasm to wasm: no JavaScript runs on any access, word, span, fill,
 // copy, atomic or grow (#1414 5d). This module is the registry (id → Memory), the accessor modules and
-// the one import that needs JavaScript, `foreign_mint`, which makes a memory. Every instantiation of the
-// THREADS engine build supplies `...foreignImports(memory)` in `temen_host` and then hands the instance
-// to `adoptEngine` (par.js, the Workers); the plain build imports none of this.
+// the two imports that need JavaScript: `foreign_mint`, which makes a memory, and `foreign_release`,
+// which lets it go, or keeps it for the next mint, once the engine's region over it is gone. Every
+// instantiation of the THREADS engine build supplies `...foreignImports(memory)` in `temen_host` and
+// then hands the instance to `adoptEngine` (`instantiateEngine` in `engine-imports.js` does both); the
+// plain build imports none of this.
 //
-// A registry is per agent (page or Worker): a Memory registered here is addressable by the engine
-// instances this agent adopted, each through its own table.
+// A registry is per agent (page or Worker) and engine memory: a Memory registered here is addressable
+// by the engine instances this agent adopted over that engine memory, each through its own table.
 
 /**
  * Adopt a shared memory this agent was handed — a Worker's copy of the engine memory, or of a detached
@@ -28,7 +30,30 @@ export function adoptMemory(memory) {
   return memory;
 }
 
-const mems = []; // id -> { m: WebAssembly.Memory, base: byte offset of region offset 0, fns: accessor exports }
+// This agent's registry for each engine memory it holds (#1414 5d), weakly, so a dropped engine memory
+// takes its registry along:
+// - `mems`: id -> { m: WebAssembly.Memory, base: byte offset of region offset 0, fns: accessor
+//   exports, and `maximum`, its maximum in bytes, if this agent minted it }. An id names one memory
+//   among all the agents of the engine memory, page and Workers alike: the engine's shared counter
+//   hands ids out (`temen_foreign_next_id`), so a memory one agent registers from another never meets
+//   one it minted itself.
+// - `engines`: the engine instances this agent adopted over the engine memory (`adoptEngine`).
+// - `spares`: memories this agent minted whose region is gone, zeroed, and kept with their ids and
+//   table slots for its next mints. V8 reserves address space for each memory, and frees a dead one's
+//   only in a full collection, which it runs when a new memory finds none left: about every 125
+//   memories, at tens of milliseconds each. So a burst of short-lived children reuses a few memories
+//   instead of building one each. A spare holds nothing a child wrote. Past `SPARE_BYTES` zeroing
+//   costs more than a fresh memory, so a bigger one goes back to the collector, as one past
+//   `SPARE_MEMORIES` does.
+const registries = new WeakMap();
+export const SPARE_MEMORIES = 8, SPARE_BYTES = 512 << 10;
+
+/** This agent's registry for `engineMemory`. */
+function registry(engineMemory) {
+  let reg = registries.get(engineMemory);
+  if (reg === undefined) registries.set(engineMemory, (reg = { mems: [], engines: [], spares: [] }));
+  return reg;
+}
 
 // Each registered memory's functions sit at `slot0 + id * SLOTS + k` in every adopted engine's table,
 // `slot0` being the table's length when it was adopted, which the engine is told (`temen_foreign_slots`):
@@ -226,14 +251,14 @@ let accessor = null, copier = null;
 // move spans as a browser without multi-memory does; it changes this agent's tables only.
 const MULTI_MEMORY = !globalThis.__temenNoMultiMemory && WebAssembly.validate(COPIER_WASM);
 
-// The engine instances this agent adopted: each one's exports (its table and span fallbacks), its table's
-// `slot0`, and its memory, the copier's second memory. Weak, so an engine a host drops keeps no window alive.
-const engines = [];
+// An adopted engine instance (a registry's `engines`) holds its exports (its table and span fallbacks),
+// its table's `slot0`, and its memory, the copier's second memory. Weak, so an engine a host drops keeps
+// no window alive.
 const adopted = new WeakSet();
 
 /** Put registered memory `id`'s functions into engine `e`'s table. */
-function install(e, ex, id) {
-  const { m, base, fns } = mems[id];
+function install(reg, e, ex, id) {
+  const { m, base, fns } = reg.mems[id];
   const table = ex.__indirect_function_table, lo = e.slot0 + SLOTS * id;
   if (table.length < lo + SLOTS) table.grow(lo + SLOTS - table.length);
   let spans = { read: ex.temen_foreign_read_words, write: ex.temen_foreign_write_words };
@@ -244,8 +269,9 @@ function install(e, ex, id) {
   FIELDS.forEach((f, k) => table.set(lo + k, fns[f] ?? spans[f]));
 }
 
-/** Each adopted engine that is still alive, with its exports. */
-function* liveEngines() {
+/** Each engine adopted into `reg` that is still alive, with its exports. */
+function* liveEngines(reg) {
+  const { engines } = reg;
   for (let i = engines.length - 1; i >= 0; i--) {
     const ex = engines[i].ex.deref();
     if (ex === undefined) engines.splice(i, 1);
@@ -267,40 +293,66 @@ export function adoptEngine(ex, engineMemory) {
   // Every instance of one build starts with the same table, so every agent on one engine memory names
   // the same slots; a mismatch would be a different build on the same memory.
   if (!ex.temen_foreign_slots(e.slot0)) throw new Error(`engine table slot base ${e.slot0} disagrees`);
-  engines.push(e);
-  mems.forEach((r, id) => r !== undefined && install(e, ex, id));
+  const reg = registry(engineMemory);
+  reg.engines.push(e);
+  reg.mems.forEach((r, id) => r !== undefined && install(reg, e, ex, id));
 }
 
 /**
- * Register a child `WebAssembly.Memory`; returns the id the engine names it by. `base` is where the
- * engine's region offset 0 lands in the memory — a detached child's window starts one host header page
- * in (`temen_detached_header_bytes()`), so its region is `[base, …)` and the header below stays the
- * host's (DETACHED_JIT.md §3.1). `id` is the next free one, or the id another agent gave the memory,
- * for a Worker the memory was handed to with it (#1414 B6-3c): such a Worker registers it first, so
- * the ids it mints after cannot meet it.
+ * Register a child `WebAssembly.Memory` for the engine instances over `engineMemory`; returns the id
+ * they name it by. `base` is where the engine's region offset 0 lands in the memory — a detached child's
+ * window starts one host header page in (`temen_detached_header_bytes()`), so its region is `[base, …)`
+ * and the header below stays the host's (DETACHED_JIT.md §3.1). `id` is a fresh one from the engine, or
+ * the id another agent gave the memory, for one the memory was handed to with it (#1414 B6-3c).
  */
-export function registerForeign(memory, base = 0, id = mems.length) {
-  if (mems[id] !== undefined) throw new Error(`foreign memory ${id} is already registered`);
+export function registerForeign(engineMemory, memory, base = 0, id = undefined) {
+  const reg = registry(engineMemory);
+  if (id === undefined) {
+    const [, ex] = liveEngines(reg).next().value ?? [];
+    if (ex === undefined) throw new Error('foreign memory: no engine adopted over this memory gives ids');
+    id = ex.temen_foreign_next_id();
+  }
+  if (reg.mems[id] !== undefined) throw new Error(`foreign memory ${id} is already registered`);
   accessor ??= new WebAssembly.Module(ACCESSOR_WASM);
   // a detached child's memory, shared by its threads' Workers
   const fns = new WebAssembly.Instance(accessor, { a: { m: adoptMemory(memory), base } }).exports;
-  mems[id] = { m: memory, base, fns };
-  for (const [e, ex] of liveEngines()) install(e, ex, id);
+  reg.mems[id] = { m: memory, base, fns };
+  for (const [e, ex] of liveEngines(reg)) install(reg, e, ex, id);
   return id;
 }
 
-/** Let go of the memory registered as `id`: its slots in every adopted engine empty. Its id is not reused. */
-export function releaseForeign(id) {
-  mems[id] = undefined;
-  for (const [e, ex] of liveEngines()) {
+/**
+ * Let go of the memory registered for `engineMemory` as `id`: its slots in every adopted engine empty.
+ * Its id is not reused.
+ */
+export function releaseForeign(engineMemory, id) {
+  const reg = registry(engineMemory);
+  reg.mems[id] = undefined;
+  const spare = reg.spares.indexOf(id);
+  if (spare >= 0) reg.spares.splice(spare, 1);
+  for (const [e, ex] of liveEngines(reg)) {
     const table = ex.__indirect_function_table, lo = e.slot0 + SLOTS * id;
     for (let k = 0; k < SLOTS && lo + k < table.length; k++) table.set(lo + k, null);
   }
 }
 
-/** The registered Memory for `id` (e.g. to read a result out). */
-export function foreignMemory(id) {
-  return mems[id].m;
+/**
+ * The engine's region over memory `id` is gone (`foreign_release`). A memory this agent minted is kept
+ * as a spare, zeroed, while it is small and there is room; any other is let go (`releaseForeign`).
+ */
+function retireForeign(engineMemory, id) {
+  const reg = registry(engineMemory), r = reg.mems[id];
+  if (r?.maximum === undefined || reg.spares.length >= SPARE_MEMORIES || r.m.buffer.byteLength > SPARE_BYTES) {
+    releaseForeign(engineMemory, id);
+    return;
+  }
+  new Uint8Array(r.m.buffer).fill(0);
+  reg.spares.push(id);
+}
+
+/** The Memory registered for `engineMemory` as `id`; `undefined` once it is released. */
+export function foreignMemory(engineMemory, id) {
+  return registry(engineMemory).mems[id]?.m;
 }
 
 /** The `temen_host` import entries for an engine instance whose linear memory is `engineMemory`. */
@@ -308,22 +360,31 @@ export function foreignImports(engineMemory) {
   // Every threads-engine instantiation comes through here, so this is where an agent handed the engine
   // memory adopts it: before the instance built over these imports (#1996).
   adoptMemory(engineMemory);
+  const reg = registry(engineMemory);
   return {
-    // Mint a fresh shared child memory of `initial`..`maximum` bytes (header included) and register it
-    // with `base` as the region origin (#1286). Returns the id, or -1 if the constructor refused, or if
-    // this agent adopted no engine: then no table would hold the memory's functions, and every access
-    // to it would trap.
+    // Mint a shared child memory of `initial`..`maximum` bytes (header included) with `base` as the
+    // region origin (#1286): the last spare that fits, or a fresh one, registered. Returns the id, or -1
+    // if the constructor refused, or if this agent adopted no engine: then no table would hold the
+    // memory's functions, and every access to it would trap.
     foreign_mint: (base, initial, maximum) => {
-      if (engines.length === 0) {
+      if (reg.engines.length === 0) {
         console.error('foreign_mint: this agent adopted no engine instance (a host calls adoptEngine)');
         return -1;
       }
+      const fits = (id) => reg.mems[id].base === base && reg.mems[id].maximum === maximum
+        && reg.mems[id].m.buffer.byteLength >= initial;
+      const spare = reg.spares.findLastIndex(fits);
+      if (spare >= 0) return reg.spares.splice(spare, 1)[0];
       try {
         const m = new WebAssembly.Memory({
           initial: Math.ceil(initial / 65536), maximum: Math.ceil(maximum / 65536), shared: true,
         });
-        return registerForeign(m, base);
+        const id = registerForeign(engineMemory, m, base);
+        reg.mems[id].maximum = maximum;
+        return id;
       } catch { return -1; }
     },
+    // The engine's region over memory `id` is gone (#1414 5d).
+    foreign_release: (id) => retireForeign(engineMemory, id),
   };
 }

@@ -23,6 +23,13 @@
 //
 // #2251: a plain root that returns its `self.parallelism` answers the page's core count
 // (`navigator.hardwareConcurrency`): each of the run's threads gets a Worker of its own.
+//
+// #1414 5d: on the pump too, on the page's own engine (`temen_run_nested`), each child's window is a
+// memory of its own. Two runs of a root that runs 90 children one after another make 180 children, more
+// than a page can hold memories at once (Chromium holds about 125). When a child's window drops, the
+// engine gives its memory back, and the page zeroes it and hands it to the next child, so the 180
+// share one memory. Each child reads its word before it writes it, so a byte left by the child before
+// would show in the sum. Non-vacuity: the runs minted one memory, which the page still holds.
 import { startServer } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -191,6 +198,63 @@ block 0 (v0: i64) {
 }
 `;
 
+// #1414 5d: the root runs its `kid` export, a child image, 90 times one after another, each spawned
+// detached by the record at 34816 and paid from the run's `budget`, and joined before the next. The
+// child reads a word of its own window, stores 7 there, and returns the word it read plus the one it
+// reads back: 7 in a zeroed window, so the root returns 630. (A run of `temen_run_nested` has fuel
+// for 91 such children.)
+const PUMP_CHILDREN = 90, PUMP_RUNS = 2;
+const PUMP_ROOT_SRC = `memory 17
+data ro 40960 "budget"
+data ro 40976 "kid"
+export 0 func "kid" 1
+func (i32) -> (i64) {
+block 0 (vinst: i32) {
+  vbp = i64.const 40960
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  vkp = i64.const 40976
+  vkl = i64.const 3
+  vk = self.resolve vkp vkl
+  vrec = i64.const 34816
+  vw0 = i64.const -4294967296
+  i64.store vrec vw0
+  i32.store vrec vk offset=8
+  i32.store vrec vb offset=12
+  vw6 = i64.const 4294967295
+  i64.store vrec vw6 offset=48
+  vi = i64.const 0
+  vacc = i64.const 0
+  br 1(vinst, vi, vacc)
+}
+block 1 (vin: i32, vi1: i64, vacc1: i64) {
+  vrec1 = i64.const 34816
+  vh = call.cap 6 17 (i64) -> (i32) vin (vrec1)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vin (vh)
+  vacc2 = i64.add vacc1 vj
+  vone = i64.const 1
+  vi2 = i64.add vi1 vone
+  vn = i64.const ${PUMP_CHILDREN}
+  vmore = i64.lt_s vi2 vn
+  br_if vmore 1(vin, vi2, vacc2) 2(vacc2)
+}
+block 2 (vres: i64) {
+  return vres
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.const 16400
+  vold = i64.load va
+  v7 = i64.const 7
+  i64.store va v7
+  vl = i64.load va
+  vs = i64.add vold vl
+  return vs
+  }
+}
+`;
+
 // #2251: `self.parallelism`, returned.
 const CPUS_SRC = `memory 16
 func () -> (i64) {
@@ -202,8 +266,9 @@ block 0 () {
 }
 `;
 
-const res = await page.evaluate(async ({ rootSrc, childSrc, minter, selfRootSrc, nineUnitSrc, carveRootSrc, cpusSrc }) => {
+const res = await page.evaluate(async ({ rootSrc, childSrc, minter, selfRootSrc, nineUnitSrc, carveRootSrc, cpusSrc, pumpRootSrc, pumpRuns }) => {
   const { loadEngine, makeRunner } = await import('./par.js');
+  const { foreignMemory, registerForeign, releaseForeign } = await import('./foreign-mem.js');
   const once = async (eng, emitted = false, src = { root: rootSrc, child: childSrc, minter }) => {
   const ex = eng.ex, memory = eng.memory;
   const u8 = () => new Uint8Array(memory.buffer);
@@ -243,8 +308,40 @@ const res = await page.evaluate(async ({ rootSrc, childSrc, minter, selfRootSrc,
   const carve = await once(await loadEngine(fresh), false, { root: carveRootSrc, child: null, minter: 0, winSize: 1 << 20 });
   const cpus = await once(await loadEngine(fresh), false, { root: cpusSrc, child: null, plain: true });
   const cores = String(navigator.hardwareConcurrency || 1);
-  return { ...first, second, emitted, self, carve, cpus, cores, reused: fresh.module === eng.module, freshMemory: fresh.memory !== eng.memory && freshBytes < usedBytes };
-}, { rootSrc: ROOT_SRC, childSrc: CHILD_SRC, minter: MINTER_QUOTA, selfRootSrc: SELF_ROOT_SRC, nineUnitSrc: NINE_UNIT_SRC, carveRootSrc: CARVE_ROOT_SRC, cpusSrc: CPUS_SRC });
+  // The pump: the root's children, one after another, on this page's own engine, in two runs. The
+  // engine's next foreign id before and after the runs counts the memories they minted, and those
+  // still registered are the page's spares.
+  const pumped = await (async () => {
+    const pe = await loadEngine(fresh), pex = pe.ex;
+    const pu8 = () => new Uint8Array(pe.memory.buffer);
+    const b = new TextEncoder().encode(pumpRootSrc);
+    const p = pex.temen_alloc(b.length);
+    pu8().set(b, p);
+    const parsed = pex.temen_parse(p, b.length);
+    pex.temen_dealloc(p, b.length);
+    const bytes = pu8().slice(pex.temen_parse_ptr(), pex.temen_parse_ptr() + pex.temen_parse_len());
+    if (parsed !== 1) return { err: 'parse: ' + new TextDecoder().decode(bytes) };
+    const nextId = () => {
+      const id = registerForeign(pe.memory, new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }));
+      releaseForeign(pe.memory, id);
+      return id;
+    };
+    const m = pex.temen_alloc(bytes.length);
+    pu8().set(bytes, m);
+    const before = nextId();
+    const runs = [];
+    for (let r = 0; r < pumpRuns; r++) {
+      const value = pex.temen_run_nested(m, bytes.length);
+      runs.push(`${value}:${pex.temen_status()}`);
+    }
+    const after = nextId();
+    const minted = after - before - 1;
+    let held = 0;
+    for (let id = before + 1; id < after; id++) if (foreignMemory(pe.memory, id) !== undefined) held++;
+    return { runs, minted, held };
+  })();
+  return { ...first, second, emitted, self, carve, cpus, cores, pumped, reused: fresh.module === eng.module, freshMemory: fresh.memory !== eng.memory && freshBytes < usedBytes };
+}, { rootSrc: ROOT_SRC, childSrc: CHILD_SRC, minter: MINTER_QUOTA, selfRootSrc: SELF_ROOT_SRC, nineUnitSrc: NINE_UNIT_SRC, carveRootSrc: CARVE_ROOT_SRC, cpusSrc: CPUS_SRC, pumpRootSrc: PUMP_ROOT_SRC, pumpRuns: PUMP_RUNS });
 
 await browser.close();
 await new Promise((r) => server.close(r));
@@ -258,12 +355,17 @@ const sf = res.self, cv = res.carve;
 const selfOk = sf && !sf.err && sf.value === '7' && sf.tierups === 1;
 const carveOk = cv && cv.err === 'guest trap: CapFault';
 const cpusOk = res.cpus && !res.cpus.err && res.cpus.value === res.cores;
-const ok = errors.length === 0 && !res.err && res.value === EXPECT && res.started === 4 && res.childMems === 3 && again && res.reused && res.freshMemory && emittedOk && selfOk && carveOk && cpusOk;
+const pm = res.pumped;
+const pumpRun = `${7 * PUMP_CHILDREN}:0`;
+const pumpOk = pm && !pm.err && pm.runs.every((r) => r === pumpRun)
+  && pm.minted === 1 && pm.held === 1;
+const ok = errors.length === 0 && !res.err && res.value === EXPECT && res.started === 4 && res.childMems === 3 && again && res.reused && res.freshMemory && emittedOk && selfOk && carveOk && cpusOk && pumpOk;
 console.log(`  detached children across Workers: value ${res.value}/${EXPECT} workers ${res.started}/4 threads over a child's own memory ${res.childMems}/3${res.err ? ` · ERR ${res.err}` : ''}`);
 console.log(`  again on loadEngine(prev): value ${res.second?.value}/${EXPECT} · compiled module reused ${res.reused} · fresh memory ${res.freshMemory}`);
 console.log(`  on emitted wasm: value ${em?.value}/${EXPECT} workers ${em?.started}/4 emitted children ${em?.tierups}/3${em?.err ? ` · ERR ${em.err}` : ''}`);
 console.log(`  own-module child under tierup: value ${sf?.value}/7 emitted ${sf?.tierups}/1${sf?.err ? ` · ERR ${sf.err}` : ''}`);
 console.log(`  carve spawn: ${carveOk ? 'fails closed' : `NOT refused (${cv?.err ?? cv?.value})`}`);
 console.log(`  self.parallelism: ${res.cpus?.value}/${res.cores} (the page's core count)${res.cpus?.err ? ` · ERR ${res.cpus.err}` : ''}`);
-console.log(ok ? 'PASS — three detached children ran concurrently, each on its own Worker in its own WebAssembly.Memory, grew it on vm_map, and the exhausted minter refused a fourth' : 'FAIL');
+console.log(`  on the pump: runs (value:status) ${pm?.runs?.join(' ')} of ${pumpRun} · memories minted ${pm?.minted}/1, held ${pm?.held}/1${pm?.err ? ` · ERR ${pm.err}` : ''}`);
+console.log(ok ? 'PASS — three detached children ran concurrently, each on its own Worker in its own WebAssembly.Memory, grew it on vm_map, and the exhausted minter refused a fourth; on the pump, 180 children ran one after another, each in a memory of its own, which the page zeroed and handed to the next' : 'FAIL');
 process.exit(ok ? 0 : 1);
