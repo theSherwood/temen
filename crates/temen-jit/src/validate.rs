@@ -49,18 +49,22 @@ pub(crate) struct WindowLayout {
     pub guard_offset: u64,
 }
 
+/// What a validated function is: guest code, with its module's window layout (`None` if the
+/// module is memoryless), or one of the JIT's own trampolines, which carry no guest window and are
+/// the only code that may set the pinned register (D73).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Code {
+    Guest(Option<WindowLayout>),
+    Trampoline,
+}
+
 /// Validate one emitted function's `bytes` against its basic-block hints from
 /// `CompiledCode`: `bb_starts` (block start offsets) and `bb_edges` (block-to-block control-flow
-/// edges, each `(from_start, to_start)`), with the module's `layout` (`None` if memoryless). Shadow
-/// mode: every problem is logged and counted, never returned.
-pub(crate) fn shadow_check(
-    bytes: &[u8],
-    bb_starts: &[u32],
-    bb_edges: &[(u32, u32)],
-    layout: Option<WindowLayout>,
-) {
+/// edges, each `(from_start, to_start)`), as the `code` it is. Shadow mode: every problem is logged
+/// and counted, never returned.
+pub(crate) fn shadow_check(bytes: &[u8], bb_starts: &[u32], bb_edges: &[(u32, u32)], code: Code) {
     #[cfg(target_arch = "x86_64")]
-    for f in x86::check(bytes, bb_starts, bb_edges, layout) {
+    for f in x86::check(bytes, bb_starts, bb_edges, code) {
         // Count every disagreement (a fuzz run asserts the total), but cap the logging so a bad
         // decode on every module can't swamp a fuzzer's stderr.
         let n = DISAGREEMENTS.fetch_add(1, Ordering::Relaxed);
@@ -69,7 +73,7 @@ pub(crate) fn shadow_check(
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = (bytes, bb_starts, bb_edges, layout);
+    let _ = (bytes, bb_starts, bb_edges, code);
 }
 
 // --- test-only capture of real compiled code, cross-checked against iced-x86 ---
@@ -124,7 +128,7 @@ pub(crate) mod x86 {
     //! classification), the machine-CFG recovery and abstract dataflow (#2535), and the
     //! memory-access confinement policy (#2535/#2603) they feed.
 
-    use super::WindowLayout;
+    use super::{Code, WindowLayout};
 
     /// A machine-code policy disagreement: `why`, at byte offset `at` in the function.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,12 +139,12 @@ pub(crate) mod x86 {
 
     /// x86-64 GP register numbers the entry ABI and the policy refer to by name (Tail CC, §3b).
     mod reg {
-        pub const RCX: u8 = 1; // stack_limit (arg 3)
-        pub const RDX: u8 = 2; // vmctx / trap_out (arg 2)
+        pub const RDX: u8 = 2; // stack_limit (arg 2)
         pub const RSP: u8 = 4; // stack pointer
         pub const RBP: u8 = 5; // frame pointer
-        pub const RSI: u8 = 6; // fn_table_base (arg 1)
-        pub const RDI: u8 = 7; // mem_base (arg 0)
+        pub const RSI: u8 = 6; // vmctx / trap_out (arg 1)
+        pub const RDI: u8 = 7; // fn_table_base (arg 0)
+        pub const R15: u8 = 15; // mem_base: Cranelift's pinned register (D73)
     }
 
     /// The largest machine access width (AVX-512 zmm) — used as a sound over-estimate when checking
@@ -153,13 +157,14 @@ pub(crate) mod x86 {
     /// bound widens under meet and is dropped to `Unknown` at a loop header, bounding the fixpoint.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Fact {
-        /// The window base `mem_base` (rdi at entry) — the base of a confined window access.
+        /// The window base `mem_base` (the pinned register r15, D73) — the base of a confined
+        /// window access.
         MemBase,
-        /// `fn_table_base` (rsi) — the base of a `call.dyn` table access.
+        /// `fn_table_base` (rdi) — the base of a `call.dyn` table access.
         FnTableBase,
-        /// The `vmctx`/trap-out pointer (rdx).
+        /// The `vmctx`/trap-out pointer (rsi).
         Vmctx,
-        /// `stack_limit` (rcx).
+        /// `stack_limit` (rdx).
         StackLimit,
         /// A known constant (e.g. the guard-offset materialization `mov r, imm`).
         Const(i64),
@@ -213,14 +218,15 @@ pub(crate) mod x86 {
     }
 
     impl State {
-        /// The entry ABI: the four context params in their argument registers, everything else
-        /// unknown, no slots. rsp/rbp are the stack and are recognized structurally, not as facts.
+        /// The entry ABI: the window base in the pinned register and the three context params in
+        /// their argument registers, everything else unknown, no slots. rsp/rbp are the stack and
+        /// are recognized structurally, not as facts.
         fn entry() -> State {
             let mut regs = [Fact::Unknown; 16];
-            regs[reg::RDI as usize] = Fact::MemBase;
-            regs[reg::RSI as usize] = Fact::FnTableBase;
-            regs[reg::RDX as usize] = Fact::Vmctx;
-            regs[reg::RCX as usize] = Fact::StackLimit;
+            regs[reg::R15 as usize] = Fact::MemBase;
+            regs[reg::RDI as usize] = Fact::FnTableBase;
+            regs[reg::RSI as usize] = Fact::Vmctx;
+            regs[reg::RDX as usize] = Fact::StackLimit;
             State {
                 regs,
                 slots: [None; SLOT_CAP],
@@ -313,12 +319,16 @@ pub(crate) mod x86 {
         bytes: &[u8],
         bb_starts: &[u32],
         bb_edges: &[(u32, u32)],
-        layout: Option<WindowLayout>,
+        code: Code,
     ) -> Vec<Finding> {
         let mut findings = Vec::new();
         if bytes.is_empty() {
             return findings;
         }
+        let layout = match code {
+            Code::Guest(layout) => layout,
+            Code::Trampoline => None,
+        };
 
         // Layers 1–2: recover the machine basic blocks, decode each, and collect direct successors.
         let leaders = recover_leaders(bytes, bb_starts, bb_edges);
@@ -338,6 +348,19 @@ pub(crate) mod x86 {
                 }
             }
             blocks.push(insns);
+        }
+        // D73 — the pinned register holds the window base for the whole run: an entry trampoline
+        // sets it, and guest code only reads it.
+        if code != Code::Trampoline {
+            for &(at, d) in blocks.iter().flatten() {
+                if writes_of(d.eff, &d.operands) & bit(reg::R15) != 0 {
+                    findings.push(Finding {
+                        at,
+                        why: "guest code writes the pinned register r15, the window base (D73)"
+                            .into(),
+                    });
+                }
+            }
         }
         // The one edge the decoder cannot read — an indirect `jmp`'s jump-table targets — comes from
         // the `bb_edges` hint: attach each edge's target to the machine block containing its source.
@@ -1832,7 +1855,7 @@ pub(crate) mod x86 {
                         bytes
                     );
                 }
-                let findings = check(&bytes, &bb_starts, &bb_edges, layout);
+                let findings = check(&bytes, &bb_starts, &bb_edges, Code::Guest(layout));
                 assert!(
                     findings.is_empty(),
                     "clean Cranelift output flagged: {findings:?}\n{:02x?}",
@@ -2008,16 +2031,16 @@ pub(crate) mod x86 {
             s.widen();
             assert_eq!(s.regs[8], Unknown);
             assert_eq!(s.regs[9], conf);
-            assert_eq!(s.regs[reg::RDI as usize], MemBase);
+            assert_eq!(s.regs[reg::R15 as usize], MemBase);
         }
 
         /// A window access through an index that was **not** confined by the D63 sequence is the
-        /// escape-relevant case the policy must flag: `mov rax, [rdi + r8]` with `r8` a guest
-        /// argument (unknown, unconfined) and `rdi` = `mem_base`.
+        /// escape-relevant case the policy must flag: `mov rax, [r15 + r8]` with `r8` a guest
+        /// argument (unknown, unconfined) and `r15` = `mem_base`.
         #[test]
         fn policy_flags_unconfined_window_index() {
-            let bytes = [0x4a, 0x8b, 0x04, 0x07, 0xc3]; // mov rax,[rdi+r8*1]; ret
-            let f = check(&bytes, &[], &[], None);
+            let bytes = [0x4b, 0x8b, 0x04, 0x07, 0xc3]; // mov rax,[r15+r8*1]; ret
+            let f = check(&bytes, &[], &[], Code::Guest(None));
             assert!(
                 f.iter().any(|f| f.why.contains("unconfined index")),
                 "expected an unconfined-window-index finding, got {f:?}"
@@ -2029,7 +2052,7 @@ pub(crate) mod x86 {
         #[test]
         fn policy_flags_unknown_base() {
             let bytes = [0x49, 0x8b, 0x01, 0xc3]; // mov rax,[r9]; ret
-            let f = check(&bytes, &[], &[], None);
+            let f = check(&bytes, &[], &[], Code::Guest(None));
             assert!(
                 f.iter().any(|f| f.why.contains("unrecognized provenance")),
                 "expected an unknown-base finding, got {f:?}"
@@ -2045,10 +2068,10 @@ pub(crate) mod x86 {
                 0x00, // mov rax, 0x2000000000
                 0x4c, 0x3b, 0xc0, // cmp r8, rax
                 0x4c, 0x0f, 0x43, 0xc0, // cmovae r8, rax
-                0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
+                0x4b, 0x8b, 0x04, 0x07, // mov rax, [r15 + r8*1]
                 0xc3, // ret
             ];
-            let f = check(&bytes, &[], &[], None);
+            let f = check(&bytes, &[], &[], Code::Guest(None));
             assert!(f.is_empty(), "the confinement sequence was flagged: {f:?}");
         }
 
@@ -2058,7 +2081,7 @@ pub(crate) mod x86 {
         #[test]
         fn policy_reproves_elided_access_against_reservation() {
             let bytes = [
-                0x48, 0x8b, 0x87, 0x40, 0x9c, 0x00, 0x00, // mov rax, [rdi + 0x9C40 (=40000)]
+                0x49, 0x8b, 0x87, 0x40, 0x9c, 0x00, 0x00, // mov rax, [r15 + 0x9C40 (=40000)]
                 0xc3, // ret
             ];
             // A large reservation easily holds offset 40000 → no finding.
@@ -2066,25 +2089,25 @@ pub(crate) mod x86 {
                 mask: (1u64 << 37) - 1,
                 guard_offset: 1u64 << 37,
             });
-            assert!(check(&bytes, &[], &[], big).is_empty());
+            assert!(check(&bytes, &[], &[], Code::Guest(big)).is_empty());
             // A 32 KiB reservation does not → the access reaches past it.
             let small = Some(WindowLayout {
                 mask: (1u64 << 15) - 1,
                 guard_offset: 1u64 << 15,
             });
-            let f = check(&bytes, &[], &[], small);
+            let f = check(&bytes, &[], &[], Code::Guest(small));
             assert!(
                 f.iter().any(|f| f.why.contains("past the reservation")),
                 "expected a reservation-overrun finding, got {f:?}"
             );
         }
 
-        /// Spill-slot tracking carries `mem_base` across a stack round-trip: spill rdi to `[rsp]`,
-        /// confine r8, reload rdi from `[rsp]`, then access `[mem_base + confined]` — clean.
+        /// Spill-slot tracking carries `mem_base` across a stack round-trip: spill r15 to `[rsp]`,
+        /// confine r8, reload it into rdi from `[rsp]`, then access `[mem_base + confined]`: clean.
         #[test]
         fn policy_tracks_membase_through_a_spill_slot() {
             let bytes = [
-                0x48, 0x89, 0x3c, 0x24, // mov [rsp], rdi  (spill mem_base)
+                0x4c, 0x89, 0x3c, 0x24, // mov [rsp], r15  (spill mem_base)
                 0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00,
                 0x00, // mov rax, 0x2000000000
                 0x4c, 0x3b, 0xc0, // cmp r8, rax
@@ -2093,7 +2116,7 @@ pub(crate) mod x86 {
                 0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
                 0xc3, // ret
             ];
-            let f = check(&bytes, &[], &[], None);
+            let f = check(&bytes, &[], &[], Code::Guest(None));
             assert!(
                 f.is_empty(),
                 "spilled-then-reloaded mem_base was flagged: {f:?}"
@@ -2105,17 +2128,44 @@ pub(crate) mod x86 {
         #[test]
         fn policy_slot_overwrite_drops_the_stale_fact() {
             let bytes = [
-                0x48, 0x89, 0x3c, 0x24, // mov [rsp], rdi            (slot := mem_base)
+                0x4c, 0x89, 0x3c, 0x24, // mov [rsp], r15            (slot := mem_base)
                 0x48, 0xc7, 0x04, 0x24, 0x00, 0x00, 0x00,
                 0x00, // mov qword [rsp], 0  (overwrites it)
                 0x48, 0x8b, 0x3c, 0x24, // mov rdi, [rsp]            (reload ⇒ Unknown)
                 0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
                 0xc3, // ret
             ];
-            let f = check(&bytes, &[], &[], None);
+            let f = check(&bytes, &[], &[], Code::Guest(None));
             assert!(
                 f.iter().any(|f| f.why.contains("unrecognized provenance")),
                 "a stale slot fact survived an overwrite: {f:?}"
+            );
+        }
+
+        /// D73 — guest code that writes the pinned register is flagged, and a later access through
+        /// it is no longer the window: the base it held is gone. A trampoline may set it.
+        #[test]
+        fn policy_flags_a_guest_write_to_the_pinned_register() {
+            let bytes = [
+                0x4d, 0x89, 0xcf, // mov r15, r9
+                0x4b, 0x8b, 0x04, 0x07, // mov rax, [r15 + r8*1]
+                0xc3, // ret
+            ];
+            let f = check(&bytes, &[], &[], Code::Guest(None));
+            assert!(
+                f.iter()
+                    .any(|f| f.why.contains("writes the pinned register")),
+                "a guest write to r15 went unflagged: {f:?}"
+            );
+            assert!(
+                f.iter().any(|f| f.why.contains("unrecognized provenance")),
+                "r15 kept the window-base fact after a write: {f:?}"
+            );
+            let set = [0x49, 0x89, 0xff, 0xc3]; // mov r15, rdi; ret
+            let f = check(&set, &[], &[], Code::Trampoline);
+            assert!(
+                f.is_empty(),
+                "a trampoline's write to r15 was flagged: {f:?}"
             );
         }
     }
