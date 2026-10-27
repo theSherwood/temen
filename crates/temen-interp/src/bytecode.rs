@@ -3990,10 +3990,14 @@ impl Reactor {
         if func as usize >= self.n_funcs {
             return Err(Trap::Malformed);
         }
-        // A fresh natural dispatch table over the shared compiled source (cheap: an `Arc` clone + the
-        // slot vector) — there is no §22 install state to carry between frames, so a natural table each
-        // call is correct. `run` consumes the `Domain`; the persistent `mem` carries state across calls.
-        let dom = Domain::child(self.source.clone(), SharedSlots::new(self.n_funcs, 0, 0));
+        // A fresh dispatch table over the shared compiled source (cheap: an `Arc` clone + the slot
+        // vector), with the install room the powerbox's `Jit` grant sizes, as `coop_call` and every
+        // run's table have (#1296, #2661). No §22 install state carries between frames, so each call's
+        // table is fresh. `run` consumes the `Domain`; the persistent `mem` carries state across calls.
+        let dom = Domain::child(
+            self.source.clone(),
+            build_table(self.n_funcs, host.jit_table_log2()),
+        );
         run(dom, func, args, fuel, &mut self.mem, host)
     }
 

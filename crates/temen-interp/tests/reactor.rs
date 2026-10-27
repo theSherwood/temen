@@ -149,3 +149,68 @@ fn a_coarse_page_entry_expands_over_every_codec_page_it_covers() {
     want[4..8].fill(CapturedProt::Ro);
     assert_eq!(layout.dense_prots(), want);
 }
+
+/// #2661 — the guest installs the §22 unit it is handed and calls it through `call.dyn`.
+const INSTALLS: &str = r#"
+memory 16
+func (i32, i32) -> (i64) {
+block 0 (vjit: i32, vcode: i32) {
+  vc = i64.extend_i32_u vcode
+  vslot = call.cap 11 3 (i64) -> (i64) vjit (vc)
+  vs = i32.wrap_i64 vslot
+  vfive = i64.const 5
+  vr = call.dyn (i64) -> (i64) vs (vfive)
+  return vr
+  }
+}
+"#;
+
+/// The unit it installs: its argument plus 100.
+const PLUS_100: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v100 = i64.const 100
+  vr = i64.add v0 v100
+  return vr
+  }
+}
+"#;
+
+/// A stub validator: every blob is [`PLUS_100`] (trusted test input).
+fn plus_100(_: &[u8], _: Option<u8>, _: &[u8]) -> Result<temen_interp::JitValidated, i64> {
+    let m = parse_module(PLUS_100).map_err(|_| -22i64)?;
+    Ok(temen_interp::JitValidated {
+        funcs: m.funcs.into(),
+        types: m.types.into(),
+        data: None,
+    })
+}
+
+/// **A reactor frame calls a unit it installs (#2661).** `call` sizes each frame's dispatch table by
+/// the powerbox's `Jit` grant, as `coop_call` and a one-shot run do, so the install lands in the
+/// frame's table and its `call.dyn` reaches it. Each frame gets a fresh table, so every frame
+/// installs and calls the unit again.
+#[test]
+fn a_reactor_frame_calls_a_unit_it_installs() {
+    let m = parse_module(INSTALLS).expect("parse the installing module");
+    temen_verify::verify_module(&m).expect("verify");
+    let mut host = Host::new();
+    let jit = host.grant_jit_with_table(Some(16), 4);
+    host.set_jit_validator(plus_100);
+    let code = match host.jit_compile(jit, &[0]) {
+        Ok(Ok(c)) => c.handle,
+        Ok(Err(e)) => panic!("the stub compile refused: {e}"),
+        Err(t) => panic!("the stub compile trapped: {t:?}"),
+    };
+    let args = [Value::I32(jit), Value::I32(code)];
+    let mut r = bytecode::Reactor::open(&m).expect("the bytecode engine runs the module");
+    for frame in 0..2 {
+        let mut fuel = 1_000_000u64;
+        assert_eq!(
+            r.call(0, &args, &mut fuel, &mut host),
+            Ok(vec![Value::I64(105)]),
+            "frame {frame}: the installed unit answers 5 + 100"
+        );
+    }
+}
