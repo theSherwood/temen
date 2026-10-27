@@ -8,7 +8,7 @@
 //
 // Boots the backend twice (a few seconds each). Exits 0 on success, 1 on any mismatch.
 import { readFileSync } from 'node:fs';
-import { engineImports } from './engine-imports.mjs';
+import { instantiateEngine } from './engine-imports.mjs';
 
 const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
 const modPath = process.argv[3] ?? 'web/assets/postgres_resolved.temen';
@@ -18,7 +18,7 @@ const mod = await WebAssembly.compile(readFileSync(wasmPath));
 // The threads build imports its linear memory as a shared memory (same shape as web/par.js). A plain
 // build owns its own memory and ignores the import; pass one unconditionally so both work.
 const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
-const ex = (await WebAssembly.instantiate(mod, engineImports(memory))).exports;
+const ex = await instantiateEngine(mod, memory);
 const is64 = ex.temen_abi_is64() === 1;
 const N = (x) => (is64 ? BigInt(x) : Number(x));
 const put = (bytes) => {

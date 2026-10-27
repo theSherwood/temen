@@ -441,8 +441,8 @@ property, so in practice:
   thread's page-state table, rebuilt from the task's page map when it moves (B6-3b-4b). A spilling
   emit pushes its frames' live words to its thread's spill stack, and a `gc.roots` in a bounce scans
   them with the task beneath (B6-3b-4c). A detached child's window is a `WebAssembly.Memory` of its
-  own (`ThreadPlatform::child_window`): the spawning thread's Worker
-  mints it, and the Worker of each of the child's threads is handed it, so the child's threads
+  own (`Host::set_child_window`, which the pump honours too since #1414 5d): the spawning thread's
+  Worker mints it, and the Worker of each of the child's threads is handed it, so the child's threads
   interpret over it through `Region::Foreign` (B6-3c-1). A thread whose entry is eligible runs the
   entry itself on its Worker's tier, and the results end the thread (#1414 ED-1). The child's root
   task runs its granted module's emit over the child's memory, with its context in the memory's

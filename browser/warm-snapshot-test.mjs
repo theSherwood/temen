@@ -10,7 +10,7 @@
 // Exits 0 on success (all parity checks pass), 1 on any mismatch.
 import { readFileSync, existsSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
-import { engineImports } from './engine-imports.mjs';
+import { instantiateEngine } from './engine-imports.mjs';
 
 const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
 const modPath = process.argv[3] ?? 'web/assets/qjs_snapshot.temen';
@@ -28,7 +28,7 @@ const mod = await WebAssembly.compile(readFileSync(wasmPath));
 // unconditionally so both work, and read through whichever memory the instance actually uses
 // (`ex.memory` for the plain build's own export; the imported `memory` for the threads build).
 const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
-const ex = (await WebAssembly.instantiate(mod, engineImports(memory))).exports;
+const ex = await instantiateEngine(mod, memory);
 const membuf = () => (ex.memory ?? memory).buffer;
 const is64 = ex.temen_abi_is64() === 1;
 const N = (x) => (is64 ? BigInt(x) : Number(x));

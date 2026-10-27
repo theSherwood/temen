@@ -19,7 +19,9 @@
 // window under the leaf's own frames, which the driver's `"win"` fan-out must follow.
 //
 // #2248: then a child that runs its program's child image, a granted module, tiers up through the
-// image's own emit, a program of the run's besides its own, over its own window (#2102).
+// image's own emit, a program of the run's besides its own, over its own window: a memory of its own
+// (#1414 5d), which the engine gives back once the child has ended, and the page keeps, zeroed, for
+// the next child.
 //
 // Usage:  node browser-coop-grow-test.mjs [module.wasm]   (build the threads cdylib first)
 
@@ -27,7 +29,8 @@ import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { driveCoopTierupRun, runJitModule } from './web/wasmjit-module.js';
-import { engineImports } from './engine-imports.mjs';
+import { instantiateEngine } from './engine-imports.mjs';
+import { foreignMemory } from './web/foreign-mem.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const wasmPath = process.argv[2]
@@ -45,7 +48,7 @@ for (const p of [wasmPath, fixture]) {
 // memory import is shared and needs a bounded one.
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
 const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
-const { exports: ex } = await WebAssembly.instantiate(mod, engineImports(memory));
+const ex = await instantiateEngine(mod, memory);
 const u8 = () => new Uint8Array(memory.buffer);
 const dec = new TextDecoder();
 const readStdout = () => dec.decode(u8().slice(
@@ -304,11 +307,14 @@ if (childWant.status !== 0 || childWant.out.length !== 8) {
 }
 const childOpened = ex.temen_coop_open(cp, childGuest.length, 0, 0, 1, 0, 0, 0);
 ex.temen_dealloc(cp, childGuest.length);
-// The program each tier-up names, each bounce's pending program, and each program whose own emit
-// the driver loaded.
+// The program each tier-up names, the memory it names, each bounce's pending program, and each
+// program whose own emit the driver loaded.
 const childPrograms = [];
+const childMems = [];
 const childBounces = [];
 const childLoaded = [];
+// What the child's own memory holds where f2 stores, as each of its emitted calls returns.
+const childStored = [];
 if (childOpened !== 0) {
   fail(`the child guest's open refused (status ${ex.temen_status()})`);
 } else {
@@ -317,6 +323,19 @@ if (childOpened !== 0) {
       const m = ex.temen_coop_module();
       childPrograms.push(m);
       return m;
+    },
+    temen_coop_tierup_mem: () => {
+      const mem = ex.temen_coop_tierup_mem();
+      childMems.push(mem);
+      return mem;
+    },
+    temen_coop_deliver: (...a) => {
+      const mem = childMems.at(-1);
+      if (mem >= 0) {
+        const at = (ex.temen_detached_header_bytes() + 32768) / 8;
+        childStored.push(new BigInt64Array(foreignMemory(memory, mem).buffer)[at]);
+      }
+      return ex.temen_coop_deliver(...a);
     },
     temen_coop_call_interp: (...a) => {
       childBounces.push(ex.temen_coop_module());
@@ -339,6 +358,17 @@ if (childOpened !== 0) {
   if (!childBounces.includes(1)) {
     fail(`the child's emitted frames must bounce to f3: bounces from ${JSON.stringify(childBounces)}`);
   }
+  // #1414 5d: the child's window is a memory of its own, which each of its tier-ups names and the
+  // root's do not, and which the engine gave back when the child ended: the page keeps it, zeroed.
+  const named = childPrograms.map((m, i) => [m, childMems[i]]);
+  const own = [...new Set(named.filter(([m]) => m === 1).map(([, mem]) => mem))];
+  if (own.length !== 1 || !(own[0] >= 0) || named.some(([m, mem]) => m !== 1 && mem !== -1)) {
+    fail(`program 1's tier-ups must name one memory of the child's own: ${JSON.stringify(named)}`);
+  } else if (!childStored.includes(11n)) {
+    fail(`f2's store must land in the child's own memory: it held ${childStored}`);
+  } else if (!new Uint8Array(foreignMemory(memory, own[0])?.buffer ?? [1]).every((b) => b === 0)) {
+    fail(`the child's memory ${own[0]} must come back zeroed once the child has ended`);
+  }
   if (childStatus !== 0 || childGot.status !== childWant.status) {
     fail(`child: status ${childGot.status} (returned ${childStatus}), oracle ${childWant.status}`);
   }
@@ -350,4 +380,4 @@ if (process.exitCode) process.exit(process.exitCode);
 console.log(`ok — coop path, ${counts.tierups} tier-up(s), ${counts.bounces} bounce(s), `
   + `window ${winAtOpen} → ${winAtLastBounce} bytes, stdout matches the bytecode oracle; `
   + 'as a root leaf, the same over a growing window; a child image tiers up as program '
-  + `${JSON.stringify([...new Set(childPrograms)])}`);
+  + `${JSON.stringify([...new Set(childPrograms)])} over memories ${JSON.stringify([...new Set(childMems)])}`);

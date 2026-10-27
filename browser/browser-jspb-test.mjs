@@ -10,7 +10,7 @@
 //   (build: cargo build --release --lib --target wasm32-unknown-unknown)
 import { readFileSync, existsSync } from 'node:fs';
 
-import { engineImports } from './engine-imports.mjs';
+import { instantiateEngine } from './engine-imports.mjs';
 import { definePowerbox } from './web/powerbox.js';
 
 const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
@@ -47,7 +47,7 @@ block 0 () {
 `;
 
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
-const { exports: ex } = await WebAssembly.instantiate(mod, engineImports());
+const ex = await instantiateEngine(mod);
 const eng = { ex, memory: ex.memory };
 const is64 = ex.temen_abi_is64() === 1;
 const N = (x) => (is64 ? BigInt(x) : Number(x));

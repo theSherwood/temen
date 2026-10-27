@@ -138,7 +138,8 @@ pub enum Region {
 /// (`a` = value), 2..=7 = read-modify-write ([`RmwOp::code`], `a` = operand), 8 = compare-exchange
 /// (`a` = expected, `b` = replacement); it returns the **old** value (`width` 4 or 8, `off` aligned).
 /// `grow` asks the embedder to make at least `len` bytes addressable (a `memory.grow` of the foreign
-/// memory); 0 = refused, the region keeps its old length.
+/// memory); 0 = refused, the region keeps its old length. `release` tells the embedder, once, as the
+/// region drops, that nothing reaches the memory through it again: it may let the memory go.
 ///
 /// The functions are `extern "C"`, so the embedder can fill the table with functions it did not
 /// compile: the browser's are another wasm instance's, called by their index in the engine's own
@@ -157,6 +158,7 @@ pub struct ForeignOps {
     pub copy_within: extern "C" fn(id: u32, dst: u64, src: u64, len: u64),
     pub atomic: extern "C" fn(id: u32, kind: u32, off: u64, width: u32, a: u64, b: u64) -> u64,
     pub grow: extern "C" fn(id: u32, len: u64) -> u32,
+    pub release: extern "C" fn(id: u32),
 }
 
 /// The [`ForeignOps::atomic`] kind for a plain load / store / compare-exchange.
@@ -172,6 +174,12 @@ pub struct Foreign {
     id: u32,
     len: AtomicU64,
     ops: ForeignOps,
+}
+
+impl Drop for Foreign {
+    fn drop(&mut self) {
+        (self.ops.release)(self.id)
+    }
 }
 
 impl Foreign {
@@ -2347,6 +2355,16 @@ mod mock_foreign {
         1
     }
 
+    /// A released memory's bytes go; its id is not reused.
+    extern "C" fn release(id: u32) {
+        MEMS.lock().unwrap()[id as usize] = Vec::new();
+    }
+
+    /// Whether memory `id` is still held.
+    pub fn held(id: u32) -> bool {
+        !MEMS.lock().unwrap()[id as usize].is_empty()
+    }
+
     pub static OPS: ForeignOps = ForeignOps {
         read,
         write,
@@ -2356,6 +2374,7 @@ mod mock_foreign {
         copy_within,
         atomic,
         grow,
+        release,
     };
 }
 
@@ -2407,6 +2426,17 @@ mod foreign_tests {
         assert_eq!(r.read_word(5000, 4), 0xdead_beef);
         assert_eq!(r.atomic_rmw(5000, 4, RmwOp::Add, 1), 0xdead_beef);
         assert_eq!(r.atomic_load(5000, 4), 0xdead_bef0);
+    }
+
+    /// The embedder hears that a region is gone as it drops, and only then: its memory can go.
+    #[test]
+    fn a_foreign_region_releases_its_memory_as_it_drops() {
+        let id = mock_foreign::new_mem(4096);
+        let r = Region::foreign(id, 4096, mock_foreign::OPS);
+        r.set_byte(8, 1);
+        assert!(mock_foreign::held(id), "a live region holds its memory");
+        drop(r);
+        assert!(!mock_foreign::held(id), "the dropped region released it");
     }
 }
 

@@ -11,7 +11,7 @@
 // The `.temen` is deploy-built (the Tcl fetch+toolchain isn't in the committed-asset CI job), so this
 // SKIPs cleanly when it's absent — like the other Tcl demos.
 import { readFileSync, existsSync } from 'node:fs';
-import { engineImports } from './engine-imports.mjs';
+import { instantiateEngine } from './engine-imports.mjs';
 import { runWarmCoop } from './web/wasmjit-module.js';
 
 const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
@@ -23,7 +23,7 @@ if (!existsSync(modPath)) {
 
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
 const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
-const ex = (await WebAssembly.instantiate(mod, engineImports(memory))).exports;
+const ex = await instantiateEngine(mod, memory);
 const membuf = () => (ex.memory ?? memory).buffer;
 const put = (bytes) => { const p = ex.temen_alloc(bytes.length); new Uint8Array(membuf()).set(bytes, Number(p)); return { p, len: bytes.length, free: () => ex.temen_dealloc(p, bytes.length) }; };
 const readStdout = () => { const p = Number(ex.temen_stdout_ptr()), l = Number(ex.temen_stdout_len()); return p && l ? Buffer.from(new Uint8Array(membuf(), p, l)).toString() : ''; };

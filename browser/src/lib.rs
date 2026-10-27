@@ -371,7 +371,7 @@ pub extern "C" fn run_fork() -> i64 {
     else {
         return i64::MIN;
     };
-    let mut host = Host::new();
+    let mut host = run_host();
     let inst = host.grant_instantiator();
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
@@ -494,7 +494,7 @@ fn run_at(ptr: *const u8, len: usize, args: &[Value]) -> i64 {
         }
     };
     let mut fuel = DEFAULT_FUEL;
-    let mut host = temen_interp::Host::new(); // deny-all powerbox (compute-only)
+    let mut host = run_host(); // deny-all powerbox (compute-only)
     match bytecode::compile_and_run_with_host(&m, 0, args, &mut fuel, &mut host) {
         None => {
             set(STATUS_UNSUPPORTED);
@@ -617,7 +617,7 @@ pub extern "C" fn temen_run_bench(
         })
         .collect();
     let mut fuel = DEFAULT_FUEL;
-    let mut host = Host::new(); // deny-all powerbox (compute-only)
+    let mut host = run_host(); // deny-all powerbox (compute-only)
     match bytecode::compile_and_run_with_host(&m, func, &args, &mut fuel, &mut host) {
         None => {
             set(STATUS_UNSUPPORTED);
@@ -797,7 +797,7 @@ pub extern "C" fn temen_par_powerbox(guest_ptr: *const u8, guest_len: usize) -> 
         Ok(s) => temen_encode::encode_module(&s),
         Err(_) => return 0,
     };
-    let mut host = Host::new();
+    let mut host = run_host();
     let jit = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), PAR_JIT_TABLE_LOG2);
     host.set_jit_validator(temen_interp::jit_blob_validator);
     let code = match host.jit_compile(jit, &service) {
@@ -888,7 +888,7 @@ pub extern "C" fn temen_par_powerbox_jit_codegen(guest_ptr: *const u8, guest_len
         return 0;
     };
     let service = temen_encode::encode_module(&service_m);
-    let mut host = Host::new();
+    let mut host = run_host();
     let jit = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), PAR_JIT_TABLE_LOG2);
     host.set_jit_validator(temen_interp::jit_blob_validator);
     let code = match host.jit_compile(jit, &service) {
@@ -976,7 +976,7 @@ fn par_inst_powerbox(
     module: &std::sync::Arc<temen_ir::Module>,
     outline: bool,
 ) -> (Host, Vec<Value>) {
-    let mut host = Host::new();
+    let mut host = run_host();
     host.set_self_module(module);
     let inst = host.grant_instantiator();
     let mut args = vec![Value::I32(inst)];
@@ -1042,7 +1042,7 @@ static PAR_IO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_powerbox_io() -> i32 {
-    let mut host = Host::new();
+    let mut host = run_host();
     let out = host.grant_stream(StreamRole::Out);
     par_publish_io(ParIoCfg {
         host: std::sync::Mutex::new(host),
@@ -1119,7 +1119,7 @@ pub extern "C" fn temen_par_powerbox_onramp(
         return 0;
     }
     let staged = take_staged();
-    let mut host = Host::new();
+    let mut host = run_host();
     host.stdin = stdin.to_vec();
     host.set_stdin_blocking(fed_later != 0);
     let requests = temen_interp::CapRequests::default();
@@ -1198,7 +1198,7 @@ pub extern "C" fn temen_par_powerbox_jit_runtime(guest_ptr: *const u8, guest_len
     let Ok(m) = temen_encode::decode_module(bytes) else {
         return 0;
     };
-    let mut host = Host::new();
+    let mut host = run_host();
     host.set_jit_validator(temen_interp::jit_blob_validator);
     host.set_jit_wasm_emitter(browser_jit_wasm_emitter);
     let jit = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), PAR_JIT_TABLE_LOG2);
@@ -1343,7 +1343,7 @@ fn emitted_trap(code: i32) -> Trap {
 // The imports the parallel driver's platform needs (`X2_PLATFORM`). (Plain `//`: rustdoc rejects
 // `///` on an extern block.)
 // - `x2_spawn(start, mem)`: ask the page to start a Worker that runs `temen_x2_thread(start)`. `mem`
-//   is the foreign memory the thread's window lives in (a detached child's own, [`x2_child_window`]),
+//   is the foreign memory the thread's window lives in (a detached child's own, [`child_window`]),
 //   or -1: the page hands it to the Worker, which registers it under the same id before it runs the
 //   thread. 0 when the request is posted; nonzero when this agent cannot start Workers.
 // - `x2_now_ms()`: milliseconds since the epoch, below a millisecond, on a clock every Worker reads
@@ -1742,8 +1742,8 @@ pub extern "C" fn temen_x2_pagestate_len() -> usize {
     x2_call(|c| c.pagestate().map_or(0, |(_, len)| len)).unwrap_or(0)
 }
 
-/// The parallel driver's [`bytecode::ThreadPlatform`] in a browser: each thread a Worker, the
-/// page's clock, and each detached child's window in a `WebAssembly.Memory` of its own.
+/// The parallel driver's [`bytecode::ThreadPlatform`] in a browser: each thread a Worker, and the
+/// page's clock.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 const X2_PLATFORM: bytecode::ThreadPlatform = bytecode::ThreadPlatform {
     spawn: |f, window| {
@@ -1760,23 +1760,37 @@ const X2_PLATFORM: bytecode::ThreadPlatform = bytecode::ThreadPlatform {
     // SAFETY: a pure import.
     now_ns: || (unsafe { x2_now_ms() } * 1e6) as u64,
     tier: None,
-    child_window: Some(x2_child_window),
     // The root runs on the Worker that opens the run (`temen_x2_open`), unless that Worker pumps
     // it: another Worker would cost the run ~11 ms.
     root_on_opener: true,
 };
 
-/// A detached child's window on the parallel driver (#1414 B6-3c): a `WebAssembly.Memory` of its own
-/// (a header page, then the window, growable to the detached ceiling), minted on the spawner's Worker and handed to each Worker that runs one of the child's
-/// threads ([`x2_spawn`]'s `mem`).
+/// A browser run's root powerbox: empty, and on the threads build its detached children's windows
+/// each in a `WebAssembly.Memory` of its own ([`child_window`], #1414 5d), which their children
+/// inherit. Every run here starts from one, so none can leave its children's windows in the
+/// engine's memory by omission.
+pub(crate) fn run_host() -> Host {
+    #[allow(unused_mut)] // the plain build sets nothing
+    let mut host = Host::new();
+    #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+    host.set_child_window(child_window);
+    host
+}
+
+/// A detached child's window in a browser, on either executor (#1414 B6-3c, 5d): a
+/// `WebAssembly.Memory` of its own (a header page, then the window, growable to the detached
+/// ceiling), minted in the spawner's agent. On the parallel driver it is handed to each Worker that
+/// runs one of the child's threads ([`x2_spawn`]'s `mem`). `None` when the agent cannot make one: a
+/// page holds so many memories, and an agent that adopted no engine instance makes none.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
-fn x2_child_window(size_log2: u8) -> Option<std::sync::Arc<temen_interp::Region>> {
+fn child_window(size_log2: u8) -> Option<std::sync::Arc<temen_interp::Region>> {
     let size = 1u64 << size_log2;
-    let id = foreign_mem::mint(
+    let window = foreign_mem::mint(
         DETACHED_HEADER_BYTES + size,
         DETACHED_HEADER_BYTES + DETACHED_DEFAULT_MAX_BYTES,
+        size,
     )?;
-    Some(std::sync::Arc::new(foreign_region(id, size)))
+    Some(std::sync::Arc::new(window))
 }
 
 /// Run the parallel-driver thread the page started this Worker for: `start` is what `x2_spawn`
@@ -1883,7 +1897,7 @@ pub extern "C" fn temen_x2_open(
         )
     } else {
         match PAR_PB.swap(0, Ordering::AcqRel) {
-            0 => (Host::new(), Vec::new(), Vec::new()),
+            0 => (run_host(), Vec::new(), Vec::new()),
             pb => {
                 // SAFETY: published by `temen_par_powerbox` and taken out of `PAR_PB` above, so
                 // this run owns it: no Worker of another run reads it.
@@ -2459,7 +2473,7 @@ const POWERBOX_CAP_NAMES: [&str; 5] = ["stdout", "stdin", "exit", "stderr", "clo
 /// differential compares the *same* logic on both builds.
 pub fn powerbox_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
     let arity = m.funcs.first().map_or(0, |f| f.params.len());
-    let mut host = Host::new();
+    let mut host = run_host();
     host.stdin = stdin.to_vec();
     let mut slots: Vec<Value> = Vec::new();
     if arity >= 1 {
@@ -3253,7 +3267,7 @@ fn onramp_run(
     if onramp_check(m).is_err() {
         return PbOutcome::refused(STATUS_UNSUPPORTED);
     }
-    let mut host = Host::new();
+    let mut host = run_host();
     // #2168 — a program linked against resident libraries compiles through their memo: the root
     // grants it, so its compile as the nested child goes through this host.
     if let Some(memo) = memo {
@@ -3332,7 +3346,7 @@ pub fn onramp_posix_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
     if onramp_check(m).is_err() {
         return PbOutcome::refused(STATUS_UNSUPPORTED);
     }
-    let mut host = Host::new();
+    let mut host = run_host();
     // The personality's `malloc` hands out the top 64 KiB of the guest window (window offsets, as the
     // `c_shell` harness grants it); the shell's static data + stack sit below. `stdin` seeds `read(0)`.
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
@@ -3692,7 +3706,7 @@ fn posix_host_build(
         return None;
     }
     use temen_interp::cap_id;
-    let mut host = Host::new();
+    let mut host = run_host();
     let (px_h, posix) = temen_posix::grant(&mut host, 0, 0, run.stdin.to_vec());
     // Reached by name too: bash's shim resolves the personality via `__vm_cap_resolve("posix")`.
     host.register_cap_name("posix", px_h);
@@ -3791,7 +3805,7 @@ pub fn posix_shell_exec_with(
     cmds: &[(&str, &temen_ir::Module)],
 ) -> PbOutcome {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-    let mut host = Host::new();
+    let mut host = run_host();
     // Grant order mirrors `c_shell.rs`'s `setup` (shared stdout sink, Stream, Instantiator,
     // AddressSpace, the command Modules, then the personality) so a run here discovers the same handles
     // as the tested one, and the shell's fd-1 writes + each child's re-granted `Stream` share one sink.
@@ -3861,7 +3875,7 @@ fn pg_setup(
     // IMPORTS.md phase 4: an import-bearing module must be a manifest module (paramless exported
     // `_start`) — the runtime binds slots, it never rewrites. Fail closed otherwise.
     onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
-    let mut host = Host::new();
+    let mut host = run_host();
     // Grant the on-ramp powerbox prefix — stdout, stdin, exit, memory (the heap-growth cap `malloc`
     // uses) — and register each **by name** (`self.resolve`). Granted directly — not via
     // `grant_onramp_caps`, whose graphical `display`/`keyboard`/`webgpu` caps would add a host
@@ -4730,7 +4744,7 @@ impl OnrampReactor {
         // The per-frame entry: the guest's exported `tick` (reactor convention `(sp) -> …`).
         let tick = module.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
         let entry_sp = temen_ir::powerbox_entry_sp(&module);
-        let mut host = Host::new();
+        let mut host = run_host();
         let caps = grant_onramp_caps(&mut host, &module, fs, None, &take_staged())?;
         let (inst, back) = reactor_instance(&module, 0).ok_or(STATUS_UNSUPPORTED)?;
         let mut r = OnrampReactor {
@@ -4802,7 +4816,7 @@ impl OnrampReactor {
         // table with its own — same grants in the same order, so the same slots and generations,
         // which is what keeps a guest-held handle value valid across the save; a capability the guest
         // had dropped before the freeze is absent from the artifact and stays dropped.
-        let mut host = Host::new();
+        let mut host = run_host();
         let caps = grant_onramp_caps(&mut host, &module, fs, None, &take_staged())?;
         host.set_named_cap_registrar(caps.registrar());
 
@@ -4998,7 +5012,7 @@ pub fn capture_exec(m: &temen_ir::Module, init: &[u8], arg: i64) -> CapOutcome {
 /// under its export's name (#2219), which a spawn names. Returns `(status, i64-widened value)`. Shared
 /// by the wasm [`temen_run_nested`] export and the native `gencorpus` ground truth.
 pub fn instantiate_exec(m: &temen_ir::Module) -> (i32, i64) {
-    let mut host = Host::new();
+    let mut host = run_host();
     let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 1 << 20, -1);
     host.register_cap_name("budget", budget);
@@ -5434,7 +5448,7 @@ pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
         w[b..b + 8].copy_from_slice(&hb);
         w[t..t + 8].copy_from_slice(&hb);
     }
-    let mut host = Host::new();
+    let mut host = run_host();
     if let Err(status) = grant_onramp_caps(&mut host, &m, None, None, &take_staged()) {
         set(status);
         return -1;
@@ -5528,7 +5542,7 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
     // Restore the warm image, and zero the tail any prior eval grew the heap into — so this Run sees
     // byte-identical warm state (fresh-per-Run isolation).
     s.restore_warm_window();
-    let mut host = Host::new();
+    let mut host = run_host();
     host.stdin = stdin.to_vec();
     // The eval's output streams as it writes it (#1142), as every on-ramp powerbox's does.
     if let Err(status) = grant_onramp_caps(&mut host, &s.module, None, None, &take_staged()) {
@@ -5673,7 +5687,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
     let staged = take_staged();
     // `None` once the powerbox refused `m` (#2579), its status set.
     let host_for = |m: &temen_ir::Module| {
-        let mut host = Host::new();
+        let mut host = run_host();
         host.stdin = stdin.clone();
         match grant_onramp_caps(&mut host, m, None, None, &staged) {
             Ok(granted) => Some((host, granted.frame)),
@@ -8626,7 +8640,7 @@ pub extern "C" fn temen_mem_profile(
     // Discover the handle the hook grant will mint (grants are deterministic; the run host below
     // grants the hook first, so a scratch first-grant yields the exact baked-in value).
     let handle = {
-        let mut scratch = Host::new();
+        let mut scratch = run_host();
         scratch.grant_host_proc(HostProcGrant::new(
             ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![]))),
             temen_interp::CapState::Stateless,
@@ -8670,7 +8684,7 @@ pub extern "C" fn temen_mem_profile(
         .unwrap_or_else(|e| e.into_inner())
         .set_snapshots(false); // run-mode: forward-only clock, no seeks
     let feed = Arc::clone(&model);
-    let mut host = Host::new();
+    let mut host = run_host();
     let mut n: u64 = 0; // the profile's event clock (hooks carry none; forward-only)
     let h = host.grant_host_proc(HostProcGrant::new(
         ProcHandler::Sync(Box::new(move |op, args, _mem, _| {
@@ -8935,7 +8949,7 @@ pub extern "C" fn temen_wasmjit_call_interp(func: u32, args_ptr: *mut u8) -> i32
 /// entry takes one. Returns `(status, i64-widened value)`. Shared by [`temen_run_reflect`] and
 /// `gencorpus`.
 pub fn reflect_exec(m: &temen_ir::Module, arg: i64) -> (i32, i64) {
-    let mut host = Host::new();
+    let mut host = run_host();
     let _ = host.grant_stream(StreamRole::Out); // handle 0, type_id 0
     let _ = host.grant_exit(); // handle 1, type_id 1
                                // handle 2, type_id 13
@@ -9006,7 +9020,7 @@ pub fn jit_exec(m: &temen_ir::Module) -> (i32, i64) {
         Ok(s) => temen_encode::encode_module(&s),
         Err(_) => return (STATUS_BAD_RESULT, 0),
     };
-    let mut host = Host::new();
+    let mut host = run_host();
     let jit = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), 4); // 2^4 = 16-slot table
     host.set_jit_validator(temen_interp::jit_blob_validator);
     let code = match host.jit_compile(jit, &service) {
@@ -9057,7 +9071,7 @@ pub fn dynlink_exec(m: &temen_ir::Module, link: bool) -> (i32, i64) {
         Ok(u) => temen_encode::encode_module(&u),
         Err(_) => return (STATUS_BAD_RESULT, 0),
     };
-    let mut host = Host::new();
+    let mut host = run_host();
     let jit = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), 4);
     host.set_jit_validator(temen_interp::jit_blob_validator);
     let clock = host.grant_clock();
@@ -9136,7 +9150,7 @@ pub fn durable_run(
     window: &[u8],
     clock_v: i64,
 ) -> (i32, i64, Vec<u8>, i64) {
-    let mut host = Host::new();
+    let mut host = run_host();
     host.set_durable(true);
     let clk = host.grant_clock();
     host.clock_ns = clock_v;
@@ -9270,7 +9284,7 @@ pub extern "C" fn temen_durable_freeze(
     };
     let back = std::sync::Arc::new(back);
     back.write_from(0, &init);
-    let mut host = Host::new();
+    let mut host = run_host();
     host.set_durable(true);
     let space = host.grant_memory();
     let clk = host.grant_clock();
@@ -9381,7 +9395,7 @@ pub extern "C" fn temen_durable_thaw_resume(
             return 0;
         }
     };
-    let mut host = Host::new();
+    let mut host = run_host();
     host.set_durable(true);
     let (mut rwin, rprots, rreserved) = match temen_snapshot::restore_with_prots(art, &m, &mut host)
     {
@@ -9481,7 +9495,7 @@ pub extern "C" fn temen_durable_thaw_resume(
 /// at multiple offsets (the magic-ring-buffer primitive); op 2 `len`, op 3 `page_size`. Returns
 /// `(status, i64-widened value)`. Shared by [`temen_run_region`] and `gencorpus`.
 pub fn region_exec(m: &temen_ir::Module) -> (i32, i64) {
-    let mut host = Host::new();
+    let mut host = run_host();
     let h = host.grant_shared_region(1 << 16); // 64 KiB, comfortably larger than any host page
     let mut fuel = 5_000_000u64;
     match bytecode::compile_and_run_with_host(m, 0, &[Value::I32(h)], &mut fuel, &mut host) {
@@ -10137,6 +10151,9 @@ struct CoopTierupRun {
     /// The program the pending TIERUP runs: one of `programs`, or (`0` with no root leaf) this
     /// run's own region emit.
     module: u32,
+    /// #1414 5d — the memory the pending TIERUP's window is in, when it is one of its own (a
+    /// detached child's, [`child_window`]); `None`: the engine's ([`temen_coop_tierup_mem`]).
+    memory: Option<u32>,
     /// #1954: the host-completed cap names declared at open, in order — a parked request names its
     /// cap by index into this list ([`COOP_RUN_CAP_PARK`]).
     caps: Vec<String>,
@@ -10362,6 +10379,7 @@ impl CoopTierupRun {
             nim: None,
             programs: Programs::default(),
             module: 0,
+            memory: None,
             caps: Vec::new(),
             requests: temen_interp::CapRequests::default(),
             warm: false,
@@ -10421,7 +10439,7 @@ impl CoopTierupRun {
         let ver = self.run.mem_map_version();
         if ver != self.pagestate_version || env != self.pagestate_env {
             let info = self.run.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
-            let backed = self.run.pending_win().map_or(0, |(_, len)| len);
+            let backed = self.run.pending_win_len();
             let (table, cover) = bytecode::build_pagestate_table(&info, backed);
             self.pagestate = table;
             self.pagestate_cover = cover;
@@ -10846,7 +10864,7 @@ pub extern "C" fn temen_coop_open(
     let staged = take_staged();
     // `None` once the powerbox refused `m` (#2579), its status set.
     let host_for = |m: &temen_ir::Module| {
-        let mut host = Host::new();
+        let mut host = run_host();
         host.stdin = stdin.clone();
         match grant_onramp_caps(&mut host, m, None, Some((&caps, &requests)), &staged) {
             Ok(granted) => Some((host, granted.frame)),
@@ -11052,8 +11070,10 @@ fn coop_pump(budget: Option<u64>) -> i32 {
             func,
             argv,
             mapped,
+            memory,
         } => {
             s.module = module;
+            s.memory = memory;
             s.func = func;
             s.argv = argv.into_vec();
             if s.event_paged() {
@@ -11287,6 +11307,17 @@ pub extern "C" fn temen_coop_task() -> i32 {
 #[no_mangle]
 pub extern "C" fn temen_coop_module() -> u32 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.module)
+}
+
+/// #1414 5d — the memory the pending TIERUP's window is in, by the id its agent registered it under
+/// (`web/foreign-mem.js`): a detached child's own ([`child_window`]), where the window starts past
+/// its header ([`temen_detached_header_bytes`]). `-1`: the engine's memory, at
+/// [`temen_coop_tierup_win_ptr`].
+#[no_mangle]
+pub extern "C" fn temen_coop_tierup_mem() -> i32 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .and_then(|s| s.memory)
+        .map_or(-1, |id| id as i32)
 }
 
 /// #1896: the emitted wasm of program `module`, a leaf image or a granted module (`null` when the
@@ -11871,8 +11902,9 @@ pub extern "C" fn temen_coop_close() {
 // at `slot0 + id * FOREIGN_SLOTS` + the field's place in the function table of each engine instance its
 // agent adopted, telling it `slot0` (`temen_foreign_slots`). So an access is one wasm call, from
 // `Region` straight into the accessor; no JavaScript runs on any access (#1414 5d). Only minting a
-// memory needs JavaScript (`foreign_mint`). Threads build only (the plain build has no Workers and no
-// detached children, and stays import-free for its Node harnesses).
+// memory needs JavaScript (`foreign_mint`), and so does giving it back (`foreign_release`). Threads
+// build only (the plain build has no Workers and no detached children, and stays import-free for
+// its Node harnesses).
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 mod foreign_mem {
     use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
@@ -11881,6 +11913,7 @@ mod foreign_mem {
     #[link(wasm_import_module = "temen_host")]
     extern "C" {
         fn foreign_mint(base: u32, initial: u32, maximum: u32) -> i32;
+        fn foreign_release(id: u32);
     }
 
     /// The table slots each foreign memory's functions take: one per `ForeignOps` field, in field
@@ -11907,7 +11940,22 @@ mod foreign_mem {
         }
     }
 
+    /// The next foreign memory id. A static lives in the engine's shared memory, so every agent of it
+    /// draws from this one counter: an id names one memory among them all, and a memory one agent
+    /// registers from another (a Worker its thread's, the page a child's it serves) never meets one
+    /// it minted itself (#1414 5d).
+    static NEXT_ID: AtomicU32 = AtomicU32::new(0);
+
+    /// A fresh foreign memory id ([`NEXT_ID`]), for `registerForeign` in `web/foreign-mem.js`.
+    #[no_mangle]
+    pub extern "C" fn temen_foreign_next_id() -> u32 {
+        NEXT_ID.fetch_add(1, Relaxed)
+    }
+
     /// Foreign memory `id`'s table: its accessor's functions, by their slots in this instance's table.
+    /// A region over it leaves it registered when it drops: whoever registered it lets it go, the
+    /// page or a Worker it was handed to. A region over a memory minted for it owns it instead
+    /// ([`mint`]).
     pub fn ops(id: u32) -> ForeignOps {
         // Never 0, the null function pointer: `SLOT0` is not, and a slot past `u32::MAX` saturates.
         let slot = |k: u32| {
@@ -11929,20 +11977,35 @@ mod foreign_mem {
                 copy_within: core::mem::transmute::<usize, _>(slot(5)),
                 atomic: core::mem::transmute::<usize, _>(slot(6)),
                 grow: core::mem::transmute::<usize, _>(slot(7)),
+                release: keep,
             }
         }
     }
 
-    /// Mint a fresh child memory on the page (#1286): `initial`/`maximum` bytes **including** the host
-    /// header, registered with the header as the region's base. `None` if the page refused (the
-    /// `WebAssembly.Memory` constructor threw — address-space / limits).
-    pub fn mint(initial: u64, maximum: u64) -> Option<u32> {
+    extern "C" fn keep(_: u32) {}
+
+    /// The region that owned memory `id` is gone: this agent lets the memory go, and with it the
+    /// memory's slots in its table, or zeroes it and keeps it for a later mint (`retireForeign` in
+    /// `web/foreign-mem.js`).
+    extern "C" fn release(id: u32) {
+        // SAFETY: no cdylib memory is touched.
+        unsafe { foreign_release(id) }
+    }
+
+    /// Mint a child memory in this agent (#1286): `initial`/`maximum` bytes **including** the host
+    /// header, registered with the header as the region's base, and the region over its first `len`
+    /// bytes, which owns it (#1414 5d). The memory is fresh, or a spare: one a dropped region gave
+    /// back, zeroed. `None` if the agent refused (the `WebAssembly.Memory` constructor threw —
+    /// address-space / limits — or the agent adopted no engine instance).
+    pub fn mint(initial: u64, maximum: u64, len: u64) -> Option<temen_mem::Region> {
         let (Ok(i), Ok(m)) = (u32::try_from(initial), u32::try_from(maximum)) else {
             return None;
         };
         // SAFETY: no cdylib memory is touched.
-        let id = unsafe { foreign_mint(super::DETACHED_HEADER_BYTES as u32, i, m) };
-        u32::try_from(id).ok()
+        let id = u32::try_from(unsafe { foreign_mint(super::DETACHED_HEADER_BYTES as u32, i, m) });
+        let id = id.ok()?;
+        let ops = ForeignOps { release, ..ops(id) };
+        Some(temen_mem::Region::foreign(id, len, ops))
     }
 
     /// The `read` slot where the agent has no multi-memory: a span out of foreign memory `id`, through
@@ -12011,7 +12074,8 @@ pub const DETACHED_PAGESTATE_OFF: u64 = DETACHED_CONTEXTS * DETACHED_CONTEXT_BYT
 /// #1286 V8-limits probe decides whether it should derive from the spawn instead.
 pub const DETACHED_DEFAULT_MAX_BYTES: u64 = 1 << 30;
 
-/// A `Region::Foreign` over the page-registered memory `id` with `len` addressable bytes.
+/// A `Region::Foreign` over the page-registered memory `id` with `len` addressable bytes, which leaves
+/// the memory registered when it drops ([`foreign_mem::ops`]).
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 pub fn foreign_region(id: u32, len: u64) -> temen_mem::Region {
     temen_mem::Region::foreign(id, len, foreign_mem::ops(id))

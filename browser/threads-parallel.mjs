@@ -7,7 +7,7 @@
 //   node threads-parallel.mjs <module.wasm> [guest.temenc] [expected] [workers]
 import { readFileSync } from 'node:fs';
 import { Worker, isMainThread, workerData, parentPort } from 'node:worker_threads';
-import { engineImports } from './engine-imports.mjs';
+import { instantiateEngine } from './engine-imports.mjs';
 
 const WASM = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
 const GUEST = process.argv[3] ?? 'corpus/threads.temenc';
@@ -18,9 +18,10 @@ const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 // --- worker: bootstrap its own stack + TLS, then run the engine over its window ----------------
 async function worker() {
   const { module, memory, modPtr, modLen, winPtr, winSize, stackTop, tlsBase, arg } = workerData;
-  const { exports: ex } = await WebAssembly.instantiate(module, engineImports(memory));
-  ex.__stack_pointer.value = stackTop; // a private stack region (grows down from the top)
-  if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // a private TLS block
+  const ex = await instantiateEngine(module, memory, {}, (e) => {
+    e.__stack_pointer.value = stackTop; // a private stack region (grows down from the top)
+    if (e.__tls_size.value > 0) e.__wasm_init_tls(tlsBase); // a private TLS block
+  });
   const got = ex.temen_run_shared(modPtr, modLen, winPtr, winSize, BigInt(arg));
   parentPort.postMessage(String(got));
 }
@@ -33,7 +34,7 @@ async function main() {
     process.exit(1);
   }
   const memory = new WebAssembly.Memory({ initial: 1024, maximum: 16384, shared: true });
-  const { exports: ex } = await WebAssembly.instantiate(module, engineImports(memory));
+  const ex = await instantiateEngine(module, memory);
   const u8 = () => new Uint8Array(memory.buffer);
 
   // Guest bytes are read-only → shared by all Workers. Everything else is per-Worker + disjoint.
