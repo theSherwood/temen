@@ -457,8 +457,9 @@ fn both(src: &str) -> [Result<Vec<i64>, temen_interp::Trap>; 2] {
 
 /// Every child op resolves a handle by the join's rule (`temen_ir::handle_slot`): child 0 spent by a
 /// join or a detach, a negative handle, and 3, past the table (the span is 4, and slot 3 was never
-/// issued). `join`, `poll`, `detach` and `kill` trap `ThreadFault`; `child_offer` and `grant` answer
-/// `-EINVAL`. The JIT trapped `CapFault` on a bad `poll` or `detach`, and killed a joined child.
+/// issued). On a spent handle `join`, `poll`, `detach` and `kill` answer `-EBADF` (#2667); on a
+/// forged one they trap `ThreadFault`; `child_offer` and `grant` answer `-EINVAL` for both. The JIT
+/// trapped `CapFault` on a bad `poll` or `detach`, and killed a joined child.
 #[test]
 fn a_spent_or_forged_handle_gets_the_oracles_answer_on_the_jit() {
     use temen_interp::Trap;
@@ -475,28 +476,37 @@ fn a_spent_or_forged_handle_gets_the_oracles_answer_on_the_jit() {
         ("past the table", "  vbad = i32.const 3\n"),
     ];
     let fault = Err(Trap::ThreadFault);
+    let ebadf = Ok(vec![temen_ir::errno::EBADF]);
     let einval = Ok(vec![temen_ir::errno::EINVAL]);
+    // Each op, and whether a spent handle gets `-EBADF` from it (else what a forged one gets). The
+    // join leaves its status in `vr`.
     let ops = [
-        ("join", "  vst, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vbad)\n", &fault),
-        ("poll", "  vo = call.cap 6 9 (i32) -> (i32) vinst (vbad)\n  vr = i64.extend_i32_s vo\n", &fault),
-        ("detach", "  vo = call.cap 6 10 (i32) -> (i32) vinst (vbad)\n  vr = i64.extend_i32_s vo\n", &fault),
-        ("kill", "  vo = call.cap 6 12 (i32) -> (i32) vinst (vbad)\n  vr = i64.extend_i32_s vo\n", &fault),
+        ("join", "  vr, vv = call.cap 6 1 (i32) -> (i64, i64) vinst (vbad)\n", true),
+        ("poll", "  vo = call.cap 6 9 (i32) -> (i32) vinst (vbad)\n  vr = i64.extend_i32_s vo\n", true),
+        ("detach", "  vo = call.cap 6 10 (i32) -> (i32) vinst (vbad)\n  vr = i64.extend_i32_s vo\n", true),
+        ("kill", "  vo = call.cap 6 12 (i32) -> (i32) vinst (vbad)\n  vr = i64.extend_i32_s vo\n", true),
         (
             "child_offer",
             "  vx = i64.const 0\n  vo = call.cap 6 14 (i32, i64) -> (i32) vinst (vbad, vx)\n  vr = i64.extend_i32_s vo\n",
-            &einval,
+            false,
         ),
         (
             "grant",
             "  vgh = i64.extend_i32_s vout\n  vo = call.cap 6 19 (i32, i64) -> (i32) vinst (vbad, vgh)\n  vr = i64.extend_i32_s vo\n",
-            &einval,
+            false,
         ),
     ];
     let mut wrong = Vec::new();
     for (handle, prelude) in spend {
-        for (op, call, want) in &ops {
+        let spent = matches!(handle, "joined" | "detached");
+        for (op, call, ebadf_when_spent) in &ops {
+            let want = match (ebadf_when_spent, spent) {
+                (true, true) => &ebadf,
+                (true, false) => &fault,
+                (false, _) => &einval,
+            };
             let got = both(&three_children(&format!("{prelude}{call}")));
-            if got.iter().any(|g| g != *want) {
+            if got.iter().any(|g| g != want) {
                 wrong.push(format!(
                     "{op} on a {handle} handle: interp {:?}, JIT {:?}",
                     got[0], got[1]
@@ -512,7 +522,8 @@ fn a_spent_or_forged_handle_gets_the_oracles_answer_on_the_jit() {
 }
 
 /// A handle past the table that the mask folds onto a live child names that child on the JIT too:
-/// `join(5)` joins child 1, and `detach(5)` detaches it, so child 1's own handle is spent after.
+/// `join(5)` joins child 1, and `detach(5)` detaches it, so child 1's own handle is spent after: its
+/// join's status is `-EBADF` (#2667).
 #[test]
 fn a_masked_handle_names_the_same_child_on_the_jit() {
     let joined = both(&three_children(
@@ -520,14 +531,8 @@ fn a_masked_handle_names_the_same_child_on_the_jit() {
     ));
     assert_eq!(joined, [Ok(vec![7]), Ok(vec![7])], "join(5) joins child 1");
     let detached = both(&three_children(
-        "  vn = i32.const 5\n  vd = call.cap 6 10 (i32) -> (i32) vinst (vn)\n  vst, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vh1)\n",
+        "  vn = i32.const 5\n  vd = call.cap 6 10 (i32) -> (i32) vinst (vn)\n  vr, vv = call.cap 6 1 (i32) -> (i64, i64) vinst (vh1)\n",
     ));
-    assert_eq!(
-        detached,
-        [
-            Err(temen_interp::Trap::ThreadFault),
-            Err(temen_interp::Trap::ThreadFault)
-        ],
-        "detach(5) detaches child 1"
-    );
+    let ebadf = Ok(vec![temen_ir::errno::EBADF]);
+    assert_eq!(detached, [ebadf.clone(), ebadf], "detach(5) detaches child 1");
 }

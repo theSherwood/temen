@@ -2,8 +2,9 @@
 //! design"): the per-vCPU fiber tables are replaced by one **run-shared registry**, so a fiber
 //! created (and even part-run) on one vCPU can be claimed and continued by another — a safe
 //! `Vec<Frame>` hand-off, exactly like the vCPUs the scheduler already migrates. The registry's
-//! claim is the **single-owner arbiter**: of any racing `cont.resume`s, exactly one wins and a
-//! loser gets a clean `FiberFault`.
+//! claim is the **single-owner arbiter**: of any racing `cont.resume`s, exactly one wins. A loser
+//! that arrives while the winner runs the fiber gets a clean `FiberFault`; one that arrives after
+//! the fiber returned finds its handle spent, `(-EBADF, 0)` (#2667).
 //!
 //! These pin the reference semantics — the oracle the JIT's lock-free registry (3b-ii) and
 //! cross-thread asm resume (3c) will be differentially tested against. Each behavior runs on the
@@ -118,10 +119,13 @@ fn fiber_suspended_on_root_resumes_on_spawned_vcpu() {
 
 /// **Racing resumes: exactly one claimant wins.** The root creates one `Pending` fiber and spawns
 /// two workers that both `cont.resume` it (the fiber returns `arg + 41 = 42` to whichever wins).
-/// In *every* interleaving exactly one worker wins and the other's lost claim is a `FiberFault`
-/// that propagates through the root's join — so the outcome set is exactly `{FiberFault}`.
-/// Non-vacuous: if both claims could win, both joins would succeed and `Ok(84)` would appear; if
-/// neither could, the fiber's 42 would never be computed (covered by the single-worker control).
+/// In *every* interleaving exactly one worker wins. The fiber runs to its return inside the
+/// winner's resume, one step of the explorer, so the other's claim lands after it returned: the
+/// handle is spent, the resume answers `(-EBADF, 0)` (#2667), and the root sums `42 + 0`. The
+/// outcome set is exactly `{42}`. (On real threads the loser can also land while the winner runs
+/// the fiber — a lost claim, a `FiberFault` through the root's join.) Non-vacuous: if both claims
+/// could win, both joins would succeed and `Ok(84)` would appear; if neither could, the fiber's 42
+/// would never be computed (covered by the single-worker control).
 const RACE: &str = r#"
 func () -> (i64) {
 block 0 () {
@@ -154,9 +158,13 @@ block 0 (vsp: i64, varg: i64) {
 
 #[test]
 fn racing_resumes_have_exactly_one_winner() {
-    assert_outcomes(RACE, &[Err(Trap::FiberFault)]);
-    // The real pool agrees (whichever worker loses, the join propagates its fault).
-    assert_eq!(run_i64(RACE), Err(Trap::FiberFault));
+    assert_outcomes(RACE, &[Ok(42)]);
+    // The real pool lands in that set: a lost claim's fault, or the late claimant's spent handle.
+    let real = run_i64(RACE);
+    assert!(
+        matches!(real, Err(Trap::FiberFault) | Ok(42)),
+        "real pool: {real:?}"
+    );
 }
 
 /// The single-worker control for [`RACE`]: with no competitor, the foreign claim **wins** — a
@@ -359,11 +367,16 @@ fn a_fiber_migrates_across_vcpus_on_every_driver() {
 }
 
 /// The claim is the arbiter across OS threads too: of two workers racing to resume one fiber, one
-/// wins and the other's `FiberFault` reaches the root through its join — the tree-walker's outcome.
+/// wins, and the other's lost claim faults or its spent handle answers `-EBADF` — the tree-walker's
+/// outcome set ([`racing_resumes_have_exactly_one_winner`]). Never both winning (`Ok(84)`).
 #[test]
 fn racing_resumes_have_one_winner_on_the_parallel_driver() {
     for i in 0..if cfg!(miri) { 2 } else { 50 } {
-        assert_eq!(bytecode_parallel(RACE), Err(Trap::FiberFault), "run {i}");
+        let got = bytecode_parallel(RACE);
+        assert!(
+            matches!(got, Err(Trap::FiberFault) | Ok(42)),
+            "run {i}: {got:?}"
+        );
     }
 }
 

@@ -1171,7 +1171,8 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     //   main thread's reserve, unless `pthread_attr_setstacksize` put another size in nim's attr blob.
     //   It `thread.spawn`s an entry that installs the block (`vcpu.tls.set`), calls the start routine
     //   through `call.dyn`, and unmaps the region when the routine returns.
-    // - `pthread_join` is `thread.join`, and the `pthread_t` is the thread handle.
+    // - `pthread_join` is `thread.join`, and the `pthread_t` is the thread handle. A spent handle
+    //   (one already joined) answers `ESRCH`, as chibicc's `<pthread.h>` does (#2667).
     // - A program that declares `pthread_create` links its `tvar`s as thread-locals
     //   ([`starts_threads`]).
     // - `syscall` serves `SYS_futex` (202, nimony's amd64 number), which `std/locks`' mutex and

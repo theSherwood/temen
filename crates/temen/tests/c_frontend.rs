@@ -2385,6 +2385,29 @@ fn c_pthread_join_returns_value() {
     }
 }
 
+/// A second `pthread_join` of a thread finds its handle spent (#2667): `ESRCH` (3), with `*retval`
+/// left as it was, where the second join used to trap the program. The first join still delivers
+/// the thread's value.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_pthread_join_twice_answers_esrch() {
+    let src = "#include <pthread.h>\n\
+        static void *dbl(void *arg) { return (void *)((long)arg * 2); }\n\
+        int main(void) {\n\
+        \x20 pthread_t t;\n\
+        \x20 pthread_create(&t, 0, dbl, (void *)21);\n\
+        \x20 void *r;\n\
+        \x20 int e1 = pthread_join(t, &r);\n\
+        \x20 void *r2 = (void *)7;\n\
+        \x20 int e2 = pthread_join(t, &r2);\n\
+        \x20 return e1 * 10000 + e2 * 1000 + (int)(long)r + (int)(long)r2;\n\
+        }\n";
+    match run_c_full(src).outcome {
+        Outcome::Returned(v) => assert_eq!(v.as_slice(), [Value::I32(3 * 1000 + 42 + 7)]),
+        Outcome::Exited(c) => panic!("unexpected exit({c})"),
+    }
+}
+
 // ---- `_Thread_local` (#1715) --------------------------------------------------------------------
 // A thread-local lives in a per-thread block: the root thread's is placed with the program's data,
 // and `pthread_create` gives each new thread its own, copied from the program's initial values.

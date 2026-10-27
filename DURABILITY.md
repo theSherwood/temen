@@ -1938,8 +1938,9 @@ freeze unwind drops — is **consumed**: each runtime tracks that per fiber, the
 **Returned fibers (#1835).** Re-issuing is right only while the fiber is still there to redeliver.
 One that **returned** inside the resume the freeze landed at is done and its slot free, so the
 resume's `(status, value)` is spilled with its frame, and its thaw arm reloads them when the status
-is *returned* (and, the deepest frame on its thread then, flips the thaw word); any other status
-re-issues. A fiber that unwound for the freeze reports `FIBER_FROZEN` (`-1`, never observed: the
+is *returned* (and, the deepest frame on its thread then, flips the thaw word). So does one whose
+handle was **spent** (`-EBADF`, #2667): it ran no fiber, so none is left to rewind and flip the
+word. Any other status re-issues. A fiber that unwound for the freeze reports `FIBER_FROZEN` (`-1`, never observed: the
 trailing poll unwinds first) rather than *returned*, in every engine, so its resume is re-issued.
 The byte-level snapshot **Section-2 codec** lands too: `temen-snapshot` serializes the
 `FrozenFiber` residue (slot/funcref/sp/shadow-SP) into a TLV control section (elided when there

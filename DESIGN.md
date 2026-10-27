@@ -1892,6 +1892,13 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
   independent-op reorderings and busy-wait retries, sound vs an unreduced
   enumerator, §18), against which the real-thread JIT is differential-tested; the
   futex glue is loom-checked.
+- **A spent handle is a value (#2667, INVARIANTS #5).** `thread.join` yields
+  `(status, value)`, the shape of `Instantiator.join`: `(0, its result)`, or `(-EBADF, 0)`
+  for a handle already joined. A `cont.resume` of a fiber that already returned yields
+  `(-EBADF, 0)`, and the §14 child ops answer `-EBADF` for a child already joined or
+  detached. Only a handle that names no slot, or carries a generation its slot never issued,
+  is forged and traps. A joined thread's own trap stays its domain's (INVARIANTS #6); a
+  child domain's is a value (#2066).
 - **Blocking fiber resume (`cont.resume.block`, I48, landed 2026-08-07).** A fiber
   park (§3.6 slice-5a) unwinds `FIBER_PARKED (3)` to the resumer, which polls; a
   guest whose *only* pending work is one parked fiber would busy-spin that poll.

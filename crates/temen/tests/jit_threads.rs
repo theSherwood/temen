@@ -354,9 +354,10 @@ fn thread_parallel_with_fibers() {
     assert_jit_matches_interp(src);
 }
 
-/// Joining the same handle twice is inert the second time → `ThreadFault`, on both backends.
+/// Joining the same handle twice finds it spent the second time → status `-EBADF` (#2667), on both
+/// backends.
 #[test]
-fn thread_double_join_traps() {
+fn thread_double_join_is_spent() {
     let src = "func () -> (i64) {\n\
         block 0 () {\n\
         \x20 v0 = i64.const 0\n\
@@ -364,7 +365,7 @@ fn thread_double_join_traps() {
         \x20 v2 = thread.spawn 1 v0 v1\n\
         \x20 v3_st, v3 = thread.join v2\n\
         \x20 v4_st, v4 = thread.join v2\n\
-        \x20 return v4\n\
+        \x20 return v4_st\n\
           }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\

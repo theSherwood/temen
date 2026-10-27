@@ -241,10 +241,11 @@ block 0 (vsp: i64, v0: i64) {
     assert_eq!(run_i64(src), Ok(1000));
 }
 
-/// Joining the same handle twice is inert on the second join (the slot is consumed) — a re-join
-/// can't observe or double-free another vCPU.
+/// Joining the same handle twice finds it spent on the second join (the slot is consumed): status
+/// `-EBADF`, value 0 (#2667) — a re-join can't observe or double-free another vCPU, and it is not a
+/// trap.
 #[test]
-fn double_join_is_inert() {
+fn double_join_is_spent() {
     let src = r#"
 memory 16
 func () -> (i64) {
@@ -253,7 +254,8 @@ block 0 () {
   v1 = thread.spawn 1 v0 v0
   v2_st, v2 = thread.join v1
   v3_st, v3 = thread.join v1
-  return v2
+  v4 = i64.add v3_st v3
+  return v4
   }
 }
 func (i64, i64) -> (i64) {
@@ -262,7 +264,7 @@ block 0 (vsp: i64, v0: i64) {
   }
 }
 "#;
-    assert_eq!(run_i64(src), Err(Trap::ThreadFault));
+    assert_eq!(run_i64(src), Ok(temen_ir::errno::EBADF));
 }
 
 /// A trap inside a spawned vCPU propagates out of the `thread.join` (a misaligned atomic in the
