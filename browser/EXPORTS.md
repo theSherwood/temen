@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**285 exports** in 37 families — 238 referenced from JS, 47 referenced by nothing, 54 behind a `cfg`.
+**285 exports** in 37 families — 239 referenced from JS, 46 referenced by nothing, 54 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -26,7 +26,7 @@
 | `module` | 3 | 0 | 0 |
 | `nim` | 5 | 5 | 0 |
 | `notes` | 2 | 2 | 0 |
-| `onramp` | 36 | 25 | 0 |
+| `onramp` | 36 | 26 | 0 |
 | `par` | 17 | 17 | 14 |
 | `parse` | 3 | 3 | 0 |
 | `pg` | 6 | 6 | 0 |
@@ -275,7 +275,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_onramp_stage_budget` — *unreferenced*
 - `temen_onramp_stage_clear`
 - `temen_onramp_stage_js_cap`
-- `temen_onramp_stage_module` — *unreferenced*
+- `temen_onramp_stage_module`
 - `temen_onramp_thaw`
 - `temen_onramp_timeline_begin_tick`
 - `temen_onramp_timeline_close`

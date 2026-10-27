@@ -105,6 +105,13 @@ Import modes:
 There is deliberately **no `deferred`/`import.bind`** mode (a mid-run
 guest→instantiator upcall channel); see §5.2.
 
+**One binder for every root host** (#2579): native `temen-run`, the DAP
+launch, and the browser's on-ramp, POSIX and pg opens bind a root manifest
+through `temen_interp::powerbox_manifest_bindings`. So a `required` import
+nothing grants, or one whose declared signature is not its capability op's
+(#1524), refuses the run on every one of them, with a note naming the
+import. Children bind through `Host::bind_child_manifest` (#2219).
+
 **Slot-layout rules** (audit-verified, §7):
 
 - **Root modules: `import i` = slot `i` is already the tree's behavior.** The

@@ -269,7 +269,21 @@ self.onmessage = async (e) => {
     const bytes = new Uint8Array(memory.buffer, ptr >>> 0, len >>> 0).slice();
     self.postMessage({ kind: 'out', fd, seq: seq >>> 0, bytes }, [bytes.buffer]);
   };
-  ({ exports: ex } = await WebAssembly.instantiate(module, engineImports(memory, { stream_chunk, x2_spawn, x2_tierup, x2_invoke })));
+  // A call this Worker's thread makes to a JS capability (#2579), whose function lives on the page:
+  // the call goes there, and the thread waits inside it until the page has answered in this
+  // Worker's cell (`[flag: i32, _, result: i64]`). Its arguments and its window view (`mem`) stay
+  // where they are, live while the call is, and the page reads and writes the window through that
+  // view alone (par.js).
+  let jsCell = 0;
+  const js_cap_call = (slot, op, argsPtr, nArgs, mem) => {
+    jsCell ||= ex.temen_par_alloc(16);
+    const flag = new Int32Array(memory.buffer, jsCell, 1);
+    Atomics.store(flag, 0, 0);
+    self.postMessage({ kind: 'jscap', cell: jsCell, slot, op, argsPtr, nArgs, mem });
+    while (Atomics.load(flag, 0) === 0) Atomics.wait(flag, 0, 0);
+    return new BigInt64Array(memory.buffer, jsCell + 8, 1)[0];
+  };
+  ({ exports: ex } = await WebAssembly.instantiate(module, engineImports(memory, { stream_chunk, x2_spawn, x2_tierup, x2_invoke, js_cap_call })));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
   adoptEngine(ex, memory); // after the stack: it calls into the engine

@@ -18,6 +18,8 @@
 //!
 //! ABI: the page supplies one import, `temen_host.js_cap_call(slot, op, args_ptr, n_args, mem) ->
 //! i64` — the whole JS side of the seam — and, from inside a call, uses the two window accessors.
+//! On executor 2 a Worker's import sends the call to the page and waits inside it (`web/worker.js`),
+//! and the page answers it with the same accessors over the calling task's window (`web/par.js`).
 
 use temen_interp::{GuestMem, Host};
 

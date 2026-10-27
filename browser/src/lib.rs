@@ -1080,14 +1080,14 @@ fn par_publish_io(cfg: ParIoCfg) {
 /// the run idles on it ([`COOP_RUN_IDLE`]) until the page feeds it or ends it
 /// ([`temen_x2_feed_end`]). A JS host may leave the trailing three out (they read as zero).
 ///
-/// What the page staged for the next open ([`Staged`]) is granted here too, but a JS capability
-/// (#2579) refuses the run: it is answered inside the call, where its function lives, and this run's
-/// tasks run on Workers that cannot call the page's.
+/// What the page staged for the next open ([`Staged`]) is granted here too. A JS capability (#2579)
+/// is answered inside the call, by its function on the page: the calling task's Worker sends the
+/// call there and waits inside it (`web/worker.js`'s `js_cap_call`), holding the run's shared host
+/// as every capability call does, and the page answers over the task's window (`web/par.js`).
 ///
-/// Returns `1`, or `0` — nothing published — for undecodable bytes or cap names, a module the
+/// Returns `1`, or `0` — nothing published — for undecodable bytes or cap names, or a module the
 /// on-ramp refuses ([`onramp_check`]) or whose required imports its powerbox does not grant (#2579,
-/// its notes published), or a staged JS capability. Call on the main thread before the run, like
-/// [`temen_par_powerbox_io`].
+/// its notes published). Call on the main thread before the run, like [`temen_par_powerbox_io`].
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_par_powerbox_onramp(
@@ -1116,9 +1116,6 @@ pub extern "C" fn temen_par_powerbox_onramp(
         return 0;
     }
     let staged = take_staged();
-    if !staged.js.is_empty() {
-        return 0;
-    }
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
     host.set_stdin_blocking(fed_later != 0);
@@ -6866,8 +6863,8 @@ pub extern "C" fn temen_onramp_stage_budget(fuel: i64, mem: i64, spawn: i64) {
 /// dispatches on (the coop driver's `onCap`). It is answered inside the call, with the calling
 /// guest's window through [`jspb::temen_jspb_read`] / [`jspb::temen_jspb_write`], and re-granted to
 /// a child or fork twin like any forkable host capability. `-1` for an empty or non-UTF-8 name, or
-/// one already staged. Executor 2 refuses a run with one ([`temen_par_powerbox_onramp`]): its tasks
-/// run on Workers that cannot call the page's function.
+/// one already staged. On executor 2 ([`temen_par_powerbox_onramp`]) the calling task's Worker sends
+/// the call to the page and waits inside it.
 #[no_mangle]
 pub extern "C" fn temen_onramp_stage_js_cap(name_ptr: *const u8, name_len: usize) -> i32 {
     let Ok(name) = core::str::from_utf8(link_slice(name_ptr, name_len)) else {

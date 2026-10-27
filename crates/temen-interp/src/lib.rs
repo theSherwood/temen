@@ -35214,7 +35214,21 @@ impl Mem {
 
     /// Read/write the shared address space, recovering from a poisoned lock (the interpreter never
     /// panics while holding it) rather than propagating the panic.
+    ///
+    /// #2579 — on the browser's threads build a contended read spins instead of waiting: the page
+    /// reads a task's window while it serves that task's JS capability call, and a browser's main
+    /// thread may not wait (`memory.atomic.wait32` traps there). A writer holds the lock only while
+    /// it changes the page map.
     fn space_read(&self) -> std::sync::RwLockReadGuard<'_, AddrSpace> {
+        #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+        loop {
+            match self.space.try_read() {
+                Ok(space) => return space,
+                Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => std::hint::spin_loop(),
+            }
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
         self.space.read_unpoisoned()
     }
     fn space_write(&self) -> SpaceWrite<'_> {
