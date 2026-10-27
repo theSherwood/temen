@@ -2163,8 +2163,8 @@ mod flatten_claim_tests {
     /// #2032 — two freeze drivers walk one table: each snapshots the parked fibers, then claims
     /// them. A rival that claimed and flattened one first leaves its slot free at the next
     /// generation, as the race left it, so this driver's claim of its snapshot's handle loses. That
-    /// is a stale snapshot, not a forgery: a flattening resume skips the fiber, where a guest's
-    /// resume of the same handle still faults.
+    /// is a stale snapshot, not a forgery: a flattening resume skips the fiber. A guest's resume of
+    /// the same handle finds it spent (#2667), and only a generation the slot never reached faults.
     #[test]
     fn a_flattening_resume_that_loses_its_claim_skips_the_fiber() {
         let table = Arc::new(SharedFiberTable::new(4, ShadowArena::EMPTY, None));
@@ -2175,15 +2175,15 @@ mod flatten_claim_tests {
         let mut status = 0i64;
         let ctx = crate::VmCtx::new(crate::InstanceAddrs::NONE);
         let vm = &ctx as *const crate::VmCtx as u64;
-        // SAFETY: `rt` is published as this thread's runtime for both calls, and the claim fails
+        // SAFETY: `rt` is published as this thread's runtime for every call, and each claim fails
         // before any stack switch, so no fiber runs.
         unsafe {
             (*rt).flattening = true;
             fiber_resume(snapshot, 0, &mut status, vm);
         }
         assert_eq!(
-            ctx.ended(),
-            None,
+            (ctx.ended(), status),
+            (None, 1),
             "a driver's stale snapshot is not a forgery"
         );
         // SAFETY: as above.
@@ -2192,9 +2192,16 @@ mod flatten_claim_tests {
             fiber_resume(snapshot, 0, &mut status, vm);
         }
         assert_eq!(
+            (ctx.ended(), status),
+            (None, temen_ir::errno::EBADF),
+            "a guest's resume of a flattened fiber finds it spent"
+        );
+        // SAFETY: as above.
+        unsafe { fiber_resume(fiber_handle(slot, 2), 0, &mut status, vm) };
+        assert_eq!(
             ctx.ended(),
             Some(TrapKind::FiberFault as i64),
-            "a guest's resume of a flattened fiber still faults"
+            "a generation the slot never reached is a forgery"
         );
         set_current(prev);
         // SAFETY: `rt` came from `Box::into_raw` above and is no longer published.

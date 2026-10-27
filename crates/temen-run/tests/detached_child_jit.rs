@@ -22,7 +22,7 @@ use detached::{
 use std::sync::Mutex;
 use temen_interp::{cap_id, run_with_host, Host, MemLayout, Trap, Value};
 use temen_ir::SpawnRec;
-use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChild, JitOutcome, TrapKind};
+use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChild, JitOutcome};
 
 /// "hello-de" as a little-endian i64 — the word the child reads at `args_base + 8`.
 const ARGV_WORD: i64 = i64::from_le_bytes(*b"hello-de");
@@ -245,22 +245,23 @@ fn a_detached_childs_budget_bounds_its_fuel_under_an_unmetered_jit_root() {
 }
 
 /// #2066 — the join that answers a child's `OUT_OF_FUEL` reaps it, on the JIT as on the
-/// interpreter: joining it again is a spent handle.
+/// interpreter: joining it again is a spent handle, which answers `-EBADF` (#2667).
 #[test]
 fn a_join_reaps_a_child_that_ran_out_of_fuel_on_the_jit() {
     let join_join = module(&parent_then(
         "vs, vv = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n  \
          vs2, vv2 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n  \
-         return vv2",
+         return vs2",
     ));
     let c = module(CHILD_LOOPS);
+    let spent = temen_ir::errno::EBADF;
     assert_eq!(
         interp_result(&join_join, fuel_host(&c, 500)),
-        Err(Trap::ThreadFault)
+        Ok(vec![Value::I64(spent)])
     );
     assert_eq!(
         jit_outcome(&join_join, fuel_host(&c, 500)),
-        JitOutcome::Trapped(TrapKind::ThreadFault)
+        JitOutcome::Returned(vec![spent])
     );
 }
 

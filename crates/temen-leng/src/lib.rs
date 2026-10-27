@@ -3557,7 +3557,8 @@ block 19 () {{
     /// - bit 0: the counter is not 4·n, so the lock let two threads in;
     /// - bits 1–4: thread k's thread-local is not n·(k + 1), so it was not the thread's own;
     /// - bit 5: the root thread's thread-local, 7 before the threads started, changed;
-    /// - bit 6: a `pthread_*` call failed;
+    /// - bit 6: a `pthread_*` call failed, or a second join of thread 0 did not answer `ESRCH`
+    ///   (#2667);
     /// - bits 7–9: a futex wait that times out, one on a word that no longer holds the value it
     ///   expects, and an unknown syscall don't each fail with `ETIMEDOUT`, `EAGAIN` and `ENOSYS`.
     #[cfg(unix)]
@@ -3611,11 +3612,14 @@ block 19 () {{
                 c + 112 + 8 * k
             );
         }
-        // Bit 6: any pthread call that did not return 0.
+        // Bit 6: any pthread call that did not return 0, or a second join of thread 0 (its
+        // handle spent) that did not return `ESRCH`, 3.
         s.push_str(
-            "  e0 = i32.or p0 p1\n  e1 = i32.or e0 p2\n  e2 = i32.or e1 q0\n  e3 = i32.or e2 q1\n  \
+            "  nul = i64.const 0\n  j4 = call.import 4 (h0, nul)\n  \
+             e0 = i32.or p0 p1\n  e1 = i32.or e0 p2\n  e2 = i32.or e1 q0\n  e3 = i32.or e2 q1\n  \
              e4 = i32.or e3 q2\n  e5 = i32.or e4 q3\n  e6 = i32.or e5 j0\n  e7 = i32.or e6 j1\n  \
-             e8 = i32.or e7 j2\n  e9 = i32.or e8 j3\n  ez = i32.const 0\n  ef = i32.ne e9 ez\n  \
+             e8 = i32.or e7 j2\n  e9 = i32.or e8 j3\n  srch = i32.const 3\n  jx = i32.ne j4 srch\n  \
+             e10 = i32.or e9 jx\n  ez = i32.const 0\n  ef = i32.ne e10 ez\n  \
              eb = i64.extend_i32_u ef\n  es = i64.const 6\n  m0 = i64.shl eb es\n",
         );
         // Bits 0–5: the counter, each thread's thread-local, the root's.

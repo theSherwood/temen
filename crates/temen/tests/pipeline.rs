@@ -446,10 +446,10 @@ fn fiber_nested_resume_chain() {
 }
 
 #[test]
-fn fiber_resume_after_return_traps() {
+fn fiber_resume_after_return_is_spent() {
     // Func 1 returns immediately (no suspend): the first resume yields (RETURNED, arg).
-    // Resuming the now-`Done` fiber a second time is inert -> `FiberFault`.
-    let src = "func () -> (i64) {\n\
+    // Resuming the now-`Done` fiber a second time is inert: its handle is spent -> `-EBADF` (#2667).
+    let src = "func () -> (i32) {\n\
         block 0 () {\n\
         \x20 v0 = ref.func 1\n\
         \x20 v1 = i64.const 4096\n\
@@ -457,7 +457,7 @@ fn fiber_resume_after_return_traps() {
         \x20 v3 = i64.const 1\n\
         \x20 v4, v5 = cont.resume v2 v3\n\
         \x20 v6, v7 = cont.resume v2 v3\n\
-        \x20 return v7\n\
+        \x20 return v6\n\
           }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
@@ -468,7 +468,10 @@ fn fiber_resume_after_return_traps() {
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
     let mut fuel = 1_000_000u64;
-    assert_eq!(run(&m, 0, &[], &mut fuel), Err(Trap::FiberFault));
+    assert_eq!(
+        run(&m, 0, &[], &mut fuel),
+        Ok(vec![Value::I32(temen_ir::errno::EBADF as i32)])
+    );
 }
 
 #[test]
