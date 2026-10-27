@@ -12542,11 +12542,11 @@ fn fiber_sig() -> FuncType {
     }
 }
 
-/// Resolve a §12 thread or §14 child handle to a table slot. Like a fiber's ([`FiberRegistry::claim`]),
-/// the handle is forgeable, so it is **masked** into the power-of-two-padded table, then bounds- and
-/// liveness-checked. A handle that names no slot is inert ([`Trap::ThreadFault`]). `None` is a
-/// **spent** handle, whose slot was issued and whose child has since been joined or detached: the
-/// op answers `-EBADF` (INVARIANTS #5, #2667).
+/// Resolve a §12 thread or §14 child handle to a table slot. Like a fiber's
+/// ([`FiberRegistry::claim`]), the handle is forgeable, so it is **masked** into the
+/// power-of-two-padded table, then bounds- and liveness-checked. A handle that names no slot is
+/// inert ([`Trap::ThreadFault`]). `None` is a **spent** handle, whose slot was issued and whose
+/// child has since been joined or detached: the op answers `-EBADF` (INVARIANTS #5, #2667).
 fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<Option<usize>, Trap> {
     // The one rule every engine resolves a handle by ([`temen_ir::handle_slot`], #2378); a slot is
     // live while its entry is.
@@ -15323,12 +15323,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             };
                             frames[top].vals.push(Reg::from_i32(status));
                         }
-                        // detach(child) -> 0 (PROCESS.md S3): drop the parent's join claim. The child
-                        // keeps running to completion (detach is not kill) and is never joinable again.
-                        // A forged handle is a `ThreadFault`, and a spent one answers `-EBADF`. #2359 —
-                        // it is reaped, its result and what this vCPU keeps for it, once it has ended:
-                        // now if it has, else at a later detach. Until then its kill flag stays, so a
-                        // kill of this vCPU still ends it.
+                        // detach(child) -> 0 (PROCESS.md S3): drop the parent's join claim. The
+                        // child keeps running to completion (detach is not kill) and is never
+                        // joinable again. A forged handle is a `ThreadFault`, and a spent one
+                        // answers `-EBADF`. #2359 — it is reaped, its result and what this vCPU
+                        // keeps for it, once it has ended: now if it has, else at a later detach.
+                        // Until then its kill flag stays, so a kill of this vCPU still ends it.
                         10 => {
                             let ch =
                                 get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
@@ -15369,8 +15369,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 Some(slot) => {
                                     if let Some(flag) = child_kill.get(&slot) {
                                         // #2455 — a kill can end the last child this domain is held
-                                        // for. The release then reaches every vCPU of the domain but
-                                        // this running one, which takes the freeze itself.
+                                        // for. The release then reaches every vCPU of the domain
+                                        // but this running one, which takes the freeze itself.
                                         let held = durable && sched.held(sig_domain);
                                         sched.kill_child(flag, child_hosts.get(&slot));
                                         if held && !sched.held(sig_domain) {
@@ -17690,9 +17690,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                 }
                 // §12 thread join: park until vCPU `handle` finishes, then (on resume) take its
-                // `(status, value)`. A forged / out-of-range handle is inert (masked + checked like a
-                // fiber handle); a spent one answers `(-EBADF, 0)` without parking (#2667); a trap in
-                // the joined vCPU propagates here (on resume).
+                // `(status, value)`. A forged / out-of-range handle is inert (masked + checked like
+                // a fiber handle); a spent one answers `(-EBADF, 0)` without parking (#2667); a
+                // trap in the joined vCPU propagates here (on resume).
                 Inst::ThreadJoin { handle } => {
                     let h = get_i32(&frames[top].vals, *handle)?;
                     match resolve_thread(threads, h)? {

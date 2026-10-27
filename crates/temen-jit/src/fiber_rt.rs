@@ -1153,13 +1153,13 @@ pub(crate) unsafe extern "C" fn fiber_new(
 }
 
 /// `cont.resume` thunk: switch into fiber `handle`, delivering `arg`; writes `*status_out` (0 =
-/// suspended on a guest `suspend`, 1 = returned, 3 = [`FIBER_PARKED`] — the fiber hit an event
-/// park (a `memory.wait` inside it), so it is set aside with `value` 0 and is **not** done; the
-/// resumer keeps running and re-polls with another `cont.resume`, §3.6 slice 5a) and returns the
-/// fiber's yielded/returned value. A join's park is never reported (#2322): it blocks the whole
-/// vCPU, so this resume parks the resumer's own context with it and returns once the fiber moves
-/// on. A finished fiber's handle is spent: status `-EBADF`, value 0 (#2667). A forged / out-of-range
-/// / already-running handle traps (`FiberFault`), matching the interpreter.
+/// suspended on a guest `suspend`, 1 = returned, 3 = [`FIBER_PARKED`] — the fiber hit an event park
+/// (a `memory.wait` inside it), so it is set aside with `value` 0 and is **not** done; the resumer
+/// keeps running and re-polls with another `cont.resume`, §3.6 slice 5a) and returns the fiber's
+/// yielded/returned value. A join's park is never reported (#2322): it blocks the whole vCPU, so
+/// this resume parks the resumer's own context with it and returns once the fiber moves on. A
+/// finished fiber's handle is spent: status `-EBADF`, value 0 (#2667). A forged / out-of-range /
+/// already-running handle traps (`FiberFault`), matching the interpreter.
 ///
 /// # Safety
 /// `status_out` is a live `*mut i64` cell and `vm` a live context address. The running vCPU's

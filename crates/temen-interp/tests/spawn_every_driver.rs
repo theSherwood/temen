@@ -748,11 +748,11 @@ fn a_handle_masks_onto_the_table() {
 const OFFERING: [Driver; 3] = [Driver::Oracle, Driver::Coop, Driver::Parallel];
 
 /// #2378 — every child op resolves a handle by the join's rule, so a spent or forged one gets one
-/// answer on every driver: the oracle's. On a spent handle `join`, `poll`, `detach` and `kill` answer
-/// `-EBADF` (#2667); on a forged one they trap `ThreadFault`. `child_offer` and `grant` answer
-/// `-EINVAL` for both, the value they give a child they cannot reach. The handles: child 0 spent by a
-/// join, child 0 spent by a detach, a negative one, and 3, past the table (the span is 4, and slot 3
-/// was never issued). The debug scheduler declines op 14 ([`OFFERING`]).
+/// answer on every driver: the oracle's. On a spent handle `join`, `poll`, `detach` and `kill`
+/// answer `-EBADF` (#2667); on a forged one they trap `ThreadFault`. `child_offer` and `grant`
+/// answer `-EINVAL` for both, the value they give a child they cannot reach. The handles: child 0
+/// spent by a join, child 0 spent by a detach, a negative one, and 3, past the table (the span is
+/// 4, and slot 3 was never issued). The debug scheduler declines op 14 ([`OFFERING`]).
 #[test]
 fn a_spent_or_forged_handle_gets_the_oracles_answer_from_every_child_op() {
     let spend = [

@@ -522,8 +522,8 @@ fn a_spent_or_forged_handle_gets_the_oracles_answer_on_the_jit() {
 }
 
 /// A handle past the table that the mask folds onto a live child names that child on the JIT too:
-/// `join(5)` joins child 1, and `detach(5)` detaches it, so child 1's own handle is spent after: its
-/// join's status is `-EBADF` (#2667).
+/// `join(5)` joins child 1, and `detach(5)` detaches it, so child 1's own handle is spent after:
+/// its join's status is `-EBADF` (#2667).
 #[test]
 fn a_masked_handle_names_the_same_child_on_the_jit() {
     let joined = both(&three_children(

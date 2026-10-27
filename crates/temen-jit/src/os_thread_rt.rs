@@ -2433,8 +2433,8 @@ pub(crate) unsafe extern "C" fn thread_join(
             drop(dc);
             let mut t = lock(&dom.threads);
             // Out-of-range and negative handles are inert (trap), like a forged capability index,
-            // and an already-joined one is spent: the oracle's rule (`temen_ir::handle_slot`, #2378,
-            // #2667).
+            // and an already-joined one is spent: the oracle's rule (`temen_ir::handle_slot`;
+            // #2378, #2667).
             let Some(slot) = temen_ir::handle_slot(t.cells.len(), handle) else {
                 vm.raise(TrapKind::ThreadFault as i64);
                 return 0;

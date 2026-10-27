@@ -724,10 +724,10 @@ block 4 (vd: i64) {
 
 /// #2465 — the parent of [`SHARING_PARENT`]'s spawn, which detaches the child (op 10) at once and
 /// maps the region. It raises the flag at 128 KiB, waits (at most 50,000,000 polls) for the child's
-/// answer at 128 KiB + 24, spins `DELAY` times, and runs `FINISH`, the tail that returns ([`ANSWER`]
-/// or [`POLL_DETACHED`]; `-1` if no answer came). A short loop comes before the flag and another
-/// after the spin, and the freeze lands at the header of the first after a `FLIP` the test places
-/// ([`Cut`]).
+/// answer at 128 KiB + 24, spins `DELAY` times, and runs `FINISH`, the tail that returns
+/// ([`ANSWER`] or [`POLL_DETACHED`]; `-1` if no answer came). A short loop comes before the flag
+/// and another after the spin, and the freeze lands at the header of the first after a `FLIP` the
+/// test places ([`Cut`]).
 const DETACHING_PARENT: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vmod: i32, vbud: i32, vrh: i32) {
@@ -874,7 +874,8 @@ block 0 (v0: i64, v1: i64) {
 }
 ";
 
-/// [`DETACHING_PARENT`] ending in `finish`, requesting the freeze at `cut`, as `confined` builds it.
+/// [`DETACHING_PARENT`] ending in `finish`, requesting the freeze at `cut`, as `confined` builds
+/// it.
 fn detaching_parent(finish: &str, cut: Option<Cut>) -> Module {
     let at = |c| {
         if cut == Some(c) {
@@ -909,12 +910,12 @@ const POLLED: i64 = temen_ir::errno::EBADF * 10000 + 3333;
 
 /// #2465 — **a child its spawner detached (op 10) rides the freeze, and thaws unjoinable.** Cut
 /// while the child waits for its parent's flag, the freeze rings it as it rings one a join slot
-/// names, records it as detached, and the thaw relaunches it so: it answers its parent as before the
-/// cut, and the parent's handle still reaches nothing (`poll` answers `-EBADF`). Before, the freeze neither
-/// rang nor recorded it: the run waited for the child, whose wait for the flag only the thawed
-/// parent raises ran the run out of fuel, and the freeze failed. A child that returned leaves
-/// nothing for the thaw, not even an outcome a slot would deliver: one that returned before the cut,
-/// and one the freeze rang that returned before it reached a poll ([`STRAIGHT_CHILD`]).
+/// names, records it as detached, and the thaw relaunches it so: it answers its parent as before
+/// the cut, and the parent's handle still reaches nothing (`poll` answers `-EBADF`). Before, the
+/// freeze neither rang nor recorded it: the run waited for the child, whose wait for the flag only
+/// the thawed parent raises ran the run out of fuel, and the freeze failed. A child that returned
+/// leaves nothing for the thaw, not even an outcome a slot would deliver: one that returned before
+/// the cut, and one the freeze rang that returned before it reached a poll ([`STRAIGHT_CHILD`]).
 #[test]
 fn a_child_its_spawner_detached_rides_the_freeze_unjoinable() {
     let polled = Ok(vec![Value::I64(POLLED)]);

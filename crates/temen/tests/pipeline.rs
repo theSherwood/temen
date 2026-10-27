@@ -447,8 +447,8 @@ fn fiber_nested_resume_chain() {
 
 #[test]
 fn fiber_resume_after_return_is_spent() {
-    // Func 1 returns immediately (no suspend): the first resume yields (RETURNED, arg).
-    // Resuming the now-`Done` fiber a second time is inert: its handle is spent -> `-EBADF` (#2667).
+    // Func 1 returns immediately (no suspend): the first resume yields (RETURNED, arg). Resuming
+    // the now-`Done` fiber a second time is inert: its handle is spent -> `-EBADF` (#2667).
     let src = "func () -> (i32) {\n\
         block 0 () {\n\
         \x20 v0 = ref.func 1\n\

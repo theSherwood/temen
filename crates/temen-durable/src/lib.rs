@@ -2289,10 +2289,10 @@ fn result_types(
         ContResume { .. } => vec![ValType::I32, ValType::I64],
         Suspend { .. } => vec![ValType::I64],
         // §12 thread ops (Phase 3.2): `thread.spawn` yields an `i32` handle, `thread.join` an `i64`
-        // `(status, value)` pair (#2667). Neither is a may-suspend checkpoint — they are copied verbatim
-        // into their segment and their results spill/reload like any scalar; the multi-vCPU freeze/thaw
-        // choreography is the runtime's (durable §12.8 slice 3.2.1), so the transform only needs to
-        // type them.
+        // `(status, value)` pair (#2667). Neither is a may-suspend checkpoint — they are copied
+        // verbatim into their segment and their results spill/reload like any scalar; the
+        // multi-vCPU freeze/thaw choreography is the runtime's (durable §12.8 slice 3.2.1), so the
+        // transform only needs to type them.
         ThreadSpawn { .. } => vec![ValType::I32],
         ThreadJoin { .. } => vec![ValType::I64, ValType::I64],
         // §12 futex ops: `atomic.wait` yields an `i32` status (woken / not-equal / timed-out),

@@ -132,11 +132,12 @@ block 2 () {
     assert_eq!(run_i64(src), Ok(4000));
 }
 
-/// A forged thread handle, one that names no slot (here a negative one), is **inert**: `thread.join`
-/// traps (`ThreadFault`) rather than doing anything — the handle is masked + bounds/liveness-checked
-/// like a fiber/capability handle (§3c), so it can never reach another vCPU's state. (A positive
-/// handle past the table folds onto a slot under the mask, `temen_ir::handle_slot`, and answers as
-/// that slot's handle: here the joined one's, so `-EBADF`, #2667.)
+/// A forged thread handle, one that names no slot (here a negative one), is **inert**:
+/// `thread.join` traps (`ThreadFault`) rather than doing anything — the handle is masked +
+/// bounds/liveness-checked like a fiber/capability handle (§3c), so it can never reach another
+/// vCPU's state. (A positive handle past the table folds onto a slot under the mask,
+/// `temen_ir::handle_slot`, and answers as that slot's handle: here the joined one's, so it
+/// answers `-EBADF`, #2667.)
 #[test]
 fn forged_join_handle_is_inert() {
     let src = r#"

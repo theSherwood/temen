@@ -9650,8 +9650,9 @@ fn new_fiber(
 /// continues once its event has fired, with the event's result instead of `arg` (the oracle's
 /// `LiveWoken`); until then its resumer polls it, or blocks on it under a blocking resume
 /// (`blocking_ip`) on a driver that can idle the task (`may_block`, I48). A finished fiber's handle
-/// is spent ([`Claim::Spent`]); anything else (forged, running) is a `FiberFault`. `blocking_ip` also tags the fiber while it runs, so a park inside
-/// it idles the task instead of answering the poll.
+/// is spent ([`Claim::Spent`]); anything else (forged, running) is a `FiberFault`. `blocking_ip`
+/// also tags the fiber while it runs, so a park inside it idles the task instead of answering the
+/// poll.
 fn claim_fiber(
     fibers: &mut FiberCell,
     host: &mut HostCell,
@@ -17462,9 +17463,9 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
 }
 
 /// A join of child handle `handle` (`of_child`: [`super::join_delivery`]'s mode). A child that
-/// already finished delivers now, or its trap completes the joiner; else the joiner parks on it until
-/// [`complete`] wakes it. A spent handle delivers [`super::join_spent`]; a forged one completes the
-/// joiner with its trap.
+/// already finished delivers now, or its trap completes the joiner; else the joiner parks on it
+/// until [`complete`] wakes it. A spent handle delivers [`super::join_spent`]; a forged one
+/// completes the joiner with its trap.
 fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32, of_child: bool) {
     let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
         Ok(Some(s)) => s,
