@@ -3716,12 +3716,18 @@ impl CompiledModule {
         // effect unless the env var is set; used to compare temen-jit's generated code against other
         // backends (e.g. the Embench cross-engine bench).
         let dump_codegen = std::env::var_os("TEMEN_JIT_DUMP_CLIF").is_some();
-        // #2603 — the §4 window geometry the machine-code validator re-proves window accesses
-        // against (memoryless module ⇒ `None`, no window to confine).
-        let win_layout = (mask != 0).then(|| validate::WindowLayout {
-            mask,
-            guard_offset: guard_offset_of(win_reserved as u64),
-        });
+        // #2603 — what the machine-code validator checks this module's code against: the §4 window
+        // geometry it re-proves window accesses against (memoryless module ⇒ `None`, no window to
+        // confine), the fn table's size, and the contract a `call.dyn` of each type reaches.
+        let dyn_contracts = type_contracts(&distinct);
+        let guest = validate::Guest {
+            window: (mask != 0).then(|| validate::WindowLayout {
+                mask,
+                guard_offset: guard_offset_of(win_reserved as u64),
+            }),
+            table: table_len as u64,
+            types: &dyn_contracts,
+        };
         let base_bytes = define_funcs(
             &mut module,
             &ids,
@@ -3819,7 +3825,7 @@ impl CompiledModule {
                     }
                 }
             },
-            win_layout,
+            &guest,
         )?;
         let mut ctx = module.make_context();
 
@@ -5391,11 +5397,17 @@ impl CompiledModule {
         let nesting = self.nesting;
         let callees = Callees::new(&mut *module, &ids, funcs, types, self.fast_resolver)?;
         // Byte-accurate occupancy: each function's emitted code size. A unit's code is not kept.
-        // #2603 — the validator re-proves this unit's window accesses against the parent's geometry.
-        let win_layout = (self.mask != 0).then(|| validate::WindowLayout {
-            mask: self.mask,
-            guard_offset: guard_offset_of(self.win_reserved as u64),
-        });
+        // #2603 — the validator checks this unit's code against the parent's window, fn table and
+        // types.
+        let dyn_contracts = type_contracts(&self.distinct);
+        let guest = validate::Guest {
+            window: (self.mask != 0).then(|| validate::WindowLayout {
+                mask: self.mask,
+                guard_offset: guard_offset_of(self.win_reserved as u64),
+            }),
+            table: self.fn_table_mask + 1,
+            types: &dyn_contracts,
+        };
         let extra_bytes = define_funcs(
             &mut *module,
             &ids,
@@ -5426,7 +5438,7 @@ impl CompiledModule {
                 )
             },
             |_, _, _| {},
-            win_layout,
+            &guest,
         )?;
         self.extra_bytes += extra_bytes;
         let mut ctx = module.make_context();
@@ -6557,7 +6569,7 @@ fn define_funcs(
     code: &mut Codegen<'_>,
     lower: impl Fn(&mut cranelift_codegen::Context, usize) -> Result<(), JitError> + Sync,
     mut defined: impl FnMut(&JITModule, &CompiledCode, usize),
-    layout: Option<validate::WindowLayout>,
+    guest: &validate::Guest,
 ) -> Result<usize, JitError> {
     let keep = match code {
         Codegen::Replay(kept, imports) => return kept.replay(module, ids, imports),
@@ -6582,7 +6594,7 @@ fn define_funcs(
                     let mut ctx = cranelift_codegen::Context::new();
                     ctx.func.signature.call_conv = isa.default_call_conv();
                     lower(&mut ctx, i)?;
-                    let entry = validate::Entry::Guest(layout);
+                    let entry = validate::Entry::Guest(guest);
                     compile_verified(isa, &mut ctx, ids[i], entry, callee)
                         .map_err(JitError::Backend)
                 }));
@@ -6612,7 +6624,9 @@ fn define_funcs(
                 validate::capture_code(validate::CapturedFn {
                     code: code.code_buffer().to_vec(),
                     relocs: validate::relocs(&relocs, callee, isa.default_call_conv()),
-                    layout,
+                    window: guest.window,
+                    table: guest.table,
+                    types: guest.types.to_vec(),
                     contract: callee(ids[next].as_u32()),
                 });
                 let kept = keep
@@ -6685,6 +6699,18 @@ fn compile_verified(
         validate::shadow_check(code.code_buffer(), &checked, entry);
     }
     Ok((code, relocs))
+}
+
+/// #2603 — the contract of a function of each type id in `distinct` (its [`sig_from`]), which the
+/// machine-code validator gives a `call.dyn` whose type check matched. Empty when it doesn't run.
+fn type_contracts(distinct: &[FuncType]) -> Vec<Option<validate::Contract>> {
+    if !(validate::enabled() || cfg!(test)) {
+        return Vec::new();
+    }
+    distinct
+        .iter()
+        .map(|t| validate::contract(&sig_from(&t.params, &t.results)))
+        .collect()
 }
 
 /// #2603 — the contract of each function `module` declares, by `FuncId`, which the machine-code
@@ -7447,11 +7473,17 @@ fn compile_child_windowed(
     // the child spawns only when it uses them. Neither when no domain was supplied.
     let threads = futex_sched != 0;
     let spawns = threads && uses_threads;
-    // #2603 — the §14 child's own window geometry, for the validator's window-access re-proof.
-    let win_layout = (mask != 0).then(|| validate::WindowLayout {
-        mask,
-        guard_offset: guard_offset_of(reserved),
-    });
+    // #2603 — the §14 child's own window, fn table and types, which the validator checks its code
+    // against.
+    let dyn_contracts = type_contracts(&distinct);
+    let guest = validate::Guest {
+        window: (mask != 0).then(|| validate::WindowLayout {
+            mask,
+            guard_offset: guard_offset_of(reserved),
+        }),
+        table: fn_table_mask + 1,
+        types: &dyn_contracts,
+    };
     let base_bytes = define_funcs(
         &mut module,
         &ids,
@@ -7482,7 +7514,7 @@ fn compile_child_windowed(
             )
         },
         |_, _, _| {},
-        win_layout,
+        &guest,
     )?;
     let mut ctx = module.make_context();
     build_trampoline(

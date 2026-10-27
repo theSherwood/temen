@@ -240,9 +240,10 @@ Escape-freedom decomposes into five sub-invariants; their conjunction is the the
 
 ### Checking what the backend emits — the machine-code validator (#2481)
 **Status:** shadow mode. It runs under the fuzzers and `TEMEN_JIT_VALIDATE` and logs what it finds.
-Today it checks fresh compiles for the allowlist, direct control flow and the window accesses of
-guest functions. #2603's PRs 2–4 add jump tables, calls, the other regions' extents, I5 and a
-default-deny decoder. At the flip (PR 5), a function runs only if its machine code passes, whether
+Today it checks fresh compiles for the allowlist, the machine CFG (jump tables included), every
+relocation and every call's callee contract, and in guest functions every memory access outside the
+stack against its region's extent. #2603's PRs 3–4 add the frame and I5, argument and trampoline
+contracts, and a default-deny decoder. At the flip (PR 5), a function runs only if its machine code passes, whether
 freshly compiled or replayed from a `CodeDir` (D71). `Correct(JIT)` then becomes Correct(our CLIF
 generation and lowering) ∧ Correct(validator). Cranelift's backend, the instruction selection,
 register allocation and encoding where its published escapes were (CVE-2021-32629, CVE-2023-26489),
@@ -257,16 +258,22 @@ entry contract:
 4. every exit restores the callee-saved registers and `rsp`.
 
 **Trusted:** the validator (decoder, transfer, policy, checker); the runtime, which builds the window,
-guards, fn table and vmctx and enters each function in its contract; the host functions; the
-hardware. **Not trusted:** Cranelift, the code cache, or any metadata stored with code. A hint is a
+guards, fn table and vmctx and its cells, never rewrites a live fn-table entry, and enters each
+function in its contract; the linker, which patches each relocation with the address of the symbol
+it names; the host functions, the fuel refill among them a `PreserveAll` one; the hardware. **Not trusted:** Cranelift, the code cache, or any metadata stored with code. A hint is a
 claim the validator checks, never an input it believes.
 
-**Why it holds.** The validator decodes the bytes itself and recovers the machine CFG from them. It
-abstracts the machine state at each point as:
-- a fact per register (`mem_base`, an index `Confined` to `[0, bound) ∪ {guard}`, a stack pointer at
-  a known offset, …);
+**Why it holds.** The validator decodes the bytes itself and recovers the machine CFG from them,
+reading a jump table's targets from the table its `jmp` computes. It abstracts the machine state at
+each point as:
+- a fact per register (`mem_base`, an index `Confined` to `[0, bound) ∪ {guard}`, a pointer into the
+  window or the stack at a known offset, a fn-table index whose entry's type was checked, a vmctx
+  cell, a callee's address, …);
 - the flags of the last compare;
 - the spill slots, keyed by their offset from the entry `rsp`.
+
+A block's out-state can differ by edge: the edge where a fn-table type check holds carries what it
+proves.
 
 Only a check is trusted. An untrusted fixpoint proposes a state for each block. One linear pass then
 verifies that the entry contract implies the entry block's state, that every edge's out-state implies
@@ -290,7 +297,17 @@ found (#2603):
   in between, and its condition takes the compared value only while it is below that bound.
 - No constant is read from bytes a relocation patches. D63's bound is a constant-pool operand, since
   the reservation doesn't fit an `imm32`.
-- A call clobbers the caller-saved registers and the flags.
+- A call runs its callee's contract: it clobbers the registers that contract names and the flags, and
+  moves `rsp` by what the callee pops (a `Tail` callee its stack arguments). The callee is known only
+  from a relocation, a vmctx cell, or a fn-table entry whose type the code checked; any other is
+  rejected.
+- A type check proves something only on its equal edge, of the index register still holding the
+  value that selected the entry, and only until the next call. `test r, r` is exactly `cmp r, 0`.
+- A relocation is honored only on a call's `rel32` or a `movabs`'s `imm64`, and the bytes it patches
+  are never read as a fact. A jump table's targets hold on every execution because they are derived
+  in their block alone, from no assumption, behind the clamp the `cmov` rule confines.
+- An access is checked at its exact width, which the decoder reports and the tests cross-check
+  against iced-x86; where it doesn't know one, the widest.
 - A form whose address isn't `[base + index·scale + disp]` (fs/gs, `0x67`, `xlat`, `bt* [mem], reg`)
   is rejected, not modeled.
 
