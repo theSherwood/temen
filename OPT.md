@@ -97,9 +97,10 @@ param threading). The wire format and verifier never see it. Same shape as the J
 converts to its own form too); one boundary to fuzz instead of per-pass renumbering cleverness.
 Since #2454 the wire IR may also carry a block's **captures** (values of dominating blocks); every
 module-level pass here first takes the module to block-local form (`temen_opt::block_local`, over
-`Func::localize`), so the passes themselves still see only block params. What `optimize_module`,
-`optimize_linked` and peval's `specialize` hand back is raised again (`Module::raise`, #2637), so a
-pipeline through them keeps the smaller form.
+`Func::localize`), so the passes themselves still see only block params. What `optimize_module`
+and `optimize_linked` hand back is raised again (`Module::raise`, #2637), so a pipeline through
+them keeps the smaller form. peval's `specialize` localizes a function only when it first reads
+it, raises only the functions it builds, and carries every other function as it came (#2672).
 The round-trip is differentially fuzzed as a **no-op** (convert → lower, no passes) before any
 pass uses it.
 
