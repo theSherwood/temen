@@ -756,14 +756,22 @@ const OFFERING: [Driver; 3] = [Driver::Oracle, Driver::Coop, Driver::Parallel];
 #[test]
 fn a_spent_or_forged_handle_gets_the_oracles_answer_from_every_child_op() {
     let spend = [
-        ("joined", join("vsp", "vh0") + "  vbad = i32.const 0\n", true),
+        (
+            "joined",
+            join("vsp", "vh0") + "  vbad = i32.const 0\n",
+            true,
+        ),
         (
             "detached",
             "  vsp = call.cap 6 10 (i32) -> (i32) vinst (vh0)\n  vbad = i32.const 0\n".to_string(),
             true,
         ),
         ("negative", "  vbad = i32.const -1\n".to_string(), false),
-        ("past the table", "  vbad = i32.const 3\n".to_string(), false),
+        (
+            "past the table",
+            "  vbad = i32.const 3\n".to_string(),
+            false,
+        ),
     ];
     let einval = ok(temen_ir::errno::EINVAL);
     let ebadf = ok(temen_ir::errno::EBADF);

@@ -217,7 +217,9 @@ fn concurrent_callers_never_lose_an_admission() {
             ));
         }
         for i in 0..N {
-            body.push_str(&format!("               vj{i}_st, vj{i} = thread.join vt{i}\n"));
+            body.push_str(&format!(
+                "               vj{i}_st, vj{i} = thread.join vt{i}\n"
+            ));
         }
         body.push_str(&format!("               vh = i32.const {offer}\n"));
         body.push_str("               vacc0 = i64.const 0\n");

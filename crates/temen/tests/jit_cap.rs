@@ -922,7 +922,7 @@ fn threaded_install_agrees_across_backends() {
         "  v10 = i64.const 16384\n",
         "  v11 = i32.const 1\n",
         "  i32.atomic.store v10 v11\n", // window[16384] = ready (release) (#1094: guard-shifted from 0)
-        "  v12_st, v12 = thread.join v6\n",     // worker result (i64)
+        "  v12_st, v12 = thread.join v6\n", // worker result (i64)
         "  v13 = i32.wrap_i64 v12\n",
         "  return v13\n",
         "  }\n",
@@ -992,7 +992,7 @@ fn threaded_compile_agrees_across_backends() {
         "  v7 = i32.const 6\n",
         "  v8 = i32.const 7\n",
         "  v9 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v6, v7, v8)\n", // 6*7+10 = 52
-        "  v10_st, v10 = thread.join v3\n",                                        // worker result (i64)
+        "  v10_st, v10 = thread.join v3\n",                                // worker result (i64)
         "  v11 = i32.wrap_i64 v10\n",
         "  v12 = i32.add v9 v11\n", // 52 + 82 = 134
         "  return v12\n",

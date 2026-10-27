@@ -659,7 +659,11 @@ block 0 (v0: i64, v1: i64) {
     // The fiber returns 7 + 100 on the first resume, the second finds its handle spent, and a fresh
     // fiber returns 1000 + 100.
     let want = run_normal(&inst).expect("uninterrupted run");
-    assert_eq!(want, vec![Value::I64(-9 * 1000 + 107 + 1100)], "uninterrupted result");
+    assert_eq!(
+        want,
+        vec![Value::I64(-9 * 1000 + 107 + 1100)],
+        "uninterrupted result"
+    );
     for cut in 1..=3 {
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
         arm_freeze_after(&mut win, TEST_ARENA, cut);
@@ -668,7 +672,10 @@ block 0 (v0: i64, v1: i64) {
         let mut fuel = 1_000_000u64;
         let (rf, frozen_win) =
             run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut fhost);
-        assert!(rf.is_ok(), "cut {cut}: the freeze returns a placeholder: {rf:?}");
+        assert!(
+            rf.is_ok(),
+            "cut {cut}: the freeze returns a placeholder: {rf:?}"
+        );
         let frozen = fhost.frozen_fibers().to_vec();
         let mut thaw_win = frozen_win;
         begin_thaw(&mut thaw_win, TEST_ARENA, 0);
@@ -677,7 +684,13 @@ block 0 (v0: i64, v1: i64) {
         thost.set_frozen_fibers(frozen);
         let mut tfuel = 1_000_000u64;
         let (rt, done_win) = run_capture_reserved_with_host(
-            &inst, 0, &[], &mut tfuel, &thaw_win, SIZE_LOG2, &mut thost,
+            &inst,
+            0,
+            &[],
+            &mut tfuel,
+            &thaw_win,
+            SIZE_LOG2,
+            &mut thost,
         );
         assert_eq!(rt.expect("the thaw runs to completion"), want, "cut {cut}");
         assert_eq!(

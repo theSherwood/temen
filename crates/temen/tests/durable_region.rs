@@ -920,7 +920,13 @@ const POLLED: i64 = temen_ir::errno::EBADF * 10000 + 3333;
 fn a_child_its_spawner_detached_rides_the_freeze_unjoinable() {
     let polled = Ok(vec![Value::I64(POLLED)]);
     for (child, cut, finish, want, rides) in [
-        (DETACHED_CHILD, Cut::Live, ANSWER, Ok(vec![Value::I64(3333)]), 1),
+        (
+            DETACHED_CHILD,
+            Cut::Live,
+            ANSWER,
+            Ok(vec![Value::I64(3333)]),
+            1,
+        ),
         (DETACHED_CHILD, Cut::Live, POLL_DETACHED, polled.clone(), 1),
         (DETACHED_CHILD, Cut::Ended, POLL_DETACHED, polled.clone(), 0),
         (STRAIGHT_CHILD, Cut::Live, POLL_DETACHED, polled, 0),
@@ -973,7 +979,14 @@ fn a_child_its_spawner_detached_rides_a_jit_freeze() {
     let shm = || temen_run::new_shared_region(LEN).expect("a region");
     let fresh = || MemLayout::image(init_durable_window(WINDOW, TEST_ARENA));
     let (mut host, args) = sharing_host(&child, shm());
-    let base = run_jit(&detaching_parent(ANSWER, None), 0, &mut host, &args, &fresh()).0;
+    let base = run_jit(
+        &detaching_parent(ANSWER, None),
+        0,
+        &mut host,
+        &args,
+        &fresh(),
+    )
+    .0;
     assert_eq!(base, Some(3333), "uninterrupted run");
 
     let freeze_on = |parent: &Module| {

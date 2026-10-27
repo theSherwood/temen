@@ -12270,9 +12270,7 @@ impl FiberRegistry {
         let mask = t.fibers.len().next_power_of_two() - 1;
         let slot = (handle as u64 as usize) & mask;
         let issued = fiber_handle_generation(handle);
-        slot < t.fibers.len()
-            && issued != (t.gens[slot] & FIBER_GEN_MASK)
-            && issued < t.gens[slot]
+        slot < t.fibers.len() && issued != (t.gens[slot] & FIBER_GEN_MASK) && issued < t.gens[slot]
     }
 
     /// §3.6 slice 5a — park the running fiber on an **event** (fiber-level park): its frames
@@ -13918,7 +13916,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     let mut svc_timed_out = false;
     // Resuming from a park: finish the op the scheduler woke us for.
     match v.pending.take() {
-        Some(Pending::Join { slot, child: of_child }) => {
+        Some(Pending::Join {
+            slot,
+            child: of_child,
+        }) => {
             let child = v
                 .threads
                 .get(slot)

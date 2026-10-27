@@ -534,5 +534,9 @@ fn a_masked_handle_names_the_same_child_on_the_jit() {
         "  vn = i32.const 5\n  vd = call.cap 6 10 (i32) -> (i32) vinst (vn)\n  vr, vv = call.cap 6 1 (i32) -> (i64, i64) vinst (vh1)\n",
     ));
     let ebadf = Ok(vec![temen_ir::errno::EBADF]);
-    assert_eq!(detached, [ebadf.clone(), ebadf], "detach(5) detaches child 1");
+    assert_eq!(
+        detached,
+        [ebadf.clone(), ebadf],
+        "detach(5) detaches child 1"
+    );
 }

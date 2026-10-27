@@ -33,7 +33,11 @@ fn run_on(src: &str, backend: Backend) -> Result<Vec<Value>, String> {
 fn pin_returns(src: &str, what: &str, want: &[i64]) {
     let want: Vec<Value> = want.iter().map(|&v| Value::I64(v)).collect();
     for backend in ALL {
-        assert_eq!(run_on(src, backend), Ok(want.clone()), "{backend:?}: {what}");
+        assert_eq!(
+            run_on(src, backend),
+            Ok(want.clone()),
+            "{backend:?}: {what}"
+        );
     }
 }
 
@@ -41,7 +45,10 @@ fn pin_returns(src: &str, what: &str, want: &[i64]) {
 fn pin_traps(src: &str, what: &str, trap: &str) {
     for backend in ALL {
         match run_on(src, backend) {
-            Err(e) => assert!(e.contains(trap), "{backend:?}: {what}: want {trap}, got {e}"),
+            Err(e) => assert!(
+                e.contains(trap),
+                "{backend:?}: {what}: want {trap}, got {e}"
+            ),
             Ok(vals) => panic!("{backend:?}: {what}: want {trap}, got {vals:?}"),
         }
     }
@@ -50,7 +57,8 @@ fn pin_traps(src: &str, what: &str, trap: &str) {
 const EBADF: i64 = temen_ir::errno::EBADF;
 
 /// A worker that returns its argument.
-const WORKER: &str = "func (i64, i64) -> (i64) {\nblock 0 (vsp: i64, va: i64) {\n  return va\n  }\n}\n";
+const WORKER: &str =
+    "func (i64, i64) -> (i64) {\nblock 0 (vsp: i64, va: i64) {\n  return va\n  }\n}\n";
 
 /// The second join of a thread finds its handle spent: `(-EBADF, 0)`, and the first join's
 /// `(0, 5)` is untouched.
