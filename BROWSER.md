@@ -649,15 +649,16 @@ Where each face runs:
   bounce out of emitted code.
 - **Executor 2** (`par.js`'s `runAcrossWorkers`), in one of two places the run's options choose:
   - **in the calling task's own Worker**, with `capModule`: a module URL whose `onCap` export every
-    Worker of the run imports (#2645). A call costs about what it costs on the pump (5.8 µs in
-    headless Chromium, against 1.76 µs on the pump). The module's JS state is each Worker's own, and
-    it has a Worker's APIs, not the page's: OPFS's synchronous access handles, but not the DOM;
+    Worker of the run imports (#2645). A call never leaves the Worker: 5.8 µs in headless Chromium,
+    against 1.76 µs on the pump and about 50 µs through the page. The module's JS state is each
+    Worker's own, and it has a Worker's APIs, not the page's: OPFS's synchronous access handles, but
+    not the DOM;
   - **on the page**, with `onCap`: the calling task's Worker sends the call there (`worker.js`'s
     `js_cap_call`) and waits inside it; the page runs `onCap` over the task's window and answers in
     the Worker's cell. A detached child's window is a memory of its own, which the page registers
-    for the call (`foreign-mem.js`). Each call is a round trip to the page's main thread (about
-    50 µs here, the browser's floor, not overhead), and a call that waits holds the page, which
-    starts the run's Workers. `onCap` reaches the engine only through `mem`: the page never waits on
+    for the call (`foreign-mem.js`). Each call is a round trip to the page's main thread, about
+    50 µs here, nearly all of it the browser's own wake (a bare Worker-to-page round trip costs
+    46 µs). A call that waits holds the page, which starts the run's Workers. `onCap` reaches the engine only through `mem`: the page never waits on
     an engine lock, and a window read that finds the page map changing spins (`Mem::space_read` on
     the threads build).
 
