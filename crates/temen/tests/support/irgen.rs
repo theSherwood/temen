@@ -118,7 +118,7 @@ impl Gen {
             self.u32v() % n
         }
     }
-    fn boolean(&mut self) -> bool {
+    pub fn boolean(&mut self) -> bool {
         self.byte() & 1 == 1
     }
 

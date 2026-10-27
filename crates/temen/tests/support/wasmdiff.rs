@@ -195,10 +195,18 @@ fn wasm_run(m: &Module, wasm: &[u8], args: &[Value], init: &[u8]) -> (WasmOutcom
 /// entry/data shape the harness does not model. The single entry point shared by the stable seed
 /// loop and the libFuzzer target.
 pub fn fuzz_one_wasm(g: &mut Gen) {
-    let m = gen_module(g);
+    let mut m = gen_module(g);
     verify_module(&m).unwrap_or_else(|e| panic!("generator emitted invalid IR: {e:?}\n{m:#?}"));
     let params = m.funcs[0].params.clone();
     let args = gen_args(g, &params);
+    // Half the modules are raised into dominance form (#2454), so the tier's captures are covered.
+    if g.boolean() {
+        for f in &mut m.funcs {
+            f.raise();
+        }
+        verify_module(&m)
+            .unwrap_or_else(|e| panic!("raised module fails to verify: {e:?}\n{m:#?}"));
+    }
     run_differential_wasm(&m, &args);
 }
 

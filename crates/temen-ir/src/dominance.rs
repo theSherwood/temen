@@ -9,13 +9,15 @@
 //! ([`Func::forwards`]) becomes a capture of that value. Both report where each value went
 //! ([`Moves`]), so debug info can follow it.
 
+use alloc::collections::btree_map::Entry;
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::ops::Range;
 
-use crate::cfg::Cfg;
+use crate::cfg::{successors, Cfg};
 use crate::{
-    Block, BlockIdx, DebugInfo, Func, FuncIdx, SsaLoc, Terminator, ValIdx, ValType, VarLoc,
+    Block, BlockIdx, DebugInfo, Func, FuncIdx, Module, SsaLoc, Terminator, ValIdx, ValType, VarLoc,
 };
 
 /// Where each block, and each value of each block, went when a pass renumbered a function: one
@@ -122,22 +124,81 @@ impl Moves {
     }
 }
 
+/// What a function's captures name, and where each captured value is still to be read
+/// ([`Func::captured`]). [`Func::localize`] threads a captured value as a param through the blocks
+/// where it is live; the wasm-JIT keeps each in a local and reads here which ones a call leaves live.
+#[derive(Clone, Debug, Default)]
+pub struct Captured {
+    /// The captured definitions, each a param or an instruction result, each once, in order of block
+    /// and value. A definition is numbered by its place here.
+    pub def: Vec<(BlockIdx, ValIdx)>,
+    /// Each block's captures, as the number of the definition each names: a capture of a capture is
+    /// followed to the value it takes.
+    pub capture: Vec<Vec<usize>>,
+    /// Where each block's definitions start in `def`, and where the last block's end.
+    first: Vec<usize>,
+    /// Which definitions are live at each block's entry, `words` bits per block.
+    live: Vec<u64>,
+    words: usize,
+}
+
+impl Captured {
+    /// The numbers of the definitions block `b` holds.
+    pub fn defined_in(&self, b: usize) -> Range<usize> {
+        match self.first.get(b..b + 2) {
+            Some(&[lo, hi]) => lo..hi,
+            _ => 0..0,
+        }
+    }
+
+    /// The number of value `v` of block `b`, or `None` when nothing captures it.
+    pub fn id(&self, b: BlockIdx, v: ValIdx) -> Option<usize> {
+        let r = self.defined_in(b as usize);
+        let i = self.def[r.clone()].binary_search(&(b, v)).ok()?;
+        Some(r.start + i)
+    }
+
+    /// The captured definition value `v` of block `b` holds: the one it names if it is a capture,
+    /// itself if a later block captures it, else `None`. `params` is the block's param count.
+    pub fn def_of(&self, b: usize, params: usize, v: usize) -> Option<usize> {
+        match v.checked_sub(params) {
+            Some(c) if c < self.capture[b].len() => Some(self.capture[b][c]),
+            _ => self.id(b as BlockIdx, v as ValIdx),
+        }
+    }
+
+    /// The definitions live at block `b`'s entry, in increasing number: those its captures read, and
+    /// those a successor needs that `b` does not define.
+    pub fn live_in(&self, b: usize) -> impl Iterator<Item = usize> + '_ {
+        let words = self
+            .live
+            .get(b * self.words..(b + 1) * self.words)
+            .unwrap_or(&[]);
+        words.iter().enumerate().flat_map(|(w, &bits)| {
+            let mut bits = bits;
+            core::iter::from_fn(move || {
+                (bits != 0).then(|| {
+                    let i = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    w * 64 + i
+                })
+            })
+        })
+    }
+}
+
 impl Func {
-    /// Rewrite this function into block-local form: each capture becomes a block param at the same
-    /// index, a captured value is threaded as a param through every block between its own and the
-    /// one capturing it, and every parent becomes the entry. `types` are the function's value types
-    /// per block (temen-verify's `func_value_types`), for the params this adds. Assumes a verified
-    /// function. A function with no captures only has its parents reset, and moves nothing.
-    pub fn localize(&mut self, types: &[Vec<ValType>]) -> Moves {
-        for b in &mut self.blocks {
-            b.parent = 0;
-        }
-        if self.blocks.iter().all(|b| b.captures.is_empty()) {
-            return Moves::default();
-        }
+    /// What this function's captures name, and where each captured definition is live: a backward
+    /// fixpoint over the edges. Assumes a verified function.
+    pub fn captured(&self) -> Captured {
         let n = self.blocks.len();
-        // The definition each capture names (a param or a result), following a capture of a
-        // capture to the value it takes: ancestors come first, so theirs are already resolved.
+        if self.blocks.iter().all(|b| b.captures.is_empty()) {
+            return Captured {
+                capture: vec![Vec::new(); n],
+                ..Captured::default()
+            };
+        }
+        // Ancestors come first, so a capture of a capture is resolved by the time it is read.
         let mut origin: Vec<Vec<(BlockIdx, ValIdx)>> = Vec::with_capacity(n);
         for b in &self.blocks {
             let o = b
@@ -153,38 +214,52 @@ impl Func {
                 .collect();
             origin.push(o);
         }
-        // Number the captured definitions, and record each one's block.
-        let mut id: BTreeMap<(BlockIdx, ValIdx), usize> = BTreeMap::new();
-        for &o in origin.iter().flatten() {
-            let k = id.len();
-            id.entry(o).or_insert(k);
+        let mut def: Vec<(BlockIdx, ValIdx)> = origin.iter().flatten().copied().collect();
+        def.sort_unstable();
+        def.dedup();
+        let mut first = vec![0; n + 1];
+        for &(b, _) in &def {
+            first[b as usize + 1] += 1;
         }
-        let mut def: Vec<(BlockIdx, ValIdx)> = vec![(0, 0); id.len()];
-        for (&o, &k) in &id {
-            def[k] = o;
+        for b in 0..n {
+            first[b + 1] += first[b];
         }
-        // Which captured definitions each block needs on entry: its own captures', and every one a
-        // successor needs that the block does not define. A backward fixpoint over bitsets.
-        let words = id.len().div_ceil(64);
+        let id = |d: (BlockIdx, ValIdx)| {
+            let lo = first[d.0 as usize];
+            lo + def[lo..first[d.0 as usize + 1]]
+                .binary_search(&d)
+                .expect("every origin is a definition")
+        };
+        let capture: Vec<Vec<usize>> = origin
+            .iter()
+            .map(|os| os.iter().map(|&o| id(o)).collect())
+            .collect();
+        // Live at a block's entry: what its captures read, and what a successor needs that the
+        // block does not define. A block's definitions are a run of numbers, so it kills a run of
+        // bits.
+        let words = def.len().div_ceil(64);
+        let kill = |b: usize, w: usize| -> u64 {
+            let (lo, hi) = (first[b].max(w * 64), first[b + 1].min(w * 64 + 64));
+            if lo >= hi {
+                0
+            } else {
+                (u64::MAX >> (64 - (hi - lo))) << (lo - w * 64)
+            }
+        };
         let mut live = vec![0u64; n * words];
-        let mut kill = vec![0u64; n * words];
-        for (k, &(b, _)) in def.iter().enumerate() {
-            kill[b as usize * words + k / 64] |= 1 << (k % 64);
-        }
-        for (b, os) in origin.iter().enumerate() {
-            for o in os {
-                let k = id[o];
+        for (b, ks) in capture.iter().enumerate() {
+            for &k in ks {
                 live[b * words + k / 64] |= 1 << (k % 64);
             }
         }
-        let succs = Cfg::new(&self.blocks).succs;
+        let succs: Vec<Vec<u32>> = self.blocks.iter().map(|b| successors(&b.term)).collect();
         let mut changed = true;
         while changed {
             changed = false;
             for b in (0..n).rev() {
                 for &s in &succs[b] {
                     for w in 0..words {
-                        let flow = live[s as usize * words + w] & !kill[b * words + w];
+                        let flow = live[s as usize * words + w] & !kill(b, w);
                         let cur = &mut live[b * words + w];
                         if flow & !*cur != 0 {
                             *cur |= flow;
@@ -194,6 +269,30 @@ impl Func {
                 }
             }
         }
+        Captured {
+            def,
+            capture,
+            first,
+            live,
+            words,
+        }
+    }
+
+    /// Rewrite this function into block-local form: each capture becomes a block param at the same
+    /// index, a captured value is threaded as a param through every block between its own and the
+    /// one capturing it, and every parent becomes the entry. `types` are the function's value types
+    /// per block (temen-verify's `func_value_types`), for the params this adds. Assumes a verified
+    /// function. A function with no captures only has its parents reset, and moves nothing.
+    pub fn localize(&mut self, types: &[Vec<ValType>]) -> Moves {
+        for b in &mut self.blocks {
+            b.parent = 0;
+        }
+        if self.blocks.iter().all(|b| b.captures.is_empty()) {
+            return Moves::default();
+        }
+        let n = self.blocks.len();
+        let captured = self.captured();
+        let Captured { def, capture, .. } = &captured;
         // Each block's added params: one per live definition its captures do not already bring.
         // `local[b]` maps a live definition to the param that holds it in `b`.
         let mut moves = Vec::with_capacity(n);
@@ -202,14 +301,14 @@ impl Func {
         for (b, blk) in self.blocks.iter().enumerate() {
             let inputs = blk.inputs() as ValIdx;
             let mut here = BTreeMap::new();
-            for (j, o) in origin[b].iter().enumerate() {
-                here.entry(id[o])
+            for (j, &k) in capture[b].iter().enumerate() {
+                here.entry(k)
                     .or_insert(blk.params.len() as ValIdx + j as ValIdx);
             }
             let mut more = Vec::new();
-            for k in 0..id.len() {
-                if live[b * words + k / 64] >> (k % 64) & 1 == 1 && !here.contains_key(&k) {
-                    here.insert(k, inputs + more.len() as ValIdx);
+            for k in captured.live_in(b) {
+                if let Entry::Vacant(e) = here.entry(k) {
+                    e.insert(inputs + more.len() as ValIdx);
                     more.push(k);
                 }
             }
@@ -243,11 +342,10 @@ impl Func {
                     .iter()
                     .map(|&(s, _)| {
                         let s = s as usize;
-                        origin[s]
+                        capture[s]
                             .iter()
-                            .map(|o| id[o])
-                            .chain(added[s].iter().copied())
-                            .map(|k| in_block(b, k))
+                            .chain(&added[s])
+                            .map(|&k| in_block(b, k))
                             .collect()
                     })
                     .collect(),
@@ -402,6 +500,19 @@ impl Func {
             self.blocks.push(blk);
         }
         moves
+    }
+}
+
+impl Module {
+    /// [`Func::raise`] every function, and re-point the debug info at where each moved its blocks
+    /// and values.
+    pub fn raise(&mut self) {
+        for (i, f) in self.funcs.iter_mut().enumerate() {
+            let moves = f.raise();
+            if let Some(di) = &mut self.debug_info {
+                moves.remap_debug(di, i as FuncIdx);
+            }
+        }
     }
 }
 

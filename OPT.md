@@ -97,7 +97,9 @@ param threading). The wire format and verifier never see it. Same shape as the J
 converts to its own form too); one boundary to fuzz instead of per-pass renumbering cleverness.
 Since #2454 the wire IR may also carry a block's **captures** (values of dominating blocks); every
 module-level pass here first takes the module to block-local form (`temen_opt::block_local`, over
-`Func::localize`), so the passes themselves still see only block params.
+`Func::localize`), so the passes themselves still see only block params. What `optimize_module`,
+`optimize_linked` and peval's `specialize` hand back is raised again (`Module::raise`, #2637), so a
+pipeline through them keeps the smaller form.
 The round-trip is differentially fuzzed as a **no-op** (convert → lower, no passes) before any
 pass uses it.
 
@@ -280,7 +282,8 @@ tracked enhancement, not a blocker.
   - [x] **Linked programs** (`temen_opt::optimize_linked`, #2147): what temen-leng's link runs on every
     nim program it ships. It inlines callees of at most `LINKED_MAX_CALLEE` (6) instructions,
     canonicalizes every function (the always-on fixpoint of `optimize_func_with`, every optional pass
-    off), then numbers each function's blocks in **reverse postorder** (`order_blocks`).
+    off), then raises every function into dominance form (`Module::raise`, #2454), which also numbers
+    its blocks in **reverse postorder** and drops the ones the entry cannot reach.
     - **The cleanup folds no floats** (`OptConfig::floats` off): a host linker and the in-guest one
       (built without `libm-floats`) must produce the same module, which the self-hosted lane's fixed
       point requires, and a float fold can differ between them.
@@ -295,7 +298,7 @@ tracked enhancement, not a blocker.
     Fuel is charged per taken back edge (INVARIANTS #9), which every engine reads off the block
     indices: a branch to an equal-or-earlier block. In reverse postorder that is exactly a loop's back
     edge, while leng's own order puts an `if`'s join before its arms; on `hexer` that was 63% of its
-    fuel checks. `order_blocks` remaps the debug positions that name a block. Tests in
+    fuel checks. `raise` remaps the debug positions that name a block or a value. Tests in
     `tests/linked.rs`; the `opt_sccp` fuzz target checks it against the interpreter beside
     `optimize_module`.
   - [x] **Constant-funcref devirtualization** (`temen_opt::interproc::devirtualize`): a
@@ -458,8 +461,8 @@ The first ablation surfaced concrete next steps, tracked here so they aren't los
   is the same instruction budget + total-insts size guard + self-recursion skip as the single-block
   path. (Chose uniform over-threading + cleanup over selective `crate::thread::make_available` — same
   result, simpler code.)
-- [ ] Debug-info (line map) preservation through transforms. (`order_blocks` remaps positions, and
-  the inliner keeps the positions of every function it did not change; the rest still drop them.)
+- [ ] Debug-info (line map) preservation through transforms. (`raise` remaps positions, and the
+  inliner keeps the positions of every function it did not change; the rest still drop them.)
 - [ ] Loop unrolling / peeling under `OptConfig` budgets.
 - [x] Interprocedural constant propagation (beyond what inlining exposes). Landed
   (`temen_opt::interproc::const_prop`, Phase 3 above) — reaches callees too big to inline, plus the

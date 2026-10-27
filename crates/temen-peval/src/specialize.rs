@@ -639,6 +639,19 @@ pub fn specialize_with_config(
     args: &[SpecArg],
     config: &SpecConfig,
 ) -> Result<Module, SpecError> {
+    // The residual comes out in block-local form; it goes back in dominance form (#2454).
+    let mut residual = specialize_local(module, func, args, config)?;
+    residual.raise();
+    Ok(residual)
+}
+
+/// [`specialize_with_config`], before its residual is raised.
+fn specialize_local(
+    module: &Module,
+    func: u32,
+    args: &[SpecArg],
+    config: &SpecConfig,
+) -> Result<Module, SpecError> {
     // The abstract interpreter keeps one block's values at a time: it reads a function whose blocks
     // capture (#2454) in block-local form.
     let local = temen_opt::block_local(module);

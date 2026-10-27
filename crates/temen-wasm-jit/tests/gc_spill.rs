@@ -31,6 +31,8 @@ const TABLE_LOG2: u32 = 4;
 /// the op; f3 holds `vy` across it, so it must push nothing. f4 holds `va` across an **emitted**
 /// call into f0, and f5 holds `vb` across a `call.dyn` whose slot the test points at f0. Those two
 /// are the nesting cases: at the collector's bounce, both frames' words must be present, in order.
+/// f6 calls the collector in a block below its entry, in dominance form (#2454): see
+/// [`a_captured_value_is_pushed_where_a_later_block_reads_it`].
 const SRC: &str = r#"memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
@@ -90,6 +92,28 @@ block 0 (v0: i64) {
   return vs
   }
 }
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vone = i64.const 1
+  vx = i64.add v0 vone
+  vd = i64.const 1000
+  br 1()
+}
+block 1 in 0 (vd1 = 0.vd, v01 = 0.v0) {
+  vy = i64.add vd1 v01
+  vz = i64.const 5
+  vr = call 1 (vy)
+  vw = i64.const 9
+  br 2(vr)
+}
+block 2 in 1 (vr2: i64, vx2 = 0.vx, v02 = 0.v0, vz2 = 1.vz, vw2 = 1.vw) {
+  vs1 = i64.add vr2 vx2
+  vs2 = i64.add vs1 v02
+  vs3 = i64.add vs2 vz2
+  vs4 = i64.add vs3 vw2
+  return vs4
+  }
+}
 "#;
 
 /// One bounce as the host saw it: the target, and the spill region's words at that moment.
@@ -130,7 +154,7 @@ fn run(name: &str, arg: i64, end: u32) -> (Result<i64, i32>, Vec<Bounce>) {
     .expect("emit");
     assert_eq!(
         emitted,
-        [true, false, false, true, true, true],
+        [true, false, false, true, true, true, true],
         "spill mode emits every in-subset caller; the collector and the cap helper bounce"
     );
     let engine = Engine::default();
@@ -255,6 +279,17 @@ fn an_indirect_call_pushes_before_dispatch() {
     let (res, bounces) = run("f5", 7, SPILL_END);
     assert_eq!(bounces, [(1, vec![2007, 8])], "f5's `vb`, then f0's `vx`");
     assert_eq!(res, Ok(2007 + 8));
+}
+
+/// #2454: a value a later block captures is live across a call until that block reads it. In f6's
+/// block 1, `v01` (the entry's `v0`) and `vz` are read by block 2, and the entry's `vx` is live
+/// through block 1 without being one of its values: all three are pushed, the block's own first. The
+/// entry's `vd` is read only before the call, and `vw` is defined after it: neither is.
+#[test]
+fn a_captured_value_is_pushed_where_a_later_block_reads_it() {
+    let (res, bounces) = run("f6", 41, SPILL_END);
+    assert_eq!(bounces, [(1, vec![41, 5, 42])]);
+    assert_eq!(res, Ok(42 + 41 + 5 + 9));
 }
 
 #[test]
