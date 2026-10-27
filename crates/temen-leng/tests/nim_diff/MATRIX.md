@@ -72,6 +72,7 @@ means adding it to a row.
 | User-defined operators, overloading | `operators` | ✅ |
 | Procs as values | `proc_types` | ✅ |
 | Closures | `closures` | ✅ |
+| A plain proc as a closure (#2611) | `closure_from_proc` | ✅ |
 | Inline iterators | `iterators` | ✅ |
 | Closure iterators | `iterators_closure` | ✅ |
 | Threads (`std/rawthreads`) | `threads` | ✅ |
