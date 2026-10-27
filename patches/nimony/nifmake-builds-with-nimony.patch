@@ -9,7 +9,7 @@ yielding a float, multi-argument `writeLine`, `except ValueError`/`OSError`, a c
 comparator, a nil `ptr`, raising table and OS calls outside `try`, globals with no word on their
 synchronization). It also fixes a latent bug:
 `countProcessors()` is 0 when the count cannot be detected, and `-j` then scheduled nothing and
-reported the unbuilt graph as a success. Not fixed upstream as of nim-lang/nimony master 650bebb2 (2026-10-14).
+reported the unbuilt graph as a success. Not fixed upstream as of nim-lang/nimony master 4a965c9b (2026-10-27).
 And nimony's borrow checker, which classic Nim does not have, rejects `visit` iterating
 `nodes[nodeId].deps` while it passes `nodes` on as `var` (upstream's borrow checking from 2026-10-16;
 #2613), so `visit` walks the deps by index.
@@ -21,7 +21,7 @@ Behaviour is unchanged, except that a nimony-built nifmake's `--profile` reports
 pinned devel) and with nimony, and either binary drives `nimony c` to the same result.
 
 Applied to a COPY of the pinned sources at build time (`scripts/nim-toolchain.sh`); the
-vendored `nimony/` submodule is never modified. Against the submodule pin (650bebb2).
+vendored `nimony/` submodule is never modified. Against the submodule pin (4a965c9b).
 Drop it when upstream nifmake builds with nimony.
 diff --git a/src/nifmake/nifmake.nim b/src/nifmake/nifmake.nim
 index 7b6e92cc..e26f5197 100644

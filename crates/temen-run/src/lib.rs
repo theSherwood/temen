@@ -9232,7 +9232,7 @@ mod nim_module_suffix_tests {
     #[test]
     fn it_reproduces_the_build_directories_nimony_names_in_its_own_tree() {
         use super::NIMONY_TREE_PATHS;
-        // Observed verbatim: nimony 650bebb2, run at the root of its tree, built these programs in
+        // Observed verbatim: nimony 4a965c9b, run at the root of its tree, built these programs in
         // `nimcache/c/<stem>/`. `src/lib` is on its search path, so the stem is hashed from a `../`
         // walk, one character shorter than the spelling it was given.
         for (prog, stem) in [
