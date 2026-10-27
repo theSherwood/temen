@@ -122,8 +122,9 @@ try {
     ? ok('debugged detached run ran to completion')
     : fail(`detached debug finish: ${detDone}`);
 
-  // The "JS powerbox" card: the page defines the guest's capabilities in JavaScript (`web/powerbox.js`
-  // over the `temen_jspb_*` seam). Two editors — the Temen guest and the powerbox implementing it.
+  // The "JS powerbox" card: the page defines the guest's capabilities in JavaScript (`web/powerbox.js`,
+  // staged as an on-ramp run's JS capabilities). Two editors — the Temen guest and the powerbox
+  // implementing it.
   // Running it proves the whole loop through the DOM: a capability reads the guest's window (the
   // greeting reaches the output pane), one writes it back (the second line comes back uppercased), and
   // a pure one returns the host clock as the guest's result.

@@ -85,7 +85,7 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
 //   `onOutput(stdout, stderr)` (`Uint8Array`s) gets the run's output as its threads write it, in the
 //   order its buffers hold it, as the coop driver's does;
 //   `caps` (names) ⇒ with `onramp`, the host-answered caps the page answers (#1414 5b-2): a call to
-//   one comes to `onCapPark({ id, index, args })`, which resolves to the call's result (a Number or
+//   one comes to `onCapPark({ id, index, op, args })`, which resolves to the call's result (a Number or
 //   BigInt) while the run's other tasks go on, or to `null` to stop the run, as the pump's driver's
 //   does;
 //   `stdinLater` ⇒ with `onramp`, the page feeds stdin as the run goes, through `feed(bytes)` and
@@ -259,7 +259,7 @@ export function makeRunner({ module, memory, ex }) {
               // can while the run goes on. An answer of `null` stops the run, and so does one that
               // is not an integer, with its error.
               Promise.resolve()
-                .then(() => (onCapPark ? onCapPark({ id: m.id, index: m.index, args: m.args }) : null))
+                .then(() => (onCapPark ? onCapPark({ id: m.id, index: m.index, op: m.op, args: m.args }) : null))
                 .then((value) => {
                   if (value === null || value === undefined) return stop();
                   const answer = BigInt(value);

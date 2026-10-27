@@ -69,9 +69,11 @@ fn doom_frame_hashes_match_native() {
         jit: None,
         stderr: None,
     };
-    // The one shared powerbox binder (#1524): an unknown name — or one whose declared signature
-    // is not the capability op's — is left unbound, a fail-closed `CapFault` at dispatch.
-    host.bind_powerbox_manifest(&m.imports, &m.types, &granted, &[]);
+    // The one shared powerbox binder (#1524): an unknown name, or one whose declared signature is
+    // not the capability op's, would refuse the run (#2579).
+    let grant = temen_interp::powerbox_grant(&granted, &[]);
+    host.bind_powerbox_manifest(&m.imports, &m.types, &grant)
+        .expect("Doom's manifest binds on this powerbox");
 
     // A read-only in-memory WAD over the `fs` capability (op protocol per lua_files_stdio.c):
     // 0 open(name,len,flags)->fd; 1 read(fd,buf,len)->n; 3 seek(fd,whence,off)->pos; 4 close.

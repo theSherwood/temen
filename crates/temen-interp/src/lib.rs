@@ -1065,12 +1065,14 @@ pub enum VarValue {
 }
 
 /// #1366 / #1953 — a call parked on a **declared host-answered cap**
-/// ([`Host::grant_declared_host_caps`]): the cap's name, the guest's flat call arguments (the
-/// guest's own op rides in `args[0]` by convention, like `vm_fs`), and the [`Completer`] that
-/// answers it.
+/// ([`Host::grant_declared_host_caps`]): the cap's name, the op and arguments the call dispatched
+/// with, and the [`Completer`] that answers it. A flat `call.sym "<name>"` import binds at op 0 with
+/// the guest's own op in `args[0]` by convention, like `vm_fs`; a call through a handle the guest
+/// resolved by name (`call.cap 13 <op>`) carries its op here (#2579).
 #[derive(Debug)]
 pub struct CapRequest {
     pub name: String,
+    pub op: u32,
     pub args: Vec<i64>,
     pub completer: Completer,
 }
@@ -1080,6 +1082,27 @@ pub struct CapRequest {
 /// rebuilt run's procs file into the same map. Dropping a request answers its call
 /// `CAP_REVOKED`.
 pub type CapRequests = Arc<Mutex<BTreeMap<u64, CapRequest>>>;
+
+/// The handler of declared host-answered cap `name` ([`Host::grant_declared_host_caps`]): every call
+/// punts to the embedder, filed in `requests` under its completion id.
+fn declared_host_cap(name: &str, requests: &CapRequests) -> OffloadHostProc {
+    let (name, requests) = (name.to_string(), Arc::clone(requests));
+    Box::new(move |op, args| {
+        let (name, requests, args) = (name.clone(), Arc::clone(&requests), args.to_vec());
+        OffloadOutcome::Host(Box::new(move |completer: Completer| {
+            let id = completer.id();
+            requests.lock_unpoisoned().insert(
+                id,
+                CapRequest {
+                    name,
+                    op,
+                    args,
+                    completer,
+                },
+            );
+        }))
+    })
+}
 
 /// One recorded crossing of the capability boundary (DEBUGGING.md W1 `CapTape`): the inputs the
 /// guest passed and the result slots the host returned, for a **nondeterministic input** capability
@@ -19570,21 +19593,142 @@ fn preseeded_iface_id(names: &[String], sigs: &[FuncType]) -> Option<u32> {
     })
 }
 
-/// One import the powerbox binder ([`Host::bind_powerbox_manifest`]) refused although its **name**
-/// resolved to a capability: the declared signature is not that capability op's, so binding it
-/// would dispatch with the wrong calling convention (#1524). The slot is left unbound (fail-closed
-/// `CapFault` at use); this record is returned so an embedder can say *why* rather than leaving a
-/// silent hole. Not an error type — a refusal is a legitimate outcome for a program whose extern
-/// merely collided with a capability name.
+/// One `required` import of a root's manifest the powerbox binder ([`Host::bind_powerbox_manifest`])
+/// cannot bind, which refuses the run before it starts (IMPORTS.md §2.1, #2579), as a child's spawn
+/// is refused (#2219). Either nothing the host grants answers to its name, or the name resolves to a
+/// capability whose op the import is not shaped like, so binding it would dispatch with the wrong
+/// calling convention (#1524).
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct ShapeRefusal {
+pub struct ImportRefusal {
     /// Index into the module's import table.
     pub import: u32,
     pub name: String,
-    /// What the module declared (a `TypeEntry::Func` behind [`temen_ir::ImportShape::Func`]).
-    pub declared: FuncType,
-    /// What the capability op's pinned shape says it must be.
-    pub expected: FuncType,
+    /// For an import shaped unlike its capability: what the module declared (a `TypeEntry::Func`
+    /// behind [`temen_ir::ImportShape::Func`]), and what the capability op's pinned shape says it
+    /// must be. `None` when no grant answers to the name.
+    pub shape: Option<(FuncType, FuncType)>,
+}
+
+impl std::fmt::Display for ImportRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.shape {
+            None => write!(f, "no grant satisfies its import `{}`", self.name),
+            Some((declared, expected)) => write!(
+                f,
+                "its import `{}` is declared {declared:?}, not as the capability's {expected:?}",
+                self.name
+            ),
+        }
+    }
+}
+
+/// What a root's manifest is bound against ([`Host::bind_powerbox_manifest`]): an import name to
+/// the capability it denotes and the handle the host granted for it, `None` for a name the host
+/// grants nothing for.
+pub type ImportGrant<'a> = &'a dyn Fn(&str) -> Option<(temen_ir::ResolvedCap, i32)>;
+
+/// The grant every powerbox host binds a manifest against: its raw [`cap_id::HOST_PROC`] seams
+/// first (the `vm_fs` memfs, declared host-answered caps, JS capabilities), each bound flat at op 0
+/// with the guest's own op riding in arg0, then the shared name→cap table
+/// ([`temen_ir::PowerboxHandles::bind`]).
+pub fn powerbox_grant<'a>(
+    granted: &'a temen_ir::PowerboxHandles,
+    seams: &'a [(&'a str, i32)],
+) -> impl Fn(&str) -> Option<(temen_ir::ResolvedCap, i32)> + 'a {
+    move |name| match seams.iter().find(|(n, _)| *n == name) {
+        Some(&(_, handle)) => Some((
+            temen_ir::ResolvedCap {
+                type_id: cap_id::HOST_PROC,
+                op: 0,
+            },
+            handle,
+        )),
+        None => granted.bind(name),
+    }
+}
+
+/// The bindings of a root's manifest on a host that grants what `grant` answers: each `required`
+/// import bound to its grant, each `rebindable` one to its grant or empty (IMPORTS.md §2.1). Every
+/// `required` import that does not bind is a refusal ([`ImportRefusal`]), and any refusal refuses
+/// the run. A host can ask before it launches anything: no `Host` is involved.
+///
+/// **The shape check (#1524).** A name resolving to a capability is *not* sufficient to bind it:
+/// the import must also be *shaped* like that capability's op. A frontend emits two different
+/// things through the same `call.sym` syntax —
+///
+/// * a **capability** import — the handle operand is a real granted handle, the args are the op's
+///   args (chibicc's `gen_builtin_import`, the `<temen.h>` §7 late-binding pattern);
+/// * a **function-symbol** import — a cross-TU call to a declared-but-undefined function, whose
+///   args are the C list *led by the data stack pointer* (chibicc `--emit-object`).
+///
+/// Both intern as [`temen_ir::ImportShape::Func`], so the shape *enum* cannot tell them apart — only
+/// the signature can. When the retained function-symbol import's name happens to be a powerbox row
+/// (`extern long vm_map(long, long)` in a program unit that no linked unit defines), binding it by
+/// name alone would dispatch the capability with every argument shifted by one: the data-SP arrives
+/// where the length belongs. So an import whose declared signature does not bind as the capability
+/// op's ([`sig_binds_as_capability`] — **arity**, since the data-SP is what changes it, and scalar
+/// width legitimately varies) does not bind.
+///
+/// This is only as strong as the *pinned* signatures: [`builtin_iface_shape`] is seeded for `Stream`
+/// and `Exit` (#1515 slice 1), so those two are checked. The other seven built-ins have no canonical
+/// signature yet — #1515's decision 1 is exactly that, and is the owner's to make — so a name
+/// resolving to one binds unchecked. The gap is narrowed here, not closed; #1524 records what closing
+/// it needs.
+pub fn powerbox_manifest_bindings(
+    imports: &[temen_ir::Import],
+    types: &[temen_ir::TypeEntry],
+    grant: ImportGrant,
+) -> Result<Vec<BoundImport>, Vec<ImportRefusal>> {
+    let mut bindings = Vec::with_capacity(imports.len());
+    let mut refusals = Vec::new();
+    for (i, im) in imports.iter().enumerate() {
+        let rebindable = im.mode == temen_ir::ImportMode::Rebindable;
+        let refusal = |shape| ImportRefusal {
+            import: i as u32,
+            name: im.name.clone(),
+            shape,
+        };
+        let Some((cap, handle)) = grant(&im.name) else {
+            match rebindable {
+                true => bindings.push(BoundImport::rebindable(0, 0, None)),
+                false => refusals.push(refusal(None)),
+            }
+            continue;
+        };
+        // Only a *flat* import can be a mis-shaped function-symbol import; a grouped (`Interface`)
+        // one is coverage-bound elsewhere and never carries the C list.
+        if let (temen_ir::ImportShape::Func(t), Some(expected)) =
+            (im.shape, canonical_op_sig(cap.type_id, cap.op))
+        {
+            let mismatch = match types.get(t as usize) {
+                Some(temen_ir::TypeEntry::Func(declared))
+                    if sig_binds_as_capability(declared, &expected) =>
+                {
+                    None
+                }
+                Some(temen_ir::TypeEntry::Func(declared)) => {
+                    Some(Some((declared.clone(), expected)))
+                }
+                // A malformed type reference (an unverified module): fail closed too.
+                _ => Some(None),
+            };
+            if let Some(shape) = mismatch {
+                match rebindable {
+                    true => bindings.push(BoundImport::rebindable(0, 0, None)),
+                    false => refusals.push(refusal(shape)),
+                }
+                continue;
+            }
+        }
+        bindings.push(match rebindable {
+            true => BoundImport::rebindable(cap.type_id, cap.op, Some(handle)),
+            false => BoundImport::required(cap.type_id, cap.op, handle),
+        });
+    }
+    match refusals.is_empty() {
+        true => Ok(bindings),
+        false => Err(refusals),
+    }
 }
 
 /// The pinned signature of one built-in capability op, or `None` when that built-in's convention is
@@ -26115,90 +26259,36 @@ impl Host {
     }
 
     /// Bind a **root module's manifest against the powerbox grants** — the one binder every
-    /// embedder uses (#1524). Import `i`'s name resolves through the shared name→cap table
-    /// ([`temen_ir::PowerboxHandles::bind`]) to a `(type_id, op)` and the handle this host granted
-    /// for it; a name outside the table, or a capability this host chose not to grant, leaves the
-    /// slot **unbound** — a dispatch through it is a fail-closed `CapFault`.
-    ///
-    /// `host_procs` is consulted first: names this host serves as a raw [`cap_id::HOST_PROC`]
-    /// (the `vm_fs` memfs seam, the debugger's host-completed caps), bound flat at op 0 with the
-    /// guest's own op riding in arg0. Passing a name here overrides the powerbox table for it.
+    /// embedder uses (#1524): [`powerbox_manifest_bindings`] over `grant`, usually
+    /// [`powerbox_grant`]. A `required` import that does not bind **refuses the run** (IMPORTS.md
+    /// §2.1, #2579), as a child's spawn is refused (#2219): nothing is installed, each refusal is
+    /// noted ([`Host::take_notes`]), since the guest never runs to see why, and the embedder ends
+    /// the run before it starts.
     ///
     /// **Why this is one function.** It replaced eight hand-copied
     /// `imports.iter().map(|im| granted.bind(&im.name))` blocks (browser ×3, temen-run, temen-dap,
     /// three tests) — INVARIANTS #15's "second route through a behaviour that already has one",
-    /// once per embedder. The shape check below had to land in all eight or none.
-    ///
-    /// **The shape check (#1524).** A name resolving to a capability is *not* sufficient to bind
-    /// it: the import must also be *shaped* like that capability's op. A frontend emits two
-    /// different things through the same `call.sym` syntax —
-    ///
-    /// * a **capability** import — the handle operand is a real granted handle, the args are the
-    ///   op's args (chibicc's `gen_builtin_import`, the `<temen.h>` §7 late-binding pattern);
-    /// * a **function-symbol** import — a cross-TU call to a declared-but-undefined function,
-    ///   whose args are the C list *led by the data stack pointer* (chibicc `--emit-object`).
-    ///
-    /// Both intern as [`temen_ir::ImportShape::Func`], so the shape *enum* cannot tell them apart —
-    /// only the signature can. When the retained function-symbol import's name happens to be a
-    /// powerbox row (`extern long vm_map(long, long)` in a program unit that no linked unit
-    /// defines), binding it by name alone dispatches the capability with every argument shifted by
-    /// one: the data-SP arrives where the length belongs. So an import whose declared signature does
-    /// not bind as the capability op's ([`sig_binds_as_capability`] — **arity**, since the data-SP
-    /// is what changes it, and scalar width legitimately varies) is refused here and left unbound,
-    /// and the refusal is returned for the embedder to surface.
-    ///
-    /// This is only as strong as the *pinned* signatures: [`builtin_iface_shape`] is seeded for
-    /// `Stream` and `Exit` (#1515 slice 1), so those two are checked. The other seven built-ins
-    /// have no canonical signature yet — #1515's decision 1 is exactly that, and is the owner's to
-    /// make — so a name resolving to one binds unchecked, as before. The gap is narrowed here, not
-    /// closed; #1524 records what closing it needs.
+    /// once per embedder. The shape check had to land in all eight or none, and so did the refusal.
     pub fn bind_powerbox_manifest(
         &mut self,
         imports: &[temen_ir::Import],
         types: &[temen_ir::TypeEntry],
-        granted: &temen_ir::PowerboxHandles,
-        host_procs: &[(&str, i32)],
-    ) -> Vec<ShapeRefusal> {
-        if imports.is_empty() {
-            return Vec::new();
+        grant: ImportGrant,
+    ) -> Result<(), Vec<ImportRefusal>> {
+        match powerbox_manifest_bindings(imports, types, grant) {
+            Ok(bindings) => {
+                if !bindings.is_empty() {
+                    self.set_import_bindings(bindings);
+                }
+                Ok(())
+            }
+            Err(refusals) => {
+                for r in &refusals {
+                    self.note(format!("refused the run: {r}"));
+                }
+                Err(refusals)
+            }
         }
-        let mut refusals = Vec::new();
-        let bindings = imports
-            .iter()
-            .enumerate()
-            .map(|(i, im)| {
-                if let Some((_, h)) = host_procs.iter().find(|(n, _)| *n == im.name) {
-                    return BoundImport::required(cap_id::HOST_PROC, 0, *h);
-                }
-                let Some((cap, handle)) = granted.bind(&im.name) else {
-                    return BoundImport::rebindable(0, 0, None);
-                };
-                // Only a *flat* import can be a mis-shaped function-symbol import; a grouped
-                // (`Interface`) one is coverage-bound elsewhere and never carries the C list.
-                if let (temen_ir::ImportShape::Func(t), Some(expected)) =
-                    (im.shape, canonical_op_sig(cap.type_id, cap.op))
-                {
-                    match types.get(t as usize) {
-                        Some(temen_ir::TypeEntry::Func(declared))
-                            if sig_binds_as_capability(declared, &expected) => {}
-                        Some(temen_ir::TypeEntry::Func(declared)) => {
-                            refusals.push(ShapeRefusal {
-                                import: i as u32,
-                                name: im.name.clone(),
-                                declared: declared.clone(),
-                                expected,
-                            });
-                            return BoundImport::rebindable(0, 0, None);
-                        }
-                        // A malformed type reference (an unverified module): fail closed too.
-                        _ => return BoundImport::rebindable(0, 0, None),
-                    }
-                }
-                BoundImport::required(cap.type_id, cap.op, handle)
-            })
-            .collect();
-        self.set_import_bindings(bindings);
-        refusals
     }
 
     /// Mark this domain **durable**: its module has been freeze/thaw-instrumented, so the runtime
@@ -29360,6 +29450,10 @@ impl Host {
     /// #2579 — a name is granted whether or not the module imports it: a guest may resolve it by
     /// name instead (unir's `bell`). One the module never calls costs only where it makes an inline
     /// host-capability call, which may then park on the embedder (`image_parks`).
+    ///
+    /// #2579 — each is forkable: a §14 child or `fork()` twin it is re-granted to files its calls in
+    /// the same `requests`, under completion ids unique in the process, so the embedder answers a
+    /// child's call as it answers the root's.
     pub fn grant_declared_host_caps(
         &mut self,
         names: &[String],
@@ -29367,24 +29461,18 @@ impl Host {
     ) -> Vec<(String, i32)> {
         let mut declared = Vec::new();
         for name in names {
-            let requests = Arc::clone(requests);
-            let cap = name.clone();
+            let fork: HostProcFork = {
+                let (name, requests) = (name.clone(), Arc::clone(requests));
+                Arc::new(move |_pid| {
+                    Some(ForkedProc::offloadable(
+                        declared_host_cap(&name, &requests),
+                        CapState::Stateless,
+                    ))
+                })
+            };
             let h = self.grant_host_proc_offloadable(
-                Box::new(move |_op: u32, args: &[i64]| {
-                    let requests = Arc::clone(&requests);
-                    let name = cap.clone();
-                    let args = args.to_vec();
-                    OffloadOutcome::Host(Box::new(move |completer: Completer| {
-                        let request = CapRequest {
-                            name,
-                            args,
-                            completer,
-                        };
-                        let id = request.completer.id();
-                        requests.lock_unpoisoned().insert(id, request);
-                    }))
-                }),
-                None,
+                declared_host_cap(name, requests),
+                Some(fork),
                 // Each call is answered afresh by the embedder; nothing is held between calls.
                 CapState::Stateless,
             );
@@ -31913,10 +32001,10 @@ impl Host {
         // refuses (`None`, fail-closed); such a cap the parent keeps. This is the deep-copy path
         // `resolve_copyable` defers for `HostProc`.
         if let Ok(Binding::HostProc(idx)) = self.resolve(handle, cap_id::HOST_PROC) {
-            let vt = self
+            let (vt, on_host) = self
                 .host_procs
                 .get(idx as usize)
-                .and_then(|e| e.vtable.clone());
+                .map_or((None, false), |e| (e.vtable.clone(), e.on_host));
             return self
                 .host_procs
                 .get(idx as usize)
@@ -31938,14 +32026,16 @@ impl Host {
                         child.exec_remap_hooks.push(x);
                     }
                     // #2424 — the handler the factory minted, of whichever shape: an offloadable
-                    // one parks the child's caller as the parent's parks its own.
+                    // one parks the child's caller as the parent's parks its own, and a declared
+                    // host-answered one stays the embedder's to answer (#2579), as `fork_powerbox`
+                    // carries it into a twin.
                     let h = child.grant_host_proc_entry(HostProcEntry {
                         handler: forked.handler,
                         fork: Some(forked.refork.unwrap_or_else(|| Arc::clone(&factory))),
                         mints: false,
                         vtable: None,
                         state: forked.state,
-                        on_host: false,
+                        on_host,
                     });
                     // #801 — the vtable rides the re-grant, and its op names enter the child's
                     // directory: a spawned `__px_`-linked child binds its manifest in-loop, same

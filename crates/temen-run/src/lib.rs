@@ -5574,9 +5574,7 @@ pub fn run_powerbox_with_host(
         .map_err(|e| format!("verification failed (fail-closed): {e:?}"))?;
     // §2.1 fail-closed: a manifest module's required imports must all be bindable (same gate as
     // `instantiate` — an unknown name refuses to start, not CapFaults mid-run).
-    if is_named_powerbox_entry(module) {
-        validate_powerbox_manifest(module)?;
-    }
+    validate_powerbox_manifest(module)?;
     // The fixed §3e powerbox preset, expressed over the converged [`Instance`] core (F1): the
     // arity-based grant ([`grant_powerbox_prefix`]) and the JIT compile→run + §5 watchdog
     // ([`run_jit`]) now live in exactly one place, shared with the frontend-independent embedding
@@ -5649,9 +5647,7 @@ impl PowerboxProgram {
         // native code to be confinement-sound is that the module verified.
         temen_verify::verify_module(&module)
             .map_err(|e| format!("verification failed (fail-closed): {e:?}"))?;
-        if is_named_powerbox_entry(&module) {
-            validate_powerbox_manifest(&module)?;
-        }
+        validate_powerbox_manifest(&module)?;
         // Refuse the shapes the one-shot path routes away from the single-threaded non-locked JIT
         // arm — the only arm this cache implements. Mirrors `Instance::run_with_caps`'s TreeWalk
         // fallback predicate plus the concurrency (locked-thunk) case.
@@ -7841,35 +7837,25 @@ fn decode_mem_event(op: u32, args: &[i64]) -> Option<MemEvent> {
 }
 
 /// §2.1 fail-closed instantiation check for a manifest (named-powerbox) module: every `required`
-/// import must resolve under the reference policy ([`default_cap_resolver`]) to an interface the
-/// powerbox binds ([`Instance::grant_caps`]'s by-interface map). An unknown name, or a
-/// dynamic-only interface (e.g. `SharedRegion`, whose objects are runtime-minted), refuses to
-/// start the module — the `ImportError::Unresolved` semantics IMPORTS.md §2.1 keeps.
+/// import must bind on the fixed powerbox ([`grant_powerbox_prefix`], which grants every row of the
+/// reference policy, [`default_cap_resolver`]), through the one binder's rule
+/// ([`temen_interp::powerbox_manifest_bindings`]). An unknown name, a dynamic-only interface (e.g.
+/// `SharedRegion`, whose objects are runtime-minted), or an import not shaped like its capability's
+/// op refuses to start the module — the `ImportError::Unresolved` semantics IMPORTS.md §2.1 keeps.
 fn validate_powerbox_manifest(module: &Module) -> Result<(), String> {
-    use temen_interp::cap_id;
-    for im in &module.imports {
-        if im.mode != temen_ir::ImportMode::Required {
-            continue; // a rebindable slot may legitimately start empty
-        }
-        let Some(cap) = default_cap_resolver(&im.name) else {
-            return Err(format!(
-                "unresolved capability import `{}` (no binding in the host policy)",
-                im.name
-            ));
-        };
-        let bindable = matches!(
-            cap.type_id,
-            cap_id::STREAM | cap_id::EXIT | cap_id::ADDRESS_SPACE | cap_id::JIT
-        );
-        if !bindable {
-            return Err(format!(
-                "capability import `{}` names a dynamic-only interface (use `call.cap` on a live \
-                 handle)",
-                im.name
-            ));
+    let granted = temen_ir::PowerboxHandles {
+        jit: Some(0),
+        stderr: Some(0),
+        ..temen_ir::PowerboxHandles::prefix([0; 5])
+    };
+    let grant = temen_interp::powerbox_grant(&granted, &[]);
+    match temen_interp::powerbox_manifest_bindings(&module.imports, &module.types, &grant) {
+        Ok(_) => Ok(()),
+        Err(refusals) => {
+            let why: Vec<String> = refusals.iter().map(ToString::to_string).collect();
+            Err(format!("refused to start: {}", why.join("; ")))
         }
     }
-    Ok(())
 }
 
 /// Verify `module` (the escape-freedom gate, §2a) and build an [`Instance`] over its manifest: a
@@ -8643,15 +8629,14 @@ impl Instance {
                         jit: Some(jit),
                         stderr: Some(stderr),
                     };
-                    // The one shared powerbox binder (#1524). An unknown name, a capability
-                    // this host did not grant, or a declared signature that is not the
-                    // capability op's: declared but unbound — fail-closed at dispatch.
+                    // The one shared powerbox binder (#1524), which refused at
+                    // instantiation every module whose imports this powerbox cannot bind.
                     h.bind_powerbox_manifest(
                         &self.module.imports,
                         &self.module.types,
-                        &granted,
-                        &[],
-                    );
+                        &temen_interp::powerbox_grant(&granted, &[]),
+                    )
+                    .expect("instantiate refused a manifest the fixed powerbox cannot bind");
                 }
             }
         }

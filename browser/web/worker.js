@@ -286,7 +286,7 @@ self.onmessage = async (e) => {
         if (ev === 6 /* COOP_RUN_CAP_PARK */) {
           const n = ex.temen_coop_cap_len();
           const words = new BigInt64Array(memory.buffer, Number(ex.temen_coop_cap_ptr()), n).slice();
-          self.postMessage({ kind: 'cap', id: words[0], index: Number(words[1]), args: Array.from(words.slice(2)) });
+          self.postMessage({ kind: 'cap', id: words[0], index: Number(words[1]), op: Number(words[2]), args: Array.from(words.slice(3)) });
         } else if (ev === 7 /* COOP_RUN_IDLE */) {
           self.postMessage({ kind: 'idle' });
           ex.temen_x2_wait(); // until the page acts, a task makes a call, or the run ends

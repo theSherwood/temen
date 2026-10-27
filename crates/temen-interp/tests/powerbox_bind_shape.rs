@@ -14,13 +14,14 @@
 //! If its name then happens to be a powerbox row, binding by name alone dispatches the capability
 //! with every argument shifted by one — the data-SP arrives where the first op argument belongs.
 //!
-//! These tests pin that a signature that is not the capability op's is **refused** (slot left
-//! unbound, a fail-closed `CapFault` at use) and reported, while the capability-shaped import for
-//! the same name still binds. `Stream` is used because its op signatures are pinned
-//! (`preseeded_iface_shapes`, #1515 slice 1) — the check is only ever as strong as the seeded
-//! shapes, which is exactly what #1515's remaining decisions widen.
+//! These tests pin that a signature that is not the capability op's is **refused**, and that a
+//! refused `required` import refuses the whole run before it starts (IMPORTS.md §2.1, #2579), as
+//! one no grant answers to does, while the capability-shaped import for the same name binds.
+//! `Stream` is used because its op signatures are pinned (`preseeded_iface_shapes`, #1515 slice 1)
+//! — the check is only ever as strong as the seeded shapes, which is exactly what #1515's remaining
+//! decisions widen.
 
-use temen_interp::{cap_id, Host};
+use temen_interp::{cap_id, powerbox_grant, Host, ImportRefusal};
 use temen_ir::{FuncType, Import, ImportMode, ImportShape, PowerboxHandles, TypeEntry, ValType};
 
 fn sig(params: Vec<ValType>, results: Vec<ValType>) -> FuncType {
@@ -32,6 +33,24 @@ fn powerbox() -> (Host, PowerboxHandles) {
     let mut host = Host::new();
     let granted = PowerboxHandles::prefix(host.grant_powerbox_prefix(1 << 16));
     (host, granted)
+}
+
+/// Bind `imports` on `host` against its §3e grants alone.
+fn bind(
+    host: &mut Host,
+    granted: &PowerboxHandles,
+    imports: &[Import],
+    types: &[TypeEntry],
+) -> Result<(), Vec<ImportRefusal>> {
+    host.bind_powerbox_manifest(imports, types, &powerbox_grant(granted, &[]))
+}
+
+fn import(name: &str, ty: u32, mode: ImportMode) -> Import {
+    Import {
+        name: name.into(),
+        shape: ImportShape::Func(ty),
+        mode,
+    }
 }
 
 /// The capability form of `write` — `Stream.write` is the pinned `(i64, i64) -> (i64)`
@@ -50,11 +69,8 @@ fn capability_shaped_write_binds() {
         mode: ImportMode::Required,
     }];
 
-    let refusals = host.bind_powerbox_manifest(&imports, &types, &granted, &[]);
-    assert!(
-        refusals.is_empty(),
-        "capability-shaped write binds: {refusals:?}"
-    );
+    let bound = bind(&mut host, &granted, &imports, &types);
+    assert_eq!(bound, Ok(()), "capability-shaped write binds");
 
     let b = host.import_binding(0).expect("write bound");
     assert_eq!(b.type_id, cap_id::STREAM);
@@ -68,7 +84,7 @@ fn capability_shaped_write_binds() {
 ///
 /// Binding it by name would dispatch `Stream.write` with the SP where `buf` belongs and `fd`
 /// where `len` belongs — a write of `fd` bytes from a pointer the guest never chose. It is
-/// refused instead, and the refusal names both signatures.
+/// refused instead, the refusal names both signatures, and the run is refused with it.
 #[test]
 fn function_symbol_shaped_write_is_refused() {
     let (mut host, granted) = powerbox();
@@ -83,33 +99,82 @@ fn function_symbol_shaped_write_is_refused() {
         mode: ImportMode::Required,
     }];
 
-    let refusals = host.bind_powerbox_manifest(&imports, &types, &granted, &[]);
+    let refusals = bind(&mut host, &granted, &imports, &types).expect_err("refused");
     assert_eq!(refusals.len(), 1, "the mis-shaped import is refused");
     assert_eq!(refusals[0].import, 0);
     assert_eq!(refusals[0].name, "write");
     assert_eq!(
-        refusals[0].declared, c_abi,
-        "reports what the module declared"
-    );
-    assert_eq!(
-        refusals[0].expected,
-        sig(vec![ValType::I64, ValType::I64], vec![ValType::I64]),
-        "reports the capability op's pinned signature"
+        refusals[0].shape,
+        Some((
+            c_abi,
+            sig(vec![ValType::I64, ValType::I64], vec![ValType::I64])
+        )),
+        "reports what the module declared, and the capability op's pinned signature"
     );
 
-    // Fail-closed, not merely unreported: the slot holds no live binding, so a `call.import`
-    // through it is a `CapFault` rather than a shifted dispatch.
+    // Refused, not merely unreported: nothing is installed, and the note says why, since the
+    // guest never runs to see it.
+    assert!(host.import_binding(0).is_none(), "nothing is installed");
+    let notes = host.take_notes();
     assert!(
-        host.import_binding(0).is_none(),
-        "a refused slot is left unbound"
+        notes.len() == 1 && notes[0].contains("its import `write` is declared"),
+        "the refusal is noted: {notes:?}"
     );
 }
 
-/// The refusal is **per import**, not per module: a manifest carrying both forms binds the good
-/// one and refuses only the bad one, so one colliding extern cannot disarm a program's real
-/// capabilities.
+/// A `required` import no grant answers to refuses the run, named in the refusal and the note:
+/// the browser on-ramp used to leave its slot empty and fault at the call, where every other host
+/// refused the start (IMPORTS.md §2.1, #2579).
 #[test]
-fn refusal_is_per_import() {
+fn an_import_no_grant_answers_to_refuses_the_run() {
+    let (mut host, granted) = powerbox();
+    let types = vec![TypeEntry::Func(sig(vec![ValType::I64], vec![ValType::I64]))];
+    let imports = vec![import("frobnicate", 0, ImportMode::Required)];
+    let refusals = bind(&mut host, &granted, &imports, &types).expect_err("refused");
+    assert_eq!(
+        refusals,
+        vec![ImportRefusal {
+            import: 0,
+            name: "frobnicate".into(),
+            shape: None
+        }]
+    );
+    assert_eq!(
+        host.take_notes(),
+        vec!["refused the run: no grant satisfies its import `frobnicate`".to_string()]
+    );
+}
+
+/// A `rebindable` import may start empty (IMPORTS.md §2.1): no grant answering to it refuses
+/// nothing, and the slot waits for an `import.attach`. One a grant answers to binds and stays
+/// attachable, as on `temen-run`'s named path.
+#[test]
+fn a_rebindable_import_starts_empty_or_bound_and_stays_attachable() {
+    let (mut host, granted) = powerbox();
+    let types = vec![TypeEntry::Func(sig(
+        vec![ValType::I64, ValType::I64],
+        vec![ValType::I64],
+    ))];
+    let imports = vec![
+        import("frobnicate", 0, ImportMode::Rebindable),
+        import("write", 0, ImportMode::Rebindable),
+    ];
+    assert_eq!(bind(&mut host, &granted, &imports, &types), Ok(()));
+    assert!(
+        host.import_binding(0).is_none(),
+        "the empty slot waits for an attach"
+    );
+    let b = host.import_binding(1).expect("write bound");
+    assert!(b.rebindable, "a rebindable import stays attachable");
+    assert_eq!(b.handle, granted.stdout);
+}
+
+/// One refused import refuses the **whole run** (#2579), and the refusal names that import alone:
+/// a manifest carrying a capability-shaped `write` and an SP-led `read` does not start, so a
+/// program never runs with a slot it declared and could not have. (Under #1524 the good import
+/// bound and the bad one faulted at its call: a run the native host refused started here.)
+#[test]
+fn one_refused_import_refuses_the_run_and_names_only_itself() {
     let (mut host, granted) = powerbox();
     let types = vec![
         TypeEntry::Func(sig(vec![ValType::I64, ValType::I64], vec![ValType::I64])),
@@ -131,11 +196,13 @@ fn refusal_is_per_import() {
         },
     ];
 
-    let refusals = host.bind_powerbox_manifest(&imports, &types, &granted, &[]);
+    let refusals = bind(&mut host, &granted, &imports, &types).expect_err("refused");
     assert_eq!(refusals.len(), 1);
     assert_eq!(refusals[0].name, "read");
-    assert!(host.import_binding(0).is_some(), "write still binds");
-    assert!(host.import_binding(1).is_none(), "read refused");
+    assert!(
+        host.import_binding(0).is_none() && host.import_binding(1).is_none(),
+        "nothing is installed for a refused run"
+    );
 }
 
 /// A built-in whose signature convention is **not pinned yet** binds unchecked — the honest
@@ -157,9 +224,9 @@ fn unpinned_builtin_binds_unchecked_for_now() {
         mode: ImportMode::Required,
     }];
 
-    let refusals = host.bind_powerbox_manifest(&imports, &types, &granted, &[]);
+    let bound = bind(&mut host, &granted, &imports, &types);
     assert!(
-        refusals.is_empty() && host.import_binding(0).is_some(),
+        bound.is_ok() && host.import_binding(0).is_some(),
         "AddressSpace has no pinned op signature yet, so the shape cannot be checked (#1515)"
     );
     assert!(
@@ -169,8 +236,8 @@ fn unpinned_builtin_binds_unchecked_for_now() {
     );
 }
 
-/// A `host_procs` name overrides the powerbox table and is bound flat at op 0 — the `vm_fs` memfs
-/// seam and the debugger's host-completed caps. Unchecked by design: a raw `HostProc` carries no
+/// A seam's name ([`powerbox_grant`]) overrides the powerbox table and is bound flat at op 0 — the
+/// `vm_fs` memfs seam and the debugger's host-completed caps. Unchecked by design: a raw `HostProc` carries no
 /// typed interface (its op rides in arg0), so there is no signature to compare against.
 #[test]
 fn host_proc_seam_overrides_the_table() {
@@ -189,8 +256,9 @@ fn host_proc_seam_overrides_the_table() {
         temen_interp::CapState::Stateless,
     );
 
-    let refusals = host.bind_powerbox_manifest(&imports, &types, &granted, &[("vm_fs", h)]);
-    assert!(refusals.is_empty());
+    let seams = [("vm_fs", h)];
+    let bound = host.bind_powerbox_manifest(&imports, &types, &powerbox_grant(&granted, &seams));
+    assert_eq!(bound, Ok(()));
     let b = host.import_binding(0).expect("vm_fs bound");
     assert_eq!(b.type_id, cap_id::HOST_PROC);
     assert_eq!(b.op, 0, "flat: the guest's fs op rides in arg0");
@@ -215,10 +283,11 @@ fn exit_binds_at_either_width_but_not_at_the_wrong_arity() {
             mode: ImportMode::Required,
         }];
         let types = vec![TypeEntry::Func(sig(vec![code], vec![]))];
-        let refusals = host.bind_powerbox_manifest(&imports, &types, &granted, &[]);
-        assert!(
-            refusals.is_empty(),
-            "exit declared as ({code:?}) -> () is a well-formed capability import, got {refusals:?}"
+        let bound = bind(&mut host, &granted, &imports, &types);
+        assert_eq!(
+            bound,
+            Ok(()),
+            "exit declared as ({code:?}) -> () is a well-formed capability import"
         );
     }
 
@@ -233,7 +302,7 @@ fn exit_binds_at_either_width_but_not_at_the_wrong_arity() {
         vec![ValType::I64, ValType::I32],
         vec![],
     ))];
-    let refusals = host.bind_powerbox_manifest(&imports, &types, &granted, &[]);
+    let refusals = bind(&mut host, &granted, &imports, &types).expect_err("refused");
     assert_eq!(refusals.len(), 1, "the SP-led form is refused");
     assert_eq!(refusals[0].name, "exit");
 }
