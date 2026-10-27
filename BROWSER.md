@@ -592,7 +592,7 @@ the one import object every instantiation of the engine uses — the page's, eac
 harnesses' (#2579): each `temen_host` seam reaches a `globalThis` hook its host may install, and a
 host whose seam does more (the executor-2 Worker's thread platform) passes its own.
 
-## A powerbox defined in JavaScript (`temen_jspb_*`, #1419)
+## A powerbox defined in JavaScript (JS capabilities, #1419, #2579)
 
 Every other run entry in the cdylib hands the guest a powerbox whose capabilities are implemented
 **Rust-side**: `powerbox_exec`'s fixed §3e prefix (stdout/stdin/exit/…), `grant_onramp_caps`'
@@ -601,33 +601,10 @@ looks like — a `HostProc` closure that marshals each op out through a wasm imp
 hard-coded capability with a fixed op vocabulary, chosen by Rust.
 
 `browser/src/jspb.rs` generalizes exactly that shape into the general case, so an embedder can define
-**its own** powerbox without touching Rust:
-
-| Piece | What it is |
-|---|---|
-| `temen_jspb_reset()` / `temen_jspb_bind(name)` | the page declares capability **names**; each bind returns the *slot* JS dispatches on |
-| `temen_jspb_run(module)` | grant one `HostProc` per name, bind the module's **import manifest** by name (IMPORTS.md §2.1), run its entry on the bytecode engine |
-| `temen_host.js_cap_call(slot, op, args, n, mem)` | the one wasm import the page supplies: service one capability call |
-| `temen_jspb_read` / `temen_jspb_write` | the calling guest's window, **bounds-checked**, live for that call only |
-| `temen_jspb_error_ptr/_len` | why a run was refused (an unbound import names itself) or trapped |
-| `web/powerbox.js` | the page-side sugar: `definePowerbox(eng, { 'js.log': (args, mem) => … }).run(module)` |
-
-The guest side is ordinary §7: it names each capability with `call.sym "<name>"`, and the manifest
-binds name → handle at instantiation (the module bytes are never rewritten). Authority is unchanged
-— a JS capability is an iface-13 `HostProc` like any other, the guest only ever holds a masked,
-type-checked handle, the window pointer never crosses to JS, and an import the page did **not** bind
-refuses the run before a single guest op executes.
-
-A JS capability can only be serviced where its function lives: on the thread whose engine import
-reaches the page's servicer (`globalThis.__temen_js_cap_call`). A Worker vCPU of executor 2 gets
-`-ENOSYS` from its stub import.
-
-### JS capabilities on any on-ramp open (#2579)
-
-`temen_jspb_run` runs a guest to completion with the JS capabilities alone. The same capabilities
-can join the **on-ramp powerbox** of any open instead — a run, a cooperative session, a reactor, a
-warm eval — beside its §3e prefix, `memory`, the Instantiator and the declared caps the page answers
-later. Before the open, on the open's thread, the embedder stages what it grants on top:
+**its own** capabilities without touching Rust. They join the **on-ramp powerbox** of any open — a
+run, a cooperative session, a reactor, a warm eval, an executor-2 run — beside its §3e prefix,
+`memory`, the Instantiator and the declared caps the page answers later. Before the open, on the
+open's thread, the embedder stages what it grants on top:
 
 | Export | Granted at the next open |
 |---|---|
@@ -635,24 +612,57 @@ later. Before the open, on the open's thread, the embedder stages what it grants
 | `temen_onramp_stage_module(name, bytes)` | a `Module` under `name`, verified: a child image the guest spawns by name |
 | `temen_onramp_stage_budget(fuel, mem, spawn)` | the `"budget"` a spawn pays from (`-1`: no ceiling of its own) |
 | `temen_onramp_stage_clear()` | nothing: drops what is staged |
+| `temen_host.js_cap_call(slot, op, args, n, mem)` | the one wasm import the page supplies: service one capability call |
+| `temen_jspb_read` / `temen_jspb_write` | the calling guest's window, **bounds-checked**, live for that call only |
+
+`web/powerbox.js` is the page-side sugar: `definePowerbox(eng, { 'js.log': (args, mem) => … })
+.run(module)` stages each capability and runs the module on the on-ramp (`temen_run_onramp`), so its
+guest gets the on-ramp's grants too.
+
+The guest side is ordinary §7: it names each capability with `call.sym "<name>"`, and the manifest
+binds name → handle at instantiation (the module bytes are never rewritten). Authority is unchanged
+— a JS capability is an iface-13 `HostProc` like any other, the guest only ever holds a masked,
+type-checked handle, the window pointer never crosses to JS, and an import nothing grants refuses
+the run before a single guest op executes (IMPORTS.md §2.1), with a note naming it
+(`temen_notes_len`/`temen_notes_ptr`). Every on-ramp open binds through the one powerbox binder
+(`temen_interp::powerbox_manifest_bindings`), which also refuses an import whose declared signature
+is not the capability's (#1524).
 
 The open takes what is staged, so it serves that run alone (a leaf the engine declines and the run
-it falls back to get the same grants). A JS capability is `grant_js_caps`' forkable `HostProc`, the
-one `temen_jspb_run` grants: a §14 child the root re-grants it to by name, or a fork twin, calls the
-same function with its **own** window. The coop driver installs the servicer for a run:
-`driveCoopTierupRun`'s `onCap(slot, op, args, mem)` beside `onCapPark`. So a powerbox holds both
-faces: a call answered inside it (`onCap`), and a call the page answers when it can (`onCapPark`).
-A declared cap is granted whether or not the module imports it, since a guest may resolve it by
-name instead.
+it falls back to get the same grants). A JS capability is `grant_js_caps`' forkable `HostProc`: a §14
+child the root re-grants it to by name, or a fork twin, calls the same function with its **own**
+window. So a powerbox holds two faces of capability, each answered by the page:
 
-Executor 2 refuses a run with a staged JS capability (`temen_par_powerbox_onramp` returns `0`): its
-tasks run on Workers that cannot call the page's function. A Worker that runs an engine of its own on
-the cooperative driver serves JS capabilities as the page does.
+- **inside the call** (`onCap(slot, op, args, mem)`): the page runs the capability's function while
+  the call is in progress, with the calling guest's window;
+- **later** (`onCapPark({ id, index, op, args })`): a declared cap's call parks its task, and the
+  page answers it when it can (`temen_coop_deliver_cap`, executor 2's `temen_x2_answer`). Scalars
+  only, as the engine's offloadable face is: nothing touches a window while its call is parked. `op`
+  is the op the call dispatched with: 0 for a flat `call.sym` import, whose own op rides in
+  `args[0]`. A declared cap is granted whether or not the module imports it, since a guest may resolve
+  it by name instead, and it is forkable too: a child it is re-granted to files its calls with the
+  same embedder.
 
-Gates: `browser/tests/jspb.rs` (native — registry, name binding, window read/write, fail-closed
-refusal, `-ENOSYS` with no servicer), `browser/browser-jspb-test.mjs` (headless node — the real wasm
-import, the ABI marshalling, and the shipped `web/powerbox.js`), and the playground's **"JS
-powerbox"** card, whose guest program the native test mirrors.
+Where each face runs:
+
+- **The pump** (`driveCoopTierupRun`): `onCap` runs on the pump's thread, from the pump or from a
+  bounce out of emitted code.
+- **Executor 2** (`par.js`'s `runAcrossWorkers` with `onCap`): the calling task's Worker sends the
+  call to the page (`worker.js`'s `js_cap_call`) and waits inside it; the page runs `onCap` over the
+  task's window and answers in the Worker's cell. A detached child's window is a memory of its own,
+  which the page registers for the call (`foreign-mem.js`). The waiting Worker holds the run's shared
+  host, as every capability call does, so the run's other capability calls wait meanwhile, and
+  `onCap` reaches the engine only through `mem`. The page never waits on an engine lock: a window
+  read that finds the page map changing spins (`Mem::space_read` on the threads build).
+- **A Worker that runs an engine of its own** on the cooperative driver serves JS capabilities as
+  the page does.
+
+Gates: `browser/tests/jspb.rs` (native — staging, name binding, window read/write, children,
+fail-closed refusal, `-ENOSYS` with no servicer), `browser/browser-jspb-test.mjs` (headless node —
+the real wasm import, the ABI marshalling, and the shipped `web/powerbox.js`),
+`browser/browser-coop-embedder-test.mjs` (the pump in Node and Chromium; executor 2 in Chromium: the
+root's calls, a leaf's, a thread's and a detached child's), and the playground's **"JS powerbox"**
+card, whose guest program the native test mirrors.
 
 ## Link-time dead-code elimination, and linking against several units (#1407 / #1408)
 

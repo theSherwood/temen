@@ -1,9 +1,10 @@
 // **A powerbox defined in JavaScript**, end to end and headless: the engine's `temen_host.js_cap_call`
-// import, the `temen_jspb_*` exports (`browser/src/jspb.rs`) and the shipped page module
-// `web/powerbox.js` — the same file the playground's "JS powerbox" card runs — driven over the plain
-// wasm32 build. `browser/tests/jspb.rs` proves the Rust half natively; this proves the JS half: the
-// wasm import really reaches a page function, the pointer/length marshalling is right on this ABI,
-// the window accessors read and write the guest's memory, and an unbound import refuses the run.
+// import, the staged JS capabilities of an on-ramp run and its window accessors (`browser/src/jspb.rs`)
+// and the shipped page module `web/powerbox.js` — the same file the playground's "JS powerbox" card
+// runs — driven over the plain wasm32 build. `browser/tests/jspb.rs` proves the Rust half natively;
+// this proves the JS half: the wasm import really reaches a page function, the pointer/length
+// marshalling is right on this ABI, the window accessors read and write the guest's memory, and an
+// import nothing grants refuses the run, its notes naming it.
 //
 // Usage: node browser-jspb-test.mjs [temen_browser.wasm]
 //   (build: cargo build --release --lib --target wasm32-unknown-unknown)
@@ -85,8 +86,8 @@ const okValue = BigInt(run.value) === CLOCK;
 const okRead = logged[0] === 'hello from the guest\n';
 const okWrite = logged[1] === 'THE HOST IS JAVASCRIPT\n';
 
-// Fail-closed: drop one capability and the run is refused *before* any guest op — the message names
-// the missing import, and the remaining capability is never called.
+// Fail-closed: drop one capability and the run is refused *before* any guest op — the run's notes
+// name the missing import, and the remaining capability is never called.
 logged.length = 0;
 const { 'js.now': _dropped, ...partial } = caps;
 const refused = definePowerbox(eng, partial).run(guest);

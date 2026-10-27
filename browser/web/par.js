@@ -9,8 +9,9 @@
 // `/<repo>/`). The deployed site keeps the same `web/` + `target/…` layout, so `../target/…`
 // resolves correctly under either base.
 import { engineImports } from './engine-imports.js';
-import { adoptEngine } from './foreign-mem.js';
+import { adoptEngine, registerForeign, releaseForeign } from './foreign-mem.js';
 import { engineMemory } from './engine-mem.js';
+import { jsCapServicer } from './coop-driver.js';
 const WASM = new URL('../target/wasm32-unknown-unknown/release/temen_browser.wasm', import.meta.url);
 const STACK = 1 << 20;
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
@@ -85,9 +86,15 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
 //   `onOutput(stdout, stderr)` (`Uint8Array`s) gets the run's output as its threads write it, in the
 //   order its buffers hold it, as the coop driver's does;
 //   `caps` (names) ⇒ with `onramp`, the host-answered caps the page answers (#1414 5b-2): a call to
-//   one comes to `onCapPark({ id, index, args })`, which resolves to the call's result (a Number or
+//   one comes to `onCapPark({ id, index, op, args })`, which resolves to the call's result (a Number or
 //   BigInt) while the run's other tasks go on, or to `null` to stop the run, as the pump's driver's
 //   does;
+//   `onCap(slot, op, args, mem)` ⇒ with `onramp`, the JS capabilities the page staged for the run
+//   (`temen_onramp_stage_js_cap`, #2579), answered inside each call as the pump's driver answers
+//   them: the calling task's Worker sends the call here and waits inside it, holding the run's
+//   shared host as every capability call does, so the run's other capability calls wait meanwhile.
+//   `mem` is the calling task's window, a detached child's included. `onCap` reaches the engine
+//   only through `mem`, since the Worker that waits holds the run's host;
 //   `stdinLater` ⇒ with `onramp`, the page feeds stdin as the run goes, through `feed(bytes)` and
 //   `end()` on the run this returns: a read of empty stdin waits for more until `end()`. `onIdle()`
 //   is called each time no task can run until the page acts, by answering or feeding.
@@ -102,8 +109,8 @@ export function makeRunner({ module, memory, ex }) {
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 
   // `ctl` gets what the run's caller feeds it with while it goes (`stdinLater`).
-  const runOn = async (guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, io = false, onramp = false, stdin = null, env = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, onOutput = null, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [], caps = [], onCapPark = null, stdinLater = false, onIdle = null } = {}, ctl) => {
-    if ((caps.length || stdinLater) && !onramp) throw new Error('`caps` and `stdinLater` need the on-ramp powerbox (`onramp`)');
+  const runOn = async (guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, io = false, onramp = false, stdin = null, env = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, onOutput = null, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [], caps = [], onCapPark = null, onCap = null, stdinLater = false, onIdle = null } = {}, ctl) => {
+    if ((caps.length || stdinLater || onCap) && !onramp) throw new Error('`caps`, `onCap` and `stdinLater` need the on-ramp powerbox (`onramp`)');
     // A stop asked for a run before this one is withdrawn before this one starts, and what the page
     // left for an earlier run is dropped.
     ex.temen_x2_stop(0);
@@ -211,6 +218,21 @@ export function makeRunner({ module, memory, ex }) {
     let started = 0, childMems = 0;
     // The run's output as its Workers post it, handed on in `seq` order (see `stream_chunk`).
     const output = onOutput && outputInOrder(onOutput);
+    // #2579: `onCap` over the calling task's window. A detached child's window is its own memory,
+    // which the page addresses only once it has registered it under the id the child's Workers name
+    // it by. Ids are each minting Worker's own, so two children's may meet: the page holds one
+    // registration per id, the last caller's (`held`: id → its Worker), and lets them all go after.
+    const jsCap = onCap && jsCapServicer(ex, memory, onCap);
+    const held = new Map();
+    const jsCall = (w, cfg, m) => {
+      if (finished || !jsCap) return -38n; // -ENOSYS: no servicer, or the run is over
+      if (cfg.x2Mem && held.get(cfg.x2MemId) !== w) {
+        if (held.has(cfg.x2MemId)) releaseForeign(cfg.x2MemId);
+        registerForeign(cfg.x2Mem, ex.temen_detached_header_bytes(), cfg.x2MemId);
+        held.set(cfg.x2MemId, w);
+      }
+      return jsCap(m.slot, m.op, m.argsPtr, m.nArgs, m.mem);
+    };
     let tornDown = false;
     try {
       const { value = null, exit = null } = await new Promise((resolve, reject) => {
@@ -254,12 +276,25 @@ export function makeRunner({ module, memory, ex }) {
               startWorker({ role: 'x2thread', start: m.start, stackTop: m.stackTop, tlsBase: m.tlsBase, x2Mem: m.x2Mem, x2MemId: m.x2MemId });
             } else if (m.kind === 'out') {
               if (output) output.chunk(m.fd, m.seq, m.bytes);
+            } else if (m.kind === 'jscap') {
+              // #2579: a JS capability call, which its thread waits inside: answered in its
+              // Worker's cell (worker.js's `js_cap_call`), at once, and always, even with -EIO.
+              let answer = -5n;
+              try {
+                answer = BigInt(jsCall(w, cfg, m));
+              } catch (e) {
+                console.error('JS capability call:', e);
+              }
+              new BigInt64Array(memory.buffer, m.cell + 8, 1)[0] = answer;
+              const flag = new Int32Array(memory.buffer, m.cell, 1);
+              Atomics.store(flag, 0, 1);
+              Atomics.notify(flag, 0);
             } else if (m.kind === 'cap') {
               // #1414 5b-2: a call to a declared host-answered cap, which the page answers when it
               // can while the run goes on. An answer of `null` stops the run, and so does one that
               // is not an integer, with its error.
               Promise.resolve()
-                .then(() => (onCapPark ? onCapPark({ id: m.id, index: m.index, args: m.args }) : null))
+                .then(() => (onCapPark ? onCapPark({ id: m.id, index: m.index, op: m.op, args: m.args }) : null))
                 .then((value) => {
                   if (value === null || value === undefined) return stop();
                   const answer = BigInt(value);
@@ -294,6 +329,7 @@ export function makeRunner({ module, memory, ex }) {
       if (unlisten) unlisten();
       if (root) root.terminate();
       if (tornDown) for (const w of threads) w.terminate();
+      for (const id of held.keys()) releaseForeign(id);
     }
   };
   // The run, which resolves as above, with `feed(bytes)` and `end()` for a run fed later.

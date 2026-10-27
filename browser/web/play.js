@@ -191,8 +191,9 @@ block 0 (vsp: i64, vh: i64) {
     kind: 'jspb',
     editable: true,
     desc: 'Everywhere else on this page a guest’s capabilities are implemented Rust-side. Here the ' +
-      'page defines them: the JavaScript below is itself the powerbox — one function per capability ' +
-      'the guest imports, bound by name when the module is instantiated. The guest logs a line, has the ' +
+      'page adds its own: the JavaScript below is a set of capabilities — one function per capability ' +
+      'the guest imports, joining the run’s powerbox and bound by name when the module is instantiated. ' +
+      'The guest logs a line, has the ' +
       'host uppercase a string inside its own window (proving the host can write back, bounds-checked), ' +
       'and reads the host clock. Edit either pane and Run; give the guest an import the JS doesn’t ' +
       'define and the run is refused before a single guest op executes.',
@@ -4771,10 +4772,9 @@ function parseGuest(c, rec, src) {
 }
 
 // A powerbox defined **in the page** (`web/powerbox.js`): the JS pane is the host. The guest still
-// parses, verifies and runs inside the sandbox; what is new is where its capabilities come from —
-// the page names them, the module's import manifest binds them, and each call is serviced by the JS
-// function of that name. Main-thread and single-vCPU by construction: a JS capability can only be
-// serviced where its function lives, so there are no Workers on this path.
+// parses, verifies and runs inside the sandbox, as an ordinary on-ramp run; what is new is where its
+// capabilities come from — the page names them, the module's import manifest binds them, and each
+// call is serviced by the JS function of that name, here on the main thread where it lives.
 async function runJsPowerbox(c) {
   const rec = runStart(c, { tier: 'interpreter', mode: 'js-powerbox' });
   setState(c, 'running', 'parsing…');

@@ -1994,7 +1994,10 @@ id. Under a recording host (W1) the bytecode drivers tape the delivered value wh
 (`Completions::take_record`); the tree-walker and the JIT tape none, so they offer no parking face
 there and the call declines. The completer is the one way to answer: `deliver_cap` is gone, and the
 browser's `temen_coop_deliver_cap` and the DAP's `provideCap` answer through the request's
-completer.
+completer. A declared cap's request (`CapRequest`, #2579) carries the op the call dispatched with: a
+flat `call.sym` import binds at op 0, with the guest's own op in its first argument, and a call
+through a handle the guest resolved by name keeps its own. The cap is forkable: a §14 child or fork
+twin it is re-granted to files its calls in the same requests, and they stay `OpParks::OnHost`.
 
 **An answer from inside a host procedure (#2522, 2026-10-21).** A host procedure may answer another
 call: a read that takes an event answers whoever waits on that input. The wake runs on the thread

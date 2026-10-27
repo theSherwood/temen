@@ -1286,7 +1286,7 @@ fn unknown_named_import_fails_closed() {
         Err(e) => e,
     };
     assert!(
-        err.contains("unresolved capability import") && err.contains("frobnicate"),
+        err.contains("no grant satisfies its import `frobnicate`"),
         "error names the bad import: {err}"
     );
 }

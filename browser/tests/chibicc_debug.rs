@@ -2076,7 +2076,8 @@ fn release_host_caps_run(module: &temen_ir::Module, budget: u64) -> (String, Opt
                     core::slice::from_raw_parts(temen_coop_cap_ptr(), temen_coop_cap_len())
                 }
                 .to_vec();
-                let (id, name, args) = (words[0] as u64, names[words[1] as usize], &words[2..]);
+                // `[id, cap index, op, args…]`
+                let (id, name, args) = (words[0] as u64, names[words[1] as usize], &words[3..]);
                 let mut read = |addr: u64, len: usize| {
                     let n = temen_coop_read(addr, len);
                     // SAFETY: as above, until the next read.
