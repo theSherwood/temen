@@ -1,8 +1,9 @@
 //! #2306 — the process's descriptor pool: each descriptor a guest causes holds one of the pool's
 //! while it is open, and one the pool has no room for is refused with `-EMFILE` before the host asks
 //! the OS for it, never a panic. Covered: a guest's region mint, on the tree-walker and on the JIT;
-//! a host-directory open; and an `FS_MAP_REGION`. The test lowers the soft limit first, so the pool
-//! is small on any host. Its own binary: the pool and the limit are the process's.
+//! the directory a host-directory grant holds, and an open under it; and an `FS_MAP_REGION`. The
+//! test lowers the soft limit first, so the pool is small on any host. Its own binary: the pool and
+//! the limit are the process's.
 #![cfg(unix)]
 
 use core::ffi::c_void;
@@ -93,7 +94,8 @@ fn a_descriptor_the_pool_cannot_hold_is_refused_with_emfile() {
         assert_eq!(mint(jit), EMFILE, "a guest's mint is refused (JIT: {jit})");
     }
 
-    // The host-directory grant: an open takes one, so a region over the file has none left.
+    // The host-directory grant: its first path op opens its root, which takes one, and an open takes
+    // one more, so a region over the file has none left.
     let mut host = Host::new();
     let fs_h = temen_run::fs::host_fs_mmap(dir.clone()).install(&mut host, 0);
     let mut win = vec![0u8; 4096];
@@ -106,8 +108,14 @@ fn a_descriptor_the_pool_cannot_hold_is_refused_with_emfile() {
     let open = [0i64, 4, O_READ | O_WRITE, 0];
     assert_eq!(call(FS_OPEN, &open), EMFILE, "an open is refused");
     held.pop();
+    assert_eq!(
+        call(FS_OPEN, &open),
+        EMFILE,
+        "the descriptor handed back is the root's"
+    );
+    held.pop();
     let fd = call(FS_OPEN, &open);
-    assert!(fd >= 0, "the descriptor handed back is the open's: {fd}");
+    assert!(fd >= 0, "the next one handed back is the open's: {fd}");
     assert_eq!(
         call(FS_MAP_REGION, &[fd, 0, 4096]),
         EMFILE,

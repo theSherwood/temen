@@ -46,6 +46,11 @@ temen-jit.workspace = true
 temen-peval.workspace = true
 # The generic IR→IR optimizer (OPT.md): CFG cleanup of the residual before re-verify/encode.
 temen-opt.workspace = true
+# #2643: `host_fs` resolves each guest path beneath its root with cap-std, the resolver Wasmtime's
+# WASI preopens use. It refuses a symlink that leads out of the root, and resolves a component at a
+# time from a handle, so a link the host makes in the tree mid-op can't redirect it (on Windows,
+# `fs/win.rs` takes the last step of five ops on handles too).
+cap-std = "4"
 
 [dev-dependencies]
 # #1236: the Forth session freeze/thaw tests serialize the kernel's durable domain through the §12
@@ -66,9 +71,17 @@ libc = "0.2"
 # pages — the same software-page-map model as the unix `mprotect` path, only the syscalls differ.
 # `GetSystemInfo` supplies the host page size. §13 SharedRegion (issue #1) adds `MapViewOfFile3` +
 # `CreateFileMappingW` shared views: `Win32_System_Threading` for `GetCurrentProcess`, and
-# `Win32_Security` gates `CreateFileMappingW` (its `SECURITY_ATTRIBUTES` parameter).
+# `Win32_Security` gates `CreateFileMappingW` (its `SECURITY_ATTRIBUTES` parameter). #2643: `host_fs`
+# makes, removes, renames and lists on handles (`fs/win.rs`): `NtCreateFile` and
+# `NtSetInformationFile` (`Wdk_*`, `Win32_System_IO`, `Win32_System_Kernel`), and
+# `SetFileInformationByHandle` and `GetFileInformationByHandleEx` (`Win32_Storage_FileSystem`).
 windows-sys = { version = "0.59", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Kernel",
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
