@@ -594,7 +594,10 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
   powerbox when the embedder stages them (with child images and a budget beside them), so they are
   not run-once: a cooperative session answers them inside each call (`onCap`), a §14 child it
   re-grants one to calls it with its own window, a Worker that runs an engine of its own serves them,
-  and on executor 2 the calling task's Worker sends each call to the page and waits inside it. An
+  and on executor 2 the calling task's Worker sends each call to the page and waits inside it. #2645:
+  executor 2 can instead serve them in each Worker from a module the run names (`capModule`), with no
+  trip to the page, and the capabilities are granted unlocked, so a call that waits holds back no
+  other task's host call. An
   import nothing grants refuses the run on every open (one binder, IMPORTS.md §2.1). Open: the seam
   is browser-only, and a JS capability returns exactly one `i64`.
 

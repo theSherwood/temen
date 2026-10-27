@@ -6419,7 +6419,7 @@ mod tests {
     fn sync(h: &mut ProcHandler) -> &mut HostProc {
         match h {
             ProcHandler::Sync(f) => f,
-            ProcHandler::Offloadable(_) => panic!("posix mints a synchronous handler"),
+            _ => panic!("posix mints a synchronous handler"),
         }
     }
 
