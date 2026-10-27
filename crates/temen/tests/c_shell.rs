@@ -1137,6 +1137,15 @@ fn stage0_shell_hash_comments() {
     assert_eq!(j, i, "jit: comment handling matches interp");
 }
 
+/// A committed fixture's bytes: `m` verified, raised into dominance form (#2454) as every producer's
+/// output is, verified again, and encoded.
+fn fixture_bytes(mut m: temen_ir::Module, name: &str) -> Vec<u8> {
+    verify_module(&m).unwrap_or_else(|e| panic!("verify {name}: {e:?}"));
+    m.raise();
+    verify_module(&m).unwrap_or_else(|e| panic!("verify {name}, raised: {e:?}"));
+    temen_encode::encode_module(&m)
+}
+
 /// **Browser fixture generator** (run explicitly). Compiles the real shell (`shim + ring +
 /// shell_main`), resolves its libc/personality imports by name (the same `link_shim` the differential
 /// uses), verifies, and encodes it to `browser/tests/fixtures/shell.temen` — the exact module bytes the
@@ -1162,8 +1171,7 @@ fn gen_browser_shell_fixture() {
     let ir = c_to_ir_with(&src, &["--data-page", "65536"]);
     let raw = parse_module_raw(&ir).expect("parse shell IR");
     let m = temen_ir::resolve_imports_with(&raw, link_shim).expect("resolve shell imports");
-    verify_module(&m).expect("verify shell");
-    let bytes = temen_encode::encode_module(&m);
+    let bytes = fixture_bytes(m, "shell");
     let dir = repo_root().join("browser/tests/fixtures");
     std::fs::create_dir_all(&dir).expect("create fixtures dir");
     let out = dir.join("shell.temen");
@@ -1182,14 +1190,13 @@ fn gen_browser_shell_fixture() {
         &["--data-page", "65536", "-D", "TEMEN_STAGE_LOG2=19"],
     );
     let rraw = parse_module_raw(&runner_ir).expect("parse stage runner IR");
-    verify_module(&rraw).expect("verify stage runner");
     assert_eq!(
         rraw.memory.map(|mm| mm.size_log2),
         Some(19),
         "the 64 KiB-page __stage runner must declare memory 19 (its ring layout's window); \
          drift maps its rings past the window"
     );
-    let rbytes = temen_encode::encode_module(&rraw);
+    let rbytes = fixture_bytes(rraw, "stage runner");
     let rout = dir.join("stage_runner.temen");
     std::fs::write(&rout, &rbytes).expect("write stage_runner.temen");
     eprintln!("wrote {} ({} bytes)", rout.display(), rbytes.len());
@@ -1202,8 +1209,7 @@ fn gen_browser_shell_fixture() {
     for (name, source) in [("primes", PRIMES_MAIN), ("upper", UPPER_MAIN)] {
         let cir = c_to_ir_child_with(source, &["--data-page", "65536"]);
         let craw = parse_module_raw(&cir).unwrap_or_else(|e| panic!("parse {name} IR: {e:?}"));
-        verify_module(&craw).unwrap_or_else(|e| panic!("verify {name}: {e:?}"));
-        let cbytes = temen_encode::encode_module(&craw);
+        let cbytes = fixture_bytes(craw, name);
         let cout = dir.join(format!("{name}.temen"));
         std::fs::write(&cout, &cbytes).unwrap_or_else(|e| panic!("write {name}.temen: {e:?}"));
         eprintln!("wrote {} ({} bytes)", cout.display(), cbytes.len());
@@ -1328,8 +1334,7 @@ fn gen_browser_bash_coreutils() {
         };
         let cir = c_to_ir_child_with(&full, &["--data-page", "65536"]);
         let craw = parse_module_raw(&cir).unwrap_or_else(|e| panic!("parse {name} IR: {e:?}"));
-        verify_module(&craw).unwrap_or_else(|e| panic!("verify {name}: {e:?}"));
-        let cbytes = temen_encode::encode_module(&craw);
+        let cbytes = fixture_bytes(craw, name);
         let cout = dir.join(format!("bin_{name}.temen"));
         std::fs::write(&cout, &cbytes).unwrap_or_else(|e| panic!("write bin_{name}.temen: {e:?}"));
         eprintln!("wrote {} ({} bytes)", cout.display(), cbytes.len());

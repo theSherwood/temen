@@ -30,8 +30,8 @@ use temen_durable::{
     transform_module_assume_confined,
 };
 use temen_interp::{
-    run_capture_reserved_with_host, CapState, FreezeRule, Host, ParkSite, SignalSource, StreamRole,
-    Value,
+    run_capture_reserved_with_host, CapState, FreezeRule, Host, HostProcGrant, ParkSite,
+    ProcHandler, SignalSource, StreamRole, Value,
 };
 use temen_ir::{Memory, Module, SpawnRec};
 use temen_jit::JitOutcome;
@@ -801,13 +801,13 @@ block 0 (vsp: i64, varg: i64) {
         |h| {
             h.set_signal_source(stopper.clone(), Default::default());
             let s = stopper.clone();
-            let stop = h.grant_host_proc(
-                Box::new(move |_op, _args, _mem, _minter| {
+            let stop = h.grant_host_proc(HostProcGrant::new(
+                ProcHandler::Sync(Box::new(move |_op, _args, _mem, _minter| {
                     s.set(true);
                     Ok(vec![0])
-                }),
+                })),
                 CapState::Stateless,
-            );
+            ));
             let out = h.grant_stream(StreamRole::Out);
             vec![Value::I32(stop), Value::I32(out)]
         },

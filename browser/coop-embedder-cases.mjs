@@ -315,6 +315,41 @@ export 0 func "_start" 0
 `;
 export const JS_CAPS_CHILD_VALUE = 67006n;
 
+// #1414 5d — a root on the pump that spawns its `kid` export detached, joins it and returns its 7.
+// Run on the page's engine, it leaves the page a memory of its own: the child's window, which the page
+// keeps as a spare once the child is gone.
+const PUMP_KID_ROOT = `memory 17
+data ro 40960 "budget"
+data ro 40976 "kid"
+export 0 func "kid" 1
+func (i32) -> (i64) {
+block 0 (vinst: i32) {
+  vbp = i64.const 40960
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  vkp = i64.const 40976
+  vkl = i64.const 3
+  vk = self.resolve vkp vkl
+  vrec = i64.const 34816
+  vw0 = i64.const -4294967296
+  i64.store vrec vw0
+  i32.store vrec vk offset=8
+  i32.store vrec vb offset=12
+  vw6 = i64.const 4294967295
+  i64.store vrec vw6 offset=48
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vrec)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
+  return vj
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v7 = i64.const 7
+  return v7
+  }
+}
+`;
+
 // #2645 — a thread's JS call that waits for another thread's host calls: thread B writes a byte to
 // stdout, then counts it at 40960, until thread A is done (the word at 40968); A waits until B has
 // counted one, then calls `js.waitFor` (slot 2) on the counter. A call that held the domain's host
@@ -707,6 +742,14 @@ export async function runX2Cases({ par, eng }) {
   // #2579: JS capabilities answered inside each call, each task's Worker waiting inside it while the
   // page answers: the root's (interpreted, and run whole as a leaf), a thread's, and a detached
   // child's over a memory of its own.
+  // #1414 5d: the page-answered child's call below is answered while the page holds a memory it
+  // minted itself, a pump child's spare, under the first id the page gave out. The page registers the
+  // executor-2 child's memory beside it, which works only because every agent of one engine memory
+  // takes its ids from the engine: a Worker numbering its own would have given the child that same
+  // first id.
+  const nested = parsed(PUMP_KID_ROOT), np = put(nested);
+  results.pumpKid = String(ex.temen_run_nested(np, nested.length));
+  ex.temen_dealloc(np, nested.length);
   // #2645: the same, answered by the capabilities' module in each calling task's own Worker, and a
   // thread's call that waits for another thread's host calls, which go on while it waits.
   const caps3 = ['js.upper', 'js.add', 'js.waitFor'];

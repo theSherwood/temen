@@ -586,11 +586,13 @@ node browser-play-editor-test.mjs
 ```
 
 A Node harness that instantiates the cdylib directly must then supply the shared `env.memory`
-(`engineImports(memory)`) and read linear memory from *it*, not from `exports.memory` — see
-`browser-pg-libc-test.mjs`, which handles either build. `engineImports` (`web/engine-imports.js`) is
-the one import object every instantiation of the engine uses — the page's, each Worker's and the
-harnesses' (#2579): each `temen_host` seam reaches a `globalThis` hook its host may install, and a
-host whose seam does more (the executor-2 Worker's thread platform) passes its own.
+(`instantiateEngine(module, memory)`) and read linear memory from *it*, not from `exports.memory` —
+see `browser-pg-libc-test.mjs`, which handles either build. `instantiateEngine`
+(`web/engine-imports.js`) is how every host instantiates the engine — the page, each Worker and the
+harnesses: one import object (#2579), in which each `temen_host` seam reaches a `globalThis` hook its
+host may install, and a host whose seam does more (the executor-2 Worker's thread platform) passes
+its own. It adopts the instance too (#1414 5d), so a detached child's window, a memory of its own,
+is reachable from it; a Worker sets its stack and TLS first, in `init`.
 
 ## A powerbox defined in JavaScript (JS capabilities, #1419, #2579)
 
@@ -662,7 +664,7 @@ Where each face runs:
     an engine lock, and a window read that finds the page map changing spins (`Mem::space_read` on
     the threads build).
 
-  Either way a JS capability is an **unlocked** host procedure (`Host::grant_host_proc_unlocked`,
+  Either way a JS capability is an **unlocked** host procedure (`ProcHandler::Unlocked`,
   #2645): its call runs with its domain's host let go, so a call that waits holds back no other
   task's host call.
 - **A Worker that runs an engine of its own** on the cooperative driver serves JS capabilities as

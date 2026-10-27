@@ -21,7 +21,7 @@
 //! — the check is only ever as strong as the seeded shapes, which is exactly what #1515's remaining
 //! decisions widen.
 
-use temen_interp::{cap_id, powerbox_grant, Host, ImportRefusal};
+use temen_interp::{cap_id, powerbox_grant, Host, HostProcGrant, ImportRefusal, ProcHandler};
 use temen_ir::{FuncType, Import, ImportMode, ImportShape, PowerboxHandles, TypeEntry, ValType};
 
 fn sig(params: Vec<ValType>, results: Vec<ValType>) -> FuncType {
@@ -251,10 +251,10 @@ fn host_proc_seam_overrides_the_table() {
         shape: ImportShape::Func(0),
         mode: ImportMode::Required,
     }];
-    let h = host.grant_host_proc(
-        Box::new(|_op, _args, _mem, _minter| Ok(vec![0i64])),
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(|_op, _args, _mem, _minter| Ok(vec![0i64]))),
         temen_interp::CapState::Stateless,
-    );
+    ));
 
     let seams = [("vm_fs", h)];
     let bound = host.bind_powerbox_manifest(&imports, &types, &powerbox_grant(&granted, &seams));

@@ -268,10 +268,22 @@ fn project_whole_print_chunk_from_entry() {
 
     // The divergent edge: an OP_CALL/OP_TAILCALL handler calls `luaD_precall` (cut, so its result is
     // dynamic) and branches on "was the callee a Lua function?"; the Lua-function edge re-enters the
-    // dispatch loop (block 1) with a dynamic new frame and diverges. For a C-function call (`print`)
-    // that edge is dead. Mark every `precall`-block → dispatch(block 1) edge a cold deopt edge.
+    // function's top (`goto startfunc`) with a dynamic new frame and diverges. For a C-function call
+    // (`print`) that edge is dead. Mark every such edge out of a `precall` block a cold deopt edge.
     let precall = byname(&m, "luaD_precall").expect("luaD_precall");
-    let dispatch = 1u32; // luaV_execute's main br_table dispatch (the loop header)
+    // `goto startfunc`: the arm that re-enters the top of luaV_execute, the block its entry branches
+    // to, directly or through a block that only passes the new frame on. Found by shape, not index:
+    // the translator numbers blocks in reverse postorder (#2454).
+    let f = &m.funcs[luav as usize];
+    let Terminator::Br { target: top, .. } = f.blocks[0].term else {
+        panic!("luaV_execute's entry falls into startfunc");
+    };
+    let reenters = |t: u32| {
+        let b = &f.blocks[t as usize];
+        t == top
+            || (b.insts.is_empty()
+                && matches!(b.term, Terminator::Br { target, .. } if target == top))
+    };
     let mut deopt_edges: Vec<(u32, u32, u32)> = Vec::new();
     for (bi, b) in m.funcs[luav as usize].blocks.iter().enumerate() {
         let calls_precall = b
@@ -285,10 +297,10 @@ fn project_whole_print_chunk_from_entry() {
             then_blk, else_blk, ..
         } = b.term
         {
-            if then_blk == dispatch {
+            if reenters(then_blk) {
                 deopt_edges.push((luav, bi as u32, then_blk));
             }
-            if else_blk == dispatch {
+            if reenters(else_blk) {
                 deopt_edges.push((luav, bi as u32, else_blk));
             }
         }

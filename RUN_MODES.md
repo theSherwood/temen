@@ -15,7 +15,7 @@ Every cell comes from **runs**: each feature's probe on each configuration that 
 
 On each executor a cell uses the runner that adds its properties and the fewest others. A cell is ✅ when every run gives the oracle's answer, 🚧 when any run is a known gap, ⛔ when every run declines by design, 🔶 for any other mix, and ❔ when no runner covers it. Each pair of properties appears once, in the earlier property's row.
 
-**102 of 192 cells audited.** Every 🚧 cell cites the issue tracking its gap.
+**124 of 192 cells audited.** Every 🚧 cell cites the issue tracking its gap.
 
 ## Legend
 
@@ -70,34 +70,36 @@ The property rows are the columns' properties again.
 - **tree-walk interpreter, frozen and thawed** — run_capture_reserved_with_host_layout over an instrumented module: frozen at its first safepoint, serialized by the §12 codec, restored into a fresh powerbox and thawed
 - **bytecode, one thread, frozen and thawed** — bytecode::compile_and_run_capture_reserved_with_host, frozen and thawed the same way
 - **Cranelift JIT, frozen and thawed** — temen_run::jit_cap_run over a durable host, frozen and thawed the same way
+- **bytecode, one thread, re-entered per frame** — bytecode::Reactor, the engine under the browser's reactors: the entry called as two frames over one window and one powerbox, each run to its end, and held to the tree-walker's capture entry called the same way
+- **bytecode, one thread, held by the embedder, re-entered per frame** — bytecode::Reactor::coop_call, each frame a CoopRun the embedder holds
 
 ## Features
 
 | a program that… | tree-walk interpreter | bytecode, one thread | bytecode, thread per task | Cranelift JIT | under a debugger | frozen and thawed | held by the embedder | from a warm snapshot | re-entered per frame | in the browser | with the wasm-JIT |
 |----|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|
-| spawns threads | ✅ | ✅ | ✅ | 🔶 | ✅ | 🚧 | ✅ | ❔ | ❔ | ❔ | ❔ |
-| runs fibers | ✅ | ✅ | ✅ | 🔶 | ✅ | 🔶 | ✅ | ❔ | ❔ | ❔ | ❔ |
-| spawns a child domain (§14) | ✅ | ✅ | ✅ | 🔶 | 🚧 | 🚧 | ✅ | ❔ | ❔ | ❔ | ❔ |
-| forks itself (clone_caller) | ✅ | ✅ | ✅ | 🚧 | 🚧 | 🚧 | ✅ | ❔ | ❔ | ❔ | ❔ |
-| execs another image (exec_module) | ✅ | ✅ | ✅ | 🚧 | 🚧 | 🚧 | ✅ | ❔ | ❔ | ❔ | ❔ |
-| makes a call the embedder answers | ✅ | ✅ | ✅ | ✅ | 🚧 | 🚧 | ✅ | ❔ | ❔ | ❔ | ❔ |
-| makes a call a pool thread answers | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ |
-| reads input that arrives later | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ |
-| is stopped and continued (job control) | ✅ | ✅ | ✅ | 🚧 | 🚧 | 🚧 | ✅ | ❔ | ❔ | ❔ | ❔ |
-| grows its window | ✅ | ✅ | ✅ | ✅ | ✅ | 🚧 | ✅ | ❔ | ❔ | ❔ | ❔ |
-| maps a shared region (§13) | ✅ | ✅ | ✅ | 🔶 | ✅ | 🔶 | ✅ | ❔ | ❔ | ❔ | ❔ |
-| compiles code at runtime (§22) | ✅ | ✅ | ✅ | ✅ | 🚧 | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ |
-| serves calls on its offer | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ |
+| spawns threads | ✅ | ✅ | ✅ | 🔶 | ✅ | 🚧 | ✅ | ❔ | ✅ | ❔ | ❔ |
+| runs fibers | ✅ | ✅ | ✅ | 🔶 | ✅ | 🔶 | ✅ | ❔ | ✅ | ❔ | ❔ |
+| spawns a child domain (§14) | ✅ | ✅ | ✅ | 🔶 | 🚧 | 🚧 | ✅ | ❔ | ✅ | ❔ | ❔ |
+| forks itself (clone_caller) | ✅ | ✅ | ✅ | 🚧 | 🚧 | 🚧 | ✅ | ❔ | ✅ | ❔ | ❔ |
+| execs another image (exec_module) | ✅ | ✅ | ✅ | 🚧 | 🚧 | 🚧 | ✅ | ❔ | 🚧 | ❔ | ❔ |
+| makes a call the embedder answers | ✅ | ✅ | ✅ | ✅ | 🚧 | 🚧 | ✅ | ❔ | ✅ | ❔ | ❔ |
+| makes a call a pool thread answers | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❔ | ✅ | ❔ | ❔ |
+| reads input that arrives later | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❔ | ✅ | ❔ | ❔ |
+| is stopped and continued (job control) | ✅ | ✅ | ✅ | 🚧 | 🚧 | 🚧 | ✅ | ❔ | ✅ | ❔ | ❔ |
+| grows its window | ✅ | ✅ | ✅ | ✅ | ✅ | 🚧 | ✅ | ❔ | ✅ | ❔ | ❔ |
+| maps a shared region (§13) | ✅ | ✅ | ✅ | 🔶 | ✅ | 🔶 | ✅ | ❔ | ✅ | ❔ | ❔ |
+| compiles code at runtime (§22) | ✅ | ✅ | ✅ | ✅ | 🚧 | ✅ | ✅ | ❔ | 🚧 | ❔ | ❔ |
+| serves calls on its offer | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❔ | ✅ | ❔ | ❔ |
 
 ## Properties
 
 | a run… | tree-walk interpreter | bytecode, one thread | bytecode, thread per task | Cranelift JIT | under a debugger | frozen and thawed | held by the embedder | from a warm snapshot | re-entered per frame | in the browser | with the wasm-JIT |
 |----|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|:----:|
-| under a debugger | 🚧 | 🚧 | ⛔ | ⛔ | · | ❔ | 🚧 | ❔ | ❔ | ❔ | ❔ |
-| frozen and thawed | 🚧 | 🚧 | 🚧 | 🚧 | · | · | ❔ | ❔ | ❔ | ❔ | ❔ |
-| held by the embedder | ❔ | ✅ | ✅ | ❔ | · | · | · | ❔ | ❔ | ❔ | ❔ |
+| under a debugger | 🚧 | 🚧 | ⛔ | ⛔ | · | 🚧 | 🚧 | ❔ | ❔ | ❔ | ❔ |
+| frozen and thawed | 🚧 | 🚧 | 🚧 | 🚧 | · | · | 🚧 | ❔ | ❔ | ❔ | ❔ |
+| held by the embedder | ⛔ | ✅ | ✅ | 🚧 | · | · | · | ❔ | 🚧 | ❔ | ❔ |
 | from a warm snapshot | ❔ | ❔ | ❔ | ❔ | · | · | · | · | ❔ | ❔ | ❔ |
-| re-entered per frame | ❔ | ❔ | ❔ | ❔ | · | · | · | · | · | ❔ | ❔ |
+| re-entered per frame | 🚧 | 🚧 | 🚧 | 🚧 | · | · | · | · | · | ❔ | ❔ |
 | in the browser | ❔ | ❔ | ❔ | ❔ | · | · | · | · | · | · | ❔ |
 | with the wasm-JIT | ❔ | ❔ | ❔ | ❔ | · | · | · | · | · | · | · |
 
@@ -131,6 +133,7 @@ The property rows are the columns' properties again.
 - *under a debugger* 🚧 — bytecode, one thread: the bytecode debug scheduler declines every process seam: fork, exec, spawn, wait and pipes (#2554)
 - *frozen and thawed* 🚧 — tree-walk interpreter; bytecode, one thread: a durable domain refuses exec_module with -EINVAL (#1696)
 - *frozen and thawed* 🚧 — Cranelift JIT: declines exec_module, the op C's execve replaces its image with (#2555); the POSIX personality's OP_EXECVE runs there (FORK.md §9.4)
+- *re-entered per frame* 🚧 — bytecode, one thread: the frame that execs drops the reactor's window, so the next frame traps Malformed (#2660)
 
 **makes a call the embedder answers**
 - *under a debugger* 🚧 — tree-walk interpreter: the tree-walk Inspector traps CapFault on a host-answered call (#2560)
@@ -151,6 +154,7 @@ The property rows are the columns' properties again.
 
 **compiles code at runtime (§22)**
 - *under a debugger* 🚧 — tree-walk interpreter: the tree-walk Inspector traps IndirectCallType at the installed unit's call.dyn (#2560)
+- *re-entered per frame* 🚧 — bytecode, one thread: Reactor::call gives a frame no room for a §22 install, so the unit's call.dyn traps IndirectCallType; coop_call sizes it by the Jit grant (#2661)
 
 **under a debugger**
 - *tree-walk interpreter* 🚧 — spawns a child domain (§14): the tree-walk Inspector runs one vCPU over the powerbox, or every vCPU over none, so a child's join blocks (#2560)
@@ -163,9 +167,9 @@ The property rows are the columns' properties again.
 - *bytecode, one thread* 🚧 — is stopped and continued (job control): the bytecode debug scheduler runs a stopped process on: its pick never asks whether the process is stopped (#2615)
 - *bytecode, thread per task* ⛔ — the debug scheduler owns the schedule, every task on one thread, which is what makes a replay see the same interleaving (DEBUGGING.md); executor 2 runs its tasks at once
 - *Cranelift JIT* ⛔ — the interpreter is the debug engine and the JIT the production engine, differential-checked against it (DEBUGGING.md)
-- *held by the embedder* 🚧 — tree-walk interpreter: the tree-walk Inspector hands its embedder no call to answer and no read to feed (#2560)
-- *held by the embedder* 🚧 — forks itself (clone_caller) on bytecode, one thread; execs another image (exec_module) on bytecode, one thread: the bytecode debug scheduler declines every process seam: fork, exec, spawn, wait and pipes (#2554)
-- *held by the embedder* 🚧 — is stopped and continued (job control) on bytecode, one thread: the bytecode debug scheduler runs a stopped process on: its pick never asks whether the process is stopped (#2615)
+- *frozen and thawed* 🚧 — tree-walk interpreter; bytecode, one thread: a debugger runs no durable run: its checkpoints refuse a durable host, and nothing freezes a run under it (#2658)
+- *held by the embedder* 🚧 — forks itself (clone_caller); execs another image (exec_module): the bytecode debug scheduler declines every process seam: fork, exec, spawn, wait and pipes (#2554)
+- *held by the embedder* 🚧 — is stopped and continued (job control): the bytecode debug scheduler runs a stopped process on: its pick never asks whether the process is stopped (#2615)
 
 **frozen and thawed**
 - *tree-walk interpreter* 🚧 — execs another image (exec_module): a durable domain refuses exec_module with -EINVAL (#1696)
@@ -181,4 +185,17 @@ The property rows are the columns' properties again.
 - *Cranelift JIT* 🚧 — makes a call the embedder answers: a durable run declines a host-answered call with CapFault before its embedder sees it: no caller in a durable run parks on a call (#2504)
 - *Cranelift JIT* 🚧 — is stopped and continued (job control): serves no job control, so a stopped process runs on (#1826)
 - *Cranelift JIT* 🔶 — maps a shared region (§13): for a region over an OS shared-memory object (temen_run::new_shared_region), which the JIT maps by its descriptor; a software-only one (Host::grant_shared_region) has none, so its map answers -EINVAL there
+- *held by the embedder* 🚧 — bytecode, one thread: a held run cannot be frozen: CoopRun takes no freeze (#2659)
+
+**held by the embedder**
+- *tree-walk interpreter* ⛔ — the tree-walker runs every run to its end: the oracle's only run an embedder holds is its debugger's, the Inspector
+- *Cranelift JIT* 🚧 — an embedder holds and resumes a run only on the bytecode tier; whether a Cranelift run can be held, and at what cost, is #2561
+- *re-entered per frame* 🚧 — execs another image (exec_module): the frame that execs drops the reactor's window, so the next frame traps Malformed (#2660)
+
+**re-entered per frame**
+- *tree-walk interpreter* 🚧 — only the pump's reactor runs an embedder's powerbox: the tree-walker's and the JIT's are temen_run::Session, which runs a single-threaded on-ramp module, and executor 2 has none (#2662)
+- *bytecode, one thread* 🚧 — execs another image (exec_module): the frame that execs drops the reactor's window, so the next frame traps Malformed (#2660)
+- *bytecode, one thread* 🚧 — compiles code at runtime (§22): Reactor::call gives a frame no room for a §22 install, so the unit's call.dyn traps IndirectCallType; coop_call sizes it by the Jit grant (#2661)
+- *bytecode, thread per task* 🚧 — only the pump's reactor runs an embedder's powerbox: the tree-walker's and the JIT's are temen_run::Session, which runs a single-threaded on-ramp module, and executor 2 has none (#2662)
+- *Cranelift JIT* 🚧 — only the pump's reactor runs an embedder's powerbox: the tree-walker's and the JIT's are temen_run::Session, which runs a single-threaded on-ramp module, and executor 2 has none (#2662)
 

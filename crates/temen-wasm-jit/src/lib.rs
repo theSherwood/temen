@@ -75,8 +75,8 @@
 use temen_ir::bounds::{in_window, ub_at, ub_of, UB_TOP};
 use temen_ir::cap_id;
 use temen_ir::{
-    AtomicRmwOp, BinOp, Block, CmpOp, ConvOp, Func, FuncType, Inst, IntTy, IntUnOp, LoadOp, Module,
-    StoreOp, Terminator, TypeEntry, ValIdx, ValType, DEFAULT_RESERVED_LOG2,
+    AtomicRmwOp, BinOp, Block, Captured, CmpOp, ConvOp, Func, FuncType, Inst, IntTy, IntUnOp,
+    LoadOp, Module, StoreOp, Terminator, TypeEntry, ValIdx, ValType, DEFAULT_RESERVED_LOG2,
 };
 
 /// Resolve an interned call type index (#922) to its [`FuncType`] — the index a call variant
@@ -867,22 +867,36 @@ fn vextadd_sub(shape: VShape, signed: bool) -> Option<u32> {
 
 // ---- per-function value typing (mirrors the verifier's block-scoped numbering) -------------------
 
-/// The types of one block's value list: params first, then each instruction's results in order.
-/// Only the v1 subset is typed; anything else is `Unsupported` (fail-closed — the module was
-/// verified, so no `unwrap` here can be reached by a malformed operand index).
-fn block_value_types(m: &Module, b: &Block) -> Result<Vec<ValType>, Error> {
-    block_value_types_with(m, b, |_| {})
+/// The types of each block's value list ([`block_value_types`]), block by block.
+fn func_value_types(m: &Module, f: &Func) -> Result<Vec<Vec<ValType>>, Error> {
+    let mut types = Vec::with_capacity(f.blocks.len());
+    for b in &f.blocks {
+        let tys = block_value_types(m, b, &types, |_| {})?;
+        types.push(tys);
+    }
+    Ok(types)
 }
 
-/// [`block_value_types`], telling `defined` after each instruction how many values the block has
-/// so far: instruction `j` defines the values from the previous count (the block's params, for the
-/// first) up to this one.
-fn block_value_types_with(
+/// The types of one block's value list: params first, then captures (#2454), each typed as the
+/// value it names in `earlier`, the types of the blocks before this one, then each instruction's
+/// results in order. `defined` hears after each instruction how many values the block has so far:
+/// instruction `j` defines the values from the previous count (the block's inputs, for the first)
+/// up to this one. Only the v1 subset is typed; anything else is `Unsupported` (fail-closed — the
+/// module was verified, so no `unwrap` here can be reached by a malformed operand index).
+fn block_value_types(
     m: &Module,
     b: &Block,
+    earlier: &[Vec<ValType>],
     mut defined: impl FnMut(usize),
 ) -> Result<Vec<ValType>, Error> {
     let mut tys: Vec<ValType> = b.params.clone();
+    for &(a, v) in &b.captures {
+        let t = earlier
+            .get(a as usize)
+            .and_then(|tys| tys.get(v as usize))
+            .ok_or(Error::Unsupported("capture"))?;
+        tys.push(*t);
+    }
     for inst in &b.insts {
         match inst {
             Inst::ConstI32(_) => tys.push(ValType::I32),
@@ -993,18 +1007,25 @@ fn block_value_types_with(
 /// take theirs while its results still hold theirs, so a result never shares a slot with an operand
 /// of its own instruction: a lowering may write a result before it has read every operand. The
 /// terminator's operands are live to the end of the block, and every param holds a slot from its
-/// start, since each edge into the block writes them all.
+/// start, since each edge into the block writes them all. The block's captures, and the values
+/// `pinned` names (those a later block captures, #2454), take no slot: each lives in a local outside
+/// the pools ([`lay_out_locals`]), and keeps [`PINNED`] here.
 fn block_slots(
     m: &Module,
     b: &Block,
+    earlier: &[Vec<ValType>],
+    pinned: impl Iterator<Item = usize>,
     scratch: &mut SlotScratch,
 ) -> Result<(Vec<ValType>, Vec<u32>), Error> {
     let SlotScratch { ends, free } = scratch;
     ends.clear();
-    let tys = block_value_types_with(m, b, |n| ends.push(n))?;
+    let tys = block_value_types(m, b, earlier, |n| ends.push(n))?;
     free.iter_mut().for_each(Vec::clear);
     let mut next = [0u32; NTYPES];
     let mut slot = vec![u32::MAX; tys.len()];
+    for v in (b.params.len()..b.inputs()).chain(pinned) {
+        slot[v] = PINNED;
+    }
     let mut take = |v: usize, slot: &mut [u32], free: &mut [Vec<u32>; NTYPES]| {
         if slot[v] == u32::MAX {
             let t = val_type_slot(tys[v]);
@@ -1017,12 +1038,12 @@ fn block_slots(
     b.term
         .for_each_operand(&mut |v| take(*v as usize, &mut slot, free));
     for (j, inst) in b.insts.iter().enumerate().rev() {
-        let defs = j.checked_sub(1).map_or(b.params.len(), |p| ends[p])..ends[j];
+        let defs = j.checked_sub(1).map_or(b.inputs(), |p| ends[p])..ends[j];
         inst.for_each_operand(&mut |v| take(*v as usize, &mut slot, free));
         for r in defs.clone() {
             take(r, &mut slot, free); // a result nothing reads still writes its local
         }
-        for r in defs {
+        for r in defs.filter(|&r| slot[r] != PINNED) {
             free[val_type_slot(tys[r])].push(slot[r]);
         }
     }
@@ -1031,6 +1052,9 @@ fn block_slots(
     }
     Ok((tys, slot))
 }
+
+/// The slot of a value in no pool ([`block_slots`]).
+const PINNED: u32 = u32::MAX - 1;
 
 /// [`block_slots`]' buffers, reused across a function's blocks: where each instruction's results
 /// end, and each pool's free slots.
@@ -1054,6 +1078,166 @@ fn val_type_slot(t: ValType) -> usize {
         ValType::Ref => 5,
         ValType::Cap => 6,
     }
+}
+
+/// Each pool's type, by [`val_type_slot`].
+const POOL_TYPES: [ValType; NTYPES] = [
+    ValType::I32,
+    ValType::I64,
+    ValType::F32,
+    ValType::F64,
+    ValType::V128,
+    ValType::Ref,
+    ValType::Cap,
+];
+
+/// A function's values laid out in wasm locals ([`lay_out_locals`]).
+struct Locals {
+    /// Each block's value types ([`block_value_types`]).
+    types: Vec<Vec<ValType>>,
+    /// `local_of[block][value]`: the local holding each value; empty for a block not laid out.
+    local_of: Vec<Vec<u32>>,
+    /// The locals' types, in declaration order.
+    decl: Vec<ValType>,
+    /// What the function's captures name (#2454).
+    captured: Captured,
+    /// The local, and type, of each captured definition in [`Captured::def`].
+    pinned: Vec<(u32, ValType)>,
+}
+
+/// Lay out the values of `f`'s blocks in wasm locals from index `first` on, type by type: the type's
+/// pool ([`emit_func`], [`block_slots`]), then a local for each captured definition of that type.
+/// Only the blocks `laid_out` admits (one group's, in a split function) get locals and count
+/// towards a pool.
+///
+/// A captured value (#2454) is read in the blocks that capture it, after its own block has run, so
+/// it cannot share a pool slot, which the next block reuses. It has a local of its own: written
+/// where it is defined (by its instruction, or for a param by every edge into its block) and read
+/// wherever a block captures it. That is the value the capture names: a block's ancestors stay as
+/// they last ran until control goes back above them, and an ancestor that runs again redefines the
+/// value before any block below it can read it.
+fn lay_out_locals(
+    m: &Module,
+    f: &Func,
+    first: u32,
+    laid_out: impl Fn(usize) -> bool,
+) -> Result<Locals, Error> {
+    let captured = f.captured();
+    let mut scratch = SlotScratch::default();
+    let mut types: Vec<Vec<ValType>> = Vec::with_capacity(f.blocks.len());
+    let mut local_of: Vec<Vec<u32>> = Vec::with_capacity(f.blocks.len());
+    for (k, b) in f.blocks.iter().enumerate() {
+        let pinned = captured.def[captured.defined_in(k)].iter();
+        let (tys, slots) =
+            block_slots(m, b, &types, pinned.map(|&(_, v)| v as usize), &mut scratch)?;
+        types.push(tys);
+        local_of.push(slots);
+    }
+    // Pool size per type = the most slots of that type any laid-out block uses.
+    let mut pool = [0u32; NTYPES];
+    for (k, (tys, slots)) in types.iter().zip(&local_of).enumerate() {
+        if !laid_out(k) {
+            continue;
+        }
+        for (t, &s) in tys.iter().zip(slots) {
+            if s != PINNED {
+                let i = val_type_slot(*t);
+                pool[i] = pool[i].max(s + 1);
+            }
+        }
+    }
+    let def_ty: Vec<ValType> = captured
+        .def
+        .iter()
+        .map(|&(a, v)| types[a as usize][v as usize])
+        .collect();
+    let (color, npinned) = color_captured(&captured, &def_ty, f.blocks.len());
+    // Lay the types out one after another, each its pool then its captured definitions' locals;
+    // `base[t]` is the first local of type `t`.
+    let mut base = [0u32; NTYPES];
+    let mut decl = Vec::new();
+    for (i, &t) in POOL_TYPES.iter().enumerate() {
+        base[i] = first + decl.len() as u32;
+        decl.resize(decl.len() + (pool[i] + npinned[i]) as usize, t);
+    }
+    let pinned: Vec<(u32, ValType)> = def_ty
+        .iter()
+        .zip(&color)
+        .map(|(&t, &c)| {
+            let i = val_type_slot(t);
+            (base[i] + pool[i] + c, t)
+        })
+        .collect();
+    for (k, slots) in local_of.iter_mut().enumerate() {
+        if !laid_out(k) {
+            slots.clear();
+            continue;
+        }
+        let params = f.blocks[k].params.len();
+        for (v, s) in slots.iter_mut().enumerate() {
+            *s = if *s != PINNED {
+                base[val_type_slot(types[k][v])] + *s
+            } else {
+                let d = captured.def_of(k, params, v);
+                pinned[d.expect("a value in no pool is captured")].0
+            };
+        }
+    }
+    Ok(Locals {
+        types,
+        local_of,
+        decl,
+        captured,
+        pinned,
+    })
+}
+
+/// Share locals among a function's captured definitions (#2454): two that are never live at once
+/// can hold one local. Returns each definition's colour, its index among its type's locals, and how
+/// many each type needs.
+///
+/// One local each would be correct, but a large function captures thousands of values, and V8's
+/// optimizing compiler slows with every local a loop assigns: QuickJS's interpreter loop compiled
+/// eleven times slower. The definitions are SSA values, so of two live at once one is defined where
+/// the other is live: colouring them in dominance order, each with the lowest colour of its type
+/// that none live at its definition holds, needs only as many colours as are ever live at once.
+/// Live where a definition is: those live at its block's entry ([`Captured::live_in`]), and every
+/// one its block defines before it (the dead ones among them only cost a colour). A definition live
+/// at a block's entry comes from a block above it, with a smaller index, so the definitions' order
+/// (by block and value) is a dominance order.
+fn color_captured(
+    captured: &Captured,
+    def_ty: &[ValType],
+    nblocks: usize,
+) -> (Vec<u32>, [u32; NTYPES]) {
+    let mut color = vec![u32::MAX; captured.def.len()];
+    let mut ncolors = [0u32; NTYPES];
+    let mut busy: Vec<bool> = Vec::new();
+    let mut live: Vec<usize> = Vec::new();
+    for a in 0..nblocks {
+        let here = captured.defined_in(a);
+        if here.is_empty() {
+            continue;
+        }
+        live.clear();
+        live.extend(captured.live_in(a));
+        for d in here.clone() {
+            let t = val_type_slot(def_ty[d]);
+            busy.clear();
+            busy.resize(ncolors[t] as usize + 1, false);
+            for e in live.iter().copied().chain(here.start..d) {
+                if val_type_slot(def_ty[e]) == t {
+                    debug_assert!(color[e] != u32::MAX, "a live definition is coloured first");
+                    if let Some(b) = busy.get_mut(color[e] as usize) {
+                        *b = true;
+                    }
+                }
+            }
+            color[d] = busy.iter().position(|&b| !b).expect("one colour is free") as u32;
+            ncolors[t] = ncolors[t].max(color[d] + 1);
+        }
+    }
+    (color, ncolors)
 }
 
 // ---- tiering analysis (slice 3): which functions the JIT tier emits vs. leaves to the interp ------
@@ -1101,16 +1285,12 @@ fn term_in_subset(t: &Terminator) -> bool {
 }
 
 /// Whether every instruction, terminator, and value type of `f` is in the emitter's integer compute
-/// subset — reusing [`block_value_types`] (which errors on any out-of-subset instruction) as the
+/// subset — reusing [`func_value_types`] (which errors on any out-of-subset instruction) as the
 /// single source of truth, plus a type check (all values i32/i64) and the terminator check.
 fn func_in_subset(m: &Module, f: &Func) -> bool {
-    // A block that captures a dominating block's value (#2454) is outside it: this tier types and
-    // pools each block's values on their own, so such a function runs on the interpreter tier.
-    f.blocks.iter().all(|b| {
-        b.captures.is_empty()
-            && block_value_types(m, b).is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
-            && term_in_subset(&b.term)
-    })
+    func_value_types(m, f)
+        .is_ok_and(|types| types.iter().flatten().all(|t| valtype_byte(*t).is_ok()))
+        && f.blocks.iter().all(|b| term_in_subset(&b.term))
 }
 
 /// Whether `f` invokes a **shrinking or aliasing** window-remapping op — one that can make a
@@ -3359,7 +3539,8 @@ fn emit_module(
     let mut next_group_widx = first_widx + emitted.len() as u32 + extra_bodies.len() as u32;
     for &fi in emitted {
         if let Some(bg) = fn_split_plan(fi) {
-            if let Some(mut fs) = plan_fn_split(fi, &m.funcs[fi], bg, next_group_widx) {
+            let f = split_form(m, &m.funcs[fi])?;
+            if let Some(mut fs) = plan_fn_split(fi, f, bg, next_group_widx) {
                 next_group_widx += fs.group_blocks.len() as u32;
                 let mut gres = Vec::with_capacity(m.funcs[fi].results.len());
                 for r in &m.funcs[fi].results {
@@ -3385,7 +3566,7 @@ fn emit_module(
         if let Some(fs) = fn_splits.iter().find(|s| s.fi == fi) {
             // Split function: its normal slot is the entry wrapper; the K groups are appended below.
             bodies.push(emit_split_wrapper(
-                &m.funcs[fi],
+                &fs.func,
                 fs.entry_ordinal[0],
                 fs.group_widx[fs.block_group[0]],
             )?);
@@ -3418,7 +3599,7 @@ fn emit_module(
         for g in 0..fs.group_blocks.len() {
             bodies.push(emit_split_group(
                 m,
-                &m.funcs[fs.fi],
+                &fs.func,
                 &split,
                 &fs.group_blocks[g],
                 &fs.entry_blocks[g],
@@ -4239,6 +4420,10 @@ struct FnCtx {
     /// Whether the module's memory is shared, so another agent can touch the bytes an atomic does
     /// ([`emit_atomic`]).
     shared: bool,
+    /// What the function's captures name (#2454), and the local and type of each captured
+    /// definition ([`lay_out_locals`]): a call in spill mode pushes the ones it leaves live.
+    captured: Captured,
+    pinned: Vec<(u32, ValType)>,
 }
 
 impl FnCtx {
@@ -4281,66 +4466,27 @@ fn emit_func(
 
     // Allocate locals with a **per-type pool reused across blocks**, then $next/$ea/$fuel/$atomic.
     //
-    // Values are block-scoped (SSA numbering resets per block; all cross-block dataflow goes through
-    // block params), and control is in exactly one block at a time — so when block B executes,
-    // every other block's value locals are dead. Their slots can therefore be shared: a type needs
-    // only `max over blocks of (that type's value count in the block)` locals, not the sum. This is
-    // what keeps a huge function (QuickJS's ~1800-block `JS_CallInternal`) under wasm engines'
-    // per-function local cap — the sum would be hundreds of thousands, the max is a few thousand.
+    // Values are block-scoped (SSA numbering resets per block; cross-block dataflow goes through
+    // block params, or through captures, #2454), and control is in exactly one block at a time — so
+    // when block B executes, every other block's pooled locals are dead. (A captured value lives past
+    // its block, so it has a local of its own instead, [`lay_out_locals`].) The pooled slots can
+    // therefore be shared: a type needs only `max over blocks of (that type's value count in the
+    // block)` locals, not the sum. This is what keeps a huge function (QuickJS's ~1800-block
+    // `JS_CallInternal`) under wasm engines' per-function local cap — the sum would be hundreds of
+    // thousands, the max is a few thousand.
     //
     // Sharing is safe because the only cross-block local write, `emit_edge`, pushes **all** branch
     // args onto the operand stack before storing any target param, so a target param slot that aliases
     // a source value slot still reads the old value first (the same property that already made a
     // param-permuting self-branch safe). Within a block, values whose live ranges are disjoint share
     // a slot too ([`block_slots`]), so a type needs only as many locals as it has values live at once.
-    let mut scratch = SlotScratch::default();
-    let (per_block_types, per_block_slots): (Vec<Vec<ValType>>, Vec<Vec<u32>>) = f
-        .blocks
-        .iter()
-        .map(|b| block_slots(m, b, &mut scratch))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .unzip();
-    // Pool size per type = the most slots of that type any single block uses.
-    let mut pool: [u32; NTYPES] = [0; NTYPES];
-    for (tys, slots) in per_block_types.iter().zip(&per_block_slots) {
-        for (t, s) in tys.iter().zip(slots) {
-            let i = val_type_slot(*t);
-            pool[i] = pool[i].max(s + 1);
-        }
-    }
-    // Lay the pools out contiguously; `base[t]` is the first local index (past the wasm params) of
-    // type `t`'s pool.
-    let mut base = [0u32; NTYPES];
-    let mut acc = 0u32;
-    for i in 0..NTYPES {
-        base[i] = acc;
-        acc += pool[i];
-    }
-    let mut local_types: Vec<ValType> = Vec::with_capacity(acc as usize + 4);
-    for (i, &t) in [
-        ValType::I32,
-        ValType::I64,
-        ValType::F32,
-        ValType::F64,
-        ValType::V128,
-        ValType::Ref,
-    ]
-    .iter()
-    .enumerate()
-    {
-        for _ in 0..pool[i] {
-            local_types.push(t);
-        }
-    }
-    // Map each block's values to pool slots: value `v` of type `t` gets `base[t] + its slot`. Reused
-    // across blocks — block B's slots overlap block A's.
-    let mut local_of = per_block_slots;
-    for (tys, slots) in per_block_types.iter().zip(&mut local_of) {
-        for (t, s) in tys.iter().zip(slots.iter_mut()) {
-            *s += n_params + base[val_type_slot(*t)];
-        }
-    }
+    let Locals {
+        types: per_block_types,
+        local_of,
+        decl: mut local_types,
+        captured,
+        pinned,
+    } = lay_out_locals(m, f, n_params, |_| true)?;
     let next_l = n_params + local_types.len() as u32;
     local_types.push(ValType::I32);
     let ea_l = n_params + local_types.len() as u32;
@@ -4383,6 +4529,8 @@ fn emit_func(
         null_guard,
         structure: None,
         shared,
+        captured,
+        pinned,
     };
 
     let mut code = Vec::new();
@@ -4519,57 +4667,18 @@ fn emit_split_group(
 ) -> Result<Vec<u8>, Error> {
     let n_params = 3u32; // win, env, entry
     let nblocks = f.blocks.len();
-    let mut scratch = SlotScratch::default();
-    let (per_block_types, per_block_slots): (Vec<Vec<ValType>>, Vec<Vec<u32>>) = f
-        .blocks
-        .iter()
-        .map(|b| block_slots(m, b, &mut scratch))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .unzip();
     // Pool per type = the most slots any of THIS group's blocks uses (a group is smaller than the
-    // whole func).
-    let mut pool: [u32; NTYPES] = [0; NTYPES];
-    for &gb in group_blocks {
-        for (t, s) in per_block_types[gb].iter().zip(&per_block_slots[gb]) {
-            let i = val_type_slot(*t);
-            pool[i] = pool[i].max(s + 1);
-        }
-    }
-    let mut base = [0u32; NTYPES];
-    let mut acc = 0u32;
-    for i in 0..NTYPES {
-        base[i] = acc;
-        acc += pool[i];
-    }
-    let mut local_types: Vec<ValType> = Vec::with_capacity(acc as usize + 6);
-    for (i, &t) in [
-        ValType::I32,
-        ValType::I64,
-        ValType::F32,
-        ValType::F64,
-        ValType::V128,
-        ValType::Ref,
-    ]
-    .iter()
-    .enumerate()
-    {
-        for _ in 0..pool[i] {
-            local_types.push(t);
-        }
-    }
-    // local_of is indexed by GLOBAL block index; only this group's blocks get slot maps (others empty,
-    // never referenced here — inter-group edges read the *source* group's locals, all in-group).
-    let mut local_of = per_block_slots;
-    for (bi, slots) in local_of.iter_mut().enumerate() {
-        if split.block_group[bi] != split.block_group[group_blocks[0]] {
-            slots.clear();
-            continue;
-        }
-        for (t, s) in per_block_types[bi].iter().zip(slots.iter_mut()) {
-            *s += n_params + base[val_type_slot(*t)];
-        }
-    }
+    // whole func). `local_of` is indexed by GLOBAL block index; only this group's blocks get slot maps
+    // (others empty, never referenced here — inter-group edges read the *source* group's locals, all
+    // in-group).
+    let group = split.block_group[group_blocks[0]];
+    let Locals {
+        types: per_block_types,
+        local_of,
+        decl: mut local_types,
+        captured,
+        pinned,
+    } = lay_out_locals(m, f, n_params, |b| split.block_group[b] == group)?;
     let next_l = n_params + local_types.len() as u32;
     local_types.push(ValType::I32);
     let ea_l = n_params + local_types.len() as u32;
@@ -4612,6 +4721,8 @@ fn emit_split_group(
         null_guard,
         structure: None,
         shared,
+        captured,
+        pinned,
     };
 
     let mut code = Vec::new();
@@ -4765,6 +4876,8 @@ fn emit_split_wrapper(f: &Func, entry_ord0: u32, group0_widx: u32) -> Result<Vec
         null_guard: None,
         structure: None,
         shared: false, // the wrapper only marshals params
+        captured: Captured::default(),
+        pinned: Vec::new(),
     };
     let mut code = Vec::new();
     emit_fuel_check(&mut cx, &mut code); // the single function-entry safepoint
@@ -4822,6 +4935,8 @@ fn term_targets(t: &Terminator) -> Vec<u32> {
 struct FnSplit {
     /// Which emitted function this splits.
     fi: usize,
+    /// The function the wrapper and the groups emit: its [`split_form`].
+    func: Func,
     /// Per-block group id.
     block_group: Vec<usize>,
     /// Group id → its blocks (global indices).
@@ -4836,12 +4951,23 @@ struct FnSplit {
     group_type: u32,
 }
 
+/// `f` as a split emits it: in block-local form (#2454). A split function's groups share no locals,
+/// and an edge into another group carries only its target's params (through the env scratch), so a
+/// captured value has to travel as a param.
+fn split_form(m: &Module, f: &Func) -> Result<Func, Error> {
+    let mut f = f.clone();
+    if f.blocks.iter().any(|b| !b.captures.is_empty()) {
+        f.localize(&func_value_types(m, &f)?);
+    }
+    Ok(f)
+}
+
 /// Validate a per-block group assignment and derive the [`FnSplit`], or return `None` to **decline**
 /// (the caller then emits the function whole — always correct, just no tier-up win for it). Declines on:
 /// fewer than 2 groups, a length mismatch, an out-of-range group id, an empty group, or an inter-group
 /// entry block whose params exceed the env scratch (the split ABI marshals them there). `group_base` is
 /// the wasm index assigned to this function's first group function.
-fn plan_fn_split(fi: usize, f: &Func, block_group: &[usize], group_base: u32) -> Option<FnSplit> {
+fn plan_fn_split(fi: usize, f: Func, block_group: &[usize], group_base: u32) -> Option<FnSplit> {
     let n = f.blocks.len();
     if block_group.len() != n {
         return None;
@@ -4889,6 +5015,7 @@ fn plan_fn_split(fi: usize, f: &Func, block_group: &[usize], group_base: u32) ->
     let group_widx = (0..k).map(|g| group_base + g as u32).collect();
     Some(FnSplit {
         fi,
+        func: f,
         block_group: block_group.to_vec(),
         group_blocks,
         entry_blocks,
@@ -4914,7 +5041,7 @@ pub fn compile_split_fn(
     group_count: usize,
     shared_memory: bool,
 ) -> Result<Vec<u8>, Error> {
-    let f = &m.funcs[fidx];
+    let f = &split_form(m, &m.funcs[fidx])?;
     let a = analyze(m);
     if !a.in_subset.iter().all(|&s| s) {
         return Err(Error::Unsupported(
@@ -6099,8 +6226,8 @@ fn emit_edge(
 
 /// #1627 — `last[v]` is the index of the last instruction of `b` that reads value `v`
 /// (`b.insts.len()` for the terminator; `0` if nothing does). Values are block-scoped (see
-/// [`emit_func`]), so this is all the liveness a call site needs: `v` is live across the call at `j`
-/// iff `last[v] > j`.
+/// [`emit_func`]), so this, with the captured values [`spill_liveness`] adds, is all the liveness a
+/// call site needs: `v` is live across the call at `j` iff `last[v] > j`.
 fn last_uses(b: &Block, n_vals: usize) -> Vec<usize> {
     let mut last = vec![0; n_vals];
     for (j, inst) in b.insts.iter().enumerate() {
@@ -6118,8 +6245,44 @@ fn last_uses(b: &Block, n_vals: usize) -> Vec<usize> {
     last
 }
 
+/// #1627 with captures (#2454) — [`last_uses`] for spill mode, with the captured values counted
+/// too. A value of this block that a later block captures counts as read by the terminator if it is
+/// live where the block exits. The second list is the captured definitions live through the block
+/// that are none of its values (a later block captures them from an ancestor): every call in the
+/// block leaves those live.
+fn spill_liveness(
+    captured: &Captured,
+    k: usize,
+    b: &Block,
+    n_vals: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut last = last_uses(b, n_vals);
+    if captured.def.is_empty() {
+        return (last, Vec::new());
+    }
+    let mut exit: Vec<usize> = term_targets(&b.term)
+        .into_iter()
+        .flat_map(|s| captured.live_in(s as usize))
+        .collect();
+    exit.sort_unstable();
+    exit.dedup();
+    let mut named = Vec::new();
+    for (v, l) in last.iter_mut().enumerate() {
+        if let Some(d) = captured.def_of(k, b.params.len(), v) {
+            if exit.binary_search(&d).is_ok() {
+                *l = b.insts.len();
+            }
+            named.push(d);
+        }
+    }
+    named.sort_unstable();
+    exit.retain(|d| named.binary_search(d).is_err());
+    (last, exit)
+}
+
 /// #1627 — before the call at instruction `j` of block `k`, push every value it leaves live
-/// (defined before it, read after it) to the spill stack as 8-byte words (a `v128` takes two), so a
+/// (defined before it, read after it, by `last`; and the captured definitions live `through` the
+/// block, [`spill_liveness`]) to the spill stack as 8-byte words (a `v128` takes two), so a
 /// `gc.roots` in a bounce beneath this frame scans them (`CoopRun::bounce`'s `spill`). Returns
 /// whether it pushed: a call with nothing live across it pushes nothing and needs no
 /// [`emit_spill_pop`]. Traps [`TRAP_SPILL_OVERFLOW`] rather than write past the region's end.
@@ -6127,25 +6290,30 @@ fn last_uses(b: &Block, n_vals: usize) -> Vec<usize> {
 ///
 /// The addresses come only from the host-written env cell, never from a guest value — the same
 /// footing as the cross-tier scratch — so this is no confinement surface.
+#[allow(clippy::too_many_arguments)]
 fn emit_spill_push(
     cx: &mut FnCtx,
     code: &mut Vec<u8>,
     k: usize,
     tys: &[ValType],
     last: &[usize],
+    through: &[usize],
     j: usize,
     defined: usize,
 ) -> bool {
     let Some(sp) = cx.spill_l else {
         return false;
     };
-    let live: Vec<usize> = (0..defined)
-        .filter(|&v| last[v] > j && !matches!(tys[v], ValType::Ref | ValType::Cap))
+    let live: Vec<(u32, ValType)> = (0..defined)
+        .filter(|&v| last[v] > j)
+        .map(|v| (cx.local_of[k][v], tys[v]))
+        .chain(through.iter().map(|&d| cx.pinned[d]))
+        .filter(|(_, t)| !matches!(t, ValType::Ref | ValType::Cap))
         .collect();
     if live.is_empty() {
         return false;
     }
-    let bytes: u64 = live.iter().map(|&v| slots_of(tys[v]) * 8).sum();
+    let bytes: u64 = live.iter().map(|&(_, t)| slots_of(t) * 8).sum();
     // sp = [env + SP]; trap unless sp + bytes <= [env + END].
     code.push(OP_LOCAL_GET);
     uleb(code, 1); // env
@@ -6170,21 +6338,21 @@ fn emit_spill_push(
     code.push(OP_END);
     cx.depth -= 1;
     let mut off = 0u64;
-    for v in live {
+    for (l, t) in live {
         code.push(OP_LOCAL_GET);
         uleb(code, sp as u64);
         code.push(OP_I32_CONST);
         sleb32(code, off as i32);
         code.push(0x6a); // i32.add
         code.push(OP_LOCAL_GET);
-        uleb(code, cx.local_of[k][v] as u64);
-        if tys[v] == ValType::F32 {
+        uleb(code, l as u64);
+        if t == ValType::F32 {
             code.push(0xbc); // i32.reinterpret_f32: a whole zero-extended word, like an i32
             emit_slot_store(code, ValType::I32);
         } else {
-            emit_slot_store(code, tys[v]);
+            emit_slot_store(code, t);
         }
-        off += slots_of(tys[v]) * 8;
+        off += slots_of(t) * 8;
     }
     // Publish the bumped cursor, so a nested push lands above these words.
     code.push(OP_LOCAL_GET);
@@ -6231,27 +6399,28 @@ fn emit_block_body(
     gc_reach: &[bool],
 ) -> Result<(), Error> {
     let is_xmod = |i: usize| cross_module.get(i).copied().unwrap_or(false);
-    let mut next_val = b.params.len(); // where the next instruction's results land
-                                       // Slice-3 confinement-check elision: a block-local **upper-bound** map over SSA values, in
-                                       // lockstep with the value numbering `next_val` drives (block params carry no bound → `UB_TOP`;
-                                       // bounds do not cross block boundaries). At each memory access, `elide_access` consults the
-                                       // address value's bound via the shared `temen_ir::bounds` proof to decide whether the runtime
-                                       // bounds check is redundant. Kept aligned to `next_val` by construction below — a misalignment
-                                       // could only mis-elide (a trap-parity divergence the differential catches; never an escape,
-                                       // since the `& MASK` clamp is always emitted).
-    let mut ubs: Vec<u64> = vec![UB_TOP; b.params.len()];
+    let mut next_val = b.inputs(); // where the next instruction's results land
+
+    // Slice-3 confinement-check elision: a block-local **upper-bound** map over SSA values, in
+    // lockstep with the value numbering `next_val` drives (block params and captures carry no bound
+    // → `UB_TOP`; bounds do not cross block boundaries). At each memory access, `elide_access`
+    // consults the address value's bound via the shared `temen_ir::bounds` proof to decide whether
+    // the runtime bounds check is redundant. Kept aligned to `next_val` by construction below — a
+    // misalignment could only mis-elide (a trap-parity divergence the differential catches; never an
+    // escape, since the `& MASK` clamp is always emitted).
+    let mut ubs: Vec<u64> = vec![UB_TOP; b.inputs()];
     // #2099: the block's `i64.const` values, numbered as `ubs` is — what makes a bulk op short
     // ([`short_len`]).
-    let mut consts: Vec<Option<i64>> = vec![None; b.params.len()];
+    let mut consts: Vec<Option<i64>> = vec![None; b.inputs()];
     let get = |code: &mut Vec<u8>, cx: &FnCtx, v: temen_ir::ValIdx| {
         code.push(OP_LOCAL_GET);
         uleb(code, cx.local_of[k][v as usize] as u64);
     };
     // #1627 spill mode: where each value is last read, so a call site pushes exactly the live ones.
-    let last_use = if cx.spill_l.is_some() {
-        last_uses(b, value_types.len())
+    let (last_use, through) = if cx.spill_l.is_some() {
+        spill_liveness(&cx.captured, k, b, value_types.len())
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     for (j, inst) in b.insts.iter().enumerate() {
         let val_before = next_val;
@@ -6615,7 +6784,7 @@ fn emit_block_body(
                 let callee = &m.funcs[*func as usize];
                 let n_results = callee.results.len();
                 let spilled = gc_reach.get(*func as usize).copied().unwrap_or(false)
-                    && emit_spill_push(cx, code, k, value_types, &last_use, j, next_val);
+                    && emit_spill_push(cx, code, k, value_types, &last_use, &through, j, next_val);
                 match wasm_of[*func as usize] {
                     // Same-tier: a direct wasm call to the emitted function (win/env threaded).
                     Some(widx) => {
@@ -6740,7 +6909,7 @@ fn emit_block_body(
                 let n_results = ft.results.len();
                 // #1627: any slot may hold a bounce shim into a collector (see `reaches`).
                 let spilled = !gc_reach.is_empty()
-                    && emit_spill_push(cx, code, k, value_types, &last_use, j, next_val);
+                    && emit_spill_push(cx, code, k, value_types, &last_use, &through, j, next_val);
                 code.push(OP_LOCAL_GET);
                 uleb(code, 0); // win
                 code.push(OP_LOCAL_GET);

@@ -14,7 +14,10 @@ use temen_durable::{
     begin_thaw, init_durable_window, transform_module, transform_module_assume_confined,
     write_state, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value, DEFAULT_SHADOW_STRIDE};
+use temen_interp::{
+    run_capture_reserved_with_host, Host, HostProcGrant, ProcHandler, Trap, Value,
+    DEFAULT_SHADOW_STRIDE,
+};
 use temen_ir::{Inst, Memory, Module, Terminator};
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
@@ -1051,8 +1054,8 @@ const SRC_CONSUMED_PARK: &str = "memory 18 shadow 16448 65536\n\
 fn consumed_park_host(freeze: bool) -> (Host, i32) {
     let mut h = Host::new();
     h.set_durable(true);
-    let hf = h.grant_host_proc(
-        Box::new(move |_op, _args, mem, _| {
+    let hf = h.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(move |_op, _args, mem, _| {
             if freeze {
                 if let Some(m) = mem {
                     let word = m
@@ -1064,9 +1067,9 @@ fn consumed_park_host(freeze: bool) -> (Host, i32) {
                 }
             }
             Ok(vec![0])
-        }),
+        })),
         temen_interp::CapState::Stateless,
-    );
+    ));
     (h, hf)
 }
 

@@ -382,11 +382,14 @@ pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
     // Dead-function elimination (OPT.md Phase 3) is the one module-level pass — it drops functions no
     // reachable code can call and renumbers the survivors, so it runs once over the assembled module
     // after the per-function passes (which are order-preserving and never change the call graph).
-    if cfg.dfe {
+    let mut out = if cfg.dfe {
         interproc::dead_func_elim(&optimized)
     } else {
         optimized
-    }
+    };
+    // The passes read block-local form; what they hand back is in dominance form (#2454).
+    out.raise();
+    out
 }
 
 /// Optimize a single function with the full pipeline (see [`optimize_func_with`]).
@@ -2233,7 +2236,14 @@ fn remap_targets(t: &mut Terminator, map: &[u32]) {
 /// 2. canonicalize every function ([`optimize_func_with`] with every optional pass off): fold
 ///    constants, resolve constant branches, prune dead blocks, merge straight-line chains, drop dead
 ///    block parameters, propagate copies and drop dead values;
-/// 3. number every function's blocks in reverse postorder ([`order_blocks`]).
+/// 3. raise every function into dominance form ([`Module::raise`], #2454), which also numbers its
+///    blocks in reverse postorder and drops the ones the entry cannot reach.
+///
+/// Reverse postorder matters to fuel: INVARIANTS #9 charges it per taken back edge, and every engine
+/// reads a back edge off the block indices, as a branch to an equal-or-earlier block. In reverse
+/// postorder that is a loop's back edge. In a producer's own order it is often an ordinary join
+/// placed before the arms that branch to it, as leng places an `if`'s, and every engine then pays a
+/// fuel check there for no loop (#2147: 63% of hexer's checks).
 ///
 /// Step 2 folds no float or vector op ([`OptConfig::floats`]), so a host linker and an in-guest one
 /// (whose temen-opt is built without `libm-floats`) still produce the same module, which the
@@ -2270,7 +2280,7 @@ pub fn optimize_linked(m: &Module) -> Module {
         .debug_info
         .as_ref()
         .and_then(|d| drop_stale_debug(d, &changed));
-    order_blocks(&mut out);
+    out.raise();
     out
 }
 
@@ -2278,81 +2288,6 @@ pub fn optimize_linked(m: &Module) -> Module {
 /// that follows, a limit of 12 runs 1.2% fewer instructions than 6 and 24 no fewer than 12, but at 12
 /// the program is 18% larger and Cranelift compiles it 19% slower.
 pub const LINKED_MAX_CALLEE: usize = 6;
-
-/// Number each function's blocks in **reverse postorder** from the entry, with the blocks the entry
-/// cannot reach last, in their original order. Branch targets and the debug positions that name a
-/// block move with them; nothing else changes.
-///
-/// INVARIANTS #9 charges fuel per taken back edge, and every engine reads a back edge off the block
-/// indices: a branch to an equal-or-earlier block. In reverse postorder that is a loop's back edge. In a producer's own order it is often an ordinary join placed before the
-/// arms that branch to it, as leng places an `if`'s, and every engine then pays a fuel check there
-/// for no loop (#2147: 63% of hexer's checks). Every engine charges the same IR, so all of them pay
-/// less, and stay in step.
-pub fn order_blocks(m: &mut Module) {
-    let maps: Vec<Option<Vec<u32>>> = m.funcs.iter_mut().map(order_func_blocks).collect();
-    if let Some(d) = &mut m.debug_info {
-        let block = |f: u32, b: u32| -> u32 {
-            let map = maps.get(f as usize).and_then(Option::as_ref);
-            map.and_then(|map| map.get(b as usize).copied())
-                .unwrap_or(b)
-        };
-        for l in &mut d.locs {
-            l.block = block(l.func, l.block);
-        }
-        for v in &mut d.vars {
-            let f = v.func;
-            match &mut v.loc {
-                temen_ir::VarLoc::SsaList(list)
-                | temen_ir::VarLoc::WindowVia { base: list, .. } => {
-                    for at in list {
-                        at.block = block(f, at.block);
-                    }
-                }
-                temen_ir::VarLoc::Window { .. }
-                | temen_ir::VarLoc::Ssa { .. }
-                | temen_ir::VarLoc::Fixed { .. }
-                | temen_ir::VarLoc::Tls { .. } => {}
-            }
-        }
-    }
-}
-
-/// [`order_blocks`] for one function. Returns each old block's new index, or `None` when the blocks
-/// are already in that order.
-fn order_func_blocks(f: &mut Func) -> Option<Vec<u32>> {
-    let n = f.blocks.len();
-    let mut order = cfg::Cfg::new(&f.blocks).rpo();
-    let mut placed = vec![false; n];
-    for &b in &order {
-        placed[b as usize] = true;
-    }
-    order.extend((0..n as u32).filter(|&b| !placed[b as usize]));
-    if order.iter().enumerate().all(|(i, &b)| i as u32 == b) {
-        return None;
-    }
-    let mut new_of = vec![0u32; n];
-    for (i, &b) in order.iter().enumerate() {
-        new_of[b as usize] = i as u32;
-    }
-    let mut old: Vec<Option<Block>> = core::mem::take(&mut f.blocks)
-        .into_iter()
-        .map(Some)
-        .collect();
-    f.blocks = order
-        .iter()
-        .map(|&b| {
-            let mut blk = old[b as usize].take().expect("each block is placed once");
-            remap_targets(&mut blk.term, &new_of);
-            // An ancestor dominates its descendants (#2454), so it still comes first.
-            blk.parent = new_of[blk.parent as usize];
-            for (a, _) in &mut blk.captures {
-                *a = new_of[*a as usize];
-            }
-            blk
-        })
-        .collect();
-    Some(new_of)
-}
 
 /// `d` without the positional entries of the functions marked in `stale`, whose code changed, so their
 /// `(block, inst)` locations and variable locations no longer point at what they described. What is

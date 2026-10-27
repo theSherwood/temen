@@ -23,7 +23,7 @@
 use std::process::Command;
 use std::sync::Arc;
 
-use temen_interp::{run_with_host, Host, HostProc, ProcHandler, StreamRole, Value};
+use temen_interp::{run_with_host, Host, HostProc, HostProcGrant, ProcHandler, StreamRole, Value};
 use temen_text::parse_module as parse_module_raw;
 use temen_verify::verify_module;
 
@@ -1453,16 +1453,19 @@ fn a_shell_redirects_a_command_output_to_a_file() {
         std::sync::Arc::new(move |_pid| -> Option<temen_interp::ForkedProc> {
             let (mut inner, state) = factory();
             Some(temen_interp::ForkedProc::shared(
-                Box::new(move |_slot_op, args, mem, minter| {
+                ProcHandler::Sync(Box::new(move |_slot_op, args, mem, minter| {
                     inner(args[0] as u32, &args[1..], mem, minter)
-                }),
+                })),
                 state,
             ))
         })
     };
     let fs_cap = {
         let m = make(0).expect("a shared memfs always mints");
-        host.grant_host_proc_forkable(sync_handler(m.handler), make.clone(), m.state)
+        host.grant_host_proc(
+            HostProcGrant::new(ProcHandler::Sync(sync_handler(m.handler)), m.state)
+                .forkable(make.clone()),
+        )
     };
 
     let mut fuel = 120_000_000u64;
@@ -1561,16 +1564,19 @@ fn a_shell_appends_a_command_output_to_a_file() {
         std::sync::Arc::new(move |_pid| -> Option<temen_interp::ForkedProc> {
             let (mut inner, state) = factory();
             Some(temen_interp::ForkedProc::shared(
-                Box::new(move |_slot_op, args, mem, minter| {
+                ProcHandler::Sync(Box::new(move |_slot_op, args, mem, minter| {
                     inner(args[0] as u32, &args[1..], mem, minter)
-                }),
+                })),
                 state,
             ))
         })
     };
     let fs_cap = {
         let m = make(0).expect("a shared memfs always mints");
-        host.grant_host_proc_forkable(sync_handler(m.handler), make.clone(), m.state)
+        host.grant_host_proc(
+            HostProcGrant::new(ProcHandler::Sync(sync_handler(m.handler)), m.state)
+                .forkable(make.clone()),
+        )
     };
 
     let mut fuel = 120_000_000u64;
@@ -1673,16 +1679,19 @@ fn a_shell_redirects_a_file_into_a_command_stdin() {
         std::sync::Arc::new(move |_pid| -> Option<temen_interp::ForkedProc> {
             let (mut inner, state) = factory();
             Some(temen_interp::ForkedProc::shared(
-                Box::new(move |_slot_op, args, mem, minter| {
+                ProcHandler::Sync(Box::new(move |_slot_op, args, mem, minter| {
                     inner(args[0] as u32, &args[1..], mem, minter)
-                }),
+                })),
                 state,
             ))
         })
     };
     let fs_cap = {
         let m = make(0).expect("a shared memfs always mints");
-        host.grant_host_proc_forkable(sync_handler(m.handler), make.clone(), m.state)
+        host.grant_host_proc(
+            HostProcGrant::new(ProcHandler::Sync(sync_handler(m.handler)), m.state)
+                .forkable(make.clone()),
+        )
     };
 
     let mut fuel = 120_000_000u64;
@@ -1779,16 +1788,19 @@ fn a_shell_redirects_a_command_stderr_to_a_file() {
         std::sync::Arc::new(move |_pid| -> Option<temen_interp::ForkedProc> {
             let (mut inner, state) = factory();
             Some(temen_interp::ForkedProc::shared(
-                Box::new(move |_slot_op, args, mem, minter| {
+                ProcHandler::Sync(Box::new(move |_slot_op, args, mem, minter| {
                     inner(args[0] as u32, &args[1..], mem, minter)
-                }),
+                })),
                 state,
             ))
         })
     };
     let fs_cap = {
         let m = make(0).expect("a shared memfs always mints");
-        host.grant_host_proc_forkable(sync_handler(m.handler), make.clone(), m.state)
+        host.grant_host_proc(
+            HostProcGrant::new(ProcHandler::Sync(sync_handler(m.handler)), m.state)
+                .forkable(make.clone()),
+        )
     };
 
     let mut fuel = 120_000_000u64;
@@ -2154,16 +2166,19 @@ fn a_nested_compiled_c_command_reads_a_file_through_a_granted_fs_cap() {
         std::sync::Arc::new(move |_pid| -> Option<temen_interp::ForkedProc> {
             let (mut inner, state) = factory();
             Some(temen_interp::ForkedProc::shared(
-                Box::new(move |_slot_op, args, mem, minter| {
+                ProcHandler::Sync(Box::new(move |_slot_op, args, mem, minter| {
                     inner(args[0] as u32, &args[1..], mem, minter)
-                }),
+                })),
                 state,
             ))
         })
     };
     let fs_cap = {
         let m = make(0).expect("a shared memfs always mints");
-        host.grant_host_proc_forkable(sync_handler(m.handler), make.clone(), m.state)
+        host.grant_host_proc(
+            HostProcGrant::new(ProcHandler::Sync(sync_handler(m.handler)), m.state)
+                .forkable(make.clone()),
+        )
     };
 
     let mut fuel = 120_000_000u64;
@@ -2564,16 +2579,19 @@ fn a_compiled_c_program_forks_execs_a_real_command_that_reads_a_file_and_waits()
         std::sync::Arc::new(move |_pid| -> Option<temen_interp::ForkedProc> {
             let (mut inner, state) = factory();
             Some(temen_interp::ForkedProc::shared(
-                Box::new(move |_slot_op, args, mem, minter| {
+                ProcHandler::Sync(Box::new(move |_slot_op, args, mem, minter| {
                     inner(args[0] as u32, &args[1..], mem, minter)
-                }),
+                })),
                 state,
             ))
         })
     };
     let fs_cap = {
         let m = make(0).expect("a shared memfs always mints");
-        host.grant_host_proc_forkable(sync_handler(m.handler), make.clone(), m.state)
+        host.grant_host_proc(
+            HostProcGrant::new(ProcHandler::Sync(sync_handler(m.handler)), m.state)
+                .forkable(make.clone()),
+        )
     };
 
     let mut fuel = 120_000_000u64;
@@ -2733,10 +2751,9 @@ fn a_compiled_c_parent_kills_its_forked_child_by_pid() {
     let (mut inner, px_state) = make();
     let px_handler: temen_interp::HostProc =
         Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter));
-    let px_cap = host.grant_host_proc_forkable(
-        px_handler,
-        opshift_fork(temen_posix::cap_fork_factory(&posix)),
-        px_state,
+    let px_cap = host.grant_host_proc(
+        HostProcGrant::new(ProcHandler::Sync(px_handler), px_state)
+            .forkable(opshift_fork(temen_posix::cap_fork_factory(&posix))),
     );
 
     let mut fuel = 120_000_000u64;
@@ -2810,10 +2827,9 @@ fn an_unhandled_sigterm_kills_a_runaway_forked_child_for_real() {
     let (mut inner, px_state) = make();
     let px_handler: temen_interp::HostProc =
         Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter));
-    let px_cap = host.grant_host_proc_forkable(
-        px_handler,
-        opshift_fork(temen_posix::cap_fork_factory(&posix)),
-        px_state,
+    let px_cap = host.grant_host_proc(
+        HostProcGrant::new(ProcHandler::Sync(px_handler), px_state)
+            .forkable(opshift_fork(temen_posix::cap_fork_factory(&posix))),
     );
 
     let mut fuel = 120_000_000u64;
@@ -2886,10 +2902,9 @@ fn a_single_waitpid_call_blocks_until_the_child_exits() {
     let (mut inner, px_state) = make();
     let px_handler: temen_interp::HostProc =
         Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter));
-    let px_cap = host.grant_host_proc_forkable(
-        px_handler,
-        opshift_fork(temen_posix::cap_fork_factory(&posix)),
-        px_state,
+    let px_cap = host.grant_host_proc(
+        HostProcGrant::new(ProcHandler::Sync(px_handler), px_state)
+            .forkable(opshift_fork(temen_posix::cap_fork_factory(&posix))),
     );
 
     let mut fuel = 120_000_000u64;
@@ -2976,10 +2991,9 @@ fn a_ctrl_c_interrupts_a_blocked_personality_waitpid() {
     let (mut inner, px_state) = make();
     let px_handler: temen_interp::HostProc =
         Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter));
-    let px_cap = host.grant_host_proc_forkable(
-        px_handler,
-        opshift_fork(temen_posix::cap_fork_factory(&posix)),
-        px_state,
+    let px_cap = host.grant_host_proc(
+        HostProcGrant::new(ProcHandler::Sync(px_handler), px_state)
+            .forkable(opshift_fork(temen_posix::cap_fork_factory(&posix))),
     );
 
     let done = Arc::new(AtomicBool::new(false));
@@ -3069,10 +3083,9 @@ fn isatty_discriminates_the_proto_terminal_and_getppid_names_the_forking_parent(
     let (mut inner, px_state) = make();
     let px_handler: temen_interp::HostProc =
         Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter));
-    let px_cap = host.grant_host_proc_forkable(
-        px_handler,
-        opshift_fork(temen_posix::cap_fork_factory(&posix)),
-        px_state,
+    let px_cap = host.grant_host_proc(
+        HostProcGrant::new(ProcHandler::Sync(px_handler), px_state)
+            .forkable(opshift_fork(temen_posix::cap_fork_factory(&posix))),
     );
 
     let mut fuel = 120_000_000u64;
@@ -3156,10 +3169,9 @@ fn sa_restart_rides_a_parked_wait_through_a_delivered_signal() {
     let (mut inner, px_state) = make();
     let px_handler: temen_interp::HostProc =
         Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter));
-    let px_cap = host.grant_host_proc_forkable(
-        px_handler,
-        opshift_fork(temen_posix::cap_fork_factory(&posix)),
-        px_state,
+    let px_cap = host.grant_host_proc(
+        HostProcGrant::new(ProcHandler::Sync(px_handler), px_state)
+            .forkable(opshift_fork(temen_posix::cap_fork_factory(&posix))),
     );
 
     let mut fuel = 120_000_000u64;
@@ -3254,10 +3266,9 @@ fn a_terminal_ctrl_c_interrupts_a_forked_parent_blocked_in_wait() {
     let (mut inner, px_state) = make();
     let px_handler: temen_interp::HostProc =
         Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter));
-    let px_cap = host.grant_host_proc_forkable(
-        px_handler,
-        opshift_fork(temen_posix::cap_fork_factory(&posix)),
-        px_state,
+    let px_cap = host.grant_host_proc(
+        HostProcGrant::new(ProcHandler::Sync(px_handler), px_state)
+            .forkable(opshift_fork(temen_posix::cap_fork_factory(&posix))),
     );
 
     // The "terminal": raise SIGINT at the parent (personality pid 1000) until the run returns.
@@ -3399,10 +3410,9 @@ fn a_ctrl_c_at_the_parent_never_sweeps_the_childs_wait_park() {
     let (mut inner, px_state) = make();
     let px_handler: temen_interp::HostProc =
         Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter));
-    let px_cap = host.grant_host_proc_forkable(
-        px_handler,
-        opshift_fork(temen_posix::cap_fork_factory(&posix)),
-        px_state,
+    let px_cap = host.grant_host_proc(
+        HostProcGrant::new(ProcHandler::Sync(px_handler), px_state)
+            .forkable(opshift_fork(temen_posix::cap_fork_factory(&posix))),
     );
 
     let done = Arc::new(AtomicBool::new(false));
@@ -3503,10 +3513,9 @@ fn a_compiled_c_parent_reaps_its_fork_twin_through_posix_waitpid() {
     let (mut inner, px_state) = make();
     let px_handler: temen_interp::HostProc =
         Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter));
-    let px_cap = host.grant_host_proc_forkable(
-        px_handler,
-        opshift_fork(temen_posix::cap_fork_factory(&posix)),
-        px_state,
+    let px_cap = host.grant_host_proc(
+        HostProcGrant::new(ProcHandler::Sync(px_handler), px_state)
+            .forkable(opshift_fork(temen_posix::cap_fork_factory(&posix))),
     );
 
     let mut fuel = 120_000_000u64;
@@ -3607,10 +3616,9 @@ fn a_compiled_c_shell_runs_the_job_control_loop() {
     let (mut inner, px_state) = make();
     let px_handler: temen_interp::HostProc =
         Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter));
-    let px_cap = host.grant_host_proc_forkable(
-        px_handler,
-        opshift_fork(temen_posix::cap_fork_factory(&posix)),
-        px_state,
+    let px_cap = host.grant_host_proc(
+        HostProcGrant::new(ProcHandler::Sync(px_handler), px_state)
+            .forkable(opshift_fork(temen_posix::cap_fork_factory(&posix))),
     );
 
     let mut fuel = 120_000_000u64;
@@ -3727,10 +3735,9 @@ fn ctrl_z_stops_a_forked_child_and_fg_resumes_it() {
     let (mut inner, px_state) = make();
     let px_handler: temen_interp::HostProc =
         Box::new(move |_slot_op, args, mem, minter| inner(args[0] as u32, &args[1..], mem, minter));
-    let px_cap = host.grant_host_proc_forkable(
-        px_handler,
-        opshift_fork(temen_posix::cap_fork_factory(&posix)),
-        px_state,
+    let px_cap = host.grant_host_proc(
+        HostProcGrant::new(ProcHandler::Sync(px_handler), px_state)
+            .forkable(opshift_fork(temen_posix::cap_fork_factory(&posix))),
     );
 
     let mut fuel = 220_000_000u64;

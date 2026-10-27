@@ -21,7 +21,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { engineImports } from './engine-imports.mjs';
+import { instantiateEngine } from './engine-imports.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WASM = join(HERE, 'target/wasm32-unknown-unknown/release/temen_browser.wasm');
@@ -60,7 +60,7 @@ const mod = await WebAssembly.compile(readFileSync(WASM));
 const shared = WebAssembly.Module.imports(mod).some((i) => i.kind === 'memory')
   ? new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true }) // this harness's own 1 GiB (the engine's ceiling is `web/engine-mem.js`'s)
   : null;
-const { exports: ex } = await WebAssembly.instantiate(mod, engineImports(shared));
+const ex = await instantiateEngine(mod, shared);
 const memory = shared || ex.memory;
 const u8 = () => new Uint8Array(memory.buffer);
 const enc = new TextEncoder(), dec = new TextDecoder();

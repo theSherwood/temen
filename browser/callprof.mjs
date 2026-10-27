@@ -6,10 +6,10 @@
 // distribution shape don't need heavy iteration. Run from browser/:
 //   node callprof.mjs [path/to/temen_browser.wasm]  (default: the wasm32 build path)
 import { readFileSync, writeFileSync } from 'node:fs';
-import { engineImports } from './engine-imports.mjs';
+import { instantiateEngine } from './engine-imports.mjs';
 
 const wasmPath = process.argv[2] || 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
-const eng = (await WebAssembly.instantiate(await WebAssembly.compile(readFileSync(wasmPath)), engineImports())).exports;
+const eng = await instantiateEngine(await WebAssembly.compile(readFileSync(wasmPath)));
 if (!eng.temen_callprof_reset) { console.error('cdylib built without --features callprof — rebuild with it'); process.exit(2); }
 const memory = eng.memory;
 const u8 = () => new Uint8Array(memory.buffer);

@@ -6588,8 +6588,8 @@ fn define_funcs(
                     let mut ctx = cranelift_codegen::Context::new();
                     ctx.func.signature.call_conv = isa.default_call_conv();
                     lower(&mut ctx, i)?;
-                    let code =
-                        compile_verified(isa, &mut ctx, layout).map_err(JitError::Backend)?;
+                    let code = compile_verified(isa, &mut ctx, validate::Entry::Guest(layout))
+                        .map_err(JitError::Backend)?;
                     let relocs = code
                         .buffer
                         .relocs()
@@ -6621,7 +6621,13 @@ fn define_funcs(
                 #[cfg(test)]
                 record_emitted(module, code.code_buffer(), &relocs);
                 #[cfg(all(test, target_arch = "x86_64"))]
-                validate::capture_code(code.code_buffer(), &code.bb_starts, &code.bb_edges, layout);
+                validate::capture_code(
+                    code.code_buffer(),
+                    &code.bb_starts,
+                    &code.bb_edges,
+                    validate::patches(relocs.iter().map(|r| (r.offset, r.kind))),
+                    layout,
+                );
                 let kept = keep
                     .as_mut()
                     .is_some_and(|k| k.push(module, ids, align, code.code_buffer(), &relocs));
@@ -6661,7 +6667,7 @@ fn define_funcs(
 fn compile_verified(
     isa: &dyn cranelift_codegen::isa::TargetIsa,
     ctx: &mut cranelift_codegen::Context,
-    layout: Option<validate::WindowLayout>,
+    entry: validate::Entry,
 ) -> Result<CompiledCode, String> {
     let mut ctrl = cranelift_codegen::control::ControlPlane::default();
     ctx.verify(isa)
@@ -6676,10 +6682,18 @@ fn compile_verified(
     let code = code.apply_params(&ctx.func.params);
     // #2481 — shadow-mode machine-code validation: check the emitted bytes against the policy and
     // log any disagreement, but never reject. `enabled()` is false on a production compile, so this
-    // is inert there; `jit_isa` only records `bb_starts`/`bb_edges` when it is true. `layout` is the
-    // module's §4 window geometry, which the window-access policy re-proves against (#2603).
+    // is inert there; `jit_isa` only records `bb_starts`/`bb_edges` when it is true. `entry` says what
+    // is known of the function's entry: a guest function's window geometry, which the window-access
+    // policy re-proves against, or a trampoline's host ABI (#2603).
     if validate::enabled() {
-        validate::shadow_check(code.code_buffer(), &code.bb_starts, &code.bb_edges, layout);
+        let patches = validate::patches(code.buffer.relocs().iter().map(|r| (r.offset, r.kind)));
+        validate::shadow_check(
+            code.code_buffer(),
+            &code.bb_starts,
+            &code.bb_edges,
+            &patches,
+            entry,
+        );
     }
     Ok(code)
 }
@@ -6692,9 +6706,10 @@ fn define_verified(
     id: FuncId,
     ctx: &mut cranelift_codegen::Context,
 ) -> Result<CompiledCode, JitError> {
-    // Trampolines (cap thunks, fuel refill) carry no guest window, so the policy has no window
-    // access to re-prove — the layout hint is `None`.
-    let code = compile_verified(module.isa(), ctx, None).map_err(JitError::Backend)?;
+    // Trampolines (cap thunks, fuel refill) are called under the host's ABI, not a guest function's
+    // entry contract, so they get the validator's decode and control-flow layers only (#2603 PR 3).
+    let code =
+        compile_verified(module.isa(), ctx, validate::Entry::Host).map_err(JitError::Backend)?;
     let relocs: Vec<ModuleReloc> = code
         .buffer
         .relocs()
@@ -7167,7 +7182,7 @@ mod compile_verified_tests {
     fn malformed_clif_fails_the_compile_before_cranelifts_passes() {
         let isa = jit_isa().unwrap();
         let mut ctx = cranelift_codegen::Context::for_function(malformed(&*isa));
-        let err = compile_verified(&*isa, &mut ctx, None).unwrap_err();
+        let err = compile_verified(&*isa, &mut ctx, validate::Entry::Host).unwrap_err();
         assert!(
             err.starts_with("CLIF verifier, on the lowered CLIF"),
             "{err}"
@@ -7215,7 +7230,7 @@ mod compile_verified_tests {
     fn compile_verified_emits_what_cranelifts_compile_emits() {
         let isa = jit_isa().unwrap();
         let mut ours = cranelift_codegen::Context::for_function(summing(&*isa));
-        let code = compile_verified(&*isa, &mut ours, None).unwrap();
+        let code = compile_verified(&*isa, &mut ours, validate::Entry::Host).unwrap();
         let mut theirs = cranelift_codegen::Context::for_function(summing(&*isa));
         let want = theirs.compile(&*isa, &mut Default::default()).unwrap();
         assert_eq!(code.code_buffer(), want.code_buffer());
@@ -8462,8 +8477,9 @@ fn build_clif(
     emit_stack_check(&mut b, &lower);
     b.ins().jump(blocks.clif[0], &entry_args);
 
+    let mut checked = CheckedBases::new(&lower, f);
     for (i, blk) in f.blocks.iter().enumerate() {
-        lower_block(&mut b, blk, i, &mut blocks, &lower)?;
+        lower_block(&mut b, blk, i, &mut blocks, &mut checked, &lower)?;
     }
 
     b.seal_all_blocks();
@@ -8743,6 +8759,7 @@ fn lower_block(
     blk: &Block,
     block_idx: usize,
     blocks: &mut Blocks,
+    checked: &mut CheckedBases,
     lower: &Lower,
 ) -> Result<(), JitError> {
     let cb = blocks.clif[block_idx];
@@ -8778,8 +8795,8 @@ fn lower_block(
     // via `mask` (= size−1).
     let mut ubs: Vec<u64> = vec![UB_TOP; vals.len()];
     let size = lower.mask.wrapping_add(1);
-    // #2147 — the bounds checks this block's loads and stores share.
-    let mut checked = CheckedBases::new(lower);
+    // #2147 — the bounds checks this block shares with the blocks that dominate it (D74).
+    checked.enter(block_idx, blk.parent as usize);
 
     for (inst_idx, inst) in blk.insts.iter().enumerate() {
         // Single-site `ubs` maintenance (#893): repair any lag a previous multi-result arm left —
@@ -9113,6 +9130,8 @@ fn lower_block(
             // r = _setjmp(slot) -> i32 — emitted inline in this JIT frame.
             let c2 = call_host(lower.callees, b, HostFn::Setjmp, &[slot])?;
             let r = b.inst_results(c2)[0];
+            // No check point's base crosses the call (#2652): a later access tests its own.
+            checked.forget();
             // #2537: reload the saved values and rewrite the value map to the reloaded copies, so every
             // later use in this block — and every successor's forwarded use (which reads this block's
             // final value map, #2448) — sources the value from the reuse-immune slot.
@@ -9982,7 +10001,7 @@ fn lower_block(
                 let phys = if elide {
                     mask_addr(b, lower, a, *offset, true, op.info().2)
                 } else {
-                    checked.confine(b, lower, *addr, a, *offset, op.info().2)
+                    checked.confine(b, lower, a, *offset, op.info().2)
                 };
                 emit_page_check(b, lower, phys, op.info().2, 0);
                 lower_load(b, *op, phys)
@@ -10004,7 +10023,7 @@ fn lower_block(
                 let phys = if elide {
                     mask_addr(b, lower, a, *offset, true, op.info().2)
                 } else {
-                    checked.confine(b, lower, *addr, a, *offset, op.info().2)
+                    checked.confine(b, lower, a, *offset, op.info().2)
                 };
                 emit_page_check(b, lower, phys, op.info().2, PAGE_MISS_WRITE);
                 lower_store(b, *op, phys, get(&vals, *value)?);
@@ -10016,12 +10035,12 @@ fn lower_block(
             // #2177: a short copy of one of this block's constant lengths is loads and stores instead
             // ([`copy_inline`]); a zero-length one is inert, as the libcall path makes it.
             Inst::MemCopy { dst, src, len } | Inst::MemMove { dst, src, len } => {
-                let short = checked.consts.get(len).copied();
+                let short = checked.consts.get(&get(&vals, *len)?).copied();
                 if let Some(n) =
                     short.filter(|n| lower.mask != 0 && (0..=INLINE_COPY_MAX).contains(n))
                 {
                     if n > 0 {
-                        copy_inline(b, lower, &mut checked, &ubs, &vals, *dst, *src, n as u32)?;
+                        copy_inline(b, lower, checked, &ubs, &vals, *dst, *src, n as u32)?;
                     }
                     continue;
                 }
@@ -10166,7 +10185,7 @@ fn lower_block(
         };
         // Single-result instruction: record its value and a sound upper bound in lockstep.
         let u = ub_of(inst, &ubs);
-        checked.note(vals.len() as u32, inst);
+        checked.note(v, inst, &vals);
         vals.push(v);
         ubs.push(u);
     }
@@ -10404,6 +10423,7 @@ fn lower_block(
         }
     }
     blocks.vals[block_idx] = vals;
+    checked.leave(block_idx);
     Ok(())
 }
 
@@ -11268,20 +11288,27 @@ fn guard_reach(lower: &Lower) -> u64 {
     }
 }
 
-/// #2147 — the bounds checks one IR block's loads and stores share. A **check point** is an access
+/// #2147 — the bounds checks a function's loads and stores share. A **check point** is an access
 /// whose own address `a` is tested against the reservation alone: `a ≥ reserved` redirects the base to
 /// the guard page (`select_spectre_guard`, as [`mask_addr`] redirects), and the access's offset and
-/// width fall within [`guard_reach`]. A later access in the same CLIF block whose address adds a
-/// constant to the same **root** value — `d ≥ 0` past the check point's, with `d + offset + width`
-/// within the reach — takes the checked base plus a constant, and tests nothing.
+/// width fall within [`guard_reach`]. A later access whose address adds a constant to the same
+/// **root** value — `d ≥ 0` past the check point's, with `d + offset + width` within the reach —
+/// takes the checked base plus a constant, and tests nothing.
 ///
 /// Exact, not approximate. If the check point's `a < reserved`, the later address is `a + d` with no
 /// wrap (`a + d < reserved + page`), so it is the interpreter's address, and whatever of the access
 /// lies past `reserved` lies on the guard page and faults there, at that access, where the
 /// interpreter's `checked_reserved` faults it. If `a ≥ reserved`, the check point itself faulted
 /// first. Under misspeculation the check point's base is the guard page's, so every access derived
-/// from it stays on that page. A base is reused only in the CLIF block that computed it, so it always
-/// dominates its uses; a call's trap check or a safepoint starts a new block, and with it new checks.
+/// from it stays on that page.
+///
+/// A check point serves the rest of its IR block and every block that block dominates (D74): the
+/// IR block's CLIF blocks form a chain each of which dominates the next, every path into a block it
+/// dominates leaves it through its terminator, and a block starts from the check points of its
+/// dominance-certificate parent, as a forwarded param or a capture takes the parent's value. So the
+/// check point ran on every path to a later access, and its base dominates the access. A `_setjmp`
+/// ends every check point ([`Self::forget`]): a base live across it could come back from a spill
+/// slot the longjmp path reused (#2537, #2652).
 ///
 /// A store that straddles `reserved` writes nothing before it faults only on hardware that never
 /// tears a faulting store: x86-64 guarantees it, Arm and RISC-V don't. [`mask_addr`] already relies
@@ -11291,39 +11318,67 @@ fn guard_reach(lower: &Lower) -> u64 {
 struct CheckedBases {
     /// [`guard_reach`]: `0` checks every access exactly.
     reach: i128,
-    /// The block's `i64.const` values, by value index.
-    consts: HashMap<u32, i64>,
-    /// A value the block computes as `root + c` by adding (or subtracting) constants, by value index.
-    roots: HashMap<u32, (u32, i128)>,
-    /// The check points still usable: one per root, the latest.
+    /// The function's `i64.const` values.
+    consts: HashMap<Value, i64>,
+    /// A value the function computes as `root + c` by adding (or subtracting) constants.
+    roots: HashMap<Value, (Value, i128)>,
+    /// The check points usable in the block being lowered: one per root, the latest.
     points: Vec<CheckPoint>,
+    /// Each lowered IR block's check points at its end, which the blocks it dominates start from.
+    /// `None` in a function that calls `setjmp`: there a base inherited from a dominator could have
+    /// crossed a `_setjmp` on another path into the block.
+    exits: Option<Vec<Vec<CheckPoint>>>,
 }
 
+#[derive(Clone)]
 struct CheckPoint {
-    root: u32,
+    root: Value,
     /// The check point's address is `root + c`.
     c: i128,
     /// `mem_base + (a ≥ reserved ? guard_offset : a)`.
     base: Value,
-    /// The CLIF block the base was computed in, the only one that may use it.
-    at: cranelift_codegen::ir::Block,
 }
 
 impl CheckedBases {
-    fn new(lower: &Lower) -> CheckedBases {
+    fn new(lower: &Lower, f: &Func) -> CheckedBases {
         CheckedBases {
             reach: i128::from(guard_reach(lower)),
             consts: HashMap::new(),
             roots: HashMap::new(),
             points: Vec::new(),
+            exits: (!f.uses_setjmp()).then(|| vec![Vec::new(); f.blocks.len()]),
         }
     }
 
-    /// Record what value `idx`, which `inst` defines, adds to a root.
-    fn note(&mut self, idx: u32, inst: &Inst) {
+    /// Start IR block `block`, which `parent` dominates (its dominance-certificate parent; the
+    /// entry block names itself): it starts from the check points the parent ended with.
+    fn enter(&mut self, block: usize, parent: usize) {
+        self.points = match &self.exits {
+            Some(exits) if parent < block => exits[parent].clone(),
+            _ => Vec::new(),
+        };
+    }
+
+    /// End IR block `block`, keeping its check points for the blocks it dominates.
+    fn leave(&mut self, block: usize) {
+        let points = std::mem::take(&mut self.points);
+        if let Some(exits) = &mut self.exits {
+            exits[block] = points;
+        }
+    }
+
+    /// End every check point, at a `_setjmp` (see the type's docs).
+    fn forget(&mut self) {
+        self.points.clear();
+    }
+
+    /// Record what `v`, the value `inst` defines, adds to a root. `vals` holds the block's values
+    /// before `v`.
+    fn note(&mut self, v: Value, inst: &Inst, vals: &[Value]) {
+        let val = |i: u32| vals.get(i as usize).copied();
         match *inst {
             Inst::ConstI64(k) => {
-                self.consts.insert(idx, k);
+                self.consts.insert(v, k);
             }
             Inst::IntBin {
                 ty: IntTy::I64,
@@ -11331,10 +11386,13 @@ impl CheckedBases {
                 a,
                 b,
             } => {
+                let (Some(a), Some(b)) = (val(a), val(b)) else {
+                    return;
+                };
                 if let Some(&k) = self.consts.get(&b) {
-                    self.roots.insert(idx, self.root_of(a, k));
+                    self.roots.insert(v, self.root_of(a, k));
                 } else if let Some(&k) = self.consts.get(&a) {
-                    self.roots.insert(idx, self.root_of(b, k));
+                    self.roots.insert(v, self.root_of(b, k));
                 }
             }
             Inst::IntBin {
@@ -11343,8 +11401,11 @@ impl CheckedBases {
                 a,
                 b,
             } => {
+                let (Some(a), Some(b)) = (val(a), val(b)) else {
+                    return;
+                };
                 if let Some(&k) = self.consts.get(&b) {
-                    self.roots.insert(idx, self.root_of(a, -i128::from(k)));
+                    self.roots.insert(v, self.root_of(a, -i128::from(k)));
                 }
             }
             _ => {}
@@ -11352,17 +11413,16 @@ impl CheckedBases {
     }
 
     /// `v + k` as `(root, c)`.
-    fn root_of(&self, v: u32, k: impl Into<i128>) -> (u32, i128) {
+    fn root_of(&self, v: Value, k: impl Into<i128>) -> (Value, i128) {
         let (root, c) = self.roots.get(&v).copied().unwrap_or((v, 0));
         (root, c + k.into())
     }
 
-    /// The physical address of a non-elided `width`-byte access at IR value `idx` (`addr`) + `offset`.
+    /// The physical address of a non-elided `width`-byte access at `addr` + `offset`.
     fn confine(
         &mut self,
         b: &mut FunctionBuilder,
         lower: &Lower,
-        idx: u32,
         addr: Value,
         offset: u64,
         width: u32,
@@ -11372,9 +11432,8 @@ impl CheckedBases {
         if span > reach {
             return mask_addr(b, lower, addr, offset, false, width);
         }
-        let (root, c) = self.root_of(idx, 0);
-        let here = b.current_block().expect("lowering inside a block");
-        if let Some(p) = self.points.iter().find(|p| p.root == root && p.at == here) {
+        let (root, c) = self.root_of(addr, 0);
+        if let Some(p) = self.points.iter().find(|p| p.root == root) {
             let d = c - p.c;
             if d >= 0 && d + span <= reach {
                 let base = p.base;
@@ -11389,12 +11448,7 @@ impl CheckedBases {
         let confined = b.ins().select_spectre_guard(oob, guard, addr);
         let mem_base = b.use_var(lower.mem_var);
         let base = b.ins().iadd(mem_base, confined);
-        let point = CheckPoint {
-            root,
-            c,
-            base,
-            at: here,
-        };
+        let point = CheckPoint { root, c, base };
         match self.points.iter_mut().find(|p| p.root == root) {
             Some(p) => *p = point,
             None => self.points.push(point),
@@ -11707,7 +11761,7 @@ fn copy_inline(
         Ok(if in_window(ub_at(ubs, idx), 0, n, size) {
             mask_addr(b, lower, a, 0, true, n)
         } else {
-            checked.confine(b, lower, idx, a, 0, n)
+            checked.confine(b, lower, a, 0, n)
         })
     };
     let s = confine(b, src)?;

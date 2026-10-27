@@ -22,8 +22,7 @@
 // whole lifecycle: keystrokes that land while the instantiate is still in flight are BUFFERED and
 // fed on ready (the page enables its input the moment the Workers exist, so this race is real).
 
-import { engineImports } from './engine-imports.js';
-import { adoptEngine } from './foreign-mem.js';
+import { instantiateEngine } from './engine-imports.js';
 let ex = null;
 let memory = null;
 let drainBuf = 0;
@@ -68,10 +67,10 @@ async function init(cfg) {
   try {
     // No GPU surface, no card-output streaming and no parallel-driver run in a bash Worker: no hook is
     // installed, so those seams do nothing (a refused `x2_spawn` ends such a run with `ThreadFault`).
-    ({ exports } = await WebAssembly.instantiate(module, engineImports(memory)));
-    exports.__stack_pointer.value = stackTop;
-    if (exports.__tls_size.value > 0) exports.__wasm_init_tls(tlsBase);
-    adoptEngine(exports, memory);
+    exports = await instantiateEngine(module, memory, {}, (ex) => {
+      ex.__stack_pointer.value = stackTop;
+      if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase);
+    });
   } catch (err) {
     postMessage({ kind: 'fail', why: String(err) });
     return;

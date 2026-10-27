@@ -15,7 +15,8 @@
 //!      wholly-valid list is never falsely refused.
 
 use temen_interp::{
-    read_grant_records, read_slice, ForkedProc, Host, HostProc, Lease, Trap, WINDOW_RUNS,
+    read_grant_records, read_slice, ForkedProc, Host, HostProc, HostProcGrant, Lease, ProcHandler,
+    Trap, WINDOW_RUNS,
 };
 
 const CHILD_SIZE: u64 = 1 << 12;
@@ -50,11 +51,17 @@ fn parent_host() -> (Host, i32) {
     let handler: HostProc = Box::new(|_op, _args, _mem, _| Ok(vec![0]));
     let fork = std::sync::Arc::new(|_pid: u64| {
         Some(ForkedProc::shared(
-            Box::new(|_op, _args, _mem, _| Ok(vec![0])),
+            ProcHandler::Sync(Box::new(|_op, _args, _mem, _| Ok(vec![0]))),
             temen_interp::CapState::Stateless,
         ))
     });
-    let h = host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Stateless);
+    let h = host.grant_host_proc(
+        HostProcGrant::new(
+            ProcHandler::Sync(handler),
+            temen_interp::CapState::Stateless,
+        )
+        .forkable(fork),
+    );
     (host, h)
 }
 

@@ -6,7 +6,7 @@
 //   node bench_pg.mjs <temen_browser.wasm> <postgres_resolved.temen> <pgdata.img> [sql-file]
 import { readFileSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
-import { engineImports } from './engine-imports.mjs';
+import { instantiateEngine } from './engine-imports.mjs';
 
 const [wasmPath, modPath, imgPath, sqlPath] = process.argv.slice(2);
 if (!imgPath) {
@@ -18,7 +18,7 @@ const sql = sqlPath
   : Buffer.from('CREATE TABLE t (x int, s text);\nINSERT INTO t VALUES (1,\'one\');\nINSERT INTO t VALUES (2,\'two\');\nSELECT * FROM t ORDER BY x DESC;\nSELECT count(*), sum(x) FROM t;\n');
 
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
-const ex = (await WebAssembly.instantiate(mod, engineImports())).exports;
+const ex = await instantiateEngine(mod);
 const is64 = ex.temen_abi_is64() === 1;
 const N = (x) => (is64 ? BigInt(x) : Number(x));
 

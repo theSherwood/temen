@@ -12,7 +12,7 @@ use std::sync::Arc;
 use temen_durable::{
     arm_freeze_after, init_durable_window, read_state, transform_module, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, Host, Value};
+use temen_interp::{run_capture_reserved_with_host, Host, HostProcGrant, ProcHandler, Value};
 use temen_ir::{Memory, Module};
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
@@ -71,13 +71,13 @@ fn run_armed(n: i64) -> (u64, bool) {
     let sink = Arc::clone(&calls);
     let mut host = Host::new();
     host.set_durable(true);
-    let hf = host.grant_host_proc(
-        Box::new(move |_op, _args, _mem, _| {
+    let hf = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(move |_op, _args, _mem, _| {
             sink.fetch_add(1, Ordering::Relaxed);
             Ok(vec![0])
-        }),
+        })),
         temen_interp::CapState::Stateless,
-    );
+    ));
 
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_after(&mut win, TEST_ARENA, n);
@@ -131,13 +131,13 @@ fn an_unarmed_durable_run_is_untouched() {
     let sink = Arc::clone(&calls);
     let mut host = Host::new();
     host.set_durable(true);
-    let hf = host.grant_host_proc(
-        Box::new(move |_op, _args, _mem, _| {
+    let hf = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(move |_op, _args, _mem, _| {
             sink.fetch_add(1, Ordering::Relaxed);
             Ok(vec![0])
-        }),
+        })),
         temen_interp::CapState::Stateless,
-    );
+    ));
     let win = init_durable_window(WINDOW, TEST_ARENA);
     let mut fuel = 100_000u64;
     let (res, snap) = run_capture_reserved_with_host(

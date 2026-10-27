@@ -11,7 +11,9 @@ use std::time::Duration;
 mod drivers;
 
 use drivers::{agree_on, Driver, Ran};
-use temen_interp::{run_with_host, Host, OffloadOutcome, StreamRole, Value};
+use temen_interp::{
+    run_with_host, Host, HostProcGrant, OffloadOutcome, ProcHandler, StreamRole, Value,
+};
 
 /// Futex park: the fiber `atomic.wait`s on a zero cell (forever). The root sees
 /// `(FIBER_PARKED, 0)` twice (park, then poll), `atomic.notify`s the cell (waking exactly 1
@@ -275,14 +277,13 @@ fn a_punted_host_call_parks_the_fiber_not_the_vcpu() {
     let m = temen_text::parse_module(PUNT_IN_FIBER).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let mut host = Host::new();
-    let h = host.grant_host_proc_offloadable(
-        Box::new(|_op, args| {
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Offloadable(Box::new(|_op, args| {
             let a = *args.first().unwrap_or(&0);
             OffloadOutcome::Offload(Box::new(move || a + 100))
-        }),
-        None,
+        })),
         temen_interp::CapState::Stateless,
-    );
+    ));
     let comps = host.completions();
     // Bounded fuel: a lost completion wake leaves the poll loop spinning forever — convert
     // that into a loud OutOfFuel instead of a hang.
@@ -510,17 +511,16 @@ fn root_return_abandons_a_cap_parked_fiber() {
     let m = temen_text::parse_module(RESUME_ONCE).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let mut host = Host::new();
-    let h = host.grant_host_proc_offloadable(
-        Box::new(|_op, args| {
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Offloadable(Box::new(|_op, args| {
             let a = *args.first().unwrap_or(&0);
             OffloadOutcome::Offload(Box::new(move || {
                 std::thread::sleep(Duration::from_millis(100));
                 a + 100
             }))
-        }),
-        None,
+        })),
         temen_interp::CapState::Stateless,
-    );
+    ));
     let comps = host.completions();
     let t0 = std::time::Instant::now();
     let mut fuel = 2_000_000_000;
@@ -547,14 +547,13 @@ fn a_durable_caller_never_fiber_parks_on_a_punt() {
     temen_verify::verify_module(&m).expect("verify");
     let mut host = Host::new();
     host.set_durable(true);
-    let h = host.grant_host_proc_offloadable(
-        Box::new(|_op, args| {
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Offloadable(Box::new(|_op, args| {
             let a = *args.first().unwrap_or(&0);
             OffloadOutcome::Offload(Box::new(move || a + 100))
-        }),
-        None,
+        })),
         temen_interp::CapState::Stateless,
-    );
+    ));
     let comps = host.completions();
     let mut fuel = 2_000_000_000;
     let r = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host).expect("no trap");
@@ -583,8 +582,8 @@ fn a_later_answer_is_not_held_behind_an_earlier_call() {
     let gate_job = std::sync::Arc::clone(&gate);
     let gate_rel = std::sync::Arc::clone(&gate);
     let mut host = Host::new();
-    let h = host.grant_host_proc_offloadable(
-        Box::new(move |op, args| {
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Offloadable(Box::new(move |op, args| {
             if op == 1 {
                 // The release (inline `Done` — never punts): open the latch.
                 let (m, cv) = &*gate_rel;
@@ -606,10 +605,9 @@ fn a_later_answer_is_not_held_behind_an_earlier_call() {
             } else {
                 OffloadOutcome::Offload(Box::new(move || 222))
             }
-        }),
-        None,
+        })),
         temen_interp::CapState::Stateless,
-    );
+    ));
     let comps = host.completions();
     let mut fuel = 2_000_000_000;
     let r = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host).expect("no trap");

@@ -253,6 +253,50 @@ fn rides_every_checkpoint(session: impl Fn() -> ScheduledDebugRun) -> (String, S
     (result, out)
 }
 
+/// The child of [`a_handle_a_child_closed_stays_closed_across_every_checkpoint`]: it resolves its
+/// `"stdout"` and closes it, counts to 20, then writes through the closed handle and returns what the
+/// write answered.
+const CLOSING_CHILD: &str = r#"memory 16
+data 16400 "stdout"
+func (i64, i64) -> (i64) {
+block 0 (vi0: i64, vas: i64) {
+  vp = i64.const 16400
+  vl = i64.const 6
+  vo = self.resolve vp vl
+  vc = call.cap 0 2 () -> (i64) vo ()
+  vz = i64.const 0
+  br 1(vo, vz)
+}
+block 1 (vo1: i32, vi: i64) {
+  vone = i64.const 1
+  vn = i64.add vi vone
+  vlim = i64.const 20
+  vmore = i64.ne vn vlim
+  br_if vmore 1(vo1, vn) 2(vo1)
+}
+block 2 (vo2: i32) {
+  vb = i64.const 20100
+  vlen = i64.const 0
+  vw = call.cap 0 1 (i64, i64) -> (i64) vo2 (vb, vlen)
+  return vw
+  }
+}
+"#;
+
+/// #2360 — a handle a detached child closed stays closed across every checkpoint. A checkpoint
+/// carries the child's powerbox with every slot's generation, so after a restore the write through
+/// the closed handle answers `-EBADF`, as in the uninterrupted run. When the checkpoint carried only
+/// the live entries, the restored slot came back never issued, and the write trapped `CapFault`.
+#[test]
+fn a_handle_a_child_closed_stays_closed_across_every_checkpoint() {
+    let (result, out) = rides_every_checkpoint(|| session(ROOT, CLOSING_CHILD, false));
+    assert_eq!(
+        (result.as_str(), out.as_str()),
+        ("Ok([I64(-9)])", ""),
+        "the uninterrupted run: the child's write through its closed stdout answers -EBADF"
+    );
+}
+
 /// The child of [`an_undo_with_a_live_detached_child_matches_a_fresh_run`]: it adds 1 to a word of
 /// its window 3000 times, long enough for the journal's stride to fall inside its life, and returns
 /// the word.

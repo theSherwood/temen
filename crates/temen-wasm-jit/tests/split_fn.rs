@@ -22,6 +22,16 @@ fn parse(src: &str) -> temen_ir::Module {
     m
 }
 
+/// `src` raised into dominance form (#2454).
+fn raised(src: &str) -> temen_ir::Module {
+    let mut m = parse(src);
+    for f in &mut m.funcs {
+        f.raise();
+    }
+    temen_verify::verify_module(&m).expect("verify raised");
+    m
+}
+
 /// Interpreter oracle: run func 0 with the given i64 args.
 fn oracle(m: &temen_ir::Module, args: &[i64]) -> i64 {
     let vals: Vec<Value> = args.iter().map(|&a| Value::I64(a)).collect();
@@ -82,18 +92,20 @@ fn run_split_fn(m: &temen_ir::Module, fidx: usize, k: usize, args: &[i64]) -> i6
 }
 
 /// Split `m`'s function `fidx` at every K from 1..=its block count and assert parity with the oracle
-/// (entry = func 0) over `inputs`.
+/// (entry = func 0) over `inputs` — as written, and raised into dominance form (#2454), whose
+/// captures a split carries across groups as params.
 fn assert_split_parity_fn(src: &str, fidx: usize, inputs: &[&[i64]]) {
-    let m = parse(src);
-    let nblocks = m.funcs[fidx].blocks.len();
-    for args in inputs {
-        let want = oracle(&m, args);
-        for k in 1..=nblocks {
-            let got = run_split_fn(&m, fidx, k, args);
-            assert_eq!(
-                got, want,
-                "split fidx={fidx} k={k} args={args:?}: got {got} != oracle {want}"
-            );
+    for m in [parse(src), raised(src)] {
+        let nblocks = m.funcs[fidx].blocks.len();
+        for args in inputs {
+            let want = oracle(&m, args);
+            for k in 1..=nblocks {
+                let got = run_split_fn(&m, fidx, k, args);
+                assert_eq!(
+                    got, want,
+                    "split fidx={fidx} k={k} args={args:?}: got {got} != oracle {want}"
+                );
+            }
         }
     }
 }

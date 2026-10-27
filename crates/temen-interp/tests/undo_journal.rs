@@ -10,7 +10,7 @@
 //! journaling armed must not perturb the run), the bulk-op span coverage that `watch_accesses` buys,
 //! and the level-2 coalescing bound (#1558) that makes aging the journal safe.
 
-use temen_interp::bytecode::ScheduledDebugRun;
+use temen_interp::{bytecode::ScheduledDebugRun, HostProcGrant, ProcHandler};
 
 /// `iters` rewrites of one hot cell, then two distinct cells, then a 4 KiB `mem.fill`. The three
 /// phases are the three cases the journal has to get right: repeated writes to one address (what
@@ -283,14 +283,14 @@ fn counting_host() -> (temen_interp::Host, i32) {
     let mut host = temen_interp::Host::new();
     host.record_caps();
     let n = Arc::new(Mutex::new(0i64));
-    let h = host.grant_host_proc(
-        Box::new(move |_op, _args, _mem, _minter| {
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(move |_op, _args, _mem, _minter| {
             let mut g = n.lock().unwrap();
             *g += 1;
             Ok(vec![*g])
-        }),
+        })),
         temen_interp::CapState::Stateless,
-    );
+    ));
     (host, h)
 }
 
@@ -352,19 +352,19 @@ fn stateful_counter_host(
     let n = Arc::new(Mutex::new(0i64));
     let cap = Arc::clone(&n);
     let (get, set) = (Arc::clone(&n), Arc::clone(&n));
-    let h = host.grant_host_proc(
-        Box::new(move |_op, _args, _mem, _minter| {
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(move |_op, _args, _mem, _minter| {
             let mut g = cap.lock().unwrap();
             *g += 1;
             Ok(vec![*g])
-        }),
+        })),
         temen_interp::CapState::Captured {
             capture: Box::new(move || get.lock().unwrap().to_le_bytes().to_vec()),
             restore: Box::new(move |b| {
                 *set.lock().unwrap() = i64::from_le_bytes(b.try_into().expect("8 bytes"));
             }),
         },
-    );
+    ));
     (host, h, n)
 }
 
@@ -461,8 +461,8 @@ fn undoing_across_an_answer_takes_it_where_the_run_did() {
         let calls = Arc::new(AtomicU64::new(0));
         let made = Arc::clone(&calls);
         let mut host = temen_interp::Host::new();
-        let h = host.grant_host_proc_offloadable(
-            Box::new(move |_op, args| {
+        let h = host.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Offloadable(Box::new(move |_op, args| {
                 let (first, n) = (made.fetch_add(1, Ordering::SeqCst) == 0, args[0]);
                 temen_interp::OffloadOutcome::Offload(Box::new(move || {
                     if first {
@@ -470,10 +470,9 @@ fn undoing_across_an_answer_takes_it_where_the_run_did() {
                     }
                     n
                 }))
-            }),
-            None,
+            })),
             temen_interp::CapState::Stateless,
-        );
+        ));
         let mut r = ScheduledDebugRun::new_with_host(&m, 0, &[temen_interp::Value::I32(h)], host)
             .expect("in the debug subset");
         r.set_journal_armed(true);

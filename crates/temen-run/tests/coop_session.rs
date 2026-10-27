@@ -5,7 +5,9 @@
 //! with [`RunConfig::parallel`].
 
 use std::sync::{Arc, Mutex};
-use temen_interp::{cap_id, CapState, Completer, OffloadOutcome, Value};
+use temen_interp::{
+    cap_id, CapState, Completer, HostProcGrant, OffloadOutcome, ProcHandler, Value,
+};
 use temen_run::{instantiate, HostCap, Outcome, RunConfig, SessionStep};
 use temen_text::parse_module;
 
@@ -35,15 +37,14 @@ fn ask(filed: &Filed) -> HostCap {
     let filed = Arc::clone(filed);
     HostCap::custom(cap_id::HOST_PROC, 1, move |h, _| {
         let filed = Arc::clone(&filed);
-        h.grant_host_proc_offloadable(
-            Box::new(move |_op, args| {
+        h.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Offloadable(Box::new(move |_op, args| {
                 let a = *args.first().unwrap_or(&0);
                 let filed = Arc::clone(&filed);
                 OffloadOutcome::Host(Box::new(move |c| filed.lock().unwrap().push((c, a))))
-            }),
-            None,
+            })),
             CapState::Stateless,
-        )
+        ))
     })
 }
 

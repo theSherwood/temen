@@ -3,7 +3,7 @@
 // Verifies (a) the no-import smoke anchors via run_guest, and (b) the production temen_run path,
 // which decodes an encoded Temen IR module from the scratch buffer and runs it on the bytecode engine.
 import { readFileSync } from 'node:fs';
-import { engineImports } from './engine-imports.mjs';
+import { instantiateEngine } from './engine-imports.mjs';
 
 const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
 const fixturePath = process.argv[3] ?? 'alu.temenc';
@@ -12,8 +12,7 @@ const mod = await WebAssembly.compile(readFileSync(wasmPath));
 const imports = WebAssembly.Module.imports(mod);
 console.log(`module: ${wasmPath}`);
 console.log('imports required:', imports);
-const instance = await WebAssembly.instantiate(mod, engineImports());
-const ex = instance.exports;
+const ex = await instantiateEngine(mod);
 
 // Pointers/lengths are usize: i32 on wasm32 (Number), i64 on wasm64 (BigInt). Normalize.
 const is64 = ex.temen_abi_is64() === 1;
