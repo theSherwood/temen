@@ -273,11 +273,11 @@ pub(crate) unsafe fn window_is_unwinding(mem_base: u64, arena: ShadowArena) -> b
 }
 
 /// The generated CLIF call-trampoline: `extern "C"` on the outside (callable from Rust), it
-/// `call.dyn`s a guest fiber entry (`Tail` ABI `(fn_table_base, vm, sp, arg) -> i64`) with
-/// `mem_base` in the pinned register (D73). One trampoline serves every fiber since all fiber
-/// entries share that signature (§12). The entry ABI carries a `stack_limit` param right after `vm`
-/// (§2b path B — the always-on software stack guard), so this fn-pointer type does too — kept in
-/// exact lockstep with `sig_from` / the CLIF trampoline.
+/// `call.dyn`s a guest fiber entry (`Tail` ABI `(mem_base, fn_table_base, vm, sp, arg) ->
+/// i64`). One trampoline serves every fiber since all fiber entries share that signature (§12).
+/// The entry ABI carries a `stack_limit` param right after `vm` (§2b path B — the always-on
+/// software stack guard), so this fn-pointer type does too — kept in exact lockstep with `sig_from` /
+/// the CLIF trampoline.
 pub(crate) type FiberCallTramp = extern "C" fn(
     code: u64,
     mem_base: u64,

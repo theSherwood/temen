@@ -52,13 +52,11 @@
 //! mismatch — a forged/wrong-type index is inert), and calls the slot's code pointer.
 //!
 //! ## Calling convention
-//! All functions share a natural CLIF ABI `(fn_table_base, vmctx, stack_limit, params…) ->
-//! (results…)` (the `tail` call conv, so `return_call` works); the context arguments are
-//! threaded through every call. The window base is not an argument: it lives in Cranelift's
-//! **pinned register** (r15 on x86-64, x21 on aarch64), which an entry trampoline sets and guest
-//! code only reads (D73). The entry is wrapped in a fixed buffer-ABI trampoline `fn(args: *const
-//! i64, results: *mut i64, mem_base: *mut u8, fn_table_base: *const FnEntry, vmctx)` so
-//! [`compile_and_run`] can call any arity from Rust.
+//! All functions share a natural CLIF ABI `(mem_base, fn_table_base, params…) ->
+//! (results…)` (the `tail` call conv, so `return_call` works); the two context
+//! pointers are threaded through every call. The entry is wrapped in a fixed
+//! buffer-ABI trampoline `fn(args: *const i64, results: *mut i64, mem_base: *mut u8,
+//! fn_table_base: *const FnEntry)` so [`compile_and_run`] can call any arity from Rust.
 
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -1223,10 +1221,9 @@ fn float_clif_ty(t: FloatTy) -> Type {
 /// parameter slot; `i32`/`f32` occupy the low 32 bits). Returns the result slots, or a
 /// [`JitOutcome::Trapped`] if the run trapped. Intended for the differential harness.
 ///
-/// All functions are compiled with a **natural CLIF ABI** — `(fn_table_base, vmctx,
-/// stack_limit, params…) -> (results…)`, the window base in the pinned register — so
-/// direct/indirect/tail calls are ordinary CLIF calls; the entry is wrapped in a fixed
-/// buffer-ABI trampoline (any arity).
+/// All functions are compiled with a **natural CLIF ABI** — `(mem_base, fn_table_base,
+/// vmctx, params…) -> (results…)` — so direct/indirect/tail calls are ordinary CLIF
+/// calls; the entry is wrapped in a fixed buffer-ABI trampoline (any arity).
 pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<JitOutcome, JitError> {
     // No host: an empty powerbox, so any `call.cap` is an inert CapFault (like `run`).
     compile_and_run_with_host(m, func, args, empty_cap_thunk, core::ptr::null_mut())
@@ -6530,10 +6527,6 @@ fn jit_isa() -> Result<cranelift_codegen::isa::OwnedTargetIsa, JitError> {
     let _ = flags.set("opt_level", "speed");
     // The escape-TCB pin — see `new_jit_module`'s doc.
     let _ = flags.set("enable_probestack", "false");
-    // D73 — the window base lives in the pinned register (r15 on x86-64, x21 on aarch64): the
-    // register allocator never hands it out, so guest code reads it and never writes it. See
-    // `sig_from`.
-    let _ = flags.set("enable_pinned_reg", "true");
     // [`compile_verified`] runs Cranelift's verifier before and after Cranelift's passes on every
     // compile (#2449). With debug assertions and under the fuzzers, Cranelift also runs it after
     // each pass, which names the pass that broke the CLIF.
@@ -6595,8 +6588,8 @@ fn define_funcs(
                     let mut ctx = cranelift_codegen::Context::new();
                     ctx.func.signature.call_conv = isa.default_call_conv();
                     lower(&mut ctx, i)?;
-                    let code = compile_verified(isa, &mut ctx, validate::Code::Guest(layout))
-                        .map_err(JitError::Backend)?;
+                    let code =
+                        compile_verified(isa, &mut ctx, layout).map_err(JitError::Backend)?;
                     let relocs = code
                         .buffer
                         .relocs()
@@ -6668,7 +6661,7 @@ fn define_funcs(
 fn compile_verified(
     isa: &dyn cranelift_codegen::isa::TargetIsa,
     ctx: &mut cranelift_codegen::Context,
-    code: validate::Code,
+    layout: Option<validate::WindowLayout>,
 ) -> Result<CompiledCode, String> {
     let mut ctrl = cranelift_codegen::control::ControlPlane::default();
     ctx.verify(isa)
@@ -6677,24 +6670,18 @@ fn compile_verified(
         .map_err(|e| cranelift_module::ModuleError::from(e).to_string())?;
     ctx.verify(isa)
         .map_err(|e| format!("CLIF verifier, after Cranelift's passes: {e}"))?;
-    let compiled = isa
+    let code = isa
         .compile_function(&ctx.func, &ctx.domtree, ctx.want_disasm, &mut ctrl)
         .map_err(|e| cranelift_module::ModuleError::from(e).to_string())?;
-    let compiled = compiled.apply_params(&ctx.func.params);
+    let code = code.apply_params(&ctx.func.params);
     // #2481 — shadow-mode machine-code validation: check the emitted bytes against the policy and
     // log any disagreement, but never reject. `enabled()` is false on a production compile, so this
-    // is inert there; `jit_isa` only records `bb_starts`/`bb_edges` when it is true. A guest
-    // function's `code` carries its module's §4 window geometry, which the window-access policy
-    // re-proves against (#2603).
+    // is inert there; `jit_isa` only records `bb_starts`/`bb_edges` when it is true. `layout` is the
+    // module's §4 window geometry, which the window-access policy re-proves against (#2603).
     if validate::enabled() {
-        validate::shadow_check(
-            compiled.code_buffer(),
-            &compiled.bb_starts,
-            &compiled.bb_edges,
-            code,
-        );
+        validate::shadow_check(code.code_buffer(), &code.bb_starts, &code.bb_edges, layout);
     }
-    Ok(compiled)
+    Ok(code)
 }
 
 /// Define `id` in `module` from `ctx`'s CLIF, compiled by [`compile_verified`], and return its code.
@@ -6705,10 +6692,9 @@ fn define_verified(
     id: FuncId,
     ctx: &mut cranelift_codegen::Context,
 ) -> Result<CompiledCode, JitError> {
-    // Trampolines (the entries, fuel refill) carry no guest window, so the policy has no window
-    // access to re-prove; and the entries set the pinned register, which guest code may not (D73).
-    let code = compile_verified(module.isa(), ctx, validate::Code::Trampoline)
-        .map_err(JitError::Backend)?;
+    // Trampolines (cap thunks, fuel refill) carry no guest window, so the policy has no window
+    // access to re-prove — the layout hint is `None`.
+    let code = compile_verified(module.isa(), ctx, None).map_err(JitError::Backend)?;
     let relocs: Vec<ModuleReloc> = code
         .buffer
         .relocs()
@@ -7181,7 +7167,7 @@ mod compile_verified_tests {
     fn malformed_clif_fails_the_compile_before_cranelifts_passes() {
         let isa = jit_isa().unwrap();
         let mut ctx = cranelift_codegen::Context::for_function(malformed(&*isa));
-        let err = compile_verified(&*isa, &mut ctx, validate::Code::Trampoline).unwrap_err();
+        let err = compile_verified(&*isa, &mut ctx, None).unwrap_err();
         assert!(
             err.starts_with("CLIF verifier, on the lowered CLIF"),
             "{err}"
@@ -7229,7 +7215,7 @@ mod compile_verified_tests {
     fn compile_verified_emits_what_cranelifts_compile_emits() {
         let isa = jit_isa().unwrap();
         let mut ours = cranelift_codegen::Context::for_function(summing(&*isa));
-        let code = compile_verified(&*isa, &mut ours, validate::Code::Trampoline).unwrap();
+        let code = compile_verified(&*isa, &mut ours, None).unwrap();
         let mut theirs = cranelift_codegen::Context::for_function(summing(&*isa));
         let want = theirs.compile(&*isa, &mut Default::default()).unwrap();
         assert_eq!(code.code_buffer(), want.code_buffer());
@@ -7863,9 +7849,9 @@ pub fn child_compiles() -> u64 {
     }
 }
 
-/// The natural CLIF signature for an IR function: `(fn_table_base, vmctx, stack_limit, params…)
-/// -> (results…)`. The context arguments are threaded through every call so `call.dyn` reaches the
-/// function table; loads and stores reach the window through the pinned register ([`sig_from`]).
+/// The natural CLIF signature for an IR function: `(mem_base, fn_table_base, params…)
+/// -> (results…)`. Both context pointers are threaded through every call so loads/
+/// stores reach the window and `call.dyn` reaches the function table.
 fn natural_sig(f: &Func) -> cranelift_codegen::ir::Signature {
     sig_from(&f.params, &f.results)
 }
@@ -7902,11 +7888,7 @@ fn sig_from(params: &[ValType], results: &[ValType]) -> cranelift_codegen::ir::S
     // The `tail` calling convention so `return_call` (guaranteed tail calls, §3b) is
     // available; a normal `call` from the trampoline works against it too.
     let mut sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
-    // D73 — no `mem_base`: the window base is the pinned register. An entry trampoline sets it
-    // (`build_trampoline`, `build_fiber_call_trampoline`) and everything guest code calls preserves
-    // it: Cranelift never allocates it, the host ABI saves it, and a fiber switch saves it with the
-    // stack's other callee-saved registers. As an argument it cost a move at every call and, live
-    // across a call, a reload from the stack after it (#2147).
+    sig.params.push(AbiParam::new(I64)); // mem_base
     sig.params.push(AbiParam::new(I64)); // fn_table_base
     sig.params.push(AbiParam::new(I64)); // vmctx (the instance's context; field 0 its trap cell)
                                          // §2b path B: a 4th context param — the running stack's limit: a fiber's `usable_low`, or the
@@ -8288,7 +8270,7 @@ fn trap_capture_addr() -> Option<*const ()> {
     None
 }
 
-/// Build the natural-ABI CLIF for one IR function: `(fn_table_base, vmctx, stack_limit, params…)
+/// Build the natural-ABI CLIF for one IR function: `(mem_base, fn_table_base, params…)
 /// -> (results…)`. The CLIF entry block holds the native params and jumps into IR
 /// block 0 passing the parameters as its block args.
 ///
@@ -8369,6 +8351,7 @@ fn build_clif(
     }
     let sret = uses_sret(&f.results);
     let entry = b.create_block();
+    b.append_block_param(entry, I64); // mem_base
     b.append_block_param(entry, I64); // fn_table_base
     b.append_block_param(entry, I64); // vmctx (its field 0 is the trap cell)
     b.append_block_param(entry, I64); // stack_limit (§2b path B) — mirrors sig_from
@@ -8380,11 +8363,9 @@ fn build_clif(
     }
     b.switch_to_block(entry);
     b.seal_block(entry);
-    // The window base, from the pinned register ([`sig_from`]); read again after every call
-    // ([`emit_trap_propagate`]), so no copy of it lives across one.
-    let mem_base = b.ins().get_pinned_reg(I64);
-    let fn_table_base = b.block_params(entry)[0];
-    let vmctx = b.block_params(entry)[1];
+    let mem_base = b.block_params(entry)[0];
+    let fn_table_base = b.block_params(entry)[1];
+    let vmctx = b.block_params(entry)[2];
 
     // The context pointers are needed across blocks; stash them in variables.
     let mem_var = b.declare_var(I64);
@@ -8393,18 +8374,18 @@ fn build_clif(
     b.def_var(fn_table_var, fn_table_base);
     let vmctx_var = b.declare_var(I64);
     b.def_var(vmctx_var, vmctx);
-    // §2b path B: stash the stack-limit param (block index 2, right after the context pointers) so
-    // the prologue check and every call can reach it.
+    // §2b path B: stash the stack-limit param (block index 3, right after the context pointers) so the
+    // prologue check and every call can reach it.
     let limit_var = {
         let var = b.declare_var(I64);
-        b.def_var(var, b.block_params(entry)[2]);
+        b.def_var(var, b.block_params(entry)[3]);
         var
     };
     // The return-area pointer (when sret) is likewise needed in the `Return`/tail-call blocks. Its
-    // block index is after the context pointers + the stack-limit param (index 3).
+    // block index is after the context pointers + the stack-limit param (index 4).
     let sret_var = if sret {
         let var = b.declare_var(I64);
-        b.def_var(var, b.block_params(entry)[3]);
+        b.def_var(var, b.block_params(entry)[4]);
         Some(var)
     } else {
         None
@@ -8455,12 +8436,12 @@ fn build_clif(
         page,
     };
 
-    // Jump into IR block 0 passing the function parameters (entry params after the two context
-    // pointers and the stack limit, plus the sret pointer when present). A §5 kill-path check
-    // guards the *entry* (caught before any work): this is what stops unbounded recursion and
-    // tail-call loops — each (re-)entry polls the interrupt cell. Intra-function loops are caught
-    // by the per-back-edge check in `lower_block`.
-    let pbase = 3 + usize::from(sret); // 2 context ptrs + stack_limit, then sret
+    // Jump into IR block 0 passing the function parameters (entry params after the three context
+    // pointers, plus the sret pointer when present). A §5 kill-path check guards the *entry* (caught
+    // before any work): this is what stops unbounded recursion and tail-call loops — each (re-)entry
+    // polls the interrupt cell. Intra-function loops are caught by the per-back-edge check in
+    // `lower_block`.
+    let pbase = 4 + usize::from(sret); // 3 context ptrs + stack_limit, then sret
     let entry_args: Vec<BlockArg> = b.block_params(entry)[pbase..]
         .iter()
         .map(|v| BlockArg::from(*v))
@@ -8535,7 +8516,7 @@ fn build_trampoline(
     // via sret, hand it `results_ptr` directly as the return-area pointer — it writes its results
     // (8-byte `encode_slot` slots) straight into the buffer Rust reads, so no register read-back.
     let sret = uses_sret(&entry.results);
-    let mut call_args = vec![fn_table_base, vmctx];
+    let mut call_args = vec![mem_base, fn_table_base, vmctx];
     // §2b path B: the root runs on the calling thread's own stack, so it takes that stack's limit from
     // the host (#1983, `stack_check::thread_limit`); fibers get a real limit at their own entry.
     let limit = if with_limit {
@@ -8555,13 +8536,7 @@ fn build_trampoline(
         call_args.push(decode_slot(&mut b, slot, *p));
     }
     let callee = callees.import(b.func, entry_id)?;
-    // D73 — the guest reads its window base from the pinned register. The host ABI has the caller
-    // keep its own value there, which Cranelift does not save for a pinned register, so it is put
-    // back after the call (a trap's `siglongjmp` restores it from the guard's `sigsetjmp`).
-    let saved = b.ins().get_pinned_reg(I64);
-    b.ins().set_pinned_reg(mem_base);
     let call = b.ins().call(callee, &call_args);
-    b.ins().set_pinned_reg(saved);
     if !sret {
         let rets: Vec<Value> = b.inst_results(call).to_vec();
         for (i, r) in rets.iter().enumerate() {
@@ -8671,11 +8646,10 @@ fn funcs_use_instantiator(funcs: &[Func]) -> bool {
 /// instead; one trampoline serves all fibers since every entry is `(i64 sp, i64 arg) -> i64`.
 #[cfg(fiber_rt)]
 fn build_fiber_call_trampoline(clif: &mut Function) {
-    // Params: `code`, `mem_base` (the pinned register's value for the call, D73), then the guest
-    // entry's Tail args in order — fn_table_base, vmctx, stack_limit (§2b path B, always present),
-    // sp, arg -> i64. `stack_limit` sits in the same relative slot as in `sig_from`, so the entry
-    // call args are exactly `p[2..]` (see [`FiberCallTramp`]).
-    let np = 7; // code + mem_base + (fn_table_base, vmctx, stack_limit, sp, arg)
+    // Params: `code`, then the guest entry's Tail args in order — mem_base, fn_table_base, vmctx,
+    // stack_limit (§2b path B, always present), sp, arg -> i64. `stack_limit` sits in the same relative
+    // slot as in `sig_from`, so the entry call args are exactly `p[1..]` (see [`FiberCallTramp`]).
+    let np = 7; // code + (mem_base, fn_table_base, vmctx, stack_limit, sp, arg)
     for _ in 0..np {
         clif.signature.params.push(AbiParam::new(I64));
     }
@@ -8692,13 +8666,9 @@ fn build_fiber_call_trampoline(clif: &mut Function) {
     b.seal_block(blk);
     let p = b.block_params(blk).to_vec();
     let code = p[0];
-    let call_args = p[2..].to_vec(); // (fn_table_base, vmctx, [stack_limit], sp, arg)
+    let call_args = p[1..].to_vec(); // (mem_base, fn_table_base, vmctx, [stack_limit], sp, arg)
     let sig = b.import_signature(sig_from(&[ValType::I64, ValType::I64], &[ValType::I64]));
-    // The caller's pinned register back after, as in `build_trampoline`.
-    let saved = b.ins().get_pinned_reg(I64);
-    b.ins().set_pinned_reg(p[1]);
     let call = b.ins().call_indirect(sig, code, &call_args);
-    b.ins().set_pinned_reg(saved);
     let r = b.inst_results(call)[0];
     b.ins().return_(&[r]);
     b.seal_all_blocks();
@@ -9143,11 +9113,6 @@ fn lower_block(
             // r = _setjmp(slot) -> i32 — emitted inline in this JIT frame.
             let c2 = call_host(lower.callees, b, HostFn::Setjmp, &[slot])?;
             let r = b.inst_results(c2)[0];
-            // D73 — the window base again, from the pinned register, which `_setjmp` saved and a
-            // `_longjmp` restores: no copy of it crosses the call in a spill slot the longjmp path
-            // may reuse (#2537).
-            let base = b.ins().get_pinned_reg(I64);
-            b.def_var(lower.mem_var, base);
             // #2537: reload the saved values and rewrite the value map to the reloaded copies, so every
             // later use in this block — and every successor's forwarded use (which reads this block's
             // final value map, #2448) — sources the value from the reuse-immune slot.
@@ -10442,6 +10407,8 @@ fn lower_block(
     Ok(())
 }
 
+/// The leading context arguments threaded into every guest call: `(mem_base,
+/// fn_table_base, vmctx, stack_limit)`.
 /// Load one of the instance's per-run addresses from its [`VmCtx`] (a field offset from
 /// [`vmctx`](crate::vmctx)). The fields are written before an entry and never during it, so the load is
 /// `readonly` + `can_move`: Cranelift may hoist it out of a loop or share it between uses — the
@@ -10453,10 +10420,9 @@ fn vmctx_load(b: &mut FunctionBuilder, lower: &Lower, field: i32) -> Value {
     b.ins().load(I64, flags, vmctx, field)
 }
 
-/// The leading context arguments threaded into every guest call: `(fn_table_base, vmctx,
-/// stack_limit)`. The window base is not one of them ([`sig_from`]).
 fn ctx_args(b: &mut FunctionBuilder, lower: &Lower) -> Vec<Value> {
     vec![
+        b.use_var(lower.mem_var),
         b.use_var(lower.fn_table_var),
         b.use_var(lower.vmctx_var),
         // §2b path B: pass our own stack-limit on to the callee (same stack, same limit) — mirrors
@@ -10934,10 +10900,6 @@ fn indirect_dispatch(b: &mut FunctionBuilder, lower: &Lower, idx: Value, ty: &Fu
 /// every `call`/`call.dyn`, so a trap raised deep in a callee unwinds the whole guest stack
 /// immediately — before any later op can observe bogus zero results. A sibling vCPU's end stops
 /// this one here too: the cell is the domain's, and nothing clears it during a run (#2499).
-///
-/// It then reads the window base from the pinned register again (D73). Every call is followed by
-/// this check, so no copy of the base lives across a call, which would spill it and reload it from
-/// the stack after; a call kills store-to-load forwarding anyway, so a new base costs none.
 fn emit_trap_propagate(b: &mut FunctionBuilder, lower: &Lower) {
     let vmctx = b.use_var(lower.vmctx_var);
     let tc = b.ins().load(I64, MemFlags::trusted(), vmctx, 0);
@@ -10950,8 +10912,6 @@ fn emit_trap_propagate(b: &mut FunctionBuilder, lower: &Lower) {
     emit_trap_return(b, lower);
     b.switch_to_block(cont);
     b.seal_block(cont);
-    let base = b.ins().get_pinned_reg(I64);
-    b.def_var(lower.mem_var, base);
 }
 
 /// Lower a `call.cap` via the **devirtualized fast path** (§9 / D45): a direct register-to-register
