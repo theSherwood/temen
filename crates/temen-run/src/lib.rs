@@ -30,7 +30,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use temen_interp::{
     cap_id, run_capture_reserved_with_host, run_with_host, run_with_host_fast, CapPageMap,
-    GuestMem, Host, HostProc, NodeRef, RegionBacking, RootWindow, StreamRole, Trap, UnlockedCall,
+    GuestMem, Host, HostProc, HostProcGrant, NodeRef, ProcHandler, RegionBacking, RootWindow,
+    StreamRole, Trap, UnlockedCall,
 };
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
@@ -7477,7 +7478,9 @@ impl SharedHostProc {
             return *h;
         }
         let (f, state) = (self.make)(&host.own_node());
-        let handle = host.grant_host_proc_forkable(f, Arc::clone(&self.fork), state);
+        let handle = host.grant_host_proc(
+            HostProcGrant::new(ProcHandler::Sync(f), state).forkable(Arc::clone(&self.fork)),
+        );
         g.push((dom, handle));
         handle
     }
@@ -7590,11 +7593,14 @@ impl HostCap {
                     let (make, payer) = (Arc::clone(&make), payer.clone());
                     move |_pid| {
                         let (h, state) = make(&payer, Mint::Inherit)?;
-                        Some(temen_interp::ForkedProc::shared(h, state))
+                        Some(temen_interp::ForkedProc::shared(
+                            ProcHandler::Sync(h),
+                            state,
+                        ))
                     }
                 });
                 let (f, state) = make(&payer, Mint::Grant).expect("a grant always mints");
-                h.grant_host_proc_forkable(f, fork, state)
+                h.grant_host_proc(HostProcGrant::new(ProcHandler::Sync(f), state).forkable(fork))
             }),
             unbound: false,
             offer: None,
@@ -7616,7 +7622,9 @@ impl HostCap {
             op,
             grant: Arc::new(move |h, _| {
                 let (f, state) = make(&h.own_node());
-                h.grant_host_proc_forkable(f, Arc::clone(&fork), state)
+                h.grant_host_proc(
+                    HostProcGrant::new(ProcHandler::Sync(f), state).forkable(Arc::clone(&fork)),
+                )
             }),
             unbound: false,
             offer: None,
@@ -7638,7 +7646,7 @@ impl HostCap {
     }
 
     /// An **mmap-capable** host-defined capability (§4b): like [`host_proc`](HostCap::host_proc) but the
-    /// handler is registered via [`Host::grant_host_proc_region`], so it is also handed a
+    /// handler is registered as [`temen_interp::ProcHandler::Minting`], so it is also handed a
     /// [`temen_interp::RegionMinter`] and can mint a file-backed `SharedRegion` to hand the guest for
     /// zero-copy aliasing. Resolves under the same [`cap_id::HOST_PROC`], so the guest reaches it exactly
     /// like a plain `host_proc`.
@@ -7654,7 +7662,7 @@ impl HostCap {
             op,
             grant: Arc::new(move |h, _| {
                 let (f, state) = make(&h.own_node());
-                h.grant_host_proc_region(f, state)
+                h.grant_host_proc(HostProcGrant::new(ProcHandler::Minting(f), state))
             }),
             unbound: false,
             offer: None,
@@ -8185,10 +8193,10 @@ impl Instance {
         // the value the instrumented code must bake in as its `call.cap` handle constant.
         let handle = {
             let mut scratch = Host::new();
-            scratch.grant_host_proc(
-                Box::new(|_, _, _, _| Ok(vec![])),
+            scratch.grant_host_proc(HostProcGrant::new(
+                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![]))),
                 temen_interp::CapState::Stateless,
-            )
+            ))
         };
         let spec = temen_opt::instrument::MemHookSpec {
             type_id: cap_id::HOST_PROC,
@@ -8221,17 +8229,16 @@ impl Instance {
     fn grant_mem_hooks(&self, h: &mut Host) {
         let Some(hooks) = &self.hooks else { return };
         let mut hook = (hooks.make)();
-        let handle = h.grant_host_proc(
-            Box::new(
+        let handle = h.grant_host_proc(HostProcGrant::new(
+            ProcHandler::Sync(Box::new(
                 move |op, args, _mem, _minter: Option<&mut dyn temen_interp::RegionMinter>| {
                     let ev = decode_mem_event(op, args).ok_or(Trap::Malformed)?;
                     hook(ev)?;
                     Ok(vec![])
                 },
-            ),
-            // The hook observes; the guest reads nothing back from it.
+            )), // The hook observes; the guest reads nothing back from it.
             temen_interp::CapState::Stateless,
-        );
+        ));
         assert_eq!(
             handle, hooks.handle,
             "mem-hook grant must be the first grant on a fresh Host (deterministic handles)"

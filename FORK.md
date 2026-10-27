@@ -205,7 +205,7 @@ the freeze/flatten soundness change from the instantiation, interp==JIT, TDD-fir
 
 - **`fork_ctx` (host-cap forkability). DONE.** `HostProcFork = Arc<dyn Fn() -> HostProc>` — the
   provider's fork factory, the Rust face of a C embedder's `fork_ctx(parent_ctx) → child_ctx`;
-  `grant_host_proc_forkable` registers it; `fork_powerbox` carries host procs iff **every** entry has a
+  a forkable grant registers it (`HostProcGrant::forkable`, #2625); `fork_powerbox` carries host procs iff **every** entry has a
   factory (one factory-less entry fails the whole fork closed), minting the twin's closures at the same
   indices and riding the factories along (fork-of-fork). `HostCap::host_proc`'s `make` **is already the
   factory** (the multi-backend "fresh closure per grant over shared state" contract = fork-shares-state),
@@ -236,7 +236,7 @@ to a shared stdout stream. That guest is **hand-written IR** and uses a **regran
 The remaining slices turn that into a *compiled-C* program with *real libc*:
 
 - **Slice 1 — forkable libc. DONE (this PR).** `temen_posix::grant` mints libc via
-  `grant_host_proc_forkable` over the shared `Inner`, so a chibicc-world domain's libc carries across a
+  a forkable grant (`HostProcGrant::forkable`) over the shared `Inner`, so a chibicc-world domain's libc carries across a
   twin (was fail-closed). `posix_cap` (on-ramp) was already forkable (§8.4).
 - **Slice 2 — bind a child's named `fork` import to the live fork offer. DONE.** *Refined from the
   original `__px_`-shim framing.* A compiled-C command is its **own module**, spawned nested via
@@ -569,7 +569,7 @@ in `c_fork.rs`:
   in `args[0]`) to the registered closure. This is the same op-in-arg0 wrapper `c_link.rs` uses at the
   top level, now reachable through a spawn's grant list (op 13's then, the op-17 record's now) so a spawned/exec'd child
   inherits fs authority.
-  The cap is granted **forkable** (`grant_host_proc_forkable`), the shape `regrant_into_child` re-mints
+  The cap is granted **forkable** (`HostProcGrant::forkable`), the shape `regrant_into_child` re-mints
   into a child, so the memfs store is shared across the fork.
 
 **`waitpid(-1)` — reap *any* child. DONE.** The servicer-side `reap` now special-cases `pid == -1`

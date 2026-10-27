@@ -11,6 +11,7 @@
 //! `__vm_host_call(__vm_cap_resolve("posix"), OP_*, a, b, c, d)`.
 
 use crate::HostCap;
+use temen_interp::{HostProcGrant, ProcHandler};
 use temen_posix::Posix;
 
 /// Build the POSIX personality as a named powerbox capability. Returns the [`HostCap`] to grant (e.g.
@@ -55,7 +56,9 @@ fn posix_cap_inner(
     let cap = HostCap::custom(temen_interp::cap_id::HOST_PROC, 0, move |h, _win| {
         p.bind(&h.own_node()); // #2306 — the domain it is granted to pays for its state
         let (f, state) = make();
-        let handle = h.grant_host_proc_forkable(f, std::sync::Arc::clone(&fork), state);
+        let handle = h.grant_host_proc(
+            HostProcGrant::new(ProcHandler::Sync(f), state).forkable(std::sync::Arc::clone(&fork)),
+        );
         let (door, armed) = temen_posix::cap_signal_source(&p);
         h.set_signal_source(door, armed);
         h.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(&p));

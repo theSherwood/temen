@@ -11,7 +11,7 @@
 //! via `DOOM_TEMEN` / `DOOM_WAD` / `DOOM_NATIVE_FRAMES`; the defaults match the demo scripts' cache.
 //! Run:  `cargo test -p temen-run --test doom_diff -- --ignored --nocapture`
 
-use temen_interp::{bytecode, Host, StreamRole};
+use temen_interp::{bytecode, Host, HostProcGrant, ProcHandler, StreamRole};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -78,8 +78,8 @@ fn doom_frame_hashes_match_native() {
     // A read-only in-memory WAD over the `fs` capability (op protocol per lua_files_stdio.c):
     // 0 open(name,len,flags)->fd; 1 read(fd,buf,len)->n; 3 seek(fd,whence,off)->pos; 4 close.
     let mut cursors: Vec<u64> = Vec::new();
-    let h = host.grant_host_proc(
-        Box::new(move |op, a, mem, _| match op {
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(move |op, a, mem, _| match op {
             0 => {
                 let name = mem
                     .and_then(|m| m.read_bytes(a[0] as u64, a[1] as u64))
@@ -114,9 +114,9 @@ fn doom_frame_hashes_match_native() {
             }
             2 => Ok(vec![a[2]]), // write: discard-accept (config/savegame), non-fatal
             _ => Ok(vec![0]),
-        }),
+        })),
         temen_interp::CapState::Stateless,
-    );
+    ));
     host.register_cap_name("fs", h);
 
     // func 0 = _start → main → doomgeneric_Create + the N-frame loop, printing a hash per frame.

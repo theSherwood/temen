@@ -1991,7 +1991,7 @@ subsumed (a blocking dispatch held the one `Mutex<Host>`, serializing even the t
 `max_active` 1). The parking plan then landed in three slices and the ring was retired on the
 numbers:
 
-1. *Registration declares blockingness* (`Host::grant_host_proc_offloadable`, the `HostProcEntry`
+1. *Registration declares blockingness* (`ProcHandler::Offloadable`, the `HostProcEntry`
    per-entry-powers pattern): the handler decides per call — `Done` inline (the fast case pays
    nothing) or `Offload` a self-contained scalar job (the io_uring try-nonblocking model). Scalars
    only, **no window access** (the pool never touches the window), single-`i64` replies
@@ -2021,7 +2021,7 @@ on an outstanding call, so a call waiting on the world never holds back a timed 
 every engine in `temen-run/tests/cap_park.rs`.
 
 **A child's call parks the child alone (#2424, 2026-10-16).** A provider that gives an offloadable
-procedure a fork factory (`grant_host_proc_offloadable`'s `fork`, minting `ForkedProc::offloadable`)
+procedure a fork factory (`HostProcGrant::fork`, minting an offloadable `ForkedProc`)
 lets a spawn re-grant it to a §14 child and a fork twin carry it, as a synchronous one's. Each
 domain's calls stay in its own `Completions`, ids unique in the process (#2495), and each answer is
 delivered as it arrives (#2477), so no outstanding call holds back another's answer, in its domain or another. The
@@ -2078,7 +2078,7 @@ longer posts without ringing: that special case is gone. Pinned on every engine 
 the domain's host, so where a domain's tasks share it under a lock (the tree-walker, the parallel
 driver and executor 2, the JIT's `cap_thunk_locked`) a handler that waits holds back every other
 task's host call until it returns. An unlocked procedure (`ProcHandler::Unlocked`,
-`Host::grant_host_proc_unlocked`) keeps no state in the host and gets no region minter: the dispatch
+granted like any other through `HostProcGrant`) keeps no state in the host and gets no region minter: the dispatch
 still resolves the handle and the op under the lock, then hands the call back
 (`UnlockedCall`, through `cap_dispatch_slots_deferring`'s `unlocked` face, beside the parking face),
 and the engine runs it once it has let go of the host. The call keeps the caller's window. An

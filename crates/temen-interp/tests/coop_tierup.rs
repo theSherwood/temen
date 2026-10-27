@@ -29,8 +29,8 @@ mod rec;
 use std::sync::{Arc, Mutex};
 use temen_interp::bytecode::{ModuleEmitter, ModuleOffer, ProgramEmit, TierUpConfig};
 use temen_interp::{
-    bytecode, CapState, ForkedProc, Host, HostProc, HostProcFork, ParkEvent, SignalSource, Trap,
-    Value,
+    bytecode, CapState, ForkedProc, Host, HostProc, HostProcFork, HostProcGrant, ParkEvent,
+    ProcHandler, SignalSource, Trap, Value,
 };
 use temen_text::parse_module;
 
@@ -1436,11 +1436,16 @@ fn grant_proc_doors(host: &mut Host) -> i32 {
         Some(ForkedProc {
             signal: Some((source, Arc::default())),
             exit: Some(Arc::new(move |s| *exited.lock().unwrap() = Some(s))),
-            ..ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![ENOSYS])), CapState::Stateless)
+            ..ForkedProc::shared(
+                ProcHandler::Sync(Box::new(|_, _, _, _| Ok(vec![ENOSYS]))),
+                CapState::Stateless,
+            )
         })
     });
     host.set_signal_source(door, Arc::default());
-    host.grant_host_proc_forkable(doors, fork, CapState::Stateless)
+    host.grant_host_proc(
+        HostProcGrant::new(ProcHandler::Sync(doors), CapState::Stateless).forkable(fork),
+    )
 }
 
 /// The park door the driver installs on a domain's signal source.

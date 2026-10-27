@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use temen_durable::transform_module_assume_confined;
 use temen_interp::{
-    CapState, Host, HostProc, NamedCapGrant, OffloadOutcome, SignalSource, StreamRole, Value,
+    CapState, Host, HostProc, HostProcGrant, NamedCapGrant, OffloadOutcome, ProcHandler,
+    SignalSource, StreamRole, Value,
 };
 use temen_ir::durable_abi::ShadowArena;
 use temen_ir::{Module, SpawnRec};
@@ -141,9 +142,7 @@ pub fn named_proc(name: &str, e: &Embedder) -> Option<HostProc> {
 /// [`named_proc`] as a thaw's registrar re-grants it: stateless, with no fork factory.
 pub fn regrant(name: &str, e: &Embedder) -> Option<NamedCapGrant> {
     named_proc(name, e).map(|handler| NamedCapGrant {
-        handler,
-        fork: None,
-        state: CapState::Stateless,
+        grant: HostProcGrant::new(ProcHandler::Sync(handler), CapState::Stateless),
         process: None,
     })
 }
@@ -151,7 +150,10 @@ pub fn regrant(name: &str, e: &Embedder) -> Option<NamedCapGrant> {
 /// Grant [`named_proc`] `name` under its name.
 fn grant_named(host: &mut Host, e: &Embedder, name: &str) -> i32 {
     let proc = named_proc(name, e).expect("a probe grants only what its embedder serves");
-    let h = host.grant_host_proc(proc, CapState::Stateless);
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(proc),
+        CapState::Stateless,
+    ));
     host.register_cap_name(name, h);
     h
 }
@@ -688,8 +690,8 @@ block 0 (vh: i32) {
 /// millisecond: the call waits on the world while the run goes on.
 fn host_answered() -> (Host, Vec<Value>) {
     let mut host = Host::new();
-    let h = host.grant_host_proc_offloadable(
-        Box::new(|_op, args| {
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Offloadable(Box::new(|_op, args| {
             let a = plus_100(args);
             OffloadOutcome::Host(Box::new(move |c| {
                 std::thread::spawn(move || {
@@ -697,10 +699,9 @@ fn host_answered() -> (Host, Vec<Value>) {
                     c.complete(a);
                 });
             }))
-        }),
-        None,
+        })),
         CapState::Stateless,
-    );
+    ));
     host.register_cap_name("plus100", h);
     (host, vec![Value::I32(h)])
 }
@@ -708,14 +709,13 @@ fn host_answered() -> (Host, Vec<Value>) {
 /// A powerbox whose op 1 a pool thread answers, `argument + 100`.
 fn offloaded() -> (Host, Vec<Value>) {
     let mut host = Host::new();
-    let h = host.grant_host_proc_offloadable(
-        Box::new(|_op, args| {
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Offloadable(Box::new(|_op, args| {
             let a = plus_100(args);
             OffloadOutcome::Offload(Box::new(move || a))
-        }),
-        None,
+        })),
         CapState::Stateless,
-    );
+    ));
     host.register_cap_name("plus100", h);
     (host, vec![Value::I32(h)])
 }

@@ -23,8 +23,8 @@
 //! which is exactly what this asserts does *not* happen.
 
 use std::sync::{Arc, Mutex};
-use temen_interp::bytecode::ScheduledDebugRun;
 use temen_interp::moment::Refusal;
+use temen_interp::{bytecode::ScheduledDebugRun, HostProcGrant, ProcHandler};
 use temen_interp::{run_with_host, GuestMem, Host, RegionMinter, Value};
 use temen_text::parse_module;
 
@@ -76,8 +76,8 @@ fn grant_counter(host: &mut Host, named: bool) {
     let n = Arc::new(Mutex::new(0i64));
     let call = Arc::clone(&n);
     let (cap, put) = (Arc::clone(&n), Arc::clone(&n));
-    let h = host.grant_host_proc(
-        Box::new(
+    let h = host.grant_host_proc(HostProcGrant::new(
+        ProcHandler::Sync(Box::new(
             move |_op: u32,
                   _args: &[i64],
                   _mem: Option<&mut dyn GuestMem>,
@@ -86,7 +86,7 @@ fn grant_counter(host: &mut Host, named: bool) {
                 *c += 1;
                 Ok(vec![*c])
             },
-        ),
+        )),
         temen_interp::CapState::Captured {
             capture: Box::new(move || cap.lock().unwrap().to_le_bytes().to_vec()),
             restore: Box::new(move |b| {
@@ -96,7 +96,7 @@ fn grant_counter(host: &mut Host, named: bool) {
                 *put.lock().unwrap() = i64::from_le_bytes(buf);
             }),
         },
-    );
+    ));
     if named {
         host.register_cap_name("cnt", h);
     }

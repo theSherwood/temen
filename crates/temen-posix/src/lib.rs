@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use temen_interp::{
     cap_id, CapState, ForkedProc, GuestMem, Host, HostBuffer, HostCharge, HostProc, HostProcFork,
-    NamedCapGrant, NodeRef, OpParks, ProcHandler, SignalSource, Trap, TABLE_ENTRY,
+    HostProcGrant, NamedCapGrant, NodeRef, OpParks, ProcHandler, SignalSource, Trap, TABLE_ENTRY,
 };
 use temen_ir::ResolvedCap;
 
@@ -2794,8 +2794,7 @@ pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> 
     // cwd / env / signal state over the shared memfs and open-file descriptions — real POSIX fork
     // semantics. `Host::fork_powerbox` calls this factory to carry libc into the twin, instead of
     // failing closed on an opaque closure.
-    let g = named_grant(&posix);
-    let handle = host.grant_host_proc_forkable(g.handler, g.fork.expect("forkable"), g.state);
+    let handle = host.grant_host_proc(named_grant(&posix).grant);
     install(host, &posix, handle);
     (handle, posix)
 }
@@ -2819,12 +2818,14 @@ fn new_posix(heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> Posix {
 /// registrar returns it for a personality rebuilt with [`Posix::from_state`].
 pub fn named_grant(posix: &Posix) -> NamedCapGrant {
     NamedCapGrant {
-        handler: handler(Arc::clone(&posix.world), Arc::clone(&posix.root)),
-        fork: Some(fork_factory(
+        grant: HostProcGrant::new(
+            ProcHandler::Sync(handler(Arc::clone(&posix.world), Arc::clone(&posix.root))),
+            captured(posix),
+        )
+        .forkable(fork_factory(
             Arc::clone(&posix.world),
             Arc::clone(&posix.root),
         )),
-        state: captured(posix),
         process: None,
     }
 }
@@ -2875,9 +2876,11 @@ fn twin_grant(posix: &Posix, pid: i32) -> Option<NamedCapGrant> {
     };
     let (signal, exit, exec_remap) = process_doors(&posix.world, &proc_, pid);
     Some(NamedCapGrant {
-        handler: handler(Arc::clone(&posix.world), Arc::clone(&proc_)),
-        fork: Some(fork_factory(Arc::clone(&posix.world), Arc::clone(&proc_))),
-        state: twin_state(pid),
+        grant: HostProcGrant::new(
+            ProcHandler::Sync(handler(Arc::clone(&posix.world), Arc::clone(&proc_))),
+            twin_state(pid),
+        )
+        .forkable(fork_factory(Arc::clone(&posix.world), Arc::clone(&proc_))),
         process: Some(temen_interp::ProcessDoors {
             signal: Some(signal),
             exit: Some(exit),
@@ -3149,8 +3152,10 @@ pub fn cap(
     // process, so they share both sides (unlike a fork, which clones the proc side).
     let p = posix.clone();
     let make = move || {
-        let g = named_grant(&p);
-        (g.handler, g.state)
+        (
+            handler(Arc::clone(&p.world), Arc::clone(&p.root)),
+            captured(&p),
+        )
     };
     (posix, make)
 }
@@ -8504,7 +8509,7 @@ block 0 (vph: i32) {\n\
         posix.write_file("greet", b"hi!"); // host writes into the shared memfs
         let mut host = Host::new();
         let (f, state) = make(); // a factory-minted libc handler (the twin's libc)
-        let h = host.grant_host_proc(f, state);
+        let h = host.grant_host_proc(HostProcGrant::new(ProcHandler::Sync(f), state));
         let mut fuel = 5_000_000u64;
         let ir = run_capture_reserved_with_host(
             &m,

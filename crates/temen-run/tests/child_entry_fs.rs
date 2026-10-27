@@ -31,7 +31,7 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use temen_interp::{ForkedProc, Host, HostProcFork, Value};
+use temen_interp::{ForkedProc, Host, HostProcFork, HostProcGrant, ProcHandler, Value};
 use temen_ir::Module;
 use temen_run::fs::MemFsHandle;
 use temen_text::parse_module;
@@ -66,10 +66,12 @@ fn spawn_child_over_memfs(
             let factory = Arc::clone(&factory);
             Arc::new(move |_pid| {
                 let (h, s) = (*factory)();
-                Some(ForkedProc::shared(h, s))
+                Some(ForkedProc::shared(ProcHandler::Sync(h), s))
             })
         };
-        let fs_h = host.grant_host_proc_forkable(init, fork, init_state);
+        let fs_h = host.grant_host_proc(
+            HostProcGrant::new(ProcHandler::Sync(init), init_state).forkable(fork),
+        );
         let (inst, modh, budget) = temen_run::grant_conductor(&mut host, child);
         let args = [inst, modh, budget, fs_h].map(Value::I32).to_vec();
         (host, args)

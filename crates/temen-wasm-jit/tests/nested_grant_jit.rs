@@ -10,7 +10,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use temen_interp::{bytecode, ForkedProc, Host, HostProc, Region, Value};
+use temen_interp::{
+    bytecode, ForkedProc, Host, HostProc, HostProcGrant, ProcHandler, Region, Value,
+};
 use temen_wasm_jit::compile_module_reactor;
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
@@ -65,15 +67,21 @@ fn granted_host() -> (Host, Arc<Mutex<i64>>) {
     let fork = Arc::new(move |_pid: u64| {
         let c = Arc::clone(&c2);
         Some(ForkedProc::shared(
-            Box::new(move |_op, _args, _mem, _| {
+            ProcHandler::Sync(Box::new(move |_op, _args, _mem, _| {
                 let mut c = c.lock().unwrap();
                 *c += 1;
                 Ok(vec![*c])
-            }),
+            })),
             temen_interp::CapState::Stateless,
         ))
     });
-    let h = host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Stateless);
+    let h = host.grant_host_proc(
+        HostProcGrant::new(
+            ProcHandler::Sync(handler),
+            temen_interp::CapState::Stateless,
+        )
+        .forkable(fork),
+    );
     host.register_cap_name("fs", h);
     (host, counter)
 }

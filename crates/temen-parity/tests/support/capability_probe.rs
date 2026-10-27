@@ -21,7 +21,9 @@
 // call site; the compiler will not.
 #![allow(dead_code)]
 
-use temen_interp::{CapState, Host, HostProc, RegionBacking, SharedBacking, StreamRole};
+use temen_interp::{
+    CapState, Host, HostProc, HostProcGrant, ProcHandler, RegionBacking, SharedBacking, StreamRole,
+};
 use temen_parity::frontier::Capability;
 
 pub fn a_module() -> temen_ir::Module {
@@ -298,12 +300,18 @@ pub fn rows() -> Vec<Row> {
             &[
                 || {
                     let mut h = Host::new();
-                    let x = h.grant_host_proc(zero(), CapState::Stateless);
+                    let x = h.grant_host_proc(HostProcGrant::new(
+                        ProcHandler::Sync(zero()),
+                        CapState::Stateless,
+                    ));
                     (h, x)
                 },
                 || {
                     let mut h = Host::new();
-                    let x = h.grant_host_proc(zero(), CapState::Stateless);
+                    let x = h.grant_host_proc(HostProcGrant::new(
+                        ProcHandler::Sync(zero()),
+                        CapState::Stateless,
+                    ));
                     h.register_cap_name(ZERO, x);
                     (h, x)
                 },
