@@ -151,37 +151,47 @@ fn stress(n: usize) -> String {
     s
 }
 
-/// For each `n` and input, the JIT must equal the tree-walk oracle (INVARIANTS #9).
-#[test]
-fn jit_setjmp_matches_oracle_under_register_pressure() {
-    let inputs: [i64; 5] = [7, 64, 1000, -7, i64::MAX];
-    // n <= 14 fits in registers and already agrees; n >= 15 is where the crossing values spill and
-    // the longjmp path clobbers their slots. Sweep across the threshold and well past it.
-    for n in [1usize, 8, 14, 15, 16, 24, 48, 128] {
-        let src = stress(n);
-        let m = parse_module(&src).unwrap_or_else(|e| panic!("parse n={n}: {e:?}"));
+/// For each `n` and input `x`, the JIT must return what the tree-walk oracle returns on
+/// `module(n)` (INVARIANTS #9). Every repro here returns `i64`s cleanly on the oracle.
+fn assert_jit_matches_oracle(module: impl Fn(usize) -> String, ns: &[usize], inputs: &[i64]) {
+    for &n in ns {
+        let src = module(n);
+        let m = parse_module(&src).unwrap_or_else(|e| panic!("parse n={n}: {e:?}\n{src}"));
         verify_module(&m).unwrap_or_else(|e| panic!("verify n={n}: {e:?}"));
-        for &x in &inputs {
+        for &x in inputs {
             let mut fuel = 100_000_000u64;
-            let want = match run(&m, 0, &[Value::I64(x)], &mut fuel) {
-                Ok(vs) => match vs.as_slice() {
-                    [Value::I64(v)] => *v,
-                    other => panic!("oracle result shape n={n} x={x}: {other:?}"),
-                },
-                Err(t) => {
-                    panic!("oracle trapped n={n} x={x}: {t:?} (repro expects a clean return)")
-                }
+            let want: Vec<i64> = match run(&m, 0, &[Value::I64(x)], &mut fuel) {
+                Ok(vs) => vs
+                    .iter()
+                    .map(|v| match v {
+                        Value::I64(v) => *v,
+                        other => panic!("oracle result shape n={n} x={x}: {other:?}"),
+                    })
+                    .collect(),
+                Err(t) => panic!("oracle trapped n={n} x={x}: {t:?} (a repro returns cleanly)"),
             };
             let got = match compile_and_run(&m, 0, &[x]) {
-                Ok(JitOutcome::Returned(s)) => s[0],
+                Ok(JitOutcome::Returned(s)) => s,
                 other => panic!("jit did not return n={n} x={x}: {other:?}"),
             };
             assert_eq!(
                 want, got,
-                "#2537: JIT disagrees with the oracle at n={n} x={x} (oracle={want}, jit={got})"
+                "JIT disagrees with the oracle at n={n} x={x} (oracle={want:?}, jit={got:?})"
             );
         }
     }
+}
+
+/// For each `n` and input, the JIT must equal the tree-walk oracle (INVARIANTS #9).
+#[test]
+fn jit_setjmp_matches_oracle_under_register_pressure() {
+    // n <= 14 fits in registers and already agrees; n >= 15 is where the crossing values spill and
+    // the longjmp path clobbers their slots. Sweep across the threshold and well past it.
+    assert_jit_matches_oracle(
+        stress,
+        &[1, 8, 14, 15, 16, 24, 48, 128],
+        &[7, 64, 1000, -7, i64::MAX],
+    );
 }
 
 /// [`stress`] with the crossing values defined a block *before* the `setjmp`: they reach the
@@ -253,28 +263,87 @@ fn stress_forwarded(n: usize) -> String {
 /// that forward them past the `setjmp` block.
 #[test]
 fn jit_setjmp_matches_oracle_with_forwarded_crossing_values() {
-    let inputs: [i64; 3] = [7, 1000, -7];
-    for n in [1usize, 8, 15, 24, 48] {
-        let src = stress_forwarded(n);
-        let m = parse_module(&src).unwrap_or_else(|e| panic!("parse n={n}: {e:?}\n{src}"));
-        verify_module(&m).unwrap_or_else(|e| panic!("verify n={n}: {e:?}"));
-        for &x in &inputs {
-            let mut fuel = 100_000_000u64;
-            let want = match run(&m, 0, &[Value::I64(x)], &mut fuel) {
-                Ok(vs) => match vs.as_slice() {
-                    [Value::I64(v)] => *v,
-                    other => panic!("oracle result shape n={n} x={x}: {other:?}"),
-                },
-                Err(t) => panic!("oracle trapped n={n} x={x}: {t:?}"),
-            };
-            let got = match compile_and_run(&m, 0, &[x]) {
-                Ok(JitOutcome::Returned(s)) => s[0],
-                other => panic!("jit did not return n={n} x={x}: {other:?}"),
-            };
-            assert_eq!(
-                want, got,
-                "JIT disagrees with the oracle at n={n} x={x} (oracle={want}, jit={got})"
-            );
-        }
+    assert_jit_matches_oracle(stress_forwarded, &[1, 8, 15, 24, 48], &[7, 1000, -7]);
+}
+
+/// #2652 — [`stress`], but the re-entry block also reads the lowering's own context values, which
+/// are CLIF values and no IR value names: its `call.dyn` reads the function table's base, the
+/// vmctx and the stack limit, and with more than four `results` its `return` writes them through
+/// the return area's pointer. Nothing reads the table base, the limit or that pointer between the
+/// function's entry and the re-entry, so with `n` loads live at once before the `setjmp` the
+/// allocator spills them. The longjmp path makes no call and never returns, so they are dead
+/// there, and its own spills may reuse their slots.
+fn stress_context(n: usize, results: usize) -> String {
+    let types = vec!["i64"; results].join(", ");
+    let mut s = format!("memory 16\nfunc (i64) -> ({types}) {{\nblock 0 (v0: i64) {{\n");
+    for k in 0..n {
+        s += &format!(
+            "  c{k} = i64.const {}\n  a{k} = i64.add v0 c{k}\n  o{k} = i64.const {}\n  i64.store o{k} a{k}\n",
+            k + 1,
+            41000 + 8 * k
+        );
     }
+    for k in 0..n {
+        s += &format!(
+            "  p{k} = i64.const {}\n  x{k} = i64.load p{k}\n",
+            41000 + 8 * k
+        );
+    }
+    let crossing: Vec<String> = (0..n).map(|k| format!("x{k}")).collect();
+    s += &format!(
+        "  f = ref.func 1\n  buf = i64.const 40000\n  sj = setjmp buf\n  zero = i32.const 0\n  first = i32.eq sj zero\n  br_if first 1() 2({}, f)\n  }}\n",
+        crossing.join(", ")
+    );
+    // The longjmp path: as many loads live at once as the crossing values, and no call.
+    s += "block 1 () {\n";
+    for k in 0..n {
+        s += &format!(
+            "  e{k} = i64.const {}\n  q{k} = i64.const {}\n  i64.store q{k} e{k}\n",
+            7 * k + 5,
+            43000 + 8 * k
+        );
+    }
+    for k in 0..n {
+        s += &format!(
+            "  r{k} = i64.const {}\n  y{k} = i64.load r{k}\n",
+            43000 + 8 * k
+        );
+    }
+    s += "  t0 = i64.const 0\n";
+    for k in 0..n {
+        s += &format!("  t{} = i64.add t{k} y{k}\n", k + 1);
+    }
+    s += &format!(
+        "  tc = i64.const 45000\n  i64.store tc t{n}\n  one = i32.const 1\n  buf2 = i64.const 40000\n  longjmp buf2 one\n  unreachable\n  }}\n"
+    );
+    // The re-entry: sum the crossing values, then dispatch through the function table.
+    let params: Vec<String> = (0..n).map(|k| format!("d{k}: i64")).collect();
+    s += &format!(
+        "block 2 ({}, g: i32) {{\n  s0 = i64.const 0\n",
+        params.join(", ")
+    );
+    for k in 0..n {
+        s += &format!("  s{} = i64.add s{k} d{k}\n", k + 1);
+    }
+    s += &format!(
+        "  m = call.dyn (i64) -> (i64) g (s{n})\n  fixed = i64.const 48000\n  i64.store fixed m\n  back = i64.load fixed\n"
+    );
+    // The other results: the sum plus 1, 2, …, so each is distinct.
+    for k in 1..results {
+        s += &format!("  k{k} = i64.const {k}\n  w{k} = i64.add s{n} k{k}\n");
+    }
+    let rest: String = (1..results).map(|k| format!(" w{k}")).collect();
+    s += &format!("  return back{rest}\n  }}\n}}\n");
+    s += "\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i64.const 3\n  v2 = i64.mul v0 v1\n  return v2\n  }\n}\n";
+    s
+}
+
+/// The JIT must equal the oracle when the re-entry block reads the context values (#2652). Before
+/// the fix, from `n = 15` the table base came back clobbered and the `call.dyn` crashed the host.
+#[test]
+fn jit_setjmp_matches_oracle_with_context_values_after_the_second_return() {
+    let ns = [1, 8, 15, 24, 48, 128];
+    assert_jit_matches_oracle(|n| stress_context(n, 1), &ns, &[7, 1000, -7]);
+    // Five results return through the return area, whose pointer is a context value too.
+    assert_jit_matches_oracle(|n| stress_context(n, 5), &ns, &[7, 1000, -7]);
 }
