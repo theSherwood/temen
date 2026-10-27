@@ -70,6 +70,33 @@ fn generator_reaches_the_wasm_memory_oracle() {
     );
 }
 
+/// Non-vacuity for #2454: `fuzz_one_wasm` raises half its modules into dominance form, and the tier
+/// must emit them with their captures rather than decline — or the sweep above skips every capture.
+#[test]
+fn raised_modules_reach_the_wasm_tier_with_captures() {
+    let iters: u64 = if cfg!(windows) { 1200 } else { 8000 };
+    let mut emitted = 0u64;
+    for seed in 0..iters {
+        let mut m = wasmdiff::gen_module(&mut seed_gen(seed));
+        for f in &mut m.funcs {
+            f.raise();
+        }
+        let captures = m
+            .funcs
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .any(|b| !b.captures.is_empty());
+        if captures && temen_wasm_jit::compile_module(&m).is_ok() {
+            emitted += 1;
+        }
+    }
+    // 8000 seeds yield ~6100 today.
+    assert!(
+        emitted > iters / 2,
+        "too few raised modules with captures emit ({emitted} of {iters})"
+    );
+}
+
 /// #1856: `min`/`max` of a NaN yield the IR's canonical NaN (the interpreter's `fmin`/`fmax`, and the
 /// JIT's `canonicalize_nan`). The wasm tier emitted the native op, which may return an input NaN's
 /// payload and sign, and a reinterpret makes those bits observable. The nightly's module was

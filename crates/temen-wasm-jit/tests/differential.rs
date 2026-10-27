@@ -234,6 +234,42 @@ fn alu() {
     diff("alu", ALU, ARGS, FUEL);
 }
 
+/// #2454: the ALU recurrence in dominance form. The loop bound and the LCG multiplier are defined in
+/// the entry block and captured by the blocks below it, which reuse the pool slots around them, so a
+/// captured value needs a local of its own. Block 3 captures block 1's capture of the bound: a capture
+/// of a capture is the value it takes.
+const ALU_CAPTURED: &str = r#"
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 0
+  v2 = i64.const 6364136223846793005
+  br 1(v1, v1)
+}
+block 1 in 0 (v3: i64, v4: i64, v5 = 0.v0) {
+  v6 = i64.lt_s v4 v5
+  br_if v6 2() 3()
+}
+block 2 in 1 (v7 = 1.v3, v8 = 1.v4, v9 = 0.v2) {
+  v10 = i64.mul v7 v9
+  v11 = i64.const 1442695040888963407
+  v12 = i64.add v10 v11
+  v13 = i64.add v12 v8
+  v14 = i64.const 1
+  v15 = i64.add v8 v14
+  br 1(v13, v15)
+}
+block 3 in 1 (v16 = 1.v3, v17 = 1.v5) {
+  v18 = i64.add v16 v17
+  return v18
+  }
+}
+"#;
+
+#[test]
+fn alu_captured() {
+    diff("alu_captured", ALU_CAPTURED, ARGS, FUEL);
+}
+
 /// A standalone `atomic.fence` is a pure ordering barrier — observably a no-op in a single-threaded
 /// guest. It must not perturb the surrounding computation (the result stays `arg + 1`), and the
 /// wasm-JIT emits nothing for it.

@@ -25,6 +25,20 @@ fn parse(src: &str) -> temen_ir::Module {
     m
 }
 
+/// `src` raised into dominance form (#2454): a split carries its captures across groups as params.
+fn raised(src: &str) -> temen_ir::Module {
+    let mut m = parse(src);
+    for f in &mut m.funcs {
+        f.raise();
+    }
+    temen_verify::verify_module(&m).expect("verify raised");
+    assert!(
+        m.funcs[0].blocks.iter().any(|b| !b.captures.is_empty()),
+        "raise captured nothing"
+    );
+    m
+}
+
 fn oracle(m: &temen_ir::Module, arg: i64) -> i64 {
     let mut fuel = u64::MAX;
     match run(m, 0, &[Value::I64(arg)], &mut fuel) {
@@ -180,42 +194,44 @@ fn run_local(wasm: &[u8], arg: i64) -> i64 {
 /// This is the mode `compile_jit`/`compile_module_reactor` emit, so it de-risks the warm-path wiring.
 #[test]
 fn local_split_dispatch_loop_matches_interp() {
-    let m = parse(DISPATCH_LOOP);
-    let nblocks = m.funcs[0].blocks.len();
-    for &n in &[0i64, 1, 2, 3, 7, 20, 100] {
-        let want = oracle(&m, n);
-        for k in 2..=nblocks {
-            let split = compile_module_with_split(&m, false, 0, k).expect("local split emits");
-            assert_eq!(
-                run_local(&split, n),
-                want,
-                "local split k={k} != interp (n={n})"
-            );
+    for m in [parse(DISPATCH_LOOP), raised(DISPATCH_LOOP)] {
+        let nblocks = m.funcs[0].blocks.len();
+        for &n in &[0i64, 1, 2, 3, 7, 20, 100] {
+            let want = oracle(&m, n);
+            for k in 2..=nblocks {
+                let split = compile_module_with_split(&m, false, 0, k).expect("local split emits");
+                assert_eq!(
+                    run_local(&split, n),
+                    want,
+                    "local split k={k} != interp (n={n})"
+                );
+            }
         }
     }
 }
 
 #[test]
 fn b2_split_dispatch_loop_matches_interp() {
-    let m = parse(DISPATCH_LOOP);
-    let nblocks = m.funcs[0].blocks.len();
-    let unsplit = compile_module_b2(&m, false, LOG2).expect("b2 emits");
-    for &n in &[0i64, 1, 2, 3, 7, 20, 100] {
-        let want = oracle(&m, n);
-        // Unsplit B2 is the baseline (also proves the harness).
-        assert_eq!(
-            run_b2(&m, &unsplit, n),
-            want,
-            "unsplit b2 != interp (n={n})"
-        );
-        // Split func 0 (the hot loop with the call_indirect) at every K.
-        for k in 2..=nblocks {
-            let split = compile_module_b2_split(&m, false, LOG2, 0, k).expect("b2 split emits");
+    for m in [parse(DISPATCH_LOOP), raised(DISPATCH_LOOP)] {
+        let nblocks = m.funcs[0].blocks.len();
+        let unsplit = compile_module_b2(&m, false, LOG2).expect("b2 emits");
+        for &n in &[0i64, 1, 2, 3, 7, 20, 100] {
+            let want = oracle(&m, n);
+            // Unsplit B2 is the baseline (also proves the harness).
             assert_eq!(
-                run_b2(&m, &split, n),
+                run_b2(&m, &unsplit, n),
                 want,
-                "b2 split k={k} != interp (n={n})"
+                "unsplit b2 != interp (n={n})"
             );
+            // Split func 0 (the hot loop with the call_indirect) at every K.
+            for k in 2..=nblocks {
+                let split = compile_module_b2_split(&m, false, LOG2, 0, k).expect("b2 split emits");
+                assert_eq!(
+                    run_b2(&m, &split, n),
+                    want,
+                    "b2 split k={k} != interp (n={n})"
+                );
+            }
         }
     }
 }
