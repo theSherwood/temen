@@ -221,8 +221,8 @@ impl HostFsState {
     ///
     /// Each op resolves its path beneath it with cap-std, the resolver Wasmtime's preopens use.
     /// `read_path` has already refused absolute paths and `..`; cap-std refuses a symlink that would
-    /// lead out, `-EACCES` alike, and acts on what it resolved, so a link the host swaps into the
-    /// tree mid-op can't redirect the op.
+    /// lead out, `-EACCES` alike. The op then acts on what was resolved (on Windows, five of them
+    /// through `win`), so a link the host makes in the tree mid-op can't redirect it.
     fn dir(&mut self) -> Result<&Dir, i64> {
         let open = match self.dir.take() {
             Some(open) => open,
@@ -383,7 +383,7 @@ impl HostFsState {
                     Ok(at) => at,
                     Err(e) => return e,
                 };
-                match dir.remove_file(path) {
+                match unlink(dir, &path) {
                     Ok(()) => 0,
                     Err(e) => io_errno(&e),
                 }
@@ -397,7 +397,7 @@ impl HostFsState {
                     Ok(at) => at,
                     Err(e) => return e,
                 };
-                match dir.rename(from, dir, to) {
+                match rename(dir, &from, &to) {
                     Ok(()) => 0,
                     Err(e) => io_errno(&e),
                 }
@@ -591,7 +591,7 @@ impl HostFsState {
                     Ok(at) => at,
                     Err(e) => return e,
                 };
-                match dir.create_dir(path) {
+                match mkdir(dir, &path) {
                     Ok(()) => 0,
                     Err(e) => io_errno(&e),
                 }
@@ -601,7 +601,7 @@ impl HostFsState {
                     Ok(at) => at,
                     Err(e) => return e,
                 };
-                match dir.remove_dir(path) {
+                match rmdir(dir, &path) {
                     Ok(()) => 0,
                     Err(e) => io_errno(&e),
                 }
@@ -611,8 +611,8 @@ impl HostFsState {
                     Ok(at) => at,
                     Err(e) => return e,
                 };
-                let rd = match dir.read_dir(path) {
-                    Ok(r) => r,
+                let listing = match names(dir, &path) {
+                    Ok(names) => names,
                     Err(e) => return io_errno(&e),
                 };
                 // #2306 — the snapshot is the guest's until it closes it: an entry, and one per
@@ -622,11 +622,11 @@ impl HostFsState {
                     return ENOSPC;
                 }
                 let mut names: Vec<String> = Vec::new();
-                for ent in rd {
-                    let refused = match ent {
+                for name in listing {
+                    let refused = match name {
                         // Names are OS strings; a non-UTF-8 entry can't round-trip through the guest's
                         // UTF-8 path protocol, so skip it (it was never nameable anyway).
-                        Ok(e) => match e.file_name().to_str() {
+                        Ok(name) => match name.to_str() {
                             Some(s) if !self.grow_tables(TABLE_ENTRY + s.len() as u64) => ENOSPC,
                             Some(s) => {
                                 names.push(s.to_string());
@@ -686,6 +686,41 @@ impl HostFsState {
         }
     }
 }
+
+// #2643 — the last step of five path ops, once cap-std has resolved the path beneath the root. Off
+// Windows these are cap-std's own, which act on the handle it resolved. On Windows cap-std rebuilds
+// a path from that handle for the OS to resolve again, which a directory turned into a junction in
+// between redirects, so `win` acts on handles there.
+#[cfg(not(windows))]
+fn mkdir(dir: &Dir, path: &str) -> std::io::Result<()> {
+    dir.create_dir(path)
+}
+#[cfg(not(windows))]
+fn rmdir(dir: &Dir, path: &str) -> std::io::Result<()> {
+    dir.remove_dir(path)
+}
+#[cfg(not(windows))]
+fn unlink(dir: &Dir, path: &str) -> std::io::Result<()> {
+    dir.remove_file(path)
+}
+#[cfg(not(windows))]
+fn rename(dir: &Dir, from: &str, to: &str) -> std::io::Result<()> {
+    dir.rename(from, dir, to)
+}
+/// The names in the directory `path` beneath `dir`, read as they are asked for.
+#[cfg(not(windows))]
+fn names(
+    dir: &Dir,
+    path: &str,
+) -> std::io::Result<impl Iterator<Item = std::io::Result<std::ffi::OsString>>> {
+    Ok(dir
+        .read_dir(path)?
+        .map(|entry| entry.map(|e| e.file_name())))
+}
+#[cfg(windows)]
+mod win;
+#[cfg(windows)]
+use win::{mkdir, names, rename, rmdir, unlink};
 
 /// Fill a [`StatBuf`] from real-fs metadata. On unix the `st_*` fields come straight from the
 /// `stat(2)` the OS already did; elsewhere the portable `Metadata` fills type + size and the rest
@@ -1405,13 +1440,16 @@ mod tests {
 
     /// #2643 — a host that swaps a directory of the tree for a link out, and back, while the guest
     /// walks through it never lets an op reach outside: an op resolves its path beneath the root
-    /// once and acts on what it resolved, so no swap lands between a check and a use.
+    /// once and acts on what it resolved, so no swap lands between a check and a use. The walk
+    /// takes every path op through `d`, and `outside` holds what each would find there: `secret`,
+    /// which only an escaped read returns, and `victim` and `d`, which `d` itself never holds.
     #[test]
     fn swapping_a_directory_for_a_link_out_never_lets_an_op_out() {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         let (base, root, outside) = link_fixture("link_swap");
         std::fs::create_dir(root.join("d")).unwrap();
         std::fs::write(root.join("d/secret"), "MINE").unwrap();
+        std::fs::write(outside.join("victim"), "VICTIM").unwrap();
         let before = listing(&outside);
 
         // The swapper takes each step once a whole walk has run since its last, so the guest walks
@@ -1462,29 +1500,53 @@ mod tests {
         let mut host = Host::new();
         let h = (host_fs(root.clone()).grant)(&mut host, 0);
         let mut win = vec![0u8; 4096];
+        // An op on one path, with its other two arguments; and a rename.
+        fn at(host: &mut Host, h: i32, win: &mut [u8], op: u32, path: &str, cd: [i64; 2]) -> i64 {
+            let (p, l) = put(win, 0, path);
+            call(host, h, win, op, &[p, l, cd[0], cd[1]])
+        }
+        fn rename(host: &mut Host, h: i32, win: &mut [u8], from: &str, to: &str) -> i64 {
+            let (tp, tl) = put(win, 1024, to);
+            let (p, l) = put(win, 0, from);
+            call(host, h, win, FS_RENAME, &[p, l, tp, tl])
+        }
+        let (host, win) = (&mut host, &mut win[..]);
+        let stat = [2048, STATBUF_LEN as i64];
         while !swapper.is_finished() {
-            let (p, l) = put(&mut win, 0, "d/secret");
-            let fd = call(&mut host, h, &mut win, FS_OPEN, &[p, l, O_READ, 0]);
+            let fd = at(host, h, win, FS_OPEN, "d/secret", [O_READ, 0]);
             if fd >= 0 {
-                assert_eq!(call(&mut host, h, &mut win, FS_READ, &[fd, 1024, 8, 0]), 4);
+                assert_eq!(call(host, h, win, FS_READ, &[fd, 1024, 8, 0]), 4);
                 assert_eq!(&win[1024..1028], b"MINE", "d/secret is the root's");
-                call(&mut host, h, &mut win, FS_CLOSE, &[fd, 0, 0, 0]);
+                call(host, h, win, FS_CLOSE, &[fd, 0, 0, 0]);
             }
-            let (p, l) = put(&mut win, 0, "d/new");
-            let fd = call(
-                &mut host,
-                h,
-                &mut win,
-                FS_OPEN,
-                &[p, l, O_WRITE | O_CREATE, 0],
-            );
+            let fd = at(host, h, win, FS_OPEN, "d/new", [O_WRITE | O_CREATE, 0]);
             if fd >= 0 {
-                call(&mut host, h, &mut win, FS_CLOSE, &[fd, 0, 0, 0]);
-                call(&mut host, h, &mut win, FS_REMOVE, &[p, l, 0, 0]);
+                call(host, h, win, FS_CLOSE, &[fd, 0, 0, 0]);
+                let left = match rename(host, h, win, "d/new", "d/new2") {
+                    0 => "d/new2",
+                    _ => "d/new",
+                };
+                at(host, h, win, FS_REMOVE, left, [0, 0]);
             }
-            let (p, l) = put(&mut win, 0, "d/m");
-            if call(&mut host, h, &mut win, FS_MKDIR, &[p, l, 0, 0]) == 0 {
-                call(&mut host, h, &mut win, FS_RMDIR, &[p, l, 0, 0]);
+            if at(host, h, win, FS_MKDIR, "d/m", [0, 0]) == 0 {
+                at(host, h, win, FS_RMDIR, "d/m", [0, 0]);
+            }
+            // `d` never holds `victim` or `d`: only an op that got out finds them.
+            assert_ne!(at(host, h, win, FS_STAT, "d/victim", stat), 0, "stat");
+            assert_ne!(at(host, h, win, FS_REMOVE, "d/victim", [0, 0]), 0, "remove");
+            assert_ne!(at(host, h, win, FS_RMDIR, "d/d", [0, 0]), 0, "rmdir");
+            assert_ne!(rename(host, h, win, "d/victim", "d/moved"), 0, "rename");
+            let dh = at(host, h, win, FS_OPENDIR, "d", [0, 0]);
+            if dh >= 0 {
+                loop {
+                    let n = call(host, h, win, FS_READDIR, &[dh, 1024, 64, 0]);
+                    if n <= 0 {
+                        break;
+                    }
+                    let name = &win[1024..1024 + n as usize];
+                    assert!(name != b"victim" && name != b"d", "d lists outside");
+                }
+                call(host, h, win, FS_CLOSEDIR, &[dh, 0, 0, 0]);
             }
             walks.fetch_add(1, Relaxed);
         }
