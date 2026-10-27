@@ -10,7 +10,8 @@
 //!   tests and differential runs: no real-fs state, no cleanup, parallel-safe.
 //! - [`host_fs`] — the **real** filesystem, attenuated to a root directory: the capability *is* the
 //!   rooted directory (relative paths only; `..` and absolute paths are refused), so the guest cannot
-//!   name anything outside it.
+//!   name anything outside it. Every path resolves beneath that directory (#2643): a symlink that
+//!   stays inside it works as its target does, and one that leads out is refused, as `..` is.
 //!
 //! ## Op protocol (`__vm_host_call(handle, op, a, b, c, d) -> i64`)
 //!
@@ -48,11 +49,10 @@
 //! the `S_IF*` type bits, size, mtime, ino/dev, …) so the guest libc can tell a directory from a file
 //! and read a size without opening; `mkdir`/`rmdir` create and remove directories; `opendir` snapshots
 //! a directory's immediate entries and `readdir` yields their names one per call (`0` when exhausted),
-//! `closedir` drops the handle. `stat` uses **lstat** semantics (does not follow symlinks) so a symlink
-//! in the tree cannot be used to probe the file *type* of something outside the granted root. Both
-//! backends implement the identical protocol; [`mem_fs`] models directories over its flat name table
-//! (a path is a directory if it was `mkdir`'d or is a strict prefix of an existing file), so a
-//! differential still runs identically on `mem_fs` and `host_fs`.
+//! `closedir` drops the handle. `stat` uses **lstat** semantics: a symlink is reported as itself, not
+//! as its target. Both backends implement the identical protocol; [`mem_fs`] models directories over
+//! its flat name table (a path is a directory if it was `mkdir`'d or is a strict prefix of an
+//! existing file), so a differential still runs identically on `mem_fs` and `host_fs`.
 //!
 //! ## The file-backed-mmap surface (`mmap`/`msync`/`munmap`) — the second storage shape
 //!
@@ -73,6 +73,7 @@
 
 use crate::Descriptor;
 use crate::HostCap;
+use cap_std::fs::Dir;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use temen_interp::{GuestMem, HostCharge, HostProc, NodeRef, RegionMinter, TABLE_ENTRY};
@@ -162,7 +163,11 @@ struct HostMapping {
 }
 
 struct HostFsState {
+    /// The granted directory's path.
     root: PathBuf,
+    /// The granted directory itself, once a path op has opened it ([`Self::dir`]), and the
+    /// descriptor of the process's it holds (#2306).
+    dir: Option<(Dir, Descriptor)>,
     open: Vec<Option<HostOpen>>,
     /// Snapshots taken by [`FS_OPENDIR`]: `opendirs[dh]` is the remaining child names to yield
     /// (sorted, so a walk is deterministic and matches `mem_fs`).
@@ -181,6 +186,7 @@ impl HostFsState {
     fn new(root: PathBuf, crash: Option<CrashCtl>, payer: &NodeRef) -> HostFsState {
         HostFsState {
             root,
+            dir: None,
             open: Vec::new(),
             opendirs: Vec::new(),
             maps: Vec::new(),
@@ -208,6 +214,40 @@ impl HostFsState {
         self.crash.as_ref().is_some_and(|c| c.crashed)
     }
 
+    /// The granted directory every path resolves beneath (#2643), opened by the first path op and
+    /// held from then on: the grant names that directory wherever the host later moves it. A root
+    /// that can't be opened yet fails the op with the `-errno` the open got, and the next op tries
+    /// again.
+    ///
+    /// Each op resolves its path beneath it with cap-std, the resolver Wasmtime's preopens use.
+    /// `read_path` has already refused absolute paths and `..`; cap-std refuses a symlink that would
+    /// lead out, `-EACCES` alike, and acts on what it resolved, so a link the host swaps into the
+    /// tree mid-op can't redirect the op.
+    fn dir(&mut self) -> Result<&Dir, i64> {
+        let open = match self.dir.take() {
+            Some(open) => open,
+            None => {
+                let held = Descriptor::take()?;
+                match Dir::open_ambient_dir(&self.root, cap_std::ambient_authority()) {
+                    Ok(dir) => (dir, held),
+                    Err(e) => return Err(io_errno(&e)),
+                }
+            }
+        };
+        Ok(&self.dir.insert(open).0)
+    }
+
+    /// The guest's path at window `(p, l)`, and the granted directory to resolve it beneath.
+    fn path_at(
+        &mut self,
+        mem: Option<&dyn GuestMem>,
+        p: i64,
+        l: i64,
+    ) -> Result<(&Dir, String), i64> {
+        let path = read_path(mem, p, l)?;
+        Ok((self.dir()?, path))
+    }
+
     fn handle(
         &mut self,
         op: u32,
@@ -217,20 +257,14 @@ impl HostFsState {
     ) -> i64 {
         let mut mem = mem;
         let a = |i: usize| args.get(i).copied().unwrap_or(0);
-        // `read_path` already refused anything that could escape (absolute / `..` / empty), so the
-        // join below cannot leave `root` — the rooted directory *is* the attenuation.
-        let path_at =
-            |mem: Option<&dyn GuestMem>, root: &Path, p: i64, l: i64| -> Result<PathBuf, i64> {
-                Ok(root.join(read_path(mem, p, l)?))
-            };
         match op {
             FS_OPEN => {
-                let path = match path_at(mem.as_deref(), &self.root, a(0), a(1)) {
-                    Ok(p) => p,
+                let (dir, path) = match self.path_at(mem.as_deref(), a(0), a(1)) {
+                    Ok(at) => at,
                     Err(e) => return e,
                 };
                 let flags = a(2);
-                let mut oo = std::fs::OpenOptions::new();
+                let mut oo = cap_std::fs::OpenOptions::new();
                 oo.read(flags & O_READ != 0);
                 if flags & O_APPEND != 0 {
                     oo.append(true);
@@ -244,8 +278,8 @@ impl HostFsState {
                     Ok(held) => held,
                     Err(errno) => return errno,
                 };
-                let file = match oo.open(&path) {
-                    Ok(f) => f,
+                let file = match dir.open_with(path, &oo) {
+                    Ok(f) => f.into_std(),
                     Err(e) => return io_errno(&e),
                 };
                 let o = HostOpen {
@@ -345,25 +379,25 @@ impl HostFsState {
                 0
             }
             FS_REMOVE => {
-                let path = match path_at(mem.as_deref(), &self.root, a(0), a(1)) {
-                    Ok(p) => p,
+                let (dir, path) = match self.path_at(mem.as_deref(), a(0), a(1)) {
+                    Ok(at) => at,
                     Err(e) => return e,
                 };
-                match std::fs::remove_file(path) {
+                match dir.remove_file(path) {
                     Ok(()) => 0,
                     Err(e) => io_errno(&e),
                 }
             }
             FS_RENAME => {
-                let from = match path_at(mem.as_deref(), &self.root, a(0), a(1)) {
+                let from = match read_path(mem.as_deref(), a(0), a(1)) {
                     Ok(p) => p,
                     Err(e) => return e,
                 };
-                let to = match path_at(mem.as_deref(), &self.root, a(2), a(3)) {
-                    Ok(p) => p,
+                let (dir, to) = match self.path_at(mem.as_deref(), a(2), a(3)) {
+                    Ok(at) => at,
                     Err(e) => return e,
                 };
-                match std::fs::rename(from, to) {
+                match dir.rename(from, dir, to) {
                     Ok(()) => 0,
                     Err(e) => io_errno(&e),
                 }
@@ -530,13 +564,12 @@ impl HostFsState {
                 }
             }
             FS_STAT => {
-                let path = match path_at(mem.as_deref(), &self.root, a(0), a(1)) {
-                    Ok(p) => p,
+                let (dir, path) = match self.path_at(mem.as_deref(), a(0), a(1)) {
+                    Ok(at) => at,
                     Err(e) => return e,
                 };
-                // lstat semantics (symlink_metadata): a symlink is reported as a symlink and never
-                // followed, so its type can't be confused with a target outside the granted root.
-                let md = match std::fs::symlink_metadata(&path) {
+                // lstat semantics (symlink_metadata): a symlink is reported as itself.
+                let md = match dir.symlink_metadata(path) {
                     Ok(m) => m,
                     Err(e) => return io_errno(&e),
                 };
@@ -554,31 +587,31 @@ impl HostFsState {
                 }
             }
             FS_MKDIR => {
-                let path = match path_at(mem.as_deref(), &self.root, a(0), a(1)) {
-                    Ok(p) => p,
+                let (dir, path) = match self.path_at(mem.as_deref(), a(0), a(1)) {
+                    Ok(at) => at,
                     Err(e) => return e,
                 };
-                match std::fs::create_dir(path) {
+                match dir.create_dir(path) {
                     Ok(()) => 0,
                     Err(e) => io_errno(&e),
                 }
             }
             FS_RMDIR => {
-                let path = match path_at(mem.as_deref(), &self.root, a(0), a(1)) {
-                    Ok(p) => p,
+                let (dir, path) = match self.path_at(mem.as_deref(), a(0), a(1)) {
+                    Ok(at) => at,
                     Err(e) => return e,
                 };
-                match std::fs::remove_dir(path) {
+                match dir.remove_dir(path) {
                     Ok(()) => 0,
                     Err(e) => io_errno(&e),
                 }
             }
             FS_OPENDIR => {
-                let path = match path_at(mem.as_deref(), &self.root, a(0), a(1)) {
-                    Ok(p) => p,
+                let (dir, path) = match self.path_at(mem.as_deref(), a(0), a(1)) {
+                    Ok(at) => at,
                     Err(e) => return e,
                 };
-                let rd = match std::fs::read_dir(&path) {
+                let rd = match dir.read_dir(path) {
                     Ok(r) => r,
                     Err(e) => return io_errno(&e),
                 };
@@ -657,10 +690,10 @@ impl HostFsState {
 /// Fill a [`StatBuf`] from real-fs metadata. On unix the `st_*` fields come straight from the
 /// `stat(2)` the OS already did; elsewhere the portable `Metadata` fills type + size and the rest
 /// stays zero (the guest libc only ever needs type + size + mtime to walk an `initdb` tree).
-fn host_stat_bytes(md: &std::fs::Metadata) -> [u8; STATBUF_LEN] {
+fn host_stat_bytes(md: &cap_std::fs::Metadata) -> [u8; STATBUF_LEN] {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
+        use cap_std::fs::MetadataExt;
         stat_bytes(
             md.mode(),
             md.nlink() as u32,
@@ -709,7 +742,10 @@ pub(crate) fn io_errno(e: &std::io::Error) -> i64 {
 }
 
 /// The **real** filesystem, attenuated to `root` (relative paths only; `..`/absolute refused). The
-/// guest sees exactly the subtree the embedder granted — nothing else is nameable.
+/// guest sees exactly the subtree the embedder granted — nothing else is nameable, through a
+/// symlink either: one that stays beneath `root` works as its target does, and one that leads out
+/// is refused with `-EACCES`, as `..` is (#2643). A grant opens `root` at its first path op and holds
+/// it from then on, so it keeps the directory it opened wherever the host later moves `root`.
 pub fn host_fs(root: PathBuf) -> HostCap {
     host_fs_impl(root, false)
 }
@@ -759,6 +795,24 @@ fn host_fs_impl(root: PathBuf, crashy: bool) -> HostCap {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use temen_interp::{cap_id, Host, WindowMem};
+
+    /// Drive fs op `op` on handle `h` over a fresh view of `win`, as a guest's `__vm_host_call`
+    /// does. `win` persists between calls, so the paths put there stay put.
+    fn call(host: &mut Host, h: i32, win: &mut [u8], op: u32, args: &[i64]) -> i64 {
+        let n = win.len();
+        let mut wm = WindowMem::new(win, n as u64);
+        host.cap_dispatch_slots(cap_id::HOST_PROC, op, h, args, Some(&mut wm))
+            .unwrap()[0]
+    }
+
+    /// Put `s` in `win` at `at`: the `(ptr, len)` a guest passes for a path.
+    fn put(win: &mut [u8], at: usize, s: &str) -> (i64, i64) {
+        win[at..at + s.len()].copy_from_slice(s.as_bytes());
+        (at as i64, s.len() as i64)
+    }
+
     /// `temen-llvm` pins the `HostProc` interface id numerically (it produces `temen-ir` and cannot depend
     /// on the interpreter crate); this locks the pin to the real constant.
     #[test]
@@ -797,9 +851,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn map_region_op_mints_a_file_backed_region_only_on_the_mmap_grant() {
-        use super::*;
         use std::io::Write;
-        use temen_interp::{cap_id, Host, WindowMem};
 
         let dir = std::env::temp_dir().join(format!("temen_fs_mapregion_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -876,26 +928,11 @@ mod tests {
     /// backend it walks.
     #[test]
     fn os_metadata_ops_parity_mem_vs_host() {
-        use super::*;
-        use temen_interp::{cap_id, Host, WindowMem};
-
         // Window layout: [0..64) path A, [64..128) path B, [256..328) statbuf, [512..576) name buf.
         const PA: usize = 0;
         const PB: usize = 64;
         const SB: usize = 256;
         const NB: usize = 512;
-
-        // Drive one op over a fresh window view; `win` persists between calls (paths stay put).
-        fn call(host: &mut Host, h: i32, win: &mut [u8], op: u32, args: &[i64]) -> i64 {
-            let n = win.len();
-            let mut wm = WindowMem::new(win, n as u64);
-            host.cap_dispatch_slots(cap_id::HOST_PROC, op, h, args, Some(&mut wm))
-                .unwrap()[0]
-        }
-        fn put(win: &mut [u8], at: usize, s: &str) -> (i64, i64) {
-            win[at..at + s.len()].copy_from_slice(s.as_bytes());
-            (at as i64, s.len() as i64)
-        }
 
         // The scripted walk: returns (rc-sequence, stat-of-dir mode&S_IFMT, stat-of-file (mode,size),
         // readdir name). Run identically against whatever cap is granted.
@@ -1011,9 +1048,6 @@ mod tests {
     /// [`mem_fs_from_archive`] into a working fs — the shippable-artifact path (no host filesystem).
     #[test]
     fn data_image_roundtrip_and_mount() {
-        use super::*;
-        use temen_interp::{cap_id, Host, WindowMem};
-
         let files = vec![
             ("PG_VERSION".to_string(), b"17\n".to_vec()),
             ("base/1/1259".to_string(), vec![0u8; 300]),
@@ -1067,22 +1101,9 @@ mod tests {
     /// demo boot needs from a virtual filesystem (`BOOTSPEED.md` Milestone A).
     #[test]
     fn seeded_mem_fs_open_norm_and_dir_fsync() {
-        use super::*;
-        use temen_interp::{cap_id, Host, WindowMem};
-
         const PA: usize = 0;
         const SB: usize = 256;
         const RB: usize = 512;
-        fn call(host: &mut Host, h: i32, win: &mut [u8], op: u32, args: &[i64]) -> i64 {
-            let n = win.len();
-            let mut wm = WindowMem::new(win, n as u64);
-            host.cap_dispatch_slots(cap_id::HOST_PROC, op, h, args, Some(&mut wm))
-                .unwrap()[0]
-        }
-        fn put(win: &mut [u8], at: usize, s: &str) -> (i64, i64) {
-            win[at..at + s.len()].copy_from_slice(s.as_bytes());
-            (at as i64, s.len() as i64)
-        }
 
         // Seed a file under a subdir + an *empty* subdir (the shape of `pg_logical/mappings`).
         let cap = mem_fs_seeded(
@@ -1162,15 +1183,6 @@ mod tests {
     /// (`-EINVAL`) without consuming the entry.
     #[test]
     fn readdir_is_sorted_and_bounded() {
-        use super::*;
-        use temen_interp::{cap_id, Host, WindowMem};
-
-        fn call(host: &mut Host, h: i32, win: &mut [u8], op: u32, args: &[i64]) -> i64 {
-            let n = win.len();
-            let mut wm = WindowMem::new(win, n as u64);
-            host.cap_dispatch_slots(cap_id::HOST_PROC, op, h, args, Some(&mut wm))
-                .unwrap()[0]
-        }
         fn names(host: &mut Host, h: i32, win: &mut [u8]) -> Vec<String> {
             // opendir "." (the root) and drain it.
             win[0] = b'.';
@@ -1224,5 +1236,265 @@ mod tests {
             call(&mut host, h, &mut win, FS_READDIR, &[dh, 512, 64, 0]),
             5
         );
+    }
+
+    /// #2643 — the tree the link tests run in, under a fresh directory named for `test`: `root`, the
+    /// directory a grant names, and beside it `outside`, which holds `secret` and an empty `d`.
+    /// Returns `(base, root, outside)`.
+    fn link_fixture(test: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("temen_fs_{test}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (root, outside) = (base.join("root"), base.join("outside"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(outside.join("d")).unwrap();
+        std::fs::write(outside.join("secret"), "SECRET").unwrap();
+        (base, root, outside)
+    }
+
+    /// Link `link` to the directory `target` with a symlink.
+    #[cfg(unix)]
+    fn link_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    /// Link `link` to the directory `target` with a junction, which any user may make (a symlink
+    /// needs a privilege on Windows).
+    #[cfg(windows)]
+    fn link_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()?;
+        match out.status.success() {
+            true => Ok(()),
+            false => Err(std::io::Error::other(
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )),
+        }
+    }
+
+    /// Remove the link [`link_dir`] made, not what it points to.
+    fn unlink_dir(link: &Path) -> std::io::Result<()> {
+        if cfg!(windows) {
+            std::fs::remove_dir(link)
+        } else {
+            std::fs::remove_file(link)
+        }
+    }
+
+    /// What `dir` holds: each entry's name, and a file's contents.
+    fn listing(dir: &Path) -> Vec<(String, String)> {
+        let mut all: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let path = e.unwrap().path();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                (name, std::fs::read_to_string(&path).unwrap_or_default())
+            })
+            .collect();
+        all.sort();
+        all
+    }
+
+    /// #2643 — a link in the granted tree is no way out of it. `out` links to a directory outside
+    /// the root (and on unix `up` does too, relatively, and `leak` links to a file there): every
+    /// path op through one is `-EACCES`, as `..` is, and nothing outside changes.
+    #[test]
+    fn a_link_out_of_the_root_reaches_nothing() {
+        let (base, root, outside) = link_fixture("link_out");
+        std::fs::write(root.join("mine"), "MINE").unwrap();
+        link_dir(&outside, &root.join("out")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("../outside", root.join("up")).unwrap();
+            std::os::unix::fs::symlink(outside.join("secret"), root.join("leak")).unwrap();
+        }
+        let links: &[&str] = if cfg!(unix) { &["out", "up"] } else { &["out"] };
+        let before = listing(&outside);
+
+        let mut host = Host::new();
+        let h = (host_fs(root.clone()).grant)(&mut host, 0);
+        let mut win = vec![0u8; 4096];
+        let (sb, sl) = (2048, STATBUF_LEN as i64);
+        for link in links {
+            let through = |s: &str| format!("{link}/{s}");
+            for (op, path, c, d) in [
+                (FS_OPEN, through("secret"), O_READ, 0),
+                (FS_OPEN, through("secret"), O_WRITE | O_TRUNC, 0),
+                (FS_OPEN, through("new"), O_WRITE | O_CREATE, 0),
+                (FS_STAT, through("secret"), sb, sl),
+                (FS_MKDIR, through("new"), 0, 0),
+                (FS_RMDIR, through("d"), 0, 0),
+                (FS_REMOVE, through("secret"), 0, 0),
+                (FS_OPENDIR, link.to_string(), 0, 0),
+                (FS_OPENDIR, through("d"), 0, 0),
+            ] {
+                let (p, l) = put(&mut win, 0, &path);
+                let got = call(&mut host, h, &mut win, op, &[p, l, c, d]);
+                assert_eq!(got, EACCES, "op {op} on {path}");
+            }
+            for (from, to) in [
+                (through("secret"), "taken".into()),
+                ("mine".into(), through("mine")),
+            ] {
+                let (fp, fl) = put(&mut win, 0, &from);
+                let (tp, tl) = put(&mut win, 1024, &to);
+                let got = call(&mut host, h, &mut win, FS_RENAME, &[fp, fl, tp, tl]);
+                assert_eq!(got, EACCES, "rename {from} to {to}");
+            }
+        }
+        #[cfg(unix)]
+        for flags in [O_READ, O_WRITE | O_TRUNC] {
+            let (p, l) = put(&mut win, 0, "leak");
+            let got = call(&mut host, h, &mut win, FS_OPEN, &[p, l, flags, 0]);
+            assert_eq!(got, EACCES, "open leak with flags {flags}");
+        }
+
+        assert_eq!(
+            listing(&outside),
+            before,
+            "nothing outside the root changed"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("mine")).unwrap(), "MINE");
+        assert!(!root.join("taken").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #2643 — a link that stays inside the root works as its target does, as under Wasmtime's
+    /// preopens. (On Windows only a junction can be made without a privilege, and a junction's
+    /// target is absolute, so it is refused there, as an absolute symlink is everywhere.)
+    #[cfg(unix)]
+    #[test]
+    fn a_link_within_the_root_works_as_its_target() {
+        let (base, root, _) = link_fixture("link_in");
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/f"), "IN").unwrap();
+        std::os::unix::fs::symlink("sub", root.join("in")).unwrap();
+        std::os::unix::fs::symlink("in/f", root.join("f")).unwrap();
+
+        let mut host = Host::new();
+        let h = (host_fs(root.clone()).grant)(&mut host, 0);
+        let mut win = vec![0u8; 4096];
+        for path in ["in/f", "f"] {
+            let (p, l) = put(&mut win, 0, path);
+            let fd = call(&mut host, h, &mut win, FS_OPEN, &[p, l, O_READ, 0]);
+            assert!(fd >= 0, "open {path}: {fd}");
+            assert_eq!(call(&mut host, h, &mut win, FS_READ, &[fd, 1024, 8, 0]), 2);
+            assert_eq!(&win[1024..1026], b"IN", "{path} reads sub/f");
+            assert_eq!(call(&mut host, h, &mut win, FS_CLOSE, &[fd, 0, 0, 0]), 0);
+        }
+        let (p, l) = put(&mut win, 0, "in/m");
+        assert_eq!(call(&mut host, h, &mut win, FS_MKDIR, &[p, l, 0, 0]), 0);
+        assert!(root.join("sub/m").is_dir());
+        let (p, l) = put(&mut win, 0, "in");
+        let dh = call(&mut host, h, &mut win, FS_OPENDIR, &[p, l, 0, 0]);
+        assert!(dh >= 0, "opendir in: {dh}");
+        let mut names = Vec::new();
+        loop {
+            let n = call(&mut host, h, &mut win, FS_READDIR, &[dh, 1024, 64, 0]);
+            if n <= 0 {
+                assert_eq!(n, 0);
+                break;
+            }
+            names.push(String::from_utf8(win[1024..1024 + n as usize].to_vec()).unwrap());
+        }
+        assert_eq!(names, ["f", "m"]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #2643 — a host that swaps a directory of the tree for a link out, and back, while the guest
+    /// walks through it never lets an op reach outside: an op resolves its path beneath the root
+    /// once and acts on what it resolved, so no swap lands between a check and a use.
+    #[test]
+    fn swapping_a_directory_for_a_link_out_never_lets_an_op_out() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let (base, root, outside) = link_fixture("link_swap");
+        std::fs::create_dir(root.join("d")).unwrap();
+        std::fs::write(root.join("d/secret"), "MINE").unwrap();
+        let before = listing(&outside);
+
+        // The swapper takes each step once a whole walk has run since its last, so the guest walks
+        // through every state the tree passes through, the link out among them, while each step
+        // lands in the middle of some walk. A step can fail while the guest holds what it moves
+        // (Windows refuses to rename a directory a handle holds open), so it is retried. A step that
+        // waits a minute fails the test rather than hanging it.
+        fn step(
+            walks: &AtomicU64,
+            seen: &mut u64,
+            what: &str,
+            mut f: impl FnMut() -> std::io::Result<()>,
+        ) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while walks.load(Relaxed) < *seen + 2 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what}: the guest stopped walking"
+                );
+                std::thread::yield_now();
+            }
+            loop {
+                match f() {
+                    Ok(()) => break,
+                    Err(e) => assert!(std::time::Instant::now() < deadline, "{what}: {e}"),
+                }
+                std::thread::yield_now();
+            }
+            *seen = walks.load(Relaxed);
+        }
+        // A junction costs a process on Windows, so fewer swaps there.
+        let swaps = if cfg!(windows) { 50 } else { 500 };
+        let walks = std::sync::Arc::new(AtomicU64::new(0));
+        let swapper = std::thread::spawn({
+            let walks = walks.clone();
+            let (d, aside, outside) = (root.join("d"), root.join("d.aside"), outside.clone());
+            move || {
+                let seen = &mut 0;
+                for _ in 0..swaps {
+                    step(&walks, seen, "move d aside", || std::fs::rename(&d, &aside));
+                    step(&walks, seen, "link d out", || link_dir(&outside, &d));
+                    step(&walks, seen, "unlink d", || unlink_dir(&d));
+                    step(&walks, seen, "move d back", || std::fs::rename(&aside, &d));
+                }
+            }
+        });
+
+        let mut host = Host::new();
+        let h = (host_fs(root.clone()).grant)(&mut host, 0);
+        let mut win = vec![0u8; 4096];
+        while !swapper.is_finished() {
+            let (p, l) = put(&mut win, 0, "d/secret");
+            let fd = call(&mut host, h, &mut win, FS_OPEN, &[p, l, O_READ, 0]);
+            if fd >= 0 {
+                assert_eq!(call(&mut host, h, &mut win, FS_READ, &[fd, 1024, 8, 0]), 4);
+                assert_eq!(&win[1024..1028], b"MINE", "d/secret is the root's");
+                call(&mut host, h, &mut win, FS_CLOSE, &[fd, 0, 0, 0]);
+            }
+            let (p, l) = put(&mut win, 0, "d/new");
+            let fd = call(
+                &mut host,
+                h,
+                &mut win,
+                FS_OPEN,
+                &[p, l, O_WRITE | O_CREATE, 0],
+            );
+            if fd >= 0 {
+                call(&mut host, h, &mut win, FS_CLOSE, &[fd, 0, 0, 0]);
+                call(&mut host, h, &mut win, FS_REMOVE, &[p, l, 0, 0]);
+            }
+            let (p, l) = put(&mut win, 0, "d/m");
+            if call(&mut host, h, &mut win, FS_MKDIR, &[p, l, 0, 0]) == 0 {
+                call(&mut host, h, &mut win, FS_RMDIR, &[p, l, 0, 0]);
+            }
+            walks.fetch_add(1, Relaxed);
+        }
+        swapper.join().unwrap();
+
+        assert_eq!(
+            listing(&outside),
+            before,
+            "nothing outside the root changed"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -46,6 +46,10 @@ temen-jit.workspace = true
 temen-peval.workspace = true
 # The generic IR→IR optimizer (OPT.md): CFG cleanup of the residual before re-verify/encode.
 temen-opt.workspace = true
+# #2643: `host_fs` resolves each guest path beneath its root with cap-std, the resolver Wasmtime's
+# WASI preopens use. It refuses a symlink that leads out of the root, and resolves without the
+# check-then-use race a host that swaps a directory for a link would win, on Linux, macOS and Windows.
+cap-std = "4"
 
 [dev-dependencies]
 # #1236: the Forth session freeze/thaw tests serialize the kernel's durable domain through the §12
