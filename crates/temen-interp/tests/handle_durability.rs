@@ -57,7 +57,7 @@ fn durable_handles_round_trip_through_capture_restore() {
         }));
 
     let mut b = Host::new();
-    b.restore_durable_handles(&captured);
+    b.restore_durable_handles(&a.slot_generations(), &captured);
     assert_eq!(
         b.capture_durable_handles().unwrap(),
         captured,
@@ -89,7 +89,7 @@ fn restore_pins_generation_not_destination_default() {
     );
 
     let mut b = Host::new(); // slot 0 is generation 0 here
-    b.restore_durable_handles(&captured);
+    b.restore_durable_handles(&a.slot_generations(), &captured);
     let restored = b.capture_durable_handles().unwrap();
     assert_eq!(
         restored, captured,
@@ -344,7 +344,7 @@ fn a_registrar_re_grants_named_caps_and_the_handles_still_dispatch() {
     }));
     b.restore_durable_named(&named)
         .expect("the registrar serves `fs`");
-    b.restore_durable_handles(&handles);
+    b.restore_durable_handles(&a.slot_generations(), &handles);
 
     assert_eq!(
         &*seen.lock().unwrap(),
@@ -394,7 +394,7 @@ fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
         }));
         b.restore_durable_named(&named)
             .expect("the registrar serves it");
-        b.restore_durable_handles(&handles);
+        b.restore_durable_handles(&a.slot_generations(), &handles);
         let lease = Lease {
             budget: b.grant_budget(-1, 1 << 20, -1),
             bytes: 1 << 16,
@@ -470,7 +470,7 @@ fn restore_closes_the_slots_the_capture_does_not_carry() {
     b.grant_clock();
     assert_eq!(b.grant_stream(StreamRole::Out), out);
     assert_eq!(b.grant_exit(), exit);
-    b.restore_durable_handles(&captured);
+    b.restore_durable_handles(&a.slot_generations(), &captured);
     assert_eq!(
         b.capture_durable_handles().unwrap(),
         captured,
@@ -481,6 +481,87 @@ fn restore_closes_the_slots_the_capture_does_not_carry() {
         "the dropped capability is not resurrected by the fresh grant"
     );
     assert!(b.handle_live(out));
+}
+
+/// #2360 — **a handle closed before the freeze stays closed after it**, restored into a host that
+/// granted nothing first. The slot's counter rides, so a use of the closed handle answers `-EBADF`
+/// as it did before the freeze; a generation the slot never issued is still a forgery. On main the
+/// slot came back at the fresh host's counter, `0`, and the closed handle trapped `CapFault`.
+#[test]
+fn a_handle_closed_before_the_freeze_answers_ebadf_after_it() {
+    let mut a = Host::new();
+    a.grant_stream(StreamRole::Out); // slot 0
+    let clk = a.grant_clock(); // slot 1
+    a.close(clk);
+    let generations = a.slot_generations();
+    assert_eq!(generations, [1, 1], "the closed slot keeps its counter");
+    let captured = a.capture_durable_handles().unwrap();
+    assert_eq!(captured.len(), 1, "only the live slot is an entry");
+
+    let mut b = Host::new();
+    b.restore_durable_handles(&generations, &captured);
+    assert_eq!(b.slot_generations(), generations, "the table rides whole");
+    assert_eq!(
+        b.cap_dispatch_slots(cap_id::CLOCK, 0, clk, &[], None),
+        Ok(vec![-9]),
+        "the closed handle answers -EBADF, as before the freeze"
+    );
+    let forged = clk + (1 << 10); // the next generation, which slot 1 never issued
+    assert_eq!(
+        b.cap_dispatch_slots(cap_id::CLOCK, 0, forged, &[], None),
+        Err(temen_interp::Trap::CapFault),
+        "a generation the slot never issued is still a forgery"
+    );
+}
+
+/// #2360 — **a grant after the thaw issues what the uninterrupted run's would.** The next grant into
+/// a closed slot counts on from the slot's carried counter, so it never re-issues the closed
+/// handle's value. On main it counted from the restoring host's `0`, and issued the closed value
+/// again.
+#[test]
+fn a_grant_after_the_thaw_issues_a_newer_generation() {
+    let mut a = Host::new();
+    let closed = a.grant_clock(); // slot 0, generation 1
+    a.close(closed);
+    let (generations, captured) = (a.slot_generations(), a.capture_durable_handles().unwrap());
+    let uninterrupted = a.grant_clock();
+    assert_ne!(uninterrupted, closed, "the slot's generation advanced");
+
+    let mut b = Host::new();
+    b.restore_durable_handles(&generations, &captured);
+    assert_eq!(
+        b.grant_clock(),
+        uninterrupted,
+        "the thawed grant issues the uninterrupted run's handle, not the closed one's value"
+    );
+    assert_eq!(
+        b.cap_dispatch_slots(cap_id::CLOCK, 0, closed, &[], None),
+        Ok(vec![-9]),
+        "and the closed handle is still closed"
+    );
+}
+
+/// #2360 — **the restored table is the artifact's, counters included.** A slot the thawing embedder
+/// granted before restoring, which the frozen run never granted, comes back never issued: its
+/// handle is a forgery there, and the next grant into it issues generation 1 as the frozen run's
+/// would.
+#[test]
+fn restore_resets_a_slot_the_frozen_run_never_granted() {
+    let mut a = Host::new();
+    a.grant_clock(); // slot 0
+    let (generations, captured) = (a.slot_generations(), a.capture_durable_handles().unwrap());
+
+    let mut b = Host::new();
+    b.grant_clock();
+    let stray = b.grant_clock(); // slot 1, which the frozen run never granted
+    b.restore_durable_handles(&generations, &captured);
+    assert_eq!(b.slot_generations(), [1], "slot 1 is back to never granted");
+    assert_eq!(
+        b.cap_dispatch_slots(cap_id::CLOCK, 0, stray, &[], None),
+        Err(temen_interp::Trap::CapFault),
+        "the embedder's own pre-restore handle names nothing the guest was granted"
+    );
+    assert_eq!(b.grant_clock(), a.grant_clock(), "slot 1's first grant");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -503,9 +584,14 @@ fn read(host: &mut Host, h: i32, field: i64) -> i64 {
         .expect("read")[0]
 }
 
-/// Restore `nodes` then `handles` into `host`, rewriting each handle's node key to its new id — what
-/// the snapshot codec does between its two steps.
-fn restore_budgets(host: &mut Host, nodes: &[DurableBudget], handles: &[DurableHandle]) {
+/// Restore `nodes` then `handles`, captured from `from`, into `host`, rewriting each handle's node key
+/// to its new id — what the snapshot codec does between its two steps.
+fn restore_budgets(
+    host: &mut Host,
+    from: &Host,
+    nodes: &[DurableBudget],
+    handles: &[DurableHandle],
+) {
     let ids = host
         .restore_durable_budgets(nodes)
         .expect("parents come first");
@@ -516,7 +602,7 @@ fn restore_budgets(host: &mut Host, nodes: &[DurableBudget], handles: &[DurableH
             *node = ids[at];
         }
     }
-    host.restore_durable_handles(&handles);
+    host.restore_durable_handles(&from.slot_generations(), &handles);
 }
 
 /// A root with a child node `b` that has charged a window round-trips through capture/restore: each
@@ -548,7 +634,7 @@ fn a_budget_node_round_trips_with_its_ceilings_charge_and_parent() {
     // An unbounded run, so a read reports the restored nodes alone: a guest sees the run's own
     // node's `channel` too (#2337).
     t.set_grant(-1, -1, -1, -1);
-    restore_budgets(&mut t, &nodes, &captured);
+    restore_budgets(&mut t, &a, &nodes, &captured);
     assert_eq!(read(&mut t, root, 1), (1 << 20) - 4096, "the root's room");
     assert_eq!(read(&mut t, b, 1), (1 << 19) - 4096, "b's room");
     assert_eq!(read(&mut t, root, 3), -1, "an unbounded field survives");
@@ -669,7 +755,7 @@ fn the_programs_child_image_rides_a_freeze() {
     b.grant_child_image();
     b.check_modules_for_thaw(&captured)
         .expect("the restoring powerbox derived the same image");
-    b.restore_durable_handles(&captured);
+    b.restore_durable_handles(&a.slot_generations(), &captured);
     assert_eq!(
         b.capture_durable_handles().unwrap(),
         captured,

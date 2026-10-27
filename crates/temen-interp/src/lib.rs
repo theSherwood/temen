@@ -22070,7 +22070,8 @@ pub struct DurableNamedCap {
 /// §12.5 Section 3). The `(slot, generation)` pin is what keeps a **guest-held handle value**
 /// valid across restore: the guest names `(generation << CAP_LOG2) | slot`, so restore must
 /// reinstate the same pair. `type_id` is the interface the slot was granted under (the
-/// resolve check is `type_id` + `generation`).
+/// resolve check is `type_id` + `generation`). The slots no entry holds ride as generations
+/// alone ([`Host::slot_generations`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DurableHandle {
     pub slot: u32,
@@ -23362,6 +23363,9 @@ type ImportReq = Arc<(Vec<String>, Vec<FuncType>)>;
 /// (#2219), and the checkpoint stays in the run, so nothing re-pins them by digest.
 #[derive(Clone)]
 pub(crate) struct ChildPowerbox {
+    /// Every slot's counter ([`Host::slot_generations`]), so a handle closed before the
+    /// checkpoint stays closed after it (#2360).
+    generations: Vec<u32>,
     handles: Vec<DurableHandle>,
     /// `(slot, generation, type_id, index into modules)` of each module handle.
     module_slots: Vec<(u32, u32, u32, u32)>,
@@ -27680,7 +27684,8 @@ impl Host {
     /// state or native pointers (`SharedRegion`/`Module`/`Blocking`/`HostProc`; the §22 `JitTable`/
     /// `JitCode` bindings ride Section 5 since Slice 2 and stay) — and leaves the durable handles untouched. Each close frees the slot but **keeps its
     /// generation** (D37), so a guest's stale handle value becomes a dead generation and any later
-    /// `call.cap` on it is an inert `CapFault`, never authority into a recycled slot. Returns the drained
+    /// `call.cap` on it answers `-EBADF` (I41), after a thaw too (#2360), never authority into a
+    /// recycled slot. Returns the drained
     /// handles in ascending slot order (for the embedder to audit the relinquished authority). The exact
     /// complement of [`Self::capture_durable_handles`]'s refusal set: after a drain, `capture` succeeds,
     /// so a subtree that held non-durable authority can now be frozen.
@@ -27747,18 +27752,35 @@ impl Host {
         }
     }
 
-    /// Reinstate a captured durable set into this table (DURABILITY.md §12.5), pinning each
-    /// `(slot, generation)` so guest-held handle values stay valid across restore. The table
-    /// becomes **exactly** the captured set: every other slot is closed first (a host that granted
+    /// #2360 — each slot's generation counter, in slot order up to the last slot ever granted: the
+    /// half of the table [`Host::capture_durable_handles`] does not carry. A closed slot keeps its
+    /// counter (D37), and a freeze must carry it too. Otherwise the thaw cannot tell a handle the
+    /// guest closed (`-EBADF`, [`Host::handle_revoked`]) from a forgery, and the next grant into the
+    /// slot could issue the closed handle's value again.
+    pub fn slot_generations(&self) -> Vec<u32> {
+        let len = self.table.iter().rposition(|s| s.generation != 0);
+        let len = len.map_or(0, |i| i + 1);
+        self.table[..len].iter().map(|s| s.generation).collect()
+    }
+
+    /// Reinstate a captured table (DURABILITY.md §12.5): every slot's counter from `generations`
+    /// ([`Host::slot_generations`]; `0` past its end), then each live entry of `handles` pinned at
+    /// its `(slot, generation)`, so guest-held handle values stay valid across restore. The table
+    /// becomes **exactly** the captured one: a slot the embedder granted before restoring and the
+    /// artifact holds closed, or never granted, ends as the artifact has it (a host that granted
     /// before restoring keeps only what the artifact carries). Slots must be in range (the snapshot
     /// codec validates that against [`Host::handle_capacity`] before calling).
-    pub fn restore_durable_handles(&mut self, handles: &[DurableHandle]) {
-        // The restored table is exactly the artifact's. A slot the artifact does not carry is closed
-        // (its generation kept, so a stale handle value stays a dead generation) — an embedder that
-        // grants its powerbox fresh and then restores over it must not resurrect a capability the
-        // guest had dropped before the freeze.
-        for s in &mut self.table {
-            s.entry = None;
+    pub fn restore_durable_handles(&mut self, generations: &[u32], handles: &[DurableHandle]) {
+        // The restored table is exactly the artifact's, counters included: a closed handle stays
+        // closed (`-EBADF`), a never-issued one stays a forgery, and the next grant into a slot issues
+        // the value the uninterrupted run would have (#2360). An embedder that grants its powerbox
+        // fresh and then restores over it must not resurrect a capability the guest had dropped
+        // before the freeze.
+        for (i, s) in self.table.iter_mut().enumerate() {
+            *s = Slot {
+                generation: generations.get(i).copied().unwrap_or(0),
+                ..Slot::default()
+            };
         }
         for h in handles {
             let binding = match h.binding {
@@ -32196,6 +32218,7 @@ impl Host {
             })
             .collect();
         plain.then(|| ChildPowerbox {
+            generations: self.slot_generations(),
             handles,
             module_slots,
             modules: self.modules.clone(),
@@ -32224,7 +32247,7 @@ impl Host {
         // #1909, #2268 — what the checkpoint's window held, which the restored tree still charges.
         child.set_window_held(pb.held);
         child.lane_cap = pb.lane_cap;
-        child.restore_durable_handles(&pb.handles);
+        child.restore_durable_handles(&pb.generations, &pb.handles);
         child.modules = pb.modules.clone();
         for &(slot, generation, type_id, id) in &pb.module_slots {
             child.grant_at(slot, generation, type_id, Binding::Module(id));

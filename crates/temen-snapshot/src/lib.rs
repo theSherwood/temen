@@ -298,7 +298,11 @@ use temen_ir::Module;
 /// v51 (#2465): a Section 8 launch record ends with whether the spawner still holds its join claim
 /// (`1`), or detached the child (op 10) before the cut (`0`). Such a child rides, and thaws
 /// unjoinable, where it was left out and its end decided the freeze.
-const FORMAT_VERSION: u16 = 51;
+/// v52 (#2360): Section 3 opens with every slot's generation counter, in slot order up to the last
+/// slot ever granted, and a live record no longer carries its own. A slot the guest closed keeps its
+/// counter across the thaw, so its handle still answers `-EBADF` rather than trapping as a forgery,
+/// and the next grant into it issues the value the uninterrupted run would have.
+const FORMAT_VERSION: u16 = 52;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -748,6 +752,7 @@ fn freeze_at(
     let handles = host
         .capture_durable_handles()
         .map_err(FreezeError::NonDurableHandle)?;
+    let generations = host.slot_generations();
     // Freeze-side twin of the restore boundary's `binding_in_window` gate: refuse to emit an
     // artifact restore would reject, so out-of-window authority fails at freeze with a clear
     // error instead of surfacing as a Malformed artifact later.
@@ -889,8 +894,12 @@ fn freeze_at(
         });
     }
 
-    // Section 3 — Handle table (§12.5): ascending slot (capture already orders it).
-    section(&mut out, TAG_HANDLES, |b| write_handle_recs(b, &handles));
+    // Section 3 — Handle table (§12.5): every slot's generation, then the live entries in ascending
+    // slot (capture already orders them).
+    section(&mut out, TAG_HANDLES, |b| {
+        write_generations(b, &generations);
+        write_handle_recs(b, &handles);
+    });
 
     // Section 4 — Serve state (DURABILITY.md §13.4 step 3, v13): the domain's inbound queue
     // (FIFO order), completion cells (ascending ticket — `svc_state` yields the `BTreeMap`
@@ -1766,14 +1775,23 @@ fn restore_at(
 
     // ---- Handle table: decode, bounds-check, re-grant. ----
     let mut hr = Reader::new(handles_body);
+    let generations = read_generations(&mut hr, Host::handle_capacity())?;
     let n = hr.uleb()?;
-    let mut handles = Vec::with_capacity(n as usize);
+    let mut handles: Vec<DurableHandle> = Vec::with_capacity(n as usize);
     for _ in 0..n {
         let slot = u32::try_from(hr.uleb()?).map_err(|_| RestoreError::Malformed)?;
         if slot >= Host::handle_capacity() {
             return Err(RestoreError::SlotOutOfRange(slot));
         }
-        let generation = u32::try_from(hr.uleb()?).map_err(|_| RestoreError::Malformed)?;
+        // Canonical: ascending slots, each one a slot that was granted (a live entry's counter is
+        // never 0).
+        if handles.last().is_some_and(|h| slot <= h.slot) {
+            return Err(RestoreError::Malformed);
+        }
+        let generation = match generations.get(slot as usize) {
+            Some(&g) if g != 0 => g,
+            _ => return Err(RestoreError::Malformed),
+        };
         let type_id = u32::try_from(hr.uleb()?).map_err(|_| RestoreError::Malformed)?;
         let binding = read_binding(&mut hr)?;
         // Re-establish the window-containment invariant the §14 JIT instantiator's `unsafe` relies on:
@@ -1938,7 +1956,7 @@ fn restore_at(
             *region = region_ids[region];
         }
     }
-    host.restore_durable_handles(&handles);
+    host.restore_durable_handles(&generations, &handles);
 
     // ---- Control state (§12.4): seed the residue (decoded above) for the thaw, so the next
     // (REWINDING) run re-creates the fibers, re-spawns the vCPUs and delivers the completed
@@ -2379,11 +2397,9 @@ fn read_jit_body(jr: &mut Reader) -> Result<(u8, Vec<DurableJitTable>), RestoreE
     Ok((table_log2, domains))
 }
 
-// ---- Shared section encoders (#915): the serve-trio and handle-record wire shapes are written
-// byte-for-byte the same for the domain-level sections and each frozen child's inline state, so they
-// have one encoder each here rather than a hand-copied pair. (The *decoders* legitimately diverge —
-// the root handle table also bounds-checks the slot against `Host::handle_capacity()` — so they stay
-// inline.) ----
+// ---- Section encoders (#915): the serve trio, a table's slot generations and its handle records,
+// each with one encoder. A child domain rides as an artifact of its own, so it reaches them through
+// the same sections. ----
 
 /// Encode a serve trio (§13.4): the dispatch `queue` (FIFO), completion `results` (ascending ticket),
 /// and the `next_ticket` counter. Length-prefixed ULEB throughout; the exact bytes both serve sites
@@ -2479,13 +2495,37 @@ fn read_ticket_map(r: &mut Reader) -> Result<Vec<(u32, u64)>, RestoreError> {
     Ok(map)
 }
 
-/// Encode a handle table (§12.5): a length prefix then each record's `slot`/`generation`/`type_id`
-/// and its binding. The exact bytes both handle-table sites emit.
+/// Encode a table's slot generations (#2360): a count, then each slot's counter in slot order. The
+/// last is nonzero: slots past the last one ever granted are left off, and read back as `0`.
+fn write_generations(b: &mut Vec<u8>, generations: &[u32]) {
+    write_uleb(b, generations.len() as u64);
+    for &g in generations {
+        write_uleb(b, g as u64);
+    }
+}
+
+/// The inverse of [`write_generations`], for a table of `capacity` slots. A trailing `0` is
+/// non-canonical.
+fn read_generations(r: &mut Reader, capacity: u32) -> Result<Vec<u32>, RestoreError> {
+    let n = r.uleb()?;
+    if n > u64::from(capacity) {
+        return Err(RestoreError::Malformed);
+    }
+    let generations = (0..n)
+        .map(|_| u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed))
+        .collect::<Result<Vec<u32>, _>>()?;
+    if generations.last() == Some(&0) {
+        return Err(RestoreError::Malformed);
+    }
+    Ok(generations)
+}
+
+/// Encode a handle table's live entries (§12.5): a length prefix then each record's `slot`/`type_id`
+/// and its binding. Its generation is the slot's, in the table's generations ([`write_generations`]).
 fn write_handle_recs(b: &mut Vec<u8>, handles: &[DurableHandle]) {
     write_uleb(b, handles.len() as u64);
     for h in handles {
         write_uleb(b, h.slot as u64);
-        write_uleb(b, h.generation as u64);
         write_uleb(b, h.type_id as u64);
         write_binding(b, &h.binding);
     }
@@ -2938,6 +2978,108 @@ mod window_section_tests {
         assert!(
             held.is_ok(),
             "the control: pages held past the head, at its end and the top"
+        );
+    }
+}
+
+#[cfg(test)]
+mod handle_section_tests {
+    use super::*;
+    use temen_interp::StreamRole;
+
+    const ARENA: temen_ir::durable_abi::ShadowArena =
+        temen_ir::durable_abi::ShadowArena::new(16448, 65536);
+
+    /// A module, and an artifact of it whose root holds stdout (slot 0) and a closed clock (slot 1).
+    fn frozen() -> (Module, Vec<u8>) {
+        let src = "memory 18 shadow 16448 65536
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 0
+  return v0
+  }
+}
+";
+        let m = temen_text::parse_module(src).expect("parse");
+        let m = temen_durable::transform_module_assume_confined(&m).expect("transform");
+        let mut host = Host::new();
+        host.grant_stream(StreamRole::Out);
+        let clk = host.grant_clock();
+        host.close(clk);
+        let window = temen_durable::init_durable_window(1 << 18, ARENA);
+        let artifact = freeze(&m, &window, &host).expect("freezes");
+        (m, artifact)
+    }
+
+    /// `artifact` with its Section 3 body replaced by `body`.
+    fn with_handles(artifact: &[u8], body: &[u8]) -> Vec<u8> {
+        let (_, payload) = wire::read_header(artifact).expect("a header");
+        let mut out = Vec::new();
+        wire::write_header(&mut out, wire::KIND_SNAPSHOT, FORMAT_VERSION, 0);
+        let mut r = Reader::new(payload);
+        while !r.at_end() {
+            let tag = r.uleb().unwrap();
+            let len = r.uleb().unwrap() as usize;
+            let old = r.take(len).unwrap();
+            let new = if tag == TAG_HANDLES { body } else { old };
+            section(&mut out, tag, |b| b.extend_from_slice(new));
+        }
+        out
+    }
+
+    /// A Section 3 body: `generations`, then a stdout record at each of `slots`.
+    fn body(generations: &[u32], slots: &[u32]) -> Vec<u8> {
+        let handles: Vec<DurableHandle> = slots
+            .iter()
+            .map(|&slot| DurableHandle {
+                slot,
+                generation: 0, // not on the wire: the slot's counter is
+                type_id: temen_interp::cap_id::STREAM,
+                binding: DurableBinding::Stream {
+                    role: StreamRole::Out,
+                    inherited: false,
+                },
+            })
+            .collect();
+        let mut b = Vec::new();
+        write_generations(&mut b, generations);
+        write_handle_recs(&mut b, &handles);
+        b
+    }
+
+    fn restores(m: &Module, artifact: &[u8]) -> Result<(), RestoreError> {
+        restore(artifact, m, &mut Host::new()).map(|_| ())
+    }
+
+    /// #2360 — Section 3 carries the closed slot's counter, and the decoder holds the section to its
+    /// one canonical form: no trailing never-granted slot, no live entry at a slot never granted,
+    /// and live entries in ascending slot order.
+    #[test]
+    fn the_handle_section_carries_every_counter_in_one_form() {
+        let (m, artifact) = frozen();
+        assert_eq!(
+            with_handles(&artifact, &body(&[1, 1], &[0])),
+            artifact,
+            "the clock's slot rides closed, as a counter with no entry"
+        );
+        assert_eq!(restores(&m, &artifact), Ok(()));
+        for (why, generations, slots) in [
+            ("a trailing never-granted slot", &[1, 1, 0][..], &[0][..]),
+            ("an entry at a slot never granted", &[1, 0, 1], &[0, 1]),
+            ("an entry past the generations", &[1], &[0, 1]),
+            ("entries out of slot order", &[1, 1], &[1, 0]),
+        ] {
+            assert_eq!(
+                restores(&m, &with_handles(&artifact, &body(generations, slots))),
+                Err(RestoreError::Malformed),
+                "{why} is not canonical"
+            );
+        }
+        let over = vec![1; Host::handle_capacity() as usize + 1];
+        assert_eq!(
+            restores(&m, &with_handles(&artifact, &body(&over, &[]))),
+            Err(RestoreError::Malformed),
+            "more generations than the table has slots"
         );
     }
 }

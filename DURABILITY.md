@@ -1460,9 +1460,16 @@ construction. What's stored:
 > tag 12) went with the carve path (INVARIANTS #13, 2026-09-29). Freeze authority has one scope, the
 > holder's detached progeny, into which the carve form folded.
 
-Per **live** slot (`Slot.entry.is_some()`, `temen-interp` `:4427`), sparse:
+The table rides whole (v52, #2360): every slot's generation counter, then each **live** slot
+(`Slot.entry.is_some()`), sparse:
 
-- `slot_index: uleb`, `generation: u32`, `type_id: u32`, durable binding descriptor.
+- `generations`: a count, then each slot's counter (`uleb`) in slot order, up to the last slot ever
+  granted (the last one is nonzero; a slot past it reads back as never granted). A slot the guest
+  closed, or the embedder drained, keeps its counter, so its handle still answers `-EBADF` after a
+  thaw, not `CapFault`, and the next grant into the slot issues the value the uninterrupted run's
+  would.
+- per live slot, in ascending order: `slot_index: uleb`, `type_id: u32`, durable binding descriptor.
+  Its generation is the slot's counter.
 
 **Durable (re-grantable) in v1** — entire state is value-typed:
 
@@ -1621,7 +1628,8 @@ escape-TCB; the verifier/mask hinge is untouched — §3.)
 and pinning on `Host` (`crates/temen-interp/tests/handle_durability.rs`):
 `capture_durable_handles() -> Result<Vec<DurableHandle>, NonDurableHandle>` (the
 re-grantable set in ascending slot order, or a clean refusal naming the first non-durable
-slot — freeze is all-or-nothing), `restore_durable_handles` + the `grant_at` pin, and
+slot — freeze is all-or-nothing), `slot_generations()` (every slot's counter, the closed ones'
+included, #2360), `restore_durable_handles(generations, handles)` + the `grant_at` pin, and
 `handle_capacity()` for the codec's bounds check. The value-typed descriptors
 (`DurableBinding`/`DurableHandle`) are public; `Binding` stays private. The byte-level
 **Section 3** serialization is now wired into the `temen-snapshot` container (§12.6 below).
@@ -1631,7 +1639,8 @@ slot — freeze is all-or-nothing), `restore_durable_handles` + the `grant_at` p
 set `capture_durable_handles` refuses on) and returns them in ascending slot order for the embedder to
 audit the relinquished authority, leaving the durable handles untouched. Each close frees the slot but
 **retains its generation** (D37), so a guest's stale handle value becomes a dead generation — any later
-`call.cap` on it is an inert `CapFault`, never authority into the recycled slot. After a drain, `capture`
+`call.cap` on it answers `-EBADF` (I41), after a thaw too (the counter rides Section 3, #2360), never
+authority into the recycled slot. After a drain, `capture`
 succeeds, so a subtree that held non-durable authority becomes **snapshottable** — the actionable form of
 "freeze refuses unless the non-durable handles are closed/drained first". The freeze is host-driven (STW),
 so the embedder calls this at a freeze safepoint (the STW quiesce + §12.8 4A.7 guarantee no vCPU is
