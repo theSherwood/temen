@@ -55,7 +55,7 @@ pub mod fs;
 mod jit_proc;
 pub use jit_proc::JitCodeCache;
 pub mod posix;
-use temen_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, Parks, TrapKind};
+use temen_jit::{CompiledModule, JitFrameLoc, JitOutcome, Parks, TrapKind};
 pub use temen_peval::{SpecArg, SpecConfig};
 
 /// Render a JIT trap-time backtrace (§5 W3) for a kill message — `\n    #i file:line:col in <name>`
@@ -5889,23 +5889,22 @@ impl CompiledCache {
 }
 
 /// Run a bare (non-powerbox) kernel — `module`'s entry on the JIT with `args` and no host
-/// capabilities — returning its typed result values. For hand-written IR that is a pure
-/// function rather than a program (e.g. the benchmark kernels). `Err` on compile failure,
-/// a guest trap, or an `Exit` (a kernel should not call one).
-pub fn run_kernel(module: &Module, args: &[i64]) -> Result<Vec<Value>, String> {
+/// capabilities — under `limits`, returning its typed result values. For hand-written IR that is a
+/// pure function rather than a program. A kernel is a run's root like any other (#2636): it runs
+/// through `jit_run`, which charges it to the root's grant (the default grant where `limits`
+/// names none) and arms the deadline. `Err` on compile failure, a guest trap (`OutOfFuel`
+/// included), or an `Exit` (a kernel should not call one).
+pub fn run_kernel(module: &Module, args: &[i64], limits: &Limits) -> Result<Vec<Value>, String> {
     // Escape gate (fail-closed, §2a): like the powerbox entry point, verify before running so a
     // direct library caller can't skip the verifier. Idempotent vs an already-verified module.
     temen_verify::verify_module(module)
         .map_err(|e| format!("verification failed (fail-closed): {e:?}"))?;
-    match compile_and_run(module, 0, args).map_err(|e| format!("JIT compile failed: {e:?}"))? {
-        JitOutcome::Returned(s) => {
-            let results = &module.funcs[0].results;
-            Ok(s.iter().zip(results).map(|(&v, t)| typed(*t, v)).collect())
-        }
-        JitOutcome::Exited(code) => Err(format!("kernel called Exit({code})")),
-        JitOutcome::Trapped(kind) => Err(format!("kernel trapped ({kind:?})")),
-        // Only an exec-armed powerbox unwinds a run; a kernel's host never is.
-        JitOutcome::HostUnwound => Err("kernel run unwound by its host".into()),
+    let mut host = Host::new();
+    let (outcome, _, results) =
+        jit_run(module, 0, args, &mut host, limits, None, None, false, None)?;
+    match outcome_from_jit(&results, outcome)? {
+        Outcome::Returned(values) => Ok(values),
+        Outcome::Exited(code) => Err(format!("kernel called Exit({code})")),
     }
 }
 
@@ -8661,7 +8660,8 @@ impl Instance {
     /// the outcome (no host capabilities granted — the escape hatch for pure kernel functions).
     fn run_kernel_diff(&self, fidx: FuncIdx, args: &[Value]) -> Result<Run, String> {
         if self.hooks.is_some() {
-            // The bare-kernel JIT path runs hostless, so the hook capability has nowhere to live.
+            // A bare kernel export gets a fresh host with no capabilities, so the hook capability
+            // has nowhere to live.
             return Err(
                 "a mem-hooked instance runs through the powerbox entry (`run`/`run_with_caps`/\
                  `run_diff`/`call(\"_start\")`), not a bare kernel export"
@@ -8669,12 +8669,27 @@ impl Instance {
             );
         }
         let m = &self.module;
+        // #2636 — both lanes run under the same grant, so a kernel that runs out of fuel runs out
+        // on both, and the JIT's lane goes through `jit_run` like every other JIT run.
+        let limits = Limits {
+            fuel: Some(50_000_000),
+            ..Limits::default()
+        };
         let mut h = Host::new();
-        let mut fuel = 50_000_000u64;
+        let mut fuel = limits.fuel();
         let interp = run_with_host(m, fidx, args, &mut fuel, &mut h);
         let slots: Vec<i64> = args.iter().copied().map(value_slot).collect();
-        let jit =
-            compile_and_run(m, fidx, &slots).map_err(|e| format!("JIT compile failed: {e:?}"))?;
+        let (jit, _, _) = jit_run(
+            m,
+            fidx,
+            &slots,
+            &mut Host::new(),
+            &limits,
+            None,
+            None,
+            false,
+            None,
+        )?;
         let outcome = diff_outcome(&m.funcs[fidx as usize].results, interp, jit)?;
         Ok(Run {
             outcome,
