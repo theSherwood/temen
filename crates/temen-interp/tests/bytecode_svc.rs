@@ -517,7 +517,7 @@ block 0 (v0: i64) {
   vt = thread.spawn 2 vz vz
   vinst = i32.wrap_i64 v0
   voff = call.cap 6 14 (i32, i64) -> (i32) vinst (vt, vz)
-  vjt = thread.join vt
+  vjt_st, vjt = thread.join vt
   vr = i64.extend_i32_s voff
   return vr
   }

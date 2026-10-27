@@ -408,10 +408,10 @@ block 0 (v0: i64) {
   vz = i64.const 0
   va = i64.const 10
   vt1 = thread.spawn 1 vz va
-  vj1 = thread.join vt1
+  vj1_st, vj1 = thread.join vt1
   vb = i64.const 20
   vt2 = thread.spawn 1 vz vb
-  vj2 = thread.join vt2
+  vj2_st, vj2 = thread.join vt2
   vr = i64.add vj1 vj2
   return vr
   }
@@ -1144,7 +1144,7 @@ func (i64) -> (i64) {{
 block 0 (v0: i64) {{
   vz = i64.const 0
   vt = thread.spawn 1 vz v0
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   return vj
   }}
 }}
@@ -1242,7 +1242,7 @@ func (i64) -> (i64) {
 block 0 (v0: i64) {
   vz = i64.const 0
   vt = thread.spawn 1 vz vz
-  vr = thread.join vt
+  vr_st, vr = thread.join vt
   return vr
   }
 }

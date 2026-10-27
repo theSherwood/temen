@@ -154,7 +154,7 @@ func () -> (i64) {
 block 0 () {
   vz = i64.const 0
   vt = thread.spawn 1 vz vz
-  vr = thread.join vt
+  vr_st, vr = thread.join vt
   vk = i64.const 2000
   vs = i64.add vk vr
   return vs
@@ -291,7 +291,7 @@ block 1 (vt1: i32, vi: i64) {
   br_if vmore 1(vt1, vi2) 2(vt1)
 }
 block 2 (vt2: i32) {
-  vr = thread.join vt2
+  vr_st, vr = thread.join vt2
   vk = i64.const 2000
   vs = i64.add vk vr
   return vs
@@ -484,7 +484,7 @@ block 0 (vr: i32, vw: i32) {
   vbuf = i64.const 66100
   vlen = i64.const 1
   vn = call.cap 0 0 (i64, i64) -> (i64) vr (vbuf, vlen)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vk = i64.const 1000
   vnk = i64.mul vn vk
   vb = i32.load8_u vbuf
@@ -804,7 +804,7 @@ block 0 (vin: i32, vout: i32) {
   vbuf = i64.const 66100
   vlen = i64.const 1
   vn = call.cap 0 0 (i64, i64) -> (i64) vin (vbuf, vlen)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vk = i64.const 1000
   vnk = i64.mul vn vk
   vb = i32.load8_u vbuf

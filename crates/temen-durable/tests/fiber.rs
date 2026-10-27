@@ -561,7 +561,10 @@ block 0 (v0: i64, v1: i64) {
     );
 
     // After slot 0 is recycled (now holds fiber B at gen 1), resuming A's stale gen-0 handle (i64 0)
-    // must fault — even though slot 0 is live — because the generation no longer matches.
+    // must not reach B — even though slot 0 is live — because the generation no longer matches.
+    // The handle was issued and its fiber returned, so it is spent: `(-EBADF, 0)` (#2667). The
+    // status comes back in the high word and the value in the low one, so a resume that reached B
+    // (status 1, value 7) reads differently.
     const STALE: &str = r#"
 func () -> (i64) {
 block 0 () {
@@ -573,7 +576,11 @@ block 0 () {
   v6 = cont.new v0 v1
   v9 = i64.const 0
   v7, v8 = cont.resume v9 v3
-  return v8
+  v10 = i64.extend_i32_s v7
+  v11 = i64.const 32
+  v12 = i64.shl v10 v11
+  v13 = i64.or v12 v8
+  return v13
   }
 }
 func (i64, i64) -> (i64) {
@@ -590,8 +597,19 @@ block 0 (v0: i64, v1: i64) {
     });
     assert_eq!(
         run_normal(&stale),
+        Ok(vec![Value::I64(-9 << 32)]),
+        "a stale (gen-0) handle to a recycled slot is spent (-EBADF, 0), never fiber B (the ABA guard)"
+    );
+
+    // A generation slot 0 has not reached (5, where it is at 1) was never issued: a forgery, which
+    // still faults.
+    let forged = STALE.replace("v9 = i64.const 0", "v9 = i64.const 83886080"); // (5 << 24) | 0
+    let mut forged = temen_text::parse_module(&forged).expect("parse FORGED");
+    forged.memory = stale.memory.clone();
+    assert_eq!(
+        run_normal(&forged),
         Err(Trap::FiberFault),
-        "a stale (gen-0) handle to a recycled slot faults (the ABA guard)"
+        "a never-issued generation is a forgery"
     );
 }
 

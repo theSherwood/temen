@@ -247,7 +247,7 @@ block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = i64.const 41
   v3 = thread.spawn 1 v1 v2
-  v4 = thread.join v3
+  v4_st, v4 = thread.join v3
   return v4
   }
 }

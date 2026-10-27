@@ -105,7 +105,7 @@ block 4 (vj2: i64) {
   vm2 = i64.mul vj2 v82
   va2 = i64.add vh2 vm2
   vt2 = i32.load va2
-  vr = thread.join vt2
+  vr_st, vr = thread.join vt2
   vone2 = i64.const 1
   vn2 = i64.add vj2 vone2
   br 3(vn2)
@@ -188,7 +188,7 @@ block 0 () {
   ve = i32.const 0
   vinf = i64.const -1
   vs = i32.atomic.wait vx ve vinf
-  vr = thread.join vt
+  vr_st, vr = thread.join vt
   vv = i32.load vx
   vs64 = i64.extend_i32_u vs
   vk = i64.const 100
@@ -236,7 +236,7 @@ func () -> (i64) {
 block 0 () {
   vz = i64.const 0
   vt = thread.spawn 1 vz vz
-  vr = thread.join vt
+  vr_st, vr = thread.join vt
   return vr
   }
 }

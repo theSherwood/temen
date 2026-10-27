@@ -3232,7 +3232,7 @@ block 0 (v0: i64, v1: i64) {
             let (h, r) = (10 + 4 * t + 3, 100 + 2 * t);
             let _ = write!(
                 main,
-                "  v{r} = thread.join v{h}\n  v{} = i64.add v{sum} v{r}\n",
+                "  v{r}_st, v{r} = thread.join v{h}\n  v{} = i64.add v{sum} v{r}\n",
                 r + 1
             );
             sum = r + 1;
@@ -3324,7 +3324,7 @@ block 0 (v0: i64, v1: i64) {
             );
         }
         for k in 0..4 {
-            let _ = writeln!(s, "  j{k} = thread.join h{k}");
+            let _ = writeln!(s, "  j{k}_st, j{k} = thread.join h{k}");
         }
         s.push_str("  m0 = i64.const 0\n");
         for (k, (off, narrow, want)) in cells.iter().enumerate() {

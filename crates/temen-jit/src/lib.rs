@@ -2615,7 +2615,7 @@ mod domain_teardown_tests {
              func (i64, i64) -> (i64) {{\n\
              block 0 (vsp: i64, v0: i64) {{\n\
              \x20 v1 = i32.const 0\n\
-             \x20 v2 = thread.join v1\n\
+             \x20 v2_st, v2 = thread.join v1\n\
              \x20 return v2\n\
                }}\n\
              }}\n"
@@ -6117,8 +6117,8 @@ impl HostFn {
             GcRoots => (&[I64], &[I64]),
             // (domain, mem_base, fn_table, vmctx, func, sp, arg) -> handle
             ThreadSpawn => (&[I64, I64, I64, I64, I32, I64, I64], &[I32]),
-            // (domain, handle, vmctx) -> result
-            ThreadJoin => (&[I64, I32, I64], &[I64]),
+            // (domain, handle, status_out, vmctx) -> value
+            ThreadJoin => (&[I64, I32, I64, I64], &[I64]),
             // (domain, addr, expected, width, timeout, vmctx) -> how the wait ended
             ThreadWait => (&[I64, I64, I64, I32, I64, I64], &[I32]),
             // (domain, addr, count) -> the waiters woken
@@ -6853,7 +6853,7 @@ block 0 (vh: i32, vi: i32, vx: i64) {
   vs1, vv1 = cont.resume vk vx
   vs2, vv2 = cont.resume.block vk vx
   vt = thread.spawn 1 vsp vx
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   va = i64.const 64
   ve = i32.const 0
   vto = i64.const 0
@@ -9284,13 +9284,24 @@ fn lower_block(
             continue;
         }
         if let Inst::ThreadJoin { handle } = inst {
-            // thread_join(sched, handle:i32, vmctx:i64) -> result:i64
+            // thread_join(sched, handle:i32, status_out:i64, vmctx:i64) -> value:i64, the status
+            // through `status_out` as `Instantiator.join`'s is (#2667).
             let sched = vmctx_load(b, lower, vmctx::SCHED);
             let h = get(&vals, *handle)?;
+            let ss =
+                b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+            let status_ptr = b.ins().stack_addr(I64, ss, 0);
             let vmctx = b.use_var(lower.vmctx_var);
-            let call = call_host(lower.callees, b, HostFn::ThreadJoin, &[sched, h, vmctx])?;
+            let call = call_host(
+                lower.callees,
+                b,
+                HostFn::ThreadJoin,
+                &[sched, h, status_ptr, vmctx],
+            )?;
             emit_trap_propagate(b, lower);
-            vals.push(b.inst_results(call)[0]);
+            let value = b.inst_results(call)[0];
+            vals.push(b.ins().stack_load(I64, ss, 0)); // result 0: status (i64)
+            vals.push(value); // result 1: value (i64)
             continue;
         }
         if let Inst::MemoryWait {

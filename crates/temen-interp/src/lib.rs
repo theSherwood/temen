@@ -5474,6 +5474,8 @@ const MAX_VCPUS: usize = 1 << 16;
 /// `cont.resume` status results (§12): the fiber `suspend`ed (resumable) vs. returned (done).
 const FIBER_SUSPENDED: i32 = 0;
 const FIBER_RETURNED: i32 = 1;
+/// The `cont.resume` status for a spent handle, whose fiber already returned (#2667).
+const FIBER_SPENT: i32 = EBADF as i32;
 use temen_ir::durable_abi::FIBER_FROZEN;
 /// §3.6 slice 5a — the third `cont.resume` status (beside suspended/returned; `2` was the retired
 /// coroutine `CORO_FAULTED`, kept unassigned): the fiber hit an event park (`memory.wait`, a
@@ -5803,9 +5805,9 @@ enum Blocked {
 
 /// Set on a parked vCPU before it is re-enqueued, telling its driver how to finish the op on resume.
 enum Pending {
-    /// Finish a join of the child at `threads[slot]`: a `thread.join`, or with `status` a §14
-    /// child's (`Instantiator.join`, op 1), which pushes how the child ended ([`join_delivery`]).
-    Join { slot: usize, status: bool },
+    /// Finish a join of the child at `threads[slot]`: a `thread.join`, or with `child` a §14
+    /// child's (`Instantiator.join`, op 1). Either pushes how the child ended ([`join_delivery`]).
+    Join { slot: usize, child: bool },
     /// Finish a `reap` (FORK.md §8.6 — servicer-side `wait()`): take the twin's outcome from the
     /// scheduler by `TaskId` and push its **exit status** (a clean `Ok(first i64)`; a trapped twin
     /// becomes a nonzero crash status — never a propagated trap, so the waiting shell survives).
@@ -8195,24 +8197,27 @@ enum ReapOutcome {
     Retry,
 }
 
-/// The registers a finished child's outcome `res` gives the vCPU that joined it, in result order.
-/// A §14 child's `join` (`Instantiator` op 1, `status`) answers how it ended as two results:
-/// `(0, its first value)` if it returned, `(its trap's wire code, 0)` if not ([`Trap::code`]). A
-/// child's end is never its parent's trap (INVARIANTS #5, #2066). A `thread.join` answers the
-/// thread's first value, and a thread's trap is its joiner's: a trap ends the whole domain
-/// (INVARIANTS #6). Either way the child is reaped. One rule for every driver.
-pub(crate) fn join_delivery(
-    res: &Result<Vec<Value>, Trap>,
-    status: bool,
-) -> Result<impl Iterator<Item = Reg>, Trap> {
-    let value = |vals: &[Value]| Reg::from_value(vals.first().copied().unwrap_or(Value::I64(0)));
-    let (first, second) = match (res, status) {
-        (Ok(vals), true) => (Reg::from_i64(0), Some(value(vals))),
-        (Err(t), true) => (Reg::from_i64(t.code()), Some(Reg::from_i64(0))),
-        (Ok(vals), false) => (value(vals), None),
-        (Err(t), false) => return Err(*t),
-    };
-    Ok(core::iter::once(first).chain(second))
+/// The `(status, value)` a finished child's outcome `res` gives the vCPU that joined it. A child
+/// that returned answers `(0, its first value)`. A §14 child's trap (`child`, an `Instantiator`
+/// op 1 join) answers `(its trap's wire code, 0)` ([`Trap::code`]): a child's end is never its
+/// parent's trap (INVARIANTS #5, #2066). A `thread.join`'s thread shares the joiner's world, so its
+/// trap is the joiner's: a trap ends the whole domain (INVARIANTS #6). Either way the child is
+/// reaped. One rule for every driver.
+pub(crate) fn join_delivery(res: &Result<Vec<Value>, Trap>, child: bool) -> Result<[Reg; 2], Trap> {
+    match res {
+        Ok(vals) => Ok([
+            Reg::from_i64(0),
+            Reg::from_value(vals.first().copied().unwrap_or(Value::I64(0))),
+        ]),
+        Err(t) if child => Ok([Reg::from_i64(t.code()), Reg::from_i64(0)]),
+        Err(t) => Err(*t),
+    }
+}
+
+/// The `(status, value)` a join of a spent handle answers, without parking: `(-EBADF, 0)`
+/// (INVARIANTS #5, #2667). One rule for every driver.
+pub(crate) fn join_spent() -> [Reg; 2] {
+    [Reg::from_i64(EBADF), Reg::from_i64(0)]
 }
 
 /// FORK.md §8.6 — a twin's exit status for servicer-side `wait()`. A clean finish yields the twin's
@@ -12255,6 +12260,21 @@ impl FiberRegistry {
         }
     }
 
+    /// #2667 — whether `handle` is **spent**: its generation is below its slot's, which
+    /// [`FiberRegistry::finish`] moves on when a fiber returns, so the handle was issued and its
+    /// fiber is gone. A resume of it answers `-EBADF` (INVARIANTS #5). A generation the slot has
+    /// not reached was never issued: a forgery, which [`FiberRegistry::claim`] faults. Asked only
+    /// of a handle `claim` refused, so a live claim never pays for it.
+    fn spent(&self, handle: i64) -> bool {
+        let t = self.lock();
+        let mask = t.fibers.len().next_power_of_two() - 1;
+        let slot = (handle as u64 as usize) & mask;
+        let issued = fiber_handle_generation(handle);
+        slot < t.fibers.len()
+            && issued != (t.gens[slot] & FIBER_GEN_MASK)
+            && issued < t.gens[slot]
+    }
+
     /// §3.6 slice 5a — park the running fiber on an **event** (fiber-level park): its frames
     /// are set aside, not claimable until [`FiberRegistry::wake_blocked`] flips it. The
     /// suspend-shaped counterpart of [`FiberRegistry::park_suspended`] for parks the guest
@@ -12522,15 +12542,16 @@ fn fiber_sig() -> FuncType {
     }
 }
 
-/// Resolve a `thread.join` handle to a table slot (§12). Like [`resolve_fiber`], the handle is
-/// forgeable, so it is **masked** into the power-of-two-padded table, then bounds- and
-/// liveness-checked: out of range or an already-joined (`None`) slot is inert ([`Trap::ThreadFault`]).
-fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> {
+/// Resolve a §12 thread or §14 child handle to a table slot. Like a fiber's ([`FiberRegistry::claim`]),
+/// the handle is forgeable, so it is **masked** into the power-of-two-padded table, then bounds- and
+/// liveness-checked. A handle that names no slot is inert ([`Trap::ThreadFault`]). `None` is a
+/// **spent** handle, whose slot was issued and whose child has since been joined or detached: the
+/// op answers `-EBADF` (INVARIANTS #5, #2667).
+fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<Option<usize>, Trap> {
     // The one rule every engine resolves a handle by ([`temen_ir::handle_slot`], #2378); a slot is
     // live while its entry is.
-    temen_ir::handle_slot(threads.len(), handle)
-        .filter(|&slot| threads[slot].is_some())
-        .ok_or(Trap::ThreadFault)
+    let slot = temen_ir::handle_slot(threads.len(), handle).ok_or(Trap::ThreadFault)?;
+    Ok(threads[slot].is_some().then_some(slot))
 }
 
 /// #2359 — drop what a vCPU keeps for the child at join `slot` once no handle names the child and it
@@ -13897,7 +13918,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     let mut svc_timed_out = false;
     // Resuming from a park: finish the op the scheduler woke us for.
     match v.pending.take() {
-        Some(Pending::Join { slot, status }) => {
+        Some(Pending::Join { slot, child: of_child }) => {
             let child = v
                 .threads
                 .get(slot)
@@ -13910,10 +13931,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             if v.durable && detached && v.sched.unwound(child) {
                 abandon_for_freeze(&mut v.mem, v.durable_sp_ctx);
                 let top = v.frames.len() - 1;
-                let n = if status { 2 } else { 1 };
                 v.frames[top]
                     .vals
-                    .extend(core::iter::repeat_n(Reg::from_i64(0), n));
+                    .extend(core::iter::repeat_n(Reg::from_i64(0), 2));
             } else {
                 v.threads[slot] = None; // a handle is joined once
                 forget_child(
@@ -13932,7 +13952,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 }
                 let out = v.sched.take_result(child).ok_or(Trap::Malformed)?;
                 // A thread's trap is this vCPU's; a §14 child's end is a value (#2066).
-                let regs = join_delivery(&out.result, status)?;
+                let regs = join_delivery(&out.result, of_child)?;
                 let top = v.frames.len() - 1;
                 v.frames[top].vals.extend(regs);
             }
@@ -15268,81 +15288,102 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // code, 0)`, the child reaped ([`join_delivery`], on resume via
                         // `Pending::Join`). Siblings run on. A spawner learns its child ran out of
                         // fuel, crashed, was killed or exited without inheriting it (INVARIANTS #5).
+                        // A spent handle answers `(-EBADF, 0)` ([`join_spent`]).
                         1 => {
                             let ch =
                                 get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
-                            let slot = resolve_thread(threads, ch)?;
-                            let child = threads[slot].ok_or(Trap::ThreadFault)?;
-                            *pending = Some(Pending::Join { slot, status: true });
-                            return Ok(Inner::Park(Blocked::Join { child }));
+                            match resolve_thread(threads, ch)? {
+                                Some(slot) => {
+                                    let child = threads[slot].ok_or(Trap::ThreadFault)?;
+                                    *pending = Some(Pending::Join { slot, child: true });
+                                    return Ok(Inner::Park(Blocked::Join { child }));
+                                }
+                                None => frames[top].vals.extend(join_spent()),
+                            }
                         }
                         // poll(child) -> 0 running | 1 returned | 2 trapped (PROCESS.md S3). Never
                         // parks — the reap probe a shell loops for `WNOHANG` / `SIGCHLD`.
                         // **Non-destructive**: the join-table slot and the child's stashed result are
-                        // left in place, so a later `join` still delivers it. A forged / already-joined
-                        // / detached handle is a `ThreadFault`, exactly like `join`.
+                        // left in place, so a later `join` still delivers it. A forged handle is a
+                        // `ThreadFault`, and a spent (joined or detached) one answers `-EBADF`,
+                        // exactly like `join`.
                         9 => {
                             let ch =
                                 get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
-                            let slot = resolve_thread(threads, ch)?;
-                            let child = threads[slot].ok_or(Trap::ThreadFault)?;
-                            let status = match sched.outcome_code(child) {
-                                None => 0,    // still running
-                                Some(0) => 1, // returned cleanly
-                                Some(_) => 2, // trapped
+                            let status = match resolve_thread(threads, ch)? {
+                                Some(slot) => {
+                                    let child = threads[slot].ok_or(Trap::ThreadFault)?;
+                                    match sched.outcome_code(child) {
+                                        None => 0,    // still running
+                                        Some(0) => 1, // returned cleanly
+                                        Some(_) => 2, // trapped
+                                    }
+                                }
+                                None => EBADF as i32,
                             };
                             frames[top].vals.push(Reg::from_i32(status));
                         }
                         // detach(child) -> 0 (PROCESS.md S3): drop the parent's join claim. The child
                         // keeps running to completion (detach is not kill) and is never joinable again.
-                        // A forged / already-joined handle is a `ThreadFault`. #2359 — it is reaped, its
-                        // result and what this vCPU keeps for it, once it has ended: now if it has, else
-                        // at a later detach. Until then its kill flag stays, so a kill of this vCPU
-                        // still ends it.
+                        // A forged handle is a `ThreadFault`, and a spent one answers `-EBADF`. #2359 —
+                        // it is reaped, its result and what this vCPU keeps for it, once it has ended:
+                        // now if it has, else at a later detach. Until then its kill flag stays, so a
+                        // kill of this vCPU still ends it.
                         10 => {
                             let ch =
                                 get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
-                            let slot = resolve_thread(threads, ch)?;
-                            let child = threads[slot].ok_or(Trap::ThreadFault)?;
-                            threads[slot] = None; // no longer joinable
-                            credit_child_lane(child_lane, host, slot); // D66
-                            unreaped.push((slot, child));
-                            unreaped.retain(|&(slot, child)| {
-                                let ended = sched.take_result(child).is_some();
-                                if ended {
-                                    forget_child(
-                                        slot,
-                                        child_hosts,
-                                        child_kill,
-                                        child_freeze,
-                                        delivered_detached,
-                                    );
+                            let answer = match resolve_thread(threads, ch)? {
+                                Some(slot) => {
+                                    let child = threads[slot].ok_or(Trap::ThreadFault)?;
+                                    threads[slot] = None; // no longer joinable
+                                    credit_child_lane(child_lane, host, slot); // D66
+                                    unreaped.push((slot, child));
+                                    unreaped.retain(|&(slot, child)| {
+                                        let ended = sched.take_result(child).is_some();
+                                        if ended {
+                                            forget_child(
+                                                slot,
+                                                child_hosts,
+                                                child_kill,
+                                                child_freeze,
+                                                delivered_detached,
+                                            );
+                                        }
+                                        !ended
+                                    });
+                                    0
                                 }
-                                !ended
-                            });
-                            frames[top].vals.push(Reg::from_i32(0));
+                                None => EBADF as i32,
+                            };
+                            frames[top].vals.push(Reg::from_i32(answer));
                         }
                         // kill(child) -> 0 (PROCESS.md S3, #2074): end the child and everything under
                         // it, running or parked, with `ThreadFault` (`poll` → 2, `join` → its code).
                         // Idempotent; killing an already-finished child is a harmless success. A
-                        // forged or joined handle is a `ThreadFault`.
+                        // forged handle is a `ThreadFault`, and a spent (joined or detached) one
+                        // answers `-EBADF`.
                         12 => {
                             let ch =
                                 get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
-                            let slot = resolve_thread(threads, ch)?;
-                            if let Some(flag) = child_kill.get(&slot) {
-                                // #2455 — a kill can end the last child this domain is held for. The
-                                // release then reaches every vCPU of the domain but this running one,
-                                // which takes the freeze itself.
-                                let held = durable && sched.held(sig_domain);
-                                sched.kill_child(flag, child_hosts.get(&slot));
-                                if held && !sched.held(sig_domain) {
-                                    if let Some(m) = mem.as_mut() {
-                                        m.durable_set_state(STATE_UNWINDING);
+                            let answer = match resolve_thread(threads, ch)? {
+                                Some(slot) => {
+                                    if let Some(flag) = child_kill.get(&slot) {
+                                        // #2455 — a kill can end the last child this domain is held
+                                        // for. The release then reaches every vCPU of the domain but
+                                        // this running one, which takes the freeze itself.
+                                        let held = durable && sched.held(sig_domain);
+                                        sched.kill_child(flag, child_hosts.get(&slot));
+                                        if held && !sched.held(sig_domain) {
+                                            if let Some(m) = mem.as_mut() {
+                                                m.durable_set_state(STATE_UNWINDING);
+                                            }
+                                        }
                                     }
+                                    0
                                 }
-                            }
-                            frames[top].vals.push(Reg::from_i32(0));
+                                None => EBADF as i32,
+                            };
+                            frames[top].vals.push(Reg::from_i32(answer));
                         }
                         // §3.6 slice 3 — `child_offer(child_handle, export) -> cap | -EINVAL`:
                         // mint a **live-callee offer** over a running child's impl-export. A
@@ -15360,7 +15401,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let export =
                                 get_i32(&frames[top].vals, *args.get(1).ok_or(Trap::Malformed)?)?
                                     as u32;
-                            let cap = resolve_thread(threads, ch).ok().and_then(|slot| {
+                            let cap = resolve_thread(threads, ch).ok().flatten().and_then(|slot| {
                                 let callee = child_hosts.get(&slot).cloned()?;
                                 let task = threads[slot]?;
                                 let (names, sigs) = callee.lock_unpoisoned().offer_shape(export)?;
@@ -15386,6 +15427,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 get_i32(&frames[top].vals, *args.get(1).ok_or(Trap::Malformed)?)?;
                             let callee = resolve_thread(threads, ch)
                                 .ok()
+                                .flatten()
                                 .filter(|&slot| threads[slot].is_some_and(|c| !sched.has_result(c)))
                                 .and_then(|slot| child_hosts.get(&slot));
                             let r = grant_into_running(host, callee, gh)?;
@@ -17177,8 +17219,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let kh = get_i64(&frames[top].vals, *k)?;
                     let av = get_i64(&frames[top].vals, *arg)?;
                     // Materialize the target's frames: start a `Pending` fiber, or continue a
-                    // parked one (delivering `arg` as the result of its `suspend`).
-                    let (target, claimed) = registry.claim(kh)?;
+                    // parked one (delivering `arg` as the result of its `suspend`). A spent handle
+                    // runs nothing and answers `(-EBADF, 0)` (#2667); a forged one faults.
+                    let (target, claimed) = match registry.claim(kh) {
+                        Ok(c) => c,
+                        Err(_) if registry.spent(kh) => {
+                            frames[top].vals.push(Reg::from_i32(FIBER_SPENT));
+                            frames[top].vals.push(Reg::from_i64(0));
+                            continue;
+                        }
+                        Err(t) => return Err(t),
+                    };
                     // §3.6 slice 5a (timed fiber waits): a poll of a still-blocked fiber is a
                     // scheduler touchpoint — fire due timers, then re-claim, so a fiber wait
                     // whose deadline has passed completes at the poll instead of starving in a
@@ -17638,18 +17689,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         None => return Err(Trap::ThreadFault), // live cap (a thread-bomb)
                     }
                 }
-                // §12 thread join: park until vCPU `handle` finishes, then (on resume) take its i64
-                // result. A forged / out-of-range / already-joined handle is inert (masked + checked
-                // like a fiber handle); a trap in the joined vCPU propagates here (on resume).
+                // §12 thread join: park until vCPU `handle` finishes, then (on resume) take its
+                // `(status, value)`. A forged / out-of-range handle is inert (masked + checked like a
+                // fiber handle); a spent one answers `(-EBADF, 0)` without parking (#2667); a trap in
+                // the joined vCPU propagates here (on resume).
                 Inst::ThreadJoin { handle } => {
                     let h = get_i32(&frames[top].vals, *handle)?;
-                    let slot = resolve_thread(threads, h)?;
-                    let child = threads[slot].ok_or(Trap::ThreadFault)?;
-                    *pending = Some(Pending::Join {
-                        slot,
-                        status: false,
-                    });
-                    return Ok(Inner::Park(Blocked::Join { child }));
+                    match resolve_thread(threads, h)? {
+                        Some(slot) => {
+                            let child = threads[slot].ok_or(Trap::ThreadFault)?;
+                            *pending = Some(Pending::Join { slot, child: false });
+                            return Ok(Inner::Park(Blocked::Join { child }));
+                        }
+                        None => frames[top].vals.extend(join_spent()),
+                    }
                 }
                 // §12 futex wait: validate the address (confine/align/prot — traps surface here), then
                 // park; the executor re-checks the value under its lock (atomic vs. `notify`) and either
@@ -19827,8 +19880,8 @@ fn builtin_iface_ops(id: u32) -> Option<&'static [(&'static str, FuncType)]> {
 /// `>= 0` is success. Errors do **not** trap — traps stay reserved for escape/fatal. The standard
 /// errnos come from the one shared table ([`temen_ir::errno`]); the aliases below are temen-interp's own.
 use temen_ir::errno::{
-    E2BIG, EACCES, EAGAIN, EBUSY, ECHILD, EFAULT, EINTR, EINVAL, EMFILE, ENOEXEC, ENOMEM, ENOSPC,
-    EPIPE,
+    E2BIG, EACCES, EAGAIN, EBADF, EBUSY, ECHILD, EFAULT, EINTR, EINVAL, EMFILE, ENOEXEC, ENOMEM,
+    ENOSPC, EPIPE,
 };
 /// §3.6 revocation-unparks completion status (`-EBADF`): the errno a fiber's parked capability
 /// call returns when the handle it was parked through is revoked out from under it. Probeable

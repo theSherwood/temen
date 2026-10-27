@@ -2254,7 +2254,7 @@ long counter;
 long __vm_atomic_add(void *p, long v);
 long __vm_atomic_load(void *p);
 int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
-long __vm_thread_join(int h);
+long __vm_thread_join(int h, long *status);
 
 long worker(long iters) {
   for (long i = 0; i < iters; i++)
@@ -2267,10 +2267,10 @@ int main(void) {
   int b = __vm_thread_spawn(worker, (void *)0, 500);
   int c = __vm_thread_spawn(worker, (void *)0, 500);
   int d = __vm_thread_spawn(worker, (void *)0, 500);
-  __vm_thread_join(a);
-  __vm_thread_join(b);
-  __vm_thread_join(c);
-  __vm_thread_join(d);
+  __vm_thread_join(a, &(long){0});
+  __vm_thread_join(b, &(long){0});
+  __vm_thread_join(c, &(long){0});
+  __vm_thread_join(d, &(long){0});
   return (int)__vm_atomic_load(&counter);
 }
 "#;
@@ -2308,9 +2308,9 @@ fn c_thread_shares_powerbox_for_io() {
     let src = format!(
         "{LIBC}\n\
          int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);\n\
-         long __vm_thread_join(int h);\n\
+         long __vm_thread_join(int h, long *status);\n\
          long worker(long arg) {{ write(1, \"hi from a thread\\n\", 17); return 0; }}\n\
-         int main(void) {{ int h = __vm_thread_spawn(worker, (void *)0, 0); __vm_thread_join(h); return 0; }}\n"
+         int main(void) {{ int h = __vm_thread_spawn(worker, (void *)0, 0); __vm_thread_join(h, &(long){{0}}); return 0; }}\n"
     );
     let run = run_c_full(&src);
     assert_eq!(run.stdout, b"hi from a thread\n");

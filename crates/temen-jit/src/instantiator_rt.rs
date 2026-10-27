@@ -136,7 +136,7 @@ impl DurableCell {
 }
 
 /// One spawned child's join-table entry: its completion cell plus whether it has been `join`ed (a
-/// second join is inert — `ThreadFault`, matching the interpreter's once-only join).
+/// second join answers `-EBADF`, matching the interpreter's once-only join, #2667).
 struct Child {
     done: std::sync::Arc<ChildDone>,
     joined: bool,
@@ -944,7 +944,7 @@ impl Nursery {
 
     /// The live child slot `handle` names, by the oracle's rule ([`temen_ir::handle_slot`], #2378):
     /// issued, and neither joined nor detached. `None` for a forged or spent handle — the interp's
-    /// dead thread slot.
+    /// dead thread slot. [`refused`] tells the two apart.
     fn live_slot(children: &[Child], handle: i32) -> Option<usize> {
         temen_ir::handle_slot(children.len(), handle).filter(|&slot| !children[slot].joined)
     }
@@ -1943,11 +1943,10 @@ pub(crate) unsafe extern "C" fn join(
         return 0; // a forged `Instantiator` — its CapFault is raised (#1729)
     }
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
-    // A forged or spent child handle: `ThreadFault`, as the oracle's join rule answers — a child
-    // rides the §12 executor as a vCPU, so this is a thread-handle forgery, not a capability one
-    // (#1573). The `Instantiator` operand itself was checked above and is the `CapFault` case.
+    // A child handle that is not live: spent, or forged ([`refused`]). The `Instantiator` operand
+    // itself was checked above and is the `CapFault` case.
     let Some(slot) = Nursery::live_slot(&children, handle) else {
-        vm.raise(TrapKind::ThreadFault as i64);
+        *status_out = refused(&children, handle, vm);
         return 0;
     };
     let c = &mut children[slot];
@@ -2098,8 +2097,7 @@ pub(crate) unsafe extern "C" fn join(
 /// ops 0/5/8/11/13) runs on its own OS thread, so `poll` reports the live cell state: `0` while its
 /// thread is still executing, then `1` (clean) / `2` (trapped) once it publishes an outcome. A
 /// synchronous (durable) child is already done, so it never reads `0`. Non-destructive: the slot + its
-/// result stay for a later `join`. A forged or spent handle is a `ThreadFault`, as `join`'s and the
-/// oracle's (#2378).
+/// result stay for a later `join`. A spent or forged handle answers as `join`'s does ([`refused`]).
 ///
 /// # Safety
 /// As [`join`]: `rt`/`vm` are the instance's nursery + run trap cell, valid for the call.
@@ -2116,8 +2114,7 @@ pub(crate) unsafe extern "C" fn poll(
     }
     let children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let Some(slot) = Nursery::live_slot(&children, handle) else {
-        vm.raise(TrapKind::ThreadFault as i64);
-        return 0;
+        return refused(&children, handle, vm) as i32;
     };
     let st = children[slot]
         .done
@@ -2134,8 +2131,8 @@ pub(crate) unsafe extern "C" fn poll(
 /// PROCESS.md S3 `detach(child) -> 0` (JIT). Drop the parent's join claim; a later `join` is then inert.
 /// The child's OS thread (if still running) is joined at run teardown (`join_children`), so a detached
 /// async child never outlives the window; what the nursery keeps for it goes once it has ended
-/// (#2359, [`Nursery::claim_ended`]). A forged or spent handle is a `ThreadFault`, as the oracle's
-/// (#2378).
+/// (#2359, [`Nursery::claim_ended`]). A spent or forged handle answers as `join`'s does
+/// ([`refused`]).
 ///
 /// # Safety
 /// As [`join`].
@@ -2152,8 +2149,7 @@ pub(crate) unsafe extern "C" fn detach(
     }
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let Some(slot) = Nursery::live_slot(&children, handle) else {
-        vm.raise(TrapKind::ThreadFault as i64);
-        return 0;
+        return refused(&children, handle, vm) as i32;
     };
     children[slot].joined = true;
     drop(children);
@@ -2163,8 +2159,8 @@ pub(crate) unsafe extern "C" fn detach(
 
 /// PROCESS.md S3 `kill(child) -> 0` (JIT, #2074): end the child and every child under it with
 /// `ThreadFault`, running or parked ([`Nursery::kill_slot`]), as the interpreter's op-12 arm does. A
-/// child that has finished is left as it is. A forged or spent handle is a `ThreadFault`, as the
-/// oracle's: a joined or detached child is no longer this parent's to kill (#2378).
+/// child that has finished is left as it is. A joined or detached child is no longer this parent's
+/// to kill: a spent or forged handle answers as `join`'s does ([`refused`]).
 ///
 /// # Safety
 /// As [`join`].
@@ -2181,12 +2177,24 @@ pub(crate) unsafe extern "C" fn kill(
     }
     let children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let Some(slot) = Nursery::live_slot(&children, handle) else {
-        vm.raise(TrapKind::ThreadFault as i64);
-        return 0;
+        return refused(&children, handle, vm) as i32;
     };
     drop(children);
     rt.kill_slot(slot);
     0
+}
+
+/// What `join`/`poll`/`detach`/`kill` answer for a child handle [`Nursery::live_slot`] refused, by
+/// the oracle's rule (#2667). A **spent** handle names a slot whose child was since joined or
+/// detached: `-EBADF` (INVARIANTS #5). A forged one names no slot: `ThreadFault` — a child rides
+/// the §12 executor as a vCPU, so this is a thread-handle forgery, not a capability one (#1573).
+fn refused(children: &[Child], handle: i32, vm: &crate::VmCtx) -> i64 {
+    if temen_ir::handle_slot(children.len(), handle).is_some() {
+        temen_ir::errno::EBADF
+    } else {
+        vm.raise(TrapKind::ThreadFault as i64);
+        0
+    }
 }
 
 /// Whether the §5 kill-path interrupt cell at `addr` has fired (`0` ⇒ no kill-path armed) — so a

@@ -428,7 +428,7 @@ block 0 () {{
   vexp = i32.const 0
   vinf = i64.const -1
   vst = i32.atomic.wait vaddr vexp vinf
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vw = i32.load vaddr
   vw64 = i64.extend_i32_u vw
   vk = i64.const 1000
@@ -501,7 +501,7 @@ func () -> (i64) {{
 block 0 () {{
   vz = i64.const 0
   vt = thread.spawn 1 vz vz
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vk = i64.const 1000
   vr = i64.add vk vj
   return vr
@@ -579,7 +579,7 @@ block 0 (vr: i32, vw: i32) {{
   vbuf = i64.const 66100
   vlen = i64.const 1
   vn = call.cap 0 0 (i64, i64) -> (i64) vr (vbuf, vlen)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vk = i64.const 1000
   vnk = i64.mul vn vk
   vb = i32.load8_u vbuf
@@ -636,7 +636,7 @@ block 0 (vr: i32, vw: i32) {{
   vfill = call.cap 0 1 (i64, i64) -> (i64) vw (vbuf, vcap)
   vone = i64.const 1
   vn = call.cap 0 1 (i64, i64) -> (i64) vw (vbuf, vone)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vk = i64.const 1000
   vnk = i64.mul vn vk
   vres = i64.add vnk vj
@@ -892,7 +892,7 @@ block 0 () {{
   vt = thread.spawn 1 vz vz
   vz32 = i32.const 0
   vn = call.cap 4294967295 10 () -> (i64) vz32 ()
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vc = i64.const 65600
   vafter = i64.load vc
   vk = i64.const 1000
@@ -1036,7 +1036,7 @@ block 1 (vi0: i32, vc1: i32, vt1: i32, vk1: i64, vi: i64) {
   br_if vmore 1(vi0, vc1, vt1, vk1, vi2) 2(vi0, vc1, vt1)
 }
 block 2 (vi3: i32, vc2: i32, vt2: i32) {
-  vr = thread.join vt2
+  vr_st, vr = thread.join vt2
   vn_st, vn = call.cap 6 1 (i32) -> (i64, i64) vi3 (vc2)
   vth = i64.const 1000
   vm = i64.mul vn vth
@@ -1343,7 +1343,7 @@ block 1 (vt1: i32, vk1: i64, va: i64) {{
   br_if vdone 2(vt1, vn) 1(vt1, vk1, va)
 }}
 block 2 (vt2: i32, vn2: i64) {{
-  vj = thread.join vt2
+  vj_st, vj = thread.join vt2
   vk = i64.const 1000
   vnk = i64.mul vn2 vk
   vbuf = i64.const 66100

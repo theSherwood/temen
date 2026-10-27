@@ -1158,8 +1158,8 @@ pub(crate) unsafe extern "C" fn fiber_new(
 /// resumer keeps running and re-polls with another `cont.resume`, §3.6 slice 5a) and returns the
 /// fiber's yielded/returned value. A join's park is never reported (#2322): it blocks the whole
 /// vCPU, so this resume parks the resumer's own context with it and returns once the fiber moves
-/// on. A forged / out-of-range / already-running / finished handle traps (`FiberFault`), matching
-/// the interpreter.
+/// on. A finished fiber's handle is spent: status `-EBADF`, value 0 (#2667). A forged / out-of-range
+/// / already-running handle traps (`FiberFault`), matching the interpreter.
 ///
 /// # Safety
 /// `status_out` is a live `*mut i64` cell and `vm` a live context address. The running vCPU's
@@ -1209,11 +1209,15 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             // #2032 — a freeze driver resumes the handles of its own snapshot of the table, and
             // another vCPU's driver (or a guest resume under the freeze) may have flattened one
             // since: that claimant records it, so this one skips it. Only a guest's lost claim is a
-            // forged, running or finished handle.
-            if !rt.flattening {
+            // forged, running or finished handle. A finished one is spent: `-EBADF` (#2667).
+            if rt.flattening {
+                *status_out = 1;
+            } else if slot.own.spent(fiber_handle_generation(handle)) {
+                *status_out = temen_ir::errno::EBADF;
+            } else {
                 fault(vm);
+                *status_out = 1;
             }
-            *status_out = 1;
             return 0;
         }
         if rt.durable {

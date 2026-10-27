@@ -28,9 +28,9 @@ block 0 () {
   t0 = thread.spawn 1 vz vz
   t1 = thread.spawn 1 vz vz
   t2 = thread.spawn 1 vz vz
-  j0 = thread.join t0
-  j1 = thread.join t1
-  j2 = thread.join t2
+  j0_st, j0 = thread.join t0
+  j1_st, j1 = thread.join t1
+  j2_st, j2 = thread.join t2
   va = i64.const 16384
   vr = i64.atomic.load va
   return vr
@@ -133,10 +133,10 @@ block 0 () {
   t1 = thread.spawn 1 vn vn
   t2 = thread.spawn 1 vn vn
   t3 = thread.spawn 1 vn vn
-  j0 = thread.join t0
-  j1 = thread.join t1
-  j2 = thread.join t2
-  j3 = thread.join t3
+  j0_st, j0 = thread.join t0
+  j1_st, j1 = thread.join t1
+  j2_st, j2 = thread.join t2
+  j3_st, j3 = thread.join t3
   va = i64.const 16384
   vr = i64.atomic.load va
   return vr
@@ -658,8 +658,8 @@ block 0 (v0: i32, v1: i32) {
   vsp = i64.const 0
   t0 = thread.spawn 1 vsp vp
   t1 = thread.spawn 1 vsp vp
-  j0 = thread.join t0
-  j1 = thread.join t1
+  j0_st, j0 = thread.join t0
+  j1_st, j1 = thread.join t1
   va = i64.const 16392
   vr = i64.atomic.load va
   return vr
@@ -876,7 +876,7 @@ block 0 () {
   vr = call.cap 5 2 (i64, i64, i32) -> (i64) vas (vp, vlen, vprot)
   vz = i64.const 0
   t0 = thread.spawn 1 vz vz
-  j0 = thread.join t0
+  j0_st, j0 = thread.join t0
   va = call 2 (vp)
   vs = i64.add j0 va
   return vs
@@ -1094,7 +1094,7 @@ block 0 (v0: i64) {
   i64.store va v7
   vz = i64.const 0
   t = thread.spawn 1 vz vz
-  j = thread.join t
+  j_st, j = thread.join t
   vb = i64.const 16408
   vt = i64.load vb
   vs = i64.add v7 vt
@@ -1326,7 +1326,7 @@ block 0 (v0: i64) {
   t = thread.spawn 1 vz vz
   v7 = i64.const 7
   va = call 2 (v7)
-  j = thread.join t
+  j_st, j = thread.join t
   vs = i64.add va j
   return vs
   }
@@ -1429,9 +1429,9 @@ block 0 () {
   t0 = thread.spawn 2 vz vz
   t1 = thread.spawn 2 vz vz
   t2 = thread.spawn 2 vz vz
-  j0 = thread.join t0
-  j1 = thread.join t1
-  j2 = thread.join t2
+  j0_st, j0 = thread.join t0
+  j1_st, j1 = thread.join t1
+  j2_st, j2 = thread.join t2
   va = i64.const 16384
   vr = i64.atomic.load va
   return vr
@@ -1478,7 +1478,7 @@ block 0 () {
   vz = i64.const 0
   t = thread.spawn 2 vz vz
   vr = call 1 ()
-  j = thread.join t
+  j_st, j = thread.join t
   return vr
   }
 }

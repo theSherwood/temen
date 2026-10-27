@@ -549,7 +549,7 @@ fn gc_roots_cross_vcpu_stop_the_world_scan() {
         \x20 v21 = i64.const 16520\n\
         \x20 v22 = i32.const 1\n\
         \x20 v23 = atomic.notify v21 v22\n\
-        \x20 v24 = thread.join v13\n\
+        \x20 v24_st, v24 = thread.join v13\n\
         \x20 v25 = i64.const 16384\n\
         \x20 v26 = i64.load v25\n\
         \x20 v27 = i64.const 16392\n\

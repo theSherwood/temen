@@ -209,7 +209,7 @@ block 1 () {
 block 2 () {
   va2 = i64.const 16384
   vh2 = i32.load va2
-  vj = thread.join vh2
+  vj_st, vj = thread.join vh2
   br 3()
   }
 block 3 () {

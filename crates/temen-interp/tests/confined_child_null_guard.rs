@@ -63,7 +63,7 @@ block 0 () {{
   vsp = i64.const 32768
   varg = i64.const 0
   vt = thread.spawn 1 vsp varg
-  vr = thread.join vt
+  vr_st, vr = thread.join vt
   return vr
   }}
 }}

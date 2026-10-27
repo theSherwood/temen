@@ -333,6 +333,9 @@ pub mod wire {
         matches!(sniff_kind(bytes), Some(KIND_MODULE | KIND_OBJECT))
     }
 }
+// v15 (#2667) gives `thread.join` two results, `(status, value)`, where it had one. Its encoding is
+// unchanged, but every value after a join numbers one higher, so a v14 stream would decode into a
+// different program: the bump makes the decoder refuse it. Every committed asset is re-encoded.
 // v14 (#2454) lets a block use a value of a block that dominates it. Each block header gains its
 // **parent** in a dominator tree the producer supplies, written as a distance back (the entry writes
 // 0), and after its params a **capture list**: `(distance back to an ancestor, value index)` pairs,
@@ -390,7 +393,7 @@ pub mod wire {
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
 // for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
-const VERSION: u16 = 14;
+const VERSION: u16 = 15;
 
 // The object dialect is its own header `kind` (`wire::KIND_OBJECT`), not a flag bit.
 

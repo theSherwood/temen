@@ -152,8 +152,8 @@ fn concurrent_callers_share_one_threaded_instance() {
            vt0 = thread.spawn 1 vsp va0\n\
            va1 = i64.const 1\n\
            vt1 = thread.spawn 1 vsp va1\n\
-           vj0 = thread.join vt0\n\
-           vj1 = thread.join vt1\n\
+           vj0_st, vj0 = thread.join vt0\n\
+           vj1_st, vj1 = thread.join vt1\n\
            vh = i32.const {offer}\n\
            vc0 = i64.const 16400\n\
            vr0 = call.cap {tid} 1 (i64) -> (i64) vh (vc0)\n\
@@ -217,7 +217,7 @@ fn concurrent_callers_never_lose_an_admission() {
             ));
         }
         for i in 0..N {
-            body.push_str(&format!("               vj{i} = thread.join vt{i}\n"));
+            body.push_str(&format!("               vj{i}_st, vj{i} = thread.join vt{i}\n"));
         }
         body.push_str(&format!("               vh = i32.const {offer}\n"));
         body.push_str("               vacc0 = i64.const 0\n");

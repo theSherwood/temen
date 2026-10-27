@@ -149,7 +149,7 @@ func (i32, i32) -> (i64) {\n\
 block 0 (vw: i32, vr: i32) {\n\
   vz = i64.const 0\n\
   vt = thread.spawn 1 vz vz\n\
-  vj = thread.join vt\n\
+  vj_st, vj = thread.join vt\n\
   a0 = i64.const 16384\n\
   cx = i32.const 120\n\
   i32.store8 a0 cx\n\

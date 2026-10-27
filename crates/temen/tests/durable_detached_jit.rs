@@ -542,7 +542,7 @@ func (i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64) {
   vz = i64.const 0
   vt = thread.spawn 1 vz vz
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vhundred = i64.const 100
   vr = i64.add vj vhundred
   return vr
@@ -578,7 +578,7 @@ block 0 (v0: i64, v1: i64) {
   vto = i64.const 1000000000
   vw = i32.atomic.wait va vw0 vto
   vs2, vx2 = cont.resume vk vz
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vhundred = i64.const 100
   vr0 = i64.add vx vx2
   vr1 = i64.add vr0 vj

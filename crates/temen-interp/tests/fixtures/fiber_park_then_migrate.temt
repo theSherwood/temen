@@ -6,7 +6,7 @@ block 0 () {
   vk = cont.new v0 vz
   vs1, vv1 = cont.resume vk vz
   vt = thread.spawn 2 vz vk
-  vr = thread.join vt
+  vr_st, vr = thread.join vt
   vk1 = i64.const 1000
   vs1e = i64.extend_i32_s vs1
   va = i64.mul vs1e vk1

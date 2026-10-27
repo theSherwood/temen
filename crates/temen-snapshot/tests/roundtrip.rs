@@ -490,7 +490,7 @@ block 0 (v0: i32) {
   v4 = thread.spawn 1 v2 v3
   v5 = i32.const 0
   v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
-  v7 = thread.join v4
+  v7_st, v7 = thread.join v4
   v8 = i64.add v6 v7
   return v8
   }
@@ -627,7 +627,7 @@ block 0 (v0: i32) {
   v7 = cont.new v5 v6
   v8 = i64.const 0
   v9, v10 = cont.resume v7 v8
-  v13 = thread.join v4
+  v13_st, v13 = thread.join v4
   v14 = i64.add v10 v13
   return v14
   }
@@ -922,7 +922,7 @@ block 0 (v0: i32) {
   v4 = thread.spawn 1 v2 v3
   v5 = i32.const 0
   v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
-  v7 = thread.join v4
+  v7_st, v7 = thread.join v4
   v8 = i64.add v6 v7
   return v8
   }
@@ -936,7 +936,7 @@ block 0 (v0: i64, v1: i64) {
   v6 = thread.spawn 2 v4 v5
   v7 = i32.const 0
   v8 = call.cap 2 0 (i32) -> (i64) v3 (v7)
-  v9 = thread.join v6
+  v9_st, v9 = thread.join v6
   v10 = i64.add v8 v9
   return v10
   }
@@ -1726,7 +1726,7 @@ block 0 (v0: i32, vai: i32, vbi: i32, vb: i32) {
   i32.store pt vbi offset=4
   i32.store pt vb offset=8
   vt = thread.spawn 4 vz vz
-  vtr = thread.join vt
+  vtr_st, vtr = thread.join vt
   vx = i64.const 0
   vra = call.cap 268435456 0 (i64) -> (i64) vcapa (vx)
   va_st, va_n = call.cap 6 1 (i32) -> (i64, i64) v0 (va)

@@ -2380,17 +2380,21 @@ impl Domain {
     }
 }
 
-/// `thread.join` thunk: block this OS thread until vCPU `handle` finishes; return its `i64` result. A
-/// forged / out-of-range handle is inert (**traps** `ThreadFault`); a child that itself trapped
-/// propagates that trap here (the joiner's `emit_trap_propagate` then unwinds).
+/// `thread.join` thunk: block this OS thread until vCPU `handle` finishes; return its `i64` result,
+/// with status 0 through `status_out`. A forged / out-of-range handle is inert (**traps**
+/// `ThreadFault`); a spent (already-joined) one answers status `-EBADF` and value 0 without
+/// blocking (INVARIANTS #5, #2667); a child that itself trapped propagates that trap here (the
+/// joiner's `emit_trap_propagate` then unwinds).
 ///
 /// # Safety
-/// `sched` is the run's live `Domain`.
+/// `sched` is the run's live `Domain`, and `status_out` is valid for writes.
 pub(crate) unsafe extern "C" fn thread_join(
     sched: *const Domain,
     handle: i32,
+    status_out: *mut i64,
     vm: &crate::VmCtx,
 ) -> i64 {
+    *status_out = 0;
     let dom = current_domain(sched);
     // Durable single-worker (slice 3.4): resolve the handle in the **current** vCPU's per-vCPU table —
     // nested spawns give each spawning vCPU its own handle namespace. `dchildren` is populated only on
@@ -2406,14 +2410,16 @@ pub(crate) unsafe extern "C" fn thread_join(
             // handle ⇒ inert trap.
             match dc.get_mut(&cur) {
                 Some(tbl) => {
-                    // The oracle's rule (`temen_ir::handle_slot`, #2378): a forged, negative or
-                    // already-joined handle is inert.
-                    let Some(slot) =
-                        temen_ir::handle_slot(tbl.cells.len(), handle).filter(|&s| !tbl.joined[s])
-                    else {
+                    // The oracle's rule (`temen_ir::handle_slot`, #2378): a forged or negative
+                    // handle is inert, and an already-joined one is spent (#2667).
+                    let Some(slot) = temen_ir::handle_slot(tbl.cells.len(), handle) else {
                         vm.raise(TrapKind::ThreadFault as i64);
                         return 0;
                     };
+                    if tbl.joined[slot] {
+                        *status_out = temen_ir::errno::EBADF;
+                        return 0;
+                    }
                     tbl.joined[slot] = true;
                     tbl.cells[slot].joined.store(true, Ordering::Relaxed);
                     std::sync::Arc::clone(&tbl.cells[slot])
@@ -2426,13 +2432,17 @@ pub(crate) unsafe extern "C" fn thread_join(
         } else {
             drop(dc);
             let mut t = lock(&dom.threads);
-            // Out-of-range, negative or already-joined handles are inert (trap), like a forged
-            // capability index: the oracle's rule (`temen_ir::handle_slot`, #2378).
-            let Some(slot) = temen_ir::handle_slot(t.cells.len(), handle).filter(|&s| !t.joined[s])
-            else {
+            // Out-of-range and negative handles are inert (trap), like a forged capability index,
+            // and an already-joined one is spent: the oracle's rule (`temen_ir::handle_slot`, #2378,
+            // #2667).
+            let Some(slot) = temen_ir::handle_slot(t.cells.len(), handle) else {
                 vm.raise(TrapKind::ThreadFault as i64);
                 return 0;
             };
+            if t.joined[slot] {
+                *status_out = temen_ir::errno::EBADF;
+                return 0;
+            }
             t.joined[slot] = true;
             t.cells[slot].joined.store(true, Ordering::Relaxed);
             std::sync::Arc::clone(&t.cells[slot])

@@ -59,7 +59,7 @@ block 0 (v0: i32) {
   v4 = thread.spawn 1 v2 v3
   v5 = i32.const 0
   v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
-  v7 = thread.join v4
+  v7_st, v7 = thread.join v4
   v8 = i64.add v6 v7
   return v8
   }
@@ -404,7 +404,7 @@ block 0 (v0: i32) {
   v3 = thread.spawn 1 v1 v2
   v4 = i32.const 0
   v5 = call.cap 2 0 (i32) -> (i64) v0 (v4)
-  v6 = thread.join v3
+  v6_st, v6 = thread.join v3
   v7 = i64.add v5 v6
   return v7
   }
@@ -621,7 +621,7 @@ block 0 (v0: i32) {
   v4 = thread.spawn 1 v2 v3
   v5 = i32.const 0
   v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
-  v7 = thread.join v4
+  v7_st, v7 = thread.join v4
   v8 = i64.add v6 v7
   return v8
   }
@@ -635,7 +635,7 @@ block 0 (v0: i64, v1: i64) {
   v6 = thread.spawn 2 v4 v5
   v7 = i32.const 0
   v8 = call.cap 2 0 (i32) -> (i64) v3 (v7)
-  v9 = thread.join v6
+  v9_st, v9 = thread.join v6
   v10 = i64.add v8 v9
   return v10
   }
@@ -830,7 +830,7 @@ func () -> (i64) {
 block 0 () {
   vz = i64.const 0
   vt = thread.spawn 1 vz vz
-  vr = thread.join vt
+  vr_st, vr = thread.join vt
   vk = i64.const 2000
   vs = i64.add vk vr
   return vs

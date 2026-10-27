@@ -49,7 +49,7 @@ func () -> (i64) {
 block 0 () {
   v0 = i64.const 5
   v1 = thread.spawn 1 v0 v0
-  v2 = thread.join v1
+  v2_st, v2 = thread.join v1
   return v2
   }
 }
@@ -76,7 +76,7 @@ block 1 (v1: i64) {
 block 2 (v4: i64) {
   v5 = i64.const 7
   v6 = thread.spawn 1 v5 v5
-  v7 = thread.join v6
+  v7_st, v7 = thread.join v6
   v8 = i64.const 1
   v9 = i64.add v4 v8
   br 1(v9)
@@ -102,7 +102,7 @@ block 0 () {
   v1 = i64.const 0
   v2 = cont.new v0 v1
   v3 = thread.spawn 1 v1 v1
-  v4 = thread.join v3
+  v4_st, v4 = thread.join v3
   return v4
   }
 }

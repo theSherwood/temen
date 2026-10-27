@@ -267,7 +267,7 @@ block 5 (vj2: i64) {{
   vb2 = i64.const 16400
   va2 = i64.add vb2 voff2
   vt2 = i32.load va2
-  vjr = thread.join vt2
+  vjr_st, vjr = thread.join vt2
   vone2 = i64.const 1
   vnj = i64.add vj2 vone2
   br 4(vnj)

@@ -23,7 +23,7 @@ block 0 () {
   vsp = i64.const 0
   va = i64.const 0
   vh = thread.spawn 1 vsp va
-  vj = thread.join vh
+  vj_st, vj = thread.join vh
   vptr = i64.const 16384
   vlen = i64.const 3
   vw = call.import 0 (vptr, vlen)
@@ -143,7 +143,7 @@ block 0 () {
   vaddr = i64.const 16384
   vc = i64.load vaddr
   vn = i64.add vc va
-  vj = thread.join vh
+  vj_st, vj = thread.join vh
   vr = i64.load vaddr
   return vr
   }

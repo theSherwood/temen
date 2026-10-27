@@ -147,7 +147,7 @@ func () -> (i64) {
 block 0 () {
   v0 = i64.const 0
   v1 = thread.spawn 1 v0 v0
-  v2 = thread.join v1
+  v2_st, v2 = thread.join v1
   return v2
   }
 }

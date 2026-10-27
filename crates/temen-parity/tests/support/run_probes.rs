@@ -366,8 +366,8 @@ block 0 () {
   t0 = thread.spawn 1 vz v5
   v7 = i64.const 7
   t1 = thread.spawn 1 vz v7
-  j0 = thread.join t0
-  j1 = thread.join t1
+  j0_st, j0 = thread.join t0
+  j1_st, j1 = thread.join t1
   vs = i64.add j0 j1
   return vs
   }

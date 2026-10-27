@@ -80,7 +80,7 @@ block 0 () {
   v3 = i64.const 5
   v4, v5 = cont.resume v2 v3
   v6 = thread.spawn 1 v2 v2
-  v7 = thread.join v6
+  v7_st, v7 = thread.join v6
   return v7
   }
 }
@@ -130,8 +130,8 @@ block 0 () {
   v2 = cont.new v0 v1
   v3 = thread.spawn 1 v2 v2
   v4 = thread.spawn 1 v2 v2
-  v5 = thread.join v3
-  v6 = thread.join v4
+  v5_st, v5 = thread.join v3
+  v6_st, v6 = thread.join v4
   v7 = i64.add v5 v6
   return v7
   }
@@ -169,7 +169,7 @@ block 0 () {
   v1 = i64.const 0
   v2 = cont.new v0 v1
   v3 = thread.spawn 1 v2 v2
-  v4 = thread.join v3
+  v4_st, v4 = thread.join v3
   return v4
   }
 }
@@ -207,7 +207,7 @@ block 0 () {
   v1 = i64.const 0
   v2 = cont.new v0 v1
   v3 = thread.spawn 1 v1 v1
-  v4 = thread.join v3
+  v4_st, v4 = thread.join v3
   return v4
   }
 }
@@ -263,7 +263,7 @@ block 0 () {
   v3 = i64.const 5
   v4, v5 = cont.resume v2 v3
   v6 = thread.spawn 1 v2 v2
-  v7 = thread.join v6
+  v7_st, v7 = thread.join v6
   v8 = i64.const 9
   v9, v10 = cont.resume v2 v8
   v11 = i64.add v5 v7
@@ -381,7 +381,7 @@ block 0 () {
   v3 = i64.const 0
   v4, v5 = cont.resume v2 v3
   v6 = thread.spawn 1 v2 v2
-  v7 = thread.join v6
+  v7_st, v7 = thread.join v6
   v8 = vcpu.tls.get
   v9 = i64.add v5 v7
   v10 = i64.add v9 v8

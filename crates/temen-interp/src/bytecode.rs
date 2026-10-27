@@ -5061,6 +5061,11 @@ fn debug_advance_fiber(
                         vt.active.set(dst + 1, Reg::from_i64(0));
                         return FiberStep::Stepped;
                     }
+                    Ok(Claim::Spent) => {
+                        vt.active.set(dst, Reg::from_i32(super::FIBER_SPENT));
+                        vt.active.set(dst + 1, Reg::from_i64(0));
+                        return FiberStep::Stepped;
+                    }
                     Err(t) => return FiberStep::Trapped(t),
                 };
             enter_fiber(vt, &mut cell, mem, false, k, target, dst);
@@ -6215,10 +6220,10 @@ fn service_advance(
             Outcome::ThreadJoin {
                 handle,
                 dst,
-                status,
+                of_child,
             } => {
                 *turn += 1;
-                join_child(tasks, ti, handle, dst, status);
+                join_child(tasks, ti, handle, dst, of_child);
             }
             Outcome::ChildCtl { child, dst, ctl } => {
                 *turn += 1;
@@ -9115,12 +9120,13 @@ enum Outcome {
         dst: u32,
         module: usize,
     },
-    /// A join (`thread.join`, or with `status` a §14 child's `Instantiator.join`, op 1): park until
-    /// child `handle` ends; what it gives the joiner lands from `dst` ([`super::join_delivery`]).
+    /// A join (`thread.join`, or with `of_child` a §14 child's `Instantiator.join`, op 1): park
+    /// until child `handle` ends; what it gives the joiner lands from `dst`
+    /// ([`super::join_delivery`]).
     ThreadJoin {
         handle: i32,
         dst: u32,
-        status: bool,
+        of_child: bool,
     },
     /// §3.6 (I36 slice 2) — a caller's `call.cap` through a live-callee offer. The dispatch is
     /// already enqueued on the callee (the op exec holds the callee `Arc`); the driver parks this
@@ -9570,6 +9576,9 @@ enum Claim {
     Block,
     /// An event-parked fiber still blocked: the resumer gets `(FIBER_PARKED, 0)`.
     Poll,
+    /// A fiber that already returned, so its handle is spent: the resumer gets `(-EBADF, 0)`
+    /// (INVARIANTS #5, #2667).
+    Spent,
 }
 
 /// #1538 — take the argument a thaw claim queued for fiber `slot`'s rewound `suspend` (see
@@ -9640,8 +9649,8 @@ fn new_fiber(
 /// A pending fiber starts; a parked one continues, `arg` its `suspend`'s result. An event-parked fiber
 /// continues once its event has fired, with the event's result instead of `arg` (the oracle's
 /// `LiveWoken`); until then its resumer polls it, or blocks on it under a blocking resume
-/// (`blocking_ip`) on a driver that can idle the task (`may_block`, I48). Anything else (forged,
-/// running, done) is a `FiberFault`. `blocking_ip` also tags the fiber while it runs, so a park inside
+/// (`blocking_ip`) on a driver that can idle the task (`may_block`, I48). A finished fiber's handle
+/// is spent ([`Claim::Spent`]); anything else (forged, running) is a `FiberFault`. `blocking_ip` also tags the fiber while it runs, so a park inside
 /// it idles the task instead of answering the poll.
 fn claim_fiber(
     fibers: &mut FiberCell,
@@ -9776,7 +9785,8 @@ fn claim_fiber(
             vm.set(cap_dst, Reg::from_i64(r));
             Ok(Claim::Continue(vm))
         }
-        _ => Err(Trap::FiberFault), // forged / Running / Done
+        Some(FiberState::Done) => Ok(Claim::Spent), // a finished slot keeps its place (#1684)
+        _ => Err(Trap::FiberFault),                 // forged / Running
     })
 }
 
@@ -10844,6 +10854,11 @@ fn drive_nested(
                         vt.active.set(dst + 1, Reg::from_i64(0));
                         continue;
                     }
+                    Claim::Spent => {
+                        vt.active.set(dst, Reg::from_i32(super::FIBER_SPENT));
+                        vt.active.set(dst + 1, Reg::from_i64(0));
+                        continue;
+                    }
                 };
                 enter_fiber(&mut vt, fibers, mem, false, k, target, dst);
             }
@@ -11079,7 +11094,7 @@ enum VcpuStop {
     Join {
         handle: i32,
         dst: u32,
-        status: bool,
+        of_child: bool,
     },
     /// §5 `Instantiator.instantiate_rec` (op 17, #1286) — see [`Outcome::InstantiateDetached`].
     InstantiateDetached {
@@ -11162,11 +11177,11 @@ impl Outcome {
             Outcome::ThreadJoin {
                 handle,
                 dst,
-                status,
+                of_child,
             } => VcpuStop::Join {
                 handle,
                 dst,
-                status,
+                of_child,
             },
             // §3.6 (I36 slice 2): the serve/call/offer trio surface straight to the driver. The
             // qualification veto keeps them out of fiber contexts, so no registry state is live.
@@ -11424,6 +11439,11 @@ fn step_vcpu(
                         }
                         Claim::Block | Claim::Poll => {
                             vt.active.set(dst, Reg::from_i32(super::FIBER_PARKED));
+                            vt.active.set(dst + 1, Reg::from_i64(0));
+                            continue;
+                        }
+                        Claim::Spent => {
+                            vt.active.set(dst, Reg::from_i32(super::FIBER_SPENT));
                             vt.active.set(dst + 1, Reg::from_i64(0));
                             continue;
                         }
@@ -11743,13 +11763,13 @@ fn refund_ended_windows(
 #[derive(Clone)]
 enum TaskState {
     Runnable,
-    /// Parked on a join of task `child` (with `status`, a §14 child's); deliver what it gives the
+    /// Parked on a join of task `child` (with `of_child`, a §14 child's); deliver what it gives the
     /// joiner from `dst` ([`super::join_delivery`]) and wake.
     BlockedJoin {
         child: usize,
         slot: usize,
         dst: u32,
-        status: bool,
+        of_child: bool,
     },
     /// Parked on `memory.wait` at address `addr` of its own window until notified or `deadline`
     /// (logical clock). It waits at `site`, taken at the park as the oracle takes its key; a `notify`
@@ -13854,6 +13874,7 @@ impl SchedCore {
                 let export = arg as u32;
                 let callee = super::resolve_thread(&tasks[ti].threads, child)
                     .ok()
+                    .flatten()
                     .and_then(|slot| tasks[ti].threads[slot])
                     .and_then(|cidx| tasks[cidx].env)
                     .filter(|&k| Some(k) != tasks[ti].env)
@@ -14403,8 +14424,8 @@ impl SchedCore {
             Ok(VcpuStop::Join {
                 handle,
                 dst,
-                status,
-            }) => join_child(tasks, ti, handle, dst, status),
+                of_child,
+            }) => join_child(tasks, ti, handle, dst, of_child),
             Ok(VcpuStop::Wait {
                 base,
                 expected,
@@ -17420,7 +17441,7 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
                 child,
                 slot,
                 dst,
-                status,
+                of_child,
             } = t.state
             else {
                 continue;
@@ -17429,7 +17450,7 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
                 continue;
             }
             t.threads[slot] = None;
-            match super::join_delivery(&res, status) {
+            match super::join_delivery(&res, of_child) {
                 Ok(regs) => {
                     t.deliver_from(dst, regs);
                     t.state = TaskState::Runnable;
@@ -17440,18 +17461,20 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
     }
 }
 
-/// A join of child handle `handle` (`status`: [`super::join_delivery`]'s mode). A child that already
-/// finished delivers now, or its trap completes the joiner; else the joiner parks on it until
-/// [`complete`] wakes it. A bad handle completes the joiner with its trap.
-fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32, status: bool) {
+/// A join of child handle `handle` (`of_child`: [`super::join_delivery`]'s mode). A child that
+/// already finished delivers now, or its trap completes the joiner; else the joiner parks on it until
+/// [`complete`] wakes it. A spent handle delivers [`super::join_spent`]; a forged one completes the
+/// joiner with its trap.
+fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32, of_child: bool) {
     let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
-        Ok(s) => s,
+        Ok(Some(s)) => s,
+        Ok(None) => return tasks[ti].deliver_from(dst, super::join_spent()),
         Err(t) => return complete(tasks, ti, Err(t)),
     };
     let child = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
     match &tasks[child].state {
         TaskState::Done(res) => {
-            let out = super::join_delivery(res, status);
+            let out = super::join_delivery(res, of_child);
             tasks[ti].threads[slot] = None;
             match out {
                 Ok(regs) => tasks[ti].deliver_from(dst, regs),
@@ -17463,7 +17486,7 @@ fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32, status: 
                 child,
                 slot,
                 dst,
-                status,
+                of_child,
             }
         }
     }
@@ -17474,7 +17497,7 @@ fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32, status: 
 /// or a child whose root task is done, which has ended — what `poll` reports — though its env is
 /// released only once its threads are done too.
 fn grant_target(tasks: &[TaskSlot], ti: usize, child: i32) -> Option<usize> {
-    let slot = super::resolve_thread(&tasks[ti].threads, child).ok()?;
+    let slot = super::resolve_thread(&tasks[ti].threads, child).ok()??;
     let c = tasks[ti].threads[slot]?;
     if matches!(tasks[c].state, TaskState::Done(_)) {
         return None;
@@ -17483,8 +17506,8 @@ fn grant_target(tasks: &[TaskSlot], ti: usize, child: i32) -> Option<usize> {
 }
 
 /// PROCESS.md S3 `poll`/`detach`/`kill` of child handle `child`, the answer at `dst`. `spawners`
-/// names each env's spawner, for a `kill` to end the subtree ([`kill_env`]). A bad handle completes
-/// the caller with its trap.
+/// names each env's spawner, for a `kill` to end the subtree ([`kill_env`]). A spent handle answers
+/// `-EBADF` (#2667); a forged one completes the caller with its trap.
 fn child_ctl(
     tasks: &mut [TaskSlot],
     spawners: &[Option<usize>],
@@ -17494,7 +17517,8 @@ fn child_ctl(
     ctl: ChildCtl,
 ) {
     let slot = match super::resolve_thread(&tasks[ti].threads, child) {
-        Ok(s) => s,
+        Ok(Some(s)) => s,
+        Ok(None) => return tasks[ti].deliver(dst, Reg::from_i32(super::EBADF as i32)),
         Err(t) => return complete(tasks, ti, Err(t)),
     };
     let c = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
@@ -19909,7 +19933,7 @@ impl Vm {
                     return Ok(Outcome::ThreadJoin {
                         handle,
                         dst,
-                        status: false,
+                        of_child: false,
                     });
                 }
                 // §14 executor children — the Instantiator authority `(ibase, isize)` is resolved here
@@ -20051,7 +20075,7 @@ impl Vm {
                     return Ok(Outcome::ThreadJoin {
                         handle,
                         dst,
-                        status: true,
+                        of_child: true,
                     });
                 }
                 Op::MemoryWait {

@@ -3802,7 +3802,7 @@ block 0 (xt: i64, x: i64) {
 func (i64) -> (i64) {
 block 0 (t: i64) {
   h = i32.wrap_i64 t
-  y = thread.join h
+  y_st, y = thread.join h
   return y
   }
 }

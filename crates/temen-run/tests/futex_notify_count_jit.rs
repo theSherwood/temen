@@ -141,7 +141,7 @@ block 10 (vj2: i64, vnf3: i64) {
   vm10 = i64.mul vj2 v410
   va10 = i64.add vh10 vm10
   vt10 = i32.load va10
-  vr10 = thread.join vt10
+  vr10_st, vr10 = thread.join vt10
   vone10 = i64.const 1
   vj3 = i64.add vj2 vone10
   br 9(vj3, vnf3)
@@ -274,7 +274,7 @@ block 6 (vk6: i64, vcl: i64) {
 block 7 (vcl2: i64) {
   vha7 = i64.const 16416
   vt7 = i32.load vha7
-  vj = thread.join vt7
+  vj_st, vj = thread.join vt7
   vfa7 = i64.const 16424
   vfw = i64.atomic.load vfa7
   vva7 = i64.const 16432
@@ -433,7 +433,7 @@ block 11 (vj2: i64, vn0e: i64, vnae: i64) {
   vm11 = i64.mul vj2 v411
   va11 = i64.add vh11 vm11
   vt11 = i32.load va11
-  vr11 = thread.join vt11
+  vr11_st, vr11 = thread.join vt11
   vone11 = i64.const 1
   vj3 = i64.add vj2 vone11
   br 10(vj3, vn0e, vnae)

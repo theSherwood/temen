@@ -88,8 +88,8 @@ block 0 (v0: i32) {
   v4 = thread.spawn 2 v2 v2
   v5 = i32.const 0
   v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
-  v7 = thread.join v3
-  v8 = thread.join v4
+  v7_st, v7 = thread.join v3
+  v8_st, v8 = thread.join v4
   v9 = i64.const 65544
   v10 = i64.load v9
   v11 = i64.const 1000000
@@ -113,7 +113,7 @@ block 0 (v0: i32) {
   i32.store v1 v0
   v2 = i64.const 0
   v3 = thread.spawn 1 v2 v2
-  v7 = thread.join v3
+  v7_st, v7 = thread.join v3
   v4 = thread.spawn 2 v2 v2
   f0 = ref.func 3
   f1 = i64.const 4096
@@ -121,7 +121,7 @@ block 0 (v0: i32) {
   f3, f4 = cont.resume f2 v2
   v5 = i32.const 0
   v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
-  v8 = thread.join v4
+  v8_st, v8 = thread.join v4
   v9 = i64.const 65544
   v10 = i64.load v9
   v11 = i64.const 1000000
@@ -824,7 +824,7 @@ block 0 (v0: i32) {
   i32.store v1 v0
   v2 = i64.const 0
   v3 = thread.spawn 2 v2 v2
-  v4 = thread.join v3
+  v4_st, v4 = thread.join v3
   v5 = i32.const 0
   v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
   v7 = i64.add v4 v6

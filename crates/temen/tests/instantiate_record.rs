@@ -571,7 +571,7 @@ fn client_death_releases_the_server_while_a_resumer_is_parked_under_its_key() {
             "block 0 (v0: i64) {
   vz = i64.const 0
   vt = thread.spawn 4 vz vz
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vz32 = i32.const 0
   vs = svc.wait vz32
   return vs
@@ -1359,7 +1359,7 @@ fn a_paged_childs_thread_is_paged_in() {
         )
         .replace(
             "  vb = i32.load8_u va\n  vbw = i64.extend_i32_u vb\n  return vbw\n",
-            "  vsp = i64.const 0\n  vth = thread.spawn 3 vsp va\n  vtj = thread.join vth\n  \
+            "  vsp = i64.const 0\n  vth = thread.spawn 3 vsp va\n  vtj_st, vtj = thread.join vth\n  \
              vc = i64.const 49152\n  vb = i32.load8_u vc\n  vbw = i64.extend_i32_u vb\n  \
              vr = i64.add vtj vbw\n  return vr\n",
         )
@@ -1416,7 +1416,7 @@ block 0 (vk: i64, vaddr: i64) {
 fn a_fault_in_a_paged_childs_thread_fiber_blocks_its_vcpu() {
     let src = detached_pager_src(32768).replace(
         "  vb = i32.load8_u va\n  vbw = i64.extend_i32_u vb\n  return vbw\n",
-        "  vsp = i64.const 0\n  vth = thread.spawn 3 vsp va\n  vtj = thread.join vth\n  \
+        "  vsp = i64.const 0\n  vth = thread.spawn 3 vsp va\n  vtj_st, vtj = thread.join vth\n  \
              return vtj\n",
     ) + "
 func 3 (i64, i64) -> (i64) {

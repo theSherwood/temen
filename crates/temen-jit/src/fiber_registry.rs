@@ -207,6 +207,16 @@ impl Ownership {
             .is_ok()
     }
 
+    /// #2667 — whether a handle carrying `handle_generation` is **spent**: below the slot's
+    /// generation, which [`Self::finish`] moves on when the fiber returns, so the handle was issued
+    /// and its fiber is gone. Its resume answers `-EBADF` (INVARIANTS #5). A generation the slot has
+    /// not reached was never issued: a forgery. Asked only of a handle [`Self::claim_gen`] refused.
+    pub(crate) fn spent(&self, handle_generation: u64) -> bool {
+        let g = gen_of(self.word.load(Ordering::Relaxed));
+        let issued = handle_generation & FIBER_HANDLE_GEN_MASK;
+        issued != (g & FIBER_HANDLE_GEN_MASK) && issued < g
+    }
+
     /// Voluntarily suspend the running fiber **into the steal pool**: `RUNNING → RUNNABLE` (same
     /// generation), a **release** store so a stealer's acquiring claim sees the complete saved
     /// context. Returns the slot's current **generation**, which the caller records alongside the

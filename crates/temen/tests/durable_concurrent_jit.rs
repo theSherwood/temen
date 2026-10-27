@@ -232,8 +232,8 @@ block 1 (v10: i32, v11: i32, v12: i64) {
   br_if v16 1(v10, v11, v14) 2(v10, v11, v14)
 }
 block 2 (v17: i32, v18: i32, v19: i64) {
-  v20 = thread.join v17
-  v21 = thread.join v18
+  v20_st, v20 = thread.join v17
+  v21_st, v21 = thread.join v18
   v22 = i64.const 65536
   i64.store v22 v19
   return v19
@@ -321,7 +321,7 @@ block 1 (v7: i32, v8: i64) {
   br_if v12 1(v7, v10) 2(v7, v10)
 }
 block 2 (v13: i32, v14: i64) {
-  v15 = thread.join v13
+  v15_st, v15 = thread.join v13
   v16 = i64.add v14 v15
   v17 = i64.const 65536
   i64.store v17 v16
@@ -403,7 +403,7 @@ block 1 (v6: i32, v7: i32, v8: i64) {
 block 2 (v13: i32, v14: i32, v15: i64) {
   v16 = i32.const 0
   v17 = call.cap 2 0 (i32) -> (i64) v13 (v16)
-  v18 = thread.join v14
+  v18_st, v18 = thread.join v14
   v19 = i64.const 65536
   i64.store v19 v15
   return v15
@@ -523,7 +523,7 @@ block 1 (v6: i32, v7: i32, v8: i64) {
 block 2 (v13: i32, v14: i32, v15: i64) {
   v16 = i32.const 0
   v17 = call.cap 2 0 (i32) -> (i64) v13 (v16)
-  v18 = thread.join v14
+  v18_st, v18 = thread.join v14
   v19 = i64.const 65536
   i64.store v19 v15
   return v15
@@ -630,7 +630,7 @@ block 0 (v0: i32, v1: i32) {
   i32.store v2 v1
   v3 = i64.const 0
   v4 = thread.spawn 1 v3 v3
-  v5 = thread.join v4
+  v5_st, v5 = thread.join v4
   v6 = i64.const 65536
   i64.store v6 v5
   return v5
@@ -705,7 +705,7 @@ func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 0
   v2 = thread.spawn 1 v1 v1
-  v3 = thread.join v2
+  v3_st, v3 = thread.join v2
   return v3
   }
 }
@@ -713,7 +713,7 @@ func (i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64) {
   v2 = i64.const 0
   v3 = thread.spawn 2 v2 v2
-  v4 = thread.join v3
+  v4_st, v4 = thread.join v3
   return v4
   }
 }
@@ -787,7 +787,7 @@ block 1 (v6: i32, v7: i64) {
   br_if v11 1(v6, v9) 2(v6, v9)
 }
 block 2 (v12: i32, v13: i64) {
-  v14 = thread.join v12
+  v14_st, v14 = thread.join v12
   v15 = i64.add v13 v14
   v16 = i64.const 65536
   i64.store v16 v15
@@ -809,7 +809,7 @@ block 1 (v5: i32, v6: i64) {
   br_if v10 1(v5, v8) 2(v5, v8)
 }
 block 2 (v11: i32, v12: i64) {
-  v13 = thread.join v11
+  v13_st, v13 = thread.join v11
   v14 = i64.add v12 v13
   v15 = i64.const 65544
   i64.store v15 v14
@@ -906,7 +906,7 @@ block 0 (v0: i32, v1: i32) {
   v8 = i32.atomic.wait v5 v6 v7
   v9 = i64.const 65536
   i32.store v9 v8
-  v10 = thread.join v4
+  v10_st, v10 = thread.join v4
   v11 = i64.const 0
   return v11
   }
@@ -1072,7 +1072,7 @@ block 0 (v0: i32, v1: i32) {
   v8 = i32.atomic.wait v5 v6 v7
   v9 = i64.const 65536
   i32.store v9 v8
-  v10 = thread.join v4
+  v10_st, v10 = thread.join v4
   v11 = i64.const 0
   return v11
   }
@@ -1157,8 +1157,8 @@ block 0 (v0: i32, v1: i32) {
   v2 = i64.const 0
   v3 = thread.spawn 1 v2 v2
   v4 = thread.spawn 2 v2 v2
-  v5 = thread.join v3
-  v6 = thread.join v4
+  v5_st, v5 = thread.join v3
+  v6_st, v6 = thread.join v4
   v7 = i64.const 0
   return v7
   }
@@ -1242,8 +1242,8 @@ block 0 (v0: i32, v1: i32) {
   v2 = i64.const 0
   v3 = thread.spawn 1 v2 v2
   v4 = thread.spawn 2 v2 v2
-  v5 = thread.join v3
-  v6 = thread.join v4
+  v5_st, v5 = thread.join v3
+  v6_st, v6 = thread.join v4
   v7 = i64.const 0
   return v7
   }
@@ -1374,7 +1374,7 @@ block 0 (v0: i32, v1: i32) {
   i32.store v2 v0
   v3 = i64.const 7
   v4 = thread.spawn 1 v3 v3
-  v5 = thread.join v4
+  v5_st, v5 = thread.join v4
   v6 = i64.const 65544
   v7 = thread.spawn 2 v6 v6
   v8 = i32.const 0
@@ -1391,7 +1391,7 @@ block 1 (v11: i64, v12: i32, v13: i64) {
 }
 block 2 (v18: i64, v19: i32, v20: i64) {
   v21 = i64.add v20 v18
-  v22 = thread.join v19
+  v22_st, v22 = thread.join v19
   v23 = i64.const 65536
   i64.store v23 v21
   return v21
