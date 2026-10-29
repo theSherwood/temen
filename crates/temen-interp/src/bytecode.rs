@@ -8557,10 +8557,10 @@ fn spawn_task(
 /// applied to the run's own image at its entry. Offered when it cannot park, or parks only where its
 /// host suspends the emitted frames ([`image_parks`]), and the host's emitter takes it; a durable run
 /// (whose freeze could not meet emitted frames) and a window emitted code cannot address as one span
-/// ([`Mem::one_span`]) run interpreted, as before. Both executors ask it whenever their caller holds the image: the pump's
-/// [`CoopRun::start`] for a run over a module, a [`SharedProgram`] warm restore given its module
-/// (#1414 S4-3c) and a [`Reactor`] call given its module (#1414 S4-4), and executor 2's
-/// [`CoopRun::new_parallel`] (#1414 5c).
+/// ([`Mem::one_span`]) run interpreted, as before. Both executors ask it whenever their caller holds
+/// the image: the pump's [`CoopRun::start`] for a run over a module, a [`SharedProgram`] warm restore
+/// given its module (#1414 S4-3c) and a [`Reactor`] call given its module (#1414 S4-4), and executor
+/// 2's [`CoopRun::new_parallel`] (#1414 5c).
 fn root_leaf(
     emit: &LeafEmitter,
     m: &Module,

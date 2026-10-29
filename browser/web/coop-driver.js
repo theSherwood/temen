@@ -460,6 +460,23 @@ export function windowTier(ex, memory, windowMemory, x) {
   const scratchBytes = ex.temen_wasmjit_call_scratch_bytes();
   const spillBytes = Math.min(h.spillBytes, x.spillBytes?.() ?? 0);
   const span = (m, at, n) => new Uint8Array(m.buffer, at, n);
+  // What a bounce copies between, viewed once: a view of a shared memory stays valid as the memory
+  // grows, the header never moves, and neither does the engine's scratch nor its spill buffer while
+  // they are held. Made again only when one of them is not the one viewed.
+  let views = null;
+  const viewsFor = (argsPtr, scratch) => {
+    if (views?.argsPtr !== argsPtr || views.scratch !== scratch) {
+      views = {
+        argsPtr, scratch, win: span(windowMemory, argsPtr, scratchBytes), eng: span(memory, scratch, scratchBytes),
+      };
+    }
+    return views;
+  };
+  let spills = null;
+  const spillsFor = (ptr) => {
+    if (spills?.ptr !== ptr) spills = { ptr, win: span(windowMemory, spillAt, spillBytes), eng: span(memory, ptr, spillBytes) };
+    return spills;
+  };
   let copied; // the stamp of the table the context holds
   const pagestateAt = () => {
     const [p, n, stamp] = x.pagestate();
@@ -480,10 +497,14 @@ export function windowTier(ex, memory, windowMemory, x) {
     envCell: env,
     callInterp: (target, argsPtr, spillLen) => {
       const scratch = x.scratch();
-      span(memory, scratch, scratchBytes).set(span(windowMemory, argsPtr, scratchBytes));
-      if (spillLen) span(memory, Number(x.spillPtr()), spillLen * 8).set(span(windowMemory, spillAt, spillLen * 8));
+      const v = viewsFor(argsPtr, scratch);
+      v.eng.set(v.win);
+      if (spillLen) {
+        const sp = spillsFor(Number(x.spillPtr()));
+        sp.eng.set(sp.win.subarray(0, spillLen * 8));
+      }
       const rc = x.callInterp(target, scratch, spillLen);
-      span(windowMemory, argsPtr, scratchBytes).set(span(memory, scratch, scratchBytes));
+      v.win.set(v.eng);
       return rc;
     },
     pagestatePtr: pagestateAt,

@@ -27,8 +27,9 @@
 // #1414 5d: then a root's memory of its own, against the oracle each time: a root leaf grown past
 // 256 MiB, which leaves the engine's memory as it was; a map past a smaller grant, refused as the
 // oracle refuses it (`temen_set_mem_grant`), and allowed again under the default; a window no memory
-// can hold, whose open fails cleanly; and a collecting guest whose emitted frames spill its roots,
-// which the bounce copies to where `gc.roots` scans them.
+// can hold, whose open fails cleanly; a collecting guest whose emitted frames spill its roots, which
+// the bounce copies to where `gc.roots` scans them; and a page-checked child grown past 240 MiB, past
+// what its header's page-state table could cover before (its table now covers its memory's maximum).
 //
 // Usage:  node browser-coop-grow-test.mjs [module.wasm]   (build the threads or the plain cdylib first)
 
@@ -589,11 +590,79 @@ if (gc.opened !== 0) {
   if (!own(gc)) fail(`the collecting root's events must name one memory of its own: ${show([...gc.mems])}`);
   if (!same(gc, gcWant)) fail(`the collector's roots: ${show(gc.got)}, oracle ${show(gcWant)}`);
 }
+
+// 6e. Section 5's child, its emit page-checked (the module has read-only data) and its f3 mapping
+// 16 KiB at 300 MiB for f2 to store through: the child's page-state table, one byte per 4 KiB page,
+// is longer than the 60 KiB its header held before #1414 5d. The `"budget"` it is paid from is
+// staged for each open to fund that growth (by default it funds one window, #2579).
+const stageBudget = () => ex.temen_onramp_stage_budget(-1n, BigInt(400 << 20), -1n);
+const PAGED_CHILD_SRC = CHILD_SRC
+  .replace('memory 16\n', 'memory 16\nimport 0 "vm_map" (i64, i64, i32) -> (i64)\n')
+  .replace(`  vnp = i64.const 40992
+  vnl = i64.const 6
+  vh = self.resolve vnp vnl
+  vaddr = i64.const 32768
+  return vaddr`, `  voff = i64.const ${BIG}
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vg = call.import 0 (voff, vlen, vprot)
+  vaddr = i64.const ${BIG + 16}
+  return vaddr`);
+if (PAGED_CHILD_SRC === CHILD_SRC || !PAGED_CHILD_SRC.includes('call.import')) {
+  throw new Error('6e: the child source did not take its edits');
+}
+const pagedGuest = parse(PAGED_CHILD_SRC);
+stageBudget();
+const pagedWant = oracle(pagedGuest);
+let pagedTable = 0, pagedChecked = 0;
+// Each event asks for its memory (`pendingTier`), then its program: pair them in that order.
+const pagedSeen = { mems: [], programs: [] };
+stageBudget();
+const pagedOpened = withGuest(pagedGuest, (p, n) => ex.temen_coop_open(p, n, 0, 0, 1, 0, 0, 0));
+let pagedReturned;
+if (pagedOpened === 0) {
+  pagedReturned = await driveCoopTierupRun({ ...ex,
+    temen_coop_module: () => {
+      const m = ex.temen_coop_module();
+      pagedSeen.programs.push(m);
+      return m;
+    },
+    temen_coop_tierup_mem: () => {
+      const mem = ex.temen_coop_tierup_mem();
+      pagedSeen.mems.push(mem);
+      return mem;
+    },
+    temen_coop_pagestate_len: () => {
+      const n = ex.temen_coop_pagestate_len();
+      if (pagedSeen.programs.at(-1) === 1) pagedTable = Math.max(pagedTable, n);
+      return n;
+    },
+    temen_coop_paged: () => {
+      const on = ex.temen_coop_paged();
+      if (pagedSeen.programs.at(-1) === 1 && on) pagedChecked++;
+      return on;
+    } }, memory, {});
+}
+const pagedGot = { status: ex.temen_status(), out: outWord() };
+if (pagedWant.status !== 0 || pagedWant.out !== 22n) fail(`paged child oracle sanity: ${show(pagedWant)}`);
+if (pagedOpened !== 0) {
+  fail(`the paged child's open refused: ${pagedOpened}`);
+} else {
+  if (!pagedSeen.programs.includes(1) || pagedChecked < 1) {
+    fail(`the child's program must tier up page-checked: programs ${show(pagedSeen.programs)}, checked ${pagedChecked}`);
+  }
+  if (!(pagedTable > 61440)) fail(`the child's page-state table must outgrow the old header: ${pagedTable} bytes`);
+  const childMemsSeen = new Set(pagedSeen.programs.flatMap((m, i) => (m === 1 ? [pagedSeen.mems[i]] : [])));
+  if (!own({ mems: childMemsSeen })) fail(`the paged child must run in one memory of its own: ${show([...childMemsSeen])}`);
+  if (pagedReturned !== 0 || pagedGot.status !== pagedWant.status || pagedGot.out !== pagedWant.out) {
+    fail(`a page-checked child past 240 MiB: ${show(pagedGot)} (returned ${pagedReturned}), oracle ${show(pagedWant)}`);
+  }
+}
 ex.temen_coop_reset_hotness();
 
 if (process.exitCode) process.exit(process.exitCode);
 console.log(`${growOk()}; a child image tiers up as program `
   + `${show([...new Set(childPrograms)])} over memories ${show([...new Set(childMems)])}; `
   + `a root grown past 256 MiB in a memory of its own (the engine's grew ${big.grew} bytes), a map past a `
-  + `64 MiB grant refused (${capped.got?.out}), a 4 GiB window refused, and a collector's spilled roots `
-  + `found (${gc.got?.out})`);
+  + `64 MiB grant refused (${capped.got?.out}), a 4 GiB window refused, a collector's spilled roots `
+  + `found (${gc.got?.out}), and a page-checked child grown past 240 MiB (a ${pagedTable}-byte page-state table)`);
