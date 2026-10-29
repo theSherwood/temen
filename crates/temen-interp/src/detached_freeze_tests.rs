@@ -202,6 +202,7 @@ fn a_live_detached_child_is_captured_and_its_thaw_completes_the_join() {
     begin_thaw(&mut twin, ARENA, 0);
     let (mut thost, targs) = powerbox(&child);
     thost.set_thawed_detached(captured.into_iter().map(thawed).collect());
+    thost.set_child_generations(fhost.child_generations().to_vec());
     let (tr, tsnap) = run(&parent, &mut thost, &targs, &twin);
     assert_eq!(
         tr,
@@ -260,6 +261,7 @@ block 0 (v0: i64) {
     begin_thaw(&mut twin, ARENA, 0);
     let (mut thost, targs) = powerbox(&child);
     thost.set_frozen_detached(frozen);
+    thost.set_child_generations(fhost.child_generations().to_vec());
     let (tr, _) = run(&parent, &mut thost, &targs, &twin);
     assert_eq!(tr, Ok(vec![Value::I64(4950)]), "the join took the result");
 }
@@ -309,7 +311,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
     );
     assert_eq!(
         spawn(true),
-        Ok(vec![Value::I64(0)]),
+        Ok(vec![Value::I64(temen_ir::handles::pack(0, 1) as i64)]),
         "admitted at slot 0 with it"
     );
 }
@@ -410,6 +412,7 @@ fn a_child_the_thaw_does_not_relaunch_ends_with_thread_fault() {
     begin_thaw(&mut twin, ARENA, 0);
     let (mut thost, targs) = powerbox(&summing(7));
     thost.set_thawed_detached(captured.into_iter().map(thawed).collect());
+    thost.set_child_generations(fhost.child_generations().to_vec());
     let (tr, _) = run(&parent, &mut thost, &targs, &twin);
     assert_eq!(
         tr,

@@ -2602,7 +2602,7 @@ impl ThawResidue {
             live_detached: std::mem::take(&mut host.thawed_detached),
             twins: std::mem::take(&mut host.thawed_twins),
             exited_twins: std::mem::take(&mut host.frozen_twins),
-            children: std::mem::take(&mut host.thawed_children),
+            children: std::mem::take(&mut host.frozen_children),
         }
     }
 
@@ -2712,13 +2712,11 @@ fn seed_domain(
         children: thaw_children,
     } = residue;
     // #2043 — the domain's child table, as the freeze left it: every slot's counter, before the
-    // children below are re-filed at their slots. Its powerbox is told of it, for the freeze that
-    // captures it.
+    // children below are re-filed at their slots.
     *root.children.lock_unpoisoned() = Children {
         table: temen_ir::handles::Table::from_generations(&thaw_children),
         ..Children::default()
     };
-    host_shared.lock_unpoisoned().set_children(&root.children);
     // Only a durable window has control words at the guard base; any other run keeps its own data
     // there, and starts in no freeze phase whatever it holds (#2101).
     root.dstate = match root.mem.as_ref() {
@@ -7949,8 +7947,6 @@ impl Scheduler {
         self.wire_signal_doors(&twin_host);
         let parent_key = domain_key_of(&v); // the forking domain — this twin's parent (per-parent reap)
         let mut twin = v.fork_twin(twin_id, twin_mem, twin_host);
-        // #2043 — a twin is a domain of its own, whose children are its own; its powerbox is new.
-        twin.host.lock_unpoisoned().set_children(&twin.children);
         twin.live = live;
         twin.pending = Some(Pending::CapResult(reply_twin));
         // #1688 — the run's freeze reaches a twin through its doorbell, as it reaches a child. The
@@ -9846,6 +9842,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         // later child, so the root's residue can't ride the window).
                         v.host.lock_unpoisoned().frozen_root_sp = Some(self_sp);
                     }
+                    // #2043 — its domain's child counters, as they stand now: the last vCPU of the
+                    // domain to unwind writes the cut's, since nothing changes the table after it.
+                    let generations = v.children.lock_unpoisoned().table.generations();
+                    v.host.lock_unpoisoned().frozen_children = generations;
                     let r = v.freeze_drive().and(result);
                     // Hand this vCPU's flattened fibers back to the embedder via the shared host. **Extend**
                     // (not assign): every vCPU contributes its own, and the snapshot's canonical sort-by-slot
@@ -12809,8 +12809,8 @@ struct VCpu {
     /// This vCPU's fuel (metering, §5): drawn from its domain's budget node (#1944 slice 3).
     fuel: Fuel,
     /// #2043 D1 — its domain's children, shared by every vCPU of the domain: a domain root makes the
-    /// table, and a thread it spawns (or a thaw re-creates) shares it. The domain's powerbox holds it
-    /// too ([`Host::set_children`]), for the freeze that captures it once every vCPU has stopped.
+    /// table, and a thread it spawns (or a thaw re-creates) shares it. A freeze records its counters
+    /// in the domain's powerbox ([`Host::child_generations`]).
     children: Arc<Mutex<Children>>,
     /// CONSOLIDATION.md §2.2: this vCPU is a **demand process child** (`Instantiator` op 16)
     /// whose recoverable page faults become calls on its parent's pager offer instead of
@@ -15856,14 +15856,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                     child.fault_pager = true;
                                                 }
                                                 child.lane_chain = chain_child; // D66: own domain (its lane), then ours
-                                                                                // #2043 — its own domain's children, for the
-                                                                                // freeze that captures them. Its powerbox is new,
-                                                                                // so locking it here, in the spawn, contends with
-                                                                                // no one.
-                                                child
-                                                    .host
-                                                    .lock_unpoisoned()
-                                                    .set_children(&child.children);
                                                 Box::new(child)
                                             });
                                             match made {
@@ -25307,12 +25299,11 @@ pub struct Host {
     /// recorded here instead. `None` ⇒ a single-vCPU thaw, which reads the extent from the window's
     /// active-SP word as before. Set by the freeze driver; consumed by `drive` on thaw.
     frozen_root_sp: Option<u64>,
-    /// #2043 — this domain's children ([`Children`]), the table its vCPUs share, registered by its
-    /// root's seeding. A freeze reads it here once every vCPU has stopped.
-    children: Option<Arc<Mutex<Children>>>,
-    /// #2043 — the child table's counters a restore seeded, which the thaw's seeding gives the
-    /// domain's table before it re-files the children the artifact holds.
-    thawed_children: Vec<u32>,
+    /// #2043 — this domain's child table's counters ([`Children`]). Each vCPU of the domain writes them
+    /// as it unwinds for a freeze, so the last to unwind leaves the cut's; a restore seeds them, and
+    /// the thaw's seeding gives them to the domain's table before re-filing the children the artifact
+    /// holds. The table itself dies with the domain's vCPUs, its children's records with it.
+    frozen_children: Vec<u32>,
     /// §7 the **capability-name directory** (Followup F7): name → handle for the powerbox grants, so a
     /// guest can resolve a capability by name at runtime (`cap.self` op 2) — dlopen-style discovery, the
     /// dynamic counterpart to load-time name binding. Populated by the powerbox layer at grant time
@@ -25965,8 +25956,7 @@ impl Host {
             thaw_pipes: BTreeMap::new(),
             thaw_names: Vec::new(),
             frozen_root_sp: None,
-            children: None,
-            thawed_children: Vec::new(),
+            frozen_children: Vec::new(),
             cap_names: Vec::new(),
             notes: Arc::default(),
             named_cap_registrar: None,
@@ -27253,24 +27243,17 @@ impl Host {
         self.frozen_root_sp = Some(sp);
     }
 
-    /// #2043 — register the child table this domain's vCPUs share ([`Children`]).
-    pub(crate) fn set_children(&mut self, children: &Arc<Mutex<Children>>) {
-        self.children = Some(Arc::clone(children));
-    }
-
-    /// #2043 — every slot's counter in this domain's child table, in slot order up to the last slot
-    /// that ever issued: what a freeze carries, so after a thaw a spent child handle stays spent and
-    /// the next spawn gets the handle the uninterrupted run would have (#2619). Empty for a domain
-    /// that never spawned.
-    pub fn child_generations(&self) -> Vec<u32> {
-        self.children
-            .as_ref()
-            .map_or_else(Vec::new, |c| c.lock_unpoisoned().table.generations())
+    /// #2043 — every slot's counter in this domain's child table as the last freeze left it, in slot
+    /// order up to the last slot that ever issued: what an artifact carries, so after a thaw a spent
+    /// child handle stays spent and the next spawn gets the handle the uninterrupted run would have
+    /// (#2619). Empty for a domain that never spawned.
+    pub fn child_generations(&self) -> &[u32] {
+        &self.frozen_children
     }
 
     /// #2043 — seed the child table's counters a **thaw** must restore ([`Host::child_generations`]).
-    pub fn set_thawed_child_generations(&mut self, generations: Vec<u32>) {
-        self.thawed_children = generations;
+    pub fn set_child_generations(&mut self, generations: Vec<u32>) {
+        self.frozen_children = generations;
     }
 
     /// Take the root extent [`Host::set_frozen_root_sp`] seeded (cleared here) — for an engine that
