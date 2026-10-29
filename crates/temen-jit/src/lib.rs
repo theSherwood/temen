@@ -8695,9 +8695,8 @@ fn build_fiber_call_trampoline(clif: &mut Function) {
 /// `v128` (SIMD) crossing value; a scalar uses the low bytes. setjmp is rare, so the slack is free.
 const SETJMP_SAVE_STRIDE: usize = 16;
 
-/// #2537 — save the guest values **live across a `setjmp`** to a reuse-immune explicit stackslot,
-/// returning the slot and the `(value-index, type)` list to reload after the call (or `None` when
-/// nothing crosses). The caller stores before the libc `_setjmp` call and reloads after it.
+/// #2537 — save the values **live across a `setjmp`** to a reuse-immune explicit stackslot, for the
+/// caller to reload after the libc `_setjmp` call ([`Laundered::reload`]).
 ///
 /// Why this is needed. `_setjmp` lowers to an ordinary CLIF `call`, and neither Cranelift nor
 /// regalloc2 has a returns-twice concept. A value live across the call gets a spill slot; the
@@ -8709,19 +8708,22 @@ const SETJMP_SAVE_STRIDE: usize = 16;
 /// An **explicit** stackslot is never reused by regalloc and no guest op writes it, so it holds the
 /// pre-`setjmp` value on both returns.
 ///
-/// The set saved is exactly the IR values referenced at or after the `setjmp` (the rest of this
-/// block's insts and its terminator's edge args) that were defined before it. The terminator's edge
-/// args are the load-bearing case: a value forwarded to a successor block crosses the `setjmp`, and
-/// the IR still carries it as an edge arg even where the CLIF lowering drops it (#2448). `ubs` is
-/// deliberately left untouched — a laundered value keeps its IR identity and proven bound, so an
-/// elided access reads the reuse-immune copy and cannot be driven out of window by a clobbered
-/// reload.
+/// The set saved is the IR values referenced at or after the `setjmp` (the rest of this block's
+/// insts and its terminator's edge args) that were defined before it, and the lowering's context
+/// variables ([`context_vars`]). The terminator's edge args are the load-bearing IR case: a value
+/// forwarded to a successor block crosses the `setjmp`, and the IR still carries it as an edge arg
+/// even where the CLIF lowering drops it (#2448). The context variables are CLIF values no IR value
+/// names, and the code after the `setjmp` reads them: a clobbered function-table base sent a
+/// `call.dyn` through a forged entry (#2652). `ubs` is deliberately left untouched — a laundered
+/// value keeps its IR identity and proven bound, so an elided access reads the reuse-immune copy
+/// and cannot be driven out of window by a clobbered reload.
 fn launder_across_setjmp(
     b: &mut FunctionBuilder,
+    lower: &Lower,
     blk: &Block,
     inst_idx: usize,
     vals: &[Value],
-) -> Option<(cranelift_codegen::ir::StackSlot, Vec<(usize, Type)>)> {
+) -> Laundered {
     let defined = vals.len();
     let mut live = std::collections::BTreeSet::new();
     let mut note = |v: &u32| {
@@ -8734,23 +8736,72 @@ fn launder_across_setjmp(
         inst.for_each_operand(&mut note);
     }
     blk.term.for_each_operand(&mut note);
-    if live.is_empty() {
-        return None;
-    }
-    let saved: Vec<(usize, Type)> = live
+    let ctx: Vec<(Variable, Value)> = context_vars(lower)
         .into_iter()
-        .map(|i| (i, b.func.dfg.value_type(vals[i])))
+        .map(|var| (var, b.use_var(var)))
         .collect();
-    let save = b.create_sized_stack_slot(StackSlotData::new(
+    let saved: Vec<Value> = live
+        .iter()
+        .map(|&i| vals[i])
+        .chain(ctx.iter().map(|&(_, v)| v))
+        .collect();
+    let slot = b.create_sized_stack_slot(StackSlotData::new(
         StackSlotKind::ExplicitSlot,
         (saved.len() * SETJMP_SAVE_STRIDE) as u32,
         4, // align 2^4 = 16, so a v128 slot is aligned
     ));
-    for (k, &(i, _)) in saved.iter().enumerate() {
+    for (k, &v) in saved.iter().enumerate() {
         b.ins()
-            .stack_store(vals[i], save, (k * SETJMP_SAVE_STRIDE) as i32);
+            .stack_store(v, slot, (k * SETJMP_SAVE_STRIDE) as i32);
     }
-    Some((save, saved))
+    let ty = |b: &FunctionBuilder, v: Value| b.func.dfg.value_type(v);
+    Laundered {
+        slot,
+        vals: live.into_iter().map(|i| (i, ty(b, vals[i]))).collect(),
+        ctx: ctx.into_iter().map(|(var, v)| (var, ty(b, v))).collect(),
+    }
+}
+
+/// What [`launder_across_setjmp`] saved before a `_setjmp`, in its slot's entries in order: the IR
+/// values, then the context variables.
+struct Laundered {
+    slot: cranelift_codegen::ir::StackSlot,
+    /// Each IR value saved: its index in the block's value map, and its type.
+    vals: Vec<(usize, Type)>,
+    /// Each context variable saved, and its type.
+    ctx: Vec<(Variable, Type)>,
+}
+
+impl Laundered {
+    /// After the `_setjmp`, reload everything saved: the value map's entries become the reloaded
+    /// copies, so every later use in this block — and every successor's forwarded use, which reads
+    /// this block's final value map (#2448) — reads the reuse-immune slot, and each context
+    /// variable is redefined as its own copy.
+    fn reload(&self, b: &mut FunctionBuilder, vals: &mut [Value]) {
+        let at = |k: usize| (k * SETJMP_SAVE_STRIDE) as i32;
+        for (k, &(i, ty)) in self.vals.iter().enumerate() {
+            vals[i] = b.ins().stack_load(ty, self.slot, at(k));
+        }
+        for (k, &(var, ty)) in self.ctx.iter().enumerate() {
+            let v = b.ins().stack_load(ty, self.slot, at(self.vals.len() + k));
+            b.def_var(var, v);
+        }
+    }
+}
+
+/// The lowering's context variables: the CLIF values a function's code reads that no IR value
+/// names — the window base, the function table's base, the vmctx, the stack limit, the return
+/// area when it returns through one, and a demand-paged child's access table.
+fn context_vars(lower: &Lower) -> Vec<Variable> {
+    let mut vars = vec![
+        lower.mem_var,
+        lower.fn_table_var,
+        lower.vmctx_var,
+        lower.limit_var,
+    ];
+    vars.extend(lower.sret_var);
+    vars.extend(lower.page.as_ref().map(|&(_, _, table)| table));
+    vars
 }
 
 /// Lower one IR block's body + terminator into its CLIF block.
@@ -9117,12 +9168,12 @@ fn lower_block(
         // `i32` 0 (direct) / long-jump value (re-entry). The slot alloc is infallible, so no
         // trap-propagate.
         if let Inst::SetJmp { buf } = inst {
-            let bufv = get(&vals, *buf)?; // i64 guest jmp_buf window address (the table key)
-                                          // #2537: save every guest value live across this setjmp to a
-                                          // reuse-immune explicit stackslot *before* the call; reloaded
-                                          // after it, so both returns (direct and via longjmp) read the
-                                          // saved copy, not a spill slot the longjmp path may clobber.
-            let laundered = launder_across_setjmp(b, blk, inst_idx, &vals);
+            // The guest jmp_buf's window address: the key of its host table entry.
+            let bufv = get(&vals, *buf)?;
+            // #2537, #2652: save every value live across this setjmp to a reuse-immune explicit
+            // stackslot *before* the call, and reload it after, so both returns (direct and via
+            // longjmp) read the saved copy, not a spill slot the longjmp path may clobber.
+            let laundered = launder_across_setjmp(b, lower, blk, inst_idx, &vals);
             // slot = rt_setjmp_slot(rt_addr, buf) -> *mut jmp_buf
             let rt_addr = vmctx_load(b, lower, vmctx::SETJMP);
             let c1 = call_host(lower.callees, b, HostFn::SetjmpSlot, &[rt_addr, bufv])?;
@@ -9132,16 +9183,7 @@ fn lower_block(
             let r = b.inst_results(c2)[0];
             // No check point's base crosses the call (#2652): a later access tests its own.
             checked.forget();
-            // #2537: reload the saved values and rewrite the value map to the reloaded copies, so every
-            // later use in this block — and every successor's forwarded use (which reads this block's
-            // final value map, #2448) — sources the value from the reuse-immune slot.
-            if let Some((save, saved)) = laundered {
-                for (k, &(i, ty)) in saved.iter().enumerate() {
-                    vals[i] = b
-                        .ins()
-                        .stack_load(ty, save, (k * SETJMP_SAVE_STRIDE) as i32);
-                }
-            }
+            laundered.reload(b, &mut vals);
             vals.push(r);
             continue;
         }
