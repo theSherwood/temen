@@ -3,9 +3,9 @@
 // The native `coop_tierup_driver.rs` differential plays the browser's role with wasmi; this is the
 // other half: the *actual* `driveCoopTierupRun` in `web/coop-driver.js`, over the *actual* wasm
 // cdylib, on the path the playground takes (`runJitModule` → whole-program open declines → coop).
-// On the threads build a pump root's window is a memory of its own (#1414 5d), which grows in place;
-// the plain build's grows in the engine's memory, relocating, and the driver's `"win"` fan-out after a
-// bounce follows it there.
+// On the threads build a pump root's window is a memory of its own (#1414 5d), which grows in place.
+// On the plain build it grows in the engine's memory, by reallocating, and the driver's `"win"`
+// fan-out after a bounce must follow it there: this file runs over both builds.
 //
 // The guest (`tests/fixtures/coop_grow_past_window.temen`, from `genfixture … grow_past_window`) is
 // the reduced synthesized-allocator shape: a hot leaf bounces to a helper that `vm_map`s a page past
@@ -30,7 +30,7 @@
 // can hold, whose open fails cleanly; and a collecting guest whose emitted frames spill its roots,
 // which the bounce copies to where `gc.roots` scans them.
 //
-// Usage:  node browser-coop-grow-test.mjs [module.wasm]   (build the threads cdylib first)
+// Usage:  node browser-coop-grow-test.mjs [module.wasm]   (build the threads or the plain cdylib first)
 
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -51,11 +51,16 @@ for (const p of [wasmPath, fixture]) {
 }
 
 // The **threads** cdylib (the build the playground ships and the one whose emitted modules import a
-// shared memory): it imports `env.memory`, so supply one with a maximum — the emitted wasm's own
-// memory import is shared and needs a bounded one.
+// shared memory) imports `env.memory`, so supply one with a maximum — the emitted wasm's own memory
+// import is shared and needs a bounded one. The **plain** one owns its memory and ignores the import:
+// its emitted modules import that memory unshared, and it has no memories of its own for windows, so
+// it stops after section 4.
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
-const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
-const ex = await instantiateEngine(mod, memory);
+const imported = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
+const ex = await instantiateEngine(mod, imported);
+const plain = ex.memory !== undefined;
+const memory = ex.memory ?? imported;
+const shared = plain ? 0 : 1;
 const u8 = () => new Uint8Array(memory.buffer);
 const dec = new TextDecoder();
 const readStdout = () => dec.decode(u8().slice(
@@ -112,7 +117,7 @@ const exWatched = { ...exCounted,
 // precisely the pre-fix symptom, so name it rather than letting the stack trace speak.
 let status;
 try {
-  status = await runJitModule(exWatched, memory, guest, new Uint8Array(0), 'coop-grow');
+  status = await runJitModule(exWatched, memory, guest, new Uint8Array(0), 'coop-grow', shared);
 } catch (e) {
   console.error(`FAIL: the coop run did not complete: ${e.message}`);
   console.error('       (a trap here is the #1312 symptom: the allocator\'s vm_map past the run '
@@ -198,7 +203,7 @@ if (leafWant.status !== 0 || leafWant.out.length !== 8) {
   throw new Error(`root-leaf oracle sanity: status ${leafWant.status}, ${leafWant.out.length} bytes`);
 }
 const COOP_LEAF_ROOT = 1;
-const opened = ex.temen_coop_open(gp, leafGuest.length, 0, 0, 1, 0, 0, COOP_LEAF_ROOT);
+const opened = ex.temen_coop_open(gp, leafGuest.length, 0, 0, shared, 0, 0, COOP_LEAF_ROOT);
 ex.temen_dealloc(gp, leafGuest.length);
 if (opened !== 0) {
   fail(`the root-leaf open refused (status ${ex.temen_status()})`);
@@ -229,6 +234,15 @@ if (opened !== 0) {
   if (!(leafWin > leafOpen.win)) {
     fail(`root leaf: the window must grow past ${leafOpen.win} bytes, saw ${leafWin}`);
   }
+}
+
+const growOk = () => `ok — coop path, ${counts.tierups} tier-up(s), ${counts.bounces} bounce(s), `
+  + `window ${winAtOpen} → ${winAtLastBounce} bytes, stdout matches the bytecode oracle; `
+  + 'as a root leaf, the same over a growing window';
+if (plain) {
+  if (process.exitCode) process.exit(process.exitCode);
+  console.log(`${growOk()} (the plain build: the window grew in the engine's memory)`);
+  process.exit(0);
 }
 
 // ---- 5. #2248: a granted child's program tiers up -------------------------------------------------
@@ -578,9 +592,7 @@ if (gc.opened !== 0) {
 ex.temen_coop_reset_hotness();
 
 if (process.exitCode) process.exit(process.exitCode);
-console.log(`ok — coop path, ${counts.tierups} tier-up(s), ${counts.bounces} bounce(s), `
-  + `window ${winAtOpen} → ${winAtLastBounce} bytes, stdout matches the bytecode oracle; `
-  + 'as a root leaf, the same over a growing window; a child image tiers up as program '
+console.log(`${growOk()}; a child image tiers up as program `
   + `${show([...new Set(childPrograms)])} over memories ${show([...new Set(childMems)])}; `
   + `a root grown past 256 MiB in a memory of its own (the engine's grew ${big.grew} bytes), a map past a `
   + `64 MiB grant refused (${capped.got?.out}), a 4 GiB window refused, and a collector's spilled roots `
