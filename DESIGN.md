@@ -3937,7 +3937,9 @@ of ops 0/5/8/11/13, with the copy-in/`copy_back` below) — is a task — a plat
 carrying the child's own window, trap cell and fiber execution context — on a pool of workers spawned
 on demand, one of them kept free while the pool may grow (#1991: a worker that takes a task and leaves
 none free adds one, since only a free worker takes a task that becomes runnable, fires a parked task's
-deadline and sweeps); any worker may resume it under the same single-owner claim guest fibers use (the D57
+deadline and sweeps, and none sleeps past the cadence; a task that wakes one sibling leaves it to its
+own worker, which runs it next, and wakes a free worker only for a second); any worker may resume it
+under the same single-owner claim guest fibers use (the D57
 migration unsafe, no new one), each resume its own guard bracket over the *task's* fault range (R1),
 the per-thread state seeded and reset at both edges of every residency (R2: `CURRENT_RT`, `vcpu.tls`,
 the current-task word — all `#[inline(never)]` readers). A futex `wait` inside the child takes the

@@ -699,9 +699,22 @@ impl ChildExec {
                     d.task_unparked();
                 }
             }
-            // #1991 — one free worker for each task queued: waking them all for each made every
-            // wake cost a context switch per free worker, and a pool kept wide pays it often.
             g.runnable.push_back(id);
+            self.offer(g);
+        }
+    }
+
+    /// #1991 — wakes a free worker for a task just queued, unless the waker's own worker will take
+    /// it. A task that wakes one sibling leaves it to its own worker, which runs it next, once the
+    /// task parks or ends: a request and its reply stay on one worker, and no thread is woken.
+    /// Waking another worker cost each hop of a keystroke through unir's store vat a thread's wake
+    /// (98 µs a keystroke, where one worker took 53). A second task queued meanwhile, or a task
+    /// queued from outside any task (the root's thread, a host's, a free worker's sweep), wakes one
+    /// free worker, which runs it beside the waker. A task left queued behind a waker that runs on
+    /// is taken at a free worker's next look, within a [`RECHECK`]. Waking every free worker at
+    /// each wake, as before, cost one switch per free worker.
+    fn offer(&self, g: &ExecState) {
+        if g.runnable.len() > 1 || !fiber_rt::in_task() {
             self.cv.notify_one();
         }
     }
@@ -750,21 +763,24 @@ impl ChildExec {
                     // the cadence: it arrives through `Domain::wake_child_tasks`. Nor does a parked
                     // task's own deadline (#2012): the worker wakes for the earliest one, if it
                     // comes before the next sweep, and re-offers just the tasks it has passed.
+                    // #1991 — and no free worker sleeps past the cadence, so a task left queued
+                    // behind a waker that runs on ([`Self::offer`]) is taken within it: one that
+                    // slept while nothing was parked would otherwise sleep until woken.
                     let sweeping = g.tasks.values().any(|e| e.parked);
-                    g = if sweeping {
-                        let next = g
-                            .tasks
+                    let now = Instant::now();
+                    let next = if sweeping {
+                        g.tasks
                             .values()
                             .filter_map(|e| e.deadline.filter(|_| e.parked))
-                            .fold(g.swept + RECHECK, Instant::min);
-                        let wait = next.saturating_duration_since(Instant::now());
-                        self.cv
-                            .wait_timeout(g, wait)
-                            .unwrap_or_else(|e| e.into_inner())
-                            .0
+                            .fold(g.swept + RECHECK, Instant::min)
                     } else {
-                        self.cv.wait(g).unwrap_or_else(|e| e.into_inner())
+                        now + RECHECK
                     };
+                    g = self
+                        .cv
+                        .wait_timeout(g, next.saturating_duration_since(now))
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
                     if sweeping {
                         let now = Instant::now();
                         if now >= g.swept + RECHECK {
@@ -796,10 +812,11 @@ impl ChildExec {
                 self.run_once(&mut task, worker)
             };
             // The lane goes back before anything else: a peer 1:1 vCPU or sibling task may be
-            // queued behind it. `lane_give_back` touches only the domain's lane lock, so it is safe
-            // to call before taking this executor's.
+            // queued behind it. `lane_leave` touches only the domain's lane lock, so it is safe to
+            // call before taking this executor's. It wakes no worker of this pool: this worker's
+            // own next `pick` re-offers the queue.
             if let Some(d) = self.domain() {
-                d.lane_give_back(&task.chain);
+                d.lane_leave(&task.chain);
             }
             // #1469 — a root that returns while its vCPUs run publishes its outcome now and
             // retires; a retiring task finishes once they have all ended.

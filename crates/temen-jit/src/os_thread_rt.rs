@@ -1120,16 +1120,28 @@ impl Domain {
         if chain.is_empty() {
             return;
         }
+        self.lane_leave(chain);
+        let exec = lock(&self.hub().child_exec).clone();
+        if let Some(e) = exec {
+            e.notify_workers();
+        }
+    }
+
+    /// [`Self::lane_give_back`] without the executor's wake: every lane in `chain` given back, and
+    /// the 1:1 vCPUs blocked in [`Domain::lane_acquire`] woken. An executor worker gives its task's
+    /// lanes back with this: its own next `pick` re-offers the queue, and a lane it gave back admits
+    /// at most one more task. #1991 — waking the pool after every residency woke a free worker
+    /// to find nothing, and to take from this one the task it was about to run.
+    pub(crate) fn lane_leave(&self, chain: &[(usize, i64)]) {
+        if chain.is_empty() {
+            return;
+        }
         let hub = self.hub();
         {
             let mut g = lock(&hub.lanes);
             temen_ir::lanes::leave(&mut g, chain);
         }
         hub.lane_cv.notify_all();
-        let exec = lock(&hub.child_exec).clone();
-        if let Some(e) = exec {
-            e.notify_workers();
-        }
     }
 
     /// D66 — block until every lane in `chain` has room, then take them. `true` = taken and the
