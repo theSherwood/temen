@@ -10465,7 +10465,8 @@ impl CoopTierupRun {
             self.pagestate_cover = cover;
             self.pagestate_version = ver;
             self.pagestate_env = env;
-            self.pagestate_stamp = PAGESTATE_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.pagestate_stamp =
+                PAGESTATE_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.mapped = self.pagestate_cover;
     }

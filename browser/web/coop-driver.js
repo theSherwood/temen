@@ -467,14 +467,19 @@ export function windowTier(ex, memory, windowMemory, x) {
   const viewsFor = (argsPtr, scratch) => {
     if (views?.argsPtr !== argsPtr || views.scratch !== scratch) {
       views = {
-        argsPtr, scratch, win: span(windowMemory, argsPtr, scratchBytes), eng: span(memory, scratch, scratchBytes),
+        argsPtr,
+        scratch,
+        win: span(windowMemory, argsPtr, scratchBytes),
+        eng: span(memory, scratch, scratchBytes),
       };
     }
     return views;
   };
   let spills = null;
   const spillsFor = (ptr) => {
-    if (spills?.ptr !== ptr) spills = { ptr, win: span(windowMemory, spillAt, spillBytes), eng: span(memory, ptr, spillBytes) };
+    if (spills?.ptr !== ptr) {
+      spills = { ptr, win: span(windowMemory, spillAt, spillBytes), eng: span(memory, ptr, spillBytes) };
+    }
     return spills;
   };
   let copied; // the stamp of the table the context holds
