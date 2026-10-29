@@ -6857,6 +6857,359 @@ fn vector_shift_per_lane_amount() {
     check_powerbox_vs_native("vshift_per_lane", src, b"");
 }
 
+/// A 128-bit vector shape for the handwritten-IR vector tests: `n` lanes of `w` bits.
+#[derive(Clone, Copy)]
+struct Lanes {
+    n: usize,
+    w: u32,
+}
+
+impl Lanes {
+    const ALL: [Lanes; 4] = [
+        Lanes { n: 16, w: 8 },
+        Lanes { n: 8, w: 16 },
+        Lanes { n: 4, w: 32 },
+        Lanes { n: 2, w: 64 },
+    ];
+
+    fn ty(self) -> String {
+        format!("<{} x i{}>", self.n, self.w)
+    }
+
+    /// The intrinsic name suffix, `v4i32`.
+    fn suffix(self) -> String {
+        format!("v{}i{}", self.n, self.w)
+    }
+
+    fn mask(self) -> u64 {
+        if self.w == 64 {
+            u64::MAX
+        } else {
+            (1u64 << self.w) - 1
+        }
+    }
+
+    /// Lane value `v` read as signed.
+    fn signed(self, v: u64) -> i128 {
+        let v = v & self.mask();
+        if v >> (self.w - 1) & 1 == 1 {
+            v as i128 - (1i128 << self.w)
+        } else {
+            v as i128
+        }
+    }
+
+    /// `seed`'s lanes: the width's edges (0, 1, the signed and unsigned extremes) and mixed bits.
+    fn values(self, seed: u64) -> Vec<u64> {
+        let m = self.mask();
+        let edges = [
+            0,
+            1,
+            m,
+            m - 1,
+            m >> 1,
+            (m >> 1) + 1,
+            0x5555_5555_5555_5555 & m,
+            3,
+        ];
+        (0..self.n)
+            .map(|i| {
+                let mix = (seed.wrapping_add(i as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                match (i + seed as usize) % 3 {
+                    0 => edges[(i + seed as usize) % edges.len()],
+                    _ => (mix ^ (mix >> 29)) & m,
+                }
+            })
+            .collect()
+    }
+
+    /// `vals` as an LLVM vector constant.
+    fn constant(self, vals: &[u64]) -> String {
+        let lanes: Vec<String> = vals.iter().map(|v| format!("i{} {}", self.w, v)).collect();
+        format!("<{}>", lanes.join(", "))
+    }
+}
+
+/// IR whose `@run` applies `call` (an instruction defining `%r`, over `%a` and `%b`, loaded from
+/// globals so nothing folds) to `a` and `b`, and returns its lanes folded into one `i64`.
+fn vector_lanes_ir(l: Lanes, decl: &str, call: &str, a: &[u64], b: &[u64]) -> String {
+    let t = l.ty();
+    let mut ir = format!(
+        "@A = global {t} {}\n@B = global {t} {}\n{decl}\n\
+         define i64 @run() {{\nentry:\n  %a = load {t}, ptr @A\n  %b = load {t}, ptr @B\n  {call}\n  %h0 = add i64 0, 0\n",
+        l.constant(a),
+        l.constant(b)
+    );
+    for i in 0..l.n {
+        // A 64-bit lane is its own `i64`; a narrower one is zero-extended.
+        let z = match l.w {
+            64 => format!("  %z{i} = add i64 %e{i}, 0\n"),
+            w => format!("  %z{i} = zext i{w} %e{i} to i64\n"),
+        };
+        ir += &format!(
+            "  %e{i} = extractelement {t} %r, i32 {i}\n{z}  %m{i} = mul i64 %h{i}, 1000003\n  %h{n} = add i64 %m{i}, %z{i}\n",
+            n = i + 1
+        );
+    }
+    ir += &format!("  ret i64 %h{}\n}}\n", l.n);
+    ir
+}
+
+/// `lanes` folded as [`vector_lanes_ir`] folds them.
+fn fold_lanes(lanes: &[u64]) -> i64 {
+    lanes
+        .iter()
+        .fold(0u64, |h, &v| h.wrapping_mul(1000003).wrapping_add(v)) as i64
+}
+
+#[test]
+fn vector_saturating_add_and_sub() {
+    // `llvm.{u,s}{add,sub}.sat` on every 128-bit integer shape (#2682): rustc's SLP vectorizer
+    // turns `saturating_sub` on `usize` pairs into `usub.sat.v2i64`. Byte and half-word lanes take
+    // the native `VSatBin`; wider unsigned lanes clamp through min/max, wider signed ones per lane.
+    // Each lane must be the width's saturated result, on the interpreter and the JIT.
+    for l in Lanes::ALL {
+        for (op, seed) in [("uadd", 1u64), ("usub", 2), ("sadd", 3), ("ssub", 4)] {
+            let (a, b) = (l.values(seed), l.values(seed * 7 + 5));
+            let t = l.ty();
+            let f = format!("llvm.{op}.sat.{}", l.suffix());
+            let ir = vector_lanes_ir(
+                l,
+                &format!("declare {t} @{f}({t}, {t})"),
+                &format!("%r = call {t} @{f}({t} %a, {t} %b)"),
+                &a,
+                &b,
+            );
+            let (smin, smax) = (-(1i128 << (l.w - 1)), (1i128 << (l.w - 1)) - 1);
+            let want: Vec<u64> = (a.iter().zip(&b))
+                .map(|(&x, &y)| {
+                    let (ux, uy) = (x as i128, y as i128);
+                    let (sx, sy) = (l.signed(x), l.signed(y));
+                    let r = match op {
+                        "uadd" => (ux + uy).min(l.mask() as i128),
+                        "usub" => (ux - uy).max(0),
+                        "sadd" => (sx + sy).clamp(smin, smax),
+                        _ => (sx - sy).clamp(smin, smax),
+                    };
+                    r as u64 & l.mask()
+                })
+                .collect();
+            assert_eq!(
+                run_ll_i64(&format!("{op}.sat {t}"), &ir),
+                fold_lanes(&want),
+                "{op}.sat on {t}: a {a:?}, b {b:?}, want {want:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn vector_funnel_shift_by_a_splat() {
+    // A funnel shift by a **constant splat** (#2682): a rotate (`a == b`) and a general shift,
+    // `fshl` and `fshr`, on every 128-bit integer shape, at amounts including a whole width and
+    // more than one. A uniform amount lowers to two native `VShift`s and an `Or`, not one scalar
+    // rotate a lane: a hash over `u32x4` lanes rotates four times in every quarter round.
+    for l in Lanes::ALL {
+        let w = u64::from(l.w);
+        for amt in [0, 1, 7, w / 2, w - 1, w, w + 3] {
+            for (f, rotate) in [
+                ("fshl", true),
+                ("fshl", false),
+                ("fshr", true),
+                ("fshr", false),
+            ] {
+                let (a, b) = (l.values(amt + 11), l.values(amt * 3 + 2));
+                let t = l.ty();
+                let name = format!("llvm.{f}.{}", l.suffix());
+                let second = if rotate { "%a" } else { "%b" };
+                let splat = l.constant(&vec![amt & l.mask(); l.n]);
+                let ir = vector_lanes_ir(
+                    l,
+                    &format!("declare {t} @{name}({t}, {t}, {t})"),
+                    &format!("%r = call {t} @{name}({t} %a, {t} {second}, {t} {splat})"),
+                    &a,
+                    &b,
+                );
+                let s = amt % w;
+                let want: Vec<u64> = (a.iter().zip(&b))
+                    .map(|(&x, &y)| {
+                        let y = if rotate { x } else { y };
+                        let (x, y) = (x as u128, y as u128);
+                        // The concatenation `x:y`, shifted left (`fshl`, the high half) or right
+                        // (`fshr`, the low half) by `s`.
+                        let cat = x << w | y;
+                        let r = match f {
+                            "fshl" => cat << s >> w,
+                            _ => cat >> s,
+                        };
+                        r as u64 & l.mask()
+                    })
+                    .collect();
+                let what = format!("{f} {t} by {amt}, rotate {rotate}");
+                assert_eq!(run_ll_i64(&what, &ir), fold_lanes(&want), "{what}");
+                let m = temen_llvm::translate_ll_str(&ir).expect("translate").module;
+                let scalar_rotate = |i: &temen_ir::Inst| {
+                    matches!(
+                        i,
+                        temen_ir::Inst::IntBin {
+                            op: temen_ir::BinOp::Rotl | temen_ir::BinOp::Rotr,
+                            ..
+                        }
+                    )
+                };
+                assert!(
+                    !module_has_inst(&m, scalar_rotate),
+                    "{what}: a splat amount must not be scalarized"
+                );
+                assert!(
+                    s == 0 || module_has_inst(&m, |i| matches!(i, temen_ir::Inst::VShift { .. })),
+                    "{what}: a splat amount lowers to `VShift`"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn vector_gep_over_vector_indices() {
+    // A `getelementptr` with a **scalar base and vector indices** (#2682): rustc's loop vectorizer
+    // forms `getelementptr i8, ptr %p, <2 x i64> <i64 0, i64 56>` to step two pointers at once.
+    // Each lane is `base + index × size`: constant and loaded indices, an `i32` index vector
+    // sign-extended (a negative lane), a struct field after the vector index, a four-lane result
+    // (a wide pointer vector), and a vector base with a vector index. Then a GEP **into a vector's
+    // lane**, which clang 18 forms to read a lane through memory: lanes lie their size apart.
+    let ir = "%S = type { i32, i64 }\n\
+        @buf = global [512 x i8] zeroinitializer\n\
+        @idx = global <2 x i64> <i64 5, i64 -3>\n\
+        define i64 @run() {\n\
+        entry:\n\
+          %base = ptrtoint ptr @buf to i64\n\
+          %iv = load <2 x i64>, ptr @idx\n\
+          %p0 = getelementptr i8, ptr @buf, <2 x i64> <i64 0, i64 56>\n\
+          %p1 = getelementptr i64, ptr @buf, <2 x i64> %iv\n\
+          %p2 = getelementptr %S, ptr @buf, <2 x i64> %iv, i32 1\n\
+          %p3 = getelementptr i32, ptr @buf, <4 x i32> <i32 3, i32 -1, i32 0, i32 7>\n\
+          %p4 = getelementptr i8, <2 x ptr> %p0, <2 x i64> <i64 1, i64 2>\n\
+          %i = extractelement <2 x i64> %iv, i32 0\n\
+          %l0 = getelementptr [4 x <4 x i32>], ptr @buf, i64 0, i64 %i, i64 2\n\
+          %l1 = getelementptr <2 x i64>, ptr @buf, i64 1, i64 1\n\
+          %q0 = extractelement <2 x ptr> %p0, i32 1\n\
+          %q1 = extractelement <2 x ptr> %p1, i32 0\n\
+          %q2 = extractelement <2 x ptr> %p1, i32 1\n\
+          %q3 = extractelement <2 x ptr> %p2, i32 1\n\
+          %q4 = extractelement <4 x ptr> %p3, i32 1\n\
+          %q5 = extractelement <4 x ptr> %p3, i32 3\n\
+          %q6 = extractelement <2 x ptr> %p4, i32 1\n\
+          %i0 = ptrtoint ptr %q0 to i64\n\
+          %i1 = ptrtoint ptr %q1 to i64\n\
+          %i2 = ptrtoint ptr %q2 to i64\n\
+          %i3 = ptrtoint ptr %q3 to i64\n\
+          %i4 = ptrtoint ptr %q4 to i64\n\
+          %i5 = ptrtoint ptr %q5 to i64\n\
+          %i6 = ptrtoint ptr %q6 to i64\n\
+          %i7 = ptrtoint ptr %l0 to i64\n\
+          %i8 = ptrtoint ptr %l1 to i64\n\
+          %d0 = sub i64 %i0, %base\n\
+          %d1 = sub i64 %i1, %base\n\
+          %d2 = sub i64 %i2, %base\n\
+          %d3 = sub i64 %i3, %base\n\
+          %d4 = sub i64 %i4, %base\n\
+          %d5 = sub i64 %i5, %base\n\
+          %d6 = sub i64 %i6, %base\n\
+          %d7 = sub i64 %i7, %base\n\
+          %d8 = sub i64 %i8, %base\n\
+          %h1 = mul i64 %d0, 1000003\n\
+          %h2 = add i64 %h1, %d1\n\
+          %h3 = mul i64 %h2, 1000003\n\
+          %h4 = add i64 %h3, %d2\n\
+          %h5 = mul i64 %h4, 1000003\n\
+          %h6 = add i64 %h5, %d3\n\
+          %h7 = mul i64 %h6, 1000003\n\
+          %h8 = add i64 %h7, %d4\n\
+          %h9 = mul i64 %h8, 1000003\n\
+          %h10 = add i64 %h9, %d5\n\
+          %h11 = mul i64 %h10, 1000003\n\
+          %h12 = add i64 %h11, %d6\n\
+          %h13 = mul i64 %h12, 1000003\n\
+          %h14 = add i64 %h13, %d7\n\
+          %h15 = mul i64 %h14, 1000003\n\
+          %h16 = add i64 %h15, %d8\n\
+          ret i64 %h16\n\
+        }\n";
+    // `%S` is 16 bytes, its `i64` field at 8. A `<4 x i32>` is 16 bytes, its lane 2 at 8; a
+    // `<2 x i64>`'s lane 1 is at 8.
+    let want = fold_lanes(&[
+        56,
+        40,
+        (-24i64) as u64,
+        (-3 * 16 + 8i64) as u64,
+        (-4i64) as u64,
+        28,
+        58,
+        5 * 16 + 8,
+        16 + 8,
+    ]);
+    assert_eq!(run_ll_i64("vector-index GEPs", ir), want);
+}
+
+#[test]
+fn vector_rotates_and_saturation_vs_native() {
+    // The forms of #2682 as clang emits them from C: a BLAKE3 quarter round over `u32x4` lanes
+    // (vector rotates by a constant, `llvm.fshl.v4i32` splats), saturating loops the vectorizer
+    // turns into `llvm.{u,s}{add,sub}.sat` on byte, half-word and quad-word lanes, and lanes read
+    // through memory (clang 18 indexes the vector's lane in a GEP; LLVM 22 steps bytes).
+    // Byte-identical to native.
+    let src = "#include <stdio.h>\n\
+        typedef unsigned v4u __attribute__((vector_size(16)));\n\
+        volatile unsigned SEED = 0x6a09e667u;\n\
+        static v4u rotr(v4u x, int n) { return (x >> n) | (x << (32 - n)); }\n\
+        static void g(v4u *a, v4u *b, v4u *c, v4u *d, v4u mx, v4u my) {\n\
+          *a = *a + *b + mx; *d = rotr(*d ^ *a, 16); *c = *c + *d; *b = rotr(*b ^ *c, 12);\n\
+          *a = *a + *b + my; *d = rotr(*d ^ *a, 8); *c = *c + *d; *b = rotr(*b ^ *c, 7);\n\
+        }\n\
+        unsigned char x[64], y[64], su[64], au[64];\n\
+        short p[64], q[64], ss[64], as[64];\n\
+        unsigned long long m[64], n[64], sq[64];\n\
+        int main(void){\n\
+          unsigned s = SEED;\n\
+          v4u a = {s, s ^ 0xbb67ae85u, s + 3u, s * 5u}, b = {1u, s, ~s, s >> 3};\n\
+          v4u c = {s * 9u, 7u, s ^ 0x3c6ef372u, s << 5}, d = {0xa54ff53au, s, 2u * s, 11u};\n\
+          for (unsigned r = 0; r < 7; r++) g(&a, &b, &c, &d, (v4u){s, r, s ^ r, 3u}, (v4u){r, s, 5u, s + r});\n\
+          for (int i = 0; i < 64; i++) {\n\
+            x[i] = (unsigned char)(s * (i + 1) >> 3); y[i] = (unsigned char)(s * (i + 7) >> 11);\n\
+            p[i] = (short)(s * (i + 3) >> 5); q[i] = (short)(s * (i + 5) >> 9);\n\
+            m[i] = (unsigned long long)s * (i + 1); n[i] = (unsigned long long)s * (64 - i);\n\
+          }\n\
+          for (int i = 0; i < 64; i++) su[i] = x[i] > y[i] ? x[i] - y[i] : 0;\n\
+          for (int i = 0; i < 64; i++) { unsigned v = x[i] + y[i]; au[i] = v > 255 ? 255 : v; }\n\
+          for (int i = 0; i < 64; i++) { int v = p[i] - q[i]; ss[i] = v > 32767 ? 32767 : v < -32768 ? -32768 : v; }\n\
+          for (int i = 0; i < 64; i++) { int v = p[i] + q[i]; as[i] = v > 32767 ? 32767 : v < -32768 ? -32768 : v; }\n\
+          for (int i = 0; i < 64; i++) sq[i] = m[i] > n[i] ? m[i] - n[i] : 0;\n\
+          v4u w[16];\n\
+          for (int i = 0; i < 16; i++) w[i] = a * (unsigned)(i + 1) + d;\n\
+          unsigned long long acc = 0;\n\
+          for (int i = 0; i < 4; i++) acc = acc * 131u + a[i] + b[i] + c[i] + d[i];\n\
+          for (int i = 0; i < 16; i++) for (int l = 0; l < 4; l++) acc = acc * 131u + w[i][l];\n\
+          for (int i = 0; i < 64; i++) acc = acc * 131u + su[i] + au[i] + (unsigned short)ss[i] + (unsigned short)as[i] + sq[i];\n\
+          printf(\"%llu\\n\", acc); return 0; }";
+    // The loops must reach the translator as the saturating intrinsics, or this tests nothing new.
+    let ll = compile_to_ll("vrot_sat_ir", src);
+    if let Some(ll) = &ll {
+        let ir = std::fs::read_to_string(ll).expect("the IR");
+        // (clang widens the unsigned add into `umin`, and clang 18 leaves the 64-bit subtract
+        // scalar; the handwritten-IR tests above cover those forms.)
+        for f in [
+            "llvm.fshl.v4i32",
+            "llvm.usub.sat.v16i8",
+            "llvm.sadd.sat.v8i16",
+            "llvm.ssub.sat.v8i16",
+        ] {
+            assert!(ir.contains(f), "clang no longer emits `{f}` here");
+        }
+    }
+    check_powerbox_vs_native("vrot_sat", src, b"");
+}
+
 #[test]
 fn tail_call_lowers_and_runs() {
     // Local validation (no native `cc` needed): the `musttail` mutual recursion translates with
