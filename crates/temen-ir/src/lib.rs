@@ -312,6 +312,8 @@ pub mod errno {
     pub const EEXIST: i64 = -17;
     /// Not a directory (`opendir`/dir op on a regular file).
     pub const ENOTDIR: i64 = -20;
+    /// Is a directory: an op that writes a file was given a directory (`replace`, #2510).
+    pub const EISDIR: i64 = -21;
     /// Invalid argument.
     pub const EINVAL: i64 = -22;
     /// Too many open files — the handle table is full (§3c).
@@ -322,6 +324,9 @@ pub mod errno {
     pub const ENOSPC: i64 = -28;
     /// Illegal seek (`lseek` on a pipe/stdio fd).
     pub const ESPIPE: i64 = -29;
+    /// Too many links: `replace` refuses a file with other hard links, which replacing it would
+    /// part from them (#2510).
+    pub const EMLINK: i64 = -31;
     /// Broken pipe — write to a pipe whose read end is fully closed (FORK.md §8.6).
     pub const EPIPE: i64 = -32;
     /// Result too large for the caller's buffer (`getcwd`).
@@ -330,6 +335,8 @@ pub mod errno {
     pub const ENOSYS: i64 = -38;
     /// Directory not empty (`rmdir` on a non-empty directory).
     pub const ENOTEMPTY: i64 = -39;
+    /// Too many levels of symbolic links: a path's links chain past the limit (40, Linux's).
+    pub const ELOOP: i64 = -40;
     /// Socket operation on a non-socket fd.
     pub const ENOTSOCK: i64 = -88;
     /// Address already in use (loopback port another listener holds).

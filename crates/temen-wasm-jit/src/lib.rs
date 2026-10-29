@@ -4393,7 +4393,7 @@ struct FnCtx {
     /// globals, without a global load at every access.
     mapped_l: u32,
     table_l: u32,
-    /// #2117: i64 scratch for the paged check — the access's last byte, then its page.
+    /// #2117: i64 scratch for the paged check — the access's last byte.
     lp_l: u32,
     /// Whether this function accesses memory, i.e. whether its checks read `mapped_l`/`table_l`
     /// ([`touches_memory`]).
@@ -5606,9 +5606,11 @@ fn emit_confined_addr(cx: &FnCtx, code: &mut Vec<u8>) {
 /// contract): the table holds one state byte per page of `[0, mapped)`, and `mapped` is a whole
 /// number of pages. So for the access's last byte `last = addr + offset + width - 1`, `last < mapped`
 /// is both the interpreter's bound `addr + offset + width <= mapped` and the bound that keeps every
-/// page index below inside the table. The last byte's page is consulted first; the first byte's only
-/// when the access crosses into it (an `align`ed access, of power-of-two `width` ≤ a page, never
-/// does). Never elided: page state is dynamic, and the bound is one compare.
+/// page index below inside the table. The last byte's page is consulted first, then the first
+/// byte's, unless the access is `align`ed (of power-of-two `width` ≤ a page, it never crosses one).
+/// The second lookup is unconditional: when both bytes share a page it repeats the first, which
+/// measured cheaper in V8 than an `if` to skip it (#2099: 4–6% of a nim macro build). Never
+/// elided: page state is dynamic, and the bound is one compare.
 ///
 /// **Wrapping.** `addr + offset`, or `last`, may wrap past `2^64`, which the interpreter faults. A
 /// wrapped `last` is below `offset + width`, and the NULL guard's pages are `Unmapped` in every table
@@ -5673,41 +5675,23 @@ fn emit_paged_confine(
         code.push(0x54); // i64.lt_u
         emit_trap_if(cx, code);
     }
-    let crosses = width > 1 && !align;
-    // The last byte's page.
+    // The last byte's page, then the first byte's.
+    emit_page_of(code, cx.lp_l, page_log2);
+    emit_page_state_check(cx, code, write);
+    if width > 1 && !align {
+        emit_page_of(code, cx.ea_l, page_log2);
+        emit_page_state_check(cx, code, write);
+    }
+    emit_confined_addr(cx, code);
+}
+
+/// Push the index of the page holding the address in `local`: `local >> page_log2`.
+fn emit_page_of(code: &mut Vec<u8>, local: u32, page_log2: u8) {
     code.push(OP_LOCAL_GET);
-    uleb(code, cx.lp_l as u64);
+    uleb(code, local as u64);
     code.push(OP_I64_CONST);
     sleb64(code, page_log2 as i64);
     code.push(0x88); // i64.shr_u
-    if crosses {
-        code.push(OP_LOCAL_TEE);
-        uleb(code, cx.lp_l as u64); // lp = the last byte's page
-    }
-    emit_page_state_check(cx, code, write);
-    if crosses {
-        // The first byte's page, when it is another one.
-        code.push(OP_LOCAL_GET);
-        uleb(code, cx.ea_l as u64);
-        code.push(OP_I64_CONST);
-        sleb64(code, page_log2 as i64);
-        code.push(0x88); // i64.shr_u
-        code.push(OP_LOCAL_GET);
-        uleb(code, cx.lp_l as u64);
-        code.push(0x52); // i64.ne
-        code.push(OP_IF);
-        code.push(BLOCKTYPE_VOID);
-        cx.depth += 1;
-        code.push(OP_LOCAL_GET);
-        uleb(code, cx.ea_l as u64);
-        code.push(OP_I64_CONST);
-        sleb64(code, page_log2 as i64);
-        code.push(0x88); // i64.shr_u
-        emit_page_state_check(cx, code, write);
-        code.push(OP_END);
-        cx.depth -= 1;
-    }
-    emit_confined_addr(cx, code);
 }
 
 /// Consume an i64 page index and trap `MemoryFault` unless that page admits the access: a load any
@@ -5928,18 +5912,38 @@ fn emit_span_check(cx: &mut FnCtx, code: &mut Vec<u8>, base_local: u32, len_loca
 /// is unchanged and unconditional; a wrong page table is a trap-parity divergence the coop differential
 /// catches (INVARIANTS #9), never a confinement escape (#2 — the span check has already confined the
 /// bytes to `[0, mapped)`).
+///
+/// #2099: a `short` span, of a constant length no longer than a page, touches at most two pages, so
+/// it looks up its last byte's and first byte's, as a scalar access does, with no loop.
 fn emit_span_page_check(
     cx: &mut FnCtx,
     code: &mut Vec<u8>,
     base_local: u32,
     len_local: u32,
+    short: Option<u64>,
     write: bool,
 ) {
     let Some(page_log2) = cx.page_check else {
         return;
     };
-    let (page_l, last_l) = (cx.span_page_l, cx.span_last_page_l);
     emit_span_fault_addr(cx, code, base_local);
+    if let Some(n) = short.filter(|&n| n <= 1 << page_log2) {
+        code.push(OP_LOCAL_GET);
+        uleb(code, base_local as u64);
+        code.push(OP_I64_CONST);
+        sleb64(code, (n - 1) as i64);
+        code.push(0x7c); // i64.add → the last byte
+        code.push(OP_I64_CONST);
+        sleb64(code, page_log2 as i64);
+        code.push(0x88); // i64.shr_u
+        emit_page_state_check(cx, code, write);
+        if n > 1 {
+            emit_page_of(code, base_local, page_log2);
+            emit_page_state_check(cx, code, write);
+        }
+        return;
+    }
+    let (page_l, last_l) = (cx.span_page_l, cx.span_last_page_l);
     // page_l = (base & MASK) >> page_log2  — the span's first window-relative page.
     code.push(OP_LOCAL_GET);
     uleb(code, base_local as u64);
@@ -6033,6 +6037,80 @@ fn emit_win_addr(code: &mut Vec<u8>, base_local: u32) {
     code.push(OP_LOCAL_GET);
     uleb(code, 0); // win
     code.push(0x6a); // i32.add
+}
+
+/// #2099 — the most bytes a bulk op of a constant length moves as loads and stores, where V8 would
+/// call C for `memory.copy`/`memory.fill`. nim's aggregate assignments are mostly 16 or 24 bytes
+/// (#2177, where the Cranelift JIT inlines copies of up to 64).
+const INLINE_BULK_MAX: i64 = 32;
+
+/// #2099 — the length of a **short** bulk op: its `len` is one of its block's constants (`consts`,
+/// numbered as its values), of `1..=`[`INLINE_BULK_MAX`] bytes.
+fn short_len(consts: &[Option<i64>], len: temen_ir::ValIdx) -> Option<u64> {
+    match consts.get(len as usize) {
+        Some(&Some(n)) if (1..=INLINE_BULK_MAX).contains(&n) => Some(n as u64),
+        _ => None,
+    }
+}
+
+/// #2099 — copy a short span's `n` bytes, both spans checked, as loads and stores: every word is
+/// loaded before the first is stored, so overlapping spans copy as `memory.copy` does.
+fn emit_inline_copy(code: &mut Vec<u8>, dst_local: u32, src_local: u32, n: u64) {
+    for (off, w) in bulk_words(n) {
+        emit_win_addr(code, dst_local);
+        emit_win_addr(code, src_local);
+        code.push(word_ops(w).0);
+        uleb(code, 0); // align
+        uleb(code, off);
+    }
+    // Each word sits on the stack above its destination address, the last word on top.
+    for (off, w) in bulk_words(n).rev() {
+        code.push(word_ops(w).1);
+        uleb(code, 0); // align
+        uleb(code, off);
+    }
+}
+
+/// #2099 — fill a short span's `n` bytes, checked, with the low byte of the `i32` in `val_local`, as
+/// stores of that byte repeated across a word: `(val & 0xff) * 0x0101…`.
+fn emit_inline_fill(code: &mut Vec<u8>, dst_local: u32, val_local: u32, n: u64) {
+    for (off, w) in bulk_words(n) {
+        emit_win_addr(code, dst_local);
+        code.push(OP_LOCAL_GET);
+        uleb(code, val_local as u64);
+        code.push(0xad); // i64.extend_i32_u
+        code.push(OP_I64_CONST);
+        sleb64(code, 0xff);
+        code.push(0x83); // i64.and
+        code.push(OP_I64_CONST);
+        sleb64(code, 0x0101_0101_0101_0101);
+        code.push(0x7e); // i64.mul
+        if w < 8 {
+            code.push(0xa7); // i32.wrap_i64: a narrower store keeps the low bytes
+        }
+        code.push(word_ops(w).1);
+        uleb(code, 0); // align
+        uleb(code, off);
+    }
+}
+
+/// The words of a short span of `n` bytes, as `(offset, width)`: its 8-byte words, then a 4-, 2- and
+/// 1-byte word for the bits of `n % 8`, each after the 8-byte words and the wider tail words.
+fn bulk_words(n: u64) -> impl DoubleEndedIterator<Item = (u64, u64)> {
+    let tail = [4, 2, 1].into_iter().filter(move |w| n & w != 0);
+    (0..n / 8)
+        .map(|i| (8 * i, 8))
+        .chain(tail.map(move |w| (n & !(2 * w - 1), w)))
+}
+
+/// The load and the store of a `w`-byte word ([`bulk_words`]): `i64` for 8 bytes, else `i32`.
+fn word_ops(w: u64) -> (u8, u8) {
+    match w {
+        8 => (0x29, 0x37), // i64.load, i64.store
+        4 => (0x28, 0x36), // i32.load, i32.store
+        2 => (0x2f, 0x3b), // i32.load16_u, i32.store16
+        _ => (0x2d, 0x3a), // i32.load8_u, i32.store8
+    }
 }
 
 /// Push branch args onto the operand stack, then pop them into the target block's param locals in
@@ -6335,6 +6413,9 @@ fn emit_block_body(
     // misalignment could only mis-elide (a trap-parity divergence the differential catches; never an
     // escape, since the `& MASK` clamp is always emitted).
     let mut ubs: Vec<u64> = vec![UB_TOP; b.inputs()];
+    // #2099: the block's `i64.const` values, numbered as `ubs` is — what makes a bulk op short
+    // ([`short_len`]).
+    let mut consts: Vec<Option<i64>> = vec![None; b.inputs()];
     let get = |code: &mut Vec<u8>, cx: &FnCtx, v: temen_ir::ValIdx| {
         code.push(OP_LOCAL_GET);
         uleb(code, cx.local_of[k][v as usize] as u64);
@@ -6601,17 +6682,28 @@ fn emit_block_body(
             // masks each base into the window (a no-op past the check) — same net confinement as the
             // per-byte `Store` path, proven once per span. `len` (i64) is `i32.wrap`ped after the
             // check (exact, since `len <= mapped <= 2^32`); `val` is already the i32 fill byte.
+            //
+            // #2099: a **short** op, whose `len` is a constant of at most [`INLINE_BULK_MAX`] bytes
+            // ([`short_len`]), takes the same checks, its page walk as two lookups, and then moves
+            // its bytes as loads and stores ([`emit_inline_copy`], [`emit_inline_fill`]): V8 lowers
+            // `memory.copy`/`.fill` to a C call.
             Inst::MemFill { dst, val, len } => {
                 let dl = cx.local_of[k][*dst as usize];
                 let ll = cx.local_of[k][*len as usize];
+                let short = short_len(&consts, *len);
                 emit_bulk_guard_open(cx, code, ll);
                 emit_span_check(cx, code, dl, ll);
-                emit_span_page_check(cx, code, dl, ll, true); // #1081: paged per-page walk (write)
-                emit_win_addr(code, dl); // dest addr (i32)
-                get(code, cx, *val); // fill byte (already i32)
-                get(code, cx, *len);
-                code.push(0xa7); // i32.wrap_i64 → size (i32)
-                code.extend_from_slice(&[0xFC, 0x0B, 0x00]); // memory.fill mem=0
+                emit_span_page_check(cx, code, dl, ll, short, true); // #1081: paged per-page walk (write)
+                match short {
+                    Some(n) => emit_inline_fill(code, dl, cx.local_of[k][*val as usize], n),
+                    None => {
+                        emit_win_addr(code, dl); // dest addr (i32)
+                        get(code, cx, *val); // fill byte (already i32)
+                        get(code, cx, *len);
+                        code.push(0xa7); // i32.wrap_i64 → size (i32)
+                        code.extend_from_slice(&[0xFC, 0x0B, 0x00]); // memory.fill mem=0
+                    }
+                }
                 code.push(OP_END); // close `if len != 0`
                 cx.depth -= 1;
             }
@@ -6621,16 +6713,22 @@ fn emit_block_body(
                 let dl = cx.local_of[k][*dst as usize];
                 let sl = cx.local_of[k][*src as usize];
                 let ll = cx.local_of[k][*len as usize];
+                let short = short_len(&consts, *len);
                 emit_bulk_guard_open(cx, code, ll);
                 emit_span_check(cx, code, dl, ll);
                 emit_span_check(cx, code, sl, ll);
-                emit_span_page_check(cx, code, sl, ll, false); // #1081: paged per-page walk (read src)
-                emit_span_page_check(cx, code, dl, ll, true); //  #1081: paged per-page walk (write dst)
-                emit_win_addr(code, dl); // dest addr (i32)
-                emit_win_addr(code, sl); // src addr (i32)
-                get(code, cx, *len);
-                code.push(0xa7); // i32.wrap_i64 → size (i32)
-                code.extend_from_slice(&[0xFC, 0x0A, 0x00, 0x00]); // memory.copy dst=0 src=0
+                emit_span_page_check(cx, code, sl, ll, short, false); // #1081: paged per-page walk (read src)
+                emit_span_page_check(cx, code, dl, ll, short, true); //  #1081: paged per-page walk (write dst)
+                match short {
+                    Some(n) => emit_inline_copy(code, dl, sl, n),
+                    None => {
+                        emit_win_addr(code, dl); // dest addr (i32)
+                        emit_win_addr(code, sl); // src addr (i32)
+                        get(code, cx, *len);
+                        code.push(0xa7); // i32.wrap_i64 → size (i32)
+                        code.extend_from_slice(&[0xFC, 0x0A, 0x00, 0x00]); // memory.copy dst=0 src=0
+                    }
+                }
                 code.push(OP_END); // close `if len != 0`
                 cx.depth -= 1;
             }
@@ -7119,6 +7217,10 @@ fn emit_block_body(
             ubs.push(bound);
         } else {
             ubs.resize(next_val, UB_TOP);
+        }
+        consts.resize(next_val, None);
+        if let Inst::ConstI64(v) = inst {
+            consts[val_before] = Some(*v);
         }
     }
     debug_assert_eq!(next_val, value_types.len());

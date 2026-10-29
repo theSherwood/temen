@@ -361,6 +361,42 @@ exit:\n\
     }
 }
 
+/// #2454: `extractvalue` emits no instruction, it names the field's slot. In `mid` that slot is a
+/// capture of `%p`'s field, which nothing in `mid` reads, so `mid` drops the capture. `%a` and `%b`
+/// must then be read from where the fields live (the entry), not from a slot `mid` no longer has.
+#[test]
+fn a_field_named_in_one_block_and_read_in_the_next() {
+    let ll = "\
+define { i64, i64 } @mk(i64 %x) {
+  %1 = insertvalue { i64, i64 } undef, i64 %x, 0
+  %2 = insertvalue { i64, i64 } %1, i64 7, 1
+  ret { i64, i64 } %2
+}
+define i64 @f(i64 %x, i1 %c) {
+entry:
+  %p = call { i64, i64 } @mk(i64 %x)
+  br label %mid
+mid:
+  %a = extractvalue { i64, i64 } %p, 0
+  %b = extractvalue { i64, i64 } %p, 1
+  br i1 %c, label %t, label %e
+t:
+  %r = add i64 %a, %b
+  ret i64 %r
+e:
+  ret i64 %b
+}
+define i64 @run() {
+  %u = call i64 @f(i64 35, i1 true)
+  %v = call i64 @f(i64 35, i1 false)
+  %w = mul i64 %u, 1000
+  %s = add i64 %w, %v
+  ret i64 %s
+}
+";
+    assert_eq!(run_ll_i64("field read a block later", ll), 42_007);
+}
+
 #[test]
 fn thread_local_tier2_vcpu_tls_isolation_and_pause_drop() {
     // The threaded-`std` build's native TLS shape (NIM.md §3d Tier-2): a `thread_local` global,
@@ -8565,6 +8601,53 @@ int main() {
 }
 "#;
     check_cpp_eh_vs_native("cpp_eh_unwind_cleanup", src, b"");
+}
+
+/// **C++ exceptions — the call's result read in a loop it enters** (#2454). With nothing to compute
+/// before the loop, clang `-O2` makes the loop's header the `invoke`'s normal destination: the header
+/// has a second predecessor, its own back edge, and reads the result directly. The translator
+/// captures the result from the call block `lower_invoke` adds, which dominates the header. Byte-
+/// identical to native.
+#[test]
+fn cpp_eh_invoke_result_read_in_the_loop_it_enters() {
+    let src = r#"
+extern "C" int write(int fd, const char *buf, long n);
+
+static void puti(int v) {
+  char b[16]; int i = 16;
+  int neg = v < 0; unsigned u = neg ? -(unsigned)v : (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  if (neg) b[--i] = '-';
+  write(1, b + i, 16 - i);
+}
+
+volatile int sink, ctr;
+
+__attribute__((noinline)) static int may_throw(int x) {
+  if (x < 0) throw x;
+  return x + 1;
+}
+
+// The loop reads `r` and does no work before its first trip, so the `invoke` branches to its header.
+__attribute__((noinline)) static int f(int n) {
+  try {
+    int r = may_throw(n);
+    int acc = 0;
+    do { acc += r; sink = acc; } while (ctr++ < r);
+    return acc;
+  } catch (int e) { return e; }
+}
+
+int main() {
+  ctr = 0;
+  puti(f(5));    // r = 6, 7 trips: 42
+  ctr = 0;
+  puti(f(-3));   // -3
+  return 0;
+}
+"#;
+    check_cpp_eh_vs_native("cpp_eh_invoke_into_loop_header", src, b"");
 }
 
 /// **C++ exceptions — catch-by-value + destructor** — the path that forces `__cxa_end_catch` to stop

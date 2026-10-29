@@ -131,3 +131,13 @@ fn out_of_range_target_is_ignored_not_panicked() {
     assert_eq!(g.succs[0], Vec::<u32>::new());
     assert_eq!(g.rpo(), vec![0]);
 }
+
+#[test]
+fn from_succs_drops_repeated_and_out_of_range_targets() {
+    // What a producer hands over before it has built any blocks (temen-llvm): a `switch` with two
+    // cases into one block repeats a target, and a stray target names no block.
+    let g = Cfg::from_succs(vec![vec![1, 2, 1, 9], vec![2, 2], vec![]]);
+    assert_eq!(g.succs, vec![vec![1, 2], vec![2], vec![]]);
+    assert_eq!(g.preds, vec![vec![], vec![0], vec![0, 1]]);
+    assert_eq!(g.rpo(), vec![0, 1, 2]);
+}

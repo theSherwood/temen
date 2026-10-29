@@ -192,6 +192,18 @@ fn diff(name: &str, src: &str, sweep: &[i64], fuel: u64) {
     }
 }
 
+/// [`diff`] over [`ARGS`] for a test of what memory holds, which first asserts that the oracle runs
+/// `src` to the end: if every run trapped (say, on an address in the NULL guard), there would be no
+/// data to compare.
+fn diff_data(name: &str, src: &str) {
+    let ran = oracle(&parse(name, src), &[Value::I64(1)], FUEL);
+    assert!(
+        matches!(ran, Outcome::Vals(_)),
+        "{name} runs to the end: {ran:?}"
+    );
+    diff(name, src, ARGS, FUEL);
+}
+
 fn parse(name: &str, src: &str) -> temen_ir::Module {
     let m = temen_text::parse_module(src).unwrap_or_else(|e| panic!("{name}: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("{name}: verify: {e:?}"));
@@ -475,21 +487,22 @@ fn mem_oob() {
 // in-window correctness (the fill/copy actually happened, and only the intended bytes) and the
 // out-of-window / zero-length trap agreement (both engines must fault on the SAME spans, §4).
 
-/// `memset(16, arg&0xff, 40)`, then read the first + last filled byte and the byte just past the span
-/// (which must stay 0): proves `memory.fill` wrote exactly `[16, 56)`.
+/// `memset(G+16, arg&0xff, 40)` past the 16 KiB NULL guard `G`, then read the first + last filled byte
+/// and the byte just past the span (which must stay 0): proves `memory.fill` wrote exactly
+/// `[G+16, G+56)`.
 const MEMFILL: &str = r#"
 memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 16
+  v1 = i64.const 16400
   v2 = i32.wrap_i64 v0
   v3 = i64.const 40
   mem.fill v1 v2 v3
-  v4 = i64.const 16
+  v4 = i64.const 16400
   v5 = i64.load8_u v4
-  v6 = i64.const 55
+  v6 = i64.const 16439
   v7 = i64.load8_u v6
-  v8 = i64.const 56
+  v8 = i64.const 16440
   v9 = i64.load8_u v8
   v10 = i64.add v5 v7
   v11 = i64.add v10 v9
@@ -500,19 +513,19 @@ block 0 (v0: i64) {
 
 #[test]
 fn memfill() {
-    diff("memfill", MEMFILL, ARGS, FUEL);
+    diff_data("memfill", MEMFILL);
 }
 
-/// `memcpy(64, 0, 8)` after seeding `mem[0..8] = arg`: the copied i64 read back from the destination
-/// must equal `arg` (non-overlapping copy).
+/// `memcpy(G+64, G, 8)` after seeding `mem[G..G+8] = arg`, past the NULL guard `G`: the copied i64
+/// read back from the destination must equal `arg` (non-overlapping copy).
 const MEMCOPY: &str = r#"
 memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   i64.store v1 v0
-  v2 = i64.const 64
-  v3 = i64.const 0
+  v2 = i64.const 16448
+  v3 = i64.const 16384
   v4 = i64.const 8
   mem.copy v2 v3 v4
   v5 = i64.load v2
@@ -523,21 +536,22 @@ block 0 (v0: i64) {
 
 #[test]
 fn memcopy() {
-    diff("memcopy", MEMCOPY, ARGS, FUEL);
+    diff_data("memcopy", MEMCOPY);
 }
 
-/// `memmove(4, 0, 16)` over an **overlapping** source/dest (both spans seeded with `arg`): the read-back
-/// must match the overlap-safe result — `memory.copy` and the interpreter's snapshotting copy agree.
+/// `memmove(G+4, G, 16)` over an **overlapping** source/dest (both spans seeded with `arg`), past the
+/// NULL guard `G`: the read-back must match the overlap-safe result — `memory.copy` and the
+/// interpreter's snapshotting copy agree.
 const MEMMOVE: &str = r#"
 memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 0
+  v1 = i64.const 16384
   i64.store v1 v0
-  v2 = i64.const 8
+  v2 = i64.const 16392
   i64.store v2 v0
-  v3 = i64.const 4
-  v4 = i64.const 0
+  v3 = i64.const 16388
+  v4 = i64.const 16384
   v5 = i64.const 16
   mem.move v3 v4 v5
   v6 = i64.load v3
@@ -548,7 +562,7 @@ block 0 (v0: i64) {
 
 #[test]
 fn memmove() {
-    diff("memmove", MEMMOVE, ARGS, FUEL);
+    diff_data("memmove", MEMMOVE);
 }
 
 /// The span boundary for a bulk op: `memset(arg, 0xab, 8)` swept across the window edge. Both engines
@@ -658,6 +672,95 @@ block 0 (v0: i64) {
 fn bulk_zero_len_never_traps() {
     diff("memfill_zero", MEMFILL_ZERO, SPAN_PROBE, FUEL);
     diff("memcopy_zero", MEMCOPY_ZERO, SPAN_PROBE, FUEL);
+}
+
+/// #2099 — bulk ops of a constant `n` bytes, past the NULL guard at `G`: seed `[G, G+80)` from the
+/// argument, `mem.move` over spans that overlap forward and backward, `mem.copy` to a disjoint span,
+/// `mem.fill` with a byte above `0xff`, then fold `[G, G+120)` (every byte the ops wrote, and those
+/// around them) into the result.
+fn short_bulk_src(n: u64) -> String {
+    let at = |off: u64| temen_ir::module_null_guard() + off;
+    let mut s = String::from("memory 16\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n");
+    for k in 0..10 {
+        s += &format!(
+            "  vk{k} = i64.const {}\n  vm{k} = i64.mul v0 vk{k}\n  va{k} = i64.const {}\n  i64.store va{k} vm{k}\n",
+            2 * k + 1,
+            at(8 * k)
+        );
+    }
+    s += &format!(
+        "  vn = i64.const {n}
+  vs0 = i64.const {}
+  vd0 = i64.const {}
+  mem.move vd0 vs0 vn
+  vs1 = i64.const {}
+  vd1 = i64.const {}
+  mem.move vd1 vs1 vn
+  vs2 = i64.const {}
+  vd2 = i64.const {}
+  mem.copy vd2 vs2 vn
+  vf = i32.const 421
+  vd3 = i64.const {}
+  mem.fill vd3 vf vn
+  vh0 = i64.const 0
+",
+        at(1),
+        at(4),
+        at(9),
+        at(2),
+        at(40),
+        at(81),
+        at(43)
+    );
+    for k in 0..15 {
+        s += &format!(
+            "  vp{k} = i64.const {}\n  vw{k} = i64.load vp{k}\n  vc{k} = i64.const 31\n  vx{k} = i64.mul vh{k} vc{k}\n  vh{} = i64.add vx{k} vw{k}\n",
+            at(8 * k),
+            k + 1
+        );
+    }
+    s + "  return vh15\n  }\n}\n"
+}
+
+/// Every word shape of a short bulk op — 8-byte words, a 4/2/1-byte tail — and the first length past
+/// the limit, which takes `memory.copy`/`memory.fill`.
+const SHORT_BULK_LENS: [u64; 12] = [1, 2, 3, 4, 7, 8, 13, 16, 24, 31, 32, 33];
+
+#[test]
+fn short_bulk_ops_match_the_oracle() {
+    for n in SHORT_BULK_LENS {
+        diff_data(&format!("short_bulk_{n}"), &short_bulk_src(n));
+    }
+}
+
+/// #2099 — a short bulk op moves its bytes as loads and stores: V8 lowers `memory.copy` and
+/// `memory.fill` to a C call. Up to 32 bytes the emit holds neither; at 33 it holds both again.
+#[test]
+fn short_bulk_ops_are_loads_and_stores() {
+    let bulk_ops = |n: u64| {
+        let wasm = compile_module(&parse("short_bulk", &short_bulk_src(n))).expect("emit");
+        let mut ops = op_names(&wasm);
+        ops.retain(|name| name.starts_with("Memory"));
+        ops
+    };
+    assert!(bulk_ops(32).is_empty(), "32 bytes: loads and stores");
+    let bulk = ["MemoryCopy", "MemoryCopy", "MemoryCopy", "MemoryFill"];
+    assert_eq!(bulk_ops(33), bulk, "33 bytes: the bulk ops");
+}
+
+/// The name of every operator in `wasm`'s code section, in order (`I64Load`, `MemoryCopy`, …).
+fn op_names(wasm: &[u8]) -> Vec<String> {
+    let mut ops = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.expect("parses") {
+            let mut r = body.get_operators_reader().expect("operators");
+            while !r.eof() {
+                let op = format!("{:?}", r.read().expect("operator"));
+                ops.push(op.split([' ', '{']).next().unwrap_or_default().to_string());
+            }
+        }
+    }
+    ops
 }
 
 /// `memset(base, 0xc8, len)` — both the base and the length are function params, so the sweep drives
@@ -1731,19 +1834,8 @@ fn shared_memory_atomics_are_hardware_ops() {
         wasmparser::Validator::new_with_features(features)
             .validate_all(&wasm)
             .unwrap_or_else(|e| panic!("shared {shared}: the emit validates: {e}"));
-        let mut ops = Vec::new();
-        for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
-            if let wasmparser::Payload::CodeSectionEntry(body) = payload.expect("parses") {
-                let mut r = body.get_operators_reader().expect("operators");
-                while !r.eof() {
-                    let op = format!("{:?}", r.read().expect("operator"));
-                    let name = op.split([' ', '{']).next().unwrap_or_default();
-                    if name.contains("Atomic") {
-                        ops.push(name.to_string());
-                    }
-                }
-            }
-        }
+        let mut ops = op_names(&wasm);
+        ops.retain(|name| name.contains("Atomic"));
         ops
     };
     assert_eq!(

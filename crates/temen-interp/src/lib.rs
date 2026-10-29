@@ -28955,12 +28955,18 @@ impl Host {
     /// default grant until this is called ([`DEFAULT_MEM`]); its fuel is granted per activation
     /// ([`Self::begin_activation`]).
     pub fn set_grant(&mut self, mem: i64, channel: i64, spawn: i64, maps: i64) {
-        self.budgets.set_ceiling(self.own_budget, BUDGET_MEM, mem);
+        self.set_mem_grant(mem);
         self.budgets
             .set_ceiling(self.own_budget, BUDGET_CHANNEL, channel);
         self.budgets
             .set_ceiling(self.own_budget, BUDGET_SPAWN, spawn);
         self.budgets.set_ceiling(self.own_budget, BUDGET_MAPS, maps);
+    }
+
+    /// #1414 5d — the `mem` ceiling of [`Self::set_grant`] alone, the others left as they are: a
+    /// browser grants a run what its window's memory is made to hold.
+    pub fn set_mem_grant(&mut self, mem: i64) {
+        self.budgets.set_ceiling(self.own_budget, BUDGET_MEM, mem);
     }
 
     /// D66 — set this domain's lane cap (see [`Host::lane_cap`]); `-1` = unbounded. The embedder sets
@@ -35844,10 +35850,10 @@ impl Mem {
     /// window's, the image's its declared memory (#2332). Emitted `win + addr` code can serve the
     /// window only over a flat backing; otherwise the tier-up `tierup_servable` gate strips its
     /// bitmap and it interprets.
-    /// - When my backing grows in place ([`Region::Growable`]: a cooperative tier-up run's root
-    ///   window, or a detached child's in such a run, #2102), the new one does too, `mapped` bytes,
-    ///   on every target. Only a run with a single owner builds one, and the new window is in that
-    ///   run.
+    /// - When my backing grows ([`Region::can_grow`]: a cooperative tier-up run's root window, or a
+    ///   detached child's in such a run, #2102, in the engine's memory or one of its own, #1414 5d),
+    ///   the new one does too: a [`Region::Growable`] of `mapped` bytes, on every target. Only a run
+    ///   with a single owner builds one, and the new window is in that run.
     /// - Otherwise [`Region::new`]: a lazy `mmap` on unix, but off unix the non-flat `Sparse`
     ///   table. When that comes back non-flat, this (my) window is itself flat-addressable (the
     ///   browser's `Region::shared` window over the cdylib's linear memory), and the reservation is
@@ -35856,7 +35862,7 @@ impl Mem {
     ///
     /// Fail-soft: an allocation failure keeps the default, and the twin then stays interpreted.
     fn twin_backing(&self, mapped: u64, reserved: u64) -> Region {
-        if matches!(*self.back, Region::Growable(_)) {
+        if self.back.can_grow() {
             if let Some(grows) = Region::growable(mapped, self.page) {
                 return grows;
             }
@@ -37276,6 +37282,13 @@ impl Mem {
     /// fail-closed arm of the tier-up eligibility gate).
     pub(crate) fn flat_win_base(&self) -> Option<*const u8> {
         self.back.raw_base_at(0).map(|p| p as *const u8)
+    }
+
+    /// Whether emitted `win + addr` code can address this window as one span: a flat backing
+    /// ([`Self::flat_win_base`]), or a memory of its own ([`Self::foreign_id`], #1414 5d), whose
+    /// window starts past its header.
+    pub(crate) fn one_span(&self) -> bool {
+        self.flat_win_base().is_some() || self.foreign_id().is_some()
     }
 
     /// #816/#1312 — the **flat span** this window's base actually addresses: its reservation, clamped to

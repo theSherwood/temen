@@ -4,9 +4,9 @@
 // Worker (no nested Workers) and never blocks: a browser permits a blocking `Atomics.wait` only off
 // the main thread, so the Workers do all the blocking.
 
-import { foreignMemory, registerForeign, releaseForeign } from './foreign-mem.js';
+import { foreignMemory, headerOf, registerForeign, releaseForeign } from './foreign-mem.js';
 import { instantiateEngine } from './engine-imports.js';
-import { childTier, emittedTier, jsCapServicer, tierupJitArg, tierupJitRes } from './coop-driver.js';
+import { emittedTier, jsCapServicer, tierupJitArg, tierupJitRes, windowTier } from './coop-driver.js';
 const STACK = 1 << 20; // per-Worker stack
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 
@@ -140,16 +140,16 @@ self.onmessage = async (e) => {
     return [tier, x2Win, program];
   };
   // A detached child's tier (#1414 ED-2): its granted module's emit over the child's own memory,
-  // which this Worker registered for the child's root task (`childTier`, the pump's too).
+  // which this Worker registered for the child's root task (`windowTier`, the pump's too).
   let x2Child = null, x2ChildModule = -1, x2ChildScratch = 0;
   const x2ChildEnter = (mem, module, mapped, over) => {
     if (mem !== x2MemId) throw new Error(`memory ${mem} is not this Worker's`);
     x2Mapped = mapped;
     x2Over = over;
     if (x2Child === null) {
-      x2ChildScratch = Number(ex.temen_alloc(ex.temen_wasmjit_env_bytes()));
-      x2Child = childTier(ex, memory, x2Mem, {
-        scratch: x2ChildScratch,
+      x2ChildScratch = Number(ex.temen_alloc(ex.temen_wasmjit_call_scratch_bytes()));
+      x2Child = windowTier(ex, memory, x2Mem, {
+        scratch: () => x2ChildScratch,
         tableGen: () => ex.temen_x2_table_gen(),
         callInterp: (target, argsPtr, spillLen) => ex.temen_x2_call_interp(target, argsPtr, spillLen),
         paged: () => ex.temen_x2_paged(),
@@ -299,10 +299,10 @@ self.onmessage = async (e) => {
     return;
   }
   if (role === 'x2thread') {
-    if (x2Mem) registerForeign(memory, x2Mem, ex.temen_detached_header_bytes(), x2MemId);
+    if (x2Mem) registerForeign(memory, x2Mem, headerOf(x2Mem).base, x2MemId);
     ex.temen_x2_thread(start);
     for (const tier of [x2Tier, x2LeafTier]) tier?.free();
-    if (x2Child !== null) ex.temen_dealloc(x2ChildScratch, ex.temen_wasmjit_env_bytes());
+    if (x2Child !== null) ex.temen_dealloc(x2ChildScratch, ex.temen_wasmjit_call_scratch_bytes());
     self.close(); // the thread has counted itself out of its run: this Worker has nothing left to do
     return;
   }
