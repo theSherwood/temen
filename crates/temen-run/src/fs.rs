@@ -37,6 +37,7 @@
 //! | 17 | `opendir` | `(path_ptr, path_len, _, _)` | dir handle ≥ 0 / `-errno` |
 //! | 18 | `readdir` | `(dh, name_ptr, name_cap, _)` | name length > 0, `0` = end, `-errno` |
 //! | 19 | `closedir` | `(dh, _, _, _)` | 0 / `-errno` |
+//! | 20 | `replace` | `(path_ptr, path_len, buf_ptr, len)` | 0 / `-errno` |
 //!
 //! Op 12 (`crash_arm`) exists **only on the `*_crashy` test variants** (see [`FS_CRASH_ARM`]); op 13
 //! (`map_region`, the §4b zero-copy path — see [`FS_MAP_REGION`]) exists **only on [`host_fs_mmap`]**.
@@ -214,27 +215,9 @@ impl HostFsState {
         self.crash.as_ref().is_some_and(|c| c.crashed)
     }
 
-    /// The granted directory every path resolves beneath (#2643), opened by the first path op and
-    /// held from then on: the grant names that directory wherever the host later moves it. A root
-    /// that can't be opened yet fails the op with the `-errno` the open got, and the next op tries
-    /// again.
-    ///
-    /// Each op resolves its path beneath it with cap-std, the resolver Wasmtime's preopens use.
-    /// `read_path` has already refused absolute paths and `..`; cap-std refuses a symlink that would
-    /// lead out, `-EACCES` alike. The op then acts on what was resolved (on Windows, five of them
-    /// through `win`), so a link the host makes in the tree mid-op can't redirect it.
+    /// The granted directory every path resolves beneath ([`open_root`]).
     fn dir(&mut self) -> Result<&Dir, i64> {
-        let open = match self.dir.take() {
-            Some(open) => open,
-            None => {
-                let held = Descriptor::take()?;
-                match Dir::open_ambient_dir(&self.root, cap_std::ambient_authority()) {
-                    Ok(dir) => (dir, held),
-                    Err(e) => return Err(io_errno(&e)),
-                }
-            }
-        };
-        Ok(&self.dir.insert(open).0)
+        open_root(&mut self.dir, &self.root)
     }
 
     /// The guest's path at window `(p, l)`, and the granted directory to resolve it beneath.
@@ -682,9 +665,158 @@ impl HostFsState {
                 self.shrink_tables(TABLE_ENTRY + listing_cost(&names));
                 0
             }
+            FS_REPLACE => {
+                let path = match read_path(mem.as_deref(), a(0), a(1)) {
+                    Ok(p) => p,
+                    Err(e) => return e,
+                };
+                let (buf, len) = (a(2), a(3));
+                if buf < 0 || len < 0 {
+                    return EINVAL;
+                }
+                let Some(bytes) = mem
+                    .as_deref()
+                    .and_then(|m| m.read_bytes(buf as u64, len as u64))
+                else {
+                    return EFAULT;
+                };
+                if self.crash_frozen() {
+                    return 0; // power-loss: nothing reaches the disk
+                }
+                let root = match open_root(&mut self.dir, &self.root) {
+                    Ok(root) => root,
+                    Err(e) => return e,
+                };
+                match replace(root, &path, &bytes, &mut self.crash) {
+                    Ok(()) => 0,
+                    Err(e) => io_errno(&e),
+                }
+            }
             _ => EINVAL,
         }
     }
+}
+
+/// The granted directory every path resolves beneath (#2643), opened by the first path op into
+/// `dir` and held there from then on: the grant names that directory wherever the host later moves
+/// `root`. A root that can't be opened yet fails the op with the `-errno` the open got, and the
+/// next op tries again.
+///
+/// Each op resolves its path beneath it with cap-std, the resolver Wasmtime's preopens use.
+/// `read_path` has already refused absolute paths and `..`; cap-std refuses a symlink that would
+/// lead out, `-EACCES` alike. The op then acts on what was resolved (on Windows, five of them
+/// through `win`), so a link the host makes in the tree mid-op can't redirect it.
+fn open_root<'a>(dir: &'a mut Option<(Dir, Descriptor)>, root: &Path) -> Result<&'a Dir, i64> {
+    let open = match dir.take() {
+        Some(open) => open,
+        None => {
+            let held = Descriptor::take()?;
+            match Dir::open_ambient_dir(root, cap_std::ambient_authority()) {
+                Ok(opened) => (opened, held),
+                Err(e) => return Err(io_errno(&e)),
+            }
+        }
+    };
+    Ok(&dir.insert(open).0)
+}
+
+/// #2510 — [`FS_REPLACE`]: `path` beneath `root` holds exactly `bytes`, atomically and durably,
+/// with the target's protection. `crash` counts the op's three crash points (`*_crashy`).
+///
+/// The bytes go to a temporary file in the target's directory, which takes the target's protection
+/// once written (writing clears set-user-ID bits) and is then synced and renamed over the target.
+/// Until the rename, an error removes it (`os::Temp` does as it is dropped).
+fn replace(
+    root: &Dir,
+    path: &str,
+    bytes: &[u8],
+    crash: &mut Option<CrashCtl>,
+) -> std::io::Result<()> {
+    let mut crashed = || crash.as_mut().is_some_and(CrashCtl::barrier);
+    let (dir, name) = replace_target(root, path)?;
+    let target = os::target(&dir, &name)?;
+    let mut temp = os::Temp::create(&dir, &temp_name(&name), target.as_ref())?;
+    temp.file.write_all(bytes)?;
+    if let Some(target) = &target {
+        temp.protect(target)?;
+    }
+    // A crash at the temporary file's sync, or at the rename, leaves the old file, and the
+    // temporary file as far as it got for the next replace to remove.
+    if crashed() {
+        temp.keep();
+        return Ok(());
+    }
+    temp.sync()?;
+    if crashed() {
+        temp.keep();
+        return Ok(());
+    }
+    temp.rename_over(&name)?;
+    if crashed() {
+        return Ok(()); // the directory's sync: the rename stands
+    }
+    temp.sync_dir()
+}
+
+/// R2 (#2510) — where [`FS_REPLACE`] writes for the guest's `path`: the directory beneath `root`
+/// that holds the file, open, and the file's name there. A symlink is followed, beneath `root` as
+/// every path's links are (#2643): the file it leads to is replaced and the link kept, and a
+/// dangling one leads to the file the replace creates. Past 40 links, `-ELOOP`, as Linux counts.
+fn replace_target(root: &Dir, path: &str) -> std::io::Result<(Dir, String)> {
+    let mut path = path.to_owned();
+    for _ in 0..=40 {
+        let (parent, name) = path
+            .rsplit_once(std::path::is_separator)
+            .unwrap_or(("", &path));
+        if matches!(name, "" | "." | "..") {
+            root.open_dir(&path)?; // a directory, if it names anything
+            return Err(refuse(EISDIR));
+        }
+        let dir = root.open_dir(if parent.is_empty() { "." } else { parent })?;
+        match dir.symlink_metadata(name) {
+            Ok(md) if md.file_type().is_symlink() => {
+                // cap-std refuses an absolute link, -EACCES, as a path that leads out.
+                let link = dir.read_link(name)?;
+                let link = link.to_str().ok_or(std::io::ErrorKind::InvalidInput)?;
+                path = match parent {
+                    "" => link.to_owned(),
+                    _ => format!("{parent}/{link}"),
+                };
+            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => return Ok((dir, name.to_owned())),
+        }
+    }
+    Err(refuse(ELOOP))
+}
+
+/// The name of [`FS_REPLACE`]'s temporary file for the file `name`: [`REPLACE_TEMP`] and the
+/// name's 64-bit FNV-1a hash in hex. Each file has its own, so a crash's leftover is the next
+/// replace's to remove, and any name's fits in a name.
+fn temp_name(name: &str) -> String {
+    let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("{REPLACE_TEMP}{hash:016x}")
+}
+
+/// A protocol `-errno` carried in an `io::Error`, for a refusal of `host_fs`'s own that no
+/// `io::ErrorKind` names exactly: `TooManyLinks` is `EMLINK` on Unix, but cap-std's symlink loop
+/// on Windows.
+#[derive(Debug)]
+struct Errno(i64);
+
+impl std::fmt::Display for Errno {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "errno {}", -self.0)
+    }
+}
+
+impl std::error::Error for Errno {}
+
+/// A refusal of `host_fs`'s own, which [`io_errno`] returns as `errno`.
+fn refuse(errno: i64) -> std::io::Error {
+    std::io::Error::other(Errno(errno))
 }
 
 // #2643 — the last step of five path ops, once cap-std has resolved the path beneath the root. Off
@@ -721,6 +853,15 @@ fn names(
 mod win;
 #[cfg(windows)]
 use win::{mkdir, names, rename, rmdir, unlink};
+
+// #2510 — `replace`'s steps on the target's directory: `unix` acts on descriptors, `win` on
+// handles.
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+use unix as os;
+#[cfg(windows)]
+use win as os;
 
 /// Fill a [`StatBuf`] from real-fs metadata. On unix the `st_*` fields come straight from the
 /// `stat(2)` the OS already did; elsewhere the portable `Metadata` fills type + size and the rest
@@ -765,6 +906,9 @@ fn host_stat_bytes(md: &cap_std::fs::Metadata) -> [u8; STATBUF_LEN] {
 /// canonical value on Linux, the differential's reference host) for kinds without a fixed mapping.
 pub(crate) fn io_errno(e: &std::io::Error) -> i64 {
     use std::io::ErrorKind;
+    if let Some(Errno(errno)) = e.get_ref().and_then(|inner| inner.downcast_ref()) {
+        return *errno;
+    }
     match e.kind() {
         ErrorKind::NotFound => ENOENT,
         ErrorKind::PermissionDenied => EACCES,
@@ -842,9 +986,10 @@ mod tests {
             .unwrap()[0]
     }
 
-    /// Put `s` in `win` at `at`: the `(ptr, len)` a guest passes for a path.
-    fn put(win: &mut [u8], at: usize, s: &str) -> (i64, i64) {
-        win[at..at + s.len()].copy_from_slice(s.as_bytes());
+    /// Put `s` in `win` at `at`: the `(ptr, len)` a guest passes for a path or a buffer.
+    fn put(win: &mut [u8], at: usize, s: impl AsRef<[u8]>) -> (i64, i64) {
+        let s = s.as_ref();
+        win[at..at + s.len()].copy_from_slice(s);
         (at as i64, s.len() as i64)
     }
 
@@ -1557,6 +1702,494 @@ mod tests {
             before,
             "nothing outside the root changed"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // #2510 — `replace`. A test puts its path at `PATH` in the window, and the bytes at `BYTES`.
+    const PATH: usize = 0;
+    const BYTES: usize = 4096;
+
+    /// `replace` the file `path` with `bytes`, as a guest does.
+    fn replace_with(host: &mut Host, h: i32, win: &mut [u8], path: &str, bytes: &[u8]) -> i64 {
+        let (p, l) = put(win, PATH, path);
+        let (b, n) = put(win, BYTES, bytes);
+        call(host, h, win, FS_REPLACE, &[p, l, b, n])
+    }
+
+    /// The bytes of the file `path`, read as a guest reads them, or the `-errno` of the open.
+    fn read_back(host: &mut Host, h: i32, win: &mut [u8], path: &str) -> Result<Vec<u8>, i64> {
+        let (p, l) = put(win, PATH, path);
+        let fd = call(host, h, win, FS_OPEN, &[p, l, O_READ, 0]);
+        if fd < 0 {
+            return Err(fd);
+        }
+        let bytes = drain(host, h, win, fd);
+        assert_eq!(call(host, h, win, FS_CLOSE, &[fd, 0, 0, 0]), 0);
+        Ok(bytes)
+    }
+
+    /// What is left to read from the open file `fd`.
+    fn drain(host: &mut Host, h: i32, win: &mut [u8], fd: i64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        loop {
+            let n = call(host, h, win, FS_READ, &[fd, BYTES as i64, 4096, 0]);
+            assert!(n >= 0, "read: {n}");
+            if n == 0 {
+                return bytes;
+            }
+            bytes.extend_from_slice(&win[BYTES..BYTES + n as usize]);
+        }
+    }
+
+    /// The names of the `replace` temporary files in `dir`.
+    fn temps(dir: &Path) -> Vec<String> {
+        listing(dir)
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| name.starts_with(REPLACE_TEMP))
+            .collect()
+    }
+
+    /// #2510 — `replace` behaves alike on both backends. It makes a missing file and replaces an
+    /// existing one with exactly the bytes given; a descriptor open on the old bytes keeps them;
+    /// and it refuses a directory, a path out of the root and a bad buffer. `host_fs` leaves no
+    /// temporary file behind.
+    #[test]
+    fn replace_parity_mem_vs_host() {
+        fn script(host: &mut Host, h: i32, win: &mut [u8]) -> Vec<String> {
+            let text = |read: Result<Vec<u8>, i64>| match read {
+                Ok(bytes) => String::from_utf8(bytes).unwrap(),
+                Err(e) => format!("errno {e}"),
+            };
+            let mut seen = vec![];
+            seen.push(format!("make: {}", replace_with(host, h, win, "f", b"one")));
+            seen.push(format!("made: {}", text(read_back(host, h, win, "f"))));
+            let (p, l) = put(win, PATH, "f");
+            let old = call(host, h, win, FS_OPEN, &[p, l, O_READ, 0]);
+            seen.push(format!(
+                "replace: {}",
+                replace_with(host, h, win, "f", b"two!")
+            ));
+            seen.push(format!("replaced: {}", text(read_back(host, h, win, "f"))));
+            seen.push(format!(
+                "old descriptor: {}",
+                text(Ok(drain(host, h, win, old)))
+            ));
+            call(host, h, win, FS_CLOSE, &[old, 0, 0, 0]);
+            let (p, l) = put(win, PATH, "d");
+            seen.push(format!(
+                "mkdir: {}",
+                call(host, h, win, FS_MKDIR, &[p, l, 0, 0])
+            ));
+            seen.push(format!("in it: {}", replace_with(host, h, win, "d/g", b"")));
+            seen.push(format!(
+                "made empty: {}",
+                text(read_back(host, h, win, "d/g"))
+            ));
+            seen.push(format!(
+                "a directory: {}",
+                replace_with(host, h, win, "d", b"x")
+            ));
+            seen.push(format!(
+                "the root: {}",
+                replace_with(host, h, win, ".", b"x")
+            ));
+            seen.push(format!("out: {}", replace_with(host, h, win, "../x", b"x")));
+            let (p, l) = put(win, PATH, "f");
+            let negative = call(host, h, win, FS_REPLACE, &[p, l, -1, 1]);
+            seen.push(format!("negative: {negative}"));
+            let past = call(host, h, win, FS_REPLACE, &[p, l, BYTES as i64, 1 << 40]);
+            seen.push(format!("past the window: {past}"));
+            seen.push(format!("kept: {}", text(read_back(host, h, win, "f"))));
+            seen
+        }
+        let expected = [
+            "make: 0".to_string(),
+            "made: one".into(),
+            "replace: 0".into(),
+            "replaced: two!".into(),
+            "old descriptor: one".into(),
+            "mkdir: 0".into(),
+            "in it: 0".into(),
+            "made empty: ".into(),
+            format!("a directory: {EISDIR}"),
+            format!("the root: {EISDIR}"),
+            format!("out: {EACCES}"),
+            format!("negative: {EINVAL}"),
+            format!("past the window: {EFAULT}"),
+            "kept: two!".into(),
+        ];
+
+        let mut win = vec![0u8; 1 << 16];
+        let mut host = Host::new();
+        let h = (mem_fs().grant)(&mut host, 0);
+        assert_eq!(script(&mut host, h, &mut win), expected, "mem_fs");
+
+        let (base, root, _) = link_fixture("replace_parity");
+        let mut host = Host::new();
+        let h = (host_fs(root.clone()).grant)(&mut host, 0);
+        assert_eq!(script(&mut host, h, &mut win), expected, "host_fs");
+        assert_eq!(temps(&root), Vec::<String>::new());
+        assert_eq!(temps(&root.join("d")), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// What the host protects `path` with, as a test compares it: on Unix its mode, owner, group
+    /// and an extended attribute; on Windows its DACL, as `icacls` lists it, and its attributes.
+    #[cfg(unix)]
+    fn protection(path: &Path) -> (u32, u32, u32, Option<Vec<u8>>) {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(path).unwrap();
+        (md.mode() & 0o7777, md.uid(), md.gid(), get_xattr(path))
+    }
+    #[cfg(windows)]
+    fn protection(path: &Path) -> (String, u32) {
+        use std::os::windows::fs::MetadataExt;
+        let out = std::process::Command::new("icacls")
+            .arg(path)
+            .output()
+            .unwrap();
+        // The listing names the file on its first line, which this leaves out.
+        let acl = String::from_utf8_lossy(&out.stdout).replace(&*path.to_string_lossy(), "");
+        let attributes = std::fs::metadata(path).unwrap().file_attributes();
+        (acl, attributes & 0x2) // FILE_ATTRIBUTE_HIDDEN
+    }
+
+    /// The extended attribute these tests set: `None` where the filesystem has none.
+    #[cfg(unix)]
+    const XATTR: &str = if cfg!(target_vendor = "apple") {
+        "com.temen.kept"
+    } else {
+        "user.temen.kept"
+    };
+
+    /// Set [`XATTR`] on `path`: `false` where the filesystem has no such attributes.
+    #[cfg(unix)]
+    fn set_xattr(path: &Path, value: &[u8]) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = std::ffi::CString::new(XATTR).unwrap();
+        let (v, n) = (value.as_ptr().cast(), value.len());
+        // SAFETY: both strings are NUL-terminated and `value` is `n` bytes, for the call.
+        #[cfg(target_vendor = "apple")]
+        let set = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), v, n, 0, 0) };
+        // SAFETY: as above.
+        #[cfg(not(target_vendor = "apple"))]
+        let set = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), v, n, 0) };
+        if set != 0 {
+            let e = std::io::Error::last_os_error();
+            assert_eq!(e.raw_os_error(), Some(libc::ENOTSUP), "setxattr: {e}");
+        }
+        set == 0
+    }
+
+    /// [`XATTR`]'s value on `path`, if it has one.
+    #[cfg(unix)]
+    fn get_xattr(path: &Path) -> Option<Vec<u8>> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = std::ffi::CString::new(XATTR).unwrap();
+        let mut buf = [0u8; 64];
+        let (v, n) = (buf.as_mut_ptr().cast(), buf.len());
+        // SAFETY: both strings are NUL-terminated and `buf` is `n` bytes, for the call to fill.
+        #[cfg(target_vendor = "apple")]
+        let got = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), v, n, 0, 0) };
+        // SAFETY: as above.
+        #[cfg(not(target_vendor = "apple"))]
+        let got = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), v, n) };
+        usize::try_from(got).ok().map(|len| buf[..len].to_vec())
+    }
+
+    /// #2510 — `replace` keeps what the host protects the file with. On Unix that is its mode
+    /// (set-user-ID bit and all), its owner and group, and its extended attributes, where the
+    /// filesystem has them. On Windows it is its DACL, here with an entry of its own, and its
+    /// attributes, here hidden.
+    #[test]
+    fn replace_keeps_the_hosts_protection() {
+        let (base, root, _) = link_fixture("replace_protection");
+        let f = root.join("f");
+        std::fs::write(&f, "old").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o4750)).unwrap();
+            // As root, a file someone else owns: the replace gives the new file to them.
+            // SAFETY: geteuid reads the process's effective user id.
+            if unsafe { libc::geteuid() } == 0 {
+                std::os::unix::fs::chown(&f, Some(65534), Some(65534)).unwrap();
+            }
+            set_xattr(&f, b"kept");
+        }
+        #[cfg(windows)]
+        {
+            // An entry of its own, read and execute for everyone, beside those it inherits.
+            let run = |cmd: &str, args: &[&str]| {
+                let out = std::process::Command::new(cmd)
+                    .args(args)
+                    .arg(&f)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "{cmd}: {out:?}");
+            };
+            run("icacls", &["/grant", "*S-1-1-0:(RX)"]);
+            run("attrib", &["+h"]);
+        }
+        let before = protection(&f);
+
+        let mut host = Host::new();
+        let h = (host_fs(root.clone()).grant)(&mut host, 0);
+        let mut win = vec![0u8; 1 << 16];
+        assert_eq!(replace_with(&mut host, h, &mut win, "f", b"new"), 0);
+        assert_eq!(std::fs::read(&f).unwrap(), b"new");
+        assert_eq!(protection(&f), before);
+        assert_eq!(temps(&root), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #2510 — a file `replace` makes is made as `open` with `O_CREATE` makes one, with the host's
+    /// defaults.
+    #[test]
+    fn replace_makes_a_missing_file_as_open_does() {
+        let (base, root, _) = link_fixture("replace_make");
+        let mut host = Host::new();
+        let h = (host_fs(root.clone()).grant)(&mut host, 0);
+        let mut win = vec![0u8; 1 << 16];
+        let (p, l) = put(&mut win, PATH, "opened");
+        let fd = call(
+            &mut host,
+            h,
+            &mut win,
+            FS_OPEN,
+            &[p, l, O_CREATE | O_WRITE, 0],
+        );
+        assert_eq!(call(&mut host, h, &mut win, FS_CLOSE, &[fd, 0, 0, 0]), 0);
+        assert_eq!(replace_with(&mut host, h, &mut win, "made", b"new"), 0);
+        assert_eq!(std::fs::read(root.join("made")).unwrap(), b"new");
+        assert_eq!(
+            protection(&root.join("made")),
+            protection(&root.join("opened"))
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Run `f` as a process the host's protection binds: as root on Linux, with the file-system
+    /// ids of `nobody`, which drops the privilege to ignore a file's mode.
+    fn unprivileged<T>(f: impl FnOnce() -> T) -> T {
+        #[cfg(target_os = "linux")]
+        // SAFETY: geteuid reads the process's effective user id.
+        if unsafe { libc::geteuid() } == 0 {
+            // SAFETY: setfsuid sets this thread's file-system user id, which is set back below.
+            unsafe { libc::setfsuid(65534) };
+            let out = f();
+            // SAFETY: as above.
+            unsafe { libc::setfsuid(0) };
+            return out;
+        }
+        f()
+    }
+
+    /// Make the temporary file `replace` would make for `name` in `dir`, and hold it as a replace
+    /// in progress does: locked on Unix, open without sharing deletes on Windows.
+    fn hold_temp(dir: &Path, name: &str) -> std::fs::File {
+        let path = dir.join(temp_name(name));
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let file = std::fs::File::create(&path).unwrap();
+            // SAFETY: the descriptor is open for the call.
+            let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            assert_eq!(locked, 0);
+            file
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .share_mode(0x1 | 0x2) // FILE_SHARE_READ | FILE_SHARE_WRITE
+                .open(&path)
+                .unwrap()
+        }
+    }
+
+    /// #2510 — `replace` refuses what it may not replace, and changes nothing: a file the host
+    /// marks read-only for the process (`-EACCES`), a file with another hard link (R1,
+    /// `-EMLINK`), and a file another replace is replacing (`-EBUSY`). Once that one is done, or
+    /// a crash ended it, its temporary file is a leftover, which the next replace removes.
+    #[test]
+    fn replace_refuses_what_it_may_not_replace() {
+        let (base, root, _) = link_fixture("replace_refusals");
+        let mut host = Host::new();
+        let h = (host_fs(root.clone()).grant)(&mut host, 0);
+        let mut win = vec![0u8; 1 << 16];
+
+        std::fs::write(root.join("a"), "linked").unwrap();
+        std::fs::hard_link(root.join("a"), root.join("b")).unwrap();
+        assert_eq!(replace_with(&mut host, h, &mut win, "a", b"new"), EMLINK);
+        assert_eq!(std::fs::read(root.join("b")).unwrap(), b"linked");
+
+        let ro = root.join("ro");
+        std::fs::write(&ro, "ro").unwrap();
+        // The directory is anyone's to write in, so it is the file's own mode that refuses.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        let mut read_only = std::fs::metadata(&ro).unwrap().permissions();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(&ro, read_only.clone()).unwrap();
+        let refused = unprivileged(|| replace_with(&mut host, h, &mut win, "ro", b"new"));
+        assert_eq!(refused, EACCES);
+        assert_eq!(std::fs::read(&ro).unwrap(), b"ro");
+        #[allow(clippy::permissions_set_readonly_false)]
+        read_only.set_readonly(false); // so it can be removed on Windows
+        std::fs::set_permissions(&ro, read_only).unwrap();
+
+        std::fs::write(root.join("f"), "old").unwrap();
+        let held = hold_temp(&root, "f");
+        assert_eq!(replace_with(&mut host, h, &mut win, "f", b"new"), EBUSY);
+        assert_eq!(std::fs::read(root.join("f")).unwrap(), b"old");
+        drop(held);
+        assert_eq!(temps(&root).len(), 1, "the other replace's temporary file");
+        assert_eq!(replace_with(&mut host, h, &mut win, "f", b"new"), 0);
+        assert_eq!(std::fs::read(root.join("f")).unwrap(), b"new");
+        assert_eq!(temps(&root), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #2510 — a crash at each of `replace`'s three barriers leaves the old bytes or the new, on
+    /// both backends alike: the old at the temporary file's sync and at the rename, the new at
+    /// the directory's sync. What a crash leaves of `host_fs`'s temporary file, the next replace
+    /// of the file removes.
+    #[test]
+    fn a_crash_at_each_step_of_replace_leaves_the_old_bytes_or_the_new() {
+        let (base, root, _) = link_fixture("replace_crash");
+        let f = root.join("f");
+        let mut win = vec![0u8; 1 << 16];
+        for (n, want) in ["old", "old", "new", "new"].into_iter().enumerate() {
+            let mut host = Host::new();
+            let h = (mem_fs_crashy().grant)(&mut host, 0);
+            assert_eq!(replace_with(&mut host, h, &mut win, "f", b"old"), 0);
+            assert_eq!(
+                call(&mut host, h, &mut win, FS_CRASH_ARM, &[n as i64, 0, 0, 0]),
+                0
+            );
+            assert_eq!(replace_with(&mut host, h, &mut win, "f", b"new"), 0);
+            let read = read_back(&mut host, h, &mut win, "f");
+            assert_eq!(read, Ok(want.into()), "mem_fs, a crash at barrier {n}");
+
+            std::fs::write(&f, "old").unwrap();
+            let mut host = Host::new();
+            let h = (host_fs_crashy(root.clone()).grant)(&mut host, 0);
+            assert_eq!(
+                call(&mut host, h, &mut win, FS_CRASH_ARM, &[n as i64, 0, 0, 0]),
+                0
+            );
+            assert_eq!(replace_with(&mut host, h, &mut win, "f", b"new"), 0);
+            let read = std::fs::read_to_string(&f).unwrap();
+            assert_eq!(read, want, "host_fs, a crash at barrier {n}");
+            if n == 1 {
+                assert_eq!(
+                    temps(&root).len(),
+                    1,
+                    "a crash at the rename leaves the file"
+                );
+            }
+            // A grant after the crash, as after a restart.
+            let mut host = Host::new();
+            let h = (host_fs(root.clone()).grant)(&mut host, 0);
+            assert_eq!(replace_with(&mut host, h, &mut win, "f", b"after"), 0);
+            assert_eq!(std::fs::read_to_string(&f).unwrap(), "after");
+            assert_eq!(temps(&root), Vec::<String>::new());
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #2510 — a reader racing `replace` sees the old bytes or the new, never part of either.
+    #[test]
+    fn a_reader_racing_replace_sees_the_old_bytes_or_the_new() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let (base, root, _) = link_fixture("replace_race");
+        let (a, b) = (vec![b'a'; 24 << 10], vec![b'b'; 40 << 10]);
+        let f = root.join("f");
+        std::fs::write(&f, &a).unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (f, a, b, stop) = (f.clone(), a.clone(), b.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut reads = 0u64;
+                while !stop.load(Relaxed) {
+                    let got = std::fs::read(&f).unwrap();
+                    assert!(got == a || got == b, "a read of {} bytes", got.len());
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        let mut host = Host::new();
+        let h = (host_fs(root.clone()).grant)(&mut host, 0);
+        let mut win = vec![0u8; 1 << 17];
+        for i in 0..200 {
+            let next = if i % 2 == 0 { &b } else { &a };
+            assert_eq!(replace_with(&mut host, h, &mut win, "f", next), 0);
+        }
+        stop.store(true, Relaxed);
+        assert!(reader.join().unwrap() > 0, "the reader read");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #2510 R2 — `replace` through a symlink beneath the root replaces the file it leads to and
+    /// keeps the link, and a dangling one leads to the file the replace makes. A link out of the
+    /// root is `-EACCES`, as it is for every op (#2643), a link to a directory `-EISDIR`, and a
+    /// loop `-ELOOP`.
+    #[cfg(unix)]
+    #[test]
+    fn replace_through_a_link_replaces_what_it_leads_to() {
+        use std::os::unix::fs::symlink;
+        let (base, root, outside) = link_fixture("replace_links");
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/f"), "old").unwrap();
+        for (link, to) in [
+            ("l", "sub/f"),
+            ("chain", "l"),
+            ("sub/up", "../l"),
+            ("dangling", "sub/new"),
+            ("out", "../outside/secret"),
+            ("dir", "sub"),
+            ("x", "y"),
+            ("y", "x"),
+        ] {
+            symlink(to, root.join(link)).unwrap();
+        }
+        symlink(outside.join("secret"), root.join("abs")).unwrap();
+        let mut host = Host::new();
+        let h = (host_fs(root.clone()).grant)(&mut host, 0);
+        let mut win = vec![0u8; 1 << 16];
+        for via in ["l", "chain", "sub/up"] {
+            assert_eq!(replace_with(&mut host, h, &mut win, via, via.as_bytes()), 0);
+            assert_eq!(std::fs::read(root.join("sub/f")).unwrap(), via.as_bytes());
+        }
+        assert_eq!(replace_with(&mut host, h, &mut win, "dangling", b"made"), 0);
+        assert_eq!(std::fs::read(root.join("sub/new")).unwrap(), b"made");
+        for link in ["l", "chain", "sub/up", "dangling"] {
+            let md = std::fs::symlink_metadata(root.join(link)).unwrap();
+            assert!(md.file_type().is_symlink(), "{link} is still a link");
+        }
+        assert_eq!(replace_with(&mut host, h, &mut win, "out", b"x"), EACCES);
+        assert_eq!(replace_with(&mut host, h, &mut win, "abs", b"x"), EACCES);
+        assert_eq!(replace_with(&mut host, h, &mut win, "dir", b"x"), EISDIR);
+        assert_eq!(replace_with(&mut host, h, &mut win, "x", b"x"), ELOOP);
+        assert_eq!(
+            listing(&outside),
+            [
+                ("d".into(), String::new()),
+                ("secret".into(), "SECRET".into())
+            ]
+        );
+        assert_eq!(temps(&root), Vec::<String>::new());
+        assert_eq!(temps(&root.join("sub")), Vec::<String>::new());
         let _ = std::fs::remove_dir_all(&base);
     }
 }
