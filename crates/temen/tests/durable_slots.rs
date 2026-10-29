@@ -178,6 +178,38 @@ block 0 (v0: i32) {
 }
 "#;
 
+/// The `Instantiator` every run's host grants, second: slot 1's first handle.
+const INSTANTIATOR: i32 = temen_ir::handles::pack(1, 1);
+
+/// #2043 — the root spawns B and detaches it (`Instantiator.detach`), spawns A, which reissues B's
+/// slot at generation 2, and resumes a fiber: the safepoint the trigger freezes it at. Then it joins
+/// B's old handle, which is spent, and A. Returns `(status + 100) * 1000 + join(A)`.
+const DETACHED_THREAD: &str = r#"
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 65536
+  i32.store v1 v0
+  z = i64.const 0
+  t = thread.spawn 2 z z
+  vi = i32.const INST
+  d = call.cap 6 10 (i32) -> (i32) vi (t)
+  a = thread.spawn 1 z z
+  f0 = ref.func 3
+  f1 = i64.const 4096
+  f2 = cont.new f0 f1
+  f3, f4 = cont.resume f2 z
+  s, x = thread.join t
+  sa, ja = thread.join a
+  k100 = i64.const 100
+  s1 = i64.add s k100
+  k1000 = i64.const 1000
+  s2 = i64.mul s1 k1000
+  r = i64.add s2 ja
+  return r
+  }
+}
+"#;
+
 /// f (func 1): suspend its argument, then return what the next resume sends + 1. g (func 2): suspend
 /// twice. The root runs k0 = f to completion (freeing slot 0), creates k1 = f and leaves it fresh,
 /// and resumes k2 = g — the safepoint the trigger freezes at. After the cut it runs k1, then creates
@@ -490,6 +522,8 @@ fn run(
     h.set_durable(true);
     h.clock_ns = clock;
     let clk = h.grant_clock();
+    // Granted second, so its handle is [`INSTANTIATOR`]: what [`DETACHED_THREAD`] detaches through.
+    assert_eq!(h.grant_instantiator(), INSTANTIATOR);
     if let (Engine::Interp | Engine::Bytecode, Some(r)) = (engine, seed) {
         h.set_frozen_vcpus(r.vcpus.clone());
         h.set_frozen_fibers(r.fibers.clone());
@@ -776,6 +810,41 @@ fn a_spent_handle_stays_spent_and_the_next_spawn_matches_across_the_cut() {
             "{engine:?}: residue"
         );
         assert_eq!(r.residue.children, [1, 1, 1], "{engine:?}: the child table");
+    }
+}
+
+/// #2043 — a thread its spawner detached, whose slot it then reissued, rides the freeze with no
+/// handle naming it: at slot 0, unjoinable, beside the slot's new holder, which rides completed there.
+/// The thaw re-creates it unjoinable, so its old handle still answers `-EBADF` and the new one names
+/// A, as uninterrupted.
+#[test]
+fn a_detached_thread_rides_with_no_handle_naming_it() {
+    let src = format!(
+        "{}{THREADS}",
+        DETACHED_THREAD.replace("INST", &INSTANTIATOR.to_string())
+    );
+    let want = (temen_ir::errno::EBADF + 100) * 1000 + 107;
+    let inst = instrument(&src);
+    for &engine in ARMED_ENGINES {
+        let fresh = init_durable_window(WINDOW, arena(&inst));
+        if let Some(whole) = run(engine, &inst, &fresh, 42, None) {
+            assert_eq!(whole.result, Ok(want), "{engine:?}: uninterrupted");
+        }
+    }
+    for (engine, r) in freeze_thaw(ARMED_ENGINES, &src, |w| arm_freeze_after(w, TEST_ARENA, 1)) {
+        let mut vcpus: Vec<_> = r
+            .residue
+            .vcpus
+            .iter()
+            .map(|v| (v.task, v.slot, v.joinable, v.completed_result))
+            .collect();
+        vcpus.sort();
+        assert_eq!(
+            vcpus,
+            [(1, 0, false, None), (2, 0, true, Some(107))],
+            "{engine:?}: residue"
+        );
+        assert_eq!(r.residue.children, [2], "{engine:?}: the child table");
     }
 }
 
