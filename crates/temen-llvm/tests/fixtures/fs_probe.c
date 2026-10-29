@@ -2,11 +2,13 @@
  * embedder-granted capability by name (`__vm_cap_resolve`, §7 self.resolve) and drive the whole
  * op protocol through `__vm_host_call` (§7 host-defined capability, the wasm-import analogue) —
  * open/write/close, reopen/seek/read-back, rename, append, remove, truncate (shrink-discard /
- * grow-zero-fill / read-only refusal), sync, and the attenuation refusals (`..`/absolute paths).
- * Exit 0 iff every step behaved; any failure returns its step number.
+ * grow-zero-fill / read-only refusal), sync, replace, and the attenuation refusals (`..`/absolute
+ * paths). Exit 0 iff every step behaved; any failure returns its step number.
  *
- * The committed `fs_probe.bc` is this file compiled with `clang -O2 -emit-llvm -c` (regenerate the
- * same way after editing).
+ * The committed `fs_probe.ll` is this file compiled with clang 18, from the repository root:
+ * `clang -O2 -emit-llvm -c crates/temen-llvm/tests/fixtures/fs_probe.c -o fs_probe.bc`, then
+ * `llvm-dis fs_probe.bc -o crates/temen-llvm/tests/fixtures/fs_probe.ll` (regenerate the same way
+ * after editing).
  *
  * Phase B (host-fs verification) is keyed on a `seed.txt` the embedder may pre-place in the granted
  * root: when present, its content is verified and an `out.txt` is written AND LEFT BEHIND, so the
@@ -17,7 +19,8 @@ extern int __vm_cap_resolve(const char *name, long len);
 extern long __vm_host_call(int h, int op, long a, long b, long c, long d);
 int printf(const char *, ...);
 
-enum { OPEN = 0, READ = 1, WRITE = 2, SEEK = 3, CLOSE = 4, REMOVE = 5, RENAME = 6, TRUNCATE = 7, SYNC = 8 };
+enum { OPEN = 0, READ = 1, WRITE = 2, SEEK = 3, CLOSE = 4, REMOVE = 5, RENAME = 6, TRUNCATE = 7, SYNC = 8,
+       REPLACE = 20 };
 enum { O_READ = 1, O_WRITE = 2, O_APPEND = 4, O_TRUNC = 8, O_CREATE = 16 };
 
 static int fs;
@@ -85,6 +88,23 @@ int main(void) {
   if (hc(TRUNCATE, fd, 0, 0, 0) >= 0) return 45; /* read-only fd refuses truncate */
   if (hc(CLOSE, fd, 0, 0, 0) != 0) return 46;
   if (hc(REMOVE, (long)"trunc.txt", 9, 0, 0) != 0) return 47;
+
+  /* replace (#2510): the file holds exactly the new bytes, a descriptor open on the old bytes
+   * keeps them, and a directory is refused (-EISDIR) */
+  fd = hc(OPEN, (long)"rep.txt", 7, O_WRITE | O_CREATE | O_TRUNC, 0);
+  if (fd < 0) return 48;
+  if (hc(WRITE, fd, (long)"old!", 4, 0) != 4) return 49;
+  if (hc(CLOSE, fd, 0, 0, 0) != 0) return 50;
+  long old = hc(OPEN, (long)"rep.txt", 7, O_READ, 0);
+  if (old < 0) return 51;
+  if (hc(REPLACE, (long)"rep.txt", 7, (long)"brand new", 9) != 0) return 52;
+  fd = hc(OPEN, (long)"rep.txt", 7, O_READ, 0);
+  if (hc(READ, fd, (long)buf, 16, 0) != 9 || buf[0] != 'b' || buf[8] != 'w') return 53;
+  if (hc(CLOSE, fd, 0, 0, 0) != 0) return 54;
+  if (hc(READ, old, (long)buf, 16, 0) != 4 || buf[0] != 'o' || buf[3] != '!') return 55;
+  if (hc(CLOSE, old, 0, 0, 0) != 0) return 56;
+  if (hc(REPLACE, (long)".", 1, (long)"x", 1) != -21) return 57;
+  if (hc(REMOVE, (long)"rep.txt", 7, 0, 0) != 0) return 58;
 
   /* attenuation: `..` and absolute paths are refused by protocol, on every backend */
   if (hc(OPEN, (long)"../escape", 9, O_WRITE | O_CREATE, 0) >= 0) return 25;
