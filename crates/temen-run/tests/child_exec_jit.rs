@@ -759,8 +759,10 @@ fn a_grandchild_is_gated_on_the_roots_lane_on_the_jit() {
     let p = module(&root_spins_beside_grandchild());
     let c = module(&grandchild_spins());
     let g = temen_ir::child_image_at(&c, 1).expect("the grandchild's image");
-    assert_eq!(run_interp(&p, &c, &g, 1), 7, "the oracle");
+    // The child returns its grandchild's handle (its table's first, #2043) + 7.
+    let want = i64::from(temen_ir::handles::pack(0, 1)) + 7;
+    assert_eq!(run_interp(&p, &c, &g, 1), want, "the oracle");
     for run in 0..3 {
-        assert_eq!(run_jit(&p, &c, &g, 1), 7, "run {run}: no overlap");
+        assert_eq!(run_jit(&p, &c, &g, 1), want, "run {run}: no overlap");
     }
 }

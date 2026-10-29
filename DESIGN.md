@@ -888,7 +888,8 @@ tag at a *fixed* offset, index at the bottom, an optional generation between:
 | **data pointer** | i64 | — | window offset (≤ `reserved_log2` < 56) | none — masking already strips high bits (the `gc.roots` top-byte mask, §21) |
 | **funcref** | i64 | — | function-table index | none — no generation; `call.dyn` masks `& (len-1)` |
 | **import/cap handle** | **i32** | 21 bits | 10-bit slot (`CAP_LOG2`); bit 31 clear, so a handle is never negative or a grant tag (#2365) | none — the handle lives in the low 32 bits of a 64-bit tagged cell; `call.cap` truncates to `i32`, dropping the top byte |
-| **fiber/thread handle** | i64 | **32 bits** (was 40) | 24-bit slot (`MAX_FIBERS=1<<24`) | generation trimmed 40→32 to vacate the top byte |
+| **fiber handle** | i64 | **32 bits** (was 40) | 24-bit slot (`MAX_FIBERS=1<<24`) | generation trimmed 40→32 to vacate the top byte |
+| **thread / §14 child handle** | **i32** | 21 bits | 10-bit slot of the domain's one child table (`temen_ir::handles`), packed as a cap handle is (#2043) | none — as a cap handle |
 
 Three properties make this coherent rather than four ad-hoc conventions:
 
@@ -1899,6 +1900,17 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
   detached. Only a handle that names no slot, or carries a generation its slot never issued,
   is forged and traps. A joined thread's own trap stays its domain's (INVARIANTS #6); a
   child domain's is a value (#2066).
+- **One child table per domain (#2043).** A domain's `thread.spawn` vCPUs and its §14
+  children take their handles from one table its vCPUs share (`temen_ir::handles`), packed
+  as a capability handle is (§3c): a positive `i32`, a 21-bit generation above a 10-bit
+  slot, so the first spawn's handle is `pack(0, 1)` = 1024 and a domain holds 1,024 unjoined
+  children at once. A join or a detach retires the handle, and its slot is reissued at the
+  next generation. Every child op names a handle by the table and acts by what the slot
+  holds: `thread.join` and `Instantiator.join` both join a thread or a child, and deliver as
+  the joined one ends. The joiner that takes a child retires its handle, so the second of two
+  racing joiners reads it spent: a benign race, which INVARIANTS #5 keeps from trapping. A
+  freeze carries every slot's counter (snapshot v53), so a spent handle stays spent across a
+  thaw, and the next spawn takes the handle the uninterrupted run would have (#2619).
 - **Blocking fiber resume (`cont.resume.block`, I48, landed 2026-08-07).** A fiber
   park (§3.6 slice-5a) unwinds `FIBER_PARKED (3)` to the resumer, which polls; a
   guest whose *only* pending work is one parked fiber would busy-spin that poll.

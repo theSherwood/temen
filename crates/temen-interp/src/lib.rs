@@ -2951,10 +2951,14 @@ fn seed_thread(
         }
     };
     let cid = claim_task(s, ff.task);
-    p.children
-        .lock_unpoisoned()
-        .table
-        .pin(ff.slot, Child::thread(cid));
+    // #2043 — a detached thread runs on with no handle naming it, as it did before the freeze.
+    let mut c = p.children.lock_unpoisoned();
+    if ff.joinable {
+        c.table.pin(ff.slot, Child::thread(cid));
+    } else {
+        c.unreaped.push(Child::thread(cid));
+    }
+    drop(c);
     // #1685 — a child that finished unjoined is not re-created: its result waits in the scheduler
     // for the rewound `join`, as it did before the freeze.
     if let Some(r) = ff.completed_result {
@@ -3731,6 +3735,7 @@ fn drive_over_cell(
                     task: task as usize,
                     parent_task: f.parent_task as usize,
                     slot: f.slot,
+                    joinable: true,
                     func: 0,
                     args: Vec::new(),
                     shadow_sp: 0,
@@ -9828,10 +9833,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     if let Some((func, args, slot)) = v.spawn_residue.clone() {
                         // A **spawned** vCPU (slice 3.2.1) records *itself* as residue: its continuation now
                         // lives in its own region (extent = `self_sp`); a thaw re-spawns it there.
+                        let joinable = names_task(&v.children, slot, v.id);
                         v.host.lock_unpoisoned().frozen_vcpus.push(FrozenVCpu {
                             task: v.id as usize,
                             parent_task: v.parent_task as usize,
-                            slot,
+                            slot: if joinable { slot } else { 0 },
+                            joinable,
                             func: func as i32,
                             args,
                             shadow_sp: self_sp,
@@ -9927,7 +9934,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // #1685 — a durable thread that finished cleanly: its result must ride a freeze
                 // until it is joined.
                 let finished_thread = match &v.spawn_residue {
-                    Some((_, _, slot)) if v.durable && !froze && result.is_ok() => {
+                    // Not one its spawner detached: nothing can join it (#2043).
+                    Some((_, _, slot))
+                        if v.durable
+                            && !froze
+                            && result.is_ok()
+                            && names_task(&v.children, *slot, v.id) =>
+                    {
                         Some(FinishedThread {
                             parent_task: v.parent_task,
                             slot: *slot,
@@ -11789,9 +11802,15 @@ pub struct FrozenVCpu {
     /// residue by this, re-attaches parents before children, and rebuilds each parent's join table so a
     /// grandchild's reloaded handle resolves in its *parent's* table, not the root's.
     pub parent_task: usize,
-    /// The child's handle in its spawner's join table (#1685). The thaw re-attaches it there, not by
-    /// push, so a handle joined before the freeze leaves its slot empty instead of shifting the rest.
+    /// The child's slot in its domain's child table (#1685, #2043). The thaw re-attaches it there,
+    /// not by push, so a handle joined before the freeze leaves its slot spent instead of shifting
+    /// the rest. `0` for one no handle names ([`Self::joinable`]).
     pub slot: usize,
+    /// #2043 — whether a handle still names it. A thread its spawner detached (op 10) is not
+    /// joinable: its slot may since have been reissued, so it rides at slot `0`, and the thaw
+    /// re-creates it with no handle naming it. One that finished after the detach does not ride at
+    /// all: nothing can join it.
+    pub joinable: bool,
     /// The child's entry function (the `thread.spawn` target), re-entered on thaw.
     pub func: i32,
     /// The child's spawn args (`[sp, arg]`, the fiber-style thread entry), replayed on re-spawn.
@@ -12674,6 +12693,16 @@ fn name_child(children: &Mutex<Children>, handle: i32) -> Result<Option<(usize, 
         temen_ir::handles::Named::Spent => Ok(None),
         temen_ir::handles::Named::Forged => Err(Trap::ThreadFault),
     }
+}
+
+/// Whether `slot` of `children`'s table still holds task `task`: whether its spawner's handle still
+/// names it (#2043).
+fn names_task(children: &Mutex<Children>, slot: usize, task: TaskId) -> bool {
+    children
+        .lock_unpoisoned()
+        .table
+        .get(slot)
+        .is_some_and(|c| c.task == Some(task))
 }
 
 /// D66 — a reaped §14 child gives its lane back to its domain's Σ. A thread has none. The record is
@@ -22607,15 +22636,21 @@ struct Slot {
 
 /// `log2` of the handle-table capacity: 1,024 live capabilities a domain holds at once, the
 /// POSIX personality's `FD_MAX` (#2365). A handle value packs `(generation, slot)`:
-/// `slot = h & (cap-1)`, `generation = h >> CAP_LOG2`.
-const CAP_LOG2: u32 = 10;
-const CAP: usize = 1 << CAP_LOG2;
+/// `slot = h & (cap-1)`, `generation = h >> CAP_LOG2` — the one layout every handle table has
+/// ([`temen_ir::handles`], which a domain's child table runs on, #2043).
+const CAP_LOG2: u32 = temen_ir::handles::SLOT_BITS;
+const CAP: usize = temen_ir::handles::SLOTS;
 
-/// Bits the packed handle carries for the generation counter: the 31 bits of a **positive** `i32`
-/// minus the `CAP_LOG2` slot bits. Bit 31 stays clear, so a handle is never negative — a guest can
-/// tell it from a `-errno` — and never a grant-record tag ([`GRANT_SERVE_LIVE_TAG`],
-/// [`GRANT_EMPTY`]), both of which set it (#2365). `Slot::generation` is a full `u32`, so it is
-/// compared **masked to these bits** (`GEN_MASK`) — otherwise, once the counter passed
+/// DURABILITY.md §13.3 — the process-wide [`Host::domain_id`] mint (uniqueness is all the
+/// runtime needs; a snapshot records the ids it saw and a thaw re-links by record, so the
+/// counter's absolute values never matter).
+static NEXT_DOMAIN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The generation bits a packed handle carries ([`temen_ir::handles::GEN_BITS`]): the 31 bits of a
+/// **positive** `i32` minus the `CAP_LOG2` slot bits. Bit 31 stays clear, so a handle is never
+/// negative — a guest can tell it from a `-errno` — and never a grant-record tag
+/// ([`GRANT_SERVE_LIVE_TAG`], [`GRANT_EMPTY`]), both of which set it (#2365). `Slot::generation` is
+/// a full `u32`, so it is compared **masked to these bits** — otherwise, once the counter passed
 /// `2^GEN_BITS` regrants of one slot the full-width `generation` could no longer equal the truncated
 /// value carried in any handle, and the slot died permanently (a single-slot, fail-closed DoS —
 /// reachable via a `Jit.compile`→`release` loop). Masking lets the slot recycle cleanly on wrap. ABA
@@ -22623,19 +22658,12 @@ const CAP: usize = 1 << CAP_LOG2;
 /// wrap is still inert — it re-selects one of *this domain's own* current grants, re-checked by
 /// `type_id` at the call (D37) — so this is not an authority escape, only the documented "a forged
 /// index is inert" property.
-const GEN_BITS: u32 = 31 - CAP_LOG2;
-const _: () = assert!(CAP_LOG2 + GEN_BITS == 31);
-/// DURABILITY.md §13.3 — the process-wide [`Host::domain_id`] mint (uniqueness is all the
-/// runtime needs; a snapshot records the ids it saw and a thaw re-links by record, so the
-/// counter's absolute values never matter).
-static NEXT_DOMAIN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-const GEN_MASK: u32 = (1u32 << GEN_BITS) - 1;
+const GEN_MASK: u32 = temen_ir::handles::GEN_MASK;
 
 /// The handle a grant of `slot` at `generation` returns: `(generation << CAP_LOG2) | slot`, the
-/// generation masked to the `GEN_BITS` a handle carries. Every handle is packed here, so the layout
-/// lives in one place (#2365).
+/// generation masked to the `GEN_BITS` a handle carries ([`temen_ir::handles::pack`], #2365).
 const fn handle_of(slot: u32, generation: u32) -> i32 {
-    (((generation & GEN_MASK) << CAP_LOG2) | slot) as i32
+    temen_ir::handles::pack(slot, generation)
 }
 
 /// How many workers a domain's offload pool runs (§12 path 2): at most this many of its punted calls
@@ -40520,7 +40548,7 @@ mod gen_recycle_tests {
         // + regrant: the counter passes `2^GEN_BITS`, whose low `GEN_BITS` are 0 — exactly the case
         // the old `s.generation == gen` compare got wrong (the slot would have died forever). That
         // masked 0 is skipped, so the handle is issued at masked generation 1 (#2365).
-        h.table[slot].generation = (1u32 << GEN_BITS) - 2;
+        h.table[slot].generation = (1u32 << temen_ir::handles::GEN_BITS) - 2;
         h.close(handle0);
         let last = h.try_grant(cap_id::EXIT, Binding::Exit).expect("regrant");
         h.close(last);
@@ -40532,7 +40560,7 @@ mod gen_recycle_tests {
         );
         assert_eq!(
             h.table[slot].generation,
-            (1u32 << GEN_BITS) + 1,
+            (1u32 << temen_ir::handles::GEN_BITS) + 1,
             "counter wrapped past GEN_BITS, skipping the masked 0"
         );
         assert!(

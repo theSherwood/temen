@@ -141,16 +141,13 @@ unsafe impl Send for Env {}
 unsafe impl Sync for Env {}
 
 /// A spawned vCPU's completion cell: its `i64` result once finished, and the trap code (`0` = clean).
-struct Done {
+pub(crate) struct Done {
     state: Mutex<Option<(i64, i64)>>,
     cv: Condvar,
     /// `true` while this cell's joiner is counted in [`Domain::parked`] — the join half of
     /// [`WaitCell::parked`], settled the same way ([`cell_unpark`]): by the joiner leaving, or by
     /// [`Done::publish`] before the child's `live` slot is dropped.
     joiner_parked: AtomicBool,
-    /// Set by the `thread.join` that claims this cell, whichever table it resolved in — so a freeze
-    /// carries only the finished children nobody has joined yet (#1685).
-    joined: AtomicBool,
     /// Set when the child unwound for a freeze: its result is a placeholder, so a join that takes it
     /// is re-issued on thaw instead of reloaded (#1685).
     unwound: AtomicBool,
@@ -162,9 +159,13 @@ impl Done {
             state: Mutex::new(result),
             cv: Condvar::new(),
             joiner_parked: AtomicBool::new(false),
-            joined: AtomicBool::new(false),
             unwound: AtomicBool::new(false),
         })
+    }
+
+    /// Its `(result, trap)` once its vCPU has published one.
+    pub(crate) fn outcome(&self) -> Option<(i64, i64)> {
+        *lock(&self.state)
     }
 
     /// The child's computation has ended: free its concurrent-live slot, then publish the result so
@@ -191,6 +192,124 @@ impl Done {
         *st = Some((result, trap));
         self.cv.notify_all();
     }
+}
+
+/// #2043 — what one handle of a domain's child table names.
+pub(crate) enum ChildEntry {
+    /// A `thread.spawn` vCPU: its completion cell.
+    Thread(std::sync::Arc<Done>),
+    /// A §14 child, filed through the domain's nursery.
+    Instance(crate::instantiator_rt::Child),
+}
+
+/// How a domain's child table names a handle for an op on it.
+pub(crate) enum ChildRef {
+    /// A live `thread.spawn` vCPU: its completion cell.
+    Thread(std::sync::Arc<Done>),
+    /// A live §14 child, which the nursery acts on.
+    Instance,
+    /// A handle the table issued and has since retired (joined or detached): `-EBADF`.
+    Spent,
+    /// A handle it never issued: the op traps (INVARIANTS #5).
+    Forged,
+}
+
+/// #2043 D1 — a domain's child handles: its `thread.spawn` vCPUs and its §14 children, in the one
+/// generation-checked table ([`temen_ir::handles`]) its vCPUs' `thread.*` thunks and its
+/// nursery's `Instantiator` ops share, as on every engine. Its counters ride a freeze
+/// ([`Self::generations`]).
+pub(crate) struct Children {
+    pub(crate) table: Mutex<temen_ir::handles::Table<ChildEntry>>,
+    /// The nursery the domain's §14 children are filed through (`0`: none), which a `thread.join`
+    /// of one joins it by.
+    nursery: AtomicUsize,
+}
+
+/// A domain's [`Children`], shared by its [`Domain`] and its nursery.
+pub(crate) type ChildTable = std::sync::Arc<Children>;
+
+impl Default for Children {
+    fn default() -> Self {
+        Children::restored(&[])
+    }
+}
+
+impl Children {
+    /// A thaw's table: every slot free at the counter its freeze left it, before the records the
+    /// artifact carries are pinned back at their slots.
+    pub(crate) fn restored(generations: &[u32]) -> Children {
+        Children {
+            table: Mutex::new(temen_ir::handles::Table::from_generations(generations)),
+            nursery: AtomicUsize::new(0),
+        }
+    }
+
+    /// Every slot's counter, as a freeze carries them.
+    pub(crate) fn generations(&self) -> Vec<u32> {
+        lock(&self.table).generations()
+    }
+
+    /// Name the nursery the domain's §14 children are filed through.
+    pub(crate) fn set_nursery(&self, nursery: *const crate::instantiator_rt::Nursery) {
+        self.nursery.store(nursery as usize, Ordering::Release);
+    }
+
+    /// The nursery the domain's §14 children are filed through.
+    ///
+    /// # Safety
+    /// A nursery outlives every child it filed, so one that named itself here is live while a
+    /// handle in this table can name one of its children.
+    unsafe fn nursery(&self) -> Option<&crate::instantiator_rt::Nursery> {
+        let n = self.nursery.load(Ordering::Acquire) as *const crate::instantiator_rt::Nursery;
+        n.as_ref()
+    }
+
+    /// How the table names `handle`. A §14 child whose filing is still in flight was never given to
+    /// the guest, so its handle is forged.
+    pub(crate) fn name(&self, handle: i32) -> ChildRef {
+        let t = lock(&self.table);
+        match t.name(handle) {
+            temen_ir::handles::Named::Live(slot) => match t.get(slot) {
+                Some(ChildEntry::Thread(done)) => ChildRef::Thread(std::sync::Arc::clone(done)),
+                Some(ChildEntry::Instance(c)) if c.filed() => ChildRef::Instance,
+                _ => ChildRef::Forged,
+            },
+            temen_ir::handles::Named::Spent => ChildRef::Spent,
+            temen_ir::handles::Named::Forged => ChildRef::Forged,
+        }
+    }
+
+    /// Whether `slot` still holds the vCPU whose cell is `done`: whether a handle still names it.
+    fn names_thread(&self, slot: usize, done: &std::sync::Arc<Done>) -> bool {
+        holds(lock(&self.table).get(slot), done)
+    }
+
+    /// Retire `handle` if it still names the vCPU whose cell is `done`: whether this caller took
+    /// it. A handle is joined once; its slot is free to reissue.
+    fn take_thread(&self, handle: i32, done: &std::sync::Arc<Done>) -> bool {
+        let mut t = lock(&self.table);
+        let named = holds(t.get_live(handle).map(|(_, e)| e), done);
+        if named {
+            t.retire(temen_ir::handles::slot_of(handle));
+        }
+        named
+    }
+
+    /// The completion cells of the live `thread.spawn` vCPUs.
+    fn thread_cells(&self) -> Vec<std::sync::Arc<Done>> {
+        lock(&self.table)
+            .live()
+            .filter_map(|(_, e)| match e {
+                ChildEntry::Thread(d) => Some(std::sync::Arc::clone(d)),
+                ChildEntry::Instance(_) => None,
+            })
+            .collect()
+    }
+}
+
+/// Whether `entry` is the `thread.spawn` vCPU whose cell is `done`.
+fn holds(entry: Option<&ChildEntry>, done: &std::sync::Arc<Done>) -> bool {
+    matches!(entry, Some(ChildEntry::Thread(d)) if std::sync::Arc::ptr_eq(d, done))
 }
 
 /// #1685 — mark the call the running context is in for re-issue on thaw: a `thread.join` or an
@@ -515,17 +634,14 @@ pub(crate) struct Domain {
     /// `run_inner` merges it into the run's `frozen_out` (the root's own fibers are flattened directly
     /// there). Empty on a non-durable run or a thread-only domain.
     frozen_fibers: Mutex<Vec<crate::FrozenFiber>>,
-    /// **Durable single-worker** (slice 3.4: nested spawns): per-vCPU join tables, keyed by the
-    /// **spawning** task. A nested child's guest handle is its index *within its parent's* table —
-    /// matching the interpreter's per-vCPU `threads`, so the handle the guest spills is byte-identical
-    /// across backends. Populated only on the durable single-worker path (freeze defer / thaw
-    /// re-attach); empty (and unused) on the global OS-thread path, which keeps using [`Threads::cells`].
-    dchildren: Mutex<HashMap<u64, DTable>>,
+    /// #2043 D1 — the domain's child handles, shared with its nursery: every vCPU's `thread.spawn`
+    /// issues from it, whatever path spawned it, as do its §14 children.
+    children: ChildTable,
     /// The inline vCPU currently executing on the single worker (routing for `defer_spawn` +
     /// `thread_join`); the root is `0`. Set around each inline child run; `0` while the root runs.
     cur_task: Mutex<u64>,
-    /// Monotonic task-id allocator for the durable single-worker path (root = `0`, first spawn = `1`),
-    /// matching the interpreter's `next_task` so `FrozenVCpu.task` is byte-identical.
+    /// Monotonic task-id allocator for the domain's spawns (root = `0`, first spawn = `1`), matching
+    /// the interpreter's `next_task` so `FrozenVCpu.task` is byte-identical, and its `vcpu.tls` seed.
     next_task: Mutex<u64>,
     futex: Mutex<HashMap<FutexKey, FutexEntry>>,
     futex_cv: Condvar,
@@ -585,29 +701,14 @@ pub(crate) struct Domain {
     node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
 }
 
-/// One vCPU's join table on the durable single-worker path (slice 3.4): its spawned children's
-/// completion cells by per-vCPU handle (the index), plus the per-handle "already joined" flag. The
-/// handle namespace is per-spawning-vCPU, mirroring the interpreter's per-vCPU `threads`.
-#[derive(Default)]
-struct DTable {
-    cells: Vec<std::sync::Arc<Done>>,
-    joined: Vec<bool>,
-}
-
 #[derive(Default)]
 struct Threads {
     /// §15 **concurrently-live** vCPUs — the root (1) plus every spawned vCPU that hasn't finished.
     /// Incremented under this lock at a successful `thread.spawn`, decremented when a spawned vCPU's
     /// computation ends ([`run_child`]). [`MAX_VCPUS`] bounds *this* (concurrent liveness, like the
-    /// interpreter's `s.live`), **not** `cells.len()` (the cumulative handle table that never shrinks —
-    /// symmetric with the interpreter's per-vCPU `threads` Vec). Starts at 1 (the root) via
-    /// [`Domain::new`]; `Default` is 0 only for the unused loom path.
+    /// interpreter's `s.live`); the domain's child table bounds its unjoined handles. Starts at 1 (the
+    /// root) via [`Domain::new`]; `Default` is 0 only for the unused loom path.
     live: usize,
-    /// Completion cells, indexed by thread handle (a masked, generation-free table index, §3c).
-    cells: Vec<std::sync::Arc<Done>>,
-    /// Per-handle "already joined" flag — a second `thread.join` of the same vCPU is inert (traps),
-    /// matching the interpreter oracle and the IR contract.
-    joined: Vec<bool>,
     /// OS-thread handles, joined by `run_inner` at run end so no vCPU outlives the window/code.
     joins: Vec<std::thread::JoinHandle<()>>,
 }
@@ -843,7 +944,7 @@ impl Domain {
             frozen_vcpus: Mutex::new(Vec::new()),
             completed_children: Mutex::new(Vec::new()),
             frozen_fibers: Mutex::new(Vec::new()),
-            dchildren: Mutex::new(HashMap::new()),
+            children: ChildTable::default(),
             cur_task: Mutex::new(0),
             next_task: Mutex::new(1), // root is task 0; first spawn is 1
             futex: Mutex::new(HashMap::new()),
@@ -865,17 +966,33 @@ impl Domain {
     /// #1469 — the domain of a §14 child task's own vCPUs, sharing `hub` (see [`Domain::hub`]).
     /// Its `live` counts only the child's spawned vCPUs, from 0: the task itself is counted on the
     /// hub when it is filed ([`Domain::try_child_start`]), and each vCPU spawned here is counted on
-    /// both. [`Domain::set_env`] supplies the child's window before any of its vCPUs can spawn.
+    /// both. [`Domain::set_env`] supplies the child's window before any of its vCPUs can spawn. Its
+    /// `children` are the child's, which its nursery shares (#2043).
     pub(crate) fn new_child(
         hub: &Domain,
         lane_chain: Vec<(usize, i64)>,
         node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
+        children: ChildTable,
     ) -> Domain {
         let mut d = Domain::new(node);
         d.threads = Mutex::new(Threads::default());
         d.lane_chain = Mutex::new(lane_chain);
         d.hub = hub as *const Domain as usize;
+        d.children = children;
         d
+    }
+
+    /// #2043 — the domain's child handles, which its nursery shares.
+    pub(crate) fn children(&self) -> &ChildTable {
+        &self.children
+    }
+
+    /// The next spawn's task id: its vCPU id within the domain (root `0`, then `1`, `2`, …).
+    fn take_task(&self) -> u64 {
+        let mut nt = lock(&self.next_task);
+        let t = *nt;
+        *nt += 1;
+        t
     }
 
     /// #2001 — charge one spawned vCPU to [`Self::node`]: `false` when a level's `spawn` is full.
@@ -1263,11 +1380,13 @@ impl Domain {
     pub(crate) fn take_completed_children_residue(&self) -> Vec<crate::FrozenVCpu> {
         std::mem::take(&mut *lock(&self.completed_children))
             .into_iter()
-            .filter(|c| !c.done.joined.load(Ordering::Relaxed))
+            // Only one a handle still names: nothing can join one joined or detached (#2043).
+            .filter(|c| self.children.names_thread(c.slot, &c.done))
             .map(|c| crate::FrozenVCpu {
                 task: c.task as usize,
                 parent_task: c.parent as usize,
                 slot: c.slot,
+                joinable: true,
                 func: 0, // inert — a completed child is not re-run
                 args: Vec::new(),
                 shadow_sp: 0,
@@ -1326,15 +1445,10 @@ impl Domain {
             let _g = lock(&hub.futex);
             hub.futex_cv.notify_all();
         }
-        // Snapshot the completion cells out of their table locks, then notify each under its own
-        // state lock (never hold a table lock while taking a cell lock).
-        let mut cells: Vec<std::sync::Arc<Done>> = lock(&self.threads).cells.to_vec();
-        cells.extend(
-            lock(&self.dchildren)
-                .values()
-                .flat_map(|t| t.cells.iter().cloned()),
-        );
-        for c in cells {
+        // Snapshot the completion cells out of the table lock, then notify each under its own state
+        // lock (never hold the table lock while taking a cell lock). A joiner racing a detach for a
+        // cell no longer in the table is woken by its vCPU's own publish.
+        for c in self.children.thread_cells() {
             let _g = lock(&c.state);
             c.cv.notify_all();
         }
@@ -1365,11 +1479,11 @@ impl Domain {
 /// `MutexGuard` helper that recovers from poisoning (a panicking holder means the domain is already
 /// being killed; we still want the data). loom's `Mutex` has no poisoning, so it returns the guard.
 #[cfg(not(loom))]
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 #[cfg(loom)]
-fn lock<T>(m: &Mutex<T>) -> loom::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> loom::sync::MutexGuard<'_, T> {
     m.lock().unwrap()
 }
 
@@ -1430,7 +1544,8 @@ struct DurableChild {
     task: u64,
     /// The spawning task (`parent_task`) — the root (`0`) for a flat spawn.
     parent: u64,
-    /// The handle the spawner's guest holds for it (#1685): the thaw re-attaches it at this slot.
+    /// Its slot in the domain's child table (#1685, #2043): the thaw re-attaches it there while a
+    /// handle still names it.
     slot: usize,
     /// The reserved top-down shadow context the child unwinds into (kept on a freeze-unwind so a thaw
     /// re-spawns it there; freed on a genuine finish).
@@ -1461,8 +1576,8 @@ struct SpawnArgs {
     code: u64,
     sp: u64,
     arg: u64,
-    /// §12 dense vCPU id seeded into this child's per-vCPU TLS register (`vcpu.tls`). Root is 0, so a
-    /// spawned vCPU takes `handle + 1` (handles are 0-based, cumulative spawn order).
+    /// §12 dense vCPU id seeded into this child's per-vCPU TLS register (`vcpu.tls`): its task, the
+    /// domain's spawns in order (root 0; children 1, 2, …).
     vcpu_id: i64,
     /// §12.8 4A.5 stage (ii): present on a concurrent durable child (see [`DurableChild`]).
     durable_child: Option<DurableChild>,
@@ -1486,7 +1601,7 @@ struct PendingSpawn {
     task: u64,
     /// The task that spawned it (its `parent_task`) — the root (`0`) or another child, for nested spawns.
     parent: u64,
-    /// Its handle in the spawner's table (#1685).
+    /// Its slot in the domain's child table (#1685, #2043).
     slot: usize,
     /// The reserved top-down durable shadow context (kept on a freeze-unwind, freed on a genuine
     /// finish) the child runs in.
@@ -1703,10 +1818,13 @@ fn run_child(a: SpawnArgs) {
         if froze {
             unsafe {
                 a.done.unwound.store(true, Ordering::Relaxed);
+                // #2043 — one its spawner detached rides with no handle naming it.
+                let joinable = (*a.dom).children.names_thread(dc.slot, &a.done);
                 lock(&(*a.dom).frozen_vcpus).push(crate::FrozenVCpu {
                     task: dc.task as usize,
                     parent_task: dc.parent as usize,
-                    slot: dc.slot,
+                    slot: if joinable { dc.slot } else { 0 },
+                    joinable,
                     func: dc.func_idx as i32,
                     args: vec![a.sp as i64, a.arg as i64],
                     shadow_sp: extent,
@@ -1817,12 +1935,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
             }
         };
         let parent = CONCURRENT_SPAWN_TASK.with(|c| c.get()).unwrap_or(0);
-        let task = {
-            let mut nt = lock(&dom.next_task);
-            let t = *nt;
-            *nt += 1;
-            t
-        };
+        let task = dom.take_task();
         Some(DurableChild {
             shadow: dom.shadow(),
             task,
@@ -1850,10 +1963,22 @@ pub(crate) unsafe extern "C" fn thread_spawn(
         // #2001 — the vCPU is also one `spawn` of its domain's budget node while it lives
         // ([`Done::publish`] hands it back): a full ceiling refuses it as the live cap does.
         let unfunded = !at_ceiling && !dom.charge_vcpu();
-        if unfunded && !std::ptr::eq(hub, dom) {
-            lock(&hub.threads).live -= 1; // the slot `try_child_start` took
-        }
-        if at_ceiling || unfunded {
+        // #2043 — and a handle, from the table the domain's §14 children share: a full one refuses
+        // it as the live cap does.
+        let issued = (!at_ceiling && !unfunded)
+            .then(|| {
+                lock(&dom.children.table)
+                    .issue(ChildEntry::Thread(std::sync::Arc::clone(&done)))
+                    .ok()
+            })
+            .flatten();
+        let Some(handle) = issued else {
+            if !at_ceiling && !unfunded {
+                dom.vcpu_ended(); // the charge it took
+            }
+            if !at_ceiling && !std::ptr::eq(hub, dom) {
+                lock(&hub.threads).live -= 1; // the slot `try_child_start` took
+            }
             if let Some(dc) = &durable_child {
                 if let Some(table) = dom.fiber_table() {
                     table.free_vcpu_context(dc.ctx);
@@ -1861,17 +1986,16 @@ pub(crate) unsafe extern "C" fn thread_spawn(
             }
             vm.raise(TrapKind::ThreadFault as i64);
             return -1;
-        }
-        let idx = t.cells.len();
-        t.cells.push(std::sync::Arc::clone(&done));
-        t.joined.push(false);
+        };
+        let slot = temen_ir::handles::slot_of(handle);
         if let Some(d) = durable_child.as_mut() {
-            d.slot = idx;
+            d.slot = slot;
         }
-        let vcpu_id = durable_child
-            .as_ref()
-            .map(|d| d.task as i64)
-            .unwrap_or(idx as i64 + 1); // dense id seed (root 0; children 1, 2, …)
+        // Its vCPU id seed: its task, the domain's spawns in order (root 0; children 1, 2, …).
+        let vcpu_id = match &durable_child {
+            Some(d) => d.task as i64,
+            None => dom.take_task() as i64,
+        };
         let args = SpawnArgs {
             env,
             code,
@@ -1883,7 +2007,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
             dom,
         };
         let jh = std::thread::Builder::new()
-            .name(format!("temen-vcpu-{idx}"))
+            .name(format!("temen-vcpu-{vcpu_id}"))
             .spawn(move || run_child(args));
         match jh {
             Ok(jh) => {
@@ -1891,13 +2015,13 @@ pub(crate) unsafe extern "C" fn thread_spawn(
                 // Count the new vCPU as live *before* releasing the lock, so its own completion
                 // decrement (which takes this lock) can't underflow.
                 t.live += 1;
-                idx as i32
+                handle
             }
             Err(_) => {
-                // Out of OS threads: pop the cell we reserved and trap (no `live` change). The child's
-                // reserved shadow context (if any) leaks for this run — a spawn failure aborts the run.
-                t.cells.pop();
-                t.joined.pop();
+                // Out of OS threads: give back the handle we issued and trap (no `live` change). The
+                // child's reserved shadow context (if any) leaks for this run — a spawn failure
+                // aborts the run.
+                lock(&dom.children.table).retire(slot);
                 dom.vcpu_ended();
                 if !std::ptr::eq(hub, dom) {
                     lock(&hub.threads).live -= 1; // the slot `try_child_start` took
@@ -1959,28 +2083,22 @@ unsafe fn defer_spawn(
         t.live += 1;
     }
     // The **spawning** vCPU (cur_task) and a fresh **global** task id for the child (monotonic, matching
-    // the interp). The guest handle is the child's index *within the spawning vCPU's* table (per-vCPU
-    // namespace) — so a nested grandchild's handle is `0` in its parent's table, byte-identical to the
-    // interp, not a global running index.
+    // the interp).
     let parent = *lock(&dom.cur_task);
-    let task = {
-        let mut nt = lock(&dom.next_task);
-        let t = *nt;
-        *nt += 1;
-        t
-    };
-    let handle = {
-        let mut dc = lock(&dom.dchildren);
-        let tbl = dc.entry(parent).or_default();
-        let h = tbl.cells.len();
-        tbl.cells.push(std::sync::Arc::clone(&done));
-        tbl.joined.push(false);
-        h
+    let task = dom.take_task();
+    // #2043 — its handle comes from the domain's one table, as every spawn's does.
+    let issued = lock(&dom.children.table).issue(ChildEntry::Thread(std::sync::Arc::clone(&done)));
+    let Ok(handle) = issued else {
+        lock(&dom.threads).live -= 1;
+        dom.vcpu_ended();
+        table.free_vcpu_context(ctx);
+        vm.raise(TrapKind::ThreadFault as i64);
+        return -1;
     };
     lock(&dom.pending_spawns).push(PendingSpawn {
         task,
         parent,
-        slot: handle,
+        slot: temen_ir::handles::slot_of(handle),
         ctx,
         code,
         func_idx,
@@ -1988,7 +2106,7 @@ unsafe fn defer_spawn(
         arg,
         done,
     });
-    handle as i32
+    handle
 }
 
 impl Domain {
@@ -2176,10 +2294,13 @@ impl Domain {
                 // genuine finish frees the context for reuse (recycling).
                 if froze {
                     p.done.unwound.store(true, Ordering::Relaxed);
+                    // #2043 — one its spawner detached rides with no handle naming it.
+                    let joinable = self.children.names_thread(p.slot, &p.done);
                     lock(&self.frozen_vcpus).push(crate::FrozenVCpu {
                         task: p.task as usize,
                         parent_task: p.parent as usize,
-                        slot: p.slot,
+                        slot: if joinable { p.slot } else { 0 },
+                        joinable,
                         func: p.func_idx as i32,
                         args: vec![p.sp as i64, p.arg as i64],
                         shadow_sp: child_sp,
@@ -2210,12 +2331,14 @@ impl Domain {
     /// **before** the root re-enters — the JIT's single-worker thaw. Mirrors the interp `drive` thaw
     /// re-spawn: the root's `REWINDING` rewind *skips* its prologue `thread.spawn` (it reloads the
     /// recorded handle), so a child that existed before the freeze point is reconstructed here, not by
-    /// the root. Each child (in ascending task = spawn order) is registered into the join table at its
-    /// own handle slot (`task − 1`, padding finished/joined slots so the root's reloaded handle still
-    /// resolves) and run inline under `REWINDING` from its restored shadow extent: it rewinds, flips to
-    /// `NORMAL`, runs forward to completion, and publishes its result — so the root's re-executed
-    /// `thread.join` (after its checkpoint) resolves immediately. Finally the active shadow-SP + state
-    /// word are set to the root's extent + `REWINDING` so the root rewinds from the right point.
+    /// the root. Each child (in ascending task = spawn order) is pinned back at its slot of the
+    /// domain's child table, which the thaw rebuilt from its counters ([`Children::restored`], #2043),
+    /// so the root's reloaded handle resolves and a spent one stays spent; one its spawner detached
+    /// is re-created with no handle naming it. Each runs under `REWINDING` from its restored shadow
+    /// extent: it rewinds, flips to `NORMAL`, runs forward to completion, and publishes its result —
+    /// so the root's re-executed `thread.join` (after its checkpoint) resolves immediately. Finally the
+    /// active shadow-SP + state word are set to the root's extent + `REWINDING` so the root rewinds
+    /// from the right point.
     ///
     /// The children run *before* the root (rather than the interp's root-parks-on-join dispatch): a
     /// thaw runs to completion with no re-snapshot, and the §12.6 equivalence holds because a
@@ -2233,10 +2356,8 @@ impl Domain {
         let env = self.env();
         mem::install_guard();
 
-        // (1) Rebuild the **per-parent** join tables in ascending task (= spawn) order — a parent's
-        // table exists before a (grand)child attaches, and per-parent append reproduces the freeze-time
-        // handles (slice 3.4: a grandchild's handle is its index in its *parent's* table, not a global
-        // one). Each child is counted toward §15 live and keeps its Done cell + run params.
+        // (1) Re-attach each child at its slot, in ascending task (= spawn) order. Each is counted
+        // toward §15 live and keeps its Done cell + run params.
         struct Run {
             task: u64,
             parent: u64,
@@ -2260,10 +2381,10 @@ impl Domain {
         let mut runs: Vec<Run> = Vec::with_capacity(ordered.len());
         for v in &ordered {
             // §12.8 4A.5 follow-up A: a child that **completed** before the freeze point (no frozen
-            // continuation) gets its `thread.join` result delivered into the spawner's table directly —
+            // continuation) gets its `thread.join` result delivered into the domain's table directly —
             // its Done cell is pre-filled and it is **not** re-run (its side effects are already in the
             // snapshot). Every child lands at its recorded slot (#1685); a slot joined before the
-            // freeze gets an inert, already-joined cell, so a re-join of it traps as it would have.
+            // freeze keeps its counter, so a re-join of it answers `-EBADF` as it would have (#2043).
             // #2001 — a live one handed its `spawn` back as it unwound for the freeze, and lived before
             // it: charged again. #2318 — never past the process's pools: one they have no room for is
             // a vCPU the process cannot hold, so it is not re-run either, and its join answers
@@ -2276,16 +2397,9 @@ impl Domain {
                 None => None,
             };
             let done = Done::new(ended);
-            {
-                let mut dc = lock(&self.dchildren);
-                let tbl = dc.entry(v.parent_task as u64).or_default();
-                while tbl.cells.len() <= v.slot {
-                    tbl.cells
-                        .push(Done::new(Some((0, TrapKind::ThreadFault as i64))));
-                    tbl.joined.push(true);
-                }
-                tbl.cells[v.slot] = std::sync::Arc::clone(&done);
-                tbl.joined[v.slot] = false;
+            if v.joinable {
+                lock(&self.children.table)
+                    .pin(v.slot, ChildEntry::Thread(std::sync::Arc::clone(&done)));
             }
             if ended.is_some() {
                 continue; // already-done: no re-run, no §15 live count, no context
@@ -2380,11 +2494,13 @@ impl Domain {
     }
 }
 
-/// `thread.join` thunk: block this OS thread until vCPU `handle` finishes; return its `i64` result,
-/// with status 0 through `status_out`. A forged / out-of-range handle is inert (**traps**
-/// `ThreadFault`); a spent (already-joined) one answers status `-EBADF` and value 0 without
-/// blocking (INVARIANTS #5, #2667); a child that itself trapped propagates that trap here (the
-/// joiner's `emit_trap_propagate` then unwinds).
+/// `thread.join` thunk: block this OS thread until the child `handle` names ends; return its `i64`
+/// result, with its status through `status_out`. The domain's one table names every child it has
+/// (#2043 D1), so a `thread.join` and an `Instantiator.join` deliver alike, by what the handle names: a
+/// `thread.spawn` vCPU's trap propagates here (the joiner's `emit_trap_propagate` then unwinds), and a
+/// §14 child's end is a status (#2066). A forged handle traps `ThreadFault`; a spent one (joined or
+/// detached) answers status `-EBADF` and value 0 without blocking (INVARIANTS #5, #2667), as it does
+/// to the second of two joiners racing for one child.
 ///
 /// # Safety
 /// `sched` is the run's live `Domain`, and `status_out` is valid for writes.
@@ -2396,72 +2512,96 @@ pub(crate) unsafe extern "C" fn thread_join(
 ) -> i64 {
     *status_out = 0;
     let dom = current_domain(sched);
-    // Durable single-worker (slice 3.4): resolve the handle in the **current** vCPU's per-vCPU table —
-    // nested spawns give each spawning vCPU its own handle namespace. `dchildren` is populated only on
-    // that path (freeze defer / thaw re-attach); when it's empty this is the global OS-thread table.
-    // §12.8 concurrent-thaw stage 2: on a concurrent durable child's OS thread, use *this* thread's task
-    // (set by `run_child`) — concurrent children would race the shared `cur_task`. The root's own thread
-    // has no `CONCURRENT_SPAWN_TASK`, so it falls back to `cur_task` (set to the root by the thaw driver).
-    let cur = dom.current_task();
-    let done = {
-        let mut dc = lock(&dom.dchildren);
-        if !dc.is_empty() {
-            // Per-vCPU: the current vCPU's children. A vCPU with no table (spawned nothing) ⇒ a forged
-            // handle ⇒ inert trap.
-            match dc.get_mut(&cur) {
-                Some(tbl) => {
-                    // The oracle's rule (`temen_ir::handle_slot`, #2378): a forged or negative
-                    // handle is inert, and an already-joined one is spent (#2667).
-                    let Some(slot) = temen_ir::handle_slot(tbl.cells.len(), handle) else {
-                        vm.raise(TrapKind::ThreadFault as i64);
-                        return 0;
-                    };
-                    if tbl.joined[slot] {
-                        *status_out = temen_ir::errno::EBADF;
-                        return 0;
-                    }
-                    tbl.joined[slot] = true;
-                    tbl.cells[slot].joined.store(true, Ordering::Relaxed);
-                    std::sync::Arc::clone(&tbl.cells[slot])
-                }
-                None => {
-                    vm.raise(TrapKind::ThreadFault as i64);
-                    return 0;
-                }
+    match dom.children.name(handle) {
+        ChildRef::Thread(done) => join_thread(dom, handle, &done, status_out, vm),
+        // SAFETY: the nursery that filed the child outlives it.
+        ChildRef::Instance => match dom.children.nursery() {
+            Some(n) => {
+                crate::instantiator_rt::join_named(n, dom.env().mem_base, handle, status_out, vm)
             }
-        } else {
-            drop(dc);
-            let mut t = lock(&dom.threads);
-            // Out-of-range and negative handles are inert (trap), like a forged capability index,
-            // and an already-joined one is spent: the oracle's rule (`temen_ir::handle_slot`;
-            // #2378, #2667).
-            let Some(slot) = temen_ir::handle_slot(t.cells.len(), handle) else {
+            None => {
                 vm.raise(TrapKind::ThreadFault as i64);
-                return 0;
-            };
-            if t.joined[slot] {
-                *status_out = temen_ir::errno::EBADF;
-                return 0;
+                0
             }
-            t.joined[slot] = true;
-            t.cells[slot].joined.store(true, Ordering::Relaxed);
-            std::sync::Arc::clone(&t.cells[slot])
+        },
+        ChildRef::Spent => {
+            *status_out = temen_ir::errno::EBADF;
+            0
         }
-    };
+        ChildRef::Forged => {
+            vm.raise(TrapKind::ThreadFault as i64);
+            0
+        }
+    }
+}
+
+/// The join of the `thread.spawn` vCPU `handle` names, whose completion cell is `done`, by a vCPU of
+/// its domain `dom`: block until it publishes, then deliver its result. The joiner that takes it
+/// retires its handle, under the table's lock, so a second joiner finds it spent (#2043 D3): the
+/// oracle's rule. A join a kill, a freeze or the domain's end stops returns 0 and retires nothing;
+/// one that takes the placeholder of a vCPU that unwound for a freeze is re-issued on thaw.
+///
+/// # Safety
+/// As [`thread_join`]: `dom` is the joiner's live domain.
+pub(crate) unsafe fn join_thread(
+    dom: &Domain,
+    handle: i32,
+    done: &std::sync::Arc<Done>,
+    status_out: *mut i64,
+    vm: &crate::VmCtx,
+) -> i64 {
+    // §12.8 concurrent-thaw stage 2: on a concurrent durable child's OS thread, its own task (set by
+    // `run_child`) — concurrent children would race the shared `cur_task`. The root's own thread has
+    // no `CONCURRENT_SPAWN_TASK`, so it falls back to `cur_task` (set to the root by the thaw driver).
+    let cur = dom.current_task();
     // #1469 — inside a child-domain task the thread that would block is an executor worker, not a
     // vCPU: the task root parks the *task* instead (as `fiber_resume_block` does). A guest fiber
     // inside the task fails closed rather than hold a worker the joined vCPU may need. (An
     // `Instantiator` join there parks the task through the fiber's resumers, #2322, a route this
     // join could share: `ParkOn::Thread` is passed up the same way.)
-    if fiber_rt::in_task() {
-        return match fiber_rt::current_fiber_slot() {
-            Some(s) if s.is_platform() => task_join(dom, &s, &done, vm),
+    let outcome = if fiber_rt::in_task() {
+        match fiber_rt::current_fiber_slot() {
+            Some(s) if s.is_platform() => task_join(dom, &s, done, vm),
             _ => {
                 vm.raise(TrapKind::ThreadFault as i64);
-                0
+                return 0;
             }
-        };
+        }
+    } else {
+        let outcome = os_join(dom, cur, done, vm);
+        // Back from the park; re-take the lane before the guest runs again.
+        let epoch_addr = dom.env().epoch_addr;
+        if !dom.lane_acquire(&dom.lane_chain(), || {
+            epoch_fired(epoch_addr) || vm.ended().is_some()
+        }) {
+            vm.raise(TrapKind::ThreadFault as i64);
+            return 0;
+        }
+        outcome
+    };
+    let Some((result, trap)) = outcome else {
+        return 0; // killed, frozen or the domain ended: the join's trailing guards unwind
+    };
+    if trap != 0 {
+        vm.raise(trap);
+        return 0;
     }
+    if done.unwound.load(Ordering::Relaxed) {
+        // A vCPU unwinds only on a durable run, whose window is committed.
+        mark_reissue(dom.env().mem_base);
+        return result;
+    }
+    if !dom.children.take_thread(handle, done) {
+        *status_out = temen_ir::errno::EBADF;
+        return 0;
+    }
+    result
+}
+
+/// `thread.join`'s park on an OS vCPU: wait on `done` until its vCPU publishes, holding no lane.
+/// `Some((result, trap))` once it has; `None` when the joiner's kill, a freeze or its domain's end
+/// stops the wait first (a freeze marks the join for re-issue).
+unsafe fn os_join(dom: &Domain, cur: u64, done: &Done, vm: &crate::VmCtx) -> Option<(i64, i64)> {
     // §5 kill-path: a joiner blocked on a sibling must also unwind when the host kills the domain
     // (else `join_all` hangs on a vCPU that will never finish). When armed, re-check the interrupt
     // cell periodically; on a kill, return so the caller's next epoch poll traps `OutOfFuel`.
@@ -2480,71 +2620,56 @@ pub(crate) unsafe extern "C" fn thread_join(
     }
     // D66 — a joiner holds no lane while it waits. Under a cap of 1 this is load-bearing: the child
     // being joined cannot run at all until the joiner steps aside. Released before the completion
-    // cell's lock is taken and re-taken after it is dropped — blocking for a lane while holding that
-    // lock would stop the child from ever publishing the result being waited for.
-    let lane = dom.lane_chain();
-    dom.lane_give_back(&lane);
-    let result = (|| -> i64 {
-        let mut st = lock(&done.state);
-        // §12.8 concurrent-thaw stage 3: count this joiner as blocked while it parks, so a sibling waiter's
-        // `peers_live` (and the deadlock detector) see a join↔wait mutual block as full quiescence.
-        // Set under the cell's lock, so the child's [`Done::publish`] settles it before dropping `live`
-        // — and only while there is no result yet, which no publisher would settle.
-        let _pg = st.is_none().then(|| dom.join_park(&done.joiner_parked));
-        loop {
-            if let Some((result, trap)) = *st {
-                if trap != 0 {
-                    vm.raise(trap);
-                }
-                if done.unwound.load(Ordering::Relaxed) {
-                    // SAFETY: a child unwinds only on a durable run, whose window is committed.
-                    unsafe { mark_reissue(dom.env().mem_base) };
-                }
-                return result;
-            }
-            if epoch_fired(epoch_addr) {
-                return 0; // killed — unwind to guest code, which traps OutOfFuel at its next poll
-            }
-            // SAFETY: a watched window is the run's, live while it is.
-            if let Some(f) = freeze.filter(|f| unsafe { f.landed() }) {
-                unsafe { f.mark_reissue() };
-                return 0; // freeze in progress — return so the join's trailing safepoint unwinds
-            }
-            // Owner decision 2026-07-24 (domain teardown; DESIGN.md §12, D37 death-is-revocation): a
-            // trap/exit from any vCPU — or the root's completion (the internal DOMAIN_DONE sentinel) —
-            // ends the domain; sibling outcomes are unobservable past teardown. Return so the join's
-            // trailing trap-propagation guard (which checks this same cell) unwinds this thread.
-            // Woken promptly by [`Domain::wake_all_parked`].
-            if vm.ended().is_some() {
-                return 0;
-            }
-            // A timeout wait so the kill (`epoch_addr`) and freeze (`freeze`) re-checks above run
-            // periodically even when no `notify` arrives; a plain `wait` only when neither is armed.
-            #[cfg(not(loom))]
-            if epoch_addr != 0 || freeze.is_some() {
-                st = done
-                    .cv
-                    .wait_timeout(st, KILL_RECHECK)
-                    .unwrap_or_else(|e| e.into_inner())
-                    .0;
-                continue;
-            }
-            st = done.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+    // cell's lock is taken and re-taken after it is dropped ([`join_thread`]) — blocking for a lane
+    // while holding that lock would stop the child from ever publishing the result being waited for.
+    dom.lane_give_back(&dom.lane_chain());
+    let mut st = lock(&done.state);
+    // §12.8 concurrent-thaw stage 3: count this joiner as blocked while it parks, so a sibling waiter's
+    // `peers_live` (and the deadlock detector) see a join↔wait mutual block as full quiescence.
+    // Set under the cell's lock, so the child's [`Done::publish`] settles it before dropping `live`
+    // — and only while there is no result yet, which no publisher would settle.
+    let _pg = st.is_none().then(|| dom.join_park(&done.joiner_parked));
+    loop {
+        if let Some(outcome) = *st {
+            return Some(outcome);
         }
-    })();
-    // Back from the park; re-take the lane before the guest runs again.
-    if !dom.lane_acquire(&lane, || epoch_fired(epoch_addr) || vm.ended().is_some()) {
-        vm.raise(TrapKind::ThreadFault as i64);
-        return 0;
+        if epoch_fired(epoch_addr) {
+            return None; // killed — unwind to guest code, which traps OutOfFuel at its next poll
+        }
+        // SAFETY: a watched window is the run's, live while it is.
+        if let Some(f) = freeze.filter(|f| unsafe { f.landed() }) {
+            unsafe { f.mark_reissue() };
+            return None; // freeze in progress — return so the join's trailing safepoint unwinds
+        }
+        // Owner decision 2026-07-24 (domain teardown; DESIGN.md §12, D37 death-is-revocation): a
+        // trap/exit from any vCPU — or the root's completion (the internal DOMAIN_DONE sentinel) —
+        // ends the domain; sibling outcomes are unobservable past teardown. Return so the join's
+        // trailing trap-propagation guard (which checks this same cell) unwinds this thread.
+        // Woken promptly by [`Domain::wake_all_parked`].
+        if vm.ended().is_some() {
+            return None;
+        }
+        // A timeout wait so the kill (`epoch_addr`) and freeze (`freeze`) re-checks above run
+        // periodically even when no `notify` arrives; a plain `wait` only when neither is armed.
+        #[cfg(not(loom))]
+        if epoch_addr != 0 || freeze.is_some() {
+            st = done
+                .cv
+                .wait_timeout(st, KILL_RECHECK)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+            continue;
+        }
+        st = done.cv.wait(st).unwrap_or_else(|e| e.into_inner());
     }
-    result
 }
 
 /// #1469 — `thread.join` at a child task's root: park the task on the one event park until the
 /// joined vCPU publishes. It counts as blocked for the deadlock predicate through the completion
 /// cell, as an OS joiner does ([`Domain::join_park`], #1820); the executor gives back the task's lanes while
 /// it is parked, and re-offers it at the joined vCPU's exit broadcast (`run_child` →
-/// [`Domain::wake_all_parked`]) or its cadence sweep, poisoning it at teardown.
+/// [`Domain::wake_all_parked`]) or its cadence sweep, poisoning it at teardown. As [`os_join`], it
+/// answers the outcome, or `None` when a kill, a freeze or the domain's end stops it.
 ///
 /// #2010 — in a durable child it follows the OS-thread join's freeze rule: a freeze of the child's
 /// window ends the wait for re-issue on thaw, and a vCPU that unwound leaves its placeholder,
@@ -2557,22 +2682,15 @@ unsafe fn task_join(
     slot: &std::sync::Arc<fiber_rt::FiberSlot>,
     done: &Done,
     vm: &crate::VmCtx,
-) -> i64 {
+) -> Option<(i64, i64)> {
     let env = dom.env();
     let freeze = dom.freeze_watch();
     let mut _pg = None;
     loop {
         {
             let st = lock(&done.state);
-            if let Some((result, trap)) = *st {
-                if trap != 0 {
-                    vm.raise(trap);
-                }
-                if done.unwound.load(Ordering::Relaxed) {
-                    // A vCPU unwinds only on a durable run, whose window is committed.
-                    mark_reissue(env.mem_base);
-                }
-                return result;
+            if let Some(outcome) = *st {
+                return Some(outcome);
             }
             if _pg.is_none() {
                 _pg = Some(dom.join_park(&done.joiner_parked));
@@ -2580,11 +2698,11 @@ unsafe fn task_join(
         }
         // Killed, or the child's domain is over: return; the join's trailing guards unwind.
         if epoch_fired(env.epoch_addr) || vm.ended().is_some() {
-            return 0;
+            return None;
         }
         if let Some(f) = freeze.filter(|f| f.landed()) {
             f.mark_reissue();
-            return 0; // a freeze: the join's trailing safepoint unwinds
+            return None; // a freeze: the join's trailing safepoint unwinds
         }
         fiber_rt::fiber_event_park(slot, None, fiber_rt::ParkOn::Thread);
     }

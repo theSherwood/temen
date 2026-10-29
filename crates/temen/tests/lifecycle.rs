@@ -402,8 +402,8 @@ fn jit_poll_observes_a_concurrently_running_child() {
 
 // ---- #2378: a spent or forged child handle gets the oracle's answer on the JIT ------------------
 
-/// A root that spawns three children (func 1, each returning 7: handles 0, 1 and 2), resolves its
-/// `"out"` stream as `vout`, then runs `ops`, which leaves its answer in `vr`.
+/// A root that spawns three children (func 1, each returning 7: slots 0, 1 and 2 at generation 1),
+/// resolves its `"out"` stream as `vout`, then runs `ops`, which leaves its answer in `vr`.
 fn three_children(ops: &str) -> String {
     format!(
         "memory 17
@@ -455,25 +455,27 @@ fn both(src: &str) -> [Result<Vec<i64>, temen_interp::Trap>; 2] {
     [interp, jit]
 }
 
-/// Every child op resolves a handle by the join's rule (`temen_ir::handle_slot`): child 0 spent by a
-/// join or a detach, a negative handle, and 3, past the table (the span is 4, and slot 3 was never
-/// issued). On a spent handle `join`, `poll`, `detach` and `kill` answer `-EBADF` (#2667); on a
-/// forged one they trap `ThreadFault`; `child_offer` and `grant` answer `-EINVAL` for both. The JIT
-/// trapped `CapFault` on a bad `poll` or `detach`, and killed a joined child.
+/// Every child op resolves a handle by the domain's child table (`temen_ir::handles`, #2043): child
+/// 0 spent by a join or a detach, a negative handle, and one past the table (slot 3 never issued).
+/// On a spent handle `join`, `poll`, `detach` and `kill` answer `-EBADF` (#2667); on a forged one
+/// they trap `ThreadFault`; `child_offer` and `grant` answer `-EINVAL` for both. The JIT trapped
+/// `CapFault` on a bad `poll` or `detach`, and killed a joined child.
 #[test]
 fn a_spent_or_forged_handle_gets_the_oracles_answer_on_the_jit() {
     use temen_interp::Trap;
+    let child0 = format!("  vbad = i32.const {}\n", temen_ir::handles::pack(0, 1));
+    let past = format!("  vbad = i32.const {}\n", temen_ir::handles::pack(3, 1));
     let spend = [
         (
             "joined",
-            "  vs0, vv0 = call.cap 6 1 (i32) -> (i64, i64) vinst (vh0)\n  vbad = i32.const 0\n",
+            "  vs0, vv0 = call.cap 6 1 (i32) -> (i64, i64) vinst (vh0)\n".to_string() + &child0,
         ),
         (
             "detached",
-            "  vd0 = call.cap 6 10 (i32) -> (i32) vinst (vh0)\n  vbad = i32.const 0\n",
+            "  vd0 = call.cap 6 10 (i32) -> (i32) vinst (vh0)\n".to_string() + &child0,
         ),
-        ("negative", "  vbad = i32.const -1\n"),
-        ("past the table", "  vbad = i32.const 3\n"),
+        ("negative", "  vbad = i32.const -1\n".to_string()),
+        ("past the table", past),
     ];
     let fault = Err(Trap::ThreadFault);
     let ebadf = Ok(vec![temen_ir::errno::EBADF]);
@@ -497,8 +499,8 @@ fn a_spent_or_forged_handle_gets_the_oracles_answer_on_the_jit() {
         ),
     ];
     let mut wrong = Vec::new();
-    for (handle, prelude) in spend {
-        let spent = matches!(handle, "joined" | "detached");
+    for (handle, prelude) in &spend {
+        let spent = matches!(*handle, "joined" | "detached");
         for (op, call, ebadf_when_spent) in &ops {
             let want = match (ebadf_when_spent, spent) {
                 (true, true) => &ebadf,
@@ -521,22 +523,37 @@ fn a_spent_or_forged_handle_gets_the_oracles_answer_on_the_jit() {
     );
 }
 
-/// A handle past the table that the mask folds onto a live child names that child on the JIT too:
-/// `join(5)` joins child 1, and `detach(5)` detaches it, so child 1's own handle is spent after:
-/// its join's status is `-EBADF` (#2667).
+/// #2043 — a handle names a slot at a generation on the JIT too: slot 1's first handle joins child
+/// 1, and once child 1 is detached a fourth child takes its slot at the next generation, while child
+/// 1's own handle stays spent: its join's status is `-EBADF` (#2667).
 #[test]
-fn a_masked_handle_names_the_same_child_on_the_jit() {
-    let joined = both(&three_children(
-        "  vn = i32.const 5\n  vst, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vn)\n",
-    ));
-    assert_eq!(joined, [Ok(vec![7]), Ok(vec![7])], "join(5) joins child 1");
-    let detached = both(&three_children(
-        "  vn = i32.const 5\n  vd = call.cap 6 10 (i32) -> (i32) vinst (vn)\n  vr, vv = call.cap 6 1 (i32) -> (i64, i64) vinst (vh1)\n",
-    ));
+fn a_handle_names_its_slot_at_a_generation_on_the_jit() {
+    let joined = both(&three_children(&format!(
+        "  vn = i32.const {}\n  vst, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vn)\n",
+        temen_ir::handles::pack(1, 1)
+    )));
+    assert_eq!(
+        joined,
+        [Ok(vec![7]), Ok(vec![7])],
+        "slot 1, generation 1 joins child 1"
+    );
+    let detach_then_spawn = "  vd = call.cap 6 10 (i32) -> (i32) vinst (vh1)\n  vh3 = call.cap 6 17 (i64) -> (i32) vinst (vrp)\n";
+    let reissued = both(&three_children(&format!(
+        "{detach_then_spawn}  vr = i64.extend_i32_s vh3\n"
+    )));
+    let next = Ok(vec![i64::from(temen_ir::handles::pack(1, 2))]);
+    assert_eq!(
+        reissued,
+        [next.clone(), next],
+        "the fourth child takes slot 1, generation 2"
+    );
+    let spent = both(&three_children(&format!(
+        "{detach_then_spawn}  vr, vv = call.cap 6 1 (i32) -> (i64, i64) vinst (vh1)\n"
+    )));
     let ebadf = Ok(vec![temen_ir::errno::EBADF]);
     assert_eq!(
-        detached,
+        spent,
         [ebadf.clone(), ebadf],
-        "detach(5) detaches child 1"
+        "and child 1's handle stays spent"
     );
 }

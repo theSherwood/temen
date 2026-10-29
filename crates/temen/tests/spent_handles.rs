@@ -80,11 +80,18 @@ block 0 () {{
     pin_returns(&src, "a re-join", &[0, 5, EBADF, 0]);
 }
 
-/// A handle that names no slot is a forgery: negative, or past the table where the mask folds it
-/// onto no slot (three threads span four slots, and slot 3 was never issued).
+/// A handle the domain's child table never issued is a forgery (#2043): negative, a slot past the
+/// table (three threads fill slots 0 to 2), a generation its slot never reached, or a bare slot
+/// index, whose generation 0 is never issued.
 #[test]
 fn a_forged_thread_handle_traps() {
-    for (what, h) in [("join(-1)", "-1"), ("join(3)", "3")] {
+    let pack = temen_ir::handles::pack;
+    for (what, h) in [
+        ("join(-1)", -1),
+        ("join(slot 3)", pack(3, 1)),
+        ("join(slot 1, gen 2)", pack(1, 2)),
+        ("join(slot 1, gen 0)", pack(1, 0)),
+    ] {
         let src = format!(
             "func () -> (i64) {{
 block 0 () {{
@@ -105,6 +112,68 @@ block 0 () {{
         );
         pin_traps(&src, what, "ThreadFault");
     }
+}
+
+/// #2043 — a thread handle is a slot at a generation: the first spawn's is slot 0's first, and a
+/// joined thread's slot is reissued at its next generation, its old handle spent rather than naming
+/// the newcomer. Returns `(first, second, the old handle's join status, the newcomer's value)`.
+#[test]
+fn a_joined_threads_slot_is_reissued_at_its_next_generation() {
+    let src = format!(
+        "func () -> (i64, i64, i64, i64) {{
+block 0 () {{
+  vsp = i64.const 0
+  va = i64.const 5
+  vt0 = thread.spawn 1 vsp va
+  vs0, vv0 = thread.join vt0
+  vb = i64.const 9
+  vt1 = thread.spawn 1 vsp vb
+  vs, vv = thread.join vt0
+  vs1, vv1 = thread.join vt1
+  vh0 = i64.extend_i32_s vt0
+  vh1 = i64.extend_i32_s vt1
+  return vh0 vh1 vs vv1
+  }}
+}}
+{WORKER}"
+    );
+    let pack = |slot, generation| i64::from(temen_ir::handles::pack(slot, generation));
+    pin_returns(&src, "a reissued slot", &[pack(0, 1), pack(0, 2), EBADF, 9]);
+}
+
+/// #2380 — a slot is reused once its thread is joined, so a domain that spawns and joins in a loop
+/// never runs out of handles: 3,000 spawns, though the table holds 1,024 at once, and the last one
+/// takes slot 0 at generation 3,000.
+#[test]
+fn a_spawn_join_loop_reuses_one_slot() {
+    let src = format!(
+        "func () -> (i64) {{
+block 0 () {{
+  vn = i64.const 3000
+  vh = i32.const 0
+  br 1(vn, vh)
+}}
+block 1 (vi: i64, vlast: i32) {{
+  vz = i64.eqz vi
+  br_if vz 3(vlast) 2(vi)
+}}
+block 2 (vj: i64) {{
+  vsp = i64.const 0
+  vt = thread.spawn 1 vsp vj
+  vs, vv = thread.join vt
+  vone = i64.const 1
+  vk = i64.sub vj vone
+  br 1(vk, vt)
+}}
+block 3 (vfin: i32) {{
+  vr = i64.extend_i32_s vfin
+  return vr
+  }}
+}}
+{WORKER}"
+    );
+    let last = i64::from(temen_ir::handles::pack(0, 3000));
+    pin_returns(&src, "a spawn-join loop", &[last]);
 }
 
 /// A fiber that returns its argument plus 100.

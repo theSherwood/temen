@@ -1,7 +1,7 @@
-//! Generation-checked handle tables (DESIGN.md §3c): the one layout and the one rule a domain's
-//! handles are issued and resolved by. A domain holds two tables of them, each shared by all its
-//! vCPUs: its capabilities (the powerbox), and its children, where `thread.spawn` threads and §14
-//! children share one table (#2043, D1–D3).
+//! Generation-checked handle tables (DESIGN.md §3c): the one layout a domain's handles pack by, and
+//! the table its children are issued and resolved by. A domain holds two tables of handles, each
+//! shared by all its vCPUs: its capabilities (the powerbox, which packs by this layout), and its
+//! children, where `thread.spawn` threads and §14 children share one [`Table`] (#2043, D1–D3).
 //!
 //! A handle is a positive `i32` packing `(generation << SLOT_BITS) | slot`. A slot's counter
 //! advances when the slot issues a handle, never when the handle is retired, so every generation in

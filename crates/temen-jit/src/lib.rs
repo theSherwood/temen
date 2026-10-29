@@ -569,8 +569,12 @@ pub struct FrozenVCpu {
     /// children, a child's task for a grandchild. Thaw rebuilds the per-parent join tables from this so
     /// a grandchild's reloaded handle resolves in its parent's table. Mirror of `temen_interp`'s field.
     pub parent_task: usize,
-    /// The child's handle in its spawner's join table (#1685) — the thaw re-attaches it there.
+    /// Its slot in its domain's child table (#1685, #2043) — the thaw re-attaches it there. `0` for
+    /// one no handle names ([`Self::joinable`]).
     pub slot: usize,
+    /// #2043 — whether a handle still names it: `false` for one its spawner detached, which rides at
+    /// slot `0` and thaws with no handle naming it. Mirror of `temen_interp`'s field.
+    pub joinable: bool,
     pub func: i32,
     pub args: Vec<i64>,
     pub shadow_sp: u64,
@@ -1839,6 +1843,9 @@ pub struct DurableResidue {
     /// shared active-SP word ends at the last child's. `None` ⇒ the root's extent is the window's own
     /// active-SP word (a single-vCPU run).
     pub root_sp: Option<u64>,
+    /// #2043 — the domain's child-handle table: every slot's counter, which the records above name
+    /// their slots in (`temen_ir::handles::Table::generations`). Empty when the domain never spawned.
+    pub children: Vec<u32>,
 }
 
 /// #1361 step 4 — a **detached** child a durable JIT freeze reached: what the embedder needs to put
@@ -2592,10 +2599,11 @@ mod domain_teardown_tests {
     }
 
     /// Rule 2 for the **`thread.join` park**: a sibling blocked joining the forever-parked daemon
-    /// (handle 0, the first spawn) must also unwind when the root returns — the join park site has
-    /// its own teardown check and its own wake.
+    /// (the first spawn's handle, slot 0 at generation 1) must also unwind when the root returns —
+    /// the join park site has its own teardown check and its own wake.
     #[test]
     fn root_return_tears_down_parked_joiner() {
+        let daemon = temen_ir::handles::pack(0, 1);
         let src = format!(
             "memory 16\n\
              func () -> (i64) {{\n\
@@ -2614,7 +2622,7 @@ mod domain_teardown_tests {
              {PARKED_DAEMON}\
              func (i64, i64) -> (i64) {{\n\
              block 0 (vsp: i64, v0: i64) {{\n\
-             \x20 v1 = i32.const 0\n\
+             \x20 v1 = i32.const {daemon}\n\
              \x20 v2_st, v2 = thread.join v1\n\
              \x20 return v2\n\
                }}\n\
@@ -2978,6 +2986,9 @@ pub struct CompiledModule {
     /// child's extent, so the root's own extent is reported separately for a thaw to restore. `0` on a
     /// non-freeze run.
     frozen_root_sp_out: u64,
+    /// #2043 — the domain's child-handle table's counters at the freeze (see
+    /// [`DurableResidue::children`]). Empty on a non-freeze run.
+    frozen_children_out: Vec<u32>,
     /// Durable **thaw** seed (slice 3.3): the spawned vCPUs to re-attach + run before the root re-enters
     /// under `REWINDING`. Empty for a freeze / ordinary run.
     frozen_vcpu_seed: Vec<FrozenVCpu>,
@@ -4054,6 +4065,7 @@ impl CompiledModule {
             frozen_out: Vec::new(),
             frozen_vcpus_out: Vec::new(),
             frozen_root_sp_out: 0,
+            frozen_children_out: Vec::new(),
             frozen_vcpu_seed: Vec::new(),
             detached_out: Vec::new(),
             detached_seed: Vec::new(),
@@ -4361,6 +4373,7 @@ impl CompiledModule {
             frozen_out: Vec::new(),
             frozen_vcpus_out: Vec::new(),
             frozen_root_sp_out: 0,
+            frozen_children_out: Vec::new(),
             frozen_vcpu_seed: Vec::new(),
             detached_out: Vec::new(),
             detached_seed: Vec::new(),
@@ -4423,6 +4436,14 @@ impl CompiledModule {
         if let Some(sp) = seed.root_sp {
             self.thaw_root_sp = sp;
         }
+        // #2043 — the domain's child table as its freeze left it, before the thaw pins its records
+        // back: a spent handle stays spent, and the next spawn takes the handle the uninterrupted
+        // run would have (#2619).
+        #[cfg(fiber_rt)]
+        if let Some(d) = &self.domain {
+            *os_thread_rt::lock(&d.children().table) =
+                temen_ir::handles::Table::from_generations(&seed.children);
+        }
         self.durable = true;
     }
 
@@ -4434,6 +4455,7 @@ impl CompiledModule {
             fibers: std::mem::take(&mut self.frozen_out),
             vcpus: std::mem::take(&mut self.frozen_vcpus_out),
             root_sp: (root_sp != 0).then_some(root_sp),
+            children: std::mem::take(&mut self.frozen_children_out),
         }
     }
 
@@ -5169,6 +5191,9 @@ impl CompiledModule {
                 // §12.8 4A.5 follow-up B: a concurrent child that owns fibers flattened them in its own
                 // `run_child` `freeze_drive`, recorded during `join_all` — drain after the join.
                 (*this).frozen_out.extend(d.take_frozen_fibers());
+                // #2043 — and the domain's child table, which the records name their slots in: after
+                // the join and the nursery's harvest, nothing changes it.
+                (*this).frozen_children_out = d.children().generations();
             }
         }
         // #1684 — every fiber slot nobody flattened rides too (a fresh one, a free one), so the thaw
@@ -7657,6 +7682,7 @@ fn compile_child_windowed(
         frozen_out: Vec::new(),
         frozen_vcpus_out: Vec::new(),
         frozen_root_sp_out: 0,
+        frozen_children_out: Vec::new(),
         frozen_vcpu_seed: Vec::new(),
         detached_out: Vec::new(),
         detached_seed: Vec::new(),
@@ -8627,7 +8653,7 @@ fn nursery_over(
     domain: Option<&os_thread_rt::Domain>,
     shadow: temen_ir::durable_abi::ShadowArena,
 ) -> Box<instantiator_rt::Nursery> {
-    Box::new(instantiator_rt::Nursery::new(
+    let n = Box::new(instantiator_rt::Nursery::new(
         cap_thunk,
         cap_ctx,
         resolve_module,
@@ -8635,7 +8661,11 @@ fn nursery_over(
         domain.map_or(0, |d| d as *const os_thread_rt::Domain as usize),
         None, // the run's own child executor
         shadow,
-    ))
+        // #2043 D1 — the domain's one child table, its threads' and its §14 children's.
+        domain.map_or_else(Default::default, |d| std::sync::Arc::clone(d.children())),
+    ));
+    n.adopt();
+    n
 }
 
 /// [`module_uses_instantiator`] over a bare function list — a §22 unit's, in `define_extra`.

@@ -64,7 +64,15 @@ fn le_i64(w: &[u8], off: i64) -> i64 {
 }
 
 /// A concurrent freeze result: `(outcome, window image, fiber residue, vCPU residue, root extent)`.
-type FreezeOutcome = (JitOutcome, Vec<u8>, Vec<FrozenFiber>, Vec<FrozenVCpu>, u64);
+/// A freeze's outcome, window, fibers, vCPUs, root extent and child-handle table (#2043).
+type FreezeOutcome = (
+    JitOutcome,
+    Vec<u8>,
+    Vec<FrozenFiber>,
+    Vec<FrozenVCpu>,
+    u64,
+    Vec<u32>,
+);
 
 /// Who requests the freeze once the guest signals.
 #[derive(Clone, Copy)]
@@ -151,7 +159,7 @@ fn concurrent_freeze_from(inst: &Module, from: FreezeFrom) -> Option<FreezeOutco
         c.join().unwrap();
     }
     match res {
-        Ok((o, s, r)) => Some((o, s, r.fibers, r.vcpus, r.root_sp.unwrap_or(0))),
+        Ok((o, s, r)) => Some((o, s, r.fibers, r.vcpus, r.root_sp.unwrap_or(0), r.children)),
         Err(JitError::Unsupported(_)) => None,
         Err(JitError::Backend(msg)) if msg.contains("Allocation error") => None,
         Err(e) => panic!("concurrent freeze failed: {e:?}"),
@@ -164,6 +172,7 @@ fn thaw(
     fibers: &[FrozenFiber],
     vcpus: &[FrozenVCpu],
     root_sp: u64,
+    children: &[u32],
 ) -> (JitOutcome, Vec<u8>) {
     let mut twin = snap.to_vec();
     begin_thaw(&mut twin, TEST_ARENA, 0);
@@ -191,6 +200,7 @@ fn thaw(
                 fibers: fibers.to_vec(),
                 vcpus: vcpus.to_vec(),
                 root_sp: Some(root_sp),
+                children: children.to_vec(),
             },
             ..Default::default()
         },
@@ -265,7 +275,7 @@ block 2 (v12: i64, v13: i32, v14: i64) {
 #[test]
 fn concurrent_children_self_unwind_and_thaw_reproduces_the_result() {
     let inst = instrument(SRC_LOOPS);
-    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp, fchildren)) = concurrent_freeze(&inst) else {
         return;
     };
 
@@ -286,7 +296,7 @@ fn concurrent_children_self_unwind_and_thaw_reproduces_the_result() {
         "both concurrent children were captured as residue"
     );
 
-    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp, &fchildren);
     assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
     assert_eq!(
         read_state(&tfinal, TEST_ARENA),
@@ -342,7 +352,7 @@ fn concurrent_join_result_survives_a_freeze_before_the_join() {
     let inst = instrument(SRC_JOIN);
     const ORACLE: i64 = K + 1007; // loop total + child(arg 7 + 1000)
 
-    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp, fchildren)) = concurrent_freeze(&inst) else {
         return;
     };
 
@@ -361,7 +371,7 @@ fn concurrent_join_result_survives_a_freeze_before_the_join() {
         "the child's join result rides the artifact",
     );
 
-    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp, &fchildren);
     assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
     assert_eq!(
         read_state(&tfinal, TEST_ARENA),
@@ -451,7 +461,7 @@ block 0 (v0: i64, v1: i64) {
 #[test]
 fn concurrent_child_owns_fiber_through_freeze_thaw() {
     let inst = instrument(SRC_CHILD_FIBER);
-    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp, fchildren)) = concurrent_freeze(&inst) else {
         return;
     };
 
@@ -475,7 +485,7 @@ fn concurrent_child_owns_fiber_through_freeze_thaw() {
         return;
     }
 
-    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp, &fchildren);
     assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
     assert_eq!(
         read_state(&tfinal, TEST_ARENA),
@@ -581,7 +591,7 @@ block 2 (v12: i64) {
 #[test]
 fn concurrent_child_owns_active_chain_fiber_through_freeze_thaw() {
     let inst = instrument(SRC_CHILD_FIBER_ACTIVE);
-    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp, fchildren)) = concurrent_freeze(&inst) else {
         return;
     };
 
@@ -600,7 +610,7 @@ fn concurrent_child_owns_active_chain_fiber_through_freeze_thaw() {
         return;
     }
 
-    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp, &fchildren);
     assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
     assert_eq!(
         read_state(&tfinal, TEST_ARENA),
@@ -663,7 +673,7 @@ block 2 (v12: i64) {
 #[test]
 fn concurrent_freeze_while_root_blocked_in_join() {
     let inst = instrument(SRC_BLOCKED_JOIN);
-    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp, fchildren)) = concurrent_freeze(&inst) else {
         return;
     };
 
@@ -677,7 +687,7 @@ fn concurrent_freeze_while_root_blocked_in_join() {
         "freeze placeholder while the root was blocked in the join",
     );
 
-    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp, &fchildren);
     assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
     assert_eq!(
         read_state(&tfinal, TEST_ARENA),
@@ -843,7 +853,7 @@ block 2 (v12: i64) {
 #[test]
 fn nested_concurrent_tree_freezes_and_thaws() {
     let inst = instrument(SRC_NESTED_FREEZE);
-    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp, fchildren)) = concurrent_freeze(&inst) else {
         return;
     };
 
@@ -859,7 +869,7 @@ fn nested_concurrent_tree_freezes_and_thaws() {
         "concurrent freeze returns a placeholder",
     );
 
-    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp, &fchildren);
     assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
     assert_eq!(
         read_state(&tfinal, TEST_ARENA),
@@ -941,7 +951,7 @@ block 2 (v8: i64) {
 #[test]
 fn concurrent_freeze_while_root_blocked_in_wait_thaws_when_value_changed() {
     let inst = instrument(SRC_WAIT_WORKS);
-    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) =
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp, fchildren)) =
         concurrent_freeze_from(&inst, FreezeFrom::Signal)
     else {
         return;
@@ -957,7 +967,7 @@ fn concurrent_freeze_while_root_blocked_in_wait_thaws_when_value_changed() {
         "freeze placeholder while the root was blocked in the wait: {fout:?}",
     );
 
-    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp, &fchildren);
     assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
     assert_eq!(
         read_state(&tfinal, TEST_ARENA),
@@ -1027,7 +1037,7 @@ block 2 (v12: i64) {
 #[test]
 fn concurrent_freeze_while_root_blocked_in_wait_fails_closed_on_thaw() {
     let inst = instrument(SRC_WAIT_DEADLOCK);
-    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp, fchildren)) = concurrent_freeze(&inst) else {
         return;
     };
 
@@ -1040,7 +1050,7 @@ fn concurrent_freeze_while_root_blocked_in_wait_fails_closed_on_thaw() {
         "freeze placeholder while the root was blocked in the wait",
     );
 
-    let (tout, _tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    let (tout, _tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp, &fchildren);
     assert!(
         matches!(tout, JitOutcome::Trapped(TrapKind::ThreadFault)),
         "a re-issued wait whose every notifier has exited fails closed (ThreadFault), got {tout:?}",
@@ -1109,7 +1119,7 @@ block 2 (v12: i64) {
 #[test]
 fn concurrent_freeze_while_root_blocked_in_wait_thaws_via_sibling_notify() {
     let inst = instrument(SRC_WAIT_NOTIFY);
-    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp, fchildren)) = concurrent_freeze(&inst) else {
         return;
     };
 
@@ -1122,7 +1132,7 @@ fn concurrent_freeze_while_root_blocked_in_wait_thaws_via_sibling_notify() {
         "freeze placeholder while the root was blocked in the wait",
     );
 
-    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp, &fchildren);
     assert!(
         matches!(tout, JitOutcome::Returned(_)),
         "thaw resolves (the parked wait is woken by the sibling's re-issued notify), got {tout:?}",
@@ -1315,7 +1325,8 @@ fn concurrent_freeze_thaw_is_deterministic_across_interleavings() {
     // Kept modest (the controller `yield_now`s rather than busy-spins, so this doesn't starve CI cores).
     let inst = instrument(SRC_LOOPS);
     for i in 0..10 {
-        let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+        let Some((fout, fsnap, ffibers, fvcpus, froot_sp, fchildren)) = concurrent_freeze(&inst)
+        else {
             continue; // unsupported shape / host alloc pressure: skip this iteration
         };
         if read_state(&fsnap, TEST_ARENA) != STATE_UNWINDING {
@@ -1329,7 +1340,7 @@ fn concurrent_freeze_thaw_is_deterministic_across_interleavings() {
             matches!(fout, JitOutcome::Returned(_)),
             "iter {i}: freeze placeholder"
         );
-        let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+        let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp, &fchildren);
         assert!(
             matches!(tout, JitOutcome::Returned(_)),
             "iter {i}: thaw returns"
@@ -1431,7 +1442,7 @@ block 2 (v12: i64, v13: i32, v14: i64) {
 fn recycled_context_freeze_residue_is_sparse() {
     let inst = instrument(SRC_RECYCLE);
     const ROOT_ORACLE: i64 = K + 1007; // root loop total K + A's join result (7 + 1000)
-    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp, fchildren)) = concurrent_freeze(&inst) else {
         return;
     };
     if read_state(&fsnap, TEST_ARENA) != STATE_UNWINDING {
@@ -1449,16 +1460,18 @@ fn recycled_context_freeze_residue_is_sparse() {
         "freeze placeholder"
     );
     // The recycled-context residue: A finished + had its context freed, then B reserved a context (reusing
-    // the freed slot) and froze live there. A was joined before the freeze, so only **B** rides — at its
-    // own join slot (1), which the thaw seeds directly, leaving A's slot empty (#1685).
+    // the freed slot) and froze live there. A was joined before the freeze, so only **B** rides — at slot
+    // 0, A's, which A's join freed and B's spawn reissued at generation 2 (#2043): the slot's counter
+    // rides, so the thaw re-seeds B under the handle its spawner holds.
     assert_eq!(fvcpus.len(), 1, "B frozen; A joined, so it does not ride");
     assert_eq!(
         (fvcpus[0].slot, fvcpus[0].completed_result),
-        (1, None),
-        "B frozen at its join slot"
+        (0, None),
+        "B frozen at the slot it reissued"
     );
+    assert_eq!(fchildren, [2], "the slot's second generation");
 
-    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
+    let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp, &fchildren);
     assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
     assert_eq!(
         read_state(&tfinal, TEST_ARENA),
@@ -1479,7 +1492,8 @@ fn recycled_context_freeze_residue_is_sparse() {
 
 // §12.8 4A.6 codec follow-up — the recycled-context artifact through the **temen-snapshot §12 codec**.
 // `recycled_context_freeze_residue_is_sparse` (above) checks the *in-memory* residue shape; this drives
-// the **same real concurrent freeze residue** (B frozen at slot 1, A joined and its context recycled)
+// the **same real concurrent freeze residue** (B frozen at slot 0, the slot A's join freed, A's context
+// recycled)
 // through the serialize/restore codec and asserts the **§12.6 invariant 1 (canonical re-freeze)**:
 // serialize → restore → re-serialize is **byte-identical**, with the vCPU residue and the sparse window
 // image (recycled regions zero-elided) surviving intact.
@@ -1493,7 +1507,7 @@ fn recycled_context_freeze_residue_is_sparse() {
 #[test]
 fn recycled_context_artifact_canonical_re_freeze_through_the_codec() {
     let inst = instrument(SRC_RECYCLE);
-    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp, fchildren)) = concurrent_freeze(&inst) else {
         return;
     };
     if read_state(&fsnap, TEST_ARENA) != STATE_UNWINDING {
@@ -1530,6 +1544,7 @@ fn recycled_context_artifact_canonical_re_freeze_through_the_codec() {
             task: v.task,
             parent_task: v.parent_task,
             slot: v.slot,
+            joinable: v.joinable,
             func: v.func,
             args: v.args.clone(),
             shadow_sp: v.shadow_sp,
@@ -1543,6 +1558,7 @@ fn recycled_context_artifact_canonical_re_freeze_through_the_codec() {
     fhost.set_frozen_fibers(i_fibers);
     fhost.set_frozen_vcpus(i_vcpus);
     fhost.set_frozen_root_sp(froot_sp);
+    fhost.set_child_generations(fchildren);
 
     // Serialize the real §12 artifact carrying the recycled residue + sparse window image.
     let artifact = codec_freeze(&inst, &fsnap, &fhost).expect("recycled artifact serializes");
@@ -1562,9 +1578,10 @@ fn recycled_context_artifact_canonical_re_freeze_through_the_codec() {
             .iter()
             .map(|v| (v.slot, v.completed_result))
             .collect::<Vec<_>>(),
-        vec![(1, None)],
-        "restore re-seeded B at its join slot",
+        vec![(0, None)],
+        "restore re-seeded B at the slot it reissued",
     );
+    assert_eq!(thost.child_generations(), &[2], "and the slot's counter");
 
     // §12.6 invariant 1 — canonical: re-serializing the freshly-restored domain reproduces the recycled
     // artifact byte-for-byte (sparse window image + recycled vCPU residue).

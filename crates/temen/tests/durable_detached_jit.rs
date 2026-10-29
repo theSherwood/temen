@@ -1288,49 +1288,6 @@ fn controller_freeze(child: &str, check: impl FnOnce(&Host)) {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// #2041 — a JIT thaw refuses, whole, two detached children of one domain that claim one join slot.
-/// The interpreter keeps a join table per spawning vCPU, so children of different spawners can share
-/// a slot number; the JIT keeps one per domain, where both handles would name one child. Here the
-/// captured child's live grandchild holds slot 0, and a completed record from another of its vCPUs
-/// claims slot 0 too. The residue stays on the host for a thaw on the interpreter.
-#[test]
-fn a_jit_thaw_refuses_two_detached_children_at_one_join_slot() {
-    let (root, nest) = nest_modules(&nest());
-    let (mut fhost, args) = nest_powerbox(&nest, 0, 2);
-    let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
-    arm_freeze_after(&mut win, ARENA, 1);
-    let (_, _, fsnap) =
-        nest_run(Engine::Interp, &root, &args, &win, &mut fhost, None).expect("oracle");
-    let art = temen_snapshot::freeze(&root, &fsnap, &fhost).expect("serialize");
-    let (mut host, win) = nest_restore(&art, &root, &nest);
-    let mut thawed = host.take_thawed_detached();
-    assert_eq!(thawed.len(), 1, "the captured child");
-    thawed[0]
-        .host
-        .set_frozen_detached(vec![temen_interp::FrozenDetached {
-            parent_task: 3,
-            slot: 0,
-            completed_result: Ok(7),
-        }]);
-    host.set_thawed_detached(thawed);
-    let refused = temen_run::jit_cap_run(
-        &root,
-        0,
-        &args,
-        &MemLayout::image(win),
-        PARENT_LOG2,
-        0,
-        &mut host,
-        None,
-    );
-    assert!(
-        matches!(refused, Err(JitError::Unsupported(_))),
-        "the JIT refuses the thaw: {:?}",
-        refused.as_ref().map(|(o, _)| o)
-    );
-    assert_eq!(host.thawed_detached().len(), 1, "and keeps the residue");
-}
-
 /// #2010 — **a durable detached child's thread unwinds with it, and rides its artifact**, on every
 /// engine. The child spawns the thread while its window is `NORMAL`, so on the JIT the thread is an OS
 /// thread with a shadow context of its own; the freeze lands while the child is parked joining it and

@@ -306,7 +306,8 @@ use temen_ir::Module;
 /// order up to the last slot that ever issued. A child handle packs like a capability handle, and
 /// threads and §14 children share one table per domain, so a record's slot is the domain's, not its
 /// spawner's. A spent child handle stays spent across the thaw, and the next spawn gets the handle the
-/// uninterrupted run would have (#2619).
+/// uninterrupted run would have (#2619). A Section 2 vCPU record gains, after its slot, whether a
+/// handle still names it (`1`), or its spawner detached it (`0`, at slot `0`).
 const FORMAT_VERSION: u16 = 53;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
@@ -868,7 +869,8 @@ fn freeze_at(
                 for v in &vcpus {
                     write_uleb(b, v.task as u64);
                     write_uleb(b, v.parent_task as u64); // slice 3.4 (v4): who spawned it (nested spawns)
-                    write_uleb(b, v.slot as u64); // v33 (#1685): its handle in the spawner's join table
+                    write_uleb(b, v.slot as u64); // v33 (#1685): its slot in the domain's child table
+                    write_uleb(b, u64::from(v.joinable)); // v53 (#2043): a handle still names it
                     write_uleb(b, v.func as u32 as u64);
                     write_uleb(b, v.args.len() as u64);
                     for &a in &v.args {
@@ -2073,7 +2075,12 @@ fn restore_at(
         }
         None => Vec::new(),
     };
-    joinable_slots.extend(host.frozen_vcpus().iter().map(|v| v.slot));
+    joinable_slots.extend(
+        host.frozen_vcpus()
+            .iter()
+            .filter(|v| v.joinable)
+            .map(|v| v.slot),
+    );
     joinable_slots.extend(host.frozen_detached().iter().map(|d| d.slot));
     joinable_slots.sort_unstable();
     let issued = |&slot: &usize| child_generations.get(slot).is_some_and(|&g| g != 0);
@@ -2324,7 +2331,12 @@ fn decode_control(
             }
             last = Some(task);
             let parent_task = cr.uleb()?; // slice 3.4 (v4): the spawning task (nested spawns)
-            let slot = cr.uleb()?; // v33 (#1685): its handle in the spawner's join table
+            let slot = cr.uleb()?; // v33 (#1685): its slot in the domain's child table
+            let joinable = match cr.uleb()? {
+                0 => false,
+                1 => true,
+                _ => return Err(RestoreError::Malformed),
+            };
             let func = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)? as i32;
             let nargs = cr.uleb()?;
             let mut args = Vec::with_capacity(nargs as usize);
@@ -2337,10 +2349,15 @@ fn decode_control(
                 0 => None,
                 _ => Some(cr.uleb()? as i64),
             };
+            // An unjoinable vCPU rides at slot 0, and only while it runs: nothing can join its result.
+            if !joinable && (slot != 0 || completed_result.is_some()) {
+                return Err(RestoreError::Malformed);
+            }
             vcpus.push(FrozenVCpu {
                 task: usize::try_from(task).map_err(|_| RestoreError::Malformed)?,
                 parent_task: usize::try_from(parent_task).map_err(|_| RestoreError::Malformed)?,
                 slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
+                joinable,
                 func,
                 args,
                 shadow_sp,

@@ -739,8 +739,8 @@ answers the trap without spawning the child again (#2041). A thawed run frozen a
 was delivered, and the JIT's nursery marks the child, so the next freeze records it as completed as
 it did the first time. A thaw can be armed for that next freeze: a context's `REWINDING` is its own
 thaw word's, and the thaw leaves an `ARMED` freeze word alone (it clears only the `UNWINDING` the
-artifact froze with). The interpreter keeps a join table per spawning vCPU and the JIT one per
-domain, so a JIT thaw where two of a domain's children claim one slot is refused whole.
+artifact froze with). A domain keeps one child table on every engine (#2043), so a slot names one
+child everywhere, and the codec refuses an artifact where two records claim one.
 
 **A durable child's own children (#2010).** A durable child that spawns gets a durable nursery of its
 own, so its children are durable too, and the freeze reaches them through it:
@@ -1653,6 +1653,19 @@ drained handle faults at its use site; an all-durable drain is a no-op) and
 cancellation (R2); the guest-facing first-class `self.close` op (vs. this host primitive) is a possible
 ergonomics follow-up.
 
+### 12.5b Section 13 — Child-handle table (v53, #2043)
+
+A domain's `thread.spawn` vCPUs and its §14 children take their handles from one table on every
+engine (DESIGN §12), packed as a capability handle is, and the table rides as the capability table
+does: every slot's counter, in slot order up to the last slot that ever issued, elided when the
+domain never spawned. Each record of a child — a frozen or completed vCPU (Section 2), a captured or
+completed detached child (Sections 2 and 8) — names its slot in it. So after a thaw a handle spent
+before the cut still answers `-EBADF`, a live one names the child it named, and the next spawn takes
+the handle the uninterrupted run takes (#2619). A record no handle names any more — a vCPU or a child
+its spawner detached (op 10) — rides unjoinable at slot 0 and thaws with no handle naming it; a vCPU
+that finished after its detach does not ride, since nothing can join it. The restore refuses an
+artifact whose joinable records name a slot the table never issued, or two records one slot.
+
 ### 12.6 Round-trip / equivalence contract
 
 The format exists to make this testable (extends §7, `jit_diff.rs` / `fuzz/diff.rs`):
@@ -2109,9 +2122,8 @@ vcpus, nested, root_sp }` — the interpreter's residue, piece for piece — and
 carry all of it through the `Host` both ways. An async freeze controller now always engages the
 concurrent path, so a child spawned while `NORMAL` has its own shadow context rather than unwinding into
 the root's (#1691). Residue the JIT cannot re-create yet (a separate-module nested child, a nested
-child's host state, a live detached child whose program the thawing host no longer grants — #1692 —
-or two detached children of one domain at one join slot, #2041) is refused whole as `Unsupported` and
-left on the `Host` for an interpreter thaw, never dropped. Pinned by `durable_multivcpu_jit.rs`
+child's host state, or a live detached child whose program the thawing host no longer grants — #1692)
+is refused whole as `Unsupported` and left on the `Host` for an interpreter thaw, never dropped. Pinned by `durable_multivcpu_jit.rs`
 (`the_embedder_jit_path_carries_the_vcpu_residue_both_ways`, `…_refuses_residue_it_cannot_recreate_and_keeps_it`).
 
 **Declined freezes (#1671, owner decision 2026-09-23).** A freeze that cannot complete is **declined at its
@@ -2655,8 +2667,8 @@ per-context word set on all contexts at once — TBD in stage 1.
    has gone false can never be satisfied (a parked waiter can't notify itself; a wasm wait returns only on
    notify/timeout), so it fails closed with `ThreadFault` (the interp's join-deadlock) within `KILL_RECHECK`
    of the last peer exiting — general (helps fresh runs too), not thaw-specific. **Join ordering:**
-   `thread_join` resolves its per-vCPU table by the per-OS-thread task (`CONCURRENT_SPAWN_TASK`), not the
-   shared `cur_task`, so a concurrent child's nested grandchild-join routes correctly. *Known gap:* a
+   `thread_join` resolves a handle in the domain's one child table (#2043), so a concurrent child's
+   nested grandchild-join routes correctly whichever vCPU joins. *Known gap:* a
    *mutual* block (two live vCPUs each waiting on the other) isn't caught by the `live`-count heuristic —
    the interp catches it via scheduler quiescence; a future cross-thread quiescence check would close it.
 3. **Determinism / equivalence (LANDED).** A concurrent thaw reintroduces real interleaving; §12.6 holds:

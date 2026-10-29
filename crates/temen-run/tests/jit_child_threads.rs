@@ -132,8 +132,9 @@ block 0 (vsp: i64, varg: i64) {
 }
 ";
 
-/// The child's root spawns two vCPUs and joins both. Its handles are its own (0 and 1), however many
-/// vCPUs the parent's domain has: `h0 * 1000 + h1 * 100 + 10 + 20`.
+/// The child's root spawns two vCPUs and joins both. Its handles are its own child table's first two
+/// (slots 0 and 1 at generation 1, #2043), however many vCPUs the parent's domain has:
+/// `h0 * 1000 + h1 * 100 + 10 + 20`.
 #[test]
 fn a_child_spawns_and_joins_its_own_threads() {
     let child = format!(
@@ -162,7 +163,11 @@ block 0 (vs: i64) {{
 }}
 {TIMES_TEN}"
     );
-    assert_eq!(parity(&child), Ok(130));
+    let (h0, h1) = (temen_ir::handles::pack(0, 1), temen_ir::handles::pack(1, 1));
+    assert_eq!(
+        parity(&child),
+        Ok(i64::from(h0) * 1000 + i64::from(h1) * 100 + 30)
+    );
 }
 
 /// A child's vCPU parks on a word of the child's window until the child's root notifies it, then
