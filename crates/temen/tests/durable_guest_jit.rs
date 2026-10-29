@@ -17,7 +17,9 @@
 //!
 //! **Install-durability** (`durable_jit_install_slot_survives_freeze_thaw`(`_native`)): a unit's B2
 //! `install` occupancy rides the artifact (Section 5 / v17) and is re-applied on thaw, so a
-//! `call.dyn` through an installed slot resolves after a freeze/thaw on both backends.
+//! `call.dyn` through an installed slot resolves after a freeze/thaw on the tree-walker, the bytecode
+//! pump and the native JIT. Without a freeze too: the next run over the same powerbox re-applies it
+//! (`jit_install_slot_survives_into_the_next_run`, #2670).
 //!
 //! **In-flight continuation** (`durable_jit_install_call_indirect_freezes_in_flight_continuation`):
 //! `invoke` is a seam-free atomic leaf (never interrupted mid-flight), so the freezable path for
@@ -375,72 +377,121 @@ fn install_unit() -> Vec<u8> {
 /// A `call.dyn` table reservation with room for the installer's padding slots.
 const TABLE_LOG2: u8 = 4;
 
-/// **Install-durability, interpreter.** A guest compiles + `install`s a unit into a `call.dyn`
+/// An interpreter's capture entry: `func(args)` over a window seeded from `init_mem`, answering the
+/// result and the window the run leaves.
+type Capture = fn(
+    &temen_ir::Module,
+    u32,
+    &[Value],
+    &mut u64,
+    &[u8],
+    u8,
+    &mut Host,
+) -> (Result<Vec<Value>, temen_interp::Trap>, Vec<u8>);
+
+/// Both interpreters, each by its capture entry: the tree-walker and the bytecode pump.
+const INTERPRETERS: [(&str, Capture); 2] = [
+    ("tree-walker", run_capture_reserved_with_host),
+    ("bytecode", |m, func, args, fuel, init_mem, reserved_log2, host| {
+        temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
+            m,
+            func,
+            args,
+            fuel,
+            init_mem,
+            reserved_log2,
+            host,
+        )
+        .expect("the bytecode engine runs the installer")
+    }),
+];
+
+/// Entry 0 on `run` over `host`: compile + install the unit (staged at `BLOB_OFF`) → its table slot,
+/// and the window the run leaves.
+fn install(run: Capture, m: &temen_ir::Module, jd: i32, host: &mut Host) -> (i32, Vec<u8>) {
+    let unit = install_unit();
+    let mut win = vec![0u8; WINDOW];
+    win[BLOB_OFF..BLOB_OFF + unit.len()].copy_from_slice(&unit);
+    let args = [
+        Value::I32(jd),
+        Value::I64(BLOB_OFF as i64),
+        Value::I64(unit.len() as i64),
+    ];
+    let mut fuel = 5_000_000u64;
+    let (r, snap) = run(m, 0, &args, &mut fuel, &win, SIZE_LOG2, host);
+    let slot = match r.expect("install ok").as_slice() {
+        [Value::I64(s)] if *s >= 0 => *s as i32,
+        other => panic!("install returned {other:?}"),
+    };
+    (slot, snap)
+}
+
+/// Entry 1 on `run` over `host` and `window`: `call.dyn` through `slot`.
+fn call_slot(
+    run: Capture,
+    m: &temen_ir::Module,
+    slot: i32,
+    window: &[u8],
+    host: &mut Host,
+) -> Result<Vec<Value>, temen_interp::Trap> {
+    let mut fuel = 5_000_000u64;
+    run(m, 1, &[Value::I32(slot)], &mut fuel, window, SIZE_LOG2, host).0
+}
+
+/// **An install outlives its run** (#2670). The dispatch table is a per-run transient (§12.4), so
+/// each interpreter records the install on the powerbox and re-applies it when the next run over that
+/// powerbox builds its table: entry 1, a second run, `call.dyn`s the slot entry 0 filled → 42.
+#[test]
+fn jit_install_slot_survives_into_the_next_run() {
+    let m = parse_module(INSTALLER_CALLER).expect("parse installer/caller");
+    verify_module(&m).expect("verify");
+    for (engine, run) in INTERPRETERS {
+        let mut host = Host::new();
+        let jd = grant_jit(&mut host, &m, TABLE_LOG2);
+        let (slot, window) = install(run, &m, jd, &mut host);
+        assert_eq!(
+            call_slot(run, &m, slot, &window, &mut host),
+            Ok(vec![Value::I64(42)]),
+            "{engine}: call.dyn through the slot a previous run filled → 42"
+        );
+    }
+}
+
+/// **Install-durability, interpreters.** A guest compiles + `install`s a unit into a `call.dyn`
 /// slot, the domain is frozen + restored, and a second entry `call.dyn`s that slot → 42. The
 /// dispatch table is a per-run transient (§12.4), so the occupancy is recorded on the domain, rides
 /// the artifact (Section 5, v17), and is **re-applied** when the thaw run builds its table.
 #[test]
 fn durable_jit_install_slot_survives_freeze_thaw() {
-    let unit = install_unit();
     let m = parse_module(INSTALLER_CALLER).expect("parse installer/caller");
     verify_module(&m).expect("verify");
+    for (engine, run) in INTERPRETERS {
+        let mut hd = Host::new();
+        let jd = grant_jit(&mut hd, &m, TABLE_LOG2);
+        let (slot, snap) = install(run, &m, jd, &mut hd);
 
-    let mut hd = Host::new();
-    let jd = grant_jit(&mut hd, &m, TABLE_LOG2);
+        // Freeze + restore. The install occupancy is captured on the domain and re-granted.
+        let artifact = freeze(&m, &snap, &hd).expect("freeze");
+        let mut th = Host::new();
+        let window = restore(&artifact, &m, &mut th).expect("restore");
+        assert_eq!(
+            th.jit_installs(0),
+            vec![(slot as u32, 0)],
+            "{engine}: the install occupancy round-trips (slot → unit 0)"
+        );
+        assert_eq!(
+            freeze(&m, &window, &th).expect("re-freeze"),
+            artifact,
+            "{engine}: re-serialize of a restored install-bearing domain is byte-identical"
+        );
 
-    // Entry 0: compile + install the unit (staged at BLOB_OFF) → the table slot.
-    let mut win = vec![0u8; WINDOW];
-    win[BLOB_OFF..BLOB_OFF + unit.len()].copy_from_slice(&unit);
-    let mut fuel = 5_000_000u64;
-    let (r_inst, snap) = run_capture_reserved_with_host(
-        &m,
-        0,
-        &[
-            Value::I32(jd),
-            Value::I64(BLOB_OFF as i64),
-            Value::I64(unit.len() as i64),
-        ],
-        &mut fuel,
-        &win,
-        SIZE_LOG2,
-        &mut hd,
-    );
-    let slot = match r_inst.expect("install ok").as_slice() {
-        [Value::I64(s)] if *s >= 0 => *s as i32,
-        other => panic!("install returned {other:?}"),
-    };
-
-    // Freeze + restore. The install occupancy is captured on the domain and re-granted.
-    let artifact = freeze(&m, &snap, &hd).expect("freeze");
-    let mut th = Host::new();
-    let window = restore(&artifact, &m, &mut th).expect("restore");
-    assert_eq!(
-        th.jit_installs(0),
-        vec![(slot as u32, 0)],
-        "the install occupancy round-trips (slot → unit 0)"
-    );
-    assert_eq!(
-        freeze(&m, &window, &th).expect("re-freeze"),
-        artifact,
-        "re-serialize of a restored install-bearing domain is byte-identical"
-    );
-
-    // Entry 1 over the thawed host: call.dyn through the restored slot resolves to the unit.
-    let mut fuel2 = 5_000_000u64;
-    let (r_call, _) = run_capture_reserved_with_host(
-        &m,
-        1,
-        &[Value::I32(slot)],
-        &mut fuel2,
-        &window,
-        SIZE_LOG2,
-        &mut th,
-    );
-    assert_eq!(
-        r_call.expect("call ok"),
-        vec![Value::I64(42)],
-        "call.dyn through the restored install slot → 42"
-    );
+        // Entry 1 over the thawed host: call.dyn through the restored slot resolves to the unit.
+        assert_eq!(
+            call_slot(run, &m, slot, &window, &mut th),
+            Ok(vec![Value::I64(42)]),
+            "{engine}: call.dyn through the restored install slot → 42"
+        );
+    }
 }
 
 /// **Install-durability, native.** The same install → freeze → restore, but both entries run on the

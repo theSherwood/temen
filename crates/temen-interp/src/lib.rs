@@ -2401,9 +2401,10 @@ fn drive(
 
 /// [`drive`] over an already-shared function table — the §3.2 wired-offer dispatch reuses the
 /// offer's `Arc<[Func]>` verbatim instead of re-copying the table per call.
-/// One B2-installed unit to re-apply onto a sub-run's fresh dispatch table: `(slot, funcs, types)` —
-/// the unit's own type section (#922) rides alongside its funcs so its interned call sigs resolve.
-type JitReapply = (u32, Arc<[Func]>, Arc<[temen_ir::TypeEntry]>);
+/// One B2-installed unit to re-apply onto a run's fresh dispatch table: its slot, and the unit as
+/// [`Host::resolve_jit_unit`] gives it — its funcs, its own type section (#922, so its interned call
+/// sigs resolve) and its `(table, unit)`.
+type JitReapply = (u32, ResolvedJitUnit);
 
 fn drive_arc(
     funcs: Arc<[Func]>,
@@ -3071,7 +3072,7 @@ fn relaunch_twin(
         funcs,
         twin_host.lock_unpoisoned().jit_table_log2(),
     ));
-    for (slot, unit_funcs, unit_types) in twin_host.lock_unpoisoned().jit_reapply() {
+    for (slot, (unit_funcs, unit_types, _)) in twin_host.lock_unpoisoned().jit_reapply() {
         dt.install(unit_funcs, unit_types, Some(slot));
     }
     // Entry args are inert under a rewind (the prologue reloads spilled values).
@@ -3473,7 +3474,7 @@ fn drive_over_cell(
         // artifact on thaw, so the padding these slots land in exists. A unit that names its own
         // functions installs them again first, in the first free slots: the record holds only
         // entries, so they land where they did only if they were the first free then too.
-        for (slot, unit_funcs, unit_types) in &jit_reapply {
+        for (slot, (unit_funcs, unit_types, _)) in &jit_reapply {
             dt.install(Arc::clone(unit_funcs), Arc::clone(unit_types), Some(*slot));
         }
         let mut root = Box::new(VCpu::new(
@@ -31283,10 +31284,11 @@ impl Host {
     /// no-op there.
     fn jit_reapply(&self) -> Vec<JitReapply> {
         let mut out = Vec::new();
-        for t in &self.jit_tables {
+        for (table, t) in self.jit_tables.iter().enumerate() {
             for &(slot, unit) in &t.installed {
                 if let Some(u) = t.units.get(unit as usize) {
-                    out.push((slot, Arc::clone(&u.funcs), Arc::clone(&u.types)));
+                    let id = (table as u32, unit);
+                    out.push((slot, (Arc::clone(&u.funcs), Arc::clone(&u.types), id)));
                 }
             }
         }

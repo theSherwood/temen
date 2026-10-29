@@ -1288,36 +1288,71 @@ impl Domain {
 /// mid-run), and lands in the task's own `table`: a §14 child's installs stay out of its parent's
 /// `call.dyn` (#1296). A unit that names its own functions installs them first, once
 /// ([`unit_module`]). The guest gets the slot at `active`'s `dst`, or `-ENOSPC` when the table is
-/// full. Returns the slot filled.
+/// full. The install goes to `record` as `(table, slot, unit)`, for the task's host to keep
+/// ([`Host::jit_record_install`](super::Host::jit_record_install)): a run's table is its own, so the
+/// host's record is what a later run over that host re-applies ([`reapply_installs`]), as the
+/// tree-walker records and re-applies its installs (#2670). Returns the slot filled.
 fn jit_install(
     unit: Result<super::ResolvedJitUnit, Trap>,
     source: &ModuleSource,
     table: &SharedSlots,
     active: &mut Vm,
     dst: u32,
+    record: impl FnOnce(u32, u32, u32),
 ) -> Result<Option<usize>, Trap> {
     let unit = unit?;
+    let (jit_table, jit_unit) = unit.2;
     let slot = unit_module(source, table, &unit)?
-        .and_then(|module| jit_install_into(source, table, module, unit.2));
+        .and_then(|module| jit_install_into(source, table, module, unit.2, None));
+    if let Some(slot) = slot {
+        record(jit_table, slot as u32, jit_unit);
+    }
     active.set(dst, Reg::from_i64(slot.map_or(super::ENOSPC, |s| s as i64)));
     Ok(slot)
 }
 
-/// §22 `Jit.uninstall` (op 4), as every bytecode driver services it. `authority` is the host's check
+/// Re-apply `host`'s recorded §22 installs onto a run's `table`, each at the slot it held, as the
+/// tree-walker does when it starts a run (`drive_over_cell`; DURABILITY.md §12.5): an install outlives
+/// the run that made it, so a later run over the same powerbox reaches it — the next run, a thaw
+/// (#2670). A slot that already holds its unit, in a table kept across runs, is left alone, so
+/// nothing is compiled or pushed twice. A unit that names its own functions installs them first, in
+/// the first free slots, as on the tree-walker. `Malformed` if a unit is outside the engine's
+/// coverage.
+fn reapply_installs(host: &Host, source: &ModuleSource, table: &SharedSlots) -> Result<(), Trap> {
+    for (slot, unit) in host.jit_reapply() {
+        let slot = slot as usize;
+        if slot < table.len() && table.jit_unit(table.slot(slot).module as usize) == Some(unit.2) {
+            continue;
+        }
+        if let Some(module) = unit_module(source, table, &unit)? {
+            jit_install_into(source, table, module, unit.2, Some(slot));
+        }
+    }
+    Ok(())
+}
+
+/// §22 `Jit.uninstall` (op 4), as every bytecode driver services it. `jit_table` is the host's check
 /// of the op's `Jit` handle ([`Host::resolve_jit_domain`]: a forged one is its `CapFault`). A filled
 /// padding slot of the task's own `table` clears back to trapping (`0` at `active`'s `dst`); a
-/// real-function, out-of-range or empty slot is `-EINVAL`. Returns the slot cleared.
+/// real-function, out-of-range or empty slot is `-EINVAL`. A cleared slot goes to `forget` as
+/// `(table, slot)`, for the task's host to drop from its record
+/// ([`Host::jit_forget_install`](super::Host::jit_forget_install)), so no later run re-applies it.
+/// Returns the slot cleared.
 fn jit_uninstall(
-    authority: Result<(), Trap>,
+    jit_table: Result<u32, Trap>,
     source: &ModuleSource,
     table: &SharedSlots,
     slot: i64,
     active: &mut Vm,
     dst: u32,
+    forget: impl FnOnce(u32, u32),
 ) -> Result<Option<usize>, Trap> {
-    authority?;
+    let jit_table = jit_table?;
     let n_real = source.primary().progs.len();
     let cleared = jit_uninstall_from(source, table, slot as usize, n_real).then_some(slot as usize);
+    if let Some(slot) = cleared {
+        forget(jit_table, slot as u32);
+    }
     active.set(dst, Reg::from_i64(cleared.map_or(super::EINVAL, |_| 0)));
     Ok(cleared)
 }
@@ -1442,22 +1477,27 @@ fn set_slot_results(
     }
 }
 
-/// `Jit.install`'s table half, under [`jit_install`]: fill the first padding slot with `(module, 0)`,
-/// the entry of the module `unit` runs as, returning the slot — or `None` if the table is full. A
-/// fresh unit is appended to the shared source as a new module only once its slot is found; a unit
-/// that names its own functions already runs as one, and its entry fills one more slot of it. The
-/// whole op serializes under the source lock, and the slot store is `Release`, so a reader that
-/// observes the slot also observes the unit. `id` is the unit's `(table, unit)` on the installing
-/// host, which the table records for a new module ([`SharedSlots::jit_unit`]).
+/// `Jit.install`'s table half, under [`jit_install`]: fill the first padding slot — or slot `at`, the
+/// one a re-applied install held ([`reapply_installs`]) — with `(module, 0)`, the entry of the module
+/// `unit` runs as, returning the slot, or `None` if the table is full or too small for `at`. A fresh
+/// unit is appended to the shared source as a new module only once its slot is found; a unit that
+/// names its own functions already runs as one, and its entry fills one more slot of it. The whole op
+/// serializes under the source lock, and the slot store is `Release`, so a reader that observes the
+/// slot also observes the unit. `id` is the unit's `(table, unit)` on the installing host, which the
+/// table records for a new module ([`SharedSlots::jit_unit`]).
 fn jit_install_into(
     source: &ModuleSource,
     table: &SharedSlots,
     unit: UnitModule,
     id: (u32, u32),
+    at: Option<usize>,
 ) -> Option<usize> {
     use std::sync::atomic::Ordering;
     let mut mods = source.mods.lock_unpoisoned();
-    let slot = table.free_slots().next()?;
+    let slot = match at {
+        Some(slot) => (slot < table.len()).then_some(slot)?,
+        None => table.free_slots().next()?,
+    };
     let module = match unit {
         UnitModule::Fresh(unit) => {
             mods.code.push(std::sync::Arc::new(unit));
@@ -3917,6 +3957,10 @@ pub struct Reactor {
     /// The live guest window — retained across calls (this is the whole point). `None` for a
     /// memory-less module, and while a [`coop_call`](Self::coop_call) run holds it.
     mem: Option<Mem>,
+    /// The dispatch table every frame runs over, built at the first frame with the install room
+    /// that frame's `Jit` grant sizes: a §22 install outlives the frame that made it, as it outlives
+    /// a run over the same powerbox (#2670).
+    table: Option<std::sync::Arc<SharedSlots>>,
 }
 
 impl Reactor {
@@ -3940,6 +3984,7 @@ impl Reactor {
             source: std::sync::Arc::new(ModuleSource::new(c)),
             n_funcs,
             mem: Mem::root(m, default_reserved_log2(), back, &[]),
+            table: None,
         })
     }
 
@@ -3987,17 +4032,21 @@ impl Reactor {
     }
 
     /// The `Domain` one frame of `func` runs in, for [`call`](Self::call) and
-    /// [`coop_call`](Self::coop_call) alike: a fresh dispatch table over the shared compiled source
-    /// (cheap: an `Arc` clone + the slot vector), with the install room the powerbox's `Jit` grant
-    /// sizes, as every run's table has (#1296, #2661). No §22 install state carries between frames.
+    /// [`coop_call`](Self::coop_call) alike: the shared compiled source and the reactor's one table,
+    /// built at the first frame with the install room the powerbox's `Jit` grant sizes, as every
+    /// run's table has (#1296, #2661). A §22 install stays in it for the frames after (#2670).
     /// `Trap::Malformed` if `func` is out of range.
-    fn frame(&self, func: FuncIdx, host: &Host) -> Result<Domain, Trap> {
+    fn frame(&mut self, func: FuncIdx, host: &Host) -> Result<Domain, Trap> {
         if func as usize >= self.n_funcs {
             return Err(Trap::Malformed);
         }
-        Ok(Domain::child(
+        let n_funcs = self.n_funcs;
+        let table = self.table.get_or_insert_with(|| {
+            std::sync::Arc::new(build_table(n_funcs, host.jit_table_log2()))
+        });
+        Ok(Domain::child_shared(
             self.source.clone(),
-            build_table(self.n_funcs, host.jit_table_log2()),
+            std::sync::Arc::clone(table),
         ))
     }
 
@@ -5083,14 +5132,16 @@ fn debug_advance_fiber(
         // vCPU (`CapFault`/`Malformed`), exactly as the production `drive`. (DESIGN.md §22 debug tier.)
         Ok(Outcome::JitInstall { h, code, dst }) => {
             let unit = host.resolve_jit_unit(h, code);
-            match jit_install(unit, source, table, &mut vt.active, dst) {
+            let record = |t, slot, u| host.jit_record_install(t, slot, u);
+            match jit_install(unit, source, table, &mut vt.active, dst, record) {
                 Ok(_) => FiberStep::Stepped,
                 Err(t) => FiberStep::Trapped(t),
             }
         }
         Ok(Outcome::JitUninstall { h, slot, dst }) => {
-            let authority = host.resolve_jit_domain(h).map(drop);
-            match jit_uninstall(authority, source, table, slot, &mut vt.active, dst) {
+            let jit_table = host.resolve_jit_domain(h);
+            let forget = |t, slot| host.jit_forget_install(t, slot);
+            match jit_uninstall(jit_table, source, table, slot, &mut vt.active, dst, forget) {
                 Ok(_) => FiberStep::Stepped,
                 Err(t) => FiberStep::Trapped(t),
             }
@@ -7006,6 +7057,7 @@ impl ScheduledDebugRun {
         let mut source = ModuleSource::over(std::sync::Arc::new(c));
         source.debug = true;
         let source = std::sync::Arc::new(source);
+        reapply_installs(&host, &source, &table).ok()?;
         let mem = Mem::root(m, default_reserved_log2(), None, &[]);
         let vt = VTask::new(
             &source.primary(),
@@ -10863,11 +10915,13 @@ fn drive_nested(
             // `Jit.invoke` reached the same way is serviced by the arm below, #1334.)
             Outcome::JitInstall { h, code, dst } if run_meta.is_some() => {
                 let unit = host.with(|p| p.resolve_jit_unit(h, code));
-                jit_install(unit, source, table, &mut vt.active, dst)?;
+                let record = |t, slot, u| host.with(|p| p.jit_record_install(t, slot, u));
+                jit_install(unit, source, table, &mut vt.active, dst, record)?;
             }
             Outcome::JitUninstall { h, slot, dst } if run_meta.is_some() => {
-                let authority = host.with(|p| p.resolve_jit_domain(h)).map(drop);
-                jit_uninstall(authority, source, table, slot, &mut vt.active, dst)?;
+                let jit_table = host.with(|p| p.resolve_jit_domain(h));
+                let forget = |t, slot| host.with(|p| p.jit_forget_install(t, slot));
+                jit_uninstall(jit_table, source, table, slot, &mut vt.active, dst, forget)?;
             }
             // #1334: a §22 `Jit.invoke` reached on a nested interpretation — a cross-tier bounce out
             // of an emitted region (the JACL compiler stages a macro from a helper the tiered-up
@@ -12854,8 +12908,9 @@ impl SchedCore {
     }
 
     /// A run's initial scheduling state: the root task at `entry`, plus any fibers a durable freeze
-    /// left to re-seed (taken from `host.frozen_fibers`), after the once-per-run entry-fuel charge.
-    /// Both executors start a run here ([`CoopSched::new`], [`drive_threads`]).
+    /// left to re-seed (taken from `host.frozen_fibers`), after the once-per-run entry-fuel charge,
+    /// over a table that holds the §22 installs `host` recorded ([`reapply_installs`]). Both
+    /// executors start a run here ([`CoopSched::new`], [`drive_threads`]).
     fn new(
         dom: &Domain,
         entry: FuncIdx,
@@ -12864,6 +12919,7 @@ impl SchedCore {
         mem: Option<&Mem>,
         host: &mut Host,
     ) -> Result<SchedCore, Trap> {
+        reapply_installs(host, &dom.source, &dom.table)?;
         // Fuel unification (safepoint-anchored): charge one fuel for *entering the top-level entry
         // function*, mirroring the per-callee-entry charge at `Op::Call`/`CallIndirect`/`TailCall*` and
         // the JIT's entry-prologue charge, so the tree-walker, bytecode, and JIT engines burn identically.
@@ -14461,25 +14517,25 @@ impl SchedCore {
             // arms, after which the driver re-syncs before the emitted frame resumes.
             Ok(VcpuStop::JitInstall { h, code, dst }) => {
                 let env = tasks[ti].env;
-                let unit = task_host(root, extra_envs, env)
-                    .lock_unpoisoned()
-                    .resolve_jit_unit(h, code);
+                let host = task_host(root, extra_envs, env);
+                let unit = host.lock_unpoisoned().resolve_jit_unit(h, code);
+                let record = |t, slot, u| host.lock_unpoisoned().jit_record_install(t, slot, u);
                 let table = env.map_or(&*dom.table, |k| &*extra_envs[k].table);
                 let active = &mut tasks[ti].vm.vt.active;
-                if let Err(t) = jit_install(unit, &dom.source, table, active, dst) {
+                if let Err(t) = jit_install(unit, &dom.source, table, active, dst, record) {
                     complete(tasks, ti, Err(t));
                     return None;
                 }
             }
             Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
                 let env = tasks[ti].env;
-                let authority = task_host(root, extra_envs, env)
-                    .lock_unpoisoned()
-                    .resolve_jit_domain(h)
-                    .map(drop);
+                let host = task_host(root, extra_envs, env);
+                let jit_table = host.lock_unpoisoned().resolve_jit_domain(h);
+                let forget = |t, slot| host.lock_unpoisoned().jit_forget_install(t, slot);
                 let table = env.map_or(&*dom.table, |k| &*extra_envs[k].table);
                 let active = &mut tasks[ti].vm.vt.active;
-                let cleared = jit_uninstall(authority, &dom.source, table, slot, active, dst);
+                let cleared =
+                    jit_uninstall(jit_table, &dom.source, table, slot, active, dst, forget);
                 if let Err(t) = cleared {
                     complete(tasks, ti, Err(t));
                     return None;
