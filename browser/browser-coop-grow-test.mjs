@@ -3,8 +3,9 @@
 // The native `coop_tierup_driver.rs` differential plays the browser's role with wasmi; this is the
 // other half: the *actual* `driveCoopTierupRun` in `web/coop-driver.js`, over the *actual* wasm
 // cdylib, on the path the playground takes (`runJitModule` → whole-program open declines → coop).
-// It is the only place the `"win"` fan-out after a bounce is exercised, because only here is the
-// window the engine's own (relocating) backing rather than a mirrored copy.
+// On the threads build a pump root's window is a memory of its own (#1414 5d), which grows in place;
+// the plain build's grows in the engine's memory, relocating, and the driver's `"win"` fan-out after a
+// bounce follows it there.
 //
 // The guest (`tests/fixtures/coop_grow_past_window.temen`, from `genfixture … grow_past_window`) is
 // the reduced synthesized-allocator shape: a hot leaf bounces to a helper that `vm_map`s a page past
@@ -23,6 +24,12 @@
 // (#1414 5d), which the engine gives back once the child has ended, and the page keeps, zeroed, for
 // the next child.
 //
+// #1414 5d: then a root's memory of its own, against the oracle each time: a root leaf grown past
+// 256 MiB, which leaves the engine's memory as it was; a map past a smaller grant, refused as the
+// oracle refuses it (`temen_set_mem_grant`), and allowed again under the default; a window no memory
+// can hold, whose open fails cleanly; and a collecting guest whose emitted frames spill its roots,
+// which the bounce copies to where `gc.roots` scans them.
+//
 // Usage:  node browser-coop-grow-test.mjs [module.wasm]   (build the threads cdylib first)
 
 import { readFileSync, existsSync } from 'node:fs';
@@ -30,7 +37,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { driveCoopTierupRun, runJitModule } from './web/wasmjit-module.js';
 import { instantiateEngine } from './engine-imports.mjs';
-import { foreignMemory } from './web/foreign-mem.js';
+import { foreignMemory, headerOf } from './web/foreign-mem.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const wasmPath = process.argv[2]
@@ -135,7 +142,7 @@ if (!(winAtLastBounce > winAtOpen)) {
 // reduction: the root calls a function that bounces to the `vm_map` helper, stores through the new
 // page past the window, and writes the result to stdout.
 const WIN = 1 << 25;
-const LEAF_SRC = String.raw`memory 16
+const leafSrc = (WIN) => String.raw`memory 16
 data ro 40960 "stdout\x00\x00memory"
 func () -> (i64) {
 block 0 () {
@@ -175,6 +182,7 @@ block 0 (v0: i64) {
 }
 export 0 func "_start" 0
 `;
+const LEAF_SRC = leafSrc(WIN);
 const src = new TextEncoder().encode(LEAF_SRC);
 const sp = Number(ex.temen_alloc(src.length));
 u8().set(src, sp);
@@ -332,8 +340,8 @@ if (childOpened !== 0) {
     temen_coop_deliver: (...a) => {
       const mem = childMems.at(-1);
       if (mem >= 0) {
-        const at = (ex.temen_detached_header_bytes() + 32768) / 8;
-        childStored.push(new BigInt64Array(foreignMemory(memory, mem).buffer)[at]);
+        const own = foreignMemory(memory, mem);
+        childStored.push(new BigInt64Array(own.buffer)[(headerOf(own).base + 32768) / 8]);
       }
       return ex.temen_coop_deliver(...a);
     },
@@ -359,14 +367,16 @@ if (childOpened !== 0) {
     fail(`the child's emitted frames must bounce to f3: bounces from ${JSON.stringify(childBounces)}`);
   }
   // #1414 5d: the child's window is a memory of its own, which each of its tier-ups names and the
-  // root's do not, and which the engine gave back when the child ended: the page keeps it, zeroed.
+  // root's do not, and which the engine gave back when the child ended: the page keeps it, its
+  // window zeroed.
   const named = childPrograms.map((m, i) => [m, childMems[i]]);
   const own = [...new Set(named.filter(([m]) => m === 1).map(([, mem]) => mem))];
-  if (own.length !== 1 || !(own[0] >= 0) || named.some(([m, mem]) => m !== 1 && mem !== -1)) {
+  const kept = own.length === 1 ? foreignMemory(memory, own[0]) : undefined;
+  if (own.length !== 1 || !(own[0] >= 0) || named.some(([m, mem]) => m !== 1 && mem === own[0])) {
     fail(`program 1's tier-ups must name one memory of the child's own: ${JSON.stringify(named)}`);
   } else if (!childStored.includes(11n)) {
     fail(`f2's store must land in the child's own memory: it held ${childStored}`);
-  } else if (!new Uint8Array(foreignMemory(memory, own[0])?.buffer ?? [1]).every((b) => b === 0)) {
+  } else if (!kept || !new Uint8Array(kept.buffer, headerOf(kept).base).every((b) => b === 0)) {
     fail(`the child's memory ${own[0]} must come back zeroed once the child has ended`);
   }
   if (childStatus !== 0 || childGot.status !== childWant.status) {
@@ -374,10 +384,204 @@ if (childOpened !== 0) {
   }
   if (childGot.out !== childWant.out) fail('child: stdout differs from the oracle');
 }
+
+// ---- 6. #1414 5d: a root's window is a memory of its own --------------------------------------------
+const show = (v) => JSON.stringify(v, (_, x) => (typeof x === 'bigint' ? `${x}n` : x));
+const parse = (text) => {
+  const bytes = new TextEncoder().encode(text);
+  const p = Number(ex.temen_alloc(bytes.length));
+  u8().set(bytes, p);
+  const ok = ex.temen_parse(p, bytes.length);
+  ex.temen_dealloc(p, bytes.length);
+  const out = u8().slice(Number(ex.temen_parse_ptr()), Number(ex.temen_parse_ptr()) + Number(ex.temen_parse_len()));
+  if (ok !== 1) throw new Error(`parse: ${dec.decode(out)}`);
+  return out;
+};
+// `f(ptr, len)` over a copy of `guest` in the engine's memory.
+const withGuest = (guest, f) => {
+  const p = Number(ex.temen_alloc(guest.length));
+  u8().set(guest, p);
+  try {
+    return f(p, guest.length);
+  } finally {
+    ex.temen_dealloc(p, guest.length);
+  }
+};
+// The 8 bytes a guest wrote to stdout, as the i64 it wrote.
+const outWord = () => {
+  const p = Number(ex.temen_stdout_ptr());
+  const n = Number(ex.temen_stdout_len());
+  return n === 8 ? new DataView(u8().slice(p, p + 8).buffer).getBigInt64(0, true) : `${n} bytes`;
+};
+const oracle = (guest) => withGuest(guest, (p, n) => {
+  ex.temen_run_onramp(p, n, 0, 0);
+  return { status: ex.temen_status(), out: outWord() };
+});
+// Open `guest` on the pump in `mode` and drive it, noting the memories its events name, its tier-ups,
+// the most words a bounce carried spilled, and how far the engine's memory grew.
+const coop = async (guest, mode) => {
+  const r = { mems: new Set(), tierups: 0, spill: 0 };
+  const before = memory.buffer.byteLength;
+  r.opened = withGuest(guest, (p, n) => ex.temen_coop_open(p, n, 0, 0, 1, 0, 0, mode));
+  if (r.opened !== 0) return r;
+  const exSeen = { ...ex,
+    temen_coop_tierup_mem: () => {
+      const mem = ex.temen_coop_tierup_mem();
+      r.mems.add(mem);
+      return mem;
+    },
+    temen_coop_func: () => {
+      r.tierups++;
+      return ex.temen_coop_func();
+    },
+    temen_coop_call_interp: (target, argsPtr, spillLen) => {
+      r.spill = Math.max(r.spill, spillLen);
+      return ex.temen_coop_call_interp(target, argsPtr, spillLen);
+    } };
+  r.returned = await driveCoopTierupRun(exSeen, memory, {});
+  r.got = { status: ex.temen_status(), out: outWord() };
+  r.grew = memory.buffer.byteLength - before;
+  return r;
+};
+const own = (r) => r.mems.size === 1 && [...r.mems][0] >= 0;
+const same = (r, want) => r.returned === 0 && r.got.status === want.status && r.got.out === want.out;
+
+// 6a. The root leaf of section 4, its map moved past 256 MiB: its window grows there in its own memory.
+const BIG = 300 << 20;
+const bigGuest = parse(leafSrc(BIG));
+const bigWant = oracle(bigGuest);
+const big = await coop(bigGuest, COOP_LEAF_ROOT);
+if (big.opened !== 0) {
+  fail(`a root that grows past 256 MiB must open: ${big.opened}`);
+} else {
+  if (!same(big, bigWant)) fail(`a root grown past 256 MiB: ${show(big.got)}, oracle ${show(bigWant)}`);
+  if (!own(big)) fail(`a root's events must name one memory of its own: ${show([...big.mems])}`);
+  if (big.grew > 16 << 20) {
+    fail(`the engine's memory grew ${big.grew} bytes under a root grown past 256 MiB: the window is not its own`);
+  }
+}
+
+// 6b. A root that maps 16 KiB at `at` and writes what the map returned.
+const mapSrc = (at) => String.raw`memory 16
+data ro 40960 "stdout\x00\x00memory"
+func () -> (i64) {
+block 0 () {
+  vr = call 1 ()
+  vsl = i64.const 34816
+  i64.store vsl vr
+  vnp = i64.const 40960
+  vnl = i64.const 6
+  vout = self.resolve vnp vnl
+  vlen8 = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vr
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vnp = i64.const 40968
+  vnl = i64.const 6
+  vas = self.resolve vnp vnl
+  voff = i64.const ${at}
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  return vr
+  }
+}
+export 0 func "_start" 0
+`;
+const mapGuest = parse(mapSrc(100 << 20));
+ex.temen_set_mem_grant(BigInt(64 << 20));
+const cappedWant = oracle(mapGuest);
+const capped = await coop(mapGuest, COOP_LEAF_ROOT);
+ex.temen_set_mem_grant(0n);
+const freed = await coop(mapGuest, COOP_LEAF_ROOT);
+if (cappedWant.out !== -12n) fail(`the oracle must refuse a map past a 64 MiB grant with -ENOMEM: ${cappedWant.out}`);
+if (capped.opened !== 0 || !same(capped, cappedWant)) {
+  fail(`a map past a 64 MiB grant: ${show(capped.got)}, oracle ${show(cappedWant)}`);
+}
+if (freed.opened !== 0 || freed.got?.out !== 0n) {
+  fail(`under the default grant the same map must succeed: ${show(freed.got)}`);
+}
+
+// 6c. A window no wasm32 memory can hold: the open fails cleanly.
+const huge = withGuest(parse(`memory 32
+func () -> (i64) {
+block 0 () {
+  v = i64.const 0
+  return v
+  }
+}
+export 0 func "_start" 0
+`), (p, n) => ex.temen_coop_open(p, n, 0, 0, 1, 0, 0, COOP_LEAF_ROOT));
+if (huge !== -2) fail(`a 4 GiB window's open must fail with STATUS_UNSUPPORTED (-2): ${huge}`);
+
+// 6d. A collector (#1627). f1 tiers up and holds `vroot`, in the scanned range, across its call to the
+// collector, which stays interpreted: the emitted frame spills `vroot` before it bounces, and the
+// bounce copies the spilled words out of the root's memory to where `gc.roots` scans them. The scan
+// counts the collector's own `vlo` and `vroot`, as it does on the oracle, where f1's frame holds it.
+const GC_SRC = String.raw`memory 16
+data ro 40960 "stdout"
+func () -> (i64) {
+block 0 () {
+  vp = i64.const 137120
+  vr = call 1 (vp)
+  vsl = i64.const 34816
+  i64.store vsl vr
+  vnp = i64.const 40960
+  vnl = i64.const 6
+  vout = self.resolve vnp vnl
+  vlen8 = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vp: i64) {
+  vk = i64.const 100000
+  vroot = i64.sub vp vk
+  vres = call 2 ()
+  vd = i64.sub vroot vroot
+  vnine = i64.const 9
+  vs = i64.add vres vnine
+  vt = i64.add vs vd
+  return vt
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vlo = i64.const 36864
+  vhi = i64.const 40960
+  vmask = i64.const -1
+  vbuf = i64.const 45056
+  vcap = i64.const 64
+  vt = gc.roots vlo vhi vmask vbuf vcap
+  return vt
+  }
+}
+export 0 func "_start" 0
+`;
+const gcGuest = parse(GC_SRC);
+const gcWant = oracle(gcGuest);
+const gc = await coop(gcGuest, 0);
+if (gcWant.status !== 0 || gcWant.out !== 11n) fail(`gc oracle sanity: ${show(gcWant)}`);
+if (gc.opened !== 0) {
+  fail(`the collecting root's open refused: ${gc.opened}`);
+} else {
+  if (gc.tierups < 1 || gc.spill < 1) {
+    fail(`f1 must run emitted and spill across its bounce: ${gc.tierups} tier-up(s), ${gc.spill} word(s)`);
+  }
+  if (!own(gc)) fail(`the collecting root's events must name one memory of its own: ${show([...gc.mems])}`);
+  if (!same(gc, gcWant)) fail(`the collector's roots: ${show(gc.got)}, oracle ${show(gcWant)}`);
+}
 ex.temen_coop_reset_hotness();
 
 if (process.exitCode) process.exit(process.exitCode);
 console.log(`ok — coop path, ${counts.tierups} tier-up(s), ${counts.bounces} bounce(s), `
   + `window ${winAtOpen} → ${winAtLastBounce} bytes, stdout matches the bytecode oracle; `
   + 'as a root leaf, the same over a growing window; a child image tiers up as program '
-  + `${JSON.stringify([...new Set(childPrograms)])} over memories ${JSON.stringify([...new Set(childMems)])}`);
+  + `${show([...new Set(childPrograms)])} over memories ${show([...new Set(childMems)])}; `
+  + `a root grown past 256 MiB in a memory of its own (the engine's grew ${big.grew} bytes), a map past a `
+  + `64 MiB grant refused (${capped.got?.out}), a 4 GiB window refused, and a collector's spilled roots `
+  + `found (${gc.got?.out})`);
