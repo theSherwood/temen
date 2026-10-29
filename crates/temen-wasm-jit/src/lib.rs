@@ -2140,7 +2140,9 @@ pub fn outline_cap_calls(m: &mut Module) {
                         func: g,
                         args: call_args,
                     };
-                } else if let Some((operands, op, params, results)) = scheduler_op(inst) {
+                } else if let Some((operands, op, FuncType { params, results })) =
+                    scheduler_op(inst)
+                {
                     // #2443: the op over the wrapper's own params, its results returned.
                     let g = base + wrappers.len() as u32;
                     let nparams = params.len() as u32;
@@ -2170,9 +2172,10 @@ pub fn outline_cap_calls(m: &mut Module) {
 
 /// #2443 — a scheduler op [`outline_cap_calls`] hoists: `thread.spawn`, `thread.join`,
 /// `memory.wait` or `memory.notify`. Returns its operands, the same op over a wrapper's parameters,
-/// their types, and its results' types; `None` for any other op.
-fn scheduler_op(inst: &Inst) -> Option<(Vec<u32>, Inst, Vec<ValType>, Vec<ValType>)> {
+/// and the wrapper's signature; `None` for any other op.
+fn scheduler_op(inst: &Inst) -> Option<(Vec<u32>, Inst, FuncType)> {
     use ValType::{I32, I64};
+    let sig = |params: Vec<ValType>, results: Vec<ValType>| FuncType { params, results };
     Some(match *inst {
         Inst::ThreadSpawn { func, sp, arg } => (
             vec![sp, arg],
@@ -2181,15 +2184,13 @@ fn scheduler_op(inst: &Inst) -> Option<(Vec<u32>, Inst, Vec<ValType>, Vec<ValTyp
                 sp: 0,
                 arg: 1,
             },
-            vec![I64, I64],
-            vec![I32],
+            sig(vec![I64, I64], vec![I32]),
         ),
         // `(status, value)` (#2667).
         Inst::ThreadJoin { handle } => (
             vec![handle],
             Inst::ThreadJoin { handle: 0 },
-            vec![I32],
-            vec![I64, I64],
+            sig(vec![I32], vec![I64, I64]),
         ),
         Inst::MemoryWait {
             ty,
@@ -2204,14 +2205,12 @@ fn scheduler_op(inst: &Inst) -> Option<(Vec<u32>, Inst, Vec<ValType>, Vec<ValTyp
                 expected: 1,
                 timeout: 2,
             },
-            vec![I64, ty.val(), I64],
-            vec![I32],
+            sig(vec![I64, ty.val(), I64], vec![I32]),
         ),
         Inst::MemoryNotify { addr, count } => (
             vec![addr, count],
             Inst::MemoryNotify { addr: 0, count: 1 },
-            vec![I64, I32],
-            vec![I32],
+            sig(vec![I64, I32], vec![I32]),
         ),
         _ => return None,
     })
