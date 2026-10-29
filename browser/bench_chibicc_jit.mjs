@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { runJitCompiler } from './web/wasmjit-module.js';
-import { engineImports } from './engine-imports.mjs';
+import { instantiateEngine } from './engine-imports.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const wasmPath = process.argv[2] ?? join(ROOT, 'target/wasm32-unknown-unknown/release/temen_browser.wasm');
@@ -28,7 +28,7 @@ if (!WebAssembly.Module.imports(mod).some((i) => i.kind === 'memory')) {
   process.exit(1);
 }
 const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
-const { exports: ex } = await WebAssembly.instantiate(mod, engineImports(memory));
+const ex = await instantiateEngine(mod, memory);
 const compiler = new Uint8Array(readFileSync(chibiccPath));
 
 const dec = new TextDecoder();

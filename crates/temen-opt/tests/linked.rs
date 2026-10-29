@@ -1,4 +1,4 @@
-//! Spec for the whole-program passes a linker runs (#2147). [`order_blocks`] numbers each function's
+//! Spec for the whole-program passes a linker runs (#2147). [`Module::raise`] numbers each function's
 //! blocks in reverse postorder, so the only branch to an equal-or-earlier block is a loop's back
 //! edge — the branch every engine charges fuel on (INVARIANTS #9). The inliner's one-pass driver
 //! inlines what its splices bring in, and stops at its size limit. [`optimize_linked`] runs the two
@@ -12,7 +12,7 @@ use temen_ir::{
 };
 use temen_opt::cfg::{successors, Cfg};
 use temen_opt::interproc::{inline_calls, inline_calls_with, InlineLimits};
-use temen_opt::{optimize_linked, order_blocks};
+use temen_opt::optimize_linked;
 use temen_verify::verify_module;
 
 /// Run `func` on the reference interpreter: its results and the fuel it burned.
@@ -159,7 +159,7 @@ fn an_early_join_moves_after_its_arms_and_stops_charging_fuel() {
         "both arms branch back to the early join"
     );
     let mut o = m.clone();
-    order_blocks(&mut o);
+    o.raise();
     verify_module(&o).expect("ordered module verifies");
     assert!(
         index_back_edges(&o.funcs[0]).is_empty(),
@@ -213,7 +213,7 @@ fn a_loop_keeps_exactly_its_back_edge() {
         "the exit edge counts as a back edge, besides the latch"
     );
     let mut o = m.clone();
-    order_blocks(&mut o);
+    o.raise();
     verify_module(&o).expect("ordered module verifies");
     let back = index_back_edges(&o.funcs[0]);
     assert_eq!(back.len(), 1, "only the latch is left: {back:?}");
@@ -236,7 +236,7 @@ fn a_loop_keeps_exactly_its_back_edge() {
 }
 
 #[test]
-fn unreachable_blocks_go_last_with_their_targets_remapped() {
+fn unreachable_blocks_are_dropped() {
     // b0(a): br b2(a) / b1: unreachable from the entry, br b2(7) / b2(x): return x
     let m = module(vec![func(
         1,
@@ -247,19 +247,14 @@ fn unreachable_blocks_go_last_with_their_targets_remapped() {
         ],
     )]);
     let mut o = m.clone();
-    order_blocks(&mut o);
+    o.raise();
     verify_module(&o).expect("ordered module verifies");
     let f = &o.funcs[0];
-    assert_eq!(f.blocks.len(), 3, "no block is dropped");
+    assert_eq!(f.blocks.len(), 2, "the unreachable block is gone");
     assert_eq!(
         f.blocks[1].term,
         Terminator::Return(vec![0]),
-        "reachable blocks first"
-    );
-    assert_eq!(
-        f.blocks[2],
-        block(0, vec![Inst::ConstI32(7)], br(1, vec![0])),
-        "the unreachable block is last, still branching to the return block"
+        "the return block follows the entry"
     );
     assert_eq!(
         run(&o, 0, &[Value::I32(3)]).0,
@@ -296,7 +291,7 @@ fn debug_positions_move_with_their_blocks() {
         ..Default::default()
     });
     let mut o = m.clone();
-    order_blocks(&mut o);
+    o.raise();
     let f = &o.funcs[0];
     // Find each block by what it holds: the `10` arm, the `20` arm, the join.
     let at = |want: &Block| f.blocks.iter().position(|b| b == want).unwrap() as u32;

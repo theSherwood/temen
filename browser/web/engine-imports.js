@@ -1,15 +1,15 @@
-// The import object every instantiation of the **engine** wasm (`temen_browser.wasm`) supplies: the
-// page's (`par.js`), each Worker's, and the Node harnesses' (`../engine-imports.mjs`). One definition
-// (#2579, INVARIANTS #15): each `temen_host` seam reaches a `globalThis` hook its host may install,
-// and does nothing without one. A host whose seam must do more passes its own in `hooks`: the
-// executor-2 Worker's thread platform and output relay (`worker.js`).
+// How every host instantiates the **engine** wasm (`temen_browser.wasm`), and the import object it
+// supplies: the page's (`par.js`), each Worker's, and the Node harnesses' (`../engine-imports.mjs`).
+// One definition (#2579, INVARIANTS #15): each `temen_host` seam reaches a `globalThis` hook its host
+// may install, and does nothing without one. A host whose seam must do more passes its own in `hooks`:
+// the executor-2 Worker's thread platform and output relay (`worker.js`).
 //
 // `memory` is the shared memory the threads build imports; the plain build owns its own, so a host
 // of it passes none. (Emitted wasm-JIT *units* are a different module with their own imports —
 // `env.{memory,trap,call_interp}`, no `temen_host` — so they do not use this.)
-import { foreignImports } from './foreign-mem.js';
+import { adoptEngine, foreignImports } from './foreign-mem.js';
 
-export function engineImports(memory, hooks = {}) {
+function engineImports(memory, hooks = {}) {
   const temen_host = {
     // #1284 `Region::Foreign`: detached children's own memories; only the threads build imports them.
     ...(memory ? foreignImports(memory) : {}),
@@ -42,4 +42,20 @@ export function engineImports(memory, hooks = {}) {
     ...hooks,
   };
   return memory ? { env: { memory }, temen_host } : { temen_host };
+}
+
+/**
+ * Instantiate the engine `module` (a `WebAssembly.Module`, or its bytes) over `memory` (none for the
+ * plain build) with `engineImports(memory, hooks)`, and return its exports, adopted: the threads build's
+ * detached children's windows are memories of their own, which the engine reaches through this
+ * instance's table (`adoptEngine`). `init(exports)` runs first, for what must precede any call into the
+ * engine: a Worker's stack pointer and TLS block. Every host of the engine instantiates it here, so none
+ * can forget to adopt it.
+ */
+export async function instantiateEngine(module, memory, hooks = {}, init = () => {}) {
+  const made = await WebAssembly.instantiate(module, engineImports(memory, hooks));
+  const ex = (made.instance ?? made).exports;
+  init(ex);
+  if (memory) adoptEngine(ex, memory);
+  return ex;
 }

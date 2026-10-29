@@ -1459,7 +1459,7 @@ fn translate_impl(
         .map(|(i, f)| (f.name.clone(), base + i as u32))
         .collect();
     let types = sig_types.into_inner();
-    Ok(Translated {
+    let mut t = Translated {
         module: Module {
             types,
             impl_exports: vec![],
@@ -1515,7 +1515,11 @@ fn translate_impl(
         // mapping `name2idx` holds, emitted in defined order for determinism.
         exports: exported,
         data_symbols,
-    })
+    };
+    // Dominance form (#2454): a value reaches the blocks it dominates as a capture, not as a param of
+    // every block between. The data-SP is the function's first param, which a block captures.
+    t.module.raise();
+    Ok(t)
 }
 
 /// The **default** page granularity the data stack is aligned to above the globals (≥ the largest OS

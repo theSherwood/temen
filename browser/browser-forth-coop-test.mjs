@@ -26,7 +26,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { runJitModule } from './web/wasmjit-module.js';
-import { engineImports } from './engine-imports.mjs';
+import { instantiateEngine } from './engine-imports.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const wasmPath = process.argv[2]
@@ -101,7 +101,7 @@ variable arr   variable lim
 // with a maximum — the emitted wasm's own memory import is shared and needs a bounded one.
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
 const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
-const { exports: ex } = await WebAssembly.instantiate(mod, engineImports(memory));
+const ex = await instantiateEngine(mod, memory);
 const u8 = () => new Uint8Array(memory.buffer);
 const enc = new TextEncoder();
 const dec = new TextDecoder();

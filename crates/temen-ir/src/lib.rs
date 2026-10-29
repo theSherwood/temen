@@ -7526,7 +7526,7 @@ pub struct Data {
 
 pub mod cfg;
 pub mod dominance;
-pub use dominance::Moves;
+pub use dominance::{Captured, Moves};
 
 /// **Compile-time confinement bound analysis** (§1a "guard-when-bounded", D36–D38/D63) — the shared,
 /// single-definition proof both native and wasm JITs use to decide when a memory access is *provably*

@@ -609,7 +609,16 @@ pub fn while_rolled(m: &Module, script: &str) -> AutoRolled {
     let cmp_a_addr = base + (cmp_a + 1) * STACKVALUE_SIZE; // +1: VARARGPREP frame shift
     let cmp_b_addr = base + (cmp_b + 1) * STACKVALUE_SIZE;
 
-    // ---- Pass 1: observe the register file at loop-top hits (keyed on the real pc = IR value 1). ----
+    // ---- Pass 1: observe the register file at loop-top hits (keyed on the real pc). ----
+    // The dispatch block's `pc` is the address its instruction fetch (`i = *pc`, its first load) reads.
+    let pc_val = m.funcs[luav as usize].blocks[dispatch as usize]
+        .insts
+        .iter()
+        .find_map(|i| match i {
+            Inst::Load { addr, .. } => Some(*addr as usize),
+            _ => None,
+        })
+        .expect("the dispatch block fetches the instruction at pc");
     const N_REGS: u64 = 32;
     let observe = |target_hits: usize| -> (Vec<Vec<u64>>, Vec<u8>) {
         let inst = temen_run::instantiate(m.clone()).expect("instantiate");
@@ -631,7 +640,7 @@ pub fn while_rolled(m: &Module, script: &str) -> AutoRolled {
                     reason: StopReason::Breakpoint,
                     ..
                 } => {
-                    let pcptr = match insp.read_ir_value(0, 1) {
+                    let pcptr = match insp.read_ir_value(0, pc_val) {
                         Some(Value::I64(v)) => v as u64,
                         _ => continue,
                     };

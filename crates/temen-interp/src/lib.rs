@@ -2200,8 +2200,8 @@ impl Inspector {
                     frame_value(frame, &types, resolve(locs)? as usize).map(VarValue::Value)
                 }
                 VarLoc::Window { off } => {
-                    // Address = data-SP (block param v0) + off.
-                    window_read(frame.vals.first()?.i64() as u64, *off)
+                    // Address = data-SP + off.
+                    window_read(frame.sp()?.i64() as u64, *off)
                 }
                 VarLoc::WindowVia { base, off } => {
                     // Address = (the per-pc base SSA value, e.g. a wasm frame pointer) + off.
@@ -2231,7 +2231,7 @@ impl Inspector {
             }
             let var = pick_var(di, frame.func, name, frame.block, frame.inst)?;
             let base = match &var.loc {
-                VarLoc::Window { off } => frame.vals.first()?.i64() as u64 + *off as u64,
+                VarLoc::Window { off } => frame.sp()?.i64() as u64 + *off as u64,
                 VarLoc::WindowVia { base, off } => {
                     let idx = loclist_value(base, frame.block, frame.inst)?;
                     frame.vals.get(idx as usize)?.i64() as u64 + *off as u64
@@ -4876,6 +4876,20 @@ pub(crate) struct Frame {
     vals: Vals,
 }
 
+impl Frame {
+    /// The function's first param: value 0 of its entry block, which every other block has as an
+    /// ancestor, so the frame holds it wherever it is. A §3d frontend passes the data-SP there and
+    /// never moves it within the function, so this is the frame's data-SP — whether or not the
+    /// current block takes it as its own param 0 (a raised block captures it, #2454).
+    fn sp(&self) -> Option<Reg> {
+        match self.block {
+            0 => self.vals.cur.first(),
+            _ => self.vals.above.first(),
+        }
+        .copied()
+    }
+}
+
 /// A frame's values: its current block's, and the values of that block's proper ancestors in its
 /// function's dominance certificate (#2454), each as the frame last left that ancestor. Reads, pushes
 /// and pops see the current block's only, by its block-local indices; [`Vals::enter`] keeps the
@@ -5024,7 +5038,7 @@ impl FromIterator<Reg> for Vals {
 /// not be reconstructed from the live (later-block) frame, so it is snapshotted here. `longjmp` truncates
 /// the call stack to `depth` (the intervening frames discarded — C has no cleanups), overwrites the
 /// surviving `setjmp` frame with `(block, inst, vals)`, sets `vals[result_idx]` to the long-jump value,
-/// and resumes. The data-stack pointer rides in `vals[0]` (the §3d SP block-param), so restoring `vals`
+/// and resumes. The data-stack pointer is among those values ([`Frame::sp`]), so restoring `vals`
 /// restores it.
 #[derive(Clone)]
 struct SetJmpPoint {
@@ -13432,7 +13446,7 @@ impl VCpu {
     ) -> Result<(), Trap> {
         // The entry funcref (== func index) + data-stack base, to re-enter the fiber on thaw.
         let func = frames.first().map(|f| f.func as i32).unwrap_or(0);
-        let sp = match frames.first().and_then(|f| f.vals.first()) {
+        let sp = match frames.first().and_then(Frame::sp) {
             Some(r) => r.i64(),
             _ => 0,
         };
@@ -18140,7 +18154,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let (func, sp) = match popped.as_ref() {
                             Some(f) => (
                                 f.func as i32,
-                                match f.vals.first() {
+                                match f.sp() {
                                     Some(r) => r.i64(),
                                     _ => 0,
                                 },
@@ -24747,6 +24761,9 @@ pub struct Host {
     /// installs an OS-shared-memory factory ([`Host::set_region_factory`], e.g.
     /// `temen_run::new_shared_region`) so a JIT guest can `map` what it mints for real aliasing.
     region_factory: Option<fn(usize) -> Result<RegionBacking, i64>>,
+    /// #1414 5d — where a detached child's window lives ([`Host::set_child_window`]): a backing the
+    /// embedder makes. `None` (the default) builds it in the engine's own memory.
+    child_window: Option<bytecode::ChildBacking>,
     /// §12 `Blocking` capability backings, indexed by the id a [`Binding::Blocking`] carries. Each is
     /// a `Send + Sync` [`AsyncState`] a `submit` batch can run on the offload pool.
     blockings: Vec<Arc<AsyncState>>,
@@ -25718,6 +25735,7 @@ impl Host {
             attestation: Attestation::default(),
             modules: Vec::new(),
             region_factory: None,
+            child_window: None,
             blockings: Vec::new(),
             host_procs: Vec::new(),
             offers: Vec::new(),
@@ -31817,12 +31835,14 @@ impl Host {
     /// once for the whole run. It mints `SharedRegion`s with this host's [`Host::set_region_factory`];
     /// without it a detached child's own `region_create` minted a [`VecBacking`], which has no OS
     /// handle, so the JIT's `map` of it failed with `-EINVAL` while a region its parent granted
-    /// mapped. It runs on this host's driver, so it has its workers ([`Host::set_workers`], #2254).
-    /// Every place that builds a child's or a twin's host starts from this, so no spawn path can drop
-    /// one of them again.
+    /// mapped. Its own detached children's windows live where this host's do
+    /// ([`Host::set_child_window`]). It runs on this host's driver, so it has its workers
+    /// ([`Host::set_workers`], #2254). Every place that builds a child's or a twin's host starts from
+    /// this, so no spawn path can drop one of them again.
     pub(crate) fn child_host(&self) -> Host {
         let mut child = Host::new();
         child.region_factory = self.region_factory;
+        child.child_window = self.child_window;
         child.notes = Arc::clone(&self.notes);
         child.workers = self.workers;
         child
@@ -31847,6 +31867,20 @@ impl Host {
     /// descriptors: a guest's mint reaches it, so it must never panic.
     pub fn set_region_factory(&mut self, f: fn(usize) -> Result<RegionBacking, i64>) {
         self.region_factory = Some(f);
+    }
+
+    /// #1414 5d — build each detached child's window over a backing `make` makes, `2^size_log2`
+    /// bytes to start with, apart from the engine's own memory: a browser's is a
+    /// `WebAssembly.Memory` of the child's own ([`Region::foreign`]). The run's children's children
+    /// follow ([`Host::child_host`]), on either executor. A backing `make` cannot make refuses the
+    /// spawn. Without it a child's window is built in the engine's memory.
+    pub fn set_child_window(&mut self, make: bytecode::ChildBacking) {
+        self.child_window = Some(make);
+    }
+
+    /// Where this host's detached children's windows live ([`Host::set_child_window`]).
+    pub(crate) fn child_window(&self) -> Option<bytecode::ChildBacking> {
+        self.child_window
     }
 
     /// Resolve a handle as a §13 `SharedRegion` and return its backing (an `Arc` clone — the same

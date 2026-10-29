@@ -34,7 +34,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { driveCoopTierupRun, suspendsLeaves } from './web/coop-driver.js';
-import { engineImports } from './engine-imports.mjs';
+import { instantiateEngine } from './engine-imports.mjs';
 import {
   runCases, runX2Cases, pong, PINGS, bigFeed, LONE_WAIT_MS, JS_CAPS_OUT, JS_CAPS_THREAD_VALUE,
   JS_CAPS_CHILD_VALUE,
@@ -185,6 +185,9 @@ const checkX2 = (r) => {
   leaf('pings', r.leafPings);
   echoed('a root leaf\'s stdin fed as it idles', r.leafEcho, 'hello world\n');
   leaf('stdin fed later', r.leafEcho);
+  // #1414 5d: before the JS capability cases, a pump run's detached child left the page a spare
+  // memory of its own (`runX2Cases`).
+  if (r.pumpKid !== '7') fail(`chromium: the pump's detached child returned ${r.pumpKid} (want 7)`);
   // #2579: JS capabilities answered inside each call, on the page (the calling task's Worker
   // waiting inside it) or, with `capModule`, in the calling task's own Worker (#2645, where the page
   // answers none): the uppercasing landed in the window of the task that called, the root's, a
@@ -216,7 +219,7 @@ const checkX2 = (r) => {
 
 const mod = await WebAssembly.compile(readFileSync(wasmPath));
 const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
-const { exports: ex } = await WebAssembly.instantiate(mod, engineImports(memory));
+const ex = await instantiateEngine(mod, memory);
 check('node', await runCases({ ex, memory, drive: driveCoopTierupRun, suspends: suspendsLeaves }),
   suspendsLeaves);
 

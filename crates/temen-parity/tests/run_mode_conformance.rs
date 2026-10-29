@@ -11,9 +11,10 @@
 //! powerbox it needs, and the answer the oracle gives. A **runner** is one configuration of the
 //! manifest, run the way its embedder runs it: the four executors one-shot, the DAP's two debug
 //! engines (the tree-walk `Inspector` and the bytecode debug scheduler), `CoopRun` on the pump and
-//! on executor 2, and the durable entries of the tree-walker, the pump and the Cranelift JIT, each
-//! run frozen and thawed. The runners live in `support/runners.rs`, which the frontier matrix's
-//! run-driven axes run on too (D3a).
+//! on executor 2, the durable entries of the tree-walker, the pump and the Cranelift JIT, each run
+//! frozen and thawed, and the pump's reactor, its entry called as two frames, each run to its end
+//! or held. The runners live in `support/runners.rs`, which the frontier matrix's run-driven axes
+//! run on too (D3a).
 //!
 //! A probe's embedder may have to act from outside the run ([`Outside`]), and each runner acts as
 //! its embedder would. A run the embedder holds hands control back when it can only wait on the
@@ -285,8 +286,8 @@ fn audited_coverage_does_not_regress() {
         .filter(|c| c.status != Status::Unaudited)
         .count();
     assert!(
-        audited >= 102,
+        audited >= 124,
         "audited cell count fell to {audited}; it was 102 when the frozen-and-thawed runners \
-         landed (#2545)"
+         landed, and 124 once the reactor runners did (#2545)"
     );
 }

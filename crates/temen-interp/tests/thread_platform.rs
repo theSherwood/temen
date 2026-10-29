@@ -5,17 +5,20 @@
 //! was handed: for every thread it starts, for every tier-up a thread meets, and for stopping
 //! emitted code when the run ends.
 
+#[path = "support/fake_foreign.rs"]
+mod fake_foreign;
 #[path = "support/rec.rs"]
 mod rec;
 
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use fake_foreign::{fake_child_window, fake_word};
 use temen_interp::bytecode::{
-    self, CoopEvent, EmittedCall, EmittedTarget, Hotness, LeafOffer, ModuleOffer, ProgramEmit,
-    ThreadPlatform, ThreadStart, ThreadTier,
+    self, ChildBacking, CoopEvent, EmittedCall, EmittedTarget, Hotness, LeafOffer, ModuleOffer,
+    ProgramEmit, ThreadPlatform, ThreadStart, ThreadTier, TierUpConfig,
 };
-use temen_interp::{ForeignOps, Host, JitValidated, Region, Trap, Value};
+use temen_interp::{Host, JitValidated, Region, Trap, Value};
 use temen_ir::{Module, SpawnRec, ValType};
 use temen_text::parse_module;
 
@@ -1042,7 +1045,7 @@ fn a_collector_under_each_threads_emitted_frame_sees_its_spilled_words() {
     assert_eq!(run_over(&m, spilling, flat_window()), interpreted);
 }
 
-// ----- a detached child's window in the platform's memory (#1414 B6-3c) -----------------------
+// ----- a detached child's window in its host's memory, on either executor (#1414 B6-3c, 5d) -----
 
 /// The root spawns the granted module's entry 0, detached in its declared window, by the spawn record
 /// at 17536, paid from `budget`. A refused spawn is tried once more. The root returns what the
@@ -1111,35 +1114,33 @@ block 0 (vsp: i64, varg: i64) {
 }
 ";
 
-/// Run [`spawn_and_join`] under `platform`, granting it `child` (its program) and a budget of `mem`
-/// bytes.
-fn run_detached(platform: ThreadPlatform, mem: i64, child: &str) -> Result<Vec<Value>, Trap> {
-    run_detached_root(&spawn_and_join(), platform, mem, child)
+/// Run [`spawn_and_join`] under `platform`, its children's windows made by `window` if given,
+/// granting it `child` (its program) and a budget of `mem` bytes.
+fn run_detached(
+    platform: ThreadPlatform,
+    window: Option<ChildBacking>,
+    mem: i64,
+    child: &str,
+) -> Result<Vec<Value>, Trap> {
+    run_detached_root(&spawn_and_join(), platform, window, mem, child)
 }
 
-/// Run the root `root`, given `(instantiator, child module, budget)`, under `platform`, granting
-/// it `child` (its program) and a budget of `mem` bytes. The root's window is flat, as executor 2's
-/// is in a browser: a tier-up over a window without a flat span runs interpreted (#1414 B6-3a), and
-/// the driver's own reservation is flat only where it is an `mmap`.
+/// Run the root `root`, given `(instantiator, child module, budget)`, under `platform`, its
+/// children's windows made by `window` if given, granting it `child` (its program) and a budget of
+/// `mem` bytes. The root's window is flat, as executor 2's is in a browser: a tier-up over a window
+/// without a flat span runs interpreted (#1414 B6-3a), and the driver's own reservation is flat
+/// only where it is an `mmap`.
 fn run_detached_root(
     root: &str,
     platform: ThreadPlatform,
+    window: Option<ChildBacking>,
     mem: i64,
     child: &str,
 ) -> Result<Vec<Value>, Trap> {
     let m = module(root);
     let size = 1 << m.memory.expect("the root has a window").size_log2;
     let back = Region::owned_zeroed(size, temen_interp::host_page_size()).expect("a flat window");
-    let mut host = Host::new();
-    host.set_thread_platform(platform);
-    let inst = host.grant_instantiator();
-    let child = host.grant_module(&module(child));
-    let budget = host.grant_budget(-1, mem, -1);
-    let args = [
-        Value::I32(inst),
-        Value::I32(child),
-        Value::I64(budget as i64),
-    ];
+    let (mut host, args) = detached_host(platform, window, mem, child);
     let mut fuel = 50_000_000;
     bytecode::compile_and_run_capture_over_parallel_with_host(
         &m,
@@ -1154,95 +1155,103 @@ fn run_detached_root(
     .0
 }
 
-/// The test's own foreign memories, as a browser's are a child's `WebAssembly.Memory`: byte
-/// vectors the engine reaches only through [`FAKE_OPS`].
-static FAKE_MEMS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-
-fn fake_read_span(id: u32, off: u64, out: &mut [u8]) {
-    let o = off as usize;
-    out.copy_from_slice(&FAKE_MEMS.lock().unwrap()[id as usize][o..o + out.len()]);
-}
-
-fn fake_write_span(id: u32, off: u64, data: &[u8]) {
-    let o = off as usize;
-    FAKE_MEMS.lock().unwrap()[id as usize][o..o + data.len()].copy_from_slice(data);
-}
-
-unsafe extern "C" fn fake_read(id: u32, off: u64, dst: *mut u8, len: usize) {
-    // SAFETY: the caller's contract (`ForeignOps::read`).
-    fake_read_span(id, off, unsafe { std::slice::from_raw_parts_mut(dst, len) })
-}
-
-unsafe extern "C" fn fake_write(id: u32, off: u64, src: *const u8, len: usize) {
-    // SAFETY: the caller's contract (`ForeignOps::write`).
-    fake_write_span(id, off, unsafe { std::slice::from_raw_parts(src, len) })
-}
-
-extern "C" fn fake_load(id: u32, off: u64, width: u32) -> u64 {
-    let mut b = [0u8; 8];
-    fake_read_span(id, off, &mut b[..width as usize]);
-    u64::from_le_bytes(b)
-}
-
-extern "C" fn fake_store(id: u32, off: u64, width: u32, val: u64) {
-    fake_write_span(id, off, &val.to_le_bytes()[..width as usize]);
-}
-
-extern "C" fn fake_fill(id: u32, off: u64, len: u64, b: u8) {
-    FAKE_MEMS.lock().unwrap()[id as usize][off as usize..(off + len) as usize].fill(b);
-}
-
-extern "C" fn fake_copy(id: u32, dst: u64, src: u64, len: u64) {
-    let range = src as usize..(src + len) as usize;
-    FAKE_MEMS.lock().unwrap()[id as usize].copy_within(range, dst as usize);
-}
-
-/// A load, a store or a compare-exchange: what these guests' runs perform.
-extern "C" fn fake_atomic(id: u32, kind: u32, off: u64, width: u32, a: u64, b: u64) -> u64 {
-    let mut mems = FAKE_MEMS.lock().unwrap();
-    let cell = &mut mems[id as usize][off as usize..(off + width as u64) as usize];
-    let mut raw = [0u8; 8];
-    raw[..cell.len()].copy_from_slice(cell);
-    let old = u64::from_le_bytes(raw);
-    let new = match kind {
-        0 => return old,
-        1 => a,
-        8 if old == a => b,
-        8 => return old,
-        k => unreachable!("atomic kind {k}: these runs load, store and compare-exchange only"),
-    };
-    let len = cell.len();
-    cell.copy_from_slice(&new.to_le_bytes()[..len]);
-    old
-}
-
-extern "C" fn fake_grow(id: u32, len: u64) -> u32 {
-    let mut mems = FAKE_MEMS.lock().unwrap();
-    let m = &mut mems[id as usize];
-    if m.len() < len as usize {
-        m.resize(len as usize, 0);
+/// The host [`spawn_and_join`]'s run is given, and the root's arguments: an `Instantiator`, `child`
+/// (its program) and a budget of `mem` bytes, the children's windows made by `window` if given.
+fn detached_host(
+    platform: ThreadPlatform,
+    window: Option<ChildBacking>,
+    mem: i64,
+    child: &str,
+) -> (Host, [Value; 3]) {
+    let mut host = Host::new();
+    host.set_thread_platform(platform);
+    if let Some(make) = window {
+        host.set_child_window(make);
     }
-    1
+    let inst = host.grant_instantiator();
+    let child = host.grant_module(&module(child));
+    let budget = host.grant_budget(-1, mem, -1);
+    let args = [
+        Value::I32(inst),
+        Value::I32(child),
+        Value::I64(budget as i64),
+    ];
+    (host, args)
 }
 
-static FAKE_OPS: ForeignOps = ForeignOps {
-    read: fake_read,
-    write: fake_write,
-    load: fake_load,
-    store: fake_store,
-    fill: fake_fill,
-    copy_within: fake_copy,
-    atomic: fake_atomic,
-    grow: fake_grow,
-};
+/// Which executor runs [`spawn_and_join`] ([`run_detached_on`]).
+#[derive(Clone, Copy, Debug)]
+enum Executor {
+    /// The pump: every task in turn on the caller's thread.
+    Pump,
+    /// Executor 2, under the OS's platform.
+    Threads,
+}
 
-/// A child window in a fresh foreign memory of the test's own.
-fn fake_child_window(size_log2: u8) -> Option<Arc<Region>> {
-    let len = 1u64 << size_log2;
-    let mut mems = FAKE_MEMS.lock().unwrap();
-    mems.push(vec![0; len as usize]);
-    let id = mems.len() as u32 - 1;
-    Some(Arc::new(Region::foreign(id, len, FAKE_OPS)))
+const EXECUTORS: [Executor; 2] = [Executor::Pump, Executor::Threads];
+
+/// [`run_detached`] on `executor`.
+fn run_detached_on(
+    executor: Executor,
+    window: Option<ChildBacking>,
+    mem: i64,
+    child: &str,
+) -> Result<Vec<Value>, Trap> {
+    match executor {
+        Executor::Threads => run_detached(ThreadPlatform::OS, window, mem, child),
+        Executor::Pump => {
+            let (mut host, args) = detached_host(ThreadPlatform::OS, window, mem, child);
+            let mut fuel = 50_000_000;
+            bytecode::compile_and_run_with_host(
+                &module(&spawn_and_join()),
+                0,
+                &args,
+                &mut fuel,
+                &mut host,
+            )
+            .expect("the pump runs the module")
+        }
+    }
+}
+
+/// The memories [`windows_recorded`] made, in order.
+static WINDOWS_MADE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// A child window in a fresh fake memory, its id recorded in [`WINDOWS_MADE`].
+fn windows_recorded(size_log2: u8) -> Option<Arc<Region>> {
+    let window = fake_child_window(size_log2)?;
+    WINDOWS_MADE
+        .lock()
+        .unwrap()
+        .push(window.foreign_id().expect("a fake memory"));
+    Some(window)
+}
+
+/// #1414 5d — the host says where a child's window lives, on either executor: the child and its
+/// thread store into the memory its host made, and the engine lets that memory go once the child's
+/// window has gone.
+#[test]
+fn a_detached_childs_window_is_in_its_hosts_memory_on_either_executor() {
+    for executor in EXECUTORS {
+        assert_eq!(
+            run_detached_on(executor, Some(windows_recorded), 1 << 20, CHILD_AND_THREAD),
+            Ok(vec![Value::I64(42)]),
+            "{executor:?}: 7 + 35"
+        );
+        let made = std::mem::take(&mut *WINDOWS_MADE.lock().unwrap());
+        let [id] = made[..] else {
+            panic!("{executor:?}: one window made, the child's: {made:?}");
+        };
+        assert_eq!(
+            (fake_word(id, 16400), fake_word(id, 16408)),
+            (7, 35),
+            "{executor:?}: the child and its thread stored into its host's memory"
+        );
+        assert!(
+            fake_foreign::released(id),
+            "{executor:?}: the engine let the child's memory go"
+        );
+    }
 }
 
 /// The window each thread [`a_detached_childs_window_is_in_the_platforms_memory`]'s run starts was
@@ -1258,16 +1267,18 @@ fn recording_spawn(f: ThreadStart, window: Option<u32>) -> std::io::Result<()> {
 fn a_detached_childs_window_is_in_the_platforms_memory() {
     let want = Ok(vec![Value::I64(42)]);
     assert_eq!(
-        run_detached(ThreadPlatform::OS, 1 << 20, CHILD_AND_THREAD),
+        run_detached(ThreadPlatform::OS, None, 1 << 20, CHILD_AND_THREAD),
         want,
         "7 + 35, in a window of the engine's"
     );
     let platform = ThreadPlatform {
         spawn: recording_spawn,
-        child_window: Some(fake_child_window),
         ..ThreadPlatform::OS
     };
-    assert_eq!(run_detached(platform, 1 << 20, CHILD_AND_THREAD), want);
+    assert_eq!(
+        run_detached(platform, Some(fake_child_window), 1 << 20, CHILD_AND_THREAD),
+        want
+    );
     let spawned = SPAWNED_OVER.lock().unwrap().clone();
     let id = spawned[1].expect("the child's task runs over its memory");
     assert_eq!(
@@ -1285,7 +1296,7 @@ fn a_detached_childs_window_is_in_the_platforms_memory() {
 
 static WINDOWS_ASKED: AtomicUsize = AtomicUsize::new(0);
 
-/// A platform that cannot make the first child window it is asked for, and makes the next in the
+/// A host that cannot make the first child window it is asked for, and makes the next in the
 /// engine's own kind of memory.
 fn refuse_the_first_window(size_log2: u8) -> Option<Arc<Region>> {
     match WINDOWS_ASKED.fetch_add(1, Ordering::SeqCst) {
@@ -1297,23 +1308,23 @@ fn refuse_the_first_window(size_log2: u8) -> Option<Arc<Region>> {
 }
 
 #[test]
-fn a_child_window_the_platform_cannot_make_refuses_the_spawn_and_charges_nothing() {
-    // The budget holds one window. The refused spawn hands it back, so the second spawn finds it.
-    let platform = ThreadPlatform {
-        child_window: Some(refuse_the_first_window),
-        ..ThreadPlatform::OS
-    };
-    assert_eq!(
-        run_detached(platform, 1 << 16, CHILD_AND_THREAD),
-        Ok(vec![Value::I64(42)])
-    );
-    assert_eq!(WINDOWS_ASKED.load(Ordering::SeqCst), 2);
-}
-
-/// The word at `at` of the test's foreign memory `id`.
-fn fake_word(id: u32, at: usize) -> i64 {
-    let mems = FAKE_MEMS.lock().unwrap();
-    i64::from_le_bytes(mems[id as usize][at..at + 8].try_into().unwrap())
+fn a_child_window_its_host_cannot_make_refuses_the_spawn_and_charges_nothing() {
+    for executor in EXECUTORS {
+        WINDOWS_ASKED.store(0, Ordering::SeqCst);
+        // The budget holds one window. The refused spawn hands it back, so the second spawn finds
+        // it.
+        assert_eq!(
+            run_detached_on(
+                executor,
+                Some(refuse_the_first_window),
+                1 << 16,
+                CHILD_AND_THREAD
+            ),
+            Ok(vec![Value::I64(42)]),
+            "{executor:?}"
+        );
+        assert_eq!(WINDOWS_ASKED.load(Ordering::SeqCst), 2, "{executor:?}");
+    }
 }
 
 /// #1414 ED-2 — the child: its entry spawns a thread (f1), calls f2 with 7 itself, joins the
@@ -1387,12 +1398,16 @@ fn a_childs_root_task_tiers_up_over_its_own_memory() {
             })),
             run: recording_child_calls,
         }),
-        child_window: Some(fake_child_window),
         ..ThreadPlatform::OS
     };
     assert_eq!(
-        run_detached(platform, 1 << 20, CHILD_CALLS_A_LEAF),
-        run_detached(ThreadPlatform::OS, 1 << 20, CHILD_CALLS_A_LEAF),
+        run_detached(
+            platform,
+            Some(fake_child_window),
+            1 << 20,
+            CHILD_CALLS_A_LEAF
+        ),
+        run_detached(ThreadPlatform::OS, None, 1 << 20, CHILD_CALLS_A_LEAF),
         "the oracle's 7 + 35"
     );
     let calls = CHILD_CALLS.lock().unwrap().clone();
@@ -1409,6 +1424,88 @@ fn a_childs_root_task_tiers_up_over_its_own_memory() {
         (fake_word(id, 16384 + 8 * 7), fake_word(id, 16384 + 8 * 35)),
         (7, 35),
         "both calls stored into the child's memory"
+    );
+}
+
+/// #1414 5d — [`a_childs_root_task_tiers_up_over_its_own_memory`] on the pump: the tier-up of the
+/// child's root task names the memory its window is in, and the call its host runs there, bounced
+/// whole into the interpreter as an emitted body would bounce it, stores into that memory.
+#[test]
+fn a_childs_tier_up_on_the_pump_names_its_own_memory() {
+    let leaf_of_child = |_: &ModuleOffer| {
+        Some(ProgramEmit {
+            eligible: Arc::from([false, false, true]),
+            page_checked: false,
+            ..Default::default()
+        })
+    };
+    let tierup = TierUpConfig {
+        root: ProgramEmit {
+            eligible: Arc::from([false]),
+            page_checked: false,
+            ..Default::default()
+        },
+        leaf: None,
+        modules: Some(Arc::new(leaf_of_child)),
+    };
+    let (host, args) = detached_host(
+        ThreadPlatform::OS,
+        Some(fake_child_window),
+        1 << 20,
+        CHILD_CALLS_A_LEAF,
+    );
+    let mut run = bytecode::CoopRun::new(
+        &module(&spawn_and_join()),
+        0,
+        &args,
+        50_000_000,
+        host,
+        Some(tierup),
+    )
+    .expect("the module is in the engine's subset")
+    .expect("the run starts");
+    let mut calls = Vec::new();
+    let got = loop {
+        match run.run() {
+            CoopEvent::Done(vals) => break Ok(vals),
+            CoopEvent::Trapped(t) => break Err(t),
+            CoopEvent::TierUp {
+                module,
+                func,
+                argv,
+                memory,
+                ..
+            } => {
+                calls.push((module, func, memory));
+                let mut io = [0i64; 8];
+                io[..argv.len()].copy_from_slice(&argv);
+                let n = run
+                    .bounce(func, &mut io, None)
+                    .expect("the call runs")
+                    .expect("nothing here parks");
+                run.deliver_tierup(&io[..n]);
+            }
+            _ => panic!("nothing here waits on the embedder"),
+        }
+    };
+    assert_eq!(
+        got,
+        run_detached_on(Executor::Pump, None, 1 << 20, CHILD_CALLS_A_LEAF),
+        "the oracle's 7 + 35"
+    );
+    let [(module, func, Some(id))] = calls[..] else {
+        panic!("one call tiered up, over a memory of the host's: {calls:?}");
+    };
+    assert_eq!(
+        (module, func),
+        (1, 2),
+        "the child's root task tiered up its call to f2, in the child's program; its thread's \
+         call interpreted"
+    );
+    assert_eq!(
+        (fake_word(id, 16384 + 8 * 7), fake_word(id, 16384 + 8 * 35)),
+        (7, 35),
+        "both calls stored into the memory the tier-up named"
     );
 }
 
@@ -1595,14 +1692,19 @@ fn a_bounce_spawns_and_joins_a_child_whose_entry_spawns_a_thread() {
             })),
             run: recording_child_bounces,
         }),
-        child_window: Some(fake_child_window),
         ..ThreadPlatform::OS
     };
     let root = spawn_and_join_in_a_call();
-    let interpreted = run_detached_root(&root, ThreadPlatform::OS, 1 << 20, CHILD_AND_THREAD);
+    let interpreted = run_detached_root(&root, ThreadPlatform::OS, None, 1 << 20, CHILD_AND_THREAD);
     assert_eq!(interpreted, Ok(vec![Value::I64(42)]), "the oracle's 7 + 35");
     assert_eq!(
-        run_detached_root(&root, platform, 1 << 20, CHILD_AND_THREAD),
+        run_detached_root(
+            &root,
+            platform,
+            Some(fake_child_window),
+            1 << 20,
+            CHILD_AND_THREAD
+        ),
         interpreted
     );
     let mut ran = CHILD_BOUNCES.lock().unwrap().clone();

@@ -8477,8 +8477,9 @@ fn build_clif(
     emit_stack_check(&mut b, &lower);
     b.ins().jump(blocks.clif[0], &entry_args);
 
+    let mut checked = CheckedBases::new(&lower, f);
     for (i, blk) in f.blocks.iter().enumerate() {
-        lower_block(&mut b, blk, i, &mut blocks, &lower)?;
+        lower_block(&mut b, blk, i, &mut blocks, &mut checked, &lower)?;
     }
 
     b.seal_all_blocks();
@@ -8694,9 +8695,8 @@ fn build_fiber_call_trampoline(clif: &mut Function) {
 /// `v128` (SIMD) crossing value; a scalar uses the low bytes. setjmp is rare, so the slack is free.
 const SETJMP_SAVE_STRIDE: usize = 16;
 
-/// #2537 — save the guest values **live across a `setjmp`** to a reuse-immune explicit stackslot,
-/// returning the slot and the `(value-index, type)` list to reload after the call (or `None` when
-/// nothing crosses). The caller stores before the libc `_setjmp` call and reloads after it.
+/// #2537 — save the values **live across a `setjmp`** to a reuse-immune explicit stackslot, for the
+/// caller to reload after the libc `_setjmp` call ([`Laundered::reload`]).
 ///
 /// Why this is needed. `_setjmp` lowers to an ordinary CLIF `call`, and neither Cranelift nor
 /// regalloc2 has a returns-twice concept. A value live across the call gets a spill slot; the
@@ -8708,19 +8708,22 @@ const SETJMP_SAVE_STRIDE: usize = 16;
 /// An **explicit** stackslot is never reused by regalloc and no guest op writes it, so it holds the
 /// pre-`setjmp` value on both returns.
 ///
-/// The set saved is exactly the IR values referenced at or after the `setjmp` (the rest of this
-/// block's insts and its terminator's edge args) that were defined before it. The terminator's edge
-/// args are the load-bearing case: a value forwarded to a successor block crosses the `setjmp`, and
-/// the IR still carries it as an edge arg even where the CLIF lowering drops it (#2448). `ubs` is
-/// deliberately left untouched — a laundered value keeps its IR identity and proven bound, so an
-/// elided access reads the reuse-immune copy and cannot be driven out of window by a clobbered
-/// reload.
+/// The set saved is the IR values referenced at or after the `setjmp` (the rest of this block's
+/// insts and its terminator's edge args) that were defined before it, and the lowering's context
+/// variables ([`context_vars`]). The terminator's edge args are the load-bearing IR case: a value
+/// forwarded to a successor block crosses the `setjmp`, and the IR still carries it as an edge arg
+/// even where the CLIF lowering drops it (#2448). The context variables are CLIF values no IR value
+/// names, and the code after the `setjmp` reads them: a clobbered function-table base sent a
+/// `call.dyn` through a forged entry (#2652). `ubs` is deliberately left untouched — a laundered
+/// value keeps its IR identity and proven bound, so an elided access reads the reuse-immune copy
+/// and cannot be driven out of window by a clobbered reload.
 fn launder_across_setjmp(
     b: &mut FunctionBuilder,
+    lower: &Lower,
     blk: &Block,
     inst_idx: usize,
     vals: &[Value],
-) -> Option<(cranelift_codegen::ir::StackSlot, Vec<(usize, Type)>)> {
+) -> Laundered {
     let defined = vals.len();
     let mut live = std::collections::BTreeSet::new();
     let mut note = |v: &u32| {
@@ -8733,23 +8736,72 @@ fn launder_across_setjmp(
         inst.for_each_operand(&mut note);
     }
     blk.term.for_each_operand(&mut note);
-    if live.is_empty() {
-        return None;
-    }
-    let saved: Vec<(usize, Type)> = live
+    let ctx: Vec<(Variable, Value)> = context_vars(lower)
         .into_iter()
-        .map(|i| (i, b.func.dfg.value_type(vals[i])))
+        .map(|var| (var, b.use_var(var)))
         .collect();
-    let save = b.create_sized_stack_slot(StackSlotData::new(
+    let saved: Vec<Value> = live
+        .iter()
+        .map(|&i| vals[i])
+        .chain(ctx.iter().map(|&(_, v)| v))
+        .collect();
+    let slot = b.create_sized_stack_slot(StackSlotData::new(
         StackSlotKind::ExplicitSlot,
         (saved.len() * SETJMP_SAVE_STRIDE) as u32,
         4, // align 2^4 = 16, so a v128 slot is aligned
     ));
-    for (k, &(i, _)) in saved.iter().enumerate() {
+    for (k, &v) in saved.iter().enumerate() {
         b.ins()
-            .stack_store(vals[i], save, (k * SETJMP_SAVE_STRIDE) as i32);
+            .stack_store(v, slot, (k * SETJMP_SAVE_STRIDE) as i32);
     }
-    Some((save, saved))
+    let ty = |b: &FunctionBuilder, v: Value| b.func.dfg.value_type(v);
+    Laundered {
+        slot,
+        vals: live.into_iter().map(|i| (i, ty(b, vals[i]))).collect(),
+        ctx: ctx.into_iter().map(|(var, v)| (var, ty(b, v))).collect(),
+    }
+}
+
+/// What [`launder_across_setjmp`] saved before a `_setjmp`, in its slot's entries in order: the IR
+/// values, then the context variables.
+struct Laundered {
+    slot: cranelift_codegen::ir::StackSlot,
+    /// Each IR value saved: its index in the block's value map, and its type.
+    vals: Vec<(usize, Type)>,
+    /// Each context variable saved, and its type.
+    ctx: Vec<(Variable, Type)>,
+}
+
+impl Laundered {
+    /// After the `_setjmp`, reload everything saved: the value map's entries become the reloaded
+    /// copies, so every later use in this block — and every successor's forwarded use, which reads
+    /// this block's final value map (#2448) — reads the reuse-immune slot, and each context
+    /// variable is redefined as its own copy.
+    fn reload(&self, b: &mut FunctionBuilder, vals: &mut [Value]) {
+        let at = |k: usize| (k * SETJMP_SAVE_STRIDE) as i32;
+        for (k, &(i, ty)) in self.vals.iter().enumerate() {
+            vals[i] = b.ins().stack_load(ty, self.slot, at(k));
+        }
+        for (k, &(var, ty)) in self.ctx.iter().enumerate() {
+            let v = b.ins().stack_load(ty, self.slot, at(self.vals.len() + k));
+            b.def_var(var, v);
+        }
+    }
+}
+
+/// The lowering's context variables: the CLIF values a function's code reads that no IR value
+/// names — the window base, the function table's base, the vmctx, the stack limit, the return
+/// area when it returns through one, and a demand-paged child's access table.
+fn context_vars(lower: &Lower) -> Vec<Variable> {
+    let mut vars = vec![
+        lower.mem_var,
+        lower.fn_table_var,
+        lower.vmctx_var,
+        lower.limit_var,
+    ];
+    vars.extend(lower.sret_var);
+    vars.extend(lower.page.as_ref().map(|&(_, _, table)| table));
+    vars
 }
 
 /// Lower one IR block's body + terminator into its CLIF block.
@@ -8758,6 +8810,7 @@ fn lower_block(
     blk: &Block,
     block_idx: usize,
     blocks: &mut Blocks,
+    checked: &mut CheckedBases,
     lower: &Lower,
 ) -> Result<(), JitError> {
     let cb = blocks.clif[block_idx];
@@ -8793,8 +8846,8 @@ fn lower_block(
     // via `mask` (= size−1).
     let mut ubs: Vec<u64> = vec![UB_TOP; vals.len()];
     let size = lower.mask.wrapping_add(1);
-    // #2147 — the bounds checks this block's loads and stores share.
-    let mut checked = CheckedBases::new(lower);
+    // #2147 — the bounds checks this block shares with the blocks that dominate it (D74).
+    checked.enter(block_idx, blk.parent as usize);
 
     for (inst_idx, inst) in blk.insts.iter().enumerate() {
         // Single-site `ubs` maintenance (#893): repair any lag a previous multi-result arm left —
@@ -9115,12 +9168,12 @@ fn lower_block(
         // `i32` 0 (direct) / long-jump value (re-entry). The slot alloc is infallible, so no
         // trap-propagate.
         if let Inst::SetJmp { buf } = inst {
-            let bufv = get(&vals, *buf)?; // i64 guest jmp_buf window address (the table key)
-                                          // #2537: save every guest value live across this setjmp to a
-                                          // reuse-immune explicit stackslot *before* the call; reloaded
-                                          // after it, so both returns (direct and via longjmp) read the
-                                          // saved copy, not a spill slot the longjmp path may clobber.
-            let laundered = launder_across_setjmp(b, blk, inst_idx, &vals);
+            // The guest jmp_buf's window address: the key of its host table entry.
+            let bufv = get(&vals, *buf)?;
+            // #2537, #2652: save every value live across this setjmp to a reuse-immune explicit
+            // stackslot *before* the call, and reload it after, so both returns (direct and via
+            // longjmp) read the saved copy, not a spill slot the longjmp path may clobber.
+            let laundered = launder_across_setjmp(b, lower, blk, inst_idx, &vals);
             // slot = rt_setjmp_slot(rt_addr, buf) -> *mut jmp_buf
             let rt_addr = vmctx_load(b, lower, vmctx::SETJMP);
             let c1 = call_host(lower.callees, b, HostFn::SetjmpSlot, &[rt_addr, bufv])?;
@@ -9128,16 +9181,9 @@ fn lower_block(
             // r = _setjmp(slot) -> i32 — emitted inline in this JIT frame.
             let c2 = call_host(lower.callees, b, HostFn::Setjmp, &[slot])?;
             let r = b.inst_results(c2)[0];
-            // #2537: reload the saved values and rewrite the value map to the reloaded copies, so every
-            // later use in this block — and every successor's forwarded use (which reads this block's
-            // final value map, #2448) — sources the value from the reuse-immune slot.
-            if let Some((save, saved)) = laundered {
-                for (k, &(i, ty)) in saved.iter().enumerate() {
-                    vals[i] = b
-                        .ins()
-                        .stack_load(ty, save, (k * SETJMP_SAVE_STRIDE) as i32);
-                }
-            }
+            // No check point's base crosses the call (#2652): a later access tests its own.
+            checked.forget();
+            laundered.reload(b, &mut vals);
             vals.push(r);
             continue;
         }
@@ -10008,7 +10054,7 @@ fn lower_block(
                 let phys = if elide {
                     mask_addr(b, lower, a, *offset, true, op.info().2)
                 } else {
-                    checked.confine(b, lower, *addr, a, *offset, op.info().2)
+                    checked.confine(b, lower, a, *offset, op.info().2)
                 };
                 emit_page_check(b, lower, phys, op.info().2, 0);
                 lower_load(b, *op, phys)
@@ -10030,7 +10076,7 @@ fn lower_block(
                 let phys = if elide {
                     mask_addr(b, lower, a, *offset, true, op.info().2)
                 } else {
-                    checked.confine(b, lower, *addr, a, *offset, op.info().2)
+                    checked.confine(b, lower, a, *offset, op.info().2)
                 };
                 emit_page_check(b, lower, phys, op.info().2, PAGE_MISS_WRITE);
                 lower_store(b, *op, phys, get(&vals, *value)?);
@@ -10042,12 +10088,12 @@ fn lower_block(
             // #2177: a short copy of one of this block's constant lengths is loads and stores instead
             // ([`copy_inline`]); a zero-length one is inert, as the libcall path makes it.
             Inst::MemCopy { dst, src, len } | Inst::MemMove { dst, src, len } => {
-                let short = checked.consts.get(len).copied();
+                let short = checked.consts.get(&get(&vals, *len)?).copied();
                 if let Some(n) =
                     short.filter(|n| lower.mask != 0 && (0..=INLINE_COPY_MAX).contains(n))
                 {
                     if n > 0 {
-                        copy_inline(b, lower, &mut checked, &ubs, &vals, *dst, *src, n as u32)?;
+                        copy_inline(b, lower, checked, &ubs, &vals, *dst, *src, n as u32)?;
                     }
                     continue;
                 }
@@ -10192,7 +10238,7 @@ fn lower_block(
         };
         // Single-result instruction: record its value and a sound upper bound in lockstep.
         let u = ub_of(inst, &ubs);
-        checked.note(vals.len() as u32, inst);
+        checked.note(v, inst, &vals);
         vals.push(v);
         ubs.push(u);
     }
@@ -10430,6 +10476,7 @@ fn lower_block(
         }
     }
     blocks.vals[block_idx] = vals;
+    checked.leave(block_idx);
     Ok(())
 }
 
@@ -11294,20 +11341,27 @@ fn guard_reach(lower: &Lower) -> u64 {
     }
 }
 
-/// #2147 — the bounds checks one IR block's loads and stores share. A **check point** is an access
+/// #2147 — the bounds checks a function's loads and stores share. A **check point** is an access
 /// whose own address `a` is tested against the reservation alone: `a ≥ reserved` redirects the base to
 /// the guard page (`select_spectre_guard`, as [`mask_addr`] redirects), and the access's offset and
-/// width fall within [`guard_reach`]. A later access in the same CLIF block whose address adds a
-/// constant to the same **root** value — `d ≥ 0` past the check point's, with `d + offset + width`
-/// within the reach — takes the checked base plus a constant, and tests nothing.
+/// width fall within [`guard_reach`]. A later access whose address adds a constant to the same
+/// **root** value — `d ≥ 0` past the check point's, with `d + offset + width` within the reach —
+/// takes the checked base plus a constant, and tests nothing.
 ///
 /// Exact, not approximate. If the check point's `a < reserved`, the later address is `a + d` with no
 /// wrap (`a + d < reserved + page`), so it is the interpreter's address, and whatever of the access
 /// lies past `reserved` lies on the guard page and faults there, at that access, where the
 /// interpreter's `checked_reserved` faults it. If `a ≥ reserved`, the check point itself faulted
 /// first. Under misspeculation the check point's base is the guard page's, so every access derived
-/// from it stays on that page. A base is reused only in the CLIF block that computed it, so it always
-/// dominates its uses; a call's trap check or a safepoint starts a new block, and with it new checks.
+/// from it stays on that page.
+///
+/// A check point serves the rest of its IR block and every block that block dominates (D74): the
+/// IR block's CLIF blocks form a chain each of which dominates the next, every path into a block it
+/// dominates leaves it through its terminator, and a block starts from the check points of its
+/// dominance-certificate parent, as a forwarded param or a capture takes the parent's value. So the
+/// check point ran on every path to a later access, and its base dominates the access. A `_setjmp`
+/// ends every check point ([`Self::forget`]): a base live across it could come back from a spill
+/// slot the longjmp path reused (#2537, #2652).
 ///
 /// A store that straddles `reserved` writes nothing before it faults only on hardware that never
 /// tears a faulting store: x86-64 guarantees it, Arm and RISC-V don't. [`mask_addr`] already relies
@@ -11317,39 +11371,67 @@ fn guard_reach(lower: &Lower) -> u64 {
 struct CheckedBases {
     /// [`guard_reach`]: `0` checks every access exactly.
     reach: i128,
-    /// The block's `i64.const` values, by value index.
-    consts: HashMap<u32, i64>,
-    /// A value the block computes as `root + c` by adding (or subtracting) constants, by value index.
-    roots: HashMap<u32, (u32, i128)>,
-    /// The check points still usable: one per root, the latest.
+    /// The function's `i64.const` values.
+    consts: HashMap<Value, i64>,
+    /// A value the function computes as `root + c` by adding (or subtracting) constants.
+    roots: HashMap<Value, (Value, i128)>,
+    /// The check points usable in the block being lowered: one per root, the latest.
     points: Vec<CheckPoint>,
+    /// Each lowered IR block's check points at its end, which the blocks it dominates start from.
+    /// `None` in a function that calls `setjmp`: there a base inherited from a dominator could have
+    /// crossed a `_setjmp` on another path into the block.
+    exits: Option<Vec<Vec<CheckPoint>>>,
 }
 
+#[derive(Clone)]
 struct CheckPoint {
-    root: u32,
+    root: Value,
     /// The check point's address is `root + c`.
     c: i128,
     /// `mem_base + (a ≥ reserved ? guard_offset : a)`.
     base: Value,
-    /// The CLIF block the base was computed in, the only one that may use it.
-    at: cranelift_codegen::ir::Block,
 }
 
 impl CheckedBases {
-    fn new(lower: &Lower) -> CheckedBases {
+    fn new(lower: &Lower, f: &Func) -> CheckedBases {
         CheckedBases {
             reach: i128::from(guard_reach(lower)),
             consts: HashMap::new(),
             roots: HashMap::new(),
             points: Vec::new(),
+            exits: (!f.uses_setjmp()).then(|| vec![Vec::new(); f.blocks.len()]),
         }
     }
 
-    /// Record what value `idx`, which `inst` defines, adds to a root.
-    fn note(&mut self, idx: u32, inst: &Inst) {
+    /// Start IR block `block`, which `parent` dominates (its dominance-certificate parent; the
+    /// entry block names itself): it starts from the check points the parent ended with.
+    fn enter(&mut self, block: usize, parent: usize) {
+        self.points = match &self.exits {
+            Some(exits) if parent < block => exits[parent].clone(),
+            _ => Vec::new(),
+        };
+    }
+
+    /// End IR block `block`, keeping its check points for the blocks it dominates.
+    fn leave(&mut self, block: usize) {
+        let points = std::mem::take(&mut self.points);
+        if let Some(exits) = &mut self.exits {
+            exits[block] = points;
+        }
+    }
+
+    /// End every check point, at a `_setjmp` (see the type's docs).
+    fn forget(&mut self) {
+        self.points.clear();
+    }
+
+    /// Record what `v`, the value `inst` defines, adds to a root. `vals` holds the block's values
+    /// before `v`.
+    fn note(&mut self, v: Value, inst: &Inst, vals: &[Value]) {
+        let val = |i: u32| vals.get(i as usize).copied();
         match *inst {
             Inst::ConstI64(k) => {
-                self.consts.insert(idx, k);
+                self.consts.insert(v, k);
             }
             Inst::IntBin {
                 ty: IntTy::I64,
@@ -11357,10 +11439,13 @@ impl CheckedBases {
                 a,
                 b,
             } => {
+                let (Some(a), Some(b)) = (val(a), val(b)) else {
+                    return;
+                };
                 if let Some(&k) = self.consts.get(&b) {
-                    self.roots.insert(idx, self.root_of(a, k));
+                    self.roots.insert(v, self.root_of(a, k));
                 } else if let Some(&k) = self.consts.get(&a) {
-                    self.roots.insert(idx, self.root_of(b, k));
+                    self.roots.insert(v, self.root_of(b, k));
                 }
             }
             Inst::IntBin {
@@ -11369,8 +11454,11 @@ impl CheckedBases {
                 a,
                 b,
             } => {
+                let (Some(a), Some(b)) = (val(a), val(b)) else {
+                    return;
+                };
                 if let Some(&k) = self.consts.get(&b) {
-                    self.roots.insert(idx, self.root_of(a, -i128::from(k)));
+                    self.roots.insert(v, self.root_of(a, -i128::from(k)));
                 }
             }
             _ => {}
@@ -11378,17 +11466,16 @@ impl CheckedBases {
     }
 
     /// `v + k` as `(root, c)`.
-    fn root_of(&self, v: u32, k: impl Into<i128>) -> (u32, i128) {
+    fn root_of(&self, v: Value, k: impl Into<i128>) -> (Value, i128) {
         let (root, c) = self.roots.get(&v).copied().unwrap_or((v, 0));
         (root, c + k.into())
     }
 
-    /// The physical address of a non-elided `width`-byte access at IR value `idx` (`addr`) + `offset`.
+    /// The physical address of a non-elided `width`-byte access at `addr` + `offset`.
     fn confine(
         &mut self,
         b: &mut FunctionBuilder,
         lower: &Lower,
-        idx: u32,
         addr: Value,
         offset: u64,
         width: u32,
@@ -11398,9 +11485,8 @@ impl CheckedBases {
         if span > reach {
             return mask_addr(b, lower, addr, offset, false, width);
         }
-        let (root, c) = self.root_of(idx, 0);
-        let here = b.current_block().expect("lowering inside a block");
-        if let Some(p) = self.points.iter().find(|p| p.root == root && p.at == here) {
+        let (root, c) = self.root_of(addr, 0);
+        if let Some(p) = self.points.iter().find(|p| p.root == root) {
             let d = c - p.c;
             if d >= 0 && d + span <= reach {
                 let base = p.base;
@@ -11415,12 +11501,7 @@ impl CheckedBases {
         let confined = b.ins().select_spectre_guard(oob, guard, addr);
         let mem_base = b.use_var(lower.mem_var);
         let base = b.ins().iadd(mem_base, confined);
-        let point = CheckPoint {
-            root,
-            c,
-            base,
-            at: here,
-        };
+        let point = CheckPoint { root, c, base };
         match self.points.iter_mut().find(|p| p.root == root) {
             Some(p) => *p = point,
             None => self.points.push(point),
@@ -11733,7 +11814,7 @@ fn copy_inline(
         Ok(if in_window(ub_at(ubs, idx), 0, n, size) {
             mask_addr(b, lower, a, 0, true, n)
         } else {
-            checked.confine(b, lower, idx, a, 0, n)
+            checked.confine(b, lower, a, 0, n)
         })
     };
     let s = confine(b, src)?;

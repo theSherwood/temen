@@ -4,12 +4,12 @@
 //   node browser/bench_link_lib.mjs <temen_browser.wasm> <lib.temen|.temt> <prog unit> [entry] [N]
 import { readFileSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
-import { engineImports } from './engine-imports.mjs';
+import { instantiateEngine } from './engine-imports.mjs';
 
 const [wasmPath, libPath, progPath, entryName = '__jacl_entry', nArg = '30'] = process.argv.slice(2);
 const N = Number(nArg);
-const { instance } = await WebAssembly.instantiate(readFileSync(wasmPath), engineImports());
-const ex = instance.exports, u8 = () => new Uint8Array(ex.memory.buffer), enc = new TextEncoder();
+const ex = await instantiateEngine(readFileSync(wasmPath));
+const u8 = () => new Uint8Array(ex.memory.buffer), enc = new TextEncoder();
 const load = (b) => { const p = Number(ex.temen_alloc(b.length)); u8().set(b, p); return p; };
 const lib = new Uint8Array(readFileSync(libPath)), prog = new Uint8Array(readFileSync(progPath)), entry = enc.encode(entryName);
 const libP = load(lib), progP = load(prog), entryP = load(entry);
