@@ -1496,6 +1496,11 @@ fn x2_run(call: &mut bytecode::EmittedCall<'_>) -> Result<(), Trap> {
     let mem = call.memory.map_or(-1, |id| id as i32);
     let unit = match call.target {
         bytecode::EmittedTarget::Region { module, func } => Err((module, func)),
+        // A Worker runs a unit over the engine's memory: executor 2's root, whose units these are,
+        // has its window there (#1414 5d).
+        bytecode::EmittedTarget::Unit { .. } if call.memory.is_some() => {
+            return Err(Trap::Malformed)
+        }
         bytecode::EmittedTarget::Unit {
             code,
             wasm,
@@ -1765,32 +1770,71 @@ const X2_PLATFORM: bytecode::ThreadPlatform = bytecode::ThreadPlatform {
     root_on_opener: true,
 };
 
-/// A browser run's root powerbox: empty, and on the threads build its detached children's windows
-/// each in a `WebAssembly.Memory` of its own ([`child_window`], #1414 5d), which their children
-/// inherit. Every run here starts from one, so none can leave its children's windows in the
-/// engine's memory by omission.
+/// A browser run's `mem` grant when its embedder sets none (#1414 D5): 512 MiB. A window's memory is
+/// made to hold it ([`root_window`], [`child_window`]), and V8 reserves a shared memory's maximum as
+/// address space, which a page has a few GiB of.
+pub const DEFAULT_MEM_GRANT: u64 = 512 << 20;
+static MEM_GRANT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_MEM_GRANT);
+
+/// Set the `mem` grant of the runs opened after this (#1414 D5): `bytes`, or with 0 the default
+/// ([`DEFAULT_MEM_GRANT`]). It bounds what a run's guest maps, its windows and its children's
+/// included, and each window's memory is made to hold it.
+#[no_mangle]
+pub extern "C" fn temen_set_mem_grant(bytes: u64) {
+    let bytes = if bytes == 0 { DEFAULT_MEM_GRANT } else { bytes };
+    MEM_GRANT.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The `mem` grant of a run opened now ([`temen_set_mem_grant`]).
+fn mem_grant() -> u64 {
+    MEM_GRANT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A browser run's root powerbox: empty but for its `mem` grant ([`temen_set_mem_grant`]), and on
+/// the threads build its detached children's windows each in a `WebAssembly.Memory` of its own
+/// ([`child_window`], #1414 5d), which their children inherit. Every run here starts from one, so
+/// none can leave its children's windows in the engine's memory, or run past its grant, by
+/// omission.
 pub(crate) fn run_host() -> Host {
-    #[allow(unused_mut)] // the plain build sets nothing
     let mut host = Host::new();
+    host.set_mem_grant(i64::try_from(mem_grant()).unwrap_or(-1));
     #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
     host.set_child_window(child_window);
     host
 }
 
 /// A detached child's window in a browser, on either executor (#1414 B6-3c, 5d): a
-/// `WebAssembly.Memory` of its own (a header page, then the window, growable to the detached
-/// ceiling), minted in the spawner's agent. On the parallel driver it is handed to each Worker that
-/// runs one of the child's threads ([`x2_spawn`]'s `mem`). `None` when the agent cannot make one: a
-/// page holds so many memories, and an agent that adopted no engine instance makes none.
+/// `WebAssembly.Memory` of its own ([`WindowHeader`], then the window, growable to the run's grant),
+/// minted in the spawner's agent. On the parallel driver it is handed to each Worker that runs one
+/// of the child's threads ([`x2_spawn`]'s `mem`). `None` when the agent cannot make one: a page
+/// holds so many memories, and an agent that adopted no engine instance makes none.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 fn child_window(size_log2: u8) -> Option<std::sync::Arc<temen_interp::Region>> {
     let size = 1u64 << size_log2;
-    let window = foreign_mem::mint(
-        DETACHED_HEADER_BYTES + size,
-        DETACHED_HEADER_BYTES + DETACHED_DEFAULT_MAX_BYTES,
-        size,
-    )?;
-    Some(std::sync::Arc::new(window))
+    let maximum = mem_grant().max(size);
+    let header = WindowHeader::new(maximum, false);
+    foreign_mem::mint(&header, size, maximum).map(std::sync::Arc::new)
+}
+
+/// A pump root's window (#1414 5d), `initial` bytes to start with: on the threads build a
+/// `WebAssembly.Memory` of its own ([`WindowHeader`], with a spill stack for a collecting guest's
+/// emitted frames, then the window, growable to the run's grant), so the run's growth never grows
+/// the engine's memory, and its memory goes back once the run ends. `None` when the agent cannot
+/// make one, or the window cannot fit one: the open fails cleanly. The plain build has no memories
+/// of its own, so its root's window grows in the engine's memory, as everywhere natively.
+pub(crate) fn root_window(initial: u64) -> Option<std::sync::Arc<temen_interp::Region>> {
+    #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+    {
+        let maximum = mem_grant().max(initial);
+        let header = WindowHeader::new(maximum, true);
+        foreign_mem::mint(&header, initial, maximum).map(std::sync::Arc::new)
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
+    {
+        temen_interp::Region::growable(initial, temen_interp::host_page_size())
+            .map(std::sync::Arc::new)
+    }
 }
 
 /// Run the parallel-driver thread the page started this Worker for: `start` is what `x2_spawn`
@@ -3582,14 +3626,13 @@ fn coop_open_fs(c: &'static ProgramCache, image: &[u8], argv: &[&[u8]], shared: 
             return -status;
         }
     };
-    // A growable window, as `temen_coop_open`'s (#1312): a `vm_map` grows it past its first size.
+    // A growable window, as `temen_coop_open`'s (#1312): a `vm_map` grows it past its first size, in
+    // a memory of its own where the agent can make one ([`root_window`]).
     let declared = m.memory.map_or(0, |mc| mc.size_log2);
-    let first = 1u64 << JIT_RUN_WIN_LOG2.max(declared);
-    let Some(region) = temen_interp::Region::growable(first, temen_interp::host_page_size()) else {
+    let Some(back) = root_window(1u64 << JIT_RUN_WIN_LOG2.max(declared)) else {
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     };
-    let back = std::sync::Arc::new(region);
     let leaves = Programs::default();
     let tierup = bytecode::TierUpConfig {
         root: bytecode::ProgramEmit::default(),
@@ -4698,10 +4741,7 @@ fn reactor_instance(
 ) -> Option<(bytecode::Reactor, std::sync::Arc<temen_interp::Region>)> {
     let declared = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let page = temen_interp::host_page_size();
-    let back = std::sync::Arc::new(temen_interp::Region::growable(
-        declared.max(len).max(page),
-        page,
-    )?);
+    let back = root_window(declared.max(len).max(page))?;
     Some((bytecode::Reactor::open_over(m, back.clone())?, back))
 }
 
@@ -5258,10 +5298,10 @@ struct WarmSession {
     /// The powerbox data-stack base (`powerbox_entry_sp`), passed as each entry's `sp` arg.
     entry_sp: u64,
     eval_fn: temen_ir::FuncIdx,
-    /// The session's window: a **growable** owned region (#1312) opening at `1 << WARM_MAPPED_LOG2`.
-    /// An eval whose guest `vm_map`s past that (a compiler-guest whose heap outgrows 64 MiB) extends
-    /// it instead of `-EINVAL`ing, and extending it *reallocates*, so the base moves — read it through
-    /// [`WarmSession::win_ptr`] / [`WarmSession::win`] at every use, never cached.
+    /// The session's window: a **growable** region (#1312) opening at `1 << WARM_MAPPED_LOG2`, in a
+    /// memory of its own where the agent can make one ([`root_window`], #1414 5d). An eval whose
+    /// guest `vm_map`s past that (a compiler-guest whose heap outgrows 64 MiB) extends it instead of
+    /// `-EINVAL`ing. The session reads and writes it through the region alone, wherever it lives.
     back: std::sync::Arc<temen_interp::Region>,
     /// The program-independent warm image — the live prefix `[0, brk)` captured after `warmup`,
     /// together with the warmup's explicit page-state entries (#816): the on-ramp's `protect`ed rodata
@@ -5297,14 +5337,12 @@ impl WarmSession {
     /// the second position INVARIANTS #15 is about — and the kind that bites quietly, since a fourth
     /// entry point would have been written by copying a third.
     fn restore_warm_window(&self) {
+        // Every caller is between runs, so nothing else touches the window.
         let image = self.warm.bytes();
-        // SAFETY: `win_ptr` owns `win >= dirty_end` bytes; no engine run is in flight (every caller
-        // is between runs, which is what makes the whole-window overwrite sound).
-        unsafe {
-            let w = core::slice::from_raw_parts_mut(self.win_ptr(), self.win() as usize);
-            w[..image.len()].copy_from_slice(image);
-            w[image.len()..self.dirty_end].fill(0);
-        }
+        self.back.write_from(0, image);
+        let end = self.dirty_end.max(image.len());
+        self.back
+            .zero(image.len() as u64, (end - image.len()) as u64);
     }
 
     /// Raise [`dirty_end`](Self::dirty_end) over what the eval that just ended may have written:
@@ -5312,25 +5350,11 @@ impl WarmSession {
     /// ([`committed_end`](fn@committed_end)). One body for both warm tiers (#1734).
     fn note_eval(&mut self, committed_end: u64) {
         let win = self.win() as usize;
-        // SAFETY: `win_ptr` owns `win` bytes; the eval has ended, so no run is in flight.
-        let brk = unsafe {
-            warm_read_brk(
-                core::slice::from_raw_parts(self.win_ptr(), win),
-                self.scratch,
-            )
-        };
+        let brk = warm_read_brk(&self.back, self.scratch);
         self.dirty_end = self
             .dirty_end
             .max(brk.min(win))
             .max(committed_end.min(win as u64) as usize);
-    }
-
-    /// The window's base address **right now**. A `vm_map` grow inside an eval reallocates the
-    /// backing, so this can differ from one call to the next (#1312) — never cache it across a run.
-    fn win_ptr(&self) -> *mut u8 {
-        self.back
-            .raw_base()
-            .expect("a warm session's window is always flat-addressable")
     }
 
     /// The window's byte length right now — `1 << WARM_MAPPED_LOG2` at open, plus whatever an eval's
@@ -5363,10 +5387,9 @@ struct WarmCoop {
 static mut WARM_SESSION: Option<WarmSession> = None;
 
 /// Read the on-ramp guest heap bump pointer (`POWERBOX_HEAP_BRK`, shifted one guard up on the #964
-/// marked layout — pass the module's `scratch` base) from a window image.
-fn warm_read_brk(win: &[u8], scratch: u64) -> usize {
-    let o = (scratch + temen_ir::POWERBOX_HEAP_BRK) as usize;
-    i64::from_le_bytes(win[o..o + 8].try_into().unwrap()) as usize
+/// marked layout — pass the module's `scratch` base) from a window.
+fn warm_read_brk(win: &temen_interp::Region, scratch: u64) -> usize {
+    win.read_word(scratch + temen_ir::POWERBOX_HEAP_BRK, 8) as usize
 }
 
 /// #1734 — the end of the highest page a run left committed (`Rw`, kind 1) in `entries`, a
@@ -5424,30 +5447,17 @@ pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
         return -1;
     };
     // #1312: a **growable** window — an eval whose guest `vm_map`s past `1 << WARM_MAPPED_LOG2`
-    // extends it rather than being refused. The session owns it through the `Arc<Region>` alone
-    // (no separate raw pointer + layout to keep in step), and it frees itself on close.
-    let Some(region) = temen_interp::Region::growable(win, temen_interp::host_page_size()) else {
+    // extends it rather than being refused. The session owns it through the `Arc<Region>` alone,
+    // and it goes back on close: a memory of its own where the agent can make one ([`root_window`]).
+    let Some(back) = root_window(win) else {
         set(STATUS_TRAP);
         return -1;
     };
-    let back = std::sync::Arc::new(region);
-    let win_ptr = back
-        .raw_base()
-        .expect("a growable region is flat-addressable");
     // Seed the on-ramp heap bump words (`_start` normally does this): brk = top = heap_base.
-    // #964: a marked module's heap words sit one guard up.
+    // #964: a marked module's heap words sit one guard up. No engine run is in flight.
     let scratch = temen_ir::module_null_guard();
-    // SAFETY: `win_ptr` owns `win` zeroed bytes; no engine run is in flight (sole access here).
-    unsafe {
-        let w = core::slice::from_raw_parts_mut(win_ptr, win as usize);
-        let hb = (heap_base as i64).to_le_bytes();
-        let (b, t) = (
-            (scratch + temen_ir::POWERBOX_HEAP_BRK) as usize,
-            (scratch + temen_ir::POWERBOX_HEAP_TOP) as usize,
-        );
-        w[b..b + 8].copy_from_slice(&hb);
-        w[t..t + 8].copy_from_slice(&hb);
-    }
+    back.write_word(scratch + temen_ir::POWERBOX_HEAP_BRK, 8, heap_base);
+    back.write_word(scratch + temen_ir::POWERBOX_HEAP_TOP, 8, heap_base);
     let mut host = run_host();
     if let Err(status) = grant_onramp_caps(&mut host, &m, None, None, &take_staged()) {
         set(status);
@@ -5476,16 +5486,11 @@ pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
             return -1;
         }
     };
-    // Capture the live prefix `[0, brk)` — everything above brk is still the zero `warmup` left.
-    // SAFETY: the region owns `win` bytes; read the post-warmup image, no run in flight. The base is
-    // re-read because the rule for this window is never to cache it (the warmup itself is clamped to
-    // `WARM_MAPPED_LOG2`, so it cannot have grown, but the rule is uniform).
-    let win_ptr = back.raw_base().expect("flat-addressable");
-    let (image, live) = unsafe {
-        let w = core::slice::from_raw_parts(win_ptr, win as usize);
-        let live = warm_read_brk(w, scratch).min(win as usize);
-        (w[..live].to_vec(), live)
-    };
+    // Capture the live prefix `[0, brk)` — everything above brk is still the zero `warmup` left. No
+    // run is in flight.
+    let live = warm_read_brk(&back, scratch).min(win as usize);
+    let mut image = vec![0; live];
+    back.read_into(0, &mut image);
     // Bytes + page map as the one form. `from_parts` rejects a §13 `Backed` entry, which is the same
     // fail-closed rule the `pages` match above applies — an alias cannot be reproduced from an image.
     //
@@ -8865,6 +8870,14 @@ pub extern "C" fn temen_wasmjit_env_bytes() -> usize {
     temen_wasm_jit::ENV_CELL_BYTES
 }
 
+/// #1414 5d: bytes of the env cell's call scratch, from the `argsPtr` an emitted `env.call_interp`
+/// passes: the slots a bounce reads its arguments from and writes its results to. A host whose env
+/// cell is in a window's own memory copies them through the engine's memory around the bounce.
+#[no_mangle]
+pub extern "C" fn temen_wasmjit_call_scratch_bytes() -> usize {
+    temen_wasm_jit::XCALL_MAX_SLOTS * 8
+}
+
 /// #2126: byte offset of the env cell's fault address (`i64`), which an emitted `MemoryFault` guard
 /// writes before it traps ([`temen_coop_deliver_fault_addr`]).
 #[no_mangle]
@@ -10126,8 +10139,8 @@ pub const COOP_RUN_IDLE: i32 = 7;
 /// `Mem`; both drop together at [`temen_coop_close`].
 struct CoopTierupRun {
     run: bytecode::CoopRun,
-    /// The run window's backing — in this module's linear memory, so emitted leaves address it
-    /// through the one shared `env.memory`. For a [`temen_coop_open`] run this is a
+    /// The run window's backing ([`root_window`]): a memory of its own on the threads build (#1414
+    /// 5d), else in this module's linear memory. For a [`temen_coop_open`] run this is a
     /// **growable** region (#1312) the guest's `vm_map` can extend past the declared window, the way
     /// the interpreter oracle's own reservation does; for a **warm-coop** run (#816 item 4,
     /// [`temen_warm_coop_prepare`]) it is the warm session's window, whose close tears this run down
@@ -10136,7 +10149,8 @@ struct CoopTierupRun {
     /// **Read the base and length per use, never cache them**: growing a `Region::Growable`
     /// reallocates, so the base moves. That is what [`temen_coop_win_ptr`] /
     /// [`temen_coop_tierup_win_ptr`] are for, and why the JS driver re-reads them after every
-    /// cross-tier bounce (publishing the fresh base into the emitted `"win"` global).
+    /// cross-tier bounce (publishing the fresh base into the emitted `"win"` global). A memory of
+    /// its own grows in place.
     ///
     /// `None` for a nimony build ([`nimony::temen_nim_open`]): the run holds its root's window (a
     /// growable buffer when the root runs whole as a leaf, #2608), each process it tiers up runs over
@@ -10151,8 +10165,9 @@ struct CoopTierupRun {
     /// The program the pending TIERUP runs: one of `programs`, or (`0` with no root leaf) this
     /// run's own region emit.
     module: u32,
-    /// #1414 5d — the memory the pending TIERUP's window is in, when it is one of its own (a
-    /// detached child's, [`child_window`]); `None`: the engine's ([`temen_coop_tierup_mem`]).
+    /// #1414 5d — the memory the pending TIERUP's or JIT_INVOKE's window is in, when it is one of its
+    /// own (a root's, [`root_window`], or a detached child's, [`child_window`]); `None`: the
+    /// engine's ([`temen_coop_tierup_mem`]).
     memory: Option<u32>,
     /// #1954: the host-completed cap names declared at open, in order — a parked request names its
     /// cap by index into this list ([`COOP_RUN_CAP_PARK`]).
@@ -10207,6 +10222,10 @@ struct CoopTierupRun {
     /// counters, so the cache key is (env, version), never version alone.
     pagestate_env: i64,
     pagestate_cover: u64,
+    /// #1414 5d — names the table [`Self::pagestate`] holds: it changes with every build, so a host
+    /// that copies the table into a window's own memory copies it only when it changed
+    /// ([`temen_coop_pagestate_stamp`]).
+    pagestate_stamp: u32,
     /// #1627: the spill stack a spilling emit ([`CoopEmit::spill`]) pushes to — [`COOP_SPILL_BYTES`]
     /// of `u64`s, so it is 8-aligned (a `temen_alloc`ation is not); empty for a run that doesn't
     /// spill. Emitted code writes it through the env cell's cursor; Rust only reads the live prefix.
@@ -10404,6 +10423,7 @@ impl CoopTierupRun {
             pagestate_version: u64::MAX,
             pagestate_env: i64::MIN,
             pagestate_cover: 0,
+            pagestate_stamp: 0,
             spill: Vec::new(),
         }
     }
@@ -10445,12 +10465,17 @@ impl CoopTierupRun {
             self.pagestate_cover = cover;
             self.pagestate_version = ver;
             self.pagestate_env = env;
+            self.pagestate_stamp = PAGESTATE_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.mapped = self.pagestate_cover;
     }
 }
 
 static mut COOP_RUN: Option<CoopTierupRun> = None;
+
+/// The page-state tables built so far, across runs: the next one's stamp
+/// ([`CoopTierupRun::pagestate_stamp`]). From 1, so a run's stamp is never one no table has.
+static PAGESTATE_BUILDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 /// Host policy (#1384): override the emitter's per-function size cap
 /// (`temen_wasm_jit::MAX_EST_EMITTED_FN_BYTES`, estimated emitted bytes above which a function stays
@@ -10843,14 +10868,11 @@ pub extern "C" fn temen_coop_open(
     // #1312: a **growable** window. `win_log2` is the *initial* size (and the emit-time mask domain);
     // a guest allocator's `vm_map` grows the backing past it on demand, exactly as it grows the
     // oracle's own reservation, instead of `-EINVAL`ing at a pre-sized ceiling (INVARIANTS.md #14).
-    // Growing relocates, so nothing may cache the base — see `CoopTierupRun::back`.
-    let Some(region) =
-        temen_interp::Region::growable(1u64 << win_log2, temen_interp::host_page_size())
-    else {
+    // #1414 5d: in a memory of its own, where the agent can make one ([`root_window`]).
+    let Some(back) = root_window(1u64 << win_log2) else {
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     };
-    let back = std::sync::Arc::new(region);
     let stdin = if stdin_ptr.is_null() || stdin_len == 0 {
         Vec::new()
     } else {
@@ -11098,7 +11120,9 @@ fn coop_pump(budget: Option<u64>) -> i32 {
             params,
             results,
             mapped,
+            memory,
         } => {
+            s.memory = memory;
             // The unit is emittable + all-scalar (the pump gated surfacing on it), so every type
             // maps to a scalar code; the host marshals the i64 slots by these.
             let codes = |ts: &[temen_ir::ValType]| {
@@ -11309,15 +11333,24 @@ pub extern "C" fn temen_coop_module() -> u32 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.module)
 }
 
-/// #1414 5d — the memory the pending TIERUP's window is in, by the id its agent registered it under
-/// (`web/foreign-mem.js`): a detached child's own ([`child_window`]), where the window starts past
-/// its header ([`temen_detached_header_bytes`]). `-1`: the engine's memory, at
-/// [`temen_coop_tierup_win_ptr`].
+/// #1414 5d — the memory the pending TIERUP's or JIT_INVOKE's window is in, by the id its agent
+/// registered it under (`web/foreign-mem.js`): a root's own ([`root_window`]) or a detached child's
+/// ([`child_window`]), where the window starts past its header ([`WindowHeader`]). `-1`: the
+/// engine's memory, at [`temen_coop_tierup_win_ptr`].
 #[no_mangle]
 pub extern "C" fn temen_coop_tierup_mem() -> i32 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
         .and_then(|s| s.memory)
         .map_or(-1, |id| id as i32)
+}
+
+/// #1414 5d — whether the pending event is the run's root domain's (its root task's, or a thread's
+/// of it), whose emitted code calls through the run's shared dispatch table, rather than a child's,
+/// whose granted module dispatches through a table of its own.
+#[no_mangle]
+pub extern "C" fn temen_coop_tierup_root() -> i32 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .map_or(0, |s| i32::from(s.run.pending_env() < 0))
 }
 
 /// #1896: the emitted wasm of program `module`, a leaf image or a granted module (`null` when the
@@ -11465,6 +11498,14 @@ pub extern "C" fn temen_coop_pagestate_len() -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.pagestate.len())
 }
 
+/// #1414 5d: which page-state table [`temen_coop_pagestate_ptr`] holds. It changes whenever the
+/// table is rebuilt, so a driver that copies the table into a window's own memory copies it again
+/// only then.
+#[no_mangle]
+pub extern "C" fn temen_coop_pagestate_stamp() -> u32 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.pagestate_stamp)
+}
+
 /// #1009: the root's dispatch-table generation, which moves with every §22 install and uninstall
 /// into it. The driver rebuilds its `WebAssembly.Table` only when this moves.
 #[no_mangle]
@@ -11497,7 +11538,8 @@ pub extern "C" fn temen_coop_wasm_len() -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.emitted_wasm.len())
 }
 
-/// The run window's base address in this module's linear memory (the emitted `f{i}`s' `win` arg).
+/// The run window's base address in this module's linear memory (the emitted `f{i}`s' `win` arg);
+/// null when the window is in a memory of its own ([`temen_coop_tierup_mem`]).
 ///
 /// #1312: read this **fresh** every time it is needed. A `vm_map` grow reallocates the growable
 /// backing, so the base can differ from one call to the next; a host that cached it would address
@@ -11912,7 +11954,7 @@ mod foreign_mem {
 
     #[link(wasm_import_module = "temen_host")]
     extern "C" {
-        fn foreign_mint(base: u32, initial: u32, maximum: u32) -> i32;
+        fn foreign_mint(desc: *const u8, initial_pages: u32, maximum_pages: u32) -> i32;
         fn foreign_release(id: u32);
     }
 
@@ -11992,20 +12034,28 @@ mod foreign_mem {
         unsafe { foreign_release(id) }
     }
 
-    /// Mint a child memory in this agent (#1286): `initial`/`maximum` bytes **including** the host
-    /// header, registered with the header as the region's base, and the region over its first `len`
-    /// bytes, which owns it (#1414 5d). The memory is fresh, or a spare: one a dropped region gave
-    /// back, zeroed. `None` if the agent refused (the `WebAssembly.Memory` constructor threw —
-    /// address-space / limits — or the agent adopted no engine instance).
-    pub fn mint(initial: u64, maximum: u64, len: u64) -> Option<temen_mem::Region> {
-        let (Ok(i), Ok(m)) = (u32::try_from(initial), u32::try_from(maximum)) else {
-            return None;
-        };
-        // SAFETY: no cdylib memory is touched.
-        let id = u32::try_from(unsafe { foreign_mint(super::DETACHED_HEADER_BYTES as u32, i, m) });
-        let id = id.ok()?;
+    /// Mint a window memory in this agent (#1286, #1414 5d): `header`, then a window of `initial`
+    /// bytes that can grow to `maximum` (with the header, at most what a wasm32 memory holds),
+    /// registered with the header's end as the region's base, and the region over the window, which
+    /// owns the memory. The memory is fresh, or a spare: one a dropped region gave back, zeroed,
+    /// with the same header and maximum. `None` if the agent refused (the `WebAssembly.Memory`
+    /// constructor threw — address-space / limits — or the agent adopted no engine instance), or
+    /// the window cannot fit.
+    pub fn mint(
+        header: &super::WindowHeader,
+        initial: u64,
+        maximum: u64,
+    ) -> Option<temen_mem::Region> {
+        let base = u64::from(header.base);
+        let pages = |bytes: u64| u32::try_from(bytes.div_ceil(super::WASM_PAGE)).ok();
+        let initial_pages = pages(base.checked_add(initial)?)?;
+        let maximum_pages = pages(base.saturating_add(maximum).min(super::WASM32_MAX))?;
+        let desc = header.desc();
+        // SAFETY: `desc` is a live buffer the call only reads.
+        let id = unsafe { foreign_mint(desc.as_ptr(), initial_pages, maximum_pages) };
+        let id = u32::try_from(id).ok()?;
         let ops = ForeignOps { release, ..ops(id) };
-        Some(temen_mem::Region::foreign(id, len, ops))
+        Some(temen_mem::Region::foreign(id, initial, ops))
     }
 
     /// The `read` slot where the agent has no multi-memory: a span out of foreign memory `id`, through
@@ -12053,26 +12103,81 @@ mod foreign_mem {
     }
 }
 
-/// The host header at the bottom of a detached child's memory (#1285): one wasm page holding the
-/// contexts its emitted code runs in ([`DETACHED_CONTEXTS`], from 0) and, for a paged run, its
-/// `pagestate` table (at [`DETACHED_PAGESTATE_OFF`]). The guest window starts here (`win`), so the
-/// header is unreachable by the guest (spans are bounded by `"mapped"` before `win` is added) and
-/// never moves on `memory.grow`.
-pub const DETACHED_HEADER_BYTES: u64 = 65536;
-/// The bytes of a context in a detached child's header: an env cell and its call scratch
-/// (`temen_wasmjit_env_bytes`), which a task running emitted code over the child's memory uses. The
-/// header holds [`DETACHED_CONTEXTS`] of them, from its start, then its page-state table (#1414 ED-2).
-pub const DETACHED_CONTEXT_BYTES: u64 = 4096;
-/// How many tasks of a detached child can run emitted code at once: its root task. Its threads
-/// interpret (#1414 ED-2).
-pub const DETACHED_CONTEXTS: u64 = 1;
-/// Where the paged run's page-state table lives inside the header: after the contexts.
-pub const DETACHED_PAGESTATE_OFF: u64 = DETACHED_CONTEXTS * DETACHED_CONTEXT_BYTES;
-/// The default `maximum` of a minted detached child memory (its guest window, excluding the header):
-/// 1 GiB, the engine's own ceiling. V8
-/// reserves a shared memory's `maximum` as address space, so this bounds per-child reservation; the
-/// #1286 V8-limits probe decides whether it should derive from the spawn instead.
-pub const DETACHED_DEFAULT_MAX_BYTES: u64 = 1 << 30;
+/// The header of a window's own memory (#1285, #1414 5d), a root's or a detached child's: what lies
+/// below the window, out of the guest's reach (spans are bounded by `"mapped"` before `win` is
+/// added), sized when the memory is made and fixed after, so the window never moves on
+/// `memory.grow`. The memory starts with this descriptor ([`Self::desc`]), from which any agent
+/// holding the memory reads its layout (`headerOf` in `web/foreign-mem.js`):
+/// - `contexts` contexts, from `context0`, `stride` bytes apart, one per task that can run emitted
+///   code over the window at once. Each holds an env cell and its call scratch
+///   (`temen_wasmjit_env_bytes`), the page-state table a page-checked emit reads (`table_bytes`
+///   at `table_off` from the context's start: one byte per page of the window's maximum), and the
+///   spill stack a spilling emit pushes to (`spill_bytes` at `spill_off`).
+/// - The window, from `base`, a multiple of the wasm page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowHeader {
+    pub base: u32,
+    pub contexts: u32,
+    pub context0: u32,
+    pub stride: u32,
+    pub table_off: u32,
+    pub table_bytes: u32,
+    pub spill_off: u32,
+    pub spill_bytes: u32,
+}
+
+/// The bytes at a window memory's start that hold its [`WindowHeader`]'s descriptor.
+pub const HEADER_DESC_BYTES: u64 = 64;
+/// The bytes of a context's env cell and its call scratch, the table after them.
+const CONTEXT_ENV_BYTES: u64 = 4096;
+const _: () = assert!(temen_wasm_jit::ENV_CELL_BYTES as u64 <= CONTEXT_ENV_BYTES);
+const WASM_PAGE: u64 = 65536;
+/// What a wasm32 memory can hold.
+const WASM32_MAX: u64 = 1 << 32;
+
+impl WindowHeader {
+    /// The header of a window that grows to at most `maximum` bytes, with one context (the window's
+    /// root task's: its other tasks interpret, #1414 ED-2), and a spill stack in it when `spill`.
+    pub fn new(maximum: u64, spill: bool) -> WindowHeader {
+        let page = temen_interp::host_page_size();
+        let table = maximum.min(WASM32_MAX).div_ceil(page).next_multiple_of(8);
+        let spill = if spill { COOP_SPILL_BYTES as u64 } else { 0 };
+        let (contexts, context0) = (1, HEADER_DESC_BYTES);
+        let stride = CONTEXT_ENV_BYTES + table + spill;
+        let base = (context0 + contexts * stride).next_multiple_of(WASM_PAGE);
+        // A table covers at most 4 GiB, so no field passes a few MiB.
+        let w = |v: u64| v as u32;
+        WindowHeader {
+            base: w(base),
+            contexts: w(contexts),
+            context0: w(context0),
+            stride: w(stride),
+            table_off: w(CONTEXT_ENV_BYTES),
+            table_bytes: w(table),
+            spill_off: w(CONTEXT_ENV_BYTES + table),
+            spill_bytes: w(spill),
+        }
+    }
+
+    /// The descriptor the memory starts with: the fields as little-endian `u32`s, in order.
+    pub fn desc(&self) -> [u8; HEADER_DESC_BYTES as usize] {
+        let mut d = [0; HEADER_DESC_BYTES as usize];
+        let fields = [
+            self.base,
+            self.contexts,
+            self.context0,
+            self.stride,
+            self.table_off,
+            self.table_bytes,
+            self.spill_off,
+            self.spill_bytes,
+        ];
+        for (at, v) in d.chunks_exact_mut(4).zip(fields) {
+            at.copy_from_slice(&v.to_le_bytes());
+        }
+        d
+    }
+}
 
 /// A `Region::Foreign` over the page-registered memory `id` with `len` addressable bytes, which leaves
 /// the memory registered when it drops ([`foreign_mem::ops`]).
@@ -12166,18 +12271,6 @@ pub extern "C" fn temen_foreign_bench(id: u32, size: u32, kind: u32, iters: u32)
     // SAFETY: same layout; `shared` dropped above.
     unsafe { std::alloc::dealloc(base, layout) };
     sum
-}
-
-/// The detached child's header size (the `win` the JS driver passes and the page it must keep clear).
-#[no_mangle]
-pub extern "C" fn temen_detached_header_bytes() -> usize {
-    DETACHED_HEADER_BYTES as usize
-}
-
-/// The header offset of a paged detached run's `pagestate` table.
-#[no_mangle]
-pub extern "C" fn temen_detached_pagestate_off() -> usize {
-    DETACHED_PAGESTATE_OFF as usize
 }
 
 #[cfg(test)]

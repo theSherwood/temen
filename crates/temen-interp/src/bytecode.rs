@@ -8556,8 +8556,8 @@ fn spawn_task(
 /// #1954 — the **root program** as a leaf: the rule an exec'd image meets ([`exec_image_build`]),
 /// applied to the run's own image at its entry. Offered when it cannot park, or parks only where its
 /// host suspends the emitted frames ([`image_parks`]), and the host's emitter takes it; a durable run
-/// (whose freeze could not meet emitted frames) and a window emitted code cannot address flat run
-/// interpreted, as before. Both executors ask it whenever their caller holds the image: the pump's
+/// (whose freeze could not meet emitted frames) and a window emitted code cannot address as one span
+/// ([`Mem::one_span`]) run interpreted, as before. Both executors ask it whenever their caller holds the image: the pump's
 /// [`CoopRun::start`] for a run over a module, a [`SharedProgram`] warm restore given its module
 /// (#1414 S4-3c) and a [`Reactor`] call given its module (#1414 S4-4), and executor 2's
 /// [`CoopRun::new_parallel`] (#1414 5c).
@@ -8569,7 +8569,7 @@ fn root_leaf(
     host: &Host,
     mem: Option<&Mem>,
 ) -> Option<LeafStart> {
-    if host.is_durable() || mem.is_some_and(|w| w.flat_win_base().is_none()) {
+    if host.is_durable() || mem.is_some_and(|w| !w.one_span()) {
         return None;
     }
     let program = dom.source.primary();
@@ -12218,6 +12218,8 @@ enum CoopStep {
     /// `wasm` its emitted module, `argv` the raw i64 arg slots, `params`/`results` the unit entry's
     /// scalar signature, `mapped` the committed extent. A unit without emitted wasm (or a non-scalar
     /// signature / unrepresentable window) is serviced interpreted inside the pump and never surfaces.
+    /// `memory` is the memory of its own the task's window is in, if it is one, as for a
+    /// [`CoopStep::TierUp`].
     JitInvoke {
         code: i32,
         wasm: std::sync::Arc<[u8]>,
@@ -12225,6 +12227,7 @@ enum CoopStep {
         params: Box<[ValType]>,
         results: Box<[ValType]>,
         mapped: u64,
+        memory: Option<u32>,
     },
 }
 
@@ -14517,11 +14520,11 @@ impl SchedCore {
                         // #1301
                     });
                     drop(g);
-                    // #1414 B6-3: emitted code addresses the window as one flat span, so a window
+                    // #1414 B6-3: emitted code addresses the window as one span, so a window
                     // backed without one runs the unit interpreted.
                     let mapped = match mem.as_ref() {
                         None => Some(0),
-                        Some(m) if m.flat_win_base().is_none() => None,
+                        Some(m) if !m.one_span() => None,
                         Some(m) if root_emit.is_some_and(|e| e.page_checked) => {
                             Some(m.reserved_size())
                         }
@@ -14540,6 +14543,7 @@ impl SchedCore {
                         params,
                         results,
                         mapped,
+                        memory: mem.as_ref().and_then(Mem::foreign_id),
                     });
                 }
                 // Interpreted ([`jit_invoke_unit`], [`run_invoke`]) over the TASK's window, table
@@ -14739,8 +14743,9 @@ pub enum CoopEvent {
     /// module a child runs ([`TierUpConfig::modules`]) — or a process whose exec'd image is a leaf
     /// the host emitted ([`TierUpConfig::leaf`]), at its entry. `mapped` is the committed scalar
     /// window extent for the emitted `"mapped"` global. `memory` names the memory of its own the
-    /// task's window is in, a detached child's ([`Host::set_child_window`], `Region::foreign_id`):
-    /// the host runs the emit over that memory, as executor 2's tier does ([`EmittedCall::memory`]).
+    /// task's window is in, a root's or a detached child's (#1414 5d: [`Host::set_child_window`],
+    /// `Region::foreign_id`): the host runs the emit over that memory, as executor 2's tier does
+    /// ([`EmittedCall::memory`]).
     /// `None`: the window is in the engine's memory, at [`CoopRun::pending_win`]. The host runs the
     /// emitted `f{func}` and calls [`CoopRun::deliver_tierup`] / [`CoopRun::deliver_tierup_trap`];
     /// for an entry, the delivery ends the process as a return from its entry, or a trap in it,
@@ -14762,6 +14767,8 @@ pub enum CoopEvent {
     /// runs the unit's `f0(win, env, ...argv)` (marshalling by `params`/`results`, `mapped` into its
     /// `"mapped"` global) and calls [`CoopRun::deliver_jit_invoke_vals`] /
     /// [`CoopRun::deliver_jit_invoke_trap`]. A non-emittable unit runs interpreted and never surfaces.
+    /// `memory` names the memory of its own the window is in, as for a [`CoopEvent::TierUp`]: the
+    /// host runs the unit over it.
     JitInvoke {
         code: i32,
         wasm: std::sync::Arc<[u8]>,
@@ -14769,6 +14776,7 @@ pub enum CoopEvent {
         params: Box<[ValType]>,
         results: Box<[ValType]>,
         mapped: u64,
+        memory: Option<u32>,
     },
 }
 
@@ -15420,6 +15428,7 @@ impl CoopRun {
                 params,
                 results,
                 mapped,
+                memory,
             }) => CoopEvent::JitInvoke {
                 code,
                 wasm,
@@ -15427,6 +15436,7 @@ impl CoopRun {
                 params,
                 results,
                 mapped,
+                memory,
             },
             Err(t) => CoopEvent::Trapped(t),
         }
@@ -17064,6 +17074,7 @@ impl ThreadRun {
                 params,
                 results,
                 mapped,
+                ..
             }) => {
                 let (_, dst, _) = emit
                     .pending_jit
@@ -18359,7 +18370,7 @@ impl Vm {
     fn tierup_extent(&self, mem: Option<&Mem>) -> Option<u64> {
         match mem {
             None => Some(0),
-            Some(m) if m.flat_win_base().is_none() && m.foreign_id().is_none() => None,
+            Some(m) if !m.one_span() => None,
             Some(m) if self.jit_page_checked => (!m.has_aliased()).then(|| m.reserved_size()),
             Some(m) => m.scalar_extent(),
         }
