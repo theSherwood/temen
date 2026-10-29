@@ -2200,8 +2200,8 @@ impl Inspector {
                     frame_value(frame, &types, resolve(locs)? as usize).map(VarValue::Value)
                 }
                 VarLoc::Window { off } => {
-                    // Address = data-SP (block param v0) + off.
-                    window_read(frame.vals.first()?.i64() as u64, *off)
+                    // Address = data-SP + off.
+                    window_read(frame.sp()?.i64() as u64, *off)
                 }
                 VarLoc::WindowVia { base, off } => {
                     // Address = (the per-pc base SSA value, e.g. a wasm frame pointer) + off.
@@ -2231,7 +2231,7 @@ impl Inspector {
             }
             let var = pick_var(di, frame.func, name, frame.block, frame.inst)?;
             let base = match &var.loc {
-                VarLoc::Window { off } => frame.vals.first()?.i64() as u64 + *off as u64,
+                VarLoc::Window { off } => frame.sp()?.i64() as u64 + *off as u64,
                 VarLoc::WindowVia { base, off } => {
                     let idx = loclist_value(base, frame.block, frame.inst)?;
                     frame.vals.get(idx as usize)?.i64() as u64 + *off as u64
@@ -4877,6 +4877,20 @@ pub(crate) struct Frame {
     vals: Vals,
 }
 
+impl Frame {
+    /// The function's first param: value 0 of its entry block, which every other block has as an
+    /// ancestor, so the frame holds it wherever it is. A §3d frontend passes the data-SP there and
+    /// never moves it within the function, so this is the frame's data-SP — whether or not the
+    /// current block takes it as its own param 0 (a raised block captures it, #2454).
+    fn sp(&self) -> Option<Reg> {
+        match self.block {
+            0 => self.vals.cur.first(),
+            _ => self.vals.above.first(),
+        }
+        .copied()
+    }
+}
+
 /// A frame's values: its current block's, and the values of that block's proper ancestors in its
 /// function's dominance certificate (#2454), each as the frame last left that ancestor. Reads, pushes
 /// and pops see the current block's only, by its block-local indices; [`Vals::enter`] keeps the
@@ -5025,7 +5039,7 @@ impl FromIterator<Reg> for Vals {
 /// not be reconstructed from the live (later-block) frame, so it is snapshotted here. `longjmp` truncates
 /// the call stack to `depth` (the intervening frames discarded — C has no cleanups), overwrites the
 /// surviving `setjmp` frame with `(block, inst, vals)`, sets `vals[result_idx]` to the long-jump value,
-/// and resumes. The data-stack pointer rides in `vals[0]` (the §3d SP block-param), so restoring `vals`
+/// and resumes. The data-stack pointer is among those values ([`Frame::sp`]), so restoring `vals`
 /// restores it.
 #[derive(Clone)]
 struct SetJmpPoint {
@@ -13414,7 +13428,7 @@ impl VCpu {
     ) -> Result<(), Trap> {
         // The entry funcref (== func index) + data-stack base, to re-enter the fiber on thaw.
         let func = frames.first().map(|f| f.func as i32).unwrap_or(0);
-        let sp = match frames.first().and_then(|f| f.vals.first()) {
+        let sp = match frames.first().and_then(Frame::sp) {
             Some(r) => r.i64(),
             _ => 0,
         };
@@ -18087,7 +18101,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let (func, sp) = match popped.as_ref() {
                             Some(f) => (
                                 f.func as i32,
-                                match f.vals.first() {
+                                match f.sp() {
                                     Some(r) => r.i64(),
                                     _ => 0,
                                 },

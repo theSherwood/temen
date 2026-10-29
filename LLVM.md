@@ -2201,7 +2201,7 @@ Picking a target is really picking the *gap* it drives to completion. Current st
   pay nothing). **Tree-walker**: `setjmp` snapshots the frame's resume point (block/inst/value-state —
   the value state is captured because `Frame::vals` is *replaced per block*) keyed by the `jmp_buf`
   address in a per-vCPU table; `longjmp` truncates the call stack back to it (intervening frames
-  discarded, no cleanup — C has none), restores the frame + data-SP (which rides in `vals[0]`), and
+  discarded, no cleanup — C has none), restores the frame + data-SP (one of its values), and
   re-enters with the result set to the long-jump value. **Engine matrix** (kept in sync — never
   divergent): **both interpreters run it** — the tree-walker (snapshots the frame's value state, since
   `vals` is replaced per block) and the **bytecode** engine (no snapshot: its flat per-function register
@@ -2210,8 +2210,11 @@ Picking a target is really picking the *gap* it drives to completion. Current st
   runs it too (**Option B, DONE** — see "JIT `longjmp`" below): libc `_setjmp`/`_longjmp` called **inline
   from JITted code** with the `jmp_buf` in a host-side per-run table keyed by the guest buffer address
   (no host SP/return-addr leaks into the window); the in-frame `_setjmp` dodges the "helper-frame-is-gone"
-  problem, and clang's `-O2` returns-twice spills + Cranelift's caller-saved spills defuse the optimizer
-  hazard. Gated to the `setjmp_rt` targets (unix among `fiber_rt`); a module mixing `setjmp` with
+  problem. Cranelift sees no edge from `_longjmp` back to the `setjmp`, so a spill slot live across the
+  call can be reused on the longjmp path: every value the code reads after it, the guest's and the
+  lowering's own context values (window base, function table, vmctx, stack limit, return area, a paged
+  child's access table) alike, is saved to an explicit stack slot no spill reuses and reloaded from it
+  (#2537, #2652). Gated to the `setjmp_rt` targets (unix among `fiber_rt`); a module mixing `setjmp` with
   fibers/threads is fail-closed-declined (the interpreters' per-vCPU keying covers it — a documented
   per-fiber-JIT-keying follow-on). Tests: `setjmp_longjmp_round_trip`, `setjmp_longjmp_loop_and_deep_nesting`,
   plus returns-twice stress (`setjmp_value_live_across`, `setjmp_nested_buffers`) — **all three engines ==

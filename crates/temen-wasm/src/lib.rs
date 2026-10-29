@@ -777,7 +777,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         None
     };
 
-    Ok(Transpiled {
+    let mut t = Transpiled {
         module: Module {
             data_ptrs: Vec::new(),
             data_funcrefs: Vec::new(),
@@ -810,7 +810,11 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
             debug_info: build_debug_info(debug_line.as_deref(), op_locs, local_locs, debug_blobs),
         },
         exports,
-    })
+    };
+    // Dominance form (#2454): a wasm local is threaded through every block as a param, and a block
+    // that only passes one on captures it instead.
+    t.module.raise();
+    Ok(t)
 }
 
 /// Build the §6 debug-info waist from a wasm guest's embedded DWARF: map `.debug_line` rows onto IR
