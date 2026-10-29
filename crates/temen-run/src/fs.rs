@@ -1850,8 +1850,14 @@ mod tests {
             .arg(path)
             .output()
             .unwrap();
-        // The listing names the file on its first line, which this leaves out.
-        let acl = String::from_utf8_lossy(&out.stdout).replace(&*path.to_string_lossy(), "");
+        // The entries, without the file's name, which opens the listing and sets its indent.
+        let acl = String::from_utf8_lossy(&out.stdout)
+            .replace(&*path.to_string_lossy(), "")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("Successfully processed"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let attributes = std::fs::metadata(path).unwrap().file_attributes();
         let stream = std::fs::read(format!("{}:temen.kept", path.display())).ok();
         (acl, attributes & 0x2, stream) // FILE_ATTRIBUTE_HIDDEN
@@ -1925,16 +1931,13 @@ mod tests {
         #[cfg(windows)]
         {
             // An entry of its own, read and execute for everyone, beside those it inherits.
-            let run = |cmd: &str, args: &[&str]| {
-                let out = std::process::Command::new(cmd)
-                    .args(args)
-                    .arg(&f)
-                    .output()
-                    .unwrap();
-                assert!(out.status.success(), "{cmd}: {out:?}");
+            let run = |cmd: &mut std::process::Command| {
+                let out = cmd.output().unwrap();
+                assert!(out.status.success(), "{cmd:?}: {out:?}");
             };
-            run("icacls", &["/grant", "*S-1-1-0:(RX)"]);
-            run("attrib", &["+h"]);
+            let mut icacls = std::process::Command::new("icacls");
+            run(icacls.arg(&f).args(["/grant", "*S-1-1-0:(RX)"]));
+            run(std::process::Command::new("attrib").arg("+h").arg(&f));
             std::fs::write(format!("{}:temen.kept", f.display()), "kept").unwrap();
         }
         let before = protection(&f);

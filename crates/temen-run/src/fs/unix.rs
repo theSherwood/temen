@@ -40,9 +40,16 @@ pub(super) fn target(dir: &Dir, name: &str) -> io::Result<Option<File>> {
     // Writing it in place would fail, so replacing it does too: its mode, an ACL, a read-only
     // mount. The kernel decides, for the process's effective ids, as it would for the write.
     // SAFETY: `name` is NUL-terminated and lives for the call.
-    cvt(unsafe { libc::faccessat(at, name.as_ptr(), libc::W_OK, libc::AT_EACCESS) })?;
+    cvt(unsafe { libc::faccessat(at, name.as_ptr(), libc::W_OK, EFFECTIVE_IDS) })?;
     Ok(Some(file))
 }
+
+/// `faccessat`'s flag to check as the effective ids, as a write would. Android's libc refuses
+/// `AT_EACCESS`: Android runs no set-user-ID programs, so its real ids are the effective ones.
+#[cfg(not(target_os = "android"))]
+const EFFECTIVE_IDS: libc::c_int = libc::AT_EACCESS;
+#[cfg(target_os = "android")]
+const EFFECTIVE_IDS: libc::c_int = 0;
 
 /// `replace`'s temporary file, in the target's directory.
 pub(super) struct Temp<'a> {
