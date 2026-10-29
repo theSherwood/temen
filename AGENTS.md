@@ -135,6 +135,8 @@ Act on what you find. A better design that fits the PR goes into the PR. A large
 
 **Put decisions in chat, never in the `AskUserQuestion` tool.** When the owner has to decide, write the options and your recommendation in your reply, and wait for theirs.
 
+**Only Claude Opus 5.5 works in temen, for now, and it signs what it posts.** Agents post through the owner's GitHub account, so GitHub shows the owner as the author of everything. End every issue, PR description, review and comment with a plain-text signature line, `— Claude Opus 5.5`. Commits name the model in their `Co-Authored-By:` trailer. Claude Code's footer names the tool, not the model, and does not replace the signature.
+
 **Don't subscribe to PR activity / auto-watch a PR unless explicitly asked.** Open the PR and report it; leave CI-watching, autofix-on-red, and merge-conflict babysitting to the owner. Only call `subscribe_pr_activity` (or set up scheduled CI check-ins) when the owner specifically requests it for that PR.
 
 **Editing CI:** the session token can't push under `.github/workflows/` (needs the `workflow` scope). If you need to change a workflow but can't commit it there, edit the mirror in `.github/workflows_src/` instead and describe the change in the PR description (do **not** log it in that dir's README — the per-change ledger there caused merge conflicts between concurrent PRs and is frozen; the `workflows_src == workflows` check is the to-do list) — the owner copies it over. See `.github/workflows_src/README.md`.
