@@ -1835,7 +1835,8 @@ mod tests {
     }
 
     /// What the host protects `path` with, as a test compares it: on Unix its mode, owner, group
-    /// and an extended attribute; on Windows its DACL, as `icacls` lists it, and its attributes.
+    /// and an extended attribute; on Windows its DACL, as `icacls` lists it, whether it is hidden,
+    /// and a named stream.
     #[cfg(unix)]
     fn protection(path: &Path) -> (u32, u32, u32, Option<Vec<u8>>) {
         use std::os::unix::fs::MetadataExt;
@@ -1843,7 +1844,7 @@ mod tests {
         (md.mode() & 0o7777, md.uid(), md.gid(), get_xattr(path))
     }
     #[cfg(windows)]
-    fn protection(path: &Path) -> (String, u32) {
+    fn protection(path: &Path) -> (String, u32, Option<Vec<u8>>) {
         use std::os::windows::fs::MetadataExt;
         let out = std::process::Command::new("icacls")
             .arg(path)
@@ -1852,7 +1853,8 @@ mod tests {
         // The listing names the file on its first line, which this leaves out.
         let acl = String::from_utf8_lossy(&out.stdout).replace(&*path.to_string_lossy(), "");
         let attributes = std::fs::metadata(path).unwrap().file_attributes();
-        (acl, attributes & 0x2) // FILE_ATTRIBUTE_HIDDEN
+        let stream = std::fs::read(format!("{}:temen.kept", path.display())).ok();
+        (acl, attributes & 0x2, stream) // FILE_ATTRIBUTE_HIDDEN
     }
 
     /// The extended attribute these tests set: `None` where the filesystem has none.
@@ -1902,8 +1904,8 @@ mod tests {
 
     /// #2510 — `replace` keeps what the host protects the file with. On Unix that is its mode
     /// (set-user-ID bit and all), its owner and group, and its extended attributes, where the
-    /// filesystem has them. On Windows it is its DACL, here with an entry of its own, and its
-    /// attributes, here hidden.
+    /// filesystem has them. On Windows it is its DACL, here with an entry of its own, its
+    /// attributes, here hidden, and its named streams.
     #[test]
     fn replace_keeps_the_hosts_protection() {
         let (base, root, _) = link_fixture("replace_protection");
@@ -1933,6 +1935,7 @@ mod tests {
             };
             run("icacls", &["/grant", "*S-1-1-0:(RX)"]);
             run("attrib", &["+h"]);
+            std::fs::write(format!("{}:temen.kept", f.display()), "kept").unwrap();
         }
         let before = protection(&f);
 
