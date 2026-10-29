@@ -98,7 +98,7 @@ fn two_vcpu_domain_freezes_and_thaws() {
     // Freeze: UNWINDING from the start. Single-worker — the root runs (spawns the child, reads the
     // clock → 42), unwinds at its poll; then the child runs (reads the clock → 43), unwinds into its
     // own region. Capture the window + the child's residue.
-    let (frozen, root_sp, snap, clock_after) = {
+    let (frozen, root_sp, children, snap, clock_after) = {
         let mut h = Host::new();
         h.set_durable(true);
         h.clock_ns = 42;
@@ -119,6 +119,7 @@ fn two_vcpu_domain_freezes_and_thaws() {
         (
             h.frozen_vcpus().to_vec(),
             h.frozen_root_sp().expect("root extent recorded"),
+            h.child_generations().to_vec(),
             snap,
             h.clock_ns,
         )
@@ -145,6 +146,7 @@ fn two_vcpu_domain_freezes_and_thaws() {
         let clk = h.grant_clock();
         h.set_frozen_vcpus(frozen);
         h.set_frozen_root_sp(root_sp);
+        h.set_child_generations(children);
         let mut fuel = 1_000_000u64;
         let (r, _) = run_capture_reserved_with_host(
             &inst,
@@ -247,7 +249,7 @@ fn vcpu_and_fiber_coexist_through_freeze_thaw() {
 
     // Freeze: UNWINDING. The root unwinds at cont.resume with the fiber parked (context 1); the child
     // unwinds into its top-down context. Capture window + both residues.
-    let (frozen_fibers, frozen_vcpus, root_sp, snap, clock_after) = {
+    let (frozen_fibers, frozen_vcpus, root_sp, children, snap, clock_after) = {
         let mut h = Host::new();
         h.set_durable(true);
         h.clock_ns = 42;
@@ -269,6 +271,7 @@ fn vcpu_and_fiber_coexist_through_freeze_thaw() {
             h.frozen_fibers().to_vec(),
             h.frozen_vcpus().to_vec(),
             h.frozen_root_sp().expect("root extent recorded"),
+            h.child_generations().to_vec(),
             snap,
             h.clock_ns,
         )
@@ -293,6 +296,7 @@ fn vcpu_and_fiber_coexist_through_freeze_thaw() {
         h.set_frozen_fibers(frozen_fibers);
         h.set_frozen_vcpus(frozen_vcpus);
         h.set_frozen_root_sp(root_sp);
+        h.set_child_generations(children);
         let mut fuel = 1_000_000u64;
         let (r, _) = run_capture_reserved_with_host(
             &inst,
@@ -387,7 +391,7 @@ fn child_owns_fiber_through_freeze_thaw() {
 
     // Freeze: UNWINDING. The root unwinds (no fiber); the child reads the clock, parks its fiber at
     // cont.resume, and unwinds into its top-down context. Capture window + both residues.
-    let (frozen_fibers, frozen_vcpus, root_sp, snap, clock_after) = {
+    let (frozen_fibers, frozen_vcpus, root_sp, children, snap, clock_after) = {
         let mut h = Host::new();
         h.set_durable(true);
         h.clock_ns = 42;
@@ -409,6 +413,7 @@ fn child_owns_fiber_through_freeze_thaw() {
             h.frozen_fibers().to_vec(),
             h.frozen_vcpus().to_vec(),
             h.frozen_root_sp().expect("root extent recorded"),
+            h.child_generations().to_vec(),
             snap,
             h.clock_ns,
         )
@@ -437,6 +442,7 @@ fn child_owns_fiber_through_freeze_thaw() {
         h.set_frozen_fibers(frozen_fibers);
         h.set_frozen_vcpus(frozen_vcpus);
         h.set_frozen_root_sp(root_sp);
+        h.set_child_generations(children);
         let mut fuel = 1_000_000u64;
         let (r, _) = run_capture_reserved_with_host(
             &inst,
@@ -530,7 +536,7 @@ fn nested_spawn_tree_freezes_and_thaws() {
     // Freeze: UNWINDING. root spawns child + reads clock + unwinds; child spawns grandchild + reads
     // clock + unwinds (FrozenVCpu, parent = root); grandchild reads clock + unwinds (FrozenVCpu,
     // parent = child). Capture window + residues.
-    let (frozen, root_sp, snap, clock_after) = {
+    let (frozen, root_sp, children, snap, clock_after) = {
         let mut h = Host::new();
         h.set_durable(true);
         h.clock_ns = 42;
@@ -551,6 +557,7 @@ fn nested_spawn_tree_freezes_and_thaws() {
         (
             h.frozen_vcpus().to_vec(),
             h.frozen_root_sp().expect("root extent recorded"),
+            h.child_generations().to_vec(),
             snap,
             h.clock_ns,
         )
@@ -586,6 +593,7 @@ fn nested_spawn_tree_freezes_and_thaws() {
         let clk = h.grant_clock();
         h.set_frozen_vcpus(frozen);
         h.set_frozen_root_sp(root_sp);
+        h.set_child_generations(children);
         let mut fuel = 1_000_000u64;
         let (r, _) = run_capture_reserved_with_host(
             &inst,

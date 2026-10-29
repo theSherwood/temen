@@ -208,6 +208,7 @@ fn a_join_parked_root_takes_the_freeze_its_child_was_re_admitted_for() {
     h2.set_durable(true);
     h2.set_self_module(&inst);
     h2.set_frozen_vcpus(frozen);
+    h2.set_child_generations(h.child_generations().to_vec());
     if let Some(sp) = root_sp {
         h2.set_frozen_root_sp(sp);
     }
@@ -256,6 +257,7 @@ fn thaw_with_the_word_changed(inst: &Inst, snap: &[u8], h: &Host) -> Result<Vec<
     h2.set_durable(true);
     h2.set_self_module(inst);
     h2.set_frozen_vcpus(h.frozen_vcpus().to_vec());
+    h2.set_child_generations(h.child_generations().to_vec());
     if let Some(sp) = h.frozen_root_sp() {
         h2.set_frozen_root_sp(sp);
     }
