@@ -257,11 +257,13 @@ entry contract:
 3. no instruction outside the allowlist executes;
 4. every exit restores the callee-saved registers and `rsp`.
 
-**Trusted:** the validator (decoder, transfer, policy, checker); the runtime, which builds the window,
-guards, fn table and vmctx and its cells, never rewrites a live fn-table entry, and enters each
-function in its contract; the linker, which patches each relocation with the address of the symbol
-it names; the host functions, the fuel refill among them a `PreserveAll` one; the hardware. **Not trusted:** Cranelift, the code cache, or any metadata stored with code. A hint is a
-claim the validator checks, never an input it believes.
+**Trusted:** the validator (decoder, transfer, policy, checker); the runtime, which builds the
+window, guards, fn table and vmctx and its cells, keeps every fn-table entry's type id and code
+pointer in agreement for any reader (concurrent slot reuse breaks this today: #2680), and enters
+each function in its contract; the linker, which patches each relocation with the address of the
+symbol it names; the host functions, the fuel refill among them a `PreserveAll` one; the hardware.
+**Not trusted:** Cranelift, the code cache, or any metadata stored with code. A hint is a claim the
+validator checks, never an input it believes.
 
 **Why it holds.** The validator decodes the bytes itself and recovers the machine CFG from them,
 reading a jump table's targets from the table its `jmp` computes. It abstracts the machine state at
