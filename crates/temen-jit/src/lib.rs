@@ -4844,12 +4844,11 @@ impl CompiledModule {
         let mem_base = window.base();
         let mut results = vec![0i64; n_results];
         // This run's instance context: the module's own instance (#1768 — the powerbox, kill-path
-        // cell, fuel cell and signal arm its compile was handed), entered by the root and shared with
-        // every vCPU and fiber of the run. Its field 0 is the trap cell — how the domain ended: 0
-        // while it runs; low 32 bits = a TrapKind / EXIT_CODE; high 32 bits = the exit code for an
-        // Exit. It is **shared across vCPU threads** (every spawned vCPU gets its address via
-        // `set_env`), so every end is a compare-and-swap from 0 — emitted code's and the runtime's
-        // alike ([`VmCtx::raise`]) — and the first end wins (#2499).
+        // cell, fuel cell and signal arm its compile was handed), entered by the root. It owns the
+        // domain's end: 0 while it runs; low 32 bits = a TrapKind / EXIT_CODE; high 32 bits = the
+        // exit code for an Exit. Each spawned vCPU runs on a context of its own that shares that end
+        // (#2488, `set_env`), so every end is a compare-and-swap from 0 — emitted code's and the
+        // runtime's alike ([`VmCtx::raise`]) — and the first end wins (#2499).
         let vm = VmCtx::new((*this).instance);
 
         // §12: the root vCPU (`main`) runs on this thread under the §5 detect-and-kill guard; any spawned
@@ -5168,10 +5167,10 @@ impl CompiledModule {
         if let Some(d) = &(*this).domain {
             // Owner decision 2026-07-24 — domain teardown (DESIGN.md §12; ISSUES.md I37; D37
             // death-is-revocation): the root vCPU has finished, which ends the domain — a trap or
-            // `exit` from any vCPU already sits in the shared cell, and a clean root return raises
-            // the internal `DOMAIN_DONE_CODE` sentinel ("root completion ends the activation").
-            // Either way every parked sibling (futex wait / join) is woken to observe the non-zero
-            // cell and unwind through its trailing trap-propagation guard, so `join_all` below
+            // `exit` from any vCPU is already the domain's end, and a clean root return raises the
+            // internal `DOMAIN_DONE_CODE` sentinel ("root completion ends the activation").
+            // Either way every parked sibling (futex wait / join) is woken to observe the end and
+            // unwind through its trailing trap-propagation guard, so `join_all` below
             // returns promptly instead of hanging on a parked daemon. A durable **freeze** is not
             // teardown: the root unwound under `UNWINDING` and parked siblings return through the
             // freeze re-issue machinery (the sentinel is skipped so their residue is recorded).
@@ -7970,7 +7969,7 @@ fn sig_from(params: &[ValType], results: &[ValType]) -> cranelift_codegen::ir::S
     let mut sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
     sig.params.push(AbiParam::new(I64)); // mem_base
     sig.params.push(AbiParam::new(I64)); // fn_table_base
-    sig.params.push(AbiParam::new(I64)); // vmctx (the instance's context; field 0 its trap cell)
+    sig.params.push(AbiParam::new(I64)); // vmctx (this vCPU's context; field 0 its stop word)
                                          // §2b path B: a 4th context param — the running stack's limit: a fiber's `usable_low`, or the
                                          // root/thread-top's thread limit (`stack_check::thread_limit`, #1983). Threaded through every call (constant within
                                          // a stack's call tree; set anew at each fiber/root entry), so the prologue check reads a per-vCPU
@@ -8220,15 +8219,88 @@ impl PageEnv {
     }
 }
 
+/// #2488 — a function's shared exits, each made at its first use and filled after the function's own
+/// blocks ([`Exits::fill`]). Every early exit jumps into this chain rather than carrying its own copy:
+/// a trap to `raise`, a check that read the domain's end to `stop`, a check that read this vCPU's
+/// stop word to `unwind`.
+#[derive(Default)]
+struct Exits {
+    /// `raise(code, vmctx)`: end the domain with `code` ([`emit_raise`]), then `stop` on the end
+    /// that won.
+    raise: std::cell::Cell<Option<cranelift_codegen::ir::Block>>,
+    /// `stop(ended, vmctx)`: copy the end into the stop word ([`emit_stop`]), then `unwind`.
+    stop: std::cell::Cell<Option<cranelift_codegen::ir::Block>>,
+    /// `unwind()`: return zero results ([`emit_trap_return`]), so each caller's check returns in
+    /// turn.
+    unwind: std::cell::Cell<Option<cranelift_codegen::ir::Block>>,
+}
+
+impl Exits {
+    /// The exit in `slot`, made (cold, with `params` `i64` params) at its first use. The `vmctx` an
+    /// exit takes is passed, not looked up: the block is reached from every exit of the function.
+    fn get(
+        b: &mut FunctionBuilder,
+        slot: &std::cell::Cell<Option<cranelift_codegen::ir::Block>>,
+        params: usize,
+    ) -> cranelift_codegen::ir::Block {
+        slot.get().unwrap_or_else(|| {
+            let blk = b.create_block();
+            for _ in 0..params {
+                b.append_block_param(blk, I64);
+            }
+            b.set_cold_block(blk);
+            slot.set(Some(blk));
+            blk
+        })
+    }
+
+    fn raise(&self, b: &mut FunctionBuilder) -> cranelift_codegen::ir::Block {
+        Self::get(b, &self.raise, 2)
+    }
+
+    fn stop(&self, b: &mut FunctionBuilder) -> cranelift_codegen::ir::Block {
+        Self::get(b, &self.stop, 2)
+    }
+
+    fn unwind(&self, b: &mut FunctionBuilder) -> cranelift_codegen::ir::Block {
+        Self::get(b, &self.unwind, 0)
+    }
+
+    /// Fill the exits the function used, in chain order, since each jumps on to the next.
+    fn fill(&self, b: &mut FunctionBuilder, lower: &Lower) {
+        // No one op's position: every exit of the function comes here.
+        b.set_srcloc(SourceLoc::default());
+        if let Some(raise) = self.raise.get() {
+            b.switch_to_block(raise);
+            let (code, vmctx) = (b.block_params(raise)[0], b.block_params(raise)[1]);
+            let ended = emit_raise(b, vmctx, code);
+            let stop = self.stop(b);
+            let args = [BlockArg::from(ended), BlockArg::from(vmctx)];
+            b.ins().jump(stop, &args);
+        }
+        if let Some(stop) = self.stop.get() {
+            b.switch_to_block(stop);
+            let (ended, vmctx) = (b.block_params(stop)[0], b.block_params(stop)[1]);
+            emit_stop(b, vmctx, ended);
+            let unwind = self.unwind(b);
+            b.ins().jump(unwind, &[]);
+        }
+        if let Some(unwind) = self.unwind.get() {
+            b.switch_to_block(unwind);
+            emit_trap_return(b, lower);
+        }
+    }
+}
+
 /// Per-function lowering context shared across blocks.
 struct Lower<'a> {
     /// Holds `mem_base` (the window base) for load/store lowering and call threading.
     mem_var: Variable,
     /// Holds `fn_table_base` for `call.dyn` dispatch and call threading.
     fn_table_var: Variable,
-    /// Holds the instance's [`VmCtx`] pointer — which is also its trap cell (field 0), the host-owned
-    /// `*mut i64` a trap (or the cap thunk) writes before returning (the host reads it to learn the
-    /// run trapped, §5). Every other per-instance address is loaded from it ([`vmctx_load`]).
+    /// Holds this vCPU's [`VmCtx`] pointer — which is also its stop word (field 0), which a raise
+    /// (compiled code's or the cap thunk's) sets before returning, and the check after each call
+    /// reads (§5, #2488). Every other per-instance address is loaded from it ([`vmctx_load`]).
     vmctx_var: Variable,
     /// §2b path B: holds `stack_limit` (the running stack's `usable_low`, or 0 for the root), for the
     /// prologue [`emit_stack_check`] and to thread on to callees. Always present (the guard is in the
@@ -8287,8 +8359,8 @@ struct Lower<'a> {
     /// plain (non-atomic); the store⇒load dependency on the same address keeps Cranelift from hoisting
     /// the check out of a loop.
     fuel: bool,
-    /// DESIGN §12 domain teardown for **running** vCPUs: poll the domain's trap cell at every loop
-    /// back-edge (and the entry of a function that tail-calls), and unwind once it holds an end — a
+    /// DESIGN §12 domain teardown for **running** vCPUs: poll the domain's end at every loop
+    /// back-edge (and the entry of a function that tail-calls), and unwind once it holds one — a
     /// sibling's trap, the root's completion sentinel ([`DOMAIN_DONE_CODE`]), or a parent's teardown
     /// of a §14 child. On for code that can run beside other vCPUs (a threaded module, every §14
     /// child); a single-vCPU compile emits nothing.
@@ -8330,6 +8402,8 @@ struct Lower<'a> {
     /// ([`HostFn::PageMiss`]) imported into the function, and the variable holding the instance's
     /// access table, loaded once at entry. `None` for an unpaged compile.
     page: Option<(PageEnv, FuncRef, Variable)>,
+    /// #2488 — the function's shared exits ([`Exits`]).
+    exits: Exits,
 }
 
 /// The address of the §5 W3 explicit-trap capture helper (`temen_capture_explicit_trap` in
@@ -8433,7 +8507,7 @@ fn build_clif(
     let entry = b.create_block();
     b.append_block_param(entry, I64); // mem_base
     b.append_block_param(entry, I64); // fn_table_base
-    b.append_block_param(entry, I64); // vmctx (its field 0 is the trap cell)
+    b.append_block_param(entry, I64); // vmctx (its field 0 is the stop word)
     b.append_block_param(entry, I64); // stack_limit (§2b path B) — mirrors sig_from
     if sret {
         b.append_block_param(entry, I64); // return-area pointer (results spilled here, not returned)
@@ -8514,6 +8588,7 @@ fn build_clif(
         var_labels,
         trap_capture,
         page,
+        exits: Exits::default(),
     };
 
     // Jump into IR block 0 passing the function parameters (entry params after the three context
@@ -8546,6 +8621,7 @@ fn build_clif(
     for (i, blk) in f.blocks.iter().enumerate() {
         lower_block(&mut b, blk, i, &mut blocks, &mut checked, &lower)?;
     }
+    lower.exits.fill(&mut b, &lower);
 
     b.seal_all_blocks();
     b.finalize();
@@ -8952,7 +9028,7 @@ fn lower_block(
             // it here so it unwinds immediately (else the caller would run on with bogus results,
             // and a later successful `call.cap` could reset the cell, masking the trap). On the sret
             // path this also returns *before* reading the unwritten return-area slots.
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Guest);
             read_call_results(b, call, sret, results, &mut vals);
             continue;
         }
@@ -8967,7 +9043,7 @@ fn lower_block(
             }
             let call = b.ins().call_indirect(sig, code, &cargs);
             // Propagate a callee trap immediately (see the direct-call case above).
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Guest);
             read_call_results(b, call, sret, &ty.results, &mut vals);
             continue;
         }
@@ -8991,7 +9067,7 @@ fn lower_block(
             // crashing the differential — nightlies Jun 19 / Jul 2 / Jul 4, ISSUES.md I16.)
             if !temen_ir::served_shape_ok(*type_id, *op, sig) {
                 emit_trap_set(b, lower, TrapKind::CapFault);
-                emit_trap_propagate(b, lower);
+                emit_trap_propagate(b, lower, Callee::Host);
                 // Dead at runtime (the cell is already set), but keep the verifier's value
                 // accounting for the rest of the block: push zeros of the *declared* result types.
                 for t in &sig.results {
@@ -9170,7 +9246,7 @@ fn lower_block(
                 HostFn::FiberNew,
                 &[mem_base, fnt, vmctx, funcref, spv, fuel],
             )?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             vals.push(b.inst_results(call)[0]);
             continue;
         }
@@ -9212,7 +9288,7 @@ fn lower_block(
                     &[kh, av, status_ptr, vmctx],
                 )?
             };
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             let value = b.inst_results(call)[0];
             let status64 = b.ins().stack_load(I64, ss, 0);
             let status = b.ins().ireduce(I32, status64);
@@ -9225,7 +9301,7 @@ fn lower_block(
             let v = get(&vals, *value)?;
             let vmctx = b.use_var(lower.vmctx_var);
             let call = call_host(lower.callees, b, HostFn::FiberSuspend, &[v, vmctx])?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             vals.push(b.inst_results(call)[0]);
             continue;
         }
@@ -9274,8 +9350,9 @@ fn lower_block(
                 &[rt_addr, bufv, vmctx],
             )?;
             let slot = b.inst_results(c1)[0];
-            emit_trap_propagate(b, lower); // bail on a miss (forged/stale token) before `_longjmp`
-                                           // _longjmp(slot, val) — inline, noreturn.
+            // Bail on a miss (forged/stale token) before `_longjmp`.
+            emit_trap_propagate(b, lower, Callee::Host);
+            // _longjmp(slot, val) — inline, noreturn.
             call_host(lower.callees, b, HostFn::Longjmp, &[slot, valv])?;
             continue;
         }
@@ -9362,7 +9439,7 @@ fn lower_block(
             }
             let args_ptr = b.ins().stack_addr(I64, slot, 0);
             let call = call_host(lower.callees, b, HostFn::GcRoots, &[args_ptr])?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             vals.push(b.inst_results(call)[0]);
             continue;
         }
@@ -9394,7 +9471,7 @@ fn lower_block(
                 HostFn::ThreadSpawn,
                 &[sched, mem_base, fnt, vmctx, func_idx, spv, av],
             )?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             vals.push(b.inst_results(call)[0]);
             continue;
         }
@@ -9413,7 +9490,7 @@ fn lower_block(
                 HostFn::ThreadJoin,
                 &[sched, h, status_ptr, vmctx],
             )?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             let value = b.inst_results(call)[0];
             vals.push(b.ins().stack_load(I64, ss, 0)); // result 0: status (i64)
             vals.push(value); // result 1: value (i64)
@@ -9451,7 +9528,7 @@ fn lower_block(
                 HostFn::ThreadWait,
                 &[sched, phys, exp, width, to, vmctx],
             )?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             vals.push(b.inst_results(call)[0]);
             continue;
         }
@@ -10558,6 +10635,11 @@ fn lower_block(
 /// by the caller with its own ordering.
 fn vmctx_load(b: &mut FunctionBuilder, lower: &Lower, field: i32) -> Value {
     let vmctx = b.use_var(lower.vmctx_var);
+    vmctx_field(b, vmctx, field)
+}
+
+/// [`vmctx_load`] from the context at `vmctx`.
+fn vmctx_field(b: &mut FunctionBuilder, vmctx: Value, field: i32) -> Value {
     let flags = MemFlags::trusted().with_readonly().with_can_move();
     b.ins().load(I64, flags, vmctx, field)
 }
@@ -10615,30 +10697,37 @@ fn read_call_results(
     }
 }
 
-/// Lower a trap (§5 detect-and-kill): store the kind code into the host trap cell, then
-/// `return` dummy zero results so the run unwinds to the trampoline, which reports the
-/// trap. (The reference JIT detects traps this way; production uses hardware faults.)
-///
-/// Caveat: this returns from the *current* function only. The current scalar tests put
-/// every trap in the entry function (or its dispatch), so that suffices; propagating a
-/// trap *out of a callee* would need a post-call check, added when a case needs it.
+/// Lower a trap (§5 detect-and-kill): under `-g`, record its backtrace here, then jump to the
+/// function's raise exit ([`Exits`]), which raises `kind` as the domain's end and returns zero
+/// results. Each caller's post-call check ([`emit_trap_propagate`]) returns in turn, up to the
+/// entry trampoline, which reports the trap.
 fn emit_trap(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
-    emit_trap_set(b, lower, kind);
-    emit_trap_return(b, lower);
+    emit_trap_capture(b, lower);
+    let code = b.ins().iconst(I64, kind as u32 as i64); // full i64 cell (high bits 0)
+    let vmctx = b.use_var(lower.vmctx_var);
+    let raise = lower.exits.raise(b);
+    b.ins()
+        .jump(raise, &[BlockArg::from(code), BlockArg::from(vmctx)]);
 }
 
-/// Record a trap in the cell (with the §5 W3 backtrace capture) **without** terminating the block.
-/// Callers pair it with [`emit_trap_return`] (an unconditional trap, via [`emit_trap`]) or with
-/// [`emit_trap_propagate`] (the shared branch-on-cell exit) when compilation of the rest of the
-/// block must continue — the branch keeps the continuation formally reachable, so later
+/// Record a trap (with the §5 W3 backtrace capture) **without** terminating the block. The caller
+/// pairs it with [`emit_trap_propagate`] (the shared branch-on-stop exit) when compilation of the
+/// rest of the block must continue — the branch keeps the continuation formally reachable, so later
 /// instructions still lower against a well-formed value stack even though they are dead at runtime.
 fn emit_trap_set(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
-    // §5 W3 Stage 2: record a source backtrace for this explicit trap *before* it unwinds — the trap
-    // stores its kind and returns, and that return propagates up tearing down every guest frame, so
-    // the helper must walk the frame-pointer chain from this live site now. The current op's
-    // `SourceLoc` is in effect, so the call inherits it and symbolizes to the trapping op's line.
-    // Only present under `-g` (else the backtrace would be empty); the trap path is otherwise
-    // unchanged.
+    emit_trap_capture(b, lower);
+    let code = b.ins().iconst(I64, kind as u32 as i64); // full i64 cell (high bits 0)
+    let vmctx = b.use_var(lower.vmctx_var);
+    let ended = emit_raise(b, vmctx, code);
+    emit_stop(b, vmctx, ended);
+}
+
+/// §5 W3 Stage 2: record a source backtrace for an explicit trap *before* it unwinds — the trap
+/// records its kind and returns, and that return propagates up tearing down every guest frame, so
+/// the helper must walk the frame-pointer chain from this live site now. The current op's
+/// `SourceLoc` is in effect, so the call inherits it and symbolizes to the trapping op's line. Only
+/// present under `-g` (else the backtrace would be empty).
+fn emit_trap_capture(b: &mut FunctionBuilder, lower: &Lower) {
     if let Some(capture) = lower.trap_capture {
         // Pass the trapping function's frame pointer so the helper can walk the caller chain without
         // `__builtin_frame_address` (which MSVC lacks); it pairs `fp` with its own return address (the
@@ -10646,12 +10735,23 @@ fn emit_trap_set(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
         let fp = b.ins().get_frame_pointer(I64);
         b.ins().call(capture, &[fp]);
     }
-    let cell = b.use_var(lower.vmctx_var);
+}
+
+/// End the domain with `code`, returning the end that won, for the caller to stop on. #2499 — raise,
+/// never store: the domain's end holds the first end any of its vCPUs raised ([`VmCtx::raise`]).
+fn emit_raise(b: &mut FunctionBuilder, vmctx: Value, code: Value) -> Value {
+    let end = vmctx_field(b, vmctx, vmctx::END);
     let none = b.ins().iconst(I64, 0);
-    let code = b.ins().iconst(I64, kind as u32 as i64); // full i64 cell (high bits 0)
-                                                        // #2499 — raise, never store: the cell holds the domain's end, and an end a sibling vCPU raised
-                                                        // first stands ([`VmCtx::raise`]).
-    b.ins().atomic_cas(atomic_flags(), cell, none, code);
+    let first = b.ins().atomic_cas(atomic_flags(), end, none, code);
+    let won = b.ins().icmp_imm(IntCC::Equal, first, 0);
+    b.ins().select(won, code, first)
+}
+
+/// #2488 — copy the domain's end `ended` into the stop word of the context at `vmctx`, so the check
+/// after each call up this vCPU's stack returns too.
+fn emit_stop(b: &mut FunctionBuilder, vmctx: Value, ended: Value) {
+    let none = b.ins().iconst(I64, 0);
+    b.ins().atomic_cas(atomic_flags(), vmctx, none, ended);
 }
 
 /// Emit the function `return` on a trap / early-exit path: **void** for an sret function (its results
@@ -10698,27 +10798,27 @@ fn emit_epoch_check(b: &mut FunctionBuilder, lower: &Lower) {
 
 /// Emit the domain-teardown poll ([`Lower::domain_poll`]) — at loop back-edges and at the entry of
 /// a function that tail-calls: if this vCPU's domain has ended — a sibling's trap or `exit`, the
-/// root's completion, or a parent's `kill` or teardown, all raised on the trap cell — return
-/// straight up the stack, as a call's trap-propagation guard does. The cell is only read, so the
-/// value that ended the domain is the one reported. The load is atomic for the reason
-/// [`emit_epoch_check`]'s is: another thread writes the cell, and a plain load could be hoisted out
-/// of the loop it bounds. A no-op when `domain_poll` is off.
+/// root's completion, or a parent's `kill` or teardown, all raised on the domain's end — copy the
+/// end into this context's stop word and return straight up the stack, as a call's
+/// trap-propagation guard does. The load is atomic for the reason [`emit_epoch_check`]'s is:
+/// another thread writes the end, and a plain load could be hoisted out of the loop it bounds. The
+/// end's address, a field of the context, can be. A no-op when `domain_poll` is off.
 ///
 /// On return the builder is positioned at the continuation block.
 fn emit_domain_poll(b: &mut FunctionBuilder, lower: &Lower) {
     if !lower.domain_poll {
         return;
     }
-    let cell = b.use_var(lower.vmctx_var);
-    let ended = b.ins().atomic_load(I64, atomic_flags(), cell);
-    let stop = b.create_block();
+    let vmctx = b.use_var(lower.vmctx_var);
+    let end = vmctx_field(b, vmctx, vmctx::END);
+    let ended = b.ins().atomic_load(I64, atomic_flags(), end);
+    // Taken once per vCPU lifetime: the stop exit is cold, off the loop's fall-through path.
+    let stop = lower.exits.stop(b);
     let cont = b.create_block();
-    b.set_cold_block(stop); // taken once per vCPU lifetime: keep it off the loop's fall-through path
-    b.ins().brif(ended, stop, &[], cont, &[]);
-    b.switch_to_block(stop);
-    emit_trap_return(b, lower);
+    let args = [BlockArg::from(ended), BlockArg::from(vmctx)];
+    b.ins().brif(ended, stop, &args, cont, &[]);
     b.switch_to_block(cont);
-    // `stop`/`cont` are sealed by the caller's `seal_all_blocks`.
+    // `cont` is sealed by the caller's `seal_all_blocks`.
 }
 
 /// #932 — emit the async-signal **delivery safepoint**: poll the host `armed` flag
@@ -10786,7 +10886,7 @@ fn emit_signal_check(b: &mut FunctionBuilder, lower: &Lower) -> Result<(), JitEr
     b.ins().call_indirect(hsig, code, &cargs);
     // The handler may `exit`/trap or `longjmp`; propagate a set trap cell now (unwinds this function),
     // exactly as after a `call.dyn`. Leaves the builder in a fresh continuation block.
-    emit_trap_propagate(b, lower);
+    emit_trap_propagate(b, lower, Callee::Guest);
     // Handler returned normally: notify the host (restore the block-during-handler mask, pop nesting).
     let ctx2 = vmctx_load(b, lower, vmctx::SIG_CTX);
     call_host(lower.callees, b, HostFn::SigReturn, &[ctx2])?;
@@ -11036,22 +11136,44 @@ fn indirect_dispatch(b: &mut FunctionBuilder, lower: &Lower, idx: Value, ty: &Fu
     b.ins().load(I64, MemFlags::trusted(), entry_addr, 8)
 }
 
-/// Emit "if the host trap cell is non-zero, propagate the trap now": branch to an early
-/// `return` of zero-valued results (the trap kind / exit code already sits in the cell, which the
-/// entry trampoline reads to decide `Trapped`/`Exited`). Used after **every** `call.cap` *and*
-/// every `call`/`call.dyn`, so a trap raised deep in a callee unwinds the whole guest stack
-/// immediately — before any later op can observe bogus zero results. A sibling vCPU's end stops
-/// this one here too: the cell is the domain's, and nothing clears it during a run (#2499).
-fn emit_trap_propagate(b: &mut FunctionBuilder, lower: &Lower) {
+/// What a call's trap check follows (#2488), which decides the word it reads.
+#[derive(Clone, Copy)]
+enum Callee {
+    /// Guest code, run on this vCPU's stack: whatever ended it stopped this context first (a raise,
+    /// a poll or a host call's check, each of which writes the stop word), so the stop word is
+    /// enough, and the check stays one load on the hot path.
+    Guest,
+    /// The host, which may have seen another vCPU end the domain (a join, a park, a fiber that
+    /// trapped on its creator's context): read the domain's end, and copy it into the stop word
+    /// before returning.
+    Host,
+}
+
+/// Emit "if this vCPU has stopped, propagate the end now": branch to an early `return` of
+/// zero-valued results (the end already sits in the domain's word, which the entry trampoline reads
+/// to decide `Trapped`/`Exited`). Used after **every** `call.cap` *and* every `call`/`call.dyn`, so
+/// a trap raised deep in a callee unwinds the whole guest stack immediately — before any later op
+/// can observe bogus zero results. A sibling vCPU's end stops this one at the first check after a
+/// host call: the end is the domain's, and nothing clears it during a run (#2499).
+fn emit_trap_propagate(b: &mut FunctionBuilder, lower: &Lower, callee: Callee) {
     let vmctx = b.use_var(lower.vmctx_var);
-    let tc = b.ins().load(I64, MemFlags::trusted(), vmctx, 0);
-    let trapped = b.ins().icmp_imm(IntCC::NotEqual, tc, 0);
-    let trapret = b.create_block();
     let cont = b.create_block();
-    b.ins().brif(trapped, trapret, &[], cont, &[]);
-    b.switch_to_block(trapret);
-    b.seal_block(trapret);
-    emit_trap_return(b, lower);
+    match callee {
+        Callee::Guest => {
+            let stopped = b.ins().load(I64, MemFlags::trusted(), vmctx, 0);
+            let unwind = lower.exits.unwind(b);
+            b.ins().brif(stopped, unwind, &[], cont, &[]);
+        }
+        Callee::Host => {
+            // Not [`vmctx_field`]: a movable load is re-placed without a source position, and this
+            // one sits at the call's return address, which a parked fiber's backtrace symbolizes.
+            let end = b.ins().load(I64, MemFlags::trusted(), vmctx, vmctx::END);
+            let ended = b.ins().load(I64, MemFlags::trusted(), end, 0);
+            let stop = lower.exits.stop(b);
+            let args = [BlockArg::from(ended), BlockArg::from(vmctx)];
+            b.ins().brif(ended, stop, &args, cont, &[]);
+        }
+    }
     b.switch_to_block(cont);
     b.seal_block(cont);
 }
@@ -11092,7 +11214,7 @@ fn lower_cap_call_fast(
     let call = b.ins().call(callee, &call_args);
 
     // If the specialized fn set the trap cell, propagate (the cell already holds the kind / exit code).
-    emit_trap_propagate(b, lower);
+    emit_trap_propagate(b, lower, Callee::Host);
 
     if n_res == 1 {
         let slot = b.inst_results(call)[0]; // the i64 return register
@@ -11198,7 +11320,7 @@ fn lower_cap_call(
 
     // If the thunk set the trap cell, propagate (return early; the cell already holds
     // the kind / exit code).
-    emit_trap_propagate(b, lower);
+    emit_trap_propagate(b, lower, Callee::Host);
 
     // Read the result slots back.
     if let Some(ss) = res_ss {
@@ -11252,7 +11374,7 @@ fn lower_instantiator(
                 HostFn::InstJoin,
                 &[nursery, mem_base, h, child, status_ptr, vmctx],
             )?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             let value = b.inst_results(call)[0];
             let status = b.ins().stack_load(I64, ss, 0);
             vals.push(result_as(b, status, sig.results[0]));
@@ -11274,7 +11396,7 @@ fn lower_instantiator(
                 thunk,
                 &[nursery, mem_base, h, child, vmctx],
             )?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
         }
@@ -11300,7 +11422,7 @@ fn lower_instantiator(
                 HostFn::InstSpawn,
                 &[nursery, mem_base, mem_size, h, record_ptr, vmctx],
             )?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
         }
@@ -11324,7 +11446,7 @@ fn lower_instantiator(
                 thunk,
                 &[nursery, mem_base, h, child, arg, vmctx],
             )?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
         }
@@ -11802,7 +11924,7 @@ fn emit_page_miss(
     let vm = b.use_var(lower.vmctx_var);
     let flags = b.ins().iconst(I64, flags as i64);
     b.ins().call(thunk, &[vm, base, off, len, flags]);
-    emit_trap_propagate(b, lower);
+    emit_trap_propagate(b, lower, Callee::Host);
 }
 
 /// **Bulk-span backed-extent probe (ISSUES.md I21).** Fault a bulk span that overruns the

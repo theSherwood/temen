@@ -15211,6 +15211,44 @@ fn lower_int_intrinsic(
             }
             let lane_ty = int_ty(shape.lane_val())?;
             let is_fshl = base == "llvm.fshl";
+            // A **uniform** amount (a constant splat: how a rotate by a constant compiles, e.g. a
+            // hash over `u32x4` lanes, #2682) is two native `VShift`s and an `Or`:
+            // `fshl(a, b, s) = (a << s) | (b >>u (w − s))`, `fshr(a, b, s) = (a << (w − s)) |
+            // (b >>u s)`. A whole-width amount shifts nothing, leaving `a` (`fshl`) or `b`
+            // (`fshr`). Per-lane amounts are scalarized below.
+            if let Some(amt) = const_splat_int(args[2]) {
+                let w = shape.lane_bytes() as u64 * 8;
+                let s = amt % w;
+                if s == 0 {
+                    return Ok(Some(ctx.operand(if is_fshl {
+                        args[0]
+                    } else {
+                        args[1]
+                    })?));
+                }
+                let (left, right) = if is_fshl { (s, w - s) } else { (w - s, s) };
+                let a = ctx.operand(args[0])?;
+                let b = ctx.operand(args[1])?;
+                let l = ctx.push(Inst::ConstI32(left as i32));
+                let r = ctx.push(Inst::ConstI32(right as i32));
+                let hi = ctx.push(Inst::VShift {
+                    shape,
+                    op: temen_ir::VShiftOp::Shl,
+                    a,
+                    amt: l,
+                });
+                let lo = ctx.push(Inst::VShift {
+                    shape,
+                    op: temen_ir::VShiftOp::ShrU,
+                    a: b,
+                    amt: r,
+                });
+                return Ok(Some(ctx.push(Inst::VBitBin {
+                    op: temen_ir::VBitBinOp::Or,
+                    a: hi,
+                    b: lo,
+                })));
+            }
             // The **rotate idiom** (`a == b`): temen-ir's lane `Rotl`/`Rotr` masks the count mod width
             // and accepts a runtime amount, so scalarize to one rotate per lane (the auto-vectorizer
             // emits per-lane-varying constant amounts, e.g. xxHash's `<1,7,12,18>`).
@@ -15323,6 +15361,12 @@ fn lower_int_intrinsic(
                 out.push(emit_bswap(ctx, l, lane_ty, lane_bytes));
             }
             return Ok(Some(build_v128_from_lanes(ctx, shape, &out)));
+        }
+        if base.ends_with(".sat") {
+            if shape.is_float() {
+                return unsup("vector saturating op on a float shape");
+            }
+            return lower_vector_sat(ctx, base, shape, &args, types).map(Some);
         }
         let op = match base {
             "llvm.smax" => temen_ir::VIntBinOp::MaxS,
@@ -15699,95 +15743,154 @@ fn lower_int_intrinsic(
             }
             let a = ctx.operand(args[0])?;
             let b = ctx.operand(args[1])?;
-            let k = |ctx: &mut BlockCtx, v: i64| {
-                ctx.push(if ty == IntTy::I64 {
-                    Inst::ConstI64(v)
-                } else {
-                    Inst::ConstI32(v as i32)
-                })
-            };
-            let bin = |ctx: &mut BlockCtx, op: BinOp, a: ValIdx, b: ValIdx| {
-                ctx.push(Inst::IntBin { ty, op, a, b })
-            };
-            match base {
-                // unsigned add: carry (s <u a) ⇒ all-ones (UMAX).
-                "llvm.uadd.sat" => {
-                    let s = bin(ctx, BinOp::Add, a, b);
-                    let carry = ctx.push(Inst::IntCmp {
-                        ty,
-                        op: CmpOp::LtU,
-                        a: s,
-                        b: a,
-                    });
-                    let umax = k(ctx, -1);
-                    ctx.push(Inst::Select {
-                        cond: carry,
-                        a: umax,
-                        b: s,
-                    })
-                }
-                // unsigned sub: borrow (a <u b) ⇒ 0.
-                "llvm.usub.sat" => {
-                    let under = ctx.push(Inst::IntCmp {
-                        ty,
-                        op: CmpOp::LtU,
-                        a,
-                        b,
-                    });
-                    let diff = bin(ctx, BinOp::Sub, a, b);
-                    let zero = k(ctx, 0);
-                    ctx.push(Inst::Select {
-                        cond: under,
-                        a: zero,
-                        b: diff,
-                    })
-                }
-                // signed add/sub: overflow when the sign rule is violated ⇒ clamp to SMIN/SMAX by the
-                // sign of `a`. `sadd`: overflow iff `(a^s)&(b^s) < 0`; `ssub`: iff `(a^b)&(a^d) < 0`.
-                "llvm.sadd.sat" | "llvm.ssub.sat" => {
-                    let is_add = base == "llvm.sadd.sat";
-                    let r = bin(ctx, if is_add { BinOp::Add } else { BinOp::Sub }, a, b);
-                    let (l, rr) = if is_add {
-                        (bin(ctx, BinOp::Xor, a, r), bin(ctx, BinOp::Xor, b, r))
-                    } else {
-                        (bin(ctx, BinOp::Xor, a, b), bin(ctx, BinOp::Xor, a, r))
-                    };
-                    let ov_bits = bin(ctx, BinOp::And, l, rr);
-                    let zero = k(ctx, 0);
-                    let ov = ctx.push(Inst::IntCmp {
-                        ty,
-                        op: CmpOp::LtS,
-                        a: ov_bits,
-                        b: zero,
-                    });
-                    let (smax, smin) = if ty == IntTy::I64 {
-                        (k(ctx, i64::MAX), k(ctx, i64::MIN))
-                    } else {
-                        (k(ctx, i32::MAX as i64), k(ctx, i32::MIN as i64))
-                    };
-                    let neg = ctx.push(Inst::IntCmp {
-                        ty,
-                        op: CmpOp::LtS,
-                        a,
-                        b: zero,
-                    });
-                    let sat = ctx.push(Inst::Select {
-                        cond: neg,
-                        a: smin,
-                        b: smax,
-                    });
-                    ctx.push(Inst::Select {
-                        cond: ov,
-                        a: sat,
-                        b: r,
-                    })
-                }
-                _ => unreachable!(),
-            }
+            emit_wide_sat(ctx, base, ty, a, b)
         }
         _ => unreachable!(),
     };
     Ok(Some(idx))
+}
+
+/// A vector saturating add or subtract (`llvm.{u,s}{add,sub}.sat` on a 128-bit integer vector;
+/// rustc's SLP vectorizer forms `saturating_sub` on `usize` pairs this way, #2682). Byte and
+/// half-word lanes have the native `VSatBin`. Wider unsigned lanes clamp through min/max:
+/// `usub.sat(a, b) = max_u(a, b) − b`, `uadd.sat(a, b) = min_u(a, !b) + b`. Wider signed lanes are
+/// scalarized through [`emit_wide_sat`].
+fn lower_vector_sat(
+    ctx: &mut BlockCtx,
+    base: &str,
+    shape: temen_ir::VShape,
+    args: &[&Operand],
+    types: &Types,
+) -> Result<ValIdx, Error> {
+    use temen_ir::{VIntBinOp, VSatBinOp, VShape};
+    let vint = |ctx: &mut BlockCtx, op: VIntBinOp, a: ValIdx, b: ValIdx| {
+        ctx.push(Inst::VIntBin { shape, op, a, b })
+    };
+    if matches!(shape, VShape::I8x16 | VShape::I16x8) {
+        let op = match base {
+            "llvm.sadd.sat" => VSatBinOp::AddS,
+            "llvm.uadd.sat" => VSatBinOp::AddU,
+            "llvm.ssub.sat" => VSatBinOp::SubS,
+            _ => VSatBinOp::SubU,
+        };
+        let a = ctx.operand(args[0])?;
+        let b = ctx.operand(args[1])?;
+        return Ok(ctx.push(Inst::VSatBin { shape, op, a, b }));
+    }
+    match base {
+        "llvm.usub.sat" => {
+            let a = ctx.operand(args[0])?;
+            let b = ctx.operand(args[1])?;
+            let m = vint(ctx, VIntBinOp::MaxU, a, b);
+            Ok(vint(ctx, VIntBinOp::Sub, m, b))
+        }
+        "llvm.uadd.sat" => {
+            let a = ctx.operand(args[0])?;
+            let b = ctx.operand(args[1])?;
+            let nb = ctx.push(Inst::VNot { a: b });
+            let m = vint(ctx, VIntBinOp::MinU, a, nb);
+            Ok(vint(ctx, VIntBinOp::Add, m, b))
+        }
+        _ => {
+            let ty = int_ty(shape.lane_val())?;
+            let a = vec_explode(ctx, args[0], types, true)?;
+            let b = vec_explode(ctx, args[1], types, true)?;
+            let lanes: Vec<ValIdx> = (a.iter().zip(&b))
+                .map(|(&x, &y)| emit_wide_sat(ctx, base, ty, x, y))
+                .collect();
+            Ok(build_v128_from_lanes(ctx, shape, &lanes))
+        }
+    }
+}
+
+/// A 32- or 64-bit saturating add or subtract, `base` naming which (`llvm.uadd.sat` …): a scalar
+/// operand's, or one lane of a vector's ([`lower_vector_sat`]).
+fn emit_wide_sat(ctx: &mut BlockCtx, base: &str, ty: IntTy, a: ValIdx, b: ValIdx) -> ValIdx {
+    let k = |ctx: &mut BlockCtx, v: i64| {
+        ctx.push(if ty == IntTy::I64 {
+            Inst::ConstI64(v)
+        } else {
+            Inst::ConstI32(v as i32)
+        })
+    };
+    let bin = |ctx: &mut BlockCtx, op: BinOp, a: ValIdx, b: ValIdx| {
+        ctx.push(Inst::IntBin { ty, op, a, b })
+    };
+    match base {
+        // unsigned add: carry (s <u a) ⇒ all-ones (UMAX).
+        "llvm.uadd.sat" => {
+            let s = bin(ctx, BinOp::Add, a, b);
+            let carry = ctx.push(Inst::IntCmp {
+                ty,
+                op: CmpOp::LtU,
+                a: s,
+                b: a,
+            });
+            let umax = k(ctx, -1);
+            ctx.push(Inst::Select {
+                cond: carry,
+                a: umax,
+                b: s,
+            })
+        }
+        // unsigned sub: borrow (a <u b) ⇒ 0.
+        "llvm.usub.sat" => {
+            let under = ctx.push(Inst::IntCmp {
+                ty,
+                op: CmpOp::LtU,
+                a,
+                b,
+            });
+            let diff = bin(ctx, BinOp::Sub, a, b);
+            let zero = k(ctx, 0);
+            ctx.push(Inst::Select {
+                cond: under,
+                a: zero,
+                b: diff,
+            })
+        }
+        // signed add/sub: overflow when the sign rule is violated ⇒ clamp to SMIN/SMAX by the
+        // sign of `a`. `sadd`: overflow iff `(a^s)&(b^s) < 0`; `ssub`: iff `(a^b)&(a^d) < 0`.
+        "llvm.sadd.sat" | "llvm.ssub.sat" => {
+            let is_add = base == "llvm.sadd.sat";
+            let r = bin(ctx, if is_add { BinOp::Add } else { BinOp::Sub }, a, b);
+            let (l, rr) = if is_add {
+                (bin(ctx, BinOp::Xor, a, r), bin(ctx, BinOp::Xor, b, r))
+            } else {
+                (bin(ctx, BinOp::Xor, a, b), bin(ctx, BinOp::Xor, a, r))
+            };
+            let ov_bits = bin(ctx, BinOp::And, l, rr);
+            let zero = k(ctx, 0);
+            let ov = ctx.push(Inst::IntCmp {
+                ty,
+                op: CmpOp::LtS,
+                a: ov_bits,
+                b: zero,
+            });
+            let (smax, smin) = if ty == IntTy::I64 {
+                (k(ctx, i64::MAX), k(ctx, i64::MIN))
+            } else {
+                (k(ctx, i32::MAX as i64), k(ctx, i32::MIN as i64))
+            };
+            let neg = ctx.push(Inst::IntCmp {
+                ty,
+                op: CmpOp::LtS,
+                a,
+                b: zero,
+            });
+            let sat = ctx.push(Inst::Select {
+                cond: neg,
+                a: smin,
+                b: smax,
+            });
+            ctx.push(Inst::Select {
+                cond: ov,
+                a: sat,
+                b: r,
+            })
+        }
+        _ => unreachable!(),
+    }
 }
 
 /// Lower `llvm.{u,s}{add,sub,mul}.with.overflow.iN` → the wrapping op plus a computed overflow flag,
@@ -22046,31 +22149,51 @@ fn mask_operand(ctx: &mut BlockCtx, op: &Operand, n: usize) -> Result<Vec<ValIdx
     }
 }
 
-/// #1993 — a `getelementptr` over a **pointer vector** (`getelementptr i8, <2 x ptr> %bases, i64 16`:
-/// clang 22's early-exit vectorizer forms each lane's `base + SPAN` this way). Each lane is an `i64`
-/// window offset, so the scalar offset walk runs once per lane and the lanes repack into the result
-/// vector. Vector *indices* are not handled. `Ok(false)` if the base is not a vector.
+/// A `getelementptr` that yields a **pointer vector**: over a vector of bases (`getelementptr i8,
+/// <2 x ptr> %bases, i64 16`, clang 22's early-exit vectorizer, #1993), over a vector of indices
+/// (`getelementptr i8, ptr %p, <2 x i64> <i64 0, i64 56>`, rustc's loop vectorizer, #2682), or
+/// both. Each lane is an `i64` window offset, so the scalar offset walk runs once per lane, a
+/// vector operand's lane standing in for the operand, and the lanes repack into the result vector.
+/// `Ok(false)` if no operand is a vector.
 fn lower_vector_gep(
     ctx: &mut BlockCtx,
     g: &crate::ll::ast::GetElementPtr,
     types: &Types,
 ) -> Result<bool, Error> {
+    let lanes_of = |t: &Type| match t {
+        Type::VectorType { num_elements, .. } => Some(*num_elements),
+        _ => None,
+    };
     let base_ty = g.address.get_type(types);
-    if !matches!(base_ty.as_ref(), Type::VectorType { .. }) {
+    let Some(n) = lanes_of(base_ty.as_ref())
+        .or_else(|| (g.indices.iter()).find_map(|i| lanes_of(i.get_type(types).as_ref())))
+    else {
         return Ok(false);
+    };
+    // Each vector index's lanes, sign-extended to `i64` as a scalar index is; none for a scalar one.
+    let mut indices = Vec::with_capacity(g.indices.len());
+    for i in &g.indices {
+        let mut lanes = Vec::new();
+        if let Some(bits) = vec_int_lane_bits(i.get_type(types).as_ref()) {
+            for l in vec_explode(ctx, i, types, true)? {
+                lanes.push(match bits {
+                    64 => l,
+                    _ => emit_ext(ctx, l, bits, 64, true),
+                });
+            }
+        }
+        indices.push(lanes);
     }
-    if g.indices
-        .iter()
-        .any(|i| matches!(i.get_type(types).as_ref(), Type::VectorType { .. }))
-    {
-        return unsup("getelementptr with vector indices");
+    let bases = match lanes_of(base_ty.as_ref()) {
+        Some(_) => vec_explode(ctx, &g.address, types, false)?,
+        None => vec![ctx.operand(&g.address)?; n],
+    };
+    let mut out = Vec::with_capacity(n);
+    for (lane, b) in bases.into_iter().enumerate() {
+        out.push(gep_from(ctx, b, g, types, &indices, lane)?);
     }
-    let lanes = vec_explode(ctx, &g.address, types, false)?;
-    let mut out = Vec::with_capacity(lanes.len());
-    for b in lanes {
-        out.push(gep_from(ctx, b, g, types)?);
-    }
-    vec_implode(ctx, &g.dest, &out, base_ty.as_ref(), types)?;
+    let ptrs = types.vector_of(types.pointer(0), n, false);
+    vec_implode(ctx, &g.dest, &out, ptrs.as_ref(), types)?;
     Ok(true)
 }
 
@@ -22761,16 +22884,18 @@ fn translate_gep(
     types: &Types,
 ) -> Result<ValIdx, Error> {
     let base = ctx.operand(&g.address)?;
-    gep_from(ctx, base, g, types)
+    gep_from(ctx, base, g, types, &[], 0)
 }
 
-/// [`translate_gep`]'s offset walk from an explicit `base` address — also one lane of a pointer
-/// vector's GEP ([`lower_vector_gep`]).
+/// [`translate_gep`]'s offset walk from an explicit `base` address — also lane `lane` of a pointer
+/// vector's GEP ([`lower_vector_gep`]), where `lanes[k]` holds index `k`'s lanes if it is a vector.
 fn gep_from(
     ctx: &mut BlockCtx,
     base: ValIdx,
     g: &crate::ll::ast::GetElementPtr,
     types: &Types,
+    lanes: &[Vec<ValIdx>],
+    lane: usize,
 ) -> Result<ValIdx, Error> {
     let mut addr = base;
     let mut cur = g.source_element_type.clone();
@@ -22809,6 +22934,18 @@ fn gep_from(
                     cur = element_type.clone();
                     s
                 }
+                // A vector's lane through memory (`getelementptr [16 x <4 x i32>], ptr %v, i64 0,
+                // i64 %i, i64 1`: clang reading a lane of a vector it keeps in memory, #2682) is
+                // an array's element: lanes of whole bytes lie at their size apart.
+                Type::VectorType {
+                    element_type,
+                    scalable: false,
+                    ..
+                } if int_bits(element_type.as_ref()).is_none_or(|b| b % 8 == 0) => {
+                    let s = type_size(element_type.as_ref(), types)?;
+                    cur = element_type.clone();
+                    s
+                }
                 other => return unsup(format!("GEP into type {other} (Milestone 1+)")),
             }
         };
@@ -22820,12 +22957,17 @@ fn gep_from(
             }
         }
         // Variable index → `addr += sext_i64(idx) * stride`.
-        let bits = src_bits(idx, types)?;
-        let iv = ctx.operand(idx)?;
-        let iv64 = if bits >= 64 {
-            iv
-        } else {
-            emit_ext(ctx, iv, bits, 64, true)
+        let iv64 = match lanes.get(k).and_then(|l| l.get(lane)) {
+            Some(&l) => l,
+            None => {
+                let bits = src_bits(idx, types)?;
+                let iv = ctx.operand(idx)?;
+                if bits >= 64 {
+                    iv
+                } else {
+                    emit_ext(ctx, iv, bits, 64, true)
+                }
+            }
         };
         let sv = ctx.const_i64(stride as i64);
         let term = ctx.mul_i64(iv64, sv);
