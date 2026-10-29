@@ -2053,10 +2053,29 @@ auto-vectorizer emits **per-lane-varying constant** amounts (xxHash's `<1,7,12,1
 scalarizes the **rotate idiom** (`a == b`, the only funnel-shift form clang emits for `(x<<n)|(x>>(w-n))`)
 lane-wise: explode the data + amount lanes (reusing slice AP's `vec_explode_int`), rotate each lane with
 the scalar `IntBin Rotl`/`Rotr` (count masked mod lane width — no shift-by-width edge), and repack the
-`v128` (`build_v128_from_lanes`). Handled in `lower_int_intrinsic`'s `vec128` branch; a general
-(non-rotate) or float-shape funnel shift stays `Unsupported`.
+`v128` (`build_v128_from_lanes`). Handled in `lower_int_intrinsic`'s `vec128` branch; a float-shape
+funnel shift stays `Unsupported`.
 - Test: `simd_vector_rotate_fshl` — a `(x<<13)|(x>>19)` rotate loop (`check_vectorized_vs_native`,
   vectorization enabled, verified to emit `llvm.fshl.v4i32`), vs native. 126 translate tests green.
+- *Since #2682:* a **uniform** amount (a constant splat, as a rotate by a constant compiles: BLAKE3's
+  16, 12, 8 and 7 over `u32x4` lanes) lowers to two native `VShift`s and an `Or`, for the rotate and
+  the general funnel shift alike, every lane width; only per-lane amounts are scalarized.
+
+**#2682 (DONE) — what rustc's vectorizers emit.** unir's Rust guests built with LLVM's vectorizers on
+reached two forms no C corpus had. **Vector saturating add and sub** (`llvm.{u,s}{add,sub}.sat`,
+rustc's SLP vectorizer on `saturating_sub` of `usize` pairs): byte and half-word lanes take the native
+`VSatBin`; wider unsigned lanes clamp through min/max (`usub.sat(a, b) = max_u(a, b) − b`,
+`uadd.sat(a, b) = min_u(a, !b) + b`); wider signed lanes are scalarized through the scalar lowering
+(`emit_wide_sat`). **A GEP with vector indices** (`getelementptr i8, ptr %p, <2 x i64> <i64 0, i64 56>`,
+the loop vectorizer stepping two pointers): `lower_vector_gep` runs the scalar offset walk once a lane
+with each vector operand's lane in its place, for a vector base, vector indices, or both (#1993 had the
+vector base alone). **A GEP into a vector's lane** through memory (`getelementptr [16 x <4 x i32>],
+ptr %v, i64 0, i64 %i, i64 1`, clang reading a lane of a vector it keeps in memory) steps the lanes as
+an array's elements, for whole-byte lanes. Tests: `vector_saturating_add_and_sub`, `vector_funnel_shift_by_a_splat` (and
+that it emits no scalar rotate), `vector_gep_over_vector_indices` (interp == JIT), and
+`vector_rotates_and_saturation_vs_native` (a BLAKE3 quarter round, saturating loops and lanes read
+through memory, vs native). A BLAKE3 compression over four `u32` lanes runs about 4× faster on the JIT
+with the rotates as shifts (0.23–0.30 s → 0.067–0.071 s for 200,000; native 0.041 s).
 
 **Slice AR (DONE) — general constant-mask wide shuffle (`shufflevector`).** The third vector-op class
 (lands `vm_async_io_runtime` when vectorized). The single-`v128` `shufflevector` already lowered to
