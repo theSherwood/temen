@@ -13,8 +13,8 @@
 //! spawned OS thread before tearing the run down, so nothing outlives the window/code.
 //!
 //! Detect-and-kill (§5): a guest memory fault on any vCPU `siglongjmp`s out of that thread's guarded
-//! call; the thread records the trap in its completion cell + the shared trap cell, and the joiner
-//! propagates it. The **fuel/epoch kill-path** for a *runaway* (non-faulting) guest works across the
+//! call; the thread records the trap in its completion cell and raises it as the domain's end, and
+//! the joiner propagates it. The **fuel/epoch kill-path** for a *runaway* (non-faulting) guest works across the
 //! whole domain: the lowering polls a host-owned interrupt cell at loop back-edges + function entries
 //! and traps `OutOfFuel` when the host sets it (see `compile_and_run_with_host_interruptible` /
 //! `emit_epoch_check`). Because every vCPU runs the same finalized code, a *spinning* sibling polls
@@ -27,15 +27,16 @@
 //! death-is-revocation): a trap or `exit` from **any** vCPU — and the **root vCPU's completion**,
 //! clean return included — ends the whole domain: sibling vCPUs, RUNNING or PARKED, unwind and
 //! their outcomes are unobservable ("root completion ends the activation; the owner's departure
-//! ends the domain"). The mechanism is the shared trap cell + the emitted trap-propagation guard: a
-//! trap/exit is already in the cell, and a clean root return stores the internal
-//! [`crate::DOMAIN_DONE_CODE`] sentinel ([`Domain::begin_teardown`]); every park site (futex `wait`,
-//! `thread.join`) returns on observing a non-zero cell — woken promptly by
-//! [`Domain::wake_all_parked`] — so the caller's trailing guard unwinds it at its next safepoint. A
-//! *running* vCPU reaches no park site, so code that runs beside other vCPUs polls the same cell at
-//! every loop back-edge and on entry to a function that tail-calls (`emit_domain_poll`), and
-//! unwinds from there. A §14 child has a cell of its own, which the parent's teardown sets
-//! (`ChildExec::shutdown_and_join`). A
+//! ends the domain"). The mechanism is the domain's end ([`crate::VmCtx`]) + the emitted
+//! trap-propagation guard: a trap/exit is already raised there, and a clean root return raises the
+//! internal [`crate::DOMAIN_DONE_CODE`] sentinel ([`Domain::begin_teardown`]); every park site
+//! (futex `wait`, `thread.join`) returns on observing the end — woken promptly by
+//! [`Domain::wake_all_parked`] — and the guard after that host call reads the end and unwinds the
+//! caller. A *running* vCPU reaches no park site, so code that runs beside other vCPUs polls the end
+//! at every loop back-edge and on entry to a function that tail-calls (`emit_domain_poll`), and
+//! unwinds from there. Each vCPU runs on a context of its own, so that it charges a fuel cell of its
+//! own; the contexts share the end (#2488). A §14 child's domain has an end of its own, which the
+//! parent's teardown raises (`ChildExec::shutdown_and_join`). A
 //! durable **freeze** is *not* teardown: the root unwinds under `UNWINDING` and parked siblings
 //! return through the freeze re-issue machinery instead (the sentinel is skipped).
 
@@ -135,8 +136,8 @@ impl Env {
 }
 
 // SAFETY: `Env`'s raw pointers refer to the run's shared window / context, valid for the whole run.
-// The context's one concurrently written field, the trap cell, is atomic; the window is the shared
-// guest memory.
+// The context's concurrently written words, the domain's end and the stop word, are atomic; the
+// window is the shared guest memory.
 unsafe impl Send for Env {}
 unsafe impl Sync for Env {}
 
@@ -583,6 +584,22 @@ pub(crate) struct Domain {
     /// it lives: a run's own (the embedder's grant, #2113) or a detached child's. `None` for shared
     /// code's ([`Self::fresh`]), which spawns nothing.
     node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
+    /// #2488 — the contexts this run's ended vCPUs left, for the next spawn to reuse
+    /// ([`Self::take_vcpu_ctx`]). Emptied when a run starts ([`Self::set_env`]): each points at its
+    /// run's end. Boxed, since code holds each context's address while the list grows.
+    #[allow(clippy::vec_box)]
+    vcpu_ctxs: Mutex<Vec<Box<VcpuCtx>>>,
+}
+
+/// #2488 — a spawned vCPU's own context ([`crate::VmCtx::vcpu`]) and the fuel cell it charges: the
+/// vCPUs of a domain once shared one cell, and every fuel check stored to its cache line. Boxed,
+/// since compiled code holds the context's address, and a fiber the vCPU made goes on holding it
+/// after the vCPU ends, charging its cell wherever it runs. So an ended vCPU's context is kept for
+/// the next spawn, not freed, and the run frees them all when its vCPUs are joined.
+struct VcpuCtx {
+    vm: crate::VmCtx,
+    /// `None` when the run is unmetered, or meters a fixed allowance, which every vCPU shares.
+    cell: Option<Box<crate::FuelCell>>,
 }
 
 /// One vCPU's join table on the durable single-worker path (slice 3.4): its spawned children's
@@ -859,6 +876,7 @@ impl Domain {
             lane_chain: Mutex::new(Vec::new()),
             hub: 0,
             node,
+            vcpu_ctxs: Mutex::new(Vec::new()),
         }
     }
 
@@ -888,6 +906,34 @@ impl Domain {
         if let Some(n) = &self.node {
             n.vcpu_ended();
         }
+    }
+
+    /// #2488 — a context for a vCPU about to enter guest code: one an ended vCPU of this run left,
+    /// or a new one over `env`'s instance, with a fuel cell of its own drawing from the root's chain.
+    fn take_vcpu_ctx(&self, env: &Env) -> Box<VcpuCtx> {
+        if let Some(c) = lock(&self.vcpu_ctxs).pop() {
+            return c;
+        }
+        let root = env.ctx();
+        // SAFETY: a non-null `fuel` is the run's live cell, which outlives the run's vCPUs.
+        let mut cell = unsafe { root.fuel.as_ref() }.and_then(crate::FuelCell::sibling);
+        let fuel = cell
+            .as_deref_mut()
+            .map_or(root.fuel, |c| c as *mut crate::FuelCell);
+        Box::new(VcpuCtx {
+            vm: root.vcpu(fuel),
+            cell,
+        })
+    }
+
+    /// #2488 — a vCPU ended: its cell hands back what it did not burn, and its context waits for
+    /// the next spawn.
+    fn put_vcpu_ctx(&self, mut ctx: Box<VcpuCtx>) {
+        if let Some(cell) = ctx.cell.as_deref_mut() {
+            // SAFETY: a live cell; a fiber still charging it is `settle`'s documented race.
+            unsafe { crate::FuelCell::settle(cell) };
+        }
+        lock(&self.vcpu_ctxs).push(ctx);
     }
 
     /// The domain holding the futex, park count, lanes and run-wide live count this one uses:
@@ -930,7 +976,8 @@ impl Domain {
         mem_base: u64,
         fn_table_base: u64,
         // The instance the domain's vCPUs run as — the one whose window and powerbox they share, and
-        // whose trap cell holds the domain's end.
+        // whose context owns the domain's end. Each spawned vCPU runs on a context of its own over
+        // it (#2488).
         vmctx: *const crate::VmCtx,
         call_tramp: Option<FiberCallTramp>,
         fault: (usize, usize),
@@ -940,6 +987,7 @@ impl Domain {
         durable: bool,
         shadow: temen_ir::durable_abi::ShadowArena,
     ) {
+        lock(&self.vcpu_ctxs).clear();
         *lock(&self.env) = Some(Env {
             mem_base,
             fn_table_base,
@@ -1547,7 +1595,14 @@ pub(crate) fn on_spawned_vcpu() -> bool {
 
 fn run_child(a: SpawnArgs) {
     SPAWNED_VCPU.with(|c| c.set(true));
-    let env = a.env;
+    // SAFETY: `a.dom` is the run's live `Domain` (joined at run end).
+    let dom = unsafe { &*a.dom };
+    // #2488 — this vCPU enters guest code on a context of its own, charging a fuel cell of its own.
+    let own = dom.take_vcpu_ctx(&a.env);
+    let env = Env {
+        vm: &own.vm as *const crate::VmCtx as u64,
+        ..a.env
+    };
     // #1469 — this vCPU's thunks act in the domain that spawned it (a §14 child's, or the run's).
     set_current_domain(a.dom);
     // §12 seed this vCPU's per-vCPU TLS register to its dense id before any guest code runs.
@@ -1613,9 +1668,7 @@ fn run_child(a: SpawnArgs) {
 
     // D66 — parallelism is a granted resource, bounded at dispatch. A spawned vCPU is 1:1 with an
     // OS thread (D56 is unchanged), but it may only *run* while its domain's lane has room: the
-    // thread exists, it simply queues. Unbounded runs (no cap) skip this entirely. SAFETY: `a.dom`
-    // is the run's live `Domain`, joined before it drops.
-    let dom = unsafe { &*a.dom };
+    // thread exists, it simply queues. Unbounded runs (no cap) skip this entirely.
     let chain = dom.lane_chain();
     let got_lane = dom.lane_acquire(&chain, || {
         epoch_fired(env.epoch_addr) || env.ctx().ended().is_some()
@@ -1743,6 +1796,7 @@ fn run_child(a: SpawnArgs) {
             unsafe { (*a.dom).hub().publish_trap_capture(cap) };
         }
     }
+    dom.put_vcpu_ctx(own);
     // §15: free this vCPU's concurrent-live slot (and a §14 child's run-wide one) and publish its
     // result. The domain outlives all spawned threads, so the pointer is live. SAFETY: `a.dom` is the
     // run's `Domain` (joined at run end).
@@ -2009,6 +2063,12 @@ impl Domain {
         arg: u64,
         vcpu_id: i64,
     ) -> (i64, i64, bool) {
+        // #2488 — a context and fuel cell of its own, as a child on its own OS thread has.
+        let own = self.take_vcpu_ctx(&env);
+        let env = Env {
+            vm: &own.vm as *const crate::VmCtx as u64,
+            ..env
+        };
         // §12 this inline child runs on *this* (the root's) OS thread, so seed its per-vCPU TLS id and
         // restore the caller's afterward — a real OS-thread child gets its own thread-local in `run_child`.
         let prev_tls = crate::vcpu_tls::get();
@@ -2084,6 +2144,7 @@ impl Domain {
         } else {
             (call.ret, env.ctx().ended().unwrap_or(0))
         };
+        self.put_vcpu_ctx(own);
         (result, trap, faulted)
     }
 
@@ -2503,7 +2564,7 @@ pub(crate) unsafe extern "C" fn thread_join(
             // Owner decision 2026-07-24 (domain teardown; DESIGN.md §12, D37 death-is-revocation): a
             // trap/exit from any vCPU — or the root's completion (the internal DOMAIN_DONE sentinel) —
             // ends the domain; sibling outcomes are unobservable past teardown. Return so the join's
-            // trailing trap-propagation guard (which checks this same cell) unwinds this thread.
+            // trailing trap-propagation guard (which reads the domain's end) unwinds this thread.
             // Woken promptly by [`Domain::wake_all_parked`].
             if vm.ended().is_some() {
                 return 0;
@@ -2683,9 +2744,10 @@ pub(crate) unsafe extern "C" fn thread_wait(
         // notify; `live == parked` ⇒ every live vCPU is blocked (a lone or **mutual** deadlock).
         || hub.peers_live(),
         // Owner decision 2026-07-24 (domain teardown): return once the **caller's own** instance
-        // (`vm`) has ended ([`crate::VmCtx::ended`]), its trap cell being the one this waiter's
-        // trailing guard checks, so the wake always unwinds the right thread (a §14 child parked on
-        // the shared futex has its own cell and is untouched by a parent-domain teardown, as before).
+        // (`vm`) has ended ([`crate::VmCtx::ended`]), its domain's end being the one this waiter's
+        // trailing guard reads, so the wake always unwinds the right thread (a §14 child parked on
+        // the shared futex has its own domain's end and is untouched by a parent-domain teardown, as
+        // before).
         || vm.ended().is_some(),
     );
     // Back from the park: re-take the lane before any guest code runs again. An abort (kill or a
@@ -3075,10 +3137,10 @@ fn futex_wait(
     // a `notify`). An infinite wait whose `peers_live()` is false (every live vCPU is blocked) can never
     // be satisfied → [`WAIT_DEADLOCK`].
     peers_live: impl Fn() -> bool,
-    // Owner decision 2026-07-24 (domain teardown): `true` once **this waiter's own** trap cell is
-    // non-zero — a trap/exit from any vCPU of its domain, or the root-completed
-    // [`crate::DOMAIN_DONE_CODE`] sentinel. The waiter returns as if woken; its caller's trailing
-    // trap-propagation guard checks the same cell and unwinds it before the guest observes the status.
+    // Owner decision 2026-07-24 (domain teardown): `true` once **this waiter's own** domain has
+    // ended — a trap/exit from any of its vCPUs, or the root-completed [`crate::DOMAIN_DONE_CODE`]
+    // sentinel. The waiter returns as if woken; its caller's trailing trap-propagation guard reads the
+    // same end and unwinds it before the guest observes the status.
     torn_down: impl Fn() -> bool,
 ) -> i32 {
     let mut g = lock(futex);
@@ -3132,7 +3194,7 @@ fn futex_wait(
         }
         // Owner decision 2026-07-24 (domain teardown; DESIGN.md §12, D37 death-is-revocation): the
         // domain is over — a trap/exit from any vCPU, or the root's completion (the internal
-        // DOMAIN_DONE sentinel), sits in this waiter's trap cell. Return as if woken; the caller's
+        // DOMAIN_DONE sentinel), is this waiter's domain's end. Return as if woken; the caller's
         // trailing trap-propagation guard unwinds it. Re-checked on every [`Domain::wake_all_parked`]
         // broadcast, so a PARKED sibling observes teardown promptly even with no kill-path armed.
         if torn_down() {

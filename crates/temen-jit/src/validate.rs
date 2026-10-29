@@ -382,6 +382,9 @@ pub(crate) mod x86 {
         Epoch,
         /// The #932 signal `armed` flag, a byte, read.
         SigArmed,
+        /// #2488 — the domain's end word (`VmCtx`'s `end`): read by the check after a host call and
+        /// by a loop's poll, and compared-and-swapped by a raise.
+        End,
     }
 
     /// How many spill slots the state tracks. Register allocation spills a context param (mem_base
@@ -1734,7 +1737,7 @@ pub(crate) mod x86 {
     }
 
     /// A vmctx field compiled code may access at offset `disp`: whether it may write it (only the
-    /// trap cell, offset 0), and what an 8-byte load of it yields — a host cell compiled code reads,
+    /// stop word, offset 0), and what an 8-byte load of it yields — a host cell compiled code reads,
     /// or an opaque pointer it only hands to host functions. `None` for any other offset.
     fn vmctx_field(disp: i64) -> Option<(bool, Fact)> {
         use crate::vmctx as v;
@@ -1751,6 +1754,7 @@ pub(crate) mod x86 {
             d if d == i64::from(v::FUEL) => (false, Fact::Cell(Cell::Fuel)),
             d if d == i64::from(v::EPOCH) => (false, Fact::Cell(Cell::Epoch)),
             d if d == i64::from(v::SIG_ARMED) => (false, Fact::Cell(Cell::SigArmed)),
+            d if d == i64::from(v::END) => (false, Fact::Cell(Cell::End)),
             d if opaque.iter().any(|&o| i64::from(o) == d) => (false, Fact::Unknown),
             _ => return None,
         })
@@ -1768,6 +1772,7 @@ pub(crate) mod x86 {
             ],
             Cell::Epoch => &[(0, 8, false)],
             Cell::SigArmed => &[(0, 1, false)],
+            Cell::End => &[(0, 8, true)],
         }
     }
 
@@ -4681,7 +4686,7 @@ pub(crate) mod x86 {
         }
 
         /// vmctx and the host cells it points to: code reads their fields at fixed offsets and widths
-        /// and writes only the ones it owns (the trap cell, the fuel left). The fuel cell's refill is
+        /// and writes only the ones it owns (the stop word, the domain's end, the fuel left). The fuel cell's refill is
         /// a `PreserveAll` function, so mem_base survives a call to it; its `remaining` is a C
         /// function, so it doesn't.
         #[test]
@@ -4712,19 +4717,47 @@ pub(crate) mod x86 {
             ));
 
             let ok = [
-                0x31, 0xc0, // xor eax, eax
-                0xb9, 0x05, 0, 0, 0, // mov ecx, 5
-                0xf0, 0x48, 0x0f, 0xb1, 0x0a, // lock cmpxchg [rdx], rcx   (the trap cell)
-                0x48, 0x8b, 0x42, 0x10, // mov rax, [rdx + 0x10]   (vmctx.epoch)
-                0x48, 0x8b, 0x08, // mov rcx, [rax]
-                0x48, 0x8b, 0x42, 0x20, // mov rax, [rdx + 0x20]   (vmctx.sig_armed)
-                0x80, 0x38, 0x00, // cmp byte [rax], 0
+                0x31,
+                0xc0, // xor eax, eax
+                0xb9,
+                0x05,
+                0,
+                0,
+                0, // mov ecx, 5
+                0xf0,
+                0x48,
+                0x0f,
+                0xb1,
+                0x0a, // lock cmpxchg [rdx], rcx   (the stop word)
+                0x48,
+                0x8b,
+                0x42,
+                0x10, // mov rax, [rdx + 0x10]   (vmctx.epoch)
+                0x48,
+                0x8b,
+                0x08, // mov rcx, [rax]
+                0x48,
+                0x8b,
+                0x42,
+                0x20, // mov rax, [rdx + 0x20]   (vmctx.sig_armed)
+                0x80,
+                0x38,
+                0x00, // cmp byte [rax], 0
+                0x48,
+                0x8b,
+                0x42,
+                crate::vmctx::END as u8, // mov rax, [rdx + END]   (vmctx.end)
+                0xf0,
+                0x48,
+                0x0f,
+                0xb1,
+                0x08, // lock cmpxchg [rax], rcx   (the domain's end)
                 0xc3,
             ];
             let f = findings(&ok);
             assert!(
                 f.is_empty(),
-                "a read of the trap, epoch or signal cell was flagged: {f:?}"
+                "a raise, or a read of the epoch or signal cell, was flagged: {f:?}"
             );
             let cases: [(&[u8], &str); 4] = [
                 (
