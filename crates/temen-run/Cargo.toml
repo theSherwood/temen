@@ -75,6 +75,8 @@ libc = "0.2"
 # makes, removes, renames and lists on handles (`fs/win.rs`): `NtCreateFile` and
 # `NtSetInformationFile` (`Wdk_*`, `Win32_System_IO`, `Win32_System_Kernel`), and
 # `SetFileInformationByHandle` and `GetFileInformationByHandleEx` (`Win32_Storage_FileSystem`).
+# #2510: `replace` copies the target's DACL, `GetSecurityInfo` and `SetSecurityInfo`
+# (`Win32_Security_Authorization`).
 windows-sys = { version = "0.59", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
@@ -86,4 +88,5 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_Security",
+    "Win32_Security_Authorization",
 ] }

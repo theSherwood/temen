@@ -92,7 +92,7 @@
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec; // the `vec!` macro
 use alloc::vec::Vec;
-use core::cell::RefCell;
+use core::cell::{OnceCell, RefCell};
 
 use temen_ir::{
     BinOp, Block, CastOp, ConvOp, Func, Inst, IntTy, LoadOp, Module, StoreOp, Terminator, ValType,
@@ -633,29 +633,15 @@ pub fn specialize_with(
 /// segments are carried through, so any residual loads still resolve. With
 /// [`SpecConfig::outline_calls`] the residual is **multi-function** (the entry plus one specialized
 /// function per outlined `(callee, arg pattern)`); otherwise it is a single inlined function.
+///
+/// The functions it builds come out in dominance form (#2454). The ones it carries keep the form they
+/// came in.
 pub fn specialize_with_config(
     module: &Module,
     func: u32,
     args: &[SpecArg],
     config: &SpecConfig,
 ) -> Result<Module, SpecError> {
-    // The residual comes out in block-local form; it goes back in dominance form (#2454).
-    let mut residual = specialize_local(module, func, args, config)?;
-    residual.raise();
-    Ok(residual)
-}
-
-/// [`specialize_with_config`], before its residual is raised.
-fn specialize_local(
-    module: &Module,
-    func: u32,
-    args: &[SpecArg],
-    config: &SpecConfig,
-) -> Result<Module, SpecError> {
-    // The abstract interpreter keeps one block's values at a time: it reads a function whose blocks
-    // capture (#2454) in block-local form.
-    let local = temen_opt::block_local(module);
-    let module: &Module = &local;
     // Approach A: optionally rewrite dynamic-index `call.dyn`s into bounded direct-call
     // dispatch before specializing, so the engine folds through them (see `lower_indirect`). The
     // rewrite preserves function signatures/indices, so `func` and `args` still refer to the same
@@ -711,12 +697,7 @@ fn specialize_local(
         }
     }
 
-    let has_memory = module.memory.is_some();
-    let value_types: Vec<Vec<Vec<ValType>>> = module
-        .funcs
-        .iter()
-        .map(|f| func_value_types(f, &module.funcs, &module.types, has_memory))
-        .collect();
+    let source = Source::new(module);
 
     // When outlining, the renamed region's live abstract cells are threaded across each residual call
     // boundary (passed in as extra arguments, returned as extra results); see `outline_call`. The
@@ -756,26 +737,29 @@ fn specialize_local(
                 Some((ridx, pass)) => (Some(ridx), pass),
                 None => (None, false),
             };
-        let entry_func = build_func(
-            module,
-            config,
-            &value_types,
-            None,
-            func,
-            &entry_pattern,
-            &entry_mem,
-            &cut,
-            &deopt_targets,
-            deopt_handler,
-            deopt_pass_args,
-            false,
-        )?
-        .0;
-        // Carry every source function at its own index, but replace any function that reaches a host
-        // boundary (a `CallImport` / capability / symbol call) with a same-signature trap stub: a
-        // standalone residual can't verify an unresolved import, and such functions are never on the
-        // cut closure's execution path (they are the guest's I/O layer, not its allocator/GC). Their
-        // slots stay filled so every other function's indices — and the identity table — are unchanged.
+        let entry_func = raised(
+            build_func(
+                module,
+                config,
+                &source,
+                None,
+                func,
+                &entry_pattern,
+                &entry_mem,
+                &cut,
+                &deopt_targets,
+                deopt_handler,
+                deopt_pass_args,
+                false,
+            )?
+            .0,
+        );
+        // Carry every source function at its own index, in the form it came in (#2672), but replace
+        // any function that reaches a host boundary (a `CallImport` / capability / symbol call) with a
+        // same-signature trap stub: a standalone residual can't verify an unresolved import, and such
+        // functions are never on the cut closure's execution path (they are the guest's I/O layer, not
+        // its allocator/GC). Their slots stay filled so every other function's indices — and the
+        // identity table — are unchanged.
         // With [`SpecConfig::carry_keep_imports`] the import-bearing bodies are kept verbatim instead
         // of stubbed — for a residual meant to be **embedded back into a runnable module** (whose host
         // binds the imports), where the I/O layer must still work. The caller then re-attaches the
@@ -832,20 +816,16 @@ fn specialize_local(
             // driver numbers them differently, so the combination is rejected.
             return Err(SpecError::Unsupported);
         }
-        outline_funcs(
-            module,
-            config,
-            &value_types,
-            func,
-            entry_pattern,
-            &entry_mem,
-        )?
+        outline_funcs(module, config, &source, func, entry_pattern, &entry_mem)?
+            .into_iter()
+            .map(raised)
+            .collect()
     } else if carry_roots.is_empty() {
-        vec![
+        vec![raised(
             build_func(
                 module,
                 config,
-                &value_types,
+                &source,
                 None,
                 func,
                 &entry_pattern,
@@ -857,7 +837,7 @@ fn specialize_local(
                 false,
             )?
             .0,
-        ]
+        )]
     } else {
         // Reserve residual index 0 for the specialized entry, then carry each root and its transitive
         // direct-call closure verbatim at indices 1.. — so an opaque cut `call` / deopt tail-call
@@ -877,11 +857,11 @@ fn specialize_local(
                 Some((ridx, pass)) => (Some(ridx), pass),
                 None => (None, false),
             };
-        let mut funcs = vec![
+        let mut funcs = vec![raised(
             build_func(
                 module,
                 config,
-                &value_types,
+                &source,
                 None,
                 func,
                 &entry_pattern,
@@ -893,7 +873,7 @@ fn specialize_local(
                 false,
             )?
             .0,
-        ];
+        )];
         for &orig in &carried {
             funcs.push(carry_func(&module.funcs[orig as usize], &cut)?);
         }
@@ -930,7 +910,7 @@ fn specialize_local(
 fn build_func(
     module: &Module,
     config: &SpecConfig,
-    value_types: &[Vec<Vec<ValType>>],
+    source: &Source<'_>,
     outline: Option<&RefCell<OutlineState>>,
     callee: u32,
     pattern: &ParamPattern,
@@ -976,7 +956,7 @@ fn build_func(
         module,
         config,
         regions: all_regions(config),
-        value_types,
+        source,
         outline,
         selective,
         thread_cells,
@@ -1056,7 +1036,7 @@ fn build_func(
 fn outline_funcs(
     module: &Module,
     config: &SpecConfig,
-    value_types: &[Vec<Vec<ValType>>],
+    source: &Source<'_>,
     entry: u32,
     entry_pattern: ParamPattern,
     entry_mem: &MemPattern,
@@ -1080,7 +1060,7 @@ fn outline_funcs(
     let (entry_func, _) = build_func(
         module,
         config,
-        value_types,
+        source,
         Some(&state),
         entry,
         &entry_pattern,
@@ -1123,7 +1103,7 @@ struct OutlineState {
 fn request_outline(
     module: &Module,
     config: &SpecConfig,
-    value_types: &[Vec<Vec<ValType>>],
+    source: &Source<'_>,
     state: &RefCell<OutlineState>,
     callee: u32,
     arg_pat: ParamPattern,
@@ -1152,7 +1132,7 @@ fn request_outline(
     let (func, sig) = build_func(
         module,
         config,
-        value_types,
+        source,
         Some(state),
         callee,
         &key.1,
@@ -1192,6 +1172,62 @@ fn dyn_args(args_abs: &[Abs]) -> Vec<u32> {
         .collect()
 }
 
+/// The source functions as the specializer reads them. It keeps one block's values at a time, so it
+/// reads a function whose blocks capture (#2454) in block-local form. Each function is localized, and
+/// its values typed, the first time the specializer reads it: a specialization pays for the functions
+/// it reads, not for the module (#2672).
+struct Source<'a> {
+    module: &'a Module,
+    /// Each function, once read.
+    read: Vec<OnceCell<Read>>,
+}
+
+/// A source function as the specializer read it.
+struct Read {
+    /// Its block-local form: `None` where it captures nothing, so is read as it is.
+    local: Option<Func>,
+    /// Its values' types per block.
+    types: Vec<Vec<ValType>>,
+}
+
+impl<'a> Source<'a> {
+    fn new(module: &'a Module) -> Self {
+        Source {
+            module,
+            read: module.funcs.iter().map(|_| OnceCell::new()).collect(),
+        }
+    }
+
+    /// Function `f` in block-local form, and its values' types per block.
+    fn func(&self, f: u32) -> Option<(&Func, &[Vec<ValType>])> {
+        let m = self.module;
+        let src = m.funcs.get(f as usize)?;
+        let read = self.read[f as usize].get_or_init(|| {
+            let types = |g: &Func| func_value_types(g, &m.funcs, &m.types, m.memory.is_some());
+            if src.blocks.iter().all(|b| b.captures.is_empty()) {
+                return Read {
+                    local: None,
+                    types: types(src),
+                };
+            }
+            let mut local = src.clone();
+            local.localize(&types(src));
+            Read {
+                types: types(&local),
+                local: Some(local),
+            }
+        });
+        Some((read.local.as_ref().unwrap_or(src), &read.types))
+    }
+}
+
+/// A function the specializer built, in dominance form (#2454). It builds one residual block at a
+/// time, threading every value a block uses through its params.
+fn raised(mut f: Func) -> Func {
+    f.raise();
+    f
+}
+
 struct Spec<'a> {
     module: &'a Module,
     config: &'a SpecConfig,
@@ -1199,9 +1235,9 @@ struct Spec<'a> {
     /// [`SpecConfig::rename_extra`], precomputed once. An access is renamed if it lies fully within
     /// any one; disjoint only if disjoint from all.
     regions: Vec<(u64, u64)>,
-    /// Per-function, per-block, per-value source types (`value_types[func][block][value_idx]`) —
-    /// used to type the SSA values threaded into a residual block as block parameters.
-    value_types: &'a [Vec<Vec<ValType>>],
+    /// The source functions as the specializer reads them ([`Source`]). Their values' types type the
+    /// SSA values threaded into a residual block as block parameters.
+    source: &'a Source<'a>,
     /// `Some` ⇒ outline calls into shared residual functions via this state; `None` ⇒ inline them.
     outline: Option<&'a RefCell<OutlineState>>,
     /// Selective outlining: inline calls, outlining only unbounded-recursion back-edges. Implies
@@ -1301,7 +1337,7 @@ impl Spec<'_> {
     }
 
     fn build_block(&mut self, task: Task) -> Result<temen_ir::Block, SpecError> {
-        let module = self.module;
+        let source = self.source;
         let task_is_deopt_edge = task.deopt;
 
         // Reconstruct every frame's env and the memory cells from the context, assigning a fresh
@@ -1313,7 +1349,7 @@ impl Spec<'_> {
         let mut rnext: u32 = 0;
         let mut frames: Vec<FrameAbs> = Vec::with_capacity(task.frames.len());
         for fr in &task.frames {
-            let types = &self.value_types[fr.func as usize][fr.block as usize];
+            let types = &source.func(fr.func).ok_or(SpecError::BadFunc)?.1[fr.block as usize];
             let mut env = Vec::with_capacity(fr.env.len());
             for (i, slot) in fr.env.iter().enumerate() {
                 match slot {
@@ -1422,7 +1458,8 @@ impl Spec<'_> {
             }
         }
 
-        let src = &module.funcs[active_func as usize].blocks[active_block as usize];
+        let src =
+            &source.func(active_func).ok_or(SpecError::BadFunc)?.0.blocks[active_block as usize];
         let mut out: Vec<Inst> = Vec::new();
         let mut fuel = INLINE_FUEL;
         // `frames` is now exactly the suspended ancestors; together with `(active_func, active_entry)`
@@ -1655,7 +1692,7 @@ impl Spec<'_> {
         let (ridx, out_sig) = request_outline(
             self.module,
             self.config,
-            self.value_types,
+            self.source,
             state,
             callee,
             arg_pat,
@@ -2127,10 +2164,10 @@ impl Spec<'_> {
         fuel: &mut usize,
     ) -> Result<Vec<Abs>, InlineErr> {
         let g = self
-            .module
-            .funcs
-            .get(func as usize)
-            .ok_or(InlineErr::Spec(SpecError::BadFunc))?;
+            .source
+            .func(func)
+            .ok_or(InlineErr::Spec(SpecError::BadFunc))?
+            .0;
         let mut cur_args: Vec<Abs> = args_abs.to_vec();
         let mut block_idx = 0u32;
         loop {
@@ -2952,7 +2989,7 @@ impl Spec<'_> {
                 let (ridx, _) = request_outline(
                     self.module,
                     self.config,
-                    self.value_types,
+                    self.source,
                     state,
                     callee,
                     arg_pattern(args_abs),
@@ -3484,7 +3521,7 @@ fn direct_callees(f: &Func) -> Result<Vec<u32>, SpecError> {
 
 /// Carry a cut callee into the residual verbatim, rewriting its direct-call targets from source
 /// indices to residual indices via `cut`. Every callee it references was included in the carry
-/// closure, so each target is present in the map.
+/// closure, so each target is present in the map. It keeps the form it came in (#2672).
 fn carry_func(f: &Func, cut: &BTreeMap<u32, u32>) -> Result<Func, SpecError> {
     let remap = |func: u32| -> Result<u32, SpecError> {
         cut.get(&func).copied().ok_or(SpecError::Unsupported)
@@ -3509,8 +3546,8 @@ fn carry_func(f: &Func, cut: &BTreeMap<u32, u32>) -> Result<Func, SpecError> {
             other => other.clone(),
         };
         blocks.push(temen_ir::Block {
-            parent: 0,
-            captures: vec![],
+            parent: b.parent,
+            captures: b.captures.clone(),
             params: b.params.clone(),
             insts,
             term,

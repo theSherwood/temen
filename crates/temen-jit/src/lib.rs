@@ -3716,12 +3716,18 @@ impl CompiledModule {
         // effect unless the env var is set; used to compare temen-jit's generated code against other
         // backends (e.g. the Embench cross-engine bench).
         let dump_codegen = std::env::var_os("TEMEN_JIT_DUMP_CLIF").is_some();
-        // #2603 — the §4 window geometry the machine-code validator re-proves window accesses
-        // against (memoryless module ⇒ `None`, no window to confine).
-        let win_layout = (mask != 0).then(|| validate::WindowLayout {
-            mask,
-            guard_offset: guard_offset_of(win_reserved as u64),
-        });
+        // #2603 — what the machine-code validator checks this module's code against: the §4 window
+        // geometry it re-proves window accesses against (memoryless module ⇒ `None`, no window to
+        // confine), the fn table's size, and the contract a `call.dyn` of each type reaches.
+        let dyn_contracts = type_contracts(&distinct);
+        let guest = validate::Guest {
+            window: (mask != 0).then(|| validate::WindowLayout {
+                mask,
+                guard_offset: guard_offset_of(win_reserved as u64),
+            }),
+            table: table_len as u64,
+            types: &dyn_contracts,
+        };
         let base_bytes = define_funcs(
             &mut module,
             &ids,
@@ -3819,7 +3825,7 @@ impl CompiledModule {
                     }
                 }
             },
-            win_layout,
+            &guest,
         )?;
         let mut ctx = module.make_context();
 
@@ -5390,11 +5396,17 @@ impl CompiledModule {
         let nesting = self.nesting;
         let callees = Callees::new(&mut *module, &ids, funcs, types, self.fast_resolver)?;
         // Byte-accurate occupancy: each function's emitted code size. A unit's code is not kept.
-        // #2603 — the validator re-proves this unit's window accesses against the parent's geometry.
-        let win_layout = (self.mask != 0).then(|| validate::WindowLayout {
-            mask: self.mask,
-            guard_offset: guard_offset_of(self.win_reserved as u64),
-        });
+        // #2603 — the validator checks this unit's code against the parent's window, fn table and
+        // types.
+        let dyn_contracts = type_contracts(&self.distinct);
+        let guest = validate::Guest {
+            window: (self.mask != 0).then(|| validate::WindowLayout {
+                mask: self.mask,
+                guard_offset: guard_offset_of(self.win_reserved as u64),
+            }),
+            table: self.fn_table_mask + 1,
+            types: &dyn_contracts,
+        };
         let extra_bytes = define_funcs(
             &mut *module,
             &ids,
@@ -5425,7 +5437,7 @@ impl CompiledModule {
                 )
             },
             |_, _, _| {},
-            win_layout,
+            &guest,
         )?;
         self.extra_bytes += extra_bytes;
         let mut ctx = module.make_context();
@@ -6531,14 +6543,6 @@ fn jit_isa() -> Result<cranelift_codegen::isa::OwnedTargetIsa, JitError> {
     // each pass, which names the pass that broke the CLIF.
     let per_pass = cfg!(any(debug_assertions, fuzzing));
     let _ = flags.set("enable_verifier", if per_pass { "true" } else { "false" });
-    // #2481 — when the machine-code validator runs, ask Cranelift to record each function's basic
-    // block start offsets (`CompiledCode::bb_starts`), the hints the validator checks control-flow
-    // targets against instead of recovering the CFG itself. Off otherwise, so a production compile
-    // that does not validate pays nothing. The flag adds metadata only; it does not change the code.
-    // Also on under `cfg(test)`, so the decoder/validator cross-check tests see real block layout.
-    if validate::enabled() || cfg!(test) {
-        let _ = flags.set("machine_code_cfg_info", "true");
-    }
     cranelift_native::builder()
         .map_err(|e| JitError::Backend(e.to_string()))?
         .finish(settings::Flags::new(flags))
@@ -6564,13 +6568,15 @@ fn define_funcs(
     code: &mut Codegen<'_>,
     lower: impl Fn(&mut cranelift_codegen::Context, usize) -> Result<(), JitError> + Sync,
     mut defined: impl FnMut(&JITModule, &CompiledCode, usize),
-    layout: Option<validate::WindowLayout>,
+    guest: &validate::Guest,
 ) -> Result<usize, JitError> {
     let keep = match code {
         Codegen::Replay(kept, imports) => return kept.replay(module, ids, imports),
         Codegen::Compile(keep) => keep,
     };
     let isa = jit_isa()?;
+    let contracts = callee_contracts(module);
+    let callee = &|id: u32| contracts.get(id as usize).copied().flatten();
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .clamp(1, ids.len().max(1));
@@ -6587,15 +6593,9 @@ fn define_funcs(
                     let mut ctx = cranelift_codegen::Context::new();
                     ctx.func.signature.call_conv = isa.default_call_conv();
                     lower(&mut ctx, i)?;
-                    let code = compile_verified(isa, &mut ctx, validate::Entry::Guest(layout))
-                        .map_err(JitError::Backend)?;
-                    let relocs = code
-                        .buffer
-                        .relocs()
-                        .iter()
-                        .map(|r| ModuleReloc::from_mach_reloc(r, &ctx.func, ids[i]))
-                        .collect();
-                    Ok((code, relocs))
+                    let entry = validate::Entry::Guest(guest);
+                    compile_verified(isa, &mut ctx, ids[i], entry, callee)
+                        .map_err(JitError::Backend)
                 }));
                 if done_tx.send((i, out)).is_err() {
                     break;
@@ -6620,13 +6620,14 @@ fn define_funcs(
                 #[cfg(test)]
                 record_emitted(module, code.code_buffer(), &relocs);
                 #[cfg(all(test, target_arch = "x86_64"))]
-                validate::capture_code(
-                    code.code_buffer(),
-                    &code.bb_starts,
-                    &code.bb_edges,
-                    validate::patches(relocs.iter().map(|r| (r.offset, r.kind))),
-                    layout,
-                );
+                validate::capture_code(validate::CapturedFn {
+                    code: code.code_buffer().to_vec(),
+                    relocs: validate::relocs(&relocs, callee, isa.default_call_conv()),
+                    window: guest.window,
+                    table: guest.table,
+                    types: guest.types.to_vec(),
+                    contract: callee(ids[next].as_u32()),
+                });
                 let kept = keep
                     .as_mut()
                     .is_some_and(|k| k.push(module, ids, align, code.code_buffer(), &relocs));
@@ -6661,13 +6662,16 @@ fn define_funcs(
 /// on the CLIF temen lowered, before Cranelift's passes rely on it being well formed, and on the CLIF
 /// those passes hand the backend. A lowering bug that makes malformed CLIF fails the compile there,
 /// and so does a pass that breaks it. With debug assertions and under the fuzzers, [`jit_isa`]'s
-/// `enable_verifier` also runs the verifier after each pass. No verifier sees the machine code the
-/// backend emits (#2481).
+/// `enable_verifier` also runs the verifier after each pass. Returns the code with the relocations
+/// that link it as function `id`. The machine-code validator (#2481) checks the code against those
+/// relocations and the contract `callee` gives each function a call names.
 fn compile_verified(
     isa: &dyn cranelift_codegen::isa::TargetIsa,
     ctx: &mut cranelift_codegen::Context,
+    id: FuncId,
     entry: validate::Entry,
-) -> Result<CompiledCode, String> {
+    callee: &(dyn Fn(u32) -> Option<validate::Contract> + Sync),
+) -> Result<(CompiledCode, Vec<ModuleReloc>), String> {
     let mut ctrl = cranelift_codegen::control::ControlPlane::default();
     ctx.verify(isa)
         .map_err(|e| format!("CLIF verifier, on the lowered CLIF: {e}"))?;
@@ -6679,22 +6683,49 @@ fn compile_verified(
         .compile_function(&ctx.func, &ctx.domtree, ctx.want_disasm, &mut ctrl)
         .map_err(|e| cranelift_module::ModuleError::from(e).to_string())?;
     let code = code.apply_params(&ctx.func.params);
+    let relocs: Vec<ModuleReloc> = code
+        .buffer
+        .relocs()
+        .iter()
+        .map(|r| ModuleReloc::from_mach_reloc(r, &ctx.func, id))
+        .collect();
     // #2481 — shadow-mode machine-code validation: check the emitted bytes against the policy and
     // log any disagreement, but never reject. `enabled()` is false on a production compile, so this
-    // is inert there; `jit_isa` only records `bb_starts`/`bb_edges` when it is true. `entry` says what
-    // is known of the function's entry: a guest function's window geometry, which the window-access
-    // policy re-proves against, or a trampoline's host ABI (#2603).
+    // is inert there. `entry` says what is known of the function's entry: a guest function's window
+    // geometry, which the window-access policy re-proves against, or a trampoline's host ABI (#2603).
     if validate::enabled() {
-        let patches = validate::patches(code.buffer.relocs().iter().map(|r| (r.offset, r.kind)));
-        validate::shadow_check(
-            code.code_buffer(),
-            &code.bb_starts,
-            &code.bb_edges,
-            &patches,
-            entry,
-        );
+        let checked = validate::relocs(&relocs, callee, isa.default_call_conv());
+        validate::shadow_check(code.code_buffer(), &checked, entry);
     }
-    Ok(code)
+    Ok((code, relocs))
+}
+
+/// #2603 — the contract of a function of each type id in `distinct` (its [`sig_from`]), which the
+/// machine-code validator gives a `call.dyn` whose type check matched. Empty when it doesn't run.
+fn type_contracts(distinct: &[FuncType]) -> Vec<Option<validate::Contract>> {
+    if !(validate::enabled() || cfg!(test)) {
+        return Vec::new();
+    }
+    distinct
+        .iter()
+        .map(|t| validate::contract(&sig_from(&t.params, &t.results)))
+        .collect()
+}
+
+/// #2603 — the contract of each function `module` declares, by `FuncId`, which the machine-code
+/// validator checks the calls that name it against. Empty when the validator doesn't run.
+fn callee_contracts(module: &JITModule) -> Vec<Option<validate::Contract>> {
+    let mut out = Vec::new();
+    if validate::enabled() || cfg!(test) {
+        for (id, decl) in module.declarations().get_functions() {
+            let i = id.as_u32() as usize;
+            if out.len() <= i {
+                out.resize(i + 1, None);
+            }
+            out[i] = validate::contract(&decl.signature);
+        }
+    }
+    out
 }
 
 /// Define `id` in `module` from `ctx`'s CLIF, compiled by [`compile_verified`], and return its code.
@@ -6707,14 +6738,10 @@ fn define_verified(
 ) -> Result<CompiledCode, JitError> {
     // Trampolines (cap thunks, fuel refill) are called under the host's ABI, not a guest function's
     // entry contract, so they get the validator's decode and control-flow layers only (#2603 PR 3).
-    let code =
-        compile_verified(module.isa(), ctx, validate::Entry::Host).map_err(JitError::Backend)?;
-    let relocs: Vec<ModuleReloc> = code
-        .buffer
-        .relocs()
-        .iter()
-        .map(|r| ModuleReloc::from_mach_reloc(r, &ctx.func, id))
-        .collect();
+    let contracts = callee_contracts(module);
+    let callee = |id: u32| contracts.get(id as usize).copied().flatten();
+    let (code, relocs) = compile_verified(module.isa(), ctx, id, validate::Entry::Host, &callee)
+        .map_err(JitError::Backend)?;
     module
         .define_function_bytes(
             id,
@@ -7181,7 +7208,11 @@ mod compile_verified_tests {
     fn malformed_clif_fails_the_compile_before_cranelifts_passes() {
         let isa = jit_isa().unwrap();
         let mut ctx = cranelift_codegen::Context::for_function(malformed(&*isa));
-        let err = compile_verified(&*isa, &mut ctx, validate::Entry::Host).unwrap_err();
+        let host = validate::Entry::Host;
+        let Err(err) = compile_verified(&*isa, &mut ctx, FuncId::from_u32(0), host, &|_| None)
+        else {
+            panic!("malformed CLIF compiled");
+        };
         assert!(
             err.starts_with("CLIF verifier, on the lowered CLIF"),
             "{err}"
@@ -7229,7 +7260,9 @@ mod compile_verified_tests {
     fn compile_verified_emits_what_cranelifts_compile_emits() {
         let isa = jit_isa().unwrap();
         let mut ours = cranelift_codegen::Context::for_function(summing(&*isa));
-        let code = compile_verified(&*isa, &mut ours, validate::Entry::Host).unwrap();
+        let host = validate::Entry::Host;
+        let (code, _) =
+            compile_verified(&*isa, &mut ours, FuncId::from_u32(0), host, &|_| None).unwrap();
         let mut theirs = cranelift_codegen::Context::for_function(summing(&*isa));
         let want = theirs.compile(&*isa, &mut Default::default()).unwrap();
         assert_eq!(code.code_buffer(), want.code_buffer());
@@ -7439,11 +7472,17 @@ fn compile_child_windowed(
     // the child spawns only when it uses them. Neither when no domain was supplied.
     let threads = futex_sched != 0;
     let spawns = threads && uses_threads;
-    // #2603 — the §14 child's own window geometry, for the validator's window-access re-proof.
-    let win_layout = (mask != 0).then(|| validate::WindowLayout {
-        mask,
-        guard_offset: guard_offset_of(reserved),
-    });
+    // #2603 — the §14 child's own window, fn table and types, which the validator checks its code
+    // against.
+    let dyn_contracts = type_contracts(&distinct);
+    let guest = validate::Guest {
+        window: (mask != 0).then(|| validate::WindowLayout {
+            mask,
+            guard_offset: guard_offset_of(reserved),
+        }),
+        table: fn_table_mask + 1,
+        types: &dyn_contracts,
+    };
     let base_bytes = define_funcs(
         &mut module,
         &ids,
@@ -7474,7 +7513,7 @@ fn compile_child_windowed(
             )
         },
         |_, _, _| {},
-        win_layout,
+        &guest,
     )?;
     let mut ctx = module.make_context();
     build_trampoline(

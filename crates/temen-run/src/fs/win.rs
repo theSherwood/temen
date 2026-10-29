@@ -8,29 +8,53 @@
 //! place: `mklink /J` makes a directory, then turns that directory into the link. A directory the
 //! host turns into a junction between the two lookups redirects the op out of the root. So each op
 //! here names what it acts on by one component relative to a handle, or acts on the handle itself.
+//!
+//! #2510 — `replace`'s steps too. It writes a temporary file beside the target and renames that
+//! file's handle over the target, rather than calling `ReplaceFileW`, which takes paths. The
+//! temporary file takes the target's DACL when it is made, and its attributes, creation time and
+//! named streams once written. It is held without sharing deletes until it is renamed: that is how a `replace`
+//! tells another's temporary file from one a crash left, which it can open to remove.
 
+use super::refuse;
 use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io;
 use std::mem::{offset_of, size_of};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::MetadataExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use temen_ir::errno::{EBUSY, EISDIR, EMLINK};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FileRenameInformation, NtCreateFile, NtSetInformationFile, FILE_CREATE, FILE_DIRECTORY_FILE,
-    FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
+    FileRenameInformation, FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
+    FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_RENAME_INFORMATION,
+    FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS, FILE_SYNCHRONOUS_IO_NONALERT,
 };
 use windows_sys::Win32::Foundation::{
-    RtlNtStatusToDosError, ERROR_ACCESS_DENIED, ERROR_DIRECTORY, ERROR_NO_MORE_FILES, NTSTATUS,
-    UNICODE_STRING,
+    LocalFree, RtlNtStatusToDosError, ERROR_ACCESS_DENIED, ERROR_DIRECTORY, ERROR_HANDLE_EOF,
+    ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NOT_SUPPORTED, ERROR_NO_MORE_FILES,
+    ERROR_SHARING_VIOLATION, ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, NTSTATUS,
+    STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED, UNICODE_STRING,
+};
+use windows_sys::Win32::Security::Authorization::{
+    GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT,
+};
+use windows_sys::Win32::Security::{
+    GetSecurityDescriptorControl, ACL, DACL_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+    UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FileDispositionInfo, FileFullDirectoryInfo, FileFullDirectoryRestartInfo,
-    GetFileInformationByHandleEx, SetFileInformationByHandle, DELETE, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FULL_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+    FileBasicInfo, FileDispositionInfo, FileFullDirectoryInfo, FileFullDirectoryRestartInfo,
+    FileStreamInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_ARCHIVE,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_SYSTEM,
+    FILE_ATTRIBUTE_TEMPORARY, FILE_BASIC_INFO, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FULL_DIR_INFO, FILE_INFO_BY_HANDLE_CLASS,
+    FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_STREAM_INFO, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
 };
 use windows_sys::Win32::System::Kernel::OBJ_CASE_INSENSITIVE;
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -38,7 +62,15 @@ use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 /// Make the directory `path` beneath `dir`, by name in the directory its parent resolves to.
 pub(super) fn mkdir(dir: &Dir, path: &str) -> io::Result<()> {
     let (parent, name) = parent_of(dir, path)?;
-    let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+    let flags = (FILE_LIST_DIRECTORY, FILE_CREATE, FILE_DIRECTORY_FILE);
+    create_at(&parent, OsStr::new(name), flags).map(drop)
+}
+
+/// `name` relative to the open `root`, a name in a directory or a stream of a file, opened or made
+/// by `NtCreateFile` with its `(access, disposition, options)`, sharing everything.
+fn create_at(root: &impl AsRawHandle, name: &OsStr, flags: (u32, u32, u32)) -> io::Result<File> {
+    let (access, disposition, options) = flags;
+    let mut wide: Vec<u16> = name.encode_wide().collect();
     let bytes =
         u16::try_from(wide.len() * 2).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     let name = UNICODE_STRING {
@@ -48,7 +80,7 @@ pub(super) fn mkdir(dir: &Dir, path: &str) -> io::Result<()> {
     };
     let attributes = OBJECT_ATTRIBUTES {
         Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-        RootDirectory: parent.as_raw_handle(),
+        RootDirectory: root.as_raw_handle(),
         ObjectName: &name,
         Attributes: OBJ_CASE_INSENSITIVE as u32,
         SecurityDescriptor: std::ptr::null(),
@@ -57,25 +89,24 @@ pub(super) fn mkdir(dir: &Dir, path: &str) -> io::Result<()> {
     let mut handle = std::ptr::null_mut();
     let mut status = io_status();
     // SAFETY: each pointer is to a local of the type NtCreateFile takes, live for the call:
-    // `attributes` names `name`, whose buffer is `wide`, relative to `parent`, an open directory.
+    // `attributes` names `name`, whose buffer is `wide`, relative to `root`, which is open.
     nt(unsafe {
         NtCreateFile(
             &mut handle,
-            FILE_LIST_DIRECTORY | SYNCHRONIZE,
+            access | SYNCHRONIZE,
             &attributes,
             &mut status,
             std::ptr::null(),
             FILE_ATTRIBUTE_NORMAL,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_CREATE,
-            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+            disposition,
+            options | FILE_SYNCHRONOUS_IO_NONALERT,
             std::ptr::null(),
             0,
         )
     })?;
     // SAFETY: NtCreateFile succeeded, so `handle` is an open handle no one else owns.
-    drop(unsafe { OwnedHandle::from_raw_handle(handle) });
-    Ok(())
+    Ok(unsafe { File::from_raw_handle(handle) })
 }
 
 /// Remove the file `path` beneath `dir`, or a link to a file, as `DeleteFileW` does: a directory,
@@ -98,9 +129,15 @@ pub(super) fn rmdir(dir: &Dir, path: &str) -> io::Result<()> {
     delete(&file)
 }
 
-/// Rename `from` beneath `dir` to `to` beneath it, replacing a file there, as `MoveFileExW` does.
+/// Rename `from` beneath `dir` to `to` beneath it, replacing a file there.
 pub(super) fn rename(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
-    let file = open_itself(dir, from)?;
+    rename_handle(&open_itself(dir, from)?, dir, to)
+}
+
+/// Rename what `file` is open on to `to` beneath `dir`, replacing a file there. With POSIX
+/// semantics where the volume has them, a file open elsewhere is replaced, as on Unix; where it
+/// doesn't, as `MoveFileExW` does.
+fn rename_handle(file: &File, dir: &Dir, to: &str) -> io::Result<()> {
     let (parent, name) = parent_of(dir, to)?;
     let name: Vec<u16> = OsStr::new(name).encode_wide().collect();
     // A FILE_RENAME_INFORMATION with the name in place of its one-element `FileName`, in u64s for
@@ -111,7 +148,7 @@ pub(super) fn rename(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
     // SAFETY: `buf` is `len` bytes, 8-aligned: the structure, and from `FileName` on the name's
     // `name.len()` u16s. Nothing else refers to it.
     unsafe {
-        (*info).Anonymous.ReplaceIfExists = 1;
+        (*info).Anonymous.Flags = FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;
         (*info).RootDirectory = parent.as_raw_handle();
         (*info).FileNameLength = (name.len() * 2) as u32;
         std::ptr::copy_nonoverlapping(
@@ -120,18 +157,30 @@ pub(super) fn rename(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
             name.len(),
         );
     }
-    let mut status = io_status();
-    // SAFETY: `file` is open with DELETE access, and `info` is a FILE_RENAME_INFORMATION of `len`
-    // bytes whose directory, `parent`, is open for the call.
-    nt(unsafe {
-        NtSetInformationFile(
-            file.as_raw_handle(),
-            &mut status,
-            info.cast(),
-            len as u32,
-            FileRenameInformation,
-        )
-    })
+    let set = move |class| {
+        let mut status = io_status();
+        // SAFETY: `file` is open with DELETE access, and `info` is a FILE_RENAME_INFORMATION of
+        // `len` bytes whose directory, `parent`, is open for the call.
+        unsafe {
+            NtSetInformationFile(
+                file.as_raw_handle(),
+                &mut status,
+                info.cast(),
+                len as u32,
+                class,
+            )
+        }
+    };
+    match set(FileRenameInformationEx) {
+        // Windows before 10 1607, or a volume without POSIX semantics (FAT): the classic rename,
+        // whose `ReplaceIfExists` is the flags' first byte.
+        STATUS_INVALID_INFO_CLASS | STATUS_INVALID_PARAMETER | STATUS_NOT_SUPPORTED => {
+            // SAFETY: as above; nothing else refers to `info`.
+            unsafe { (*info).Anonymous.Flags = FILE_RENAME_REPLACE_IF_EXISTS };
+            nt(set(FileRenameInformation))
+        }
+        status => nt(status),
+    }
 }
 
 /// The names in the directory `path` beneath `dir`, read a piece at a time as they are asked for.
@@ -163,7 +212,7 @@ impl Iterator for Names {
     fn next(&mut self) -> Option<io::Result<OsString>> {
         loop {
             if let Some(at) = self.next {
-                let record = record(&self.buf, at);
+                let record = record(&self.buf, at, DIR_RECORD);
                 let Some((step, wide)) = record else {
                     self.done = true;
                     self.next = None;
@@ -201,25 +250,322 @@ impl Iterator for Names {
     }
 }
 
-/// The `FILE_FULL_DIR_INFO` record at byte `at` of `buf`: the offset of the next one (0 if none),
+/// Where a record's fields are: the offset of the next record, its name's length, and its name.
+type Layout = (usize, usize, usize);
+const DIR_RECORD: Layout = (
+    offset_of!(FILE_FULL_DIR_INFO, NextEntryOffset),
+    offset_of!(FILE_FULL_DIR_INFO, FileNameLength),
+    offset_of!(FILE_FULL_DIR_INFO, FileName),
+);
+const STREAM_RECORD: Layout = (
+    offset_of!(FILE_STREAM_INFO, NextEntryOffset),
+    offset_of!(FILE_STREAM_INFO, StreamNameLength),
+    offset_of!(FILE_STREAM_INFO, StreamName),
+);
+
+/// The record laid out as `layout` at byte `at` of `buf`: the offset of the next one (0 if none),
 /// and its name. `None` if the record runs past the buffer.
-fn record(buf: &[u64], at: usize) -> Option<(usize, Vec<u16>)> {
+fn record(buf: &[u64], at: usize, layout: Layout) -> Option<(usize, Vec<u16>)> {
     // SAFETY: `buf`'s memory is `buf.len() * 8` initialized bytes, at a looser alignment.
     let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf.len() * 8) };
     let field = |off: usize| {
         let b = bytes.get(at + off..at + off + 4)?;
         Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
     };
-    let step = field(offset_of!(FILE_FULL_DIR_INFO, NextEntryOffset))?;
-    let len = field(offset_of!(FILE_FULL_DIR_INFO, FileNameLength))?;
-    let from = at + offset_of!(FILE_FULL_DIR_INFO, FileName);
-    let name = bytes.get(from..from + len)?;
+    let (next, len, name) = layout;
+    let step = field(next)?;
+    let len = field(len)?;
+    let name = bytes.get(at + name..at + name + len)?;
     Some((
         step,
         name.chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect(),
     ))
+}
+
+/// The file `name` in `dir`, open to read its protection from, or `None` if there is none.
+/// Refused: a directory, a file with other hard links (R1), and a file the process may not write
+/// in place: one marked read-only or whose DACL denies it writing, or (`-EBUSY`) one open
+/// elsewhere without sharing writes.
+pub(super) fn target(dir: &Dir, name: &str) -> io::Result<Option<File>> {
+    // The file itself, not what a link there leads to: `replace_target` followed the links.
+    let mut options = OpenOptions::new();
+    options
+        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = match dir.open_with(name, &options) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        opened => opened?.into_std(),
+    };
+    // SAFETY: BY_HANDLE_FILE_INFORMATION is plain data, for which all zeros is a value.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` is open, and `info` is the structure the call fills.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        return Err(refuse(EISDIR));
+    }
+    if info.nNumberOfLinks > 1 {
+        return Err(refuse(EMLINK));
+    }
+    // Writing it in place would fail, so replacing it does too.
+    dir.open_with(name, OpenOptions::new().write(true))
+        .map_err(busy)?;
+    Ok(Some(file))
+}
+
+/// `replace`'s temporary file, in the target's directory.
+pub(super) struct Temp<'a> {
+    dir: &'a Dir,
+    pub(super) file: File,
+    /// Whether to leave it as it is when dropped: renamed over the target, or left by a crash.
+    kept: bool,
+}
+
+impl<'a> Temp<'a> {
+    /// A new temporary file `name` in `dir`. It takes an existing `target`'s DACL before it holds
+    /// a byte, so its new bytes are never open to more than the target's are; a new file has the
+    /// directory's default. It is held without sharing deletes until it is renamed.
+    pub(super) fn create(dir: &'a Dir, name: &str, target: Option<&File>) -> io::Result<Temp<'a>> {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | WRITE_DAC)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        let file = match dir.open_with(name, &options) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                clear(dir, name)?;
+                // Made in between by another `replace`, whose it is.
+                dir.open_with(name, &options).map_err(|e| match e.kind() {
+                    io::ErrorKind::AlreadyExists => refuse(EBUSY),
+                    _ => e,
+                })?
+            }
+            made => made?,
+        };
+        let temp = Temp {
+            dir,
+            file: file.into_std(),
+            kept: false,
+        };
+        if let Some(target) = target {
+            copy_dacl(target, &temp.file)?;
+        }
+        Ok(temp)
+    }
+
+    /// Give the file `target`'s attributes (hidden, system, archive, not indexed and the like),
+    /// creation time and named streams, as `ReplaceFileW` keeps them. It has had the target's DACL
+    /// since it was made.
+    pub(super) fn protect(&self, target: &File) -> io::Result<()> {
+        // SAFETY: FILE_BASIC_INFO is plain data, for which all zeros is a value.
+        let mut from: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: `target` is open with FILE_READ_ATTRIBUTES, and `from` is the structure its
+        // class fills, of the size given.
+        let read = unsafe {
+            GetFileInformationByHandleEx(
+                target.as_raw_handle(),
+                FileBasicInfo,
+                (&mut from as *mut FILE_BASIC_INFO).cast(),
+                size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        };
+        if read == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // The attributes a file can be given. A target is never read-only here: `target` refused it.
+        let settable = FILE_ATTRIBUTE_ARCHIVE
+            | FILE_ATTRIBUTE_HIDDEN
+            | FILE_ATTRIBUTE_NORMAL
+            | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED
+            | FILE_ATTRIBUTE_OFFLINE
+            | FILE_ATTRIBUTE_SYSTEM
+            | FILE_ATTRIBUTE_TEMPORARY;
+        let attributes = match from.FileAttributes & settable {
+            0 => FILE_ATTRIBUTE_NORMAL,
+            some => some,
+        };
+        // A time of 0 leaves that time as it is.
+        let info = FILE_BASIC_INFO {
+            CreationTime: from.CreationTime,
+            LastAccessTime: 0,
+            LastWriteTime: 0,
+            ChangeTime: 0,
+            FileAttributes: attributes,
+        };
+        // SAFETY: `file` is open for writing, and FILE_BASIC_INFO is its class's structure.
+        unsafe { set_info(&self.file, FileBasicInfo, &info) }?;
+        copy_streams(target, &self.file)
+    }
+
+    /// Make the file's bytes and protection durable.
+    pub(super) fn sync(&mut self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+
+    /// Rename the file over `target`, its directory's file of that name.
+    pub(super) fn rename_over(&mut self, target: &str) -> io::Result<()> {
+        rename_handle(&self.file, self.dir, target)?;
+        self.kept = true;
+        Ok(())
+    }
+
+    /// Make the rename durable. Windows syncs no directory: NTFS journals the rename, and flushing
+    /// the file it renamed flushes the journal through it.
+    pub(super) fn sync_dir(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+
+    /// Leave the file as it is, as a crash does.
+    pub(super) fn keep(&mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for Temp<'_> {
+    /// Remove the file after an error before the rename.
+    fn drop(&mut self) {
+        if !self.kept {
+            let _ = delete(&self.file);
+        }
+    }
+}
+
+/// Give `to` each named stream of `from`: its alternate data streams, such as `Zone.Identifier`,
+/// the mark of the web.
+fn copy_streams(from: &File, to: &File) -> io::Result<()> {
+    for name in stream_names(from)? {
+        let mut source = create_at(
+            from,
+            &name,
+            (GENERIC_READ, FILE_OPEN, FILE_NON_DIRECTORY_FILE),
+        )?;
+        let mut sink = create_at(
+            to,
+            &name,
+            (GENERIC_WRITE, FILE_CREATE, FILE_NON_DIRECTORY_FILE),
+        )?;
+        io::copy(&mut source, &mut sink)?;
+    }
+    Ok(())
+}
+
+/// The names of `file`'s named streams, each `:name:$DATA`: none on a volume without streams.
+fn stream_names(file: &File) -> io::Result<Vec<OsString>> {
+    // FILE_STREAM_INFO records, in u64s for their alignment, in a buffer grown until they fit.
+    let mut buf = vec![0u64; 512];
+    loop {
+        // SAFETY: `buf` is live and 8-aligned, of the size given; the call fills it with records.
+        let read = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileStreamInfo,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * 8) as u32,
+            )
+        };
+        if read != 0 {
+            break;
+        }
+        let e = io::Error::last_os_error();
+        match e.raw_os_error().map(|code| code as u32) {
+            Some(ERROR_MORE_DATA) => buf.resize(buf.len() * 2, 0),
+            Some(ERROR_HANDLE_EOF | ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED) => {
+                return Ok(Vec::new());
+            }
+            _ => return Err(e),
+        }
+    }
+    let mut names = Vec::new();
+    let mut at = 0;
+    loop {
+        let (step, name) = record(&buf, at, STREAM_RECORD).ok_or(io::ErrorKind::InvalidData)?;
+        let name = OsString::from_wide(&name);
+        // The file's own bytes, its unnamed stream, are the new ones.
+        if name != "::$DATA" {
+            names.push(name);
+        }
+        if step == 0 {
+            return Ok(names);
+        }
+        at += step;
+    }
+}
+
+/// Remove the temporary file `name` in `dir` that a crash left: no `replace` holds it, so it can
+/// be opened to be removed. `-EBUSY` if another `replace` holds it, without sharing deletes.
+fn clear(dir: &Dir, name: &str) -> io::Result<()> {
+    match open_itself(dir, name) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(busy(e)),
+        Ok(file) => delete(&file),
+    }
+}
+
+/// A sharing violation, a file open elsewhere that doesn't share what was asked: `-EBUSY`.
+fn busy(e: io::Error) -> io::Error {
+    match e.raw_os_error() {
+        Some(code) if code == ERROR_SHARING_VIOLATION as i32 => refuse(EBUSY),
+        _ => e,
+    }
+}
+
+/// Give `to` the DACL of `from`, inherited or protected as `from`'s is.
+fn copy_dacl(from: &File, to: &File) -> io::Result<()> {
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `from` is open with READ_CONTROL. The call allocates `descriptor` and points `dacl`
+    // into it.
+    let got = unsafe {
+        GetSecurityInfo(
+            from.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if got != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(got as i32));
+    }
+    let (mut control, mut revision) = (0u16, 0u32);
+    // SAFETY: `descriptor` is the one the call above allocated.
+    let read = unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
+    let done = if read == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        let inherit = match control & SE_DACL_PROTECTED {
+            0 => UNPROTECTED_DACL_SECURITY_INFORMATION,
+            _ => PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+        // SAFETY: `to` is open with WRITE_DAC, and `dacl` points into `descriptor`, live until it
+        // is freed below.
+        match unsafe {
+            SetSecurityInfo(
+                to.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | inherit,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null(),
+            )
+        } {
+            ERROR_SUCCESS => Ok(()),
+            e => Err(io::Error::from_raw_os_error(e as i32)),
+        }
+    };
+    // SAFETY: GetSecurityInfo allocated `descriptor` to be freed with LocalFree, and nothing uses
+    // it after.
+    unsafe { LocalFree(descriptor) };
+    done
 }
 
 /// `path`'s parent resolved beneath `dir`, open, and `path`'s last component, which is a name: never
@@ -237,7 +583,7 @@ fn parent_of<'p>(dir: &Dir, path: &'p str) -> io::Result<(Dir, &'p str)> {
 }
 
 /// `path` beneath `dir`, opened as itself (a link, not what it links to) to be removed or renamed.
-fn open_itself(dir: &Dir, path: &str) -> io::Result<std::fs::File> {
+fn open_itself(dir: &Dir, path: &str) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options
         .access_mode(DELETE | FILE_READ_ATTRIBUTES)
@@ -246,16 +592,30 @@ fn open_itself(dir: &Dir, path: &str) -> io::Result<std::fs::File> {
 }
 
 /// Have what `file` is open on deleted when it closes.
-fn delete(file: &std::fs::File) -> io::Result<()> {
-    let info = FILE_DISPOSITION_INFO { DeleteFile: 1 };
-    // SAFETY: `file` is open with DELETE access, and `info` is the FILE_DISPOSITION_INFO its class
-    // takes, of the size given.
+fn delete(file: &File) -> io::Result<()> {
+    // SAFETY: `file` is open with DELETE access, and FILE_DISPOSITION_INFO is its class's structure.
+    unsafe {
+        set_info(
+            file,
+            FileDispositionInfo,
+            &FILE_DISPOSITION_INFO { DeleteFile: 1 },
+        )
+    }
+}
+
+/// Set `file`'s information of `class` to `info`.
+///
+/// # Safety
+///
+/// `T` is the structure `class` takes, and `file` is open with the access it needs.
+unsafe fn set_info<T>(file: &File, class: FILE_INFO_BY_HANDLE_CLASS, info: &T) -> io::Result<()> {
+    // SAFETY: the caller's: `info` is the structure `class` takes, of the size given.
     let done = unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle(),
-            FileDispositionInfo,
-            (&info as *const FILE_DISPOSITION_INFO).cast(),
-            size_of::<FILE_DISPOSITION_INFO>() as u32,
+            class,
+            (info as *const T).cast(),
+            size_of::<T>() as u32,
         )
     };
     match done {

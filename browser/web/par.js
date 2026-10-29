@@ -9,7 +9,7 @@
 // `/<repo>/`). The deployed site keeps the same `web/` + `target/…` layout, so `../target/…`
 // resolves correctly under either base.
 import { instantiateEngine } from './engine-imports.js';
-import { registerForeign, releaseForeign } from './foreign-mem.js';
+import { headerOf, registerForeign, releaseForeign } from './foreign-mem.js';
 import { engineMemory } from './engine-mem.js';
 import { jsCapServicer } from './coop-driver.js';
 const WASM = new URL('../target/wasm32-unknown-unknown/release/temen_browser.wasm', import.meta.url);
@@ -233,7 +233,7 @@ export function makeRunner({ module, memory, ex }) {
     const jsCall = (cfg, m) => {
       if (finished || !jsCap) return -38n; // -ENOSYS: no servicer, or the run is over
       if (cfg.x2Mem && !held.has(cfg.x2MemId)) {
-        registerForeign(memory, cfg.x2Mem, ex.temen_detached_header_bytes(), cfg.x2MemId);
+        registerForeign(memory, cfg.x2Mem, headerOf(cfg.x2Mem).base, cfg.x2MemId);
         held.add(cfg.x2MemId);
       }
       return jsCap(m.slot, m.op, m.argsPtr, m.nArgs, m.mem);

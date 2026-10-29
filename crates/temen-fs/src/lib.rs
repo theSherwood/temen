@@ -71,6 +71,31 @@ pub const FS_OPENDIR: u32 = 17;
 pub const FS_READDIR: u32 = 18;
 /// `closedir(dh)` — drop a dir handle opened by [`FS_OPENDIR`].
 pub const FS_CLOSEDIR: u32 = 19;
+/// `replace(path_ptr, path_len, buf_ptr, len)` — make the file at `path` hold exactly the window's
+/// `[buf_ptr, buf_ptr+len)`, atomically and durably, keeping the host's protection of it (#2510).
+/// A reader sees the old bytes or the new, never part of either, and a crash leaves one or the
+/// other. Once it returns `0`, the bytes and the name are both synced. Nothing is left pending
+/// between calls.
+/// - `host_fs` writes and syncs a temporary file in the target's directory, gives it the target's
+///   protection, renames it over the target and syncs the directory. On Unix the protection is the
+///   mode, ACLs and extended attributes, and the owner and group where the process may set them; on
+///   Windows, the attributes, creation time and DACL. A missing target is created as `open` with
+///   [`O_CREATE`] creates one, with the host's defaults. A symlink beneath the root is followed: its
+///   target is replaced and the link kept.
+/// - Refused, changing nothing: a target the process may not write in place, or read the
+///   protection of (`-EACCES`); a directory (`-EISDIR`); anything else but a regular file
+///   (`-EINVAL`); a file with other hard links, which replacing would part from them (`-EMLINK`);
+///   and a file another `replace` is replacing at that moment (`-EBUSY`).
+/// - The temporary file is [`REPLACE_TEMP`] and 16 hex digits, a hash of the target's name. On Linux
+///   it has no name until it is synced (`O_TMPFILE`). A crash can leave one behind, and the next
+///   `replace` of that file removes it. A consumer that mirrors a directory skips the pattern.
+/// - Crash injection (`*_crashy`) counts three barriers: the temporary file's sync, the rename and
+///   the directory's sync. A crash at either of the first two leaves the old bytes, at the third
+///   the new.
+/// - `mem_fs` swaps the file's bytes in one step. It has no host protection to keep, nor links.
+pub const FS_REPLACE: u32 = 20;
+/// The prefix of a [`FS_REPLACE`] temporary file's name.
+pub const REPLACE_TEMP: &str = ".temen-replace-";
 
 /// Byte length of the fixed [`StatBuf`] the [`FS_STAT`] op writes.
 pub const STATBUF_LEN: usize = 72;
@@ -1112,6 +1137,59 @@ impl MemFsState {
                     return EBADF;
                 };
                 self.shrink_tables(ENTRY + names_cost(&names));
+                0
+            }
+            FS_REPLACE => {
+                let path = match read_path(mem.as_deref(), a(0), a(1)).map(|p| norm(&p)) {
+                    Ok(p) => p,
+                    Err(e) => return e,
+                };
+                let (buf, len) = (a(2), a(3));
+                if buf < 0 || len < 0 {
+                    return EINVAL;
+                }
+                let Some(bytes) = mem
+                    .as_deref()
+                    .and_then(|m| m.read_bytes(buf as u64, len as u64))
+                else {
+                    return EFAULT;
+                };
+                if self.crash_frozen() {
+                    return 0; // power-loss: nothing reaches the store
+                }
+                let existed = self.files.contains_key(&path);
+                if !existed && self.is_dir(&path) {
+                    return EISDIR;
+                }
+                // The barriers `host_fs` passes before its rename (its temporary file's sync, and the
+                // rename itself), so a crash sweep counts alike on both: either leaves the old bytes.
+                if self.crash_barrier() || self.crash_barrier() {
+                    return 0;
+                }
+                // #2306 — a new name is an entry of the store's tables, and the bytes are charged
+                // to the store's payer as they are written.
+                let named = if existed {
+                    0
+                } else {
+                    ENTRY + path.len() as u64
+                };
+                if !self.grow_tables(named) {
+                    return ENOSPC;
+                }
+                let data = self.new_file();
+                if !data
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .write_at(0, &bytes)
+                {
+                    self.shrink_tables(named);
+                    return ENOSPC;
+                }
+                // Descriptors and mappings open on the old bytes keep them, as a host's old file
+                // lives on for whoever has it open.
+                self.files.insert(path, data);
+                // The third, the directory's sync: the swap is done, so a crash there keeps it.
+                self.crash_barrier();
                 0
             }
             _ => EINVAL,

@@ -2,7 +2,7 @@
 //! embedder-granted capability by name (`__vm_cap_resolve` → §7 `self.resolve`) and drives the
 //! whole op protocol through `__vm_host_call` (§7 host-defined capability — the wasm-import
 //! analogue): open/write/close, reopen/seek/read-back, rename, append, remove, truncate, sync,
-//! EOF, read-only refusal, and the attenuation refusals (`..`/absolute paths). No filesystem authority exists
+//! replace, EOF, read-only refusal, and the attenuation refusals (`..`/absolute paths). No filesystem authority exists
 //! unless the test injects one via [`temen_run::Instance::run_with_caps`] — the fixed powerbox is
 //! untouched.
 //!
@@ -63,7 +63,8 @@ fn fs_probe_mem_fs_jit() {
 /// The same guest against the **real** filesystem, attenuated to a fresh temp root. Beyond the
 /// guest's own exit-0, the *host side* is asserted: the pre-seeded `seed.txt` was readable by the
 /// guest (phase B ran), the guest's `out.txt` really landed on disk with the right bytes, and the
-/// probe's scratch files (`hello.txt`/`world.txt`) were genuinely created-then-removed.
+/// probe's scratch files (`hello.txt`/`world.txt`/`trunc.txt`/`rep.txt`) were genuinely
+/// created-then-removed, leaving no `replace` temporary file behind.
 #[test]
 fn fs_probe_host_fs_all_backends() {
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
@@ -89,8 +90,17 @@ fn fs_probe_host_fs_all_backends() {
             out_txt, "GUEST",
             "{backend:?}: guest bytes must land on disk"
         );
-        // ...and the removed scratch files are really gone.
-        assert!(!root.join("hello.txt").exists() && !root.join("world.txt").exists());
+        // ...and the removed scratch files are really gone, with nothing else left behind.
+        let mut left: Vec<_> = std::fs::read_dir(&root)
+            .expect("list the root")
+            .map(|e| e.expect("entry").file_name().into_string().expect("UTF-8"))
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["out.txt", "seed.txt"],
+            "{backend:?}: what the probe left"
+        );
 
         std::fs::remove_dir_all(&root).expect("cleanup");
     }

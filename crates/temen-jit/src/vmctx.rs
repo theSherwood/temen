@@ -56,10 +56,6 @@ pub struct VmCtx {
     /// The stop word: `0` while the code running on this context may go on; once the domain ended,
     /// a copy of its end. **Offset 0** — a pointer to the vmctx is a pointer to the stop word.
     trap: AtomicI64,
-    /// The domain's end: `0` while it runs; once it ended, the low 32 bits a [`crate::TrapKind`] /
-    /// `EXIT_CODE` / internal code, the high 32 bits an exit code. Written once, by [`Self::raise`]
-    /// (or compiled code's raise). The root context's [`Self::owned_end`].
-    end: *const AtomicI64,
     /// The `call.cap` thunk's opaque ctx: the instance's powerbox (`*mut Host`, `*const Mutex<Host>`,
     /// or a child's own), handed to every `call.cap` as the thunk's first argument.
     pub cap_ctx: *mut c_void,
@@ -87,6 +83,10 @@ pub struct VmCtx {
     /// #2164 — a demand-paged child's **access table** (`temen_ir::PAGE_READ`), which a paged
     /// compile tests before each access. Null when the instance is not paged.
     pub pages: *const AtomicU8,
+    /// The domain's end: `0` while it runs; once it ended, the low 32 bits a [`crate::TrapKind`] /
+    /// `EXIT_CODE` / internal code, the high 32 bits an exit code. Written once, by [`Self::raise`]
+    /// (or compiled code's raise). The root context's [`Self::owned_end`].
+    end: *const AtomicI64,
     /// The domain's end word, owned by its root context ([`Self::new`]); `None` for a vCPU's
     /// context ([`Self::vcpu`]), which points at its root's. Never read by compiled code.
     owned_end: Option<Box<AtomicI64>>,
