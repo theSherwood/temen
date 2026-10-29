@@ -175,9 +175,9 @@ use crate::ll::ast::{
 };
 
 use temen_ir::{
-    AtomicRmwOp, BinOp, Block, BlockIdx, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp, FCmpOp, FToI,
-    FUnOp, FloatTy, Func, FuncName, IToF, Inst, IntTy, IntUnOp, LoadOp, Loc, Module, Ordering,
-    SsaLoc, StoreOp, Terminator, TypeDef, ValIdx, ValType, VarInfo, VarLoc,
+    cfg::Cfg, AtomicRmwOp, BinOp, Block, BlockIdx, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp,
+    FCmpOp, FToI, FUnOp, FloatTy, Func, FuncName, IToF, Inst, IntTy, IntUnOp, LoadOp, Loc, Module,
+    Ordering, SsaLoc, StoreOp, Terminator, TypeDef, ValIdx, ValType, VarInfo, VarLoc,
 };
 
 /// The §6 debug-info + computed-`goto` data models (built by the [`ll`] reader, consumed by the
@@ -3123,7 +3123,8 @@ struct Scan {
     /// struct can cross a block edge (a `phi` of a struct, e.g. wikisort's `MakeRange` result); within a
     /// block they are the same field-wise `agg` values built by `insertvalue`/multi-result `call`.
     agg_layout: HashMap<ValueId, Vec<ValType>>,
-    /// `ValueId` → the block it is defined in (parameters are defined in the entry block, 0).
+    /// `ValueId` → the block it is defined in (parameters are defined in the entry block, 0). An
+    /// `invoke`'s result is its block's, though `lower_invoke` defines it in the call block it adds.
     def_block: Vec<usize>,
     /// Block name → block index (entry is 0).
     block_idx: HashMap<Name, usize>,
@@ -3135,6 +3136,17 @@ struct Scan {
     /// (`movsx (mem)`) instead of a zero-extending load + a separate register sign-extend. Pure
     /// value-lowering peephole — confinement/width unchanged, verifier re-checks, +0 escape-TCB.
     sext_fused: HashMap<Name, (u32, u32)>,
+}
+
+impl Scan {
+    /// The block that defines `v`: the entry for the data-SP, as for the parameters.
+    fn defined_in(&self, v: ValueId) -> usize {
+        if v == SP {
+            0
+        } else {
+            self.def_block[v]
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3181,13 +3193,10 @@ fn translate_func(
     let results = result_types(f.return_type.as_ref(), types)?;
 
     let scan = scan_func(f, types)?;
-    let (succ, order) = flow(f, &scan)?;
-    let (block_params, invoke_def) = block_params(f, &scan, &succ);
-    let def_of = |v: ValueId| match v {
-        SP => 0,
-        v => invoke_def.get(&v).copied().unwrap_or(scan.def_block[v]),
-    };
-    let captured = captures(f, &scan, &succ, &order, &def_of)?;
+    let cfg = cfg(f, &scan)?;
+    let order = cfg.rpo();
+    let block_params = block_params(f, &scan);
+    let captured = captures(f, &scan, &cfg, &order)?;
     let (frame, frame_size) = frame_layout(f, &scan, types)?;
 
     let n = f.basic_blocks.len();
@@ -3195,12 +3204,13 @@ fn translate_func(
     // What each block captures once it is translated: the value each capture slot holds.
     let mut capture_ids: Vec<Vec<ValueId>> = vec![Vec::new(); n];
     // Synthetic blocks appended *after* all real blocks (so real block indices are unchanged): a
-    // sparse `switch` lowers to a comparison chain whose extra blocks land here (see `translate_switch`).
+    // sparse `switch`'s comparison chain (`translate_switch`) and an `invoke`'s call block
+    // (`lower_invoke`).
     let mut aux_blocks: Vec<Block> = Vec::new();
     let mut defs = Defs::new();
     // In reverse postorder: a value's defining block dominates every block that uses it, so it is
     // translated first, and a block captures what it reads from elsewhere from there (#2454).
-    for &bi in &order {
+    for bi in order.iter().map(|&b| b as usize) {
         let (block, ids) = translate_block(
             &f.basic_blocks[bi],
             bi,
@@ -3211,7 +3221,6 @@ fn translate_func(
             &scan,
             &block_params,
             &captured[bi],
-            &def_of,
             &mut defs,
             &frame,
             frame_size,
@@ -3491,7 +3500,7 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
             // (entry φ is impossible — entry has no predecessors)
         }
         for instr in &bb.instrs {
-            // Validate support + collect uses now so liveness can rely on it.
+            // Validate support now, so `captures` can rely on it.
             let _ = local_uses(instr)?;
             if let Some(dest) = instr.try_get_result() {
                 let id = s.ty.len();
@@ -3531,9 +3540,10 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
                     // An `i128` result is held as a 2×`i64` aggregate pair `(lo, hi)` (the unified
                     // `agg`-pair representation, shared with `load i128` / `icmp i128` / the tier-3
                     // `lower_i128` ops). Recording an `[i64, i64]` `agg_layout` — exactly like a flat
-                    // 2-field struct — lets the value **cross block edges**: the per-field fan-out in
-                    // `block_params`/`branch_args` threads its `(lo, hi)` as two block params (an i128
-                    // loop-carried φ / live-across value), not just same-block.
+                    // 2-field struct — lets the value **cross block edges**: the per-field fan-out at
+                    // block boundaries carries its `(lo, hi)` as two values, two φ params or two
+                    // captures (an i128 loop-carried φ / a value read in a later block), not just
+                    // same-block.
                     // (65..=127-bit results — e.g. a `load i96` SROA folds from an odd struct tail —
                     // share the pair representation; their producers zero-extend the hi half, so the
                     // pair is canonical.)
@@ -3559,9 +3569,10 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
             }
         }
         term_local_uses(&bb.term)?; // validate terminator support
-                                    // An `invoke`'s result is defined by the *terminator* (not an instruction), so assign it an
-                                    // id + type here — the callee's (non-void) return type. The normal-edge successor then
-                                    // threads it like any cross-block value (it is recorded as a def of this block in liveness).
+
+        // An `invoke`'s result is defined by the *terminator* (not an instruction), so assign it an
+        // id + type here — the callee's (non-void) return type. `lower_invoke` defines it in the call
+        // block it adds, which every block that reads it captures it from.
         if let LTerm::Invoke(inv) = &bb.term {
             if let Type::FuncType { result_type, .. } = inv.function_ty.as_ref() {
                 if !matches!(result_type.as_ref(), Type::VoidType) {
@@ -3664,8 +3675,8 @@ fn signed_load_op(loaded: u32, to: u32) -> temen_ir::LoadOp {
 
 /// The local (non-constant) value operands an instruction *uses*, and — as a side effect — the
 /// slice-A support check (an unsupported instruction is a fail-closed [`Error::Unsupported`]).
-/// φ incoming values are **edge** uses (counted per-predecessor in liveness), so a `Phi` reports
-/// no direct uses here.
+/// φ incoming values are **edge** uses, read by the predecessor that passes them ([`captures`]), so a
+/// `Phi` reports no direct uses here.
 fn local_uses(instr: &Instruction) -> Result<Vec<Name>, Error> {
     use Instruction as I;
     let locals = |ops: &[&Operand]| -> Vec<Name> {
@@ -3753,7 +3764,7 @@ fn local_uses(instr: &Instruction) -> Result<Vec<Name>, Error> {
             }));
             v
         }
-        // A φ's operands are edge uses, handled in liveness via `PhiUses`.
+        // A φ's operands are edge uses, read by the predecessor that passes them ([`captures`]).
         I::Phi(_) => Vec::new(),
         // A `landingpad` reads only the reserved EH slots (the current exception/selector), no LLVM
         // value operands — its `{ptr,i32}` result is bound field-wise in `translate_inst`.
@@ -17379,7 +17390,8 @@ fn lower_eh_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
 }
 
 /// The local value operands a terminator uses (the branch condition / returned value). Validates
-/// terminator support. Branch *arguments* are synthesized from block parameters, not from here.
+/// terminator support. Branch *arguments*, the successors' φ incomings, are not reported here
+/// ([`branch_args`]).
 fn term_local_uses(term: &LTerm) -> Result<Vec<Name>, Error> {
     let one = |o: &Operand| match o {
         Operand::LocalOperand { name, .. } => vec![name.clone()],
@@ -17394,8 +17406,8 @@ fn term_local_uses(term: &LTerm) -> Result<Vec<Name>, Error> {
         LTerm::IndirectBr(ib) => Ok(one(&ib.operand)),
         LTerm::Unreachable(_) => Ok(Vec::new()),
         // An `invoke` uses its argument operands (and, for an indirect callee, the function pointer);
-        // the result is bound in the synthetic call block. Its two edges' block-args come from block
-        // parameters, like any branch.
+        // the result is bound in the synthetic call block. Its two edges' φ args are read like any
+        // branch's.
         LTerm::Invoke(inv) => {
             let mut v = inv.function.as_ref().right().map(one).unwrap_or_default();
             v.extend(inv.arguments.iter().flat_map(|(o, _)| one(o)));
@@ -17407,45 +17419,24 @@ fn term_local_uses(term: &LTerm) -> Result<Vec<Name>, Error> {
     }
 }
 
-/// Pass 1b: each block's successors, and the blocks the entry reaches, in reverse postorder.
-/// Blocks are translated in that order: a value's defining block dominates every block that uses it
-/// (SSA), so it is translated first, and the blocks that read the value capture it from there.
-fn flow(f: &Function, s: &Scan) -> Result<(Vec<Vec<usize>>, Vec<usize>), Error> {
-    let succ: Vec<Vec<usize>> = f
+/// Pass 1b: the function's control-flow graph. Blocks are translated in its reverse postorder: a
+/// value's defining block dominates every block that uses it (SSA), so it is translated first, and
+/// the blocks that read the value capture it from there.
+fn cfg(f: &Function, s: &Scan) -> Result<Cfg, Error> {
+    let succs = f
         .basic_blocks
         .iter()
         .map(|bb| term_succs(&bb.term, s))
         .collect::<Result<_, _>>()?;
-    let mut seen = vec![false; succ.len()];
-    let mut post = Vec::with_capacity(succ.len());
-    // Depth-first from the entry: each frame is a block and the next successor to visit.
-    let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
-    seen[0] = true;
-    while let Some((b, next)) = stack.last_mut() {
-        match succ[*b].get(*next) {
-            Some(&t) => {
-                *next += 1;
-                if !seen[t] {
-                    seen[t] = true;
-                    stack.push((t, 0));
-                }
-            }
-            None => {
-                post.push(*b);
-                stack.pop();
-            }
-        }
-    }
-    post.reverse();
-    Ok((succ, post))
+    Ok(Cfg::from_succs(succs))
 }
 
 /// The successor block indices of a terminator.
-fn term_succs(term: &LTerm, s: &Scan) -> Result<Vec<usize>, Error> {
-    let b = |name: &Name| -> Result<usize, Error> {
+fn term_succs(term: &LTerm, s: &Scan) -> Result<Vec<u32>, Error> {
+    let b = |name: &Name| -> Result<u32, Error> {
         s.block_idx
             .get(name)
-            .copied()
+            .map(|&i| i as u32)
             .ok_or_else(|| Error::Unsupported(format!("branch to unknown block {name:?}")))
     };
     match term {
@@ -17462,8 +17453,7 @@ fn term_succs(term: &LTerm, s: &Scan) -> Result<Vec<usize>, Error> {
         // successor, so the `br_table` edges supply each target's φ args.
         LTerm::IndirectBr(ib) => ib.possible_dests.iter().map(b).collect(),
         LTerm::Ret(_) | LTerm::Unreachable(_) => Ok(Vec::new()),
-        // An `invoke`'s two edges (normal return / unwind to the landing pad) are both successors —
-        // liveness threads each target's live-ins out of this block.
+        // An `invoke`'s two edges (normal return / unwind to the landing pad) are both successors.
         LTerm::Invoke(inv) => Ok(vec![b(&inv.return_label)?, b(&inv.exception_label)?]),
         // `resume` leaves the function (re-throws to the runtime), so it has no successors.
         LTerm::Resume(_) => Ok(Vec::new()),
@@ -17472,18 +17462,10 @@ fn term_succs(term: &LTerm, s: &Scan) -> Result<Vec<usize>, Error> {
 }
 
 /// Pass 1c: the ordered parameter value-ids of each block. Entry's are the data-SP then the
-/// function's parameters (§3b, §3d). Every other block's are its φ-results, in φ order. The normal
-/// successor of an `invoke` that has no other way in also takes the invoke's result: the result exists
-/// only once the call returns, in the synthetic call block (`lower_invoke`), which passes it there.
-/// That successor is where the result is defined, which the second map records. Everything else a
-/// block reads from elsewhere it captures ([`captures`]).
-fn block_params(
-    f: &Function,
-    s: &Scan,
-    succ: &[Vec<usize>],
-) -> (Vec<Vec<ValueId>>, HashMap<ValueId, usize>) {
-    let mut out: Vec<Vec<ValueId>> = f
-        .basic_blocks
+/// function's parameters (§3b, §3d). Every other block's are its φ-results, in φ order. Everything
+/// else a block reads from elsewhere it captures ([`captures`]).
+fn block_params(f: &Function, s: &Scan) -> Vec<Vec<ValueId>> {
+    f.basic_blocks
         .iter()
         .enumerate()
         .map(|(bi, bb)| match bi {
@@ -17498,26 +17480,7 @@ fn block_params(
                 .filter_map(|p| s.name2id.get(&p.dest).copied())
                 .collect(),
         })
-        .collect();
-    let mut ins = vec![0u32; succ.len()];
-    for t in succ.iter().flatten() {
-        ins[*t] += 1;
-    }
-    let mut invoke_def = HashMap::new();
-    for bb in &f.basic_blocks {
-        if let LTerm::Invoke(inv) = &bb.term {
-            if let (Some(&rv), Some(&ok)) = (
-                s.name2id.get(&inv.result),
-                s.block_idx.get(&inv.return_label),
-            ) {
-                if ins[ok] == 1 {
-                    out[ok].push(rv);
-                    invoke_def.insert(rv, ok);
-                }
-            }
-        }
-    }
-    (out, invoke_def)
+        .collect()
 }
 
 /// Pass 1d: what each reachable block captures (#2454): the values it reads that another block
@@ -17526,25 +17489,14 @@ fn block_params(
 /// passes along its out-edges. Every non-entry block also captures the data-SP (§3d), which its
 /// lowering reads without an LLVM operand; a block that never reads it drops it again
 /// ([`drop_unread_captures`]). Sorted by value id, so the data-SP comes last.
-fn captures(
-    f: &Function,
-    s: &Scan,
-    succ: &[Vec<usize>],
-    order: &[usize],
-    def_of: &impl Fn(ValueId) -> usize,
-) -> Result<Vec<Vec<ValueId>>, Error> {
+fn captures(f: &Function, s: &Scan, cfg: &Cfg, order: &[u32]) -> Result<Vec<Vec<ValueId>>, Error> {
     let mut out: Vec<Vec<ValueId>> = vec![Vec::new(); f.basic_blocks.len()];
-    for &bi in order.iter().filter(|&&b| b != 0) {
+    for bi in order.iter().map(|&b| b as usize).filter(|&b| b != 0) {
         let bb = &f.basic_blocks[bi];
-        // The result of this block's own `invoke` is defined past its terminator, never in it.
-        let own = match &bb.term {
-            LTerm::Invoke(inv) => s.name2id.get(&inv.result).copied(),
-            _ => None,
-        };
         let mut c = vec![SP];
         let mut read = |name: &Name| {
             if let Some(&v) = s.name2id.get(name) {
-                if def_of(v) != bi && Some(v) != own {
+                if s.defined_in(v) != bi {
                     c.push(v);
                 }
             }
@@ -17562,8 +17514,8 @@ fn captures(
             read(&u);
         }
         let name = &s.block_name[bi];
-        for &t in &succ[bi] {
-            for instr in &f.basic_blocks[t].instrs {
+        for &t in &cfg.succs[bi] {
+            for instr in &f.basic_blocks[t as usize].instrs {
                 let Instruction::Phi(p) = instr else { break };
                 for (op, pred) in &p.incoming_values {
                     if let (Operand::LocalOperand { name: v, .. }, true) = (op, pred == name) {
@@ -17712,7 +17664,7 @@ struct BlockCtx<'a> {
     /// `[chunk_0 … chunk_{C-1}, tail_0 … tail_{T-1}]` (`C` full `v128`s then `T` lane scalars, per
     /// the value's [`WideLayout`] in `s.wide`). The vector analog of `agg` — one LLVM value is
     /// several IR values — but, unlike `agg`, these *do* cross block boundaries (a vectorized loop's
-    /// wide accumulator), fanned out into per-part block params by `block_params`/`branch_args`.
+    /// wide accumulator), fanned out per part at block boundaries, as φ params or captures.
     wide_vals: HashMap<ValueId, Vec<ValIdx>>,
     next_val: ValIdx,
     /// Set true only while lowering a block's final instruction when it is a tail-position call
@@ -18712,7 +18664,6 @@ fn translate_block(
     s: &Scan,
     block_params: &[Vec<ValueId>],
     captured: &[ValueId],
-    def_of: &impl Fn(ValueId) -> usize,
     defs: &mut Defs,
     frame: &HashMap<ValueId, u64>,
     frame_size: u64,
@@ -18872,7 +18823,7 @@ fn translate_block(
     // and falls through to the ordinary `ret` here.)
     let term = match ctx.pending_tail.take() {
         Some(t) => t,
-        None => translate_term(&mut ctx, &bb.term, bi, f, s, block_params, aux_blocks)?,
+        None => translate_term(&mut ctx, &bb.term, bi, f, s, block_params, defs, aux_blocks)?,
     };
     let mut block = Block {
         parent: 0,
@@ -18891,7 +18842,7 @@ fn translate_block(
         Some(&source) => source,
         None => (bi as BlockIdx, to(i)),
     };
-    let here = |v: &ValueId| def_of(*v) == bi;
+    let here = |v: &ValueId| s.defined_in(*v) == bi;
     for (&v, &i) in ctx.idx_of.iter().filter(|(v, _)| here(v)) {
         defs.insert(v, Parts::One(place(i)));
     }
@@ -23613,6 +23564,7 @@ fn lower_vec_fp_convert(
     vec_implode(ctx, dest, &out, to_type, types)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn translate_term(
     ctx: &mut BlockCtx,
     term: &LTerm,
@@ -23620,6 +23572,7 @@ fn translate_term(
     f: &Function,
     s: &Scan,
     block_params: &[Vec<ValueId>],
+    defs: &mut Defs,
     aux_blocks: &mut Vec<Block>,
 ) -> Result<Terminator, Error> {
     match term {
@@ -23636,7 +23589,7 @@ fn translate_term(
         },
         LTerm::Br(x) => {
             let target = s.block_idx[&x.dest];
-            let args = branch_args(ctx, bi, target, f, s, block_params)?;
+            let args = branch_args(ctx, bi, target, f, s)?;
             Ok(Terminator::Br {
                 target: target as u32,
                 args,
@@ -23646,8 +23599,8 @@ fn translate_term(
             let cond = ctx.operand(&x.condition)?;
             let then_blk = s.block_idx[&x.true_dest];
             let else_blk = s.block_idx[&x.false_dest];
-            let then_args = branch_args(ctx, bi, then_blk, f, s, block_params)?;
-            let else_args = branch_args(ctx, bi, else_blk, f, s, block_params)?;
+            let then_args = branch_args(ctx, bi, then_blk, f, s)?;
+            let else_args = branch_args(ctx, bi, else_blk, f, s)?;
             Ok(Terminator::BrIf {
                 cond,
                 then_blk: then_blk as u32,
@@ -23657,9 +23610,9 @@ fn translate_term(
             })
         }
         LTerm::Switch(sw) => translate_switch(ctx, sw, bi, f, s, block_params, aux_blocks),
-        LTerm::IndirectBr(ib) => translate_indirectbr(ctx, ib, bi, f, s, block_params),
+        LTerm::IndirectBr(ib) => translate_indirectbr(ctx, ib, bi, f, s),
         LTerm::Unreachable(_) => Ok(Terminator::Unreachable),
-        LTerm::Invoke(inv) => lower_invoke(ctx, inv, bi, f, s, block_params, aux_blocks),
+        LTerm::Invoke(inv) => lower_invoke(ctx, inv, bi, f, s, block_params, defs, aux_blocks),
         // `resume` re-throws the current (slot-held) exception into the next outer handler — the same
         // unwind as a rethrow. `eh_unwind` ends in `LongJmp` (noreturn), so the terminator is dead.
         LTerm::Resume(_) => {
@@ -23686,9 +23639,11 @@ fn translate_term(
 /// return, and left at `d` by the throw's unwind — so `%lpad` always sees the outer depth.
 ///
 /// `T` (the synthetic block's threaded params) is the data-SP, the call-argument values, and every
-/// value `%ok` needs *except* the call result (defined inside `Bcall`). Only a direct call to a
-/// defined function with a scalar/void result is supported (a struct return / indirect invoke is a
-/// clean `Unsupported`).
+/// value `%ok`'s φs take *except* the call result. `Bcall` defines the result, and a block that reads
+/// it captures it from there: `Bcall` is the normal edge, which dominates every block LLVM lets read
+/// the result. Only a direct call to a defined function with a scalar/void result is supported (a
+/// struct return / indirect invoke is a clean `Unsupported`).
+#[allow(clippy::too_many_arguments)]
 fn lower_invoke(
     ctx: &mut BlockCtx,
     inv: &crate::ll::ast::Invoke,
@@ -23696,6 +23651,7 @@ fn lower_invoke(
     f: &Function,
     s: &Scan,
     block_params: &[Vec<ValueId>],
+    defs: &mut Defs,
     aux_blocks: &mut Vec<Block>,
 ) -> Result<Terminator, Error> {
     use std::collections::hash_map::Entry;
@@ -23759,35 +23715,26 @@ fn lower_invoke(
     let lpad_blk = s.block_idx[&inv.exception_label];
 
     // The unwind edge is taken directly from B — resolve its args in B's context.
-    let lpad_args = branch_args(ctx, bi, lpad_blk, f, s, block_params)?;
+    let lpad_args = branch_args(ctx, bi, lpad_blk, f, s)?;
 
-    // The normal edge feeds `%ok`, whose args may include the invoke result — directly (`%ok`'s param
-    // for it, `block_params`) or as a φ incoming (when `return_label` is itself a φ block). The result is defined only in `Bcall`,
-    // so resolve `%ok`'s args in B's context with the result temporarily bound to a fresh dummy const;
-    // every `ok_args` slot that comes back equal to that dummy's id is a result slot (handles a result
-    // used zero, one, or several times), filled with the real result inside `Bcall` and kept out of `T`.
-    let result_vid = ctx.s.name2id.get(&inv.result).copied();
-    let saved = if n_results == 1 {
-        result_vid.map(|rv| {
-            let dummy = ctx.const_i64(0);
-            (rv, dummy, ctx.idx_of.insert(rv, dummy))
-        })
-    } else {
-        None
-    };
-    let ok_args = branch_args(ctx, bi, ok_blk, f, s, block_params)?;
-    if let Some((rv, _, prev)) = saved {
-        match prev {
-            Some(old) => {
-                ctx.idx_of.insert(rv, old);
-            }
-            None => {
-                ctx.idx_of.remove(&rv);
-            }
-        }
+    // The normal edge feeds `%ok`'s φs, which may take the invoke result. The result is defined only
+    // in `Bcall`, so resolve `%ok`'s args in B's context with the result temporarily bound to a fresh
+    // dummy const; every `ok_args` slot that comes back equal to that dummy's id is a result slot
+    // (handles a result used zero, one, or several times), filled with the real result inside `Bcall`
+    // and kept out of `T`.
+    let result_vid = (n_results == 1)
+        .then(|| ctx.s.name2id.get(&inv.result).copied())
+        .flatten();
+    let dummy = result_vid.map(|rv| {
+        let dummy = ctx.const_i64(0);
+        ctx.idx_of.insert(rv, dummy);
+        dummy
+    });
+    let ok_args = branch_args(ctx, bi, ok_blk, f, s)?;
+    if let Some(rv) = result_vid {
+        ctx.idx_of.remove(&rv);
     }
-    let dummy_idx = saved.map(|(_, d, _)| d);
-    let is_result = |a: ValIdx| Some(a) == dummy_idx;
+    let is_result = |a: ValIdx| Some(a) == dummy;
 
     // Build the threaded set `T` (deduped, ordered): SP, then each call arg, then every `%ok` arg
     // except the result slots. A value's index in `T` is its parameter index in `Bcall`.
@@ -23898,6 +23845,9 @@ fn lower_invoke(
             args: ok_remapped,
         },
     });
+    if let Some(rv) = result_vid {
+        defs.insert(rv, Parts::One((bcall_idx, result)));
+    }
 
     // ── This block's terminator: install the handler and branch on the `setjmp` return. ──
     let d_addr = ctx.const_i64((base + EH_HSP_O) as i64);
@@ -23941,7 +23891,6 @@ fn translate_indirectbr(
     bi: usize,
     f: &Function,
     s: &Scan,
-    block_params: &[Vec<ValueId>],
 ) -> Result<Terminator, Error> {
     // The address is a pointer (the loaded `blockaddress`); narrow it to the `i32` `br_table` index.
     let operand = ctx.operand(&ib.operand)?;
@@ -23966,7 +23915,7 @@ fn translate_indirectbr(
     let mut args_for: HashMap<usize, Vec<ValIdx>> = HashMap::new();
     for &d in &dests {
         if let std::collections::hash_map::Entry::Vacant(e) = args_for.entry(d) {
-            e.insert(branch_args(ctx, bi, d, f, s, block_params)?);
+            e.insert(branch_args(ctx, bi, d, f, s)?);
         }
     }
 
@@ -24029,7 +23978,7 @@ fn translate_switch(
         .ok_or_else(|| Error::Unsupported("switch default to unknown block".into()))?;
     if cases.is_empty() {
         // Degenerate: an unconditional branch to the default.
-        let args = branch_args(ctx, bi, default_blk, f, s, block_params)?;
+        let args = branch_args(ctx, bi, default_blk, f, s)?;
         return Ok(Terminator::Br {
             target: default_blk as u32,
             args,
@@ -24128,11 +24077,11 @@ fn translate_switch(
 
     // Block arguments per distinct target (computed once — `branch_args` materializes constants).
     let mut args_for: HashMap<usize, Vec<ValIdx>> = HashMap::new();
-    let default_args = branch_args(ctx, bi, default_blk, f, s, block_params)?;
+    let default_args = branch_args(ctx, bi, default_blk, f, s)?;
     args_for.insert(default_blk, default_args.clone());
     for &(_, blk) in &cases {
         if let std::collections::hash_map::Entry::Vacant(e) = args_for.entry(blk) {
-            let a = branch_args(ctx, bi, blk, f, s, block_params)?;
+            let a = branch_args(ctx, bi, blk, f, s)?;
             e.insert(a);
         }
     }
@@ -24220,10 +24169,10 @@ fn lower_sparse_switch(
 
     // Compute every target's branch args in *this* block's context (φ resolution needs the real
     // predecessor `bi`). The returned ids are this-block-local.
-    let default_args = branch_args(ctx, bi, default_blk, f, s, block_params)?;
+    let default_args = branch_args(ctx, bi, default_blk, f, s)?;
     let mut case_args: Vec<Vec<ValIdx>> = Vec::with_capacity(cases.len());
     for &(_, blk) in cases {
-        case_args.push(branch_args(ctx, bi, blk, f, s, block_params)?);
+        case_args.push(branch_args(ctx, bi, blk, f, s)?);
     }
 
     // The threaded value set `T`, in order: the data-SP, the operand, then
@@ -24342,53 +24291,38 @@ fn operand_bits(op: &Operand) -> Result<u32, Error> {
     }
 }
 
-/// Build the argument list for a branch from `from` to `target`: for each of `target`'s
-/// parameters, supply — from the *source* block `from` — the φ's incoming value for this
-/// predecessor, or for an `invoke`'s normal successor the invoke's result.
+/// Build the argument list for a branch from `from` to `target`: each of `target`'s φs' incoming
+/// value for predecessor `from`, read in `from`'s context.
 fn branch_args(
     ctx: &mut BlockCtx,
     from: usize,
     target: usize,
     f: &Function,
     s: &Scan,
-    block_params: &[Vec<ValueId>],
 ) -> Result<Vec<ValIdx>, Error> {
-    // Map each φ-result id in `target` to its incoming operand from predecessor `from`, plus the φ's
-    // position (`phi_ord` within the block, `incoming_idx` within the φ) — the key into the recovered
-    // operand-position `blockaddress` map (an incoming may be a φ-threaded `blockaddress`).
     let from_name = &s.block_name[from];
-    let target_bb = &f.basic_blocks[target];
-    let mut phi_incoming: HashMap<ValueId, (&Operand, u32, u32)> = HashMap::new();
-    let mut phi_ord = 0u32;
-    for instr in &target_bb.instrs {
-        if let Instruction::Phi(p) = instr {
-            if let Some(&vid) = s.name2id.get(&p.dest) {
-                let inc_idx = p
-                    .incoming_values
-                    .iter()
-                    .position(|(_, pred)| pred == from_name)
-                    .ok_or_else(|| {
-                        Error::Unsupported(format!(
-                            "φ {:?} has no incoming for predecessor {from_name:?}",
-                            p.dest
-                        ))
-                    })?;
-                phi_incoming.insert(
-                    vid,
-                    (&p.incoming_values[inc_idx].0, phi_ord, inc_idx as u32),
-                );
-            }
-            phi_ord += 1;
-        }
-    }
-    let mut args = Vec::with_capacity(block_params[target].len());
-    for &pv in &block_params[target] {
-        let Some(&(op, phi_ord, inc_idx)) = phi_incoming.get(&pv) else {
-            // Not a φ: an `invoke`'s result ([`block_params`]), bound in this block's context to the
-            // slot `lower_invoke` fills from the call.
-            args.push(ctx.id(pv)?);
+    let phis = f.basic_blocks[target].instrs.iter().map_while(|i| match i {
+        Instruction::Phi(p) => Some(p),
+        _ => None,
+    });
+    let mut args = Vec::new();
+    // A φ's position (its ordinal in the block, the incoming's index in it) is the key into the
+    // recovered operand-position `blockaddress` map (an incoming may be a φ-threaded `blockaddress`).
+    for (phi_ord, p) in phis.enumerate() {
+        let Some(&pv) = s.name2id.get(&p.dest) else {
             continue;
         };
+        let inc_idx = p
+            .incoming_values
+            .iter()
+            .position(|(_, pred)| pred == from_name)
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "φ {:?} has no incoming for predecessor {from_name:?}",
+                    p.dest
+                ))
+            })?;
+        let op = &p.incoming_values[inc_idx].0;
         // A wide-vector φ takes `K` args, its incoming value's chunk/tail parts, and a struct φ one
         // per field, in the order the target's param fan-out expects (I2 step 1 cross-block).
         if let Some(&layout) = s.wide.get(&pv) {
@@ -24396,7 +24330,7 @@ fn branch_args(
         } else if let Some(ftys) = s.agg_layout.get(&pv) {
             args.extend(ctx.agg_operand(op, ftys)?);
         } else {
-            args.push(ctx.phi_operand(op, target as u32, phi_ord, inc_idx)?);
+            args.push(ctx.phi_operand(op, target as u32, phi_ord as u32, inc_idx as u32)?);
         }
     }
     Ok(args)

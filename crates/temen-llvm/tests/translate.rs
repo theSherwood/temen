@@ -8602,6 +8602,53 @@ int main() {
     check_cpp_eh_vs_native("cpp_eh_unwind_cleanup", src, b"");
 }
 
+/// **C++ exceptions — the call's result read in a loop it enters** (#2454). With nothing to compute
+/// before the loop, clang `-O2` makes the loop's header the `invoke`'s normal destination: the header
+/// has a second predecessor, its own back edge, and reads the result directly. The translator
+/// captures the result from the call block `lower_invoke` adds, which dominates the header. Byte-
+/// identical to native.
+#[test]
+fn cpp_eh_invoke_result_read_in_the_loop_it_enters() {
+    let src = r#"
+extern "C" int write(int fd, const char *buf, long n);
+
+static void puti(int v) {
+  char b[16]; int i = 16;
+  int neg = v < 0; unsigned u = neg ? -(unsigned)v : (unsigned)v;
+  b[--i] = '\n';
+  do { b[--i] = '0' + u % 10; u /= 10; } while (u);
+  if (neg) b[--i] = '-';
+  write(1, b + i, 16 - i);
+}
+
+volatile int sink, ctr;
+
+__attribute__((noinline)) static int may_throw(int x) {
+  if (x < 0) throw x;
+  return x + 1;
+}
+
+// The loop reads `r` and does no work before its first trip, so the `invoke` branches to its header.
+__attribute__((noinline)) static int f(int n) {
+  try {
+    int r = may_throw(n);
+    int acc = 0;
+    do { acc += r; sink = acc; } while (ctr++ < r);
+    return acc;
+  } catch (int e) { return e; }
+}
+
+int main() {
+  ctr = 0;
+  puti(f(5));    // r = 6, 7 trips: 42
+  ctr = 0;
+  puti(f(-3));   // -3
+  return 0;
+}
+"#;
+    check_cpp_eh_vs_native("cpp_eh_invoke_into_loop_header", src, b"");
+}
+
 /// **C++ exceptions — catch-by-value + destructor** — the path that forces `__cxa_end_catch` to stop
 /// being a no-op. The thrown type `E` has an observable copy-constructor (`+1`) and destructor
 /// (`+100`). `catch (E e)` copy-constructs a local from the exception object (`+1`), and on handler

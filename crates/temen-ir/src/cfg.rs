@@ -65,23 +65,24 @@ impl Cfg {
     /// guarantees they are in range); any stray out-of-range target is ignored rather than panicking,
     /// so this stays safe to run on unverified IR (fuzz discipline).
     pub fn new(blocks: &[Block]) -> Cfg {
-        let n = blocks.len();
-        let mut succs: Vec<Vec<u32>> = Vec::with_capacity(n);
+        Cfg::from_succs(blocks.iter().map(|b| successors(&b.term)).collect())
+    }
+
+    /// Build the graph from each block's successor indices, for a producer that knows its control
+    /// flow before it has built any blocks (temen-llvm translates in reverse postorder). Repeated and
+    /// out-of-range targets are dropped, as in [`Cfg::new`].
+    pub fn from_succs(mut succs: Vec<Vec<u32>>) -> Cfg {
+        let n = succs.len();
         let mut preds: Vec<Vec<u32>> = vec![Vec::new(); n];
-        for b in blocks {
-            let s: Vec<u32> = successors(&b.term)
-                .into_iter()
-                .filter(|&t| (t as usize) < n)
-                .collect();
-            succs.push(s);
-        }
-        for (b, ss) in succs.iter().enumerate() {
-            for &s in ss {
-                let p = &mut preds[s as usize];
-                if !p.contains(&(b as u32)) {
-                    p.push(b as u32);
+        for (b, ss) in succs.iter_mut().enumerate() {
+            // Blocks are visited in order, so an edge already seen from `b` ends `preds[t]`.
+            ss.retain(|&t| {
+                let keep = (t as usize) < n && preds[t as usize].last() != Some(&(b as u32));
+                if keep {
+                    preds[t as usize].push(b as u32);
                 }
-            }
+                keep
+            });
         }
         Cfg { succs, preds }
     }

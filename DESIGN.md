@@ -3106,8 +3106,9 @@ the rest → SSA) and the on-ramp only walks the legalized bitcode read-only.
 - **Core.** The headline is the **SSA → block-argument conversion** (the §1a win over wasm):
   LLVM dominance-SSA + φ-nodes → Temen's dominance form — φ-results become block params whose
   args branches supply, and every other value a block reads is captured from the block that defines
-  it (#2454); loops/joins/irreducible/critical edges need no edge splitting. Plus: narrow ints collapse to `i32` with re-emitted truncation /
-  sign-extension at the hazards (§3b — incl. signed `icmp` on a narrow operand); pointers are `i64`;
+  it (#2454); loops/joins/irreducible/critical edges need no edge splitting. Plus: narrow ints
+  collapse to `i32` with re-emitted truncation / sign-extension at the hazards (§3b — incl. signed
+  `icmp` on a narrow operand); pointers are `i64`;
   the **data-SP is the function's first param**, constant through the function (a call passes
   `sp+frame_size`). A block that uses the SP captures it rather than taking it as a param.
 - **Scalar+memory+call+aggregate coverage.** Integer/float arithmetic, `icmp`/`fcmp`, casts;
