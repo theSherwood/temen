@@ -13,18 +13,19 @@
 //! **Scope (Milestone 1, slices A–M):** multi-block scalar functions with stack memory, calls,
 //! `switch`, globals, floats, indirect calls, struct aggregates, memory intrinsics, by-value
 //! aggregates, pointer-valued global relocations, libm math calls, and integer min/max+bit intrinsics.
-//! - **A — control flow + scalar SSA.** The headline is the **SSA → block-argument conversion**:
-//!   LLVM's dominance-based SSA (a value usable in any dominated block; φ-nodes merging across
-//!   edges) becomes Temen's block-local form (§3a). Liveness makes every value live across a block's
-//!   entry a parameter (φ-results included); each branch supplies the args — loops, joins, and
-//!   critical edges all work without edge splitting. Integer arith/bitwise/shift/div-rem, `icmp`,
+//! - **A — control flow + scalar SSA.** LLVM's dominance-based SSA (a value usable in any dominated
+//!   block; φ-nodes merging across edges) maps onto Temen's dominance form (§3a, #2454): a φ becomes a
+//!   block parameter whose args each branch supplies, and a block captures every other value it reads
+//!   from the block that defines it. Blocks are translated in reverse postorder, so a value's block is
+//!   always done first; loops, joins, and critical edges all work without edge splitting. Integer
+//!   arith/bitwise/shift/div-rem, `icmp`,
 //!   `i1`/`i8`/`i16`/`i32`/`i64` `trunc`/`zext`/`sext`, `select`, `br`/`br_if`/`return`/`unreachable`.
 //! - **B — the §3d data stack.** `alloca` → an `sp`-relative window frame slot, `load`/`store`
 //!   (incl. narrow widths), `getelementptr` → address arithmetic. `undef`/`poison`/`null` → 0;
 //!   `llvm.lifetime`/`dbg`/`assume` dropped. Pointers are `i64`.
-//! - **C — calls + the threaded data-SP.** Every function takes a leading `sp` parameter (§3d),
-//!   threaded as block-local index 0 of every block; a direct `call` passes the callee `sp +
-//!   frame_size`, so activations get fresh frames and recursion is sound.
+//! - **C — calls + the data-SP.** Every function takes a leading `sp` parameter (§3d), the entry
+//!   block's value 0, which every other block that reads it captures; a direct `call` passes the
+//!   callee `sp + frame_size`, so activations get fresh frames and recursion is sound.
 //! - **D — `switch`.** Lowered to a `br_table` biased by the minimum case value, gaps filled with
 //!   the default edge (dense spans only; a too-sparse switch is `Unsupported`).
 //! - **E — global variables.** Globals live low in the window as `data` segments (constants
@@ -174,9 +175,9 @@ use crate::ll::ast::{
 };
 
 use temen_ir::{
-    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
-    FloatTy, Func, FuncName, IToF, Inst, IntTy, IntUnOp, LoadOp, Loc, Module, Ordering, SsaLoc,
-    StoreOp, Terminator, TypeDef, ValIdx, ValType, VarInfo, VarLoc,
+    AtomicRmwOp, BinOp, Block, BlockIdx, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp, FCmpOp, FToI,
+    FUnOp, FloatTy, Func, FuncName, IToF, Inst, IntTy, IntUnOp, LoadOp, Loc, Module, Ordering,
+    SsaLoc, StoreOp, Terminator, TypeDef, ValIdx, ValType, VarInfo, VarLoc,
 };
 
 /// The §6 debug-info + computed-`goto` data models (built by the [`ll`] reader, consumed by the
@@ -1548,8 +1549,8 @@ const _: () = assert!(temen_ir::POWERBOX_ARGS_END == DEFAULT_STACK_PAGE);
 /// past this faults rather than escaping the window ([`temen_ir::POWERBOX_STACK_RESERVE`]).
 const STACK_RESERVE: u64 = temen_ir::POWERBOX_STACK_RESERVE;
 
-/// The data-SP's synthetic value id — threaded as block-local index 0 of *every* block (§3d),
-/// like chibicc's `v0`. It carries no LLVM name; it is supplied positionally.
+/// The data-SP's synthetic value id — the entry block's value 0 (§3d), which every other block that
+/// reads it captures. It carries no LLVM name; it is supplied positionally.
 const SP: ValueId = usize::MAX;
 
 /// A sentinel `frame` key (never a real SSA value) holding the `sp`-relative offset of this
@@ -3170,7 +3171,8 @@ fn translate_func(
         return unsup(format!("declaration-only function `{}`", f.name));
     }
     // The IR signature prepends the data-SP (§3d): `(sp:i64, c-params…) -> results`. The data-SP
-    // is threaded as block-local index 0 of every block; a call passes `sp + frame_size`.
+    // is the entry block's value 0, which every other block captures; a call passes
+    // `sp + frame_size`.
     let mut params: Vec<ValType> = vec![ValType::I64];
     for p in &f.parameters {
         params.extend(param_vtypes(&p.ty)?);
@@ -3179,72 +3181,28 @@ fn translate_func(
     let results = result_types(f.return_type.as_ref(), types)?;
 
     let scan = scan_func(f, types)?;
-    let live_in = liveness(f, &scan)?;
-    let block_params = block_params(f, &scan, &live_in);
+    let (succ, order) = flow(f, &scan)?;
+    let (block_params, invoke_def) = block_params(f, &scan, &succ);
+    let def_of = |v: ValueId| match v {
+        SP => 0,
+        v => invoke_def.get(&v).copied().unwrap_or(scan.def_block[v]),
+    };
+    let captured = captures(f, &scan, &succ, &order, &def_of)?;
     let (frame, frame_size) = frame_layout(f, &scan, types)?;
 
-    // §6 debug-info variables. The `di` reader gives this function's source locals; resolve each to
-    // an IR location:
-    //   - `dbg.declare` (`-O0`): an alloca *ordinal* → the alloca's data-stack offset (same textual
-    //     order `frame_layout` lays out) → `VarLoc::Window`.
-    //   - `dbg.value` bound to argument `k` (`-O2`/`-Og`): the argument is ValueId `k`, threaded as
-    //     a block parameter wherever it is live; its block-local value index is its position in that
-    //     block's param list, so one `SsaLoc` per such block (effective from block entry) gives an
-    //     `SsaList` covering the argument's whole live range.
-    // §6 function name: the `DISubprogram` source name → this IR function index. (Only under `-g`: a
-    // stripped build deliberately carries no debug info to keep `.temen` lean — `translate.rs`'s
-    // `llvm_without_g_has_no_debug_info` guards that. The emitted wasm name section (#865) therefore
-    // falls back to `gfN` guest indices for a stripped guest; real symbol names need a `-g` build or a
-    // future opt-in symbol-recording flag.)
-    if let Some(src) = di.and_then(|d| d.func_names.get(&f.name)) {
-        dbg.func_names.push(FuncName {
-            func: func_idx,
-            name: src.clone(),
-        });
-    }
-    if let Some(vars) = di.and_then(|d| d.vars.get(&f.name)) {
-        let alloca_offsets = alloca_order_offsets(f, &scan, &frame);
-        for v in vars {
-            let loc = match v.loc {
-                di::DiLoc::Window { alloca_ordinal } => match alloca_offsets.get(alloca_ordinal) {
-                    Some(&off) => VarLoc::Window { off: off as i64 },
-                    None => continue,
-                },
-                di::DiLoc::Arg { index } => {
-                    let mut locs = Vec::new();
-                    for (bi, params) in block_params.iter().enumerate() {
-                        if let Some(pos) = params.iter().position(|&p| p == index as ValueId) {
-                            locs.push(SsaLoc {
-                                block: bi as u32,
-                                inst: 0,
-                                value: pos as u32,
-                            });
-                        }
-                    }
-                    if locs.is_empty() {
-                        continue;
-                    }
-                    VarLoc::SsaList(locs)
-                }
-            };
-            dbg.vars.push(VarInfo {
-                func: func_idx,
-                name: v.name.clone(),
-                ty: v.ty.clone(),
-                loc,
-                type_id: v.type_id,
-                scope: v.scope,
-            });
-        }
-    }
-
-    let mut blocks = Vec::with_capacity(f.basic_blocks.len());
+    let n = f.basic_blocks.len();
+    let mut blocks: Vec<Option<Block>> = (0..n).map(|_| None).collect();
+    // What each block captures once it is translated: the value each capture slot holds.
+    let mut capture_ids: Vec<Vec<ValueId>> = vec![Vec::new(); n];
     // Synthetic blocks appended *after* all real blocks (so real block indices are unchanged): a
     // sparse `switch` lowers to a comparison chain whose extra blocks land here (see `translate_switch`).
     let mut aux_blocks: Vec<Block> = Vec::new();
-    for (bi, bb) in f.basic_blocks.iter().enumerate() {
-        blocks.push(translate_block(
-            bb,
+    let mut defs = Defs::new();
+    // In reverse postorder: a value's defining block dominates every block that uses it, so it is
+    // translated first, and a block captures what it reads from elsewhere from there (#2454).
+    for &bi in &order {
+        let (block, ids) = translate_block(
+            &f.basic_blocks[bi],
             bi,
             func_idx,
             bc_func_idx,
@@ -3252,6 +3210,9 @@ fn translate_func(
             types,
             &scan,
             &block_params,
+            &captured[bi],
+            &def_of,
+            &mut defs,
             &frame,
             frame_size,
             name2idx,
@@ -3273,9 +3234,89 @@ fn translate_func(
             taken,
             sig_types,
             link,
-        )?);
+        )?;
+        blocks[bi] = Some(block);
+        capture_ids[bi] = ids;
     }
-    blocks.extend(aux_blocks);
+    // A block the entry can't reach runs never; it keeps its params, so the module stays well
+    // formed until `raise` drops it.
+    let blocks: Vec<Block> = blocks
+        .into_iter()
+        .enumerate()
+        .map(|(bi, b)| {
+            b.unwrap_or_else(|| Block {
+                parent: 0,
+                captures: vec![],
+                params: block_param_types(&block_params[bi], &scan),
+                insts: vec![],
+                term: Terminator::Unreachable,
+            })
+        })
+        .chain(aux_blocks)
+        .collect();
+
+    // §6 debug-info variables. The `di` reader gives this function's source locals; resolve each to
+    // an IR location:
+    //   - `dbg.declare` (`-O0`): an alloca *ordinal* → the alloca's data-stack offset (same textual
+    //     order `frame_layout` lays out) → `VarLoc::Window`.
+    //   - `dbg.value` bound to argument `k` (`-O2`/`-Og`): the argument is ValueId `k`, an entry
+    //     param, which a block that reads it captures; its block-local value index is its slot in
+    //     the entry's params or that block's captures, so one `SsaLoc` per such block (effective from
+    //     block entry) gives an `SsaList` covering where the argument is read.
+    // §6 function name: the `DISubprogram` source name → this IR function index. (Only under `-g`: a
+    // stripped build deliberately carries no debug info to keep `.temen` lean — `translate.rs`'s
+    // `llvm_without_g_has_no_debug_info` guards that. The emitted wasm name section (#865) therefore
+    // falls back to `gfN` guest indices for a stripped guest; real symbol names need a `-g` build or a
+    // future opt-in symbol-recording flag.)
+    if let Some(src) = di.and_then(|d| d.func_names.get(&f.name)) {
+        dbg.func_names.push(FuncName {
+            func: func_idx,
+            name: src.clone(),
+        });
+    }
+    if let Some(vars) = di.and_then(|d| d.vars.get(&f.name)) {
+        let alloca_offsets = alloca_order_offsets(f, &scan, &frame);
+        for v in vars {
+            let loc = match v.loc {
+                di::DiLoc::Window { alloca_ordinal } => match alloca_offsets.get(alloca_ordinal) {
+                    Some(&off) => VarLoc::Window { off: off as i64 },
+                    None => continue,
+                },
+                di::DiLoc::Arg { index } => {
+                    let arg = index as ValueId;
+                    let mut locs = Vec::new();
+                    if let Some(pos) = block_params[0].iter().position(|&p| p == arg) {
+                        locs.push(SsaLoc {
+                            block: 0,
+                            inst: 0,
+                            value: pos as u32,
+                        });
+                    }
+                    for (bi, ids) in capture_ids.iter().enumerate() {
+                        if let Some(pos) = ids.iter().position(|&c| c == arg) {
+                            locs.push(SsaLoc {
+                                block: bi as u32,
+                                inst: 0,
+                                value: (blocks[bi].params.len() + pos) as u32,
+                            });
+                        }
+                    }
+                    if locs.is_empty() {
+                        continue;
+                    }
+                    VarLoc::SsaList(locs)
+                }
+            };
+            dbg.vars.push(VarInfo {
+                func: func_idx,
+                name: v.name.clone(),
+                ty: v.ty.clone(),
+                loc,
+                type_id: v.type_id,
+                scope: v.scope,
+            });
+        }
+    }
     Ok((
         Func {
             params,
@@ -17366,108 +17407,37 @@ fn term_local_uses(term: &LTerm) -> Result<Vec<Name>, Error> {
     }
 }
 
-/// Pass 1b: SSA liveness (backward fixpoint). Returns each block's **live-in** set — the values
-/// defined elsewhere that are live at the block's entry (used here or threaded to a successor).
-/// These become the block's threaded parameters (φ-results are added separately). φ semantics:
-/// a φ in `S` taking `v` from predecessor `B` makes `v` live-*out* of `B` (an edge use), not
-/// live-in of `S`.
-fn liveness(f: &Function, s: &Scan) -> Result<Vec<HashSet<ValueId>>, Error> {
-    let n = f.basic_blocks.len();
-    // Per-block precomputed sets.
-    let mut defs: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
-    let mut uevar: Vec<HashSet<ValueId>> = vec![HashSet::new(); n]; // upward-exposed direct uses
-    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut phi_defs: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
-    // phi_uses[b] = values that some successor's φ pulls from predecessor `b`.
-    let mut phi_uses: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
-
-    let id = |name: &Name| -> Option<ValueId> { s.name2id.get(name).copied() };
-
-    for (bi, bb) in f.basic_blocks.iter().enumerate() {
-        for instr in &bb.instrs {
-            if let Some(d) = instr.try_get_result() {
-                if let Some(vid) = id(d) {
-                    defs[bi].insert(vid);
-                    if matches!(instr, Instruction::Phi(_)) {
-                        phi_defs[bi].insert(vid);
-                    }
+/// Pass 1b: each block's successors, and the blocks the entry reaches, in reverse postorder.
+/// Blocks are translated in that order: a value's defining block dominates every block that uses it
+/// (SSA), so it is translated first, and the blocks that read the value capture it from there.
+fn flow(f: &Function, s: &Scan) -> Result<(Vec<Vec<usize>>, Vec<usize>), Error> {
+    let succ: Vec<Vec<usize>> = f
+        .basic_blocks
+        .iter()
+        .map(|bb| term_succs(&bb.term, s))
+        .collect::<Result<_, _>>()?;
+    let mut seen = vec![false; succ.len()];
+    let mut post = Vec::with_capacity(succ.len());
+    // Depth-first from the entry: each frame is a block and the next successor to visit.
+    let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+    seen[0] = true;
+    while let Some((b, next)) = stack.last_mut() {
+        match succ[*b].get(*next) {
+            Some(&t) => {
+                *next += 1;
+                if !seen[t] {
+                    seen[t] = true;
+                    stack.push((t, 0));
                 }
             }
-            // A direct use of a value defined in another block is upward-exposed.
-            for u in local_uses(instr)? {
-                if let Some(vid) = id(&u) {
-                    if s.def_block[vid] != bi {
-                        uevar[bi].insert(vid);
-                    }
-                }
-            }
-        }
-        for u in term_local_uses(&bb.term)? {
-            if let Some(vid) = id(&u) {
-                if s.def_block[vid] != bi {
-                    uevar[bi].insert(vid);
-                }
-            }
-        }
-        // An `invoke`'s (non-void) result is defined by this block (the synthetic call block on the
-        // normal edge), so record it as a def here — it threads out to the normal successor.
-        if let LTerm::Invoke(inv) = &bb.term {
-            if let Some(vid) = id(&inv.result) {
-                defs[bi].insert(vid);
-            }
-        }
-        for t in term_succs(&bb.term, s)? {
-            succ[bi].push(t);
-        }
-    }
-    // φ edge-uses: attribute each φ incoming to its named predecessor.
-    for bb in &f.basic_blocks {
-        for instr in &bb.instrs {
-            if let Instruction::Phi(p) = instr {
-                for (op, pred) in &p.incoming_values {
-                    if let Operand::LocalOperand { name, .. } = op {
-                        if let (Some(vid), Some(&pb)) = (id(name), s.block_idx.get(pred)) {
-                            phi_uses[pb].insert(vid);
-                        }
-                    }
-                }
+            None => {
+                post.push(*b);
+                stack.pop();
             }
         }
     }
-
-    let mut live_in: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
-    let mut live_out: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for bi in (0..n).rev() {
-            // live_out(B) = ∪_succ [ (live_in(S) \ PhiDefs(S)) ∪ PhiUses(B,S-via-edge) ]
-            let mut new_out: HashSet<ValueId> = phi_uses[bi].clone();
-            for &sblk in &succ[bi] {
-                for &v in &live_in[sblk] {
-                    if !phi_defs[sblk].contains(&v) {
-                        new_out.insert(v);
-                    }
-                }
-            }
-            // live_in(B) = UEVar(B) ∪ (live_out(B) \ Defs(B))
-            let mut new_in = uevar[bi].clone();
-            for &v in &new_out {
-                if !defs[bi].contains(&v) {
-                    new_in.insert(v);
-                }
-            }
-            if new_out != live_out[bi] {
-                live_out[bi] = new_out;
-                changed = true;
-            }
-            if new_in != live_in[bi] {
-                live_in[bi] = new_in;
-                changed = true;
-            }
-        }
-    }
-    Ok(live_in)
+    post.reverse();
+    Ok((succ, post))
 }
 
 /// The successor block indices of a terminator.
@@ -17489,8 +17459,7 @@ fn term_succs(term: &LTerm, s: &Scan) -> Result<Vec<usize>, Error> {
             Ok(v)
         }
         // `indirectbr` enumerates its full destination set (`possible_dests`) — every one is a
-        // successor, so liveness threads each target's live-ins out of this block (the `br_table`
-        // edges then supply them).
+        // successor, so the `br_table` edges supply each target's φ args.
         LTerm::IndirectBr(ib) => ib.possible_dests.iter().map(b).collect(),
         LTerm::Ret(_) | LTerm::Unreachable(_) => Ok(Vec::new()),
         // An `invoke`'s two edges (normal return / unwind to the landing pad) are both successors —
@@ -17502,43 +17471,173 @@ fn term_succs(term: &LTerm, s: &Scan) -> Result<Vec<usize>, Error> {
     }
 }
 
-/// Pass 1c: the ordered parameter value-ids of each block. Entry's parameters are the function's
-/// parameters (§3b). Every other block's are its φ-results (in φ order) followed by its threaded
-/// live-in values (sorted by id for a deterministic order shared by the block header and every
-/// branch into it).
-fn block_params(f: &Function, s: &Scan, live_in: &[HashSet<ValueId>]) -> Vec<Vec<ValueId>> {
-    let mut out = Vec::with_capacity(f.basic_blocks.len());
-    for (bi, bb) in f.basic_blocks.iter().enumerate() {
-        if bi == 0 {
-            // Entry: the data-SP then the function parameters (ids 0..nparams), matching the
-            // prepended IR signature `(sp, c-params…)`.
-            let mut params = vec![SP];
-            params.extend(0..f.parameters.len());
-            out.push(params);
-            continue;
-        }
-        // Every non-entry block carries the data-SP as its first parameter (§3d), then its
-        // φ-results and threaded live-ins.
-        let mut params: Vec<ValueId> = vec![SP];
-        let mut phi_set: HashSet<ValueId> = HashSet::new();
-        for instr in &bb.instrs {
-            if let Instruction::Phi(p) = instr {
-                if let Some(&vid) = s.name2id.get(&p.dest) {
-                    params.push(vid);
-                    phi_set.insert(vid);
+/// Pass 1c: the ordered parameter value-ids of each block. Entry's are the data-SP then the
+/// function's parameters (§3b, §3d). Every other block's are its φ-results, in φ order. The normal
+/// successor of an `invoke` that has no other way in also takes the invoke's result: the result exists
+/// only once the call returns, in the synthetic call block (`lower_invoke`), which passes it there.
+/// That successor is where the result is defined, which the second map records. Everything else a
+/// block reads from elsewhere it captures ([`captures`]).
+fn block_params(
+    f: &Function,
+    s: &Scan,
+    succ: &[Vec<usize>],
+) -> (Vec<Vec<ValueId>>, HashMap<ValueId, usize>) {
+    let mut out: Vec<Vec<ValueId>> = f
+        .basic_blocks
+        .iter()
+        .enumerate()
+        .map(|(bi, bb)| match bi {
+            0 => std::iter::once(SP).chain(0..f.parameters.len()).collect(),
+            _ => bb
+                .instrs
+                .iter()
+                .map_while(|i| match i {
+                    Instruction::Phi(p) => Some(p),
+                    _ => None,
+                })
+                .filter_map(|p| s.name2id.get(&p.dest).copied())
+                .collect(),
+        })
+        .collect();
+    let mut ins = vec![0u32; succ.len()];
+    for t in succ.iter().flatten() {
+        ins[*t] += 1;
+    }
+    let mut invoke_def = HashMap::new();
+    for bb in &f.basic_blocks {
+        if let LTerm::Invoke(inv) = &bb.term {
+            if let (Some(&rv), Some(&ok)) = (
+                s.name2id.get(&inv.result),
+                s.block_idx.get(&inv.return_label),
+            ) {
+                if ins[ok] == 1 {
+                    out[ok].push(rv);
+                    invoke_def.insert(rv, ok);
                 }
             }
         }
-        let mut threaded: Vec<ValueId> = live_in[bi]
-            .iter()
-            .copied()
-            .filter(|v| !phi_set.contains(v))
-            .collect();
-        threaded.sort_unstable();
-        params.extend(threaded);
-        out.push(params);
     }
-    out
+    (out, invoke_def)
+}
+
+/// Pass 1d: what each reachable block captures (#2454): the values it reads that another block
+/// defines. A value's defining block dominates every block that reads it, so this is one pass over
+/// each block's own reads: its instructions' operands, its terminator's, and the φ incomings it
+/// passes along its out-edges. Every non-entry block also captures the data-SP (§3d), which its
+/// lowering reads without an LLVM operand; a block that never reads it drops it again
+/// ([`drop_unread_captures`]). Sorted by value id, so the data-SP comes last.
+fn captures(
+    f: &Function,
+    s: &Scan,
+    succ: &[Vec<usize>],
+    order: &[usize],
+    def_of: &impl Fn(ValueId) -> usize,
+) -> Result<Vec<Vec<ValueId>>, Error> {
+    let mut out: Vec<Vec<ValueId>> = vec![Vec::new(); f.basic_blocks.len()];
+    for &bi in order.iter().filter(|&&b| b != 0) {
+        let bb = &f.basic_blocks[bi];
+        // The result of this block's own `invoke` is defined past its terminator, never in it.
+        let own = match &bb.term {
+            LTerm::Invoke(inv) => s.name2id.get(&inv.result).copied(),
+            _ => None,
+        };
+        let mut c = vec![SP];
+        let mut read = |name: &Name| {
+            if let Some(&v) = s.name2id.get(name) {
+                if def_of(v) != bi && Some(v) != own {
+                    c.push(v);
+                }
+            }
+        };
+        for instr in bb
+            .instrs
+            .iter()
+            .filter(|i| !matches!(i, Instruction::Phi(_)))
+        {
+            for u in local_uses(instr)? {
+                read(&u);
+            }
+        }
+        for u in term_local_uses(&bb.term)? {
+            read(&u);
+        }
+        let name = &s.block_name[bi];
+        for &t in &succ[bi] {
+            for instr in &f.basic_blocks[t].instrs {
+                let Instruction::Phi(p) = instr else { break };
+                for (op, pred) in &p.incoming_values {
+                    if let (Operand::LocalOperand { name: v, .. }, true) = (op, pred == name) {
+                        read(v);
+                    }
+                }
+            }
+        }
+        c.sort_unstable();
+        c.dedup();
+        out[bi] = c;
+    }
+    Ok(out)
+}
+
+/// Where each value already translated lives: the block and block-local index of the value, or of
+/// each of its parts (a wide vector's, a flat struct's), which can live in different blocks.
+type Defs = HashMap<ValueId, Parts>;
+
+/// A translated value's place, or its parts' places.
+enum Parts {
+    One((BlockIdx, ValIdx)),
+    Many(Vec<(BlockIdx, ValIdx)>),
+}
+
+impl Parts {
+    fn as_slice(&self) -> &[(BlockIdx, ValIdx)] {
+        match self {
+            Parts::One(v) => core::slice::from_ref(v),
+            Parts::Many(v) => v,
+        }
+    }
+}
+
+/// Drop the captures block `b` never reads, and renumber what follows them. `ids` holds the value each
+/// capture slot holds; it is trimmed to match. Returns the renumbering, which maps each kept capture
+/// and each instruction result to its new index.
+fn drop_unread_captures(b: &mut Block, ids: &mut Vec<ValueId>) -> impl Fn(ValIdx) -> ValIdx {
+    let np = b.params.len() as ValIdx;
+    let nc = b.captures.len() as ValIdx;
+    let mut read = vec![false; nc as usize];
+    let mut note = |&v: &ValIdx| {
+        if (np..np + nc).contains(&v) {
+            read[(v - np) as usize] = true;
+        }
+    };
+    for inst in &b.insts {
+        inst.for_each_operand(&mut note);
+    }
+    b.term.for_each_operand(&mut note);
+    // Each capture slot's new index, and how many slots before each were dropped.
+    let mut to: Vec<ValIdx> = Vec::with_capacity(nc as usize);
+    let mut kept: ValIdx = 0;
+    for &r in &read {
+        to.push(np + kept);
+        kept += r as ValIdx;
+    }
+    let dropped = nc - kept;
+    let remap = move |v: ValIdx| match v {
+        v if v < np => v,
+        v if v < np + nc => to[(v - np) as usize],
+        v => v - dropped,
+    };
+    if dropped > 0 {
+        let mut r = read.iter();
+        b.captures.retain(|_| *r.next().unwrap());
+        let mut r = read.iter();
+        ids.retain(|_| *r.next().unwrap());
+        for inst in &mut b.insts {
+            inst.for_each_operand_mut(&mut |v| *v = remap(*v));
+        }
+        b.term.for_each_operand_mut(&mut |v| *v = remap(*v));
+    }
+    remap
 }
 
 /// A block under construction: the straight-line body, the value-id → block-local-index map
@@ -18612,6 +18711,9 @@ fn translate_block(
     types: &Types,
     s: &Scan,
     block_params: &[Vec<ValueId>],
+    captured: &[ValueId],
+    def_of: &impl Fn(ValueId) -> usize,
+    defs: &mut Defs,
     frame: &HashMap<ValueId, u64>,
     frame_size: u64,
     name2idx: &HashMap<String, u32>,
@@ -18633,7 +18735,7 @@ fn translate_block(
     taken: &RefCell<HashSet<u32>>,
     sig_types: &RefCell<Vec<temen_ir::TypeEntry>>,
     link: Option<&LinkCtx>,
-) -> Result<Block, Error> {
+) -> Result<(Block, Vec<ValueId>), Error> {
     let param_ids = &block_params[bi];
     // Materialize the block parameters. A scalar value (incl. the data-SP, which types as `i64`) is
     // one slot; a **wide-vector** value fans out into `K = full_chunks + tail_lanes` consecutive
@@ -18705,7 +18807,32 @@ fn translate_block(
     for (vid, parts) in agg_seed {
         ctx.agg.insert(vid, parts);
     }
-    ctx.next_val = params.len() as ValIdx;
+    // Then what the block captures (#2454): each part of each value it reads that another block
+    // defines, from the slot that block holds it in. Translated in reverse postorder, the defining
+    // block, which dominates this one, is already done.
+    let mut captures: Vec<(BlockIdx, ValIdx)> = Vec::new();
+    let mut capture_ids: Vec<ValueId> = Vec::new();
+    for &vid in captured {
+        let parts = defs.get(&vid).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "value {vid} is read in block {bi} but not defined in a block that dominates it"
+            ))
+        })?;
+        let start = (params.len() + captures.len()) as ValIdx;
+        for &part in parts.as_slice() {
+            captures.push(part);
+            capture_ids.push(vid);
+        }
+        let slots: Vec<ValIdx> = (start..(params.len() + captures.len()) as ValIdx).collect();
+        if s.wide.contains_key(&vid) {
+            ctx.wide_vals.insert(vid, slots);
+        } else if let Parts::Many(_) = parts {
+            ctx.agg.insert(vid, slots);
+        } else {
+            ctx.idx_of.insert(vid, start);
+        }
+    }
+    ctx.next_val = (params.len() + captures.len()) as ValIdx;
 
     // Entry prologue: seed the dynamic-alloca running top (`DYN_TOP` slot) to `sp + frame_size` — the
     // base of the variable-length region, just above this activation's fixed frame. Emitted first in
@@ -18747,13 +18874,36 @@ fn translate_block(
         Some(t) => t,
         None => translate_term(&mut ctx, &bb.term, bi, f, s, block_params, aux_blocks)?,
     };
-    Ok(Block {
+    let mut block = Block {
         parent: 0,
-        captures: vec![],
+        captures,
         params,
         insts: ctx.insts,
         term,
-    })
+    };
+    // Record where each value this block defines lives, for the blocks it dominates to capture. A
+    // value the lowering binds to one of this block's captures (an `extractvalue` of a captured
+    // struct, a no-op cast) lives where that capture's source does, so record the source: what reads
+    // it captures it from there, and this block needn't hold it.
+    let (np, sources) = (block.params.len() as ValIdx, block.captures.clone());
+    let to = drop_unread_captures(&mut block, &mut capture_ids);
+    let place = |i: ValIdx| match i.checked_sub(np).and_then(|c| sources.get(c as usize)) {
+        Some(&source) => source,
+        None => (bi as BlockIdx, to(i)),
+    };
+    let here = |v: &ValueId| def_of(*v) == bi;
+    for (&v, &i) in ctx.idx_of.iter().filter(|(v, _)| here(v)) {
+        defs.insert(v, Parts::One(place(i)));
+    }
+    for (&v, parts) in ctx
+        .wide_vals
+        .iter()
+        .chain(ctx.agg.iter())
+        .filter(|(v, _)| here(v))
+    {
+        defs.insert(v, Parts::Many(parts.iter().map(|&i| place(i)).collect()));
+    }
+    Ok((block, capture_ids))
 }
 
 /// The width class of an atomic operation's value type. `i32`/`i64`/pointer map to a native
@@ -23611,8 +23761,8 @@ fn lower_invoke(
     // The unwind edge is taken directly from B — resolve its args in B's context.
     let lpad_args = branch_args(ctx, bi, lpad_blk, f, s, block_params)?;
 
-    // The normal edge feeds `%ok`, whose args may include the invoke result — directly (a live-in) or
-    // as a φ incoming (when `return_label` is itself a φ block). The result is defined only in `Bcall`,
+    // The normal edge feeds `%ok`, whose args may include the invoke result — directly (`%ok`'s param
+    // for it, `block_params`) or as a φ incoming (when `return_label` is itself a φ block). The result is defined only in `Bcall`,
     // so resolve `%ok`'s args in B's context with the result temporarily bound to a fresh dummy const;
     // every `ok_args` slot that comes back equal to that dummy's id is a result slot (handles a result
     // used zero, one, or several times), filled with the real result inside `Bcall` and kept out of `T`.
@@ -23812,7 +23962,7 @@ fn translate_indirectbr(
         return unsup("indirectbr with no destinations");
     }
 
-    // Branch arguments per distinct destination (each target's φ-results + threaded live-ins).
+    // Branch arguments per distinct destination (each target's φ-results).
     let mut args_for: HashMap<usize, Vec<ValIdx>> = HashMap::new();
     for &d in &dests {
         if let std::collections::hash_map::Entry::Vacant(e) = args_for.entry(d) {
@@ -24036,9 +24186,9 @@ fn block_param_types(param_ids: &[ValueId], s: &Scan) -> Vec<ValType> {
 /// Rust's niche-optimized enums (discriminants at `i64::MIN`-ish sentinels) produce exactly these
 /// astronomically-sparse switches. The chain blocks are appended to `aux_blocks` — *after* all real
 /// blocks, so existing block indices are unchanged — and thread, as block parameters, everything a
-/// downstream edge consumes: the data-SP (every block's param 0, §3d), the compared operand, and every
-/// case/default target's branch args. Those args are computed **once here**, in the switch block's
-/// context, because φ-operand / live-in resolution needs the real predecessor (`bi`), not the synthetic
+/// downstream edge consumes: the data-SP (§3d), the compared operand, and every case/default target's
+/// branch args. Those args are computed **once here**, in the switch block's context, because
+/// φ-operand resolution needs the real predecessor (`bi`), not the synthetic
 /// blocks; they are then threaded to wherever the chain consumes them.
 #[allow(clippy::too_many_arguments)]
 fn lower_sparse_switch(
@@ -24068,15 +24218,15 @@ fn lower_sparse_switch(
     };
     let operand = ctx.operand(&sw.operand)?;
 
-    // Compute every target's branch args in *this* block's context (φ/live-in resolution needs the
-    // real predecessor `bi`). The returned ids are this-block-local.
+    // Compute every target's branch args in *this* block's context (φ resolution needs the real
+    // predecessor `bi`). The returned ids are this-block-local.
     let default_args = branch_args(ctx, bi, default_blk, f, s, block_params)?;
     let mut case_args: Vec<Vec<ValIdx>> = Vec::with_capacity(cases.len());
     for &(_, blk) in cases {
         case_args.push(branch_args(ctx, bi, blk, f, s, block_params)?);
     }
 
-    // The threaded value set `T`, in order: the data-SP (param 0 of every block), the operand, then
+    // The threaded value set `T`, in order: the data-SP, the operand, then
     // every distinct value any edge consumes. A chain block's params are exactly `T` (this order), so a
     // value's chain-block param index is its position in `T`.
     let sp = ctx.sp()?;
@@ -24193,8 +24343,8 @@ fn operand_bits(op: &Operand) -> Result<u32, Error> {
 }
 
 /// Build the argument list for a branch from `from` to `target`: for each of `target`'s
-/// parameters (φ-results then threaded live-ins), supply — from the *source* block `from` —
-/// the φ's incoming value for this predecessor, or the threaded value itself.
+/// parameters, supply — from the *source* block `from` — the φ's incoming value for this
+/// predecessor, or for an `invoke`'s normal successor the invoke's result.
 fn branch_args(
     ctx: &mut BlockCtx,
     from: usize,
@@ -24233,35 +24383,20 @@ fn branch_args(
     }
     let mut args = Vec::with_capacity(block_params[target].len());
     for &pv in &block_params[target] {
-        // A wide-vector param takes `K` args — its incoming value's chunk/tail parts, in the same
-        // order the target block's param fan-out expects (I2 step 1 cross-block).
-        if let Some(&layout) = s.wide.get(&pv) {
-            let parts = if let Some(&(op, _, _)) = phi_incoming.get(&pv) {
-                ctx.wide_operand(op, layout)?
-            } else {
-                // A threaded wide live-in: its parts are live-out of `from`, available here.
-                ctx.wide_vals.get(&pv).cloned().ok_or_else(|| {
-                    Error::Unsupported(format!("wide value {pv} not available across edge"))
-                })?
-            };
-            args.extend(parts);
-        } else if let Some(ftys) = s.agg_layout.get(&pv) {
-            // A struct param takes one arg per field — the incoming struct's fields, in the same order
-            // the target's per-field fan-out expects (the aggregate analog of the wide branch above).
-            let parts = if let Some(&(op, _, _)) = phi_incoming.get(&pv) {
-                ctx.agg_operand(op, ftys)?
-            } else {
-                // A threaded struct live-in: its fields are live-out of `from`, available here.
-                ctx.agg.get(&pv).cloned().ok_or_else(|| {
-                    Error::Unsupported(format!("struct value {pv} not available across edge"))
-                })?
-            };
-            args.extend(parts);
-        } else if let Some(&(op, phi_ord, inc_idx)) = phi_incoming.get(&pv) {
-            args.push(ctx.phi_operand(op, target as u32, phi_ord, inc_idx)?);
-        } else {
-            // A threaded live-in: it is live-out of `from`, so available in this block.
+        let Some(&(op, phi_ord, inc_idx)) = phi_incoming.get(&pv) else {
+            // Not a φ: an `invoke`'s result ([`block_params`]), bound in this block's context to the
+            // slot `lower_invoke` fills from the call.
             args.push(ctx.id(pv)?);
+            continue;
+        };
+        // A wide-vector φ takes `K` args, its incoming value's chunk/tail parts, and a struct φ one
+        // per field, in the order the target's param fan-out expects (I2 step 1 cross-block).
+        if let Some(&layout) = s.wide.get(&pv) {
+            args.extend(ctx.wide_operand(op, layout)?);
+        } else if let Some(ftys) = s.agg_layout.get(&pv) {
+            args.extend(ctx.agg_operand(op, ftys)?);
+        } else {
+            args.push(ctx.phi_operand(op, target as u32, phi_ord, inc_idx)?);
         }
     }
     Ok(args)

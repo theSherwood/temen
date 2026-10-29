@@ -35,8 +35,9 @@ The **demo-driven breadth plan (demos 1–6) is now complete** — `hexdump` (va
 `lineedit` (overlap-safe `memmove`, AA), and `raytrace` (transcendental libm bundled as guest code,
 AB) all run byte-identical to native.**
 `crates/temen-llvm` does the **SSA → block-argument
-conversion** (LLVM dominance SSA + φ-nodes → Temen's block-local form via liveness; loops/joins/
-critical edges, no edge splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
+conversion** (LLVM dominance SSA + φ-nodes → Temen's dominance form: φs become block params, every
+other value a block reads is captured from its defining block; loops/joins/critical edges, no edge
+splitting), the integer scalar op set, the **§3d data-stack** (`alloca` →
 window frame slots, `load`/`store` incl. narrow widths, `getelementptr` → address arithmetic),
 **direct calls with the threaded data-SP** (every function takes a leading `sp`; a call passes
 `sp + frame_size`, so recursion is sound), **`switch` → `br_table`**, **global variables**
@@ -360,9 +361,10 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
 
 ### Milestone 1 — the chibicc-proven scalar+memory+call subset 🟢 (the D54 MVP)
 **Slice A (DONE) — control flow + scalar SSA.** Multi-block integer functions on both backends.
-- [x] φ → block parameters — done as a general **SSA → block-argument conversion** (liveness-based:
-      every value live across a block entry becomes a parameter, φ-results included; each branch
-      supplies the args). Critical edges need **no splitting** — args are evaluated in the
+- [x] φ → block parameters — done as a general **SSA → block-argument conversion**: φ-results become
+      parameters, and each branch supplies the args. Every other value a block reads it captures
+      from the block that defines it (#2454; a liveness fixpoint threaded each one through every block
+      in between until 3b). Critical edges need **no splitting** — args are evaluated in the
       predecessor. Loops/joins/back-edges all covered.
 - [x] Integer arith/bitwise/`shl`/`lshr`/`ashr`/`udiv`/`sdiv`/`urem`/`srem`; `icmp` (all 10
       predicates); `select`; `i1`/`i8`/`i16`/`i32`/`i64` `trunc`/`zext`/`sext` (narrow-int collapse
@@ -383,8 +385,8 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       frame), interp == JIT == hand-computed.
 
 **Slice C (DONE) — calls + the threaded data-SP.** Direct calls; per-activation frames.
-- [x] Every function takes a leading `sp` parameter (§3d), threaded as block-local index 0 of every
-      block (like chibicc's `v0`); each branch passes it through. A direct `call` resolves the
+- [x] Every function takes a leading `sp` parameter (§3d), the entry block's value 0; every other
+      block that reads it captures it (#2454). A direct `call` resolves the
       target by name → IR function index, and passes the callee `sp + frame_size` (so frames never
       overlap; recursion is sound), then the mapped arguments; the result threads back. Tested on
       `clang -O2` recursive `fib` and a `noinline` cross-function call, interp == JIT == hand-computed.
@@ -396,7 +398,7 @@ demand)**, **🟠 real-program blocker**, **⚪ non-goal/deferred**.
       switch and the `even`/`odd` mutual recursion `-O2` lowers onto a switch-loop.
 - [x] **Sparse** switches (span > 4096 — i64 niche-optimized enum discriminants, real parsers
       dispatching on 4-byte fourccs) → an equality **compare chain** of synthetic blocks
-      (`lower_sparse_switch`, threading live-ins/φ args via `aux_blocks`), since a dense `br_table`
+      (`lower_sparse_switch`, threading the φ args via `aux_blocks`), since a dense `br_table`
       would be astronomically large. Tested by `switch_sparse_*`; also lands stb_image's PNG chunk
       loop (slice BH).
 
@@ -2154,7 +2156,7 @@ constants in the dispatch-table global and `goto *p` into an `indirectbr`:
   (`translate_indirectbr`) → a `br_table` indexed by that block index over `[0, nblocks)`: each listed
   dest routes to its block; out-of-list / out-of-range (UB) falls to the default (the first dest — a
   defined in-sandbox branch, §3b totality, never taken on well-defined input). `possible_dests` are all
-  successors, so liveness threads each target's live-ins as `br_table` edge args (reusing `branch_args`).
+  successors, so each target's φ args ride the `br_table` edges (reusing `branch_args`).
 - **Tests:** `computed_goto_threaded_interpreter` (a real threaded bytecode VM whose program is derived
   from `n` at runtime — so no dispatch constant-folds — byte-identical to native on **both** backends)
   and `computed_goto_lowers_indirectbr_to_br_table` (structural: recovery finds the table labels, the
