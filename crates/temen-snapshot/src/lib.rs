@@ -302,7 +302,12 @@ use temen_ir::Module;
 /// slot ever granted, and a live record no longer carries its own. A slot the guest closed keeps its
 /// counter across the thaw, so its handle still answers `-EBADF` rather than trapping as a forgery,
 /// and the next grant into it issues the value the uninterrupted run would have.
-const FORMAT_VERSION: u16 = 52;
+/// v53 (#2043): Section 13 carries the domain's child-handle table: every slot's counter, in slot
+/// order up to the last slot that ever issued. A child handle packs like a capability handle, and
+/// threads and §14 children share one table per domain, so a record's slot is the domain's, not its
+/// spawner's. A spent child handle stays spent across the thaw, and the next spawn gets the handle the
+/// uninterrupted run would have (#2619).
+const FORMAT_VERSION: u16 = 53;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -344,6 +349,9 @@ const TAG_REGIONS: u64 = 11;
 /// Section 12 (v49, #1688): the fork twins a domain forked, each live one a nested artifact. See
 /// [`write_twins`].
 const TAG_TWINS: u64 = 12;
+/// Section 13 (v53, #2043): the domain's child-handle table's counters. Emitted only when the domain
+/// spawned.
+const TAG_CHILDREN: u64 = 13;
 /// A Section 12 record's kind: a live twin a personality forked, which its own table reaps.
 const TWIN_LIVE: u8 = 0;
 /// A live twin a servicer's `clone_caller` forked, which the servicer's `wait` reaps (v50, #2571).
@@ -1011,6 +1019,16 @@ fn freeze_at(
         section(&mut out, TAG_TWINS, |b| b.extend_from_slice(&body));
     }
 
+    // Section 13 — the domain's child-handle table (#2043, v53): every slot's counter, so a spent child
+    // handle stays spent after the thaw and the next spawn gets the handle the uninterrupted run would
+    // have (#2619). The records above name their slots in it. Elided when the domain never spawned.
+    let child_generations = host.child_generations();
+    if !child_generations.is_empty() {
+        section(&mut out, TAG_CHILDREN, |b| {
+            write_generations(b, child_generations)
+        });
+    }
+
     Ok(out)
 }
 
@@ -1632,6 +1650,7 @@ fn restore_at(
     let mut budgets_body = None;
     let mut regions_body = None;
     let mut twins_body = None;
+    let mut children_body = None;
     while !r.at_end() {
         let tag = r.uleb()?;
         let len = r.uleb()? as usize;
@@ -1650,6 +1669,7 @@ fn restore_at(
             TAG_BUDGETS => budgets_body = Some(body),
             TAG_REGIONS => regions_body = Some(body),
             TAG_TWINS => twins_body = Some(body),
+            TAG_CHILDREN => children_body = Some(body),
             // Fail closed on an unknown tag (#915/§8). The version gate above already pins
             // `version == FORMAT_VERSION`, so no artifact this build emits can carry one — silently
             // skipping it was dead "forward-compat" that only opened a canonicality hole (a
@@ -2028,10 +2048,39 @@ fn restore_at(
     // its own powerbox, against the module grant its launch record names. Last, so the parent's own
     // handle table (and so the registrar's answers for it) is settled first; all-or-nothing — any
     // child failing fails this restore. ----
+    let mut joinable_slots = Vec::new();
     if let Some(body) = detached_body {
         let children = decode_detached(body, module, host, depth, cut)?;
+        joinable_slots.extend(
+            children
+                .iter()
+                .filter(|c| c.launch.joinable)
+                .map(|c| c.slot),
+        );
         host.set_thawed_detached(children);
     }
+    // ---- The child-handle table (#2043, v53): every slot's counter. Each record a join slot names is
+    // one the table issued, and no two name one slot: the domain has one table, which the thaw rebuilds
+    // before re-filing them. ----
+    let child_generations = match children_body {
+        Some(body) => {
+            let mut cr = Reader::new(body);
+            let g = read_generations(&mut cr, temen_ir::handles::SLOTS as u32)?;
+            if !cr.at_end() || g.is_empty() {
+                return Err(RestoreError::Malformed); // non-canonical: an empty table is elided
+            }
+            g
+        }
+        None => Vec::new(),
+    };
+    joinable_slots.extend(host.frozen_vcpus().iter().map(|v| v.slot));
+    joinable_slots.extend(host.frozen_detached().iter().map(|d| d.slot));
+    joinable_slots.sort_unstable();
+    let issued = |&slot: &usize| child_generations.get(slot).is_some_and(|&g| g != 0);
+    if !joinable_slots.iter().all(issued) || joinable_slots.windows(2).any(|w| w[0] == w[1]) {
+        return Err(RestoreError::Malformed);
+    }
+    host.set_child_generations(child_generations);
     // ---- Fork twins (#1688, v49): each live one restored from its own nested artifact into its own
     // powerbox, against its parent's program, as a detached child is. ----
     if let Some(body) = twins_body {
