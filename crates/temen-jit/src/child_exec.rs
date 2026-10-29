@@ -207,7 +207,7 @@ impl ChildTask {
         let a = SendRaw(args.as_ptr());
         let r = SendRaw(results.as_ptr() as *mut i64);
         let b = SendRaw(base);
-        let t = SendRaw(code.fn_table.as_ptr() as *const core::ffi::c_void);
+        let t = SendRaw(code.fn_table.base());
         // The entry ABI spells the vmctx as its trap cell (`VmCtx` field 0).
         let c = SendRaw(Arc::as_ptr(&vm) as *mut i64);
         // The body: enter the child once through the limit-taking trampoline with this fiber's
@@ -509,7 +509,7 @@ impl ChildExec {
                         &mut *task.rt,
                         &thaw.fibers,
                         task.window.base() as u64,
-                        task._code.fn_table.as_ptr() as u64,
+                        task._code.fn_table.base() as u64,
                         Arc::as_ptr(&task.vm) as u64,
                     )
                 };
@@ -522,7 +522,7 @@ impl ChildExec {
                 let d = Arc::new(Domain::new_child(hub, task.chain.clone(), task.node.take()));
                 d.set_env(
                     task.window.base() as u64,
-                    task._code.fn_table.as_ptr() as u64,
+                    task._code.fn_table.base() as u64,
                     Arc::as_ptr(&task.vm), // the child's vCPUs are its instance
                     task._code.call_tramp,
                     task.fault,

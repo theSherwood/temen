@@ -63,7 +63,7 @@
 //! resumed, exclusive because its slot is `RUNNING` and only the claimant proceeds.
 
 use crate::fiber_registry::{Ownership, FIBER_HANDLE_GEN_MASK};
-use crate::{FnEntry, TrapKind};
+use crate::{slot_record, TrapKind};
 use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap};
@@ -1022,8 +1022,9 @@ unsafe fn make_fiber(
             (*current()).yielders.push(y as *const Yielder);
             // Resolve + type-check the funcref now (first resume), like the interpreter.
             let slot = (funcref as u32 as usize) & (mask as usize);
-            let entry = (fn_table_base as *const FnEntry).add(slot);
-            let result = if (*entry).type_id() != type_id {
+            // One read of the slot: the record type-checked is the one called (#2680).
+            let entry = slot_record(fn_table_base as *const _, slot);
+            let result = if entry.type_id() != type_id {
                 fault(vm);
                 0u64
             } else {
@@ -1039,7 +1040,7 @@ unsafe fn make_fiber(
                 // stack-limit so the guest's prologue checks trap before overflowing it (per-vCPU by
                 // construction — each fiber supplies its own, threaded on as an ABI param).
                 call_tramp(
-                    (*entry).code(),
+                    entry.code(),
                     mem_base,
                     fn_table_base,
                     vm,

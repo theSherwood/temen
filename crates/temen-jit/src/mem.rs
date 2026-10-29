@@ -23,7 +23,7 @@ use core::ffi::c_void;
 use std::collections::BTreeMap;
 
 /// The compiled entry trampoline ABI (see `build_trampoline`): `(args, results, mem_base,
-/// fn_table_base, vmctx)`. The 4th pointer is opaque here (`FnEntry*` to the JIT); the 5th is the
+/// fn_table_base, vmctx)`. The 4th pointer is opaque here (the fn table's slots to the JIT); the 5th is the
 /// instance's [`crate::VmCtx`], spelled as the trap cell it starts with.
 type Entry = extern "C" fn(*const i64, *mut i64, *mut u8, *const c_void, *mut i64);
 

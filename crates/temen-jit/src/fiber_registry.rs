@@ -44,7 +44,7 @@
 //! A suspend that publishes a fiber to the pool (`suspend_to_pool`, `pin`) is a **release** store; a
 //! claim that takes ownership (`try_steal`, `begin_owned`) is an **acquire** CAS. So the winning
 //! claimant *synchronizes-with* the suspending thread and observes the complete saved context — the
-//! same publish/consume discipline as the futex word and the JIT's atomic `FnEntry` (DESIGN §22).
+//! same publish/consume discipline as the futex word and the JIT's fn-table slots (DESIGN §22).
 
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicU64, Ordering};
