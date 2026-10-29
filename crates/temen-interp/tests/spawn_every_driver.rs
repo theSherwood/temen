@@ -673,8 +673,8 @@ fn join_status(dst: &str, h: &str) -> String {
 }
 
 /// Run `joins` after three detached spawns on every driver. A join's handle is resolved by the
-/// oracle's rule (`resolve_thread`): negative traps, any other is masked to the table's power-of-two
-/// span, a never-issued slot traps, and a spent one answers `-EBADF`.
+/// domain's child table (`temen_ir::handles`, #2043): a handle is a slot at a generation, one the
+/// table never issued traps, and a spent one answers `-EBADF`.
 fn joins_agree(what: &str, joins: &str, want: &Ran) {
     handles_agree(&drivers::ALL, what, joins, want);
 }
@@ -724,23 +724,41 @@ fn a_negative_handle_traps() {
     );
 }
 
+/// `join` of the handle `slot` issued at `generation`.
+fn join_of(slot: u32, generation: u32) -> String {
+    let h = temen_ir::handles::pack(slot, generation);
+    format!("  vn = i32.const {h}\n{}", join("vr", "vn"))
+}
+
 #[test]
 fn a_handle_past_the_table_traps() {
-    // Three children: the span is 4, and slot 3 was never issued.
+    // Three children fill slots 0 to 2: slot 3 never issued a handle.
+    joins_agree("join(slot 3)", &join_of(3, 1), &trapped(Trap::ThreadFault));
+}
+
+#[test]
+fn a_handle_names_a_slot_at_the_generation_it_issued() {
+    // Slot 1's first handle: the second child.
+    joins_agree("join(slot 1, gen 1)", &join_of(1, 1), &ok(101));
+}
+
+#[test]
+fn a_generation_its_slot_never_issued_traps() {
     joins_agree(
-        "join(3)",
-        &format!("  vn = i32.const 3\n{}", join("vr", "vn")),
+        "join(slot 1, gen 2)",
+        &join_of(1, 2),
         &trapped(Trap::ThreadFault),
     );
 }
 
+/// A table index is not a handle: generation 0 is never issued, so the index of a live child names
+/// no child (#2043).
 #[test]
-fn a_handle_masks_onto_the_table() {
-    // 5 & (4 - 1) is slot 1: the second child.
+fn a_bare_slot_index_is_not_a_handle() {
     joins_agree(
-        "join(5)",
-        &format!("  vn = i32.const 5\n{}", join("vr", "vn")),
-        &ok(101),
+        "join(slot 1, gen 0)",
+        &join_of(1, 0),
+        &trapped(Trap::ThreadFault),
     );
 }
 
@@ -751,25 +769,22 @@ const OFFERING: [Driver; 3] = [Driver::Oracle, Driver::Coop, Driver::Parallel];
 /// answer on every driver: the oracle's. On a spent handle `join`, `poll`, `detach` and `kill`
 /// answer `-EBADF` (#2667); on a forged one they trap `ThreadFault`. `child_offer` and `grant`
 /// answer `-EINVAL` for both, the value they give a child they cannot reach. The handles: child 0
-/// spent by a join, child 0 spent by a detach, a negative one, and 3, past the table (the span is
-/// 4, and slot 3 was never issued). The debug scheduler declines op 14 ([`OFFERING`]).
+/// spent by a join, child 0 spent by a detach, a negative one, and one past the table (slot 3 never
+/// issued). The debug scheduler declines op 14 ([`OFFERING`]).
 #[test]
 fn a_spent_or_forged_handle_gets_the_oracles_answer_from_every_child_op() {
+    let child0 = format!("  vbad = i32.const {}\n", temen_ir::handles::pack(0, 1));
     let spend = [
-        (
-            "joined",
-            join("vsp", "vh0") + "  vbad = i32.const 0\n",
-            true,
-        ),
+        ("joined", join("vsp", "vh0") + &child0, true),
         (
             "detached",
-            "  vsp = call.cap 6 10 (i32) -> (i32) vinst (vh0)\n  vbad = i32.const 0\n".to_string(),
+            "  vsp = call.cap 6 10 (i32) -> (i32) vinst (vh0)\n".to_string() + &child0,
             true,
         ),
         ("negative", "  vbad = i32.const -1\n".to_string(), false),
         (
             "past the table",
-            "  vbad = i32.const 3\n".to_string(),
+            format!("  vbad = i32.const {}\n", temen_ir::handles::pack(3, 1)),
             false,
         ),
     ];
@@ -831,18 +846,31 @@ fn a_spent_or_forged_handle_gets_the_oracles_answer_from_every_child_op() {
     }
 }
 
-/// #2378 — a handle past the table that the mask folds onto a live child names that child for every
-/// op, as for `join` ([`a_handle_masks_onto_the_table`]): `detach(5)` detaches child 1, so its own
-/// handle is spent after (#2667).
+/// #2043 — a spent slot is reissued at its next generation: a fourth child spawned after child 1 is
+/// detached takes slot 1, so its handle is that slot's second, and child 1's own handle stays spent
+/// rather than naming the newcomer. Its value is `handle * 1000 + join`.
 #[test]
-fn a_masked_handle_detaches_the_child_it_names() {
-    let ops = format!(
-        "  vn = i32.const 5\n  vd = call.cap 6 10 (i32) -> (i32) vinst (vn)\n{}",
-        join_status("vr", "vh1")
+fn a_spent_slot_is_reissued_at_its_next_generation() {
+    let detach_then_spawn = format!(
+        "  vd = call.cap 6 10 (i32) -> (i32) vinst (vh1)\n{}",
+        spawn_into("vh3", 20480 + 24, 103)
     );
+    let ops = format!(
+        "{detach_then_spawn}{}  vk = i64.extend_i32_s vh3\n  vt = i64.const 1000\n  \
+         vkt = i64.mul vk vt\n  vr = i64.add vkt vj\n",
+        join("vj", "vh3")
+    );
+    let reissued = temen_ir::handles::pack(1, 2) as i64;
     handles_agree(
         &ALL,
-        "detach(5), then join child 1",
+        "detach child 1, spawn a fourth",
+        &ops,
+        &ok(reissued * 1000 + 103),
+    );
+    let ops = format!("{detach_then_spawn}{}", join_status("vr", "vh1"));
+    handles_agree(
+        &ALL,
+        "detach child 1, spawn a fourth, join child 1",
         &ops,
         &ok(temen_ir::errno::EBADF),
     );
@@ -1498,7 +1526,7 @@ fn a_child_live_at_the_runs_end_hands_its_window_back() {
     let setup = detached_setup(&child, 1 << 15);
     for d in ALL {
         let (ran, held) = run_on_then(d, &m, &setup, &budget_held).expect("runs");
-        assert_eq!(ran, ok(0), "{d:?}");
+        assert_eq!(ran, ok(temen_ir::handles::pack(0, 1) as i64), "{d:?}");
         assert_eq!(held, (0, 0), "{d:?}: the run's end left the child charged");
     }
 }

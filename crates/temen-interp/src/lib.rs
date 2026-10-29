@@ -7878,7 +7878,7 @@ impl Scheduler {
         let bare = v.cur == ROOT_FIBER
             && v.chain.as_slice() == [ROOT_FIBER]
             && v.root_parked.is_none()
-            && v.children.lock_unpoisoned().never_spawned()
+            && v.children.lock_unpoisoned().idle()
             && !v.registry.has_blocked_parks();
         macro_rules! put_back_none {
             () => {{
@@ -12590,18 +12590,6 @@ fn fiber_sig() -> FuncType {
     }
 }
 
-/// Resolve a §12 thread or §14 child handle to a table slot. Like a fiber's
-/// ([`FiberRegistry::claim`]), the handle is forgeable, so it is **masked** into the
-/// power-of-two-padded table, then bounds- and liveness-checked. A handle that names no slot is
-/// inert ([`Trap::ThreadFault`]). `None` is a **spent** handle, whose slot was issued and whose
-/// child has since been joined or detached: the op answers `-EBADF` (INVARIANTS #5, #2667).
-fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<Option<usize>, Trap> {
-    // The one rule every engine resolves a handle by ([`temen_ir::handle_slot`], #2378); a slot is
-    // live while its entry is.
-    let slot = temen_ir::handle_slot(threads.len(), handle).ok_or(Trap::ThreadFault)?;
-    Ok(threads[slot].is_some().then_some(slot))
-}
-
 /// #2043 D1 — a domain's children: its `thread.spawn` threads and its §14 children, in one
 /// generation-checked table ([`temen_ir::handles`]) that every vCPU of the domain shares. A handle
 /// names the same child on whichever vCPU uses it (D2), and a spent one answers `-EBADF` where a
@@ -12620,8 +12608,14 @@ pub(crate) struct Children {
 }
 
 impl Children {
-    /// Whether the domain never spawned: its table never issued a handle, live or spent. Only such a
-    /// domain is one a fork twin or a checkpoint copies faithfully.
+    /// Whether no child of the domain is live: none its table names, none detached and still
+    /// running. Only such a domain is one a fork twin duplicates faithfully.
+    fn idle(&self) -> bool {
+        self.table.is_idle() && self.unreaped.is_empty()
+    }
+
+    /// Whether the domain never spawned: its table never issued a handle, live or spent. A checkpoint
+    /// copies only such a domain faithfully, since its restore starts the table afresh.
     fn never_spawned(&self) -> bool {
         self.table.generations().is_empty() && self.unreaped.is_empty()
     }
@@ -12690,9 +12684,12 @@ fn reap_child(child: Child, host: &Arc<Mutex<Host>>) {
     }
 }
 
+/// A §14 child's kill flag and powerbox: what its parent domain's end takes down.
+type ChildKill = (Arc<AtomicBool>, Option<Arc<Mutex<Host>>>);
+
 /// The kill flag and powerbox of every §14 child `children` holds, its table's and its unreaped
 /// ones: what its domain's end takes down with it (ownership anchors their lifetime, PROCESS.md S3).
-fn child_domains(children: &Mutex<Children>) -> Vec<(Arc<AtomicBool>, Option<Arc<Mutex<Host>>>)> {
+fn child_domains(children: &Mutex<Children>) -> Vec<ChildKill> {
     let c = children.lock_unpoisoned();
     c.table
         .live()
