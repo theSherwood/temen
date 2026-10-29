@@ -661,8 +661,10 @@ pub fn case_from_seed(seed: u64) -> [u8; 8] {
 // transition. Same invariant, same oracle, same harness; plus the window bytes must match.
 
 /// The page-state leaf bodies over `(v0 = base, vn = span)`: scalar loads/stores per width, `v128`
-/// load/store staged through an in-window scratch slot, and the bulk write/read/move walks.
-const PS_LEAVES: [&str; 13] = [
+/// load/store staged through an in-window scratch slot, the bulk write/read/move walks, and short
+/// bulk ops of constant lengths (#2099: loads and stores, two page lookups a span) — a read, a write,
+/// a fill, and a move whose spans overlap.
+const PS_LEAVES: [&str; 17] = [
     "  vl = i64.load8_u v0\n  return vl",
     "  vl = i64.load16_u v0\n  return vl",
     "  vl = i64.load32_u v0\n  return vl",
@@ -676,6 +678,10 @@ const PS_LEAVES: [&str; 13] = [
     "  vval = i32.const 0\n  mem.fill v0 vval vn\n  return v0",
     "  vdst = i64.const 20480\n  mem.copy vdst v0 vn\n  return v0",
     "  vsrc = i64.const 20480\n  mem.move v0 vsrc vn\n  return v0",
+    "  vdst = i64.const 20480\n  vn24 = i64.const 24\n  mem.copy vdst v0 vn24\n  return v0",
+    "  vsrc = i64.const 20480\n  vn13 = i64.const 13\n  mem.move v0 vsrc vn13\n  return v0",
+    "  vval = i32.const 421\n  vn32 = i64.const 32\n  mem.fill v0 vval vn32\n  return v0",
+    "  vk = i64.const 5\n  vd = i64.add v0 vk\n  vn24 = i64.const 24\n  mem.move vd v0 vn24\n  return v0",
 ];
 
 /// One page op over `[vo{i}, vo{i}+vl{i})`: `k % 4` — 0 `unmap`, 1 `protect` read-only, 2 `protect`
