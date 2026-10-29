@@ -324,12 +324,10 @@ pub(crate) mod x86 {
         /// The address of a callee whose contract is known: one a relocation names (`movabs r, sym`),
         /// or a host function a fuel cell points to. A call through the register runs the contract.
         FnAddr(Contract),
-        /// A fn-table index scaled to a byte offset: `k << shift` for some `k < n`. `and idx, mask;
-        /// shl idx, 4` makes one that selects a whole 16-byte entry.
-        Stride { n: u64, shift: u8 },
-        /// A fn-table entry's byte offset (`16·k`, `k < n`) whose type id the code checked is `ty`.
-        Checked { n: u64, ty: u32 },
-        /// The code pointer of a fn-table entry whose type id is `ty`: a function of type `ty`.
+        /// The address of an immutable fn-table record, what a slot holds: one whose type id the
+        /// code compared equal to `ty` when `Some(ty)`, since a record never changes.
+        Record(Option<u32>),
+        /// The code pointer of a record whose type id is `ty`: a function of type `ty`.
         FnPtr(u32),
         /// A pointer to one of the host cells compiled code reads and writes at fixed offsets.
         Cell(Cell),
@@ -356,15 +354,7 @@ pub(crate) mod x86 {
                     }
                 }
                 (Fact::Stack(_), Fact::Stack(_)) => Fact::Stack(None),
-                (Fact::Stride { n: a, shift: s }, Fact::Stride { n: b, shift: t }) if s == t => {
-                    Fact::Stride {
-                        n: a.max(b),
-                        shift: s,
-                    }
-                }
-                (Fact::Checked { n: a, ty: s }, Fact::Checked { n: b, ty: t }) if s == t => {
-                    Fact::Checked { n: a.max(b), ty: s }
-                }
+                (Fact::Record(_), Fact::Record(_)) => Fact::Record(None),
                 (Fact::WinPtr(a), Fact::WinPtr(b)) => Fact::WinPtr(a.max(b)),
                 _ => Fact::Unknown,
             }
@@ -401,13 +391,11 @@ pub(crate) mod x86 {
         fact: Fact,
     }
 
-    /// The abstract state at a program point: a fact per GP register, the tracked spill slots, and
-    /// the fn-table entry at a constant offset whose type id the code checked, `(entry, type id)`.
+    /// The abstract state at a program point: a fact per GP register and the tracked spill slots.
     #[derive(Clone, Copy, PartialEq, Eq)]
     struct State {
         regs: [Fact; 16],
         slots: [Option<Slot>; SLOT_CAP],
-        checked_entry: Option<(u64, u32)>,
     }
 
     impl State {
@@ -417,7 +405,6 @@ pub(crate) mod x86 {
             State {
                 regs: [Fact::Unknown; 16],
                 slots: [None; SLOT_CAP],
-                checked_entry: None,
             }
         }
         /// The entry ABI: the four context params in their argument registers, `rsp` at the return
@@ -432,7 +419,6 @@ pub(crate) mod x86 {
             State {
                 regs,
                 slots: [None; SLOT_CAP],
-                checked_entry: None,
             }
         }
         fn meet(&self, other: &State) -> State {
@@ -450,14 +436,7 @@ pub(crate) mod x86 {
                     n += 1;
                 }
             }
-            let checked_entry = self
-                .checked_entry
-                .filter(|&c| other.checked_entry == Some(c));
-            State {
-                regs,
-                slots,
-                checked_entry,
-            }
+            State { regs, slots }
         }
         /// The fact spilled to the 8-byte slot at `off`, or `Unknown` if no slot is tracked there.
         fn slot_get(&self, off: i64) -> Fact {
@@ -521,7 +500,6 @@ pub(crate) mod x86 {
                 .iter()
                 .flatten()
                 .all(|s| out.slot_get(s.off).meet(s.fact) == s.fact)
-            && (inn.checked_entry.is_none() || out.checked_entry == inn.checked_entry)
     }
 
     /// What the transfer reads besides the instruction: the function's bytes (a compare bound sits
@@ -1272,8 +1250,9 @@ pub(crate) mod x86 {
         });
         let mut next_id = 16u32;
         let mut flags: Option<Cmp> = None;
-        // The last fn-table type id the block loaded: the loaded value, and the entry it reads.
-        let mut type_id: Option<(Sym, EntryOf)> = None;
+        // The last record type id the block loaded: the loaded value, and the record it reads (the
+        // value of the register that holds the record's address).
+        let mut type_id: Option<(Sym, Sym)> = None;
         // A bound on each register's low byte, where a `setcc` wrote it (`256`: none known), so a
         // `movzx` of it is bounded (Cranelift drops the fn-table mask of a boolean index).
         let mut low_byte = [256u16; 16];
@@ -1424,8 +1403,8 @@ pub(crate) mod x86 {
                     loaded_type_id = d
                         .operands
                         .mem
-                        .and_then(|m| type_id_entry(&state, &m, &sym))
-                        .map(|e| (dst, e));
+                        .and_then(|m| record_of_type_id(&state, &m, &sym))
+                        .map(|r| (dst, r));
                     set(&mut state, dst, Fact::Unknown);
                 }
                 Eff::Zext { dst, bound, low } => {
@@ -1433,17 +1412,6 @@ pub(crate) mod x86 {
                         .filter(|_| d.operands.mem.is_none())
                         .map_or(bound, |r| u32::from(low_byte[r as usize & 15]).min(bound));
                     set(&mut state, dst, Fact::Bounded(u64::from(byte)));
-                }
-                Eff::ShlImm { dst, by } => {
-                    let f = match fact(&state, dst) {
-                        Fact::Bounded(n) if imm_ok => n
-                            .checked_sub(1)
-                            .and_then(|max| max.checked_shl(u32::from(by)))
-                            .filter(|&top| top >> by == n - 1)
-                            .map_or(Fact::Unknown, |_| Fact::Stride { n, shift: by }),
-                        _ => Fact::Unknown,
-                    };
-                    set(&mut state, dst, f);
                 }
                 Eff::LoadSx32 { dst } => {
                     let f = d
@@ -1513,15 +1481,9 @@ pub(crate) mod x86 {
                     clobbers: SYSV_CLOBBERS,
                     pops: None,
                 });
+                // A checked record survives in any register the callee keeps: records never change.
                 state.clear_slots();
                 slot_vals.clear();
-                // A callee may change the fn table, so no type check outlives a call.
-                state.checked_entry = None;
-                for f in state.regs.iter_mut() {
-                    if let Fact::Checked { n, .. } = *f {
-                        *f = Fact::Stride { n, shift: 4 };
-                    }
-                }
                 let rsp = match (fact(&state, reg::RSP), c.pops) {
                     (Fact::Stack(Some(h)), Some(p)) => Fact::Stack(h.checked_add(i64::from(p))),
                     (Fact::Stack(_), _) => Fact::Stack(None),
@@ -1602,37 +1564,29 @@ pub(crate) mod x86 {
             }
         }
         // A block that ends `cmp type_id, T; je` (or `jne`) proves, on the edge where they are equal,
-        // that the entry it read the type id from holds a function of type `T`: the index register
-        // that selected it (still holding that value) becomes `Checked`, or for an entry at a
-        // constant offset, the state records it.
+        // that the record it read the type id from is a function of type `T`: every register still
+        // holding that record's address becomes `Record(Some(T))`.
         let equal = match (insns.last(), flags, type_id) {
-            (Some((_, d)), Some(f), Some((loaded, entry))) => match d.kind {
+            (Some((_, d)), Some(f), Some((loaded, record))) => match d.kind {
                 Kind::DirectJcc {
                     cc: cc @ (0x4 | 0x5),
                     ..
-                } => compared_type(f, loaded).map(|ty| (cc == 0x4, entry, ty)),
+                } => compared_type(f, loaded).map(|ty| (cc == 0x4, record, ty)),
                 _ => None,
             },
             _ => None,
         };
-        let Some((on_taken, entry, ty)) = equal else {
+        let Some((on_taken, record, ty)) = equal else {
             return Out {
                 taken: state,
                 fall: state,
             };
         };
         let mut checked = state;
-        match entry {
-            EntryOf::Index(index) => {
-                for (f, &s) in checked.regs.iter_mut().zip(&sym) {
-                    if let Fact::Stride { n, shift: 4 } = *f {
-                        if s == index {
-                            *f = Fact::Checked { n, ty };
-                        }
-                    }
-                }
+        for (f, &s) in checked.regs.iter_mut().zip(&sym) {
+            if matches!(*f, Fact::Record(_)) && s == record {
+                *f = Fact::Record(Some(ty));
             }
-            EntryOf::Const(k) => checked.checked_entry = Some((k, ty)),
         }
         if on_taken {
             Out {
@@ -1655,28 +1609,12 @@ pub(crate) mod x86 {
         fall: State,
     }
 
-    /// Which fn-table entry a type-id load reads: the one a stride-scaled index register selects (by
-    /// the value it holds), or the one at a constant offset.
-    #[derive(Clone, Copy)]
-    enum EntryOf {
-        Index(Sym),
-        Const(u64),
-    }
-
-    /// The entry `mov r32, [m]` reads the type id of, if `m` is a fn-table entry's first field.
-    fn type_id_entry(state: &State, m: &Mem, sym: &[Sym; 16]) -> Option<EntryOf> {
-        let fact = |r: u8| state.regs[r as usize & 15];
-        match (m.base.map(fact), m.index, m.disp) {
-            (Some(Fact::FnTableBase), Some(i), 0)
-                if m.scale == 1 && matches!(fact(i), Fact::Stride { shift: 4, .. }) =>
-            {
-                Some(EntryOf::Index(sym[i as usize & 15]))
-            }
-            (Some(Fact::FnTableBase), None, d) if d >= 0 && d % 16 == 0 => {
-                Some(EntryOf::Const(d as u64 / 16))
-            }
-            _ => None,
-        }
+    /// The record `mov r32, [m]` reads the type id of, if `m` is a record's first field: the value
+    /// of the register holding its address.
+    fn record_of_type_id(state: &State, m: &Mem, sym: &[Sym; 16]) -> Option<Sym> {
+        let b = m.base?;
+        let is_record = matches!(state.regs[b as usize & 15], Fact::Record(_));
+        (is_record && m.index.is_none() && m.disp == 0).then(|| sym[b as usize & 15])
     }
 
     /// The type id a compare tests the loaded type id `loaded` against: the other side's constant.
@@ -1708,21 +1646,13 @@ pub(crate) mod x86 {
         if let Some(Some(off)) = frame_addr(state, m) {
             return state.slot_get(off);
         }
+        if let Some(Ok(_)) = table_reach(m, state) {
+            return Fact::Record(None);
+        }
         let fact = |r: Option<u8>| r.map(|x| state.regs[x as usize & 15]);
         let (base, index) = (fact(m.base), fact(m.index));
         match (base, index, m.disp) {
-            (Some(Fact::FnTableBase), Some(Fact::Checked { ty, .. }), 8)
-            | (Some(Fact::Checked { ty, .. }), Some(Fact::FnTableBase), 8)
-                if m.scale == 1 =>
-            {
-                Fact::FnPtr(ty)
-            }
-            (Some(Fact::FnTableBase), None, d) if d >= 8 && (d - 8) % 16 == 0 => {
-                match state.checked_entry {
-                    Some((k, ty)) if k == (d as u64 - 8) / 16 => Fact::FnPtr(ty),
-                    _ => Fact::Unknown,
-                }
-            }
+            (Some(Fact::Record(Some(ty))), None, 8) => Fact::FnPtr(ty),
             (Some(Fact::Vmctx), None, d) => vmctx_field(d).map_or(Fact::Unknown, |f| f.1),
             (Some(Fact::Cell(Cell::Fuel)), None, d) if d == i64::from(crate::fuel::REFILL_OFF) => {
                 Fact::FnAddr(FUEL_REFILL)
@@ -1734,6 +1664,28 @@ pub(crate) mod x86 {
             }
             _ => Fact::Unknown,
         }
+    }
+
+    /// Whether `m` addresses the fn table, and if so whether it reads one whole 8-byte slot: `Ok`
+    /// with the byte offset of the furthest slot it can reach, `Err` with why not. A slot is
+    /// `[table + idx*8 + disp]`, `idx` bounded, `disp` a whole number of slots.
+    fn table_reach(m: &Mem, state: &State) -> Option<Result<u64, &'static str>> {
+        let fact = |r: Option<u8>| r.map(|x| state.regs[x as usize & 15]);
+        let (index, scale) = match (fact(m.base), fact(m.index)) {
+            (Some(Fact::FnTableBase), i) => (i, m.scale),
+            (b, Some(Fact::FnTableBase)) if m.scale == 1 => (b, 1),
+            _ => return None,
+        };
+        let reach = match index {
+            None => Some(0),
+            Some(f) if scale == 8 => max_value(f).and_then(|k| k.checked_mul(8)),
+            Some(_) => None,
+        };
+        Some(match reach {
+            None => Err("fn-table access through an index that selects no whole slot"),
+            Some(_) if m.disp < 0 || m.disp % 8 != 0 => Err("fn-table access between two slots"),
+            Some(r) => Ok(r.saturating_add(m.disp as u64)),
+        })
     }
 
     /// A vmctx field compiled code may access at offset `disp`: whether it may write it (only the
@@ -1876,7 +1828,6 @@ pub(crate) mod x86 {
             | Eff::LoadReg { dst }
             | Eff::LoadSx32 { dst }
             | Eff::LoadZx32 { dst }
-            | Eff::ShlImm { dst, .. }
             | Eff::Zext { dst, .. }
             | Eff::SetByte { dst }
             | Eff::Lea { dst, .. }
@@ -2021,43 +1972,31 @@ pub(crate) mod x86 {
             }
             Ok(None) => {}
         }
-        // The fn table: `[table + idx + disp]`, `idx` a whole number of 16-byte entries.
-        let other = match (base_f, index_f) {
-            (Some(Fact::FnTableBase), i) => Some(i),
-            (b, Some(Fact::FnTableBase)) if scale == 1 => Some(b),
-            _ => None,
-        };
-        if let Some(index) = other {
-            let entries = match index {
-                None => Some(0),
-                Some(Fact::Stride { n, shift: 4 } | Fact::Checked { n, .. }) if scale == 1 => {
-                    n.checked_sub(1).and_then(|k| k.checked_mul(16))
-                }
-                _ => None,
-            };
-            let Some(reach) = entries else {
-                flag("fn-table access through an index that selects no whole entry".into());
-                return;
-            };
-            if write {
-                flag("write to the fn table".into());
-                return;
+        // The fn table: one whole 8-byte slot, read.
+        if let Some(reach) = table_reach(&mem, state) {
+            let size = ctx.guest.table.saturating_mul(8);
+            match reach {
+                Err(why) => flag(why.into()),
+                Ok(_) if write => flag("write to the fn table".into()),
+                Ok(_) if width != 8 => flag(format!("fn-table access of {width} bytes")),
+                Ok(r) if r.saturating_add(8) > size => flag(format!(
+                    "fn-table access reaches +0x{:x}, past the table's 0x{size:x} bytes",
+                    r.saturating_add(8)
+                )),
+                Ok(_) => {}
             }
-            let field = mem.disp.rem_euclid(16);
-            if mem.disp < 0 || !matches!((field, width), (0, 4) | (8, 8)) {
+            return;
+        }
+        // A record a slot names: its type id or its code pointer, read.
+        if let Some(Fact::Record(_)) = base_f {
+            if mem.index.is_some() || !matches!((mem.disp, width), (0, 4) | (8, 8)) {
                 flag(format!(
-                    "fn-table access of {width} bytes at +0x{:x} is neither an entry's type id nor \
-                     its code pointer",
+                    "record access of {width} bytes at +0x{:x} is neither its type id nor its code \
+                     pointer",
                     mem.disp
                 ));
-                return;
-            }
-            let top = reach.saturating_add(mem.disp as u64).saturating_add(width);
-            let size = ctx.guest.table.saturating_mul(16);
-            if top > size {
-                flag(format!(
-                    "fn-table access reaches +0x{top:x}, past the table's 0x{size:x} bytes"
-                ));
+            } else if write {
+                flag("write to a fn-table record".into());
             }
             return;
         }
@@ -2172,10 +2111,8 @@ pub(crate) mod x86 {
         /// `movsxd dst, dword [mem]` (REX.W) — a sign-extending 32-bit load, the read of a jump-table
         /// entry.
         LoadSx32 { dst: u8 },
-        /// `mov dst32, [mem]` — a zero-extending 32-bit load, the read of a fn-table entry's type id.
+        /// `mov dst32, [mem]` — a zero-extending 32-bit load, the read of a fn-table record's type id.
         LoadZx32 { dst: u8 },
-        /// A 64-bit `shl dst, by` — the scaling of a fn-table index to its entry's byte offset.
-        ShlImm { dst: u8, by: u8 },
         /// A `movzx dst, …` that leaves `dst` below `bound` (`2^8` or `2^16`); `low` is the register
         /// whose low byte it reads, when it reads one.
         Zext {
@@ -2465,8 +2402,6 @@ pub(crate) mod x86 {
         Test,
         /// `movsxd reg, r/m32` (`63`).
         Movsxd,
-        /// `C1 /digit ib` — a shift or rotate of the r/m by an immediate.
-        ShiftImm(u8),
         /// `movzx reg, r/m` from a source of this many bytes; `true` when a byte source register
         /// 4–7 is ah–bh (no REX).
         Movzx(u8, bool),
@@ -2580,14 +2515,6 @@ pub(crate) mod x86 {
                     low: rm.filter(|&r| bytes == 1 && !(high && (4..8).contains(&r))),
                 },
                 _ => Eff::WrReg,
-            },
-            I::ShiftImm(digit) => match (rm, mem) {
-                // `/4` is shl, `/6` its alias sal.
-                (Some(dst), false) if osz == 8 && matches!(digit, 4 | 6) => Eff::ShlImm {
-                    dst,
-                    by: (immv & 63) as u8,
-                },
-                _ => Eff::WrRm,
             },
             I::Movsxd => match (reg, mem) {
                 (Some(dst), true) if osz == 8 => Eff::LoadSx32 { dst },
@@ -2903,10 +2830,7 @@ pub(crate) mod x86 {
             }
             0x6B => finish_modrm(c, start, p, 1, Normal, E::WrReg).map(|d| d.width(w)), // imul r, r/m, imm8
             0xC0 => finish_modrm(c, start, p, 1, Normal, E::WrRm).map(|d| d.width(w)), // shift r/m8, imm8
-            0xC1 => {
-                let digit = (c.peek()? >> 3) & 0x07;
-                finish_modrm(c, start, p, 1, Normal, E::ShiftImm(digit)).map(|d| d.width(w))
-            }
+            0xC1 => finish_modrm(c, start, p, 1, Normal, E::WrRm).map(|d| d.width(w)), // shift r/m, imm8
             0xC6 => keep(finish_modrm(c, start, p, 1, Normal, E::WrRm)).map(|d| d.width(1)), // mov r/m8, imm8
             // ModRM + immZ.
             0x81 => {
@@ -3796,6 +3720,23 @@ pub(crate) mod x86 {
             );
         }
 
+        /// `call.dyn` and `return_call.dyn` through the fn table, by a guest index and by a constant
+        /// one: the slot load, the record's type check and the call through its code pointer.
+        #[test]
+        fn call_dyn_through_the_fn_table() {
+            let leaf = "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i64.const 1\n  \
+                        v2 = i64.add v0 v1\n  return v2\n  }\n}\n";
+            cross_check(&format!(
+                "func (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  v1 = i32.wrap_i64 v0\n  \
+                 v2 = call.dyn (i64) -> (i64) v1 (v0)\n  v3 = i32.const 1\n  \
+                 v4 = call.dyn (i64) -> (i64) v3 (v2)\n  return v4\n  }}\n}}\n{leaf}"
+            ));
+            cross_check(&format!(
+                "func (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  v1 = i32.wrap_i64 v0\n  \
+                 return_call.dyn (i64) -> (i64) v1 (v0)\n  }}\n}}\n{leaf}"
+            ));
+        }
+
         #[test]
         fn decoder_rejects_a_syscall() {
             // Sanity on the allowlist: a hand-assembled `syscall` (0F 05) is Forbidden, and a `ret`
@@ -4531,158 +4472,170 @@ pub(crate) mod x86 {
             assert!(has(&f, "relocated symbol"), "{f:?}");
         }
 
-        /// The fn table is read a whole 16-byte entry at a time — its type id or its code pointer,
-        /// inside the table — and never written. An index selects whole entries once `and` bounds it
-        /// and `shl 4` scales it.
+        /// The fn table is read a whole 8-byte slot at a time, inside the table, and never written. A
+        /// slot holds a record's address, and a record is read only for its type id (4 bytes at 0)
+        /// or its code pointer (8 bytes at 8), never written.
         #[test]
-        fn regions_the_fn_table_is_read_by_whole_entry() {
-            let read = |mask: u8, shift: u8, field: u8, width: u8| {
-                let load = if width == 4 {
-                    [0x8b, 0x4c]
-                } else {
-                    [0x48, 0x8b]
-                };
+        fn regions_the_fn_table_is_read_by_whole_slot() {
+            let read = |access: &[u8]| {
                 let mut b = vec![
                     0x4c, 0x89, 0xc0, // mov rax, r8
-                    0x48, 0x83, 0xe0, mask, // and rax, mask
-                    0x48, 0xc1, 0xe0, shift, // shl rax, shift
+                    0x48, 0x83, 0xe0, 0x03, // and rax, 3
                 ];
-                if width == 4 {
-                    b.extend([load[0], load[1], 0x06, field]); // mov ecx, [rsi + rax + field]
-                } else {
-                    b.extend([load[0], load[1], 0x4c, 0x06, field]); // mov rcx, [rsi + rax + field]
-                }
+                b.extend(access);
                 b.push(0xc3);
                 b
             };
-            let f = findings(&read(3, 4, 0, 4));
-            assert!(f.is_empty(), "a type-id read was flagged: {f:?}");
-            let f = findings(&read(3, 4, 8, 8));
-            assert!(f.is_empty(), "a code-pointer read was flagged: {f:?}");
-            assert!(has(&findings(&read(3, 3, 0, 4)), "selects no whole entry")); // shl 3
-            assert!(has(
-                &findings(&read(3, 4, 4, 4)),
-                "neither an entry's type id"
-            )); // +4
-            assert!(has(
-                &findings(&read(3, 4, 0, 8)),
-                "neither an entry's type id"
-            )); // 8 bytes
-            assert!(has(
-                &findings(&read(7, 4, 8, 8)),
-                "past the table's 0x40 bytes"
-            )); // 8 entries
-            let mut write = read(3, 4, 8, 8);
-            write[12] = 0x89; // mov [rsi + rax + 8], rcx
-            assert!(has(&findings(&write), "write to the fn table"));
+            let slot = [0x48, 0x8b, 0x0c, 0xc6]; // mov rcx, [rsi + rax*8]
+            let f = findings(&read(&slot));
+            assert!(f.is_empty(), "a slot read was flagged: {f:?}");
+            let cases: [(&[u8], &str); 4] = [
+                (&[0x48, 0x8b, 0x4c, 0xc6, 0x04], "between two slots"), // [rsi + rax*8 + 4]
+                (&[0x8b, 0x0c, 0xc6], "fn-table access of 4 bytes"),    // mov ecx, [rsi + rax*8]
+                (&[0x48, 0x8b, 0x0c, 0x06], "selects no whole slot"),   // [rsi + rax*1]
+                (&[0x48, 0x89, 0x0c, 0xc6], "write to the fn table"),   // mov [rsi + rax*8], rcx
+            ];
+            for (access, why) in cases {
+                let f = findings(&read(access));
+                assert!(has(&f, why), "{access:02x?} not flagged as {why}: {f:?}");
+            }
+            let last = [0x48, 0x8b, 0x4e, 0x18, 0xc3]; // mov rcx, [rsi + 0x18]: slot 3 of 4
+            assert!(findings(&last).is_empty());
+            let past = [0x48, 0x8b, 0x4e, 0x20, 0xc3]; // mov rcx, [rsi + 0x20]: slot 4 of 4
+            assert!(has(&findings(&past), "past the table's 0x20 bytes"));
+            let mut wide = read(&slot);
+            wide[6] = 0x07; // and rax, 7: eight slots
+            assert!(has(&findings(&wide), "past the table"));
+
+            let record = |access: &[u8]| {
+                let mut b = vec![0x48, 0x8b, 0x4e, 0x08]; // mov rcx, [rsi + 8]: slot 1's record
+                b.extend(access);
+                b.push(0xc3);
+                b
+            };
+            let fields = [
+                0x8b, 0x01, // mov eax, [rcx]       (its type id)
+                0x48, 0x8b, 0x41, 0x08, // mov rax, [rcx + 8]   (its code pointer)
+            ];
+            let f = findings(&record(&fields));
+            assert!(f.is_empty(), "a record's fields were flagged: {f:?}");
+            let cases: [(&[u8], &str); 3] = [
+                (&[0x8b, 0x41, 0x04], "neither its type id"), // mov eax, [rcx + 4]
+                (&[0x48, 0x8b, 0x01], "neither its type id"), // mov rax, [rcx]: 8 bytes at 0
+                (&[0x48, 0x89, 0x41, 0x08], "write to a fn-table record"), // mov [rcx + 8], rax
+            ];
+            for (access, why) in cases {
+                let f = findings(&record(access));
+                assert!(has(&f, why), "{access:02x?} not flagged as {why}: {f:?}");
+            }
         }
 
-        /// A `call.dyn`: the code compares the entry's type id with the expected one, and on the
-        /// edge where they are equal the code pointer it then loads is a function of that type, so
-        /// the call takes that type's contract (here type 1's, which pops 16 bytes). On the other
-        /// edge, or without the check, or across a call (which may change the table), it is
-        /// unidentified.
+        /// A `call.dyn`: the code loads the slot's record, compares its type id with the expected
+        /// one, and on the edge where they are equal the code pointer it loads from that record is a
+        /// function of that type, so the call takes that type's contract (here type 1's, which pops
+        /// 16 bytes). On the other edge, without the check, or through another value, it is
+        /// unidentified. A record never changes, so its check holds across a call in a callee-saved
+        /// register; in a caller-saved one, the call clobbers it.
         #[test]
         fn calls_through_the_fn_table_take_the_checked_type() {
             let bytes = [
                 0x4c, 0x89, 0xc0, // [00] mov rax, r8
                 0x48, 0x83, 0xe0, 0x03, // [03] and rax, 3
-                0x48, 0xc1, 0xe0, 0x04, // [07] shl rax, 4
-                0x8b, 0x0c, 0x06, // [0b] mov ecx, [rsi + rax]
-                0x83, 0xf9, 0x01, // [0e] cmp ecx, 1
-                0x75, 0x0b, // [11] jne +0b  (→ 1e)
-                0x48, 0x8b, 0x44, 0x06, 0x08, // [13] mov rax, [rsi + rax + 8]
-                0xff, 0xd0, // [18] call rax
-                0x48, 0x89, 0xe1, // [1a] mov rcx, rsp
-                0xc3, // [1d] ret
-                0x0f, 0x0b, // [1e] ud2
+                0x48, 0x8b, 0x0c, 0xc6, // [07] mov rcx, [rsi + rax*8]
+                0x8b, 0x11, // [0b] mov edx, [rcx]
+                0x83, 0xfa, 0x01, // [0d] cmp edx, 1
+                0x75, 0x0a, // [10] jne +0a  (→ 1c)
+                0x48, 0x8b, 0x41, 0x08, // [12] mov rax, [rcx + 8]
+                0xff, 0xd0, // [16] call rax
+                0x48, 0x89, 0xe1, // [18] mov rcx, rsp
+                0xc3, // [1b] ret
+                0x0f, 0x0b, // [1c] ud2
             ];
             let f = findings(&bytes);
             assert!(f.is_empty(), "a checked call.dyn was flagged: {f:?}");
-            let out = out_of(&bytes, &[], 0x13);
+            let out = out_of(&bytes, &[], 0x12);
             assert_eq!(out.regs[reg::RCX as usize], Fact::Stack(Some(16)));
             let mut wrong_edge = bytes;
-            wrong_edge[0x11] = 0x74; // je: the call runs where the type ids differ
+            wrong_edge[0x10] = 0x74; // je: the call runs where the type ids differ
             assert!(has(&findings(&wrong_edge), "unidentified callee"));
             let mut unchecked = bytes;
-            unchecked[0x0e..0x13].copy_from_slice(&[0x90; 5]); // no cmp, no jne
+            unchecked[0x0d..0x12].copy_from_slice(&[0x90; 5]); // no cmp, no jne
             assert!(has(&findings(&unchecked), "unidentified callee"));
             let mut other_value = bytes;
-            other_value[0x0f] = 0xfa; // cmp edx, 1: not the loaded type id
+            other_value[0x0e] = 0xf8; // cmp eax, 1: not the loaded type id
             assert!(has(&findings(&other_value), "unidentified callee"));
 
-            // The index survives a call in r12, the table base in rbx, but the check doesn't.
+            // The record in rbx survives a call; the same in rcx would not.
             let across = [
-                0x48, 0x89, 0xf3, // [00] mov rbx, rsi
-                0x4d, 0x89, 0xc4, // [03] mov r12, r8
-                0x49, 0x83, 0xe4, 0x03, // [06] and r12, 3
-                0x49, 0xc1, 0xe4, 0x04, // [0a] shl r12, 4
-                0x42, 0x8b, 0x0c, 0x23, // [0e] mov ecx, [rbx + r12]
-                0x83, 0xf9, 0x01, // [12] cmp ecx, 1
-                0x75, 0x0d, // [15] jne +0d  (→ 24)
-                0xe8, 0, 0, 0, 0, // [17] call <callee>   (rel32 patched at 0x18)
-                0x4a, 0x8b, 0x44, 0x23, 0x08, // [1c] mov rax, [rbx + r12 + 8]
-                0xff, 0xd0, // [21] call rax
-                0xc3, // [23] ret
-                0x0f, 0x0b, // [24] ud2
+                0x4c, 0x89, 0xc0, // [00] mov rax, r8
+                0x48, 0x83, 0xe0, 0x03, // [03] and rax, 3
+                0x48, 0x8b, 0x1c, 0xc6, // [07] mov rbx, [rsi + rax*8]
+                0x8b, 0x13, // [0b] mov edx, [rbx]
+                0x83, 0xfa, 0x01, // [0d] cmp edx, 1
+                0x75, 0x0c, // [10] jne +0c  (→ 1e)
+                0xe8, 0, 0, 0, 0, // [12] call <callee>   (rel32 patched at 0x13)
+                0x48, 0x8b, 0x43, 0x08, // [17] mov rax, [rbx + 8]
+                0xff, 0xd0, // [1b] call rax
+                0xc3, // [1d] ret
+                0x0f, 0x0b, // [1e] ud2
             ];
-            let f = check(&across, &[call_reloc(0x18)], Entry::Guest(&G));
+            let f = check(&across, &[call_reloc(0x13)], Entry::Guest(&G));
+            assert!(
+                f.is_empty(),
+                "a checked record in rbx did not survive a call: {f:?}"
+            );
+            let mut caller_saved = across;
+            caller_saved[0x09] = 0x0c; // mov rcx, [rsi + rax*8]
+            caller_saved[0x0c] = 0x11; // mov edx, [rcx]
+            caller_saved[0x19] = 0x41; // mov rax, [rcx + 8]
+            let f = check(&caller_saved, &[call_reloc(0x13)], Entry::Guest(&G));
             assert!(has(&f, "unidentified callee"), "{f:?}");
         }
 
-        /// A `call.dyn` of a constant index checks the entry at a constant offset, and `test eax,
-        /// eax` is Cranelift's compare with type id 0. The code pointer of that entry — and no other —
-        /// is then a function of type 0, through a call or a tail call.
+        /// A `call.dyn` of a constant index loads a slot at a constant offset, and `test eax, eax` is
+        /// Cranelift's compare with type id 0. The code pointer of that record — and no other — is
+        /// then a function of type 0, through a call or a tail call.
         #[test]
-        fn calls_through_a_constant_fn_table_entry_take_the_checked_type() {
+        fn calls_through_a_constant_fn_table_slot_take_the_checked_type() {
             let bytes = [
-                0x8b, 0x46, 0x20, // [00] mov eax, [rsi + 0x20]   (entry 2's type id)
-                0x85, 0xc0, // [03] test eax, eax
-                0x74, 0x02, // [05] je +2  (→ 09)
-                0x0f, 0x0b, // [07] ud2
-                0x48, 0x8b, 0x46, 0x28, // [09] mov rax, [rsi + 0x28]   (entry 2's code)
-                0xff, 0xd0, // [0d] call rax
-                0xc3, // [0f] ret
+                0x48, 0x8b, 0x4e, 0x10, // [00] mov rcx, [rsi + 0x10]   (slot 2's record)
+                0x8b, 0x01, // [04] mov eax, [rcx]
+                0x85, 0xc0, // [06] test eax, eax
+                0x74, 0x02, // [08] je +2  (→ 0c)
+                0x0f, 0x0b, // [0a] ud2
+                0x48, 0x8b, 0x41, 0x08, // [0c] mov rax, [rcx + 8]
+                0xff, 0xd0, // [10] call rax
+                0xc3, // [12] ret
             ];
             let f = findings(&bytes);
             assert!(
                 f.is_empty(),
                 "a checked constant call.dyn was flagged: {f:?}"
             );
-            let mut other_entry = bytes;
-            other_entry[0x0c] = 0x18; // entry 1's code pointer
-            assert!(has(&findings(&other_entry), "unidentified callee"));
+            // The check of slot 2's record says nothing of slot 1's.
+            let other_record = [
+                0x48, 0x8b, 0x4e, 0x10, // [00] mov rcx, [rsi + 0x10]
+                0x48, 0x8b, 0x56, 0x08, // [04] mov rdx, [rsi + 0x08]
+                0x8b, 0x01, // [08] mov eax, [rcx]
+                0x85, 0xc0, // [0a] test eax, eax
+                0x74, 0x02, // [0c] je +2  (→ 10)
+                0x0f, 0x0b, // [0e] ud2
+                0x48, 0x8b, 0x42, 0x08, // [10] mov rax, [rdx + 8]
+                0xff, 0xd0, // [14] call rax
+                0xc3, // [16] ret
+            ];
+            assert!(has(&findings(&other_record), "unidentified callee"));
             let mut not_a_compare = bytes;
-            not_a_compare[0x04] = 0xc8; // test eax, ecx: no compare with a constant
+            not_a_compare[0x07] = 0xc8; // test eax, ecx: no compare with a constant
             assert!(has(&findings(&not_a_compare), "unidentified callee"));
             let mut tail = bytes;
-            tail[0x0e] = 0xe0; // jmp rax
-            let f = findings(&tail[..0x0f]);
+            tail[0x11] = 0xe0; // jmp rax
+            let f = findings(&tail[..0x12]);
             assert!(f.is_empty(), "a checked tail call.dyn was flagged: {f:?}");
             let mut unchecked_tail = tail;
-            unchecked_tail[0x03..0x09].copy_from_slice(&[0x90; 6]); // no test, je or ud2
-            let f = findings(&unchecked_tail[..0x0f]);
+            unchecked_tail[0x06..0x0c].copy_from_slice(&[0x90; 6]); // no test, je or ud2
+            let f = findings(&unchecked_tail[..0x12]);
             assert!(has(&f, "nor a callee"), "{f:?}");
-            let past = [0x8b, 0x46, 0x40, 0xc3]; // mov eax, [rsi + 0x40]: entry 4 of 4
-            assert!(has(&findings(&past), "past the table's 0x40 bytes"));
-            // A call ends the check, even with the table base parked in rbx.
-            let across = [
-                0x8b, 0x46, 0x20, // [00] mov eax, [rsi + 0x20]
-                0x85, 0xc0, // [03] test eax, eax
-                0x74, 0x02, // [05] je +2  (→ 09)
-                0x0f, 0x0b, // [07] ud2
-                0x48, 0x89, 0xf3, // [09] mov rbx, rsi
-                0xe8, 0, 0, 0, 0, // [0c] call <callee>   (rel32 patched at 0x0d)
-                0x48, 0x8b, 0x43, 0x28, // [11] mov rax, [rbx + 0x28]
-                0xff, 0xd0, // [15] call rax
-                0xc3, // [17] ret
-            ];
-            let f = check(&across, &[call_reloc(0x0d)], Entry::Guest(&G));
-            assert!(has(&f, "unidentified callee"), "{f:?}");
-            let mut no_call = across;
-            no_call[0x0c..0x11].copy_from_slice(&[0x90; 5]);
-            let f = findings(&no_call);
-            assert!(f.is_empty(), "the check through rbx was flagged: {f:?}");
         }
 
         /// vmctx and the host cells it points to: code reads their fields at fixed offsets and widths

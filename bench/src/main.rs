@@ -359,7 +359,7 @@ block 3 (v20: i64) {
     n_span: None,
 };
 
-const KERNELS: &[Kernel] = &[ALU, MEMSUM, SCATTER, SIMD, FLOAT, CALLI, CACHE];
+const KERNELS: &[Kernel] = &[ALU, MEMSUM, SCATTER, SIMD, FLOAT, CALLI, CALLI_POLY, CACHE];
 
 /// `(i64 n) -> i64`: like `memsum` but the store and the load go to **different, per-iter
 /// varying** slots — write slot `(i·M1)&1023`, read slot `(i·M2)&1023` (M1,M2 odd, so each
@@ -609,6 +609,134 @@ block 0 (v0: i64) {
     n_span: None,
 };
 
+/// `(i64 n) -> i64`: a **polymorphic `call.dyn`** loop — like `calli`, but each iteration calls one
+/// of four leaves `x -> x + k` (slots 1–4), picked by the top two bits of a 64-bit LCG, so the
+/// target is unpredictable. A mispredicted indirect call waits for the table's loads to resolve its
+/// target, which `calli`'s one hot target hides behind the branch predictor (#2680).
+const CALLI_POLY: Kernel = Kernel {
+    name: "calli_poly",
+    ir: "\
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 0
+  v2 = i64.const 0
+  v3 = i64.const 1
+  br 1(v0, v1, v2, v3)
+}
+block 1 (v4: i64, v5: i64, v6: i64, v7: i64) {
+  v8 = i64.lt_s v6 v4
+  br_if v8 2(v4, v5, v6, v7) 3(v5)
+}
+block 2 (v9: i64, v10: i64, v11: i64, v12: i64) {
+  v13 = i64.const 6364136223846793005
+  v14 = i64.mul v12 v13
+  v15 = i64.const 1442695040888963407
+  v16 = i64.add v14 v15
+  v17 = i64.const 62
+  v18 = i64.shr_u v16 v17
+  v19 = i32.wrap_i64 v18
+  v20 = i32.const 1
+  v21 = i32.add v19 v20
+  v22 = call.dyn (i64) -> (i64) v21 (v11)
+  v23 = i64.add v10 v22
+  v24 = i64.const 1
+  v25 = i64.add v11 v24
+  br 1(v9, v23, v25, v16)
+}
+block 3 (v26: i64) {
+  return v26
+}
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 1
+  v2 = i64.add v0 v1
+  return v2
+}
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 2
+  v2 = i64.add v0 v1
+  return v2
+}
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 3
+  v2 = i64.add v0 v1
+  return v2
+}
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 4
+  v2 = i64.add v0 v1
+  return v2
+}
+}
+",
+    wat32: r#"
+(module
+  (type $sig (func (param i64) (result i64)))
+  (table 5 funcref)
+  (elem (i32.const 1) $l1 $l2 $l3 $l4)
+  (func $l1 (type $sig) (i64.add (local.get 0) (i64.const 1)))
+  (func $l2 (type $sig) (i64.add (local.get 0) (i64.const 2)))
+  (func $l3 (type $sig) (i64.add (local.get 0) (i64.const 3)))
+  (func $l4 (type $sig) (i64.add (local.get 0) (i64.const 4)))
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64) (local $x i64)
+    (local.set $x (i64.const 1))
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (local.set $x
+          (i64.add (i64.mul (local.get $x) (i64.const 6364136223846793005))
+                   (i64.const 1442695040888963407)))
+        (local.set $acc
+          (i64.add (local.get $acc)
+            (call_indirect (type $sig) (local.get $i)
+              (i32.add (i32.wrap_i64 (i64.shr_u (local.get $x) (i64.const 62)))
+                       (i32.const 1)))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (local.get $acc)))
+"#,
+    wat64: Some(
+        r#"
+(module
+  (memory i64 1)
+  (type $sig (func (param i64) (result i64)))
+  (table 5 funcref)
+  (elem (i32.const 1) $l1 $l2 $l3 $l4)
+  (func $l1 (type $sig) (i64.add (local.get 0) (i64.const 1)))
+  (func $l2 (type $sig) (i64.add (local.get 0) (i64.const 2)))
+  (func $l3 (type $sig) (i64.add (local.get 0) (i64.const 3)))
+  (func $l4 (type $sig) (i64.add (local.get 0) (i64.const 4)))
+  (func (export "run") (param $n i64) (result i64)
+    (local $acc i64) (local $i i64) (local $x i64)
+    (local.set $x (i64.const 1))
+    (block $done
+      (loop $loop
+        (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
+        (local.set $x
+          (i64.add (i64.mul (local.get $x) (i64.const 6364136223846793005))
+                   (i64.const 1442695040888963407)))
+        (local.set $acc
+          (i64.add (local.get $acc)
+            (call_indirect (type $sig) (local.get $i)
+              (i32.add (i32.wrap_i64 (i64.shr_u (local.get $x) (i64.const 62)))
+                       (i32.const 1)))))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $loop)))
+    (local.get $acc)))
+"#,
+    ),
+    native: Some(native_calli_poly),
+    n_span: None,
+};
+
 /// `(i64 n) -> i64`: a **memory-latency** loop — like `scatter` but over a 1 MiB array (mask
 /// `0x1FFFF` ⇒ 128 Ki `i64` slots), so the hashed store/load addresses miss L1/L2 (and on smaller
 /// machines L3). The interesting question: temen's confinement mask (§4) is ~one `AND`; once an access
@@ -814,6 +942,34 @@ fn native_calli(n: i64) -> i64 {
     let mut acc: i64 = 0;
     for i in 0..n {
         let f = black_box(table[1]);
+        acc = acc.wrapping_add(f(i));
+    }
+    acc
+}
+
+/// Native twin of `CALLI_POLY`: the same LCG picks one of four leaves through a `black_box`'d table
+/// each iteration.
+fn native_calli_poly(n: i64) -> i64 {
+    fn l1(x: i64) -> i64 {
+        x.wrapping_add(1)
+    }
+    fn l2(x: i64) -> i64 {
+        x.wrapping_add(2)
+    }
+    fn l3(x: i64) -> i64 {
+        x.wrapping_add(3)
+    }
+    fn l4(x: i64) -> i64 {
+        x.wrapping_add(4)
+    }
+    let table: [fn(i64) -> i64; 5] = [l1, l1, l2, l3, l4];
+    let mut acc: i64 = 0;
+    let mut x: u64 = 1;
+    for i in 0..n {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let f = black_box(table[(x >> 62) as usize + 1]);
         acc = acc.wrapping_add(f(i));
     }
     acc
