@@ -3951,16 +3951,12 @@ fn parallel_domain(
 /// The usual shape is `open` → `call(0, …)` to run the on-ramp `_start` bootstrap once, then
 /// `call(tick, …)` once per frame.
 pub struct Reactor {
-    /// The compiled program, shared (an `Arc` clone seeds each call's throwaway `Domain`).
-    source: std::sync::Arc<ModuleSource>,
-    n_funcs: usize,
+    /// The compiled program, shared: each frame's domain wraps it in a fresh source and table
+    /// ([`Domain::over_primary`]), as a run over a kept program does (#1144).
+    program: std::sync::Arc<Compiled>,
     /// The live guest window — retained across calls (this is the whole point). `None` for a
     /// memory-less module, and while a [`coop_call`](Self::coop_call) run holds it.
     mem: Option<Mem>,
-    /// The dispatch table every frame runs over, built at the first frame with the install room
-    /// that frame's `Jit` grant sizes: a §22 install outlives the frame that made it, as it outlives
-    /// a run over the same powerbox (#2670).
-    table: Option<std::sync::Arc<SharedSlots>>,
 }
 
 impl Reactor {
@@ -3979,12 +3975,9 @@ impl Reactor {
 
     fn open_on(m: &Module, back: Option<std::sync::Arc<super::Region>>) -> Option<Reactor> {
         let c = compile_module_for(m, true)?;
-        let n_funcs = c.progs.len();
         Some(Reactor {
-            source: std::sync::Arc::new(ModuleSource::new(c)),
-            n_funcs,
+            program: std::sync::Arc::new(c),
             mem: Mem::root(m, default_reserved_log2(), back, &[]),
-            table: None,
         })
     }
 
@@ -4032,21 +4025,17 @@ impl Reactor {
     }
 
     /// The `Domain` one frame of `func` runs in, for [`call`](Self::call) and
-    /// [`coop_call`](Self::coop_call) alike: the shared compiled source and the reactor's one table,
-    /// built at the first frame with the install room the powerbox's `Jit` grant sizes, as every
-    /// run's table has (#1296, #2661). A §22 install stays in it for the frames after (#2670).
-    /// `Trap::Malformed` if `func` is out of range.
-    fn frame(&mut self, func: FuncIdx, host: &Host) -> Result<Domain, Trap> {
-        if func as usize >= self.n_funcs {
+    /// [`coop_call`](Self::coop_call) alike: a fresh source and table over the shared program, with
+    /// the install room the powerbox's `Jit` grant sizes (#1296, #2661). A frame is a run over the
+    /// reactor's window and powerbox, so it starts with the §22 installs the powerbox recorded, as
+    /// any run does (#2670). `Trap::Malformed` if `func` is out of range.
+    fn frame(&self, func: FuncIdx, host: &Host) -> Result<Domain, Trap> {
+        if func as usize >= self.program.progs.len() {
             return Err(Trap::Malformed);
         }
-        let n_funcs = self.n_funcs;
-        let table = self.table.get_or_insert_with(|| {
-            std::sync::Arc::new(build_table(n_funcs, host.jit_table_log2()))
-        });
-        Ok(Domain::child_shared(
-            self.source.clone(),
-            std::sync::Arc::clone(table),
+        Ok(Domain::over_primary(
+            std::sync::Arc::clone(&self.program),
+            host.jit_table_log2(),
         ))
     }
 
