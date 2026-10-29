@@ -7526,6 +7526,7 @@ pub struct Data {
 
 pub mod cfg;
 pub mod dominance;
+pub mod handles;
 pub use dominance::{Captured, Moves};
 
 /// **Compile-time confinement bound analysis** (§1a "guard-when-bounded", D36–D38/D63) — the shared,
