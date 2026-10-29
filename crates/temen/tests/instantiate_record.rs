@@ -1892,3 +1892,180 @@ fn a_childs_ceiling_caps_its_subtree_while_its_parent_has_room() {
         assert_eq!(run_detached(b, &src).expect("run"), 78, "{b:?}");
     }
 }
+
+// ===== #2043 (D1) — threads and §14 children share their domain's one child table ==============
+
+/// [`detached_record_program`] with the tail of its root — spawn `"child"`, join it, return the
+/// child's value — replaced by `tail`, which closes the root's last block and function, and with a
+/// thread worker, func 2, that returns its argument.
+fn with_tail(tail: &str) -> String {
+    let base = detached_record_program();
+    let old = "  vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)
+  vc = i32.wrap_i64 vj
+  return vc
+  }
+}
+";
+    assert!(base.contains(old), "the rewrite must apply");
+    let worker = "
+func 2 (i64, i64) -> (i64) {
+block 0 (vsp: i64, va: i64) {
+  return va
+  }
+}
+";
+    format!("{}{worker}", base.replace(old, tail))
+}
+
+/// Either join joins either kind of child, and delivers by the child's kind (INVARIANTS #6):
+/// `thread.join` of a §14 child gets its `(0, 142)`, and `Instantiator.join` of a thread gets the
+/// thread's `(0, 5)`. The root returns `(status | status) * 100000 + 142 * 100 + 5`.
+#[test]
+fn either_join_joins_either_kind_of_child() {
+    let src = with_tail(
+        "  vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
+  vsp = i64.const 0
+  vfive = i64.const 5
+  vt = thread.spawn 2 vsp vfive
+  vcs, vcv = thread.join vch
+  vts, vtv = call.cap 6 1 (i32) -> (i64, i64) vh (vt)
+  vst = i64.or vcs vts
+  vk = i64.const 100000
+  vstk = i64.mul vst vk
+  vhun = i64.const 100
+  vcvh = i64.mul vcv vhun
+  vsum = i64.add vcvh vtv
+  vall = i64.add vsum vstk
+  vc = i32.wrap_i64 vall
+  return vc
+  }
+}
+",
+    );
+    for d in DRIVERS {
+        assert_eq!(run_detached(d, &src), Ok(14205), "{d:?}");
+    }
+}
+
+/// A §14 child's trap is a value to whichever join takes it (#2066): `thread.join` of a child that
+/// trapped gets `(its trap code, 0)` and the joiner runs on, where a thread's trap would be its
+/// domain's.
+#[test]
+fn a_thread_join_of_a_trapped_child_gets_its_trap_as_a_value() {
+    let src = with_tail(
+        "  vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
+  vcs, vcv = thread.join vch
+  vc = i32.wrap_i64 vcs
+  return vc
+  }
+}
+",
+    );
+    let child = "  vk = i64.const 100\n  vr = i64.add vbw vk\n  return vr\n";
+    assert!(src.contains(child), "the rewrite must apply");
+    let src = src.replace(child, "  unreachable\n");
+    let unreachable = temen_interp::Trap::Unreachable.code() as i32;
+    for d in DRIVERS {
+        assert_eq!(run_detached(d, &src), Ok(unreachable), "{d:?}");
+    }
+}
+
+/// A root that spawns `"child"` and 1,024 threads, in the order `first` and `then` place them in
+/// block 0 and the loop, runs `full` once the loop is done; `full` closes the function.
+fn fill_the_table(first: &str, full: &str) -> String {
+    with_tail(&format!(
+        "{first}  vzero = i32.const 0
+  br 1(vh, vzero)
+  }}
+block 1 (vh1: i32, vi: i32) {{
+  vcap = i32.const 1024
+  vdone = i32.eq vi vcap
+  br_if vdone 3(vh1) 2(vh1, vi)
+  }}
+block 2 (vh2: i32, vi2: i32) {{
+  vsp = i64.const 0
+  va = i64.const 5
+  vt = thread.spawn 2 vsp va
+  vone = i32.const 1
+  vi3 = i32.add vi2 vone
+  br 1(vh2, vi3)
+  }}
+block 3 (vh3: i32) {{
+{full}"
+    ))
+}
+
+/// The table holds 1,024 children of either kind at once (`temen_ir::handles::SLOTS`). Once 1,024
+/// threads fill it, a §14 spawn answers `-EMFILE` and takes nothing: joining one thread frees its
+/// slot, and the spawn then succeeds on a budget that funds exactly one child window, so the refused
+/// one was refunded. Then every thread is joined. The root returns `refusal * 1000 + 142`.
+#[test]
+fn a_child_spawn_into_a_table_full_of_threads_answers_emfile() {
+    let src = fill_the_table(
+        "",
+        "  vrp3 = i64.const 17408
+  vrefused = call.cap 6 17 (i64) -> (i32) vh3 (vrp3)
+  vt0 = i32.const 1024
+  vs0, vv0 = thread.join vt0
+  vch = call.cap 6 17 (i64) -> (i32) vh3 (vrp3)
+  vcs, vcv = call.cap 6 1 (i32) -> (i64, i64) vh3 (vch)
+  vone3 = i32.const 1
+  br 4(vrefused, vcv, vone3)
+  }
+block 4 (vr4: i32, vc4: i64, vj: i32) {
+  vcap4 = i32.const 1024
+  vend = i32.eq vj vcap4
+  br_if vend 6(vr4, vc4) 5(vr4, vc4, vj)
+  }
+block 5 (vr5: i32, vc5: i64, vj5: i32) {
+  vgen1 = i32.const 1024
+  vth = i32.or vgen1 vj5
+  vs5, vv5 = thread.join vth
+  vone5 = i32.const 1
+  vj6 = i32.add vj5 vone5
+  br 4(vr5, vc5, vj6)
+  }
+block 6 (vr6: i32, vc6: i64) {
+  vr64 = i64.extend_i32_s vr6
+  vk = i64.const 1000
+  vrk = i64.mul vr64 vk
+  vsum = i64.add vrk vc6
+  vc = i32.wrap_i64 vsum
+  return vc
+  }
+}
+",
+    );
+    let want = temen_ir::errno::EMFILE as i32 * 1000 + 142;
+    for d in DRIVERS {
+        assert_eq!(
+            run_detached_with(d, &src, 1 << 17, RunConfig::default()),
+            Ok(want),
+            "{d:?}"
+        );
+    }
+}
+
+/// And the other way round: a §14 child holds slot 0, 1,023 threads the rest, and the next
+/// `thread.spawn` traps `ThreadFault`, as a spawn past its node's `spawn` ceiling does (#2001).
+#[test]
+fn a_thread_spawn_into_a_full_table_traps() {
+    let src = fill_the_table(
+        "  vch = call.cap 6 17 (i64) -> (i32) vh (vrp)\n",
+        "  vc = i32.const 0
+  return vc
+  }
+}
+",
+    );
+    for d in DRIVERS {
+        match run_detached(d, &src) {
+            Err(e) => assert!(
+                e.contains("ThreadFault"),
+                "{d:?}: want ThreadFault, got {e}"
+            ),
+            Ok(v) => panic!("{d:?}: want ThreadFault, got {v}"),
+        }
+    }
+}
