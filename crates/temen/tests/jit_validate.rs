@@ -8,8 +8,7 @@
 //! slice 1 fails loudly in CI if the count moves off zero.
 //!
 //! This is its own test binary and sets the environment before the first compile, so the cached
-//! `validate::enabled()` observes it (the flag also makes `jit_isa` record the block layout the
-//! validator checks branch targets against).
+//! `validate::enabled()` observes it.
 
 #![cfg(all(unix, target_arch = "x86_64"))]
 
