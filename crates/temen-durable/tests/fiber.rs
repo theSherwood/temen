@@ -605,7 +605,7 @@ block 0 (v0: i64, v1: i64) {
     // still faults.
     let forged = STALE.replace("v9 = i64.const 0", "v9 = i64.const 83886080"); // (5 << 24) | 0
     let mut forged = temen_text::parse_module(&forged).expect("parse FORGED");
-    forged.memory = stale.memory.clone();
+    forged.memory = stale.memory;
     assert_eq!(
         run_normal(&forged),
         Err(Trap::FiberFault),
