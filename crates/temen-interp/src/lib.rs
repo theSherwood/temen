@@ -9643,6 +9643,19 @@ fn park_cap_reply(sched: &Arc<Scheduler>, v: Box<VCpu>, ticket: u64, callee: Arc
     }
 }
 
+/// D66 — give `chain`'s lanes back, and re-admit every vCPU waiting on a lane: each re-checks at its
+/// own dispatch.
+fn release_lanes(sched: &Scheduler, chain: &[(usize, i64)]) {
+    let mut s = sched.lock();
+    lane_leave(&mut s.lane_running, chain);
+    if !s.lane_waiters.is_empty() {
+        let woken: Vec<Box<VCpu>> = s.lane_waiters.drain(..).collect();
+        s.runnable.extend(woken);
+        drop(s);
+        sched.work.notify_all();
+    }
+}
+
 fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
     // §2.2 fast lane: the whole body loops so an inline-serviced page fault (`Step::PageFault`
     // + parked pager + direct handoff) supplies the page and **continues this vCPU on this
@@ -9697,18 +9710,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
         // D66 — the lanes are held until the vCPU parks or finishes, as a JIT thread holds its lane
         // from resume to park: a quantum's end keeps them, so no sibling takes a full lane from a
         // holder mid-body, and a lane wider than the pool time-slices among the vCPUs it admits
-        // (#2237). Otherwise release them before any routing below, and re-admit everything that was
-        // waiting on a lane — each re-checks at its own dispatch.
+        // (#2237). Otherwise release them before any routing below. A finished vCPU releases them
+        // only once its freeze has reached its domain's children (the `Done` arm): a child the
+        // release admitted could run to its end before the freeze rang it.
         v.holds_lanes = bounded && matches!(step, Step::Yield);
-        if bounded && !v.holds_lanes {
-            let mut s = sched.lock();
-            lane_leave(&mut s.lane_running, &v.lane_chain);
-            if !s.lane_waiters.is_empty() {
-                let woken: Vec<Box<VCpu>> = s.lane_waiters.drain(..).collect();
-                s.runnable.extend(woken);
-                drop(s);
-                sched.work.notify_all();
-            }
+        if bounded && !v.holds_lanes && !matches!(step, Step::Done(_)) {
+            release_lanes(sched, &v.lane_chain);
         }
         // Save this vCPU's durable words whenever it parks (it resumes later on this single worker and must
         // restore the same context). Skipped on `Done` (it won't run again; its residue, if any, is read
@@ -9820,6 +9827,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     }
                     refuse
                 };
+                // D66 — the freeze has reached the domain's children: the lanes go back now (#2706).
+                if bounded {
+                    release_lanes(sched, &v.lane_chain);
+                }
                 let result = if detached_live_refused {
                     Err(Trap::ThreadFault)
                 } else if froze {
