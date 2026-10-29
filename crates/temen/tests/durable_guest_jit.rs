@@ -392,18 +392,21 @@ type Capture = fn(
 /// Both interpreters, each by its capture entry: the tree-walker and the bytecode pump.
 const INTERPRETERS: [(&str, Capture); 2] = [
     ("tree-walker", run_capture_reserved_with_host),
-    ("bytecode", |m, func, args, fuel, init_mem, reserved_log2, host| {
-        temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
-            m,
-            func,
-            args,
-            fuel,
-            init_mem,
-            reserved_log2,
-            host,
-        )
-        .expect("the bytecode engine runs the installer")
-    }),
+    (
+        "bytecode",
+        |m, func, args, fuel, init_mem, reserved_log2, host| {
+            temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
+                m,
+                func,
+                args,
+                fuel,
+                init_mem,
+                reserved_log2,
+                host,
+            )
+            .expect("the bytecode engine runs the installer")
+        },
+    ),
 ];
 
 /// Entry 0 on `run` over `host`: compile + install the unit (staged at `BLOB_OFF`) → its table slot,
@@ -435,7 +438,16 @@ fn call_slot(
     host: &mut Host,
 ) -> Result<Vec<Value>, temen_interp::Trap> {
     let mut fuel = 5_000_000u64;
-    run(m, 1, &[Value::I32(slot)], &mut fuel, window, SIZE_LOG2, host).0
+    run(
+        m,
+        1,
+        &[Value::I32(slot)],
+        &mut fuel,
+        window,
+        SIZE_LOG2,
+        host,
+    )
+    .0
 }
 
 /// **An install outlives its run** (#2670). The dispatch table is a per-run transient (§12.4), so

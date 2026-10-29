@@ -253,7 +253,9 @@ fn a_unit_one_frame_installs_is_called_in_the_next() {
         let mut r = bytecode::Reactor::open(&m).expect("the bytecode engine runs the module");
         let mut frame = |func, args: &[Value], host: Host| -> (Result<Vec<Value>, _>, Host) {
             if held {
-                let mut run = r.coop_call(func, args, 1_000_000, host, None, None).expect("starts");
+                let mut run = r
+                    .coop_call(func, args, 1_000_000, host, None, None)
+                    .expect("starts");
                 let ended = match run.run_clockless() {
                     bytecode::CoopEvent::Done(vals) => Ok(vals),
                     bytecode::CoopEvent::Trapped(t) => Err(t),
