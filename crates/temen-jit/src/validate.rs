@@ -223,6 +223,9 @@ pub(crate) mod x86 {
         FnTableBase,
         /// The `vmctx`/trap-out pointer (rdx).
         Vmctx,
+        /// What `[vmctx + END]` holds: the address of the domain's end word (#2488), which a raise
+        /// compares-and-swaps and the check after a host call reads.
+        DomainEnd,
         /// `stack_limit` (rcx).
         StackLimit,
         /// A known constant (e.g. the guard-offset materialization `mov r, imm`).
@@ -998,10 +1001,14 @@ pub(crate) mod x86 {
                     set(&mut state, dst, f);
                 }
                 Eff::LoadReg { dst } => {
-                    // A full-width reload from a tracked slot restores its fact.
-                    let f = match d.operands.mem.and_then(|m| frame_addr(&state, &m)) {
-                        Some(Some(off)) => state.slot_get(off),
-                        _ => Fact::Unknown,
+                    // A full-width reload from a tracked slot restores its fact, and a load of the
+                    // context's end field is the domain's end word.
+                    let f = match d.operands.mem {
+                        Some(m) if is_domain_end_field(&state, &m) => Fact::DomainEnd,
+                        m => match m.and_then(|m| frame_addr(&state, &m)) {
+                            Some(Some(off)) => state.slot_get(off),
+                            _ => Fact::Unknown,
+                        },
                     };
                     set(&mut state, dst, f);
                 }
@@ -1103,6 +1110,14 @@ pub(crate) mod x86 {
     /// `[s + disp]` through a stack pointer `s` at a known entry-relative offset, `Some(None)` for any
     /// other access the frame might hold (a stack pointer at an unknown offset, or indexed by one),
     /// `None` for an access that cannot reach the stack.
+    /// Whether `m` is `[vmctx + END]`, the context field that points at the domain's end (#2488).
+    fn is_domain_end_field(state: &State, m: &Mem) -> bool {
+        !m.rip
+            && m.index.is_none()
+            && m.disp == i64::from(crate::vmctx::END)
+            && m.base.map(|b| state.regs[b as usize & 15]) == Some(Fact::Vmctx)
+    }
+
     fn frame_addr(state: &State, m: &Mem) -> Option<Option<i64>> {
         if m.rip {
             return None;
@@ -1313,10 +1328,13 @@ pub(crate) mod x86 {
             }
             return;
         }
-        // Other known bases: the fn-table (call.dyn dispatch), vmctx (the trap-out cell and
-        // per-instance fields), and a lea'd pointer into the function's own rodata / jump tables (the
-        // br_table dispatch's table read). Their extents are #2603 PR 3.
-        if matches!(base_f, Some(Fact::FnTableBase | Fact::Vmctx | Fact::RipRel)) {
+        // Other known bases: the fn-table (call.dyn dispatch), vmctx (the stop word and
+        // per-instance fields), the domain's end word, and a lea'd pointer into the function's own
+        // rodata / jump tables (the br_table dispatch's table read). Their extents are #2603 PR 3.
+        if matches!(
+            base_f,
+            Some(Fact::FnTableBase | Fact::Vmctx | Fact::DomainEnd | Fact::RipRel)
+        ) {
             return;
         }
         // Anything else: an access through a base of unknown or non-pointer provenance.

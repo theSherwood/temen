@@ -31,12 +31,20 @@
 //! handler invoked over a live window (the window's owner). The type makes the omission a compile
 //! error; the comment at each site says which instance.
 //!
-//! **The trap cell is how the domain ended, written once (#2499).** Every vCPU of a domain shares its
-//! context, and by invariants 5 and 6 every code the cell can hold — a trap, an `exit`, the end
-//! teardown records — ends the whole domain. So the cell is not a per-call status: [`VmCtx::raise`]
-//! records an end only if none is recorded (the first end wins), nothing clears it while a run is in
-//! it, and every check — the propagation guard after each call, a loop's poll, a park, the run's
-//! outcome — reads that one word. The field is private: a host thunk raises and reads, never stores.
+//! **The domain's end is one word, written once (#2499).** By invariants 5 and 6 every code an end
+//! can hold — a trap, an `exit`, the end teardown records — ends the whole domain. So the end is not a
+//! per-call status: [`VmCtx::raise`] records one only if none is recorded (the first end wins), and
+//! nothing clears it while a run is in it. The word belongs to the domain's root context; every
+//! context of the domain points at it ([`END`]).
+//!
+//! **Each vCPU runs on a context of its own (#2488)**, made by [`VmCtx::vcpu`], so that it charges a
+//! fuel cell of its own: the vCPUs of a domain once shared one, and every fuel check stored to the
+//! same cache line. So the check after each call reads the context's **stop word** at offset 0, a
+//! copy of the domain's end. The copy is written only after the end: by a raise, by a loop's poll
+//! that read the end, and by the check after a host call, which reads the end itself because the host
+//! may have seen another vCPU end the domain. The check after a guest call stays one load. A root
+//! context's stop word is the root vCPU's. The fields are private: a host thunk raises and reads,
+//! never stores.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
@@ -45,10 +53,13 @@ use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 /// at the fixed offsets below.
 #[repr(C)]
 pub struct VmCtx {
-    /// The trap cell: `0` while the domain runs; once it ended, the low 32 bits a [`crate::TrapKind`] /
-    /// `EXIT_CODE` / internal code, the high 32 bits an exit code. Written once, by [`Self::raise`].
-    /// **Offset 0** — a pointer to the vmctx is a pointer to the trap cell.
+    /// The stop word: `0` while the code running on this context may go on; once the domain ended,
+    /// a copy of its end. **Offset 0** — a pointer to the vmctx is a pointer to the stop word.
     trap: AtomicI64,
+    /// The domain's end: `0` while it runs; once it ended, the low 32 bits a [`crate::TrapKind`] /
+    /// `EXIT_CODE` / internal code, the high 32 bits an exit code. Written once, by [`Self::raise`]
+    /// (or compiled code's raise). The root context's [`Self::owned_end`].
+    end: *const AtomicI64,
     /// The `call.cap` thunk's opaque ctx: the instance's powerbox (`*mut Host`, `*const Mutex<Host>`,
     /// or a child's own), handed to every `call.cap` as the thunk's first argument.
     pub cap_ctx: *mut c_void,
@@ -76,6 +87,9 @@ pub struct VmCtx {
     /// #2164 — a demand-paged child's **access table** (`temen_ir::PAGE_READ`), which a paged
     /// compile tests before each access. Null when the instance is not paged.
     pub pages: *const AtomicU8,
+    /// The domain's end word, owned by its root context ([`Self::new`]); `None` for a vCPU's
+    /// context ([`Self::vcpu`]), which points at its root's. Never read by compiled code.
+    owned_end: Option<Box<AtomicI64>>,
 }
 
 /// The per-instance addresses a [`VmCtx`] is filled from — everything but the trap cell, which each
@@ -113,10 +127,13 @@ impl InstanceAddrs {
 }
 
 impl VmCtx {
-    /// A fresh context (trap cell `0`) for the instance at `a`.
+    /// A fresh root context for the instance at `a`: a domain of its own, not yet ended.
     pub fn new(a: InstanceAddrs) -> VmCtx {
+        // Boxed, so the word stays put when the context moves.
+        let owned_end = Box::new(AtomicI64::new(0));
         VmCtx {
             trap: AtomicI64::new(0),
+            end: &*owned_end,
             cap_ctx: a.cap_ctx,
             epoch: a.epoch,
             fuel: a.fuel,
@@ -127,22 +144,58 @@ impl VmCtx {
             nursery: a.nursery,
             setjmp: a.setjmp,
             pages: a.pages,
+            owned_end: Some(owned_end),
         }
     }
 
+    /// #2488 — a context for another vCPU of this context's domain: the same instance and the same
+    /// end, charging `fuel`. It must not outlive the domain's root context, which owns the end.
+    pub(crate) fn vcpu(&self, fuel: *mut crate::FuelCell) -> VmCtx {
+        VmCtx {
+            // A domain that already ended stops the vCPU at its first check.
+            trap: AtomicI64::new(self.ended().unwrap_or(0)),
+            end: self.end,
+            cap_ctx: self.cap_ctx,
+            epoch: self.epoch,
+            fuel,
+            sig_armed: self.sig_armed,
+            sig_ctx: self.sig_ctx,
+            embedder: self.embedder,
+            sched: self.sched,
+            nursery: self.nursery,
+            setjmp: self.setjmp,
+            pages: self.pages,
+            owned_end: None,
+        }
+    }
+
+    /// The domain's end word.
+    fn end(&self) -> &AtomicI64 {
+        // SAFETY: `end` is the root context's boxed word, which outlives every context of its domain
+        // (`Self::vcpu`'s contract).
+        unsafe { &*self.end }
+    }
+
     /// End this context's domain with `code` — a trap, an `exit`, or an internal end — unless an end
-    /// is already recorded: the first end wins, and a later one changes nothing (#2499). Every vCPU
-    /// sharing the context sees it at its next check.
+    /// is already recorded: the first end wins, and a later one changes nothing (#2499). This
+    /// context stops at its next check; the domain's other vCPUs, at their next poll or park.
     pub fn raise(&self, code: i64) {
         debug_assert_ne!(code, 0, "an end is never 0");
+        let end = match self
+            .end()
+            .compare_exchange(0, code, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => code,
+            Err(first) => first,
+        };
         let _ = self
             .trap
-            .compare_exchange(0, code, Ordering::Relaxed, Ordering::Relaxed);
+            .compare_exchange(0, end, Ordering::Relaxed, Ordering::Relaxed);
     }
 
     /// The code that ended this context's domain, or `None` while it runs.
     pub fn ended(&self) -> Option<i64> {
-        match self.trap.load(Ordering::Relaxed) {
+        match self.end().load(Ordering::Relaxed) {
             0 => None,
             code => Some(code),
         }
@@ -160,14 +213,15 @@ impl VmCtx {
 
 // SAFETY: every pointer field is the address of a host-owned object that outlives each run entering
 // through this context (the caller's contract at every entry), and compiled code only *reads* them; the
-// one field written concurrently — the trap cell, by sibling vCPUs of one instance and a parent ending
-// it — is atomic. So one context may be shared by the threads of one instance (its spawned vCPUs, a
-// §14 task's worker).
+// words written concurrently — the domain's end and the stop word, by sibling vCPUs of one instance
+// and a parent ending it — are atomic. So one context may be shared by the threads of one instance (a
+// fiber that moved to another vCPU, a §14 task's worker).
 unsafe impl Send for VmCtx {}
 unsafe impl Sync for VmCtx {}
 
 /// Field offsets compiled code loads at (`#[repr(C)]` makes them fixed; `offset_of!` keeps them in
 /// step with the struct).
+pub(crate) const END: i32 = core::mem::offset_of!(VmCtx, end) as i32;
 pub(crate) const CAP_CTX: i32 = core::mem::offset_of!(VmCtx, cap_ctx) as i32;
 pub(crate) const EPOCH: i32 = core::mem::offset_of!(VmCtx, epoch) as i32;
 pub(crate) const FUEL: i32 = core::mem::offset_of!(VmCtx, fuel) as i32;
@@ -178,7 +232,8 @@ pub(crate) const NURSERY: i32 = core::mem::offset_of!(VmCtx, nursery) as i32;
 pub(crate) const SETJMP: i32 = core::mem::offset_of!(VmCtx, setjmp) as i32;
 pub(crate) const PAGES: i32 = core::mem::offset_of!(VmCtx, pages) as i32;
 
-// The trap cell must be the first field: every trap-cell reader dereferences the vmctx pointer itself.
+// The stop word must be the first field: the check after each call dereferences the vmctx pointer
+// itself.
 const _: () = assert!(core::mem::offset_of!(VmCtx, trap) == 0);
 
 #[cfg(test)]
@@ -193,5 +248,138 @@ mod tests {
         vm.raise(7);
         vm.raise(9);
         assert_eq!(vm.ended(), Some(7));
+    }
+
+    /// #2488 — a vCPU's context shares its root's end and stops on a copy of it: an end raised
+    /// through either is the domain's, and the raiser's stop word holds the end that won.
+    #[test]
+    fn a_vcpu_context_shares_the_end_and_stops_on_its_copy() {
+        let stop = |vm: &VmCtx| vm.trap.load(core::sync::atomic::Ordering::Relaxed);
+        let root = VmCtx::new(InstanceAddrs::NONE);
+        let a = root.vcpu(core::ptr::null_mut());
+        let b = root.vcpu(core::ptr::null_mut());
+        a.raise(7);
+        assert_eq!((root.ended(), b.ended()), (Some(7), Some(7)));
+        assert_eq!(
+            (stop(&a), stop(&b), stop(&root)),
+            (7, 0, 0),
+            "only the raiser stops at once"
+        );
+        b.raise(9);
+        assert_eq!(
+            (root.ended(), stop(&b)),
+            (Some(7), 7),
+            "b stops on the end that won"
+        );
+        assert_eq!(
+            stop(&root.vcpu(core::ptr::null_mut())),
+            7,
+            "a late vCPU starts stopped"
+        );
+    }
+
+    /// Runs `src` (the root takes one `i64`) and returns its outcome and whether anything stored the
+    /// marker at window offset 16392, just past the NULL guard.
+    fn run_marked(src: &str) -> (crate::JitOutcome, bool) {
+        let m = temen_text::parse_module(src).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let (outcome, mem) = crate::run_inner(
+            &m,
+            0,
+            &[0],
+            crate::empty_cap_thunk,
+            core::ptr::null_mut(),
+            crate::RunOpts {
+                snapshot_cap: Some(16400),
+                ..crate::RunOpts::default()
+            },
+        )
+        .expect("compiles and runs");
+        (outcome, mem[16392..16400] != [0; 8])
+    }
+
+    /// #2488 — a vCPU parked when a sibling ends the domain wakes as if woken, with nothing raised on
+    /// its own context: only the check after the wait, which reads the domain's end, stops it. The
+    /// root ends the domain once the vCPU has flagged that it is about to wait. Had the vCPU run on,
+    /// it would have stored the marker.
+    #[test]
+    fn a_parked_vcpu_stops_when_a_sibling_ends_the_domain() {
+        if !temen_fiber::supported() {
+            return;
+        }
+        let src = "memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 0
+  v2 = thread.spawn 1 v1 v0
+  br 1()
+  }
+block 1 () {
+  v3 = i64.const 16400
+  v4 = i32.atomic.load v3
+  br_if v4 2() 1()
+  }
+block 2 () {
+  unreachable
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 16400
+  v3 = i32.const 1
+  i32.atomic.store v2 v3
+  v4 = i64.const 16384
+  v5 = i32.const 0
+  v6 = i64.const -1
+  v7 = i32.atomic.wait v4 v5 v6
+  v8 = i64.const 16392
+  v9 = i64.const 99
+  i64.store v8 v9
+  return v1
+  }
+}
+";
+        let trapped = crate::JitOutcome::Trapped(crate::TrapKind::Unreachable);
+        assert_eq!(run_marked(src), (trapped, false), "the waiter stopped");
+    }
+
+    /// #2488 — a fiber runs on its creator's context wherever it is resumed, so a fiber the root made
+    /// that traps on another vCPU stops the root's context, not the resumer's: the resumer stops
+    /// at the check after its `cont.resume`, which reads the domain's end.
+    #[test]
+    fn a_resumer_stops_when_a_fiber_made_elsewhere_traps() {
+        if !temen_fiber::supported() {
+            return;
+        }
+        let src = "memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = ref.func 2
+  v2 = i64.const 8192
+  v3 = cont.new v1 v2
+  v4 = i64.const 0
+  v5 = thread.spawn 1 v4 v3
+  v6 = thread.join v5
+  return v6
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 0
+  vs, vv = cont.resume v1 v2
+  v3 = i64.const 16392
+  v4 = i64.const 99
+  i64.store v3 v4
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  unreachable
+  }
+}
+";
+        let trapped = crate::JitOutcome::Trapped(crate::TrapKind::Unreachable);
+        assert_eq!(run_marked(src), (trapped, false), "the resumer stopped");
     }
 }

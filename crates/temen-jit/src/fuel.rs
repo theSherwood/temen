@@ -87,6 +87,30 @@ impl FuelCell {
         })
     }
 
+    /// #2488 — a cell for another vCPU of this cell's domain, drawing from the same chain, none drawn
+    /// yet. `None` for a fixed allowance (or a chain that proved unbounded): it has no chain to
+    /// split, so its vCPUs keep sharing this cell.
+    pub(crate) fn sibling(&self) -> Option<Box<FuelCell>> {
+        let src = self.src.lock().unwrap_or_else(|e| e.into_inner());
+        src.clone().map(Self::drawing)
+    }
+
+    /// #2488 — a vCPU that charged this cell has ended: hand back what its draw left, as an ended
+    /// vCPU does (invariant 3). The cell keeps its chain, so code that still charges it draws again.
+    ///
+    /// # Safety
+    /// `cell` is a live cell. A fiber that outlived its vCPU may still charge it: a charge racing this
+    /// one can be lost or counted twice, by at most one chunk.
+    pub(crate) unsafe fn settle(cell: *mut FuelCell) {
+        let src = (*cell).src.lock().unwrap_or_else(|e| e.into_inner());
+        let left = core::ptr::addr_of_mut!((*cell).left);
+        let unspent = core::ptr::read_volatile(left);
+        core::ptr::write_volatile(left, 0);
+        if let Some(s) = src.as_ref() {
+            s.give_back(unspent);
+        }
+    }
+
     /// #2113 — point a cell that compiled code keeps across runs (a compile-once program's) at the
     /// chain its next run draws from: what the last draw left goes back to its chain first. `None`
     /// detaches it, so code run before the next re-arm traps `OutOfFuel`. Only between runs: no
@@ -447,6 +471,98 @@ mod tests {
             drip.draws.load(Ordering::Relaxed),
             n as u64 + 1,
             "the entry and every back edge refilled"
+        );
+    }
+
+    /// A chain that hands out [`CHUNK`] per draw, never runs dry, and counts what goes back.
+    #[derive(Default)]
+    struct Chunks {
+        draws: AtomicU64,
+        back: AtomicU64,
+    }
+
+    const CHUNK: u64 = 1 << 20;
+
+    impl BudgetNode for Chunks {
+        fn draw(&self) -> Option<u64> {
+            self.draws.fetch_add(1, Ordering::Relaxed);
+            Some(CHUNK)
+        }
+        fn give_back(&self, unspent: u64) {
+            self.back.fetch_add(unspent, Ordering::Relaxed);
+        }
+        fn room(&self) -> i64 {
+            i64::MAX
+        }
+        fn charge_vcpu(&self) -> bool {
+            true
+        }
+        fn rebuild_vcpu(&self) -> bool {
+            true
+        }
+        fn vcpu_ended(&self) {}
+        fn charge_fiber(&self) -> bool {
+            true
+        }
+        fn force_fiber(&self) {}
+        fn fiber_ended(&self) {}
+    }
+
+    /// The root spawns a vCPU that turns a loop its argument's times, and returns what it joins.
+    const SPAWNS_A_LOOP: &str = "memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 0
+  v2 = thread.spawn 1 v1 v0
+  v3 = thread.join v2
+  return v3
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 0
+  br 1(v2, v1)
+}
+block 1 (v3: i64, v4: i64) {
+  v5 = i64.const 1
+  v6 = i64.add v3 v5
+  v7 = i64.lt_s v6 v4
+  br_if v7 1(v6, v4) 2(v6)
+}
+block 2 (v8: i64) {
+  return v8
+  }
+}
+";
+
+    /// #2488 — a spawned vCPU charges a cell of its own, drawn from the root cell's chain, and hands
+    /// back what it did not burn when it ends. The root's cell pays only the root's safepoints, so
+    /// the domain's vCPUs no longer store to one cache line.
+    #[test]
+    fn a_spawned_vcpu_charges_a_cell_of_its_own() {
+        if !temen_fiber::supported() {
+            return;
+        }
+        let m = temen_text::parse_module(SPAWNS_A_LOOP).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let chain = Arc::new(Chunks::default());
+        let mut root = FuelCell::drawing(chain.clone());
+        let n = 10_000;
+        assert_eq!(run_jit(&m, n, &mut root), JitOutcome::Returned(vec![n]));
+        assert_eq!(
+            chain.draws.load(Ordering::Relaxed),
+            2,
+            "the root's cell and the vCPU's each drew one chunk"
+        );
+        let root_burned = CHUNK - root.left;
+        assert!(
+            root_burned < 10,
+            "the root's cell paid the root's safepoints only, not the loop's: {root_burned}"
+        );
+        let vcpu_burned = CHUNK - chain.back.load(Ordering::Relaxed);
+        assert!(
+            (n as u64..n as u64 + 10).contains(&vcpu_burned),
+            "the vCPU's cell paid the loop and handed back the rest: {vcpu_burned}"
         );
     }
 
