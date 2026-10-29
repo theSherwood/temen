@@ -3935,15 +3935,19 @@ as a value with the budget un-spent (#1587).
 non-durable §14 child — the **detached** children of op 17 (and, until #1867, the **carve** children
 of ops 0/5/8/11/13, with the copy-in/`copy_back` below) — is a task — a platform-owned `FiberSlot` (in no guest table, spends no fiber quota)
 carrying the child's own window, trap cell and fiber execution context — on a pool of workers spawned
-on demand; any worker may resume it under the same single-owner claim guest fibers use (the D57
+on demand, one of them kept free while the pool may grow (#1991: a worker that takes a task and leaves
+none free adds one, since only a free worker takes a task that becomes runnable, fires a parked task's
+deadline and sweeps); any worker may resume it under the same single-owner claim guest fibers use (the D57
 migration unsafe, no new one), each resume its own guard bracket over the *task's* fault range (R1),
 the per-thread state seeded and reset at both edges of every residency (R2: `CURRENT_RT`, `vcpu.tls`,
 the current-task word — all `#[inline(never)]` readers). A futex `wait` inside the child takes the
 existing "inside a fiber ⇒ park the fiber" arm unchanged (INVARIANTS #15: no second park mechanism);
-**one** wake reaches every parked task and each re-checks its own predicate in the loop it already
-has — `Domain::wake_all_parked` extended to tasks, so a `notify`, a vCPU exit, the §5 kill path and
-teardown all arrive by the same route, and an idle worker sweeps the parked set on the bounded
-`KILL_RECHECK` cadence to fire deadlines. No per-task waker, no second deadline store, no second
+**one** wake route reaches the parked tasks (`Domain::wake_child_tasks`), and each task it reaches
+re-checks its own predicate in the loop it already has: a vCPU exit, a child's end, the §5 kill path
+and teardown re-offer every parked task, a `notify` only those whose futex wait it claimed (#1991:
+the rest would re-check and park again, and with many tasks that was most of a busy run's work), and a
+free worker sweeps the parked set on the bounded `KILL_RECHECK` cadence to fire deadlines. No
+per-task waker, no second deadline store, no second
 runnable queue: the executor's whole state is a task map, a FIFO and the per-domain lane counts. Every
 resume is gated on the task's lane chain with `temen_ir::lanes` — the oracle's arithmetic — held
 exactly while on a worker and released the moment it parks, so a child of a cap-1 parent never overlaps

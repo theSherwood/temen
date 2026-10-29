@@ -395,6 +395,11 @@ impl ParkOn {
     pub(crate) fn blocks_vcpu(&self) -> bool {
         matches!(self, ParkOn::Thread | ParkOn::Child | ParkOn::Page)
     }
+
+    /// #1991 — a futex wait whose event has fired ([`crate::os_thread_rt::WaitCell::resolved`]).
+    pub(crate) fn resolved(&self) -> bool {
+        matches!(self, ParkOn::Futex(cell) if cell.resolved())
+    }
 }
 
 /// The **domain-shared fiber table** (D57 3b-ii): one per compiled module, shared by the root vCPU
@@ -659,6 +664,14 @@ impl FiberSlot {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// #1991 — whether that event park is a futex wait whose event has fired ([`ParkOn::resolved`]).
+    pub(crate) fn park_resolved(&self) -> bool {
+        self.park_on
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resolved()
     }
 
     /// D66 — the single-owner claim for a platform slot's resume (generation 0, never recycled).

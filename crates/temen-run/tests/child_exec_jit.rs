@@ -33,8 +33,8 @@ fn module(text: &str) -> temen_ir::Module {
 /// `v0` Instantiator, `v1` AddressSpace, `v2` child module A, `v3` child module B, `v4` Budget.
 /// Mints a 64 KiB region, maps it at 65536 of its own window, spawns A then B detached, each from a
 /// record of its own (A's at 17408, B's at 17536), with the region pre-mapped at 65536 of each
-/// child's window (2^17), then runs `tail`.
-fn parent(tail: &str) -> String {
+/// child's window (2^17), running `between` after A's spawn and before B's, then runs `tail`.
+fn parent(between: &str, tail: &str) -> String {
     let child = SpawnRec {
         size_log2: 17,
         child_off: 65536,
@@ -65,6 +65,7 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
   i32.store vbreg vrh
   varec = i64.const 17408
   vca = call.cap 6 17 (i64) -> (i32) v0 (varec)
+  {between}
   vbrec = i64.const 17536
   vcb = call.cap 6 17 (i64) -> (i32) v0 (vbrec)
   {tail}
@@ -242,7 +243,7 @@ fn run_interp(p: &temen_ir::Module, a: &temen_ir::Module, b: &temen_ir::Module, 
 /// violations; at 20M it cost 27s of CI time for no extra signal.
 #[test]
 fn a_parent_lane_cap_of_one_serializes_two_detached_children_on_the_jit() {
-    let p = module(&parent(TAIL_VIOLATIONS));
+    let p = module(&parent("", TAIL_VIOLATIONS));
     let s = module(SPINNER);
     assert_eq!(run_interp(&p, &s, &s, 1), 0, "the oracle");
     assert_eq!(
@@ -258,7 +259,7 @@ fn a_parent_lane_cap_of_one_serializes_two_detached_children_on_the_jit() {
 /// and the parent joins both: `1001`. A worker pinned to the parked child would never run B.
 #[test]
 fn a_parked_child_hands_its_lane_to_the_sibling_that_wakes_it() {
-    let p = module(&parent(TAIL_SUM));
+    let p = module(&parent("", TAIL_SUM));
     let a = module(&waiter(-1));
     let b = module(NOTIFIER);
     // The oracle's worker pool does not order two freshly spawned children — B may store before A
@@ -277,7 +278,7 @@ fn a_parked_child_hands_its_lane_to_the_sibling_that_wakes_it() {
 /// 0: `200`, and the trivial sibling `0` ⇒ `200000`.
 #[test]
 fn a_tasks_timed_wait_times_out_without_a_poller() {
-    let p = module(&parent(TAIL_SUM));
+    let p = module(&parent("", TAIL_SUM));
     let a = module(&waiter(1_000_000));
     let b = module(TRIVIAL);
     assert_eq!(run_interp(&p, &a, &b, 1), 200_000, "the oracle");
@@ -337,7 +338,7 @@ block 3 (vr: i64) {{
 /// stale by the time the child waits — 3.6 ms per wait sampled, then 8.4 ms in the child, on macOS.
 #[test]
 fn a_tasks_short_timed_waits_end_at_their_deadlines() {
-    let p = module(&parent(TAIL_SUM));
+    let p = module(&parent("", TAIL_SUM));
     let a = module(&sleeper(100, 1_000_000));
     let b = module(TRIVIAL);
     assert_eq!(run_interp(&p, &a, &b, -1), 100_000, "the oracle");
@@ -369,13 +370,156 @@ fn a_tasks_short_timed_waits_end_at_their_deadlines() {
     );
 }
 
+/// Where #1991's pair meets in the shared region: each child stores its `READY` word before it
+/// parks on `GO`, which the root sets once both have; the sleeper stores `DONE` when its waits are
+/// over.
+const READY_A: u64 = 65560;
+const READY_B: u64 = 65564;
+const GO: u64 = 65568;
+const DONE: u64 = 65572;
+
+/// A child's first lines: store 1 to `ready` and notify it, then park on [`GO`] until the root sets
+/// it.
+fn ready_then_go(ready: u64) -> String {
+    format!(
+        "vrdy = i64.const {ready}
+  vone = i32.const 1
+  i32.atomic.store vrdy vone
+  vnr = atomic.notify vrdy vone
+  vgo = i64.const {GO}
+  vz = i32.const 0
+  vinf = i64.const -1
+  vwg = i32.atomic.wait vgo vz vinf"
+    )
+}
+
+/// #1991's A: [`ready_then_go`], then `waits` timed waits of 1 ms on X, which nobody stores, then
+/// [`DONE`]. Returns 1.
+fn sleep_then_done(waits: i64) -> String {
+    format!(
+        r#"memory 17
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  {ready}
+  vi = i64.const 0
+  br 1(vi)
+}}
+block 1 (vi1: i64) {{
+  vn = i64.const {waits}
+  vlt = i64.lt_u vi1 vn
+  br_if vlt 2(vi1) 3()
+}}
+block 2 (vi2: i64) {{
+  vx = i64.const 65552
+  ve = i32.const 0
+  vt = i64.const 1000000
+  vs = i32.atomic.wait vx ve vt
+  vone2 = i64.const 1
+  vi3 = i64.add vi2 vone2
+  br 1(vi3)
+}}
+block 3 () {{
+  vdone = i64.const {DONE}
+  vone3 = i32.const 1
+  i32.atomic.store vdone vone3
+  vr = i64.const 1
+  return vr
+  }}
+}}
+"#,
+        ready = ready_then_go(READY_A),
+    )
+}
+
+/// #1991's B: [`ready_then_go`], then spin, never parking, until [`DONE`] is set, for at most
+/// `limit` turns. Returns 1 if it saw `DONE`, 0 if it gave up.
+fn spin_until_done(limit: i64) -> String {
+    format!(
+        r#"memory 17
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  {ready}
+  vi = i64.const 0
+  br 1(vi)
+}}
+block 1 (vi1: i64) {{
+  vdone = i64.const {DONE}
+  vd = i32.atomic.load vdone
+  vz1 = i32.const 0
+  vseen = i32.ne vd vz1
+  br_if vseen 3() 2(vi1)
+}}
+block 2 (vi2: i64) {{
+  vlim = i64.const {limit}
+  vone2 = i64.const 1
+  vi3 = i64.add vi2 vone2
+  vlt = i64.lt_u vi3 vlim
+  br_if vlt 1(vi3) 4()
+}}
+block 3 () {{
+  vr = i64.const 1
+  return vr
+}}
+block 4 () {{
+  vr0 = i64.const 0
+  return vr0
+  }}
+}}
+"#,
+        ready = ready_then_go(READY_B),
+    )
+}
+
+/// The root waits until the child has stored `ready` (registers prefixed `p`).
+fn root_waits(ready: u64, p: &str) -> String {
+    format!(
+        "v{p}r = i64.const {ready}
+  v{p}z = i32.const 0
+  v{p}inf = i64.const -1
+  v{p}w = i32.atomic.wait v{p}r v{p}z v{p}inf"
+    )
+}
+
+/// After B's spawn: wait until B is ready too, set [`GO`] and wake both, then [`TAIL_SUM`].
+fn tail_go() -> String {
+    format!(
+        "{wait_b}
+  vgo = i64.const {GO}
+  vgone = i32.const 1
+  i32.atomic.store vgo vgone
+  vgtwo = i32.const 2
+  vgn = atomic.notify vgo vgtwo
+  {TAIL_SUM}",
+        wait_b = root_waits(READY_B, "b"),
+    )
+}
+
+/// **#1991 — a task's deadline fires while its sibling spins.** Only a free worker fires a parked
+/// task's deadline, so a worker that takes a task and leaves none free adds one, up to the pool's
+/// ceiling. A sleeps through 20 timed waits of 1 ms, then sets `DONE`; B, its sibling, spins
+/// without ever parking until it sees `DONE`, for at most 4·10⁹ turns (seconds on the JIT). Both
+/// wait for `GO` first, and the root spawns B only once A is ready, so A has parked and left the
+/// pool's one worker free when B is filed. When the pool grew only at a spawn that found no worker
+/// free, B took that one worker and A's deadlines waited for B to give it back, after B's last turn
+/// with `DONE` still unset: `1000`. With a worker kept free, A's waits end on time while B spins,
+/// and B sees `DONE`: `1001`, the oracle's answer, whose quantum round-robin gives every child its
+/// own progress.
+#[test]
+fn a_tasks_deadline_fires_while_its_sibling_spins() {
+    let p = module(&parent(&root_waits(READY_A, "a"), &tail_go()));
+    let a = module(&sleep_then_done(20));
+    let b = module(&spin_until_done(4_000_000_000));
+    assert_eq!(run_interp(&p, &a, &b, -1), 1001, "the oracle");
+    assert_eq!(run_jit(&p, &a, &b, -1), 1001);
+}
+
 /// **Teardown unwinds a task parked forever.** The parent spawns a child that waits on a word no
 /// one stores, and returns without joining. Run teardown poisons the parked task (the domain is
 /// over — `DOMAIN_DONE`, D37 death-is-revocation), it unwinds through its trailing guard, and the
 /// run completes with the parent's `7` instead of hanging on the child.
 #[test]
 fn run_teardown_unwinds_a_detached_child_parked_forever() {
-    let p = module(&parent(TAIL_LEAVE));
+    let p = module(&parent("", TAIL_LEAVE));
     let a = module(&waiter(-1));
     let b = module(TRIVIAL);
     assert_eq!(run_jit(&p, &a, &b, -1), 7);
@@ -443,7 +587,7 @@ block 5 (vi6: i64) {{
 /// sides — well over any plausible healthy run, comfortably under the 4 s floor of a broken one.
 #[test]
 fn two_child_tasks_ping_pong_through_the_futex_without_waiting_on_the_sweep() {
-    let p = module(&parent(TAIL_SUM));
+    let p = module(&parent("", TAIL_SUM));
     let a = module(&pingpong(0, 1, 200));
     let b = module(&pingpong(1, 0, 200));
     let start = std::time::Instant::now();
@@ -502,7 +646,7 @@ const TAIL_ROOT_WAITS_FOR_A_SLEEPING_CHILD: &str = "vx2 = i64.const 65556
 /// divergence — the interpreter answered `WAIT_WOKEN` throughout.
 #[test]
 fn a_task_asleep_on_its_own_deadline_is_not_a_deadlock() {
-    let p = module(&parent(TAIL_ROOT_WAITS_FOR_A_SLEEPING_CHILD));
+    let p = module(&parent("", TAIL_ROOT_WAITS_FOR_A_SLEEPING_CHILD));
     let a = module(SLEEP_THEN_NOTIFY);
     let b = module(TRIVIAL);
     // WAIT_WOKEN (0) on both engines: the root is woken by the task, not failed closed.
@@ -568,7 +712,7 @@ block 5 (h5: i32, a5: i32, b5: i32) {{
 #[test]
 fn a_notify_racing_a_tasks_park_is_not_lost() {
     const ROUNDS: i64 = 3000;
-    let p = module(&parent(&tail_root_pingpong(ROUNDS)));
+    let p = module(&parent("", &tail_root_pingpong(ROUNDS)));
     let a = module(&pingpong(0, 1, ROUNDS));
     let b = module(TRIVIAL);
     let want = 1000 * ROUNDS;
