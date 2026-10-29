@@ -361,6 +361,42 @@ exit:\n\
     }
 }
 
+/// #2454: `extractvalue` emits no instruction, it names the field's slot. In `mid` that slot is a
+/// capture of `%p`'s field, which nothing in `mid` reads, so `mid` drops the capture. `%a` and `%b`
+/// must then be read from where the fields live (the entry), not from a slot `mid` no longer has.
+#[test]
+fn a_field_named_in_one_block_and_read_in_the_next() {
+    let ll = "\
+define { i64, i64 } @mk(i64 %x) {
+  %1 = insertvalue { i64, i64 } undef, i64 %x, 0
+  %2 = insertvalue { i64, i64 } %1, i64 7, 1
+  ret { i64, i64 } %2
+}
+define i64 @f(i64 %x, i1 %c) {
+entry:
+  %p = call { i64, i64 } @mk(i64 %x)
+  br label %mid
+mid:
+  %a = extractvalue { i64, i64 } %p, 0
+  %b = extractvalue { i64, i64 } %p, 1
+  br i1 %c, label %t, label %e
+t:
+  %r = add i64 %a, %b
+  ret i64 %r
+e:
+  ret i64 %b
+}
+define i64 @run() {
+  %u = call i64 @f(i64 35, i1 true)
+  %v = call i64 @f(i64 35, i1 false)
+  %w = mul i64 %u, 1000
+  %s = add i64 %w, %v
+  ret i64 %s
+}
+";
+    assert_eq!(run_ll_i64("field read a block later", ll), 42_007);
+}
+
 #[test]
 fn thread_local_tier2_vcpu_tls_isolation_and_pause_drop() {
     // The threaded-`std` build's native TLS shape (NIM.md §3d Tier-2): a `thread_local` global,
