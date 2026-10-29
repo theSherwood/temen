@@ -1821,3 +1821,118 @@ fn a_live_call_to_a_serving_child_parks_until_the_child_serves_it() {
         &ok(142),
     );
 }
+
+/// A parent `(i32 inst, i32 module, i32 budget, i32 out) -> i64` that runs `first` (block 0, with
+/// the record's handles stored), spawns 1,024 threads of func 1, which returns its argument, and
+/// then runs `full`, which closes the function. `first` spawns from the record at [`REC_AT`]
+/// ([`payload_rec`]) as `rp`, `full` as `rp3`; its child returns the word at 20480, 7.
+fn fill_with_threads(first: &str, full: &str) -> String {
+    format!(
+        "memory 17
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vmod: i32, vbud: i32, vout: i32) {{
+{h}  pa = i64.const 20480
+  pw = i64.const 7
+  i64.store pa pw
+  ap = i64.const {args_at}
+  i64.store ap pa
+  rp = i64.const {REC_AT}
+{first}  vzero = i32.const 0
+  br 1(vinst, vzero)
+}}
+block 1 (vinst1: i32, vi: i32) {{
+  vcap = i32.const 1024
+  vdone = i32.eq vi vcap
+  br_if vdone 3(vinst1) 2(vinst1, vi)
+}}
+block 2 (vinst2: i32, vi2: i32) {{
+  vsp = i64.const 0
+  va = i64.const 5
+  vt = thread.spawn 1 vsp va
+  vone = i32.const 1
+  vi3 = i32.add vi2 vone
+  br 1(vinst2, vi3)
+}}
+block 3 (vinst3: i32) {{
+  rp3 = i64.const {REC_AT}
+{full}}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  return varg
+  }}
+}}
+{seg}",
+        h = store_handles(),
+        args_at = REC_AT + 32, // the record's args pointer (`temen_ir::SpawnRec`)
+        seg = rec::segment(REC_AT, &payload_rec()),
+    )
+}
+
+/// #2043 (D1) — threads and §14 children share their domain's one table of 1,024. Once 1,024
+/// threads fill it, an op-17 spawn answers `-EMFILE` and takes nothing: after one thread's join
+/// frees a slot, a budget of exactly one child window still funds the spawn. Every thread is then
+/// joined. The parent returns `refusal * 1000 + the child's 7`.
+#[test]
+fn a_child_spawn_into_a_table_full_of_threads_answers_emfile() {
+    let m = module(&fill_with_threads(
+        "",
+        "  vrefused = call.cap 6 17 (i64) -> (i32) vinst3 (rp3)
+  vt0 = i32.const 1024
+  vs0, vv0 = thread.join vt0
+  vch = call.cap 6 17 (i64) -> (i32) vinst3 (rp3)
+  vcs, vcv = call.cap 6 1 (i32) -> (i64, i64) vinst3 (vch)
+  vone3 = i32.const 1
+  br 4(vrefused, vcv, vone3)
+}
+block 4 (vr4: i32, vc4: i64, vj: i32) {
+  vcap4 = i32.const 1024
+  vend = i32.eq vj vcap4
+  br_if vend 6(vr4, vc4) 5(vr4, vc4, vj)
+}
+block 5 (vr5: i32, vc5: i64, vj5: i32) {
+  vgen1 = i32.const 1024
+  vth = i32.or vgen1 vj5
+  vs5, vv5 = thread.join vth
+  vone5 = i32.const 1
+  vj6 = i32.add vj5 vone5
+  br 4(vr5, vc5, vj6)
+}
+block 6 (vr6: i32, vc6: i64) {
+  vr64 = i64.extend_i32_s vr6
+  vk = i64.const 1000
+  vrk = i64.mul vr64 vk
+  vsum = i64.add vrk vc6
+  return vsum
+  }
+",
+    ));
+    let child = module(CHILD_RETURNS_PAYLOAD);
+    let setup = detached_setup(&child, 1 << 15);
+    agree_on_every_driver(
+        "1,024 threads, then a child",
+        &m,
+        &setup,
+        &ok(temen_ir::errno::EMFILE * 1000 + 7),
+    );
+}
+
+/// And the other way round: a §14 child holds slot 0 and 1,023 threads the rest, so the next
+/// `thread.spawn` traps `ThreadFault`, as one past its node's `spawn` ceiling does (#2001).
+#[test]
+fn a_thread_spawn_into_a_full_table_traps() {
+    let m = module(&fill_with_threads(
+        "  vch = call.cap 6 17 (i64) -> (i32) vinst (rp)\n",
+        "  vr = i64.const 0
+  return vr
+  }
+",
+    ));
+    let child = module(CHILD_RETURNS_PAYLOAD);
+    let setup = detached_setup(&child, 1 << 15);
+    agree_on_every_driver(
+        "a child, then 1,024 threads",
+        &m,
+        &setup,
+        &trapped(Trap::ThreadFault),
+    );
+}
