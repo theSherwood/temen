@@ -8,8 +8,9 @@
 // engine's; (3) a span moves by the copier where the page has multi-memory and by the engine's own word
 // loops where it hasn't (the table's `read`/`write` slots); (4) of the foreign imports, the engine takes
 // only `foreign_mint` and `foreign_release`, which make a memory and give it back; (5) a memory given
-// back comes back zeroed from the next mint, and the page keeps no more of them than its spares hold:
-// none bigger than `SPARE_BYTES`, none past `SPARE_MEMORIES`, and none it did not mint itself. Then the
+// back comes back from the next mint with its window zeroed and its header as it was, and the page
+// keeps no more of them than its spares hold: none whose window is bigger than `SPARE_BYTES`, none
+// past `SPARE_MEMORIES`, and none it did not mint itself. Then the
 // cost gate: per-access timings of words, bytes, atomics and 64-byte spans over Foreign vs the flat
 // `Shared` backing, on the multi-memory page, reported as a ratio.
 import { startServer } from './serve.mjs';
@@ -40,7 +41,7 @@ async function runPage({ noMultiMemory, bench }) {
   await page.goto(`http://127.0.0.1:${port}/web/play.html`);
   const res = await page.evaluate(async (bench) => {
     const par = await import('./par.js');
-    const { registerForeign, foreignImports: importsFor, foreignMemory, SPARE_MEMORIES, SPARE_BYTES } =
+    const { registerForeign, foreignImports: importsFor, foreignMemory, headerOf, SPARE_MEMORIES, SPARE_BYTES } =
       await import('./foreign-mem.js');
     const eng = await par.loadEngine();
     const ex = eng.ex, memory = eng.memory;
@@ -70,24 +71,28 @@ async function runPage({ noMultiMemory, bench }) {
     const wordSpans = table.get(lo) === ex.temen_foreign_read_words
       && table.get(lo + 1) === ex.temen_foreign_write_words;
 
-    // (5) spares, through the imports the engine calls: a child's 64 KiB window, header first.
+    // (5) spares, through the imports the engine calls: a child's 64 KiB window, past a header page that
+    // the descriptor in the engine's memory describes (`WindowHeader` in `src/lib.rs`), sizes in pages.
     const { foreign_mint, foreign_release } = importsFor(memory);
-    const header = ex.temen_detached_header_bytes(), maximum = header + (1 << 30);
-    const mint = (bytes) => foreign_mint(header, bytes, maximum);
+    const PAGE = 65536, desc = Number(ex.temen_alloc(64));
+    new Uint32Array(memory.buffer, desc, 16).set([PAGE, 1, 64, 4096, 4096, 0, 4096, 0]);
+    const maximum = 1 + (1 << 30) / PAGE;
+    const mint = (window) => foreign_mint(desc, 1 + Math.ceil(window / PAGE), maximum);
     const held = (id) => foreignMemory(memory, id);
-    const zeroed = (id) => new Uint8Array(held(id).buffer).every((b) => b === 0);
-    const a = mint(header + 65536);
-    new Uint8Array(held(a).buffer).fill(9, 0, header + 65536);
+    const windowOf = (id) => new Uint8Array(held(id).buffer, headerOf(held(id)).base);
+    const a = mint(PAGE);
+    windowOf(a).fill(9);
     foreign_release(a);
-    const back = mint(header + 65536);
-    const reused = back === a && zeroed(back);
-    const big = mint(SPARE_BYTES + 65536);
+    const back = mint(PAGE);
+    const reused = back === a && headerOf(held(back)).base === PAGE && windowOf(back).every((b) => b === 0);
+    const big = mint(SPARE_BYTES + PAGE);
     foreign_release(big);
     const elsewhere = registerForeign(memory, new WebAssembly.Memory({ initial: 2, maximum: 2, shared: true }));
     foreign_release(elsewhere);
-    const burst = Array.from({ length: SPARE_MEMORIES + 2 }, () => mint(header + 65536));
+    const burst = Array.from({ length: SPARE_MEMORIES + 2 }, () => mint(PAGE));
     burst.forEach(foreign_release);
     foreign_release(back);
+    ex.temen_dealloc(desc, 64);
     const spares = {
       reused,
       bigLetGo: held(big) === undefined,

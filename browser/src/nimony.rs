@@ -91,17 +91,14 @@ pub fn nim_open(
     }
     // No region of the driver tiers up: it spawns and waits, and a tiered-up region cannot park. With
     // `leaf` it runs whole as a leaf instead, where its host suspends a leaf's frames when it parks.
-    // Emitted code addresses its window flat, so the window is a growable buffer of the driver's
-    // declared memory, as the window of each process it execs is (#2102): the engine's own
-    // reservation is flat only where it is an `mmap`, so on wasm the driver ran interpreted (#2608).
-    // Without the buffer it runs there still, interpreted.
+    // Emitted code addresses its window as one span, so the window is a run root's of the driver's
+    // declared memory (`root_window`: a memory of its own on the threads build, #1414 5d), not the
+    // engine's own reservation, which is one span only where it is an `mmap`, so on wasm the driver
+    // ran interpreted (#2608). Without one it runs there still, interpreted.
     let back = leaf
         .as_ref()
         .and(driver.module().memory)
-        .and_then(|mc| {
-            temen_interp::Region::growable(1 << mc.size_log2, temen_interp::host_page_size())
-        })
-        .map(Arc::new);
+        .and_then(|mc| crate::root_window(1 << mc.size_log2));
     let tierup = leaf.map(|leaf| TierUpConfig {
         root: ProgramEmit::default(),
         leaf: Some(leaf),
