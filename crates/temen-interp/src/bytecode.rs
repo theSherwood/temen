@@ -2372,7 +2372,7 @@ fn compile_module_with(
     // §14 **executor children** (the `Instantiator`'s spawn and `join`) run on the scheduler like
     // threads, and they combine with `cont.*` fibers: every driver gives each child domain its own
     // fiber registry (the cooperative `ChildEnv::fibers`, which the parallel driver shares, and the
-    // debugger's `DbgEnv::fibers`), as the oracle does. Fiber / thread / instantiate modules are each
+    // debugger's `ChildEnv::fibers`), as the oracle does. Fiber / thread / instantiate modules are each
     // fine, as are instantiate+thread and instantiate+fiber.
     let s = scan_seams(funcs);
     // `gc.roots` (§GC) is per-vCPU **conservative root enumeration**: on this engine it scans the
@@ -4505,11 +4505,11 @@ fn any_event_parked<'a>(mut fibers: impl Iterator<Item = &'a FiberState>) -> boo
     })
 }
 
-/// Capture a child [`DbgEnv`] into an [`EnvSnapshot`] (#1866): host replay substate, fuel, fibers,
+/// Capture a child [`ChildEnv`] into an [`EnvSnapshot`] (#1866): host replay substate, fuel, fibers,
 /// the env that spawned it, and its own window image and powerbox, or nothing of either once it is
 /// `spent` ([`env_spent`]). Refused when a live one's powerbox holds a binding that is not a plain
 /// value ([`Host::child_powerbox`]), or it has no window.
-fn env_snapshot(e: &DbgEnv, spent: bool) -> Result<EnvSnapshot, Refusal> {
+fn env_snapshot(e: &ChildEnv, spent: bool) -> Result<EnvSnapshot, Refusal> {
     let live = match (&e.mem, spent) {
         (_, true) => None,
         (Some(m), false) => Some(DetachedLive {
@@ -4517,13 +4517,17 @@ fn env_snapshot(e: &DbgEnv, spent: bool) -> Result<EnvSnapshot, Refusal> {
             reserved_log2: m.window.reserved().trailing_zeros() as u8,
             mapped_log2: m.window.mapped().trailing_zeros() as u8,
             shadow: m.shadow,
-            powerbox: e.host.child_powerbox().ok_or(Refusal::ChildPowerbox)?,
+            powerbox: e
+                .host
+                .lock_unpoisoned()
+                .child_powerbox()
+                .ok_or(Refusal::ChildPowerbox)?,
         }),
         (None, false) => return Err(Refusal::NoWindow),
     };
     Ok(EnvSnapshot {
         module: e.program as usize,
-        host: e.host.replay_substate(),
+        host: e.host.lock_unpoisoned().replay_substate(),
         fuel: e.fuel.can_burn(),
         fibers: e.fibers.fibers.clone(),
         spawner: e.spawner,
@@ -4531,24 +4535,25 @@ fn env_snapshot(e: &DbgEnv, spent: bool) -> Result<EnvSnapshot, Refusal> {
     })
 }
 
-/// #1866 — rebuild a detached child's [`DbgEnv`] under `spawner`, the powerbox of the env that spawned
+/// #1866 — rebuild a detached child's [`ChildEnv`] under `spawner`, the powerbox of the env that spawned
 /// it (already rebuilt: envs come back in spawn order). Its window is built as a spawn builds it, then
 /// its own image laid over it, as a thaw's relaunch does; its powerbox is rebuilt from its
 /// [`ChildPowerbox`](super::ChildPowerbox), its inherited stdio aliased to `spawner`'s. A spent env comes
 /// back empty: nothing runs in it again.
-fn rebuild_detached_env(es: &EnvSnapshot, spawner: &mut Host, source: &ModuleSource) -> DbgEnv {
+fn rebuild_detached_env(es: &EnvSnapshot, spawner: &mut Host, source: &ModuleSource) -> ChildEnv {
     let progs_len = source.get(es.module).map_or(0, |u| u.progs.len());
     let Some(live) = &es.live else {
         let host = Host::new();
         let table = build_table_for(progs_len, host.jit_table_log2(), es.module as u32);
-        return DbgEnv {
+        return ChildEnv {
             mem: None,
-            host,
-            table,
+            host: host.into_cell(),
+            table: std::sync::Arc::new(table),
             program: es.module as u32,
             fuel: Fuel::fixed(es.fuel),
             fibers: FiberTables::default(),
             spawner: es.spawner,
+            nested: true,
         };
     };
     let mut mem = Mem::from_spec(WindowSpec {
@@ -4562,14 +4567,15 @@ fn rebuild_detached_env(es: &EnvSnapshot, spawner: &mut Host, source: &ModuleSou
     let mut host = spawner.rebuild_child_powerbox(&live.powerbox);
     host.restore_replay_substate(&es.host);
     let table_log2 = host.jit_table_log2();
-    DbgEnv {
+    ChildEnv {
         mem: Some(mem),
-        table: build_table_for(progs_len, table_log2, es.module as u32),
+        table: std::sync::Arc::new(build_table_for(progs_len, table_log2, es.module as u32)),
         program: es.module as u32,
         fuel: Fuel::fixed(es.fuel),
         fibers: FiberTables::restored(es.fibers.clone(), &host),
-        host,
+        host: host.into_cell(),
         spawner: es.spawner,
+        nested: true,
     }
 }
 
@@ -4903,7 +4909,7 @@ fn journal_op(
 fn journal_state(
     journal: &mut super::journal::Journal,
     tasks: &[TaskSlot],
-    extra_envs: &[DbgEnv],
+    extra_envs: &[ChildEnv],
     fibers: &[FiberState],
     source: &ModuleSource,
     host: &Host,
@@ -4924,7 +4930,9 @@ fn journal_state(
         return;
     }
     let invertible = host.journal_invertible()
-        && extra_envs.iter().all(|e| e.host.region_count() == 0)
+        && extra_envs
+            .iter()
+            .all(|e| e.host.lock_unpoisoned().region_count() == 0)
         && tasks.iter().all(|t| t.vm.vt.active_invoke.is_none())
         && !any_event_parked(fibers.iter())
         && !pool_parked(tasks, extra_envs, host);
@@ -5247,7 +5255,7 @@ fn write_task_window(
     journal: &mut super::journal::Journal,
     turn: u64,
     mem: &mut Option<Mem>,
-    envs: &mut [DbgEnv],
+    envs: &mut [ChildEnv],
     env: Option<usize>,
     addr: u64,
     bytes: &[u8],
@@ -5272,7 +5280,7 @@ fn apply_target(
     width: usize,
     vm_regs: &mut [Reg],
     mem: &mut Option<Mem>,
-    envs: &mut [DbgEnv],
+    envs: &mut [ChildEnv],
     env: Option<usize>,
     journal: &mut super::journal::Journal,
     turn: u64,
@@ -5315,7 +5323,7 @@ fn apply_due_writes(
     tasks: &mut [TaskSlot],
     source: &ModuleSource,
     mem: &mut Option<Mem>,
-    envs: &mut [DbgEnv],
+    envs: &mut [ChildEnv],
     journal: &mut super::journal::Journal,
 ) {
     while *cursor < writes.len() && writes[*cursor].0 < turn {
@@ -5624,7 +5632,7 @@ pub enum SchedBreak {
 fn dbg_refund_ended_windows(
     tasks: &mut [TaskSlot],
     host: &mut Host,
-    envs: &mut [DbgEnv],
+    envs: &mut [ChildEnv],
     run_ended: bool,
 ) {
     for t in tasks.iter_mut() {
@@ -5632,10 +5640,10 @@ fn dbg_refund_ended_windows(
             if let Some((env, lease)) = t.lease.take() {
                 match env {
                     None => host.release_detached(lease),
-                    Some(k) => envs[k].host.release_detached(lease),
+                    Some(k) => envs[k].host.lock_unpoisoned().release_detached(lease),
                 }
                 if let Some(k) = t.env {
-                    envs[k].host.release_memory();
+                    envs[k].host.lock_unpoisoned().release_memory();
                 }
             }
         }
@@ -5652,27 +5660,10 @@ fn dbg_refund_ended_windows(
     }
 }
 
-struct DbgEnv {
-    mem: Option<Mem>,
-    host: Host,
-    table: SharedSlots,
-    /// The unit of the run's source the domain runs (the root's is module 0, a child's the unit of the
-    /// module it was granted): a checkpoint rebuilds the env's table over it.
-    program: u32,
-    /// A fixed allowance (#1944 slice 3): a checkpoint captures it whole, and a seek replays it.
-    fuel: Fuel,
-    /// The child domain's own §12 fiber registry: each domain numbers its fibers from 0 and cannot
-    /// reach another's, as on the oracle (the root's is [`ScheduledDebugRun::fibers`]).
-    fibers: FiberTables,
-    /// The env whose powerbox spawned this one (`None`: the root's): whose stdio its inherited
-    /// streams alias on a rebuild (#1866), and whose `kill` ends it with its subtree ([`kill_env`]).
-    spawner: Option<usize>,
-}
-
 /// #1866 — whether nothing runs in env `k` again and nothing still leans on it: every task in it has
 /// finished, no live task's window lease is owed to its powerbox, and no live child env was spawned
 /// from it. A checkpoint carries such an env as spent rather than copying its window and powerbox.
-fn env_spent(tasks: &[TaskSlot], envs: &[DbgEnv], k: usize) -> bool {
+fn env_spent(tasks: &[TaskSlot], envs: &[ChildEnv], k: usize) -> bool {
     let live = |t: &&TaskSlot| !matches!(t.state, TaskState::Done(_));
     !tasks
         .iter()
@@ -5750,13 +5741,13 @@ impl ScheduledContinuation {
     }
 }
 
-/// A §14 child environment ([`DbgEnv`]) inside a [`Moment`] (#1866): its own window and powerbox
+/// A §14 child environment ([`ChildEnv`]) inside a [`Moment`] (#1866): its own window and powerbox
 /// ([`DetachedLive`]) unless it is spent, its host replay substate, a natural dispatch table over the
 /// child's [`module`] (whose pushed unit rides in `extra_units`) and its fixed `fuel`. A §13
 /// region-aliased child stays outside the checkpointable subset.
 #[derive(Clone)]
 struct EnvSnapshot {
-    /// The unit the child's domain runs ([`DbgEnv::program`]): the granted module's, whose pushed unit
+    /// The unit the child's domain runs ([`ChildEnv::program`]): the granted module's, whose pushed unit
     /// is captured in the run snapshot's `extra_units`. Its natural dispatch table is rebuilt over this
     /// index.
     module: usize,
@@ -5764,7 +5755,7 @@ struct EnvSnapshot {
     fuel: u64,
     /// The child's fiber registry (its `Vm`s' bytes ride in its window image).
     fibers: Vec<FiberState>,
-    /// The env that spawned it ([`DbgEnv::spawner`]).
+    /// The env that spawned it ([`ChildEnv::spawner`]).
     spawner: Option<usize>,
     /// Its own window and powerbox, unless it is spent ([`env_spent`]).
     live: Option<DetachedLive>,
@@ -5794,7 +5785,7 @@ struct DetachedLive {
 /// to the earliest wait deadline, exactly as the production `drive`), and **§12 fibers** switch each
 /// vCPU's active continuation (breakpoints fire inside a resumed fiber; the fiber registry is run-shared
 /// so a fiber migrates across vCPUs — D57), and **§14 `instantiate` / `instantiate_module`** spawn a
-/// confined executor child as its own scheduled vCPU (its own [`DbgEnv`] — window / powerbox / quota —
+/// confined executor child as its own scheduled vCPU (its own [`ChildEnv`] — window / powerbox / quota —
 /// joinable through the shared thread machinery; a separate-module child runs its own pushed module,
 /// and nesting composes to any depth), and **§14 coroutines** are stepped op-by-op (step-into) with the
 /// coroutine's vCPU **pinned** across the body so a `resume` stays atomic w.r.t. other vCPUs. The only
@@ -5808,9 +5799,9 @@ pub struct ScheduledDebugRun {
     /// §14 `instantiate` confined children's environments (handle = index; a task's [`TaskSlot::env`] is
     /// `Some(k)` into this). Grown as children spawn; rebuilt deterministically on a reverse-`seek`
     /// replay. Not torn down mid-run (a finished child's env is inert — revocation semantics deferred).
-    extra_envs: Vec<DbgEnv>,
+    extra_envs: Vec<ChildEnv>,
     /// The root domain's §12 fiber registry (one handle namespace across its vCPUs; a fiber created on
-    /// one can be resumed on another — D57). Each §14 child has its own ([`DbgEnv::fibers`]). Rebuilt
+    /// one can be resumed on another — D57). Each §14 child has its own ([`ChildEnv::fibers`]). Rebuilt
     /// deterministically on a reverse `seek` replay.
     fibers: FiberTables,
     /// Module 0's frame metadata, the same as its unit's ([`Compiled::debug`]), for the per-op
@@ -6151,13 +6142,13 @@ fn dbg_spawn(
 }
 
 /// The per-op driver for a scheduled debug task, selecting its runtime context: the shared domain
-/// (`env = None`) or its confined [`DbgEnv`] (`env = Some(k)`). Centralizes the split borrow so the
+/// (`env = None`) or its confined [`ChildEnv`] (`env = Some(k)`). Centralizes the split borrow so the
 /// unified `drive`/`tick` pumps stay a single call. Mirrors the production `drive`'s `RunCtx` selection.
 #[allow(clippy::too_many_arguments)]
 fn dbg_advance_task(
     tasks: &mut [TaskSlot],
     ti: usize,
-    extra_envs: &mut [DbgEnv],
+    extra_envs: &mut [ChildEnv],
     fibers: &mut FiberTables,
     source: &ModuleSource,
     table: &SharedSlots,
@@ -6176,7 +6167,7 @@ fn dbg_advance_task(
                 &e.table,
                 &mut e.fuel,
                 &mut e.mem,
-                &mut e.host,
+                &mut e.host.lock_unpoisoned(),
             )
         }
     }
@@ -6203,7 +6194,7 @@ enum Serviced {
 fn service_advance(
     tasks: &mut Vec<TaskSlot>,
     ti: usize,
-    extra_envs: &mut Vec<DbgEnv>,
+    extra_envs: &mut Vec<ChildEnv>,
     fibers: &mut FiberTables,
     source: &ModuleSource,
     table: &SharedSlots,
@@ -6246,9 +6237,13 @@ fn service_advance(
                 module,
             } => {
                 *turn += 1;
+                let mut child_host;
                 let host = match tasks[ti].env {
                     None => &mut *host,
-                    Some(k) => &mut extra_envs[k].host,
+                    Some(k) => {
+                        child_host = extra_envs[k].host.lock_unpoisoned();
+                        &mut *child_host
+                    }
                 };
                 if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, module, source, host) {
                     complete(tasks, ti, Err(t));
@@ -6287,7 +6282,7 @@ fn service_advance(
                 dst,
             } => {
                 *turn += 1;
-                // The task's domain: the root's registry and window, or its `DbgEnv`'s. No blocking
+                // The task's domain: the root's registry and window, or its `ChildEnv`'s. No blocking
                 // resume idles here (this engine claims with `may_block` off), so a fiber's park
                 // hands its resumer `FIBER_PARKED`.
                 let (fibers, mem) = match tasks[ti].env {
@@ -6329,7 +6324,7 @@ fn service_advance(
             }
             // §5 detached spawn (op 17): a fresh window of its own as a debug task — the
             // cooperative executor's spawn on this path, so a spawning guest stays steppable through
-            // its child (a `DbgEnv` over the child's own `Mem`, joined like a confined child's).
+            // its child (a `ChildEnv` over the child's own `Mem`, joined like a confined child's).
             Outcome::InstantiateDetached { spawn, dst } => {
                 *turn += 1;
                 if let Err(t) =
@@ -6433,7 +6428,7 @@ fn service_advance(
     Serviced::Ran
 }
 
-/// Schedule an admitted §14/§5 child as a debug task over its own [`DbgEnv`], registered as a child
+/// Schedule an admitted §14/§5 child as a debug task over its own [`ChildEnv`], registered as a child
 /// handle of `ti` (so `Instantiator.join` → `ThreadJoin` joins it), and land the handle in `dst`.
 /// `Err(ThreadFault)` on the vCPU-count bomb (the caller completes `ti`). A child refused here hands
 /// its window lease back to its spawner's powerbox, the root's `host` or an env's, so a spawn refused
@@ -6442,7 +6437,7 @@ fn service_advance(
 fn dbg_start_child(
     tasks: &mut Vec<TaskSlot>,
     ti: usize,
-    extra_envs: &mut Vec<DbgEnv>,
+    extra_envs: &mut Vec<ChildEnv>,
     host: &mut Host,
     child: AdmittedChild,
     dst: u32,
@@ -6459,13 +6454,13 @@ fn dbg_start_child(
         lease,
     } = child.build(room, |lease| match spawner {
         None => host.release_detached(lease),
-        Some(k) => extra_envs[k].host.release_detached(lease),
+        Some(k) => extra_envs[k].host.lock_unpoisoned().release_detached(lease),
     })?;
     let eidx = extra_envs.len();
-    extra_envs.push(DbgEnv {
+    extra_envs.push(ChildEnv {
         mem,
-        host: child_host,
-        table,
+        host: child_host.into_cell(),
+        table: std::sync::Arc::new(table),
         program: module,
         // The debugger runs every task on a fixed allowance: a detached child gets what its chain
         // lets it burn at the spawn, where an executor's child draws from the chain as it goes
@@ -6473,6 +6468,7 @@ fn dbg_start_child(
         fuel: Fuel::fixed(fuel.can_burn()),
         fibers: FiberTables::default(),
         spawner,
+        nested: true,
     });
     let cidx = tasks.len();
     tasks.push(TaskSlot {
@@ -6492,7 +6488,7 @@ fn dbg_start_child(
 fn dbg_instantiate_detached(
     tasks: &mut Vec<TaskSlot>,
     ti: usize,
-    extra_envs: &mut Vec<DbgEnv>,
+    extra_envs: &mut Vec<ChildEnv>,
     source: &ModuleSource,
     shared_mem: &Option<Mem>,
     host: &mut Host,
@@ -6500,14 +6496,19 @@ fn dbg_instantiate_detached(
     dst: u32,
 ) -> Result<(), Trap> {
     // The parent's window and the powerbox its handles resolve in: its own (#1727).
-    let (pm, owner) = match tasks[ti].env {
-        None => (shared_mem.as_ref(), &mut *host),
-        Some(k) => {
-            let e = &mut extra_envs[k];
-            (e.mem.as_ref(), &mut e.host)
-        }
+    let admitted = {
+        let mut child_host;
+        let (pm, owner) = match tasks[ti].env {
+            None => (shared_mem.as_ref(), &mut *host),
+            Some(k) => {
+                let e = &extra_envs[k];
+                child_host = e.host.lock_unpoisoned();
+                (e.mem.as_ref(), &mut *child_host)
+            }
+        };
+        admit_detached_in_process(owner, pm, spawn, source, |_| None)?
     };
-    let Some((child, _)) = admit_detached_in_process(owner, pm, spawn, source, |_| None)? else {
+    let Some((child, _)) = admitted else {
         tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
     };
@@ -6521,21 +6522,28 @@ fn dbg_instantiate_detached(
 fn dbg_grant(
     tasks: &[TaskSlot],
     ti: usize,
-    envs: &mut [DbgEnv],
+    envs: &mut [ChildEnv],
     host: &mut Host,
     child: i32,
     handle: i32,
 ) -> Result<i64, Trap> {
     match (tasks[ti].env, grant_target(tasks, ti, child)) {
-        (None, k) => host.grant_running_child(None, handle, k.map(|k| &mut envs[k].host)),
-        (Some(p), Some(k)) => match envs.get_disjoint_mut([p, k]) {
-            Ok([pe, ke]) => pe
+        (None, k) => {
+            let mut kh = k.map(|k| envs[k].host.lock_unpoisoned());
+            host.grant_running_child(None, handle, kh.as_deref_mut())
+        }
+        // `grant_target` names an env other than the spawner's own.
+        (Some(p), Some(k)) if p != k => {
+            let mut kh = envs[k].host.lock_unpoisoned();
+            envs[p]
                 .host
-                .grant_running_child(None, handle, Some(&mut ke.host)),
-            // Unreachable: `grant_target` names an env other than the spawner's own.
-            Err(_) => envs[p].host.grant_running_child(None, handle, None),
-        },
-        (Some(p), None) => envs[p].host.grant_running_child(None, handle, None),
+                .lock_unpoisoned()
+                .grant_running_child(None, handle, Some(&mut kh))
+        }
+        (Some(p), _) => envs[p]
+            .host
+            .lock_unpoisoned()
+            .grant_running_child(None, handle, None),
     }
 }
 
@@ -6622,7 +6630,7 @@ fn step_active_invoke(
 /// The window a task steps against: its §14 env's, or the root's for `env == None`.
 fn dbg_env_mem<'a>(
     mem: &'a Option<Mem>,
-    envs: &'a [DbgEnv],
+    envs: &'a [ChildEnv],
     env: Option<usize>,
 ) -> Option<&'a Mem> {
     match env {
@@ -6777,7 +6785,7 @@ fn dbg_preview_pick(
 fn dbg_pick_runnable(
     tasks: &mut [TaskSlot],
     fibers: &mut FiberTables,
-    envs: &mut [DbgEnv],
+    envs: &mut [ChildEnv],
     host: &mut Host,
     takes: &mut Takes,
     replay: bool,
@@ -6819,7 +6827,7 @@ fn dbg_pick_runnable(
 /// Every domain's fiber registry: the root's, then each §14 child's.
 fn registries<'a>(
     fibers: &'a mut FiberTables,
-    envs: &'a mut [DbgEnv],
+    envs: &'a mut [ChildEnv],
 ) -> Vec<&'a mut Vec<FiberState>> {
     std::iter::once(&mut fibers.fibers)
         .chain(envs.iter_mut().map(|e| &mut e.fibers.fibers))
@@ -6906,7 +6914,7 @@ fn dbg_parked(tasks: &[TaskSlot]) -> Vec<Parked> {
 #[allow(clippy::too_many_arguments)]
 fn dbg_take_answer(
     tasks: &mut [TaskSlot],
-    extra_envs: &mut [DbgEnv],
+    extra_envs: &mut [ChildEnv],
     host: &mut Host,
     takes: &mut Takes,
     replay: bool,
@@ -6924,9 +6932,13 @@ fn dbg_take_answer(
     }
     loop {
         for &(p, env, dst, id, _) in &parked {
+            let mut child_host;
             let h = match env {
                 None => &mut *host,
-                Some(k) => &mut extra_envs[k].host,
+                Some(k) => {
+                    child_host = extra_envs[k].host.lock_unpoisoned();
+                    &mut *child_host
+                }
             };
             if let Some(r) = take_answer(h, id) {
                 tasks[p].deliver(dst, Reg::from_i64(r));
@@ -6962,7 +6974,7 @@ fn dbg_take_answer(
 /// wherever the run did.
 fn dbg_await_answer(
     tasks: &[TaskSlot],
-    extra_envs: &[DbgEnv],
+    extra_envs: &[ChildEnv],
     host: &Host,
     takes: &Takes,
     replay: bool,
@@ -6993,7 +7005,7 @@ fn dbg_await_answer(
 /// Whether a thread is parked on a punted call the offload pool answers (#2047): its answer comes
 /// from outside the run, which a restore cannot reach, so it keeps a checkpoint and a journal state
 /// record out, as a fiber's cap park does. A host-completed park is the replay's to serve.
-fn pool_parked(tasks: &[TaskSlot], extra_envs: &[DbgEnv], host: &Host) -> bool {
+fn pool_parked(tasks: &[TaskSlot], extra_envs: &[ChildEnv], host: &Host) -> bool {
     tasks.iter().any(|t| match t.state {
         TaskState::BlockedHostCap { id, .. } => {
             !dbg_completions(t.env, extra_envs, host).is_host_owned(id)
@@ -7005,12 +7017,12 @@ fn pool_parked(tasks: &[TaskSlot], extra_envs: &[DbgEnv], host: &Host) -> bool {
 /// The completion store of a debug task's domain: the root's, or its child env's.
 fn dbg_completions(
     env: Option<usize>,
-    extra_envs: &[DbgEnv],
+    extra_envs: &[ChildEnv],
     host: &Host,
 ) -> std::sync::Arc<super::Completions> {
     match env {
         None => host.completions(),
-        Some(k) => extra_envs[k].host.completions(),
+        Some(k) => extra_envs[k].host.lock_unpoisoned().completions(),
     }
 }
 
@@ -8085,7 +8097,7 @@ impl ScheduledDebugRun {
     /// multi-vCPU time-travel **checkpoint** (W1) snapshots, over every task:
     /// **§12 fibers** are admitted (the run-shared registry + each task's active fiber / resume chain,
     /// all sharing the run's window) except an event-parked (`memory.wait`) fiber (non-deterministic
-    /// wall-clock deadline); **§14 children** are admitted, each [`DbgEnv`] carrying its own window
+    /// wall-clock deadline); **§14 children** are admitted, each [`ChildEnv`] carrying its own window
     /// image and powerbox ([`DetachedLive`]) and rebuilt under its spawner's on restore
     /// ([`rebuild_detached_env`]), or nothing of either once spent (#1866). The root's §13 regions
     /// ride the moment ([`Moment::checkpoint`](super::moment::Moment::checkpoint), #2026), its
@@ -8113,7 +8125,7 @@ impl ScheduledDebugRun {
             if env_spent(&self.tasks, &self.extra_envs, k) {
                 continue;
             }
-            child_host_admits(&e.host)?;
+            child_host_admits(&e.host.lock_unpoisoned())?;
             match &e.mem {
                 None => return Err(Refusal::NoWindow),
                 Some(m) if !m.layout_snapshot_safe() => return Err(Refusal::Region),
@@ -8223,13 +8235,19 @@ impl ScheduledDebugRun {
         self.line_bps.unbind();
         // Rebuild each task's full `VTask` and each §14 child env, each table over the child's own
         // module. A child's env is rebuilt under its spawner's, which comes back first (#1866).
-        let mut envs: Vec<DbgEnv> = Vec::with_capacity(c.extra_envs.len());
+        let mut envs: Vec<ChildEnv> = Vec::with_capacity(c.extra_envs.len());
         for es in &c.extra_envs {
-            let spawner = match es.spawner {
-                None => &mut self.host,
-                Some(k) => &mut envs[k].host,
+            let env = {
+                let mut spawner_host;
+                let spawner = match es.spawner {
+                    None => &mut self.host,
+                    Some(k) => {
+                        spawner_host = envs[k].host.lock_unpoisoned();
+                        &mut *spawner_host
+                    }
+                };
+                rebuild_detached_env(es, spawner, &self.source)
             };
-            let env = rebuild_detached_env(es, spawner, &self.source);
             envs.push(env);
         }
         self.extra_envs = envs;
@@ -8276,7 +8294,9 @@ impl ScheduledDebugRun {
                 live: match (ts.live, ts.env) {
                     (false, _) => LiveVcpu::none(),
                     (true, None) => LiveVcpu::force(self.host.own_node()),
-                    (true, Some(k)) => LiveVcpu::force(self.extra_envs[k].host.own_node()),
+                    (true, Some(k)) => {
+                        LiveVcpu::force(self.extra_envs[k].host.lock_unpoisoned().own_node())
+                    }
                 },
             })
             .collect();
@@ -11538,11 +11558,13 @@ fn resolve_fiber_entry(
     }
 }
 
-/// A child domain's runtime (a §14 child, a fork twin or an exec image), owned by [`drive`] alongside
-/// the task set. Its `mem` is the domain's own window, its `host` its powerbox, its `table` a fresh
-/// **natural** dispatch table over its unit (no access to installed §22 units — like the
-/// tree-walker's fresh `DomainTable`), and `fuel` its own (#1944 slice 3: a §14 child's is drawn
-/// from its budget node).
+/// A child domain's runtime (a §14 child, a fork twin or an exec image), owned by its run alongside
+/// the task set: the executors' ([`drive`], [`drive_threads`]) and the debugger's
+/// ([`ScheduledDebugRun`]). Its `mem` is the domain's own window, its `host` its powerbox, its
+/// `table` a fresh **natural** dispatch table over its unit (no access to installed §22 units — like
+/// the tree-walker's fresh `DomainTable`), and `fuel` its own (#1944 slice 3: an executor's §14
+/// child draws from its budget node; the debugger gives each a fixed allowance, which a checkpoint
+/// captures whole and a seek replays).
 struct ChildEnv {
     mem: Option<Mem>,
     /// The child's live powerbox, in its cell ([`DomainCell`]): a §3.6 live-callee offer holds the
@@ -11555,16 +11577,18 @@ struct ChildEnv {
     fuel: Fuel,
     /// The child domain's own §12 fiber registry (with its durable halves): each domain numbers its
     /// fibers from 0 and cannot reach another's, as on the tree-walk oracle. The root domain's is
-    /// [`SchedCore::fibers`].
+    /// [`SchedCore::fibers`] (the debugger's, [`ScheduledDebugRun::fibers`]).
     fibers: FiberTables,
     /// #2074 — for a §14 child, the env whose task spawned it (`None`: the root domain); `None` for
-    /// a fork twin or an exec image, which are not §14 children. A kill descends through it.
+    /// a fork twin or an exec image, which are not §14 children. A kill descends through it
+    /// ([`kill_env`] on the debugger), and a checkpoint's rebuild aliases its inherited stdio to it
+    /// (#1866).
     spawner: Option<usize>,
     /// A §14 child's domain, not a fork twin's or an exec image's: its end releases the services
     /// it was a client of (#1217), as the oracle's does for a detached child's.
     nested: bool,
     /// The unit of the run's [`ModuleSource`] this env's domain runs, which a fork twin of it runs
-    /// too. The root domain's is unit 0.
+    /// too, and over which a debugger checkpoint rebuilds its table. The root domain's is unit 0.
     program: u32,
 }
 
@@ -15836,14 +15860,15 @@ mod dbg_domain_end_tests {
             sp: 0,
             charge: child.fiber_charge().expect("room"),
         });
-        let mut envs = vec![DbgEnv {
+        let mut envs = vec![ChildEnv {
             mem: None,
-            host: child,
-            table: build_table_for(1, 0, 0),
+            host: child.into_cell(),
+            table: std::sync::Arc::new(build_table_for(1, 0, 0)),
             program: 0,
             fuel: Fuel::fixed(0),
             fibers,
             spawner: None,
+            nested: true,
         }];
         let held = |h: &Host| h.capture_durable_budgets()[0].used.mem;
         let done = || TaskState::Done(Ok(Vec::new()));
