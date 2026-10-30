@@ -201,7 +201,22 @@ fn host(a: &temen_ir::Module, b: &temen_ir::Module, lane_cap: i64) -> (Host, [i3
 }
 
 fn run_jit(p: &temen_ir::Module, a: &temen_ir::Module, b: &temen_ir::Module, cap: i64) -> i64 {
+    run_jit_on(p, a, b, cap, None)
+}
+
+/// [`run_jit`] with the host's driver holding `workers`, and so the run's child pool (#1991); the
+/// host's default when `None`.
+fn run_jit_on(
+    p: &temen_ir::Module,
+    a: &temen_ir::Module,
+    b: &temen_ir::Module,
+    cap: i64,
+    workers: Option<usize>,
+) -> i64 {
     let (mut host, h) = host(a, b, cap);
+    if let Some(n) = workers {
+        host.set_workers(n);
+    }
     let args: Vec<i64> = h.iter().map(|&x| x as i64).collect();
     let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
         p,
@@ -494,23 +509,75 @@ fn tail_go() -> String {
     )
 }
 
-/// **#1991 — a task's deadline fires while its sibling spins.** Only a free worker fires a parked
-/// task's deadline, so a worker that takes a task and leaves none free adds one, up to the pool's
-/// ceiling. A sleeps through 20 timed waits of 1 ms, then sets `DONE`; B, its sibling, spins
-/// without ever parking until it sees `DONE`, for at most 4·10⁹ turns (seconds on the JIT). Both
-/// wait for `GO` first, and the root spawns B only once A is ready, so A has parked and left the
-/// pool's one worker free when B is filed. When the pool grew only at a spawn that found no worker
-/// free, B took that one worker and A's deadlines waited for B to give it back, after B's last turn
-/// with `DONE` still unset: `1000`. With a worker kept free, A's waits end on time while B spins,
-/// and B sees `DONE`: `1001`, the oracle's answer, whose quantum round-robin gives every child its
-/// own progress.
+/// **#1991 — a task's deadline fires while its sibling spins, on one worker.** A sleeps through 20
+/// timed waits of 1 ms, then sets `DONE`; B, its sibling, spins without ever parking until it sees
+/// `DONE`, for at most 4·10⁹ turns (seconds on the JIT). Both wait for `GO` first, and the root spawns
+/// B only once A is ready. The pool holds one worker. Without preemption B took it and A's deadlines
+/// waited for B to give it back, after B's last turn with `DONE` still unset: `1000`. Preempted at
+/// the end of each quantum, where the pool also fires the deadlines that have passed, B gives the
+/// worker to A each time a wait of A's ends, and sees `DONE`: `1001`, the oracle's answer, whose
+/// quantum round-robin gives every child its own progress.
 #[test]
 fn a_tasks_deadline_fires_while_its_sibling_spins() {
     let p = module(&parent(&root_waits(READY_A, "a"), &tail_go()));
     let a = module(&sleep_then_done(20));
     let b = module(&spin_until_done(4_000_000_000));
     assert_eq!(run_interp(&p, &a, &b, -1), 1001, "the oracle");
-    assert_eq!(run_jit(&p, &a, &b, -1), 1001);
+    assert_eq!(run_jit_on(&p, &a, &b, -1, Some(1)), 1001);
+}
+
+/// #1991: stores 1 to `mine`, then spins, never parking, until `other` is set, for at most `limit`
+/// turns. Returns 1 if it saw `other`, 0 if it gave up.
+fn spin_on(mine: u64, other: u64, limit: i64) -> String {
+    format!(
+        r#"memory 17
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vmine = i64.const {mine}
+  vone = i32.const 1
+  i32.atomic.store vmine vone
+  vi = i64.const 0
+  br 1(vi)
+}}
+block 1 (vi1: i64) {{
+  voth = i64.const {other}
+  vd = i32.atomic.load voth
+  vz1 = i32.const 0
+  vseen = i32.ne vd vz1
+  br_if vseen 3() 2(vi1)
+}}
+block 2 (vi2: i64) {{
+  vlim = i64.const {limit}
+  vone2 = i64.const 1
+  vi3 = i64.add vi2 vone2
+  vlt = i64.lt_u vi3 vlim
+  br_if vlt 1(vi3) 4()
+}}
+block 3 () {{
+  vr = i64.const 1
+  return vr
+}}
+block 4 () {{
+  vr0 = i64.const 0
+  return vr0
+  }}
+}}
+"#
+    )
+}
+
+/// **#1991 — two tasks that spin on each other both finish on one worker** (the interpreter's #2202,
+/// as tasks). Each sets its own word, then spins, never parking, until it sees the other's, for at
+/// most 4·10⁹ turns. Without preemption the first held the pool's one worker for all of its turns and
+/// gave up before the second ever ran: `1` or `1000`. Preempted at its quantum's end, each sees the
+/// other's word: `1001`, as on the interpreter.
+#[test]
+fn two_tasks_that_spin_on_each_other_finish_on_one_worker() {
+    let p = module(&parent("", TAIL_SUM));
+    let a = module(&spin_on(READY_A, READY_B, 4_000_000_000));
+    let b = module(&spin_on(READY_B, READY_A, 4_000_000_000));
+    assert_eq!(run_interp(&p, &a, &b, -1), 1001, "the oracle");
+    assert_eq!(run_jit_on(&p, &a, &b, -1, Some(1)), 1001);
 }
 
 /// **Teardown unwinds a task parked forever.** The parent spawns a child that waits on a word no
