@@ -940,7 +940,7 @@ fn spawn_output_guest(form: Form, threaded: bool) -> String {
     ]
     .concat();
     let run_body = if threaded {
-        "vt = thread.spawn 1 vz vz\n  vr = thread.join vt"
+        "vt = thread.spawn 1 vz vz\n  vr_st, vr = thread.join vt"
     } else {
         "vr = call 1 (vz, vz)"
     };

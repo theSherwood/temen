@@ -490,7 +490,7 @@ block 0 (v0: i32) {
   v4 = thread.spawn 1 v2 v3
   v5 = i32.const 0
   v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
-  v7 = thread.join v4
+  v7_st, v7 = thread.join v4
   v8 = i64.add v6 v7
   return v8
   }
@@ -561,6 +561,11 @@ fn multivcpu_freeze_serialize_restore_thaw_through_the_codec() {
     );
     assert!(frozen.is_ok(), "freeze returns a placeholder: {frozen:?}");
     assert_eq!(fhost.frozen_vcpus().len(), 1, "one spawned vCPU flattened");
+    assert_eq!(
+        fhost.child_generations(),
+        &[1],
+        "its slot's counter (#2043)"
+    );
 
     // Serialize the real artifact (carrying the control section's vCPU residue + root extent).
     let artifact = freeze(&inst, &snapshot, &fhost).expect("freeze");
@@ -574,6 +579,11 @@ fn multivcpu_freeze_serialize_restore_thaw_through_the_codec() {
         thost.frozen_vcpus().len(),
         1,
         "restore re-seeded the spawned vCPU residue"
+    );
+    assert_eq!(
+        thost.child_generations(),
+        &[1],
+        "and the child table it names its slot in"
     );
 
     // §12.6 invariant 1 — canonical: re-serializing the freshly-restored domain reproduces the
@@ -611,6 +621,75 @@ fn multivcpu_freeze_serialize_restore_thaw_through_the_codec() {
     );
 }
 
+/// #2043 — the restore refuses child records the artifact's child table does not name, as it refuses
+/// any non-canonical artifact: a joinable record at a slot the table never issued, two records at one
+/// slot, and an unjoinable record anywhere but slot 0. Each case tampers with the residue of a real
+/// freeze of [`SRC_MULTIVCPU`] before it is serialized.
+#[test]
+fn restore_refuses_child_records_the_child_table_does_not_name() {
+    let mut m = temen_text::parse_module(SRC_MULTIVCPU).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
+    });
+    let inst = temen_durable::transform_module_assume_confined(&m).expect("transform");
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    let clk = fhost.grant_clock();
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
+    let mut fuel = 100_000u64;
+    let (frozen, snapshot) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut fhost,
+    );
+    assert!(frozen.is_ok(), "freeze returns a placeholder: {frozen:?}");
+    let vcpu = fhost.frozen_vcpus()[0].clone();
+    assert_eq!((vcpu.slot, vcpu.joinable), (0, true), "the child at slot 0");
+
+    let refused = |what: &str, host: &Host| {
+        let artifact = freeze(&inst, &snapshot, host).expect("freeze");
+        let r = restore(&artifact, &inst, &mut Host::new());
+        assert!(
+            matches!(r, Err(RestoreError::Malformed)),
+            "{what}: {:?}",
+            r.err()
+        );
+    };
+    let unnamed = {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.grant_clock();
+        h.set_frozen_vcpus(vec![vcpu.clone()]);
+        h.set_frozen_root_sp(fhost.frozen_root_sp().expect("root extent"));
+        h
+    };
+    refused("a slot the table never issued", &unnamed);
+
+    let mut twice = unnamed;
+    twice.set_child_generations(vec![1]);
+    let second = temen_interp::FrozenVCpu {
+        task: vcpu.task + 1,
+        ..vcpu.clone()
+    };
+    twice.set_frozen_vcpus(vec![vcpu.clone(), second]);
+    refused("two records at one slot", &twice);
+
+    twice.set_child_generations(vec![1, 1]);
+    let stray = temen_interp::FrozenVCpu {
+        slot: 1,
+        joinable: false,
+        ..vcpu.clone()
+    };
+    twice.set_frozen_vcpus(vec![stray]);
+    refused("an unjoinable record at slot 1", &twice);
+}
+
 // Slice 3.2.2 — vCPU + fiber coexistence through the codec. The root spawns a child vCPU and owns a
 // fiber (which parks); the artifact's control section must carry BOTH the fiber residue and the
 // spawned-vCPU residue (+ root extent), and the thaw must reconstruct both into non-colliding regions.
@@ -627,7 +706,7 @@ block 0 (v0: i32) {
   v7 = cont.new v5 v6
   v8 = i64.const 0
   v9, v10 = cont.resume v7 v8
-  v13 = thread.join v4
+  v13_st, v13 = thread.join v4
   v14 = i64.add v10 v13
   return v14
   }
@@ -922,7 +1001,7 @@ block 0 (v0: i32) {
   v4 = thread.spawn 1 v2 v3
   v5 = i32.const 0
   v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
-  v7 = thread.join v4
+  v7_st, v7 = thread.join v4
   v8 = i64.add v6 v7
   return v8
   }
@@ -936,7 +1015,7 @@ block 0 (v0: i64, v1: i64) {
   v6 = thread.spawn 2 v4 v5
   v7 = i32.const 0
   v8 = call.cap 2 0 (i32) -> (i64) v3 (v7)
-  v9 = thread.join v6
+  v9_st, v9 = thread.join v6
   v10 = i64.add v8 v9
   return v10
   }
@@ -1726,7 +1805,7 @@ block 0 (v0: i32, vai: i32, vbi: i32, vb: i32) {
   i32.store pt vbi offset=4
   i32.store pt vb offset=8
   vt = thread.spawn 4 vz vz
-  vtr = thread.join vt
+  vtr_st, vtr = thread.join vt
   vx = i64.const 0
   vra = call.cap 268435456 0 (i64) -> (i64) vcapa (vx)
   va_st, va_n = call.cap 6 1 (i32) -> (i64, i64) v0 (va)
@@ -2186,6 +2265,8 @@ fn a_completed_detached_child_rides_the_control_section() {
 
     let mut host = Host::new();
     host.set_durable(true);
+    // #2043 — its child table: slots 0 to 4 issued, slot 1's child joined.
+    host.set_child_generations(vec![1; 5]);
     host.set_frozen_detached(vec![
         FrozenDetached {
             parent_task: 0,

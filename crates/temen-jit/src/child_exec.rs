@@ -111,6 +111,9 @@ pub(crate) struct ChildTask {
     dom: Option<Arc<Domain>>,
     /// #2001 — a detached child's own budget node, handed to [`Self::dom`] for its threads' charges.
     node: Option<Arc<dyn crate::BudgetNode>>,
+    /// #2043 — the child domain's child table, which its nursery and [`Self::dom`] share; its
+    /// counters ride the child's capture.
+    children: crate::os_thread_rt::ChildTable,
     /// #1469 — the child's root has returned (its outcome is published) while vCPUs it spawned
     /// still run. As on the oracle, a root's return does not end its domain; the task stays filed,
     /// never resumed again, until the last of them ends, and only then frees its window and
@@ -152,6 +155,7 @@ impl ChildTask {
         done: Arc<ChildDone>,
         teardown: Teardown,
         node: Option<Arc<dyn crate::BudgetNode>>,
+        children: crate::os_thread_rt::ChildTable,
     ) -> Result<ChildTask, Teardown> {
         // #2305/#2286 — a window the OS will not give refuses the child as a refused pre-map does:
         // no room for its reservation, or a commit or protection its seeding needs. It never runs,
@@ -242,6 +246,7 @@ impl ChildTask {
             teardown: Some(teardown),
             dom: None,
             node,
+            children,
             retiring: false,
             thaw: crate::DurableResidue::default(),
         })
@@ -364,6 +369,7 @@ impl ChildTask {
                 fibers,
                 vcpus,
                 root_sp: Some(root_sp),
+                children: self.children.generations(),
             },
         })
     }
@@ -519,7 +525,12 @@ impl ChildExec {
         }
         if task._code.spawns || durable {
             if let Some(hub) = self.domain() {
-                let d = Arc::new(Domain::new_child(hub, task.chain.clone(), task.node.take()));
+                let d = Arc::new(Domain::new_child(
+                    hub,
+                    task.chain.clone(),
+                    task.node.take(),
+                    Arc::clone(&task.children),
+                ));
                 d.set_env(
                     task.window.base() as u64,
                     task._code.fn_table.base() as u64,

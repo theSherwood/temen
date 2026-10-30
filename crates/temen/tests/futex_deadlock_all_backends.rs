@@ -221,7 +221,7 @@ block 1 (vi: i64) {
   vz1 = i64.const 0
   vc = thread.spawn 1 vz1 vz1
   vw = thread.spawn 2 vz1 vi
-  vrc = thread.join vc
+  vrc_st, vrc = thread.join vc
   vk = i64.const 16392
   vone = i64.const 1
   vnext = i64.add vi vone
@@ -229,7 +229,7 @@ block 1 (vi: i64) {
   i32.atomic.store vk vn32
   vcnt = i32.const 1
   vwoke = atomic.notify vk vcnt
-  vrw = thread.join vw
+  vrw_st, vrw = thread.join vw
   vrounds = i64.const 300
   vmore = i64.lt_u vnext vrounds
   br_if vmore 1(vnext) 2(vnext)
@@ -302,7 +302,7 @@ block 1 (vt1: i32, vi: i64) {
   br_if vmore 1(vt1, vnext) 2(vt1)
 }
 block 2 (vt2: i32) {
-  vr = thread.join vt2
+  vr_st, vr = thread.join vt2
   return vr
   }
 }

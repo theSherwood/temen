@@ -41,8 +41,8 @@ block 0 () {
   vz = i64.const 0
   vt1 = thread.spawn 2 vsp vz
   vt2 = thread.spawn 2 vsp vz
-  vj1 = thread.join vt1
-  vj2 = thread.join vt2
+  vj1_st, vj1 = thread.join vt1
+  vj2_st, vj2 = thread.join vt2
   vs = i64.add vj1 vj2
   return vs
   }
@@ -206,8 +206,8 @@ block 0 (v0: i64) {
   vz = i64.const 0
   vt1 = thread.spawn 2 vsp vz
   vt2 = thread.spawn 2 vsp vz
-  vj1 = thread.join vt1
-  vj2 = thread.join vt2
+  vj1_st, vj1 = thread.join vt1
+  vj2_st, vj2 = thread.join vt2
   vs = i64.add vj1 vj2
   return vs
   }

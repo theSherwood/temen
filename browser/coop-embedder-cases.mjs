@@ -155,7 +155,7 @@ block 0 () {
   vst = i32.atomic.wait vaddr vexp vto
   vflagat = i64.const 40960
   vflag = i64.load vflagat
-  vr = thread.join vt
+  vr_st, vr = thread.join vt
   vst64 = i64.extend_i32_s vst
   vk = i64.const 10000
   vs = i64.mul vst64 vk
@@ -228,7 +228,7 @@ func () -> (i64) {
 block 0 () {
   vz = i64.const 0
   vt = thread.spawn 1 vz vz
-  vr = thread.join vt
+  vr_st, vr = thread.join vt
   return vr
   }
 }
@@ -365,8 +365,8 @@ block 0 () {
   vz = i64.const 0
   va = thread.spawn 1 vz vz
   vb = thread.spawn 2 vz vz
-  vra = thread.join va
-  vrb = thread.join vb
+  vra_st, vra = thread.join va
+  vrb_st, vrb = thread.join vb
   return vra
   }
 }
@@ -559,7 +559,7 @@ block 1 (vt1: i32) {
   br_if vwait 1(vt1) 2(vt1)
 }
 block 2 (vt2: i32) {
-  vr = thread.join vt2
+  vr_st, vr = thread.join vt2
   return vr
   }
 }

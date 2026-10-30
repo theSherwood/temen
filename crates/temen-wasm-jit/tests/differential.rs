@@ -1641,7 +1641,7 @@ fn fail_closed() {
         ),
         (
             "threads",
-            "memory 16\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 0\n  v1 = thread.spawn 1 v0 v0\n  v2 = thread.join v1\n  return v2\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (vsp: i64, v0: i64) {\n  v1 = i64.const 0\n  return v1\n  }\n}\n",
+            "memory 16\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 0\n  v1 = thread.spawn 1 v0 v0\n  v2_st, v2 = thread.join v1\n  return v2\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (vsp: i64, v0: i64) {\n  v1 = i64.const 0\n  return v1\n  }\n}\n",
         ),
         // (`tailcall` was here — `return_call`/`return_call.dyn` are now lowered; see `fn tailcall`.)
     ] {

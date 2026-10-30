@@ -39,7 +39,7 @@ block 0 (v0: i32) {
   v4 = thread.spawn 1 v2 v3
   v5 = i32.const 0
   v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
-  v7 = thread.join v4
+  v7_st, v7 = thread.join v4
   v8 = i64.add v6 v7
   return v8
   }
@@ -98,7 +98,7 @@ fn two_vcpu_domain_freezes_and_thaws() {
     // Freeze: UNWINDING from the start. Single-worker — the root runs (spawns the child, reads the
     // clock → 42), unwinds at its poll; then the child runs (reads the clock → 43), unwinds into its
     // own region. Capture the window + the child's residue.
-    let (frozen, root_sp, snap, clock_after) = {
+    let (frozen, root_sp, children, snap, clock_after) = {
         let mut h = Host::new();
         h.set_durable(true);
         h.clock_ns = 42;
@@ -119,6 +119,7 @@ fn two_vcpu_domain_freezes_and_thaws() {
         (
             h.frozen_vcpus().to_vec(),
             h.frozen_root_sp().expect("root extent recorded"),
+            h.child_generations().to_vec(),
             snap,
             h.clock_ns,
         )
@@ -145,6 +146,7 @@ fn two_vcpu_domain_freezes_and_thaws() {
         let clk = h.grant_clock();
         h.set_frozen_vcpus(frozen);
         h.set_frozen_root_sp(root_sp);
+        h.set_child_generations(children);
         let mut fuel = 1_000_000u64;
         let (r, _) = run_capture_reserved_with_host(
             &inst,
@@ -183,7 +185,7 @@ block 0 (v0: i32) {
   v7 = cont.new v5 v6
   v8 = i64.const 0
   v9, v10 = cont.resume v7 v8
-  v13 = thread.join v4
+  v13_st, v13 = thread.join v4
   v14 = i64.add v10 v13
   return v14
   }
@@ -247,7 +249,7 @@ fn vcpu_and_fiber_coexist_through_freeze_thaw() {
 
     // Freeze: UNWINDING. The root unwinds at cont.resume with the fiber parked (context 1); the child
     // unwinds into its top-down context. Capture window + both residues.
-    let (frozen_fibers, frozen_vcpus, root_sp, snap, clock_after) = {
+    let (frozen_fibers, frozen_vcpus, root_sp, children, snap, clock_after) = {
         let mut h = Host::new();
         h.set_durable(true);
         h.clock_ns = 42;
@@ -269,6 +271,7 @@ fn vcpu_and_fiber_coexist_through_freeze_thaw() {
             h.frozen_fibers().to_vec(),
             h.frozen_vcpus().to_vec(),
             h.frozen_root_sp().expect("root extent recorded"),
+            h.child_generations().to_vec(),
             snap,
             h.clock_ns,
         )
@@ -293,6 +296,7 @@ fn vcpu_and_fiber_coexist_through_freeze_thaw() {
         h.set_frozen_fibers(frozen_fibers);
         h.set_frozen_vcpus(frozen_vcpus);
         h.set_frozen_root_sp(root_sp);
+        h.set_child_generations(children);
         let mut fuel = 1_000_000u64;
         let (r, _) = run_capture_reserved_with_host(
             &inst,
@@ -332,7 +336,7 @@ block 0 (v0: i32) {
   v3 = thread.spawn 1 v1 v2
   v4 = i32.const 0
   v5 = call.cap 2 0 (i32) -> (i64) v0 (v4)
-  v6 = thread.join v3
+  v6_st, v6 = thread.join v3
   v7 = i64.add v5 v6
   return v7
   }
@@ -387,7 +391,7 @@ fn child_owns_fiber_through_freeze_thaw() {
 
     // Freeze: UNWINDING. The root unwinds (no fiber); the child reads the clock, parks its fiber at
     // cont.resume, and unwinds into its top-down context. Capture window + both residues.
-    let (frozen_fibers, frozen_vcpus, root_sp, snap, clock_after) = {
+    let (frozen_fibers, frozen_vcpus, root_sp, children, snap, clock_after) = {
         let mut h = Host::new();
         h.set_durable(true);
         h.clock_ns = 42;
@@ -409,6 +413,7 @@ fn child_owns_fiber_through_freeze_thaw() {
             h.frozen_fibers().to_vec(),
             h.frozen_vcpus().to_vec(),
             h.frozen_root_sp().expect("root extent recorded"),
+            h.child_generations().to_vec(),
             snap,
             h.clock_ns,
         )
@@ -437,6 +442,7 @@ fn child_owns_fiber_through_freeze_thaw() {
         h.set_frozen_fibers(frozen_fibers);
         h.set_frozen_vcpus(frozen_vcpus);
         h.set_frozen_root_sp(root_sp);
+        h.set_child_generations(children);
         let mut fuel = 1_000_000u64;
         let (r, _) = run_capture_reserved_with_host(
             &inst,
@@ -472,7 +478,7 @@ block 0 (v0: i32) {
   v4 = thread.spawn 1 v2 v3
   v5 = i32.const 0
   v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
-  v7 = thread.join v4
+  v7_st, v7 = thread.join v4
   v8 = i64.add v6 v7
   return v8
   }
@@ -486,7 +492,7 @@ block 0 (v0: i64, v1: i64) {
   v6 = thread.spawn 2 v4 v5
   v7 = i32.const 0
   v8 = call.cap 2 0 (i32) -> (i64) v3 (v7)
-  v9 = thread.join v6
+  v9_st, v9 = thread.join v6
   v10 = i64.add v8 v9
   return v10
   }
@@ -530,7 +536,7 @@ fn nested_spawn_tree_freezes_and_thaws() {
     // Freeze: UNWINDING. root spawns child + reads clock + unwinds; child spawns grandchild + reads
     // clock + unwinds (FrozenVCpu, parent = root); grandchild reads clock + unwinds (FrozenVCpu,
     // parent = child). Capture window + residues.
-    let (frozen, root_sp, snap, clock_after) = {
+    let (frozen, root_sp, children, snap, clock_after) = {
         let mut h = Host::new();
         h.set_durable(true);
         h.clock_ns = 42;
@@ -551,6 +557,7 @@ fn nested_spawn_tree_freezes_and_thaws() {
         (
             h.frozen_vcpus().to_vec(),
             h.frozen_root_sp().expect("root extent recorded"),
+            h.child_generations().to_vec(),
             snap,
             h.clock_ns,
         )
@@ -586,6 +593,7 @@ fn nested_spawn_tree_freezes_and_thaws() {
         let clk = h.grant_clock();
         h.set_frozen_vcpus(frozen);
         h.set_frozen_root_sp(root_sp);
+        h.set_child_generations(children);
         let mut fuel = 1_000_000u64;
         let (r, _) = run_capture_reserved_with_host(
             &inst,

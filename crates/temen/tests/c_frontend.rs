@@ -2254,7 +2254,7 @@ long counter;
 long __vm_atomic_add(void *p, long v);
 long __vm_atomic_load(void *p);
 int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
-long __vm_thread_join(int h);
+long __vm_thread_join(int h, long *status);
 
 long worker(long iters) {
   for (long i = 0; i < iters; i++)
@@ -2267,10 +2267,10 @@ int main(void) {
   int b = __vm_thread_spawn(worker, (void *)0, 500);
   int c = __vm_thread_spawn(worker, (void *)0, 500);
   int d = __vm_thread_spawn(worker, (void *)0, 500);
-  __vm_thread_join(a);
-  __vm_thread_join(b);
-  __vm_thread_join(c);
-  __vm_thread_join(d);
+  __vm_thread_join(a, &(long){0});
+  __vm_thread_join(b, &(long){0});
+  __vm_thread_join(c, &(long){0});
+  __vm_thread_join(d, &(long){0});
   return (int)__vm_atomic_load(&counter);
 }
 "#;
@@ -2308,9 +2308,9 @@ fn c_thread_shares_powerbox_for_io() {
     let src = format!(
         "{LIBC}\n\
          int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);\n\
-         long __vm_thread_join(int h);\n\
+         long __vm_thread_join(int h, long *status);\n\
          long worker(long arg) {{ write(1, \"hi from a thread\\n\", 17); return 0; }}\n\
-         int main(void) {{ int h = __vm_thread_spawn(worker, (void *)0, 0); __vm_thread_join(h); return 0; }}\n"
+         int main(void) {{ int h = __vm_thread_spawn(worker, (void *)0, 0); __vm_thread_join(h, &(long){{0}}); return 0; }}\n"
     );
     let run = run_c_full(&src);
     assert_eq!(run.stdout, b"hi from a thread\n");
@@ -2381,6 +2381,29 @@ fn c_pthread_join_returns_value() {
         }\n";
     match run_c_full(src).outcome {
         Outcome::Returned(v) => assert_eq!(v.as_slice(), [Value::I32(42)]),
+        Outcome::Exited(c) => panic!("unexpected exit({c})"),
+    }
+}
+
+/// A second `pthread_join` of a thread finds its handle spent (#2667): `ESRCH` (3), with `*retval`
+/// left as it was, where the second join used to trap the program. The first join still delivers
+/// the thread's value.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_pthread_join_twice_answers_esrch() {
+    let src = "#include <pthread.h>\n\
+        static void *dbl(void *arg) { return (void *)((long)arg * 2); }\n\
+        int main(void) {\n\
+        \x20 pthread_t t;\n\
+        \x20 pthread_create(&t, 0, dbl, (void *)21);\n\
+        \x20 void *r;\n\
+        \x20 int e1 = pthread_join(t, &r);\n\
+        \x20 void *r2 = (void *)7;\n\
+        \x20 int e2 = pthread_join(t, &r2);\n\
+        \x20 return e1 * 10000 + e2 * 1000 + (int)(long)r + (int)(long)r2;\n\
+        }\n";
+    match run_c_full(src).outcome {
+        Outcome::Returned(v) => assert_eq!(v.as_slice(), [Value::I32(3 * 1000 + 42 + 7)]),
         Outcome::Exited(c) => panic!("unexpected exit({c})"),
     }
 }

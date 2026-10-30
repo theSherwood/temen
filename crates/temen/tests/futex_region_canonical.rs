@@ -44,7 +44,7 @@ block 0 (v0: i32) {\n\
   vexp = i32.const 0\n\
   vto = i64.const -1\n\
   vst = i32.atomic.wait vbo vexp vto\n\
-  vjr = thread.join vchild\n\
+  vjr_st, vjr = thread.join vchild\n\
   vst64 = i64.extend_i32_u vst\n\
   return vst64\n\
   }\n\

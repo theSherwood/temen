@@ -127,7 +127,7 @@ block 0 () {
   vexp = i32.const 0
   vinf = i64.const -1
   vst = i32.atomic.wait vaddr vexp vinf
-  vr = thread.join vt
+  vr_st, vr = thread.join vt
   vst64 = i64.extend_i32_u vst
   return vst64
   }

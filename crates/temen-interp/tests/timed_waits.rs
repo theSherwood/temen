@@ -40,7 +40,7 @@ block 1 (vchild: i32) {
   br_if vset 2(vchild) 1(vchild)
   }
 block 2 (vchild: i32) {
-  vr = thread.join vchild
+  vr_st, vr = thread.join vchild
   return vr
   }
 }
@@ -256,7 +256,7 @@ block 0 (vcall: i32) {{
   vf = i64.const 17900
   vone = i32.const 1
   i32.atomic.store vf vone
-  vnaps = thread.join vth
+  vnaps_st, vnaps = thread.join vth
   return vnaps
   }}
 }}

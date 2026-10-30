@@ -270,7 +270,7 @@ fn diff_run_threads(
 #[test]
 fn installed_unit_spawns_its_own_func_native_agrees() {
     // The spawning unit: `f0() -> i32` spawns its own `f1` (→ 7), joins, returns 7.
-    let unit = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  vsp = i64.const 0\n  varg = i64.const 0\n  vt = thread.spawn 1 vsp varg\n  vr = thread.join vt\n  vr32 = i32.wrap_i64 vr\n  return vr32\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (vsp: i64, varg: i64) {\n  v7 = i64.const 7\n  return v7\n  }\n}\n";
+    let unit = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  vsp = i64.const 0\n  varg = i64.const 0\n  vt = thread.spawn 1 vsp varg\n  vr_st, vr = thread.join vt\n  vr32 = i32.wrap_i64 vr\n  return vr32\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (vsp: i64, varg: i64) {\n  v7 = i64.const 7\n  return v7\n  }\n}\n";
     let b = blob(unit);
     // (jit) -> i32:  slot = install(compile(blob));  return call.dyn[slot]().
     let guest_src = "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i64.const 20480\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 3 (i64) -> (i64) v0 (v3)\n  v5 = i32.wrap_i64 v4\n  v6 = call.dyn () -> (i32) v5 ()\n  return v6\n  }\n}\n";
@@ -315,7 +315,7 @@ fn installed_unit_futex_wait_native_agrees() {
 #[test]
 fn invoked_threaded_unit_capfaults_native_agrees() {
     // The unit's `f0() -> i32` spawns its own `f1`, so it uses threads.
-    let unit = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  vsp = i64.const 0\n  varg = i64.const 0\n  vt = thread.spawn 1 vsp varg\n  vr = thread.join vt\n  vr32 = i32.wrap_i64 vr\n  return vr32\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (vsp: i64, varg: i64) {\n  v7 = i64.const 7\n  return v7\n  }\n}\n";
+    let unit = "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  vsp = i64.const 0\n  varg = i64.const 0\n  vt = thread.spawn 1 vsp varg\n  vr_st, vr = thread.join vt\n  vr32 = i32.wrap_i64 vr\n  return vr32\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (vsp: i64, varg: i64) {\n  v7 = i64.const 7\n  return v7\n  }\n}\n";
     let b = blob(unit);
     // (jit) -> i32:  return invoke(compile(blob))  — invoke of a threaded unit is a CapFault.
     let guest_src = "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i64.const 20480\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 1 (i64) -> (i32) v0 (v3)\n  return v4\n  }\n}\n";
@@ -362,7 +362,7 @@ func () -> (i64) {\nblock 0 () {\n  v0 = i32.const 1\n  v1 = i64.const 32768\n  
 /// threaded unit still CapFaults on both (seam-free leaf).
 #[test]
 fn submitted_unit_threads_compile_split_by_tier() {
-    let b = blob("memory 16\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 32768\n  v1 = i64.const 0\n  v2 = thread.spawn 1 v0 v1\n  v3 = thread.join v2\n  return v3\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = i64.const 5\n  return v2\n  }\n}\n");
+    let b = blob("memory 16\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 32768\n  v1 = i64.const 0\n  v2 = thread.spawn 1 v0 v1\n  v3_st, v3 = thread.join v2\n  return v3\n  }\n}\nfunc (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = i64.const 5\n  return v2\n  }\n}\n");
     let guest = with_len(COMPILE_ONLY, b.len());
     let m = parse_module(&guest).expect("parse guest");
     verify_module(&m).expect("verify guest");
@@ -923,7 +923,7 @@ fn threaded_install_agrees_across_backends() {
         "  v10 = i64.const 16384\n",
         "  v11 = i32.const 1\n",
         "  i32.atomic.store v10 v11\n", // window[16384] = ready (release) (#1094: guard-shifted from 0)
-        "  v12 = thread.join v6\n",     // worker result (i64)
+        "  v12_st, v12 = thread.join v6\n", // worker result (i64)
         "  v13 = i32.wrap_i64 v12\n",
         "  return v13\n",
         "  }\n",
@@ -993,7 +993,7 @@ fn threaded_compile_agrees_across_backends() {
         "  v7 = i32.const 6\n",
         "  v8 = i32.const 7\n",
         "  v9 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v6, v7, v8)\n", // 6*7+10 = 52
-        "  v10 = thread.join v3\n",                                        // worker result (i64)
+        "  v10_st, v10 = thread.join v3\n",                                // worker result (i64)
         "  v11 = i32.wrap_i64 v10\n",
         "  v12 = i32.add v9 v11\n", // 52 + 82 = 134
         "  return v12\n",
@@ -1063,7 +1063,7 @@ fn threaded_compile_loop_stress_agrees() {
         "  br 1(v11, v12, v22, v20)\n",
         "  }\n",
         "block 3 (v23: i32, v24: i32) {\n", // wh, acc
-        "  v25 = thread.join v23\n",
+        "  v25_st, v25 = thread.join v23\n",
         "  v26 = i32.wrap_i64 v25\n",
         "  v27 = i32.add v24 v26\n",
         "  return v27\n",
@@ -1141,7 +1141,7 @@ fn cross_thread_execute_fresh_code_agrees() {
         "  v10 = i64.const 16384\n",
         "  v11 = i32.const 1\n",
         "  i32.atomic.store v10 v11\n", // publish ready (release) (#1094: window[16384/16388])
-        "  v12 = thread.join v3\n",
+        "  v12_st, v12 = thread.join v3\n",
         "  v13 = i32.wrap_i64 v12\n",
         "  return v13\n",
         "  }\n",

@@ -318,7 +318,7 @@ block 0 () {
   vsp = i64.const 0
   varg = i64.const 0
   vh = thread.spawn 1 vsp varg
-  vjr = thread.join vh
+  vjr_st, vjr = thread.join vh
   vroot = i64.const 5000
   vlo = i64.const 4096
   vhi = i64.const 8192
@@ -354,7 +354,7 @@ block 0 () {
   vsp0 = i64.const 0
   varg0 = i64.const 0
   vh = thread.spawn 2 vsp0 varg0
-  vjr = thread.join vh
+  vjr_st, vjr = thread.join vh
   vf = ref.func 1
   vfsp = i64.const 0
   vk = cont.new vf vfsp

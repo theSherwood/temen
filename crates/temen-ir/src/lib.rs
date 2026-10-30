@@ -222,8 +222,8 @@ pub mod cap_id {
 ///
 /// | type | op | | args | results |
 /// |---|---|---|---|---|
-/// | Instantiator | 1 | `join` | child | status, value: `(0, its first result)` if it returned, `(its trap's [`trap_code`], 0)` if not |
-/// | Instantiator | 9, 10, 12 | `poll`, `detach`, `kill` | child | i32 |
+/// | Instantiator | 1 | `join` | child | status, value: `(0, its first result)` if it returned, `(its trap's [`trap_code`], 0)` if not, `(-EBADF, 0)` for a spent child |
+/// | Instantiator | 9, 10, 12 | `poll`, `detach`, `kill` | child | i32, or `-EBADF` for a spent child |
 /// | Instantiator | 14, 19 | `child_offer`, `grant` | child, export or handle | the child's handle or `-errno` |
 /// | Instantiator | 17 | `instantiate_rec` | record pointer ([`SpawnRec`]) | child or `-errno` |
 /// | Jit | 3, 4 | `install`, `uninstall` | code handle, or slot | slot or `-errno`, or `0` or `-EINVAL` |
@@ -266,20 +266,6 @@ pub fn served_shape_ok(type_id: u32, op: u32, sig: &FuncType) -> bool {
         }
         None => type_id != cap_id::INSTANTIATOR,
     }
-}
-
-/// The slot a §12 thread or §14 child handle names in a table of `len` slots, by the one rule every
-/// engine resolves one by (#2378). A negative handle names none: it is a forgery, or a failed
-/// spawn's `-errno` passed on unchecked (#773), and folding it onto a live slot would wedge a join on
-/// a child that never ends. Any other is masked into the table padded to a power of two, so a handle
-/// past the table names a slot only where the mask folds it onto one. Whether that slot is live
-/// (issued and neither joined nor detached) is the caller's table's to say.
-pub fn handle_slot(len: usize, handle: i32) -> Option<usize> {
-    if handle < 0 || len == 0 {
-        return None;
-    }
-    let slot = (handle as u32 as usize) & (len.next_power_of_two() - 1);
-    (slot < len).then_some(slot)
 }
 
 /// Guest-facing **errno values** — the negative `-errno` a fallible capability op returns on its
@@ -2669,12 +2655,14 @@ pub enum Inst {
         func: ValIdx,
         sp: ValIdx,
     },
-    /// §12 fiber resume (`cont.resume` / `cont.resume.block`): switch to fiber `k` (an `i32`
+    /// §12 fiber resume (`cont.resume` / `cont.resume.block`): switch to fiber `k` (an `i64`
     /// handle), delivering `arg` (`i64`) — the argument to the fiber's function on the first
     /// resume, or the result of the fiber's `suspend` on later resumes. Runs the fiber until it
     /// suspends or returns, then yields `(status: i32, value: i64)`: `status` 0 = **suspended**
-    /// (the fiber stays resumable), 1 = **returned** (the fiber is done; resuming it again
-    /// traps). A **call-clobbering** control op — like a call it switches stacks, but it
+    /// (the fiber stays resumable), 1 = **returned** (the fiber is done). A handle whose fiber
+    /// already returned is **spent**: nothing runs, and the resume yields `(-EBADF, 0)`
+    /// (INVARIANTS #5, #2667). A handle carrying a generation its slot never issued is forged
+    /// and traps. A **call-clobbering** control op — like a call it switches stacks, but it
     /// does not end the block.
     ///
     /// The `block: true` form (`cont.resume.block`, ISSUES.md I48) is an advisory scheduling
@@ -2776,8 +2764,11 @@ pub enum Inst {
         arg: ValIdx,
     },
     /// §12 thread join (`thread.join`): block until the vCPU named by `handle` (an `i32` thread
-    /// handle) finishes and yield its `i64` result. A forged / out-of-range / already-joined handle
-    /// is inert (**traps**); if the joined vCPU itself trapped, that trap propagates here.
+    /// handle) finishes, then yield `(status: i64, value: i64)`, the shape of `Instantiator.join`
+    /// (op 1): `(0, its result)`. A **spent** handle — one that named a slot since joined, or a
+    /// §14 child's since detached — yields `(-EBADF, 0)` without blocking (INVARIANTS #5, #2667).
+    /// A handle that names no slot is forged and **traps**. If the joined vCPU itself trapped,
+    /// that trap is the domain's (INVARIANTS #6) and propagates here.
     ThreadJoin {
         handle: ValIdx,
     },
@@ -3554,8 +3545,9 @@ impl Inst {
             | Inst::V128Store { .. } => 0,
             // `vcpu.tls.get` appends one `i64`; `durable.shadow_base` likewise (a window byte offset).
             Inst::VcpuTlsGet | Inst::DurableShadowBase => 1,
-            // `cont.resume` (in both its blocking and non-blocking forms) is the multi-result non-call op: `(status, value)`.
-            Inst::ContResume { .. } => 2,
+            // The multi-result non-call ops, each `(status, value)`: `cont.resume` (in both its
+            // blocking and non-blocking forms) and `thread.join`.
+            Inst::ContResume { .. } | Inst::ThreadJoin { .. } => 2,
             // `self.type_id`/`covers` append one `i32`. (The `self.count`/`get`/`resolve`/
             // `label`/`attest` reflection ops are now `call.cap CAP_SELF` — counted by their `sig`.)
             Inst::CapSelfTypeId { .. } | Inst::CapSelfCovers { .. } | Inst::ExportHandle { .. } => {
@@ -7523,6 +7515,7 @@ pub struct Data {
 
 pub mod cfg;
 pub mod dominance;
+pub mod handles;
 pub use dominance::{Captured, Moves};
 
 /// **Compile-time confinement bound analysis** (§1a "guard-when-bounded", D36–D38/D63) — the shared,

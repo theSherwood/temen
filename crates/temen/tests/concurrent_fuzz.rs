@@ -92,7 +92,7 @@ fn gen_program(seed: u64) -> Program {
         main.push_str(&format!("  vh{t} = thread.spawn 1 vsp varg{t}\n"));
     }
     for t in 0..workers.len() {
-        main.push_str(&format!("  vj{t} = thread.join vh{t}\n"));
+        main.push_str(&format!("  vj{t}_st, vj{t} = thread.join vh{t}\n"));
     }
     main.push_str("  vacc0 = i64.const 0\n");
     for c in 0..cells {

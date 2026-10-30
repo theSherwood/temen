@@ -975,7 +975,8 @@ uses:
 - It `thread.spawn`s an entry that installs the block (`vcpu.tls.set`) and calls nim's start routine
   through `call.dyn`, with the leading `$sp` the funcref ABI gives every target. When the routine
   returns, the entry unmaps the region; nim's thread wrapper has already handed its heap on.
-- `pthread_join` is `thread.join`, and the `pthread_t` is the thread handle.
+- `pthread_join` is `thread.join`, and the `pthread_t` is the thread handle. A handle already
+  joined answers `ESRCH` (#2667).
 
 **Locks.** nimony's default build (`nimNativeIo`) makes `std/locks` and `std/rlocks` a futex mutex and
 condition variable over `syscall(SYS_futex, …)`. The shim's `syscall` (row 58) serves `FUTEX_WAIT` as

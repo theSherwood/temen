@@ -70,7 +70,7 @@ block 0 () {{
   vt = thread.spawn 3 vz vz
   vseed = i64.const 11
   vr = call 1 (vseed)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vtot = i64.add vr vj
   vsl = i64.const {SLOT}
   i64.store vsl vtot

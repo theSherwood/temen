@@ -197,7 +197,7 @@ func () -> (i64) {
 block 0 () {
   v0 = i64.const 500
   v1 = thread.spawn 1 v0 v0
-  v2 = thread.join v1
+  v2_st, v2 = thread.join v1
   v3 = i64.const 0
   v4 = i64.atomic.load v3
   return v4
@@ -238,7 +238,7 @@ const TRANSITIVE: &str = r#"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = thread.spawn 1 v0 v0
-  v2 = thread.join v1
+  v2_st, v2 = thread.join v1
   return v2
   }
 }
@@ -558,7 +558,7 @@ block 2 (vk: i64, va: i64, vt2: i32) {
   br 1(vk1, vs, vt2)
 }
 block 3 (vsum: i64, vt3: i32) {
-  vj = thread.join vt3
+  vj_st, vj = thread.join vt3
   vr = i64.add vsum vj
   return vr
   }

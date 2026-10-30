@@ -11,8 +11,8 @@
 //! 3.1.4–5) — so these tests pin verification + NORMAL-inertness + the arm wiring, structurally.
 
 use temen_durable::{
-    begin_thaw, init_durable_window, transform_module, transform_module_assume_confined,
-    write_state, STATE_UNWINDING,
+    arm_freeze_after, begin_thaw, init_durable_window, read_thaw_state, transform_module,
+    transform_module_assume_confined, write_state, STATE_NORMAL, STATE_UNWINDING,
 };
 use temen_interp::{
     run_capture_reserved_with_host, Host, HostProcGrant, ProcHandler, Trap, Value,
@@ -561,7 +561,10 @@ block 0 (v0: i64, v1: i64) {
     );
 
     // After slot 0 is recycled (now holds fiber B at gen 1), resuming A's stale gen-0 handle (i64 0)
-    // must fault — even though slot 0 is live — because the generation no longer matches.
+    // must not reach B — even though slot 0 is live — because the generation no longer matches.
+    // The handle was issued and its fiber returned, so it is spent: `(-EBADF, 0)` (#2667). The
+    // status comes back in the high word and the value in the low one, so a resume that reached B
+    // (status 1, value 7) reads differently.
     const STALE: &str = r#"
 func () -> (i64) {
 block 0 () {
@@ -573,7 +576,11 @@ block 0 () {
   v6 = cont.new v0 v1
   v9 = i64.const 0
   v7, v8 = cont.resume v9 v3
-  return v8
+  v10 = i64.extend_i32_s v7
+  v11 = i64.const 32
+  v12 = i64.shl v10 v11
+  v13 = i64.or v12 v8
+  return v13
   }
 }
 func (i64, i64) -> (i64) {
@@ -590,9 +597,108 @@ block 0 (v0: i64, v1: i64) {
     });
     assert_eq!(
         run_normal(&stale),
-        Err(Trap::FiberFault),
-        "a stale (gen-0) handle to a recycled slot faults (the ABA guard)"
+        Ok(vec![Value::I64(-9 << 32)]),
+        "a stale (gen-0) handle to a recycled slot is spent (-EBADF, 0), never fiber B (the ABA guard)"
     );
+
+    // A generation slot 0 has not reached (5, where it is at 1) was never issued: a forgery, which
+    // still faults.
+    let forged = STALE.replace("v9 = i64.const 0", "v9 = i64.const 83886080"); // (5 << 24) | 0
+    let mut forged = temen_text::parse_module(&forged).expect("parse FORGED");
+    forged.memory = stale.memory;
+    assert_eq!(
+        run_normal(&forged),
+        Err(Trap::FiberFault),
+        "a never-issued generation is a forgery"
+    );
+}
+
+/// #2667 — a freeze that lands at a resume of a **spent** handle (its fiber already returned)
+/// thaws to the uninterrupted result. That resume ran no fiber, so no fiber frame is left to rewind
+/// and flip the root's thaw word: its thaw reloads `(-EBADF, 0)` and flips the word itself, as a
+/// resume whose fiber returned does (#1835). A word left `REWINDING` would send the root's next
+/// safepoint, a fresh fiber's resume, down its thaw arm. Swept over every fiber safepoint.
+#[test]
+fn a_freeze_at_a_spent_resume_thaws_to_the_uninterrupted_run() {
+    const SPENT: &str = r#"
+func () -> (i64) {
+block 0 () {
+  v0 = ref.func 1
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 7
+  v4, v5 = cont.resume v2 v3
+  v6, v7 = cont.resume v2 v3
+  v8 = i64.extend_i32_s v6
+  v9 = i64.const 1000
+  v10 = i64.mul v8 v9
+  v11 = i64.add v10 v5
+  v12 = i64.add v11 v7
+  v13 = i64.const 8192
+  v14 = cont.new v0 v13
+  v15, v16 = cont.resume v14 v9
+  v17 = i64.add v12 v16
+  return v17
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 100
+  v3 = i64.add v1 v2
+  return v3
+  }
+}
+"#;
+    let mut m = temen_text::parse_module(SPENT).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
+    });
+    let inst = transform_module(&m).expect("transform");
+    temen_verify::verify_module(&inst).expect("instrumented IR verifies");
+    // The fiber returns 7 + 100 on the first resume, the second finds its handle spent, and a fresh
+    // fiber returns 1000 + 100.
+    let want = run_normal(&inst).expect("uninterrupted run");
+    assert_eq!(
+        want,
+        vec![Value::I64(-9 * 1000 + 107 + 1100)],
+        "uninterrupted result"
+    );
+    for cut in 1..=3 {
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
+        arm_freeze_after(&mut win, TEST_ARENA, cut);
+        let mut fhost = Host::new();
+        fhost.set_durable(true);
+        let mut fuel = 1_000_000u64;
+        let (rf, frozen_win) =
+            run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut fhost);
+        assert!(
+            rf.is_ok(),
+            "cut {cut}: the freeze returns a placeholder: {rf:?}"
+        );
+        let frozen = fhost.frozen_fibers().to_vec();
+        let mut thaw_win = frozen_win;
+        begin_thaw(&mut thaw_win, TEST_ARENA, 0);
+        let mut thost = Host::new();
+        thost.set_durable(true);
+        thost.set_frozen_fibers(frozen);
+        let mut tfuel = 1_000_000u64;
+        let (rt, done_win) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[],
+            &mut tfuel,
+            &thaw_win,
+            SIZE_LOG2,
+            &mut thost,
+        );
+        assert_eq!(rt.expect("the thaw runs to completion"), want, "cut {cut}");
+        assert_eq!(
+            read_thaw_state(&done_win, TEST_ARENA, 0),
+            STATE_NORMAL,
+            "cut {cut}: the thaw flips the root's thaw word back to NORMAL"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

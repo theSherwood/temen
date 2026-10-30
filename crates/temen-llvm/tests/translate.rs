@@ -7818,7 +7818,7 @@ fn vm_threads_atomic_counter() {
 long __vm_atomic_add(void *p, long v);
 long __vm_atomic_load(void *p);
 int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
-long __vm_thread_join(int h);
+long __vm_thread_join(int h, long *status);
 long counter = 0;
 long worker(long arg);
 int driver(void) {
@@ -7826,10 +7826,11 @@ int driver(void) {
   int b = __vm_thread_spawn(worker, (void *)0, 500);
   int c = __vm_thread_spawn(worker, (void *)0, 500);
   int d = __vm_thread_spawn(worker, (void *)0, 500);
-  __vm_thread_join(a);
-  __vm_thread_join(b);
-  __vm_thread_join(c);
-  __vm_thread_join(d);
+  long st;
+  __vm_thread_join(a, &st);
+  __vm_thread_join(b, &st);
+  __vm_thread_join(c, &st);
+  __vm_thread_join(d, &st);
   return (int)__vm_atomic_load(&counter);
 }
 long worker(long arg) {
@@ -7853,7 +7854,7 @@ fn malloc_hands_parallel_threads_distinct_blocks() {
     let src = r#"
 #include <stdlib.h>
 int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
-long __vm_thread_join(int h);
+long __vm_thread_join(int h, long *status);
 #define N 2000
 long worker(long tag) {
   long **blocks = malloc(N * sizeof(long *));
@@ -7871,8 +7872,8 @@ long worker(long tag) {
 int main(void) {
   int h[4];
   for (int t = 0; t < 4; t++) h[t] = __vm_thread_spawn(worker, malloc(1 << 16), t + 1);
-  long bad = 0;
-  for (int t = 0; t < 4; t++) bad += __vm_thread_join(h[t]);
+  long bad = 0, st;
+  for (int t = 0; t < 4; t++) bad += __vm_thread_join(h[t], &st);
   return bad != 0;
 }
 "#;

@@ -159,6 +159,8 @@ pub use temen_ir::durable_abi::{ShadowArena, FIBER_FROZEN, WAIT_FROZEN};
 
 /// `cont.resume`'s status for a fiber that returned ([`Inst::ContResume`]).
 const FIBER_RETURNED: i32 = 1;
+/// `cont.resume`'s status for a spent handle, whose fiber already returned (#2667).
+const FIBER_SPENT: i32 = temen_ir::errno::EBADF as i32;
 
 // Block layout of an instrumented function with `S` forward segments (each original
 // block is split at its suspend ops into `points+1` segments; non-suspend blocks are one
@@ -1316,7 +1318,7 @@ fn transform_func(
                     }
                     (SuspendKind::Resume { .. }, _) => 2, // (status, value)
                     (SuspendKind::Yield { .. }, _) => 1,  // the resume arg
-                    (SuspendKind::ThreadJoin { .. }, _) => 1, // the join result (i64)
+                    (SuspendKind::ThreadJoin { .. }, _) => 2, // (status, value)
                     (SuspendKind::MemoryWait { .. }, _) => 1, // the wait status (i32)
                     _ => unreachable!(),
                 };
@@ -1733,10 +1735,19 @@ fn transform_func(
             // turn (its `Yield` re-park, or the frames it unwound) and redelivers `(status, value)`.
             // The resumer does **not** flip the thaw word there: the fiber's deepest frame does.
             // One whose fiber returned reloads the two, and, the deepest frame now, flips it (#1835).
+            // So does one whose handle was spent (#2667): no fiber ran, so none rewinds to flip it.
             SuspendKind::Resume { k, arg } => {
                 let status = cont_args[pt.out - 2];
                 let returned = ab.one(Inst::ConstI32(FIBER_RETURNED));
-                let cond = ab.one(icmp(IntTy::I32, CmpOp::Ne, status, returned));
+                let spent = ab.one(Inst::ConstI32(FIBER_SPENT));
+                let not_returned = ab.one(icmp(IntTy::I32, CmpOp::Ne, status, returned));
+                let not_spent = ab.one(icmp(IntTy::I32, CmpOp::Ne, status, spent));
+                let cond = ab.one(Inst::IntBin {
+                    ty: IntTy::I32,
+                    op: BinOp::And,
+                    a: not_returned,
+                    b: not_spent,
+                });
                 let mut fb = Bb::new(pt.slot_types[..pt.out].to_vec());
                 let (st_a, st_off) = fb.thaw_word_addr();
                 let normal_v = fb.one(Inst::ConstI32(STATE_NORMAL));
@@ -2278,11 +2289,12 @@ fn result_types(
         ContResume { .. } => vec![ValType::I32, ValType::I64],
         Suspend { .. } => vec![ValType::I64],
         // §12 thread ops (Phase 3.2): `thread.spawn` yields an `i32` handle, `thread.join` an `i64`
-        // result. Neither is a may-suspend checkpoint — they are copied verbatim into their segment and
-        // their results spill/reload like any scalar; the multi-vCPU freeze/thaw choreography is the
-        // runtime's (durable §12.8 slice 3.2.1), so the transform only needs to type them.
+        // `(status, value)` pair (#2667). Neither is a may-suspend checkpoint — they are copied
+        // verbatim into their segment and their results spill/reload like any scalar; the
+        // multi-vCPU freeze/thaw choreography is the runtime's (durable §12.8 slice 3.2.1), so the
+        // transform only needs to type them.
         ThreadSpawn { .. } => vec![ValType::I32],
-        ThreadJoin { .. } => vec![ValType::I64],
+        ThreadJoin { .. } => vec![ValType::I64, ValType::I64],
         // §12 futex ops: `atomic.wait` yields an `i32` status (woken / not-equal / timed-out),
         // `atomic.notify` an `i32` woken count. `atomic.wait` is a may-suspend re-issue safepoint
         // (the parked-vCPU slice); `atomic.notify` is copied verbatim into its segment.

@@ -72,8 +72,8 @@ block 0 () {
   va = i64.const 1
   vh0 = thread.spawn 1 vsp va
   vh1 = thread.spawn 1 vsp va
-  vj0 = thread.join vh0
-  vj1 = thread.join vh1
+  vj0_st, vj0 = thread.join vh0
+  vj1_st, vj1 = thread.join vh1
   vaddr = i64.const 0
   vr = i64.atomic.load vaddr
   return vr
@@ -100,8 +100,8 @@ block 0 () {
   va = i64.const 1
   vh0 = thread.spawn 1 vsp va
   vh1 = thread.spawn 1 vsp va
-  vj0 = thread.join vh0
-  vj1 = thread.join vh1
+  vj0_st, vj0 = thread.join vh0
+  vj1_st, vj1 = thread.join vh1
   vaddr = i64.const 0
   vr = i64.load vaddr
   return vr
@@ -132,8 +132,8 @@ block 0 () {
   va = i64.const 0
   vh0 = thread.spawn 1 vsp va
   vh1 = thread.spawn 2 vsp va
-  vj0 = thread.join vh0
-  vj1 = thread.join vh1
+  vj0_st, vj0 = thread.join vh0
+  vj1_st, vj1 = thread.join vh1
   v2 = i64.const 2
   vt = i64.mul vj0 v2
   vres = i64.add vt vj1
@@ -173,8 +173,8 @@ block 0 () {
   va = i64.const 0
   vh0 = thread.spawn 1 vsp va
   vh1 = thread.spawn 2 vsp va
-  vj0 = thread.join vh0
-  vj1 = thread.join vh1
+  vj0_st, vj0 = thread.join vh0
+  vj1_st, vj1 = thread.join vh1
   vz = i64.const 0
   return vz
   }
@@ -277,10 +277,10 @@ block 0 () {
   vh1 = thread.spawn 1 vsp va
   vh2 = thread.spawn 2 vsp va
   vh3 = thread.spawn 2 vsp va
-  vj0 = thread.join vh0
-  vj1 = thread.join vh1
-  vj2 = thread.join vh2
-  vj3 = thread.join vh3
+  vj0_st, vj0 = thread.join vh0
+  vj1_st, vj1 = thread.join vh1
+  vj2_st, vj2 = thread.join vh2
+  vj3_st, vj3 = thread.join vh3
   vx = i64.const 0
   vrx = i64.atomic.load vx
   vy = i64.const 8
@@ -324,10 +324,10 @@ block 0 () {
   vh1 = thread.spawn 1 vsp va
   vh2 = thread.spawn 2 vsp va
   vh3 = thread.spawn 2 vsp va
-  vj0 = thread.join vh0
-  vj1 = thread.join vh1
-  vj2 = thread.join vh2
-  vj3 = thread.join vh3
+  vj0_st, vj0 = thread.join vh0
+  vj1_st, vj1 = thread.join vh1
+  vj2_st, vj2 = thread.join vh2
+  vj3_st, vj3 = thread.join vh3
   vx = i64.const 0
   vrx = i64.load vx
   vy = i64.const 8

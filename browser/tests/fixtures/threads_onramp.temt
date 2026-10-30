@@ -34,10 +34,10 @@ block 2 (vt0: i32, vt1: i32, vt2: i32, vt3: i32, vcur: i32) {
   br 1(vt0, vt1, vt2, vt3)
 }
 block 3 (vt0: i32, vt1: i32, vt2: i32, vt3: i32) {
-  vj0 = thread.join vt0
-  vj1 = thread.join vt1
-  vj2 = thread.join vt2
-  vj3 = thread.join vt3
+  vj0_st, vj0 = thread.join vt0
+  vj1_st, vj1 = thread.join vt1
+  vj2_st, vj2 = thread.join vt2
+  vj3_st, vj3 = thread.join vt3
   vs1 = i64.add vj0 vj1
   vs2 = i64.add vs1 vj2
   vs3 = i64.add vs2 vj3

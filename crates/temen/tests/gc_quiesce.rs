@@ -267,7 +267,7 @@ fn build_quiesce_module(n_vcpus: usize) -> String {
         let jr = fresh(&mut nv);
         writeln!(s, "  {ha} = i64.const {}", HANDLE_BASE + i * 4).unwrap();
         writeln!(s, "  {h} = i32.atomic.load {ha}").unwrap();
-        writeln!(s, "  {jr} = thread.join {h}").unwrap();
+        writeln!(s, "  {jr}_st, {jr} = thread.join {h}").unwrap();
         let nxt = if i < m - 1 { join(i + 1) } else { final_blk };
         writeln!(s, "  br {nxt}()").unwrap();
     }

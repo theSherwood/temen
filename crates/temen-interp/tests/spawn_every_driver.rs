@@ -667,9 +667,14 @@ fn join(dst: &str, h: &str) -> String {
     format!("  {dst}_st, {dst} = call.cap 6 1 (i32) -> (i64, i64) vinst ({h})\n")
 }
 
+/// A join of `h` whose status lands in `dst`: what a spent handle's join answers, `-EBADF` (#2667).
+fn join_status(dst: &str, h: &str) -> String {
+    format!("  {dst}, {dst}_v = call.cap 6 1 (i32) -> (i64, i64) vinst ({h})\n")
+}
+
 /// Run `joins` after three detached spawns on every driver. A join's handle is resolved by the
-/// oracle's rule (`resolve_thread`): negative traps, any other is masked to the table's power-of-two
-/// span, and a spent or never-issued slot traps.
+/// domain's child table (`temen_ir::handles`, #2043): a handle is a slot at a generation, one the
+/// table never issued traps, and a spent one answers `-EBADF`.
 fn joins_agree(what: &str, joins: &str, want: &Ran) {
     handles_agree(&drivers::ALL, what, joins, want);
 }
@@ -705,9 +710,9 @@ fn each_child_joins_once_by_its_handle() {
 }
 
 #[test]
-fn a_second_join_of_a_child_traps() {
-    let joins = format!("{}{}", join("vr0", "vh0"), join("vr", "vh0"));
-    joins_agree("a re-join", &joins, &trapped(Trap::ThreadFault));
+fn a_second_join_of_a_child_is_spent() {
+    let joins = format!("{}{}", join("vr0", "vh0"), join_status("vr", "vh0"));
+    joins_agree("a re-join", &joins, &ok(temen_ir::errno::EBADF));
 }
 
 #[test]
@@ -719,23 +724,41 @@ fn a_negative_handle_traps() {
     );
 }
 
+/// `join` of the handle `slot` issued at `generation`.
+fn join_of(slot: u32, generation: u32) -> String {
+    let h = temen_ir::handles::pack(slot, generation);
+    format!("  vn = i32.const {h}\n{}", join("vr", "vn"))
+}
+
 #[test]
 fn a_handle_past_the_table_traps() {
-    // Three children: the span is 4, and slot 3 was never issued.
+    // Three children fill slots 0 to 2: slot 3 never issued a handle.
+    joins_agree("join(slot 3)", &join_of(3, 1), &trapped(Trap::ThreadFault));
+}
+
+#[test]
+fn a_handle_names_a_slot_at_the_generation_it_issued() {
+    // Slot 1's first handle: the second child.
+    joins_agree("join(slot 1, gen 1)", &join_of(1, 1), &ok(101));
+}
+
+#[test]
+fn a_generation_its_slot_never_issued_traps() {
     joins_agree(
-        "join(3)",
-        &format!("  vn = i32.const 3\n{}", join("vr", "vn")),
+        "join(slot 1, gen 2)",
+        &join_of(1, 2),
         &trapped(Trap::ThreadFault),
     );
 }
 
+/// A table index is not a handle: generation 0 is never issued, so the index of a live child names
+/// no child (#2043).
 #[test]
-fn a_handle_masks_onto_the_table() {
-    // 5 & (4 - 1) is slot 1: the second child.
+fn a_bare_slot_index_is_not_a_handle() {
     joins_agree(
-        "join(5)",
-        &format!("  vn = i32.const 5\n{}", join("vr", "vn")),
-        &ok(101),
+        "join(slot 1, gen 0)",
+        &join_of(1, 0),
+        &trapped(Trap::ThreadFault),
     );
 }
 
@@ -743,51 +766,59 @@ fn a_handle_masks_onto_the_table() {
 const OFFERING: [Driver; 3] = [Driver::Oracle, Driver::Coop, Driver::Parallel];
 
 /// #2378 — every child op resolves a handle by the join's rule, so a spent or forged one gets one
-/// answer on every driver: the oracle's. `join`, `poll`, `detach` and `kill` trap `ThreadFault`;
-/// `child_offer` and `grant` answer `-EINVAL`, the value they give a child they cannot reach. The
-/// handles: child 0 spent by a join, child 0 spent by a detach, a negative one, and 3, past the
-/// table (the span is 4, and slot 3 was never issued). The debug scheduler declines op 14
-/// ([`OFFERING`]).
+/// answer on every driver: the oracle's. On a spent handle `join`, `poll`, `detach` and `kill`
+/// answer `-EBADF` (#2667); on a forged one they trap `ThreadFault`. `child_offer` and `grant`
+/// answer `-EINVAL` for both, the value they give a child they cannot reach. The handles: child 0
+/// spent by a join, child 0 spent by a detach, a negative one, and one past the table (slot 3 never
+/// issued). The debug scheduler declines op 14 ([`OFFERING`]).
 #[test]
 fn a_spent_or_forged_handle_gets_the_oracles_answer_from_every_child_op() {
+    let child0 = format!("  vbad = i32.const {}\n", temen_ir::handles::pack(0, 1));
     let spend = [
-        ("joined", join("vsp", "vh0") + "  vbad = i32.const 0\n"),
+        ("joined", join("vsp", "vh0") + &child0, true),
         (
             "detached",
-            "  vsp = call.cap 6 10 (i32) -> (i32) vinst (vh0)\n  vbad = i32.const 0\n".to_string(),
+            "  vsp = call.cap 6 10 (i32) -> (i32) vinst (vh0)\n".to_string() + &child0,
+            true,
         ),
-        ("negative", "  vbad = i32.const -1\n".to_string()),
-        ("past the table", "  vbad = i32.const 3\n".to_string()),
+        ("negative", "  vbad = i32.const -1\n".to_string(), false),
+        (
+            "past the table",
+            format!("  vbad = i32.const {}\n", temen_ir::handles::pack(3, 1)),
+            false,
+        ),
     ];
     let einval = ok(temen_ir::errno::EINVAL);
+    let ebadf = ok(temen_ir::errno::EBADF);
     let faults = trapped(Trap::ThreadFault);
     // An op answering an `i32` leaves it in `vo`, widened into `vr`.
     let widen = |call: &str| format!("{call}  vr = i64.extend_i32_s vo\n");
-    let ops: [(&str, String, &[Driver], &Ran); 6] = [
-        ("join", join("vr", "vbad"), &ALL, &faults),
+    // Each op, and whether a spent handle gets `-EBADF` from it (else what a forged one gets).
+    let ops: [(&str, String, &[Driver], bool); 6] = [
+        ("join", join_status("vr", "vbad"), &ALL, true),
         (
             "poll",
             widen("  vo = call.cap 6 9 (i32) -> (i32) vinst (vbad)\n"),
             &ALL,
-            &faults,
+            true,
         ),
         (
             "detach",
             widen("  vo = call.cap 6 10 (i32) -> (i32) vinst (vbad)\n"),
             &ALL,
-            &faults,
+            true,
         ),
         (
             "kill",
             widen("  vo = call.cap 6 12 (i32) -> (i32) vinst (vbad)\n"),
             &ALL,
-            &faults,
+            true,
         ),
         (
             "child_offer",
             widen("  vx = i64.const 0\n  vo = call.cap 6 14 (i32, i64) -> (i32) vinst (vbad, vx)\n"),
             &OFFERING,
-            &einval,
+            false,
         ),
         (
             "grant",
@@ -795,11 +826,16 @@ fn a_spent_or_forged_handle_gets_the_oracles_answer_from_every_child_op() {
                 "  vgh = i64.extend_i32_s vout\n  vo = call.cap 6 19 (i32, i64) -> (i32) vinst (vbad, vgh)\n",
             ),
             &ALL,
-            &einval,
+            false,
         ),
     ];
-    for (handle, prelude) in &spend {
-        for (op, call, drivers, want) in &ops {
+    for (handle, prelude, spent) in &spend {
+        for (op, call, drivers, ebadf_when_spent) in &ops {
+            let want = match (ebadf_when_spent, spent) {
+                (true, true) => &ebadf,
+                (true, false) => &faults,
+                (false, _) => &einval,
+            };
             handles_agree(
                 drivers,
                 &format!("{op} on a {handle} handle"),
@@ -810,20 +846,33 @@ fn a_spent_or_forged_handle_gets_the_oracles_answer_from_every_child_op() {
     }
 }
 
-/// #2378 — a handle past the table that the mask folds onto a live child names that child for every
-/// op, as for `join` ([`a_handle_masks_onto_the_table`]): `detach(5)` detaches child 1, so its own
-/// handle is spent after.
+/// #2043 — a spent slot is reissued at its next generation: a fourth child spawned after child 1 is
+/// detached takes slot 1, so its handle is that slot's second, and child 1's own handle stays spent
+/// rather than naming the newcomer. Its value is `handle * 1000 + join`.
 #[test]
-fn a_masked_handle_detaches_the_child_it_names() {
-    let ops = format!(
-        "  vn = i32.const 5\n  vd = call.cap 6 10 (i32) -> (i32) vinst (vn)\n{}",
-        join("vr", "vh1")
+fn a_spent_slot_is_reissued_at_its_next_generation() {
+    let detach_then_spawn = format!(
+        "  vd = call.cap 6 10 (i32) -> (i32) vinst (vh1)\n{}",
+        spawn_into("vh3", 20480 + 24, 103)
     );
+    let ops = format!(
+        "{detach_then_spawn}{}  vk = i64.extend_i32_s vh3\n  vt = i64.const 1000\n  \
+         vkt = i64.mul vk vt\n  vr = i64.add vkt vj\n",
+        join("vj", "vh3")
+    );
+    let reissued = temen_ir::handles::pack(1, 2) as i64;
     handles_agree(
         &ALL,
-        "detach(5), then join child 1",
+        "detach child 1, spawn a fourth",
         &ops,
-        &trapped(Trap::ThreadFault),
+        &ok(reissued * 1000 + 103),
+    );
+    let ops = format!("{detach_then_spawn}{}", join_status("vr", "vh1"));
+    handles_agree(
+        &ALL,
+        "detach child 1, spawn a fourth, join child 1",
+        &ops,
+        &ok(temen_ir::errno::EBADF),
     );
 }
 
@@ -1165,10 +1214,10 @@ block 0 (v0: i64) {
   vz = i64.const 0
   va = i64.const 10
   vt1 = thread.spawn 1 vz va
-  vj1 = thread.join vt1
+  vj1_st, vj1 = thread.join vt1
   vb = i64.const 20
   vt2 = thread.spawn 1 vz vb
-  vj2 = thread.join vt2
+  vj2_st, vj2 = thread.join vt2
   vr = i64.add vj1 vj2
   return vr
   }
@@ -1212,7 +1261,7 @@ fn a_detached_childs_threads_are_capped_by_its_budget() {
 const JOIN_JOIN: &str = "\
   j1s, j1 = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   j2s, j2 = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
-  return j2
+  return j2s
   }
 }
 ";
@@ -1272,7 +1321,7 @@ fn join_answers_how_a_detached_child_ended() {
         "a second join of a child that trapped",
         &module(&detached_then(false, JOIN_JOIN)),
         &detached_fuel_setup(&loops, PAYLOAD / 2),
-        &trapped(Trap::ThreadFault),
+        &ok(temen_ir::errno::EBADF),
     );
 }
 
@@ -1353,7 +1402,7 @@ const POLL_THEN_KILL_JOIN: &str = "\
 const DETACH_JOIN: &str = "\
   d1 = call.cap 6 10 (i32) -> (i32) vinst (vch)
   jr_st, jr = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
-  return jr
+  return jr_st
   }
 }
 ";
@@ -1363,7 +1412,7 @@ const DETACH_JOIN: &str = "\
 /// - a kill ends a child that would spin forever, and its `join` answers `THREAD_FAULT` (a kill that
 ///   did nothing would run the child into its node's fuel ceiling: `OUT_OF_FUEL`);
 /// - `poll` on a child that returned answers 1, and leaves it for its `join`;
-/// - `detach` spends the handle, so a `join` after it is a `ThreadFault`;
+/// - `detach` spends the handle, so a `join` after it answers `-EBADF` (#2667);
 /// - a kill of a child that has ended does nothing: its `join` still gets its value.
 #[test]
 fn poll_detach_and_kill_answer_on_every_driver() {
@@ -1392,7 +1441,7 @@ fn poll_detach_and_kill_answer_on_every_driver() {
             DETACH_JOIN.into(),
             &loops,
             -1,
-            trapped(Trap::ThreadFault),
+            ok(temen_ir::errno::EBADF),
         ),
         (
             "poll until it ends, kill, join",
@@ -1477,7 +1526,7 @@ fn a_child_live_at_the_runs_end_hands_its_window_back() {
     let setup = detached_setup(&child, 1 << 15);
     for d in ALL {
         let (ran, held) = run_on_then(d, &m, &setup, &budget_held).expect("runs");
-        assert_eq!(ran, ok(0), "{d:?}");
+        assert_eq!(ran, ok(temen_ir::handles::pack(0, 1) as i64), "{d:?}");
         assert_eq!(held, (0, 0), "{d:?}: the run's end left the child charged");
     }
 }
@@ -1498,7 +1547,7 @@ block 0 (vas: i32) {
   vown = i64.load voff
   vz = i64.const 0
   vt = thread.spawn 1 vz voff
-  vth = thread.join vt
+  vth_st, vth = thread.join vt
   vk = i64.const 1000
   vhi = i64.mul vown vk
   vsum = i64.add vhi vth
@@ -1770,5 +1819,120 @@ fn a_live_call_to_a_serving_child_parks_until_the_child_serves_it() {
         &m,
         &setup,
         &ok(142),
+    );
+}
+
+/// A parent `(i32 inst, i32 module, i32 budget, i32 out) -> i64` that runs `first` (block 0, with
+/// the record's handles stored), spawns 1,024 threads of func 1, which returns its argument, and
+/// then runs `full`, which closes the function. `first` spawns from the record at [`REC_AT`]
+/// ([`payload_rec`]) as `rp`, `full` as `rp3`; its child returns the word at 20480, 7.
+fn fill_with_threads(first: &str, full: &str) -> String {
+    format!(
+        "memory 17
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vmod: i32, vbud: i32, vout: i32) {{
+{h}  pa = i64.const 20480
+  pw = i64.const 7
+  i64.store pa pw
+  ap = i64.const {args_at}
+  i64.store ap pa
+  rp = i64.const {REC_AT}
+{first}  vzero = i32.const 0
+  br 1(vinst, vzero)
+}}
+block 1 (vinst1: i32, vi: i32) {{
+  vcap = i32.const 1024
+  vdone = i32.eq vi vcap
+  br_if vdone 3(vinst1) 2(vinst1, vi)
+}}
+block 2 (vinst2: i32, vi2: i32) {{
+  vsp = i64.const 0
+  va = i64.const 5
+  vt = thread.spawn 1 vsp va
+  vone = i32.const 1
+  vi3 = i32.add vi2 vone
+  br 1(vinst2, vi3)
+}}
+block 3 (vinst3: i32) {{
+  rp3 = i64.const {REC_AT}
+{full}}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  return varg
+  }}
+}}
+{seg}",
+        h = store_handles(),
+        args_at = REC_AT + 32, // the record's args pointer (`temen_ir::SpawnRec`)
+        seg = rec::segment(REC_AT, &payload_rec()),
+    )
+}
+
+/// #2043 (D1) — threads and §14 children share their domain's one table of 1,024. Once 1,024
+/// threads fill it, an op-17 spawn answers `-EMFILE` and takes nothing: after one thread's join
+/// frees a slot, a budget of exactly one child window still funds the spawn. Every thread is then
+/// joined. The parent returns `refusal * 1000 + the child's 7`.
+#[test]
+fn a_child_spawn_into_a_table_full_of_threads_answers_emfile() {
+    let m = module(&fill_with_threads(
+        "",
+        "  vrefused = call.cap 6 17 (i64) -> (i32) vinst3 (rp3)
+  vt0 = i32.const 1024
+  vs0, vv0 = thread.join vt0
+  vch = call.cap 6 17 (i64) -> (i32) vinst3 (rp3)
+  vcs, vcv = call.cap 6 1 (i32) -> (i64, i64) vinst3 (vch)
+  vone3 = i32.const 1
+  br 4(vrefused, vcv, vone3)
+}
+block 4 (vr4: i32, vc4: i64, vj: i32) {
+  vcap4 = i32.const 1024
+  vend = i32.eq vj vcap4
+  br_if vend 6(vr4, vc4) 5(vr4, vc4, vj)
+}
+block 5 (vr5: i32, vc5: i64, vj5: i32) {
+  vgen1 = i32.const 1024
+  vth = i32.or vgen1 vj5
+  vs5, vv5 = thread.join vth
+  vone5 = i32.const 1
+  vj6 = i32.add vj5 vone5
+  br 4(vr5, vc5, vj6)
+}
+block 6 (vr6: i32, vc6: i64) {
+  vr64 = i64.extend_i32_s vr6
+  vk = i64.const 1000
+  vrk = i64.mul vr64 vk
+  vsum = i64.add vrk vc6
+  return vsum
+  }
+",
+    ));
+    let child = module(CHILD_RETURNS_PAYLOAD);
+    let setup = detached_setup(&child, 1 << 15);
+    agree_on_every_driver(
+        "1,024 threads, then a child",
+        &m,
+        &setup,
+        &ok(temen_ir::errno::EMFILE * 1000 + 7),
+    );
+}
+
+/// And the other way round: a §14 child holds slot 0 and 1,023 threads the rest, so the next
+/// `thread.spawn` traps `ThreadFault`, as one past its node's `spawn` ceiling does (#2001).
+#[test]
+fn a_thread_spawn_into_a_full_table_traps() {
+    let m = module(&fill_with_threads(
+        "  vch = call.cap 6 17 (i64) -> (i32) vinst (rp)\n",
+        "  vr = i64.const 0
+  return vr
+  }
+",
+    ));
+    let child = module(CHILD_RETURNS_PAYLOAD);
+    let setup = detached_setup(&child, 1 << 15);
+    agree_on_every_driver(
+        "a child, then 1,024 threads",
+        &m,
+        &setup,
+        &trapped(Trap::ThreadFault),
     );
 }

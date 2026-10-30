@@ -85,7 +85,7 @@ fn guest(w: usize, n: i64, stores: usize) -> String {
         ));
     }
     for i in 0..w {
-        s.push_str(&format!("  vj{i} = thread.join vh{i}\n"));
+        s.push_str(&format!("  vj{i}_st, vj{i} = thread.join vh{i}\n"));
     }
     s.push_str("  vrc = i32.const 0\n  return vrc\n  }\n}\n");
     s.push_str(&worker(stores));

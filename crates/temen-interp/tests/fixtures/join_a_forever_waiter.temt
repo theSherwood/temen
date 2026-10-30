@@ -4,7 +4,7 @@ block 0 () {
   vz = i64.const 0
   va = i64.const 131072
   vchild = thread.spawn 1 vz va
-  vst = thread.join vchild
+  vst_st, vst = thread.join vchild
   return vst
   }
 }

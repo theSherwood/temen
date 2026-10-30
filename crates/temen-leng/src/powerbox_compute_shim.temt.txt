@@ -511,18 +511,26 @@ block 4 (v0: i64, v1: i32) {
 func (i64, i64) -> (i32) {
 block 0 (v0: i64, v1: i64) {
   v2 = i32.wrap_i64 v0
-  v3 = thread.join v2
-  v4 = i64.eqz v1
-  br_if v4 1() 2(v1, v3)
+  v3_st, v3 = thread.join v2
+  v4 = i64.eqz v3_st
+  br_if v4 1(v1, v3) 3()
   }
-block 1 () {
-  v0 = i32.const 0
-  return v0
+block 1 (v0: i64, v1: i64) {
+  v2 = i64.eqz v0
+  br_if v2 4() 2(v0, v1)
   }
 block 2 (v0: i64, v1: i64) {
   i64.store v0 v1
   v2 = i32.const 0
   return v2
+  }
+block 3 () {
+  v0 = i32.const 3
+  return v0
+  }
+block 4 () {
+  v0 = i32.const 0
+  return v0
   }
 }
 func (i64) -> () {

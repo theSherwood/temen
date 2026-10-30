@@ -153,7 +153,7 @@ fn compile_refuses_concurrent_module() {
          block 0 () {\n\
          \x20 v0 = i64.const 5\n\
          \x20 v1 = thread.spawn 1 v0 v0\n\
-         \x20 v2 = thread.join v1\n\
+         \x20 v2_st, v2 = thread.join v1\n\
          \x20 return\n\
            }\n\
          }\n\

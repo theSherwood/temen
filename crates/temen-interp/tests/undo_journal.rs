@@ -420,7 +420,7 @@ block 1 (vth1: i32, vc: i64) {{
   br_if vup 2(vth1, vc1) 1(vth1, vc1)
 }}
 block 2 (vth2: i32, vc2: i64) {{
-  vr = thread.join vth2
+  vr_st, vr = thread.join vth2
   vk = i64.const 1000
   vm = i64.mul vc2 vk
   vsum = i64.add vm vr
@@ -992,7 +992,7 @@ block 2 (vh2: i32, vk2: i64) {
   br 1(vh2, vn2)
 }
 block 3 (vh3: i32) {
-  vj3 = thread.join vh3
+  vj3_st, vj3 = thread.join vh3
   va3 = i64.const 131080
   vr3 = i64.load va3
   return vr3

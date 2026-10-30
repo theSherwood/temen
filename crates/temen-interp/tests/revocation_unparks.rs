@@ -30,7 +30,7 @@ block 0 (v0: i32) {
   vbuf = i64.const 16392
   vcap = i64.const 4
   vr = call.cap 0 0 (i64, i64) -> (i64) v0 (vbuf, vcap)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   return vr
   }
 }
@@ -108,7 +108,7 @@ block 0 (v0: i32, v1: i32) {
   vbuf = i64.const 16392
   vcap = i64.const 4
   vr = call.cap 0 0 (i64, i64) -> (i64) v0 (vbuf, vcap)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   return vr
   }
 }
