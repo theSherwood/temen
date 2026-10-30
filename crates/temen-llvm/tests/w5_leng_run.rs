@@ -10,8 +10,8 @@
 //! - the fixture depends on `temen-leng` with `default-features = false`, so float literals fail closed
 //!   and the module carries no `flt2dec`/`dec2flt` — the u128/vector float intrinsics the on-ramp does
 //!   not yet lower (`llvm.fshl.v4i32`); and
-//! - `build-std-features=panic_immediate_abort` collapses panics to `abort`, so no float *formatter* is
-//!   pulled in for panic messages either.
+//! - `-Cpanic=immediate-abort` collapses panics to `abort`, so no float *formatter* is pulled in for
+//!   panic messages either.
 //!
 //! The Leng module translated is a fixed integer program (`main() -> 3 + 4*2`); the translator itself —
 //! nif parse, the `Translator`, `String`/`Vec`/`HashMap`-driven TEMEN-text emission — is the real crate.

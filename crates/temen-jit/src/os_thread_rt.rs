@@ -41,7 +41,7 @@
 //! return through the freeze re-issue machinery instead (the sentinel is skipped).
 
 use crate::fiber_rt::{self, FiberCallTramp, FiberRuntime, SharedFiberTable};
-use crate::{mem, FnEntry, TrapKind};
+use crate::{mem, slot_record, TrapKind};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -1947,8 +1947,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     let dom = current_domain(sched);
     let hub = dom.hub();
     let env = dom.env();
-    let entry = (env.fn_table_base as *const FnEntry).add(func_idx as usize);
-    let code = (*entry).code();
+    let code = slot_record(env.fn_table_base as *const _, func_idx as usize).code();
     // Durable freeze/thaw in progress (slice 3.3): the run is **single-worker** while the window
     // state ≠ NORMAL (mirroring the interp's `workers=1`), so don't start an OS thread — *defer* the
     // child (record it, return its handle) and run it inline after the spawning vCPU yields
@@ -2472,14 +2471,14 @@ impl Domain {
             if !std::ptr::eq(self.hub(), self) {
                 lock(&self.hub().threads).live += 1;
             }
-            let entry = (env.fn_table_base as *const FnEntry).add(v.func as u32 as usize);
+            let entry = slot_record(env.fn_table_base as *const _, v.func as u32 as usize);
             runs.push(Run {
                 task: v.task as u64,
                 parent: v.parent_task as u64,
                 slot: v.slot,
                 func_idx: v.func as u32,
                 ctx: self.shadow().ctx_of_sp(v.shadow_sp),
-                code: (*entry).code(),
+                code: entry.code(),
                 sp: v.args.first().copied().unwrap_or(0) as u64,
                 arg: v.args.get(1).copied().unwrap_or(0) as u64,
                 shadow_sp: v.shadow_sp,

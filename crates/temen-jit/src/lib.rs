@@ -56,9 +56,9 @@
 //! (results…)` (the `tail` call conv, so `return_call` works); the two context
 //! pointers are threaded through every call. The entry is wrapped in a fixed
 //! buffer-ABI trampoline `fn(args: *const i64, results: *mut i64, mem_base: *mut u8,
-//! fn_table_base: *const FnEntry)` so [`compile_and_run`] can call any arity from Rust.
+//! fn_table_base: *const *const FnRecord)` so [`compile_and_run`] can call any arity from Rust.
 
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{
     F32, F32X4, F64, F64X2, I16, I16X8, I32, I32X4, I64, I64X2, I8, I8X16,
@@ -75,7 +75,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, ModuleReloc};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use temen_ir::bounds::{in_window, ub_at, ub_of, UB_TOP};
 use temen_ir::cap_id;
 use temen_ir::{
@@ -281,64 +281,223 @@ const MAX_JIT_RESERVED_LOG2: u8 = 40; // 1 TiB of reserved VA (lazy)
 /// region. **Must match `temen_interp`'s `SNAP_CAP`** so both backends snapshot the same span.
 const SNAP_CAP: usize = 1 << 18; // 256 KiB
 
-/// A function-table entry (§3c `FnEntry`): host-owned, guest-unwritable. `type_id`
-/// identifies the signature (distinct-`FuncType` index); `code` is the finalized
-/// function address. `call.dyn` masks the guest index into the table, checks
-/// `type_id` (offset 0), then calls `code` (offset 8) — confinement at the use site (invariant I2).
-///
-/// The fields are **atomic** so a guest-driven `install`/`uninstall` (a host-side write) is sound
-/// against a *concurrent* `call.dyn` from another thread (DESIGN.md §22 threaded install). The
-/// `#[repr(C)]` layout (`type_id` @0, `code` @8) is exactly what [`indirect_dispatch`] bakes its
-/// loads against, unchanged. Two distinct guarantees, both platform-uniform:
-/// - **Visibility** (a synchronized reader sees a complete install) rides the **guest's own**
-///   acquire/release — the worker only dispatches a slot it learned about through a guest atomic, so
-///   the install's stores are ordered-before the worker's dispatch loads via that synchronization,
-///   on weakly-ordered targets too. The dispatch's own plain loads need no acquire. `publish` still
-///   stores `code` before `type_id` (release-ordered) as belt-and-suspenders for a reader that
-///   happens to synchronize on `type_id` directly.
-/// - **No torn pointer** (a *racy* reader never sees a half-written `code`): each field is a single
-///   atomic word, so a concurrent dispatch reads either the old or the new value — never a wild
-///   pointer. A racy reinstall is the guest's own bug and is contained (trap), never an escape.
+/// One function the `call.dyn` table can name (§3c): its signature's id (a distinct-`FuncType`
+/// index) and its finalized code. **Immutable** from the moment a slot can point at it, so a dispatch
+/// reads one record's `type_id` and `code` together, never one install's type id with another's code
+/// (#2680). `call.dyn` checks `type_id` (offset 0), then calls `code` (offset 8): the layout
+/// [`indirect_dispatch`] loads against.
 #[repr(C)]
-pub(crate) struct FnEntry {
-    type_id: AtomicU32,
+pub(crate) struct FnRecord {
+    type_id: u32,
     _pad: u32,
-    code: AtomicU64,
+    code: u64,
 }
 
-impl FnEntry {
-    /// A real/installed entry.
-    pub(crate) fn new(type_id: u32, code: u64) -> FnEntry {
-        FnEntry {
-            type_id: AtomicU32::new(type_id),
+impl FnRecord {
+    fn new(type_id: u32, code: u64) -> FnRecord {
+        FnRecord {
+            type_id,
             _pad: 0,
-            code: AtomicU64::new(code),
+            code,
         }
     }
-    /// A trapping padding entry (`call.dyn` here is inert).
-    pub(crate) fn padding() -> FnEntry {
-        FnEntry::new(PADDING_TYPE_ID, 0)
-    }
-    /// The slot's signature id (the host-side bookkeeping read; the hot dispatch read is in
-    /// generated code). `Acquire` pairs with [`Self::publish`]'s release of `type_id`.
+    /// The signature id a `call.dyn` of it must name.
     pub(crate) fn type_id(&self) -> u32 {
-        self.type_id.load(Ordering::Acquire)
+        self.type_id
     }
-    /// The slot's code pointer (host-side bookkeeping read).
+    /// The function's code address.
     pub(crate) fn code(&self) -> u64 {
-        self.code.load(Ordering::Acquire)
+        self.code
     }
-    /// **Publish** an installed function: `code` first, then `type_id` (release-ordered), so a
-    /// concurrent reader that sees the new `type_id` also sees the new `code`.
-    pub(crate) fn publish(&self, type_id: u32, code: u64) {
-        self.code.store(code, Ordering::Release);
-        self.type_id.store(type_id, Ordering::Release);
+}
+
+/// The record of a slot that holds no function (the power-of-two padding, a reserved slot, an
+/// uninstalled one): its type id matches no call site, so a `call.dyn` of it always traps before its
+/// code is read.
+static PADDING: FnRecord = FnRecord {
+    type_id: PADDING_TYPE_ID,
+    _pad: 0,
+    code: 0,
+};
+
+/// The function table `call.dyn` dispatches through (§3c): host-owned, guest-unwritable, one slot per
+/// index, each the address of an immutable [`FnRecord`]. `call.dyn` masks the guest index into it,
+/// loads the slot, checks the record's type id, then calls its code: confinement at the use site
+/// (invariant I2).
+///
+/// A guest-driven `install`/`uninstall` (DESIGN.md §22 threaded install) changes a slot with **one
+/// release store of a record's address**, so it is sound against a concurrent `call.dyn` from another
+/// thread. The dispatch reads the slot once and reads the record through the address it read, an
+/// address dependency that orders those reads after the record's initialization on every target
+/// (x86's TSO, Arm's dependency ordering). So a racy reader calls either the old function or the new
+/// one under its own type check, never a pair of them (#2680). Visibility of a fresh install still
+/// rides the guest's own acquire/release: a worker dispatches a slot it learned about through a guest
+/// atomic.
+pub(crate) struct FnTable {
+    /// The slots, boxed so their address never moves: running code holds it.
+    slots: Box<[AtomicPtr<FnRecord>]>,
+    /// What the slots point at, shared with every instance of the same code (`instance`).
+    records: Arc<FnRecords>,
+}
+
+/// The records a table's slots may point at, besides [`PADDING`]. None is freed while a table that
+/// can name it lives: a racing dispatch may read a record after its slot has moved on.
+struct FnRecords {
+    /// The module's own functions, slot `i` = function `i`.
+    own: Box<[FnRecord]>,
+    /// Installed units, one per `(type_id, code)`, so reinstalling a unit allocates nothing and the
+    /// records grow only with the code the guest compiled.
+    installed: Mutex<HashMap<(u32, u64), Box<FnRecord>>>,
+}
+
+impl FnTable {
+    /// A table of `len` slots naming the module's `own` functions, then padding.
+    fn new(own: Vec<FnRecord>, len: usize) -> FnTable {
+        let records = Arc::new(FnRecords {
+            own: own.into_boxed_slice(),
+            installed: Mutex::new(HashMap::new()),
+        });
+        let slots = (0..len)
+            .map(|i| {
+                let r = records.own.get(i).unwrap_or(&PADDING);
+                AtomicPtr::new(r as *const FnRecord as *mut FnRecord)
+            })
+            .collect();
+        FnTable { slots, records }
     }
-    /// **Clear** to trapping padding: `type_id` (the ready field) first so a new dispatch traps
-    /// promptly, then zero `code`.
-    pub(crate) fn clear(&self) {
-        self.type_id.store(PADDING_TYPE_ID, Ordering::Release);
-        self.code.store(0, Ordering::Relaxed);
+
+    /// The address running code dispatches through (`fn_table_base`).
+    pub(crate) fn base(&self) -> *const core::ffi::c_void {
+        self.slots.as_ptr() as *const core::ffi::c_void
+    }
+
+    /// The record slot `slot` names now.
+    fn record(&self, slot: usize) -> &FnRecord {
+        // SAFETY: the table outlives the borrow, and every slot points at `PADDING` or a record in
+        // `self.records`, which outlives it too.
+        unsafe { slot_record(self.base(), slot) }
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The slots that hold no function, in order: where an install may go.
+    fn free_slots(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.len()).filter(|&i| self.record(i).type_id() == PADDING_TYPE_ID)
+    }
+
+    /// Point `slot` at the record of `code` with signature `type_id`, made once per pair.
+    fn publish(&self, slot: usize, type_id: u32, code: u64) {
+        let mut installed = self
+            .records
+            .installed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let r: &FnRecord = installed
+            .entry((type_id, code))
+            .or_insert_with(|| Box::new(FnRecord::new(type_id, code)));
+        self.slots[slot].store(r as *const FnRecord as *mut FnRecord, Ordering::Release);
+    }
+
+    /// Point `slot` back at the padding record, so a stale `call.dyn` of it traps.
+    fn clear(&self, slot: usize) {
+        self.slots[slot].store(
+            &PADDING as *const FnRecord as *mut FnRecord,
+            Ordering::Release,
+        );
+    }
+
+    /// A copy for a new instance of the same code: its own slots, naming the same records.
+    fn instance(&self) -> FnTable {
+        let slots = self
+            .slots
+            .iter()
+            .map(|s| AtomicPtr::new(s.load(Ordering::Acquire)))
+            .collect();
+        FnTable {
+            slots,
+            records: Arc::clone(&self.records),
+        }
+    }
+}
+
+/// The records of a compile's own functions, slot `i` = function `i`, each with the finalized address
+/// of its code (`ids[i]`).
+fn own_records(
+    funcs: &[Func],
+    distinct: &[FuncType],
+    module: &JITModule,
+    ids: &[FuncId],
+) -> Vec<FnRecord> {
+    funcs
+        .iter()
+        .zip(ids)
+        .map(|(f, &id)| {
+            let ty = FuncType {
+                params: f.params.clone(),
+                results: f.results.clone(),
+            };
+            FnRecord::new(
+                type_id_of(distinct, &ty),
+                module.get_finalized_function(id) as u64,
+            )
+        })
+        .collect()
+}
+
+/// The record slot `slot` of the table at `base` names now: the host-side read of a slot, for a
+/// runtime that holds only the base (`thread.spawn`, `cont.new`). One load, like the dispatch's.
+///
+/// # Safety
+/// `base` is a live [`FnTable`]'s [`FnTable::base`] and `slot` is below its length; the borrow does
+/// not outlive the table.
+pub(crate) unsafe fn slot_record<'a>(base: *const core::ffi::c_void, slot: usize) -> &'a FnRecord {
+    &*(*(base as *const AtomicPtr<FnRecord>).add(slot)).load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+mod fn_table_tests {
+    use super::*;
+
+    /// #2680 — a reader of a slot pairs one install's type id with that install's code, whatever
+    /// happens to the slot after it read it: it read the address of a record, and records never
+    /// change. The two-field entry this replaced failed exactly this: a type id read before an
+    /// uninstall and an install of another type, and a code pointer read after, named two functions.
+    #[test]
+    fn a_reader_sees_one_install_whatever_reuses_its_slot() {
+        let t = FnTable::new(vec![FnRecord::new(0, 0x1000)], 4);
+        t.publish(1, 7, 0x2000);
+        let read = t.record(1);
+        t.clear(1);
+        t.publish(1, 9, 0x3000);
+        assert_eq!((read.type_id(), read.code()), (7, 0x2000));
+        let now = t.record(1);
+        assert_eq!((now.type_id(), now.code()), (9, 0x3000));
+    }
+
+    /// Reinstalling a unit makes no new record, so a guest that loops install and uninstall grows no
+    /// host memory: records grow only with the code it compiled.
+    #[test]
+    fn reinstalling_a_unit_reuses_its_record() {
+        let t = FnTable::new(Vec::new(), 4);
+        t.publish(0, 7, 0x2000);
+        let first = t.record(0) as *const FnRecord;
+        t.clear(0);
+        assert_eq!(t.record(0).type_id(), PADDING_TYPE_ID);
+        t.publish(2, 7, 0x2000);
+        assert_eq!(t.record(2) as *const FnRecord, first);
+        assert_eq!(t.records.installed.lock().unwrap().len(), 1);
+    }
+
+    /// An instance's table names the same records, which live as long as the last table that can.
+    #[test]
+    fn an_instance_shares_its_records() {
+        let t = FnTable::new(vec![FnRecord::new(0, 0x1000)], 2);
+        let i = t.instance();
+        drop(t);
+        assert_eq!((i.record(0).type_id(), i.record(0).code()), (0, 0x1000));
+        assert_eq!(i.record(1).type_id(), PADDING_TYPE_ID);
     }
 }
 
@@ -2856,9 +3015,9 @@ pub struct VarMachineInfo {
 
 pub struct CompiledModule {
     /// The padded function table `call.dyn` dispatches through. Its address is threaded as
-    /// a runtime argument (not baked), but running code reads it — boxed so it never moves, and
+    /// a runtime argument (not baked), but running code reads it — its slots never move, and it is
     /// declared before `module` so drop order matches the old `drop(fn_table); drop(module)`.
-    fn_table: Box<[FnEntry]>,
+    fn_table: FnTable,
     /// The entry's buffer-ABI trampoline (finalized code, owned by `module`).
     tramp_code: *const u8,
     /// D66 — the entry's **limit-taking** trampoline (`build_trampoline(.., with_limit = true)`), the
@@ -3987,24 +4146,10 @@ impl CompiledModule {
         }
 
         // Build the function table (§3c) now that code addresses are known: power-of-two
-        // padded (to `table_len`, possibly B2-reserved beyond the module), AoS, host-owned.
+        // padded (to `table_len`, possibly B2-reserved beyond the module), host-owned.
         // `call.dyn` masks the guest index into this; padding/reserved slots trap until
         // `install` fills them.
-        let fn_table: Box<[FnEntry]> = (0..table_len)
-            .map(|slot| match m.funcs.get(slot) {
-                Some(f) => FnEntry::new(
-                    type_id_of(
-                        &distinct,
-                        &FuncType {
-                            params: f.params.clone(),
-                            results: f.results.clone(),
-                        },
-                    ),
-                    module.get_finalized_function(ids[slot]) as u64,
-                ),
-                None => FnEntry::padding(),
-            })
-            .collect();
+        let fn_table = FnTable::new(own_records(&m.funcs, &distinct, &module, &ids), table_len);
 
         let tramp_code = module.get_finalized_function(tramp);
         // I36 slice 3: resolve the handler trampolines now that code is finalized.
@@ -4337,11 +4482,7 @@ impl CompiledModule {
             hosted: self.hosted,
             nests: self.nests,
             page: self.page,
-            fn_table: self
-                .fn_table
-                .iter()
-                .map(|e| FnEntry::new(e.type_id(), e.code()))
-                .collect(),
+            fn_table: self.fn_table.instance(),
             tramp_code: self.tramp_code,
             tramp_code_limited: self.tramp_code_limited,
             serve_tramps: self.serve_tramps.clone(),
@@ -4636,7 +4777,7 @@ impl CompiledModule {
         let (fn_table_ptr, live, caller_window, reserved) = {
             let t = &*this;
             (
-                t.fn_table.as_ptr() as *const core::ffi::c_void,
+                t.fn_table.base(),
                 t.live_fault_range,
                 t.caller_window,
                 t.win_reserved,
@@ -4796,7 +4937,7 @@ impl CompiledModule {
             // protected and set rewinding by the fork (`ForkPoint::twin`), so none of the fresh
             // window's seeding below applies.
             let t = &*this;
-            let fn_table_ptr = t.fn_table.as_ptr() as *const core::ffi::c_void;
+            let fn_table_ptr = t.fn_table.base();
             (twin.window, t.win_mapped, t.mask, fn_table_ptr)
         } else {
             let t = &mut *this;
@@ -4837,7 +4978,7 @@ impl CompiledModule {
                 let sp_word = window.base().add(t.shadow.region_base(0) as usize) as *mut u64;
                 sp_word.write_unaligned(t.shadow.frame_base(0));
             }
-            let fn_table_ptr = t.fn_table.as_ptr() as *const core::ffi::c_void;
+            let fn_table_ptr = t.fn_table.base();
             (window, win_size, t.mask, fn_table_ptr)
         };
 
@@ -5401,10 +5542,8 @@ impl CompiledModule {
         let ref_slots: Option<Vec<u32>> = if funcs.iter().any(Func::names_own_funcs) {
             let free: Vec<u32> = self
                 .fn_table
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.type_id() == PADDING_TYPE_ID)
-                .map(|(i, _)| i as u32)
+                .free_slots()
+                .map(|i| i as u32)
                 .take(funcs.len())
                 .collect();
             if free.len() < funcs.len() {
@@ -5720,17 +5859,14 @@ impl CompiledModule {
     /// padding slot, returning that slot index — a funcref the guest (or another unit) can
     /// `call.dyn` at native speed (old→new / new→new). `None` if the table is full (every
     /// reserved slot taken). The base never moves (the table was pre-reserved at compile, the
-    /// mask is a baked constant), so this is just a slot write. The write is **release-ordered and
-    /// atomic** ([`FnEntry::publish`]), so it is sound against a concurrent `call.dyn` from
-    /// another thread — the JIT §6 #2 threaded-install path — not only the single-threaded MVP.
+    /// mask is a baked constant), so this is just a slot write: one release store of the function's
+    /// immutable record ([`FnTable::publish`]), sound against a concurrent `call.dyn` from another
+    /// thread — the JIT §6 #2 threaded-install path — not only the single-threaded MVP.
     /// Takes `&self`: the running generated code reads the table through raw pointers, so the host
     /// install must not claim a Rust exclusive borrow over it.
     pub fn install(&self, code: *const u8, type_id: u32) -> Option<u32> {
-        let slot = self
-            .fn_table
-            .iter()
-            .position(|e| e.type_id() == PADDING_TYPE_ID)?;
-        self.fn_table[slot].publish(type_id, code as u64);
+        let slot = self.fn_table.free_slots().next()?;
+        self.fn_table.publish(slot, type_id, code as u64);
         Some(slot as u32)
     }
 
@@ -5745,10 +5881,10 @@ impl CompiledModule {
         if i < self.n_real_funcs || i >= self.fn_table.len() {
             return false;
         }
-        if self.fn_table[i].type_id() == PADDING_TYPE_ID {
+        if self.fn_table.record(i).type_id() == PADDING_TYPE_ID {
             return false; // already empty
         }
-        self.fn_table[i].clear();
+        self.fn_table.clear(i);
         true
     }
 
@@ -5766,10 +5902,10 @@ impl CompiledModule {
         if i < self.n_real_funcs || i >= self.fn_table.len() {
             return false;
         }
-        if self.fn_table[i].type_id() != PADDING_TYPE_ID {
+        if self.fn_table.record(i).type_id() != PADDING_TYPE_ID {
             return false; // occupied — install_at never overwrites a live slot
         }
-        self.fn_table[i].publish(type_id, code as u64);
+        self.fn_table.publish(i, type_id, code as u64);
         true
     }
 
@@ -5780,12 +5916,10 @@ impl CompiledModule {
     /// fresh module with [`Self::install_at`]. Real module-function slots (`< n_real_funcs`) are
     /// excluded — they are reproduced by `compile` itself, not by the driver.
     pub fn installed_slots(&self) -> Vec<(u32, u64, u32)> {
-        self.fn_table
-            .iter()
-            .enumerate()
-            .skip(self.n_real_funcs)
-            .filter(|(_, e)| e.type_id() != PADDING_TYPE_ID)
-            .map(|(i, e)| (i as u32, e.code(), e.type_id()))
+        (self.n_real_funcs..self.fn_table.len())
+            .map(|i| (i, self.fn_table.record(i)))
+            .filter(|(_, r)| r.type_id() != PADDING_TYPE_ID)
+            .map(|(i, r)| (i as u32, r.code(), r.type_id()))
             .collect()
     }
 
@@ -5866,7 +6000,7 @@ pub unsafe fn invoke_handler(
     vmctx: *const VmCtx,
 ) {
     let cc = cc as *const CompiledModule;
-    let fn_table_ptr = (*cc).fn_table.as_ptr() as *const core::ffi::c_void;
+    let fn_table_ptr = (*cc).fn_table.base();
     let (lo, hi) = mem::fault_range_of(mem_base, mem_reserved as usize);
     vcpu_tls::set_serve_handlers(serve_handlers() + 1);
     let faulted = mem::run_guarded_range(
@@ -7635,21 +7769,7 @@ fn compile_child_windowed(
             None => (None, None),
         };
 
-    let fn_table: Box<[FnEntry]> = (0..table_len)
-        .map(|slot| match funcs.get(slot) {
-            Some(f) => FnEntry::new(
-                type_id_of(
-                    &distinct,
-                    &FuncType {
-                        params: f.params.clone(),
-                        results: f.results.clone(),
-                    },
-                ),
-                module.get_finalized_function(ids[slot]) as u64,
-            ),
-            None => FnEntry::padding(),
-        })
-        .collect();
+    let fn_table = FnTable::new(own_records(funcs, &distinct, &module, &ids), table_len);
 
     let code = module.get_finalized_function(tramp);
     let code_limited = module.get_finalized_function(tramp_limited);
@@ -11114,13 +11234,16 @@ fn indirect_dispatch(b: &mut FunctionBuilder, lower: &Lower, idx: Value, ty: &Fu
     let idx64 = b.ins().uextend(I64, idx);
     let m = b.ins().iconst(I64, lower.fn_table_mask as i64);
     let slot = b.ins().band(idx64, m);
-    // entry_addr = fn_table_base + slot * sizeof(FnEntry=16)
-    let off = b.ins().imul_imm(slot, 16);
+    // The slot holds its record's address (`FnTable`, 8 bytes a slot): one load, so the type id
+    // checked and the code called below are one record's, whatever an `install` on another thread
+    // does to the slot meanwhile (#2680).
+    let off = b.ins().imul_imm(slot, 8);
     let base = b.use_var(lower.fn_table_var);
-    let entry_addr = b.ins().iadd(base, off);
+    let slot_addr = b.ins().iadd(base, off);
+    let record = b.ins().load(I64, MemFlags::trusted(), slot_addr, 0);
 
     // type_id check against the call's expected id.
-    let tid = b.ins().load(I32, MemFlags::trusted(), entry_addr, 0);
+    let tid = b.ins().load(I32, MemFlags::trusted(), record, 0);
     let expected = type_id_of(lower.distinct, ty);
     let want = b.ins().iconst(I32, expected as i32 as i64);
     let cond = b.ins().icmp(IntCC::Equal, tid, want);
@@ -11133,7 +11256,7 @@ fn indirect_dispatch(b: &mut FunctionBuilder, lower: &Lower, idx: Value, ty: &Fu
     b.switch_to_block(matched);
     b.seal_block(matched);
     // code pointer at offset 8.
-    b.ins().load(I64, MemFlags::trusted(), entry_addr, 8)
+    b.ins().load(I64, MemFlags::trusted(), record, 8)
 }
 
 /// What a call's trap check follows (#2488), which decides the word it reads.
