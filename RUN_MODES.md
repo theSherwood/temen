@@ -88,7 +88,7 @@ The property rows are the columns' properties again.
 | is stopped and continued (job control) | ✅ | ✅ | ✅ | 🚧 | 🚧 | 🚧 | ✅ | ❔ | ✅ | ❔ | ❔ |
 | grows its window | ✅ | ✅ | ✅ | ✅ | ✅ | 🚧 | ✅ | ❔ | ✅ | ❔ | ❔ |
 | maps a shared region (§13) | ✅ | ✅ | ✅ | 🔶 | ✅ | 🔶 | ✅ | ❔ | ✅ | ❔ | ❔ |
-| compiles code at runtime (§22) | ✅ | ✅ | ✅ | ✅ | 🚧 | ✅ | ✅ | ❔ | 🚧 | ❔ | ❔ |
+| compiles code at runtime (§22) | ✅ | ✅ | ✅ | ✅ | 🚧 | ✅ | ✅ | ❔ | ✅ | ❔ | ❔ |
 | serves calls on its offer | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❔ | ✅ | ❔ | ❔ |
 
 ## Properties
@@ -154,7 +154,6 @@ The property rows are the columns' properties again.
 
 **compiles code at runtime (§22)**
 - *under a debugger* 🚧 — tree-walk interpreter: the tree-walk Inspector traps IndirectCallType at the installed unit's call.dyn (#2560)
-- *re-entered per frame* 🚧 — bytecode, one thread: Reactor::call gives a frame no room for a §22 install, so the unit's call.dyn traps IndirectCallType; coop_call sizes it by the Jit grant (#2661)
 
 **under a debugger**
 - *tree-walk interpreter* 🚧 — spawns a child domain (§14): the tree-walk Inspector runs one vCPU over the powerbox, or every vCPU over none, so a child's join blocks (#2560)
@@ -195,7 +194,6 @@ The property rows are the columns' properties again.
 **re-entered per frame**
 - *tree-walk interpreter* 🚧 — only the pump's reactor runs an embedder's powerbox: the tree-walker's and the JIT's are temen_run::Session, which runs a single-threaded on-ramp module, and executor 2 has none (#2662)
 - *bytecode, one thread* 🚧 — execs another image (exec_module): the frame that execs drops the reactor's window, so the next frame traps Malformed (#2660)
-- *bytecode, one thread* 🚧 — compiles code at runtime (§22): Reactor::call gives a frame no room for a §22 install, so the unit's call.dyn traps IndirectCallType; coop_call sizes it by the Jit grant (#2661)
 - *bytecode, thread per task* 🚧 — only the pump's reactor runs an embedder's powerbox: the tree-walker's and the JIT's are temen_run::Session, which runs a single-threaded on-ramp module, and executor 2 has none (#2662)
 - *Cranelift JIT* 🚧 — only the pump's reactor runs an embedder's powerbox: the tree-walker's and the JIT's are temen_run::Session, which runs a single-threaded on-ramp module, and executor 2 has none (#2662)
 
