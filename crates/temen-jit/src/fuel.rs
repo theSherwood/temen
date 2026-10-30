@@ -514,7 +514,7 @@ func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = i64.const 0
   v2 = thread.spawn 1 v1 v0
-  v3 = thread.join v2
+  v3_st, v3 = thread.join v2
   return v3
   }
 }

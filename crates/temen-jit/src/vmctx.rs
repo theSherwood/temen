@@ -359,7 +359,7 @@ block 0 (v0: i64) {
   v3 = cont.new v1 v2
   v4 = i64.const 0
   v5 = thread.spawn 1 v4 v3
-  v6 = thread.join v5
+  v6_st, v6 = thread.join v5
   return v6
   }
 }
