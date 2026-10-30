@@ -485,8 +485,8 @@ pub(crate) struct Nursery {
     grant_premap_admit: std::sync::atomic::AtomicUsize,
     grant_premap_stage: std::sync::atomic::AtomicUsize,
     grant_premap_apply: std::sync::atomic::AtomicUsize,
-    /// #1944 slice 3 — the installed [`crate::ChildBudgetNode`] (0 = none: detached children run
-    /// un-metered, and their threads uncharged).
+    /// #1944 slice 3 — the installed [`crate::ChildBudgetNode`] (0 = none: no hooks are installed, so
+    /// no detached child spawns).
     grant_budget_node: std::sync::atomic::AtomicUsize,
     /// #1854 — the installed child [`crate::HeldTail`] (0 = none).
     grant_held_tail: std::sync::atomic::AtomicUsize,
@@ -686,6 +686,11 @@ impl Nursery {
             .store(hooks.map_or(0, |h| h.grant as usize), Ordering::Release);
         self.grant_thunk.store(t, Ordering::Release);
         self.grant_parent_ctx.store(pc, Ordering::Release);
+        // #1991 — the run's pool holds no more workers than the host's driver has. A detached
+        // child's nursery shares the run's pool, and its host the run's worker count.
+        if let Some(h) = hooks {
+            self.child_exec.set_workers(h.workers);
+        }
     }
 
     /// #1234 — the parent host pointer to hand a §14 child hook: the one **registered with the
@@ -790,10 +795,10 @@ impl Nursery {
     /// #1944 slice 3 — the budget node child powerbox `ctx` holds as its own
     /// ([`crate::ChildBudgetNode`]), and the fuel cell its vCPUs draw from it. The node is `None` when
     /// no hook is installed. The cell draws whether or not this run is metered, so a child's budget
-    /// caps it on an unmetered root too (#1705); it is `None`, compiled un-metered, when the chain is
-    /// unbounded at the spawn (every level `-1`). The caller bakes the cell's address into the child
-    /// and hands the cell to the child's task, whose end returns what it did not burn, and the node to
-    /// its domain, which charges its threads (#2001).
+    /// caps it on an unmetered root too (#1705), and whether or not the chain is bounded: an unbounded
+    /// one hands it a quantum at a time, where its pool preempts it (#1991). The caller bakes the
+    /// cell's address into the child and hands the cell to the child's task, whose end returns what it
+    /// did not burn, and the node to its domain, which charges its threads (#2001).
     ///
     /// # Safety
     /// `ctx` is a detached child's powerbox the installed hooks built.
@@ -809,7 +814,9 @@ impl Nursery {
             return (None, None);
         }
         let node = core::mem::transmute::<usize, crate::ChildBudgetNode>(addr)(ctx);
-        let fuel = node.clone().and_then(crate::FuelCell::metering);
+        // #1991 — every child counts, metered or not: its pool preempts it where a chunk of its
+        // fuel runs out (`child_exec::quantum_end`).
+        let fuel = node.clone().map(crate::FuelCell::drawing);
         (node, fuel)
     }
 
@@ -1380,7 +1387,7 @@ unsafe fn spawn_detached_child(
     // #1587 — the lease `spawn_detached` already took from the funding budget, `(budget, bytes,
     // runs)`, so a spawn that fails *after* that commit can hand it back.
     lease: (i32, u64, u64),
-    // #1944 slice 3 — the child's fuel cell, drawing from its own budget node (`None`: un-metered);
+    // #1944 slice 3 — the child's fuel cell, drawing from its own budget node (`None`: no hooks);
     // its task's teardown returns what it did not burn.
     fuel: Option<Box<crate::FuelCell>>,
     // #2001 — that node, which the child's threads are charged to.

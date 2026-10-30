@@ -379,6 +379,10 @@ pub(crate) enum ParkOn {
     /// ([`crate::wait_outside`]), since it may yet end a peer's wait. The answer re-offers it
     /// ([`crate::outside_waker`]).
     Outside,
+    /// #1991 — a pool task's quantum ended with another task waiting for a worker
+    /// ([`crate::child_exec::quantum_end`]): nothing to wait for, so the executor requeues it at once,
+    /// behind that task. It takes the whole task, whatever fiber its quantum ended in.
+    Yield,
 }
 
 impl ParkOn {
@@ -390,10 +394,18 @@ impl ParkOn {
     }
 
     /// Whether the park blocks its whole vCPU, as on every engine: a join (counted as its vCPU's
-    /// block, it must be one) and a page fault. A guest fiber's such park parks every context up to
-    /// its task (#2322, [`fiber_resume`]), never the fiber alone.
+    /// block, it must be one), a page fault, and a quantum's end. A guest fiber's such park parks
+    /// every context up to its task (#2322, [`fiber_resume`]), never the fiber alone.
     pub(crate) fn blocks_vcpu(&self) -> bool {
-        matches!(self, ParkOn::Thread | ParkOn::Child | ParkOn::Page)
+        matches!(
+            self,
+            ParkOn::Thread | ParkOn::Child | ParkOn::Page | ParkOn::Yield
+        )
+    }
+
+    /// #1991 — a futex wait whose event has fired ([`crate::os_thread_rt::WaitCell::resolved`]).
+    pub(crate) fn resolved(&self) -> bool {
+        matches!(self, ParkOn::Futex(cell) if cell.resolved())
     }
 }
 
@@ -659,6 +671,14 @@ impl FiberSlot {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// #1991 — whether that event park is a futex wait whose event has fired ([`ParkOn::resolved`]).
+    pub(crate) fn park_resolved(&self) -> bool {
+        self.park_on
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resolved()
     }
 
     /// D66 — the single-owner claim for a platform slot's resume (generation 0, never recycled).

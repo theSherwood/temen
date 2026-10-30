@@ -4,13 +4,13 @@
 //!
 //! The root spawns the [`nester`] four times, each two deep: three times from an unmetered budget and
 //! once from a metered one, and every level spawns and joins the next itself. That is twelve spawns
-//! of one module, and every engine returns the same sum. On the JIT a run compiles the nester twice,
-//! once for each shape: a metered child's code charges its fuel cell, and an unmetered one's does
-//! not. Runs handed one `JitCodeCache` share those compiles, so a later run compiles none — the
-//! root's included, though it spawns: each instance of its code stands up a nursery of its own
-//! (temen#2389). A cache that keeps its code in a directory (temen#2452) carries that to a later
-//! process. So it does for an image that extends its own code, though it shares no compile: a root
-//! that drives a `Jit`, and a child that holds one.
+//! of one module, and every engine returns the same sum. On the JIT a run compiles the nester once:
+//! every child's code charges its fuel cell, metered or not, since its pool preempts it where a
+//! chunk runs out (#1991). Runs handed one `JitCodeCache` share those compiles, so a later run
+//! compiles none — the root's included, though it spawns: each instance of its code stands up a
+//! nursery of its own (temen#2389). A cache that keeps its code in a directory (temen#2452) carries
+//! that to a later process. So it does for an image that extends its own code, though it shares no
+//! compile: a root that drives a `Jit`, and a child that holds one.
 //!
 //! The process-wide compile counters move only for one test's runs: the other runs its in
 //! processes of their own.
@@ -166,8 +166,8 @@ fn a_run_compiles_each_detached_child_once_for_all_its_spawns() {
     }
     assert_eq!(
         compiles(&unmetered),
-        (2, 1),
-        "twelve spawns of one child: its metered code and its unmetered code; and the root"
+        (1, 1),
+        "twelve spawns of one child, metered or not, share its one code (#1991); and the root"
     );
 
     let cache = JitCodeCache::default();
@@ -175,17 +175,13 @@ fn a_run_compiles_each_detached_child_once_for_all_its_spawns() {
         jit_code: Some(cache.clone()),
         ..unmetered
     };
-    assert_eq!(
-        compiles(&cached),
-        (2, 1),
-        "the first run compiles all three"
-    );
+    assert_eq!(compiles(&cached), (1, 1), "the first run compiles both");
     assert_eq!(
         compiles(&cached),
         (0, 0),
         "a later run compiles none: the root that spawns them is shared too (temen#2389)"
     );
-    assert_eq!(cache.children_compiled(), 2);
+    assert_eq!(cache.children_compiled(), 1);
     assert_eq!(cache.compiled(), 1);
 }
 
@@ -249,8 +245,8 @@ fn a_later_process_compiles_none_of_what_an_earlier_one_kept() {
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(
         in_a_process("run_kept_here", &dir),
-        [2, 1],
-        "the first process compiles the nester's two shapes and the root"
+        [1, 1],
+        "the first process compiles the nester and the root"
     );
     assert_eq!(
         in_a_process("run_kept_here", &dir),

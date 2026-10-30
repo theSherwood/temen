@@ -28754,10 +28754,16 @@ impl Host {
         self.workers = Some(n.max(1));
     }
 
+    /// The workers the driver running this domain has ([`Host::set_workers`]): unset, the real
+    /// pool's size ([`pool_workers`]). The JIT's child pool holds no more (temen#1991).
+    pub fn workers(&self) -> usize {
+        self.workers.unwrap_or_else(pool_workers)
+    }
+
     /// How many of this domain's vCPUs may run at once, as `self.parallelism` answers it: the workers
     /// its driver has ([`Host::set_workers`]), bounded by its lane cap when it has one (D66).
     pub fn parallelism(&self) -> i64 {
-        let workers = self.workers.unwrap_or_else(pool_workers) as i64;
+        let workers = self.workers() as i64;
         if self.lane_cap >= 0 {
             workers.min(self.lane_cap)
         } else {

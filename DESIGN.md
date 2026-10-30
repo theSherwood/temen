@@ -3961,26 +3961,37 @@ as a value with the budget un-spent (#1587).
 non-durable §14 child — the **detached** children of op 17 (and, until #1867, the **carve** children
 of ops 0/5/8/11/13, with the copy-in/`copy_back` below) — is a task — a platform-owned `FiberSlot` (in no guest table, spends no fiber quota)
 carrying the child's own window, trap cell and fiber execution context — on a pool of workers spawned
-on demand; any worker may resume it under the same single-owner claim guest fibers use (the D57
+as work waits with none free, never more than the host's driver has (#1991: `Host::workers`, by
+default the cores, as the interpreter's pool; a task that wakes one sibling leaves it to its own
+worker, which runs it next, and finds a worker only for a second); any worker may resume it
+under the same single-owner claim guest fibers use (the D57
 migration unsafe, no new one), each resume its own guard bracket over the *task's* fault range (R1),
 the per-thread state seeded and reset at both edges of every residency (R2: `CURRENT_RT`, `vcpu.tls`,
 the current-task word — all `#[inline(never)]` readers). A futex `wait` inside the child takes the
 existing "inside a fiber ⇒ park the fiber" arm unchanged (INVARIANTS #15: no second park mechanism);
-**one** wake reaches every parked task and each re-checks its own predicate in the loop it already
-has — `Domain::wake_all_parked` extended to tasks, so a `notify`, a vCPU exit, the §5 kill path and
-teardown all arrive by the same route, and an idle worker sweeps the parked set on the bounded
-`KILL_RECHECK` cadence to fire deadlines. No per-task waker, no second deadline store, no second
+**one** wake route reaches the parked tasks (`Domain::wake_child_tasks`), and each task it reaches
+re-checks its own predicate in the loop it already has: a vCPU exit, a child's end, the §5 kill path
+and teardown re-offer every parked task, a `notify` only those whose futex wait it claimed (#1991:
+the rest would re-check and park again, and with many tasks that was most of a busy run's work), and
+a worker sweeps the parked set on the bounded `KILL_RECHECK` cadence and fires passed deadlines,
+before each task it takes, at a quantum's end and when it wakes idle. No per-task waker, no second
+deadline store, no second
 runnable queue: the executor's whole state is a task map, a FIFO and the per-domain lane counts. Every
 resume is gated on the task's lane chain with `temen_ir::lanes` — the oracle's arithmetic — held
 exactly while on a worker and released the moment it parks, so a child of a cap-1 parent never overlaps
-a sibling and a parked one never wedges a runnable one (the two pins, `child_exec_jit.rs`). Run
+a sibling and a parked one never wedges a runnable one (the two pins, `child_exec_jit.rs`). **The pool
+preempts** (#1991), as the interpreter's does at its quantum: every task counts its fuel, metered or
+not (an unmetered chain hands it a quantum, 2¹⁶ safepoints, at a time). At each refill the task at
+the head of the queue gets a worker: a free one, a new one, or, once the pool is full, this one — the
+running task parks as runnable (`ParkOn::Yield`, which takes the whole task from whichever of its
+fibers the quantum ended in) and goes to the back of the queue, keeping its lanes as a preempted vCPU
+of the interpreter does (#2237). So the pool's cap stays invisible: a task that never parks still
+gives way, and nothing waits on it longer than a quantum. Run
 teardown poisons a task parked forever (its cell reads `DOMAIN_DONE`; it unwinds through its trailing
 guard — the interpreter's sweep, D37) instead of hanging the join. The child enters through a
 **limit-taking** variant of its one trampoline (`build_trampoline(.., with_limit)`, one flag not a
-second family), so its prologue checks guard the fiber stack. JIT frontier, still open on #1600: no
-preemption (a task that never parks holds its lane until it returns — the interpreter's quantum
-round-robin has no twin); the task stack is the fiber arena's 256 KiB slot (a `StackOverflow` trap,
-no longer a 2 MiB OS stack).
+second family), so its prologue checks guard the fiber stack. The task stack is the fiber arena's
+256 KiB slot (a `StackOverflow` trap, no longer a 2 MiB OS stack).
 
 *Broad lanes* (owner ruling 2026-09-21): a lane bounds **all** concurrency in a subtree, not only its
 child domains. The interpreter always read it that way — its `dispatch` gates `thread.spawn` siblings

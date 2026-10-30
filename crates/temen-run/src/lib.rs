@@ -2793,20 +2793,22 @@ fn jit_layout(
 pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
     let locked = ctx.is_locked();
     // D66 — the parent's lane coordinates, read now (before any guest runs): the run's own lane, which
-    // its domain's vCPUs and its children's tasks draw on.
+    // its domain's vCPUs and its children's tasks draw on; and its driver's workers, the most its
+    // child pool holds (#1991).
     // SAFETY: `ctx` is the live parent host in the shape it declares (the contract of this fn).
-    let (parent_domain, parent_lane_cap) = unsafe {
+    let (parent_domain, parent_lane_cap, workers) = unsafe {
         match ctx {
-            CapCtx::Raw(h) => ((*h).domain_id(), (*h).lane_cap()),
+            CapCtx::Raw(h) => ((*h).domain_id(), (*h).lane_cap(), (*h).workers()),
             CapCtx::Locked(m) => {
                 let g = (*m).lock().unwrap_or_else(|e| e.into_inner());
-                (g.domain_id(), g.lane_cap())
+                (g.domain_id(), g.lane_cap(), g.workers())
             }
         }
     };
     temen_jit::GrantChildHooks {
         parent_domain,
         parent_lane_cap,
+        workers,
         build_detached: if locked {
             grant_detached_child_build_locked
         } else {

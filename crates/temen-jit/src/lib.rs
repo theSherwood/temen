@@ -1235,6 +1235,10 @@ pub struct GrantChildHooks {
     /// unbounded.
     pub parent_domain: u64,
     pub parent_lane_cap: i64,
+    /// #1991 — the most workers the run's child pool holds: the workers the parent host's driver has
+    /// (`temen_interp::Host::workers`), by default its cores. The pool preempts its tasks at the end
+    /// of each fuel chunk, so this cap is invisible to them, as the interpreter's pool size is.
+    pub workers: usize,
     /// #1956 — the [`ModuleResolver`] for `parent_ctx`'s shape: what a detached child's spawns
     /// resolve their `Module` against. (A run's own spawns use the resolver it was compiled with.)
     pub resolve_module: ModuleResolver,

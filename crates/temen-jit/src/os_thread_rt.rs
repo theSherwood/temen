@@ -438,7 +438,7 @@ pub unsafe fn outside_waker(vm: &crate::VmCtx) -> Option<std::sync::Arc<dyn Fn()
         .map(std::sync::Arc::downgrade)?;
     Some(std::sync::Arc::new(move || {
         if let Some(exec) = exec.upgrade() {
-            exec.wake_all_parked_locked();
+            exec.wake_locked(crate::child_exec::Wake::All);
         }
     }))
 }
@@ -479,7 +479,7 @@ fn wake_hub_parks(hub: &Domain, key: u64) {
         u32::MAX,
         &hub.parked,
     );
-    hub.wake_child_tasks();
+    hub.wake_child_tasks(crate::child_exec::Wake::All);
 }
 
 /// The per-run thread table + futex — the "scheduler address" baked into the `thread.*` thunks. It
@@ -674,6 +674,14 @@ fn wait_cell_new(parked: bool) -> std::sync::Arc<WaitCell> {
         status: AtomicI32::new(PENDING_WAIT),
         parked: AtomicBool::new(parked),
     })
+}
+
+impl WaitCell {
+    /// #1991 — whether the wait's event has fired: a `notify` claimed it, or the park-time recheck
+    /// found the word changed. A child task parked on such a cell is runnable.
+    pub(crate) fn resolved(&self) -> bool {
+        self.status.load(Ordering::Acquire) != PENDING_WAIT
+    }
 }
 
 /// End this cell's contribution to [`Domain::parked`], if it still has one. Idempotent and racy-safe:
@@ -1108,7 +1116,7 @@ impl Domain {
             let _g = lock(&self.futex);
             self.futex_cv.notify_all();
         }
-        self.wake_child_tasks();
+        self.wake_child_tasks(crate::child_exec::Wake::All);
     }
 
     /// D66 — install the lane chain this domain's own vCPUs run under (see [`Domain::lane_chain`]).
@@ -1160,16 +1168,28 @@ impl Domain {
         if chain.is_empty() {
             return;
         }
+        self.lane_leave(chain);
+        let exec = lock(&self.hub().child_exec).clone();
+        if let Some(e) = exec {
+            e.notify_workers();
+        }
+    }
+
+    /// [`Self::lane_give_back`] without the executor's wake: every lane in `chain` given back, and
+    /// the 1:1 vCPUs blocked in [`Domain::lane_acquire`] woken. An executor worker gives its task's
+    /// lanes back with this: its own next `pick` re-offers the queue, and a lane it gave back admits
+    /// at most one more task. #1991 — waking the pool after every residency woke a free worker
+    /// to find nothing, and to take from this one the task it was about to run.
+    pub(crate) fn lane_leave(&self, chain: &[(usize, i64)]) {
+        if chain.is_empty() {
+            return;
+        }
         let hub = self.hub();
         {
             let mut g = lock(&hub.lanes);
             temen_ir::lanes::leave(&mut g, chain);
         }
         hub.lane_cv.notify_all();
-        let exec = lock(&hub.child_exec).clone();
-        if let Some(e) = exec {
-            e.notify_workers();
-        }
     }
 
     /// D66 — block until every lane in `chain` has room, then take them. `true` = taken and the
@@ -1227,13 +1247,13 @@ impl Domain {
         *lock(&self.child_exec) = Some(exec);
     }
 
-    /// D66 — re-offer every parked child task so it re-checks its own predicate. Paired with the
-    /// futex broadcast at every wake site: a `notify`, a vCPU exit, the §5 kill path and domain
-    /// teardown all reach parked tasks through here.
-    pub(crate) fn wake_child_tasks(&self) {
+    /// D66 — re-offer the parked child tasks `which` names, each to re-check its own predicate.
+    /// Paired with the futex broadcast at every wake site: a `notify`, a vCPU exit, the §5 kill path
+    /// and domain teardown all reach parked tasks through here.
+    pub(crate) fn wake_child_tasks(&self, which: crate::child_exec::Wake) {
         let exec = lock(&self.hub().child_exec).clone();
         if let Some(e) = exec {
-            e.wake_all_parked_locked();
+            e.wake_locked(which);
         }
     }
 
@@ -1361,7 +1381,7 @@ impl Domain {
         self.wake_own_parked();
         // D66 — and every parked child task, for the same reason: a completion changed `live`, or
         // teardown began, and a parked task must re-check rather than sleep to the cadence.
-        self.wake_child_tasks();
+        self.wake_child_tasks(crate::child_exec::Wake::All);
     }
 
     /// [`Self::wake_all_parked`] without the child tasks: this domain's own parked vCPUs only. The
@@ -3077,11 +3097,11 @@ pub(crate) unsafe extern "C" fn thread_notify(sched: *const Domain, phys: u64, c
         &dom.parked,
     );
     if woken > 0 {
-        // D66 — a parked **child-domain task** has no resumer polling it: re-offer the parked set
-        // so the one whose cell this notify just filled runs again promptly, instead of waiting
-        // for an idle worker's cadence sweep. Each re-checks its own predicate; the unsatisfied
-        // park again (`Domain::wake_all_parked`'s discipline, extended to tasks).
-        dom.wake_child_tasks();
+        // D66 — a parked **child-domain task** has no resumer polling it: re-offer the tasks whose
+        // cells this notify just filled, so they run again promptly instead of waiting for a free
+        // worker's cadence sweep. #1991 — only those: every other parked task would re-check and
+        // park again, and with many tasks those re-checks were most of a busy run's work.
+        dom.wake_child_tasks(crate::child_exec::Wake::Resolved);
     }
     woken as i32
 }
