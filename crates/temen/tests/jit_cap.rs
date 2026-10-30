@@ -881,8 +881,8 @@ fn two_units_interleaved_agree_across_backends() {
 /// thread**, then `install`s the unit and signals readiness through a guest atomic; the worker —
 /// already running — `call.dyn`s the **post-spawn-installed** slot. This is the divergence #2
 /// named: a per-vCPU/snapshotted table would hide the install from the worker. With the interp's
-/// shared atomic `DomainTable` and the JIT's atomic `FnEntry` (release-ordered publication, the
-/// visibility carried by the guest's own ready flag), both backends now agree: the worker reaches
+/// shared atomic `DomainTable` and the JIT's slots of immutable `FnRecord`s (one release store per
+/// install, the visibility carried by the guest's own ready flag), both backends now agree: the worker reaches
 /// the installed unit and returns `6 * 7 + 10 = 52`. Compile (the only `finalize`) happens *before*
 /// the spawn, so install is the lone concurrent table op — no threaded-`compile` W^X concern.
 ///
@@ -894,8 +894,9 @@ fn two_units_interleaved_agree_across_backends() {
 /// aarch64 unix/macOS, x86-64 Windows), like the other JIT thread tests. Correct on weakly-ordered
 /// aarch64 because the install's visibility rides the *guest's own* acquire/release on the ready
 /// flag (install stores → ready store-release → ready load-acquire → the worker's dispatch loads),
-/// not the dispatch's own load order; the atomic `FnEntry` fields additionally guarantee a racy
-/// reader never observes a torn (half-written) code pointer on any platform.
+/// not the dispatch's own load order. A slot is one atomic word naming an immutable record, so a
+/// racy reader also calls the old function or the new one under its own type check, never a pair
+/// of them (#2680).
 #[test]
 #[cfg(any(
     all(unix, target_arch = "x86_64"),

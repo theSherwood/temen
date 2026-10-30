@@ -1,6 +1,7 @@
-// Foreign memories (#1284, DETACHED_JIT.md §3.3): the engine cdylib addresses a detached child's own
-// `WebAssembly.Memory`, which its pointers cannot reach, through a small accessor instance over that
-// memory, whose functions this module puts in the engine's function table. `Region::Foreign` in
+// Foreign memories (#1284, DETACHED_JIT.md §3.3): the engine cdylib addresses a window's own
+// `WebAssembly.Memory`, a run's root's or a detached child's (#1414 5d), which its pointers cannot
+// reach, through a small accessor instance over that memory, whose functions this module puts in the
+// engine's function table. `Region::Foreign` in
 // `temen-mem` calls one per access, wasm to wasm: no JavaScript runs on any access, word, span, fill,
 // copy, atomic or grow (#1414 5d). This module is the registry (id → Memory), the accessor modules and
 // the two imports that need JavaScript: `foreign_mint`, which makes a memory, and `foreign_release`,
@@ -30,10 +31,27 @@ export function adoptMemory(memory) {
   return memory;
 }
 
+/** The bytes at the start of a window memory that describe its header (`HEADER_DESC_BYTES` in `src/lib.rs`). */
+const DESC_BYTES = 64;
+
+/**
+ * The layout of a window memory's header (`WindowHeader` in `src/lib.rs`), from the descriptor at its
+ * start: where the window starts (`base`), how many contexts the header holds (`contexts`), where the
+ * first starts (`context0`) and the bytes between them (`stride`), and, from a context's start, its
+ * page-state table (`tableOff`, `tableBytes`) and its spill stack (`spillOff`, `spillBytes`). Every
+ * memory the engine mints has one; any agent holding the memory reads it here.
+ */
+export function headerOf(memory) {
+  const [base, contexts, context0, stride, tableOff, tableBytes, spillOff, spillBytes] =
+    new Uint32Array(memory.buffer, 0, 8);
+  return { base, contexts, context0, stride, tableOff, tableBytes, spillOff, spillBytes };
+}
+
 // This agent's registry for each engine memory it holds (#1414 5d), weakly, so a dropped engine memory
 // takes its registry along:
 // - `mems`: id -> { m: WebAssembly.Memory, base: byte offset of region offset 0, fns: accessor
-//   exports, and `maximum`, its maximum in bytes, if this agent minted it }. An id names one memory
+//   exports, and, if this agent minted it, `maximum`, its maximum in pages, and `desc`, its header's
+//   descriptor }. An id names one memory
 //   among all the agents of the engine memory, page and Workers alike: the engine's shared counter
 //   hands ids out (`temen_foreign_next_id`), so a memory one agent registers from another never meets
 //   one it minted itself.
@@ -42,9 +60,9 @@ export function adoptMemory(memory) {
 //   table slots for its next mints. V8 reserves address space for each memory, and frees a dead one's
 //   only in a full collection, which it runs when a new memory finds none left: about every 125
 //   memories, at tens of milliseconds each. So a burst of short-lived children reuses a few memories
-//   instead of building one each. A spare holds nothing a child wrote. Past `SPARE_BYTES` zeroing
-//   costs more than a fresh memory, so a bigger one goes back to the collector, as one past
-//   `SPARE_MEMORIES` does.
+//   instead of building one each. A spare's window holds nothing a child wrote. Past `SPARE_BYTES`
+//   of window zeroing costs more than a fresh memory, so a bigger one goes back to the collector, as
+//   one past `SPARE_MEMORIES` does.
 const registries = new WeakMap();
 export const SPARE_MEMORIES = 8, SPARE_BYTES = 512 << 10;
 
@@ -299,11 +317,11 @@ export function adoptEngine(ex, engineMemory) {
 }
 
 /**
- * Register a child `WebAssembly.Memory` for the engine instances over `engineMemory`; returns the id
- * they name it by. `base` is where the engine's region offset 0 lands in the memory — a detached child's
- * window starts one host header page in (`temen_detached_header_bytes()`), so its region is `[base, …)`
- * and the header below stays the host's (DETACHED_JIT.md §3.1). `id` is a fresh one from the engine, or
- * the id another agent gave the memory, for one the memory was handed to with it (#1414 B6-3c).
+ * Register a window's `WebAssembly.Memory` for the engine instances over `engineMemory`; returns the id
+ * they name it by. `base` is where the engine's region offset 0 lands in the memory — a window starts
+ * past its memory's header (`headerOf(memory).base`), so its region is `[base, …)` and the header below
+ * stays the host's (DETACHED_JIT.md §3.1). `id` is a fresh one from the engine, or the id another agent
+ * gave the memory, for one the memory was handed to with it (#1414 B6-3c).
  */
 export function registerForeign(engineMemory, memory, base = 0, id = undefined) {
   const reg = registry(engineMemory);
@@ -314,7 +332,7 @@ export function registerForeign(engineMemory, memory, base = 0, id = undefined) 
   }
   if (reg.mems[id] !== undefined) throw new Error(`foreign memory ${id} is already registered`);
   accessor ??= new WebAssembly.Module(ACCESSOR_WASM);
-  // a detached child's memory, shared by its threads' Workers
+  // a window's memory, shared by its threads' Workers
   const fns = new WebAssembly.Instance(accessor, { a: { m: adoptMemory(memory), base } }).exports;
   reg.mems[id] = { m: memory, base, fns };
   for (const [e, ex] of liveEngines(reg)) install(reg, e, ex, id);
@@ -342,11 +360,13 @@ export function releaseForeign(engineMemory, id) {
  */
 function retireForeign(engineMemory, id) {
   const reg = registry(engineMemory), r = reg.mems[id];
-  if (r?.maximum === undefined || reg.spares.length >= SPARE_MEMORIES || r.m.buffer.byteLength > SPARE_BYTES) {
+  if (r?.maximum === undefined || reg.spares.length >= SPARE_MEMORIES
+    || r.m.buffer.byteLength - r.base > SPARE_BYTES) {
     releaseForeign(engineMemory, id);
     return;
   }
-  new Uint8Array(r.m.buffer).fill(0);
+  // The header stays: a mint whose descriptor matches reuses it as it is.
+  new Uint8Array(r.m.buffer, r.base).fill(0);
   reg.spares.push(id);
 }
 
@@ -362,25 +382,28 @@ export function foreignImports(engineMemory) {
   adoptMemory(engineMemory);
   const reg = registry(engineMemory);
   return {
-    // Mint a shared child memory of `initial`..`maximum` bytes (header included) with `base` as the
-    // region origin (#1286): the last spare that fits, or a fresh one, registered. Returns the id, or -1
-    // if the constructor refused, or if this agent adopted no engine: then no table would hold the
-    // memory's functions, and every access to it would trap.
-    foreign_mint: (base, initial, maximum) => {
+    // Mint a shared window memory of `initial`..`maximum` pages (header included) whose header the
+    // `DESC_BYTES` at `desc` in the engine's memory describe (#1286, #1414 5d): the last spare with that
+    // header that fits, or a fresh one with the descriptor written at its start, registered with the
+    // header's end as the region origin. Returns the id, or -1 if the constructor refused, or if this
+    // agent adopted no engine: then no table would hold the memory's functions, and every access to it
+    // would trap.
+    foreign_mint: (desc, initial, maximum) => {
       if (reg.engines.length === 0) {
         console.error('foreign_mint: this agent adopted no engine instance (a host calls adoptEngine)');
         return -1;
       }
-      const fits = (id) => reg.mems[id].base === base && reg.mems[id].maximum === maximum
-        && reg.mems[id].m.buffer.byteLength >= initial;
+      const d = new Uint8Array(engineMemory.buffer, desc >>> 0, DESC_BYTES).slice();
+      const same = (a) => a.every((b, i) => b === d[i]);
+      const fits = (id) => reg.mems[id].maximum === maximum && same(reg.mems[id].desc)
+        && reg.mems[id].m.buffer.byteLength >= initial * 65536;
       const spare = reg.spares.findLastIndex(fits);
       if (spare >= 0) return reg.spares.splice(spare, 1)[0];
       try {
-        const m = new WebAssembly.Memory({
-          initial: Math.ceil(initial / 65536), maximum: Math.ceil(maximum / 65536), shared: true,
-        });
-        const id = registerForeign(engineMemory, m, base);
-        reg.mems[id].maximum = maximum;
+        const m = new WebAssembly.Memory({ initial, maximum, shared: true });
+        new Uint8Array(m.buffer).set(d);
+        const id = registerForeign(engineMemory, m, headerOf(m).base);
+        Object.assign(reg.mems[id], { maximum, desc: d });
         return id;
       } catch { return -1; }
     },

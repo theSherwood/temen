@@ -180,25 +180,30 @@ fn carry_funcs(module: &Module, funcs: Vec<Func>) -> Module {
 /// lowered. `cap == 0` is a no-op. Function *signatures* are unchanged, so `call.dyn` target
 /// indices — and every other reference — stay valid. Name-bearing link metadata is dropped (see
 /// [`carry_funcs`]); the residual is addressed by index, like the specializer's own output.
+///
+/// A function it rewrites comes out in dominance form (#2454). The others keep the form they came in.
 pub fn lower_indirect_dispatch(module: &Module, cap: usize) -> Module {
-    // Splitting a block renumbers its values: it reads a module whose blocks capture (#2454) in
-    // block-local form.
-    let local = temen_opt::block_local(module);
-    let module: &Module = &local;
     if cap == 0 {
         return carry_funcs(module, module.funcs.clone());
     }
     let mask = table_mask(module.funcs.len());
     let fn_results: Vec<usize> = module.funcs.iter().map(|f| f.results.len()).collect();
     let has_memory = module.memory.is_some();
+    let types = |f: &Func| func_value_types(f, &module.funcs, &module.types, has_memory);
     let mut funcs = module.funcs.clone();
     for f in &mut funcs {
+        if find_site(f, module, cap).is_none() {
+            continue;
+        }
+        // Splitting a block renumbers its values, so a function is rewritten in block-local form, and
+        // raised again after (#2672).
+        f.localize(&types(f));
         // Rewrite one eligible site per pass, re-typing the (growing) function each time; a lowered
         // site becomes direct calls and is never re-found, so this drains in finitely many passes.
         while let Some(site) = find_site(f, module, cap) {
-            let types = func_value_types(f, &module.funcs, &module.types, has_memory);
-            split_site(f, site, &types, &module.types, mask, &fn_results);
+            split_site(f, site, &types(f), &module.types, mask, &fn_results);
         }
+        f.raise();
     }
     carry_funcs(module, funcs)
 }

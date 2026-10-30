@@ -121,18 +121,24 @@ A detached child on the wasm-JIT tier is an ordinary emitted instance whose `env
 import is a **fresh** `WebAssembly.Memory` created for it, not the engine's shared memory.
 
 - **Memory**: `new WebAssembly.Memory({ initial: 1 << (size_log2 − 16), maximum: M })`. The
-  child's memory *is* its window (`win` = one host header page, below). Growth is the child's own `memory.grow` —
+  child's memory *is* its window (`win` = past a host header, below). Growth is the child's own `memory.grow` —
   independent of every other child and of the cdylib's heap. No partition, no topmost
   problem, no `mapped`-global re-pointing across children (each instance has its own).
 - **`maximum`**: a non-shared memory needs none (grows to the wasm32 ceiling); a child that
   will `thread.spawn` into Workers must be **shared**, hence needs a declared `maximum` — V8
   reserves that as *address* and commits lazily, so it can be generous (the `WindowMinter`
   quota is the natural source of `M`).
-- **Layout — a host header page below `win`.** The emitted code reads two host-owned things
-  through *its* memory: the `env` bounce cell (`ENV_CELL_BYTES` = 2576 B; scratch slots are
-  stored via `env.memory`) and the paged variant's `pagestate` table. Today both are engine-heap
-  pointers, which are meaningless in a foreign memory. Put them in the **first 64 KiB page of
-  the child's memory** and set `win = 65536`. Guest addresses are span-checked against
+- **Layout — a host header below `win`.** The emitted code reads host-owned things through *its*
+  memory: the `env` bounce cell (`ENV_CELL_BYTES`; scratch slots are stored via `env.memory`), the
+  paged variant's `pagestate` table and a spilling emit's spill stack. Engine-heap pointers are
+  meaningless in a foreign memory, so they live at the **bottom of the memory**, and `win` starts
+  past them, at a 64 KiB boundary. Since #1414 5d the same header serves a run root's memory of its
+  own, and is sized when the memory is made (`WindowHeader` in `browser/src/lib.rs`): a 64-byte
+  descriptor at 0 that any agent holding the memory reads (`headerOf` in `web/foreign-mem.js`), then
+  one context per task that can run emitted code over the window (one, its root task's): an env
+  cell, a page-state table covering the memory's maximum, and, in a root's, a 1 MiB spill stack. A
+  bounce copies the 512-byte call scratch, and the words the frames spilled, through the engine's
+  memory, where the interpreter reads them. Guest addresses are span-checked against
   `"mapped"` *before* `win` is added (`emit_span_check` then `emit_win_addr`), so the guest can
   never reach `[0, win)`; the header never moves on `memory.grow` (which appends at the top);
   and no new invariant is needed — the alternative, a cell *above* `mapped`, would introduce

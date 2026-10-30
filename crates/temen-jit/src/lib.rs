@@ -56,9 +56,9 @@
 //! (results…)` (the `tail` call conv, so `return_call` works); the two context
 //! pointers are threaded through every call. The entry is wrapped in a fixed
 //! buffer-ABI trampoline `fn(args: *const i64, results: *mut i64, mem_base: *mut u8,
-//! fn_table_base: *const FnEntry)` so [`compile_and_run`] can call any arity from Rust.
+//! fn_table_base: *const *const FnRecord)` so [`compile_and_run`] can call any arity from Rust.
 
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{
     F32, F32X4, F64, F64X2, I16, I16X8, I32, I32X4, I64, I64X2, I8, I8X16,
@@ -75,7 +75,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, ModuleReloc};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use temen_ir::bounds::{in_window, ub_at, ub_of, UB_TOP};
 use temen_ir::cap_id;
 use temen_ir::{
@@ -281,64 +281,223 @@ const MAX_JIT_RESERVED_LOG2: u8 = 40; // 1 TiB of reserved VA (lazy)
 /// region. **Must match `temen_interp`'s `SNAP_CAP`** so both backends snapshot the same span.
 const SNAP_CAP: usize = 1 << 18; // 256 KiB
 
-/// A function-table entry (§3c `FnEntry`): host-owned, guest-unwritable. `type_id`
-/// identifies the signature (distinct-`FuncType` index); `code` is the finalized
-/// function address. `call.dyn` masks the guest index into the table, checks
-/// `type_id` (offset 0), then calls `code` (offset 8) — confinement at the use site (invariant I2).
-///
-/// The fields are **atomic** so a guest-driven `install`/`uninstall` (a host-side write) is sound
-/// against a *concurrent* `call.dyn` from another thread (DESIGN.md §22 threaded install). The
-/// `#[repr(C)]` layout (`type_id` @0, `code` @8) is exactly what [`indirect_dispatch`] bakes its
-/// loads against, unchanged. Two distinct guarantees, both platform-uniform:
-/// - **Visibility** (a synchronized reader sees a complete install) rides the **guest's own**
-///   acquire/release — the worker only dispatches a slot it learned about through a guest atomic, so
-///   the install's stores are ordered-before the worker's dispatch loads via that synchronization,
-///   on weakly-ordered targets too. The dispatch's own plain loads need no acquire. `publish` still
-///   stores `code` before `type_id` (release-ordered) as belt-and-suspenders for a reader that
-///   happens to synchronize on `type_id` directly.
-/// - **No torn pointer** (a *racy* reader never sees a half-written `code`): each field is a single
-///   atomic word, so a concurrent dispatch reads either the old or the new value — never a wild
-///   pointer. A racy reinstall is the guest's own bug and is contained (trap), never an escape.
+/// One function the `call.dyn` table can name (§3c): its signature's id (a distinct-`FuncType`
+/// index) and its finalized code. **Immutable** from the moment a slot can point at it, so a dispatch
+/// reads one record's `type_id` and `code` together, never one install's type id with another's code
+/// (#2680). `call.dyn` checks `type_id` (offset 0), then calls `code` (offset 8): the layout
+/// [`indirect_dispatch`] loads against.
 #[repr(C)]
-pub(crate) struct FnEntry {
-    type_id: AtomicU32,
+pub(crate) struct FnRecord {
+    type_id: u32,
     _pad: u32,
-    code: AtomicU64,
+    code: u64,
 }
 
-impl FnEntry {
-    /// A real/installed entry.
-    pub(crate) fn new(type_id: u32, code: u64) -> FnEntry {
-        FnEntry {
-            type_id: AtomicU32::new(type_id),
+impl FnRecord {
+    fn new(type_id: u32, code: u64) -> FnRecord {
+        FnRecord {
+            type_id,
             _pad: 0,
-            code: AtomicU64::new(code),
+            code,
         }
     }
-    /// A trapping padding entry (`call.dyn` here is inert).
-    pub(crate) fn padding() -> FnEntry {
-        FnEntry::new(PADDING_TYPE_ID, 0)
-    }
-    /// The slot's signature id (the host-side bookkeeping read; the hot dispatch read is in
-    /// generated code). `Acquire` pairs with [`Self::publish`]'s release of `type_id`.
+    /// The signature id a `call.dyn` of it must name.
     pub(crate) fn type_id(&self) -> u32 {
-        self.type_id.load(Ordering::Acquire)
+        self.type_id
     }
-    /// The slot's code pointer (host-side bookkeeping read).
+    /// The function's code address.
     pub(crate) fn code(&self) -> u64 {
-        self.code.load(Ordering::Acquire)
+        self.code
     }
-    /// **Publish** an installed function: `code` first, then `type_id` (release-ordered), so a
-    /// concurrent reader that sees the new `type_id` also sees the new `code`.
-    pub(crate) fn publish(&self, type_id: u32, code: u64) {
-        self.code.store(code, Ordering::Release);
-        self.type_id.store(type_id, Ordering::Release);
+}
+
+/// The record of a slot that holds no function (the power-of-two padding, a reserved slot, an
+/// uninstalled one): its type id matches no call site, so a `call.dyn` of it always traps before its
+/// code is read.
+static PADDING: FnRecord = FnRecord {
+    type_id: PADDING_TYPE_ID,
+    _pad: 0,
+    code: 0,
+};
+
+/// The function table `call.dyn` dispatches through (§3c): host-owned, guest-unwritable, one slot per
+/// index, each the address of an immutable [`FnRecord`]. `call.dyn` masks the guest index into it,
+/// loads the slot, checks the record's type id, then calls its code: confinement at the use site
+/// (invariant I2).
+///
+/// A guest-driven `install`/`uninstall` (DESIGN.md §22 threaded install) changes a slot with **one
+/// release store of a record's address**, so it is sound against a concurrent `call.dyn` from another
+/// thread. The dispatch reads the slot once and reads the record through the address it read, an
+/// address dependency that orders those reads after the record's initialization on every target
+/// (x86's TSO, Arm's dependency ordering). So a racy reader calls either the old function or the new
+/// one under its own type check, never a pair of them (#2680). Visibility of a fresh install still
+/// rides the guest's own acquire/release: a worker dispatches a slot it learned about through a guest
+/// atomic.
+pub(crate) struct FnTable {
+    /// The slots, boxed so their address never moves: running code holds it.
+    slots: Box<[AtomicPtr<FnRecord>]>,
+    /// What the slots point at, shared with every instance of the same code (`instance`).
+    records: Arc<FnRecords>,
+}
+
+/// The records a table's slots may point at, besides [`PADDING`]. None is freed while a table that
+/// can name it lives: a racing dispatch may read a record after its slot has moved on.
+struct FnRecords {
+    /// The module's own functions, slot `i` = function `i`.
+    own: Box<[FnRecord]>,
+    /// Installed units, one per `(type_id, code)`, so reinstalling a unit allocates nothing and the
+    /// records grow only with the code the guest compiled.
+    installed: Mutex<HashMap<(u32, u64), Box<FnRecord>>>,
+}
+
+impl FnTable {
+    /// A table of `len` slots naming the module's `own` functions, then padding.
+    fn new(own: Vec<FnRecord>, len: usize) -> FnTable {
+        let records = Arc::new(FnRecords {
+            own: own.into_boxed_slice(),
+            installed: Mutex::new(HashMap::new()),
+        });
+        let slots = (0..len)
+            .map(|i| {
+                let r = records.own.get(i).unwrap_or(&PADDING);
+                AtomicPtr::new(r as *const FnRecord as *mut FnRecord)
+            })
+            .collect();
+        FnTable { slots, records }
     }
-    /// **Clear** to trapping padding: `type_id` (the ready field) first so a new dispatch traps
-    /// promptly, then zero `code`.
-    pub(crate) fn clear(&self) {
-        self.type_id.store(PADDING_TYPE_ID, Ordering::Release);
-        self.code.store(0, Ordering::Relaxed);
+
+    /// The address running code dispatches through (`fn_table_base`).
+    pub(crate) fn base(&self) -> *const core::ffi::c_void {
+        self.slots.as_ptr() as *const core::ffi::c_void
+    }
+
+    /// The record slot `slot` names now.
+    fn record(&self, slot: usize) -> &FnRecord {
+        // SAFETY: the table outlives the borrow, and every slot points at `PADDING` or a record in
+        // `self.records`, which outlives it too.
+        unsafe { slot_record(self.base(), slot) }
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The slots that hold no function, in order: where an install may go.
+    fn free_slots(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.len()).filter(|&i| self.record(i).type_id() == PADDING_TYPE_ID)
+    }
+
+    /// Point `slot` at the record of `code` with signature `type_id`, made once per pair.
+    fn publish(&self, slot: usize, type_id: u32, code: u64) {
+        let mut installed = self
+            .records
+            .installed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let r: &FnRecord = installed
+            .entry((type_id, code))
+            .or_insert_with(|| Box::new(FnRecord::new(type_id, code)));
+        self.slots[slot].store(r as *const FnRecord as *mut FnRecord, Ordering::Release);
+    }
+
+    /// Point `slot` back at the padding record, so a stale `call.dyn` of it traps.
+    fn clear(&self, slot: usize) {
+        self.slots[slot].store(
+            &PADDING as *const FnRecord as *mut FnRecord,
+            Ordering::Release,
+        );
+    }
+
+    /// A copy for a new instance of the same code: its own slots, naming the same records.
+    fn instance(&self) -> FnTable {
+        let slots = self
+            .slots
+            .iter()
+            .map(|s| AtomicPtr::new(s.load(Ordering::Acquire)))
+            .collect();
+        FnTable {
+            slots,
+            records: Arc::clone(&self.records),
+        }
+    }
+}
+
+/// The records of a compile's own functions, slot `i` = function `i`, each with the finalized address
+/// of its code (`ids[i]`).
+fn own_records(
+    funcs: &[Func],
+    distinct: &[FuncType],
+    module: &JITModule,
+    ids: &[FuncId],
+) -> Vec<FnRecord> {
+    funcs
+        .iter()
+        .zip(ids)
+        .map(|(f, &id)| {
+            let ty = FuncType {
+                params: f.params.clone(),
+                results: f.results.clone(),
+            };
+            FnRecord::new(
+                type_id_of(distinct, &ty),
+                module.get_finalized_function(id) as u64,
+            )
+        })
+        .collect()
+}
+
+/// The record slot `slot` of the table at `base` names now: the host-side read of a slot, for a
+/// runtime that holds only the base (`thread.spawn`, `cont.new`). One load, like the dispatch's.
+///
+/// # Safety
+/// `base` is a live [`FnTable`]'s [`FnTable::base`] and `slot` is below its length; the borrow does
+/// not outlive the table.
+pub(crate) unsafe fn slot_record<'a>(base: *const core::ffi::c_void, slot: usize) -> &'a FnRecord {
+    &*(*(base as *const AtomicPtr<FnRecord>).add(slot)).load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+mod fn_table_tests {
+    use super::*;
+
+    /// #2680 — a reader of a slot pairs one install's type id with that install's code, whatever
+    /// happens to the slot after it read it: it read the address of a record, and records never
+    /// change. The two-field entry this replaced failed exactly this: a type id read before an
+    /// uninstall and an install of another type, and a code pointer read after, named two functions.
+    #[test]
+    fn a_reader_sees_one_install_whatever_reuses_its_slot() {
+        let t = FnTable::new(vec![FnRecord::new(0, 0x1000)], 4);
+        t.publish(1, 7, 0x2000);
+        let read = t.record(1);
+        t.clear(1);
+        t.publish(1, 9, 0x3000);
+        assert_eq!((read.type_id(), read.code()), (7, 0x2000));
+        let now = t.record(1);
+        assert_eq!((now.type_id(), now.code()), (9, 0x3000));
+    }
+
+    /// Reinstalling a unit makes no new record, so a guest that loops install and uninstall grows no
+    /// host memory: records grow only with the code it compiled.
+    #[test]
+    fn reinstalling_a_unit_reuses_its_record() {
+        let t = FnTable::new(Vec::new(), 4);
+        t.publish(0, 7, 0x2000);
+        let first = t.record(0) as *const FnRecord;
+        t.clear(0);
+        assert_eq!(t.record(0).type_id(), PADDING_TYPE_ID);
+        t.publish(2, 7, 0x2000);
+        assert_eq!(t.record(2) as *const FnRecord, first);
+        assert_eq!(t.records.installed.lock().unwrap().len(), 1);
+    }
+
+    /// An instance's table names the same records, which live as long as the last table that can.
+    #[test]
+    fn an_instance_shares_its_records() {
+        let t = FnTable::new(vec![FnRecord::new(0, 0x1000)], 2);
+        let i = t.instance();
+        drop(t);
+        assert_eq!((i.record(0).type_id(), i.record(0).code()), (0, 0x1000));
+        assert_eq!(i.record(1).type_id(), PADDING_TYPE_ID);
     }
 }
 
@@ -2848,9 +3007,9 @@ pub struct VarMachineInfo {
 
 pub struct CompiledModule {
     /// The padded function table `call.dyn` dispatches through. Its address is threaded as
-    /// a runtime argument (not baked), but running code reads it — boxed so it never moves, and
+    /// a runtime argument (not baked), but running code reads it — its slots never move, and it is
     /// declared before `module` so drop order matches the old `drop(fn_table); drop(module)`.
-    fn_table: Box<[FnEntry]>,
+    fn_table: FnTable,
     /// The entry's buffer-ABI trampoline (finalized code, owned by `module`).
     tramp_code: *const u8,
     /// D66 — the entry's **limit-taking** trampoline (`build_trampoline(.., with_limit = true)`), the
@@ -3716,12 +3875,18 @@ impl CompiledModule {
         // effect unless the env var is set; used to compare temen-jit's generated code against other
         // backends (e.g. the Embench cross-engine bench).
         let dump_codegen = std::env::var_os("TEMEN_JIT_DUMP_CLIF").is_some();
-        // #2603 — the §4 window geometry the machine-code validator re-proves window accesses
-        // against (memoryless module ⇒ `None`, no window to confine).
-        let win_layout = (mask != 0).then(|| validate::WindowLayout {
-            mask,
-            guard_offset: guard_offset_of(win_reserved as u64),
-        });
+        // #2603 — what the machine-code validator checks this module's code against: the §4 window
+        // geometry it re-proves window accesses against (memoryless module ⇒ `None`, no window to
+        // confine), the fn table's size, and the contract a `call.dyn` of each type reaches.
+        let dyn_contracts = type_contracts(&distinct);
+        let guest = validate::Guest {
+            window: (mask != 0).then(|| validate::WindowLayout {
+                mask,
+                guard_offset: guard_offset_of(win_reserved as u64),
+            }),
+            table: table_len as u64,
+            types: &dyn_contracts,
+        };
         let base_bytes = define_funcs(
             &mut module,
             &ids,
@@ -3819,7 +3984,7 @@ impl CompiledModule {
                     }
                 }
             },
-            win_layout,
+            &guest,
         )?;
         let mut ctx = module.make_context();
 
@@ -3970,24 +4135,10 @@ impl CompiledModule {
         }
 
         // Build the function table (§3c) now that code addresses are known: power-of-two
-        // padded (to `table_len`, possibly B2-reserved beyond the module), AoS, host-owned.
+        // padded (to `table_len`, possibly B2-reserved beyond the module), host-owned.
         // `call.dyn` masks the guest index into this; padding/reserved slots trap until
         // `install` fills them.
-        let fn_table: Box<[FnEntry]> = (0..table_len)
-            .map(|slot| match m.funcs.get(slot) {
-                Some(f) => FnEntry::new(
-                    type_id_of(
-                        &distinct,
-                        &FuncType {
-                            params: f.params.clone(),
-                            results: f.results.clone(),
-                        },
-                    ),
-                    module.get_finalized_function(ids[slot]) as u64,
-                ),
-                None => FnEntry::padding(),
-            })
-            .collect();
+        let fn_table = FnTable::new(own_records(&m.funcs, &distinct, &module, &ids), table_len);
 
         let tramp_code = module.get_finalized_function(tramp);
         // I36 slice 3: resolve the handler trampolines now that code is finalized.
@@ -4319,11 +4470,7 @@ impl CompiledModule {
             hosted: self.hosted,
             nests: self.nests,
             page: self.page,
-            fn_table: self
-                .fn_table
-                .iter()
-                .map(|e| FnEntry::new(e.type_id(), e.code()))
-                .collect(),
+            fn_table: self.fn_table.instance(),
             tramp_code: self.tramp_code,
             tramp_code_limited: self.tramp_code_limited,
             serve_tramps: self.serve_tramps.clone(),
@@ -4608,7 +4755,7 @@ impl CompiledModule {
         let (fn_table_ptr, live, caller_window, reserved) = {
             let t = &*this;
             (
-                t.fn_table.as_ptr() as *const core::ffi::c_void,
+                t.fn_table.base(),
                 t.live_fault_range,
                 t.caller_window,
                 t.win_reserved,
@@ -4768,7 +4915,7 @@ impl CompiledModule {
             // protected and set rewinding by the fork (`ForkPoint::twin`), so none of the fresh
             // window's seeding below applies.
             let t = &*this;
-            let fn_table_ptr = t.fn_table.as_ptr() as *const core::ffi::c_void;
+            let fn_table_ptr = t.fn_table.base();
             (twin.window, t.win_mapped, t.mask, fn_table_ptr)
         } else {
             let t = &mut *this;
@@ -4809,19 +4956,18 @@ impl CompiledModule {
                 let sp_word = window.base().add(t.shadow.region_base(0) as usize) as *mut u64;
                 sp_word.write_unaligned(t.shadow.frame_base(0));
             }
-            let fn_table_ptr = t.fn_table.as_ptr() as *const core::ffi::c_void;
+            let fn_table_ptr = t.fn_table.base();
             (window, win_size, t.mask, fn_table_ptr)
         };
 
         let mem_base = window.base();
         let mut results = vec![0i64; n_results];
         // This run's instance context: the module's own instance (#1768 — the powerbox, kill-path
-        // cell, fuel cell and signal arm its compile was handed), entered by the root and shared with
-        // every vCPU and fiber of the run. Its field 0 is the trap cell — how the domain ended: 0
-        // while it runs; low 32 bits = a TrapKind / EXIT_CODE; high 32 bits = the exit code for an
-        // Exit. It is **shared across vCPU threads** (every spawned vCPU gets its address via
-        // `set_env`), so every end is a compare-and-swap from 0 — emitted code's and the runtime's
-        // alike ([`VmCtx::raise`]) — and the first end wins (#2499).
+        // cell, fuel cell and signal arm its compile was handed), entered by the root. It owns the
+        // domain's end: 0 while it runs; low 32 bits = a TrapKind / EXIT_CODE; high 32 bits = the
+        // exit code for an Exit. Each spawned vCPU runs on a context of its own that shares that end
+        // (#2488, `set_env`), so every end is a compare-and-swap from 0 — emitted code's and the
+        // runtime's alike ([`VmCtx::raise`]) — and the first end wins (#2499).
         let vm = VmCtx::new((*this).instance);
 
         // §12: the root vCPU (`main`) runs on this thread under the §5 detect-and-kill guard; any spawned
@@ -5140,10 +5286,10 @@ impl CompiledModule {
         if let Some(d) = &(*this).domain {
             // Owner decision 2026-07-24 — domain teardown (DESIGN.md §12; ISSUES.md I37; D37
             // death-is-revocation): the root vCPU has finished, which ends the domain — a trap or
-            // `exit` from any vCPU already sits in the shared cell, and a clean root return raises
-            // the internal `DOMAIN_DONE_CODE` sentinel ("root completion ends the activation").
-            // Either way every parked sibling (futex wait / join) is woken to observe the non-zero
-            // cell and unwind through its trailing trap-propagation guard, so `join_all` below
+            // `exit` from any vCPU is already the domain's end, and a clean root return raises the
+            // internal `DOMAIN_DONE_CODE` sentinel ("root completion ends the activation").
+            // Either way every parked sibling (futex wait / join) is woken to observe the end and
+            // unwind through its trailing trap-propagation guard, so `join_all` below
             // returns promptly instead of hanging on a parked daemon. A durable **freeze** is not
             // teardown: the root unwound under `UNWINDING` and parked siblings return through the
             // freeze re-issue machinery (the sentinel is skipped so their residue is recorded).
@@ -5371,10 +5517,8 @@ impl CompiledModule {
         let ref_slots: Option<Vec<u32>> = if funcs.iter().any(Func::names_own_funcs) {
             let free: Vec<u32> = self
                 .fn_table
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.type_id() == PADDING_TYPE_ID)
-                .map(|(i, _)| i as u32)
+                .free_slots()
+                .map(|i| i as u32)
                 .take(funcs.len())
                 .collect();
             if free.len() < funcs.len() {
@@ -5391,11 +5535,17 @@ impl CompiledModule {
         let nesting = self.nesting;
         let callees = Callees::new(&mut *module, &ids, funcs, types, self.fast_resolver)?;
         // Byte-accurate occupancy: each function's emitted code size. A unit's code is not kept.
-        // #2603 — the validator re-proves this unit's window accesses against the parent's geometry.
-        let win_layout = (self.mask != 0).then(|| validate::WindowLayout {
-            mask: self.mask,
-            guard_offset: guard_offset_of(self.win_reserved as u64),
-        });
+        // #2603 — the validator checks this unit's code against the parent's window, fn table and
+        // types.
+        let dyn_contracts = type_contracts(&self.distinct);
+        let guest = validate::Guest {
+            window: (self.mask != 0).then(|| validate::WindowLayout {
+                mask: self.mask,
+                guard_offset: guard_offset_of(self.win_reserved as u64),
+            }),
+            table: self.fn_table_mask + 1,
+            types: &dyn_contracts,
+        };
         let extra_bytes = define_funcs(
             &mut *module,
             &ids,
@@ -5426,7 +5576,7 @@ impl CompiledModule {
                 )
             },
             |_, _, _| {},
-            win_layout,
+            &guest,
         )?;
         self.extra_bytes += extra_bytes;
         let mut ctx = module.make_context();
@@ -5684,17 +5834,14 @@ impl CompiledModule {
     /// padding slot, returning that slot index — a funcref the guest (or another unit) can
     /// `call.dyn` at native speed (old→new / new→new). `None` if the table is full (every
     /// reserved slot taken). The base never moves (the table was pre-reserved at compile, the
-    /// mask is a baked constant), so this is just a slot write. The write is **release-ordered and
-    /// atomic** ([`FnEntry::publish`]), so it is sound against a concurrent `call.dyn` from
-    /// another thread — the JIT §6 #2 threaded-install path — not only the single-threaded MVP.
+    /// mask is a baked constant), so this is just a slot write: one release store of the function's
+    /// immutable record ([`FnTable::publish`]), sound against a concurrent `call.dyn` from another
+    /// thread — the JIT §6 #2 threaded-install path — not only the single-threaded MVP.
     /// Takes `&self`: the running generated code reads the table through raw pointers, so the host
     /// install must not claim a Rust exclusive borrow over it.
     pub fn install(&self, code: *const u8, type_id: u32) -> Option<u32> {
-        let slot = self
-            .fn_table
-            .iter()
-            .position(|e| e.type_id() == PADDING_TYPE_ID)?;
-        self.fn_table[slot].publish(type_id, code as u64);
+        let slot = self.fn_table.free_slots().next()?;
+        self.fn_table.publish(slot, type_id, code as u64);
         Some(slot as u32)
     }
 
@@ -5709,10 +5856,10 @@ impl CompiledModule {
         if i < self.n_real_funcs || i >= self.fn_table.len() {
             return false;
         }
-        if self.fn_table[i].type_id() == PADDING_TYPE_ID {
+        if self.fn_table.record(i).type_id() == PADDING_TYPE_ID {
             return false; // already empty
         }
-        self.fn_table[i].clear();
+        self.fn_table.clear(i);
         true
     }
 
@@ -5730,10 +5877,10 @@ impl CompiledModule {
         if i < self.n_real_funcs || i >= self.fn_table.len() {
             return false;
         }
-        if self.fn_table[i].type_id() != PADDING_TYPE_ID {
+        if self.fn_table.record(i).type_id() != PADDING_TYPE_ID {
             return false; // occupied — install_at never overwrites a live slot
         }
-        self.fn_table[i].publish(type_id, code as u64);
+        self.fn_table.publish(i, type_id, code as u64);
         true
     }
 
@@ -5744,12 +5891,10 @@ impl CompiledModule {
     /// fresh module with [`Self::install_at`]. Real module-function slots (`< n_real_funcs`) are
     /// excluded — they are reproduced by `compile` itself, not by the driver.
     pub fn installed_slots(&self) -> Vec<(u32, u64, u32)> {
-        self.fn_table
-            .iter()
-            .enumerate()
-            .skip(self.n_real_funcs)
-            .filter(|(_, e)| e.type_id() != PADDING_TYPE_ID)
-            .map(|(i, e)| (i as u32, e.code(), e.type_id()))
+        (self.n_real_funcs..self.fn_table.len())
+            .map(|i| (i, self.fn_table.record(i)))
+            .filter(|(_, r)| r.type_id() != PADDING_TYPE_ID)
+            .map(|(i, r)| (i as u32, r.code(), r.type_id()))
             .collect()
     }
 
@@ -5830,7 +5975,7 @@ pub unsafe fn invoke_handler(
     vmctx: *const VmCtx,
 ) {
     let cc = cc as *const CompiledModule;
-    let fn_table_ptr = (*cc).fn_table.as_ptr() as *const core::ffi::c_void;
+    let fn_table_ptr = (*cc).fn_table.base();
     let (lo, hi) = mem::fault_range_of(mem_base, mem_reserved as usize);
     vcpu_tls::set_serve_handlers(serve_handlers() + 1);
     let faulted = mem::run_guarded_range(
@@ -6532,14 +6677,6 @@ fn jit_isa() -> Result<cranelift_codegen::isa::OwnedTargetIsa, JitError> {
     // each pass, which names the pass that broke the CLIF.
     let per_pass = cfg!(any(debug_assertions, fuzzing));
     let _ = flags.set("enable_verifier", if per_pass { "true" } else { "false" });
-    // #2481 — when the machine-code validator runs, ask Cranelift to record each function's basic
-    // block start offsets (`CompiledCode::bb_starts`), the hints the validator checks control-flow
-    // targets against instead of recovering the CFG itself. Off otherwise, so a production compile
-    // that does not validate pays nothing. The flag adds metadata only; it does not change the code.
-    // Also on under `cfg(test)`, so the decoder/validator cross-check tests see real block layout.
-    if validate::enabled() || cfg!(test) {
-        let _ = flags.set("machine_code_cfg_info", "true");
-    }
     cranelift_native::builder()
         .map_err(|e| JitError::Backend(e.to_string()))?
         .finish(settings::Flags::new(flags))
@@ -6565,13 +6702,15 @@ fn define_funcs(
     code: &mut Codegen<'_>,
     lower: impl Fn(&mut cranelift_codegen::Context, usize) -> Result<(), JitError> + Sync,
     mut defined: impl FnMut(&JITModule, &CompiledCode, usize),
-    layout: Option<validate::WindowLayout>,
+    guest: &validate::Guest,
 ) -> Result<usize, JitError> {
     let keep = match code {
         Codegen::Replay(kept, imports) => return kept.replay(module, ids, imports),
         Codegen::Compile(keep) => keep,
     };
     let isa = jit_isa()?;
+    let contracts = callee_contracts(module);
+    let callee = &|id: u32| contracts.get(id as usize).copied().flatten();
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .clamp(1, ids.len().max(1));
@@ -6588,15 +6727,9 @@ fn define_funcs(
                     let mut ctx = cranelift_codegen::Context::new();
                     ctx.func.signature.call_conv = isa.default_call_conv();
                     lower(&mut ctx, i)?;
-                    let code = compile_verified(isa, &mut ctx, validate::Entry::Guest(layout))
-                        .map_err(JitError::Backend)?;
-                    let relocs = code
-                        .buffer
-                        .relocs()
-                        .iter()
-                        .map(|r| ModuleReloc::from_mach_reloc(r, &ctx.func, ids[i]))
-                        .collect();
-                    Ok((code, relocs))
+                    let entry = validate::Entry::Guest(guest);
+                    compile_verified(isa, &mut ctx, ids[i], entry, callee)
+                        .map_err(JitError::Backend)
                 }));
                 if done_tx.send((i, out)).is_err() {
                     break;
@@ -6621,13 +6754,14 @@ fn define_funcs(
                 #[cfg(test)]
                 record_emitted(module, code.code_buffer(), &relocs);
                 #[cfg(all(test, target_arch = "x86_64"))]
-                validate::capture_code(
-                    code.code_buffer(),
-                    &code.bb_starts,
-                    &code.bb_edges,
-                    validate::patches(relocs.iter().map(|r| (r.offset, r.kind))),
-                    layout,
-                );
+                validate::capture_code(validate::CapturedFn {
+                    code: code.code_buffer().to_vec(),
+                    relocs: validate::relocs(&relocs, callee, isa.default_call_conv()),
+                    window: guest.window,
+                    table: guest.table,
+                    types: guest.types.to_vec(),
+                    contract: callee(ids[next].as_u32()),
+                });
                 let kept = keep
                     .as_mut()
                     .is_some_and(|k| k.push(module, ids, align, code.code_buffer(), &relocs));
@@ -6662,13 +6796,16 @@ fn define_funcs(
 /// on the CLIF temen lowered, before Cranelift's passes rely on it being well formed, and on the CLIF
 /// those passes hand the backend. A lowering bug that makes malformed CLIF fails the compile there,
 /// and so does a pass that breaks it. With debug assertions and under the fuzzers, [`jit_isa`]'s
-/// `enable_verifier` also runs the verifier after each pass. No verifier sees the machine code the
-/// backend emits (#2481).
+/// `enable_verifier` also runs the verifier after each pass. Returns the code with the relocations
+/// that link it as function `id`. The machine-code validator (#2481) checks the code against those
+/// relocations and the contract `callee` gives each function a call names.
 fn compile_verified(
     isa: &dyn cranelift_codegen::isa::TargetIsa,
     ctx: &mut cranelift_codegen::Context,
+    id: FuncId,
     entry: validate::Entry,
-) -> Result<CompiledCode, String> {
+    callee: &(dyn Fn(u32) -> Option<validate::Contract> + Sync),
+) -> Result<(CompiledCode, Vec<ModuleReloc>), String> {
     let mut ctrl = cranelift_codegen::control::ControlPlane::default();
     ctx.verify(isa)
         .map_err(|e| format!("CLIF verifier, on the lowered CLIF: {e}"))?;
@@ -6680,22 +6817,49 @@ fn compile_verified(
         .compile_function(&ctx.func, &ctx.domtree, ctx.want_disasm, &mut ctrl)
         .map_err(|e| cranelift_module::ModuleError::from(e).to_string())?;
     let code = code.apply_params(&ctx.func.params);
+    let relocs: Vec<ModuleReloc> = code
+        .buffer
+        .relocs()
+        .iter()
+        .map(|r| ModuleReloc::from_mach_reloc(r, &ctx.func, id))
+        .collect();
     // #2481 — shadow-mode machine-code validation: check the emitted bytes against the policy and
     // log any disagreement, but never reject. `enabled()` is false on a production compile, so this
-    // is inert there; `jit_isa` only records `bb_starts`/`bb_edges` when it is true. `entry` says what
-    // is known of the function's entry: a guest function's window geometry, which the window-access
-    // policy re-proves against, or a trampoline's host ABI (#2603).
+    // is inert there. `entry` says what is known of the function's entry: a guest function's window
+    // geometry, which the window-access policy re-proves against, or a trampoline's host ABI (#2603).
     if validate::enabled() {
-        let patches = validate::patches(code.buffer.relocs().iter().map(|r| (r.offset, r.kind)));
-        validate::shadow_check(
-            code.code_buffer(),
-            &code.bb_starts,
-            &code.bb_edges,
-            &patches,
-            entry,
-        );
+        let checked = validate::relocs(&relocs, callee, isa.default_call_conv());
+        validate::shadow_check(code.code_buffer(), &checked, entry);
     }
-    Ok(code)
+    Ok((code, relocs))
+}
+
+/// #2603 — the contract of a function of each type id in `distinct` (its [`sig_from`]), which the
+/// machine-code validator gives a `call.dyn` whose type check matched. Empty when it doesn't run.
+fn type_contracts(distinct: &[FuncType]) -> Vec<Option<validate::Contract>> {
+    if !(validate::enabled() || cfg!(test)) {
+        return Vec::new();
+    }
+    distinct
+        .iter()
+        .map(|t| validate::contract(&sig_from(&t.params, &t.results)))
+        .collect()
+}
+
+/// #2603 — the contract of each function `module` declares, by `FuncId`, which the machine-code
+/// validator checks the calls that name it against. Empty when the validator doesn't run.
+fn callee_contracts(module: &JITModule) -> Vec<Option<validate::Contract>> {
+    let mut out = Vec::new();
+    if validate::enabled() || cfg!(test) {
+        for (id, decl) in module.declarations().get_functions() {
+            let i = id.as_u32() as usize;
+            if out.len() <= i {
+                out.resize(i + 1, None);
+            }
+            out[i] = validate::contract(&decl.signature);
+        }
+    }
+    out
 }
 
 /// Define `id` in `module` from `ctx`'s CLIF, compiled by [`compile_verified`], and return its code.
@@ -6708,14 +6872,10 @@ fn define_verified(
 ) -> Result<CompiledCode, JitError> {
     // Trampolines (cap thunks, fuel refill) are called under the host's ABI, not a guest function's
     // entry contract, so they get the validator's decode and control-flow layers only (#2603 PR 3).
-    let code =
-        compile_verified(module.isa(), ctx, validate::Entry::Host).map_err(JitError::Backend)?;
-    let relocs: Vec<ModuleReloc> = code
-        .buffer
-        .relocs()
-        .iter()
-        .map(|r| ModuleReloc::from_mach_reloc(r, &ctx.func, id))
-        .collect();
+    let contracts = callee_contracts(module);
+    let callee = |id: u32| contracts.get(id as usize).copied().flatten();
+    let (code, relocs) = compile_verified(module.isa(), ctx, id, validate::Entry::Host, &callee)
+        .map_err(JitError::Backend)?;
     module
         .define_function_bytes(
             id,
@@ -7182,7 +7342,11 @@ mod compile_verified_tests {
     fn malformed_clif_fails_the_compile_before_cranelifts_passes() {
         let isa = jit_isa().unwrap();
         let mut ctx = cranelift_codegen::Context::for_function(malformed(&*isa));
-        let err = compile_verified(&*isa, &mut ctx, validate::Entry::Host).unwrap_err();
+        let host = validate::Entry::Host;
+        let Err(err) = compile_verified(&*isa, &mut ctx, FuncId::from_u32(0), host, &|_| None)
+        else {
+            panic!("malformed CLIF compiled");
+        };
         assert!(
             err.starts_with("CLIF verifier, on the lowered CLIF"),
             "{err}"
@@ -7230,7 +7394,9 @@ mod compile_verified_tests {
     fn compile_verified_emits_what_cranelifts_compile_emits() {
         let isa = jit_isa().unwrap();
         let mut ours = cranelift_codegen::Context::for_function(summing(&*isa));
-        let code = compile_verified(&*isa, &mut ours, validate::Entry::Host).unwrap();
+        let host = validate::Entry::Host;
+        let (code, _) =
+            compile_verified(&*isa, &mut ours, FuncId::from_u32(0), host, &|_| None).unwrap();
         let mut theirs = cranelift_codegen::Context::for_function(summing(&*isa));
         let want = theirs.compile(&*isa, &mut Default::default()).unwrap();
         assert_eq!(code.code_buffer(), want.code_buffer());
@@ -7440,11 +7606,17 @@ fn compile_child_windowed(
     // the child spawns only when it uses them. Neither when no domain was supplied.
     let threads = futex_sched != 0;
     let spawns = threads && uses_threads;
-    // #2603 — the §14 child's own window geometry, for the validator's window-access re-proof.
-    let win_layout = (mask != 0).then(|| validate::WindowLayout {
-        mask,
-        guard_offset: guard_offset_of(reserved),
-    });
+    // #2603 — the §14 child's own window, fn table and types, which the validator checks its code
+    // against.
+    let dyn_contracts = type_contracts(&distinct);
+    let guest = validate::Guest {
+        window: (mask != 0).then(|| validate::WindowLayout {
+            mask,
+            guard_offset: guard_offset_of(reserved),
+        }),
+        table: fn_table_mask + 1,
+        types: &dyn_contracts,
+    };
     let base_bytes = define_funcs(
         &mut module,
         &ids,
@@ -7475,7 +7647,7 @@ fn compile_child_windowed(
             )
         },
         |_, _, _| {},
-        win_layout,
+        &guest,
     )?;
     let mut ctx = module.make_context();
     build_trampoline(
@@ -7572,21 +7744,7 @@ fn compile_child_windowed(
             None => (None, None),
         };
 
-    let fn_table: Box<[FnEntry]> = (0..table_len)
-        .map(|slot| match funcs.get(slot) {
-            Some(f) => FnEntry::new(
-                type_id_of(
-                    &distinct,
-                    &FuncType {
-                        params: f.params.clone(),
-                        results: f.results.clone(),
-                    },
-                ),
-                module.get_finalized_function(ids[slot]) as u64,
-            ),
-            None => FnEntry::padding(),
-        })
-        .collect();
+    let fn_table = FnTable::new(own_records(funcs, &distinct, &module, &ids), table_len);
 
     let code = module.get_finalized_function(tramp);
     let code_limited = module.get_finalized_function(tramp_limited);
@@ -7905,7 +8063,7 @@ fn sig_from(params: &[ValType], results: &[ValType]) -> cranelift_codegen::ir::S
     let mut sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
     sig.params.push(AbiParam::new(I64)); // mem_base
     sig.params.push(AbiParam::new(I64)); // fn_table_base
-    sig.params.push(AbiParam::new(I64)); // vmctx (the instance's context; field 0 its trap cell)
+    sig.params.push(AbiParam::new(I64)); // vmctx (this vCPU's context; field 0 its stop word)
                                          // §2b path B: a 4th context param — the running stack's limit: a fiber's `usable_low`, or the
                                          // root/thread-top's thread limit (`stack_check::thread_limit`, #1983). Threaded through every call (constant within
                                          // a stack's call tree; set anew at each fiber/root entry), so the prologue check reads a per-vCPU
@@ -8155,15 +8313,88 @@ impl PageEnv {
     }
 }
 
+/// #2488 — a function's shared exits, each made at its first use and filled after the function's own
+/// blocks ([`Exits::fill`]). Every early exit jumps into this chain rather than carrying its own copy:
+/// a trap to `raise`, a check that read the domain's end to `stop`, a check that read this vCPU's
+/// stop word to `unwind`.
+#[derive(Default)]
+struct Exits {
+    /// `raise(code, vmctx)`: end the domain with `code` ([`emit_raise`]), then `stop` on the end
+    /// that won.
+    raise: std::cell::Cell<Option<cranelift_codegen::ir::Block>>,
+    /// `stop(ended, vmctx)`: copy the end into the stop word ([`emit_stop`]), then `unwind`.
+    stop: std::cell::Cell<Option<cranelift_codegen::ir::Block>>,
+    /// `unwind()`: return zero results ([`emit_trap_return`]), so each caller's check returns in
+    /// turn.
+    unwind: std::cell::Cell<Option<cranelift_codegen::ir::Block>>,
+}
+
+impl Exits {
+    /// The exit in `slot`, made (cold, with `params` `i64` params) at its first use. The `vmctx` an
+    /// exit takes is passed, not looked up: the block is reached from every exit of the function.
+    fn get(
+        b: &mut FunctionBuilder,
+        slot: &std::cell::Cell<Option<cranelift_codegen::ir::Block>>,
+        params: usize,
+    ) -> cranelift_codegen::ir::Block {
+        slot.get().unwrap_or_else(|| {
+            let blk = b.create_block();
+            for _ in 0..params {
+                b.append_block_param(blk, I64);
+            }
+            b.set_cold_block(blk);
+            slot.set(Some(blk));
+            blk
+        })
+    }
+
+    fn raise(&self, b: &mut FunctionBuilder) -> cranelift_codegen::ir::Block {
+        Self::get(b, &self.raise, 2)
+    }
+
+    fn stop(&self, b: &mut FunctionBuilder) -> cranelift_codegen::ir::Block {
+        Self::get(b, &self.stop, 2)
+    }
+
+    fn unwind(&self, b: &mut FunctionBuilder) -> cranelift_codegen::ir::Block {
+        Self::get(b, &self.unwind, 0)
+    }
+
+    /// Fill the exits the function used, in chain order, since each jumps on to the next.
+    fn fill(&self, b: &mut FunctionBuilder, lower: &Lower) {
+        // No one op's position: every exit of the function comes here.
+        b.set_srcloc(SourceLoc::default());
+        if let Some(raise) = self.raise.get() {
+            b.switch_to_block(raise);
+            let (code, vmctx) = (b.block_params(raise)[0], b.block_params(raise)[1]);
+            let ended = emit_raise(b, vmctx, code);
+            let stop = self.stop(b);
+            let args = [BlockArg::from(ended), BlockArg::from(vmctx)];
+            b.ins().jump(stop, &args);
+        }
+        if let Some(stop) = self.stop.get() {
+            b.switch_to_block(stop);
+            let (ended, vmctx) = (b.block_params(stop)[0], b.block_params(stop)[1]);
+            emit_stop(b, vmctx, ended);
+            let unwind = self.unwind(b);
+            b.ins().jump(unwind, &[]);
+        }
+        if let Some(unwind) = self.unwind.get() {
+            b.switch_to_block(unwind);
+            emit_trap_return(b, lower);
+        }
+    }
+}
+
 /// Per-function lowering context shared across blocks.
 struct Lower<'a> {
     /// Holds `mem_base` (the window base) for load/store lowering and call threading.
     mem_var: Variable,
     /// Holds `fn_table_base` for `call.dyn` dispatch and call threading.
     fn_table_var: Variable,
-    /// Holds the instance's [`VmCtx`] pointer — which is also its trap cell (field 0), the host-owned
-    /// `*mut i64` a trap (or the cap thunk) writes before returning (the host reads it to learn the
-    /// run trapped, §5). Every other per-instance address is loaded from it ([`vmctx_load`]).
+    /// Holds this vCPU's [`VmCtx`] pointer — which is also its stop word (field 0), which a raise
+    /// (compiled code's or the cap thunk's) sets before returning, and the check after each call
+    /// reads (§5, #2488). Every other per-instance address is loaded from it ([`vmctx_load`]).
     vmctx_var: Variable,
     /// §2b path B: holds `stack_limit` (the running stack's `usable_low`, or 0 for the root), for the
     /// prologue [`emit_stack_check`] and to thread on to callees. Always present (the guard is in the
@@ -8222,8 +8453,8 @@ struct Lower<'a> {
     /// plain (non-atomic); the store⇒load dependency on the same address keeps Cranelift from hoisting
     /// the check out of a loop.
     fuel: bool,
-    /// DESIGN §12 domain teardown for **running** vCPUs: poll the domain's trap cell at every loop
-    /// back-edge (and the entry of a function that tail-calls), and unwind once it holds an end — a
+    /// DESIGN §12 domain teardown for **running** vCPUs: poll the domain's end at every loop
+    /// back-edge (and the entry of a function that tail-calls), and unwind once it holds one — a
     /// sibling's trap, the root's completion sentinel ([`DOMAIN_DONE_CODE`]), or a parent's teardown
     /// of a §14 child. On for code that can run beside other vCPUs (a threaded module, every §14
     /// child); a single-vCPU compile emits nothing.
@@ -8265,6 +8496,8 @@ struct Lower<'a> {
     /// ([`HostFn::PageMiss`]) imported into the function, and the variable holding the instance's
     /// access table, loaded once at entry. `None` for an unpaged compile.
     page: Option<(PageEnv, FuncRef, Variable)>,
+    /// #2488 — the function's shared exits ([`Exits`]).
+    exits: Exits,
 }
 
 /// The address of the §5 W3 explicit-trap capture helper (`temen_capture_explicit_trap` in
@@ -8368,7 +8601,7 @@ fn build_clif(
     let entry = b.create_block();
     b.append_block_param(entry, I64); // mem_base
     b.append_block_param(entry, I64); // fn_table_base
-    b.append_block_param(entry, I64); // vmctx (its field 0 is the trap cell)
+    b.append_block_param(entry, I64); // vmctx (its field 0 is the stop word)
     b.append_block_param(entry, I64); // stack_limit (§2b path B) — mirrors sig_from
     if sret {
         b.append_block_param(entry, I64); // return-area pointer (results spilled here, not returned)
@@ -8449,6 +8682,7 @@ fn build_clif(
         var_labels,
         trap_capture,
         page,
+        exits: Exits::default(),
     };
 
     // Jump into IR block 0 passing the function parameters (entry params after the three context
@@ -8481,6 +8715,7 @@ fn build_clif(
     for (i, blk) in f.blocks.iter().enumerate() {
         lower_block(&mut b, blk, i, &mut blocks, &mut checked, &lower)?;
     }
+    lower.exits.fill(&mut b, &lower);
 
     b.seal_all_blocks();
     b.finalize();
@@ -8695,9 +8930,8 @@ fn build_fiber_call_trampoline(clif: &mut Function) {
 /// `v128` (SIMD) crossing value; a scalar uses the low bytes. setjmp is rare, so the slack is free.
 const SETJMP_SAVE_STRIDE: usize = 16;
 
-/// #2537 — save the guest values **live across a `setjmp`** to a reuse-immune explicit stackslot,
-/// returning the slot and the `(value-index, type)` list to reload after the call (or `None` when
-/// nothing crosses). The caller stores before the libc `_setjmp` call and reloads after it.
+/// #2537 — save the values **live across a `setjmp`** to a reuse-immune explicit stackslot, for the
+/// caller to reload after the libc `_setjmp` call ([`Laundered::reload`]).
 ///
 /// Why this is needed. `_setjmp` lowers to an ordinary CLIF `call`, and neither Cranelift nor
 /// regalloc2 has a returns-twice concept. A value live across the call gets a spill slot; the
@@ -8709,19 +8943,22 @@ const SETJMP_SAVE_STRIDE: usize = 16;
 /// An **explicit** stackslot is never reused by regalloc and no guest op writes it, so it holds the
 /// pre-`setjmp` value on both returns.
 ///
-/// The set saved is exactly the IR values referenced at or after the `setjmp` (the rest of this
-/// block's insts and its terminator's edge args) that were defined before it. The terminator's edge
-/// args are the load-bearing case: a value forwarded to a successor block crosses the `setjmp`, and
-/// the IR still carries it as an edge arg even where the CLIF lowering drops it (#2448). `ubs` is
-/// deliberately left untouched — a laundered value keeps its IR identity and proven bound, so an
-/// elided access reads the reuse-immune copy and cannot be driven out of window by a clobbered
-/// reload.
+/// The set saved is the IR values referenced at or after the `setjmp` (the rest of this block's
+/// insts and its terminator's edge args) that were defined before it, and the lowering's context
+/// variables ([`context_vars`]). The terminator's edge args are the load-bearing IR case: a value
+/// forwarded to a successor block crosses the `setjmp`, and the IR still carries it as an edge arg
+/// even where the CLIF lowering drops it (#2448). The context variables are CLIF values no IR value
+/// names, and the code after the `setjmp` reads them: a clobbered function-table base sent a
+/// `call.dyn` through a forged entry (#2652). `ubs` is deliberately left untouched — a laundered
+/// value keeps its IR identity and proven bound, so an elided access reads the reuse-immune copy
+/// and cannot be driven out of window by a clobbered reload.
 fn launder_across_setjmp(
     b: &mut FunctionBuilder,
+    lower: &Lower,
     blk: &Block,
     inst_idx: usize,
     vals: &[Value],
-) -> Option<(cranelift_codegen::ir::StackSlot, Vec<(usize, Type)>)> {
+) -> Laundered {
     let defined = vals.len();
     let mut live = std::collections::BTreeSet::new();
     let mut note = |v: &u32| {
@@ -8734,23 +8971,72 @@ fn launder_across_setjmp(
         inst.for_each_operand(&mut note);
     }
     blk.term.for_each_operand(&mut note);
-    if live.is_empty() {
-        return None;
-    }
-    let saved: Vec<(usize, Type)> = live
+    let ctx: Vec<(Variable, Value)> = context_vars(lower)
         .into_iter()
-        .map(|i| (i, b.func.dfg.value_type(vals[i])))
+        .map(|var| (var, b.use_var(var)))
         .collect();
-    let save = b.create_sized_stack_slot(StackSlotData::new(
+    let saved: Vec<Value> = live
+        .iter()
+        .map(|&i| vals[i])
+        .chain(ctx.iter().map(|&(_, v)| v))
+        .collect();
+    let slot = b.create_sized_stack_slot(StackSlotData::new(
         StackSlotKind::ExplicitSlot,
         (saved.len() * SETJMP_SAVE_STRIDE) as u32,
         4, // align 2^4 = 16, so a v128 slot is aligned
     ));
-    for (k, &(i, _)) in saved.iter().enumerate() {
+    for (k, &v) in saved.iter().enumerate() {
         b.ins()
-            .stack_store(vals[i], save, (k * SETJMP_SAVE_STRIDE) as i32);
+            .stack_store(v, slot, (k * SETJMP_SAVE_STRIDE) as i32);
     }
-    Some((save, saved))
+    let ty = |b: &FunctionBuilder, v: Value| b.func.dfg.value_type(v);
+    Laundered {
+        slot,
+        vals: live.into_iter().map(|i| (i, ty(b, vals[i]))).collect(),
+        ctx: ctx.into_iter().map(|(var, v)| (var, ty(b, v))).collect(),
+    }
+}
+
+/// What [`launder_across_setjmp`] saved before a `_setjmp`, in its slot's entries in order: the IR
+/// values, then the context variables.
+struct Laundered {
+    slot: cranelift_codegen::ir::StackSlot,
+    /// Each IR value saved: its index in the block's value map, and its type.
+    vals: Vec<(usize, Type)>,
+    /// Each context variable saved, and its type.
+    ctx: Vec<(Variable, Type)>,
+}
+
+impl Laundered {
+    /// After the `_setjmp`, reload everything saved: the value map's entries become the reloaded
+    /// copies, so every later use in this block — and every successor's forwarded use, which reads
+    /// this block's final value map (#2448) — reads the reuse-immune slot, and each context
+    /// variable is redefined as its own copy.
+    fn reload(&self, b: &mut FunctionBuilder, vals: &mut [Value]) {
+        let at = |k: usize| (k * SETJMP_SAVE_STRIDE) as i32;
+        for (k, &(i, ty)) in self.vals.iter().enumerate() {
+            vals[i] = b.ins().stack_load(ty, self.slot, at(k));
+        }
+        for (k, &(var, ty)) in self.ctx.iter().enumerate() {
+            let v = b.ins().stack_load(ty, self.slot, at(self.vals.len() + k));
+            b.def_var(var, v);
+        }
+    }
+}
+
+/// The lowering's context variables: the CLIF values a function's code reads that no IR value
+/// names — the window base, the function table's base, the vmctx, the stack limit, the return
+/// area when it returns through one, and a demand-paged child's access table.
+fn context_vars(lower: &Lower) -> Vec<Variable> {
+    let mut vars = vec![
+        lower.mem_var,
+        lower.fn_table_var,
+        lower.vmctx_var,
+        lower.limit_var,
+    ];
+    vars.extend(lower.sret_var);
+    vars.extend(lower.page.as_ref().map(|&(_, _, table)| table));
+    vars
 }
 
 /// Lower one IR block's body + terminator into its CLIF block.
@@ -8832,7 +9118,7 @@ fn lower_block(
             // it here so it unwinds immediately (else the caller would run on with bogus results,
             // and a later successful `call.cap` could reset the cell, masking the trap). On the sret
             // path this also returns *before* reading the unwritten return-area slots.
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Guest);
             read_call_results(b, call, sret, results, &mut vals);
             continue;
         }
@@ -8847,7 +9133,7 @@ fn lower_block(
             }
             let call = b.ins().call_indirect(sig, code, &cargs);
             // Propagate a callee trap immediately (see the direct-call case above).
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Guest);
             read_call_results(b, call, sret, &ty.results, &mut vals);
             continue;
         }
@@ -8871,7 +9157,7 @@ fn lower_block(
             // crashing the differential — nightlies Jun 19 / Jul 2 / Jul 4, ISSUES.md I16.)
             if !temen_ir::served_shape_ok(*type_id, *op, sig) {
                 emit_trap_set(b, lower, TrapKind::CapFault);
-                emit_trap_propagate(b, lower);
+                emit_trap_propagate(b, lower, Callee::Host);
                 // Dead at runtime (the cell is already set), but keep the verifier's value
                 // accounting for the rest of the block: push zeros of the *declared* result types.
                 for t in &sig.results {
@@ -9050,7 +9336,7 @@ fn lower_block(
                 HostFn::FiberNew,
                 &[mem_base, fnt, vmctx, funcref, spv, fuel],
             )?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             vals.push(b.inst_results(call)[0]);
             continue;
         }
@@ -9092,7 +9378,7 @@ fn lower_block(
                     &[kh, av, status_ptr, vmctx],
                 )?
             };
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             let value = b.inst_results(call)[0];
             let status64 = b.ins().stack_load(I64, ss, 0);
             let status = b.ins().ireduce(I32, status64);
@@ -9105,7 +9391,7 @@ fn lower_block(
             let v = get(&vals, *value)?;
             let vmctx = b.use_var(lower.vmctx_var);
             let call = call_host(lower.callees, b, HostFn::FiberSuspend, &[v, vmctx])?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             vals.push(b.inst_results(call)[0]);
             continue;
         }
@@ -9117,12 +9403,12 @@ fn lower_block(
         // `i32` 0 (direct) / long-jump value (re-entry). The slot alloc is infallible, so no
         // trap-propagate.
         if let Inst::SetJmp { buf } = inst {
-            let bufv = get(&vals, *buf)?; // i64 guest jmp_buf window address (the table key)
-                                          // #2537: save every guest value live across this setjmp to a
-                                          // reuse-immune explicit stackslot *before* the call; reloaded
-                                          // after it, so both returns (direct and via longjmp) read the
-                                          // saved copy, not a spill slot the longjmp path may clobber.
-            let laundered = launder_across_setjmp(b, blk, inst_idx, &vals);
+            // The guest jmp_buf's window address: the key of its host table entry.
+            let bufv = get(&vals, *buf)?;
+            // #2537, #2652: save every value live across this setjmp to a reuse-immune explicit
+            // stackslot *before* the call, and reload it after, so both returns (direct and via
+            // longjmp) read the saved copy, not a spill slot the longjmp path may clobber.
+            let laundered = launder_across_setjmp(b, lower, blk, inst_idx, &vals);
             // slot = rt_setjmp_slot(rt_addr, buf) -> *mut jmp_buf
             let rt_addr = vmctx_load(b, lower, vmctx::SETJMP);
             let c1 = call_host(lower.callees, b, HostFn::SetjmpSlot, &[rt_addr, bufv])?;
@@ -9132,16 +9418,7 @@ fn lower_block(
             let r = b.inst_results(c2)[0];
             // No check point's base crosses the call (#2652): a later access tests its own.
             checked.forget();
-            // #2537: reload the saved values and rewrite the value map to the reloaded copies, so every
-            // later use in this block — and every successor's forwarded use (which reads this block's
-            // final value map, #2448) — sources the value from the reuse-immune slot.
-            if let Some((save, saved)) = laundered {
-                for (k, &(i, ty)) in saved.iter().enumerate() {
-                    vals[i] = b
-                        .ins()
-                        .stack_load(ty, save, (k * SETJMP_SAVE_STRIDE) as i32);
-                }
-            }
+            laundered.reload(b, &mut vals);
             vals.push(r);
             continue;
         }
@@ -9163,8 +9440,9 @@ fn lower_block(
                 &[rt_addr, bufv, vmctx],
             )?;
             let slot = b.inst_results(c1)[0];
-            emit_trap_propagate(b, lower); // bail on a miss (forged/stale token) before `_longjmp`
-                                           // _longjmp(slot, val) — inline, noreturn.
+            // Bail on a miss (forged/stale token) before `_longjmp`.
+            emit_trap_propagate(b, lower, Callee::Host);
+            // _longjmp(slot, val) — inline, noreturn.
             call_host(lower.callees, b, HostFn::Longjmp, &[slot, valv])?;
             continue;
         }
@@ -9251,7 +9529,7 @@ fn lower_block(
             }
             let args_ptr = b.ins().stack_addr(I64, slot, 0);
             let call = call_host(lower.callees, b, HostFn::GcRoots, &[args_ptr])?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             vals.push(b.inst_results(call)[0]);
             continue;
         }
@@ -9283,7 +9561,7 @@ fn lower_block(
                 HostFn::ThreadSpawn,
                 &[sched, mem_base, fnt, vmctx, func_idx, spv, av],
             )?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             vals.push(b.inst_results(call)[0]);
             continue;
         }
@@ -9293,7 +9571,7 @@ fn lower_block(
             let h = get(&vals, *handle)?;
             let vmctx = b.use_var(lower.vmctx_var);
             let call = call_host(lower.callees, b, HostFn::ThreadJoin, &[sched, h, vmctx])?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             vals.push(b.inst_results(call)[0]);
             continue;
         }
@@ -9329,7 +9607,7 @@ fn lower_block(
                 HostFn::ThreadWait,
                 &[sched, phys, exp, width, to, vmctx],
             )?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             vals.push(b.inst_results(call)[0]);
             continue;
         }
@@ -10436,6 +10714,11 @@ fn lower_block(
 /// by the caller with its own ordering.
 fn vmctx_load(b: &mut FunctionBuilder, lower: &Lower, field: i32) -> Value {
     let vmctx = b.use_var(lower.vmctx_var);
+    vmctx_field(b, vmctx, field)
+}
+
+/// [`vmctx_load`] from the context at `vmctx`.
+fn vmctx_field(b: &mut FunctionBuilder, vmctx: Value, field: i32) -> Value {
     let flags = MemFlags::trusted().with_readonly().with_can_move();
     b.ins().load(I64, flags, vmctx, field)
 }
@@ -10493,30 +10776,37 @@ fn read_call_results(
     }
 }
 
-/// Lower a trap (§5 detect-and-kill): store the kind code into the host trap cell, then
-/// `return` dummy zero results so the run unwinds to the trampoline, which reports the
-/// trap. (The reference JIT detects traps this way; production uses hardware faults.)
-///
-/// Caveat: this returns from the *current* function only. The current scalar tests put
-/// every trap in the entry function (or its dispatch), so that suffices; propagating a
-/// trap *out of a callee* would need a post-call check, added when a case needs it.
+/// Lower a trap (§5 detect-and-kill): under `-g`, record its backtrace here, then jump to the
+/// function's raise exit ([`Exits`]), which raises `kind` as the domain's end and returns zero
+/// results. Each caller's post-call check ([`emit_trap_propagate`]) returns in turn, up to the
+/// entry trampoline, which reports the trap.
 fn emit_trap(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
-    emit_trap_set(b, lower, kind);
-    emit_trap_return(b, lower);
+    emit_trap_capture(b, lower);
+    let code = b.ins().iconst(I64, kind as u32 as i64); // full i64 cell (high bits 0)
+    let vmctx = b.use_var(lower.vmctx_var);
+    let raise = lower.exits.raise(b);
+    b.ins()
+        .jump(raise, &[BlockArg::from(code), BlockArg::from(vmctx)]);
 }
 
-/// Record a trap in the cell (with the §5 W3 backtrace capture) **without** terminating the block.
-/// Callers pair it with [`emit_trap_return`] (an unconditional trap, via [`emit_trap`]) or with
-/// [`emit_trap_propagate`] (the shared branch-on-cell exit) when compilation of the rest of the
-/// block must continue — the branch keeps the continuation formally reachable, so later
+/// Record a trap (with the §5 W3 backtrace capture) **without** terminating the block. The caller
+/// pairs it with [`emit_trap_propagate`] (the shared branch-on-stop exit) when compilation of the
+/// rest of the block must continue — the branch keeps the continuation formally reachable, so later
 /// instructions still lower against a well-formed value stack even though they are dead at runtime.
 fn emit_trap_set(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
-    // §5 W3 Stage 2: record a source backtrace for this explicit trap *before* it unwinds — the trap
-    // stores its kind and returns, and that return propagates up tearing down every guest frame, so
-    // the helper must walk the frame-pointer chain from this live site now. The current op's
-    // `SourceLoc` is in effect, so the call inherits it and symbolizes to the trapping op's line.
-    // Only present under `-g` (else the backtrace would be empty); the trap path is otherwise
-    // unchanged.
+    emit_trap_capture(b, lower);
+    let code = b.ins().iconst(I64, kind as u32 as i64); // full i64 cell (high bits 0)
+    let vmctx = b.use_var(lower.vmctx_var);
+    let ended = emit_raise(b, vmctx, code);
+    emit_stop(b, vmctx, ended);
+}
+
+/// §5 W3 Stage 2: record a source backtrace for an explicit trap *before* it unwinds — the trap
+/// records its kind and returns, and that return propagates up tearing down every guest frame, so
+/// the helper must walk the frame-pointer chain from this live site now. The current op's
+/// `SourceLoc` is in effect, so the call inherits it and symbolizes to the trapping op's line. Only
+/// present under `-g` (else the backtrace would be empty).
+fn emit_trap_capture(b: &mut FunctionBuilder, lower: &Lower) {
     if let Some(capture) = lower.trap_capture {
         // Pass the trapping function's frame pointer so the helper can walk the caller chain without
         // `__builtin_frame_address` (which MSVC lacks); it pairs `fp` with its own return address (the
@@ -10524,12 +10814,23 @@ fn emit_trap_set(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
         let fp = b.ins().get_frame_pointer(I64);
         b.ins().call(capture, &[fp]);
     }
-    let cell = b.use_var(lower.vmctx_var);
+}
+
+/// End the domain with `code`, returning the end that won, for the caller to stop on. #2499 — raise,
+/// never store: the domain's end holds the first end any of its vCPUs raised ([`VmCtx::raise`]).
+fn emit_raise(b: &mut FunctionBuilder, vmctx: Value, code: Value) -> Value {
+    let end = vmctx_field(b, vmctx, vmctx::END);
     let none = b.ins().iconst(I64, 0);
-    let code = b.ins().iconst(I64, kind as u32 as i64); // full i64 cell (high bits 0)
-                                                        // #2499 — raise, never store: the cell holds the domain's end, and an end a sibling vCPU raised
-                                                        // first stands ([`VmCtx::raise`]).
-    b.ins().atomic_cas(atomic_flags(), cell, none, code);
+    let first = b.ins().atomic_cas(atomic_flags(), end, none, code);
+    let won = b.ins().icmp_imm(IntCC::Equal, first, 0);
+    b.ins().select(won, code, first)
+}
+
+/// #2488 — copy the domain's end `ended` into the stop word of the context at `vmctx`, so the check
+/// after each call up this vCPU's stack returns too.
+fn emit_stop(b: &mut FunctionBuilder, vmctx: Value, ended: Value) {
+    let none = b.ins().iconst(I64, 0);
+    b.ins().atomic_cas(atomic_flags(), vmctx, none, ended);
 }
 
 /// Emit the function `return` on a trap / early-exit path: **void** for an sret function (its results
@@ -10576,27 +10877,27 @@ fn emit_epoch_check(b: &mut FunctionBuilder, lower: &Lower) {
 
 /// Emit the domain-teardown poll ([`Lower::domain_poll`]) — at loop back-edges and at the entry of
 /// a function that tail-calls: if this vCPU's domain has ended — a sibling's trap or `exit`, the
-/// root's completion, or a parent's `kill` or teardown, all raised on the trap cell — return
-/// straight up the stack, as a call's trap-propagation guard does. The cell is only read, so the
-/// value that ended the domain is the one reported. The load is atomic for the reason
-/// [`emit_epoch_check`]'s is: another thread writes the cell, and a plain load could be hoisted out
-/// of the loop it bounds. A no-op when `domain_poll` is off.
+/// root's completion, or a parent's `kill` or teardown, all raised on the domain's end — copy the
+/// end into this context's stop word and return straight up the stack, as a call's
+/// trap-propagation guard does. The load is atomic for the reason [`emit_epoch_check`]'s is:
+/// another thread writes the end, and a plain load could be hoisted out of the loop it bounds. The
+/// end's address, a field of the context, can be. A no-op when `domain_poll` is off.
 ///
 /// On return the builder is positioned at the continuation block.
 fn emit_domain_poll(b: &mut FunctionBuilder, lower: &Lower) {
     if !lower.domain_poll {
         return;
     }
-    let cell = b.use_var(lower.vmctx_var);
-    let ended = b.ins().atomic_load(I64, atomic_flags(), cell);
-    let stop = b.create_block();
+    let vmctx = b.use_var(lower.vmctx_var);
+    let end = vmctx_field(b, vmctx, vmctx::END);
+    let ended = b.ins().atomic_load(I64, atomic_flags(), end);
+    // Taken once per vCPU lifetime: the stop exit is cold, off the loop's fall-through path.
+    let stop = lower.exits.stop(b);
     let cont = b.create_block();
-    b.set_cold_block(stop); // taken once per vCPU lifetime: keep it off the loop's fall-through path
-    b.ins().brif(ended, stop, &[], cont, &[]);
-    b.switch_to_block(stop);
-    emit_trap_return(b, lower);
+    let args = [BlockArg::from(ended), BlockArg::from(vmctx)];
+    b.ins().brif(ended, stop, &args, cont, &[]);
     b.switch_to_block(cont);
-    // `stop`/`cont` are sealed by the caller's `seal_all_blocks`.
+    // `cont` is sealed by the caller's `seal_all_blocks`.
 }
 
 /// #932 — emit the async-signal **delivery safepoint**: poll the host `armed` flag
@@ -10664,7 +10965,7 @@ fn emit_signal_check(b: &mut FunctionBuilder, lower: &Lower) -> Result<(), JitEr
     b.ins().call_indirect(hsig, code, &cargs);
     // The handler may `exit`/trap or `longjmp`; propagate a set trap cell now (unwinds this function),
     // exactly as after a `call.dyn`. Leaves the builder in a fresh continuation block.
-    emit_trap_propagate(b, lower);
+    emit_trap_propagate(b, lower, Callee::Guest);
     // Handler returned normally: notify the host (restore the block-during-handler mask, pop nesting).
     let ctx2 = vmctx_load(b, lower, vmctx::SIG_CTX);
     call_host(lower.callees, b, HostFn::SigReturn, &[ctx2])?;
@@ -10892,13 +11193,16 @@ fn indirect_dispatch(b: &mut FunctionBuilder, lower: &Lower, idx: Value, ty: &Fu
     let idx64 = b.ins().uextend(I64, idx);
     let m = b.ins().iconst(I64, lower.fn_table_mask as i64);
     let slot = b.ins().band(idx64, m);
-    // entry_addr = fn_table_base + slot * sizeof(FnEntry=16)
-    let off = b.ins().imul_imm(slot, 16);
+    // The slot holds its record's address (`FnTable`, 8 bytes a slot): one load, so the type id
+    // checked and the code called below are one record's, whatever an `install` on another thread
+    // does to the slot meanwhile (#2680).
+    let off = b.ins().imul_imm(slot, 8);
     let base = b.use_var(lower.fn_table_var);
-    let entry_addr = b.ins().iadd(base, off);
+    let slot_addr = b.ins().iadd(base, off);
+    let record = b.ins().load(I64, MemFlags::trusted(), slot_addr, 0);
 
     // type_id check against the call's expected id.
-    let tid = b.ins().load(I32, MemFlags::trusted(), entry_addr, 0);
+    let tid = b.ins().load(I32, MemFlags::trusted(), record, 0);
     let expected = type_id_of(lower.distinct, ty);
     let want = b.ins().iconst(I32, expected as i32 as i64);
     let cond = b.ins().icmp(IntCC::Equal, tid, want);
@@ -10911,25 +11215,47 @@ fn indirect_dispatch(b: &mut FunctionBuilder, lower: &Lower, idx: Value, ty: &Fu
     b.switch_to_block(matched);
     b.seal_block(matched);
     // code pointer at offset 8.
-    b.ins().load(I64, MemFlags::trusted(), entry_addr, 8)
+    b.ins().load(I64, MemFlags::trusted(), record, 8)
 }
 
-/// Emit "if the host trap cell is non-zero, propagate the trap now": branch to an early
-/// `return` of zero-valued results (the trap kind / exit code already sits in the cell, which the
-/// entry trampoline reads to decide `Trapped`/`Exited`). Used after **every** `call.cap` *and*
-/// every `call`/`call.dyn`, so a trap raised deep in a callee unwinds the whole guest stack
-/// immediately — before any later op can observe bogus zero results. A sibling vCPU's end stops
-/// this one here too: the cell is the domain's, and nothing clears it during a run (#2499).
-fn emit_trap_propagate(b: &mut FunctionBuilder, lower: &Lower) {
+/// What a call's trap check follows (#2488), which decides the word it reads.
+#[derive(Clone, Copy)]
+enum Callee {
+    /// Guest code, run on this vCPU's stack: whatever ended it stopped this context first (a raise,
+    /// a poll or a host call's check, each of which writes the stop word), so the stop word is
+    /// enough, and the check stays one load on the hot path.
+    Guest,
+    /// The host, which may have seen another vCPU end the domain (a join, a park, a fiber that
+    /// trapped on its creator's context): read the domain's end, and copy it into the stop word
+    /// before returning.
+    Host,
+}
+
+/// Emit "if this vCPU has stopped, propagate the end now": branch to an early `return` of
+/// zero-valued results (the end already sits in the domain's word, which the entry trampoline reads
+/// to decide `Trapped`/`Exited`). Used after **every** `call.cap` *and* every `call`/`call.dyn`, so
+/// a trap raised deep in a callee unwinds the whole guest stack immediately — before any later op
+/// can observe bogus zero results. A sibling vCPU's end stops this one at the first check after a
+/// host call: the end is the domain's, and nothing clears it during a run (#2499).
+fn emit_trap_propagate(b: &mut FunctionBuilder, lower: &Lower, callee: Callee) {
     let vmctx = b.use_var(lower.vmctx_var);
-    let tc = b.ins().load(I64, MemFlags::trusted(), vmctx, 0);
-    let trapped = b.ins().icmp_imm(IntCC::NotEqual, tc, 0);
-    let trapret = b.create_block();
     let cont = b.create_block();
-    b.ins().brif(trapped, trapret, &[], cont, &[]);
-    b.switch_to_block(trapret);
-    b.seal_block(trapret);
-    emit_trap_return(b, lower);
+    match callee {
+        Callee::Guest => {
+            let stopped = b.ins().load(I64, MemFlags::trusted(), vmctx, 0);
+            let unwind = lower.exits.unwind(b);
+            b.ins().brif(stopped, unwind, &[], cont, &[]);
+        }
+        Callee::Host => {
+            // Not [`vmctx_field`]: a movable load is re-placed without a source position, and this
+            // one sits at the call's return address, which a parked fiber's backtrace symbolizes.
+            let end = b.ins().load(I64, MemFlags::trusted(), vmctx, vmctx::END);
+            let ended = b.ins().load(I64, MemFlags::trusted(), end, 0);
+            let stop = lower.exits.stop(b);
+            let args = [BlockArg::from(ended), BlockArg::from(vmctx)];
+            b.ins().brif(ended, stop, &args, cont, &[]);
+        }
+    }
     b.switch_to_block(cont);
     b.seal_block(cont);
 }
@@ -10970,7 +11296,7 @@ fn lower_cap_call_fast(
     let call = b.ins().call(callee, &call_args);
 
     // If the specialized fn set the trap cell, propagate (the cell already holds the kind / exit code).
-    emit_trap_propagate(b, lower);
+    emit_trap_propagate(b, lower, Callee::Host);
 
     if n_res == 1 {
         let slot = b.inst_results(call)[0]; // the i64 return register
@@ -11076,7 +11402,7 @@ fn lower_cap_call(
 
     // If the thunk set the trap cell, propagate (return early; the cell already holds
     // the kind / exit code).
-    emit_trap_propagate(b, lower);
+    emit_trap_propagate(b, lower, Callee::Host);
 
     // Read the result slots back.
     if let Some(ss) = res_ss {
@@ -11130,7 +11456,7 @@ fn lower_instantiator(
                 HostFn::InstJoin,
                 &[nursery, mem_base, h, child, status_ptr, vmctx],
             )?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             let value = b.inst_results(call)[0];
             let status = b.ins().stack_load(I64, ss, 0);
             vals.push(result_as(b, status, sig.results[0]));
@@ -11152,7 +11478,7 @@ fn lower_instantiator(
                 thunk,
                 &[nursery, mem_base, h, child, vmctx],
             )?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
         }
@@ -11178,7 +11504,7 @@ fn lower_instantiator(
                 HostFn::InstSpawn,
                 &[nursery, mem_base, mem_size, h, record_ptr, vmctx],
             )?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
         }
@@ -11202,7 +11528,7 @@ fn lower_instantiator(
                 thunk,
                 &[nursery, mem_base, h, child, arg, vmctx],
             )?;
-            emit_trap_propagate(b, lower);
+            emit_trap_propagate(b, lower, Callee::Host);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
         }
@@ -11680,7 +12006,7 @@ fn emit_page_miss(
     let vm = b.use_var(lower.vmctx_var);
     let flags = b.ins().iconst(I64, flags as i64);
     b.ins().call(thunk, &[vm, base, off, len, flags]);
-    emit_trap_propagate(b, lower);
+    emit_trap_propagate(b, lower, Callee::Host);
 }
 
 /// **Bulk-span backed-extent probe (ISSUES.md I21).** Fault a bulk span that overruns the

@@ -79,8 +79,8 @@ fn ci_has_every_tool_the_auto_skips_probe_for() {
     assert_eq!(
         rustc_llvm, link_llvm,
         "rustc's LLVM major ({rustc_llvm:?}) != the installed llvm-link's ({link_llvm:?}) — the \
-         peval probes would auto-skip. Bump `LLVM_MAJOR` in scripts/ci/install-llvm.sh to match \
-         `RUST_STABLE`'s LLVM (`rustc -vV`), or vice versa."
+         build-std probes would fail in llvm-link. Bump `LLVM_MAJOR` in scripts/ci/install-llvm.sh \
+         to match `RUST_STABLE`'s LLVM (`rustc -vV`), or vice versa."
     );
 }
 

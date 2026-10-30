@@ -841,6 +841,13 @@ jobs:
       - name: JS-defined powerbox (headless)
         working-directory: browser
         run: node browser-jspb-test.mjs target/wasm32-unknown-unknown/release/temen_browser.wasm
+      # #1312, #1414 5d: on the plain build a pump root's window grows in the engine's memory by
+      # reallocating, and the shipped JS driver must follow it: its post-bounce `"win"` fan-out runs
+      # only here (the threads build's roots have memories of their own). Node only; it reuses the
+      # wasm32 build above.
+      - name: coop window growth on the plain build (headless)
+        working-directory: browser
+        run: node browser-coop-grow-test.mjs target/wasm32-unknown-unknown/release/temen_browser.wasm
 
   browser-host-guests:
     # The browser crate is its OWN cargo workspace, so the gating `check` job's
@@ -1079,8 +1086,10 @@ jobs:
           node browser-foreign-mem-test.mjs
           # #1312 the cooperative window grows: a guest whose allocator `vm_map`s past the 32 MiB coop
           # run window runs on the emitted tier through the REAL JS driver (the native wasmi
-          # differential plays the driver's role; this is the shipped `driveCoopTierupRun`, the only
-          # place the post-bounce `"win"` fan-out over a relocating backing is exercised).
+          # differential plays the driver's role; this is the shipped `driveCoopTierupRun`). #1414 5d:
+          # here a root's window is a memory of its own, grown past 256 MiB without growing the engine's
+          # memory, bounded by the run's grant, and a collector's spilled roots reach `gc.roots`. The
+          # plain build's window relocates as it grows: the wasm32 differential job runs this file there.
           node browser-coop-grow-test.mjs
           # #1896: a process tree's leaf processes run whole on the emitted tier through the REAL JS
           # driver (`temen_nim_open` + `driveCoopTierupRun`): a leaf child tiers up at its entry, as a
