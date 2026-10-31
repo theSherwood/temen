@@ -64,6 +64,28 @@ pub(crate) struct Contract {
     pub pops: Option<u32>,
 }
 
+/// What the validator knows of a function's own frame at entry (#2603 PR 3): the bytes of incoming
+/// stack arguments it may read above the return address (its own `Contract::pops`, `None` when the
+/// convention doesn't pin them), and, when it returns more than `MAX_REG_RESULTS` results, the
+/// number of result slots it writes through the caller's `sret` pointer (in r8). A trampoline's is
+/// `Frame::UNKNOWN`: no stack extent until #2603 PR 3b gives it a contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Frame {
+    pub stack_args: Option<u32>,
+    pub sret_results: Option<u32>,
+}
+
+impl Frame {
+    /// A trampoline's frame, or a test's: no known incoming stack args, no sret. Only the x86-64
+    /// tests use it (production always builds a `Frame` from the signature), so it is dead code
+    /// elsewhere — including the aarch64 test build (#2642).
+    #[cfg_attr(not(all(test, target_arch = "x86_64")), allow(dead_code))]
+    pub(crate) const UNKNOWN: Frame = Frame {
+        stack_args: None,
+        sret_results: None,
+    };
+}
+
 /// The contract of a callee with signature `sig`. Every convention temen calls clobbers the SysV
 /// caller-saved registers, except `PreserveAll`, which clobbers only the registers it returns in. A
 /// `Tail` callee pops its stack arguments; the others leave them to the caller. `None` for a
@@ -196,9 +218,9 @@ pub(crate) enum Entry<'a> {
 
 /// Validate one emitted function's `bytes` against its relocations and what is known of its
 /// `entry`. Shadow mode: every problem is logged and counted, never returned.
-pub(crate) fn shadow_check(bytes: &[u8], relocs: &[Reloc], entry: Entry) {
+pub(crate) fn shadow_check(bytes: &[u8], relocs: &[Reloc], entry: Entry, frame: Frame) {
     #[cfg(target_arch = "x86_64")]
-    for f in x86::check(bytes, relocs, entry) {
+    for f in x86::check(bytes, relocs, entry, frame) {
         // Count every disagreement (a fuzz run asserts the total), but cap the logging so a bad
         // decode on every module can't swamp a fuzzer's stderr.
         let n = DISAGREEMENTS.fetch_add(1, Ordering::Relaxed);
@@ -207,7 +229,7 @@ pub(crate) fn shadow_check(bytes: &[u8], relocs: &[Reloc], entry: Entry) {
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = (bytes, relocs, entry);
+    let _ = (bytes, relocs, entry, frame);
 }
 
 // --- test-only capture of real compiled code, cross-checked against iced-x86 ---
@@ -222,6 +244,7 @@ pub(crate) fn shadow_check(bytes: &[u8], relocs: &[Reloc], entry: Entry) {
 pub(crate) struct CapturedFn {
     pub code: Vec<u8>,
     pub relocs: Vec<Reloc>,
+    pub sret_results: Option<u32>,
     pub window: Option<WindowLayout>,
     pub table: u64,
     pub types: Vec<Option<Contract>>,
@@ -264,7 +287,7 @@ pub(crate) mod x86 {
     //! classification), the machine-CFG recovery and abstract dataflow (#2535), and the
     //! memory-access confinement policy (#2535/#2603) they feed.
 
-    use super::{Contract, Entry, Guest, Reloc, WindowLayout, SYSV_CLOBBERS};
+    use super::{Contract, Entry, Frame, Guest, Reloc, WindowLayout, SYSV_CLOBBERS};
 
     /// A machine-code policy disagreement: `why`, at byte offset `at` in the function.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -280,12 +303,25 @@ pub(crate) mod x86 {
         pub const RSP: u8 = 4; // stack pointer
         pub const RSI: u8 = 6; // fn_table_base (arg 1)
         pub const RDI: u8 = 7; // mem_base (arg 0)
+        pub const R8: u8 = 8; // sret return-area pointer (arg 4, when present)
+        /// The callee-saved GP registers (SysV): rbx, rbp, r12–r15. A function must leave each as it
+        /// found it (claim item 4); every other GP register a call may clobber.
+        pub const CALLEE_SAVED: [u8; 6] = [3, 5, 12, 13, 14, 15];
+        /// The integer argument registers a call passes in (SysV/Tail): rdi, rsi, rdx, rcx, r8, r9.
+        /// A native frame pointer handed to a callee rides one of these.
+        pub const ARG_REGS: [u8; 6] = [7, 6, 2, 1, 8, 9];
     }
 
     /// The largest machine access width (AVX-512 zmm) — used as a sound over-estimate when checking
     /// that a confined access's displacement rides within the guard slack. (Decoding the exact width
     /// is a precision refinement; over-estimating only ever rejects, never admits, so it is sound.)
     const MAX_ACCESS_WIDTH: u64 = 64;
+
+    /// The headroom (bytes) the prologue's overflow check reserves below the stack limit
+    /// ([`crate::stack_check::RED_ZONE`], the single source of truth so the two cannot drift). A
+    /// guest frame must stay within it (I5): the check proves `rsp − RED_ZONE ≥ limit`, so any
+    /// `rsp` no deeper than `RED_ZONE` below entry addresses memory at or above the limit.
+    const RED_ZONE: i64 = crate::stack_check::RED_ZONE as i64;
 
     /// What a GP register holds, for the #2535 window-access policy. A finite lattice: [`Fact::meet`]
     /// is the fact true on *both* predecessors (`Unknown` when they disagree). `Bounded`'s upper
@@ -334,6 +370,14 @@ pub(crate) mod x86 {
         /// A pointer into the window, `mem_base + o` with `o ≤ .0`: what `lea r, [mem_base +
         /// confined]` computes for the accesses that share one address.
         WinPtr(u64),
+        /// The entry value of a callee-saved register `.0` (rbx, rbp, r12–r15). At every exit the
+        /// register must hold this again, so the caller's value is preserved (claim item 4). It flows
+        /// through a spill slot: the prologue saves it, the epilogue reloads it.
+        Saved(u8),
+        /// The caller's result-area pointer (`sret`, in r8 at entry) of a function that returns more
+        /// than `MAX_REG_RESULTS` results: the function writes its `.0` eight-byte result slots
+        /// through it, so `[0, .0·8)` is writable host memory the caller granted.
+        ReturnArea(u32),
         /// No information.
         Unknown,
     }
@@ -356,6 +400,9 @@ pub(crate) mod x86 {
                 (Fact::Stack(_), Fact::Stack(_)) => Fact::Stack(None),
                 (Fact::Record(_), Fact::Record(_)) => Fact::Record(None),
                 (Fact::WinPtr(a), Fact::WinPtr(b)) => Fact::WinPtr(a.max(b)),
+                // `Saved` and `ReturnArea` carry a register number / a result count, both
+                // function-wide constants, so two that differ cannot both hold: only `a == b` (above)
+                // survives the meet.
                 _ => Fact::Unknown,
             }
         }
@@ -377,10 +424,13 @@ pub(crate) mod x86 {
         End,
     }
 
-    /// How many spill slots the state tracks. Register allocation spills a context param (mem_base
-    /// and friends) to the stack in a high-pressure function; a handful of slots covers that.
-    /// Overflow simply stops tracking new slots — sound, since an untracked reload reads `Unknown`.
-    const SLOT_CAP: usize = 8;
+    /// How many spill slots the state tracks. A function saves its six callee-saved registers to
+    /// slots in the prologue and reloads them in the epilogue (the `Saved` discipline, claim item 4),
+    /// so the cap holds those plus the context-param spills (mem_base and friends) of a high-pressure
+    /// function. Overflow simply stops tracking new slots — sound, since an untracked reload reads
+    /// `Unknown` (a reload of a dropped callee-saved slot then shows as "not restored", a false
+    /// positive, not an unsoundness).
+    const SLOT_CAP: usize = 32;
 
     /// One tracked spill slot: the 8-byte value at entry-relative stack offset `off`. Keying by the
     /// offset from the entry `rsp` (not by the instruction's `(base, disp)`) gives a slot one identity
@@ -391,11 +441,15 @@ pub(crate) mod x86 {
         fact: Fact,
     }
 
-    /// The abstract state at a program point: a fact per GP register and the tracked spill slots.
+    /// The abstract state at a program point: a fact per GP register, the tracked spill slots, and
+    /// whether the prologue's stack-overflow check (`emit_stack_check`, I5) has run on every path
+    /// here. `checked` starts false, is set on the safe edge of the recognized check, and meets by
+    /// AND, so it holds only where the check dominates — the condition a `call` is required to meet.
     #[derive(Clone, Copy, PartialEq, Eq)]
     struct State {
         regs: [Fact; 16],
         slots: [Option<Slot>; SLOT_CAP],
+        checked: bool,
     }
 
     impl State {
@@ -405,20 +459,29 @@ pub(crate) mod x86 {
             State {
                 regs: [Fact::Unknown; 16],
                 slots: [None; SLOT_CAP],
+                checked: false,
             }
         }
-        /// The entry ABI: the four context params in their argument registers, `rsp` at the return
-        /// address, everything else unknown, no slots.
-        fn entry() -> State {
+        /// The entry ABI: the four context params in their argument registers, the `sret` pointer in
+        /// r8 when the function returns through one, each callee-saved register holding its own entry
+        /// value, `rsp` at the return address, everything else unknown, no slots.
+        fn entry(frame: Frame) -> State {
             let mut regs = [Fact::Unknown; 16];
             regs[reg::RDI as usize] = Fact::MemBase;
             regs[reg::RSI as usize] = Fact::FnTableBase;
             regs[reg::RDX as usize] = Fact::Vmctx;
             regs[reg::RCX as usize] = Fact::StackLimit;
             regs[reg::RSP as usize] = Fact::Stack(Some(0));
+            if let Some(n) = frame.sret_results {
+                regs[reg::R8 as usize] = Fact::ReturnArea(n);
+            }
+            for r in reg::CALLEE_SAVED {
+                regs[r as usize] = Fact::Saved(r);
+            }
             State {
                 regs,
                 slots: [None; SLOT_CAP],
+                checked: false,
             }
         }
         fn meet(&self, other: &State) -> State {
@@ -436,7 +499,12 @@ pub(crate) mod x86 {
                     n += 1;
                 }
             }
-            State { regs, slots }
+            // The check dominates a point only if it dominates on both incoming paths.
+            State {
+                regs,
+                slots,
+                checked: self.checked && other.checked,
+            }
         }
         /// The fact spilled to the 8-byte slot at `off`, or `Unknown` if no slot is tracked there.
         fn slot_get(&self, off: i64) -> Fact {
@@ -466,6 +534,18 @@ pub(crate) mod x86 {
         }
         fn clear_slots(&mut self) {
             self.slots = [None; SLOT_CAP];
+        }
+        /// Drop the data spill slots but keep the callee-saved save slots (`Saved(r)`). A call that
+        /// is passed a frame pointer may have the host write through it, so a spilled pointer no
+        /// longer holds; but the callee-saved save area is the function's own prologue/epilogue real
+        /// estate, its address never handed to a callee, so its slots survive every call (#2603 PR
+        /// 3). PR 3b's per-argument host contracts replace this with exactly which slot a call writes.
+        fn clear_data_slots(&mut self) {
+            for s in self.slots.iter_mut() {
+                if !matches!(s, Some(e) if matches!(e.fact, Fact::Saved(_))) {
+                    *s = None;
+                }
+            }
         }
         /// Loop-header widening (#2535): a `Bounded` carried into a header could grow each iteration,
         /// so drop it to `Unknown` (in registers and slots). The context-param and `Confined` facts
@@ -500,6 +580,8 @@ pub(crate) mod x86 {
                 .iter()
                 .flatten()
                 .all(|s| out.slot_get(s.off).meet(s.fact) == s.fact)
+            // `checked` is a fact too: a proposal may assert it only where the out-state has it.
+            && (!inn.checked || out.checked)
     }
 
     /// What the transfer reads besides the instruction: the function's bytes (a compare bound sits
@@ -509,6 +591,7 @@ pub(crate) mod x86 {
         bytes: &'a [u8],
         relocs: &'a [Reloc],
         guest: Guest<'a>,
+        frame: Frame,
     }
 
     /// The facts of no module: what the decode and control-flow layers run under for a trampoline,
@@ -721,7 +804,7 @@ pub(crate) mod x86 {
         let Some(r) = d.operands.rm_reg else {
             return Err("indirect jmp through memory".into());
         };
-        let out = transfer_block(insns, State::top(), None, ctx).fall;
+        let out = transfer_block(insns, State::top(), None, ctx, false).fall;
         let Fact::TableTarget { at, n } = out.regs[r as usize & 15] else {
             return Err(format!(
                 "indirect jmp through r{r}, which holds no jump-table target"
@@ -869,7 +952,12 @@ pub(crate) mod x86 {
     /// guesses a state per block — a heuristic, free to widen or give up — and [`verify`] checks the
     /// guess in one linear pass. A wrong or unconverged guess fails the check; it never admits code.
     /// It needs the guest entry contract, so a trampoline ([`Entry::Host`]) gets layers 1–2 only.
-    pub(crate) fn check(bytes: &[u8], relocs: &[Reloc], entry: Entry) -> Vec<Finding> {
+    pub(crate) fn check(
+        bytes: &[u8],
+        relocs: &[Reloc],
+        entry: Entry,
+        frame: Frame,
+    ) -> Vec<Finding> {
         let mut findings = Vec::new();
         if bytes.is_empty() {
             return findings;
@@ -882,6 +970,7 @@ pub(crate) mod x86 {
             bytes,
             relocs,
             guest,
+            frame,
         };
         let cfg = Cfg::build(ctx, &mut findings);
         if let Entry::Host = entry {
@@ -927,7 +1016,7 @@ pub(crate) mod x86 {
         for _ in 0..nb * 4 + 8 {
             let mut changed = false;
             for i in 0..nb {
-                let mut cur = (i == 0).then(State::entry);
+                let mut cur = (i == 0).then(|| State::entry(ctx.frame));
                 for &p in &preds[i] {
                     if let Some(po) = &out_st[p] {
                         let e = cfg.edge(po, p, i);
@@ -942,7 +1031,7 @@ pub(crate) mod x86 {
                         in_st[i] = Some(s);
                         changed = true;
                     }
-                    let o = transfer_block(&cfg.blocks[i], s, None, ctx);
+                    let o = transfer_block(&cfg.blocks[i], s, None, ctx, false);
                     if out_st[i] != Some(o) {
                         out_st[i] = Some(o);
                         changed = true;
@@ -968,7 +1057,7 @@ pub(crate) mod x86 {
             .first()
             .copied()
             .flatten()
-            .is_some_and(|s| implies(&State::entry(), &s))
+            .is_some_and(|s| implies(&State::entry(ctx.frame), &s))
         {
             findings.push(Finding {
                 at: 0,
@@ -978,7 +1067,18 @@ pub(crate) mod x86 {
         }
         for (i, insns) in cfg.blocks.iter().enumerate() {
             let Some(s) = states[i] else { continue };
-            let out = transfer_block(insns, s, Some(findings), ctx);
+            // Whether this block leaves the function — a `ret`, a direct tail call, or an indirect
+            // `jmp` with no jump table (a tail call). `transfer_block` then checks `rsp` and the
+            // callee-saved registers at the terminator (claim item 4).
+            let exit = match insns.last() {
+                Some(&(at, d)) => {
+                    d.kind == Kind::Ret
+                        || matches!(d.kind, Kind::DirectJmp { .. }) && tail_call(&d, at, ctx)
+                        || d.kind == Kind::IndirectJmp && cfg.exits[i].is_some()
+                }
+                None => false,
+            };
+            let out = transfer_block(insns, s, Some(findings), ctx, exit);
             // An indirect `jmp` with no jump table leaves the function: a tail call, so its target
             // must be a callee the state identifies.
             if let (Some(why), Some(&(at, d))) = (&cfg.exits[i], insns.last()) {
@@ -1001,6 +1101,52 @@ pub(crate) mod x86 {
                         ),
                     });
                 }
+            }
+        }
+    }
+
+    /// The frame stays within the red zone the overflow check reserves (I5): `rsp` never descends
+    /// more than `RED_ZONE` below entry. The check proves `rsp − RED_ZONE ≥ limit` at the (deepest)
+    /// frame bottom, so a frame no deeper than `RED_ZONE` keeps every stack address at or above the
+    /// limit; this closes `STACK_GUARD.md`'s deferred frame-size bound, which `CompiledCode` can't
+    /// supply but the final `sub rsp` in the bytes can. A dynamic `sub rsp, reg` leaves `rsp`
+    /// `Stack(None)`, which a stack access or a call then rejects.
+    fn frame_bound(state: &State, at: usize, findings: &mut Vec<Finding>) {
+        if let Fact::Stack(Some(off)) = state.regs[reg::RSP as usize] {
+            if off < -RED_ZONE {
+                findings.push(Finding {
+                    at,
+                    why: format!(
+                        "the frame descends 0x{:x} below entry, past the red zone (0x{RED_ZONE:x})",
+                        -off
+                    ),
+                });
+            }
+        }
+    }
+
+    /// Check that a function exit restores `rsp` to the return address (`Stack(Some(0))`) and every
+    /// callee-saved register to its entry value (`Saved(r)`). A `Saved` reaches here through the
+    /// spill slot the prologue saved it to and the epilogue reloaded it from.
+    fn exit_restores(out: &State, at: usize, findings: &mut Vec<Finding>) {
+        if out.regs[reg::RSP as usize] != Fact::Stack(Some(0)) {
+            findings.push(Finding {
+                at,
+                why: format!(
+                    "exit with rsp not restored to the return address ({:?})",
+                    out.regs[reg::RSP as usize]
+                ),
+            });
+        }
+        for r in reg::CALLEE_SAVED {
+            if out.regs[r as usize] != Fact::Saved(r) {
+                findings.push(Finding {
+                    at,
+                    why: format!(
+                        "exit without restoring callee-saved r{r} ({:?})",
+                        out.regs[r as usize]
+                    ),
+                });
             }
         }
     }
@@ -1243,6 +1389,7 @@ pub(crate) mod x86 {
         mut state: State,
         mut findings: Option<&mut Vec<Finding>>,
         ctx: Ctx,
+        exit: bool,
     ) -> Out {
         let mut sym: [Sym; 16] = std::array::from_fn(|r| Sym {
             id: r as u32,
@@ -1250,6 +1397,9 @@ pub(crate) mod x86 {
         });
         let mut next_id = 16u32;
         let mut flags: Option<Cmp> = None;
+        // Whether the live `flags` were set by the stack-overflow check `cmp (rsp − RED_ZONE),
+        // stack_limit` (I5): the terminating `jb` to the trap then marks the fall-through `checked`.
+        let mut sc_cmp = false;
         // The last record type id the block loaded: the loaded value, and the record it reads (the
         // value of the register that holds the record's address).
         let mut type_id: Option<(Sym, Sym)> = None;
@@ -1259,10 +1409,20 @@ pub(crate) mod x86 {
         // The symbolic value each 8-byte frame slot holds, by entry-relative offset, while nothing
         // writes it: two reloads of one spill are one value to the `cmov` rule.
         let mut slot_vals: Vec<(i64, Sym)> = Vec::new();
+        let last = insns.last().map(|&(p, _)| p);
         for &(pos, d) in insns {
             let mut loaded_type_id = None;
             if let Some(f) = findings.as_deref_mut() {
                 mem_policy(pos, &d, &state, ctx, f);
+                frame_bound(&state, pos, f);
+                // Leaving the function (a `ret` or a tail call, this block's terminator) must restore
+                // `rsp` to the return address and every callee-saved register (claim item 4). Checked
+                // against the state *before* the terminator, since `ret` then clobbers `rsp` (it pops
+                // the return address). A tail callee inherits the restored registers and restores
+                // them on its own exit.
+                if exit && Some(pos) == last {
+                    exit_restores(&state, pos, f);
+                }
             }
             let end = pos + d.len;
             // An immediate the linker patches is not the value that runs.
@@ -1327,6 +1487,20 @@ pub(crate) mod x86 {
                         lhs: side(lhs),
                         rhs: side(rhs),
                     });
+                    // The overflow check compares a stack pointer `RED_ZONE` below the current `rsp`
+                    // (`emit_stack_check`'s `rsp − RED_ZONE`) against `stack_limit`. Match on the
+                    // facts, so `mov r,rsp; add r,-RED_ZONE` and `lea r,[rsp−RED_ZONE]` both qualify.
+                    sc_cmp = if let Fact::Stack(Some(rsp)) = fact(&state, reg::RSP) {
+                        let guard = |o: Opnd| {
+                            matches!(o, Opnd::Reg(r)
+                                if matches!(fact(&state, r), Fact::Stack(Some(s))
+                                    if rsp.checked_sub(s) == Some(RED_ZONE)))
+                        };
+                        let limit = |o: Opnd| matches!(o, Opnd::Reg(r) if fact(&state, r) == Fact::StackLimit);
+                        guard(lhs) && limit(rhs)
+                    } else {
+                        false
+                    };
                 }
                 Eff::MovReg { dst, src } => {
                     let f = fact(&state, src);
@@ -1463,17 +1637,32 @@ pub(crate) mod x86 {
                 // A call runs its callee's contract: the registers it clobbers become unknown (below),
                 // the rest keep their facts, the flags are forgotten, and rsp moves by what the
                 // callee pops. An unidentified callee is a finding, and is taken to clobber the SysV
-                // set and pop an unknown amount. No slot survives a call until #2603 PR 3 checks that
-                // every callee writes only its own frame.
+                // set and pop an unknown amount.
                 let callee = match d.kind {
                     Kind::DirectCall => ctx.call_reloc(pos, &d).and_then(|r| r.callee),
                     _ => indirect_callee(&state, &d, ctx),
                 };
-                if callee.is_none() && d.kind == Kind::IndirectCall {
-                    if let Some(f) = findings.as_deref_mut() {
+                if let Some(f) = findings.as_deref_mut() {
+                    if callee.is_none() && d.kind == Kind::IndirectCall {
                         f.push(Finding {
                             at: pos,
                             why: "indirect call to an unidentified callee".into(),
+                        });
+                    }
+                    // A call pushes the return address below the frame and enters a callee that
+                    // relies on the limit, so the overflow check must dominate it (I5). The
+                    // exception is a prologue/trap **safepoint**: it rides a path the check does not
+                    // dominate but the same `RED_ZONE` margin covers (like the pre-check register
+                    // spills, `STACK_GUARD.md`). The fuel refill is one — a bounded, host-identified
+                    // `PreserveAll` call in `emit_fuel_check`, which `emit_stack_check` follows. The
+                    // other is `emit_trap`'s `-g` `trap_capture` call on each trap path; it is a host
+                    // call, so its safepoint contract lands with the rest of the host-call contracts
+                    // in PR 3b (#2534), and no validated build emits it (it needs `-g`). The check
+                    // still dominates every body call (they follow it in `cont`).
+                    if !state.checked && callee != Some(FUEL_REFILL) {
+                        f.push(Finding {
+                            at: pos,
+                            why: "call not dominated by the stack-overflow check".into(),
                         });
                     }
                 }
@@ -1481,9 +1670,20 @@ pub(crate) mod x86 {
                     clobbers: SYSV_CLOBBERS,
                     pops: None,
                 });
-                // A checked record survives in any register the callee keeps: records never change.
-                state.clear_slots();
-                slot_vals.clear();
+                // The caller's slots survive the call: an accepted guest callee writes only its own
+                // frame (below this `rsp`, claim item 4, the induction), and a host callee writes the
+                // caller's stack only through a pointer it was handed. So a slot is cleared only when
+                // a frame pointer is passed in an argument register — the shape a `call.cap` result
+                // buffer takes (a `lea` of a frame slot). A guest callee is never passed a native
+                // frame pointer (a guest pointer is a window offset). #2534/PR 3b replaces this with
+                // the exact per-argument host contracts. A checked record survives too (never changes).
+                let passes_frame_ptr = reg::ARG_REGS
+                    .iter()
+                    .any(|&r| matches!(fact(&state, r), Fact::Stack(_) | Fact::ReturnArea(_)));
+                if passes_frame_ptr {
+                    state.clear_data_slots();
+                    slot_vals.clear();
+                }
                 let rsp = match (fact(&state, reg::RSP), c.pops) {
                     (Fact::Stack(Some(h)), Some(p)) => Fact::Stack(h.checked_add(i64::from(p))),
                     (Fact::Stack(_), _) => Fact::Stack(None),
@@ -1561,44 +1761,43 @@ pub(crate) mod x86 {
             }
             if !matches!(d.eff, Eff::Cmp { .. }) && !d.keeps_flags {
                 flags = None;
+                sc_cmp = false;
             }
+        }
+        // Two terminating branches refine one out-edge.
+        let mut taken = state;
+        let mut fall = state;
+        let term = insns.last().map(|&(_, d)| d.kind);
+        // The stack-overflow check `cmp (rsp − RED_ZONE), stack_limit; jb trap` proves, on the
+        // not-below (fall-through) edge, that the running frame is below the limit — so the rest of
+        // the function is dominated by the check (I5).
+        if sc_cmp && matches!(term, Some(Kind::DirectJcc { cc: 0x2, .. })) {
+            fall.checked = true;
         }
         // A block that ends `cmp type_id, T; je` (or `jne`) proves, on the edge where they are equal,
         // that the record it read the type id from is a function of type `T`: every register still
         // holding that record's address becomes `Record(Some(T))`.
-        let equal = match (insns.last(), flags, type_id) {
-            (Some((_, d)), Some(f), Some((loaded, record))) => match d.kind {
-                Kind::DirectJcc {
-                    cc: cc @ (0x4 | 0x5),
-                    ..
-                } => compared_type(f, loaded).map(|ty| (cc == 0x4, record, ty)),
-                _ => None,
-            },
-            _ => None,
-        };
-        let Some((on_taken, record, ty)) = equal else {
-            return Out {
-                taken: state,
-                fall: state,
-            };
-        };
-        let mut checked = state;
-        for (f, &s) in checked.regs.iter_mut().zip(&sym) {
-            if matches!(*f, Fact::Record(_)) && s == record {
-                *f = Fact::Record(Some(ty));
+        if let (
+            Some(Kind::DirectJcc {
+                cc: cc @ (0x4 | 0x5),
+                ..
+            }),
+            Some(f),
+            Some((loaded, record)),
+        ) = (term, flags, type_id)
+        {
+            if let Some(ty) = compared_type(f, loaded) {
+                let refine = |s: &mut State| {
+                    for (fa, &sy) in s.regs.iter_mut().zip(&sym) {
+                        if matches!(*fa, Fact::Record(_)) && sy == record {
+                            *fa = Fact::Record(Some(ty));
+                        }
+                    }
+                };
+                refine(if cc == 0x4 { &mut taken } else { &mut fall });
             }
         }
-        if on_taken {
-            Out {
-                taken: checked,
-                fall: state,
-            }
-        } else {
-            Out {
-                taken: state,
-                fall: checked,
-            }
-        }
+        Out { taken, fall }
     }
 
     /// A block's out-states: `taken` on the edge a terminating `jcc` takes, `fall` on every other.
@@ -1945,8 +2144,46 @@ pub(crate) mod x86 {
             return;
         }
 
-        // Stack: based on a stack pointer.
-        if matches!(base_f, Some(Fact::Stack(_))) {
+        // Stack: an access through a stack pointer stays in the function's own frame. A write lands
+        // strictly below the return address (entry-relative `< 0`); a read may also reach the
+        // incoming stack arguments `[8, 8 + stack_args)`. The low bound is the current `rsp`: nothing
+        // legitimately touches below the allocated frame. The frame is host memory outside the
+        // window, so reads are bounded too, not only writes.
+        if matches!(base_f, Some(Fact::Stack(_))) || matches!(index_f, Some(Fact::Stack(_))) {
+            let Fact::Stack(Some(cur)) = state.regs[reg::RSP as usize] else {
+                flag("stack access while rsp is not a known stack pointer".into());
+                return;
+            };
+            let Some(Some(off)) = frame_addr(state, &mem) else {
+                flag("stack access at an unknown frame offset".into());
+                return;
+            };
+            let top = off.saturating_add(width as i64);
+            let args = i64::from(ctx.frame.stack_args.unwrap_or(0));
+            let in_frame = top <= 0;
+            let in_args = !write && off >= 8 && top <= 8 + args;
+            if !(off >= cur && (in_frame || in_args)) {
+                flag(format!(
+                    "stack {} [{off}, {top}) is outside the frame [{cur}, {})",
+                    if write { "write" } else { "read" },
+                    if write { 0 } else { 8 + args },
+                ));
+            }
+            return;
+        }
+        // The caller's result area (`sret`): the function writes its result slots through the pointer
+        // the caller passed in r8. `[0, n·8)` is writable; nothing else.
+        if let Some(Fact::ReturnArea(n)) = base_f {
+            let size = u64::from(n) * 8;
+            let past = mem.index.is_some()
+                || mem.disp < 0
+                || (mem.disp as u64).saturating_add(width) > size;
+            if past {
+                flag(format!(
+                    "sret result-area access of {width} bytes at +0x{:x} past 0x{size:x}",
+                    mem.disp
+                ));
+            }
             return;
         }
         // Window: re-prove the largest offset from `mem_base` the access can reach stays within the
@@ -3341,6 +3578,7 @@ pub(crate) mod x86 {
             bytes,
             relocs,
             guest: NO_GUEST,
+            frame: Frame::UNKNOWN,
         };
         let mut findings = Vec::new();
         Cfg::build(ctx, &mut findings)
@@ -3565,7 +3803,11 @@ pub(crate) mod x86 {
                     types: &f.types,
                 };
                 let entry = Entry::Guest(&guest);
-                let findings = check(bytes, &f.relocs, entry);
+                let frame = Frame {
+                    stack_args: f.contract.and_then(|c| c.pops),
+                    sret_results: f.sret_results,
+                };
+                let findings = check(bytes, &f.relocs, entry, frame);
                 assert!(
                     findings.is_empty(),
                     "clean Cranelift output flagged: {findings:?}\n{:02x?}",
@@ -3782,7 +4024,7 @@ pub(crate) mod x86 {
 
             // Widening at a loop header drops `Bounded` (which could grow each iteration) but keeps
             // the loop-invariant context-param and `Confined` facts, so the fixpoint terminates.
-            let mut s = State::entry();
+            let mut s = State::entry(Frame::UNKNOWN);
             s.regs[8] = Bounded(16);
             s.regs[9] = conf;
             s.widen();
@@ -3811,8 +4053,32 @@ pub(crate) mod x86 {
             types: &[Some(TAIL0), Some(TAIL16)],
         };
 
+        /// The length of the overflow-check prologue [`checked`] prepends.
+        const CHECK_LEN: usize = 19;
+
+        /// Wrap a body snippet in the canonical overflow-check prologue the JIT emits
+        /// (`emit_stack_check`: `mov rax,rsp; add rax,-RED_ZONE; cmp rax,stack_limit; jb trap`), so
+        /// a body-focused snippet runs in the `checked` state a `call` requires (I5), plus the trap
+        /// block — a bare `ret` — the check branches to. The body begins at `CHECK_LEN`; a caller
+        /// placing relocations adds that to its offsets. The prologue touches only `rax`, so it
+        /// disturbs no fact the body relies on, and a fixed prefix preserves intra-body rip-relative
+        /// references (instruction and target shift together).
+        fn checked(body: &[u8]) -> Vec<u8> {
+            let rel = (body.len() as i32).to_le_bytes();
+            let mut v = vec![
+                0x48, 0x89, 0xe0, // mov rax, rsp
+                0x48, 0x81, 0xc0, 0x00, 0xc0, 0xff, 0xff, // add rax, -0x4000
+                0x48, 0x3b, 0xc1, // cmp rax, rcx
+                0x0f, 0x82, rel[0], rel[1], rel[2], rel[3], // jb <trap, past the body>
+            ];
+            debug_assert_eq!(v.len(), CHECK_LEN);
+            v.extend_from_slice(body);
+            v.push(0xc3); // trap block: ret
+            v
+        }
+
         fn findings(bytes: &[u8]) -> Vec<Finding> {
-            check(bytes, &[], Entry::Guest(&G))
+            check(bytes, &[], Entry::Guest(&G), Frame::UNKNOWN)
         }
 
         fn has(f: &[Finding], needle: &str) -> bool {
@@ -3868,9 +4134,10 @@ pub(crate) mod x86 {
                 bytes,
                 relocs,
                 guest: G,
+                frame: Frame::UNKNOWN,
             };
             let (insns, _) = decode_block(ctx, 0, bytes.len(), &mut fs);
-            transfer_block(&insns, State::entry(), None, ctx).fall
+            transfer_block(&insns, State::entry(Frame::UNKNOWN), None, ctx, false).fall
         }
 
         /// A window access through an index that was **not** confined by the D63 sequence is the
@@ -3900,10 +4167,15 @@ pub(crate) mod x86 {
                 0x4a, 0x8b, 0x04, 0x07, // mov rax, [rdi + r8*1]
                 0xc3,
             ]);
-            let f = check(&bytes, &[], Entry::Guest(&Guest { window: None, ..G }));
+            let f = check(
+                &bytes,
+                &[],
+                Entry::Guest(&Guest { window: None, ..G }),
+                Frame::UNKNOWN,
+            );
             assert!(has(&f, "no window"), "{f:?}");
             // A trampoline's arguments are the host's, so the memory policy waits for its contract.
-            assert!(check(&bytes, &[], Entry::Host).is_empty());
+            assert!(check(&bytes, &[], Entry::Host, Frame::UNKNOWN).is_empty());
         }
 
         /// The full D63 confinement sequence is recognized and produces no finding: materialize the
@@ -3939,7 +4211,7 @@ pub(crate) mod x86 {
                 "a constant-pool bound was not recognized: {f:?}"
             );
             let patched = [data_reloc(26, R::Abs8)];
-            let f = check(&bytes, &patched, Entry::Guest(&G));
+            let f = check(&bytes, &patched, Entry::Guest(&G), Frame::UNKNOWN);
             assert!(
                 has(&f, "unconfined index"),
                 "a patched bound confined: {f:?}"
@@ -4011,7 +4283,12 @@ pub(crate) mod x86 {
                 0x5d, // [19] pop rbp
                 0xc3, // [1a] ret
             ];
-            let f = check(&bytes, &[call_reloc(0x12)], Entry::Guest(&G));
+            let f = check(
+                &bytes,
+                &[call_reloc(0x12)],
+                Entry::Guest(&G),
+                Frame::UNKNOWN,
+            );
             assert!(
                 f.is_empty(),
                 "a tail call fell through into the next block: {f:?}"
@@ -4066,27 +4343,39 @@ pub(crate) mod x86 {
         /// `imm64` and names an allowed callee, and every `call rel32` carries one.
         #[test]
         fn relocs_must_sit_on_a_recognized_field() {
-            let call = [0xe8, 0, 0, 0, 0, 0xc3]; // call <rel32>; ret
+            // The relocation offsets ride on the body, which `checked` places at `CHECK_LEN`.
+            let c = CHECK_LEN as u32;
+            let call = checked(&[0xe8, 0, 0, 0, 0, 0xc3]); // call <rel32>; ret
             assert!(has(&findings(&call), "direct call without a relocation"));
-            let f = check(&call, &[call_reloc(1)], Entry::Guest(&G));
+            let f = check(
+                &call,
+                &[call_reloc(1 + c)],
+                Entry::Guest(&G),
+                Frame::UNKNOWN,
+            );
             assert!(f.is_empty(), "a relocated call was flagged: {f:?}");
             let disallowed = Reloc {
                 callee: None,
-                ..call_reloc(1)
+                ..call_reloc(1 + c)
             };
-            let f = check(&call, &[disallowed], Entry::Guest(&G));
+            let f = check(&call, &[disallowed], Entry::Guest(&G), Frame::UNKNOWN);
             assert!(has(&f, "does not allow code to call"), "{f:?}");
             let shifted = Reloc {
                 addend: 0,
-                ..call_reloc(1)
+                ..call_reloc(1 + c)
             };
-            let f = check(&call, &[shifted], Entry::Guest(&G));
+            let f = check(&call, &[shifted], Entry::Guest(&G), Frame::UNKNOWN);
             assert!(has(&f, "outside a call target"), "{f:?}");
-            let misplaced = call_reloc(2);
-            let f = check(&call, &[misplaced], Entry::Guest(&G));
+            let misplaced = call_reloc(2 + c);
+            let f = check(&call, &[misplaced], Entry::Guest(&G), Frame::UNKNOWN);
             assert!(has(&f, "outside a call target"), "{f:?}");
-            let data = [0xc3, 0, 0, 0, 0, 0, 0, 0, 0]; // ret; then 8 bytes no code reaches
-            let f = check(&data, &[data_reloc(1, R::Abs8)], Entry::Guest(&G));
+            let data = checked(&[0xc3, 0, 0, 0, 0, 0, 0, 0, 0]); // ret; then 8 bytes no code reaches
+            let f = check(
+                &data,
+                &[data_reloc(1 + c, R::Abs8)],
+                Entry::Guest(&G),
+                Frame::UNKNOWN,
+            );
             assert!(has(&f, "patches no instruction"), "{f:?}");
         }
 
@@ -4161,6 +4450,7 @@ pub(crate) mod x86 {
                 bytes: &bytes,
                 relocs: &[],
                 guest: G,
+                frame: Frame::UNKNOWN,
             };
             let mut fs = Vec::new();
             let cfg = Cfg::build(ctx, &mut fs);
@@ -4191,7 +4481,7 @@ pub(crate) mod x86 {
             assert!(has(&findings(&split), "overruns its block"));
             let bytes = jump_table(3, [0x10, 0x11, 0x12, 0x13]);
             let patched = [data_reloc(0x21, R::Abs4)];
-            let f = check(&bytes, &patched, Entry::Guest(&G));
+            let f = check(&bytes, &patched, Entry::Guest(&G), Frame::UNKNOWN);
             assert!(has(&f, "holds no jump-table target"), "{f:?}");
         }
 
@@ -4349,6 +4639,188 @@ pub(crate) mod x86 {
             assert_eq!(s.regs[reg::RSP as usize], Fact::Stack(Some(0)));
         }
 
+        /// #2603 PR 3 — a stack access stays inside the function's own frame `[rsp, 0)`: a store
+        /// below the entry `rsp` is the frame; one at or above the return address escapes it.
+        #[test]
+        fn frame_extent_bounds_stack_writes() {
+            let within = [
+                0x48, 0x83, 0xec, 0x10, // sub rsp, 0x10
+                0x48, 0x89, 0x04, 0x24, // mov [rsp], rax     (offset -0x10, in the frame)
+                0x48, 0x83, 0xc4, 0x10, // add rsp, 0x10
+                0xc3, // ret
+            ];
+            let f = findings(&within);
+            assert!(f.is_empty(), "a write inside the frame was flagged: {f:?}");
+            let above = [
+                0x48, 0x83, 0xec, 0x10, // sub rsp, 0x10
+                0x48, 0x89, 0x44, 0x24,
+                0x20, // mov [rsp + 0x20], rax   (offset +0x10, above ret addr)
+                0x48, 0x83, 0xc4, 0x10, // add rsp, 0x10
+                0xc3, // ret
+            ];
+            assert!(
+                has(&findings(&above), "outside the frame"),
+                "{:?}",
+                findings(&above)
+            );
+        }
+
+        /// #2603 PR 3 (claim item 4) — a function exit restores `rsp` to the return address and every
+        /// callee-saved register to its entry value. The `Saved` fact rides through the prologue
+        /// spill slot and the epilogue reload.
+        #[test]
+        fn exit_restores_rsp_and_callee_saved() {
+            let ok = [
+                0x53, // push rbx         (Saved(rbx) → slot -8)
+                0x48, 0x89, 0xfb, // mov rbx, rdi     (rbx clobbered in the body)
+                0x5b, // pop rbx          (Saved(rbx) reloaded)
+                0xc3, // ret
+            ];
+            assert!(
+                findings(&ok).is_empty(),
+                "a clean exit was flagged: {:?}",
+                findings(&ok)
+            );
+            // rbx is clobbered and never reloaded: its entry value is lost at the exit.
+            let lost_reg = [
+                0x53, // push rbx
+                0x48, 0x89, 0xfb, // mov rbx, rdi
+                0x48, 0x83, 0xc4, 0x08, // add rsp, 8   (balance rsp without reloading rbx)
+                0xc3, // ret
+            ];
+            assert!(
+                has(&findings(&lost_reg), "callee-saved r3"),
+                "{:?}",
+                findings(&lost_reg)
+            );
+            // rsp left below the return address at the exit.
+            let lost_rsp = [
+                0x48, 0x83, 0xec, 0x10, // sub rsp, 0x10
+                0xc3, // ret   (rsp still −0x10)
+            ];
+            assert!(
+                has(&findings(&lost_rsp), "rsp not restored"),
+                "{:?}",
+                findings(&lost_rsp)
+            );
+        }
+
+        /// #2603 PR 3 — a function returning more than `MAX_REG_RESULTS` results writes them through
+        /// the caller's result-area pointer in r8 (`sret`). `[0, n·8)` is writable; past it is not.
+        #[test]
+        fn sret_result_area_is_writable_within_its_bounds() {
+            let frame = Frame {
+                stack_args: None,
+                sret_results: Some(2),
+            };
+            let within = [
+                0x49, 0x89, 0x00, // mov [r8], rax        (slot 0)
+                0x49, 0x89, 0x40, 0x08, // mov [r8 + 8], rax    (slot 1)
+                0xc3, // ret
+            ];
+            let f = check(&within, &[], Entry::Guest(&G), frame);
+            assert!(
+                f.is_empty(),
+                "a write to the result area was flagged: {f:?}"
+            );
+            let past = [
+                0x49, 0x89, 0x40, 0x10, // mov [r8 + 0x10], rax   (slot 2, past the 2 granted)
+                0xc3, // ret
+            ];
+            let f = check(&past, &[], Entry::Guest(&G), frame);
+            assert!(has(&f, "sret result-area access"), "{f:?}");
+        }
+
+        /// I5 — a body `call` must be dominated by the prologue's stack-overflow check: the same call
+        /// is clean under the check [`checked`] prepends and flagged without it.
+        #[test]
+        fn i5_a_body_call_must_be_dominated_by_the_overflow_check() {
+            let call = [0xe8, 0, 0, 0, 0, 0xc3]; // call <rel32>; ret
+            let dominated = check(
+                &checked(&call),
+                &[call_reloc(1 + CHECK_LEN as u32)],
+                Entry::Guest(&G),
+                Frame::UNKNOWN,
+            );
+            assert!(
+                dominated.is_empty(),
+                "a dominated call was flagged: {dominated:?}"
+            );
+            let bare = check(&call, &[call_reloc(1)], Entry::Guest(&G), Frame::UNKNOWN);
+            assert!(
+                has(&bare, "not dominated by the stack-overflow check"),
+                "{bare:?}"
+            );
+        }
+
+        /// I5 — the frame may not descend more than `RED_ZONE` below entry (the overflow check's
+        /// reservation; closes `STACK_GUARD.md`'s deferred frame-size bound).
+        #[test]
+        fn i5_frame_may_not_exceed_the_red_zone() {
+            let ok = [
+                0x48, 0x81, 0xec, 0x00, 0x10, 0x00, 0x00, // sub rsp, 0x1000
+                0x48, 0x81, 0xc4, 0x00, 0x10, 0x00, 0x00, // add rsp, 0x1000
+                0xc3, // ret
+            ];
+            assert!(
+                findings(&ok).is_empty(),
+                "an in-bounds frame was flagged: {:?}",
+                findings(&ok)
+            );
+            let huge = [
+                0x48, 0x81, 0xec, 0x00, 0x50, 0x00, 0x00, // sub rsp, 0x5000  (> RED_ZONE)
+                0x48, 0x81, 0xc4, 0x00, 0x50, 0x00, 0x00, // add rsp, 0x5000
+                0xc3, // ret
+            ];
+            assert!(
+                has(&findings(&huge), "past the red zone"),
+                "{:?}",
+                findings(&huge)
+            );
+        }
+
+        /// I5 — the fuel refill rides the prologue fuel safepoint, before the stack check, so it is
+        /// exempt from the dominance rule (the `RED_ZONE` margin covers it, like the pre-check
+        /// spills). A plain refill sequence with no stack check is clean.
+        #[test]
+        fn i5_the_fuel_refill_call_is_exempt_from_dominance() {
+            let refill = [
+                0x48, 0x8b, 0x42, 0x18, // mov rax, [rdx + 0x18]   (vmctx.fuel cell)
+                0x48, 0x8b, 0x48, 0x08, // mov rcx, [rax + 8]      (the refill fn pointer)
+                0xff,
+                0xd1, // call rcx                (PreserveAll; identified as the fuel refill)
+                0xc3, // ret
+            ];
+            let f = findings(&refill);
+            assert!(f.is_empty(), "the fuel refill call was flagged: {f:?}");
+        }
+
+        /// I5 / claim item 4 — a callee-saved register spilled to its save slot survives a call that
+        /// hands the callee a native frame pointer (which clears the *data* slots but keeps the save
+        /// slots): the reload still reads `Saved`, so the exit is clean.
+        #[test]
+        fn callee_saved_slot_survives_a_frame_pointer_call() {
+            let body = [
+                0x53, // [00] push rbx            (Saved(rbx) → slot -8)
+                0x48, 0x8d, 0x3c,
+                0x24, // [01] lea rdi, [rsp]     (a native frame pointer in an arg reg)
+                0xe8, 0, 0, 0,
+                0,    // [05] call <rel32>      (passes the frame ptr → clears data slots)
+                0x5b, // [0a] pop rbx            (Saved(rbx) reloaded — must have survived)
+                0xc3, // [0b] ret
+            ];
+            let f = check(
+                &checked(&body),
+                &[call_reloc(6 + CHECK_LEN as u32)],
+                Entry::Guest(&G),
+                Frame::UNKNOWN,
+            );
+            assert!(
+                f.is_empty(),
+                "a saved slot did not survive a frame-pointer call: {f:?}"
+            );
+        }
+
         /// Hole 7: `mov ax, 5` keeps rax's upper 48 bits, so it is no constant.
         #[test]
         fn policy_a_16_bit_immediate_is_not_a_constant() {
@@ -4401,6 +4873,7 @@ pub(crate) mod x86 {
                 bytes: &bytes,
                 relocs: &[],
                 guest: G,
+                frame: Frame::UNKNOWN,
             };
             let mut fs = Vec::new();
             let cfg = Cfg::build(ctx, &mut fs);
@@ -4411,35 +4884,18 @@ pub(crate) mod x86 {
             assert!(has(&f, "unrecognized provenance"), "{f:?}");
 
             let mut lie = honest.clone();
-            lie[1] = Some(State::entry());
+            lie[1] = Some(State::entry(Frame::UNKNOWN));
             let mut f = Vec::new();
             verify(&cfg, &lie, ctx, &mut f);
             assert!(has(&f, "does not hold on the edge"), "{f:?}");
 
             let mut bad_entry = honest;
-            let mut s = State::entry();
+            let mut s = State::entry(Frame::UNKNOWN);
             s.regs[0] = Fact::MemBase;
             bad_entry[0] = Some(s);
             let mut f = Vec::new();
             verify(&cfg, &bad_entry, ctx, &mut f);
             assert!(has(&f, "entry contract"), "{f:?}");
-        }
-
-        /// The state block `leader` ends in, run from its proposed in-state: what its last
-        /// instruction leaves on its fall-through edge.
-        fn out_of(bytes: &[u8], relocs: &[Reloc], leader: usize) -> State {
-            let ctx = Ctx {
-                bytes,
-                relocs,
-                guest: G,
-            };
-            let cfg = Cfg::build(ctx, &mut Vec::new());
-            let states = propose(&cfg, ctx);
-            let i = cfg
-                .leaders
-                .binary_search(&leader)
-                .expect("a block starts there");
-            transfer_block(&cfg.blocks[i], states[i].expect("reached"), None, ctx).fall
         }
 
         /// Rodata: a rip-relative operand reads the function's own bytes, all of them inside it, and
@@ -4468,7 +4924,7 @@ pub(crate) mod x86 {
                 "store to the function's rodata at +0x8"
             ));
             let patched = [data_reloc(3, R::X86PCRel4)];
-            let f = check(&load(1), &patched, Entry::Guest(&G));
+            let f = check(&load(1), &patched, Entry::Guest(&G), Frame::UNKNOWN);
             assert!(has(&f, "relocated symbol"), "{f:?}");
         }
 
@@ -4532,10 +4988,10 @@ pub(crate) mod x86 {
 
         /// A `call.dyn`: the code loads the slot's record, compares its type id with the expected
         /// one, and on the edge where they are equal the code pointer it loads from that record is a
-        /// function of that type, so the call takes that type's contract (here type 1's, which pops
-        /// 16 bytes). On the other edge, without the check, or through another value, it is
-        /// unidentified. A record never changes, so its check holds across a call in a callee-saved
-        /// register; in a caller-saved one, the call clobbers it.
+        /// function of that type (here type 0, which pops nothing), so the call takes that contract.
+        /// On the other edge, without the check, or through another value, it is unidentified. A
+        /// record never changes, so its check holds across a call in a callee-saved register (the
+        /// prologue saved it); in a caller-saved one, the call clobbers it.
         #[test]
         fn calls_through_the_fn_table_take_the_checked_type() {
             let bytes = [
@@ -4543,7 +4999,7 @@ pub(crate) mod x86 {
                 0x48, 0x83, 0xe0, 0x03, // [03] and rax, 3
                 0x48, 0x8b, 0x0c, 0xc6, // [07] mov rcx, [rsi + rax*8]
                 0x8b, 0x11, // [0b] mov edx, [rcx]
-                0x83, 0xfa, 0x01, // [0d] cmp edx, 1
+                0x83, 0xfa, 0x00, // [0d] cmp edx, 0
                 0x75, 0x0a, // [10] jne +0a  (→ 1c)
                 0x48, 0x8b, 0x41, 0x08, // [12] mov rax, [rcx + 8]
                 0xff, 0xd0, // [16] call rax
@@ -4551,44 +5007,59 @@ pub(crate) mod x86 {
                 0xc3, // [1b] ret
                 0x0f, 0x0b, // [1c] ud2
             ];
-            let f = findings(&bytes);
+            let f = findings(&checked(&bytes));
             assert!(f.is_empty(), "a checked call.dyn was flagged: {f:?}");
-            let out = out_of(&bytes, &[], 0x12);
-            assert_eq!(out.regs[reg::RCX as usize], Fact::Stack(Some(16)));
             let mut wrong_edge = bytes;
             wrong_edge[0x10] = 0x74; // je: the call runs where the type ids differ
-            assert!(has(&findings(&wrong_edge), "unidentified callee"));
+            assert!(has(&findings(&checked(&wrong_edge)), "unidentified callee"));
             let mut unchecked = bytes;
             unchecked[0x0d..0x12].copy_from_slice(&[0x90; 5]); // no cmp, no jne
-            assert!(has(&findings(&unchecked), "unidentified callee"));
+            assert!(has(&findings(&checked(&unchecked)), "unidentified callee"));
             let mut other_value = bytes;
-            other_value[0x0e] = 0xf8; // cmp eax, 1: not the loaded type id
-            assert!(has(&findings(&other_value), "unidentified callee"));
+            other_value[0x0e] = 0xf8; // cmp eax, 0: not the loaded type id
+            assert!(has(
+                &findings(&checked(&other_value)),
+                "unidentified callee"
+            ));
 
-            // The record in rbx survives a call; the same in rcx would not.
+            // The record in rbx (saved in the prologue, restored before the ret) survives a call;
+            // the same in caller-saved rcx would not.
             let across = [
-                0x4c, 0x89, 0xc0, // [00] mov rax, r8
-                0x48, 0x83, 0xe0, 0x03, // [03] and rax, 3
-                0x48, 0x8b, 0x1c, 0xc6, // [07] mov rbx, [rsi + rax*8]
-                0x8b, 0x13, // [0b] mov edx, [rbx]
-                0x83, 0xfa, 0x01, // [0d] cmp edx, 1
-                0x75, 0x0c, // [10] jne +0c  (→ 1e)
-                0xe8, 0, 0, 0, 0, // [12] call <callee>   (rel32 patched at 0x13)
-                0x48, 0x8b, 0x43, 0x08, // [17] mov rax, [rbx + 8]
-                0xff, 0xd0, // [1b] call rax
-                0xc3, // [1d] ret
-                0x0f, 0x0b, // [1e] ud2
+                0x53, // [00] push rbx
+                0x4c, 0x89, 0xc0, // [01] mov rax, r8
+                0x48, 0x83, 0xe0, 0x03, // [04] and rax, 3
+                0x48, 0x8b, 0x1c, 0xc6, // [08] mov rbx, [rsi + rax*8]
+                0x8b, 0x13, // [0c] mov edx, [rbx]
+                0x83, 0xfa, 0x00, // [0e] cmp edx, 0
+                0x75, 0x0d, // [11] jne +0d  (→ 20)
+                0xe8, 0, 0, 0, 0, // [13] call <callee>   (rel32 patched at 0x14)
+                0x48, 0x8b, 0x43, 0x08, // [18] mov rax, [rbx + 8]
+                0xff, 0xd0, // [1c] call rax
+                0x5b, // [1e] pop rbx
+                0xc3, // [1f] ret
+                0x0f, 0x0b, // [20] ud2
             ];
-            let f = check(&across, &[call_reloc(0x13)], Entry::Guest(&G));
+            let c = CHECK_LEN as u32;
+            let f = check(
+                &checked(&across),
+                &[call_reloc(0x14 + c)],
+                Entry::Guest(&G),
+                Frame::UNKNOWN,
+            );
             assert!(
                 f.is_empty(),
                 "a checked record in rbx did not survive a call: {f:?}"
             );
             let mut caller_saved = across;
-            caller_saved[0x09] = 0x0c; // mov rcx, [rsi + rax*8]
-            caller_saved[0x0c] = 0x11; // mov edx, [rcx]
-            caller_saved[0x19] = 0x41; // mov rax, [rcx + 8]
-            let f = check(&caller_saved, &[call_reloc(0x13)], Entry::Guest(&G));
+            caller_saved[0x0a] = 0x0c; // mov rcx, [rsi + rax*8]
+            caller_saved[0x0d] = 0x11; // mov edx, [rcx]
+            caller_saved[0x1a] = 0x41; // mov rax, [rcx + 8]
+            let f = check(
+                &checked(&caller_saved),
+                &[call_reloc(0x14 + c)],
+                Entry::Guest(&G),
+                Frame::UNKNOWN,
+            );
             assert!(has(&f, "unidentified callee"), "{f:?}");
         }
 
@@ -4607,7 +5078,7 @@ pub(crate) mod x86 {
                 0xff, 0xd0, // [10] call rax
                 0xc3, // [12] ret
             ];
-            let f = findings(&bytes);
+            let f = findings(&checked(&bytes));
             assert!(
                 f.is_empty(),
                 "a checked constant call.dyn was flagged: {f:?}"
@@ -4624,17 +5095,23 @@ pub(crate) mod x86 {
                 0xff, 0xd0, // [14] call rax
                 0xc3, // [16] ret
             ];
-            assert!(has(&findings(&other_record), "unidentified callee"));
+            assert!(has(
+                &findings(&checked(&other_record)),
+                "unidentified callee"
+            ));
             let mut not_a_compare = bytes;
             not_a_compare[0x07] = 0xc8; // test eax, ecx: no compare with a constant
-            assert!(has(&findings(&not_a_compare), "unidentified callee"));
+            assert!(has(
+                &findings(&checked(&not_a_compare)),
+                "unidentified callee"
+            ));
             let mut tail = bytes;
             tail[0x11] = 0xe0; // jmp rax
-            let f = findings(&tail[..0x12]);
+            let f = findings(&checked(&tail[..0x12]));
             assert!(f.is_empty(), "a checked tail call.dyn was flagged: {f:?}");
             let mut unchecked_tail = tail;
             unchecked_tail[0x06..0x0c].copy_from_slice(&[0x90; 6]); // no test, je or ud2
-            let f = findings(&unchecked_tail[..0x12]);
+            let f = findings(&checked(&unchecked_tail[..0x12]));
             assert!(has(&f, "nor a callee"), "{f:?}");
         }
 
@@ -4654,18 +5131,24 @@ pub(crate) mod x86 {
                 0x48, 0x8b, 0x0f, // [14] mov rcx, [rdi]
                 0xc3, // [17] ret
             ];
-            let f = findings(&fuel);
+            let f = findings(&checked(&fuel));
             assert!(f.is_empty(), "the fuel charge was flagged: {f:?}");
             let mut remaining = fuel;
             remaining[0x11] = 0x10; // mov rcx, [rax + 16]: `remaining` clobbers rdi
-            assert!(has(&findings(&remaining), "unrecognized provenance"));
+            assert!(has(
+                &findings(&checked(&remaining)),
+                "unrecognized provenance"
+            ));
             let mut narrow = fuel;
             narrow[0x04..0x07].copy_from_slice(&[0x8b, 0x08, 0x90]); // mov ecx, [rax]; nop
-            assert!(has(&findings(&narrow), "no field compiled code may access"));
+            assert!(has(
+                &findings(&checked(&narrow)),
+                "no field compiled code may access"
+            ));
             let mut refill_write = fuel;
             refill_write[0x0f] = 0x89; // mov [rax + 8], rcx
             assert!(has(
-                &findings(&refill_write),
+                &findings(&checked(&refill_write)),
                 "read-only host field at +0x8"
             ));
 
@@ -4790,7 +5273,7 @@ pub(crate) mod x86 {
                 "a constant-pool mask was not recognized: {f:?}"
             );
             let patched = [data_reloc(0x0e, R::Abs8)];
-            let f = check(&bytes, &patched, Entry::Guest(&G));
+            let f = check(&bytes, &patched, Entry::Guest(&G), Frame::UNKNOWN);
             assert!(has(&f, "unconfined index"), "a patched mask bounded: {f:?}");
             let s = run(&[
                 0xb9, 0xff, 0xff, 0, 0, // mov ecx, 0xffff
@@ -4909,13 +5392,24 @@ pub(crate) mod x86 {
                 mask: (1u64 << 37) - 1,
                 guard_offset: 1u64 << 37,
             });
-            assert!(check(&bytes, &[], Entry::Guest(&Guest { window: big, ..G })).is_empty());
+            assert!(check(
+                &bytes,
+                &[],
+                Entry::Guest(&Guest { window: big, ..G }),
+                Frame::UNKNOWN
+            )
+            .is_empty());
             // A 32 KiB reservation does not → the access reaches past it.
             let small = Some(WindowLayout {
                 mask: (1u64 << 15) - 1,
                 guard_offset: 1u64 << 15,
             });
-            let f = check(&bytes, &[], Entry::Guest(&Guest { window: small, ..G }));
+            let f = check(
+                &bytes,
+                &[],
+                Entry::Guest(&Guest { window: small, ..G }),
+                Frame::UNKNOWN,
+            );
             assert!(has(&f, "past the reservation"), "{f:?}");
         }
     }

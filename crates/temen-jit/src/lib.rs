@@ -3996,6 +3996,10 @@ impl CompiledModule {
                 }
             },
             &guest,
+            &|i: usize| {
+                let r = &m.funcs[i].results;
+                uses_sret(r).then_some(r.len() as u32)
+            },
         )?;
         let mut ctx = module.make_context();
 
@@ -5602,6 +5606,10 @@ impl CompiledModule {
             },
             |_, _, _| {},
             &guest,
+            &|i: usize| {
+                let r = &funcs[i].results;
+                uses_sret(r).then_some(r.len() as u32)
+            },
         )?;
         self.extra_bytes += extra_bytes;
         let mut ctx = module.make_context();
@@ -6728,6 +6736,10 @@ fn define_funcs(
     lower: impl Fn(&mut cranelift_codegen::Context, usize) -> Result<(), JitError> + Sync,
     mut defined: impl FnMut(&JITModule, &CompiledCode, usize),
     guest: &validate::Guest,
+    // #2603 PR 3 — for function `i`, the count of result slots it returns through its `sret` pointer
+    // (when it has more than `MAX_REG_RESULTS` results), so the validator can bound writes through
+    // r8. `None` for a register-result function. Built from the IR, where the result list is known.
+    sret: &(dyn Fn(usize) -> Option<u32> + Sync),
 ) -> Result<usize, JitError> {
     let keep = match code {
         Codegen::Replay(kept, imports) => return kept.replay(module, ids, imports),
@@ -6753,7 +6765,7 @@ fn define_funcs(
                     ctx.func.signature.call_conv = isa.default_call_conv();
                     lower(&mut ctx, i)?;
                     let entry = validate::Entry::Guest(guest);
-                    compile_verified(isa, &mut ctx, ids[i], entry, callee)
+                    compile_verified(isa, &mut ctx, ids[i], entry, callee, sret(i))
                         .map_err(JitError::Backend)
                 }));
                 if done_tx.send((i, out)).is_err() {
@@ -6786,6 +6798,7 @@ fn define_funcs(
                     table: guest.table,
                     types: guest.types.to_vec(),
                     contract: callee(ids[next].as_u32()),
+                    sret_results: sret(next),
                 });
                 let kept = keep
                     .as_mut()
@@ -6830,6 +6843,7 @@ fn compile_verified(
     id: FuncId,
     entry: validate::Entry,
     callee: &(dyn Fn(u32) -> Option<validate::Contract> + Sync),
+    sret_results: Option<u32>,
 ) -> Result<(CompiledCode, Vec<ModuleReloc>), String> {
     let mut ctrl = cranelift_codegen::control::ControlPlane::default();
     ctx.verify(isa)
@@ -6854,7 +6868,14 @@ fn compile_verified(
     // geometry, which the window-access policy re-proves against, or a trampoline's host ABI (#2603).
     if validate::enabled() {
         let checked = validate::relocs(&relocs, callee, isa.default_call_conv());
-        validate::shadow_check(code.code_buffer(), &checked, entry);
+        // #2603 PR 3 — the function's own frame: the stack-argument bytes it may read above its
+        // return address (its own `Contract::pops`), and, when it returns via `sret`, the count of
+        // result slots it writes through the caller's area pointer in r8.
+        let frame = validate::Frame {
+            stack_args: callee(id.as_u32()).and_then(|c| c.pops),
+            sret_results,
+        };
+        validate::shadow_check(code.code_buffer(), &checked, entry, frame);
     }
     Ok((code, relocs))
 }
@@ -6899,8 +6920,9 @@ fn define_verified(
     // entry contract, so they get the validator's decode and control-flow layers only (#2603 PR 3).
     let contracts = callee_contracts(module);
     let callee = |id: u32| contracts.get(id as usize).copied().flatten();
-    let (code, relocs) = compile_verified(module.isa(), ctx, id, validate::Entry::Host, &callee)
-        .map_err(JitError::Backend)?;
+    let (code, relocs) =
+        compile_verified(module.isa(), ctx, id, validate::Entry::Host, &callee, None)
+            .map_err(JitError::Backend)?;
     module
         .define_function_bytes(
             id,
@@ -7368,7 +7390,8 @@ mod compile_verified_tests {
         let isa = jit_isa().unwrap();
         let mut ctx = cranelift_codegen::Context::for_function(malformed(&*isa));
         let host = validate::Entry::Host;
-        let Err(err) = compile_verified(&*isa, &mut ctx, FuncId::from_u32(0), host, &|_| None)
+        let Err(err) =
+            compile_verified(&*isa, &mut ctx, FuncId::from_u32(0), host, &|_| None, None)
         else {
             panic!("malformed CLIF compiled");
         };
@@ -7421,7 +7444,7 @@ mod compile_verified_tests {
         let mut ours = cranelift_codegen::Context::for_function(summing(&*isa));
         let host = validate::Entry::Host;
         let (code, _) =
-            compile_verified(&*isa, &mut ours, FuncId::from_u32(0), host, &|_| None).unwrap();
+            compile_verified(&*isa, &mut ours, FuncId::from_u32(0), host, &|_| None, None).unwrap();
         let mut theirs = cranelift_codegen::Context::for_function(summing(&*isa));
         let want = theirs.compile(&*isa, &mut Default::default()).unwrap();
         assert_eq!(code.code_buffer(), want.code_buffer());
@@ -7673,6 +7696,10 @@ fn compile_child_windowed(
         },
         |_, _, _| {},
         &guest,
+        &|i: usize| {
+            let r = &funcs[i].results;
+            uses_sret(r).then_some(r.len() as u32)
+        },
     )?;
     let mut ctx = module.make_context();
     build_trampoline(
