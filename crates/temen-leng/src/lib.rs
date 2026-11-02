@@ -2356,13 +2356,15 @@ fn posix_runtime(
     Ok(out)
 }
 
-/// **`temen-link -o:<out.temen> [-g] [--edge:posix|caps] [--libc:<path>] <main.c.nif> <dep.c.nif>...`**,
+/// **`temen-link -o:<out.temen> [-g] [--edge:posix|caps] [--libc:<path>] <main.c.nif> <dep.c.nif>... [<lib.temeno>...]`**,
 /// the command nimony's Temen backend plans after dead-code elimination (#1609): link a program's
 /// `.c.nif` modules with [`link_nim`], against the prebuilt guest libc (`/lib/temen/libc.temeno`
 /// unless `--libc:` names another; linked without one if it is absent), and write the encoded module.
-/// The program links on the POSIX edge, over `personality`'s ops, unless `--edge:caps` asks for the
-/// capability edge ([`Edge`]); nimony's own build links on POSIX. A release build unless `-g` asks for
-/// a debug build, as `cc -g` does.
+/// An input ending in `.temeno` is a C library unit, one of [`link_nim`]'s `libs` (#2294): that is
+/// how a `{.link.}` pragma names one, which nimony passes after the modules, as a C build does a
+/// static library. The program links on the POSIX edge, over `personality`'s ops, unless
+/// `--edge:caps` asks for the capability edge ([`Edge`]); nimony's own build links on POSIX. A
+/// release build unless `-g` asks for a debug build, as `cc -g` does.
 ///
 /// It reaches files only through `read` and `write`. The in-guest `temen-link` passes the
 /// personality's file ops; an embedder that serves the command natively passes its filesystem. Either
@@ -2402,8 +2404,13 @@ pub fn link_command(
         return 1;
     };
     let mut srcs = Vec::new();
+    let mut libs = Vec::new();
     for &p in &inputs {
         let Some(bytes) = read(p) else { return 2 };
+        if p.ends_with(".temeno") {
+            libs.push(bytes);
+            continue;
+        }
         // A module's stem is its file's name to the first dot: `nimcache/t/x/sysvq0asl.c.nif`.
         let name = p.rsplit('/').next().unwrap_or(p);
         let stem = name.split('.').next().unwrap_or(name);
@@ -2413,8 +2420,9 @@ pub fn link_command(
         .iter()
         .map(|(stem, src)| WholeModule { stem, src })
         .collect();
+    let libs: Vec<&[u8]> = libs.iter().map(Vec::as_slice).collect();
     let libc = read(libc_path);
-    let Ok(module) = link_nim(&units, edge, libc.as_deref(), &[], debug) else {
+    let Ok(module) = link_nim(&units, edge, libc.as_deref(), &libs, debug) else {
         return 3;
     };
     if !write(out, &temen_encode::encode_module(&module)) {

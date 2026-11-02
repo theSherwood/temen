@@ -61,8 +61,12 @@ block 0 (v0: i64, v1: i64) {
   }
 }";
 
+/// The library as the `.temeno` its toolchain would write.
+fn library() -> Vec<u8> {
+    temen_encode::encode_unit(&temen_text::parse_module(LIB).expect("parse the library"))
+}
+
 fn link() -> temen_ir::Module {
-    let lib = temen_encode::encode_unit(&temen_text::parse_module(LIB).expect("parse the library"));
     let units = [
         WholeModule {
             stem: "sysvstub",
@@ -73,7 +77,7 @@ fn link() -> temen_ir::Module {
             src: PROG,
         },
     ];
-    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[&lib], false)
+    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[&library()], false)
         .unwrap_or_else(|e| panic!("link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     m
@@ -116,4 +120,39 @@ fn a_c_library_and_its_callback_run_on_every_engine() {
             run.outcome
         );
     }
+}
+
+/// `temen-link` takes a library as a `.temeno` input, which is how nimony passes the file a
+/// `{.link.}` pragma names. The module it writes is the one `link_nim` links.
+#[test]
+fn temen_link_takes_a_library_as_a_temeno_input() {
+    let lib = library();
+    let files: std::collections::HashMap<&str, &[u8]> = [
+        ("prog.c.nif", PROG.as_bytes()),
+        ("sysvstub.c.nif", SYSTEM.as_bytes()),
+        ("/opt/lib/c.temeno", lib.as_slice()),
+    ]
+    .into();
+    let (names, sigs) = temen_posix::cap_vtable();
+    let mut out = None;
+    let status = temen_leng::link_command(
+        &[
+            "--edge:caps",
+            "-o:prog.temen",
+            "prog.c.nif",
+            "sysvstub.c.nif",
+            "/opt/lib/c.temeno",
+        ],
+        (&names, &sigs),
+        &mut |path| files.get(path).map(|b| b.to_vec()),
+        &mut |_, bytes| {
+            out = Some(bytes.to_vec());
+            true
+        },
+    );
+    assert_eq!(status, 0, "temen-link links the program with its library");
+    assert!(
+        out.as_deref() == Some(temen_encode::encode_module(&link()).as_slice()),
+        "temen-link wrote the module link_nim links"
+    );
 }
