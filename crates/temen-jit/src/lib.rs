@@ -6268,6 +6268,35 @@ impl HostFn {
         }
     }
 
+    /// #2534 — what each argument register must be, for the machine-code validator to accept a call
+    /// to this host function. A host function confines guest pointers against the window values the
+    /// emitted code hands it, so a wrong register (a backend bug) would move the window the host
+    /// trusts; these tags pin the ones it would subvert. Positional, SysV integer-register order;
+    /// `Any`/trailing-unlisted arguments are unconstrained. Arguments past the sixth ride the stack
+    /// (the `call.cap` marshalling buffers, GcRoots' array, a fiber's status word) and are checked
+    /// in a PR 3b follow-up; `WindowSize`/`VmctxField`/`sret`-slot tags land with their facts.
+    fn arg_contract(self) -> &'static [validate::ArgTag] {
+        use validate::ArgTag::{Any, StackSlot, Vmctx, WindowBase};
+        // The host writes an 8-byte status word back through a fiber resume's `status_ptr`.
+        const STATUS: validate::ArgTag = StackSlot {
+            len: 8,
+            write: true,
+        };
+        match self {
+            // ctx, mem_base, mem_size, mem_reserved, tid, op, handle, args_ptr, … (mem_size and
+            // mem_reserved are window constants — their `WindowSize`/`WindowReserved` tags wait on
+            // the validator tracking those constants across the spill they often ride, PR 3b).
+            HostFn::CapThunk => &[Any, WindowBase],
+            // vmctx, mem_base, off, len, flags
+            HostFn::PageMiss => &[Vmctx, WindowBase],
+            // k, arg, status_ptr, vmctx
+            HostFn::FiberResume => &[Any, Any, STATUS, Vmctx],
+            // sched, k, arg, status_ptr, vmctx
+            HostFn::FiberResumeBlock => &[Any, Any, Any, STATUS, Vmctx],
+            _ => &[],
+        }
+    }
+
     /// Its C signature, in the target's calling convention `cc`.
     fn signature(self, cc: cranelift_codegen::isa::CallConv) -> Signature {
         use HostFn::*;
@@ -6902,10 +6931,32 @@ fn callee_contracts(module: &JITModule) -> Vec<Option<validate::Contract>> {
             if out.len() <= i {
                 out.resize(i + 1, None);
             }
-            out[i] = validate::contract(&decl.signature);
+            // The convention gives clobbers/pops; the symbol gives the argument tags (#2534) — the
+            // callee is identified by name, which `contract` (seeing only the signature) cannot do.
+            let mut c = validate::contract(&decl.signature);
+            if let (Some(c), Some(name)) = (c.as_mut(), decl.name.as_deref()) {
+                c.args = host_args(name);
+            }
+            out[i] = c;
         }
     }
     out
+}
+
+/// The #2534 argument tags for the host function a symbol names (`&[]` for a guest function or an
+/// unconstrained host one). The D45 fast-cap thunk is one symbol per call shape
+/// (`temen.fast_cap.{type}.{op}.{n_args}.{n_res}`), so it is matched by prefix; every other host
+/// function is matched against [`HostFn::symbol`], the single source of truth for these names.
+fn host_args(name: &str) -> &'static [validate::ArgTag] {
+    use validate::ArgTag::{Any, Vmctx, WindowBase};
+    if name.starts_with("temen.fast_cap.") {
+        // ctx, mem_base, mem_size, handle, vmctx, args…
+        return &[Any, WindowBase, Any, Any, Vmctx];
+    }
+    HostFn::ALL
+        .iter()
+        .find(|h| h.symbol() == name)
+        .map_or(&[], |h| h.arg_contract())
 }
 
 /// Define `id` in `module` from `ctx`'s CLIF, compiled by [`compile_verified`], and return its code.
