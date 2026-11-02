@@ -316,9 +316,15 @@ found (#2603):
   must be `mem_base`, `Vmctx` must be `vmctx`, and a caller-frame buffer must be a known frame slot,
   never a guest value — a wrong register would move the window the host trusts or hand it a forged
   pointer. The caller's spill slots survive the call: a host callee writes the caller's stack only
-  through a write-buffer pointer its contract names, so exactly that buffer's slots are dropped and
-  the context-pointer spills (`mem_base`, `vmctx`, the fuel cell) survive; a frame pointer the
-  contract does not model forces a full clear, the sound fallback.
+  through a *write*-buffer pointer its contract names, so exactly that buffer's slots are dropped; a
+  *read* buffer it only reads (GcRoots' marshalling struct) drops nothing; and the context-pointer
+  spills (`mem_base`, `vmctx`, the fuel cell) survive either way. A frame pointer the contract does
+  not model forces a full clear, the sound fallback — so every host call that hands the host a
+  caller-frame pointer in an argument register is tagged (the fiber and thread status words in
+  `rdx`/`rcx`/`r8`, the signal record in `rsi`, GcRoots' struct in `rdi`), or that fallback fires
+  needlessly and, once the validator is fail-closed (#2536), could refuse sound thread/fiber/GC code.
+  The `call.cap` marshalling buffers ride the stack (past the sixth argument) and are tagged in a
+  later #2534 slice, when stack-passed arguments carry facts.
 - A type check proves something only on its equal edge, and only of the record whose type id it
   loaded: every register still holding that record's address. A record never changes, so the proof
   outlives a call in a register the callee keeps. `test r, r` is exactly `cmp r, 0`.
@@ -336,7 +342,8 @@ found (#2603):
   prologue/trap **safepoint** is exempt — a bounded call the same `RED_ZONE` margin covers, like the
   pre-check register spills (`STACK_GUARD.md`): the fuel refill rides the prologue fuel check
   *before* the overflow check, and `emit_trap`'s `-g` `trap_capture` call rides each trap path (its
-  safepoint contract lands with the host-call contracts in PR 3b). A frame deeper than `RED_ZONE`
+  safepoint contract lands with the remaining host-call contracts in a later #2534 slice; no
+  validated build emits it, since it needs `-g`). A frame deeper than `RED_ZONE`
   below entry is rejected, bounding every stack access the frame policy admits.
 
 **Spectre.** Window indices are confined only branchlessly (a `cmov`, a mask, a constant), so the
