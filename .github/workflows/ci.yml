@@ -965,7 +965,11 @@ jobs:
 
   browser-real:
     name: real-browser (Chromium via Playwright)
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`: that moved to Ubuntu 26.04 between 2026-10-29 and 2026-11-02, and
+    # Playwright 1.56.1 refuses it ("Playwright does not support chromium on ubuntu26.04-x64"). The
+    # no-`--with-deps` install below (#1788) also leans on the image's own Chromium libraries, so the
+    # image is part of this job's pinned environment, like the Playwright version.
+    runs-on: ubuntu-24.04
     # #1175: the multi-Worker Chromium threads/atomics battery (step "Build threads module + run in
     # Chromium (powerbox + multi-Worker → 4000)") is a lost-wakeup/deadlock flake source; with no
     # job-level cap a hang runs to GitHub's 6-hour default instead of failing fast. The step was ~11 min
@@ -1321,7 +1325,8 @@ jobs:
   # are last-writer-wins, which is fine here because it carries no deploy gate.
   browser-real-nim:
     name: real-browser nim cards
-    runs-on: ubuntu-latest
+    # Pinned for the same reason as `browser-real`: Playwright 1.56.1 refuses Ubuntu 26.04.
+    runs-on: ubuntu-24.04
     # Same #1175 backstop as `browser-real`: these are the multi-Worker batteries, and a lost wakeup
     # must red in minutes rather than run to GitHub's 6-hour default. The job is ~8 min cold.
     timeout-minutes: 30
