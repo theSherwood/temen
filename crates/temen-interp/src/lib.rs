@@ -1231,6 +1231,9 @@ impl Inspector {
         fuel: u64,
         mut host: Host,
     ) -> Inspector {
+        // #2695 step 2 — this driver ends a run at its entry, so it declines a held domain, which
+        // serves calls after it ([`Host::hold`]).
+        let declined = host.held().then_some(Err(Trap::ThreadFault));
         let funcs: Arc<[Func]> = m.funcs.to_vec().into();
         let types: Arc<[temen_ir::TypeEntry]> = m.types.to_vec().into();
         let args: Arc<[Value]> = args.into();
@@ -1259,7 +1262,8 @@ impl Inspector {
             debug_info: m.debug_info.clone().map(Arc::new),
             shared,
             focus: None,
-            seek_init: Some(SeekInit {
+            // A declined run has nothing to seek through: a seek would re-run it unheld.
+            seek_init: declined.is_none().then_some(SeekInit {
                 funcs,
                 types,
                 func,
@@ -1271,7 +1275,7 @@ impl Inspector {
                 seed: None,
                 null_guard,
             }),
-            finished: None,
+            finished: declined,
             checkpoints: moment::Ladder::new(SEEK_CHECKPOINT_STRIDE, 0, 0),
         }
     }
@@ -2335,7 +2339,8 @@ pub fn run_with_host_fast(
     fuel: &mut u64,
     host: &mut Host,
 ) -> Result<Vec<Value>, Trap> {
-    if !host.is_durable() {
+    // #2695 step 2 — only the tree-walker rests a held domain ([`Host::hold`]).
+    if !host.is_durable() && !host.held() {
         if let Some(result) = bytecode::compile_and_run_with_host(m, func, args, fuel, host) {
             return result;
         }
@@ -2359,7 +2364,8 @@ pub fn run_with_host_fast_traced(
     fuel: &mut u64,
     host: &mut Host,
 ) -> TracedRun {
-    if !host.is_durable() {
+    // #2695 step 2 — only the tree-walker rests a held domain ([`Host::hold`]).
+    if !host.is_durable() && !host.held() {
         if let Some(result) = bytecode::compile_and_run_with_host_traced(m, func, args, fuel, host)
         {
             return result;
@@ -2416,6 +2422,10 @@ fn drive_arc(
     mem: &mut Option<Mem>,
     host: &mut Host,
 ) -> TracedRun {
+    // #2695 step 2 — a resting domain has no durable form yet: a held durable root is refused.
+    if host.held() && host.is_durable() {
+        return (Err(Trap::ThreadFault), Vec::new(), None);
+    }
     let workers = pool_workers();
     // B2 `install`: the table reservation the root vCPU builds its dispatch table with (must
     // equal the JIT's `table_reserve_log2`). Read before the host is moved into the Arc below.
@@ -3721,6 +3731,19 @@ fn drive_over_cell(
         // freeze.
         if let (true, Ok(_), Some(t)) = (froze, &out.result, s.freeze_fault) {
             out.result = Err(t);
+        }
+        // #2695 step 2 — the run's end ends a domain that rests: what its main vCPU's end hands back
+        // goes back now, its window and its pipe ends (#2113, #2220). A root that rested answers its
+        // entry's results, unless its domain ended since: then the run answers that end.
+        let resting = std::mem::take(&mut s.resting);
+        for r in resting.values() {
+            let mut h = r.domain.host.lock_unpoisoned();
+            h.release_memory();
+            h.release_pipe_ends(); // the run is over: no reader or writer is left to wake
+        }
+        let rested = resting.contains_key(&s.root_domain);
+        if let (true, Ok(_), Some(t)) = (rested, &out.result, s.dead.get(&s.root_domain)) {
+            out.result = Err(*t);
         }
         (out, s.trap_origin.take(), std::mem::take(&mut s.twin_traps))
     };
@@ -6887,6 +6910,16 @@ struct FinishedThread {
     sink: Arc<Mutex<Host>>,
 }
 
+/// #2695 step 2 — a domain whose entry returned and which its embedder holds ([`Host::hold`]):
+/// what a new activation of it starts from ([`serve_resting`]).
+struct Resting {
+    domain: Arc<Domain>,
+    /// A thread's view of its window, which each activation forks.
+    mem: Option<Mem>,
+    /// Its fuel, which each activation draws from as a thread does.
+    fuel: Fuel,
+}
+
 #[derive(Default)]
 struct Sched {
     /// vCPUs ready to run.
@@ -7108,6 +7141,13 @@ struct Sched {
     /// #1689 — the first trap of any vCPU (a fork twin's excepted) that finished once the freeze was
     /// in flight. `drive` fails the run with it: a freeze with a failed member is not a freeze.
     freeze_fault: Option<Trap>,
+    /// #2695 step 2 — each domain resting after its entry returned ([`Host::hold`]), by
+    /// [`Domain::id`]: what its activations run over ([`serve_resting`]). Kept, dead or not, until
+    /// the run ends.
+    resting: BTreeMap<usize, Resting>,
+    /// #2695 step 2 — resting domains a call has landed on since a worker last looked
+    /// ([`Scheduler::svc_wake`]): the next one starts their activations.
+    serve_due: std::collections::BTreeSet<usize>,
     /// §5 W3 / §23-D57 — the **trap-origin capture**: the backtrace, fiber and faulting address of
     /// the *first* vCPU to trap on its own op, run-shared and **first-wins**. A thread's trap ends its
     /// domain, the root's with the same trap where it stood, and a child's trap reaches its joiner as
@@ -7143,6 +7183,15 @@ impl Scheduler {
     /// demand warrants. `None` if the live cap is hit (a thread-bomb).
     fn spawn(self: &Arc<Self>, make: impl FnOnce(TaskId) -> Box<VCpu>) -> Option<TaskId> {
         let mut s = self.lock();
+        self.spawn_locked(&mut s, make)
+    }
+
+    /// [`Self::spawn`], with the scheduler locked.
+    fn spawn_locked(
+        self: &Arc<Self>,
+        s: &mut Sched,
+        make: impl FnOnce(TaskId) -> Box<VCpu>,
+    ) -> Option<TaskId> {
         // §12 teardown (owner 2026-07-24): a post-teardown sibling (running at the sweep, effects
         // unspecified) must not repopulate a run that is already over.
         if s.live >= self.cap || s.shutdown {
@@ -7152,7 +7201,7 @@ impl Scheduler {
         s.next_task += 1;
         s.live += 1;
         s.runnable.push_back(make(id));
-        self.maybe_spawn_worker(&mut s);
+        self.maybe_spawn_worker(s);
         self.work.notify_one();
         Some(id)
     }
@@ -7561,29 +7610,8 @@ impl Scheduler {
     /// Lock order (scheduler, then callee powerbox) matches the caller's park handler and the
     /// fiber early-probe, so the pair can't deadlock.
     fn cap_reply_or_stash(&self, ticket: u64, reply: Reply, callee: &Arc<Mutex<Host>>) {
-        let mut s = self.lock();
-        let callee_id = {
-            let mut c = callee.lock_unpoisoned();
-            // #1862 — a page request answered without a settle (an error reply) drops its sink.
-            c.page_sinks.remove(&ticket);
-            c.domain_id() as usize
-        };
-        match s.ticket_waiters.remove(&(callee_id, ticket)) {
-            Some((waiter, to)) => {
-                let out = to.complete(reply, callee);
-                if deliver_reply(&mut s, waiter, to, out) {
-                    self.work.notify_all();
-                }
-            }
-            None => {
-                // I40: the caller was reaped with this call in flight — drop the reply instead of
-                // stashing an entry into `svc_results` that nothing will ever claim. A handle in it
-                // stays the callee's: nothing is granted to a caller that is gone.
-                if s.orphan_tickets.remove(&(callee_id, ticket)) {
-                    return;
-                }
-                callee.lock_unpoisoned().svc_results.insert(ticket, reply);
-            }
+        if reply_locked(&mut self.lock(), ticket, reply, callee) {
+            self.work.notify_all();
         }
     }
 
@@ -7685,7 +7713,10 @@ impl Scheduler {
     /// serves — or, for a consumer that lost the admission race, re-parks.
     fn svc_wake(&self, key: usize) -> bool {
         let mut s = self.lock();
-        if svc_wake_locked(&mut s, key) {
+        // #2695 step 2 — a resting domain has no serve loop to wake: the next worker starts an
+        // activation for the call ([`serve_resting`]).
+        let due = s.resting.contains_key(&key) && s.serve_due.insert(key);
+        if svc_wake_locked(&mut s, key) || due {
             self.work.notify_all();
             true
         } else {
@@ -8584,6 +8615,7 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
         .values()
         .map(|&(_, t)| t)
         .chain(v.serve_run.as_ref().map(|r| r.ticket))
+        .chain(v.answers)
         .collect();
     for (flag, host) in child_domains(&v.domain.children) {
         kill_child_locked(s, &flag, host.as_ref());
@@ -8784,6 +8816,11 @@ fn teardown_run(s: &mut Sched) {
             .get(&v.domain.id)
             .cloned()
             .unwrap_or(Trap::ThreadFault);
+        // #2695 step 2 — an activation stranded here strands its call, which ends its domain as a
+        // stranded root ends the run.
+        if v.answers.is_some() {
+            s.dead.entry(v.domain.id).or_insert(reason);
+        }
         reap(s, v, reason);
     }
 }
@@ -9475,6 +9512,10 @@ fn worker_loop(sched: &Arc<Scheduler>) {
             let mut s = sched.lock();
             loop {
                 process_timers(&mut s);
+                // #2695 step 2 — calls that landed on resting domains start their activations.
+                while let Some(key) = s.serve_due.pop_first() {
+                    serve_resting(sched, &mut s, key);
+                }
                 if let Some(v) = s.runnable.pop_front() {
                     break Some(v);
                 }
@@ -9887,9 +9928,36 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // is dropped — its domain key, its powerbox (the dying domain's queue), and the tickets
                 // of dispatches it admitted but never replied (their cross-domain callers wake, D37).
                 let key = v.domain.id;
+                // #2695 step 2 — a held root whose entry returned rests: its domain lives on and
+                // serves the calls queued on it as activations ([`serve_resting`]). An activation is
+                // not its domain's main either. Neither ends the domain, as a thread's end does not.
+                let rests = !froze
+                    && v.id == ROOT_TASK
+                    && v.answers.is_none()
+                    && result.is_ok()
+                    && v.domain.host.lock_unpoisoned().held();
+                let main = v.spawn_residue.is_none() && v.answers.is_none() && !rests;
+                let rest = rests.then(|| Resting {
+                    domain: Arc::clone(&v.domain),
+                    mem: v.mem.as_ref().map(Mem::fork_for_thread),
+                    fuel: v.fuel.for_thread(),
+                });
+                // INVARIANTS #8 — an activation's return is its reply: every result, the first a page
+                // request's status, settled from this window as a serve loop settles it.
+                let answer = match (v.answers, &result) {
+                    (Some(t), Ok(vals)) => {
+                        let mut slots: Vec<i64> = vals.iter().map(|&x| val_to_slot(x)).collect();
+                        if let Some(first) = slots.first_mut() {
+                            let mem = v.mem.as_ref().map(|m| m as &dyn GuestMem);
+                            *first = v.domain.host.lock_unpoisoned().settle_page(t, *first, mem);
+                        }
+                        Some((t, Reply::Results(slots)))
+                    }
+                    _ => None,
+                };
                 // #2480 — the domain's main vCPU finishing ends the domain (#1917), and with it the
                 // fibers no one will resume now.
-                let ends_domain = !froze && v.spawn_residue.is_none();
+                let ends_domain = !froze && main;
                 let spawner_domain = v.spawner_domain;
                 let dying_host = Arc::clone(&v.domain.host);
                 let own_tickets: Vec<u64> = v
@@ -9897,6 +9965,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     .values()
                     .map(|&(_, t)| t)
                     .chain(v.serve_run.as_ref().map(|r| r.ticket))
+                    .chain(v.answers.filter(|_| answer.is_none()))
                     .collect();
                 // FORK.md §8.6 — a domain finishing (cleanly or trapping) releases its pipe write ends,
                 // so a producer that exits lets its consumer see EOF. Collect the pipes that thereby
@@ -9908,7 +9977,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // domain whose *thread* finished (#1917): a `thread.spawn` child shares its domain's
                 // powerbox and so its pipe ends, and a thread's exit closes nothing. The domain's main
                 // vCPU finishing ends the domain, and releases them.
-                let (pipe_eofs, pipe_epipes) = if froze || v.spawn_residue.is_some() {
+                let (pipe_eofs, pipe_epipes) = if froze || !main {
                     (Vec::new(), Vec::new())
                 } else {
                     let mut h = v.domain.host.lock_unpoisoned();
@@ -9970,6 +10039,14 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let mut s = sched.lock();
                 for (flag, host) in &orphans {
                     kill_child_locked(&mut s, flag, host.as_ref());
+                }
+                if let Some((t, reply)) = answer {
+                    // §12 — one that finished after its domain's teardown answers the domain's end.
+                    let reply = match s.dead.contains_key(&key) {
+                        true => Reply::Failed(CAP_REVOKED),
+                        false => reply,
+                    };
+                    reply_locked(&mut s, t, reply, &dying_host);
                 }
                 // #1584 — a freeze is now in flight: the worker loop drains the parks that will not
                 // otherwise observe it (see `freeze_in_flight`).
@@ -10074,6 +10151,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 }
                 end_hold_member(&mut s, id);
                 s.live -= 1;
+                // #2695 step 2 — the rest begins with the calls queued on it.
+                if let Some(r) = rest {
+                    s.resting.insert(key, r);
+                    serve_resting(sched, &mut s, key);
+                }
                 // Domain lifetime & teardown (DESIGN.md §12 / ISSUES.md I37, owner 2026-07-24):
                 // executors never anchor a domain's lifetime — ownership does. `exit(n)` or any trap
                 // from ANY member is domain-wide teardown; the ROOT's completion (return, exit, or
@@ -10086,7 +10168,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         teardown_domain(&mut s, key, t, &dying_host);
                         wake_dead_tickets(&mut s, key, own_tickets);
                     }
-                    if id == ROOT_TASK || (died.is_some() && key == s.root_domain) {
+                    if (id == ROOT_TASK && !rests) || (died.is_some() && key == s.root_domain) {
                         teardown_run(&mut s);
                     }
                 }
@@ -12967,6 +13049,10 @@ struct VCpu {
     /// (#1917). `None` on a domain's main vCPU, whose entry/args the thaw caller supplies.
     /// (slice 3.2.1)
     spawn_residue: Option<(FuncIdx, Vec<i64>, usize)>,
+    /// #2695 step 2 — the call this vCPU answers, by its dispatch's ticket: an activation of a
+    /// resting domain ([`serve_resting`]). Its return replies, and, as a thread's does, its end ends
+    /// nothing else.
+    answers: Option<u64>,
     /// This spawned vCPU's durable **shadow context** (`1..=MAX_SHADOW_CTX`), reserved at
     /// `thread.spawn` and freed back to the registry when the vCPU genuinely finishes (context
     /// recycling). 0 for the root and every non-durable vCPU (nothing to free).
@@ -13205,6 +13291,7 @@ impl VCpu {
             durable_sp_ctx: 0,
             frozen: Vec::new(),
             spawn_residue: None,
+            answers: None,
             vcpu_ctx: 0,
             dstate: STATE_NORMAL,
             wait_indefinite: false,
@@ -13279,6 +13366,7 @@ impl VCpu {
             durable_sp_ctx: self.durable_sp_ctx,
             frozen: Vec::new(),
             spawn_residue: None,
+            answers: None,
             vcpu_ctx: self.vcpu_ctx,
             dstate: self.dstate,
             wait_indefinite: false,
@@ -13360,6 +13448,7 @@ impl VCpu {
             durable_sp_ctx: 0,
             frozen: Vec::new(),
             spawn_residue: None,
+            answers: None,
             vcpu_ctx: 0,
             dstate: STATE_NORMAL,
             wait_indefinite: false,
@@ -14387,6 +14476,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         unit_ref_cache,
         window_lease: _, // settled where the vCPU ends (`Done` / `reap`), never mid-run
         live: _,         // #2001: handed back when the vCPU is dropped
+        answers: _,      // #2695: read where the vCPU ends (`Done` / `reap`)
     } = v;
     let depth = *depth;
     let durable = *durable;
@@ -24559,6 +24649,93 @@ impl ReplyTo {
     }
 }
 
+/// [`Scheduler::cap_reply_or_stash`], with the scheduler locked: whether a worker needs waking.
+fn reply_locked(s: &mut Sched, ticket: u64, reply: Reply, callee: &Arc<Mutex<Host>>) -> bool {
+    let callee_id = {
+        let mut c = callee.lock_unpoisoned();
+        // #1862 — a page request answered without a settle (an error reply) drops its sink.
+        c.page_sinks.remove(&ticket);
+        c.domain_id() as usize
+    };
+    match s.ticket_waiters.remove(&(callee_id, ticket)) {
+        Some((waiter, to)) => {
+            let out = to.complete(reply, callee);
+            deliver_reply(s, waiter, to, out)
+        }
+        None => {
+            // I40: the caller was reaped with this call in flight — drop the reply instead of
+            // stashing an entry into `svc_results` that nothing will ever claim. A handle in it
+            // stays the callee's: nothing is granted to a caller that is gone.
+            if !s.orphan_tickets.remove(&(callee_id, ticket)) {
+                callee.lock_unpoisoned().svc_results.insert(ticket, reply);
+            }
+            false
+        }
+    }
+}
+
+/// #2695 step 2 — start an activation of resting domain `key` ([`Host::hold`]) for each call queued
+/// on it. An activation is a new vCPU of the domain, over a thread's view of its window and on its
+/// fuel, at the op's handler, called with the call's arguments. Its return replies with every result
+/// the handler returns, and its trap or exit ends the domain, as any member's does. A call of
+/// another arity than its handler is answered `-EINVAL`, as a serve loop answers one, and one the
+/// run has no room for `-EAGAIN`, as a serve loop answers one when its fibers are spent.
+fn serve_resting(sched: &Arc<Scheduler>, s: &mut Sched, key: usize) {
+    let Some(r) = s.resting.get(&key) else {
+        return;
+    };
+    if s.shutdown || s.dead.contains_key(&key) {
+        return;
+    }
+    let domain = Arc::clone(&r.domain);
+    let host = &domain.host;
+    let queued: Vec<SvcDispatch> = host.lock_unpoisoned().svc_queue.drain(..).collect();
+    for d in queued {
+        let start = {
+            let mut h = host.lock_unpoisoned();
+            let handler = h.svc_handler_func(d.export, d.op).filter(|&f| {
+                (domain.funcs.get(f as usize)).is_some_and(|f| f.params.len() == d.args.len())
+            });
+            match handler {
+                None => Err(EINVAL),
+                Some(f) => LiveVcpu::charge(h.own_node())
+                    .map(|live| (f, live, h.next_vcpu_id()))
+                    .ok_or(EAGAIN),
+            }
+        };
+        let (f, live, tls) = match start {
+            Ok(start) => start,
+            Err(errno) => {
+                reply_locked(s, d.ticket, Reply::Failed(errno), host);
+                continue;
+            }
+        };
+        let args: Vec<Value> = (domain.funcs[f as usize].params.iter().zip(&d.args))
+            .map(|(&ty, &slot)| slot_to_val(ty, slot))
+            .collect();
+        let r = &s.resting[&key];
+        let (mem, fuel) = (
+            r.mem.as_ref().map(Mem::fork_for_thread),
+            r.fuel.for_thread(),
+        );
+        let (vdomain, sref, ticket) = (
+            Arc::clone(&domain),
+            SchedRef::Real(Arc::clone(sched)),
+            d.ticket,
+        );
+        let made = sched.spawn_locked(s, move |id| {
+            let mut v = VCpu::new(vdomain, f, &args, mem, fuel, 0, id, sref);
+            v.answers = Some(ticket);
+            v.tls = tls;
+            v.live = live;
+            Box::new(v)
+        });
+        if made.is_none() {
+            reply_locked(s, ticket, Reply::Failed(EAGAIN), host);
+        }
+    }
+}
+
 /// INVARIANTS #8 — hand a live call's laid-out reply ([`ReplyTo::complete`]) to the caller parked on
 /// it, `to`: a vCPU resumes with it ([`Pending::Reply`]), a fiber is woken with it
 /// ([`FiberRegistry::wake_reply`]). Whether a worker needs waking.
@@ -25267,6 +25444,8 @@ pub struct Host {
     /// default ⇒ today's enqueue+park transport, byte-identical. The `handoff-on ≡ handoff-off`
     /// differential pin toggles exactly this.
     handoff: bool,
+    /// #2695 step 2 — the embedder holds the domain that becomes the root of a run ([`Host::hold`]).
+    held: bool,
     /// DURABILITY.md §13.3 — this domain's **stable identity** for every serve-path key
     /// (`svc_waiters`/`svc_timers` keys, fiber waiters' domain field, `svc_wake` targets):
     /// process-unique, minted at construction. The `Arc` pointer it replaces was
@@ -26175,6 +26354,7 @@ impl Host {
             frozen_handlers: BTreeMap::new(),
             svc_next_ticket: 0,
             handoff: false,
+            held: false,
             domain_id: NEXT_DOMAIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             serve_ctx: 0,
             park_hub: 0,
@@ -27836,6 +28016,23 @@ impl Host {
     /// Whether direct handoff is enabled on this domain (the knob [`drive_arc`] reads).
     pub fn handoff(&self) -> bool {
         self.handoff
+    }
+
+    /// #2695 step 2 — hold the domain that becomes the root of a run. When its entry returns, it
+    /// rests rather than ending the run, and serves each call queued on it ([`Host::svc_enqueue`])
+    /// as an activation: a new vCPU of the domain at the op's handler, called with the call's
+    /// arguments, whose results are the call's reply ([`Host::svc_result`]). Its threads run on
+    /// meanwhile. The run ends once nothing in it can run: it answers the entry's results, or how
+    /// the domain ended if a member's exit or trap ended it, or a stall verdict stranded a call.
+    /// The tree-walker serves a held domain. The other engines and the debugger decline one, and a
+    /// durable one is refused.
+    pub fn hold(&mut self) {
+        self.held = true;
+    }
+
+    /// Whether the embedder holds this domain ([`Host::hold`]).
+    pub fn held(&self) -> bool {
+        self.held
     }
 
     /// #1458 — capture every host capability's declared state, positionally over `host_procs`

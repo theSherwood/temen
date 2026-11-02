@@ -1413,6 +1413,12 @@ pub fn jit_cap_run(
     host: &mut Host,
     freeze: Option<std::sync::Arc<temen_jit::FreezeController>>,
 ) -> Result<(JitOutcome, temen_interp::MemLayout), temen_jit::JitError> {
+    // #2695 step 2 — this engine does not rest a domain yet ([`Host::hold`]).
+    if host.held() {
+        return Err(temen_jit::JitError::Unsupported(
+            "a held domain rests on the tree-walker only",
+        ));
+    }
     // A fresh window: its page map is `init`'s, none from an earlier run (see `reset_cap_pages`).
     host.reset_cap_pages(init.page_map());
     // #1944 slice 3, #2113 — an activation of the run `host` roots, as `jit_run`'s: the default fuel,

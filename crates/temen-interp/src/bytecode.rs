@@ -12815,6 +12815,12 @@ impl SchedCore {
         host: DomainCell,
     ) -> Result<SchedCore, Trap> {
         let mut h = host.lock_unpoisoned();
+        // #2695 step 2 — this engine does not rest a domain yet. It refuses a held root rather than
+        // ending it at its entry, as it would an ordinary one (INVARIANTS #9). The tree-walker
+        // serves it ([`Host::hold`]).
+        if h.held() {
+            return Err(Trap::ThreadFault);
+        }
         reapply_installs(&h, source, &table)?;
         // Fuel unification (safepoint-anchored): charge one fuel for *entering the top-level entry
         // function*, mirroring the per-callee-entry charge at `Op::Call`/`CallIndirect`/`TailCall*` and
