@@ -12572,15 +12572,16 @@ fn settle_wakes(
     // producer that exits lets its consumer see EOF; a consumer that exits (e.g. `head`) wakes a
     // parked producer to `-EPIPE`. What its window grew goes back with them (#1909). The root's end
     // is the run's, which its teardown handles.
-    let mut live = vec![false; extra_envs.len()];
-    let mut seen = vec![false; extra_envs.len()];
+    // Per child domain, `k - 1` for domain `k`: a run with none allocates nothing, every round.
+    let mut live = vec![false; extra_envs.len() - 1];
+    let mut seen = vec![false; extra_envs.len() - 1];
     for t in tasks.iter().filter(|t| t.env != 0) {
-        seen[t.env] = true;
-        live[t.env] |= !matches!(t.state, TaskState::Done(_));
+        seen[t.env - 1] = true;
+        live[t.env - 1] |= !matches!(t.state, TaskState::Done(_));
     }
     let mut finished: Vec<usize> = Vec::new();
     for k in 1..extra_envs.len() {
-        if seen[k] && !live[k] && released.envs.insert(k) {
+        if seen[k - 1] && !live[k - 1] && released.envs.insert(k) {
             let mut h = extra_envs[k].host.lock_unpoisoned();
             h.release_memory();
             h.release_pipe_ends();
@@ -12617,7 +12618,11 @@ fn settle_wakes(
         .iter()
         .enumerate()
         .filter_map(|(ti2, t)| match &t.state {
-            TaskState::Done(res) if forked_twins.contains(&ti2) && !hooked_twins.contains(&ti2) => {
+            // A twin is never in the root domain: the cheap test first, as every round scans every
+            // task the run has had.
+            TaskState::Done(res)
+                if t.env != 0 && forked_twins.contains(&ti2) && !hooked_twins.contains(&ti2) =>
+            {
                 Some((ti2, super::reap_status(res), t.env))
             }
             _ => None,
@@ -12986,7 +12991,7 @@ impl CoopSched {
         // #1414 D4 — the embedder hears of a call it answers as the leaf makes it, once: one its
         // last bounce made, before anything runs.
         if let Some((ti, id)) = emit.bounce_call.take() {
-            let host = &core.extra_envs[core.tasks[ti].env].host.lock_unpoisoned();
+            let host = core.extra_envs[core.tasks[ti].env].host.lock_unpoisoned();
             if *embedder_pumps && host.completions().is_host_owned(id) {
                 return Ok(CoopStep::CapPark { id });
             }
@@ -14289,8 +14294,9 @@ impl SchedCore {
                 timeout,
                 dst,
             }) => {
-                let root = std::sync::Arc::clone(&extra_envs[0].host);
-                let durable = || root.lock_unpoisoned().is_durable();
+                // The run's durability, the root's, which only a fiber's park reads: read it then.
+                let fiber = tasks[ti].vm.vt.active_id != ROOT_FIBER;
+                let durable = fiber && extra_envs[0].host.lock_unpoisoned().is_durable();
                 // The wait is against THIS task's domain's registry and window. A child's `wait`
                 // on its mapped ring flag must not re-read an unrelated root byte.
                 let e = &mut extra_envs[tasks[ti].env];
@@ -14300,7 +14306,7 @@ impl SchedCore {
                     &mut e.fibers.fibers,
                     &mut e.fibers.sp,
                     &mut e.mem,
-                    durable,
+                    || durable,
                     true,
                     *clock,
                     base,
