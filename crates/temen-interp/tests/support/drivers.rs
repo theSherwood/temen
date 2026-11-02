@@ -155,7 +155,8 @@ pub fn run_on_then<R>(
                     other => panic!("the debug scheduler stopped early: {other:?}"),
                 }
             };
-            done(r, d.host())
+            let ran = done(r, &d.host());
+            ran
         }
     }
 }
