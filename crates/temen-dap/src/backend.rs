@@ -364,13 +364,14 @@ pub trait Debuggee {
     /// The guest's captured stdout at the current stop, if this session runs under a powerbox (else
     /// empty). The server surfaces it as DAP `output` events; on a reverse `seek` it reflects exactly
     /// the output produced up to *here* (the run is rebuilt + replayed), so it rewinds with the program.
-    fn stdout(&self) -> &[u8] {
-        &[]
+    /// A copy when the powerbox sits behind a lock.
+    fn stdout(&self) -> std::borrow::Cow<'_, [u8]> {
+        std::borrow::Cow::Borrowed(&[])
     }
     /// The guest's captured stderr at the current stop — [`stdout`](Self::stdout)'s twin, for a
     /// program that imports the `"stderr"` stream. Rewinds with the program the same way.
-    fn stderr(&self) -> &[u8] {
-        &[]
+    fn stderr(&self) -> std::borrow::Cow<'_, [u8]> {
+        std::borrow::Cow::Borrowed(&[])
     }
     /// The program's `vm_fs` files, as a [`temen_fs::encode_image`] blob (the launch's `fsImage`
     /// format). An empty image when the session grants no `vm_fs`. Like the streams it rewinds with
@@ -1583,14 +1584,15 @@ impl Debuggee for BytecodeBackend {
     }
     /// The guest's captured stdout at the current stop (the on-ramp powerbox's `write` output). On a
     /// reverse `seek` the run is rebuilt and replayed to the earlier point, so this reflects exactly the
-    /// output produced up to *here* — it rewinds with the program. Empty for a deny-all session.
-    fn stdout(&self) -> &[u8] {
-        &self.run.host().stdout
+    /// output produced up to *here* — it rewinds with the program. Empty for a deny-all session. A
+    /// copy: the run's powerbox sits in a cell.
+    fn stdout(&self) -> std::borrow::Cow<'_, [u8]> {
+        std::borrow::Cow::Owned(self.run.host().stdout.clone())
     }
-    fn stderr(&self) -> &[u8] {
-        &self.run.host().stderr
+    fn stderr(&self) -> std::borrow::Cow<'_, [u8]> {
+        std::borrow::Cow::Owned(self.run.host().stderr.clone())
     }
     fn fs_image(&self) -> Vec<u8> {
-        temen_fs::vm_fs_image(self.run.host())
+        temen_fs::vm_fs_image(&self.run.host())
     }
 }
