@@ -241,9 +241,16 @@ Escape-freedom decomposes into five sub-invariants; their conjunction is the the
 ### Checking what the backend emits — the machine-code validator (#2481)
 **Status:** shadow mode. It runs under the fuzzers and `TEMEN_JIT_VALIDATE` and logs what it finds.
 Today it checks fresh compiles for the allowlist, the machine CFG (jump tables included), every
-relocation and every call's callee contract, and in guest functions every memory access outside the
-stack against its region's extent. #2603's PRs 3–4 add the frame and I5, argument and trampoline
-contracts, and a default-deny decoder. At the flip (PR 5), a function runs only if its machine code passes, whether
+relocation and every call's callee contract, and in guest functions every memory access against its
+region's extent — the window, vmctx and its cells, the fn table, rodata, and now the function's own
+frame: a stack access stays within `[rsp, 0)` or the incoming stack-argument area, an `sret`
+return-area write within the result slots the caller granted, and every exit restores `rsp` and the
+callee-saved registers. It also checks **I5**: the prologue's software stack-overflow check
+(`SP − RED_ZONE < limit → trap`) is present and dominates the body's calls, and no frame descends
+more than `RED_ZONE` below entry — the frame-size bound `STACK_GUARD.md` deferred, which the
+validator can enforce because it reads the final `sub rsp` that Cranelift's `CompiledCode` doesn't
+expose. #2603's PRs 3b–4 add the per-argument and trampoline contracts and a default-deny decoder.
+At the flip (PR 5), a function runs only if its machine code passes, whether
 freshly compiled or replayed from a `CodeDir` (D71). `Correct(JIT)` then becomes Correct(our CLIF
 generation and lowering) ∧ Correct(validator). Cranelift's backend, the instruction selection,
 register allocation and encoding where its published escapes were (CVE-2021-32629, CVE-2023-26489),
@@ -270,9 +277,10 @@ reading a jump table's targets from the table its `jmp` computes. It abstracts t
 each point as:
 - a fact per register (`mem_base`, an index `Confined` to `[0, bound) ∪ {guard}`, a pointer into the
   window or the stack at a known offset, a fn-table record whose type was checked, a vmctx cell, a
-  callee's address, …);
+  callee's address, the entry value of a callee-saved register, the caller's `sret` area, …);
 - the flags of the last compare;
-- the spill slots, keyed by their offset from the entry `rsp`.
+- the spill slots, keyed by their offset from the entry `rsp`;
+- whether the stack-overflow check has run on every path to this point.
 
 A block's out-state can differ by edge: the edge where a fn-table type check holds carries what it
 proves.
@@ -313,6 +321,15 @@ found (#2603):
   against iced-x86; where it doesn't know one, the widest.
 - A form whose address isn't `[base + index·scale + disp]` (fs/gs, `0x67`, `xlat`, `bt* [mem], reg`)
   is rejected, not modeled.
+- The native frame is confined by the overflow check (I5), not the window mask. The check is
+  recognized by the facts it compares — a stack pointer `RED_ZONE` below the current `rsp` against
+  `stack_limit` — so both the `mov r,rsp; add r,-RED_ZONE` and `lea r,[rsp−RED_ZONE]` forms qualify;
+  its not-below edge marks the state checked, and a body call is rejected unless it is. A
+  prologue/trap **safepoint** is exempt — a bounded call the same `RED_ZONE` margin covers, like the
+  pre-check register spills (`STACK_GUARD.md`): the fuel refill rides the prologue fuel check
+  *before* the overflow check, and `emit_trap`'s `-g` `trap_capture` call rides each trap path (its
+  safepoint contract lands with the host-call contracts in PR 3b). A frame deeper than `RED_ZONE`
+  below entry is rejected, bounding every stack access the frame policy admits.
 
 **Spectre.** Window indices are confined only branchlessly (a `cmov`, a mask, a constant), so the
 validator also pins D63's Spectre-v1 hardening (§4).
