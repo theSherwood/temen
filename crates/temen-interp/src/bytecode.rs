@@ -6464,7 +6464,7 @@ fn dbg_start_child(
     if !child_room(tasks, ti) {
         child.refuse(|lease| match spawner {
             None => host.release_detached(lease),
-            Some(k) => extra_envs[k].host.release_detached(lease),
+            Some(k) => extra_envs[k].host.lock_unpoisoned().release_detached(lease),
         });
         tasks[ti].deliver(dst, Reg::from_i32(super::EMFILE as i32));
         return Ok(());
