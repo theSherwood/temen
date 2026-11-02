@@ -535,7 +535,7 @@ fn link_selected_with_extra(
     synth_start: bool,
 ) -> Result<Module, LengError> {
     link_lowered(
-        &lower_selected(units, synth_start)?,
+        &lower_selected(units, synth_start, &[])?,
         &extra,
         manifest,
         synth_start,
@@ -548,12 +548,14 @@ fn link_selected_with_extra(
 /// result.
 ///
 /// The lowering is all but the whole cost of a link, and nothing linked beside the units changes
-/// it. So a link that binds the same units twice lowers them once (#1790): the nim link's first pass,
-/// which only discovers the system calls the compute shim leaves ([`nim_compute_exports`]), and its
-/// real link share one lowering.
+/// it but the C libraries in `libs` ([`link_nim`]), whose functions take the on-ramp's ABI at both
+/// ends of a call. So a link that binds the same units twice lowers them once (#1790): the nim
+/// link's first pass, which only discovers the system calls the compute shim leaves
+/// ([`nim_compute_exports`]), and its real link share one lowering.
 fn lower_selected(
     units: &[Parsed],
     synth_start: bool,
+    libs: &[Module],
 ) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
     // Cross-module aggregate type layouts. Unlike the other pools, an object type can *inherit* a
     // base defined in another unit (`JsonParser = object of BaseLexer`, `BaseLexer` in a sibling
@@ -673,6 +675,25 @@ fn lower_selected(
             &pooled_proc_params,
         )?);
     }
+    // **A proc C calls takes the on-ramp's ABI**, the data-stack pointer first (#2294). C calls a
+    // function by name, handing it the top of its own frame as `$sp`. That is the funcref ABI, so an
+    // `exportc` proc whose C name a unit linked beside the program imports joins the pool, framed
+    // whatever its body needs. Two kinds of unit import one: a C library in `libs` (unir's C ABI calls
+    // its heap, `unir_host_alloc`, this way), and the powerbox `_start`, which calls `main`. A `main`
+    // that needed no frame used to take no `$sp`, and only the inliner's splice of it into `_start`
+    // hid the extra argument from the verifier (#2719).
+    let start = synth_start.then(|| synth_start_unit("main")).transpose()?;
+    let callers: Vec<&Module> = libs.iter().chain(start.iter().map(|s| &s.module)).collect();
+    for Parsed { stem, root, .. } in units {
+        for (sym, c) in translate::Translator::exportc_procs(root)? {
+            if callers
+                .iter()
+                .any(|m| m.imports.iter().any(|i| i.name == c))
+            {
+                pooled_funcrefs.insert(format!("{sym}{stem}"));
+            }
+        }
+    }
     // Frame fixpoint input — computed now that every unit's sret-ness is pooled, so a proc that calls
     // an sret proc is correctly seen as frame-needing (its result temp lives in its own frame).
     for Parsed { stem, root, .. } in units {
@@ -699,10 +720,11 @@ fn lower_selected(
     // `call_import` prepend `sp + frame_size` (its `ext_frame_procs` check is on the *bare* import
     // name) and, through the fixpoint below, makes every caller frame-needing so it owns an `$sp` to
     // hand down. A callee edge is recorded in its **globalized** form (`proc_frame_nodes` suffixes a
-    // trailing-`.` name with the importer's stem), so seed both spellings.
+    // trailing-`.` name with the importer's stem), so seed both spellings. A leaf one of `libs`
+    // serves ([`library_unit`]) is a C function too, and is seeded the same way.
     for Parsed { stem, root, .. } in units {
         for (sym, c) in translate::Translator::importc_procs(root)? {
-            if libc_serves(&c) {
+            if libc_serves(&c) || libs.iter().any(|l| l.exports.iter().any(|e| e.name == c)) {
                 pooled_frame_procs.insert(format!("{sym}{stem}"));
                 pooled_frame_procs.insert(sym);
             }
@@ -747,9 +769,7 @@ fn lower_selected(
     // The powerbox `_start` links **first** so it is function 0 (the manifest entry shape), and so
     // the linker's single-pass funcref baking numbers the program's `data.funcref` initializers
     // above it — no fragile post-link index shift. See [`synth_start_unit`].
-    if synth_start {
-        link_units.push(synth_start_unit("main")?);
-    }
+    link_units.extend(start);
     for bytes in &objects {
         let module = temen_encode::decode_unit(bytes)
             .map_err(|e| LengError::Malformed(format!("decode `.temeno` object: {e:?}")))?;
@@ -934,13 +954,19 @@ pub fn link_whole_powerbox_manifest(
     units: &[WholeModule],
     runtime: Vec<temen_ir::LinkUnit>,
 ) -> Result<Module, LengError> {
-    link_lowered(&lower_program(&parse_whole(units)?)?, &runtime, true, true)
+    link_lowered(
+        &lower_program(&parse_whole(units)?, &[])?,
+        &runtime,
+        true,
+        true,
+    )
 }
 
-/// A nim program's whole units, lowered for its link ([`lower_selected`]) after a powerbox `_start`:
-/// what [`link_whole_powerbox_manifest`] links, and what both of the nim link's passes share.
-fn lower_program(units: &[Parsed]) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
-    lower_selected(units, true)
+/// A nim program's whole units, lowered for its link ([`lower_selected`]) beside the C libraries
+/// `libs` after a powerbox `_start`: what [`link_whole_powerbox_manifest`] links, and what both of
+/// the nim link's passes share.
+fn lower_program(units: &[Parsed], libs: &[Module]) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
+    lower_selected(units, true, libs)
 }
 
 /// The **pure-compute C bottom edge** as TEMEN-text funcs — nimony's `memcpy`/`memcmp`/`memset`,
@@ -1425,17 +1451,9 @@ fn libc_serves(c_name: &str) -> bool {
     LIBC_SERVED.contains(&c_name)
 }
 
-/// The **guest-libc leaves** a set of nim units imports, as `(import symbol, C name)` — the `importc`
-/// procs whose C name is in [`LIBC_SERVED`]. Drives both the frame seeding and [`nim_libc_units`].
-fn libc_leaves_of(units: &[Parsed]) -> Result<Vec<(String, String)>, LengError> {
-    let mut out = importc_leaves_of(units)?;
-    out.retain(|(_, c)| libc_serves(c));
-    Ok(out)
-}
-
 /// **Every** `importc` leaf a set of nim units declares, as `(import symbol, C name)` — the one walk
-/// both the guest libc ([`libc_leaves_of`]) and the POSIX edge ([`posix_runtime`]) read, so the
-/// two can never disagree about what a leaf is called.
+/// the C libraries ([`library_unit`]) and the POSIX edge ([`posix_runtime`]) read, so the two can
+/// never disagree about what a leaf is called.
 ///
 /// Each leaf is yielded under **both spellings the linker may see**: the bare leng symbol
 /// (`c_snprintf.0.`, how a module calls a leaf it declares itself) and the stem-suffixed global
@@ -1506,19 +1524,11 @@ pub fn nim_libc_units(
 
 /// [`nim_libc_units`] for parsed units.
 fn libc_units(libc: &[u8], units: &[Parsed]) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
-    let module = temen_encode::decode_unit(libc)
-        .map_err(|e| LengError::Malformed(format!("decode guest libc unit: {e:?}")))?;
-    let mut exports: Vec<(String, u32)> = Vec::new();
-    for (sym, c) in libc_leaves_of(units)? {
-        if let Some(e) = module.exports.iter().find(|e| e.name == c) {
-            exports.push((sym, e.func));
-        }
-    }
-    let libc_unit = temen_ir::LinkUnit {
-        module,
-        exports,
-        ..Default::default()
-    };
+    let libc_unit = library_unit(
+        decode_library(libc)?,
+        &importc_leaves_of(units)?,
+        libc_serves,
+    );
     let stubs = temen_text::parse_module(LIBC_CAP_STUBS)
         .map_err(|e| LengError::Malformed(format!("libc cap stubs parse: {e:?}")))?;
     let stub_unit = temen_ir::LinkUnit {
@@ -1531,6 +1541,41 @@ fn libc_units(libc: &[u8], units: &[Parsed]) -> Result<Vec<temen_ir::LinkUnit>, 
         ..Default::default()
     };
     Ok(vec![libc_unit, stub_unit])
+}
+
+/// Decode a C library's encoded `.temeno` link unit (the guest libc, or one of [`link_nim`]'s
+/// `libs`). The bytes are untrusted like any frontend's output: they pass the `decode_unit`
+/// firewall here, and the linked program is re-verified.
+fn decode_library(bytes: &[u8]) -> Result<Module, LengError> {
+    temen_encode::decode_unit(bytes)
+        .map_err(|e| LengError::Malformed(format!("decode C library unit: {e:?}")))
+}
+
+/// A **C library's link unit** for a nim program: `module` with each function it exports under a C
+/// name `serves` admits, exported again under the nim symbols of the `importc` leaves that name it
+/// (`leaves`, [`importc_leaves_of`]), which is how the program's calls reach it. A leaf whose C name
+/// the library does not export is left to whatever else serves it, or stays an unbound manifest
+/// import. The library's own imports are left to the link: a capability, which the program's
+/// manifest asks the host for, or an `exportc` proc of the program's, which [`lower_selected`] gave
+/// the on-ramp's ABI.
+fn library_unit(
+    module: Module,
+    leaves: &[(String, String)],
+    serves: impl Fn(&str) -> bool,
+) -> temen_ir::LinkUnit {
+    let exports = leaves
+        .iter()
+        .filter(|(_, c)| serves(c))
+        .filter_map(|(sym, c)| {
+            let e = module.exports.iter().find(|e| e.name == *c)?;
+            Some((sym.clone(), e.func))
+        })
+        .collect();
+    temen_ir::LinkUnit {
+        module,
+        exports,
+        ..Default::default()
+    }
 }
 
 /// The **capability edge** ([`Edge::Caps`]): nimony's system calls on the host's capabilities and
@@ -1937,6 +1982,13 @@ impl Edge<'_> {
 /// ops, or the host's capabilities), plus the core's memory ops its heap grows with. Re-verify it like
 /// any linked output.
 ///
+/// `libs` are **C libraries** the program links beside the libc (#2294): encoded `.temeno` link
+/// units, such as a host's C ABI that a nim library wraps. Each serves the program's `importc` procs
+/// whose C names it exports ([`library_unit`]). Their functions take the on-ramp's ABI, the
+/// data-stack pointer first, in both directions: a call to one passes `$sp`, and an `exportc` proc
+/// whose C name a library imports takes one, as the library's callback (its heap, say). A library's
+/// other imports are the host's, in the program's manifest.
+///
 /// `debug` links a **debug build**, which keeps the units' debug info. A **release build** drops it,
 /// so no engine pays for it (#2186): nim code carries none, but the prebuilt libc carries its own, for
 /// a debugger to step into, and the Cranelift JIT captures every explicit trap's backtrace in a module
@@ -1945,15 +1997,22 @@ pub fn link_nim(
     units: &[WholeModule],
     edge: Edge,
     libc: Option<&[u8]>,
+    libs: &[&[u8]],
     debug: bool,
 ) -> Result<Module, LengError> {
     let units = &parse_whole(&link_order(units))?;
+    let libs = libs
+        .iter()
+        .map(|l| decode_library(l))
+        .collect::<Result<Vec<_>, _>>()?;
     // One lowering for both passes (#1790): the runtime's discovery link and this one.
-    let program = lower_program(units)?;
+    let program = lower_program(units, &libs)?;
     let mut runtime = runtime_for(units, &program, edge)?;
     if let Some(libc) = libc {
         runtime.extend(libc_units(libc, units)?);
     }
+    let leaves = importc_leaves_of(units)?;
+    runtime.extend(libs.into_iter().map(|l| library_unit(l, &leaves, |_| true)));
     let mut m = link_lowered(&program, &runtime, true, true)?;
     if !debug {
         m.debug_info = None;
@@ -2008,7 +2067,7 @@ pub fn nim_runtime(
     edge: Edge,
 ) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
     let units = &parse_whole(units)?;
-    runtime_for(units, &lower_program(units)?, edge)
+    runtime_for(units, &lower_program(units, &[])?, edge)
 }
 
 /// [`nim_runtime`] over `program`, the units already lowered ([`lower_program`]), so the link that
@@ -2088,7 +2147,7 @@ fn caps_runtime(
 /// as [`nim_runtime`]: one route through the compute bottom edge.
 pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit, LengError> {
     let units = &parse_whole(units)?;
-    let mut exports = nim_compute_exports(units, &lower_program(units)?)?.0;
+    let mut exports = nim_compute_exports(units, &lower_program(units, &[])?)?.0;
     exports.push((HEAP_GROW_HOOK.to_string(), SHIM_HEAP_FIXED));
     let mut unit = compute_shim_unit(exports)?;
     unit.module.memory = Some(FIXED_HEAP_WINDOW);
@@ -2297,13 +2356,15 @@ fn posix_runtime(
     Ok(out)
 }
 
-/// **`temen-link -o:<out.temen> [-g] [--edge:posix|caps] [--libc:<path>] <main.c.nif> <dep.c.nif>...`**,
+/// **`temen-link -o:<out.temen> [-g] [--edge:posix|caps] [--libc:<path>] <main.c.nif> <dep.c.nif>... [<lib.temeno>...]`**,
 /// the command nimony's Temen backend plans after dead-code elimination (#1609): link a program's
 /// `.c.nif` modules with [`link_nim`], against the prebuilt guest libc (`/lib/temen/libc.temeno`
 /// unless `--libc:` names another; linked without one if it is absent), and write the encoded module.
-/// The program links on the POSIX edge, over `personality`'s ops, unless `--edge:caps` asks for the
-/// capability edge ([`Edge`]); nimony's own build links on POSIX. A release build unless `-g` asks for
-/// a debug build, as `cc -g` does.
+/// An input ending in `.temeno` is a C library unit, one of [`link_nim`]'s `libs` (#2294): that is
+/// how a `{.link.}` pragma names one, which nimony passes after the modules, as a C build does a
+/// static library. The program links on the POSIX edge, over `personality`'s ops, unless
+/// `--edge:caps` asks for the capability edge ([`Edge`]); nimony's own build links on POSIX. A
+/// release build unless `-g` asks for a debug build, as `cc -g` does.
 ///
 /// It reaches files only through `read` and `write`. The in-guest `temen-link` passes the
 /// personality's file ops; an embedder that serves the command natively passes its filesystem. Either
@@ -2343,8 +2404,13 @@ pub fn link_command(
         return 1;
     };
     let mut srcs = Vec::new();
+    let mut libs = Vec::new();
     for &p in &inputs {
         let Some(bytes) = read(p) else { return 2 };
+        if p.ends_with(".temeno") {
+            libs.push(bytes);
+            continue;
+        }
         // A module's stem is its file's name to the first dot: `nimcache/t/x/sysvq0asl.c.nif`.
         let name = p.rsplit('/').next().unwrap_or(p);
         let stem = name.split('.').next().unwrap_or(name);
@@ -2354,8 +2420,9 @@ pub fn link_command(
         .iter()
         .map(|(stem, src)| WholeModule { stem, src })
         .collect();
+    let libs: Vec<&[u8]> = libs.iter().map(Vec::as_slice).collect();
     let libc = read(libc_path);
-    let Ok(module) = link_nim(&units, edge, libc.as_deref(), debug) else {
+    let Ok(module) = link_nim(&units, edge, libc.as_deref(), &libs, debug) else {
         return 3;
     };
     if !write(out, &temen_encode::encode_module(&module)) {

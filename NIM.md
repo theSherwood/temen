@@ -773,6 +773,19 @@ POSIX, such as a capability OS, and `temen-link --edge:caps` builds for it.
 The two share the compute shim, the heap hook and the guest libc, whose streams and exit each edge
 serves. The corpus runs every case on both.
 
+**C libraries beside the libc (#2294).** `link_nim`'s `libs` are C libraries a program links: encoded
+`.temeno` link units, such as a capability host's C ABI that a nim library wraps (unir's
+`unir_cabi.temeno`). A library serves the program's `importc` procs whose C names it exports, and
+its functions take the on-ramp's ABI, the data-stack pointer first, in both directions. A call to
+one passes `$sp`, as a call to the libc does. An `exportc` proc whose C name a library imports takes
+one, because the library calls it as C calls a function pointer: it joins the funcref pool, framed
+whatever its body needs. A library's heap callbacks (`unir_host_alloc`) are such procs. The library's
+other imports are capabilities, which the program's manifest asks the host for; `stream_write` and
+its siblings bind to each edge's streams, as the libc's do. Unlike the libc, which serves only the
+leaves `LIBC_SERVED` lists, a library serves every function it exports: its export table is the
+list. `temen-link` takes a library as a `.temeno` input, which is how nimony passes the file a
+`{.link.}` pragma names, so a nim library can name its C library itself.
+
 **Two paths to the near-term milestone (run one real program):**
 
 - **Path B — host runtime shim first (recommended, no linker).** Skip compiling Nim's `seqimpl`;
