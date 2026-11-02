@@ -1459,20 +1459,20 @@ fn real_envvars_report_an_empty_environment() {
 /// shim, or to one returning a plausible-looking 0, links exactly as cleanly. `-1|-1|-1` is the
 /// contract — the facility is absent, and `epoll_wait` says so rather than answering "no events
 /// ready" for an epoll set that was never created.
+///
+/// It calls them through `std/posix/epoll`, the declarations `std/threadpool` and `std/parfor` link
+/// against. It used to declare its own, against `<sys/epoll.h>` and with `ptr int64` for the event
+/// buffer, and GCC 14 and later reject that mismatched pointer, so `nimony c` failed.
 #[test]
 fn real_epoll_leaves_report_failure() {
     let src = concat!(
         "import std/syncio\n",
+        "import std/posix/epoll\n",
         "\n",
-        "proc epoll_create1(flags: cint): cint {.importc, header: \"<sys/epoll.h>\".}\n",
-        "proc epoll_ctl(epfd: cint; op: cint; fd: cint; event: ptr int64): cint {.importc,\n",
-        "    header: \"<sys/epoll.h>\".}\n",
-        "proc epoll_wait(epfd: cint; events: ptr int64; maxevents: cint; timeout: cint): cint {.importc,\n",
-        "    header: \"<sys/epoll.h>\".}\n",
-        "\n",
-        // nimony pointers are non-nullable (`nil` is rejected outright), so the two pointer-taking
-        // leaves get a real buffer. The stubs never read it.
-        "var ev: array[8, int64]\n",
+        // `epoll_wait` takes a non-nil `ptr`, so both pointer-taking leaves get a real buffer. The
+        // stubs never read it. `noinit`, as nimony's own epoll backend declares its buffer: the
+        // event's union holds a `pointer`, which has no default.
+        "var ev {.noinit.}: array[8, EpollEvent]\n",
         "let a = epoll_create1(0.cint)\n",
         "let b = epoll_ctl(0.cint, 1.cint, 2.cint, addr ev[0])\n",
         "let c = epoll_wait(0.cint, addr ev[0], 1.cint, 0.cint)\n",
