@@ -95,7 +95,7 @@ static long emit_unit(char *buf) {
   eb(buf, 'T'); eb(buf, 'E'); eb(buf, 'M'); eb(buf, 'E'); eb(buf, 'N');
   eb(buf, 0); eb(buf, 0); eb(buf, 0);
   eb(buf, 0); eb(buf, 0);                 // kind = module
-  eb(buf, (15) & 0xff); eb(buf, (15) >> 8); // version (u16)
+  eb(buf, (16) & 0xff); eb(buf, (16) >> 8); // version (u16)
   eb(buf, 0); eb(buf, 0); eb(buf, 0); eb(buf, 0); // flags
   // Memory descriptor: present, size_log2 17 — must match this module's window (the validator's
   // memory-match precondition), which chibicc keeps at the 64 KiB default for a small program.
@@ -122,23 +122,21 @@ static long emit_unit(char *buf) {
   eb(buf, 1);
   eb(buf, 1);
   eb(buf, 0); // no captures (v14)
-  // 3 instructions: mul, const 10, add.
-  uleb(buf, 3);
-  // v2 = i64.mul v0 v1   (a * b)
-  eb(buf, 0x42);
+  // 2 instructions: mul, add 10.
+  uleb(buf, 2);
+  // v2 = i64.mul v0 v1   (a * b; 0x4F: an i64 binop of two values, then the BinOp index)
+  eb(buf, 0x4F);
+  eb(buf, 2);
   uleb(buf, 0);
   uleb(buf, 1);
-  // v3 = i64.const 10
-  eb(buf, 0x11);
-  sleb(buf, 10);
-  // v4 = i64.add v2 v3   (+ 10)
+  // v3 = i64.add v2 10   (an immediate: uleb operand index, sleb immediate)
   eb(buf, 0x40);
   uleb(buf, 2);
-  uleb(buf, 3);
-  // return v4
+  sleb(buf, 10);
+  // return v3
   eb(buf, 0x83);
   uleb(buf, 1);
-  uleb(buf, 4);
+  uleb(buf, 3);
   return n_out;
 }
 

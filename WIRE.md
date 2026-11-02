@@ -49,7 +49,7 @@ numbers can't be reused for something else.
 
 | kind     | name       | status      | payload / owner |
 |----------|------------|-------------|-----------------|
-| `0x0000` | `module`   | implemented | a runnable module — `temen-encode` `encode_module`/`decode_module`; today `version` = 15 (v15: `thread.join` yields `(status, value)`, so every value after a join numbers one higher, #2667; v14: each block header's dominance-certificate parent and captures, #2454; v13: the data-image funcref slots `link` records, #1830; v12: thread-local templates in the object dialect; v11: the memory descriptor carries the module-declared durable shadow arena) |
+| `0x0000` | `module`   | implemented | a runnable module — `temen-encode` `encode_module`/`decode_module`; today `version` = 16 (v16: the integer binary and compare ops' immediate forms take each family's one-byte opcodes, and the register forms move to one opcode per family plus an op byte, #2585; v15: `thread.join` yields `(status, value)`, so every value after a join numbers one higher, #2667; v14: each block header's dominance-certificate parent and captures, #2454; v13: the data-image funcref slots `link` records, #1830; v12: thread-local templates in the object dialect; v11: the memory descriptor carries the module-declared durable shadow arena) |
 | `0x0001` | `object`   | implemented | a link unit, the pre-link dialect — `encode_unit`/`decode_unit`; same `version` sequence as `module` |
 | `0x0002` | `snapshot` | implemented | a §12 durable-snapshot artifact — `temen-snapshot` (`DURABILITY.md` §12); today `version` = 18 |
 | `0x0003` | `fs-image` | implemented | a filesystem image a guest mounts — `temen-fs::encode_image`; today `version` = 1 |

@@ -88,7 +88,7 @@ static void emit_header(char *buf) {
   eb(buf, 'T'); eb(buf, 'E'); eb(buf, 'M'); eb(buf, 'E'); eb(buf, 'N');
   eb(buf, 0); eb(buf, 0); eb(buf, 0);
   eb(buf, 0); eb(buf, 0);                 // kind = module
-  eb(buf, (15) & 0xff); eb(buf, (15) >> 8); // version (u16)
+  eb(buf, (16) & 0xff); eb(buf, (16) >> 8); // version (u16)
   eb(buf, 0); eb(buf, 0); eb(buf, 0); eb(buf, 0); // flags
   eb(buf, 1);  // memory present
   eb(buf, 17); // size_log2 = 17 (must match this module's 128 KiB window, #1059 NULL guard)
@@ -123,10 +123,12 @@ static long emit_service(char *buf) {
   eb(buf, 1);
   eb(buf, 0); // no captures (v14)
   eb(buf, 2);     // 2 instructions
-  eb(buf, 0x42);  // v2 = i64.mul v0 v0
+  eb(buf, 0x4F);  // v2 = i64.mul v0 v0 (0x4F: an i64 binop of two values, then the BinOp index)
+  eb(buf, 2);
   uleb(buf, 0);
   uleb(buf, 0);
-  eb(buf, 0x40);  // v3 = i64.add v2 v1
+  eb(buf, 0x4F);  // v3 = i64.add v2 v1
+  eb(buf, 0);
   uleb(buf, 2);
   uleb(buf, 1);
   eb(buf, 0x83);  // return v3
@@ -137,8 +139,8 @@ static long emit_service(char *buf) {
 
 // `client(a, b) = F(a, b) + 100`, where `F` is an **unresolved symbol** the loader binds by name.
 // Opcodes: 0x10 = i32.const (the symbol's handle placeholder — patched to the resolved slot and
-// reused as the call.dyn index), 0x7B = call.sym (v8 link form), 0x11 = i64.const,
-// 0x40 = i64.add. Values: v0,v1 = params; v2 = handle const; v3 = F(a,b); v4 = 100; v5 = v3+v4.
+// reused as the call.dyn index), 0x7B = call.sym (v8 link form), 0x40 = i64.add of an immediate.
+// Values: v0,v1 = params; v2 = handle const; v3 = F(a,b); v4 = v3+100.
 static long emit_client(char *buf) {
   emit_header(buf);
   // Import section (v8): one import, "F" : func -> type entry 0.
@@ -161,7 +163,7 @@ static long emit_client(char *buf) {
   eb(buf, 1);
   eb(buf, 1);
   eb(buf, 0); // no captures (v14)
-  eb(buf, 4);    // 4 instructions
+  eb(buf, 3);    // 3 instructions
   eb(buf, 0x10); // v2 = i32.const 0  (import handle placeholder)
   sleb(buf, 0);
   eb(buf, 0x7B);          // v3 = call.sym "F" ... (v8 link-form placeholder)
@@ -171,14 +173,12 @@ static long emit_client(char *buf) {
   eb(buf, 2);             //   2 args
   uleb(buf, 0);           //     v0
   uleb(buf, 1);           //     v1
-  eb(buf, 0x11);          // v4 = i64.const 100
-  sleb(buf, 100);
-  eb(buf, 0x40); // v5 = i64.add v3 v4
+  eb(buf, 0x40); // v4 = i64.add v3 100 (uleb operand index, sleb immediate)
   uleb(buf, 3);
-  uleb(buf, 4);
-  eb(buf, 0x83); // return v5
+  sleb(buf, 100);
+  eb(buf, 0x83); // return v4
   uleb(buf, 1);
-  uleb(buf, 5);
+  uleb(buf, 4);
   return n_out;
 }
 
