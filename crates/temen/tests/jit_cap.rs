@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 use temen_encode::encode_module;
-use temen_interp::{bytecode, run_capture_reserved_with_host, Host, MemLayout, Value};
+use temen_interp::{bytecode, run_capture_reserved_with_host, Host, MemLayout, Reply, Value};
 use temen_ir::DEFAULT_RESERVED_LOG2;
 use temen_jit::{JitOutcome, TrapKind};
 use temen_run::{grant_jit, grant_jit_fibers, grant_jit_threads, jit_cap_run};
@@ -1282,7 +1282,7 @@ fn svc_module(src: &str) -> Arc<temen_ir::Module> {
 fn diff_serve(
     m: &Arc<temen_ir::Module>,
     dispatches: &[(u32, u32, Vec<i64>)],
-) -> (Vec<i64>, Vec<Option<i64>>) {
+) -> (Vec<i64>, Vec<Option<Reply>>) {
     // Tree-walk oracle.
     let mut host_i = Host::new();
     host_i.set_self_module(m);
@@ -1309,11 +1309,11 @@ fn diff_serve(
             other => panic!("scalar result expected, got {other:?}"),
         })
         .collect();
-    let icells: Vec<Option<i64>> = tickets_i
+    let icells: Vec<Option<Reply>> = tickets_i
         .iter()
         .map(|t| t.and_then(|t| host_i.svc_result(t)))
         .collect();
-    let iagain: Vec<Option<i64>> = tickets_i
+    let iagain: Vec<Option<Reply>> = tickets_i
         .iter()
         .map(|t| t.and_then(|t| host_i.svc_result(t)))
         .collect();
@@ -1344,11 +1344,11 @@ fn diff_serve(
         JitOutcome::Returned(slots) => slots,
         other => panic!("JIT run must return cleanly, got {other:?}"),
     };
-    let jcells: Vec<Option<i64>> = tickets_j
+    let jcells: Vec<Option<Reply>> = tickets_j
         .iter()
         .map(|t| t.and_then(|t| host_j.svc_result(t)))
         .collect();
-    let jagain: Vec<Option<i64>> = tickets_j
+    let jagain: Vec<Option<Reply>> = tickets_j
         .iter()
         .map(|t| t.and_then(|t| host_j.svc_result(t)))
         .collect();
@@ -1384,7 +1384,13 @@ fn jit_serve_loop_matches_the_tree_walker() {
     // Pin the headline values too (not just cross-backend equality).
     let (vals, cells) = diff_serve(&m, &[(0, 0, vec![5]), (0, 0, vec![30])]);
     assert_eq!(vals, vec![2042]);
-    assert_eq!(cells, vec![Some(7), Some(12)]);
+    assert_eq!(
+        cells,
+        vec![
+            Some(Reply::Results(vec![7])),
+            Some(Reply::Results(vec![12]))
+        ]
+    );
 }
 
 /// `svc.wait` with work already queued behaves like `svc.poll` (progress ⇒ deliver the count,
@@ -1399,7 +1405,13 @@ fn a_jit_svc_wait_with_queued_work_serves_and_returns() {
     assert!(bytecode::serve_qualifies(&m.funcs));
     let (vals, cells) = diff_serve(&m, &[(0, 0, vec![5]), (0, 0, vec![30])]);
     assert_eq!(vals, vec![2042]);
-    assert_eq!(cells, vec![Some(7), Some(12)]);
+    assert_eq!(
+        cells,
+        vec![
+            Some(Reply::Results(vec![7])),
+            Some(Reply::Results(vec![12]))
+        ]
+    );
 }
 
 /// #2160 — a `svc.poll` under a running handler is refused with `-EINVAL` and serves nothing, as
@@ -1419,7 +1431,10 @@ fn a_jit_serve_nested_under_a_handler_is_refused() {
     assert_eq!(vals, vec![2042], "2 served by the outer poll, counter 42");
     assert_eq!(
         cells,
-        vec![Some(-22), Some(-22)],
+        vec![
+            Some(Reply::Results(vec![-22])),
+            Some(Reply::Results(vec![-22]))
+        ],
         "each nested poll refused"
     );
 }

@@ -62,7 +62,7 @@ use temen_interp::{
     CapturedTwin, DetachedLaunch, DurableBinding, DurableBudget, DurableHandle, DurableJitTable,
     DurableJitUnit, DurableNamedCap, DurablePipe, DurableRegion, FrozenDetached, FrozenFiber,
     FrozenTwin, FrozenVCpu, Host, MemLayout, NonDurableHandle, RegionBacking, RegionNotCaptured,
-    RegionRefusal, ShadowArena, StreamRole, SvcDispatch, ThawedDetached, ThawedTwin, Trap,
+    RegionRefusal, Reply, ShadowArena, StreamRole, SvcDispatch, ThawedDetached, ThawedTwin, Trap,
     TwinLaunch,
 };
 use temen_ir::Module;
@@ -308,7 +308,10 @@ use temen_ir::Module;
 /// spawner's. A spent child handle stays spent across the thaw, and the next spawn gets the handle the
 /// uninterrupted run would have (#2619). A Section 2 vCPU record gains, after its slot, whether a
 /// handle still names it (`1`), or its spawner detached it (`0`, at slot `0`).
-const FORMAT_VERSION: u16 = 53;
+/// v54 (#2738): a serve trio's completion cell holds a live call's reply as INVARIANTS #8 shapes it:
+/// `0`, then the handler's results (a count, then each slot), or `1`, then a transport failure's
+/// errno.
+const FORMAT_VERSION: u16 = 54;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -2469,11 +2472,12 @@ fn read_jit_body(jr: &mut Reader) -> Result<(u8, Vec<DurableJitTable>), RestoreE
 
 /// Encode a serve trio (§13.4): the dispatch `queue` (FIFO), completion `results` (ascending ticket),
 /// and the `next_ticket` counter. Length-prefixed ULEB throughout; the exact bytes both serve sites
-/// emit, pinned by the §12.6 byte-identity tests.
+/// emit, pinned by the §12.6 byte-identity tests. A completion's reply is a tag, `0` for the
+/// handler's results (a count, then each slot) or `1` for a transport failure (its errno) (v54).
 fn write_serve_trio(
     b: &mut Vec<u8>,
     queue: &[SvcDispatch],
-    results: &[(u64, i64)],
+    results: &[(u64, Reply)],
     next_ticket: u64,
 ) {
     write_uleb(b, queue.len() as u64);
@@ -2487,16 +2491,28 @@ fn write_serve_trio(
         write_uleb(b, d.ticket);
     }
     write_uleb(b, results.len() as u64);
-    for &(t, v) in results {
-        write_uleb(b, t);
-        write_uleb(b, v as u64);
+    for (t, reply) in results {
+        write_uleb(b, *t);
+        match reply {
+            Reply::Results(slots) => {
+                write_uleb(b, 0);
+                write_uleb(b, slots.len() as u64);
+                for &v in slots {
+                    write_uleb(b, v as u64);
+                }
+            }
+            Reply::Failed(errno) => {
+                write_uleb(b, 1);
+                write_uleb(b, *errno as u64);
+            }
+        }
     }
     write_uleb(b, next_ticket);
 }
 
-/// A decoded serve trio (§13.4): the inbound dispatch queue, the completion cells `(ticket, value)`
+/// A decoded serve trio (§13.4): the inbound dispatch queue, the completion cells `(ticket, reply)`
 /// in canonical ascending-ticket order, and the next-ticket counter.
-type ServeTrio = (Vec<SvcDispatch>, Vec<(u64, i64)>, u64);
+type ServeTrio = (Vec<SvcDispatch>, Vec<(u64, Reply)>, u64);
 
 /// Decode a serve trio — the exact inverse of [`write_serve_trio`], shared by the two decode sites
 /// (the root serve section and a child domain's state). Each caller does its own framing/canonicality
@@ -2529,8 +2545,19 @@ fn read_serve_trio(r: &mut Reader) -> Result<ServeTrio, RestoreError> {
             return Err(RestoreError::Malformed); // non-canonical: tickets must ascend
         }
         last = Some(t);
-        let v = r.uleb()? as i64;
-        results.push((t, v));
+        let reply = match r.uleb()? {
+            0 => {
+                let n = r.uleb()?;
+                let mut slots = Vec::new();
+                for _ in 0..n {
+                    slots.push(r.uleb()? as i64);
+                }
+                Reply::Results(slots)
+            }
+            1 => Reply::Failed(r.uleb()? as i64),
+            _ => return Err(RestoreError::Malformed),
+        };
+        results.push((t, reply));
     }
     let next_ticket = r.uleb()?;
     Ok((queue, results, next_ticket))

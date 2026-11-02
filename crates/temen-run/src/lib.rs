@@ -29,9 +29,9 @@ use core::ffi::c_void;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use temen_interp::{
-    cap_id, run_capture_reserved_with_host, run_with_host, run_with_host_fast, CapPageMap,
-    GuestMem, Host, HostProc, HostProcGrant, NodeRef, ProcHandler, RegionBacking, RootWindow,
-    StreamRole, Trap, UnlockedCall,
+    cap_id, run_capture_reserved_with_host, run_with_host, run_with_host_fast, CallerHost,
+    CapPageMap, GuestMem, Host, HostProc, HostProcGrant, LiveTarget, NodeRef, ProcHandler,
+    RegionBacking, Reply, RootWindow, StreamRole, Trap, UnlockedCall,
 };
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
@@ -215,7 +215,7 @@ pub unsafe extern "C" fn cap_thunk(
     // ([`cap_wait`]). A fiber parks alone (the §3.6 slice-5a contract, completion form). A vCPU
     // waits outside the run with its lane given back, while the run's children run — the call may
     // wait on the world, or on what a child does. Gated on the oracle's predicate: exactly one
-    // result slot (the wake delivers one scalar — invariant 8) and a non-durable run (the freeze
+    // result slot (the wake delivers a punted job's one scalar) and a non-durable run (the freeze
     // driver has no cap-park re-derivation). Sync ops never pay: nothing is minted unless a handler
     // punts. Either face, a would-block op parks the calling fiber and runs again (#1826, #1952).
     // #2495 — nor under a recording host: this engine tapes no host-answered call's delivered
@@ -538,11 +538,10 @@ unsafe fn cap_thunk_impl(
         let h = &*(ctx as *mut Host);
         h.live_impl_of(handle, type_id).map(|t| (t, h.handoff()))
     };
-    if let Some(((callee, export), fast)) = target {
-        let r = live_impl_call(&callee, export, fast, op, arg_slots, vm);
-        if vm.ended().is_none() && n_results != 0 {
-            *results = r;
-        }
+    if let Some((target, fast)) = target {
+        let out = result_slots(results, n_results);
+        let caller = &mut CallerHost::Owned(&mut *(ctx as *mut Host));
+        live_impl_call(caller, &target, fast, op, arg_slots, out, vm);
         return;
     }
     // #1768 — a JIT process's powerbox serves its personality's caller requests (`fork`, `execve`,
@@ -755,7 +754,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
         // CALLS.md 5c.1b — a **locked-domain caller** takes the parked transport too, with this
         // domain's guard released before it blocks (#2139): blocking on a sibling's reply while
         // holding it would deadlock (A holds A waiting B; B blocked on A's lock).
-        if let Some((callee, export)) = guard.live_impl_of(handle, type_id) {
+        if let Some(target) = guard.live_impl_of(handle, type_id) {
             let fast = guard.handoff();
             drop(guard);
             let arg_slots = if n_args == 0 {
@@ -763,10 +762,16 @@ pub unsafe extern "C" fn cap_thunk_locked(
             } else {
                 std::slice::from_raw_parts(args, n_args as usize)
             };
-            let r = live_impl_call(&callee, export, fast, op, arg_slots, vm);
-            if vm.ended().is_none() && n_results != 0 {
-                *results = r;
-            }
+            let out = result_slots(results, n_results);
+            live_impl_call(
+                &mut CallerHost::Cell(m),
+                &target,
+                fast,
+                op,
+                arg_slots,
+                out,
+                vm,
+            );
             return;
         }
         let host_ptr = &mut *guard as *mut Host as *mut c_void;
@@ -835,8 +840,8 @@ pub unsafe extern "C" fn cap_thunk_locked(
         // §12 parking-on-blocking: a punted offloadable dispatch — release the domain lock **before**
         // waiting, so sibling vCPU threads' call.cap calls proceed while the offload pool does the work
         // (the §5b serialization fix on the JIT threaded tier). The impl wrote no results on the punt;
-        // the completion's scalar is the call's single result slot (invariant 8 — a wider declared
-        // signature fails closed).
+        // the completion's scalar is the call's single result slot (a punted job answers one — a
+        // wider declared signature fails closed).
         if let Some(id) = pending_id {
             let comps = guard.completions();
             let durable = guard.is_durable();
@@ -3089,7 +3094,7 @@ unsafe fn serve_locked(
             };
             if args.len() != n_params {
                 let v = guard.settle_page(ticket, EINVAL, None); // a page request's sink goes too
-                guard.svc_settle(ticket, v);
+                guard.svc_settle(ticket, Reply::Failed(v));
                 ring(&guard);
                 continue;
             }
@@ -3115,13 +3120,13 @@ unsafe fn serve_locked(
             guard = m.lock().unwrap_or_else(|e| e.into_inner());
             // §2.2 / #2164 — a page request's bytes move now, out of this domain's window, the
             // pager's, before the reply wakes the child and before the pager can reuse its buffer.
-            let v = res.first().copied().unwrap_or(0);
+            // Its status is the handler's one result. INVARIANTS #8: the reply is every result.
             #[cfg(any(unix, windows))]
-            let v = {
+            if let Some(first) = res.first_mut() {
                 let pager = MprotectWindow::of(&mut guard, mem_base, mem_size, mem_reserved);
-                guard.settle_page(ticket, v, Some(&pager))
-            };
-            guard.svc_settle(ticket, v);
+                *first = guard.settle_page(ticket, *first, Some(&pager));
+            }
+            guard.svc_settle(ticket, Reply::Results(res));
             ring(&guard);
             count += 1;
         }
@@ -3185,25 +3190,78 @@ fn crossing_depth_ok() -> bool {
     CROSSING_DEPTH.with(|d| d.get() < CROSSING_DEPTH_MAX)
 }
 
+/// The `n_results` result slots of a cap call at `results`, which compiled code zeroes before the call.
+///
+/// # Safety
+/// `results` is valid for `n_results` slots, as the `CapThunk` contract has it.
+unsafe fn result_slots<'a>(results: *mut i64, n_results: u64) -> &'a mut [i64] {
+    if n_results == 0 {
+        &mut []
+    } else {
+        std::slice::from_raw_parts_mut(results, n_results as usize)
+    }
+}
+
 /// CALLS.md 5c.1b — the **caller side** of the JIT parked transport: a cross-domain `call.cap`
-/// through a minted live-impl. Enqueue on the callee child's shared cell (ticket `t`), then park on
-/// the cell's bell until the child's serve loop settles `t` ([`await_settle`]: a task's fiber
-/// yields, an OS vCPU waits, #2173) — the §10.2 arm-5 transport, caller half. Fail-closed edges:
-/// full callee queue ⇒ `-EAGAIN` (probeable backpressure, the interp's exact answer); a callee cell
-/// with no bell (not a shared JIT child) ⇒ `-EINVAL` (the pre-5c.1 dispatch answer); a callee whose serve ctx cleared (child
-/// exited without serving) ⇒ `CAP_REVOKED` (-9, the D37 dead-callee errno); epoch/trap fire ⇒
-/// unwind via the trap cell. `callee`/`export` are the live-impl the handle resolved to and `fast`
-/// the caller's handoff knob, each read by the caller from its own powerbox before the call (a
-/// locked caller with its domain guard released first, #2139); the reply is what the caller pushes.
+/// through a minted live-impl, `target`, made from `caller` ([`live_reply`]). INVARIANTS #8: the
+/// call's results land in `out`, every one the op declares ([`LiveTarget::sig`]), each handle among
+/// them granted into the caller's table; a transport failure lands as its errno in the first when
+/// that is an integer ([`temen_interp::complete_call`]). A call of another arity, a handle that names
+/// nothing, or a failure the op cannot carry raises `CapFault`.
 unsafe fn live_impl_call(
+    caller: &mut CallerHost,
+    target: &LiveTarget,
+    fast: bool,
+    op: u32,
+    args: &[i64],
+    out: &mut [i64],
+    vm: &temen_jit::VmCtx,
+) {
+    let Ok(sig) = target.sig(op, args.len(), out.len()) else {
+        vm.raise(TrapKind::CapFault as i64);
+        return;
+    };
+    let callee = &*target.callee;
+    let Some(reply) = live_reply(
+        caller,
+        callee,
+        target.export,
+        fast,
+        op,
+        args,
+        &sig.params,
+        vm,
+    ) else {
+        return;
+    };
+    match temen_interp::complete_call(reply, &sig.results, callee, caller) {
+        Ok(slots) => out.copy_from_slice(&slots),
+        Err(_) => vm.raise(TrapKind::CapFault as i64),
+    }
+}
+
+/// The transport of a [`live_impl_call`]: its callee's reply, or `None` with the trap cell set to
+/// unwind the caller. Enqueue on the callee child's shared cell (ticket `t`), then park on the cell's
+/// bell until the child's serve loop settles `t` ([`await_settle`]: a task's fiber yields, an OS
+/// vCPU waits, #2173) — the §10.2 arm-5 transport, caller half. Fail-closed edges: full callee queue
+/// ⇒ `-EAGAIN` (probeable backpressure, the interp's exact answer); a callee cell with no bell (not
+/// a shared JIT child) ⇒ `-EINVAL` (the pre-5c.1 dispatch answer); a callee whose serve ctx cleared
+/// (child exited without serving) ⇒ `CAP_REVOKED` (-9, the D37 dead-callee errno); epoch/trap fire ⇒
+/// unwind via the trap cell. `fast` is the caller's handoff knob, read by the caller from its own
+/// powerbox before the call (a locked caller with its domain guard released first, #2139).
+/// INVARIANTS #8: the call's handles (a `cap` of `params`, the op's) are granted into the callee
+/// before its handler sees them.
+#[allow(clippy::too_many_arguments)]
+unsafe fn live_reply(
+    caller: &mut CallerHost,
     callee: &Mutex<Host>,
     export: u32,
     fast: bool,
     op: u32,
     args: &[i64],
+    params: &[temen_ir::ValType],
     vm: &temen_jit::VmCtx,
-) -> i64 {
-    // Only the callee cell is locked from here on: the caller holds no lock of its own.
+) -> Option<Reply> {
     let mut guard = callee.lock().unwrap_or_else(|e| e.into_inner());
     // CALLS.md 5c.2 — the thunk fast path (§10.2 arm 4): the callee's serve loop is parked at an
     // empty-queue `svc.wait` (activation published) and unclaimed — claim it (atomic with the
@@ -3220,6 +3278,14 @@ unsafe fn live_impl_call(
             match tramp {
                 Some((code, n_params, n_res)) if args.len() == n_params => {
                     drop(guard);
+                    let mut args = args.to_vec();
+                    if temen_interp::grant_live_args(caller, callee, params, &mut args).is_err() {
+                        let mut g2 = callee.lock().unwrap_or_else(|e| e.into_inner());
+                        g2.release_handoff(0);
+                        ring(&g2);
+                        vm.raise(TrapKind::CapFault as i64);
+                        return None;
+                    }
                     let mut res = vec![0i64; n_res];
                     // The handler runs on THIS thread but as the CHILD's instance — its powerbox,
                     // never the caller's (#1768). A handler trap/fault under handoff is the child's
@@ -3231,7 +3297,7 @@ unsafe fn live_impl_call(
                     temen_jit::invoke_handler(
                         sctx as *const c_void,
                         code,
-                        args,
+                        &args,
                         &mut res,
                         cbase as *mut u8,
                         creserved,
@@ -3246,11 +3312,11 @@ unsafe fn live_impl_call(
                         g2.set_handoff_trap(child_trap);
                         g2.release_handoff(0);
                         ring(&g2);
-                        return CAP_REVOKED;
+                        return Some(Reply::Failed(CAP_REVOKED));
                     }
                     g2.release_handoff(1);
                     ring(&g2);
-                    return res.first().copied().unwrap_or(0);
+                    return Some(Reply::Results(res));
                 }
                 _ => {
                     // Unknown handler / arity mismatch: decline to the parked transport (the
@@ -3263,13 +3329,22 @@ unsafe fn live_impl_call(
     let Some(bell) = guard.svc_bell().cloned() else {
         // Not a JIT run's shared cell (e.g. an interp-tier callee reached from a JIT run): no
         // serve loop here can ever answer, so keep the pre-5c.1 probeable answer.
-        return EINVAL;
+        return Some(Reply::Failed(EINVAL));
     };
-    let Some(ticket) = guard.svc_enqueue(export, op, args.to_vec()) else {
-        return EAGAIN; // full queue / unservable op: probeable backpressure
-    };
+    drop(guard);
+    let ticket =
+        match temen_interp::enqueue_live_call(caller, callee, export, op, args.to_vec(), params) {
+            Ok((Some(ticket), _)) => ticket,
+            // A full queue / unservable op: probeable backpressure.
+            Ok((None, _)) => return Some(Reply::Failed(EAGAIN)),
+            Err(_) => {
+                vm.raise(TrapKind::CapFault as i64);
+                return None;
+            }
+        };
+    let guard = callee.lock().unwrap_or_else(|e| e.into_inner());
     ring(&guard); // the callee's serve loop, parked on its empty queue
-    await_settle(callee, guard, &bell, ticket, Parks::Fiber, vm).unwrap_or(0)
+    await_settle(callee, guard, &bell, ticket, Parks::Fiber, vm)
 }
 
 /// The arm-5 caller park: wait, from `guard` on `callee`'s cell, parked as `parks` says, for its
@@ -3284,13 +3359,13 @@ unsafe fn await_settle<'a>(
     ticket: u64,
     parks: Parks,
     vm: &temen_jit::VmCtx,
-) -> Option<i64> {
+) -> Option<Reply> {
     loop {
         if let Some(r) = guard.svc_result(ticket) {
             return Some(r);
         }
         if guard.serve_ctx() == 0 {
-            return Some(CAP_REVOKED);
+            return Some(Reply::Failed(CAP_REVOKED));
         }
         // Until the callee's settle (or its end) rings its bell.
         let seen = bell_now(Some(bell));
@@ -3361,7 +3436,7 @@ unsafe fn request_page(
         guard = pager.lock().unwrap_or_else(|e| e.into_inner());
     };
     ring(&guard); // the pager's serve loop, parked on its empty queue
-    let reply = await_settle(pager, guard, &bell, ticket, Parks::Vcpu, vm);
+    let reply = await_settle(pager, guard, &bell, ticket, Parks::Vcpu, vm).map(|r| r.status());
     if reply.is_none_or(|r| r == CAP_REVOKED) {
         pager
             .lock()

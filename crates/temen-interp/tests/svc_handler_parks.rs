@@ -7,7 +7,7 @@
 //! resumes it. All single-vCPU: the point is that the domain keeps serving.
 
 use std::sync::Arc;
-use temen_interp::{run_with_host, Host, HostProcGrant, ProcHandler, StreamRole, Value};
+use temen_interp::{run_with_host, Host, HostProcGrant, ProcHandler, Reply, StreamRole, Value};
 
 fn module(text: &str) -> Arc<temen_ir::Module> {
     let m = temen_text::parse_module(text).expect("parse");
@@ -77,10 +77,14 @@ fn a_parked_handler_blocks_its_dispatch_not_the_serve_loop() {
     assert_eq!(r, vec![Value::I64(2)], "both dispatches completed");
     assert_eq!(
         host.svc_result(t_park),
-        Some(5),
+        Some(Reply::Results(vec![5])),
         "WAIT_WOKEN*100 + the value `wake` stored AFTER `park` parked"
     );
-    assert_eq!(host.svc_result(t_wake), Some(1), "notify woke exactly 1");
+    assert_eq!(
+        host.svc_result(t_wake),
+        Some(Reply::Results(vec![1])),
+        "notify woke exactly 1"
+    );
 }
 
 /// The racing-handlers pattern: `read` (op 0) blocks reading empty blocking stdin — its
@@ -137,8 +141,16 @@ fn a_sibling_dispatch_revokes_the_handle_a_parked_handler_reads() {
     let mut fuel = u64::MAX;
     let r = run_with_host(&m, 0, &[], &mut fuel, &mut host).expect("no trap");
     assert_eq!(r, vec![Value::I64(2)], "both dispatches completed");
-    assert_eq!(host.svc_result(t_read), Some(-9), "-EBADF, probeable");
-    assert_eq!(host.svc_result(t_close), Some(0), "close succeeded");
+    assert_eq!(
+        host.svc_result(t_read),
+        Some(Reply::Results(vec![-9])),
+        "-EBADF, probeable"
+    );
+    assert_eq!(
+        host.svc_result(t_close),
+        Some(Reply::Results(vec![0])),
+        "close succeeded"
+    );
 }
 
 /// A `svc.wait`-parked serve loop is re-admitted by an in-flight handler's wake, not just by
@@ -187,7 +199,11 @@ fn a_handler_wake_readmits_a_svc_wait_parked_serve_loop() {
         vec![Value::I64(1)],
         "svc.wait woke on the handler's completion, not an enqueue"
     );
-    assert_eq!(host.svc_result(t), Some(202), "200 + WAIT_TIMED_OUT");
+    assert_eq!(
+        host.svc_result(t),
+        Some(Reply::Results(vec![202])),
+        "200 + WAIT_TIMED_OUT"
+    );
 }
 
 /// A nested `svc.*` from under a running handler is refused with a probeable `-EINVAL`: the
@@ -226,7 +242,11 @@ fn a_nested_svc_poll_under_a_handler_is_refused_probeably() {
     let mut fuel = u64::MAX;
     let r = run_with_host(&m, 0, &[], &mut fuel, &mut host).expect("run");
     assert_eq!(r, vec![Value::I64(1)], "the dispatch itself completed");
-    assert_eq!(host.svc_result(t), Some(-22), "-EINVAL, probeable");
+    assert_eq!(
+        host.svc_result(t),
+        Some(Reply::Results(vec![-22])),
+        "-EINVAL, probeable"
+    );
 }
 
 /// A handler that `suspend`s has no resumer to receive its yield — the serve loop is not a
@@ -368,15 +388,19 @@ fn a_handler_punt_parks_the_dispatch_not_the_serve_loop() {
     assert_eq!(r, vec![Value::I64(3)], "all three dispatches completed");
     assert_eq!(
         host.svc_result(t_punt),
-        Some(111),
+        Some(Reply::Results(vec![111])),
         "the parked handler resumed with its pool job's result"
     );
     assert_eq!(
         host.svc_result(t_probe),
-        Some(7),
+        Some(Reply::Results(vec![7])),
         "served while the punting handler was parked"
     );
-    assert_eq!(host.svc_result(t_open), Some(0), "the release ran inline");
+    assert_eq!(
+        host.svc_result(t_open),
+        Some(Reply::Results(vec![0])),
+        "the release ran inline"
+    );
     assert_eq!(comps.minted(), 1, "only the punt minted");
     assert_eq!(
         comps.outstanding(),

@@ -21,7 +21,7 @@ mod rec;
 
 use std::sync::Arc;
 use temen_interp::bytecode::serve_qualifies;
-use temen_interp::{run_with_host, Host, Value};
+use temen_interp::{run_with_host, Host, Reply, Value};
 use temen_ir::SpawnRec;
 
 /// The toy grandchild (a stand-in for a nifler phase): a separate module whose child entry (func 0,
@@ -300,7 +300,7 @@ fn a_serve_handler_services_a_dispatch_by_nesting_a_spawn_and_join() {
     assert_eq!(r, vec![Value::I64(1)], "main served exactly one dispatch");
     assert_eq!(
         host.svc_result(ticket),
-        Some(99),
+        Some(Reply::Results(vec![99])),
         "the handler spawned the grandchild, joined it, and returned its status — \
          a served call answered by nesting a §14 spawn"
     );

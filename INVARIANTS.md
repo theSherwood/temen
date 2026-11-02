@@ -226,10 +226,14 @@ exactly-once claims. (§3.6 rewound parks; PROCESS.md O10; DURABILITY.md §13.)
 
 ## 8. Control plane ≠ data plane
 
-Service calls carry shell-frequency control traffic — single-slot scalar replies. Bulk data
-rides `SharedRegion` rings the guests own. *Violated by:* widening the dispatch/reply ABI to
-carry payloads, or any hot path routed through handlers. (F6; originally ISSUES.md I39 —
-retired, resolve via `git log`; the c_shell rings.)
+A call into a domain replies with exactly the op's declared results, on every transport and for
+the embedder alike: typed scalars and handles, the handles translated into the caller's table,
+in a count fixed by the signature. A transport failure is the negative errno in the first result
+when that result is an integer, with the rest zero; otherwise it is a trap. Bulk data rides
+`SharedRegion` rings the guests own. *Violated by:* a reply that carries a variable-length
+payload, a handle that crosses untranslated, or any hot path routed through handlers. (F6;
+originally ISSUES.md I39 — retired, resolve via `git log`; the c_shell rings. Renegotiated in
+#2738: a reply was one untranslated scalar.)
 
 ## 9. The interpreter is the oracle; decline, never diverge
 

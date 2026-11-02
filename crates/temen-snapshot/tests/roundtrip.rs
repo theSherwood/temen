@@ -8,7 +8,7 @@ use temen_durable::{
 };
 use temen_interp::{
     run_capture_reserved_with_host, Attestation, FrozenDetached, Host, HostProcGrant, ProcHandler,
-    Value,
+    Reply, Value,
 };
 use temen_ir::{Memory, Module};
 use temen_snapshot::{freeze, restore, FreezeError, RestoreError};
@@ -1161,7 +1161,7 @@ fn serve_state_round_trips_through_the_codec() {
                 ticket: 6,
             },
         ],
-        vec![(3, 999), (4, -9)],
+        vec![(3, Reply::Results(vec![999, -1])), (4, Reply::Failed(-9))],
         7,
     );
     let artifact = freeze(&inst, &win, &host).expect("freeze with serve state");
@@ -1332,7 +1332,7 @@ block 0 (vx: i64) {
     );
     assert_eq!(
         rhost.svc_result(ticket),
-        Some(42),
+        Some(Reply::Results(vec![42])),
         "the completion cell filled on thaw"
     );
 }
@@ -1433,7 +1433,7 @@ block 0 (vx: i64) {
     );
     assert_eq!(
         cells1,
-        vec![(ticket, 42)],
+        vec![(ticket, Reply::Results(vec![42]))],
         "the delivered result sits in the completion cell (unconsumed)"
     );
 
@@ -1452,7 +1452,7 @@ block 0 (vx: i64) {
     );
     assert_eq!(
         rhost2.svc_result(ticket),
-        Some(42),
+        Some(Reply::Results(vec![42])),
         "the completed result reloads across the re-freeze, it is not re-issued"
     );
 }

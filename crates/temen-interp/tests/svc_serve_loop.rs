@@ -10,7 +10,7 @@
 mod rec;
 
 use std::sync::Arc;
-use temen_interp::{run_with_host, Host, Value, CAP_SELF_SVC_POLL, SVC_QUEUE_CAP};
+use temen_interp::{run_with_host, Host, Reply, Value, CAP_SELF_SVC_POLL, SVC_QUEUE_CAP};
 use temen_ir::SpawnRec;
 
 /// The serving domain. Offer "counter" op 0 = func 1 `bump(x) -> old + x`, where `old` is the
@@ -75,8 +75,8 @@ fn queued_dispatches_run_as_handlers_over_the_one_world() {
     );
     // Completion cells: each handler returned the counter's value BEFORE its bump — 7 and 12 —
     // proving the handlers observed main's seed and each other's effects, serialized in order.
-    assert_eq!(host.svc_result(t1), Some(7));
-    assert_eq!(host.svc_result(t2), Some(12));
+    assert_eq!(host.svc_result(t1), Some(Reply::Results(vec![7])));
+    assert_eq!(host.svc_result(t2), Some(Reply::Results(vec![12])));
     assert_eq!(host.svc_result(t1), None, "a completion cell drains once");
 }
 
@@ -123,8 +123,12 @@ fn an_arity_mismatched_dispatch_gets_a_probeable_errno_and_serving_continues() {
     let r = run_with_host(&m, 0, &[], &mut fuel, &mut host).expect("run");
     // Only the good dispatch served (7 → 12); the bad one errnos in its cell.
     assert_eq!(r, vec![Value::I64(1012)]);
-    assert_eq!(host.svc_result(bad), Some(-22), "-EINVAL, probeable");
-    assert_eq!(host.svc_result(good), Some(7));
+    assert_eq!(
+        host.svc_result(bad),
+        Some(Reply::Failed(-22)),
+        "-EINVAL, probeable"
+    );
+    assert_eq!(host.svc_result(good), Some(Reply::Results(vec![7])));
 }
 
 /// The self-namespace op number is part of the public surface (jacl will emit it): pin it.
@@ -148,8 +152,8 @@ fn the_bytecode_entry_serves_identically_via_the_oracle_fallback() {
     let mut fuel = u64::MAX;
     let r = temen_interp::run_with_host_fast(&m, 0, &[], &mut fuel, &mut host).expect("run");
     assert_eq!(r, vec![Value::I64(2042)], "identical to the tree-walk run");
-    assert_eq!(host.svc_result(t1), Some(7));
-    assert_eq!(host.svc_result(t2), Some(12));
+    assert_eq!(host.svc_result(t1), Some(Reply::Results(vec![7])));
+    assert_eq!(host.svc_result(t2), Some(Reply::Results(vec![12])));
 }
 
 /// §3.6 parity — a backend tier **without** eval-loop servicing answers both svc ops with a
