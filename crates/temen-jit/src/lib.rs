@@ -8075,6 +8075,22 @@ pub fn child_compiles() -> u64 {
     }
 }
 
+/// #330 — how many child-executor residencies this process has run: each time a pool worker
+/// resumes a parked/runnable task's fiber ([`child_exec::ChildExec::run_once`]). A parked task
+/// advances this only when a wake or its own deadline genuinely re-offers it — never on an idle
+/// cadence, since the pool runs none. A test reads it before and after an idle window to prove the
+/// pool does not spin (0 where nesting is unsupported — nothing ever runs on the pool).
+pub fn pool_resumes() -> u64 {
+    #[cfg(fiber_rt)]
+    {
+        child_exec::POOL_RESUMES.load(Ordering::Relaxed)
+    }
+    #[cfg(not(fiber_rt))]
+    {
+        0
+    }
+}
+
 /// The natural CLIF signature for an IR function: `(mem_base, fn_table_base, params…)
 /// -> (results…)`. Both context pointers are threaded through every call so loads/
 /// stores reach the window and `call.dyn` reaches the function table.
