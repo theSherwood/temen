@@ -166,6 +166,28 @@ fn constant_chain_reassociates_to_a_single_op() {
     }
 }
 
+/// #2585: the passes read a constant as a constant whichever form it came in. A chain of
+/// immediates, as a producer's folded output holds it, reassociates as the register form does.
+#[test]
+fn a_chain_of_immediates_reassociates() {
+    let mut m = reassoc_module(BinOp::Add, &[1, 2, 3]);
+    m.fold_immediates();
+    assert_eq!(count(&m, |i| matches!(i, Inst::IntBinImm { .. })), 3);
+    let opt = optimize_module(&m);
+    verify_module(&opt).expect("re-verifies");
+    assert_eq!(
+        count(&opt, is_int_bin),
+        1,
+        "x + 1 + 2 + 3 should collapse to x + 6"
+    );
+    for x in [0i32, 1, -1, i32::MAX] {
+        assert_eq!(
+            run(&opt, &[Value::I32(x)]),
+            Ok(vec![Value::I32(x.wrapping_add(6))])
+        );
+    }
+}
+
 #[test]
 fn reassociation_exposes_cse() {
     // (x + 4) + 4  and  (x + 6) + 2  both become x + 8, then CSE folds them to one add.

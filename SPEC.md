@@ -166,9 +166,11 @@ e.g. `IntBin{I32, DivS}` is one row, roughly 200 scalar + 80 SIMD rows total):
 
 The immediate forms (`IntBinImm`, `IntCmpImm`, #2585) have rows of their own, `id`
 `i32.add imm` and so on (the text spells one with the register form's mnemonic and a
-number for its right operand), pinned as the family opcode plus the op's index. Their
-shape is `OperandsImmediate`: the operand arrives as a parameter, and each immediate is
-baked into a module of its own.
+number for its right operand). They hold the families' one-byte opcodes (family base +
+`index()`), and the register forms are pinned as one opcode per family plus the op's index,
+since folded images hold about four immediate forms to each register one. Their shape is
+`OperandsImmediate`: the operand arrives as a parameter, and each immediate is baked into a
+module of its own.
 
 **The `eval` closures are written fresh from `DESIGN.md` §3b prose, not imported
 from `temen-interp`.** This is the independence rule that keeps the suite from

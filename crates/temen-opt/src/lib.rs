@@ -84,15 +84,19 @@ use temen_ir::{
 /// The CFG utilities live in temen-ir, beside the passes that need dominators there (#2454).
 pub use temen_ir::cfg;
 
-/// `m` in block-local form (#2454), the form every pass here reads: each reasons one block at a
-/// time, and renumbers a block's values or reshapes the CFG without the blocks that would capture
-/// them. Borrowed when `m` already is (no block captures, every parent the entry). Debug info follows
-/// the values.
+/// `m` in block-local form (#2454), its constants unfolded from the ops that carry them (#2585): the
+/// form every pass here reads. Each reasons one block at a time, renumbers a block's values or
+/// reshapes the CFG without the blocks that would capture them, and sees a constant operand as the
+/// constant it is. Borrowed when `m` already is (no block captures, every parent the entry, no
+/// immediate). Debug info follows the values.
 pub fn block_local(m: &Module) -> alloc::borrow::Cow<'_, Module> {
     let local = |f: &Func| {
-        f.blocks
-            .iter()
-            .all(|b| b.parent == 0 && b.captures.is_empty())
+        f.blocks.iter().all(|b| {
+            b.parent == 0
+                && b.captures.is_empty()
+                && !(b.insts.iter())
+                    .any(|i| matches!(i, Inst::IntBinImm { .. } | Inst::IntCmpImm { .. }))
+        })
     };
     if m.funcs.iter().all(local) {
         return alloc::borrow::Cow::Borrowed(m);
@@ -110,6 +114,7 @@ pub fn block_local(m: &Module) -> alloc::borrow::Cow<'_, Module> {
             moves.remap_debug(di, i as u32);
         }
     }
+    out.unfold_immediates();
     alloc::borrow::Cow::Owned(out)
 }
 pub mod gvn;
@@ -560,8 +565,6 @@ pub(crate) fn try_fold(inst: &Inst, known: &[Option<Known>], floats: bool) -> Op
         inst,
         Inst::IntBin { .. }
             | Inst::IntCmp { .. }
-            | Inst::IntBinImm { .. }
-            | Inst::IntCmpImm { .. }
             | Inst::IntUn { .. }
             | Inst::Eqz { .. }
             | Inst::Convert { .. }
@@ -581,13 +584,6 @@ pub(crate) fn try_fold(inst: &Inst, known: &[Option<Known>], floats: bool) -> Op
             // Absorbing-element / self-cancelling identities that yield a *constant* with only one
             // operand known (or `a == b`): `x*0`/`x&0` → 0, `x|-1` → -1, `x-x`/`x^x` → 0, `x%1` → 0.
             fold_absorbing(ty, op, a, b, known)
-        }
-        // An immediate is a known `b`; a known `a` folds the op.
-        Inst::IntBinImm { ty, op, a, imm } => {
-            fold_int_bin(ty, op, get(known, a)?, Known::of_imm(ty, imm))
-        }
-        Inst::IntCmpImm { ty, op, a, imm } => {
-            fold_int_cmp(ty, op, get(known, a)?, Known::of_imm(ty, imm))
         }
         Inst::IntCmp { ty, op, a, b } => {
             // Self-comparison folds without knowing the value: `x == x`/`x <= x`/`x >= x` are 1,

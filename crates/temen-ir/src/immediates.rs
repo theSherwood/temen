@@ -3,7 +3,8 @@
 //! read by nothing else, goes. Fewer instructions to load, and fewer for the interpreters to run.
 //!
 //! Producers run [`Module::fold_immediates`] after [`Module::raise`]. Their own lowerings keep
-//! emitting a constant and the register form.
+//! emitting a constant and the register form. A pass that reasons about constants as values
+//! (temen-opt's) reads the register form: [`Module::unfold_immediates`] gives it back.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -12,23 +13,24 @@ use crate::{
     Block, BlockIdx, DebugInfo, Func, Inst, IntTy, Module, SsaLoc, TypeEntry, ValIdx, VarLoc,
 };
 
-/// Where [`Func::fold_immediates`] moved each block's values and instructions: the constants it
-/// deleted are gone, and what followed each moved down.
+/// Where [`Func::fold_immediates`] or [`Func::unfold_immediates`] moved each block's values and
+/// instructions: the constants a fold deleted are gone, an unfold's are new, and what followed each
+/// moved.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Folded(Vec<FoldedBlock>);
+pub struct Renumbered(Vec<BlockMoves>);
 
 #[derive(Clone, Debug, PartialEq)]
-struct FoldedBlock {
+struct BlockMoves {
     /// Each old value's new index, or `None` for a deleted constant.
     values: Vec<Option<ValIdx>>,
     /// Whether each old instruction was deleted.
     dead: Vec<bool>,
-    /// For each old instruction, and one past the last (the terminator), how many kept
-    /// instructions precede it: its new index, if it was kept.
+    /// The new index of each old instruction (that of the next kept one, for a deleted one), and of
+    /// one past the last (the terminator).
     before: Vec<u32>,
 }
 
-impl FoldedBlock {
+impl BlockMoves {
     /// The new index of old instruction `i`, or `None` if it was deleted.
     fn inst(&self, i: u32) -> Option<u32> {
         match self.dead.get(i as usize) {
@@ -55,10 +57,10 @@ impl FoldedBlock {
     }
 }
 
-impl Folded {
-    /// Whether the pass deleted nothing.
+impl Renumbered {
+    /// Whether nothing moved.
     pub fn is_empty(&self) -> bool {
-        self.0.iter().all(|b| !b.dead.contains(&true))
+        (self.0.iter()).all(|b| b.before.iter().enumerate().all(|(i, &n)| n == i as u32))
     }
 }
 
@@ -77,7 +79,7 @@ impl Func {
         fn_results: &[usize],
         types: &[TypeEntry],
         keep: impl Fn(BlockIdx, ValIdx) -> bool,
-    ) -> Folded {
+    ) -> Renumbered {
         // Each block's result count per instruction, and the value index of each one's first.
         let counts: Vec<Vec<u32>> = (self.blocks.iter())
             .map(|b| {
@@ -185,21 +187,100 @@ impl Func {
                 }
                 b.term.for_each_operand_mut(&mut to);
             }
-            folded.push(FoldedBlock {
+            folded.push(BlockMoves {
                 values,
                 dead,
                 before,
             });
         }
-        // A capture names its source's value where that value went.
+        follow_captures(&mut self.blocks, &folded);
+        Renumbered(folded)
+    }
+
+    /// Undo [`Func::fold_immediates`]: each immediate op becomes the constant it carries, just
+    /// before it, and the register form.
+    pub fn unfold_immediates(&mut self, fn_results: &[usize], types: &[TypeEntry]) -> Renumbered {
+        let mut moved = Vec::with_capacity(self.blocks.len());
         for b in &mut self.blocks {
-            for (a, v) in &mut b.captures {
-                if let Some(n) = folded.get(*a as usize).and_then(|f| f.value(*v)) {
-                    *v = n;
+            let inputs = (b.params.len() + b.captures.len()) as ValIdx;
+            let mut values: Vec<Option<ValIdx>> = (0..inputs).map(Some).collect();
+            let old = core::mem::take(&mut b.insts);
+            let (mut insts, mut before) = (
+                Vec::with_capacity(old.len()),
+                Vec::with_capacity(old.len() + 1),
+            );
+            let mut next = inputs;
+            for mut inst in old.iter().cloned() {
+                let count = inst.result_count(fn_results, types);
+                inst.for_each_operand_mut(&mut |v| {
+                    if let Some(&Some(n)) = values.get(*v as usize) {
+                        *v = n;
+                    }
+                });
+                let inst = match inst {
+                    Inst::IntBinImm { ty, op, a, imm } => {
+                        insts.push(constant(ty, imm));
+                        next += 1;
+                        Inst::IntBin {
+                            ty,
+                            op,
+                            a,
+                            b: next - 1,
+                        }
+                    }
+                    Inst::IntCmpImm { ty, op, a, imm } => {
+                        insts.push(constant(ty, imm));
+                        next += 1;
+                        Inst::IntCmp {
+                            ty,
+                            op,
+                            a,
+                            b: next - 1,
+                        }
+                    }
+                    other => other,
+                };
+                before.push(insts.len() as u32);
+                insts.push(inst);
+                for _ in 0..count {
+                    values.push(Some(next));
+                    next += 1;
                 }
             }
+            before.push(insts.len() as u32);
+            b.term.for_each_operand_mut(&mut |v| {
+                if let Some(&Some(n)) = values.get(*v as usize) {
+                    *v = n;
+                }
+            });
+            b.insts = insts;
+            moved.push(BlockMoves {
+                values,
+                dead: vec![false; old.len()],
+                before,
+            });
         }
-        Folded(folded)
+        follow_captures(&mut self.blocks, &moved);
+        Renumbered(moved)
+    }
+}
+
+/// The constant an immediate of type `ty` stands for.
+fn constant(ty: IntTy, imm: i64) -> Inst {
+    match ty {
+        IntTy::I32 => Inst::ConstI32(imm as i32),
+        IntTy::I64 => Inst::ConstI64(imm),
+    }
+}
+
+/// A capture names its source's value where that value went.
+fn follow_captures(blocks: &mut [Block], moved: &[BlockMoves]) {
+    for b in blocks {
+        for (a, v) in &mut b.captures {
+            if let Some(n) = moved.get(*a as usize).and_then(|f| f.value(*v)) {
+                *v = n;
+            }
+        }
     }
 }
 
@@ -221,11 +302,23 @@ impl Module {
     pub fn fold_immediates(&mut self) {
         let fn_results: Vec<usize> = self.funcs.iter().map(|f| f.results.len()).collect();
         let named = named_values(self.debug_info.as_ref(), self.funcs.len());
-        let folded: Vec<Folded> = (self.funcs.iter_mut().zip(&named))
+        let folded: Vec<Renumbered> = (self.funcs.iter_mut().zip(&named))
             .map(|(f, named)| f.fold_immediates(&fn_results, &self.types, |b, v| named.holds(b, v)))
             .collect();
         if let Some(di) = &mut self.debug_info {
             remap_debug(di, &folded);
+        }
+    }
+
+    /// [`Func::unfold_immediates`] every function, and re-point the debug info at where each
+    /// function's instructions and values went.
+    pub fn unfold_immediates(&mut self) {
+        let fn_results: Vec<usize> = self.funcs.iter().map(|f| f.results.len()).collect();
+        let moved: Vec<Renumbered> = (self.funcs.iter_mut())
+            .map(|f| f.unfold_immediates(&fn_results, &self.types))
+            .collect();
+        if let Some(di) = &mut self.debug_info {
+            remap_debug(di, &moved);
         }
     }
 }
@@ -267,11 +360,11 @@ fn named_values(di: Option<&DebugInfo>, funcs: usize) -> Vec<Named> {
     named
 }
 
-/// Re-point debug info at where [`Func::fold_immediates`] moved each function's instructions and
-/// values (`folded[func]`). A deleted constant's source location goes with it. A variable location
-/// stays on its value, which was kept; one that started at a deleted constant starts at the next
-/// instruction.
-fn remap_debug(di: &mut DebugInfo, folded: &[Folded]) {
+/// Re-point debug info at where [`Func::fold_immediates`] or [`Func::unfold_immediates`] moved each
+/// function's instructions and values (`folded[func]`). A deleted constant's source location goes
+/// with it. A variable location stays on its value, which was kept; one that started at a deleted
+/// constant starts at the next instruction.
+fn remap_debug(di: &mut DebugInfo, folded: &[Renumbered]) {
     let block = |func: u32, b: u32| {
         folded
             .get(func as usize)
@@ -462,6 +555,72 @@ mod tests {
             ]
         );
         assert_eq!(f.blocks[1].captures, vec![(0, 1), (0, 3)]);
+    }
+
+    /// Unfolding gives the register form back: each immediate is a constant just before its op, and
+    /// what follows moves up, a capture of it included.
+    #[test]
+    fn unfold_puts_each_constant_back_before_its_op() {
+        let i64 = IntTy::I64;
+        let folded = vec![
+            Inst::IntBinImm {
+                ty: i64,
+                op: BinOp::Add,
+                a: 0,
+                imm: 8,
+            }, // v1
+            Inst::IntCmpImm {
+                ty: i64,
+                op: CmpOp::GeU,
+                a: 1,
+                imm: -1,
+            }, // v2
+        ];
+        let mut f = Func {
+            params: vec![ValType::I64],
+            results: vec![ValType::I64],
+            blocks: vec![
+                block(
+                    vec![ValType::I64],
+                    vec![],
+                    folded,
+                    Terminator::Br {
+                        target: 1,
+                        args: vec![],
+                    },
+                ),
+                block(vec![], vec![(0, 1)], vec![], Terminator::Return(vec![0])),
+            ],
+        };
+        let moved = f.unfold_immediates(&[], &[]);
+        assert!(!moved.is_empty());
+        assert_eq!(
+            f.blocks[0].insts,
+            vec![
+                Inst::ConstI64(8),
+                bin(i64, BinOp::Add, 0, 1),
+                Inst::ConstI64(-1),
+                Inst::IntCmp {
+                    ty: i64,
+                    op: CmpOp::GeU,
+                    a: 2,
+                    b: 3
+                },
+            ]
+        );
+        assert_eq!(f.blocks[1].captures, vec![(0, 2)]);
+        // And folding again gives the folded form back.
+        f.fold_immediates(&[], &[], |_, _| false);
+        assert_eq!(
+            f.blocks[0].insts[0],
+            Inst::IntBinImm {
+                ty: i64,
+                op: BinOp::Add,
+                a: 0,
+                imm: 8
+            }
+        );
+        assert_eq!(f.blocks[1].captures, vec![(0, 1)]);
     }
 
     /// Debug info follows: a deleted constant's line goes, later ones move down; a variable kept

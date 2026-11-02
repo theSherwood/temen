@@ -508,17 +508,9 @@ pub fn itof(op: IToF, x: SpecVal) -> SpecVal {
 // exactly the silent format break suite 3 exists to catch. Every match is exhaustive,
 // so a new sub-op forces a conscious byte assignment here.
 
-fn enc_int_bin(ty: IntTy, op: BinOp) -> Enc {
-    let base: u8 = match ty {
-        IntTy::I32 => 0x20,
-        IntTy::I64 => 0x40,
-    };
-    Enc::Byte(base + bin_off(op))
-}
-
-/// An immediate form's encoding (#2585): its family's opcode, the byte after the register forms'
+/// A register form's encoding (#2585): its family's opcode, the byte after the immediate forms'
 /// range, then the op's index in that family (which this pins as the "sub-opcode").
-fn enc_int_bin_imm(ty: IntTy, op: BinOp) -> Enc {
+fn enc_int_bin(ty: IntTy, op: BinOp) -> Enc {
     let family: u8 = match ty {
         IntTy::I32 => 0x2F,
         IntTy::I64 => 0x4F,
@@ -526,12 +518,21 @@ fn enc_int_bin_imm(ty: IntTy, op: BinOp) -> Enc {
     Enc::Prefixed(family, bin_off(op))
 }
 
-fn enc_int_cmp_imm(ty: IntTy, op: CmpOp) -> Enc {
-    let family: u8 = match ty {
-        IntTy::I32 => 0x3B,
-        IntTy::I64 => 0x5B,
+/// The immediate forms (#2585) take the families' one-byte opcodes.
+fn enc_int_bin_imm(ty: IntTy, op: BinOp) -> Enc {
+    let base: u8 = match ty {
+        IntTy::I32 => 0x20,
+        IntTy::I64 => 0x40,
     };
-    Enc::Prefixed(family, cmp_off(op))
+    Enc::Byte(base + bin_off(op))
+}
+
+fn enc_int_cmp_imm(ty: IntTy, op: CmpOp) -> Enc {
+    let base: u8 = match ty {
+        IntTy::I32 => 0x31,
+        IntTy::I64 => 0x51,
+    };
+    Enc::Byte(base + cmp_off(op))
 }
 
 /// A `BinOp`'s index within its family.
@@ -556,11 +557,11 @@ fn bin_off(op: BinOp) -> u8 {
 }
 
 fn enc_int_cmp(ty: IntTy, op: CmpOp) -> Enc {
-    let base: u8 = match ty {
-        IntTy::I32 => 0x31,
-        IntTy::I64 => 0x51,
+    let family: u8 = match ty {
+        IntTy::I32 => 0x3B,
+        IntTy::I64 => 0x5B,
     };
-    Enc::Byte(base + cmp_off(op))
+    Enc::Prefixed(family, cmp_off(op))
 }
 
 /// A `CmpOp`'s index within its family.
