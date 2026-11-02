@@ -577,14 +577,20 @@ pub(crate) mod x86 {
                 }
             }
         }
-        /// Loop-header widening (#2535): a `Bounded` carried into a header could grow each iteration,
-        /// so drop it to `Unknown` (in registers and slots). The context-param and `Confined` facts
-        /// are loop-invariant and survive, so nearly every loop still settles in one round.
+        /// Loop-header widening (#2535): a fact whose value can grow each iteration must drop to
+        /// `Unknown` at a header, or the fixpoint might not settle. Only `WinPtr` grows — a loop that
+        /// strides a window pointer (`add winptr, stride`) raises its offset every round ([`addr_fact`]
+        /// → `WinPtr(off + stride)`). A `Bounded` does **not** grow: it comes only from an `and` mask
+        /// or a byte zero-extend, a constant bound re-established each iteration — `add`/`sub` on a
+        /// `Bounded` yields `Unknown`, never a wider bound — and `meet` only ever raises it to the
+        /// largest mask constant in the function, a finite ceiling. So widening a `Bounded` would just
+        /// discard the mask that confines a `call.dyn` index or a strided access carried around the
+        /// loop, for no termination gain (#2603). The context-param and `Confined` facts are
+        /// loop-invariant and survive; `meet` still weakens a fact a back edge disagrees on, and
+        /// `verify` rejects any proposal the round cap cut short, so dropping only `WinPtr` stays
+        /// sound and terminating.
         fn widen(&mut self) {
-            let grows = |f: &Fact| {
-                // A stride's or a checked entry's bound comes from an `and` mask, so it can't grow.
-                matches!(f, Fact::Bounded(_) | Fact::WinPtr(_))
-            };
+            let grows = |f: &Fact| matches!(f, Fact::WinPtr(_));
             for f in &mut self.regs {
                 if grows(f) {
                     *f = Fact::Unknown;
@@ -4121,14 +4127,25 @@ pub(crate) mod x86 {
             assert_eq!(Stack(Some(-8)).meet(Stack(Some(-16))), Stack(None));
             assert_eq!(Stack(Some(-8)).meet(MemBase), Unknown);
 
-            // Widening at a loop header drops `Bounded` (which could grow each iteration) but keeps
-            // the loop-invariant context-param and `Confined` facts, so the fixpoint terminates.
+            // Widening at a loop header drops only a `WinPtr`, whose offset a strided loop can grow.
+            // The mask-derived `Bounded`, the loop-invariant context-param and `Confined` facts all
+            // survive, so a `call.dyn` index or strided bound carried around a loop keeps its bound
+            // (#2603) and the fixpoint still terminates.
             let mut s = State::entry(Frame::UNKNOWN);
             s.regs[8] = Bounded(16);
             s.regs[9] = conf;
+            s.regs[10] = WinPtr(0x1000);
             s.widen();
-            assert_eq!(s.regs[8], Unknown);
+            assert_eq!(
+                s.regs[8],
+                Bounded(16),
+                "a mask bound can't grow, so widening keeps it"
+            );
             assert_eq!(s.regs[9], conf);
+            assert_eq!(
+                s.regs[10], Unknown,
+                "a strided window pointer can grow, so widening drops it"
+            );
             assert_eq!(s.regs[reg::RDI as usize], MemBase);
         }
 
