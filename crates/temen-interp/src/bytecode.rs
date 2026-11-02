@@ -2339,8 +2339,8 @@ fn compile_module_with(
 ) -> Option<Compiled> {
     // §14 **executor children** (the `Instantiator`'s spawn and `join`) run on the scheduler like
     // threads, and they combine with `cont.*` fibers: every driver gives each child domain its own
-    // fiber registry (the cooperative `ChildEnv::fibers`, which the parallel driver shares, and the
-    // debugger's `ChildEnv::fibers`), as the oracle does. Fiber / thread / instantiate modules are each
+    // fiber registry (the cooperative `Domain::fibers`, which the parallel driver shares, and the
+    // debugger's `Domain::fibers`), as the oracle does. Fiber / thread / instantiate modules are each
     // fine, as are instantiate+thread and instantiate+fiber.
     let s = scan_seams(funcs);
     // `gc.roots` (§GC) is per-vCPU **conservative root enumeration**: on this engine it scans the
@@ -3990,7 +3990,7 @@ impl Reactor {
     /// the run has ended.
     pub fn end_coop_call(&mut self, run: &mut CoopRun) -> Host {
         if let Some(p) = run.pump_mut() {
-            self.mem = p.sched.core.extra_envs[0].mem.take();
+            self.mem = p.sched.core.domains[0].mem.take();
         }
         std::mem::take(&mut *run.host_mut())
     }
@@ -4472,7 +4472,7 @@ impl LineBreakpoints {
     }
 }
 
-/// Whether a child env's host is one a restore rebuilds ([`rebuild_detached_env`]): on top of the
+/// Whether a child domain's host is one a restore rebuilds ([`rebuild_detached_domain`]): on top of the
 /// root host's rule it must hold no `Jit` table and no §13 region.
 fn child_host_admits(host: &Host) -> Result<(), Refusal> {
     host.admits_checkpoint()?;
@@ -4498,11 +4498,11 @@ fn any_event_parked<'a>(mut fibers: impl Iterator<Item = &'a FiberState>) -> boo
     })
 }
 
-/// Capture a child [`ChildEnv`] into an [`EnvSnapshot`] (#1866): host replay substate, fuel, fibers,
+/// Capture a child [`Domain`] into an [`DomainSnapshot`] (#1866): host replay substate, fuel, fibers,
 /// the env that spawned it, and its own window image and powerbox, or nothing of either once it is
-/// `spent` ([`env_spent`]). Refused when a live one's powerbox holds a binding that is not a plain
+/// `spent` ([`domain_spent`]). Refused when a live one's powerbox holds a binding that is not a plain
 /// value ([`Host::child_powerbox`]), or it has no window.
-fn env_snapshot(e: &ChildEnv, spent: bool) -> Result<EnvSnapshot, Refusal> {
+fn domain_snapshot(e: &Domain, spent: bool) -> Result<DomainSnapshot, Refusal> {
     let live = match (&e.mem, spent) {
         (_, true) => None,
         (Some(m), false) => Some(DetachedLive {
@@ -4518,7 +4518,7 @@ fn env_snapshot(e: &ChildEnv, spent: bool) -> Result<EnvSnapshot, Refusal> {
         }),
         (None, false) => return Err(Refusal::NoWindow),
     };
-    Ok(EnvSnapshot {
+    Ok(DomainSnapshot {
         module: e.program as usize,
         host: e.host.lock_unpoisoned().replay_substate(),
         fuel: e.fuel.can_burn(),
@@ -4529,17 +4529,21 @@ fn env_snapshot(e: &ChildEnv, spent: bool) -> Result<EnvSnapshot, Refusal> {
     })
 }
 
-/// #1866 — rebuild a detached child's [`ChildEnv`] under `spawner`, the powerbox of the env that spawned
+/// #1866 — rebuild a detached child's [`Domain`] under `spawner`, the powerbox of the env that spawned
 /// it (already rebuilt: envs come back in spawn order). Its window is built as a spawn builds it, then
 /// its own image laid over it, as a thaw's relaunch does; its powerbox is rebuilt from its
 /// [`ChildPowerbox`](super::ChildPowerbox), its inherited stdio aliased to `spawner`'s. A spent env comes
 /// back empty: nothing runs in it again.
-fn rebuild_detached_env(es: &EnvSnapshot, spawner: &mut Host, source: &ModuleSource) -> ChildEnv {
+fn rebuild_detached_domain(
+    es: &DomainSnapshot,
+    spawner: &mut Host,
+    source: &ModuleSource,
+) -> Domain {
     let progs_len = source.get(es.module).map_or(0, |u| u.progs.len());
     let Some(live) = &es.live else {
         let host = Host::new();
         let table = build_table_for(progs_len, host.jit_table_log2(), es.module as u32);
-        return ChildEnv {
+        return Domain {
             mem: None,
             host: host.into_cell(),
             table: std::sync::Arc::new(table),
@@ -4562,7 +4566,7 @@ fn rebuild_detached_env(es: &EnvSnapshot, spawner: &mut Host, source: &ModuleSou
     let mut host = spawner.rebuild_child_powerbox(&live.powerbox);
     host.restore_replay_substate(&es.host);
     let table_log2 = host.jit_table_log2();
-    ChildEnv {
+    Domain {
         mem: Some(mem),
         table: std::sync::Arc::new(build_table_for(progs_len, table_log2, es.module as u32)),
         program: es.module as u32,
@@ -4898,14 +4902,14 @@ fn journal_op(
 /// invertible in place: a host using the §3.6 serve queue or holding a capability with opaque declared
 /// state (`Host::journal_invertible`), a task stepping inside a §22 invoke (its transient `Vm` is not
 /// captured, the same exclusion `checkpointable` makes), an event-parked fiber (a non-deterministic
-/// wall-clock deadline), a live detached child whose powerbox is not plain values (`env_snapshot`), or
+/// wall-clock deadline), a live detached child whose powerbox is not plain values (`domain_snapshot`), or
 /// a child holding a §13 region (its writes through its own aliases are not journaled, #2026).
 /// Those runs still time-travel by checkpoint-plus-replay, exactly as today.
 #[allow(clippy::too_many_arguments)]
 fn journal_state(
     journal: &mut super::journal::Journal,
     tasks: &[TaskSlot],
-    extra_envs: &[ChildEnv],
+    domains: &[Domain],
     source: &ModuleSource,
     clock: u64,
     turn: u64,
@@ -4922,25 +4926,25 @@ fn journal_state(
     if !turn.is_multiple_of(stride) || !journal.state_due(turn) {
         return;
     }
-    let root = &extra_envs[0];
+    let root = &domains[0];
     let fibers = &root.fibers.fibers;
     // Each powerbox read takes its lock for itself: `pool_parked` locks the root's too.
     let root_invertible = root.host.lock_unpoisoned().journal_invertible();
     let invertible = root_invertible
-        && extra_envs[1..]
+        && domains[1..]
             .iter()
             .all(|e| e.host.lock_unpoisoned().region_count() == 0)
         && tasks.iter().all(|t| t.vm.vt.active_invoke.is_none())
         && !any_event_parked(fibers.iter())
-        && !pool_parked(tasks, extra_envs);
+        && !pool_parked(tasks, domains);
     if !invertible {
         return;
     }
-    let Ok(extra) = extra_envs
+    let Ok(extra) = domains
         .iter()
         .enumerate()
         .skip(1)
-        .map(|(k, e)| env_snapshot(e, env_spent(tasks, extra_envs, k)))
+        .map(|(k, e)| domain_snapshot(e, domain_spent(tasks, domains, k)))
         .collect::<Result<Vec<_>, _>>()
     else {
         return;
@@ -4955,7 +4959,7 @@ fn journal_state(
                 active_id: t.vm.vt.active_id,
                 chain: t.vm.vt.chain.clone(),
                 root_shadow_sp: t.vm.vt.root_shadow_sp,
-                env: t.env,
+                domain: t.domain,
                 state: t.state.clone(),
                 at_bp: t.at_bp,
                 lease: t.lease,
@@ -4964,7 +4968,7 @@ fn journal_state(
             .collect(),
         fibers: fibers.to_vec(),
         children: root.children.clone(),
-        extra_envs: extra,
+        child_domains: extra,
         extra_units: source.extra_units(),
         budgets: host.budget_tree(),
     };
@@ -4989,7 +4993,7 @@ fn journal_state(
             })
             .sum::<u64>()
         + cont
-            .extra_envs
+            .child_domains
             .iter()
             .filter_map(|e| e.live.as_ref())
             .map(|l| (l.image.bytes.len() / std::mem::size_of::<super::Reg>()) as u64)
@@ -5258,7 +5262,7 @@ fn journaled_write(
 fn write_task_window(
     journal: &mut super::journal::Journal,
     turn: u64,
-    envs: &mut [ChildEnv],
+    envs: &mut [Domain],
     env: usize,
     addr: u64,
     bytes: &[u8],
@@ -5281,7 +5285,7 @@ fn apply_target(
     value: i64,
     width: usize,
     vm_regs: &mut [Reg],
-    envs: &mut [ChildEnv],
+    envs: &mut [Domain],
     env: usize,
     journal: &mut super::journal::Journal,
     turn: u64,
@@ -5315,7 +5319,7 @@ fn apply_due_writes(
     turn: u64,
     tasks: &mut [TaskSlot],
     source: &ModuleSource,
-    envs: &mut [ChildEnv],
+    envs: &mut [Domain],
     journal: &mut super::journal::Journal,
 ) {
     while *cursor < writes.len() && writes[*cursor].0 < turn {
@@ -5325,7 +5329,7 @@ fn apply_due_writes(
         match &writes[*cursor].1 {
             ScheduledWrite::Window { task, addr, bytes } => {
                 if let Some(t) = tasks.get(*task) {
-                    write_task_window(journal, turn, envs, t.env, *addr, bytes);
+                    write_task_window(journal, turn, envs, t.domain, *addr, bytes);
                 }
             }
             ScheduledWrite::Var {
@@ -5340,7 +5344,7 @@ fn apply_due_writes(
                         let target = FrameReader {
                             vm: &t.vm.vt.active,
                             source,
-                            mem: &envs[t.env].mem,
+                            mem: &envs[t.domain].mem,
                             finished: matches!(t.state, TaskState::Done(Ok(_))),
                         }
                         .write_target(*frame, name);
@@ -5350,7 +5354,7 @@ fn apply_due_writes(
                             *width,
                             &mut t.vm.vt.active.regs,
                             envs,
-                            t.env,
+                            t.domain,
                             journal,
                             turn,
                         );
@@ -5614,16 +5618,16 @@ pub enum SchedBreak {
 
 /// [`refund_ended_windows`] on the debugger's scheduler: a finished detached child's window goes back
 /// to the budget that paid for it, in the spawner's own powerbox, and what the window grew with it
-/// (#1909), from the child's own. The debugger's child envs see no other end (it declines fork, spawn
+/// (#1909), from the child's own. The debugger's child domains see no other end (it declines fork, spawn
 /// and exec), and it never replaces their powerboxes, so the child's is still here. `run_ended`: the
 /// run is over, which ends every child still live too, as the oracle's teardown reaps it (#2006).
-fn dbg_refund_ended_windows(tasks: &mut [TaskSlot], envs: &mut [ChildEnv], run_ended: bool) {
+fn dbg_refund_ended_windows(tasks: &mut [TaskSlot], envs: &mut [Domain], run_ended: bool) {
     for t in tasks.iter_mut() {
         if run_ended || matches!(t.state, TaskState::Done(_)) {
             if let Some((env, lease)) = t.lease.take() {
                 envs[env].host.lock_unpoisoned().release_detached(lease);
-                if t.env != 0 {
-                    envs[t.env].host.lock_unpoisoned().release_memory();
+                if t.domain != 0 {
+                    envs[t.domain].host.lock_unpoisoned().release_memory();
                 }
             }
         }
@@ -5633,7 +5637,7 @@ fn dbg_refund_ended_windows(tasks: &mut [TaskSlot], envs: &mut [ChildEnv], run_e
     for (k, e) in envs.iter_mut().enumerate().skip(1) {
         let running = tasks
             .iter()
-            .any(|t| t.env == k && !matches!(t.state, TaskState::Done(_)));
+            .any(|t| t.domain == k && !matches!(t.state, TaskState::Done(_)));
         if run_ended || !running {
             e.fibers = FiberTables::default();
         }
@@ -5641,23 +5645,23 @@ fn dbg_refund_ended_windows(tasks: &mut [TaskSlot], envs: &mut [ChildEnv], run_e
 }
 
 /// #1866 — whether nothing runs in env `k` again and nothing still leans on it: every task in it has
-/// finished, no live task's window lease is owed to its powerbox, and no live child env was spawned
-/// from it. A checkpoint carries such an env as spent rather than copying its window and powerbox.
-fn env_spent(tasks: &[TaskSlot], envs: &[ChildEnv], k: usize) -> bool {
+/// finished, no live task's window lease is owed to its powerbox, and no live child domain was spawned
+/// from it. A checkpoint carries such a domain as spent rather than copying its window and powerbox.
+fn domain_spent(tasks: &[TaskSlot], envs: &[Domain], k: usize) -> bool {
     let live = |t: &&TaskSlot| !matches!(t.state, TaskState::Done(_));
     !tasks
         .iter()
         .filter(live)
-        .any(|t| t.env == k || matches!(t.lease, Some((e, _)) if e == k))
+        .any(|t| t.domain == k || matches!(t.lease, Some((e, _)) if e == k))
         && !envs
             .iter()
             .enumerate()
-            .any(|(i, e)| e.spawner == Some(k) && tasks.iter().filter(live).any(|t| t.env == i))
+            .any(|(i, e)| e.spawner == Some(k) && tasks.iter().filter(live).any(|t| t.domain == i))
 }
 
 /// One scheduled vCPU's captured state inside a [`ScheduledContinuation`] — its full `VTask` continuation
 /// (active `Vm`, active fiber id, resume `chain`, durable shadow-SP), its domain's index (the root's
-/// `0`, a §14 child's into [`ScheduledContinuation::extra_envs`] after it), the run state, and
+/// `0`, a §14 child's into [`ScheduledContinuation::domains`] after it), the run state, and
 /// the breakpoint-skip flag. The fiber `Vm`s share their domain's window, so their bytes ride in its
 /// image; `restore` rebuilds the `VTask`.
 #[derive(Clone)]
@@ -5666,7 +5670,7 @@ struct DbgTaskSnapshot {
     active_id: usize,
     chain: Vec<(usize, Vm, u32)>,
     root_shadow_sp: u64,
-    env: usize,
+    domain: usize,
     state: TaskState,
     at_bp: bool,
     lease: Option<(usize, Lease)>,
@@ -5694,8 +5698,8 @@ pub struct ScheduledContinuation {
     /// The root domain's children (#2043), by handle.
     children: temen_ir::handles::Table<usize>,
     /// The §14 `instantiate`-child domains, after the root: snapshot `k` is domain `k + 1`, which a
-    /// task's [`TaskSlot::env`] names. See [`EnvSnapshot`].
-    extra_envs: Vec<EnvSnapshot>,
+    /// task's [`TaskSlot::env`] names. See [`DomainSnapshot`].
+    child_domains: Vec<DomainSnapshot>,
     /// The non-primary [`ModuleSource`] units (a §14 **separate-module** `instantiate_module` child's or
     /// coroutine's pushed program), re-pushed on restore so a `module >= 1` frame resolves. Empty for a
     /// same-module-only run. Cheap `Arc` clones — the compiled units are immutable.
@@ -5717,20 +5721,20 @@ impl ScheduledContinuation {
             tasks: Vec::new(),
             fibers: Vec::new(),
             children: temen_ir::handles::Table::new(),
-            extra_envs: Vec::new(),
+            child_domains: Vec::new(),
             extra_units: Vec::new(),
             budgets: Vec::new(),
         }
     }
 }
 
-/// A §14 child environment ([`ChildEnv`]) inside a [`Moment`] (#1866): its own window and powerbox
+/// A §14 child domain ([`Domain`]) inside a [`Moment`] (#1866): its own window and powerbox
 /// ([`DetachedLive`]) unless it is spent, its host replay substate, a natural dispatch table over the
 /// child's [`module`] (whose pushed unit rides in `extra_units`) and its fixed `fuel`. A §13
 /// region-aliased child stays outside the checkpointable subset.
 #[derive(Clone)]
-struct EnvSnapshot {
-    /// The unit the child's domain runs ([`ChildEnv::program`]): the granted module's, whose pushed unit
+struct DomainSnapshot {
+    /// The unit the child's domain runs ([`Domain::program`]): the granted module's, whose pushed unit
     /// is captured in the run snapshot's `extra_units`. Its natural dispatch table is rebuilt over this
     /// index.
     module: usize,
@@ -5738,11 +5742,11 @@ struct EnvSnapshot {
     fuel: u64,
     /// The child's fiber registry (its `Vm`s' bytes ride in its window image).
     fibers: Vec<FiberState>,
-    /// The domain that spawned it ([`ChildEnv::spawner`]).
+    /// The domain that spawned it ([`Domain::spawner`]).
     spawner: Option<usize>,
-    /// Its children (#2043), by handle ([`ChildEnv::children`]).
+    /// Its children (#2043), by handle ([`Domain::children`]).
     children: temen_ir::handles::Table<usize>,
-    /// Its own window and powerbox, unless it is spent ([`env_spent`]).
+    /// Its own window and powerbox, unless it is spent ([`domain_spent`]).
     live: Option<DetachedLive>,
 }
 
@@ -5770,7 +5774,7 @@ struct DetachedLive {
 /// to the earliest wait deadline, exactly as the production `drive`), and **§12 fibers** switch each
 /// vCPU's active continuation (breakpoints fire inside a resumed fiber; the fiber registry is run-shared
 /// so a fiber migrates across vCPUs — D57), and **§14 `instantiate` / `instantiate_module`** spawn a
-/// confined executor child as its own scheduled vCPU (its own [`ChildEnv`] — window / powerbox / quota —
+/// confined executor child as its own scheduled vCPU (its own [`Domain`] — window / powerbox / quota —
 /// joinable through the shared thread machinery; a separate-module child runs its own pushed module,
 /// and nesting composes to any depth), and **§14 coroutines** are stepped op-by-op (step-into) with the
 /// coroutine's vCPU **pinned** across the body so a `resume` stays atomic w.r.t. other vCPUs. The only
@@ -5782,7 +5786,7 @@ pub struct ScheduledDebugRun {
     /// child's as it spawns. Rebuilt deterministically on a reverse-`seek` replay. Not torn down
     /// mid-run (a finished child's env is inert — revocation semantics deferred). The root's fuel is
     /// the caller's, lent per call ([`ScheduledDebugRun::lend`]).
-    extra_envs: Vec<ChildEnv>,
+    domains: Vec<Domain>,
     /// Module 0's frame metadata, the same as its unit's ([`Compiled::debug`]), for the per-op
     /// paths that read only the root's ops: the watches, the access sink and the journal.
     root_md: std::sync::Arc<ModuleDebug>,
@@ -5996,14 +6000,14 @@ fn trace_diff(
     actor_depth: usize,
     actor_children: &[(usize, usize)],
     tasks: &[TaskSlot],
-    envs: &[ChildEnv],
+    envs: &[Domain],
     turn: u64,
     actor: usize,
     out: &mut Vec<SchedTraceEvent>,
 ) {
     // #1987: a join handle the op consumed without parking — the child had already finished: a live
     // entry of the actor's domain table, gone after the advance.
-    let table = &envs[tasks[actor].env].children;
+    let table = &envs[tasks[actor].domain].children;
     for &(slot, child) in actor_children {
         if table.get(slot) != Some(&child) {
             out.push(SchedTraceEvent::Join {
@@ -6097,7 +6101,7 @@ fn trace_pick_diff(
 #[allow(clippy::too_many_arguments)]
 fn dbg_spawn(
     tasks: &mut Vec<TaskSlot>,
-    envs: &mut [ChildEnv],
+    envs: &mut [Domain],
     ti: usize,
     func: u32,
     sp: i64,
@@ -6106,7 +6110,7 @@ fn dbg_spawn(
     module: usize,
     source: &ModuleSource,
 ) -> Result<(), Trap> {
-    let env = tasks[ti].env; // a thread runs in its spawner's domain (shares its window)
+    let env = tasks[ti].domain; // a thread runs in its spawner's domain (shares its window)
     let (vt, live) = {
         let mut host = envs[env].host.lock_unpoisoned();
         let mut vt = thread_task(source, module, func, sp, arg, Some(host.own_node()))?;
@@ -6136,10 +6140,10 @@ fn dbg_spawn(
 fn dbg_advance_task(
     tasks: &mut [TaskSlot],
     ti: usize,
-    extra_envs: &mut [ChildEnv],
+    domains: &mut [Domain],
     source: &ModuleSource,
 ) -> FiberStep {
-    let e = &mut extra_envs[tasks[ti].env];
+    let e = &mut domains[tasks[ti].domain];
     debug_advance_fiber(
         &mut tasks[ti].vm.vt,
         &mut e.fibers,
@@ -6172,23 +6176,23 @@ enum Serviced {
 fn service_advance(
     tasks: &mut Vec<TaskSlot>,
     ti: usize,
-    extra_envs: &mut Vec<ChildEnv>,
+    domains: &mut Vec<Domain>,
     source: &ModuleSource,
     clock: u64,
     turn: &mut u64,
 ) -> Serviced {
-    let step_res = dbg_advance_task(tasks, ti, extra_envs, source);
+    let step_res = dbg_advance_task(tasks, ti, domains, source);
     tasks[ti].at_bp = false;
     match step_res {
         // A fiber switch (or a plain op) — the vCPU advanced one op, stays runnable.
         FiberStep::Stepped => *turn += 1,
         FiberStep::Finished(vals) => {
             *turn += 1;
-            complete(tasks, extra_envs, ti, Ok(vals));
+            complete(tasks, domains, ti, Ok(vals));
         }
         FiberStep::Trapped(t) => {
             *turn += 1;
-            complete(tasks, extra_envs, ti, Err(t));
+            complete(tasks, domains, ti, Err(t));
         }
         // #1366 — a cap park: the call has no answer yet and the turn holds (as a stdin park).
         // `drive` tells of the call as it is made (`SchedStop::CapPark`, #1414 D4); it takes the
@@ -6208,18 +6212,17 @@ fn service_advance(
                 module,
             } => {
                 *turn += 1;
-                if let Err(t) = dbg_spawn(tasks, extra_envs, ti, func, sp, arg, dst, module, source)
-                {
-                    complete(tasks, extra_envs, ti, Err(t));
+                if let Err(t) = dbg_spawn(tasks, domains, ti, func, sp, arg, dst, module, source) {
+                    complete(tasks, domains, ti, Err(t));
                 }
             }
             Outcome::ThreadJoin { handle, dst } => {
                 *turn += 1;
-                join_child(tasks, extra_envs, ti, handle, dst);
+                join_child(tasks, domains, ti, handle, dst);
             }
             Outcome::ChildCtl { child, dst, ctl } => {
                 *turn += 1;
-                child_ctl(tasks, extra_envs, ti, child, dst, ctl);
+                child_ctl(tasks, domains, ti, child, dst, ctl);
             }
             Outcome::ChildOffer {
                 grant: true,
@@ -6228,9 +6231,9 @@ fn service_advance(
                 dst,
             } => {
                 *turn += 1;
-                match dbg_grant(tasks, ti, extra_envs, child, arg as i32) {
+                match dbg_grant(tasks, ti, domains, child, arg as i32) {
                     Ok(h) => tasks[ti].deliver(dst, Reg::from_i32(h as i32)),
-                    Err(t) => complete(tasks, extra_envs, ti, Err(t)),
+                    Err(t) => complete(tasks, domains, ti, Err(t)),
                 }
             }
             Outcome::MemoryWait {
@@ -6244,7 +6247,7 @@ fn service_advance(
                 // The task's domain's registry and window. No blocking resume idles here (this
                 // engine claims with `may_block` off), so a fiber's park hands its resumer
                 // `FIBER_PARKED`.
-                let e = &mut extra_envs[tasks[ti].env];
+                let e = &mut domains[tasks[ti].domain];
                 futex_wait(
                     tasks,
                     ti,
@@ -6263,24 +6266,21 @@ fn service_advance(
             }
             Outcome::MemoryNotify { base, count, dst } => {
                 *turn += 1;
-                let win = |env: usize| extra_envs[env].mem.as_ref();
-                let key = futex_key_in(win(tasks[ti].env), base);
+                let win = |env: usize| domains[env].mem.as_ref();
+                let key = futex_key_in(win(tasks[ti].domain), base);
                 let want = count as u32;
                 let mut woken = wake_waiters(tasks, key, want, win);
-                let regs = extra_envs
-                    .iter_mut()
-                    .flat_map(|e| e.fibers.fibers.iter_mut());
+                let regs = domains.iter_mut().flat_map(|e| e.fibers.fibers.iter_mut());
                 woken += wake_fiber_waiters(regs, key, want - woken);
                 tasks[ti].deliver(dst, Reg::from_i32(woken as i32));
             }
             // §5 detached spawn (op 17): a fresh window of its own as a debug task — the
             // cooperative executor's spawn on this path, so a spawning guest stays steppable through
-            // its child (a `ChildEnv` over the child's own `Mem`, joined like a confined child's).
+            // its child (a `Domain` over the child's own `Mem`, joined like a confined child's).
             Outcome::InstantiateDetached { spawn, dst } => {
                 *turn += 1;
-                if let Err(t) = dbg_instantiate_detached(tasks, ti, extra_envs, source, spawn, dst)
-                {
-                    complete(tasks, extra_envs, ti, Err(t));
+                if let Err(t) = dbg_instantiate_detached(tasks, ti, domains, source, spawn, dst) {
+                    complete(tasks, domains, ti, Err(t));
                 }
             }
             // #1146 (deeper) — a blocking-stdin park (W4): the read did not run and the turn holds.
@@ -6359,11 +6359,11 @@ fn service_advance(
                 dst,
             } => {
                 *turn += 1;
-                let e = &mut extra_envs[tasks[ti].env];
+                let e = &mut domains[tasks[ti].domain];
                 let roots = gc_scan(&tasks[ti].vm.vt, &e.fibers.fibers, source, lo, hi, mask);
                 match gc_write(&mut e.mem, buf, cap, roots) {
                     Ok(total) => tasks[ti].deliver(dst, Reg::from_i64(total)),
-                    Err(t) => complete(tasks, extra_envs, ti, Err(t)),
+                    Err(t) => complete(tasks, domains, ti, Err(t)),
                 }
             }
         },
@@ -6371,7 +6371,7 @@ fn service_advance(
     Serviced::Ran
 }
 
-/// Schedule an admitted §14/§5 child as a debug task over its own [`ChildEnv`], registered as a child
+/// Schedule an admitted §14/§5 child as a debug task over its own [`Domain`], registered as a child
 /// handle of `ti` (so `Instantiator.join` → `ThreadJoin` joins it), and land the handle in `dst`.
 /// `Err(ThreadFault)` on the vCPU-count bomb (the caller completes `ti`). A child refused here hands
 /// its window lease back to its spawner's powerbox, so a spawn refused after its admission charges
@@ -6379,15 +6379,15 @@ fn service_advance(
 fn dbg_start_child(
     tasks: &mut Vec<TaskSlot>,
     ti: usize,
-    extra_envs: &mut Vec<ChildEnv>,
+    domains: &mut Vec<Domain>,
     child: AdmittedChild,
     dst: u32,
 ) -> Result<(), Trap> {
-    let spawner = tasks[ti].env;
+    let spawner = tasks[ti].domain;
     // #2043 — a full domain table refuses probeably, as a full powerbox does.
-    if !child_room(tasks, extra_envs, ti) {
+    if !child_room(tasks, domains, ti) {
         child.refuse(|lease| {
-            extra_envs[spawner]
+            domains[spawner]
                 .host
                 .lock_unpoisoned()
                 .release_detached(lease)
@@ -6405,13 +6405,13 @@ fn dbg_start_child(
         fuel,
         lease,
     } = child.build(room, |lease| {
-        extra_envs[spawner]
+        domains[spawner]
             .host
             .lock_unpoisoned()
             .release_detached(lease)
     })?;
-    let eidx = extra_envs.len();
-    extra_envs.push(ChildEnv {
+    let eidx = domains.len();
+    domains.push(Domain {
         mem,
         host: child_host.into_cell(),
         table: std::sync::Arc::new(table),
@@ -6430,7 +6430,7 @@ fn dbg_start_child(
         lease: Some((spawner, lease)),
         ..TaskSlot::new(vt, eidx, LiveVcpu::none())
     });
-    let handle = issue_child(tasks, extra_envs, ti, cidx).ok_or(Trap::Malformed)?; // room checked above
+    let handle = issue_child(tasks, domains, ti, cidx).ok_or(Trap::Malformed)?; // room checked above
     tasks[ti].deliver(dst, Reg::from_i32(handle));
     Ok(())
 }
@@ -6441,14 +6441,14 @@ fn dbg_start_child(
 fn dbg_instantiate_detached(
     tasks: &mut Vec<TaskSlot>,
     ti: usize,
-    extra_envs: &mut Vec<ChildEnv>,
+    domains: &mut Vec<Domain>,
     source: &ModuleSource,
     spawn: DetachedSpawn,
     dst: u32,
 ) -> Result<(), Trap> {
     // The parent's window and the powerbox its handles resolve in: its own domain's (#1727).
     let admitted = {
-        let e = &extra_envs[tasks[ti].env];
+        let e = &domains[tasks[ti].domain];
         let mut owner = e.host.lock_unpoisoned();
         admit_detached_in_process(&mut owner, e.mem.as_ref(), spawn, source, |_| None)?
     };
@@ -6456,7 +6456,7 @@ fn dbg_instantiate_detached(
         tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
     };
-    dbg_start_child(tasks, ti, extra_envs, child, dst)
+    dbg_start_child(tasks, ti, domains, child, dst)
 }
 
 /// #2220 — `Instantiator.grant` (op 19) from task `ti` into the child handle `child` names
@@ -6465,13 +6465,13 @@ fn dbg_instantiate_detached(
 fn dbg_grant(
     tasks: &[TaskSlot],
     ti: usize,
-    envs: &mut [ChildEnv],
+    envs: &mut [Domain],
     child: i32,
     handle: i32,
 ) -> Result<i64, Trap> {
     // `grant_target` names a domain other than the spawner's own, so the two locks are distinct.
     let mut kh = grant_target(tasks, envs, ti, child).map(|k| envs[k].host.lock_unpoisoned());
-    envs[tasks[ti].env]
+    envs[tasks[ti].domain]
         .host
         .lock_unpoisoned()
         .grant_running_child(None, handle, kh.as_deref_mut())
@@ -6702,7 +6702,7 @@ fn dbg_preview_pick(
 #[allow(clippy::too_many_arguments)] // the pick policy's inputs, plus the parks an idle run wakes
 fn dbg_pick_runnable(
     tasks: &mut [TaskSlot],
-    envs: &mut [ChildEnv],
+    envs: &mut [Domain],
     takes: &mut Takes,
     replay: bool,
     clock: &mut u64,
@@ -6738,13 +6738,13 @@ fn dbg_pick_runnable(
 }
 
 /// Every domain's fiber registry: the root's, then each §14 child's.
-fn registries(envs: &mut [ChildEnv]) -> Vec<&mut Vec<FiberState>> {
+fn registries(envs: &mut [Domain]) -> Vec<&mut Vec<FiberState>> {
     envs.iter_mut().map(|e| &mut e.fibers.fibers).collect()
 }
 
 /// Whether the run's root is unwinding a durable freeze: the run froze rather than ended, and the
 /// cut carries every domain still live.
-fn root_unwinding(envs: &[ChildEnv]) -> bool {
+fn root_unwinding(envs: &[Domain]) -> bool {
     let root = &envs[0];
     root.host.lock_unpoisoned().is_durable() && is_unwinding(&root.mem)
 }
@@ -6812,7 +6812,7 @@ fn dbg_parked(tasks: &[TaskSlot]) -> Vec<Parked> {
         .iter()
         .enumerate()
         .filter_map(|(i, t)| match t.state {
-            TaskState::BlockedHostCap { id, dst, at } => Some((i, t.env, dst, id, at)),
+            TaskState::BlockedHostCap { id, dst, at } => Some((i, t.domain, dst, id, at)),
             _ => None,
         })
         .collect()
@@ -6828,7 +6828,7 @@ fn dbg_parked(tasks: &[TaskSlot]) -> Vec<Parked> {
 /// `Some(Idle::Took)` when a thread took its answer.
 fn dbg_take_answer(
     tasks: &mut [TaskSlot],
-    extra_envs: &mut [ChildEnv],
+    domains: &mut [Domain],
     takes: &mut Takes,
     replay: bool,
     now: u64,
@@ -6845,7 +6845,7 @@ fn dbg_take_answer(
     }
     loop {
         for &(p, env, dst, id, _) in &parked {
-            let answer = take_answer(&mut extra_envs[env].host.lock_unpoisoned(), id);
+            let answer = take_answer(&mut domains[env].host.lock_unpoisoned(), id);
             if let Some(r) = answer {
                 tasks[p].deliver(dst, Reg::from_i64(r));
                 tasks[p].state = TaskState::Runnable;
@@ -6864,7 +6864,7 @@ fn dbg_take_answer(
         let &[(p, env, _, id, at)] = &parked[..] else {
             return None;
         };
-        let comps = dbg_completions(env, extra_envs);
+        let comps = dbg_completions(env, domains);
         if comps.is_host_owned(id) {
             return Some(Idle::OnEmbedder(p, at));
         }
@@ -6880,7 +6880,7 @@ fn dbg_take_answer(
 /// wherever the run did.
 fn dbg_await_answer(
     tasks: &[TaskSlot],
-    extra_envs: &[ChildEnv],
+    domains: &[Domain],
     takes: &Takes,
     replay: bool,
     now: u64,
@@ -6892,7 +6892,7 @@ fn dbg_await_answer(
     }
     let calls: Vec<_> = parked
         .iter()
-        .map(|&(_, env, _, id, _)| (dbg_completions(env, extra_envs), id))
+        .map(|&(_, env, _, id, _)| (dbg_completions(env, domains), id))
         .collect();
     let within = next.map(|d| std::time::Duration::from_nanos(d.saturating_sub(now)));
     if within.is_none() {
@@ -6910,18 +6910,18 @@ fn dbg_await_answer(
 /// Whether a thread is parked on a punted call the offload pool answers (#2047): its answer comes
 /// from outside the run, which a restore cannot reach, so it keeps a checkpoint and a journal state
 /// record out, as a fiber's cap park does. A host-completed park is the replay's to serve.
-fn pool_parked(tasks: &[TaskSlot], extra_envs: &[ChildEnv]) -> bool {
+fn pool_parked(tasks: &[TaskSlot], domains: &[Domain]) -> bool {
     tasks.iter().any(|t| match t.state {
         TaskState::BlockedHostCap { id, .. } => {
-            !dbg_completions(t.env, extra_envs).is_host_owned(id)
+            !dbg_completions(t.domain, domains).is_host_owned(id)
         }
         _ => false,
     })
 }
 
 /// The completion store of a debug task's domain.
-fn dbg_completions(env: usize, extra_envs: &[ChildEnv]) -> std::sync::Arc<super::Completions> {
-    extra_envs[env].host.lock_unpoisoned().completions()
+fn dbg_completions(env: usize, domains: &[Domain]) -> std::sync::Arc<super::Completions> {
+    domains[env].host.lock_unpoisoned().completions()
 }
 
 impl ScheduledDebugRun {
@@ -6969,7 +6969,7 @@ impl ScheduledDebugRun {
         // lends its fuel per resume. #2268 — a run the process has no room for is not debugged here.
         let mut host = host;
         host.begin_activation(u64::MAX, RootWindow::of(mem.as_ref()))?;
-        let root = ChildEnv::root(
+        let root = Domain::root(
             mem,
             host.into_cell(),
             std::sync::Arc::new(table),
@@ -6978,7 +6978,7 @@ impl ScheduledDebugRun {
         Some(ScheduledDebugRun {
             source,
             tasks: vec![TaskSlot::new(vt, 0, LiveVcpu::none())],
-            extra_envs: vec![root],
+            domains: vec![root],
             root_md,
             funcs: std::sync::Arc::from(m.funcs.clone()),
             breakpoints: Vec::new(),
@@ -7019,7 +7019,7 @@ impl ScheduledDebugRun {
     /// Bytes past the window are ignored, exactly as the production seed does — confinement only
     /// concerns `[0, size)`.
     pub fn seed_mem(&mut self, init: &[u8]) {
-        if let Some(m) = self.extra_envs[0].mem.as_mut() {
+        if let Some(m) = self.domains[0].mem.as_mut() {
             m.seed(init);
         }
     }
@@ -7136,7 +7136,7 @@ impl ScheduledDebugRun {
             && self.journal.state_at(turn).is_some_and(|st| {
                 let host = self.host();
                 st.cursor.jit_mark == host.jit_compile_mark()
-                    && st.region_mark == region_mark(&host, self.extra_envs[0].mem.as_ref())
+                    && st.region_mark == region_mark(&host, self.domains[0].mem.as_ref())
             })
     }
 
@@ -7168,7 +7168,7 @@ impl ScheduledDebugRun {
         // continuation does not touch guest memory. Undo all the way to the anchor — the forward
         // replay below re-runs the ops between it and the target, which re-writes exactly what was
         // just reverted, so the window ends correct at `turn` either way.
-        if let Some(m) = self.extra_envs[0].mem.as_mut() {
+        if let Some(m) = self.domains[0].mem.as_mut() {
             self.journal.undo_window_to(anchor, m);
         }
         // Verbatim (`readmit_parks = false`): an undo rewinds in place rather than re-executing, so a
@@ -7273,7 +7273,7 @@ impl ScheduledDebugRun {
     pub fn apply_writes_due_now(&mut self) {
         let Self {
             source,
-            extra_envs,
+            domains,
             tasks,
             turn,
             journal,
@@ -7287,7 +7287,7 @@ impl ScheduledDebugRun {
             *turn,
             tasks,
             source,
-            extra_envs,
+            domains,
             journal,
         );
     }
@@ -7300,7 +7300,7 @@ impl ScheduledDebugRun {
 
     /// The shared window's memory-map introspection ([`MemMapInfo`]); `None` without a memory.
     pub fn mem_map_info(&self) -> Option<MemMapInfo> {
-        self.extra_envs[0].mem.as_ref().map(|m| m.map_info())
+        self.domains[0].mem.as_ref().map(|m| m.map_info())
     }
 
     /// Arm (or drop) the **scheduler trace tape** — see [`SchedTraceEvent`]. Arming resets the
@@ -7392,9 +7392,9 @@ impl ScheduledDebugRun {
     /// back to it after. The debugger runs every domain on a fixed allowance, so a checkpoint or a
     /// seek captures each whole (#1944 slice 3).
     fn lend<R>(&mut self, fuel: &mut u64, body: impl FnOnce(&mut Self) -> R) -> R {
-        self.extra_envs[0].fuel = Fuel::fixed(*fuel);
+        self.domains[0].fuel = Fuel::fixed(*fuel);
         let r = body(self);
-        *fuel = self.extra_envs[0].fuel.can_burn();
+        *fuel = self.domains[0].fuel.can_burn();
         r
     }
 
@@ -7407,7 +7407,7 @@ impl ScheduledDebugRun {
         let Self {
             source,
             tasks,
-            extra_envs,
+            domains,
             funcs,
             breakpoints,
             line_bps,
@@ -7442,12 +7442,12 @@ impl ScheduledDebugRun {
                 let res = res.clone();
                 // #2006 — the run is over, and every child still live ends with it, as the oracle's
                 // teardown reaps it (not a run that froze: the cut carries them).
-                if !root_unwinding(extra_envs) {
-                    dbg_refund_ended_windows(tasks, extra_envs, true);
+                if !root_unwinding(domains) {
+                    dbg_refund_ended_windows(tasks, domains, true);
                 }
                 return SchedStop::Finished(res);
             }
-            dbg_refund_ended_windows(tasks, extra_envs, false);
+            dbg_refund_ended_windows(tasks, domains, false);
             // A task mid-coroutine is pinned (atomic resume); otherwise prefer the stepping thread while
             // it is runnable (so a step stays on it and a step-over runs its own call), else the
             // lowest-index runnable thread (advancing the futex clock to wake a waiter when the set is
@@ -7465,7 +7465,7 @@ impl ScheduledDebugRun {
             } else {
                 match dbg_pick_runnable(
                     tasks,
-                    extra_envs,
+                    domains,
                     takes,
                     false,
                     clock,
@@ -7529,9 +7529,9 @@ impl ScheduledDebugRun {
                         // watch (#1229) stops when a watched SSA-held variable's value changed.
                         // Both name the root's window, which a task in a child's window does not
                         // run in (#2076).
-                        Some(pc) if tasks[ti].env == 0 => watch_stop_before(
+                        Some(pc) if tasks[ti].domain == 0 => watch_stop_before(
                             cur_vm,
-                            &extra_envs[0].mem,
+                            &domains[0].mem,
                             funcs,
                             fn_block_base,
                             watchpoints,
@@ -7593,11 +7593,11 @@ impl ScheduledDebugRun {
                 *turn,
                 tasks,
                 source,
-                extra_envs,
+                domains,
                 journal,
             );
             // The sink observes the root's window only (#2076), as the journal below does.
-            if let (Some(sink), 0) = (access_sink.as_mut(), tasks[ti].env) {
+            if let (Some(sink), 0) = (access_sink.as_mut(), tasks[ti].domain) {
                 let cur_vm = tasks[ti].vm.vt.debug_active();
                 emit_access(cur_vm, source, funcs, fn_block_base, *turn, ti, sink);
             }
@@ -7610,8 +7610,8 @@ impl ScheduledDebugRun {
                 funcs,
                 fn_block_base,
                 *turn,
-                if tasks[ti].env == 0 {
-                    &extra_envs[0].mem
+                if tasks[ti].domain == 0 {
+                    &domains[0].mem
                 } else {
                     &None
                 },
@@ -7619,7 +7619,7 @@ impl ScheduledDebugRun {
             journal_state(
                 journal,
                 tasks,
-                extra_envs,
+                domains,
                 source,
                 *clock,
                 *turn,
@@ -7632,7 +7632,7 @@ impl ScheduledDebugRun {
             let pre_adv = tracing.then(|| trace_tags(tasks));
             let pre_depth = trace_depth(&tasks[ti]);
             let pre_threads = if tracing {
-                live_children(tasks, extra_envs, ti)
+                live_children(tasks, domains, ti)
             } else {
                 Vec::new()
             };
@@ -7643,8 +7643,7 @@ impl ScheduledDebugRun {
                 };
                 record_sched(sched_trace, sched_sink, vec![event]);
             }
-            if let Serviced::Declined = service_advance(tasks, ti, extra_envs, source, *clock, turn)
-            {
+            if let Serviced::Declined = service_advance(tasks, ti, domains, source, *clock, turn) {
                 // A coroutine / tier-up op this engine does not drive — bail, `turn` untouched.
                 return SchedStop::Declined;
             }
@@ -7656,7 +7655,7 @@ impl ScheduledDebugRun {
                     pre_depth,
                     &pre_threads,
                     tasks,
-                    extra_envs,
+                    domains,
                     trace_turn,
                     ti,
                     &mut events,
@@ -7667,7 +7666,7 @@ impl ScheduledDebugRun {
             // once, at the call. The thread waits for the answer, which is taken where the
             // schedule says (`dbg_take_answer`).
             if let TaskState::BlockedHostCap { id, at, .. } = tasks[ti].state {
-                if dbg_completions(tasks[ti].env, extra_envs).is_host_owned(id) {
+                if dbg_completions(tasks[ti].domain, domains).is_host_owned(id) {
                     let pc = at.or_else(|| tasks[ti].vm.vt.debug_active().cur_ir_pc(source));
                     if let Some(pc) = pc {
                         *stopped = Some(ti);
@@ -7782,7 +7781,7 @@ impl ScheduledDebugRun {
         let Self {
             source,
             tasks,
-            extra_envs,
+            domains,
             turn,
             clock,
             funcs,
@@ -7813,7 +7812,7 @@ impl ScheduledDebugRun {
                 let pref = span_at(step_spans, *turn); // #1942: replay a recorded step's thread
                 dbg_pick_runnable(
                     tasks,
-                    extra_envs,
+                    domains,
                     takes,
                     true,
                     clock,
@@ -7841,10 +7840,10 @@ impl ScheduledDebugRun {
             *turn,
             tasks,
             source,
-            extra_envs,
+            domains,
             journal,
         );
-        if let (Some(sink), 0) = (access_sink.as_mut(), tasks[ti].env) {
+        if let (Some(sink), 0) = (access_sink.as_mut(), tasks[ti].domain) {
             let cur_vm = tasks[ti].vm.vt.debug_active();
             emit_access(cur_vm, source, funcs, fn_block_base, *turn, ti, sink);
         }
@@ -7857,8 +7856,8 @@ impl ScheduledDebugRun {
             funcs,
             fn_block_base,
             *turn,
-            if tasks[ti].env == 0 {
-                &extra_envs[0].mem
+            if tasks[ti].domain == 0 {
+                &domains[0].mem
             } else {
                 &None
             },
@@ -7866,7 +7865,7 @@ impl ScheduledDebugRun {
         journal_state(
             journal,
             tasks,
-            extra_envs,
+            domains,
             source,
             *clock,
             *turn,
@@ -7878,7 +7877,7 @@ impl ScheduledDebugRun {
         let pre_adv = tracing.then(|| trace_tags(tasks));
         let pre_depth = trace_depth(&tasks[ti]);
         let pre_threads = if tracing {
-            live_children(tasks, extra_envs, ti)
+            live_children(tasks, domains, ti)
         } else {
             Vec::new()
         };
@@ -7889,7 +7888,7 @@ impl ScheduledDebugRun {
             };
             record_sched(sched_trace, sched_sink, vec![event]);
         }
-        if let Serviced::Declined = service_advance(tasks, ti, extra_envs, source, *clock, turn) {
+        if let Serviced::Declined = service_advance(tasks, ti, domains, source, *clock, turn) {
             // An unsupported op — tick this engine's clock (as it did unconditionally before) and
             // stop the replay here.
             *turn += 1;
@@ -7904,7 +7903,7 @@ impl ScheduledDebugRun {
                 pre_depth,
                 &pre_threads,
                 tasks,
-                extra_envs,
+                domains,
                 trace_turn,
                 ti,
                 &mut events,
@@ -7923,7 +7922,7 @@ impl ScheduledDebugRun {
     /// (captured stdout) and its [`CapTape`](Host::cap_tape) so a reverse `seek` rebuild replays
     /// identical cap inputs. It sits in a cell, as every domain's does, so this locks it.
     pub fn host(&self) -> std::sync::MutexGuard<'_, Host> {
-        self.extra_envs[0].host.lock_unpoisoned()
+        self.domains[0].host.lock_unpoisoned()
     }
     /// [`host`](Self::host), for a change — e.g. to drain captured stdout between stops.
     pub fn host_mut(&mut self) -> std::sync::MutexGuard<'_, Host> {
@@ -7971,7 +7970,7 @@ impl ScheduledDebugRun {
     fn host_cap_park(&self) -> Option<(u64, Option<super::IrPc>)> {
         self.tasks.iter().find_map(|t| match t.state {
             TaskState::BlockedHostCap { id, at, .. }
-                if dbg_completions(t.env, &self.extra_envs).is_host_owned(id) =>
+                if dbg_completions(t.domain, &self.domains).is_host_owned(id) =>
             {
                 Some((id, at))
             }
@@ -8004,9 +8003,9 @@ impl ScheduledDebugRun {
     /// multi-vCPU time-travel **checkpoint** (W1) snapshots, over every task:
     /// **§12 fibers** are admitted (the run-shared registry + each task's active fiber / resume chain,
     /// all sharing the run's window) except an event-parked (`memory.wait`) fiber (non-deterministic
-    /// wall-clock deadline); **§14 children** are admitted, each [`ChildEnv`] carrying its own window
+    /// wall-clock deadline); **§14 children** are admitted, each [`Domain`] carrying its own window
     /// image and powerbox ([`DetachedLive`]) and rebuilt under its spawner's on restore
-    /// ([`rebuild_detached_env`]), or nothing of either once spent (#1866). The root's §13 regions
+    /// ([`rebuild_detached_domain`]), or nothing of either once spent (#1866). The root's §13 regions
     /// ride the moment ([`Moment::checkpoint`](super::moment::Moment::checkpoint), #2026), its
     /// window's aliases in its page map. Still excluded (→ replay-from-turn-0): a task
     /// mid-§22-invoke, and a live child with no window, a `Jit` table, a §13 region, or a powerbox
@@ -8016,16 +8015,16 @@ impl ScheduledDebugRun {
         if self.tasks.iter().any(|t| t.vm.vt.active_invoke.is_some()) {
             return Err(Refusal::Invoke);
         }
-        if any_event_parked(self.extra_envs.iter().flat_map(|e| e.fibers.fibers.iter()))
-            || pool_parked(&self.tasks, &self.extra_envs)
+        if any_event_parked(self.domains.iter().flat_map(|e| e.fibers.fibers.iter()))
+            || pool_parked(&self.tasks, &self.domains)
         {
             return Err(Refusal::Fiber);
         }
-        // A child's window is its own (#1866): its image rides its env's snapshot, so only a
+        // A child's window is its own (#1866): its image rides its domain's snapshot, so only a
         // §13 region keeps it out; and once spent, nothing of it does. Its powerbox must be plain
-        // values, which the capture itself checks (`env_snapshot`). The root's ride the moment.
-        for (k, e) in self.extra_envs.iter().enumerate().skip(1) {
-            if env_spent(&self.tasks, &self.extra_envs, k) {
+        // values, which the capture itself checks (`domain_snapshot`). The root's ride the moment.
+        for (k, e) in self.domains.iter().enumerate().skip(1) {
+            if domain_spent(&self.tasks, &self.domains, k) {
                 continue;
             }
             child_host_admits(&e.host.lock_unpoisoned())?;
@@ -8048,18 +8047,18 @@ impl ScheduledDebugRun {
         self.checkpointable()?;
         let continuation = self.build_continuation()?;
         super::moment::Moment::checkpoint(
-            self.extra_envs[0].mem.as_ref().map(|m| m.layout_snapshot()),
+            self.domains[0].mem.as_ref().map(|m| m.layout_snapshot()),
             &self.host(),
             super::moment::Continuation::Bytecode(continuation),
         )
     }
 
     /// The continuation half of a capture: every task's `Vm` + join table + state, the run-shared fiber
-    /// registry, the §14 child envs, and the pushed source units. Shared by the checkpoint ladder
+    /// registry, the §14 child domains, and the pushed source units. Shared by the checkpoint ladder
     /// ([`snapshot`](Self::snapshot), which pairs it with the window image and the host substate) and by
     /// the **undo journal** (#1557), which pairs it with a compact [`HostCursor`](crate::HostCursor)
     /// and the window pre-images instead — one definition of "what the continuation is", two costs.
-    /// Refused when a live detached child's powerbox is not plain values (`env_snapshot`).
+    /// Refused when a live detached child's powerbox is not plain values (`domain_snapshot`).
     fn build_continuation(&self) -> Result<ScheduledContinuation, Refusal> {
         Ok(ScheduledContinuation {
             clock: self.clock,
@@ -8071,21 +8070,21 @@ impl ScheduledDebugRun {
                     active_id: t.vm.vt.active_id,
                     chain: t.vm.vt.chain.clone(),
                     root_shadow_sp: t.vm.vt.root_shadow_sp,
-                    env: t.env,
+                    domain: t.domain,
                     state: t.state.clone(),
                     at_bp: t.at_bp,
                     lease: t.lease,
                     live: t.live.held(),
                 })
                 .collect(),
-            fibers: self.extra_envs[0].fibers.fibers.clone(),
-            children: self.extra_envs[0].children.clone(),
-            extra_envs: self
-                .extra_envs
+            fibers: self.domains[0].fibers.fibers.clone(),
+            children: self.domains[0].children.clone(),
+            child_domains: self
+                .domains
                 .iter()
                 .enumerate()
                 .skip(1)
-                .map(|(k, e)| env_snapshot(e, env_spent(&self.tasks, &self.extra_envs, k)))
+                .map(|(k, e)| domain_snapshot(e, domain_spent(&self.tasks, &self.domains, k)))
                 .collect::<Result<_, _>>()?,
             extra_units: self.source.extra_units(),
             budgets: self.host().budget_tree(),
@@ -8098,7 +8097,7 @@ impl ScheduledDebugRun {
     /// root-only `VTask` around the captured active `Vm`), reseeds the shared window bytes, restores the
     /// host substate and both scheduler clocks, and clears the transient stop state (`locate` rederives
     /// it). A separate-module coroutine/child's pushed source units are re-pushed first (so its `module`
-    /// index resolves); the run-shared fibers and each child env are rebuilt from the snapshot.
+    /// index resolves); the run-shared fibers and each child domain are rebuilt from the snapshot.
     /// `turn` is the global turn the snapshot was taken at — the ladder's key, handed back with it.
     pub fn restore(&mut self, turn: u64, snap: &Moment) {
         let c = snap
@@ -8109,7 +8108,7 @@ impl ScheduledDebugRun {
         snap.restore_host(&mut self.host());
         // Last: the window's §13 pages re-alias onto the regions the host half just rebuilt (#2026).
         if let Some(layout) = snap.mem() {
-            let root = &mut self.extra_envs[0];
+            let root = &mut self.domains[0];
             let host = root.host.lock_unpoisoned();
             let aliased = restore_window_of(root.mem.as_mut(), &layout, &host);
             debug_assert!(
@@ -8124,7 +8123,7 @@ impl ScheduledDebugRun {
     }
 
     /// Install a [`build_continuation`](Self::build_continuation) capture: the root domain's fiber
-    /// registry and children, the pushed source units, the §14 child envs, and every task's `VTask`.
+    /// registry and children, the pushed source units, the §14 child domains, and every task's `VTask`.
     ///
     /// `readmit_parks` is the one place the two callers differ. A **checkpoint restore** rebuilds the
     /// run and replays forward, so a captured blocking-stdin / host-completed park is re-admitted
@@ -8134,7 +8133,7 @@ impl ScheduledDebugRun {
     fn install_continuation(&mut self, c: &ScheduledContinuation, readmit_parks: bool) {
         // #2112 — each live fiber is charged again, as each live thread is below. The root domain
         // itself is this run's own: only what the capture holds of it comes back.
-        let root = &mut self.extra_envs[0];
+        let root = &mut self.domains[0];
         root.fibers = FiberTables::restored(c.fibers.clone(), &root.host.lock_unpoisoned());
         root.children = c.children.clone();
         // Re-push any separate-module units before rebuilding envs/coroutines (their `module` indices
@@ -8142,22 +8141,22 @@ impl ScheduledDebugRun {
         self.source.reset_extra(&c.extra_units);
         // The units past the restored ones are gone, and a later spawn adds its module afresh.
         self.line_bps.unbind();
-        // Rebuild each task's full `VTask` and each §14 child env, each table over the child's own
+        // Rebuild each task's full `VTask` and each §14 child domain, each table over the child's own
         // module. A child's env is rebuilt under its spawner's, which comes back first (#1866): the
         // root, or a child rebuilt before it.
-        let mut children: Vec<ChildEnv> = Vec::with_capacity(c.extra_envs.len());
-        for es in &c.extra_envs {
+        let mut children: Vec<Domain> = Vec::with_capacity(c.child_domains.len());
+        for es in &c.child_domains {
             let env = {
                 let mut spawner = match es.spawner.unwrap_or(0) {
-                    0 => self.extra_envs[0].host.lock_unpoisoned(),
+                    0 => self.domains[0].host.lock_unpoisoned(),
                     k => children[k - 1].host.lock_unpoisoned(),
                 };
-                rebuild_detached_env(es, &mut spawner, &self.source)
+                rebuild_detached_domain(es, &mut spawner, &self.source)
             };
             children.push(env);
         }
-        self.extra_envs.truncate(1);
-        self.extra_envs.extend(children);
+        self.domains.truncate(1);
+        self.domains.extend(children);
         self.tasks = c
             .tasks
             .iter()
@@ -8186,7 +8185,7 @@ impl ScheduledDebugRun {
                     },
                     suspended: None,
                 }),
-                env: ts.env,
+                domain: ts.domain,
                 state: match (&ts.state, readmit_parks) {
                     (TaskState::BlockedStdin | TaskState::BlockedHostCap { .. }, true) => {
                         TaskState::Runnable
@@ -8200,7 +8199,7 @@ impl ScheduledDebugRun {
                 live: match ts.live {
                     false => LiveVcpu::none(),
                     true => {
-                        LiveVcpu::force(self.extra_envs[ts.env].host.lock_unpoisoned().own_node())
+                        LiveVcpu::force(self.domains[ts.domain].host.lock_unpoisoned().own_node())
                     }
                 },
             })
@@ -8267,11 +8266,11 @@ impl ScheduledDebugRun {
     /// The memory window a task steps against, its domain's — so inspection of a focused child reads
     /// its own confined window.
     fn task_mem(&self, ti: usize) -> &Option<Mem> {
-        &self.extra_envs[self.tasks[ti].env].mem
+        &self.domains[self.tasks[ti].domain].mem
     }
 
     /// A [`FrameReader`] over the **focused** thread's currently-stepping `Vm` (what `select_task` chose):
-    /// the thread's own vCPU over its window (a §14 child's own, for a task in a child env).
+    /// the thread's own vCPU over its window (a §14 child's own, for a task in a child domain).
     fn reader(&self) -> FrameReader<'_> {
         let vm = self.tasks[self.focus].vm.vt.debug_active();
         FrameReader {
@@ -8355,11 +8354,11 @@ impl ScheduledDebugRun {
     /// backend): the window [`read_window`](Self::read_window) reads, a child's own when a child is
     /// focused (#2072). `false` if the range is unmapped or the module has no memory.
     pub fn write_window(&mut self, addr: u64, bytes: &[u8]) -> bool {
-        let env = self.tasks[self.focus].env;
+        let env = self.tasks[self.focus].domain;
         write_task_window(
             &mut self.journal,
             self.turn,
-            &mut self.extra_envs,
+            &mut self.domains,
             env,
             addr,
             bytes,
@@ -8431,7 +8430,7 @@ struct ExecBuilt {
 
 /// A personality `posix_spawn` (#1970) task `ti` asked for: mint a process as the fork arm mints a
 /// twin (its pid is its task index + 1, and its parent reaps it) and build its image as the exec arm
-/// builds one, in an env of its own: a fresh window of the image's declared memory, with nothing of
+/// builds one, in a domain of its own: a fresh window of the image's declared memory, with nothing of
 /// the caller copied. Answers the caller's result, the pid or `-EAGAIN` when no process could be
 /// minted. A child whose image is a leaf runs it whole from its first step ([`Vm::tier_up_leaf`]).
 /// A process whose image cannot be built still takes its task, done before it ran, so the settle
@@ -8439,7 +8438,7 @@ struct ExecBuilt {
 #[allow(clippy::too_many_arguments)] // the pump's own state, borrowed field by field
 fn spawn_task(
     tasks: &mut Vec<TaskSlot>,
-    extra_envs: &mut Vec<ChildEnv>,
+    domains: &mut Vec<Domain>,
     forked_twins: &mut std::collections::BTreeSet<usize>,
     leaf: Option<&LeafEmitter>,
     source: &ModuleSource,
@@ -8453,7 +8452,7 @@ fn spawn_task(
     if live_tasks(tasks) >= super::MAX_VCPUS {
         return super::EAGAIN;
     }
-    let spawner = &extra_envs[tasks[ti].env];
+    let spawner = &domains[tasks[ti].domain];
     // #2001 — the process is one `spawn` of the node it shares with its spawner while it lives: a full
     // ceiling refuses it as the live cap does.
     let node = spawner.host.lock_unpoisoned().own_node();
@@ -8486,7 +8485,7 @@ fn spawn_task(
     let (child_mem, child_host, table, vt, state, live) = match built {
         Ok(built) => {
             // Its own park door and pump bell, as the fork arm wires a twin's.
-            wire_process(&built.host, &extra_envs[0].host);
+            wire_process(&built.host, &domains[0].host);
             let state = TaskState::Runnable;
             let (m, h) = (Some(built.mem), built.host);
             (m, h, built.table, built.vt, state, live)
@@ -8496,12 +8495,12 @@ fn spawn_task(
             vt.release();
             let failed = Err(Trap::Exit(super::SPAWN_EXEC_FAILED as i32));
             let state = TaskState::Done(failed);
-            let table = extra_envs[0].table.fork();
+            let table = domains[0].table.fork();
             (None, twin, table, vt, state, LiveVcpu::none())
         }
     };
-    let eidx = extra_envs.len();
-    extra_envs.push(ChildEnv {
+    let eidx = domains.len();
+    domains.push(Domain {
         mem: child_mem,
         host: child_host.into_cell(),
         table: std::sync::Arc::new(table),
@@ -8782,9 +8781,9 @@ fn image_pages(host: &Host, census: &ImageCensus) -> bool {
 
 /// Whether a vCPU is the bare root a fork duplicates faithfully (the oracle's `fork_vcpu` gate): no
 /// live child or thread, on its root context with no fiber resume chain. Anything else is refused.
-fn fork_bare(tasks: &[TaskSlot], envs: &[ChildEnv], ti: usize) -> bool {
+fn fork_bare(tasks: &[TaskSlot], envs: &[Domain], ti: usize) -> bool {
     let vt = &tasks[ti].vm.vt;
-    envs[tasks[ti].env].children.is_idle() && vt.active_id == ROOT_FIBER && vt.chain.is_empty()
+    envs[tasks[ti].domain].children.is_idle() && vt.active_id == ROOT_FIBER && vt.chain.is_empty()
 }
 
 /// What a fork twin takes from its parent's process (the oracle's `fork_vcpu`): one `spawn` of the
@@ -9108,7 +9107,7 @@ enum Outcome {
         ctl: ChildCtl,
     },
     /// §3.6 (I36 slice 2) — `child_offer`: mint a live offer over child `child`'s export `arg`; with
-    /// `grant` (#2220), grant capability `arg` into it (driver-side — it owns the child envs). The
+    /// `grant` (#2220), grant capability `arg` into it (driver-side — it owns the child domains). The
     /// handle (or an errno) lands at `dst`.
     ChildOffer {
         child: i32,
@@ -9472,7 +9471,7 @@ impl FiberCell<'_> {
             FiberCell::Excl { fibers, sp, meta } => (&mut **fibers, &mut **sp, &mut **meta),
             FiberCell::Core(m, env) => {
                 core = m.lock_unpoisoned();
-                let t = &mut core.core.extra_envs[*env].fibers;
+                let t = &mut core.core.domains[*env].fibers;
                 (&mut t.fibers, &mut t.sp, &mut t.meta)
             }
         };
@@ -9942,10 +9941,10 @@ fn drain_cap_parked(fibers: &mut [FiberState], comps: &super::Completions) -> Ve
 /// a parked task, as a resumer polls a parked fiber ([`drain_cap_parked`]). A task is a vCPU of its
 /// own, so between tasks the order is whatever the world's is, as on the oracle. Each task's call is
 /// in its own domain's store, a child's as the root's (#2424).
-fn drain_task_completions(tasks: &mut [TaskSlot], extra_envs: &[ChildEnv]) {
+fn drain_task_completions(tasks: &mut [TaskSlot], domains: &[Domain]) {
     for t in tasks.iter_mut() {
         if let TaskState::BlockedHostCap { id, dst, .. } = t.state {
-            let answer = take_answer(&mut extra_envs[t.env].host.lock_unpoisoned(), id);
+            let answer = take_answer(&mut domains[t.domain].host.lock_unpoisoned(), id);
             if let Some(r) = answer {
                 t.deliver(dst, Reg::from_i64(r));
                 t.state = TaskState::Runnable;
@@ -9956,8 +9955,8 @@ fn drain_task_completions(tasks: &mut [TaskSlot], extra_envs: &[ChildEnv]) {
 
 /// #2424 — [`drain_cap_parked`] over every domain's fiber registry, each against its own store.
 /// Whether anything was claimed.
-fn drain_fiber_completions(extra_envs: &mut [ChildEnv]) -> bool {
-    let regs = extra_envs
+fn drain_fiber_completions(domains: &mut [Domain]) -> bool {
+    let regs = domains
         .iter_mut()
         .map(|e| (&mut e.fibers.fibers[..], &e.host));
     let mut claimed = false;
@@ -9980,18 +9979,18 @@ fn drain_fiber_completions(extra_envs: &mut [ChildEnv]) -> bool {
 /// task's own (`BlockedHostCap`), and that of a `CapParked` fiber a task resumes, blocking
 /// (`BlockedOnFiber`), as the parallel driver counts them. A fiber no task resumes is left out, one
 /// of a domain that has finished, say (#2480): its answer wakes no one, so nothing waits for it.
-fn outstanding_calls(tasks: &[TaskSlot], extra_envs: &[ChildEnv]) -> Vec<(usize, u64)> {
+fn outstanding_calls(tasks: &[TaskSlot], domains: &[Domain]) -> Vec<(usize, u64)> {
     tasks
         .iter()
-        .filter_map(|t| call_awaited(t, extra_envs).map(|id| (t.env, id)))
+        .filter_map(|t| call_awaited(t, domains).map(|id| (t.domain, id)))
         .collect()
 }
 
 /// The punted call task `t` waits on, if it does ([`outstanding_calls`]).
-fn call_awaited(t: &TaskSlot, extra_envs: &[ChildEnv]) -> Option<u64> {
+fn call_awaited(t: &TaskSlot, domains: &[Domain]) -> Option<u64> {
     match t.state {
         TaskState::BlockedHostCap { id, .. } => Some(id),
-        TaskState::BlockedOnFiber { fiber } => match extra_envs[t.env].fibers.fibers.get(fiber) {
+        TaskState::BlockedOnFiber { fiber } => match domains[t.domain].fibers.fibers.get(fiber) {
             Some(FiberState::CapParked {
                 id, woken: None, ..
             }) => Some(*id),
@@ -10077,8 +10076,8 @@ mod stalled_tests {
 
 /// #1198 — whether task `t`'s process is stopped (SIGTSTP/SIGTTIN/SIGTTOU, before its SIGCONT): a
 /// stopped process makes no progress, so neither executor steps its runnable tasks.
-fn process_stopped(envs: &[ChildEnv], t: &TaskSlot) -> bool {
-    envs[t.env]
+fn process_stopped(envs: &[Domain], t: &TaskSlot) -> bool {
+    envs[t.domain]
         .host
         .lock_unpoisoned()
         .signal_poll()
@@ -10545,7 +10544,7 @@ fn gc_scan_beneath(
                 FiberRegRef::Owned(f) => scan(f),
                 FiberRegRef::Core(m, env) => {
                     let g = m.lock_unpoisoned();
-                    scan(&g.core.extra_envs[env].fibers.fibers)
+                    scan(&g.core.domains[env].fibers.fibers)
                 }
             }
         }
@@ -11247,7 +11246,7 @@ impl HostCell<'_> {
 /// The per-vCPU execution environment a [`step_vcpu`] runs against: the dispatch `table` it uses
 /// (the shared domain table, or a §14 confined child's own natural table), its `fuel` budget, its
 /// linear `mem`, and its capability `host`. The root vCPU and its `thread.spawn` siblings share the
-/// domain's (env `None`); a §14 `instantiate` child carries its own confined [`ChildEnv`]. Bundled so
+/// domain's (env `None`); a §14 `instantiate` child carries its own confined [`Domain`]. Bundled so
 /// [`step_vcpu`] takes one ref instead of four (and so the per-task selection has a single type).
 struct RunCtx<'a> {
     table: &'a SharedSlots,
@@ -11430,15 +11429,16 @@ fn resolve_fiber_entry(
     }
 }
 
-/// A domain's runtime — the run's root ([`ChildEnv::root`], the run's domain `0`), a §14 child, a
-/// fork twin or an exec image — owned by its run alongside the task set: the executors' ([`drive`],
+/// A domain (PROCESS.md §3) as the bytecode drivers run it: the run's root ([`Domain::root`], the
+/// run's domain `0`), a §14 child, a fork twin or an exec image, which a task names by its index in
+/// the run's `domains`. The run owns them alongside the task set: the executors' ([`drive`],
 /// [`drive_threads`]) and the debugger's ([`ScheduledDebugRun`]). Its `mem` is the domain's own
 /// window, its `host` its powerbox, its `table` its dispatch table (a child's a fresh **natural**
 /// one over its unit, with no access to installed §22 units — like the tree-walker's fresh
 /// `DomainTable`), and `fuel` its own (#1944 slice 3: an executor's domain draws from its budget
 /// node; the debugger gives each a fixed allowance, which a checkpoint captures whole and a seek
 /// replays — the root's is the caller's, lent per call).
-struct ChildEnv {
+struct Domain {
     mem: Option<Mem>,
     /// The domain's live powerbox, in its cell ([`DomainCell`]): a §3.6 live-callee offer holds the
     /// SAME callee the tree-walker's `wire_live_impl` machinery expects — enqueue, offer-shape, and
@@ -11453,7 +11453,7 @@ struct ChildEnv {
     fibers: FiberTables,
     /// #2074 — for a §14 child, the domain whose task spawned it (the root's is `0`); `None` for the
     /// root, a fork twin or an exec image, which are not §14 children. A kill descends through it
-    /// ([`kill_env`] on the debugger), and a checkpoint's rebuild aliases its inherited stdio to it
+    /// ([`kill_domain`] on the debugger), and a checkpoint's rebuild aliases its inherited stdio to it
     /// (#1866).
     spawner: Option<usize>,
     /// A §14 child's domain, not a fork twin's or an exec image's: its end releases the services
@@ -11468,7 +11468,7 @@ struct ChildEnv {
     children: temen_ir::handles::Table<usize>,
 }
 
-impl ChildEnv {
+impl Domain {
     /// A run's root domain, the run's domain `0`: its window, powerbox, table and fuel, running unit
     /// 0 of the run's program, with no fibers or children yet.
     fn root(
@@ -11476,8 +11476,8 @@ impl ChildEnv {
         host: DomainCell,
         table: std::sync::Arc<SharedSlots>,
         fuel: Fuel,
-    ) -> ChildEnv {
-        ChildEnv {
+    ) -> Domain {
+        Domain {
             mem,
             host,
             table,
@@ -11491,13 +11491,13 @@ impl ChildEnv {
     }
 }
 
-/// A domain's powerbox in the cooperative driver: the root's and every child env's sits in a cell
+/// A domain's powerbox in the cooperative driver: the root's and every child domain's sits in a cell
 /// ([`Host::into_cell`]), so a child can call back into any domain of the run through a live offer
 /// (#744). The pump locks a task's cell for the task's step.
 type DomainCell = std::sync::Arc<std::sync::Mutex<Host>>;
 
 /// The domain whose powerbox `cell` is, or `None` for a cell that is no domain of this run.
-fn domain_of(envs: &[ChildEnv], cell: &DomainCell) -> Option<usize> {
+fn domain_of(envs: &[Domain], cell: &DomainCell) -> Option<usize> {
     envs.iter()
         .position(|e| std::sync::Arc::ptr_eq(&e.host, cell))
 }
@@ -11506,7 +11506,7 @@ fn domain_of(envs: &[ChildEnv], cell: &DomainCell) -> Option<usize> {
 /// caller queued, or takes the client-gone token ([`Host::take_client_gone`], #1217).
 fn wake_serve_loops(tasks: &mut [TaskSlot], env: usize) {
     for t in tasks.iter_mut() {
-        if t.env == env && matches!(t.state, TaskState::BlockedSvc) {
+        if t.domain == env && matches!(t.state, TaskState::BlockedSvc) {
             t.state = TaskState::Runnable;
         }
     }
@@ -11529,17 +11529,17 @@ fn live_tasks(tasks: &[TaskSlot]) -> usize {
 /// charges nothing (#1975, #2006), as the oracle's undo does.
 fn coop_start_child(
     tasks: &mut Vec<TaskSlot>,
-    extra_envs: &mut Vec<ChildEnv>,
+    domains: &mut Vec<Domain>,
     ti: usize,
     child: AdmittedChild,
     dst: u32,
     tierup: Option<ProgramEmit>,
 ) -> Result<(), Trap> {
-    let spawner = tasks[ti].env;
+    let spawner = tasks[ti].domain;
     // #2043 — a full domain table refuses probeably, as a full powerbox does.
-    if !child_room(tasks, extra_envs, ti) {
+    if !child_room(tasks, domains, ti) {
         child.refuse(|lease| {
-            extra_envs[spawner]
+            domains[spawner]
                 .host
                 .lock_unpoisoned()
                 .release_detached(lease)
@@ -11557,7 +11557,7 @@ fn coop_start_child(
         fuel,
         lease,
     } = child.build(room, |lease| {
-        extra_envs[spawner]
+        domains[spawner]
             .host
             .lock_unpoisoned()
             .release_detached(lease)
@@ -11567,8 +11567,8 @@ fn coop_start_child(
     if let Some(e) = &tierup {
         vt.active.tier_up(module, e, !child_host.is_durable());
     }
-    let eidx = extra_envs.len();
-    extra_envs.push(ChildEnv {
+    let eidx = domains.len();
+    domains.push(Domain {
         mem,
         host: child_host.into_cell(),
         table: std::sync::Arc::new(table),
@@ -11584,7 +11584,7 @@ fn coop_start_child(
         lease: Some((spawner, lease)),
         ..TaskSlot::new(vt, eidx, LiveVcpu::none())
     });
-    let handle = issue_child(tasks, extra_envs, ti, cidx).ok_or(Trap::Malformed)?; // room checked above
+    let handle = issue_child(tasks, domains, ti, cidx).ok_or(Trap::Malformed)?; // room checked above
     tasks[ti].deliver(dst, Reg::from_i32(handle));
     Ok(())
 }
@@ -11596,10 +11596,10 @@ struct TaskSlot {
     /// Boxed, so a slot is a third its size: every scheduling round scans the tasks' states, and
     /// with the VM inline each one cost the scan its own cache lines.
     vm: Box<TaskVm>,
-    /// The domain this vCPU steps in: its index in the run's domains (`extra_envs`), the root's `0`.
+    /// The domain this vCPU steps in: its index in the run's domains (`domains`), the root's `0`.
     /// A `thread.spawn` child shares its spawner's domain, window and all; a §14 child, a fork twin
     /// and an exec'd image each run a domain of their own.
-    env: usize,
+    domain: usize,
     state: TaskState,
     /// A detached child's window lease `(spawner's domain, budget, bytes)`, on the child's root
     /// task: once the task is `Done`, or the run is, the scheduler returns the bytes to the spawner's
@@ -11617,13 +11617,13 @@ struct TaskSlot {
 impl TaskSlot {
     /// A runnable task `vt` in domain `env`, holding its `live` charge: nothing suspended, no window
     /// lease.
-    fn new(vt: VTask, env: usize, live: LiveVcpu) -> TaskSlot {
+    fn new(vt: VTask, domain: usize, live: LiveVcpu) -> TaskSlot {
         TaskSlot {
             vm: Box::new(TaskVm {
                 vt,
                 suspended: None,
             }),
-            env,
+            domain,
             state: TaskState::Runnable,
             lease: None,
             live,
@@ -11674,7 +11674,7 @@ impl TaskVm {
 /// again. `run_ended`: the run is over, which ends every child still live too, as the oracle's
 /// teardown reaps it ([`CoopSched::pump`]): its window goes back, and what each child domain's window
 /// and fibers hold ([`Host::release_memory`], #2006, #2112).
-fn refund_ended_windows(tasks: &mut [TaskSlot], envs: &mut [ChildEnv], run_ended: bool) {
+fn refund_ended_windows(tasks: &mut [TaskSlot], envs: &mut [Domain], run_ended: bool) {
     for t in tasks.iter_mut() {
         if run_ended || matches!(t.state, TaskState::Done(_)) {
             if let Some((env, lease)) = t.lease.take() {
@@ -11716,7 +11716,7 @@ enum TaskState {
         deadline: Option<u64>,
         dst: u32,
     },
-    /// §3.6 (I36 slice 2): parked in `svc.wait` on this task's own domain (its env's host); a
+    /// §3.6 (I36 slice 2): parked in `svc.wait` on this task's own domain (its domain's host); a
     /// caller's enqueue on that host re-admits it (the rewound op re-executes the drain).
     BlockedSvc,
     /// §3.6 (I36 slice 2): parked on a live-call `ticket` against `callee`'s completion cells;
@@ -11753,7 +11753,7 @@ enum TaskState {
     },
     /// #1080 rung 4 — parked in a blocking personality pipe **read** on an empty FIFO (writers open). The
     /// read op was rewound; the settle scan polls the shared FIFO via `pipe_read_ready(pipe)` (`pipe` =
-    /// this task's domain-local index into its env host's pipe table) and re-admits when bytes arrive or
+    /// this task's domain-local index into its domain host's pipe table) and re-admits when bytes arrive or
     /// every writer closed (EOF), so the re-executed read completes / EOFs. The cooperative analogue of
     /// the tree-walker's `Blocked::PipeRead` — polled, not held in a `pipe_waiters` map.
     BlockedPipeRead {
@@ -11888,15 +11888,10 @@ fn park_fiber_on_host(
 /// ([`FiberState::HostParked`]), in its task's domain: the root's registry and window, or its
 /// confined `instantiate` env's. Nothing parks for a vanished pipe: its op re-runs, and fails closed.
 #[allow(clippy::too_many_arguments)]
-fn host_park_fiber(
-    tasks: &mut [TaskSlot],
-    ti: usize,
-    extra_envs: &mut [ChildEnv],
-    stop: &VcpuStop,
-) {
-    let durable = extra_envs[0].host.lock_unpoisoned().is_durable();
+fn host_park_fiber(tasks: &mut [TaskSlot], ti: usize, domains: &mut [Domain], stop: &VcpuStop) {
+    let durable = domains[0].host.lock_unpoisoned().is_durable();
     let parked = {
-        let h = &*extra_envs[tasks[ti].env].host.lock_unpoisoned();
+        let h = &*domains[tasks[ti].domain].host.lock_unpoisoned();
         HostWait::of(stop, h).map(|on| {
             let ready = on.ready(h);
             (on, ready)
@@ -11905,7 +11900,7 @@ fn host_park_fiber(
     let Some((on, ready)) = parked else {
         return;
     };
-    let e = &mut extra_envs[tasks[ti].env];
+    let e = &mut domains[tasks[ti].domain];
     if let Some(k) = park_fiber_on_host(
         &mut tasks[ti].vm.vt,
         &mut e.fibers.fibers,
@@ -11961,7 +11956,7 @@ impl TaskState {
 fn freeze_step(
     tasks: &mut [TaskSlot],
     forked_twins: &std::collections::BTreeSet<usize>,
-    root: &mut ChildEnv,
+    root: &mut Domain,
     freeze_on_quiesce: &mut bool,
 ) -> bool {
     use super::{DeclineCause, FreezeDeclined, FreezeRule};
@@ -12092,7 +12087,7 @@ fn drive(
         let mut sched = CoopSched::new(&source, table, entry, args, root_fuel, mem, cell, None)?;
         sched.wall = cfg!(not(target_family = "wasm"));
         let step = sched.pump(&source, budget);
-        *mem = sched.core.extra_envs[0].mem.take();
+        *mem = sched.core.domains[0].mem.take();
         match step? {
             CoopStep::Done(vals) => Ok(vals),
             CoopStep::Idle { .. } => {
@@ -12281,13 +12276,13 @@ fn park_task(
     tasks[ti].state = state;
 }
 
-/// The child envs (§14 children and fork twins) whose domains have finished, as [`settle_wakes`]
+/// The child domains (§14 children and fork twins) whose domains have finished, as [`settle_wakes`]
 /// releases them.
 #[derive(Default)]
 struct Released {
     /// FORK.md §8.6 / #1807 — the envs whose pipe ends were released at their domain's finish.
     /// Released once: the release decrements the shared end counts.
-    envs: std::collections::BTreeSet<usize>,
+    domains: std::collections::BTreeSet<usize>,
     /// #2359 — the powerbox each is left holding: one empty `Host` for the run rather than a fresh
     /// one apiece, whose handle table alone is kilobytes.
     host: DomainCell,
@@ -12295,7 +12290,7 @@ struct Released {
 
 /// A run's scheduling core (#1414 3e): the task set and the state the scheduling rules read and
 /// write — the run-shared §12 fiber registry (+ its durable parallel arrays), the §14 confined
-/// child environments, the fork/teardown bookkeeping, and the logical clock.
+/// child domains, the fork/teardown bookkeeping, and the logical clock.
 #[derive(Default)]
 struct SchedCore {
     /// The live vCPUs: the root task (index 0) and its `thread.spawn`/`instantiate` descendants.
@@ -12304,16 +12299,16 @@ struct SchedCore {
     /// child's, fork twin's and exec'd image's as it starts. Each has its own window, powerbox,
     /// table, fuel and §12 fiber registry, which its vCPUs share, so a fiber created or suspended
     /// on one can be resumed on another (D57 migration).
-    extra_envs: Vec<ChildEnv>,
-    /// §12 teardown: child envs already torn down by a member's trap/exit (D37 death-is-revocation).
-    dead_envs: std::collections::BTreeSet<usize>,
+    domains: Vec<Domain>,
+    /// §12 teardown: child domains already torn down by a member's trap/exit (D37 death-is-revocation).
+    dead_domains: std::collections::BTreeSet<usize>,
     /// FORK.md §9.2 — fork twins minted this run (task index = the pid a `clone_caller` returned).
     forked_twins: std::collections::BTreeSet<usize>,
     /// #799/#1080 — fork twins whose personality **exit hooks have already fired** (Live → Zombie at
     /// their completion). Fired once, in the settle scan, before a personality `waitpid` re-execution
     /// reads the retired status (the bytecode port of the tree-walker's exit-hook-at-death step).
     hooked_twins: std::collections::BTreeSet<usize>,
-    /// The child envs whose domains have finished ([`Released`]).
+    /// The child domains whose domains have finished ([`Released`]).
     released: Released,
     /// The scheduler's logical clock, in ns: it moves by the ops of each quantum that runs out
     /// (#2224), and jumps to the earliest `wait` deadline when no task is runnable.
@@ -12494,7 +12489,7 @@ fn wire_run_bell(
 /// seen this round.
 fn settle_wakes(
     tasks: &mut [TaskSlot],
-    extra_envs: &mut [ChildEnv],
+    domains: &mut [Domain],
     forked_twins: &mut std::collections::BTreeSet<usize>,
     hooked_twins: &mut std::collections::BTreeSet<usize>,
     released: &mut Released,
@@ -12528,7 +12523,7 @@ fn settle_wakes(
         t.state = TaskState::Runnable;
     }
     for i in refused {
-        complete(tasks, extra_envs, i, Err(Trap::MemoryFault));
+        complete(tasks, domains, i, Err(Trap::MemoryFault));
     }
     // #1215 — the default-action TERMINATE, cooperative form (invariant 14). A domain the
     // personality has terminated (a `SIG_DFL` SIGKILL/SIGTERM/SIGINT delivered through the gate,
@@ -12546,7 +12541,7 @@ fn settle_wakes(
             if matches!(t.state, TaskState::Done(_)) {
                 return None;
             }
-            let dead = extra_envs[t.env]
+            let dead = domains[t.domain]
                 .host
                 .lock_unpoisoned()
                 .signal_poll()
@@ -12555,44 +12550,44 @@ fn settle_wakes(
         })
         .collect();
     for ti2 in killed {
-        complete(tasks, extra_envs, ti2, Err(Trap::ThreadFault));
+        complete(tasks, domains, ti2, Err(Trap::ThreadFault));
     }
-    // FORK.md §8.6 / #1807 — a child domain that has finished (every task on its env done, cleanly
+    // FORK.md §8.6 / #1807 — a child domain that has finished (every task on its domain done, cleanly
     // or not) releases its pipe ends once: the tree-walker's domain-finish `drop_all_pipe_*`. A
     // producer that exits lets its consumer see EOF; a consumer that exits (e.g. `head`) wakes a
     // parked producer to `-EPIPE`. What its window grew goes back with them (#1909). The root's end
     // is the run's, which its teardown handles.
     // Per child domain, `k - 1` for domain `k`: a run with none allocates nothing, every round.
-    let mut live = vec![false; extra_envs.len() - 1];
-    let mut seen = vec![false; extra_envs.len() - 1];
-    for t in tasks.iter().filter(|t| t.env != 0) {
-        seen[t.env - 1] = true;
-        live[t.env - 1] |= !matches!(t.state, TaskState::Done(_));
+    let mut live = vec![false; domains.len() - 1];
+    let mut seen = vec![false; domains.len() - 1];
+    for t in tasks.iter().filter(|t| t.domain != 0) {
+        seen[t.domain - 1] = true;
+        live[t.domain - 1] |= !matches!(t.state, TaskState::Done(_));
     }
     let mut finished: Vec<usize> = Vec::new();
-    for k in 1..extra_envs.len() {
-        if seen[k - 1] && !live[k - 1] && released.envs.insert(k) {
-            let mut h = extra_envs[k].host.lock_unpoisoned();
+    for k in 1..domains.len() {
+        if seen[k - 1] && !live[k - 1] && released.domains.insert(k) {
+            let mut h = domains[k].host.lock_unpoisoned();
             h.release_memory();
             h.release_pipe_ends();
             // #1217 — a §14 child's end releases every service it held a live offer to, and the
             // pager its faults called (#2164): it can no longer call one, so a `svc.wait` there
             // answers `0` instead of waiting for it (a token, when no serve loop is parked yet),
             // as on the oracle (`client_gone_targets`).
-            let mut services = if extra_envs[k].nested {
+            let mut services = if domains[k].nested {
                 h.live_offer_providers()
             } else {
                 Vec::new()
             };
             // A domain with no spawner pages from the root's, as it always has.
             if h.pager.is_some() {
-                let pager = &extra_envs[extra_envs[k].spawner.unwrap_or(0)].host;
+                let pager = &domains[domains[k].spawner.unwrap_or(0)].host;
                 services.push(std::sync::Arc::clone(pager));
             }
             drop(h);
             for service in services {
                 service.lock_unpoisoned().set_client_gone();
-                if let Some(env) = domain_of(extra_envs, &service) {
+                if let Some(env) = domain_of(domains, &service) {
                     wake_serve_loops(tasks, env);
                 }
             }
@@ -12603,7 +12598,7 @@ fn settle_wakes(
     // Zombie in the process table), the bytecode port of the tree-walker's death-hook step. It
     // runs BEFORE the reap wakes below so a personality `waitpid` re-execution finds the twin
     // already retired. Gated on the twin registry + a not-yet-hooked marker; a twin is always
-    // its own env, so its host is `extra_envs[k]`. Two-phase (gather host + status, then fire).
+    // its own env, so its host is `domains[k]`. Two-phase (gather host + status, then fire).
     let to_hook: Vec<(usize, i64, usize)> = tasks
         .iter()
         .enumerate()
@@ -12611,16 +12606,16 @@ fn settle_wakes(
             // A twin is never in the root domain: the cheap test first, as every round scans every
             // task the run has had.
             TaskState::Done(res)
-                if t.env != 0 && forked_twins.contains(&ti2) && !hooked_twins.contains(&ti2) =>
+                if t.domain != 0 && forked_twins.contains(&ti2) && !hooked_twins.contains(&ti2) =>
             {
-                Some((ti2, super::reap_status(res), t.env))
+                Some((ti2, super::reap_status(res), t.domain))
             }
             _ => None,
         })
         .collect();
     for (ti2, status, k) in to_hook {
         // Its pipe ends were released above, with every finished domain's.
-        let hooks = extra_envs[k].host.lock_unpoisoned().exit_hooks.clone();
+        let hooks = domains[k].host.lock_unpoisoned().exit_hooks.clone();
         for h in hooks {
             h(status);
         }
@@ -12633,11 +12628,11 @@ fn settle_wakes(
     // left holding the run's one empty powerbox (#2359): a fresh one apiece grew a run by its
     // handle table per child.
     for k in finished {
-        let env = &mut extra_envs[k];
+        let env = &mut domains[k];
         env.mem = None;
         env.host = std::sync::Arc::clone(&released.host);
         env.fibers = FiberTables::default();
-        for t in tasks.iter_mut().filter(|t| t.env == k) {
+        for t in tasks.iter_mut().filter(|t| t.domain == k) {
             t.vm.vt.release();
             t.vm.suspended = None;
         }
@@ -12711,7 +12706,7 @@ fn settle_wakes(
             // #1171 — a STOPPED reader/writer is not re-admitted by an input/room wake: a
             // stopped process makes no progress, so a suspended foreground `cat` must not steal
             // the bytes the shell should read (it re-admits at its `SIGCONT`). Domain-scoped.
-            let h = extra_envs[t.env].host.lock_unpoisoned();
+            let h = domains[t.domain].host.lock_unpoisoned();
             if h.signal_poll().is_some_and(|(_, s)| s.stopped()) {
                 return None;
             }
@@ -12729,7 +12724,7 @@ fn settle_wakes(
     for ci in pipe_wakes {
         tasks[ci].state = TaskState::Runnable;
     }
-    refund_ended_windows(tasks, extra_envs, false);
+    refund_ended_windows(tasks, domains, false);
     // I48 — wake blocking-resume idlers: a `TaskState::BlockedOnFiber { fiber }` becomes
     // runnable once its fiber is woken (the idle-timer's `WAIT_TIMED_OUT`, a `notify`'s
     // `WAIT_WOKEN`, or the cap-completion drain). Its cursor was rewound to the resume op, so
@@ -12738,13 +12733,13 @@ fn settle_wakes(
     // woken during the previous step is seen this iteration.
     for t in tasks.iter_mut() {
         if let TaskState::BlockedOnFiber { fiber } = t.state {
-            let woken = match extra_envs[t.env].fibers.fibers.get(fiber) {
+            let woken = match domains[t.domain].fibers.fibers.get(fiber) {
                 Some(
                     FiberState::WaitParked { woken: Some(_), .. }
                     | FiberState::CapParked { woken: Some(_), .. },
                 ) => true,
                 Some(FiberState::HostParked { on, .. }) => {
-                    on.ready(&extra_envs[t.env].host.lock_unpoisoned())
+                    on.ready(&domains[t.domain].host.lock_unpoisoned())
                 }
                 _ => false,
             };
@@ -12776,7 +12771,7 @@ impl SchedCore {
         self.clock = self.clock.saturating_add(ns);
         time_out_due(
             &mut self.tasks,
-            &mut registries(&mut self.extra_envs),
+            &mut registries(&mut self.domains),
             self.clock,
         );
     }
@@ -12866,15 +12861,15 @@ impl SchedCore {
             }
         }
         drop(h);
-        let mut root = ChildEnv::root(std::mem::take(mem), host, table, fuel);
+        let mut root = Domain::root(std::mem::take(mem), host, table, fuel);
         root.fibers = fibers;
         Ok(SchedCore {
             tasks,
-            extra_envs: vec![root],
-            // §12 "Domain lifetime & teardown" (owner 2026-07-24): child envs already torn down by
+            domains: vec![root],
+            // §12 "Domain lifetime & teardown" (owner 2026-07-24): child domains already torn down by
             // a member's trap/exit — a later live call through one completes with an errno instead
             // of parking forever (D37 death-is-revocation; the tree-walker's dead-callee park probe).
-            dead_envs: std::collections::BTreeSet::new(),
+            dead_domains: std::collections::BTreeSet::new(),
             // FORK.md §9.2 — fork twins minted this run (task index = the pid a `clone_caller`
             // returned). The servicer-side `reap` (`wait`) acts only on ids in this allow-set (a
             // foreign/bogus pid is `-ECHILD`, never a park that hangs); an id is retired when reaped.
@@ -12918,7 +12913,7 @@ impl CoopSched {
         if let Some(e) = &programs.root {
             core.arm_tierup(e);
         }
-        let root = &core.extra_envs[0];
+        let root = &core.domains[0];
         let freeze_on_quiesce = root.host.lock_unpoisoned().is_durable()
             && root
                 .mem
@@ -12959,12 +12954,12 @@ impl CoopSched {
     fn pump(&mut self, source: &ModuleSource, budget: u64) -> Result<CoopStep, Trap> {
         let step = self.pump_to_pause(source, budget);
         let ended = match &step {
-            Ok(CoopStep::Done(_)) => !root_unwinding(&self.core.extra_envs),
+            Ok(CoopStep::Done(_)) => !root_unwinding(&self.core.domains),
             Ok(_) => false,
             Err(_) => true,
         };
         if ended {
-            refund_ended_windows(&mut self.core.tasks, &mut self.core.extra_envs, true);
+            refund_ended_windows(&mut self.core.tasks, &mut self.core.domains, true);
         }
         step
     }
@@ -12982,7 +12977,7 @@ impl CoopSched {
         // #1414 D4 — the embedder hears of a call it answers as the leaf makes it, once: one its
         // last bounce made, before anything runs.
         if let Some((ti, id)) = emit.bounce_call.take() {
-            let host = core.extra_envs[core.tasks[ti].env].host.lock_unpoisoned();
+            let host = core.domains[core.tasks[ti].domain].host.lock_unpoisoned();
             if *embedder_pumps && host.completions().is_host_owned(id) {
                 return Ok(CoopStep::CapPark { id });
             }
@@ -12996,8 +12991,8 @@ impl CoopSched {
         loop {
             let SchedCore {
                 tasks,
-                extra_envs,
-                dead_envs,
+                domains,
+                dead_domains,
                 forked_twins,
                 hooked_twins,
                 released,
@@ -13015,7 +13010,7 @@ impl CoopSched {
             // after the kill sweep, a terminate landing between the two had its ring folded into
             // the snapshot and the pump slept through a dead domain until the next unrelated ring.
             // `0` when unarmed.
-            let bell_gen = extra_envs[0]
+            let bell_gen = domains[0]
                 .host
                 .lock_unpoisoned()
                 .external_wake()
@@ -13024,7 +13019,7 @@ impl CoopSched {
             // member's trap/exit is terminal for its whole DOMAIN — run the teardown fixpoint
             // before reading the root's state, so a sibling's trap that killed the root domain
             // surfaces as the run's result (previously the root's timed wait simply outlived it).
-            teardown_domains(tasks, extra_envs, dead_envs);
+            teardown_domains(tasks, domains, dead_domains);
             // The root's result is the run's result (other vCPUs' effects are already reflected in it).
             if let TaskState::Done(res) = &tasks[0].state {
                 let res = res.clone();
@@ -13033,8 +13028,8 @@ impl CoopSched {
                 // fibers into theirs, while the registry is alive, before the window is snapshotted. A drive
                 // trap (out-of-scope fiber) surfaces as the run's result. `cont.*` durability is single-vCPU
                 // (the entry guard refuses `thread.*`), so only the root task owns fibers.
-                let (root, children) = extra_envs.split_at_mut(1);
-                let ChildEnv {
+                let (root, children) = domains.split_at_mut(1);
+                let Domain {
                     mem,
                     host,
                     table,
@@ -13072,8 +13067,8 @@ impl CoopSched {
                 // trap stays `Err(trap)` (the run's fatal trap), exactly as `drive` returned it.
                 return res.map(CoopStep::Done);
             }
-            drain_task_completions(tasks, extra_envs);
-            settle_wakes(tasks, extra_envs, forked_twins, hooked_twins, released);
+            drain_task_completions(tasks, domains);
+            settle_wakes(tasks, domains, forked_twins, hooked_twins, released);
             // #1198 — a Runnable task whose DOMAIN is stopped (SIGTSTP/SIGTTIN/SIGTTOU, before its
             // SIGCONT) must not be stepped: a stopped process makes no progress. The tree-walker won't
             // run a stopped process; the coop pick must skip it too, or a background job whose read
@@ -13081,8 +13076,8 @@ impl CoopSched {
             // instead of benching. It re-runs when SIGCONT clears the stop. Domain-scoped (invariant 12).
             // #1904 — the oracle's see-through (#1672): under a landing freeze a stopped domain runs to
             // its next freeze point, and `Op::CapCall` abandons each host call on the way.
-            let see_through = root_unwinding(extra_envs);
-            let domain_stopped = |i: usize| !see_through && process_stopped(extra_envs, &tasks[i]);
+            let see_through = root_unwinding(domains);
+            let domain_stopped = |i: usize| !see_through && process_stopped(domains, &tasks[i]);
             // #1157 — round-robin from `last_pick + 1` (wrapping) rather than lowest-index-first.
             let n = tasks.len();
             let Some(ti) = (1..=n)
@@ -13091,15 +13086,15 @@ impl CoopSched {
             else {
                 // #1904 — bring the parks through a freeze before any timer fires or the run is
                 // called deadlocked.
-                if freeze_step(tasks, forked_twins, &mut extra_envs[0], freeze_on_quiesce) {
+                if freeze_step(tasks, forked_twins, &mut domains[0], freeze_on_quiesce) {
                     continue;
                 }
                 // The punted calls outstanding (F2, FIBER_PARK.md), each in its domain's store
                 // (#2424): a fiber's `CapParked`, a task's `BlockedHostCap`.
-                let calls: Vec<_> = outstanding_calls(tasks, extra_envs)
+                let calls: Vec<_> = outstanding_calls(tasks, domains)
                     .into_iter()
                     .map(|(env, id)| {
-                        let h = extra_envs[env].host.lock_unpoisoned();
+                        let h = domains[env].host.lock_unpoisoned();
                         (h.completions(), id)
                     })
                     .collect();
@@ -13111,7 +13106,7 @@ impl CoopSched {
                 // call was made (#1414 D4).
                 if *embedder_pumps {
                     let owed = calls.iter().any(|(c, id)| c.is_host_owned(*id));
-                    match run_deadline(tasks, extra_envs) {
+                    match run_deadline(tasks, domains) {
                         Some(due) if due > *clock => {
                             return Ok(CoopStep::Idle {
                                 timer: Some(due - *clock),
@@ -13122,15 +13117,15 @@ impl CoopSched {
                     }
                 }
                 // #1979 — on the native driver the time to the earliest deadline passes first.
-                if *wall && wait_out(tasks, extra_envs, clock, &calls, bell_gen) {
+                if *wall && wait_out(tasks, domains, clock, &calls, bell_gen) {
                     continue;
                 }
                 // No runnable task: fire the earliest `wait` timeout — whole-vCPU waiters and
                 // event-parked fiber waiters alike (§3.6 slice 5a), in every domain.
-                if !fire_next_timeout(tasks, &mut registries(extra_envs), clock) {
+                if !fire_next_timeout(tasks, &mut registries(domains), clock) {
                     // #1146 slice 2 — before blocking, interrupt the parks a deliverable signal
                     // reached ([`interrupt_parks`]).
-                    if interrupt_parks(tasks, extra_envs) {
+                    if interrupt_parks(tasks, domains) {
                         continue;
                     }
                     // #1122 — every task is parked and no internal wake can come. A punted call
@@ -13139,7 +13134,7 @@ impl CoopSched {
                     // drives hands the idle state back to it (#1122 route (a): it feeds the
                     // terminal and pumps again, and the loop-top settle sees the deposit or the
                     // signal) instead of sleeping this thread on the bell.
-                    let bell = extra_envs[0].host.lock_unpoisoned().external_wake();
+                    let bell = domains[0].host.lock_unpoisoned().external_wake();
                     if calls.is_empty() {
                         match stalled(tasks, *embedder_pumps, bell.is_some()) {
                             Stalled::Idle => return Ok(CoopStep::Idle { timer: None }),
@@ -13159,7 +13154,7 @@ impl CoopSched {
                         bell.as_ref().map(|b| (b, bell_gen)),
                         None,
                     );
-                    drain_fiber_completions(extra_envs);
+                    drain_fiber_completions(domains);
                 }
                 continue;
             };
@@ -13175,7 +13170,7 @@ impl CoopSched {
                 let SpawnAsk { cmd, plan, dst } = *ask;
                 let r = spawn_task(
                     tasks,
-                    extra_envs,
+                    domains,
                     forked_twins,
                     leaf.as_ref(),
                     source,
@@ -13211,7 +13206,7 @@ impl CoopSched {
                             TaskState::BlockedHostCap { .. } | TaskState::BlockedOnFiber { .. }
                         )
                     {
-                        awaits_call = call_awaited(t, extra_envs).is_some();
+                        awaits_call = call_awaited(t, domains).is_some();
                     }
                 }
                 runnable >= 2 || awaits_call
@@ -13228,16 +13223,16 @@ impl CoopSched {
             };
 
             // This vCPU's domain: its table, fuel, window and fiber registry. `tasks[ti].vm.vt` and
-            // the domain borrow disjoint storage (`tasks` vs `extra_envs`), so the split borrow is
+            // the domain borrow disjoint storage (`tasks` vs `domains`), so the split borrow is
             // sound.
             //
             // The task's domain cell is locked for its step. Nothing a step runs locks it again:
             // a task never holds a live offer into its own domain (a self-serve grant lands in the
             // child only), so a live call always locks another domain's cell.
-            let cell = std::sync::Arc::clone(&extra_envs[tasks[ti].env].host);
+            let cell = std::sync::Arc::clone(&domains[tasks[ti].domain].host);
             let mut guard = cell.lock_unpoisoned();
             let durable = guard.is_durable();
-            let e = &mut extra_envs[tasks[ti].env];
+            let e = &mut domains[tasks[ti].domain];
             let mut ctx = RunCtx {
                 table: &e.table,
                 fuel: &mut e.fuel,
@@ -13266,7 +13261,7 @@ impl CoopSched {
                     leaf: Some(LeafCall { dst, results, .. }),
                 } = *s
                 else {
-                    complete(tasks, extra_envs, ti, Err(Trap::Malformed));
+                    complete(tasks, domains, ti, Err(Trap::Malformed));
                     continue;
                 };
                 let mut parked = None;
@@ -13289,9 +13284,9 @@ impl CoopSched {
                 charge_slice(slice_left, ctx.fuel.can_burn());
                 let mut made = None;
                 match (done, parked) {
-                    (Err(trap), _) => complete(tasks, extra_envs, ti, Err(trap)),
+                    (Err(trap), _) => complete(tasks, domains, ti, Err(trap)),
                     (Ok(_), Some((vm, stop))) => {
-                        let win = extra_envs[tasks[ti].env].mem.as_ref();
+                        let win = domains[tasks[ti].domain].mem.as_ref();
                         let call = match &stop {
                             VcpuStop::CapPending { id, .. } => Some(*id),
                             _ => None,
@@ -13308,7 +13303,7 @@ impl CoopSched {
                                 }));
                                 made = call;
                             }
-                            Err(trap) => complete(tasks, extra_envs, ti, Err(trap)),
+                            Err(trap) => complete(tasks, domains, ti, Err(trap)),
                         }
                     }
                     (Ok(vals), None) => {
@@ -13373,8 +13368,8 @@ impl CoopSched {
             // the rest of the run waits for its next pump. A call answered inside its submit is
             // not one it owes.
             let owned = |id| {
-                let env = core.tasks[ti].env;
-                let host = core.extra_envs[env].host.lock_unpoisoned();
+                let env = core.tasks[ti].domain;
+                let host = core.domains[env].host.lock_unpoisoned();
                 host.completions().is_host_owned(id)
             };
             if let Some(id) = made.filter(|&id| *embedder_pumps && owned(id)) {
@@ -13406,7 +13401,7 @@ impl CoopSched {
         if vals.len() < results.len() {
             complete(
                 &mut self.core.tasks,
-                &mut self.core.extra_envs,
+                &mut self.core.domains,
                 ti,
                 Err(Trap::Malformed),
             );
@@ -13426,7 +13421,7 @@ impl CoopSched {
             // #1896: the process ran whole: it returned from its entry.
             TierUpDst::Entry { .. } => complete(
                 &mut self.core.tasks,
-                &mut self.core.extra_envs,
+                &mut self.core.domains,
                 ti,
                 Ok(vals.collect()),
             ),
@@ -13443,12 +13438,7 @@ impl CoopSched {
             .pending_tierup
             .take()
             .expect("deliver_tierup_trap with no pending tier-up");
-        complete(
-            &mut self.core.tasks,
-            &mut self.core.extra_envs,
-            ti,
-            Err(trap),
-        );
+        complete(&mut self.core.tasks, &mut self.core.domains, ti, Err(trap));
     }
 
     /// #926 slice 2e — deliver a surfaced `Jit.invoke`'s emitted `f0` result slots into the paused
@@ -13465,7 +13455,7 @@ impl CoopSched {
         if vals.len() < results.len() {
             complete(
                 &mut self.core.tasks,
-                &mut self.core.extra_envs,
+                &mut self.core.domains,
                 ti,
                 Err(Trap::Malformed),
             );
@@ -13489,12 +13479,7 @@ impl CoopSched {
             .pending_jit
             .take()
             .expect("deliver_jit_invoke_trap with no pending invoke");
-        complete(
-            &mut self.core.tasks,
-            &mut self.core.extra_envs,
-            ti,
-            Err(trap),
-        );
+        complete(&mut self.core.tasks, &mut self.core.domains, ti, Err(trap));
     }
 }
 
@@ -13517,8 +13502,8 @@ impl SchedCore {
     ) -> Option<CoopStep> {
         let SchedCore {
             tasks,
-            extra_envs,
-            dead_envs,
+            domains,
+            dead_domains,
             forked_twins,
             hooked_twins,
             clock,
@@ -13533,9 +13518,9 @@ impl SchedCore {
             ..
         } = emit;
         match stop {
-            Err(trap) => complete(tasks, extra_envs, ti, Err(trap)),
+            Err(trap) => complete(tasks, domains, ti, Err(trap)),
             Ok(VcpuStop::Preempted) => {}
-            Ok(VcpuStop::Done(vals)) => complete(tasks, extra_envs, ti, Ok(vals)),
+            Ok(VcpuStop::Done(vals)) => complete(tasks, domains, ti, Ok(vals)),
             // #926 slice 2 — wasm-JIT tier-up: this task hit a call to an eligible function of
             // `module`, the program its `Vm` carries an emit for (#2248). `step_vcpu` has
             // already spilled the frame past the call, so the task is resumable with just the
@@ -13559,7 +13544,7 @@ impl SchedCore {
                 );
                 *pending_tierup = Some((ti, dst, results));
                 *pending_call = Some((module, func));
-                let window = extra_envs[tasks[ti].env].mem.as_ref();
+                let window = domains[tasks[ti].domain].mem.as_ref();
                 return Some(CoopStep::TierUp {
                     module,
                     func,
@@ -13580,7 +13565,7 @@ impl SchedCore {
                 | VcpuStop::PipeWrite { .. }
                 | VcpuStop::StdinPark),
             ) if tasks[ti].vm.vt.active_id != ROOT_FIBER => {
-                host_park_fiber(tasks, ti, extra_envs, &stop);
+                host_park_fiber(tasks, ti, domains, &stop);
             }
             Ok(VcpuStop::StdinPark) => {
                 tasks[ti].state = TaskState::BlockedStdin;
@@ -13602,13 +13587,13 @@ impl SchedCore {
             }) => {
                 // The enqueue already happened in the op exec (holding only the callee's lock).
                 // Wake any svc.wait-parked task of the callee's domain — the tree-walker's
-                // `svc_wake` — then park the caller on its ticket. The callee is a child env's
+                // `svc_wake` — then park the caller on its ticket. The callee is a child domain's
                 // domain, or the root's: a child calling back through a self-serve grant (#744).
-                let callee_env = domain_of(extra_envs, &callee);
+                let callee_env = domain_of(domains, &callee);
                 // §12 teardown / D37 death-is-revocation (owner 2026-07-24): a call through an
                 // already-torn-down callee can never be replied — complete with the probeable
                 // errno instead of parking forever (the tree-walker's dead-callee park probe).
-                if callee_env.is_some_and(|k| dead_envs.contains(&k)) {
+                if callee_env.is_some_and(|k| dead_domains.contains(&k)) {
                     tasks[ti].deliver(dst, Reg::from_i64(super::CAP_REVOKED));
                     return None;
                 }
@@ -13629,7 +13614,7 @@ impl SchedCore {
             Ok(VcpuStop::PageFault(addr)) => {
                 // Its pager is on its spawner's domain (a domain with no spawner's, the root's).
                 let paged = {
-                    let e = &extra_envs[tasks[ti].env];
+                    let e = &domains[tasks[ti].domain];
                     let export = e.host.lock_unpoisoned().pager;
                     export.and_then(|export| {
                         Some((
@@ -13642,12 +13627,12 @@ impl SchedCore {
                 // Only a paged child's window raises a fault, and a pager that is gone can never
                 // reply: either way it is a pagerless fault.
                 let Some((pager_env, export, sink)) =
-                    paged.filter(|&(p, ..)| !dead_envs.contains(&p))
+                    paged.filter(|&(p, ..)| !dead_domains.contains(&p))
                 else {
-                    complete(tasks, extra_envs, ti, Err(Trap::MemoryFault));
+                    complete(tasks, domains, ti, Err(Trap::MemoryFault));
                     return None;
                 };
-                let pager = std::sync::Arc::clone(&extra_envs[pager_env].host);
+                let pager = std::sync::Arc::clone(&domains[pager_env].host);
                 let ticket = pager.lock_unpoisoned().request_page(export, sink);
                 wake_serve_loops(tasks, pager_env);
                 if let Some(ticket) = ticket {
@@ -13666,13 +13651,13 @@ impl SchedCore {
                 // answer posted to the same store (#2495). A durable run waits inline, as the
                 // oracle's: `freeze_drive` has no cap-park re-derivation, so the freeze must never
                 // meet one (a host-answered call never reaches it, declined at dispatch).
-                let env = tasks[ti].env;
-                let comps = extra_envs[env].host.lock_unpoisoned().completions();
-                let durable = extra_envs[0].host.lock_unpoisoned().is_durable();
+                let env = tasks[ti].domain;
+                let comps = domains[env].host.lock_unpoisoned().completions();
+                let durable = domains[0].host.lock_unpoisoned().is_durable();
                 if durable {
                     tasks[ti].deliver(dst, Reg::from_i64(comps.wait(id)));
                 } else if tasks[ti].vm.vt.active_id != ROOT_FIBER {
-                    let e = &mut extra_envs[env];
+                    let e = &mut domains[env];
                     let (fibers, fiber_sp, mem) =
                         (&mut e.fibers.fibers, &mut e.fibers.sp, &mut e.mem);
                     let k = tasks[ti].vm.vt.active_id;
@@ -13700,7 +13685,7 @@ impl SchedCore {
                             )
                         },
                     );
-                    let mut host = extra_envs[env].host.lock_unpoisoned();
+                    let mut host = domains[env].host.lock_unpoisoned();
                     for (id, r) in claimed {
                         tape_answer(&mut host, id, r);
                     }
@@ -13720,12 +13705,11 @@ impl SchedCore {
                 arg,
                 dst,
             }) => {
-                let callee =
-                    grant_target(tasks, extra_envs, ti, child).map(|k| &extra_envs[k].host);
-                let parent = &extra_envs[tasks[ti].env].host;
+                let callee = grant_target(tasks, domains, ti, child).map(|k| &domains[k].host);
+                let parent = &domains[tasks[ti].domain].host;
                 match super::grant_into_running(parent, callee, arg as i32) {
                     Ok(h) => tasks[ti].deliver(dst, Reg::from_i32(h as i32)),
-                    Err(t) => complete(tasks, extra_envs, ti, Err(t)),
+                    Err(t) => complete(tasks, domains, ti, Err(t)),
                 }
             }
             Ok(VcpuStop::ChildOffer {
@@ -13741,15 +13725,15 @@ impl SchedCore {
                 // `thread.spawn` handle, whose domain is the caller's own: no domain holds an
                 // offer into itself, so a step never locks its own cell twice.
                 let export = arg as u32;
-                let callee = name_child(tasks, extra_envs, ti, child)
+                let callee = name_child(tasks, domains, ti, child)
                     .ok()
                     .flatten()
-                    .map(|(_, cidx)| tasks[cidx].env)
-                    .filter(|&k| k != tasks[ti].env)
-                    .map(|k| std::sync::Arc::clone(&extra_envs[k].host));
+                    .map(|(_, cidx)| tasks[cidx].domain)
+                    .filter(|&k| k != tasks[ti].domain)
+                    .map(|k| std::sync::Arc::clone(&domains[k].host));
                 let cap = callee.and_then(|callee: DomainCell| {
                     let (names, sigs) = callee.lock_unpoisoned().offer_shape(export)?;
-                    extra_envs[tasks[ti].env]
+                    domains[tasks[ti].domain]
                         .host
                         .lock_unpoisoned()
                         .wire_live_impl(&callee, export, &names, &sigs)
@@ -13777,11 +13761,11 @@ impl SchedCore {
                     };
                     // The server (this task) is the callee the caller parked on. In the fork
                     // topology the server is a spawned child (never the root).
-                    let server_env = tasks[ti].env;
+                    let server_env = tasks[ti].domain;
                     if server_env == 0 {
                         break 'fork super::EINVAL;
                     }
-                    let server_host = std::sync::Arc::clone(&extra_envs[server_env].host);
+                    let server_host = std::sync::Arc::clone(&domains[server_env].host);
                     // Locate the parked caller on `(ticket, this server)`. In the cooperative driver
                     // the caller has already parked (it enqueued + woke us before we ran), so a miss
                     // is defensive → degrade.
@@ -13811,10 +13795,10 @@ impl SchedCore {
                     else {
                         break 'fork super::EINVAL;
                     };
-                    let caller_env = tasks[caller_ti].env;
+                    let caller_env = tasks[caller_ti].domain;
                     // Only a bare root caller (no spawned children/threads, no live fiber chain)
                     // forks faithfully — the oracle's `bare` gate. Anything else degrades.
-                    let bare = fork_bare(tasks, extra_envs, caller_ti);
+                    let bare = fork_bare(tasks, domains, caller_ti);
                     // Duplicate the caller's window (private copy — fork does not share memory) and
                     // powerbox (own handle namespace, shared `Arc` backings). A root caller (no env)
                     // or a non-forkable window/powerbox fails closed to a single reply.
@@ -13826,7 +13810,7 @@ impl SchedCore {
                     // caller's reply slot.
                     let forked = if bare && live_tasks(tasks) < super::MAX_VCPUS {
                         Some(caller_env).filter(|&ck| ck != 0).and_then(|ck| {
-                            let env = &extra_envs[ck];
+                            let env = &domains[ck];
                             let at = (&tasks[caller_ti].vm.vt.active, caller_dst, reply_twin);
                             let (twin_mem, twin_host, live, twin_vt) =
                                 fork_process(&env.host, env.mem.as_ref(), twin_pid, at)?;
@@ -13843,8 +13827,8 @@ impl SchedCore {
                     // servable (flat; the owned-flat twin backing makes the tier-up shapes so
                     // on every target), and only if its calls dispatch through the table its
                     // program's emit reads (#2273). Otherwise it interprets, fail-closed.
-                    let program = extra_envs[ck].program;
-                    if !tierup_servable(twin_mem.as_ref(), extra_envs[0].mem.as_ref())
+                    let program = domains[ck].program;
+                    if !tierup_servable(twin_mem.as_ref(), domains[0].mem.as_ref())
                         || !child_runs_emit(program, &twin_host)
                     {
                         twin_vt.active.tier_down();
@@ -13852,13 +13836,13 @@ impl SchedCore {
                     // The twin is its own domain: a fresh env over the private window + duplicated
                     // powerbox, its own dispatch table seeded with the caller's installs (#1297),
                     // the caller's env fuel.
-                    let twin_table = extra_envs[ck].table.fork();
-                    let twin_eidx = extra_envs.len();
-                    extra_envs.push(ChildEnv {
+                    let twin_table = domains[ck].table.fork();
+                    let twin_eidx = domains.len();
+                    domains.push(Domain {
                         mem: twin_mem,
                         host: twin_host.into_cell(),
                         table: std::sync::Arc::new(twin_table),
-                        fuel: extra_envs[ck].fuel.for_thread(),
+                        fuel: domains[ck].fuel.for_thread(),
                         fibers: FiberTables::default(),
                         spawner: None,
                         nested: false,
@@ -13890,11 +13874,11 @@ impl SchedCore {
                     let Some((ticket, _)) = tasks[ti].vm.vt.active.serve_ticket() else {
                         break 'reap super::EINVAL;
                     };
-                    let server_env = tasks[ti].env;
+                    let server_env = tasks[ti].domain;
                     if server_env == 0 {
                         break 'reap super::EINVAL;
                     }
-                    let server_host = std::sync::Arc::clone(&extra_envs[server_env].host);
+                    let server_host = std::sync::Arc::clone(&domains[server_env].host);
                     let caller_ti = tasks.iter().position(|t| {
                         matches!(&t.state,
                         TaskState::BlockedTicket { ticket: tk, callee, .. }
@@ -13964,7 +13948,7 @@ impl SchedCore {
                 // rebuilt activation's window/host/table live.
                 let clean = tasks[ti].vm.vt.active.serve_ticket().is_none()
                     && tasks[ti].vm.vt.active_id == ROOT_FIBER
-                    && !extra_envs[0].host.lock_unpoisoned().is_durable();
+                    && !domains[0].host.lock_unpoisoned().is_durable();
                 if !clean {
                     refuse!(super::EINVAL);
                 }
@@ -13974,15 +13958,15 @@ impl SchedCore {
                 // The rebuilt activation lands where the task's `env` points, with the window the
                 // image was built in, which replaces the caller's. A leaf image runs whole from the
                 // task's next step ([`Vm::tier_up_leaf`]).
-                match tasks[ti].env {
+                match tasks[ti].domain {
                     0 => {
                         // Root: build against the root's window and powerbox, then migrate the task
                         // into a domain of its own holding the command powerbox, its module table
                         // (the root's maps module 0, not the pushed command) and the root domain's
                         // children, which stay the task's.
                         let built = exec_image_build(
-                            &mut extra_envs[0].host.lock_unpoisoned(),
-                            extra_envs[0].mem.as_ref(),
+                            &mut domains[0].host.lock_unpoisoned(),
+                            domains[0].mem.as_ref(),
                             source,
                             cmd,
                             grants_ptr,
@@ -13996,13 +13980,13 @@ impl SchedCore {
                             Err(e) => refuse!(e),
                             Ok(built) => {
                                 tasks[ti].vm.vt = built.vt;
-                                let root = &mut extra_envs[0];
+                                let root = &mut domains[0];
                                 // The root's window is released for the image's own.
                                 drop(root.mem.take());
                                 let fuel = root.fuel.for_thread();
                                 let children = std::mem::take(&mut root.children);
-                                let eidx = extra_envs.len();
-                                extra_envs.push(ChildEnv {
+                                let eidx = domains.len();
+                                domains.push(Domain {
                                     mem: Some(built.mem),
                                     host: built.host.into_cell(),
                                     table: std::sync::Arc::new(built.table),
@@ -14013,20 +13997,20 @@ impl SchedCore {
                                     program: tasks[ti].vm.vt.active.module as u32,
                                     children,
                                 });
-                                tasks[ti].env = eidx;
+                                tasks[ti].domain = eidx;
                             }
                         }
                     }
                     k => {
-                        // Fork twin: build against its confined env (its powerbox carries the
+                        // Fork twin: build against its confined domain (its powerbox carries the
                         // personality), then overwrite the env's window, host and table — the fuel
                         // and task id are kept.
-                        let host_arc = std::sync::Arc::clone(&extra_envs[k].host);
+                        let host_arc = std::sync::Arc::clone(&domains[k].host);
                         let built = {
                             let mut g = host_arc.lock_unpoisoned();
                             exec_image_build(
                                 &mut g,
-                                extra_envs[k].mem.as_ref(),
+                                domains[k].mem.as_ref(),
                                 source,
                                 cmd,
                                 grants_ptr,
@@ -14041,10 +14025,10 @@ impl SchedCore {
                             Err(e) => refuse!(e),
                             Ok(built) => {
                                 tasks[ti].vm.vt = built.vt;
-                                extra_envs[k].host = built.host.into_cell();
-                                extra_envs[k].table = std::sync::Arc::new(built.table);
-                                extra_envs[k].mem = Some(built.mem);
-                                extra_envs[k].program = tasks[ti].vm.vt.active.module as u32;
+                                domains[k].host = built.host.into_cell();
+                                domains[k].table = std::sync::Arc::new(built.table);
+                                domains[k].mem = Some(built.mem);
+                                domains[k].program = tasks[ti].vm.vt.active.module as u32;
                             }
                         }
                     }
@@ -14063,7 +14047,7 @@ impl SchedCore {
                 }
                 let r = spawn_task(
                     tasks,
-                    extra_envs,
+                    domains,
                     forked_twins,
                     leaf.as_ref(),
                     source,
@@ -14089,13 +14073,13 @@ impl SchedCore {
                 // the root's (e.g. `bash -c` forking). The twin shares the caller's budget node
                 // (`fork_powerbox`), so it draws from it as a thread would (#1944 slice 3). The
                 // live cap is checked first, as the oracle's `fork_vcpu` checks it (#2006).
-                let env = tasks[ti].env;
-                let room = fork_bare(tasks, extra_envs, ti) && live_tasks(tasks) < super::MAX_VCPUS;
+                let env = tasks[ti].domain;
+                let room = fork_bare(tasks, domains, ti) && live_tasks(tasks) < super::MAX_VCPUS;
                 let forked = if room {
-                    let win = extra_envs[env].mem.as_ref();
+                    let win = domains[env].mem.as_ref();
                     // The return-twice `0`; the parent keeps the twin's pid, set below.
                     let at = (&tasks[ti].vm.vt.active, dst, 0);
-                    fork_process(&extra_envs[env].host, win, twin_pid, at)
+                    fork_process(&domains[env].host, win, twin_pid, at)
                 } else {
                     None
                 };
@@ -14107,9 +14091,9 @@ impl SchedCore {
                         // #1080 / #1262 — the twin's own park door, so its own `fork()`/`waitpid()`
                         // park (a bash pipeline subshell is a twin that forks and waits its
                         // command), and its signal doors on the run's bell.
-                        wire_process(&twin_host, &extra_envs[0].host);
+                        wire_process(&twin_host, &domains[0].host);
                         // #1297: the twin's own dispatch table, seeded with the caller's installs.
-                        let caller = &extra_envs[env];
+                        let caller = &domains[env];
                         let (twin_table, twin_fuel, program) = (
                             caller.table.fork(),
                             caller.fuel.for_thread(),
@@ -14117,20 +14101,20 @@ impl SchedCore {
                         );
                         // #816 env-routed tier-up: the clone carries the parent's bitmap; the twin
                         // may keep it only if its OWN private window (`fork_private`, pushed into
-                        // `extra_envs` below) is servable — the driver then answers each of the
+                        // `domains` below) is servable — the driver then answers each of the
                         // twin's events over that window via the pending-env routing. The
                         // owned-flat twin backing (#816 item 3) makes the tier-up shapes servable
                         // on every target; a twin still on the `Paged` fallback (unbounded
                         // reservation, allocation failure) is not. Nor is a twin whose calls would
                         // not dispatch through the table its program's emit reads (#2273). Either
                         // strips the bitmap so it interprets, fail-closed.
-                        if !tierup_servable(twin_mem.as_ref(), extra_envs[0].mem.as_ref())
+                        if !tierup_servable(twin_mem.as_ref(), domains[0].mem.as_ref())
                             || !child_runs_emit(program, &twin_host)
                         {
                             twin_vt.active.tier_down();
                         }
-                        let twin_eidx = extra_envs.len();
-                        extra_envs.push(ChildEnv {
+                        let twin_eidx = domains.len();
+                        domains.push(Domain {
                             mem: twin_mem,
                             host: twin_host.into_cell(),
                             table: std::sync::Arc::new(twin_table),
@@ -14170,23 +14154,23 @@ impl SchedCore {
                 dst,
                 module,
             }) => {
-                let node = extra_envs[tasks[ti].env].host.lock_unpoisoned().own_node();
+                let node = domains[tasks[ti].domain].host.lock_unpoisoned().own_node();
                 let payer = Some(node.clone());
                 let mut child = match thread_task(source, module as usize, func, sp, arg, payer) {
                     Ok(vt) => vt,
                     Err(t) => {
-                        complete(tasks, extra_envs, ti, Err(t));
+                        complete(tasks, domains, ti, Err(t));
                         return None;
                     }
                 };
                 if live_tasks(tasks) >= super::MAX_VCPUS {
-                    complete(tasks, extra_envs, ti, Err(Trap::ThreadFault)); // thread bomb
+                    complete(tasks, domains, ti, Err(Trap::ThreadFault)); // thread bomb
                     return None;
                 }
                 // #2001 — the thread is one `spawn` of its domain's node while it lives: a full
                 // ceiling refuses it as the live cap does.
                 let Some(live) = LiveVcpu::charge(node) else {
-                    complete(tasks, extra_envs, ti, Err(Trap::ThreadFault));
+                    complete(tasks, domains, ti, Err(Trap::ThreadFault));
                     return None;
                 };
                 // #926 slice 2, #2248: a `thread.spawn` child tiers up its own eligible calls when
@@ -14205,29 +14189,29 @@ impl SchedCore {
                 // context its root task holds (#1414 ED-2), and a child domain whose calls would not
                 // dispatch through the table the emit reads (#2273, [`child_runs_emit`]).
                 // A thread shares its spawner's domain: its window, powerbox and child table.
-                let env = tasks[ti].env;
-                let window = extra_envs[env].mem.as_ref();
+                let env = tasks[ti].domain;
+                let window = domains[env].mem.as_ref();
                 let dispatches =
-                    env == 0 || child_runs_emit(module, &extra_envs[env].host.lock_unpoisoned());
+                    env == 0 || child_runs_emit(module, &domains[env].host.lock_unpoisoned());
                 if let Some(e) = programs
                     .of(module)
-                    .filter(|_| dispatches && tierup_servable(window, extra_envs[0].mem.as_ref()))
+                    .filter(|_| dispatches && tierup_servable(window, domains[0].mem.as_ref()))
                 {
-                    let durable = extra_envs[env].host.lock_unpoisoned().is_durable();
+                    let durable = domains[env].host.lock_unpoisoned().is_durable();
                     child.active.tier_up(module, e, !durable);
                 }
                 let cidx = tasks.len();
                 // §12: its `vcpu.tls` starts at its id in its domain (#1775).
-                child.active.tls = extra_envs[env].host.lock_unpoisoned().next_vcpu_id();
+                child.active.tls = domains[env].host.lock_unpoisoned().next_vcpu_id();
                 // #2043 — a full child table refuses it as the live cap does.
-                if child_room(tasks, extra_envs, ti) {
+                if child_room(tasks, domains, ti) {
                     tasks.push(TaskSlot::new(child, env, live));
-                    match issue_child(tasks, extra_envs, ti, cidx) {
+                    match issue_child(tasks, domains, ti, cidx) {
                         Some(handle) => tasks[ti].deliver(dst, Reg::from_i32(handle)),
-                        None => complete(tasks, extra_envs, ti, Err(Trap::ThreadFault)),
+                        None => complete(tasks, domains, ti, Err(Trap::ThreadFault)),
                     }
                 } else {
-                    complete(tasks, extra_envs, ti, Err(Trap::ThreadFault));
+                    complete(tasks, domains, ti, Err(Trap::ThreadFault));
                 }
             }
             // §5 detached spawn (op 17): the child is a task of this executor over a
@@ -14241,8 +14225,8 @@ impl SchedCore {
             // the window before the child runs an op. `join` is the shared seam below.
             Ok(VcpuStop::InstantiateDetached { spawn, dst }) => {
                 let admitted = admit_detached_in_process(
-                    &mut extra_envs[tasks[ti].env].host.lock_unpoisoned(),
-                    extra_envs[tasks[ti].env].mem.as_ref(),
+                    &mut domains[tasks[ti].domain].host.lock_unpoisoned(),
+                    domains[tasks[ti].domain].mem.as_ref(),
                     spawn,
                     source,
                     |c| programs.for_child(&c.program, &c.host, source),
@@ -14254,7 +14238,7 @@ impl SchedCore {
                         return None;
                     }
                     Err(t) => {
-                        complete(tasks, extra_envs, ti, Err(t));
+                        complete(tasks, domains, ti, Err(t));
                         return None;
                     }
                 };
@@ -14265,19 +14249,19 @@ impl SchedCore {
                 // threads interpret (#1414 ED-2).
                 let own = child.mem.as_ref().is_some_and(|m| m.foreign_id().is_some());
                 let tierup = tierup.filter(|_| {
-                    own || tierup_servable(child.mem.as_ref(), extra_envs[0].mem.as_ref())
+                    own || tierup_servable(child.mem.as_ref(), domains[0].mem.as_ref())
                 });
-                let started = coop_start_child(tasks, extra_envs, ti, child, dst, tierup);
+                let started = coop_start_child(tasks, domains, ti, child, dst, tierup);
                 if let Err(t) = started {
-                    complete(tasks, extra_envs, ti, Err(t));
+                    complete(tasks, domains, ti, Err(t));
                 }
             }
             // PROCESS.md S3 — `poll`/`detach`/`kill`, as the tree-walker's op 9/10/12 arms: a
             // forged or spent handle is a `ThreadFault`, like `join`'s.
             Ok(VcpuStop::ChildCtl { child, dst, ctl }) => {
-                child_ctl(tasks, extra_envs, ti, child, dst, ctl);
+                child_ctl(tasks, domains, ti, child, dst, ctl);
             }
-            Ok(VcpuStop::Join { handle, dst }) => join_child(tasks, extra_envs, ti, handle, dst),
+            Ok(VcpuStop::Join { handle, dst }) => join_child(tasks, domains, ti, handle, dst),
             Ok(VcpuStop::Wait {
                 base,
                 expected,
@@ -14287,10 +14271,10 @@ impl SchedCore {
             }) => {
                 // The run's durability, the root's, which only a fiber's park reads: read it then.
                 let fiber = tasks[ti].vm.vt.active_id != ROOT_FIBER;
-                let durable = fiber && extra_envs[0].host.lock_unpoisoned().is_durable();
+                let durable = fiber && domains[0].host.lock_unpoisoned().is_durable();
                 // The wait is against THIS task's domain's registry and window. A child's `wait`
                 // on its mapped ring flag must not re-read an unrelated root byte.
-                let e = &mut extra_envs[tasks[ti].env];
+                let e = &mut domains[tasks[ti].domain];
                 futex_wait(
                     tasks,
                     ti,
@@ -14312,20 +14296,18 @@ impl SchedCore {
                 // notifying task's own memory + backing identity (mirrors the wait arm), so a notify
                 // from one child's window matches a waiter parked from another child's window on the
                 // same `SharedRegion` byte.
-                let win = |env: usize| extra_envs[env].mem.as_ref();
-                let key = futex_key_in(win(tasks[ti].env), base);
+                let win = |env: usize| domains[env].mem.as_ref();
+                let key = futex_key_in(win(tasks[ti].domain), base);
                 let want = count as u32;
                 let mut woken = wake_waiters(tasks, key, want, win);
                 // §3.6 slice 5a: then event-parked FIBER waiters, in every domain: the root's
-                // registry, then each child env's.
-                let regs = extra_envs
-                    .iter_mut()
-                    .flat_map(|e| e.fibers.fibers.iter_mut());
+                // registry, then each child domain's.
+                let regs = domains.iter_mut().flat_map(|e| e.fibers.fibers.iter_mut());
                 woken += wake_fiber_waiters(regs, key, want - woken);
                 tasks[ti].deliver(dst, Reg::from_i32(woken as i32));
             }
             // §22 install/uninstall ([`jit_install`], [`jit_uninstall`]) against the TASK's host
-            // and its own dispatch table: a §14 child's is `extra_envs[k].table`, so its installs
+            // and its own dispatch table: a §14 child's is `domains[k].table`, so its installs
             // stay out of the parent's `call.dyn` (#1296). #926 slice 2f / #1233: the B2 mirror
             // (`slot → (domain, unit)`, keyed on the unit so it survives the guest's `release`)
             // lets the browser driver rebuild its `WebAssembly.Table` when it moves; it is the
@@ -14334,27 +14316,27 @@ impl SchedCore {
             // events, or inside a tier-up region's bounce via `drive_nested`'s twin of these
             // arms, after which the driver re-syncs before the emitted frame resumes.
             Ok(VcpuStop::JitInstall { h, code, dst }) => {
-                let env = tasks[ti].env;
-                let host = &extra_envs[env].host;
+                let env = tasks[ti].domain;
+                let host = &domains[env].host;
                 let unit = host.lock_unpoisoned().resolve_jit_unit(h, code);
                 let record = |t, slot, u| host.lock_unpoisoned().jit_record_install(t, slot, u);
-                let table = &*extra_envs[env].table;
+                let table = &*domains[env].table;
                 let active = &mut tasks[ti].vm.vt.active;
                 if let Err(t) = jit_install(unit, source, table, active, dst, record) {
-                    complete(tasks, extra_envs, ti, Err(t));
+                    complete(tasks, domains, ti, Err(t));
                     return None;
                 }
             }
             Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
-                let env = tasks[ti].env;
-                let host = &extra_envs[env].host;
+                let env = tasks[ti].domain;
+                let host = &domains[env].host;
                 let jit_table = host.lock_unpoisoned().resolve_jit_domain(h);
                 let forget = |t, slot| host.lock_unpoisoned().jit_forget_install(t, slot);
-                let table = &*extra_envs[env].table;
+                let table = &*domains[env].table;
                 let active = &mut tasks[ti].vm.vt.active;
                 let cleared = jit_uninstall(jit_table, source, table, slot, active, dst, forget);
                 if let Err(t) = cleared {
-                    complete(tasks, extra_envs, ti, Err(t));
+                    complete(tasks, domains, ti, Err(t));
                     return None;
                 }
             }
@@ -14380,14 +14362,14 @@ impl SchedCore {
                 // and host (#1296); only the root's units surface to the emitted tier.
                 let root_emit = programs.root.as_ref();
                 let emittable = root_emit.is_some()
-                    && tasks[ti].env == 0
+                    && tasks[ti].domain == 0
                     && params.iter().all(scalar)
                     && results.iter().all(scalar);
                 let surfaced = if emittable {
                     // Resolve the unit's emitted wasm exactly as the browser FFI's resolver does
                     // (`jit_unit_wasm`), and the #717 committed-extent bound over the run's window
                     // (a `Jit.invoke` runs against the shared root powerbox/window).
-                    let mut g = extra_envs[0].host.lock_unpoisoned();
+                    let mut g = domains[0].host.lock_unpoisoned();
                     let wasm = g.resolve_jit_domain(h).ok().and_then(|domain| {
                         let (cd, cu) = g.resolve_jit_code(code).ok()?;
                         (cd == domain).then(|| g.jit_unit_wasm_or_emit(cd, cu))?
@@ -14396,7 +14378,7 @@ impl SchedCore {
                     drop(g);
                     // #1414 B6-3: emitted code addresses the window as one span, so a window
                     // backed without one runs the unit interpreted.
-                    let mapped = match extra_envs[0].mem.as_ref() {
+                    let mapped = match domains[0].mem.as_ref() {
                         None => Some(0),
                         Some(m) if !m.one_span() => None,
                         Some(m) if root_emit.is_some_and(|e| e.page_checked) => {
@@ -14417,24 +14399,24 @@ impl SchedCore {
                         params,
                         results,
                         mapped,
-                        memory: extra_envs[0].mem.as_ref().and_then(Mem::foreign_id),
+                        memory: domains[0].mem.as_ref().and_then(Mem::foreign_id),
                     });
                 }
                 // Interpreted ([`jit_invoke_unit`], [`run_invoke`]) over the TASK's domain: its
                 // window, table, host and fuel — a child's unit never sees the parent's window.
-                let env = tasks[ti].env;
-                let unit = extra_envs[env]
+                let env = tasks[ti].domain;
+                let unit = domains[env]
                     .host
                     .lock_unpoisoned()
                     .resolve_jit_unit(h, code);
-                let ChildEnv {
+                let Domain {
                     mem,
                     host,
                     table,
                     fuel,
                     fibers,
                     ..
-                } = &mut extra_envs[env];
+                } = &mut domains[env];
                 let parked = FiberRegRef::Owned(&fibers.fibers);
                 let ran = jit_invoke_unit(unit, source, table, &argv, &params, &results).and_then(
                     |(umod, args)| {
@@ -14456,7 +14438,7 @@ impl SchedCore {
                         set_slot_results(&mut tasks[ti].vm.vt.active, dst, &results, slots);
                     }
                     Err(t) => {
-                        complete(tasks, extra_envs, ti, Err(t));
+                        complete(tasks, domains, ti, Err(t));
                         return None;
                     }
                 }
@@ -14563,7 +14545,7 @@ pub struct Footprint {
 impl Footprint {
     /// What a run over `dom` holds: its root window `mem`, its children's windows `envs`, and the
     /// programs `dom` has compiled.
-    fn of(envs: &[ChildEnv], source: &ModuleSource) -> Footprint {
+    fn of(envs: &[Domain], source: &ModuleSource) -> Footprint {
         Footprint {
             windows: envs.iter().filter(|e| e.mem.is_some()).count(),
             units: source.len(),
@@ -14759,7 +14741,7 @@ impl ThreadsRun {
     fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
         let read = |m: Option<&Mem>| m.map_or(Err(Trap::Malformed), |m| m.read_window(addr, len));
         match &self.run {
-            Some(run) => read(run.state.lock_unpoisoned().core.extra_envs[0].mem.as_ref()),
+            Some(run) => read(run.state.lock_unpoisoned().core.domains[0].mem.as_ref()),
             None => read(self.ended().mem.as_ref()),
         }
     }
@@ -15093,8 +15075,10 @@ impl CoopRun {
     /// always agree on which window is live.
     fn pending_mem(&self) -> Option<&Mem> {
         let p = self.pump()?;
-        let env = self.pending_ti().map_or(0, |ti| p.sched.core.tasks[ti].env);
-        p.sched.core.extra_envs[env].mem.as_ref()
+        let env = self
+            .pending_ti()
+            .map_or(0, |ti| p.sched.core.tasks[ti].domain);
+        p.sched.core.domains[env].mem.as_ref()
     }
 
     /// #816: the pending round-trip task's domain — `-1` for the root domain, a child's domain index
@@ -15105,7 +15089,10 @@ impl CoopRun {
         let Some(p) = self.pump() else {
             return -1;
         };
-        match self.pending_ti().map_or(0, |ti| p.sched.core.tasks[ti].env) {
+        match self
+            .pending_ti()
+            .map_or(0, |ti| p.sched.core.tasks[ti].domain)
+        {
             0 => -1,
             k => k as i64,
         }
@@ -15147,10 +15134,10 @@ impl CoopRun {
 
     /// The run's **root** powerbox — where the root task and its `thread.spawn` threads' host I/O
     /// lands (stdout/stderr, the framebuffer). The cdylib drains it into its capture slots at the end
-    /// of a run. (§14 confined children keep their own `host` in `extra_envs`, not exposed here.)
+    /// of a run. (§14 confined children keep their own `host` in `domains`, not exposed here.)
     pub fn host_mut(&mut self) -> std::sync::MutexGuard<'_, Host> {
         match &mut self.exec {
-            CoopExec::Pump(p) => p.sched.core.extra_envs[0].host.lock_unpoisoned(),
+            CoopExec::Pump(p) => p.sched.core.domains[0].host.lock_unpoisoned(),
             CoopExec::Threads(t) => t.root.lock_unpoisoned(),
         }
     }
@@ -15159,7 +15146,7 @@ impl CoopRun {
     /// e.g. the pixels a parked `present` call names. `Err(Malformed)` for a memory-less run.
     pub fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
         match &self.exec {
-            CoopExec::Pump(p) => match p.sched.core.extra_envs[0].mem.as_ref() {
+            CoopExec::Pump(p) => match p.sched.core.domains[0].mem.as_ref() {
                 Some(m) => m.read_window(addr, len),
                 None => Err(Trap::Malformed),
             },
@@ -15173,7 +15160,7 @@ impl CoopRun {
     /// holds an installed unit's `f0`). It names the unit rather than the §22 code handle, which the
     /// guest may release once the unit is installed.
     pub fn slot_unit(&self, slot: u32) -> Option<(u32, u32)> {
-        self.pump()?.sched.core.extra_envs[0]
+        self.pump()?.sched.core.domains[0]
             .table
             .slot_unit(slot as usize)
     }
@@ -15183,7 +15170,7 @@ impl CoopRun {
     /// `WebAssembly.Table` at and rebuilds only when this moves.
     pub fn table_gen(&self) -> u32 {
         self.pump()
-            .map_or(0, |p| p.sched.core.extra_envs[0].table.gen())
+            .map_or(0, |p| p.sched.core.domains[0].table.gen())
     }
 
     /// #1009 paged tier-up: the pending task's window memory-map introspection ([`MemMapInfo`]) — a
@@ -15207,7 +15194,7 @@ impl CoopRun {
     /// What the run holds now ([`Footprint`]).
     pub fn footprint(&self) -> Footprint {
         match &self.exec {
-            CoopExec::Pump(p) => Footprint::of(&p.sched.core.extra_envs, &p.source),
+            CoopExec::Pump(p) => Footprint::of(&p.sched.core.domains, &p.source),
             CoopExec::Threads(t) => t.footprint(),
         }
     }
@@ -15391,7 +15378,7 @@ impl CoopRun {
             core:
                 SchedCore {
                     tasks,
-                    extra_envs,
+                    domains,
                     forked_twins,
                     hooked_twins,
                     clock,
@@ -15415,7 +15402,7 @@ impl CoopRun {
         let mut parked = None;
         // The paused task's domain: its window, powerbox, table and fuel — a child's own, never the
         // root's.
-        let e = &mut extra_envs[tasks[ti].env];
+        let e = &mut domains[tasks[ti].domain];
         // The registry `coop_bounce` threads into `drive_nested`: invoke-confined (`invoke_fibers`,
         // which lives as long as the invoke, across its bounces) during an emitted `Jit.invoke`, else
         // the domain's.
@@ -15455,7 +15442,7 @@ impl CoopRun {
         };
         // #1896: the call stopped. Its task waits with the rest of the call, and its host with the
         // emitted frames. A stop the leaf cannot wait on refuses, before the round-trip ends.
-        let win = extra_envs[tasks[ti].env].mem.as_ref();
+        let win = domains[tasks[ti].domain].mem.as_ref();
         let call = match &stop {
             VcpuStop::CapPending { id, .. } => Some(*id),
             _ => None,
@@ -15628,10 +15615,10 @@ mod dbg_domain_end_tests {
             charge: child.fiber_charge().expect("room"),
         });
         let table = || std::sync::Arc::new(build_table_for(1, 0, 0));
-        let root = ChildEnv::root(None, parent.into_cell(), table(), Fuel::fixed(0));
+        let root = Domain::root(None, parent.into_cell(), table(), Fuel::fixed(0));
         let mut envs = vec![
             root,
-            ChildEnv {
+            Domain {
                 mem: None,
                 host: child.into_cell(),
                 table: table(),
@@ -15643,7 +15630,7 @@ mod dbg_domain_end_tests {
                 children: temen_ir::handles::Table::new(),
             },
         ];
-        let held = |envs: &[ChildEnv]| {
+        let held = |envs: &[Domain]| {
             envs[0].host.lock_unpoisoned().capture_durable_budgets()[0]
                 .used
                 .mem
@@ -15726,12 +15713,12 @@ mod live_cap_tests {
     }
 
     /// A run at its live cap, every task in the root domain over `host`.
-    fn full_run(host: Host) -> (Vec<TaskSlot>, Vec<ChildEnv>) {
+    fn full_run(host: Host) -> (Vec<TaskSlot>, Vec<Domain>) {
         let tasks = (0..crate::MAX_VCPUS)
             .map(|_| TaskSlot::new(vtask(), 0, LiveVcpu::none()))
             .collect();
         let table = std::sync::Arc::new(build_table_for(1, 0, 0));
-        let root = ChildEnv::root(None, host.into_cell(), table, Fuel::fixed(0));
+        let root = Domain::root(None, host.into_cell(), table, Fuel::fixed(0));
         (tasks, vec![root])
     }
 
@@ -15817,7 +15804,7 @@ impl Threads {
     /// What a thread steps a task of domain `env` over: its own view of the domain's window and its
     /// own hand of the domain's fuel.
     fn hand(&self, env: usize) -> (Option<Mem>, Fuel) {
-        let e = &self.core.extra_envs[env];
+        let e = &self.core.domains[env];
         (
             e.mem.as_ref().map(Mem::fork_for_thread),
             e.fuel.for_thread(),
@@ -16370,12 +16357,12 @@ impl ThreadRun {
         let mut core = std::mem::take(&mut g.core);
         let (over, fault) = (g.over.take(), g.fault);
         drop(g);
-        let footprint = Footprint::of(&core.extra_envs, &run.source);
+        let footprint = Footprint::of(&core.domains, &run.source);
         drop(run);
-        refund_ended_windows(&mut core.tasks, &mut core.extra_envs, true);
+        refund_ended_windows(&mut core.tasks, &mut core.domains, true);
         // The root's window goes back to the caller; the rest of the run, the root's fuel with it,
         // goes now.
-        let mem = core.extra_envs[0].mem.take();
+        let mem = core.domains[0].mem.take();
         drop(core);
         let result = over.unwrap_or(Err(Trap::ThreadFault));
         // #1720: the trap-origin fault address, first-wins, as the pump records it.
@@ -16394,7 +16381,7 @@ impl ThreadRun {
     /// What the run holds now ([`CoopRun::footprint`]).
     fn footprint(&self) -> Footprint {
         let g = self.state.lock_unpoisoned();
-        Footprint::of(&g.core.extra_envs, &self.source)
+        Footprint::of(&g.core.domains, &self.source)
     }
 }
 
@@ -16418,7 +16405,7 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
     let (mut mem, mut fuel) = (mem, fuel);
     let mut g = run.state.lock_unpoisoned();
     let park = std::sync::Arc::clone(&g.parks[ti]);
-    let mut env = g.core.tasks[ti].env;
+    let mut env = g.core.tasks[ti].domain;
     // An exec gives the task's domain the image's window, or moves the task into a domain of its
     // own: its thread steps over the new one.
     let mut exec = false;
@@ -16437,15 +16424,15 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
         if !runs {
             break;
         }
-        if exec || g.core.tasks[ti].env != env {
-            env = g.core.tasks[ti].env;
+        if exec || g.core.tasks[ti].domain != env {
+            env = g.core.tasks[ti].domain;
             (mem, fuel) = g.hand(env);
             tier.pages = PageTable::default();
         }
         std::mem::swap(&mut g.core.tasks[ti].vm, &mut vm);
         let mut exits = g.core.hooked_twins.len();
-        let host = std::sync::Arc::clone(&g.core.extra_envs[env].host);
-        let table = std::sync::Arc::clone(&g.core.extra_envs[env].table);
+        let host = std::sync::Arc::clone(&g.core.domains[env].host);
+        let table = std::sync::Arc::clone(&g.core.domains[env].table);
         release(g);
         let mut ctx = RunCtx {
             table: &table,
@@ -16942,12 +16929,7 @@ impl ThreadRun {
             Some(_) => {
                 debug_assert!(false, "executor 2 surfaced a pause it cannot serve");
                 emit.pending_tierup = None;
-                complete(
-                    &mut core.tasks,
-                    &mut core.extra_envs,
-                    ti,
-                    Err(Trap::CapFault),
-                );
+                complete(&mut core.tasks, &mut core.domains, ti, Err(Trap::CapFault));
                 None
             }
         };
@@ -16958,7 +16940,7 @@ impl ThreadRun {
         let mut made = Vec::new();
         for j in had..g.core.tasks.len() {
             g.parks.push(std::sync::Arc::default());
-            let (mem, fuel) = g.hand(g.core.tasks[j].env);
+            let (mem, fuel) = g.hand(g.core.tasks[j].domain);
             made.push((j, mem, fuel));
         }
         // Each new task's thread counts in now, before it starts, so the run cannot end unseen.
@@ -16977,25 +16959,25 @@ impl ThreadRun {
     /// lock, so the run cannot go idle unseen.
     fn settle(&self, g: &mut Threads) {
         let core = &mut g.core;
-        teardown_domains(&mut core.tasks, &mut core.extra_envs, &mut core.dead_envs);
+        teardown_domains(&mut core.tasks, &mut core.domains, &mut core.dead_domains);
         core.clock = self.now();
         time_out_due(
             &mut core.tasks,
-            &mut registries(&mut core.extra_envs),
+            &mut registries(&mut core.domains),
             core.clock,
         );
         // F2: a fiber parked on a punted call wakes once the call completes; #2047: a task too.
         // #2424: in any domain.
-        drain_fiber_completions(&mut core.extra_envs);
-        drain_task_completions(&mut core.tasks, &core.extra_envs);
+        drain_fiber_completions(&mut core.domains);
+        drain_task_completions(&mut core.tasks, &core.domains);
         settle_wakes(
             &mut core.tasks,
-            &mut core.extra_envs,
+            &mut core.domains,
             &mut core.forked_twins,
             &mut core.hooked_twins,
             &mut core.released,
         );
-        interrupt_parks(&mut core.tasks, &core.extra_envs);
+        interrupt_parks(&mut core.tasks, &core.domains);
         if g.over.is_some() {
             return;
         }
@@ -17053,7 +17035,7 @@ impl ThreadRun {
     fn missed_wake(&self, core: &SchedCore, ti: usize, exits: usize) -> bool {
         match core.tasks[ti].state {
             TaskState::BlockedSvc => {
-                let h = &core.extra_envs[core.tasks[ti].env].host;
+                let h = &core.domains[core.tasks[ti].domain].host;
                 let h = h.lock_unpoisoned();
                 !h.svc_queue.is_empty() || h.client_gone
             }
@@ -17066,7 +17048,7 @@ impl ThreadRun {
     /// SIGCONT): a stopped process makes no progress, so its runnable task is not stepped, as the
     /// pump's pick skips it.
     fn stopped(&self, core: &SchedCore, ti: usize) -> bool {
-        process_stopped(&core.extra_envs, &core.tasks[ti])
+        process_stopped(&core.domains, &core.tasks[ti])
     }
 
     /// What task `ti`'s thread waits for while the task is parked, or runnable in a stopped process.
@@ -17083,7 +17065,7 @@ impl ThreadRun {
             | TaskState::BlockedStdin => ParkFor::Poll,
             TaskState::BlockedHostCap { id, .. } => ParkFor::Answer(id),
             TaskState::BlockedOnFiber { fiber } => {
-                match core.extra_envs[t.env].fibers.fibers.get(fiber) {
+                match core.domains[t.domain].fibers.fibers.get(fiber) {
                     Some(FiberState::WaitParked {
                         deadline: Some(d),
                         woken: None,
@@ -17122,10 +17104,10 @@ impl ThreadRun {
 
     /// Whether a task waits on a host-answered call: one only the embedder answers (#1414 D4).
     fn owes(&self, core: &SchedCore) -> bool {
-        outstanding_calls(&core.tasks, &core.extra_envs)
+        outstanding_calls(&core.tasks, &core.domains)
             .into_iter()
             .any(|(env, id)| {
-                let h = core.extra_envs[env].host.lock_unpoisoned();
+                let h = core.domains[env].host.lock_unpoisoned();
                 h.completions().is_host_owned(id)
             })
     }
@@ -17150,8 +17132,8 @@ impl ThreadRun {
             // look once more first. An embedder that pumps the run hears of a call it answers
             // as soon as the call is filed (#1414 D4), while the run's other tasks go on.
             ParkFor::Answer(id) if self.watched => {
-                let env = g.core.tasks[ti].env;
-                let comps = g.core.extra_envs[env].host.lock_unpoisoned().completions();
+                let env = g.core.tasks[ti].domain;
+                let comps = g.core.domains[env].host.lock_unpoisoned().completions();
                 comps.set_notify(Some(super::ring_on_answer(&self.bell)));
                 let was_awake: Vec<bool> = g.core.tasks.iter().map(awake).collect();
                 self.settle(&mut g);
@@ -17228,10 +17210,10 @@ impl ThreadRun {
             return None;
         }
         let core = &g.core;
-        let waiting: Vec<u64> = outstanding_calls(&core.tasks, &core.extra_envs)
+        let waiting: Vec<u64> = outstanding_calls(&core.tasks, &core.domains)
             .into_iter()
             .filter(|&(env, id)| {
-                let h = core.extra_envs[env].host.lock_unpoisoned();
+                let h = core.domains[env].host.lock_unpoisoned();
                 h.completions().is_host_owned(id)
             })
             .map(|(_, id)| id)
@@ -17247,8 +17229,7 @@ impl ThreadRun {
         }
         let core = &g.core;
         g.stalled.then(|| Watched::Idle {
-            timer: run_deadline(&core.tasks, &core.extra_envs)
-                .map(|d| d.saturating_sub(self.now())),
+            timer: run_deadline(&core.tasks, &core.domains).map(|d| d.saturating_sub(self.now())),
         })
     }
 }
@@ -17270,12 +17251,7 @@ enum Watched {
 /// the joiner is delivered from its `dst` and it becomes runnable ([`super::join_delivery`]), or a
 /// thread's trap propagates — its joiner completes with the same trap (transitively, via the
 /// worklist).
-fn complete(
-    tasks: &mut [TaskSlot],
-    envs: &mut [ChildEnv],
-    ti: usize,
-    res: Result<Vec<Value>, Trap>,
-) {
+fn complete(tasks: &mut [TaskSlot], envs: &mut [Domain], ti: usize, res: Result<Vec<Value>, Trap>) {
     let mut work = vec![(ti, res)];
     while let Some((done, res)) = work.pop() {
         tasks[done].state = TaskState::Done(res.clone());
@@ -17309,11 +17285,11 @@ fn complete(
 /// for a spent handle (`-EBADF`), or the trap of a forged one ([`temen_ir::handles`]).
 fn name_child(
     tasks: &[TaskSlot],
-    envs: &[ChildEnv],
+    envs: &[Domain],
     ti: usize,
     handle: i32,
 ) -> Result<Option<(usize, usize)>, Trap> {
-    let table = &envs[tasks[ti].env].children;
+    let table = &envs[tasks[ti].domain].children;
     match table.name(handle) {
         temen_ir::handles::Named::Live(slot) => Ok(table.get(slot).map(|&c| (slot, c))),
         temen_ir::handles::Named::Spent => Ok(None),
@@ -17325,12 +17301,12 @@ fn name_child(
 /// joined once, and its slot is free to reissue.
 fn take_child(
     tasks: &[TaskSlot],
-    envs: &mut [ChildEnv],
+    envs: &mut [Domain],
     ti: usize,
     handle: i32,
     child: usize,
 ) -> bool {
-    let table = &mut envs[tasks[ti].env].children;
+    let table = &mut envs[tasks[ti].domain].children;
     match table.get_live(handle) {
         Some((slot, &c)) if c == child => table.retire(slot).is_some(),
         _ => false,
@@ -17338,14 +17314,14 @@ fn take_child(
 }
 
 /// Issue task `child` into task `ti`'s domain's table: its handle, or `None` when the table is full.
-fn issue_child(tasks: &[TaskSlot], envs: &mut [ChildEnv], ti: usize, child: usize) -> Option<i32> {
-    envs[tasks[ti].env].children.issue(child).ok()
+fn issue_child(tasks: &[TaskSlot], envs: &mut [Domain], ti: usize, child: usize) -> Option<i32> {
+    envs[tasks[ti].domain].children.issue(child).ok()
 }
 
 /// The live entries of task `ti`'s domain's table, as `(slot, task)`: what a scheduler trace compares
 /// across an advance.
-fn live_children(tasks: &[TaskSlot], envs: &[ChildEnv], ti: usize) -> Vec<(usize, usize)> {
-    envs[tasks[ti].env]
+fn live_children(tasks: &[TaskSlot], envs: &[Domain], ti: usize) -> Vec<(usize, usize)> {
+    envs[tasks[ti].domain]
         .children
         .live()
         .map(|(slot, &c)| (slot, c))
@@ -17353,22 +17329,22 @@ fn live_children(tasks: &[TaskSlot], envs: &[ChildEnv], ti: usize) -> Vec<(usize
 }
 
 /// Whether there is room in task `ti`'s domain's table for one more child.
-fn child_room(tasks: &[TaskSlot], envs: &[ChildEnv], ti: usize) -> bool {
-    let table = &envs[tasks[ti].env].children;
+fn child_room(tasks: &[TaskSlot], envs: &[Domain], ti: usize) -> bool {
+    let table = &envs[tasks[ti].domain].children;
     table.live().count() < temen_ir::handles::SLOTS
 }
 
 /// Whether child task `c`'s end is a value to joiner `ti`: a §14 child runs in a domain of its own,
 /// whose trap is a value (#2066), where a thread's trap is its domain's (INVARIANTS #6).
 fn ends_as_value(tasks: &[TaskSlot], ti: usize, c: usize) -> bool {
-    tasks[c].env != tasks[ti].env
+    tasks[c].domain != tasks[ti].domain
 }
 
 /// A join of child handle `handle`. A child that already finished delivers now, or its trap completes
 /// the joiner; else the joiner parks on it until [`complete`] wakes it. A spent handle delivers
 /// [`super::join_spent`]; a forged one completes the joiner with its trap. The entry says how the child
 /// ends ([`ends_as_value`]), so `thread.join` and `Instantiator.join` deliver alike.
-fn join_child(tasks: &mut [TaskSlot], envs: &mut [ChildEnv], ti: usize, handle: i32, dst: u32) {
+fn join_child(tasks: &mut [TaskSlot], envs: &mut [Domain], ti: usize, handle: i32, dst: u32) {
     let child = match name_child(tasks, envs, ti, handle) {
         Ok(Some((_, c))) => c,
         Ok(None) => return tasks[ti].deliver_from(dst, super::join_spent()),
@@ -17389,22 +17365,22 @@ fn join_child(tasks: &mut [TaskSlot], envs: &mut [ChildEnv], ti: usize, handle: 
 
 /// #2220 — the env of the child that handle `child` names, for an `Instantiator.grant` (op 19) from
 /// task `ti`: `None` for a bad or spent handle, a `thread.spawn` handle (it shares this task's env),
-/// or a child whose root task is done, which has ended — what `poll` reports — though its env is
+/// or a child whose root task is done, which has ended — what `poll` reports — though its domain is
 /// released only once its threads are done too.
-fn grant_target(tasks: &[TaskSlot], envs: &[ChildEnv], ti: usize, child: i32) -> Option<usize> {
+fn grant_target(tasks: &[TaskSlot], envs: &[Domain], ti: usize, child: i32) -> Option<usize> {
     let (_, c) = name_child(tasks, envs, ti, child).ok()??;
     if matches!(tasks[c].state, TaskState::Done(_)) {
         return None;
     }
-    (tasks[c].env != tasks[ti].env).then_some(tasks[c].env)
+    (tasks[c].domain != tasks[ti].domain).then_some(tasks[c].domain)
 }
 
 /// PROCESS.md S3 `poll`/`detach`/`kill` of child handle `child`, the answer at `dst`. A `kill` ends
-/// the child's domain and the subtree it spawned ([`kill_env`]). A spent handle answers `-EBADF`
+/// the child's domain and the subtree it spawned ([`kill_domain`]). A spent handle answers `-EBADF`
 /// (#2667); a forged one completes the caller with its trap.
 fn child_ctl(
     tasks: &mut [TaskSlot],
-    envs: &mut [ChildEnv],
+    envs: &mut [Domain],
     ti: usize,
     child: i32,
     dst: u32,
@@ -17421,17 +17397,17 @@ fn child_ctl(
             TaskState::Done(Err(_)) => 2,
             _ => 0,
         },
-        // The result dies with its env; a window lease is refunded once the child is done
+        // The result dies with its domain; a window lease is refunded once the child is done
         // (`refund_ended_windows`); its lane went back at admission.
         ChildCtl::Detach => {
-            envs[tasks[ti].env].children.retire(slot);
+            envs[tasks[ti].domain].children.retire(slot);
             0
         }
         // A `thread.spawn` handle shares this task's env: nothing to kill, as on the tree-walker (no
         // `child_kill` entry).
         ChildCtl::Kill => {
-            if tasks[c].env != tasks[ti].env {
-                kill_env(tasks, envs, tasks[c].env);
+            if tasks[c].domain != tasks[ti].domain {
+                kill_domain(tasks, envs, tasks[c].domain);
             }
             0
         }
@@ -17443,9 +17419,9 @@ fn child_ctl(
 /// parked ([`complete`] overwrites any blocked state and wakes its joiners), then the domains it
 /// spawned, as the tree-walker's kill ends a child and its subtree. A domain with nothing left alive
 /// is left as it is, its children with it: killing a child that has ended does nothing.
-fn kill_env(tasks: &mut [TaskSlot], envs: &mut [ChildEnv], k: usize) {
+fn kill_domain(tasks: &mut [TaskSlot], envs: &mut [Domain], k: usize) {
     let live: Vec<usize> = (0..tasks.len())
-        .filter(|&i| tasks[i].env == k && !matches!(tasks[i].state, TaskState::Done(_)))
+        .filter(|&i| tasks[i].domain == k && !matches!(tasks[i].state, TaskState::Done(_)))
         .collect();
     if live.is_empty() {
         return;
@@ -17457,7 +17433,7 @@ fn kill_env(tasks: &mut [TaskSlot], envs: &mut [ChildEnv], k: usize) {
     }
     for j in 0..envs.len() {
         if envs[j].spawner == Some(k) {
-            kill_env(tasks, envs, j);
+            kill_domain(tasks, envs, j);
         }
     }
 }
@@ -17633,7 +17609,7 @@ fn next_timeout<'a>(
 
 /// The earliest deadline among a run's timed waits: its tasks', and its event-parked fibers' in
 /// every domain.
-fn run_deadline(tasks: &[TaskSlot], envs: &[ChildEnv]) -> Option<u64> {
+fn run_deadline(tasks: &[TaskSlot], envs: &[Domain]) -> Option<u64> {
     next_timeout(tasks, envs.iter().flat_map(|e| e.fibers.fibers.iter()))
 }
 
@@ -17645,22 +17621,22 @@ fn run_deadline(tasks: &[TaskSlot], envs: &[ChildEnv]) -> Option<u64> {
 #[cold]
 fn wait_out(
     tasks: &[TaskSlot],
-    extra_envs: &mut [ChildEnv],
+    domains: &mut [Domain],
     clock: &mut u64,
     calls: &[(std::sync::Arc<super::Completions>, u64)],
     seen: u64,
 ) -> bool {
-    let Some(left) = run_deadline(tasks, extra_envs)
+    let Some(left) = run_deadline(tasks, domains)
         .and_then(|next| next.checked_sub(*clock))
         .filter(|&l| l > 0)
     else {
         return false;
     };
     let began = sched_wall_now();
-    let woke = idle_wait(&extra_envs[0].host, calls, seen, left);
+    let woke = idle_wait(&domains[0].host, calls, seen, left);
     *clock += sched_wall_now().saturating_sub(began).min(left);
     if woke {
-        drain_fiber_completions(extra_envs);
+        drain_fiber_completions(domains);
     }
     woke
 }
@@ -17697,7 +17673,7 @@ fn idle_wait(
 /// `SIGCHLD` on a child's stop/continue transition wakes its blocked `waitpid`, matching the
 /// tree-walker (whose `Blocked::Stopped` insert drains the reap waiters). Returns whether it
 /// re-admitted any.
-fn interrupt_parks(tasks: &mut [TaskSlot], extra_envs: &[ChildEnv]) -> bool {
+fn interrupt_parks(tasks: &mut [TaskSlot], domains: &[Domain]) -> bool {
     let mut woke = false;
     for t in tasks.iter_mut() {
         // A pipe read/write OR a blocking stdin read (#1146 deeper) — the interruptible
@@ -17718,7 +17694,7 @@ fn interrupt_parks(tasks: &mut [TaskSlot], extra_envs: &[ChildEnv]) -> bool {
         // blocking `waitpid(WUNTRACED/WCONTINUED)` wakes when a child stops/continues
         // even with no async SIGCHLD delivery (bash: no sigaltstack). The re-run
         // `waitpid` reports the fresh stop/continue (report-once) and returns.
-        let mut h = extra_envs[t.env].host.lock_unpoisoned();
+        let mut h = domains[t.domain].host.lock_unpoisoned();
         let signals = h.signal_poll();
         let interrupt = signals.as_ref().is_some_and(|(_, s)| s.interrupt_pending());
         let reap = is_reap && signals.is_some_and(|(_, s)| s.reap_pending());
@@ -17773,7 +17749,7 @@ fn wake_waiters<'a>(
             addr, site, dst, ..
         } = t.state
         {
-            if site_key_in(win(t.env), addr, site) == key {
+            if site_key_in(win(t.domain), addr, site) == key {
                 t.deliver(dst, Reg::from_i32(super::WAIT_WOKEN));
                 t.state = TaskState::Runnable;
                 woken += 1;
@@ -17827,26 +17803,26 @@ fn time_out_waits(tasks: &mut [TaskSlot], clock: u64) {
 /// is "next safepoint" prompt in the cooperative model.
 fn teardown_domains(
     tasks: &mut [TaskSlot],
-    extra_envs: &mut [ChildEnv],
-    dead_envs: &mut std::collections::BTreeSet<usize>,
+    domains: &mut [Domain],
+    dead_domains: &mut std::collections::BTreeSet<usize>,
 ) {
     loop {
         let hit = tasks.iter().find_map(|t| {
             if let TaskState::Done(Err(trap)) = &t.state {
-                match t.env {
+                match t.domain {
                     // The root domain: a live member left means the sweep hasn't run yet (once
                     // every member is Done the caller's root check ends the run).
                     0 if tasks
                         .iter()
-                        .any(|u| u.env == 0 && !matches!(u.state, TaskState::Done(_))) =>
+                        .any(|u| u.domain == 0 && !matches!(u.state, TaskState::Done(_))) =>
                     {
                         return Some((0, *trap));
                     }
                     0 => {}
-                    // A child domain is processed exactly once (`dead_envs` is the marker), even
+                    // A child domain is processed exactly once (`dead_domains` is the marker), even
                     // when the trapping member was its only vCPU — a later call through it must
                     // still find it dead (errno, not a deadlock).
-                    k if !dead_envs.contains(&k) => {
+                    k if !dead_domains.contains(&k) => {
                         return Some((k, *trap));
                     }
                     _ => {}
@@ -17856,19 +17832,19 @@ fn teardown_domains(
         });
         let Some((env, trap)) = hit else { return };
         if env != 0 {
-            dead_envs.insert(env);
+            dead_domains.insert(env);
         }
         for i in 0..tasks.len() {
-            if tasks[i].env == env && !matches!(tasks[i].state, TaskState::Done(_)) {
-                complete(tasks, extra_envs, i, Err(trap));
+            if tasks[i].domain == env && !matches!(tasks[i].state, TaskState::Done(_)) {
+                complete(tasks, domains, i, Err(trap));
             }
         }
         // The dying child's undelivered dispatches: wake every caller parked on a ticket
         // against its host with the probeable errno (queued or admitted — no reply will ever
-        // come), and drop the queue. Later calls are refused at the LiveCall arm (`dead_envs`).
+        // come), and drop the queue. Later calls are refused at the LiveCall arm (`dead_domains`).
         // A fault parked on a page it was to supply is a pagerless one (#2164), and its sink goes.
         if env != 0 {
-            let dying = std::sync::Arc::clone(&extra_envs[env].host);
+            let dying = std::sync::Arc::clone(&domains[env].host);
             let mut stranded = Vec::new();
             for (i, t) in tasks.iter_mut().enumerate() {
                 match &t.state {
@@ -17888,7 +17864,7 @@ fn teardown_domains(
                 }
             }
             for i in stranded {
-                complete(tasks, extra_envs, i, Err(Trap::MemoryFault));
+                complete(tasks, domains, i, Err(Trap::MemoryFault));
             }
             let mut h = dying.lock_unpoisoned();
             h.svc_queue.clear();
@@ -19824,7 +19800,7 @@ impl Vm {
                 }
                 // §14 executor children — the Instantiator authority `(ibase, isize)` is resolved here
                 // (a forged/ungranted cap is an inert CapFault in place), then the driver builds the
-                // confined child (it owns the task set + the per-child environments).
+                // confined child (it owns the task set + the per-child domains).
                 Op::ChildCtl {
                     handle,
                     child,
