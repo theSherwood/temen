@@ -6276,12 +6276,14 @@ impl HostFn {
     /// to this host function. A host function confines guest pointers against the window values the
     /// emitted code hands it, so a wrong register (a backend bug) would move the window the host
     /// trusts; these tags pin the ones it would subvert. Positional, SysV integer-register order;
-    /// `Any`/trailing-unlisted arguments are unconstrained. Arguments past the sixth ride the stack
-    /// (the `call.cap` marshalling buffers, GcRoots' array, a fiber's status word) and are checked
-    /// in a PR 3b follow-up; `WindowSize`/`VmctxField`/`sret`-slot tags land with their facts.
+    /// `Any`/trailing-unlisted arguments are unconstrained. The register-position frame buffers (a
+    /// fiber's or thread's status word, a signal record, GcRoots' marshalling struct) are tagged
+    /// here so the validator clobbers only their bytes across the call; the `call.cap` buffers ride
+    /// the stack (arguments past the sixth) and are checked in a PR 3c follow-up, when stack-passed
+    /// arguments get facts, along with `WindowSize`/`WindowReserved` tags for the window constants.
     fn arg_contract(self) -> &'static [validate::ArgTag] {
         use validate::ArgTag::{Any, StackSlot, Vmctx, WindowBase};
-        // The host writes an 8-byte status word back through a fiber resume's `status_ptr`.
+        // An 8-byte status/exit word the host writes back through a resume's or join's `status_ptr`.
         const STATUS: validate::ArgTag = StackSlot {
             len: 8,
             write: true,
@@ -6289,7 +6291,7 @@ impl HostFn {
         match self {
             // ctx, mem_base, mem_size, mem_reserved, tid, op, handle, args_ptr, … (mem_size and
             // mem_reserved are window constants — their `WindowSize`/`WindowReserved` tags wait on
-            // the validator tracking those constants across the spill they often ride, PR 3b).
+            // the validator tracking those constants across the spill they often ride, PR 3c).
             HostFn::CapThunk => &[Any, WindowBase],
             // vmctx, mem_base, off, len, flags
             HostFn::PageMiss => &[Vmctx, WindowBase],
@@ -6297,6 +6299,24 @@ impl HostFn {
             HostFn::FiberResume => &[Any, Any, STATUS, Vmctx],
             // sched, k, arg, status_ptr, vmctx
             HostFn::FiberResumeBlock => &[Any, Any, Any, STATUS, Vmctx],
+            // sched, handle, status_ptr, vmctx — status_ptr-in-rdx, the same shape as FiberResume.
+            HostFn::ThreadJoin => &[Any, Any, STATUS, Vmctx],
+            // nursery, mem_base, instantiator, child, status_ptr, vmctx
+            HostFn::InstJoin => &[Any, WindowBase, Any, Any, STATUS, Vmctx],
+            // ctx, out — the host writes a 24-byte `[fref, signum, sp]` record into the out slot.
+            HostFn::SigTake => &[
+                Any,
+                StackSlot {
+                    len: 24,
+                    write: true,
+                },
+            ],
+            // args_ptr — one 80-byte marshalling struct the host only reads (the roots it collects
+            // go to a guest-memory `buf` field named inside it, never back into this frame).
+            HostFn::GcRoots => &[StackSlot {
+                len: 80,
+                write: false,
+            }],
             _ => &[],
         }
     }
@@ -6961,6 +6981,63 @@ fn host_args(name: &str) -> &'static [validate::ArgTag] {
         .iter()
         .find(|h| h.symbol() == name)
         .map_or(&[], |h| h.arg_contract())
+}
+
+#[cfg(test)]
+mod arg_contract_tests {
+    use super::*;
+    use validate::ArgTag::{Any, StackSlot, Vmctx, WindowBase};
+
+    /// #2534 — each host call that hands the host a pointer into the *caller's* frame must tag that
+    /// pointer at the exact SysV argument index the ABI puts it: the validator clobbers the slot at
+    /// that index's frame pointer (a wrong index would leave the real buffer's stale value trusted)
+    /// and checks the window/vmctx registers the host confines with. These pin the four PR 3c calls
+    /// against the call sites in `define_funcs`, and confirm `host_args` resolves the reloc symbol
+    /// the validator sees to the same contract.
+    #[test]
+    fn frame_buffer_host_calls_are_tagged_at_their_abi_positions() {
+        const W8: validate::ArgTag = StackSlot {
+            len: 8,
+            write: true,
+        };
+        // status_ptr in rdx (idx 2), vmctx in rcx — the FiberResume shape.
+        assert_eq!(HostFn::ThreadJoin.arg_contract(), &[Any, Any, W8, Vmctx]);
+        // mem_base in rsi (idx 1), status_ptr in r8 (idx 4), vmctx in r9.
+        assert_eq!(
+            HostFn::InstJoin.arg_contract(),
+            &[Any, WindowBase, Any, Any, W8, Vmctx]
+        );
+        // the 24-byte signal record in rsi (idx 1).
+        assert_eq!(
+            HostFn::SigTake.arg_contract(),
+            &[
+                Any,
+                StackSlot {
+                    len: 24,
+                    write: true
+                }
+            ]
+        );
+        // the 80-byte marshalling struct in rdi (idx 0), read-only.
+        assert_eq!(
+            HostFn::GcRoots.arg_contract(),
+            &[StackSlot {
+                len: 80,
+                write: false
+            }]
+        );
+        // The validator reads the contract by reloc symbol, so the wiring must agree.
+        assert_eq!(
+            host_args("temen.thread_join"),
+            HostFn::ThreadJoin.arg_contract()
+        );
+        assert_eq!(
+            host_args("temen.inst_join"),
+            HostFn::InstJoin.arg_contract()
+        );
+        assert_eq!(host_args("temen.sig_take"), HostFn::SigTake.arg_contract());
+        assert_eq!(host_args("temen.gc_roots"), HostFn::GcRoots.arg_contract());
+    }
 }
 
 /// Define `id` in `module` from `ctx`'s CLIF, compiled by [`compile_verified`], and return its code.

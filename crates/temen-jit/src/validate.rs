@@ -4616,6 +4616,87 @@ pub(crate) mod x86 {
             );
         }
 
+        /// #2534 — a host call that only *reads* a caller-frame buffer (GcRoots' marshalling struct)
+        /// clears nothing: the host does not write our stack through a read buffer, so even the
+        /// buffer's own slot survives — unlike a write buffer, whose bytes are dropped. The pointer
+        /// must still be a known frame slot, never a guest value forged into the argument register.
+        #[test]
+        fn a_read_buffer_call_spares_the_buffer_itself() {
+            // sub rsp,0x20; mov [rsp],rdi (a tracked value at −0x20, inside the buffer); lea rdi,[rsp]
+            // (the buffer pointer); movabs rax,<sym>; call rax; mov rax,[rsp] (reload −0x20); add; ret
+            let body = [
+                0x48, 0x83, 0xec, 0x20, // sub rsp, 0x20
+                0x48, 0x89, 0x3c, 0x24, // mov [rsp], rdi       (mem_base at −0x20)
+                0x48, 0x8d, 0x3c, 0x24, // lea rdi, [rsp]       (the buffer in rdi)
+                0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, // movabs rax, <sym>   (Abs8 at 14)
+                0xff, 0xd0, // call rax
+                0x48, 0x8b, 0x04, 0x24, // mov rax, [rsp]       (reload −0x20)
+                0x48, 0x83, 0xc4, 0x20, // add rsp, 0x20
+                0xc3, // ret
+            ];
+            let with = |c: Contract| {
+                run_with(
+                    &body,
+                    &[Reloc {
+                        at: 14,
+                        kind: R::Abs8,
+                        addend: 0,
+                        callee: Some(c),
+                    }],
+                )
+            };
+            // A read buffer (rdi): the host does not write it, so [−0x20] keeps the value we stored.
+            let read = with(Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(0),
+                args: &[ArgTag::StackSlot {
+                    len: 80,
+                    write: false,
+                }],
+            });
+            assert_eq!(
+                read.regs[0],
+                Fact::MemBase,
+                "a read-buffer call must not clear the buffer's own slot"
+            );
+            // The same call tagged as a *write* buffer drops the overlapping bytes (the control).
+            let write = with(Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(0),
+                args: &[ArgTag::StackSlot {
+                    len: 80,
+                    write: true,
+                }],
+            });
+            assert_eq!(
+                write.regs[0],
+                Fact::Unknown,
+                "a write-buffer call must drop the buffer's bytes"
+            );
+            // The pointer must be a real frame slot: with rdi left at its entry value (the window
+            // base, not a slot), the read-buffer argument is rejected.
+            let bad = checked(&[0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xd0, 0xc3]);
+            let f = check(
+                &bad,
+                &[Reloc {
+                    at: CHECK_LEN as u32 + 2,
+                    kind: R::Abs8,
+                    addend: 0,
+                    callee: Some(Contract {
+                        clobbers: SYSV_CLOBBERS,
+                        pops: Some(0),
+                        args: &[ArgTag::StackSlot {
+                            len: 80,
+                            write: false,
+                        }],
+                    }),
+                }],
+                Entry::Guest(&G),
+                Frame::UNKNOWN,
+            );
+            assert!(has(&f, "call argument 0"), "a forged read buffer: {f:?}");
+        }
+
         /// br_table's dispatch as Cranelift emits it (`JmpTableSeq` behind the index clamp), with
         /// the table's four entries pointing at four `ret`s after it. `entries` overrides them and
         /// `n` the clamp's bound, for the rejections below.
