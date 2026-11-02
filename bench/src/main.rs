@@ -44,6 +44,12 @@
 //!     timed run recompiles, but compile cost is identical at both counts so it cancels; for
 //!     Wasmtime the module is compiled once and only the call is timed. Either way the result
 //!     is per-iteration steady-state compute.
+//!   - the large count is sized per kernel so a sample runs about [`SAMPLE_SECS`] (#2634): at a
+//!     fixed 2M iterations a sub-nanosecond kernel's sample ran under a millisecond, and one
+//!     preemption moved it by tens of percent.
+//!   - the JIT runs each kernel at [`LAYOUTS`] code layouts (#2634): a loop that moves by a few
+//!     bytes can run up to 2× slower, so the JIT lane is the median over the layouts, and the table
+//!     shows their spread.
 //!   - *cold start* times the whole path source → first result (n=0, so the loop body never
 //!     runs but the full function is still compiled).
 //!
@@ -106,9 +112,8 @@ struct Kernel {
     /// return the *identical* value as the IR/WAT (the harness asserts it before timing). `None`
     /// for kernels with no pure-native analog (the `HostCall` interface kernels).
     native: Option<fn(i64) -> i64>,
-    /// Override `(n_big, n_small)` for the subtraction. `None` ⇒ the mode default (compute /
-    /// host-call). A knob for any future kernel whose per-iteration cost is large enough that the
-    /// 2M default span would make a pass too slow (none currently need it).
+    /// The least `(n_big, n_small)` span for the subtraction. `None` ⇒ the mode default (compute /
+    /// host-call). [`sized_span`] lengthens the big end so a sample runs about [`SAMPLE_SECS`].
     n_span: Option<(i64, i64)>,
 }
 
@@ -838,12 +843,22 @@ block 3 (v27: i64) {
     ),
     native: Some(native_cache),
     // Saturating span: both ends fault every page + reach cache steady state, so that fixed
-    // transient cancels (see the kernel doc). `Some` also selects reduced per-call counts.
+    // transient cancels (see the kernel doc).
     n_span: Some((800_000, 400_000)),
 };
 
 const N_SMALL: i64 = 1_000;
 const N_BIG: i64 = 2_000_000;
+/// #2634 — how long one sample (one timed run at the big end of a span) aims to run. At a fixed 2M
+/// iterations a sub-nanosecond kernel's sample ran under a millisecond, beside a JIT compile of about
+/// as much, so one preemption moved it by tens of percent.
+const SAMPLE_SECS: f64 = 0.03;
+/// Timed runs per sample, after one warm-up ([`per_call`]).
+const PER_SAMPLE: u32 = 3;
+/// #2634 — how many code layouts the JIT lane times each kernel at ([`padded`]). A loop that moves
+/// by a few bytes can run up to 2× slower, so one layout's time says as much about where the loop
+/// landed as about the code; the lane reports their median, and their spread.
+const LAYOUTS: usize = 4;
 // Host-call kernels do real boundary crossings per iteration (≫ a compute op), so they use a
 // smaller iteration span — still large enough that the subtraction isolates per-call cost.
 const N_HOST_SMALL: i64 = 1_000;
@@ -1715,28 +1730,67 @@ fn per_call(iters: u32, mut f: impl FnMut()) -> f64 {
     t.elapsed().as_secs_f64() / iters as f64
 }
 
-/// Per-iteration time (ns) of a compiled wasm entry, via subtraction over `[n_small, n_big]`
-/// (steady-state compute for `Compute` kernels; per-host-call for `HostCall` kernels).
-fn wasm_compute_ns(
-    store: &mut Store<HostState>,
-    run: &TypedFunc<i64, i64>,
-    n_big: i64,
-    n_small: i64,
-    pc: u32,
-) -> f64 {
-    let big = per_call(pc, || {
-        black_box(run.call(&mut *store, n_big).unwrap());
-    });
-    let small = per_call(pc, || {
-        black_box(run.call(&mut *store, n_small).unwrap());
-    });
+/// Per-iteration time (ns) of `run(n)`, by subtraction over the span `(n_big, n_small)`:
+/// steady-state compute for `Compute` kernels, one host crossing for `HostCall` ones. What a run costs
+/// besides its loop (the JIT's compile, a wasm call) is the same at both ends, so it cancels.
+fn per_iter_ns((n_big, n_small): (i64, i64), mut run: impl FnMut(i64)) -> f64 {
+    let big = per_call(PER_SAMPLE, || run(n_big));
+    let small = per_call(PER_SAMPLE, || run(n_small));
     (big - small) * 1e9 / (n_big - n_small) as f64
+}
+
+/// #2634 — `least` lengthened so its big end runs for about [`SAMPLE_SECS`] in a lane that spends
+/// `per_iter_ns` on an iteration.
+fn sized_span(per_iter_ns: f64, least: (i64, i64)) -> (i64, i64) {
+    let n = (SAMPLE_SECS * 1e9 / per_iter_ns.max(0.01)).min(1e9) as i64;
+    (n.max(least.0), least.1)
+}
+
+/// #2634 — `ir` with `units` no-op accesses at the top of its entry function's first block, ahead of
+/// its loop: each loads a word of the window and stores it back. No optimizer drops a store, so the
+/// loop's code moves by their bytes, and the kernel's result does not change. A module with no window
+/// gets a small one; the words sit just past the NULL guard (#1094).
+fn padded(ir: &str, entry: u32, units: usize) -> String {
+    if units == 0 {
+        return ir.to_string();
+    }
+    let mut out = String::new();
+    if !ir.lines().any(|l| l.starts_with("memory ")) {
+        out.push_str("memory 16\n");
+    }
+    let (mut funcs, mut done) = (0, false);
+    for line in ir.split_inclusive('\n') {
+        out.push_str(line);
+        funcs += u32::from(line.starts_with("func "));
+        if !done && funcs == entry + 1 && line.trim_start().starts_with("block 0 ") {
+            out.push_str("  vpad_at = i64.const 16384\n");
+            for u in 0..units {
+                let off = 8 * u;
+                out.push_str(&format!(
+                    "  vpad_{u} = i64.load vpad_at offset={off}\n  i64.store vpad_at vpad_{u} offset={off}\n"
+                ));
+            }
+            done = true;
+        }
+    }
+    assert!(done, "no entry block to pad");
+    out
+}
+
+/// The median of `v`, which it sorts.
+fn median(v: &mut [f64]) -> f64 {
+    v.sort_by(f64::total_cmp);
+    let n = v.len();
+    (v[(n - 1) / 2] + v[n / 2]) / 2.0
 }
 
 /// Raw per-iteration timings for one kernel (ns for compute, ms for cold start), each the
 /// **min over `reps`** measurements (best observed per engine — the noise floor we compare).
 struct Raw {
+    /// The JIT lane's per-iteration ns: the median of its [`LAYOUTS`].
     temen_ns: f64,
+    /// #2634 — the JIT lane's slowest layout over its fastest.
+    temen_spread: f64,
     w32_ns: f64,
     w64_ns: Option<f64>,
     /// The interp lane's per-iteration ns (`Compute` kernels only — `None` for `HostCall`).
@@ -1809,12 +1863,21 @@ fn optimize_ir(m: &temen_ir::Module, entry: u32, name: &str) -> (temen_ir::Modul
 /// Time one kernel, taking the **best (min)** of `reps` passes per engine. Cross-checks every
 /// engine agrees on the result first, so we never benchmark a miscompile.
 fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
-    let m = temen_text::parse_module(&k.ir).expect("parse our IR text");
-    let (m, entry) = if optimize {
-        optimize_ir(&m, k.entry, &k.name)
-    } else {
-        (m, k.entry)
-    };
+    // The JIT runs the kernel at `LAYOUTS` code layouts (#2634): its IR with 0, 1, … padding units
+    // ahead of the loop ([`padded`]). Layout 0 is the IR as written, which the interp lane and the
+    // cold start run.
+    let layouts: Vec<(temen_ir::Module, u32)> = (0..LAYOUTS)
+        .map(|units| {
+            let m = temen_text::parse_module(&padded(&k.ir, k.entry, units))
+                .expect("parse our IR text");
+            if optimize {
+                optimize_ir(&m, k.entry, &k.name)
+            } else {
+                (m, k.entry)
+            }
+        })
+        .collect();
+    let (m, entry) = (&layouts[0].0, layouts[0].1);
     // wasm32 bytes come either pre-compiled (the `irreducible` kernel's clang output) or by
     // assembling the hand-written WAT.
     let wasm32 = match &k.wasm32_bytes {
@@ -1827,32 +1890,33 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
         .map(|wat| wat::parse_str(wat).expect("assemble wasm64 WAT"));
     // `Compute` kernels time the inner loop; `HostCall` kernels make one host crossing per
     // iteration, so they use the no-cap vs cap-thunk Temen path, the import-linked wasm path, and
-    // a smaller iteration span (a host call ≫ a compute op). A kernel may override the span
-    // (`n_span`) — the cache-miss kernel does, since each iteration is DRAM-latency-bound.
-    let (n_big, n_small) = k.n_span.unwrap_or(match k.mode {
+    // a smaller least span (a host call ≫ a compute op). A kernel may set its own (`n_span`) — the
+    // cache-miss kernel does, since both ends must exceed its working set.
+    let least = k.n_span.unwrap_or(match k.mode {
         Mode::Compute => (N_BIG, N_SMALL),
         Mode::HostCall => (N_HOST_BIG, N_HOST_SMALL),
     });
-    let temen = |n: i64| match k.mode {
-        Mode::Compute => temen_call(&m, entry, &k.lead_args, n),
-        Mode::HostCall => temen_call_host(&m, entry, &k.lead_args, n),
+    let n_small = least.1;
+    let temen = |m: &temen_ir::Module, entry: u32, n: i64| match k.mode {
+        Mode::Compute => temen_call(m, entry, &k.lead_args, n),
+        Mode::HostCall => temen_call_host(m, entry, &k.lead_args, n),
     };
     let inst = |wasm: &[u8]| match k.mode {
         Mode::Compute => wasm_entry(engine, wasm),
         Mode::HostCall => wasm_entry_host(engine, wasm),
     };
-    // Per-call iteration counts for the timing loops. A kernel with a custom `n_span` (the
-    // memory-latency `cache` kernel) has ~tens-of-ns iterations over a large span, so each call is
-    // milliseconds — far fewer repeats still stabilise (and best-of-`reps` tightens it further),
-    // and the high default counts would make a pass take many seconds.
-    let (pc_temen, pc_wasm, pc_native, pc_interp) = if k.n_span.is_some() {
-        (6u32, 10u32, 10u32, 4u32)
-    } else {
-        (25u32, 100u32, 200u32, 8u32)
-    };
 
-    // Cross-check every engine agrees before timing (never benchmark a miscompile).
-    let ours = temen(n_small);
+    // Cross-check every engine, and every layout, agrees before timing (never benchmark a
+    // miscompile).
+    let ours = temen(m, entry, n_small);
+    for (lm, le) in &layouts[1..] {
+        assert_eq!(
+            ours,
+            temen(lm, *le, n_small),
+            "kernel `{}`: a padded layout disagrees",
+            k.name
+        );
+    }
     {
         let (mut s32, run32) = inst(&wasm32);
         assert_eq!(
@@ -1877,7 +1941,7 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
     if interp.is_some() {
         assert_eq!(
             ours,
-            interp_call(&m, entry, &k.lead_args, n_small),
+            interp_call(m, entry, &k.lead_args, n_small),
             "kernel `{}`: temen vs interp disagree",
             k.name
         );
@@ -1891,8 +1955,26 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
         );
     }
 
+    // #2634: one span for the JIT, wasm and native lanes, sized from wasm32 (whose timing holds no
+    // compile), and the interp lane's own.
+    let span = {
+        let (mut s32, run32) = inst(&wasm32);
+        let per = per_iter_ns(least, |n| {
+            black_box(run32.call(&mut s32, n).unwrap());
+        });
+        sized_span(per, least)
+    };
+    let interp_span = interp.map(|_| {
+        let least = (N_INTERP_BIG, N_INTERP_SMALL);
+        let per = per_iter_ns(least, |n| {
+            black_box(interp_call(m, entry, &k.lead_args, n));
+        });
+        sized_span(per, least)
+    });
+
     let mut raw = Raw {
         temen_ns: f64::INFINITY,
+        temen_spread: 1.0,
         w32_ns: f64::INFINITY,
         w64_ns: wasm64.as_ref().map(|_| f64::INFINITY),
         interp_ns: interp.map(|_| f64::INFINITY),
@@ -1900,57 +1982,45 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
         temen_cold: f64::INFINITY,
         wmt_cold: f64::INFINITY,
     };
+    let mut jit = [f64::INFINITY; LAYOUTS];
+    let min = |best: Option<f64>, v: f64| best.map(|b| b.min(v));
     for _ in 0..reps.max(1) {
         // --- per-iteration time (subtraction isolates the loop body / the host call) ---
-        let temen_big = per_call(pc_temen, || {
-            black_box(temen(n_big));
-        });
-        let temen_small = per_call(pc_temen, || {
-            black_box(temen(n_small));
-        });
-        raw.temen_ns = raw
-            .temen_ns
-            .min((temen_big - temen_small) * 1e9 / (n_big - n_small) as f64);
-
+        for (best, (lm, le)) in jit.iter_mut().zip(&layouts) {
+            *best = best.min(per_iter_ns(span, |n| {
+                black_box(temen(lm, *le, n));
+            }));
+        }
         let (mut s32, run32) = inst(&wasm32);
-        raw.w32_ns = raw
-            .w32_ns
-            .min(wasm_compute_ns(&mut s32, &run32, n_big, n_small, pc_wasm));
-
+        raw.w32_ns = raw.w32_ns.min(per_iter_ns(span, |n| {
+            black_box(run32.call(&mut s32, n).unwrap());
+        }));
         if let Some(w) = &wasm64 {
             let (mut s64, run64) = inst(w);
-            let v = wasm_compute_ns(&mut s64, &run64, n_big, n_small, pc_wasm);
-            raw.w64_ns = Some(raw.w64_ns.unwrap().min(v));
-        }
-
-        // --- interp lane: the same IR via the reference interpreter (its own smaller iteration
-        // span, since it is ~100–1000× slower; per-iteration cost is span-independent). ---
-        if raw.interp_ns.is_some() {
-            let ib = per_call(pc_interp, || {
-                black_box(interp_call(&m, entry, &k.lead_args, N_INTERP_BIG));
+            let v = per_iter_ns(span, |n| {
+                black_box(run64.call(&mut s64, n).unwrap());
             });
-            let is = per_call(pc_interp, || {
-                black_box(interp_call(&m, entry, &k.lead_args, N_INTERP_SMALL));
-            });
-            let v = (ib - is) * 1e9 / (N_INTERP_BIG - N_INTERP_SMALL) as f64;
-            raw.interp_ns = Some(raw.interp_ns.unwrap().min(v));
+            raw.w64_ns = min(raw.w64_ns, v);
         }
-
-        // --- native lane: the Rust twin (same big/small span as the VMs; setup cost cancels). ---
+        // --- interp lane: the same IR via the reference interpreter, over its own span (it is
+        // ~100–1000× slower; per-iteration cost is span-independent). ---
+        if let Some(span) = interp_span {
+            let v = per_iter_ns(span, |n| {
+                black_box(interp_call(m, entry, &k.lead_args, n));
+            });
+            raw.interp_ns = min(raw.interp_ns, v);
+        }
+        // --- native lane: the Rust twin (same span as the VMs; setup cost cancels). ---
         if let Some(nat) = k.native {
-            let nb = per_call(pc_native, || {
-                black_box(nat(n_big));
+            let v = per_iter_ns(span, |n| {
+                black_box(nat(n));
             });
-            let ns = per_call(pc_native, || {
-                black_box(nat(n_small));
-            });
-            let v = (nb - ns) * 1e9 / (n_big - n_small) as f64;
-            raw.native_ns = Some(raw.native_ns.unwrap().min(v));
+            raw.native_ns = min(raw.native_ns, v);
         }
 
         // --- cold start: source bytes → first result for a trivial (n=0) program (wasm32) ---
         let temen_cold = per_call(60, || {
-            black_box(temen(0));
+            black_box(temen(m, entry, 0));
         }) * 1e3;
         raw.temen_cold = raw.temen_cold.min(temen_cold);
         let wmt_cold = per_call(60, || {
@@ -1959,6 +2029,8 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
         }) * 1e3;
         raw.wmt_cold = raw.wmt_cold.min(wmt_cold);
     }
+    raw.temen_ns = median(&mut jit);
+    raw.temen_spread = jit[LAYOUTS - 1] / jit[0];
     raw
 }
 
@@ -1972,11 +2044,19 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 /// Write the tracked ratios to a baseline file (`NA` for a ratio the kernel lacks — no wasm64
 /// form, or no interp/native lane). The header documents what the numbers are + how to regenerate.
 fn save_baseline(path: &str, results: &[(Resolved, Raw)]) {
+    std::fs::write(path, baseline_text(results))
+        .unwrap_or_else(|e| panic!("write baseline `{path}`: {e}"));
+    eprintln!("wrote baseline to {path}");
+}
+
+/// The baseline file [`save_baseline`] writes for `results`.
+fn baseline_text(results: &[(Resolved, Raw)]) -> String {
     let mut out = String::from(
         "# temen-bench baseline — the tracked signal is the RATIO (temen / wasm), which is far more\n\
          # portable across machines than the absolute ns. `--check` flags any ratio that grew\n\
-         # past the tolerance (temen got relatively slower). Regenerate after an intended change:\n\
-         #   cargo run --release -- --save-baseline baseline.txt\n\
+         # past the tolerance (temen got relatively slower). Some ratios differ by up to 2x between\n\
+         # machines, so take the baseline on the machine that checks: the nightly bench job's log ends\n\
+         # with this file, as of that run. Elsewhere: cargo run --release -- --save-baseline FILE\n\
          # columns: kernel,compute_vs_wasm32,compute_vs_wasm64,cold_vs_wasmtime,interp_vs_jit,jit_vs_native\n",
     );
     let na = |v: Option<f64>| v.map(|x| format!("{x:.3}")).unwrap_or_else(|| "NA".into());
@@ -1992,8 +2072,7 @@ fn save_baseline(path: &str, results: &[(Resolved, Raw)]) {
             na(r.jit_vs_native),
         ));
     }
-    std::fs::write(path, out).unwrap_or_else(|e| panic!("write baseline `{path}`: {e}"));
-    eprintln!("wrote baseline to {path}");
+    out
 }
 
 /// One tracked baseline row loaded from a file.
@@ -2053,8 +2132,12 @@ fn check_baseline(path: &str, results: &[(Resolved, Raw)], tol: f64) -> bool {
     for (k, raw) in results {
         let Some(b) = base.get(k.name.as_str()) else {
             println!(
-                "{:<11} {:<16} {:>9} {:>9} {:>8}  MISSING",
-                k.name, "(all)", "-", "-", "-"
+                "{:<11} {:<16} {:>9} {:>9.3} {:>8}  MISSING (no row: nothing gates it)",
+                k.name,
+                "compute/wasm32",
+                "-",
+                raw.ratios().compute32,
+                "-"
             );
             continue;
         };
@@ -2098,6 +2181,12 @@ fn check_baseline(path: &str, results: &[(Resolved, Raw)], tol: f64) -> bool {
             row("jit/native", bv, cv, true);
         }
     }
+    // #2703: this run's ratios as a baseline file, so re-baselining on the machine that checks (the
+    // nightly runner) is a copy from its log.
+    println!(
+        "\nThis run as a baseline file:\n\n{}",
+        baseline_text(results)
+    );
     if ok {
         println!("\nOK - no ratio regressed past {:.0}%.", tol * 100.0);
     } else {
@@ -2123,14 +2212,17 @@ fn print_table(results: &[(Resolved, Raw)]) {
          slower today — call.cap is a generic arg-packing thunk; devirtualization (D45) is\n\
          deferred. `hostbuf` (a zero-copy (ptr,len) borrow buffer the host reads in place)\n\
          is temen-faster even vs a cached-memory wasm import — the §7 win. Host kernels have no\n\
-         interp/native lane (`—`); their ns/ratio are per *host call* (N_big={N_HOST_BIG}).\n\
-         N_big={N_BIG} N_small={N_SMALL}\n"
+         interp/native lane (`—`); their ns/ratio are per *host call*.\n\
+         Each lane's span is sized so a sample runs about {sample_ms:.0} ms. The JIT runs each kernel at\n\
+         {LAYOUTS} code layouts: `jit` is their median, `spread` their slowest over their fastest.\n",
+        sample_ms = SAMPLE_SECS * 1e3,
     );
     println!(
-        "{:<11} | {:>8} {:>8} {:>8} {:>6} {:>7} | {:>8} {:>6} | {:>8} {:>6} | {:>8} {:>8} {:>6}",
+        "{:<11} | {:>8} {:>8} {:>6} {:>8} {:>6} {:>7} | {:>8} {:>6} | {:>8} {:>6} | {:>8} {:>8} {:>6}",
         "kernel",
         "native",
         "jit",
+        "spread",
         "interp",
         "i/jit",
         "jit/nat",
@@ -2143,8 +2235,8 @@ fn print_table(results: &[(Resolved, Raw)]) {
         "ratio"
     );
     println!(
-        "{:<11} | {:>8} {:>8} {:>8} {:>6} {:>7} | {:>8} {:>6} | {:>8} {:>6} | {:>8} {:>8} {:>6}",
-        "", "ns/it", "ns/it", "ns/it", "", "", "ns/it", "", "ns/it", "", "cold ms", "cold ms", ""
+        "{:<11} | {:>8} {:>8} {:>6} {:>8} {:>6} {:>7} | {:>8} {:>6} | {:>8} {:>6} | {:>8} {:>8} {:>6}",
+        "", "ns/it", "ns/it", "", "ns/it", "", "", "ns/it", "", "ns/it", "", "cold ms", "cold ms", ""
     );
     let fmt_ns = |o: Option<f64>| o.map(|v| format!("{v:.3}")).unwrap_or_else(|| "—".into());
     let fmt_ratio = |o: Option<f64>| o.map(|v| format!("{v:.2}×")).unwrap_or_else(|| "—".into());
@@ -2155,10 +2247,11 @@ fn print_table(results: &[(Resolved, Raw)]) {
             _ => ("—".into(), "—".into()),
         };
         println!(
-            "{:<11} | {:>8} {:>8.3} {:>8} {:>6} {:>7} | {:>8.3} {:>5.2}× | {:>8} {:>6} | {:>8.4} {:>8.4} {:>5.2}×",
+            "{:<11} | {:>8} {:>8.3} {:>5.2}× {:>8} {:>6} {:>7} | {:>8.3} {:>5.2}× | {:>8} {:>6} | {:>8.4} {:>8.4} {:>5.2}×",
             k.name,
             fmt_ns(raw.native_ns),
             raw.temen_ns,
+            raw.temen_spread,
             fmt_ns(raw.interp_ns),
             fmt_ratio(r.interp_vs_jit),
             fmt_ratio(r.jit_vs_native),
@@ -2181,9 +2274,10 @@ fn print_csv(results: &[(Resolved, Raw)]) {
             (Some(v), Some(rr)) => (format!("{v:.3}"), format!("{rr:.3}")),
             _ => ("NA".into(), "NA".into()),
         };
-        // kernel, temen, wasm32, c32, wasm64, r64, temen_cold, wmt_cold, cold, interp, native, i/jit, jit/native
+        // kernel, temen, wasm32, c32, wasm64, r64, temen_cold, wmt_cold, cold, interp, native, i/jit,
+        // jit/native, the JIT's layout spread
         println!(
-            "{},{:.3},{:.3},{:.3},{w64s},{r64},{:.4},{:.4},{:.3},{},{},{},{}",
+            "{},{:.3},{:.3},{:.3},{w64s},{r64},{:.4},{:.4},{:.3},{},{},{},{},{:.3}",
             k.name,
             raw.temen_ns,
             raw.w32_ns,
@@ -2195,6 +2289,7 @@ fn print_csv(results: &[(Resolved, Raw)]) {
             na(raw.native_ns),
             na(r.interp_vs_jit),
             na(r.jit_vs_native),
+            raw.temen_spread,
         );
     }
 }
