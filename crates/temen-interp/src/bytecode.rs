@@ -6005,6 +6005,7 @@ fn trace_tags(tasks: &[TaskSlot]) -> Vec<(u8, u64)> {
 
 /// Diff task states across one advance by `actor` at `turn`, appending the park/wake/spawn events
 /// the transition implies. A task beyond `before`'s length is a fresh spawn by the actor.
+#[allow(clippy::too_many_arguments)]
 fn trace_diff(
     before: &[(u8, u64)],
     actor_depth: usize,
@@ -13290,7 +13291,6 @@ impl CoopSched {
                 )
                 .map(Nested::done);
                 charge_slice(slice_left, ctx.fuel.can_burn());
-                drop(ctx);
                 let mut made = None;
                 match (done, parked) {
                     (Err(trap), _) => complete(tasks, extra_envs, ti, Err(trap)),
