@@ -17,7 +17,7 @@
 //! env with a window of its own and an attenuated `Instantiator`+`AddressSpace` powerbox, paid from a
 //! `Budget`). Faithful for the interleaving-invariant programs the oracle uses; and §22
 //! **guest-driven JIT units** (`Jit.install`/`uninstall`/`invoke` + cross-module `call.dyn` into an
-//! installed unit) over a multi-module [`Domain`] (a runtime dispatch table spanning `mods`;
+//! installed unit) over a multi-module [`ModuleSource`] (each domain's runtime dispatch table spans its `mods`;
 //! `invoke` runs a unit nested over the shared window/table). Hot scalar/memory ops dispatch inline; the SIMD/`v128`/fence long
 //! tail is delegated to the reference [`super::eval_inst`]. Threads and fibers compose (the fiber
 //! registry is run-shared, so fibers migrate across vCPUs); and **tail calls** (`return_call`/
@@ -891,6 +891,20 @@ impl ModuleSource {
         ModuleSource::over(std::sync::Arc::new(primary))
     }
 
+    /// The run's program over `primary`, shared by every domain of the run. Over an already-`Arc`'d
+    /// primary, a caller that cached the compiled program across runs (#1144, the browser bash entry)
+    /// reuses it with a refcount bump; each run still wraps it in a fresh program, which pushes the
+    /// run's own §14 and exec'd units.
+    fn shared(primary: std::sync::Arc<Compiled>) -> std::sync::Arc<ModuleSource> {
+        std::sync::Arc::new(ModuleSource::over(primary))
+    }
+
+    /// The dispatch table a run's root domain starts with: the program's natural entries, with room
+    /// for `2^table_log2` §22 installs. Shared (`Arc`), so a thread steps over it unlocked.
+    fn root_table(&self, table_log2: u8) -> std::sync::Arc<SharedSlots> {
+        std::sync::Arc::new(build_table(self.primary().progs.len(), table_log2))
+    }
+
     /// [`ModuleSource::new`] over an already-`Arc`'d primary (the cross-run compiled-program cache,
     /// #1144): the shared `Arc<Compiled>` becomes `mods[0]` of a fresh source.
     fn over(primary: std::sync::Arc<Compiled>) -> ModuleSource {
@@ -1225,60 +1239,6 @@ fn build_table_for(n_funcs: usize, table_log2: u8, module: u32) -> SharedSlots {
 /// Build the primary's natural module-0 dispatch table.
 fn build_table(n_funcs: usize, table_log2: u8) -> SharedSlots {
     SharedSlots::new(n_funcs, table_log2, 0)
-}
-
-/// A running domain (THREADS.md 4c-domain): its shared [`ModuleSource`] (`mods[0]` = primary, `k≥1` =
-/// installed §22 units / §14 child modules) plus its own [`SharedSlots`] `call.dyn` dispatch table.
-/// Both parts are interior-mutable + thread-safe, so a **parallel** driver can share `&Domain` across
-/// vCPU threads and still `install`; the cooperative path is single-threaded (uncontended atomics/lock,
-/// so dispatch order — hence determinism — is unchanged). A §14 child / coroutine shares the root's
-/// `source` (its table's module indices resolve there) but carries its own `table`.
-struct Domain {
-    source: std::sync::Arc<ModuleSource>,
-    /// Shared (`Arc`) so a persistent reactor can keep one table across the frames it runs — a §22
-    /// `install` must outlive the frame that made it (#1296, the cross-tier bounce).
-    table: std::sync::Arc<SharedSlots>,
-}
-
-impl Domain {
-    fn new(primary: Compiled, table_log2: u8) -> Domain {
-        Domain::over_primary(std::sync::Arc::new(primary), table_log2)
-    }
-
-    /// A domain over an existing shared table — the persistent cross-tier reactor's frames
-    /// (`SharedProgram::run_over_grown_info`) all dispatch through one table, so a unit installed in
-    /// one bounce is reachable from the next.
-    fn child_shared(
-        source: std::sync::Arc<ModuleSource>,
-        table: std::sync::Arc<SharedSlots>,
-    ) -> Domain {
-        Domain { source, table }
-    }
-
-    /// Like [`Domain::new`], but over an **already-`Arc`'d** primary `Compiled` — so a caller that
-    /// cached the compiled program across runs (#1144, the browser bash entry) reuses it via a cheap
-    /// refcount bump instead of recompiling. A **fresh** `ModuleSource` still wraps it each run (a run
-    /// pushes its own §14/exec'd command units into `mods[1..]` and must not inherit a prior run's),
-    /// so only the immutable `mods[0]` program is shared.
-    fn over_primary(primary: std::sync::Arc<Compiled>, table_log2: u8) -> Domain {
-        let table = SharedSlots::new(primary.progs.len(), table_log2, 0);
-        Domain {
-            source: std::sync::Arc::new(ModuleSource::over(primary)),
-            table: std::sync::Arc::new(table),
-        }
-    }
-
-    /// A §14 confined-child domain over a (cloned `Arc`) **shared** `source` with its own dispatch
-    /// `table`. Sharing the source keeps the parent's module archive reachable by index (so an
-    /// `instantiate_module` child's pushed program resolves); the fresh `table` is the confinement —
-    /// it carries only the child's own natural entries, never the parent's installed §22 unit slots
-    /// (matching the tree-walker's `DomainTable::new(&cfuncs, 0)`).
-    fn child(source: std::sync::Arc<ModuleSource>, table: SharedSlots) -> Domain {
-        Domain {
-            source,
-            table: std::sync::Arc::new(table),
-        }
-    }
 }
 
 /// §22 `Jit.install` (op 3), as every bytecode driver services it. `unit` is the host's resolution of
@@ -3364,10 +3324,11 @@ pub fn compile_and_run_seeded_with_host(
     host.wire_park_door();
     // Size the dispatch table to the granted `Jit` table reservation (matching the tree-walker's
     // `DomainTable::new(funcs, jit_table_log2)`), so guest-driven `install` returns the same slots.
-    let dom = Domain::new(c, host.jit_table_log2());
+    let source = ModuleSource::shared(std::sync::Arc::new(c));
+    let table = source.root_table(host.jit_table_log2());
     let mut mem = Mem::root(m, default_reserved_log2(), None, init_mem);
     super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
-    let r = run(dom, func, args, fuel, &mut mem, host);
+    let r = run(source, table, func, args, fuel, &mut mem, host);
     // #1714: the faulting address of a `MemoryFault`, in the same per-run slot the tree-walker's
     // run funnel fills (`last_capture_fault_addr`) — this path dropped the window with it, so an
     // embedder of a plain run could not say *where* a segfault was. The scheduler records the
@@ -3412,10 +3373,11 @@ pub fn compile_and_run_with_host_traced(
     if func as usize >= c.progs.len() {
         return Some((Err(Trap::Malformed), Vec::new(), None));
     }
-    let dom = Domain::new(c, host.jit_table_log2());
+    let source = ModuleSource::shared(std::sync::Arc::new(c));
+    let table = source.root_table(host.jit_table_log2());
     let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
     let mut vm = match Vm::new(
-        &dom.source.primary(),
+        &source.primary(),
         func as usize,
         args,
         Some(host.own_node()),
@@ -3430,8 +3392,8 @@ pub fn compile_and_run_with_host_traced(
     let mut vfuel = Fuel::drawn(node);
     let r = loop {
         match vm.resume(
-            &dom.source,
-            &dom.table,
+            &source,
+            &table,
             &mut vfuel,
             &mut mem,
             &mut HostCell::Excl(&mut *host),
@@ -3441,7 +3403,7 @@ pub fn compile_and_run_with_host_traced(
             Ok(Outcome::Done(vals)) => break Some((Ok(vals), Vec::new(), None)),
             Ok(_) => break None, // a seam — out of single-vCPU debug scope (fall back to tree-walker)
             Err(t) => {
-                let bt = vm_trap_bt(&vm, &dom.source, &t);
+                let bt = vm_trap_bt(&vm, &source, &t);
                 // This single-step path only ever drives the **root** (a fiber/thread op is a seam →
                 // the `Ok(_)` arm above bails to the tree-walker), so a trap here is always the root —
                 // attributed `-1`, matching the JIT's root-trap convention.
@@ -3528,9 +3490,10 @@ pub fn compile_and_run_capture(
         return Some((Err(Trap::Malformed), Vec::new()));
     }
     let mut host = Host::new();
-    let dom = Domain::new(c, host.jit_table_log2());
+    let source = ModuleSource::shared(std::sync::Arc::new(c));
+    let table = source.root_table(host.jit_table_log2());
     let mut mem = Mem::root(m, default_reserved_log2(), None, init_mem);
-    let r = run(dom, func, args, fuel, &mut mem, &mut host);
+    let r = run(source, table, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
@@ -3560,14 +3523,15 @@ pub fn compile_and_run_capture_over(
         return Some((Err(Trap::Malformed), Vec::new()));
     }
     let mut host = Host::new();
-    let dom = Domain::new(c, host.jit_table_log2());
+    let source = ModuleSource::shared(std::sync::Arc::new(c));
+    let table = source.root_table(host.jit_table_log2());
     let mut mem = Mem::root(
         m,
         default_reserved_log2(),
         Some(std::sync::Arc::clone(&back)),
         init_mem,
     );
-    let r = run(dom, func, args, fuel, &mut mem, &mut host);
+    let r = run(source, table, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
@@ -3599,7 +3563,8 @@ pub fn compile_and_run_over_shared_with_host(
     if func as usize >= c.progs.len() {
         return Some(Err(Trap::Malformed));
     }
-    let dom = Domain::new(c, host.jit_table_log2());
+    let source = ModuleSource::shared(std::sync::Arc::new(c));
+    let table = source.root_table(host.jit_table_log2());
     // #1206: this `Mem` carries its own page map over the shared window, so it seeds the guard on
     // every call, as the cached form does; only the data waits for `seed_data`.
     let mut mem = m.memory.map(|mc| {
@@ -3613,14 +3578,14 @@ pub fn compile_and_run_over_shared_with_host(
             ..WindowSpec::default()
         })
     });
-    Some(run(dom, func, args, fuel, &mut mem, host))
+    Some(run(source, table, func, args, fuel, &mut mem, host))
 }
 
 /// A module compiled **once** for repeated runs over a caller-provided shared window — the cached form
 /// of [`compile_and_run_over_shared_with_host`]. The browser wasm-JIT reactor bounces a handful of
 /// interpreter helpers per frame through `env.call_interp`; recompiling the whole module on every bounce
 /// (as the one-shot does) dominates the frame — for Doom, ~6 ms × 3 calls ≈ 19 ms of a 20 ms frame. This
-/// holds the compiled source (a cheap `Arc` clone seeds each run's throwaway [`Domain`]) so a cross-tier
+/// holds the compiled source (a cheap `Arc` clone seeds each run's program and throwaway table) so a cross-tier
 /// run is just build-window + interpret, like [`Reactor`] but over the caller's shared window.
 pub struct SharedProgram {
     source: std::sync::Arc<ModuleSource>,
@@ -3754,11 +3719,12 @@ impl SharedProgram {
         if func as usize >= self.n_funcs {
             return (Err(Trap::Malformed), None, 0);
         }
-        // The domain over the shared compiled source (cheap: an `Arc` clone) — the reactor's persistent
-        // table when it keeps one, else a fresh natural table for this call.
-        let dom = match table {
-            Some(t) => Domain::child_shared(self.source.clone(), std::sync::Arc::clone(t)),
-            None => Domain::child(self.source.clone(), SharedSlots::new(self.n_funcs, 0, 0)),
+        // The shared compiled program (cheap: an `Arc` clone), and the reactor's persistent table
+        // when it keeps one, else a fresh natural table for this call.
+        let source = self.source.clone();
+        let table = match table {
+            Some(t) => std::sync::Arc::clone(t),
+            None => std::sync::Arc::new(SharedSlots::new(self.n_funcs, 0, 0)),
         };
         let mut mem = self.mem_size_log2.map(|sl| {
             let mut mm = Mem::from_spec(WindowSpec {
@@ -3778,7 +3744,7 @@ impl SharedProgram {
             }
             mm
         });
-        let out = run(dom, func, args, fuel, &mut mem, host);
+        let out = run(source, table, func, args, fuel, &mut mem, host);
         let (pages, mapped) = match mem.as_ref() {
             None => (Some((1, 0, 0, Vec::new())), 0),
             Some(m) => {
@@ -3807,8 +3773,8 @@ impl SharedProgram {
     /// #816 item 4 — a **cooperative tier-up run** over the shared compiled source, for a restorable
     /// warm session: the resumable [`CoopRun`] twin of [`run_over_grown`](Self::run_over_grown), so a
     /// page-managing warm guest's `eval_run` can tier its eligible leaves up onto emitted wasm
-    /// instead of evaluating interpreter-only. No recompile — the run's `Domain` is a cheap `Arc`
-    /// clone of the shared source plus a fresh dispatch table (sized by `host.jit_table_log2()`,
+    /// instead of evaluating interpreter-only. No recompile — the run's program is a cheap `Arc`
+    /// clone of the shared source, and its root domain a fresh dispatch table (sized by `host.jit_table_log2()`,
     /// the B2 convention [`CoopRun::new_over`] follows) — so a per-eval run is build-window +
     /// schedule, like `run_over_grown`. The window is **not** data-seeded (the caller already
     /// restored the warm image's bytes into `back`), the reservation is caller-chosen (clamp it to
@@ -3835,10 +3801,8 @@ impl SharedProgram {
         if entry as usize >= self.n_funcs {
             return Err(Trap::Malformed);
         }
-        let dom = Domain::child(
-            self.source.clone(),
-            build_table(self.n_funcs, host.jit_table_log2()),
-        );
+        let source = self.source.clone();
+        let table = std::sync::Arc::new(build_table(self.n_funcs, host.jit_table_log2()));
         let mem = self.mem_size_log2.map(|sl| {
             let mut mm = Mem::from_spec(WindowSpec {
                 reserved_log2,
@@ -3851,7 +3815,7 @@ impl SharedProgram {
             mm.seed_pages(prots.mapped(), &prots.entries());
             mm
         });
-        CoopRun::start(dom, mem, entry, args, fuel, host, tierup, image)
+        CoopRun::start(source, table, mem, entry, args, fuel, host, tierup, image)
     }
 }
 
@@ -3872,7 +3836,7 @@ impl SharedProgram {
 /// Scope: what the cooperative pump runs, but its emitted tier — the threads model, the
 /// `memory.wait`/`notify` futex, fibers (a fiber's futex wait parks the fiber, #2215), §14 children
 /// and serving, processes, and the §22 guest JIT (interpreted; installs land in the shared,
-/// interior-mutable [`Domain`] table). Returns `None` only if the module is outside the engine's
+/// interior-mutable root domain table). Returns `None` only if the module is outside the engine's
 /// subset, same as the cooperative entry.
 pub fn compile_and_run_capture_over_parallel(
     m: &Module,
@@ -3903,12 +3867,12 @@ pub fn compile_and_run_capture_over_parallel_with_host(
     back: Option<std::sync::Arc<super::Region>>,
     host: &mut Host,
 ) -> Option<Capture> {
-    let (dom, mem) = match parallel_domain(m, func, host, default_reserved_log2(), back, init_mem)?
-    {
-        Ok(start) => start,
-        Err(t) => return Some((Err(t), Vec::new())),
-    };
-    let (r, mem) = drive_threads(dom, func, args, fuel, mem, host);
+    let (source, table, mem) =
+        match parallel_domain(m, func, host, default_reserved_log2(), back, init_mem)? {
+            Ok(start) => start,
+            Err(t) => return Some((Err(t), Vec::new())),
+        };
+    let (r, mem) = drive_threads(source, table, func, args, fuel, mem, host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
@@ -3924,6 +3888,14 @@ pub fn compile_and_run_capture_over_parallel_with_host(
 /// outside the engine's subset, or `host` is durable (#1694): executor 2 has no freeze driver, so the
 /// caller runs it where durability is kept, rather than here silently non-durable. `Some(Err)` if
 /// `entry` is out of range.
+/// What a run on executor 2 starts over ([`parallel_domain`]): its program, and its root domain's
+/// table and window.
+type ParallelStart = (
+    std::sync::Arc<ModuleSource>,
+    std::sync::Arc<SharedSlots>,
+    Option<Mem>,
+);
+
 fn parallel_domain(
     m: &Module,
     entry: FuncIdx,
@@ -3931,7 +3903,7 @@ fn parallel_domain(
     reserved_log2: u8,
     back: Option<std::sync::Arc<super::Region>>,
     init_mem: &[u8],
-) -> Option<Result<(Domain, Option<Mem>), Trap>> {
+) -> Option<Result<ParallelStart, Trap>> {
     if host.is_durable() {
         return None;
     }
@@ -3939,9 +3911,14 @@ fn parallel_domain(
     if entry as usize >= c.progs.len() {
         return Some(Err(Trap::Malformed));
     }
-    let dom = Domain::new(c, host.jit_table_log2());
+    let source = ModuleSource::shared(std::sync::Arc::new(c));
+    let table = source.root_table(host.jit_table_log2());
     host.wire_park_door();
-    Some(Ok((dom, Mem::root(m, reserved_log2, back, init_mem))))
+    Some(Ok((
+        source,
+        table,
+        Mem::root(m, reserved_log2, back, init_mem),
+    )))
 }
 
 /// A persistent, single-vCPU **reactor instance** — the "instantiate once, call exports many times"
@@ -3960,7 +3937,7 @@ fn parallel_domain(
 /// `call(tick, …)` once per frame.
 pub struct Reactor {
     /// The compiled program, shared: each frame's domain wraps it in a fresh source and table
-    /// ([`Domain::over_primary`]), as a run over a kept program does (#1144).
+    /// ([`ModuleSource::shared`]), as a run over a kept program does (#1144).
     program: std::sync::Arc<Compiled>,
     /// The live guest window — retained across calls (this is the whole point). `None` for a
     /// memory-less module, and while a [`coop_call`](Self::coop_call) run holds it.
@@ -4004,8 +3981,9 @@ impl Reactor {
         tierup: Option<TierUpConfig>,
         image: Option<&Module>,
     ) -> Result<CoopRun, Trap> {
-        let dom = self.frame(func, &host)?;
-        CoopRun::start(dom, self.mem.take(), func, args, fuel, host, tierup, image)
+        let (source, table) = self.frame(func, &host)?;
+        let mem = self.mem.take();
+        CoopRun::start(source, table, mem, func, args, fuel, host, tierup, image)
     }
 
     /// Take back the window [`coop_call`](Self::coop_call) lent `run`, and the run's powerbox, once
@@ -4027,24 +4005,27 @@ impl Reactor {
         fuel: &mut u64,
         host: &mut Host,
     ) -> Result<Vec<Value>, Trap> {
-        // `run` consumes the `Domain`; the persistent `mem` carries state across calls.
-        let dom = self.frame(func, host)?;
-        run(dom, func, args, fuel, &mut self.mem, host)
+        // A frame's program and table are fresh; the persistent `mem` carries state across calls.
+        let (source, table) = self.frame(func, host)?;
+        run(source, table, func, args, fuel, &mut self.mem, host)
     }
 
-    /// The `Domain` one frame of `func` runs in, for [`call`](Self::call) and
+    /// The program and root table one frame of `func` runs over, for [`call`](Self::call) and
     /// [`coop_call`](Self::coop_call) alike: a fresh source and table over the shared program, with
     /// the install room the powerbox's `Jit` grant sizes (#1296, #2661). A frame is a run over the
     /// reactor's window and powerbox, so it starts with the §22 installs the powerbox recorded, as
     /// any run does (#2670). `Trap::Malformed` if `func` is out of range.
-    fn frame(&self, func: FuncIdx, host: &Host) -> Result<Domain, Trap> {
+    fn frame(
+        &self,
+        func: FuncIdx,
+        host: &Host,
+    ) -> Result<(std::sync::Arc<ModuleSource>, std::sync::Arc<SharedSlots>), Trap> {
         if func as usize >= self.program.progs.len() {
             return Err(Trap::Malformed);
         }
-        Ok(Domain::over_primary(
-            std::sync::Arc::clone(&self.program),
-            host.jit_table_log2(),
-        ))
+        let source = ModuleSource::shared(std::sync::Arc::clone(&self.program));
+        let table = source.root_table(host.jit_table_log2());
+        Ok((source, table))
     }
 
     /// Capture the live window as a [`MemLayout`] — the memory half of a **moment** (a reactor
@@ -4170,7 +4151,7 @@ pub fn compile_reserved(m: &Module) -> Option<std::sync::Arc<Compiled>> {
 /// #1144 — the run half of [`compile_and_run_capture_reserved_with_host`], over an **already-compiled**
 /// (and typically cached) `Arc<Compiled>`. Everything after the compile is identical — the `thread.*`/
 /// `Instantiator` out-of-scope refusal, the personality park door, `Mem` reservation + seed +
-/// data-init + NULL guard from `m`, run, window snapshot. A fresh `Domain`/`ModuleSource` wraps the
+/// data-init + NULL guard from `m`, run, window snapshot. A fresh [`ModuleSource`] wraps the
 /// shared program each call (so exec'd command units pushed this run don't leak into the next), reusing
 /// only the immutable primary program. `m` is still needed for the `Mem` init (data segments, window
 /// size, NULL guard) and the out-of-scope scan — cheap reads, no recompile.
@@ -4195,9 +4176,10 @@ pub fn run_capture_reserved_over_compiled_with_host(
     }
     // #799/#1080 — install the personality fork/waitpid park-request door (see `compile_and_run_with_host`).
     host.wire_park_door();
-    let dom = Domain::over_primary(compiled, host.jit_table_log2());
+    let source = ModuleSource::shared(compiled);
+    let table = source.root_table(host.jit_table_log2());
     let mut mem = Mem::root(m, reserved_log2, None, init_mem);
-    let r = run(dom, func, args, fuel, &mut mem, host);
+    let r = run(source, table, func, args, fuel, &mut mem, host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot_window(super::SNAP_CAP))
@@ -4232,11 +4214,12 @@ pub fn ir_trace(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Op
     if func as usize >= c.progs.len() {
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
-    let dom = Domain::new(c, 0);
+    let source = ModuleSource::shared(std::sync::Arc::new(c));
+    let table = source.root_table(0);
     let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
     let mut host = Host::new();
     let mut vm = match Vm::new(
-        &dom.source.primary(),
+        &source.primary(),
         func as usize,
         args,
         Some(host.own_node()),
@@ -4246,12 +4229,12 @@ pub fn ir_trace(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Op
     };
     let mut trace = Vec::new();
     loop {
-        if let Some(pc) = vm.cur_ir_pc(&dom.source) {
+        if let Some(pc) = vm.cur_ir_pc(&source) {
             trace.push(pc);
         }
         match vm.resume(
-            &dom.source,
-            &dom.table,
+            &source,
+            &table,
             &mut lent.fuel,
             &mut mem,
             &mut HostCell::Excl(&mut host),
@@ -4287,11 +4270,12 @@ pub fn ir_window_trace(
     if func as usize >= c.progs.len() {
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
-    let dom = Domain::new(c, 0);
+    let source = ModuleSource::shared(std::sync::Arc::new(c));
+    let table = source.root_table(0);
     let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
     let mut host = Host::new();
     let mut vm = match Vm::new(
-        &dom.source.primary(),
+        &source.primary(),
         func as usize,
         args,
         Some(host.own_node()),
@@ -4303,7 +4287,7 @@ pub fn ir_window_trace(
     loop {
         // Snapshot the window var *before* running the op — the same point `Inspector::seek(t)` pauses
         // at (paused before the op at clock `t`), so the two byte sequences align step-for-step.
-        if let Some(pc) = vm.cur_ir_pc(&dom.source) {
+        if let Some(pc) = vm.cur_ir_pc(&source) {
             let bytes = mem
                 .as_ref()
                 .and_then(|mm| mm.read_window(addr, len).ok())
@@ -4311,8 +4295,8 @@ pub fn ir_window_trace(
             trace.push((pc, bytes));
         }
         match vm.resume(
-            &dom.source,
-            &dom.table,
+            &source,
+            &table,
             &mut lent.fuel,
             &mut mem,
             &mut HostCell::Excl(&mut host),
@@ -4360,11 +4344,12 @@ pub fn ir_value_trace(
     if func as usize >= c.progs.len() {
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
-    let dom = Domain::new(c, 0);
+    let source = ModuleSource::shared(std::sync::Arc::new(c));
+    let table = source.root_table(0);
     let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
     let mut host = Host::new();
     let mut vm = match Vm::new(
-        &dom.source.primary(),
+        &source.primary(),
         func as usize,
         args,
         Some(host.own_node()),
@@ -4374,7 +4359,7 @@ pub fn ir_value_trace(
     };
     let mut trace = Vec::new();
     loop {
-        if let Some(pc) = vm.cur_ir_pc(&dom.source) {
+        if let Some(pc) = vm.cur_ir_pc(&source) {
             // The block-0 register window typed per value — the same `(base + i, type)` resolution the
             // tree-walker uses for `read_ir_value`. A not-yet-computed slot reads as its default `Reg`;
             // the caller compares only the defined prefix (where `read_ir_value` returns `Some`).
@@ -4386,8 +4371,8 @@ pub fn ir_value_trace(
             trace.push((pc, vals));
         }
         match vm.resume(
-            &dom.source,
-            &dom.table,
+            &source,
+            &table,
             &mut lent.fuel,
             &mut mem,
             &mut HostCell::Excl(&mut host),
@@ -8417,11 +8402,13 @@ pub fn compile_and_run_sliced(
     if func as usize >= c.progs.len() {
         return Some(Err(Trap::Malformed));
     }
-    let dom = Domain::new(c, 0);
+    let source = ModuleSource::shared(std::sync::Arc::new(c));
+    let table = source.root_table(0);
     let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
     let mut host = Host::new();
     Some(drive(
-        dom,
+        source,
+        table,
         func,
         args,
         fuel,
@@ -8544,7 +8531,7 @@ fn spawn_task(
 fn root_leaf(
     emit: &LeafEmitter,
     m: &Module,
-    dom: &Domain,
+    source: &ModuleSource,
     entry: FuncIdx,
     host: &Host,
     mem: Option<&Mem>,
@@ -8552,7 +8539,7 @@ fn root_leaf(
     if host.is_durable() || mem.is_some_and(|w| !w.one_span()) {
         return None;
     }
-    let program = dom.source.primary();
+    let program = source.primary();
     let digest = program.module_digest(m);
     offer_leaf(emit, host, m, program.census(m), 0, digest, entry)
 }
@@ -8968,7 +8955,8 @@ fn exec_image_build(
 }
 
 fn run(
-    dom: Domain,
+    source: std::sync::Arc<ModuleSource>,
+    table: std::sync::Arc<SharedSlots>,
     entry: FuncIdx,
     args: &[Value],
     fuel: &mut u64,
@@ -8977,7 +8965,7 @@ fn run(
 ) -> Result<Vec<Value>, Trap> {
     // The production path never preempts itself: an unlimited budget makes `resume` run straight to
     // completion, with the per-op budget branch perfectly predicted (so the hot loop is unchanged).
-    drive(dom, entry, args, fuel, mem, host, u64::MAX)
+    drive(source, table, entry, args, fuel, mem, host, u64::MAX)
 }
 
 /// The per-op park/interrupt flags one capability dispatch may raise (#1173). They live on the shared
@@ -11059,7 +11047,7 @@ enum VcpuStop {
         count: i32,
         dst: u32,
     },
-    /// §22 `Jit.install` — the driver (which owns the mutable `Domain`) compiles + installs the unit.
+    /// §22 `Jit.install` — the driver (which owns the task's domain) compiles + installs the unit.
     JitInstall {
         h: i32,
         code: i32,
@@ -12078,8 +12066,10 @@ fn quiesced_parks_only(tasks: &[TaskSlot], fibers: &[FiberState]) -> bool {
 /// reproducible. Blocking (`join` / `wait`) parks a task; `notify` / child completion wakes it; a
 /// stuck set advances a logical clock to the next `wait` deadline (or deadlocks → `ThreadFault`,
 /// matching the deterministic explorer). The run ends when the **root** vCPU completes.
+#[allow(clippy::too_many_arguments)]
 fn drive(
-    dom: Domain,
+    source: std::sync::Arc<ModuleSource>,
+    table: std::sync::Arc<SharedSlots>,
     entry: FuncIdx,
     args: &[Value],
     fuel: &mut u64,
@@ -12099,9 +12089,9 @@ fn drive(
         // The native driver never enables tier-up (no eligibility bitmap), so `pump` runs the whole
         // schedule and returns `Done`; a `TierUp` yield is impossible here.
         let cell = std::sync::Arc::clone(&root);
-        let mut sched = CoopSched::new(&dom, entry, args, root_fuel, mem, cell, None)?;
+        let mut sched = CoopSched::new(&source, table, entry, args, root_fuel, mem, cell, None)?;
         sched.wall = cfg!(not(target_family = "wasm"));
-        let step = sched.pump(&dom.source, budget);
+        let step = sched.pump(&source, budget);
         *mem = sched.core.extra_envs[0].mem.take();
         match step? {
             CoopStep::Done(vals) => Ok(vals),
@@ -12798,16 +12788,16 @@ impl SchedCore {
     /// `fuel`; the window is taken only once nothing can refuse the run, so a refusal leaves it with
     /// the caller. Both executors start a run here ([`CoopSched::new`], [`ThreadRun::open`]).
     fn new(
-        dom: &Domain,
+        source: &ModuleSource,
+        table: std::sync::Arc<SharedSlots>,
         entry: FuncIdx,
         args: &[Value],
         mut fuel: Fuel,
         mem: &mut Option<Mem>,
         host: DomainCell,
     ) -> Result<SchedCore, Trap> {
-        let source = &*dom.source;
         let mut h = host.lock_unpoisoned();
-        reapply_installs(&h, source, &dom.table)?;
+        reapply_installs(&h, source, &table)?;
         // Fuel unification (safepoint-anchored): charge one fuel for *entering the top-level entry
         // function*, mirroring the per-callee-entry charge at `Op::Call`/`CallIndirect`/`TailCall*` and
         // the JIT's entry-prologue charge, so the tree-walker, bytecode, and JIT engines burn identically.
@@ -12876,7 +12866,6 @@ impl SchedCore {
             }
         }
         drop(h);
-        let table = std::sync::Arc::clone(&dom.table);
         let mut root = ChildEnv::root(std::mem::take(mem), host, table, fuel);
         root.fibers = fibers;
         Ok(SchedCore {
@@ -12903,8 +12892,10 @@ impl CoopSched {
     /// slice 2 config: `None` (the native `drive`) leaves everything interpreting; a config makes
     /// each task's calls to the functions its program's emit makes eligible surface as
     /// tier-ups.
+    #[allow(clippy::too_many_arguments)]
     fn new(
-        dom: &Domain,
+        source: &ModuleSource,
+        table: std::sync::Arc<SharedSlots>,
         entry: FuncIdx,
         args: &[Value],
         fuel: Fuel,
@@ -12923,7 +12914,7 @@ impl CoopSched {
             ),
             None => (ProgramEmits::default(), None),
         };
-        let mut core = SchedCore::new(dom, entry, args, fuel, mem, host)?;
+        let mut core = SchedCore::new(source, table, entry, args, fuel, mem, host)?;
         if let Some(e) = &programs.root {
             core.arm_tierup(e);
         }
@@ -14660,8 +14651,8 @@ pub enum CoopEvent {
 }
 
 /// A **resumable cooperative tier-up run**: the single-thread, no-Worker analogue of the parallel
-/// `temen_par_*` driver. It owns the run's `Domain`/window/powerbox/fuel and a [`CoopSched`] that
-/// multiplexes every vCPU (root + `thread.spawn` descendants) on this one thread, and pauses to the
+/// `temen_par_*` driver. It owns the run's program and a [`CoopSched`], which holds the run's domains
+/// and multiplexes every vCPU (root + `thread.spawn` descendants) on this one thread, and pauses to the
 /// host on each wasm-JIT tier-up ([`run`](Self::run) → [`CoopEvent::TierUp`] → run the emitted region
 /// → [`deliver_tierup`](Self::deliver_tierup) → `run` again), exactly the loop the native tests and
 /// the browser cdylib drive it with. With no tier-up config it behaves as `drive`: `run` returns
@@ -14704,7 +14695,8 @@ impl ThreadsRun {
     /// `embedder` pumps, or one whose first `run` returns at its end.
     #[allow(clippy::too_many_arguments)]
     fn open(
-        dom: Domain,
+        source: std::sync::Arc<ModuleSource>,
+        table: std::sync::Arc<SharedSlots>,
         entry: FuncIdx,
         args: &[Value],
         fuel: u64,
@@ -14713,7 +14705,7 @@ impl ThreadsRun {
         embedder: bool,
         leaf: Option<LeafStart>,
     ) -> Result<ThreadsRun, Refused> {
-        let run = ThreadRun::open(dom, entry, args, fuel, mem, host, embedder, leaf)?;
+        let run = ThreadRun::open(source, table, entry, args, fuel, mem, host, embedder, leaf)?;
         Ok(ThreadsRun {
             root: std::sync::Arc::clone(&run.root),
             run: Some(run),
@@ -14801,7 +14793,7 @@ impl Drop for ThreadsRun {
     }
 }
 
-/// The pump's [`CoopRun`]: the run's `Domain`, window, powerbox and fuel, and the [`CoopSched`] that
+/// The pump's [`CoopRun`]: the run's program, and the [`CoopSched`] that holds its domains and
 /// multiplexes its tasks on the caller's thread.
 struct PumpRun {
     /// The run's program.
@@ -14866,13 +14858,14 @@ impl CoopRun {
         back: Option<std::sync::Arc<super::Region>>,
         pump: bool,
     ) -> Option<Result<CoopRun, Trap>> {
-        let (dom, mem) = match parallel_domain(m, entry, &host, reserved_log2, back, init_mem)? {
-            Ok(start) => start,
-            Err(t) => return Some(Err(t)),
-        };
+        let (source, table, mem) =
+            match parallel_domain(m, entry, &host, reserved_log2, back, init_mem)? {
+                Ok(start) => start,
+                Err(t) => return Some(Err(t)),
+            };
         let leaf = host.thread_platform().tier.and_then(|t| t.leaf);
-        let leaf = leaf.and_then(|emit| root_leaf(&emit, m, &dom, entry, &host, mem.as_ref()));
-        match ThreadsRun::open(dom, entry, args, fuel, mem, host, pump, leaf) {
+        let leaf = leaf.and_then(|emit| root_leaf(&emit, m, &source, entry, &host, mem.as_ref()));
+        match ThreadsRun::open(source, table, entry, args, fuel, mem, host, pump, leaf) {
             Ok(t) => Some(Ok(CoopRun {
                 exec: CoopExec::Threads(t),
             })),
@@ -14984,7 +14977,7 @@ impl CoopRun {
     }
 
     /// [`new_reserved`](Self::new_reserved) over an already-compiled program (the browser's cached
-    /// `bash.temen` and `chibicc.temen` compiles, #1144): the `Domain` is `over_primary` on the shared
+    /// `bash.temen` and `chibicc.temen` compiles, #1144): the program is [`ModuleSource::shared`] over
     /// `compiled`, so an open costs a window build + schedule, not a recompile of the whole program.
     /// The window is an engine-backed reservation, or built over the caller's `back` (as
     /// [`new_over`](Self::new_over) builds it), which emitted code can address.
@@ -15005,9 +14998,10 @@ impl CoopRun {
             return Err(Trap::Malformed);
         }
         host.wire_park_door();
-        let dom = Domain::over_primary(compiled, host.jit_table_log2());
+        let source = ModuleSource::shared(compiled);
+        let table = source.root_table(host.jit_table_log2());
         let mem = Mem::root(m, reserved_log2, back, init_mem);
-        Self::start(dom, mem, entry, args, fuel, host, tierup, Some(m))
+        Self::start(source, table, mem, entry, args, fuel, host, tierup, Some(m))
     }
 
     fn assemble(
@@ -15023,9 +15017,11 @@ impl CoopRun {
         if entry as usize >= c.progs.len() {
             return Some(Err(Trap::Malformed));
         }
-        let dom = Domain::new(c, host.jit_table_log2());
+        let source = ModuleSource::shared(std::sync::Arc::new(c));
+        let table = source.root_table(host.jit_table_log2());
         Some(Self::start(
-            dom,
+            source,
+            table,
             mem,
             entry,
             args,
@@ -15036,14 +15032,15 @@ impl CoopRun {
         ))
     }
 
-    /// The one tail every run is built through: `dom` over the compiled program, the window `mem`,
-    /// the powerbox `host`, and `entry(args)` range-checked by the caller. Given a leaf emitter in
+    /// The one tail every run is built through: the run's program `source` and its root domain's
+    /// `table`, window `mem` and powerbox `host`, and `entry(args)` range-checked by the caller. Given a leaf emitter in
     /// `tierup` and `image`, the module the program was compiled from, the run offers `entry` whole
     /// as a root leaf ([`root_leaf`]). Then the powerbox's activation (#1944 slice 3: the root draws
     /// from its own node) and the schedule. `Err` if the activation is refused or scheduling traps.
     #[allow(clippy::too_many_arguments)]
     fn start(
-        dom: Domain,
+        source: std::sync::Arc<ModuleSource>,
+        table: std::sync::Arc<SharedSlots>,
         mut mem: Option<Mem>,
         entry: FuncIdx,
         args: &[Value],
@@ -15057,20 +15054,17 @@ impl CoopRun {
             .as_ref()
             .and_then(|t| t.leaf.as_ref())
             .zip(image)
-            .and_then(|(emit, m)| root_leaf(emit, m, &dom, entry, &host, mem.as_ref()));
+            .and_then(|(emit, m)| root_leaf(emit, m, &source, entry, &host, mem.as_ref()));
         let node = host.begin_activation(fuel, RootWindow::of(mem.as_ref()));
         let fuel = Fuel::drawn(node.ok_or(Trap::ThreadFault)?);
         let root = host.into_cell();
-        let mut sched = CoopSched::new(&dom, entry, args, fuel, &mut mem, root, tierup)?;
+        let mut sched = CoopSched::new(&source, table, entry, args, fuel, &mut mem, root, tierup)?;
         if let Some(leaf) = root_leaf {
             sched.core.arm_leaf(leaf);
         }
         sched.embedder_pumps = true;
         Ok(CoopRun {
-            exec: CoopExec::Pump(PumpRun {
-                source: dom.source,
-                sched,
-            }),
+            exec: CoopExec::Pump(PumpRun { source, sched }),
         })
     }
 
@@ -16214,7 +16208,8 @@ enum ParkFor {
 /// ([`ThreadExit`]). A thread starts and the clock is read through the host's [`ThreadPlatform`],
 /// and with the platform's emitted tier each thread runs its own task's tier-ups ([`ThreadRun::step`]).
 fn drive_threads(
-    dom: Domain,
+    source: std::sync::Arc<ModuleSource>,
+    table: std::sync::Arc<SharedSlots>,
     entry: FuncIdx,
     args: &[Value],
     fuel: &mut u64,
@@ -16222,7 +16217,8 @@ fn drive_threads(
     host: &mut Host,
 ) -> (Result<Vec<Value>, Trap>, Option<Mem>) {
     let mut t = match ThreadsRun::open(
-        dom,
+        source,
+        table,
         entry,
         args,
         *fuel,
@@ -16260,7 +16256,8 @@ impl ThreadRun {
     /// the host and window back with the trap that refused the run.
     #[allow(clippy::too_many_arguments)]
     fn open(
-        dom: Domain,
+        source: std::sync::Arc<ModuleSource>,
+        table: std::sync::Arc<SharedSlots>,
         entry: FuncIdx,
         args: &[Value],
         fuel: u64,
@@ -16277,7 +16274,8 @@ impl ThreadRun {
         let root = host.into_cell();
         let mut mem = mem;
         let cell = std::sync::Arc::clone(&root);
-        let mut core = match SchedCore::new(&dom, entry, args, root_fuel, &mut mem, cell) {
+        let mut core = match SchedCore::new(&source, table, entry, args, root_fuel, &mut mem, cell)
+        {
             Ok(core) => core,
             Err(t) => return Err(Box::new((t, Host::from_cell(root), mem))),
         };
@@ -16301,7 +16299,7 @@ impl ThreadRun {
             core.arm_leaf(leaf);
         }
         let run = std::sync::Arc::new(ThreadRun {
-            source: dom.source,
+            source,
             root,
             state: std::sync::Mutex::new(Threads {
                 core,
