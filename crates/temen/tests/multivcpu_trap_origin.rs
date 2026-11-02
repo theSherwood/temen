@@ -24,7 +24,7 @@ const WORKER_DIV0: &str = "func () -> (i64) {\n\
     \x20 v0 = i64.const 4096\n\
     \x20 v1 = i64.const 0\n\
     \x20 v2 = thread.spawn 1 v0 v1\n\
-    \x20 v3 = thread.join v2\n\
+    \x20 v3_st, v3 = thread.join v2\n\
     \x20 return v3\n\
       }\n\
     }\n\

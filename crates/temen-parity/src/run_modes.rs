@@ -492,7 +492,6 @@ pub fn exception(f: Feature, c: Config) -> Option<Cell> {
     let debugged = c.props.has(Property::Debugger);
     let durable = c.props.has(Property::Durable);
     let reactor = c.props.has(Property::Reactor);
-    let held = c.props.has(Property::Held);
     Some(match (f, c.executor) {
         // The Cranelift JIT, whatever the run adds.
         (Threads | Fibers | Children, Cranelift) => conditional(FIBER_RT),
@@ -560,10 +559,6 @@ pub fn exception(f: Feature, c: Config) -> Option<Cell> {
         (Exec, Pump) if reactor => not_yet(
             "the frame that execs drops the reactor's window, so the next frame traps Malformed \
              (#2660)",
-        ),
-        (GuestJit, Pump) if reactor && !held => not_yet(
-            "Reactor::call gives a frame no room for a §22 install, so the unit's call.dyn traps \
-             IndirectCallType; coop_call sizes it by the Jit grant (#2661)",
         ),
         _ => return None,
     })

@@ -132,8 +132,9 @@ block 0 (vsp: i64, varg: i64) {
 }
 ";
 
-/// The child's root spawns two vCPUs and joins both. Its handles are its own (0 and 1), however many
-/// vCPUs the parent's domain has: `h0 * 1000 + h1 * 100 + 10 + 20`.
+/// The child's root spawns two vCPUs and joins both. Its handles are its own child table's first two
+/// (slots 0 and 1 at generation 1, #2043), however many vCPUs the parent's domain has:
+/// `h0 * 1000 + h1 * 100 + 10 + 20`.
 #[test]
 fn a_child_spawns_and_joins_its_own_threads() {
     let child = format!(
@@ -146,8 +147,8 @@ block 0 (vs: i64) {{
   s1 = i64.const 49152
   a1 = i64.const 2
   h1 = thread.spawn 1 s1 a1
-  r0 = thread.join h0
-  r1 = thread.join h1
+  r0_st, r0 = thread.join h0
+  r1_st, r1 = thread.join h1
   k = i64.const 1000
   c = i64.const 100
   x0 = i64.extend_i32_s h0
@@ -162,7 +163,11 @@ block 0 (vs: i64) {{
 }}
 {TIMES_TEN}"
     );
-    assert_eq!(parity(&child), Ok(130));
+    let (h0, h1) = (temen_ir::handles::pack(0, 1), temen_ir::handles::pack(1, 1));
+    assert_eq!(
+        parity(&child),
+        Ok(i64::from(h0) * 1000 + i64::from(h1) * 100 + 30)
+    );
 }
 
 /// A child's vCPU parks on a word of the child's window until the child's root notifies it, then
@@ -187,7 +192,7 @@ block 1 (hh: i32) {{
   br_if more 1(hh) 2(hh)
   }}
 block 2 (h2: i32) {{
-  r = thread.join h2
+  r_st, r = thread.join h2
   pa = i64.const 32776
   v = i64.load pa
   k = i64.const 1000
@@ -228,7 +233,7 @@ block 0 (vs: i64) {{
   fh = cont.new f z
   s0 = i64.const 40960
   h = thread.spawn 1 s0 fh
-  r = thread.join h
+  r_st, r = thread.join h
   k = i64.const 1000
   x = i64.mul fh k
   out = i64.add x r
@@ -264,7 +269,7 @@ block 0 (vs: i64) {{
   s0 = i64.const 40960
   a0 = i64.const 0
   h = thread.spawn 1 s0 a0
-  r = thread.join h
+  r_st, r = thread.join h
   return r
   }}
 }}
@@ -330,7 +335,7 @@ block 1 (vi: i64) {{
   vz1 = i64.const 0
   vc = thread.spawn 1 vz1 vz1
   vw = thread.spawn 2 vz1 vi
-  vrc = thread.join vc
+  vrc_st, vrc = thread.join vc
   vk = i64.const 16392
   vone = i64.const 1
   vnext = i64.add vi vone
@@ -338,7 +343,7 @@ block 1 (vi: i64) {{
   i32.atomic.store vk vn32
   vcnt = i32.const 1
   vwoke = atomic.notify vk vcnt
-  vrw = thread.join vw
+  vrw_st, vrw = thread.join vw
   vrounds = i64.const 300
   vmore = i64.lt_u vnext vrounds
   br_if vmore 1(vnext) 2(vnext)

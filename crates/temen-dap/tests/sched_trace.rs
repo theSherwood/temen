@@ -29,7 +29,7 @@ block 0 () {
   v6 = i64.const 16384
   v7 = i32.const 1
   v8 = atomic.notify v6 v7
-  v9 = thread.join v3
+  v9_st, v9 = thread.join v3
   return v9
   }
 }
@@ -56,8 +56,8 @@ block 0 () {
   va = i64.const 1
   vh0 = thread.spawn 1 vsp va
   vh1 = thread.spawn 1 vsp va
-  vj0 = thread.join vh0
-  vj1 = thread.join vh1
+  vj0_st, vj0 = thread.join vh0
+  vj1_st, vj1 = thread.join vh1
   vaddr = i64.const 16384
   vr = i64.load vaddr
   return vr
@@ -125,7 +125,7 @@ block 0 () {
   v3 = i32.const 0
   v4 = i64.const 1000000000
   v5 = i32.atomic.wait v2 v3 v4
-  v6 = thread.join v1
+  v6_st, v6 = thread.join v1
   return v6
   }
 }

@@ -107,7 +107,7 @@ fn a_pipe_read_waits_for_a_siblings_write() {
   vbuf = i64.const 66100
   vlen = i64.const 1
   vn = call.cap 0 0 (i64, i64) -> (i64) vr (vbuf, vlen)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vk = i64.const 1000
   vnk = i64.mul vn vk
   vb = i32.load8_u vbuf
@@ -138,7 +138,7 @@ fn a_pipe_write_waits_for_a_siblings_drain() {
   vfill = call.cap 0 1 (i64, i64) -> (i64) vw (vbuf, vcap)
   vone = i64.const 1
   vn = call.cap 0 1 (i64, i64) -> (i64) vw (vbuf, vone)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vk = i64.const 1000
   vnk = i64.mul vn vk
   vres = i64.add vnk vj

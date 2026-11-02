@@ -448,11 +448,11 @@ block 0 () {{
   h2 = thread.spawn 1 sp a
   h3 = thread.spawn 1 sp a
   h4 = thread.spawn 1 sp a
-  j0 = thread.join h0
-  j1 = thread.join h1
-  j2 = thread.join h2
-  j3 = thread.join h3
-  j4 = thread.join h4
+  j0_st, j0 = thread.join h0
+  j1_st, j1 = thread.join h1
+  j2_st, j2 = thread.join h2
+  j3_st, j3 = thread.join h3
+  j4_st, j4 = thread.join h4
   s0 = i64.add j0 j1
   s1 = i64.add s0 j2
   s2 = i64.add s1 j3

@@ -77,7 +77,7 @@ block 0 () {
   vf = ref.func 1
   vk = cont.new vf vz
   vs, vv = cont.resume.block vk vz
-  vjr = thread.join vt
+  vjr_st, vjr = thread.join vt
   vk1 = i64.const 10
   vse = i64.extend_i32_s vs
   va = i64.mul vse vk1

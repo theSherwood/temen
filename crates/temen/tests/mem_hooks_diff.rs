@@ -221,7 +221,7 @@ func () -> (i64) {
 block 0 () {
   v0 = i64.const 43981
   v1 = thread.spawn 1 v0 v0
-  v2 = thread.join v1
+  v2_st, v2 = thread.join v1
   v3 = i64.const 16384
   v4 = i64.atomic.load v3
   return v4

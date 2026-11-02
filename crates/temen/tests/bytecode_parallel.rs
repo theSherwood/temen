@@ -51,7 +51,7 @@ block 5 (v17: i64) {
   v20 = i64.const 16400
   v21 = i64.add v20 v19
   v22 = i32.load v21
-  v23 = thread.join v22
+  v23_st, v23 = thread.join v22
   v24 = i64.const 1
   v25 = i64.add v17 v24
   br 4(v25)
@@ -127,7 +127,7 @@ block 5 (v17: i64, vacc5: i64) {
   v20 = i64.const 16400
   v21 = i64.add v20 v19
   v22 = i32.load v21
-  v23 = thread.join v22
+  v23_st, v23 = thread.join v22
   v24 = i64.add vacc5 v23
   v25 = i64.const 1
   v26 = i64.add v17 v25
@@ -163,7 +163,7 @@ block 0 () {
   v6 = i64.const 16384
   v7 = i32.const 1
   v8 = atomic.notify v6 v7
-  v9 = thread.join v3
+  v9_st, v9 = thread.join v3
   return v9
   }
 }
@@ -239,7 +239,7 @@ block 8 (v28: i64, v29: i64) {
   v32 = i64.const 16400
   v33 = i64.add v32 v31
   v34 = i32.load v33
-  v35 = thread.join v34
+  v35_st, v35 = thread.join v34
   v36 = i64.const 1
   v37 = i64.add v29 v36
   br 7(v28, v37)

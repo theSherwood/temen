@@ -542,7 +542,7 @@ func (i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64) {
   vz = i64.const 0
   vt = thread.spawn 1 vz vz
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vhundred = i64.const 100
   vr = i64.add vj vhundred
   return vr
@@ -578,7 +578,7 @@ block 0 (v0: i64, v1: i64) {
   vto = i64.const 1000000000
   vw = i32.atomic.wait va vw0 vto
   vs2, vx2 = cont.resume vk vz
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vhundred = i64.const 100
   vr0 = i64.add vx vx2
   vr1 = i64.add vr0 vj
@@ -1288,49 +1288,6 @@ fn controller_freeze(child: &str, check: impl FnOnce(&Host)) {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// #2041 — a JIT thaw refuses, whole, two detached children of one domain that claim one join slot.
-/// The interpreter keeps a join table per spawning vCPU, so children of different spawners can share
-/// a slot number; the JIT keeps one per domain, where both handles would name one child. Here the
-/// captured child's live grandchild holds slot 0, and a completed record from another of its vCPUs
-/// claims slot 0 too. The residue stays on the host for a thaw on the interpreter.
-#[test]
-fn a_jit_thaw_refuses_two_detached_children_at_one_join_slot() {
-    let (root, nest) = nest_modules(&nest());
-    let (mut fhost, args) = nest_powerbox(&nest, 0, 2);
-    let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
-    arm_freeze_after(&mut win, ARENA, 1);
-    let (_, _, fsnap) =
-        nest_run(Engine::Interp, &root, &args, &win, &mut fhost, None).expect("oracle");
-    let art = temen_snapshot::freeze(&root, &fsnap, &fhost).expect("serialize");
-    let (mut host, win) = nest_restore(&art, &root, &nest);
-    let mut thawed = host.take_thawed_detached();
-    assert_eq!(thawed.len(), 1, "the captured child");
-    thawed[0]
-        .host
-        .set_frozen_detached(vec![temen_interp::FrozenDetached {
-            parent_task: 3,
-            slot: 0,
-            completed_result: Ok(7),
-        }]);
-    host.set_thawed_detached(thawed);
-    let refused = temen_run::jit_cap_run(
-        &root,
-        0,
-        &args,
-        &MemLayout::image(win),
-        PARENT_LOG2,
-        0,
-        &mut host,
-        None,
-    );
-    assert!(
-        matches!(refused, Err(JitError::Unsupported(_))),
-        "the JIT refuses the thaw: {:?}",
-        refused.as_ref().map(|(o, _)| o)
-    );
-    assert_eq!(host.thawed_detached().len(), 1, "and keeps the residue");
-}
-
 /// #2010 — **a durable detached child's thread unwinds with it, and rides its artifact**, on every
 /// engine. The child spawns the thread while its window is `NORMAL`, so on the JIT the thread is an OS
 /// thread with a shadow context of its own; the freeze lands while the child is parked joining it and
@@ -1507,6 +1464,145 @@ fn refreezes_every_engine(child: &str, answer: Answer) {
             let art2 = temen_snapshot::freeze(&root, &ssnap, &shost).expect("serialize");
             for w in nest_thaws(&art2, second, &root, &child, &args, &runs, answer) {
                 wrong.push(format!("{first:?} → {w}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// #2379 — the root `(Instantiator, X, Y, Budget)` spawns X and then Y through the spawn record at
+/// 70144, joins X, and resumes a fiber: the safepoint a freeze lands at, with Y live. Then it joins
+/// X's handle again, which is spent, and Y. Returns
+/// `(the second join's status + 100) * 100000 + X * 100 + Y`.
+const SPENT_BELOW_A_LIVE_CHILD: &str = "memory 18 shadow 16448 65536
+func (i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vx: i32, vy: i32, vb: i32) {
+  vrm = i64.const 70152
+  i32.store vrm vx
+  vrb = i64.const 70156
+  i32.store vrb vb
+  vrp = i64.const 70144
+  vcx = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  i32.store vrm vy
+  vcy = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vjx_st, vjx = call.cap 6 1 (i32) -> (i64, i64) v0 (vcx)
+  vf = ref.func 1
+  vsp = i64.const 200000
+  vk = cont.new vf vsp
+  vz = i64.const 0
+  vs, vv = cont.resume vk vz
+  vrx_st, vrx = call.cap 6 1 (i32) -> (i64, i64) v0 (vcx)
+  vjy_st, vjy = call.cap 6 1 (i32) -> (i64, i64) v0 (vcy)
+  vhund = i64.const 100
+  vst = i64.add vrx_st vhund
+  vk5 = i64.const 100000
+  vhi = i64.mul vst vk5
+  vxh = i64.mul vjx vhund
+  vlo = i64.add vxh vjy
+  vr = i64.add vhi vlo
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  return v1
+  }
+}
+";
+
+/// X: returns 5.
+const RETURNS_5: &str = "memory 17 shadow 16448 65536
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vr = i64.const 5
+  return vr
+  }
+}
+";
+
+/// Y: waits 200 ms on a futex nothing notifies, so it is live when the freeze lands, then returns 7.
+const WAITS_THEN_7: &str = "memory 17 shadow 16448 65536
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  va = i64.const 66000
+  vw0 = i32.const 0
+  vto = i64.const 200000000
+  vw = i32.atomic.wait va vw0 vto
+  vr = i64.const 7
+  return vr
+  }
+}
+";
+
+/// #2379 — a JIT thaw re-filed each recorded child at its slot and padded the slots below it with
+/// joinable placeholders, so a child its parent had joined came back live, and its handle joined
+/// as `(0, 0)`. Since #2043 a thaw rebuilds the domain's one table from the counters the freeze
+/// carried and pins only the recorded children: X's slot, below the live Y's, is spent after the
+/// thaw as it was before the cut. Every engine freezes the root there, and every engine thaws every
+/// engine's artifact to the uninterrupted answer: X's second join `-EBADF`, Y's 7.
+#[test]
+fn a_joined_child_below_a_live_one_stays_spent_across_a_thaw_on_every_engine() {
+    use Engine::*;
+    let root = confined(&format!("{SPENT_BELOW_A_LIVE_CHILD}{}", spawn_rec(70144)));
+    let x = confined(RETURNS_5);
+    let y = confined(WAITS_THEN_7);
+    // The children's programs, granted in one order for a run and the restore of its artifact.
+    let grant_children = |host: &mut Host| {
+        let x = host.grant_durable_module(&x);
+        let y = host.grant_durable_module(&y);
+        (x, y)
+    };
+    let powerbox = || {
+        let mut host = Host::new();
+        host.set_durable(true);
+        let inst = host.grant_instantiator();
+        let (xh, yh) = grant_children(&mut host);
+        let budget = host.grant_budget(-1, 1 << 20, -1);
+        host.grant_freeze_authority();
+        (host, [inst, xh, yh, budget].map(i64::from).to_vec())
+    };
+    let want = (temen_ir::errno::EBADF + 100) * 100_000 + 5 * 100 + 7;
+    let mut wrong = Vec::new();
+    let mut runs = Vec::new();
+    for e in [Interp, Jit] {
+        let (mut host, args) = powerbox();
+        let win = init_durable_window(1 << PARENT_LOG2, ARENA);
+        let Some((r, _, _)) = nest_run(e, &root, &args, &win, &mut host, None) else {
+            continue; // a target without the JIT's child executor
+        };
+        if r != Ok(want) {
+            wrong.push(format!("uninterrupted on {e:?}: {r:?}"));
+        }
+        runs.push(e);
+    }
+    for &froze in &runs {
+        let (mut fhost, args) = powerbox();
+        let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
+        arm_freeze_after(&mut win, ARENA, 1);
+        let Some((r, _, fsnap)) = nest_run(froze, &root, &args, &win, &mut fhost, None) else {
+            wrong.push(format!("freeze on {froze:?}: refused"));
+            continue;
+        };
+        let live = fhost.captured_detached().len();
+        if (r, live) != (Ok(0), 1) {
+            wrong.push(format!(
+                "freeze on {froze:?}: {r:?}, carrying {live} live children"
+            ));
+            continue;
+        }
+        let art = temen_snapshot::freeze(&root, &fsnap, &fhost).expect("serialize");
+        for &thaws in &runs {
+            let mut host = Host::new();
+            host.set_durable(true);
+            grant_children(&mut host);
+            let mut w = temen_snapshot::restore(&art, &root, &mut host).expect("restore");
+            begin_thaw(&mut w, ARENA, 0);
+            match nest_run(thaws, &root, &args, &w, &mut host, None) {
+                Some((Ok(got), _, _)) if got == want => {}
+                other => wrong.push(format!(
+                    "frozen on {froze:?}, thawed on {thaws:?}: {:?}",
+                    other.map(|(r, _, _)| r)
+                )),
             }
         }
     }

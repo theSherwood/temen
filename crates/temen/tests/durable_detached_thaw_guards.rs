@@ -277,7 +277,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vt = thread.spawn 1 vz vz
   vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vs = i64.add vr vj
   return vs
   }
@@ -658,7 +658,7 @@ block 3 (vt3: i32) {
   i32.store vw vone
   vcnt = i32.const 1
   vwoke = atomic.notify vw vcnt
-  vj3 = thread.join vt3
+  vj3_st, vj3 = thread.join vt3
   return vroom
   }
 }

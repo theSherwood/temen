@@ -1165,7 +1165,7 @@ block 0 (ni: i64, no: i64) {
   blp = i64.const 65736
   z = i64.const 0
   i64.store blp z
-  ; "TEMEN\0\0\0" kind=0 version=14 flags=0
+  ; "TEMEN\0\0\0" kind=0 version=15 flags=0
   c84 = i64.const 84
   call 30 (c84)
   c69 = i64.const 69
@@ -1180,8 +1180,8 @@ block 0 (ni: i64, no: i64) {
   call 30 (z)
   call 30 (z)
   call 30 (z)
-  fourteen = i64.const 14
-  call 30 (fourteen)
+  fifteen = i64.const 15
+  call 30 (fifteen)
   call 30 (z)
   call 30 (z)
   call 30 (z)
@@ -3802,7 +3802,7 @@ block 0 (xt: i64, x: i64) {
 func (i64) -> (i64) {
 block 0 (t: i64) {
   h = i32.wrap_i64 t
-  y = thread.join h
+  y_st, y = thread.join h
   return y
   }
 }

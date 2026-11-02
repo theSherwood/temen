@@ -24,7 +24,7 @@
 
 // VM primitives (lowered by name in the frontend, codegen_ir.c).
 int __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
-long __vm_thread_join(int handle);
+long __vm_thread_join(int handle, long *status); // *status 0, or -EBADF for a spent handle
 int __vm_atomic_cas32(void *p, int expected, int desired);
 int __vm_atomic_load32(void *p);
 void __vm_atomic_store32(void *p, int v);
@@ -124,7 +124,10 @@ static int pthread_create(pthread_t *t, const pthread_attr_t *attr,
 }
 
 static int pthread_join(pthread_t t, void **retval) {
-  long r = __vm_thread_join(t);
+  long status;
+  long r = __vm_thread_join(t, &status);
+  if (status)
+    return 3; // ESRCH: `t` was already joined (#2667)
   if (retval)
     *retval = (void *)r;
   return 0;

@@ -13285,10 +13285,20 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, r); // i32 thread handle
             Ok(true)
         }
+        // `long __vm_thread_join(int handle, long *status)` → `status, value = thread.join handle`,
+        // the status stored through `status` as `__vm_join`'s is: 0, or `-EBADF` for a spent handle
+        // (#2667).
         "__vm_thread_join" => {
             let handle = ctx.operand_i32(vm_arg(c, 0)?)?;
-            let r = ctx.push(Inst::ThreadJoin { handle });
-            ctx.bind_dest(&c.dest, r); // i64 result
+            let status = ctx.operand_i64(vm_arg(c, 1)?)?; // `long *status`
+            let rs = ctx.push_multi(Inst::ThreadJoin { handle }, 2); // (status, value)
+            ctx.push_effect(Inst::Store {
+                op: StoreOp::I64,
+                addr: status,
+                value: rs[0],
+                offset: 0,
+            });
+            ctx.bind_dest(&c.dest, rs[1]); // i64 result
             Ok(true)
         }
         // ---- §12 atomics (linear-memory) ----

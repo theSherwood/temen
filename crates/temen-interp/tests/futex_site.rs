@@ -50,7 +50,7 @@ block 2 (v0: i32, vps: i64, va: i64, vchild: i32, vm1: i64) {
   vm2 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) v0 (va, vz, vps, vprot)
   vone = i32.const 1
   vn = atomic.notify va vone
-  vst = thread.join vchild
+  vst_st, vst = thread.join vchild
   vwoke = i64.eq vst vz
   vwoke64 = i64.extend_i32_u vwoke
   vn64 = i64.extend_i32_u vn
@@ -145,7 +145,7 @@ block 2 (va: i64, vw: i64, vchild: i32) {
   br_if vgot 3(vchild) 2(va, vw, vchild)
   }
 block 3 (vchild: i32) {
-  vr = thread.join vchild
+  vr_st, vr = thread.join vchild
   return vr
   }
 }

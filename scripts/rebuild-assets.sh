@@ -17,12 +17,12 @@
 #
 #   Usage:  bash scripts/rebuild-assets.sh              # rebuild everything the toolchain allows
 #           ONLY=leng,nim_card bash scripts/...         # rebuild a subset (comma-separated step names)
-#   Steps:  leng chibicc pg_libc pg_heap coop_grow onramp shell coreutils forth uxn nim_card
-#           lua_snapshot
+#   Steps:  leng chibicc pg_libc pg_heap coop_grow onramp shell coreutils forth fixtures uxn
+#           nim_card lua_snapshot
 #
-# Toolchains, per step: leng needs rustc (+rust-src) & llvm; chibicc/onramp/pg_heap need clang &
-# llvm-link (onramp also fetches QuickJS/SQLite/Lua sources — skipped offline); shell needs the
-# in-tree chibicc; nim_card needs the nimony toolchain (Nim + nimony/bin, as
+# Toolchains, per step: leng needs rustc (+rust-src) & llvm; chibicc/onramp/pg_heap/fixtures need
+# clang & llvm-link (onramp also fetches QuickJS/SQLite/Lua sources — skipped offline); shell and
+# fixtures need the in-tree chibicc; nim_card needs the nimony toolchain (Nim + nimony/bin, as
 # scripts/ci/provision-nimony.sh builds it).
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -184,6 +184,32 @@ if want forth; then
     || note "forth ✗ (prep_temen failed on forth.temt?)"
 fi
 
+# --- 4b') browser/tests/fixtures: the display/reactor/onramp guests and the setjmp witness ---------
+# The browser crate's tests decode these straight from the tree (display.rs, reactor*.rs, onramp.rs,
+# coop_tierup_driver.rs, setjmp.rs). The C guests are built as the playground's on-ramp assets are
+# (build-onramp-assets.mjs): clang to bitcode, translated for the 64 KiB wasm page, the NULL guard
+# unconditional (#1094). The setjmp witness has its own #[ignore]d generator (chibicc).
+if want fixtures; then
+  echo "=== [fixtures] clang + temen-llvm-translate → browser/tests/fixtures; gen_browser_setjmp_fixture ==="
+  T="$(mktemp -d)"
+  TR="$REPO/crates/temen-llvm/target/release/temen-llvm-translate"
+  FAILED=""
+  for g in gradient:display/gradient.c fsread:display/fsread.c bounce:display/bounce.c \
+           life:display/life.c mandelzoom:display/mandelzoom.c hello_onramp:hello.c; do
+    name="${g%%:*}"
+    F="browser/tests/fixtures/$name.temen"
+    clang -O2 -emit-llvm -c -fno-vectorize -fno-slp-vectorize "crates/temen-run/demos/${g#*:}" \
+        -o "$T/$name.bc" \
+      && "$TR" "$T/$name.bc" -o "$F" --host-page 65536 \
+      && validate "$F" || FAILED="$FAILED $name"
+  done
+  cargo test -p temen --test c_frontend -- --ignored --exact gen_browser_setjmp_fixture \
+    || FAILED="$FAILED setjmp_copy"
+  [ -z "$FAILED" ] && note "fixtures ✓ (browser/tests/fixtures: the display demos, hello_onramp, setjmp_copy)" \
+    || note "fixtures ✗ (failed:$FAILED — clang / temen-llvm-translate / chibicc?)"
+  rm -rf "$T"
+fi
+
 # --- 4c) uxn.temen + uxn_demo.rom (crates/temen-run/demos/uxn: cc for the assembler, clang → translate) ---
 if want uxn; then
   echo "=== [uxn] crates/temen-run/demos/uxn/build.sh → browser/web/assets/{uxn.temen,uxn_demo.rom} ==="
@@ -318,8 +344,4 @@ if [ "${#SKIPPED[@]}" -gt 0 ]; then
   echo "    complaint \u2014 which is why the note above used to blame a missing toolchain."
   echo
 fi
-echo "Also (non-CI, but tracked) browser/tests/fixtures/*.temen — the display/reactor/onramp Rust-test"
-echo "fixtures — are clang -O2 + temen-llvm-translate --host-page 65536 (+--null-guard for the #964"
-echo "guarded ones: hello_onramp/bounce/life/mandelzoom; plain for gradient/fsread). shell/stage_runner/"
-echo "primes/upper come from the [shell] step above."
 echo "Then: git add the changed browser/web/assets/*.temen(.gz) + fixtures, and commit."

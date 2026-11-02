@@ -432,7 +432,7 @@ fn concurrent_callers_park_and_retry_instead_of_eagain() {
            vt = thread.spawn 1 v0 v0\n\
            vh = i32.const {offer}\n\
            vmine = call.cap {tid} 0 () -> (i64) vh ()\n\
-           vjoined = thread.join vt\n\
+           vjoined_st, vjoined = thread.join vt\n\
            vsum = i64.add vmine vjoined\n\
            return vsum\n\
            }}\n\

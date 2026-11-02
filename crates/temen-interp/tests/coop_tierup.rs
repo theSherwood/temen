@@ -48,7 +48,7 @@ block 0 () {
   vt = thread.spawn 1 vz vz
   v3 = i64.const 3
   vlocal = call 2 (v3)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vr = i64.add vj vlocal
   return vr
   }
@@ -217,7 +217,7 @@ func () -> (i64) {
 block 0 () {
   vz = i64.const 0
   vt = thread.spawn 1 vz vz
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   return vj
   }
 }
@@ -747,7 +747,7 @@ block 0 (v0: i64) {
   vt = thread.spawn 2 vz vz
   v7 = i64.const 7
   vlocal = call 3 (v7)
-  vw = thread.join vt
+  vw_st, vw = thread.join vt
   vr = i64.add vw vlocal
   return vr
   }
@@ -1298,7 +1298,7 @@ block 1 () {
   vt = thread.spawn 2 vz1 vz1
   v5 = i64.const 5
   vown = call 1 (v5)
-  vth = thread.join vt
+  vth_st, vth = thread.join vt
   vr = i64.add vown vth
   return vr
 }

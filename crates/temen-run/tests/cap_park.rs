@@ -204,7 +204,7 @@ fn src(ticker: Ticker, paced: bool) -> String {
         Ticker::Thread => (
             "  vsp = i64.const 0\n  vta = i64.extend_i32_u vtick\n  vth = thread.spawn 2 vsp vta\n"
                 .to_string(),
-            "  vj = thread.join vth\n",
+            "  vj_st, vj = thread.join vth\n",
         ),
     };
     let child = SpawnRec {
@@ -717,7 +717,7 @@ block 1 (vh: i32, vt: i32, vs1: i64, vleft: i64) {{
   br_if vmore 1(vh, vt, vs1, vleft2) 2(vt, vs1)
 }}
 block 2 (vt2: i32, vs2: i64) {{
-  vj = thread.join vt2
+  vj_st, vj = thread.join vt2
   vone2 = i64.const 1
   vlate = i64.sub vs2 vone2
   vk = i64.const 1000
@@ -1072,8 +1072,8 @@ block 1 (vcaller: i32, vanswerer: i32) {
   br_if vgo 2(vcaller, vanswerer) 1(vcaller, vanswerer)
 }
 block 2 (vcaller: i32, vanswerer: i32) {
-  vr0 = thread.join vcaller
-  vr1 = thread.join vanswerer
+  vr0_st, vr0 = thread.join vcaller
+  vr1_st, vr1 = thread.join vanswerer
   vk = i64.const 1000
   vm = i64.mul vr0 vk
   vsum = i64.add vm vr1
@@ -1138,7 +1138,7 @@ block 1 (vth1: i32) {{
   br_if vup 2(vth1) 1(vth1)
 }}
 block 2 (vth2: i32) {{
-  vr = thread.join vth2
+  vr_st, vr = thread.join vth2
   return vr
 }}
 }}
@@ -1303,8 +1303,8 @@ block 0 (vwait: i32, vprobe: i32) {
   vt1 = thread.spawn 1 vsp vwa
   vpa = i64.extend_i32_u vprobe
   vt2 = thread.spawn 2 vsp vpa
-  vr1 = thread.join vt1
-  vr2 = thread.join vt2
+  vr1_st, vr1 = thread.join vt1
+  vr2_st, vr2 = thread.join vt2
   vk = i64.const 1000
   vm = i64.mul vr1 vk
   vs = i64.add vm vr2
@@ -1422,7 +1422,7 @@ block 0 (vupper: i32) {
   vsp = i64.const 0
   vua = i64.extend_i32_u vupper
   vt = thread.spawn 1 vsp vua
-  vr = thread.join vt
+  vr_st, vr = thread.join vt
   return vr
 }
 }

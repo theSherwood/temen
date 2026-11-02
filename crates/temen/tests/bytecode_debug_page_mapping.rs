@@ -194,8 +194,8 @@ block 0 (v0: i32) {
   va = i64.const 1
   vh0 = thread.spawn 1 vsp va
   vh1 = thread.spawn 1 vsp va
-  vj0 = thread.join vh0
-  vj1 = thread.join vh1
+  vj0_st, vj0 = thread.join vh0
+  vj1_st, vj1 = thread.join vh1
   vg = i64.const 131072
   vgl = i64.const 16384
   vrw = i64.const 3

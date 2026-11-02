@@ -112,8 +112,8 @@ block 0 (vn: i64) {
   vsp = i64.const 0
   vh0 = thread.spawn 1 vsp vn
   vh1 = thread.spawn 1 vsp vn
-  vj0 = thread.join vh0
-  vj1 = thread.join vh1
+  vj0_st, vj0 = thread.join vh0
+  vj1_st, vj1 = thread.join vh1
   vaddr = i64.const 16384
   vr = i64.load vaddr
   return vr
@@ -197,8 +197,8 @@ block 0 (vn: i64) {
   vsp = i64.const 0
   vh0 = thread.spawn 1 vsp vn
   vh1 = thread.spawn 1 vsp vn
-  vj0 = thread.join vh0
-  vj1 = thread.join vh1
+  vj0_st, vj0 = thread.join vh0
+  vj1_st, vj1 = thread.join vh1
   vaddr = i64.const 16384
   vr = i64.load vaddr
   return vr
@@ -343,8 +343,8 @@ block 0 (vn: i64) {
   vsp = i64.const 0
   vh0 = thread.spawn 1 vsp vn
   vh1 = thread.spawn 1 vsp vn
-  vj0 = thread.join vh0
-  vj1 = thread.join vh1
+  vj0_st, vj0 = thread.join vh0
+  vj1_st, vj1 = thread.join vh1
   vaddr = i64.const 16384
   vr = i64.load vaddr
   return vr

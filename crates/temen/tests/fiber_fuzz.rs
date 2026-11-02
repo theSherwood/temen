@@ -551,7 +551,7 @@ fn generated_migration_schedules_agree_on_interp_and_jit() {
                 let w = p.div_ceil(2);
                 writeln!(src, "  v{v} = i64.const 0").unwrap();
                 writeln!(src, "  v{} = thread.spawn {} v{v} v{v}", v + 1, w).unwrap();
-                writeln!(src, "  v{} = thread.join v{}", v + 2, v + 1).unwrap();
+                writeln!(src, "  v{0}_st, v{0} = thread.join v{1}", v + 2, v + 1).unwrap();
                 writeln!(src, "  v{} = i64.add v{acc} v{}", v + 3, v + 2).unwrap();
                 acc = v + 3;
                 v += 4;

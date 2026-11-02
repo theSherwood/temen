@@ -158,7 +158,7 @@ block 5 (v17: i64) {
   v20 = i64.const 16
   v21 = i64.add v20 v19
   v22 = i32.load v21
-  v23 = thread.join v22
+  v23_st, v23 = thread.join v22
   v24 = i64.const 1
   v25 = i64.add v17 v24
   br 4(v25)

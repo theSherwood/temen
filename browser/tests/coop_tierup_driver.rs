@@ -120,7 +120,7 @@ block 0 () {{
   vt = thread.spawn 1 vz vz
   v3 = i64.const 3
   vlocal = call 2 (v3)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vsum = i64.add vj vlocal
   vsl = i64.const {SLOT}
   i64.store vsl vsum
@@ -408,7 +408,7 @@ block 0 () {{
   vcode = call.import 0 (vbp, vbl)
   vprobe = i64.const {PROBE}
   vres = call.import 1 (vcode, vprobe)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vsum = i64.add vres vj
   vsl = i64.const {SLOT}
   i64.store vsl vsum
@@ -1913,7 +1913,7 @@ block 0 () {{
   vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
   vprobe = i64.const {PROBE}
   vres = call 1 (vprobe)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vsum = i64.add vres vj
   vsl = i64.const {SLOT}
   i64.store vsl vsum
@@ -2072,7 +2072,7 @@ block 0 () {{
   vslot = call.cap 11 3 (i64) -> (i64) vjit (vcode)
   vx = i64.const {X}
   vres = call 1 (vslot, vx)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vfin = i64.add vres vj
   vsl = i64.const {SLOT}
   i64.store vsl vfin
@@ -2227,7 +2227,7 @@ block 0 () {{
   vcode = call.import 0 (vbp, vbl)
   vprobe = i64.const {PROBE}
   vres = call.import 1 (vcode, vprobe)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vsum = i64.add vres vj
   vsl = i64.const {SLOT}
   i64.store vsl vsum
@@ -5456,7 +5456,7 @@ block 0 () {{
   vcode = call.import 0 (vbp, vbl, vsp, vsn)
   vprobe = i64.const {LINK_PROBE}
   vres = call.import 1 (vcode, vprobe)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vsum = i64.add vres vj
   vsl = i64.const {SLOT}
   i64.store vsl vsum
@@ -5627,7 +5627,7 @@ block 0 () {{
   vr1 = call.import 1 (vcode, vone)
   vtwo = i64.const 2
   vr2 = call.import 1 (vcode, vtwo)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vk = i64.const 10000
   vm1 = i64.mul vr1 vk
   vs0 = i64.add vm1 vr2
@@ -5755,7 +5755,7 @@ block 0 () {{
   vcode = call.import 0 (vbp, vbl)
   vprobe = i64.const {NEST_PROBE}
   vres = call 2 (vcode, vprobe)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vsum = i64.add vres vj
   vsl = i64.const {SLOT}
   i64.store vsl vsum
@@ -5873,7 +5873,7 @@ block 0 () {{
   vcode = call.import 0 (vbp, vbl)
   vprobe = i64.const {NEST_PROBE}
   vres = call 2 (vcode, vprobe)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vsum = i64.add vres vj
   vsl = i64.const {SLOT}
   i64.store vsl vsum
@@ -6446,7 +6446,7 @@ block 0 () {
   vst = i32.atomic.wait vaddr vexp vto
   vflagat = i64.const 40960
   vflag = i64.load vflagat
-  vr = thread.join vt
+  vr_st, vr = thread.join vt
   vst64 = i64.extend_i32_s vst
   vk = i64.const 10000
   vs = i64.mul vst64 vk

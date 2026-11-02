@@ -257,7 +257,7 @@ block 0 (v0: i64) {
   vsp = i64.const 0
   va = i64.const 32768
   vh = thread.spawn 1 vsp va
-  vj = thread.join vh
+  vj_st, vj = thread.join vh
   vb2 = i64.const 49152
   vc = i32.load8_u vb2
   vcw = i64.extend_i32_u vc

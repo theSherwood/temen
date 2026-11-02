@@ -783,7 +783,7 @@ long __vm_pipe(int *fds);
 long __vm_read(int fd, void *buf, long len);
 long __vm_write(int fd, void *buf, long len);
 int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
-long __vm_thread_join(int h);
+long __vm_thread_join(int h, long *status);
 static char msg[] = "GO\n";
 long g_wfd;
 long writer(long arg) {
@@ -804,7 +804,7 @@ int main(void) {
   int h = __vm_thread_spawn(writer, (void *)0, 0);
   char b[8];
   long n = __vm_read(fds[0], b, 8);  /* empty FIFO, writer open -> PARKS; woken -> drains 3 */
-  __vm_thread_join(h);
+  __vm_thread_join(h, &(long){0});
   return (int)(fd + n);              /* 3 + 3 = 6 */
 }
 "#;
@@ -848,7 +848,7 @@ const SPIN_FLAG_SRC: &str = r#"
 long __vm_atomic_add(void *p, long v);
 long __vm_atomic_load(void *p);
 int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
-long __vm_thread_join(int h);
+long __vm_thread_join(int h, long *status);
 long flag;
 long setter(long arg) {
   __vm_atomic_add(&flag, 1);   /* set the flag, then exit — no wait, no park */
@@ -857,7 +857,7 @@ long setter(long arg) {
 int main(void) {
   int h = __vm_thread_spawn(setter, (void *)0, 0);
   while (__vm_atomic_load(&flag) == 0) { }   /* SPIN yield-free until the sibling's store lands */
-  __vm_thread_join(h);
+  __vm_thread_join(h, &(long){0});
   return 7;
 }
 "#;
@@ -893,7 +893,7 @@ long __vm_read(int fd, void *buf, long len);
 long __vm_atomic_add(void *p, long v);
 long __vm_atomic_load(void *p);
 int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
-long __vm_thread_join(int h);
+long __vm_thread_join(int h, long *status);
 static char sigstk[16384];
 static volatile long fired;
 static void handler(int sig) { fired = sig; }
@@ -912,7 +912,7 @@ int main(void) {
   char b[8];
   long n = __vm_read(fds[0], b, 8);          /* PARKS; a delivered SIGINT interrupts it -> -EINTR */
   __vm_atomic_add(&done, 1);
-  __vm_thread_join(h);
+  __vm_thread_join(h, &(long){0});
   if (n == -4) return 42;                    /* -EINTR: the caught signal interrupted the blocked read */
   return (int)n;
 }
@@ -958,7 +958,7 @@ long __vm_pipe(int *fds);
 long __vm_read(int fd, void *buf, long len);
 long __vm_write(int fd, void *buf, long len);
 int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
-long __vm_thread_join(int h);
+long __vm_thread_join(int h, long *status);
 static char sigstk[16384];
 static char msg[] = "GO\n";
 long g_wfd;
@@ -978,7 +978,7 @@ int main(void) {
   int h = __vm_thread_spawn(raiser, (void *)0, 0);
   char b[8];
   long n = __vm_read(fds[0], b, 8);  /* PARKS; the ignored SIGINT must NOT interrupt -> woken by the write */
-  __vm_thread_join(h);
+  __vm_thread_join(h, &(long){0});
   if (n == -4) return 42;            /* a wrong EINTR — must not happen */
   return (int)n;                     /* 3: the read completed with data */
 }
@@ -1016,7 +1016,7 @@ long __vm_pipe(int *fds);
 long __vm_read(int fd, void *buf, long len);
 long __vm_write(int fd, void *buf, long len);
 int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);
-long __vm_thread_join(int h);
+long __vm_thread_join(int h, long *status);
 static char sigstk[16384];
 static long act[3];
 static char msg[] = "GO\n";
@@ -1043,7 +1043,7 @@ int main(void) {
   int h = __vm_thread_spawn(raiser, (void *)0, 0);
   char b[8];
   long n = __vm_read(fds[0], b, 8);  /* PARKS; interrupted -> handler -> RESTARTS -> data */
-  __vm_thread_join(h);
+  __vm_thread_join(h, &(long){0});
   if (n == -4) return 42;            /* -EINTR would mean SA_RESTART was ignored */
   return fired * 10 + (int)n;        /* 23: the handler ran AND the read completed with data */
 }
@@ -7418,7 +7418,7 @@ fn twin_thread_trap_src() -> String {
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);\n\
-long __vm_thread_join(int h);\n\
+long __vm_thread_join(int h, long *status);\n\
 static int status;\n\
 static volatile long zero;\n\
 long boom(long arg){ return 1 / zero; }\n\
@@ -7427,7 +7427,7 @@ int main(void){\n\
   if (s < 0) return 1;\n\
   if (s == 0){\n\
     int t = __vm_thread_spawn(boom, (void *)0, 0);\n\
-    __vm_thread_join(t);\n\
+    __vm_thread_join(t, &(long){0});\n\
     return 7;    /* unreachable: the thread's trap tears this process down */\n\
   }\n\
   long h; while ((h = __px_waitpid(0, s, (long)&status, 0)) == -4){}\n\

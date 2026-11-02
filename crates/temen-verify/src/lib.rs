@@ -745,7 +745,7 @@ enum InstResults<'a> {
     None,
     /// One result — the vast majority of ops.
     One(ValType),
-    /// `cont.resume`'s `(status: i32, value: i64)` pair.
+    /// A `(status, value)` pair: `cont.resume`'s `(i32, i64)`, `thread.join`'s `(i64, i64)`.
     Two(ValType, ValType),
     /// A call's result row (`callee.results` / `types[sig].results`).
     Row(&'a [ValType]),
@@ -1298,12 +1298,6 @@ fn type_inst<'a>(
             // mask is enforced defensively at runtime on both backends.
             ValType::I64
         }
-        // §12 thread join: an i32 thread handle in, the joined vCPU's i64 result out. (The handle
-        // is forgeable; safety is the runtime use-site check, like a fiber/capability handle.)
-        Inst::ThreadJoin { handle } => {
-            cx.expect(*handle, ValType::I32)?;
-            ValType::I64
-        }
         // §12 futex wait: i64 addr, `ty` expected value, i64 timeout ⇒ i32 status. Touches memory.
         Inst::MemoryWait {
             ty,
@@ -1673,6 +1667,13 @@ fn type_inst<'a>(
             cx.expect(*k, ValType::I64)?;
             cx.expect(*arg, ValType::I64)?;
             return Ok(InstResults::Two(ValType::I32, ValType::I64));
+        }
+        // §12 thread join: an i32 thread handle in, `(status: i64, value: i64)` out, the shape of
+        // `Instantiator.join` (#2667). (The handle is forgeable; safety is the runtime use-site
+        // check, like a fiber/capability handle.)
+        Inst::ThreadJoin { handle } => {
+            cx.expect(*handle, ValType::I32)?;
+            return Ok(InstResults::Two(ValType::I64, ValType::I64));
         }
         // §12 `thread.spawn` resolves a static funcidx whose signature must be the fixed thread-entry
         // type `(i64 sp, i64 arg) -> i64`; appends the spawned vCPU handle (`i32`).

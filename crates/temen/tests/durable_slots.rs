@@ -88,8 +88,8 @@ block 0 (v0: i32) {
   v4 = thread.spawn 2 v2 v2
   v5 = i32.const 0
   v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
-  v7 = thread.join v3
-  v8 = thread.join v4
+  v7_st, v7 = thread.join v3
+  v8_st, v8 = thread.join v4
   v9 = i64.const 65544
   v10 = i64.load v9
   v11 = i64.const 1000000
@@ -113,7 +113,7 @@ block 0 (v0: i32) {
   i32.store v1 v0
   v2 = i64.const 0
   v3 = thread.spawn 1 v2 v2
-  v7 = thread.join v3
+  v7_st, v7 = thread.join v3
   v4 = thread.spawn 2 v2 v2
   f0 = ref.func 3
   f1 = i64.const 4096
@@ -121,7 +121,7 @@ block 0 (v0: i32) {
   f3, f4 = cont.resume f2 v2
   v5 = i32.const 0
   v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
-  v8 = thread.join v4
+  v8_st, v8 = thread.join v4
   v9 = i64.const 65544
   v10 = i64.load v9
   v11 = i64.const 1000000
@@ -132,6 +132,80 @@ block 0 (v0: i32) {
   v16 = i64.add v15 v6
   v17 = i64.add v16 v8
   return v17
+  }
+}
+"#;
+
+/// #2619 — the root spawns B, A and A (slots 0 to 2), joins both As, and resumes a fiber: the
+/// safepoint the trigger freezes it at. Then it joins the second A again, which is spent, and spawns
+/// one more A, which takes the lowest free slot at its next generation. Returns
+/// `handle * 10^7 + (status + 100) * 10^4 + counter * 1000 + join(B)`.
+const SPENT_ACROSS_THE_CUT: &str = r#"
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 65536
+  i32.store v1 v0
+  z = i64.const 0
+  c0 = thread.spawn 2 z z
+  c1 = thread.spawn 1 z z
+  c2 = thread.spawn 1 z z
+  j1_st, j1 = thread.join c1
+  j2_st, j2 = thread.join c2
+  f0 = ref.func 3
+  f1 = i64.const 4096
+  f2 = cont.new f0 f1
+  f3, f4 = cont.resume f2 z
+  r_st, r = thread.join c2
+  c3 = thread.spawn 1 z z
+  j3_st, j3 = thread.join c3
+  j0_st, j0 = thread.join c0
+  h = i64.extend_i32_s c3
+  k7 = i64.const 10000000
+  t1 = i64.mul h k7
+  k100 = i64.const 100
+  s = i64.add r_st k100
+  k4 = i64.const 10000
+  t2 = i64.mul s k4
+  ca = i64.const 65544
+  cn = i64.load ca
+  k3 = i64.const 1000
+  t3 = i64.mul cn k3
+  a1 = i64.add t1 t2
+  a2 = i64.add a1 t3
+  a3 = i64.add a2 j0
+  return a3
+  }
+}
+"#;
+
+/// The `Instantiator` every run's host grants, second: slot 1's first handle.
+const INSTANTIATOR: i32 = temen_ir::handles::pack(1, 1);
+
+/// #2043 — the root spawns B and detaches it (`Instantiator.detach`), spawns A, which reissues B's
+/// slot at generation 2, and resumes a fiber: the safepoint the trigger freezes it at. Then it joins
+/// B's old handle, which is spent, and A. Returns `(status + 100) * 1000 + join(A)`.
+const DETACHED_THREAD: &str = r#"
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 65536
+  i32.store v1 v0
+  z = i64.const 0
+  t = thread.spawn 2 z z
+  vi = i32.const INST
+  d = call.cap 6 10 (i32) -> (i32) vi (t)
+  a = thread.spawn 1 z z
+  f0 = ref.func 3
+  f1 = i64.const 4096
+  f2 = cont.new f0 f1
+  f3, f4 = cont.resume f2 z
+  s, x = thread.join t
+  sa, ja = thread.join a
+  k100 = i64.const 100
+  s1 = i64.add s k100
+  k1000 = i64.const 1000
+  s2 = i64.mul s1 k1000
+  r = i64.add s2 ja
+  return r
   }
 }
 "#;
@@ -404,6 +478,8 @@ struct Residue {
     vcpus: Vec<FrozenVCpu>,
     fibers: Vec<FrozenFiber>,
     root_sp: Option<u64>,
+    /// #2043 — the domain's child-handle table's counters.
+    children: Vec<u32>,
 }
 
 /// One engine's run of a window: its result, the window after, the residue it recorded, and the clock
@@ -446,12 +522,15 @@ fn run(
     h.set_durable(true);
     h.clock_ns = clock;
     let clk = h.grant_clock();
+    // Granted second, so its handle is [`INSTANTIATOR`]: what [`DETACHED_THREAD`] detaches through.
+    assert_eq!(h.grant_instantiator(), INSTANTIATOR);
     if let (Engine::Interp | Engine::Bytecode, Some(r)) = (engine, seed) {
         h.set_frozen_vcpus(r.vcpus.clone());
         h.set_frozen_fibers(r.fibers.clone());
         if let Some(sp) = r.root_sp {
             h.set_frozen_root_sp(sp);
         }
+        h.set_child_generations(r.children.clone());
     }
     let mut fuel = 1_000_000u64;
     let args = [Value::I32(clk)];
@@ -470,6 +549,7 @@ fn run(
                 vcpus: h.frozen_vcpus().to_vec(),
                 fibers: h.frozen_fibers().to_vec(),
                 root_sp: h.frozen_root_sp(),
+                children: h.child_generations().to_vec(),
             };
             (one_i64(r), window, residue)
         }
@@ -508,6 +588,7 @@ mod jit {
                 vcpus: r.vcpus.iter().map(to_jit).collect(),
                 fibers: r.fibers.iter().map(fiber_to_jit).collect(),
                 root_sp: r.root_sp,
+                children: r.children.clone(),
             },
             None => DurableResidue {
                 root_sp: Some(arena(inst).region_base(0)),
@@ -546,6 +627,7 @@ mod jit {
             vcpus: residue.vcpus.iter().map(to_interp).collect(),
             fibers: residue.fibers.iter().map(fiber_to_interp).collect(),
             root_sp: residue.root_sp,
+            children: residue.children,
         };
         Some((result, window, residue))
     }
@@ -577,6 +659,7 @@ mod jit {
             task: v.task,
             parent_task: v.parent_task,
             slot: v.slot,
+            joinable: v.joinable,
             func: v.func,
             args: v.args.clone(),
             shadow_sp: v.shadow_sp,
@@ -589,6 +672,7 @@ mod jit {
             task: v.task,
             parent_task: v.parent_task,
             slot: v.slot,
+            joinable: v.joinable,
             func: v.func,
             args: v.args.clone(),
             shadow_sp: v.shadow_sp,
@@ -680,13 +764,14 @@ fn a_finished_unjoined_thread_rides_as_completed_at_its_slot() {
     );
 }
 
-/// A was joined before the freeze, so only B rides, at slot 1; its handle still resolves on thaw.
+/// A was joined before B was spawned, so B took its slot at the next generation (#2043): only B
+/// rides, at slot 0, and the slot's counter rides with it, so B's handle still resolves on thaw.
 #[test]
-fn a_slot_joined_before_the_freeze_stays_empty() {
+fn a_slot_joined_before_the_freeze_is_reissued() {
     check_threads(
         JOINED_FIRST,
         |w| arm_freeze_after(w, TEST_ARENA, 1),
-        &[(2, 1, None)],
+        &[(2, 0, None)],
     );
 }
 
@@ -700,6 +785,67 @@ fn a_join_that_got_its_result_reloads_it() {
         |w| write_state(w, TEST_ARENA, STATE_UNWINDING),
         &[],
     );
+}
+
+/// #2619 — a thread handle spent before the cut stays spent after it, and the next spawn takes the
+/// handle the uninterrupted run takes: the domain's one child table rides the freeze, every slot's
+/// counter with it (#2043). B rides completed at slot 0; both As were joined, so only their counters
+/// ride. Uninterrupted, the re-join answers `-EBADF` and the new A takes slot 1 at generation 2.
+#[test]
+fn a_spent_handle_stays_spent_and_the_next_spawn_matches_across_the_cut() {
+    let src = format!("{SPENT_ACROSS_THE_CUT}{THREADS}");
+    let handle = i64::from(temen_ir::handles::pack(1, 2));
+    let want = handle * 10_000_000 + (temen_ir::errno::EBADF + 100) * 10_000 + 3 * 1000 + 52;
+    let inst = instrument(&src);
+    for &engine in ARMED_ENGINES {
+        let fresh = init_durable_window(WINDOW, arena(&inst));
+        if let Some(whole) = run(engine, &inst, &fresh, 42, None) {
+            assert_eq!(whole.result, Ok(want), "{engine:?}: uninterrupted");
+        }
+    }
+    for (engine, r) in freeze_thaw(ARMED_ENGINES, &src, |w| arm_freeze_after(w, TEST_ARENA, 1)) {
+        assert_eq!(
+            threads(&r.residue),
+            [(1, 0, Some(52))],
+            "{engine:?}: residue"
+        );
+        assert_eq!(r.residue.children, [1, 1, 1], "{engine:?}: the child table");
+    }
+}
+
+/// #2043 — a thread its spawner detached, whose slot it then reissued, rides the freeze with no
+/// handle naming it: at slot 0, unjoinable, beside the slot's new holder, which rides completed there.
+/// The thaw re-creates it unjoinable, so its old handle still answers `-EBADF` and the new one names
+/// A, as uninterrupted.
+#[test]
+fn a_detached_thread_rides_with_no_handle_naming_it() {
+    let src = format!(
+        "{}{THREADS}",
+        DETACHED_THREAD.replace("INST", &INSTANTIATOR.to_string())
+    );
+    let want = (temen_ir::errno::EBADF + 100) * 1000 + 107;
+    let inst = instrument(&src);
+    for &engine in ARMED_ENGINES {
+        let fresh = init_durable_window(WINDOW, arena(&inst));
+        if let Some(whole) = run(engine, &inst, &fresh, 42, None) {
+            assert_eq!(whole.result, Ok(want), "{engine:?}: uninterrupted");
+        }
+    }
+    for (engine, r) in freeze_thaw(ARMED_ENGINES, &src, |w| arm_freeze_after(w, TEST_ARENA, 1)) {
+        let mut vcpus: Vec<_> = r
+            .residue
+            .vcpus
+            .iter()
+            .map(|v| (v.task, v.slot, v.joinable, v.completed_result))
+            .collect();
+        vcpus.sort();
+        assert_eq!(
+            vcpus,
+            [(1, 0, false, None), (2, 0, true, Some(107))],
+            "{engine:?}: residue"
+        );
+        assert_eq!(r.residue.children, [2], "{engine:?}: the child table");
+    }
 }
 
 /// Slot 0 is free at generation 1 (k0 finished), slot 1 fresh (k1 never resumed), slot 2 frozen (k2
@@ -824,7 +970,7 @@ block 0 (v0: i32) {
   i32.store v1 v0
   v2 = i64.const 0
   v3 = thread.spawn 2 v2 v2
-  v4 = thread.join v3
+  v4_st, v4 = thread.join v3
   v5 = i32.const 0
   v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
   v7 = i64.add v4 v6

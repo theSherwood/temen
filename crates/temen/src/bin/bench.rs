@@ -143,10 +143,10 @@ block 0 (vn: i32) {
   vt1 = thread.spawn 1 vz vn64
   vt2 = thread.spawn 1 vz vn64
   vt3 = thread.spawn 1 vz vn64
-  vr0 = thread.join vt0
-  vr1 = thread.join vt1
-  vr2 = thread.join vt2
-  vr3 = thread.join vt3
+  vr0_st, vr0 = thread.join vt0
+  vr1_st, vr1 = thread.join vt1
+  vr2_st, vr2 = thread.join vt2
+  vr3_st, vr3 = thread.join vt3
   va = i64.add vr0 vr1
   vb = i64.add vr2 vr3
   vs = i64.add va vb
@@ -185,10 +185,10 @@ block 0 (vn: i32) {
   vt1 = thread.spawn 1 vz vn64
   vt2 = thread.spawn 1 vz vn64
   vt3 = thread.spawn 1 vz vn64
-  vr0 = thread.join vt0
-  vr1 = thread.join vt1
-  vr2 = thread.join vt2
-  vr3 = thread.join vt3
+  vr0_st, vr0 = thread.join vt0
+  vr1_st, vr1 = thread.join vt1
+  vr2_st, vr2 = thread.join vt2
+  vr3_st, vr3 = thread.join vt3
   vc = i64.const 16392
   vcount = i64.load vc
   return vcount
@@ -290,7 +290,7 @@ block 3 (vi: i64, vt: i32) {
   br_if vmore 1(vi2, vt) 4(vt)
   }
 block 4 (vt: i32) {
-  vr = thread.join vt
+  vr_st, vr = thread.join vt
   return vr
   }
 }
@@ -341,7 +341,7 @@ block 0 (vn: i32) {
 block 1 (vi: i64, vacc: i64) {
   vz = i64.const 0
   vt = thread.spawn 1 vz vi
-  vr = thread.join vt
+  vr_st, vr = thread.join vt
   vacc2 = i64.add vacc vr
   vone = i64.const 1
   vi2 = i64.sub vi vone

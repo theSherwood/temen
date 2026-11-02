@@ -11,10 +11,7 @@ struct Fixture {
     root: Arc<Mutex<Host>>,
     child: Arc<Mutex<Host>>,
     registry: Arc<FiberRegistry>,
-    threads: Vec<Option<TaskId>>,
-    unreaped: Vec<(usize, TaskId)>,
-    child_hosts: BTreeMap<usize, Arc<Mutex<Host>>>,
-    child_freeze: BTreeMap<usize, (Arc<AtomicBool>, DetachedSpawn)>,
+    children: Arc<Mutex<Children>>,
 }
 
 impl Fixture {
@@ -24,24 +21,43 @@ impl Fixture {
             root: Arc::new(Mutex::new(Host::new())),
             child: Arc::new(Mutex::new(Host::new())),
             registry: Arc::new(FiberRegistry::new()),
-            threads: Vec::new(),
-            unreaped: Vec::new(),
-            child_hosts: BTreeMap::new(),
-            child_freeze: BTreeMap::new(),
+            children: Arc::default(),
         }
     }
 
-    /// The root's seat, with a detached child at slot 0 (task 7) when `threads` names one.
+    /// The root's seat, with a detached child (task 7) when its domain's table names one.
     fn root_seat(&self) -> Seat<'_> {
         Seat {
             id: 0,
-            threads: &self.threads,
-            unreaped: &self.unreaped,
-            child_hosts: &self.child_hosts,
-            child_freeze: &self.child_freeze,
+            children: &self.children,
             host: &self.root,
             registry: &self.registry,
         }
+    }
+
+    /// The detached child's record, wherever its domain keeps it.
+    fn with_record<R>(&self, f: impl FnOnce(&mut Child) -> R) -> R {
+        let mut c = self.children.lock_unpoisoned();
+        let Children {
+            table, unreaped, ..
+        } = &mut *c;
+        let record = match table.get_mut(0) {
+            Some(record) => record,
+            None => unreaped.first_mut().expect("the child"),
+        };
+        f(record)
+    }
+
+    /// Whether the detached child's doorbell has been rung.
+    fn rung(&self) -> bool {
+        self.with_record(|c| {
+            c.domain
+                .as_ref()
+                .and_then(|d| d.freeze.as_ref())
+                .expect("a bell")
+                .0
+                .load(Ordering::Relaxed)
+        })
     }
 
     fn census(&self, seat: &Seat) -> Option<DeclineCause> {
@@ -54,30 +70,37 @@ impl Fixture {
     }
 
     /// [`Fixture::with_detached_child`], demand-paged by `pager` when it has one.
-    fn with_child(mut self, bell: bool, pager: Option<u32>) -> Fixture {
-        self.threads = vec![Some(7)];
-        self.child_hosts.insert(0, Arc::clone(&self.child));
-        if bell {
+    fn with_child(self, bell: bool, pager: Option<u32>) -> Fixture {
+        let freeze = bell.then(|| {
             let m = Arc::new(Module::default());
-            self.child_freeze.insert(
-                0,
-                (
-                    Arc::new(AtomicBool::new(false)),
-                    DetachedSpawn {
-                        digest: module_digest(&m),
-                        module: m,
-                        pager,
-                    },
-                ),
-            );
-        }
+            (
+                Arc::new(AtomicBool::new(false)),
+                DetachedSpawn {
+                    digest: module_digest(&m),
+                    module: m,
+                    pager,
+                },
+            )
+        });
+        let child = Child {
+            task: Some(7),
+            domain: Some(ChildDomain {
+                host: Some(Arc::clone(&self.child)),
+                freeze,
+                ..ChildDomain::default()
+            }),
+        };
+        let issued = self.children.lock_unpoisoned().table.issue(child);
+        assert!(issued.is_ok());
         self
     }
 
     /// #2465 — the child at slot 0, detached (op 10) while it runs: no join slot names it.
-    fn detached_by_op_10(mut self) -> Fixture {
-        self.threads = vec![None];
-        self.unreaped = vec![(0, 7)];
+    fn detached_by_op_10(self) -> Fixture {
+        let mut c = self.children.lock_unpoisoned();
+        let child = c.table.retire(0).expect("the child");
+        c.unreaped.push(child);
+        drop(c);
         self
     }
 }
@@ -141,10 +164,7 @@ fn a_paged_child_detached_by_op_10_holds_its_pager() {
             "held, detached {detached}"
         );
         assert!(rs.lock().held[&domain].contains(&7), "for the child");
-        assert!(
-            f.child_freeze[&0].0.load(Ordering::Relaxed),
-            "the child is rung, detached {detached}"
-        );
+        assert!(f.rung(), "the child is rung, detached {detached}");
     }
 }
 
@@ -328,8 +348,15 @@ fn a_page_fault_park_takes_the_freeze_phase_and_waits() {
 /// ended the domain is released and its parks are brought through the freeze.
 #[test]
 fn a_domain_paging_a_live_child_is_held_until_the_child_ends() {
-    let mut f = Fixture::new().with_detached_child(true);
-    f.child_freeze.get_mut(&0).expect("slot 0").1.pager = Some(0);
+    let f = Fixture::new().with_detached_child(true);
+    f.with_record(|c| {
+        c.domain
+            .as_mut()
+            .and_then(|d| d.freeze.as_mut())
+            .expect("a bell")
+            .1
+            .pager = Some(0);
+    });
     let SchedRef::Real(rs) = &f.sched else {
         unreachable!()
     };
@@ -337,10 +364,7 @@ fn a_domain_paging_a_live_child_is_held_until_the_child_ends() {
     let mut s = rs.lock();
     park_on_futex(&mut s, &f, 4);
     assert!(hold_for_paged(&mut s, root, Some(&f.root_seat())));
-    assert!(
-        f.child_freeze[&0].0.load(Ordering::Relaxed),
-        "the child is rung"
-    );
+    assert!(f.rung(), "the child is rung");
     assert_eq!(s.held[&root], BTreeSet::from([7]));
 
     admit_parks_for_freeze(&mut s);

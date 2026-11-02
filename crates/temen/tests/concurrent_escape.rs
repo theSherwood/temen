@@ -65,10 +65,10 @@ block 0 () {
   v3 = thread.spawn 1 v0 v1
   v4 = thread.spawn 1 v0 v1
   v5 = thread.spawn 1 v0 v1
-  v6 = thread.join v2
-  v7 = thread.join v3
-  v8 = thread.join v4
-  v9 = thread.join v5
+  v6_st, v6 = thread.join v2
+  v7_st, v7 = thread.join v3
+  v8_st, v8 = thread.join v4
+  v9_st, v9 = thread.join v5
   v10 = i64.const 16392
   v11 = i64.atomic.load v10
   return v11
@@ -136,10 +136,10 @@ block 0 () {
   v6 = thread.spawn 1 v0 v5
   v7 = i64.const 16408
   v8 = thread.spawn 1 v0 v7
-  v9 = thread.join v2
-  v10 = thread.join v4
-  v11 = thread.join v6
-  v12 = thread.join v8
+  v9_st, v9 = thread.join v2
+  v10_st, v10 = thread.join v4
+  v11_st, v11 = thread.join v6
+  v12_st, v12 = thread.join v8
   v13 = i64.const 0
   return v13
   }
@@ -190,10 +190,10 @@ block 0 () {
   v3 = thread.spawn 1 v0 v1
   v4 = thread.spawn 1 v0 v1
   v5 = thread.spawn 1 v0 v1
-  v6 = thread.join v2
-  v7 = thread.join v3
-  v8 = thread.join v4
-  v9 = thread.join v5
+  v6_st, v6 = thread.join v2
+  v7_st, v7 = thread.join v3
+  v8_st, v8 = thread.join v4
+  v9_st, v9 = thread.join v5
   v10 = i64.const 0
   return v10
   }
@@ -256,7 +256,7 @@ func () -> (i64) {
 block 0 () {
   v0 = i64.const 0
   v1 = thread.spawn 1 v0 v0
-  v2 = thread.join v1
+  v2_st, v2 = thread.join v1
   v3 = i64.const 0
   return v3
   }

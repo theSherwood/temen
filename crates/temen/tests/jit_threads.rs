@@ -57,7 +57,7 @@ const ATOMIC4: &str = "memory 16\n\
     \x20 v20 = i64.const 16400\n\
     \x20 v21 = i64.add v20 v19\n\
     \x20 v22 = i32.load v21\n\
-    \x20 v23 = thread.join v22\n\
+    \x20 v23_st, v23 = thread.join v22\n\
     \x20 v24 = i64.const 1\n\
     \x20 v25 = i64.add v17 v24\n\
     \x20 br 4(v25)\n\
@@ -135,9 +135,9 @@ fn thread_spawn_join_sums_results() {
         \x20 v4 = thread.spawn 1 v0 v3\n\
         \x20 v5 = i64.const 30\n\
         \x20 v6 = thread.spawn 1 v0 v5\n\
-        \x20 v7 = thread.join v2\n\
-        \x20 v8 = thread.join v4\n\
-        \x20 v9 = thread.join v6\n\
+        \x20 v7_st, v7 = thread.join v2\n\
+        \x20 v8_st, v8 = thread.join v4\n\
+        \x20 v9_st, v9 = thread.join v6\n\
         \x20 v10 = i64.add v7 v8\n\
         \x20 v11 = i64.add v10 v9\n\
         \x20 return v11\n\
@@ -194,7 +194,7 @@ const FUTEX: &str = "memory 16\n\
     \x20 v6 = i64.const 16384\n\
     \x20 v7 = i32.const 1\n\
     \x20 v8 = atomic.notify v6 v7\n\
-    \x20 v9 = thread.join v3\n\
+    \x20 v9_st, v9 = thread.join v3\n\
     \x20 return v9\n\
       }\n\
     }\n\
@@ -241,7 +241,7 @@ fn thread_with_fiber_inside() {
         \x20 v0 = i64.const 0\n\
         \x20 v1 = i64.const 5\n\
         \x20 v2 = thread.spawn 1 v0 v1\n\
-        \x20 v3 = thread.join v2\n\
+        \x20 v3_st, v3 = thread.join v2\n\
         \x20 return v3\n\
           }\n\
         }\n\
@@ -312,7 +312,7 @@ fn thread_parallel_with_fibers() {
         \x20 v23 = i64.const 16400\n\
         \x20 v24 = i64.add v23 v22\n\
         \x20 v25 = i32.load v24\n\
-        \x20 v26 = thread.join v25\n\
+        \x20 v26_st, v26 = thread.join v25\n\
         \x20 v27 = i64.add v20 v26\n\
         \x20 v28 = i64.const 1\n\
         \x20 v29 = i64.add v19 v28\n\
@@ -354,17 +354,18 @@ fn thread_parallel_with_fibers() {
     assert_jit_matches_interp(src);
 }
 
-/// Joining the same handle twice is inert the second time → `ThreadFault`, on both backends.
+/// Joining the same handle twice finds it spent the second time → status `-EBADF` (#2667), on both
+/// backends.
 #[test]
-fn thread_double_join_traps() {
+fn thread_double_join_is_spent() {
     let src = "func () -> (i64) {\n\
         block 0 () {\n\
         \x20 v0 = i64.const 0\n\
         \x20 v1 = i64.const 7\n\
         \x20 v2 = thread.spawn 1 v0 v1\n\
-        \x20 v3 = thread.join v2\n\
-        \x20 v4 = thread.join v2\n\
-        \x20 return v4\n\
+        \x20 v3_st, v3 = thread.join v2\n\
+        \x20 v4_st, v4 = thread.join v2\n\
+        \x20 return v4_st\n\
           }\n\
         }\n\
         func (i64, i64) -> (i64) {\n\
@@ -389,7 +390,7 @@ fn fiber_namespace_is_domain_wide() {
         \x20 v1 = i64.const 0\n\
         \x20 v2 = cont.new v0 v1\n\
         \x20 v3 = thread.spawn 1 v1 v1\n\
-        \x20 v4 = thread.join v3\n\
+        \x20 v4_st, v4 = thread.join v3\n\
         \x20 v5 = i64.const 7\n\
         \x20 v6, v7 = cont.resume v2 v5\n\
         \x20 v8 = i64.const 100\n\
@@ -444,7 +445,7 @@ fn fiber_suspended_on_root_migrates_to_spawned_vcpu() {
         \x20 v3 = i64.const 5\n\
         \x20 v4, v5 = cont.resume v2 v3\n\
         \x20 v6 = thread.spawn 1 v2 v2\n\
-        \x20 v7 = thread.join v6\n\
+        \x20 v7_st, v7 = thread.join v6\n\
         \x20 return v7\n\
           }\n\
         }\n\
@@ -572,7 +573,7 @@ fn concurrent_fiber_steal_stress() {
             root.push_str(&format!(
                 "\x20 v{a} = i64.const {addr}\n\
                  \x20 v{b} = i32.load v{a}\n\
-                 \x20 v{c} = thread.join v{b}\n",
+                 \x20 v{c}_st, v{c} = thread.join v{b}\n",
                 a = v,
                 b = v + 1,
                 c = v + 2,

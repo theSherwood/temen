@@ -1750,7 +1750,8 @@ static int gen_builtin_fiber_suspend(Node *node) {
 // `(i64) -> (i64)`:
 //
 //   int  __vm_thread_spawn(long (*fn)(long), long arg);  // -> i32 handle (fn must be a direct name)
-//   long __vm_thread_join(int handle);                   // -> the thread's result
+//   long __vm_thread_join(int handle, long *status);     // -> the thread's result; *status 0, or
+//                                                        //    -EBADF for a spent handle (#2667)
 //   long __vm_atomic_add  (void *p, long v);             // fetch-add, returns the old value
 //   long __vm_atomic_load (void *p);
 //   void __vm_atomic_store(void *p, long v);
@@ -1831,13 +1832,20 @@ static int gen_builtin_vcpu_tls_set(Node *node) {
   return 0; // void
 }
 
+// `__vm_thread_join(handle, status)`: the §12 join. It answers two results, as the §14 join does
+// (#2667): the value is the return, the status is stored through `status` (a `long *`) — 0 if the
+// thread returned, `-EBADF` and a 0 value if the handle is spent (already joined).
 static int gen_builtin_thread_join(Node *node) {
-  if (!node->args || node->args->next)
-    error_tok(node->tok, "codegen_ir: __vm_thread_join(handle) expects 1 argument");
-  int h = gen_expr(node->args); // i32 handle
-  int r = nv++;
-  cg("  v%d = thread.join v%d\n", r, h);
-  return r; // i64 result
+  Node *a = node->args;
+  if (!a || !a->next || a->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_thread_join(handle, status) expects 2 arguments");
+  int h = gen_expr(a);                // i32 handle
+  int status_ptr = gen_expr(a->next); // long* — where to store the status
+  int status = nv++;
+  int value = nv++;
+  cg("  v%d, v%d = thread.join v%d\n", status, value, h);
+  cg("  i64.store v%d v%d\n", status_ptr, status);
+  return value; // i64 result
 }
 
 static int gen_builtin_atomic_add(Node *node) {

@@ -6,7 +6,8 @@
 //!   * `__vm_thread_spawn(entry, stack, arg) -> handle` → `Inst::ThreadSpawn` (start a vCPU running
 //!     `entry(stack, arg)`; `entry` must be a **direct** function symbol, `stack` is the new vCPU's
 //!     data-stack base, `arg` is passed through).
-//!   * `__vm_thread_join(handle) -> i64` → `Inst::ThreadJoin` (block until that vCPU finishes).
+//!   * `__vm_thread_join(handle, status) -> i64` → `Inst::ThreadJoin` (block until that vCPU
+//!     finishes; `*status` is 0, or `-EBADF` for a spent handle).
 //!   * `__vm_vcpu_tls_set(base)` / `__vm_tls_size()` — the NIM.md §3d Tier-2 per-vCPU TLS block: a
 //!     spawned thread allocates + zeroes a `__vm_tls_size()`-byte block and points `vcpu.tls` at it,
 //!     so its thread-locals are isolated from every other vCPU's.
@@ -32,7 +33,7 @@ pub const DEFAULT_MIN_STACK_SIZE: usize = 1 << 20; // 1 MiB, as on hermit.
 
 unsafe extern "C" {
     fn __vm_thread_spawn(entry: extern "C" fn(usize) -> i64, stack: *mut u8, arg: usize) -> i32;
-    fn __vm_thread_join(handle: i32) -> i64;
+    fn __vm_thread_join(handle: i32, status: *mut i64) -> i64;
     fn __vm_vcpu_tls_set(base: usize);
     fn __vm_tls_size() -> usize;
     fn __vm_tls_template() -> *const u8;
@@ -141,8 +142,10 @@ impl Thread {
 
     pub fn join(self) {
         // `__vm_thread_join` blocks until the vCPU finishes, so the stack is safe to free afterward.
+        // `join` consumes the `Thread`, so its handle is never spent: the status is always 0.
         unsafe {
-            let _ = __vm_thread_join(self.handle);
+            let mut status = 0;
+            let _ = __vm_thread_join(self.handle, &mut status);
             dealloc(self.stack, self.stack_layout);
         }
     }

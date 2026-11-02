@@ -53,7 +53,7 @@ block 0 () {
   k4096 = i64.const 4096
   sp = i64.add blk k4096
   t = thread.spawn 1 sp blk
-  jr = thread.join t
+  jr_st, jr = thread.join t
   mine = i64.load a
   k1000 = i64.const 1000
   hi = i64.mul jr k1000

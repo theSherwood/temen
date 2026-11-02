@@ -43,10 +43,10 @@ block 4 (vsum4: i64, d0: i32, d1: i32, d2: i32, d3: i32) {
   br 3(vsum4, d0, d1, d2, d3)
 }
 block 5 (vsum5: i64, h0: i32, h1: i32, h2: i32, h3: i32) {
-  j0 = thread.join h0
-  j1 = thread.join h1
-  j2 = thread.join h2
-  j3 = thread.join h3
+  j0_st, j0 = thread.join h0
+  j1_st, j1 = thread.join h1
+  j2_st, j2 = thread.join h2
+  j3_st, j3 = thread.join h3
   j01 = i64.add j0 j1
   j23 = i64.add j2 j3
   vj = i64.add j01 j23

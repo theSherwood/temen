@@ -84,7 +84,7 @@ block 5 (vj2: i64) {
   vbasej = i64.const 16400
   vslotj = i64.add vbasej voffj
   vtj = i32.load vslotj
-  vjoined = thread.join vtj
+  vjoined_st, vjoined = thread.join vtj
   vonej = i64.const 1
   vnextj = i64.add vj2 vonej
   br 4(vnextj)

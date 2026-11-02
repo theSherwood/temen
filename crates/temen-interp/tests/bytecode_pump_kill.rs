@@ -225,7 +225,7 @@ block 0 () {
   vsp = i64.const 0
   varg = i64.const 0
   vt = thread.spawn 1 vsp varg
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   return vj
   }
 }

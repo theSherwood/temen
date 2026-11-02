@@ -126,6 +126,9 @@ pub(crate) struct ChildTask {
     dom: Option<Arc<Domain>>,
     /// #2001 — a detached child's own budget node, handed to [`Self::dom`] for its threads' charges.
     node: Option<Arc<dyn crate::BudgetNode>>,
+    /// #2043 — the child domain's child table, which its nursery and [`Self::dom`] share; its
+    /// counters ride the child's capture.
+    children: crate::os_thread_rt::ChildTable,
     /// #1991 — its quantum ended with another task waiting, and it keeps the lanes it ran in until it
     /// parks or finishes, as the interpreter's preempted vCPU does (#2237): its next resume takes
     /// none.
@@ -171,6 +174,7 @@ impl ChildTask {
         done: Arc<ChildDone>,
         teardown: Teardown,
         node: Option<Arc<dyn crate::BudgetNode>>,
+        children: crate::os_thread_rt::ChildTable,
     ) -> Result<ChildTask, Teardown> {
         // #2305/#2286 — a window the OS will not give refuses the child as a refused pre-map does:
         // no room for its reservation, or a commit or protection its seeding needs. It never runs,
@@ -261,6 +265,7 @@ impl ChildTask {
             teardown: Some(teardown),
             dom: None,
             node,
+            children,
             holds_lanes: false,
             retiring: false,
             thaw: crate::DurableResidue::default(),
@@ -384,6 +389,7 @@ impl ChildTask {
                 fibers,
                 vcpus,
                 root_sp: Some(root_sp),
+                children: self.children.generations(),
             },
         })
     }
@@ -617,7 +623,12 @@ impl ChildExec {
         }
         if task._code.spawns || durable {
             if let Some(hub) = self.domain() {
-                let d = Arc::new(Domain::new_child(hub, task.chain.clone(), task.node.take()));
+                let d = Arc::new(Domain::new_child(
+                    hub,
+                    task.chain.clone(),
+                    task.node.take(),
+                    Arc::clone(&task.children),
+                ));
                 d.set_env(
                     task.window.base() as u64,
                     task._code.fn_table.base() as u64,

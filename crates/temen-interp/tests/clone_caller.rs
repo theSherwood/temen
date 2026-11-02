@@ -1050,7 +1050,7 @@ block 4 (vpid: i64, vth: i32) {
   br_if vretry 4(vpid, vth) 5(vstatus, vth)
   }
 block 5 (vstatus: i64, vth: i32) {
-  vts = thread.join vth
+  vts_st, vts = thread.join vth
   vsum = i64.add vstatus vts
   return vsum
   }

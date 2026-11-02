@@ -56,7 +56,7 @@ block 2 (v6: i64, v7: i64) {
   v8 = i64.const 0
   v9 = i64.const 0
   v10 = thread.spawn 1 v8 v9
-  v11 = thread.join v10
+  v11_st, v11 = thread.join v10
   v12 = i64.add v7 v11
   v13 = i64.const 1
   v14 = i64.add v6 v13
@@ -118,8 +118,8 @@ block 2 (v6: i64, v7: i64) {
   v8 = i64.const 0
   v9 = thread.spawn 1 v8 v8
   v10 = thread.spawn 1 v8 v8
-  v11 = thread.join v9
-  v12 = thread.join v10
+  v11_st, v11 = thread.join v9
+  v12_st, v12 = thread.join v10
   v13 = i64.add v7 v11
   v14 = i64.add v13 v12
   v15 = i64.const 1

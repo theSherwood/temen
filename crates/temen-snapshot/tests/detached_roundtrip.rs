@@ -127,6 +127,8 @@ fn parent_with(
     let mut host = Host::new();
     host.set_durable(true);
     host.grant_durable_module(c);
+    // #2043 — its child table: slot 0's child spent, slot 1 the captured one's.
+    host.set_child_generations(vec![1, 1]);
     host.set_captured_detached(vec![CapturedDetached {
         parent_task: 0,
         slot: 1,
@@ -201,6 +203,7 @@ fn a_live_detached_child_round_trips_through_its_parents_artifact() {
     let mut again = Host::new();
     again.set_durable(true);
     again.grant_durable_module(&c);
+    again.set_child_generations(rhost.child_generations().to_vec());
     again.set_captured_detached(thawed.into_iter().map(|t| recaptured(t, &c)).collect());
     assert_eq!(freeze(&p, &win, &again).expect("re-freeze"), art);
 }
@@ -245,6 +248,7 @@ fn a_childs_inherited_stdout_rides_its_artifact_as_inherited() {
     let mut again = Host::new();
     again.set_durable(true);
     again.grant_durable_module(&c);
+    again.set_child_generations(rhost.child_generations().to_vec());
     again.set_captured_detached(thawed.into_iter().map(|t| recaptured(t, &c)).collect());
     assert_eq!(freeze(&p, &win, &again).expect("re-freeze"), art);
 }
@@ -420,6 +424,7 @@ fn a_budget_node_the_parent_and_child_share_is_one_node_after_a_thaw() {
         .cap_dispatch_slots(cap_id::BUDGET, 0, cb, &[-1, 1 << 16, -1], None)
         .unwrap()[0] as i32;
     assert!(mine >= 0, "the child splits a node of its own");
+    host.set_child_generations(vec![1, 1]);
     host.set_captured_detached(vec![CapturedDetached {
         parent_task: 0,
         slot: 1,

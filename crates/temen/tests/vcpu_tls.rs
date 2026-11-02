@@ -108,9 +108,9 @@ mod threaded {
             \x20 h1 = thread.spawn 1 sp a1\n\
             \x20 a2 = i64.const 2\n\
             \x20 h2 = thread.spawn 1 sp a2\n\
-            \x20 j0 = thread.join h0\n\
-            \x20 j1 = thread.join h1\n\
-            \x20 j2 = thread.join h2\n\
+            \x20 j0_st, j0 = thread.join h0\n\
+            \x20 j1_st, j1 = thread.join h1\n\
+            \x20 j2_st, j2 = thread.join h2\n\
             \x20 s0 = i64.const 17408\n\
             \x20 v0 = i64.load s0\n\
             \x20 s1 = i64.const 17416\n\
@@ -168,7 +168,7 @@ mod threaded {
             \x20 st0, val0 = cont.resume fh a0\n\
             \x20 bsp = i64.const 8192\n\
             \x20 bh = thread.spawn 1 bsp fh\n\
-            \x20 bret = thread.join bh\n\
+            \x20 bret_st, bret = thread.join bh\n\
             \x20 s1 = i64.const 17408\n\
             \x20 r1 = i64.load s1\n\
             \x20 return r1 bret\n\

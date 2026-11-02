@@ -1597,9 +1597,11 @@ fn take_residue(host: &mut Host) -> temen_jit::DurableResidue {
         fibers: host.frozen_fibers().iter().map(jit_fiber).collect(),
         vcpus: host.frozen_vcpus().iter().map(jit_vcpu).collect(),
         root_sp: host.take_frozen_root_sp(),
+        children: host.child_generations().to_vec(),
     };
     host.set_frozen_fibers(Vec::new());
     host.set_frozen_vcpus(Vec::new());
+    host.set_child_generations(Vec::new());
     r
 }
 
@@ -1689,9 +1691,8 @@ fn detached_seeds(host: &mut Host) -> Vec<temen_jit::DetachedSeed> {
             },
         )));
     }
-    // #2041 — and each child that had completed but was not joined, as its outcome. The JIT keeps
-    // one join table per domain, so its spawner (`parent_task`) needs no table of its own:
-    // `jit_relaunches` has checked that no two of a domain's children claim one slot.
+    // #2041 — and each child that had completed but was not joined, as its outcome, at its slot of
+    // the domain's one child table (#2043), whichever vCPU spawned it.
     let completed = host.frozen_detached().to_vec();
     host.set_frozen_detached(Vec::new());
     for fd in completed {
@@ -1712,29 +1713,16 @@ fn detached_seeds(host: &mut Host) -> Vec<temen_jit::DetachedSeed> {
 /// depth: its program is granted, and its own powerbox's residue — its children (captured or
 /// completed, #2041), its fibers (#2031) and its `thread.spawn` vCPUs — is one the JIT re-creates.
 ///
-/// #2041 — and no two of a domain's detached children claim one join slot. The interpreter keeps a
-/// join table per spawning vCPU, so two children of different spawners can share a slot number; the
-/// JIT keeps one per domain, where both handles would name one child.
-///
 /// #2438 — and none is demand-paged: a durable JIT run pages no child, so its relaunch re-links no
 /// pager (#2489). A paged artifact thaws on the interpreter, where it was frozen.
 fn jit_relaunches(host: &Host) -> bool {
-    let mut slots: Vec<usize> = host
-        .thawed_detached()
-        .iter()
-        .map(|td| td.slot)
-        .chain(host.frozen_detached().iter().map(|fd| fd.slot))
-        .collect();
-    slots.sort_unstable();
-    let distinct = slots.windows(2).all(|w| w[0] != w[1]);
-    distinct
-        && host.thawed_detached().iter().all(|td| {
-            let c = &td.host;
-            host.durable_module_by_digest(&td.launch.digest).is_some()
-                && td.launch.pager.is_none()
-                && (c.frozen_vcpus().is_empty() || c.frozen_root_sp().is_some())
-                && jit_relaunches(c)
-        })
+    host.thawed_detached().iter().all(|td| {
+        let c = &td.host;
+        host.durable_module_by_digest(&td.launch.digest).is_some()
+            && td.launch.pager.is_none()
+            && (c.frozen_vcpus().is_empty() || c.frozen_root_sp().is_some())
+            && jit_relaunches(c)
+    })
 }
 
 /// #1361 step 4 — the durable detached children a JIT freeze reached, onto the `Host` where the
@@ -1886,6 +1874,7 @@ fn interp_vcpu(v: temen_jit::FrozenVCpu) -> temen_interp::FrozenVCpu {
         task: v.task,
         parent_task: v.parent_task,
         slot: v.slot,
+        joinable: v.joinable,
         func: v.func,
         args: v.args,
         shadow_sp: v.shadow_sp,
@@ -1899,6 +1888,7 @@ fn jit_vcpu(v: &temen_interp::FrozenVCpu) -> temen_jit::FrozenVCpu {
         task: v.task,
         parent_task: v.parent_task,
         slot: v.slot,
+        joinable: v.joinable,
         func: v.func,
         args: v.args.clone(),
         shadow_sp: v.shadow_sp,
@@ -1941,6 +1931,9 @@ fn jit_durable_leave(cm: &mut CompiledModule, host: &mut Host) {
 /// A JIT freeze's residue onto `host`, where the interpreter's freeze leaves it: a run root's, or a
 /// captured detached child's on its powerbox (#2010, #2031). [`take_residue`]'s inverse.
 fn leave_residue(host: &mut Host, r: temen_jit::DurableResidue) {
+    if !r.children.is_empty() {
+        host.set_child_generations(r.children);
+    }
     if !r.fibers.is_empty() {
         host.set_frozen_fibers(r.fibers.into_iter().map(interp_fiber).collect());
     }

@@ -1288,36 +1288,71 @@ impl Domain {
 /// mid-run), and lands in the task's own `table`: a §14 child's installs stay out of its parent's
 /// `call.dyn` (#1296). A unit that names its own functions installs them first, once
 /// ([`unit_module`]). The guest gets the slot at `active`'s `dst`, or `-ENOSPC` when the table is
-/// full. Returns the slot filled.
+/// full. The install goes to `record` as `(table, slot, unit)`, for the task's host to keep
+/// ([`Host::jit_record_install`](super::Host::jit_record_install)): a run's table is its own, so the
+/// host's record is what a later run over that host re-applies ([`reapply_installs`]), as the
+/// tree-walker records and re-applies its installs (#2670). Returns the slot filled.
 fn jit_install(
     unit: Result<super::ResolvedJitUnit, Trap>,
     source: &ModuleSource,
     table: &SharedSlots,
     active: &mut Vm,
     dst: u32,
+    record: impl FnOnce(u32, u32, u32),
 ) -> Result<Option<usize>, Trap> {
     let unit = unit?;
+    let (jit_table, jit_unit) = unit.2;
     let slot = unit_module(source, table, &unit)?
-        .and_then(|module| jit_install_into(source, table, module, unit.2));
+        .and_then(|module| jit_install_into(source, table, module, unit.2, None));
+    if let Some(slot) = slot {
+        record(jit_table, slot as u32, jit_unit);
+    }
     active.set(dst, Reg::from_i64(slot.map_or(super::ENOSPC, |s| s as i64)));
     Ok(slot)
 }
 
-/// §22 `Jit.uninstall` (op 4), as every bytecode driver services it. `authority` is the host's check
+/// Re-apply `host`'s recorded §22 installs onto a run's `table`, each at the slot it held, as the
+/// tree-walker does when it starts a run (`drive_over_cell`; DURABILITY.md §12.5): an install outlives
+/// the run that made it, so a later run over the same powerbox reaches it — the next run, a thaw
+/// (#2670). A slot that already holds its unit, in a table kept across runs, is left alone, so
+/// nothing is compiled or pushed twice. A unit that names its own functions installs them first, in
+/// the first free slots, as on the tree-walker. `Malformed` if a unit is outside the engine's
+/// coverage.
+fn reapply_installs(host: &Host, source: &ModuleSource, table: &SharedSlots) -> Result<(), Trap> {
+    for (slot, unit) in host.jit_reapply() {
+        let slot = slot as usize;
+        if slot < table.len() && table.jit_unit(table.slot(slot).module as usize) == Some(unit.2) {
+            continue;
+        }
+        if let Some(module) = unit_module(source, table, &unit)? {
+            jit_install_into(source, table, module, unit.2, Some(slot));
+        }
+    }
+    Ok(())
+}
+
+/// §22 `Jit.uninstall` (op 4), as every bytecode driver services it. `jit_table` is the host's check
 /// of the op's `Jit` handle ([`Host::resolve_jit_domain`]: a forged one is its `CapFault`). A filled
 /// padding slot of the task's own `table` clears back to trapping (`0` at `active`'s `dst`); a
-/// real-function, out-of-range or empty slot is `-EINVAL`. Returns the slot cleared.
+/// real-function, out-of-range or empty slot is `-EINVAL`. A cleared slot goes to `forget` as
+/// `(table, slot)`, for the task's host to drop from its record
+/// ([`Host::jit_forget_install`](super::Host::jit_forget_install)), so no later run re-applies it.
+/// Returns the slot cleared.
 fn jit_uninstall(
-    authority: Result<(), Trap>,
+    jit_table: Result<u32, Trap>,
     source: &ModuleSource,
     table: &SharedSlots,
     slot: i64,
     active: &mut Vm,
     dst: u32,
+    forget: impl FnOnce(u32, u32),
 ) -> Result<Option<usize>, Trap> {
-    authority?;
+    let jit_table = jit_table?;
     let n_real = source.primary().progs.len();
     let cleared = jit_uninstall_from(source, table, slot as usize, n_real).then_some(slot as usize);
+    if let Some(slot) = cleared {
+        forget(jit_table, slot as u32);
+    }
     active.set(dst, Reg::from_i64(cleared.map_or(super::EINVAL, |_| 0)));
     Ok(cleared)
 }
@@ -1442,22 +1477,27 @@ fn set_slot_results(
     }
 }
 
-/// `Jit.install`'s table half, under [`jit_install`]: fill the first padding slot with `(module, 0)`,
-/// the entry of the module `unit` runs as, returning the slot — or `None` if the table is full. A
-/// fresh unit is appended to the shared source as a new module only once its slot is found; a unit
-/// that names its own functions already runs as one, and its entry fills one more slot of it. The
-/// whole op serializes under the source lock, and the slot store is `Release`, so a reader that
-/// observes the slot also observes the unit. `id` is the unit's `(table, unit)` on the installing
-/// host, which the table records for a new module ([`SharedSlots::jit_unit`]).
+/// `Jit.install`'s table half, under [`jit_install`]: fill the first padding slot — or slot `at`, the
+/// one a re-applied install held ([`reapply_installs`]) — with `(module, 0)`, the entry of the module
+/// `unit` runs as, returning the slot, or `None` if the table is full or too small for `at`. A fresh
+/// unit is appended to the shared source as a new module only once its slot is found; a unit that
+/// names its own functions already runs as one, and its entry fills one more slot of it. The whole op
+/// serializes under the source lock, and the slot store is `Release`, so a reader that observes the
+/// slot also observes the unit. `id` is the unit's `(table, unit)` on the installing host, which the
+/// table records for a new module ([`SharedSlots::jit_unit`]).
 fn jit_install_into(
     source: &ModuleSource,
     table: &SharedSlots,
     unit: UnitModule,
     id: (u32, u32),
+    at: Option<usize>,
 ) -> Option<usize> {
     use std::sync::atomic::Ordering;
     let mut mods = source.mods.lock_unpoisoned();
-    let slot = table.free_slots().next()?;
+    let slot = match at {
+        Some(slot) => (slot < table.len()).then_some(slot)?,
+        None => table.free_slots().next()?,
+    };
     let module = match unit {
         UnitModule::Fresh(unit) => {
             mods.code.push(std::sync::Arc::new(unit));
@@ -1895,6 +1935,14 @@ impl AdmittedChild {
     /// `room` under the driver's vCPU ceiling (the instantiate bomb, `ThreadFault`). A refused child
     /// hands its window lease to `refund`, its spawner's budget, so a spawn refused after its
     /// admission charges nothing (#1975, #2006), as the oracle's undo does.
+    /// #2043 — refuse the child before anything is built, its window lease to `refund` as
+    /// [`AdmittedChild::build`] refuses it: a full domain table, which refuses probeably.
+    fn refuse(self, refund: impl FnOnce(Lease)) {
+        let mut host = self.host;
+        host.release_memory();
+        refund(self.lease);
+    }
+
     fn build(self, room: bool, refund: impl FnOnce(Lease)) -> Result<BuiltChild, Trap> {
         let AdmittedChild {
             mem,
@@ -2332,7 +2380,7 @@ fn compile_module_with(
     // §14 **executor children** (the `Instantiator`'s spawn and `join`) run on the scheduler like
     // threads, and they combine with `cont.*` fibers: every driver gives each child domain its own
     // fiber registry (the cooperative `ChildEnv::fibers`, which the parallel driver shares, and the
-    // debugger's `DbgEnv::fibers`), as the oracle does. Fiber / thread / instantiate modules are each
+    // debugger's `ChildEnv::fibers`), as the oracle does. Fiber / thread / instantiate modules are each
     // fine, as are instantiate+thread and instantiate+fiber.
     let s = scan_seams(funcs);
     // `gc.roots` (§GC) is per-vCPU **conservative root enumeration**: on this engine it scans the
@@ -3911,9 +3959,9 @@ fn parallel_domain(
 /// The usual shape is `open` → `call(0, …)` to run the on-ramp `_start` bootstrap once, then
 /// `call(tick, …)` once per frame.
 pub struct Reactor {
-    /// The compiled program, shared (an `Arc` clone seeds each call's throwaway `Domain`).
-    source: std::sync::Arc<ModuleSource>,
-    n_funcs: usize,
+    /// The compiled program, shared: each frame's domain wraps it in a fresh source and table
+    /// ([`Domain::over_primary`]), as a run over a kept program does (#1144).
+    program: std::sync::Arc<Compiled>,
     /// The live guest window — retained across calls (this is the whole point). `None` for a
     /// memory-less module, and while a [`coop_call`](Self::coop_call) run holds it.
     mem: Option<Mem>,
@@ -3935,10 +3983,8 @@ impl Reactor {
 
     fn open_on(m: &Module, back: Option<std::sync::Arc<super::Region>>) -> Option<Reactor> {
         let c = compile_module_for(m, true)?;
-        let n_funcs = c.progs.len();
         Some(Reactor {
-            source: std::sync::Arc::new(ModuleSource::new(c)),
-            n_funcs,
+            program: std::sync::Arc::new(c),
             mem: Mem::root(m, default_reserved_log2(), back, &[]),
         })
     }
@@ -3958,13 +4004,7 @@ impl Reactor {
         tierup: Option<TierUpConfig>,
         image: Option<&Module>,
     ) -> Result<CoopRun, Trap> {
-        if func as usize >= self.n_funcs {
-            return Err(Trap::Malformed);
-        }
-        let dom = Domain::child(
-            self.source.clone(),
-            build_table(self.n_funcs, host.jit_table_log2()),
-        );
+        let dom = self.frame(func, &host)?;
         CoopRun::start(dom, self.mem.take(), func, args, fuel, host, tierup, image)
     }
 
@@ -3987,14 +4027,24 @@ impl Reactor {
         fuel: &mut u64,
         host: &mut Host,
     ) -> Result<Vec<Value>, Trap> {
-        if func as usize >= self.n_funcs {
+        // `run` consumes the `Domain`; the persistent `mem` carries state across calls.
+        let dom = self.frame(func, host)?;
+        run(dom, func, args, fuel, &mut self.mem, host)
+    }
+
+    /// The `Domain` one frame of `func` runs in, for [`call`](Self::call) and
+    /// [`coop_call`](Self::coop_call) alike: a fresh source and table over the shared program, with
+    /// the install room the powerbox's `Jit` grant sizes (#1296, #2661). A frame is a run over the
+    /// reactor's window and powerbox, so it starts with the §22 installs the powerbox recorded, as
+    /// any run does (#2670). `Trap::Malformed` if `func` is out of range.
+    fn frame(&self, func: FuncIdx, host: &Host) -> Result<Domain, Trap> {
+        if func as usize >= self.program.progs.len() {
             return Err(Trap::Malformed);
         }
-        // A fresh natural dispatch table over the shared compiled source (cheap: an `Arc` clone + the
-        // slot vector) — there is no §22 install state to carry between frames, so a natural table each
-        // call is correct. `run` consumes the `Domain`; the persistent `mem` carries state across calls.
-        let dom = Domain::child(self.source.clone(), SharedSlots::new(self.n_funcs, 0, 0));
-        run(dom, func, args, fuel, &mut self.mem, host)
+        Ok(Domain::over_primary(
+            std::sync::Arc::clone(&self.program),
+            host.jit_table_log2(),
+        ))
     }
 
     /// Capture the live window as a [`MemLayout`] — the memory half of a **moment** (a reactor
@@ -4463,11 +4513,11 @@ fn any_event_parked<'a>(mut fibers: impl Iterator<Item = &'a FiberState>) -> boo
     })
 }
 
-/// Capture a child [`DbgEnv`] into an [`EnvSnapshot`] (#1866): host replay substate, fuel, fibers,
+/// Capture a child [`ChildEnv`] into an [`EnvSnapshot`] (#1866): host replay substate, fuel, fibers,
 /// the env that spawned it, and its own window image and powerbox, or nothing of either once it is
 /// `spent` ([`env_spent`]). Refused when a live one's powerbox holds a binding that is not a plain
 /// value ([`Host::child_powerbox`]), or it has no window.
-fn env_snapshot(e: &DbgEnv, spent: bool) -> Result<EnvSnapshot, Refusal> {
+fn env_snapshot(e: &ChildEnv, spent: bool) -> Result<EnvSnapshot, Refusal> {
     let live = match (&e.mem, spent) {
         (_, true) => None,
         (Some(m), false) => Some(DetachedLive {
@@ -4475,13 +4525,17 @@ fn env_snapshot(e: &DbgEnv, spent: bool) -> Result<EnvSnapshot, Refusal> {
             reserved_log2: m.window.reserved().trailing_zeros() as u8,
             mapped_log2: m.window.mapped().trailing_zeros() as u8,
             shadow: m.shadow,
-            powerbox: e.host.child_powerbox().ok_or(Refusal::ChildPowerbox)?,
+            powerbox: e
+                .host
+                .lock_unpoisoned()
+                .child_powerbox()
+                .ok_or(Refusal::ChildPowerbox)?,
         }),
         (None, false) => return Err(Refusal::NoWindow),
     };
     Ok(EnvSnapshot {
         module: e.program as usize,
-        host: e.host.replay_substate(),
+        host: e.host.lock_unpoisoned().replay_substate(),
         fuel: e.fuel.can_burn(),
         fibers: e.fibers.fibers.clone(),
         spawner: e.spawner,
@@ -4489,24 +4543,25 @@ fn env_snapshot(e: &DbgEnv, spent: bool) -> Result<EnvSnapshot, Refusal> {
     })
 }
 
-/// #1866 — rebuild a detached child's [`DbgEnv`] under `spawner`, the powerbox of the env that spawned
+/// #1866 — rebuild a detached child's [`ChildEnv`] under `spawner`, the powerbox of the env that spawned
 /// it (already rebuilt: envs come back in spawn order). Its window is built as a spawn builds it, then
 /// its own image laid over it, as a thaw's relaunch does; its powerbox is rebuilt from its
 /// [`ChildPowerbox`](super::ChildPowerbox), its inherited stdio aliased to `spawner`'s. A spent env comes
 /// back empty: nothing runs in it again.
-fn rebuild_detached_env(es: &EnvSnapshot, spawner: &mut Host, source: &ModuleSource) -> DbgEnv {
+fn rebuild_detached_env(es: &EnvSnapshot, spawner: &mut Host, source: &ModuleSource) -> ChildEnv {
     let progs_len = source.get(es.module).map_or(0, |u| u.progs.len());
     let Some(live) = &es.live else {
         let host = Host::new();
         let table = build_table_for(progs_len, host.jit_table_log2(), es.module as u32);
-        return DbgEnv {
+        return ChildEnv {
             mem: None,
-            host,
-            table,
+            host: host.into_cell(),
+            table: std::sync::Arc::new(table),
             program: es.module as u32,
             fuel: Fuel::fixed(es.fuel),
             fibers: FiberTables::default(),
             spawner: es.spawner,
+            nested: true,
         };
     };
     let mut mem = Mem::from_spec(WindowSpec {
@@ -4520,14 +4575,15 @@ fn rebuild_detached_env(es: &EnvSnapshot, spawner: &mut Host, source: &ModuleSou
     let mut host = spawner.rebuild_child_powerbox(&live.powerbox);
     host.restore_replay_substate(&es.host);
     let table_log2 = host.jit_table_log2();
-    DbgEnv {
+    ChildEnv {
         mem: Some(mem),
-        table: build_table_for(progs_len, table_log2, es.module as u32),
+        table: std::sync::Arc::new(build_table_for(progs_len, table_log2, es.module as u32)),
         program: es.module as u32,
         fuel: Fuel::fixed(es.fuel),
         fibers: FiberTables::restored(es.fibers.clone(), &host),
-        host,
+        host: host.into_cell(),
         spawner: es.spawner,
+        nested: true,
     }
 }
 
@@ -4861,7 +4917,7 @@ fn journal_op(
 fn journal_state(
     journal: &mut super::journal::Journal,
     tasks: &[TaskSlot],
-    extra_envs: &[DbgEnv],
+    extra_envs: &[ChildEnv],
     fibers: &[FiberState],
     source: &ModuleSource,
     host: &Host,
@@ -4882,7 +4938,9 @@ fn journal_state(
         return;
     }
     let invertible = host.journal_invertible()
-        && extra_envs.iter().all(|e| e.host.region_count() == 0)
+        && extra_envs
+            .iter()
+            .all(|e| e.host.lock_unpoisoned().region_count() == 0)
         && tasks.iter().all(|t| t.vm.vt.active_invoke.is_none())
         && !any_event_parked(fibers.iter())
         && !pool_parked(tasks, extra_envs, host);
@@ -4906,7 +4964,8 @@ fn journal_state(
                 active_id: t.vm.vt.active_id,
                 chain: t.vm.vt.chain.clone(),
                 root_shadow_sp: t.vm.vt.root_shadow_sp,
-                threads: t.threads.clone(),
+                domain: t.domain,
+                children: t.children.clone(),
                 env: t.env,
                 state: t.state.clone(),
                 at_bp: t.at_bp,
@@ -5059,6 +5118,11 @@ fn debug_advance_fiber(
                         vt.active.set(dst + 1, Reg::from_i64(0));
                         return FiberStep::Stepped;
                     }
+                    Ok(Claim::Spent) => {
+                        vt.active.set(dst, Reg::from_i32(super::FIBER_SPENT));
+                        vt.active.set(dst + 1, Reg::from_i64(0));
+                        return FiberStep::Stepped;
+                    }
                     Err(t) => return FiberStep::Trapped(t),
                 };
             enter_fiber(vt, &mut cell, mem, false, k, target, dst);
@@ -5079,14 +5143,16 @@ fn debug_advance_fiber(
         // vCPU (`CapFault`/`Malformed`), exactly as the production `drive`. (DESIGN.md §22 debug tier.)
         Ok(Outcome::JitInstall { h, code, dst }) => {
             let unit = host.resolve_jit_unit(h, code);
-            match jit_install(unit, source, table, &mut vt.active, dst) {
+            let record = |t, slot, u| host.jit_record_install(t, slot, u);
+            match jit_install(unit, source, table, &mut vt.active, dst, record) {
                 Ok(_) => FiberStep::Stepped,
                 Err(t) => FiberStep::Trapped(t),
             }
         }
         Ok(Outcome::JitUninstall { h, slot, dst }) => {
-            let authority = host.resolve_jit_domain(h).map(drop);
-            match jit_uninstall(authority, source, table, slot, &mut vt.active, dst) {
+            let jit_table = host.resolve_jit_domain(h);
+            let forget = |t, slot| host.jit_forget_install(t, slot);
+            match jit_uninstall(jit_table, source, table, slot, &mut vt.active, dst, forget) {
                 Ok(_) => FiberStep::Stepped,
                 Err(t) => FiberStep::Trapped(t),
             }
@@ -5203,7 +5269,7 @@ fn write_task_window(
     journal: &mut super::journal::Journal,
     turn: u64,
     mem: &mut Option<Mem>,
-    envs: &mut [DbgEnv],
+    envs: &mut [ChildEnv],
     env: Option<usize>,
     addr: u64,
     bytes: &[u8],
@@ -5228,7 +5294,7 @@ fn apply_target(
     width: usize,
     vm_regs: &mut [Reg],
     mem: &mut Option<Mem>,
-    envs: &mut [DbgEnv],
+    envs: &mut [ChildEnv],
     env: Option<usize>,
     journal: &mut super::journal::Journal,
     turn: u64,
@@ -5271,7 +5337,7 @@ fn apply_due_writes(
     tasks: &mut [TaskSlot],
     source: &ModuleSource,
     mem: &mut Option<Mem>,
-    envs: &mut [DbgEnv],
+    envs: &mut [ChildEnv],
     journal: &mut super::journal::Journal,
 ) {
     while *cursor < writes.len() && writes[*cursor].0 < turn {
@@ -5580,7 +5646,7 @@ pub enum SchedBreak {
 fn dbg_refund_ended_windows(
     tasks: &mut [TaskSlot],
     host: &mut Host,
-    envs: &mut [DbgEnv],
+    envs: &mut [ChildEnv],
     run_ended: bool,
 ) {
     for t in tasks.iter_mut() {
@@ -5588,10 +5654,10 @@ fn dbg_refund_ended_windows(
             if let Some((env, lease)) = t.lease.take() {
                 match env {
                     None => host.release_detached(lease),
-                    Some(k) => envs[k].host.release_detached(lease),
+                    Some(k) => envs[k].host.lock_unpoisoned().release_detached(lease),
                 }
                 if let Some(k) = t.env {
-                    envs[k].host.release_memory();
+                    envs[k].host.lock_unpoisoned().release_memory();
                 }
             }
         }
@@ -5608,27 +5674,10 @@ fn dbg_refund_ended_windows(
     }
 }
 
-struct DbgEnv {
-    mem: Option<Mem>,
-    host: Host,
-    table: SharedSlots,
-    /// The unit of the run's source the domain runs (the root's is module 0, a child's the unit of the
-    /// module it was granted): a checkpoint rebuilds the env's table over it.
-    program: u32,
-    /// A fixed allowance (#1944 slice 3): a checkpoint captures it whole, and a seek replays it.
-    fuel: Fuel,
-    /// The child domain's own §12 fiber registry: each domain numbers its fibers from 0 and cannot
-    /// reach another's, as on the oracle (the root's is [`ScheduledDebugRun::fibers`]).
-    fibers: FiberTables,
-    /// The env whose powerbox spawned this one (`None`: the root's): whose stdio its inherited
-    /// streams alias on a rebuild (#1866), and whose `kill` ends it with its subtree ([`kill_env`]).
-    spawner: Option<usize>,
-}
-
 /// #1866 — whether nothing runs in env `k` again and nothing still leans on it: every task in it has
 /// finished, no live task's window lease is owed to its powerbox, and no live child env was spawned
 /// from it. A checkpoint carries such an env as spent rather than copying its window and powerbox.
-fn env_spent(tasks: &[TaskSlot], envs: &[DbgEnv], k: usize) -> bool {
+fn env_spent(tasks: &[TaskSlot], envs: &[ChildEnv], k: usize) -> bool {
     let live = |t: &&TaskSlot| !matches!(t.state, TaskState::Done(_));
     !tasks
         .iter()
@@ -5650,7 +5699,8 @@ struct DbgTaskSnapshot {
     active_id: usize,
     chain: Vec<(usize, Vm, u32)>,
     root_shadow_sp: u64,
-    threads: Vec<Option<usize>>,
+    domain: usize,
+    children: temen_ir::handles::Table<usize>,
     env: Option<usize>,
     state: TaskState,
     at_bp: bool,
@@ -5706,13 +5756,13 @@ impl ScheduledContinuation {
     }
 }
 
-/// A §14 child environment ([`DbgEnv`]) inside a [`Moment`] (#1866): its own window and powerbox
+/// A §14 child environment ([`ChildEnv`]) inside a [`Moment`] (#1866): its own window and powerbox
 /// ([`DetachedLive`]) unless it is spent, its host replay substate, a natural dispatch table over the
 /// child's [`module`] (whose pushed unit rides in `extra_units`) and its fixed `fuel`. A §13
 /// region-aliased child stays outside the checkpointable subset.
 #[derive(Clone)]
 struct EnvSnapshot {
-    /// The unit the child's domain runs ([`DbgEnv::program`]): the granted module's, whose pushed unit
+    /// The unit the child's domain runs ([`ChildEnv::program`]): the granted module's, whose pushed unit
     /// is captured in the run snapshot's `extra_units`. Its natural dispatch table is rebuilt over this
     /// index.
     module: usize,
@@ -5720,7 +5770,7 @@ struct EnvSnapshot {
     fuel: u64,
     /// The child's fiber registry (its `Vm`s' bytes ride in its window image).
     fibers: Vec<FiberState>,
-    /// The env that spawned it ([`DbgEnv::spawner`]).
+    /// The env that spawned it ([`ChildEnv::spawner`]).
     spawner: Option<usize>,
     /// Its own window and powerbox, unless it is spent ([`env_spent`]).
     live: Option<DetachedLive>,
@@ -5750,7 +5800,7 @@ struct DetachedLive {
 /// to the earliest wait deadline, exactly as the production `drive`), and **§12 fibers** switch each
 /// vCPU's active continuation (breakpoints fire inside a resumed fiber; the fiber registry is run-shared
 /// so a fiber migrates across vCPUs — D57), and **§14 `instantiate` / `instantiate_module`** spawn a
-/// confined executor child as its own scheduled vCPU (its own [`DbgEnv`] — window / powerbox / quota —
+/// confined executor child as its own scheduled vCPU (its own [`ChildEnv`] — window / powerbox / quota —
 /// joinable through the shared thread machinery; a separate-module child runs its own pushed module,
 /// and nesting composes to any depth), and **§14 coroutines** are stepped op-by-op (step-into) with the
 /// coroutine's vCPU **pinned** across the body so a `resume` stays atomic w.r.t. other vCPUs. The only
@@ -5764,9 +5814,9 @@ pub struct ScheduledDebugRun {
     /// §14 `instantiate` confined children's environments (handle = index; a task's [`TaskSlot::env`] is
     /// `Some(k)` into this). Grown as children spawn; rebuilt deterministically on a reverse-`seek`
     /// replay. Not torn down mid-run (a finished child's env is inert — revocation semantics deferred).
-    extra_envs: Vec<DbgEnv>,
+    extra_envs: Vec<ChildEnv>,
     /// The root domain's §12 fiber registry (one handle namespace across its vCPUs; a fiber created on
-    /// one can be resumed on another — D57). Each §14 child has its own ([`DbgEnv::fibers`]). Rebuilt
+    /// one can be resumed on another — D57). Each §14 child has its own ([`ChildEnv::fibers`]). Rebuilt
     /// deterministically on a reverse `seek` replay.
     fibers: FiberTables,
     /// Module 0's frame metadata, the same as its unit's ([`Compiled::debug`]), for the per-op
@@ -5979,19 +6029,21 @@ fn trace_tags(tasks: &[TaskSlot]) -> Vec<(u8, u64)> {
 fn trace_diff(
     before: &[(u8, u64)],
     actor_depth: usize,
-    actor_threads: &[Option<usize>],
+    actor_children: &[(usize, usize)],
     tasks: &[TaskSlot],
     turn: u64,
     actor: usize,
     out: &mut Vec<SchedTraceEvent>,
 ) {
-    // #1987: a join handle the op consumed without parking — the child had already finished.
-    for (slot, child) in actor_threads.iter().enumerate() {
-        if let (Some(child), Some(None)) = (child, tasks[actor].threads.get(slot)) {
+    // #1987: a join handle the op consumed without parking — the child had already finished: a live
+    // entry of the actor's domain table, gone after the advance.
+    let table = &tasks[tasks[actor].domain].children;
+    for &(slot, child) in actor_children {
+        if table.get(slot) != Some(&child) {
             out.push(SchedTraceEvent::Join {
                 turn,
                 task: actor,
-                child: *child,
+                child,
             });
         }
     }
@@ -6099,21 +6151,25 @@ fn dbg_spawn(
     let cidx = tasks.len();
     // §12: its `vcpu.tls` starts at its id in its domain (#1775), as the cooperative driver's.
     vt.active.tls = host.next_vcpu_id();
-    tasks.push(TaskSlot::new(vt, env, live));
-    let handle = tasks[ti].threads.len() as i32;
-    tasks[ti].threads.push(Some(cidx));
+    // #2043 — a full domain table refuses it as the live cap does.
+    if !child_room(tasks, ti) {
+        return Err(Trap::ThreadFault);
+    }
+    let domain = tasks[ti].domain; // and its domain: one child table for both
+    tasks.push(TaskSlot::new(vt, env, live, domain));
+    let handle = issue_child(tasks, ti, cidx).ok_or(Trap::ThreadFault)?;
     tasks[ti].deliver(dst, Reg::from_i32(handle));
     Ok(())
 }
 
 /// The per-op driver for a scheduled debug task, selecting its runtime context: the shared domain
-/// (`env = None`) or its confined [`DbgEnv`] (`env = Some(k)`). Centralizes the split borrow so the
+/// (`env = None`) or its confined [`ChildEnv`] (`env = Some(k)`). Centralizes the split borrow so the
 /// unified `drive`/`tick` pumps stay a single call. Mirrors the production `drive`'s `RunCtx` selection.
 #[allow(clippy::too_many_arguments)]
 fn dbg_advance_task(
     tasks: &mut [TaskSlot],
     ti: usize,
-    extra_envs: &mut [DbgEnv],
+    extra_envs: &mut [ChildEnv],
     fibers: &mut FiberTables,
     source: &ModuleSource,
     table: &SharedSlots,
@@ -6132,7 +6188,7 @@ fn dbg_advance_task(
                 &e.table,
                 &mut e.fuel,
                 &mut e.mem,
-                &mut e.host,
+                &mut e.host.lock_unpoisoned(),
             )
         }
     }
@@ -6159,7 +6215,7 @@ enum Serviced {
 fn service_advance(
     tasks: &mut Vec<TaskSlot>,
     ti: usize,
-    extra_envs: &mut Vec<DbgEnv>,
+    extra_envs: &mut Vec<ChildEnv>,
     fibers: &mut FiberTables,
     source: &ModuleSource,
     table: &SharedSlots,
@@ -6202,21 +6258,21 @@ fn service_advance(
                 module,
             } => {
                 *turn += 1;
+                let mut child_host;
                 let host = match tasks[ti].env {
                     None => &mut *host,
-                    Some(k) => &mut extra_envs[k].host,
+                    Some(k) => {
+                        child_host = extra_envs[k].host.lock_unpoisoned();
+                        &mut *child_host
+                    }
                 };
                 if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, module, source, host) {
                     complete(tasks, ti, Err(t));
                 }
             }
-            Outcome::ThreadJoin {
-                handle,
-                dst,
-                status,
-            } => {
+            Outcome::ThreadJoin { handle, dst } => {
                 *turn += 1;
-                join_child(tasks, ti, handle, dst, status);
+                join_child(tasks, ti, handle, dst);
             }
             Outcome::ChildCtl { child, dst, ctl } => {
                 *turn += 1;
@@ -6243,7 +6299,7 @@ fn service_advance(
                 dst,
             } => {
                 *turn += 1;
-                // The task's domain: the root's registry and window, or its `DbgEnv`'s. No blocking
+                // The task's domain: the root's registry and window, or its `ChildEnv`'s. No blocking
                 // resume idles here (this engine claims with `may_block` off), so a fiber's park
                 // hands its resumer `FIBER_PARKED`.
                 let (fibers, mem) = match tasks[ti].env {
@@ -6285,7 +6341,7 @@ fn service_advance(
             }
             // §5 detached spawn (op 17): a fresh window of its own as a debug task — the
             // cooperative executor's spawn on this path, so a spawning guest stays steppable through
-            // its child (a `DbgEnv` over the child's own `Mem`, joined like a confined child's).
+            // its child (a `ChildEnv` over the child's own `Mem`, joined like a confined child's).
             Outcome::InstantiateDetached { spawn, dst } => {
                 *turn += 1;
                 if let Err(t) =
@@ -6389,7 +6445,7 @@ fn service_advance(
     Serviced::Ran
 }
 
-/// Schedule an admitted §14/§5 child as a debug task over its own [`DbgEnv`], registered as a child
+/// Schedule an admitted §14/§5 child as a debug task over its own [`ChildEnv`], registered as a child
 /// handle of `ti` (so `Instantiator.join` → `ThreadJoin` joins it), and land the handle in `dst`.
 /// `Err(ThreadFault)` on the vCPU-count bomb (the caller completes `ti`). A child refused here hands
 /// its window lease back to its spawner's powerbox, the root's `host` or an env's, so a spawn refused
@@ -6398,12 +6454,21 @@ fn service_advance(
 fn dbg_start_child(
     tasks: &mut Vec<TaskSlot>,
     ti: usize,
-    extra_envs: &mut Vec<DbgEnv>,
+    extra_envs: &mut Vec<ChildEnv>,
     host: &mut Host,
     child: AdmittedChild,
     dst: u32,
 ) -> Result<(), Trap> {
     let spawner = tasks[ti].env;
+    // #2043 — a full domain table refuses probeably, as a full powerbox does.
+    if !child_room(tasks, ti) {
+        child.refuse(|lease| match spawner {
+            None => host.release_detached(lease),
+            Some(k) => extra_envs[k].host.release_detached(lease),
+        });
+        tasks[ti].deliver(dst, Reg::from_i32(super::EMFILE as i32));
+        return Ok(());
+    }
     let room = live_tasks(tasks) < super::MAX_VCPUS;
     let BuiltChild {
         module,
@@ -6415,13 +6480,13 @@ fn dbg_start_child(
         lease,
     } = child.build(room, |lease| match spawner {
         None => host.release_detached(lease),
-        Some(k) => extra_envs[k].host.release_detached(lease),
+        Some(k) => extra_envs[k].host.lock_unpoisoned().release_detached(lease),
     })?;
     let eidx = extra_envs.len();
-    extra_envs.push(DbgEnv {
+    extra_envs.push(ChildEnv {
         mem,
-        host: child_host,
-        table,
+        host: child_host.into_cell(),
+        table: std::sync::Arc::new(table),
         program: module,
         // The debugger runs every task on a fixed allowance: a detached child gets what its chain
         // lets it burn at the spawn, where an executor's child draws from the chain as it goes
@@ -6429,14 +6494,14 @@ fn dbg_start_child(
         fuel: Fuel::fixed(fuel.can_burn()),
         fibers: FiberTables::default(),
         spawner,
+        nested: true,
     });
     let cidx = tasks.len();
     tasks.push(TaskSlot {
         lease: Some((spawner, lease)),
-        ..TaskSlot::new(vt, Some(eidx), LiveVcpu::none())
+        ..TaskSlot::new(vt, Some(eidx), LiveVcpu::none(), cidx)
     });
-    let handle = tasks[ti].threads.len() as i32;
-    tasks[ti].threads.push(Some(cidx));
+    let handle = issue_child(tasks, ti, cidx).ok_or(Trap::Malformed)?; // room checked above
     tasks[ti].deliver(dst, Reg::from_i32(handle));
     Ok(())
 }
@@ -6448,7 +6513,7 @@ fn dbg_start_child(
 fn dbg_instantiate_detached(
     tasks: &mut Vec<TaskSlot>,
     ti: usize,
-    extra_envs: &mut Vec<DbgEnv>,
+    extra_envs: &mut Vec<ChildEnv>,
     source: &ModuleSource,
     shared_mem: &Option<Mem>,
     host: &mut Host,
@@ -6456,14 +6521,19 @@ fn dbg_instantiate_detached(
     dst: u32,
 ) -> Result<(), Trap> {
     // The parent's window and the powerbox its handles resolve in: its own (#1727).
-    let (pm, owner) = match tasks[ti].env {
-        None => (shared_mem.as_ref(), &mut *host),
-        Some(k) => {
-            let e = &mut extra_envs[k];
-            (e.mem.as_ref(), &mut e.host)
-        }
+    let admitted = {
+        let mut child_host;
+        let (pm, owner) = match tasks[ti].env {
+            None => (shared_mem.as_ref(), &mut *host),
+            Some(k) => {
+                let e = &extra_envs[k];
+                child_host = e.host.lock_unpoisoned();
+                (e.mem.as_ref(), &mut *child_host)
+            }
+        };
+        admit_detached_in_process(owner, pm, spawn, source, |_| None)?
     };
-    let Some((child, _)) = admit_detached_in_process(owner, pm, spawn, source, |_| None)? else {
+    let Some((child, _)) = admitted else {
         tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
     };
@@ -6477,21 +6547,28 @@ fn dbg_instantiate_detached(
 fn dbg_grant(
     tasks: &[TaskSlot],
     ti: usize,
-    envs: &mut [DbgEnv],
+    envs: &mut [ChildEnv],
     host: &mut Host,
     child: i32,
     handle: i32,
 ) -> Result<i64, Trap> {
     match (tasks[ti].env, grant_target(tasks, ti, child)) {
-        (None, k) => host.grant_running_child(None, handle, k.map(|k| &mut envs[k].host)),
-        (Some(p), Some(k)) => match envs.get_disjoint_mut([p, k]) {
-            Ok([pe, ke]) => pe
+        (None, k) => {
+            let mut kh = k.map(|k| envs[k].host.lock_unpoisoned());
+            host.grant_running_child(None, handle, kh.as_deref_mut())
+        }
+        // `grant_target` names an env other than the spawner's own.
+        (Some(p), Some(k)) if p != k => {
+            let mut kh = envs[k].host.lock_unpoisoned();
+            envs[p]
                 .host
-                .grant_running_child(None, handle, Some(&mut ke.host)),
-            // Unreachable: `grant_target` names an env other than the spawner's own.
-            Err(_) => envs[p].host.grant_running_child(None, handle, None),
-        },
-        (Some(p), None) => envs[p].host.grant_running_child(None, handle, None),
+                .lock_unpoisoned()
+                .grant_running_child(None, handle, Some(&mut kh))
+        }
+        (Some(p), _) => envs[p]
+            .host
+            .lock_unpoisoned()
+            .grant_running_child(None, handle, None),
     }
 }
 
@@ -6578,7 +6655,7 @@ fn step_active_invoke(
 /// The window a task steps against: its §14 env's, or the root's for `env == None`.
 fn dbg_env_mem<'a>(
     mem: &'a Option<Mem>,
-    envs: &'a [DbgEnv],
+    envs: &'a [ChildEnv],
     env: Option<usize>,
 ) -> Option<&'a Mem> {
     match env {
@@ -6733,7 +6810,7 @@ fn dbg_preview_pick(
 fn dbg_pick_runnable(
     tasks: &mut [TaskSlot],
     fibers: &mut FiberTables,
-    envs: &mut [DbgEnv],
+    envs: &mut [ChildEnv],
     host: &mut Host,
     takes: &mut Takes,
     replay: bool,
@@ -6775,7 +6852,7 @@ fn dbg_pick_runnable(
 /// Every domain's fiber registry: the root's, then each §14 child's.
 fn registries<'a>(
     fibers: &'a mut FiberTables,
-    envs: &'a mut [DbgEnv],
+    envs: &'a mut [ChildEnv],
 ) -> Vec<&'a mut Vec<FiberState>> {
     std::iter::once(&mut fibers.fibers)
         .chain(envs.iter_mut().map(|e| &mut e.fibers.fibers))
@@ -6862,7 +6939,7 @@ fn dbg_parked(tasks: &[TaskSlot]) -> Vec<Parked> {
 #[allow(clippy::too_many_arguments)]
 fn dbg_take_answer(
     tasks: &mut [TaskSlot],
-    extra_envs: &mut [DbgEnv],
+    extra_envs: &mut [ChildEnv],
     host: &mut Host,
     takes: &mut Takes,
     replay: bool,
@@ -6880,9 +6957,13 @@ fn dbg_take_answer(
     }
     loop {
         for &(p, env, dst, id, _) in &parked {
+            let mut child_host;
             let h = match env {
                 None => &mut *host,
-                Some(k) => &mut extra_envs[k].host,
+                Some(k) => {
+                    child_host = extra_envs[k].host.lock_unpoisoned();
+                    &mut *child_host
+                }
             };
             if let Some(r) = take_answer(h, id) {
                 tasks[p].deliver(dst, Reg::from_i64(r));
@@ -6918,7 +6999,7 @@ fn dbg_take_answer(
 /// wherever the run did.
 fn dbg_await_answer(
     tasks: &[TaskSlot],
-    extra_envs: &[DbgEnv],
+    extra_envs: &[ChildEnv],
     host: &Host,
     takes: &Takes,
     replay: bool,
@@ -6949,7 +7030,7 @@ fn dbg_await_answer(
 /// Whether a thread is parked on a punted call the offload pool answers (#2047): its answer comes
 /// from outside the run, which a restore cannot reach, so it keeps a checkpoint and a journal state
 /// record out, as a fiber's cap park does. A host-completed park is the replay's to serve.
-fn pool_parked(tasks: &[TaskSlot], extra_envs: &[DbgEnv], host: &Host) -> bool {
+fn pool_parked(tasks: &[TaskSlot], extra_envs: &[ChildEnv], host: &Host) -> bool {
     tasks.iter().any(|t| match t.state {
         TaskState::BlockedHostCap { id, .. } => {
             !dbg_completions(t.env, extra_envs, host).is_host_owned(id)
@@ -6961,12 +7042,12 @@ fn pool_parked(tasks: &[TaskSlot], extra_envs: &[DbgEnv], host: &Host) -> bool {
 /// The completion store of a debug task's domain: the root's, or its child env's.
 fn dbg_completions(
     env: Option<usize>,
-    extra_envs: &[DbgEnv],
+    extra_envs: &[ChildEnv],
     host: &Host,
 ) -> std::sync::Arc<super::Completions> {
     match env {
         None => host.completions(),
-        Some(k) => extra_envs[k].host.completions(),
+        Some(k) => extra_envs[k].host.lock_unpoisoned().completions(),
     }
 }
 
@@ -7002,6 +7083,7 @@ impl ScheduledDebugRun {
         let mut source = ModuleSource::over(std::sync::Arc::new(c));
         source.debug = true;
         let source = std::sync::Arc::new(source);
+        reapply_installs(&host, &source, &table).ok()?;
         let mem = Mem::root(m, default_reserved_log2(), None, &[]);
         let vt = VTask::new(
             &source.primary(),
@@ -7019,7 +7101,7 @@ impl ScheduledDebugRun {
             table,
             mem,
             host,
-            tasks: vec![TaskSlot::new(vt, None, LiveVcpu::none())],
+            tasks: vec![TaskSlot::new(vt, None, LiveVcpu::none(), 0)],
             extra_envs: Vec::new(),
             fibers: FiberTables::default(),
             root_md,
@@ -7663,7 +7745,7 @@ impl ScheduledDebugRun {
             let pre_adv = tracing.then(|| trace_tags(tasks));
             let pre_depth = trace_depth(&tasks[ti]);
             let pre_threads = if tracing {
-                tasks[ti].threads.clone()
+                live_children(tasks, ti)
             } else {
                 Vec::new()
             };
@@ -7913,7 +7995,7 @@ impl ScheduledDebugRun {
         let pre_adv = tracing.then(|| trace_tags(tasks));
         let pre_depth = trace_depth(&tasks[ti]);
         let pre_threads = if tracing {
-            tasks[ti].threads.clone()
+            live_children(tasks, ti)
         } else {
             Vec::new()
         };
@@ -8040,7 +8122,7 @@ impl ScheduledDebugRun {
     /// multi-vCPU time-travel **checkpoint** (W1) snapshots, over every task:
     /// **§12 fibers** are admitted (the run-shared registry + each task's active fiber / resume chain,
     /// all sharing the run's window) except an event-parked (`memory.wait`) fiber (non-deterministic
-    /// wall-clock deadline); **§14 children** are admitted, each [`DbgEnv`] carrying its own window
+    /// wall-clock deadline); **§14 children** are admitted, each [`ChildEnv`] carrying its own window
     /// image and powerbox ([`DetachedLive`]) and rebuilt under its spawner's on restore
     /// ([`rebuild_detached_env`]), or nothing of either once spent (#1866). The root's §13 regions
     /// ride the moment ([`Moment::checkpoint`](super::moment::Moment::checkpoint), #2026), its
@@ -8068,7 +8150,7 @@ impl ScheduledDebugRun {
             if env_spent(&self.tasks, &self.extra_envs, k) {
                 continue;
             }
-            child_host_admits(&e.host)?;
+            child_host_admits(&e.host.lock_unpoisoned())?;
             match &e.mem {
                 None => return Err(Refusal::NoWindow),
                 Some(m) if !m.layout_snapshot_safe() => return Err(Refusal::Region),
@@ -8111,7 +8193,8 @@ impl ScheduledDebugRun {
                     active_id: t.vm.vt.active_id,
                     chain: t.vm.vt.chain.clone(),
                     root_shadow_sp: t.vm.vt.root_shadow_sp,
-                    threads: t.threads.clone(),
+                    domain: t.domain,
+                    children: t.children.clone(),
                     env: t.env,
                     state: t.state.clone(),
                     at_bp: t.at_bp,
@@ -8178,13 +8261,19 @@ impl ScheduledDebugRun {
         self.line_bps.unbind();
         // Rebuild each task's full `VTask` and each §14 child env, each table over the child's own
         // module. A child's env is rebuilt under its spawner's, which comes back first (#1866).
-        let mut envs: Vec<DbgEnv> = Vec::with_capacity(c.extra_envs.len());
+        let mut envs: Vec<ChildEnv> = Vec::with_capacity(c.extra_envs.len());
         for es in &c.extra_envs {
-            let spawner = match es.spawner {
-                None => &mut self.host,
-                Some(k) => &mut envs[k].host,
+            let env = {
+                let mut spawner_host;
+                let spawner = match es.spawner {
+                    None => &mut self.host,
+                    Some(k) => {
+                        spawner_host = envs[k].host.lock_unpoisoned();
+                        &mut *spawner_host
+                    }
+                };
+                rebuild_detached_env(es, spawner, &self.source)
             };
-            let env = rebuild_detached_env(es, spawner, &self.source);
             envs.push(env);
         }
         self.extra_envs = envs;
@@ -8216,7 +8305,8 @@ impl ScheduledDebugRun {
                     },
                     suspended: None,
                 }),
-                threads: ts.threads.clone(),
+                domain: ts.domain,
+                children: ts.children.clone(),
                 env: ts.env,
                 state: match (&ts.state, readmit_parks) {
                     (TaskState::BlockedStdin | TaskState::BlockedHostCap { .. }, true) => {
@@ -8231,7 +8321,9 @@ impl ScheduledDebugRun {
                 live: match (ts.live, ts.env) {
                     (false, _) => LiveVcpu::none(),
                     (true, None) => LiveVcpu::force(self.host.own_node()),
-                    (true, Some(k)) => LiveVcpu::force(self.extra_envs[k].host.own_node()),
+                    (true, Some(k)) => {
+                        LiveVcpu::force(self.extra_envs[k].host.lock_unpoisoned().own_node())
+                    }
                 },
             })
             .collect();
@@ -8547,7 +8639,7 @@ fn spawn_task(
     });
     tasks.push(TaskSlot {
         state,
-        ..TaskSlot::new(vt, Some(eidx), live)
+        ..TaskSlot::new(vt, Some(eidx), live, child_ti)
     });
     forked_twins.insert(child_ti);
     pid as i64
@@ -8815,8 +8907,9 @@ fn image_pages(host: &Host, census: &ImageCensus) -> bool {
 
 /// Whether a vCPU is the bare root a fork duplicates faithfully (the oracle's `fork_vcpu` gate): no
 /// live child or thread, on its root context with no fiber resume chain. Anything else is refused.
-fn fork_bare<T>(children: &[Option<T>], vt: &VTask) -> bool {
-    children.iter().all(Option::is_none) && vt.active_id == ROOT_FIBER && vt.chain.is_empty()
+fn fork_bare(tasks: &[TaskSlot], ti: usize) -> bool {
+    let vt = &tasks[ti].vm.vt;
+    tasks[tasks[ti].domain].children.is_idle() && vt.active_id == ROOT_FIBER && vt.chain.is_empty()
 }
 
 /// What a fork twin takes from its parent's process (the oracle's `fork_vcpu`): one `spawn` of the
@@ -9112,12 +9205,12 @@ enum Outcome {
         dst: u32,
         module: usize,
     },
-    /// A join (`thread.join`, or with `status` a §14 child's `Instantiator.join`, op 1): park until
-    /// child `handle` ends; what it gives the joiner lands from `dst` ([`super::join_delivery`]).
+    /// A join (`thread.join`, or a §14 child's `Instantiator.join`, op 1, which delivers alike): park
+    /// until child `handle` ends; what it gives the joiner lands from `dst`
+    /// ([`super::join_delivery`]).
     ThreadJoin {
         handle: i32,
         dst: u32,
-        status: bool,
     },
     /// §3.6 (I36 slice 2) — a caller's `call.cap` through a live-callee offer. The dispatch is
     /// already enqueued on the callee (the op exec holds the callee `Arc`); the driver parks this
@@ -9567,6 +9660,9 @@ enum Claim {
     Block,
     /// An event-parked fiber still blocked: the resumer gets `(FIBER_PARKED, 0)`.
     Poll,
+    /// A fiber that already returned, so its handle is spent: the resumer gets `(-EBADF, 0)`
+    /// (INVARIANTS #5, #2667).
+    Spent,
 }
 
 /// #1538 — take the argument a thaw claim queued for fiber `slot`'s rewound `suspend` (see
@@ -9637,9 +9733,10 @@ fn new_fiber(
 /// A pending fiber starts; a parked one continues, `arg` its `suspend`'s result. An event-parked fiber
 /// continues once its event has fired, with the event's result instead of `arg` (the oracle's
 /// `LiveWoken`); until then its resumer polls it, or blocks on it under a blocking resume
-/// (`blocking_ip`) on a driver that can idle the task (`may_block`, I48). Anything else (forged,
-/// running, done) is a `FiberFault`. `blocking_ip` also tags the fiber while it runs, so a park inside
-/// it idles the task instead of answering the poll.
+/// (`blocking_ip`) on a driver that can idle the task (`may_block`, I48). A finished fiber's handle
+/// is spent ([`Claim::Spent`]); anything else (forged, running) is a `FiberFault`. `blocking_ip`
+/// also tags the fiber while it runs, so a park inside it idles the task instead of answering the
+/// poll.
 fn claim_fiber(
     fibers: &mut FiberCell,
     host: &mut HostCell,
@@ -9773,7 +9870,8 @@ fn claim_fiber(
             vm.set(cap_dst, Reg::from_i64(r));
             Ok(Claim::Continue(vm))
         }
-        _ => Err(Trap::FiberFault), // forged / Running / Done
+        Some(FiberState::Done) => Ok(Claim::Spent), // a finished slot keeps its place (#1684)
+        _ => Err(Trap::FiberFault),                 // forged / Running
     })
 }
 
@@ -10102,7 +10200,7 @@ mod stalled_tests {
             .expect("parse");
         let unit = compile_module(&m.funcs, &m.types, None).expect("compile");
         let vt = VTask::new(&unit, 0, &[], None).expect("task");
-        TaskSlot::new(vt, None, LiveVcpu::none())
+        TaskSlot::new(vt, None, LiveVcpu::none(), 0)
     }
 
     /// #2529 — at an idle point a runnable task is one of a stopped process: a wait on the
@@ -10841,6 +10939,11 @@ fn drive_nested(
                         vt.active.set(dst + 1, Reg::from_i64(0));
                         continue;
                     }
+                    Claim::Spent => {
+                        vt.active.set(dst, Reg::from_i32(super::FIBER_SPENT));
+                        vt.active.set(dst + 1, Reg::from_i64(0));
+                        continue;
+                    }
                 };
                 enter_fiber(&mut vt, fibers, mem, false, k, target, dst);
             }
@@ -10859,11 +10962,13 @@ fn drive_nested(
             // `Jit.invoke` reached the same way is serviced by the arm below, #1334.)
             Outcome::JitInstall { h, code, dst } if run_meta.is_some() => {
                 let unit = host.with(|p| p.resolve_jit_unit(h, code));
-                jit_install(unit, source, table, &mut vt.active, dst)?;
+                let record = |t, slot, u| host.with(|p| p.jit_record_install(t, slot, u));
+                jit_install(unit, source, table, &mut vt.active, dst, record)?;
             }
             Outcome::JitUninstall { h, slot, dst } if run_meta.is_some() => {
-                let authority = host.with(|p| p.resolve_jit_domain(h)).map(drop);
-                jit_uninstall(authority, source, table, slot, &mut vt.active, dst)?;
+                let jit_table = host.with(|p| p.resolve_jit_domain(h));
+                let forget = |t, slot| host.with(|p| p.jit_forget_install(t, slot));
+                jit_uninstall(jit_table, source, table, slot, &mut vt.active, dst, forget)?;
             }
             // #1334: a §22 `Jit.invoke` reached on a nested interpretation — a cross-tier bounce out
             // of an emitted region (the JACL compiler stages a macro from a helper the tiered-up
@@ -11076,7 +11181,6 @@ enum VcpuStop {
     Join {
         handle: i32,
         dst: u32,
-        status: bool,
     },
     /// §5 `Instantiator.instantiate_rec` (op 17, #1286) — see [`Outcome::InstantiateDetached`].
     InstantiateDetached {
@@ -11156,15 +11260,7 @@ impl Outcome {
                 dst,
                 module: module as u32,
             },
-            Outcome::ThreadJoin {
-                handle,
-                dst,
-                status,
-            } => VcpuStop::Join {
-                handle,
-                dst,
-                status,
-            },
+            Outcome::ThreadJoin { handle, dst } => VcpuStop::Join { handle, dst },
             // §3.6 (I36 slice 2): the serve/call/offer trio surface straight to the driver. The
             // qualification veto keeps them out of fiber contexts, so no registry state is live.
             Outcome::LiveCall {
@@ -11424,6 +11520,11 @@ fn step_vcpu(
                             vt.active.set(dst + 1, Reg::from_i64(0));
                             continue;
                         }
+                        Claim::Spent => {
+                            vt.active.set(dst, Reg::from_i32(super::FIBER_SPENT));
+                            vt.active.set(dst + 1, Reg::from_i64(0));
+                            continue;
+                        }
                     };
                 enter_fiber(vt, fibers, ctx.mem, ctx.durable, k, target, dst);
             }
@@ -11491,11 +11592,13 @@ fn resolve_fiber_entry(
     }
 }
 
-/// A child domain's runtime (a §14 child, a fork twin or an exec image), owned by [`drive`] alongside
-/// the task set. Its `mem` is the domain's own window, its `host` its powerbox, its `table` a fresh
-/// **natural** dispatch table over its unit (no access to installed §22 units — like the
-/// tree-walker's fresh `DomainTable`), and `fuel` its own (#1944 slice 3: a §14 child's is drawn
-/// from its budget node).
+/// A child domain's runtime (a §14 child, a fork twin or an exec image), owned by its run alongside
+/// the task set: the executors' ([`drive`], [`drive_threads`]) and the debugger's
+/// ([`ScheduledDebugRun`]). Its `mem` is the domain's own window, its `host` its powerbox, its
+/// `table` a fresh **natural** dispatch table over its unit (no access to installed §22 units — like
+/// the tree-walker's fresh `DomainTable`), and `fuel` its own (#1944 slice 3: an executor's §14
+/// child draws from its budget node; the debugger gives each a fixed allowance, which a checkpoint
+/// captures whole and a seek replays).
 struct ChildEnv {
     mem: Option<Mem>,
     /// The child's live powerbox, in its cell ([`DomainCell`]): a §3.6 live-callee offer holds the
@@ -11508,16 +11611,18 @@ struct ChildEnv {
     fuel: Fuel,
     /// The child domain's own §12 fiber registry (with its durable halves): each domain numbers its
     /// fibers from 0 and cannot reach another's, as on the tree-walk oracle. The root domain's is
-    /// [`SchedCore::fibers`].
+    /// [`SchedCore::fibers`] (the debugger's, [`ScheduledDebugRun::fibers`]).
     fibers: FiberTables,
     /// #2074 — for a §14 child, the env whose task spawned it (`None`: the root domain); `None` for
-    /// a fork twin or an exec image, which are not §14 children. A kill descends through it.
+    /// a fork twin or an exec image, which are not §14 children. A kill descends through it
+    /// ([`kill_env`] on the debugger), and a checkpoint's rebuild aliases its inherited stdio to it
+    /// (#1866).
     spawner: Option<usize>,
     /// A §14 child's domain, not a fork twin's or an exec image's: its end releases the services
     /// it was a client of (#1217), as the oracle's does for a detached child's.
     nested: bool,
     /// The unit of the run's [`ModuleSource`] this env's domain runs, which a fork twin of it runs
-    /// too. The root domain's is unit 0.
+    /// too, and over which a debugger checkpoint rebuilds its table. The root domain's is unit 0.
     program: u32,
 }
 
@@ -11584,6 +11689,16 @@ fn coop_start_child(
     tierup: Option<ProgramEmit>,
 ) -> Result<(), Trap> {
     let spawner = tasks[ti].env;
+    // #2043 — a full domain table refuses probeably, as a full powerbox does.
+    if !child_room(tasks, ti) {
+        child.refuse(|lease| {
+            task_host(root, extra_envs, spawner)
+                .lock_unpoisoned()
+                .release_detached(lease)
+        });
+        tasks[ti].deliver(dst, Reg::from_i32(super::EMFILE as i32));
+        return Ok(());
+    }
     let room = live_tasks(tasks) < super::MAX_VCPUS;
     let BuiltChild {
         module,
@@ -11617,10 +11732,9 @@ fn coop_start_child(
     let cidx = tasks.len();
     tasks.push(TaskSlot {
         lease: Some((spawner, lease)),
-        ..TaskSlot::new(vt, Some(eidx), LiveVcpu::none())
+        ..TaskSlot::new(vt, Some(eidx), LiveVcpu::none(), cidx)
     });
-    let handle = tasks[ti].threads.len() as i32;
-    tasks[ti].threads.push(Some(cidx));
+    let handle = issue_child(tasks, ti, cidx).ok_or(Trap::Malformed)?; // room checked above
     tasks[ti].deliver(dst, Reg::from_i32(handle));
     Ok(())
 }
@@ -11632,9 +11746,12 @@ struct TaskSlot {
     /// Boxed, so a slot is a third its size: every scheduling round scans the tasks' states, and
     /// with the VM inline each one cost the scan its own cache lines.
     vm: Box<TaskVm>,
-    /// This vCPU's `thread.spawn` / `instantiate` children (handle = index → global task index).
-    /// `None` = joined. (Both seams share one handle namespace, matching the tree-walker's `threads`.)
-    threads: Vec<Option<usize>>,
+    /// #2043 D1 — the task its domain's root is: itself for a root, its spawner's for a thread.
+    domain: usize,
+    /// On a domain's root, the domain's children: its `thread.spawn` threads and its §14 children,
+    /// by generation-checked handle ([`temen_ir::handles`]) → global task index. Empty on any other
+    /// task. One table per domain, as on the tree-walker.
+    children: temen_ir::handles::Table<usize>,
     /// The runtime environment this vCPU steps against: `None` = the shared domain (root + its
     /// `thread.spawn` siblings); `Some(k)` = the confined `extra_envs[k]` of a §14 `instantiate` child
     /// (and any threads it spawns, which share its window — they inherit the same env index).
@@ -11654,15 +11771,16 @@ struct TaskSlot {
 }
 
 impl TaskSlot {
-    /// A runnable task `vt` over env `env`, holding its `live` charge: no children yet, nothing
-    /// suspended, no window lease.
-    fn new(vt: VTask, env: Option<usize>, live: LiveVcpu) -> TaskSlot {
+    /// A runnable task `vt` over env `env` in the domain whose root is task `domain`, holding its
+    /// `live` charge: no children yet, nothing suspended, no window lease.
+    fn new(vt: VTask, env: Option<usize>, live: LiveVcpu, domain: usize) -> TaskSlot {
         TaskSlot {
             vm: Box::new(TaskVm {
                 vt,
                 suspended: None,
             }),
-            threads: Vec::new(),
+            domain,
+            children: temen_ir::handles::Table::new(),
             env,
             state: TaskState::Runnable,
             lease: None,
@@ -11740,13 +11858,12 @@ fn refund_ended_windows(
 #[derive(Clone)]
 enum TaskState {
     Runnable,
-    /// Parked on a join of task `child` (with `status`, a §14 child's); deliver what it gives the
-    /// joiner from `dst` ([`super::join_delivery`]) and wake.
+    /// Parked on a join of task `child`, which `handle` named; deliver what it gives the joiner from
+    /// `dst` ([`super::join_delivery`]) and wake.
     BlockedJoin {
         child: usize,
-        slot: usize,
+        handle: i32,
         dst: u32,
-        status: bool,
     },
     /// Parked on `memory.wait` at address `addr` of its own window until notified or `deadline`
     /// (logical clock). It waits at `site`, taken at the park as the oracle takes its key; a `notify`
@@ -12853,8 +12970,9 @@ impl SchedCore {
     }
 
     /// A run's initial scheduling state: the root task at `entry`, plus any fibers a durable freeze
-    /// left to re-seed (taken from `host.frozen_fibers`), after the once-per-run entry-fuel charge.
-    /// Both executors start a run here ([`CoopSched::new`], [`drive_threads`]).
+    /// left to re-seed (taken from `host.frozen_fibers`), after the once-per-run entry-fuel charge,
+    /// over a table that holds the §22 installs `host` recorded ([`reapply_installs`]). Both
+    /// executors start a run here ([`CoopSched::new`], [`drive_threads`]).
     fn new(
         dom: &Domain,
         entry: FuncIdx,
@@ -12863,6 +12981,7 @@ impl SchedCore {
         mem: Option<&Mem>,
         host: &mut Host,
     ) -> Result<SchedCore, Trap> {
+        reapply_installs(host, &dom.source, &dom.table)?;
         // Fuel unification (safepoint-anchored): charge one fuel for *entering the top-level entry
         // function*, mirroring the per-callee-entry charge at `Op::Call`/`CallIndirect`/`TailCall*` and
         // the JIT's entry-prologue charge, so the tree-walker, bytecode, and JIT engines burn identically.
@@ -12877,7 +12996,7 @@ impl SchedCore {
             args,
             Some(host.own_node()),
         )?;
-        let tasks = vec![TaskSlot::new(root_vt, None, LiveVcpu::none())];
+        let tasks = vec![TaskSlot::new(root_vt, None, LiveVcpu::none(), 0)];
         wire_kill(host);
         // #1122/#1146/#1262 — an armed external-wake doorbell: wire the root's personality doors to
         // ring it (pipe-wake for a `feed_terminal` byte arrival; `set_wake` for an EINTR-bearing
@@ -13852,10 +13971,10 @@ impl SchedCore {
                 // `thread.spawn` handle, whose domain is the caller's own: no domain holds an
                 // offer into itself, so a step never locks its own cell twice.
                 let export = arg as u32;
-                let callee = super::resolve_thread(&tasks[ti].threads, child)
+                let callee = name_child(tasks, ti, child)
                     .ok()
-                    .and_then(|slot| tasks[ti].threads[slot])
-                    .and_then(|cidx| tasks[cidx].env)
+                    .flatten()
+                    .and_then(|(_, cidx)| tasks[cidx].env)
                     .filter(|&k| Some(k) != tasks[ti].env)
                     .map(|k| std::sync::Arc::clone(&extra_envs[k].host));
                 let cap = callee.and_then(|callee: DomainCell| {
@@ -13923,7 +14042,7 @@ impl SchedCore {
                     let caller_env = tasks[caller_ti].env;
                     // Only a bare root caller (no spawned children/threads, no live fiber chain)
                     // forks faithfully — the oracle's `bare` gate. Anything else degrades.
-                    let bare = fork_bare(&tasks[caller_ti].threads, &tasks[caller_ti].vm.vt);
+                    let bare = fork_bare(tasks, caller_ti);
                     // Duplicate the caller's window (private copy — fork does not share memory) and
                     // powerbox (own handle namespace, shared `Arc` backings). A root caller (no env)
                     // or a non-forkable window/powerbox fails closed to a single reply.
@@ -13974,7 +14093,7 @@ impl SchedCore {
                         program,
                     });
                     let twin_ti = tasks.len();
-                    tasks.push(TaskSlot::new(twin_vt, Some(twin_eidx), live));
+                    tasks.push(TaskSlot::new(twin_vt, Some(twin_eidx), live, twin_ti));
                     // Mark the twin reapable so a later servicer-side `wait()` (`reap`) can deliver
                     // its exit status to the parent (FORK.md §8.6); retired when reaped.
                     forked_twins.insert(twin_ti);
@@ -14196,8 +14315,7 @@ impl SchedCore {
                 // as a thread would (#1944 slice 3). The live cap is checked first, as the oracle's
                 // `fork_vcpu` checks it (#2006).
                 let env = tasks[ti].env;
-                let room = fork_bare(&tasks[ti].threads, &tasks[ti].vm.vt)
-                    && live_tasks(tasks) < super::MAX_VCPUS;
+                let room = fork_bare(tasks, ti) && live_tasks(tasks) < super::MAX_VCPUS;
                 let forked = if room {
                     let win = match env {
                         Some(k) => extra_envs[k].mem.as_ref(),
@@ -14253,7 +14371,7 @@ impl SchedCore {
                             program,
                         });
                         debug_assert_eq!(tasks.len(), twin_ti, "twin lands at its pre-read index");
-                        tasks.push(TaskSlot::new(twin_vt, Some(twin_eidx), live));
+                        tasks.push(TaskSlot::new(twin_vt, Some(twin_eidx), live, twin_ti));
                         forked_twins.insert(twin_ti);
                         tasks[ti].deliver(dst, Reg::from_i64(twin_pid as i64));
                     }
@@ -14343,10 +14461,18 @@ impl SchedCore {
                 // (the shared domain for a root-spawned thread, or the same confined `instantiate`
                 // env for one spawned by a confined child).
                 let env = tasks[ti].env;
-                tasks.push(TaskSlot::new(child, env, live));
-                let handle = tasks[ti].threads.len() as i32;
-                tasks[ti].threads.push(Some(cidx));
-                tasks[ti].deliver(dst, Reg::from_i32(handle));
+                // #2043 — and its domain: one child table for both. A full one refuses it as the
+                // live cap does.
+                if child_room(tasks, ti) {
+                    let domain = tasks[ti].domain;
+                    tasks.push(TaskSlot::new(child, env, live, domain));
+                    match issue_child(tasks, ti, cidx) {
+                        Some(handle) => tasks[ti].deliver(dst, Reg::from_i32(handle)),
+                        None => complete(tasks, ti, Err(Trap::ThreadFault)),
+                    }
+                } else {
+                    complete(tasks, ti, Err(Trap::ThreadFault));
+                }
             }
             // §5 detached spawn (op 17): the child is a task of this executor over a
             // **fresh window of its own** (`Mem::from_spec`, its own guard) — not a carve — the
@@ -14399,11 +14525,7 @@ impl SchedCore {
                 let spawners: Vec<_> = extra_envs.iter().map(|e| e.spawner).collect();
                 child_ctl(tasks, &spawners, ti, child, dst, ctl);
             }
-            Ok(VcpuStop::Join {
-                handle,
-                dst,
-                status,
-            }) => join_child(tasks, ti, handle, dst, status),
+            Ok(VcpuStop::Join { handle, dst }) => join_child(tasks, ti, handle, dst),
             Ok(VcpuStop::Wait {
                 base,
                 expected,
@@ -14460,25 +14582,25 @@ impl SchedCore {
             // arms, after which the driver re-syncs before the emitted frame resumes.
             Ok(VcpuStop::JitInstall { h, code, dst }) => {
                 let env = tasks[ti].env;
-                let unit = task_host(root, extra_envs, env)
-                    .lock_unpoisoned()
-                    .resolve_jit_unit(h, code);
+                let host = task_host(root, extra_envs, env);
+                let unit = host.lock_unpoisoned().resolve_jit_unit(h, code);
+                let record = |t, slot, u| host.lock_unpoisoned().jit_record_install(t, slot, u);
                 let table = env.map_or(&*dom.table, |k| &*extra_envs[k].table);
                 let active = &mut tasks[ti].vm.vt.active;
-                if let Err(t) = jit_install(unit, &dom.source, table, active, dst) {
+                if let Err(t) = jit_install(unit, &dom.source, table, active, dst, record) {
                     complete(tasks, ti, Err(t));
                     return None;
                 }
             }
             Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
                 let env = tasks[ti].env;
-                let authority = task_host(root, extra_envs, env)
-                    .lock_unpoisoned()
-                    .resolve_jit_domain(h)
-                    .map(drop);
+                let host = task_host(root, extra_envs, env);
+                let jit_table = host.lock_unpoisoned().resolve_jit_domain(h);
+                let forget = |t, slot| host.lock_unpoisoned().jit_forget_install(t, slot);
                 let table = env.map_or(&*dom.table, |k| &*extra_envs[k].table);
                 let active = &mut tasks[ti].vm.vt.active;
-                let cleared = jit_uninstall(authority, &dom.source, table, slot, active, dst);
+                let cleared =
+                    jit_uninstall(jit_table, &dom.source, table, slot, active, dst, forget);
                 if let Err(t) = cleared {
                     complete(tasks, ti, Err(t));
                     return None;
@@ -15767,7 +15889,7 @@ mod dbg_domain_end_tests {
         let vt = VTask::new(&unit, 0, &[], None).expect("task");
         TaskSlot {
             state,
-            ..TaskSlot::new(vt, Some(0), LiveVcpu::none())
+            ..TaskSlot::new(vt, Some(0), LiveVcpu::none(), 0)
         }
     }
 
@@ -15797,14 +15919,15 @@ mod dbg_domain_end_tests {
             sp: 0,
             charge: child.fiber_charge().expect("room"),
         });
-        let mut envs = vec![DbgEnv {
+        let mut envs = vec![ChildEnv {
             mem: None,
-            host: child,
-            table: build_table_for(1, 0, 0),
+            host: child.into_cell(),
+            table: std::sync::Arc::new(build_table_for(1, 0, 0)),
             program: 0,
             fuel: Fuel::fixed(0),
             fibers,
             spawner: None,
+            nested: true,
         }];
         let held = |h: &Host| h.capture_durable_budgets()[0].used.mem;
         let done = || TaskState::Done(Ok(Vec::new()));
@@ -15889,7 +16012,7 @@ mod live_cap_tests {
         let (host, child) = admitted();
         let root = host.into_cell();
         let mut tasks: Vec<TaskSlot> = (0..crate::MAX_VCPUS)
-            .map(|_| TaskSlot::new(vtask(), None, LiveVcpu::none()))
+            .map(|_| TaskSlot::new(vtask(), None, LiveVcpu::none(), 0))
             .collect();
         let r = coop_start_child(&mut tasks, &mut Vec::new(), &root, 0, child, 0, None);
         assert_eq!(r, Err(Trap::ThreadFault));
@@ -15905,7 +16028,7 @@ mod live_cap_tests {
     fn the_debug_scheduler_hands_a_refused_childs_window_back() {
         let (mut host, child) = admitted();
         let mut tasks: Vec<TaskSlot> = (0..crate::MAX_VCPUS)
-            .map(|_| TaskSlot::new(vtask(), None, LiveVcpu::none()))
+            .map(|_| TaskSlot::new(vtask(), None, LiveVcpu::none(), 0))
             .collect();
         let r = dbg_start_child(&mut tasks, 0, &mut Vec::new(), &mut host, child, 0);
         assert_eq!(r, Err(Trap::ThreadFault));
@@ -17430,24 +17553,24 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
     while let Some((done, res)) = work.pop() {
         tasks[done].state = TaskState::Done(res.clone());
         tasks[done].live = LiveVcpu::none(); // #2001: its `spawn` goes back
-        for (j, t) in tasks.iter_mut().enumerate() {
-            let TaskState::BlockedJoin {
-                child,
-                slot,
-                dst,
-                status,
-            } = t.state
-            else {
-                continue;
+        let joiners: Vec<(usize, i32, u32)> = (0..tasks.len())
+            .filter_map(|j| match tasks[j].state {
+                TaskState::BlockedJoin { child, handle, dst } if child == done => {
+                    Some((j, handle, dst))
+                }
+                _ => None,
+            })
+            .collect();
+        for (j, handle, dst) in joiners {
+            // The first joiner of the handle takes the child; another finds it spent (#2043 D3).
+            let regs = match take_child(tasks, j, handle, done) {
+                true => super::join_delivery(&res, ends_as_value(tasks, j, done)),
+                false => Ok(super::join_spent()),
             };
-            if child != done {
-                continue;
-            }
-            t.threads[slot] = None;
-            match super::join_delivery(&res, status) {
+            match regs {
                 Ok(regs) => {
-                    t.deliver_from(dst, regs);
-                    t.state = TaskState::Runnable;
+                    tasks[j].deliver_from(dst, regs);
+                    tasks[j].state = TaskState::Runnable;
                 }
                 Err(trap) => work.push((j, Err(trap))),
             }
@@ -17455,32 +17578,75 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
     }
 }
 
-/// A join of child handle `handle` (`status`: [`super::join_delivery`]'s mode). A child that already
-/// finished delivers now, or its trap completes the joiner; else the joiner parks on it until
-/// [`complete`] wakes it. A bad handle completes the joiner with its trap.
-fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32, status: bool) {
-    let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
-        Ok(s) => s,
+/// #2043 — how task `ti`'s domain names child handle `handle`: the live child's slot and task, `None`
+/// for a spent handle (`-EBADF`), or the trap of a forged one ([`temen_ir::handles`]).
+fn name_child(tasks: &[TaskSlot], ti: usize, handle: i32) -> Result<Option<(usize, usize)>, Trap> {
+    let table = &tasks[tasks[ti].domain].children;
+    match table.name(handle) {
+        temen_ir::handles::Named::Live(slot) => Ok(table.get(slot).map(|&c| (slot, c))),
+        temen_ir::handles::Named::Spent => Ok(None),
+        temen_ir::handles::Named::Forged => Err(Trap::ThreadFault),
+    }
+}
+
+/// Retire `handle` in task `ti`'s domain if it still names task `child`: whether it did. A handle is
+/// joined once, and its slot is free to reissue.
+fn take_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, child: usize) -> bool {
+    let d = tasks[ti].domain;
+    match tasks[d].children.get_live(handle) {
+        Some((slot, &c)) if c == child => tasks[d].children.retire(slot).is_some(),
+        _ => false,
+    }
+}
+
+/// Issue task `child` into task `ti`'s domain's table: its handle, or `None` when the table is full.
+fn issue_child(tasks: &mut [TaskSlot], ti: usize, child: usize) -> Option<i32> {
+    let d = tasks[ti].domain;
+    tasks[d].children.issue(child).ok()
+}
+
+/// The live entries of task `ti`'s domain's table, as `(slot, task)`: what a scheduler trace compares
+/// across an advance.
+fn live_children(tasks: &[TaskSlot], ti: usize) -> Vec<(usize, usize)> {
+    tasks[tasks[ti].domain]
+        .children
+        .live()
+        .map(|(slot, &c)| (slot, c))
+        .collect()
+}
+
+/// Whether there is room in task `ti`'s domain's table for one more child.
+fn child_room(tasks: &[TaskSlot], ti: usize) -> bool {
+    let table = &tasks[tasks[ti].domain].children;
+    table.live().count() < temen_ir::handles::SLOTS
+}
+
+/// Whether child task `c`'s end is a value to joiner `ti`: a §14 child runs in a domain of its own,
+/// whose trap is a value (#2066), where a thread's trap is its domain's (INVARIANTS #6).
+fn ends_as_value(tasks: &[TaskSlot], ti: usize, c: usize) -> bool {
+    tasks[c].env != tasks[ti].env
+}
+
+/// A join of child handle `handle`. A child that already finished delivers now, or its trap completes
+/// the joiner; else the joiner parks on it until [`complete`] wakes it. A spent handle delivers
+/// [`super::join_spent`]; a forged one completes the joiner with its trap. The entry says how the child
+/// ends ([`ends_as_value`]), so `thread.join` and `Instantiator.join` deliver alike.
+fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32) {
+    let child = match name_child(tasks, ti, handle) {
+        Ok(Some((_, c))) => c,
+        Ok(None) => return tasks[ti].deliver_from(dst, super::join_spent()),
         Err(t) => return complete(tasks, ti, Err(t)),
     };
-    let child = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
     match &tasks[child].state {
         TaskState::Done(res) => {
-            let out = super::join_delivery(res, status);
-            tasks[ti].threads[slot] = None;
+            let out = super::join_delivery(res, ends_as_value(tasks, ti, child));
+            take_child(tasks, ti, handle, child);
             match out {
                 Ok(regs) => tasks[ti].deliver_from(dst, regs),
                 Err(t) => complete(tasks, ti, Err(t)),
             }
         }
-        _ => {
-            tasks[ti].state = TaskState::BlockedJoin {
-                child,
-                slot,
-                dst,
-                status,
-            }
-        }
+        _ => tasks[ti].state = TaskState::BlockedJoin { child, handle, dst },
     }
 }
 
@@ -17489,8 +17655,7 @@ fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32, status: 
 /// or a child whose root task is done, which has ended — what `poll` reports — though its env is
 /// released only once its threads are done too.
 fn grant_target(tasks: &[TaskSlot], ti: usize, child: i32) -> Option<usize> {
-    let slot = super::resolve_thread(&tasks[ti].threads, child).ok()?;
-    let c = tasks[ti].threads[slot]?;
+    let (_, c) = name_child(tasks, ti, child).ok()??;
     if matches!(tasks[c].state, TaskState::Done(_)) {
         return None;
     }
@@ -17498,8 +17663,8 @@ fn grant_target(tasks: &[TaskSlot], ti: usize, child: i32) -> Option<usize> {
 }
 
 /// PROCESS.md S3 `poll`/`detach`/`kill` of child handle `child`, the answer at `dst`. `spawners`
-/// names each env's spawner, for a `kill` to end the subtree ([`kill_env`]). A bad handle completes
-/// the caller with its trap.
+/// names each env's spawner, for a `kill` to end the subtree ([`kill_env`]). A spent handle answers
+/// `-EBADF` (#2667); a forged one completes the caller with its trap.
 fn child_ctl(
     tasks: &mut [TaskSlot],
     spawners: &[Option<usize>],
@@ -17508,11 +17673,11 @@ fn child_ctl(
     dst: u32,
     ctl: ChildCtl,
 ) {
-    let slot = match super::resolve_thread(&tasks[ti].threads, child) {
-        Ok(s) => s,
+    let (slot, c) = match name_child(tasks, ti, child) {
+        Ok(Some(named)) => named,
+        Ok(None) => return tasks[ti].deliver(dst, Reg::from_i32(super::EBADF as i32)),
         Err(t) => return complete(tasks, ti, Err(t)),
     };
-    let c = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
     let answer = match ctl {
         ChildCtl::Poll => match &tasks[c].state {
             TaskState::Done(Ok(_)) => 1,
@@ -17522,7 +17687,8 @@ fn child_ctl(
         // The result dies with its env; a window lease is refunded once the child is done
         // (`refund_ended_windows`); its lane went back at admission.
         ChildCtl::Detach => {
-            tasks[ti].threads[slot] = None;
+            let d = tasks[ti].domain;
+            tasks[d].children.retire(slot);
             0
         }
         // A `thread.spawn` handle shares this task's env: nothing to kill, as on the tree-walker (no
@@ -19921,11 +20087,7 @@ impl Vm {
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    return Ok(Outcome::ThreadJoin {
-                        handle,
-                        dst,
-                        status: false,
-                    });
+                    return Ok(Outcome::ThreadJoin { handle, dst });
                 }
                 // §14 executor children — the Instantiator authority `(ibase, isize)` is resolved here
                 // (a forged/ungranted cap is an inert CapFault in place), then the driver builds the
@@ -20063,11 +20225,7 @@ impl Vm {
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    return Ok(Outcome::ThreadJoin {
-                        handle,
-                        dst,
-                        status: true,
-                    });
+                    return Ok(Outcome::ThreadJoin { handle, dst });
                 }
                 Op::MemoryWait {
                     ty,

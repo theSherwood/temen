@@ -630,7 +630,7 @@ fn check_inst(
         }
         Inst::ThreadJoin { handle } => {
             w(*handle, V::I32)?;
-            vec![V::I64]
+            vec![V::I64, V::I64] // (status, value), the shape of `Instantiator.join` (#2667)
         }
         Inst::VcpuTlsGet => vec![V::I64],
         Inst::VcpuTlsSet { val } => {

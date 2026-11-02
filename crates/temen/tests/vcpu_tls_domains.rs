@@ -28,7 +28,7 @@ func (i32, i32, i32) -> (i64, i64, i64) {
 block 0 (vinst: i32, vmod: i32, vbud: i32) {
   z = i64.const 0
   ha = thread.spawn 1 z z
-  ta = thread.join ha
+  ta_st, ta = thread.join ha
   rm = i64.const 17416
   i32.store rm vmod
   rb = i64.const 17420
@@ -37,7 +37,7 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {
   hc = call.cap 6 17 (i64) -> (i32) vinst (rp)
   rc_st, rc = call.cap 6 1 (i32) -> (i64, i64) vinst (hc)
   hb = thread.spawn 1 z z
-  tb = thread.join hb
+  tb_st, tb = thread.join hb
   return ta, rc, tb
   }
 }
@@ -56,9 +56,9 @@ block 0 (v0: i64) {
   r0 = vcpu.tls.get
   z = i64.const 0
   h1 = thread.spawn 1 z z
-  r1 = thread.join h1
+  r1_st, r1 = thread.join h1
   h2 = thread.spawn 1 z z
-  r2 = thread.join h2
+  r2_st, r2 = thread.join h2
   k100 = i64.const 100
   k10 = i64.const 10
   a = i64.mul r0 k100

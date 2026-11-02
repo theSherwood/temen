@@ -37,8 +37,8 @@ block 0 () {
   va = i64.const 1
   vh0 = thread.spawn 1 vsp va
   vh1 = thread.spawn 1 vsp va
-  vj0 = thread.join vh0
-  vj1 = thread.join vh1
+  vj0_st, vj0 = thread.join vh0
+  vj1_st, vj1 = thread.join vh1
   vaddr = i64.const 16384
   vr = i64.atomic.load vaddr
   return vr
@@ -94,7 +94,7 @@ block 5 (v17: i64) {
   v20 = i64.const 16400
   v21 = i64.add v20 v19
   v22 = i32.load v21
-  v23 = thread.join v22
+  v23_st, v23 = thread.join v22
   v24 = i64.const 1
   v25 = i64.add v17 v24
   br 4(v25)
@@ -148,7 +148,7 @@ block 0 () {
   v6 = i64.const 16384
   v7 = i32.const 1
   v8 = atomic.notify v6 v7
-  v9 = thread.join v3
+  v9_st, v9 = thread.join v3
   return v9
   }
 }
@@ -171,7 +171,7 @@ memory 16
 func () -> (i64) {
 block 0 () {
   v0 = i32.const 0
-  v1 = thread.join v0
+  v1_st, v1 = thread.join v0
   return v1
   }
 }
@@ -192,7 +192,7 @@ block 0 () {
   v4, v5 = cont.resume v2 v3
   v6 = i64.extend_i32_u v2
   v7 = thread.spawn 1 v6 v6
-  v8 = thread.join v7
+  v8_st, v8 = thread.join v7
   return v8
   }
 }

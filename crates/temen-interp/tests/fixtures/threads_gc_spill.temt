@@ -6,10 +6,10 @@ block 0 () {
   t1 = thread.spawn 3 vz vz
   t2 = thread.spawn 3 vz vz
   t3 = thread.spawn 3 vz vz
-  j0 = thread.join t0
-  j1 = thread.join t1
-  j2 = thread.join t2
-  j3 = thread.join t3
+  j0_st, j0 = thread.join t0
+  j1_st, j1 = thread.join t1
+  j2_st, j2 = thread.join t2
+  j3_st, j3 = thread.join t3
   vp = i64.const 37120
   va = call 1 (vp)
   s0 = i64.add j0 j1

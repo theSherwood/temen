@@ -158,7 +158,7 @@ block 5 (v17: i64) {
   v20 = i64.const 16400
   v21 = i64.add v20 v19
   v22 = i32.load v21
-  v23 = thread.join v22
+  v23_st, v23 = thread.join v22
   v24 = i64.const 1
   v25 = i64.add v17 v24
   br 4(v25)
@@ -241,7 +241,7 @@ block 5 (v18: i64, v19: i64) {
   v22 = i64.const 16400
   v23 = i64.add v22 v21
   v24 = i32.load v23
-  v25 = thread.join v24
+  v25_st, v25 = thread.join v24
   v26 = i64.add v19 v25
   v27 = i64.const 1
   v28 = i64.add v18 v27
@@ -325,7 +325,7 @@ block 5 (v17: i64) {
   v20 = i64.const 16400
   v21 = i64.add v20 v19
   v22 = i32.load v21
-  v23 = thread.join v22
+  v23_st, v23 = thread.join v22
   v24 = i64.const 1
   v25 = i64.add v17 v24
   br 4(v25)
@@ -435,7 +435,7 @@ block 5 (v17: i64) {
   v20 = i64.const 16400
   v21 = i64.add v20 v19
   v22 = i32.load v21
-  v23 = thread.join v22
+  v23_st, v23 = thread.join v22
   v24 = i64.const 1
   v25 = i64.add v17 v24
   br 4(v25)
@@ -491,7 +491,7 @@ block 0 () {
   v5 = i32.atomic.wait v0 v1 v2
   v6 = i64.const 16392
   v7 = i64.atomic.load v6
-  v8 = thread.join v4
+  v8_st, v8 = thread.join v4
   return v7
   }
 }
@@ -1051,7 +1051,7 @@ block 5 (vj2: i64) {
   v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
-  v18 = thread.join v17
+  v18_st, v18 = thread.join v17
   v19 = i64.const 1
   v20 = i64.add vj2 v19
   br 4(v20)
@@ -1129,7 +1129,7 @@ block 5 (vj2: i64) {
   v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
-  v18 = thread.join v17
+  v18_st, v18 = thread.join v17
   v19 = i64.const 1
   v20 = i64.add vj2 v19
   br 4(v20)
@@ -1205,7 +1205,7 @@ block 5 (vj2: i64) {
   v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
-  v18 = thread.join v17
+  v18_st, v18 = thread.join v17
   v19 = i64.const 1
   v20 = i64.add vj2 v19
   br 4(v20)
@@ -1288,10 +1288,10 @@ block 0 () {{
   t1 = thread.spawn 1 vz vz
   t2 = thread.spawn 1 vz vz
   t3 = thread.spawn 1 vz vz
-  j0 = thread.join t0
-  j1 = thread.join t1
-  j2 = thread.join t2
-  j3 = thread.join t3
+  j0_st, j0 = thread.join t0
+  j1_st, j1 = thread.join t1
+  j2_st, j2 = thread.join t2
+  j3_st, j3 = thread.join t3
   va = call 2 (vp)
   s0 = i64.add j0 j1
   s1 = i64.add j2 j3
@@ -1471,7 +1471,7 @@ block 5 (vj2: i64) {
   v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
-  v18 = thread.join v17
+  v18_st, v18 = thread.join v17
   v19 = i64.const 1
   v20 = i64.add vj2 v19
   br 4(v20)
@@ -1495,7 +1495,7 @@ block 0 (v0: i64) {
   vsp = i64.const 0
   varg = i64.const 0
   vt = thread.spawn 1 vsp varg
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vaddr = i64.const 16448
   vexp = i32.const 99
   vtmo = i64.const 0
@@ -1758,7 +1758,7 @@ block 5 (vj2: i64) {
   v15 = i64.const 16400
   v16 = i64.add v15 v14
   v17 = i32.load v16
-  v18 = thread.join v17
+  v18_st, v18 = thread.join v17
   v19 = i64.const 1
   v20 = i64.add vj2 v19
   br 4(v20)

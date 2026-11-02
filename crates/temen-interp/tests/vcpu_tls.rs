@@ -75,8 +75,8 @@ block 0 () {
   va = i64.const 0
   vh = thread.spawn 1 vsp va
   vh2 = thread.spawn 1 vsp va
-  vj = thread.join vh
-  vj2 = thread.join vh2
+  vj_st, vj = thread.join vh
+  vj2_st, vj2 = thread.join vh2
   vk = i64.const 100
   vm = i64.mul vj vk
   vr = i64.add vm vj2

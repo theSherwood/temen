@@ -102,7 +102,7 @@ ${stores}  vbp = i64.const ${BLOB_BASE}
   vcode = call.import 2 (vbp, vbl)
   vprobe = i64.const ${PROBE}
   vres = call.import 3 (vcode, vprobe)
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vsum = i64.add vres vj
   vsl = i64.const ${SLOT}
   i64.store vsl vsum

@@ -242,7 +242,7 @@ block 0 () {
   vsp = i64.const 0
   vz = i64.const 0
   vh = thread.spawn 1 vsp vz
-  vj = thread.join vh
+  vj_st, vj = thread.join vh
   return vj
   }
 }

@@ -18,9 +18,9 @@ fn waiter(segment: bool, word: i32, root_waits: bool) -> temen_ir::Module {
     };
     // The root waits beside a thread that returns at once, or joins the thread that waits.
     let (spawned, rest) = if root_waits {
-        (2, "  vr = call 1 (vsp, va)\n  vj = thread.join vt\n")
+        (2, "  vr = call 1 (vsp, va)\n  vj_st, vj = thread.join vt\n")
     } else {
-        (1, "  vr = thread.join vt\n")
+        (1, "  vr_st, vr = thread.join vt\n")
     };
     let src = format!(
         "memory 17\n{data}\nfunc () -> (i64) {{\nblock 0 () {{\n  vg = i64.const 16384\n  \

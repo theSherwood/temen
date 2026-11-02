@@ -281,7 +281,7 @@ block 0 (vr: i32, vw: i32) {
   vone = i32.const 1
   i32.atomic.store vflag vone
   vwoke = atomic.notify vflag vone
-  vj = thread.join vt
+  vj_st, vj = thread.join vt
   vs2, vx2 = cont.resume vk vz
   vs164 = i64.extend_i32_u vs1
   vs264 = i64.extend_i32_u vs2

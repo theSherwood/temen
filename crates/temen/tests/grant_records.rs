@@ -130,18 +130,20 @@ fn a_record_outside_the_window_is_a_memory_fault_on_every_engine() {
     );
 }
 
-/// Control: two well-formed records inside the window grant the stream, and the child spawns.
+/// Control: two well-formed records inside the window grant the stream, and the child spawns: its
+/// handle is the first its spawner's child table issues, slot 0's first (#2043).
 #[test]
 fn a_grant_list_inside_the_window_spawns() {
     let m = guest(16640, 2);
+    let first = i64::from(temen_ir::handles::pack(0, 1));
     assert_eq!(
         oracle(&m),
-        Ok(vec![Value::I64(0)]),
+        Ok(vec![Value::I64(first)]),
         "oracle: the first child's handle"
     );
-    assert_eq!(bytecode_engine(&m), Ok(vec![Value::I64(0)]), "bytecode");
+    assert_eq!(bytecode_engine(&m), Ok(vec![Value::I64(first)]), "bytecode");
     assert!(
-        matches!(cranelift(&m), JitOutcome::Returned(ref v) if v == &[0]),
+        matches!(cranelift(&m), JitOutcome::Returned(ref v) if v == &[first]),
         "cranelift"
     );
 }
