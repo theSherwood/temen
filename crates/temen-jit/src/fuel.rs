@@ -3,8 +3,14 @@
 //! Compiled code burns [`FuelCell::left`] one unit per safepoint (word 0, a plain load/decrement/store)
 //! and, when it is spent, calls the cell's refill (word 1) instead of trapping at once: the refill
 //! draws the next chunk from the budget chain the embedder accounts in ([`BudgetNode`]), and only a
-//! spent chain traps `OutOfFuel`. A cell with no source is a fixed allowance, refilled never — a
-//! harness's `u64` budget. The JIT meters; the embedder's budget tree accounts.
+//! spent chain traps `OutOfFuel`. A chain unbounded at every level hands the cell a [`QUANTUM`] at a
+//! time all the same, drawn from nothing, so none of it goes back. A cell with no source is a fixed
+//! allowance, refilled never — a harness's `u64` budget. The JIT meters; the embedder's budget tree
+//! accounts.
+//!
+//! #1991 — the refill is also where a child pool's task ends its quantum: it hands its worker to the
+//! next runnable task, if one waits ([`crate::child_exec::quantum_end`]). Every pool task counts, so
+//! every one reaches a refill within a chunk, metered or not.
 //!
 //! The refill is called through a `PreserveAll` trampoline ([`refill_trampoline`]), which clobbers
 //! no register. A plain call would clobber the caller-saved registers at every safepoint, so a value
@@ -12,6 +18,10 @@
 //! saves and restores on every call, refill or not (#2147).
 
 use std::sync::{Arc, Mutex};
+
+/// What an unmetered chain hands a cell at each refill: as many safepoints as the interpreter's pool
+/// runs a vCPU for before its quantum ends (`temen_interp`'s `POOL_QUANTUM`, and its `FUEL_CHUNK`).
+pub(crate) const QUANTUM: u64 = 1 << 16;
 
 /// A domain's node in the embedder's budget chain (temen-run's, over a `temen_interp` budget node):
 /// where a [`FuelCell`] draws its next chunk, and what a domain's vCPUs (#2001) and fibers (#2112)
@@ -55,9 +65,13 @@ pub struct FuelCell {
     /// when the chain is spent. Compiled code reads it after a refill instead of `left`, which a
     /// sibling vCPU's plain store can have overwritten ([`fuel_refill`]).
     granted: u64,
-    /// The chain the next draw comes from; `None` for a fixed allowance (or once the chain proved
-    /// unbounded). Locked by a refill, so the vCPUs of a domain sharing the cell draw one at a time.
+    /// The chain the next draw comes from; `None` for a fixed allowance. Locked by a refill, so the
+    /// vCPUs of a domain sharing the cell draw one at a time.
     src: Mutex<Option<Arc<dyn BudgetNode>>>,
+    /// #1991 — `left` came from no draw: the chain was unbounded at every level at the last refill,
+    /// which granted a [`QUANTUM`] to count all the same. None of it goes back to the chain. Written
+    /// by a refill, under `src`'s lock.
+    free: bool,
 }
 
 impl FuelCell {
@@ -84,12 +98,13 @@ impl FuelCell {
             remaining: fuel_remaining,
             granted: 0,
             src: Mutex::new(src),
+            free: false,
         })
     }
 
     /// #2488 — a cell for another vCPU of this cell's domain, drawing from the same chain, none drawn
-    /// yet. `None` for a fixed allowance (or a chain that proved unbounded): it has no chain to
-    /// split, so its vCPUs keep sharing this cell.
+    /// yet. `None` for a fixed allowance: it has no chain to split, so its vCPUs keep sharing this
+    /// cell.
     pub(crate) fn sibling(&self) -> Option<Box<FuelCell>> {
         let src = self.src.lock().unwrap_or_else(|e| e.into_inner());
         src.clone().map(Self::drawing)
@@ -106,7 +121,7 @@ impl FuelCell {
         let left = core::ptr::addr_of_mut!((*cell).left);
         let unspent = core::ptr::read_volatile(left);
         core::ptr::write_volatile(left, 0);
-        if let Some(s) = src.as_ref() {
+        if let Some(s) = src.as_ref().filter(|_| !(*cell).free) {
             s.give_back(unspent);
         }
     }
@@ -118,7 +133,7 @@ impl FuelCell {
     pub fn rearm(&mut self, src: Option<Arc<dyn BudgetNode>>) {
         let slot = self.src.get_mut().unwrap_or_else(|e| e.into_inner());
         let left = std::mem::take(&mut self.left);
-        if let Some(s) = slot.take() {
+        if let Some(s) = slot.take().filter(|_| !std::mem::take(&mut self.free)) {
             s.give_back(left);
         }
         *slot = src;
@@ -139,7 +154,8 @@ impl FuelCell {
 
 impl Drop for FuelCell {
     fn drop(&mut self) {
-        if let Some(s) = self.src.get_mut().unwrap_or_else(|e| e.into_inner()) {
+        let src = self.src.get_mut().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = src.as_ref().filter(|_| !self.free) {
             s.give_back(self.left);
         }
     }
@@ -157,11 +173,15 @@ impl Drop for FuelCell {
 /// full (#2202: five threads in a loop trapped within milliseconds). Only a refill writes `granted`,
 /// under the lock, and it writes `0` only when the chain is spent.
 ///
+/// A child pool's task ends its quantum here first, before the lock ([`crate::child_exec::quantum_end`]):
+/// it may park, as a runnable task, until a worker takes it again.
+///
 /// # Safety
 /// `cell` is a live [`FuelCell`].
 pub(crate) unsafe extern "C" fn fuel_refill(cell: *mut FuelCell) {
+    crate::child_exec::quantum_end();
     // Only the `src` field is borrowed: compiled code writes `left` through the raw cell pointer.
-    let mut src = (*cell).src.lock().unwrap_or_else(|e| e.into_inner());
+    let src = (*cell).src.lock().unwrap_or_else(|e| e.into_inner());
     let left = core::ptr::addr_of_mut!((*cell).left);
     let granted = core::ptr::addr_of_mut!((*cell).granted);
     let refilled = core::ptr::read_volatile(left);
@@ -169,14 +189,13 @@ pub(crate) unsafe extern "C" fn fuel_refill(cell: *mut FuelCell) {
         core::ptr::write_volatile(granted, refilled);
         return;
     }
-    let drawn = match src.as_ref().map(|s| s.draw()) {
-        None | Some(Some(0)) => 0,
-        Some(None) => {
-            *src = None; // every level unbounded: nothing left to meter
-            u64::MAX
-        }
-        Some(Some(n)) => n,
+    let (drawn, free) = match src.as_ref().map(|s| s.draw()) {
+        None | Some(Some(0)) => (0, false),
+        // Every level unbounded: nothing to meter, but a quantum to count (#1991).
+        Some(None) => (QUANTUM, true),
+        Some(Some(n)) => (n, false),
     };
+    *core::ptr::addr_of_mut!((*cell).free) = free;
     core::ptr::write_volatile(left, drawn);
     core::ptr::write_volatile(granted, drawn);
 }
@@ -474,9 +493,11 @@ mod tests {
         );
     }
 
-    /// A chain that hands out [`CHUNK`] per draw, never runs dry, and counts what goes back.
+    /// A chain that hands out [`CHUNK`] per draw, never runs dry, and counts what goes back; or, when
+    /// `unbounded`, one unbounded at every level, which has nothing to hand out.
     #[derive(Default)]
     struct Chunks {
+        unbounded: bool,
         draws: AtomicU64,
         back: AtomicU64,
     }
@@ -486,13 +507,17 @@ mod tests {
     impl BudgetNode for Chunks {
         fn draw(&self) -> Option<u64> {
             self.draws.fetch_add(1, Ordering::Relaxed);
-            Some(CHUNK)
+            (!self.unbounded).then_some(CHUNK)
         }
         fn give_back(&self, unspent: u64) {
             self.back.fetch_add(unspent, Ordering::Relaxed);
         }
         fn room(&self) -> i64 {
-            i64::MAX
+            if self.unbounded {
+                -1
+            } else {
+                i64::MAX
+            }
         }
         fn charge_vcpu(&self) -> bool {
             true
@@ -564,6 +589,32 @@ block 2 (v8: i64) {
             (n as u64..n as u64 + 10).contains(&vcpu_burned),
             "the vCPU's cell paid the loop and handed back the rest: {vcpu_burned}"
         );
+    }
+
+    /// #1991 — a chain unbounded at every level hands a cell a [`super::QUANTUM`] at a time, so a
+    /// pool task reaches the end of its quantum, and none of it goes back: nothing was drawn. So
+    /// it is for the spawned vCPU's own cell (#2488).
+    #[test]
+    fn an_unbounded_chains_quanta_go_back_to_nothing() {
+        if !temen_fiber::supported() {
+            return;
+        }
+        let m = temen_text::parse_module(SPAWNS_A_LOOP).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let chain = Arc::new(Chunks {
+            unbounded: true,
+            ..Chunks::default()
+        });
+        let mut root = FuelCell::drawing(chain.clone());
+        let n = 3 * super::QUANTUM as i64;
+        assert_eq!(run_jit(&m, n, &mut root), JitOutcome::Returned(vec![n]));
+        assert_eq!(root.can_burn(), u64::MAX, "nothing to meter");
+        drop(root);
+        assert!(
+            chain.draws.load(Ordering::Relaxed) > 3,
+            "the loop drew a quantum at a time, three times, and the root once"
+        );
+        assert_eq!(chain.back.load(Ordering::Relaxed), 0, "nothing went back");
     }
 
     #[test]
