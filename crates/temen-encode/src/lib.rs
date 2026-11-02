@@ -86,16 +86,24 @@ mod op {
     pub const I64_UN_END: u8 = 0x1F;
 
     // Family bases (each op is `base + op.index()`) and their inclusive range ends.
-    pub const I32_BIN: u8 = 0x20; // + BinOp index (0..=14)
-    pub const I32_BIN_END: u8 = 0x2E;
+    // v16 (#2585): an integer binary or compare family's one-byte opcodes are its immediate forms,
+    // which folded images hold four to one over the register forms: `a`, then the immediate as an
+    // sleb (an `i32` one must fit `i32`). The register form is the byte after the range, then the
+    // `BinOp`/`CmpOp` index byte, `a` and `b`.
+    pub const I32_BIN_IMM: u8 = 0x20; // + BinOp index (0..=14)
+    pub const I32_BIN_IMM_END: u8 = 0x2E;
+    pub const I32_BIN: u8 = 0x2F;
     pub const I32_EQZ: u8 = 0x30;
-    pub const I32_CMP: u8 = 0x31; // + CmpOp index (0..=9)
-    pub const I32_CMP_END: u8 = 0x3A;
-    pub const I64_BIN: u8 = 0x40;
-    pub const I64_BIN_END: u8 = 0x4E;
+    pub const I32_CMP_IMM: u8 = 0x31; // + CmpOp index (0..=9)
+    pub const I32_CMP_IMM_END: u8 = 0x3A;
+    pub const I32_CMP: u8 = 0x3B;
+    pub const I64_BIN_IMM: u8 = 0x40;
+    pub const I64_BIN_IMM_END: u8 = 0x4E;
+    pub const I64_BIN: u8 = 0x4F;
     pub const I64_EQZ: u8 = 0x50;
-    pub const I64_CMP: u8 = 0x51;
-    pub const I64_CMP_END: u8 = 0x5A;
+    pub const I64_CMP_IMM: u8 = 0x51;
+    pub const I64_CMP_IMM_END: u8 = 0x5A;
+    pub const I64_CMP: u8 = 0x5B;
 
     // Conversions.
     pub const EXTEND_I32_S: u8 = 0x60;
@@ -393,7 +401,11 @@ pub mod wire {
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
 // for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
-const VERSION: u16 = 15;
+// v16 (#2585) adds the immediate forms of the integer binary and compare ops (`IntBinImm`,
+// `IntCmpImm`): an op whose right operand is a constant carries it, instead of naming a constant
+// instruction. They take the families' one-byte opcodes, and the register forms move to one opcode
+// per family and an op byte.
+const VERSION: u16 = 16;
 
 // The object dialect is its own header `kind` (`wire::KIND_OBJECT`), not a flag bit.
 
@@ -1044,14 +1056,32 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_sleb(out, *c);
         }
         Inst::IntBin { ty, op: o, a, b } => {
-            out.push(bin_base(*ty) + o.index());
+            out.push(match ty {
+                IntTy::I32 => op::I32_BIN,
+                IntTy::I64 => op::I64_BIN,
+            });
+            out.push(o.index());
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
         }
         Inst::IntCmp { ty, op: o, a, b } => {
-            out.push(cmp_base(*ty) + o.index());
+            out.push(match ty {
+                IntTy::I32 => op::I32_CMP,
+                IntTy::I64 => op::I64_CMP,
+            });
+            out.push(o.index());
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
+        }
+        Inst::IntBinImm { ty, op: o, a, imm } => {
+            out.push(bin_imm_base(*ty) + o.index());
+            write_uleb(out, *a as u64);
+            write_sleb(out, *imm);
+        }
+        Inst::IntCmpImm { ty, op: o, a, imm } => {
+            out.push(cmp_imm_base(*ty) + o.index());
+            write_uleb(out, *a as u64);
+            write_sleb(out, *imm);
         }
         Inst::IntUn { ty, op: o, a } => {
             out.push(un_base(*ty) + o.index());
@@ -1881,16 +1911,16 @@ fn encode_term(out: &mut Vec<u8>, t: &Terminator) {
     }
 }
 
-fn bin_base(ty: IntTy) -> u8 {
+fn bin_imm_base(ty: IntTy) -> u8 {
     match ty {
-        IntTy::I32 => op::I32_BIN,
-        IntTy::I64 => op::I64_BIN,
+        IntTy::I32 => op::I32_BIN_IMM,
+        IntTy::I64 => op::I64_BIN_IMM,
     }
 }
-fn cmp_base(ty: IntTy) -> u8 {
+fn cmp_imm_base(ty: IntTy) -> u8 {
     match ty {
-        IntTy::I32 => op::I32_CMP,
-        IntTy::I64 => op::I64_CMP,
+        IntTy::I32 => op::I32_CMP_IMM,
+        IntTy::I64 => op::I64_CMP_IMM,
     }
 }
 fn un_base(ty: IntTy) -> u8 {
@@ -2579,8 +2609,10 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
         op::I32_UN..=op::I32_UN_END => int_un(IntTy::I32, b - op::I32_UN, c)?,
         op::I64_UN..=op::I64_UN_END => int_un(IntTy::I64, b - op::I64_UN, c)?,
 
-        op::I32_BIN..=op::I32_BIN_END => int_bin(IntTy::I32, b - op::I32_BIN, c)?,
-        op::I64_BIN..=op::I64_BIN_END => int_bin(IntTy::I64, b - op::I64_BIN, c)?,
+        op::I32_BIN_IMM..=op::I32_BIN_IMM_END => int_bin_imm(IntTy::I32, b - op::I32_BIN_IMM, c)?,
+        op::I64_BIN_IMM..=op::I64_BIN_IMM_END => int_bin_imm(IntTy::I64, b - op::I64_BIN_IMM, c)?,
+        op::I32_BIN => int_bin(IntTy::I32, c)?,
+        op::I64_BIN => int_bin(IntTy::I64, c)?,
 
         op::I32_EQZ => Inst::Eqz {
             ty: IntTy::I32,
@@ -2591,8 +2623,10 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             a: c.idx()?,
         },
 
-        op::I32_CMP..=op::I32_CMP_END => int_cmp(IntTy::I32, b - op::I32_CMP, c)?,
-        op::I64_CMP..=op::I64_CMP_END => int_cmp(IntTy::I64, b - op::I64_CMP, c)?,
+        op::I32_CMP_IMM..=op::I32_CMP_IMM_END => int_cmp_imm(IntTy::I32, b - op::I32_CMP_IMM, c)?,
+        op::I64_CMP_IMM..=op::I64_CMP_IMM_END => int_cmp_imm(IntTy::I64, b - op::I64_CMP_IMM, c)?,
+        op::I32_CMP => int_cmp(IntTy::I32, c)?,
+        op::I64_CMP => int_cmp(IntTy::I64, c)?,
 
         op::EXTEND_I32_S => Inst::Convert {
             op: ConvOp::ExtendI32S,
@@ -2859,7 +2893,8 @@ fn fcmp(ty: FloatTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
     })
 }
 
-fn int_bin(ty: IntTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
+fn int_bin(ty: IntTy, c: &mut Cursor) -> Result<Inst, DecodeError> {
+    let index = c.byte()?;
     let op = BinOp::from_index(index).ok_or(DecodeError::BadOpcode(index))?;
     Ok(Inst::IntBin {
         ty,
@@ -2869,13 +2904,44 @@ fn int_bin(ty: IntTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
     })
 }
 
-fn int_cmp(ty: IntTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
+fn int_cmp(ty: IntTy, c: &mut Cursor) -> Result<Inst, DecodeError> {
+    let index = c.byte()?;
     let op = CmpOp::from_index(index).ok_or(DecodeError::BadOpcode(index))?;
     Ok(Inst::IntCmp {
         ty,
         op,
         a: c.idx()?,
         b: c.idx()?,
+    })
+}
+
+/// An immediate operand of type `ty`: an `i32` one must fit `i32`, and is held sign-extended.
+fn imm(ty: IntTy, c: &mut Cursor) -> Result<i64, DecodeError> {
+    match ty {
+        IntTy::I32 => Ok(c.sleb_i32()? as i64),
+        IntTy::I64 => c.sleb(),
+    }
+}
+
+fn int_bin_imm(ty: IntTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
+    let op = BinOp::from_index(index).ok_or(DecodeError::BadOpcode(index))?;
+    let a = c.idx()?;
+    Ok(Inst::IntBinImm {
+        ty,
+        op,
+        a,
+        imm: imm(ty, c)?,
+    })
+}
+
+fn int_cmp_imm(ty: IntTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
+    let op = CmpOp::from_index(index).ok_or(DecodeError::BadOpcode(index))?;
+    let a = c.idx()?;
+    Ok(Inst::IntCmpImm {
+        ty,
+        op,
+        a,
+        imm: imm(ty, c)?,
     })
 }
 

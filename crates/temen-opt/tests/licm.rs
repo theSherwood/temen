@@ -172,10 +172,16 @@ fn an_invariant_bare_constant_is_not_hoisted() {
     // loop-invariant, but a constant is free to recompute — hoisting it would only thread a parameter
     // around the loop (pure overhead, DESIGN §hoist cost model). So the constant must stay in the loop
     // alongside the variant decrement that uses it, not be lifted to the preheader.
+    // (The output folds a constant into the op that reads it, #2585: in the loop, it is the
+    // decrement's immediate, `i + -1`. Hoisted, it would reach the decrement as a param, which does
+    // not fold.)
     let m = loop_module(bin(BinOp::Mul, 0, 2));
     let opt = check_equiv(&m);
     assert!(
-        matches_inside_loop(&opt.funcs[0], |i| matches!(i, Inst::ConstI32(_))),
+        matches_inside_loop(&opt.funcs[0], |i| matches!(
+            i,
+            Inst::ConstI32(_) | Inst::IntBinImm { .. }
+        )),
         "an invariant constant used only by loop-variant code must not be hoisted out"
     );
 }
@@ -242,9 +248,9 @@ fn an_invariant_op_over_a_constant_is_still_hoisted() {
         }
     }
     // The invariant `a' + 100` is hoisted, and its constant operand `100` is rematerialized in the
-    // preheader — so `ConstI32(100)` leaves the loop entirely (it still exists out-of-loop, since `a'`
-    // is a runtime value the add can't be folded away).
-    let is_100 = |i: &Inst| matches!(i, Inst::ConstI32(100));
+    // preheader — so `100` leaves the loop entirely (it still exists out-of-loop, since `a'` is a
+    // runtime value the add can't be folded away), there as the add's immediate (#2585).
+    let is_100 = |i: &Inst| matches!(i, Inst::ConstI32(100) | Inst::IntBinImm { imm: 100, .. });
     assert!(
         !matches_inside_loop(&opt.funcs[0], is_100),
         "the invariant add's constant operand must be rematerialized out of the loop"

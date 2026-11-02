@@ -196,6 +196,38 @@ fn scalar_int(ops: &mut Vec<Op>) {
                 unit(&[t, t], i, &[ValType::I32], false),
             );
         }
+        // The immediate forms (#2585): the right operand is a constant the op carries. 3 divides
+        // without trapping.
+        for op in BinOp::ALL {
+            let i = Inst::IntBinImm {
+                ty,
+                op,
+                a: 0,
+                imm: 3,
+            };
+            push(
+                ops,
+                format!("{}.{} imm", ty.prefix(), op.name()),
+                FAM,
+                i.clone(),
+                unit(&[t], i, &[t], false),
+            );
+        }
+        for op in CmpOp::ALL {
+            let i = Inst::IntCmpImm {
+                ty,
+                op,
+                a: 0,
+                imm: 3,
+            };
+            push(
+                ops,
+                format!("{}.{} imm", ty.prefix(), op.name()),
+                FAM,
+                i.clone(),
+                unit(&[t], i, &[ValType::I32], false),
+            );
+        }
         for op in IntUnOp::ALL {
             let i = Inst::IntUn { ty, op, a: 0 };
             push(

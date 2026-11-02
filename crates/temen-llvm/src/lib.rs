@@ -1520,6 +1520,8 @@ fn translate_impl(
     // Dominance form (#2454): a value reaches the blocks it dominates as a capture, not as a param of
     // every block between. The data-SP is the function's first param, which a block captures.
     t.module.raise();
+    // A constant an integer op reads is the op's immediate (#2585).
+    t.module.fold_immediates();
     Ok(t)
 }
 

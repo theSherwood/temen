@@ -8337,6 +8337,8 @@ fn ensure_supported(f: &Func, type_section: &[temen_ir::TypeEntry]) -> Result<()
                 | Inst::ImportAttach { .. }
                 | Inst::RefFunc { .. }
                 | Inst::IntBin { .. }
+                | Inst::IntBinImm { .. }
+                | Inst::IntCmpImm { .. }
                 | Inst::Convert { .. } => {}
                 Inst::IntUn { .. } => {}
                 // §17 SIMD (D58): all lowered via Cranelift's native vector ops.
@@ -9863,6 +9865,24 @@ fn lower_block(
                 let (x, y) = (get(&vals, *a)?, get(&vals, *rb)?);
                 let c = b.ins().icmp(int_cc(*op), x, y);
                 b.ins().uextend(I32, c) // bool (I8) -> i32 0/1
+            }
+            // The immediate forms (#2585) lower as the constant and the register form would;
+            // Cranelift's instruction selection folds the constant into the machine instruction.
+            Inst::IntBinImm { ty, op, a, imm } => {
+                let x = get(&vals, *a)?;
+                let y = b.ins().iconst(int_clif_ty(*ty), *imm);
+                match op {
+                    BinOp::DivS | BinOp::DivU | BinOp::RemS | BinOp::RemU => {
+                        lower_div_rem(b, lower, *ty, *op, x, y)
+                    }
+                    _ => int_bin(b, *op, x, y),
+                }
+            }
+            Inst::IntCmpImm { ty, op, a, imm } => {
+                let x = get(&vals, *a)?;
+                let y = b.ins().iconst(int_clif_ty(*ty), *imm);
+                let c = b.ins().icmp(int_cc(*op), x, y);
+                b.ins().uextend(I32, c)
             }
             Inst::Eqz { a, .. } => {
                 let x = get(&vals, *a)?;
@@ -11932,6 +11952,27 @@ impl CheckedBases {
                 };
                 if let Some(&k) = self.consts.get(&b) {
                     self.roots.insert(v, self.root_of(a, -i128::from(k)));
+                }
+            }
+            // The immediate forms add the same constants (#2585).
+            Inst::IntBinImm {
+                ty: IntTy::I64,
+                op: BinOp::Add,
+                a,
+                imm,
+            } => {
+                if let Some(a) = val(a) {
+                    self.roots.insert(v, self.root_of(a, imm));
+                }
+            }
+            Inst::IntBinImm {
+                ty: IntTy::I64,
+                op: BinOp::Sub,
+                a,
+                imm,
+            } => {
+                if let Some(a) = val(a) {
+                    self.roots.insert(v, self.root_of(a, -i128::from(imm)));
                 }
             }
             _ => {}

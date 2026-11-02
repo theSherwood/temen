@@ -644,6 +644,14 @@ security — UB in a sandbox IR would void the escape guarantee.
   popcnt`.
 - **Integer compare** (→ i32 0/1): `eq ne lt_s lt_u le_s le_u gt_s gt_u ge_s ge_u
   eqz`.
+- **Immediate operands** (#2585): a binary integer op or a compare may carry its right operand
+  as a constant instead of naming a value (`v2 = i32.add v0 5`; `IntBinImm`, `IntCmpImm`), with
+  the same semantics as the constant it stands for. An `i32` immediate is held sign-extended, and
+  the verifier rejects one that isn't. Producers emit the register form and run
+  `fold_immediates` after `raise`: it moves each constant of an op's own block into the op (a
+  commutative op swaps its operands, a compare turns around) and deletes the constants nothing
+  else reads. Constants were a third of all instructions, three quarters of them read once by an
+  integer op.
 - **Float arithmetic** (f32/f64, IEEE 754, no traps): `add sub mul div sqrt min max
   abs neg ceil floor trunc nearest copysign fma` (`min`/`max` are wasm-identical:
   NaN-propagating, with `-0 < +0` — *not* IEEE minNum; `nearest` rounds ties to

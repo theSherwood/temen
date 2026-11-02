@@ -283,12 +283,21 @@ impl<'g> BB<'g> {
 
 const CONVS: [ConvOp; 3] = [ConvOp::ExtendI32S, ConvOp::ExtendI32U, ConvOp::WrapI64];
 
+/// An immediate of type `ty` ([`Inst::IntBinImm`]): one of the boundary constants, an `i32` one
+/// sign-extended as the IR holds it.
+fn gen_imm(bb: &mut BB, ty: IntTy) -> i64 {
+    match ty {
+        IntTy::I32 => i64::from(bb.g.i32c()),
+        IntTy::I64 => bb.g.i64c(),
+    }
+}
+
 /// Append one random instruction to `bb`, valid in this context.
 fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_mem: bool) {
     let nfuncs = sigs.len();
     let can_call = fi + 1 < nfuncs;
     loop {
-        match bb.g.below(27) {
+        match bb.g.below(29) {
             0 => {
                 let ty = bb.g.inttype();
                 let op = BinOp::from_index(bb.g.below(15) as u8).unwrap();
@@ -637,6 +646,22 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                     let val = bb.want(ValType::I32);
                     bb.push0(Inst::MemFill { dst, val, len });
                 }
+            }
+            // The immediate forms (#2585), over the generator's boundary constants: `a op imm`
+            // for every op, a division by a 0 or -1 immediate included.
+            27 => {
+                let ty = bb.g.inttype();
+                let op = BinOp::from_index(bb.g.below(15) as u8).unwrap();
+                let a = bb.want(ty.val());
+                let imm = gen_imm(bb, ty);
+                bb.push(Inst::IntBinImm { ty, op, a, imm }, ty.val());
+            }
+            28 => {
+                let ty = bb.g.inttype();
+                let op = CmpOp::from_index(bb.g.below(10) as u8).unwrap();
+                let a = bb.want(ty.val());
+                let imm = gen_imm(bb, ty);
+                bb.push(Inst::IntCmpImm { ty, op, a, imm }, ValType::I32);
             }
             _ => continue, // a mem/call kind that isn't available here — re-roll
         }

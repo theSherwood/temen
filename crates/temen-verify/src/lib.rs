@@ -135,6 +135,9 @@ pub enum VerifyError {
     /// A lane-wise op was given a shape of the wrong category — an integer op on a float shape
     /// or a float op on an integer shape (§17).
     BadSimdShape { func: u32, block: u32 },
+    /// An `i32` [`Inst::IntBinImm`] or [`Inst::IntCmpImm`] carried an immediate that is not an
+    /// `i32` sign-extended to 64 bits (#2585): each constant has one spelling.
+    ImmOutOfRange { func: u32, block: u32 },
     /// A [`Inst::CallImport`] referenced an import index at or past the end of the module's
     /// [`Module::imports`] manifest (§7 / IMPORTS.md phase 1). A `call.import` is executable when
     /// its index names a declared import; one that names nothing is fail-closed. (This variant also
@@ -1148,6 +1151,20 @@ fn type_inst<'a>(
             cx.expect(*a, t)?;
             cx.expect(*b, t)?;
             ValType::I32
+        }
+        Inst::IntBinImm { ty, a, imm, .. } | Inst::IntCmpImm { ty, a, imm, .. } => {
+            let t = ty.val();
+            cx.expect(*a, t)?;
+            if *ty == temen_ir::IntTy::I32 && i32::try_from(*imm).is_err() {
+                return Err(VerifyError::ImmOutOfRange {
+                    func: fi,
+                    block: bi,
+                });
+            }
+            match inst {
+                Inst::IntBinImm { .. } => t,
+                _ => ValType::I32,
+            }
         }
         Inst::IntUn { ty, a, .. } => {
             cx.expect(*a, ty.val())?;

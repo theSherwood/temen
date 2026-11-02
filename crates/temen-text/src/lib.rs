@@ -512,6 +512,9 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         Inst::IntBin { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
         Inst::IntUn { ty, op, a } => format!("{}.{} v{a}", ty.prefix(), op.name()),
         Inst::IntCmp { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
+        // The immediate form spells its right operand as a number (#2585).
+        Inst::IntBinImm { ty, op, a, imm } => format!("{}.{} v{a} {imm}", ty.prefix(), op.name()),
+        Inst::IntCmpImm { ty, op, a, imm } => format!("{}.{} v{a} {imm}", ty.prefix(), op.name()),
         Inst::Eqz { ty, a } => format!("{}.eqz v{a}", ty.prefix()),
         Inst::Convert { op, a } => format!("{} v{a}", op.sig().0),
         Inst::Select { cond, a, b } => format!("select v{cond} v{a} v{b}"),
@@ -3508,6 +3511,19 @@ impl<'a> Parser<'a> {
         Ok(bytes)
     }
 
+    /// An integer immediate of type `ty`, held as [`Inst::IntBinImm`] holds it: an `i32` one may be
+    /// spelled signed or unsigned, as an `i32.const` may, and is sign-extended.
+    fn parse_imm(&mut self, ty: IntTy) -> Result<i64, ParseError> {
+        let v = self.parse_int()?;
+        match ty {
+            IntTy::I32 => i32::try_from(v)
+                .or_else(|_| u32::try_from(v).map(|u| u as i32))
+                .map(i64::from)
+                .map_err(|_| ParseError(format!("i32 immediate out of range: {v}"))),
+            IntTy::I64 => Ok(v),
+        }
+    }
+
     fn parse_int_inst(
         &mut self,
         ty: IntTy,
@@ -3542,13 +3558,22 @@ impl<'a> Parser<'a> {
                 a: self.value(names)?,
             });
         }
+        // A number for the right operand is the immediate form (#2585).
         if let Some(o) = BinOp::from_name(suffix) {
             let a = self.value(names)?;
+            if matches!(self.peek(), Some(Tok::Int(_))) {
+                let imm = self.parse_imm(ty)?;
+                return Ok(Inst::IntBinImm { ty, op: o, a, imm });
+            }
             let b = self.value(names)?;
             return Ok(Inst::IntBin { ty, op: o, a, b });
         }
         if let Some(o) = CmpOp::from_name(suffix) {
             let a = self.value(names)?;
+            if matches!(self.peek(), Some(Tok::Int(_))) {
+                let imm = self.parse_imm(ty)?;
+                return Ok(Inst::IntCmpImm { ty, op: o, a, imm });
+            }
             let b = self.value(names)?;
             return Ok(Inst::IntCmp { ty, op: o, a, b });
         }
@@ -4493,5 +4518,57 @@ block 0 () {
             "prints as the sugar: {printed}"
         );
         assert_eq!(parse_module(&printed).expect("re-parse"), m);
+    }
+}
+
+#[cfg(test)]
+mod immediate_text_tests {
+    use super::*;
+    use temen_ir::{BinOp, CmpOp, Inst, IntTy};
+
+    /// #2585: a number for an integer op's right operand is the immediate form. An `i32` immediate
+    /// may be spelled unsigned, as an `i32.const` may, and is held sign-extended; it prints signed
+    /// and re-parses to the same instruction. One past either range is an error.
+    #[test]
+    fn immediates_parse_print_and_reparse() {
+        let src = "\
+func (i32, i64) -> (i32) {
+block 0 (v0: i32, v1: i64) {
+  v2 = i32.add v0 4294967295
+  v3 = i64.shr_u v1 63
+  v4 = i32.lt_s v2 -7
+  return v4
+  }
+}
+";
+        let m = parse_module(src).expect("parse");
+        assert_eq!(
+            m.funcs[0].blocks[0].insts,
+            vec![
+                Inst::IntBinImm {
+                    ty: IntTy::I32,
+                    op: BinOp::Add,
+                    a: 0,
+                    imm: -1
+                },
+                Inst::IntBinImm {
+                    ty: IntTy::I64,
+                    op: BinOp::ShrU,
+                    a: 1,
+                    imm: 63
+                },
+                Inst::IntCmpImm {
+                    ty: IntTy::I32,
+                    op: CmpOp::LtS,
+                    a: 2,
+                    imm: -7
+                },
+            ]
+        );
+        let printed = print_module(&m);
+        assert!(printed.contains("v2 = i32.add v0 -1"), "{printed}");
+        assert_eq!(parse_module(&printed).expect("reparse"), m);
+        let over = src.replace("4294967295", "4294967296");
+        assert!(parse_module(&over).is_err(), "an i32 immediate past u32");
     }
 }

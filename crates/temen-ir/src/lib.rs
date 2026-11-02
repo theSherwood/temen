@@ -1538,6 +1538,14 @@ impl BinOp {
         BinOp::Rotr,
     ];
 
+    /// Whether `a op b == b op a`, so a constant left operand can move right ([`Inst::IntBinImm`]).
+    pub fn commutes(self) -> bool {
+        matches!(
+            self,
+            BinOp::Add | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor
+        )
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             BinOp::Add => "add",
@@ -1597,6 +1605,22 @@ impl CmpOp {
         CmpOp::GeS,
         CmpOp::GeU,
     ];
+
+    /// The compare with its operands swapped: `a op b == b op.swapped() a`.
+    pub fn swapped(self) -> CmpOp {
+        match self {
+            CmpOp::Eq => CmpOp::Eq,
+            CmpOp::Ne => CmpOp::Ne,
+            CmpOp::LtS => CmpOp::GtS,
+            CmpOp::LtU => CmpOp::GtU,
+            CmpOp::LeS => CmpOp::GeS,
+            CmpOp::LeU => CmpOp::GeU,
+            CmpOp::GtS => CmpOp::LtS,
+            CmpOp::GtU => CmpOp::LtU,
+            CmpOp::GeS => CmpOp::LeS,
+            CmpOp::GeU => CmpOp::LeU,
+        }
+    }
 
     pub fn name(self) -> &'static str {
         match self {
@@ -2249,6 +2273,21 @@ pub enum Inst {
         op: CmpOp,
         a: ValIdx,
         b: ValIdx,
+    },
+    /// [`Inst::IntBin`] whose right operand is the immediate `imm` (#2585). An `i32` immediate is
+    /// the constant sign-extended to 64 bits, as [`Inst::ConstI32`] would hold it.
+    IntBinImm {
+        ty: IntTy,
+        op: BinOp,
+        a: ValIdx,
+        imm: i64,
+    },
+    /// [`Inst::IntCmp`] whose right operand is the immediate `imm`, held as in [`Inst::IntBinImm`].
+    IntCmpImm {
+        ty: IntTy,
+        op: CmpOp,
+        a: ValIdx,
+        imm: i64,
     },
     /// Unary integer op; operand and result are `ty`.
     IntUn {
@@ -3136,7 +3175,9 @@ macro_rules! inst_operands {
             | Inst::VAllTrue { a, .. }
             | Inst::VBitmask { a, .. }
             | Inst::VFloatUn { a, .. }
-            | Inst::VNot { a, .. } => {
+            | Inst::VNot { a, .. }
+            | Inst::IntBinImm { a, .. }
+            | Inst::IntCmpImm { a, .. } => {
                 $f(a);
             }
 
@@ -3378,6 +3419,7 @@ impl Inst {
             | Inst::ConstF64(_)
             | Inst::ConstV128(_)
             | Inst::IntCmp { .. }
+            | Inst::IntCmpImm { .. }
             | Inst::IntUn { .. }
             | Inst::Eqz { .. }
             | Inst::Convert { .. }
@@ -3432,7 +3474,7 @@ impl Inst {
             | Inst::Swizzle { .. } => Effects::default(),
 
             // `div`/`rem` trap on a zero (or signed-overflow) divisor; the rest of `IntBin` is pure.
-            Inst::IntBin { op, .. } => fx(
+            Inst::IntBin { op, .. } | Inst::IntBinImm { op, .. } => fx(
                 matches!(op, BinOp::DivS | BinOp::DivU | BinOp::RemS | BinOp::RemU),
                 false,
                 false,
@@ -7530,6 +7572,7 @@ pub struct Data {
 pub mod cfg;
 pub mod dominance;
 pub mod handles;
+pub mod immediates;
 pub use dominance::{Captured, Moves};
 
 /// **Compile-time confinement bound analysis** (§1a "guard-when-bounded", D36–D38/D63) — the shared,
@@ -7546,7 +7589,7 @@ pub use dominance::{Captured, Moves};
 /// only elides the trap branch, so there a wrong proof is at worst a trap-parity divergence (caught
 /// by the interpreter differential), never an escape.
 pub mod bounds {
-    use super::{BinOp, ConvOp, Inst, ValIdx};
+    use super::{BinOp, ConvOp, Inst, IntTy, ValIdx};
 
     /// The "unknown / no useful bound" element of the upper-bound lattice (`u64::MAX`): any value
     /// annotated `UB_TOP` forces the runtime check (never elided).
@@ -7557,6 +7600,17 @@ pub mod bounds {
     #[inline]
     pub fn ub_at(ubs: &[u64], i: ValIdx) -> u64 {
         ubs.get(i as usize).copied().unwrap_or(UB_TOP)
+    }
+
+    /// The bound of `a op b` from the bounds of `a` (`x`) and `b` (`y`).
+    fn ub_bin(op: BinOp, x: u64, y: u64) -> u64 {
+        match op {
+            // a & b ≤ min(a, b); a|b, a^b, a+b ≤ a + b; a*b ≤ a * b (wrap ⇒ Top).
+            BinOp::And => x.min(y),
+            BinOp::Add | BinOp::Or | BinOp::Xor => x.checked_add(y).unwrap_or(UB_TOP),
+            BinOp::Mul => x.checked_mul(y).unwrap_or(UB_TOP),
+            _ => UB_TOP,
+        }
     }
 
     /// A **sound, conservative upper bound** on an SSA value's unsigned (`u64`) magnitude, used only
@@ -7570,15 +7624,14 @@ pub mod bounds {
         match inst {
             Inst::ConstI64(c) => *c as u64,
             Inst::ConstI32(c) => *c as u32 as u64,
-            Inst::IntBin { op, a, b, .. } => {
-                let (x, y) = (ub(*a), ub(*b));
-                match op {
-                    // a & b ≤ min(a, b); a|b, a^b, a+b ≤ a + b; a*b ≤ a * b (wrap ⇒ Top).
-                    BinOp::And => x.min(y),
-                    BinOp::Add | BinOp::Or | BinOp::Xor => x.checked_add(y).unwrap_or(UB_TOP),
-                    BinOp::Mul => x.checked_mul(y).unwrap_or(UB_TOP),
-                    _ => UB_TOP,
-                }
+            Inst::IntBin { op, a, b, .. } => ub_bin(*op, ub(*a), ub(*b)),
+            // The immediate bounds itself, as the `ConstI32`/`ConstI64` it was would.
+            Inst::IntBinImm { ty, op, a, imm } => {
+                let y = match ty {
+                    IntTy::I32 => *imm as u32 as u64,
+                    IntTy::I64 => *imm as u64,
+                };
+                ub_bin(*op, ub(*a), y)
             }
             // Zero-extend: the i64 value is the (≤ u32::MAX) source, no wider.
             Inst::Convert {

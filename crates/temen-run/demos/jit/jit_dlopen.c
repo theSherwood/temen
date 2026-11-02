@@ -80,7 +80,7 @@ static void emit_header(char *buf) {
   eb(buf, 'T'); eb(buf, 'E'); eb(buf, 'M'); eb(buf, 'E'); eb(buf, 'N');
   eb(buf, 0); eb(buf, 0); eb(buf, 0);
   eb(buf, 0); eb(buf, 0);                 // kind = module
-  eb(buf, (15) & 0xff); eb(buf, (15) >> 8); // version (u16)
+  eb(buf, (16) & 0xff); eb(buf, (16) >> 8); // version (u16)
   eb(buf, 0); eb(buf, 0); eb(buf, 0); eb(buf, 0); // flags
   eb(buf, 1);
   eb(buf, 17);
@@ -96,8 +96,9 @@ static void emit_i64_pair_sig(char *buf) {
   eb(buf, 1);
   eb(buf, 1);
 }
-// `(a, b) -> a <op> b`, self-contained. opcode 0x40 = i64.add, 0x42 = i64.mul.
-static long emit_binop(char *buf, int opcode) {
+// `(a, b) -> a <op> b`, self-contained: 0x4F (an i64 binop of two values), then the BinOp index
+// `op` (0 = add, 2 = mul).
+static long emit_binop(char *buf, int op) {
   emit_header(buf);
   eb(buf, 0); // 0 imports
   eb(buf, 0); // 0 exports (v3 export section)
@@ -112,7 +113,8 @@ static long emit_binop(char *buf, int opcode) {
   eb(buf, 1);
   eb(buf, 0); // no captures (v14)
   eb(buf, 1);      // 1 instruction
-  eb(buf, opcode); // v2 = <op> v0 v1
+  eb(buf, 0x4F); // v2 = <op> v0 v1
+  eb(buf, op);
   uleb(buf, 0);
   uleb(buf, 1);
   eb(buf, 0x83); // return v2
@@ -181,8 +183,8 @@ int main() {
   static char buf[256];
 
   // Load the two leaves, then `poly` — which links to both **by name** at load.
-  if (vm_dlopen("add", buf, emit_binop(buf, 0x40)) < 0 ||
-      vm_dlopen("mul", buf, emit_binop(buf, 0x42)) < 0) {
+  if (vm_dlopen("add", buf, emit_binop(buf, 0)) < 0 ||
+      vm_dlopen("mul", buf, emit_binop(buf, 2)) < 0) {
     puts1("leaf load failed\n");
     return 1;
   }

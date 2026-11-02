@@ -814,6 +814,8 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
     // Dominance form (#2454): a wasm local is threaded through every block as a param, and a block
     // that only passes one on captures it instead.
     t.module.raise();
+    // A constant an integer op reads is the op's immediate (#2585).
+    t.module.fold_immediates();
     Ok(t)
 }
 

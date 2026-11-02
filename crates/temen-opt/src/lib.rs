@@ -84,15 +84,19 @@ use temen_ir::{
 /// The CFG utilities live in temen-ir, beside the passes that need dominators there (#2454).
 pub use temen_ir::cfg;
 
-/// `m` in block-local form (#2454), the form every pass here reads: each reasons one block at a
-/// time, and renumbers a block's values or reshapes the CFG without the blocks that would capture
-/// them. Borrowed when `m` already is (no block captures, every parent the entry). Debug info follows
-/// the values.
+/// `m` in block-local form (#2454), its constants unfolded from the ops that carry them (#2585): the
+/// form every pass here reads. Each reasons one block at a time, renumbers a block's values or
+/// reshapes the CFG without the blocks that would capture them, and sees a constant operand as the
+/// constant it is. Borrowed when `m` already is (no block captures, every parent the entry, no
+/// immediate). Debug info follows the values.
 pub fn block_local(m: &Module) -> alloc::borrow::Cow<'_, Module> {
     let local = |f: &Func| {
-        f.blocks
-            .iter()
-            .all(|b| b.parent == 0 && b.captures.is_empty())
+        f.blocks.iter().all(|b| {
+            b.parent == 0
+                && b.captures.is_empty()
+                && !(b.insts.iter())
+                    .any(|i| matches!(i, Inst::IntBinImm { .. } | Inst::IntCmpImm { .. }))
+        })
     };
     if m.funcs.iter().all(local) {
         return alloc::borrow::Cow::Borrowed(m);
@@ -110,6 +114,7 @@ pub fn block_local(m: &Module) -> alloc::borrow::Cow<'_, Module> {
             moves.remap_debug(di, i as u32);
         }
     }
+    out.unfold_immediates();
     alloc::borrow::Cow::Owned(out)
 }
 pub mod gvn;
@@ -137,6 +142,14 @@ pub enum Known {
 }
 
 impl Known {
+    /// The constant an immediate operand ([`Inst::IntBinImm`]) of type `ty` stands for.
+    pub fn of_imm(ty: IntTy, imm: i64) -> Known {
+        match ty {
+            IntTy::I32 => Known::I32(imm as i32),
+            IntTy::I64 => Known::I64(imm),
+        }
+    }
+
     /// The `const` instruction that materializes this value (the in-place fold result).
     pub fn to_const_inst(self) -> Inst {
         match self {
@@ -387,8 +400,10 @@ pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
     } else {
         optimized
     };
-    // The passes read block-local form; what they hand back is in dominance form (#2454).
+    // The passes read block-local form; what they hand back is in dominance form (#2454), its integer
+    // ops' constants as immediates (#2585).
     out.raise();
+    out.fold_immediates();
     out
 }
 
@@ -2281,6 +2296,7 @@ pub fn optimize_linked(m: &Module) -> Module {
         .as_ref()
         .and_then(|d| drop_stale_debug(d, &changed));
     out.raise();
+    out.fold_immediates();
     out
 }
 

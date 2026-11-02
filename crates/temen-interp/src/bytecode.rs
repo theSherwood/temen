@@ -187,6 +187,22 @@ enum Op {
         ty: IntTy,
         op: CmpOp,
     },
+    /// [`Op::IntBin`] whose right operand is an immediate ([`Inst::IntBinImm`], #2585).
+    IntBinImm {
+        dst: u32,
+        a: u32,
+        imm: i64,
+        ty: IntTy,
+        op: BinOp,
+    },
+    /// [`Op::IntCmp`] whose right operand is an immediate ([`Inst::IntCmpImm`]).
+    IntCmpImm {
+        dst: u32,
+        a: u32,
+        imm: i64,
+        ty: IntTy,
+        op: CmpOp,
+    },
     IntUn {
         dst: u32,
         a: u32,
@@ -327,6 +343,17 @@ enum Op {
     BrIfCmp {
         a: u32,
         b: u32,
+        ty: IntTy,
+        op: CmpOp,
+        then_copies: Copies,
+        then_pc: u32,
+        else_copies: Copies,
+        else_pc: u32,
+    },
+    /// [`Op::BrIfCmp`] fused from an [`Op::IntCmpImm`]: the compare's right operand is `imm`.
+    BrIfCmpImm {
+        a: u32,
+        imm: i64,
         ty: IntTy,
         op: CmpOp,
         then_copies: Copies,
@@ -2631,38 +2658,50 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
                 // cond slot is not carried to any successor (not an edge-copy source), and no
                 // forwarding param reads it (#2448). Fused compile only — `fuse == false`
                 // (debug/trace) keeps the compare as its own steppable op.
-                let fused = if fuse && !b.insts.is_empty() {
-                    match ops.last() {
-                        Some(Op::IntCmp {
-                            dst,
-                            a,
-                            b: cb,
-                            ty,
-                            op,
-                        }) if *dst == cond_slot
-                            && !read_forwarded[cond_slot as usize]
-                            && !then_copies.pairs.iter().any(|(s, _)| *s == cond_slot)
-                            && !else_copies.pairs.iter().any(|(s, _)| *s == cond_slot) =>
-                        {
-                            Some((*a, *cb, *ty, *op))
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
+                // A compare against an immediate fuses the same way, into a `BrIfCmpImm` (#2585).
+                let fusable = |dst: u32| {
+                    dst == cond_slot
+                        && !read_forwarded[cond_slot as usize]
+                        && !then_copies.pairs.iter().any(|(s, _)| *s == cond_slot)
+                        && !else_copies.pairs.iter().any(|(s, _)| *s == cond_slot)
                 };
-                if let Some((a, cb, ty, op)) = fused {
-                    ops.pop(); // drop the now-fused IntCmp op ...
-                    src.pop(); // ... and its source-map entry (kept in lockstep)
-                    ops.push(Op::BrIfCmp {
+                let fused = match ops.last() {
+                    Some(&Op::IntCmp { dst, a, b, ty, op }) if fuse && fusable(dst) => {
+                        Some(Fused::Slot(a, b, ty, op))
+                    }
+                    Some(&Op::IntCmpImm {
+                        dst,
                         a,
-                        b: cb,
+                        imm,
                         ty,
                         op,
-                        then_copies,
-                        then_pc: tt,
-                        else_copies,
-                        else_pc: et,
+                    }) if fuse && fusable(dst) => Some(Fused::Imm(a, imm, ty, op)),
+                    _ => None,
+                };
+                if let Some(cmp) = fused.filter(|_| !b.insts.is_empty()) {
+                    ops.pop(); // drop the now-fused compare op ...
+                    src.pop(); // ... and its source-map entry (kept in lockstep)
+                    ops.push(match cmp {
+                        Fused::Slot(a, b, ty, op) => Op::BrIfCmp {
+                            a,
+                            b,
+                            ty,
+                            op,
+                            then_copies,
+                            then_pc: tt,
+                            else_copies,
+                            else_pc: et,
+                        },
+                        Fused::Imm(a, imm, ty, op) => Op::BrIfCmpImm {
+                            a,
+                            imm,
+                            ty,
+                            op,
+                            then_copies,
+                            then_pc: tt,
+                            else_copies,
+                            else_pc: et,
+                        },
                     });
                 } else {
                     ops.push(Op::BrIf {
@@ -2727,6 +2766,9 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
             }
             Op::BrIfCmp {
                 then_pc, else_pc, ..
+            }
+            | Op::BrIfCmpImm {
+                then_pc, else_pc, ..
             } => {
                 patch(then_pc);
                 patch(else_pc);
@@ -2745,6 +2787,12 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
         nslots,
         src: src.into_boxed_slice(),
     })
+}
+
+/// The compare a fused branch absorbs: against a slot, or an immediate.
+enum Fused {
+    Slot(u32, u32, IntTy, CmpOp),
+    Imm(u32, i64, IntTy, CmpOp),
 }
 
 fn compile_inst(
@@ -2781,6 +2829,20 @@ fn compile_inst(
             dst,
             a: g(*a),
             b: g(*b),
+            ty: *ty,
+            op: *op,
+        },
+        Inst::IntBinImm { ty, op, a, imm } => Op::IntBinImm {
+            dst,
+            a: g(*a),
+            imm: *imm,
+            ty: *ty,
+            op: *op,
+        },
+        Inst::IntCmpImm { ty, op, a, imm } => Op::IntCmpImm {
+            dst,
+            a: g(*a),
+            imm: *imm,
             ty: *ty,
             op: *op,
         },
@@ -18760,6 +18822,34 @@ impl Vm {
                     r!(*dst) = Reg::from_i32(res as i32);
                     pc += 1;
                 }
+                Op::IntBinImm {
+                    dst,
+                    a,
+                    imm,
+                    ty,
+                    op,
+                } => {
+                    let v = match ty {
+                        IntTy::I32 => Reg::from_i32(bin32(*op, r!(*a).i32(), *imm as i32)?),
+                        IntTy::I64 => Reg::from_i64(bin64(*op, r!(*a).i64(), *imm)?),
+                    };
+                    r!(*dst) = v;
+                    pc += 1;
+                }
+                Op::IntCmpImm {
+                    dst,
+                    a,
+                    imm,
+                    ty,
+                    op,
+                } => {
+                    let res = match ty {
+                        IntTy::I32 => cmp32(*op, r!(*a).i32(), *imm as i32),
+                        IntTy::I64 => cmp64(*op, r!(*a).i64(), *imm),
+                    };
+                    r!(*dst) = Reg::from_i32(res as i32);
+                    pc += 1;
+                }
                 Op::IntUn { dst, a, ty, op } => {
                     r!(*dst) = match ty {
                         IntTy::I32 => Reg::from_i32(intun32(*op, r!(*a).i32())),
@@ -18971,6 +19061,30 @@ impl Vm {
                     let taken = match ty {
                         IntTy::I32 => cmp32(*op, r!(*a).i32(), r!(*b).i32()),
                         IntTy::I64 => cmp64(*op, r!(*a).i64(), r!(*b).i64()),
+                    };
+                    if taken {
+                        backedge!(*then_pc);
+                        edge!(then_copies);
+                        pc = *then_pc as usize;
+                    } else {
+                        backedge!(*else_pc);
+                        edge!(else_copies);
+                        pc = *else_pc as usize;
+                    }
+                }
+                Op::BrIfCmpImm {
+                    a,
+                    imm,
+                    ty,
+                    op,
+                    then_copies,
+                    then_pc,
+                    else_copies,
+                    else_pc,
+                } => {
+                    let taken = match ty {
+                        IntTy::I32 => cmp32(*op, r!(*a).i32(), *imm as i32),
+                        IntTy::I64 => cmp64(*op, r!(*a).i64(), *imm),
                     };
                     if taken {
                         backedge!(*then_pc);

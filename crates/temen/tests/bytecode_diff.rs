@@ -112,6 +112,116 @@ fn bytecode_matches_interp_on_generated_modules() {
     );
 }
 
+/// #2585: folding a block's constants into its integer ops' immediates changes no result. Each
+/// generated module is raised to dominance form, as a producer's output is, then folded: the folded
+/// module verifies, runs to the same result, trap and remaining fuel on the tree-walker, and the
+/// bytecode engine agrees with the tree-walker on it (its `BrIfCmpImm` fusion included).
+#[test]
+fn folding_immediates_changes_no_result() {
+    let (total, mut folded) = (3000u64, 0u64);
+    for seed in 0..total {
+        let mut g = Gen::from_seed(seed);
+        let mut m = gen_module(&mut g);
+        if m.funcs.is_empty() {
+            continue;
+        }
+        let args = gen_args(&mut g, &m.funcs[0].params);
+        m.raise();
+        let mut f = m.clone();
+        f.fold_immediates();
+        temen::verify::verify_module(&f).unwrap_or_else(|e| {
+            panic!(
+                "seed {seed}: the folded module fails verify: {e:?}\n{}",
+                temen::text::print_module(&f)
+            )
+        });
+        folded += (f != m) as u64;
+        let (mut fm, mut ff) = (2_000_000u64, 2_000_000u64);
+        let (want, got) = (run(&m, 0, &args, &mut fm), run(&f, 0, &args, &mut ff));
+        assert!(
+            results_eq(&want, &got) && fm == ff,
+            "seed {seed}: folding changed the run\n want={want:?} fuel {fm}\n got ={got:?} fuel {ff}\n before:\n{}\n after:\n{}",
+            temen::text::print_module(&m),
+            temen::text::print_module(&f)
+        );
+        check(&f, &args, seed);
+    }
+    assert!(
+        folded > total / 4,
+        "the fold changed too few generated modules ({folded}/{total}) — harness near-vacuous"
+    );
+}
+
+/// #2585: a constant on the left moves right exactly. For every binary op and compare, both types,
+/// over boundary values: `c op x` folds to the immediate form where the op allows (a commutative op
+/// swapped, a compare turned around) and to nothing otherwise, and runs to the same result on the
+/// tree-walker and the bytecode engine as the unfolded original.
+#[test]
+fn folding_a_left_constant_changes_no_result() {
+    use temen_ir::{BinOp, Block, CmpOp, Func, Inst, IntTy, Module, Terminator, ValType};
+    let edges: [i64; 9] = [0, 1, -1, 2, 7, -8, 63, i64::MIN, i64::MAX];
+    for ty in [IntTy::I32, IntTy::I64] {
+        let (konst, val) = match ty {
+            IntTy::I32 => (
+                (|c: i64| Inst::ConstI32(c as i32)) as fn(i64) -> Inst,
+                (|x: i64| Value::I32(x as i32)) as fn(i64) -> Value,
+            ),
+            IntTy::I64 => (
+                (|c: i64| Inst::ConstI64(c)) as fn(i64) -> Inst,
+                (|x: i64| Value::I64(x)) as fn(i64) -> Value,
+            ),
+        };
+        let ops = (BinOp::ALL
+            .iter()
+            .map(|&op| (Inst::IntBin { ty, op, a: 1, b: 0 }, ty.val())))
+        .chain(
+            CmpOp::ALL
+                .iter()
+                .map(|&op| (Inst::IntCmp { ty, op, a: 1, b: 0 }, ValType::I32)),
+        );
+        for (inst, result) in ops {
+            for &c in &edges {
+                let m = Module {
+                    funcs: vec![Func {
+                        params: vec![ty.val()],
+                        results: vec![result],
+                        blocks: vec![Block {
+                            parent: 0,
+                            captures: vec![],
+                            params: vec![ty.val()],
+                            insts: vec![konst(c), inst.clone()],
+                            term: Terminator::Return(vec![2]),
+                        }],
+                    }],
+                    ..Default::default()
+                };
+                let mut f = m.clone();
+                f.fold_immediates();
+                let swaps = match inst {
+                    Inst::IntBin { op, .. } => op.commutes(),
+                    _ => true,
+                };
+                assert_eq!(
+                    f.funcs[0].blocks[0].insts.len(),
+                    if swaps { 1 } else { 2 },
+                    "{inst:?} c={c}"
+                );
+                for &x in &edges {
+                    let args = [val(x)];
+                    let (mut fm, mut ff) = (1_000u64, 1_000u64);
+                    let want = run(&m, 0, &args, &mut fm);
+                    let got = run(&f, 0, &args, &mut ff);
+                    assert!(
+                        results_eq(&want, &got),
+                        "{inst:?} c={c} x={x}: {want:?} vs {got:?}"
+                    );
+                    check(&f, &args, 0);
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn bytecode_matches_interp_under_tight_fuel() {
     // Non-vacuous `OutOfFuel` parity. The main harness runs at 2M fuel, where almost nothing

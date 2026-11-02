@@ -172,10 +172,12 @@ fn check_one(
             row.id
         )
     };
-    let args: Vec<Value> = match row.shape {
-        Shape::Operands => vector.iter().copied().map(to_value).collect(),
-        Shape::Immediate => Vec::new(),
+    let params = match row.shape {
+        Shape::Operands => vector,
+        Shape::Immediate => &[][..],
+        Shape::OperandsImmediate(_) => &vector[..row.operands.len()],
     };
+    let args: Vec<Value> = params.iter().copied().map(to_value).collect();
 
     let mut fuel = 10_000u64;
     let ir = run(m, 0, &args, &mut fuel);
@@ -196,10 +198,7 @@ fn check_one(
         assert!(ok, "{} got={bc:?}", ctx("bytecode"));
     }
 
-    let slots: Vec<i64> = match row.shape {
-        Shape::Operands => vector.iter().copied().map(to_slot).collect(),
-        Shape::Immediate => Vec::new(),
-    };
+    let slots: Vec<i64> = params.iter().copied().map(to_slot).collect();
     if let Ok((out, _)) = cm.run(&slots, None, None) {
         let ok = match (&expected, &out) {
             (Ok(e), JitOutcome::Returned(rs)) => rs.len() == 1 && slot_matches(*e, rs[0]),
@@ -217,12 +216,12 @@ pub fn ops_one(data: &[u8]) {
     let mut r = Reader::new(data);
     let row = &rows[r.below(rows.len())];
 
-    // `Immediate` rows (consts) bake the input, so each vector is its own module; `Operands`
-    // rows compile once and run every vector.
+    // `Immediate` rows (consts) bake the input, and `OperandsImmediate` rows their last, so each
+    // vector is its own module; `Operands` rows compile once and run every vector.
     match row.shape {
-        Shape::Immediate => {
+        Shape::Immediate | Shape::OperandsImmediate(_) => {
             for _ in 0..8 {
-                let v = vec![read_val(&mut r, row.result)];
+                let v: Vec<SpecVal> = row.inputs().iter().map(|&t| read_val(&mut r, t)).collect();
                 let m = module_for(row, &v);
                 if let Ok(mut cm) = compile(&m, 0) {
                     check_one(row, &m, &mut cm, &v);
