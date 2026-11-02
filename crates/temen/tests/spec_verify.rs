@@ -72,7 +72,7 @@ fn spec_row_modules_verify_under_both() {
     for row in all_rows() {
         let m = match row.shape {
             Shape::Operands => module_for(&row, &[]),
-            Shape::Immediate => {
+            Shape::Immediate | Shape::OperandsImmediate(_) => {
                 let sample = vectors_for(&row).into_iter().next().unwrap();
                 module_for(&row, &sample)
             }

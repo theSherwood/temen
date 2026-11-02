@@ -293,6 +293,18 @@ fn check_inst(
             w(*b, ty.val())?;
             vec![V::I32]
         }
+        // §3b: an immediate operand stands in for the constant `b`; an `i32` one is that `i32`,
+        // sign-extended, so it has exactly one spelling.
+        Inst::IntBinImm { ty, a, imm, .. } | Inst::IntCmpImm { ty, a, imm, .. } => {
+            w(*a, ty.val())?;
+            if ty.val() == V::I32 && *imm != *imm as i32 as i64 {
+                return Err(format!("i32 immediate {imm} is not a sign-extended i32"));
+            }
+            match inst {
+                Inst::IntBinImm { .. } => vec![ty.val()],
+                _ => vec![V::I32],
+            }
+        }
         Inst::IntUn { ty, a, .. } => {
             w(*a, ty.val())?;
             vec![ty.val()]

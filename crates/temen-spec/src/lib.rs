@@ -87,6 +87,9 @@ pub enum Shape {
     /// The op takes no SSA operands; the single input is baked as the immediate
     /// (the `const` ops), so each vector is its own module.
     Immediate,
+    /// The SSA operands arrive as parameters, and one more input, of this type, is baked as the
+    /// op's immediate (the immediate forms, #2585): each immediate is its own module.
+    OperandsImmediate(ValType),
 }
 
 /// The wire encoding of an op (SPEC.md suite 3): its primary opcode byte, or the SIMD
@@ -130,6 +133,11 @@ impl OpRow {
         match self.shape {
             Shape::Operands => self.operands.clone(),
             Shape::Immediate => vec![self.result],
+            Shape::OperandsImmediate(t) => {
+                let mut inputs = self.operands.clone();
+                inputs.push(t);
+                inputs
+            }
         }
     }
 }
@@ -505,7 +513,30 @@ fn enc_int_bin(ty: IntTy, op: BinOp) -> Enc {
         IntTy::I32 => 0x20,
         IntTy::I64 => 0x40,
     };
-    let off: u8 = match op {
+    Enc::Byte(base + bin_off(op))
+}
+
+/// An immediate form's encoding (#2585): its family's opcode, the byte after the register forms'
+/// range, then the op's index in that family (which this pins as the "sub-opcode").
+fn enc_int_bin_imm(ty: IntTy, op: BinOp) -> Enc {
+    let family: u8 = match ty {
+        IntTy::I32 => 0x2F,
+        IntTy::I64 => 0x4F,
+    };
+    Enc::Prefixed(family, bin_off(op))
+}
+
+fn enc_int_cmp_imm(ty: IntTy, op: CmpOp) -> Enc {
+    let family: u8 = match ty {
+        IntTy::I32 => 0x3B,
+        IntTy::I64 => 0x5B,
+    };
+    Enc::Prefixed(family, cmp_off(op))
+}
+
+/// A `BinOp`'s index within its family.
+fn bin_off(op: BinOp) -> u8 {
+    match op {
         BinOp::Add => 0,
         BinOp::Sub => 1,
         BinOp::Mul => 2,
@@ -521,8 +552,7 @@ fn enc_int_bin(ty: IntTy, op: BinOp) -> Enc {
         BinOp::ShrU => 12,
         BinOp::Rotl => 13,
         BinOp::Rotr => 14,
-    };
-    Enc::Byte(base + off)
+    }
 }
 
 fn enc_int_cmp(ty: IntTy, op: CmpOp) -> Enc {
@@ -530,7 +560,12 @@ fn enc_int_cmp(ty: IntTy, op: CmpOp) -> Enc {
         IntTy::I32 => 0x31,
         IntTy::I64 => 0x51,
     };
-    let off: u8 = match op {
+    Enc::Byte(base + cmp_off(op))
+}
+
+/// A `CmpOp`'s index within its family.
+fn cmp_off(op: CmpOp) -> u8 {
+    match op {
         CmpOp::Eq => 0,
         CmpOp::Ne => 1,
         CmpOp::LtS => 2,
@@ -541,8 +576,7 @@ fn enc_int_cmp(ty: IntTy, op: CmpOp) -> Enc {
         CmpOp::GtU => 7,
         CmpOp::GeS => 8,
         CmpOp::GeU => 9,
-    };
-    Enc::Byte(base + off)
+    }
 }
 
 fn enc_int_un(ty: IntTy, op: IntUnOp) -> Enc {
@@ -730,6 +764,61 @@ pub fn scalar_rows() -> Vec<OpRow> {
                     op,
                     a: v[0],
                     b: v[1],
+                }),
+                eval: Box::new(move |x| {
+                    Ok(SpecVal::I32(match ty {
+                        IntTy::I32 => cmp_i32(op, as_i32(x[0]), as_i32(x[1])),
+                        IntTy::I64 => cmp_i64(op, as_i64(x[0]), as_i64(x[1])),
+                    }))
+                }),
+            });
+        }
+
+        // The immediate forms (#2585): the second input is the op's immediate, an `i32` one held
+        // sign-extended. The semantics are the register form's.
+        let imm = move |x: SpecVal| match ty {
+            IntTy::I32 => i64::from(as_i32(x)),
+            IntTy::I64 => as_i64(x),
+        };
+        for op in BinOp::ALL {
+            let class = match op {
+                BinOp::DivS | BinOp::DivU | BinOp::RemS | BinOp::RemU => Class::Trapping,
+                _ => Class::Pure,
+            };
+            push(OpRow {
+                id: format!("{}.{} imm", ty.prefix(), op.name()),
+                operands: vec![vt],
+                result: vt,
+                class,
+                shape: Shape::OperandsImmediate(vt),
+                encoding: enc_int_bin_imm(ty, op),
+                build: Box::new(move |v, x| Inst::IntBinImm {
+                    ty,
+                    op,
+                    a: v[0],
+                    imm: imm(x[1]),
+                }),
+                eval: Box::new(move |x| {
+                    Ok(match ty {
+                        IntTy::I32 => SpecVal::I32(bin_i32(op, as_i32(x[0]), as_i32(x[1]))?),
+                        IntTy::I64 => SpecVal::I64(bin_i64(op, as_i64(x[0]), as_i64(x[1]))?),
+                    })
+                }),
+            });
+        }
+        for op in CmpOp::ALL {
+            push(OpRow {
+                id: format!("{}.{} imm", ty.prefix(), op.name()),
+                operands: vec![vt],
+                result: ValType::I32,
+                class: Class::Pure,
+                shape: Shape::OperandsImmediate(vt),
+                encoding: enc_int_cmp_imm(ty, op),
+                build: Box::new(move |v, x| Inst::IntCmpImm {
+                    ty,
+                    op,
+                    a: v[0],
+                    imm: imm(x[1]),
                 }),
                 eval: Box::new(move |x| {
                     Ok(SpecVal::I32(match ty {
@@ -1235,7 +1324,7 @@ pub fn vectors_for(row: &OpRow) -> Vec<Vec<SpecVal>> {
 /// so a trapping op is never dead code a backend may elide.
 pub fn module_for(row: &OpRow, vector: &[SpecVal]) -> Module {
     let params = match row.shape {
-        Shape::Operands => row.operands.clone(),
+        Shape::Operands | Shape::OperandsImmediate(_) => row.operands.clone(),
         Shape::Immediate => Vec::new(),
     };
     let idx: Vec<ValIdx> = (0..params.len() as ValIdx).collect();
@@ -1658,11 +1747,13 @@ pub fn coverage(inst: &Inst) -> Class {
     match inst {
         // Slice 1 — the scalar deterministic core.
         Inst::ConstI32(..) | Inst::ConstI64(..) => Class::Pure,
-        Inst::IntBin { op, .. } => match op {
+        Inst::IntBin { op, .. } | Inst::IntBinImm { op, .. } => match op {
             BinOp::DivS | BinOp::DivU | BinOp::RemS | BinOp::RemU => Class::Trapping,
             _ => Class::Pure,
         },
-        Inst::IntCmp { .. } | Inst::IntUn { .. } | Inst::Eqz { .. } => Class::Pure,
+        Inst::IntCmp { .. } | Inst::IntCmpImm { .. } | Inst::IntUn { .. } | Inst::Eqz { .. } => {
+            Class::Pure
+        }
         Inst::Convert { .. } | Inst::Select { .. } => Class::Pure,
         Inst::Cast { .. } => Class::Pure,
 
@@ -1981,7 +2072,7 @@ mod tests {
     /// expected shape.
     #[test]
     fn table_invariants() {
-        assert_eq!(scalar_rows().len(), 77, "slice-1 row count");
+        assert_eq!(scalar_rows().len(), 127, "slice-1 row count");
         assert_eq!(float_rows().len(), 70, "slice-2 row count");
         let rows = all_rows();
         let mut ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();

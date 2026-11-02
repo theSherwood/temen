@@ -164,6 +164,12 @@ e.g. `IntBin{I32, DivS}` is one row, roughly 200 scalar + 80 SIMD rows total):
 | `class` | `Pure` / `Trapping` / `Memory` / `Control` / `Host` / `Concurrency` |
 | `eval` | for `Pure`/`Trapping` scalar+SIMD rows: `fn(&[Val]) -> Result<Val, TrapKind>` — the reference semantics |
 
+The immediate forms (`IntBinImm`, `IntCmpImm`, #2585) have rows of their own, `id`
+`i32.add imm` and so on (the text spells one with the register form's mnemonic and a
+number for its right operand), pinned as the family opcode plus the op's index. Their
+shape is `OperandsImmediate`: the operand arrives as a parameter, and each immediate is
+baked into a module of its own.
+
 **The `eval` closures are written fresh from `DESIGN.md` §3b prose, not imported
 from `temen-interp`.** This is the independence rule that keeps the suite from
 being a tautology: closures copied from the interpreter would rubber-stamp it.

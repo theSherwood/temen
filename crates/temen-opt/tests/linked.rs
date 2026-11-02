@@ -589,24 +589,26 @@ fn the_cleanup_drops_only_the_positions_it_made_stale() {
             Terminator::Return(vec![3]),
         )],
     );
+    // f1's position is its first add's: its constant becomes the add's immediate (#2585), which
+    // moves the add to instruction 0.
     let mut m = module(vec![folds, leaf_of(3)]);
-    let loc = |func: u32, line: u32| Loc {
+    let loc = |func: u32, inst: u32, line: u32| Loc {
         func,
         block: 0,
-        inst: 0,
+        inst,
         file: 0,
         line,
         col: 1,
     };
     m.debug_info = Some(DebugInfo {
         files: vec!["p.nim".into()],
-        locs: vec![loc(0, 1), loc(1, 2)],
+        locs: vec![loc(0, 0, 1), loc(1, 1, 2)],
         ..Default::default()
     });
     let o = optimize_linked(&m);
     let d = o.debug_info.as_ref().expect("debug info kept");
-    let lines: Vec<u32> = d.locs.iter().map(|l| l.line).collect();
-    assert_eq!(lines, vec![2], "only f0's position went stale");
+    let lines: Vec<(u32, u32)> = d.locs.iter().map(|l| (l.inst, l.line)).collect();
+    assert_eq!(lines, vec![(0, 2)], "only f0's position went stale");
 }
 
 #[test]

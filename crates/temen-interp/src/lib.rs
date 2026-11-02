@@ -18018,6 +18018,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     };
                     frames[top].vals.push(Reg::from_i32(r as i32));
                 }
+                Inst::IntBinImm { ty, op, a, imm } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        IntTy::I32 => Reg::from_i32(bin32(*op, get_i32(vals, *a)?, *imm as i32)?),
+                        IntTy::I64 => Reg::from_i64(bin64(*op, get_i64(vals, *a)?, *imm)?),
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::IntCmpImm { ty, op, a, imm } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        IntTy::I32 => cmp32(*op, get_i32(vals, *a)?, *imm as i32),
+                        IntTy::I64 => cmp64(*op, get_i64(vals, *a)?, *imm),
+                    };
+                    frames[top].vals.push(Reg::from_i32(r as i32));
+                }
                 Inst::IntUn { ty, op, a } => {
                     let vals = &frames[top].vals;
                     let r = match ty {
@@ -18620,6 +18636,17 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
             let r = match ty {
                 IntTy::I32 => cmp32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?),
                 IntTy::I64 => cmp64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?),
+            };
+            Reg::from_i32(r as i32)
+        }
+        Inst::IntBinImm { ty, op, a, imm } => match ty {
+            IntTy::I32 => Reg::from_i32(bin32(*op, get_i32(vals, *a)?, *imm as i32)?),
+            IntTy::I64 => Reg::from_i64(bin64(*op, get_i64(vals, *a)?, *imm)?),
+        },
+        Inst::IntCmpImm { ty, op, a, imm } => {
+            let r = match ty {
+                IntTy::I32 => cmp32(*op, get_i32(vals, *a)?, *imm as i32),
+                IntTy::I64 => cmp64(*op, get_i64(vals, *a)?, *imm),
             };
             Reg::from_i32(r as i32)
         }

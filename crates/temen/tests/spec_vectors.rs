@@ -93,10 +93,14 @@ fn check_vector(row: &OpRow, m: &temen_ir::Module, cm: &mut CompiledModule, vect
             temen::text::print_module(m)
         )
     };
-    let args: Vec<Value> = match row.shape {
-        Shape::Operands => vector.iter().copied().map(to_value).collect(),
-        Shape::Immediate => Vec::new(),
+    // The inputs that arrive as parameters: all of an `Operands` row's, none of an `Immediate`
+    // row's, and the operands, not the immediate, of an `OperandsImmediate` row's.
+    let params = match row.shape {
+        Shape::Operands => vector,
+        Shape::Immediate => &[][..],
+        Shape::OperandsImmediate(_) => &vector[..row.operands.len()],
     };
+    let args: Vec<Value> = params.iter().copied().map(to_value).collect();
 
     // Tree-walk interpreter (the runtime oracle — here itself under the spec's oracle).
     let mut fuel = 10_000u64;
@@ -121,10 +125,7 @@ fn check_vector(row: &OpRow, m: &temen_ir::Module, cm: &mut CompiledModule, vect
     assert!(ok, "{}", ctx("bytecode", &bc));
 
     // Cranelift JIT.
-    let slots: Vec<i64> = match row.shape {
-        Shape::Operands => vector.iter().copied().map(to_slot).collect(),
-        Shape::Immediate => Vec::new(),
-    };
+    let slots: Vec<i64> = params.iter().copied().map(to_slot).collect();
     let (out, _mem) = cm
         .run(&slots, None, None)
         .unwrap_or_else(|e| panic!("{}", ctx("jit", &e)));
@@ -166,6 +167,25 @@ fn spec_vectors_match_all_backends() {
                     });
                     check_vector(&row, &m, &mut cm, &vector);
                     vectors_run += 1;
+                }
+            }
+            // The last input is the baked immediate: one module (and compile) per immediate, run
+            // over every vector that has it.
+            Shape::OperandsImmediate(_) => {
+                let mut vectors = vectors_for(&row);
+                vectors.sort_by_key(|v| format!("{:?}", v.last()));
+                for group in vectors.chunk_by(|x, y| x.last() == y.last()) {
+                    let m = module_for(&row, &group[0]);
+                    temen::verify::verify_module(&m).unwrap_or_else(|e| {
+                        panic!("spec module for {} fails verify: {e:?}", row.id)
+                    });
+                    let mut cm = compile(&m, 0).unwrap_or_else(|e| {
+                        panic!("spec module for {} fails JIT compile: {e:?}", row.id)
+                    });
+                    for vector in group {
+                        check_vector(&row, &m, &mut cm, vector);
+                        vectors_run += 1;
+                    }
                 }
             }
         }

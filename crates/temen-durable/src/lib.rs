@@ -560,6 +560,8 @@ fn inst_operands(i: &Inst) -> Option<Vec<ValIdx>> {
             vec![*a, *b]
         }
         IntUn { a, .. }
+        | IntBinImm { a, .. }
+        | IntCmpImm { a, .. }
         | FUn { a, .. }
         | Eqz { a, .. }
         | Convert { a, .. }
@@ -2219,9 +2221,9 @@ fn result_types(
         ConstF32(_) => vec![ValType::F32],
         ConstF64(_) => vec![ValType::F64],
         ConstV128(_) => vec![ValType::V128],
-        IntBin { ty, .. } | IntUn { ty, .. } => vec![ty.val()],
+        IntBin { ty, .. } | IntBinImm { ty, .. } | IntUn { ty, .. } => vec![ty.val()],
         FBin { ty, .. } | FUn { ty, .. } => vec![ty.val()],
-        IntCmp { .. } | FCmp { .. } | Eqz { .. } => vec![ValType::I32],
+        IntCmp { .. } | IntCmpImm { .. } | FCmp { .. } | Eqz { .. } => vec![ValType::I32],
         // Scalar conversions (#1300 Phase 2, item 3): each yields one scalar the shadow frame
         // already spills/reloads (i32/i64/f32/f64), typed from the op itself — width conversions,
         // saturating and trapping float→int, int→float, and the float casts/reinterprets.

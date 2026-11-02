@@ -95,6 +95,8 @@ fn module_of(text: &str) -> Result<Module, LengError> {
         ))
     })?;
     temen_ir::prune_block_params(&mut m);
+    // A constant an integer op reads is the op's immediate (#2585).
+    m.fold_immediates();
     Ok(m)
 }
 

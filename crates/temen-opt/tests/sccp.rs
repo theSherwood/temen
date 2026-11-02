@@ -236,8 +236,12 @@ fn loop_invariant_constant_folds_inside_the_loop() {
     );
     // The loop-invariant `k + k` folded to the constant 14, so only the loop-decrement op survives
     // (`i - 1`, which reassociation normalizes to `i + (-1)`). Two integer ops → one.
+    // (The decrement's `-1` is its immediate in the output, #2585.)
     assert_eq!(
-        count(&opt, |i| matches!(i, Inst::IntBin { .. })),
+        count(&opt, |i| matches!(
+            i,
+            Inst::IntBin { .. } | Inst::IntBinImm { .. }
+        )),
         1,
         "loop-invariant k + k should fold, leaving only the loop decrement"
     );
@@ -280,6 +284,9 @@ fn trapping_op_is_never_marked_constant() {
         count(&opt, |i| matches!(
             i,
             Inst::IntBin {
+                op: BinOp::DivS,
+                ..
+            } | Inst::IntBinImm {
                 op: BinOp::DivS,
                 ..
             }

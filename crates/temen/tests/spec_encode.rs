@@ -63,7 +63,7 @@ fn spec_encoding_conformance() {
     for row in all_rows() {
         let m = match row.shape {
             Shape::Operands => module_for(&row, &[]),
-            Shape::Immediate => {
+            Shape::Immediate | Shape::OperandsImmediate(_) => {
                 let sample = vectors_for(&row)
                     .into_iter()
                     .next()

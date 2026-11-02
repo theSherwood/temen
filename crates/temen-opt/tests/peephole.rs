@@ -106,6 +106,12 @@ fn integer_self_comparison_folds_to_a_constant() {
 
 // ---- constant reassociation ----
 
+/// An integer binary op, its right operand a value or an immediate (the optimizer's output folds a
+/// constant operand into the op, #2585).
+fn is_int_bin(i: &Inst) -> bool {
+    matches!(i, Inst::IntBin { .. } | Inst::IntBinImm { .. })
+}
+
 /// Build `fn(x: i32) -> i32` computing a chain of `x OP c1 OP c2 ...` and return (module, expected
 /// number of surviving IntBin ops after optimization, the closed-form result fn).
 fn reassoc_module(op: BinOp, consts: &[i32]) -> Module {
@@ -150,7 +156,7 @@ fn constant_chain_reassociates_to_a_single_op() {
         verify_module(&opt).expect("re-verifies");
         // The whole constant chain folds to `x OP <combined>` — exactly one IntBin remains.
         assert_eq!(
-            count(&opt, |i| matches!(i, Inst::IntBin { .. })),
+            count(&opt, is_int_bin),
             1,
             "chain of {op:?} over {consts:?} should collapse to one op"
         );
@@ -193,7 +199,7 @@ fn reassociation_exposes_cse() {
     }
     // Both branches reassociate to `x + 8`; CSE shares it, leaving `x+8` and the final sum.
     assert_eq!(
-        count(&opt, |i| matches!(i, Inst::IntBin { .. })),
+        count(&opt, is_int_bin),
         2,
         "the two x+8 recomputations should share one op after reassociation + CSE"
     );
@@ -224,7 +230,7 @@ fn mixed_add_sub_constant_chain_collapses() {
     let opt = optimize_module(&m);
     verify_module(&opt).expect("re-verifies");
     assert_eq!(
-        count(&opt, |i| matches!(i, Inst::IntBin { .. })),
+        count(&opt, is_int_bin),
         1,
         "the mixed +/- constant chain should collapse to one op"
     );

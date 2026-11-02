@@ -137,6 +137,14 @@ pub enum Known {
 }
 
 impl Known {
+    /// The constant an immediate operand ([`Inst::IntBinImm`]) of type `ty` stands for.
+    pub fn of_imm(ty: IntTy, imm: i64) -> Known {
+        match ty {
+            IntTy::I32 => Known::I32(imm as i32),
+            IntTy::I64 => Known::I64(imm),
+        }
+    }
+
     /// The `const` instruction that materializes this value (the in-place fold result).
     pub fn to_const_inst(self) -> Inst {
         match self {
@@ -387,8 +395,10 @@ pub fn optimize_module_with(m: &Module, cfg: &OptConfig) -> Module {
     } else {
         optimized
     };
-    // The passes read block-local form; what they hand back is in dominance form (#2454).
+    // The passes read block-local form; what they hand back is in dominance form (#2454), its integer
+    // ops' constants as immediates (#2585).
     out.raise();
+    out.fold_immediates();
     out
 }
 
@@ -550,6 +560,8 @@ pub(crate) fn try_fold(inst: &Inst, known: &[Option<Known>], floats: bool) -> Op
         inst,
         Inst::IntBin { .. }
             | Inst::IntCmp { .. }
+            | Inst::IntBinImm { .. }
+            | Inst::IntCmpImm { .. }
             | Inst::IntUn { .. }
             | Inst::Eqz { .. }
             | Inst::Convert { .. }
@@ -569,6 +581,13 @@ pub(crate) fn try_fold(inst: &Inst, known: &[Option<Known>], floats: bool) -> Op
             // Absorbing-element / self-cancelling identities that yield a *constant* with only one
             // operand known (or `a == b`): `x*0`/`x&0` → 0, `x|-1` → -1, `x-x`/`x^x` → 0, `x%1` → 0.
             fold_absorbing(ty, op, a, b, known)
+        }
+        // An immediate is a known `b`; a known `a` folds the op.
+        Inst::IntBinImm { ty, op, a, imm } => {
+            fold_int_bin(ty, op, get(known, a)?, Known::of_imm(ty, imm))
+        }
+        Inst::IntCmpImm { ty, op, a, imm } => {
+            fold_int_cmp(ty, op, get(known, a)?, Known::of_imm(ty, imm))
         }
         Inst::IntCmp { ty, op, a, b } => {
             // Self-comparison folds without knowing the value: `x == x`/`x <= x`/`x >= x` are 1,
@@ -2281,6 +2300,7 @@ pub fn optimize_linked(m: &Module) -> Module {
         .as_ref()
         .and_then(|d| drop_stale_debug(d, &changed));
     out.raise();
+    out.fold_immediates();
     out
 }
 
