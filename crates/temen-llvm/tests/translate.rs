@@ -5184,12 +5184,18 @@ fn demo_pg_sscanf_vs_native() {
     // conversions Postgres parses config/version values with (d/i/u/o/x/c/s/f/[scanset]/n/`*`/width),
     // checking the return count, then drives `fscanf` from the powerbox `stdin` — byte-identical to the
     // native glibc oracle on all three engines.
+    //
+    // Both sides compile as C17 (`-std=gnu17`). C23 changed `%i`: it reads a `0b` prefix, and the
+    // probe's `"0b"` case checks the C17 answer (`0`, then stop). Under C23, glibc's headers send
+    // `sscanf` to `__isoc23_sscanf`, whose answer then depends on the glibc version. GCC 15 defaults
+    // to C23, so the oracle changed when the runner image moved to it.
     let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../temen-run/demos/postgres/sscanf_probe.c");
     let pid = std::process::id();
     let bc = std::env::temp_dir().join(format!("temen_llvm_demo_{pid}_pg_sscanf.ll"));
     let status = Command::new("clang")
         .args([
+            "-std=gnu17",
             "-O2",
             "-emit-llvm",
             "-S",
@@ -5209,7 +5215,13 @@ fn demo_pg_sscanf_vs_native() {
         }
     }
     let exe = std::env::temp_dir().join(format!("temen_llvm_pb_{pid}_pg_sscanf"));
-    match Command::new("cc").arg(&demo).arg("-o").arg(&exe).status() {
+    match Command::new("cc")
+        .arg("-std=gnu17")
+        .arg(&demo)
+        .arg("-o")
+        .arg(&exe)
+        .status()
+    {
         Ok(s) if s.success() => {}
         _ => {
             eprintln!("note: skipping pg_sscanf (cc unavailable)");

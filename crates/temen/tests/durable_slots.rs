@@ -45,14 +45,15 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 
 /// A (func 1): bump the counter at 65544, return 107. B (func 2): read the clock, return it + 10.
 /// Func 3: a fiber that suspends at once — only its resume matters, as a freeze safepoint.
+///
+/// A's bump is one atomic add: two As can run at once ([`SPENT_ACROSS_THE_CUT`] spawns two back to
+/// back), and a plain load, add and store loses one of their bumps when they overlap (#2718).
 const THREADS: &str = r#"
 func (i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64) {
   v2 = i64.const 65544
-  v3 = i64.load v2
   v4 = i64.const 1
-  v5 = i64.add v3 v4
-  i64.store v2 v5
+  v5 = i64.atomic.rmw.add v2 v4
   v6 = i64.const 107
   return v6
   }
