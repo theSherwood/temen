@@ -3618,30 +3618,32 @@ impl Terminator {
     /// Each edge of this terminator: its successor and the arguments it passes (in `br_table`
     /// order, the default last). A return or tail call has none.
     pub fn edges(&self) -> Vec<(BlockIdx, &[ValIdx])> {
-        match self {
-            Terminator::Br { target, args } => vec![(*target, args.as_slice())],
+        (0..).map_while(|k| self.edge(k)).collect()
+    }
+
+    /// Edge `k` of [`Terminator::edges`], without building the list.
+    pub fn edge(&self, k: usize) -> Option<(BlockIdx, &[ValIdx])> {
+        let (b, args) = match self {
+            Terminator::Br { target, args } if k == 0 => (target, args),
             Terminator::BrIf {
                 then_blk,
                 then_args,
+                ..
+            } if k == 0 => (then_blk, then_args),
+            Terminator::BrIf {
                 else_blk,
                 else_args,
                 ..
-            } => vec![
-                (*then_blk, then_args.as_slice()),
-                (*else_blk, else_args.as_slice()),
-            ],
+            } if k == 1 => (else_blk, else_args),
             Terminator::BrTable {
                 targets, default, ..
-            } => targets
-                .iter()
-                .chain(core::iter::once(default))
-                .map(|(b, args)| (*b, args.as_slice()))
-                .collect(),
-            Terminator::Return(_)
-            | Terminator::ReturnCall { .. }
-            | Terminator::ReturnCallIndirect { .. }
-            | Terminator::Unreachable => Vec::new(),
-        }
+            } => {
+                let (b, args) = targets.get(k).or((k == targets.len()).then_some(default))?;
+                (b, args)
+            }
+            _ => return None,
+        };
+        Some((*b, args.as_slice()))
     }
 
     /// Keep an edge argument only where `keep(successor, position)` says so.
@@ -3979,22 +3981,44 @@ impl Func {
             total += b.params.len();
         }
         first.push(total as u32);
-        let edges: Vec<Vec<(BlockIdx, &[ValIdx])>> =
-            self.blocks.iter().map(|b| b.term.edges()).collect();
-        // The blocks reachable from the entry, in reverse postorder.
+        // Only a param past the entry's can forward, so a function with none has nothing to settle.
+        if self.blocks.iter().skip(1).all(|b| b.params.is_empty()) {
+            return Forwards {
+                first,
+                src: vec![Forwards::OWN; total],
+            };
+        }
+        // An edge into a block from a reachable one: its source block (a value's high half), where
+        // that block's params start in `src`, how many it has, and the arguments.
+        #[derive(Clone, Copy)]
+        struct In<'a> {
+            from: u64,
+            at: usize,
+            np: usize,
+            args: &'a [ValIdx],
+        }
+        // The blocks reachable from the entry, in reverse postorder. The walk sees each edge of a
+        // reachable block once, and keeps those into a block with params.
         let mut reach = vec![false; n];
         let mut post = Vec::with_capacity(n);
-        let mut stack: Vec<(usize, usize)> = Vec::new();
-        if n > 0 {
-            reach[0] = true;
-            stack.push((0, 0));
-        }
+        let mut into: Vec<(BlockIdx, In)> = Vec::new();
+        let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+        reach[0] = true;
         while let Some(top) = stack.last_mut() {
             let (b, k) = *top;
-            match edges[b].get(k) {
-                Some(&(t, _)) => {
+            match self.blocks[b].term.edge(k) {
+                Some((t, args)) => {
                     top.1 += 1;
                     let t = t as usize;
+                    if self.blocks.get(t).is_some_and(|tb| !tb.params.is_empty()) {
+                        let e = In {
+                            from: (b as u64) << 32,
+                            at: first[b] as usize,
+                            np: self.blocks[b].params.len(),
+                            args,
+                        };
+                        into.push((t as BlockIdx, e));
+                    }
                     if t < n && !reach[t] {
                         reach[t] = true;
                         stack.push((t, 0));
@@ -4006,35 +4030,25 @@ impl Func {
                 }
             }
         }
-        let order: Vec<usize> = post.into_iter().rev().filter(|&b| b != 0).collect();
-        // An edge into a block from a reachable one: its source block (a value's high half), where
-        // that block's params start in `src`, how many it has, and the arguments.
-        #[derive(Clone, Copy)]
-        struct In<'a> {
-            from: u64,
-            at: usize,
-            np: usize,
-            args: &'a [ValIdx],
+        // The blocks with params to settle: reachable, past the entry, with params.
+        let order: Vec<usize> = post
+            .into_iter()
+            .rev()
+            .filter(|&b| b != 0 && !self.blocks[b].params.is_empty())
+            .collect();
+        // Each block's edges in, as one run: block `t`'s are `into[starts[t]..starts[t + 1]]`.
+        into.sort_unstable_by_key(|&(t, _)| t);
+        let mut starts = vec![0u32; n + 1];
+        for &(t, _) in &into {
+            starts[t as usize + 1] += 1;
         }
-        let mut into: Vec<Vec<In>> = vec![Vec::new(); n];
-        for (u, es) in edges.iter().enumerate().filter(|&(u, _)| reach[u]) {
-            for &(t, args) in es {
-                if let Some(e) = into.get_mut(t as usize) {
-                    e.push(In {
-                        from: (u as u64) << 32,
-                        at: first[u] as usize,
-                        np: self.blocks[u].params.len(),
-                        args,
-                    });
-                }
-            }
+        for t in 0..n {
+            starts[t + 1] += starts[t];
         }
-        let mut src = vec![Forwards::UNKNOWN; total];
-        for (b, blk) in self.blocks.iter().enumerate() {
-            if b == 0 || !reach[b] {
-                let at = first[b] as usize;
-                src[at..at + blk.params.len()].fill(Forwards::OWN);
-            }
+        let mut src = vec![Forwards::OWN; total];
+        for &t in &order {
+            let lo = first[t] as usize;
+            src[lo..lo + self.blocks[t].params.len()].fill(Forwards::UNKNOWN);
         }
         let mut settled = false;
         for _ in 0..Forwards::PASSES {
@@ -4047,7 +4061,7 @@ impl Func {
                     }
                     let me = (t as u64) << 32 | i as u64;
                     let mut val = Forwards::UNKNOWN;
-                    for e in &into[t] {
+                    for (_, e) in &into[starts[t] as usize..starts[t + 1] as usize] {
                         let Some(&a) = e.args.get(i) else {
                             val = Forwards::OWN;
                             break;
