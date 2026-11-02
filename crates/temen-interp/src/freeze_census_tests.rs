@@ -2,6 +2,7 @@
 //! reached cheaply were a nested child's, pinned end to end until the carve spawn went (#1867); the
 //! rest have reaching shapes (a parked serve handler, a detached child minted without a doorbell, a
 //! §13-mapped detached window, a child holding a `Blocking`) that are each a setup of their own.
+//! And, at the other end of the cut, how a thaw re-creates a domain's threads ([`seed_thread`]).
 
 use super::*;
 use std::time::Duration;
@@ -259,9 +260,9 @@ fn a_twin_no_freeze_can_carry_declines() {
     );
 }
 
-/// A bare vCPU of the fixture's root domain, to park by hand.
-fn parked_vcpu(f: &Fixture, id: TaskId) -> Box<VCpu> {
-    let funcs: Arc<[Func]> = Arc::from(vec![Func {
+/// A program of one function, which returns at once.
+fn returns_at_once() -> Arc<[Func]> {
+    Arc::from(vec![Func {
         params: vec![],
         results: vec![],
         blocks: vec![temen_ir::Block {
@@ -271,20 +272,23 @@ fn parked_vcpu(f: &Fixture, id: TaskId) -> Box<VCpu> {
             insts: vec![],
             term: Terminator::Return(vec![]),
         }],
-    }]);
+    }])
+}
+
+/// A bare vCPU of the fixture's root domain, to park by hand.
+fn parked_vcpu(f: &Fixture, id: TaskId) -> Box<VCpu> {
+    let funcs = returns_at_once();
     let dt = Arc::new(DomainTable::new(&funcs, 0));
+    let domain = Domain::new(Arc::clone(&f.root), funcs, Arc::from(Vec::new()), dt);
     Box::new(VCpu::new(
-        funcs,
-        Arc::from(Vec::new()),
+        Arc::new(domain),
         0,
         &[],
         None,
-        Arc::clone(&f.root),
         Fuel::fixed(0),
         0,
         id,
         f.sched.clone(),
-        dt,
     ))
 }
 
@@ -480,4 +484,58 @@ fn a_freeze_on_quiesce_with_nothing_in_the_way_fires() {
     assert!(s.runnable.iter().all(|v| v.dstate == STATE_UNWINDING));
     drop(s);
     assert_eq!(f.root.lock_unpoisoned().take_freeze_declined(), None);
+}
+
+/// #2695 — a thread a thaw re-creates joins its parent's domain, as its spawn did: its D66 lane chain
+/// and §2.2 pager come with it, where before it was re-made with neither.
+#[test]
+fn a_thread_a_thaw_re_creates_joins_its_parents_domain() {
+    let f = Fixture::new();
+    let SchedRef::Real(rs) = &f.sched else {
+        unreachable!()
+    };
+    f.root.lock_unpoisoned().set_lane_cap(1);
+    let funcs = returns_at_once();
+    let dt = Arc::new(DomainTable::new(&funcs, 0));
+    let mut domain = Domain::root(Arc::clone(&f.root), funcs, Arc::from(Vec::new()), dt);
+    domain.kill = Some(Arc::new(AtomicBool::new(false)));
+    domain.pager = Some(PagerRef {
+        cell: Arc::clone(&f.child),
+        export: 3,
+    });
+    let mut root = VCpu::new(
+        Arc::new(domain),
+        0,
+        &[],
+        None,
+        Fuel::fixed(0),
+        0,
+        1,
+        f.sched.clone(),
+    );
+    let mut threads = BTreeMap::new();
+    // The frozen run's root was task 1 too.
+    let mut live_ids = BTreeMap::from([(1, root.id)]);
+    let thread = FrozenVCpu {
+        task: 2,
+        parent_task: 1,
+        slot: 0,
+        joinable: true,
+        func: 0,
+        args: vec![0, 0],
+        shadow_sp: ShadowArena::EMPTY.frame_base(1),
+        completed_result: None,
+    };
+    seed_thread(
+        &mut rs.lock(),
+        rs,
+        &mut root,
+        &mut threads,
+        &mut live_ids,
+        thread,
+    );
+    let thread = threads.values().next().expect("the thread is re-created");
+    assert!(Arc::ptr_eq(&thread.domain, &root.domain));
+    assert_eq!(thread.domain.lane_chain, vec![(root.domain.id, 1)]);
+    assert!(thread.domain.pager.is_some());
 }

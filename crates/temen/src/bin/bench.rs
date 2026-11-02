@@ -6,9 +6,9 @@
 //!      the **bytecode engine** (`bytecode::compile_and_run`), so we can see where the bytecode
 //!      engine stands and measure Phase-2 (memory-op specialization) work against a real baseline
 //!      rather than guessing (INTERP_PERF.md "Benchmark first").
-//!   3. **bytecode concurrency** — threaded and fiber kernels on the cooperative pump and on the
-//!      parallel driver, the baseline a scheduler change is measured against (#1414 slice 3e).
-//!      `--threads` runs this section alone.
+//!   3. **concurrency** — threaded and fiber kernels on the tree-walker's scheduler, the cooperative
+//!      pump and the parallel driver, the baseline a scheduler change is measured against (#1414
+//!      slice 3e, #2695). `--threads` runs this section alone.
 //!
 //! Each compute kernel takes its **loop count `n`** as the entry argument, so per-iteration compute
 //! is isolated by **subtraction** — `(time(large_n) − time(small_n)) / (large_n − small_n)` — which
@@ -24,8 +24,8 @@ use temen::{encode, ir, verify};
 use temen_interp::{bytecode, Value};
 
 fn main() {
-    // `--threads`: only the bytecode concurrency section (the slow, noisy one), for A/B runs of a
-    // scheduler change.
+    // `--threads`: only the concurrency section (the slow, noisy one), for A/B runs of a scheduler
+    // change.
     if std::env::args().any(|a| a == "--threads") {
         concurrency();
         return;
@@ -89,8 +89,11 @@ fn main() {
 /// run's compile, window and thread start-up cancel out. The parallel column is real OS threads, so
 /// it is noisier: compare runs of two builds on the same box, interleaved.
 fn concurrency() {
-    println!("\nbytecode concurrency (ns per iteration, compute-isolated by subtraction):");
-    println!("{:>14}  {:>12}  {:>12}", "kernel", "pump", "parallel");
+    println!("\nconcurrency (ns per iteration, compute-isolated by subtraction):");
+    println!(
+        "{:>14}  {:>12}  {:>12}  {:>12}",
+        "kernel", "tree-walker", "pump", "parallel"
+    );
     // (name, source, small_n, large_n).
     let kernels = [
         ("par_compute", PAR_COMPUTE, 1_000, 101_000),
@@ -102,6 +105,11 @@ fn concurrency() {
     ];
     for (name, src, small, large) in kernels {
         let m = ir_from_text(src);
+        let tw = per_iter(&m, small, large, |m, n| {
+            let mut fuel = u64::MAX;
+            let r = temen_interp::run(m, 0, &[Value::I32(n)], &mut fuel);
+            std::hint::black_box(r.expect("the kernel runs to completion"));
+        });
         let pump = per_iter(&m, small, large, |m, n| {
             let mut fuel = u64::MAX;
             let r = bytecode::compile_and_run(m, 0, &[Value::I32(n)], &mut fuel)
@@ -111,7 +119,7 @@ fn concurrency() {
         let parallel = per_iter(&m, small, large, |m, n| {
             std::hint::black_box(run_parallel(m, n));
         });
-        println!("{name:>14}  {pump:>10.1}ns  {parallel:>10.1}ns");
+        println!("{name:>14}  {tw:>10.1}ns  {pump:>10.1}ns  {parallel:>10.1}ns");
     }
 }
 
