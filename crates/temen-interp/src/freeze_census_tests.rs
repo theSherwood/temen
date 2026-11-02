@@ -275,6 +275,14 @@ fn returns_at_once() -> Arc<[Func]> {
     }])
 }
 
+/// How a call of the fixture's root domain, parked on a reply, takes it: one `i64`.
+fn reply_to(f: &Fixture) -> ReplyTo {
+    ReplyTo {
+        sig: OpSig::page(),
+        caller: Arc::clone(&f.root),
+    }
+}
+
 /// A bare vCPU of the fixture's root domain, to park by hand.
 fn parked_vcpu(f: &Fixture, id: TaskId) -> Box<VCpu> {
     let funcs = returns_at_once();
@@ -337,7 +345,7 @@ fn a_page_fault_park_takes_the_freeze_phase_and_waits() {
     };
     rs.lock()
         .ticket_waiters
-        .insert((1, 2), Waiter::VCpu(page_faulted(&f, 5)));
+        .insert((1, 2), (Waiter::VCpu(page_faulted(&f, 5)), reply_to(&f)));
     assert_eq!(f.census(&f.root_seat()), None);
     let mut s = rs.lock();
     admit_parks_for_freeze(&mut s);
@@ -399,7 +407,9 @@ fn a_freeze_re_admits_a_reply_wait_and_records_its_ticket() {
     let mut v = parked_vcpu(&f, 5);
     v.reply_ticket = Some(2);
     v.durable_sp_ctx = 3;
-    rs.lock().ticket_waiters.insert((1, 2), Waiter::VCpu(v));
+    rs.lock()
+        .ticket_waiters
+        .insert((1, 2), (Waiter::VCpu(v), reply_to(&f)));
     assert_eq!(f.census(&f.root_seat()), None, "a reply wait re-issues");
 
     let mut s = rs.lock();

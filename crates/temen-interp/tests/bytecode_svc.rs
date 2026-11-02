@@ -14,7 +14,9 @@
 mod rec;
 
 use std::sync::Arc;
-use temen_interp::{bytecode, run_with_host, run_with_host_fast, Host, Value, SVC_QUEUE_CAP};
+use temen_interp::{
+    bytecode, run_with_host, run_with_host_fast, Host, Reply, Value, SVC_QUEUE_CAP,
+};
 
 /// The serving domain from the §3.6 slice-2 corpus: offer "counter" op 0 = func 1
 /// `bump(x) -> old + x` over the LIVE value at mem[16384] (above the #1094 NULL guard); `main` seeds
@@ -118,8 +120,8 @@ fn scenario(
     entry: Entry,
 ) -> (
     Result<Vec<Value>, temen_interp::Trap>,
-    Vec<Option<i64>>,
-    Vec<Option<i64>>,
+    Vec<Option<Reply>>,
+    Vec<Option<Reply>>,
 ) {
     let mut host = Host::new();
     host.set_self_module(m);
@@ -129,11 +131,11 @@ fn scenario(
         .collect();
     let mut fuel = u64::MAX;
     let r = entry(m, 0, &[], &mut fuel, &mut host);
-    let cells: Vec<Option<i64>> = tickets
+    let cells: Vec<Option<Reply>> = tickets
         .iter()
         .map(|t| t.and_then(|t| host.svc_result(t)))
         .collect();
-    let again: Vec<Option<i64>> = tickets
+    let again: Vec<Option<Reply>> = tickets
         .iter()
         .map(|t| t.and_then(|t| host.svc_result(t)))
         .collect();
@@ -168,7 +170,13 @@ fn bytecode_serve_loop_matches_the_tree_walker() {
     // Pin the headline values too (not just cross-entry equality): served*1000 + live counter.
     let (rf, cf, _) = scenario(&m, &[(0, 0, vec![5]), (0, 0, vec![30])], run_with_host_fast);
     assert_eq!(rf, Ok(vec![Value::I64(2042)]));
-    assert_eq!(cf, vec![Some(7), Some(12)]);
+    assert_eq!(
+        cf,
+        vec![
+            Some(Reply::Results(vec![7])),
+            Some(Reply::Results(vec![12]))
+        ]
+    );
 }
 
 /// A full queue refuses at enqueue on the shared Host — engine-independent, but run the drain on
@@ -271,7 +279,10 @@ fn a_serve_nested_under_a_handler_is_refused() {
     );
     assert_eq!(
         ci,
-        vec![Some(einval), Some(einval)],
+        vec![
+            Some(Reply::Results(vec![einval])),
+            Some(Reply::Results(vec![einval]))
+        ],
         "oracle: each nested poll refused"
     );
     assert_eq!((rf, cf), (ri, ci), "bytecode matches the oracle");

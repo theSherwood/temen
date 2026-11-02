@@ -904,7 +904,7 @@ struct HostReplaySubstate {
     /// waiter/scheduler record: the single-domain debug engine parks no cross-domain caller, so nothing
     /// here is captured scheduler state (INVARIANTS.md #7).
     svc_queue: Vec<SvcDispatch>,
-    svc_results: Vec<(u64, i64)>,
+    svc_results: Vec<(u64, Reply)>,
     svc_next_ticket: u64,
     /// #2113 — the host's half of its window's accounting, as [`HostCursor::held`]: the checkpoint's
     /// tree holds the charges.
@@ -5769,6 +5769,8 @@ enum Blocked {
     CapReply {
         ticket: u64,
         callee: Arc<Mutex<Host>>,
+        /// INVARIANTS #8 — how the reply is laid out for this call.
+        to: ReplyTo,
     },
     /// §3.6 slice 3 — a serving fiber parked in `svc.wait` on an empty queue, keyed by its
     /// domain identity. The frame was rewound before parking, so the wake re-executes the
@@ -5826,6 +5828,14 @@ enum Pending {
     /// result — a negative errno the parked fiber probes on its own error path. The fiber is
     /// never killed and never traps; cancellation is a returned value (§3.6 revocation-unparks).
     CapResult(i64),
+    /// INVARIANTS #8 — finish a live call ([`Blocked::CapReply`]) with the values its reply's slots
+    /// define, typed by its op's signature `sig` ([`ReplyTo::complete`]), or with its trap: the
+    /// reply its call could not take. A page fault's (`page_fault` set) is its pager's status
+    /// instead.
+    Reply {
+        out: Result<Vec<i64>, Trap>,
+        sig: OpSig,
+    },
     /// #1899 — a stream read ([`Blocked::CapRead`]) that a landing freeze abandoned: its result is a
     /// placeholder, and the re-issue word makes the thaw re-issue the read.
     Abandoned,
@@ -6322,6 +6332,22 @@ impl DomainMember for Box<VCpu> {
     }
 }
 
+/// A caller parked on a live call's reply ([`Sched::ticket_waiters`]) is its waiter's member.
+impl DomainMember for (Waiter, ReplyTo) {
+    fn domain_key(&self) -> usize {
+        self.0.domain_key()
+    }
+    fn into_victim(self) -> Option<Box<VCpu>> {
+        self.0.into_victim()
+    }
+    fn vcpu(&self) -> Option<&VCpu> {
+        self.0.vcpu()
+    }
+    fn vcpu_mut(&mut self) -> Option<&mut VCpu> {
+        self.0.vcpu_mut()
+    }
+}
+
 impl DomainMember for Waiter {
     fn domain_key(&self) -> usize {
         match self {
@@ -6628,7 +6654,7 @@ impl Sched {
             Some((ParkSite::PipeWrite, 0))
         } else if self.cap_waiters.values().flatten().any(is) {
             Some((ParkSite::StreamRead, 0))
-        } else if let Some((&(_, t), _)) = self.ticket_waiters.iter().find(|(_, w)| is(w)) {
+        } else if let Some((&(_, t), _)) = self.ticket_waiters.iter().find(|(_, (w, _))| is(w)) {
             Some((ParkSite::Reply, t))
         } else if self.completion_waiters.values().any(is) {
             Some((ParkSite::Completion, 0))
@@ -6655,7 +6681,7 @@ impl Sched {
             ParkSite::PipeRead => retain_waiters(&mut self.pipe_waiters, keep),
             ParkSite::PipeWrite => retain_waiters(&mut self.pipe_write_waiters, keep),
             ParkSite::StreamRead => retain_waiters(&mut self.cap_waiters, keep),
-            ParkSite::Reply => self.ticket_waiters.retain(|_, w| keep(w)),
+            ParkSite::Reply => self.ticket_waiters.retain(|_, (w, _)| keep(w)),
             _ => self.completion_waiters.retain(|_, w| keep(w)),
         }
         Some(park)
@@ -6966,7 +6992,7 @@ struct Sched {
     /// calls to *different* callees can share a ticket number — a serve chain (a handler that itself
     /// calls another server) does exactly that, and keying by the bare ticket would let the second
     /// park clobber the first's waiter (I49).
-    ticket_waiters: BTreeMap<(usize, u64), Waiter>,
+    ticket_waiters: BTreeMap<(usize, u64), (Waiter, ReplyTo)>,
     /// I40 — `(callee domain id, dispatch ticket)` whose **caller died before it could claim the
     /// reply**. A dispatch outlives its caller when the caller is reaped (its domain torn down)
     /// with a call still in flight: the callee later serves it and replies, but nobody will ever
@@ -7534,7 +7560,7 @@ impl Scheduler {
     /// Found hammering the multi-consumer suite; reachable (rarer) with a single consumer too.
     /// Lock order (scheduler, then callee powerbox) matches the caller's park handler and the
     /// fiber early-probe, so the pair can't deadlock.
-    fn cap_reply_or_stash(&self, ticket: u64, result: i64, callee: &Arc<Mutex<Host>>) {
+    fn cap_reply_or_stash(&self, ticket: u64, reply: Reply, callee: &Arc<Mutex<Host>>) {
         let mut s = self.lock();
         let callee_id = {
             let mut c = callee.lock_unpoisoned();
@@ -7543,24 +7569,20 @@ impl Scheduler {
             c.domain_id() as usize
         };
         match s.ticket_waiters.remove(&(callee_id, ticket)) {
-            Some(Waiter::VCpu(mut v)) => {
-                v.pending = Some(Pending::CapResult(result));
-                s.runnable.push_back(v);
-                self.work.notify_all();
-            }
-            Some(Waiter::Fiber { reg, slot, svc, .. }) => {
-                reg.wake_blocked(slot, Reg::from_i64(result));
-                if svc_wake_locked(&mut s, svc) {
+            Some((waiter, to)) => {
+                let out = to.complete(reply, callee);
+                if deliver_reply(&mut s, waiter, to, out) {
                     self.work.notify_all();
                 }
             }
             None => {
                 // I40: the caller was reaped with this call in flight — drop the reply instead of
-                // stashing an entry into `svc_results` that nothing will ever claim.
+                // stashing an entry into `svc_results` that nothing will ever claim. A handle in it
+                // stays the callee's: nothing is granted to a caller that is gone.
                 if s.orphan_tickets.remove(&(callee_id, ticket)) {
                     return;
                 }
-                callee.lock_unpoisoned().svc_results.insert(ticket, result);
+                callee.lock_unpoisoned().svc_results.insert(ticket, reply);
             }
         }
     }
@@ -7731,10 +7753,10 @@ impl Scheduler {
         // Only a whole parked vCPU is forkable this slice; anything else stays put. The extracted
         // caller is owned — dropping the lock before the engine call is race-free (nothing else
         // can reach it), and the engine re-acquires with the same lock discipline.
-        let v = {
+        let (v, to) = {
             let mut s = self.lock();
             match s.ticket_waiters.remove(&(callee_id, ticket)) {
-                Some(Waiter::VCpu(v)) => v,
+                Some((Waiter::VCpu(v), to)) => (v, to),
                 Some(other) => {
                     s.ticket_waiters.insert((callee_id, ticket), other);
                     return None;
@@ -7749,7 +7771,7 @@ impl Scheduler {
                 // single-reply path, so it never hangs).
                 let mut s = self.lock();
                 s.ticket_waiters
-                    .insert((callee_id, ticket), Waiter::VCpu(v));
+                    .insert((callee_id, ticket), (Waiter::VCpu(v), to));
                 None
             }
         }
@@ -8087,8 +8109,8 @@ impl Scheduler {
         // caller's domain without committing to remove it. A caller not parked yet (serve/park race)
         // is retryable (`-EAGAIN`); a parked caller of the *wrong* domain is `-ECHILD` (not its child).
         match s.ticket_waiters.get(&(callee_id, ticket)) {
-            Some(Waiter::VCpu(v)) if v.domain.id == parent => {}
-            Some(Waiter::VCpu(_)) => return ReapOutcome::NoChild,
+            Some((Waiter::VCpu(v), _)) if v.domain.id == parent => {}
+            Some((Waiter::VCpu(_), _)) => return ReapOutcome::NoChild,
             _ => return ReapOutcome::Retry,
         }
         // #1816 — a still-running twin another blocking `wait` is already parked on is claimed:
@@ -8101,7 +8123,7 @@ impl Scheduler {
         // caller's `CapReply` waiter is not registered yet (the serve/park race) — the twin is real
         // (it's in `forked_twins`), so this is retryable, never `-ECHILD`.
         let mut v = match s.ticket_waiters.remove(&(callee_id, ticket)) {
-            Some(Waiter::VCpu(v)) => v,
+            Some((Waiter::VCpu(v), _)) => v,
             Some(other) => {
                 s.ticket_waiters.insert((callee_id, ticket), other);
                 return ReapOutcome::Retry;
@@ -8154,7 +8176,7 @@ impl Scheduler {
         // Scope to the calling parent: peek the caller's domain (twins exist, so a not-yet-parked
         // caller is the serve/park race → retry). Then require ≥1 live twin of this parent.
         let parent = match s.ticket_waiters.get(&(callee_id, ticket)) {
-            Some(Waiter::VCpu(v)) => v.domain.id,
+            Some((Waiter::VCpu(v), _)) => v.domain.id,
             _ => return ReapOutcome::Retry,
         };
         let matches = |t: &Twin| t.parent == parent && t.reaper == TwinReaper::Servicer;
@@ -8162,7 +8184,7 @@ impl Scheduler {
             return ReapOutcome::NoChild; // no child of this parent — `-ECHILD`.
         }
         let mut v = match s.ticket_waiters.remove(&(callee_id, ticket)) {
-            Some(Waiter::VCpu(v)) => v,
+            Some((Waiter::VCpu(v), _)) => v,
             Some(other) => {
                 s.ticket_waiters.insert((callee_id, ticket), other);
                 return ReapOutcome::Retry;
@@ -8634,16 +8656,9 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
 /// its park instead (the `CapReply` arms probe [`Sched::dead`]).
 fn wake_dead_tickets(s: &mut Sched, callee: usize, tickets: impl IntoIterator<Item = u64>) {
     for t in tickets {
-        match s.ticket_waiters.remove(&(callee, t)) {
-            Some(Waiter::VCpu(mut w)) => {
-                w.pending = Some(Pending::CapResult(CAP_REVOKED));
-                s.runnable.push_back(w);
-            }
-            Some(Waiter::Fiber { reg, slot, svc, .. }) => {
-                reg.wake_blocked(slot, Reg::from_i64(CAP_REVOKED));
-                svc_wake_locked(s, svc);
-            }
-            None => {}
+        if let Some((waiter, to)) = s.ticket_waiters.remove(&(callee, t)) {
+            let out = to.fail(CAP_REVOKED);
+            deliver_reply(s, waiter, to, out);
         }
     }
 }
@@ -9566,7 +9581,13 @@ fn worker_loop(sched: &Arc<Scheduler>) {
 /// cell wakes the caller instead of stranding it) and D37 death-is-revocation. Shared by the
 /// `Blocked::CapReply` park and the §2.2 page-fault park (which sets `page_fault` first, so the
 /// wake supplies the page instead of pushing the reply).
-fn park_cap_reply(sched: &Arc<Scheduler>, v: Box<VCpu>, ticket: u64, callee: Arc<Mutex<Host>>) {
+fn park_cap_reply(
+    sched: &Arc<Scheduler>,
+    v: Box<VCpu>,
+    ticket: u64,
+    callee: Arc<Mutex<Host>>,
+    to: ReplyTo,
+) {
     let mut s = sched.lock();
     // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
     let Some(mut v) = park_gate(&mut s, v) else {
@@ -9589,18 +9610,20 @@ fn park_cap_reply(sched: &Arc<Scheduler>, v: Box<VCpu>, ticket: u64, callee: Arc
     let early = callee.lock_unpoisoned().svc_results.remove(&ticket);
     match early {
         Some(r) => {
-            v.pending = Some(Pending::CapResult(r));
+            let out = to.complete(r, &callee);
+            v.pending = Some(Pending::Reply { out, sig: to.sig });
             s.runnable.push_back(v);
             sched.work.notify_one();
         }
         None if callee_dead => {
-            v.pending = Some(Pending::CapResult(CAP_REVOKED));
+            let out = to.fail(CAP_REVOKED);
+            v.pending = Some(Pending::Reply { out, sig: to.sig });
             s.runnable.push_back(v);
             sched.work.notify_one();
         }
         None => {
             s.ticket_waiters
-                .insert((callee_id, ticket), Waiter::VCpu(v));
+                .insert((callee_id, ticket), (Waiter::VCpu(v), to));
         }
     }
 }
@@ -10346,9 +10369,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 }
                 sched.completion_drain();
             }
-            Step::Park(Blocked::CapReply { ticket, callee }) => {
+            Step::Park(Blocked::CapReply { ticket, callee, to }) => {
                 v.reply_ticket = Some(ticket);
-                park_cap_reply(sched, v, ticket, callee);
+                park_cap_reply(sched, v, ticket, callee, to);
             }
             // CONSOLIDATION.md §2.2 — a demand process child's recoverable page fault, serviced by
             // its pager binding (op 16): synthesize `pager.page(addr)` on the provider's cell. With
@@ -10377,7 +10400,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     if let Some(provider) = sched.take_parked_serve_loop(pager_id as usize) {
                         dispatch(sched, provider);
                         let served = pb.cell.lock_unpoisoned().svc_results.remove(&t);
-                        if let Some(r) = served {
+                        if let Some(r) = served.map(|r| r.status()) {
                             if r < 0 {
                                 // Pager refused: an unserviceable fault — detect-and-kill semantics
                                 // via the marker path (the re-entry on the next loop iteration sees
@@ -10398,7 +10421,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // as a `call.cap` does (#1815 — without it a parked pager slept through the fault).
                 sched.svc_wake(pager_id as usize);
                 v.page_fault = Some(addr);
-                park_cap_reply(sched, v, t, pb.cell);
+                let to = ReplyTo {
+                    sig: OpSig::page(),
+                    caller: Arc::clone(&v.domain.host),
+                };
+                park_cap_reply(sched, v, t, pb.cell, to);
             }
             Step::Park(Blocked::SvcWait { key, deadline_ns }) => {
                 // §3.6 slice 3: park the serving vCPU on its empty queue. Park-vs-enqueue race
@@ -10656,11 +10683,11 @@ impl SchedRef {
     }
     /// Atomic reply-or-stash ([`Scheduler::cap_reply_or_stash`]); the explorer has no caller
     /// parks, so its arm stashes straight into the cell.
-    fn cap_reply_or_stash(&self, ticket: u64, result: i64, callee: &Arc<Mutex<Host>>) {
+    fn cap_reply_or_stash(&self, ticket: u64, reply: Reply, callee: &Arc<Mutex<Host>>) {
         match self {
-            SchedRef::Real(s) => s.cap_reply_or_stash(ticket, result, callee),
+            SchedRef::Real(s) => s.cap_reply_or_stash(ticket, reply, callee),
             SchedRef::Det(_) => {
-                callee.lock_unpoisoned().svc_results.insert(ticket, result);
+                callee.lock_unpoisoned().svc_results.insert(ticket, reply);
             }
         }
     }
@@ -12025,8 +12052,13 @@ enum RegFiber {
     /// fires — a `cont.resume` of it reports `FIBER_PARKED` to the resumer without switching
     /// (a poll). The wake pushes the event's result onto the set-aside top frame and flips
     /// `woken`; a claim then delivers the frames **verbatim** (the result is already in place,
-    /// so the resumer's `arg` is deliberately not pushed).
-    ParkedOn { frames: Vec<Frame>, woken: bool },
+    /// so the resumer's `arg` is deliberately not pushed). INVARIANTS #8: a live call's reply its
+    /// call cannot take wakes it with `fault` instead, which the claim raises.
+    ParkedOn {
+        frames: Vec<Frame>,
+        woken: bool,
+        fault: Option<Trap>,
+    },
     /// Returned: resuming it again traps. Slots are **not recycled** (matching both backends'
     /// historical tables, so handles stay dense and deterministic); recycling + the generation
     /// tag land with the JIT shared registry (3b-ii) so both backends adopt one policy together.
@@ -12275,8 +12307,14 @@ impl FiberRegistry {
             // §3.6 slice 5a: a woken event-park continues verbatim (result already delivered);
             // a still-blocked one is a poll — the resumer learns FIBER_PARKED, no switch.
             RegFiber::ParkedOn {
+                fault: Some(trap),
+                woken: true,
+                ..
+            } => Err(trap),
+            RegFiber::ParkedOn {
                 frames,
                 woken: true,
+                fault: None,
             } => Ok((slot, Claimed::LiveWoken(frames))),
             old @ RegFiber::ParkedOn { woken: false, .. } => {
                 t.fibers[slot] = old;
@@ -12320,6 +12358,7 @@ impl FiberRegistry {
         t.fibers[slot] = RegFiber::ParkedOn {
             frames,
             woken: false,
+            fault: None,
         };
     }
 
@@ -12329,6 +12368,32 @@ impl FiberRegistry {
     /// the wake is then a no-op, matching every other idempotent wake path).
     fn wake_blocked(&self, slot: usize, result: Reg) -> bool {
         self.wake_parked(slot, Some(result))
+    }
+
+    /// INVARIANTS #8 — a live call's reply landed ([`deliver_reply`]): its values onto the parked
+    /// fiber's top frame, or, for a reply its call could not take, its trap, which the fiber's next
+    /// claim raises. `false` as [`Self::wake_blocked`].
+    fn wake_reply(&self, slot: usize, out: Result<Vec<i64>, Trap>, sig: &OpSig) -> bool {
+        let mut t = self.lock();
+        match &mut t.fibers[slot] {
+            RegFiber::ParkedOn {
+                frames,
+                woken: woken @ false,
+                fault,
+            } => {
+                match out {
+                    Ok(slots) => {
+                        if let Some(f) = frames.last_mut() {
+                            f.vals.extend(result_regs(&slots, sig.results()));
+                        }
+                    }
+                    Err(trap) => *fault = Some(trap),
+                }
+                *woken = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// #1952 — the event fired for a fiber parked in a **rewound** op: make it claimable with
@@ -12343,6 +12408,7 @@ impl FiberRegistry {
             RegFiber::ParkedOn {
                 frames,
                 woken: woken @ false,
+                ..
             } => {
                 if let (Some(f), Some(r)) = (frames.last_mut(), result) {
                     f.vals.push(r);
@@ -12510,7 +12576,7 @@ impl FiberRegistry {
             .iter()
             .position(|f| matches!(f, RegFiber::ParkedOn { .. }))?;
         match std::mem::replace(&mut t.fibers[slot], RegFiber::Frozen) {
-            RegFiber::ParkedOn { frames, woken } => Some((slot, frames, woken)),
+            RegFiber::ParkedOn { frames, woken, .. } => Some((slot, frames, woken)),
             _ => unreachable!("position found a ParkedOn slot"),
         }
     }
@@ -13087,6 +13153,9 @@ struct ServeRun {
     /// **skips** its auto-reply, so the servicer's injected value is the one the caller reloads —
     /// not the handler's return clobbering it. (`fork()` replies `pid`/`0` this way in PR 2.)
     replied: bool,
+    /// INVARIANTS #8 — the handler's results as slots, recorded when it returns: its dispatch's
+    /// reply. The fiber hand-back to the serve frame carries only the first.
+    results: Vec<i64>,
 }
 
 /// The module-declared shadow arena of the window `mem` ([`ShadowArena::EMPTY`] before a window
@@ -13939,9 +14008,9 @@ fn decide(
     }
 }
 
-/// Issue a live call to `callee`: enqueue its dispatch and name its ticket (`None` on a full queue),
-/// with the callee's domain id. A call whose wait a freeze abandoned is not issued again: its dispatch
-/// stayed with the callee, so this names the ticket it was waiting on (#1901).
+/// Issue a live call to `callee`: enqueue its dispatch ([`enqueue_live_call`]). A call whose wait a
+/// freeze abandoned is not issued again: its dispatch stayed with the callee, so this names the
+/// ticket it was waiting on (#1901).
 fn issue_live_call(
     host: &Arc<Mutex<Host>>,
     ctx: usize,
@@ -13949,13 +14018,94 @@ fn issue_live_call(
     export: u32,
     op: u32,
     args: Vec<i64>,
-) -> (Option<u64>, u64) {
-    let resumed = host.lock_unpoisoned().take_reply_wait(ctx);
-    let mut cg = callee.lock_unpoisoned();
-    (
-        resumed.or_else(|| cg.svc_enqueue(export, op, args)),
-        cg.domain_id(),
+    params: &[ValType],
+) -> Result<(Option<u64>, u64), Trap> {
+    if let Some(t) = host.lock_unpoisoned().take_reply_wait(ctx) {
+        return Ok((Some(t), callee.lock_unpoisoned().domain_id()));
+    }
+    enqueue_live_call(
+        &mut CallerHost::Cell(host),
+        callee,
+        export,
+        op,
+        args,
+        params,
     )
+}
+
+/// The powerbox a live call is made from: held outright by the calling thread (a JIT root that runs
+/// unlocked, in no cell, so never the callee's), or in a cell shared with other threads.
+pub enum CallerHost<'a> {
+    Owned(&'a mut Host),
+    Cell(&'a Mutex<Host>),
+}
+
+impl CallerHost<'_> {
+    /// Run `f` over this powerbox and `callee`'s, locked together: a cell with the callee's in
+    /// [`lock_host_pair`]'s order, as every scope that holds two powerboxes takes them. The callee
+    /// is `None` when it is this powerbox, whose table the call shares.
+    fn with_callee<R>(
+        &mut self,
+        callee: &Mutex<Host>,
+        f: impl FnOnce(&mut Host, Option<&mut Host>) -> R,
+    ) -> R {
+        match self {
+            CallerHost::Owned(h) => f(h, Some(&mut callee.lock_unpoisoned())),
+            CallerHost::Cell(c) => match lock_host_pair(c, callee) {
+                Some((mut hg, mut cg)) => f(&mut hg, Some(&mut cg)),
+                None => f(&mut c.lock_unpoisoned(), None),
+            },
+        }
+    }
+}
+
+/// INVARIANTS #8 — enqueue a call of op `op` of export `export` from `caller` on the powerbox in
+/// cell `callee`: its ticket (`None` on a full queue) and the callee's domain id. Each handle among
+/// `args` (a `cap` of `params`, the op's own: [`LiveTarget::sig`]) is granted into the callee
+/// before the callee can see the call ([`translate_cap_slots`]), under both powerboxes' locks, and
+/// only for a call the queue admits, so a full queue grants nothing. One naming nothing faults the
+/// call. A call with no handle takes only the callee's lock. Every engine's live call enqueues here.
+pub fn enqueue_live_call(
+    caller: &mut CallerHost,
+    callee: &Mutex<Host>,
+    export: u32,
+    op: u32,
+    mut args: Vec<i64>,
+    params: &[ValType],
+) -> Result<(Option<u64>, u64), Trap> {
+    if !params.contains(&ValType::Cap) {
+        let mut cg = callee.lock_unpoisoned();
+        return Ok((cg.svc_enqueue(export, op, args), cg.domain_id()));
+    }
+    caller.with_callee(callee, |hg, cg| {
+        let cg = match cg {
+            Some(cg) => {
+                if params.contains(&ValType::Cap) && cg.svc_admits(export, op) {
+                    translate_cap_slots(hg, cg, params, &mut args)?;
+                }
+                cg
+            }
+            None => hg,
+        };
+        Ok((cg.svc_enqueue(export, op, args), cg.domain_id()))
+    })
+}
+
+/// INVARIANTS #8 — [`enqueue_live_call`]'s grant of a call's handles into the callee, for a call its
+/// callee serves without the queue: the Cranelift JIT's direct handoff.
+pub fn grant_live_args(
+    caller: &mut CallerHost,
+    callee: &Mutex<Host>,
+    params: &[ValType],
+    args: &mut [i64],
+) -> Result<(), Trap> {
+    if !params.contains(&ValType::Cap) {
+        return Ok(());
+    }
+    caller.with_callee(callee, |hg, cg| match cg {
+        Some(cg) => translate_cap_slots(hg, cg, params, args),
+        None => Ok(()),
+    })
 }
 
 /// #1672 — mark the running context's host call abandoned ([`Decision::Abandon`]): its unwind
@@ -14155,6 +14305,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // resumes on its own error path (no trap, no kill; cancellation is a value).
                 let top = v.frames.len() - 1;
                 v.frames[top].vals.push(Reg::from_i64(status));
+            }
+        }
+        // INVARIANTS #8 — a live call's reply, laid out for this call: every value it defines, or the
+        // trap of a reply the call could not take. A page fault's is its pager's status, read as
+        // `CapResult` reads it.
+        Some(Pending::Reply { out, sig }) => {
+            let slots = out?;
+            if v.page_fault.take().is_some() {
+                if slots.first().copied().unwrap_or(0) < 0 {
+                    return Err(Trap::MemoryFault);
+                }
+            } else {
+                let top = v.frames.len() - 1;
+                v.frames[top]
+                    .vals
+                    .extend(result_regs(&slots, sig.results()));
             }
         }
         Some(Pending::Abandoned) => {
@@ -15169,6 +15335,100 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     continue 'frames;
                 }};
             }
+            // §3.6 slices 3–4, INVARIANTS #8 — a call through a live offer, from `call.cap`,
+            // `call.import` or `call.sym`: enqueue it on `$callee`'s queue (op `$op` of export
+            // `$export`), its handles granted into the callee ([`issue_live_call`]), and finish it
+            // with the reply its signature `$sig` declares ([`ReplyTo::complete`]). The reply is
+            // taken at once when direct handoff serves the call inline; otherwise the call parks
+            // until it lands — a fiber alone, the root with its vCPU. A full queue is the call's
+            // failure, `-EAGAIN`: probeable backpressure, never a trap, for an op that can carry it.
+            macro_rules! live_call {
+                ($target:expr, $op:expr, $argv:expr, $sig:expr) => {{
+                    let target: LiveTarget = $target;
+                    let op: u32 = $op;
+                    let csig = call_sig(&cur_types, $sig);
+                    // INVARIANTS #8: the op's own signature, not the call site's, says which
+                    // slots are handles.
+                    let sig = target.sig(op, csig.params.len(), csig.results.len())?;
+                    let (ticket, callee_id) = issue_live_call(
+                        host,
+                        *durable_sp_ctx,
+                        &target.callee,
+                        target.export,
+                        op,
+                        $argv,
+                        sig.params(),
+                    )?;
+                    let to = ReplyTo {
+                        sig,
+                        caller: Arc::clone(host),
+                    };
+                    let callee = target.callee;
+                    let Some(t) = ticket else {
+                        let slots = to.fail(EAGAIN)?;
+                        frames[top].vals.extend(result_regs(&slots, to.sig.results()));
+                        continue;
+                    };
+                    // CALLS.md 4d — direct handoff (real scheduler only): if enabled and the
+                    // provider's own serve loop is parked at `svc.wait`, donate this thread to serve
+                    // the just-enqueued dispatch inline ([`dispatch`] runs it to its next
+                    // park/finish and re-files it) instead of waking a worker and parking. If it
+                    // serves to completion the reply is stashed in `svc_results` (no ticket-waiter
+                    // is registered yet) — take it and continue. If the handler parks mid-handoff
+                    // (no reply) or the provider is ineligible, fall through to the enqueue+wake+park
+                    // path on the same ticket `t` (4d.2: the handler completes later and replies
+                    // via `t`).
+                    if let SchedRef::Real(sr) = sched {
+                        if sr.handoff {
+                            if let Some(provider) = sr.take_parked_serve_loop(callee_id as usize) {
+                                dispatch(sr, provider);
+                                let served = callee.lock_unpoisoned().svc_results.remove(&t);
+                                if let Some(r) = served {
+                                    let slots = to.complete(r, &callee)?;
+                                    let regs = result_regs(&slots, to.sig.results());
+                                    frames[top].vals.extend(regs);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    sched.svc_wake(callee_id as usize);
+                    if *cur != ROOT_FIBER {
+                        if let SchedRef::Real(sr) = sched {
+                            let regc = Arc::clone(registry);
+                            let calleec = Arc::clone(&callee);
+                            let svck = domain.id;
+                            let toc = to.clone();
+                            fiber_park!(|slot: usize| {
+                                let mut sg = sr.lock();
+                                // D37 death-is-revocation (§12 teardown, owner 2026-07-24): a
+                                // callee already torn down never replies — complete now with the
+                                // probeable errno instead of parking through a dead domain.
+                                if sg.dead.contains_key(&(callee_id as usize)) {
+                                    drop(sg);
+                                    regc.wake_reply(slot, toc.fail(CAP_REVOKED), &toc.sig);
+                                } else {
+                                    sg.ticket_waiters.insert(
+                                        (callee_id as usize, t),
+                                        (Waiter::fiber(Arc::clone(&regc), slot, svck), toc.clone()),
+                                    );
+                                    drop(sg);
+                                    let early = calleec.lock_unpoisoned().svc_results.remove(&t);
+                                    if let Some(r) = early {
+                                        let out = toc.complete(r, &calleec);
+                                        regc.wake_reply(slot, out, &toc.sig);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    return Ok(Inner::Park(Blocked::CapReply {
+                        ticket: t,
+                        callee,
+                        to,
+                    }));
+                }};
+            }
             // #1952 — a pipe read or write that must wait parks the **calling fiber**, with its op
             // rewound so the wake re-executes it. Fiber 0 parks its vCPU (`Blocked::PipeRead` /
             // `PipeWrite`); any other fiber parks alone, in the pipe's waiters, and its resumer runs
@@ -16052,9 +16312,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                     // The serve frame back in control after a handler switch: the fiber exit
                     // paths pushed `(status, value)` onto this frame — pop them and settle
-                    // that dispatch before the rewound op runs the machine again.
+                    // that dispatch before the rewound op runs the machine again. Its reply is
+                    // every result the handler returned ([`ServeRun::results`]), not the one value.
                     if let Some(run) = serve_run.take() {
-                        let value = frames[top].vals.pop().ok_or(Trap::Malformed)?.i64();
+                        frames[top].vals.pop().ok_or(Trap::Malformed)?;
                         let status = frames[top].vals.pop().ok_or(Trap::Malformed)?.i32();
                         match status {
                             FIBER_RETURNED => {
@@ -16067,13 +16328,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // dispatch still counts as served.
                                 if !run.replied {
                                     // #1862: a page request's bytes move now, from this serving
-                                    // vCPU's window, before the reply can wake the child.
-                                    let value = host.lock_unpoisoned().settle_page(
+                                    // vCPU's window, before the reply can wake the child. Its
+                                    // status is the handler's one result.
+                                    let mut results = run.results;
+                                    if let Some(first) = results.first_mut() {
+                                        *first = host.lock_unpoisoned().settle_page(
+                                            run.ticket,
+                                            *first,
+                                            mem.as_ref().map(|m| m as _),
+                                        );
+                                    }
+                                    sched.cap_reply_or_stash(
                                         run.ticket,
-                                        value,
-                                        mem.as_ref().map(|m| m as _),
+                                        Reply::Results(results),
+                                        host,
                                     );
-                                    sched.cap_reply_or_stash(run.ticket, value, host);
                                 }
                                 *serve_count += 1;
                             }
@@ -16112,6 +16381,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 ticket: $ticket,
                                 serve_cur: *cur,
                                 replied: false,
+                                results: Vec::new(),
                             });
                             frames[top].inst -= 1;
                             let parked = std::mem::take(frames);
@@ -16200,7 +16470,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         };
                         let params = &funcs.get(fidx as usize).ok_or(Trap::CapFault)?.params;
                         if d.args.len() != params.len() {
-                            sched.cap_reply_or_stash(d.ticket, EINVAL, host);
+                            sched.cap_reply_or_stash(d.ticket, Reply::Failed(EINVAL), host);
                             continue;
                         }
                         let child_vals: Vec<Reg> = d
@@ -16217,7 +16487,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         {
                             Ok(h_) => h_,
                             Err(_) => {
-                                sched.cap_reply_or_stash(d.ticket, EAGAIN, host);
+                                sched.cap_reply_or_stash(d.ticket, Reply::Failed(EAGAIN), host);
                                 continue;
                             }
                         };
@@ -16315,7 +16585,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // Explicit mode: the promised reply. Pid mode: -EAGAIN (POSIX
                                     // fork failure), to caller and handler alike.
                                     let fallback = reply_orig.unwrap_or(EAGAIN);
-                                    sched.cap_reply_or_stash(ticket, fallback, host);
+                                    sched.cap_reply_or_stash(
+                                        ticket,
+                                        Reply::Results(vec![fallback]),
+                                        host,
+                                    );
                                     reply_orig.map_or(EAGAIN, |_| 0)
                                 }
                             }
@@ -16488,83 +16762,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let hg = host.lock_unpoisoned();
                         hg.live_impl_of(h, *type_id)
                     };
-                    if let Some((callee, export)) = live {
-                        let (ticket, callee_id) =
-                            issue_live_call(host, *durable_sp_ctx, &callee, export, *op, argv);
-                        match ticket {
-                            Some(t) => {
-                                // CALLS.md 4d — direct handoff (real scheduler only): if enabled and
-                                // the provider's own serve loop is parked at `svc.wait`, donate this
-                                // thread to serve the just-enqueued dispatch inline ([`dispatch`]
-                                // runs it to its next park/finish and re-files it) instead of waking a
-                                // worker and parking. If it serves to completion the reply is stashed
-                                // in `svc_results` (no ticket-waiter is registered yet) — take it and
-                                // continue. If the handler parks mid-handoff (no reply) or the
-                                // provider is ineligible, fall through to the unchanged
-                                // enqueue+wake+park path on the same ticket `t` (4d.2: the handler
-                                // completes later and replies via `t`).
-                                if let SchedRef::Real(sr) = sched {
-                                    if sr.handoff {
-                                        if let Some(provider) =
-                                            sr.take_parked_serve_loop(callee_id as usize)
-                                        {
-                                            dispatch(sr, provider);
-                                            let served =
-                                                callee.lock_unpoisoned().svc_results.remove(&t);
-                                            if let Some(rv) = served {
-                                                push_results(
-                                                    &mut frames[top].vals,
-                                                    &[rv],
-                                                    &call_sig(&cur_types, *sig).results,
-                                                );
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
-                                sched.svc_wake(callee_id as usize);
-                                if *cur != ROOT_FIBER {
-                                    if let SchedRef::Real(sr) = sched {
-                                        let regc = Arc::clone(registry);
-                                        let calleec = Arc::clone(&callee);
-                                        let svck = domain.id;
-                                        fiber_park!(|slot: usize| {
-                                            let mut sg = sr.lock();
-                                            // D37 death-is-revocation (§12 teardown, owner
-                                            // 2026-07-24): a callee already torn down never
-                                            // replies — complete now with the probeable errno
-                                            // instead of parking through a dead domain.
-                                            if sg.dead.contains_key(&(callee_id as usize)) {
-                                                drop(sg);
-                                                regc.wake_blocked(slot, Reg::from_i64(CAP_REVOKED));
-                                            } else {
-                                                sg.ticket_waiters.insert(
-                                                    (callee_id as usize, t),
-                                                    Waiter::fiber(Arc::clone(&regc), slot, svck),
-                                                );
-                                                drop(sg);
-                                                let early = calleec
-                                                    .lock_unpoisoned()
-                                                    .svc_results
-                                                    .remove(&t);
-                                                if let Some(r) = early {
-                                                    regc.wake_blocked(slot, Reg::from_i64(r));
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                                return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
-                            }
-                            None => {
-                                push_results(
-                                    &mut frames[top].vals,
-                                    &[EAGAIN],
-                                    &call_sig(&cur_types, *sig).results,
-                                );
-                                continue;
-                            }
-                        }
+                    if let Some(target) = live {
+                        live_call!(target, *op, argv, *sig);
                     }
                     // CALLS.md increment 3 (slice 1): an **instanced** offer runs its sub-run with
                     // the caller powerbox lock narrowed to the two `cap`-slot translation edges —
@@ -16616,8 +16815,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let svck = hg.domain_id() as usize;
                         drop(hg);
                         if call_sig(&cur_types, *sig).results.len() > 1 {
-                            // Parkable ops carry a single-slot scalar reply (invariant 8) — a
-                            // wider declared signature is a registration bug, fail-closed. Checked
+                            // A punted job answers one scalar ([`OffloadWork`]) — a wider
+                            // declared signature is a registration bug, fail-closed. Checked
                             // BEFORE any park: a fault after the vCPU is filed is unrecoverable.
                             comps.withdraw(id);
                             return Err(Trap::CapFault);
@@ -16632,7 +16831,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // callers keep the degenerate wait below (`freeze_drive` fails closed on
                         // any unwoken cap park — the FIBER_PARK.md non-goal); the explorer keeps
                         // whole-vCPU waits (the slice-5a `SchedRef::Real` gate); the single-i64
-                        // gate matches the wake's one pushed reg (invariant 8). An animated
+                        // gate matches the wake's one pushed reg ([`OffloadWork`]). An animated
                         // offer handler that reaches this park rides `fiber_park!`'s CALLS-4b
                         // promotion branch instead — the dispatch parks, never the domain.
                         // Until F2/F3, the fast backends still block inline here — the
@@ -16838,89 +17037,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let hg = host.lock_unpoisoned();
                         hg.import_live_target(*import)
                     };
-                    if let Some((callee, export, base_op)) = live {
-                        let (ticket, callee_id) = issue_live_call(
-                            host,
-                            *durable_sp_ctx,
-                            &callee,
-                            export,
-                            base_op + *op,
-                            argv,
-                        );
-                        match ticket {
-                            Some(t) => {
-                                // CALLS.md 4d — direct handoff (real scheduler only): if enabled and
-                                // the provider's own serve loop is parked at `svc.wait`, donate this
-                                // thread to serve the just-enqueued dispatch inline ([`dispatch`]
-                                // runs it to its next park/finish and re-files it) instead of waking a
-                                // worker and parking. If it serves to completion the reply is stashed
-                                // in `svc_results` (no ticket-waiter is registered yet) — take it and
-                                // continue. If the handler parks mid-handoff (no reply) or the
-                                // provider is ineligible, fall through to the unchanged
-                                // enqueue+wake+park path on the same ticket `t` (4d.2: the handler
-                                // completes later and replies via `t`).
-                                if let SchedRef::Real(sr) = sched {
-                                    if sr.handoff {
-                                        if let Some(provider) =
-                                            sr.take_parked_serve_loop(callee_id as usize)
-                                        {
-                                            dispatch(sr, provider);
-                                            let served =
-                                                callee.lock_unpoisoned().svc_results.remove(&t);
-                                            if let Some(rv) = served {
-                                                push_results(
-                                                    &mut frames[top].vals,
-                                                    &[rv],
-                                                    &call_sig(&cur_types, *sig).results,
-                                                );
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
-                                sched.svc_wake(callee_id as usize);
-                                if *cur != ROOT_FIBER {
-                                    if let SchedRef::Real(sr) = sched {
-                                        let regc = Arc::clone(registry);
-                                        let calleec = Arc::clone(&callee);
-                                        let svck = domain.id;
-                                        fiber_park!(|slot: usize| {
-                                            let mut sg = sr.lock();
-                                            // D37 death-is-revocation (§12 teardown, owner
-                                            // 2026-07-24): a callee already torn down never
-                                            // replies — complete now with the probeable errno
-                                            // instead of parking through a dead domain.
-                                            if sg.dead.contains_key(&(callee_id as usize)) {
-                                                drop(sg);
-                                                regc.wake_blocked(slot, Reg::from_i64(CAP_REVOKED));
-                                            } else {
-                                                sg.ticket_waiters.insert(
-                                                    (callee_id as usize, t),
-                                                    Waiter::fiber(Arc::clone(&regc), slot, svck),
-                                                );
-                                                drop(sg);
-                                                let early = calleec
-                                                    .lock_unpoisoned()
-                                                    .svc_results
-                                                    .remove(&t);
-                                                if let Some(r) = early {
-                                                    regc.wake_blocked(slot, Reg::from_i64(r));
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                                return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
-                            }
-                            None => {
-                                push_results(
-                                    &mut frames[top].vals,
-                                    &[EAGAIN],
-                                    &call_sig(&cur_types, *sig).results,
-                                );
-                                continue;
-                            }
-                        }
+                    if let Some((target, base_op)) = live {
+                        live_call!(target, base_op + *op, argv, *sig);
                     }
                     // CALLS.md increment 3 (slice 1): an instanced offer bound to this slot runs
                     // with the narrowed powerbox lock (see the `call.cap` arm). Probe reproduces the
@@ -17023,79 +17141,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let hg = host.lock_unpoisoned();
                         hg.import_live_target(*import)
                     };
-                    if let Some((callee, export, base_op)) = live {
-                        let (ticket, callee_id) =
-                            issue_live_call(host, *durable_sp_ctx, &callee, export, base_op, argv);
-                        match ticket {
-                            Some(t) => {
-                                // CALLS.md 4d — direct handoff (real scheduler only): if enabled and
-                                // the provider's own serve loop is parked at `svc.wait`, donate this
-                                // thread to serve the just-enqueued dispatch inline ([`dispatch`]
-                                // runs it to its next park/finish and re-files it) instead of waking a
-                                // worker and parking. If it serves to completion the reply is stashed
-                                // in `svc_results` (no ticket-waiter is registered yet) — take it and
-                                // continue. If the handler parks mid-handoff (no reply) or the
-                                // provider is ineligible, fall through to the unchanged
-                                // enqueue+wake+park path on the same ticket `t` (4d.2: the handler
-                                // completes later and replies via `t`).
-                                if let SchedRef::Real(sr) = sched {
-                                    if sr.handoff {
-                                        if let Some(provider) =
-                                            sr.take_parked_serve_loop(callee_id as usize)
-                                        {
-                                            dispatch(sr, provider);
-                                            let served =
-                                                callee.lock_unpoisoned().svc_results.remove(&t);
-                                            if let Some(rv) = served {
-                                                push_results(
-                                                    &mut frames[top].vals,
-                                                    &[rv],
-                                                    &call_sig(&cur_types, *sig).results,
-                                                );
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
-                                sched.svc_wake(callee_id as usize);
-                                if *cur != ROOT_FIBER {
-                                    if let SchedRef::Real(sr) = sched {
-                                        let regc = Arc::clone(registry);
-                                        let calleec = Arc::clone(&callee);
-                                        let svck = domain.id;
-                                        fiber_park!(|slot: usize| {
-                                            let mut sg = sr.lock();
-                                            if sg.dead.contains_key(&(callee_id as usize)) {
-                                                drop(sg);
-                                                regc.wake_blocked(slot, Reg::from_i64(CAP_REVOKED));
-                                            } else {
-                                                sg.ticket_waiters.insert(
-                                                    (callee_id as usize, t),
-                                                    Waiter::fiber(Arc::clone(&regc), slot, svck),
-                                                );
-                                                drop(sg);
-                                                let early = calleec
-                                                    .lock_unpoisoned()
-                                                    .svc_results
-                                                    .remove(&t);
-                                                if let Some(r) = early {
-                                                    regc.wake_blocked(slot, Reg::from_i64(r));
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                                return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
-                            }
-                            None => {
-                                push_results(
-                                    &mut frames[top].vals,
-                                    &[EAGAIN],
-                                    &call_sig(&cur_types, *sig).results,
-                                );
-                                continue;
-                            }
-                        }
+                    if let Some((target, base_op)) = live {
+                        live_call!(target, base_op, argv, *sig);
                     }
                     // CALLS.md increment 3 (slice 1): a symbolic slot bound to an instanced offer
                     // runs with the narrowed powerbox lock. CallSym is "a flat call.import (op 0)",
@@ -18465,6 +18512,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         } else {
                             FIBER_RETURNED
                         };
+                        // INVARIANTS #8 — the serve loop's running handler returned: keep every
+                        // result for its dispatch's reply ([`ServeRun::results`]).
+                        if let Some(run) = serve_run.as_mut().filter(|r| r.slot == leaving) {
+                            let types = popped
+                                .as_ref()
+                                .and_then(|p| fs.get(p.func as usize))
+                                .map_or(&[][..], |f| &f.results[..]);
+                            run.results = ret_buf
+                                .iter()
+                                .zip(types)
+                                .map(|(r, ty)| val_to_slot(r.to_value(*ty)))
+                                .collect();
+                        }
                         frames[rtop].vals.push(Reg::from_i32(status));
                         frames[rtop]
                             .vals
@@ -23305,8 +23365,9 @@ impl ForkedProc {
 /// §12 parking-on-blocking — a punted blocking op: a **self-contained** scalar job the offload
 /// pool runs off the vCPU thread. Deliberately narrow (the SQE discipline, kept): it captures
 /// what it needs at punt time, sees **no window and no `Host`**, and returns exactly one `i64`
-/// (invariant 8's single-slot scalar reply; errors ride negative errnos, never traps — a pool
-/// job has nothing to forge).
+/// (errors ride negative errnos, never traps — a pool job has nothing to forge). It is a call into
+/// the host, not a domain, so INVARIANTS #8's reply shape is not its: one scalar is this
+/// transport's own bound.
 pub type OffloadWork = Box<dyn FnOnce() -> i64 + Send + 'static>;
 
 /// An **offloadable** handler's per-call decision (the io_uring try-nonblocking model): the fast
@@ -23424,7 +23485,7 @@ pub enum ProcHandler {
     /// §12 parking-on-blocking — decides per call ([`OffloadOutcome`], the io_uring
     /// try-nonblocking model): completes inline, or punts a self-contained job to the offload pool
     /// or to the embedder. It sees no window and no minter, since a punted job outlives the dispatch,
-    /// and a punted call's declared signature carries at most one result (invariant 8).
+    /// and a punted call's declared signature carries at most one result ([`OffloadWork`]).
     Offloadable(OffloadHostProc),
     /// #1954 — [`Self::Offloadable`], declared to leave every call to the embedder
     /// ([`OffloadOutcome::Host`]): a call parks without needing the caller's frames
@@ -24287,20 +24348,20 @@ struct OfferParked {
 /// context) that a caller refuses fail-closed rather than self-deadlocks on.
 #[allow(clippy::type_complexity)]
 fn lock_host_pair<'a>(
-    a: &'a Arc<Mutex<Host>>,
-    b: &'a Arc<Mutex<Host>>,
+    a: &'a Mutex<Host>,
+    b: &'a Mutex<Host>,
 ) -> Option<(
     std::sync::MutexGuard<'a, Host>,
     std::sync::MutexGuard<'a, Host>,
 )> {
-    if Arc::ptr_eq(a, b) {
+    if std::ptr::eq(a, b) {
         return None;
     }
     let unpoison = |r: std::sync::LockResult<std::sync::MutexGuard<'a, Host>>| match r {
         Ok(g) => g,
         Err(e) => e.into_inner(),
     };
-    if (Arc::as_ptr(a) as usize) < (Arc::as_ptr(b) as usize) {
+    if (a as *const Mutex<Host> as usize) < (b as *const Mutex<Host> as usize) {
         let ga = unpoison(a.lock());
         let gb = unpoison(b.lock());
         Some((ga, gb))
@@ -24344,6 +24405,175 @@ fn translate_cap_slots(
         }
     }
     Ok(())
+}
+
+/// INVARIANTS #8 — what a call through a live offer (a call queued into another running domain)
+/// answers: the handler's results, or a failure of the transport. The caller lays it out by its
+/// own call's signature ([`complete_call`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reply {
+    /// The handler returned: its results as slots, any handle among them still the callee's.
+    Results(Vec<i64>),
+    /// The transport failed — a full queue, a refused dispatch, a callee that ended unserved: a
+    /// negative errno.
+    Failed(i64),
+}
+
+impl Reply {
+    /// The reply as one status, for a call whose op answers one integer (a pager's `page`): its first
+    /// result, or the failure's errno.
+    pub fn status(&self) -> i64 {
+        match self {
+            Reply::Results(r) => r.first().copied().unwrap_or(0),
+            Reply::Failed(errno) => *errno,
+        }
+    }
+}
+
+/// INVARIANTS #8 — where a call through a live offer goes: the callee's cell, the export it serves,
+/// and the offer's interface, whose op signatures decide which of a call's slots are handles
+/// ([`LiveTarget::sig`]).
+#[derive(Clone)]
+pub struct LiveTarget {
+    pub callee: Arc<Mutex<Host>>,
+    pub export: u32,
+    sigs: Arc<[FuncType]>,
+}
+
+impl LiveTarget {
+    /// Op `op`'s signature, as the offer's interface declares it, for a call of `n_params` arguments
+    /// and `n_results` results. It decides which slots are handles and how a failure is laid out,
+    /// never the call site's claim: a caller that declared an integer result a `cap` would otherwise
+    /// take the callee's handle of that number. An op the interface lacks, or a call of another
+    /// arity, is `CapFault`, as at the instanced boundary.
+    pub fn sig(&self, op: u32, n_params: usize, n_results: usize) -> Result<OpSig, Trap> {
+        let op = op as usize;
+        self.sigs
+            .get(op)
+            .filter(|s| s.params.len() == n_params && s.results.len() == n_results)
+            .ok_or(Trap::CapFault)?;
+        Ok(OpSig {
+            sigs: Arc::clone(&self.sigs),
+            op,
+        })
+    }
+}
+
+/// INVARIANTS #8 — one op's signature among an offer interface's, held by reference rather than
+/// copied, so a live call carries it for a reference count ([`LiveTarget::sig`]).
+#[derive(Clone)]
+pub struct OpSig {
+    sigs: Arc<[FuncType]>,
+    /// In range: [`LiveTarget::sig`] checked it, and `sigs` never changes.
+    op: usize,
+}
+
+impl OpSig {
+    /// A pager's `page`, `(i64) -> (i64)` ([`Host::has_pager_export`]): a page fault's reply is the
+    /// page's status.
+    fn page() -> OpSig {
+        static PAGE: std::sync::LazyLock<Arc<[FuncType]>> = std::sync::LazyLock::new(|| {
+            Arc::from([FuncType {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+            }])
+        });
+        OpSig {
+            sigs: Arc::clone(&PAGE),
+            op: 0,
+        }
+    }
+
+    pub fn params(&self) -> &[ValType] {
+        &self.sigs[self.op].params
+    }
+
+    pub fn results(&self) -> &[ValType] {
+        &self.sigs[self.op].results
+    }
+}
+
+/// INVARIANTS #8 — the result slots a call through a live offer defines, for an op that declares
+/// `results` ([`LiveTarget::sig`]):
+/// - the handler's results, each handle granted from `callee`'s table into `caller`'s
+///   ([`translate_cap_slots`]; one naming nothing there faults the call, as at the instanced
+///   boundary), or none when the two are one powerbox, whose table they share;
+/// - for a transport failure, its errno in the first result when that is an integer, the rest zero;
+///   a `CapFault` trap when the op cannot carry it, its first result being no integer or absent.
+///
+/// A count other than the declared one, which a verified offer never answers, reads as
+/// [`push_results`] reads a host's: zero past the results, the extra dropped.
+pub fn complete_call(
+    reply: Reply,
+    results: &[ValType],
+    callee: &Mutex<Host>,
+    caller: &mut CallerHost,
+) -> Result<Vec<i64>, Trap> {
+    match reply {
+        Reply::Failed(errno) => failed_slots(errno, results),
+        Reply::Results(mut slots) => {
+            slots.resize(results.len(), 0);
+            if results.contains(&ValType::Cap) {
+                caller.with_callee(callee, |hg, cg| match cg {
+                    Some(cg) => translate_cap_slots(cg, hg, results, &mut slots),
+                    None => Ok(()),
+                })?;
+            }
+            Ok(slots)
+        }
+    }
+}
+
+/// INVARIANTS #8 — a transport failure's errno as the results of a call whose op declares `results`:
+/// in the first when it is an integer, the rest zero; a `CapFault` trap when it is not, or is absent.
+pub fn failed_slots(errno: i64, results: &[ValType]) -> Result<Vec<i64>, Trap> {
+    match results.first() {
+        Some(ValType::I32 | ValType::I64) => {
+            let mut slots = vec![0; results.len()];
+            slots[0] = errno;
+            Ok(slots)
+        }
+        _ => Err(Trap::CapFault),
+    }
+}
+
+/// INVARIANTS #8 — a caller parked on a live call's reply ([`Sched::ticket_waiters`]): its op's
+/// signature, and the powerbox the call was made from, where a handle in the reply is granted.
+#[derive(Clone)]
+struct ReplyTo {
+    sig: OpSig,
+    caller: Arc<Mutex<Host>>,
+}
+
+impl ReplyTo {
+    /// Lay `reply`, answered by `callee`, out for this caller ([`complete_call`]): the slots of the
+    /// values its call defines.
+    fn complete(&self, reply: Reply, callee: &Arc<Mutex<Host>>) -> Result<Vec<i64>, Trap> {
+        let caller = &mut CallerHost::Cell(&self.caller);
+        complete_call(reply, self.sig.results(), callee, caller)
+    }
+
+    /// [`Self::complete`] for a transport failure, which carries no handle and so needs no callee.
+    fn fail(&self, errno: i64) -> Result<Vec<i64>, Trap> {
+        failed_slots(errno, self.sig.results())
+    }
+}
+
+/// INVARIANTS #8 — hand a live call's laid-out reply ([`ReplyTo::complete`]) to the caller parked on
+/// it, `to`: a vCPU resumes with it ([`Pending::Reply`]), a fiber is woken with it
+/// ([`FiberRegistry::wake_reply`]). Whether a worker needs waking.
+fn deliver_reply(s: &mut Sched, waiter: Waiter, to: ReplyTo, out: Result<Vec<i64>, Trap>) -> bool {
+    match waiter {
+        Waiter::VCpu(mut v) => {
+            v.pending = Some(Pending::Reply { out, sig: to.sig });
+            s.runnable.push_back(v);
+            true
+        }
+        Waiter::Fiber { reg, slot, svc, .. } => {
+            reg.wake_reply(slot, out, &to.sig);
+            svc_wake_locked(s, svc)
+        }
+    }
 }
 
 // The `Host` *is* the region minter — the narrow authority a `HostProcRegion` handler is handed. It
@@ -25008,8 +25238,9 @@ pub struct Host {
     /// replies to`. The handler rides as a fiber; this is its reply linkage, which rides the serve
     /// section, and which the thaw's serve loop adopts to resume it.
     frozen_handlers: BTreeMap<u32, u64>,
-    /// Completion cells for served dispatches, keyed by ticket ([`Host::svc_result`] drains).
-    svc_results: BTreeMap<u64, i64>,
+    /// Completion cells for served dispatches, keyed by ticket ([`Host::svc_result`] drains): each
+    /// reply a caller has not taken yet (INVARIANTS #8).
+    svc_results: BTreeMap<u64, Reply>,
     /// §2.2 / #1862 — where each in-flight `page(addr)` request on this domain lands, by ticket:
     /// filed with the request ([`Host::request_page`]), taken at its settle
     /// ([`Host::settle_page`]) or dropped by an error reply that settles nothing. Never cut data:
@@ -30201,7 +30432,7 @@ impl Host {
     /// or the target isn't a well-formed offer op of the registered self module. Embedder-side
     /// this slice; a cross-domain caller's enqueue is the §3.6 caller-parking slice.
     pub fn svc_enqueue(&mut self, export: u32, op: u32, args: Vec<i64>) -> Option<u64> {
-        if self.svc_queue.len() >= SVC_QUEUE_CAP || self.svc_handler_func(export, op).is_none() {
+        if !self.svc_admits(export, op) {
             return None;
         }
         let ticket = self.svc_next_ticket;
@@ -30213,6 +30444,12 @@ impl Host {
             ticket,
         });
         Some(ticket)
+    }
+
+    /// Whether [`Host::svc_enqueue`] would take a dispatch of op `op` of export `export`: the queue has
+    /// room, and the op is a well-formed offer op of the registered self module.
+    pub(crate) fn svc_admits(&self, export: u32, op: u32) -> bool {
+        self.svc_queue.len() < SVC_QUEUE_CAP && self.svc_handler_func(export, op).is_some()
     }
 
     /// §2.2 / #1862 — enqueue a demand child's `page(addr)` request on pager export `export`, the
@@ -30289,9 +30526,9 @@ impl Host {
         self.jit_paging.clone()
     }
 
-    /// Take a served dispatch's result (first result slot; `0` for a no-result handler).
-    /// `None` while unserved — the completion cell is filled at the `svc.poll` that ran it.
-    pub fn svc_result(&mut self, ticket: u64) -> Option<i64> {
+    /// Take a served dispatch's reply (INVARIANTS #8): the handler's results, or the transport's
+    /// failure. `None` while unserved — the completion cell is filled at the `svc.poll` that ran it.
+    pub fn svc_result(&mut self, ticket: u64) -> Option<Reply> {
         self.svc_results.remove(&ticket)
     }
 
@@ -30299,17 +30536,25 @@ impl Host {
     /// `(queue, completion cells, next ticket)`. Plain data (the §13.2 inventory row
     /// "serialize as-is"); the completion cells come out in ascending-ticket order (the
     /// `BTreeMap` iteration), which is the artifact's canonical order.
-    pub fn svc_state(&self) -> (Vec<SvcDispatch>, Vec<(u64, i64)>, u64) {
+    pub fn svc_state(&self) -> (Vec<SvcDispatch>, Vec<(u64, Reply)>, u64) {
         (
             self.svc_queue.iter().cloned().collect(),
-            self.svc_results.iter().map(|(&t, &v)| (t, v)).collect(),
+            self.svc_results
+                .iter()
+                .map(|(&t, r)| (t, r.clone()))
+                .collect(),
             self.svc_next_ticket,
         )
     }
 
     /// DURABILITY.md §13.4 step 3 — restore this domain's serve state from a snapshot's
     /// serve section (the inverse of [`Host::svc_state`]). Replaces whatever is present.
-    pub fn set_svc_state(&mut self, queue: Vec<SvcDispatch>, results: Vec<(u64, i64)>, next: u64) {
+    pub fn set_svc_state(
+        &mut self,
+        queue: Vec<SvcDispatch>,
+        results: Vec<(u64, Reply)>,
+        next: u64,
+    ) {
         self.svc_queue = queue.into();
         self.svc_results = results.into_iter().collect();
         self.svc_next_ticket = next;
@@ -30378,11 +30623,11 @@ impl Host {
             .map(|d| (d.export, d.op, d.args, d.ticket))
     }
 
-    /// I36 slice 3 — settle ticket `ticket`'s completion cell with `v`: the embedder serve
+    /// I36 slice 3 — settle ticket `ticket`'s completion cell with `reply`: the embedder serve
     /// loop's counterpart of the eval-loop settle (the enqueuer claims it via
     /// [`Host::svc_result`]).
-    pub fn svc_settle(&mut self, ticket: u64, v: i64) {
-        self.svc_results.insert(ticket, v);
+    pub fn svc_settle(&mut self, ticket: u64, reply: Reply) {
+        self.svc_results.insert(ticket, reply);
     }
 
     /// I36 slice 3 — the handler [`FuncIdx`] a queued `(export, op)` dispatch runs, for the
@@ -30628,29 +30873,24 @@ impl Host {
     /// pre-dispatch probe (an ordinarily-bound slot answers `None` and flows to the ordinary
     /// dispatch); the consumer's op offsets from `base_op` (flat/identity mapping this slice —
     /// coverage-remapped grouped bindings ride a later slice).
-    fn import_live_target(&self, i: u32) -> Option<(Arc<Mutex<Host>>, u32, u32)> {
+    fn import_live_target(&self, i: u32) -> Option<(LiveTarget, u32)> {
         let b = self.import_binding(i)?;
         if !b.bound {
             return None;
         }
-        match self.resolve(b.handle, b.type_id) {
-            Ok(Binding::LiveImpl(idx)) => self
-                .live_impls
-                .get(idx as usize)
-                .map(|e| (Arc::clone(&e.callee), e.export, b.op)),
-            _ => None,
-        }
+        Some((self.live_impl_of(b.handle, b.type_id)?, b.op))
     }
 
     /// The live-callee target behind `handle` iff it resolves to a [`Binding::LiveImpl`] of the
     /// right `type_id` — the eval loop's pre-dispatch probe (a non-LiveImpl handle answers
     /// `None` and flows to the ordinary dispatch).
-    pub fn live_impl_of(&self, handle: i32, type_id: u32) -> Option<(Arc<Mutex<Host>>, u32)> {
+    pub fn live_impl_of(&self, handle: i32, type_id: u32) -> Option<LiveTarget> {
         match self.resolve(handle, type_id) {
-            Ok(Binding::LiveImpl(i)) => self
-                .live_impls
-                .get(i as usize)
-                .map(|e| (Arc::clone(&e.callee), e.export)),
+            Ok(Binding::LiveImpl(i)) => self.live_impls.get(i as usize).map(|e| LiveTarget {
+                callee: Arc::clone(&e.callee),
+                export: e.export,
+                sigs: Arc::clone(&e.sigs),
+            }),
             _ => None,
         }
     }
@@ -38208,12 +38448,18 @@ fn val_to_slot(v: Value) -> i64 {
 /// Results past the declared ones are dropped. Every engine defines the same: the Cranelift JIT's
 /// result slots start zeroed, and the bytecode engine zeroes its result registers.
 fn push_results(vals: &mut Vals, results: &[i64], declared: &[ValType]) {
-    vals.extend(
-        declared
-            .iter()
-            .enumerate()
-            .map(|(i, &ty)| Reg::from_value(slot_to_val(ty, results.get(i).copied().unwrap_or(0)))),
-    );
+    vals.extend(result_regs(results, declared));
+}
+
+/// The registers `results` define as `declared` values ([`push_results`]).
+pub(crate) fn result_regs<'a>(
+    results: &'a [i64],
+    declared: &'a [ValType],
+) -> impl Iterator<Item = Reg> + 'a {
+    declared
+        .iter()
+        .enumerate()
+        .map(|(i, &ty)| Reg::from_value(slot_to_val(ty, results.get(i).copied().unwrap_or(0))))
 }
 
 fn slot_to_val(ty: ValType, s: i64) -> Value {
@@ -40507,17 +40753,17 @@ mod orphan_reply_tests {
         let cid = callee.lock().unwrap().domain_id() as usize;
 
         // Live caller (no orphan record): the reply is stashed in the completion cell to claim.
-        sched.cap_reply_or_stash(1, 99, &callee);
+        sched.cap_reply_or_stash(1, Reply::Results(vec![99]), &callee);
         assert_eq!(
             callee.lock().unwrap().svc_result(1),
-            Some(99),
+            Some(Reply::Results(vec![99])),
             "a live caller's reply must be stashed for it to claim"
         );
 
         // Dead caller (ticket 2 recorded as an orphan when it was reaped): the reply is dropped, so
         // nothing accumulates in `svc_results`, and the one-shot orphan record is consumed.
         sched.lock().orphan_tickets.insert((cid, 2));
-        sched.cap_reply_or_stash(2, 42, &callee);
+        sched.cap_reply_or_stash(2, Reply::Results(vec![42]), &callee);
         assert_eq!(
             callee.lock().unwrap().svc_result(2),
             None,
@@ -40531,10 +40777,10 @@ mod orphan_reply_tests {
         // An orphan record for a *different* callee must not affect this one (the key includes the
         // callee domain — two callees can share a ticket number).
         sched.lock().orphan_tickets.insert((cid + 1, 3));
-        sched.cap_reply_or_stash(3, 7, &callee);
+        sched.cap_reply_or_stash(3, Reply::Results(vec![7]), &callee);
         assert_eq!(
             callee.lock().unwrap().svc_result(3),
-            Some(7),
+            Some(Reply::Results(vec![7])),
             "an orphan keyed on a different callee must not drop this callee's live reply"
         );
     }
@@ -40550,9 +40796,16 @@ mod orphan_reply_tests {
         let surviving_callee = dying_key + 1;
         {
             let mut s = sched.lock();
+            let to = ReplyTo {
+                sig: OpSig::page(),
+                caller: Arc::clone(&dying),
+            };
             s.ticket_waiters.insert(
                 (surviving_callee, 5),
-                Waiter::fiber(Arc::new(FiberRegistry::new()), 0, dying_key), // dying domain's parked caller,
+                (
+                    Waiter::fiber(Arc::new(FiberRegistry::new()), 0, dying_key), // dying domain's parked caller,
+                    to,
+                ),
             );
             s.orphan_tickets.insert((dying_key, 9)); // an orphan *for* the dying domain as callee
 

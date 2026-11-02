@@ -2070,8 +2070,9 @@ numbers:
 1. *Registration declares blockingness* (`ProcHandler::Offloadable`, the `HostProcEntry`
    per-entry-powers pattern): the handler decides per call — `Done` inline (the fast case pays
    nothing) or `Offload` a self-contained scalar job (the io_uring try-nonblocking model). Scalars
-   only, **no window access** (the pool never touches the window), single-`i64` replies
-   (invariant 8). The test-only `Blocking` cap is the exerciser.
+   only, **no window access** (the pool never touches the window), single-`i64` replies (the
+   pool's own bound: a call into the host, not into a domain, so not INVARIANTS #8's reply
+   shape). The test-only `Blocking` cap is the exerciser.
 2. *Dispatch gains a third outcome* behind an out-param face (`cap_dispatch_slots_pending` →
    `Pending(completion_id)`, job handed to the offload pool, result posted to `Completions`);
    a call site that cannot park keeps the sync face and runs punts inline — decline-never-diverge
@@ -2266,7 +2267,7 @@ the async-first paragraph above, delivered. Identical on all three engines (inva
   `completion_waiters`; the recheck is `completion_drain` itself (insert-then-drain), so an
   answer that raced the park is delivered, and an animated offer handler's
   punt rides the CALLS-4b promotion branch by construction (its wake key IS `OfferPark`'s
-  resume key). Gates: exactly-one-`i64` reply (the wake pushes one reg — invariant 8),
+  resume key). Gates: exactly-one-`i64` reply (the wake pushes a punted job's one reg),
   non-durable, `SchedRef::Real`.
 - *Bytecode (F2):* the punt surfaces as `Outcome::CapPending` (the `MemoryWait` channel) so
   each driver states its posture; the cooperative `drive` parks `FiberState::CapParked` with

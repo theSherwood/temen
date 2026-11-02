@@ -31,7 +31,7 @@ use temen_durable::{
 };
 use temen_interp::{
     run_capture_reserved_with_host, CapState, FreezeRule, Host, HostProcGrant, ParkSite,
-    ProcHandler, SignalSource, StreamRole, Value,
+    ProcHandler, Reply, SignalSource, StreamRole, Value,
 };
 use temen_ir::{Memory, Module, SpawnRec};
 use temen_jit::JitOutcome;
@@ -872,7 +872,11 @@ block 0 (vx: i64) {
         Ok(1041),
     );
     let t = ticket.lock().unwrap().expect("enqueued");
-    assert_eq!(h.svc_result(t), Some(42), "{site:?}: the handler's reply");
+    assert_eq!(
+        h.svc_result(t),
+        Some(Reply::Results(vec![42])),
+        "{site:?}: the handler's reply"
+    );
 }
 
 /// `svc.wait` beside a sibling — [`svc`] with a sibling running beside the server, whose countdown
@@ -936,7 +940,11 @@ block 0 (vx: i64) {{
         Ok(1048),
     );
     let t = ticket.lock().unwrap().expect("enqueued");
-    assert_eq!(h.svc_result(t), Some(42), "{site:?}: the handler's reply");
+    assert_eq!(
+        h.svc_result(t),
+        Some(Reply::Results(vec![42])),
+        "{site:?}: the handler's reply"
+    );
 }
 
 /// A live call's reply — thread `T` calls `bump(41)` on a detached child `C` that serves one

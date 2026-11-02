@@ -9010,6 +9010,20 @@ impl DispatchParks {
     }
 }
 
+/// INVARIANTS #8 — a call through a live offer, as the task making it stops ([`Outcome::LiveCall`]):
+/// op `op` of the callee's export `export` with its arguments, the op's own signature
+/// ([`super::LiveTarget::sig`]), and the register its results land from. The driver enqueues it
+/// ([`SchedCore::on_stop`]) once the step is over and no powerbox is locked, so it takes the
+/// caller's and the callee's as every engine's live call does ([`super::enqueue_live_call`]).
+struct LiveCall {
+    callee: std::sync::Arc<std::sync::Mutex<Host>>,
+    export: u32,
+    op: u32,
+    args: Vec<i64>,
+    sig: super::OpSig,
+    dst: u32,
+}
+
 /// Why [`Vm::resume`] returned. `Done`/`Suspended` are the run-to-completion + budget cases; the
 /// `Cont*`/`Suspend` cases are §12 fiber switches handled within [`step_vcpu`] (a vCPU's own fiber
 /// registry); the `Thread*`/`Memory*` cases are §12 multi-vCPU events handled by the [`drive`]
@@ -9086,15 +9100,11 @@ enum Outcome {
         handle: i32,
         dst: u32,
     },
-    /// §3.6 (I36 slice 2) — a caller's `call.cap` through a live-callee offer. The dispatch is
-    /// already enqueued on the callee (the op exec holds the callee `Arc`); the driver parks this
-    /// task on `ticket` until the callee's serve loop settles the completion cell, then delivers
-    /// the reply to `dst`. The cursor is persisted PAST the op (the reply is the call's result).
-    LiveCall {
-        ticket: u64,
-        callee: std::sync::Arc<std::sync::Mutex<Host>>,
-        dst: u32,
-    },
+    /// §3.6 (I36 slice 2) — a caller's `call.cap` through a live-callee offer ([`LiveCall`]). The
+    /// driver enqueues it on the callee and parks this task until the callee's serve loop settles
+    /// its ticket, then delivers the reply from `dst`. The cursor is persisted PAST the op (the
+    /// reply is the call's result).
+    LiveCall(LiveCall),
     /// §3.6 (I36 slice 2) — `svc.wait` with an empty queue and no progress: park this task on its
     /// domain until a caller's enqueue re-admits it. The cursor is persisted AT the op, so the
     /// wake re-executes the whole serve drain (the tree-walker's rewound park).
@@ -10916,13 +10926,8 @@ enum VcpuStop {
     BlockOnFiber {
         fiber: usize,
     },
-    /// §3.6 (I36 slice 2): park this task on a live-call `ticket` against `callee` (see
-    /// [`Outcome::LiveCall`] — the enqueue already happened in the op exec).
-    LiveCall {
-        ticket: u64,
-        callee: std::sync::Arc<std::sync::Mutex<Host>>,
-        dst: u32,
-    },
+    /// §3.6 (I36 slice 2): make a live call and park this task on its reply ([`Outcome::LiveCall`]).
+    LiveCall(LiveCall),
     /// F2 (FIBER_PARK.md): a punted offloadable dispatch with an exactly-`i64` reply
     /// ([`Outcome::CapPending`]) — the cooperative driver fiber-parks a punting fiber; every
     /// other driver waits inline on the completion (the I45 posture).
@@ -11109,15 +11114,7 @@ impl Outcome {
             Outcome::ThreadJoin { handle, dst } => VcpuStop::Join { handle, dst },
             // §3.6 (I36 slice 2): the serve/call/offer trio surface straight to the driver. The
             // qualification veto keeps them out of fiber contexts, so no registry state is live.
-            Outcome::LiveCall {
-                ticket,
-                callee,
-                dst,
-            } => VcpuStop::LiveCall {
-                ticket,
-                callee,
-                dst,
-            },
+            Outcome::LiveCall(call) => VcpuStop::LiveCall(call),
             Outcome::SvcWait => VcpuStop::SvcWait,
             Outcome::ChildCtl { child, dst, ctl } => VcpuStop::ChildCtl { child, dst, ctl },
             Outcome::ChildOffer {
@@ -11726,6 +11723,9 @@ enum TaskState {
         ticket: u64,
         callee: std::sync::Arc<std::sync::Mutex<Host>>,
         dst: u32,
+        /// INVARIANTS #8 — its op's signature ([`super::LiveTarget::sig`]), which its reply is laid
+        /// out by.
+        sig: super::OpSig,
     },
     /// §2.2 / #2164 — parked on a page fault: `ticket` is its `page(addr)` request on `pager`, its
     /// spawner's domain. The settle-wake scan claims the reply as it claims a live call's: the page
@@ -12205,6 +12205,23 @@ struct SpawnAsk {
     dst: u32,
 }
 
+/// INVARIANTS #8 — task `ti`'s live call failed with `errno` before a reply: its results, laid out
+/// by what the op declares ([`super::failed_slots`]) from `dst`, or the trap of an op that cannot
+/// carry the errno, which ends the task. The task is runnable either way.
+fn fail_call(
+    tasks: &mut [TaskSlot],
+    domains: &mut [Domain],
+    ti: usize,
+    dst: u32,
+    results: &[ValType],
+    errno: i64,
+) {
+    match super::failed_slots(errno, results) {
+        Ok(slots) => tasks[ti].deliver_from(dst, super::result_regs(&slots, results)),
+        Err(trap) => complete(tasks, domains, ti, Err(trap)),
+    }
+}
+
 /// #1896 — leave task `ti`, whose leaf's call stopped in a bounce, as the stop leaves an
 /// interpreted task: parked in the state the call waits in, or runnable with the process it asked
 /// for, which this answers for the call's [`LeafCall`]. The pump cannot pause for its host inside a
@@ -12509,21 +12526,27 @@ fn settle_wakes(
         else {
             continue;
         };
-        let Some(v) = callee.lock_unpoisoned().svc_results.remove(ticket) else {
+        let Some(reply) = callee.lock_unpoisoned().svc_results.remove(ticket) else {
             continue;
         };
-        match t.state {
-            TaskState::BlockedTicket { dst, .. } => t.deliver(dst, Reg::from_i64(v)),
-            _ if v < 0 => {
-                refused.push(i);
-                continue;
+        match std::mem::replace(&mut t.state, TaskState::Runnable) {
+            // INVARIANTS #8: a live call's reply, laid out by the results its op declares, its
+            // handles granted from the callee into the caller's domain ([`super::complete_call`]).
+            TaskState::BlockedTicket {
+                dst, callee, sig, ..
+            } => {
+                let to = &mut super::CallerHost::Cell(&domains[t.domain].host);
+                match super::complete_call(reply, sig.results(), &callee, to) {
+                    Ok(slots) => t.deliver_from(dst, super::result_regs(&slots, sig.results())),
+                    Err(trap) => refused.push((i, trap)),
+                }
             }
+            _ if reply.status() < 0 => refused.push((i, Trap::MemoryFault)),
             _ => {}
         }
-        t.state = TaskState::Runnable;
     }
-    for i in refused {
-        complete(tasks, domains, i, Err(Trap::MemoryFault));
+    for (i, trap) in refused {
+        complete(tasks, domains, i, Err(trap));
     }
     // #1215 — the default-action TERMINATE, cooperative form (invariant 14). A domain the
     // personality has terminated (a `SIG_DFL` SIGKILL/SIGTERM/SIGINT delivered through the gate,
@@ -13226,9 +13249,9 @@ impl CoopSched {
             // the domain borrow disjoint storage (`tasks` vs `domains`), so the split borrow is
             // sound.
             //
-            // The task's domain cell is locked for its step. Nothing a step runs locks it again:
-            // a task never holds a live offer into its own domain (a self-serve grant lands in the
-            // child only), so a live call always locks another domain's cell.
+            // The task's domain cell is locked for its step. Nothing a step runs locks it again: a
+            // live call, which may be into the task's own domain, stops the step to be made
+            // ([`LiveCall`]).
             let cell = std::sync::Arc::clone(&domains[tasks[ti].domain].host);
             let mut guard = cell.lock_unpoisoned();
             let durable = guard.is_durable();
@@ -13580,31 +13603,51 @@ impl SchedCore {
             Ok(VcpuStop::SvcWait) => {
                 tasks[ti].state = TaskState::BlockedSvc;
             }
-            Ok(VcpuStop::LiveCall {
-                ticket,
-                callee,
-                dst,
-            }) => {
-                // The enqueue already happened in the op exec (holding only the callee's lock).
-                // Wake any svc.wait-parked task of the callee's domain — the tree-walker's
-                // `svc_wake` — then park the caller on its ticket. The callee is a child domain's
-                // domain, or the root's: a child calling back through a self-serve grant (#744).
+            Ok(VcpuStop::LiveCall(call)) => {
+                let LiveCall {
+                    callee,
+                    export,
+                    op,
+                    args,
+                    sig,
+                    dst,
+                } = call;
+                // The callee is a child domain's domain, or the root's: a child calling back
+                // through a self-serve grant (#744).
                 let callee_env = domain_of(domains, &callee);
                 // §12 teardown / D37 death-is-revocation (owner 2026-07-24): a call through an
-                // already-torn-down callee can never be replied — complete with the probeable
-                // errno instead of parking forever (the tree-walker's dead-callee park probe).
+                // already-torn-down callee can never be replied — it fails now with the probeable
+                // errno, enqueuing nothing, instead of parking forever (the tree-walker's dead-callee
+                // park probe).
                 if callee_env.is_some_and(|k| dead_domains.contains(&k)) {
-                    tasks[ti].deliver(dst, Reg::from_i64(super::CAP_REVOKED));
+                    fail_call(tasks, domains, ti, dst, sig.results(), super::CAP_REVOKED);
                     return None;
                 }
-                if let Some(env) = callee_env {
-                    wake_serve_loops(tasks, env);
+                // INVARIANTS #8: its handles are granted into the callee as the queue admits it.
+                let from = &mut super::CallerHost::Cell(&domains[tasks[ti].domain].host);
+                let enqueued =
+                    super::enqueue_live_call(from, &callee, export, op, args, sig.params());
+                match enqueued {
+                    Err(trap) => complete(tasks, domains, ti, Err(trap)),
+                    // A full callee queue is probeable backpressure, the call's failure; the task
+                    // runs on.
+                    Ok((None, _)) => {
+                        fail_call(tasks, domains, ti, dst, sig.results(), super::EAGAIN)
+                    }
+                    // Wake any svc.wait-parked task of the callee's domain — the tree-walker's
+                    // `svc_wake` — then park the caller on its ticket.
+                    Ok((Some(ticket), _)) => {
+                        if let Some(env) = callee_env {
+                            wake_serve_loops(tasks, env);
+                        }
+                        tasks[ti].state = TaskState::BlockedTicket {
+                            ticket,
+                            callee,
+                            dst,
+                            sig,
+                        };
+                    }
                 }
-                tasks[ti].state = TaskState::BlockedTicket {
-                    ticket,
-                    callee,
-                    dst,
-                };
             }
             // §2.2 / #2164 — a demand-paged child's fault, the oracle's `Step::PageFault` in
             // cooperative form: a `page(addr)` request to the pager export on its spawner's domain,
@@ -17846,13 +17889,13 @@ fn teardown_domains(
         if env != 0 {
             let dying = std::sync::Arc::clone(&domains[env].host);
             let mut stranded = Vec::new();
+            let mut unanswered = Vec::new();
             for (i, t) in tasks.iter_mut().enumerate() {
                 match &t.state {
-                    TaskState::BlockedTicket { callee, dst, .. }
-                        if std::sync::Arc::ptr_eq(callee, &dying) =>
-                    {
-                        let dst = *dst;
-                        t.deliver(dst, Reg::from_i64(super::CAP_REVOKED));
+                    TaskState::BlockedTicket {
+                        callee, dst, sig, ..
+                    } if std::sync::Arc::ptr_eq(callee, &dying) => {
+                        unanswered.push((i, *dst, sig.clone()));
                         t.state = TaskState::Runnable;
                     }
                     TaskState::BlockedPage { pager, .. }
@@ -17862,6 +17905,9 @@ fn teardown_domains(
                     }
                     _ => {}
                 }
+            }
+            for (i, dst, sig) in unanswered {
+                fail_call(tasks, domains, i, dst, sig.results(), super::CAP_REVOKED);
             }
             for i in stranded {
                 complete(tasks, domains, i, Err(Trap::MemoryFault));
@@ -18015,13 +18061,31 @@ struct VmRare {
     /// `COPY_PROCENV` memcpy of `top_level` — carry the checkpoint identity with the bytes; bounded
     /// by pruning checkpoints whose `setjmp` activation has returned (`SetJmp` op).
     setjmp_points: std::collections::BTreeMap<u64, ByteSetJmp>,
-    /// §3.6 serve-loop core (I36 slice 1): the in-flight handler's completion ticket and the depth
-    /// of the serve frame that admitted it (`stack.len()` there) — `Some` between admitting a
-    /// handler activation (whose return linkage rewinds into the `SvcPoll` op) and the
-    /// re-execution that settles its result — and the count of dispatches completed by the current
-    /// `svc.poll` activation.
-    serve_ticket: Option<(u64, usize)>,
+    /// §3.6 serve-loop core (I36 slice 1): the in-flight handler ([`Serving`]) — `Some` between
+    /// admitting a handler activation (whose return linkage rewinds into the `SvcPoll` op) and the
+    /// re-execution that settles its results — and the count of dispatches completed by the
+    /// current `svc.poll` activation.
+    serve_ticket: Option<Serving>,
     serve_count: i64,
+}
+
+/// §3.6 — a serve loop's in-flight handler: its dispatch's ticket, the depth of the serve frame that
+/// admitted it (`stack.len()` there), and its function. INVARIANTS #8: its return lays its results
+/// just past its own frame ([`Serving::results_at`]), where they alias neither the frame they are
+/// copied from nor the serve frame, and the serve op settles every one of them.
+#[derive(Clone, Copy, Debug)]
+struct Serving {
+    ticket: u64,
+    depth: usize,
+    func: usize,
+}
+
+impl Serving {
+    /// Where the handler's return lays its results, for a serve frame of program `serve`'s at `base`
+    /// in `c`.
+    fn results_at(&self, c: &Compiled, base: usize, serve: usize) -> usize {
+        base + c.progs[serve].nslots as usize + c.progs[self.func].nslots as usize
+    }
 }
 
 const _: () = assert!(std::mem::size_of::<Vm>() <= 256);
@@ -18275,7 +18339,8 @@ impl Vm {
 
     /// The serve loop's in-flight ticket and the depth of the frame that admitted it.
     fn serve_ticket(&self) -> Option<(u64, usize)> {
-        self.rare.as_ref()?.serve_ticket
+        let s = self.rare.as_ref()?.serve_ticket?;
+        Some((s.ticket, s.depth))
     }
 
     /// #2336 — hold again, past any ceiling, what the `Vm` this copies held ([`RegsRoom`]): a copy
@@ -19299,28 +19364,23 @@ impl Vm {
                         }
                     }
                     // §3.6 (I36 slice 2) — caller-side parking: a call through a live-callee
-                    // offer never reaches the generic dispatch. It enqueues on the callee's
-                    // inbound queue and parks this task until the handler's reply (the
-                    // tree-walker's caller-parking arm, task-level). A full callee queue is
-                    // probeable backpressure (`EAGAIN` as the call's result), never a trap.
-                    if let Some((callee, export)) = host.with(|p| p.live_impl_of(h, *type_id)) {
-                        let t = callee.lock_unpoisoned().svc_enqueue(export, *op, argv);
-                        if let Some(ticket) = t {
-                            self.module = module;
-                            self.cur = cur;
-                            self.base = base;
-                            self.pc = pc + 1;
-                            return Ok(Outcome::LiveCall {
-                                ticket,
-                                callee,
-                                dst: *dst,
-                            });
-                        }
-                        if !results.is_empty() {
-                            self.regs[base + *dst as usize] = Reg::from_i64(super::EAGAIN);
-                        }
-                        pc += 1;
-                        continue;
+                    // offer never reaches the generic dispatch. The task stops to make it, and the
+                    // driver enqueues it on the callee's inbound queue and parks the task until the
+                    // handler's reply (the tree-walker's caller-parking arm, task-level).
+                    if let Some(target) = host.with(|p| p.live_impl_of(h, *type_id)) {
+                        let sig = target.sig(*op, argv.len(), results.len())?;
+                        self.module = module;
+                        self.cur = cur;
+                        self.base = base;
+                        self.pc = pc + 1;
+                        return Ok(Outcome::LiveCall(LiveCall {
+                            callee: target.callee,
+                            export: target.export,
+                            op: *op,
+                            args: argv,
+                            sig,
+                            dst: *dst,
+                        }));
                     }
                     // #2109: the host copies the call's buffers in one go ([`super::SoleMem`]).
                     let mut sole = mem.as_mut().map(super::SoleMem);
@@ -19371,8 +19431,8 @@ impl Vm {
                     // slice-1 inline wait right here; the placeholder `res` is discarded.
                     if let Some(id) = pending_id {
                         if results.len() > 1 {
-                            // Parkable ops carry a single-slot scalar reply (invariant 8) —
-                            // a wider declared signature is a registration bug, fail-closed
+                            // A punted job answers one scalar ([`super::OffloadWork`]) — a
+                            // wider declared signature is a registration bug, fail-closed
                             // BEFORE any park or wait.
                             return Err(Trap::CapFault);
                         }
@@ -19605,13 +19665,23 @@ impl Vm {
                         pc += 1;
                         continue;
                     }
-                    if let Some((t, _)) = self.rare.as_mut().and_then(|r| r.serve_ticket.take()) {
-                        let v = self.regs[base + *dst as usize].i64();
+                    if let Some(s) = self.rare.as_mut().and_then(|r| r.serve_ticket.take()) {
+                        // INVARIANTS #8: the reply is every result the handler returned.
+                        let at = s.results_at(&c, base, cur);
+                        let (_, tys) = c.sigs.get(s.func).ok_or(Trap::Malformed)?;
+                        let mut results: Vec<i64> = (tys.iter().enumerate())
+                            .map(|(i, ty)| super::val_to_slot(self.regs[at + i].to_value(*ty)))
+                            .collect();
                         // #1862, #2164: a page request's bytes move now, from this serving vCPU's
-                        // window, before its child can claim the reply.
+                        // window, before its child can claim the reply. Its status is the
+                        // handler's one result.
                         host.with(|p| {
-                            let v = p.settle_page(t, v, mem.as_ref().map(|m| m as _));
-                            p.svc_results.insert(t, v)
+                            if let Some(first) = results.first_mut() {
+                                *first =
+                                    p.settle_page(s.ticket, *first, mem.as_ref().map(|m| m as _));
+                            }
+                            p.svc_results
+                                .insert(s.ticket, super::Reply::Results(results))
                         });
                         self.rare().serve_count += 1;
                     }
@@ -19648,26 +19718,24 @@ impl Vm {
                         if d.args.len() != params.len() {
                             host.with(|p| {
                                 let v = p.settle_page(d.ticket, super::EINVAL, None);
-                                p.svc_results.insert(d.ticket, v)
+                                p.svc_results.insert(d.ticket, super::Reply::Failed(v))
                             });
                             continue;
                         }
                         let nb = base + c.progs[cur].nslots as usize;
-                        let need = nb + c.progs[fidx].nslots as usize;
-                        self.open_frame(need)?;
+                        let serving = Serving {
+                            ticket: d.ticket,
+                            depth: self.stack.len(),
+                            func: fidx,
+                        };
+                        let at = serving.results_at(&c, base, cur);
+                        let (_, tys) = c.sigs.get(fidx).ok_or(Trap::CapFault)?;
+                        self.open_frame(at + tys.len())?;
                         for (i, (s, ty)) in d.args.iter().zip(params.iter()).enumerate() {
                             self.regs[nb + i] = Reg::from_value(slot_to_val(*ty, *s));
                         }
-                        let depth = self.stack.len();
-                        self.rare().serve_ticket = Some((d.ticket, depth));
-                        self.stack.push((
-                            module,
-                            cur,
-                            base,
-                            pc,
-                            base + *dst as usize,
-                            self.entered,
-                        ));
+                        self.rare().serve_ticket = Some(serving);
+                        self.stack.push((module, cur, base, pc, at, self.entered));
                         self.entered = self.work;
                         cur = fidx;
                         base = nb;

@@ -16,7 +16,7 @@
 mod rec;
 
 use std::sync::Arc;
-use temen_interp::{bytecode, run_with_host, Host, Value};
+use temen_interp::{bytecode, run_with_host, Host, Reply, Value};
 use temen_ir::SpawnRec;
 
 fn module(text: &str) -> Arc<temen_ir::Module> {
@@ -88,7 +88,11 @@ fn two_pollers_split_one_queue_and_their_counts_sum() {
         "the two pollers' served counts sum to the dispatch count, however the race split them"
     );
     for (t, a) in tickets.iter().zip(args) {
-        assert_eq!(host.svc_result(*t), Some(a * 2), "pure handler, exact cell");
+        assert_eq!(
+            host.svc_result(*t),
+            Some(Reply::Results(vec![a * 2])),
+            "pure handler, exact cell"
+        );
     }
 }
 
