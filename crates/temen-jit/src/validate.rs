@@ -3453,9 +3453,25 @@ pub(crate) mod x86 {
     fn vec_reads(op2: u8, p: &Pfx) -> bool {
         match op2 {
             0x10 | 0x28 | 0x2A | 0x2C..=0x2F | 0x51 | 0x54..=0x5F | 0x6E | 0x6F | 0xE6 => true,
+            // Packed-integer arithmetic (SSE2/AVX): the memory operand is a source the op reads
+            // (`padd*`/`psub*`/`pand`/`por`/`pxor`/`pcmp*`/`pmul*`/`pavg*`/`pmin*`/`pmax*`/`psll*`/
+            // `psrl*`/`psad*`/`punpck*`/`pack*`, and `lddqu`). The stores in these rows are excluded
+            // by the gaps: `movq` store `0xD6`, `pmovmskb` `0xD7` (writes a GP reg, no memory),
+            // `movntdq` `0xE7`, and `maskmovdqu` `0xF7`. (`0x7E`/`0x7F` moves are handled above/below.)
+            0x60..=0x6D | 0x74..=0x76 | 0xD0..=0xD5 | 0xD8..=0xDF => true,
+            0xE0..=0xE5 | 0xE8..=0xEF | 0xF0..=0xF6 | 0xF8..=0xFE => true,
             0x7E => p.rep == 0xF3, // movq xmm, xmm/m64; without F3 it stores a GP or xmm value
             _ => false,
         }
+    }
+
+    /// Whether a `0F38`-map instruction only reads its memory operand. Narrow for now — the only such
+    /// form the corpus exercises is `F6` (`mulx`/`adcx`/`adox`), which reads its memory source (and
+    /// writes GP registers, a #2603 PR-4b concern). The rest of the `0F38`/`0F3A` vector maps, and
+    /// the DSL-driven completeness oracle that proves this classification covers every form Cranelift
+    /// can emit, land with the default-deny flip (PR 4b).
+    fn vec_reads_0f38(op: u8) -> bool {
+        op == 0xF6
     }
 
     /// The bytes an SSE or AVX instruction of the 0F map accesses through its memory operand, for the
@@ -3494,13 +3510,22 @@ pub(crate) mod x86 {
                     4
                 }
             } // movd/movq with a GP side
+            // Packed-integer arithmetic reads a packed (16-byte, or 32 under VEX.L) memory source —
+            // the same opcode rows `vec_reads` classifies as reads; its access width bounds the
+            // constant-pool read so it is not flagged as reaching past the function's bytes.
+            (0x60..=0x6D | 0x74..=0x76 | 0xD0..=0xD5 | 0xD8..=0xDF, _) => packed,
+            (0xE0..=0xE5 | 0xE8..=0xEF | 0xF0..=0xF6 | 0xF8..=0xFE, _) => packed,
             _ => 0,
         }
     }
 
     fn decode_0f38(c: &mut Cursor, start: usize, p: &Pfx) -> Option<Decoded> {
-        c.next()?; // opcode in the 0F38 map — all have ModRM, no immediate; XMM-only (no GP write)
-        finish_modrm(c, start, p, 0, Kind::Normal, EffIntent::NoGp)
+        let op = c.next()?; // opcode in the 0F38 map — ModRM, no immediate
+        let d = finish_modrm(c, start, p, 0, Kind::Normal, EffIntent::NoGp)?;
+        // The `F6` forms (`adcx`/`adox`; `mulx` is VEX) read their memory source; marking it
+        // read-only keeps a rip-relative constant-pool access from being read as a store. The other
+        // `0F38` forms keep the sound default (memory treated as written) until PR 4b's oracle.
+        Some(if vec_reads_0f38(op) { d.reads() } else { d })
     }
 
     fn decode_0f3a(c: &mut Cursor, start: usize, p: &Pfx) -> Option<Decoded> {
@@ -3600,6 +3625,10 @@ pub(crate) mod x86 {
         let d = finish_modrm(c, start, p, imm, Kind::Normal, EffIntent::NoGp)?;
         let d = match map {
             Map::Of => d.vector(op, p),
+            // `mulx` (`VEX.F2.0F38.F6`) reads a 4/8-byte GP memory source; the rest of the
+            // `0F38`/`0F3A` vector maps keep the sound default (memory treated as written) until PR
+            // 4b's completeness oracle.
+            Map::Of38 if vec_reads_0f38(op) => d.reads().width(if p.rex_w { 8 } else { 4 }),
             _ => d,
         };
         // The AVX moves (vmovups/vmovaps/vmovdqu/vmovq/…) leave the flags.
@@ -4092,6 +4121,44 @@ pub(crate) mod x86 {
             assert_eq!(decode(&bytes, 0).len, 5);
             assert!(matches!(decode(&bytes, 5).kind, Kind::Forbidden("syscall")));
             assert!(matches!(decode(&bytes, 7).kind, Kind::Ret));
+        }
+
+        /// #2603 PR 4a (hole 17): packed-integer arithmetic and `mulx` *read* their memory operand,
+        /// so the decoder marks it read-only — a rip-relative constant-pool access must not read as a
+        /// store to the function's rodata. A real vector store stays a write. Bytes are the exact
+        /// forms Cranelift emitted that this slice fixes.
+        #[test]
+        fn vector_memory_reads_are_not_stores() {
+            // vpaddusb xmm, xmm, [rip+disp32] — VEX.128.66.0F.WIG DC; a 16-byte packed read.
+            let d = decode(&[0xc5, 0xf9, 0xdc, 0x0d, 0x0f, 0x03, 0x00, 0x00], 0);
+            assert!(
+                d.operands.mem.is_some() && d.reads_only,
+                "vpaddusb reads: {d:?}"
+            );
+            assert_eq!(d.width, 16, "packed read is 16 bytes");
+            // paddusb xmm, [rip+disp32] — legacy 66 0F DC.
+            let d = decode(&[0x66, 0x0f, 0xdc, 0x0d, 0x00, 0x00, 0x00, 0x00], 0);
+            assert!(
+                d.operands.mem.is_some() && d.reads_only,
+                "paddusb reads: {d:?}"
+            );
+            // mulx r64, r64, [rip+disp32] — VEX.LZ.F2.0F38.W1 F6; reads an 8-byte source.
+            let d = decode(&[0xc4, 0xe2, 0xf3, 0xf6, 0x0d, 0xbf, 0x01, 0x00, 0x00], 0);
+            assert!(
+                d.operands.mem.is_some() && d.reads_only,
+                "mulx W1 reads: {d:?}"
+            );
+            assert_eq!(d.width, 8, "mulx W1 reads 8 bytes");
+            // mulx r32, r32, [rip+disp32] — VEX.LZ.F2.0F38.W0 F6; a 4-byte source.
+            let d = decode(&[0xc4, 0xe2, 0x7b, 0xf6, 0x05, 0xb9, 0x01, 0x00, 0x00], 0);
+            assert!(d.reads_only && d.width == 4, "mulx W0 reads 4 bytes: {d:?}");
+            // Regression guard: a real vector store must stay a write (not read-only), or the write
+            // policy would miss it. movdqa [rip+disp32], xmm — 66 0F 7F.
+            let d = decode(&[0x66, 0x0f, 0x7f, 0x0d, 0x00, 0x00, 0x00, 0x00], 0);
+            assert!(
+                d.operands.mem.is_some() && !d.reads_only,
+                "movdqa store stays a write: {d:?}"
+            );
         }
 
         /// The abstract lattice's `meet` (the fact true on both paths, and the order the checker
