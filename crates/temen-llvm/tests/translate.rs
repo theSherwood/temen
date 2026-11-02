@@ -415,12 +415,17 @@ fn constant_address_offsets_fold_into_loads_and_stores() {
         v.sort_unstable();
         v
     };
+    // An add of a constant is an immediate form once the output is folded (#2585).
     let adds = |f: &Func| {
         (f.blocks.iter().flat_map(|b| &b.insts))
             .filter(|i| {
                 matches!(
                     i,
                     Inst::IntBin {
+                        ty: IntTy::I64,
+                        op: BinOp::Add,
+                        ..
+                    } | Inst::IntBinImm {
                         ty: IntTy::I64,
                         op: BinOp::Add,
                         ..
