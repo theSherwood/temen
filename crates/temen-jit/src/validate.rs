@@ -56,12 +56,36 @@ pub(crate) struct WindowLayout {
 pub(crate) const SYSV_CLOBBERS: u16 = 0b0000_1111_1100_0111;
 
 /// What a call does to its caller, as far as the validator models it (#2603): the GP registers the
-/// callee may leave changed, and the bytes of stack arguments it pops on return (`None` when that
-/// isn't known, so the caller's `rsp` is unknown after the call). PR 3 adds the argument tags.
+/// callee may leave changed, the bytes of stack arguments it pops on return (`None` when that isn't
+/// known, so the caller's `rsp` is unknown after the call), and what each argument must be (#2534).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Contract {
     pub clobbers: u16,
     pub pops: Option<u32>,
+    /// The tag each argument register must satisfy (#2534): a host function takes some of its
+    /// arguments as the window's own and confines guest pointers with them, so a wrong register —
+    /// a backend bug — would move the window the host trusts or hand it a forged pointer. Positional
+    /// (argument 0 is the first integer register, SysV order); `&[]` = no argument is constrained.
+    pub args: &'static [ArgTag],
+}
+
+/// What one call argument must be, for the validator to accept the call (#2534). The host confines
+/// guest pointers against the window values the code hands it, so these are the ones a wrong
+/// register would subvert; everything else is [`ArgTag::Any`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArgTag {
+    /// Unconstrained — a guest value, a count, a handle: nothing the host confines with.
+    Any,
+    /// The window base `mem_base` (rdi at entry): the base the host confines guest pointers against.
+    WindowBase,
+    /// The `vmctx` pointer: the host's own context, never a guest value.
+    Vmctx,
+    /// A pointer to a buffer in the caller's own frame, at most `len` bytes, that the host reads
+    /// and, when `write`, writes (#2534): a `call.cap` marshalling buffer, a fiber's status word.
+    /// The argument must be a known frame slot (never a guest value — else the host would write
+    /// through a forged pointer), and a `write` buffer's slots are dropped across the call since the
+    /// host may change them, while every other slot (the context-pointer spills) survives.
+    StackSlot { len: u32, write: bool },
 }
 
 /// What the validator knows of a function's own frame at entry (#2603 PR 3): the bytes of incoming
@@ -99,7 +123,13 @@ pub(crate) fn contract(sig: &cranelift_codegen::ir::Signature) -> Option<Contrac
         CallConv::PreserveAll => (0b0101, Some(0)), // rax, rdx
         _ => return None,
     };
-    Some(Contract { clobbers, pops })
+    // From the signature alone the callee is unidentified, so no argument is constrained; the host
+    // functions get their argument tags attached by name in `lib.rs` (`HostFn::arg_contract`).
+    Some(Contract {
+        clobbers,
+        pops,
+        args: &[],
+    })
 }
 
 /// The bytes of stack arguments a `Tail` callee with signature `sig` receives, and so pops: Cranelift
@@ -287,7 +317,7 @@ pub(crate) mod x86 {
     //! classification), the machine-CFG recovery and abstract dataflow (#2535), and the
     //! memory-access confinement policy (#2535/#2603) they feed.
 
-    use super::{Contract, Entry, Frame, Guest, Reloc, WindowLayout, SYSV_CLOBBERS};
+    use super::{ArgTag, Contract, Entry, Frame, Guest, Reloc, WindowLayout, SYSV_CLOBBERS};
 
     /// A machine-code policy disagreement: `why`, at byte offset `at` in the function.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1125,6 +1155,35 @@ pub(crate) mod x86 {
         }
     }
 
+    /// Check a call's arguments against its callee's contract (#2534): a host function confines guest
+    /// pointers against the window values the code hands it, so a wrong register — a backend bug —
+    /// would move the window the host trusts. Positional over the integer argument registers (SysV
+    /// order); arguments past the sixth ride the stack and are a PR 3b follow-up. The window's mask
+    /// and reserved domain come from the module's geometry (`None`/0 for a memoryless module).
+    fn check_args(c: &Contract, state: &State, at: usize, findings: &mut Vec<Finding>) {
+        for (i, &tag) in c.args.iter().enumerate() {
+            let Some(&r) = reg::ARG_REGS.get(i) else {
+                break;
+            };
+            let fact = state.regs[r as usize];
+            let ok = match tag {
+                ArgTag::Any => true,
+                ArgTag::WindowBase => fact == Fact::MemBase,
+                ArgTag::Vmctx => fact == Fact::Vmctx,
+                // A buffer pointer must be a known frame slot, never a guest value: the host writes
+                // through it, so a forged pointer would escape. The extent is enforced by the frame
+                // policy on the slots the write clears below.
+                ArgTag::StackSlot { .. } => matches!(fact, Fact::Stack(Some(_))),
+            };
+            if !ok {
+                findings.push(Finding {
+                    at,
+                    why: format!("call argument {i} is {fact:?}, not {tag:?}"),
+                });
+            }
+        }
+    }
+
     /// Check that a function exit restores `rsp` to the return address (`Stack(Some(0))`) and every
     /// callee-saved register to its entry value (`Saved(r)`). A `Saved` reaches here through the
     /// spill slot the prologue saved it to and the epilogue reloaded it from.
@@ -1669,20 +1728,56 @@ pub(crate) mod x86 {
                 let c = callee.unwrap_or(Contract {
                     clobbers: SYSV_CLOBBERS,
                     pops: None,
+                    args: &[],
                 });
+                if let Some(f) = findings.as_deref_mut() {
+                    check_args(&c, &state, pos, f);
+                }
                 // The caller's slots survive the call: an accepted guest callee writes only its own
                 // frame (below this `rsp`, claim item 4, the induction), and a host callee writes the
-                // caller's stack only through a pointer it was handed. So a slot is cleared only when
-                // a frame pointer is passed in an argument register — the shape a `call.cap` result
-                // buffer takes (a `lea` of a frame slot). A guest callee is never passed a native
-                // frame pointer (a guest pointer is a window offset). #2534/PR 3b replaces this with
-                // the exact per-argument host contracts. A checked record survives too (never changes).
-                let passes_frame_ptr = reg::ARG_REGS
-                    .iter()
-                    .any(|&r| matches!(fact(&state, r), Fact::Stack(_) | Fact::ReturnArea(_)));
-                if passes_frame_ptr {
+                // caller's stack only through a write-buffer pointer the contract says it was handed
+                // (#2534, §2a handler hygiene). So drop exactly those buffers' slots and let the
+                // context-pointer spills (`mem_base`, `vmctx`, the fuel cell, …) survive. A frame
+                // pointer the contract does not tag as a buffer is unexpected — a guest pointer is a
+                // window offset, never a native frame pointer — so clear every data slot, sound but
+                // imprecise. (`ReturnArea`, the caller's own `sret` area, is outside this frame, so a
+                // callee handed it writes the caller's result slots, not ours.)
+                // A frame pointer in a register the contract doesn't account for forces a full clear
+                // only when the callee is unidentified (an empty contract — arguments unknown). An
+                // identified callee's contract lists its frame-pointer arguments, so a frame pointer
+                // in a register past them is caller scratch, not an argument, and is ignored — e.g. a
+                // stale pointer left in `rsi` across the fuel refill, which reads only the cell.
+                let conservative = c.args.is_empty();
+                let mut unexpected = false;
+                let mut writes: Vec<(i64, i64)> = Vec::new();
+                for (i, &r) in reg::ARG_REGS.iter().enumerate() {
+                    let f = fact(&state, r);
+                    match c.args.get(i) {
+                        Some(ArgTag::StackSlot { len, write: true }) => match f {
+                            Fact::Stack(Some(off)) => {
+                                writes.push((off, off.saturating_add(i64::from(*len))))
+                            }
+                            // A write buffer at an unknown offset: clear conservatively.
+                            _ => unexpected = true,
+                        },
+                        // A read buffer: the host doesn't write our stack through it.
+                        Some(ArgTag::StackSlot { write: false, .. }) => {}
+                        // Another tagged argument (a window value, vmctx, a guest value): a frame
+                        // pointer where the contract expects none is unexpected.
+                        Some(_) => unexpected |= matches!(f, Fact::Stack(_)),
+                        // Past the contract's arguments: scratch, unless the callee is unidentified.
+                        // (`ReturnArea`, the caller's own `sret` area, is never one of our slots.)
+                        None => unexpected |= conservative && matches!(f, Fact::Stack(_)),
+                    }
+                }
+                if unexpected {
                     state.clear_data_slots();
                     slot_vals.clear();
+                } else {
+                    for (lo, hi) in writes {
+                        state.clobber(lo, hi);
+                        slot_vals.retain(|&(o, _)| o >= hi || o + 8 <= lo);
+                    }
                 }
                 let rsp = match (fact(&state, reg::RSP), c.pops) {
                     (Fact::Stack(Some(h)), Some(p)) => Fact::Stack(h.checked_add(i64::from(p))),
@@ -1830,13 +1925,17 @@ pub(crate) mod x86 {
 
     /// The contract of the fuel cell's refill (a `PreserveAll` trampoline with no result) and of its
     /// `remaining` (a C function).
+    // Each takes the fuel cell pointer alone (never a frame pointer), so the contract lists that one
+    // argument — a scratch frame pointer left in another register is then not mistaken for a buffer.
     const FUEL_REFILL: Contract = Contract {
         clobbers: 0,
         pops: Some(0),
+        args: &[ArgTag::Any],
     };
     const FUEL_REMAINING: Contract = Contract {
         clobbers: SYSV_CLOBBERS,
         pops: Some(0),
+        args: &[ArgTag::Any],
     };
 
     /// What a 64-bit load from `m` yields: the fact a tracked spill slot holds, the code pointer of a
@@ -4089,12 +4188,14 @@ pub(crate) mod x86 {
         const TAIL0: Contract = Contract {
             clobbers: SYSV_CLOBBERS,
             pops: Some(0),
+            args: &[],
         };
 
         /// A Tail-CC callee with 16 bytes of stack arguments.
         const TAIL16: Contract = Contract {
             clobbers: SYSV_CLOBBERS,
             pops: Some(16),
+            args: &[],
         };
 
         /// The relocation a call or tail call to [`TAIL0`] carries on the `rel32` at `at`.
@@ -4325,7 +4426,8 @@ pub(crate) mod x86 {
                 sysv,
                 Some(Contract {
                     clobbers: SYSV_CLOBBERS,
-                    pops: Some(0)
+                    pops: Some(0),
+                    args: &[],
                 })
             );
             let preserve = |r: &[types::Type]| {
@@ -4401,21 +4503,117 @@ pub(crate) mod x86 {
             let sysv = with(Contract {
                 clobbers: SYSV_CLOBBERS,
                 pops: Some(0),
+                args: &[],
             });
             assert_eq!(sysv.regs[reg::RDI as usize], Fact::Unknown);
             assert_eq!(sysv.regs[reg::RSP as usize], Fact::Stack(Some(0)));
             let tail = with(Contract {
                 clobbers: SYSV_CLOBBERS,
                 pops: Some(16),
+                args: &[],
             });
             assert_eq!(tail.regs[reg::RSP as usize], Fact::Stack(Some(16)));
             let preserve = with(Contract {
                 clobbers: 0,
                 pops: Some(0),
+                args: &[],
             });
             assert_eq!(preserve.regs[reg::RDI as usize], Fact::MemBase);
             let unknown = [0x48, 0x89, 0xf0, 0xff, 0xd0, 0xc3]; // mov rax, rsi; call rax; ret
             assert!(has(&findings(&unknown), "unidentified callee"));
+        }
+
+        /// #2534 — a host call's argument registers are checked against its contract: the window base
+        /// must be the real `mem_base`, never another value a backend bug left in the register.
+        #[test]
+        fn a_host_call_argument_must_match_its_contract() {
+            // A callee that wants the window base in its second argument register (rsi), as the
+            // `call.cap` thunk does.
+            const CAP: Contract = Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(0),
+                args: &[ArgTag::Any, ArgTag::WindowBase],
+            };
+            let reloc = |at: u32| Reloc {
+                at,
+                kind: R::Abs8,
+                addend: 0,
+                callee: Some(CAP),
+            };
+            let c = CHECK_LEN as u32;
+            // mov rsi, rdi (rsi := the window base); movabs rax, <sym>; call rax; ret
+            let ok = checked(&[
+                0x48, 0x89, 0xfe, 0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xd0, 0xc3,
+            ]);
+            let f = check(&ok, &[reloc(c + 5)], Entry::Guest(&G), Frame::UNKNOWN);
+            assert!(
+                f.is_empty(),
+                "a correct window-base argument was flagged: {f:?}"
+            );
+            // Without the move, rsi is still fn_table_base — a different window.
+            let bad = checked(&[0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xd0, 0xc3]);
+            let f = check(&bad, &[reloc(c + 2)], Entry::Guest(&G), Frame::UNKNOWN);
+            assert!(has(&f, "call argument 1"), "{f:?}");
+        }
+
+        /// #2534 — a host call that writes a caller-frame buffer clears only that buffer's slots, so
+        /// a context-pointer spill (here `mem_base`) survives; a frame pointer the contract doesn't
+        /// model forces a full clear, the sound fallback.
+        #[test]
+        fn a_write_buffer_call_spares_the_context_spills() {
+            // sub rsp,0x20; mov [rsp+0x10],rdi (spill mem_base at −0x10); lea rdx,[rsp] (an 8-byte
+            // buffer at −0x20); movabs rax,<sym>; call rax; mov rax,[rsp+0x10] (reload); add rsp,0x20; ret
+            let body = [
+                0x48, 0x83, 0xec, 0x20, // sub rsp, 0x20
+                0x48, 0x89, 0x7c, 0x24, 0x10, // mov [rsp+0x10], rdi
+                0x48, 0x8d, 0x14, 0x24, // lea rdx, [rsp]
+                0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, // movabs rax, <sym>   (Abs8 at 15)
+                0xff, 0xd0, // call rax
+                0x48, 0x8b, 0x44, 0x24, 0x10, // mov rax, [rsp+0x10]
+                0x48, 0x83, 0xc4, 0x20, // add rsp, 0x20
+                0xc3, // ret
+            ];
+            let with = |c: Contract| {
+                run_with(
+                    &body,
+                    &[Reloc {
+                        at: 15,
+                        kind: R::Abs8,
+                        addend: 0,
+                        callee: Some(c),
+                    }],
+                )
+            };
+            // Writes an 8-byte buffer through its third argument (rdx): only [−0x20,−0x18) is dropped.
+            let status = with(Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(0),
+                args: &[
+                    ArgTag::Any,
+                    ArgTag::Any,
+                    ArgTag::StackSlot {
+                        len: 8,
+                        write: true,
+                    },
+                ],
+            });
+            assert_eq!(
+                status.regs[0],
+                Fact::MemBase,
+                "the mem_base spill did not survive a write-buffer call"
+            );
+            // An identified callee with no argument contract: the frame pointer is unexpected, so
+            // every data slot is cleared, including the spill.
+            let plain = with(Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(0),
+                args: &[],
+            });
+            assert_eq!(
+                plain.regs[0],
+                Fact::Unknown,
+                "an unmodelled frame-pointer call must clear the spill"
+            );
         }
 
         /// br_table's dispatch as Cranelift emits it (`JmpTableSeq` behind the index clamp), with

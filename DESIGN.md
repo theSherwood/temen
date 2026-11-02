@@ -311,6 +311,14 @@ found (#2603):
   moves `rsp` by what the callee pops (a `Tail` callee its stack arguments). The callee is known only
   from a relocation, a vmctx cell, or a fn-table entry whose type the code checked; any other is
   rejected.
+- A host call's arguments are checked against its contract (#2534): a host function confines guest
+  pointers against the window values the code hands it, so an argument the contract tags `WindowBase`
+  must be `mem_base`, `Vmctx` must be `vmctx`, and a caller-frame buffer must be a known frame slot,
+  never a guest value — a wrong register would move the window the host trusts or hand it a forged
+  pointer. The caller's spill slots survive the call: a host callee writes the caller's stack only
+  through a write-buffer pointer its contract names, so exactly that buffer's slots are dropped and
+  the context-pointer spills (`mem_base`, `vmctx`, the fuel cell) survive; a frame pointer the
+  contract does not model forces a full clear, the sound fallback.
 - A type check proves something only on its equal edge, and only of the record whose type id it
   loaded: every register still holding that record's address. A record never changes, so the proof
   outlives a call in a register the callee keeps. `test r, r` is exactly `cmp r, 0`.
