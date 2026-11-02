@@ -3229,12 +3229,12 @@ unsafe fn live_impl_call(
         fast,
         op,
         args,
-        &sig.params,
+        sig.params(),
         vm,
     ) else {
         return;
     };
-    match temen_interp::complete_call(reply, &sig.results, callee, caller) {
+    match temen_interp::complete_call(reply, sig.results(), callee, caller) {
         Ok(slots) => out.copy_from_slice(&slots),
         Err(_) => vm.raise(TrapKind::CapFault as i64),
     }
@@ -3278,8 +3278,13 @@ unsafe fn live_reply(
             match tramp {
                 Some((code, n_params, n_res)) if args.len() == n_params => {
                     drop(guard);
-                    let mut args = args.to_vec();
-                    if temen_interp::grant_live_args(caller, callee, params, &mut args).is_err() {
+                    let mut args = std::borrow::Cow::Borrowed(args);
+                    // INVARIANTS #8: the call's handles, granted into the callee before its
+                    // handler sees them; a call with none borrows its arguments as they are.
+                    if params.contains(&temen_ir::ValType::Cap)
+                        && temen_interp::grant_live_args(caller, callee, params, args.to_mut())
+                            .is_err()
+                    {
                         let mut g2 = callee.lock().unwrap_or_else(|e| e.into_inner());
                         g2.release_handoff(0);
                         ring(&g2);

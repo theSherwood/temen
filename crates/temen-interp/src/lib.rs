@@ -5828,10 +5828,14 @@ enum Pending {
     /// result — a negative errno the parked fiber probes on its own error path. The fiber is
     /// never killed and never traps; cancellation is a returned value (§3.6 revocation-unparks).
     CapResult(i64),
-    /// INVARIANTS #8 — finish a live call ([`Blocked::CapReply`]) with the values its reply defines
-    /// ([`ReplyTo::complete`]), or its trap: the reply its call could not take. A page fault's
-    /// (`page_fault` set) is its pager's status instead.
-    Reply(Result<Vec<Reg>, Trap>),
+    /// INVARIANTS #8 — finish a live call ([`Blocked::CapReply`]) with the values its reply's slots
+    /// define, typed by its op's signature `sig` ([`ReplyTo::complete`]), or with its trap: the
+    /// reply its call could not take. A page fault's (`page_fault` set) is its pager's status
+    /// instead.
+    Reply {
+        out: Result<Vec<i64>, Trap>,
+        sig: OpSig,
+    },
     /// #1899 — a stream read ([`Blocked::CapRead`]) that a landing freeze abandoned: its result is a
     /// placeholder, and the re-issue word makes the thaw re-issue the read.
     Abandoned,
@@ -7567,7 +7571,7 @@ impl Scheduler {
         match s.ticket_waiters.remove(&(callee_id, ticket)) {
             Some((waiter, to)) => {
                 let out = to.complete(reply, callee);
-                if deliver_reply(&mut s, waiter, out) {
+                if deliver_reply(&mut s, waiter, to, out) {
                     self.work.notify_all();
                 }
             }
@@ -8654,7 +8658,7 @@ fn wake_dead_tickets(s: &mut Sched, callee: usize, tickets: impl IntoIterator<It
     for t in tickets {
         if let Some((waiter, to)) = s.ticket_waiters.remove(&(callee, t)) {
             let out = to.fail(CAP_REVOKED);
-            deliver_reply(s, waiter, out);
+            deliver_reply(s, waiter, to, out);
         }
     }
 }
@@ -9606,12 +9610,14 @@ fn park_cap_reply(
     let early = callee.lock_unpoisoned().svc_results.remove(&ticket);
     match early {
         Some(r) => {
-            v.pending = Some(Pending::Reply(to.complete(r, &callee)));
+            let out = to.complete(r, &callee);
+            v.pending = Some(Pending::Reply { out, sig: to.sig });
             s.runnable.push_back(v);
             sched.work.notify_one();
         }
         None if callee_dead => {
-            v.pending = Some(Pending::Reply(to.fail(CAP_REVOKED)));
+            let out = to.fail(CAP_REVOKED);
+            v.pending = Some(Pending::Reply { out, sig: to.sig });
             s.runnable.push_back(v);
             sched.work.notify_one();
         }
@@ -10415,9 +10421,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // as a `call.cap` does (#1815 — without it a parked pager slept through the fault).
                 sched.svc_wake(pager_id as usize);
                 v.page_fault = Some(addr);
-                // The pager's `page` answers one status (`has_pager_export`).
                 let to = ReplyTo {
-                    results: Arc::from([ValType::I64]),
+                    sig: OpSig::page(),
                     caller: Arc::clone(&v.domain.host),
                 };
                 park_cap_reply(sched, v, t, pb.cell, to);
@@ -12368,7 +12373,7 @@ impl FiberRegistry {
     /// INVARIANTS #8 — a live call's reply landed ([`deliver_reply`]): its values onto the parked
     /// fiber's top frame, or, for a reply its call could not take, its trap, which the fiber's next
     /// claim raises. `false` as [`Self::wake_blocked`].
-    fn wake_reply(&self, slot: usize, out: Result<Vec<Reg>, Trap>) -> bool {
+    fn wake_reply(&self, slot: usize, out: Result<Vec<i64>, Trap>, sig: &OpSig) -> bool {
         let mut t = self.lock();
         match &mut t.fibers[slot] {
             RegFiber::ParkedOn {
@@ -12377,9 +12382,9 @@ impl FiberRegistry {
                 fault,
             } => {
                 match out {
-                    Ok(regs) => {
+                    Ok(slots) => {
                         if let Some(f) = frames.last_mut() {
-                            f.vals.extend(regs);
+                            f.vals.extend(result_regs(&slots, sig.results()));
                         }
                     }
                     Err(trap) => *fault = Some(trap),
@@ -14059,7 +14064,7 @@ impl CallerHost<'_> {
 /// `args` (a `cap` of `params`, the op's own: [`LiveTarget::sig`]) is granted into the callee
 /// before the callee can see the call ([`translate_cap_slots`]), under both powerboxes' locks, and
 /// only for a call the queue admits, so a full queue grants nothing. One naming nothing faults the
-/// call. Every engine's live call enqueues here.
+/// call. A call with no handle takes only the callee's lock. Every engine's live call enqueues here.
 pub fn enqueue_live_call(
     caller: &mut CallerHost,
     callee: &Mutex<Host>,
@@ -14068,6 +14073,10 @@ pub fn enqueue_live_call(
     mut args: Vec<i64>,
     params: &[ValType],
 ) -> Result<(Option<u64>, u64), Trap> {
+    if !params.contains(&ValType::Cap) {
+        let mut cg = callee.lock_unpoisoned();
+        return Ok((cg.svc_enqueue(export, op, args), cg.domain_id()));
+    }
     caller.with_callee(callee, |hg, cg| {
         let cg = match cg {
             Some(cg) => {
@@ -14301,15 +14310,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         // INVARIANTS #8 — a live call's reply, laid out for this call: every value it defines, or the
         // trap of a reply the call could not take. A page fault's is its pager's status, read as
         // `CapResult` reads it.
-        Some(Pending::Reply(out)) => {
-            let regs = out?;
+        Some(Pending::Reply { out, sig }) => {
+            let slots = out?;
             if v.page_fault.take().is_some() {
-                if regs.first().map_or(0, |r| r.i64()) < 0 {
+                if slots.first().copied().unwrap_or(0) < 0 {
                     return Err(Trap::MemoryFault);
                 }
             } else {
                 let top = v.frames.len() - 1;
-                v.frames[top].vals.extend(regs);
+                v.frames[top]
+                    .vals
+                    .extend(result_regs(&slots, sig.results()));
             }
         }
         Some(Pending::Abandoned) => {
@@ -15339,10 +15350,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // INVARIANTS #8: the op's own signature, not the call site's, says which
                     // slots are handles.
                     let sig = target.sig(op, csig.params.len(), csig.results.len())?;
-                    let to = ReplyTo {
-                        results: Arc::from(&sig.results[..]),
-                        caller: Arc::clone(host),
-                    };
                     let (ticket, callee_id) = issue_live_call(
                         host,
                         *durable_sp_ctx,
@@ -15350,11 +15357,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         target.export,
                         op,
                         $argv,
-                        &sig.params,
+                        sig.params(),
                     )?;
+                    let to = ReplyTo {
+                        sig,
+                        caller: Arc::clone(host),
+                    };
                     let callee = target.callee;
                     let Some(t) = ticket else {
-                        frames[top].vals.extend(to.fail(EAGAIN)?);
+                        let slots = to.fail(EAGAIN)?;
+                        frames[top].vals.extend(result_regs(&slots, to.sig.results()));
                         continue;
                     };
                     // CALLS.md 4d — direct handoff (real scheduler only): if enabled and the
@@ -15372,7 +15384,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 dispatch(sr, provider);
                                 let served = callee.lock_unpoisoned().svc_results.remove(&t);
                                 if let Some(r) = served {
-                                    frames[top].vals.extend(to.complete(r, &callee)?);
+                                    let slots = to.complete(r, &callee)?;
+                                    let regs = result_regs(&slots, to.sig.results());
+                                    frames[top].vals.extend(regs);
                                     continue;
                                 }
                             }
@@ -15392,7 +15406,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // probeable errno instead of parking through a dead domain.
                                 if sg.dead.contains_key(&(callee_id as usize)) {
                                     drop(sg);
-                                    regc.wake_reply(slot, toc.fail(CAP_REVOKED));
+                                    regc.wake_reply(slot, toc.fail(CAP_REVOKED), &toc.sig);
                                 } else {
                                     sg.ticket_waiters.insert(
                                         (callee_id as usize, t),
@@ -15401,7 +15415,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     drop(sg);
                                     let early = calleec.lock_unpoisoned().svc_results.remove(&t);
                                     if let Some(r) = early {
-                                        regc.wake_reply(slot, toc.complete(r, &calleec));
+                                        let out = toc.complete(r, &calleec);
+                                        regc.wake_reply(slot, out, &toc.sig);
                                     }
                                 }
                             });
@@ -24431,11 +24446,50 @@ impl LiveTarget {
     /// never the call site's claim: a caller that declared an integer result a `cap` would otherwise
     /// take the callee's handle of that number. An op the interface lacks, or a call of another
     /// arity, is `CapFault`, as at the instanced boundary.
-    pub fn sig(&self, op: u32, n_params: usize, n_results: usize) -> Result<&FuncType, Trap> {
+    pub fn sig(&self, op: u32, n_params: usize, n_results: usize) -> Result<OpSig, Trap> {
+        let op = op as usize;
         self.sigs
-            .get(op as usize)
+            .get(op)
             .filter(|s| s.params.len() == n_params && s.results.len() == n_results)
-            .ok_or(Trap::CapFault)
+            .ok_or(Trap::CapFault)?;
+        Ok(OpSig {
+            sigs: Arc::clone(&self.sigs),
+            op,
+        })
+    }
+}
+
+/// INVARIANTS #8 — one op's signature among an offer interface's, held by reference rather than
+/// copied, so a live call carries it for a reference count ([`LiveTarget::sig`]).
+#[derive(Clone)]
+pub struct OpSig {
+    sigs: Arc<[FuncType]>,
+    /// In range: [`LiveTarget::sig`] checked it, and `sigs` never changes.
+    op: usize,
+}
+
+impl OpSig {
+    /// A pager's `page`, `(i64) -> (i64)` ([`Host::has_pager_export`]): a page fault's reply is the
+    /// page's status.
+    fn page() -> OpSig {
+        static PAGE: std::sync::LazyLock<Arc<[FuncType]>> = std::sync::LazyLock::new(|| {
+            Arc::from([FuncType {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+            }])
+        });
+        OpSig {
+            sigs: Arc::clone(&PAGE),
+            op: 0,
+        }
+    }
+
+    pub fn params(&self) -> &[ValType] {
+        &self.sigs[self.op].params
+    }
+
+    pub fn results(&self) -> &[ValType] {
+        &self.sigs[self.op].results
     }
 }
 
@@ -24483,47 +24537,40 @@ pub fn failed_slots(errno: i64, results: &[ValType]) -> Result<Vec<i64>, Trap> {
     }
 }
 
-/// INVARIANTS #8 — a caller parked on a live call's reply ([`Sched::ticket_waiters`]): the results
-/// its op declares ([`LiveTarget::sig`]), and the powerbox the call was made from, where a handle in
-/// the reply is granted.
+/// INVARIANTS #8 — a caller parked on a live call's reply ([`Sched::ticket_waiters`]): its op's
+/// signature, and the powerbox the call was made from, where a handle in the reply is granted.
 #[derive(Clone)]
 struct ReplyTo {
-    results: Arc<[ValType]>,
+    sig: OpSig,
     caller: Arc<Mutex<Host>>,
 }
 
 impl ReplyTo {
-    /// Lay `reply`, answered by `callee`, out for this caller ([`complete_call`]), as the registers
-    /// its call defines.
-    fn complete(&self, reply: Reply, callee: &Arc<Mutex<Host>>) -> Result<Vec<Reg>, Trap> {
-        let slots = complete_call(
-            reply,
-            &self.results,
-            callee,
-            &mut CallerHost::Cell(&self.caller),
-        )?;
-        Ok(result_regs(&slots, &self.results).collect())
+    /// Lay `reply`, answered by `callee`, out for this caller ([`complete_call`]): the slots of the
+    /// values its call defines.
+    fn complete(&self, reply: Reply, callee: &Arc<Mutex<Host>>) -> Result<Vec<i64>, Trap> {
+        let caller = &mut CallerHost::Cell(&self.caller);
+        complete_call(reply, self.sig.results(), callee, caller)
     }
 
     /// [`Self::complete`] for a transport failure, which carries no handle and so needs no callee.
-    fn fail(&self, errno: i64) -> Result<Vec<Reg>, Trap> {
-        let slots = failed_slots(errno, &self.results)?;
-        Ok(result_regs(&slots, &self.results).collect())
+    fn fail(&self, errno: i64) -> Result<Vec<i64>, Trap> {
+        failed_slots(errno, self.sig.results())
     }
 }
 
 /// INVARIANTS #8 — hand a live call's laid-out reply ([`ReplyTo::complete`]) to the caller parked on
-/// it: a vCPU resumes with it ([`Pending::Reply`]), a fiber is woken with it
+/// it, `to`: a vCPU resumes with it ([`Pending::Reply`]), a fiber is woken with it
 /// ([`FiberRegistry::wake_reply`]). Whether a worker needs waking.
-fn deliver_reply(s: &mut Sched, waiter: Waiter, out: Result<Vec<Reg>, Trap>) -> bool {
+fn deliver_reply(s: &mut Sched, waiter: Waiter, to: ReplyTo, out: Result<Vec<i64>, Trap>) -> bool {
     match waiter {
         Waiter::VCpu(mut v) => {
-            v.pending = Some(Pending::Reply(out));
+            v.pending = Some(Pending::Reply { out, sig: to.sig });
             s.runnable.push_back(v);
             true
         }
         Waiter::Fiber { reg, slot, svc, .. } => {
-            reg.wake_reply(slot, out);
+            reg.wake_reply(slot, out, &to.sig);
             svc_wake_locked(s, svc)
         }
     }
@@ -40750,7 +40797,7 @@ mod orphan_reply_tests {
         {
             let mut s = sched.lock();
             let to = ReplyTo {
-                results: Arc::from([ValType::I64]),
+                sig: OpSig::page(),
                 caller: Arc::clone(&dying),
             };
             s.ticket_waiters.insert(

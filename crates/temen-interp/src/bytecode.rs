@@ -9020,7 +9020,7 @@ struct LiveCall {
     export: u32,
     op: u32,
     args: Vec<i64>,
-    sig: temen_ir::FuncType,
+    sig: super::OpSig,
     dst: u32,
 }
 
@@ -9104,7 +9104,7 @@ enum Outcome {
     /// driver enqueues it on the callee and parks this task until the callee's serve loop settles
     /// its ticket, then delivers the reply from `dst`. The cursor is persisted PAST the op (the
     /// reply is the call's result).
-    LiveCall(Box<LiveCall>),
+    LiveCall(LiveCall),
     /// §3.6 (I36 slice 2) — `svc.wait` with an empty queue and no progress: park this task on its
     /// domain until a caller's enqueue re-admits it. The cursor is persisted AT the op, so the
     /// wake re-executes the whole serve drain (the tree-walker's rewound park).
@@ -10927,7 +10927,7 @@ enum VcpuStop {
         fiber: usize,
     },
     /// §3.6 (I36 slice 2): make a live call and park this task on its reply ([`Outcome::LiveCall`]).
-    LiveCall(Box<LiveCall>),
+    LiveCall(LiveCall),
     /// F2 (FIBER_PARK.md): a punted offloadable dispatch with an exactly-`i64` reply
     /// ([`Outcome::CapPending`]) — the cooperative driver fiber-parks a punting fiber; every
     /// other driver waits inline on the completion (the I45 posture).
@@ -11723,9 +11723,9 @@ enum TaskState {
         ticket: u64,
         callee: std::sync::Arc<std::sync::Mutex<Host>>,
         dst: u32,
-        /// INVARIANTS #8 — the results its op declares ([`super::LiveTarget::sig`]), which its reply
-        /// is laid out by.
-        results: Box<[ValType]>,
+        /// INVARIANTS #8 — its op's signature ([`super::LiveTarget::sig`]), which its reply is laid
+        /// out by.
+        sig: super::OpSig,
     },
     /// §2.2 / #2164 — parked on a page fault: `ticket` is its `page(addr)` request on `pager`, its
     /// spawner's domain. The settle-wake scan claims the reply as it claims a live call's: the page
@@ -12529,35 +12529,21 @@ fn settle_wakes(
         let Some(reply) = callee.lock_unpoisoned().svc_results.remove(ticket) else {
             continue;
         };
-        match &t.state {
+        match std::mem::replace(&mut t.state, TaskState::Runnable) {
             // INVARIANTS #8: a live call's reply, laid out by the results its op declares, its
             // handles granted from the callee into the caller's domain ([`super::complete_call`]).
             TaskState::BlockedTicket {
-                dst,
-                callee,
-                results,
-                ..
+                dst, callee, sig, ..
             } => {
-                let caller = std::sync::Arc::clone(&domains[t.domain].host);
-                let to = &mut super::CallerHost::Cell(&caller);
-                match super::complete_call(reply, results, callee, to) {
-                    Ok(slots) => {
-                        let (dst, results) = (*dst, results.clone());
-                        t.deliver_from(dst, super::result_regs(&slots, &results));
-                    }
-                    Err(trap) => {
-                        refused.push((i, trap));
-                        continue;
-                    }
+                let to = &mut super::CallerHost::Cell(&domains[t.domain].host);
+                match super::complete_call(reply, sig.results(), &callee, to) {
+                    Ok(slots) => t.deliver_from(dst, super::result_regs(&slots, sig.results())),
+                    Err(trap) => refused.push((i, trap)),
                 }
             }
-            _ if reply.status() < 0 => {
-                refused.push((i, Trap::MemoryFault));
-                continue;
-            }
+            _ if reply.status() < 0 => refused.push((i, Trap::MemoryFault)),
             _ => {}
         }
-        t.state = TaskState::Runnable;
     }
     for (i, trap) in refused {
         complete(tasks, domains, i, Err(trap));
@@ -13625,7 +13611,7 @@ impl SchedCore {
                     args,
                     sig,
                     dst,
-                } = *call;
+                } = call;
                 // The callee is a child domain's domain, or the root's: a child calling back
                 // through a self-serve grant (#744).
                 let callee_env = domain_of(domains, &callee);
@@ -13634,18 +13620,19 @@ impl SchedCore {
                 // errno, enqueuing nothing, instead of parking forever (the tree-walker's dead-callee
                 // park probe).
                 if callee_env.is_some_and(|k| dead_domains.contains(&k)) {
-                    fail_call(tasks, domains, ti, dst, &sig.results, super::CAP_REVOKED);
+                    fail_call(tasks, domains, ti, dst, sig.results(), super::CAP_REVOKED);
                     return None;
                 }
                 // INVARIANTS #8: its handles are granted into the callee as the queue admits it.
-                let caller = std::sync::Arc::clone(&domains[tasks[ti].domain].host);
-                let from = &mut super::CallerHost::Cell(&caller);
-                match super::enqueue_live_call(from, &callee, export, op, args, &sig.params) {
+                let from = &mut super::CallerHost::Cell(&domains[tasks[ti].domain].host);
+                let enqueued =
+                    super::enqueue_live_call(from, &callee, export, op, args, sig.params());
+                match enqueued {
                     Err(trap) => complete(tasks, domains, ti, Err(trap)),
                     // A full callee queue is probeable backpressure, the call's failure; the task
                     // runs on.
                     Ok((None, _)) => {
-                        fail_call(tasks, domains, ti, dst, &sig.results, super::EAGAIN)
+                        fail_call(tasks, domains, ti, dst, sig.results(), super::EAGAIN)
                     }
                     // Wake any svc.wait-parked task of the callee's domain — the tree-walker's
                     // `svc_wake` — then park the caller on its ticket.
@@ -13657,7 +13644,7 @@ impl SchedCore {
                             ticket,
                             callee,
                             dst,
-                            results: sig.results.into(),
+                            sig,
                         };
                     }
                 }
@@ -17906,12 +17893,9 @@ fn teardown_domains(
             for (i, t) in tasks.iter_mut().enumerate() {
                 match &t.state {
                     TaskState::BlockedTicket {
-                        callee,
-                        dst,
-                        results,
-                        ..
+                        callee, dst, sig, ..
                     } if std::sync::Arc::ptr_eq(callee, &dying) => {
-                        unanswered.push((i, *dst, results.clone()));
+                        unanswered.push((i, *dst, sig.clone()));
                         t.state = TaskState::Runnable;
                     }
                     TaskState::BlockedPage { pager, .. }
@@ -17922,8 +17906,8 @@ fn teardown_domains(
                     _ => {}
                 }
             }
-            for (i, dst, results) in unanswered {
-                fail_call(tasks, domains, i, dst, &results, super::CAP_REVOKED);
+            for (i, dst, sig) in unanswered {
+                fail_call(tasks, domains, i, dst, sig.results(), super::CAP_REVOKED);
             }
             for i in stranded {
                 complete(tasks, domains, i, Err(Trap::MemoryFault));
@@ -19384,19 +19368,19 @@ impl Vm {
                     // driver enqueues it on the callee's inbound queue and parks the task until the
                     // handler's reply (the tree-walker's caller-parking arm, task-level).
                     if let Some(target) = host.with(|p| p.live_impl_of(h, *type_id)) {
-                        let sig = target.sig(*op, argv.len(), results.len())?.clone();
+                        let sig = target.sig(*op, argv.len(), results.len())?;
                         self.module = module;
                         self.cur = cur;
                         self.base = base;
                         self.pc = pc + 1;
-                        return Ok(Outcome::LiveCall(Box::new(LiveCall {
+                        return Ok(Outcome::LiveCall(LiveCall {
                             callee: target.callee,
                             export: target.export,
                             op: *op,
                             args: argv,
                             sig,
                             dst: *dst,
-                        })));
+                        }));
                     }
                     // #2109: the host copies the call's buffers in one go ([`super::SoleMem`]).
                     let mut sole = mem.as_mut().map(super::SoleMem);

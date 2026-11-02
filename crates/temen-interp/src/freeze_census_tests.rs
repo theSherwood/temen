@@ -278,7 +278,7 @@ fn returns_at_once() -> Arc<[Func]> {
 /// How a call of the fixture's root domain, parked on a reply, takes it: one `i64`.
 fn reply_to(f: &Fixture) -> ReplyTo {
     ReplyTo {
-        results: Arc::from([ValType::I64]),
+        sig: OpSig::page(),
         caller: Arc::clone(&f.root),
     }
 }
