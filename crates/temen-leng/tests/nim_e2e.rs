@@ -451,7 +451,7 @@ fn nim_write_runs_under_the_powerbox() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Caps, None, false)
+    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[], false)
         .unwrap_or_else(|e| panic!("bridge link: {e}"));
     let run = temen_run::run_powerbox(&m, &[]).unwrap_or_else(|e| panic!("run_powerbox: {e}"));
     assert_eq!(
@@ -490,7 +490,7 @@ fn nim_reads_its_argv_and_env_under_the_powerbox() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Caps, None, false)
+    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[], false)
         .unwrap_or_else(|e| panic!("bridge link: {e}"));
     let run = temen_run::run_powerbox_cfg(
         &m,
@@ -529,7 +529,7 @@ fn nim_with_no_argv_sees_an_empty_command_line() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Caps, None, false)
+    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[], false)
         .unwrap_or_else(|e| panic!("bridge link: {e}"));
     let run = temen_run::run_powerbox(&m, &[]).unwrap_or_else(|e| panic!("run_powerbox: {e}"));
     assert_eq!(run.stdout, b"-1", "`argc = 0` ⇒ nim's `paramCount()` is -1");
@@ -555,7 +555,7 @@ fn nim_strutils_cross_module_arg_widths_verify() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Caps, None, false)
+    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[], false)
         .unwrap_or_else(|e| panic!("bridge link: {e}"));
     temen_verify::verify_module(&m)
         .unwrap_or_else(|e| panic!("strutils linked module must verify (#1400): {e:?}"));
@@ -574,7 +574,7 @@ fn link_verify_std_module(module: &str) {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Caps, None, false)
+    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[], false)
         .unwrap_or_else(|e| panic!("bridge link `{module}`: {e}"));
     temen_verify::verify_module(&m)
         .unwrap_or_else(|e| panic!("`{module}` linked module must verify: {e:?}"));
@@ -713,12 +713,12 @@ fn a_nim_program_links_to_the_same_module_in_any_order() {
         u
     };
     let posix =
-        |reverse| temen_leng::link_nim(&units(reverse), Edge::Posix(px_vtable()), None, false);
+        |reverse| temen_leng::link_nim(&units(reverse), Edge::Posix(px_vtable()), None, &[], false);
     assert!(
         posix(false).expect("link") == posix(true).expect("link"),
         "the POSIX edge: the order the modules were listed in changed the module"
     );
-    let caps = |reverse| temen_leng::link_nim(&units(reverse), Edge::Caps, None, false);
+    let caps = |reverse| temen_leng::link_nim(&units(reverse), Edge::Caps, None, &[], false);
     assert!(
         caps(false).expect("link") == caps(true).expect("link"),
         "the capability edge: the order the modules were listed in changed the module"
@@ -758,8 +758,8 @@ fn a_nim_programs_heap_grows_past_its_window() {
         .collect();
     let want = format!("grew:{}\n", N + 7);
 
-    let posix =
-        temen_leng::link_nim(&units, Edge::Posix(px_vtable()), Some(&libc), false).expect("link");
+    let posix = temen_leng::link_nim(&units, Edge::Posix(px_vtable()), Some(&libc), &[], false)
+        .expect("link");
     let window = 1u64 << posix.memory.expect("a window").size_log2;
     assert!(
         window < N * 8,
@@ -780,7 +780,7 @@ fn a_nim_programs_heap_grows_past_its_window() {
         );
     }
 
-    let powerbox = temen_leng::link_nim(&units, Edge::Caps, Some(&libc), false).expect("link");
+    let powerbox = temen_leng::link_nim(&units, Edge::Caps, Some(&libc), &[], false).expect("link");
     let run = temen_run::run_powerbox(&powerbox, &[]).expect("run the powerbox program");
     assert_eq!(
         String::from_utf8_lossy(&run.stdout),
@@ -837,7 +837,7 @@ fn nim_powerbox_seeds_heap_words_to_window_top() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Caps, None, false)
+    let m = temen_leng::link_nim(&units, Edge::Caps, None, &[], false)
         .unwrap_or_else(|e| panic!("link: {e}"));
 
     // Read an 8-byte little-endian word from the linked data image at window offset `off`.
@@ -906,7 +906,7 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
     // the link) keeps the program's `data.funcref` gvar initializers valid — the funcref-carrying
     // at-exit flush this very program registers would otherwise dispatch through a stale, off-by-one
     // index.
-    let m = temen_leng::link_nim(&units, Edge::Posix(px_vtable()), None, false)
+    let m = temen_leng::link_nim(&units, Edge::Posix(px_vtable()), None, &[], false)
         .unwrap_or_else(|e| panic!("powerbox manifest link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     // The merged module carries the §3e powerbox entry shape: a paramless `_start` at function 0
@@ -1053,6 +1053,87 @@ const CAPS_MANIFEST: [&str; 6] = [
     "vm_page_size",
 ];
 
+/// **#2294: real Nim links a C library unit beside the libc**, on both edges and every engine. The
+/// library is written as the on-ramp translates C, every function taking `$sp` first:
+///
+/// - `lib_twice(x)` doubles `x` in memory the program's allocator serves: it calls back into two
+///   `exportc` procs, `host_alloc` and `host_free`, the way unir's C ABI takes its heap from the
+///   program (`unir_host_alloc`/`unir_host_free`).
+/// - `lib_say(s, n)` writes through `stream_write`, a capability the libc imports too. On the
+///   capability edge the manifest asks the host for it once, and on the POSIX edge it binds to the
+///   edge's fd 1.
+///
+/// `c_library.rs` pins the same seam toolchain-free.
+#[test]
+fn a_nim_program_links_a_c_library() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let Some(libc) = guest_libc() else {
+        eprintln!("SKIP: browser/web/assets/pg_libc.temeno absent");
+        return;
+    };
+    const LIB: &str = "\
+import 0 \"host_alloc\" (i64, i64, i64) -> (i64)
+import 1 \"host_free\" (i64, i64, i64, i64) -> ()
+import 2 \"stream_write\" (i64, i64) -> (i64)
+export 0 func \"lib_twice\" 0
+export 1 func \"lib_say\" 1
+
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 8
+  v3 = call.import 0 (v0, v2, v2)
+  v4 = i64.add v1 v1
+  i64.store v3 v4
+  v5 = i64.load v3
+  call.import 1 (v0, v3, v2, v2)
+  return v5
+  }
+}
+
+func (i64, i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64, v2: i64) {
+  v3 = call.import 2 (v1, v2)
+  return v3
+  }
+}";
+    let lib = temen_encode::encode_unit(&temen_text::parse_module(LIB).expect("parse the library"));
+    let mods = compile_to_leng(
+        &path,
+        "import std/syncio\n\
+         {.passL: \"-Wl,--unresolved-symbols=ignore-all\".}\n\
+         proc lib_twice(x: int): int {.importc: \"lib_twice\".}\n\
+         proc lib_say(s: cstring; n: int): int {.importc: \"lib_say\".}\n\
+         proc host_alloc(size, align: uint): nil pointer {.exportc: \"host_alloc\".} =\n\
+         \x20 alloc(int(size))\n\
+         proc host_free(p: nil pointer; size, align: uint) {.exportc: \"host_free\".} =\n\
+         \x20 dealloc(p)\n\
+         discard lib_say(cstring(\"said\\n\"), 5)\n\
+         write(stdout, \"twice:\" & $lib_twice(21) & \"\\n\")\n",
+    );
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    for (name, edge) in edges() {
+        let m = temen_leng::link_nim(&units, edge, Some(&libc), &[&lib], false)
+            .unwrap_or_else(|e| panic!("{name}: link: {e}"));
+        temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("{name}: verify: {e:?}"));
+        for engine in ENGINES {
+            let ran = run_on_edge(&m, edge, &[], &[], engine)
+                .unwrap_or_else(|e| panic!("{name} on {engine:?}: {e}"));
+            assert_eq!(
+                String::from_utf8_lossy(&ran.stdout),
+                "said\ntwice:42\n",
+                "{name} on {engine:?} ({:?})",
+                ran.outcome
+            );
+        }
+    }
+}
+
 /// The committed guest libc, or `None` when the asset is absent (the caller then skips).
 fn guest_libc() -> Option<Vec<u8>> {
     std::fs::read("../../browser/web/assets/pg_libc.temeno").ok()
@@ -1068,7 +1149,7 @@ fn run_libc_program(src: &str) -> Option<Vec<u8>> {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Caps, Some(&libc), false)
+    let m = temen_leng::link_nim(&units, Edge::Caps, Some(&libc), &[], false)
         .unwrap_or_else(|e| panic!("nim→powerbox link (with libc): {e}"));
     dump_module("libc_program", &m);
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
@@ -1538,7 +1619,7 @@ fn real_ioring_blocked_on_conflicting_syscall_decls() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let err = match temen_leng::link_nim(&units, Edge::Caps, guest_libc().as_deref(), false) {
+    let err = match temen_leng::link_nim(&units, Edge::Caps, guest_libc().as_deref(), &[], false) {
         Err(e) => e.to_string(),
         Ok(_) => panic!(
             "std/ioring now links — upstream aligned the three `syscall` declarations. Restore this \
@@ -1663,7 +1744,7 @@ fn runnability_sweep() {
             .iter()
             .map(|(stem, src)| temen_leng::WholeModule { stem, src })
             .collect();
-        match temen_leng::link_nim(&units, Edge::Caps, Some(&libc), false) {
+        match temen_leng::link_nim(&units, Edge::Caps, Some(&libc), &[], false) {
             Err(e) => unrunnable.push((m, format!("link: {e}"))),
             Ok(module) => match temen_verify::verify_module(&module) {
                 Err(e) => unrunnable.push((m, format!("verify: {e:?}"))),
@@ -2184,8 +2265,8 @@ fn temen_link(
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m =
-        temen_leng::link_nim(&units, edge, Some(libc), false).map_err(|e| format!("link: {e}"))?;
+    let m = temen_leng::link_nim(&units, edge, Some(libc), &[], false)
+        .map_err(|e| format!("link: {e}"))?;
     dump_module(name, &m);
     Ok(m)
 }
@@ -2374,7 +2455,7 @@ fn both_edges_serve_a_programs_streams_and_exit_status() {
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
     for (label, edge) in edges() {
-        let m = temen_leng::link_nim(&units, edge, None, false)
+        let m = temen_leng::link_nim(&units, edge, None, &[], false)
             .unwrap_or_else(|e| panic!("{label}: link: {e}"));
         for engine in ENGINES {
             let ran = run_on_edge(&m, edge, &["prog"], b"hello\n", engine)
@@ -2411,7 +2492,7 @@ fn a_panic_says_why_on_both_edges() {
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
     for (label, edge) in edges() {
-        let m = temen_leng::link_nim(&units, edge, None, false)
+        let m = temen_leng::link_nim(&units, edge, None, &[], false)
             .unwrap_or_else(|e| panic!("{label}: link: {e}"));
         for engine in ENGINES {
             let ran = run_on_edge(&m, edge, &["prog"], b"", engine)
@@ -2579,7 +2660,7 @@ fn nim_memory_maps_a_file_through_the_posix_personality() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Posix(px_vtable()), None, false)
+    let m = temen_leng::link_nim(&units, Edge::Posix(px_vtable()), None, &[], false)
         .unwrap_or_else(|e| panic!("posix-route link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     let posix = run_io_capture(
@@ -2633,7 +2714,7 @@ fn nim_unmapping_a_file_gives_its_pages_back() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Posix(px_vtable()), None, false)
+    let m = temen_leng::link_nim(&units, Edge::Posix(px_vtable()), None, &[], false)
         .unwrap_or_else(|e| panic!("posix-route link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     for backend in [temen_run::Backend::TreeWalk, temen_run::Backend::Jit] {
@@ -2716,7 +2797,7 @@ fn link_posix_program(path: &str, src: &str) -> temen_ir::Module {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Posix(px_vtable()), None, false).expect("link");
+    let m = temen_leng::link_nim(&units, Edge::Posix(px_vtable()), None, &[], false).expect("link");
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     let unbound = posix_unbound(&m);
     assert!(unbound.is_empty(), "a linked program imports {unbound:?}");
@@ -3162,7 +3243,7 @@ fn nim_reads_and_writes_files_through_the_posix_personality() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim(&units, Edge::Posix(px_vtable()), None, false)
+    let m = temen_leng::link_nim(&units, Edge::Posix(px_vtable()), None, &[], false)
         .unwrap_or_else(|e| panic!("posix-route link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     let posix = run_io_capture(
@@ -3304,6 +3385,7 @@ fn nifler2_links_through_leng() {
         &units,
         Edge::Posix(px_vtable()),
         guest_libc().as_deref(),
+        &[],
         false,
     ) {
         Ok(m) => {
@@ -3906,7 +3988,7 @@ fn nimonys_thread_tests_run_on_every_engine() {
             .iter()
             .map(|(stem, src)| temen_leng::WholeModule { stem, src })
             .collect();
-        let m = temen_leng::link_nim(&units, Edge::Caps, Some(&libc), false)
+        let m = temen_leng::link_nim(&units, Edge::Caps, Some(&libc), &[], false)
             .unwrap_or_else(|e| panic!("{name}: link: {e}"));
         temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("{name}: verify: {e:?}"));
         let backends = [

@@ -233,6 +233,7 @@ fn expect_host_link(
         &units,
         temen_leng::Edge::Posix((&names, &sigs)),
         libc,
+        &[],
         false,
     )
     .unwrap_or_else(|e| panic!("the host link: {e}"));
