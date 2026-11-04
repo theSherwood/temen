@@ -92,9 +92,25 @@ static void sleb(Emit *e, long v) {
   }
 }
 
+// v17 (#2596): a function body follows its length in bytes. The body is written before its length
+// is known, so the length is a four-byte LEB128 placeholder, patched when the body ends (a padded
+// LEB128 decodes as any other).
+static long body_begin(Emit *e) {
+  long at = e->n;
+  for (int k = 0; k < 4; k++)
+    eb(e, 0);
+  return at;
+}
+
+static void body_end(Emit *e, long at) {
+  unsigned long n = (unsigned long)(e->n - at - 4);
+  for (int k = 0; k < 4; k++)
+    e->buf[at + k] = (char)(((n >> (7 * k)) & 0x7f) | (k < 3 ? 0x80 : 0));
+}
+
 // Emit a one-function unit `(i64 a, i64 b) -> (i64)` (the raw shape `__vm_jit_invoke2` calls)
 // computing `a * k + b + w` as straight-line IR. `k`/`w` are worker-specific, so each worker JITs a
-// genuinely distinct unit. Opcodes mirror temen-encode (v16): 0x40 = i64.add and 0x42 = i64.mul of an
+// genuinely distinct unit. Opcodes mirror temen-encode (v17): 0x40 = i64.add and 0x42 = i64.mul of an
 // immediate (+ uleb operand index, sleb immediate); 0x4F 0x00 = i64.add of two values (+ uleb operand
 // indices); 0x83 = return.
 static long emit_unit(char *buf, long k, long w) {
@@ -105,7 +121,7 @@ static long emit_unit(char *buf, long k, long w) {
   eb(&e, 'T'); eb(&e, 'E'); eb(&e, 'M'); eb(&e, 'E'); eb(&e, 'N');
   eb(&e, 0); eb(&e, 0); eb(&e, 0);
   eb(&e, 0); eb(&e, 0);                 // kind = module
-  eb(&e, (16) & 0xff); eb(&e, (16) >> 8); // version (u16)
+  eb(&e, (17) & 0xff); eb(&e, (17) >> 8); // version (u16)
   eb(&e, 0); eb(&e, 0); eb(&e, 0); eb(&e, 0); // flags
   // Memory descriptor: present, size_log2 17 — must match this module's window (the validator's
   // memory-match precondition), which chibicc keeps at the 64 KiB default for a small program.
@@ -119,6 +135,7 @@ static long emit_unit(char *buf, long k, long w) {
   eb(&e, 0); // no interfaces (v6 interface section)
   eb(&e, 0); // no impl exports (v5 impl-export section)
   eb(&e, 1); // one function
+  long body = body_begin(&e);
   // params (a, b) : i64, i64 ; results : i64 (type tag 1 = i64).
   eb(&e, 2);
   eb(&e, 1);
@@ -151,6 +168,7 @@ static long emit_unit(char *buf, long k, long w) {
   eb(&e, 0x83);
   uleb(&e, 1);
   uleb(&e, 4);
+  body_end(&e, body);
   return e.n;
 }
 

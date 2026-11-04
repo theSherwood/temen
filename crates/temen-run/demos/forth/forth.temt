@@ -1167,7 +1167,7 @@ block 0 (ni: i64, no: i64) {
   blp = i64.const 65736
   z = i64.const 0
   i64.store blp z
-  ; "TEMEN\0\0\0" kind=0 version=16 flags=0
+  ; "TEMEN\0\0\0" kind=0 version=17 flags=0
   c84 = i64.const 84
   call 30 (c84)
   c69 = i64.const 69
@@ -1182,8 +1182,8 @@ block 0 (ni: i64, no: i64) {
   call 30 (z)
   call 30 (z)
   call 30 (z)
-  sixteen = i64.const 16
-  call 30 (sixteen)
+  seventeen = i64.const 17
+  call 30 (seventeen)
   call 30 (z)
   call 30 (z)
   call 30 (z)
@@ -1244,20 +1244,29 @@ block 3 (ni: i64, no: i64) {
   call 30 (z)
   one = i64.const 1
   call 30 (one)
+  ; v17: the body's length in bytes comes first. Keep four bytes at `s` for it, a padded uleb128
+  ; that block 6 fills in once the body is written.
+  blp = i64.const 65736
+  s = i64.load blp
+  c80 = i64.const 128
+  call 30 (c80)
+  call 30 (c80)
+  call 30 (c80)
+  call 30 (z)
   call 32 (ni)
   call 32 (no)
   nbp = i64.const 65592
   nb = i64.load nbp
   call 31 (nb)
-  br 4(z)
+  br 4(s, z)
   }
-block 4 (i: i64) {
+block 4 (s: i64, i: i64) {
   nbp = i64.const 65592
   nb = i64.load nbp
   c = i64.ge_s i nb
-  br_if c 6() 5(i)
+  br_if c 6(s) 5(s, i)
   }
-block 5 (i: i64) {
+block 5 (s: i64, i: i64) {
   sixteen = i64.const 16
   toff = i64.mul i sixteen
   tab = i64.const 70656
@@ -1275,11 +1284,34 @@ block 5 (i: i64) {
   i64.store blp bl1
   one = i64.const 1
   i1 = i64.add i one
-  br 4(i1)
+  br 4(s, i1)
   }
-block 6 () {
+block 6 (s: i64) {
   blp = i64.const 65736
   bl = i64.load blp
+  ; the body's length: what follows the four bytes kept at `s`, seven bits a byte
+  four = i64.const 4
+  s4 = i64.add s four
+  n = i64.sub bl s4
+  blob = i64.const 327680
+  a = i64.add blob s
+  m = i64.const 127
+  hi = i64.const 128
+  seven = i64.const 7
+  b0 = i64.and n m
+  c0 = i64.or b0 hi
+  i64.store8 a c0
+  n1 = i64.shr_u n seven
+  b1 = i64.and n1 m
+  c1 = i64.or b1 hi
+  i64.store8 a c1 offset=1
+  n2 = i64.shr_u n1 seven
+  b2 = i64.and n2 m
+  c2 = i64.or b2 hi
+  i64.store8 a c2 offset=2
+  n3 = i64.shr_u n2 seven
+  b3 = i64.and n3 m
+  i64.store8 a b3 offset=3
   return bl
   }
 }

@@ -80,7 +80,7 @@ static void emit_header(char *buf) {
   eb(buf, 'T'); eb(buf, 'E'); eb(buf, 'M'); eb(buf, 'E'); eb(buf, 'N');
   eb(buf, 0); eb(buf, 0); eb(buf, 0);
   eb(buf, 0); eb(buf, 0);                 // kind = module
-  eb(buf, (16) & 0xff); eb(buf, (16) >> 8); // version (u16)
+  eb(buf, (17) & 0xff); eb(buf, (17) >> 8); // version (u16)
   eb(buf, 0); eb(buf, 0); eb(buf, 0); eb(buf, 0); // flags
   eb(buf, 1);
   eb(buf, 17);
@@ -96,6 +96,22 @@ static void emit_i64_pair_sig(char *buf) {
   eb(buf, 1);
   eb(buf, 1);
 }
+// v17 (#2596): a function body follows its length in bytes. The body is written before its length
+// is known, so the length is a four-byte LEB128 placeholder, patched when the body ends (a padded
+// LEB128 decodes as any other).
+static long body_begin(char *buf) {
+  long at = n_out;
+  for (int k = 0; k < 4; k++)
+    eb(buf, 0);
+  return at;
+}
+
+static void body_end(char *buf, long at) {
+  unsigned long n = (unsigned long)(n_out - at - 4);
+  for (int k = 0; k < 4; k++)
+    buf[at + k] = (char)(((n >> (7 * k)) & 0x7f) | (k < 3 ? 0x80 : 0));
+}
+
 // `(a, b) -> a <op> b`, self-contained: 0x4F (an i64 binop of two values), then the BinOp index
 // `op` (0 = add, 2 = mul).
 static long emit_binop(char *buf, int op) {
@@ -105,6 +121,7 @@ static long emit_binop(char *buf, int op) {
   eb(buf, 0); // 0 interfaces (v6 interface section)
   eb(buf, 0); // 0 impl exports (v5 impl-export section)
   eb(buf, 1); // 1 function
+  long body = body_begin(buf);
   emit_i64_pair_sig(buf);
   eb(buf, 1); // 1 block
   eb(buf, 0); // its parent: none, it is the entry (v14)
@@ -120,6 +137,7 @@ static long emit_binop(char *buf, int op) {
   eb(buf, 0x83); // return v2
   uleb(buf, 1);
   uleb(buf, 2);
+  body_end(buf, body);
   return n_out;
 }
 // `poly(a, b) = add(mul(a, a), b)` — imports `mul` (idx 0) and `add` (idx 1) by name.
@@ -147,6 +165,7 @@ static long emit_poly(char *buf) {
   emit_i64_pair_sig(buf);
   eb(buf, 0); // 0 impl exports (v5 impl-export section)
   eb(buf, 1); // 1 function
+  long body = body_begin(buf);
   emit_i64_pair_sig(buf);
   eb(buf, 1); // 1 block
   eb(buf, 0); // its parent: none, it is the entry (v14)
@@ -176,6 +195,7 @@ static long emit_poly(char *buf) {
   eb(buf, 0x83); // return v5
   uleb(buf, 1);
   uleb(buf, 5);
+  body_end(buf, body);
   return n_out;
 }
 
