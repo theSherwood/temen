@@ -318,13 +318,19 @@ found (#2603):
   pointer. The caller's spill slots survive the call: a host callee writes the caller's stack only
   through a *write*-buffer pointer its contract names, so exactly that buffer's slots are dropped; a
   *read* buffer it only reads (GcRoots' marshalling struct) drops nothing; and the context-pointer
-  spills (`mem_base`, `vmctx`, the fuel cell) survive either way. A frame pointer the contract does
-  not model forces a full clear, the sound fallback — so every host call that hands the host a
-  caller-frame pointer in an argument register is tagged (the fiber and thread status words in
-  `rdx`/`rcx`/`r8`, the signal record in `rsi`, GcRoots' struct in `rdi`), or that fallback fires
-  needlessly and, once the validator is fail-closed (#2536), could refuse sound thread/fiber/GC code.
-  The `call.cap` marshalling buffers ride the stack (past the sixth argument) and are tagged in a
-  later #2534 slice, when stack-passed arguments carry facts.
+  spills (`mem_base`, `vmctx`, the fuel cell) survive either way. This holds for an **identified**
+  callee of any kind: a guest callee (a direct call or a `call.dyn`) writes only its own frame, below
+  this `rsp`, and so tags no caller buffer, so a frame pointer sitting in an argument register across
+  it — a `mem_base` or fuel-cell pointer left there as scratch — is not something it writes through
+  and is ignored. Only an **unidentified** callee, whose target and thus whose writes are unknown,
+  forces the full data-slot clear, the sound fallback. (#2739: keying that clear on the contract
+  being argument-less rather than on identification dropped exactly those context spills across a
+  `call.dyn` in a loop, so the reloaded fuel cell read `Unknown`, its refill decoded as an
+  unidentified call, and `rsp` fell to unknown — cascading a whole function to a false rejection.)
+  Every host call that *does* write a caller-frame pointer must still tag it (the fiber and thread
+  status words in `rdx`/`rcx`/`r8`, the signal record in `rsi`, GcRoots' struct in `rdi`), or the
+  validator would miss that write. The `call.cap` marshalling buffers ride the stack (past the sixth
+  argument) and are tagged in a later #2534 slice, when stack-passed arguments carry facts.
 - A type check proves something only on its equal edge, and only of the record whose type id it
   loaded: every register still holding that record's address. A record never changes, so the proof
   outlives a call in a register the callee keeps. `test r, r` is exactly `cmp r, 0`.
