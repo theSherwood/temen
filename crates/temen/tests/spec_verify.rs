@@ -535,8 +535,9 @@ fn directed_rule_rejects() {
         name: "main".into(),
         func: 0,
     });
+    // The second occurrence is the one reported.
     reject(&m, "duplicate export", |e| {
-        matches!(e, VerifyError::DuplicateExport { .. })
+        matches!(e, VerifyError::DuplicateExport { export: 1 })
     });
 
     // Interface offers (IMPORTS.md §3.2, v6): real op targets, non-empty op lists, a
@@ -619,7 +620,7 @@ fn directed_rule_rejects() {
         m.impl_exports.push(offer(1, vec![0]));
     }
     reject(&m, "duplicate impl export", |e| {
-        matches!(e, VerifyError::DuplicateImplExport { .. })
+        matches!(e, VerifyError::DuplicateImplExport { export: 1 })
     });
     let mut m = offer_module();
     m.exports.push(Export {

@@ -3453,7 +3453,7 @@ pub fn bash_exec_with(
     };
     // Uncached path: compile fresh (the cross-Run cache lives in `temen_run_bash`, which has the module
     // bytes to key on). `bash_exec` / native callers pay one compile.
-    let Some(compiled) = bytecode::compile_reserved(m) else {
+    let Some(compiled) = bytecode::compile_reserved(&std::sync::Arc::new(m.clone())) else {
         return unsupported(STATUS_UNSUPPORTED);
     };
     let commands: Vec<(PreparedModule, Vec<&str>)> = bins
@@ -3519,7 +3519,9 @@ fn bash_run_over_compiled(
 /// fills the slot again.
 struct ProgramCache {
     key: u64,
-    module: temen_ir::Module,
+    /// Shared with its bytecode program, which compiles its functions as they are first entered
+    /// (#2764).
+    module: std::sync::Arc<temen_ir::Module>,
     /// Its bytecode program, compiled on the first run that needs one: a wasm-JIT run takes only the
     /// module. `None` inside for a module outside the bytecode subset.
     compiled: std::sync::OnceLock<Option<std::sync::Arc<temen_interp::bytecode::Compiled>>>,
@@ -3531,7 +3533,7 @@ struct ProgramCache {
 
 /// A module with its cap calls outlined, and its bytecode program ([`ProgramCache::outlined`]).
 type Outlined = (
-    temen_ir::Module,
+    std::sync::Arc<temen_ir::Module>,
     std::sync::Arc<temen_interp::bytecode::Compiled>,
 );
 static mut BASH_PROGRAM: Option<ProgramCache> = None;
@@ -3570,7 +3572,7 @@ fn cached_module(
         temen_verify::verify_module(&m).map_err(|_| STATUS_VERIFY_ERR)?;
         *slot = Some(ProgramCache {
             key,
-            module: m,
+            module: std::sync::Arc::new(m),
             compiled: std::sync::OnceLock::new(),
             outlined: std::sync::OnceLock::new(),
         });
@@ -3596,7 +3598,7 @@ fn cached_program(
         .get_or_init(|| bytecode::compile_reserved(&c.module))
         .clone()
         .ok_or(STATUS_UNSUPPORTED)?;
-    Ok((&c.module, compiled))
+    Ok((&*c.module, compiled))
 }
 
 /// #1414 S4-3b — open a pump run of `c`'s program over the memfs `image` with `argv`, its root offered
@@ -3610,8 +3612,9 @@ fn coop_open_fs(c: &'static ProgramCache, image: &[u8], argv: &[&[u8]], shared: 
     let set = |s: i32| unsafe { LAST_STATUS = s };
     temen_coop_close();
     let outlined = c.outlined.get_or_init(|| {
-        let mut m = c.module.clone();
+        let mut m = temen_ir::Module::clone(&c.module);
         temen_wasm_jit::outline_cap_calls(&mut m);
+        let m = std::sync::Arc::new(m);
         let compiled = bytecode::compile_reserved(&m)?;
         Some((m, compiled))
     });
@@ -4038,7 +4041,9 @@ fn onramp_fs_run(
         Err(status) => return PbOutcome::refused(status),
     };
     host.stdin = stdin.to_vec();
-    let Some(compiled) = compiled.or_else(|| bytecode::compile_reserved(m)) else {
+    let compiled =
+        compiled.or_else(|| bytecode::compile_reserved(&std::sync::Arc::new(m.clone())));
+    let Some(compiled) = compiled else {
         return PbOutcome::refused(STATUS_UNSUPPORTED);
     };
     let mut fuel = DEFAULT_FUEL;

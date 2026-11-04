@@ -576,6 +576,37 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
 
 ---
 
+## Compile on first entry (#2764)
+
+A module's functions compile the first time a run enters one (`Compiled::prog`), not all of them
+before the entry runs. A start runs a fraction of its image: a QuickJS start that evaluates
+`print(1+1);` enters 135 of `qjs_repl`'s 1,194 functions (28% of its ops), and Lua's 195 of 701.
+
+- **The per-op read checks nothing.** Each program sits in a `OnceLock`. A prototype that read it
+  through the cell on every op ran 8–13% slower on `fib(25)`, because op dispatch is only a few
+  instructions. So the run loop keeps its current function's op slice, set again wherever the
+  current function changes (`enter!`), and reads `ops[pc]`, one index fewer than before. In test
+  builds a debug assertion checks the slice on every op.
+- **A module still declines whole, before any of it runs (invariant 9).** Only cap calls decline,
+  so admission (`admits_funcs`) tries each cap call through the lowering the compile itself uses
+  (`lower_cap_call`).
+- **The IR is shared, not copied.** `Compiled` keeps what it compiles from (`Ir`): the module a
+  temen-run start's host runs as its own (an `Arc` the `Instance` shares, which also ends a deep
+  clone per run), a grant's module, a §22 unit's functions, or the browser cache's module. A
+  caller that has only a `&Module` compiles from a copy.
+- **Measured** (minimum of 21 runs, 3 alternating rounds, against the previous head):
+
+  | | before | after |
+  |---|---:|---:|
+  | QuickJS start, `print(1+1)` | 68.3 ms | 40.2 ms |
+  | Lua start, `print(1+1)` | 18.8 ms | 11.4 ms |
+  | MicroPython start, `print(1+1)` | 11.5 ms | 6.1 ms |
+  | `qjs_repl`'s bytecode load (compile → admission) | 16.0 ms | 2.1 ms |
+  | QuickJS `fib(25)` run (min of 5) | 3236 ms | 3186 ms |
+  | Lua `fib(25)` run (min of 5) | 993 ms | 1009 ms |
+
+  Run time is within noise.
+
 ## Validation strategy (every phase)
 
 - Full differential oracle must stay green: `jit_diff`, `jit_fuzz`, `fiber_fuzz`, `concurrent_fuzz`,

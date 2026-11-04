@@ -6323,6 +6323,15 @@ impl HostFn {
         }
     }
 
+    /// Whether the validator may treat a call to this host function as an I5 **safepoint** (exempt
+    /// from the stack-check-domination rule, `validate::Contract::safepoint`). Only `trap_capture`:
+    /// `emit_trap` calls it on trap paths that branch off before the prologue's overflow check (the
+    /// epoch/fuel/overflow traps), so it rides the `RED_ZONE` margin like the fuel refill, and no
+    /// other host call is reached before the check.
+    fn is_safepoint(self) -> bool {
+        matches!(self, HostFn::TrapCapture)
+    }
+
     /// Its C signature, in the target's calling convention `cc`.
     fn signature(self, cc: cranelift_codegen::isa::CallConv) -> Signature {
         use HostFn::*;
@@ -6962,6 +6971,7 @@ fn callee_contracts(module: &JITModule) -> Vec<Option<validate::Contract>> {
             let mut c = validate::contract(&decl.signature);
             if let (Some(c), Some(name)) = (c.as_mut(), decl.name.as_deref()) {
                 c.args = host_args(name);
+                c.safepoint = host_safepoint(name);
             }
             out[i] = c;
         }
@@ -6983,6 +6993,16 @@ fn host_args(name: &str) -> &'static [validate::ArgTag] {
         .iter()
         .find(|h| h.symbol() == name)
         .map_or(&[], |h| h.arg_contract())
+}
+
+/// Whether the host function a symbol names is an I5 safepoint (`HostFn::is_safepoint`) — the
+/// validator exempts its calls from stack-check domination. A guest function or an unknown symbol
+/// never is.
+fn host_safepoint(name: &str) -> bool {
+    HostFn::ALL
+        .iter()
+        .find(|h| h.symbol() == name)
+        .is_some_and(|h| h.is_safepoint())
 }
 
 #[cfg(test)]
@@ -7467,6 +7487,69 @@ block 2 (v7: i32) {
             a.len(),
             b.len()
         );
+    }
+
+    /// #2534 PR 5a — a **signal-armed** compile (`compile_with_signal` with a `SignalArm`, the one-shot
+    /// async-signal entry `compile_and_run_with_host_signals` uses) is machine-code-validator-clean,
+    /// including under `-g` (so `emit_trap`'s `trap_capture` calls are emitted). This is the
+    /// regression for the signal-arm prologue's three issues: the fn-table **handler dispatch** is a
+    /// dead dispatch whose type is `NO_MATCH` (A1 — an unidentified fallback poisoned `rsp` through the
+    /// re-poll loop and cascaded to 100+ findings); the `SigTake`/dispatch/`SigReturn` **safepoint
+    /// calls** run before the overflow check (A2 — `emit_signal_check` now follows `emit_stack_check`,
+    /// so they are dominated); and `trap_capture` on the prologue trap paths (A3 — an I5 safepoint).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn validator_is_clean_on_a_signal_armed_compile() {
+        let mut fuel = FuelCell::fixed(1);
+        let interrupt = AtomicU64::new(0);
+        let armed = core::sync::atomic::AtomicBool::new(false);
+        let mut calls = program(CALLS);
+        calls.debug_info = Some(temen_ir::DebugInfo::default()); // -g, so `trap_capture` is emitted
+        validate::arm_capture();
+        CompiledModule::compile_with_signal(
+            &calls,
+            0,
+            cap_thunk,
+            core::ptr::null_mut(),
+            0,
+            None,
+            Some(&interrupt as *const AtomicU64),
+            Some(&mut *fuel as *mut FuelCell),
+            Some(resolver),
+            None,
+            0,
+            Some(SignalArm {
+                armed: &armed,
+                take: sig_take,
+                ret: sig_return,
+                ctx: core::ptr::null_mut(),
+            }),
+            None,
+        )
+        .expect("a signal-armed compile");
+        let caps = validate::take_capture();
+        assert!(
+            !caps.is_empty(),
+            "the compile defined no functions to check"
+        );
+        for (i, c) in caps.iter().enumerate() {
+            let guest = validate::Guest {
+                window: c.window,
+                table: c.table,
+                types: &c.types,
+            };
+            let frame = validate::Frame {
+                stack_args: c.contract.and_then(|k| k.pops),
+                sret_results: c.sret_results,
+            };
+            let findings =
+                validate::x86::check(&c.code, &c.relocs, validate::Entry::Guest(&guest), frame);
+            assert!(
+                findings.is_empty(),
+                "signal-armed fn#{i} ({} bytes) flagged: {findings:#?}",
+                c.code.len()
+            );
+        }
     }
 }
 
@@ -8912,9 +8995,15 @@ fn build_clif(
     }) {
         emit_domain_poll(&mut b, &lower);
     }
-    emit_signal_check(&mut b, &lower)?; // #932 async signal delivery (no-op when disarmed)
     emit_fuel_check(&mut b, &lower);
     emit_stack_check(&mut b, &lower);
+    // #932 async signal delivery (no-op when disarmed). After the stack check so its safepoint
+    // calls (`SigTake`, the guest-handler dispatch, `SigReturn`) are dominated by the overflow guard
+    // (I5): the guard fires before any host call or guest-handler dispatch runs on this frame, and
+    // the validator needs no I5 exemption for them. Fuel stays before the stack check (the bytecode
+    // VM burns fuel before opening the frame, so the engines agree on fuel-vs-overflow at an entry);
+    // moving the signal poll last also matches the VM, which polls signals after both (#932).
+    emit_signal_check(&mut b, &lower)?;
     b.ins().jump(blocks.clif[0], &entry_args);
 
     let mut checked = CheckedBases::new(&lower, f);
@@ -8925,7 +9014,200 @@ fn build_clif(
 
     b.seal_all_blocks();
     b.finalize();
+    // A loop is a cycle, and a cycle has an edge to an earlier or the same block: a function with
+    // none has nothing to lay out.
+    let cyclic = f.blocks.iter().enumerate().any(|(i, blk)| {
+        (0..)
+            .map_while(|k| blk.term.edge(k))
+            .any(|(to, _)| to as usize <= i)
+    });
+    if cyclic {
+        lay_out_loop_branches(clif);
+    }
     Ok(())
+}
+
+/// #2758 — point each loop branch at the layout that jumps least. Where it can, Cranelift lays out a
+/// `brif`'s else-target right after it, so the producer's polarity decides how many jumps a loop
+/// takes: a `while` that branches into its body (`br_if cond body exit`, as temen-leng lowers one)
+/// jumps into the body and back each iteration, where one that exits on the branch only jumps back.
+/// A `brif` in a loop gets the target that continues the loop on its else-edge when the other target
+/// leaves the loop, and a back edge (which can't fall through) on its then-edge. A swap tests the
+/// condition's complement, which Cranelift folds into an integer compare.
+fn lay_out_loop_branches(func: &mut Function) {
+    use cranelift_codegen::cursor::{Cursor, FuncCursor};
+    use cranelift_codegen::ir::{InstructionData, Opcode};
+    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
+    let domtree = cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
+    let mut loops = cranelift_codegen::loop_analysis::LoopAnalysis::new();
+    loops.compute(func, &cfg, &domtree);
+    let blocks: Vec<_> = func.layout.blocks().collect();
+    for block in blocks {
+        let Some(lp) = loops.innermost_loop(block) else {
+            continue;
+        };
+        let Some(inst) = func.layout.last_inst(block) else {
+            continue;
+        };
+        let InstructionData::Brif {
+            opcode: Opcode::Brif,
+            arg,
+            blocks: [then, els],
+        } = func.dfg.insts[inst]
+        else {
+            continue;
+        };
+        let pool = &func.dfg.value_lists;
+        let (t, e) = (then.block(pool), els.block(pool));
+        let back = |to| domtree.block_dominates(to, block);
+        let swap = if back(t) || back(e) {
+            back(e) && !back(t)
+        } else {
+            loops.is_in_loop(t, lp) && !loops.is_in_loop(e, lp)
+        };
+        if swap {
+            let loc = func.srcloc(inst);
+            let mut pos = FuncCursor::new(func).at_inst(inst).with_srcloc(loc);
+            let done = pos.ins().icmp_imm(IntCC::Equal, arg, 0);
+            pos.func.dfg.insts[inst] = InstructionData::Brif {
+                opcode: Opcode::Brif,
+                arg: done,
+                blocks: [els, then],
+            };
+        }
+    }
+}
+
+#[cfg(test)]
+mod loop_layout_tests {
+    use super::*;
+    use cranelift_codegen::ir::{Block as ClifBlock, InstructionData, Opcode};
+
+    /// `fn(n) -> i`: a `while (i < n) i++` whose header tests at the top, with the body on the
+    /// branch's then-edge (`body_on_then`) or its else-edge.
+    fn while_loop(body_on_then: bool) -> (Function, ClifBlock, ClifBlock, ClifBlock) {
+        let mut func = Function::new();
+        func.signature.params.push(AbiParam::new(I64));
+        func.signature.returns.push(AbiParam::new(I64));
+        let mut fctx = FunctionBuilderContext::new();
+        let mut b = FunctionBuilder::new(&mut func, &mut fctx);
+        let (entry, header, body, exit) = (
+            b.create_block(),
+            b.create_block(),
+            b.create_block(),
+            b.create_block(),
+        );
+        b.append_block_params_for_function_params(entry);
+        b.append_block_param(header, I64);
+        b.switch_to_block(entry);
+        let n = b.block_params(entry)[0];
+        let zero = b.ins().iconst(I64, 0);
+        b.ins().jump(header, &[BlockArg::from(zero)]);
+        b.switch_to_block(header);
+        let i = b.block_params(header)[0];
+        if body_on_then {
+            let c = b.ins().icmp(IntCC::SignedLessThan, i, n);
+            b.ins().brif(c, body, &[], exit, &[]);
+        } else {
+            let c = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, i, n);
+            b.ins().brif(c, exit, &[], body, &[]);
+        }
+        b.switch_to_block(body);
+        let next = b.ins().iadd_imm(i, 1);
+        b.ins().jump(header, &[BlockArg::from(next)]);
+        b.switch_to_block(exit);
+        b.ins().return_(&[i]);
+        b.seal_all_blocks();
+        b.finalize();
+        (func, header, body, exit)
+    }
+
+    /// `fn(n) -> n`: a `do i++ while (i < n)` whose one block tests at its end, with the back edge
+    /// on the branch's then-edge (`back_on_then`) or its else-edge.
+    fn do_while(back_on_then: bool) -> (Function, ClifBlock, ClifBlock) {
+        let mut func = Function::new();
+        func.signature.params.push(AbiParam::new(I64));
+        func.signature.returns.push(AbiParam::new(I64));
+        let mut fctx = FunctionBuilderContext::new();
+        let mut b = FunctionBuilder::new(&mut func, &mut fctx);
+        let (entry, body, exit) = (b.create_block(), b.create_block(), b.create_block());
+        b.append_block_params_for_function_params(entry);
+        b.append_block_param(body, I64);
+        b.switch_to_block(entry);
+        let n = b.block_params(entry)[0];
+        let zero = b.ins().iconst(I64, 0);
+        b.ins().jump(body, &[BlockArg::from(zero)]);
+        b.switch_to_block(body);
+        let i = b.block_params(body)[0];
+        let next = b.ins().iadd_imm(i, 1);
+        let again = [BlockArg::from(next)];
+        if back_on_then {
+            let c = b.ins().icmp(IntCC::SignedLessThan, next, n);
+            b.ins().brif(c, body, &again, exit, &[]);
+        } else {
+            let c = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, next, n);
+            b.ins().brif(c, exit, &[], body, &again);
+        }
+        b.switch_to_block(exit);
+        b.ins().return_(&[n]);
+        b.seal_all_blocks();
+        b.finalize();
+        (func, body, exit)
+    }
+
+    /// The `brif` ending `block`: its condition and its then- and else-targets.
+    fn branch(func: &Function, block: ClifBlock) -> (Value, ClifBlock, ClifBlock) {
+        let inst = func.layout.last_inst(block).expect("a terminator");
+        let InstructionData::Brif {
+            arg,
+            blocks: [then, els],
+            ..
+        } = func.dfg.insts[inst]
+        else {
+            panic!("{block} doesn't end in a brif");
+        };
+        let pool = &func.dfg.value_lists;
+        (arg, then.block(pool), els.block(pool))
+    }
+
+    #[test]
+    fn a_header_that_branches_into_its_body_falls_into_it_instead() {
+        let (mut func, header, body, exit) = while_loop(true);
+        let (before, ..) = branch(&func, header);
+        lay_out_loop_branches(&mut func);
+        let (cond, then, els) = branch(&func, header);
+        assert_eq!(
+            (then, els),
+            (exit, body),
+            "the body is the else-target, laid out next"
+        );
+        let def = func.dfg.value_def(cond).unwrap_inst();
+        assert!(matches!(
+            func.dfg.insts[def],
+            InstructionData::IntCompareImm { opcode: Opcode::IcmpImm, cond: IntCC::Equal, arg, imm }
+                if arg == before && imm.bits() == 0
+        ));
+    }
+
+    #[test]
+    fn a_header_that_exits_on_its_branch_is_left_alone() {
+        let (mut func, header, body, exit) = while_loop(false);
+        lay_out_loop_branches(&mut func);
+        assert_eq!(branch(&func, header).1, exit);
+        assert_eq!(branch(&func, header).2, body);
+    }
+
+    #[test]
+    fn a_back_edge_goes_on_the_then_edge() {
+        // Already there: left alone.
+        let (mut func, body, exit) = do_while(true);
+        lay_out_loop_branches(&mut func);
+        assert_eq!((branch(&func, body).1, branch(&func, body).2), (body, exit));
+        // On the else-edge, where it can't fall through: swapped.
+        let (mut func, body, exit) = do_while(false);
+        lay_out_loop_branches(&mut func);
+        assert_eq!((branch(&func, body).1, branch(&func, body).2), (body, exit));
+    }
 }
 
 /// Build the fixed buffer-ABI trampoline `fn(args_ptr, results_ptr, mem_base,

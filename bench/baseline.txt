@@ -4,18 +4,16 @@
 # machines, so take the baseline on the machine that checks: the nightly bench job's log ends
 # with this file, as of that run. Elsewhere: cargo run --release -- --save-baseline FILE
 # columns: kernel,compute_vs_wasm32,compute_vs_wasm64,cold_vs_wasmtime,interp_vs_jit,jit_vs_native
-alu,1.016,1.015,1.308,70.683,5.082
-memsum,1.512,1.008,1.225,248.527,1.294
-scatter,1.065,0.696,1.212,320.780,0.937
-# simd: projected from the Nov 3 row for #2749 (the JIT lane's median halves: compute 2.0 -> 1.0,
-# interp/jit doubles) until the next nightly's file replaces this one.
-simd,1.000,1.000,1.304,357.800,NA
-float,1.010,1.010,1.321,64.339,1.011
-calli,1.293,1.294,0.863,61.805,1.812
-calli_poly,1.049,1.047,0.785,24.324,1.236
-cache,1.007,0.765,1.157,164.778,1.336
-alu_c,1.011,1.011,1.894,129.965,5.050
-locals_c,1.506,1.004,1.714,476.506,1.403
-irreducible,0.184,NA,1.529,472.120,NA
-hostcall,1.081,NA,1.463,NA,NA
-hostbuf,0.481,NA,1.083,NA,NA
+alu,1.018,1.013,1.408,45.113,5.115
+memsum,1.029,0.596,1.242,375.725,0.812
+scatter,1.036,0.612,1.214,242.631,1.365
+simd,1.068,1.061,1.352,125.902,NA
+float,1.024,1.027,1.331,40.216,1.029
+calli,1.110,1.103,1.049,48.546,1.292
+calli_poly,0.998,0.992,1.074,14.410,0.974
+cache,1.003,0.683,1.220,189.657,0.947
+alu_c,1.019,1.022,2.142,85.414,5.070
+locals_c,1.654,0.975,1.850,433.982,1.314
+irreducible,0.305,NA,1.596,283.881,NA
+hostcall,0.774,NA,1.519,NA,NA
+hostbuf,0.427,NA,1.150,NA,NA

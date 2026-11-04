@@ -19,6 +19,7 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 use temen_ir::{Block, BlockIdx, Func, Inst, Module, Terminator, VShape, ValIdx, ValType};
@@ -347,7 +348,9 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
     }
     // Named exports must point at a real function and be uniquely addressable (backends ignore the
     // table, but the host resolves `call("name")` through it, so a dangling/ambiguous name is
-    // fail-closed here).
+    // fail-closed here). The names seen so far are a set, so the check is linear in the exports
+    // rather than quadratic (#2586); a repeated name fails at its second occurrence, as before.
+    let mut export_names = BTreeSet::new();
     for (ei, e) in m.exports.iter().enumerate() {
         if e.func as usize >= m.funcs.len() {
             return Err(VerifyError::ExportFuncOutOfRange {
@@ -355,7 +358,7 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
                 func: e.func,
             });
         }
-        if m.exports[..ei].iter().any(|o| o.name == e.name) {
+        if !export_names.insert(e.name.as_str()) {
             return Err(VerifyError::DuplicateExport { export: ei as u32 });
         }
     }
@@ -363,6 +366,7 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
     // signature IS that function's declared type, so a dangling index would leave the interface
     // unspecifiable), the op list must be non-empty, and names must be unique across *both*
     // export namespaces (the host wires offers by name).
+    let mut impl_names = BTreeSet::new();
     for (ei, e) in m.impl_exports.iter().enumerate() {
         if e.ops.is_empty() {
             return Err(VerifyError::ImplExportEmpty { export: ei as u32 });
@@ -401,9 +405,7 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
                 });
             }
         }
-        if m.impl_exports[..ei].iter().any(|o| o.name == e.name)
-            || m.exports.iter().any(|o| o.name == e.name)
-        {
+        if !impl_names.insert(e.name.as_str()) || export_names.contains(e.name.as_str()) {
             return Err(VerifyError::DuplicateImplExport { export: ei as u32 });
         }
     }
