@@ -51,9 +51,8 @@
 //!     that straddles a 64-byte line can run 2× slower on either engine, so each lane is the median
 //!     over layouts that step the loop across a whole line, and the table shows the JIT's spread.
 //!   - every hand-written kernel's loop header exits on its `br_if`'s taken edge and falls through
-//!     to the body, the shape temen's C frontend and wasm transpiler emit (#2754). Cranelift lays a
-//!     branch's else-target out right after it, so a loop written the other way round takes an
-//!     extra jump each iteration that no producer's code pays.
+//!     to the body, the shape temen's C frontend and wasm transpiler emit (#2754). The JIT now lays
+//!     a loop out that way whichever edge its producer put the body on (#2758).
 //!   - *cold start* times the whole path source → first result (n=0, so the loop body never
 //!     runs but the full function is still compiled).
 //!
