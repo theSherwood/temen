@@ -1520,6 +1520,8 @@ fn translate_impl(
     // Dominance form (#2454): a value reaches the blocks it dominates as a capture, not as a param of
     // every block between. The data-SP is the function's first param, which a block captures.
     t.module.raise();
+    // A constant an integer op reads is the op's immediate (#2585).
+    t.module.fold_immediates();
     Ok(t)
 }
 
@@ -3136,6 +3138,14 @@ struct Scan {
     /// (`movsx (mem)`) instead of a zero-extending load + a separate register sign-extend. Pure
     /// value-lowering peephole — confinement/width unchanged, verifier re-checks, +0 escape-TCB.
     sext_fused: HashMap<Name, (u32, u32)>,
+    /// The scalar GEPs whose every use is a load's or store's address or another GEP's base
+    /// ([`foldable`], #2583). One whose constant part fits an access's offset ([`fits_offset`])
+    /// lowers to its address without it, which each use adds: a load or store as its offset, a
+    /// GEP to its own constant.
+    folded: HashSet<ValueId>,
+    /// The static allocas used only that way whose frame offset fits, each with the offset. One
+    /// has no value at all: in every block its address is the data-SP plus the offset.
+    slots: HashMap<ValueId, u64>,
 }
 
 impl Scan {
@@ -3192,12 +3202,13 @@ fn translate_func(
     // A small by-value struct return flattens to a multi-result signature (§3a).
     let results = result_types(f.return_type.as_ref(), types)?;
 
-    let scan = scan_func(f, types)?;
+    let mut scan = scan_func(f, types)?;
+    let (frame, frame_size) = frame_layout(f, &scan, types)?;
+    (scan.folded, scan.slots) = foldable(f, &scan, &frame, types)?;
     let cfg = cfg(f, &scan)?;
     let order = cfg.rpo();
     let block_params = block_params(f, &scan);
     let captured = captures(f, &scan, &cfg, &order)?;
-    let (frame, frame_size) = frame_layout(f, &scan, types)?;
 
     let n = f.basic_blocks.len();
     let mut blocks: Vec<Option<Block>> = (0..n).map(|_| None).collect();
@@ -3445,6 +3456,77 @@ fn frame_layout(
     Ok((frame, off.div_ceil(16) * 16))
 }
 
+/// Pass 1a′ (#2583): the addresses whose constant offset the accesses through them take as their own
+/// offset. A candidate is a scalar GEP (its address without its constant part, the constant
+/// carried) or a static alloca (the data-SP, its frame offset carried). It folds when every use
+/// takes the offset: a load's or store's address, or a GEP's base, which adds it to its own
+/// constant. Any other use reads it as a value, so it keeps its value: one add where it is defined
+/// rather than one at each such use.
+///
+/// An access takes an offset `c` only when `c` is at most the NULL guard ([`fits_offset`]).
+fn foldable(
+    f: &Function,
+    s: &Scan,
+    frame: &HashMap<ValueId, u64>,
+    types: &Types,
+) -> Result<(HashSet<ValueId>, HashMap<ValueId, u64>), Error> {
+    let mut geps = HashSet::new();
+    let mut slots = HashMap::new();
+    for instr in f.basic_blocks.iter().flat_map(|bb| &bb.instrs) {
+        match instr {
+            Instruction::GetElementPtr(g) if gep_lanes(g, types).is_none() => {
+                geps.extend(s.name2id.get(&g.dest).copied());
+            }
+            Instruction::Alloca(a) => {
+                let v = s.name2id.get(&a.dest).copied();
+                let off = v.and_then(|v| frame.get(&v)).copied();
+                if let (Some(v), Some(off)) = (v, off.filter(|&o| fits_offset(o as i64))) {
+                    slots.insert(v, off);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut keep = |name: &Name| {
+        if let Some(v) = s.name2id.get(name) {
+            geps.remove(v);
+            slots.remove(v);
+        }
+    };
+    for bb in &f.basic_blocks {
+        for instr in &bb.instrs {
+            match instr {
+                // A load's one operand is its address. A GEP's base takes the offset, and its
+                // indices are integers.
+                Instruction::Load(_) | Instruction::GetElementPtr(_) => {}
+                Instruction::Store(st) => local_name(&st.value).into_iter().for_each(&mut keep),
+                Instruction::Phi(p) => (p.incoming_values.iter())
+                    .filter_map(|(op, _)| local_name(op))
+                    .for_each(&mut keep),
+                other => local_uses(other)?.iter().for_each(&mut keep),
+            }
+        }
+        term_local_uses(&bb.term)?.iter().for_each(&mut keep);
+    }
+    Ok((geps, slots))
+}
+
+/// The name of a local operand.
+fn local_name(op: &Operand) -> Option<&Name> {
+    match op {
+        Operand::LocalOperand { name, .. } => Some(name),
+        _ => None,
+    }
+}
+
+/// Whether a load or store can take the constant `c` as its offset ([`foldable`]): when
+/// `0 ≤ c ≤` the NULL guard. Its effective address `addr + c` is a checked add, which traps on the
+/// overflow where `addr + c` as an `i64.add` would wrap. That differs only when the wrapped address
+/// is below `c`, inside the guard: nothing lives there, so the access traps either way.
+fn fits_offset(c: i64) -> bool {
+    (0..=temen_ir::POWERBOX_NULL_GUARD as i64).contains(&c)
+}
+
 /// The count of **variadic** (beyond-the-fixed) arguments of a call to a `(...)` function — direct
 /// or **indirect** (a `(...)` function pointer) — or `None` if `c` is not a varargs call. The
 /// fixed-parameter count comes from the call's declared function type (`param_types`); the variadic
@@ -3475,6 +3557,8 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
         block_idx: HashMap::new(),
         block_name: Vec::new(),
         sext_fused: HashMap::new(),
+        folded: HashSet::new(),
+        slots: HashMap::new(),
     };
     for (bi, bb) in f.basic_blocks.iter().enumerate() {
         s.block_idx.insert(bb.name.clone(), bi);
@@ -17609,7 +17693,7 @@ fn captures(f: &Function, s: &Scan, cfg: &Cfg, order: &[u32]) -> Result<Vec<Vec<
         let mut c = vec![SP];
         let mut read = |name: &Name| {
             if let Some(&v) = s.name2id.get(name) {
-                if s.defined_in(v) != bi {
+                if s.defined_in(v) != bi && !s.slots.contains_key(&v) {
                     c.push(v);
                 }
             }
@@ -17648,16 +17732,18 @@ fn captures(f: &Function, s: &Scan, cfg: &Cfg, order: &[u32]) -> Result<Vec<Vec<
 /// each of its parts (a wide vector's, a flat struct's), which can live in different blocks.
 type Defs = HashMap<ValueId, Parts>;
 
-/// A translated value's place, or its parts' places.
+/// A translated value's place, or its parts' places. A folded GEP ([`Scan::folded`]) is its
+/// address without its constant offset, with the offset its uses add.
 enum Parts {
     One((BlockIdx, ValIdx)),
+    Offset((BlockIdx, ValIdx), u64),
     Many(Vec<(BlockIdx, ValIdx)>),
 }
 
 impl Parts {
     fn as_slice(&self) -> &[(BlockIdx, ValIdx)] {
         match self {
-            Parts::One(v) => core::slice::from_ref(v),
+            Parts::One(v) | Parts::Offset(v, _) => core::slice::from_ref(v),
             Parts::Many(v) => v,
         }
     }
@@ -17768,6 +17854,9 @@ struct BlockCtx<'a> {
     link: Option<&'a LinkCtx>,
     insts: Vec<Inst>,
     idx_of: HashMap<ValueId, ValIdx>,
+    /// The constant offset of each folded GEP this block holds ([`Scan::folded`]): its value in
+    /// `idx_of` is its address without it.
+    offs: HashMap<ValueId, u64>,
     /// Aggregate SSA values (a small by-value struct), tracked field-wise: value-id → its scalar
     /// fields' block-local indices. Built by a multi-result `call`/`insertvalue`, read by
     /// `extractvalue`/`ret` (§3a multi-result). Assumed not to cross block boundaries (clang's
@@ -18452,6 +18541,41 @@ impl<'a> BlockCtx<'a> {
         unsup("`__vm_thread_spawn` requires a direct function name as its first argument")
     }
 
+    /// The `ValueId` of local `name`.
+    fn local(&self, name: &Name) -> Result<ValueId, Error> {
+        self.s
+            .name2id
+            .get(name)
+            .copied()
+            .ok_or_else(|| Error::Unsupported(format!("unresolved local {name:?}")))
+    }
+
+    /// Where local `vid` points, as a value and a constant offset. Only a folded GEP or alloca
+    /// has an offset ([`Scan::folded`], [`Scan::slots`]); a folded alloca's value is the data-SP.
+    fn local_address(&self, vid: ValueId) -> Result<(ValIdx, u64), Error> {
+        if let Some(&off) = self.s.slots.get(&vid) {
+            return Ok((self.sp()?, off));
+        }
+        Ok((self.id(vid)?, self.offs.get(&vid).copied().unwrap_or(0)))
+    }
+
+    /// The address `op` names, as a value and the constant offset a load or store takes (#2583).
+    fn address(&mut self, op: &Operand) -> Result<(ValIdx, u64), Error> {
+        match op {
+            Operand::LocalOperand { name, .. } => self.local_address(self.local(name)?),
+            _ => Ok((self.operand(op)?, 0)),
+        }
+    }
+
+    /// `base + off`, or `base` itself when `off` is 0.
+    fn at(&mut self, base: ValIdx, off: i64) -> ValIdx {
+        if off == 0 {
+            return base;
+        }
+        let c = self.const_i64(off);
+        self.add_i64(base, c)
+    }
+
     /// Resolve a value-id already available in this block (a parameter or an earlier result).
     fn id(&self, vid: ValueId) -> Result<ValIdx, Error> {
         self.idx_of.get(&vid).copied().ok_or_else(|| {
@@ -18552,12 +18676,10 @@ impl<'a> BlockCtx<'a> {
     fn operand(&mut self, op: &Operand) -> Result<ValIdx, Error> {
         match op {
             Operand::LocalOperand { name, .. } => {
-                let vid = *self
-                    .s
-                    .name2id
-                    .get(name)
-                    .ok_or_else(|| Error::Unsupported(format!("unresolved local {name:?}")))?;
-                self.id(vid)
+                // A folded address read as a value, by an access that can't take an offset or a
+                // use the fold lets through: add its offset here.
+                let (base, off) = self.local_address(self.local(name)?)?;
+                Ok(self.at(base, off as i64))
             }
             Operand::ConstantOperand(c) => match c.as_ref() {
                 Constant::Int { bits, value } if *bits <= 32 => {
@@ -18855,6 +18977,7 @@ fn translate_block(
         link,
         insts: Vec::new(),
         idx_of: HashMap::new(),
+        offs: HashMap::new(),
         agg: HashMap::new(),
         wide_vals: HashMap::new(),
         next_val: 0,
@@ -18876,24 +18999,35 @@ fn translate_block(
     // block, which dominates this one, is already done.
     let mut captures: Vec<(BlockIdx, ValIdx)> = Vec::new();
     let mut capture_ids: Vec<ValueId> = Vec::new();
+    // Values with one source share a capture: an address and a folded GEP of it, a value and an
+    // alias of it. A function's arguments have the lowest ids, so a shared slot keeps theirs.
+    let mut slot_of: HashMap<(BlockIdx, ValIdx), ValIdx> = HashMap::new();
     for &vid in captured {
         let parts = defs.get(&vid).ok_or_else(|| {
             Error::Unsupported(format!(
                 "value {vid} is read in block {bi} but not defined in a block that dominates it"
             ))
         })?;
-        let start = (params.len() + captures.len()) as ValIdx;
-        for &part in parts.as_slice() {
-            captures.push(part);
-            capture_ids.push(vid);
-        }
-        let slots: Vec<ValIdx> = (start..(params.len() + captures.len()) as ValIdx).collect();
+        let slots: Vec<ValIdx> = parts
+            .as_slice()
+            .iter()
+            .map(|&part| {
+                *slot_of.entry(part).or_insert_with(|| {
+                    captures.push(part);
+                    capture_ids.push(vid);
+                    (params.len() + captures.len() - 1) as ValIdx
+                })
+            })
+            .collect();
         if s.wide.contains_key(&vid) {
             ctx.wide_vals.insert(vid, slots);
         } else if let Parts::Many(_) = parts {
             ctx.agg.insert(vid, slots);
         } else {
-            ctx.idx_of.insert(vid, start);
+            ctx.idx_of.insert(vid, slots[0]);
+            if let Parts::Offset(_, off) = *parts {
+                ctx.offs.insert(vid, off);
+            }
         }
     }
     ctx.next_val = (params.len() + captures.len()) as ValIdx;
@@ -18957,7 +19091,12 @@ fn translate_block(
     };
     let here = |v: &ValueId| s.defined_in(*v) == bi;
     for (&v, &i) in ctx.idx_of.iter().filter(|(v, _)| here(v)) {
-        defs.insert(v, Parts::One(place(i)));
+        let at = place(i);
+        let parts = match ctx.offs.get(&v) {
+            Some(&off) => Parts::Offset(at, off),
+            None => Parts::One(at),
+        };
+        defs.insert(v, parts);
     }
     for (&v, parts) in ctx
         .wide_vals
@@ -20134,17 +20273,18 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             }
             return Ok(());
         }
-        let addr = ctx.operand(&st.address)?;
+        let (addr, offset) = ctx.address(&st.address)?;
         let value = ctx.operand(&st.value)?;
         // A 128-bit vector store is a 16-byte `v128.store`; everything else is a width-tagged `store`.
         if vec128_shape(st.value.get_type(types).as_ref()).is_some() {
             ctx.push_effect(Inst::V128Store {
                 addr,
                 value,
-                offset: 0,
+                offset,
             });
         } else if let Some(bits) = nonstd_int_bits(st.value.get_type(types).as_ref()) {
             // Non-power-of-two integer store (e.g. an `i56` niche field): write exactly its bytes.
+            let addr = ctx.at(addr, offset as i64);
             store_nonstd_int(ctx, addr, value, bits);
         } else {
             let op = store_op(st.value.get_type(types).as_ref())?;
@@ -20152,7 +20292,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 op,
                 addr,
                 value,
-                offset: 0,
+                offset,
             });
         }
         return Ok(());
@@ -20695,10 +20835,13 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 .get(&a.dest)
                 .ok_or_else(|| Error::Unsupported("alloca without result".into()))?;
             if let Some(&off) = ctx.frame.get(&vid) {
-                // Static alloca: its `sp`-relative slot (laid out by `frame_layout`) — address `sp + off`.
+                // Static alloca: its `sp`-relative slot (laid out by `frame_layout`) — address
+                // `sp + off`. A folded one has no value: each use reads the data-SP and adds `off`.
+                if ctx.s.slots.contains_key(&vid) {
+                    return Ok(());
+                }
                 let sp = ctx.sp()?;
-                let c = ctx.const_i64(off as i64);
-                (&a.dest, ctx.add_i64(sp, c))
+                (&a.dest, ctx.at(sp, off as i64))
             } else {
                 // Dynamic alloca (runtime element count): bump the `DYN_TOP` running top by
                 // `align16(count * elem_size)` and hand back the *old* top as the base address. The
@@ -20749,22 +20892,21 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             }
         }
         I::Load(l) => {
-            let addr = ctx.operand(&l.address)?;
+            let (addr, offset) = ctx.address(&l.address)?;
             // A `load atomic` (seq-cst): a native `iN.atomic.load` for i32/i64; for i8/i16, an
             // atomic load of the enclosing aligned 32-bit word then extract the field — atomic for
             // the narrow value (no CAS needed: a single aligned word read sees a consistent byte).
             if l.atomicity.is_some() {
                 let v = match atom_width(l.loaded_ty.as_ref())? {
-                    AtomWidth::Wide(ty) => ctx.push(Inst::AtomicLoad {
-                        ty,
-                        addr,
-                        offset: 0,
-                    }),
-                    AtomWidth::Narrow(w) => lower_narrow_atomic_load(ctx, addr, w)?,
+                    AtomWidth::Wide(ty) => ctx.push(Inst::AtomicLoad { ty, addr, offset }),
+                    AtomWidth::Narrow(w) => {
+                        let addr = ctx.at(addr, offset as i64);
+                        lower_narrow_atomic_load(ctx, addr, w)?
+                    }
                 };
                 (&l.dest, v)
             } else if vec128_shape(l.loaded_ty.as_ref()).is_some() {
-                (&l.dest, ctx.push(Inst::V128Load { addr, offset: 0 }))
+                (&l.dest, ctx.push(Inst::V128Load { addr, offset }))
             } else if let Some(bits) = nonstd_int_bits(l.loaded_ty.as_ref()) {
                 // Non-power-of-two integer load (e.g. an `i56` niche-discriminant field): temen-IR has no
                 // `iN` load, so read the enclosing `i64` and mask to N bits. The window-bounded read may
@@ -20773,7 +20915,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 let raw = ctx.push(Inst::Load {
                     op: temen_ir::LoadOp::I64,
                     addr,
-                    offset: 0,
+                    offset,
                 });
                 let m = ctx.const_i64(((1u64 << bits) - 1) as i64);
                 let v = ctx.push(Inst::IntBin {
@@ -20792,19 +20934,12 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     ctx.push(Inst::Load {
                         op: signed_load_op(lb, to),
                         addr,
-                        offset: 0,
+                        offset,
                     }),
                 )
             } else {
                 let op = load_op(l.loaded_ty.as_ref())?;
-                (
-                    &l.dest,
-                    ctx.push(Inst::Load {
-                        op,
-                        addr,
-                        offset: 0,
-                    }),
-                )
+                (&l.dest, ctx.push(Inst::Load { op, addr, offset }))
             }
         }
         // `atomicrmw <op>` (seq-cst), yielding the old value. i32/i64 with a natively-supported op
@@ -22160,14 +22295,7 @@ fn lower_vector_gep(
     g: &crate::ll::ast::GetElementPtr,
     types: &Types,
 ) -> Result<bool, Error> {
-    let lanes_of = |t: &Type| match t {
-        Type::VectorType { num_elements, .. } => Some(*num_elements),
-        _ => None,
-    };
-    let base_ty = g.address.get_type(types);
-    let Some(n) = lanes_of(base_ty.as_ref())
-        .or_else(|| (g.indices.iter()).find_map(|i| lanes_of(i.get_type(types).as_ref())))
-    else {
+    let Some(n) = gep_lanes(g, types) else {
         return Ok(false);
     };
     // Each vector index's lanes, sign-extended to `i64` as a scalar index is; none for a scalar one.
@@ -22184,17 +22312,33 @@ fn lower_vector_gep(
         }
         indices.push(lanes);
     }
-    let bases = match lanes_of(base_ty.as_ref()) {
+    let bases = match lanes_of(g.address.get_type(types).as_ref()) {
         Some(_) => vec_explode(ctx, &g.address, types, false)?,
         None => vec![ctx.operand(&g.address)?; n],
     };
     let mut out = Vec::with_capacity(n);
     for (lane, b) in bases.into_iter().enumerate() {
-        out.push(gep_from(ctx, b, g, types, &indices, lane)?);
+        let (addr, c) = gep_parts(ctx, b, g, types, &indices, lane)?;
+        out.push(ctx.at(addr, c));
     }
     let ptrs = types.vector_of(types.pointer(0), n, false);
     vec_implode(ctx, &g.dest, &out, ptrs.as_ref(), types)?;
     Ok(true)
+}
+
+/// The lane count of a GEP that yields a pointer vector ([`lower_vector_gep`]): its base's, or a
+/// vector index's. `None` for a scalar GEP.
+fn gep_lanes(g: &crate::ll::ast::GetElementPtr, types: &Types) -> Option<usize> {
+    lanes_of(g.address.get_type(types).as_ref())
+        .or_else(|| (g.indices.iter()).find_map(|i| lanes_of(i.get_type(types).as_ref())))
+}
+
+/// A vector type's lane count.
+fn lanes_of(t: &Type) -> Option<usize> {
+    match t {
+        Type::VectorType { num_elements, .. } => Some(*num_elements),
+        _ => None,
+    }
 }
 
 /// Lower the **`<N x i1>` boolean-mask** instructions a vectorized program produces. temen-ir has no
@@ -22878,25 +23022,35 @@ fn store_op(ty: &Type) -> Result<temen_ir::StoreOp, Error> {
 /// size; each later index walks *into* the current type — an array/vector element (stride =
 /// element size) or a **struct field** (a constant index → the field's byte offset). Constant
 /// indices fold into one offset add; variable indices emit a `mul`+`add` (sign-extended to `i64`).
+///
+/// A folded GEP ([`Scan::folded`]) is its address without the constant, which its uses add (#2583).
 fn translate_gep(
     ctx: &mut BlockCtx,
     g: &crate::ll::ast::GetElementPtr,
     types: &Types,
 ) -> Result<ValIdx, Error> {
-    let base = ctx.operand(&g.address)?;
-    gep_from(ctx, base, g, types, &[], 0)
+    let (base, off) = ctx.address(&g.address)?;
+    let (addr, c) = gep_parts(ctx, base, g, types, &[], 0)?;
+    let c = c.wrapping_add(off as i64);
+    let vid = ctx.local(&g.dest)?;
+    if fits_offset(c) && ctx.s.folded.contains(&vid) {
+        ctx.offs.insert(vid, c as u64);
+        return Ok(addr);
+    }
+    Ok(ctx.at(addr, c))
 }
 
 /// [`translate_gep`]'s offset walk from an explicit `base` address — also lane `lane` of a pointer
 /// vector's GEP ([`lower_vector_gep`]), where `lanes[k]` holds index `k`'s lanes if it is a vector.
-fn gep_from(
+/// Returns the address of the variable indices and the sum of the constant ones.
+fn gep_parts(
     ctx: &mut BlockCtx,
     base: ValIdx,
     g: &crate::ll::ast::GetElementPtr,
     types: &Types,
     lanes: &[Vec<ValIdx>],
     lane: usize,
-) -> Result<ValIdx, Error> {
+) -> Result<(ValIdx, i64), Error> {
     let mut addr = base;
     let mut cur = g.source_element_type.clone();
     let mut const_off: i64 = 0;
@@ -22973,11 +23127,7 @@ fn gep_from(
         let term = ctx.mul_i64(iv64, sv);
         addr = ctx.add_i64(addr, term);
     }
-    if const_off != 0 {
-        let c = ctx.const_i64(const_off);
-        addr = ctx.add_i64(addr, c);
-    }
-    Ok(addr)
+    Ok((addr, const_off))
 }
 
 fn icmp_op(p: IntPredicate) -> CmpOp {

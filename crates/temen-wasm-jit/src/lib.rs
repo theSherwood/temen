@@ -234,6 +234,20 @@ const OP_I32_CONST: u8 = 0x41;
 const OP_I64_CONST: u8 = 0x42;
 const BLOCKTYPE_VOID: u8 = 0x40;
 
+/// Push an immediate operand of type `ty` ([`Inst::IntBinImm`]) as a wasm constant.
+fn imm_const(code: &mut Vec<u8>, ty: IntTy, imm: i64) {
+    match ty {
+        IntTy::I32 => {
+            code.push(OP_I32_CONST);
+            sleb32(code, imm as i32);
+        }
+        IntTy::I64 => {
+            code.push(OP_I64_CONST);
+            sleb64(code, imm);
+        }
+    }
+}
+
 /// `IntBin` opcodes are contiguous in wasm in exactly [`BinOp`]'s declaration order.
 fn intbin_opcode(ty: IntTy, op: BinOp) -> u8 {
     let idx = BinOp::ALL.iter().position(|o| *o == op).unwrap() as u8;
@@ -901,8 +915,10 @@ fn block_value_types(
         match inst {
             Inst::ConstI32(_) => tys.push(ValType::I32),
             Inst::ConstI64(_) => tys.push(ValType::I64),
-            Inst::IntBin { ty, .. } => tys.push(ty.val()),
-            Inst::IntCmp { .. } | Inst::Eqz { .. } => tys.push(ValType::I32),
+            Inst::IntBin { ty, .. } | Inst::IntBinImm { ty, .. } => tys.push(ty.val()),
+            Inst::IntCmp { .. } | Inst::IntCmpImm { .. } | Inst::Eqz { .. } => {
+                tys.push(ValType::I32)
+            }
             Inst::IntUn { ty, .. } => tys.push(ty.val()),
             Inst::Convert { op, .. } => tys.push(op.sig().2),
             Inst::Select { a, .. } => {
@@ -6448,6 +6464,19 @@ fn emit_block_body(
             Inst::IntCmp { ty, op, a, b: rb } => {
                 get(code, cx, *a);
                 get(code, cx, *rb);
+                code.push(intcmp_opcode(*ty, *op));
+                set_result(cx, code, k, &mut next_val);
+            }
+            // The immediate forms (#2585): the constant, then the register form's opcode.
+            Inst::IntBinImm { ty, op, a, imm } => {
+                get(code, cx, *a);
+                imm_const(code, *ty, *imm);
+                code.push(intbin_opcode(*ty, *op));
+                set_result(cx, code, k, &mut next_val);
+            }
+            Inst::IntCmpImm { ty, op, a, imm } => {
+                get(code, cx, *a);
+                imm_const(code, *ty, *imm);
                 code.push(intcmp_opcode(*ty, *op));
                 set_result(cx, code, k, &mut next_val);
             }

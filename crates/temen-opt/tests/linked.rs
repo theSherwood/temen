@@ -589,22 +589,68 @@ fn the_cleanup_drops_only_the_positions_it_made_stale() {
             Terminator::Return(vec![3]),
         )],
     );
+    // f1's position is its first add's: its constant becomes the add's immediate (#2585), which
+    // moves the add to instruction 0.
     let mut m = module(vec![folds, leaf_of(3)]);
-    let loc = |func: u32, line: u32| Loc {
+    let loc = |func: u32, inst: u32, line: u32| Loc {
         func,
         block: 0,
-        inst: 0,
+        inst,
         file: 0,
         line,
         col: 1,
     };
     m.debug_info = Some(DebugInfo {
         files: vec!["p.nim".into()],
-        locs: vec![loc(0, 1), loc(1, 2)],
+        locs: vec![loc(0, 0, 1), loc(1, 1, 2)],
         ..Default::default()
     });
     let o = optimize_linked(&m);
     let d = o.debug_info.as_ref().expect("debug info kept");
-    let lines: Vec<u32> = d.locs.iter().map(|l| l.line).collect();
-    assert_eq!(lines, vec![2], "only f0's position went stale");
+    let lines: Vec<(u32, u32)> = d.locs.iter().map(|l| (l.inst, l.line)).collect();
+    assert_eq!(lines, vec![(0, 2)], "only f0's position went stale");
+}
+
+#[test]
+fn a_call_that_does_not_match_its_callee_stays_unverifiable() {
+    // f1 calls f0 with three arguments where f0 takes two, as a linker finds when two units disagree
+    // on a function's ABI (#2719): a C library passes the data-stack pointer to a callback that takes
+    // none. The verifier refuses that call. Inlining it would bind the arguments by position, `1 + 2`,
+    // and ship a module that verifies and computes something else.
+    let callee = func(
+        2,
+        vec![block(2, vec![add(0, 1)], Terminator::Return(vec![2]))],
+    );
+    let caller = func(
+        0,
+        vec![block(
+            0,
+            vec![
+                Inst::ConstI32(1),
+                Inst::ConstI32(2),
+                Inst::ConstI32(3),
+                call(0, vec![0, 1, 2]),
+            ],
+            Terminator::Return(vec![3]),
+        )],
+    );
+    let m = Module {
+        funcs: vec![callee, caller],
+        ..Default::default()
+    };
+    assert!(
+        matches!(
+            verify_module(&m),
+            Err(temen_verify::VerifyError::CallArgCountMismatch { .. })
+        ),
+        "the input is the ill-typed call"
+    );
+    assert_eq!(n_calls(&inline_calls(&m)), 1, "the inliner leaves the call");
+    assert!(
+        matches!(
+            verify_module(&optimize_linked(&m)),
+            Err(temen_verify::VerifyError::CallArgCountMismatch { .. })
+        ),
+        "the linked program still fails to verify"
+    );
 }

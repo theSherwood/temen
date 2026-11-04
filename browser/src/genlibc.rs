@@ -69,8 +69,10 @@ fn main() {
     let ir = String::from_utf8(compiled.stdout).expect("chibicc emits utf8 IR text");
     let mut unit = temen_text::parse_module(&ir).expect("the emitted unit parses");
     // Dominance form (#2454), as every producer's output: chibicc threads each value through every
-    // block's params, and a block that only passes one on captures it instead.
+    // block's params, and a block that only passes one on captures it instead. Its integer ops'
+    // constants become immediates (#2585).
     unit.raise();
+    unit.fold_immediates();
     let encoded = temen_encode::encode_unit(&unit);
 
     // Re-decode what we are about to commit: an asset that cannot be loaded back is worse than none.

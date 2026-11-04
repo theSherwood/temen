@@ -722,6 +722,8 @@ pub fn row_home(inst: &Inst) -> RowHome {
         | Inst::ConstF64(_)
         | Inst::IntBin { .. }
         | Inst::IntCmp { .. }
+        | Inst::IntBinImm { .. }
+        | Inst::IntCmpImm { .. }
         | Inst::IntUn { .. }
         | Inst::Eqz { .. }
         | Inst::Convert { .. }

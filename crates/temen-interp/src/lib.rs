@@ -502,11 +502,13 @@ fn frame_value_types(v: &VCpu, frame: &Frame) -> Vec<ValType> {
     if frame.module != 0 {
         return Vec::new();
     }
-    match v.funcs.get(frame.func as usize) {
-        Some(f) => temen_verify::func_value_types(f, &v.funcs, &v.types, v.mem.is_some())
-            .into_iter()
-            .nth(frame.block)
-            .unwrap_or_default(),
+    match v.domain.funcs.get(frame.func as usize) {
+        Some(f) => {
+            temen_verify::func_value_types(f, &v.domain.funcs, &v.domain.types, v.mem.is_some())
+                .into_iter()
+                .nth(frame.block)
+                .unwrap_or_default()
+        }
         None => Vec::new(),
     }
 }
@@ -902,7 +904,7 @@ struct HostReplaySubstate {
     /// waiter/scheduler record: the single-domain debug engine parks no cross-domain caller, so nothing
     /// here is captured scheduler state (INVARIANTS.md #7).
     svc_queue: Vec<SvcDispatch>,
-    svc_results: Vec<(u64, i64)>,
+    svc_results: Vec<(u64, Reply)>,
     svc_next_ticket: u64,
     /// #2113 — the host's half of its window's accounting, as [`HostCursor::held`]: the checkpoint's
     /// tree holds the charges.
@@ -1311,17 +1313,14 @@ impl Inspector {
         // A debugged run burns a fixed allowance, so a checkpoint's counter is the whole of its fuel
         // state and a seek replays it exactly (#1944 slice 3).
         let mut root = VCpu::new(
-            funcs,
-            types,
+            Arc::new(Domain::new(host, funcs, types, dt)),
             func,
             args,
             mem,
-            host,
             Fuel::fixed(fuel),
             0,
             0,
             SchedRef::Real(sched),
-            dt,
         );
         let mut d = DebugCtx::new(shared);
         d.seek_target = seek_target;
@@ -1470,23 +1469,25 @@ impl Inspector {
             s.next_task += 1;
             s.live += 1;
             let dt = Arc::new(DomainTable::new(&funcs, 0));
-            let mut root = VCpu::new(
+            let domain = Domain::root(
+                Arc::clone(&host),
                 Arc::clone(&funcs),
                 Arc::clone(&types),
+                dt,
+            );
+            let mut root = VCpu::new(
+                Arc::new(domain),
                 func,
                 args,
                 mem,
-                Arc::clone(&host),
                 Fuel::fixed(fuel), // a debugged run's allowance, as `fresh_single_root`
                 0,
                 id,
                 SchedRef::Det(Arc::clone(&det)),
-                dt,
             );
             root.memop = true; // one visible op per turn — the granularity steps/breakpoints align to
             root.debug = Some(Box::new(DebugCtx::new(Arc::clone(&shared))));
-            s.root_domain = domain_key_of(&root); // §12: the root domain's key (owner 2026-07-24)
-            root.lane_chain = vec![(s.root_domain, root.host.lock_unpoisoned().lane_cap())]; // D66
+            s.root_domain = root.domain.id; // §12: the root domain's key (owner 2026-07-24)
             s.runnable.push(Box::new(root));
             id
         };
@@ -1652,7 +1653,7 @@ impl Inspector {
                 Step::Park(_) | Step::Yield => return Stop::Blocked,
                 // §2.2 / §8.6: pager fault-service and `execve` image-replace both need the real
                 // scheduler's `dispatch`; under the inspector they are out of scope (fail closed).
-                Step::PageFault(_) | Step::Exec(_) => {
+                Step::PageFault(..) | Step::Exec(_) => {
                     let r = Err(Trap::FiberFault);
                     self.finished = Some(r.clone());
                     return Stop::Finished(r);
@@ -1979,7 +1980,7 @@ impl Inspector {
             Step::Pause(reason, pc) => Stop::Break { reason, pc },
             // §2.2 / §8.6: pager fault-service and `execve` image-replace both need the real
             // scheduler's `dispatch` — fail closed under the single-vCPU inspector driver.
-            Step::PageFault(_) | Step::Exec(_) => {
+            Step::PageFault(..) | Step::Exec(_) => {
                 let r = Err(Trap::FiberFault);
                 self.finished = Some(r.clone());
                 Stop::Finished(r)
@@ -2291,6 +2292,127 @@ pub fn run_with_host(
     host: &mut Host,
 ) -> Result<Vec<Value>, Trap> {
     run_with_host_traced(m, func, args, fuel, host).0
+}
+
+/// #2695 step 2 — a domain its embedder **holds**. Started with [`HeldDomain::start`], it outlives
+/// its entry and takes calls until it ends itself (an exit or a trap, by any of its members) or its
+/// embedder ends it ([`HeldDomain::end`], or dropping the handle).
+///
+/// Between calls it is a process: its threads keep running, on the tree-walker's own workers. A call
+/// ([`HeldDomain::call`]), or a call into it from a domain of its run (a live offer), runs as an
+/// **activation**: a new fiber in the domain at the op's handler, called with exactly the op's
+/// arguments, on the caller's thread, which funds it. The domain's calls run one at a time, each
+/// until it parks (`Single`, DESIGN.md §12a); its own threads run beside them. The tree-walker runs
+/// held domains; the other engines do not yet.
+pub struct HeldDomain {
+    link: Arc<HeldLink>,
+    run: Option<HeldRun>,
+}
+
+/// The thread a held domain's run is on, which answers the run and hands the powerbox back.
+type HeldRun = std::thread::JoinHandle<(Result<Vec<Value>, Trap>, Host)>;
+
+impl HeldDomain {
+    /// Run `entry` of `m` with `args` over `host`, the domain's powerbox, with `fuel` for the domain's
+    /// own work: its entry and its threads. Once the entry returns, the domain rests and this answers
+    /// the handle and the entry's results. If the domain ends first, it answers the trap that ended
+    /// it and the powerbox. A durable domain cannot be held yet: it is refused with `ThreadFault`.
+    pub fn start(
+        m: Arc<Module>,
+        entry: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        mut host: Host,
+    ) -> Result<(HeldDomain, Vec<Value>), (Trap, Box<Host>)> {
+        if host.is_durable() {
+            return Err((Trap::ThreadFault, Box::new(host)));
+        }
+        let link = Arc::new(HeldLink::default());
+        host.held = Some(Arc::clone(&link));
+        let (args, ended) = (args.to_vec(), Arc::clone(&link));
+        let run = std::thread::spawn(move || {
+            let mut fuel = fuel;
+            let r = run_with_host(&m, entry, &args, &mut fuel, &mut host);
+            host.held = None;
+            ended.done();
+            (r, host)
+        });
+        match link.wait_rest() {
+            Some(results) => Ok((
+                HeldDomain {
+                    link,
+                    run: Some(run),
+                },
+                results,
+            )),
+            None => {
+                let (r, host) = join_held(run);
+                Err((r.err().unwrap_or(Trap::ThreadFault), Box::new(host)))
+            }
+        }
+    }
+
+    /// Call op `op` of export `export` with `args`, in the i64-slot ABI (a handle is a slot of the
+    /// domain's own table), lending the call `fuel`: what it leaves comes back there. Blocks until the
+    /// reply: the op's results, or a failed call's errno. That is `-EINVAL` for an op the export lacks
+    /// or a call of another arity, and `CAP_REVOKED` once the domain has ended, as a call into a dead
+    /// domain answers (INVARIANTS #8, rule (i)).
+    pub fn call(&self, export: u32, op: u32, args: &[i64], fuel: &mut u64) -> Reply {
+        let Some(sched) = self.link.scheduler() else {
+            return Reply::Failed(CAP_REVOKED);
+        };
+        let wait = Arc::new(EmbedderReply::default());
+        let act = {
+            let mut s = sched.lock();
+            let (key, to) = (s.root_domain, AnswerTo::Embedder(Arc::clone(&wait)));
+            let lent = Some(Fuel::fixed(*fuel));
+            match activation(&sched, &mut s, key, export, op, args, lent, to) {
+                Ok(v) => {
+                    s.lent += 1;
+                    v
+                }
+                Err(errno) => return Reply::Failed(errno),
+            }
+        };
+        // On this thread, as a caller in the run runs its own ([`Scheduler::take_resting`]).
+        dispatch(&sched, act);
+        sched.lock().lent -= 1;
+        sched.work.notify_all();
+        drop(sched);
+        let (reply, left) = wait.wait();
+        *fuel = left;
+        reply
+    }
+
+    /// End the domain: its threads stop where they are, and its powerbox comes back, with the trap
+    /// that ended the domain first if one did.
+    pub fn end(mut self) -> (Host, Option<Trap>) {
+        let (r, host) = self.finish();
+        (host, r.err())
+    }
+
+    fn finish(&mut self) -> (Result<Vec<Value>, Trap>, Host) {
+        if let Some(sched) = self.link.scheduler() {
+            let mut s = sched.lock();
+            s.held_open = false;
+            teardown_run(&mut s);
+            drop(s);
+            sched.work.notify_all();
+        }
+        join_held(self.run.take().expect("a held domain ends once"))
+    }
+}
+
+impl Drop for HeldDomain {
+    fn drop(&mut self) {
+        if self.run.is_some() {
+            let _ended = self.finish();
+        }
+    }
+}
+
+fn join_held(run: HeldRun) -> (Result<Vec<Value>, Trap>, Host) {
+    run.join().unwrap_or_else(|e| std::panic::resume_unwind(e))
 }
 
 /// Like [`run_with_host`], but also return the guest's **trap-time backtrace** — the call stack
@@ -2677,17 +2799,7 @@ impl ThawLinks {
 /// threads, parents first. A thaw so starts every spawner before its children, as an uninterrupted
 /// run does, where a child queues behind the spawner that is running it up. Under a lane cap of 1
 /// that order decides which vCPU holds the lane.
-#[allow(clippy::too_many_arguments)]
-fn seed_domain(
-    s: &mut Sched,
-    sched: &Arc<Scheduler>,
-    mut root: Box<VCpu>,
-    funcs: &Arc<[Func]>,
-    types: &Arc<[temen_ir::TypeEntry]>,
-    dt: &Arc<DomainTable>,
-    host_shared: &Arc<Mutex<Host>>,
-    residue: ThawResidue,
-) {
+fn seed_domain(s: &mut Sched, sched: &Arc<Scheduler>, mut root: Box<VCpu>, residue: ThawResidue) {
     let id = root.id;
     // Each domain this seeding re-launches enqueues itself from here, already in order.
     let at = s.runnable.len();
@@ -2714,7 +2826,7 @@ fn seed_domain(
     } = residue;
     // #2043 — the domain's child table, as the freeze left it: every slot's counter, before the
     // children below are re-filed at their slots.
-    *root.children.lock_unpoisoned() = Children {
+    *root.domain.children.lock_unpoisoned() = Children {
         table: temen_ir::handles::Table::from_generations(&thaw_children),
         ..Children::default()
     };
@@ -2745,11 +2857,11 @@ fn seed_domain(
         seed.sort_by_key(|f| f.slot);
         for (expected, ff) in seed.into_iter().enumerate() {
             let got = if ff.is_free() {
-                root.registry.seed_free(ff.generation)
+                root.domain.registry.seed_free(ff.generation)
             } else {
                 // #2112 — the fiber handed its charge back as the freeze flattened it.
-                let charge = root.host.lock_unpoisoned().fiber_recharge();
-                root.registry.seed_frozen(
+                let charge = root.domain.host.lock_unpoisoned().fiber_recharge();
+                root.domain.registry.seed_frozen(
                     ff.func,
                     ff.sp,
                     ff.shadow_sp,
@@ -2774,17 +2886,7 @@ fn seed_domain(
     vseed.sort_by_key(|f| f.task);
     {
         for ff in vseed {
-            seed_thread(
-                s,
-                sched,
-                &mut root,
-                &mut children,
-                &mut live_ids,
-                funcs,
-                types,
-                dt,
-                ff,
-            );
+            seed_thread(s, sched, &mut root, &mut children, &mut live_ids, ff);
         }
         // #1361 step 2 — deliver each completed-but-unjoined **detached** child: post its result
         // into the scheduler and map it to the recording parent's join slot, so the parent's
@@ -2829,28 +2931,28 @@ fn seed_domain(
                 },
                 None => continue, // not re-created ⇒ its own rewound join already fails closed
             };
-            relaunch_detached(s, sched, spawner, host_shared, td);
+            relaunch_detached(s, sched, spawner, td);
         }
         // #1688 — the twins this domain forked, each re-created under the pid its `fork()` returned,
         // as a domain of its own window ([`relaunch_twin`]).
         let mut tseed = thaw_twins;
         tseed.sort_by_key(|t| t.pid);
         for tt in tseed {
-            relaunch_twin(s, sched, &root, funcs, types, tt);
+            relaunch_twin(s, sched, &root, tt);
         }
         // #2571 — and the servicer twins it forked that exited unreaped, filed again under their
         // pids for its `wait` to reap.
         for ft in thaw_exited_twins {
             let result = ft.outcome.map(|x| vec![Value::I64(x)]);
-            file_exited_twin(s, ft.pid as TaskId, domain_key_of(&root), result);
+            file_exited_twin(s, ft.pid as TaskId, root.domain.id, result);
         }
         // §13.4 slice 4d, #1681: this domain's restored `LiveImpl` handles wait for the whole tree,
         // since one may name a child that any domain re-launches ([`ThawLinks`]).
-        let pending = host_shared.lock_unpoisoned().take_pending_live_impls();
+        let pending = root.domain.host.lock_unpoisoned().take_pending_live_impls();
         if !pending.is_empty() {
             s.thaw_links
                 .holders
-                .push((Arc::clone(host_shared), pending));
+                .push((Arc::clone(&root.domain.host), pending));
         }
         // The domain's own vCPUs, ahead of the domains they spawned: the root, then its threads,
         // parents first (ascending cid).
@@ -2889,7 +2991,7 @@ fn deliver_detached(
     s.results.insert(cid, Outcome::ended(result));
     // #2044 — nothing is re-created for it, so its domain keeps nothing but the edge: a freeze before
     // the join records it completed again, while its slot still names it.
-    spawner.children.lock_unpoisoned().table.pin(
+    spawner.domain.children.lock_unpoisoned().table.pin(
         slot,
         Child {
             task: Some(cid),
@@ -2935,9 +3037,6 @@ fn seed_thread(
     root: &mut VCpu,
     children: &mut BTreeMap<TaskId, Box<VCpu>>,
     live_ids: &mut BTreeMap<TaskId, TaskId>,
-    funcs: &Arc<[Func]>,
-    types: &Arc<[temen_ir::TypeEntry]>,
-    dt: &Arc<DomainTable>,
     ff: FrozenVCpu,
 ) {
     let Some(&parent) = live_ids.get(&(ff.parent_task as TaskId)) else {
@@ -2953,7 +3052,7 @@ fn seed_thread(
     };
     let cid = claim_task(s, ff.task);
     // #2043 — a detached thread runs on with no handle naming it, as it did before the freeze.
-    let mut c = p.children.lock_unpoisoned();
+    let mut c = p.domain.children.lock_unpoisoned();
     if ff.joinable {
         c.table.pin(ff.slot, Child::thread(cid));
     } else {
@@ -2971,7 +3070,7 @@ fn seed_thread(
     // it: charged again past any ceiling. #2318 — never past the process's pools: a thread they
     // have no room for is one the process cannot hold, so it ends with `ThreadFault`, which its
     // rewound join answers, and nothing it spawned is re-created.
-    let Some(live) = LiveVcpu::rebuild(p.host.lock_unpoisoned().own_node()) else {
+    let Some(live) = LiveVcpu::rebuild(p.domain.host.lock_unpoisoned().own_node()) else {
         s.results
             .insert(cid, Outcome::ended(Err(Trap::ThreadFault)));
         return;
@@ -2979,26 +3078,21 @@ fn seed_thread(
     live_ids.insert(ff.task as TaskId, cid);
     s.live += 1;
     let ctx = p.arena().ctx_of_sp(ff.shadow_sp);
-    p.registry.seed_vcpu_mask(1 << ctx);
+    p.domain.registry.seed_vcpu_mask(1 << ctx);
+    // It joins its domain, as its spawn did ([`Domain`]).
     let mut child = Box::new(VCpu::new(
-        Arc::clone(funcs),
-        Arc::clone(types),
+        Arc::clone(&p.domain),
         ff.func as FuncIdx,
         &[
             Value::I64(ff.args.first().copied().unwrap_or(0)),
             Value::I64(ff.args.get(1).copied().unwrap_or(0)),
         ],
         p.mem.as_ref().map(|m| m.fork_for_thread()),
-        Arc::clone(&p.host),
         p.fuel.for_thread(),
         0,
         cid,
         SchedRef::Real(Arc::clone(sched)),
-        Arc::clone(dt),
     ));
-    child.registry = Arc::clone(&p.registry);
-    child.children = Arc::clone(&p.children); // #2043 D1: its domain's, as its spawn shared them
-    child.kill = p.kill.clone();
     child.live = live;
     child.durable = true;
     child.dstate = STATE_REWINDING; // re-enter under rewind, from its restored extent
@@ -3017,14 +3111,8 @@ fn seed_thread(
 /// parent's program. When it cannot be (the process's pools have no room for it, or its pages name
 /// a region its powerbox does not hold), it ends with `ThreadFault`, which its parent's `wait` reaps
 /// as a crash.
-fn relaunch_twin(
-    s: &mut Sched,
-    sched: &Arc<Scheduler>,
-    parent: &VCpu,
-    funcs: &Arc<[Func]>,
-    types: &Arc<[temen_ir::TypeEntry]>,
-    tt: ThawedTwin,
-) {
+fn relaunch_twin(s: &mut Sched, sched: &Arc<Scheduler>, parent: &VCpu, tt: ThawedTwin) {
+    let (funcs, types) = (&parent.domain.funcs, &parent.domain.types);
     let ThawedTwin {
         pid,
         window,
@@ -3040,15 +3128,16 @@ fn relaunch_twin(
     } else {
         TwinReaper::Personality
     };
-    let parent_key = domain_key_of(parent);
+    let parent_key = parent.domain.id;
     let built = parent.mem.as_ref().and_then(|pm| {
         let declared = pm.window.mapped();
         let grown = window.page_map().grown_bytes();
-        let rejoined =
-            parent
-                .host
-                .lock_unpoisoned()
-                .rejoin_twin(&mut host, &launch.names, declared, grown);
+        let rejoined = parent.domain.host.lock_unpoisoned().rejoin_twin(
+            &mut host,
+            &launch.names,
+            declared,
+            grown,
+        );
         let spec = WindowSpec {
             reserved_log2,
             mapped_log2: declared.trailing_zeros() as u8,
@@ -3098,25 +3187,28 @@ fn relaunch_twin(
     let arity = funcs.get(entry as usize).map_or(0, |f| f.params.len());
     let args = bytecode::child_entry_args(arity, 0, 0);
     let bell = Arc::new(AtomicBool::new(s.twins_rung));
-    let mut twin = Box::new(VCpu::new(
+    let domain = Domain::new(
+        Arc::clone(&twin_host),
         Arc::clone(funcs),
         Arc::clone(types),
+        Arc::clone(&dt),
+    );
+    let mut twin = Box::new(VCpu::new(
+        Arc::new(domain),
         entry,
         &args,
         Some(mem),
-        Arc::clone(&twin_host),
         parent.fuel.for_thread(),
         parent.depth,
         pid,
         SchedRef::Real(Arc::clone(sched)),
-        Arc::clone(&dt),
     ));
     twin.durable = true;
     (twin.vcpu_ctx, twin.durable_sp_ctx) = (ctx, ctx);
     twin.parent_task = parent.parent_task;
     twin.live = live;
     twin.freeze_bell = Some(Arc::clone(&bell));
-    seed_domain(s, sched, twin, funcs, types, &dt, &twin_host, residue);
+    seed_domain(s, sched, twin, residue);
     s.forked_twins.insert(
         pid,
         Twin {
@@ -3164,7 +3256,6 @@ fn relaunch_detached(
     s: &mut Sched,
     sched: &Arc<Scheduler>,
     spawner: &mut VCpu,
-    grants: &Arc<Mutex<Host>>,
     td: ThawedDetached,
 ) {
     let ThawedDetached {
@@ -3179,11 +3270,11 @@ fn relaunch_detached(
     // Each step that may refuse the relaunch, `Err(leased)` when one does: whether the child's lease
     // was filed again (and has gone back on its own).
     let ready = 'ready: {
-        let relaunch = grants.lock_unpoisoned().prepare_detached_relaunch(
-            &launch,
-            &mut host,
-            window.page_map(),
-        );
+        let relaunch = spawner
+            .domain
+            .host
+            .lock_unpoisoned()
+            .prepare_detached_relaunch(&launch, &mut host, window.page_map());
         let Some(relaunch) = relaunch else {
             break 'ready Err(false);
         };
@@ -3193,15 +3284,15 @@ fn relaunch_detached(
         let runs = window
             .page_map()
             .window_runs(temen_ir::module_null_guard(), 1u64 << reserved_log2);
-        let filed =
-            spawner
-                .host
-                .lock_unpoisoned()
-                .relaunch_lease(&mut host, relaunch.memory_log2, runs);
+        let filed = spawner.domain.host.lock_unpoisoned().relaunch_lease(
+            &mut host,
+            relaunch.memory_log2,
+            runs,
+        );
         let Ok(lease) = filed else {
             break 'ready Err(false);
         };
-        let lease = lease.map(|lease| (Arc::clone(&spawner.host), lease));
+        let lease = lease.map(|lease| (Arc::clone(&spawner.domain.host), lease));
         // The window: built as op 17 builds it (its NULL guard included, #1733), its runs paid for
         // by its lease.
         let spec = WindowSpec {
@@ -3257,39 +3348,39 @@ fn relaunch_detached(
     let child_fuel = Fuel::drawn(child_host.lock_unpoisoned().own_node());
     let kflag = Arc::new(AtomicBool::new(false));
     let bell = Arc::new(AtomicBool::new(false));
-    let mut child = Box::new(VCpu::new(
+    let mut cdomain = Domain::new(
+        Arc::clone(&child_host),
         Arc::clone(&funcs),
         Arc::clone(&types),
+        Arc::clone(&cdt),
+    );
+    cdomain.kill = Some(Arc::clone(&kflag));
+    // #2438 — a demand-paged child's faults go to its spawner's pager again, as op 17 wired them: its
+    // unsupplied pages are still unmapped in its image. The codec checked the export against the
+    // spawner's program.
+    cdomain.pager = launch.pager.map(|export| PagerRef {
+        cell: Arc::clone(&spawner.domain.host),
+        export,
+    });
+    cdomain.lane_chain = std::iter::once((dom, launch.lane))
+        .chain(spawner.domain.lane_chain.iter().copied())
+        .collect();
+    let mut child = Box::new(VCpu::new(
+        Arc::new(cdomain),
         0,
         &args,
         Some(mem),
-        Arc::clone(&child_host),
         child_fuel,
         spawner.depth + 1,
         cid,
         SchedRef::Real(Arc::clone(sched)),
-        Arc::clone(&cdt),
     ));
     child.memop = spawner.memop;
     child.durable = true;
-    child.kill = Some(Arc::clone(&kflag));
     child.freeze_bell = Some(Arc::clone(&bell));
-    child.spawner_domain = Some(domain_key_of(spawner)); // #2455, as op 17 sets it
+    child.spawner_domain = Some(spawner.domain.id); // #2455, as op 17 sets it
     child.window_lease = lease;
-    // #2438 — a demand-paged child's faults go to its spawner's pager again, as op 17 wired them: its
-    // unsupplied pages are still unmapped in its image. The codec checked the export against the
-    // spawner's program.
-    if let Some(export) = launch.pager {
-        child.pager = Some(PagerRef {
-            cell: Arc::clone(&spawner.host),
-            export,
-        });
-        child.fault_pager = true;
-    }
-    child.lane_chain = std::iter::once((dom, launch.lane))
-        .chain(spawner.lane_chain.iter().copied())
-        .collect();
-    seed_domain(s, sched, child, &funcs, &types, &cdt, &child_host, residue);
+    seed_domain(s, sched, child, residue);
     // A detached child is a callee (#1901), named by the task it was (#1681).
     s.thaw_links
         .callees
@@ -3313,7 +3404,12 @@ fn relaunch_detached(
         // D66: re-reserve the child's lane against the spawner's Σ. The thawing host set the
         // spawner's own cap, so a lane that no longer fits is not re-drawn (and so not credited back
         // at reap) — the child keeps its own cap either way, which bounds its tasks.
-        if spawner.host.lock_unpoisoned().try_grant_lane(launch.lane) {
+        if spawner
+            .domain
+            .host
+            .lock_unpoisoned()
+            .try_grant_lane(launch.lane)
+        {
             domain.lane = Some(launch.lane);
         }
     }
@@ -3321,7 +3417,7 @@ fn relaunch_detached(
         task: Some(cid),
         domain: Some(domain),
     };
-    let mut c = spawner.children.lock_unpoisoned();
+    let mut c = spawner.domain.children.lock_unpoisoned();
     if joinable {
         // At the slot its handle names, as before the cut.
         c.table.pin(slot, child);
@@ -3382,11 +3478,17 @@ fn drive_over_cell(
         }
     }
     // CALLS.md 4d — copy the root domain's direct-handoff knob into the run-global scheduler flag.
+    // #2695 step 2 — a run whose root its embedder holds hands the handle its scheduler.
+    let held = host_shared.lock_unpoisoned().held_link();
     let sched = {
         let mut s = Scheduler::new(MAX_VCPUS, workers);
         s.handoff = handoff;
+        s.held = held.is_some();
         Arc::new(s)
     };
+    if let Some(link) = &held {
+        link.publish(&sched);
+    }
     // #799 L1 (embedder `^C`) / #863 slice 3 — hand the signal source a scheduler-wake closure so an
     // embedder raise (`Posix::raise_signal`) can interrupt a parked blocking syscall even when every
     // fiber is parked and no safepoint fires. The personality invokes it only for a *deliverable*
@@ -3502,22 +3604,23 @@ fn drive_over_cell(
         for (slot, (unit_funcs, unit_types, _)) in &jit_reapply {
             dt.install(Arc::clone(unit_funcs), Arc::clone(unit_types), Some(*slot));
         }
-        let mut root = Box::new(VCpu::new(
+        let domain = Domain::root(
+            Arc::clone(&host_shared),
             Arc::clone(&funcs),
             Arc::clone(&types),
+            Arc::clone(&dt),
+        );
+        let mut root = Box::new(VCpu::new(
+            Arc::new(domain),
             entry,
             args,
             mem.take(),
-            Arc::clone(&host_shared),
             root_fuel,
             0,
             id,
             SchedRef::Real(Arc::clone(&sched)),
-            Arc::clone(&dt),
         ));
         root.durable = durable;
-        // D66 — the root's lane chain is just its own domain at the embedder-set cap.
-        root.lane_chain = vec![(s.root_domain, host_shared.lock_unpoisoned().lane_cap())];
         // The root's own durable state word is the window's initial phase (NORMAL / UNWINDING freeze /
         // REWINDING thaw); the runtime swaps it per vCPU from here (slice 3.2.1). §12.8 concurrent-thaw
         // stage 1: combine the global freeze word with the root's per-context thaw word (a thaw seeds
@@ -3526,17 +3629,8 @@ fn drive_over_cell(
         // no other task the seeding mints may take one, and the run's counter passes them all.
         let pids = thaw.twin_pids();
         s.reserved_pids = pids.clone();
-        let (registry, arena) = (Arc::clone(&root.registry), root.arena());
-        seed_domain(
-            &mut s,
-            &sched,
-            root,
-            &funcs,
-            &types,
-            &dt,
-            &host_shared,
-            thaw,
-        );
+        let (registry, arena) = (Arc::clone(&root.domain.registry), root.arena());
+        seed_domain(&mut s, &sched, root, thaw);
         if let Some(&last) = pids.last() {
             s.next_task = s.next_task.max(last + 1);
         }
@@ -3546,6 +3640,15 @@ fn drive_over_cell(
     };
     // Run as worker 0 until the run shuts down (every vCPU finished), then join spawned workers.
     worker_loop(&sched);
+    // #2695 step 2 — and wait for an embedder's calls into its held domain, which run on its own
+    // threads ([`HeldDomain::call`]): one may have left a vCPU queued with no worker to run it.
+    if held.is_some() {
+        let mut s = sched.lock();
+        while s.lent > 0 {
+            s = sched.work.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+        teardown_run(&mut s);
+    }
     let handles = std::mem::take(&mut sched.lock().handles);
     for h in handles {
         let _ = h.join();
@@ -3754,6 +3857,20 @@ fn drive_over_cell(
         // freeze.
         if let (true, Ok(_), Some(t)) = (froze, &out.result, s.freeze_fault) {
             out.result = Err(t);
+        }
+        // #2695 step 2 — the run's end ends a domain that rests: what its main vCPU's end hands back
+        // goes back now, its window and its pipe ends (#2113, #2220). A root that rested answers its
+        // entry's results, unless its domain ended since: then the run answers that end.
+        let resting = std::mem::take(&mut s.resting);
+        for r in resting.values() {
+            let mut h = r.domain.host.lock_unpoisoned();
+            h.release_memory();
+            h.release_pipe_ends(); // the run is over: no reader or writer is left to wake
+            h.svc_payers.clear();
+        }
+        let rested = resting.contains_key(&s.root_domain);
+        if let (true, Ok(_), Some(t)) = (rested, &out.result, s.dead.get(&s.root_domain)) {
+            out.result = Err(*t);
         }
         (out, s.trap_origin.take(), std::mem::take(&mut s.twin_traps))
     };
@@ -4062,21 +4179,18 @@ pub fn run_scheduled(
         let mut host = Host::new();
         let node = host.begin_activation(fuel, RootWindow::of(mem.as_ref())); // #1944 slice 3
         let fuel = Fuel::drawn(node.ok_or(Trap::ThreadFault)?);
-        let mut root = Box::new(VCpu::new(
-            funcs,
-            types,
+        let domain = Domain::root(Arc::new(Mutex::new(host)), funcs, types, dt);
+        let root = Box::new(VCpu::new(
+            Arc::new(domain),
             func,
             args,
             mem,
-            Arc::new(Mutex::new(host)),
             fuel,
             0,
             id,
             SchedRef::Det(Arc::clone(&det)),
-            dt,
         ));
-        s.root_domain = domain_key_of(&root); // §12: the root domain's key (owner 2026-07-24)
-        root.lane_chain = vec![(s.root_domain, root.host.lock_unpoisoned().lane_cap())]; // D66
+        s.root_domain = root.domain.id; // §12: the root domain's key (owner 2026-07-24)
         s.runnable.push(root);
         id
     };
@@ -4852,22 +4966,24 @@ fn run_one_schedule(
         let mut host = Host::new();
         let node = host.begin_activation(fuel, RootWindow::of(mem.as_ref())); // #1944 slice 3
         let fuel = Fuel::drawn(node.ok_or(Trap::ThreadFault)?);
-        let mut root = VCpu::new(
+        let domain = Domain::root(
+            Arc::new(Mutex::new(host)),
             Arc::clone(funcs),
             Arc::clone(types),
+            dt,
+        );
+        let mut root = VCpu::new(
+            Arc::new(domain),
             func,
             args,
             mem,
-            Arc::new(Mutex::new(host)),
             fuel,
             0,
             id,
             SchedRef::Det(Arc::clone(&det)),
-            dt,
         );
         root.memop = true;
-        s.root_domain = domain_key_of(&root); // §12: the root domain's key (owner 2026-07-24)
-        root.lane_chain = vec![(s.root_domain, root.host.lock_unpoisoned().lane_cap())]; // D66
+        s.root_domain = root.domain.id; // §12: the root domain's key (owner 2026-07-24)
         s.runnable.push(Box::new(root));
         id
     };
@@ -5644,7 +5760,7 @@ impl Outcome {
 
 /// #2455 — a child that unwound while its spawner's domain was held ([`Sched::withheld`]).
 struct Withheld {
-    /// The child's own domain ([`domain_key_of`]), which a `kill` names.
+    /// The child's own domain ([`Domain::id`]), which a `kill` names.
     domain: usize,
     outcome: Outcome,
     /// Its window's lease, handed back if a kill ends it ([`VCpu::window_lease`]).
@@ -5668,7 +5784,7 @@ fn trap_fiber_of(v: &VCpu) -> i64 {
     if v.cur == ROOT_FIBER {
         -1
     } else {
-        fiber_handle(v.cur, v.registry.generation(v.cur))
+        fiber_handle(v.cur, v.domain.registry.generation(v.cur))
     }
 }
 
@@ -5803,6 +5919,8 @@ enum Blocked {
     CapReply {
         ticket: u64,
         callee: Arc<Mutex<Host>>,
+        /// INVARIANTS #8 — how the reply is laid out for this call.
+        to: ReplyTo,
     },
     /// §3.6 slice 3 — a serving fiber parked in `svc.wait` on an empty queue, keyed by its
     /// domain identity. The frame was rewound before parking, so the wake re-executes the
@@ -5860,6 +5978,14 @@ enum Pending {
     /// result — a negative errno the parked fiber probes on its own error path. The fiber is
     /// never killed and never traps; cancellation is a returned value (§3.6 revocation-unparks).
     CapResult(i64),
+    /// INVARIANTS #8 — finish a live call ([`Blocked::CapReply`]) with the values its reply's slots
+    /// define, typed by its op's signature `sig` ([`ReplyTo::complete`]), or with its trap: the
+    /// reply its call could not take. A page fault's (`page_fault` set) is its pager's status
+    /// instead.
+    Reply {
+        out: Result<Vec<i64>, Trap>,
+        sig: OpSig,
+    },
     /// #1899 — a stream read ([`Blocked::CapRead`]) that a landing freeze abandoned: its result is a
     /// placeholder, and the re-issue word makes the thaw re-issue the read.
     Abandoned,
@@ -5883,8 +6009,8 @@ enum Step {
     /// the next `run` resumes exactly here. Carries the reason + location for the driver to report.
     Pause(StopReason, IrPc),
     /// CONSOLIDATION.md §2.2: a demand process child's recoverable fault, serviced by its pager
-    /// binding at dispatch level (see [`Inner::PageFault`]).
-    PageFault(u64),
+    /// binding at dispatch level (see [`Inner::PageFault`]): the faulting address, and the binding.
+    PageFault(u64, PagerRef),
     /// FORK.md §8.6 — **`execve` image-replace** (folded to [`Step::Exec`] by [`VCpu::run`]).
     Exec(Box<ExecReq>),
 }
@@ -5982,18 +6108,18 @@ impl ExecReq {
         if let Some(m) = &mem {
             host.start_window(m.window_runs());
         }
+        // A new domain: the image's powerbox and program, with no fibers, children, kill flag,
+        // lanes or pager.
+        let domain = Domain::new(Arc::new(Mutex::new(host)), self.funcs, self.types, dt);
         VCpu::new(
-            self.funcs,
-            self.types,
+            Arc::new(domain),
             self.entry as FuncIdx,
             &self.entry_args,
             mem,
-            Arc::new(Mutex::new(host)),
             fuel,
             depth,
             id,
             sched,
-            dt,
         )
     }
 }
@@ -6144,6 +6270,9 @@ struct Scheduler {
     /// lock: a caller resolving a `single` process provider parked at `svc.wait` serves the dispatch
     /// inline instead of enqueue + `svc_wake` + park. Off ⇒ today's transport, byte-identical.
     handoff: bool,
+    /// #2695 step 2 — the run's root is held by its embedder ([`HeldDomain`]). Read (never written)
+    /// after construction: a live call checks it before taking the lock for the held paths.
+    held: bool,
 }
 
 /// #2522 — a domain's host, locked for a capability call of a vCPU in `run`. A host procedure the
@@ -6343,7 +6472,7 @@ trait DomainMember {
 
 impl DomainMember for Box<VCpu> {
     fn domain_key(&self) -> usize {
-        domain_key_of(self)
+        self.domain.id
     }
     fn into_victim(self) -> Option<Box<VCpu>> {
         Some(self)
@@ -6356,10 +6485,26 @@ impl DomainMember for Box<VCpu> {
     }
 }
 
+/// A caller parked on a live call's reply ([`Sched::ticket_waiters`]) is its waiter's member.
+impl DomainMember for (Waiter, ReplyTo) {
+    fn domain_key(&self) -> usize {
+        self.0.domain_key()
+    }
+    fn into_victim(self) -> Option<Box<VCpu>> {
+        self.0.into_victim()
+    }
+    fn vcpu(&self) -> Option<&VCpu> {
+        self.0.vcpu()
+    }
+    fn vcpu_mut(&mut self) -> Option<&mut VCpu> {
+        self.0.vcpu_mut()
+    }
+}
+
 impl DomainMember for Waiter {
     fn domain_key(&self) -> usize {
         match self {
-            Waiter::VCpu(v) => domain_key_of(v),
+            Waiter::VCpu(v) => v.domain.id,
             Waiter::Fiber { svc, .. } => *svc,
         }
     }
@@ -6662,7 +6807,7 @@ impl Sched {
             Some((ParkSite::PipeWrite, 0))
         } else if self.cap_waiters.values().flatten().any(is) {
             Some((ParkSite::StreamRead, 0))
-        } else if let Some((&(_, t), _)) = self.ticket_waiters.iter().find(|(_, w)| is(w)) {
+        } else if let Some((&(_, t), _)) = self.ticket_waiters.iter().find(|(_, (w, _))| is(w)) {
             Some((ParkSite::Reply, t))
         } else if self.completion_waiters.values().any(is) {
             Some((ParkSite::Completion, 0))
@@ -6689,7 +6834,7 @@ impl Sched {
             ParkSite::PipeRead => retain_waiters(&mut self.pipe_waiters, keep),
             ParkSite::PipeWrite => retain_waiters(&mut self.pipe_write_waiters, keep),
             ParkSite::StreamRead => retain_waiters(&mut self.cap_waiters, keep),
-            ParkSite::Reply => self.ticket_waiters.retain(|_, w| keep(w)),
+            ParkSite::Reply => self.ticket_waiters.retain(|_, (w, _)| keep(w)),
             _ => self.completion_waiters.retain(|_, w| keep(w)),
         }
         Some(park)
@@ -6791,8 +6936,9 @@ fn client_gone_targets(v: &VCpu) -> Vec<usize> {
     if v.freeze_bell.is_none() {
         return Vec::new();
     }
-    let mut cells: Vec<Arc<Mutex<Host>>> = v.pager.iter().map(|p| Arc::clone(&p.cell)).collect();
-    cells.extend(v.host.lock_unpoisoned().live_offer_providers());
+    let mut cells: Vec<Arc<Mutex<Host>>> =
+        v.domain.pager.iter().map(|p| Arc::clone(&p.cell)).collect();
+    cells.extend(v.domain.host.lock_unpoisoned().live_offer_providers());
     let mut ids: Vec<usize> = cells
         .iter()
         .map(|c| c.lock_unpoisoned().domain_id() as usize)
@@ -6892,6 +7038,109 @@ struct FinishedThread {
     slot: usize,
     /// The thread's powerbox, where its domain's freeze residue lands.
     sink: Arc<Mutex<Host>>,
+}
+
+/// #2695 step 2 — a domain whose entry returned and which its embedder holds ([`HeldDomain`]):
+/// what an activation of it starts from ([`activation`]).
+struct Resting {
+    domain: Arc<Domain>,
+    /// A thread's view of its window, which each activation forks.
+    mem: Option<Mem>,
+    /// The thread-local word its main vCPU left, which each activation starts with. Its calls run
+    /// one at a time (`Single`), as its main thread would run them, so they see that thread's.
+    tls: i64,
+    /// Its own fuel: what a call no caller funds draws, and what a thread an activation spawns
+    /// draws, the thread being the domain's.
+    home: Fuel,
+}
+
+/// #2695 step 2 — what a run whose root its embedder holds shares with the [`HeldDomain`]: the
+/// run's scheduler, once it exists, and the entry's results, once the root rests.
+#[derive(Default)]
+pub(crate) struct HeldLink {
+    state: Mutex<HeldState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct HeldState {
+    sched: std::sync::Weak<Scheduler>,
+    rested: Option<Vec<Value>>,
+    done: bool,
+}
+
+impl HeldLink {
+    fn publish(&self, sched: &Arc<Scheduler>) {
+        self.state.lock_unpoisoned().sched = Arc::downgrade(sched);
+    }
+
+    fn rested(&self, results: Vec<Value>) {
+        self.state.lock_unpoisoned().rested = Some(results);
+        self.changed.notify_all();
+    }
+
+    fn done(&self) {
+        self.state.lock_unpoisoned().done = true;
+        self.changed.notify_all();
+    }
+
+    fn scheduler(&self) -> Option<Arc<Scheduler>> {
+        self.state.lock_unpoisoned().sched.upgrade()
+    }
+
+    /// The entry's results once the root rests, or `None` once the run ends without resting.
+    fn wait_rest(&self) -> Option<Vec<Value>> {
+        let mut g = self.state.lock_unpoisoned();
+        loop {
+            if let Some(r) = g.rested.take() {
+                return Some(r);
+            }
+            if g.done {
+                return None;
+            }
+            g = self.changed.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// #2695 step 2 — the call an activation answers ([`VCpu::answers`]).
+struct Answers {
+    to: AnswerTo,
+    /// Its domain's own fuel ([`Resting::home`]), which a thread it spawns draws from.
+    home: Fuel,
+}
+
+/// Where an activation's reply goes.
+enum AnswerTo {
+    /// A call through the domain's queue, answered under its dispatch's ticket ([`reply_locked`]).
+    Ticket(u64),
+    /// The embedder's call ([`HeldDomain::call`]).
+    Embedder(Arc<EmbedderReply>),
+}
+
+/// #2695 step 2 — where an embedder's call waits ([`HeldDomain::call`]): its reply, and what is
+/// left of the fuel it lent the call.
+#[derive(Default)]
+struct EmbedderReply {
+    cell: Mutex<Option<(Reply, u64)>>,
+    ready: Condvar,
+}
+
+impl EmbedderReply {
+    fn post(&self, reply: Reply, fuel: u64) {
+        *self.cell.lock_unpoisoned() = Some((reply, fuel));
+        self.ready.notify_all();
+    }
+
+    fn wait(&self) -> (Reply, u64) {
+        let mut g = self.cell.lock_unpoisoned();
+        loop {
+            if let Some(r) = g.take() {
+                return r;
+            }
+            g = self.ready.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
 }
 
 #[derive(Default)]
@@ -6999,7 +7248,7 @@ struct Sched {
     /// calls to *different* callees can share a ticket number — a serve chain (a handler that itself
     /// calls another server) does exactly that, and keying by the bare ticket would let the second
     /// park clobber the first's waiter (I49).
-    ticket_waiters: BTreeMap<(usize, u64), Waiter>,
+    ticket_waiters: BTreeMap<(usize, u64), (Waiter, ReplyTo)>,
     /// I40 — `(callee domain id, dispatch ticket)` whose **caller died before it could claim the
     /// reply**. A dispatch outlives its caller when the caller is reaped (its domain torn down)
     /// with a call still in flight: the callee later serves it and replies, but nobody will ever
@@ -7104,7 +7353,7 @@ struct Sched {
     /// #1685 — the vCPUs that finished by unwinding for the freeze: their results are placeholders,
     /// so a `join` that takes one is re-issued on thaw rather than reloaded.
     unwound: std::collections::BTreeSet<TaskId>,
-    /// #2455 — leaves-first: a domain ([`domain_key_of`]) that pages live detached children when a
+    /// #2455 — leaves-first: a domain ([`Domain::id`]) that pages live detached children when a
     /// freeze reaches it is **held** at `NORMAL`, so it keeps serving their faults, until each child
     /// it waits on here has ended. Then [`release_hold`] lets it unwind ([`hold_for_paged`]).
     held: BTreeMap<usize, std::collections::BTreeSet<TaskId>>,
@@ -7115,6 +7364,21 @@ struct Sched {
     /// #1689 — the first trap of any vCPU (a fork twin's excepted) that finished once the freeze was
     /// in flight. `drive` fails the run with it: a freeze with a failed member is not a freeze.
     freeze_fault: Option<Trap>,
+    /// #2695 step 2 — each domain resting after its entry returned ([`HeldDomain`]), by
+    /// [`Domain::id`]: what its activations run over ([`activation`]). Kept, dead or not, until
+    /// the run ends.
+    resting: BTreeMap<usize, Resting>,
+    /// #2695 step 2 — resting domains a call has landed on since a worker last looked
+    /// ([`Scheduler::svc_wake`]): the next one starts their activations.
+    serve_due: std::collections::BTreeSet<usize>,
+    /// #2695 step 2 — the run's root rests while its embedder holds it ([`HeldDomain`]). The run
+    /// then goes on with nothing in it to run, since the embedder can call in, so no stall verdict
+    /// ends it and its last vCPU's end does not either.
+    held_open: bool,
+    /// #2695 step 2 — threads outside the run's pool running one of its vCPUs: an embedder's calls
+    /// into its held domain, each on its own thread ([`HeldDomain::call`]). The run waits for them
+    /// before it reads back, as it joins its workers.
+    lent: usize,
     /// §5 W3 / §23-D57 — the **trap-origin capture**: the backtrace, fiber and faulting address of
     /// the *first* vCPU to trap on its own op, run-shared and **first-wins**. A thread's trap ends its
     /// domain, the root's with the same trap where it stood, and a child's trap reaches its joiner as
@@ -7139,6 +7403,7 @@ impl Scheduler {
             cap,
             max_workers,
             handoff: false,
+            held: false,
         }
     }
 
@@ -7150,6 +7415,29 @@ impl Scheduler {
     /// demand warrants. `None` if the live cap is hit (a thread-bomb).
     fn spawn(self: &Arc<Self>, make: impl FnOnce(TaskId) -> Box<VCpu>) -> Option<TaskId> {
         let mut s = self.lock();
+        self.spawn_locked(&mut s, make)
+    }
+
+    /// [`Self::spawn`], with the scheduler locked.
+    fn spawn_locked(
+        self: &Arc<Self>,
+        s: &mut Sched,
+        make: impl FnOnce(TaskId) -> Box<VCpu>,
+    ) -> Option<TaskId> {
+        let v = self.adopt_locked(s, make)?;
+        let id = v.id;
+        s.runnable.push_back(v);
+        self.work.notify_one();
+        Some(id)
+    }
+
+    /// [`Self::spawn_locked`], but the vCPU comes back to run on this thread ([`dispatch`]) rather
+    /// than queued for a worker.
+    fn adopt_locked(
+        self: &Arc<Self>,
+        s: &mut Sched,
+        make: impl FnOnce(TaskId) -> Box<VCpu>,
+    ) -> Option<Box<VCpu>> {
         // §12 teardown (owner 2026-07-24): a post-teardown sibling (running at the sweep, effects
         // unspecified) must not repopulate a run that is already over.
         if s.live >= self.cap || s.shutdown {
@@ -7158,10 +7446,9 @@ impl Scheduler {
         let id = s.next_task;
         s.next_task += 1;
         s.live += 1;
-        s.runnable.push_back(make(id));
-        self.maybe_spawn_worker(&mut s);
-        self.work.notify_one();
-        Some(id)
+        let v = make(id);
+        self.maybe_spawn_worker(s);
+        Some(v)
     }
 
     /// Grow the pool toward `min(live, max_workers)` so parked/queued vCPUs have a thread to run them.
@@ -7366,7 +7653,7 @@ impl Scheduler {
             n += 1;
             match w {
                 Waiter::VCpu(v) => {
-                    v.host.lock_unpoisoned().set_sig_interrupt();
+                    v.domain.host.lock_unpoisoned().set_sig_interrupt();
                     s.runnable.push_back(v);
                 }
                 // #1952 — the vCPU discipline: flag the fiber's powerbox, and its rewound op
@@ -7400,7 +7687,7 @@ impl Scheduler {
             let keep: VecDeque<Box<VCpu>> = std::mem::take(ws)
                 .into_iter()
                 .filter_map(|v| {
-                    if domain_key_of(&v) == domain {
+                    if v.domain.id == domain {
                         hit_reaps.push(v);
                         None
                     } else {
@@ -7412,7 +7699,7 @@ impl Scheduler {
         }
         s.posix_reap_waiters.retain(|_, ws| !ws.is_empty());
         for v in hit_reaps {
-            v.host.lock_unpoisoned().set_sig_interrupt();
+            v.domain.host.lock_unpoisoned().set_sig_interrupt();
             s.runnable.push_back(v);
             n += 1;
         }
@@ -7446,7 +7733,9 @@ impl Scheduler {
                 // neither be asked nor prime the cache with another domain's answer.
                 let skip = d == domain
                     && match &w {
-                        Waiter::VCpu(v) => restart_of(&mut restart_cache, honor_restart, &v.host),
+                        Waiter::VCpu(v) => {
+                            restart_of(&mut restart_cache, honor_restart, &v.domain.host)
+                        }
                         Waiter::Fiber { .. } => honor_restart && restart_cache.unwrap_or(false),
                     };
                 if d == domain && !skip {
@@ -7474,12 +7763,12 @@ impl Scheduler {
         // POSIX `wait` parks: a named `wait(pid)` sits in `join_waiters` under `Pending::ReapPid`
         // (a `thread.join` park has a different pending and is NOT a syscall — left alone).
         let mut restart =
-            |v: &VCpu| -> bool { restart_of(&mut restart_cache, honor_restart, &v.host) };
+            |v: &VCpu| -> bool { restart_of(&mut restart_cache, honor_restart, &v.domain.host) };
         let reap_keys: Vec<TaskId> = s
             .join_waiters
             .iter()
             .filter(|(_, v)| {
-                matches!(v.pending, Some(Pending::ReapPid { .. })) && domain_key_of(v) == domain
+                matches!(v.pending, Some(Pending::ReapPid { .. })) && v.domain.id == domain
             })
             .map(|(k, _)| *k)
             .collect();
@@ -7496,7 +7785,7 @@ impl Scheduler {
         let anyw = std::mem::take(&mut s.reap_any_waiters);
         let mut keep_any = std::collections::VecDeque::new();
         for mut v in anyw {
-            if domain_key_of(&v) == domain && !restart(&v) {
+            if v.domain.id == domain && !restart(&v) {
                 v.pending = Some(Pending::CapResult(EINTR));
                 s.runnable.push_back(v);
                 n += 1;
@@ -7536,7 +7825,7 @@ impl Scheduler {
             let keep: VecDeque<Box<VCpu>> = std::mem::take(ws)
                 .into_iter()
                 .filter_map(|v| {
-                    if domain_key_of(&v) == domain {
+                    if v.domain.id == domain {
                         hits.push(v);
                         None
                     } else {
@@ -7565,34 +7854,9 @@ impl Scheduler {
     /// Found hammering the multi-consumer suite; reachable (rarer) with a single consumer too.
     /// Lock order (scheduler, then callee powerbox) matches the caller's park handler and the
     /// fiber early-probe, so the pair can't deadlock.
-    fn cap_reply_or_stash(&self, ticket: u64, result: i64, callee: &Arc<Mutex<Host>>) {
-        let mut s = self.lock();
-        let callee_id = {
-            let mut c = callee.lock_unpoisoned();
-            // #1862 — a page request answered without a settle (an error reply) drops its sink.
-            c.page_sinks.remove(&ticket);
-            c.domain_id() as usize
-        };
-        match s.ticket_waiters.remove(&(callee_id, ticket)) {
-            Some(Waiter::VCpu(mut v)) => {
-                v.pending = Some(Pending::CapResult(result));
-                s.runnable.push_back(v);
-                self.work.notify_all();
-            }
-            Some(Waiter::Fiber { reg, slot, svc, .. }) => {
-                reg.wake_blocked(slot, Reg::from_i64(result));
-                if svc_wake_locked(&mut s, svc) {
-                    self.work.notify_all();
-                }
-            }
-            None => {
-                // I40: the caller was reaped with this call in flight — drop the reply instead of
-                // stashing an entry into `svc_results` that nothing will ever claim.
-                if s.orphan_tickets.remove(&(callee_id, ticket)) {
-                    return;
-                }
-                callee.lock_unpoisoned().svc_results.insert(ticket, result);
-            }
+    fn cap_reply_or_stash(&self, ticket: u64, reply: Reply, callee: &Arc<Mutex<Host>>) {
+        if reply_locked(&mut self.lock(), ticket, reply, callee) {
+            self.work.notify_all();
         }
     }
 
@@ -7688,13 +7952,33 @@ impl Scheduler {
         self.lock().take_fiber_park(reg, slot)
     }
 
+    /// #2695 step 2 — the call just queued on `callee` under `ticket`, as an [`activation`] for the
+    /// caller's thread to run ([`dispatch`]), when `callee` rests. `None` when it does not, or when
+    /// the call was refused (answered already) or another thread took it first.
+    fn take_resting(self: &Arc<Self>, callee: usize, ticket: u64) -> Option<Box<VCpu>> {
+        let mut s = self.lock();
+        if serves(&s, callee) {
+            return None;
+        }
+        let host = Arc::clone(&s.resting.get(&callee)?.domain.host);
+        let d = {
+            let mut h = host.lock_unpoisoned();
+            let i = h.svc_queue.iter().position(|d| d.ticket == ticket)?;
+            h.svc_queue.remove(i)?
+        };
+        queued_activation(self, &mut s, callee, d, &host)
+    }
+
     /// §3.6 slice 3 — a caller's enqueue landed on domain `key`'s queue: wake its vCPUs parked
     /// in `svc.wait`, if any (all of them — see [`Sched::svc_waiters`]). Resume re-executes the
     /// `svc.wait` (the frame was rewound at the park), which then finds the queue non-empty and
     /// serves — or, for a consumer that lost the admission race, re-parks.
     fn svc_wake(&self, key: usize) -> bool {
         let mut s = self.lock();
-        if svc_wake_locked(&mut s, key) {
+        // #2695 step 2 — a resting domain has no serve loop to wake: the next worker starts an
+        // activation for the call ([`serve_resting`]).
+        let due = s.resting.contains_key(&key) && s.serve_due.insert(key);
+        if svc_wake_locked(&mut s, key) || due {
             self.work.notify_all();
             true
         } else {
@@ -7762,10 +8046,10 @@ impl Scheduler {
         // Only a whole parked vCPU is forkable this slice; anything else stays put. The extracted
         // caller is owned — dropping the lock before the engine call is race-free (nothing else
         // can reach it), and the engine re-acquires with the same lock discipline.
-        let v = {
+        let (v, to) = {
             let mut s = self.lock();
             match s.ticket_waiters.remove(&(callee_id, ticket)) {
-                Some(Waiter::VCpu(v)) => v,
+                Some((Waiter::VCpu(v), to)) => (v, to),
                 Some(other) => {
                     s.ticket_waiters.insert((callee_id, ticket), other);
                     return None;
@@ -7780,7 +8064,7 @@ impl Scheduler {
                 // single-reply path, so it never hangs).
                 let mut s = self.lock();
                 s.ticket_waiters
-                    .insert((callee_id, ticket), Waiter::VCpu(v));
+                    .insert((callee_id, ticket), (Waiter::VCpu(v), to));
                 None
             }
         }
@@ -7877,15 +8161,15 @@ impl Scheduler {
         }
         // #799 — never fork a member of an already-dead domain (the drive-loop route can race a
         // teardown; the caller's own next safepoint observes the domain trap).
-        if s.dead.contains_key(&domain_key_of(&v)) {
+        if s.dead.contains_key(&v.domain.id) {
             return Err(v);
         }
         // A bare root park with no children/fibers is the only shape `fork_twin` duplicates faithfully.
         let bare = v.cur == ROOT_FIBER
             && v.chain.as_slice() == [ROOT_FIBER]
             && v.root_parked.is_none()
-            && v.children.lock_unpoisoned().idle()
-            && !v.registry.has_blocked_parks();
+            && v.domain.children.lock_unpoisoned().idle()
+            && !v.domain.registry.has_blocked_parks();
         macro_rules! put_back_none {
             () => {{
                 drop(s);
@@ -7905,7 +8189,7 @@ impl Scheduler {
         };
         // #2001 — the twin is one `spawn` of its parent's node (which it shares) while it lives: a
         // full ceiling refuses the fork as the live cap does.
-        let node = v.host.lock_unpoisoned().own_node();
+        let node = v.domain.host.lock_unpoisoned().own_node();
         let Some(live) = LiveVcpu::charge(node) else {
             put_back_none!();
         };
@@ -7933,7 +8217,7 @@ impl Scheduler {
         // Duplicated powerbox (own handle namespace, shared `Arc` backings, new `domain_id`) — fails
         // closed on any domain the core can't duplicate on its own (closure caps, live offers, …).
         let twin_host = {
-            let hg = v.host.lock_unpoisoned();
+            let hg = v.domain.host.lock_unpoisoned();
             match hg.fork_powerbox(twin_id, v.mem.as_ref().map_or(0, Mem::mapped_size)) {
                 Some(h) => Arc::new(Mutex::new(h)),
                 None => {
@@ -7951,7 +8235,7 @@ impl Scheduler {
         // deliverable signal raised against the twin (`kill(pid)`) interrupts ITS blocked syscalls —
         // and only its (invariant 12). Weak: the run's `Arc` dies with the run, no teardown needed.
         self.wire_signal_doors(&twin_host);
-        let parent_key = domain_key_of(&v); // the forking domain — this twin's parent (per-parent reap)
+        let parent_key = v.domain.id; // the forking domain — this twin's parent (per-parent reap)
         let mut twin = v.fork_twin(twin_id, twin_mem, twin_host);
         twin.live = live;
         twin.pending = Some(Pending::CapResult(reply_twin));
@@ -7987,7 +8271,7 @@ impl Scheduler {
                 bell,
                 entry: entry.unwrap_or(0),
                 ctx: twin.vcpu_ctx,
-                host: Some(Arc::clone(&twin.host)),
+                host: Some(Arc::clone(&twin.domain.host)),
             },
         );
         s.runnable.push_back(twin);
@@ -8013,8 +8297,8 @@ impl Scheduler {
         let mut zeroed = (Vec::new(), Vec::new());
         // #2001 — the process is one `spawn` of its spawner's node (which it shares) while it
         // lives: a full ceiling refuses it as the live cap does.
-        let node = v.host.lock_unpoisoned().own_node();
-        let reply = if s.live >= self.cap || s.shutdown || s.dead.contains_key(&domain_key_of(&v)) {
+        let node = v.domain.host.lock_unpoisoned().own_node();
+        let reply = if s.live >= self.cap || s.shutdown || s.dead.contains_key(&v.domain.id) {
             EAGAIN
         } else if let Some(live) = LiveVcpu::charge(node) {
             if s.next_task <= 1 {
@@ -8024,7 +8308,11 @@ impl Scheduler {
             // #1648 — from here a factory may register a process under this pid: burn it.
             s.next_task += 1;
             let window = v.mem.as_ref().map_or(0, Mem::mapped_size);
-            let twin = v.host.lock_unpoisoned().spawn_powerbox(pid, plan, window);
+            let twin = v
+                .domain
+                .host
+                .lock_unpoisoned()
+                .spawn_powerbox(pid, plan, window);
             match twin.map(|t| Arc::new(Mutex::new(t))) {
                 None => EAGAIN,
                 Some(twin) => {
@@ -8041,8 +8329,8 @@ impl Scheduler {
                             );
                             child.live = live;
                             s.live += 1;
-                            self.wire_signal_doors(&child.host);
-                            let parent = domain_key_of(&v);
+                            self.wire_signal_doors(&child.domain.host);
+                            let parent = v.domain.id;
                             // A command image is not instrumented: nothing can unwind it,
                             // so it has no doorbell (#1688).
                             s.forked_twins.insert(
@@ -8053,7 +8341,7 @@ impl Scheduler {
                                     bell: None,
                                     entry: 0,
                                     ctx: 0,
-                                    host: Some(Arc::clone(&child.host)),
+                                    host: Some(Arc::clone(&child.domain.host)),
                                 },
                             );
                             s.runnable.push_back(Box::new(child));
@@ -8114,8 +8402,8 @@ impl Scheduler {
         // caller's domain without committing to remove it. A caller not parked yet (serve/park race)
         // is retryable (`-EAGAIN`); a parked caller of the *wrong* domain is `-ECHILD` (not its child).
         match s.ticket_waiters.get(&(callee_id, ticket)) {
-            Some(Waiter::VCpu(v)) if domain_key_of(v) == parent => {}
-            Some(Waiter::VCpu(_)) => return ReapOutcome::NoChild,
+            Some((Waiter::VCpu(v), _)) if v.domain.id == parent => {}
+            Some((Waiter::VCpu(_), _)) => return ReapOutcome::NoChild,
             _ => return ReapOutcome::Retry,
         }
         // #1816 — a still-running twin another blocking `wait` is already parked on is claimed:
@@ -8128,7 +8416,7 @@ impl Scheduler {
         // caller's `CapReply` waiter is not registered yet (the serve/park race) — the twin is real
         // (it's in `forked_twins`), so this is retryable, never `-ECHILD`.
         let mut v = match s.ticket_waiters.remove(&(callee_id, ticket)) {
-            Some(Waiter::VCpu(v)) => v,
+            Some((Waiter::VCpu(v), _)) => v,
             Some(other) => {
                 s.ticket_waiters.insert((callee_id, ticket), other);
                 return ReapOutcome::Retry;
@@ -8181,7 +8469,7 @@ impl Scheduler {
         // Scope to the calling parent: peek the caller's domain (twins exist, so a not-yet-parked
         // caller is the serve/park race → retry). Then require ≥1 live twin of this parent.
         let parent = match s.ticket_waiters.get(&(callee_id, ticket)) {
-            Some(Waiter::VCpu(v)) => domain_key_of(v),
+            Some((Waiter::VCpu(v), _)) => v.domain.id,
             _ => return ReapOutcome::Retry,
         };
         let matches = |t: &Twin| t.parent == parent && t.reaper == TwinReaper::Servicer;
@@ -8189,7 +8477,7 @@ impl Scheduler {
             return ReapOutcome::NoChild; // no child of this parent — `-ECHILD`.
         }
         let mut v = match s.ticket_waiters.remove(&(callee_id, ticket)) {
-            Some(Waiter::VCpu(v)) => v,
+            Some((Waiter::VCpu(v), _)) => v,
             Some(other) => {
                 s.ticket_waiters.insert((callee_id, ticket), other);
                 return ReapOutcome::Retry;
@@ -8298,7 +8586,7 @@ fn wake_reap_any(s: &mut Sched, id: TaskId) -> bool {
     let pos = s
         .reap_any_waiters
         .iter()
-        .position(|w| domain_key_of(w) == parent);
+        .position(|w| w.domain.id == parent);
     if let Some(pos) = pos {
         let mut waiter = s.reap_any_waiters.remove(pos).expect("position just found");
         waiter.pending = Some(Pending::ReapPid { pid: id });
@@ -8513,15 +8801,6 @@ fn process_timers(s: &mut Sched) {
     }
 }
 
-/// A vCPU's **domain key**: its powerbox identity ([`Host::domain_id`] — the same key
-/// `svc_waiters`, fiber waiters' `svc` field, and [`Sched::dead`] use). All vCPUs of a domain
-/// share the powerbox `Arc`, so this partitions a run's vCPUs into its domains (the root + its
-/// `thread.spawn` threads vs. each §14 live child + *its* threads). Lock order sched → host is
-/// the established one (the park arms take it the same way).
-fn domain_key_of(v: &VCpu) -> usize {
-    v.host.lock_unpoisoned().domain_id() as usize
-}
-
 /// A fork twin's main vCPU `id` has finished with `result` — returned, trapped, or killed at a
 /// teardown ([`reap`], #1816). A no-op for any other vCPU: a thread sibling completing on a
 /// *shared* host must not fire the domain's hooks. Returns whether a `waitpid` bench was woken (the
@@ -8589,7 +8868,7 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     // D66 — a vCPU its quantum preempted still holds its lanes (#2237): give them back, and re-admit
     // what waited on them, as its next dispatch would have.
     if v.holds_lanes {
-        lane_leave(&mut s.lane_running, &v.lane_chain);
+        lane_leave(&mut s.lane_running, &lanes(&v));
         let woken: Vec<Box<VCpu>> = s.lane_waiters.drain(..).collect();
         s.runnable.extend(woken);
     }
@@ -8598,8 +8877,20 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
         .values()
         .map(|&(_, t)| t)
         .chain(v.serve_run.as_ref().map(|r| r.ticket))
+        .chain(v.answers.as_ref().and_then(|a| match a.to {
+            AnswerTo::Ticket(t) => Some(t),
+            AnswerTo::Embedder(_) => None,
+        }))
         .collect();
-    for (flag, host) in child_domains(&v.children) {
+    // #2695 step 2 — an embedder's call answers its domain's end where the activation dies.
+    if let Some(Answers {
+        to: AnswerTo::Embedder(e),
+        ..
+    }) = &v.answers
+    {
+        e.post(Reply::Failed(CAP_REVOKED), v.fuel.can_burn());
+    }
+    for (flag, host) in child_domains(&v.domain.children) {
         kill_child_locked(s, &flag, host.as_ref());
     }
     // CALLS.md 4b.3 — a reaped caller that was mid-animation holds a provider instance checked out
@@ -8617,7 +8908,7 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
         state.lock_unpoisoned().admit_parked -= 1;
     }
     if v.vcpu_ctx > 0 {
-        v.registry.free_vcpu_context(v.vcpu_ctx);
+        v.domain.registry.free_vcpu_context(v.vcpu_ctx);
     }
     let outcome = Outcome {
         result: Err(reason),
@@ -8631,13 +8922,13 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     // back to the budget that paid for them (lock order sched → host), and what it grew (#1909).
     // Every vCPU of the dying domain passes here; the first hands it back, with the window of a
     // process that paid for its own (#2106).
-    v.host.lock_unpoisoned().release_memory();
+    v.domain.host.lock_unpoisoned().release_memory();
     if let Some((cell, lease)) = v.window_lease.take() {
         cell.lock_unpoisoned().release_detached(lease);
     }
     // #1816 — a fork twin's main vCPU killed here has finished as surely as one reaching `Done`:
     // its personalities and its `waitpid` benchers hear it the same way.
-    twin_finished_locked(s, id, &v.host, &outcome.result);
+    twin_finished_locked(s, id, &v.domain.host, &outcome.result);
     // A twin a freeze rang stays for the harvest, which refuses to carry it: this may be the run's
     // own end reaping it where it parked, and it did not die.
     let retired =
@@ -8658,7 +8949,7 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     }
     end_hold_member(s, id); // #2455
     s.live -= 1;
-    if s.live == 0 {
+    if s.live == 0 && !s.held_open {
         s.shutdown = true;
     }
     tickets
@@ -8670,16 +8961,9 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
 /// its park instead (the `CapReply` arms probe [`Sched::dead`]).
 fn wake_dead_tickets(s: &mut Sched, callee: usize, tickets: impl IntoIterator<Item = u64>) {
     for t in tickets {
-        match s.ticket_waiters.remove(&(callee, t)) {
-            Some(Waiter::VCpu(mut w)) => {
-                w.pending = Some(Pending::CapResult(CAP_REVOKED));
-                s.runnable.push_back(w);
-            }
-            Some(Waiter::Fiber { reg, slot, svc, .. }) => {
-                reg.wake_blocked(slot, Reg::from_i64(CAP_REVOKED));
-                svc_wake_locked(s, svc);
-            }
-            None => {}
+        if let Some((waiter, to)) = s.ticket_waiters.remove(&(callee, t)) {
+            let out = to.fail(CAP_REVOKED);
+            deliver_reply(s, waiter, to, out);
         }
     }
 }
@@ -8768,6 +9052,7 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
             .drain(..)
             .map(|d| d.ticket),
     );
+    dying.lock_unpoisoned().svc_payers.clear();
     // Every ticket collected here is a dispatch *to* the dying domain `key` (its members' admitted
     // handler/serve tickets and its queued dispatches), so its callers are keyed `(key, ticket)`.
     wake_dead_tickets(s, key, tickets);
@@ -8802,7 +9087,7 @@ fn teardown_run(s: &mut Sched) {
     for v in victims {
         let reason = s
             .dead
-            .get(&domain_key_of(&v))
+            .get(&v.domain.id)
             .cloned()
             .unwrap_or(Trap::ThreadFault);
         reap(s, v, reason);
@@ -8890,7 +9175,7 @@ mod park_before_wake_tests {
 }
 
 fn park_gate(s: &mut Sched, v: Box<VCpu>) -> Option<Box<VCpu>> {
-    let key = domain_key_of(&v);
+    let key = v.domain.id;
     if !s.shutdown && !s.dead.contains_key(&key) {
         return Some(v);
     }
@@ -8942,7 +9227,9 @@ fn park_gate(s: &mut Sched, v: Box<VCpu>) -> Option<Box<VCpu>> {
 /// executor waits on the condvar forever where the cooperative driver traps (INVARIANTS.md #9: a
 /// run completes, traps, or declines — never hangs).
 fn run_deadlocked(s: &Sched) -> bool {
-    s.live > 0
+    // #2695 step 2 — a held domain's embedder can always call in.
+    !s.held_open
+        && s.live > 0
         && s.parked == s.workers.saturating_sub(1)
         && s.pipe_waiters.is_empty()
         && s.pipe_write_waiters.is_empty()
@@ -8964,6 +9251,26 @@ fn run_deadlocked(s: &Sched) -> bool {
 /// D66 — the lane arithmetic, shared with the JIT's child-domain executor through
 /// [`temen_ir::lanes`] so the 6/2/2 answer is one function (INVARIANTS #15). See there.
 use temen_ir::lanes::{bounded as lane_bounded, enter as lane_enter, leave as lane_leave};
+
+/// #2695 step 2 — the lane key of domain `domain`'s **admission gate**: under `Single`, its calls
+/// run one at a time, each until it parks ([`OfferPolicy`]). That is a lane of width 1 over its
+/// activations alone, held across a quantum's end and given back at a park, as every lane is. Lane
+/// keys are otherwise domain ids, so the top bit keeps the two apart.
+fn gate_key(domain: usize) -> usize {
+    domain | 1 << (usize::BITS - 1)
+}
+
+/// The lanes `v` runs in: its domain's (D66), and an activation's admission gate besides.
+fn lanes(v: &VCpu) -> std::borrow::Cow<'_, [(usize, i64)]> {
+    match v.answers {
+        None => std::borrow::Cow::Borrowed(&v.domain.lane_chain),
+        Some(_) => std::borrow::Cow::Owned(
+            (v.domain.lane_chain.iter().copied())
+                .chain([(gate_key(v.domain.id), 1)])
+                .collect(),
+        ),
+    }
+}
 
 /// #1584 / §13.4 4c-bis — is the run **quiesced**: is there at least one park for a freeze to
 /// re-admit, and will nothing wake on its own?
@@ -9016,7 +9323,7 @@ fn freeze_can_admit(s: &Sched) -> bool {
         site.freeze_rule() == FreezeRule::Reissue
             && s.parked(site)
                 .iter()
-                .any(|v| !s.held.contains_key(&domain_key_of(v)))
+                .any(|v| !s.held.contains_key(&v.domain.id))
     })
 }
 
@@ -9033,7 +9340,7 @@ fn hold_for_paged(s: &mut Sched, domain: usize, me: Option<&Seat>) -> bool {
     {
         let others: Vec<Seat> = scheduled_vcpus(s)
             .into_iter()
-            .filter(|v| domain_key_of(v) == domain)
+            .filter(|v| v.domain.id == domain)
             .map(VCpu::seat)
             .collect();
         for seat in domain_seats(me.into_iter().chain(others.iter())) {
@@ -9131,18 +9438,14 @@ fn release_hold(s: &mut Sched, domain: usize) {
         .withheld
         .keys()
         .copied()
-        .filter(|c| {
-            s.join_waiters
-                .get(c)
-                .is_some_and(|v| domain_key_of(v) == domain)
-        })
+        .filter(|c| s.join_waiters.get(c).is_some_and(|v| v.domain.id == domain))
         .collect();
     for child in ends {
         let joiner = s.join_waiters.remove(&child).expect("filtered just above");
         s.runnable.push_back(joiner);
     }
     for v in s.runnable.iter_mut() {
-        if domain_key_of(v) == domain && v.dstate != STATE_REWINDING {
+        if v.domain.id == domain && v.dstate != STATE_REWINDING {
             v.dstate = STATE_UNWINDING;
         }
     }
@@ -9210,7 +9513,7 @@ fn admit_parks_for_freeze(s: &mut Sched) {
     let parked: BTreeSet<usize> = ParkSite::ALL
         .iter()
         .flat_map(|&site| s.parked(site))
-        .map(domain_key_of)
+        .map(|v| v.domain.id)
         .collect();
     for domain in parked {
         hold_for_paged(s, domain, None);
@@ -9243,7 +9546,8 @@ fn admit_parks(s: &mut Sched, of: &dyn Fn(usize) -> bool) {
                                 .reply_ticket
                                 .take()
                                 .expect("a reply park carries its ticket");
-                            v.host
+                            v.domain
+                                .host
                                 .lock_unpoisoned()
                                 .await_reply_after_thaw(v.durable_sp_ctx, t);
                             v.pending = Some(Pending::Abandoned);
@@ -9255,7 +9559,7 @@ fn admit_parks(s: &mut Sched, of: &dyn Fn(usize) -> bool) {
             }
             FreezeRule::Phase => {
                 for v in s.parked_mut(site) {
-                    if of(domain_key_of(v)) {
+                    if of(v.domain.id) {
                         v.dstate = STATE_UNWINDING;
                     }
                 }
@@ -9281,9 +9585,9 @@ impl VCpu {
     fn seat(&self) -> Seat<'_> {
         Seat {
             id: self.id,
-            children: &self.children,
-            host: &self.host,
-            registry: &self.registry,
+            children: &self.domain.children,
+            host: &self.domain.host,
+            registry: &self.domain.registry,
         }
     }
 }
@@ -9499,6 +9803,10 @@ fn worker_loop(sched: &Arc<Scheduler>) {
             let mut s = sched.lock();
             loop {
                 process_timers(&mut s);
+                // #2695 step 2 — calls that landed on resting domains start their activations.
+                while let Some(key) = s.serve_due.pop_first() {
+                    serve_resting(sched, &mut s, key);
+                }
                 if let Some(v) = s.runnable.pop_front() {
                     break Some(v);
                 }
@@ -9605,7 +9913,13 @@ fn worker_loop(sched: &Arc<Scheduler>) {
 /// cell wakes the caller instead of stranding it) and D37 death-is-revocation. Shared by the
 /// `Blocked::CapReply` park and the §2.2 page-fault park (which sets `page_fault` first, so the
 /// wake supplies the page instead of pushing the reply).
-fn park_cap_reply(sched: &Arc<Scheduler>, v: Box<VCpu>, ticket: u64, callee: Arc<Mutex<Host>>) {
+fn park_cap_reply(
+    sched: &Arc<Scheduler>,
+    v: Box<VCpu>,
+    ticket: u64,
+    callee: Arc<Mutex<Host>>,
+    to: ReplyTo,
+) {
     let mut s = sched.lock();
     // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
     let Some(mut v) = park_gate(&mut s, v) else {
@@ -9628,18 +9942,20 @@ fn park_cap_reply(sched: &Arc<Scheduler>, v: Box<VCpu>, ticket: u64, callee: Arc
     let early = callee.lock_unpoisoned().svc_results.remove(&ticket);
     match early {
         Some(r) => {
-            v.pending = Some(Pending::CapResult(r));
+            let out = to.complete(r, &callee);
+            v.pending = Some(Pending::Reply { out, sig: to.sig });
             s.runnable.push_back(v);
             sched.work.notify_one();
         }
         None if callee_dead => {
-            v.pending = Some(Pending::CapResult(CAP_REVOKED));
+            let out = to.fail(CAP_REVOKED);
+            v.pending = Some(Pending::Reply { out, sig: to.sig });
             s.runnable.push_back(v);
             sched.work.notify_one();
         }
         None => {
             s.ticket_waiters
-                .insert((callee_id, ticket), Waiter::VCpu(v));
+                .insert((callee_id, ticket), (Waiter::VCpu(v), to));
         }
     }
 }
@@ -9668,10 +9984,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
         // the worker; a blocked one waits in `lane_waiters` (re-admitted on any release) and the worker
         // moves on. One that its quantum preempted still holds its lanes. Unbounded chains — every run
         // that sets no cap — skip the lock entirely.
-        let bounded = lane_bounded(&v.lane_chain);
+        let bounded = lane_bounded(&lanes(&v));
         if bounded && !v.holds_lanes {
             let mut s = sched.lock();
-            if !lane_enter(&mut s.lane_running, &v.lane_chain) {
+            if !lane_enter(&mut s.lane_running, &lanes(&v)) {
                 s.lane_waiters.push_back(v);
                 return;
             }
@@ -9716,7 +10032,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
         // release admitted could run to its end before the freeze rang it.
         v.holds_lanes = bounded && matches!(step, Step::Yield);
         if bounded && !v.holds_lanes && !matches!(step, Step::Done(_)) {
-            release_lanes(sched, &v.lane_chain);
+            release_lanes(sched, &lanes(&v));
         }
         // Save this vCPU's durable words whenever it parks (it resumes later on this single worker and must
         // restore the same context). Skipped on `Done` (it won't run again; its residue, if any, is read
@@ -9774,7 +10090,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let detached_live_refused = froze && {
                     let mut refuse = false;
                     for (slot, cid, child) in v.seat().children() {
-                        if !v.children.lock_unpoisoned().reached.insert(cid) {
+                        if !v.domain.children.lock_unpoisoned().reached.insert(cid) {
                             continue;
                         }
                         // A child that already unwound for this freeze (rung while its parent was
@@ -9783,14 +10099,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         if let Some(o) = finished.then(|| v.sched.take_result(cid)).flatten() {
                             // One no one can join leaves nothing a thaw needs (#2465).
                             if let Some(slot) = slot {
-                                v.host
-                                    .lock_unpoisoned()
-                                    .frozen_detached
-                                    .push(FrozenDetached {
+                                v.domain.host.lock_unpoisoned().frozen_detached.push(
+                                    FrozenDetached {
                                         parent_task: v.id as usize,
                                         slot,
                                         completed_result: join_outcome(o.result),
-                                    });
+                                    },
+                                );
                             }
                         } else if let (Some((bell, spawn)), Some(host)) =
                             (&child.freeze, &child.host)
@@ -9808,17 +10123,16 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                             // veto its parent's freeze, but until the parked kinds are reachable the
                             // honest answer is to refuse loudly rather than emit a partial artifact.
                             bell.store(true, Ordering::Relaxed);
-                            v.host
-                                .lock_unpoisoned()
-                                .pending_detached
-                                .push(PendingDetached {
+                            v.domain.host.lock_unpoisoned().pending_detached.push(
+                                PendingDetached {
                                     parent_task: v.id as usize,
                                     slot: slot.unwrap_or(0),
                                     child_task: cid,
                                     host: Arc::clone(host),
                                     spawn: spawn.clone(),
                                     joinable: slot.is_some(),
-                                });
+                                },
+                            );
                         } else {
                             // No doorbell: a child reached by a path that does not wire one.
                             // Nothing can reach it.
@@ -9830,7 +10144,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 };
                 // D66 — the freeze has reached the domain's children: the lanes go back now (#2706).
                 if bounded {
-                    release_lanes(sched, &v.lane_chain);
+                    release_lanes(sched, &lanes(&v));
                 }
                 let result = if detached_live_refused {
                     Err(Trap::ThreadFault)
@@ -9845,33 +10159,37 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     if let Some((func, args, slot)) = v.spawn_residue.clone() {
                         // A **spawned** vCPU (slice 3.2.1) records *itself* as residue: its continuation now
                         // lives in its own region (extent = `self_sp`); a thaw re-spawns it there.
-                        let joinable = names_task(&v.children, slot, v.id);
-                        v.host.lock_unpoisoned().frozen_vcpus.push(FrozenVCpu {
-                            task: v.id as usize,
-                            parent_task: v.parent_task as usize,
-                            slot: if joinable { slot } else { 0 },
-                            joinable,
-                            func: func as i32,
-                            args,
-                            shadow_sp: self_sp,
-                            completed_result: None, // re-spawned and rewound on thaw
-                        });
+                        let joinable = names_task(&v.domain.children, slot, v.id);
+                        v.domain
+                            .host
+                            .lock_unpoisoned()
+                            .frozen_vcpus
+                            .push(FrozenVCpu {
+                                task: v.id as usize,
+                                parent_task: v.parent_task as usize,
+                                slot: if joinable { slot } else { 0 },
+                                joinable,
+                                func: func as i32,
+                                args,
+                                shadow_sp: self_sp,
+                                completed_result: None, // re-spawned and rewound on thaw
+                            });
                     } else {
                         // The root: record its extent (the shared active-SP word will be overwritten by a
                         // later child, so the root's residue can't ride the window).
-                        v.host.lock_unpoisoned().frozen_root_sp = Some(self_sp);
+                        v.domain.host.lock_unpoisoned().frozen_root_sp = Some(self_sp);
                     }
                     // #2043 — its domain's child counters, as they stand now: the last vCPU of the
                     // domain to unwind writes the cut's, since nothing changes the table after it.
-                    let generations = v.children.lock_unpoisoned().table.generations();
-                    v.host.lock_unpoisoned().frozen_children = generations;
+                    let generations = v.domain.children.lock_unpoisoned().table.generations();
+                    v.domain.host.lock_unpoisoned().frozen_children = generations;
                     let r = v.freeze_drive().and(result);
                     // Hand this vCPU's flattened fibers back to the embedder via the shared host. **Extend**
                     // (not assign): every vCPU contributes its own, and the snapshot's canonical sort-by-slot
                     // makes the accumulation order irrelevant to the artifact.
                     if !v.frozen.is_empty() {
                         let frozen = std::mem::take(&mut v.frozen);
-                        v.host.lock_unpoisoned().frozen_fibers.extend(frozen);
+                        v.domain.host.lock_unpoisoned().frozen_fibers.extend(frozen);
                     }
                     r
                 } else {
@@ -9880,7 +10198,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // Context recycling: a spawned vCPU that genuinely finished frees its shadow context for a
                 // later spawn to reuse (a freeze-unwound child keeps it — it's re-spawned there on thaw).
                 if v.vcpu_ctx > 0 && !froze {
-                    v.registry.free_vcpu_context(v.vcpu_ctx);
+                    v.domain.registry.free_vcpu_context(v.vcpu_ctx);
                 }
                 let id = v.id;
                 // §5 W3: snapshot the trap-time call stack before the vCPU is dropped (only on a trap).
@@ -9900,12 +10218,46 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // §12 domain lifetime (owner 2026-07-24): capture what a teardown needs before the vCPU
                 // is dropped — its domain key, its powerbox (the dying domain's queue), and the tickets
                 // of dispatches it admitted but never replied (their cross-domain callers wake, D37).
-                let key = domain_key_of(&v);
+                let key = v.domain.id;
+                // #2695 step 2 — a held root whose entry returned rests: its domain lives on, and
+                // each call into it runs as an activation ([`activation`]). An activation is not its
+                // domain's main either. Neither ends the domain, as a thread's end does not.
+                let held = (!froze && v.id == ROOT_TASK && v.answers.is_none() && result.is_ok())
+                    .then(|| v.domain.host.lock_unpoisoned().held_link())
+                    .flatten();
+                let rests = held.is_some();
+                let main = v.spawn_residue.is_none() && v.answers.is_none() && !rests;
+                let rest = rests.then(|| Resting {
+                    domain: Arc::clone(&v.domain),
+                    mem: v.mem.as_ref().map(Mem::fork_for_thread),
+                    tls: v.tls,
+                    home: v.fuel.for_thread(),
+                });
+                let entry_results = rest.as_ref().and(result.as_ref().ok()).cloned();
+                // INVARIANTS #8 — an activation's return is its reply: every result, the first a page
+                // request's status, settled from this window as a serve loop settles it. Its trap or
+                // exit ends the domain, so its call answers as a dead domain's does.
+                let answer = v.answers.take().map(|a| {
+                    let reply = match &result {
+                        Ok(vals) => {
+                            let mut slots: Vec<i64> =
+                                vals.iter().map(|&x| val_to_slot(x)).collect();
+                            if let (AnswerTo::Ticket(t), Some(first)) = (&a.to, slots.first_mut()) {
+                                let mem = v.mem.as_ref().map(|m| m as &dyn GuestMem);
+                                *first =
+                                    v.domain.host.lock_unpoisoned().settle_page(*t, *first, mem);
+                            }
+                            Reply::Results(slots)
+                        }
+                        Err(_) => Reply::Failed(CAP_REVOKED),
+                    };
+                    (a.to, reply, v.fuel.can_burn())
+                });
                 // #2480 — the domain's main vCPU finishing ends the domain (#1917), and with it the
                 // fibers no one will resume now.
-                let ends_domain = !froze && v.spawn_residue.is_none();
+                let ends_domain = !froze && main;
                 let spawner_domain = v.spawner_domain;
-                let dying_host = Arc::clone(&v.host);
+                let dying_host = Arc::clone(&v.domain.host);
                 let own_tickets: Vec<u64> = v
                     .handler_parks
                     .values()
@@ -9922,10 +10274,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // domain whose *thread* finished (#1917): a `thread.spawn` child shares its domain's
                 // powerbox and so its pipe ends, and a thread's exit closes nothing. The domain's main
                 // vCPU finishing ends the domain, and releases them.
-                let (pipe_eofs, pipe_epipes) = if froze || v.spawn_residue.is_some() {
+                let (pipe_eofs, pipe_epipes) = if froze || !main {
                     (Vec::new(), Vec::new())
                 } else {
-                    let mut h = v.host.lock_unpoisoned();
+                    let mut h = v.domain.host.lock_unpoisoned();
                     // #1909, #2106 — and its window goes, with what it held.
                     h.release_memory();
                     h.release_pipe_ends()
@@ -9951,12 +10303,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         if v.durable
                             && !froze
                             && result.is_ok()
-                            && names_task(&v.children, *slot, v.id) =>
+                            && names_task(&v.domain.children, *slot, v.id) =>
                     {
                         Some(FinishedThread {
                             parent_task: v.parent_task,
                             slot: *slot,
-                            sink: Arc::clone(&v.host),
+                            sink: Arc::clone(&v.domain.host),
                         })
                     }
                     _ => None,
@@ -9970,9 +10322,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 };
                 // #2074 — a killed vCPU that stopped at its own poll (it was running, so no teardown
                 // reaped it) takes its §14 children with it, as a reaped one does ([`reap`]).
-                let killed = v.kill.as_ref().is_some_and(|k| k.load(Ordering::Relaxed));
+                let killed = v
+                    .domain
+                    .kill
+                    .as_ref()
+                    .is_some_and(|k| k.load(Ordering::Relaxed));
                 let orphans = if killed {
-                    child_domains(&v.children)
+                    child_domains(&v.domain.children)
                 } else {
                     Vec::new()
                 };
@@ -9980,6 +10336,19 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let mut s = sched.lock();
                 for (flag, host) in &orphans {
                     kill_child_locked(&mut s, flag, host.as_ref());
+                }
+                if let Some((to, reply, fuel_left)) = answer {
+                    // §12 — one that finished after its domain's teardown answers the domain's end.
+                    let reply = match s.dead.contains_key(&key) {
+                        true => Reply::Failed(CAP_REVOKED),
+                        false => reply,
+                    };
+                    match to {
+                        AnswerTo::Ticket(t) => {
+                            reply_locked(&mut s, t, reply, &dying_host);
+                        }
+                        AnswerTo::Embedder(e) => e.post(reply, fuel_left),
+                    }
                 }
                 // #1584 — a freeze is now in flight: the worker loop drains the parks that will not
                 // otherwise observe it (see `freeze_in_flight`).
@@ -10084,6 +10453,14 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 }
                 end_hold_member(&mut s, id);
                 s.live -= 1;
+                // #2695 step 2 — the rest begins with the calls queued on it, and the embedder holds the
+                // domain from here: the run goes on with nothing in it to run.
+                if let (Some(r), Some(link)) = (rest, held) {
+                    s.resting.insert(key, r);
+                    s.held_open = true;
+                    link.rested(entry_results.unwrap_or_default());
+                    serve_resting(sched, &mut s, key);
+                }
                 // Domain lifetime & teardown (DESIGN.md §12 / ISSUES.md I37, owner 2026-07-24):
                 // executors never anchor a domain's lifetime — ownership does. `exit(n)` or any trap
                 // from ANY member is domain-wide teardown; the ROOT's completion (return, exit, or
@@ -10096,11 +10473,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         teardown_domain(&mut s, key, t, &dying_host);
                         wake_dead_tickets(&mut s, key, own_tickets);
                     }
-                    if id == ROOT_TASK || (died.is_some() && key == s.root_domain) {
+                    if (id == ROOT_TASK && !rests) || (died.is_some() && key == s.root_domain) {
                         teardown_run(&mut s);
                     }
                 }
-                if s.live == 0 {
+                if s.live == 0 && !s.held_open {
                     s.shutdown = true;
                 }
                 sched.work.notify_all();
@@ -10115,8 +10492,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // #2455 — a child whose unwind is withheld has ended once the joiner's domain is no
                 // longer held.
                 let ended = s.results.contains_key(&child)
-                    || (s.withheld.contains_key(&child)
-                        && !s.held.contains_key(&domain_key_of(&v)));
+                    || (s.withheld.contains_key(&child) && !s.held.contains_key(&v.domain.id));
                 if ended {
                     // Already finished between the join check and here — resume immediately.
                     s.runnable.push_back(v);
@@ -10179,7 +10555,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     return;
                 };
                 let (domain, live, interrupted) = {
-                    let hg = v.host.lock_unpoisoned();
+                    let hg = v.domain.host.lock_unpoisoned();
                     // #796 slice D — the pre-park pending check, same shape as the revoke
                     // re-check beside it: a deliverable raise that landed after this vCPU's last
                     // per-op poll ran its sweep against a map we were not yet in; complete the
@@ -10242,11 +10618,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // are real threads). Without the mark the parent slept through a SIGTTIN stop and
                 // the child waited forever for the SIGCONT only that parent would send.
                 let (key, exits) = if child == REAP_ANY_CHILD {
-                    (REAP_ANY_BASE | domain_key_of(&v) as TaskId, None)
+                    (REAP_ANY_BASE | v.domain.id as TaskId, None)
                 } else {
                     (child, Some(child))
                 };
-                if reap_bench_must_wake(&mut s, key, exits, &mut v.host.lock_unpoisoned()) {
+                if reap_bench_must_wake(&mut s, key, exits, &mut v.domain.host.lock_unpoisoned()) {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
                 } else {
@@ -10271,14 +10647,14 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // makes the read trustworthy under the reordered stop/continue fires — see its decl.)
                 // The read takes the host lock while holding the scheduler lock — the established
                 // scheduler → personality order (see the twin-completion drain above).
-                let dom = domain_key_of(&v);
+                let dom = v.domain.id;
                 let mut s = sched.lock();
                 let Some(v) = park_gate(&mut s, v) else {
                     sched.work.notify_all();
                     return;
                 };
                 let (still_stopped, term) = {
-                    let hg = v.host.lock_unpoisoned();
+                    let hg = v.domain.host.lock_unpoisoned();
                     (
                         hg.stop_depth.load(Ordering::SeqCst) > 0,
                         // #796 — the same race against a terminate: a kill whose `wake_stopped`
@@ -10323,7 +10699,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 };
                 // `pipe` is the parker's domain-local index; waiters key on the FIFO's global id
                 // so a wake from another image of the pipe (fork twin, exec carry) finds them.
-                let (ready, gid) = pipe_park_check(&v.host, pipe, false);
+                let (ready, gid) = pipe_park_check(&v.domain.host, pipe, false);
                 if ready {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
@@ -10344,7 +10720,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     return;
                 };
                 // Same global-id keying as the read park above.
-                let (ready, gid) = pipe_park_check(&v.host, pipe, true);
+                let (ready, gid) = pipe_park_check(&v.domain.host, pipe, true);
                 if ready {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
@@ -10363,7 +10739,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // caller. (The host guard below is released before the scheduler lock is taken —
                 // lock order sched → host is never crossed.)
                 let (comps, dom) = {
-                    let h = v.host.lock_unpoisoned();
+                    let h = v.domain.host.lock_unpoisoned();
                     (h.completions(), h.domain_id())
                 };
                 sched.wake_on(&comps);
@@ -10380,9 +10756,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 }
                 sched.completion_drain();
             }
-            Step::Park(Blocked::CapReply { ticket, callee }) => {
+            Step::Park(Blocked::CapReply { ticket, callee, to }) => {
                 v.reply_ticket = Some(ticket);
-                park_cap_reply(sched, v, ticket, callee);
+                park_cap_reply(sched, v, ticket, callee, to);
             }
             // CONSOLIDATION.md §2.2 — a demand process child's recoverable page fault, serviced by
             // its pager binding (op 16): synthesize `pager.page(addr)` on the provider's cell. With
@@ -10390,17 +10766,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             // thread (the §10.2 shape) — supply the page and requeue; otherwise wake the pager and
             // park exactly as a live-offer caller does (`park_cap_reply`), with `page_fault`
             // marking the wake to supply instead of pushing a reply.
-            Step::PageFault(addr) => {
-                let Some(pb) = v.pager.clone() else {
-                    // Unreachable by construction (`fault_pager` is set only with `pager`), but never
-                    // trust a flag alone: clear it and re-run — the re-executed access now traps as an
-                    // ordinary detect-and-kill memory fault.
-                    v.fault_pager = false;
-                    let mut s = sched.lock();
-                    s.runnable.push_back(v);
-                    sched.work.notify_one();
-                    return;
-                };
+            Step::PageFault(addr, pb) => {
                 // #1862: the pager gets the fault address in the child's own coordinates, and its
                 // reply is copied into the child through the sink filed with the request.
                 let (ticket, pager_id) = {
@@ -10421,7 +10787,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     if let Some(provider) = sched.take_parked_serve_loop(pager_id as usize) {
                         dispatch(sched, provider);
                         let served = pb.cell.lock_unpoisoned().svc_results.remove(&t);
-                        if let Some(r) = served {
+                        if let Some(r) = served.map(|r| r.status()) {
                             if r < 0 {
                                 // Pager refused: an unserviceable fault — detect-and-kill semantics
                                 // via the marker path (the re-entry on the next loop iteration sees
@@ -10442,7 +10808,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // as a `call.cap` does (#1815 — without it a parked pager slept through the fault).
                 sched.svc_wake(pager_id as usize);
                 v.page_fault = Some(addr);
-                park_cap_reply(sched, v, t, pb.cell);
+                let to = ReplyTo {
+                    sig: OpSig::page(),
+                    caller: Arc::clone(&v.domain.host),
+                };
+                park_cap_reply(sched, v, t, pb.cell, to);
             }
             Step::Park(Blocked::SvcWait { key, deadline_ns }) => {
                 // §3.6 slice 3: park the serving vCPU on its empty queue. Park-vs-enqueue race
@@ -10456,7 +10826,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_all();
                     return;
                 };
-                let empty = v.host.lock_unpoisoned().svc_queue.is_empty();
+                let empty = v.domain.host.lock_unpoisoned().svc_queue.is_empty();
                 // Lost-wakeup guard (the macOS/Windows serve-chain flake, ISSUES.md I52): a reply may
                 // have woken one of THIS vCPU's parked handler fibers between the serve loop deciding
                 // to park (its `handler_parks` claim saw the handler still blocked) and this point.
@@ -10470,7 +10840,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let woken_handler = v
                     .handler_parks
                     .keys()
-                    .any(|slot| v.registry.slot_woken(*slot));
+                    .any(|slot| v.domain.registry.slot_woken(*slot));
                 // #1217 — a client of this domain finished before we parked: take the one-shot
                 // token and return `0` (the timed form's answer) instead of parking on a queue no
                 // client can ever fill. Consulted only where we would otherwise park, so queued
@@ -10514,7 +10884,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let woken = v
                     .offer_parked
                     .as_ref()
-                    .is_some_and(|p| v.registry.slot_woken(p.handler_slot));
+                    .is_some_and(|p| v.domain.registry.slot_woken(p.handler_slot));
                 if woken {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
@@ -10539,7 +10909,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_all();
                     return;
                 };
-                if v.registry.slot_woken(slot) {
+                if v.domain.registry.slot_woken(slot) {
                     s.runnable.push_back(v);
                     sched.work.notify_one();
                 } else {
@@ -10606,7 +10976,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // #802 interactive — RE-wire the door over the rebuilt vCPU's host (fresh
                 // domain id): see [`Scheduler::wire_signal_doors`].
                 if let SchedRef::Real(sc) = &v.sched {
-                    sc.wire_signal_doors(&v.host);
+                    sc.wire_signal_doors(&v.domain.host);
                 }
                 continue;
             }
@@ -10700,11 +11070,11 @@ impl SchedRef {
     }
     /// Atomic reply-or-stash ([`Scheduler::cap_reply_or_stash`]); the explorer has no caller
     /// parks, so its arm stashes straight into the cell.
-    fn cap_reply_or_stash(&self, ticket: u64, result: i64, callee: &Arc<Mutex<Host>>) {
+    fn cap_reply_or_stash(&self, ticket: u64, reply: Reply, callee: &Arc<Mutex<Host>>) {
         match self {
-            SchedRef::Real(s) => s.cap_reply_or_stash(ticket, result, callee),
+            SchedRef::Real(s) => s.cap_reply_or_stash(ticket, reply, callee),
             SchedRef::Det(_) => {
-                callee.lock_unpoisoned().svc_results.insert(ticket, result);
+                callee.lock_unpoisoned().svc_results.insert(ticket, reply);
             }
         }
     }
@@ -10881,7 +11251,7 @@ struct DetState {
     clock: u64, // logical nanoseconds, advanced only to fire a timeout
     rng: u64,
     cap: usize,
-    /// §12 domain lifetime (owner 2026-07-24): the root domain's key ([`domain_key_of`] of the
+    /// §12 domain lifetime (owner 2026-07-24): the root domain's key ([`Domain::id`] of the
     /// root vCPU, set at creation). A trap/exit anywhere in this domain ends the whole run —
     /// see [`det_teardown_run`]; a §14 child domain's death reaps only its members.
     root_domain: usize,
@@ -10963,7 +11333,7 @@ impl DetState {
 fn det_reap(s: &mut DetState, mut v: Box<VCpu>, reason: &Trap) {
     // D66 — as [`reap`]: a vCPU whose turn ended holding its lanes gives them back.
     if v.holds_lanes {
-        lane_leave(&mut s.lane_running, &v.lane_chain);
+        lane_leave(&mut s.lane_running, &v.domain.lane_chain);
         let woken = std::mem::take(&mut s.lane_waiters);
         s.runnable.extend(woken);
     }
@@ -10993,7 +11363,7 @@ fn det_teardown_domain(s: &mut DetState, key: usize, reason: &Trap) {
     let mut victims: Vec<Box<VCpu>> = Vec::new();
     let runnable = std::mem::take(&mut s.runnable);
     for v in runnable {
-        if domain_key_of(&v) == key {
+        if v.domain.id == key {
             victims.push(v);
         } else {
             s.runnable.push(v);
@@ -11001,7 +11371,7 @@ fn det_teardown_domain(s: &mut DetState, key: usize, reason: &Trap) {
     }
     let jw = std::mem::take(&mut s.join_waiters);
     for (k, v) in jw {
-        if domain_key_of(&v) == key {
+        if v.domain.id == key {
             victims.push(v);
         } else {
             s.join_waiters.insert(k, v);
@@ -11009,7 +11379,7 @@ fn det_teardown_domain(s: &mut DetState, key: usize, reason: &Trap) {
     }
     let ww = std::mem::take(&mut s.wait_waiters);
     for w in ww {
-        if domain_key_of(&w.vcpu) == key {
+        if w.vcpu.domain.id == key {
             victims.push(w.vcpu);
         } else {
             s.wait_waiters.push(w);
@@ -11017,7 +11387,7 @@ fn det_teardown_domain(s: &mut DetState, key: usize, reason: &Trap) {
     }
     let sw = std::mem::take(&mut s.spin_waiters);
     for w in sw {
-        if domain_key_of(&w.vcpu) == key {
+        if w.vcpu.domain.id == key {
             victims.push(w.vcpu);
         } else {
             s.spin_waiters.push(w);
@@ -11025,7 +11395,7 @@ fn det_teardown_domain(s: &mut DetState, key: usize, reason: &Trap) {
     }
     let lw = std::mem::take(&mut s.lane_waiters); // D66
     for v in lw {
-        if domain_key_of(&v) == key {
+        if v.domain.id == key {
             victims.push(v);
         } else {
             s.lane_waiters.push(v);
@@ -11251,9 +11621,9 @@ impl SchedDriver {
                         // chain has a full lane is deferred (it waits in `lane_waiters` until a
                         // release re-admits it) and the driver picks again. A deferred planned pick
                         // is fine: the plan named a runnable tid, and the tid is still live.
-                        if lane_bounded(&v.lane_chain)
+                        if lane_bounded(&v.domain.lane_chain)
                             && !v.holds_lanes
-                            && !lane_enter(&mut s.lane_running, &v.lane_chain)
+                            && !lane_enter(&mut s.lane_running, &v.domain.lane_chain)
                         {
                             s.lane_waiters.push(v);
                             continue;
@@ -11280,10 +11650,10 @@ impl SchedDriver {
             // lane-deferred pick (see `dispatch`; the exploration driver must gate identically to stay
             // the oracle's oracle).
             v.holds_lanes =
-                lane_bounded(&v.lane_chain) && matches!(step, Step::Yield | Step::Pause(..));
-            if lane_bounded(&v.lane_chain) && !v.holds_lanes {
+                lane_bounded(&v.domain.lane_chain) && matches!(step, Step::Yield | Step::Pause(..));
+            if lane_bounded(&v.domain.lane_chain) && !v.holds_lanes {
                 let mut s = det.lock();
-                lane_leave(&mut s.lane_running, &v.lane_chain);
+                lane_leave(&mut s.lane_running, &v.domain.lane_chain);
                 let woken = std::mem::take(&mut s.lane_waiters);
                 s.runnable.extend(woken);
             }
@@ -11319,13 +11689,13 @@ impl SchedDriver {
             }
             // §2.2 / §8.6: pager fault-service and `execve` image-replace run on the real scheduler
             // only for this slice (the deterministic explorer has no transport for them) — fail closed.
-            let step = if matches!(step, Step::PageFault(_) | Step::Exec(_)) {
+            let step = if matches!(step, Step::PageFault(..) | Step::Exec(_)) {
                 Step::Done(Err(Trap::FiberFault))
             } else {
                 step
             };
             match step {
-                Step::PageFault(_) | Step::Exec(_) => {
+                Step::PageFault(..) | Step::Exec(_) => {
                     unreachable!("converted to Done(FiberFault) above")
                 }
                 Step::Done(result) => {
@@ -11341,7 +11711,7 @@ impl SchedDriver {
                         .is_err()
                         .then(|| v.mem.as_ref().and_then(|m| m.peek_fault_rel()))
                         .flatten();
-                    let key = domain_key_of(&v); // §12 teardown: read before the vCPU is dropped
+                    let key = v.domain.id; // §12 teardown: read before the vCPU is dropped
                     let outcome = Outcome {
                         result,
                         mem: v.mem.take(),
@@ -11427,7 +11797,7 @@ impl SchedDriver {
                     | Blocked::SpawnSelf(_),
                 ) => {
                     let id = v.id;
-                    let key = domain_key_of(&v); // §12 teardown: read before the vCPU is dropped
+                    let key = v.domain.id; // §12 teardown: read before the vCPU is dropped
                     drop(v);
                     let mut s = det.lock();
                     if let Some(parent) = s.join_waiters.remove(&id) {
@@ -12069,8 +12439,13 @@ enum RegFiber {
     /// fires — a `cont.resume` of it reports `FIBER_PARKED` to the resumer without switching
     /// (a poll). The wake pushes the event's result onto the set-aside top frame and flips
     /// `woken`; a claim then delivers the frames **verbatim** (the result is already in place,
-    /// so the resumer's `arg` is deliberately not pushed).
-    ParkedOn { frames: Vec<Frame>, woken: bool },
+    /// so the resumer's `arg` is deliberately not pushed). INVARIANTS #8: a live call's reply its
+    /// call cannot take wakes it with `fault` instead, which the claim raises.
+    ParkedOn {
+        frames: Vec<Frame>,
+        woken: bool,
+        fault: Option<Trap>,
+    },
     /// Returned: resuming it again traps. Slots are **not recycled** (matching both backends'
     /// historical tables, so handles stay dense and deterministic); recycling + the generation
     /// tag land with the JIT shared registry (3b-ii) so both backends adopt one policy together.
@@ -12319,8 +12694,14 @@ impl FiberRegistry {
             // §3.6 slice 5a: a woken event-park continues verbatim (result already delivered);
             // a still-blocked one is a poll — the resumer learns FIBER_PARKED, no switch.
             RegFiber::ParkedOn {
+                fault: Some(trap),
+                woken: true,
+                ..
+            } => Err(trap),
+            RegFiber::ParkedOn {
                 frames,
                 woken: true,
+                fault: None,
             } => Ok((slot, Claimed::LiveWoken(frames))),
             old @ RegFiber::ParkedOn { woken: false, .. } => {
                 t.fibers[slot] = old;
@@ -12364,6 +12745,7 @@ impl FiberRegistry {
         t.fibers[slot] = RegFiber::ParkedOn {
             frames,
             woken: false,
+            fault: None,
         };
     }
 
@@ -12373,6 +12755,32 @@ impl FiberRegistry {
     /// the wake is then a no-op, matching every other idempotent wake path).
     fn wake_blocked(&self, slot: usize, result: Reg) -> bool {
         self.wake_parked(slot, Some(result))
+    }
+
+    /// INVARIANTS #8 — a live call's reply landed ([`deliver_reply`]): its values onto the parked
+    /// fiber's top frame, or, for a reply its call could not take, its trap, which the fiber's next
+    /// claim raises. `false` as [`Self::wake_blocked`].
+    fn wake_reply(&self, slot: usize, out: Result<Vec<i64>, Trap>, sig: &OpSig) -> bool {
+        let mut t = self.lock();
+        match &mut t.fibers[slot] {
+            RegFiber::ParkedOn {
+                frames,
+                woken: woken @ false,
+                fault,
+            } => {
+                match out {
+                    Ok(slots) => {
+                        if let Some(f) = frames.last_mut() {
+                            f.vals.extend(result_regs(&slots, sig.results()));
+                        }
+                    }
+                    Err(trap) => *fault = Some(trap),
+                }
+                *woken = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// #1952 — the event fired for a fiber parked in a **rewound** op: make it claimable with
@@ -12387,6 +12795,7 @@ impl FiberRegistry {
             RegFiber::ParkedOn {
                 frames,
                 woken: woken @ false,
+                ..
             } => {
                 if let (Some(f), Some(r)) = (frames.last_mut(), result) {
                     f.vals.push(r);
@@ -12554,7 +12963,7 @@ impl FiberRegistry {
             .iter()
             .position(|f| matches!(f, RegFiber::ParkedOn { .. }))?;
         match std::mem::replace(&mut t.fibers[slot], RegFiber::Frozen) {
-            RegFiber::ParkedOn { frames, woken } => Some((slot, frames, woken)),
+            RegFiber::ParkedOn { frames, woken, .. } => Some((slot, frames, woken)),
             _ => unreachable!("position found a ParkedOn slot"),
         }
     }
@@ -12752,27 +13161,153 @@ struct Paused {
     registry: Arc<FiberRegistry>,
 }
 
-/// Run one vCPU. `funcs` is an `Arc<[Func]>` the vCPU **owns** (a child gets its own cheap clone), so
-/// a spawned vCPU borrows nothing from its parent and can run on a detached OS thread (the seam for a
-/// `'static` worker pool). The shared runtime state — thread `budget`, the `parking` lot, the
-/// `registry` of spawned threads — is `Arc`-shared across all vCPUs.
+/// A domain (PROCESS.md §3) as the tree-walker runs it: its code, powerbox, dispatch table, fiber
+/// registry and children, which every vCPU of the domain shares through one `Arc` ([`VCpu::domain`]).
+/// A run's root makes one ([`drive_over_cell`]), and so does each §14 child, fork twin, exec image
+/// and `posix_spawn` child; a `thread.spawn` thread, or a thaw re-creating one, joins its spawner's.
+///
+/// Two vCPUs run over a domain **derived** from their caller's, which shares the caller's tables but
+/// differs where noted ([`Domain::for_invoke`], [`Domain::animating`]):
+/// - a `Jit.invoke` child: its own fiber registry, and no kill flag, lanes or pager;
+/// - a vCPU running an animated offer handler: the provider's powerbox and id.
+///
+/// So two vCPUs are of one domain when their domains' `id`s match, never by the `Arc` itself.
+struct Domain {
+    /// Its **domain key**: its powerbox's identity ([`Host::domain_id`]), read without the powerbox's
+    /// lock. It is the key `svc_waiters`, fiber waiters' `svc` field, [`Sched::dead`] and the
+    /// scheduler's other per-domain records use, and it partitions a run's vCPUs into its domains
+    /// (the root and its `thread.spawn` threads, each §14 child and *its* threads, …).
+    id: usize,
+    /// Its powerbox: a thread inherits the same capability table and I/O sinks, so a handle granted
+    /// to the domain works in any thread and I/O from any thread reaches the same sink (matching the
+    /// JIT, whose `call.cap`s all hit the one host ctx). Locked briefly per `call.cap`.
+    host: Arc<Mutex<Host>>,
+    /// Its primary program (module 0)'s function table; `Frame::func` resolves against it.
+    funcs: Arc<[Func]>,
+    /// Module 0's type section — the home for every call variant's interned signature (FuncType
+    /// interning, #922). Resolved per running frame's module like `funcs` (installed units carry
+    /// their own, `invoked` its own).
+    types: Arc<[temen_ir::TypeEntry]>,
+    /// Its **live** dispatch table (slots + installed units), so a guest-driven `install` is visible
+    /// across `thread.spawn` and `Jit.invoke` children (DESIGN.md §22). Reads are lock-free atomic
+    /// loads (see [`DomainTable`]).
+    dt: Arc<DomainTable>,
+    /// Its §12 fiber table (D57 3b-i), so any of its vCPUs can resume any fiber; the registry's
+    /// claim is the single-owner arbiter.
+    registry: Arc<FiberRegistry>,
+    /// #2043 D1 — its children. A freeze records the table's counters in the domain's powerbox
+    /// ([`Host::child_generations`]).
+    children: Arc<Mutex<Children>>,
+    /// PROCESS.md S3 `kill` — `Some` on a §14 child: a flag the parent sets via `Instantiator.kill`.
+    /// Polled at each vCPU's per-op fuel `step`; when set the vCPU traps (`ThreadFault`, which `poll`
+    /// reports as `2`), so the child's whole subtree self-terminates. `None` on the root (nothing
+    /// above it to kill it).
+    kill: Option<Arc<AtomicBool>>,
+    /// D66 — its **lane chain**: `(domain, cap)` for itself and every ancestor, innermost first. A
+    /// worker may run one of its vCPUs only while every bounded cap in the chain has room
+    /// ([`lane_enter`]); the vCPU holds those lanes from that dispatch until it parks or finishes
+    /// ([`lane_leave`]), as a JIT thread holds its lane from resume to park. A §14 child prepends its
+    /// own entry to its spawner's. Empty ⇒ nothing bounded: the hot path skips both scheduler locks
+    /// entirely, which is every run that sets no lane cap.
+    lane_chain: Vec<(usize, i64)>,
+    /// CONSOLIDATION.md §2.2: a **demand process child**'s pager binding (`Instantiator` op 16),
+    /// the provider's host cell + export, stored at spawn. Its recoverable page faults become calls
+    /// on it instead of trapping; without one a page fault is detect-and-kill. Held substrate-side
+    /// (never in the child's powerbox) — the child cannot name or call it; only the fault seam does,
+    /// userfaultfd-style.
+    pager: Option<PagerRef>,
+}
+
+impl Domain {
+    /// A domain over `host`, running `funcs` through `dt`, with no fibers or children yet, no kill
+    /// flag, lanes or pager.
+    fn new(
+        host: Arc<Mutex<Host>>,
+        funcs: Arc<[Func]>,
+        types: Arc<[temen_ir::TypeEntry]>,
+        dt: Arc<DomainTable>,
+    ) -> Domain {
+        let id = host.lock_unpoisoned().domain_id() as usize;
+        Domain {
+            id,
+            host,
+            funcs,
+            types,
+            dt,
+            registry: Arc::new(FiberRegistry::new()),
+            children: Arc::default(),
+            kill: None,
+            lane_chain: Vec::new(),
+            pager: None,
+        }
+    }
+
+    /// A run's root domain over `host`: [`Domain::new`], with D66 a lane chain of just its own
+    /// domain at its powerbox's (the embedder-set) cap.
+    fn root(
+        host: Arc<Mutex<Host>>,
+        funcs: Arc<[Func]>,
+        types: Arc<[temen_ir::TypeEntry]>,
+        dt: Arc<DomainTable>,
+    ) -> Domain {
+        let mut d = Domain::new(host, funcs, types, dt);
+        d.lane_chain = vec![(d.id, d.host.lock_unpoisoned().lane_cap())];
+        d
+    }
+
+    /// The domain a `Jit.invoke` child runs over ([`VCpu::new_invoke`]): this one's code, powerbox,
+    /// dispatch table and children, with a fiber registry of its own, and no kill flag, lanes or pager
+    /// (#2733).
+    fn for_invoke(&self) -> Domain {
+        Domain {
+            id: self.id,
+            host: Arc::clone(&self.host),
+            funcs: Arc::clone(&self.funcs),
+            types: Arc::clone(&self.types),
+            dt: Arc::clone(&self.dt),
+            registry: Arc::new(FiberRegistry::new()),
+            children: Arc::clone(&self.children),
+            kill: None,
+            lane_chain: Vec::new(),
+            pager: None,
+        }
+    }
+
+    /// CALLS.md 4a — the domain a vCPU runs over while it animates an offer handler of the provider
+    /// whose powerbox is `provider` ([`OfferAnim`]): this one, with the provider's powerbox and id. The
+    /// id is the provider's because the handler's park keys on it (`Blocked::OfferPark`); a vCPU that
+    /// ends mid-animation so ends as the provider's domain, not its own (#2732).
+    fn animating(&self, provider: Arc<Mutex<Host>>) -> Domain {
+        let id = provider.lock_unpoisoned().domain_id() as usize;
+        Domain {
+            id,
+            host: provider,
+            funcs: Arc::clone(&self.funcs),
+            types: Arc::clone(&self.types),
+            dt: Arc::clone(&self.dt),
+            registry: Arc::clone(&self.registry),
+            children: Arc::clone(&self.children),
+            kill: self.kill.clone(),
+            lane_chain: self.lane_chain.clone(),
+            pager: self.pager.clone(),
+        }
+    }
+}
+
+/// Run one vCPU. Its [`Domain`] is an `Arc` the vCPU **owns** a share of (a thread shares its
+/// spawner's), so a spawned vCPU borrows nothing from its parent and can run on a detached OS thread
+/// (the seam for a `'static` worker pool). The shared runtime state — the domain's tables, thread
+/// `budget`, the `parking` lot — is `Arc`-shared across the vCPUs that use it.
 ///
 /// All the run state is **owned**, so a vCPU is `Send` and self-contained — the basis for moving it
 /// between worker threads and (next) parking its continuation on a blocking op.
 struct VCpu {
-    /// The owned function table; `Frame::func` resolves against it.
-    funcs: Arc<[Func]>,
-    /// This vCPU's primary program (module 0) type section — the home for every call variant's
-    /// interned signature (FuncType interning, #922). Resolved per running frame's module like
-    /// `funcs` (module 0 here; installed units carry their own, `invoked` its own).
-    types: Arc<[temen_ir::TypeEntry]>,
+    /// The domain this vCPU runs in: its code, powerbox, dispatch table, fiber registry and
+    /// children, shared by every vCPU of the domain ([`Domain`]).
+    domain: Arc<Domain>,
     /// The type section of the transient `invoked` unit (module [`INVOKE_MODULE`]), paralleling
     /// `invoked`; `Some` only for an invoke child (FuncType interning, #922).
     invoked_types: Option<Arc<[temen_ir::TypeEntry]>>,
-    /// The §12 fiber table — **shared by every vCPU of the domain** (root + `thread.spawn`
-    /// children, D57 3b-i), so any vCPU can resume any fiber; the registry's claim is the
-    /// single-owner arbiter. Nested §14 children / separate domains get a fresh registry.
-    registry: Arc<FiberRegistry>,
     /// The resume chain: `chain[0]` is [`ROOT_FIBER`] (this vCPU's off-table root computation),
     /// `chain.last()` the running fiber's registry slot.
     chain: Vec<usize>,
@@ -12819,6 +13354,9 @@ struct VCpu {
     /// (#1917). `None` on a domain's main vCPU, whose entry/args the thaw caller supplies.
     /// (slice 3.2.1)
     spawn_residue: Option<(FuncIdx, Vec<i64>, usize)>,
+    /// #2695 step 2 — the call this vCPU answers: an activation of a resting domain
+    /// ([`activation`]). Its return replies, and, as a thread's does, its end ends nothing else.
+    answers: Option<Answers>,
     /// This spawned vCPU's durable **shadow context** (`1..=MAX_SHADOW_CTX`), reserved at
     /// `thread.spawn` and freed back to the registry when the vCPU genuinely finishes (context
     /// recycling). 0 for the root and every non-durable vCPU (nothing to free).
@@ -12839,26 +13377,8 @@ struct VCpu {
     wait_indefinite: bool,
     /// This vCPU's linear-memory view (shared `Region` + address space; see [`Mem`]).
     mem: Option<Mem>,
-    /// The domain's powerbox, **shared** by every vCPU of the run (`Arc<Mutex<Host>>`): a spawned
-    /// thread inherits the same capability table + I/O sinks, so a handle granted to the domain works
-    /// in any thread and I/O from any thread reaches the same sink (matching the JIT, whose `call.cap`s
-    /// all hit the one host ctx). Locked briefly per `call.cap`.
-    host: Arc<Mutex<Host>>,
     /// This vCPU's fuel (metering, §5): drawn from its domain's budget node (#1944 slice 3).
     fuel: Fuel,
-    /// #2043 D1 — its domain's children, shared by every vCPU of the domain: a domain root makes the
-    /// table, and a thread it spawns (or a thaw re-creates) shares it. A freeze records its counters
-    /// in the domain's powerbox ([`Host::child_generations`]).
-    children: Arc<Mutex<Children>>,
-    /// CONSOLIDATION.md §2.2: this vCPU is a **demand process child** (`Instantiator` op 16)
-    /// whose recoverable page faults become calls on its parent's pager offer instead of
-    /// trapping. Set together with `pager`; `false` for every ordinary vCPU (a page fault is
-    /// detect-and-kill).
-    fault_pager: bool,
-    /// The resolved pager binding op 16 stored at spawn: the provider's host cell + export. Held
-    /// substrate-side (never in the child's powerbox) — the child cannot name or call it; only the
-    /// fault seam does, userfaultfd-style.
-    pager: Option<PagerRef>,
     /// A fault address awaiting its pager reply: set when the fault parks awaiting the pager
     /// (the queued transport), consumed at resume — supply the page instead of pushing the reply.
     page_fault: Option<u64>,
@@ -12901,11 +13421,6 @@ struct VCpu {
     /// point; `None` if the turn ran no visible op). Read back by the DPOR driver ([`explore_all`]) to
     /// build the schedule trace; unused by the real pool / seeded explorer.
     acc: Option<MemAccess>,
-    /// The domain's **shared, live** dispatch table (slots + installed units), shared by every vCPU
-    /// of the domain via `Arc` so a guest-driven `install` is visible across `thread.spawn` children
-    /// and `Jit.invoke` children (DESIGN.md §22). Reads are lock-free atomic loads (see
-    /// [`DomainTable`]).
-    dt: Arc<DomainTable>,
     /// A lock-free **local clone** (a prefix) of `dt`'s installed units (module `k` ≡ `units[k-1]`),
     /// re-synced only on a miss (see [`resolve_module`]) — so resolving a running unit frame or an
     /// installed `call.dyn` target never locks the shared `units`.
@@ -12928,11 +13443,6 @@ struct VCpu {
     /// undebugged run pays a single null check per op and is otherwise byte-identical (S7). Not
     /// inherited across `thread.spawn` (slice 1 debugs single-threaded guests).
     debug: Option<Box<DebugCtx>>,
-    /// PROCESS.md S3 `kill` — `Some` on a §14 child (and, inherited, its `thread.spawn` descendants):
-    /// a shared flag the parent sets via `Instantiator.kill`. Polled at the per-op fuel `step`; when
-    /// set the vCPU traps (`ThreadFault`, which `poll` reports as `2`), so the child's whole subtree
-    /// self-terminates. `None` on the root and top-level threads (nothing above them to kill them).
-    kill: Option<Arc<AtomicBool>>,
     /// #1361 step 3 — the **freeze doorbell**: `Some` on a *detached* §14 child, whose window its
     /// parent cannot reach. The child owns its window elsewhere and the parent holds no pointer into
     /// it, so the broadcast is rung out-of-band — the same shape as [`kill`](Self::kill), which
@@ -12943,7 +13453,7 @@ struct VCpu {
     /// durable domain unwind. The instrumented code takes it from there exactly as it would for a
     /// root freeze. `None` on every other vCPU — the common case, one predicted branch.
     freeze_bell: Option<Arc<AtomicBool>>,
-    /// #2455 — on a detached child's root, its spawner's domain ([`domain_key_of`]): while that
+    /// #2455 — on a detached child's root, its spawner's domain ([`Domain::id`]): while that
     /// domain is held for a leaves-first freeze ([`Sched::held`]), this child's unwind is withheld
     /// from it.
     spawner_domain: Option<usize>,
@@ -12969,15 +13479,6 @@ struct VCpu {
     /// which also tells the source to restore its pre-delivery mask
     /// ([`SignalSource::handler_returned`]).
     sig_handler_stack: Vec<usize>,
-    /// D66 — this vCPU's **lane chain**: `(domain, cap)` for its own domain and every ancestor,
-    /// innermost first. A worker may run it only while every bounded cap in the chain has room
-    /// ([`lane_enter`]); it holds those lanes from that dispatch until it parks or finishes
-    /// ([`lane_leave`]), as a JIT thread holds its lane from resume to park. Copied from the spawner
-    /// at spawn (a `thread.spawn` sibling shares its domain's chain; a §14 child prepends its own
-    /// domain), so it never changes for the vCPU's life and needs no lock to read. Empty ⇒ nothing
-    /// bounded: the hot path skips both scheduler locks entirely, which is every run that sets no
-    /// lane cap.
-    lane_chain: Vec<(usize, i64)>,
     /// D66 — whether this vCPU holds its chain's lanes off a worker: its quantum ended, or the
     /// explorer holds its turn at a debug stop, and neither releases them (#2237). Its next dispatch
     /// skips admission, and [`reap`] gives them back if it never runs again.
@@ -13042,6 +13543,9 @@ struct ServeRun {
     /// **skips** its auto-reply, so the servicer's injected value is the one the caller reloads —
     /// not the handler's return clobbering it. (`fork()` replies `pid`/`0` this way in PR 2.)
     replied: bool,
+    /// INVARIANTS #8 — the handler's results as slots, recorded when it returns: its dispatch's
+    /// reply. The fiber hand-back to the serve frame carries only the first.
+    results: Vec<i64>,
 }
 
 /// The module-declared shadow arena of the window `mem` ([`ShadowArena::EMPTY`] before a window
@@ -13055,30 +13559,25 @@ impl VCpu {
     fn arena(&self) -> ShadowArena {
         arena_of(self.mem.as_ref())
     }
-    /// A fresh vCPU whose root frame is `funcs[entry](args)`. A bad `entry` is caught by the driver's
-    /// first block lookup ([`Trap::Malformed`]), so construction is infallible.
+    /// A fresh vCPU of `domain` whose root frame is its `funcs[entry](args)`. A bad `entry` is caught
+    /// by the driver's first block lookup ([`Trap::Malformed`]), so construction is infallible.
     #[allow(clippy::too_many_arguments)]
     fn new(
-        funcs: Arc<[Func]>,
-        types: Arc<[temen_ir::TypeEntry]>,
+        domain: Arc<Domain>,
         entry: FuncIdx,
         args: &[Value],
         mem: Option<Mem>,
-        host: Arc<Mutex<Host>>,
         fuel: Fuel,
         depth: u32,
         id: TaskId,
         sched: SchedRef,
-        dt: Arc<DomainTable>,
     ) -> VCpu {
         // A fresh root starts at its window's empty root extent; a run that resumes a frozen root
         // re-seeds it from the artifact.
         let root_shadow_sp = arena_of(mem.as_ref()).frame_base(0);
         VCpu {
-            funcs,
-            types,
+            domain,
             invoked_types: None,
-            registry: Arc::new(FiberRegistry::new()),
             chain: vec![ROOT_FIBER],
             cur: ROOT_FIBER,
             frames: vec![Frame {
@@ -13096,15 +13595,12 @@ impl VCpu {
             durable_sp_ctx: 0,
             frozen: Vec::new(),
             spawn_residue: None,
+            answers: None,
             vcpu_ctx: 0,
             dstate: STATE_NORMAL,
             wait_indefinite: false,
             mem,
-            host,
             fuel,
-            children: Arc::default(),
-            fault_pager: false,
-            pager: None,
             page_fault: None,
             reply_ticket: None,
             depth,
@@ -13116,19 +13612,16 @@ impl VCpu {
             sched,
             memop: false,
             acc: None,
-            dt,
             units: Vec::new(),
             invoked: None,
             invoked_ref_slots: None,
             debug: None,
-            kill: None,
             freeze_bell: None,
             spawner_domain: None,
             held_for_paged: false,
             window_lease: None,
             live: LiveVcpu::none(),
             sig_handler_stack: Vec::new(),
-            lane_chain: Vec::new(),
             holds_lanes: false,
             serve_run: None,
             handler_parks: BTreeMap::new(),
@@ -13155,11 +13648,17 @@ impl VCpu {
         twin_mem: Option<Mem>,
         twin_host: Arc<Mutex<Host>>,
     ) -> Box<VCpu> {
+        // Its own domain: the duplicated powerbox, the same program, and #1297 its own table seeded
+        // with the parent's installs; a fresh fiber registry and child table.
+        let twin = Domain::new(
+            twin_host,
+            Arc::clone(&self.domain.funcs),
+            Arc::clone(&self.domain.types),
+            Arc::new(self.domain.dt.fork()),
+        );
         Box::new(VCpu {
-            funcs: Arc::clone(&self.funcs),
-            types: Arc::clone(&self.types),
+            domain: Arc::new(twin),
             invoked_types: self.invoked_types.clone(),
-            registry: Arc::new(FiberRegistry::new()), // its own fiber table (a separate domain)
             chain: vec![ROOT_FIBER],
             cur: ROOT_FIBER,
             frames: self.frames.clone(), // the continuation inside the pending fork `call.cap`
@@ -13171,15 +13670,12 @@ impl VCpu {
             durable_sp_ctx: self.durable_sp_ctx,
             frozen: Vec::new(),
             spawn_residue: None,
+            answers: None,
             vcpu_ctx: self.vcpu_ctx,
             dstate: self.dstate,
             wait_indefinite: false,
             mem: twin_mem,
-            host: twin_host,
             fuel: self.fuel.for_thread(), // a twin shares the budget node (the powerbox's `fork`)
-            children: Arc::default(),
-            fault_pager: false,
-            pager: None,
             page_fault: None,
             reply_ticket: None,
             depth: self.depth,
@@ -13191,19 +13687,16 @@ impl VCpu {
             sched: self.sched.clone(),
             memop: false,
             acc: None,
-            dt: Arc::new(self.dt.fork()), // #1297: its own table, seeded with the parent's installs
             units: Vec::new(),
             invoked: None,
             invoked_ref_slots: None,
             debug: None,
-            kill: None,
             freeze_bell: None,
             spawner_domain: None,
             held_for_paged: false,
             window_lease: None,
             live: LiveVcpu::none(),
             sig_handler_stack: self.sig_handler_stack.clone(), // forked mid-handler: the twin returns from the inherited frame too
-            lane_chain: Vec::new(),
             holds_lanes: false,
             serve_run: None,
             handler_parks: BTreeMap::new(),
@@ -13226,15 +13719,12 @@ impl VCpu {
     /// funcrefs"; the caller installs them, refusing the invoke when the table has no room).
     #[allow(clippy::too_many_arguments)]
     fn new_invoke(
-        parent: Arc<[Func]>,
-        parent_types: Arc<[temen_ir::TypeEntry]>,
-        dt: Arc<DomainTable>,
+        parent: &Domain,
         unit: Arc<[Func]>,
         unit_types: Arc<[temen_ir::TypeEntry]>,
         invoked_ref_slots: Option<Vec<u32>>,
         args: &[Value],
         mem: Option<Mem>,
-        host: Arc<Mutex<Host>>,
         fuel: Fuel,
         depth: u32,
         sched: SchedRef,
@@ -13243,10 +13733,8 @@ impl VCpu {
         // re-seeds it from the artifact.
         let root_shadow_sp = arena_of(mem.as_ref()).frame_base(0);
         VCpu {
-            funcs: parent,
-            types: parent_types,
+            domain: Arc::new(parent.for_invoke()),
             invoked_types: Some(unit_types),
-            registry: Arc::new(FiberRegistry::new()),
             chain: vec![ROOT_FIBER],
             cur: ROOT_FIBER,
             frames: vec![Frame {
@@ -13264,15 +13752,12 @@ impl VCpu {
             durable_sp_ctx: 0,
             frozen: Vec::new(),
             spawn_residue: None,
+            answers: None,
             vcpu_ctx: 0,
             dstate: STATE_NORMAL,
             wait_indefinite: false,
             mem,
-            host,
             fuel,
-            children: Arc::default(),
-            fault_pager: false,
-            pager: None,
             page_fault: None,
             reply_ticket: None,
             depth,
@@ -13284,19 +13769,16 @@ impl VCpu {
             sched,
             memop: false,
             acc: None,
-            dt,
             units: Vec::new(),
             invoked: Some(unit),
             invoked_ref_slots,
             debug: None,
-            kill: None,
             freeze_bell: None,
             spawner_domain: None,
             held_for_paged: false,
             window_lease: None,
             live: LiveVcpu::none(),
             sig_handler_stack: Vec::new(),
-            lane_chain: Vec::new(),
             holds_lanes: false,
             serve_run: None,
             handler_parks: BTreeMap::new(),
@@ -13388,7 +13870,7 @@ impl VCpu {
         if self.cur != ROOT_FIBER
             || self.chain.as_slice() != [ROOT_FIBER]
             || self.root_parked.is_some()
-            || self.registry.has_blocked_parks()
+            || self.domain.registry.has_blocked_parks()
             || !self.handler_parks.is_empty()
         {
             return Err(Refusal::Fiber);
@@ -13396,7 +13878,7 @@ impl VCpu {
         if !self.frozen.is_empty() || self.durable {
             return Err(Refusal::Durable);
         }
-        if !self.children.lock_unpoisoned().never_spawned() {
+        if !self.domain.children.lock_unpoisoned().never_spawned() {
             return Err(Refusal::Thread);
         }
         // Guest-installed §22 units would need the domain table rebuilt.
@@ -13439,7 +13921,12 @@ impl VCpu {
             Ok(Inner::Done(v)) => Step::Done(Ok(v)),
             Ok(Inner::Park(b)) => Step::Park(b),
             Ok(Inner::Yield) => Step::Yield,
-            Ok(Inner::PageFault(a)) => Step::PageFault(a),
+            // `run_inner` raises a page fault only on a domain with a pager (`fault_pager`); were
+            // there none, the fault is the detect-and-kill one a pagerless domain takes.
+            Ok(Inner::PageFault(a)) => match self.domain.pager.clone() {
+                Some(pager) => Step::PageFault(a, pager),
+                None => Step::Done(Err(Trap::MemoryFault)),
+            },
             Ok(Inner::Pause(r, pc)) => Step::Pause(r, pc),
             Ok(Inner::Exec(req)) => Step::Exec(req),
             Err(t) => Step::Done(Err(t)),
@@ -13471,7 +13958,8 @@ impl VCpu {
         // #1676 — this vCPU's serve handlers, parked or caught mid-run, ride as fibers like any
         // other; their reply linkage rides the powerbox, for the thaw's serve loop to adopt.
         for (&slot, &(_, ticket)) in &self.handler_parks {
-            self.host
+            self.domain
+                .host
                 .lock_unpoisoned()
                 .hold_handler_for_thaw(slot, ticket);
         }
@@ -13479,12 +13967,12 @@ impl VCpu {
         // freezes when its thaw can re-derive the park. A WOKEN park's delivered result is already
         // in its frames (the point's spill reloads it). An unwoken park follows its site's rule, as
         // a vCPU's does (#1677): only a re-issue site freezes, and the census declined the rest.
-        for (slot, woken) in self.registry.blocked_parks() {
+        for (slot, woken) in self.domain.registry.blocked_parks() {
             let reissues = |(site, _): (ParkSite, u64)| site.freeze_rule() == FreezeRule::Reissue;
             if !woken
                 && !self
                     .sched
-                    .fiber_park(&self.registry, slot)
+                    .fiber_park(&self.domain.registry, slot)
                     .is_some_and(reissues)
             {
                 return Err(Trap::FiberFault);
@@ -13499,7 +13987,7 @@ impl VCpu {
             .as_ref()
             .and_then(|m| m.durable_get_sp(root_word))
             .unwrap_or_else(|| arena.frame_base(self.vcpu_ctx));
-        while let Some((slot, frames)) = self.registry.take_parked_for_freeze() {
+        while let Some((slot, frames)) = self.domain.registry.take_parked_for_freeze() {
             // Placeholder resume value (inert; not spilled by `Yield`).
             self.flatten_fiber_for_freeze(slot, frames, Some(Reg::from_i64(0)), false)?;
         }
@@ -13512,9 +14000,9 @@ impl VCpu {
         // and its context's re-issue word, and the thaw re-issues the call, the reply's on the
         // same ticket (#1901). A pipe park's op is rewound (#1952): the unwind re-runs it, and
         // `decide` abandons it under the landing freeze, as a re-admitted vCPU's (#1672).
-        while let Some(&(slot, _)) = self.registry.blocked_parks().first() {
-            let park = self.sched.take_fiber_park(&self.registry, slot);
-            let Some((_, frames, woken)) = self.registry.take_blocked_for_freeze() else {
+        while let Some(&(slot, _)) = self.domain.registry.blocked_parks().first() {
+            let park = self.sched.take_fiber_park(&self.domain.registry, slot);
+            let Some((_, frames, woken)) = self.domain.registry.take_blocked_for_freeze() else {
                 break;
             };
             let (placeholder, reissue) = match park {
@@ -13526,7 +14014,8 @@ impl VCpu {
                 Some((ParkSite::PipeRead | ParkSite::PipeWrite, _)) => (None, false),
                 Some((ParkSite::StreamRead, _)) => (Some(Reg::from_i64(0)), true),
                 Some((ParkSite::Reply, ticket)) => {
-                    self.host
+                    self.domain
+                        .host
                         .lock_unpoisoned()
                         .await_reply_after_thaw(shadow_context_index(slot), ticket);
                     (Some(Reg::from_i64(0)), true)
@@ -13592,14 +14081,14 @@ impl VCpu {
             .as_ref()
             .and_then(|m| m.durable_get_sp(arena.region_base(fctx)))
             .unwrap_or_else(|| arena.frame_base(fctx));
-        self.registry.set_saved_sp(slot, shadow_sp);
+        self.domain.registry.set_saved_sp(slot, shadow_sp);
         self.frozen.push(FrozenFiber {
             slot,
             func,
             sp,
             shadow_sp,
-            generation: self.registry.generation(slot),
-            consumed: self.registry.consumed(slot),
+            generation: self.domain.registry.generation(slot),
+            consumed: self.domain.registry.consumed(slot),
         });
         Ok(())
     }
@@ -13912,9 +14401,10 @@ fn decide(
     }
 }
 
-/// Issue a live call to `callee`: enqueue its dispatch and name its ticket (`None` on a full queue),
-/// with the callee's domain id. A call whose wait a freeze abandoned is not issued again: its dispatch
-/// stayed with the callee, so this names the ticket it was waiting on (#1901).
+/// Issue a live call to `callee`: enqueue its dispatch ([`enqueue_live_call`]). A call whose wait a
+/// freeze abandoned is not issued again: its dispatch stayed with the callee, so this names the
+/// ticket it was waiting on (#1901).
+#[allow(clippy::too_many_arguments)]
 fn issue_live_call(
     host: &Arc<Mutex<Host>>,
     ctx: usize,
@@ -13922,13 +14412,99 @@ fn issue_live_call(
     export: u32,
     op: u32,
     args: Vec<i64>,
-) -> (Option<u64>, u64) {
-    let resumed = host.lock_unpoisoned().take_reply_wait(ctx);
-    let mut cg = callee.lock_unpoisoned();
-    (
-        resumed.or_else(|| cg.svc_enqueue(export, op, args)),
-        cg.domain_id(),
+    params: &[ValType],
+    payer: Option<NodeRef>,
+) -> Result<(Option<u64>, u64), Trap> {
+    if let Some(t) = host.lock_unpoisoned().take_reply_wait(ctx) {
+        return Ok((Some(t), callee.lock_unpoisoned().domain_id()));
+    }
+    enqueue_live_call(
+        &mut CallerHost::Cell(host),
+        callee,
+        export,
+        op,
+        args,
+        params,
+        payer,
     )
+}
+
+/// The powerbox a live call is made from: held outright by the calling thread (a JIT root that runs
+/// unlocked, in no cell, so never the callee's), or in a cell shared with other threads.
+pub enum CallerHost<'a> {
+    Owned(&'a mut Host),
+    Cell(&'a Mutex<Host>),
+}
+
+impl CallerHost<'_> {
+    /// Run `f` over this powerbox and `callee`'s, locked together: a cell with the callee's in
+    /// [`lock_host_pair`]'s order, as every scope that holds two powerboxes takes them. The callee
+    /// is `None` when it is this powerbox, whose table the call shares.
+    fn with_callee<R>(
+        &mut self,
+        callee: &Mutex<Host>,
+        f: impl FnOnce(&mut Host, Option<&mut Host>) -> R,
+    ) -> R {
+        match self {
+            CallerHost::Owned(h) => f(h, Some(&mut callee.lock_unpoisoned())),
+            CallerHost::Cell(c) => match lock_host_pair(c, callee) {
+                Some((mut hg, mut cg)) => f(&mut hg, Some(&mut cg)),
+                None => f(&mut c.lock_unpoisoned(), None),
+            },
+        }
+    }
+}
+
+/// INVARIANTS #8 — enqueue a call of op `op` of export `export` from `caller` on the powerbox in
+/// cell `callee`: its ticket (`None` on a full queue) and the callee's domain id. Each handle among
+/// `args` (a `cap` of `params`, the op's own: [`LiveTarget::sig`]) is granted into the callee
+/// before the callee can see the call ([`translate_cap_slots`]), under both powerboxes' locks, and
+/// only for a call the queue admits, so a full queue grants nothing. One naming nothing faults the
+/// call. A call with no handle takes only the callee's lock. Every engine's live call enqueues here.
+/// `payer` is the caller's fuel node, which a held callee ([`HeldDomain`]) charges the call to.
+pub fn enqueue_live_call(
+    caller: &mut CallerHost,
+    callee: &Mutex<Host>,
+    export: u32,
+    op: u32,
+    mut args: Vec<i64>,
+    params: &[ValType],
+    payer: Option<NodeRef>,
+) -> Result<(Option<u64>, u64), Trap> {
+    if !params.contains(&ValType::Cap) {
+        let mut cg = callee.lock_unpoisoned();
+        let ticket = cg.svc_enqueue_paid(export, op, args, payer);
+        return Ok((ticket, cg.domain_id()));
+    }
+    caller.with_callee(callee, |hg, cg| {
+        let cg = match cg {
+            Some(cg) => {
+                if params.contains(&ValType::Cap) && cg.svc_admits(export, op) {
+                    translate_cap_slots(hg, cg, params, &mut args)?;
+                }
+                cg
+            }
+            None => hg,
+        };
+        Ok((cg.svc_enqueue_paid(export, op, args, payer), cg.domain_id()))
+    })
+}
+
+/// INVARIANTS #8 — [`enqueue_live_call`]'s grant of a call's handles into the callee, for a call its
+/// callee serves without the queue: the Cranelift JIT's direct handoff.
+pub fn grant_live_args(
+    caller: &mut CallerHost,
+    callee: &Mutex<Host>,
+    params: &[ValType],
+    args: &mut [i64],
+) -> Result<(), Trap> {
+    if !params.contains(&ValType::Cap) {
+        return Ok(());
+    }
+    caller.with_callee(callee, |hg, cg| match cg {
+        Some(cg) => translate_cap_slots(hg, cg, params, args),
+        None => Ok(()),
+    })
 }
 
 /// #1672 — mark the running context's host call abandoned ([`Decision::Abandon`]): its unwind
@@ -14052,7 +14628,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // The joiner that takes the child retires its slot, under the same lock as the look-up:
             // a second joiner of the handle finds it spent (#2043 D3, a benign race).
             let joined = {
-                let mut c = v.children.lock_unpoisoned();
+                let mut c = v.domain.children.lock_unpoisoned();
                 match c.table.get_live(handle) {
                     Some((slot, child)) if child.task == Some(task) => {
                         let detached = child.domain.as_ref().is_some_and(|d| d.host.is_some());
@@ -14076,10 +14652,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Some(None) => v.frames[top].vals.extend(join_spent()),
                 Some(Some(child)) => {
                     let as_value = child.ends_as_value();
-                    reap_child(child, &v.host); // D66 — before the `?`: a trapped child returns its lane too
-                                                // #1685 — under a freeze, a child that unwound hands back a placeholder: mark the
-                                                // join for re-issue on thaw, against the re-spawned child. A child that finished
-                                                // for real is not re-run, so its result rides this frame instead.
+                    reap_child(child, &v.domain.host); // D66 — before the `?`: a trapped child returns its lane too
+                                                       // #1685 — under a freeze, a child that unwound hands back a placeholder: mark the
+                                                       // join for re-issue on thaw, against the re-spawned child. A child that finished
+                                                       // for real is not re-run, so its result rides this frame instead.
                     if unwound {
                         abandon_for_freeze(&mut v.mem, v.durable_sp_ctx);
                     }
@@ -14130,6 +14706,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 v.frames[top].vals.push(Reg::from_i64(status));
             }
         }
+        // INVARIANTS #8 — a live call's reply, laid out for this call: every value it defines, or the
+        // trap of a reply the call could not take. A page fault's is its pager's status, read as
+        // `CapResult` reads it.
+        Some(Pending::Reply { out, sig }) => {
+            let slots = out?;
+            if v.page_fault.take().is_some() {
+                if slots.first().copied().unwrap_or(0) < 0 {
+                    return Err(Trap::MemoryFault);
+                }
+            } else {
+                let top = v.frames.len() - 1;
+                v.frames[top]
+                    .vals
+                    .extend(result_regs(&slots, sig.results()));
+            }
+        }
         Some(Pending::Abandoned) => {
             abandon_for_freeze(&mut v.mem, v.durable_sp_ctx);
             let top = v.frames.len() - 1;
@@ -14139,21 +14731,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         None => {}
     }
 
-    let funcs = Arc::clone(&v.funcs); // module 0 (this vCPU's primary program), immutable for the run
-    let types = Arc::clone(&v.types); // module 0 type section (#922)
+    let funcs = Arc::clone(&v.domain.funcs); // module 0 (this vCPU's primary program), immutable for the run
+    let types = Arc::clone(&v.domain.types); // module 0 type section (#922)
 
     // `dt` is the **shared** domain table (atomic slots + the writer-locked installed units); reads
     // off it are lock-free. `units` here is this vCPU's **local clone** of the installed-units prefix,
     // refreshed lazily on a miss (`resolve_module`) so neither a running unit frame nor the
     // `Jit.install` arm needs the shared lock on the hot loop.
     let VCpu {
-        types: _,      // module 0 type section — already cloned above (#922)
+        domain,
         invoked_types, // the invoked unit's type section (module INVOKE_MODULE), if any
-        registry,
         chain,
         cur,
-        fault_pager,
-        pager,
         page_fault: _,
         reply_ticket: _,
         frames,
@@ -14169,30 +14758,24 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         dstate: _, // swapped at the dispatch boundary, not inside `run_inner`
         wait_indefinite: _, // #1584 — set at the futex park site, read by the quiesce gate
         mem,
-        host,
         fuel,
-        children,
         depth,
         pending,
         sched,
-        funcs: _,
         id,
         parent_task: _, // a spawned child stamps *its own* id as the grandchild's parent below
         tls,
         memop,
         acc,
         setjmp_points,
-        dt,
         units,
         invoked,
         invoked_ref_slots,
         debug,
-        kill,
         freeze_bell,
         spawner_domain: _, // read where the vCPU ends (`Done`)
         held_for_paged,
         sig_handler_stack,
-        lane_chain,
         holds_lanes: _, // #2237: set at the dispatch boundary, after the run
         serve_run,
         handler_parks,
@@ -14203,18 +14786,29 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         unit_ref_cache,
         window_lease: _, // settled where the vCPU ends (`Done` / `reap`), never mid-run
         live: _,         // #2001: handed back when the vCPU is dropped
+        answers,
     } = v;
     let depth = *depth;
     let durable = *durable;
     let memop = *memop;
-    let fault_pager = *fault_pager;
+    // The domain's tables, which a domain an offer animation derives from it shares
+    // ([`Domain::animating`]), so they serve the whole call. Clones of the tables, never of the
+    // domain itself: a settle's leak guard counts the holders of an animated handler's domain.
+    let registry = &Arc::clone(&domain.registry);
+    let children = &Arc::clone(&domain.children);
+    let dt = &Arc::clone(&domain.dt);
+    let kill = &domain.kill.clone();
+    let fault_pager = domain.pager.is_some();
+    // The powerbox the running code sees: the domain's, or an animated handler's provider's. Every
+    // swap of `*domain` ([`Domain::animating`], and its settle) borrows it again.
+    let mut host = &domain.host;
     // #796 L2 — pull the async-signal poll pair once per quantum (a single `Host` lock here, never per
     // op). `None` when no personality installed a `SignalSource`, so the per-op check below compiles to a
     // predicted `is_some()` branch and the hot path is untouched for every non-signal guest.
     let signal_poll = host.lock_unpoisoned().signal_poll();
     // #863 slice 3 — this vCPU's own domain, for the scoped park interrupt a deliverable signal
     // fires (INVARIANTS.md #12: a signal to this process never sweeps another domain's parks).
-    let sig_domain = host.lock_unpoisoned().domain_id() as usize;
+    let sig_domain = domain.id;
     // #798 slice 2 — the domain's job-control stop depth (shared by every vCPU of the domain): one
     // relaxed load per op, park [`Blocked::Stopped`] while `> 0`. Cloned once — the personality's
     // stop closure holds the same `Arc`.
@@ -14307,7 +14901,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                 };
                 let saved_mem = std::mem::replace(mem, pm);
-                let saved_host = std::mem::replace(host, ph);
+                let animating = Arc::new(domain.animating(ph));
+                let saved_domain = std::mem::replace(domain, animating);
+                host = &domain.host;
                 // CALLS.md 5b caller-pays: `*fuel` is the caller's own counter and persisted on this
                 // vCPU across the park, so the resumed handler continues draining it from where it
                 // parked.
@@ -14335,7 +14931,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     handler_slot: slot,
                     handler_handle: parked.handler_handle,
                     saved_mem,
-                    saved_host,
+                    saved_domain,
                     saved_invoked,
                     saved_invoked_types,
                     saved_ref_slots: saved_ref,
@@ -14715,7 +15311,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // fuel here (mirroring `drive_over_cell` and a `call` prologue):
                                     // the admission drew it (`has_one`), so this cannot trap.
                                     let saved_mem_ = std::mem::replace(mem, pm_);
-                                    let saved_host_ = std::mem::replace(host, ph_);
+                                    let animating_ = Arc::new(domain.animating(ph_));
+                                    let saved_domain_ = std::mem::replace(domain, animating_);
+                                    host = &domain.host;
                                     fuel.burn()?;
                                     let saved_invoked_ = invoked.replace(entry_.funcs.clone());
                                     // #922: install the provider's type section as `invoked_types`
@@ -14737,7 +15335,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         handler_slot: hslot_,
                                         handler_handle: handle_,
                                         saved_mem: saved_mem_,
-                                        saved_host: saved_host_,
+                                        saved_domain: saved_domain_,
                                         saved_invoked: saved_invoked_,
                                         saved_invoked_types: saved_invoked_types_,
                                         saved_ref_slots: saved_ref_,
@@ -15029,15 +15627,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // re-admits it). Non-durable (a durable animation declined to `drive_arc` in 4a),
                     // so no `shadow_switch` — the 4a switch shape, reversed.
                     if let Some(anim) = offer_anim.pop_if(|a| a.handler_slot == leaving) {
-                        let resume_key =
-                            host.lock_unpoisoned().domain_id() as usize;
+                        let resume_key = domain.id;
                         // CALLS.md 5b caller-pays: `*fuel` is the caller's own counter, drained by
                         // the handler up to this park. Leave it (do NOT restore `anim.saved_fuel`) so
                         // the caller carries the paid-down fuel across the park and the resumed
                         // handler keeps draining it; the provider reserve is untouched.
                         // Pull the provider world off this vCPU, restoring the caller's.
                         let prov_mem = std::mem::replace(mem, anim.saved_mem);
-                        let prov_host_arc = std::mem::replace(host, anim.saved_host);
+                        let prov_domain = std::mem::replace(domain, anim.saved_domain);
                         *invoked = anim.saved_invoked;
                         *invoked_types = anim.saved_invoked_types; // #922: restore caller type section
                         *invoked_ref_slots = anim.saved_ref_slots;
@@ -15045,24 +15642,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // can't hand the world back cleanly: fail closed, terminal for this run (a
                         // spawning handler declines to `drive_arc` in a later slice). Fuel/world are
                         // never surrendered on this path, so the errno is a wrong-shape guard, never
-                        // a wrong answer. CALLS.md 6d.4.1 — the powerbox is now the instance's
-                        // permanent shared cell, so the old `try_unwrap` (unique-ownership) test is
-                        // re-expressed as a `strong_count`: on a clean return the only live refs are
-                        // the instance's own (1) and this vCPU's checkout clone (1) = 2; a surviving
-                        // extra ref is the leaked fiber. `busy` serialized admission, so no
-                        // concurrent checkout races the count.
+                        // a wrong answer ([`sole_checkout`]).
                         if anim.threaded {
                             // CALLS.md increment 7 — a threaded animation holds a fork + a cell
                             // clone, never the world: both just drop (concurrent clones are the
                             // declared regime, so no leak guard), and there is no `busy` to
                             // reopen and nobody parked to wake.
                             drop(prov_mem);
-                            drop(prov_host_arc);
+                            drop(prov_domain);
                         } else {
-                            if Arc::strong_count(&prov_host_arc) != 2 {
+                            if !sole_checkout(&prov_domain) {
                                 return Err(Trap::FiberFault);
                             }
-                            drop(prov_host_arc); // the checkout clone; the instance keeps its ref
+                            drop(prov_domain); // the checkout clone; the instance keeps its ref
                             {
                                 let mut st = anim.state.lock_unpoisoned();
                                 st.mem = prov_mem;
@@ -15130,9 +15722,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
                     if cont_block.contains(&leaving) && !(durable && unwinding) {
                         if let SchedRef::Real(_) = sched {
-                            let key = host
-                                .lock_unpoisoned()
-                                .domain_id() as usize;
+                            let key = domain.id;
                             frames[rtop].inst -= 1; // rewind: the wake re-executes the resume
                             return Ok(Inner::Park(Blocked::ContResumeBlock {
                                 key,
@@ -15143,6 +15733,121 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     frames[rtop].vals.push(Reg::from_i32(FIBER_PARKED));
                     frames[rtop].vals.push(Reg::from_i64(0));
                     continue 'frames;
+                }};
+            }
+            // §3.6 slices 3–4, INVARIANTS #8 — a call through a live offer, from `call.cap`,
+            // `call.import` or `call.sym`: enqueue it on `$callee`'s queue (op `$op` of export
+            // `$export`), its handles granted into the callee ([`issue_live_call`]), and finish it
+            // with the reply its signature `$sig` declares ([`ReplyTo::complete`]). The reply is
+            // taken at once when direct handoff serves the call inline; otherwise the call parks
+            // until it lands — a fiber alone, the root with its vCPU. A full queue is the call's
+            // failure, `-EAGAIN`: probeable backpressure, never a trap, for an op that can carry it.
+            macro_rules! live_call {
+                ($target:expr, $op:expr, $argv:expr, $sig:expr) => {{
+                    let target: LiveTarget = $target;
+                    let op: u32 = $op;
+                    let csig = call_sig(&cur_types, $sig);
+                    // INVARIANTS #8: the op's own signature, not the call site's, says which
+                    // slots are handles.
+                    let sig = target.sig(op, csig.params.len(), csig.results.len())?;
+                    let (ticket, callee_id) = issue_live_call(
+                        host,
+                        *durable_sp_ctx,
+                        &target.callee,
+                        target.export,
+                        op,
+                        $argv,
+                        sig.params(),
+                        match sched {
+                            SchedRef::Real(sr) if sr.held => fuel.source(),
+                            _ => None,
+                        },
+                    )?;
+                    let to = ReplyTo {
+                        sig,
+                        caller: Arc::clone(host),
+                    };
+                    let callee = target.callee;
+                    let Some(t) = ticket else {
+                        let slots = to.fail(EAGAIN)?;
+                        frames[top].vals.extend(result_regs(&slots, to.sig.results()));
+                        continue;
+                    };
+                    // CALLS.md 4d — direct handoff (real scheduler only): if enabled and the
+                    // provider's own serve loop is parked at `svc.wait`, donate this thread to serve
+                    // the just-enqueued dispatch inline ([`dispatch`] runs it to its next
+                    // park/finish and re-files it) instead of waking a worker and parking. If it
+                    // serves to completion the reply is stashed in `svc_results` (no ticket-waiter
+                    // is registered yet) — take it and continue. If the handler parks mid-handoff
+                    // (no reply) or the provider is ineligible, fall through to the enqueue+wake+park
+                    // path on the same ticket `t` (4d.2: the handler completes later and replies
+                    // via `t`).
+                    if let SchedRef::Real(sr) = sched {
+                        if sr.handoff {
+                            if let Some(provider) = sr.take_parked_serve_loop(callee_id as usize) {
+                                dispatch(sr, provider);
+                                let served = callee.lock_unpoisoned().svc_results.remove(&t);
+                                if let Some(r) = served {
+                                    let slots = to.complete(r, &callee)?;
+                                    let regs = result_regs(&slots, to.sig.results());
+                                    frames[top].vals.extend(regs);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    // #2695 step 2 — a resting callee runs the call on this thread, as an activation
+                    // this caller funds ([`Scheduler::take_resting`]): its reply is taken at once if
+                    // it finishes without parking, as direct handoff's is.
+                    if let SchedRef::Real(sr) = sched {
+                        if sr.held {
+                            if let Some(act) = sr.take_resting(callee_id as usize, t) {
+                                dispatch(sr, act);
+                            }
+                            let served = callee.lock_unpoisoned().svc_results.remove(&t);
+                            if let Some(r) = served {
+                                let slots = to.complete(r, &callee)?;
+                                let regs = result_regs(&slots, to.sig.results());
+                                frames[top].vals.extend(regs);
+                                continue;
+                            }
+                        }
+                    }
+                    sched.svc_wake(callee_id as usize);
+                    if *cur != ROOT_FIBER {
+                        if let SchedRef::Real(sr) = sched {
+                            let regc = Arc::clone(registry);
+                            let calleec = Arc::clone(&callee);
+                            let svck = domain.id;
+                            let toc = to.clone();
+                            fiber_park!(|slot: usize| {
+                                let mut sg = sr.lock();
+                                // D37 death-is-revocation (§12 teardown, owner 2026-07-24): a
+                                // callee already torn down never replies — complete now with the
+                                // probeable errno instead of parking through a dead domain.
+                                if sg.dead.contains_key(&(callee_id as usize)) {
+                                    drop(sg);
+                                    regc.wake_reply(slot, toc.fail(CAP_REVOKED), &toc.sig);
+                                } else {
+                                    sg.ticket_waiters.insert(
+                                        (callee_id as usize, t),
+                                        (Waiter::fiber(Arc::clone(&regc), slot, svck), toc.clone()),
+                                    );
+                                    drop(sg);
+                                    let early = calleec.lock_unpoisoned().svc_results.remove(&t);
+                                    if let Some(r) = early {
+                                        let out = toc.complete(r, &calleec);
+                                        regc.wake_reply(slot, out, &toc.sig);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    return Ok(Inner::Park(Blocked::CapReply {
+                        ticket: t,
+                        callee,
+                        to,
+                    }));
                 }};
             }
             // #1952 — a pipe read or write that must wait parks the **calling fiber**, with its op
@@ -15282,21 +15987,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // live `fn_table`. A nested invoke costs call depth like a call, so invoke
                     // recursion is bounded by the same stack-overflow bound as ordinary recursion.
                     let mut child = VCpu::new_invoke(
-                        Arc::clone(&funcs),
-                        Arc::clone(&types), // parent_types = module 0 type section (#922)
-                        Arc::clone(dt),
+                        domain,
                         unit_funcs,
                         unit_types, // the invoked unit's type section (#922)
                         ref_slots,
                         &child_args,
                         child_mem,
-                        Arc::clone(host),
                         std::mem::replace(fuel, Fuel::fixed(0)),
                         depth + frames.len() as u32 + 1,
                         sched.clone(),
                     );
                     child.memop = memop;
-                    child.children = Arc::clone(children); // #2043 D1: the domain's, like its window
                     // #1660: the unit runs over this window's heap, so a collection inside it must
                     // see everything paused beneath it — this computation, and whatever was already
                     // beneath *it*. Moved (not copied) and moved back whatever the outcome.
@@ -15823,7 +16524,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             child_host.lock_unpoisoned().domain_id() as usize,
                                             child_lane_val,
                                         )];
-                                        c.extend(lane_chain.iter().copied());
+                                        c.extend(domain.lane_chain.iter().copied());
                                         c
                                     };
                                     // #2043 — the child's handle is issued before it is spawned, so a
@@ -15867,33 +16568,32 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                     &cfuncs,
                                                     child_host.lock_unpoisoned().jit_table_log2(),
                                                 ));
+                                                let mut cdomain =
+                                                    Domain::new(child_host, cfuncs, ctypes, cdt);
+                                                cdomain.kill = Some(kflag_child); // lifecycle stays the spawner's
+                                                cdomain.lane_chain = chain_child; // D66: own domain (its lane), then ours
+                                                cdomain.pager =
+                                                    pager_for_child.map(|(cell, export)| {
+                                                        PagerRef { cell, export }
+                                                    });
                                                 let mut child = VCpu::new(
-                                                    cfuncs,
-                                                    ctypes,
+                                                    Arc::new(cdomain),
                                                     0,
                                                     &child_args,
                                                     Some(fm),
-                                                    child_host,
                                                     child_fuel,
                                                     depth + 1,
                                                     id,
                                                     csched,
-                                                    cdt,
                                                 );
                                                 child.memop = memop;
                                                 // §4 / #1501: the vCPU's durable bit too, as the nested arm
                                                 // sets it — the shadow-SP bookkeeping keys on this, not the
                                                 // host's.
                                                 child.durable = durable;
-                                                child.kill = Some(kflag_child); // lifecycle stays the spawner's
-                                                child.freeze_bell = Some(bell_child); // and so does the freeze
+                                                child.freeze_bell = Some(bell_child); // the freeze stays the spawner's too
                                                 child.spawner_domain = Some(sig_domain); // #2455
                                                 child.window_lease = Some(lease); // its window's bytes, until it ends
-                                                if let Some((cell, export)) = pager_for_child {
-                                                    child.pager = Some(PagerRef { cell, export });
-                                                    child.fault_pager = true;
-                                                }
-                                                child.lane_chain = chain_child; // D66: own domain (its lane), then ours
                                                 Box::new(child)
                                             });
                                             match made {
@@ -16033,9 +16733,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                     // The serve frame back in control after a handler switch: the fiber exit
                     // paths pushed `(status, value)` onto this frame — pop them and settle
-                    // that dispatch before the rewound op runs the machine again.
+                    // that dispatch before the rewound op runs the machine again. Its reply is
+                    // every result the handler returned ([`ServeRun::results`]), not the one value.
                     if let Some(run) = serve_run.take() {
-                        let value = frames[top].vals.pop().ok_or(Trap::Malformed)?.i64();
+                        frames[top].vals.pop().ok_or(Trap::Malformed)?;
                         let status = frames[top].vals.pop().ok_or(Trap::Malformed)?.i32();
                         match status {
                             FIBER_RETURNED => {
@@ -16048,13 +16749,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // dispatch still counts as served.
                                 if !run.replied {
                                     // #1862: a page request's bytes move now, from this serving
-                                    // vCPU's window, before the reply can wake the child.
-                                    let value = host.lock_unpoisoned().settle_page(
+                                    // vCPU's window, before the reply can wake the child. Its
+                                    // status is the handler's one result.
+                                    let mut results = run.results;
+                                    if let Some(first) = results.first_mut() {
+                                        *first = host.lock_unpoisoned().settle_page(
+                                            run.ticket,
+                                            *first,
+                                            mem.as_ref().map(|m| m as _),
+                                        );
+                                    }
+                                    sched.cap_reply_or_stash(
                                         run.ticket,
-                                        value,
-                                        mem.as_ref().map(|m| m as _),
+                                        Reply::Results(results),
+                                        host,
                                     );
-                                    sched.cap_reply_or_stash(run.ticket, value, host);
                                 }
                                 *serve_count += 1;
                             }
@@ -16093,6 +16802,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 ticket: $ticket,
                                 serve_cur: *cur,
                                 replied: false,
+                                results: Vec::new(),
                             });
                             frames[top].inst -= 1;
                             let parked = std::mem::take(frames);
@@ -16181,7 +16891,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         };
                         let params = &funcs.get(fidx as usize).ok_or(Trap::CapFault)?.params;
                         if d.args.len() != params.len() {
-                            sched.cap_reply_or_stash(d.ticket, EINVAL, host);
+                            sched.cap_reply_or_stash(d.ticket, Reply::Failed(EINVAL), host);
                             continue;
                         }
                         let child_vals: Vec<Reg> = d
@@ -16198,7 +16908,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         {
                             Ok(h_) => h_,
                             Err(_) => {
-                                sched.cap_reply_or_stash(d.ticket, EAGAIN, host);
+                                sched.cap_reply_or_stash(d.ticket, Reply::Failed(EAGAIN), host);
                                 continue;
                             }
                         };
@@ -16228,7 +16938,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         && !std::mem::take(&mut svc_timed_out)
                     {
                         frames[top].inst -= 1;
-                        let key = host.lock_unpoisoned().domain_id() as usize;
+                        let key = domain.id;
                         // I38 timed form: the op's single optional arg is a timeout in ns
                         // (`< 0` / absent = wait forever). Re-read on every (re-)park, so a
                         // spurious wake restarts the clock — "at least this long" semantics.
@@ -16281,7 +16991,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Some(sr) if *cur != sr.serve_cur => {
                             let ticket = sr.ticket;
                             sr.replied = true;
-                            let callee_id = host.lock_unpoisoned().domain_id() as usize;
+                            let callee_id = domain.id;
                             // Fork the parked caller into a twin (Real scheduler only); on any failure
                             // fall back to a single reply so the original never hangs — no twin.
                             let twin = if let SchedRef::Real(sr_sched) = sched {
@@ -16296,7 +17006,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // Explicit mode: the promised reply. Pid mode: -EAGAIN (POSIX
                                     // fork failure), to caller and handler alike.
                                     let fallback = reply_orig.unwrap_or(EAGAIN);
-                                    sched.cap_reply_or_stash(ticket, fallback, host);
+                                    sched.cap_reply_or_stash(
+                                        ticket,
+                                        Reply::Results(vec![fallback]),
+                                        host,
+                                    );
                                     reply_orig.map_or(EAGAIN, |_| 0)
                                 }
                             }
@@ -16331,7 +17045,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Some(sr) if *cur != sr.serve_cur => {
                             if let SchedRef::Real(sr_sched) = sched {
                                 let ticket = sr.ticket;
-                                let callee_id = host.lock_unpoisoned().domain_id() as usize;
+                                let callee_id = domain.id;
                                 // POSIX `waitpid` pid selector on the core capability path: `-1` =
                                 // any child; `> 0` = a specific twin. `pid < -1` (any child in a
                                 // process group) is **retired from the core** (#973) — group-wait
@@ -16427,7 +17141,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let grants_n = argn(2)? as u64;
                     let entry = argn(3)? as u64;
                     let size_log2 = argn(4)?;
-                    let clean_root = serve_run.is_none() && *cur == ROOT_FIBER;
+                    // An activation is a handler too (#2695).
+                    let clean_root = serve_run.is_none() && answers.is_none() && *cur == ROOT_FIBER;
                     match build_exec_req(
                         host,
                         mem.as_ref(),
@@ -16469,83 +17184,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let hg = host.lock_unpoisoned();
                         hg.live_impl_of(h, *type_id)
                     };
-                    if let Some((callee, export)) = live {
-                        let (ticket, callee_id) =
-                            issue_live_call(host, *durable_sp_ctx, &callee, export, *op, argv);
-                        match ticket {
-                            Some(t) => {
-                                // CALLS.md 4d — direct handoff (real scheduler only): if enabled and
-                                // the provider's own serve loop is parked at `svc.wait`, donate this
-                                // thread to serve the just-enqueued dispatch inline ([`dispatch`]
-                                // runs it to its next park/finish and re-files it) instead of waking a
-                                // worker and parking. If it serves to completion the reply is stashed
-                                // in `svc_results` (no ticket-waiter is registered yet) — take it and
-                                // continue. If the handler parks mid-handoff (no reply) or the
-                                // provider is ineligible, fall through to the unchanged
-                                // enqueue+wake+park path on the same ticket `t` (4d.2: the handler
-                                // completes later and replies via `t`).
-                                if let SchedRef::Real(sr) = sched {
-                                    if sr.handoff {
-                                        if let Some(provider) =
-                                            sr.take_parked_serve_loop(callee_id as usize)
-                                        {
-                                            dispatch(sr, provider);
-                                            let served =
-                                                callee.lock_unpoisoned().svc_results.remove(&t);
-                                            if let Some(rv) = served {
-                                                push_results(
-                                                    &mut frames[top].vals,
-                                                    &[rv],
-                                                    &call_sig(&cur_types, *sig).results,
-                                                );
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
-                                sched.svc_wake(callee_id as usize);
-                                if *cur != ROOT_FIBER {
-                                    if let SchedRef::Real(sr) = sched {
-                                        let regc = Arc::clone(registry);
-                                        let calleec = Arc::clone(&callee);
-                                        let svck = host.lock_unpoisoned().domain_id() as usize;
-                                        fiber_park!(|slot: usize| {
-                                            let mut sg = sr.lock();
-                                            // D37 death-is-revocation (§12 teardown, owner
-                                            // 2026-07-24): a callee already torn down never
-                                            // replies — complete now with the probeable errno
-                                            // instead of parking through a dead domain.
-                                            if sg.dead.contains_key(&(callee_id as usize)) {
-                                                drop(sg);
-                                                regc.wake_blocked(slot, Reg::from_i64(CAP_REVOKED));
-                                            } else {
-                                                sg.ticket_waiters.insert(
-                                                    (callee_id as usize, t),
-                                                    Waiter::fiber(Arc::clone(&regc), slot, svck),
-                                                );
-                                                drop(sg);
-                                                let early = calleec
-                                                    .lock_unpoisoned()
-                                                    .svc_results
-                                                    .remove(&t);
-                                                if let Some(r) = early {
-                                                    regc.wake_blocked(slot, Reg::from_i64(r));
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                                return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
-                            }
-                            None => {
-                                push_results(
-                                    &mut frames[top].vals,
-                                    &[EAGAIN],
-                                    &call_sig(&cur_types, *sig).results,
-                                );
-                                continue;
-                            }
-                        }
+                    if let Some(target) = live {
+                        live_call!(target, *op, argv, *sig);
                     }
                     // CALLS.md increment 3 (slice 1): an **instanced** offer runs its sub-run with
                     // the caller powerbox lock narrowed to the two `cap`-slot translation edges —
@@ -16597,8 +17237,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let svck = hg.domain_id() as usize;
                         drop(hg);
                         if call_sig(&cur_types, *sig).results.len() > 1 {
-                            // Parkable ops carry a single-slot scalar reply (invariant 8) — a
-                            // wider declared signature is a registration bug, fail-closed. Checked
+                            // A punted job answers one scalar ([`OffloadWork`]) — a wider
+                            // declared signature is a registration bug, fail-closed. Checked
                             // BEFORE any park: a fault after the vCPU is filed is unrecoverable.
                             comps.withdraw(id);
                             return Err(Trap::CapFault);
@@ -16613,7 +17253,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // callers keep the degenerate wait below (`freeze_drive` fails closed on
                         // any unwoken cap park — the FIBER_PARK.md non-goal); the explorer keeps
                         // whole-vCPU waits (the slice-5a `SchedRef::Real` gate); the single-i64
-                        // gate matches the wake's one pushed reg (invariant 8). An animated
+                        // gate matches the wake's one pushed reg ([`OffloadWork`]). An animated
                         // offer handler that reaches this park rides `fiber_park!`'s CALLS-4b
                         // promotion branch instead — the dispatch parks, never the domain.
                         // Until F2/F3, the fast backends still block inline here — the
@@ -16728,7 +17368,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         host,
                         mem.as_ref(),
                         durable,
-                        serve_run.is_none(),
+                        serve_run.is_none() && answers.is_none(),
                     ) {
                         Decision::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
                         Decision::Spawn(req) => return Ok(Inner::Park(Blocked::SpawnSelf(req))),
@@ -16819,89 +17459,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let hg = host.lock_unpoisoned();
                         hg.import_live_target(*import)
                     };
-                    if let Some((callee, export, base_op)) = live {
-                        let (ticket, callee_id) = issue_live_call(
-                            host,
-                            *durable_sp_ctx,
-                            &callee,
-                            export,
-                            base_op + *op,
-                            argv,
-                        );
-                        match ticket {
-                            Some(t) => {
-                                // CALLS.md 4d — direct handoff (real scheduler only): if enabled and
-                                // the provider's own serve loop is parked at `svc.wait`, donate this
-                                // thread to serve the just-enqueued dispatch inline ([`dispatch`]
-                                // runs it to its next park/finish and re-files it) instead of waking a
-                                // worker and parking. If it serves to completion the reply is stashed
-                                // in `svc_results` (no ticket-waiter is registered yet) — take it and
-                                // continue. If the handler parks mid-handoff (no reply) or the
-                                // provider is ineligible, fall through to the unchanged
-                                // enqueue+wake+park path on the same ticket `t` (4d.2: the handler
-                                // completes later and replies via `t`).
-                                if let SchedRef::Real(sr) = sched {
-                                    if sr.handoff {
-                                        if let Some(provider) =
-                                            sr.take_parked_serve_loop(callee_id as usize)
-                                        {
-                                            dispatch(sr, provider);
-                                            let served =
-                                                callee.lock_unpoisoned().svc_results.remove(&t);
-                                            if let Some(rv) = served {
-                                                push_results(
-                                                    &mut frames[top].vals,
-                                                    &[rv],
-                                                    &call_sig(&cur_types, *sig).results,
-                                                );
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
-                                sched.svc_wake(callee_id as usize);
-                                if *cur != ROOT_FIBER {
-                                    if let SchedRef::Real(sr) = sched {
-                                        let regc = Arc::clone(registry);
-                                        let calleec = Arc::clone(&callee);
-                                        let svck = host.lock_unpoisoned().domain_id() as usize;
-                                        fiber_park!(|slot: usize| {
-                                            let mut sg = sr.lock();
-                                            // D37 death-is-revocation (§12 teardown, owner
-                                            // 2026-07-24): a callee already torn down never
-                                            // replies — complete now with the probeable errno
-                                            // instead of parking through a dead domain.
-                                            if sg.dead.contains_key(&(callee_id as usize)) {
-                                                drop(sg);
-                                                regc.wake_blocked(slot, Reg::from_i64(CAP_REVOKED));
-                                            } else {
-                                                sg.ticket_waiters.insert(
-                                                    (callee_id as usize, t),
-                                                    Waiter::fiber(Arc::clone(&regc), slot, svck),
-                                                );
-                                                drop(sg);
-                                                let early = calleec
-                                                    .lock_unpoisoned()
-                                                    .svc_results
-                                                    .remove(&t);
-                                                if let Some(r) = early {
-                                                    regc.wake_blocked(slot, Reg::from_i64(r));
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                                return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
-                            }
-                            None => {
-                                push_results(
-                                    &mut frames[top].vals,
-                                    &[EAGAIN],
-                                    &call_sig(&cur_types, *sig).results,
-                                );
-                                continue;
-                            }
-                        }
+                    if let Some((target, base_op)) = live {
+                        live_call!(target, base_op + *op, argv, *sig);
                     }
                     // CALLS.md increment 3 (slice 1): an instanced offer bound to this slot runs
                     // with the narrowed powerbox lock (see the `call.cap` arm). Probe reproduces the
@@ -16955,7 +17514,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         host,
                         mem.as_ref(),
                         durable,
-                        serve_run.is_none(),
+                        serve_run.is_none() && answers.is_none(),
                     ) {
                         Decision::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
                         Decision::Spawn(req) => return Ok(Inner::Park(Blocked::SpawnSelf(req))),
@@ -17004,79 +17563,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let hg = host.lock_unpoisoned();
                         hg.import_live_target(*import)
                     };
-                    if let Some((callee, export, base_op)) = live {
-                        let (ticket, callee_id) =
-                            issue_live_call(host, *durable_sp_ctx, &callee, export, base_op, argv);
-                        match ticket {
-                            Some(t) => {
-                                // CALLS.md 4d — direct handoff (real scheduler only): if enabled and
-                                // the provider's own serve loop is parked at `svc.wait`, donate this
-                                // thread to serve the just-enqueued dispatch inline ([`dispatch`]
-                                // runs it to its next park/finish and re-files it) instead of waking a
-                                // worker and parking. If it serves to completion the reply is stashed
-                                // in `svc_results` (no ticket-waiter is registered yet) — take it and
-                                // continue. If the handler parks mid-handoff (no reply) or the
-                                // provider is ineligible, fall through to the unchanged
-                                // enqueue+wake+park path on the same ticket `t` (4d.2: the handler
-                                // completes later and replies via `t`).
-                                if let SchedRef::Real(sr) = sched {
-                                    if sr.handoff {
-                                        if let Some(provider) =
-                                            sr.take_parked_serve_loop(callee_id as usize)
-                                        {
-                                            dispatch(sr, provider);
-                                            let served =
-                                                callee.lock_unpoisoned().svc_results.remove(&t);
-                                            if let Some(rv) = served {
-                                                push_results(
-                                                    &mut frames[top].vals,
-                                                    &[rv],
-                                                    &call_sig(&cur_types, *sig).results,
-                                                );
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
-                                sched.svc_wake(callee_id as usize);
-                                if *cur != ROOT_FIBER {
-                                    if let SchedRef::Real(sr) = sched {
-                                        let regc = Arc::clone(registry);
-                                        let calleec = Arc::clone(&callee);
-                                        let svck = host.lock_unpoisoned().domain_id() as usize;
-                                        fiber_park!(|slot: usize| {
-                                            let mut sg = sr.lock();
-                                            if sg.dead.contains_key(&(callee_id as usize)) {
-                                                drop(sg);
-                                                regc.wake_blocked(slot, Reg::from_i64(CAP_REVOKED));
-                                            } else {
-                                                sg.ticket_waiters.insert(
-                                                    (callee_id as usize, t),
-                                                    Waiter::fiber(Arc::clone(&regc), slot, svck),
-                                                );
-                                                drop(sg);
-                                                let early = calleec
-                                                    .lock_unpoisoned()
-                                                    .svc_results
-                                                    .remove(&t);
-                                                if let Some(r) = early {
-                                                    regc.wake_blocked(slot, Reg::from_i64(r));
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                                return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
-                            }
-                            None => {
-                                push_results(
-                                    &mut frames[top].vals,
-                                    &[EAGAIN],
-                                    &call_sig(&cur_types, *sig).results,
-                                );
-                                continue;
-                            }
-                        }
+                    if let Some((target, base_op)) = live {
+                        live_call!(target, base_op, argv, *sig);
                     }
                     // CALLS.md increment 3 (slice 1): a symbolic slot bound to an instanced offer
                     // runs with the narrowed powerbox lock. CallSym is "a flat call.import (op 0)",
@@ -17131,7 +17619,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         host,
                         mem.as_ref(),
                         durable,
-                        serve_run.is_none(),
+                        serve_run.is_none() && answers.is_none(),
                     ) {
                         Decision::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
                         Decision::Spawn(req) => return Ok(Inner::Park(Blocked::SpawnSelf(req))),
@@ -17225,7 +17713,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         host,
                         mem.as_ref(),
                         durable,
-                        serve_run.is_none(),
+                        serve_run.is_none() && answers.is_none(),
                     ) {
                         Decision::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
                         Decision::Spawn(req) => return Ok(Inner::Park(Blocked::SpawnSelf(req))),
@@ -17509,7 +17997,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
                             if blocking && !(durable && unwinding) {
                                 if let SchedRef::Real(_) = sched {
-                                    let key = host.lock_unpoisoned().domain_id() as usize;
+                                    let key = domain.id;
                                     frames[top].inst -= 1; // rewind: the wake re-executes this op
                                     return Ok(Inner::Park(Blocked::ContResumeBlock {
                                         key,
@@ -17785,28 +18273,24 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         0
                     };
                     let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
-                    let child_host = Arc::clone(host); // inherit the domain powerbox
-                    let child_fuel = fuel.for_thread(); // the domain's one fuel budget (INVARIANTS #6)
-                    let cfuncs = Arc::clone(&funcs);
-                    let ctypes = Arc::clone(&types); // (#922)
-                    let cdt = Arc::clone(dt); // **share** the domain table: a post-spawn install is visible here (§6 #2)
-                                              // **Share** the fiber registry (D57 3b-i): one handle namespace per domain, so
-                                              // the child can resume fibers the parent (or a sibling) created and suspended.
-                    let creg = Arc::clone(registry);
-                    let chain_sib = lane_chain.clone(); // D66
+                    // The thread joins this domain ([`Domain`]): its powerbox and code, its table (a
+                    // post-spawn install is visible there, §6 #2), its fiber registry (D57 3b-i: the
+                    // thread can resume fibers the parent or a sibling created and suspended), its
+                    // children (D1), and its S3 kill flag (killing a §14 child terminates its whole
+                    // thread subtree), D66 lanes and §2.2 / #2164 pager (the thread runs over the
+                    // same demand-paged window).
+                    let cdomain = Arc::clone(domain);
+                    // The domain's one fuel budget (INVARIANTS #6): an activation draws its caller's, but
+                    // a thread it spawns is its domain's (#2695).
+                    let child_fuel = answers
+                        .as_ref()
+                        .map_or_else(|| fuel.for_thread(), |a| a.home.for_thread());
                     let parent_id = *id; // the spawning vCPU's task — the child's `parent_task`
                     let csched = sched.clone();
                     // A debugged run shares one breakpoint/watchpoint set across all threads
                     // (DEBUGGING.md Milestone B): the child gets its own per-vCPU `DebugCtx` (fresh
                     // logical clock) over the same shared state, so a breakpoint fires in it too.
                     let cdebug = debug.as_ref().map(|d| Arc::clone(&d.shared));
-                    // S3 `kill`: a `thread.spawn` descendant of a §14 child **inherits** its kill
-                    // flag, so killing the §14 child terminates its whole thread subtree; `None` (root
-                    // / top-level thread) stays unkillable.
-                    let kill_inherit = kill.clone();
-                    // §2.2 / #2164 — and its pager: the thread runs over the same demand-paged window,
-                    // whose pages the pager supplies whichever vCPU touches one first.
-                    let pager_inherit = pager.clone();
                     // #2001 — the thread is one `spawn` of its domain's node while it lives: a full
                     // ceiling refuses it as the live cap does (dropped with the closure if that does).
                     let mut h = host.lock_unpoisoned();
@@ -17825,26 +18309,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         })
                         .map_err(|_| Trap::ThreadFault)?;
                     let slot = temen_ir::handles::slot_of(handle);
-                    let cchildren = Arc::clone(children); // D1: the thread shares its domain's
                     let made = sched.spawn(move |id| {
                         let mut child = VCpu::new(
-                            cfuncs,
-                            ctypes,
+                            cdomain,
                             entry,
                             &[Value::I64(spv), Value::I64(av)], // (sp, arg) — the fiber-style entry
                             child_mem,
-                            child_host,
                             child_fuel,
                             0,
                             id,
                             csched,
-                            cdt,
                         );
                         // Start the child in the spawning frame's module (an installed §22 unit's own
                         // module; `0` for a plain guest) so `entry` resolves there, not in module 0.
                         child.frames[0].module = cmodule;
-                        child.registry = creg;
-                        child.children = cchildren;
                         child.memop = memop; // inherit the explorer's memory-op granularity
                         child.durable = durable; // durability is a domain property (shared window/registry)
                                                  // Durable multi-vCPU (slice 3.2.2): this child owns the top-down context reserved
@@ -17857,10 +18335,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         child.tls = vcpu_id; // §12: its id in its domain (#1775)
                         child.spawn_residue = Some((entry, vec![spv, av], slot));
                         child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));
-                        child.kill = kill_inherit; // S3: inherit the §14 subtree kill flag (or None)
-                        child.fault_pager = pager_inherit.is_some();
-                        child.pager = pager_inherit;
-                        child.lane_chain = chain_sib; // D66: a sibling shares its domain's chain
                         child.live = live;
                         Box::new(child)
                     });
@@ -17923,7 +18397,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if *cur != ROOT_FIBER {
                         if let SchedRef::Real(sr) = sched {
                             let regc = Arc::clone(registry);
-                            let svck = host.lock_unpoisoned().domain_id() as usize;
+                            let svck = domain.id;
                             fiber_park!(|slot: usize| {
                                 let mut sg = sr.lock();
                                 // Compare-under-lock: a value that already changed wakes the
@@ -18014,6 +18488,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let r = match ty {
                         IntTy::I32 => cmp32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?),
                         IntTy::I64 => cmp64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?),
+                    };
+                    frames[top].vals.push(Reg::from_i32(r as i32));
+                }
+                Inst::IntBinImm { ty, op, a, imm } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        IntTy::I32 => Reg::from_i32(bin32(*op, get_i32(vals, *a)?, *imm as i32)?),
+                        IntTy::I64 => Reg::from_i64(bin64(*op, get_i64(vals, *a)?, *imm)?),
+                    };
+                    frames[top].vals.push(r);
+                }
+                Inst::IntCmpImm { ty, op, a, imm } => {
+                    let vals = &frames[top].vals;
+                    let r = match ty {
+                        IntTy::I32 => cmp32(*op, get_i32(vals, *a)?, *imm as i32),
+                        IntTy::I64 => cmp64(*op, get_i64(vals, *a)?, *imm),
                     };
                     frames[top].vals.push(Reg::from_i32(r as i32));
                 }
@@ -18384,21 +18874,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         *invoked_types = anim.saved_invoked_types; // #922: restore caller type section
                         *invoked_ref_slots = anim.saved_ref_slots;
                         let prov_mem = std::mem::replace(mem, anim.saved_mem);
-                        let prov_host_arc = std::mem::replace(host, anim.saved_host);
+                        let prov_domain = std::mem::replace(domain, anim.saved_domain);
+                        host = &domain.host;
                         // Run-to-completion: a handler that parked/spawned would have leaked a clone
-                        // of the provider-host `Arc` (that is 4b's promotion). If one escaped, fail
-                        // closed — a mid-animation park is a 4b capability, never a wrong answer.
-                        // CALLS.md 6d.4.1 — shared-cell form: clean return ⇒ exactly the instance's
-                        // ref + this checkout clone = 2; more is a leak (`busy` serialized admission).
-                        // Increment 7: a **threaded** animation skips the guard — concurrent clones
-                        // are the declared regime, and there is no world to hand back (the fork
-                        // drops) and no `busy` to reopen.
-                        if !anim.threaded && Arc::strong_count(&prov_host_arc) != 2 {
+                        // of the provider world (that is 4b's promotion). If one escaped, fail
+                        // closed — a mid-animation park is a 4b capability, never a wrong answer
+                        // ([`sole_checkout`]). Increment 7: a **threaded** animation skips the guard
+                        // — concurrent clones are the declared regime, and there is no world to hand
+                        // back (the fork drops) and no `busy` to reopen.
+                        if !anim.threaded && !sole_checkout(&prov_domain) {
                             let mut st = anim.state.lock_unpoisoned();
                             st.busy = false;
                             return Err(Trap::FiberFault);
                         }
-                        drop(prov_host_arc); // the checkout clone; the instance keeps its ref
+                        drop(prov_domain); // the checkout clone; the instance keeps its ref
                         let mut result_slots: Vec<i64> = anim
                             .results
                             .iter()
@@ -18465,6 +18954,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         } else {
                             FIBER_RETURNED
                         };
+                        // INVARIANTS #8 — the serve loop's running handler returned: keep every
+                        // result for its dispatch's reply ([`ServeRun::results`]).
+                        if let Some(run) = serve_run.as_mut().filter(|r| r.slot == leaving) {
+                            let types = popped
+                                .as_ref()
+                                .and_then(|p| fs.get(p.func as usize))
+                                .map_or(&[][..], |f| &f.results[..]);
+                            run.results = ret_buf
+                                .iter()
+                                .zip(types)
+                                .map(|(r, ty)| val_to_slot(r.to_value(*ty)))
+                                .collect();
+                        }
                         frames[rtop].vals.push(Reg::from_i32(status));
                         frames[rtop]
                             .vals
@@ -18620,6 +19122,17 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
             let r = match ty {
                 IntTy::I32 => cmp32(*op, get_i32(vals, *a)?, get_i32(vals, *b)?),
                 IntTy::I64 => cmp64(*op, get_i64(vals, *a)?, get_i64(vals, *b)?),
+            };
+            Reg::from_i32(r as i32)
+        }
+        Inst::IntBinImm { ty, op, a, imm } => match ty {
+            IntTy::I32 => Reg::from_i32(bin32(*op, get_i32(vals, *a)?, *imm as i32)?),
+            IntTy::I64 => Reg::from_i64(bin64(*op, get_i64(vals, *a)?, *imm)?),
+        },
+        Inst::IntCmpImm { ty, op, a, imm } => {
+            let r = match ty {
+                IntTy::I32 => cmp32(*op, get_i32(vals, *a)?, *imm as i32),
+                IntTy::I64 => cmp64(*op, get_i64(vals, *a)?, *imm),
             };
             Reg::from_i32(r as i32)
         }
@@ -22142,6 +22655,11 @@ impl Fuel {
         self.can_burn().min(i64::MAX as u64) as i64
     }
 
+    /// The node this fuel draws from: who pays for what it burns. `None` on a fixed allowance.
+    pub(crate) fn source(&self) -> Option<NodeRef> {
+        self.src.clone()
+    }
+
     /// Fuel for a new vCPU of the same domain (`thread.spawn`): it draws from the same node, or, on a
     /// fixed allowance, starts with a copy of it, as every thread did before (#1944 slice 3).
     pub(crate) fn for_thread(&self) -> Fuel {
@@ -23305,8 +23823,9 @@ impl ForkedProc {
 /// §12 parking-on-blocking — a punted blocking op: a **self-contained** scalar job the offload
 /// pool runs off the vCPU thread. Deliberately narrow (the SQE discipline, kept): it captures
 /// what it needs at punt time, sees **no window and no `Host`**, and returns exactly one `i64`
-/// (invariant 8's single-slot scalar reply; errors ride negative errnos, never traps — a pool
-/// job has nothing to forge).
+/// (errors ride negative errnos, never traps — a pool job has nothing to forge). It is a call into
+/// the host, not a domain, so INVARIANTS #8's reply shape is not its: one scalar is this
+/// transport's own bound.
 pub type OffloadWork = Box<dyn FnOnce() -> i64 + Send + 'static>;
 
 /// An **offloadable** handler's per-call decision (the io_uring try-nonblocking model): the fast
@@ -23424,7 +23943,7 @@ pub enum ProcHandler {
     /// §12 parking-on-blocking — decides per call ([`OffloadOutcome`], the io_uring
     /// try-nonblocking model): completes inline, or punts a self-contained job to the offload pool
     /// or to the embedder. It sees no window and no minter, since a punted job outlives the dispatch,
-    /// and a punted call's declared signature carries at most one result (invariant 8).
+    /// and a punted call's declared signature carries at most one result ([`OffloadWork`]).
     Offloadable(OffloadHostProc),
     /// #1954 — [`Self::Offloadable`], declared to leave every call to the embedder
     /// ([`OffloadOutcome::Host`]): a call parks without needing the caller's frames
@@ -24180,10 +24699,10 @@ const OFFER_FUEL: u64 = 1 << 26;
 /// only while an animated handler fiber is on the resume chain (run-to-completion in 4a; a mid-run
 /// park is a `FiberFault` until 4b wires promotion).
 ///
-/// The handler runs on the caller's own `'frames` loop, so the caller's `{mem, host, fuel}` are
-/// swapped to the provider's for the handler and restored here on its return — `fuel` too, so the
-/// drain lands on the provider's reserve (provider-pays, 3a), not the caller (caller-pays is
-/// increment 5).
+/// The handler runs on the caller's own `'frames` loop, so the caller's `mem` and powerbox are
+/// swapped to the provider's for the handler (the powerbox through a domain derived from the
+/// caller's, [`Domain::animating`]) and restored here on its return. Its fuel is the caller's own
+/// (CALLS.md 5b, caller-pays).
 struct OfferAnim {
     /// The provider instance whose world is checked out (`busy = true`) for this animation.
     state: Arc<Mutex<ProviderState>>,
@@ -24195,8 +24714,9 @@ struct OfferAnim {
     handler_handle: i64,
     /// The caller's `mem`, parked while the provider's window is installed on the vCPU.
     saved_mem: Option<Mem>,
-    /// The caller's `Arc<Mutex<Host>>`, parked while the provider's host is installed.
-    saved_host: Arc<Mutex<Host>>,
+    /// The caller's domain, parked while the vCPU runs over the one derived from it with the
+    /// provider's powerbox ([`Domain::animating`]).
+    saved_domain: Arc<Domain>,
     /// The caller's `invoked` unit (the transient [`INVOKE_MODULE`] code table), parked while the
     /// provider's `entry.funcs` is installed as the animated handler's code.
     saved_invoked: Option<Arc<[Func]>>,
@@ -24220,6 +24740,15 @@ struct OfferAnim {
     /// was never set, so the settle drops the fork instead of handing a world back — no leak guard,
     /// no `busy` clear, no `admit_wake` (nothing can be parked on an ungated instance).
     threaded: bool,
+}
+
+/// CALLS.md 6d.4.1 — whether an animated handler's domain, just taken off its vCPU, held the only
+/// checkout of the provider world: no clone of the domain escaped (a thread the handler spawned
+/// shares it), and the provider's powerbox cell has no holder but the instance and this domain (a
+/// fiber the handler spawned would hold one more). `busy` serialized admission, so no concurrent
+/// checkout races the counts.
+fn sole_checkout(animated: &Arc<Domain>) -> bool {
+    Arc::strong_count(animated) == 1 && Arc::strong_count(&animated.host) == 2
 }
 
 /// CALLS.md 4b — a **parked** cross-world offer animation: the handler fiber parked mid-run, so
@@ -24277,20 +24806,20 @@ struct OfferParked {
 /// context) that a caller refuses fail-closed rather than self-deadlocks on.
 #[allow(clippy::type_complexity)]
 fn lock_host_pair<'a>(
-    a: &'a Arc<Mutex<Host>>,
-    b: &'a Arc<Mutex<Host>>,
+    a: &'a Mutex<Host>,
+    b: &'a Mutex<Host>,
 ) -> Option<(
     std::sync::MutexGuard<'a, Host>,
     std::sync::MutexGuard<'a, Host>,
 )> {
-    if Arc::ptr_eq(a, b) {
+    if std::ptr::eq(a, b) {
         return None;
     }
     let unpoison = |r: std::sync::LockResult<std::sync::MutexGuard<'a, Host>>| match r {
         Ok(g) => g,
         Err(e) => e.into_inner(),
     };
-    if (Arc::as_ptr(a) as usize) < (Arc::as_ptr(b) as usize) {
+    if (a as *const Mutex<Host> as usize) < (b as *const Mutex<Host> as usize) {
         let ga = unpoison(a.lock());
         let gb = unpoison(b.lock());
         Some((ga, gb))
@@ -24334,6 +24863,297 @@ fn translate_cap_slots(
         }
     }
     Ok(())
+}
+
+/// INVARIANTS #8 — what a call through a live offer (a call queued into another running domain)
+/// answers: the handler's results, or a failure of the transport. The caller lays it out by its
+/// own call's signature ([`complete_call`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reply {
+    /// The handler returned: its results as slots, any handle among them still the callee's.
+    Results(Vec<i64>),
+    /// The transport failed — a full queue, a refused dispatch, a callee that ended unserved: a
+    /// negative errno.
+    Failed(i64),
+}
+
+impl Reply {
+    /// The reply as one status, for a call whose op answers one integer (a pager's `page`): its first
+    /// result, or the failure's errno.
+    pub fn status(&self) -> i64 {
+        match self {
+            Reply::Results(r) => r.first().copied().unwrap_or(0),
+            Reply::Failed(errno) => *errno,
+        }
+    }
+}
+
+/// INVARIANTS #8 — where a call through a live offer goes: the callee's cell, the export it serves,
+/// and the offer's interface, whose op signatures decide which of a call's slots are handles
+/// ([`LiveTarget::sig`]).
+#[derive(Clone)]
+pub struct LiveTarget {
+    pub callee: Arc<Mutex<Host>>,
+    pub export: u32,
+    sigs: Arc<[FuncType]>,
+}
+
+impl LiveTarget {
+    /// Op `op`'s signature, as the offer's interface declares it, for a call of `n_params` arguments
+    /// and `n_results` results. It decides which slots are handles and how a failure is laid out,
+    /// never the call site's claim: a caller that declared an integer result a `cap` would otherwise
+    /// take the callee's handle of that number. An op the interface lacks, or a call of another
+    /// arity, is `CapFault`, as at the instanced boundary.
+    pub fn sig(&self, op: u32, n_params: usize, n_results: usize) -> Result<OpSig, Trap> {
+        let op = op as usize;
+        self.sigs
+            .get(op)
+            .filter(|s| s.params.len() == n_params && s.results.len() == n_results)
+            .ok_or(Trap::CapFault)?;
+        Ok(OpSig {
+            sigs: Arc::clone(&self.sigs),
+            op,
+        })
+    }
+}
+
+/// INVARIANTS #8 — one op's signature among an offer interface's, held by reference rather than
+/// copied, so a live call carries it for a reference count ([`LiveTarget::sig`]).
+#[derive(Clone)]
+pub struct OpSig {
+    sigs: Arc<[FuncType]>,
+    /// In range: [`LiveTarget::sig`] checked it, and `sigs` never changes.
+    op: usize,
+}
+
+impl OpSig {
+    /// A pager's `page`, `(i64) -> (i64)` ([`Host::has_pager_export`]): a page fault's reply is the
+    /// page's status.
+    fn page() -> OpSig {
+        static PAGE: std::sync::LazyLock<Arc<[FuncType]>> = std::sync::LazyLock::new(|| {
+            Arc::from([FuncType {
+                params: vec![ValType::I64],
+                results: vec![ValType::I64],
+            }])
+        });
+        OpSig {
+            sigs: Arc::clone(&PAGE),
+            op: 0,
+        }
+    }
+
+    pub fn params(&self) -> &[ValType] {
+        &self.sigs[self.op].params
+    }
+
+    pub fn results(&self) -> &[ValType] {
+        &self.sigs[self.op].results
+    }
+}
+
+/// INVARIANTS #8 — the result slots a call through a live offer defines, for an op that declares
+/// `results` ([`LiveTarget::sig`]):
+/// - the handler's results, each handle granted from `callee`'s table into `caller`'s
+///   ([`translate_cap_slots`]; one naming nothing there faults the call, as at the instanced
+///   boundary), or none when the two are one powerbox, whose table they share;
+/// - for a transport failure, its errno in the first result when that is an integer, the rest zero;
+///   a `CapFault` trap when the op cannot carry it, its first result being no integer or absent.
+///
+/// A count other than the declared one, which a verified offer never answers, reads as
+/// [`push_results`] reads a host's: zero past the results, the extra dropped.
+pub fn complete_call(
+    reply: Reply,
+    results: &[ValType],
+    callee: &Mutex<Host>,
+    caller: &mut CallerHost,
+) -> Result<Vec<i64>, Trap> {
+    match reply {
+        Reply::Failed(errno) => failed_slots(errno, results),
+        Reply::Results(mut slots) => {
+            slots.resize(results.len(), 0);
+            if results.contains(&ValType::Cap) {
+                caller.with_callee(callee, |hg, cg| match cg {
+                    Some(cg) => translate_cap_slots(cg, hg, results, &mut slots),
+                    None => Ok(()),
+                })?;
+            }
+            Ok(slots)
+        }
+    }
+}
+
+/// INVARIANTS #8 — a transport failure's errno as the results of a call whose op declares `results`:
+/// in the first when it is an integer, the rest zero; a `CapFault` trap when it is not, or is absent.
+pub fn failed_slots(errno: i64, results: &[ValType]) -> Result<Vec<i64>, Trap> {
+    match results.first() {
+        Some(ValType::I32 | ValType::I64) => {
+            let mut slots = vec![0; results.len()];
+            slots[0] = errno;
+            Ok(slots)
+        }
+        _ => Err(Trap::CapFault),
+    }
+}
+
+/// INVARIANTS #8 — a caller parked on a live call's reply ([`Sched::ticket_waiters`]): its op's
+/// signature, and the powerbox the call was made from, where a handle in the reply is granted.
+#[derive(Clone)]
+struct ReplyTo {
+    sig: OpSig,
+    caller: Arc<Mutex<Host>>,
+}
+
+impl ReplyTo {
+    /// Lay `reply`, answered by `callee`, out for this caller ([`complete_call`]): the slots of the
+    /// values its call defines.
+    fn complete(&self, reply: Reply, callee: &Arc<Mutex<Host>>) -> Result<Vec<i64>, Trap> {
+        let caller = &mut CallerHost::Cell(&self.caller);
+        complete_call(reply, self.sig.results(), callee, caller)
+    }
+
+    /// [`Self::complete`] for a transport failure, which carries no handle and so needs no callee.
+    fn fail(&self, errno: i64) -> Result<Vec<i64>, Trap> {
+        failed_slots(errno, self.sig.results())
+    }
+}
+
+/// [`Scheduler::cap_reply_or_stash`], with the scheduler locked: whether a worker needs waking.
+fn reply_locked(s: &mut Sched, ticket: u64, reply: Reply, callee: &Arc<Mutex<Host>>) -> bool {
+    let callee_id = {
+        let mut c = callee.lock_unpoisoned();
+        // #1862 — a page request answered without a settle (an error reply) drops its sink.
+        c.page_sinks.remove(&ticket);
+        c.svc_payers.remove(&ticket);
+        c.domain_id() as usize
+    };
+    match s.ticket_waiters.remove(&(callee_id, ticket)) {
+        Some((waiter, to)) => {
+            let out = to.complete(reply, callee);
+            deliver_reply(s, waiter, to, out)
+        }
+        None => {
+            // I40: the caller was reaped with this call in flight — drop the reply instead of
+            // stashing an entry into `svc_results` that nothing will ever claim. A handle in it
+            // stays the callee's: nothing is granted to a caller that is gone.
+            if !s.orphan_tickets.remove(&(callee_id, ticket)) {
+                callee.lock_unpoisoned().svc_results.insert(ticket, reply);
+            }
+            false
+        }
+    }
+}
+
+/// #2695 step 2 — an **activation** of resting domain `key`: a call of op `op` of export `export`
+/// with `args` (i64 slots), run as a new fiber in the domain at the op's handler, called with
+/// exactly those arguments. It runs on the caller's thread: the caller funds it (`fuel`; the domain's
+/// own when no caller does), and it costs the domain no thread of its own. It starts with the
+/// thread-local word the domain's main thread left, and under `Single` (the default) the domain's
+/// activations run one at a time, each until it parks ([`gate_key`]). Its return replies, `to`; its
+/// trap or exit ends the domain, as any member's does. A call of another arity than its handler is
+/// refused `-EINVAL`, as a serve loop refuses one; one past the run's vCPU cap, `-EAGAIN`.
+#[allow(clippy::too_many_arguments)]
+fn activation(
+    sched: &Arc<Scheduler>,
+    s: &mut Sched,
+    key: usize,
+    export: u32,
+    op: u32,
+    args: &[i64],
+    fuel: Option<Fuel>,
+    to: AnswerTo,
+) -> Result<Box<VCpu>, i64> {
+    if s.shutdown || s.dead.contains_key(&key) {
+        return Err(CAP_REVOKED);
+    }
+    let r = s.resting.get(&key).ok_or(CAP_REVOKED)?;
+    let funcs = &r.domain.funcs;
+    let f = (r.domain.host.lock_unpoisoned().svc_handler_func(export, op))
+        .filter(|&f| {
+            funcs
+                .get(f as usize)
+                .is_some_and(|f| f.params.len() == args.len())
+        })
+        .ok_or(EINVAL)?;
+    let vals: Vec<Value> = (funcs[f as usize].params.iter().zip(args))
+        .map(|(&ty, &slot)| slot_to_val(ty, slot))
+        .collect();
+    let (domain, mem, tls) = (
+        Arc::clone(&r.domain),
+        r.mem.as_ref().map(Mem::fork_for_thread),
+        r.tls,
+    );
+    let (fuel, home) = (
+        fuel.unwrap_or_else(|| r.home.for_thread()),
+        r.home.for_thread(),
+    );
+    let sref = SchedRef::Real(Arc::clone(sched));
+    let made = sched.adopt_locked(s, move |id| {
+        let mut v = VCpu::new(domain, f, &vals, mem, fuel, 0, id, sref);
+        v.tls = tls;
+        v.answers = Some(Answers { to, home });
+        Box::new(v)
+    });
+    made.ok_or(EAGAIN)
+}
+
+/// #2695 step 2 — the queued call `d` on resting domain `key` as an [`activation`], funded by the
+/// caller its enqueue named ([`Host::svc_payers`]). A refusal answers the call at once.
+fn queued_activation(
+    sched: &Arc<Scheduler>,
+    s: &mut Sched,
+    key: usize,
+    d: SvcDispatch,
+    host: &Arc<Mutex<Host>>,
+) -> Option<Box<VCpu>> {
+    let payer = host.lock_unpoisoned().svc_payers.remove(&d.ticket);
+    let to = AnswerTo::Ticket(d.ticket);
+    let fuel = payer.map(Fuel::drawn);
+    match activation(sched, s, key, d.export, d.op, &d.args, fuel, to) {
+        Ok(v) => Some(v),
+        Err(errno) => {
+            reply_locked(s, d.ticket, Reply::Failed(errno), host);
+            None
+        }
+    }
+}
+
+/// #2695 step 2 — whether a thread of domain `key` is parked in `svc.wait`. A resting domain whose
+/// thread serves leaves its calls to it: the guest chose to serve them so.
+fn serves(s: &Sched, key: usize) -> bool {
+    (s.svc_waiters.get(&key)).is_some_and(|q| q.iter().any(|(k, _)| *k == SvcPark::Consumer))
+}
+
+/// #2695 step 2 — every call queued on resting domain `key` as an [`activation`], for the workers:
+/// the calls that waited while its entry ran, and any whose caller did not start its own.
+fn serve_resting(sched: &Arc<Scheduler>, s: &mut Sched, key: usize) {
+    let Some(r) = s.resting.get(&key).filter(|_| !serves(s, key)) else {
+        return;
+    };
+    let host = Arc::clone(&r.domain.host);
+    let queued: Vec<SvcDispatch> = host.lock_unpoisoned().svc_queue.drain(..).collect();
+    for d in queued {
+        if let Some(v) = queued_activation(sched, s, key, d, &host) {
+            s.runnable.push_back(v);
+            sched.work.notify_one();
+        }
+    }
+}
+
+/// INVARIANTS #8 — hand a live call's laid-out reply ([`ReplyTo::complete`]) to the caller parked on
+/// it, `to`: a vCPU resumes with it ([`Pending::Reply`]), a fiber is woken with it
+/// ([`FiberRegistry::wake_reply`]). Whether a worker needs waking.
+fn deliver_reply(s: &mut Sched, waiter: Waiter, to: ReplyTo, out: Result<Vec<i64>, Trap>) -> bool {
+    match waiter {
+        Waiter::VCpu(mut v) => {
+            v.pending = Some(Pending::Reply { out, sig: to.sig });
+            s.runnable.push_back(v);
+            true
+        }
+        Waiter::Fiber { reg, slot, svc, .. } => {
+            reg.wake_reply(slot, out, &to.sig);
+            svc_wake_locked(s, svc)
+        }
+    }
 }
 
 // The `Host` *is* the region minter — the narrow authority a `HostProcRegion` handler is handed. It
@@ -24990,6 +25810,10 @@ pub struct Host {
     /// enqueuer), per the pinned §3.6 design. Enqueued embedder-side this slice
     /// ([`Host::svc_enqueue`]); the cross-domain caller side is the §3.6 caller-parking slice.
     svc_queue: VecDeque<SvcDispatch>,
+    /// #2695 step 2 — who pays for each call queued on this domain while its embedder holds it
+    /// ([`HeldDomain`]): its caller's fuel node, by ticket. The call runs as an activation on its
+    /// caller's thread, drawing from it.
+    pub(crate) svc_payers: BTreeMap<u64, NodeRef>,
     /// #1901 — the reply each live call a freeze abandoned was waiting on, by shadow context. The
     /// dispatch stayed with its callee, so the context's re-issued call waits on this ticket instead
     /// of enqueueing the call again. Cut data: it rides the serve section.
@@ -24998,8 +25822,9 @@ pub struct Host {
     /// replies to`. The handler rides as a fiber; this is its reply linkage, which rides the serve
     /// section, and which the thaw's serve loop adopts to resume it.
     frozen_handlers: BTreeMap<u32, u64>,
-    /// Completion cells for served dispatches, keyed by ticket ([`Host::svc_result`] drains).
-    svc_results: BTreeMap<u64, i64>,
+    /// Completion cells for served dispatches, keyed by ticket ([`Host::svc_result`] drains): each
+    /// reply a caller has not taken yet (INVARIANTS #8).
+    svc_results: BTreeMap<u64, Reply>,
     /// §2.2 / #1862 — where each in-flight `page(addr)` request on this domain lands, by ticket:
     /// filed with the request ([`Host::request_page`]), taken at its settle
     /// ([`Host::settle_page`]) or dropped by an error reply that settles nothing. Never cut data:
@@ -25026,6 +25851,8 @@ pub struct Host {
     /// default ⇒ today's enqueue+park transport, byte-identical. The `handoff-on ≡ handoff-off`
     /// differential pin toggles exactly this.
     handoff: bool,
+    /// #2695 step 2 — the link to the embedder holding this domain ([`HeldDomain`]), while it does.
+    held: Option<Arc<HeldLink>>,
     /// DURABILITY.md §13.3 — this domain's **stable identity** for every serve-path key
     /// (`svc_waiters`/`svc_timers` keys, fiber waiters' domain field, `svc_wake` targets):
     /// process-unique, minted at construction. The `Arc` pointer it replaces was
@@ -25925,6 +26752,7 @@ impl Host {
             self_instance: None,
             self_reified: BTreeMap::new(),
             svc_queue: VecDeque::new(),
+            svc_payers: BTreeMap::new(),
             svc_results: BTreeMap::new(),
             page_sinks: BTreeMap::new(),
             pager: None,
@@ -25934,6 +26762,7 @@ impl Host {
             frozen_handlers: BTreeMap::new(),
             svc_next_ticket: 0,
             handoff: false,
+            held: None,
             domain_id: NEXT_DOMAIN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             serve_ctx: 0,
             park_hub: 0,
@@ -27597,6 +28426,11 @@ impl Host {
         self.handoff
     }
 
+    /// #2695 step 2 — the link to the embedder holding this domain ([`HeldDomain`]), while it does.
+    pub(crate) fn held_link(&self) -> Option<Arc<HeldLink>> {
+        self.held.clone()
+    }
+
     /// #1458 — capture every host capability's declared state, positionally over `host_procs`
     /// (`None` where a capability isn't [`CapState::Captured`]). The in-session half of a moment: pair with
     /// [`restore_cap_states`](Host::restore_cap_states) to rewind the capabilities alongside the
@@ -28999,10 +29833,16 @@ impl Host {
         self.workers = Some(n.max(1));
     }
 
+    /// The workers the driver running this domain has ([`Host::set_workers`]): unset, the real
+    /// pool's size ([`pool_workers`]). The JIT's child pool holds no more (temen#1991).
+    pub fn workers(&self) -> usize {
+        self.workers.unwrap_or_else(pool_workers)
+    }
+
     /// How many of this domain's vCPUs may run at once, as `self.parallelism` answers it: the workers
     /// its driver has ([`Host::set_workers`]), bounded by its lane cap when it has one (D66).
     pub fn parallelism(&self) -> i64 {
-        let workers = self.workers.unwrap_or_else(pool_workers) as i64;
+        let workers = self.workers() as i64;
         if self.lane_cap >= 0 {
             workers.min(self.lane_cap)
         } else {
@@ -30184,8 +31024,24 @@ impl Host {
     /// **fail-closed** when the queue is full (backpressure is the enqueuer's problem, probeable)
     /// or the target isn't a well-formed offer op of the registered self module. Embedder-side
     /// this slice; a cross-domain caller's enqueue is the §3.6 caller-parking slice.
+    /// [`Self::svc_enqueue`] for a caller drawing on `payer`, whom a held domain charges the call to
+    /// ([`Self::svc_payers`]).
+    fn svc_enqueue_paid(
+        &mut self,
+        export: u32,
+        op: u32,
+        args: Vec<i64>,
+        payer: Option<NodeRef>,
+    ) -> Option<u64> {
+        let ticket = self.svc_enqueue(export, op, args)?;
+        if let (Some(p), Some(_)) = (payer, &self.held) {
+            self.svc_payers.insert(ticket, p);
+        }
+        Some(ticket)
+    }
+
     pub fn svc_enqueue(&mut self, export: u32, op: u32, args: Vec<i64>) -> Option<u64> {
-        if self.svc_queue.len() >= SVC_QUEUE_CAP || self.svc_handler_func(export, op).is_none() {
+        if !self.svc_admits(export, op) {
             return None;
         }
         let ticket = self.svc_next_ticket;
@@ -30197,6 +31053,12 @@ impl Host {
             ticket,
         });
         Some(ticket)
+    }
+
+    /// Whether [`Host::svc_enqueue`] would take a dispatch of op `op` of export `export`: the queue has
+    /// room, and the op is a well-formed offer op of the registered self module.
+    pub(crate) fn svc_admits(&self, export: u32, op: u32) -> bool {
+        self.svc_queue.len() < SVC_QUEUE_CAP && self.svc_handler_func(export, op).is_some()
     }
 
     /// §2.2 / #1862 — enqueue a demand child's `page(addr)` request on pager export `export`, the
@@ -30273,9 +31135,9 @@ impl Host {
         self.jit_paging.clone()
     }
 
-    /// Take a served dispatch's result (first result slot; `0` for a no-result handler).
-    /// `None` while unserved — the completion cell is filled at the `svc.poll` that ran it.
-    pub fn svc_result(&mut self, ticket: u64) -> Option<i64> {
+    /// Take a served dispatch's reply (INVARIANTS #8): the handler's results, or the transport's
+    /// failure. `None` while unserved — the completion cell is filled at the `svc.poll` that ran it.
+    pub fn svc_result(&mut self, ticket: u64) -> Option<Reply> {
         self.svc_results.remove(&ticket)
     }
 
@@ -30283,17 +31145,25 @@ impl Host {
     /// `(queue, completion cells, next ticket)`. Plain data (the §13.2 inventory row
     /// "serialize as-is"); the completion cells come out in ascending-ticket order (the
     /// `BTreeMap` iteration), which is the artifact's canonical order.
-    pub fn svc_state(&self) -> (Vec<SvcDispatch>, Vec<(u64, i64)>, u64) {
+    pub fn svc_state(&self) -> (Vec<SvcDispatch>, Vec<(u64, Reply)>, u64) {
         (
             self.svc_queue.iter().cloned().collect(),
-            self.svc_results.iter().map(|(&t, &v)| (t, v)).collect(),
+            self.svc_results
+                .iter()
+                .map(|(&t, r)| (t, r.clone()))
+                .collect(),
             self.svc_next_ticket,
         )
     }
 
     /// DURABILITY.md §13.4 step 3 — restore this domain's serve state from a snapshot's
     /// serve section (the inverse of [`Host::svc_state`]). Replaces whatever is present.
-    pub fn set_svc_state(&mut self, queue: Vec<SvcDispatch>, results: Vec<(u64, i64)>, next: u64) {
+    pub fn set_svc_state(
+        &mut self,
+        queue: Vec<SvcDispatch>,
+        results: Vec<(u64, Reply)>,
+        next: u64,
+    ) {
         self.svc_queue = queue.into();
         self.svc_results = results.into_iter().collect();
         self.svc_next_ticket = next;
@@ -30362,11 +31232,11 @@ impl Host {
             .map(|d| (d.export, d.op, d.args, d.ticket))
     }
 
-    /// I36 slice 3 — settle ticket `ticket`'s completion cell with `v`: the embedder serve
+    /// I36 slice 3 — settle ticket `ticket`'s completion cell with `reply`: the embedder serve
     /// loop's counterpart of the eval-loop settle (the enqueuer claims it via
     /// [`Host::svc_result`]).
-    pub fn svc_settle(&mut self, ticket: u64, v: i64) {
-        self.svc_results.insert(ticket, v);
+    pub fn svc_settle(&mut self, ticket: u64, reply: Reply) {
+        self.svc_results.insert(ticket, reply);
     }
 
     /// I36 slice 3 — the handler [`FuncIdx`] a queued `(export, op)` dispatch runs, for the
@@ -30612,29 +31482,24 @@ impl Host {
     /// pre-dispatch probe (an ordinarily-bound slot answers `None` and flows to the ordinary
     /// dispatch); the consumer's op offsets from `base_op` (flat/identity mapping this slice —
     /// coverage-remapped grouped bindings ride a later slice).
-    fn import_live_target(&self, i: u32) -> Option<(Arc<Mutex<Host>>, u32, u32)> {
+    fn import_live_target(&self, i: u32) -> Option<(LiveTarget, u32)> {
         let b = self.import_binding(i)?;
         if !b.bound {
             return None;
         }
-        match self.resolve(b.handle, b.type_id) {
-            Ok(Binding::LiveImpl(idx)) => self
-                .live_impls
-                .get(idx as usize)
-                .map(|e| (Arc::clone(&e.callee), e.export, b.op)),
-            _ => None,
-        }
+        Some((self.live_impl_of(b.handle, b.type_id)?, b.op))
     }
 
     /// The live-callee target behind `handle` iff it resolves to a [`Binding::LiveImpl`] of the
     /// right `type_id` — the eval loop's pre-dispatch probe (a non-LiveImpl handle answers
     /// `None` and flows to the ordinary dispatch).
-    pub fn live_impl_of(&self, handle: i32, type_id: u32) -> Option<(Arc<Mutex<Host>>, u32)> {
+    pub fn live_impl_of(&self, handle: i32, type_id: u32) -> Option<LiveTarget> {
         match self.resolve(handle, type_id) {
-            Ok(Binding::LiveImpl(i)) => self
-                .live_impls
-                .get(i as usize)
-                .map(|e| (Arc::clone(&e.callee), e.export)),
+            Ok(Binding::LiveImpl(i)) => self.live_impls.get(i as usize).map(|e| LiveTarget {
+                callee: Arc::clone(&e.callee),
+                export: e.export,
+                sigs: Arc::clone(&e.sigs),
+            }),
             _ => None,
         }
     }
@@ -38192,12 +39057,18 @@ fn val_to_slot(v: Value) -> i64 {
 /// Results past the declared ones are dropped. Every engine defines the same: the Cranelift JIT's
 /// result slots start zeroed, and the bytecode engine zeroes its result registers.
 fn push_results(vals: &mut Vals, results: &[i64], declared: &[ValType]) {
-    vals.extend(
-        declared
-            .iter()
-            .enumerate()
-            .map(|(i, &ty)| Reg::from_value(slot_to_val(ty, results.get(i).copied().unwrap_or(0)))),
-    );
+    vals.extend(result_regs(results, declared));
+}
+
+/// The registers `results` define as `declared` values ([`push_results`]).
+pub(crate) fn result_regs<'a>(
+    results: &'a [i64],
+    declared: &'a [ValType],
+) -> impl Iterator<Item = Reg> + 'a {
+    declared
+        .iter()
+        .enumerate()
+        .map(|(i, &ty)| Reg::from_value(slot_to_val(ty, results.get(i).copied().unwrap_or(0))))
 }
 
 fn slot_to_val(ty: ValType, s: i64) -> Value {
@@ -40491,17 +41362,17 @@ mod orphan_reply_tests {
         let cid = callee.lock().unwrap().domain_id() as usize;
 
         // Live caller (no orphan record): the reply is stashed in the completion cell to claim.
-        sched.cap_reply_or_stash(1, 99, &callee);
+        sched.cap_reply_or_stash(1, Reply::Results(vec![99]), &callee);
         assert_eq!(
             callee.lock().unwrap().svc_result(1),
-            Some(99),
+            Some(Reply::Results(vec![99])),
             "a live caller's reply must be stashed for it to claim"
         );
 
         // Dead caller (ticket 2 recorded as an orphan when it was reaped): the reply is dropped, so
         // nothing accumulates in `svc_results`, and the one-shot orphan record is consumed.
         sched.lock().orphan_tickets.insert((cid, 2));
-        sched.cap_reply_or_stash(2, 42, &callee);
+        sched.cap_reply_or_stash(2, Reply::Results(vec![42]), &callee);
         assert_eq!(
             callee.lock().unwrap().svc_result(2),
             None,
@@ -40515,10 +41386,10 @@ mod orphan_reply_tests {
         // An orphan record for a *different* callee must not affect this one (the key includes the
         // callee domain — two callees can share a ticket number).
         sched.lock().orphan_tickets.insert((cid + 1, 3));
-        sched.cap_reply_or_stash(3, 7, &callee);
+        sched.cap_reply_or_stash(3, Reply::Results(vec![7]), &callee);
         assert_eq!(
             callee.lock().unwrap().svc_result(3),
-            Some(7),
+            Some(Reply::Results(vec![7])),
             "an orphan keyed on a different callee must not drop this callee's live reply"
         );
     }
@@ -40534,9 +41405,16 @@ mod orphan_reply_tests {
         let surviving_callee = dying_key + 1;
         {
             let mut s = sched.lock();
+            let to = ReplyTo {
+                sig: OpSig::page(),
+                caller: Arc::clone(&dying),
+            };
             s.ticket_waiters.insert(
                 (surviving_callee, 5),
-                Waiter::fiber(Arc::new(FiberRegistry::new()), 0, dying_key), // dying domain's parked caller,
+                (
+                    Waiter::fiber(Arc::new(FiberRegistry::new()), 0, dying_key), // dying domain's parked caller,
+                    to,
+                ),
             );
             s.orphan_tickets.insert((dying_key, 9)); // an orphan *for* the dying domain as callee
 

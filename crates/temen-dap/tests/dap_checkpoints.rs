@@ -313,7 +313,7 @@ block 3 (vi2: i64, vacc2: i64, vfd2: i64) {
 /// The **threaded** twin of [`FILE_WRITE_LOOP`]: the root opens nothing, each of two spawned workers
 /// opens the scratch file through `vm_fs` and appends bytes in a loop, accumulating into the shared
 /// counter at 16384. The scheduled engine's checkpoint consults the *same* `Host::admits_checkpoint`
-/// — over the root host and every `extra_envs` child — so admitting a named capability admits it here
+/// — over the root host and every child domain's — so admitting a named capability admits it here
 /// too; this pins that rather than assuming it (INVARIANTS #14).
 const FILE_WRITE_THREADS: &str = r#"
 memory 16

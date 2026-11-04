@@ -2567,6 +2567,22 @@ impl Translator {
         Ok(out)
     }
 
+    /// Every **`exportc` proc** a module defines, as `(leng symbol, C name)`: the procs C can call
+    /// by name. The linker needs them before any unit is translated, to give the ones a C library
+    /// calls the on-ramp's ABI, so this is a standalone scan like [`importc_procs`](Self::importc_procs).
+    pub fn exportc_procs(root: &Node) -> Result<Vec<(String, String)>, LengError> {
+        let mut out = Vec::new();
+        for item in root.args() {
+            if item.tag() == Some("proc") && !is_bodyless_proc(item) {
+                if let Some(c) = exportc_name(item.args().get(3)) {
+                    out.push((sym_def(&item.args()[0])?, c));
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     /// A module's procs under their stem-suffixed global names, mapped to their **declared scalar
     /// param [`ValType`]s and return [`ValType`]** — one param per nim param, in order, plus the
     /// return (`None` for a void/sret proc), exactly as [`proc_sig`](Self::proc_sig) /

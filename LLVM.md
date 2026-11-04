@@ -241,7 +241,10 @@ The MVP target is the subset the chibicc demos already exercise. Mapping sketch 
 - `trunc`/`zext`/`sext`/`fptrunc`/`fpext`/`fptosi`/`sitofp`/`bitcast`/`inttoptr`/`ptrtoint`
   → the §3b conversions (`wrap`/`extend`/`trunc_sat`/`reinterpret`/`ptr.from_int`/`to_int`).
 - `getelementptr` → `ptr.add` with the byte offset computed from `DataLayout` (constant
-  folded where possible; otherwise index-times-stride arithmetic).
+  folded where possible; otherwise index-times-stride arithmetic). When every use of a GEP is a
+  load's or store's address or another GEP's base, its constant part is those accesses' offset,
+  if it is at most the NULL guard; a static `alloca` used only that way has no value, just the
+  data-SP plus its frame offset (#2583).
 - `load`/`store` → typed `{i32,i64,f32,f64}.load/store` + narrow `load8/16`/`store8/16`
   (the access width drives narrow handling, §3b). `align`/`volatile`: alignment is a hint
   (§3b); `volatile` keeps the access in memory (no promotion — moot post-`mem2reg`).

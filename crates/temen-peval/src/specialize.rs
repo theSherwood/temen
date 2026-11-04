@@ -2318,6 +2318,29 @@ impl Spec<'_> {
                 out.push(Inst::IntCmp { ty, op, a, b });
                 Abs::Dyn(bump(rnext))
             }
+            // The immediate forms (#2585): `b` is the known `imm`.
+            Inst::IntBinImm { ty, op, a, imm } => {
+                let av = env[a as usize];
+                if let Abs::Const(x) = av {
+                    if let Some(k) = fold_int_bin(ty, op, x, Known::of_imm(ty, imm)) {
+                        return Ok(Some(Abs::Const(k)));
+                    }
+                }
+                let a = materialize(av, out, rnext);
+                out.push(Inst::IntBinImm { ty, op, a, imm });
+                Abs::Dyn(bump(rnext))
+            }
+            Inst::IntCmpImm { ty, op, a, imm } => {
+                let av = env[a as usize];
+                if let Abs::Const(x) = av {
+                    if let Some(k) = fold_int_cmp(ty, op, x, Known::of_imm(ty, imm)) {
+                        return Ok(Some(Abs::Const(k)));
+                    }
+                }
+                let a = materialize(av, out, rnext);
+                out.push(Inst::IntCmpImm { ty, op, a, imm });
+                Abs::Dyn(bump(rnext))
+            }
             Inst::IntUn { ty, op, a } => {
                 let av = env[a as usize];
                 if let Abs::Const(x) = av {

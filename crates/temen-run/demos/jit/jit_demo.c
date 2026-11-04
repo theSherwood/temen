@@ -130,7 +130,7 @@ static long emit_unit(Ins *prog, char *buf, int abi_sp) {
   eb(buf, 'T'); eb(buf, 'E'); eb(buf, 'M'); eb(buf, 'E'); eb(buf, 'N');
   eb(buf, 0); eb(buf, 0); eb(buf, 0);
   eb(buf, 0); eb(buf, 0);                 // kind = module
-  eb(buf, (15) & 0xff); eb(buf, (15) >> 8); // version (u16)
+  eb(buf, (16) & 0xff); eb(buf, (16) >> 8); // version (u16)
   eb(buf, 0); eb(buf, 0); eb(buf, 0); eb(buf, 0); // flags
   // Memory descriptor: present, size_log2 17. The validator's memory-match precondition
   // requires the blob to declare the SAME window as this module — chibicc keeps a small
@@ -158,28 +158,28 @@ static long emit_unit(Ins *prog, char *buf, int abi_sp) {
   for (int k = 0; k < nparams; k++)
     eb(buf, 1);
   eb(buf, 0); // no captures (v14)
-  // Instruction count: ADDB/MULB are one binop; ADDK/MULK are a const + a binop.
+  // Instruction count: one per op (ADDK/MULK carry their constant as an immediate).
   long ni = 0;
   for (int i = 0; prog[i].op != OP_END; i++)
-    ni += (prog[i].op == OP_ADDK || prog[i].op == OP_MULK) ? 2 : 1;
+    ni++;
   uleb(buf, ni);
-  // The straight-line body. Opcodes mirror temen-encode: 0x11 = i64.const (+ sleb immediate);
-  // 0x40 + BinOp index = i64 binop (add = 0x40, mul = 0x42) + uleb operand indices.
+  // The straight-line body. Opcodes mirror temen-encode (v16): an i64 binop with an immediate is
+  // 0x40 + BinOp index (add = 0x40, mul = 0x42), then a uleb operand index and an sleb immediate; one
+  // of two values is 0x4F, then the BinOp index (add = 0, mul = 2) and two uleb operand indices.
   long acc = a_idx;
   long next = nparams; // results follow the block params
   for (int i = 0; prog[i].op != OP_END; i++) {
-    long rhs;
     int mul = (prog[i].op == OP_MULB || prog[i].op == OP_MULK);
     if (prog[i].op == OP_ADDK || prog[i].op == OP_MULK) {
-      eb(buf, 0x11);
+      eb(buf, mul ? 0x42 : 0x40);
+      uleb(buf, acc);
       sleb(buf, prog[i].k);
-      rhs = next++;
     } else {
-      rhs = b_idx;
+      eb(buf, 0x4F);
+      eb(buf, mul ? 2 : 0);
+      uleb(buf, acc);
+      uleb(buf, b_idx);
     }
-    eb(buf, mul ? 0x42 : 0x40);
-    uleb(buf, acc);
-    uleb(buf, rhs);
     acc = next++;
   }
   // return <acc>

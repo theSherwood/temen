@@ -1155,7 +1155,7 @@ pub extern "C" fn temen_par_powerbox_none() {
 }
 
 /// Borrow the published I/O powerbox (`None` until [`temen_par_powerbox_io`] ran). Leaked; interior
-/// mutability is the `Mutex` (cross-Worker-safe on wasm atomics, like the `Domain`'s `ModuleSource`).
+/// mutability is the `Mutex` (cross-Worker-safe on wasm atomics, like a run's `ModuleSource`).
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 fn par_io() -> Option<&'static ParIoCfg> {
     let p = PAR_IO.load(std::sync::atomic::Ordering::Acquire) as *const ParIoCfg;

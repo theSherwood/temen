@@ -11,7 +11,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 - 🚧 **Not yet (parity not achieved)** — a real gap this backend could close but hasn't.
 - 🔶 **Conditional** — Full where a build/target cfg holds, Declines elsewhere (the note names the condition).
 
-**463 ops.** Across the two JIT columns: 859 ✅ Full · 53 ⛔ Declines · 3 🚧 Not-yet · 11 🔶 Conditional.
+**513 ops.** Across the two JIT columns: 959 ✅ Full · 53 ⛔ Declines · 3 🚧 Not-yet · 11 🔶 Conditional.
 
 ## scalar integer
 
@@ -43,6 +43,31 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 | `i32.gt_u` | ✅ | ✅ | ✅ | ✅ |  |
 | `i32.ge_s` | ✅ | ✅ | ✅ | ✅ |  |
 | `i32.ge_u` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.add imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.sub imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.mul imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.div_s imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.div_u imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.rem_s imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.rem_u imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.and imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.or imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.xor imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.shl imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.shr_s imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.shr_u imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.rotl imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.rotr imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.eq imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.ne imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.lt_s imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.lt_u imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.le_s imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.le_u imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.gt_s imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.gt_u imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.ge_s imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i32.ge_u imm` | ✅ | ✅ | ✅ | ✅ |  |
 | `i32.clz` | ✅ | ✅ | ✅ | ✅ |  |
 | `i32.ctz` | ✅ | ✅ | ✅ | ✅ |  |
 | `i32.popcnt` | ✅ | ✅ | ✅ | ✅ |  |
@@ -76,6 +101,31 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 | `i64.gt_u` | ✅ | ✅ | ✅ | ✅ |  |
 | `i64.ge_s` | ✅ | ✅ | ✅ | ✅ |  |
 | `i64.ge_u` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.add imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.sub imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.mul imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.div_s imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.div_u imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.rem_s imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.rem_u imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.and imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.or imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.xor imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.shl imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.shr_s imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.shr_u imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.rotl imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.rotr imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.eq imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.ne imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.lt_s imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.lt_u imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.le_s imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.le_u imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.gt_s imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.gt_u imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.ge_s imm` | ✅ | ✅ | ✅ | ✅ |  |
+| `i64.ge_u imm` | ✅ | ✅ | ✅ | ✅ |  |
 | `i64.clz` | ✅ | ✅ | ✅ | ✅ |  |
 | `i64.ctz` | ✅ | ✅ | ✅ | ✅ |  |
 | `i64.popcnt` | ✅ | ✅ | ✅ | ✅ |  |

@@ -311,16 +311,40 @@ found (#2603):
   moves `rsp` by what the callee pops (a `Tail` callee its stack arguments). The callee is known only
   from a relocation, a vmctx cell, or a fn-table entry whose type the code checked; any other is
   rejected.
+- A host call's arguments are checked against its contract (#2534): a host function confines guest
+  pointers against the window values the code hands it, so an argument the contract tags `WindowBase`
+  must be `mem_base`, `Vmctx` must be `vmctx`, and a caller-frame buffer must be a known frame slot,
+  never a guest value — a wrong register would move the window the host trusts or hand it a forged
+  pointer. The caller's spill slots survive the call: a host callee writes the caller's stack only
+  through a *write*-buffer pointer its contract names, so exactly that buffer's slots are dropped; a
+  *read* buffer it only reads (GcRoots' marshalling struct) drops nothing; and the context-pointer
+  spills (`mem_base`, `vmctx`, the fuel cell) survive either way. A frame pointer the contract does
+  not model forces a full clear, the sound fallback — so every host call that hands the host a
+  caller-frame pointer in an argument register is tagged (the fiber and thread status words in
+  `rdx`/`rcx`/`r8`, the signal record in `rsi`, GcRoots' struct in `rdi`), or that fallback fires
+  needlessly and, once the validator is fail-closed (#2536), could refuse sound thread/fiber/GC code.
+  The `call.cap` marshalling buffers ride the stack (past the sixth argument) and are tagged in a
+  later #2534 slice, when stack-passed arguments carry facts.
 - A type check proves something only on its equal edge, and only of the record whose type id it
   loaded: every register still holding that record's address. A record never changes, so the proof
   outlives a call in a register the callee keeps. `test r, r` is exactly `cmp r, 0`.
 - A relocation is honored only on a call's `rel32` or a `movabs`'s `imm64`, and the bytes it patches
   are never read as a fact. A jump table's targets hold on every execution because they are derived
   in their block alone, from no assumption, behind the clamp the `cmov` rule confines.
-- An access is checked at its exact width, which the decoder reports and the tests cross-check
-  against iced-x86; where it doesn't know one, the widest.
+- An access is checked at its exact width and direction (read vs write), which the decoder reports;
+  where it doesn't know a width, the widest. Every GP register a form writes is reported too, so a
+  stale fact (`mem_base`, a confined index) cannot survive a real overwrite — including the second
+  destination the BMI VEX forms write in `vvvv` (`mulx`, `blsi`/`blsr`/`blsmsk`) and the lane/mask
+  extracts to a GP register (`pextr*`, `movmskps`, `cvt*2si`, `movd`-to-GP).
+- The decoder's coverage of what Cranelift can emit is pinned by a **completeness oracle** (#2603
+  hole 17): a test synthesizes every form in Cranelift's own x64 assembler DSL
+  (`cranelift-assembler-x64-meta`, what the backend's encoder is generated from) and checks the
+  decoder either rejects it or agrees with iced-x86 on its length, its memory operand and direction,
+  its GP write-set, and its control flow. A Cranelift upgrade that adds an encoding the decoder does
+  not model fails that test, not a user's compile.
 - A form whose address isn't `[base + index·scale + disp]` (fs/gs, `0x67`, `xlat`, `bt* [mem], reg`)
-  is rejected, not modeled.
+  is rejected, not modeled; so is an EVEX compressed-`disp8` operand, whose scale is a per-form
+  property the bytes don't carry (Cranelift's pool/stack operands use `disp0`/`disp32`).
 - The native frame is confined by the overflow check (I5), not the window mask. The check is
   recognized by the facts it compares — a stack pointer `RED_ZONE` below the current `rsp` against
   `stack_limit` — so both the `mov r,rsp; add r,-RED_ZONE` and `lea r,[rsp−RED_ZONE]` forms qualify;
@@ -328,7 +352,8 @@ found (#2603):
   prologue/trap **safepoint** is exempt — a bounded call the same `RED_ZONE` margin covers, like the
   pre-check register spills (`STACK_GUARD.md`): the fuel refill rides the prologue fuel check
   *before* the overflow check, and `emit_trap`'s `-g` `trap_capture` call rides each trap path (its
-  safepoint contract lands with the host-call contracts in PR 3b). A frame deeper than `RED_ZONE`
+  safepoint contract lands with the remaining host-call contracts in a later #2534 slice; no
+  validated build emits it, since it needs `-g`). A frame deeper than `RED_ZONE`
   below entry is rejected, bounding every stack access the frame policy admits.
 
 **Spectre.** Window indices are confined only branchlessly (a `cmov`, a mask, a constant), so the
@@ -629,6 +654,14 @@ security — UB in a sandbox IR would void the escape guarantee.
   popcnt`.
 - **Integer compare** (→ i32 0/1): `eq ne lt_s lt_u le_s le_u gt_s gt_u ge_s ge_u
   eqz`.
+- **Immediate operands** (#2585): a binary integer op or a compare may carry its right operand
+  as a constant instead of naming a value (`v2 = i32.add v0 5`; `IntBinImm`, `IntCmpImm`), with
+  the same semantics as the constant it stands for. An `i32` immediate is held sign-extended, and
+  the verifier rejects one that isn't. Producers emit the register form and run
+  `fold_immediates` after `raise`: it moves each constant of an op's own block into the op (a
+  commutative op swaps its operands, a compare turns around) and deletes the constants nothing
+  else reads. Constants were a third of all instructions, three quarters of them read once by an
+  integer op.
 - **Float arithmetic** (f32/f64, IEEE 754, no traps): `add sub mul div sqrt min max
   abs neg ceil floor trunc nearest copysign fma` (`min`/`max` are wasm-identical:
   NaN-propagating, with `-0 < +0` — *not* IEEE minNum; `nearest` rounds ties to
@@ -2055,8 +2088,9 @@ numbers:
 1. *Registration declares blockingness* (`ProcHandler::Offloadable`, the `HostProcEntry`
    per-entry-powers pattern): the handler decides per call — `Done` inline (the fast case pays
    nothing) or `Offload` a self-contained scalar job (the io_uring try-nonblocking model). Scalars
-   only, **no window access** (the pool never touches the window), single-`i64` replies
-   (invariant 8). The test-only `Blocking` cap is the exerciser.
+   only, **no window access** (the pool never touches the window), single-`i64` replies (the
+   pool's own bound: a call into the host, not into a domain, so not INVARIANTS #8's reply
+   shape). The test-only `Blocking` cap is the exerciser.
 2. *Dispatch gains a third outcome* behind an out-param face (`cap_dispatch_slots_pending` →
    `Pending(completion_id)`, job handed to the offload pool, result posted to `Completions`);
    a call site that cannot park keeps the sync face and runs punts inline — decline-never-diverge
@@ -2251,7 +2285,7 @@ the async-first paragraph above, delivered. Identical on all three engines (inva
   `completion_waiters`; the recheck is `completion_drain` itself (insert-then-drain), so an
   answer that raced the park is delivered, and an animated offer handler's
   punt rides the CALLS-4b promotion branch by construction (its wake key IS `OfferPark`'s
-  resume key). Gates: exactly-one-`i64` reply (the wake pushes one reg — invariant 8),
+  resume key). Gates: exactly-one-`i64` reply (the wake pushes a punted job's one reg),
   non-durable, `SchedRef::Real`.
 - *Bytecode (F2):* the punt surfaces as `Outcome::CapPending` (the `MemoryWait` channel) so
   each driver states its posture; the cooperative `drive` parks `FiberState::CapParked` with
@@ -2477,6 +2511,35 @@ prior work (fuel is a checked cross-engine quantity), bit-identical on every bac
 metering is read-before minus read-after. Deferred, named-consumer-gated: a per-call fuel cap
 (caller-side D19 attenuation) and an admission fuel floor (gate-side refusal when the caller
 can't fund a handler).
+
+### Held domains — a domain at rest takes calls as a library provider does  [BUILT on the tree-walker, #2695 step 2]
+
+A domain its embedder holds (`HeldDomain`) outlives its entry: once the entry returns, it
+**rests**. Its threads keep running, and it ends only when it ends itself (any member's exit or
+trap) or its embedder ends it. At rest it is what axis 1 calls a library provider, a domain with
+no running main, so each call into it, from its embedder or from a domain of its run, runs as an
+**activation**:
+
+- **A fiber in the callee**, at the op's handler, called with exactly the op's arguments. Its
+  control stack is the runtime's; any data stack lives in the guest's memory, the guest's to
+  manage.
+- **On the caller's thread**, which funds it (caller-pays, as above). It costs the callee no
+  thread: no vCPU of its own, no charge against the callee's vCPU ceiling. A thread it spawns is
+  the callee's, drawing on the callee's own fuel.
+- **Admitted by the callee's policy**: `Single`, run-to-park, serializes the domain's activations
+  against each other, never against its own threads. The tree-walker builds that as a lane of
+  width 1 over the activations (D66's mechanism: held across a quantum's end, given back at a
+  park).
+- **With the thread-local word the domain's main thread left** (`vcpu.tls`). Under `Single` the
+  calls run one at a time, as that thread would run them. The caller's word would name the
+  caller's memory.
+- **No entry charge.** Fuel burns at its safepoints from the caller's budget, as a thread's does.
+
+A call that arrives while the entry still runs waits on the queue and runs once the domain rests,
+funded by its caller. A thread of the domain parked in `svc.wait` takes calls first: serving them
+there is the guest's choice. A handler's trap ends the domain (INVARIANTS #6). Every call it had
+not answered, and every later one, answers `CAP_REVOKED`, the embedder's included (rule (i)).
+While the domain is held, its run has no stall verdict, since the embedder can always call in.
 
 ### Invariants this holds
 
@@ -3997,26 +4060,37 @@ as a value with the budget un-spent (#1587).
 non-durable §14 child — the **detached** children of op 17 (and, until #1867, the **carve** children
 of ops 0/5/8/11/13, with the copy-in/`copy_back` below) — is a task — a platform-owned `FiberSlot` (in no guest table, spends no fiber quota)
 carrying the child's own window, trap cell and fiber execution context — on a pool of workers spawned
-on demand; any worker may resume it under the same single-owner claim guest fibers use (the D57
+as work waits with none free, never more than the host's driver has (#1991: `Host::workers`, by
+default the cores, as the interpreter's pool; a task that wakes one sibling leaves it to its own
+worker, which runs it next, and finds a worker only for a second); any worker may resume it
+under the same single-owner claim guest fibers use (the D57
 migration unsafe, no new one), each resume its own guard bracket over the *task's* fault range (R1),
 the per-thread state seeded and reset at both edges of every residency (R2: `CURRENT_RT`, `vcpu.tls`,
 the current-task word — all `#[inline(never)]` readers). A futex `wait` inside the child takes the
 existing "inside a fiber ⇒ park the fiber" arm unchanged (INVARIANTS #15: no second park mechanism);
-**one** wake reaches every parked task and each re-checks its own predicate in the loop it already
-has — `Domain::wake_all_parked` extended to tasks, so a `notify`, a vCPU exit, the §5 kill path and
-teardown all arrive by the same route, and an idle worker sweeps the parked set on the bounded
-`KILL_RECHECK` cadence to fire deadlines. No per-task waker, no second deadline store, no second
+**one** wake route reaches the parked tasks (`Domain::wake_child_tasks`), and each task it reaches
+re-checks its own predicate in the loop it already has: a vCPU exit, a child's end, the §5 kill path
+and teardown re-offer every parked task, a `notify` only those whose futex wait it claimed (#1991:
+the rest would re-check and park again, and with many tasks that was most of a busy run's work), and
+a worker sweeps the parked set on the bounded `KILL_RECHECK` cadence and fires passed deadlines,
+before each task it takes, at a quantum's end and when it wakes idle. No per-task waker, no second
+deadline store, no second
 runnable queue: the executor's whole state is a task map, a FIFO and the per-domain lane counts. Every
 resume is gated on the task's lane chain with `temen_ir::lanes` — the oracle's arithmetic — held
 exactly while on a worker and released the moment it parks, so a child of a cap-1 parent never overlaps
-a sibling and a parked one never wedges a runnable one (the two pins, `child_exec_jit.rs`). Run
+a sibling and a parked one never wedges a runnable one (the two pins, `child_exec_jit.rs`). **The pool
+preempts** (#1991), as the interpreter's does at its quantum: every task counts its fuel, metered or
+not (an unmetered chain hands it a quantum, 2¹⁶ safepoints, at a time). At each refill the task at
+the head of the queue gets a worker: a free one, a new one, or, once the pool is full, this one — the
+running task parks as runnable (`ParkOn::Yield`, which takes the whole task from whichever of its
+fibers the quantum ended in) and goes to the back of the queue, keeping its lanes as a preempted vCPU
+of the interpreter does (#2237). So the pool's cap stays invisible: a task that never parks still
+gives way, and nothing waits on it longer than a quantum. Run
 teardown poisons a task parked forever (its cell reads `DOMAIN_DONE`; it unwinds through its trailing
 guard — the interpreter's sweep, D37) instead of hanging the join. The child enters through a
 **limit-taking** variant of its one trampoline (`build_trampoline(.., with_limit)`, one flag not a
-second family), so its prologue checks guard the fiber stack. JIT frontier, still open on #1600: no
-preemption (a task that never parks holds its lane until it returns — the interpreter's quantum
-round-robin has no twin); the task stack is the fiber arena's 256 KiB slot (a `StackOverflow` trap,
-no longer a 2 MiB OS stack).
+second family), so its prologue checks guard the fiber stack. The task stack is the fiber arena's
+256 KiB slot (a `StackOverflow` trap, no longer a 2 MiB OS stack).
 
 *Broad lanes* (owner ruling 2026-09-21): a lane bounds **all** concurrency in a subtree, not only its
 child domains. The interpreter always read it that way — its `dispatch` gates `thread.spawn` siblings

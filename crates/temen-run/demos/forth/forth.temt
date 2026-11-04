@@ -18,7 +18,7 @@
 ; The kernel's own primitives are a flat table declared in the prelude (below) with the one
 ; hardwired defining word `prim <name> <kind> <nin> <nout> <payload>`:
 ;   kind 0 = installed word / kernel function (payload = call.dyn slot)
-;   kind 1 = i64 binop template (payload = opcode byte)   kind 3 = i64 compare (→ 0/1)
+;   kind 1 = i64 binop template (payload = BinOp index)   kind 3 = i64 compare (payload = CmpOp index; → 0/1)
 ;   kind 4 = load (payload = load opcode)                  kind 5 = store (payload = store opcode)
 ;   kind 6 = constant (payload = value; `variable`/`create`) kind 8 = i64.eqz (`0=`)
 ;   kind 7 = i64 atomic rmw `( n addr -- old )` (payload = rmw op)  kind 9 = cmpxchg `( exp new addr -- old )`
@@ -180,23 +180,23 @@ prim r@ 2 0 0 45
 prim char 2 0 0 46
 prim [char] 2 0 0 47
 prim pick 2 0 0 48
-prim + 1 2 1 64
-prim - 1 2 1 65
-prim * 1 2 1 66
-prim / 1 2 1 67
-prim mod 1 2 1 69
-prim and 1 2 1 71
-prim or 1 2 1 72
-prim xor 1 2 1 73
-prim lshift 1 2 1 74
-prim rshift 1 2 1 76
-prim = 3 2 1 81
-prim <> 3 2 1 82
-prim < 3 2 1 83
-prim u< 3 2 1 84
-prim <= 3 2 1 85
-prim > 3 2 1 87
-prim >= 3 2 1 89
+prim + 1 2 1 0
+prim - 1 2 1 1
+prim * 1 2 1 2
+prim / 1 2 1 3
+prim mod 1 2 1 5
+prim and 1 2 1 7
+prim or 1 2 1 8
+prim xor 1 2 1 9
+prim lshift 1 2 1 10
+prim rshift 1 2 1 12
+prim = 3 2 1 0
+prim <> 3 2 1 1
+prim < 3 2 1 2
+prim u< 3 2 1 3
+prim <= 3 2 1 4
+prim > 3 2 1 6
+prim >= 3 2 1 8
 prim 0= 8 1 1 80
 prim @ 4 1 1 241
 prim c@ 4 1 1 249
@@ -960,9 +960,11 @@ block 0 (x: i64) {
   }
 }
 
-; 23 emit_bin(op, a, b) -> v
-func (i64, i64, i64) -> (i64) {
-block 0 (op: i64, a: i64, b: i64) {
+; 23 emit_bin(fam, op, a, b) -> v: a register-form op of the family `fam` (79 = 0x4F, i64 binop;
+; 91 = 0x5B, i64 compare), then `op`, its BinOp or CmpOp index (wire v16).
+func (i64, i64, i64, i64) -> (i64) {
+block 0 (fam: i64, op: i64, a: i64, b: i64) {
+  call 6 (fam)
   call 6 (op)
   call 7 (a)
   call 7 (b)
@@ -1165,7 +1167,7 @@ block 0 (ni: i64, no: i64) {
   blp = i64.const 65736
   z = i64.const 0
   i64.store blp z
-  ; "TEMEN\0\0\0" kind=0 version=15 flags=0
+  ; "TEMEN\0\0\0" kind=0 version=16 flags=0
   c84 = i64.const 84
   call 30 (c84)
   c69 = i64.const 69
@@ -1180,8 +1182,8 @@ block 0 (ni: i64, no: i64) {
   call 30 (z)
   call 30 (z)
   call 30 (z)
-  fifteen = i64.const 15
-  call 30 (fifteen)
+  sixteen = i64.const 16
+  call 30 (sixteen)
   call 30 (z)
   call 30 (z)
   call 30 (z)
@@ -1940,7 +1942,8 @@ block 6 (pay: i64) {
   call 11 (two)
   b = call 12 ()
   a = call 12 ()
-  v = call 23 (pay, a, b)
+  fam = i64.const 79
+  v = call 23 (fam, pay, a, b)
   call 10 (v)
   return
   }
@@ -1949,7 +1952,8 @@ block 7 (pay: i64) {
   call 11 (two)
   b = call 12 ()
   a = call 12 ()
-  c = call 23 (pay, a, b)
+  fam = i64.const 91
+  c = call 23 (fam, pay, a, b)
   ext = i64.const 97
   v = call 27 (ext, c)
   call 10 (v)
@@ -3108,8 +3112,9 @@ func (i64) -> (i64) {
 block 0 (x: i64) {
   z = i64.const 0
   zv = call 22 (z)
-  ne = i64.const 82
-  c = call 23 (ne, x, zv)
+  cmpf = i64.const 91
+  ne = i64.const 1
+  c = call 23 (cmpf, ne, x, zv)
   return c
   }
 }
@@ -4042,10 +4047,12 @@ block 6 (h: i64, x: i64, islot: i64, floor: i64) {
   la = i64.add base loff
   lim = i64.load la
   onev = call 22 (one)
-  addop = i64.const 64
-  idx1 = call 23 (addop, idx, onev)
-  geop = i64.const 89
-  cond = call 23 (geop, idx1, lim)
+  binf = i64.const 79
+  cmpf = i64.const 91
+  addop = i64.const 0
+  idx1 = call 23 (binf, addop, idx, onev)
+  geop = i64.const 8
+  cond = call 23 (cmpf, geop, idx1, lim)
   i64.store ia idx1
   call 17 (cond, x, h)
   call 14 (x, floor)
@@ -4094,17 +4101,19 @@ block 10 (h: i64, x: i64, islot: i64, floor: i64) {
   loff = i64.mul lslot eight
   la = i64.add base loff
   lim = i64.load la
-  addop = i64.const 64
-  idx1 = call 23 (addop, idx, step)
-  subop = i64.const 65
-  od = call 23 (subop, idx, lim)
-  nnd = call 23 (subop, idx1, lim)
-  xorop = i64.const 73
-  cross = call 23 (xorop, od, nnd)
+  binf = i64.const 79
+  cmpf = i64.const 91
+  addop = i64.const 0
+  idx1 = call 23 (binf, addop, idx, step)
+  subop = i64.const 1
+  od = call 23 (binf, subop, idx, lim)
+  nnd = call 23 (binf, subop, idx1, lim)
+  xorop = i64.const 9
+  cross = call 23 (binf, xorop, od, nnd)
   zconst = i64.const 0
   zc = call 22 (zconst)
-  ltop = i64.const 83
-  cond = call 23 (ltop, cross, zc)
+  ltop = i64.const 2
+  cond = call 23 (cmpf, ltop, cross, zc)
   i64.store ia idx1
   call 17 (cond, x, h)
   call 14 (x, floor)

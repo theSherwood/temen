@@ -397,6 +397,183 @@ define i64 @run() {
     assert_eq!(run_ll_i64("field read a block later", ll), 42_007);
 }
 
+/// #2583: a constant address offset is the load's or store's own offset, not an `add` and a
+/// constant. `@fold` reads and writes a stack struct and a buffer through GEPs, chained and across
+/// blocks: every constant becomes an offset and it has no `add` left. `@keep` holds the GEPs and
+/// allocas that keep their add: a negative offset, one past the NULL guard, a GEP also passed to a
+/// call, φ incomings, and an alloca whose frame offset is past the guard.
+#[test]
+fn constant_address_offsets_fold_into_loads_and_stores() {
+    use temen_ir::{BinOp, Func, Inst, IntTy};
+    let offsets = |f: &Func| {
+        let mut v: Vec<u64> = (f.blocks.iter().flat_map(|b| &b.insts))
+            .filter_map(|i| match i {
+                Inst::Load { offset, .. } | Inst::Store { offset, .. } => Some(*offset),
+                _ => None,
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    // An add of a constant is an immediate form once the output is folded (#2585).
+    let adds = |f: &Func| {
+        (f.blocks.iter().flat_map(|b| &b.insts))
+            .filter(|i| {
+                matches!(
+                    i,
+                    Inst::IntBin {
+                        ty: IntTy::I64,
+                        op: BinOp::Add,
+                        ..
+                    } | Inst::IntBinImm {
+                        ty: IntTy::I64,
+                        op: BinOp::Add,
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+    let func = |t: &temen_llvm::Translated, name: &str| {
+        let (_, i) = (t.exports.iter().find(|(n, _)| n == name))
+            .unwrap_or_else(|| panic!("no export {name}"));
+        t.module.funcs[*i as usize].clone()
+    };
+
+    let fold = "\
+%S = type { i64, { i32, i32 }, [4 x i64] }
+define i64 @fold(ptr %p, i1 %c) {
+entry:
+  %s = alloca %S, align 8
+  %f0 = getelementptr inbounds %S, ptr %s, i64 0, i32 0
+  store i64 5, ptr %f0
+  %f1 = getelementptr inbounds %S, ptr %s, i64 0, i32 1, i32 1
+  store i32 7, ptr %f1
+  %arr = getelementptr inbounds %S, ptr %s, i64 0, i32 2
+  %e = getelementptr inbounds [4 x i64], ptr %arr, i64 0, i64 2
+  store i64 3, ptr %e
+  %q = getelementptr i8, ptr %p, i64 24
+  store i64 11, ptr %q
+  br i1 %c, label %then, label %join
+then:
+  %e2 = getelementptr inbounds [4 x i64], ptr %arr, i64 0, i64 2
+  store i64 14, ptr %e2
+  %q8 = getelementptr inbounds i8, ptr %q, i64 8
+  store i64 13, ptr %q8
+  br label %join
+join:
+  %a = load i64, ptr %f0
+  %b = load i32, ptr %f1
+  %x = load i64, ptr %e
+  %y = load i64, ptr %q
+  %z8 = getelementptr inbounds i64, ptr %p, i64 4
+  %z = load i64, ptr %z8
+  %bx = zext i32 %b to i64
+  %b4 = shl i64 %bx, 4
+  %x8 = shl i64 %x, 8
+  %y12 = shl i64 %y, 12
+  %z16 = shl i64 %z, 16
+  %r1 = or i64 %a, %b4
+  %r2 = or i64 %r1, %x8
+  %r3 = or i64 %r2, %y12
+  %r = or i64 %r3, %z16
+  ret i64 %r
+}
+define i64 @run() {
+  %buf = alloca [8 x i64], align 8
+  %z = getelementptr inbounds i64, ptr %buf, i64 4
+  store i64 0, ptr %z
+  %r0 = call i64 @fold(ptr %buf, i1 false)
+  %r1 = call i64 @fold(ptr %buf, i1 true)
+  %hi = shl i64 %r1, 20
+  %r = or i64 %r0, %hi
+  ret i64 %r
+}
+";
+    // `fold(false)` = 5 | 7<<4 | 3<<8 | 11<<12 | 0<<16; `fold(true)` reads 14 and 13 instead.
+    assert_eq!(run_ll_i64("folded offsets", fold), 0xB375 | 0xD_BE75 << 20);
+    let t = temen_llvm::translate_ll_str(fold).expect("translate");
+    let f = func(&t, "fold");
+    // The struct is at frame offset 0: field 0 at 0, field 1.1 at 12, the array's element 2 at 32.
+    // The buffer's GEPs are 24, 24 + 8, and 4 × 8.
+    assert_eq!(offsets(&f), [0, 0, 12, 12, 24, 24, 32, 32, 32, 32, 32]);
+    assert_eq!(adds(&f), 0, "every address constant is an offset");
+    // `join` reads `%f0`, `%f1` and `%e`, all the data-SP plus a constant, and `%q` and `%z8`, both
+    // `%p` plus one: it captures each source once.
+    for b in &f.blocks {
+        let mut sources = b.captures.clone();
+        sources.sort_unstable();
+        sources.dedup();
+        assert_eq!(sources.len(), b.captures.len(), "{:?}", b.captures);
+    }
+
+    let keep = "\
+define i64 @id(ptr %p) {
+  %v = ptrtoint ptr %p to i64
+  ret i64 %v
+}
+define i64 @keep(ptr %p, i1 %c) {
+entry:
+  %big = alloca [20480 x i8], align 8
+  %late = alloca i64, align 8
+  %far = getelementptr inbounds i8, ptr %big, i64 20000
+  store i64 1, ptr %far
+  store i64 6, ptr %late
+  %neg = getelementptr inbounds i8, ptr %p, i64 -8
+  %n = load i64, ptr %neg
+  %arg = getelementptr inbounds i8, ptr %p, i64 8
+  %w = load i64, ptr %arg
+  %ia = call i64 @id(ptr %arg)
+  %ip = ptrtoint ptr %p to i64
+  %d = sub i64 %ia, %ip
+  %g1 = getelementptr inbounds i8, ptr %p, i64 8
+  br i1 %c, label %join, label %other
+other:
+  %g2 = getelementptr inbounds i8, ptr %p, i64 16
+  br label %join
+join:
+  %ph = phi ptr [ %g1, %entry ], [ %g2, %other ]
+  %h = load i64, ptr %ph
+  %f = load i64, ptr %far
+  %l = load i64, ptr %late
+  %w4 = shl i64 %w, 4
+  %d8 = shl i64 %d, 8
+  %h12 = shl i64 %h, 12
+  %f16 = shl i64 %f, 16
+  %l20 = shl i64 %l, 20
+  %r1 = or i64 %n, %w4
+  %r2 = or i64 %r1, %d8
+  %r3 = or i64 %r2, %h12
+  %r4 = or i64 %r3, %f16
+  %r = or i64 %r4, %l20
+  ret i64 %r
+}
+define i64 @run() {
+  %buf = alloca [8 x i64], align 8
+  %b1 = getelementptr inbounds i64, ptr %buf, i64 1
+  store i64 2, ptr %b1
+  %b3 = getelementptr inbounds i64, ptr %buf, i64 3
+  store i64 4, ptr %b3
+  %b4 = getelementptr inbounds i64, ptr %buf, i64 4
+  store i64 5, ptr %b4
+  %p = getelementptr inbounds i64, ptr %buf, i64 2
+  %k1 = call i64 @keep(ptr %p, i1 true)
+  %k0 = call i64 @keep(ptr %p, i1 false)
+  %hi = shl i64 %k1, 24
+  %r = or i64 %k0, %hi
+  ret i64 %r
+}
+";
+    // `keep(c)` = 2 | 4<<4 | 8<<8 | (c ? 4 : 5)<<12 | 1<<16 | 6<<20.
+    assert_eq!(run_ll_i64("kept adds", keep), 0x61_5842 | 0x61_4842 << 24);
+    let t = temen_llvm::translate_ll_str(keep).expect("translate");
+    let k = func(&t, "keep");
+    assert!(offsets(&k).iter().all(|&o| o == 0), "{:?}", offsets(&k));
+    // `%far`, `%late`, `%neg`, `%arg`, `%g1`, `%g2`: each one add where it is defined. The 7th is
+    // the call's data-SP for `@id`.
+    assert_eq!(adds(&k), 7);
+}
+
 #[test]
 fn thread_local_tier2_vcpu_tls_isolation_and_pause_drop() {
     // The threaded-`std` build's native TLS shape (NIM.md §3d Tier-2): a `thread_local` global,

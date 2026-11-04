@@ -33,12 +33,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use temen_ir::{
-    AtomicRmwOp, BinOp, Block, CastOp, CmpOp, ConvOp, Data, DataExport, DataPtr, DataPtrTarget,
-    DebugInfo, Edge, Encoding, Export, FBinOp, FCmpOp, FToI, FUnOp, Field, FloatTy, Func, FuncIdx,
-    FuncName, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Loc, Memory, Module, Ordering,
-    ProducerBlob, SsaLoc, StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp,
-    VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp,
-    VWidenOp, ValIdx, ValType, VarInfo, VarLoc,
+    AtomicRmwOp, BinOp, Block, BlockIdx, CastOp, CmpOp, ConvOp, Data, DataExport, DataPtr,
+    DataPtrTarget, DebugInfo, Edge, Encoding, Export, FBinOp, FCmpOp, FToI, FUnOp, Field, FloatTy,
+    Func, FuncIdx, FuncName, IToF, Import, Inst, IntTy, IntUnOp, LoadOp, Loc, Memory, Module,
+    Ordering, ProducerBlob, SsaLoc, StoreOp, Terminator, TypeDef, VBitBinOp, VCvtOp, VFCmpOp,
+    VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp,
+    VShape, VShiftOp, VWidenOp, ValIdx, ValType, VarInfo, VarLoc,
 };
 
 /// Decode the atomic/fence memory-ordering byte (its [`Ordering::index`]).
@@ -86,16 +86,24 @@ mod op {
     pub const I64_UN_END: u8 = 0x1F;
 
     // Family bases (each op is `base + op.index()`) and their inclusive range ends.
-    pub const I32_BIN: u8 = 0x20; // + BinOp index (0..=14)
-    pub const I32_BIN_END: u8 = 0x2E;
+    // v16 (#2585): an integer binary or compare family's one-byte opcodes are its immediate forms,
+    // which folded images hold four to one over the register forms: `a`, then the immediate as an
+    // sleb (an `i32` one must fit `i32`). The register form is the byte after the range, then the
+    // `BinOp`/`CmpOp` index byte, `a` and `b`.
+    pub const I32_BIN_IMM: u8 = 0x20; // + BinOp index (0..=14)
+    pub const I32_BIN_IMM_END: u8 = 0x2E;
+    pub const I32_BIN: u8 = 0x2F;
     pub const I32_EQZ: u8 = 0x30;
-    pub const I32_CMP: u8 = 0x31; // + CmpOp index (0..=9)
-    pub const I32_CMP_END: u8 = 0x3A;
-    pub const I64_BIN: u8 = 0x40;
-    pub const I64_BIN_END: u8 = 0x4E;
+    pub const I32_CMP_IMM: u8 = 0x31; // + CmpOp index (0..=9)
+    pub const I32_CMP_IMM_END: u8 = 0x3A;
+    pub const I32_CMP: u8 = 0x3B;
+    pub const I64_BIN_IMM: u8 = 0x40;
+    pub const I64_BIN_IMM_END: u8 = 0x4E;
+    pub const I64_BIN: u8 = 0x4F;
     pub const I64_EQZ: u8 = 0x50;
-    pub const I64_CMP: u8 = 0x51;
-    pub const I64_CMP_END: u8 = 0x5A;
+    pub const I64_CMP_IMM: u8 = 0x51;
+    pub const I64_CMP_IMM_END: u8 = 0x5A;
+    pub const I64_CMP: u8 = 0x5B;
 
     // Conversions.
     pub const EXTEND_I32_S: u8 = 0x60;
@@ -393,7 +401,11 @@ pub mod wire {
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
 // for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
-const VERSION: u16 = 15;
+// v16 (#2585) adds the immediate forms of the integer binary and compare ops (`IntBinImm`,
+// `IntCmpImm`): an op whose right operand is a constant carries it, instead of naming a constant
+// instruction. They take the families' one-byte opcodes, and the register forms move to one opcode
+// per family and an op byte.
+const VERSION: u16 = 16;
 
 // The object dialect is its own header `kind` (`wire::KIND_OBJECT`), not a flag bit.
 
@@ -1044,14 +1056,32 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_sleb(out, *c);
         }
         Inst::IntBin { ty, op: o, a, b } => {
-            out.push(bin_base(*ty) + o.index());
+            out.push(match ty {
+                IntTy::I32 => op::I32_BIN,
+                IntTy::I64 => op::I64_BIN,
+            });
+            out.push(o.index());
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
         }
         Inst::IntCmp { ty, op: o, a, b } => {
-            out.push(cmp_base(*ty) + o.index());
+            out.push(match ty {
+                IntTy::I32 => op::I32_CMP,
+                IntTy::I64 => op::I64_CMP,
+            });
+            out.push(o.index());
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
+        }
+        Inst::IntBinImm { ty, op: o, a, imm } => {
+            out.push(bin_imm_base(*ty) + o.index());
+            write_uleb(out, *a as u64);
+            write_sleb(out, *imm);
+        }
+        Inst::IntCmpImm { ty, op: o, a, imm } => {
+            out.push(cmp_imm_base(*ty) + o.index());
+            write_uleb(out, *a as u64);
+            write_sleb(out, *imm);
         }
         Inst::IntUn { ty, op: o, a } => {
             out.push(un_base(*ty) + o.index());
@@ -1881,16 +1911,16 @@ fn encode_term(out: &mut Vec<u8>, t: &Terminator) {
     }
 }
 
-fn bin_base(ty: IntTy) -> u8 {
+fn bin_imm_base(ty: IntTy) -> u8 {
     match ty {
-        IntTy::I32 => op::I32_BIN,
-        IntTy::I64 => op::I64_BIN,
+        IntTy::I32 => op::I32_BIN_IMM,
+        IntTy::I64 => op::I64_BIN_IMM,
     }
 }
-fn cmp_base(ty: IntTy) -> u8 {
+fn cmp_imm_base(ty: IntTy) -> u8 {
     match ty {
-        IntTy::I32 => op::I32_CMP,
-        IntTy::I64 => op::I64_CMP,
+        IntTy::I32 => op::I32_CMP_IMM,
+        IntTy::I64 => op::I64_CMP_IMM,
     }
 }
 fn un_base(ty: IntTy) -> u8 {
@@ -2318,11 +2348,7 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
         });
     }
     let nfuncs = c.count()?;
-    let mut funcs = Vec::new();
-    for _ in 0..nfuncs {
-        funcs.push(decode_func(&mut c, object)?);
-    }
-    let funcs = exact(funcs);
+    let funcs = c.list(nfuncs, |s| &mut s.funcs, |c| decode_func(c, object))?;
     // Optional strippable debug section (mirrors the encoder): present iff bytes remain after the
     // funcs. Strippable and untrusted-for-escape (§2a) — the verifier ignores it.
     let debug_info = if c.at_end() {
@@ -2536,14 +2562,19 @@ fn decode_func(c: &mut Cursor, object: bool) -> Result<Func, DecodeError> {
     let params = decode_types(c)?;
     let results = decode_types(c)?;
     let nblocks = c.count()?;
-    let mut blocks = Vec::new();
-    for bi in 0..nblocks as u32 {
-        blocks.push(decode_block(c, bi, object)?);
-    }
+    let mut bi = 0;
+    let blocks = c.list(
+        nblocks,
+        |s| &mut s.blocks,
+        |c| {
+            bi += 1;
+            decode_block(c, bi - 1, object)
+        },
+    )?;
     Ok(Func {
         params,
         results,
-        blocks: exact(blocks),
+        blocks,
     })
 }
 
@@ -2551,32 +2582,21 @@ fn decode_block(c: &mut Cursor, bi: u32, object: bool) -> Result<Block, DecodeEr
     let parent = c.block_back(bi)?;
     let params = decode_types(c)?;
     let ncaptures = c.count()?;
-    let mut captures = Vec::new();
-    for _ in 0..ncaptures {
-        captures.push((c.block_back(bi)?, c.idx()?));
-    }
+    let captures = c.list(
+        ncaptures,
+        |s| &mut s.captures,
+        |c| Ok((c.block_back(bi)?, c.idx()?)),
+    )?;
     let ninsts = c.count()?;
-    let mut insts = Vec::new();
-    for _ in 0..ninsts {
-        insts.push(decode_inst(c, object)?);
-    }
+    let insts = c.list(ninsts, |s| &mut s.insts, |c| decode_inst(c, object))?;
     let term = decode_term(c)?;
     Ok(Block {
         parent,
         params,
-        captures: exact(captures),
-        insts: exact(insts),
+        captures,
+        insts,
         term,
     })
-}
-
-/// `v` without the room it grew by. The decoder grows each list as its elements decode, never by
-/// the count the input claims (audit #7), so a finished list can hold twice what it needs. Trimmed
-/// as it finishes (in place, where the allocator can), a decoded module is no larger than it needs
-/// to be, and a caller that keeps one (a toolchain's commands) need not copy it to shrink it.
-fn exact<T>(mut v: Vec<T>) -> Vec<T> {
-    v.shrink_to_fit();
-    v
 }
 
 fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
@@ -2589,8 +2609,10 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
         op::I32_UN..=op::I32_UN_END => int_un(IntTy::I32, b - op::I32_UN, c)?,
         op::I64_UN..=op::I64_UN_END => int_un(IntTy::I64, b - op::I64_UN, c)?,
 
-        op::I32_BIN..=op::I32_BIN_END => int_bin(IntTy::I32, b - op::I32_BIN, c)?,
-        op::I64_BIN..=op::I64_BIN_END => int_bin(IntTy::I64, b - op::I64_BIN, c)?,
+        op::I32_BIN_IMM..=op::I32_BIN_IMM_END => int_bin_imm(IntTy::I32, b - op::I32_BIN_IMM, c)?,
+        op::I64_BIN_IMM..=op::I64_BIN_IMM_END => int_bin_imm(IntTy::I64, b - op::I64_BIN_IMM, c)?,
+        op::I32_BIN => int_bin(IntTy::I32, c)?,
+        op::I64_BIN => int_bin(IntTy::I64, c)?,
 
         op::I32_EQZ => Inst::Eqz {
             ty: IntTy::I32,
@@ -2601,8 +2623,10 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             a: c.idx()?,
         },
 
-        op::I32_CMP..=op::I32_CMP_END => int_cmp(IntTy::I32, b - op::I32_CMP, c)?,
-        op::I64_CMP..=op::I64_CMP_END => int_cmp(IntTy::I64, b - op::I64_CMP, c)?,
+        op::I32_CMP_IMM..=op::I32_CMP_IMM_END => int_cmp_imm(IntTy::I32, b - op::I32_CMP_IMM, c)?,
+        op::I64_CMP_IMM..=op::I64_CMP_IMM_END => int_cmp_imm(IntTy::I64, b - op::I64_CMP_IMM, c)?,
+        op::I32_CMP => int_cmp(IntTy::I32, c)?,
+        op::I64_CMP => int_cmp(IntTy::I64, c)?,
 
         op::EXTEND_I32_S => Inst::Convert {
             op: ConvOp::ExtendI32S,
@@ -2869,7 +2893,8 @@ fn fcmp(ty: FloatTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
     })
 }
 
-fn int_bin(ty: IntTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
+fn int_bin(ty: IntTy, c: &mut Cursor) -> Result<Inst, DecodeError> {
+    let index = c.byte()?;
     let op = BinOp::from_index(index).ok_or(DecodeError::BadOpcode(index))?;
     Ok(Inst::IntBin {
         ty,
@@ -2879,13 +2904,44 @@ fn int_bin(ty: IntTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
     })
 }
 
-fn int_cmp(ty: IntTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
+fn int_cmp(ty: IntTy, c: &mut Cursor) -> Result<Inst, DecodeError> {
+    let index = c.byte()?;
     let op = CmpOp::from_index(index).ok_or(DecodeError::BadOpcode(index))?;
     Ok(Inst::IntCmp {
         ty,
         op,
         a: c.idx()?,
         b: c.idx()?,
+    })
+}
+
+/// An immediate operand of type `ty`: an `i32` one must fit `i32`, and is held sign-extended.
+fn imm(ty: IntTy, c: &mut Cursor) -> Result<i64, DecodeError> {
+    match ty {
+        IntTy::I32 => Ok(c.sleb_i32()? as i64),
+        IntTy::I64 => c.sleb(),
+    }
+}
+
+fn int_bin_imm(ty: IntTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
+    let op = BinOp::from_index(index).ok_or(DecodeError::BadOpcode(index))?;
+    let a = c.idx()?;
+    Ok(Inst::IntBinImm {
+        ty,
+        op,
+        a,
+        imm: imm(ty, c)?,
+    })
+}
+
+fn int_cmp_imm(ty: IntTy, index: u8, c: &mut Cursor) -> Result<Inst, DecodeError> {
+    let op = CmpOp::from_index(index).ok_or(DecodeError::BadOpcode(index))?;
+    let a = c.idx()?;
+    Ok(Inst::IntCmpImm {
+        ty,
+        op,
+        a,
+        imm: imm(ty, c)?,
     })
 }
 
@@ -2920,14 +2976,11 @@ fn decode_term(c: &mut Cursor) -> Result<Terminator, DecodeError> {
         op::BR_TABLE => {
             let idx = c.idx()?;
             let n = c.count()?;
-            let mut targets = Vec::new();
-            for _ in 0..n {
-                targets.push(decode_edge(c)?);
-            }
+            let targets = c.list(n, |s| &mut s.targets, decode_edge)?;
             let default = decode_edge(c)?;
             Terminator::BrTable {
                 idx,
-                targets: exact(targets),
+                targets,
                 default,
             }
         }
@@ -2955,11 +3008,7 @@ fn decode_edge(c: &mut Cursor) -> Result<Edge, DecodeError> {
 
 fn decode_types(c: &mut Cursor) -> Result<Vec<ValType>, DecodeError> {
     let n = c.count()?;
-    let mut ts = Vec::new();
-    for _ in 0..n {
-        ts.push(decode_type(c)?);
-    }
-    Ok(exact(ts))
+    c.list(n, |s| &mut s.types, decode_type)
 }
 
 fn decode_type(c: &mut Cursor) -> Result<ValType, DecodeError> {
@@ -2977,22 +3026,56 @@ fn decode_type(c: &mut Cursor) -> Result<ValType, DecodeError> {
 
 fn decode_idxs(c: &mut Cursor) -> Result<Vec<u32>, DecodeError> {
     let n = c.count()?;
-    let mut v = Vec::new();
-    for _ in 0..n {
-        v.push(c.idx()?);
-    }
-    Ok(exact(v))
+    c.list(n, |s| &mut s.idxs, |c| c.idx())
 }
 
 /// A bounds-checked forward cursor. All reads return `Err` past the end.
 struct Cursor<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// The buffers [`Cursor::list`] decodes into, kept from one list to the next.
+    spare: Spare,
+}
+
+/// One buffer for each kind of list the decoder builds per function, block, edge or call.
+#[derive(Default)]
+struct Spare {
+    funcs: Vec<Func>,
+    blocks: Vec<Block>,
+    captures: Vec<(BlockIdx, ValIdx)>,
+    insts: Vec<Inst>,
+    targets: Vec<Edge>,
+    types: Vec<ValType>,
+    idxs: Vec<ValIdx>,
 }
 
 impl<'a> Cursor<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Cursor { bytes, pos: 0 }
+        Cursor {
+            bytes,
+            pos: 0,
+            spare: Spare::default(),
+        }
+    }
+
+    /// Decode a list of `n` elements with `each`, into the buffer `spare` picks, then move them
+    /// out into a `Vec` of exactly their number: one allocation per list. The decoder never sizes
+    /// a list by the count the input claims, which is attacker-influenced (audit #7): a buffer
+    /// holds only elements that decoded, and grows to the longest list once.
+    fn list<T>(
+        &mut self,
+        n: usize,
+        spare: fn(&mut Spare) -> &mut Vec<T>,
+        mut each: impl FnMut(&mut Self) -> Result<T, DecodeError>,
+    ) -> Result<Vec<T>, DecodeError> {
+        let mut buf = core::mem::take(spare(&mut self.spare));
+        for _ in 0..n {
+            buf.push(each(self)?);
+        }
+        let mut list = Vec::with_capacity(buf.len());
+        list.append(&mut buf);
+        *spare(&mut self.spare) = buf;
+        Ok(list)
     }
 
     fn at_end(&self) -> bool {
@@ -4141,5 +4224,120 @@ mod unit_info_tests {
         };
         assert_eq!(read(&unit_info(&encode_module(&m)).unwrap()), (0, vec![]));
         assert!(unit_info(b"not a unit").is_err());
+    }
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+
+    fn exact<T>(v: &Vec<T>) -> bool {
+        v.capacity() == v.len()
+    }
+
+    /// A function whose lists differ in length from one block to the next, so each reused buffer
+    /// ([`Cursor::list`]) holds a longer list before a shorter one, and an empty one after both.
+    fn func() -> Func {
+        Func {
+            params: vec![ValType::I64, ValType::I32],
+            results: vec![ValType::I64],
+            blocks: vec![
+                Block {
+                    parent: 0,
+                    params: vec![ValType::I64, ValType::I32],
+                    captures: vec![],
+                    insts: vec![
+                        Inst::ConstI64(7),
+                        Inst::ConstI64(9),
+                        Inst::Call {
+                            func: 1,
+                            args: vec![0, 2, 3],
+                        },
+                    ],
+                    term: Terminator::BrIf {
+                        cond: 1,
+                        then_blk: 1,
+                        then_args: vec![2],
+                        else_blk: 2,
+                        else_args: vec![],
+                    },
+                },
+                Block {
+                    parent: 0,
+                    params: vec![ValType::I64],
+                    captures: vec![(0, 0), (0, 3), (0, 4)],
+                    insts: vec![Inst::ConstI64(1)],
+                    term: Terminator::BrTable {
+                        idx: 1,
+                        targets: vec![(2, vec![]), (2, vec![])],
+                        default: (2, vec![]),
+                    },
+                },
+                Block {
+                    parent: 0,
+                    params: vec![],
+                    captures: vec![(0, 4)],
+                    insts: vec![],
+                    term: Terminator::Return(vec![0]),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn every_decoded_list_is_exactly_its_length() {
+        let m = Module {
+            memory: None,
+            data: vec![],
+            data_ptrs: vec![],
+            data_funcrefs: vec![],
+            data_funcref_slots: vec![],
+            tls: vec![],
+            data_exports: vec![],
+            funcs: vec![func(), func()],
+            imports: vec![],
+            exports: vec![],
+            impl_exports: vec![],
+            types: vec![],
+            debug_info: None,
+        };
+        let back = decode_module(&encode_module(&m)).expect("decode");
+        assert_eq!(back, m);
+        assert!(exact(&back.funcs));
+        for f in &back.funcs {
+            assert!(exact(&f.params));
+            assert!(exact(&f.results));
+            assert!(exact(&f.blocks));
+            for b in &f.blocks {
+                assert!(exact(&b.params));
+                assert!(exact(&b.captures));
+                assert!(exact(&b.insts));
+                for i in &b.insts {
+                    if let Inst::Call { args, .. } = i {
+                        assert!(exact(args));
+                    }
+                }
+                let mut edges: Vec<&Vec<ValIdx>> = Vec::new();
+                match &b.term {
+                    Terminator::BrIf {
+                        then_args,
+                        else_args,
+                        ..
+                    } => edges.extend([then_args, else_args]),
+                    Terminator::BrTable {
+                        targets, default, ..
+                    } => {
+                        assert!(exact(targets));
+                        edges.extend(targets.iter().map(|(_, a)| a));
+                        edges.push(&default.1);
+                    }
+                    Terminator::Return(v) => edges.push(v),
+                    _ => {}
+                }
+                for a in edges {
+                    assert!(exact(a));
+                }
+            }
+        }
     }
 }

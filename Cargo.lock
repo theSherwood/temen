@@ -867,6 +867,7 @@ name = "temen-jit"
 version = "0.0.0"
 dependencies = [
  "cc",
+ "cranelift-assembler-x64-meta",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-jit",

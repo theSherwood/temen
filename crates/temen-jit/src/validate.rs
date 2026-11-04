@@ -56,12 +56,36 @@ pub(crate) struct WindowLayout {
 pub(crate) const SYSV_CLOBBERS: u16 = 0b0000_1111_1100_0111;
 
 /// What a call does to its caller, as far as the validator models it (#2603): the GP registers the
-/// callee may leave changed, and the bytes of stack arguments it pops on return (`None` when that
-/// isn't known, so the caller's `rsp` is unknown after the call). PR 3 adds the argument tags.
+/// callee may leave changed, the bytes of stack arguments it pops on return (`None` when that isn't
+/// known, so the caller's `rsp` is unknown after the call), and what each argument must be (#2534).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Contract {
     pub clobbers: u16,
     pub pops: Option<u32>,
+    /// The tag each argument register must satisfy (#2534): a host function takes some of its
+    /// arguments as the window's own and confines guest pointers with them, so a wrong register —
+    /// a backend bug — would move the window the host trusts or hand it a forged pointer. Positional
+    /// (argument 0 is the first integer register, SysV order); `&[]` = no argument is constrained.
+    pub args: &'static [ArgTag],
+}
+
+/// What one call argument must be, for the validator to accept the call (#2534). The host confines
+/// guest pointers against the window values the code hands it, so these are the ones a wrong
+/// register would subvert; everything else is [`ArgTag::Any`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArgTag {
+    /// Unconstrained — a guest value, a count, a handle: nothing the host confines with.
+    Any,
+    /// The window base `mem_base` (rdi at entry): the base the host confines guest pointers against.
+    WindowBase,
+    /// The `vmctx` pointer: the host's own context, never a guest value.
+    Vmctx,
+    /// A pointer to a buffer in the caller's own frame, at most `len` bytes, that the host reads
+    /// and, when `write`, writes (#2534): a `call.cap` marshalling buffer, a fiber's status word.
+    /// The argument must be a known frame slot (never a guest value — else the host would write
+    /// through a forged pointer), and a `write` buffer's slots are dropped across the call since the
+    /// host may change them, while every other slot (the context-pointer spills) survives.
+    StackSlot { len: u32, write: bool },
 }
 
 /// What the validator knows of a function's own frame at entry (#2603 PR 3): the bytes of incoming
@@ -99,7 +123,13 @@ pub(crate) fn contract(sig: &cranelift_codegen::ir::Signature) -> Option<Contrac
         CallConv::PreserveAll => (0b0101, Some(0)), // rax, rdx
         _ => return None,
     };
-    Some(Contract { clobbers, pops })
+    // From the signature alone the callee is unidentified, so no argument is constrained; the host
+    // functions get their argument tags attached by name in `lib.rs` (`HostFn::arg_contract`).
+    Some(Contract {
+        clobbers,
+        pops,
+        args: &[],
+    })
 }
 
 /// The bytes of stack arguments a `Tail` callee with signature `sig` receives, and so pops: Cranelift
@@ -287,7 +317,7 @@ pub(crate) mod x86 {
     //! classification), the machine-CFG recovery and abstract dataflow (#2535), and the
     //! memory-access confinement policy (#2535/#2603) they feed.
 
-    use super::{Contract, Entry, Frame, Guest, Reloc, WindowLayout, SYSV_CLOBBERS};
+    use super::{ArgTag, Contract, Entry, Frame, Guest, Reloc, WindowLayout, SYSV_CLOBBERS};
 
     /// A machine-code policy disagreement: `why`, at byte offset `at` in the function.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -547,14 +577,20 @@ pub(crate) mod x86 {
                 }
             }
         }
-        /// Loop-header widening (#2535): a `Bounded` carried into a header could grow each iteration,
-        /// so drop it to `Unknown` (in registers and slots). The context-param and `Confined` facts
-        /// are loop-invariant and survive, so nearly every loop still settles in one round.
+        /// Loop-header widening (#2535): a fact whose value can grow each iteration must drop to
+        /// `Unknown` at a header, or the fixpoint might not settle. Only `WinPtr` grows — a loop that
+        /// strides a window pointer (`add winptr, stride`) raises its offset every round ([`addr_fact`]
+        /// → `WinPtr(off + stride)`). A `Bounded` does **not** grow: it comes only from an `and` mask
+        /// or a byte zero-extend, a constant bound re-established each iteration — `add`/`sub` on a
+        /// `Bounded` yields `Unknown`, never a wider bound — and `meet` only ever raises it to the
+        /// largest mask constant in the function, a finite ceiling. So widening a `Bounded` would just
+        /// discard the mask that confines a `call.dyn` index or a strided access carried around the
+        /// loop, for no termination gain (#2603). The context-param and `Confined` facts are
+        /// loop-invariant and survive; `meet` still weakens a fact a back edge disagrees on, and
+        /// `verify` rejects any proposal the round cap cut short, so dropping only `WinPtr` stays
+        /// sound and terminating.
         fn widen(&mut self) {
-            let grows = |f: &Fact| {
-                // A stride's or a checked entry's bound comes from an `and` mask, so it can't grow.
-                matches!(f, Fact::Bounded(_) | Fact::WinPtr(_))
-            };
+            let grows = |f: &Fact| matches!(f, Fact::WinPtr(_));
             for f in &mut self.regs {
                 if grows(f) {
                     *f = Fact::Unknown;
@@ -1125,6 +1161,35 @@ pub(crate) mod x86 {
         }
     }
 
+    /// Check a call's arguments against its callee's contract (#2534): a host function confines guest
+    /// pointers against the window values the code hands it, so a wrong register — a backend bug —
+    /// would move the window the host trusts. Positional over the integer argument registers (SysV
+    /// order); arguments past the sixth ride the stack and are a PR 3b follow-up. The window's mask
+    /// and reserved domain come from the module's geometry (`None`/0 for a memoryless module).
+    fn check_args(c: &Contract, state: &State, at: usize, findings: &mut Vec<Finding>) {
+        for (i, &tag) in c.args.iter().enumerate() {
+            let Some(&r) = reg::ARG_REGS.get(i) else {
+                break;
+            };
+            let fact = state.regs[r as usize];
+            let ok = match tag {
+                ArgTag::Any => true,
+                ArgTag::WindowBase => fact == Fact::MemBase,
+                ArgTag::Vmctx => fact == Fact::Vmctx,
+                // A buffer pointer must be a known frame slot, never a guest value: the host writes
+                // through it, so a forged pointer would escape. The extent is enforced by the frame
+                // policy on the slots the write clears below.
+                ArgTag::StackSlot { .. } => matches!(fact, Fact::Stack(Some(_))),
+            };
+            if !ok {
+                findings.push(Finding {
+                    at,
+                    why: format!("call argument {i} is {fact:?}, not {tag:?}"),
+                });
+            }
+        }
+    }
+
     /// Check that a function exit restores `rsp` to the return address (`Stack(Some(0))`) and every
     /// callee-saved register to its entry value (`Saved(r)`). A `Saved` reaches here through the
     /// spill slot the prologue saved it to and the epilogue reloaded it from.
@@ -1669,20 +1734,56 @@ pub(crate) mod x86 {
                 let c = callee.unwrap_or(Contract {
                     clobbers: SYSV_CLOBBERS,
                     pops: None,
+                    args: &[],
                 });
+                if let Some(f) = findings.as_deref_mut() {
+                    check_args(&c, &state, pos, f);
+                }
                 // The caller's slots survive the call: an accepted guest callee writes only its own
                 // frame (below this `rsp`, claim item 4, the induction), and a host callee writes the
-                // caller's stack only through a pointer it was handed. So a slot is cleared only when
-                // a frame pointer is passed in an argument register — the shape a `call.cap` result
-                // buffer takes (a `lea` of a frame slot). A guest callee is never passed a native
-                // frame pointer (a guest pointer is a window offset). #2534/PR 3b replaces this with
-                // the exact per-argument host contracts. A checked record survives too (never changes).
-                let passes_frame_ptr = reg::ARG_REGS
-                    .iter()
-                    .any(|&r| matches!(fact(&state, r), Fact::Stack(_) | Fact::ReturnArea(_)));
-                if passes_frame_ptr {
+                // caller's stack only through a write-buffer pointer the contract says it was handed
+                // (#2534, §2a handler hygiene). So drop exactly those buffers' slots and let the
+                // context-pointer spills (`mem_base`, `vmctx`, the fuel cell, …) survive. A frame
+                // pointer the contract does not tag as a buffer is unexpected — a guest pointer is a
+                // window offset, never a native frame pointer — so clear every data slot, sound but
+                // imprecise. (`ReturnArea`, the caller's own `sret` area, is outside this frame, so a
+                // callee handed it writes the caller's result slots, not ours.)
+                // A frame pointer in a register the contract doesn't account for forces a full clear
+                // only when the callee is unidentified (an empty contract — arguments unknown). An
+                // identified callee's contract lists its frame-pointer arguments, so a frame pointer
+                // in a register past them is caller scratch, not an argument, and is ignored — e.g. a
+                // stale pointer left in `rsi` across the fuel refill, which reads only the cell.
+                let conservative = c.args.is_empty();
+                let mut unexpected = false;
+                let mut writes: Vec<(i64, i64)> = Vec::new();
+                for (i, &r) in reg::ARG_REGS.iter().enumerate() {
+                    let f = fact(&state, r);
+                    match c.args.get(i) {
+                        Some(ArgTag::StackSlot { len, write: true }) => match f {
+                            Fact::Stack(Some(off)) => {
+                                writes.push((off, off.saturating_add(i64::from(*len))))
+                            }
+                            // A write buffer at an unknown offset: clear conservatively.
+                            _ => unexpected = true,
+                        },
+                        // A read buffer: the host doesn't write our stack through it.
+                        Some(ArgTag::StackSlot { write: false, .. }) => {}
+                        // Another tagged argument (a window value, vmctx, a guest value): a frame
+                        // pointer where the contract expects none is unexpected.
+                        Some(_) => unexpected |= matches!(f, Fact::Stack(_)),
+                        // Past the contract's arguments: scratch, unless the callee is unidentified.
+                        // (`ReturnArea`, the caller's own `sret` area, is never one of our slots.)
+                        None => unexpected |= conservative && matches!(f, Fact::Stack(_)),
+                    }
+                }
+                if unexpected {
                     state.clear_data_slots();
                     slot_vals.clear();
+                } else {
+                    for (lo, hi) in writes {
+                        state.clobber(lo, hi);
+                        slot_vals.retain(|&(o, _)| o >= hi || o + 8 <= lo);
+                    }
                 }
                 let rsp = match (fact(&state, reg::RSP), c.pops) {
                     (Fact::Stack(Some(h)), Some(p)) => Fact::Stack(h.checked_add(i64::from(p))),
@@ -1830,13 +1931,17 @@ pub(crate) mod x86 {
 
     /// The contract of the fuel cell's refill (a `PreserveAll` trampoline with no result) and of its
     /// `remaining` (a C function).
+    // Each takes the fuel cell pointer alone (never a frame pointer), so the contract lists that one
+    // argument — a scratch frame pointer left in another register is then not mistaken for a buffer.
     const FUEL_REFILL: Contract = Contract {
         clobbers: 0,
         pops: Some(0),
+        args: &[ArgTag::Any],
     };
     const FUEL_REMAINING: Contract = Contract {
         clobbers: SYSV_CLOBBERS,
         pops: Some(0),
+        args: &[ArgTag::Any],
     };
 
     /// What a 64-bit load from `m` yields: the fact a tracked spill slot holds, the code pointer of a
@@ -2510,6 +2615,7 @@ pub(crate) mod x86 {
         rex_x: bool, // SIB.index extension
         rex_b: bool, // ModRM.rm / SIB.base extension
         rex: bool,   // any REX prefix: byte registers 4–7 are spl–dil with one, ah–bh without
+        vvvv: u8,    // the GP/XMM register VEX/EVEX names in its vvvv field (the BMI ops write it)
     }
 
     impl Pfx {
@@ -3303,15 +3409,34 @@ pub(crate) mod x86 {
                     d
                 });
             }
-            // xadd — writes both; cmpxchg → rax (+ r/m). The even opcode is the byte form.
-            0xC0 | 0xC1 | 0xB0 | 0xB1 => {
-                let intent = if op2 >= 0xC0 {
-                    E::XchgRegRm
-                } else {
-                    E::Wr(bit(0))
-                };
+            // xadd — writes its reg and its r/m. The even opcode is the byte form.
+            0xC0 | 0xC1 => {
                 let w = if op2 & 1 == 0 { 1 } else { osz };
-                return finish_modrm(c, start, p, 0, Normal, intent).map(|d| d.width(w));
+                return finish_modrm(c, start, p, 0, Normal, E::XchgRegRm).map(|d| d.width(w));
+            }
+            // cmpxchg r/m, reg — compares rax with r/m, then writes either r/m (equal) or rax: so it
+            // writes both rax and its r/m destination (a register, or memory for the memory form).
+            0xB0 | 0xB1 => {
+                let w = if op2 & 1 == 0 { 1 } else { osz };
+                let d = finish_modrm(c, start, p, 0, Normal, E::Wr(bit(0)))?.width(w);
+                let eff = Eff::Wr(bit(0) | d.operands.rm_reg.map_or(0, bit));
+                return Some(Decoded { eff, ..d });
+            }
+            // cmpxchg8b/16b m, — compares and conditionally writes rdx:rax (and the memory operand).
+            // (`/1`; Cranelift emits no other `0F C7` form.) `C7` is 16 bytes under REX.W, else 8.
+            0xC7 => {
+                let w = if p.rex_w { 16 } else { 8 };
+                return finish_modrm(c, start, p, 0, Normal, E::Wr(bit(0) | bit(2)))
+                    .map(|d| d.width(w));
+            }
+            // bt/bts/btr/btc r/m, imm8 (`/4`..`/7`): the imm8 bit offset is masked to the operand's
+            // own bits, so the access stays within the operand (unlike the register-offset forms
+            // `A3`/`AB`/`B3`/`BB`, forbidden above). `/4` (bt) only reads; the rest write the r/m.
+            0xBA => {
+                let digit = (c.peek()? >> 3) & 0x07;
+                let intent = if digit == 4 { E::NoGp } else { E::WrRm };
+                let d = finish_modrm(c, start, p, 1, Normal, intent)?.width(osz);
+                return Some(if digit == 4 { d.reads() } else { d });
             }
             0xA2 => {
                 return Some(one(
@@ -3323,23 +3448,39 @@ pub(crate) mod x86 {
             } // cpuid
             0x31 => return Some(one(c, start, Normal, Eff::Wr(bit(0) | bit(2)))), // rdtsc → rax, rdx
             0x77 => return Some(one(c, start, Normal, Eff::NoGp)),                // emms
+            // bswap r32/r64 (`0F C8+r`): byte-reverses a GP register in place (no memory, no flags).
+            0xC8..=0xCF => {
+                let r = (op2 & 0x07) | (u8::from(p.rex_b) << 3);
+                return Some(one(c, start, Normal, Eff::Wr(bit(r))).keep_flags());
+            }
             _ => {}
         }
-        match op2 {
-            // SSE/vector ModRM + imm8 (operands are XMM — no GP write) …
-            0x70..=0x73 | 0xC2 | 0xC4 | 0xC6 => finish_modrm(c, start, p, 1, Normal, E::NoGp),
-            // … except pextrw r32, xmm, imm8, which writes a GP register.
-            0xC5 => finish_modrm(c, start, p, 1, Normal, E::WrReg),
+        // The rest of the 0F map: SSE/SSE2 float+int vector ops and the SSE moves. All take a ModRM
+        // and, in the `imm8` group, a trailing byte; none has a modeled ALU effect. `vector` stamps
+        // the memory direction/width, then `vec_gp_writes` adds the GP destination for the handful
+        // that write one (`cvt*2si` `2C`/`2D`, `movmsk` `50`, `pmovmskb` `D7`, `movd/q`-store `7E`,
+        // `pextrw` `C5`) — the rest are XMM-only.
+        let d = match op2 {
+            0x70..=0x73 | 0xC2 | 0xC4 | 0xC5 | 0xC6 => {
+                finish_modrm(c, start, p, 1, Normal, E::NoGp)?
+            }
             // The SSE moves (movups/movss/movsd, movaps, movd/movq, movdqa/movdqu, movq) leave the
             // flags: a register allocator's spills and moves.
             0x10 | 0x11 | 0x28 | 0x29 | 0x6E | 0x6F | 0x7E | 0x7F | 0xD6 => {
-                keep(finish_modrm(c, start, p, 0, Normal, E::NoGp)).map(|d| d.vector(op2, p))
+                finish_modrm(c, start, p, 0, Normal, E::NoGp)?.keep_flags()
             }
-            // Everything else in the 0F map (SSE/SSE2 float+int vector ops, fences): ModRM, no imm.
-            // A handful move a value into a GP register; those are cross-checked against iced and the
-            // ones the corpus exercises are classified above. The rest are XMM-only (no GP write).
-            _ => finish_modrm(c, start, p, 0, Normal, E::NoGp).map(|d| d.vector(op2, p)),
+            _ => finish_modrm(c, start, p, 0, Normal, E::NoGp)?,
         }
+        .vector(op2, p);
+        let gp = vec_gp_writes(Map::Of, op2, p, &d.operands);
+        Some(if gp != 0 {
+            Decoded {
+                eff: Eff::Wr(gp),
+                ..d
+            }
+        } else {
+            d
+        })
     }
 
     /// Whether an SSE or AVX instruction of the 0F map only reads its memory operand: a load, a
@@ -3348,8 +3489,102 @@ pub(crate) mod x86 {
     fn vec_reads(op2: u8, p: &Pfx) -> bool {
         match op2 {
             0x10 | 0x28 | 0x2A | 0x2C..=0x2F | 0x51 | 0x54..=0x5F | 0x6E | 0x6F | 0xE6 => true,
+            // Packed-integer arithmetic (SSE2/AVX): the memory operand is a source the op reads
+            // (`padd*`/`psub*`/`pand`/`por`/`pxor`/`pcmp*`/`pmul*`/`pavg*`/`pmin*`/`pmax*`/`psll*`/
+            // `psrl*`/`psad*`/`punpck*`/`pack*`, and `lddqu`). The stores in these rows are excluded
+            // by the gaps: `movq` store `0xD6`, `pmovmskb` `0xD7` (writes a GP reg, no memory),
+            // `movntdq` `0xE7`, and `maskmovdqu` `0xF7`. (`0x7E`/`0x7F` moves are handled above/below.)
+            0x60..=0x6D | 0x74..=0x76 | 0xD0..=0xD5 | 0xD8..=0xDF => true,
+            0xE0..=0xE5 | 0xE8..=0xEF | 0xF0..=0xF6 | 0xF8..=0xFE => true,
             0x7E => p.rep == 0xF3, // movq xmm, xmm/m64; without F3 it stores a GP or xmm value
             _ => false,
+        }
+    }
+
+    /// The memory operand of a `0F38`/`0F3A`-map instruction: whether it is only **read**, and how
+    /// many bytes it accesses. Every form Cranelift emits in these maps reads its memory operand
+    /// except the lane *extracts* (`pextr{b,w,d,q}`/`extractps`, `0F3A 14..=17`), which store a lane.
+    /// Most access a full 128-bit vector (`packed`; 256 under VEX.L); the sub-packed forms read one
+    /// lane (`pmovsx`/`pmovzx`, broadcasts, inserts, scalar round/FMA) or a GP word (BMI, `rorx`).
+    /// The default-deny spirit: an unlisted form reads a full vector, the widest access in the map, so
+    /// an unmodeled read is never under-measured. Cross-checked against iced by the completeness
+    /// oracle, so a Cranelift bump that changes a width fails a test, not a user's compile.
+    fn vec_mem_0f38_3a(map: Map, op: u8, p: &Pfx) -> (bool, u8) {
+        let packed = if p.vex_l { 32 } else { 16 };
+        let gpw = if p.rex_w { 8 } else { 4 }; // a BMI op's GP memory source
+        match map {
+            Map::Of38 => match op {
+                // Sign/zero-extending lane loads read a sub-vector: 8/4/2 bytes by the source lanes.
+                0x20..=0x25 | 0x30..=0x35 => (true, [8, 4, 2, 8, 4, 8][usize::from(op & 0x0F) % 6]),
+                0x18 | 0x58 => (true, 4), // vbroadcastss, vpbroadcastd
+                0x59 => (true, 8),        // vpbroadcastq
+                0x78 => (true, 1),        // vpbroadcastb
+                0x79 => (true, 2),        // vpbroadcastw
+                // FMA: packed `ps`/`pd` read a full vector; scalar `ss`/`sd` read one lane (W → sd).
+                0x98..=0x9F | 0xA8..=0xAF | 0xB8..=0xBF if op & 1 == 1 => {
+                    (true, if p.rex_w { 8 } else { 4 })
+                }
+                // BMI (andn/bzhi/mulx/shlx/shrx/sarx) and legacy adcx/adox read a GP memory source.
+                0xF2 | 0xF5 | 0xF6 | 0xF7 => (true, gpw),
+                _ => (true, packed),
+            },
+            Map::Of3a => match op {
+                0x0A => (true, 4),                            // roundss
+                0x0B => (true, 8),                            // roundsd
+                0x14 => (false, 1),                           // pextrb → store 1 byte
+                0x15 => (false, 2),                           // pextrw → store 2
+                0x16 => (false, if p.rex_w { 8 } else { 4 }), // pextrd/pextrq
+                0x17 => (false, 4),                           // extractps → store 4
+                0x20 => (true, 1),                            // pinsrb
+                0x21 => (true, 4),                            // insertps
+                0x22 => (true, if p.rex_w { 8 } else { 4 }),  // pinsrd/pinsrq
+                0xF0 => (true, gpw),                          // rorx (GP source)
+                _ => (true, packed), // roundps/pd, pblendw, palignr, blendv*
+            },
+            // Not called for the 0F map (it uses `vec_reads`/`vec_width`); the sound default —
+            // memory treated as written, width unknown — covers the unreachable case without a panic.
+            Map::Of => (false, 0),
+        }
+    }
+
+    /// The GP registers a vector-map instruction writes, keyed by its ModRM-field register
+    /// (`ops.reg`) and its r/m register (`ops.rm_reg`, `0` for a memory r/m — then it stores to
+    /// memory, no GP write). `0` for the XMM-only majority. A missed GP write would let a stale fact
+    /// (`mem_base`, a confined index) survive a real overwrite, so the completeness oracle checks this
+    /// against iced's write-set for every form. The second GP destination the VEX forms write in
+    /// `vvvv` (`blsi`/`blsr`/`blsmsk`, `mulx`) is added by the caller, which knows `vvvv`.
+    fn vec_gp_writes(map: Map, op: u8, p: &Pfx, ops: &Operands) -> u16 {
+        let reg = ops.reg.map_or(0, bit);
+        let rm = ops.rm_reg.map_or(0, bit);
+        match map {
+            Map::Of => match op {
+                0x2C | 0x2D | 0x50 | 0xD7 => reg, // cvt(t)s{s,d}2si, movmskp{s,d}, pmovmskb → GP
+                0x7E if p.op66 => rm, // movd/movq r/m, xmm (store to a GP reg or memory)
+                0xC5 if p.op66 => reg, // pextrw r32, xmm, imm8
+                _ => 0,
+            },
+            // andn/bzhi/shlx/shrx/sarx write `reg`; mulx writes `reg` and a second dest in `vvvv`;
+            // adcx/adox (legacy `F6`) write `reg`. blsi/blsr/blsmsk (`F3`) write only `vvvv` (their
+            // `reg` field is a `/digit`), so they are not here — the caller adds their `vvvv` write.
+            Map::Of38 => match op {
+                0xF2 | 0xF5 | 0xF6 | 0xF7 => reg,
+                _ => 0,
+            },
+            Map::Of3a => match op {
+                0x14..=0x17 => rm, // pextr{b,w,d,q}/extractps → a GP reg (or a memory store)
+                0xF0 => reg,       // rorx
+                _ => 0,
+            },
+        }
+    }
+
+    /// The `vvvv`-named GP destination of the VEX `0F38` forms that write one: `blsi`/`blsr`/`blsmsk`
+    /// (`F3`, their only destination) and `mulx` (`F6`, its second). A legacy encoding has no `vvvv`,
+    /// and no legacy form in these maps writes one, so this is VEX/EVEX-only.
+    fn vec_gp_writes_vvvv(map: Map, op: u8, p: &Pfx) -> u16 {
+        match (map, op) {
+            (Map::Of38, 0xF3 | 0xF6) => bit(p.vvvv),
+            _ => 0,
         }
     }
 
@@ -3389,18 +3624,39 @@ pub(crate) mod x86 {
                     4
                 }
             } // movd/movq with a GP side
+            // Packed-integer arithmetic reads a packed (16-byte, or 32 under VEX.L) memory source —
+            // the same opcode rows `vec_reads` classifies as reads; its access width bounds the
+            // constant-pool read so it is not flagged as reaching past the function's bytes.
+            (0x60..=0x6D | 0x74..=0x76 | 0xD0..=0xD5 | 0xD8..=0xDF, _) => packed,
+            (0xE0..=0xE5 | 0xE8..=0xEF | 0xF0..=0xF6 | 0xF8..=0xFE, _) => packed,
             _ => 0,
         }
     }
 
     fn decode_0f38(c: &mut Cursor, start: usize, p: &Pfx) -> Option<Decoded> {
-        c.next()?; // opcode in the 0F38 map — all have ModRM, no immediate; XMM-only (no GP write)
-        finish_modrm(c, start, p, 0, Kind::Normal, EffIntent::NoGp)
+        let op = c.next()?; // opcode in the 0F38 map — ModRM, no immediate
+        let d = finish_modrm(c, start, p, 0, Kind::Normal, EffIntent::NoGp)?;
+        Some(apply_vec_class(d, Map::Of38, op, p))
     }
 
     fn decode_0f3a(c: &mut Cursor, start: usize, p: &Pfx) -> Option<Decoded> {
-        c.next()?; // opcode in the 0F3A map — all have ModRM + imm8; XMM-only (no GP write)
-        finish_modrm(c, start, p, 1, Kind::Normal, EffIntent::NoGp)
+        let op = c.next()?; // opcode in the 0F3A map — all have ModRM + imm8
+        let d = finish_modrm(c, start, p, 1, Kind::Normal, EffIntent::NoGp)?;
+        Some(apply_vec_class(d, Map::Of3a, op, p))
+    }
+
+    /// Stamp a decoded vector-map instruction with its memory direction/width ([`vec_mem_0f38_3a`])
+    /// and GP write-set ([`vec_gp_writes`] + the `vvvv` destination): the one place the `0F38`/`0F3A`
+    /// classification is applied, shared by the legacy and VEX/EVEX decoders (invariant #15).
+    fn apply_vec_class(d: Decoded, map: Map, op: u8, p: &Pfx) -> Decoded {
+        let (reads, width) = vec_mem_0f38_3a(map, op, p);
+        let gp = vec_gp_writes(map, op, p, &d.operands) | vec_gp_writes_vvvv(map, op, p);
+        Decoded {
+            width,
+            reads_only: reads,
+            eff: if gp != 0 { Eff::Wr(gp) } else { d.eff },
+            ..d
+        }
     }
 
     fn decode_vex2(c: &mut Cursor, start: usize) -> Option<Decoded> {
@@ -3409,6 +3665,7 @@ pub(crate) mod x86 {
         let op = c.next()?;
         let p = Pfx {
             rex_r: (b1 & 0x80) == 0,
+            vvvv: (!(b1 >> 3)) & 0x0F,
             ..vex_pp_l(b1)
         };
         vex_body(c, start, &p, Map::Of, op)
@@ -3424,6 +3681,7 @@ pub(crate) mod x86 {
             rex_x: (b1 & 0x40) == 0,
             rex_b: (b1 & 0x20) == 0,
             rex_w: (b2 & 0x80) != 0,
+            vvvv: (!(b2 >> 3)) & 0x0F,
             ..vex_pp_l(b2)
         };
         let map = match b1 & 0x1f {
@@ -3446,6 +3704,10 @@ pub(crate) mod x86 {
             rex_x: (b0 & 0x40) == 0,
             rex_b: (b0 & 0x20) == 0,
             rex_w: (b1 & 0x80) != 0,
+            // EVEX carries pp/L like VEX; the mandatory prefix picks a scalar/packed width.
+            op66: (b1 & 0x03) == 1,
+            rep: [0, 0, 0xF3, 0xF2][usize::from(b1 & 0x03)],
+            vvvv: (!(b1 >> 3)) & 0x0F,
             ..Pfx::default()
         };
         let map = match b0 & 0x07 {
@@ -3454,6 +3716,18 @@ pub(crate) mod x86 {
             3 => Map::Of3a,
             _ => return Some(UNDECODABLE),
         };
+        // An EVEX `disp8` is *compressed*: the processor scales it by the form's tuple size (table
+        // 2-34/2-35), so the raw byte the ModRM decoder reads is not the real displacement, and the
+        // address the policy would check would be wrong. The scale is a per-form property EVEX does
+        // not carry in the bytes, so reject a compressed-`disp8` operand rather than mis-read it
+        // (`disp0`/`disp32`/rip are not scaled, so they decode exactly). Cranelift emits AVX-512 only
+        // for a few 128-bit element ops, and its pool/stack operands use `disp0`/`disp32`.
+        if (c.peek()? >> 6) == 0b01 {
+            return Some(Decoded {
+                kind: Kind::Forbidden("EVEX compressed disp8 (unknown scale)"),
+                ..UNDECODABLE
+            });
+        }
         // EVEX's L'L can make the operand 512 bits wide, which `vec_width` doesn't model.
         let d = vex_body(c, start, &p, map, op)?;
         Some(Decoded {
@@ -3489,13 +3763,24 @@ pub(crate) mod x86 {
             Map::Of38 => 0,
             Map::Of => usize::from(matches!(op, 0x70..=0x73 | 0xC2 | 0xC4 | 0xC5 | 0xC6)),
         };
-        // VEX/EVEX encode AVX vector ops: their operands are XMM/YMM/ZMM, so no GP register is
-        // written. (The BMI GP-writing VEX ops are not in the corpus; the iced write-set cross-check
-        // would flag one if it appeared, to be classified then.)
+        // Most VEX/EVEX forms are AVX vector ops over XMM/YMM/ZMM (no GP register written); the GP
+        // writers (the float→int converts, the lane/mask extracts, and the BMI ops) are classified
+        // per map — in the 0F map by `vec_gp_writes`, in the 0F38/0F3A maps by `apply_vec_class`.
         let d = finish_modrm(c, start, p, imm, Kind::Normal, EffIntent::NoGp)?;
         let d = match map {
-            Map::Of => d.vector(op, p),
-            _ => d,
+            Map::Of => {
+                let d = d.vector(op, p);
+                let gp = vec_gp_writes(Map::Of, op, p, &d.operands);
+                if gp != 0 {
+                    Decoded {
+                        eff: Eff::Wr(gp),
+                        ..d
+                    }
+                } else {
+                    d
+                }
+            }
+            Map::Of38 | Map::Of3a => apply_vec_class(d, map, op, p),
         };
         // The AVX moves (vmovups/vmovaps/vmovdqu/vmovq/…) leave the flags.
         let moves = matches!(map, Map::Of)
@@ -3590,6 +3875,8 @@ pub(crate) mod x86 {
 
     #[cfg(test)]
     mod tests {
+        mod oracle;
+
         use super::*;
         use crate::{compile, validate};
         use cranelift_codegen::binemit::Reloc as R;
@@ -3989,6 +4276,114 @@ pub(crate) mod x86 {
             assert!(matches!(decode(&bytes, 7).kind, Kind::Ret));
         }
 
+        /// #2603 PR 4a (hole 17): packed-integer arithmetic and `mulx` *read* their memory operand,
+        /// so the decoder marks it read-only — a rip-relative constant-pool access must not read as a
+        /// store to the function's rodata. A real vector store stays a write. Bytes are the exact
+        /// forms Cranelift emitted that this slice fixes.
+        #[test]
+        fn vector_memory_reads_are_not_stores() {
+            // vpaddusb xmm, xmm, [rip+disp32] — VEX.128.66.0F.WIG DC; a 16-byte packed read.
+            let d = decode(&[0xc5, 0xf9, 0xdc, 0x0d, 0x0f, 0x03, 0x00, 0x00], 0);
+            assert!(
+                d.operands.mem.is_some() && d.reads_only,
+                "vpaddusb reads: {d:?}"
+            );
+            assert_eq!(d.width, 16, "packed read is 16 bytes");
+            // paddusb xmm, [rip+disp32] — legacy 66 0F DC.
+            let d = decode(&[0x66, 0x0f, 0xdc, 0x0d, 0x00, 0x00, 0x00, 0x00], 0);
+            assert!(
+                d.operands.mem.is_some() && d.reads_only,
+                "paddusb reads: {d:?}"
+            );
+            // mulx r64, r64, [rip+disp32] — VEX.LZ.F2.0F38.W1 F6; reads an 8-byte source.
+            let d = decode(&[0xc4, 0xe2, 0xf3, 0xf6, 0x0d, 0xbf, 0x01, 0x00, 0x00], 0);
+            assert!(
+                d.operands.mem.is_some() && d.reads_only,
+                "mulx W1 reads: {d:?}"
+            );
+            assert_eq!(d.width, 8, "mulx W1 reads 8 bytes");
+            // mulx r32, r32, [rip+disp32] — VEX.LZ.F2.0F38.W0 F6; a 4-byte source.
+            let d = decode(&[0xc4, 0xe2, 0x7b, 0xf6, 0x05, 0xb9, 0x01, 0x00, 0x00], 0);
+            assert!(d.reads_only && d.width == 4, "mulx W0 reads 4 bytes: {d:?}");
+            // Regression guard: a real vector store must stay a write (not read-only), or the write
+            // policy would miss it. movdqa [rip+disp32], xmm — 66 0F 7F.
+            let d = decode(&[0x66, 0x0f, 0x7f, 0x0d, 0x00, 0x00, 0x00, 0x00], 0);
+            assert!(
+                d.operands.mem.is_some() && !d.reads_only,
+                "movdqa store stays a write: {d:?}"
+            );
+        }
+
+        #[test]
+        fn vector_gp_writes_are_modeled() {
+            // The forms that move a value into a GP register must report that write, or a stale fact
+            // (mem_base, a confined index) would survive the overwrite. (#2603 hole 17; the
+            // completeness oracle checks every form, this pins the corpus-relevant ones by hand.)
+
+            // mulx rax, rbx, [rip] — VEX.LZ.F2.0F38.W1 F6: writes BOTH GP dests (reg=rax, vvvv=rbx).
+            let d = decode(&[0xc4, 0xe2, 0xe3, 0xf6, 0x05, 0, 0, 0, 0], 0);
+            assert_eq!(
+                writes_of(&d),
+                bit(0) | bit(3),
+                "mulx writes rax and rbx: {d:?}"
+            );
+            assert!(
+                d.reads_only && d.width == 8,
+                "mulx reads an 8-byte source: {d:?}"
+            );
+
+            // andn eax, ebx, [rip] — VEX.LZ.0F38.W0 F2: writes reg (rax), reads a 4-byte source.
+            let d = decode(&[0xc4, 0xe2, 0x60, 0xf2, 0x05, 0, 0, 0, 0], 0);
+            assert_eq!(writes_of(&d), bit(0), "andn writes rax: {d:?}");
+            assert!(
+                d.reads_only && d.width == 4,
+                "andn reads a 4-byte source: {d:?}"
+            );
+
+            // blsr ebx, [rip] — VEX.LZ.0F38.W0 F3 /1: the destination is in vvvv (ebx), not reg.
+            let d = decode(&[0xc4, 0xe2, 0x60, 0xf3, 0x0d, 0, 0, 0, 0], 0);
+            assert_eq!(
+                writes_of(&d),
+                bit(3),
+                "blsr writes its vvvv dest rbx: {d:?}"
+            );
+
+            // pextrq rbx, xmm0, 0 — 66 REX.W 0F3A 16 /r ib: writes the GP r/m (rbx).
+            let d = decode(&[0x66, 0x48, 0x0f, 0x3a, 0x16, 0xc3, 0x00], 0);
+            assert_eq!(writes_of(&d), bit(3), "pextrq writes rbx: {d:?}");
+
+            // cvtsd2si rbx, [rip] — F2 REX.W 0F 2D /r: a float→GP-int convert writes the GP reg.
+            let d = decode(&[0xf2, 0x48, 0x0f, 0x2d, 0x1d, 0, 0, 0, 0], 0);
+            assert_eq!(writes_of(&d), bit(3), "cvtsd2si writes rbx: {d:?}");
+
+            // movmskps eax, xmm1 — 0F 50 /r: a lane-mask into a GP reg (no memory).
+            let d = decode(&[0x0f, 0x50, 0xc1], 0);
+            assert_eq!(writes_of(&d), bit(0), "movmskps writes rax: {d:?}");
+
+            // movd r/m32, xmm (store to a GP reg) — 66 0F 7E /r: writes the r/m GP reg (rbx).
+            let d = decode(&[0x66, 0x0f, 0x7e, 0xc3], 0);
+            assert_eq!(writes_of(&d), bit(3), "movd-to-reg writes rbx: {d:?}");
+
+            // cmpxchg rbx, rcx — 0F B1 /r: writes its r/m destination (rbx) and rax.
+            let d = decode(&[0x48, 0x0f, 0xb1, 0xcb], 0);
+            assert_eq!(
+                writes_of(&d),
+                bit(0) | bit(3),
+                "cmpxchg writes rax and rbx: {d:?}"
+            );
+
+            // An EVEX compressed-disp8 memory operand is rejected (its scale is unknown): vaddpd with
+            // a disp8 (ModRM 0x40) must not decode to a trusted access. EVEX.66.0F.W1 58.
+            let d = decode(&[0x62, 0xf1, 0xfd, 0x08, 0x58, 0x40, 0x02], 0);
+            assert!(
+                matches!(d.kind, Kind::Forbidden(_)),
+                "EVEX disp8 rejected (unknown scale): {d:?}"
+            );
+            // Its disp32 form (ModRM 0x05, rip-relative) decodes — the scale applies only to disp8.
+            let d = decode(&[0x62, 0xf1, 0xfd, 0x08, 0x58, 0x05, 0, 0, 0, 0], 0);
+            assert_eq!(d.kind, Kind::Normal, "EVEX disp32 decodes: {d:?}");
+        }
+
         /// The abstract lattice's `meet` (the fact true on both paths, and the order the checker
         /// relies on) and the loop-header widening that bounds the fixpoint (#2535).
         #[test]
@@ -4022,14 +4417,25 @@ pub(crate) mod x86 {
             assert_eq!(Stack(Some(-8)).meet(Stack(Some(-16))), Stack(None));
             assert_eq!(Stack(Some(-8)).meet(MemBase), Unknown);
 
-            // Widening at a loop header drops `Bounded` (which could grow each iteration) but keeps
-            // the loop-invariant context-param and `Confined` facts, so the fixpoint terminates.
+            // Widening at a loop header drops only a `WinPtr`, whose offset a strided loop can grow.
+            // The mask-derived `Bounded`, the loop-invariant context-param and `Confined` facts all
+            // survive, so a `call.dyn` index or strided bound carried around a loop keeps its bound
+            // (#2603) and the fixpoint still terminates.
             let mut s = State::entry(Frame::UNKNOWN);
             s.regs[8] = Bounded(16);
             s.regs[9] = conf;
+            s.regs[10] = WinPtr(0x1000);
             s.widen();
-            assert_eq!(s.regs[8], Unknown);
+            assert_eq!(
+                s.regs[8],
+                Bounded(16),
+                "a mask bound can't grow, so widening keeps it"
+            );
             assert_eq!(s.regs[9], conf);
+            assert_eq!(
+                s.regs[10], Unknown,
+                "a strided window pointer can grow, so widening drops it"
+            );
             assert_eq!(s.regs[reg::RDI as usize], MemBase);
         }
 
@@ -4089,12 +4495,14 @@ pub(crate) mod x86 {
         const TAIL0: Contract = Contract {
             clobbers: SYSV_CLOBBERS,
             pops: Some(0),
+            args: &[],
         };
 
         /// A Tail-CC callee with 16 bytes of stack arguments.
         const TAIL16: Contract = Contract {
             clobbers: SYSV_CLOBBERS,
             pops: Some(16),
+            args: &[],
         };
 
         /// The relocation a call or tail call to [`TAIL0`] carries on the `rel32` at `at`.
@@ -4325,7 +4733,8 @@ pub(crate) mod x86 {
                 sysv,
                 Some(Contract {
                     clobbers: SYSV_CLOBBERS,
-                    pops: Some(0)
+                    pops: Some(0),
+                    args: &[],
                 })
             );
             let preserve = |r: &[types::Type]| {
@@ -4401,21 +4810,198 @@ pub(crate) mod x86 {
             let sysv = with(Contract {
                 clobbers: SYSV_CLOBBERS,
                 pops: Some(0),
+                args: &[],
             });
             assert_eq!(sysv.regs[reg::RDI as usize], Fact::Unknown);
             assert_eq!(sysv.regs[reg::RSP as usize], Fact::Stack(Some(0)));
             let tail = with(Contract {
                 clobbers: SYSV_CLOBBERS,
                 pops: Some(16),
+                args: &[],
             });
             assert_eq!(tail.regs[reg::RSP as usize], Fact::Stack(Some(16)));
             let preserve = with(Contract {
                 clobbers: 0,
                 pops: Some(0),
+                args: &[],
             });
             assert_eq!(preserve.regs[reg::RDI as usize], Fact::MemBase);
             let unknown = [0x48, 0x89, 0xf0, 0xff, 0xd0, 0xc3]; // mov rax, rsi; call rax; ret
             assert!(has(&findings(&unknown), "unidentified callee"));
+        }
+
+        /// #2534 — a host call's argument registers are checked against its contract: the window base
+        /// must be the real `mem_base`, never another value a backend bug left in the register.
+        #[test]
+        fn a_host_call_argument_must_match_its_contract() {
+            // A callee that wants the window base in its second argument register (rsi), as the
+            // `call.cap` thunk does.
+            const CAP: Contract = Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(0),
+                args: &[ArgTag::Any, ArgTag::WindowBase],
+            };
+            let reloc = |at: u32| Reloc {
+                at,
+                kind: R::Abs8,
+                addend: 0,
+                callee: Some(CAP),
+            };
+            let c = CHECK_LEN as u32;
+            // mov rsi, rdi (rsi := the window base); movabs rax, <sym>; call rax; ret
+            let ok = checked(&[
+                0x48, 0x89, 0xfe, 0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xd0, 0xc3,
+            ]);
+            let f = check(&ok, &[reloc(c + 5)], Entry::Guest(&G), Frame::UNKNOWN);
+            assert!(
+                f.is_empty(),
+                "a correct window-base argument was flagged: {f:?}"
+            );
+            // Without the move, rsi is still fn_table_base — a different window.
+            let bad = checked(&[0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xd0, 0xc3]);
+            let f = check(&bad, &[reloc(c + 2)], Entry::Guest(&G), Frame::UNKNOWN);
+            assert!(has(&f, "call argument 1"), "{f:?}");
+        }
+
+        /// #2534 — a host call that writes a caller-frame buffer clears only that buffer's slots, so
+        /// a context-pointer spill (here `mem_base`) survives; a frame pointer the contract doesn't
+        /// model forces a full clear, the sound fallback.
+        #[test]
+        fn a_write_buffer_call_spares_the_context_spills() {
+            // sub rsp,0x20; mov [rsp+0x10],rdi (spill mem_base at −0x10); lea rdx,[rsp] (an 8-byte
+            // buffer at −0x20); movabs rax,<sym>; call rax; mov rax,[rsp+0x10] (reload); add rsp,0x20; ret
+            let body = [
+                0x48, 0x83, 0xec, 0x20, // sub rsp, 0x20
+                0x48, 0x89, 0x7c, 0x24, 0x10, // mov [rsp+0x10], rdi
+                0x48, 0x8d, 0x14, 0x24, // lea rdx, [rsp]
+                0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, // movabs rax, <sym>   (Abs8 at 15)
+                0xff, 0xd0, // call rax
+                0x48, 0x8b, 0x44, 0x24, 0x10, // mov rax, [rsp+0x10]
+                0x48, 0x83, 0xc4, 0x20, // add rsp, 0x20
+                0xc3, // ret
+            ];
+            let with = |c: Contract| {
+                run_with(
+                    &body,
+                    &[Reloc {
+                        at: 15,
+                        kind: R::Abs8,
+                        addend: 0,
+                        callee: Some(c),
+                    }],
+                )
+            };
+            // Writes an 8-byte buffer through its third argument (rdx): only [−0x20,−0x18) is dropped.
+            let status = with(Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(0),
+                args: &[
+                    ArgTag::Any,
+                    ArgTag::Any,
+                    ArgTag::StackSlot {
+                        len: 8,
+                        write: true,
+                    },
+                ],
+            });
+            assert_eq!(
+                status.regs[0],
+                Fact::MemBase,
+                "the mem_base spill did not survive a write-buffer call"
+            );
+            // An identified callee with no argument contract: the frame pointer is unexpected, so
+            // every data slot is cleared, including the spill.
+            let plain = with(Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(0),
+                args: &[],
+            });
+            assert_eq!(
+                plain.regs[0],
+                Fact::Unknown,
+                "an unmodelled frame-pointer call must clear the spill"
+            );
+        }
+
+        /// #2534 — a host call that only *reads* a caller-frame buffer (GcRoots' marshalling struct)
+        /// clears nothing: the host does not write our stack through a read buffer, so even the
+        /// buffer's own slot survives — unlike a write buffer, whose bytes are dropped. The pointer
+        /// must still be a known frame slot, never a guest value forged into the argument register.
+        #[test]
+        fn a_read_buffer_call_spares_the_buffer_itself() {
+            // sub rsp,0x20; mov [rsp],rdi (a tracked value at −0x20, inside the buffer); lea rdi,[rsp]
+            // (the buffer pointer); movabs rax,<sym>; call rax; mov rax,[rsp] (reload −0x20); add; ret
+            let body = [
+                0x48, 0x83, 0xec, 0x20, // sub rsp, 0x20
+                0x48, 0x89, 0x3c, 0x24, // mov [rsp], rdi       (mem_base at −0x20)
+                0x48, 0x8d, 0x3c, 0x24, // lea rdi, [rsp]       (the buffer in rdi)
+                0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, // movabs rax, <sym>   (Abs8 at 14)
+                0xff, 0xd0, // call rax
+                0x48, 0x8b, 0x04, 0x24, // mov rax, [rsp]       (reload −0x20)
+                0x48, 0x83, 0xc4, 0x20, // add rsp, 0x20
+                0xc3, // ret
+            ];
+            let with = |c: Contract| {
+                run_with(
+                    &body,
+                    &[Reloc {
+                        at: 14,
+                        kind: R::Abs8,
+                        addend: 0,
+                        callee: Some(c),
+                    }],
+                )
+            };
+            // A read buffer (rdi): the host does not write it, so [−0x20] keeps the value we stored.
+            let read = with(Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(0),
+                args: &[ArgTag::StackSlot {
+                    len: 80,
+                    write: false,
+                }],
+            });
+            assert_eq!(
+                read.regs[0],
+                Fact::MemBase,
+                "a read-buffer call must not clear the buffer's own slot"
+            );
+            // The same call tagged as a *write* buffer drops the overlapping bytes (the control).
+            let write = with(Contract {
+                clobbers: SYSV_CLOBBERS,
+                pops: Some(0),
+                args: &[ArgTag::StackSlot {
+                    len: 80,
+                    write: true,
+                }],
+            });
+            assert_eq!(
+                write.regs[0],
+                Fact::Unknown,
+                "a write-buffer call must drop the buffer's bytes"
+            );
+            // The pointer must be a real frame slot: with rdi left at its entry value (the window
+            // base, not a slot), the read-buffer argument is rejected.
+            let bad = checked(&[0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xd0, 0xc3]);
+            let f = check(
+                &bad,
+                &[Reloc {
+                    at: CHECK_LEN as u32 + 2,
+                    kind: R::Abs8,
+                    addend: 0,
+                    callee: Some(Contract {
+                        clobbers: SYSV_CLOBBERS,
+                        pops: Some(0),
+                        args: &[ArgTag::StackSlot {
+                            len: 80,
+                            write: false,
+                        }],
+                    }),
+                }],
+                Entry::Guest(&G),
+                Frame::UNKNOWN,
+            );
+            assert!(has(&f, "call argument 0"), "a forged read buffer: {f:?}");
         }
 
         /// br_table's dispatch as Cranelift emits it (`JmpTableSeq` behind the index clamp), with

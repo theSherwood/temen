@@ -80,7 +80,7 @@ static void emit_header(char *buf) {
   eb(buf, 'T'); eb(buf, 'E'); eb(buf, 'M'); eb(buf, 'E'); eb(buf, 'N');
   eb(buf, 0); eb(buf, 0); eb(buf, 0);
   eb(buf, 0); eb(buf, 0);                 // kind = module
-  eb(buf, (15) & 0xff); eb(buf, (15) >> 8); // version (u16)
+  eb(buf, (16) & 0xff); eb(buf, (16) >> 8); // version (u16)
   eb(buf, 0); eb(buf, 0); eb(buf, 0); eb(buf, 0); // flags
   eb(buf, 1);
   eb(buf, 17);
@@ -110,15 +110,13 @@ static long emit_adder(char *buf, long k) {
   eb(buf, 1);
   eb(buf, 1);
   eb(buf, 0); // no captures (v14)
-  eb(buf, 2);    // 2 instructions
-  eb(buf, 0x11); // v2 = i64.const k
-  sleb(buf, k);
-  eb(buf, 0x40); // v3 = i64.add v0 v2
+  eb(buf, 1);    // 1 instruction
+  eb(buf, 0x40); // v2 = i64.add v0 k (an immediate: uleb operand index, sleb immediate)
   uleb(buf, 0);
-  uleb(buf, 2);
-  eb(buf, 0x83); // return v3
+  sleb(buf, k);
+  eb(buf, 0x83); // return v2
   uleb(buf, 1);
-  uleb(buf, 3);
+  uleb(buf, 2);
   return n_out;
 }
 // `caller(a, b) = f(a, b)` — imports `f` by name (idx 0) and forwards. The *same* bytes are loaded

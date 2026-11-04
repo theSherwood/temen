@@ -94,8 +94,9 @@ static void sleb(Emit *e, long v) {
 
 // Emit a one-function unit `(i64 a, i64 b) -> (i64)` (the raw shape `__vm_jit_invoke2` calls)
 // computing `a * k + b + w` as straight-line IR. `k`/`w` are worker-specific, so each worker JITs a
-// genuinely distinct unit. Opcodes mirror temen-encode: 0x11 = i64.const (+ sleb), 0x40 = i64.add,
-// 0x42 = i64.mul (+ uleb operand indices); 0x83 = return.
+// genuinely distinct unit. Opcodes mirror temen-encode (v16): 0x40 = i64.add and 0x42 = i64.mul of an
+// immediate (+ uleb operand index, sleb immediate); 0x4F 0x00 = i64.add of two values (+ uleb operand
+// indices); 0x83 = return.
 static long emit_unit(char *buf, long k, long w) {
   Emit e = {buf, 0};
   // Header: the unified TEMEN wire header (WIRE.md) — 16 bytes, little-endian:
@@ -104,7 +105,7 @@ static long emit_unit(char *buf, long k, long w) {
   eb(&e, 'T'); eb(&e, 'E'); eb(&e, 'M'); eb(&e, 'E'); eb(&e, 'N');
   eb(&e, 0); eb(&e, 0); eb(&e, 0);
   eb(&e, 0); eb(&e, 0);                 // kind = module
-  eb(&e, (15) & 0xff); eb(&e, (15) >> 8); // version (u16)
+  eb(&e, (16) & 0xff); eb(&e, (16) >> 8); // version (u16)
   eb(&e, 0); eb(&e, 0); eb(&e, 0); eb(&e, 0); // flags
   // Memory descriptor: present, size_log2 17 — must match this module's window (the validator's
   // memory-match precondition), which chibicc keeps at the 64 KiB default for a small program.
@@ -131,30 +132,25 @@ static long emit_unit(char *buf, long k, long w) {
   eb(&e, 1);
   eb(&e, 1);
   eb(&e, 0); // no captures (v14)
-  // 5 instructions: const k, mul, add b, const w, add w.
-  uleb(&e, 5);
-  // v2 = i64.const k
-  eb(&e, 0x11);
-  sleb(&e, k);
-  // v3 = i64.mul v0 v2   (a * k)
+  // 3 instructions: mul by k, add b, add w.
+  uleb(&e, 3);
+  // v2 = i64.mul v0 k   (a * k)
   eb(&e, 0x42);
   uleb(&e, 0);
+  sleb(&e, k);
+  // v3 = i64.add v2 v1   (+ b)
+  eb(&e, 0x4F);
+  eb(&e, 0);
   uleb(&e, 2);
-  // v4 = i64.add v3 v1   (+ b)
+  uleb(&e, 1);
+  // v4 = i64.add v3 w   (+ w)
   eb(&e, 0x40);
   uleb(&e, 3);
-  uleb(&e, 1);
-  // v5 = i64.const w
-  eb(&e, 0x11);
   sleb(&e, w);
-  // v6 = i64.add v4 v5   (+ w)
-  eb(&e, 0x40);
-  uleb(&e, 4);
-  uleb(&e, 5);
-  // return v6
+  // return v4
   eb(&e, 0x83);
   uleb(&e, 1);
-  uleb(&e, 6);
+  uleb(&e, 4);
   return e.n;
 }
 

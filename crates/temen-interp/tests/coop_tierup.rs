@@ -711,7 +711,7 @@ fn coop_tierup_live_futex_matches_pure_interp() {
     );
 }
 
-// #816 env-routed tier-up — a task whose window lives in `extra_envs` (a §14 child, or a thread it
+// #816 env-routed tier-up — a task whose window is a child domain's (a §14 child, or a thread it
 // spawns) TIERS UP over its own window: the engine routes the driver's per-event reads
 // (`pending_win`, `window_scalar_extent`, `mem_map_info`/`mem_map_version`) to the pending
 // round-trip's task env, and the eligibility gates (`tierup_servable`) admit a window the driver can
@@ -1343,8 +1343,8 @@ fn a_root_fork_twin_interprets_when_the_run_holds_a_jit() {
             got, want,
             "jit {jit}: the tier-up run diverged from the oracle"
         );
-        // `-1` is the root's env; `0`, the twin's, which its thread shares.
-        let tiered: &[i64] = if jit { &[-1] } else { &[-1, 0, 0] };
+        // `-1` is the root's domain; `1`, the twin's, which its thread shares.
+        let tiered: &[i64] = if jit { &[-1] } else { &[-1, 1, 1] };
         assert_eq!(
             envs, tiered,
             "jit {jit}: the envs whose leaf calls tiered up"

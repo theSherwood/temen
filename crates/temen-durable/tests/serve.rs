@@ -5,7 +5,7 @@
 //! linkage rides the powerbox, and the thaw's serve loop resumes it to reply for real.
 
 use temen_durable::{arm_freeze_after, init_durable_window, transform_module_assume_confined};
-use temen_interp::{run_capture_reserved_with_host, Host, Value};
+use temen_interp::{run_capture_reserved_with_host, Host, Reply, Value};
 use temen_ir::Memory;
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
@@ -82,7 +82,11 @@ fn a_mid_handler_freeze_thaws_and_the_handler_replies() {
             &mut h,
         );
         assert_eq!(r, Ok(vec![Value::I64(1)]), "one dispatch served");
-        assert_eq!(h.svc_result(t), Some(42), "the handler's real reply");
+        assert_eq!(
+            h.svc_result(t),
+            Some(Reply::Results(vec![42])),
+            "the handler's real reply"
+        );
     }
 
     // Armed at the first fiber safepoint — the handler's own `cont.resume` — so the freeze
@@ -118,7 +122,11 @@ fn a_mid_handler_freeze_thaws_and_the_handler_replies() {
     let mut fuel = 1_000_000u64;
     let (r, _) = run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &twin, SIZE_LOG2, &mut h);
     assert_eq!(r, Ok(vec![Value::I64(1)]), "one dispatch served");
-    assert_eq!(h.svc_result(t), Some(42), "the handler's real reply");
+    assert_eq!(
+        h.svc_result(t),
+        Some(Reply::Results(vec![42])),
+        "the handler's real reply"
+    );
     assert!(h.frozen_handlers().is_empty(), "the serve loop took it");
 }
 
@@ -237,7 +245,7 @@ fn a_domain_frozen_at_its_serve_point_thaws_and_drains_the_restored_queue() {
     );
     assert_eq!(
         h2.svc_result(0),
-        Some(42),
+        Some(Reply::Results(vec![42])),
         "the completion cell filled on thaw"
     );
 }
@@ -335,7 +343,11 @@ fn an_idle_server_freezes_on_quiesce_and_thaws_still_serving() {
         Ok(vec![Value::I64(1041)]),
         "the thawed server drains and serves the restored dispatch (served*1000 + cell)"
     );
-    assert_eq!(h2.svc_result(ticket), Some(42), "the handler's reply");
+    assert_eq!(
+        h2.svc_result(ticket),
+        Some(Reply::Results(vec![42])),
+        "the handler's reply"
+    );
 }
 
 /// #1676 — a serving domain whose handler is **parked**: `hold` (op 0) waits on a word only `poke`
@@ -421,7 +433,10 @@ fn a_parked_handler_freezes_and_its_thaw_replies() {
     assert_eq!(r, Ok(vec![Value::I64(2)]), "two served");
     assert_eq!(
         (h.svc_result(t_hold), h.svc_result(t_poke)),
-        (Some(100), Some(7))
+        (
+            Some(Reply::Results(vec![100])),
+            Some(Reply::Results(vec![7]))
+        )
     );
 
     // Frozen with `hold` parked.
@@ -453,6 +468,9 @@ fn a_parked_handler_freezes_and_its_thaw_replies() {
     assert_eq!(r, Ok(vec![Value::I64(2)]), "two served across the cut");
     assert_eq!(
         (h.svc_result(t_hold), h.svc_result(t_poke)),
-        (Some(100), Some(7))
+        (
+            Some(Reply::Results(vec![100])),
+            Some(Reply::Results(vec![7]))
+        )
     );
 }

@@ -652,16 +652,21 @@ pub fn inline_calls_with(m: &Module, limits: InlineLimits) -> Module {
         while bi < funcs[ci].blocks.len() {
             let mut ii = 0;
             while ii < funcs[ci].blocks[bi].insts.len() {
-                let callee = match funcs[ci].blocks[bi].insts[ii] {
-                    Inst::Call { func, .. } => func as usize,
+                let (callee, argc) = match &funcs[ci].blocks[bi].insts[ii] {
+                    Inst::Call { func, args } => (*func as usize, args.len()),
                     _ => {
                         ii += 1;
                         continue;
                     }
                 };
-                // Skip direct self-recursion, an out-of-range index, an ineligible or too-big callee.
+                // Skip direct self-recursion, an out-of-range index, an ineligible or too-big callee,
+                // and a call whose arguments don't match the callee's parameters. The verifier refuses
+                // that call, and a linker meets one when two units disagree on a function's ABI. Its
+                // splice would bind the arguments to the parameters by position, and so turn a module
+                // that fails to verify into one that verifies and computes something else (#2719).
                 let fits = callee != ci
                     && callee < funcs.len()
+                    && funcs[callee].params.len() == argc
                     && is_inlinable(&funcs[callee], limits.max_callee)
                     && callee_total_insts(&funcs[callee]) <= budget;
                 if !fits {

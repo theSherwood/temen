@@ -2054,7 +2054,7 @@ impl DapServer {
                     ("category", Json::s(category)),
                     (
                         "output",
-                        Json::s(String::from_utf8_lossy(text).into_owned()),
+                        Json::s(String::from_utf8_lossy(&text).into_owned()),
                     ),
                 ]),
             ));

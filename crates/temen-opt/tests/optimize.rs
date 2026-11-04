@@ -241,11 +241,12 @@ fn does_not_fold_trapping_div_and_preserves_trap() {
         2,
     );
     let opt = check_equiv(&m, &[vec![]]);
-    // The division survives the optimizer untouched.
+    // The division survives the optimizer, its divisor its immediate (#2585).
     assert!(matches!(
-        opt.funcs[0].blocks[0].insts[2],
-        Inst::IntBin {
+        opt.funcs[0].blocks[0].insts[1],
+        Inst::IntBinImm {
             op: BinOp::DivS,
+            imm: 0,
             ..
         }
     ));
@@ -272,9 +273,10 @@ fn signed_min_div_neg_one_not_folded() {
     );
     let opt = check_equiv(&m, &[vec![]]);
     assert!(matches!(
-        opt.funcs[0].blocks[0].insts[2],
-        Inst::IntBin {
+        opt.funcs[0].blocks[0].insts[1],
+        Inst::IntBinImm {
             op: BinOp::DivS,
+            imm: -1,
             ..
         }
     ));
@@ -627,10 +629,16 @@ fn drops_dead_arithmetic_keeps_live_path() {
 
     let opt = check_equiv(&m, &[vec![Value::I64(10)], vec![Value::I64(-1)]]);
     let insts = &opt.funcs[0].blocks[0].insts;
-    // Only the live const 7 and the live add survive; the dead 100/200/300 chain is gone.
-    assert_eq!(insts.len(), 2);
-    assert!(matches!(insts[0], Inst::ConstI64(7)));
-    assert!(matches!(insts[1], Inst::IntBin { op: BinOp::Add, .. }));
+    // Only the live add survives, its 7 its immediate (#2585); the dead 100/200/300 chain is gone.
+    assert_eq!(insts.len(), 1);
+    assert!(matches!(
+        insts[0],
+        Inst::IntBinImm {
+            op: BinOp::Add,
+            imm: 7,
+            ..
+        }
+    ));
     assert_eq!(run(&opt, &[Value::I64(10)]), Ok(vec![Value::I64(17)]));
 }
 

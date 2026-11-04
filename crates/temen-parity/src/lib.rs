@@ -262,6 +262,8 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         | Inst::ConstF64(_)
         | Inst::IntBin { .. }
         | Inst::IntCmp { .. }
+        | Inst::IntBinImm { .. }
+        | Inst::IntCmpImm { .. }
         | Inst::Eqz { .. }
         | Inst::Convert { .. }
         | Inst::Select { .. }
