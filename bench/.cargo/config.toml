@@ -1,0 +1,11 @@
+# #2779 — every function aligned to 64 bytes. Otherwise a change to the size of any code in the binary
+# (temen-jit, temen-run, the bench itself) moves the host code a kernel runs, such as the `call.cap`
+# thunk, within its cache line, and the kernel's ratio moves with it: `hostcall` by ~15%.
+#
+# Native targets only: `rustbench` builds its wasm workloads under this directory too, and a wasm
+# function has no address to align.
+#
+# Cargo ignores this when `RUSTFLAGS` is set, so the nightly bench job unsets it, and the bench
+# warns at startup when it was built without the alignment.
+[target.'cfg(not(target_family = "wasm"))']
+rustflags = ["-C", "llvm-args=-align-all-functions=6"]
