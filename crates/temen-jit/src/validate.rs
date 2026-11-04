@@ -1739,21 +1739,22 @@ pub(crate) mod x86 {
                 if let Some(f) = findings.as_deref_mut() {
                     check_args(&c, &state, pos, f);
                 }
-                // The caller's slots survive the call: an accepted guest callee writes only its own
-                // frame (below this `rsp`, claim item 4, the induction), and a host callee writes the
-                // caller's stack only through a write-buffer pointer the contract says it was handed
-                // (#2534, §2a handler hygiene). So drop exactly those buffers' slots and let the
-                // context-pointer spills (`mem_base`, `vmctx`, the fuel cell, …) survive. A frame
-                // pointer the contract does not tag as a buffer is unexpected — a guest pointer is a
-                // window offset, never a native frame pointer — so clear every data slot, sound but
-                // imprecise. (`ReturnArea`, the caller's own `sret` area, is outside this frame, so a
-                // callee handed it writes the caller's result slots, not ours.)
-                // A frame pointer in a register the contract doesn't account for forces a full clear
-                // only when the callee is unidentified (an empty contract — arguments unknown). An
-                // identified callee's contract lists its frame-pointer arguments, so a frame pointer
-                // in a register past them is caller scratch, not an argument, and is ignored — e.g. a
-                // stale pointer left in `rsi` across the fuel refill, which reads only the cell.
-                let conservative = c.args.is_empty();
+                // The caller's slots survive the call: an **identified** callee writes the caller's
+                // stack only through a write-buffer pointer its contract tags (#2534, §2a handler
+                // hygiene) — a guest callee writes only its own frame (below this `rsp`, claim item 4,
+                // the induction) and so tags none; a host callee tags exactly the buffers it was
+                // handed. So drop exactly those tagged buffers' slots and let the context-pointer
+                // spills (`mem_base`, `vmctx`, the fuel cell, …) survive. Only an **unidentified**
+                // callee (an empty fallback contract, target unknown) could write anywhere, so there
+                // a frame pointer in an argument register forces a full data-slot clear — sound but
+                // imprecise. For an identified callee, a frame pointer in a register past its tagged
+                // arguments is caller scratch, not something it writes through, and is ignored (e.g. a
+                // `mem_base`/fuel-cell pointer left in an argument register across a `call.dyn`, whose
+                // Tail-CC guest callee has no tagged buffers — #2739: keying this clear on
+                // `args.is_empty()` instead of identification dropped that spill and cascaded).
+                // (`ReturnArea`, the caller's own `sret` area, is outside this frame, so a callee
+                // handed it writes the caller's result slots, not ours.)
+                let conservative = callee.is_none();
                 let mut unexpected = false;
                 let mut writes: Vec<(i64, i64)> = Vec::new();
                 for (i, &r) in reg::ARG_REGS.iter().enumerate() {
@@ -4909,8 +4910,9 @@ pub(crate) mod x86 {
                 Fact::MemBase,
                 "the mem_base spill did not survive a write-buffer call"
             );
-            // An identified callee with no argument contract: the frame pointer is unexpected, so
-            // every data slot is cleared, including the spill.
+            // An identified callee with no argument contract (a Tail-CC guest callee) writes no
+            // caller buffer, so the frame pointer in `rdx` is caller scratch and the spill survives
+            // (#2739). An *unidentified* callee is the conservative case: the spill is cleared.
             let plain = with(Contract {
                 clobbers: SYSV_CLOBBERS,
                 pops: Some(0),
@@ -4918,8 +4920,22 @@ pub(crate) mod x86 {
             });
             assert_eq!(
                 plain.regs[0],
+                Fact::MemBase,
+                "an identified empty-contract call must keep the spill under a scratch frame pointer"
+            );
+            let unident = run_with(
+                &body,
+                &[Reloc {
+                    at: 15,
+                    kind: R::Abs8,
+                    addend: 0,
+                    callee: None,
+                }],
+            );
+            assert_eq!(
+                unident.regs[0],
                 Fact::Unknown,
-                "an unmodelled frame-pointer call must clear the spill"
+                "an unidentified frame-pointer call must clear the spill"
             );
         }
 
@@ -5002,6 +5018,52 @@ pub(crate) mod x86 {
                 Frame::UNKNOWN,
             );
             assert!(has(&f, "call argument 0"), "a forged read buffer: {f:?}");
+        }
+
+        #[test]
+        fn an_identified_call_keeps_a_context_spill_under_a_scratch_frame_pointer() {
+            // #2739: a context pointer (here mem_base) is spilled to a frame slot and reloaded across
+            // an identified call that happens to hold a frame pointer in an argument register (a
+            // `lea rsi,[rsp]` scratch). An identified callee writes the caller's frame only through a
+            // tagged write buffer — a Tail-CC guest callee (empty-args contract, like a `call.dyn`
+            // result) tags none — so the spill must survive. Keying the conservative clear on
+            // `args.is_empty()` instead of callee identification dropped it, which cascaded a whole
+            // function to `rsp = Stack(None)` once the reload (e.g. a fuel cell) came back `Unknown`.
+            let body = [
+                0x48, 0x83, 0xec, 0x20, // sub rsp, 0x20
+                0x48, 0x89, 0x7c, 0x24, 0x18, // mov [rsp+0x18], rdi   (mem_base at −8)
+                0x48, 0x8d, 0x34,
+                0x24, // lea rsi, [rsp]        (a frame pointer in an arg reg)
+                0xe8, 0, 0, 0,
+                0, // call rel32                 (X86CallPCRel4 at 14 → TAIL0)
+                0x48, 0x8b, 0x44, 0x24, 0x18, // mov rax, [rsp+0x18]   (reload −8)
+                0x48, 0x83, 0xc4, 0x20, // add rsp, 0x20
+                0xc3, // ret
+            ];
+            // An identified callee (TAIL0): the spill survives, so the reload is still mem_base.
+            let ident = run_with(&body, &[call_reloc(14)]);
+            assert_eq!(
+                ident.regs[0],
+                Fact::MemBase,
+                "an identified call must keep a context spill under a scratch frame pointer"
+            );
+            // The control: the same call with an unidentified callee clears the data slots, so the
+            // reload reads Unknown — the sound fallback when the target (and thus its writes) is
+            // unknown.
+            let unident = run_with(
+                &body,
+                &[Reloc {
+                    at: 14,
+                    kind: R::X86CallPCRel4,
+                    addend: -4,
+                    callee: None,
+                }],
+            );
+            assert_eq!(
+                unident.regs[0],
+                Fact::Unknown,
+                "an unidentified call must still clear the data slots conservatively"
+            );
         }
 
         /// br_table's dispatch as Cranelift emits it (`JmpTableSeq` behind the index clamp), with
