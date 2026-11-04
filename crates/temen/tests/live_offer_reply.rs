@@ -456,40 +456,21 @@ block 0 (vh: i64) {
 /// #2742 — a handler that calls its own domain waits while its serve loop serves that call. The
 /// parent grants the child the offer over the child (op 19) and calls `again(h, 1)` with the child's
 /// index of it. That handler calls `again(h, 0)` through `h`, which queues on the child's own queue,
-/// and answers its reply plus one. The child's entry serves until it has served both. On the
-/// tree-walker a handler is a fiber of the serve loop, so the outer handler's wait parks only it.
+/// and answers its reply plus one. The child's one `svc.wait` serves both: the handler parked on
+/// its own domain's call parks alone, as a fiber of the serve loop, and takes the reply at once.
 #[test]
 fn a_handler_calling_its_own_domain_is_served_meanwhile() {
-    let r = run(&caller(AGAIN_CALL, ""), AGAIN_SERVER, false);
-    assert_eq!(r, Ok(vec![Value::I64(2_000_008)]), "both served: 7 + 1");
+    let r = run(&caller(AGAIN_CALL, ""), &server(AGAIN_TYPES, AGAIN), false);
+    // Two dispatches served, and the call answers 7 + 1.
+    assert_eq!(r, Ok(vec![Value::I64(2_000_008)]));
 }
 
-/// The child of [`a_handler_calling_its_own_domain_is_served_meanwhile`]: `again(h, n)` answers 7 at
-/// `n = 0`, else one more than its call of `again(h, n - 1)` through `h`. Its entry serves until it
-/// has served two.
-const AGAIN_SERVER: &str = r#"memory 12
-type 0 func (i64, i64) -> (i64)
+const AGAIN_TYPES: &str = "type 0 func (i64, i64) -> (i64)
 type 1 interface { again: 0 }
-export 0 interface "again" 1 { again: 1 }
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  vz = i64.const 0
-  br 1(vz)
-}
-block 1 (vt: i64) {
-  vw = i32.const 0
-  vn = svc.wait vw
-  vt2 = i64.add vt vn
-  vtwo = i64.const 2
-  vmore = i64.lt_s vt2 vtwo
-  br_if vmore 1(vt2) 2(vt2)
-}
-block 2 (vdone: i64) {
-  return vdone
-  }
-}
+export 0 interface \"again\" 1 { again: 1 }";
 
-func (i64, i64) -> (i64) {
+/// `again(h, n)`: 7 at `n = 0`, else one more than its call of `again(h, n - 1)` through `h`.
+const AGAIN: &str = r#"func (i64, i64) -> (i64) {
 block 0 (vh: i64, vn: i64) {
   vzero = i64.const 0
   vlast = i64.eq vn vzero
@@ -518,14 +499,6 @@ const AGAIN_CALL: &str = r#"
   vone = i64.const 1
   vcall = call.cap 268435456 0 (i64, i64) -> (i64) v7 (vin64, vone)"#;
 
-#[test]
-fn probe_2742() {
-    let (c, s) = (caller(AGAIN_CALL, ""), AGAIN_SERVER);
-    eprintln!("tree-walker: {:?}", run_on(tree_walker, &c, s, false));
-    eprintln!("bytecode:    {:?}", run_on(bytecode_engine, &c, s, false));
-    eprintln!("jit:         {:?}", run_on(jit, &c, s, false));
-}
-
 /// The caller's entry resumes fiber func 1 once with a plain `cont.resume`, then with
 /// `cont.resume.block` until it returns. `vcall` is the first resume's status · 100_000 plus the
 /// fiber's value.
@@ -551,6 +524,60 @@ block 2 (v0: i32, v5: i32, ws1: i32, wv: i64) {
   vsh1 = i64.mul ws164 vhk
   vcall = i64.add vsh1 wv"#;
 
+/// Fiber func 1 of [`a_fiber_s_thread_local_word_survives_its_park`]: [`ADDMUL_FIBER`]'s call, after
+/// it sets the thread-local word to 42.
+const TLS_FIBER: &str = r#"
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, voff: i64) {
+  vtl = i64.const 42
+  vcpu.tls.set vtl
+  v7 = i32.wrap_i64 voff
+  va = i64.const 40
+  vb = i64.const 2
+  vsum, vprod = call.cap 268435456 0 (i64, i64) -> (i64, i64) v7 (va, vb)
+  vthousand = i64.const 1000
+  vsh = i64.mul vsum vthousand
+  vr = i64.add vsh vprod
+  return vr
+  }
+}
+"#;
+
+/// The caller's entry resumes fiber func 1 once with a plain `cont.resume`, reads the thread-local
+/// word, then resumes it with `cont.resume.block` until it returns. `vcall` is the word · 100_000
+/// plus the fiber's value.
+const TLS_READER: &str = r#"
+  vf = ref.func 1
+  vfsp = i64.const 24576
+  vfk = cont.new vf vfsp
+  voff = i64.extend_i32_u v7
+  vs1, vv1 = cont.resume vfk voff
+  vtl = vcpu.tls.get
+  br 1(v0, v5, vfk, voff, vtl)
+}
+block 1 (x0: i32, x5: i32, xk: i64, xoff: i64, xtl: i64) {
+  xs, xv = cont.resume.block xk xoff
+  xone = i32.const 1
+  xdone = i32.eq xs xone
+  br_if xdone 2(x0, x5, xtl, xv) 1(x0, x5, xk, xoff, xtl)
+}
+block 2 (v0: i32, v5: i32, wtl: i64, wv: i64) {
+  vhk = i64.const 100000
+  vsh1 = i64.mul wtl vhk
+  vcall = i64.add vsh1 wv"#;
+
+/// A fiber parked on its call hands the thread-local word back with execution: the word is the
+/// vCPU's, so its resumer reads what the fiber set (#2742, `park_running_fiber`).
+#[test]
+fn a_fiber_s_thread_local_word_survives_its_park() {
+    let r = run(
+        &caller(TLS_READER, TLS_FIBER),
+        &server(ADDMUL_TYPES, ADDMUL),
+        false,
+    );
+    assert_eq!(r, served(42 * 100_000 + 42_080));
+}
+
 /// #2742 — a fiber's call parks the fiber, not its task: the plain resume that ran it into the call
 /// answers `FIBER_PARKED` (3), and the blocking resumes after it take the call's value once the
 /// reply comes.
@@ -562,4 +589,49 @@ fn a_polled_fiber_making_a_call_parks_alone() {
         false,
     );
     assert_eq!(r, served(3 * 100_000 + 42_080));
+}
+
+/// #2742 — a handler parked on a call into another domain: its serve loop waits in `svc.wait` with
+/// nothing queued, and the reply, when it comes, wakes the loop to resume the handler. The parent
+/// spawns two children from [`AGAIN`]'s module, grants the first an offer over the second (op 19),
+/// and calls `again(h, 1)` on the first, whose handler calls `again(h, 0)` on the second. Each child
+/// serves one dispatch. The parent answers `joinA · 1_000_000 + joinB · 1_000 + call`.
+#[test]
+fn a_handler_waiting_on_another_domain_wakes_its_serve_loop() {
+    let caller = format!(
+        r#"memory 17
+
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
+  vrm = i64.const 17416
+  i32.store vrm v1
+  vrb = i64.const 17420
+  i32.store vrb v2
+  vrp = i64.const 17408
+  va = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vb = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vz = i64.const 0
+  vtob = call.cap 6 14 (i32, i64) -> (i32) v0 (vb, vz)
+  vtob64 = i64.extend_i32_u vtob
+  vin = call.cap 6 19 (i32, i64) -> (i32) v0 (va, vtob64)
+  vin64 = i64.extend_i32_s vin
+  vtoa = call.cap 6 14 (i32, i64) -> (i32) v0 (va, vz)
+  vone = i64.const 1
+  vcall = call.cap 268435456 0 (i64, i64) -> (i64) vtoa (vin64, vone)
+  vja_st, vja = call.cap 6 1 (i32) -> (i64, i64) v0 (va)
+  vjb_st, vjb = call.cap 6 1 (i32) -> (i64, i64) v0 (vb)
+  vmil = i64.const 1000000
+  vk = i64.const 1000
+  vma = i64.mul vja vmil
+  vmb = i64.mul vjb vk
+  vs1 = i64.add vma vmb
+  vs = i64.add vs1 vcall
+  return vs
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(17408, &temen_ir::SpawnRec::default())
+    );
+    let r = run(&caller, &server(AGAIN_TYPES, AGAIN), false);
+    assert_eq!(r, Ok(vec![Value::I64(1_001_008)]));
 }
