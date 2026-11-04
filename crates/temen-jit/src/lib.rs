@@ -8075,7 +8075,7 @@ pub fn child_compiles() -> u64 {
     }
 }
 
-/// #330 — how many child-executor residencies this process has run: each time a pool worker
+/// #2722 — how many child-executor residencies this process has run: each time a pool worker
 /// resumes a parked/runnable task's fiber ([`child_exec::ChildExec::run_once`]). A parked task
 /// advances this only when a wake or its own deadline genuinely re-offers it — never on an idle
 /// cadence, since the pool runs none. A test reads it before and after an idle window to prove the

@@ -1,4 +1,4 @@
-//! #330 — **an idle child pool does not spin.** A detached §14 child runs as a `ChildExec` task
+//! #2722 — **an idle child pool does not spin.** A detached §14 child runs as a `ChildExec` task
 //! (temen#1469); when its root parks with no deadline, the pool must sleep until something wakes it,
 //! not re-offer it on a cadence. Before this fix an idle worker swept every parked task every 20 ms,
 //! so a `unir` session (≈5 parked vats) burned ~1 CPU core sitting at its prompt — all of it in the
@@ -32,7 +32,7 @@ const CHILD_LOG2: u8 = 16;
 
 /// Milliseconds the sibling vCPU naps before it wakes the forever-parked root. Long enough that the
 /// old 20 ms sweep would have re-offered the root ~15 times — far past the bound below — so the test
-/// fails on the pre-#330 code and passes on the fixed pool.
+/// fails on the pre-#2722 code and passes on the fixed pool.
 const IDLE_MS: u64 = 300;
 
 /// The most residencies a correct pool spends on the child root: reach the park (1), wake on the
@@ -154,7 +154,7 @@ fn jit(parent: &Module, child: &Module) -> i64 {
 
 /// A forever-parked child root is woken by a notify, not by a cadence sweep: the run completes with
 /// the self-checking 42, and the pool resumes the root only a handful of times across a 300 ms idle
-/// window (not once per 20 ms, as the pre-#330 sweep did).
+/// window (not once per 20 ms, as the pre-#2722 sweep did).
 #[test]
 fn an_idle_child_pool_does_not_spin() {
     let parent = parse(&parent_src());

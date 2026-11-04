@@ -47,18 +47,29 @@ use crate::{mem, vcpu_tls, CompiledModule, TrapKind, VmCtx};
 /// `StackOverflow` cleanly instead of relying on the OS guard.
 const TASK_STACK: usize = 1 << 18;
 
-/// The teardown-join backstop (#330): how often [`ChildExec::shutdown_and_join`] re-checks that the
-/// task table has drained, in case a completion's `quiescent` notify is lost in the teardown churn.
-/// The idle worker loop runs **no** cadence — a parked task is re-offered only by an explicit wake
-/// ([`Domain::wake_all_parked`]: a `notify`, a kill, a vCPU exit, teardown) or its own deadline
-/// (#2012: [`Entry::deadline`]), so an idle pool sleeps instead of sweeping tasks it cannot advance.
+/// The teardown-join backstop: how often [`ChildExec::shutdown_and_join`] re-checks that the task
+/// table has drained, in case a completion's `quiescent` notify is lost in the teardown churn. The
+/// idle worker loop runs **no** cadence (#2757): a parked task is re-offered only by a wake — a
+/// `notify`, a kill, a vCPU exit, teardown ([`Domain::wake_all_parked`]), its freeze doorbell
+/// ([`ChildExec::wake`]) — or by its own deadline (#2012: [`Entry::deadline`]).
+///
+/// Two stores still fire no wake: the host's kill-path store into the epoch cell, and
+/// [`crate::FreezeController::request_freeze`]'s into the root's freeze word. They reach a parked
+/// task only through the run's root vCPU, which re-checks them on `os_thread_rt::KILL_RECHECK`,
+/// ends, and re-offers every parked task at teardown. So vCPUs keep that re-check until those
+/// stores fire wakes of their own (#2757, slice 3).
 const TEARDOWN_RECHECK: Duration = Duration::from_millis(20);
 
-/// #330 — process-wide count of child-executor residencies ([`ChildExec::run_once`]): each time a
+/// #2722 — process-wide count of child-executor residencies ([`ChildExec::run_once`]): each time a
 /// pool worker resumes a task's fiber. A parked task advances it only when something genuinely
 /// re-offers it (a wake or its deadline), never on an idle cadence — the observable
 /// [`crate::pool_resumes`] exposes so a test can prove the idle pool does not spin.
 pub(crate) static POOL_RESUMES: AtomicU64 = AtomicU64::new(0);
+
+/// #2757 — a waker registered on what a park waits for: firing it re-offers the one task waiting
+/// there ([`ChildExec::wake`]). It holds the executor weakly, so a store that outlives the run wakes
+/// nothing.
+pub(crate) type TaskWaker = Arc<dyn Fn() + Send + Sync>;
 
 /// The limit-taking buffer-ABI trampoline a task's fiber body enters the child through
 /// (`build_trampoline(.., with_limit = true)`): the five `Entry` params plus the running stack's
@@ -419,8 +430,8 @@ extern "C" fn resume_shim(
 /// Per-task executor bookkeeping. `task` is `None` while a worker holds the task (running).
 struct Entry {
     task: Option<Box<ChildTask>>,
-    /// Parked (yielded on an event park) and not yet woken. Drives the cadence sweep and the
-    /// teardown poison; **not** the same question as [`Self::counted`].
+    /// Parked (yielded on an event park) and not yet woken: what a wake re-offers and the teardown
+    /// poisons; **not** the same question as [`Self::counted`].
     parked: bool,
     /// #1631 — whether this park was counted in `Domain::parked`. A park that carries its own
     /// deadline is not, because that counter's one reader is the futex deadlock predicate
@@ -564,6 +575,11 @@ impl ChildExec {
         let mut g = lock(&self.state);
         let id = g.next_id;
         g.next_id += 1;
+        // #2757 — a durable child's freeze doorbell wakes this task. Registered under this lock,
+        // before the task is runnable, so before it can park.
+        if let Some(d) = task.done.durable.as_ref() {
+            d.set_waker(self.waker(id));
+        }
         // Workers: one more if none is idle and the pool could still use one — bounded by the
         // widest lane this task could run in (its tightest cap), or by the task count when its
         // chain is unbounded (today's thread-per-child parallelism, as a pool).
@@ -615,10 +631,36 @@ impl ChildExec {
         // Its next poll ends it, and so does a wait a parked vCPU of it re-checks; a trap the child
         // already raised outranks the kill (#2499).
         e.vm.raise(TrapKind::ThreadFault as i64);
+        self.reoffer(&mut g, id);
+    }
+
+    /// #2757 — the waker of task `id`: what a store that can end its park fires.
+    fn waker(self: &Arc<Self>, id: u64) -> TaskWaker {
+        let exec = Arc::downgrade(self);
+        Arc::new(move || {
+            if let Some(exec) = exec.upgrade() {
+                exec.wake(id);
+            }
+        })
+    }
+
+    /// #2757 — re-offer task `id` so it re-checks its park, as a store that can end the park asks
+    /// ([`TaskWaker`]). A task that has finished is gone from the table, and nothing happens.
+    pub(crate) fn wake(&self, id: u64) {
+        let mut g = lock(&self.state);
+        self.reoffer(&mut g, id);
+    }
+
+    /// Make task `id` run again to re-check its park, and its own parked vCPUs theirs, since what
+    /// woke it may end their waits too. A running task may be on its way to a park, so the wake is
+    /// latched, as `wake_parked` latches it.
+    fn reoffer(&self, g: &mut ExecState, id: u64) {
+        let Some(e) = g.tasks.get_mut(&id) else {
+            return;
+        };
         if let Some(d) = &e.dom {
             d.wake_own_parked();
         }
-        // A running task may be on its way to a park: latch the wake, as `wake_parked` does.
         e.woken = true;
         if std::mem::take(&mut e.parked) {
             e.deadline = None;
@@ -757,13 +799,12 @@ impl ChildExec {
                         return;
                     }
                     g.idle_workers += 1;
-                    // #330 — a parked task is re-offered only by an explicit wake (a `notify`, a
-                    // kill, a vCPU exit, teardown — all through `Domain::wake_all_parked`) or by its
-                    // own deadline. Every re-check predicate (a fired kill cell, a torn-down domain,
-                    // a store a `notify` announced) rides the wake that set it, so there is nothing
-                    // to re-check on a timer: an idle worker sleeps until the earliest parked
-                    // deadline, or — when no parked task carries one — until a wake arrives, instead
-                    // of sweeping parked tasks it cannot advance.
+                    // #2757 — a parked task is re-offered only by a wake (a `notify`, a kill, a vCPU
+                    // exit, teardown, its freeze doorbell) or by its own deadline, so an idle worker
+                    // sleeps until the earliest parked deadline, or — when no parked task carries
+                    // one — until a wake arrives, instead of sweeping parked tasks it cannot
+                    // advance. A store that can end a park must fire a wake: `TEARDOWN_RECHECK`
+                    // names the two that still reach parked tasks only through the root vCPU.
                     let next = g
                         .tasks
                         .values()
@@ -882,8 +923,8 @@ impl ChildExec {
                     if e.woken {
                         g.runnable.push_back(id);
                     } else {
-                        // Parked for the wakes and the cadence sweep, never counted: the task's
-                        // root is no longer a vCPU (`settle` dropped it from `live`).
+                        // Parked until a wake (its vCPUs' exits re-offer it), never counted: the
+                        // task's root is no longer a vCPU (`settle` dropped it from `live`).
                         e.parked = true;
                     }
                 }
@@ -910,7 +951,7 @@ impl ChildExec {
     /// One residency: claim the task, seed this thread's per-task state, resume its fiber under a
     /// guard bracket over its own fault range, classify the yield, reset the thread.
     fn run_once(&self, task: &mut ChildTask, worker: u64) -> Outcome {
-        // #330 — a residency: the pool is about to resume this task's fiber (the cost a cadence
+        // #2722 — a residency: the pool is about to resume this task's fiber (the cost a cadence
         // sweep used to spend on parked tasks that could not advance). `pool_resumes` observes it.
         POOL_RESUMES.fetch_add(1, Ordering::Relaxed);
         assert!(

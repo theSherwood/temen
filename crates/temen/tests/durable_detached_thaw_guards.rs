@@ -406,16 +406,49 @@ fn a_controller_freeze_reaches_the_detached_child_a_jit_parent_is_joining() {
     );
 }
 
+/// **#2757 — a freeze reaches a parked child at once, not at its own deadline.** The freeze above,
+/// of a child parked on a 20 s futex wait. The root's join rings the child's doorbell, and the ring
+/// wakes the child's task, which sees the freeze and unwinds. Before the ring woke it, a parked
+/// child saw the freeze only at its own deadline: here, its whole 20 s wait.
+#[test]
+fn a_controller_freeze_reaches_a_parked_child_at_once_not_at_its_deadline() {
+    let Some(f) = controller_freeze_run(
+        &parent(),
+        &child_module(&waiting_child(20_000)),
+        Duration::from_millis(100),
+        1,
+        "the freeze must cut the join and carry the child",
+    ) else {
+        return;
+    };
+    assert!(
+        f.after_landing < Duration::from_secs(5),
+        "the run went on {:?} after the freeze landed: the parked child saw the freeze only at \
+         its own deadline",
+        f.after_landing
+    );
+}
+
+/// What a controller freeze left: the frozen window's image, the host carrying the detached
+/// children it captured, the powerbox's arguments, and how long the run went on once the freeze
+/// had landed.
+struct ControllerFreeze {
+    image: Vec<u8>,
+    host: Host,
+    args: Vec<i64>,
+    after_landing: Duration,
+}
+
 /// The embedder's [`temen_jit::FreezeController`] requests a freeze `after` the JIT run of `parent`
 /// starts, over a powerbox granting `child`. The frozen run returns `0` carrying `carried` detached
-/// children (`why` says why), and every engine's thaw of its artifact answers the uninterrupted `7`.
-fn controller_freeze(
+/// children (`why` says why). `None` where the JIT declines the run.
+fn controller_freeze_run(
     parent: &temen_ir::Module,
     child: &temen_ir::Module,
     after: Duration,
     carried: usize,
     why: &str,
-) {
+) -> Option<ControllerFreeze> {
     let (mut fhost, args) = powerbox(child);
     let win = init_durable_window(1 << PARENT_LOG2, ARENA);
     let fc = temen_jit::FreezeController::new();
@@ -424,9 +457,9 @@ fn controller_freeze(
         std::thread::spawn(move || {
             std::thread::sleep(after);
             fc.request_freeze();
+            std::time::Instant::now()
         })
     };
-    let started = std::time::Instant::now();
     let r = temen_run::jit_cap_run(
         parent,
         0,
@@ -437,9 +470,11 @@ fn controller_freeze(
         &mut fhost,
         Some(fc),
     );
-    eprintln!("freeze run: {:?}", started.elapsed());
-    ctl.join().expect("controller");
-    let fsnap = match r {
+    let ended = std::time::Instant::now();
+    let landed = ctl.join().expect("controller");
+    let after_landing = ended.saturating_duration_since(landed);
+    eprintln!("freeze run: went on {after_landing:?} after the freeze landed");
+    let image = match r {
         Ok((JitOutcome::Returned(v), snap)) => {
             assert_eq!(
                 (v[0], fhost.captured_detached().len()),
@@ -449,10 +484,29 @@ fn controller_freeze(
             snap.bytes().to_vec()
         }
         Ok((other, _)) => panic!("unexpected outcome {other:?}"),
-        Err(JitError::Unsupported(_)) => return,
+        Err(JitError::Unsupported(_)) => return None,
         Err(e) => panic!("JIT run failed: {e:?}"),
     };
-    let art = temen_snapshot::freeze(parent, &fsnap, &fhost).expect("serialize");
+    Some(ControllerFreeze {
+        image,
+        host: fhost,
+        args,
+        after_landing,
+    })
+}
+
+/// [`controller_freeze_run`], and every engine's thaw of its artifact answers the uninterrupted `7`.
+fn controller_freeze(
+    parent: &temen_ir::Module,
+    child: &temen_ir::Module,
+    after: Duration,
+    carried: usize,
+    why: &str,
+) {
+    let Some(f) = controller_freeze_run(parent, child, after, carried, why) else {
+        return;
+    };
+    let art = temen_snapshot::freeze(parent, &f.image, &f.host).expect("serialize");
     let mut wrong = Vec::new();
     for thaws in [Engine::Interp, Engine::Jit] {
         let mut thost = Host::new();
@@ -460,7 +514,7 @@ fn controller_freeze(
         thost.grant_durable_module(child);
         let mut twin = temen_snapshot::restore(&art, parent, &mut thost).expect("restore");
         begin_thaw(&mut twin, ARENA, 0);
-        if let Some((o, _)) = run(thaws, parent, &args, &twin, &mut thost) {
+        if let Some((o, _)) = run(thaws, parent, &f.args, &twin, &mut thost) {
             if o != Out::Ret(7) {
                 wrong.push(format!("thawed on {thaws:?}: {o:?}"));
             }

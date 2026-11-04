@@ -540,8 +540,8 @@ pub unsafe fn wait_outside<R>(
 
 /// #2424 — what re-offers a §14 child's task parked on an answer from outside the run
 /// ([`crate::fiber_park_outside`]), for the thread that posts the answer to call: it re-offers the
-/// run's parked tasks, as a `notify` does, so the task sees its answer now rather than at the
-/// executor's next sweep. It holds the executor weakly: once the run has ended it does nothing.
+/// run's parked tasks, as a `notify` does. It is the task's only wake: nothing polls a parked task
+/// (#2757). It holds the executor weakly: once the run has ended it does nothing.
 /// `None` off a task (an OS vCPU waits on the answer itself, [`wait_outside`]).
 ///
 /// # Safety
@@ -587,8 +587,9 @@ pub unsafe fn wake_host_parks_in(hub: usize, key: u64) {
 
 /// Wake the parks on `key`: an OS vCPU's through its futex cell, which the claim stops counting
 /// at once (#1625); a task's by re-offering the parked tasks, which the executor stops counting as
-/// it re-offers them (#2173) — a task's park holds no futex cell, so until then it slept to the
-/// cadence sweep still counted, and the waker's own next park could read `live == parked`.
+/// it re-offers them (#2173). A task's park holds no futex cell, so this re-offer is its only wake
+/// (#2757); before #2173 it also stayed counted until then, and the waker's own next park could
+/// read `live == parked`.
 #[cfg(not(loom))]
 fn wake_hub_parks(hub: &Domain, key: u64) {
     futex_notify(
@@ -2728,8 +2729,9 @@ unsafe fn os_join(dom: &Domain, cur: u64, done: &Done, vm: &crate::VmCtx) -> Opt
 /// joined vCPU publishes. It counts as blocked for the deadlock predicate through the completion
 /// cell, as an OS joiner does ([`Domain::join_park`], #1820); the executor gives back the task's lanes while
 /// it is parked, and re-offers it at the joined vCPU's exit broadcast (`run_child` →
-/// [`Domain::wake_all_parked`]) or its cadence sweep, poisoning it at teardown. As [`os_join`], it
-/// answers the outcome, or `None` when a kill, a freeze or the domain's end stops it.
+/// [`Domain::wake_all_parked`]), poisoning it at teardown. A freeze of its window reaches it through
+/// the joined vCPU, which re-checks the freeze, ends, and broadcasts. As [`os_join`], it answers the
+/// outcome, or `None` when a kill, a freeze or the domain's end stops it.
 ///
 /// #2010 — in a durable child it follows the OS-thread join's freeze rule: a freeze of the child's
 /// window ends the wait for re-issue on thaw, and a vCPU that unwound leaves its placeholder,
@@ -2950,9 +2952,9 @@ unsafe fn fiber_futex_wait_loop(
 ) -> i32 {
     loop {
         // D66 — a **child-domain task** has no resumer to poll it, so an already-resolved wait
-        // must not spend a park: it would then sit until an idle worker's cadence sweep. A guest
-        // fiber, a task's included (#1469), keeps the register-then-park order its resumer
-        // observes (`fiber_parks.rs`).
+        // must not spend a park: nothing would re-offer it (#2757), since an insta-wake
+        // (`WAIT_NOT_EQUAL`) fires no wake at all. A guest fiber, a task's included (#1469),
+        // keeps the register-then-park order its resumer observes (`fiber_parks.rs`).
         if slot.is_platform() {
             let st = cell.status.load(Ordering::Acquire);
             if st != PENDING_WAIT {
@@ -3206,9 +3208,10 @@ pub(crate) unsafe extern "C" fn thread_notify(sched: *const Domain, phys: u64, c
     );
     if woken > 0 {
         // D66 — a parked **child-domain task** has no resumer polling it: re-offer the parked set
-        // so the one whose cell this notify just filled runs again promptly, instead of waiting
-        // for an idle worker's cadence sweep. Each re-checks its own predicate; the unsatisfied
-        // park again (`Domain::wake_all_parked`'s discipline, extended to tasks).
+        // so the one whose cell this notify just filled runs again. Nothing else re-offers it
+        // (#2757). Each re-checks its own predicate; the unsatisfied park again
+        // (`Domain::wake_all_parked`'s discipline, extended to tasks). #2757's slice 2 re-offers
+        // only the waiter whose cell this notify filled.
         dom.wake_child_tasks();
     }
     woken as i32

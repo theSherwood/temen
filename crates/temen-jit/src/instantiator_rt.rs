@@ -89,6 +89,9 @@ pub(crate) struct DurableCell {
     /// #1854, #2427 — the pages the child holds past its declared window, asked of its own powerbox
     /// (`(hook, child ctx)`), so its capture carries them; `None` when no hook is installed.
     pub(crate) held_tail: Option<(crate::HeldTail, usize)>,
+    /// #2757 — the waker of the child's task, registered at its spawn
+    /// ([`crate::child_exec::ChildExec::spawn`]) and fired by [`Self::ring`].
+    waker: std::sync::OnceLock<crate::child_exec::TaskWaker>,
 }
 
 impl DurableCell {
@@ -105,26 +108,43 @@ impl DurableCell {
             mapped_log2,
             reserved_log2,
             held_tail,
+            waker: std::sync::OnceLock::new(),
         }
+    }
+
+    /// #2757 — register the child's task's waker: once, at its spawn, before it can park.
+    pub(crate) fn set_waker(&self, waker: crate::child_exec::TaskWaker) {
+        let first = self.waker.set(waker).is_ok();
+        debug_assert!(first, "a durable child's task is spawned once");
     }
 
     /// Ring the child's doorbell: store `UNWINDING` into its **own** freeze word (what
     /// [`crate::FreezeController::request_freeze`] does for the root), so it unwinds at its next poll
-    /// and its task deposits its window image at finish. A no-op once its window is gone, which the
-    /// answer says: whether the child was live.
+    /// and its task deposits its window image at finish. Then wake its task (#2757): a task parked
+    /// with no deadline has no next poll until something re-offers it. A no-op once its window is
+    /// gone, which the answer says: whether the child was live.
+    ///
+    /// Ring with no children table's or completion cell's lock held. The wake takes the executor's
+    /// lock, and `ChildExec::kill` holds that while it takes those (`Domain::wake_own_parked`).
     pub(crate) fn ring(&self) -> bool {
-        let base = self.base.lock().unwrap_or_else(|e| e.into_inner());
-        if let (true, Some(word)) = (*base != 0, self.shadow.freeze_word()) {
-            // SAFETY: a nonzero base is the child's live window (its task retires the base under
-            // this lock before freeing it); its freeze word is in the arena its module declared,
-            // which the verifier bounded into the window (#2518), and the word is only ever
-            // accessed as an aligned `i32`.
-            unsafe {
-                (*((*base + word as usize) as *const std::sync::atomic::AtomicI32))
-                    .store(temen_ir::durable_abi::STATE_UNWINDING, Ordering::SeqCst);
+        let live = {
+            let base = self.base.lock().unwrap_or_else(|e| e.into_inner());
+            if let (true, Some(word)) = (*base != 0, self.shadow.freeze_word()) {
+                // SAFETY: a nonzero base is the child's live window (its task retires the base under
+                // this lock before freeing it); its freeze word is in the arena its module declared,
+                // which the verifier bounded into the window (#2518), and the word is only ever
+                // accessed as an aligned `i32`.
+                unsafe {
+                    (*((*base + word as usize) as *const std::sync::atomic::AtomicI32))
+                        .store(temen_ir::durable_abi::STATE_UNWINDING, Ordering::SeqCst);
+                }
             }
+            *base != 0
+        };
+        if let Some(wake) = self.waker.get().filter(|_| live) {
+            wake();
         }
-        *base != 0
+        live
     }
 
     /// Whether the child unwound for a freeze (its task deposited its capture).
@@ -159,20 +179,26 @@ pub(crate) struct Child {
     task: u64,
 }
 
-impl Child {
-    /// #1361 step 4, #2010 — a freeze reached this child's parent: ring a durable child's doorbell,
-    /// then its own children's, if the ring found it live or it already unwound for this freeze.
-    /// The whole live subtree is rung before the run's teardown begins, so a grandchild parked under
-    /// a word nobody rang yet is never poisoned there (`ChildExec::shutdown_and_join`). A child that
-    /// already returned rings nothing: its children run on, as the oracle's do.
-    fn ring(&self) {
-        if let Some(d) = self.done.durable.as_ref() {
-            if d.ring() || d.unwound() {
-                if let Some(kid) = &self.kid {
-                    kid.ring_detached();
-                }
+/// #1361 step 4, #2010 — a freeze reached a child's parent: ring a durable child's doorbell, then
+/// its own children's, if the ring found it live or it already unwound for this freeze. The whole
+/// live subtree is rung before the run's teardown begins, so a grandchild parked under a word nobody
+/// rang yet is never poisoned there (`ChildExec::shutdown_and_join`). A child that already returned
+/// rings nothing: its children run on, as the oracle's do. Called with no table's lock held, as
+/// [`DurableCell::ring`] asks.
+fn ring_child(done: &ChildDone, kid: Option<&std::sync::Arc<Nursery>>) {
+    if let Some(d) = done.durable.as_ref() {
+        if d.ring() || d.unwound() {
+            if let Some(kid) = kid {
+                kid.ring_detached();
             }
         }
+    }
+}
+
+impl Child {
+    /// What [`ring_child`] needs of this child, taken out of its table so the ring holds no lock.
+    fn ring_target(&self) -> (std::sync::Arc<ChildDone>, Option<std::sync::Arc<Nursery>>) {
+        (std::sync::Arc::clone(&self.done), self.kid.clone())
     }
 
     /// A child whose outcome is **already known** (a thaw's delivery, or a slot's padding): a cell
@@ -1004,7 +1030,11 @@ impl Nursery {
     /// poll like any root and its task deposits its window image at finish. A child being joined is
     /// rung too (#2010): its joiner is a domain the same freeze reaches, which may itself be parked.
     pub(crate) fn ring_detached(&self) {
-        self.each_child(|_, c| c.ring());
+        let mut targets = Vec::new();
+        self.each_child(|_, c| targets.push(c.ring_target()));
+        for (done, kid) in targets {
+            ring_child(&done, kid.as_ref());
+        }
     }
 
     /// `f` of the live §14 child `handle` names, under its table's lock. `Err` with how the table
@@ -1091,8 +1121,12 @@ impl Nursery {
 
     /// #2010 — ring the child at `slot` the way [`Nursery::ring_detached`] rings each one.
     fn ring_slot(&self, slot: usize) {
-        if let Some(ChildEntry::Instance(c)) = lock(&self.children.table).get(slot) {
-            c.ring();
+        let target = match lock(&self.children.table).get(slot) {
+            Some(ChildEntry::Instance(c)) => Some(c.ring_target()),
+            _ => None,
+        };
+        if let Some((done, kid)) = target {
+            ring_child(&done, kid.as_ref());
         }
     }
 
@@ -2140,7 +2174,14 @@ pub(crate) unsafe fn join_named(
             let freezing = rt.durable.load(Ordering::Acquire)
                 && crate::fiber_rt::window_is_unwinding(mem_base, rt.shadow);
             if let Some(d) = done.durable.as_ref().filter(|_| freezing) {
+                // The ring wakes the child's task (#2757), so ring with this cell's lock released.
+                // The child may publish meanwhile.
+                drop(st);
                 d.ring();
+                st = done.state.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(outcome) = *st {
+                    break outcome;
+                }
             }
             // §5 kill-path: the host set the parent's interrupt cell — stop waiting and **propagate
             // `OutOfFuel` right here** (the child bakes the same cell, so it unwinds too, and is joined at
@@ -2173,7 +2214,8 @@ pub(crate) unsafe fn join_named(
                 return 0;
             }
             st = match &task {
-                // The child's end, or the cadence sweep, re-offers the task (`child_finished`).
+                // Re-offered by the child's end (`child_finished`), a kill, teardown, or a freeze of
+                // its own window, whose doorbell wakes it (#2757) to ring the child in turn.
                 Some(fib) => {
                     drop(st);
                     crate::fiber_rt::fiber_event_park(fib, None, crate::fiber_rt::ParkOn::Child);
