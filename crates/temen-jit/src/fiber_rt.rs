@@ -344,8 +344,7 @@ pub(crate) struct FiberSlot {
     /// #1631 — **does this park resolve itself?** `Some(deadline)` while the fiber is event-parked
     /// on a wait that carries its own deadline, so it will come back and run on with no help from
     /// anyone. Written and cleared beside [`Self::event_park`] by [`fiber_event_park`], read by the
-    /// executor on the same seam. #2012 — the executor also wakes the task at that deadline, not
-    /// on its next cadence sweep.
+    /// executor on the same seam. #2012 — the executor also wakes the task at that deadline.
     ///
     /// The executor counts a parked task in `Domain::parked`, whose one reader is the futex
     /// deadlock predicate `live > parked` — "could any live vCPU still reach a `notify`?". A task

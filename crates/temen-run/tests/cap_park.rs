@@ -437,6 +437,9 @@ enum Answer {
     /// The embedder, through the call's [`Completer`] ([`OffloadOutcome::Host`]), from a thread of
     /// its own.
     Host,
+    /// The embedder, through the call's [`Completer`], before the submit returns: the answer is in
+    /// before the caller registers to wait for it, so no wake hook is ever rung for it.
+    Inline,
 }
 
 /// `wait`: op 0 `wait(n)` waits for `n` ticks, op 1 `started(k)` for `k` waits to have begun, and
@@ -458,6 +461,9 @@ fn wait_proc(ticks: &Arc<Ticks>, answer: Answer) -> OffloadHostProc {
             Answer::Pool => OffloadOutcome::Offload(Box::new(wait)),
             Answer::Host => OffloadOutcome::Host(Box::new(move |c: Completer| {
                 std::thread::spawn(move || c.complete(wait()));
+            })),
+            Answer::Inline => OffloadOutcome::Host(Box::new(move |c: Completer| {
+                c.complete(wait());
             })),
         }
     })
@@ -684,6 +690,29 @@ fn a_childs_answer_waits_for_no_other_childs_call() {
 #[test]
 fn a_childs_fiber_waiting_on_the_host_lets_its_root_run() {
     check_children(1, true, false, -1);
+}
+
+/// #2757 — **a child's fiber whose answer is in before it waits is still woken.** As the test
+/// above, on the JIT, with the answer posted before the submit returns ([`Answer::Inline`]). The
+/// fiber registers for an answer already in, so no hook ever rings for it. Its root waits on it in
+/// `cont.resume.block`, so the child's task parks, and nothing polls a parked task. The fiber's
+/// wait must ring its own hook, or the run hangs. Windows CI hung the test above on this window,
+/// with an answer that came just before the hook went in.
+#[test]
+fn a_childs_fiber_whose_answer_is_in_before_it_waits_is_woken() {
+    let (done, got) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let m = module_of(&child_waits_src(1, false, true));
+        let _ = done.send(on_the_jit(&m, &setup(&m, -1, &[1, 2], Answer::Inline)));
+    });
+    match got.recv_timeout(GIVE_UP) {
+        Ok(got) => assert_eq!(
+            got,
+            Ok(TICKS as i64),
+            "what the child's fiber's wait answered"
+        ),
+        Err(_) => panic!("hung for {GIVE_UP:?}: the child's task was never re-offered"),
+    }
 }
 
 /// A thread waits on the host; the root, in `wait`'s op 1, waits until that wait has begun, then
