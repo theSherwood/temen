@@ -21,7 +21,7 @@ fn structural_rows_verify_roundtrip_and_pin_encoding() {
         let object = !row.is_term
             && matches!(
                 row.module.funcs[0].blocks[0].insts[0],
-                Inst::DataSelf { .. } | Inst::DataSym { .. } | Inst::DataTop | Inst::RefSym { .. }
+                Inst::DataSelf { .. } | Inst::DataSym(_) | Inst::DataTop | Inst::RefSym { .. }
             );
         let enc = |m: &Module| {
             if object {

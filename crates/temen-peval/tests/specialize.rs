@@ -1007,7 +1007,7 @@ fn assert_no_calls(residual: &Module) {
         assert!(
             !block.insts.iter().any(|i| matches!(
                 i,
-                Inst::Call { .. } | Inst::CallIndirect { .. } | Inst::RefFunc { .. }
+                Inst::Call { .. } | Inst::CallIndirect(_) | Inst::RefFunc { .. }
             )),
             "residual still contains a call / ref.func — not inlined"
         );
@@ -1046,11 +1046,11 @@ fn inlines_direct_call_leaf_helper() {
                     insts: vec![
                         Inst::Call {
                             func: 1,
-                            args: vec![0],
+                            args: vec![0].into(),
                         }, // 1: square(x)
                         Inst::Call {
                             func: 1,
-                            args: vec![1],
+                            args: vec![1].into(),
                         }, // 2: square(square(x))
                     ],
                     term: Terminator::Return(vec![2]),
@@ -1114,7 +1114,7 @@ fn inlines_static_recursion_unrolled() {
                         Inst::ConstI64(3), // 1: e = 3
                         Inst::Call {
                             func: 1,
-                            args: vec![0, 1],
+                            args: vec![0, 1].into(),
                         }, // 2: pow(base, 3)
                     ],
                     term: Terminator::Return(vec![2]),
@@ -1170,7 +1170,7 @@ fn inlines_static_recursion_unrolled() {
                             }, // 3: e - 1
                             Inst::Call {
                                 func: 1,
-                                args: vec![0, 3],
+                                args: vec![0, 3].into(),
                             }, // 4: pow(b, e - 1)
                             imul(0, 4),        // 5: b * rec
                         ],
@@ -1274,7 +1274,7 @@ fn dynamic_branch_in_callee_inlines_as_cfg() {
                     params: vec![ValType::I64], // 0: x
                     insts: vec![Inst::Call {
                         func: 1,
-                        args: vec![0],
+                        args: vec![0].into(),
                     }], // 1
                     term: Terminator::Return(vec![1]),
                 }],
@@ -1439,7 +1439,7 @@ fn build_call_interpreter(program: &[(u8, i64)]) -> Module {
         insts: vec![
             Inst::Call {
                 func: callee,
-                args: vec![0, arg],
+                args: vec![0, arg].into(),
             }, // 4: nacc
             Inst::ConstI64(9), // 5
             add(1, 5),         // 6: npc
@@ -1805,7 +1805,7 @@ fn dynamic_cf_call_threads_caller_values() {
                         }, // 2: pre = x + 100
                         Inst::Call {
                             func: 1,
-                            args: vec![0],
+                            args: vec![0].into(),
                         }, // 3: r = pick(x)
                         Inst::IntBin {
                             ty: IntTy::I64,
@@ -1912,7 +1912,7 @@ fn dynamic_loop_in_callee_survives_inlined() {
                     params: vec![ValType::I64], // 0: n
                     insts: vec![Inst::Call {
                         func: 1,
-                        args: vec![0],
+                        args: vec![0].into(),
                     }], // 1
                     term: Terminator::Return(vec![1]),
                 }],
@@ -2043,7 +2043,7 @@ fn nested_dynamic_cf_calls_inline() {
                     params: vec![ValType::I64],
                     insts: vec![Inst::Call {
                         func: 1,
-                        args: vec![0],
+                        args: vec![0].into(),
                     }],
                     term: Terminator::Return(vec![1]),
                 }],
@@ -2073,7 +2073,7 @@ fn nested_dynamic_cf_calls_inline() {
                         insts: vec![
                             Inst::Call {
                                 func: 2,
-                                args: vec![0],
+                                args: vec![0].into(),
                             }, // 1
                             Inst::ConstI64(1), // 2
                             Inst::IntBin {
@@ -2092,7 +2092,7 @@ fn nested_dynamic_cf_calls_inline() {
                         insts: vec![
                             Inst::Call {
                                 func: 2,
-                                args: vec![0],
+                                args: vec![0].into(),
                             }, // 1
                             Inst::ConstI64(1), // 2
                             Inst::IntBin {
@@ -2639,11 +2639,11 @@ fn const_indirect_call_via_ref_func_inlines() {
                     params: vec![ValType::I64], // 0: x
                     insts: vec![
                         Inst::RefFunc { func: 1 }, // 1: funcref double (folds to const 1)
-                        Inst::CallIndirect {
+                        Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                             ty: 0,
                             idx: 1,
-                            args: vec![0],
-                        }, // 2
+                            args: vec![0].into(),
+                        })), // 2
                     ],
                     term: Terminator::Return(vec![2]),
                 }],
@@ -2694,11 +2694,11 @@ fn indirect_call_through_constant_memory_table_inlines() {
                             addr: 1,
                             offset: 0,
                         }, // 2: funcref (folds to 1)
-                        Inst::CallIndirect {
+                        Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                             ty: 0,
                             idx: 2,
-                            args: vec![0],
-                        }, // 3
+                            args: vec![0].into(),
+                        })), // 3
                     ],
                     term: Terminator::Return(vec![3]),
                 }],
@@ -2793,11 +2793,11 @@ fn indirect_call_to_dynamic_cf_callee_inlines_as_cfg() {
                     params: vec![ValType::I64], // 0: x
                     insts: vec![
                         Inst::RefFunc { func: 1 },
-                        Inst::CallIndirect {
+                        Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                             ty: 0,
                             idx: 1,
-                            args: vec![0],
-                        },
+                            args: vec![0].into(),
+                        })),
                     ],
                     term: Terminator::Return(vec![2]),
                 }],
@@ -2890,11 +2890,11 @@ fn unresolvable_indirect_calls_are_unsupported() {
                     parent: 0,
                     captures: vec![],
                     params: vec![ValType::I64, ValType::I32],
-                    insts: vec![Inst::CallIndirect {
+                    insts: vec![Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                         ty: 0,
                         idx: 1,
-                        args: vec![0],
-                    }],
+                        args: vec![0].into(),
+                    }))],
                     term: Terminator::Return(vec![2]),
                 }],
             },
@@ -2922,11 +2922,11 @@ fn unresolvable_indirect_calls_are_unsupported() {
                     params: vec![ValType::I64], // 0: x
                     insts: vec![
                         Inst::RefFunc { func: 1 }, // points at a (i64,i64)->i64 function
-                        Inst::CallIndirect {
+                        Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                             ty: 0, // but the call signature is (i64)->i64
                             idx: 1,
-                            args: vec![0],
-                        },
+                            args: vec![0].into(),
+                        })),
                     ],
                     term: Terminator::Return(vec![2]),
                 }],
@@ -3006,11 +3006,11 @@ fn outlining_shares_a_callee_across_call_sites() {
                     insts: vec![
                         Inst::Call {
                             func: 1,
-                            args: vec![0],
+                            args: vec![0].into(),
                         }, // 1
                         Inst::Call {
                             func: 1,
-                            args: vec![0],
+                            args: vec![0].into(),
                         }, // 2
                         Inst::IntBin {
                             ty: IntTy::I64,
@@ -3099,7 +3099,7 @@ fn outlining_threads_a_renamed_cell_across_a_call() {
                         st(1, 0),                        // [R] = x
                         Inst::Call {
                             func: 1,
-                            args: vec![],
+                            args: vec![].into(),
                         }, // helper()
                         Inst::ConstI64(STACK_LO as i64), // 2: R
                         ld(2),                           // 3: a = [R]   (x + 10)
@@ -3250,7 +3250,7 @@ fn outlining_specializes_dynamic_depth_recursion() {
                         }, // 2: n - 1
                         Inst::Call {
                             func: 0,
-                            args: vec![2],
+                            args: vec![2].into(),
                         }, // 3: sum(n - 1)
                         Inst::IntBin {
                             ty: IntTy::I64,
@@ -3343,7 +3343,7 @@ fn outlining_makes_one_function_per_static_pattern() {
                         }, // 3: e - 1
                         Inst::Call {
                             func: 0,
-                            args: vec![0, 3],
+                            args: vec![0, 3].into(),
                         }, // 4: pow(b, e-1)
                         imul(0, 4), // 5: b * rec
                     ],
@@ -3434,7 +3434,7 @@ fn selective_outlining_inlines_leaves_and_outlines_recursion() {
                         insts: vec![
                             Inst::Call {
                                 func: 1,
-                                args: vec![0],
+                                args: vec![0].into(),
                             }, // 1: g(n)
                             Inst::ConstI64(1), // 2
                             Inst::IntBin {
@@ -3445,7 +3445,7 @@ fn selective_outlining_inlines_leaves_and_outlines_recursion() {
                             }, // 3: n - 1
                             Inst::Call {
                                 func: 0,
-                                args: vec![3],
+                                args: vec![3].into(),
                             }, // 4: f(n - 1)
                             Inst::IntBin {
                                 ty: IntTy::I64,
@@ -3610,7 +3610,7 @@ fn folds_v128_bitwise_shuffle_and_movement() {
             mask: 10,
         }, // 11
         Inst::Shuffle {
-            lanes: [0, 16, 2, 18, 4, 20, 6, 22, 8, 24, 10, 26, 12, 28, 14, 30],
+            lanes: Box::new([0, 16, 2, 18, 4, 20, 6, 22, 8, 24, 10, 26, 12, 28, 14, 30]),
             a: 11,
             b: 4,
         }, // 12

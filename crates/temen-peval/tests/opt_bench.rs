@@ -643,11 +643,11 @@ fn interproc_case() -> Module {
             params: vec![ValType::I64, ValType::I64],
             insts: vec![
                 Inst::RefFunc { func: 1 }, // v2 = funcref(1)
-                Inst::CallIndirect {
+                Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                     ty: 0, // #922: sig interned at type-section index 0
                     idx: 2,
-                    args: vec![0, 1],
-                }, // v3
+                    args: vec![0, 1].into(),
+                })), // v3
             ],
             term: Terminator::Return(vec![3]),
         }],
@@ -711,7 +711,7 @@ fn multiblock_inline_case() -> Module {
                 add(0, 1), // v2 = k = a + b  (captured across the call)
                 Inst::Call {
                     func: 1,
-                    args: vec![0, 1],
+                    args: vec![0, 1].into(),
                 }, // v3 = max(a, b)
                 add(3, 2), // v4 = t + k
             ],
@@ -827,7 +827,7 @@ fn const_prop_case() -> Module {
                 Inst::ConstI32(1),
                 Inst::Call {
                     func: 1,
-                    args: vec![1, 0],
+                    args: vec![1, 0].into(),
                 }, // helper(1, x)
             ],
             term: Terminator::Return(vec![2]),

@@ -118,11 +118,11 @@ fn dispatch_loop_module() -> Module {
                         a: 5,
                         b: 4,
                     }, // 6: idx = 1 + sel
-                    Inst::CallIndirect {
+                    Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                         ty: 0, // #922: hty interned at type-section index 0
                         idx: 6,
-                        args: vec![0, 0],
-                    }, // 7: acc'
+                        args: vec![0, 0].into(),
+                    })), // 7: acc'
                     Inst::ConstI64(1), // 8
                     Inst::IntBin {
                         ty: IntTy::I64,

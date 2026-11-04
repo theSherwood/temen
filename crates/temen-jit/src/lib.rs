@@ -592,7 +592,8 @@ fn intern_unit_sigs(
         )?;
         for b in &f.blocks {
             for i in &b.insts {
-                if let Inst::CallIndirect { ty, .. } = i {
+                if let Inst::CallIndirect(c) = i {
+                    let temen_ir::CallIndirect { ty, .. } = &**c;
                     intern_type(distinct, sig_of(type_section, *ty))?;
                 }
             }
@@ -6531,12 +6532,12 @@ impl Callees {
         let mut fast = HashMap::new();
         if let Some(resolver) = resolver {
             for inst in funcs.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.insts) {
-                let Inst::CapCall {
-                    type_id, op, sig, ..
-                } = inst
-                else {
+                let Inst::CapCall(c) = inst else {
                     continue;
                 };
+                let temen_ir::CapCall {
+                    type_id, op, sig, ..
+                } = &**c;
                 let key = fast_cap_key_of(*type_id, *op, sig_of(types, *sig));
                 if let std::collections::hash_map::Entry::Vacant(slot) = fast.entry(key) {
                     slot.insert(
@@ -8290,7 +8291,8 @@ fn ensure_supported(f: &Func, type_section: &[temen_ir::TypeEntry]) -> Result<()
             }
         }
         for inst in &blk.insts {
-            if let Inst::CallIndirect { ty, .. } = inst {
+            if let Inst::CallIndirect(c) = inst {
+                let temen_ir::CallIndirect { ty, .. } = &**c;
                 if sret_blocked_by_v128(&sig_of(type_section, *ty).results) {
                     return Err(JitError::Unsupported("v128 in a many-result signature"));
                 }
@@ -8326,11 +8328,11 @@ fn ensure_supported(f: &Func, type_section: &[temen_ir::TypeEntry]) -> Result<()
                 | Inst::AtomicCmpxchg { .. }
                 | Inst::AtomicFence { .. }
                 | Inst::Call { .. }
-                | Inst::CallIndirect { .. }
-                | Inst::CapCall { .. }
-                | Inst::CallImport { .. }
-                | Inst::CallImportDyn { .. }
-                | Inst::CallSym { .. }
+                | Inst::CallIndirect(_)
+                | Inst::CapCall(_)
+                | Inst::CallImport(_)
+                | Inst::CallImportDyn(_)
+                | Inst::CallSym(_)
                 | Inst::ExportHandle { .. }
                 | Inst::CapSelfTypeId { .. }
                 | Inst::CapSelfCovers { .. }
@@ -9069,15 +9071,9 @@ fn nursery_over(
 fn funcs_use_instantiator(funcs: &[Func]) -> bool {
     funcs.iter().any(|f| {
         f.blocks.iter().any(|blk| {
-            blk.insts.iter().any(|i| {
-                matches!(
-                    i,
-                    Inst::CapCall {
-                        type_id: cap_id::INSTANTIATOR,
-                        ..
-                    }
-                )
-            })
+            blk.insts
+                .iter()
+                .any(|i| matches!(i, Inst::CapCall(c) if c.type_id == cap_id::INSTANTIATOR))
         })
     })
 }
@@ -9313,7 +9309,8 @@ fn lower_block(
             read_call_results(b, call, sret, results, &mut vals);
             continue;
         }
-        if let Inst::CallIndirect { ty, idx, args } = inst {
+        if let Inst::CallIndirect(c) = inst {
+            let temen_ir::CallIndirect { ty, idx, args } = &**c;
             let ty = sig_of(lower.type_section, *ty); // #922: resolve interned call type index
             let code = indirect_dispatch(b, lower, get(&vals, *idx)?, ty);
             let sig = b.import_signature(sig_from(&ty.params, &ty.results));
@@ -9328,14 +9325,14 @@ fn lower_block(
             read_call_results(b, call, sret, &ty.results, &mut vals);
             continue;
         }
-        if let Inst::CapCall {
-            type_id,
-            op,
-            sig,
-            handle,
-            args,
-        } = inst
-        {
+        if let Inst::CapCall(c) = inst {
+            let temen_ir::CapCall {
+                type_id,
+                op,
+                sig,
+                handle,
+                args,
+            } = &**c;
             // #922: resolve interned call type index.
             let sig = sig_of(lower.type_section, *sig);
             // §3c: the verifier checks a `call.cap` against its *declared* `sig` only, so a
@@ -9428,14 +9425,12 @@ fn lower_block(
         // operand is not read either. The dynamic-mode dispatch by type-section reference packs
         // `(type_idx | op << 16)` into the reserved dyn entry, and its handle operand is live (the
         // value being driven). [`Inst::host_dispatch`] is the one definition of the packings.
-        if let Inst::CallImport { sig, args, .. }
-        | Inst::CallSym { sig, args, .. }
-        | Inst::CallImportDyn { sig, args, .. } = inst
-        {
-            let sig = sig_of(lower.type_section, *sig); // #922: resolve interned call type index
+        if let Inst::CallImport(_) | Inst::CallSym(_) | Inst::CallImportDyn(_) = inst {
+            let (sig, args) = inst.host_call().expect("an import-form call");
+            let sig = sig_of(lower.type_section, sig); // #922: resolve interned call type index
             let (type_id, op) = inst.host_dispatch().expect("an import-form call");
             let h = match inst {
-                Inst::CallImportDyn { handle, .. } => get(&vals, *handle)?,
+                Inst::CallImportDyn(c) => get(&vals, c.handle)?,
                 _ => b.ins().iconst(I32, 0),
             };
             lower_cap_call(b, lower, type_id, op, sig, h, args, &mut vals)?;

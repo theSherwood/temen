@@ -47,7 +47,8 @@ fn indirect_site_sigs(m: &Module) -> Vec<String> {
     for f in &m.funcs {
         for b in &f.blocks {
             for inst in &b.insts {
-                if let Inst::CallIndirect { ty, .. } = inst {
+                if let Inst::CallIndirect(c) = inst {
+                    let temen_ir::CallIndirect { ty, .. } = &**c;
                     sites.push(site_sig_key(m, *ty));
                 }
             }
@@ -133,7 +134,8 @@ fn candidate_spans(m: &Module, cap: usize) -> Vec<usize> {
     for f in &m.funcs {
         for b in &f.blocks {
             for inst in &b.insts {
-                if let Inst::CallIndirect { ty, .. } = inst {
+                if let Inst::CallIndirect(c) = inst {
+                    let temen_ir::CallIndirect { ty, .. } = &**c;
                     let key = site_sig_key(m, *ty);
                     if let Some(idxs) = by_sig.get(&key) {
                         if (1..=cap).contains(&idxs.len()) {
@@ -157,7 +159,8 @@ fn functions_with_eligible_site(m: &Module, cap: usize) -> (usize, usize) {
         let mut hit = false;
         for b in &f.blocks {
             for inst in &b.insts {
-                if let Inst::CallIndirect { ty, .. } = inst {
+                if let Inst::CallIndirect(c) = inst {
+                    let temen_ir::CallIndirect { ty, .. } = &**c;
                     let n = pop.get(&site_sig_key(m, *ty)).copied().unwrap_or(0);
                     if (1..=cap).contains(&n) {
                         sites_hit += 1;

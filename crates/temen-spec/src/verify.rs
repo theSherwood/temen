@@ -280,7 +280,7 @@ fn check_inst(
         Inst::ConstF32(_) => vec![V::F32],
         Inst::ConstF64(_) => vec![V::F64],
         // Link-form data addresses append their resolved-to `i64`; immediates only, no operands.
-        Inst::DataSym { .. } | Inst::DataSelf { .. } | Inst::DataTop => vec![V::I64],
+        Inst::DataSym(_) | Inst::DataSelf { .. } | Inst::DataTop => vec![V::I64],
         // The link-form function reference appends the `i32` funcref it resolves to (#2203).
         Inst::RefSym { .. } => vec![V::I32],
         Inst::IntBin { ty, a, b, .. } => {
@@ -456,7 +456,8 @@ fn check_inst(
             check_args(types, args, &callee.params)?;
             callee.results.clone()
         }
-        Inst::CallIndirect { ty, idx, args } => {
+        Inst::CallIndirect(c) => {
+            let temen_ir::CallIndirect { ty, idx, args } = &**c;
             w(*idx, V::I32)?;
             let sig = func_sig(tsec, *ty)
                 .ok_or_else(|| format!("call_indirect type {ty} is not a func type"))?;
@@ -469,9 +470,10 @@ fn check_inst(
             }
             vec![V::I32] // a funcref is a plain i32 table index (§3c/D37)
         }
-        Inst::CapCall {
-            sig, handle, args, ..
-        } => {
+        Inst::CapCall(c) => {
+            let temen_ir::CapCall {
+                sig, handle, args, ..
+            } = &**c;
             w(*handle, V::I32)?; // forgeable index; safety is the runtime check (D37)
             let sig = func_sig(tsec, *sig)
                 .ok_or_else(|| format!("cap.call type {sig} is not a func type"))?;
@@ -482,12 +484,13 @@ fn check_inst(
         // (op 0) plus its legacy handle operand (i32; ignored by manifest dispatch, live to
         // the linker). Executable when bound at instantiation; the linker's rewrite target
         // when resolved first.
-        Inst::CallSym {
-            import,
-            sig,
-            handle,
-            args,
-        } => {
+        Inst::CallSym(c) => {
+            let temen_ir::CallSym {
+                import,
+                sig,
+                handle,
+                args,
+            } = &**c;
             let Some(decl) = imports.get(*import as usize) else {
                 return Err(format!(
                     "unresolved import {import} (out of manifest range)"
@@ -516,12 +519,13 @@ fn check_inst(
         // import and its self-describing sig equals the manifest's (the canonical interface);
         // out-of-range (including the empty-manifest legacy shape) or a sig disagreement is
         // fail-closed. Operand typing mirrors `cap.call` (args per sig; no handle since v8).
-        Inst::CallImport {
-            import,
-            op,
-            sig,
-            args,
-        } => {
+        Inst::CallImport(c) => {
+            let temen_ir::CallImport {
+                import,
+                op,
+                sig,
+                args,
+            } = &**c;
             let Some(decl) = imports.get(*import as usize) else {
                 return Err(format!(
                     "unresolved import {import} (out of manifest range)"
@@ -552,13 +556,14 @@ fn check_inst(
         }
         // §3.5 dynamic-mode dispatch by type-section reference: well-formed interface, op in
         // range, sig equal to the resolution; handle is a forgeable i32 (runtime §3c check).
-        Inst::CallImportDyn {
-            ty,
-            op,
-            sig,
-            handle,
-            args,
-        } => {
+        Inst::CallImportDyn(c) => {
+            let temen_ir::CallImportDyn {
+                ty,
+                op,
+                sig,
+                handle,
+                args,
+            } = &**c;
             let Some(want_sig) = iface_op_sig(tsec, *ty, *op) else {
                 return Err(format!(
                     "call.import.dyn type {ty} op {op} is not a well-formed interface op"

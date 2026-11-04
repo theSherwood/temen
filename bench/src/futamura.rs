@@ -419,7 +419,7 @@ pub fn with_readback(
                 Inst::ConstI64(read_addr as i64),
                 Inst::Call {
                     func: entry,
-                    args: call_args,
+                    args: call_args.into(),
                 },
                 Inst::Load {
                     op: LoadOp::I64,

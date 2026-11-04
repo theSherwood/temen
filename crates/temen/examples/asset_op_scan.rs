@@ -30,7 +30,8 @@ fn main() {
         for f in &m.funcs {
             for b in &f.blocks {
                 for i in &b.insts {
-                    if let temen_ir::Inst::CapCall { type_id, op, .. } = i {
+                    if let temen_ir::Inst::CapCall(c) = i {
+                        let (type_id, op) = (&c.type_id, &c.op);
                         if *type_id == 6 {
                             ops.insert(*op);
                         }

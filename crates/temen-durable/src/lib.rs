@@ -310,10 +310,10 @@ impl<'a> TransformOpts<'a> {
 fn is_suspendable_op(x: &Inst) -> bool {
     matches!(
         x,
-        Inst::CapCall { .. }
-            | Inst::CallImport { .. }
-            | Inst::CallImportDyn { .. }
-            | Inst::CallSym { .. }
+        Inst::CapCall(_)
+            | Inst::CallImport(_)
+            | Inst::CallImportDyn(_)
+            | Inst::CallSym(_)
             | Inst::ContResume { .. }
             | Inst::Suspend { .. }
             | Inst::ThreadJoin { .. }
@@ -629,20 +629,15 @@ fn inst_operands(i: &Inst) -> Option<Vec<ValIdx>> {
             ..
         } => vec![*addr, *expected, *timeout],
         MemoryNotify { addr, count } => vec![*addr, *count],
-        Call { args, .. } => args.clone(),
-        CapCall { handle, args, .. }
-        | CallImportDyn { handle, args, .. }
-        | CallSym { handle, args, .. } => {
-            let mut v = Vec::with_capacity(args.len() + 1);
-            v.push(*handle);
-            v.extend_from_slice(args);
-            v
-        }
-        CallImport { args, .. } => args.clone(),
-        CallIndirect { idx, args, .. } => {
-            let mut v = Vec::with_capacity(args.len() + 1);
-            v.push(*idx);
-            v.extend_from_slice(args);
+        Call { args, .. } => args.to_vec(),
+        CapCall(c) => [&[c.handle][..], &c.args].concat(),
+        CallImportDyn(c) => [&[c.handle][..], &c.args].concat(),
+        CallSym(c) => [&[c.handle][..], &c.args].concat(),
+        Inst::CallImport(c) => c.args.to_vec(),
+        Inst::CallIndirect(c) => {
+            let mut v = Vec::with_capacity(c.args.len() + 1);
+            v.push(c.idx);
+            v.extend_from_slice(&c.args);
             v
         }
         ContNew { func, sp } => vec![*func, *sp],
@@ -757,7 +752,10 @@ fn compute_may_suspend(
                     && f.blocks.iter().any(|b| {
                         b.insts.iter().any(|x| match x {
                             Inst::Call { func, .. } => ms[*func as usize],
-                            Inst::CallIndirect { ty, .. } => tainted(*ty),
+                            Inst::CallIndirect(c) => {
+                                let temen_ir::CallIndirect { ty, .. } = &**c;
+                                tainted(*ty)
+                            },
                             _ => false,
                         })
                         // A direct or indirect **tail** call into a may-suspend callee also suspends
@@ -1074,7 +1072,10 @@ fn transform_func(
             .enumerate()
             .filter(|(_, inst)| match inst {
                 Inst::Call { func, .. } => may_suspend[*func as usize],
-                Inst::CallIndirect { ty, .. } => is_tainted(*ty),
+                Inst::CallIndirect(c) => {
+                    let temen_ir::CallIndirect { ty, .. } = &**c;
+                    is_tainted(*ty)
+                }
                 x => opts.is_site(x),
             })
             .map(|(pos, _)| pos)
@@ -1251,35 +1252,31 @@ fn transform_func(
                     // §13.4 slice 4b: a serve op re-issues (the sentinel it returned under
                     // `UNWINDING` must never reload as the served count) — before the
                     // generic `Leaf` arm.
-                    Inst::CapCall {
-                        type_id,
-                        op,
-                        sig,
-                        handle,
-                        args,
-                    } if temen_ir::durable_abi::is_serve_op(*type_id, *op) => SuspendKind::SvcServe {
-                        type_id: *type_id,
-                        op: *op,
-                        sig: *sig,
-                        handle: *handle,
-                        args: args.clone(),
-                    },
+                    Inst::CapCall(c) if temen_ir::durable_abi::is_serve_op(c.type_id, c.op) => {
+                        SuspendKind::SvcServe {
+                            type_id: c.type_id,
+                            op: c.op,
+                            sig: c.sig,
+                            handle: c.handle,
+                            args: c.args.to_vec(),
+                        }
+                    }
                     // A runtime-bound capability call is a leaf exactly like `call.cap`: the host
                     // effect happened before the freeze, so the thaw reloads its result. (A
                     // durable domain never resolves an import to a serve op — `Host::import_binding`
                     // fails those closed — so the `SvcServe` re-issue case cannot hide behind one.)
-                    op @ (Inst::CapCall { .. }
-                    | Inst::CallImport { .. }
-                    | Inst::CallImportDyn { .. }
-                    | Inst::CallSym { .. }) => SuspendKind::Leaf { op: op.clone() },
+                    op @ (Inst::CapCall(_)
+                    | Inst::CallImport(_)
+                    | Inst::CallImportDyn(_)
+                    | Inst::CallSym(_)) => SuspendKind::Leaf { op: op.clone() },
                     Inst::Call { func, args } => SuspendKind::Propagated {
                         callee: *func,
-                        args: args.clone(),
+                        args: args.to_vec(),
                     },
-                    Inst::CallIndirect { ty, idx, args } => SuspendKind::PropagatedIndirect {
-                        ty: *ty,
-                        idx: *idx,
-                        args: args.clone(),
+                    Inst::CallIndirect(c) => SuspendKind::PropagatedIndirect {
+                        ty: c.ty,
+                        idx: c.idx,
+                        args: c.args.to_vec(),
                     },
                     // `block` is advisory scheduling only — not preserved across the durable
                     // suspend record; replay re-issues a plain (non-blocking) resume.
@@ -1302,15 +1299,11 @@ fn transform_func(
                     ),
                 };
                 let nres = match (&kind, &blk.insts[pos]) {
-                    (
-                        SuspendKind::Leaf { .. },
-                        Inst::CapCall { sig, .. }
-                        | Inst::CallImport { sig, .. }
-                        | Inst::CallImportDyn { sig, .. }
-                        | Inst::CallSym { sig, .. },
-                    ) => sig_of(type_section, *sig).results.len(),
-                    (SuspendKind::SvcServe { .. }, Inst::CapCall { sig, .. }) => {
-                        sig_of(type_section, *sig).results.len()
+                    (SuspendKind::Leaf { .. } | SuspendKind::SvcServe { .. }, i)
+                        if i.host_call().is_some() =>
+                    {
+                        let (sig, _) = i.host_call().expect("a host call");
+                        sig_of(type_section, sig).results.len()
                     }
                     (SuspendKind::Propagated { callee, .. }, _) => {
                         func_results[*callee as usize].len()
@@ -1571,7 +1564,7 @@ fn transform_func(
                 ab.many(
                     Inst::Call {
                         func: *callee,
-                        args: mapped,
+                        args: mapped.into(),
                     },
                     pt.nres,
                 )
@@ -1587,11 +1580,11 @@ fn transform_func(
                     .map(|&a| reloaded[spill_slot(a as usize).expect("call.dyn arg spilled")])
                     .collect();
                 ab.many(
-                    Inst::CallIndirect {
+                    Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                         ty: *ty,
                         idx: ridx,
-                        args: mapped,
-                    },
+                        args: mapped.into(),
+                    })),
                     pt.nres,
                 )
             }
@@ -1637,13 +1630,13 @@ fn transform_func(
                     .map(|&a| reloaded[spill_slot(a as usize).expect("serve-op arg spilled")])
                     .collect();
                 ab.many(
-                    Inst::CapCall {
+                    Inst::CapCall(Box::new(temen_ir::CapCall {
                         type_id: *type_id,
                         op: *op,
                         sig: *sig,
                         handle: hh,
-                        args: aa,
-                    },
+                        args: aa.into(),
+                    })),
                     pt.nres,
                 )
             }
@@ -2102,36 +2095,48 @@ fn reissue_branch(
 /// A host call `op` rebuilt over new operands, in [`inst_operands`] order (handle first, then args).
 fn with_operands(op: &Inst, ops: &[ValIdx]) -> Inst {
     match op {
-        Inst::CapCall {
-            type_id, op, sig, ..
-        } => Inst::CapCall {
-            type_id: *type_id,
-            op: *op,
-            sig: *sig,
-            handle: ops[0],
-            args: ops[1..].to_vec(),
-        },
-        Inst::CallImportDyn { ty, op, sig, .. } => Inst::CallImportDyn {
-            ty: *ty,
-            op: *op,
-            sig: *sig,
-            handle: ops[0],
-            args: ops[1..].to_vec(),
-        },
-        Inst::CallSym { import, sig, .. } => Inst::CallSym {
-            import: *import,
-            sig: *sig,
-            handle: ops[0],
-            args: ops[1..].to_vec(),
-        },
-        Inst::CallImport {
-            import, op, sig, ..
-        } => Inst::CallImport {
-            import: *import,
-            op: *op,
-            sig: *sig,
-            args: ops.to_vec(),
-        },
+        Inst::CapCall(c) => {
+            let temen_ir::CapCall {
+                type_id, op, sig, ..
+            } = &**c;
+            Inst::CapCall(Box::new(temen_ir::CapCall {
+                type_id: *type_id,
+                op: *op,
+                sig: *sig,
+                handle: ops[0],
+                args: ops[1..].to_vec().into(),
+            }))
+        }
+        Inst::CallImportDyn(c) => {
+            let temen_ir::CallImportDyn { ty, op, sig, .. } = &**c;
+            Inst::CallImportDyn(Box::new(temen_ir::CallImportDyn {
+                ty: *ty,
+                op: *op,
+                sig: *sig,
+                handle: ops[0],
+                args: ops[1..].to_vec().into(),
+            }))
+        }
+        Inst::CallSym(c) => {
+            let temen_ir::CallSym { import, sig, .. } = &**c;
+            Inst::CallSym(Box::new(temen_ir::CallSym {
+                import: *import,
+                sig: *sig,
+                handle: ops[0],
+                args: ops[1..].to_vec().into(),
+            }))
+        }
+        Inst::CallImport(c) => {
+            let temen_ir::CallImport {
+                import, op, sig, ..
+            } = &**c;
+            Inst::CallImport(Box::new(temen_ir::CallImport {
+                import: *import,
+                op: *op,
+                sig: *sig,
+                args: ops.to_vec().into(),
+            }))
+        }
         _ => unreachable!("a leaf is a host call"),
     }
 }
@@ -2280,11 +2285,11 @@ fn result_types(
             .get(*func as usize)
             .cloned()
             .ok_or(TransformError::UnsupportedShape)?,
-        CapCall { sig, .. }
-        | CallImport { sig, .. }
-        | CallImportDyn { sig, .. }
-        | CallSym { sig, .. } => sig_of(type_section, *sig).results.clone(),
-        CallIndirect { ty, .. } => sig_of(type_section, *ty).results.clone(),
+        CapCall(c) => sig_of(type_section, c.sig).results.clone(),
+        CallImport(c) => sig_of(type_section, c.sig).results.clone(),
+        CallImportDyn(c) => sig_of(type_section, c.sig).results.clone(),
+        CallSym(c) => sig_of(type_section, c.sig).results.clone(),
+        Inst::CallIndirect(c) => sig_of(type_section, c.ty).results.clone(),
         RefFunc { .. } => vec![ValType::I32],
         // Fiber control ops (§12 / Phase 3): an i64 handle, a `(status, value)` pair, a resume arg.
         ContNew { .. } => vec![ValType::I64],

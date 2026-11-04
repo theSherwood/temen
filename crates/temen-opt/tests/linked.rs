@@ -86,7 +86,10 @@ fn cmp(op: CmpOp, a: u32, b: u32) -> Inst {
 }
 
 fn call(func: u32, args: Vec<u32>) -> Inst {
-    Inst::Call { func, args }
+    Inst::Call {
+        func,
+        args: args.into(),
+    }
 }
 
 fn func(params: usize, blocks: Vec<Block>) -> Func {

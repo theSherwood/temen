@@ -309,7 +309,7 @@ fn wrap_with_heap(
                 Inst::ConstI64(x_addr as i64),
                 Inst::Call {
                     func: entry,
-                    args: call_args,
+                    args: call_args.into(),
                 },
                 Inst::Load {
                     op: LoadOp::I64,

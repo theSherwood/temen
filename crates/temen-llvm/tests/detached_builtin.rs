@@ -27,9 +27,12 @@ fn the_record_spawn_lowers_to_instantiator_op_17() {
         .iter()
         .flat_map(|f| f.blocks.iter().flat_map(|b| b.insts.iter()))
         .filter_map(|i| match i {
-            Inst::CapCall {
-                type_id, op, args, ..
-            } => Some((*type_id, *op, args.len())),
+            Inst::CapCall(c) => {
+                let temen_ir::CapCall {
+                    type_id, op, args, ..
+                } = &**c;
+                Some((*type_id, *op, args.len()))
+            }
             _ => None,
         })
         .collect();
@@ -74,13 +77,14 @@ fn budget_split_read_and_join_lower_to_their_ops() {
         .iter()
         .flat_map(|f| f.blocks.iter().flat_map(|b| b.insts.iter()))
         .filter_map(|i| match i {
-            Inst::CapCall {
-                type_id,
-                op,
-                args,
-                sig,
-                ..
-            } => {
+            Inst::CapCall(c) => {
+                let temen_ir::CapCall {
+                    type_id,
+                    op,
+                    args,
+                    sig,
+                    ..
+                } = &**c;
                 let temen_ir::TypeEntry::Func(f) = &t.module.types[*sig as usize] else {
                     panic!("a call.cap's sig names a function type");
                 };
@@ -123,9 +127,12 @@ fn poll_kill_and_detach_lower_to_their_ops() {
         .iter()
         .flat_map(|f| f.blocks.iter().flat_map(|b| b.insts.iter()))
         .filter_map(|i| match i {
-            Inst::CapCall {
-                type_id, op, args, ..
-            } => Some((*type_id, *op, args.len())),
+            Inst::CapCall(c) => {
+                let temen_ir::CapCall {
+                    type_id, op, args, ..
+                } = &**c;
+                Some((*type_id, *op, args.len()))
+            }
             _ => None,
         })
         .collect();
@@ -164,13 +171,7 @@ fn grant_lowers_to_op_19_with_the_child_then_the_handle() {
                 .map(move |i| (n, i))
         })
         .filter_map(|(n, i)| match i {
-            Inst::CapCall {
-                type_id,
-                op,
-                handle,
-                args,
-                ..
-            } => Some((*type_id, *op, *handle, args.clone(), n)),
+            Inst::CapCall(c) => Some((c.type_id, c.op, c.handle, c.args.to_vec(), n)),
             _ => None,
         })
         .collect();

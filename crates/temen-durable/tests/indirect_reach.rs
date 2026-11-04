@@ -61,11 +61,7 @@ fn module(src: &str) -> Module {
 fn is_site(i: &Inst) -> bool {
     matches!(
         i,
-        Inst::CapCall {
-            type_id: temen_ir::cap_id::CLOCK,
-            op: 0,
-            ..
-        }
+        Inst::CapCall(c) if c.type_id == temen_ir::cap_id::CLOCK && c.op == 0
     )
 }
 

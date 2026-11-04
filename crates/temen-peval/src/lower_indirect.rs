@@ -109,7 +109,8 @@ struct Site {
 fn find_site(f: &Func, module: &Module, cap: usize) -> Option<Site> {
     for (bi, b) in f.blocks.iter().enumerate() {
         for (k, inst) in b.insts.iter().enumerate() {
-            if let Inst::CallIndirect { ty, .. } = inst {
+            if let Inst::CallIndirect(c) = inst {
+                let temen_ir::CallIndirect { ty, .. } = &**c;
                 // FuncType interning (#922): resolve the interned index to its signature.
                 let Some(temen_ir::TypeEntry::Func(ftype)) = module.types.get(*ty as usize) else {
                     continue;
@@ -236,7 +237,10 @@ fn split_site(
     let btypes = &types[bi];
 
     let (idx, args) = match &ci {
-        Inst::CallIndirect { idx, args, .. } => (*idx, args.clone()),
+        Inst::CallIndirect(c) => {
+            let temen_ir::CallIndirect { idx, args, .. } = &**c;
+            (*idx, args.clone())
+        }
         _ => unreachable!("find_site only returns a CallIndirect"),
     };
     let r = ty.results.len();
@@ -434,7 +438,7 @@ fn split_site(
         let call_args: Vec<u32> = args.iter().map(|a| live_pos[a]).collect();
         let mut insts = vec![Inst::Call {
             func: target,
-            args: call_args,
+            args: call_args.into(),
         }];
         let term = if dup {
             for inst in &tail_insts {

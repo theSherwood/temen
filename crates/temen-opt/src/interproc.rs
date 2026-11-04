@@ -59,7 +59,7 @@ fn has_indirect_funcref_dispatch(m: &Module) -> bool {
     m.funcs.iter().flat_map(|f| &f.blocks).any(|b| {
         b.insts
             .iter()
-            .any(|i| matches!(i, Inst::CallIndirect { .. } | Inst::ContNew { .. }))
+            .any(|i| matches!(i, Inst::CallIndirect(_) | Inst::ContNew { .. }))
             || matches!(b.term, Terminator::ReturnCallIndirect { .. })
     })
 }
@@ -278,7 +278,7 @@ fn inline_single_block_call(
     let base_c = result_start[call_idx];
     let rc = caller.insts[call_idx].result_count(fn_results, types) as u32;
     let args: Vec<u32> = match &caller.insts[call_idx] {
-        Inst::Call { args, .. } => args.clone(),
+        Inst::Call { args, .. } => args.to_vec(),
         _ => unreachable!("call site must be a direct call"),
     };
 
@@ -509,7 +509,7 @@ fn inline_multi_block_call(
     let base_c = result_start[call_idx];
     let rc = b.insts[call_idx].result_count(fn_results, types) as u32;
     let call_args: Vec<u32> = match &b.insts[call_idx] {
-        Inst::Call { args, .. } => args.clone(),
+        Inst::Call { args, .. } => args.to_vec(),
         _ => unreachable!("call site must be a direct call"),
     };
 
@@ -944,7 +944,8 @@ pub fn const_prop(m: &Module) -> Module {
                 for inst in &b.insts {
                     match inst {
                         Inst::Call { func, args } => push(*func as usize, args, &val),
-                        Inst::CallIndirect { ty, idx, args } => {
+                        Inst::CallIndirect(c) => {
+                            let temen_ir::CallIndirect { ty, idx, args } = &**c;
                             if let Some(g) = target(eval(&val, ci, fp, &knowns, *idx), *ty) {
                                 push(g, args, &val);
                             }
@@ -994,7 +995,8 @@ pub fn const_prop(m: &Module) -> Module {
             let knowns = block_knowns(b, &fn_results, types);
             let idx_top = |idx: u32| eval(&val, ci, fp, &knowns, idx) == Cp::Top;
             for inst in &b.insts {
-                if let Inst::CallIndirect { idx, .. } = inst {
+                if let Inst::CallIndirect(c) = inst {
+                    let temen_ir::CallIndirect { idx, .. } = &**c;
                     if idx_top(*idx) {
                         return m.clone();
                     }
@@ -1126,10 +1128,10 @@ pub fn devirtualize(m: &Module) -> Module {
         for b in &mut f.blocks {
             let known = block_funcrefs(b, &fn_results, types, num_funcs);
             for inst in &mut b.insts {
-                let repl = if let Inst::CallIndirect { ty, idx, args } = inst {
-                    resolve_devirt(&known, *idx, *ty, types, &m.funcs).map(|k| Inst::Call {
+                let repl = if let Inst::CallIndirect(c) = inst {
+                    resolve_devirt(&known, c.idx, c.ty, types, &m.funcs).map(|k| Inst::Call {
                         func: k,
-                        args: core::mem::take(args),
+                        args: core::mem::take(&mut c.args),
                     })
                 } else {
                     None

@@ -958,7 +958,7 @@ fn simd(ops: &mut Vec<Op>) {
         unit(&[v, v], q15, &[v], false),
     );
     let shuf = Inst::Shuffle {
-        lanes: [0; 16],
+        lanes: Box::new([0; 16]),
         a: 0,
         b: 1,
     };
@@ -997,7 +997,7 @@ fn control_and_calls(ops: &mut Vec<Op>) {
         vec![],
         vec![Inst::Call {
             func: 1,
-            args: vec![],
+            args: vec![].into(),
         }],
         Terminator::Return(vec![]),
     );
@@ -1006,7 +1006,7 @@ fn control_and_calls(ops: &mut Vec<Op>) {
         family: FAM,
         focus: Focus::Inst(Inst::Call {
             func: 1,
-            args: vec![],
+            args: vec![].into(),
         }),
         module: Module {
             funcs: vec![caller, nop.clone()],
@@ -1016,11 +1016,11 @@ fn control_and_calls(ops: &mut Vec<Op>) {
         conf_skip: None,
     });
     // call.dyn through the function table (idx is an i32; targets funcs[idx]).
-    let ci = Inst::CallIndirect {
+    let ci = Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
         ty: 0, /* #922: interned type index */
         idx: 0,
-        args: vec![],
-    };
+        args: vec![].into(),
+    }));
     let ci_caller = func(
         vec![],
         vec![],
@@ -1046,13 +1046,13 @@ fn caps_and_reflection(ops: &mut Vec<Op>) {
     const FAM: &str = "capabilities & reflection";
     let skip = "host cap/import wiring — covered by the differential harnesses, not auto-synth";
     // Cap-call family: build a verifiable module, but skip the end-to-end pin (needs host wiring).
-    let cc = Inst::CapCall {
+    let cc = Inst::CapCall(Box::new(temen_ir::CapCall {
         type_id: 1,
         op: 0,
         sig: 0, /* #922: interned type index */
         handle: 1,
-        args: vec![],
-    };
+        args: vec![].into(),
+    }));
     push_skip(
         ops,
         "call.cap".into(),
@@ -1105,31 +1105,31 @@ fn caps_and_reflection(ops: &mut Vec<Op>) {
         ("self.covers", Inst::CapSelfCovers { handle: 0, ty: 0 }),
         (
             "call.import",
-            Inst::CallImport {
+            Inst::CallImport(Box::new(temen_ir::CallImport {
                 import: 0,
                 op: 0,
                 sig: 0, /* #922: interned type index */
-                args: vec![],
-            },
+                args: vec![].into(),
+            })),
         ),
         (
             "call.import.dyn",
-            Inst::CallImportDyn {
+            Inst::CallImportDyn(Box::new(temen_ir::CallImportDyn {
                 ty: 0,
                 op: 0,
                 sig: 0, /* #922: interned type index */
                 handle: 0,
-                args: vec![],
-            },
+                args: vec![].into(),
+            })),
         ),
         (
             "call.sym",
-            Inst::CallSym {
+            Inst::CallSym(Box::new(temen_ir::CallSym {
                 import: 0,
                 sig: 0, /* #922: interned type index */
                 handle: 0,
-                args: vec![],
-            },
+                args: vec![].into(),
+            })),
         ),
         ("durable.shadow_base", Inst::DurableShadowBase),
     ] {
@@ -1150,12 +1150,14 @@ fn process(ops: &mut Vec<Op>) {
                 differential harnesses, not auto-synth";
     let self_ty = temen_ir::CAP_SELF_TYPE_ID;
     let inst = crate::capcall::INSTANTIATOR;
-    let capcall = |type_id: u32, op: u32| Inst::CapCall {
-        type_id,
-        op,
-        sig: 0, /* #922: interned type index */
-        handle: 0,
-        args: vec![],
+    let capcall = |type_id: u32, op: u32| {
+        Inst::CapCall(Box::new(temen_ir::CapCall {
+            type_id,
+            op,
+            sig: 0, /* #922: interned type index */
+            handle: 0,
+            args: vec![].into(),
+        }))
     };
     for (name, type_id, op) in [
         // §14 executor children — the process-spawn nouns.

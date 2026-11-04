@@ -152,11 +152,7 @@ fn symbol_table_resolves_a_capability_import_by_name() {
     let lowered_to_cap_call = unit.funcs[0].blocks.iter().flat_map(|b| &b.insts).any(|i| {
         matches!(
             i,
-            Inst::CapCall {
-                type_id: 5,
-                op: 1,
-                ..
-            }
+            Inst::CapCall(c) if c.type_id == 5 && c.op == 1
         )
     });
     assert!(

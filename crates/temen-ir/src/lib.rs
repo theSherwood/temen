@@ -17,6 +17,7 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec; // the `vec!` macro
@@ -2447,7 +2448,8 @@ pub enum Inst {
     /// many** — at the next block-local indices.
     Call {
         func: FuncIdx,
-        args: Vec<ValIdx>,
+        /// A boxed slice, not a `Vec`, so the variant fits an [`Inst`]'s 24 bytes (#2713).
+        args: Box<[ValIdx]>,
     },
     /// `ref.func`: materialize a function reference — just the function index as an
     /// `i32` (a `funcref` is a forgeable integer, §3c). The verifier checks the index
@@ -2463,20 +2465,14 @@ pub enum Inst {
     /// ([`LinkError::Unresolved`]), and a unit a guest loads into its running window refuses it
     /// ([`place_loaded_unit`]). Object dialect only, like the data link forms: a runnable module
     /// never carries one, and a backend that meets one fails closed. Result is one `i32`. The
-    /// name is a `Vec<u8>` for the reason [`Inst::DataSym`]'s is.
+    /// name is bytes for the reason [`DataSym::name`] is.
     RefSym {
-        name: alloc::vec::Vec<u8>,
+        name: Box<[u8]>,
     },
     /// Indirect call through the function table (§3c): mask `idx` into the table,
     /// runtime-check the selected function's signature against `ty`, then call.
     /// `idx` is an `i32` table index; results are `ty.results`.
-    CallIndirect {
-        /// Index into [`Module::types`] naming the [`TypeEntry::Func`] signature to
-        /// runtime-check the selected function against (FuncType interning, #922).
-        ty: u32,
-        idx: ValIdx,
-        args: Vec<ValIdx>,
-    },
+    CallIndirect(Box<CallIndirect>),
     /// Capability call (§3c): invoke operation `op` of the interface identified by
     /// `type_id` on the capability named by `handle` — a forgeable `i32` index into
     /// the **host-owned** handle table. At this use site the index is masked into the
@@ -2491,15 +2487,7 @@ pub enum Inst {
     /// canonical interface — is deferred to §13 linking. Safety does **not** depend on
     /// it: the host-owned table's use-site checks carry it, and the host handler
     /// treats all guest inputs as hostile (§2a authority-TCB).
-    CapCall {
-        type_id: u32,
-        op: u32,
-        /// Index into [`Module::types`] naming the operation's [`TypeEntry::Func`]
-        /// signature (FuncType interning, #922); its results are appended.
-        sig: u32,
-        handle: ValIdx,
-        args: Vec<ValIdx>,
-    },
+    CapCall(Box<CapCall>),
     /// Call a host capability through an **import slot** — the §7 late-binding import,
     /// reshaped by IMPORTS.md §3.5 (wire v7). `import` indexes [`Module::imports`]; `op` is
     /// the **consumer-local op index** into the import's declared interface (always `0` for a
@@ -2511,15 +2499,7 @@ pub enum Inst {
     /// bound at instantiation through the domain's import-binding table
     /// ([`CAP_IMPORT_TYPE_ID`]) — the module bytes are never rewritten. Link-form symbolic
     /// calls are a different instruction ([`Inst::CallSym`]).
-    CallImport {
-        import: u32,
-        op: u32,
-        /// Index into [`Module::types`] naming the op's [`TypeEntry::Func`] signature
-        /// (FuncType interning, #922). The verifier resolves the op's signature through
-        /// the import's declared interface and checks `types[sig]` equals it.
-        sig: u32,
-        args: Vec<ValIdx>,
-    },
+    CallImport(Box<CallImport>),
     /// §7/§22 **link-form symbolic call** — the loader ABI's placeholder, never executable.
     /// `import` names an entry of the unit's import section (its symbol list);
     /// [`resolve_imports_with`] rewrites every `CallSym` 1:1 by what the name resolves to —
@@ -2535,14 +2515,7 @@ pub enum Inst {
     /// `Resolved::Cap` outcome; dead weight for `Func`/`Slot`) is the last special case in the
     /// call encodings — the v7 `ns` field's sibling. It leaves the instruction and the wire at
     /// the **next wire rev** (whenever one happens for its own reasons); no rev is spent on it.
-    CallSym {
-        import: u32,
-        /// Index into [`Module::types`] naming the call's [`TypeEntry::Func`] signature
-        /// (FuncType interning, #922).
-        sig: u32,
-        handle: ValIdx,
-        args: Vec<ValIdx>,
-    },
+    CallSym(Box<CallSym>),
     /// A **link-form data-symbol address** — the data-side analogue of [`Inst::CallSym`] (D-LINK):
     /// the window address of the exported data symbol `name`, plus `addend`, materialized as a
     /// value. Emitted by a separately-compiled unit that references a global it does **not** define
@@ -2551,21 +2524,13 @@ pub enum Inst {
     /// fails the link ([`LinkError::Unresolved`]), and a `DataSym` that *survives* into a runnable
     /// module is a verify error (an object is not executable — the same guarantee as a surviving
     /// `CallSym`). The name rides in the instruction, so instruction insertion/reordering never
-    /// desyncs it — there is no position-keyed relocation table. Result is one `i64`. The name is a
-    /// `Vec<u8>` (not `String`) so `Inst: Clone` monomorphizes to a `Copy`-element `Vec` clone — like
-    /// `CallSym`'s `args` — and never pulls in the concrete `alloc` `String::clone`, keeping every
-    /// `Inst`-manipulating crate (e.g. `temen-peval`) translatable by the strict LLVM on-ramp (the
-    /// data-oriented IR invariant that keeps the partial evaluator self-hostable).
+    /// desyncs it — there is no position-keyed relocation table. Result is one `i64`.
     ///
     /// With `tls` the symbol is a **thread-local** export (#1715) and the result is its offset within
     /// the program's per-thread block (see [`Module::tls`]), not a window address: code adds it to the
     /// running thread's block address. Resolving a `tls` reference to a plain data export, or the
     /// reverse, fails the link ([`LinkError::TlsMismatch`]).
-    DataSym {
-        name: alloc::vec::Vec<u8>,
-        addend: i64,
-        tls: bool,
-    },
+    DataSym(Box<DataSym>),
     /// A **link-form own-data address**: this unit's assigned data base plus `offset` (a unit-local
     /// data offset), materialized as a value — the self-relative counterpart of [`Inst::DataSym`],
     /// for a reference to the unit's *own* global whose final window placement the frontend did not
@@ -2599,16 +2564,7 @@ pub enum Inst {
     /// offer; a type-section reference is resolvable at instantiation. `sig` is the
     /// self-describing copy; the verifier checks it equals `types[ty]`'s op-`op` signature.
     /// Costs the manifest-complete bit, like every dynamic-mode site.
-    CallImportDyn {
-        ty: u32,
-        op: u32,
-        /// Index into [`Module::types`] naming the op's [`TypeEntry::Func`] signature
-        /// (FuncType interning, #922); the verifier checks `types[sig]` equals the
-        /// op-`op` signature of the interface `types[ty]`.
-        sig: u32,
-        handle: ValIdx,
-        args: Vec<ValIdx>,
-    },
+    CallImportDyn(Box<CallImportDyn>),
     /// `export.handle` (IMPORTS.md §3.5): reify **this module's own** impl export `export`
     /// (an index into [`Module::impl_exports`]) as an ordinary capability handle — the only
     /// guest-reachable source of offer wiring rights (offer exposure is consent-based: bytes
@@ -3066,7 +3022,8 @@ pub enum Inst {
     /// of the result from the 32-byte concatenation `a ++ b` (indices 0..16 = `a`, 16..32
     /// = `b`). Out-of-range indices (≥32) are verifier-rejected.
     Shuffle {
-        lanes: [u8; 16],
+        /// Boxed, so the variant fits an [`Inst`]'s 24 bytes (#2713).
+        lanes: Box<[u8; 16]>,
         a: ValIdx,
         b: ValIdx,
     },
@@ -3076,6 +3033,82 @@ pub enum Inst {
         a: ValIdx,
         b: ValIdx,
     },
+}
+
+// Every instruction is 24 bytes (#2713). Instruction arrays are most of a decoded module, and decode,
+// verify, every compile and the tree-walker walk them, so a variant whose fields would make it larger
+// boxes them: the call variants below, and `DataSym`.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(core::mem::size_of::<Inst>() == 24);
+
+/// [`Inst::CallIndirect`]'s fields.
+#[derive(Clone, PartialEq, Debug)]
+pub struct CallIndirect {
+    /// Index into [`Module::types`] naming the [`TypeEntry::Func`] signature to runtime-check the
+    /// selected function against (FuncType interning, #922).
+    pub ty: u32,
+    pub idx: ValIdx,
+    pub args: Box<[ValIdx]>,
+}
+
+/// [`Inst::CapCall`]'s fields.
+#[derive(Clone, PartialEq, Debug)]
+pub struct CapCall {
+    pub type_id: u32,
+    pub op: u32,
+    /// Index into [`Module::types`] naming the operation's [`TypeEntry::Func`] signature (FuncType
+    /// interning, #922); its results are appended.
+    pub sig: u32,
+    pub handle: ValIdx,
+    pub args: Box<[ValIdx]>,
+}
+
+/// [`Inst::CallImport`]'s fields.
+#[derive(Clone, PartialEq, Debug)]
+pub struct CallImport {
+    pub import: u32,
+    pub op: u32,
+    /// Index into [`Module::types`] naming the op's [`TypeEntry::Func`] signature (FuncType
+    /// interning, #922). The verifier resolves the op's signature through the import's declared
+    /// interface and checks `types[sig]` equals it.
+    pub sig: u32,
+    pub args: Box<[ValIdx]>,
+}
+
+/// [`Inst::CallSym`]'s fields.
+#[derive(Clone, PartialEq, Debug)]
+pub struct CallSym {
+    pub import: u32,
+    /// Index into [`Module::types`] naming the call's [`TypeEntry::Func`] signature (FuncType
+    /// interning, #922).
+    pub sig: u32,
+    pub handle: ValIdx,
+    pub args: Box<[ValIdx]>,
+}
+
+/// [`Inst::DataSym`]'s fields.
+#[derive(Clone, PartialEq, Debug)]
+pub struct DataSym {
+    /// Bytes, not a `String`, so `Inst: Clone` monomorphizes to a `Copy`-element clone, like a
+    /// call's `args`, and never pulls in the concrete `alloc` `String::clone`. That keeps every
+    /// `Inst`-manipulating crate (e.g. `temen-peval`) translatable by the strict LLVM on-ramp (the
+    /// data-oriented IR invariant that keeps the partial evaluator self-hostable).
+    pub name: Box<[u8]>,
+    pub addend: i64,
+    pub tls: bool,
+}
+
+/// [`Inst::CallImportDyn`]'s fields.
+#[derive(Clone, PartialEq, Debug)]
+pub struct CallImportDyn {
+    pub ty: u32,
+    pub op: u32,
+    /// Index into [`Module::types`] naming the op's [`TypeEntry::Func`] signature (FuncType
+    /// interning, #922); the verifier checks `types[sig]` equals the op-`op` signature of the
+    /// interface `types[ty]`.
+    pub sig: u32,
+    pub handle: ValIdx,
+    pub args: Box<[ValIdx]>,
 }
 
 /// What an instruction can do **besides** producing its SSA result(s) — the single source of truth
@@ -3127,7 +3160,8 @@ impl Effects {
 /// `&mut Inst` or `&Inst`): the one exhaustive match behind [`Inst::for_each_operand_mut`] and
 /// [`Inst::for_each_operand`], whose bindings take the instruction's mutability.
 macro_rules! inst_operands {
-    ($inst:expr, $f:ident) => {
+    // `$m` is `mut` for the mutable walk: a boxed payload (#2713) is reborrowed through it.
+    ($inst:expr, $f:ident $(, $m:ident)?) => {
         match $inst {
             // No value operands.
             Inst::ConstI32(_)
@@ -3137,7 +3171,7 @@ macro_rules! inst_operands {
             | Inst::ConstV128(_)
             // Link-form data addresses carry only immediates (a name+addend, or an offset) — no value
             // operands to renumber.
-            | Inst::DataSym { .. }
+            | Inst::DataSym(_)
             | Inst::DataSelf { .. }
             | Inst::DataTop
             | Inst::RefFunc { .. }
@@ -3294,23 +3328,37 @@ macro_rules! inst_operands {
                     $f(v);
                 }
             }
-            Inst::CallIndirect { idx, args, .. } => {
+            Inst::CallIndirect(c) => {
+                let CallIndirect { idx, args, .. } = &$($m)? **c;
                 $f(idx);
                 for v in args {
                     $f(v);
                 }
             }
             Inst::CapSelfCovers { handle, .. } => $f(handle),
-            Inst::CapCall { handle, args, .. }
-            | Inst::CallImportDyn { handle, args, .. }
-            | Inst::CallSym { handle, args, .. } => {
+            Inst::CapCall(c) => {
+                let CapCall { handle, args, .. } = &$($m)? **c;
                 $f(handle);
                 for v in args {
                     $f(v);
                 }
             }
-            Inst::CallImport { args, .. } => {
+            Inst::CallImportDyn(c) => {
+                let CallImportDyn { handle, args, .. } = &$($m)? **c;
+                $f(handle);
                 for v in args {
+                    $f(v);
+                }
+            }
+            Inst::CallSym(c) => {
+                let CallSym { handle, args, .. } = &$($m)? **c;
+                $f(handle);
+                for v in args {
+                    $f(v);
+                }
+            }
+            Inst::CallImport(c) => {
+                for v in &$($m)? c.args {
                     $f(v);
                 }
             }
@@ -3390,12 +3438,34 @@ impl Inst {
     /// the entry will be handed (the JIT's fork sites, #1768) reads the same pair.
     pub fn host_dispatch(&self) -> Option<(u32, u32)> {
         match self {
-            Inst::CapCall { type_id, op, .. } => Some((*type_id, *op)),
-            Inst::CallImport { import, op, .. } => {
-                Some((CAP_IMPORT_TYPE_ID, *import | (*op << 16)))
-            }
-            Inst::CallSym { import, .. } => Some((CAP_IMPORT_TYPE_ID, *import)),
-            Inst::CallImportDyn { ty, op, .. } => Some((CAP_DYN_TYPE_ID, *ty | (*op << 16))),
+            Inst::CapCall(c) => Some((c.type_id, c.op)),
+            Inst::CallImport(c) => Some((CAP_IMPORT_TYPE_ID, c.import | (c.op << 16))),
+            Inst::CallSym(c) => Some((CAP_IMPORT_TYPE_ID, c.import)),
+            Inst::CallImportDyn(c) => Some((CAP_DYN_TYPE_ID, c.ty | (c.op << 16))),
+            _ => None,
+        }
+    }
+
+    /// The signature (an index into [`Module::types`]) and arguments of each call
+    /// [`Inst::host_dispatch`] names: `call.cap`, `call.import`, `call.sym` and `call.import.dyn`.
+    /// `None` for every other instruction.
+    pub fn host_call(&self) -> Option<(u32, &[ValIdx])> {
+        match self {
+            Inst::CapCall(c) => Some((c.sig, &c.args)),
+            Inst::CallImport(c) => Some((c.sig, &c.args)),
+            Inst::CallSym(c) => Some((c.sig, &c.args)),
+            Inst::CallImportDyn(c) => Some((c.sig, &c.args)),
+            _ => None,
+        }
+    }
+
+    /// The import-table index this instruction carries, read: the forms [`import_slot_mut`]
+    /// rewrites (`call.sym`, `call.import`, `import.attach`). `None` for every other instruction.
+    pub fn import_slot(&self) -> Option<u32> {
+        match self {
+            Inst::CallSym(c) => Some(c.import),
+            Inst::CallImport(c) => Some(c.import),
+            Inst::ImportAttach { import, .. } => Some(*import),
             _ => None,
         }
     }
@@ -3438,7 +3508,7 @@ impl Inst {
             // Link-form address materialization: pure (a to-be-`ConstI64`), no fault/mem/effect.
             // CSE/DCE on them is sound (same name+addend ⇒ same address); the linker rewrites them
             // to real consts before any backend runs.
-            | Inst::DataSym { .. }
+            | Inst::DataSym(_)
             | Inst::DataSelf { .. }
             | Inst::DataTop
             | Inst::Splat { .. }
@@ -3504,11 +3574,11 @@ impl Inst {
             // conservative full clobber. (`CallImport` is resolved to `CapCall` before a backend, but
             // is classified for completeness.) ----
             Inst::Call { .. }
-            | Inst::CallIndirect { .. }
-            | Inst::CallImport { .. }
-            | Inst::CallImportDyn { .. }
-            | Inst::CallSym { .. }
-            | Inst::CapCall { .. } => fx(true, true, true, true),
+            | Inst::CallIndirect(_)
+            | Inst::CallImport(_)
+            | Inst::CallImportDyn(_)
+            | Inst::CallSym(_)
+            | Inst::CapCall(_) => fx(true, true, true, true),
             // `export.handle` mints/aliases host capability state (a grant into the own table).
             Inst::ExportHandle { .. } => fx(false, false, false, true),
             // `import.attach` mutates host binding state (no guest-memory access, but ordering
@@ -3552,7 +3622,7 @@ impl Inst {
     /// effect does this op have" and "what are its operands"; the optimizer's `map_operands` /
     /// `each_operand` are thin adapters over it (#913).
     pub fn for_each_operand_mut(&mut self, f: &mut impl FnMut(&mut ValIdx)) {
-        inst_operands!(self, f)
+        inst_operands!(self, f, mut)
     }
 
     /// [`Inst::for_each_operand_mut`], reading: the same operands in the same order, without a
@@ -3596,11 +3666,11 @@ impl Inst {
                 1
             }
             Inst::Call { func, .. } => fn_results.get(*func as usize).copied().unwrap_or(0),
-            Inst::CallIndirect { ty, .. } => sig_results(*ty),
-            Inst::CapCall { sig, .. } => sig_results(*sig),
-            Inst::CallImport { sig, .. } => sig_results(*sig),
-            Inst::CallImportDyn { sig, .. } => sig_results(*sig),
-            Inst::CallSym { sig, .. } => sig_results(*sig),
+            Inst::CallIndirect(c) => sig_results(c.ty),
+            Inst::CapCall(c) => sig_results(c.sig),
+            Inst::CallImport(c) => sig_results(c.sig),
+            Inst::CallImportDyn(c) => sig_results(c.sig),
+            Inst::CallSym(c) => sig_results(c.sig),
             _ => 1,
         }
     }
@@ -3896,14 +3966,7 @@ impl Func {
     fn issues_instantiator(&self, ops: &[u32]) -> bool {
         self.blocks.iter().any(|b| {
             b.insts.iter().any(|i| {
-                matches!(
-                    i,
-                    Inst::CapCall {
-                        type_id: cap_id::INSTANTIATOR,
-                        op,
-                        ..
-                    } if ops.contains(op)
-                )
+                matches!(i, Inst::CapCall(c) if c.type_id == cap_id::INSTANTIATOR && ops.contains(&c.op))
             })
         })
     }
@@ -4785,7 +4848,7 @@ fn synth_start(
     };
     insts.push(Inst::Call {
         func: entry + 1,
-        args,
+        args: args.into(),
     });
     // The entry's single result (if any) is value `next`, appended by the call. A child returns it
     // as the i64 status `join` reads: widened from i32, or 0 for an entry with none.
@@ -5718,7 +5781,7 @@ pub fn resolve_imports_with(
             }
             for i in 0..b.insts.len() {
                 let (import, handle) = match &b.insts[i] {
-                    Inst::CallSym { import, handle, .. } => (*import, *handle),
+                    Inst::CallSym(c) => (c.import, c.handle),
                     _ => continue,
                 };
                 let bind = *bound
@@ -5728,28 +5791,28 @@ pub fn resolve_imports_with(
                 let (sig, args) = match &mut b.insts[i] {
                     // `sig` is now an interned `types` index (Copy); the rewritten call reuses
                     // the same index for `CapCall.sig` / `CallIndirect.ty` (FuncType interning, #922).
-                    Inst::CallSym { sig, args, .. } => (*sig, core::mem::take(args)),
+                    Inst::CallSym(c) => (c.sig, core::mem::take(&mut c.args)),
                     _ => unreachable!(),
                 };
                 b.insts[i] = match bind {
-                    Resolved::Cap(cap) => Inst::CapCall {
+                    Resolved::Cap(cap) => Inst::CapCall(Box::new(CapCall {
                         type_id: cap.type_id,
                         op: cap.op,
                         sig,
                         handle,
                         args,
-                    },
+                    })),
                     // Static-link a function symbol → a direct call (handle unused; sig re-checked).
                     Resolved::Func(func) => Inst::Call { func, args },
                     // Dynamic-link a function symbol → a `call.dyn` through the table slot: patch
                     // the handle's `ConstI32` placeholder to `slot` and reuse it as the index.
                     Resolved::Slot(slot) => {
                         patch_placeholder(&mut b.insts, &def_of, handle, slot as i32)?;
-                        Inst::CallIndirect {
+                        Inst::CallIndirect(Box::new(CallIndirect {
                             ty: sig,
                             idx: handle,
                             args,
-                        }
+                        }))
                     }
                 };
             }
@@ -5972,7 +6035,7 @@ pub fn link_base(units: &[LinkUnitRef<'_>]) -> Option<Module> {
                 .flat_map(|b| &b.insts)
                 .any(|i| match i {
                     Inst::DataTop => true,
-                    Inst::DataSym { name, tls, .. } => *tls || tls_sym(name),
+                    Inst::DataSym(d) => d.tls || tls_sym(&d.name),
                     Inst::DataSelf { tls, .. } => *tls,
                     _ => false,
                 })
@@ -6551,30 +6614,27 @@ fn rewrite_unit_imports(m: &mut Module, disps: &[ImportDisp]) -> Result<(), Link
                     .get(slot as usize)
                     .ok_or(LinkError::BadImportIndex(slot))?;
                 match (disp, &mut *inst) {
-                    (ImportDisp::Func(func), Inst::CallSym { args, .. }) => {
-                        let args = core::mem::take(args);
+                    (ImportDisp::Func(func), Inst::CallSym(c)) => {
+                        let args = core::mem::take(&mut c.args);
                         *inst = Inst::Call { func: *func, args };
                     }
-                    (ImportDisp::Func(func), Inst::CallImport { op, args, .. }) => {
-                        if *op != 0 {
+                    (ImportDisp::Func(func), Inst::CallImport(c)) => {
+                        if c.op != 0 {
                             return Err(LinkError::ImportShapeMismatch(format!(
                                 "grouped `call.import` op {} of `{}` cannot resolve to a single \
                                  exported function",
-                                op, names[slot as usize]
+                                c.op, names[slot as usize]
                             )));
                         }
-                        let args = core::mem::take(args);
+                        let args = core::mem::take(&mut c.args);
                         *inst = Inst::Call { func: *func, args };
                     }
                     (ImportDisp::Func(_), Inst::ImportAttach { .. }) => {
                         return Err(LinkError::AttachResolved(names[slot as usize].clone()));
                     }
-                    (
-                        ImportDisp::Keep(j),
-                        Inst::CallSym { import, .. }
-                        | Inst::CallImport { import, .. }
-                        | Inst::ImportAttach { import, .. },
-                    ) => *import = *j,
+                    (ImportDisp::Keep(j), inst) => {
+                        *import_slot_mut(inst).expect("an import-bearing instruction") = *j
+                    }
                     _ => unreachable!("slot extraction and rewrite match the same instructions"),
                 }
             }
@@ -6654,10 +6714,7 @@ pub fn place_loaded_unit(
         .flat_map(|f| &f.blocks)
         .flat_map(|b| &b.insts)
         .any(|i| {
-            matches!(
-                i,
-                Inst::DataSelf { tls: true, .. } | Inst::DataSym { tls: true, .. }
-            )
+            matches!(i, Inst::DataSelf { tls: true, .. }) || matches!(i, Inst::DataSym(d) if d.tls)
         });
     if tls_inst
         || !m.tls.is_empty()
@@ -6831,14 +6888,14 @@ fn resolve_unit_data_addrs(
                         saw_data_top = true;
                         entry_sp
                     }
-                    Inst::DataSym { name, addend, tls } => {
+                    Inst::DataSym(d) => {
                         // The name is stored as raw bytes (Copy-clone friendly); resolve it against
                         // the string-keyed symbol table. Non-UTF-8 or unexported ⇒ fail closed.
-                        let key = core::str::from_utf8(name).map_err(|_| {
-                            LinkError::Unresolved(String::from_utf8_lossy(name).into_owned())
+                        let key = core::str::from_utf8(&d.name).map_err(|_| {
+                            LinkError::Unresolved(String::from_utf8_lossy(&d.name).into_owned())
                         })?;
-                        let base = lookup_data_sym(key, *tls, data_tab, tls_tab)?;
-                        base.wrapping_add(*addend as u64)
+                        let base = lookup_data_sym(key, d.tls, data_tab, tls_tab)?;
+                        base.wrapping_add(d.addend as u64)
                     }
                     _ => continue,
                 };
@@ -6994,19 +7051,18 @@ fn offset_type_indices(m: &mut Module, offset: u32) {
         for b in &mut f.blocks {
             for inst in &mut b.insts {
                 match inst {
-                    Inst::CapSelfTypeId { ty }
-                    | Inst::CapSelfCovers { ty, .. }
+                    Inst::CapSelfTypeId { ty } | Inst::CapSelfCovers { ty, .. } => *ty += offset,
                     // FuncType interning (#922): a call variant's `sig`/`ty` names an entry in the
                     // unit's own type section, which the linker concatenates at `offset` — reindex
                     // it alongside the interface refs so it resolves in the merged type section.
-                    | Inst::CallIndirect { ty, .. } => *ty += offset,
-                    Inst::CapCall { sig, .. }
-                    | Inst::CallImport { sig, .. }
-                    | Inst::CallSym { sig, .. } => *sig += offset,
+                    Inst::CallIndirect(c) => c.ty += offset,
+                    Inst::CapCall(c) => c.sig += offset,
+                    Inst::CallImport(c) => c.sig += offset,
+                    Inst::CallSym(c) => c.sig += offset,
                     // `call.import.dyn` carries both an interface ref (`ty`) and the interned sig.
-                    Inst::CallImportDyn { ty, sig, .. } => {
-                        *ty += offset;
-                        *sig += offset;
+                    Inst::CallImportDyn(c) => {
+                        c.ty += offset;
+                        c.sig += offset;
                     }
                     _ => {}
                 }
@@ -7303,9 +7359,9 @@ fn trap_body(params: &[ValType]) -> Vec<Block> {
 /// capability call, the #1524 shape.
 fn import_slot_mut(inst: &mut Inst) -> Option<&mut u32> {
     match inst {
-        Inst::CallSym { import, .. }
-        | Inst::CallImport { import, .. }
-        | Inst::ImportAttach { import, .. } => Some(import),
+        Inst::CallSym(c) => Some(&mut c.import),
+        Inst::CallImport(c) => Some(&mut c.import),
+        Inst::ImportAttach { import, .. } => Some(import),
         _ => None,
     }
 }
@@ -7860,21 +7916,21 @@ mod import_tests {
             insts: vec![
                 Inst::ConstI64(0), // v1 = buf
                 Inst::ConstI64(3), // v2 = len
-                Inst::CallSym {
+                Inst::CallSym(Box::new(CallSym {
                     // v3 = write(handle=v0, v1, v2)
                     import: 0,
                     sig: 0, // #922: sig_write, interned by add_func_import at type index 0
                     handle: 0,
-                    args: vec![1, 2],
-                },
+                    args: vec![1, 2].into(),
+                })),
                 Inst::ConstI32(0), // v4 = exit code
-                Inst::CallSym {
+                Inst::CallSym(Box::new(CallSym {
                     // exit(handle=v0, v4)
                     import: 1,
                     sig: 1, // #922: sig_exit, interned by add_func_import at type index 1
                     handle: 0,
-                    args: vec![4],
-                },
+                    args: vec![4].into(),
+                })),
             ],
             term: Terminator::Unreachable,
         };
@@ -7920,22 +7976,16 @@ mod import_tests {
         let insts = &r.funcs[0].blocks[0].insts;
         // No CallSym survives.
         assert!(
-            !insts.iter().any(|i| matches!(i, Inst::CallSym { .. })),
+            !insts.iter().any(|i| matches!(i, Inst::CallSym(_))),
             "all symbols must be lowered"
         );
         // "write" became call.cap 0 1 on handle v0 with args [1,2].
         match &insts[2] {
-            Inst::CapCall {
-                type_id,
-                op,
-                handle,
-                args,
-                sig,
-            } => {
-                assert_eq!((*type_id, *op, *handle), (0, 1, 0));
-                assert_eq!(args, &vec![1, 2]);
+            Inst::CapCall(c) => {
+                assert_eq!((c.type_id, c.op, c.handle), (0, 1, 0));
+                assert_eq!(*c.args, [1, 2]);
                 // #922: the resolved call.cap carries an interned type index into `r.types`.
-                let TypeEntry::Func(ft) = &r.types[*sig as usize] else {
+                let TypeEntry::Func(ft) = &r.types[c.sig as usize] else {
                     panic!("call.cap sig must name a func type");
                 };
                 assert_eq!(ft.results.len(), 1);
@@ -7944,11 +7994,9 @@ mod import_tests {
         }
         // "exit" became call.cap 1 0.
         match &insts[4] {
-            Inst::CapCall {
-                type_id, op, args, ..
-            } => {
-                assert_eq!((*type_id, *op), (1, 0));
-                assert_eq!(args, &vec![4]);
+            Inst::CapCall(c) => {
+                assert_eq!((c.type_id, c.op), (1, 0));
+                assert_eq!(*c.args, [4]);
             }
             other => panic!("expected CapCall, got {other:?}"),
         }
@@ -8206,16 +8254,16 @@ mod load_unit_tests {
                             offset: 40,
                             tls: false,
                         },
-                        Inst::DataSym {
-                            name: b"g".to_vec(),
+                        Inst::DataSym(Box::new(DataSym {
+                            name: b"g".to_vec().into(),
                             addend: 0,
                             tls: false,
-                        },
-                        Inst::DataSym {
-                            name: b"ext".to_vec(),
+                        })),
+                        Inst::DataSym(Box::new(DataSym {
+                            name: b"ext".to_vec().into(),
                             addend: 4,
                             tls: false,
-                        },
+                        })),
                     ],
                     term: Terminator::Return(vec![0, 1, 2]),
                 }],
@@ -8458,20 +8506,20 @@ mod effects_tests {
         for inst in [
             Inst::Call {
                 func: 0,
-                args: vec![],
+                args: vec![].into(),
             },
-            Inst::CallIndirect {
+            Inst::CallIndirect(Box::new(CallIndirect {
                 ty: 0, // #922: only effects() is tested here; the sig is never resolved
                 idx: 0,
-                args: vec![],
-            },
-            Inst::CapCall {
+                args: vec![].into(),
+            })),
+            Inst::CapCall(Box::new(CapCall {
                 type_id: 0,
                 op: 0,
                 sig: 0, // #922: only effects() is tested here; the sig is never resolved
                 handle: 0,
-                args: vec![],
-            },
+                args: vec![].into(),
+            })),
             Inst::ContResume {
                 k: 0,
                 arg: 1,

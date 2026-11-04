@@ -260,13 +260,13 @@ fn emit_suspend_body(
                 insts.push(Inst::ConstI32(g.u64v() as i32)); // the i32 clock arg
                 let arg = *next;
                 *next += 1;
-                insts.push(Inst::CapCall {
+                insts.push(Inst::CapCall(Box::new(temen_ir::CapCall {
                     type_id: CLOCK_TYPE_ID,
                     op: CLOCK_OP,
                     sig: 0, // #922: interned (i32)->(i64) at type-section index 0
                     handle: 0,
-                    args: vec![arg],
-                });
+                    args: vec![arg].into(),
+                })));
                 let cap_result = *next;
                 *next += 1;
                 i64_vals.push(cap_result);
@@ -305,7 +305,7 @@ fn emit_suspend_body(
         Suspend::Call(callee) => {
             insts.push(Inst::Call {
                 func: callee,
-                args: vec![0],
+                args: vec![0].into(),
             }); // pass the handle down
             let call_result = *next;
             *next += 1;
@@ -326,11 +326,11 @@ fn emit_suspend_body(
             insts.push(Inst::ConstI32(callee as i32)); // funcref: natural table slot = func index
             let idx = *next;
             *next += 1;
-            insts.push(Inst::CallIndirect {
+            insts.push(Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                 ty: 0, // #922: interned (i32)->(i64) at type-section index 0
                 idx,
-                args: vec![0], // pass the handle down
-            });
+                args: vec![0].into(), // pass the handle down
+            })));
             let call_result = *next;
             *next += 1;
             i64_vals.push(call_result);
@@ -541,13 +541,13 @@ pub fn gen_loop_module(g: &mut Gen) -> Module {
         params: vec![ValType::I32, ValType::I64],
         insts: vec![
             Inst::ConstI32(clock_arg), // v2 = the i32 clock arg
-            Inst::CapCall {
+            Inst::CapCall(Box::new(temen_ir::CapCall {
                 type_id: CLOCK_TYPE_ID,
                 op: CLOCK_OP,
                 sig: 0,    // #922: interned (i32)->(i64) at type-section index 0
                 handle: 0, // v0
-                args: vec![2],
-            }, // v3 = clock
+                args: vec![2].into(),
+            })), // v3 = clock
             Inst::IntBin {
                 ty: IntTy::I64,
                 op: fold_op,

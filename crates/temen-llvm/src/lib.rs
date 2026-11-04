@@ -4192,11 +4192,11 @@ fn synth_dispatcher(key: &DispatchKey, arms: &[DispatchArm], site_ty: u32) -> Fu
                 _ => cargs.push(av),
             }
         }
-        insts.push(Inst::CallIndirect {
+        insts.push(Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
             ty: site_ty, // #922: the site signature, pre-interned by the caller
             idx: idx32,
-            args: cargs,
-        });
+            args: cargs.into(),
+        })));
         let ret = if key.results.is_empty() {
             vec![]
         } else {
@@ -4250,7 +4250,7 @@ fn synth_dispatcher(key: &DispatchKey, arms: &[DispatchArm], site_ty: u32) -> Fu
         }
         insts.push(Inst::Call {
             func: arm.func,
-            args: cargs,
+            args: cargs.into(),
         });
         let callv = v;
         if !arm.results.is_empty() {
@@ -4950,12 +4950,12 @@ fn synth_start(
     for &ctor in ctors {
         insts.push(Inst::Call {
             func: ctor,
-            args: vec![sp],
+            args: vec![sp].into(),
         });
     }
     insts.push(Inst::Call {
         func: main_idx,
-        args: vec![sp],
+        args: vec![sp].into(),
     });
     // The entry's result: a top-level powerbox entry returns `main`'s value verbatim (or `()` for a
     // void `main`); a §14 child entry always returns an `i64` status — `0` for a void `main`, else
@@ -5232,13 +5232,13 @@ fn synth_start_argv(
         for &ctor in ctors {
             d.push(Inst::Call {
                 func: ctor,
-                args: vec![13],
+                args: vec![13].into(),
             });
         }
         // main(main_sp, argc, argv) — argv is the pointer array at the entry SP (v1).
         d.push(Inst::Call {
             func: main_idx,
-            args: vec![13, 14, 1],
+            args: vec![13, 14, 1].into(),
         });
         // main's result is v15 (params 1 + 14 value insts before the call). A top-level entry returns
         // it verbatim (or `()` for a void main); a §14 child entry returns the i64 status the parent
@@ -5434,13 +5434,13 @@ fn synth_start_argv(
     for &ctor in ctors {
         e.push(Inst::Call {
             func: ctor,
-            args: vec![13],
+            args: vec![13].into(),
         });
     }
     // main(main_sp, argc, argv, envp): argv is at the entry SP (v16), envp just above it (v1).
     e.push(Inst::Call {
         func: main_idx,
-        args: vec![13, 15, 16, 1],
+        args: vec![13, 15, 16, 1].into(),
     });
     // main's result is v17 (params 2 + 15 value insts before the call); §14 child entry returns the i64
     // status (0 for void, else widened), a top-level entry returns main's value verbatim. See block 5.
@@ -5565,12 +5565,12 @@ fn synth_sbrk(vm_map_import: u32, stack_page: u64, scratch: u64, map_sig: u32) -
             i64bin(BinOp::And, 4, 5),    // v6 = limit
             i64bin(BinOp::Sub, 6, 2),    // v7 = limit - top
             Inst::ConstI32(PROT_RW),     // v8
-            Inst::CallImport {
+            Inst::CallImport(Box::new(temen_ir::CallImport {
                 import: vm_map_import,
                 op: 0,
                 sig: map_sig, // #922: `vm_map`'s sig, pre-interned by the caller
-                args: vec![2, 7, 8],
-            }, // v9 = 0 or -errno
+                args: vec![2, 7, 8].into(),
+            })), // v9 = 0 or -errno
             Inst::ConstI64(0),           // v10
             Inst::IntCmp {
                 ty: IntTy::I64,
@@ -6093,11 +6093,11 @@ fn synth_eh_destroy(dtor_sig: u32) -> Func {
                 op: ConvOp::WrapI64,
                 a: 2,
             }, // v3 = funcref idx
-            Inst::CallIndirect {
+            Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                 ty: dtor_sig, // #922: `(i64 dtor_sp, i64 this) -> ()`, pre-interned by the caller
                 idx: 3,
-                args: vec![0, 1], // (dtor_sp = sp, this = exn)
-            }, // void
+                args: vec![0, 1].into(), // (dtor_sp = sp, this = exn)
+            })), // void
         ],
         term: Terminator::Return(vec![]),
     };
@@ -9201,11 +9201,17 @@ impl Bdr {
     }
     /// Call a synth helper that returns one i64 (`big_cmp`); yields its result value.
     fn call1(&mut self, func: u32, args: Vec<ValIdx>) -> u32 {
-        self.push(Inst::Call { func, args })
+        self.push(Inst::Call {
+            func,
+            args: args.into(),
+        })
     }
     /// Call a synth helper that returns nothing (`big_zero`/`sub`/`mul_small`/`shl_bits`/`copy`).
     fn call0(&mut self, func: u32, args: Vec<ValIdx>) {
-        self.eff(Inst::Call { func, args });
+        self.eff(Inst::Call {
+            func,
+            args: args.into(),
+        });
     }
     fn block(self, params: Vec<ValType>, term: Terminator) -> Block {
         Block {
@@ -13135,7 +13141,7 @@ fn lower_vm_builtin(
             let scratchv = ctx.const_i64(scratch as i64);
             let len = ctx.push(Inst::Call {
                 func: formatter,
-                args: vec![bits, precv, widthv, flagsv, scratchv],
+                args: vec![bits, precv, widthv, flagsv, scratchv].into(),
             });
             // Copy the formatted field (`scratch + FMT_OUT_O .. +len`) into the guest buffer.
             let memcpy = ctx
@@ -13145,7 +13151,7 @@ fn lower_vm_builtin(
             let src = ctx.const_i64((scratch + FMT_OUT_O as u64) as i64);
             ctx.push_effect(Inst::Call {
                 func: memcpy,
-                args: vec![out, src, len],
+                args: vec![out, src, len].into(),
             });
             let len32 = ctx.push(Inst::Convert {
                 op: ConvOp::WrapI64,
@@ -13165,24 +13171,24 @@ fn lower_vm_builtin(
                 args.push(ctx.operand_i32(vm_arg(c, 2)?)?); // prot
             }
             let sig = ctx.intern_sig(import_sig(import)); // #922
-            let r = ctx.push(Inst::CallImport {
+            let r = ctx.push(Inst::CallImport(Box::new(temen_ir::CallImport {
                 import: imp,
                 op: 0,
                 sig,
-                args,
-            });
+                args: args.into(),
+            })));
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
         "__vm_page_size" => {
             let imp = ctx.import_of("vm_page_size")?;
             let sig = ctx.intern_sig(import_sig("vm_page_size")); // #922
-            let r = ctx.push(Inst::CallImport {
+            let r = ctx.push(Inst::CallImport(Box::new(temen_ir::CallImport {
                 import: imp,
                 op: 0,
                 sig,
-                args: vec![],
-            });
+                args: vec![].into(),
+            })));
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -13233,12 +13239,12 @@ fn lower_vm_builtin(
                 args.push(ctx.operand_i64(vm_arg(c, i)?)?);
             }
             let sig = ctx.intern_sig(import_sig(import)); // #922
-            let r = ctx.push(Inst::CallImport {
+            let r = ctx.push(Inst::CallImport(Box::new(temen_ir::CallImport {
                 import: imp,
                 op: 0,
                 sig,
-                args,
-            });
+                args: args.into(),
+            })));
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -13250,12 +13256,12 @@ fn lower_vm_builtin(
             let imp = ctx.import_of("vm_region_create")?;
             let len = ctx.operand_i64(vm_arg(c, 0)?)?;
             let sig = ctx.intern_sig(import_sig("vm_region_create")); // #922
-            let r = ctx.push(Inst::CallImport {
+            let r = ctx.push(Inst::CallImport(Box::new(temen_ir::CallImport {
                 import: imp,
                 op: 0,
                 sig,
-                args: vec![len],
-            });
+                args: vec![len].into(),
+            })));
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -13285,13 +13291,13 @@ fn lower_vm_builtin(
                 _ => 3,                 // vm_region_page_size
             };
             let sig = ctx.intern_sig(import_sig(import)); // #922
-            let r = ctx.push(Inst::CapCall {
+            let r = ctx.push(Inst::CapCall(Box::new(temen_ir::CapCall {
                 type_id: SHARED_REGION_TYPE_ID,
                 op,
                 sig,
                 handle,
-                args,
-            });
+                args: args.into(),
+            })));
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -13560,13 +13566,13 @@ fn lower_vm_builtin(
                 results: vec![ValType::I64],
             };
             let sig = ctx.intern_sig(sig); // #922
-            let r = ctx.push(Inst::CapCall {
+            let r = ctx.push(Inst::CapCall(Box::new(temen_ir::CapCall {
                 type_id: HOST_PROC_TYPE_ID,
                 op: op_const,
                 sig,
                 handle,
-                args,
-            });
+                args: args.into(),
+            })));
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -13583,13 +13589,13 @@ fn lower_vm_builtin(
                 results: vec![ValType::I64],
             };
             let sig = ctx.intern_sig(sig); // #922
-            let r = ctx.push(Inst::CapCall {
+            let r = ctx.push(Inst::CapCall(Box::new(temen_ir::CapCall {
                 type_id: temen_ir::CAP_SELF_TYPE_ID,
                 op: 16, // CAP_SELF_PIPE
                 sig,
                 handle,
-                args: vec![fds],
-            });
+                args: vec![fds].into(),
+            })));
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -13607,13 +13613,13 @@ fn lower_vm_builtin(
                 results: vec![ValType::I64],
             };
             let sig = ctx.intern_sig(sig); // #922
-            let r = ctx.push(Inst::CapCall {
+            let r = ctx.push(Inst::CapCall(Box::new(temen_ir::CapCall {
                 type_id: temen_ir::CAP_SELF_TYPE_ID,
                 op: 14, // CAP_SELF_EXEC
                 sig,
                 handle,
-                args,
-            });
+                args: args.into(),
+            })));
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -13631,13 +13637,13 @@ fn lower_vm_builtin(
                 results: vec![ValType::I64],
             };
             let sig = ctx.intern_sig(sig); // #922
-            let r = ctx.push(Inst::CapCall {
+            let r = ctx.push(Inst::CapCall(Box::new(temen_ir::CapCall {
                 type_id: temen_ir::cap_id::STREAM,
                 op: if name == "__vm_read" { 0 } else { 1 },
                 sig,
                 handle,
-                args: vec![buf, len],
-            });
+                args: vec![buf, len].into(),
+            })));
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -13648,13 +13654,13 @@ fn lower_vm_builtin(
                 results: vec![ValType::I64],
             };
             let sig = ctx.intern_sig(sig); // #922
-            let r = ctx.push(Inst::CapCall {
+            let r = ctx.push(Inst::CapCall(Box::new(temen_ir::CapCall {
                 type_id: temen_ir::cap_id::STREAM,
                 op: 2,
                 sig,
                 handle,
-                args: vec![],
-            });
+                args: vec![].into(),
+            })));
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -13682,13 +13688,13 @@ fn lower_vm_builtin(
                 results: vec![ValType::I64],
             };
             let sig = ctx.intern_sig(sig); // #922
-            let r = ctx.push(Inst::CapCall {
+            let r = ctx.push(Inst::CapCall(Box::new(temen_ir::CapCall {
                 type_id: SHARED_REGION_TYPE_ID,
                 op: op_const,
                 sig,
                 handle,
-                args,
-            });
+                args: args.into(),
+            })));
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -13708,13 +13714,13 @@ fn lower_vm_builtin(
                 results: vec![ValType::I64],
             };
             let sig = ctx.intern_sig(sig); // #922
-            let r = ctx.push(Inst::CapCall {
+            let r = ctx.push(Inst::CapCall(Box::new(temen_ir::CapCall {
                 type_id: INSTANTIATOR_TYPE_ID,
                 op: 17,
                 sig,
                 handle,
-                args: vec![rec],
-            });
+                args: vec![rec].into(),
+            })));
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -13735,13 +13741,13 @@ fn lower_vm_builtin(
                 results: vec![ValType::I64],
             };
             let sig = ctx.intern_sig(sig); // #922
-            let r = ctx.push(Inst::CapCall {
+            let r = ctx.push(Inst::CapCall(Box::new(temen_ir::CapCall {
                 type_id: MODULE_LOADER_TYPE_ID,
                 op: 0,
                 sig,
                 handle,
-                args,
-            });
+                args: args.into(),
+            })));
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -13762,13 +13768,13 @@ fn lower_vm_builtin(
             };
             let sig = ctx.intern_sig(sig); // #922
             let rs = ctx.push_multi(
-                Inst::CapCall {
+                Inst::CapCall(Box::new(temen_ir::CapCall {
                     type_id: INSTANTIATOR_TYPE_ID,
                     op: 1,
                     sig,
                     handle,
-                    args: vec![child],
-                },
+                    args: vec![child].into(),
+                })),
                 2,
             ); // (status, value)
             ctx.push_effect(Inst::Store {
@@ -13798,7 +13804,7 @@ fn lower_vm_builtin(
                 results: vec![ValType::I64],
             };
             let sig = ctx.intern_sig(sig); // #922
-            let r = ctx.push(Inst::CapCall {
+            let r = ctx.push(Inst::CapCall(Box::new(temen_ir::CapCall {
                 type_id: INSTANTIATOR_TYPE_ID,
                 op: match name {
                     "__vm_poll" => 9,
@@ -13808,8 +13814,8 @@ fn lower_vm_builtin(
                 },
                 sig,
                 handle,
-                args,
-            });
+                args: args.into(),
+            })));
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -13834,13 +13840,13 @@ fn lower_vm_builtin(
                 results: vec![ValType::I64],
             };
             let sig = ctx.intern_sig(sig); // #922
-            let r = ctx.push(Inst::CapCall {
+            let r = ctx.push(Inst::CapCall(Box::new(temen_ir::CapCall {
                 type_id: temen_ir::cap_id::BUDGET,
                 op,
                 sig,
                 handle,
-                args,
-            });
+                args: args.into(),
+            })));
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
@@ -13897,12 +13903,12 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
         }
         let returns = !sig.results.is_empty();
         let sig = ctx.intern_sig(sig);
-        let inst = Inst::CallImport {
+        let inst = Inst::CallImport(Box::new(temen_ir::CallImport {
             import,
             op: 0,
             sig,
-            args,
-        };
+            args: args.into(),
+        }));
         if returns {
             let r = ctx.push(inst);
             ctx.bind_dest(&c.dest, r);
@@ -13919,12 +13925,12 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             args.push(ctx.operand(a)?);
         }
         let sig = ctx.intern_sig(spec.sig); // #922
-        let inst = Inst::CallImport {
+        let inst = Inst::CallImport(Box::new(temen_ir::CallImport {
             import,
             op: 0,
             sig,
-            args,
-        };
+            args: args.into(),
+        }));
         // A non-void result (write/read) is a value to bind; `exit` is void (`push_effect`).
         match &c.dest {
             Some(_) => {
@@ -13959,7 +13965,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
                     })?;
                     let n = ctx.push(Inst::Call {
                         func: strlen,
-                        args: vec![p],
+                        args: vec![p].into(),
                     });
                     (p, n)
                 }
@@ -14014,7 +14020,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let inc = ctx.operand(&c.arguments[0].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![inc],
+                args: vec![inc].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14030,7 +14036,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let n = ctx.operand(&c.arguments[2].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![a, b, n],
+                args: vec![a, b, n].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14054,7 +14060,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let p = ctx.operand(&c.arguments[0].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![p],
+                args: vec![p].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14069,7 +14075,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let b = ctx.operand(&c.arguments[1].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![a, b],
+                args: vec![a, b].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14084,7 +14090,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let n = ctx.operand(&c.arguments[2].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![a, b, n],
+                args: vec![a, b, n].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14098,7 +14104,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let ch = ctx.operand(&c.arguments[1].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![s, ch],
+                args: vec![s, ch].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14112,7 +14118,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let s = ctx.operand(&c.arguments[1].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![d, s],
+                args: vec![d, s].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14126,7 +14132,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let set = ctx.operand(&c.arguments[1].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![s, set],
+                args: vec![s, set].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14140,7 +14146,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let set = ctx.operand(&c.arguments[1].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![s, set],
+                args: vec![s, set].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14154,7 +14160,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let ch = ctx.operand(&c.arguments[1].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![s, ch],
+                args: vec![s, ch].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14167,7 +14173,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let set = ctx.operand(&c.arguments[1].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![s, set],
+                args: vec![s, set].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14181,7 +14187,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let n = ctx.operand(&c.arguments[1].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![x, n],
+                args: vec![x, n].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14196,7 +14202,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let y = ctx.operand(&c.arguments[1].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![x, y],
+                args: vec![x, y].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14210,7 +14216,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let y = ctx.operand(&c.arguments[1].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![x, y],
+                args: vec![x, y].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14224,7 +14230,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let e = ctx.operand(&c.arguments[1].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![x, e],
+                args: vec![x, e].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14238,7 +14244,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let e = ctx.operand(&c.arguments[1].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![s, e],
+                args: vec![s, e].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14257,7 +14263,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             };
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![],
+                args: vec![].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14268,7 +14274,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             };
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![],
+                args: vec![].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14281,7 +14287,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let t = ctx.operand(&c.arguments[0].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![t],
+                args: vec![t].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14296,7 +14302,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let n = ctx.operand(&c.arguments[2].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![s, ch, n],
+                args: vec![s, ch, n].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14326,7 +14332,7 @@ fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let name = ctx.operand(&c.arguments[0].0)?;
             let r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![name],
+                args: vec![name].into(),
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)
@@ -14406,7 +14412,7 @@ fn lower_format(
                     .ok_or_else(|| Error::Unsupported("printf: strlen helper missing".into()))?;
                 let mut len = ctx.push(Inst::Call {
                     func: strlen,
-                    args: vec![ptr],
+                    args: vec![ptr].into(),
                 });
                 // Precision truncates: write at most `prec` bytes (`len = min(strlen, prec)`).
                 if let Some(p) = prec {
@@ -14572,7 +14578,7 @@ fn lower_format(
                 let scratchv = ctx.const_i64(scratch as i64);
                 let len = ctx.push(Inst::Call {
                     func: formatter,
-                    args: vec![bits, precv, widthv, flagsv, scratchv],
+                    args: vec![bits, precv, widthv, flagsv, scratchv].into(),
                 });
                 let outp = ctx.const_i64((scratch + FMT_OUT_O as u64) as i64);
                 ctx.emit_write(outp, len)?;
@@ -14607,7 +14613,7 @@ fn lower_snprintf(ctx: &mut BlockCtx, c: &crate::ll::ast::Call) -> Result<(), Er
         })?;
         let r = ctx.push(Inst::Call {
             func: f,
-            args: vec![],
+            args: vec![].into(),
         });
         ctx.bind_dest(&c.dest, r);
         return Ok(());
@@ -14834,7 +14840,7 @@ fn emit_printf_int_field(
     let bufend = ctx.const_i64(bufend_off as i64);
     let start = ctx.push(Inst::Call {
         func: utoa,
-        args: vec![mag, basec, bufend],
+        args: vec![mag, basec, bufend].into(),
     }); // real digits at [start, bufend)
 
     // The effective leftmost digit, after precision zero-extension / `%.0` suppression.
@@ -17529,7 +17535,7 @@ fn lower_eh_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             let callee_sp = ctx.callee_base()?;
             ctx.push_effect(Inst::Call {
                 func: helper,
-                args: vec![callee_sp, exn, dtor],
+                args: vec![callee_sp, exn, dtor].into(),
             });
             // Clear the dtor slot so a later `__cxa_end_catch` without an intervening throw cannot
             // re-destroy the (now-dead) object; the next `__cxa_throw` re-stores it.
@@ -18125,7 +18131,7 @@ impl<'a> BlockCtx<'a> {
             let dst = self.add_i64(sink.dest, sink.offset);
             self.push_effect(Inst::Call {
                 func: memcpy,
-                args: vec![dst, buf, ncopy],
+                args: vec![dst, buf, ncopy].into(),
             });
             let new_off = self.push(Inst::IntBin {
                 ty: IntTy::I64,
@@ -18141,12 +18147,12 @@ impl<'a> BlockCtx<'a> {
         }
         let import = self.import_of("write")?;
         let sig = self.intern_sig(import_sig("write")); // #922
-        Ok(self.push(Inst::CallImport {
+        Ok(self.push(Inst::CallImport(Box::new(temen_ir::CallImport {
             import,
             op: 0,
             sig,
-            args: vec![buf, len],
-        }))
+            args: vec![buf, len].into(),
+        }))))
     }
 
     /// Store a single byte `value` (`i32`-typed) into the 1-byte stash scratch and return its window
@@ -18327,11 +18333,11 @@ impl<'a> BlockCtx<'a> {
                 })
             }
             Some(CBase::SelfData) => self.data_addr(v.off as u64),
-            Some(CBase::DataSym(name)) => self.push(Inst::DataSym {
-                name: name.into_bytes(),
+            Some(CBase::DataSym(name)) => self.push(Inst::DataSym(Box::new(temen_ir::DataSym {
+                name: name.into_bytes().into(),
                 addend: v.off,
                 tls: false,
-            }),
+            }))),
             Some(CBase::Func(name)) => {
                 let func = match self.name2idx.get(&name) {
                     Some(&f) if v.off == 0 => f,
@@ -18349,7 +18355,7 @@ impl<'a> BlockCtx<'a> {
                     return unsup(format!("arithmetic on the address of `@{name}`"));
                 }
                 let r = self.push(Inst::RefSym {
-                    name: name.into_bytes(),
+                    name: name.into_bytes().into(),
                 });
                 self.push(Inst::Convert {
                     op: ConvOp::ExtendI32U,
@@ -18388,13 +18394,13 @@ impl<'a> BlockCtx<'a> {
         let sig = self.intern_sig(sig); // #922
         let handle = self.push(Inst::ConstI32(0));
         self.push_multi(
-            Inst::CapCall {
+            Inst::CapCall(Box::new(temen_ir::CapCall {
                 type_id: temen_ir::CAP_SELF_TYPE_ID,
                 op,
                 sig,
                 handle,
-                args,
-            },
+                args: args.into(),
+            })),
             n,
         )
     }
@@ -18486,7 +18492,7 @@ impl<'a> BlockCtx<'a> {
         let base_c = self.const_i64(base as i64);
         self.push_effect(Inst::Call {
             func: helper,
-            args: vec![base_c],
+            args: vec![base_c].into(),
         });
         Ok(())
     }
@@ -18779,14 +18785,14 @@ impl<'a> BlockCtx<'a> {
                         // A link unit reaches a global another unit defines through the linker
                         // (#1746), and the address of a function another unit defines (#2203).
                         if link.extern_data.contains(&n) {
-                            Ok(self.push(Inst::DataSym {
-                                name: n.into_bytes(),
+                            Ok(self.push(Inst::DataSym(Box::new(temen_ir::DataSym {
+                                name: n.into_bytes().into(),
                                 addend: 0,
                                 tls: false,
-                            }))
+                            }))))
                         } else {
                             let r = self.push(Inst::RefSym {
-                                name: n.into_bytes(),
+                                name: n.into_bytes().into(),
                             });
                             Ok(self.push(Inst::Convert {
                                 op: ConvOp::ExtendI32U,
@@ -19262,7 +19268,7 @@ fn lower_narrow_atomic_rmw(
     let opc = ctx.const_i64(opcode);
     let old64 = ctx.push(Inst::Call {
         func: h,
-        args: vec![word, shift, mask, value64, opc],
+        args: vec![word, shift, mask, value64, opc].into(),
     });
     Ok(ctx.push(Inst::Convert {
         op: ConvOp::WrapI64,
@@ -19308,7 +19314,7 @@ fn lower_narrow_atomic_cas(
     let repl64 = ext(ctx, replacement);
     let old64 = ctx.push(Inst::Call {
         func: h,
-        args: vec![word, shift, mask, masked_exp64, repl64],
+        args: vec![word, shift, mask, masked_exp64, repl64].into(),
     });
     let old32 = ctx.push(Inst::Convert {
         op: ConvOp::WrapI64,
@@ -20012,7 +20018,7 @@ fn i128_divrem(
     let parts = ctx.push_multi(
         Inst::Call {
             func: udivmod,
-            args: vec![nlo, nhi, dlo, dhi],
+            args: vec![nlo, nhi, dlo, dhi].into(),
         },
         4,
     );
@@ -20619,24 +20625,30 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 // `stub_unresolved_externs`: mint (or reuse) a trap stub and call it, deferring the
                 // fail-closed to run time (§2a).
                 match (ctx.name2idx.get(&name), ctx.link, ctx.stubs) {
-                    (Some(&func), _, _) => Inst::Call { func, args },
+                    (Some(&func), _, _) => Inst::Call {
+                        func,
+                        args: args.into(),
+                    },
                     (None, Some(link), _) => {
                         let sig = ctx.intern_sig(extern_stub_sig(c, types)?);
                         let import = link.imports.borrow_mut().import(&name, sig);
                         // The handle operand is unused once the linker resolves the import to a
                         // direct call (chibicc's `--emit-object` emits the same placeholder).
                         let handle = ctx.push(Inst::ConstI32(0));
-                        Inst::CallSym {
+                        Inst::CallSym(Box::new(temen_ir::CallSym {
                             import,
                             sig,
                             handle,
-                            args,
-                        }
+                            args: args.into(),
+                        }))
                     }
                     (None, None, Some(cell)) => {
                         let sig = extern_stub_sig(c, types)?;
                         let func = cell.borrow_mut().get_or_insert(&name, sig);
-                        Inst::Call { func, args }
+                        Inst::Call {
+                            func,
+                            args: args.into(),
+                        }
                     }
                     (None, None, None) => {
                         return Err(Error::Unsupported(format!(
@@ -20658,7 +20670,10 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     // (default arm), and the strict `call.dyn` fallback.
                     Some(d) => {
                         args.insert(1, fref64);
-                        Inst::Call { func: d, args }
+                        Inst::Call {
+                            func: d,
+                            args: args.into(),
+                        }
                     }
                     None => {
                         let idx = ctx.push(Inst::Convert {
@@ -20666,7 +20681,11 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                             a: fref64,
                         }); // → i32 funcref index
                         let ty = ctx.intern_sig(indirect_sig(c, types)?); // #922
-                        Inst::CallIndirect { ty, idx, args }
+                        Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
+                            ty,
+                            idx,
+                            args: args.into(),
+                        }))
                     }
                 }
             }
@@ -20679,11 +20698,19 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // leaf-frame (`frame_size == 0`) case. (Reclaiming a non-empty caller frame would need
         // `musttail` detection, which the LLVM-C binding doesn't expose.) A call to a link unit's
         // import has no `return_call` form, so it stays a call and the block's `ret` follows it.
-        if ctx.tail_return && !matches!(inst, Inst::CallSym { .. }) {
+        if ctx.tail_return && !matches!(inst, Inst::CallSym(_)) {
             let term = match inst {
-                Inst::Call { func, args } => Terminator::ReturnCall { func, args },
-                Inst::CallIndirect { ty, idx, args } => {
-                    Terminator::ReturnCallIndirect { ty, idx, args }
+                Inst::Call { func, args } => Terminator::ReturnCall {
+                    func,
+                    args: args.into_vec(),
+                },
+                Inst::CallIndirect(c) => {
+                    let temen_ir::CallIndirect { ty, idx, args } = *c;
+                    Terminator::ReturnCallIndirect {
+                        ty,
+                        idx,
+                        args: args.into_vec(),
+                    }
                 }
                 _ => unreachable!("tail call lowered to a non-call inst"),
             };
@@ -21214,7 +21241,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             }
             let mut r = ctx.push(Inst::Call {
                 func: f,
-                args: vec![a, b],
+                args: vec![a, b].into(),
             });
             if ty == FloatTy::F32 {
                 r = ctx.push(Inst::Cast {
@@ -21488,7 +21515,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 (
                     &sv.dest,
                     ctx.push(Inst::Shuffle {
-                        lanes,
+                        lanes: Box::new(lanes),
                         a: v0,
                         b: v1,
                     }),
@@ -23688,7 +23715,11 @@ fn try_native_vnarrow(
     }
     let a = parts[0];
     let b = parts[1];
-    let r = ctx.push(Inst::Shuffle { lanes: mask, a, b });
+    let r = ctx.push(Inst::Shuffle {
+        lanes: Box::new(mask),
+        a,
+        b,
+    });
     finish(ctx, dest, r)?;
     Ok(true)
 }
@@ -24115,7 +24146,10 @@ fn lower_invoke(
     for &a in &arg_vals {
         cargs.push(pos[&a] as ValIdx);
     }
-    insts.push(Inst::Call { func, args: cargs }); // p+6 (result, if any)
+    insts.push(Inst::Call {
+        func,
+        args: cargs.into(),
+    }); // p+6 (result, if any)
     let result = p + 6;
     // pop HSP back to `d` (normal return).
     insts.push(Inst::Store {

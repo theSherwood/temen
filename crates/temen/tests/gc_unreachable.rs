@@ -41,7 +41,7 @@ fn caller(callee: u32) -> Func {
             params: vec![ValType::I64],
             insts: vec![Inst::Call {
                 func: callee,
-                args: vec![0],
+                args: vec![0].into(),
             }],
             term: Terminator::Return(vec![1]),
         }],
@@ -125,11 +125,11 @@ fn a_computed_indirect_index_still_selects_the_same_slot() {
             params: vec![ValType::I64],
             insts: vec![
                 Inst::ConstI32(3), // a *computed* index: no ref.func anywhere in the module
-                Inst::CallIndirect {
+                Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                     ty: 0,
                     idx: 1,
-                    args: vec![0],
-                },
+                    args: vec![0].into(),
+                })),
             ],
             term: Terminator::Return(vec![2]),
         }],

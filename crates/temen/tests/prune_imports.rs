@@ -44,11 +44,13 @@ fn calls_imports(slots: &[u32]) -> Func {
             params: vec![],
             insts: slots
                 .iter()
-                .map(|&import| Inst::CallImport {
-                    import,
-                    op: 0,
-                    sig: 0,
-                    args: vec![],
+                .map(|&import| {
+                    Inst::CallImport(Box::new(temen_ir::CallImport {
+                        import,
+                        op: 0,
+                        sig: 0,
+                        args: vec![].into(),
+                    }))
                 })
                 .collect(),
             term: Terminator::Return(vec![]),
@@ -99,7 +101,8 @@ fn slots(m: &Module) -> Vec<(usize, u32)> {
     for (f, func) in m.funcs.iter().enumerate() {
         for b in &func.blocks {
             for inst in &b.insts {
-                if let Inst::CallImport { import, .. } = inst {
+                if let Inst::CallImport(c) = inst {
+                    let temen_ir::CallImport { import, .. } = &**c;
                     out.push((f, *import));
                 }
             }

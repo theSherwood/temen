@@ -196,7 +196,7 @@ fn gen_func(g: &mut Rng, nfuncs: usize, acyclic_from: Option<usize>) -> Func {
                     let a1 = any_i64!();
                     insts.push(Inst::Call {
                         func: (call_floor + g.range(nfuncs - call_floor)) as u32,
-                        args: vec![a0, a1],
+                        args: vec![a0, a1].into(),
                     });
                 } else {
                     insts.push(Inst::ConstI64(g.next_u64() as i64));

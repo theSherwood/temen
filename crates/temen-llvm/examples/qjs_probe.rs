@@ -92,7 +92,7 @@ fn main() {
                 Inst::Load { .. } => loads += 1,
                 Inst::Store { .. } => stores += 1,
                 Inst::Call { .. } => calls += 1,
-                Inst::CallIndirect { .. } => indirect += 1,
+                Inst::CallIndirect(_) => indirect += 1,
                 _ => {}
             }
         }

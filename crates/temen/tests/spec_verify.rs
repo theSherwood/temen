@@ -239,7 +239,7 @@ fn directed_rule_rejects() {
         vec![],
         vec![Inst::Call {
             func: 7,
-            args: vec![],
+            args: vec![].into(),
         }],
         T::Return(vec![]),
     );
@@ -252,7 +252,7 @@ fn directed_rule_rejects() {
         vec![],
         vec![Inst::Call {
             func: 1,
-            args: vec![],
+            args: vec![].into(),
         }],
         T::Return(vec![]),
     );
@@ -266,7 +266,7 @@ fn directed_rule_rejects() {
         vec![],
         vec![Inst::Call {
             func: 1,
-            args: vec![0],
+            args: vec![0].into(),
         }],
         T::Return(vec![]),
     );
@@ -400,12 +400,12 @@ fn directed_rule_rejects() {
     let f = func(
         vec![],
         vec![],
-        vec![Inst::CallImport {
+        vec![Inst::CallImport(Box::new(temen_ir::CallImport {
             import: 0,
             op: 0,
             sig: 0,
-            args: vec![],
-        }],
+            args: vec![].into(),
+        }))],
         T::Return(vec![]),
     );
     reject(&module(vec![f]), "unresolved import", |e| {
@@ -424,12 +424,12 @@ fn directed_rule_rejects() {
         m.funcs.push(func(
             vec![],
             vec![],
-            vec![Inst::CallImport {
+            vec![Inst::CallImport(Box::new(temen_ir::CallImport {
                 import: 0,
                 op: 0,
                 sig,
-                args: vec![],
-            }],
+                args: vec![].into(),
+            }))],
             T::Return(vec![]),
         ));
         m.add_func_import("ping", manifest_sig, temen_ir::ImportMode::Required);
@@ -697,12 +697,12 @@ fn spec_agreement_on_v7_grouped_surface() {
             vec![
                 Inst::ConstI32(0),
                 Inst::ConstI64(1),
-                Inst::CallImport {
+                Inst::CallImport(Box::new(temen_ir::CallImport {
                     import: 0,
                     op,
                     sig: 0, // #922: i64_sig is interned at type-section index 0 (below)
-                    args: vec![1],
-                },
+                    args: vec![1].into(),
+                })),
             ],
             T::Return(vec![]),
         )

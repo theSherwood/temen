@@ -63,12 +63,14 @@ fn serve_qualifies_still_folds_fork_for_cranelift() {
 
     // #922: `serve_qualifies` inspects only the cap-op, never the signature, so any interned
     // type index (0) is fine here — `results` still shapes the surrounding func's declared results.
-    let self_cap = |op: u32, _results: Vec<ValType>| Inst::CapCall {
-        type_id: CAP_SELF_TYPE_ID,
-        op,
-        sig: 0,
-        handle: 0,
-        args: vec![],
+    let self_cap = |op: u32, _results: Vec<ValType>| {
+        Inst::CapCall(Box::new(temen_ir::CapCall {
+            type_id: CAP_SELF_TYPE_ID,
+            op,
+            sig: 0,
+            handle: 0,
+            args: vec![].into(),
+        }))
     };
     // A bare `svc.poll` service point is serve-qualified (a fast backend runs the serve loop).
     let serve_only = vec![Func {

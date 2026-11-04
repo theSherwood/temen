@@ -778,7 +778,7 @@ fn build_inline_demo() -> Module {
             params: vec![t(), t()],
             insts: vec![Inst::Call {
                 func: 1,
-                args: vec![0, 1],
+                args: vec![0, 1].into(),
             }],
             term: Terminator::Return(vec![2]),
         }],
@@ -999,7 +999,7 @@ fn build_stack_interpreter_calls(program: &[(u8, i64)]) -> Module {
             load(LoadOp::I64, 7, 0), // 8: a = stk[sp2]
             Inst::Call {
                 func: 1,
-                args: vec![8, 6],
+                args: vec![8, 6].into(),
             }, // 9: r = combine(a, b)
             store(7, 9),             // stk[sp2] = r
             Inst::ConstI64(9),
@@ -1324,11 +1324,11 @@ fn build_threaded_interpreter(program: &[(u8, i64)]) -> Module {
         captures: vec![],
         params: vec![t(), t(), ValType::I32, t()], // 0: acc, 1: pc, 2: op (funcref idx), 3: input
         insts: vec![
-            Inst::CallIndirect {
+            Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                 ty: 0, // #922: sig() interned at type index 0
                 idx: 2,
-                args: vec![0, 3],
-            }, // 4: result
+                args: vec![0, 3].into(),
+            })), // 4: result
             Inst::ConstI64(1),
             bin(BinOp::Add, 1, 5), // 6: npc
         ],
@@ -1352,11 +1352,11 @@ fn build_threaded_interpreter(program: &[(u8, i64)]) -> Module {
                 op: ConvOp::WrapI64,
                 a: 6,
             }, // 7: idx (i32)
-            Inst::CallIndirect {
+            Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                 ty: 0, // #922: sig() interned at type index 0
                 idx: 7,
-                args: vec![0, 2],
-            }, // 8: result
+                args: vec![0, 2].into(),
+            })), // 8: result
             Inst::ConstI64(1),
             bin(BinOp::Add, 1, 9), // 10: npc
         ],

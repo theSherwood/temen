@@ -17,7 +17,7 @@ fn n_call_indirect(m: &Module) -> usize {
         .iter()
         .flat_map(|f| &f.blocks)
         .flat_map(|b| &b.insts)
-        .filter(|i| matches!(i, Inst::CallIndirect { .. }))
+        .filter(|i| matches!(i, Inst::CallIndirect(_)))
         .count()
 }
 
@@ -79,7 +79,7 @@ fn entry_calling(callee: u32) -> Func {
             params: vec![ValType::I32],
             insts: vec![Inst::Call {
                 func: callee,
-                args: vec![0],
+                args: vec![0].into(),
             }],
             term: Terminator::Return(vec![1]),
         }],
@@ -234,11 +234,11 @@ fn keeps_all_functions_when_indirect_dispatch_present() {
             params: vec![ValType::I32],
             insts: vec![
                 Inst::RefFunc { func: 2 }, // v1 = funcref(2)
-                Inst::CallIndirect {
+                Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                     ty: 0, // #922: sig interned at type-section index 0
                     idx: 1,
-                    args: vec![0],
-                }, // v2 = (*funcref)(a)
+                    args: vec![0].into(),
+                })), // v2 = (*funcref)(a)
             ],
             term: Terminator::Return(vec![2]),
         }],
@@ -413,7 +413,7 @@ fn inlines_leaf_helper_then_dfe_removes_it() {
             params: vec![ValType::I32, ValType::I32],
             insts: vec![Inst::Call {
                 func: 1,
-                args: vec![0, 1],
+                args: vec![0, 1].into(),
             }],
             term: Terminator::Return(vec![2]),
         }],
@@ -482,7 +482,7 @@ fn inlines_with_live_code_after_the_call() {
             insts: vec![
                 Inst::Call {
                     func: 1,
-                    args: vec![0],
+                    args: vec![0].into(),
                 }, // v1 = inc(a)
                 Inst::ConstI32(2),
                 mul(1, 2), // v3 = v1 * 2
@@ -584,7 +584,7 @@ fn inlines_a_multiblock_callee_threading_a_captured_value() {
                 Inst::ConstI32(10), // v1 = k
                 Inst::Call {
                     func: 1,
-                    args: vec![0],
+                    args: vec![0].into(),
                 }, // v2 = abs(a)
                 add(2, 1),          // v3 = t + k
             ],
@@ -631,7 +631,7 @@ fn multiblock_inline_through_the_full_pipeline() {
             params: vec![ValType::I32],
             insts: vec![Inst::Call {
                 func: 1,
-                args: vec![0],
+                args: vec![0].into(),
             }],
             term: Terminator::Return(vec![1]),
         }],
@@ -727,7 +727,7 @@ fn inlines_a_callee_with_a_loop_threading_a_captured_value_around_the_back_edge(
                 Inst::ConstI32(100),
                 Inst::Call {
                     func: 1,
-                    args: vec![0],
+                    args: vec![0].into(),
                 },
                 add(2, 1),
             ],
@@ -775,11 +775,11 @@ fn devirtualizes_constant_funcref_then_inlines_and_dfes() {
             params: vec![ValType::I32],
             insts: vec![
                 Inst::RefFunc { func: 1 }, // v1 = funcref(1)
-                Inst::CallIndirect {
+                Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                     ty: 0, // #922: sig interned at type-section index 0
                     idx: 1,
-                    args: vec![0],
-                }, // v2
+                    args: vec![0].into(),
+                })), // v2
             ],
             term: Terminator::Return(vec![2]),
         }],
@@ -842,11 +842,11 @@ fn does_not_devirtualize_on_signature_mismatch() {
             params: vec![ValType::I32],
             insts: vec![
                 Inst::RefFunc { func: 1 }, // funcref to the 2-arg function
-                Inst::CallIndirect {
+                Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                     ty: 0, // #922: sig interned at type-section index 0
                     idx: 1,
-                    args: vec![0],
-                },
+                    args: vec![0].into(),
+                })),
             ],
             term: Terminator::Return(vec![2]),
         }],
@@ -964,12 +964,12 @@ fn const_arg_folds_a_branch_in_the_callee() {
                 Inst::ConstI32(1),
                 Inst::Call {
                     func: 1,
-                    args: vec![1, 0],
+                    args: vec![1, 0].into(),
                 }, // sel(1, x) -> v2
                 Inst::ConstI32(1),
                 Inst::Call {
                     func: 1,
-                    args: vec![3, 0],
+                    args: vec![3, 0].into(),
                 }, // sel(1, x) -> v4
                 add(2, 4),
             ],
@@ -1012,12 +1012,12 @@ fn a_parameter_with_differing_constants_is_not_specialized() {
                 Inst::ConstI32(1),
                 Inst::Call {
                     func: 1,
-                    args: vec![1, 0],
+                    args: vec![1, 0].into(),
                 }, // sel(1, x) = x
                 Inst::ConstI32(0),
                 Inst::Call {
                     func: 1,
-                    args: vec![3, 0],
+                    args: vec![3, 0].into(),
                 }, // sel(0, x) = -x
                 add(2, 4),
             ],
@@ -1057,7 +1057,7 @@ fn an_exported_function_is_not_specialized() {
                 Inst::ConstI32(1),
                 Inst::Call {
                     func: 1,
-                    args: vec![1, 0],
+                    args: vec![1, 0].into(),
                 },
             ],
             term: Terminator::Return(vec![2]),
@@ -1112,13 +1112,13 @@ fn const_prop_bails_on_an_unresolvable_indirect_index() {
                 Inst::ConstI32(1),
                 Inst::Call {
                     func: 1,
-                    args: vec![2, 1],
+                    args: vec![2, 1].into(),
                 }, // sel(1, x) — a direct call passing a constant flag
-                Inst::CallIndirect {
+                Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                     ty: 0, // #922: sig interned at type-section index 0
                     idx: 0,
-                    args: vec![2, 1],
-                }, // (*fp)(1, x) — fp is unknown, so the pass can't see who this calls
+                    args: vec![2, 1].into(),
+                })), // (*fp)(1, x) — fp is unknown, so the pass can't see who this calls
                 add(3, 4),
             ],
             term: Terminator::Return(vec![5]),
@@ -1162,7 +1162,7 @@ fn const_funcref_argument_devirtualizes_through_the_callee() {
                 Inst::ConstI32(2), // funcref g (== funcidx 2)
                 Inst::Call {
                     func: 1,
-                    args: vec![1, 0],
+                    args: vec![1, 0].into(),
                 }, // apply(g, x)
             ],
             term: Terminator::Return(vec![2]),
@@ -1175,11 +1175,11 @@ fn const_funcref_argument_devirtualizes_through_the_callee() {
             parent: 0,
             captures: vec![],
             params: vec![ValType::I32, ValType::I32],
-            insts: vec![Inst::CallIndirect {
+            insts: vec![Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                 ty: 0, // #922: sig interned at type-section index 0
                 idx: 0,
-                args: vec![1],
-            }], // (*fp)(a)
+                args: vec![1].into(),
+            }))], // (*fp)(a)
             term: Terminator::Return(vec![2]),
         }],
     };
@@ -1235,11 +1235,11 @@ fn a_non_uniform_funcref_argument_is_not_devirtualized() {
             parent: 0,
             captures: vec![],
             params: vec![ValType::I32, ValType::I32],
-            insts: vec![Inst::CallIndirect {
+            insts: vec![Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                 ty: 0, // #922: sig interned at type-section index 0
                 idx: 0,
-                args: vec![1],
-            }],
+                args: vec![1].into(),
+            }))],
             term: Terminator::Return(vec![2]),
         }],
     };
@@ -1291,7 +1291,7 @@ fn a_non_uniform_funcref_argument_is_not_devirtualized() {
                     Inst::ConstI32(2), // funcref plus1 (funcidx 2)
                     Inst::Call {
                         func: 1,
-                        args: vec![1, 0],
+                        args: vec![1, 0].into(),
                     },
                 ],
                 term: Terminator::Return(vec![2]),
@@ -1304,7 +1304,7 @@ fn a_non_uniform_funcref_argument_is_not_devirtualized() {
                     Inst::ConstI32(3), // funcref times2 (funcidx 3)
                     Inst::Call {
                         func: 1,
-                        args: vec![1, 0],
+                        args: vec![1, 0].into(),
                     },
                 ],
                 term: Terminator::Return(vec![2]),
@@ -1388,14 +1388,14 @@ fn an_indirect_call_with_a_runtime_arg_blocks_specialization() {
                 Inst::ConstI32(1),
                 Inst::Call {
                     func: 1,
-                    args: vec![1],
+                    args: vec![1].into(),
                 }, // g(1) -> v2
                 Inst::ConstI32(1), // funcref g (funcidx 1)
-                Inst::CallIndirect {
+                Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                     ty: 0, // #922: sig interned at type-section index 0
                     idx: 3,
-                    args: vec![0],
-                }, // g(r) -> v4
+                    args: vec![0].into(),
+                })), // g(r) -> v4
                 add(2, 4),
             ],
             term: Terminator::Return(vec![5]),
@@ -1437,7 +1437,7 @@ fn a_block_parameter_is_not_read_as_a_function_parameter() {
                 Inst::ConstI32(1),
                 Inst::Call {
                     func: 1,
-                    args: vec![0],
+                    args: vec![0].into(),
                 }, // h(1)
             ],
             term: Terminator::Return(vec![1]),
@@ -1466,7 +1466,7 @@ fn a_block_parameter_is_not_read_as_a_function_parameter() {
                 params: vec![ValType::I32], // q = v0 (a phi: 5 or 7)
                 insts: vec![Inst::Call {
                     func: 2,
-                    args: vec![0],
+                    args: vec![0].into(),
                 }], // k(q)
                 term: Terminator::Return(vec![1]),
             },

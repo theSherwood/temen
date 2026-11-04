@@ -93,10 +93,10 @@ fn luav_execute_closure_has_no_host_calls() {
         for b in &m.funcs[f as usize].blocks {
             for inst in &b.insts {
                 match inst {
-                    Inst::CallImport { .. } => imports += 1,
-                    Inst::CapCall { .. } => cap_calls += 1,
-                    Inst::CallSym { .. } => call_syms += 1,
-                    Inst::CallIndirect { .. } => indirects += 1,
+                    Inst::CallImport(_) => imports += 1,
+                    Inst::CapCall(_) => cap_calls += 1,
+                    Inst::CallSym(_) => call_syms += 1,
+                    Inst::CallIndirect(_) => indirects += 1,
                     _ => {}
                 }
             }
@@ -147,7 +147,7 @@ fn cold_path_indirects_are_where_we_expect() {
     for &f in &closure {
         for b in &m.funcs[f as usize].blocks {
             for inst in &b.insts {
-                if let Inst::CallIndirect { .. } = inst {
+                if let Inst::CallIndirect(_) = inst {
                     *carriers.entry(f).or_insert(0) += 1;
                 }
             }

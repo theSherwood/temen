@@ -176,12 +176,12 @@ fn generator_covers_loops_indirect_and_cap_calls() {
                 indirect += blk
                     .insts
                     .iter()
-                    .filter(|i| matches!(i, Inst::CallIndirect { .. }))
+                    .filter(|i| matches!(i, Inst::CallIndirect(_)))
                     .count() as u32;
                 cap += blk
                     .insts
                     .iter()
-                    .filter(|i| matches!(i, Inst::CapCall { .. }))
+                    .filter(|i| matches!(i, Inst::CapCall(_)))
                     .count() as u32;
                 // type_id 5 = the AddressSpace interface (the whole-window grant): a *valid*
                 // (granted-handle) call.cap, exercising the success path, vs the forged-handle
@@ -189,7 +189,7 @@ fn generator_covers_loops_indirect_and_cap_calls() {
                 mem_cap += blk
                     .insts
                     .iter()
-                    .filter(|i| matches!(i, Inst::CapCall { type_id: 5, .. }))
+                    .filter(|i| matches!(i, Inst::CapCall(c) if c.type_id == 5))
                     .count() as u32;
                 atomics += blk
                     .insts

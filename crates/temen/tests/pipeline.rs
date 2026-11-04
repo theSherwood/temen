@@ -1130,7 +1130,7 @@ fn verifier_rejects_call_to_missing_function() {
                 params: vec![ValType::I32],
                 insts: vec![Inst::Call {
                     func: 9, // does not exist
-                    args: vec![0],
+                    args: vec![0].into(),
                 }],
                 term: Terminator::Return(vec![0]),
             }],

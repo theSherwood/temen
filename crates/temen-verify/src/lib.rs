@@ -426,10 +426,10 @@ pub fn manifest_complete(m: &Module) -> bool {
     m.funcs.iter().all(|f| {
         f.blocks.iter().all(|b| {
             !b.insts.iter().any(|i| {
-                matches!(i, Inst::CapCall { type_id, .. } if *type_id != temen_ir::CAP_SELF_TYPE_ID)
+                matches!(i, Inst::CapCall(c) if c.type_id != temen_ir::CAP_SELF_TYPE_ID)
                     // §3.5: dynamic-mode dispatch by type-section reference is dispatch on a
                     // runtime handle value — it costs the bit exactly like `call.cap`.
-                    || matches!(i, Inst::CallImportDyn { .. })
+                    || matches!(i, Inst::CallImportDyn(_))
             })
         })
     })
@@ -939,7 +939,7 @@ fn type_inst<'a>(
         // they resolve to, so a pre-link *unit* type-checks. `link` rewrites them to `ConstI64`
         // before anything runs; if one ever survives into an executed module the backends fail
         // closed (they never reach a legitimate execution path).
-        Inst::DataSym { .. } | Inst::DataSelf { .. } | Inst::DataTop => ValType::I64,
+        Inst::DataSym(_) | Inst::DataSelf { .. } | Inst::DataTop => ValType::I64,
         // The link-form function reference (#2203) likewise types as the `i32` funcref `link`
         // rewrites it to (`ref.func`).
         Inst::RefSym { .. } => ValType::I32,
@@ -947,12 +947,13 @@ fn type_inst<'a>(
         // and the call's self-describing `sig` must equal the manifest's — the canonical-interface
         // check `call.cap` cannot have (its sig is self-asserted). No handle operand (v8): the slot
         // binding identifies the capability. Appends the interned sig's result row.
-        Inst::CallImport {
-            import,
-            op,
-            sig,
-            args,
-        } => {
+        Inst::CallImport(c) => {
+            let temen_ir::CallImport {
+                import,
+                op,
+                sig,
+                args,
+            } = &**c;
             if check {
                 if imports.get(*import as usize).is_none() {
                     return Err(VerifyError::UnresolvedImport {
@@ -993,13 +994,14 @@ fn type_inst<'a>(
         // §3.5 dynamic-mode dispatch by type-section reference: `ty` names a well-formed interface,
         // `op` in range, and the self-describing `sig` equals the resolution — the same
         // canonical-interface check as static mode, at load.
-        Inst::CallImportDyn {
-            ty,
-            op,
-            sig,
-            handle,
-            args,
-        } => {
+        Inst::CallImportDyn(c) => {
+            let temen_ir::CallImportDyn {
+                ty,
+                op,
+                sig,
+                handle,
+                args,
+            } = &**c;
             if check {
                 let Some(want) = iface_op_sig(type_section, *ty, *op) else {
                     return Err(VerifyError::DynIfaceInvalid {
@@ -1032,12 +1034,13 @@ fn type_inst<'a>(
         // (op 0), plus its legacy handle operand (i32, ignored by manifest dispatch — live only to
         // the linker). Executable when the instance binds the name; the linker's rewrite target when
         // resolved first. One rule, both consumers.
-        Inst::CallSym {
-            import,
-            sig,
-            handle,
-            args,
-        } => {
+        Inst::CallSym(c) => {
+            let temen_ir::CallSym {
+                import,
+                sig,
+                handle,
+                args,
+            } = &**c;
             if check {
                 if imports.get(*import as usize).is_none() {
                     return Err(VerifyError::UnresolvedImport {
@@ -1643,7 +1646,8 @@ fn type_inst<'a>(
             return Ok(InstResults::One(ValType::I32));
         }
         // `call.dyn`: the interned `sig` (#922) must name a `Func`; `idx` is the `i32` table slot.
-        Inst::CallIndirect { ty, idx, args } => {
+        Inst::CallIndirect(c) => {
+            let temen_ir::CallIndirect { ty, idx, args } = &**c;
             if check {
                 let Some(ft) = func_sig(type_section, *ty) else {
                     return Err(VerifyError::CallSigInvalid {
@@ -1661,9 +1665,10 @@ fn type_inst<'a>(
         // `call.cap`: self-asserted signature (no manifest to resolve against), so the interned `sig`
         // need only name a `Func`; the runtime use-site check (host-owned table type_id/generation)
         // carries safety, not typing. `handle` is a forgeable `i32`.
-        Inst::CapCall {
-            sig, handle, args, ..
-        } => {
+        Inst::CapCall(c) => {
+            let temen_ir::CapCall {
+                sig, handle, args, ..
+            } = &**c;
             if check {
                 let Some(ft) = func_sig(type_section, *sig) else {
                     return Err(VerifyError::CallSigInvalid {
