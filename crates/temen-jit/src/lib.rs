@@ -6322,6 +6322,15 @@ impl HostFn {
         }
     }
 
+    /// Whether the validator may treat a call to this host function as an I5 **safepoint** (exempt
+    /// from the stack-check-domination rule, `validate::Contract::safepoint`). Only `trap_capture`:
+    /// `emit_trap` calls it on trap paths that branch off before the prologue's overflow check (the
+    /// epoch/fuel/overflow traps), so it rides the `RED_ZONE` margin like the fuel refill, and no
+    /// other host call is reached before the check.
+    fn is_safepoint(self) -> bool {
+        matches!(self, HostFn::TrapCapture)
+    }
+
     /// Its C signature, in the target's calling convention `cc`.
     fn signature(self, cc: cranelift_codegen::isa::CallConv) -> Signature {
         use HostFn::*;
@@ -6961,6 +6970,7 @@ fn callee_contracts(module: &JITModule) -> Vec<Option<validate::Contract>> {
             let mut c = validate::contract(&decl.signature);
             if let (Some(c), Some(name)) = (c.as_mut(), decl.name.as_deref()) {
                 c.args = host_args(name);
+                c.safepoint = host_safepoint(name);
             }
             out[i] = c;
         }
@@ -6982,6 +6992,16 @@ fn host_args(name: &str) -> &'static [validate::ArgTag] {
         .iter()
         .find(|h| h.symbol() == name)
         .map_or(&[], |h| h.arg_contract())
+}
+
+/// Whether the host function a symbol names is an I5 safepoint (`HostFn::is_safepoint`) — the
+/// validator exempts its calls from stack-check domination. A guest function or an unknown symbol
+/// never is.
+fn host_safepoint(name: &str) -> bool {
+    HostFn::ALL
+        .iter()
+        .find(|h| h.symbol() == name)
+        .is_some_and(|h| h.is_safepoint())
 }
 
 #[cfg(test)]
@@ -7466,6 +7486,69 @@ block 2 (v7: i32) {
             a.len(),
             b.len()
         );
+    }
+
+    /// #2534 PR 5a — a **signal-armed** compile (`compile_with_signal` with a `SignalArm`, the one-shot
+    /// async-signal entry `compile_and_run_with_host_signals` uses) is machine-code-validator-clean,
+    /// including under `-g` (so `emit_trap`'s `trap_capture` calls are emitted). This is the
+    /// regression for the signal-arm prologue's three issues: the fn-table **handler dispatch** is a
+    /// dead dispatch whose type is `NO_MATCH` (A1 — an unidentified fallback poisoned `rsp` through the
+    /// re-poll loop and cascaded to 100+ findings); the `SigTake`/dispatch/`SigReturn` **safepoint
+    /// calls** run before the overflow check (A2 — `emit_signal_check` now follows `emit_stack_check`,
+    /// so they are dominated); and `trap_capture` on the prologue trap paths (A3 — an I5 safepoint).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn validator_is_clean_on_a_signal_armed_compile() {
+        let mut fuel = FuelCell::fixed(1);
+        let interrupt = AtomicU64::new(0);
+        let armed = core::sync::atomic::AtomicBool::new(false);
+        let mut calls = program(CALLS);
+        calls.debug_info = Some(temen_ir::DebugInfo::default()); // -g, so `trap_capture` is emitted
+        validate::arm_capture();
+        CompiledModule::compile_with_signal(
+            &calls,
+            0,
+            cap_thunk,
+            core::ptr::null_mut(),
+            0,
+            None,
+            Some(&interrupt as *const AtomicU64),
+            Some(&mut *fuel as *mut FuelCell),
+            Some(resolver),
+            None,
+            0,
+            Some(SignalArm {
+                armed: &armed,
+                take: sig_take,
+                ret: sig_return,
+                ctx: core::ptr::null_mut(),
+            }),
+            None,
+        )
+        .expect("a signal-armed compile");
+        let caps = validate::take_capture();
+        assert!(
+            !caps.is_empty(),
+            "the compile defined no functions to check"
+        );
+        for (i, c) in caps.iter().enumerate() {
+            let guest = validate::Guest {
+                window: c.window,
+                table: c.table,
+                types: &c.types,
+            };
+            let frame = validate::Frame {
+                stack_args: c.contract.and_then(|k| k.pops),
+                sret_results: c.sret_results,
+            };
+            let findings =
+                validate::x86::check(&c.code, &c.relocs, validate::Entry::Guest(&guest), frame);
+            assert!(
+                findings.is_empty(),
+                "signal-armed fn#{i} ({} bytes) flagged: {findings:#?}",
+                c.code.len()
+            );
+        }
     }
 }
 
@@ -8911,9 +8994,15 @@ fn build_clif(
     }) {
         emit_domain_poll(&mut b, &lower);
     }
-    emit_signal_check(&mut b, &lower)?; // #932 async signal delivery (no-op when disarmed)
     emit_fuel_check(&mut b, &lower);
     emit_stack_check(&mut b, &lower);
+    // #932 async signal delivery (no-op when disarmed). After the stack check so its safepoint
+    // calls (`SigTake`, the guest-handler dispatch, `SigReturn`) are dominated by the overflow guard
+    // (I5): the guard fires before any host call or guest-handler dispatch runs on this frame, and
+    // the validator needs no I5 exemption for them. Fuel stays before the stack check (the bytecode
+    // VM burns fuel before opening the frame, so the engines agree on fuel-vs-overflow at an entry);
+    // moving the signal poll last also matches the VM, which polls signals after both (#932).
+    emit_signal_check(&mut b, &lower)?;
     b.ins().jump(blocks.clif[0], &entry_args);
 
     let mut checked = CheckedBases::new(&lower, f);
