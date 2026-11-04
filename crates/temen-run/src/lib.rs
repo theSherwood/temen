@@ -1908,7 +1908,7 @@ fn interp_fiber(f: temen_jit::FrozenFiber) -> temen_interp::FrozenFiber {
     temen_interp::FrozenFiber {
         slot: f.slot,
         func: f.func,
-        sp: f.sp,
+        arg0: f.arg0,
         shadow_sp: f.shadow_sp,
         generation: f.generation,
         consumed: f.consumed,
@@ -1920,7 +1920,7 @@ fn jit_fiber(f: &temen_interp::FrozenFiber) -> temen_jit::FrozenFiber {
     temen_jit::FrozenFiber {
         slot: f.slot,
         func: f.func,
-        sp: f.sp,
+        arg0: f.arg0,
         shadow_sp: f.shadow_sp,
         generation: f.generation,
         consumed: f.consumed,

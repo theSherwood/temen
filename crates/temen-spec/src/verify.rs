@@ -619,9 +619,9 @@ fn check_inst(
         // by the generic `CapCall` arm above.
 
         // ----- fibers / threads / TLS (§12) -----
-        Inst::ContNew { func, sp } => {
+        Inst::ContNew { func, arg0 } => {
             w(*func, V::I32)?;
-            w(*sp, V::I64)?;
+            w(*arg0, V::I64)?;
             vec![V::I64]
         }
         Inst::ContResume { k, arg, block: _ } => {
@@ -633,16 +633,16 @@ fn check_inst(
             w(*value, V::I64)?;
             vec![V::I64]
         }
-        Inst::ThreadSpawn { func, sp, arg } => {
+        Inst::ThreadSpawn { func, arg0, arg1 } => {
             let callee = funcs
                 .get(*func as usize)
                 .ok_or_else(|| format!("thread.spawn of out-of-range fn{func}"))?;
-            // §12: the thread entry signature is fixed — (i64 sp, i64 arg) -> i64.
+            // §12: the thread entry signature is fixed — (i64, i64) -> i64.
             if callee.params != [V::I64, V::I64] || callee.results != [V::I64] {
                 return Err(format!("thread.spawn entry fn{func} has wrong signature"));
             }
-            w(*sp, V::I64)?;
-            w(*arg, V::I64)?;
+            w(*arg0, V::I64)?;
+            w(*arg1, V::I64)?;
             vec![V::I32]
         }
         Inst::ThreadJoin { handle } => {

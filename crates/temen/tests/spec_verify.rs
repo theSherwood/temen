@@ -350,8 +350,8 @@ fn directed_rule_rejects() {
         vec![V::I32],
         vec![Inst::ThreadSpawn {
             func: 1,
-            sp: 0,
-            arg: 0,
+            arg0: 0,
+            arg1: 0,
         }],
         T::Return(vec![1]),
     );

@@ -1250,10 +1250,10 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_uleb(out, c.handle as u64);
             write_idxs(out, &c.args);
         }
-        Inst::ContNew { func, sp } => {
+        Inst::ContNew { func, arg0 } => {
             out.push(op::CONT_NEW);
             write_uleb(out, *func as u64);
-            write_uleb(out, *sp as u64);
+            write_uleb(out, *arg0 as u64);
         }
         Inst::ContResume { k, arg, block } => {
             out.push(op::CONT_RESUME);
@@ -1288,11 +1288,11 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_uleb(out, *buf as u64);
             write_uleb(out, *cap as u64);
         }
-        Inst::ThreadSpawn { func, sp, arg } => {
+        Inst::ThreadSpawn { func, arg0, arg1 } => {
             out.push(op::THREAD_SPAWN);
             write_uleb(out, *func as u64);
-            write_uleb(out, *sp as u64);
-            write_uleb(out, *arg as u64);
+            write_uleb(out, *arg0 as u64);
+            write_uleb(out, *arg1 as u64);
         }
         Inst::ThreadJoin { handle } => {
             out.push(op::THREAD_JOIN);
@@ -2798,7 +2798,7 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
 
         op::CONT_NEW => Inst::ContNew {
             func: c.idx()?,
-            sp: c.idx()?,
+            arg0: c.idx()?,
         },
         op::CONT_RESUME => Inst::ContResume {
             k: c.idx()?,
@@ -2821,8 +2821,8 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
 
         op::THREAD_SPAWN => Inst::ThreadSpawn {
             func: c.idx()?,
-            sp: c.idx()?,
-            arg: c.idx()?,
+            arg0: c.idx()?,
+            arg1: c.idx()?,
         },
         op::THREAD_JOIN => Inst::ThreadJoin { handle: c.idx()? },
         op::ATOMIC_WAIT => Inst::MemoryWait {

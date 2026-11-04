@@ -640,7 +640,7 @@ fn inst_operands(i: &Inst) -> Option<Vec<ValIdx>> {
             v.extend_from_slice(&c.args);
             v
         }
-        ContNew { func, sp } => vec![*func, *sp],
+        ContNew { func, arg0 } => vec![*func, *arg0],
         ContResume { k, arg, .. } => vec![*k, *arg],
         Suspend { value } => vec![*value],
         _ => return None,

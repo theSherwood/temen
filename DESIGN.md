@@ -1033,16 +1033,18 @@ location outside the window (and trap). Hence the SafeStack split:
 | **Control stack** | out-of-band (Cranelift-managed machine stack) | return addrs, callee-saved regs, SSA spills | **No** |
 | **Data stack** | in the window, per-thread, guard-paged (§5) | address-taken locals, by-value aggregate copies, `alloca`, varargs buffers, `sret` slots | Yes (confined) |
 
-The frontend manages the data stack via a **data-SP** (per-fiber state — see below)
-held in `vmctx` (the context the JIT already needs for window base/mask,
-handle-table base, function-table base, fuel; register-pinning the data-SP is a
-lowering detail). Overflow hits the guard page → fault → §5 detect-and-kill; frames
-larger than a guard page emit a stack-probe (stack-clash mitigation).
+The frontend manages the data stack through a **data-SP**, an ordinary value it threads
+through its own code: temen-llvm passes it as each function's first parameter (§20). The VM
+never reads it. A new fiber or vCPU gets its data stack from its creator: `cont.new` and
+`thread.spawn` carry two `i64` words of the creator's to the fixed entry `(i64, i64) -> i64`,
+and a frontend with a data stack passes the new stack's base as the first. Overflow hits the
+guard page → fault → §5 detect-and-kill; frames larger than a guard page emit a stack-probe
+(stack-clash mitigation).
 
 **This split *is* the fiber model.** A stackful fiber (§12) owns the **pair** of
-stacks — control + data — and switching swaps both SPs; the data-SP and
-callee-saved are per-fiber, while window base/mask and the table bases are
-per-domain (shared, constant). The control stack lives in VA unreachable by guest
+stacks — control + data. The runtime owns the control stack and switches it. The
+data-SP is an ordinary value in the fiber's frames, so it switches with them; window
+base/mask and the table bases are per-domain (shared, constant). The control stack lives in VA unreachable by guest
 masking (CFI) but is **charged to the guest's quota** (§15) so a fiber-bomb OOMs
 itself, not the host (§12). Nothing in this ABI dangles across a suspend: all
 §3d data (aggregates, `alloca`, varargs, `sret`) lives on the data stack, which
@@ -1939,10 +1941,11 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
 - **Fiber** — a first-class suspendable stack (an application of §6 stack
   switching). Because of the two-stack split (§3d), a fiber owns a **stack pair**:
   an in-window guard-paged **data stack** + an **out-of-band control stack**
-  (return addresses/spills, unreachable by guest masking — §5). Create = allocate
-  the pair; switch = save/restore callee-saved + swap *both* SPs (native SP → the
-  control stack and its spills follow automatically; plus the per-fiber data-SP)
-  (~ns, no syscall, no flush). **Free and uncapped, but quota-metered:** the data
+  (return addresses/spills, unreachable by guest masking — §5). Create = the runtime
+  allocates the control stack, and the creator supplies the data stack (§3d: the
+  frontend passes its base as the entry's first argument); switch = save/restore
+  callee-saved + swap the native SP (the control stack and its spills follow
+  automatically, the data-SP among them) (~ns, no syscall, no flush). **Free and uncapped, but quota-metered:** the data
   stack is guest memory; the control stack is out-of-band yet its pages are
   **charged against the guest's memory quota** (§15). So a fiber-bomb OOMs *itself*
   (sandbox-safe) — it cannot exhaust *host* memory via out-of-band stacks. (#2112:
@@ -2518,7 +2521,7 @@ metering is read-before minus read-after. Deferred, named-consumer-gated: a per-
 (caller-side D19 attenuation) and an admission fuel floor (gate-side refusal when the caller
 can't fund a handler).
 
-### Held domains — a domain at rest takes calls as a library provider does  [BUILT on the tree-walker, #2695 step 2]
+### Held domains — a domain at rest takes calls as a library provider does  [BUILT on the tree-walker and the bytecode engine's executors, #2695 step 2]
 
 A domain its embedder holds (`HeldDomain`) outlives its entry: once the entry returns, it
 **rests**. Its threads keep running, and it ends only when it ends itself (any member's exit or
@@ -2535,7 +2538,7 @@ no running main, so each call into it, from its embedder or from a domain of its
 - **Admitted by the callee's policy**: `Single`, run-to-park, serializes the domain's activations
   against each other, never against its own threads. The tree-walker builds that as a lane of
   width 1 over the activations (D66's mechanism: held across a quantum's end, given back at a
-  park).
+  park); the bytecode engine, as a gate checked before an activation steps, with the same rules.
 - **With the thread-local word the domain's main thread left** (`vcpu.tls`). Under `Single` the
   calls run one at a time, as that thread would run them. The caller's word would name the
   caller's memory.
@@ -2546,6 +2549,20 @@ funded by its caller. A thread of the domain parked in `svc.wait` takes calls fi
 there is the guest's choice. A handler's trap ends the domain (INVARIANTS #6). Every call it had
 not answered, and every later one, answers `CAP_REVOKED`, the embedder's included (rule (i)).
 While the domain is held, its run has no stall verdict, since the embedder can always call in.
+
+The executor is the embedder's choice (`Executor`):
+
+- **The tree-walker.** The domain's threads run on its own workers, between calls too.
+- **The bytecode engine's pump** has no thread of its own, so a domain it holds runs only on a
+  thread its embedder lends it. A call runs the domain until the call is answered; a pump runs it
+  until nothing in it can run. One lent thread runs it at a time.
+- **Executor 2** runs each of the domain's threads on an OS thread of its own (D56), between calls
+  too. A call runs on its caller's thread, which carries the activation until it answers: the
+  embedder's thread for the embedder's call, the calling task's thread for a call from inside the
+  run. The activation has no thread of its own.
+
+On both bytecode executors an activation is a task of the domain on its caller's fuel, which
+charges no vCPU. A module the bytecode engine declines is held by the tree-walker (INVARIANTS #9).
 
 ### Invariants this holds
 

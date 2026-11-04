@@ -125,8 +125,8 @@ pub enum VerifyError {
         expected: usize,
         found: usize,
     },
-    /// A `thread.spawn` named a function whose signature is not the fixed thread entry type
-    /// `(i64 sp, i64 arg) -> i64` (§12).
+    /// A `thread.spawn` named a function whose signature is not the fixed entry type
+    /// `(i64, i64) -> i64` (§12).
     ThreadEntrySignature { func: u32, block: u32, callee: u32 },
     /// A `<shape>.extract_lane`/`replace_lane` named a lane index `>= shape.lanes()`, or an
     /// `i8x16.shuffle` byte index `>= 32` (§17). Lane indices are immediates, so this is a
@@ -1284,9 +1284,9 @@ fn type_inst<'a>(
         // §12 fibers. `cont.new` takes an i32 funcref, yields an i64 handle (16-bit slot +
         // 48-bit generation); `suspend` takes an i64, yields the i64 of the next resume.
         // (`cont.resume` is multi-result and handled in the main loop.)
-        Inst::ContNew { func, sp } => {
+        Inst::ContNew { func, arg0 } => {
             cx.expect(*func, ValType::I32)?;
-            cx.expect(*sp, ValType::I64)?; // the fiber's data-stack base
+            cx.expect(*arg0, ValType::I64)?; // the entry's first argument, the creator's
             ValType::I64
         }
         Inst::Suspend { value } => {
@@ -1697,9 +1697,9 @@ fn type_inst<'a>(
             cx.expect(*handle, ValType::I32)?;
             return Ok(InstResults::Two(ValType::I64, ValType::I64));
         }
-        // §12 `thread.spawn` resolves a static funcidx whose signature must be the fixed thread-entry
-        // type `(i64 sp, i64 arg) -> i64`; appends the spawned vCPU handle (`i32`).
-        Inst::ThreadSpawn { func, sp, arg } => {
+        // §12 `thread.spawn` resolves a static funcidx whose signature must be the fixed entry type
+        // `(i64, i64) -> i64`; appends the spawned vCPU handle (`i32`).
+        Inst::ThreadSpawn { func, arg0, arg1 } => {
             if check {
                 let callee = funcs
                     .get(*func as usize)
@@ -1716,8 +1716,8 @@ fn type_inst<'a>(
                         callee: *func,
                     });
                 }
-                cx.expect(*sp, ValType::I64)?;
-                cx.expect(*arg, ValType::I64)?;
+                cx.expect(*arg0, ValType::I64)?;
+                cx.expect(*arg1, ValType::I64)?;
             }
             return Ok(InstResults::One(ValType::I32));
         }

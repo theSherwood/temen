@@ -448,7 +448,7 @@ pub fn struct_rows() -> Vec<StructRow> {
         "cont.new",
         Enc::Byte(0xCA),
         vec![i32t, i64t],
-        Inst::ContNew { func: 0, sp: 1 },
+        Inst::ContNew { func: 0, arg0: 1 },
         false,
     ));
     rows.push(inst_row(
@@ -490,8 +490,8 @@ pub fn struct_rows() -> Vec<StructRow> {
             vec![i64t, i64t],
             Inst::ThreadSpawn {
                 func: 1,
-                sp: 0,
-                arg: 1,
+                arg0: 0,
+                arg1: 1,
             },
             false,
             vec![thread_entry],

@@ -273,7 +273,7 @@ pub(crate) unsafe fn window_is_unwinding(mem_base: u64, arena: ShadowArena) -> b
 }
 
 /// The generated CLIF call-trampoline: `extern "C"` on the outside (callable from Rust), it
-/// `call.dyn`s a guest fiber entry (`Tail` ABI `(mem_base, fn_table_base, vm, sp, arg) ->
+/// `call.dyn`s a guest fiber entry (`Tail` ABI `(mem_base, fn_table_base, vm, arg0, arg) ->
 /// i64`). One trampoline serves every fiber since all fiber entries share that signature (§12).
 /// The entry ABI carries a `stack_limit` param right after `vm` (§2b path B — the always-on
 /// software stack guard), so this fn-pointer type does too — kept in exact lockstep with `sig_from` /
@@ -284,7 +284,7 @@ pub(crate) type FiberCallTramp = extern "C" fn(
     fn_table_base: u64,
     vm: u64,
     stack_limit: u64,
-    sp: u64,
+    arg0: u64,
     arg: u64,
 ) -> u64;
 
@@ -321,11 +321,11 @@ pub(crate) struct FiberSlot {
     /// resume. Touched only by the claimant (serialized by the `own` claim/publish), so `Relaxed`
     /// suffices; unused on a non-durable run.
     shadow_sp: AtomicU64,
-    /// **Durable**: the fiber's entry funcref and data-stack base (the `cont.new` operands),
+    /// **Durable**: the fiber's entry funcref and first argument (the `cont.new` operands),
     /// retained so the freeze driver can export them in this fiber's [`crate::FrozenFiber`] residue
     /// (a thaw re-creates the fiber from them). Immutable after creation.
     func: i32,
-    sp: i64,
+    arg0: i64,
     /// #1538 — the fiber's last `suspend` value was **consumed** (see `FrozenFiber::consumed`): set at
     /// each park (`!UNWINDING`) and at each guest claim of a suspended fiber (`UNWINDING`: the delivery
     /// is dropped by the freeze unwind); recorded into the freeze residue; restored by `seed_frozen`.
@@ -559,7 +559,7 @@ impl SharedFiberTable {
     /// `claim_gen` — and only when none is free does the table grow. `None` if a racing allocation
     /// filled the domain quota since [`Self::has_room`]. `charge` is the fiber's
     /// ([`Self::fiber_charge`]), held while the slot is its; a refusal drops it, handing it back.
-    fn create(&self, fiber: Box<Fiber>, func: i32, sp: i64, charge: FiberCharge) -> Option<i64> {
+    fn create(&self, fiber: Box<Fiber>, func: i32, arg0: i64, charge: FiberCharge) -> Option<i64> {
         let mut t = self.lock();
         let reuse = t.free.peek().map(|&Reverse(s)| s);
         if reuse.is_none() && t.slots.len() + 1 >= self.max_fibers {
@@ -579,7 +579,7 @@ impl SharedFiberTable {
             // Fresh/reused: the shadow region starts empty (SP at the region base).
             shadow_sp: AtomicU64::new(self.shadow.frame_base(slot + 1)), // §12.8 4A.5: empty = frame base (past the SP + thaw words)
             func,
-            sp,
+            arg0,
             event_park: AtomicBool::new(false),
             park_deadline: Mutex::new(None),
             park_on: Mutex::new(ParkOn::Event),
@@ -637,7 +637,7 @@ impl FiberSlot {
             fiber: Mutex::new(Some(Box::new(fiber))),
             shadow_sp: AtomicU64::new(0),
             func: -1,
-            sp: 0,
+            arg0: 0,
             event_park: AtomicBool::new(false),
             park_deadline: Mutex::new(None),
             park_on: Mutex::new(ParkOn::Event),
@@ -725,7 +725,7 @@ impl SharedFiberTable {
         &self,
         fiber: Box<Fiber>,
         func: i32,
-        sp: i64,
+        arg0: i64,
         shadow_sp: u64,
         generation: u64,
         consumed: bool,
@@ -740,7 +740,7 @@ impl SharedFiberTable {
             fiber: Mutex::new(Some(fiber)),
             shadow_sp: AtomicU64::new(shadow_sp),
             func,
-            sp,
+            arg0,
             event_park: AtomicBool::new(false),
             park_deadline: Mutex::new(None),
             park_on: Mutex::new(ParkOn::Event),
@@ -765,7 +765,7 @@ impl SharedFiberTable {
             fiber: Mutex::new(None),
             shadow_sp: AtomicU64::new(self.shadow.frame_base(slot + 1)),
             func: 0,
-            sp: 0,
+            arg0: 0,
             event_park: AtomicBool::new(false),
             park_deadline: Mutex::new(None),
             consumed: AtomicBool::new(false),
@@ -794,7 +794,7 @@ impl SharedFiberTable {
                     Some(crate::FrozenFiber {
                         slot,
                         func: s.func,
-                        sp: s.sp,
+                        arg0: s.arg0,
                         shadow_sp: self.shadow.frame_base(slot + 1),
                         generation,
                         consumed: false,
@@ -887,7 +887,7 @@ pub(crate) struct FiberRuntime {
     active_slots: Vec<Arc<FiberSlot>>,
     /// The generated call-trampoline address (filled in after the module is finalized).
     call_tramp: Option<FiberCallTramp>,
-    /// The structural type id every fiber entry must have (`(i64 sp, i64 arg) -> i64`), checked at
+    /// The structural type id every fiber entry must have (`(i64, i64) -> i64`), checked at
     /// first resume against the funcref's table slot — a forged/wrong-type funcref traps there.
     fiber_type_id: u32,
     /// `next_pow2(nfuncs) - 1`, to mask a funcref into the function table.
@@ -1007,7 +1007,7 @@ unsafe fn fault(vm: u64) {
 // loses the claim — and slots are separate heap allocations from the table vec, so a re-entrant
 // `cont.new` growing the table never moves a fiber being resumed.
 
-/// Build a suspended native fiber that, on first resume, runs guest `funcref(sp, arg)` through the
+/// Build a suspended native fiber that, on first resume, runs guest `funcref(arg0, arg)` through the
 /// call-trampoline — resolving + type-checking the funcref against the function table on that first
 /// resume, like the interpreter. Shared by `cont.new` ([`fiber_new`]) and durable thaw re-seeding
 /// ([`SharedFiberTable::seed_frozen`]), so a thawed fiber re-enters its entry identically.
@@ -1021,7 +1021,7 @@ unsafe fn fault(vm: u64) {
 #[allow(clippy::too_many_arguments)]
 unsafe fn make_fiber(
     funcref: i32,
-    sp: u64,
+    arg0: u64,
     mem_base: u64,
     fn_table_base: u64,
     vm: u64,
@@ -1064,7 +1064,7 @@ unsafe fn make_fiber(
                     fn_table_base,
                     vm,
                     y.stack_low(),
-                    sp,
+                    arg0,
                     arg,
                 )
             };
@@ -1097,7 +1097,7 @@ pub(crate) unsafe fn make_task_fiber(
     })
 }
 
-/// `cont.new` thunk: allocate a suspended fiber that, on first resume, calls guest `funcref(sp, arg)`.
+/// `cont.new` thunk: allocate a suspended fiber that, on first resume, calls guest `funcref(arg0, arg)`.
 /// Returns the fiber handle (the domain-shared table's slot index — the same numbering as the interp
 /// registry), or traps (`-1`) on a fiber-bomb (the **per-domain** bound, or its `Budget.mem`).
 ///
@@ -1111,7 +1111,7 @@ pub(crate) unsafe extern "C" fn fiber_new(
     fn_table_base: u64,
     vm: u64,
     funcref: i32,
-    sp: u64,
+    arg0: u64,
     fuel_addr: u64,
 ) -> i64 {
     let rt = current();
@@ -1145,7 +1145,7 @@ pub(crate) unsafe extern "C" fn fiber_new(
 
     let fiber = match make_fiber(
         funcref,
-        sp,
+        arg0,
         mem_base,
         fn_table_base,
         vm,
@@ -1163,7 +1163,10 @@ pub(crate) unsafe extern "C" fn fiber_new(
     };
 
     let rt = &*rt;
-    match rt.table.create(Box::new(fiber), funcref, sp as i64, charge) {
+    match rt
+        .table
+        .create(Box::new(fiber), funcref, arg0 as i64, charge)
+    {
         Some(handle) => handle,
         None => {
             fault(vm); // a sibling vCPU filled the domain quota since the pre-check
@@ -1438,7 +1441,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
                 (*current()).frozen.push(crate::FrozenFiber {
                     slot: slot_idx,
                     func: slot.func,
-                    sp: slot.sp,
+                    arg0: slot.arg0,
                     shadow_sp: flat_sp,
                     // Recorded before the `finish` below bumps it — the freeze-time generation, so a
                     // thaw re-seeds this (possibly recycled) fiber at the generation its handle carries.
@@ -1723,7 +1726,7 @@ pub(crate) unsafe fn seed_frozen_fibers(
         // `0`: no counted-fuel entry runs durable, so a thawed fiber has no budget to refund into.
         let Some(fiber) = make_fiber(
             f.func,
-            f.sp as u64,
+            f.arg0 as u64,
             mem_base,
             fn_table_base,
             vm,
@@ -1739,7 +1742,7 @@ pub(crate) unsafe fn seed_frozen_fibers(
         let got = r.table.seed_frozen(
             Box::new(fiber),
             f.func,
-            f.sp,
+            f.arg0,
             f.shadow_sp,
             f.generation,
             f.consumed,

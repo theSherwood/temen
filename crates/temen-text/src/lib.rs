@@ -719,7 +719,7 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         Inst::DurableShadowBase => "durable.shadow_base".to_string(),
         Inst::VcpuTlsSet { val } => format!("vcpu.tls.set v{val}"),
         // §12 fibers (stack switching).
-        Inst::ContNew { func, sp } => format!("cont.new v{func} v{sp}"),
+        Inst::ContNew { func, arg0 } => format!("cont.new v{func} v{arg0}"),
         Inst::ContResume { k, arg, block } => {
             if *block {
                 format!("cont.resume.block v{k} v{arg}")
@@ -739,7 +739,7 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
             cap,
         } => format!("gc.roots v{heap_lo} v{heap_hi} v{mask} v{buf} v{cap}"),
         // §12 real threads (OS-thread vCPUs over shared memory).
-        Inst::ThreadSpawn { func, sp, arg } => format!("thread.spawn {func} v{sp} v{arg}"),
+        Inst::ThreadSpawn { func, arg0, arg1 } => format!("thread.spawn {func} v{arg0} v{arg1}"),
         Inst::ThreadJoin { handle } => format!("thread.join v{handle}"),
         // §12 futex wait/notify.
         Inst::MemoryWait {
@@ -3114,8 +3114,8 @@ impl<'a> Parser<'a> {
         // §12 fibers (stack switching).
         if op == "cont.new" {
             let func = self.value(names)?;
-            let sp = self.value(names)?;
-            return Ok(Inst::ContNew { func, sp });
+            let arg0 = self.value(names)?;
+            return Ok(Inst::ContNew { func, arg0 });
         }
         if op == "cont.resume" {
             let k = self.value(names)?;
@@ -3169,9 +3169,9 @@ impl<'a> Parser<'a> {
             let n = self.parse_int()?;
             let func = u32::try_from(n)
                 .map_err(|_| ParseError(format!("function index out of range: {n}")))?;
-            let sp = self.value(names)?;
-            let arg = self.value(names)?;
-            return Ok(Inst::ThreadSpawn { func, sp, arg });
+            let arg0 = self.value(names)?;
+            let arg1 = self.value(names)?;
+            return Ok(Inst::ThreadSpawn { func, arg0, arg1 });
         }
         if op == "thread.join" {
             return Ok(Inst::ThreadJoin {

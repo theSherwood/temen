@@ -68,7 +68,7 @@ fn jit_seed(interp: &[InterpFrozen]) -> Vec<JitFrozen> {
         .map(|f| JitFrozen {
             slot: f.slot,
             func: f.func,
-            sp: f.sp,
+            arg0: f.arg0,
             shadow_sp: f.shadow_sp,
             generation: f.generation,
             consumed: f.consumed,
@@ -307,7 +307,7 @@ fn jit_and_interp_freeze_a_fiber_to_an_identical_artifact() {
             .map(|f| InterpFrozen {
                 slot: f.slot,
                 func: f.func,
-                sp: f.sp,
+                arg0: f.arg0,
                 shadow_sp: f.shadow_sp,
                 generation: f.generation,
                 consumed: f.consumed,

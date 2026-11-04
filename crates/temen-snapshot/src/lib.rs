@@ -862,7 +862,7 @@ fn freeze_at(
             for f in &fibers {
                 write_uleb(b, f.slot as u64);
                 write_uleb(b, f.func as u32 as u64);
-                write_uleb(b, f.sp as u64);
+                write_uleb(b, f.arg0 as u64);
                 write_uleb(b, f.shadow_sp);
                 write_uleb(b, f.generation); // 48-bit fiber generation (recycling step 2)
                 write_uleb(b, u64::from(f.consumed)); // v24 (#1538): the park was consumed
@@ -2300,7 +2300,7 @@ fn decode_control(
         }
         last = Some(slot);
         let func = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)? as i32;
-        let sp = cr.uleb()? as i64;
+        let arg0 = cr.uleb()? as i64;
         let shadow_sp = cr.uleb()?;
         let generation = cr.uleb()?; // 48-bit fiber generation (u64); a pre-widening artifact's
                                      // small value decodes identically (wire-compatible).
@@ -2312,7 +2312,7 @@ fn decode_control(
         fibers.push(FrozenFiber {
             slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
             func,
-            sp,
+            arg0,
             shadow_sp,
             generation,
             consumed,

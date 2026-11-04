@@ -142,8 +142,8 @@ fn gen_func(g: &mut Rng, nfuncs: usize, acyclic_from: Option<usize>) -> Func {
                         continue;
                     }
                 };
-                let sp = any_i64!();
-                insts.push(Inst::ContNew { func, sp });
+                let arg0 = any_i64!();
+                insts.push(Inst::ContNew { func, arg0 });
                 // The handle is an i64 (16-bit slot + 48-bit generation); it lands directly in the
                 // i64 pool so its *value* can flow into returns/args — the differential then observes
                 // handle numbering itself (the D57 3b-i unified namespace: handles match across

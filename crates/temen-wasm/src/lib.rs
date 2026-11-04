@@ -108,7 +108,7 @@ const WASM_PAGE: u64 = 1 << 16;
 const WASI_THREAD_MODULE: &str = "wasi";
 const WASI_THREAD_SPAWN_NAME: &str = "thread-spawn";
 /// The export the host calls on a freshly spawned thread: `(func (param $tid i32) (param $start_arg
-/// i32))`. The synthesized spawn shim adapts Temen's `(i64 sp, i64 arg)` thread-entry ABI to it.
+/// i32))`. The synthesized spawn shim adapts Temen's `(i64, i64) -> i64` thread-entry ABI to it.
 const WASI_THREAD_START_EXPORT: &str = "wasi_thread_start";
 /// `memory.grow` on an **unbounded** wasm memory may extend up to this many pages. The window must
 /// hold the whole growable span (it is eagerly committed, so a grown page is reachable; an access
@@ -1250,7 +1250,7 @@ struct TableGrow {
 struct ThreadCfg {
     /// The wasm function index of the `wasi:thread/spawn` import — its `call` lowers to `thread.spawn`.
     spawn_import: Option<u32>,
-    /// IR index of the synthesized spawn shim (`thread.spawn`'s target — a `(i64 sp, i64 arg) -> i64`
+    /// IR index of the synthesized spawn shim (`thread.spawn`'s target — a `(i64, i64) -> i64`
     /// adapter that unpacks `(tid, start_arg)` and calls `wasi_thread_start`).
     spawn_shim: u32,
     /// Window byte offset of the unique-TID counter: an i32 atomically `add`-incremented per spawn so
@@ -1512,14 +1512,14 @@ impl Lower<'_> {
     }
 }
 
-/// Synthesize the §12 spawn shim: a `(i64 sp, i64 arg) -> (i64)` IR function (the `thread.spawn`
-/// entry ABI) that unpacks `(tid, start_arg)` from its packed `arg` and calls the module's
-/// `wasi_thread_start` export (IR index `wts`), then returns 0. The data-SP `sp` is unused (temen-wasm
-/// keeps the C stack in linear memory). Capability imports need no plumbing here: a spawned
+/// Synthesize the §12 spawn shim: a `(i64, i64) -> (i64)` IR function (the `thread.spawn`
+/// entry ABI) that unpacks `(tid, start_arg)` from its packed second argument and calls the module's
+/// `wasi_thread_start` export (IR index `wts`), then returns 0. The first argument is unused
+/// (temen-wasm keeps the C stack in linear memory). Capability imports need no plumbing here: a spawned
 /// thread's `call.import`s dispatch through the instance's slot bindings like any other (IMPORTS.md
 /// phase 3 — the old per-spawn window handle stash is gone).
 fn build_spawn_shim(wts: u32) -> Func {
-    // values: v0=sp v1=arg | v2..  (a 0-result `call` appends no value)
+    // values: v0=unused v1=arg | v2..  (a 0-result `call` appends no value)
     let mut insts: Vec<Inst> = Vec::new();
     let mut next: u32 = 2;
     // tid = arg >> 32 (i32); start_arg = arg's low 32 (i32).
@@ -2343,15 +2343,15 @@ fn spawn_op(lo: &mut Lower) -> Result<(), Error> {
     // Capability imports need no per-spawn plumbing (IMPORTS.md phase 3): the spawned thread's
     // `call.import`s dispatch through the instance's slot bindings, which are host state shared
     // across vCPUs — the old handle stash is gone.
-    // The shim ignores its data-SP (temen-wasm keeps the C stack in linear memory via `__stack_pointer`),
-    // so any constant works.
-    let sp0 = lo.emit(Inst::ConstI64(0));
+    // The shim ignores its first argument (temen-wasm keeps the C stack in linear memory via
+    // `__stack_pointer`, so it passes no data-stack base), so any constant works.
+    let zero = lo.emit(Inst::ConstI64(0));
     // `thread.spawn` yields an i32 join handle; wasi-libc manages join itself (futex on the thread
     // state), so we discard it and return the tid as the wasi:thread/spawn result.
     let _join = lo.emit(Inst::ThreadSpawn {
         func: shim,
-        sp: sp0,
-        arg: packed,
+        arg0: zero,
+        arg1: packed,
     });
     lo.push(tid, ValType::I32);
     Ok(())
