@@ -6,6 +6,9 @@
 //! differs only in the target op. Together with the value/memory/SIMD suites this homes
 //! every one of the 86 `Inst` variants and all 7 `Terminator`s in a spec row.
 
+#[path = "support/opcode_pin.rs"]
+mod opcode_pin;
+
 use temen::encode::{decode_module, decode_unit, encode_module, encode_unit};
 use temen::verify::verify_module;
 use temen_ir::{Inst, Module, Terminator};
@@ -63,8 +66,8 @@ fn structural_rows_verify_roundtrip_and_pin_encoding() {
         );
 
         // (3) Opcode pin: a baseline that differs only in the single target op (the
-        // sole instruction, or the block-0 terminator) diverges from `bytes` exactly
-        // at the op's opcode byte — the wire format has counts, not length prefixes.
+        // sole instruction, or the block-0 terminator) diverges from function 0's body
+        // in `bytes` exactly at the op's opcode byte ([`opcode_pin`]).
         let mut base = row.module.clone();
         if row.is_term {
             base.funcs[0].blocks[0].term = if row.encoding == Enc::Byte(0x83) {
@@ -76,10 +79,7 @@ fn structural_rows_verify_roundtrip_and_pin_encoding() {
             base.funcs[0].blocks[0].insts[0] = Inst::ConstI32(0); // 0x10, distinct from all
         }
         let base_bytes = enc(&base);
-        let i = bytes
-            .iter()
-            .zip(&base_bytes)
-            .position(|(a, b)| a != b)
+        let i = opcode_pin::first_divergence(&row.module, &bytes, &base_bytes, enc)
             .unwrap_or_else(|| panic!("[{}] no divergence vs baseline", row.id));
         match row.encoding {
             Enc::Byte(b) => assert_eq!(
