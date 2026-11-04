@@ -1745,9 +1745,12 @@ fn per_iter_ns((n_big, n_small): (i64, i64), mut run: impl FnMut(i64)) -> f64 {
     (big - small) * 1e9 / (n_big - n_small) as f64
 }
 
-/// #2634 — `least` lengthened so its big end runs for about [`SAMPLE_SECS`] in a lane that spends
-/// `per_iter_ns` on an iteration.
-fn sized_span(per_iter_ns: f64, least: (i64, i64)) -> (i64, i64) {
+/// #2634 — `least` lengthened so its big end runs for about [`SAMPLE_SECS`] in the lane `run` times.
+/// The probe times the big end alone, whose per-call cost is a rounding error at its count. A sample
+/// subtracts the small end too, but that end runs for microseconds: a stall of a millisecond or two in
+/// it could zero the difference and stretch the span to its cap, a billion iterations.
+fn sized_span(least: (i64, i64), mut run: impl FnMut(i64)) -> (i64, i64) {
+    let per_iter_ns = per_call(PER_SAMPLE, || run(least.0)) * 1e9 / least.0 as f64;
     let n = (SAMPLE_SECS * 1e9 / per_iter_ns.max(0.01)).min(1e9) as i64;
     (n.max(least.0), least.1)
 }
@@ -2005,17 +2008,14 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
     // compile), and the interp lane's own.
     let span = {
         let (mut s32, run32) = inst(&wasm32[0]);
-        let per = per_iter_ns(least, |n| {
+        sized_span(least, |n| {
             black_box(run32.call(&mut s32, n).unwrap());
-        });
-        sized_span(per, least)
+        })
     };
     let interp_span = interp.map(|_| {
-        let least = (N_INTERP_BIG, N_INTERP_SMALL);
-        let per = per_iter_ns(least, |n| {
+        sized_span((N_INTERP_BIG, N_INTERP_SMALL), |n| {
             black_box(interp_call(m, entry, &k.lead_args, n));
-        });
-        sized_span(per, least)
+        })
     });
 
     let mut raw = Raw {
