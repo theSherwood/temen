@@ -8,8 +8,10 @@
 #[path = "support/rec.rs"]
 mod rec;
 
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
+use temen_interp::bytecode::ThreadPlatform;
 use temen_interp::{Executor, HeldDomain, Host, Reply, Trap, Value, GRANT_SERVE_LIVE_TAG};
 use temen_ir::SpawnRec;
 
@@ -406,7 +408,8 @@ fn call(d: &HeldDomain, op: u32, args: &[i64]) -> Reply {
     d.call(0, op, args, &mut fuel)
 }
 
-/// Each case runs on every executor that holds domains: the tree-walker, the oracle, and the pump.
+/// Each case runs on every executor that holds domains: the tree-walker, the oracle, the pump and
+/// executor 2.
 macro_rules! on_every_executor {
     ($($case:ident),* $(,)?) => {$(
         mod $case {
@@ -418,6 +421,11 @@ macro_rules! on_every_executor {
             #[test]
             fn pump() {
                 super::$case(temen_interp::Executor::Pump);
+            }
+
+            #[test]
+            fn threads() {
+                super::$case(temen_interp::Executor::Threads);
             }
         }
     )*};
@@ -666,4 +674,59 @@ fn a_durable_domain_is_refused(on: Executor) {
 /// Dropping the handle ends the domain, its parked thread included.
 fn dropping_the_handle_ends_the_domain(on: Executor) {
     bounded(move || drop(start(on, ENTRY_WITH_WORKER)));
+}
+
+/// The threads [`COUNTING`] has started, in this test binary.
+static STARTED: AtomicUsize = AtomicUsize::new(0);
+
+/// Executor 2's OS platform, counting the threads its runs start.
+const COUNTING: ThreadPlatform = ThreadPlatform {
+    spawn: |f, window| {
+        STARTED.fetch_add(1, SeqCst);
+        (ThreadPlatform::OS.spawn)(f, window)
+    },
+    ..ThreadPlatform::OS
+};
+
+/// Executor 2 starts a thread for each of the domain's own threads, and none for a call: the call
+/// runs on its caller's thread, the embedder's or that of a task inside the run (INVARIANTS #4,
+/// D56). The one test that counts.
+#[test]
+fn a_call_starts_no_thread_on_executor_2() {
+    bounded(|| {
+        let m = module(&parent());
+        let (mut host, exit) = host_for(&m);
+        host.set_thread_platform(COUNTING);
+        let at = STARTED.load(SeqCst);
+        let (d, _) = hold(
+            Executor::Threads,
+            m,
+            ENTRY_WITH_WORKER,
+            &[Value::I32(exit)],
+            host,
+        );
+        assert_eq!(STARTED.load(SeqCst) - at, 1, "the worker's thread");
+        for x in 0..10 {
+            assert_eq!(call(&d, PAIR, &[x]), Reply::Results(vec![x + 7, 2 * x]));
+        }
+        assert_eq!(call(&d, JOIN_WORKER, &[]), Reply::Results(vec![70]));
+        assert_eq!(
+            STARTED.load(SeqCst) - at,
+            1,
+            "an embedder's call starts no thread"
+        );
+        drop(d);
+        // A child's calls into its held parent run on the child's thread.
+        let m = module(&parent());
+        let (mut host, args) = child_host(&m, CHILD);
+        host.set_thread_platform(COUNTING);
+        let at = STARTED.load(SeqCst);
+        let (d, _) = hold(Executor::Threads, m, ENTRY_WITH_CHILD, &args, host);
+        assert_eq!(call(&d, JOIN_CHILD, &[]), Reply::Results(vec![42]));
+        assert_eq!(
+            STARTED.load(SeqCst) - at,
+            1,
+            "the child's thread, and none for its calls"
+        );
+    });
 }

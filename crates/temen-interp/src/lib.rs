@@ -2316,6 +2316,10 @@ pub enum Executor {
     /// on a thread its embedder lends it, by calling in or pumping ([`HeldDomain::pump`]). It holds
     /// the modules the bytecode engine admits; the tree-walker holds the others (INVARIANTS #9).
     Pump,
+    /// The bytecode engine's executor 2: every task of the domain on a thread of its own, between
+    /// calls too, and a call on its caller's. It holds the modules the bytecode engine admits; the
+    /// tree-walker holds the others.
+    Threads,
 }
 
 /// Where a [`HeldDomain`] runs.
@@ -2326,16 +2330,17 @@ enum HeldOn {
         run: Option<HeldRun>,
     },
     Pump(Box<bytecode::HeldPump>),
+    Threads(Box<bytecode::HeldThreads>),
 }
 
 /// The thread a held domain's run is on, which answers the run and hands the powerbox back.
 type HeldRun = std::thread::JoinHandle<(Result<Vec<Value>, Trap>, Host)>;
 
 /// #2695 step 2 — who holds a domain ([`Host::held`]): the tree-walker's run, through its link, or
-/// the pump ([`bytecode::HeldPump`]).
+/// the bytecode engine's ([`bytecode::HeldPump`], [`bytecode::HeldThreads`]).
 pub(crate) enum Holder {
     Tree(Arc<HeldLink>),
-    Pump,
+    Bytecode,
 }
 
 impl HeldDomain {
@@ -2360,6 +2365,14 @@ impl HeldDomain {
                 }
                 Ok(Err(refused)) => return Err(refused),
                 // The pump declines the module, and the oracle holds it.
+                Err(host) => *host,
+            },
+            Executor::Threads => match bytecode::HeldThreads::start(&m, entry, args, fuel, host) {
+                Ok(Ok((t, results))) => {
+                    let on = HeldOn::Threads(Box::new(t));
+                    return Ok((HeldDomain { on }, results));
+                }
+                Ok(Err(refused)) => return Err(refused),
                 Err(host) => *host,
             },
             Executor::TreeWalker => host,
@@ -2401,6 +2414,7 @@ impl HeldDomain {
         let link = match &self.on {
             HeldOn::Tree { link, .. } => link,
             HeldOn::Pump(p) => return p.call(export, op, args, fuel),
+            HeldOn::Threads(t) => return t.call(export, op, args, fuel),
         };
         let Some(sched) = link.scheduler() else {
             return Reply::Failed(CAP_REVOKED);
@@ -2430,7 +2444,7 @@ impl HeldDomain {
 
     /// Let the domain run on this thread until nothing in it can run without something outside it
     /// acting. Only a domain on the pump needs it: its threads run only on a thread its embedder
-    /// lends it. On the tree-walker they run on their own, and this returns at once.
+    /// lends it. On the other executors they run on their own, and this returns at once.
     pub fn pump(&self) {
         if let HeldOn::Pump(p) = &self.on {
             p.pump();
@@ -2443,6 +2457,7 @@ impl HeldDomain {
         match self.on {
             HeldOn::Tree { .. } => Executor::TreeWalker,
             HeldOn::Pump(_) => Executor::Pump,
+            HeldOn::Threads(_) => Executor::Threads,
         }
     }
 
@@ -2457,6 +2472,7 @@ impl HeldDomain {
         let (link, run) = match &mut self.on {
             HeldOn::Tree { link, run } => (link, run.take()?),
             HeldOn::Pump(p) => return p.finish(),
+            HeldOn::Threads(t) => return t.finish(),
         };
         if let Some(sched) = link.scheduler() {
             let mut s = sched.lock();

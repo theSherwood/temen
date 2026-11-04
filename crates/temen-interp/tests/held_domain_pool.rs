@@ -53,7 +53,7 @@ fn a_held_domain_holds_its_window_until_it_ends() {
         return;
     }
     // In turn, on every executor that holds domains: the pool is the process's, so one at a time.
-    for on in [Executor::TreeWalker, Executor::Pump] {
+    for on in [Executor::TreeWalker, Executor::Pump, Executor::Threads] {
         holds_its_window_until_it_ends(on, slots);
     }
 }

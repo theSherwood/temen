@@ -12432,12 +12432,28 @@ struct Held {
     /// The slots of activations that have answered, for later ones to take: no one joins an
     /// activation, so its slot names nothing once it is done.
     free: Vec<usize>,
+    /// The entry's results, from its return until its embedder takes them (executor 2).
+    results: Option<Vec<Value>>,
+    /// The trap that ended the domain, once one of its members exited or trapped (executor 2).
+    ended: Option<Trap>,
+    /// The activations made for calls through the queue since an executor last took them, each with
+    /// the task whose call it answers: on executor 2 that task's thread carries it.
+    made: Vec<(usize, usize)>,
 }
 
 impl Held {
     /// Whether the domain rests: its entry has returned, and calls run as activations.
     fn rests(held: &Option<Held>) -> bool {
         held.as_ref().is_some_and(|h| h.rest.is_some())
+    }
+
+    /// Whether activation `ti` may run now under the `Single` gate: the gate is free, or its own.
+    /// A holder that is no longer runnable has given it back, at its park.
+    fn admits(&self, tasks: &[TaskSlot], ti: usize) -> bool {
+        match self.gate {
+            Some(g) if g != ti => !matches!(tasks[g].state, TaskState::Runnable),
+            _ => true,
+        }
     }
 }
 
@@ -12446,7 +12462,8 @@ impl Held {
 /// exactly the op's arguments, running on `fuel` and answering `to`. It starts with the thread-local
 /// word the domain's main thread left, and charges the domain no vCPU. The errno of a call the domain
 /// cannot take: `-EINVAL` for an op its export lacks or a call of another arity, `CAP_REVOKED` for a
-/// domain that does not rest.
+/// domain that does not rest. The slot it took, which a call through the queue records with the task
+/// that made it, its `carrier` ([`Held::made`]).
 #[allow(clippy::too_many_arguments)]
 fn activation(
     tasks: &mut Vec<TaskSlot>,
@@ -12458,7 +12475,8 @@ fn activation(
     args: &[i64],
     fuel: Fuel,
     to: super::AnswerTo,
-) -> Result<(), i64> {
+    carrier: Option<usize>,
+) -> Result<usize, i64> {
     let tls = held.rest.ok_or(super::CAP_REVOKED)?;
     let host = domains[0].host.lock_unpoisoned();
     let unit = source.primary();
@@ -12479,11 +12497,20 @@ fn activation(
         answers: Some(Box::new(Answers { to, fuel })),
         ..TaskSlot::new(vt, 0, LiveVcpu::none())
     };
-    match held.free.pop() {
-        Some(i) => tasks[i] = slot,
-        None => tasks.push(slot),
+    let at = match held.free.pop() {
+        Some(i) => {
+            tasks[i] = slot;
+            i
+        }
+        None => {
+            tasks.push(slot);
+            tasks.len() - 1
+        }
+    };
+    if let Some(c) = carrier {
+        held.made.push((at, c));
     }
-    Ok(())
+    Ok(at)
 }
 
 /// #2695 step 2 — every call queued on the resting held domain as an [`activation`], funded by the
@@ -12506,9 +12533,20 @@ fn serve_resting(
         let payer = host.lock_unpoisoned().svc_payers.remove(&d.ticket);
         let fuel = payer.map_or_else(|| domains[0].fuel.for_thread(), Fuel::drawn);
         let to = super::AnswerTo::Ticket(d.ticket);
-        if let Err(errno) = activation(
-            tasks, domains, held, source, d.export, d.op, &d.args, fuel, to,
-        ) {
+        // The task parked on the call, whose thread carries it on executor 2.
+        let carrier = tasks.iter().position(|t| match &t.state {
+            TaskState::BlockedTicket { ticket, callee, .. }
+            | TaskState::BlockedPage {
+                ticket,
+                pager: callee,
+            } => *ticket == d.ticket && std::sync::Arc::ptr_eq(callee, host),
+            _ => false,
+        });
+        let (export, op) = (d.export, d.op);
+        let made = activation(
+            tasks, domains, held, source, export, op, &d.args, fuel, to, carrier,
+        );
+        if let Err(errno) = made {
             let reply = super::Reply::Failed(errno);
             host.lock_unpoisoned().svc_results.insert(d.ticket, reply);
         }
@@ -13228,6 +13266,11 @@ impl CoopSched {
             // before reading the root's state, so a sibling's trap that killed the root domain
             // surfaces as the run's result (previously the root's timed wait simply outlived it).
             let rests = Held::rests(held);
+            // #2695 step 2 — the pump runs every task on the thread lent it: no activation is
+            // carried.
+            if let Some(h) = held.as_mut() {
+                h.made.clear();
+            }
             // #2695 step 2 — a resting held domain ends when any of its members exits or traps.
             if let Some(trap) = teardown_domains(tasks, domains, dead_domains, rests) {
                 return Err(trap);
@@ -13305,9 +13348,9 @@ impl CoopSched {
             let n = tasks.len();
             // #2695 step 2 — the held domain's `Single` gate: while one activation holds it, running or
             // preempted, its other activations wait.
-            let gate = held.as_ref().and_then(|h| h.gate);
-            let gate = gate.filter(|&g| matches!(tasks[g].state, TaskState::Runnable));
-            let gated = |i: usize| tasks[i].answers.is_some() && gate.is_some_and(|g| g != i);
+            let gated = |i: usize| {
+                tasks[i].answers.is_some() && held.as_ref().is_some_and(|h| !h.admits(tasks, i))
+            };
             let Some(ti) = (1..=n).map(|k| (last_pick + k) % n).find(|&i| {
                 matches!(tasks[i].state, TaskState::Runnable) && !domain_stopped(i) && !gated(i)
             }) else {
@@ -14978,7 +15021,11 @@ impl ThreadsRun {
         embedder: bool,
         leaf: Option<LeafStart>,
     ) -> Result<ThreadsRun, Refused> {
-        let run = ThreadRun::open(source, table, entry, args, fuel, mem, host, embedder, leaf)?;
+        let driver = match embedder {
+            true => Driver::Embedder,
+            false => Driver::Platform,
+        };
+        let run = ThreadRun::open(source, table, entry, args, fuel, mem, host, driver, leaf)?;
         Ok(ThreadsRun {
             root: std::sync::Arc::clone(&run.root),
             run: Some(run),
@@ -15076,6 +15123,40 @@ struct PumpRun {
     sched: CoopSched,
 }
 
+/// #2695 step 2 — what a held run of `entry` of `m` starts from on either bytecode executor: the
+/// program and its table, a fresh window, and the powerbox, marked held. A durable domain is refused
+/// with `ThreadFault`, as on the tree-walker. The outer `Err` hands the powerbox back: the bytecode
+/// engine declines `m`.
+#[allow(clippy::type_complexity)]
+fn held_program(
+    m: &Module,
+    entry: FuncIdx,
+    mut host: Host,
+) -> Result<Result<HeldProgram, (Trap, Box<Host>)>, Box<Host>> {
+    let Some(c) = compile_module_for(m, true) else {
+        return Err(Box::new(host));
+    };
+    if host.is_durable() {
+        return Ok(Err((Trap::ThreadFault, Box::new(host))));
+    }
+    if entry as usize >= c.progs.len() {
+        return Ok(Err((Trap::Malformed, Box::new(host))));
+    }
+    let source = ModuleSource::shared(std::sync::Arc::new(c));
+    let table = source.root_table(host.jit_table_log2());
+    let mem = Mem::root(m, default_reserved_log2(), None, &[]);
+    host.held = Some(super::Holder::Bytecode);
+    Ok(Ok((source, table, mem, host)))
+}
+
+/// What [`held_program`] makes.
+type HeldProgram = (
+    std::sync::Arc<ModuleSource>,
+    std::sync::Arc<SharedSlots>,
+    Option<Mem>,
+    Host,
+);
+
 /// #2695 step 2 — a held domain on the pump ([`super::HeldDomain`]). The pump has no thread of its
 /// own: the domain runs only on a thread its embedder lends it, by calling in ([`Self::call`]) or
 /// pumping ([`Self::pump`]). One lent thread pumps at a time. It lets go at its own call's answer,
@@ -15109,26 +15190,17 @@ impl HeldPump {
         entry: FuncIdx,
         args: &[Value],
         fuel: u64,
-        mut host: Host,
+        host: Host,
     ) -> Result<Result<(HeldPump, Vec<Value>), (Trap, Box<Host>)>, Box<Host>> {
-        let Some(c) = compile_module_for(m, true) else {
-            return Err(Box::new(host));
+        let (source, table, mut mem, mut host) = match held_program(m, entry, host)? {
+            Ok(start) => start,
+            Err(refused) => return Ok(Err(refused)),
         };
-        if host.is_durable() {
-            return Ok(Err((Trap::ThreadFault, Box::new(host))));
-        }
-        if entry as usize >= c.progs.len() {
-            return Ok(Err((Trap::Malformed, Box::new(host))));
-        }
-        let source = ModuleSource::shared(std::sync::Arc::new(c));
-        let table = source.root_table(host.jit_table_log2());
-        let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
         clear_session_fault();
         if host.external_wake().is_none() {
             host.arm_external_wake();
         }
         let bell = host.external_wake().expect("armed above");
-        host.held = Some(super::Holder::Pump);
         let Some(node) = host.begin_activation(fuel, RootWindow::of(mem.as_ref())) else {
             host.held = None;
             return Ok(Err((Trap::ThreadFault, Box::new(host))));
@@ -15187,8 +15259,9 @@ impl HeldPump {
         let held = core.held.as_mut().expect("a held run");
         let to = super::AnswerTo::Embedder(std::sync::Arc::clone(&wait));
         let lent = Fuel::fixed(*fuel);
+        let tasks = &mut core.tasks;
         let made = activation(
-            &mut core.tasks,
+            tasks,
             &core.domains,
             held,
             source,
@@ -15197,6 +15270,7 @@ impl HeldPump {
             args,
             lent,
             to,
+            None,
         );
         if let Err(errno) = made {
             return super::Reply::Failed(errno);
@@ -15282,6 +15356,137 @@ impl HeldPump {
         let root = std::sync::Arc::clone(&core.domains[0].host);
         // The tasks hand their fuel back as they go, before the powerbox does.
         drop(sched);
+        let mut host = Host::from_cell(root);
+        host.held = None;
+        host.release_memory();
+        host.release_pipe_ends();
+        Some((host, ended))
+    }
+}
+
+/// #2695 step 2 — a held domain on executor 2 ([`super::HeldDomain`]): every task runs on a thread of
+/// its own, between calls too, and an activation on the thread of the caller it answers. The
+/// embedder's call runs on the embedder's thread; a call from a task of the run, on that task's.
+pub(crate) struct HeldThreads {
+    /// The run, until its embedder ends it.
+    run: Option<std::sync::Arc<ThreadRun>>,
+}
+
+impl HeldThreads {
+    /// [`HeldPump::start`] on executor 2: the entry runs on this thread, and the domain's threads on
+    /// their own.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn start(
+        m: &Module,
+        entry: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        host: Host,
+    ) -> Result<Result<(HeldThreads, Vec<Value>), (Trap, Box<Host>)>, Box<Host>> {
+        let (source, table, mem, host) = match held_program(m, entry, host)? {
+            Ok(start) => start,
+            Err(refused) => return Ok(Err(refused)),
+        };
+        host.wire_park_door();
+        let run = match ThreadRun::open(
+            source,
+            table,
+            entry,
+            args,
+            fuel,
+            mem,
+            host,
+            Driver::Held,
+            None,
+        ) {
+            Ok(run) => run,
+            Err(refused) => {
+                let (trap, mut host, _) = *refused;
+                host.held = None;
+                return Ok(Err((trap, Box::new(host))));
+            }
+        };
+        run.run_root_here();
+        let (rested, over) = {
+            let mut g = run.state.lock_unpoisoned();
+            let rested = g.core.held.as_mut().and_then(|h| h.results.take());
+            (rested, g.over.clone())
+        };
+        let mut held = HeldThreads { run: Some(run) };
+        match (rested, over) {
+            (Some(results), None) => Ok(Ok((held, results))),
+            // The domain ended in its entry, or before the embedder heard it rest.
+            (_, over) => {
+                let (host, ended) = held.finish().expect("not yet ended");
+                let trap = over.and_then(Result::err).or(ended);
+                Ok(Err((trap.unwrap_or(Trap::ThreadFault), Box::new(host))))
+            }
+        }
+    }
+
+    /// [`super::HeldDomain::call`] on executor 2: the call runs as an activation on this thread,
+    /// which waits on it, as a task's thread waits on its own, until it answers.
+    pub(crate) fn call(&self, export: u32, op: u32, args: &[i64], fuel: &mut u64) -> super::Reply {
+        let Some(run) = &self.run else {
+            return super::Reply::Failed(super::CAP_REVOKED);
+        };
+        let wait = std::sync::Arc::new(super::EmbedderReply::default());
+        let mut g = run.state.lock_unpoisoned();
+        if g.over.is_some() {
+            return super::Reply::Failed(super::CAP_REVOKED);
+        }
+        let core = &mut g.core;
+        let held = core.held.as_mut().expect("a held run");
+        let to = super::AnswerTo::Embedder(std::sync::Arc::clone(&wait));
+        let (lent, source) = (Fuel::fixed(*fuel), &run.source);
+        let tasks = &mut core.tasks;
+        let a = match activation(
+            tasks,
+            &core.domains,
+            held,
+            source,
+            export,
+            op,
+            args,
+            lent,
+            to,
+            None,
+        ) {
+            Ok(a) => a,
+            Err(errno) => return super::Reply::Failed(errno),
+        };
+        // This thread waits on a park of its own while it carries the call, and counts in.
+        match g.parks.get_mut(a) {
+            Some(park) => *park = std::sync::Arc::default(),
+            None => g.parks.push(std::sync::Arc::default()),
+        }
+        g.live += 1;
+        let (view, _) = g.hand(0);
+        // It counts out once it has let go of the run.
+        let exit = ThreadExit(run);
+        release(carry(run, g, a, view, Fuel::fixed(0)));
+        drop(exit);
+        let (reply, left) = wait
+            .take()
+            .unwrap_or((super::Reply::Failed(super::CAP_REVOKED), 0));
+        *fuel = left;
+        reply
+    }
+
+    /// [`super::HeldDomain::end`] on executor 2: the run stops where it is, every thread leaves at its
+    /// next look, and the powerbox comes back, with the trap that ended the domain first if one did.
+    /// What the domain held goes back, as [`HeldPump::finish`] hands it back. `None` once ended.
+    pub(crate) fn finish(&mut self) -> Option<(Host, Option<Trap>)> {
+        let run = self.run.take()?;
+        let ended = {
+            let mut g = run.state.lock_unpoisoned();
+            let ended = g.core.held.as_ref().and_then(|h| h.ended);
+            run.end(&mut g, Err(Trap::OutOfFuel));
+            release(g);
+            ended
+        };
+        let root = std::sync::Arc::clone(&run.root);
+        drop(ThreadRun::finish(run));
         let mut host = Host::from_cell(root);
         host.held = None;
         host.release_memory();
@@ -16306,9 +16511,21 @@ struct Threads {
     stalled: bool,
     /// The host-answered calls its embedder has heard of and not yet answered.
     told: Vec<u64>,
+    /// #2695 step 2 — the task whose thread runs each activation of a held domain that answers a
+    /// call through the queue, by activation: the caller's, which waits on the answer. An activation
+    /// has no thread of its own; one the embedder calls runs on the embedder's thread.
+    carriers: std::collections::BTreeMap<usize, usize>,
 }
 
 impl Threads {
+    /// The activation task `ti`'s thread carries, if one answers a call `ti` waits on.
+    fn carried(&self, ti: usize) -> Option<usize> {
+        self.carriers
+            .iter()
+            .find(|&(_, &c)| c == ti)
+            .map(|(&a, _)| a)
+    }
+
     /// What a thread steps a task of domain `env` over: its own view of the domain's window and its
     /// own hand of the domain's fuel.
     fn hand(&self, env: usize) -> (Option<Mem>, Fuel) {
@@ -16745,10 +16962,10 @@ fn drive_threads(
 impl ThreadRun {
     /// Open a run of `entry(args)` over `dom`, `mem` and `host`, with `fuel` for it to draw: the
     /// host's activation (#1944 slice 3: every thread draws from the host's own node), the schedule,
-    /// and a stop asked for before the run was there to be told. No thread runs yet. A run its
-    /// `embedder` pumps ([`ThreadsRun`]) is watched whatever the platform says. With `leaf`, the
-    /// root runs its entry whole, as the leaf the tier's emitter took ([`root_leaf`]). `Err` gives
-    /// the host and window back with the trap that refused the run.
+    /// and a stop asked for before the run was there to be told. No thread runs yet. Its `driver`
+    /// says who drives it ([`Driver`]). With `leaf`, the root runs its entry whole, as the leaf the
+    /// tier's emitter took ([`root_leaf`]). `Err` gives the host and window back with the trap that
+    /// refused the run.
     #[allow(clippy::too_many_arguments)]
     fn open(
         source: std::sync::Arc<ModuleSource>,
@@ -16758,7 +16975,7 @@ impl ThreadRun {
         fuel: u64,
         mem: Option<Mem>,
         mut host: Host,
-        embedder: bool,
+        driver: Driver,
         leaf: Option<LeafStart>,
     ) -> Result<std::sync::Arc<ThreadRun>, Refused> {
         super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
@@ -16779,7 +16996,13 @@ impl ThreadRun {
             let bell = host.external_wake().unwrap_or_default();
             (bell, host.run_door(), host.thread_platform())
         };
-        let watched = embedder || !platform.root_on_opener;
+        let watched = match driver {
+            Driver::Platform => !platform.root_on_opener,
+            Driver::Embedder => true,
+            Driver::Held => false,
+        };
+        // #2695 step 2 — a held run's root domain rests when its entry returns.
+        core.held = (driver == Driver::Held).then(Held::default);
         // The platform's tier emits the run's own program, each granted module a child runs
         // (#1414 ED-2), and the leaf images the run takes (#1414 5c).
         let programs = ProgramEmits {
@@ -16809,9 +17032,10 @@ impl ThreadRun {
                     leaf: platform.tier.as_ref().and_then(|t| t.leaf.clone()),
                     ..EmitTier::default()
                 },
-                embedder_pumps: embedder,
+                embedder_pumps: driver == Driver::Embedder,
                 stalled: false,
                 told: Vec::new(),
+                carriers: std::collections::BTreeMap::new(),
             }),
             start: (platform.now_ns)(),
             platform,
@@ -16909,10 +17133,24 @@ struct ThreadsEnd {
 /// over `mem` (its view of its domain's window) and `fuel` (its hand of the domain's fuel).
 fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, fuel: Fuel) {
     let _exit = ThreadExit(&run);
-    // Declared after the guard, so they go before it counts the thread out.
+    let g = run.state.lock_unpoisoned();
+    let g = carry(&run, g, ti, mem, fuel);
+    release(g);
+}
+
+/// Run task `ti` on this thread until it ends, or the run does: a task's own thread, or the thread
+/// of a task whose call it answers ([`Next::Carry`]), or the embedder's. An activation steps on the
+/// fuel its caller lent it, which this thread holds while it steps and the rules hold between.
+fn carry<'g>(
+    run: &'g std::sync::Arc<ThreadRun>,
+    mut g: std::sync::MutexGuard<'g, Threads>,
+    ti: usize,
+    mem: Option<Mem>,
+    fuel: Fuel,
+) -> std::sync::MutexGuard<'g, Threads> {
     let (mut mem, mut fuel) = (mem, fuel);
-    let mut g = run.state.lock_unpoisoned();
     let park = std::sync::Arc::clone(&g.parks[ti]);
+    let activation = g.core.tasks[ti].answers.is_some();
     let mut env = g.core.tasks[ti].domain;
     // An exec gives the task's domain the image's window, or moves the task into a domain of its
     // own: its thread steps over the new one.
@@ -16927,10 +17165,16 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
     let mut invoke = None;
     let mut tier = TierState::default();
     loop {
-        let runs;
-        (g, runs) = run.await_runnable(g, ti, &park, look);
-        if !runs {
-            break;
+        let next;
+        (g, next) = run.await_runnable(g, ti, &park, look);
+        match next {
+            Next::Run => {}
+            Next::Stop => break,
+            Next::Carry(a) => {
+                let (view, _) = g.hand(0);
+                g = carry(run, g, a, view, Fuel::fixed(0));
+                continue;
+            }
         }
         if exec || g.core.tasks[ti].domain != env {
             env = g.core.tasks[ti].domain;
@@ -16938,6 +17182,7 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
             tier.pages = PageTable::default();
         }
         std::mem::swap(&mut g.core.tasks[ti].vm, &mut vm);
+        lend_fuel(&mut g, ti, &mut fuel);
         let mut exits = g.core.hooked_twins.len();
         let host = std::sync::Arc::clone(&g.core.domains[env].host);
         let table = std::sync::Arc::clone(&g.core.domains[env].table);
@@ -16960,6 +17205,7 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
             _ => None,
         };
         g = run.state.lock_unpoisoned();
+        lend_fuel(&mut g, ti, &mut fuel);
         // Ended while it stepped (its domain torn down, or the run over): its stop is not applied.
         if g.over.is_some() || matches!(g.core.tasks[ti].state, TaskState::Done(_)) {
             break;
@@ -16972,9 +17218,28 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
         look = matches!(stop, Ok(VcpuStop::Preempted));
         let (made, surfaced) = run.apply(&mut g, ti, stop, exits);
         invoke = surfaced;
-        g = start_tasks(&run, g, made);
+        g = start_tasks(run, g, made);
     }
-    release(g);
+    // #2695 step 2 — an activation that has answered goes: its carrier back to its own task, and
+    // its slot to the next activation.
+    if activation {
+        g.carriers.remove(&ti);
+        if g.over.is_none() && matches!(g.core.tasks[ti].state, TaskState::Done(Ok(_))) {
+            if let Some(h) = g.core.held.as_mut() {
+                h.free.push(ti);
+            }
+        }
+    }
+    g
+}
+
+/// #2695 step 2 — swap the fuel an activation `ti` runs on between its slot and the thread that
+/// steps it: the thread holds it while it steps, the rules between steps. A no-op for any other
+/// task, whose thread holds its own hand of its domain's fuel.
+fn lend_fuel(g: &mut Threads, ti: usize, fuel: &mut Fuel) {
+    if let Some(a) = g.core.tasks[ti].answers.as_mut() {
+        std::mem::swap(&mut a.fuel, fuel);
+    }
 }
 
 /// Start the threads of the tasks a rule made ([`ThreadRun::apply`]), with the lock let go meanwhile.
@@ -17036,8 +17301,18 @@ impl BounceTask<'_> {
         let (made, _) = run.apply(&mut g, ti, Ok(stop), *self.exits);
         g = start_tasks(run, g, made);
         let park = std::sync::Arc::clone(&g.parks[ti]);
-        let runs;
-        (g, runs) = run.await_runnable(g, ti, &park, false);
+        let runs = loop {
+            let next;
+            (g, next) = run.await_runnable(g, ti, &park, false);
+            match next {
+                Next::Run => break true,
+                Next::Stop => break false,
+                Next::Carry(a) => {
+                    let (view, _) = g.hand(0);
+                    g = carry(run, g, a, view, Fuel::fixed(0));
+                }
+            }
+        };
         std::mem::swap(&mut *g.core.tasks[ti].vm, self.vm);
         *self.exits = g.core.hooked_twins.len();
         release(g);
@@ -17144,14 +17419,31 @@ impl ThreadRun {
         ti: usize,
         park: &std::sync::Condvar,
         mut look: bool,
-    ) -> (std::sync::MutexGuard<'g, Threads>, bool) {
+    ) -> (std::sync::MutexGuard<'g, Threads>, Next) {
         loop {
             if g.over.is_some() {
-                return (g, false);
+                return (g, Next::Stop);
             }
+            // #2695 step 2 — an activation that answers a call of this task runs on its thread.
+            if let Some(a) = g.carried(ti) {
+                return (g, Next::Carry(a));
+            }
+            let admitted = (g.core.tasks[ti].answers.is_none())
+                || g.core
+                    .held
+                    .as_ref()
+                    .is_some_and(|h| h.admits(&g.core.tasks, ti));
             match g.core.tasks[ti].state {
-                TaskState::Runnable if !(look && self.stopped(&g.core, ti)) => return (g, true),
-                TaskState::Done(_) => return (g, false),
+                TaskState::Runnable if admitted && !(look && self.stopped(&g.core, ti)) => {
+                    // An activation takes the domain's `Single` gate as it runs.
+                    if g.core.tasks[ti].answers.is_some() {
+                        if let Some(h) = g.core.held.as_mut() {
+                            h.gate = Some(ti);
+                        }
+                    }
+                    return (g, Next::Run);
+                }
+                TaskState::Done(_) => return (g, Next::Stop),
                 _ => {
                     g = self.park(g, ti, park);
                     look = true;
@@ -17444,10 +17736,33 @@ impl ThreadRun {
         if self.missed_wake(&g.core, ti, exits) {
             g.core.tasks[ti].state = TaskState::Runnable;
         }
+        // #2695 step 2 — an activation that parked or answered gives the `Single` gate back, and
+        // each activation that waits on it may run: their threads look again.
+        let gives_back = g.core.held.as_ref().is_some_and(|h| h.gate == Some(ti))
+            && !matches!(g.core.tasks[ti].state, TaskState::Runnable);
+        if gives_back {
+            if let Some(h) = g.core.held.as_mut() {
+                h.gate = None;
+            }
+            for j in 0..g.core.tasks.len() {
+                let waits = g.core.tasks[j].answers.is_some()
+                    && matches!(g.core.tasks[j].state, TaskState::Runnable);
+                if waits && j < g.parks.len() {
+                    let park = std::sync::Arc::clone(&g.parks[j]);
+                    g.woken.push(park);
+                }
+            }
+        }
         self.settle(g);
         let mut made = Vec::new();
         for j in had..g.core.tasks.len() {
-            g.parks.push(std::sync::Arc::default());
+            if j >= g.parks.len() {
+                g.parks.push(std::sync::Arc::default());
+            }
+            // #2695 step 2 — an activation has no thread of its own: its caller's carries it.
+            if g.core.tasks[j].answers.is_some() {
+                continue;
+            }
             let (mem, fuel) = g.hand(g.core.tasks[j].domain);
             made.push((j, mem, fuel));
         }
@@ -17468,12 +17783,16 @@ impl ThreadRun {
     fn settle(&self, g: &mut Threads) {
         let core = &mut g.core;
         let rests = Held::rests(&core.held);
-        teardown_domains(
+        // #2695 step 2 — a resting held domain ends when any of its members exits or traps.
+        let ended = teardown_domains(
             &mut core.tasks,
             &mut core.domains,
             &mut core.dead_domains,
             rests,
         );
+        if let (Some(h), Some(trap)) = (core.held.as_mut(), ended) {
+            h.ended.get_or_insert(trap);
+        }
         core.clock = self.now();
         time_out_due(
             &mut core.tasks,
@@ -17499,10 +17818,35 @@ impl ThreadRun {
             self.end(g, Err(Trap::OutOfFuel));
             return;
         }
+        // #2695 step 2 — a held domain whose entry returned rests: its threads run on, the calls that
+        // waited during the entry start, each on the thread of the task that made it, and the
+        // embedder takes the entry's results. One that ended ends the run.
+        let core = &mut g.core;
+        if let (Some(h), TaskState::Done(Ok(vals)), false) =
+            (core.held.as_mut(), &core.tasks[0].state, rests)
+        {
+            h.rest = Some(core.tasks[0].vm.vt.active.tls);
+            h.results = Some(vals.clone());
+            serve_resting(&mut core.tasks, &core.domains, h, &self.source);
+        }
+        let made = core.held.as_mut().map(|h| std::mem::take(&mut h.made));
+        for (a, c) in made.into_iter().flatten() {
+            g.carriers.insert(a, c);
+            let park = std::sync::Arc::clone(&g.parks[c]);
+            g.woken.push(park);
+        }
+        if let Some(trap) = g.core.held.as_ref().and_then(|h| h.ended) {
+            self.conclude(g, Err(trap));
+            return;
+        }
         let core = &g.core;
         let mut stalled_now = false;
-        let over = if let TaskState::Done(res) = &core.tasks[0].state {
+        let rests = Held::rests(&core.held);
+        let over = if let (false, TaskState::Done(res)) = (rests, &core.tasks[0].state) {
             Some(res.clone())
+        } else if rests {
+            // A resting held domain is never stalled: its embedder can always call in.
+            None
         } else if self.idle(core) {
             let bell = self.root.lock_unpoisoned().external_wake().is_some();
             match stalled(&core.tasks, g.embedder_pumps, bell) {
@@ -17533,10 +17877,11 @@ impl ThreadRun {
     /// caller's, if it is a task's thread), to be signalled when the lock is let go ([`release`]);
     /// every thread once the run is over.
     fn wake(&self, g: &mut Threads, was_awake: &[bool], own: Option<usize>) {
-        for (j, park) in g.parks.iter().enumerate() {
+        for j in 0..g.parks.len() {
             let woke = !was_awake.get(j).copied().unwrap_or(true) && awake(&g.core.tasks[j]);
             if Some(j) != own && (woke || g.over.is_some()) {
-                g.woken.push(std::sync::Arc::clone(park));
+                let park = std::sync::Arc::clone(&g.parks[j]);
+                g.woken.push(park);
             }
         }
     }
@@ -17569,6 +17914,9 @@ impl ThreadRun {
     fn park_for(&self, core: &SchedCore, ti: usize) -> ParkFor {
         let t = &core.tasks[ti];
         match t.state {
+            // #2695 step 2 — an activation that waits on its domain's `Single` gate: the holder's
+            // park or answer gives it back, and wakes it ([`ThreadRun::apply`]).
+            TaskState::Runnable if t.answers.is_some() && !self.stopped(core, ti) => ParkFor::Wake,
             // Its SIGCONT comes from another task's call or an embedder, with no rule to wake it.
             TaskState::Runnable => ParkFor::Poll,
             TaskState::BlockedWait {
@@ -17746,6 +18094,29 @@ impl ThreadRun {
             timer: run_deadline(&core.tasks, &core.domains).map(|d| d.saturating_sub(self.now())),
         })
     }
+}
+
+/// Who drives a run on executor 2 ([`ThreadRun::open`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Driver {
+    /// Nothing outside it: the opener runs its root where the platform says so
+    /// ([`ThreadPlatform::root_on_opener`]), or watches it.
+    Platform,
+    /// An embedder that pumps it ([`ThreadsRun`]): the opener watches it, whatever the platform says.
+    Embedder,
+    /// #2695 step 2 — an embedder that holds its root domain ([`HeldThreads`]): the opener runs the
+    /// root's entry, and nothing watches.
+    Held,
+}
+
+/// What a thread of executor 2 runs next ([`ThreadRun::await_runnable`]).
+enum Next {
+    /// The task it runs: it can run.
+    Run,
+    /// #2695 step 2 — an activation that answers the task's call, which the thread runs first.
+    Carry(usize),
+    /// Nothing: the task has ended, or the run has.
+    Stop,
 }
 
 /// Why a watch of a run on executor 2 ended ([`ThreadRun::watch`]).
