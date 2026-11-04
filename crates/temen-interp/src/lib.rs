@@ -23461,6 +23461,12 @@ impl CapFiberCell {
     pub fn take(&self) -> Option<i64> {
         self.result.lock_unpoisoned().take()
     }
+
+    /// Whether the drain has filled the cell, without claiming it: a waiter that installs its wake
+    /// hook after registering looks here, since an answer posted before the hook rang nothing.
+    pub fn ready(&self) -> bool {
+        self.result.lock_unpoisoned().is_some()
+    }
 }
 
 impl Completions {
@@ -23480,8 +23486,11 @@ impl Completions {
     }
 
     /// §12 — install (`Some`) or remove the hook each posted result calls
-    /// ([`Completions::notify`]). Called before the caller parks: a result posted before it was
-    /// installed is found by the driver's recheck after the park, one posted after rings it. The hook
+    /// ([`Completions::notify`]). Called before the caller parks: a result posted after it is
+    /// installed rings it, and one posted before rang nothing, so the caller rechecks once the hook
+    /// is in. An interpreter's driver rechecks after its park. A JIT task's waiter rechecks itself
+    /// (`temen_run`'s `fiber_cap_wait`, [`CapFiberCell::ready`]), since nothing polls a parked task
+    /// (#2757). The hook
     /// runs on the thread that posts: a pool worker, an embedder's thread, or one inside a host
     /// procedure, holding its domain's host lock (#2522). A hook that takes a lock taken before a
     /// host's waits until the thread lets go of it, as the tree-walker's drain does.

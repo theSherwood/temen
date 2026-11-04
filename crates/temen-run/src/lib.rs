@@ -343,11 +343,16 @@ unsafe fn fiber_cap_wait(
     vm: &temen_jit::VmCtx,
 ) -> i64 {
     let cell = comps.fiber_register(id);
-    // #2424 — a §14 child's task parked here is re-offered as soon as its answer is in. Installed
-    // before the park: an answer that comes first finds the task running, and the wake it latches
-    // re-offers the task once it parks.
+    // #2424 — a §14 child's task parked here is re-offered as soon as its answer is in. The hook is
+    // installed before the park: an answer posted after it rings it while the task still runs, and
+    // the wake it latches re-offers the task once it parks. An answer posted before the hook rang
+    // nothing, and nothing polls a parked task (#2757), so ring it here: `fiber_register` took that
+    // answer out of the store, or `complete` filled this cell before it read the hook.
     if let Some(wake) = temen_jit::outside_waker(vm) {
-        comps.set_notify(Some(wake));
+        comps.set_notify(Some(std::sync::Arc::clone(&wake)));
+        if cell.ready() {
+            wake();
+        }
     }
     loop {
         temen_jit::fiber_park_outside();
