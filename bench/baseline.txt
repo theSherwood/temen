@@ -1,12 +1,19 @@
 # temen-bench baseline — the tracked signal is the RATIO (temen / wasm), which is far more
 # portable across machines than the absolute ns. `--check` flags any ratio that grew
-# past the tolerance (temen got relatively slower). Regenerate after an intended change:
-#   cargo run --release -- --save-baseline baseline.txt
-# columns: kernel,compute_vs_wasm32,compute_vs_wasm64,cold_vs_wasmtime
-alu,1.016,NA,0.272
-memsum,1.492,1.117,0.334
-scatter,1.444,0.823,0.332
-alu_c,1.026,NA,0.995
-locals_c,2.264,NA,0.998
-hostcall,1.235,NA,0.560
-hostbuf,0.546,NA,0.458
+# past the tolerance (temen got relatively slower). Some ratios differ by up to 2x between
+# machines, so take the baseline on the machine that checks: the nightly bench job's log ends
+# with this file, as of that run. Elsewhere: cargo run --release -- --save-baseline FILE
+# columns: kernel,compute_vs_wasm32,compute_vs_wasm64,cold_vs_wasmtime,interp_vs_jit,jit_vs_native
+alu,1.016,1.015,1.308,70.683,5.082
+memsum,1.512,1.008,1.225,248.527,1.294
+scatter,1.065,0.696,1.212,320.780,0.937
+simd,2.003,2.010,1.304,178.647,NA
+float,1.010,1.010,1.321,64.339,1.011
+calli,1.293,1.294,0.863,61.805,1.812
+calli_poly,1.049,1.047,0.785,24.324,1.236
+cache,1.007,0.765,1.157,164.778,1.336
+alu_c,1.011,1.011,1.894,129.965,5.050
+locals_c,1.506,1.004,1.714,476.506,1.403
+irreducible,0.184,NA,1.529,472.120,NA
+hostcall,1.081,NA,1.463,NA,NA
+hostbuf,0.481,NA,1.083,NA,NA
