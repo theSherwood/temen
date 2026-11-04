@@ -1,7 +1,7 @@
 //! Phase-1b bytecode engine (see `INTERP_PERF.md`).
 //!
-//! Compiles a function once into a flat, operand-resolved op stream over a **function-wide
-//! global-slot register file**, executed with **register windows** for calls (each activation
+//! Compiles a function once, the first time a run enters it (#2764), into a flat, operand-resolved
+//! op stream over a **function-wide global-slot register file**, executed with **register windows** for calls (each activation
 //! occupies `[base, base + nslots)` of one shared `regs` vector — a call opens the next window with
 //! no per-call allocation, a return writes results back and restores the caller's window). This is
 //! the production form of the Phase-1 ROI spike; it reuses the crate's audited semantic helpers
@@ -715,7 +715,11 @@ pub struct Compiled {
     /// The module's declared durable shadow arena (INVARIANTS.md #16), `None` if it declared none —
     /// a child window built for this program places its contexts here.
     shadow: Option<super::ShadowArena>,
-    progs: Vec<Program>,
+    /// Each function's program, compiled the first time a run enters it or anything reads it
+    /// ([`Compiled::prog`], #2764). A start runs a fraction of its module, so it compiles that much.
+    progs: Box<[std::sync::OnceLock<Program>]>,
+    /// What those programs compile from.
+    lazy: Lazy,
     result_types: Vec<Vec<ValType>>,
     /// Per-function `(params, results)` for `call.dyn` type-checking — the natural module-0
     /// function table indexes these directly (slot `i` ⇒ func `i`).
@@ -737,6 +741,66 @@ pub struct Compiled {
     census: std::sync::OnceLock<ImageCensus>,
 }
 
+/// What a module's programs compile from, kept so each compiles the first time it is needed (#2764).
+enum Ir {
+    /// A whole module, shared with whoever else holds it: the host that runs it as its own, the
+    /// grant it was granted in, an embedder's program cache.
+    Module(std::sync::Arc<Module>),
+    /// A §22 unit's functions and types, as the unit holds them.
+    Unit(
+        std::sync::Arc<[Func]>,
+        std::sync::Arc<[temen_ir::TypeEntry]>,
+    ),
+}
+
+impl Ir {
+    fn funcs(&self) -> &[Func] {
+        match self {
+            Ir::Module(m) => &m.funcs,
+            Ir::Unit(funcs, _) => funcs,
+        }
+    }
+
+    fn types(&self) -> &[temen_ir::TypeEntry] {
+        match self {
+            Ir::Module(m) => &m.types,
+            Ir::Unit(_, types) => types,
+        }
+    }
+}
+
+/// The compiles a [`Compiled`] has still to make: the IR, each function's result count, whether to
+/// fuse, and the memo a compile goes through, if the module was compiled with one.
+struct Lazy {
+    ir: Ir,
+    arities: Box<[usize]>,
+    fuse: bool,
+    memo: Option<std::sync::Arc<std::sync::Mutex<FuncMemo>>>,
+}
+
+impl Lazy {
+    fn compile(&self, i: usize) -> Program {
+        let view = ModuleView {
+            arities: &self.arities,
+            types: self.ir.types(),
+            sigs: core::cell::RefCell::new(Vec::new()),
+        };
+        let f = &self.ir.funcs()[i];
+        match &self.memo {
+            Some(memo) => memo.lock_unpoisoned().compile(i, f, &view, self.fuse),
+            None => compile_func(f, &view, self.fuse),
+        }
+        .expect("a module is admitted only when each of its cap calls lowers")
+    }
+}
+
+// Every driver shares one program across its vCPUs, which may compile its functions as they first
+// enter them (#2764).
+const _: fn() = || {
+    fn shared<T: Send + Sync>() {}
+    shared::<Compiled>();
+};
+
 impl Compiled {
     /// The digest of `m`, the module this program was compiled from ([`super::module_digest`]): a
     /// root leaf's identity. Made on first use, so a run over a kept program (#1144) does not
@@ -752,19 +816,39 @@ impl Compiled {
         self.census.get_or_init(|| ImageCensus::of(m))
     }
 
+    /// Function `i`'s program, compiled now if nothing has needed it before (#2764). The module was
+    /// admitted whole before any of it ran, so the compile cannot decline here.
+    #[inline]
+    fn prog(&self, i: usize) -> &Program {
+        self.progs[i].get_or_init(|| self.lazy.compile(i))
+    }
+
+    /// Every function's program, compiled now: for a reader that wants them all.
+    fn compile_all(&self) {
+        for i in 0..self.progs.len() {
+            self.prog(i);
+        }
+    }
+
     /// Total compiled **bytecode op count** across all functions — the structural-size measure of this
     /// threaded register-VM program (the analogue of the JIT's emitted code bytes / the IR's
     /// instruction count). The engine is a `Vec<Op>` per function, not a serialized byte stream, so op
     /// count, not a byte length, is the meaningful size.
     pub fn op_count(&self) -> usize {
-        self.progs.iter().map(|p| p.ops.len()).sum()
+        (0..self.progs.len()).map(|i| self.prog(i).ops.len()).sum()
     }
 
     /// Lower each `ref.func N` of this §22 unit to `slots[N]`, the `call.dyn` slot its function `N`
     /// was installed into (DESIGN.md §22 "Unit-own funcrefs"): the constant the Cranelift JIT's
     /// `define_extra` emits. `None` for an index with no slot, which a verified unit has not.
     fn lower_own_funcrefs(&mut self, slots: &[usize]) -> Option<()> {
-        for op in self.progs.iter_mut().flat_map(|p| p.ops.iter_mut()) {
+        self.compile_all();
+        for op in self
+            .progs
+            .iter_mut()
+            .filter_map(|p| p.get_mut())
+            .flat_map(|p| p.ops.iter_mut())
+        {
             if let Op::RefFunc { func, .. } = op {
                 *func = *slots.get(*func as usize)? as u32;
             }
@@ -979,9 +1063,9 @@ impl ModuleSource {
     /// Append a §22 `Jit.invoke`d unit and return its index. (§22 `Jit.install` instead goes through
     /// [`jit_install_into`], which also fills a dispatch slot; a module an exec or a §14 child runs,
     /// through [`unit_of`](Self::unit_of).)
-    fn push(&self, unit: Compiled) -> usize {
+    fn push(&self, unit: std::sync::Arc<Compiled>) -> usize {
         let mut mods = self.mods.lock_unpoisoned();
-        mods.code.push(std::sync::Arc::new(unit));
+        mods.code.push(unit);
         mods.code.len() - 1
     }
 
@@ -1230,14 +1314,15 @@ block 0 () {
         let empty = temen_text::parse_module("func () -> () {\nblock 0 () {\n  return\n  }\n}\n")
             .expect("parse");
         for serves in [true, false] {
-            let src = ModuleSource::new(compile_module_for(&empty, serves).expect("compiles"));
+            let src =
+                ModuleSource::new(compile_module_for(&empty, None, serves).expect("compiles"));
             assert_eq!(
                 compile_granted(&host, &g, &src).is_some(),
                 serves,
                 "a driver that serves its children: {serves}"
             );
             assert_eq!(
-                compile_module_for(&program, serves).is_some(),
+                compile_module_for(&program, None, serves).is_some(),
                 serves,
                 "as the program itself is admitted"
             );
@@ -1390,7 +1475,7 @@ fn jit_invoke_unit(
 enum UnitModule {
     /// The unit, compiled for this use and not yet in the shared source: an install appends it once
     /// a slot is free for it ([`jit_install_into`]), an invoke as a transient module.
-    Fresh(Compiled),
+    Fresh(std::sync::Arc<Compiled>),
     /// The module a unit that names its own functions runs as in this domain ([`own_funcs_module`]).
     Own(usize),
 }
@@ -1404,12 +1489,21 @@ fn unit_module(
     table: &SharedSlots,
     unit: &super::ResolvedJitUnit,
 ) -> Result<Option<UnitModule>, Trap> {
-    let (funcs, types, id) = unit;
+    let (funcs, types, _) = unit;
     if super::unit_names_own_funcs(funcs) {
-        return Ok(own_funcs_module(source, table, funcs, types, *id)?.map(UnitModule::Own));
+        return Ok(own_funcs_module(source, table, unit)?.map(UnitModule::Own));
     }
-    let unit = compile_module(funcs, types, None).ok_or(Trap::Malformed)?;
-    Ok(Some(UnitModule::Fresh(unit)))
+    let unit = compile_unit(funcs, types).ok_or(Trap::Malformed)?;
+    Ok(Some(UnitModule::Fresh(std::sync::Arc::new(unit))))
+}
+
+/// A §22 unit's program, compiled from the functions and types the unit holds.
+fn compile_unit(
+    funcs: &std::sync::Arc<[Func]>,
+    types: &std::sync::Arc<[temen_ir::TypeEntry]>,
+) -> Option<Compiled> {
+    let ir = Ir::Unit(std::sync::Arc::clone(funcs), std::sync::Arc::clone(types));
+    compile_module_with(ir, true, None, false, None)
 }
 
 /// §22 "Unit-own funcrefs" (DESIGN.md): the module a unit that names its own functions runs as in
@@ -1425,15 +1519,14 @@ fn unit_module(
 fn own_funcs_module(
     source: &ModuleSource,
     table: &SharedSlots,
-    funcs: &[Func],
-    types: &[temen_ir::TypeEntry],
-    id: (u32, u32),
+    (funcs, types, id): &super::ResolvedJitUnit,
 ) -> Result<Option<usize>, Trap> {
     use std::sync::atomic::Ordering;
+    let id = *id;
     if let Some(k) = table.own_module(id) {
         return Ok(Some(k));
     }
-    let mut unit = compile_module(funcs, types, None).ok_or(Trap::Malformed)?;
+    let mut unit = compile_unit(funcs, types).ok_or(Trap::Malformed)?;
     let mut mods = source.mods.lock_unpoisoned();
     if let Some(k) = table.own_module(id) {
         return Ok(Some(k));
@@ -1492,7 +1585,7 @@ fn jit_install_into(
     };
     let module = match unit {
         UnitModule::Fresh(unit) => {
-            mods.code.push(std::sync::Arc::new(unit));
+            mods.code.push(unit);
             let module = mods.code.len() - 1;
             table.jit_units.lock_unpoisoned().push((module, id));
             module
@@ -1750,30 +1843,51 @@ pub fn serve_qualifies(funcs: &[Func]) -> bool {
     s.has_svc && !s.svc_park_veto()
 }
 
-/// Lower every function of `m` (fast path — superinstruction-**fused**, Slice 5a), or `None` if any
-/// uses an op outside this slice's subset. This is what every production/runtime path calls, and
-/// the one `&Module` admission (INVARIANTS.md §9) — so it is also each driver's routing.
+/// The program of `m` (fast path — superinstruction-**fused**, Slice 5a), whose functions compile as
+/// a run first enters them, or `None` if any uses an op outside this slice's subset. This is what
+/// every production/runtime path calls, and the one `&Module` admission (INVARIANTS.md §9) — so it
+/// is also each driver's routing.
 ///
 /// `serves_children`: the caller's driver serves the children a module spawns — the cooperative
 /// scheduler, `drive` and [`CoopRun`] alike, whose every domain sits in a cell its children can
 /// call back into (#744). The [`bytecode_serves_children`] escape applies to it alone; every other
 /// driver declines such a module to the tree-walk oracle, as it declines one that may page a child
 /// ([`may_page_a_child`]).
-fn compile_module_for(m: &Module, serves_children: bool) -> Option<Compiled> {
+///
+/// `own`: the module the run's host runs as its own ([`Host::self_module`]), which the program keeps
+/// for the compiles still to come when it is `m` ([`kept`]).
+fn compile_module_for(
+    m: &Module,
+    own: Option<std::sync::Arc<Module>>,
+    serves_children: bool,
+) -> Option<Compiled> {
+    admits_for(m, serves_children).then(|| {
+        let mut c = compiled(kept(m, own), true, m.memory.and_then(|x| x.shadow), None);
+        c.serves_children = serves_children;
+        c
+    })
+}
+
+/// Whether the engine admits `m` for a driver that does or does not serve the children it spawns
+/// ([`compile_module_for`]).
+fn admits_for(m: &Module, serves_children: bool) -> bool {
     if !serves_children && may_page_a_child(m) {
-        return None;
+        return false;
     }
-    let escape = serves_children && bytecode_serves_children(m);
-    let mut c = compile_module_with(
+    admits_funcs(
         &m.funcs,
         &m.types,
-        true,
-        m.memory.and_then(|x| x.shadow),
-        escape,
-        None,
-    )?;
-    c.serves_children = serves_children;
-    Some(c)
+        serves_children && bytecode_serves_children(m),
+    )
+}
+
+/// `m`, kept for the compiles still to come (#2764): `own` when it is `m`, so nothing is copied, as
+/// on a temen-run start, whose host runs its module as its own; else a copy of `m`.
+fn kept(m: &Module, own: Option<std::sync::Arc<Module>>) -> Ir {
+    Ir::Module(match own {
+        Some(own) if std::ptr::eq(&*own, m) => own,
+        _ => std::sync::Arc::new(m.clone()),
+    })
 }
 
 /// CONSOLIDATION.md §3d, #744 — the **pager guard**: a record-spawn (op 17) module that declares a
@@ -2266,7 +2380,7 @@ fn compile_granted(
     source: &ModuleSource,
 ) -> Option<std::sync::Arc<Compiled>> {
     let serves_children = source.serves_children();
-    let memo = host.compile_memo().map(|m| &**m);
+    let memo = host.compile_memo();
     let compile = |debug: bool| {
         let mut c = compile_grant(g, serves_children, !debug, memo)?;
         c.debug = debug.then(|| std::sync::Arc::new(ModuleDebug::build(&g.module)));
@@ -2292,21 +2406,12 @@ fn compile_grant(
     g: &super::ModuleGrant,
     serves_children: bool,
     fuse: bool,
-    memo: Option<&std::sync::Mutex<FuncMemo>>,
+    memo: Option<&std::sync::Arc<std::sync::Mutex<FuncMemo>>>,
 ) -> Option<Compiled> {
     let m = &g.module;
     let escape = serves_children && bytecode_serves_children(m);
-    let mut c = match memo {
-        Some(memo) => compile_module_with(
-            &m.funcs,
-            &m.types,
-            fuse,
-            g.shadow(),
-            escape,
-            Some(&mut memo.lock_unpoisoned()),
-        ),
-        None => compile_module_with(&m.funcs, &m.types, fuse, g.shadow(), escape, None),
-    }?;
+    let ir = Ir::Module(std::sync::Arc::clone(m));
+    let mut c = compile_module_with(ir, fuse, g.shadow(), escape, memo.cloned())?;
     c.serves_children = serves_children;
     Some(c)
 }
@@ -2316,7 +2421,13 @@ pub fn compile_module(
     types: &[temen_ir::TypeEntry],
     shadow: Option<super::ShadowArena>,
 ) -> Option<Compiled> {
-    compile_module_with(funcs, types, true, shadow, false, None)
+    compile_module_with(
+        Ir::Unit(funcs.into(), types.into()),
+        true,
+        shadow,
+        false,
+        None,
+    )
 }
 
 /// [`compile_module`] through `memo` (#2168): a function compiled for the same position before is
@@ -2325,9 +2436,10 @@ pub fn compile_module_memo(
     funcs: &[Func],
     types: &[temen_ir::TypeEntry],
     shadow: Option<super::ShadowArena>,
-    memo: &mut FuncMemo,
+    memo: &std::sync::Arc<std::sync::Mutex<FuncMemo>>,
 ) -> Option<Compiled> {
-    compile_module_with(funcs, types, true, shadow, false, Some(memo))
+    let ir = Ir::Unit(funcs.into(), types.into());
+    compile_module_with(ir, true, shadow, false, Some(std::sync::Arc::clone(memo)))
 }
 
 /// Unfused lowering — one op per source instruction, so the step/location trace stays
@@ -2339,20 +2451,32 @@ pub fn compile_module_unfused(
     types: &[temen_ir::TypeEntry],
     shadow: Option<super::ShadowArena>,
 ) -> Option<Compiled> {
-    compile_module_with(funcs, types, false, shadow, false, None)
+    compile_module_with(
+        Ir::Unit(funcs.into(), types.into()),
+        false,
+        shadow,
+        false,
+        None,
+    )
 }
 
-/// Lower every function, or `None` if any uses an op outside this slice's subset. `escape`: the
+/// The program of `ir`, or `None` if the engine declines it ([`admits_funcs`]). `escape`: the
 /// module took the [`bytecode_serves_children`] escape, which [`compile_module_for`] and
 /// [`compile_granted`] decide (they have the module's impl exports).
 fn compile_module_with(
-    funcs: &[Func],
-    types: &[temen_ir::TypeEntry],
+    ir: Ir,
     fuse: bool,
     shadow: Option<super::ShadowArena>,
     escape: bool,
-    mut memo: Option<&mut FuncMemo>,
+    memo: Option<std::sync::Arc<std::sync::Mutex<FuncMemo>>>,
 ) -> Option<Compiled> {
+    admits_funcs(ir.funcs(), ir.types(), escape).then(|| compiled(ir, fuse, shadow, memo))
+}
+
+/// Whether the engine admits a module of `funcs` (INVARIANTS.md §9: decline, never diverge): no
+/// seam it cannot drive, and every cap call lowers. A module is admitted or declined whole, before
+/// any of it runs, because its functions compile only as they are first entered (#2764).
+fn admits_funcs(funcs: &[Func], types: &[temen_ir::TypeEntry], escape: bool) -> bool {
     // §14 **executor children** (the `Instantiator`'s spawn and `join`) run on the scheduler like
     // threads, and they combine with `cont.*` fibers: every driver gives each child domain its own
     // fiber registry (the cooperative `Domain::fibers`, which the parallel driver shares, and the
@@ -2381,37 +2505,59 @@ fn compile_module_with(
     // is admitted natively even though `svc_park_veto` folds it for Cranelift (the per-backend split).
     // #744 — so is a module whose serve handlers cannot park, on a driver that serves its children.
     if s.svc_park_veto() && !s.bytecode_serves_fork() && !escape {
-        return None;
+        return false;
     }
-
+    // [`lower_cap_call`] is the only lowering that declines, so trying each cap call is the check.
     let arities: Vec<usize> = funcs.iter().map(|f| f.results.len()).collect();
     let view = ModuleView {
         arities: &arities,
         types,
         sigs: core::cell::RefCell::new(Vec::new()),
     };
-    let mut progs = Vec::with_capacity(funcs.len());
-    for (i, f) in funcs.iter().enumerate() {
-        progs.push(match memo.as_deref_mut() {
-            Some(memo) => memo.compile(i, f, &view, fuse)?,
-            None => compile_func(f, &view, fuse)?,
-        });
-    }
-    let table_mask = funcs.len().next_power_of_two().max(1) - 1;
-    Some(Compiled {
+    let lowers = |inst: &Inst| match inst {
+        Inst::CapCall(c) => lower_cap_call(c, 0, &view, &|v: u32| v).is_some(),
+        _ => true,
+    };
+    funcs
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+        .all(lowers)
+}
+
+/// The program of an admitted module of `ir` ([`admits_funcs`]). Nothing compiles yet: each
+/// function does when it is first needed ([`Compiled::prog`]).
+fn compiled(
+    ir: Ir,
+    fuse: bool,
+    shadow: Option<super::ShadowArena>,
+    memo: Option<std::sync::Arc<std::sync::Mutex<FuncMemo>>>,
+) -> Compiled {
+    let funcs = ir.funcs();
+    let n = funcs.len();
+    let arities = funcs.iter().map(|f| f.results.len()).collect();
+    let result_types = funcs.iter().map(|f| f.results.clone()).collect();
+    let sigs = funcs
+        .iter()
+        .map(|f| (f.params.clone(), f.results.clone()))
+        .collect();
+    Compiled {
         shadow,
-        progs,
-        result_types: funcs.iter().map(|f| f.results.clone()).collect(),
-        sigs: funcs
-            .iter()
-            .map(|f| (f.params.clone(), f.results.clone()))
-            .collect(),
-        table_mask,
+        progs: (0..n).map(|_| std::sync::OnceLock::new()).collect(),
+        lazy: Lazy {
+            ir,
+            arities,
+            fuse,
+            memo,
+        },
+        result_types,
+        sigs,
+        table_mask: n.next_power_of_two().max(1) - 1,
         debug: None,
         serves_children: false,
         digest: std::sync::OnceLock::new(),
         census: std::sync::OnceLock::new(),
-    })
+    }
 }
 
 /// The module a function compiles against — its functions' result arities and its type section — as
@@ -3014,142 +3160,7 @@ fn compile_inst(
         // need seams a later slice drives, so reject those (fall back to the tree-walker). These are
         // exactly the `type_id`/`op` combinations `run_inner` matches in dedicated arms ahead of its
         // generic `CapCall` arm.
-        Inst::CapCall(c) => {
-            let temen_ir::CapCall {
-                type_id,
-                op,
-                sig,
-                handle,
-                args,
-            } = &**c;
-            use super::cap_id;
-            match (*type_id, *op) {
-                // The ops below are served here, each delivering at `dst` the results its op's
-                // contract names (`temen_ir::served_contract`). A call declaring another shape, or an
-                // Instantiator op that isn't live, traps `CapFault`, as on every engine (#2066,
-                // #2361). Past this arm every served call has its op's arg prefix and results.
-                _ if !temen_ir::served_shape_ok(*type_id, *op, view.sig(*sig)) => Op::CapFault,
-                (cap_id::INSTANTIATOR, 1) => Op::InstJoin {
-                    handle: g(*handle),
-                    child: g(args[0]),
-                    dst,
-                },
-                // CONSOLIDATION.md §3d — instantiate_rec (op 17): the record pointer is the one
-                // arg; every other spawn parameter is data in the record, read at exec time.
-                (cap_id::INSTANTIATOR, 17) => Op::InstantiateRec {
-                    handle: g(*handle),
-                    rec: g(args[0]),
-                    dst,
-                },
-                (cap_id::INSTANTIATOR, op @ (9 | 10 | 12)) => Op::ChildCtl {
-                    handle: g(*handle),
-                    child: g(args[0]),
-                    dst,
-                    ctl: match op {
-                        9 => ChildCtl::Poll,
-                        10 => ChildCtl::Detach,
-                        _ => ChildCtl::Kill,
-                    },
-                },
-                // §3.6 (I36 slice 2) — child_offer (op 14): mint a live-callee offer over a running
-                // child's export; #2220 — grant (op 19): grant a capability into it. Both need the
-                // child's live env, so the op surfaces to the driver; the compile only marshals
-                // `(child, arg)`.
-                (cap_id::INSTANTIATOR, op @ (14 | 19)) => Op::ChildOffer {
-                    handle: g(*handle),
-                    child: g(args[0]),
-                    arg: g(args[1]),
-                    dst,
-                    grant: op == 19,
-                },
-                // §22 guest-driven JIT units: install/uninstall drive the dispatch table; compile /
-                // compile_linked (ops 0/5) are pure host ops, so they fall through to the generic
-                // dispatch below. `invoke` (op 1) is the next slice — reject it for now (fall back).
-                (cap_id::JIT, 3) => Op::JitInstall {
-                    handle: g(*handle),
-                    code: g(args[0]),
-                    dst,
-                },
-                (cap_id::JIT, 4) => Op::JitUninstall {
-                    handle: g(*handle),
-                    slot: g(args[0]),
-                    dst,
-                },
-                (cap_id::JIT, 1) if !args.is_empty() => Op::JitInvoke {
-                    handle: g(*handle),
-                    code: g(args[0]),
-                    args: args[1..].iter().map(|a| g(*a)).collect(),
-                    dst,
-                    // The call.cap sig is `(i64 code, params…) -> (results…)`; the unit entry's
-                    // params are view.sig(*sig).params without the leading code-handle.
-                    params: view
-                        .sig(*sig)
-                        .params
-                        .get(1..)
-                        .unwrap_or(&[])
-                        .to_vec()
-                        .into(),
-                    results: view.sig(*sig).results.clone().into(),
-                },
-                // A live op this lowering has no arm for declines to the oracle.
-                (cap_id::INSTANTIATOR, _) => return None,
-                (cap_id::SHARED_REGION, 4) => return None,
-                // §3.6 service points (I36 slice 1): `svc.poll` compiles to the native
-                // serve-loop-core op — the module-level veto in [`compile_module`] guarantees its
-                // handlers cannot park mid-dispatch, so the rewind linkage runs each one to
-                // completion (or trap). `svc.wait`'s empty-queue park needs a waker topology
-                // (cross-domain callers, timers) the cooperative scheduler doesn't host yet, so it
-                // declines, falling the whole module back to the tree-walk oracle, which serves.
-                // (The timed `svc.wait` form — op 10 with the optional timeout arg — is
-                // oracle-only and declines below; `serve_qualifies` already vetoed the module.)
-                (temen_ir::CAP_SELF_TYPE_ID, op @ (9 | 10)) if args.is_empty() => Op::SvcPoll {
-                    dst,
-                    wait: op == 10,
-                },
-                (temen_ir::CAP_SELF_TYPE_ID, 9 | 10) => return None,
-                // FORK.md §9.2 — `clone_caller` (op 11) / `reap` (op 12): compiled to the native fork
-                // ops (the module reached here only via the [`Seams::bytecode_serves_fork`] escape).
-                // The reply/pid args are register operands, resolved in the driver.
-                (temen_ir::CAP_SELF_TYPE_ID, 11) => Op::CloneCaller {
-                    args: args.iter().map(|a| g(*a)).collect(),
-                    dst,
-                },
-                (temen_ir::CAP_SELF_TYPE_ID, 12) => Op::Reap {
-                    pid: args.first().map(|a| g(*a)),
-                    dst,
-                },
-                // CALLS.md §10.6 — `fuel.remaining` (op 13) reads the vCPU's live fuel counter, which
-                // the host-side `cap_dispatch_slots` can't see; rather than add a native bytecode op,
-                // decline the module so it falls back to the tree-walker, which services op 13
-                // directly. (The JIT does lower it inline — it owns the fuel cell's address.)
-                (temen_ir::CAP_SELF_TYPE_ID, 13) => return None,
-                // FORK.md §8.6 — `exec_module` (`execve` image-replace, op 14, #1080): the cooperative
-                // driver owns the task/env set + `dom.source`, so the op resolves its five register
-                // operands `(module, grants_ptr, grants_n, entry, size_log2)` here and surfaces the
-                // image-replace to the driver ([`Outcome::Exec`]). The `dst` result slot receives the
-                // `-EINVAL` of a refused exec (a successful exec never returns to this activation).
-                // (The tree-walker folds this to `Step::Exec`; this tier does the replace natively so
-                // an exec-bearing module — bash — runs on the browser's bytecode engine.)
-                (temen_ir::CAP_SELF_TYPE_ID, 14) => Op::ExecModule {
-                    module: g(args[0]),
-                    grants_ptr: g(args[1]),
-                    grants_n: g(args[2]),
-                    entry: g(args[3]),
-                    size_log2: g(args[4]),
-                    dst,
-                },
-                // Generic synchronous powerbox dispatch (Stream/Clock/Memory/host-fn/JIT compile/…).
-                _ => Op::CapCall {
-                    type_id: *type_id,
-                    op: *op,
-                    handle: g(*handle),
-                    params: view.sig(*sig).params.clone().into(),
-                    args: args.iter().map(|a| g(*a)).collect(),
-                    dst,
-                    results: view.sig(*sig).results.clone().into(),
-                },
-            }
-        }
+        Inst::CapCall(c) => lower_cap_call(c, dst, view, g)?,
         // §7/§6 reflection `self.count`/`get`/`resolve`/`label`/`attest` reach here as their
         // `call.cap CAP_SELF op 0/1/2/3/4` form and compile via the generic `Op::CapCall` fallthrough
         // in the `Inst::CapCall` arm above.
@@ -3342,8 +3353,160 @@ fn compile_inst(
     })
 }
 
-/// Compile `m`'s function `func` and run it on the bytecode engine, or `None` if it (or any
-/// function it can reach by direct call) uses an op outside this slice's subset. Builds a fresh
+/// Synchronous capability call: the generic powerbox path (guest suspended, host computes,
+/// same activation continues) is driven here via `host.cap_dispatch_slots`. The
+/// executor/fiber capability variants — `Instantiator` (child vCPUs), `Yielder` (co-fiber
+/// yield), `JIT` (install/uninstall/invoke), and `SharedRegion` op 4 (`grant` into a child) —
+/// need seams a later slice drives, so reject those (fall back to the tree-walker). These are
+/// exactly the `type_id`/`op` combinations `run_inner` matches in dedicated arms ahead of its
+/// generic `CapCall` arm.
+///
+/// The only lowering that declines: a module whose cap calls do not all lower here falls back to
+/// the tree-walk oracle whole, decided before any of it runs ([`admits_cap_calls`], #2764).
+fn lower_cap_call(
+    c: &temen_ir::CapCall,
+    dst: u32,
+    view: &ModuleView<'_>,
+    g: &impl Fn(u32) -> u32,
+) -> Option<Op> {
+    let temen_ir::CapCall {
+        type_id,
+        op,
+        sig,
+        handle,
+        args,
+    } = c;
+    use super::cap_id;
+    Some(match (*type_id, *op) {
+        // The ops below are served here, each delivering at `dst` the results its op's
+        // contract names (`temen_ir::served_contract`). A call declaring another shape, or an
+        // Instantiator op that isn't live, traps `CapFault`, as on every engine (#2066,
+        // #2361). Past this arm every served call has its op's arg prefix and results.
+        _ if !temen_ir::served_shape_ok(*type_id, *op, view.sig(*sig)) => Op::CapFault,
+        (cap_id::INSTANTIATOR, 1) => Op::InstJoin {
+            handle: g(*handle),
+            child: g(args[0]),
+            dst,
+        },
+        // CONSOLIDATION.md §3d — instantiate_rec (op 17): the record pointer is the one
+        // arg; every other spawn parameter is data in the record, read at exec time.
+        (cap_id::INSTANTIATOR, 17) => Op::InstantiateRec {
+            handle: g(*handle),
+            rec: g(args[0]),
+            dst,
+        },
+        (cap_id::INSTANTIATOR, op @ (9 | 10 | 12)) => Op::ChildCtl {
+            handle: g(*handle),
+            child: g(args[0]),
+            dst,
+            ctl: match op {
+                9 => ChildCtl::Poll,
+                10 => ChildCtl::Detach,
+                _ => ChildCtl::Kill,
+            },
+        },
+        // §3.6 (I36 slice 2) — child_offer (op 14): mint a live-callee offer over a running
+        // child's export; #2220 — grant (op 19): grant a capability into it. Both need the
+        // child's live env, so the op surfaces to the driver; the compile only marshals
+        // `(child, arg)`.
+        (cap_id::INSTANTIATOR, op @ (14 | 19)) => Op::ChildOffer {
+            handle: g(*handle),
+            child: g(args[0]),
+            arg: g(args[1]),
+            dst,
+            grant: op == 19,
+        },
+        // §22 guest-driven JIT units: install/uninstall drive the dispatch table; compile /
+        // compile_linked (ops 0/5) are pure host ops, so they fall through to the generic
+        // dispatch below. `invoke` (op 1) is the next slice — reject it for now (fall back).
+        (cap_id::JIT, 3) => Op::JitInstall {
+            handle: g(*handle),
+            code: g(args[0]),
+            dst,
+        },
+        (cap_id::JIT, 4) => Op::JitUninstall {
+            handle: g(*handle),
+            slot: g(args[0]),
+            dst,
+        },
+        (cap_id::JIT, 1) if !args.is_empty() => Op::JitInvoke {
+            handle: g(*handle),
+            code: g(args[0]),
+            args: args[1..].iter().map(|a| g(*a)).collect(),
+            dst,
+            // The call.cap sig is `(i64 code, params…) -> (results…)`; the unit entry's
+            // params are view.sig(*sig).params without the leading code-handle.
+            params: view
+                .sig(*sig)
+                .params
+                .get(1..)
+                .unwrap_or(&[])
+                .to_vec()
+                .into(),
+            results: view.sig(*sig).results.clone().into(),
+        },
+        // A live op this lowering has no arm for declines to the oracle.
+        (cap_id::INSTANTIATOR, _) => return None,
+        (cap_id::SHARED_REGION, 4) => return None,
+        // §3.6 service points (I36 slice 1): `svc.poll` compiles to the native
+        // serve-loop-core op — the module-level veto in [`compile_module`] guarantees its
+        // handlers cannot park mid-dispatch, so the rewind linkage runs each one to
+        // completion (or trap). `svc.wait`'s empty-queue park needs a waker topology
+        // (cross-domain callers, timers) the cooperative scheduler doesn't host yet, so it
+        // declines, falling the whole module back to the tree-walk oracle, which serves.
+        // (The timed `svc.wait` form — op 10 with the optional timeout arg — is
+        // oracle-only and declines below; `serve_qualifies` already vetoed the module.)
+        (temen_ir::CAP_SELF_TYPE_ID, op @ (9 | 10)) if args.is_empty() => Op::SvcPoll {
+            dst,
+            wait: op == 10,
+        },
+        (temen_ir::CAP_SELF_TYPE_ID, 9 | 10) => return None,
+        // FORK.md §9.2 — `clone_caller` (op 11) / `reap` (op 12): compiled to the native fork
+        // ops (the module reached here only via the [`Seams::bytecode_serves_fork`] escape).
+        // The reply/pid args are register operands, resolved in the driver.
+        (temen_ir::CAP_SELF_TYPE_ID, 11) => Op::CloneCaller {
+            args: args.iter().map(|a| g(*a)).collect(),
+            dst,
+        },
+        (temen_ir::CAP_SELF_TYPE_ID, 12) => Op::Reap {
+            pid: args.first().map(|a| g(*a)),
+            dst,
+        },
+        // CALLS.md §10.6 — `fuel.remaining` (op 13) reads the vCPU's live fuel counter, which
+        // the host-side `cap_dispatch_slots` can't see; rather than add a native bytecode op,
+        // decline the module so it falls back to the tree-walker, which services op 13
+        // directly. (The JIT does lower it inline — it owns the fuel cell's address.)
+        (temen_ir::CAP_SELF_TYPE_ID, 13) => return None,
+        // FORK.md §8.6 — `exec_module` (`execve` image-replace, op 14, #1080): the cooperative
+        // driver owns the task/env set + `dom.source`, so the op resolves its five register
+        // operands `(module, grants_ptr, grants_n, entry, size_log2)` here and surfaces the
+        // image-replace to the driver ([`Outcome::Exec`]). The `dst` result slot receives the
+        // `-EINVAL` of a refused exec (a successful exec never returns to this activation).
+        // (The tree-walker folds this to `Step::Exec`; this tier does the replace natively so
+        // an exec-bearing module — bash — runs on the browser's bytecode engine.)
+        (temen_ir::CAP_SELF_TYPE_ID, 14) => Op::ExecModule {
+            module: g(args[0]),
+            grants_ptr: g(args[1]),
+            grants_n: g(args[2]),
+            entry: g(args[3]),
+            size_log2: g(args[4]),
+            dst,
+        },
+        // Generic synchronous powerbox dispatch (Stream/Clock/Memory/host-fn/JIT compile/…).
+        _ => Op::CapCall {
+            type_id: *type_id,
+            op: *op,
+            handle: g(*handle),
+            params: view.sig(*sig).params.clone().into(),
+            args: args.iter().map(|a| g(*a)).collect(),
+            dst,
+            results: view.sig(*sig).results.clone().into(),
+        },
+    })
+}
+
+/// Compile `m`'s function `func` and run it on the bytecode engine, or `None` if any function of `m`
+/// uses an op outside this slice's subset. Builds a fresh
 /// linear-memory window from `m`'s memory declaration + data segments, exactly like
 /// [`crate::run`]. Returns typed result `Value`s. The equality harness compares this to `run`.
 pub fn compile_and_run(
@@ -3385,7 +3548,7 @@ pub fn compile_and_run_seeded_with_host(
     init_mem: &[u8],
     host: &mut Host,
 ) -> Option<Result<Vec<Value>, Trap>> {
-    let c = compile_module_for(m, true)?;
+    let c = compile_module_for(m, host.self_module(), true)?;
     if func as usize >= c.progs.len() {
         return Some(Err(Trap::Malformed));
     }
@@ -3439,7 +3602,7 @@ pub fn compile_and_run_with_host_traced(
     fuel: &mut u64,
     host: &mut Host,
 ) -> Option<TracedRun> {
-    let c = compile_module_for(m, false)?;
+    let c = compile_module_for(m, host.self_module(), false)?;
     if func as usize >= c.progs.len() {
         return Some((Err(Trap::Malformed), Vec::new(), None));
     }
@@ -3504,7 +3667,7 @@ fn vm_trap_bt(vm: &Vm, source: &ModuleSource, trap: &Trap) -> Vec<super::IrPc> {
     let Some(c) = source.get(vm.module) else {
         return bt;
     };
-    if let Some((block, inst)) = c.progs[vm.cur].src.get(vm.pc).copied().flatten() {
+    if let Some((block, inst)) = c.prog(vm.cur).src.get(vm.pc).copied().flatten() {
         // An instruction's recorded `inst` advances past the op exactly when the tree-walker's did
         // (it does `inst += 1` before evaluating, so every trap but `OutOfFuel` lands one past); a
         // terminator (`unreachable`, `return_call.dyn`) is already stored as `insts.len()`, the
@@ -3529,7 +3692,7 @@ fn vm_trap_bt(vm: &Vm, source: &ModuleSource, trap: &Trap) -> Vec<super::IrPc> {
         let Some(cm) = source.get(module) else {
             continue;
         };
-        if let Some((block, inst)) = cm.progs[prog].src.get(call_pc).copied().flatten() {
+        if let Some((block, inst)) = cm.prog(prog).src.get(call_pc).copied().flatten() {
             bt.push(super::IrPc {
                 module: module as u32,
                 func: prog as FuncIdx,
@@ -3555,7 +3718,7 @@ pub fn compile_and_run_capture(
     fuel: &mut u64,
     init_mem: &[u8],
 ) -> Option<Capture> {
-    let c = compile_module_for(m, true)?;
+    let c = compile_module_for(m, None, true)?;
     if func as usize >= c.progs.len() {
         return Some((Err(Trap::Malformed), Vec::new()));
     }
@@ -3588,7 +3751,7 @@ pub fn compile_and_run_capture_over(
     init_mem: &[u8],
     back: std::sync::Arc<super::Region>,
 ) -> Option<Capture> {
-    let c = compile_module_for(m, true)?;
+    let c = compile_module_for(m, None, true)?;
     if func as usize >= c.progs.len() {
         return Some((Err(Trap::Malformed), Vec::new()));
     }
@@ -3629,7 +3792,7 @@ pub fn compile_and_run_over_shared_with_host(
     host: &mut Host,
     seed_data: bool,
 ) -> Option<Result<Vec<Value>, Trap>> {
-    let c = compile_module_for(m, true)?;
+    let c = compile_module_for(m, host.self_module(), true)?;
     if func as usize >= c.progs.len() {
         return Some(Err(Trap::Malformed));
     }
@@ -3671,7 +3834,7 @@ pub struct SharedProgram {
 impl SharedProgram {
     /// Compile `m` once (`None` if it uses an op outside the engine's subset).
     pub fn compile(m: &Module) -> Option<SharedProgram> {
-        let c = compile_module_for(m, true)?;
+        let c = compile_module_for(m, None, true)?;
         let n_funcs = c.progs.len();
         Some(SharedProgram {
             source: std::sync::Arc::new(ModuleSource::new(c)),
@@ -3977,7 +4140,7 @@ fn parallel_domain(
     if host.is_durable() {
         return None;
     }
-    let c = compile_module_for(m, true)?;
+    let c = compile_module_for(m, host.self_module(), true)?;
     if entry as usize >= c.progs.len() {
         return Some(Err(Trap::Malformed));
     }
@@ -4029,7 +4192,7 @@ impl Reactor {
     }
 
     fn open_on(m: &Module, back: Option<std::sync::Arc<super::Region>>) -> Option<Reactor> {
-        let c = compile_module_for(m, true)?;
+        let c = compile_module_for(m, None, true)?;
         Some(Reactor {
             program: std::sync::Arc::new(c),
             mem: Mem::root(m, default_reserved_log2(), back, &[]),
@@ -4178,7 +4341,7 @@ pub fn compile_and_run_capture_reserved_with_host(
     // driver flattens idle parked fibers into their regions, and thaw seeding re-creates them from the
     // artifact residue. So a single-vCPU `cont.*` module is driven here in any window state (NORMAL /
     // UNWINDING freeze / REWINDING thaw); only multi-vCPU `thread.*` (above) still falls back.
-    let c = std::sync::Arc::new(compile_module_for(m, true)?);
+    let c = std::sync::Arc::new(compile_module_for(m, host.self_module(), true)?);
     run_capture_reserved_over_compiled_with_host(
         m,
         c,
@@ -4206,16 +4369,17 @@ fn outside_reserved_subset(m: &Module) -> bool {
 /// as `None` after the fact (it then falls back to the tree-walker). A routing probe, as
 /// [`serve_qualifies`] is the JIT's.
 pub fn admits(m: &Module) -> bool {
-    compile_module_for(m, true).is_some()
+    admits_for(m, true)
 }
 
 /// #1144 — **compile the reserved-window program without running it**, so a caller (the browser bash
 /// entry) can **cache the `Arc<Compiled>` across Runs** and skip the ~200 ms per-Run recompile of a
 /// large module. `None` if the module is outside the bytecode subset (same gate as
 /// [`compile_and_run_capture_reserved_with_host`]'s compile). Pair with
-/// [`run_capture_reserved_over_compiled_with_host`], which takes the cached program.
-pub fn compile_reserved(m: &Module) -> Option<std::sync::Arc<Compiled>> {
-    compile_module_for(m, true).map(std::sync::Arc::new)
+/// [`run_capture_reserved_over_compiled_with_host`], which takes the cached program. The program
+/// shares `m` for the functions it has still to compile (#2764), as long as the cache keeps it.
+pub fn compile_reserved(m: &std::sync::Arc<Module>) -> Option<std::sync::Arc<Compiled>> {
+    compile_module_for(m, Some(std::sync::Arc::clone(m)), true).map(std::sync::Arc::new)
 }
 
 /// #1144 — the run half of [`compile_and_run_capture_reserved_with_host`], over an **already-compiled**
@@ -5463,9 +5627,8 @@ impl<'a> FrameReader<'a> {
         let n = self.vm.stack.len();
         let &(module, f, base, resume_pc, ..) = self.vm.stack.get(n.checked_sub(depth)?)?;
         let cm = self.source.get(module)?;
-        let (block, inst) = cm
-            .progs
-            .get(f)?
+        let (block, inst) = (f < cm.progs.len())
+            .then(|| cm.prog(f))?
             .src
             .get(resume_pc.checked_sub(1)?)
             .copied()
@@ -7019,8 +7182,10 @@ impl ScheduledDebugRun {
             return None;
         }
         let root_md = std::sync::Arc::new(ModuleDebug::build(m));
-        // Unfused: debug stepping (Slice 5a).
-        let mut c = compile_module_unfused(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow))?;
+        // Unfused: debug stepping (Slice 5a). The session and its program share the functions.
+        let funcs: std::sync::Arc<[Func]> = std::sync::Arc::from(m.funcs.clone());
+        let ir = Ir::Unit(std::sync::Arc::clone(&funcs), m.types.clone().into());
+        let mut c = compile_module_with(ir, false, m.memory.and_then(|x| x.shadow), false, None)?;
         c.debug = Some(std::sync::Arc::clone(&root_md));
         let table = SharedSlots::new(c.progs.len(), host.jit_table_log2(), 0);
         let mut source = ModuleSource::over(std::sync::Arc::new(c));
@@ -7050,7 +7215,7 @@ impl ScheduledDebugRun {
             tasks: vec![TaskSlot::new(vt, 0, LiveVcpu::none())],
             domains: vec![root],
             root_md,
-            funcs: std::sync::Arc::from(m.funcs.clone()),
+            funcs,
             breakpoints: Vec::new(),
             line_bps: LineBreakpoints::default(),
             watchpoints: Vec::new(),
@@ -8467,7 +8632,7 @@ pub fn compile_and_run_sliced(
     fuel: &mut u64,
     slice: u64,
 ) -> Option<Result<Vec<Value>, Trap>> {
-    let c = compile_module_for(m, true)?;
+    let c = compile_module_for(m, None, true)?;
     if func as usize >= c.progs.len() {
         return Some(Err(Trap::Malformed));
     }
@@ -10487,7 +10652,7 @@ fn scan_vm_roots(vm: &Vm, source: &ModuleSource, consider: &mut impl FnMut(u64))
         let Some(c) = source.get(module) else {
             continue;
         };
-        let n = c.progs[prog].nslots as usize;
+        let n = c.prog(prog).nslots as usize;
         let end = (base + n).min(vm.regs.len());
         for r in &vm.regs[base..end] {
             consider(r.lo);
@@ -15049,7 +15214,7 @@ impl CoopRun {
         init_mem: &[u8],
         reserved_log2: u8,
     ) -> Option<Result<CoopRun, Trap>> {
-        let compiled = compile_reserved(m)?;
+        let compiled = std::sync::Arc::new(compile_module_for(m, host.self_module(), true)?);
         Some(Self::new_reserved_over_compiled(
             m,
             compiled,
@@ -15101,7 +15266,7 @@ impl CoopRun {
         tierup: Option<TierUpConfig>,
         mem: Option<Mem>,
     ) -> Option<Result<CoopRun, Trap>> {
-        let c = compile_module_for(m, true)?;
+        let c = compile_module_for(m, host.self_module(), true)?;
         if entry as usize >= c.progs.len() {
             return Some(Err(Trap::Malformed));
         }
@@ -18147,7 +18312,7 @@ impl Serving {
     /// Where the handler's return lays its results, for a serve frame of program `serve`'s at `base`
     /// in `c`.
     fn results_at(&self, c: &Compiled, base: usize, serve: usize) -> usize {
-        base + c.progs[serve].nslots as usize + c.progs[self.func].nslots as usize
+        base + c.prog(serve).nslots as usize + c.prog(self.func).nslots as usize
     }
 }
 
@@ -18425,7 +18590,10 @@ impl Vm {
     /// charged to `payer`, the node of the vCPU's domain, as it grows; `None` charges nothing (a
     /// trace or a test run no budget governs).
     fn new(c: &Compiled, entry: usize, args: &[Value], payer: Option<NodeRef>) -> Result<Vm, Trap> {
-        let prog = c.progs.get(entry).ok_or(Trap::Malformed)?;
+        if entry >= c.progs.len() {
+            return Err(Trap::Malformed);
+        }
+        let prog = c.prog(entry);
         let (mut regs, mut room) = (Vec::new(), RegsRoom::new(payer));
         room.grow(&mut regs, prog.nslots as usize)?;
         for (i, a) in args.iter().enumerate() {
@@ -18468,7 +18636,7 @@ impl Vm {
     /// instruction-location sequence the tree-walker's `Inspector` reports.
     fn cur_ir_pc(&self, source: &ModuleSource) -> Option<super::IrPc> {
         let cm = source.get(self.module)?;
-        let (block, inst) = cm.progs[self.cur].src.get(self.pc).copied().flatten()?;
+        let (block, inst) = cm.prog(self.cur).src.get(self.pc).copied().flatten()?;
         // A terminator is a stop position too (#1713), at `inst == insts.len()` — see `Program::src`.
         Some(super::IrPc {
             module: self.module as u32,
@@ -18608,6 +18776,14 @@ impl Vm {
             }};
         }
         let mut c: std::sync::Arc<Compiled> = resolve!(module);
+        // The current function's ops, which every op reads (`ops[pc]`). Set again wherever the
+        // current function changes (`enter!`), so the per-op read is one index and checks nothing.
+        let mut ops: &[Op] = &c.prog(cur).ops;
+        macro_rules! enter {
+            () => {
+                ops = &c.prog(cur).ops
+            };
+        }
 
         // #1146 async signal delivery (the bytecode twin of the tree-walker's #796 L2 safepoint
         // redirect). Fetch the personality's `(armed, source)` poll pair once per resume — two cheap
@@ -18771,8 +18947,8 @@ impl Vm {
                                     // Open a fresh window past the current activation (like `Op::Call`),
                                     // seeded with `(sp, signum)`. `nb`/`need` use the *current* `c`
                                     // before any cross-module reassignment below.
-                                    let nb = base + c.progs[cur].nslots as usize;
-                                    let need = nb + tm.progs[tfunc].nslots as usize;
+                                    let nb = base + c.prog(cur).nslots as usize;
+                                    let need = nb + tm.prog(tfunc).nslots as usize;
                                     self.open_frame(need)?;
                                     self.regs[nb] = Reg::from_i64(sp as i64);
                                     self.regs[nb + 1] = Reg::from_i32(signum);
@@ -18786,6 +18962,7 @@ impl Vm {
                                         c = tm;
                                     }
                                     cur = tfunc;
+                                    enter!();
                                     base = nb;
                                     pc = 0;
                                     self.sig_handler_stack.push(self.stack.len());
@@ -18798,11 +18975,15 @@ impl Vm {
             }
             #[cfg(feature = "callprof")]
             if module == 0 {
-                if let Some(loc) = c.progs[cur].src.get(pc).copied().flatten() {
+                if let Some(loc) = c.prog(cur).src.get(pc).copied().flatten() {
                     callprof::op(cur, loc);
                 }
             }
-            match &c.progs[cur].ops[pc] {
+            debug_assert!(
+                std::ptr::eq(ops, &c.prog(cur).ops[..]),
+                "the ops a run reads are its current function's"
+            );
+            match &ops[pc] {
                 Op::Const { dst, val } => {
                     r!(*dst) = *val;
                     pc += 1;
@@ -19127,7 +19308,7 @@ impl Vm {
                     // would trap regardless. A copied-but-live checkpoint sits at a still-live
                     // activation (`depth <= stack.len()`) and is retained.
                     let live = self.stack.len();
-                    let window = self.regs[base..base + c.progs[cur].nslots as usize].into();
+                    let window = self.regs[base..base + c.prog(cur).nslots as usize].into();
                     let points = &mut self.rare().setjmp_points;
                     points.retain(|_, p| p.depth <= live);
                     points.insert(
@@ -19192,6 +19373,7 @@ impl Vm {
                     base = point.base;
                     pc = point.pc;
                     c = resolve!(module);
+                    enter!();
                     self.regs[base..base + point.window.len()].copy_from_slice(&point.window);
                     self.regs[base + point.dst as usize] = Reg::from_i32(resume);
                 }
@@ -19204,8 +19386,8 @@ impl Vm {
                     }
                     tier_up!(module, callee, c.result_types[callee], args, dst);
                     // A direct call stays in the current module.
-                    let nb = base + c.progs[cur].nslots as usize;
-                    let need = nb + c.progs[callee].nslots as usize;
+                    let nb = base + c.prog(cur).nslots as usize;
+                    let need = nb + c.prog(callee).nslots as usize;
                     self.open_frame(need)?;
                     for (i, a) in args.iter().enumerate() {
                         self.regs[nb + i] = self.regs[base + *a as usize];
@@ -19220,6 +19402,7 @@ impl Vm {
                     ));
                     self.entered = self.work;
                     cur = callee;
+                    enter!();
                     base = nb;
                     pc = 0;
                 }
@@ -19248,8 +19431,8 @@ impl Vm {
                     }
                     // #2474 — a call through the table tiers up as a direct one does.
                     tier_up!(tmod, tfunc, tm.result_types[tfunc], args, dst);
-                    let nb = base + c.progs[cur].nslots as usize;
-                    let need = nb + tm.progs[tfunc].nslots as usize;
+                    let nb = base + c.prog(cur).nslots as usize;
+                    let need = nb + tm.prog(tfunc).nslots as usize;
                     self.open_frame(need)?;
                     for (i, a) in args.iter().enumerate() {
                         self.regs[nb + i] = self.regs[base + *a as usize];
@@ -19268,6 +19451,7 @@ impl Vm {
                         c = tm;
                     }
                     cur = tfunc;
+                    enter!();
                     base = nb;
                     pc = 0;
                 }
@@ -19305,6 +19489,7 @@ impl Vm {
                                 c = resolve!(cmod);
                             }
                             cur = cprog;
+                            enter!();
                             base = cbase;
                             pc = cpc;
                         }
@@ -19322,7 +19507,7 @@ impl Vm {
                     }
                     self.count_call(module, cur);
                     self.entered = self.work;
-                    self.grow_regs(base + c.progs[callee].nslots as usize)?;
+                    self.grow_regs(base + c.prog(callee).nslots as usize)?;
                     self.scratch.clear();
                     for a in args.iter() {
                         self.scratch.push(self.regs[base + *a as usize]);
@@ -19331,6 +19516,7 @@ impl Vm {
                         self.regs[base + i] = v;
                     }
                     cur = callee;
+                    enter!();
                     pc = 0;
                 }
                 Op::TailCallIndirect {
@@ -19353,7 +19539,7 @@ impl Vm {
                     }
                     self.count_call(module, cur);
                     self.entered = self.work;
-                    self.grow_regs(base + tm.progs[tfunc].nslots as usize)?;
+                    self.grow_regs(base + tm.prog(tfunc).nslots as usize)?;
                     self.scratch.clear();
                     for a in args.iter() {
                         self.scratch.push(self.regs[base + *a as usize]);
@@ -19366,6 +19552,7 @@ impl Vm {
                         c = tm;
                     }
                     cur = tfunc;
+                    enter!();
                     pc = 0;
                 }
                 Op::CapCall {
@@ -19837,7 +20024,7 @@ impl Vm {
                             });
                             continue;
                         }
-                        let nb = base + c.progs[cur].nslots as usize;
+                        let nb = base + c.prog(cur).nslots as usize;
                         let serving = Serving {
                             ticket: d.ticket,
                             depth: self.stack.len(),
@@ -19853,6 +20040,7 @@ impl Vm {
                         self.stack.push((module, cur, base, pc, at, self.entered));
                         self.entered = self.work;
                         cur = fidx;
+                        enter!();
                         base = nb;
                         pc = 0;
                         admitted = true;
@@ -20269,7 +20457,7 @@ impl Vm {
                     // semantics. `eval_inst` borrows the frame immutably and `mem` mutably
                     // (disjoint), so we read the result before writing it back. A `v128` access
                     // pages as the oracle's `eval_inst` fallback does (its `handle_mem`).
-                    let win_hi = base + c.progs[cur].nslots as usize;
+                    let win_hi = base + c.prog(cur).nslots as usize;
                     let r = paged!(super::eval_inst(inst, &self.regs[base..win_hi], mem));
                     if let Some(v) = r {
                         self.regs[base + *dst as usize] = v;
@@ -20339,28 +20527,34 @@ mod func_memo_tests {
         );
         let one = [caller.clone(), consts(1)];
         let two = [caller, consts(2)];
-        let mut memo = FuncMemo::default();
-        compile_module_memo(&one, &[], None, &mut memo).unwrap();
-        let again = compile_module_memo(&one, &[], None, &mut memo).unwrap();
+        let memo = std::sync::Arc::new(std::sync::Mutex::new(FuncMemo::default()));
+        // A function compiles when it is first read (#2764), so each test reads every program.
+        let compile = |funcs: &[Func]| {
+            let c = compile_module_memo(funcs, &[], None, &memo).unwrap();
+            c.compile_all();
+            c
+        };
+        compile(&one);
+        let again = compile(&one);
         assert_eq!(
-            memo.reused(),
+            memo.lock_unpoisoned().reused(),
             2,
             "the same module again reuses both functions"
         );
         assert_eq!(
-            again.progs[0].nslots,
+            again.prog(0).nslots,
             1 + 1,
             "its value's slot and the discard slot"
         );
-        let changed = compile_module_memo(&two, &[], None, &mut memo).unwrap();
+        let changed = compile(&two);
         assert_eq!(
-            memo.reused(),
+            memo.lock_unpoisoned().reused(),
             2,
             "neither function is reused across the change"
         );
         let fresh = compile_module(&two, &[], None).unwrap();
-        assert_eq!(changed.progs[0].nslots, fresh.progs[0].nslots);
-        assert_eq!(changed.progs[0].nslots, 2 + 1);
+        assert_eq!(changed.prog(0).nslots, fresh.prog(0).nslots);
+        assert_eq!(changed.prog(0).nslots, 2 + 1);
     }
 
     /// A `call.dyn` whose signature's parameters change keeps its result count, so only the logged
@@ -20386,11 +20580,113 @@ mod func_memo_tests {
             })]
         };
         let funcs = [call];
-        let mut memo = FuncMemo::default();
-        compile_module_memo(&funcs, &sig(Vec::new()), None, &mut memo).unwrap();
-        compile_module_memo(&funcs, &sig(Vec::new()), None, &mut memo).unwrap();
-        assert_eq!(memo.reused(), 1);
-        compile_module_memo(&funcs, &sig(vec![ValType::I64]), None, &mut memo).unwrap();
-        assert_eq!(memo.reused(), 1, "a changed signature is compiled afresh");
+        let memo = std::sync::Arc::new(std::sync::Mutex::new(FuncMemo::default()));
+        let compile = |types: &[TypeEntry]| {
+            compile_module_memo(&funcs, types, None, &memo)
+                .unwrap()
+                .compile_all()
+        };
+        compile(&sig(Vec::new()));
+        compile(&sig(Vec::new()));
+        assert_eq!(memo.lock_unpoisoned().reused(), 1);
+        compile(&sig(vec![ValType::I64]));
+        assert_eq!(
+            memo.lock_unpoisoned().reused(),
+            1,
+            "a changed signature is compiled afresh"
+        );
+    }
+}
+
+/// #2764 — a module's functions compile as a run first enters them, and a module the engine cannot
+/// run whole declines before any of it runs.
+#[cfg(test)]
+mod lazy_compile_tests {
+    use super::*;
+
+    /// Function 0 calls function 1; function 2 is called by nothing.
+    const CALLS_ONE: &str = "\
+func () -> (i32) {
+block 0 () {
+  v0 = call 1()
+  return v0
+  }
+}
+func () -> (i32) {
+block 0 () {
+  v0 = i32.const 7
+  return v0
+  }
+}
+func () -> (i32) {
+block 0 () {
+  v0 = i32.const 9
+  return v0
+  }
+}
+";
+
+    fn compiled(m: &Module) -> std::sync::Arc<Compiled> {
+        std::sync::Arc::new(compile_module(&m.funcs, &m.types, None).expect("admitted"))
+    }
+
+    fn compiled_count(c: &Compiled) -> usize {
+        c.progs.iter().filter(|p| p.get().is_some()).count()
+    }
+
+    #[test]
+    fn a_run_compiles_only_the_functions_it_enters() {
+        let m = temen_text::parse_module(CALLS_ONE).expect("parse");
+        let c = compiled(&m);
+        assert_eq!(
+            compiled_count(&c),
+            0,
+            "admitting a module compiles none of it"
+        );
+        let source = ModuleSource::shared(std::sync::Arc::clone(&c));
+        let table = source.root_table(0);
+        let (mut host, mut fuel) = (Host::new(), u64::MAX);
+        let mut mem = Mem::root(&m, default_reserved_log2(), None, &[]);
+        let r = run(source, table, 0, &[], &mut fuel, &mut mem, &mut host);
+        assert_eq!(r, Ok(vec![Value::I32(7)]));
+        assert!(c.progs[0].get().is_some() && c.progs[1].get().is_some());
+        assert!(c.progs[2].get().is_none(), "nothing enters function 2");
+    }
+
+    /// `fuel.remaining` (`call.cap` on the self namespace, op 13) is a cap call the engine declines,
+    /// so a module holding one runs on the tree-walk oracle whole, even where no run would reach it:
+    /// a run never meets a function it cannot compile.
+    #[test]
+    fn a_module_declines_whole_for_a_cap_call_no_run_reaches() {
+        let src = format!(
+            "{CALLS_ONE}func () -> (i64) {{
+block 0 () {{
+  vz = i32.const 0
+  vr = call.cap 4294967295 13 () -> (i64) vz ()
+  return vr
+  }}
+}}
+"
+        );
+        let m = temen_text::parse_module(&src).expect("parse");
+        assert!(compile_module(&m.funcs, &m.types, None).is_none());
+        assert!(!admits(&m));
+    }
+
+    /// A program keeps the module its host runs as its own rather than a copy, and only that module.
+    #[test]
+    fn a_program_keeps_the_hosts_own_module_rather_than_a_copy() {
+        let m = std::sync::Arc::new(temen_text::parse_module(CALLS_ONE).expect("parse"));
+        let other = std::sync::Arc::new((*m).clone());
+        let keeps = |own: Option<std::sync::Arc<Module>>| match kept(&m, own) {
+            Ir::Module(k) => k,
+            Ir::Unit(..) => unreachable!("a module is kept as one"),
+        };
+        assert!(std::sync::Arc::ptr_eq(
+            &keeps(Some(std::sync::Arc::clone(&m))),
+            &m
+        ));
+        assert!(!std::sync::Arc::ptr_eq(&keeps(Some(other)), &m));
+        assert!(!std::sync::Arc::ptr_eq(&keeps(None), &m));
     }
 }

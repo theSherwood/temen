@@ -5805,7 +5805,7 @@ pub fn run_powerbox_with_host(
     // re-resolve named imports — preserving its behaviour for already-validated frontend output
     // (chibicc / temen-llvm), which emits inline `call.cap`s and a func-0 `_start` and runs JIT-only.
     let inst = Instance {
-        module: module.clone(),
+        module: Arc::new(module.clone()),
         binding: None,
         hooks: None,
     };
@@ -5892,7 +5892,7 @@ impl PowerboxProgram {
         }
         let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
         let inst = Instance {
-            module,
+            module: Arc::new(module),
             binding: None,
             hooks: None,
         };
@@ -7982,7 +7982,10 @@ struct NamedBinding {
 /// [`temen_interp::Host`] yourself and call [`temen_interp::run_with_host`] /
 /// [`temen_jit::compile_and_run_with_host`] directly. This wrapper is the default for the common case.
 pub struct Instance {
-    module: Module,
+    /// Shared with each run's host, which runs it as its own (`Host::set_self_module`), and kept by
+    /// the bytecode engine for the functions it has still to compile (#2764). A run copies it only
+    /// to resize its window.
+    module: Arc<Module>,
     // `Some` when built via `instantiate_with_imports` (name-bound capabilities); `None` for the fixed
     // powerbox preset (`instantiate`).
     binding: Option<NamedBinding>,
@@ -8100,7 +8103,7 @@ pub fn instantiate(module: Module) -> Result<Instance, String> {
     temen_verify::verify_module(&module)
         .map_err(|e| format!("verify failed (fail-closed): {e:?}"))?;
     Ok(Instance {
-        module,
+        module: Arc::new(module),
         binding: None,
         hooks: None,
     })
@@ -8200,7 +8203,7 @@ pub fn instantiate_with_imports(module: Module, imports: Imports) -> Result<Inst
     temen_verify::verify_module(&module)
         .map_err(|e| format!("verify failed (fail-closed): {e:?}"))?;
     Ok(Instance {
-        module,
+        module: Arc::new(module),
         binding: Some(NamedBinding { imports, order }),
         hooks: None,
     })
@@ -8273,7 +8276,7 @@ impl Instance {
         temen_verify::verify_module(&m)
             .map_err(|e| format!("mem-hook instrumented module failed re-verification: {e:?}"))?;
         Ok(Instance {
-            module: m,
+            module: Arc::new(m),
             binding: self.binding,
             hooks: Some(MemHooks {
                 make: Arc::new(make),
@@ -8655,7 +8658,7 @@ impl Instance {
     /// (run against `self.module` directly — no clone in the common case).
     fn window_override(&self, config: &RunConfig) -> Option<Module> {
         config.memory_size_log2.map(|size_log2| {
-            let mut m = self.module.clone();
+            let mut m = Module::clone(&self.module);
             m.memory = Some(temen_ir::Memory {
                 size_log2,
                 shadow: None,
@@ -8703,7 +8706,7 @@ impl Instance {
     fn grant_caps(&self, h: &mut Host, win: u64) {
         // §3.5: register the module's self-referential surface so `call.import.dyn`,
         // `self.type_id`/`covers`, and `export.handle` resolve host-side.
-        h.set_self_module(&Arc::new(self.module.clone()));
+        h.set_self_module(&self.module);
         // Hooks first: the instrumented module bakes the handle of a fresh host's first grant.
         self.grant_mem_hooks(h);
         match &self.binding {
@@ -9123,7 +9126,7 @@ impl Instance {
         }
         let module = self
             .window_override(config)
-            .unwrap_or_else(|| self.module.clone());
+            .unwrap_or_else(|| Module::clone(&self.module));
         let win = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
         let entry_sp = temen_ir::powerbox_entry_sp(&module);
 

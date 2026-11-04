@@ -1207,7 +1207,7 @@ block 0 () {
 /// read parks only on the blocking stdin.
 #[test]
 fn a_kept_programs_offers_ask_each_runs_host() {
-    let m = parse(ROOT_INLINE_READ);
+    let m = Arc::new(parse(ROOT_INLINE_READ));
     let program = bytecode::compile_reserved(&m).expect("in subset");
     let declared = m.memory.expect("a window").size_log2;
     let offer = |stdin_blocking: bool| {
