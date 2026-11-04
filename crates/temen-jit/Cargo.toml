@@ -30,6 +30,12 @@ temen-interp = { path = "../temen-interp" }
 # control-flow classification agree with iced-x86's. Pure Rust and **dev-only**, so it is never in
 # the product or the escape-TCB (the product decoder stays dependency-free and patchable in-tree).
 iced-x86 = "1.21.0"
+# #2603 hole 17 — that decoder's **completeness oracle**: the DSL Cranelift's x64 encoder is generated
+# from. A test synthesizes every form in it and checks the decoder rejects it or models it soundly
+# (against iced-x86), so a Cranelift upgrade that adds an encoding fails a test, not a user's compile.
+# Keep this version in lockstep with the `cranelift-*` crates below, so the oracle tests the DSL the
+# backend actually uses. Pure Rust and dev-only — never in the product or the escape-TCB.
+cranelift-assembler-x64-meta = "0.132.0"
 
 [dependencies]
 cranelift-codegen = "0.132.0"
