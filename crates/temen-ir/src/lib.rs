@@ -2680,19 +2680,19 @@ pub enum Inst {
     /// guest write op, so a guest cannot clobber it (unlike the guest-overwritable `vcpu.tls`). Result
     /// is `i64`.
     DurableShadowBase,
-    /// §12 fiber create (`cont.new`): allocate a new suspended fiber that will run the
-    /// function referenced by `func` on the data stack based at `sp`. `func` is an `i32`
-    /// funcref, resolved through the function table with signature `(i64 sp, i64 arg) ->
-    /// i64` at first resume (a bad ref traps there, like [`Inst::CallIndirect`]); `sp`
-    /// (`i64`) is the fiber's own data-stack base — a fiber owns a **stack pair** (§3d): its
-    /// in-window data stack (based here) plus the out-of-band control stack the runtime
-    /// allocates. Yields an `i64` **fiber handle**: a forgeable index into the runtime-owned
-    /// fiber table, masked + generation-checked at use like a capability handle (§3c), so a
-    /// forged handle is inert (it traps or selects one of this domain's own fibers, never
-    /// host state). The fiber does not run yet; the first resume calls `func(sp, arg)`.
+    /// §12 fiber create (`cont.new`): allocate a new suspended fiber, with the out-of-band control
+    /// stack the runtime owns, that will run the function referenced by `func`. `func` is an `i32`
+    /// funcref, resolved through the function table with the fixed entry signature
+    /// `(i64, i64) -> i64` at first resume (a bad ref traps there, like [`Inst::CallIndirect`]).
+    /// The first resume calls `func(arg0, arg)`: the creator binds `arg0` (`i64`) here, and the
+    /// resume delivers `arg`. The VM carries both words and never reads them. A frontend with a data
+    /// stack passes the fiber's base as `arg0` (§3d). Yields an `i64` **fiber handle**: a forgeable
+    /// index into the runtime-owned fiber table, masked + generation-checked at use like a
+    /// capability handle (§3c), so a forged handle is inert (it traps or selects one of this
+    /// domain's own fibers, never host state). The fiber does not run yet.
     ContNew {
         func: ValIdx,
-        sp: ValIdx,
+        arg0: ValIdx,
     },
     /// §12 fiber resume (`cont.resume` / `cont.resume.block`): switch to fiber `k` (an `i64`
     /// handle), delivering `arg` (`i64`) — the argument to the fiber's function on the first
@@ -2788,19 +2788,19 @@ pub enum Inst {
     },
     /// §12 thread spawn (`thread.spawn`): start a new vCPU — **one real OS thread** (1:1; the VM
     /// provides the thread + futex as *primitives*, not a scheduler — any M:N model is built by the
-    /// guest runtime over `thread.spawn` + `cont.*`, D22) — running `funcs[func]` on the data stack
-    /// based at `sp` (the §3d two-stack split — every vCPU owns its own in-window data stack, exactly
-    /// like a fiber) with `arg`, over the **same** guest memory (anonymous `Region` bytes and §13
-    /// aliases are shared; post-spawn mapping changes are thread-local for now). `func` must have the
-    /// fixed thread-entry type `(i64 sp, i64 arg) -> i64` (verifier-checked) — the same signature as a
-    /// fiber, so a frontend function works as-is.
+    /// guest runtime over `thread.spawn` + `cont.*`, D22) — running `funcs[func](arg0, arg1)` over the
+    /// **same** guest memory (anonymous `Region` bytes and §13 aliases are shared; post-spawn mapping
+    /// changes are thread-local for now). `func` must have the fixed entry type `(i64, i64) -> i64`
+    /// (verifier-checked), a fiber's, so one frontend function serves as either. The VM carries the
+    /// creator's two words and never reads them. A frontend with a data stack passes the thread's
+    /// base as `arg0` (§3d).
     /// Yields an `i32` **thread handle**: a forgeable index into the runtime-owned thread table,
     /// masked + generation-checked at [`Inst::ThreadJoin`] like a fiber/capability handle (§3c), so a
     /// forged handle is inert (it traps).
     ThreadSpawn {
         func: FuncIdx,
-        sp: ValIdx,
-        arg: ValIdx,
+        arg0: ValIdx,
+        arg1: ValIdx,
     },
     /// §12 thread join (`thread.join`): block until the vCPU named by `handle` (an `i32` thread
     /// handle) finishes, then yield `(status: i64, value: i64)`, the shape of `Instantiator.join`
@@ -3201,10 +3201,12 @@ macro_rules! inst_operands {
             | Inst::MemoryNotify {
                 addr: a, count: b, ..
             }
-            | Inst::ContNew { func: a, sp: b }
+            | Inst::ContNew { func: a, arg0: b }
             | Inst::ContResume { k: a, arg: b, .. }
             | Inst::LongJmp { buf: a, val: b }
-            | Inst::ThreadSpawn { sp: a, arg: b, .. }
+            | Inst::ThreadSpawn {
+                arg0: a, arg1: b, ..
+            }
             | Inst::ReplaceLane { a, b, .. }
             | Inst::VIntBin { a, b, .. }
             | Inst::VIntCmp { a, b, .. }

@@ -2863,7 +2863,7 @@ fn seed_domain(s: &mut Sched, sched: &Arc<Scheduler>, mut root: Box<VCpu>, resid
                 let charge = root.domain.host.lock_unpoisoned().fiber_recharge();
                 root.domain.registry.seed_frozen(
                     ff.func,
-                    ff.sp,
+                    ff.arg0,
                     ff.shadow_sp,
                     ff.generation,
                     ff.consumed,
@@ -12123,9 +12123,9 @@ pub struct FrozenFiber {
     pub slot: usize,
     /// The fiber's entry funcref (== func index; `ref.func`/the identity table), re-entered on thaw.
     pub func: i32,
-    /// The fiber's data-stack base (the entry's first param). Inert for rewind (the prologue
-    /// dispatches to the resume arm, ignoring params) but recorded for fidelity / forward use.
-    pub sp: i64,
+    /// The entry's first argument, `cont.new`'s `arg0`. Inert for rewind (the prologue dispatches
+    /// to the resume arm, ignoring params) but recorded for fidelity / forward use.
+    pub arg0: i64,
     /// Window offset of the flattened shadow-SP — the extent of its frozen continuation, restored
     /// into the registry's `shadow` table so the swap re-points to it when the fiber is resumed.
     /// `0` for a free slot: no shadow region lies at offset 0.
@@ -12152,7 +12152,7 @@ impl FrozenFiber {
         FrozenFiber {
             slot,
             func: 0,
-            sp: 0,
+            arg0: 0,
             shadow_sp: 0,
             generation,
             consumed: false,
@@ -12195,7 +12195,7 @@ pub struct FrozenVCpu {
     pub joinable: bool,
     /// The child's entry function (the `thread.spawn` target), re-entered on thaw.
     pub func: i32,
-    /// The child's spawn args (`[sp, arg]`, the fiber-style thread entry), replayed on re-spawn.
+    /// The child's spawn args (`thread.spawn`'s `[arg0, arg1]`), replayed on re-spawn.
     pub args: Vec<i64>,
     /// Window offset of the child's flattened shadow-SP — the extent of its frozen continuation in its
     /// region; restored as the child's shadow-SP so its thaw re-entry rewinds from the right point.
@@ -12421,9 +12421,9 @@ pub struct ThawedTwin {
 /// `RUNNING` (never claimable), `Done` ≈ `FREE` (unrecycled).
 enum RegFiber {
     /// Created by `cont.new`, not yet started: holds the `i32` funcref to launch on the
-    /// first resume (resolved then through the function table as `(i64 sp, i64 arg) ->
-    /// i64`) and the `i64` data-stack base `sp` to run it on. Claimable by any vCPU.
-    Pending { func: i32, sp: i64 },
+    /// first resume (resolved then through the function table as `(i64, i64) -> i64`) and the
+    /// entry's first argument, `arg0`. Claimable by any vCPU.
+    Pending { func: i32, arg0: i64 },
     /// **Voluntarily suspended** at a `suspend`, holding its reified call stack — in the pool,
     /// claimable by any vCPU (this is what makes a fiber *migratable*: the stack is pure data,
     /// so a foreign vCPU's claim is a safe hand-off).
@@ -12459,8 +12459,8 @@ enum RegFiber {
 
 /// What a successful [`FiberRegistry::claim`] hands the winning vCPU.
 enum Claimed {
-    /// A `Pending` fiber: launch `func(sp, arg)` on its data stack.
-    Start { func: i32, sp: i64 },
+    /// A `Pending` fiber: launch `func(arg0, arg)`, `arg` being the resume's.
+    Start { func: i32, arg0: i64 },
     /// A `Parked` fiber: its reified call stack, ready to continue past its `suspend`.
     Live(Vec<Frame>),
     /// A **woken** event-parked fiber ([`RegFiber::ParkedOn`]): frames verbatim — the wake
@@ -12618,7 +12618,7 @@ impl FiberRegistry {
     fn create(
         &self,
         func: i32,
-        sp: i64,
+        arg0: i64,
         durable: bool,
         arena: ShadowArena,
         charge: LiveFiber,
@@ -12648,14 +12648,14 @@ impl FiberRegistry {
         }
         let generation = if reuse.is_some() {
             t.free.pop();
-            t.fibers[slot] = RegFiber::Pending { func, sp };
+            t.fibers[slot] = RegFiber::Pending { func, arg0 };
             t.shadow[slot] = arena.frame_base(slot + 1); // reused region: empty stack at its frame base
             t.consumed[slot] = false;
             t.pending[slot] = None;
             t.charges[slot] = charge;
             t.gens[slot] // kept from the freed occupant's bump (the ABA guard)
         } else {
-            t.fibers.push(RegFiber::Pending { func, sp });
+            t.fibers.push(RegFiber::Pending { func, arg0 });
             t.shadow.push(arena.frame_base(slot + 1));
             t.gens.push(0); // a fresh slot is generation 0 ⇒ handle == slot
             t.consumed.push(false);
@@ -12689,7 +12689,7 @@ impl FiberRegistry {
             return Err(Trap::FiberFault);
         }
         match std::mem::replace(&mut t.fibers[slot], RegFiber::Running(None)) {
-            RegFiber::Pending { func, sp } => Ok((slot, Claimed::Start { func, sp })),
+            RegFiber::Pending { func, arg0 } => Ok((slot, Claimed::Start { func, arg0 })),
             RegFiber::Parked(f) => Ok((slot, Claimed::Live(f))),
             // §3.6 slice 5a: a woken event-park continues verbatim (result already delivered);
             // a still-blocked one is a poll — the resumer learns FIBER_PARKED, no switch.
@@ -12897,10 +12897,10 @@ impl FiberRegistry {
             .iter()
             .enumerate()
             .filter_map(|(slot, f)| match f {
-                RegFiber::Pending { func, sp } => Some(FrozenFiber {
+                RegFiber::Pending { func, arg0 } => Some(FrozenFiber {
                     slot,
                     func: *func,
-                    sp: *sp,
+                    arg0: *arg0,
                     shadow_sp: arena.frame_base(shadow_context_index(slot)),
                     generation: t.gens[slot],
                     consumed: false,
@@ -12976,7 +12976,7 @@ impl FiberRegistry {
     fn seed_frozen(
         &self,
         func: i32,
-        sp: i64,
+        arg0: i64,
         shadow_sp: u64,
         generation: u64,
         consumed: bool,
@@ -12984,7 +12984,7 @@ impl FiberRegistry {
     ) -> usize {
         let mut t = self.lock();
         let slot = t.fibers.len();
-        t.fibers.push(RegFiber::Pending { func, sp });
+        t.fibers.push(RegFiber::Pending { func, arg0 });
         t.shadow.push(shadow_sp);
         t.gens.push(generation); // restore the freeze-time generation so a recycled handle resolves
         t.consumed.push(consumed); // #1538: a consumed park delivers at its rewound suspend
@@ -13018,11 +13018,11 @@ impl FiberRegistry {
     }
 }
 
-/// The fixed fiber entry signature (§12): a fiber runs a function of type `(i64 sp, i64
-/// arg) -> i64`. `sp` is the fiber's data-stack base (the §3d two-stack split — every
-/// frontend-emitted function already takes the data-SP as its first param); `arg` carries
-/// the first-resume value in and the final value out (a window pointer can carry richer
-/// payloads).
+/// The fixed fiber entry signature (§12): a fiber runs a function of type `(i64, i64) -> i64`.
+/// The first argument is `cont.new`'s `arg0`, the creator's word (a §3d frontend passes the
+/// fiber's data-stack base there, as its functions take their data-SP first); the second carries
+/// the first-resume value in, and the result carries the final value out (a window pointer can
+/// carry richer payloads).
 fn fiber_sig() -> FuncType {
     FuncType {
         params: vec![ValType::I64, ValType::I64],
@@ -13347,7 +13347,7 @@ struct VCpu {
     /// Fibers the freeze driver flattened this run (slice 3.1.5), handed back to the embedder via
     /// the shared [`Host`] so a snapshot can record them and a thaw re-seed them. Empty otherwise.
     frozen: Vec<FrozenFiber>,
-    /// `Some` on a **spawned** (`thread.spawn`) vCPU, durable or not: its `(entry, [sp, arg], join
+    /// `Some` on a **spawned** (`thread.spawn`) vCPU, durable or not: its `(entry, [arg0, arg1], join
     /// slot)`, retained so that when it unwinds under a freeze it can emit its [`FrozenVCpu`] residue
     /// (its frames are gone by then), or, finishing unjoined, its completed residue (#1685). Its
     /// presence is also what marks a vCPU as a thread of its domain, not the domain's main vCPU
@@ -14047,9 +14047,9 @@ impl VCpu {
         placeholder: Option<Reg>,
         reissue: bool,
     ) -> Result<(), Trap> {
-        // The entry funcref (== func index) + data-stack base, to re-enter the fiber on thaw.
+        // The entry funcref (== func index) + its first argument, to re-enter the fiber on thaw.
         let func = frames.first().map(|f| f.func as i32).unwrap_or(0);
-        let sp = match frames.first().and_then(Frame::sp) {
+        let arg0 = match frames.first().and_then(Frame::sp) {
             Some(r) => r.i64(),
             _ => 0,
         };
@@ -14085,7 +14085,7 @@ impl VCpu {
         self.frozen.push(FrozenFiber {
             slot,
             func,
-            sp,
+            arg0,
             shadow_sp,
             generation: self.domain.registry.generation(slot),
             consumed: self.domain.registry.consumed(slot),
@@ -16914,7 +16914,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         };
                         // Claim it straight into `Running` (discarding the placeholder
                         // `Start`): handler first-frames are built here — their signatures
-                        // are the impl_export's own, not the `(sp, arg)` fiber launch shape.
+                        // are the impl_export's own, not the `(arg0, arg)` fiber launch shape.
                         let (hslot, _) = registry.claim(handle)?;
                         serve_switch!(
                             hslot,
@@ -17843,9 +17843,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // §12 fiber create: record a `Pending` fiber in the **run-shared** registry
                 // (D57), yield its handle (the registry slot — the first handle of a run is 0 on
                 // both backends, the unified namespace). No switch.
-                Inst::ContNew { func, sp } => {
+                Inst::ContNew { func, arg0 } => {
                     let funcref = get_i32(&frames[top].vals, *func)?;
-                    let stack_base = get_i64(&frames[top].vals, *sp)?;
+                    let arg0 = get_i64(&frames[top].vals, *arg0)?;
                     // #2112 — the fiber is `FIBER_STACK` of its domain's `mem` while it lives.
                     let charge = host
                         .lock_unpoisoned()
@@ -17853,7 +17853,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         .ok_or(Trap::FiberFault)?;
                     // `durable` runs assign the new fiber a distinct shadow region (and refuse if
                     // the reserve is full); a non-durable run ignores the region bookkeeping.
-                    let handle = registry.create(funcref, stack_base, durable, arena, charge)?;
+                    let handle = registry.create(funcref, arg0, durable, arena, charge)?;
                     frames[top].vals.push(Reg::from_i64(handle));
                 }
                 // §12 fiber resume: **claim** fiber `k` — any vCPU may, so a fiber suspended on
@@ -17931,7 +17931,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         );
                     }
                     let new_frames = match claimed {
-                        Claimed::Start { func: funcref, sp } => {
+                        Claimed::Start {
+                            func: funcref,
+                            arg0,
+                        } => {
                             // A forged / wrong-type fiber funcref is a **fiber** fault, not a
                             // generic `IndirectCallType`: the fault arises from a `cont.*` op, so it
                             // joins the forged-handle / dead / bomb family and matches the JIT, which
@@ -17959,7 +17962,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 module: cmod,
                                 block: 0,
                                 inst: 0,
-                                vals: vec![Reg::from_i64(sp), Reg::from_i64(av)].into(),
+                                vals: vec![Reg::from_i64(arg0), Reg::from_i64(av)].into(),
                             }]
                         }
                         Claimed::Live(mut f) => {
@@ -18236,7 +18239,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // the domain's powerbox** (the same `Arc<Mutex<Host>>`), so a handle granted to the
                 // domain works in the child and its I/O reaches the same sink; it gets its own fuel.
                 // Yields an i32 thread handle (the table slot).
-                Inst::ThreadSpawn { func, sp, arg } => {
+                Inst::ThreadSpawn { func, arg0, arg1 } => {
                     if fs.get(*func as usize).is_none() {
                         return Err(Trap::Malformed);
                     }
@@ -18248,8 +18251,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // reached through the shared `dt` via `resolve_module`, exactly as the bytecode
                     // engine starts the child in the unit's module).
                     let cmodule = frames[top].module;
-                    let spv = get_i64(&frames[top].vals, *sp)?; // the thread's data-stack base
-                    let av = get_i64(&frames[top].vals, *arg)?;
+                    let a0 = get_i64(&frames[top].vals, *arg0)?;
+                    let a1 = get_i64(&frames[top].vals, *arg1)?;
                     // Durable multi-vCPU (DURABILITY.md §12.8 slice 3.2.1): a child inherits the *current*
                     // state word — under a freeze it spawns into `UNWINDING` so it too unwinds at its next
                     // safepoint. (A child existing *before* the freeze point is reconstructed by the
@@ -18313,7 +18316,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let mut child = VCpu::new(
                             cdomain,
                             entry,
-                            &[Value::I64(spv), Value::I64(av)], // (sp, arg) — the fiber-style entry
+                            &[Value::I64(a0), Value::I64(a1)], // a fiber's entry shape
                             child_mem,
                             child_fuel,
                             0,
@@ -18327,13 +18330,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         child.durable = durable; // durability is a domain property (shared window/registry)
                                                  // Durable multi-vCPU (slice 3.2.2): this child owns the top-down context reserved
                                                  // above, so its shadow stack lives in its own region; it carries its own state word
-                                                 // (swapped in by the runtime). Retain `(entry, [sp, arg])` so a freeze emits residue.
+                                                 // (swapped in by the runtime). Retain `(entry, [arg0, arg1])` so a freeze emits residue.
                         child.root_shadow_sp = arena.frame_base(child_ctx);
                         child.vcpu_ctx = child_ctx; // freed back to the registry when it finishes
                         child.dstate = child_state;
                         child.parent_task = parent_id; // slice 3.4: who spawned it (nested-spawn thaw)
                         child.tls = vcpu_id; // §12: its id in its domain (#1775)
-                        child.spawn_residue = Some((entry, vec![spv, av], slot));
+                        child.spawn_residue = Some((entry, vec![a0, a1], slot));
                         child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));
                         child.live = live;
                         Box::new(child)
@@ -18814,7 +18817,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         && shadow_sp > arena.frame_base(lctx)
                         && mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
                     if freezing {
-                        let (func, sp) = match popped.as_ref() {
+                        let (func, arg0) = match popped.as_ref() {
                             Some(f) => (
                                 f.func as i32,
                                 match f.sp() {
@@ -18828,7 +18831,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         frozen.push(FrozenFiber {
                             slot: leaving,
                             func,
-                            sp,
+                            arg0,
                             shadow_sp,
                             generation: registry.generation(leaving),
                             consumed: registry.consumed(leaving),

@@ -497,11 +497,11 @@ enum Op {
         handle: Option<u32>,
         dst: u32,
     },
-    /// §12 fiber create (`cont.new`): register a pending fiber `(funcref, sp)` in the driver's
+    /// §12 fiber create (`cont.new`): register a pending fiber `(funcref, arg0)` in the driver's
     /// registry and write its handle to `dst`. No switch — handled by the driver.
     ContNew {
         func: u32,
-        sp: u32,
+        arg0: u32,
         dst: u32,
     },
     /// §12 fiber resume (`cont.resume`): switch into fiber `k`, delivering `arg`; the two results
@@ -534,12 +534,12 @@ enum Op {
         buf: u32,
         val: u32,
     },
-    /// §12 `thread.spawn`: spawn a vCPU running `func` (a direct func index) with `(sp, arg)`; its
-    /// handle lands at `dst`. Scheduler-driven.
+    /// §12 `thread.spawn`: spawn a vCPU running `func` (a direct func index) with `(arg0, arg1)`;
+    /// its handle lands at `dst`. Scheduler-driven.
     ThreadSpawn {
         func: u32,
-        sp: u32,
-        arg: u32,
+        arg0: u32,
+        arg1: u32,
         dst: u32,
     },
     /// §12 `thread.join`: park until child `handle` finishes; its result (or trap) lands at `dst`.
@@ -2000,15 +2000,15 @@ fn entry_task(
 }
 
 /// A `thread.spawn` child's task: `func` of the spawning frame's `module` (an installed §22 unit spawns
-/// its own functions, CONSOLIDATION.md §11) entered with `(sp, arg)`. The driver seeds its `vcpu.tls`
+/// its own functions, CONSOLIDATION.md §11) entered with `(arg0, arg1)`. The driver seeds its `vcpu.tls`
 /// word with the dense vCPU id it numbers the thread by (§12; a root's is 0). `Malformed` for a module
 /// or function the run's source does not have.
 fn thread_task(
     source: &ModuleSource,
     module: usize,
     func: u32,
-    sp: i64,
-    arg: i64,
+    arg0: i64,
+    arg1: i64,
     payer: Option<NodeRef>,
 ) -> Result<VTask, Trap> {
     let cm = source.get(module).ok_or(Trap::Malformed)?;
@@ -2016,7 +2016,7 @@ fn thread_task(
         &cm,
         module,
         func as usize,
-        &[Value::I64(sp), Value::I64(arg)],
+        &[Value::I64(arg0), Value::I64(arg1)],
         payer,
     )
 }
@@ -3157,9 +3157,9 @@ fn compile_inst(
         // §12 fibers — cooperative continuation switching, driven by the bytecode driver (no M:N
         // pool, no DPOR; single-vCPU). `cont.new` registers a pending fiber, `cont.resume` switches
         // in (two results), `suspend` switches back (one result).
-        Inst::ContNew { func, sp } => Op::ContNew {
+        Inst::ContNew { func, arg0 } => Op::ContNew {
             func: g(*func),
-            sp: g(*sp),
+            arg0: g(*arg0),
             dst,
         },
         // I48 — the `block: true` form idles the resumer's task on the fiber's event (see the
@@ -3189,10 +3189,10 @@ fn compile_inst(
         // §12 threads / futex — multi-vCPU, serviced by the driver (the cooperative `drive` or the
         // parallel one). Threads and fibers mix: every driver runs a run's
         // vCPUs over one fiber registry (#1761), so a fiber migrates between them.
-        Inst::ThreadSpawn { func, sp, arg } => Op::ThreadSpawn {
+        Inst::ThreadSpawn { func, arg0, arg1 } => Op::ThreadSpawn {
             func: *func,
-            sp: g(*sp),
-            arg: g(*arg),
+            arg0: g(*arg0),
+            arg1: g(*arg1),
             dst,
         },
         Inst::ThreadJoin { handle } => Op::ThreadJoin {
@@ -5139,14 +5139,14 @@ fn debug_advance_fiber(
             Some(vals) => FiberStep::Finished(vals),
             None => FiberStep::Stepped,
         },
-        Ok(Outcome::ContNew { funcref, sp, dst }) => {
+        Ok(Outcome::ContNew { funcref, arg0, dst }) => {
             match new_fiber(
                 &mut cell,
                 source,
                 mem,
                 &mut HostCell::Excl(host),
                 funcref,
-                sp,
+                arg0,
             ) {
                 Ok(h) => {
                     vt.active.set(dst, Reg::from_i32(h));
@@ -5162,9 +5162,9 @@ fn debug_advance_fiber(
             let target =
                 match claim_fiber(&mut cell, &mut HostCell::Excl(host), k, arg, None, false) {
                     Ok(Claim::Continue(vm)) => vm,
-                    Ok(Claim::Start { funcref, sp }) => {
+                    Ok(Claim::Start { funcref, arg0 }) => {
                         let payer = Some(host.own_node());
-                        match start_fiber(source, table, mem, k, funcref, sp, arg, payer) {
+                        match start_fiber(source, table, mem, k, funcref, arg0, arg, payer) {
                             Ok(vm) => vm,
                             Err(t) => return FiberStep::Trapped(t),
                         }
@@ -6158,7 +6158,7 @@ fn trace_pick_diff(
     }
 }
 
-/// `thread.spawn`: add a child vCPU running `func(sp, arg)` (sharing the domain), write its handle to
+/// `thread.spawn`: add a child vCPU running `func(arg0, arg1)` (sharing the domain), write its handle to
 /// the spawner's `dst`. Mirrors the production `drive`'s `Spawn` arm for the debuggable subset.
 #[allow(clippy::too_many_arguments)]
 fn dbg_spawn(
@@ -6166,8 +6166,8 @@ fn dbg_spawn(
     envs: &mut [Domain],
     ti: usize,
     func: u32,
-    sp: i64,
-    arg: i64,
+    arg0: i64,
+    arg1: i64,
     dst: u32,
     module: usize,
     source: &ModuleSource,
@@ -6175,7 +6175,7 @@ fn dbg_spawn(
     let env = tasks[ti].domain; // a thread runs in its spawner's domain (shares its window)
     let (vt, live) = {
         let mut host = envs[env].host.lock_unpoisoned();
-        let mut vt = thread_task(source, module, func, sp, arg, Some(host.own_node()))?;
+        let mut vt = thread_task(source, module, func, arg0, arg1, Some(host.own_node()))?;
         if live_tasks(tasks) >= super::MAX_VCPUS {
             return Err(Trap::ThreadFault); // thread bomb
         }
@@ -6268,13 +6268,14 @@ fn service_advance(
         FiberStep::Other(outcome) => match outcome {
             Outcome::ThreadSpawn {
                 func,
-                sp,
-                arg,
+                arg0,
+                arg1,
                 dst,
                 module,
             } => {
                 *turn += 1;
-                if let Err(t) = dbg_spawn(tasks, domains, ti, func, sp, arg, dst, module, source) {
+                if let Err(t) = dbg_spawn(tasks, domains, ti, func, arg0, arg1, dst, module, source)
+                {
                     complete(tasks, domains, ti, Err(t));
                 }
             }
@@ -9123,10 +9124,10 @@ enum Outcome {
         id: u64,
         dst: u32,
     },
-    /// `cont.new`: register a fiber for `(funcref, sp)`, write its handle to `dst`, continue.
+    /// `cont.new`: register a fiber for `(funcref, arg0)`, write its handle to `dst`, continue.
     ContNew {
         funcref: i32,
-        sp: i64,
+        arg0: i64,
         dst: u32,
     },
     /// `cont.resume`: switch into fiber `kh` with `arg`; `(status, value)` land at `dst`/`dst+1`.
@@ -9144,14 +9145,14 @@ enum Outcome {
         value: i64,
         dst: u32,
     },
-    /// `thread.spawn`: spawn a vCPU running `func(sp, arg)`; its handle lands at `dst`. `module` is
+    /// `thread.spawn`: spawn a vCPU running `func(arg0, arg1)`; its handle lands at `dst`. `module` is
     /// the **spawning frame's** module — `func` resolves there, so an installed §22 unit's code
     /// spawns the *unit's own* functions (CONSOLIDATION.md §11), and the child's root frame starts
     /// in that module.
     ThreadSpawn {
         func: u32,
-        sp: i64,
-        arg: i64,
+        arg0: i64,
+        arg1: i64,
         dst: u32,
         module: usize,
     },
@@ -9375,12 +9376,12 @@ fn sched_wall_deadline(_timeout: u64) -> u64 {
 #[derive(Clone)]
 enum FiberState {
     /// Created by `cont.new` but never resumed, or unwound by the freeze mid-resume (its spilled
-    /// frames in its shadow region, #1835): starts by calling `funcref(sp, arg)`. `consumed`
+    /// frames in its shadow region, #1835): starts by calling `funcref(arg0, arg)`. `consumed`
     /// (#1538) is set only for a **thaw-seeded** fiber whose frozen park was already consumed: its
     /// first resume queues the argument for the rewound `suspend` to return instead of re-parking.
     Pending {
         funcref: i32,
-        sp: i64,
+        arg0: i64,
         consumed: bool,
     },
     /// Suspended mid-run; resuming delivers the new `arg` into `suspend_dst` and continues `vm`.
@@ -9492,7 +9493,7 @@ impl FiberTables {
             .iter()
             .map(|f| FiberMeta {
                 func: 0,
-                sp: 0,
+                arg0: 0,
                 charge: match f {
                     FiberState::Done => LiveFiber::none(),
                     _ => host.fiber_recharge(),
@@ -9508,12 +9509,12 @@ impl FiberTables {
 }
 
 /// What a registry keeps of a fiber beside its state: its freeze re-entry metadata (DURABILITY.md
-/// §12.8) — its **resolved** entry function index and data-stack base, so the freeze driver can emit
+/// §12.8) — its **resolved** entry function index and first argument, so the freeze driver can emit
 /// a `FrozenFiber` for it after it parks — and #2112 its charge on the node of the domain whose
 /// `cont.new` made it, handed back when it returns or the registry goes.
 struct FiberMeta {
     func: i32,
-    sp: i64,
+    arg0: i64,
     charge: LiveFiber,
 }
 
@@ -9592,8 +9593,8 @@ enum FiberRegRef<'a> {
 // allocation to every fiber switch.
 #[allow(clippy::large_enum_variant)]
 enum Claim {
-    /// A pending fiber: start `funcref(sp, arg)`.
-    Start { funcref: i32, sp: i64 },
+    /// A pending fiber: start `funcref(arg0, arg)`.
+    Start { funcref: i32, arg0: i64 },
     /// A parked fiber, its resume value already delivered: continue it.
     Continue(Vm),
     /// An event-parked fiber still blocked, under a blocking resume on the cooperative driver: idle.
@@ -9629,11 +9630,11 @@ fn is_unwinding(mem: &Option<Mem>) -> bool {
 // run keeps durable shadow-SP words (§12.8), which only `step_vcpu` can. What a driver does with a
 // fiber it cannot claim yet ([`Claim::Block`], [`Claim::Poll`]) stays the driver's.
 
-/// `cont.new`: register a pending fiber for `funcref(sp, …)` and return its handle, charged to
+/// `cont.new`: register a pending fiber for `funcref(arg0, …)` and return its handle, charged to
 /// `host`'s domain while it lives (#2112). Fiber `h` is shadow context `h + 1`, its saved shadow-SP at
 /// its region's frame base (an empty shadow stack, DURABILITY.md §12.8 4A.5). Its freeze re-entry
 /// metadata is its **resolved** entry function (the natural-table lookup `cont.resume` does, so a
-/// `FrozenFiber.func` matches the tree-walker's `Frame::func`) and its data-stack base. A full registry,
+/// `FrozenFiber.func` matches the tree-walker's `Frame::func`) and its first argument. A full registry,
 /// or a domain that cannot pay for another fiber, is a `FiberFault`.
 fn new_fiber(
     fibers: &mut FiberCell,
@@ -9641,7 +9642,7 @@ fn new_fiber(
     mem: &Option<Mem>,
     host: &mut HostCell,
     funcref: i32,
-    sp: i64,
+    arg0: i64,
 ) -> Result<i32, Trap> {
     let arena = mem
         .as_ref()
@@ -9656,11 +9657,11 @@ fn new_fiber(
             let h = f.len();
             f.push(FiberState::Pending {
                 funcref,
-                sp,
+                arg0,
                 consumed: false,
             });
             fsp.push(arena.frame_base(h + 1));
-            meta.push(FiberMeta { func, sp, charge });
+            meta.push(FiberMeta { func, arg0, charge });
             Some(h as i32)
         })
         .ok_or(Trap::FiberFault)
@@ -9714,7 +9715,7 @@ fn claim_fiber(
         Some(slot @ FiberState::Pending { .. }) => {
             let FiberState::Pending {
                 funcref,
-                sp,
+                arg0,
                 consumed,
             } = std::mem::replace(slot, running())
             else {
@@ -9726,7 +9727,7 @@ fn claim_fiber(
                     pending: Some(arg), // #1538
                 };
             }
-            Ok(Claim::Start { funcref, sp })
+            Ok(Claim::Start { funcref, arg0 })
         }
         Some(slot @ FiberState::Parked { .. }) => {
             let FiberState::Parked {
@@ -9815,7 +9816,7 @@ fn claim_fiber(
     })
 }
 
-/// The first frame of fiber `k`, claimed pending: `funcref(sp, arg)`, resolved through the shared
+/// The first frame of fiber `k`, claimed pending: `funcref(arg0, arg)`, resolved through the shared
 /// dispatch table (module-aware, as `Op::CallIndirect`, the tree-walker's `dispatch_indirect` and the
 /// JIT's `fn_table` resolve it), so a fiber may start on an **installed §22 unit** function, not only a
 /// module-0 one (#1226, DESIGN.md §22 "Concurrency"). A forged or mistyped funcref is a `FiberFault`.
@@ -9827,13 +9828,13 @@ fn start_fiber(
     mem: &Option<Mem>,
     k: usize,
     funcref: i32,
-    sp: i64,
+    arg0: i64,
     arg: i64,
     payer: Option<NodeRef>,
 ) -> Result<Vm, Trap> {
     let (module, func, unit) =
         resolve_fiber_entry(source, table, funcref).ok_or(Trap::FiberFault)?;
-    let mut vm = Vm::new(&unit, func, &[Value::I64(sp), Value::I64(arg)], payer)?;
+    let mut vm = Vm::new(&unit, func, &[Value::I64(arg0), Value::I64(arg)], payer)?;
     vm.module = module;
     vm.durable_region_base = mem
         .as_ref()
@@ -9929,7 +9930,7 @@ fn return_from_fiber(
         f[id] = if frozen {
             FiberState::Pending {
                 funcref: meta[id].func,
-                sp: meta[id].sp,
+                arg0: meta[id].arg0,
                 consumed: false,
             }
         } else {
@@ -10414,10 +10415,10 @@ fn freeze_drive(
                 // Not parked: nothing to flatten. A fresh, already-unwound (#1835) or finished slot
                 // still rides (#1684), so the thaw rebuilds the table slot for slot.
                 match &other {
-                    FiberState::Pending { funcref, sp, .. } => frozen.push(super::FrozenFiber {
+                    FiberState::Pending { funcref, arg0, .. } => frozen.push(super::FrozenFiber {
                         slot,
                         func: *funcref,
-                        sp: *sp,
+                        arg0: *arg0,
                         shadow_sp: fiber_sp[slot], // its frame base, or the frames the freeze spilled
                         generation: 0,
                         consumed: false,
@@ -10429,7 +10430,7 @@ fn freeze_drive(
                 continue;
             }
         };
-        let (func, sp) = fiber_meta.get(slot).map_or((0, 0), |m| (m.func, m.sp));
+        let (func, arg0) = fiber_meta.get(slot).map_or((0, 0), |m| (m.func, m.arg0));
         // Point the active shadow-SP at this fiber's region base (an empty shadow stack to unwind into).
         if let Some(m) = ctx.mem.as_mut() {
             m.durable_set_sp(arena.region_base(slot + 1), arena.frame_base(slot + 1));
@@ -10457,7 +10458,7 @@ fn freeze_drive(
         frozen.push(super::FrozenFiber {
             slot,
             func,
-            sp,
+            arg0,
             shadow_sp,
             generation: 0,
             consumed,
@@ -10838,8 +10839,8 @@ fn drive_nested(
                 *slot = Some((vt.active, stop));
                 return Ok(Nested::Done(Vec::new()));
             }
-            Outcome::ContNew { funcref, sp, dst } => {
-                let h = new_fiber(fibers, source, mem, host, funcref, sp)?;
+            Outcome::ContNew { funcref, arg0, dst } => {
+                let h = new_fiber(fibers, source, mem, host, funcref, arg0)?;
                 vt.active.set(dst, Reg::from_i32(h));
             }
             // No park here can idle the task (every park surface faults or waits inline above), so
@@ -10849,8 +10850,8 @@ fn drive_nested(
                 let k = kh as usize;
                 let target = match claim_fiber(fibers, host, k, arg, None, false)? {
                     Claim::Continue(vm) => vm,
-                    Claim::Start { funcref, sp } => {
-                        start_fiber(source, table, mem, k, funcref, sp, arg, payer(host))?
+                    Claim::Start { funcref, arg0 } => {
+                        start_fiber(source, table, mem, k, funcref, arg0, arg, payer(host))?
                     }
                     Claim::Block | Claim::Poll => {
                         vt.active.set(dst, Reg::from_i32(super::FIBER_PARKED));
@@ -11085,8 +11086,8 @@ enum VcpuStop {
     },
     Spawn {
         func: u32,
-        sp: i64,
-        arg: i64,
+        arg0: i64,
+        arg1: i64,
         dst: u32,
         /// The spawning frame's module — `func` resolves there (CONSOLIDATION.md §11).
         module: u32,
@@ -11162,14 +11163,14 @@ impl Outcome {
             },
             Outcome::ThreadSpawn {
                 func,
-                sp,
-                arg,
+                arg0,
+                arg1,
                 dst,
                 module,
             } => VcpuStop::Spawn {
                 func,
-                sp,
-                arg,
+                arg0,
+                arg1,
                 dst,
                 module: module as u32,
             },
@@ -11383,8 +11384,8 @@ fn step_vcpu(
                     return Ok(VcpuStop::Done(vals));
                 }
             }
-            Outcome::ContNew { funcref, sp, dst } => {
-                let h = new_fiber(fibers, source, ctx.mem, &mut ctx.host, funcref, sp)?;
+            Outcome::ContNew { funcref, arg0, dst } => {
+                let h = new_fiber(fibers, source, ctx.mem, &mut ctx.host, funcref, arg0)?;
                 vt.active.set(dst, Reg::from_i32(h));
             }
             Outcome::ContResume {
@@ -11399,9 +11400,9 @@ fn step_vcpu(
                 let target =
                     match claim_fiber(fibers, &mut ctx.host, k, arg, blocking_ip, cooperative)? {
                         Claim::Continue(vm) => vm,
-                        Claim::Start { funcref, sp } => {
+                        Claim::Start { funcref, arg0 } => {
                             let payer = payer(&mut ctx.host);
-                            start_fiber(source, ctx.table, ctx.mem, k, funcref, sp, arg, payer)?
+                            start_fiber(source, ctx.table, ctx.mem, k, funcref, arg0, arg, payer)?
                         }
                         // The oracle's rule: a durable run whose freeze is unwinding takes the
                         // advisory downgrade (the poll status), so the resumer reaches its trailing
@@ -12906,7 +12907,7 @@ impl SchedCore {
         // freeze flattened *before* the root re-enters, so the root's re-issued `cont.resume` names
         // the same dense handles (0, 1, …), each fiber's saved durable shadow-SP (slot `s` is shadow
         // context `s + 1`) is back for the swap to re-point to, and each keeps the `(resolved entry
-        // func index, data-stack base)` a [`super::FrozenFiber`] needs after it parks. Taken
+        // func index, first argument)` a [`super::FrozenFiber`] needs after it parks. Taken
         // (cleared) from the host; empty for a freeze or ordinary run.
         let mut fibers = FiberTables::default();
         {
@@ -12928,7 +12929,7 @@ impl SchedCore {
                 } else {
                     FiberState::Pending {
                         funcref: ff.func,
-                        sp: ff.sp,
+                        arg0: ff.arg0,
                         consumed: ff.consumed, // #1538: its first resume delivers at the rewound suspend
                     }
                 });
@@ -12936,7 +12937,7 @@ impl SchedCore {
                 // #2112 — a live fiber handed its charge back as the freeze flattened it.
                 fibers.meta.push(FiberMeta {
                     func: ff.func,
-                    sp: ff.sp,
+                    arg0: ff.arg0,
                     charge: if ff.is_free() {
                         LiveFiber::none()
                     } else {
@@ -14254,14 +14255,15 @@ impl SchedCore {
             }
             Ok(VcpuStop::Spawn {
                 func,
-                sp,
-                arg,
+                arg0,
+                arg1,
                 dst,
                 module,
             }) => {
                 let node = domains[tasks[ti].domain].host.lock_unpoisoned().own_node();
                 let payer = Some(node.clone());
-                let mut child = match thread_task(source, module as usize, func, sp, arg, payer) {
+                let mut child = match thread_task(source, module as usize, func, arg0, arg1, payer)
+                {
                     Ok(vt) => vt,
                     Err(t) => {
                         complete(tasks, domains, ti, Err(t));
@@ -15710,13 +15712,13 @@ mod dbg_domain_end_tests {
         let mut fibers = FiberTables::default();
         fibers.fibers.push(FiberState::Pending {
             funcref: 0,
-            sp: 0,
+            arg0: 0,
             consumed: false,
         });
         fibers.sp.push(0);
         fibers.meta.push(FiberMeta {
             func: 0,
-            sp: 0,
+            arg0: 0,
             charge: child.fiber_charge().expect("room"),
         });
         let table = || std::sync::Arc::new(build_table_for(1, 0, 0));
@@ -19897,19 +19899,15 @@ impl Vm {
                 // advances past itself and persists the cursor, so the driver — after creating the
                 // fiber, switching in, or switching back — resumes this activation right after the op
                 // (with the op's `dst` slot(s) filled in by the driver).
-                Op::ContNew { func, sp, dst } => {
+                Op::ContNew { func, arg0, dst } => {
                     let funcref = r!(*func).i32();
-                    let spv = r!(*sp).i64();
+                    let arg0 = r!(*arg0).i64();
                     let dst = *dst;
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    return Ok(Outcome::ContNew {
-                        funcref,
-                        sp: spv,
-                        dst,
-                    });
+                    return Ok(Outcome::ContNew { funcref, arg0, dst });
                 }
                 Op::ContResume {
                     k,
@@ -19953,9 +19951,14 @@ impl Vm {
                 // §12 multi-vCPU ops escape to the `drive` scheduler (which owns the task set). Each
                 // advances past itself and persists the cursor, so the scheduler resumes this
                 // activation right after the op with the op's `dst` filled in.
-                Op::ThreadSpawn { func, sp, arg, dst } => {
-                    let sp = r!(*sp).i64();
-                    let arg = r!(*arg).i64();
+                Op::ThreadSpawn {
+                    func,
+                    arg0,
+                    arg1,
+                    dst,
+                } => {
+                    let arg0 = r!(*arg0).i64();
+                    let arg1 = r!(*arg1).i64();
                     let (func, dst) = (*func, *dst);
                     self.module = module;
                     self.cur = cur;
@@ -19965,8 +19968,8 @@ impl Vm {
                     // `func` in the unit, not module 0 (the verifier checked it there).
                     return Ok(Outcome::ThreadSpawn {
                         func,
-                        sp,
-                        arg,
+                        arg0,
+                        arg1,
                         dst,
                         module,
                     });

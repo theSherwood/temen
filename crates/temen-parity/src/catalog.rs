@@ -1190,7 +1190,7 @@ fn fibers_threads(ops: &mut Vec<Op>) {
     const FAM: &str = "fibers, threads & non-local control";
     let skip = "target-conditional (needs x86-64-unix stack-switch / setjmp substrate)";
     for (name, inst) in [
-        ("cont.new", Inst::ContNew { func: 0, sp: 1 }),
+        ("cont.new", Inst::ContNew { func: 0, arg0: 1 }),
         (
             "cont.resume",
             Inst::ContResume {
@@ -1215,8 +1215,8 @@ fn fibers_threads(ops: &mut Vec<Op>) {
             "thread.spawn",
             Inst::ThreadSpawn {
                 func: 1,
-                sp: 0,
-                arg: 0,
+                arg0: 0,
+                arg1: 0,
             },
         ),
         ("thread.join", Inst::ThreadJoin { handle: 0 }),

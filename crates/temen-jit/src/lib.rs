@@ -683,7 +683,8 @@ pub struct WindowRestore {
 pub struct FrozenFiber {
     pub slot: usize,
     pub func: i32,
-    pub sp: i64,
+    /// The entry's first argument, `cont.new`'s `arg0`.
+    pub arg0: i64,
     /// `0` for a free slot: no shadow region lies at offset 0.
     pub shadow_sp: u64,
     /// The slot's generation at freeze (recycling step 2): re-seeded on thaw so a guest handle to a
@@ -702,7 +703,7 @@ impl FrozenFiber {
         FrozenFiber {
             slot,
             func: 0,
-            sp: 0,
+            arg0: 0,
             shadow_sp: 0,
             generation,
             consumed: false,
@@ -4047,7 +4048,7 @@ impl CompiledModule {
             }
         }
 
-        // The generic call-trampoline (one per module; calls any `Tail`-ABI `(sp, arg) -> i64` entry from
+        // The generic call-trampoline (one per module; calls any `Tail`-ABI `(i64, i64) -> i64` entry from
         // Rust). Needed by both the fiber runtime (`cont.*`) and the thread scheduler (vCPU entries).
         #[cfg(fiber_rt)]
         let fiber_tramp = if uses_fibers || uses_threads {
@@ -5739,7 +5740,7 @@ impl CompiledModule {
             fiber_type_id,
             fiber_mask,
         ));
-        // The generic call-trampoline (calls any Tail-ABI `(sp, arg) -> i64` entry from Rust). A
+        // The generic call-trampoline (calls any Tail-ABI `(i64, i64) -> i64` entry from Rust). A
         // thread-only parent already built it (`compile`, `uses_threads` arm); else build it now,
         // incrementally like a submitted unit — a fresh function, a second `finalize_definitions`.
         let tramp = match self.call_tramp {
@@ -5820,7 +5821,7 @@ impl CompiledModule {
                 self.node.clone(),
             )));
         }
-        // The generic call-trampoline (calls any Tail-ABI `(sp, arg) -> i64` entry from Rust). Spawned
+        // The generic call-trampoline (calls any Tail-ABI `(i64, i64) -> i64` entry from Rust). Spawned
         // vCPUs call their entry through it; a fiber-hosting parent already built it, else build it now
         // incrementally like a submitted unit — a fresh function, a second `finalize_definitions`
         // (W^X-safe: only the fresh trampoline page is mprotected; running code is untouched).
@@ -6346,7 +6347,7 @@ impl HostFn {
             FiberSuspend => (&[I64, I64], &[I64]),
             // (args) -> the candidates found
             GcRoots => (&[I64], &[I64]),
-            // (domain, mem_base, fn_table, vmctx, func, sp, arg) -> handle
+            // (domain, mem_base, fn_table, vmctx, func, arg0, arg1) -> handle
             ThreadSpawn => (&[I64, I64, I64, I64, I32, I64, I64], &[I32]),
             // (domain, handle, status_out, vmctx) -> value
             ThreadJoin => (&[I64, I32, I64, I64], &[I64]),
@@ -8996,8 +8997,9 @@ fn build_trampoline(
     Ok(())
 }
 
-/// The fixed signature of a §12 fiber/thread entry: `(i64 sp, i64 arg) -> i64` (the unified
-/// frontend convention). Its structural id is what a `cont.new` funcref is type-checked against.
+/// The fixed signature of a §12 fiber/thread entry: `(i64, i64) -> i64`, the creator's word and the
+/// first resume's (a thread's: both the creator's). Its structural id is what a `cont.new` funcref
+/// is type-checked against.
 #[cfg(fiber_rt)]
 fn fiber_func_type() -> FuncType {
     FuncType {
@@ -9083,15 +9085,15 @@ fn funcs_use_instantiator(funcs: &[Func]) -> bool {
 }
 
 /// Build the generic fiber **call-trampoline**: `extern "C" fn(code, mem_base, fn_table_base,
-/// vmctx, sp, arg) -> i64` that `call.dyn`s a guest fiber entry under its `Tail` ABI. Rust
+/// vmctx, arg0, arg1) -> i64` that `call.dyn`s a guest fiber entry under its `Tail` ABI. Rust
 /// cannot call a `Tail`-convention function directly, so the fiber runtime calls this (default C ABI)
-/// instead; one trampoline serves all fibers since every entry is `(i64 sp, i64 arg) -> i64`.
+/// instead; one trampoline serves all fibers since every entry is `(i64, i64) -> i64`.
 #[cfg(fiber_rt)]
 fn build_fiber_call_trampoline(clif: &mut Function) {
     // Params: `code`, then the guest entry's Tail args in order — mem_base, fn_table_base, vmctx,
     // stack_limit (§2b path B, always present), sp, arg -> i64. `stack_limit` sits in the same relative
     // slot as in `sig_from`, so the entry call args are exactly `p[1..]` (see [`FiberCallTramp`]).
-    let np = 7; // code + (mem_base, fn_table_base, vmctx, stack_limit, sp, arg)
+    let np = 7; // code + (mem_base, fn_table_base, vmctx, stack_limit, arg0, arg1)
     for _ in 0..np {
         clif.signature.params.push(AbiParam::new(I64));
     }
@@ -9108,7 +9110,7 @@ fn build_fiber_call_trampoline(clif: &mut Function) {
     b.seal_block(blk);
     let p = b.block_params(blk).to_vec();
     let code = p[0];
-    let call_args = p[1..].to_vec(); // (mem_base, fn_table_base, vmctx, [stack_limit], sp, arg)
+    let call_args = p[1..].to_vec(); // (mem_base, fn_table_base, vmctx, [stack_limit], arg0, arg1)
     let sig = b.import_signature(sig_from(&[ValType::I64, ValType::I64], &[ValType::I64]));
     let call = b.ins().call_indirect(sig, code, &call_args);
     let r = b.inst_results(call)[0];
@@ -9506,8 +9508,8 @@ fn lower_block(
         // §12 fibers: lower `cont.*` to calls to the host fiber thunks ([`HostFn`]), threading
         // `mem_base`/`fn_table_base`/`vmctx` like `call.cap`. A thunk that sets the trap cell
         // (forged handle, bad funcref, fiber-bomb, root suspend) propagates here.
-        if let Inst::ContNew { func, sp } = inst {
-            // fiber_new(mem_base, fn_table_base, vmctx, funcref:i32, sp:i64, fuel_addr:i64) -> i32
+        if let Inst::ContNew { func, arg0 } = inst {
+            // fiber_new(mem_base, fn_table_base, vmctx, funcref:i32, arg0:i64, fuel_addr:i64) -> i32
             // handle. The running vCPU's fiber runtime is read from a thread-local, so threads +
             // fibers compose. `fuel_addr` (`0` ⇒ un-armed) lets the fiber's first entry refund the
             // prologue charge its starting `cont.resume` already paid (#1642).
@@ -9515,7 +9517,7 @@ fn lower_block(
             let fnt = b.use_var(lower.fn_table_var);
             let vmctx = b.use_var(lower.vmctx_var);
             let funcref = get(&vals, *func)?;
-            let spv = get(&vals, *sp)?;
+            let arg0 = get(&vals, *arg0)?;
             let fuel = if lower.fuel {
                 vmctx_load(b, lower, vmctx::FUEL)
             } else {
@@ -9525,7 +9527,7 @@ fn lower_block(
                 lower.callees,
                 b,
                 HostFn::FiberNew,
-                &[mem_base, fnt, vmctx, funcref, spv, fuel],
+                &[mem_base, fnt, vmctx, funcref, arg0, fuel],
             )?;
             emit_trap_propagate(b, lower, Callee::Host);
             vals.push(b.inst_results(call)[0]);
@@ -9727,8 +9729,8 @@ fn lower_block(
         // §12 threads: lower `thread.spawn`/`thread.join` to calls to the host scheduler thunks
         // ([`HostFn`]), threading `mem_base`/`fn_table_base`/`vmctx` like `call.cap`. A thunk
         // that sets the trap cell (forged handle, thread-bomb) propagates here.
-        if let Inst::ThreadSpawn { func, sp, arg } = inst {
-            // thread_spawn(sched, mem_base, fn_table_base, vmctx, func_idx:i32, sp:i64, arg:i64) -> i32
+        if let Inst::ThreadSpawn { func, arg0, arg1 } = inst {
+            // thread_spawn(sched, mem_base, fn_table_base, vmctx, func_idx:i32, arg0:i64, arg1:i64) -> i32
             let sched = vmctx_load(b, lower, vmctx::SCHED);
             let mem_base = b.use_var(lower.mem_var);
             let fnt = b.use_var(lower.fn_table_var);
@@ -9744,13 +9746,13 @@ fn lower_block(
                 None => *func,
             };
             let func_idx = b.ins().iconst(I32, entry as i64);
-            let spv = get(&vals, *sp)?;
-            let av = get(&vals, *arg)?;
+            let arg0 = get(&vals, *arg0)?;
+            let arg1 = get(&vals, *arg1)?;
             let call = call_host(
                 lower.callees,
                 b,
                 HostFn::ThreadSpawn,
-                &[sched, mem_base, fnt, vmctx, func_idx, spv, av],
+                &[sched, mem_base, fnt, vmctx, func_idx, arg0, arg1],
             )?;
             emit_trap_propagate(b, lower, Callee::Host);
             vals.push(b.inst_results(call)[0]);

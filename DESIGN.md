@@ -1027,16 +1027,18 @@ location outside the window (and trap). Hence the SafeStack split:
 | **Control stack** | out-of-band (Cranelift-managed machine stack) | return addrs, callee-saved regs, SSA spills | **No** |
 | **Data stack** | in the window, per-thread, guard-paged (§5) | address-taken locals, by-value aggregate copies, `alloca`, varargs buffers, `sret` slots | Yes (confined) |
 
-The frontend manages the data stack via a **data-SP** (per-fiber state — see below)
-held in `vmctx` (the context the JIT already needs for window base/mask,
-handle-table base, function-table base, fuel; register-pinning the data-SP is a
-lowering detail). Overflow hits the guard page → fault → §5 detect-and-kill; frames
-larger than a guard page emit a stack-probe (stack-clash mitigation).
+The frontend manages the data stack through a **data-SP**, an ordinary value it threads
+through its own code: temen-llvm passes it as each function's first parameter (§20). The VM
+never reads it. A new fiber or vCPU gets its data stack from its creator: `cont.new` and
+`thread.spawn` carry two `i64` words of the creator's to the fixed entry `(i64, i64) -> i64`,
+and a frontend with a data stack passes the new stack's base as the first. Overflow hits the
+guard page → fault → §5 detect-and-kill; frames larger than a guard page emit a stack-probe
+(stack-clash mitigation).
 
 **This split *is* the fiber model.** A stackful fiber (§12) owns the **pair** of
-stacks — control + data — and switching swaps both SPs; the data-SP and
-callee-saved are per-fiber, while window base/mask and the table bases are
-per-domain (shared, constant). The control stack lives in VA unreachable by guest
+stacks — control + data. The runtime owns the control stack and switches it. The
+data-SP is an ordinary value in the fiber's frames, so it switches with them; window
+base/mask and the table bases are per-domain (shared, constant). The control stack lives in VA unreachable by guest
 masking (CFI) but is **charged to the guest's quota** (§15) so a fiber-bomb OOMs
 itself, not the host (§12). Nothing in this ABI dangles across a suspend: all
 §3d data (aggregates, `alloca`, varargs, `sret`) lives on the data stack, which
@@ -1933,10 +1935,11 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
 - **Fiber** — a first-class suspendable stack (an application of §6 stack
   switching). Because of the two-stack split (§3d), a fiber owns a **stack pair**:
   an in-window guard-paged **data stack** + an **out-of-band control stack**
-  (return addresses/spills, unreachable by guest masking — §5). Create = allocate
-  the pair; switch = save/restore callee-saved + swap *both* SPs (native SP → the
-  control stack and its spills follow automatically; plus the per-fiber data-SP)
-  (~ns, no syscall, no flush). **Free and uncapped, but quota-metered:** the data
+  (return addresses/spills, unreachable by guest masking — §5). Create = the runtime
+  allocates the control stack, and the creator supplies the data stack (§3d: the
+  frontend passes its base as the entry's first argument); switch = save/restore
+  callee-saved + swap the native SP (the control stack and its spills follow
+  automatically, the data-SP among them) (~ns, no syscall, no flush). **Free and uncapped, but quota-metered:** the data
   stack is guest memory; the control stack is out-of-band yet its pages are
   **charged against the guest's memory quota** (§15). So a fiber-bomb OOMs *itself*
   (sandbox-safe) — it cannot exhaust *host* memory via out-of-band stacks. (#2112:

@@ -13303,8 +13303,9 @@ fn lower_vm_builtin(
                 op: ConvOp::WrapI64,
                 a: fn64,
             });
-            let sp = ctx.operand_i64(vm_arg(c, 1)?)?; // the fiber's own data-stack base
-            let r = ctx.push(Inst::ContNew { func, sp });
+            // This frontend's convention: the first entry argument is the fiber's data-stack base.
+            let sp = ctx.operand_i64(vm_arg(c, 1)?)?;
+            let r = ctx.push(Inst::ContNew { func, arg0: sp });
             ctx.bind_dest(&c.dest, r); // i64 fiber handle (16-bit slot + 48-bit generation)
             Ok(true)
         }
@@ -13362,10 +13363,15 @@ fn lower_vm_builtin(
         }
         // ---- §12 threads ----
         "__vm_thread_spawn" => {
+            // This frontend's convention: the first entry argument is the thread's data-stack base.
             let func = ctx.direct_func_idx(vm_arg(c, 0)?)?; // a static funcidx
-            let sp = ctx.operand_i64(vm_arg(c, 1)?)?; // the thread's data-stack base
+            let sp = ctx.operand_i64(vm_arg(c, 1)?)?;
             let arg = ctx.operand_i64(vm_arg(c, 2)?)?;
-            let r = ctx.push(Inst::ThreadSpawn { func, sp, arg });
+            let r = ctx.push(Inst::ThreadSpawn {
+                func,
+                arg0: sp,
+                arg1: arg,
+            });
             ctx.bind_dest(&c.dest, r); // i32 thread handle
             Ok(true)
         }

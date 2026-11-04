@@ -670,10 +670,13 @@ fn gen_fiber_root(g: &mut Gen, suspends: u32) -> Func {
     insts.push(Inst::RefFunc { func: 1 });
     let vf = next;
     next += 1;
-    insts.push(Inst::ConstI64(4096)); // the fiber's data-stack base (unused by the interp)
+    insts.push(Inst::ConstI64(4096)); // the entry's first argument (unused by the entry)
     let vsp = next;
     next += 1;
-    insts.push(Inst::ContNew { func: vf, sp: vsp });
+    insts.push(Inst::ContNew {
+        func: vf,
+        arg0: vsp,
+    });
     let k = next;
     next += 1;
     let mut vals: Vec<u32> = Vec::new();
@@ -855,7 +858,7 @@ fn gen_recycle_root(g: &mut Gen, throwaways: u32, suspends: u32) -> Func {
     for _ in 0..throwaways {
         insts.push(Inst::ContNew {
             func: v_fa,
-            sp: v_sp,
+            arg0: v_sp,
         });
         let k = next;
         next += 1;
@@ -875,7 +878,7 @@ fn gen_recycle_root(g: &mut Gen, throwaways: u32, suspends: u32) -> Func {
     // The real fiber B reuses slot 0 at generation `throwaways`; resume it `suspends + 1` times.
     insts.push(Inst::ContNew {
         func: v_fb,
-        sp: v_sp,
+        arg0: v_sp,
     });
     let kb = next;
     next += 1;

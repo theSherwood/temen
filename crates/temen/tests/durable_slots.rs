@@ -637,7 +637,7 @@ mod jit {
         temen_jit::FrozenFiber {
             slot: f.slot,
             func: f.func,
-            sp: f.sp,
+            arg0: f.arg0,
             shadow_sp: f.shadow_sp,
             generation: f.generation,
             consumed: f.consumed,
@@ -648,7 +648,7 @@ mod jit {
         FrozenFiber {
             slot: f.slot,
             func: f.func,
-            sp: f.sp,
+            arg0: f.arg0,
             shadow_sp: f.shadow_sp,
             generation: f.generation,
             consumed: f.consumed,

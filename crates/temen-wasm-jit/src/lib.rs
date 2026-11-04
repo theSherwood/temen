@@ -2373,12 +2373,12 @@ fn scheduler_op(inst: &Inst) -> Option<(Vec<u32>, Inst, FuncType)> {
     use ValType::{I32, I64};
     let sig = |params: Vec<ValType>, results: Vec<ValType>| FuncType { params, results };
     Some(match *inst {
-        Inst::ThreadSpawn { func, sp, arg } => (
-            vec![sp, arg],
+        Inst::ThreadSpawn { func, arg0, arg1 } => (
+            vec![arg0, arg1],
             Inst::ThreadSpawn {
                 func,
-                sp: 0,
-                arg: 1,
+                arg0: 0,
+                arg1: 1,
             },
             sig(vec![I64, I64], vec![I32]),
         ),

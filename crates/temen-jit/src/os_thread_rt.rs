@@ -1560,13 +1560,13 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> loom::sync::MutexGuard<'_, T> {
 struct ChildCall {
     env: Env,
     code: u64,
-    sp: u64,
-    arg: u64,
+    arg0: u64,
+    arg1: u64,
     ret: i64,
 }
 
 /// `Entry`-shaped shim (so it runs under [`mem::run_guarded_range`] with no new C shim): call the guest
-/// thread entry `code(sp, arg)` via the shared call-trampoline, stash the result.
+/// thread entry `code(arg0, arg1)` via the shared call-trampoline, stash the result.
 extern "C" fn child_entry(
     a: *const i64,
     _r: *mut i64,
@@ -1591,8 +1591,8 @@ extern "C" fn child_entry(
             env.fn_table_base,
             env.vm,
             crate::stack_check::thread_limit(),
-            (*c).sp,
-            (*c).arg,
+            (*c).arg0,
+            (*c).arg1,
         );
         (*c).ret = v as i64;
     }
@@ -1642,8 +1642,8 @@ struct CompletedChild {
 struct SpawnArgs {
     env: Env,
     code: u64,
-    sp: u64,
-    arg: u64,
+    arg0: u64,
+    arg1: u64,
     /// §12 dense vCPU id seeded into this child's per-vCPU TLS register (`vcpu.tls`): its task, the
     /// domain's spawns in order (root 0; children 1, 2, …).
     vcpu_id: i64,
@@ -1676,8 +1676,8 @@ struct PendingSpawn {
     ctx: usize,
     code: u64,
     func_idx: u32,
-    sp: u64,
-    arg: u64,
+    arg0: u64,
+    arg1: u64,
     done: std::sync::Arc<Done>,
 }
 
@@ -1811,8 +1811,8 @@ fn run_child(a: SpawnArgs) {
     let mut call = ChildCall {
         env,
         code: a.code,
-        sp: a.sp,
-        arg: a.arg,
+        arg0: a.arg0,
+        arg1: a.arg1,
         ret: 0,
     };
     // A vCPU that could not take a lane never runs guest code: a cap of 0 is unsatisfiable, which
@@ -1899,7 +1899,7 @@ fn run_child(a: SpawnArgs) {
                     slot: if joinable { dc.slot } else { 0 },
                     joinable,
                     func: dc.func_idx as i32,
-                    args: vec![a.sp as i64, a.arg as i64],
+                    args: vec![a.arg0 as i64, a.arg1 as i64],
                     shadow_sp: extent,
                     completed_result: None, // a spilled (frozen) child re-runs on thaw
                 });
@@ -1949,7 +1949,7 @@ fn run_child(a: SpawnArgs) {
 
 /// The running vCPU's env, found via the baked `Domain` pointer the thunks receive.
 ///
-/// `thread.spawn` thunk: launch a new vCPU OS thread running `funcs[func_idx](sp, arg)`; return its
+/// `thread.spawn` thunk: launch a new vCPU OS thread running `funcs[func_idx](arg0, arg1)`; return its
 /// `i32` handle. Traps (`ThreadFault`, returns `-1`) on a thread-bomb.
 ///
 /// # Safety
@@ -1961,8 +1961,8 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     _fn_table_base: u64,
     vm: &crate::VmCtx,
     func_idx: u32,
-    sp: u64,
-    arg: u64,
+    arg0: u64,
+    arg1: u64,
 ) -> i32 {
     let dom = current_domain(sched);
     let hub = dom.hub();
@@ -1981,7 +1981,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
         && std::ptr::eq(hub, dom)
         && fiber_rt::window_is_durable_active(env.mem_base, env.shadow)
     {
-        return defer_spawn(dom, code, func_idx, sp, arg, vm);
+        return defer_spawn(dom, code, func_idx, arg0, arg1, vm);
     }
     // §12.8 4A.5 stage (ii): a durable child spawned during NORMAL runs as a real OS thread with its own
     // top-down shadow context, so a freeze that reaches it unwinds it into its own per-context SP word
@@ -2072,8 +2072,8 @@ pub(crate) unsafe extern "C" fn thread_spawn(
         let args = SpawnArgs {
             env,
             code,
-            sp,
-            arg,
+            arg0,
+            arg1,
             vcpu_id,
             durable_child,
             done,
@@ -2121,8 +2121,8 @@ unsafe fn defer_spawn(
     dom: &Domain,
     code: u64,
     func_idx: u32,
-    sp: u64,
-    arg: u64,
+    arg0: u64,
+    arg1: u64,
     vm: &crate::VmCtx,
 ) -> i32 {
     // Reserve this child's shadow context top-down (`MAX_SHADOW_CTX`, −1, …) so it can't collide with
@@ -2175,8 +2175,8 @@ unsafe fn defer_spawn(
         ctx,
         code,
         func_idx,
-        sp,
-        arg,
+        arg0,
+        arg1,
         done,
     });
     handle
@@ -2186,7 +2186,7 @@ impl Domain {
     /// Run one child's guest entry **inline** on this thread (single-worker, slice 3.3): set up its
     /// fiber execution context (for `cont.*`), arm a **nested** detect-and-kill recovery
     /// (`run_guarded_range` saves/restores the parent run's recovery state itself, like `invoke_extra`),
-    /// call `code(sp, arg)` via the shared call-trampoline, and return `(result, trap, faulted)`. The
+    /// call `code(arg0, arg1)` via the shared call-trampoline, and return `(result, trap, faulted)`. The
     /// caller is responsible for the durable control words (state + active shadow-SP) around the call.
     ///
     /// # Safety
@@ -2196,8 +2196,8 @@ impl Domain {
         &self,
         env: Env,
         code: u64,
-        sp: u64,
-        arg: u64,
+        arg0: u64,
+        arg1: u64,
         vcpu_id: i64,
     ) -> (i64, i64, bool) {
         // #2488 — a context and fuel cell of its own, as a child on its own OS thread has.
@@ -2235,8 +2235,8 @@ impl Domain {
         let mut call = ChildCall {
             env,
             code,
-            sp,
-            arg,
+            arg0,
+            arg1,
             ret: 0,
         };
         // SAFETY: `child_entry` honours the `Entry` ABI; `call` outlives the call; the guarded call
@@ -2356,7 +2356,7 @@ impl Domain {
                 *lock(&self.cur_task) = p.task;
                 // §12: seed the child's per-vCPU TLS register to its (global) task id, matching the interp.
                 let (result, trap, faulted) =
-                    self.run_child_inline(env, p.code, p.sp, p.arg, p.task as i64);
+                    self.run_child_inline(env, p.code, p.arg0, p.arg1, p.task as i64);
                 *lock(&self.cur_task) = resume_task; // back to the caller between children
                 crate::durable_shadow::seed(resume_region); // and to the caller's region
 
@@ -2382,7 +2382,7 @@ impl Domain {
                         slot: if joinable { p.slot } else { 0 },
                         joinable,
                         func: p.func_idx as i32,
-                        args: vec![p.sp as i64, p.arg as i64],
+                        args: vec![p.arg0 as i64, p.arg1 as i64],
                         shadow_sp: child_sp,
                         completed_result: None, // a spilled (frozen) child re-runs on thaw
                     });
@@ -2445,8 +2445,8 @@ impl Domain {
             func_idx: u32,
             ctx: usize,
             code: u64,
-            sp: u64,
-            arg: u64,
+            arg0: u64,
+            arg1: u64,
             shadow_sp: u64,
             done: std::sync::Arc<Done>,
         }
@@ -2499,8 +2499,8 @@ impl Domain {
                 func_idx: v.func as u32,
                 ctx: self.shadow().ctx_of_sp(v.shadow_sp),
                 code: entry.code(),
-                sp: v.args.first().copied().unwrap_or(0) as u64,
-                arg: v.args.get(1).copied().unwrap_or(0) as u64,
+                arg0: v.args.first().copied().unwrap_or(0) as u64,
+                arg1: v.args.get(1).copied().unwrap_or(0) as u64,
                 shadow_sp: v.shadow_sp,
                 done,
             });
@@ -2530,8 +2530,8 @@ impl Domain {
             let args = SpawnArgs {
                 env,
                 code: r.code,
-                sp: r.sp,
-                arg: r.arg,
+                arg0: r.arg0,
+                arg1: r.arg1,
                 vcpu_id: r.task as i64,
                 durable_child: Some(DurableChild {
                     shadow: self.shadow(),
