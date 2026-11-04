@@ -12747,7 +12747,18 @@ fn settle_wakes(
         else {
             continue;
         };
-        let Some(reply) = callee.lock_unpoisoned().svc_results.remove(ticket) else {
+        // #2695 step 2 — the reply ends the call: a payer a held callee named for it goes, as the
+        // tree-walker's `reply_locked` lets it go (a thread of the callee that served it ran it
+        // on its own fuel).
+        let reply = {
+            let mut c = callee.lock_unpoisoned();
+            let reply = c.svc_results.remove(ticket);
+            if reply.is_some() {
+                c.svc_payers.remove(ticket);
+            }
+            reply
+        };
+        let Some(reply) = reply else {
             continue;
         };
         match std::mem::replace(&mut t.state, TaskState::Runnable) {
@@ -20635,15 +20646,7 @@ impl Vm {
                     // re-executes this op (pc deliberately NOT advanced).
                     let mut admitted = false;
                     loop {
-                        // A thread serving the call runs it on its own fuel: the payer a held
-                        // domain names for its activations goes.
-                        let d = host.with(|p| {
-                            let d = p.svc_queue.pop_front();
-                            if let Some(d) = &d {
-                                p.svc_payers.remove(&d.ticket);
-                            }
-                            d
-                        });
+                        let d = host.with(|p| p.svc_queue.pop_front());
                         let Some(d) = d else { break };
                         // The queue only holds servable dispatches (checked at enqueue), so a
                         // missing handler here is host-state corruption: fail closed. Handlers
