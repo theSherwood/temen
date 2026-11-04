@@ -8908,7 +8908,16 @@ fn build_clif(
 
     b.seal_all_blocks();
     b.finalize();
-    lay_out_loop_branches(clif);
+    // A loop is a cycle, and a cycle has an edge to an earlier or the same block: a function with
+    // none has nothing to lay out.
+    let cyclic = f.blocks.iter().enumerate().any(|(i, blk)| {
+        (0..)
+            .map_while(|k| blk.term.edge(k))
+            .any(|(to, _)| to as usize <= i)
+    });
+    if cyclic {
+        lay_out_loop_branches(clif);
+    }
     Ok(())
 }
 
