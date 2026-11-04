@@ -15310,7 +15310,7 @@ fn held_program(
     entry: FuncIdx,
     mut host: Host,
 ) -> Result<Result<HeldProgram, (Trap, Box<Host>)>, Box<Host>> {
-    let Some(c) = compile_module_for(m, true) else {
+    let Some(c) = compile_module_for(m, host.self_module(), true) else {
         return Err(Box::new(host));
     };
     if host.is_durable() {
