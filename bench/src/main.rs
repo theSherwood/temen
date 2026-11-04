@@ -50,6 +50,10 @@
 //!   - the JIT and wasm lanes run each kernel at [`LAYOUTS`] code layouts (#2634, #2749): a loop
 //!     that straddles a 64-byte line can run 2× slower on either engine, so each lane is the median
 //!     over layouts that step the loop across a whole line, and the table shows the JIT's spread.
+//!   - every hand-written kernel's loop header exits on its `br_if`'s taken edge and falls through
+//!     to the body, the shape temen's C frontend and wasm transpiler emit (#2754). Cranelift lays a
+//!     branch's else-target out right after it, so a loop written the other way round takes an
+//!     extra jump each iteration that no producer's code pays.
 //!   - *cold start* times the whole path source → first result (n=0, so the loop body never
 //!     runs but the full function is still compiled).
 //!
@@ -129,8 +133,8 @@ block 0 (v0: i64) {
   br 1(v0, v1, v2)
 }
 block 1 (v3: i64, v4: i64, v5: i64) {
-  v6 = i64.lt_s v5 v3
-  br_if v6 2(v3, v4, v5) 3(v4)
+  v6 = i64.ge_s v5 v3
+  br_if v6 3(v4) 2(v3, v4, v5)
 }
 block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 6364136223846793005
@@ -200,17 +204,9 @@ block 3 (v17: i64) {
 /// **Measured (a reference point, not a goal):** `simd` lands at **~1.0× of Wasmtime** — SIMD
 /// *compute parity*, the shared-Cranelift "as fast as wasm" story (§1a/D36) extended to v128. Both
 /// engines emit the same 25-byte loop, which runs at one cycle an iteration, or two where it straddles
-/// a 64-byte line; timed at one layout per engine it read 2.0× (#2749), hence [`LAYOUTS`].
-///
-/// The loop below is written in the **canonical hot-loop shape**: the header's `br_if` exits on
-/// the *taken* edge and the loop body is the *fall-through* (else) edge, with a backward `br` to
-/// the header. That shape matters more than it looks: an earlier hand-written version inverted it
-/// (loop body on the taken edge) and measured **~3×** on the identical JIT — purely a machine-block
-/// layout effect (two taken branches per iteration vs one), not a SIMD-lowering gap. The wasm→IR
-/// transpiler emits the canonical shape natively (wasm's `br_if $done` ⇒ "exit on true, fall
-/// through to body"), so `--from-wasm` is always ~parity; this kernel mirrors that. The effect is
-/// outsized here only because the body is one `paddd` — when the body does real work (see `alu`)
-/// the per-iteration branch cost is a negligible fraction.
+/// a 64-byte line; timed at one layout per engine it read 2.0× (#2749), hence [`LAYOUTS`]. An
+/// earlier version with its loop the other way round (see the kernels' loop shape, in the module
+/// docs) read ~3×: one `paddd` is all the body there is to hide a second jump behind.
 const SIMD: Kernel = Kernel {
     name: "simd",
     ir: "\
@@ -292,8 +288,9 @@ block 3 (v0: i64, v1: i64, v2: v128) {
 
 /// `(i64 n) -> i64`: store then load `i` through a windowed address each iteration, so the
 /// memory path is exercised. Result = Σ i (independent of where it lands). Timed against
-/// both wasm32 (i32 address + guard page) and wasm64 (i64 address + bounds check); we use a
-/// 64-bit masked address, so the design expects wasm32 < us < wasm64.
+/// both wasm32 (i32 address + guard page) and wasm64 (i64 address + bounds check). The address is
+/// provably in the window, so the lowering drops the mask: it runs at wasm32's speed and faster than
+/// wasm64. (It read 1.5× wasm32 while its loop was written the other way round, #2754.)
 const MEMSUM: Kernel = Kernel {
     name: "memsum",
     ir: "\
@@ -305,8 +302,8 @@ block 0 (v0: i64) {
   br 1(v0, v1, v2)
 }
 block 1 (v3: i64, v4: i64, v5: i64) {
-  v6 = i64.lt_s v5 v3
-  br_if v6 2(v3, v4, v5) 3(v4)
+  v6 = i64.ge_s v5 v3
+  br_if v6 3(v4) 2(v3, v4, v5)
 }
 block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 1023
@@ -383,8 +380,8 @@ block 0 (v0: i64) {
   br 1(v0, v1, v2)
 }
 block 1 (v3: i64, v4: i64, v5: i64) {
-  v6 = i64.lt_s v5 v3
-  br_if v6 2(v3, v4, v5) 3(v4)
+  v6 = i64.ge_s v5 v3
+  br_if v6 3(v4) 2(v3, v4, v5)
 }
 block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 2654435761
@@ -475,8 +472,8 @@ block 0 (v0: i64) {
   br 1(v0, v1, v2)
 }
 block 1 (v3: i64, v4: f64, v5: i64) {
-  v6 = i64.lt_s v5 v3
-  br_if v6 2(v3, v4, v5) 3(v4)
+  v6 = i64.ge_s v5 v3
+  br_if v6 3(v4) 2(v3, v4, v5)
 }
 block 2 (v7: i64, v8: f64, v9: i64) {
   v10 = i64.const 1023
@@ -548,8 +545,8 @@ block 0 (v0: i64) {
   br 1(v0, v1, v2)
 }
 block 1 (v3: i64, v4: i64, v5: i64) {
-  v6 = i64.lt_s v5 v3
-  br_if v6 2(v3, v4, v5) 3(v4)
+  v6 = i64.ge_s v5 v3
+  br_if v6 3(v4) 2(v3, v4, v5)
 }
 block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i32.const 1
@@ -630,8 +627,8 @@ block 0 (v0: i64) {
   br 1(v0, v1, v2, v3)
 }
 block 1 (v4: i64, v5: i64, v6: i64, v7: i64) {
-  v8 = i64.lt_s v6 v4
-  br_if v8 2(v4, v5, v6, v7) 3(v5)
+  v8 = i64.ge_s v6 v4
+  br_if v8 3(v5) 2(v4, v5, v6, v7)
 }
 block 2 (v9: i64, v10: i64, v11: i64, v12: i64) {
   v13 = i64.const 6364136223846793005
@@ -769,8 +766,8 @@ block 0 (v0: i64) {
   br 1(v0, v1, v2)
 }
 block 1 (v3: i64, v4: i64, v5: i64) {
-  v6 = i64.lt_s v5 v3
-  br_if v6 2(v3, v4, v5) 3(v4)
+  v6 = i64.ge_s v5 v3
+  br_if v6 3(v4) 2(v3, v4, v5)
 }
 block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i64.const 2654435761
@@ -1322,8 +1319,8 @@ block 0 (v0: i64) {
   br 1(v0, v1, v2)
 }
 block 1 (v3: i64, v4: i64, v5: i64) {
-  v6 = i64.lt_s v5 v3
-  br_if v6 2(v3, v4, v5) 3(v4)
+  v6 = i64.ge_s v5 v3
+  br_if v6 3(v4) 2(v3, v4, v5)
 }
 block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i32.const 0
@@ -1382,8 +1379,8 @@ block 0 (v0: i64) {
   br 1(v0, v1, v2)
 }
 block 1 (v3: i64, v4: i64, v5: i64) {
-  v6 = i64.lt_s v5 v3
-  br_if v6 2(v3, v4, v5) 3(v4)
+  v6 = i64.ge_s v5 v3
+  br_if v6 3(v4) 2(v3, v4, v5)
 }
 block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i32.const 0
@@ -2252,9 +2249,10 @@ fn print_table(results: &[(Resolved, Raw)]) {
          and wasm (Wasmtime); all but native via Cranelift.  ratio = temen / wasm  (<1 = temen faster).\n\
          `i/jit` = interp ÷ jit (the interpreter's slowdown); `jit/nat` = jit ÷ native (how many×\n\
          the JIT runs over the bare-metal ceiling — ≈1× ⇒ near-native).\n\
-         Expect: alu compute ≈1× vs wasm; cold-start <1×.  Memory: wasm32 < temen always (guard\n\
-         pages are free); temen < wasm64 once addresses *vary* (scatter) so Wasmtime can't\n\
-         CSE the bounds check — memsum (same addr) lets it, so wasm64 looks ~tied there.\n\
+         Expect: alu compute ≈1× vs wasm; cold-start <1×.  Memory: where the lowering proves an\n\
+         address in the window it drops the mask, and temen runs about as fast as wasm32 (whose\n\
+         guard pages are free) and faster than wasm64 (whose bounds check stays): memsum, scatter,\n\
+         cache. Where it can't, the mask costs (locals_c).\n\
          Interface (host calls, §1a): `hostcall` (scalar call.cap vs a wasm import) is temen-\n\
          slower today — call.cap is a generic arg-packing thunk; devirtualization (D45) is\n\
          deferred. `hostbuf` (a zero-copy (ptr,len) borrow buffer the host reads in place)\n\

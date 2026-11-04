@@ -10996,6 +10996,11 @@ fn read_call_results(
 /// results. Each caller's post-call check ([`emit_trap_propagate`]) returns in turn, up to the
 /// entry trampoline, which reports the trap.
 fn emit_trap(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
+    // A trap path runs at most once, so Cranelift lays it out after the function's hot code, and the
+    // branch that guards it falls through to the code that doesn't trap (#2754).
+    if let Some(trapping) = b.current_block() {
+        b.set_cold_block(trapping);
+    }
     emit_trap_capture(b, lower);
     let code = b.ins().iconst(I64, kind as u32 as i64); // full i64 cell (high bits 0)
     let vmctx = b.use_var(lower.vmctx_var);
@@ -11250,7 +11255,6 @@ fn emit_fuel_check(b: &mut FunctionBuilder, lower: &Lower) {
     b.ins()
         .brif(drawn, cont, &[BlockArg::from(drawn)], trap_blk, &[]);
     b.switch_to_block(trap_blk);
-    b.set_cold_block(trap_blk);
     emit_trap(b, lower, TrapKind::OutOfFuel);
     b.switch_to_block(cont);
     // Charge one: store `fuel - 1` back. The store⇒load dependency (same `addr`) is what keeps the
