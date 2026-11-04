@@ -1441,6 +1441,27 @@ mod tests {
     /// needs a privilege on Windows).
     #[cfg(windows)]
     fn link_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        link_via(target, link, mklink_j)
+    }
+
+    /// `mklink /J` makes a directory, then sets its reparse point. A walk through `link` that met the
+    /// plain directory between the two could fill it, which the reparse point needs empty, and leave
+    /// it in the way of every later `mklink` (#2708). So the junction is made under a name no walk
+    /// takes, then renamed into place in one step.
+    #[cfg(windows)]
+    fn link_via(
+        target: &Path,
+        link: &Path,
+        make: fn(&Path, &Path) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let tmp = link.with_extension("link");
+        let _ = std::fs::remove_dir(&tmp); // a junction a failed rename left
+        make(target, &tmp)?;
+        std::fs::rename(&tmp, link)
+    }
+
+    #[cfg(windows)]
+    fn mklink_j(target: &Path, link: &Path) -> std::io::Result<()> {
         let out = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
             .arg(link)
@@ -1458,7 +1479,7 @@ mod tests {
     /// then set its reparse point), with the window between them held open for 5 ms, so a walk
     /// through `link` meets the plain directory every time rather than once in a while.
     #[cfg(windows)]
-    fn link_dir_forced(target: &Path, link: &Path) -> std::io::Result<()> {
+    fn junction_forced(target: &Path, link: &Path) -> std::io::Result<()> {
         use std::os::windows::ffi::OsStrExt;
         use std::os::windows::fs::OpenOptionsExt;
         use std::os::windows::io::AsRawHandle;
@@ -1706,9 +1727,9 @@ mod tests {
         // A junction costs a process on Windows, so fewer swaps there.
         let swaps = if cfg!(windows) { 50 } else { 500 };
         // TEMPORARY (#2708): on Windows the link out is made the way `mklink /J` makes it, with the
-        // window between its two steps held open; removed before merge.
+        // window between its two steps held open, and then renamed into place; removed before merge.
         #[cfg(windows)]
-        let link_dir = link_dir_forced;
+        let link_dir = |target: &Path, link: &Path| link_via(target, link, junction_forced);
         let walks = std::sync::Arc::new(AtomicU64::new(0));
         let swapper = std::thread::spawn({
             let walks = walks.clone();
