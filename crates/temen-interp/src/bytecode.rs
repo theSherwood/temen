@@ -144,12 +144,17 @@ struct Copies {
 impl Copies {
     /// Build from resolved `(src, dst)` pairs, classifying `aliasing` = some `dst` is also some `src`
     /// (so a one-pass sequential copy could clobber a not-yet-read source). An edge can carry
-    /// hundreds of copies (#2447), so the sources are sorted and each `dst` searched for.
-    fn new(pairs: Box<[(u32, u32)]>) -> Copies {
-        let mut srcs: Vec<u32> = pairs.iter().map(|&(s, _)| s).collect();
+    /// hundreds of copies (#2447), so the sources are sorted and each `dst` searched for. They are
+    /// sorted in `srcs`, which the caller reuses across a function's edges (#2586).
+    fn new(pairs: &[(u32, u32)], srcs: &mut Vec<u32>) -> Copies {
+        srcs.clear();
+        srcs.extend(pairs.iter().map(|&(s, _)| s));
         srcs.sort_unstable();
         let aliasing = pairs.iter().any(|&(_, d)| srcs.binary_search(&d).is_ok());
-        Copies { pairs, aliasing }
+        Copies {
+            pairs: pairs.into(),
+            aliasing,
+        }
     }
 }
 /// A resolved branch edge: its arg copies plus the target op index (`pc`).
@@ -2538,7 +2543,10 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
     let discard = nslots;
     nslots += 1;
     let mut block_pc = vec![0u32; f.blocks.len()];
-    let mut ops: Vec<Op> = Vec::new();
+    // One op per instruction and one per terminator, less any compare a branch fuses: sized once
+    // rather than grown (#2586).
+    let nops = f.blocks.iter().map(|b| b.insts.len() + 1).sum();
+    let mut ops: Vec<Op> = Vec::with_capacity(nops);
     // Debug reverse map (Slice 1c-3), built **incrementally** alongside `ops` (was a positional
     // post-pass) so fusion — which drops an op — keeps `src` and `ops` in lockstep: each op push is
     // paired with exactly one `src` push. Instruction ops map to their `(block, inst)`; the
@@ -2546,7 +2554,7 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
     // terminator-trap site from an instruction's). A fused `BrIfCmp` takes the terminator location
     // (it can never trap), and the fused-away `IntCmp`'s entry is dropped — the fused program is
     // never single-stepped (debug/trace compile unfused), so no source location is lost there.
-    let mut src: Vec<Option<(u32, u32)>> = Vec::new();
+    let mut src: Vec<Option<(u32, u32)>> = Vec::with_capacity(nops);
     // #2448: in the fused compile, a block param that only forwards a value reads that value's
     // slot, and no edge copies into it. The unfused compile (stepping, tracing, a debug run's
     // frames, read by `(block, value)`) keeps every param in a slot of its own.
@@ -2581,29 +2589,32 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
             }
         }
     }
+    // An edge's copies are gathered in `pairs`, then boxed at their size: most edges carry one to
+    // three, which a vector grown per edge, shrunk to a box, and sorted in a copy of its own took
+    // three allocations to hold (#2586).
+    let (mut pairs, mut srcs) = (Vec::new(), Vec::new());
     for (bi, b) in f.blocks.iter().enumerate() {
         block_pc[bi] = ops.len() as u32;
         // operand: block-local index -> frame slot
         let g = |local: u32| read[(base[bi] + local) as usize];
         let mut local = b.inputs() as u32;
         for (i, inst) in b.insts.iter().enumerate() {
-            let dst = match view.results(inst) {
-                0 => discard,
-                _ => base[bi] + local,
-            };
-            local += view.results(inst) as u32;
+            let n = view.results(inst) as u32;
+            let dst = if n == 0 { discard } else { base[bi] + local };
+            local += n;
             ops.push(compile_inst(inst, dst, view, &g)?);
             src.push(Some((bi as u32, i as u32)));
         }
         // Terminator -> edge copies (block-local src in this block -> first slots of target) + jump.
-        let edge = |bidx: usize, args: &[u32]| -> Edge {
+        let mut edge = |bidx: usize, args: &[u32]| -> Edge {
             // A param that forwards reads its source's slot, so no edge writes its own.
-            let mut pairs: Vec<(u32, u32)> = args
-                .iter()
-                .zip(base[bidx]..)
-                .filter(|&(_, dst)| read[dst as usize] == dst)
-                .map(|(a, dst)| (g(*a), dst))
-                .collect();
+            pairs.clear();
+            pairs.extend(
+                args.iter()
+                    .zip(base[bidx]..)
+                    .filter(|&(_, dst)| read[dst as usize] == dst)
+                    .map(|(a, dst)| (g(*a), dst)),
+            );
             // In the unfused compile the target's captures ride every edge into it too, each copied
             // from the slot of the value it names.
             if !fuse {
@@ -2619,7 +2630,7 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
             // and its removal can't affect the gather/scatter of the other (aliasing) copies. Applies
             // uniformly to every terminator's edges (Br/BrIf/BrIfCmp/BrTable), fused or not.
             pairs.retain(|(src, dst)| src != dst);
-            (Copies::new(pairs.into()), bidx as u32) // block index; patched to entry pc below
+            (Copies::new(&pairs, &mut srcs), bidx as u32) // block index; patched to entry pc below
         };
         match &b.term {
             Terminator::Br { target, args } => {
