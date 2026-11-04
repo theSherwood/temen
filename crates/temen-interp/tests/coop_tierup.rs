@@ -1377,7 +1377,7 @@ fn root_fork_run(
     });
     let back =
         Arc::new(temen_interp::Region::owned_zeroed(1 << 16, 4096).expect("64 KiB allocates"));
-    let program = bytecode::compile_reserved(m).expect("in subset");
+    let program = bytecode::compile_reserved(&Arc::new(m.clone())).expect("in subset");
     let mut run = bytecode::CoopRun::new_reserved_over_compiled(
         m,
         program,

@@ -1438,20 +1438,25 @@ mod tests {
     }
 
     /// Link `link` to the directory `target` with a junction, which any user may make (a symlink
-    /// needs a privilege on Windows).
+    /// needs a privilege on Windows). `mklink /J` makes a directory, then sets its reparse point. A
+    /// walk through `link` that met the plain directory between the two could fill it, which the
+    /// reparse point needs empty, and leave it in the way of every later `mklink` (#2708). So the
+    /// junction is made under a name no walk takes, then renamed into place in one step.
     #[cfg(windows)]
     fn link_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        let tmp = link.with_extension("link");
+        let _ = std::fs::remove_dir(&tmp); // a junction a failed rename left
         let out = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
-            .arg(link)
+            .arg(&tmp)
             .arg(target)
             .output()?;
-        match out.status.success() {
-            true => Ok(()),
-            false => Err(std::io::Error::other(
+        if !out.status.success() {
+            return Err(std::io::Error::other(
                 String::from_utf8_lossy(&out.stderr).into_owned(),
-            )),
+            ));
         }
+        std::fs::rename(&tmp, link)
     }
 
     /// Remove the link [`link_dir`] made, not what it points to.
@@ -1601,7 +1606,8 @@ mod tests {
         // through every state the tree passes through, the link out among them, while each step
         // lands in the middle of some walk. A step can fail while the guest holds what it moves
         // (Windows refuses to rename a directory a handle holds open), so it is retried. A step that
-        // waits a minute fails the test rather than hanging it.
+        // waits a minute fails the test rather than hanging it, naming every distinct error it saw
+        // in order: the first is the one that started the failure (#2708).
         fn step(
             walks: &AtomicU64,
             seen: &mut u64,
@@ -1616,10 +1622,21 @@ mod tests {
                 );
                 std::thread::yield_now();
             }
+            let mut errors: Vec<String> = Vec::new();
             loop {
                 match f() {
                     Ok(()) => break,
-                    Err(e) => assert!(std::time::Instant::now() < deadline, "{what}: {e}"),
+                    Err(e) => {
+                        let e = e.to_string();
+                        if !errors.contains(&e) {
+                            errors.push(e);
+                        }
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "{what}: {}",
+                            errors.join(", then: ")
+                        );
+                    }
                 }
                 std::thread::yield_now();
             }
