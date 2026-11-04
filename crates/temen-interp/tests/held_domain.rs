@@ -1,19 +1,16 @@
-//! #2695 step 2 — a **held** domain ([`Host::hold`]) on the tree-walker, the oracle. Its entry
-//! returns and it rests instead of ending the run: it serves each call queued on it as an
-//! activation, a new vCPU of the domain at the op's handler, called with the call's arguments, and
-//! its threads run on meanwhile. A member's trap or exit still ends it, and the run ends once nothing
-//! in it can run. The other engines and the debugger decline a held domain, and a durable one is
-//! refused.
+//! #2695 step 2 — a domain its embedder **holds** ([`HeldDomain`]) on the tree-walker, the oracle.
+//! It outlives its entry and takes calls until it ends itself or its embedder ends it. Between calls
+//! its threads keep running. Each call, the embedder's or a domain's of its run, runs as an
+//! activation: a new fiber in the domain at the op's handler, called with exactly the op's
+//! arguments, on the caller's thread, which funds it. The domain's calls run one at a time, each
+//! until it parks (`Single`, DESIGN.md §12a).
 
 #[path = "support/rec.rs"]
 mod rec;
 
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
-use temen_interp::{
-    run_capture_reserved_with_host, run_with_host_fast, Host, Inspector, Reply, Stop, Trap, Value,
-    GRANT_SERVE_LIVE_TAG,
-};
+use temen_interp::{HeldDomain, Host, Reply, Trap, Value, GRANT_SERVE_LIVE_TAG};
 use temen_ir::SpawnRec;
 
 /// The ops of the domain's one offer, `"svc"`.
@@ -21,23 +18,39 @@ const PAIR: u32 = 0;
 const BOOM: u32 = 1;
 const QUIT: u32 = 2;
 const JOIN_WORKER: u32 = 3;
-const STUCK: u32 = 4;
+const WAIT_SIGNAL: u32 = 4;
+const SIGNAL: u32 = 5;
+const TOTAL: u32 = 7;
+const JOIN_CHILD: u32 = 8;
+const TLS: u32 = 9;
+const OBSERVE: u32 = 10;
+const BUMP: u32 = 11;
 
-/// The entries: the plain one, one that spawns a worker thread, one that spawns a child domain.
+/// The entries, each answering 1: the plain one, one that spawns a worker thread, one that spawns a
+/// child domain, the same waiting 50 ms before it returns, and one that traps.
 const ENTRY: u32 = 0;
 const ENTRY_WITH_WORKER: u32 = 1;
 const ENTRY_WITH_CHILD: u32 = 2;
+const ENTRY_WITH_CHILD_THEN_WAIT: u32 = 3;
+const ENTRY_TRAPS: u32 = 4;
 
-/// The held domain. Every entry stores 7 at 16384 and answers 1; each handler is one op of
-/// `"svc"`:
+/// `CAP_REVOKED`: what a call into a dead domain answers.
+const CAP_REVOKED: i64 = -9;
+const EINVAL: i64 = -22;
+
+/// The held domain. Every entry stores 7 at 16384 and sets its thread-local word to 1234; each
+/// handler is one op of `"svc"`:
 ///
 /// - `pair(x)` answers `(x + mem[16384], 2x)`.
 /// - `boom()` traps `Unreachable`; `quit()` exits 3 through the `Exit` handle the entry kept.
-/// - `join_worker()` releases the worker thread [`ENTRY_WITH_WORKER`] spawned (it waits on 16416)
-///   and answers what it returns: `mem[16384] * 10`.
-/// - `stuck()` waits on 16424, which nothing notifies.
-/// - `run(a, b)` answers `a + b` and adds it to 16432. [`ENTRY_WITH_CHILD`]'s child calls it through
-///   the live self-serve grant (#744) the spawn gives it, named `"exec"`.
+/// - `join_worker()` releases the worker thread [`ENTRY_WITH_WORKER`] spawned (it waits on 16416),
+///   joins it and answers what it returns: `mem[16384] * 10`.
+/// - `wait_signal()` waits until 16424 is set and answers it; `signal()` sets it to 1.
+/// - `run(a, b)` answers `a + b` and adds it to 16432, which `total()` answers.
+///   [`ENTRY_WITH_CHILD`]'s child calls `run` through the live self-serve grant (#744) its spawn
+///   gives it, named `"exec"`, and `join_child()` joins the child and answers its result.
+/// - `tls()` answers the thread-local word it runs with.
+/// - `observe()` reads 16464, spins, and answers how far 16464 moved meanwhile; `bump()` adds 1 to it.
 fn parent() -> String {
     let child = SpawnRec {
         grants_ptr: 16640,
@@ -51,8 +64,8 @@ data 16684 "exec"
 type 1 func () -> ()
 type 2 func () -> (i64)
 type 3 func (i64, i64) -> (i64)
-type 4 interface {{ pair: 0, boom: 1, quit: 1, join_worker: 2, stuck: 2, run: 3 }}
-export 0 interface "svc" 4 {{ pair: 3, boom: 4, quit: 5, join_worker: 6, stuck: 7, run: 8 }}
+type 4 interface {{ pair: 0, boom: 1, quit: 1, join_worker: 2, wait_signal: 2, signal: 2, run: 3, total: 2, join_child: 2, tls: 2, observe: 2, bump: 2 }}
+export 0 interface "svc" 4 {{ pair: 5, boom: 6, quit: 7, join_worker: 8, wait_signal: 9, signal: 10, run: 11, total: 12, join_child: 13, tls: 14, observe: 15, bump: 16 }}
 
 func (i32) -> (i64) {{
 block 0 (vexit: i32) {{
@@ -61,6 +74,8 @@ block 0 (vexit: i32) {{
   i64.store va vseed
   vh = i64.const 16400
   i32.store vh vexit
+  vt = i64.const 1234
+  vcpu.tls.set vt
   vr = i64.const 1
   return vr
   }}
@@ -72,7 +87,7 @@ block 0 (vexit: i32) {{
   vseed = i64.const 7
   i64.store va vseed
   vz = i64.const 0
-  vt = thread.spawn 9 vz vz
+  vt = thread.spawn 17 vz vz
   vth = i64.const 16408
   i32.store vth vt
   vr = i64.const 1
@@ -85,6 +100,8 @@ block 0 (vi: i32, vm: i32, vb: i32) {{
   va = i64.const 16384
   vseed = i64.const 7
   i64.store va vseed
+  vsi = i64.const 16444
+  i32.store vsi vi
   vma = i64.const {module_at}
   i32.store vma vm
   vba = i64.const {budget_at}
@@ -92,8 +109,27 @@ block 0 (vi: i32, vm: i32, vb: i32) {{
   vgh = i32.const {tag}
 {grant}  vrp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vi (vrp)
-  vr = i64.extend_i32_s vch
+  vsc = i64.const 16440
+  i32.store vsc vch
+  vr = i64.const 1
   return vr
+  }}
+}}
+
+func (i32, i32, i32) -> (i64) {{
+block 0 (vi: i32, vm: i32, vb: i32) {{
+  vr = call 2 (vi, vm, vb)
+  vc = i64.const 16456
+  vexp = i32.const 0
+  vto = i64.const 50000000
+  vst = i32.atomic.wait vc vexp vto
+  return vr
+  }}
+}}
+
+func (i32) -> (i64) {{
+block 0 (vexit: i32) {{
+  unreachable
   }}
 }}
 
@@ -144,7 +180,20 @@ block 0 () {{
   vexp = i32.const 0
   vto = i64.const -1
   vst = i32.atomic.wait vc vexp vto
-  vr = i64.extend_i32_s vst
+  vv = i32.load vc
+  vr = i64.extend_i32_s vv
+  return vr
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vc = i64.const 16424
+  vone = i32.const 1
+  i32.store vc vone
+  vn = i32.const 1
+  vw = atomic.notify vc vn
+  vr = i64.const 1
   return vr
   }}
 }}
@@ -157,6 +206,68 @@ block 0 (va: i64, vb: i64) {{
   vnew = i64.add vold vs
   i64.store vl vnew
   return vs
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vl = i64.const 16432
+  vt = i64.load vl
+  return vt
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vsi = i64.const 16444
+  vi = i32.load vsi
+  vsc = i64.const 16440
+  vch = i32.load vsc
+  vst, vv = call.cap 6 1 (i32) -> (i64, i64) vi (vch)
+  return vv
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vt = vcpu.tls.get
+  return vt
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vx = i64.const 16464
+  v0 = i64.load vx
+  vn = i64.const 0
+  br 1(v0, vn)
+}}
+block 1 (w0: i64, wn: i64) {{
+  vlim = i64.const 20000
+  vgo = i64.lt_u wn vlim
+  br_if vgo 2(w0, wn) 3(w0)
+}}
+block 2 (x0: i64, xn: i64) {{
+  vone = i64.const 1
+  xm = i64.add xn vone
+  br 1(x0, xm)
+}}
+block 3 (y0: i64) {{
+  vy = i64.const 16464
+  v1 = i64.load vy
+  vd = i64.sub v1 y0
+  return vd
+  }}
+}}
+
+func () -> (i64) {{
+block 0 () {{
+  vx = i64.const 16464
+  v0 = i64.load vx
+  vone = i64.const 1
+  v1 = i64.add v0 vone
+  i64.store vx v1
+  return v1
   }}
 }}
 
@@ -182,8 +293,8 @@ block 0 (vsp: i64, varg: i64) {{
     )
 }
 
-/// The child [`ENTRY_WITH_CHILD`] spawns: it resolves `"exec"`, the offer over its parent, and calls
-/// `run(40, 2)`, then `run` again with that answer, `run(42, 0)`.
+/// The child [`ENTRY_WITH_CHILD`] spawns: it resolves `"exec"`, the offer over its parent, calls
+/// `run(40, 2)`, then calls `run` again with that answer, `run(42, 0)`, and returns the second.
 const CHILD: &str = r#"memory 15
 data 16384 "exec"
 func (i64) -> (i64) {
@@ -193,9 +304,9 @@ block 0 (v0: i64) {
   vexec = self.resolve vnp vl
   va = i64.const 40
   vb = i64.const 2
-  vr = call.cap 268435456 5 (i64, i64) -> (i64) vexec (va, vb)
+  vr = call.cap 268435456 6 (i64, i64) -> (i64) vexec (va, vb)
   vz = i64.const 0
-  vr2 = call.cap 268435456 5 (i64, i64) -> (i64) vexec (vr, vz)
+  vr2 = call.cap 268435456 6 (i64, i64) -> (i64) vexec (vr, vz)
   return vr2
   }
 }
@@ -205,14 +316,6 @@ fn module(src: &str) -> Arc<temen_ir::Module> {
     let m = temen_text::parse_module(src).unwrap_or_else(|e| panic!("parse: {e:?}\n{src}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{src}"));
     Arc::new(m)
-}
-
-/// A host whose domain is `m` and which the embedder holds.
-fn held(m: &Arc<temen_ir::Module>) -> Host {
-    let mut host = Host::new();
-    host.set_self_module(m);
-    host.hold();
-    host
 }
 
 /// `f` on a thread of its own, so a run that hangs fails the test instead of stalling the suite.
@@ -225,189 +328,238 @@ fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
         .expect("the run ends")
 }
 
-type Run = (Result<Vec<Value>, Trap>, Vec<u8>, Host);
-
-/// Run `entry` of `m` over `host` on the tree-walker. Answers the run, its window and the host.
-fn run(m: &Arc<temen_ir::Module>, entry: u32, args: Vec<Value>, mut host: Host) -> Run {
-    let m = Arc::clone(m);
-    bounded(move || {
-        let mut fuel = 50_000_000u64;
-        let init = vec![0u8; 1 << 17];
-        let (r, window) =
-            run_capture_reserved_with_host(&m, entry, &args, &mut fuel, &init, 0, &mut host);
-        (r, window, host)
-    })
-}
-
-fn i64_at(window: &[u8], at: usize) -> i64 {
-    i64::from_le_bytes(window[at..at + 8].try_into().expect("8 bytes"))
-}
-
-/// Calls queued before the run are served once the entry has returned: each activation sees what
-/// the entry wrote and replies with both of its results.
-#[test]
-fn a_held_domain_serves_the_calls_queued_on_it_after_its_entry_returns() {
-    let m = module(&parent());
-    let mut host = held(&m);
-    let exit = host.grant_exit();
-    let t1 = host.svc_enqueue(0, PAIR, vec![5]).expect("queued");
-    let t2 = host.svc_enqueue(0, PAIR, vec![30]).expect("queued");
-    let (r, _, mut host) = run(&m, ENTRY, vec![Value::I32(exit)], host);
-    assert_eq!(r, Ok(vec![Value::I64(1)]), "the run answers the entry");
-    assert_eq!(host.svc_result(t1), Some(Reply::Results(vec![12, 10])));
-    assert_eq!(host.svc_result(t2), Some(Reply::Results(vec![37, 60])));
-}
-
-/// The same calls on a domain no one holds: its entry's return ends the run, and nothing serves
-/// them.
-#[test]
-fn a_domain_no_one_holds_ends_with_its_entry() {
-    let m = module(&parent());
+/// A powerbox for the domain: its offer, and an `Exit` handle, which [`args`] passes the entry.
+fn host_for(m: &Arc<temen_ir::Module>) -> (Host, i32) {
     let mut host = Host::new();
-    host.set_self_module(&m);
+    host.set_self_module(m);
     let exit = host.grant_exit();
-    let t = host.svc_enqueue(0, PAIR, vec![5]).expect("queued");
-    let (r, _, mut host) = run(&m, ENTRY, vec![Value::I32(exit)], host);
-    assert_eq!(r, Ok(vec![Value::I64(1)]));
-    assert_eq!(host.svc_result(t), None, "no activation ran");
+    (host, exit)
 }
 
-/// A call of another arity than its handler is answered `-EINVAL`, as a serve loop answers it, and
-/// the others are served.
-#[test]
-fn a_call_of_another_arity_is_answered_einval() {
+/// Start `entry` of the parent with the `Exit` handle.
+fn start(entry: u32) -> HeldDomain {
     let m = module(&parent());
-    let mut host = held(&m);
-    let exit = host.grant_exit();
-    let bad = host.svc_enqueue(0, PAIR, vec![5, 6]).expect("queued");
-    let good = host.svc_enqueue(0, PAIR, vec![5]).expect("queued");
-    let (r, _, mut host) = run(&m, ENTRY, vec![Value::I32(exit)], host);
-    assert_eq!(r, Ok(vec![Value::I64(1)]));
-    assert_eq!(host.svc_result(bad), Some(Reply::Failed(-22)));
-    assert_eq!(host.svc_result(good), Some(Reply::Results(vec![12, 10])));
+    let (host, exit) = host_for(&m);
+    let started = HeldDomain::start(m, entry, &[Value::I32(exit)], u64::MAX, host);
+    let (domain, results) = started.unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+    assert_eq!(results, vec![Value::I64(1)], "start answers the entry");
+    domain
 }
 
-/// An activation's trap ends its domain, as any member's does: the run answers the trap, and the
-/// call has no reply.
+/// A call of `op` with `args` and fuel to spare.
+fn call(d: &HeldDomain, op: u32, args: &[i64]) -> Reply {
+    let mut fuel = 1_000_000;
+    d.call(0, op, args, &mut fuel)
+}
+
+/// A held domain takes calls once its entry has returned. Each sees what the entry wrote and
+/// replies with every result its op declares.
+#[test]
+fn a_held_domain_takes_calls_after_its_entry_returns() {
+    bounded(|| {
+        let d = start(ENTRY);
+        assert_eq!(call(&d, PAIR, &[5]), Reply::Results(vec![12, 10]));
+        assert_eq!(call(&d, PAIR, &[30]), Reply::Results(vec![37, 60]));
+        let (_host, trap) = d.end();
+        assert_eq!(trap, None, "the domain was alive until its end");
+    });
+}
+
+/// A call runs on the fuel its caller lends it, and what it leaves comes back. One lent too little
+/// runs out inside the handler, whose trap ends the domain, as any handler's does (INVARIANTS #6).
+#[test]
+fn a_call_runs_on_the_fuel_it_is_lent() {
+    bounded(|| {
+        let d = start(ENTRY);
+        let mut fuel = 1_000_000u64;
+        assert_eq!(d.call(0, OBSERVE, &[], &mut fuel), Reply::Results(vec![0]));
+        assert!(
+            fuel <= 1_000_000 - 20_000,
+            "the call burned its loop: {fuel} left"
+        );
+        let mut fuel = 10u64;
+        assert_eq!(
+            d.call(0, OBSERVE, &[], &mut fuel),
+            Reply::Failed(CAP_REVOKED)
+        );
+        assert_eq!(fuel, 0, "it burned all it was lent");
+        assert_eq!(d.end().1, Some(Trap::OutOfFuel));
+    });
+}
+
+/// An activation runs as the domain's main thread would: with the thread-local word it left.
+#[test]
+fn an_activation_sees_the_main_threads_thread_local_word() {
+    bounded(|| {
+        let d = start(ENTRY);
+        assert_eq!(call(&d, TLS, &[]), Reply::Results(vec![1234]));
+    });
+}
+
+/// A call of another arity than its handler, or of an op the export lacks, is refused `-EINVAL`,
+/// and the domain goes on serving.
+#[test]
+fn a_call_the_domain_cannot_take_is_refused() {
+    bounded(|| {
+        let d = start(ENTRY);
+        assert_eq!(call(&d, PAIR, &[5, 6]), Reply::Failed(EINVAL));
+        assert_eq!(call(&d, 99, &[]), Reply::Failed(EINVAL));
+        assert_eq!(call(&d, PAIR, &[5]), Reply::Results(vec![12, 10]));
+    });
+}
+
+/// An activation's trap ends the domain, as any member's does: its call and every later one answer
+/// `CAP_REVOKED`, and the end reports the trap.
 #[test]
 fn a_trap_in_an_activation_ends_the_domain() {
-    let m = module(&parent());
-    let mut host = held(&m);
-    let exit = host.grant_exit();
-    let t = host.svc_enqueue(0, BOOM, vec![]).expect("queued");
-    let (r, _, mut host) = run(&m, ENTRY, vec![Value::I32(exit)], host);
-    assert_eq!(r, Err(Trap::Unreachable));
-    assert_eq!(host.svc_result(t), None);
+    bounded(|| {
+        let d = start(ENTRY);
+        assert_eq!(call(&d, BOOM, &[]), Reply::Failed(CAP_REVOKED));
+        assert_eq!(call(&d, PAIR, &[5]), Reply::Failed(CAP_REVOKED));
+        let (_host, trap) = d.end();
+        assert_eq!(trap, Some(Trap::Unreachable));
+    });
 }
 
 /// So does its exit.
 #[test]
 fn an_exit_in_an_activation_ends_the_domain() {
-    let m = module(&parent());
-    let mut host = held(&m);
-    let exit = host.grant_exit();
-    host.svc_enqueue(0, QUIT, vec![]).expect("queued");
-    let (r, _, _) = run(&m, ENTRY, vec![Value::I32(exit)], host);
-    assert_eq!(r, Err(Trap::Exit(3)));
+    bounded(|| {
+        let d = start(ENTRY);
+        assert_eq!(call(&d, QUIT, &[]), Reply::Failed(CAP_REVOKED));
+        assert_eq!(d.end().1, Some(Trap::Exit(3)));
+    });
 }
 
-/// A held domain is a process: a thread its entry spawned runs on after the entry returns, and an
-/// activation releases it, joins it and answers what it computed.
+/// A held domain is a process: a thread its entry spawned runs on after the entry returns, and a
+/// call releases it, joins it and answers what it computed.
 #[test]
-fn a_thread_the_entry_spawned_runs_on_for_an_activation() {
-    let m = module(&parent());
-    let mut host = held(&m);
-    let exit = host.grant_exit();
-    let t = host.svc_enqueue(0, JOIN_WORKER, vec![]).expect("queued");
-    let (r, _, mut host) = run(&m, ENTRY_WITH_WORKER, vec![Value::I32(exit)], host);
-    assert_eq!(r, Ok(vec![Value::I64(1)]));
-    assert_eq!(host.svc_result(t), Some(Reply::Results(vec![70])));
+fn a_thread_the_entry_spawned_runs_on_between_calls() {
+    bounded(|| {
+        let d = start(ENTRY_WITH_WORKER);
+        assert_eq!(call(&d, JOIN_WORKER, &[]), Reply::Results(vec![70]));
+    });
 }
 
-/// With no call to serve and its one thread waiting on what nothing will send, nothing in the run
-/// can run: it ends, and answers the entry, as a run whose root returned past a waiting thread does.
+/// A call that parks lets the next call in: here the second call is what releases the first.
 #[test]
-fn the_run_ends_when_only_waiting_threads_remain() {
-    let m = module(&parent());
-    let mut host = held(&m);
-    let exit = host.grant_exit();
-    let (r, _, _) = run(&m, ENTRY_WITH_WORKER, vec![Value::I32(exit)], host);
-    assert_eq!(r, Ok(vec![Value::I64(1)]));
+fn a_parked_call_lets_the_next_call_in() {
+    bounded(|| {
+        let d = Arc::new(start(ENTRY));
+        let waiter = std::thread::spawn({
+            let d = Arc::clone(&d);
+            move || call(&d, WAIT_SIGNAL, &[])
+        });
+        // The waiting call may not have parked yet; the signal releases it either way.
+        assert_eq!(call(&d, SIGNAL, &[]), Reply::Results(vec![1]));
+        assert_eq!(waiter.join().expect("the waiter"), Reply::Results(vec![1]));
+    });
 }
 
-/// An activation that waits on what nothing will send strands its call: the stall verdict ends the
-/// domain, as it ends a run whose root waits so, and the run answers `ThreadFault`.
+/// A call parked when the domain ends answers the end, as a call into a dead domain does: here one
+/// waits on a signal that never comes, and another call traps.
 #[test]
-fn a_call_the_stall_verdict_strands_ends_the_domain() {
-    let m = module(&parent());
-    let mut host = held(&m);
-    let exit = host.grant_exit();
-    let t = host.svc_enqueue(0, STUCK, vec![]).expect("queued");
-    let (r, _, mut host) = run(&m, ENTRY, vec![Value::I32(exit)], host);
-    assert_eq!(r, Err(Trap::ThreadFault));
-    assert_eq!(host.svc_result(t), None);
+fn a_parked_call_answers_the_domains_end() {
+    bounded(|| {
+        let d = Arc::new(start(ENTRY));
+        let waiter = std::thread::spawn({
+            let d = Arc::clone(&d);
+            move || call(&d, WAIT_SIGNAL, &[])
+        });
+        // Let the waiter park first; if it has not, it finds the domain dead and answers the same.
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(call(&d, BOOM, &[]), Reply::Failed(CAP_REVOKED));
+        assert_eq!(
+            waiter.join().expect("the waiter"),
+            Reply::Failed(CAP_REVOKED)
+        );
+    });
 }
 
-/// A call from inside the run lands on the resting domain too: the child its entry spawned calls
-/// `run(40, 2)` through the live self-serve grant, gets 42 back, and calls `run(42, 0)`. The parent's
-/// window holds what both activations added.
+/// The domain's calls run one at a time: while `observe` spins, no `bump` lands, though they are
+/// called at once from other threads.
 #[test]
-fn a_call_from_a_child_in_the_run_is_served_while_its_parent_rests() {
-    let m = module(&parent());
-    let mut host = held(&m);
+fn calls_run_one_at_a_time() {
+    bounded(|| {
+        let d = Arc::new(start(ENTRY));
+        for _ in 0..5 {
+            let bumpers: Vec<_> = (0..3)
+                .map(|_| {
+                    let d = Arc::clone(&d);
+                    std::thread::spawn(move || call(&d, BUMP, &[]))
+                })
+                .collect();
+            assert_eq!(call(&d, OBSERVE, &[]), Reply::Results(vec![0]));
+            for b in bumpers {
+                assert!(matches!(b.join().expect("a bumper"), Reply::Results(_)));
+            }
+        }
+    });
+}
+
+/// The powerbox for [`ENTRY_WITH_CHILD`], and its arguments: an `Instantiator`, the child's module
+/// and a budget for it.
+fn child_host(m: &Arc<temen_ir::Module>) -> (Host, Vec<Value>) {
+    let mut host = Host::new();
+    host.set_self_module(m);
     let args = vec![
         Value::I32(host.grant_instantiator()),
         Value::I32(host.grant_module(&module(CHILD))),
         Value::I32(host.grant_budget(-1, 1 << 20, -1)),
     ];
-    let (r, window, _) = run(&m, ENTRY_WITH_CHILD, args, host);
-    let child = match r.as_deref() {
-        Ok([Value::I64(h)]) => *h,
-        other => panic!("the entry answers the child's handle, not {other:?}"),
-    };
-    assert!(child >= 0, "the spawn succeeds: {child}");
-    assert_eq!(i64_at(&window, 16432), 42 + 42, "both calls were served");
+    (host, args)
 }
 
-/// A durable domain cannot rest yet: holding one is refused.
-#[test]
-fn a_held_durable_domain_is_refused() {
-    let m = module(&parent());
-    let mut host = held(&m);
-    host.set_durable(true);
-    let exit = host.grant_exit();
-    let (r, _, _) = run(&m, ENTRY, vec![Value::I32(exit)], host);
-    assert_eq!(r, Err(Trap::ThreadFault));
-}
-
-/// The bytecode engine declines a held domain, so the fast entry answers as the tree-walker does.
-#[test]
-fn the_fast_entry_serves_a_held_domain_on_the_tree_walker() {
-    let m = module(&parent());
-    let mut host = held(&m);
-    let exit = host.grant_exit();
-    let t = host.svc_enqueue(0, PAIR, vec![5]).expect("queued");
-    let m2 = Arc::clone(&m);
-    let (r, mut host) = bounded(move || {
-        let mut fuel = 50_000_000u64;
-        let r = run_with_host_fast(&m2, ENTRY, &[Value::I32(exit)], &mut fuel, &mut host);
-        (r, host)
+/// A call from inside the run reaches the held domain too: the child its entry spawned calls
+/// `run(40, 2)` through the live self-serve grant, gets 42 back, and calls `run(42, 0)`.
+fn a_child_calls_its_held_parent(entry: u32) {
+    bounded(move || {
+        let m = module(&parent());
+        let (host, args) = child_host(&m);
+        let (d, _) = HeldDomain::start(m, entry, &args, u64::MAX, host)
+            .unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+        assert_eq!(call(&d, JOIN_CHILD, &[]), Reply::Results(vec![42]));
+        assert_eq!(call(&d, TOTAL, &[]), Reply::Results(vec![42 + 42]));
     });
-    assert_eq!(r, Ok(vec![Value::I64(1)]));
-    assert_eq!(host.svc_result(t), Some(Reply::Results(vec![12, 10])));
 }
 
-/// The debugger ends a run at its entry, so it declines a held domain, and a seek does not re-run it
-/// unheld.
 #[test]
-fn the_debugger_declines_a_held_domain() {
-    let m = module(&parent());
-    let mut host = held(&m);
-    let exit = host.grant_exit();
-    let mut dbg = Inspector::attach_with_host(&m, ENTRY, &[Value::I32(exit)], 1_000_000, host);
-    assert!(matches!(
-        dbg.run_until_stop(),
-        Stop::Finished(Err(Trap::ThreadFault))
-    ));
-    assert!(matches!(dbg.seek(1), Stop::Blocked));
+fn a_call_from_a_child_is_served_while_its_parent_rests() {
+    a_child_calls_its_held_parent(ENTRY_WITH_CHILD);
+}
+
+/// The same, with the parent's entry waiting 50 ms before it returns, so the child's first call
+/// most likely arrives while the entry runs: it waits, and runs once the domain rests.
+#[test]
+fn a_call_that_arrives_during_the_entry_runs_once_it_returns() {
+    a_child_calls_its_held_parent(ENTRY_WITH_CHILD_THEN_WAIT);
+}
+
+/// A domain whose entry traps is never held: `start` answers the trap and the powerbox.
+#[test]
+fn a_domain_that_ends_in_its_entry_is_not_held() {
+    bounded(|| {
+        let m = module(&parent());
+        let (host, exit) = host_for(&m);
+        let started = HeldDomain::start(m, ENTRY_TRAPS, &[Value::I32(exit)], u64::MAX, host);
+        assert!(matches!(started, Err((Trap::Unreachable, _))));
+    });
+}
+
+/// A durable domain cannot be held yet: it is refused.
+#[test]
+fn a_durable_domain_is_refused() {
+    bounded(|| {
+        let m = module(&parent());
+        let (mut host, exit) = host_for(&m);
+        host.set_durable(true);
+        let started = HeldDomain::start(m, ENTRY, &[Value::I32(exit)], u64::MAX, host);
+        assert!(matches!(started, Err((Trap::ThreadFault, _))));
+    });
+}
+
+/// Dropping the handle ends the domain, its parked thread included.
+#[test]
+fn dropping_the_handle_ends_the_domain() {
+    bounded(|| drop(start(ENTRY_WITH_WORKER)));
 }

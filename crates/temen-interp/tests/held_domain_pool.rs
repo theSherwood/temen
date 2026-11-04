@@ -1,10 +1,11 @@
-//! #2695 step 2 — a held domain's run ends the domain, so the window it held of the process's address
-//! space (#2305) goes back with the run, as an ordinary root's goes back when its entry returns. One
-//! test in its own binary: the pool is the process's, and tests in one binary share their process.
+//! #2695 step 2 — a held domain ([`HeldDomain`]) keeps its window's share of the process's address
+//! space (#2305) while its embedder holds it, as a process holds its own, and hands it back when it
+//! ends, as an ordinary root does when its entry returns. One test in its own binary: the pool is the
+//! process's, and tests in one binary share their process.
 
 use std::sync::Arc;
 use temen_interp::{
-    maps_pool, reserved_pool, run_with_host, Host, Reply, RootWindow, Value, MAPS_PER_DOMAIN,
+    maps_pool, reserved_pool, HeldDomain, Host, Reply, RootWindow, Value, MAPS_PER_DOMAIN,
     MAPS_PER_VCPU,
 };
 
@@ -44,7 +45,7 @@ fn hold() -> Option<Host> {
 }
 
 #[test]
-fn a_held_domains_run_hands_its_window_back() {
+fn a_held_domain_holds_its_window_until_it_ends() {
     let pool = reserved_pool();
     let slots = pool / WINDOW;
     if pool == u64::MAX || maps_pool() < 2 * slots * (MAPS_PER_DOMAIN + MAPS_PER_VCPU) {
@@ -60,26 +61,27 @@ fn a_held_domains_run_hands_its_window_back() {
     let m = Arc::new(m);
     let mut host = Host::new();
     host.set_self_module(&m);
-    host.hold();
-    let t = host.svc_enqueue(0, 0, vec![21]).expect("queued");
     // On a thread of its own, so a run that hangs fails the test instead of stalling the suite.
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        let (d, results) = HeldDomain::start(m, 0, &[], u64::MAX, host)
+            .unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+        assert_eq!(
+            results,
+            vec![Value::I64(1)],
+            "the held domain takes the last window"
+        );
         let mut fuel = 1_000_000u64;
-        let r = run_with_host(&m, 0, &[], &mut fuel, &mut host);
-        let _ = tx.send((r, host));
+        assert_eq!(d.call(0, 0, &[21], &mut fuel), Reply::Results(vec![42]));
+        let while_held = hold();
+        let (_host, trap) = d.end();
+        let _ = tx.send((while_held.is_some(), trap, hold().is_some()));
     });
-    let (r, mut host) = rx
+    let (while_held, trap, after) = rx
         .recv_timeout(std::time::Duration::from_secs(60))
-        .expect("the run ends");
-    assert_eq!(
-        r,
-        Ok(vec![Value::I64(1)]),
-        "the held run takes the last window"
-    );
-    assert_eq!(host.svc_result(t), Some(Reply::Results(vec![42])));
-    // The embedder keeps the domain's powerbox, but the run ended the domain: its window went back.
-    let next = hold();
-    assert!(next.is_some(), "the held run handed its window back");
-    drop((others, next, host));
+        .expect("the domain ends");
+    assert!(!while_held, "a held domain keeps its window");
+    assert_eq!(trap, None);
+    assert!(after, "its end hands the window back");
+    drop(others);
 }

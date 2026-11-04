@@ -2494,6 +2494,35 @@ metering is read-before minus read-after. Deferred, named-consumer-gated: a per-
 (caller-side D19 attenuation) and an admission fuel floor (gate-side refusal when the caller
 can't fund a handler).
 
+### Held domains — a domain at rest takes calls as a library provider does  [BUILT on the tree-walker, #2695 step 2]
+
+A domain its embedder holds (`HeldDomain`) outlives its entry: once the entry returns, it
+**rests**. Its threads keep running, and it ends only when it ends itself (any member's exit or
+trap) or its embedder ends it. At rest it is what axis 1 calls a library provider, a domain with
+no running main, so each call into it, from its embedder or from a domain of its run, runs as an
+**activation**:
+
+- **A fiber in the callee**, at the op's handler, called with exactly the op's arguments. Its
+  control stack is the runtime's; any data stack lives in the guest's memory, the guest's to
+  manage.
+- **On the caller's thread**, which funds it (caller-pays, as above). It costs the callee no
+  thread: no vCPU of its own, no charge against the callee's vCPU ceiling. A thread it spawns is
+  the callee's, drawing on the callee's own fuel.
+- **Admitted by the callee's policy**: `Single`, run-to-park, serializes the domain's activations
+  against each other, never against its own threads. The tree-walker builds that as a lane of
+  width 1 over the activations (D66's mechanism: held across a quantum's end, given back at a
+  park).
+- **With the thread-local word the domain's main thread left** (`vcpu.tls`). Under `Single` the
+  calls run one at a time, as that thread would run them. The caller's word would name the
+  caller's memory.
+- **No entry charge.** Fuel burns at its safepoints from the caller's budget, as a thread's does.
+
+A call that arrives while the entry still runs waits on the queue and runs once the domain rests,
+funded by its caller. A thread of the domain parked in `svc.wait` takes calls first: serving them
+there is the guest's choice. A handler's trap ends the domain (INVARIANTS #6). Every call it had
+not answered, and every later one, answers `CAP_REVOKED`, the embedder's included (rule (i)).
+While the domain is held, its run has no stall verdict, since the embedder can always call in.
+
 ### Invariants this holds
 
 Confinement untouched (every transport runs verified code over masked windows; the mem/host

@@ -12815,12 +12815,6 @@ impl SchedCore {
         host: DomainCell,
     ) -> Result<SchedCore, Trap> {
         let mut h = host.lock_unpoisoned();
-        // #2695 step 2 — this engine does not rest a domain yet. It refuses a held root rather than
-        // ending it at its entry, as it would an ordinary one (INVARIANTS #9). The tree-walker
-        // serves it ([`Host::hold`]).
-        if h.held() {
-            return Err(Trap::ThreadFault);
-        }
         reapply_installs(&h, source, &table)?;
         // Fuel unification (safepoint-anchored): charge one fuel for *entering the top-level entry
         // function*, mirroring the per-callee-entry charge at `Op::Call`/`CallIndirect`/`TailCall*` and
@@ -13632,7 +13626,7 @@ impl SchedCore {
                 // INVARIANTS #8: its handles are granted into the callee as the queue admits it.
                 let from = &mut super::CallerHost::Cell(&domains[tasks[ti].domain].host);
                 let enqueued =
-                    super::enqueue_live_call(from, &callee, export, op, args, sig.params());
+                    super::enqueue_live_call(from, &callee, export, op, args, sig.params(), None);
                 match enqueued {
                     Err(trap) => complete(tasks, domains, ti, Err(trap)),
                     // A full callee queue is probeable backpressure, the call's failure; the task

@@ -1413,12 +1413,6 @@ pub fn jit_cap_run(
     host: &mut Host,
     freeze: Option<std::sync::Arc<temen_jit::FreezeController>>,
 ) -> Result<(JitOutcome, temen_interp::MemLayout), temen_jit::JitError> {
-    // #2695 step 2 — this engine does not rest a domain yet ([`Host::hold`]).
-    if host.held() {
-        return Err(temen_jit::JitError::Unsupported(
-            "a held domain rests on the tree-walker only",
-        ));
-    }
     // A fresh window: its page map is `init`'s, none from an earlier run (see `reset_cap_pages`).
     host.reset_cap_pages(init.page_map());
     // #1944 slice 3, #2113 — an activation of the run `host` roots, as `jit_run`'s: the default fuel,
@@ -3343,16 +3337,23 @@ unsafe fn live_reply(
         return Some(Reply::Failed(EINVAL));
     };
     drop(guard);
-    let ticket =
-        match temen_interp::enqueue_live_call(caller, callee, export, op, args.to_vec(), params) {
-            Ok((Some(ticket), _)) => ticket,
-            // A full queue / unservable op: probeable backpressure.
-            Ok((None, _)) => return Some(Reply::Failed(EAGAIN)),
-            Err(_) => {
-                vm.raise(TrapKind::CapFault as i64);
-                return None;
-            }
-        };
+    let ticket = match temen_interp::enqueue_live_call(
+        caller,
+        callee,
+        export,
+        op,
+        args.to_vec(),
+        params,
+        None,
+    ) {
+        Ok((Some(ticket), _)) => ticket,
+        // A full queue / unservable op: probeable backpressure.
+        Ok((None, _)) => return Some(Reply::Failed(EAGAIN)),
+        Err(_) => {
+            vm.raise(TrapKind::CapFault as i64);
+            return None;
+        }
+    };
     let guard = callee.lock().unwrap_or_else(|e| e.into_inner());
     ring(&guard); // the callee's serve loop, parked on its empty queue
     await_settle(callee, guard, &bell, ticket, Parks::Fiber, vm)
