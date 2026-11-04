@@ -320,6 +320,63 @@ fn async_controller_freezes_a_running_compute_loop_on_the_jit() {
     }
 }
 
+/// A root that sleeps 10 s in a timed wait on a word nothing stores to, then returns the wait's
+/// status.
+const TIMED_WAIT: &str = r#"
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 131072
+  v2 = i32.const 0
+  v3 = i64.const 10000000000
+  v4 = i32.atomic.wait v1 v2 v3
+  v5 = i64.extend_i32_u v4
+  return v5
+  }
+}
+"#;
+
+/// #2757 — a freeze request reaches a root parked in a **timed** wait at once, not at the wait's
+/// deadline. The root is the run's only vCPU, so nothing else runs to notice the freeze: before the
+/// request woke the run's parks, the wait slept its full 10 s and the run froze only then. Now
+/// [`FreezeController::request_freeze`] wakes it, the wait ends `WAIT_FROZEN`, and the re-issue
+/// safepoint after it unwinds the root.
+#[test]
+fn async_controller_freezes_a_root_parked_in_a_long_timed_wait_at_once() {
+    // Its wait word is guest memory, confined to the window outside the arena, as the park-freeze
+    // matrix's are.
+    let mut m = temen_text::parse_module(TIMED_WAIT).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
+    });
+    let inst = temen_durable::transform_module_assume_confined(&m).expect("transform");
+    temen_verify::verify_module(&inst).expect("verify");
+    let freeze = FreezeController::new();
+    let fc = Arc::clone(&freeze);
+    // Long after the root has parked: its compile is far quicker than this.
+    let controller = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        fc.request_freeze();
+    });
+    let started = std::time::Instant::now();
+    let (out, snap) = jit_async_freeze(&inst, 42, freeze);
+    let took = started.elapsed();
+    controller.join().unwrap();
+    assert!(
+        matches!(out, JitOutcome::Returned(_)),
+        "a freeze returns a placeholder, not a trap: {out:?}"
+    );
+    assert_eq!(
+        read_state(&snap, TEST_ARENA),
+        STATE_UNWINDING,
+        "the freeze caught the parked root"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "the freeze reached the timed wait at once, not at its 10 s deadline: took {took:?}"
+    );
+}
+
 #[test]
 fn interp_mid_loop_freeze_thaws_on_the_jit() {
     let inst = module(CAP_FIRST);

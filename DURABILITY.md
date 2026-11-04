@@ -2665,8 +2665,8 @@ per-context word set on all contexts at once — TBD in stage 1.
    test: a producer↔consumer pair frozen mid-rendezvous now resolves). Replacing the blanket fail-closed,
    `futex_wait` gained **peer-aware deadlock detection**: an infinite wait whose `peers_live()` (`live > 1`)
    has gone false can never be satisfied (a parked waiter can't notify itself; a wasm wait returns only on
-   notify/timeout), so it fails closed with `ThreadFault` (the interp's join-deadlock) within `KILL_RECHECK`
-   of the last peer exiting — general (helps fresh runs too), not thaw-specific. **Join ordering:**
+   notify/timeout), so it fails closed with `ThreadFault` (the interp's join-deadlock) as soon as the last
+   peer exits, whose exit wakes it to re-check (#2757) — general (helps fresh runs too), not thaw-specific. **Join ordering:**
    `thread_join` resolves a handle in the domain's one child table (#2043), so a concurrent child's
    nested grandchild-join routes correctly whichever vCPU joins. *Known gap:* a
    *mutual* block (two live vCPUs each waiting on the other) isn't caught by the `live`-count heuristic —

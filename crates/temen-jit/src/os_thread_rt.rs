@@ -16,12 +16,13 @@
 //! call; the thread records the trap in its completion cell and raises it as the domain's end, and
 //! the joiner propagates it. The **fuel/epoch kill-path** for a *runaway* (non-faulting) guest works across the
 //! whole domain: the lowering polls a host-owned interrupt cell at loop back-edges + function entries
-//! and traps `OutOfFuel` when the host sets it (see `compile_and_run_with_host_interruptible` /
-//! `emit_epoch_check`). Because every vCPU runs the same finalized code, a *spinning* sibling polls
-//! that one cell on its own; a *parked* sibling (blocked in a futex `wait` or `thread.join`) re-checks
-//! it on a bounded interval (`KILL_RECHECK`, real-build only) so it wakes and unwinds too — so a
-//! single host interrupt stops the entire multithreaded domain, not just its busy threads, and
-//! `join_all` never hangs on a vCPU that would otherwise wait forever.
+//! and traps `OutOfFuel` when the host fires its kill door ([`crate::Interrupt`]; see
+//! `compile_and_run_with_host_interruptible` / `emit_epoch_check`). Because every vCPU runs the same
+//! finalized code, a *spinning* sibling polls that one cell on its own; a *parked* sibling (blocked
+//! in a futex `wait`, a join, a lane, an outside answer) is woken by the door, which fires the run's
+//! wake ([`Domain::wake_run`]), so it unwinds too — so a single host interrupt stops the
+//! entire multithreaded domain, not just its busy threads, and `join_all` never hangs on a vCPU that
+//! would otherwise wait forever. Nothing re-checks the cell on a timer (#2757).
 //!
 //! **Domain teardown** (owner decision 2026-07-24; DESIGN.md §12, ISSUES.md I37, D37
 //! death-is-revocation): a trap or `exit` from **any** vCPU — and the **root vCPU's completion**,
@@ -31,7 +32,7 @@
 //! trap-propagation guard: a trap/exit is already raised there, and a clean root return raises the
 //! internal [`crate::DOMAIN_DONE_CODE`] sentinel ([`Domain::begin_teardown`]); every park site
 //! (futex `wait`, `thread.join`) returns on observing the end — woken promptly by
-//! [`Domain::wake_all_parked`] — and the guard after that host call reads the end and unwinds the
+//! [`Domain::begin_teardown`] — and the guard after that host call reads the end and unwinds the
 //! caller. A *running* vCPU reaches no park site, so code that runs beside other vCPUs polls the end
 //! at every loop back-edge and on entry to a function that tail-calls (`emit_domain_poll`), and
 //! unwinds from there. Each vCPU runs on a context of its own, so that it charges a fuel cell of its
@@ -50,9 +51,9 @@ use std::time::{Duration, Instant};
 // stay std (loom doesn't track them, and the real spawn path is `cfg(not(loom))`). The futex core is
 // exercised by the loom test below via loom threads.
 #[cfg(loom)]
-use loom::sync::{Condvar, Mutex};
+use loom::sync::{Condvar, Mutex, MutexGuard};
 #[cfg(not(loom))]
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 /// `<ty>.atomic.wait` status results (§12, matching the interpreter / wasm).
 const WAIT_WOKEN: i32 = 0;
@@ -73,13 +74,13 @@ const WAIT_DEADLOCK: i32 = 3;
 /// so a thread-bomb traps (`ThreadFault`) instead of exhausting host memory.
 const MAX_VCPUS: usize = 1 << 16;
 
-/// How often a *parked* vCPU (futex `wait` / `thread.join`) re-checks the §5 kill-path interrupt
-/// cell when the kill-path is armed. A spinning vCPU trips near-instantly (the cell is polled at
-/// every back-edge); this only bounds the extra latency for an otherwise-blocked vCPU to unwind
-/// once the host requests a kill. Real-build only (the loom futex model uses no timeouts and never
-/// arms the kill-path).
-#[cfg(not(loom))]
-const KILL_RECHECK: Duration = Duration::from_millis(20);
+/// #2757 — process-wide count of parked vCPUs waking from a park's sleep ([`crate::vcpu_wakes`]).
+pub(crate) static VCPU_WAKES: AtomicU64 = AtomicU64::new(0);
+
+/// A parked vCPU woke from its sleep: count it ([`VCPU_WAKES`]).
+pub(crate) fn woke() {
+    VCPU_WAKES.fetch_add(1, Ordering::Relaxed);
+}
 
 /// True iff the kill-path is armed (`addr != 0`) **and** the host has set the interrupt cell — i.e.
 /// a parked vCPU should stop waiting and unwind (its next epoch poll in guest code traps `OutOfFuel`).
@@ -296,15 +297,23 @@ impl Children {
         named
     }
 
-    /// The completion cells of the live `thread.spawn` vCPUs.
-    fn thread_cells(&self) -> Vec<std::sync::Arc<Done>> {
-        lock(&self.table)
-            .live()
-            .filter_map(|(_, e)| match e {
-                ChildEntry::Thread(d) => Some(std::sync::Arc::clone(d)),
-                ChildEntry::Instance(_) => None,
-            })
-            .collect()
+    /// #2757 — the completion cells a vCPU of the domain may be parked on, joining: every live
+    /// `thread.spawn` vCPU's and every live §14 child's. Snapshot out of the table lock, so each is
+    /// notified under its own lock alone.
+    fn join_cells(
+        &self,
+    ) -> (
+        Vec<std::sync::Arc<Done>>,
+        Vec<std::sync::Arc<crate::instantiator_rt::ChildDone>>,
+    ) {
+        let (mut threads, mut children) = (Vec::new(), Vec::new());
+        for (_, e) in lock(&self.table).live() {
+            match e {
+                ChildEntry::Thread(d) => threads.push(std::sync::Arc::clone(d)),
+                ChildEntry::Instance(c) => children.push(std::sync::Arc::clone(c.done())),
+            }
+        }
+        (threads, children)
     }
 }
 
@@ -471,8 +480,7 @@ pub unsafe fn park_host_call(
     dom.lane_give_back(&lane);
     let hub = dom.hub();
     let status = futex_wait(
-        &hub.futex,
-        &hub.futex_cv,
+        &hub.park,
         FutexKey::Host(key),
         still_parked,
         None,
@@ -503,10 +511,14 @@ pub unsafe fn park_host_call(
 /// #2047 — wait outside the run for a host call's answer (a job punted to the offload pool, which
 /// may wait on the world), as a park waits: the calling vCPU gives its lane back for the wait (D66)
 /// and takes it again after, and a kill or its domain's end stops the wait. It is not counted
-/// parked: the answer comes from outside, so it may yet end a peer's wait. `wait(d)` waits at most
-/// `d` for the answer, and is asked again every [`KILL_RECHECK`] until it has it. `None`: the run
-/// was killed (its domain now ends with `OutOfFuel`, as a join's does) or its domain ended, and the
-/// answer is left unclaimed.
+/// parked: the answer comes from outside, so it may yet end a peer's wait. `wait(stop)` blocks until
+/// the answer (`Some`) or until `stop()` holds (`None`), checking `stop` again whenever `rouse`
+/// wakes it. `None`: the run was killed (its domain now ends with `OutOfFuel`, as a join's does) or
+/// its domain ended, and the answer is left unclaimed.
+///
+/// #2757 — nothing re-checks on a timer: `rouse` is registered for the wait where a kill and the
+/// domain's end fire it, its run's domain ([`Domain::wake_own_parked`]), or with no domain, the
+/// kill door, since nothing else could end a lone vCPU's wait.
 ///
 /// # Safety
 /// `vm` is a live JIT call's instance context; a call in a fiber waits with its vCPU.
@@ -514,7 +526,8 @@ pub unsafe fn park_host_call(
 #[cfg(not(loom))]
 pub unsafe fn wait_outside<R>(
     vm: &crate::VmCtx,
-    mut wait: impl FnMut(Duration) -> Option<R>,
+    rouse: Box<dyn Fn() + Send + Sync>,
+    wait: impl FnOnce(&dyn Fn() -> bool) -> Option<R>,
 ) -> Option<R> {
     let dom = (!vm.sched.is_null()).then(|| current_domain(vm.sched as *const Domain));
     let lane = dom.map(|d| d.lane_chain()).unwrap_or_default();
@@ -523,14 +536,11 @@ pub unsafe fn wait_outside<R>(
     }
     let killed = || epoch_fired(vm.epoch as usize);
     let ended = || killed() || vm.ended().is_some();
-    let answer = loop {
-        if let Some(r) = wait(KILL_RECHECK) {
-            break Some(r);
-        }
-        if ended() {
-            break None;
-        }
-    };
+    // Registered before `wait` first checks `stop`, so a kill or an end after that check finds the
+    // waker, and one before it is seen by the check.
+    let roused = wake_on_run_event(vm, rouse);
+    let answer = wait(&ended);
+    drop(roused);
     let back = dom.is_none_or(|d| d.lane_acquire(&lane, ended));
     if killed() {
         vm.raise(TrapKind::OutOfFuel as i64);
@@ -538,26 +548,63 @@ pub unsafe fn wait_outside<R>(
     answer.filter(|_| back && !ended())
 }
 
-/// #2424 — what re-offers a §14 child's task parked on an answer from outside the run
-/// ([`crate::fiber_park_outside`]), for the thread that posts the answer to call: it re-offers the
-/// run's parked tasks, as a `notify` does. It is the task's only wake: nothing polls a parked task
-/// (#2757). It holds the executor weakly: once the run has ended it does nothing.
-/// `None` off a task (an OS vCPU waits on the answer itself, [`wait_outside`]).
+/// #2757 — while the returned registration lives, `wake` runs whenever something may end a park of
+/// the run whose call `vm` is: its kill, a freeze of its window, or its domain's end. It is for a
+/// park that sleeps on something of its own, which those events cannot reach otherwise: a host's
+/// store ([`wait_outside`]), a process tree's bell. Such a park re-checks the run's state when
+/// woken, and nothing re-checks it on a timer. `wake` runs on the thread that ends the parks, with
+/// locks of the run held, so it only notifies.
+///
+/// `None` when nothing can end the run's parks from outside: no domain, and no kill door.
+///
+/// # Safety
+/// `vm` is a live JIT call's instance context.
+#[cfg(not(loom))]
+pub unsafe fn wake_on_run_event(
+    vm: &crate::VmCtx,
+    wake: Box<dyn Fn() + Send + Sync>,
+) -> Option<crate::door::Registration<'_>> {
+    let wakers = if !vm.sched.is_null() {
+        // A kill reaches the domain through the run's own registration on its door, and a
+        // freeze through its controller; its end, directly ([`Domain::wake_own_parked`]).
+        &current_domain(vm.sched as *const Domain).hub().wakers
+    } else if !vm.epoch.is_null() {
+        // A lone vCPU: only its kill can end its park. SAFETY: an armed context's `epoch` is
+        // its run's live door.
+        crate::door::Interrupt::of_cell(vm.epoch as usize).wakers()
+    } else {
+        return None;
+    };
+    Some(wakers.register(wake))
+}
+
+/// #2424 — what wakes a fiber parked on an answer from outside the run
+/// ([`crate::fiber_park_outside`]), for the thread that posts the answer to call. It re-offers the
+/// run's parked §14 tasks, as a `notify` does, and rings its vCPUs' parks ([`Parking::ring`]): an
+/// OS vCPU idling in a blocking resume of such a fiber ([`fiber_resume_block`]). It is their only
+/// wake: nothing polls a parked task or a parked vCPU (#2757). One hook serves the whole run, so a
+/// store any of its callers park on keeps one. It holds the run weakly: once the run has ended it
+/// does nothing. `None` for a run with no domain, whose lone vCPU waits on the answer itself
+/// ([`wait_outside`]).
 ///
 /// # Safety
 /// `vm` is a live JIT call's instance context.
 #[cfg(not(loom))]
 pub unsafe fn outside_waker(vm: &crate::VmCtx) -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
-    if vm.sched.is_null() || !fiber_rt::in_task() {
+    if vm.sched.is_null() {
         return None;
     }
-    let dom = current_domain(vm.sched as *const Domain);
-    let exec = lock(&dom.hub().child_exec)
+    let hub = current_domain(vm.sched as *const Domain).hub();
+    let exec = lock(&hub.child_exec)
         .as_ref()
-        .map(std::sync::Arc::downgrade)?;
+        .map(std::sync::Arc::downgrade);
+    let park = std::sync::Arc::downgrade(&hub.park);
     Some(std::sync::Arc::new(move || {
-        if let Some(exec) = exec.upgrade() {
+        if let Some(exec) = exec.as_ref().and_then(std::sync::Weak::upgrade) {
             exec.wake_locked(crate::child_exec::Wake::All);
+        }
+        if let Some(p) = park.upgrade() {
+            p.ring();
         }
     }))
 }
@@ -592,14 +639,68 @@ pub unsafe fn wake_host_parks_in(hub: usize, key: u64) {
 /// read `live == parked`.
 #[cfg(not(loom))]
 fn wake_hub_parks(hub: &Domain, key: u64) {
-    futex_notify(
-        &hub.futex,
-        &hub.futex_cv,
-        FutexKey::Host(key),
-        u32::MAX,
-        &hub.parked,
-    );
+    futex_notify(&hub.park, FutexKey::Host(key), u32::MAX, &hub.parked);
+    // #2757 — a fiber's host park holds no futex cell, so the OS vCPU idling in a blocking resume of
+    // it learns of the wake by the ring, and re-polls.
+    hub.park.ring();
     hub.wake_child_tasks(crate::child_exec::Wake::All);
+}
+
+/// #2757 — a run's futex table, under whose lock every OS-vCPU park of the run sleeps
+/// ([`Domain::park`]): a futex wait on its own wait cell, which the `notify` that claims the cell
+/// wakes and no other ([`futex_notify`]); a blocking resume on its fiber's cell, or on [`Self::cv`]
+/// when the fiber's park has none.
+pub(crate) struct Parking {
+    futex: Mutex<HashMap<FutexKey, FutexEntry>>,
+    /// What a blocking resume of a park with no futex cell sleeps on ([`fiber_resume_block`]).
+    cv: Condvar,
+    /// Bumped, under [`Self::futex`], by every wake that claims no futex cell: a host key's
+    /// ([`wake_hub_parks`]), an outside answer's ([`outside_waker`]), and a wake of every park
+    /// ([`Self::wake_all`]). A blocking resume reads it before it polls its fiber and sleeps only
+    /// while it has not moved, so a wake that lands between its poll and its sleep is not slept
+    /// through.
+    rings: AtomicU64,
+    /// How many blocking resumes sleep on [`Self::cv`], so a ring with none to wake notifies no one.
+    resting: AtomicUsize,
+}
+
+impl Parking {
+    fn new() -> Self {
+        Parking {
+            futex: Mutex::new(HashMap::new()),
+            cv: Condvar::new(),
+            rings: AtomicU64::new(0),
+            resting: AtomicUsize::new(0),
+        }
+    }
+
+    /// A wake with no futex cell: bump [`Self::rings`] and wake the cell-less blocking resumes.
+    #[cfg_attr(loom, allow(dead_code))] // its callers are real-build-only
+    fn ring(&self) {
+        let g = lock(&self.futex);
+        self.ring_under(&g);
+    }
+
+    /// #2757 — wake every vCPU that sleeps under this lock, each to re-check what it waits on: the
+    /// futex waits and the blocking resumes on their cells, and the resumes of cell-less parks. For
+    /// an event that claims no cell but can end any park: a kill, a freeze, the domain's end, the
+    /// run falling quiescent. Every sleeper sleeps on a cell queued here, since a cell leaves the
+    /// queue only claimed or by its own waiter ([`FutexEntry::waiters`]).
+    fn wake_all(&self) {
+        let g = lock(&self.futex);
+        for c in g.values().flat_map(|e| &e.waiters) {
+            c.rouse();
+        }
+        self.ring_under(&g);
+    }
+
+    /// Under the futex lock `_g`: bump [`Self::rings`] and wake the resumes on [`Self::cv`].
+    fn ring_under(&self, _g: &MutexGuard<'_, HashMap<FutexKey, FutexEntry>>) {
+        self.rings.fetch_add(1, Ordering::AcqRel);
+        if self.resting.load(Ordering::Acquire) > 0 {
+            self.cv.notify_all();
+        }
+    }
 }
 
 /// The per-run thread table + futex — the "scheduler address" baked into the `thread.*` thunks. It
@@ -645,8 +746,10 @@ pub(crate) struct Domain {
     /// Monotonic task-id allocator for the domain's spawns (root = `0`, first spawn = `1`), matching
     /// the interpreter's `next_task` so `FrozenVCpu.task` is byte-identical, and its `vcpu.tls` seed.
     next_task: Mutex<u64>,
-    futex: Mutex<HashMap<FutexKey, FutexEntry>>,
-    futex_cv: Condvar,
+    /// #2757 — the futex table, under whose lock the run's futex waits and blocking resumes sleep
+    /// ([`Parking`]). Shared, so a wake that may outlive the run (an outside answer's hook,
+    /// [`outside_waker`]) can hold it weakly. A hub's; a §14 child's domain uses its hub's.
+    park: std::sync::Arc<Parking>,
     /// §5 W3 Stage 3: a trap-time backtrace capture handed up by a **spawned** vCPU when it trapped.
     /// The per-thread capture lives in `trap_shim.c`'s thread-local (filled by the SIGSEGV/SIGBUS
     /// handler or the explicit-trap helper) and would be lost when the worker thread ends, so the
@@ -685,6 +788,11 @@ pub(crate) struct Domain {
     /// Signalled whenever a lane is given back, for the 1:1 vCPUs blocked waiting for one. (The
     /// executor's workers wait on their own condvar and are woken alongside.)
     lane_cv: Condvar,
+    /// #2757 — the wakers of the run's parks that sleep on something of their own rather than on
+    /// [`Self::park`] or [`Self::lane_cv`]: a vCPU waiting on an answer from outside the run
+    /// ([`wait_outside`]) registers its store's here for the wait. A hub's; fired with the rest of
+    /// the run's parks ([`Self::wake_own_parked`]).
+    wakers: crate::door::Wakers,
     /// D66 — the lane chain **this domain's own vCPUs** run under: `[(domain id, cap)]`, or empty
     /// when the run set no cap (then every gate below is skipped and the hot path is untouched).
     /// Installed at run entry from the host's `(domain_id, lane_cap)` for a run's domain (one entry
@@ -751,8 +859,8 @@ struct FutexEntry {
 
 /// One parked waiter's completion cell (see [`FutexEntry::waiters`]). Written once, under the futex
 /// lock; read by its waiter — at each `cont.resume` poll for a fiber, at each condvar wakeup for an
-/// OS-thread vCPU. The cell owns the wake decision on both paths; the condvar is only how an OS
-/// waiter sleeps between re-checks.
+/// OS-thread vCPU. The cell owns the wake decision on both paths; its condvar is only how a vCPU
+/// sleeps between re-checks.
 pub(crate) struct WaitCell {
     /// [`PENDING_WAIT`] while queued; a `WAIT_*` status once the event fired.
     status: AtomicI32,
@@ -762,6 +870,14 @@ pub(crate) struct WaitCell {
     /// ([`cell_unpark`]). A fiber's cell and a timed wait's cell are never counted, so their flag
     /// starts `false` and every `cell_unpark` on them is a no-op.
     parked: AtomicBool,
+    /// #2757 — what a vCPU waiting on this cell sleeps on, under the futex lock: the OS vCPU whose
+    /// wait it is, or the vCPU driving the fiber whose wait it is ([`fiber_resume_block`]). So the
+    /// `notify` that claims the cell wakes that vCPU and no other. Every OS waiter of the run once
+    /// slept on one condvar, and each `notify` woke them all to find most of their cells unclaimed.
+    cv: Condvar,
+    /// How many vCPUs sleep on [`Self::cv`], moved under the futex lock: a task's cell, or a fiber's
+    /// that no vCPU idles on, costs its waker nothing.
+    sleepers: AtomicUsize,
 }
 
 /// [`WaitCell::status`] sentinel: no event yet. Distinct from every `WAIT_*` status; 0 is
@@ -775,6 +891,8 @@ fn wait_cell_new(parked: bool) -> std::sync::Arc<WaitCell> {
     std::sync::Arc::new(WaitCell {
         status: AtomicI32::new(PENDING_WAIT),
         parked: AtomicBool::new(parked),
+        cv: Condvar::new(),
+        sleepers: AtomicUsize::new(0),
     })
 }
 
@@ -783,6 +901,41 @@ impl WaitCell {
     /// found the word changed. A child task parked on such a cell is runnable.
     pub(crate) fn resolved(&self) -> bool {
         self.status.load(Ordering::Acquire) != PENDING_WAIT
+    }
+
+    /// Under the futex lock: wake the vCPUs sleeping on this cell, to re-check it.
+    fn rouse(&self) {
+        if self.sleepers.load(Ordering::Relaxed) > 0 {
+            self.cv.notify_all();
+        }
+    }
+
+    /// Sleep on this cell under the futex lock `g` until [`Self::rouse`] or `deadline`; `true` if
+    /// the deadline passed. Like any condvar wait it may also return for nothing.
+    fn sleep<'a, T>(
+        &self,
+        g: MutexGuard<'a, T>,
+        deadline: Option<Instant>,
+    ) -> (MutexGuard<'a, T>, bool) {
+        self.sleepers.fetch_add(1, Ordering::Relaxed);
+        let slept = match deadline {
+            None => (self.cv.wait(g).unwrap_or_else(|e| e.into_inner()), false),
+            // loom's `Condvar` models no timeouts, and no loom model waits with a deadline.
+            #[cfg(not(loom))]
+            Some(dl) => {
+                let left = dl.saturating_duration_since(Instant::now());
+                let (g, to) = self
+                    .cv
+                    .wait_timeout(g, left)
+                    .unwrap_or_else(|e| e.into_inner());
+                (g, to.timed_out())
+            }
+            #[cfg(loom)]
+            Some(_) => unreachable!("loom futex model uses no timeout"),
+        };
+        self.sleepers.fetch_sub(1, Ordering::Relaxed);
+        woke();
+        slept
     }
 }
 
@@ -973,8 +1126,7 @@ impl Domain {
             children: ChildTable::default(),
             cur_task: Mutex::new(0),
             next_task: Mutex::new(1), // root is task 0; first spawn is 1
-            futex: Mutex::new(HashMap::new()),
-            futex_cv: Condvar::new(),
+            park: std::sync::Arc::new(Parking::new()),
             trap_capture: Mutex::new(None),
             quiesce: Mutex::new(0),
             quiesce_cv: Condvar::new(),
@@ -983,6 +1135,7 @@ impl Domain {
             child_exec: Mutex::new(None),
             lanes: Mutex::new(BTreeMap::new()),
             lane_cv: Condvar::new(),
+            wakers: crate::door::Wakers::default(),
             lane_chain: Mutex::new(Vec::new()),
             hub: 0,
             node,
@@ -1223,18 +1376,24 @@ impl Domain {
         cell_unpark(flag, &self.hub().parked);
     }
 
-    /// The §14 child finished — drop it from the live count (see [`Self::child_started`]) and wake
-    /// the futex waiters so a parked infinite waiter re-evaluates `peers_live` promptly (not only
-    /// on the `KILL_RECHECK` cadence, which an unarmed run doesn't have), exactly as when a spawned
-    /// vCPU exits (`run_child`'s decrement + wake). The parked child tasks re-check too: one may be
-    /// a detached child's root joining this child (#1956).
+    /// The §14 child finished — drop it from the live count (see [`Self::child_started`]), and if
+    /// that leaves the run quiescent wake its parked vCPUs, whose indefinite parks it has made
+    /// deadlocks, exactly as when a spawned vCPU exits ([`run_child`]): nothing re-checks on a
+    /// timer (#2757). The parked child tasks re-check too: one may be a detached child's root
+    /// joining this child (#1956).
     pub(crate) fn child_finished(&self) {
         lock(&self.threads).live -= 1;
-        {
-            let _g = lock(&self.futex);
-            self.futex_cv.notify_all();
-        }
+        self.wake_if_quiescent();
         self.wake_child_tasks(crate::child_exec::Wake::All);
+    }
+
+    /// #2757 — a vCPU's end dropped `live`: if no live vCPU is left uncounted, every indefinite park
+    /// of the run is a deadlock, so wake the vCPU parks that decide the verdict. Any other end
+    /// changes no park's answer, so it wakes none.
+    fn wake_if_quiescent(&self) {
+        if !self.hub().peers_live() {
+            self.wake_own_parked();
+        }
     }
 
     /// D66 — install the lane chain this domain's own vCPUs run under (see [`Domain::lane_chain`]).
@@ -1340,24 +1499,13 @@ impl Domain {
             if abort() {
                 return false;
             }
-            #[cfg(not(loom))]
-            {
-                g = hub
-                    .lane_cv
-                    .wait_timeout(g, KILL_RECHECK)
-                    .unwrap_or_else(|e| e.into_inner())
-                    .0;
-            }
-            #[cfg(loom)]
-            {
-                g = hub.lane_cv.wait(g).unwrap_or_else(|e| e.into_inner());
-            }
+            // #2757 — a lane given back (`lane_leave`), a kill or the domain's end
+            // (`wake_own_parked`) wakes this; nothing re-checks on a timer.
+            g = hub.lane_cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            woke();
         }
     }
 
-    /// D66 — a child-domain task parked (an event park inside it): it counts as blocked for the
-    /// 1:1 vCPUs' deadlock predicate (`live > parked`), exactly as a parked OS-thread child did
-    /// through its `ParkGuard`; the futex broadcast lets an infinite waiter re-evaluate now.
     /// D66 — the run's child-domain executor (`child_exec`), registered by the nursery that owns
     /// it. `None` on a domain whose run files no child tasks (and on the Domain-less durable
     /// nested nursery, which has no futex either, so nothing can park).
@@ -1375,10 +1523,12 @@ impl Domain {
         }
     }
 
+    /// D66 — a child-domain task parked (an event park inside it): it counts as blocked for the
+    /// 1:1 vCPUs' deadlock predicate (`live > parked`), exactly as a parked OS-thread child did
+    /// through its `ParkGuard`. If that leaves the run quiescent, the executor wakes the vCPU parks
+    /// that decide the verdict (`ChildExec::wake_vcpus_if_quiescent`).
     pub(crate) fn task_parked(&self) {
         self.parked.fetch_add(1, Ordering::AcqRel);
-        let _g = lock(&self.futex);
-        self.futex_cv.notify_all();
     }
 
     /// D66 — the task is runnable again (woken, due, or poisoned).
@@ -1475,8 +1625,8 @@ impl Domain {
     /// fault — right before [`Self::join_all`]. Raise the internal [`crate::DOMAIN_DONE_CODE`]
     /// sentinel ("root completion ends the activation"), which a trap or exit raised first outranks
     /// (#2499), so every surviving sibling's trap-propagation guard and poll treat the domain as
-    /// over. Then wake every parked vCPU so it observes the end and unwinds instead of waiting
-    /// forever.
+    /// over. Then wake every parked vCPU and task so it observes the end and unwinds instead of
+    /// waiting forever: nothing else would wake them, since nothing re-checks on a timer (#2757).
     ///
     /// `freezing` (a durable **freeze**: the root unwound under `UNWINDING`) is *not* teardown —
     /// the sentinel is skipped so parked siblings park-and-unwind through the freeze re-issue
@@ -1486,41 +1636,52 @@ impl Domain {
         if !freezing {
             self.env().ctx().raise(crate::DOMAIN_DONE_CODE as i64);
         }
-        self.wake_all_parked();
-    }
-
-    /// Wake every parked vCPU in this domain so it re-evaluates its park predicate: the futex
-    /// waiters (`atomic.wait`) and every joiner (`thread.join` parks on a per-child [`Done`] cell).
-    /// Each notify is serialized with the corresponding waiter lock (the futex map / `Done.state`),
-    /// so a waiter's check-then-park can never miss it — the same no-lost-wake discipline as
-    /// [`futex_notify`]. Called at domain teardown ([`Self::begin_teardown`]) and whenever a vCPU
-    /// finishes ([`run_child`]): a completion changes `live` (the deadlock predicate) and a
-    /// trap/exit begins teardown (owner decision 2026-07-24), and either way the parked must
-    /// re-check, not sleep until `KILL_RECHECK` (or forever, when no kill-path is armed).
-    pub(crate) fn wake_all_parked(&self) {
         self.wake_own_parked();
-        // D66 — and every parked child task, for the same reason: a completion changed `live`, or
-        // teardown began, and a parked task must re-check rather than sleep to the cadence.
         self.wake_child_tasks(crate::child_exec::Wake::All);
     }
 
-    /// [`Self::wake_all_parked`] without the child tasks: this domain's own parked vCPUs only. The
-    /// child executor calls it for a task's domain while holding its own lock, which
-    /// [`Self::wake_child_tasks`] would take again.
+    /// Wake this domain's own parked vCPUs, each to re-evaluate its park predicate; the child
+    /// tasks are [`Self::wake_child_tasks`]'s. Each wake is serialized with its waiters' lock, so a
+    /// waiter's check-then-park can never miss it — the same no-lost-wake discipline as
+    /// [`futex_notify`]. The child executor calls it for a task's domain while holding its own
+    /// lock, which [`Self::wake_child_tasks`] would take again.
     pub(crate) fn wake_own_parked(&self) {
-        // A §14 child's waiters park on its hub's futex; its joiners on its own cells, below.
+        // A §14 child's waiters park on its hub's futex and lanes; its joiners on its own cells.
+        // Each wake is taken under its waiters' lock, so a waiter between its check and its sleep
+        // cannot miss it.
+        let hub = self.hub();
+        hub.park.wake_all();
+        // A vCPU queued for a lane stops on a kill or the domain's end (`lane_acquire`'s `abort`).
         {
-            let hub = self.hub();
-            let _g = lock(&hub.futex);
-            hub.futex_cv.notify_all();
+            let _g = lock(&hub.lanes);
+            hub.lane_cv.notify_all();
         }
-        // Snapshot the completion cells out of the table lock, then notify each under its own state
-        // lock (never hold the table lock while taking a cell lock). A joiner racing a detach for a
-        // cell no longer in the table is woken by its vCPU's own publish.
-        for c in self.children.thread_cells() {
+        // And the parks that sleep on something of their own (#2757).
+        hub.wakers.fire();
+        self.wake_joiners();
+    }
+
+    /// The joiners of this domain's vCPUs and §14 children, each on its joinee's cell. A joiner
+    /// racing a detach for a cell no longer in the table is woken by its vCPU's own publish. All
+    /// that [`Self::wake_own_parked`] wakes of a task's domain once its hub's parks are woken
+    /// (`ChildExec::wake_task_vcpus`).
+    pub(crate) fn wake_joiners(&self) {
+        let (threads, children) = self.children.join_cells();
+        for c in threads {
             let _g = lock(&c.state);
             c.cv.notify_all();
         }
+        for c in children {
+            let _g = c.state.lock().unwrap_or_else(|e| e.into_inner());
+            c.cv.notify_all();
+        }
+    }
+
+    /// #2757 — a store that can end any park of the run fired (its kill door, a freeze): wake the
+    /// domain's parked vCPUs and tasks, and every vCPU of its §14 children's domains.
+    pub(crate) fn wake_run(&self) {
+        self.wake_own_parked();
+        self.wake_child_tasks(crate::child_exec::Wake::Run);
     }
 
     /// Join every spawned OS thread (run teardown). After this returns no vCPU is still touching the
@@ -1548,11 +1709,11 @@ impl Domain {
 /// `MutexGuard` helper that recovers from poisoning (a panicking holder means the domain is already
 /// being killed; we still want the data). loom's `Mutex` has no poisoning, so it returns the guard.
 #[cfg(not(loom))]
-pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 #[cfg(loom)]
-pub(crate) fn lock<T>(m: &Mutex<T>) -> loom::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap()
 }
 
@@ -1939,13 +2100,21 @@ fn run_child(a: SpawnArgs) {
     // §15: free this vCPU's concurrent-live slot (and a §14 child's run-wide one) and publish its
     // result. The domain outlives all spawned threads, so the pointer is live. SAFETY: `a.dom` is the
     // run's `Domain` (joined at run end).
-    a.done.publish(unsafe { &*a.dom }, result, trap);
-    // A finished vCPU re-wakes the whole domain (owner decision 2026-07-24; DESIGN.md §12): parked
-    // futex waiters re-evaluate the deadlock predicate against the dropped `live`, and — when this
-    // vCPU carried a trap (any trap is domain teardown) — every parked sibling observes the shared
-    // cell and unwinds. A few condvar broadcasts, only on vCPU exit.
     // SAFETY: `a.dom` is the run's live `Domain` (joined at run end).
-    unsafe { (*a.dom).wake_all_parked() };
+    let d = unsafe { &*a.dom };
+    a.done.publish(d, result, trap);
+    // A finished vCPU wakes its domain's parked vCPUs when it changes their answer (owner decision
+    // 2026-07-24; DESIGN.md §12): a trap ends the domain (any trap is domain teardown), so every
+    // parked sibling observes the shared cell and unwinds; an end that leaves the run quiescent makes
+    // every indefinite park a deadlock. Its own joiner the publish woke. #2757 — any other end wakes
+    // none: woken, they would only park again, and with many parked that was most of an exit's cost.
+    if trap != 0 {
+        d.wake_own_parked();
+    } else {
+        d.wake_if_quiescent();
+    }
+    // D66 — the parked child tasks re-check either way: one may be joining this vCPU.
+    d.wake_child_tasks(crate::child_exec::Wake::All);
 }
 
 /// The running vCPU's env, found via the baked `Domain` pointer the thunks receive.
@@ -2684,8 +2853,8 @@ pub(crate) unsafe fn join_thread(
 /// stops the wait first (a freeze marks the join for re-issue).
 unsafe fn os_join(dom: &Domain, cur: u64, done: &Done, vm: &crate::VmCtx) -> Option<(i64, i64)> {
     // §5 kill-path: a joiner blocked on a sibling must also unwind when the host kills the domain
-    // (else `join_all` hangs on a vCPU that will never finish). When armed, re-check the interrupt
-    // cell periodically; on a kill, return so the caller's next epoch poll traps `OutOfFuel`.
+    // (else `join_all` hangs on a vCPU that will never finish); on a kill, return so the caller's
+    // next epoch poll traps `OutOfFuel`.
     let epoch_addr = dom.env().epoch_addr;
     // §12.8 4A.5 (blocked-in-join freeze): a joiner parked here when a freeze begins must also return
     // so its instrumented caller can unwind at the re-issue safepoint the `temen-durable` transform now
@@ -2704,6 +2873,10 @@ unsafe fn os_join(dom: &Domain, cur: u64, done: &Done, vm: &crate::VmCtx) -> Opt
     // cell's lock is taken and re-taken after it is dropped ([`join_thread`]) — blocking for a lane
     // while holding that lock would stop the child from ever publishing the result being waited for.
     dom.lane_give_back(&dom.lane_chain());
+    // #2757 — nothing re-checks on a timer: whatever can end the join notifies the cell. The joined
+    // vCPU's publish ([`Done::publish`]); a kill or a freeze, through the run's wake on its doors,
+    // and the domain's end ([`Domain::wake_own_parked`]); and the run falling quiescent, at a vCPU's
+    // end ([`Domain::wake_if_quiescent`]) or a task's park (`ChildExec::wake_vcpus_if_quiescent`).
     let mut st = lock(&done.state);
     // §12.8 concurrent-thaw stage 3: count this joiner as blocked while it parks, so a sibling waiter's
     // `peers_live` (and the deadlock detector) see a join↔wait mutual block as full quiescence.
@@ -2726,30 +2899,28 @@ unsafe fn os_join(dom: &Domain, cur: u64, done: &Done, vm: &crate::VmCtx) -> Opt
         // trap/exit from any vCPU — or the root's completion (the internal DOMAIN_DONE sentinel) —
         // ends the domain; sibling outcomes are unobservable past teardown. Return so the join's
         // trailing trap-propagation guard (which reads the domain's end) unwinds this thread.
-        // Woken promptly by [`Domain::wake_all_parked`].
         if vm.ended().is_some() {
             return None;
         }
-        // A timeout wait so the kill (`epoch_addr`) and freeze (`freeze`) re-checks above run
-        // periodically even when no `notify` arrives; a plain `wait` only when neither is armed.
-        #[cfg(not(loom))]
-        if epoch_addr != 0 || freeze.is_some() {
-            st = done
-                .cv
-                .wait_timeout(st, KILL_RECHECK)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
-            continue;
+        // #2757 — the deadlock verdict, decided here as `futex_wait` decides it: with this join's
+        // cell seen empty and the joiner counted, no live vCPU left uncounted means nothing can
+        // ever end the joined vCPU, so fail closed (`ThreadFault`, the oracle's answer) rather
+        // than wait forever. The vCPU park that leaves the run quiescent decides it, whichever kind
+        // it is, so it wakes no other to re-ask. Lock order: this cell, then `threads`.
+        if !dom.hub().peers_live() {
+            vm.raise(TrapKind::ThreadFault as i64);
+            return None;
         }
         st = done.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        woke();
     }
 }
 
 /// #1469 — `thread.join` at a child task's root: park the task on the one event park until the
 /// joined vCPU publishes. It counts as blocked for the deadlock predicate through the completion
 /// cell, as an OS joiner does ([`Domain::join_park`], #1820); the executor gives back the task's lanes while
-/// it is parked, and re-offers it at the joined vCPU's exit broadcast (`run_child` →
-/// [`Domain::wake_all_parked`]), poisoning it at teardown. A freeze of its window reaches it through
+/// it is parked, and re-offers it at the joined vCPU's exit (`run_child` →
+/// [`Domain::wake_child_tasks`]), poisoning it at teardown. A freeze of its window reaches it through
 /// the joined vCPU, which re-checks the freeze, ends, and broadcasts. As [`os_join`], it answers the
 /// outcome, or `None` when a kill, a freeze or the domain's end stops it.
 ///
@@ -2879,8 +3050,7 @@ pub(crate) unsafe extern "C" fn thread_wait(
     // value re-check below still reads the real `phys` — queue on the canonical key, compare on the
     // address (mirrors the interpreter's split key/addr park).
     let status = futex_wait(
-        &hub.futex,
-        &hub.futex_cv,
+        &hub.park,
         futex_key_of(phys),
         || read_phys(phys, width) & mask == expected & mask,
         deadline,
@@ -2946,7 +3116,7 @@ unsafe fn fiber_futex_wait(
     let key = futex_key_of(phys);
     let cell = wait_cell_new(false);
     {
-        let mut g = lock(&dom.hub().futex);
+        let mut g = lock(&dom.hub().park.futex);
         if read_phys(phys, width) & mask != expected & mask {
             // Insta-wake (the park-vs-store race, closed): deliver `WAIT_NOT_EQUAL` without
             // queueing — but still park once below, so the resumer sees the one transient
@@ -2999,7 +3169,7 @@ unsafe fn fiber_futex_wait_loop(
         // propagation, the durable re-issue safepoint) unwind before the guest observes it.
         let frozen = freeze.is_some_and(|f| f.landed());
         if epoch_fired(dom.env().epoch_addr) || vm.ended().is_some() || frozen {
-            wait_deregister(&mut lock(&dom.hub().futex), key, cell);
+            wait_deregister(&mut lock(&dom.hub().park.futex), key, cell);
             // A freeze ended this wait, not its event: the thaw re-issues it (#1769).
             return if frozen {
                 temen_ir::durable_abi::WAIT_FROZEN
@@ -3011,7 +3181,7 @@ unsafe fn fiber_futex_wait_loop(
             if Instant::now() >= dl {
                 // The deadline passed: fire the timeout at this poll. A notify that raced us
                 // and already consumed the cell wins with its own status.
-                if wait_deregister(&mut lock(&dom.hub().futex), key, cell) {
+                if wait_deregister(&mut lock(&dom.hub().park.futex), key, cell) {
                     return WAIT_TIMED_OUT;
                 }
                 return cell.status.load(Ordering::Acquire);
@@ -3053,14 +3223,17 @@ const FIBER_PARKED_STATUS: i64 = 3;
 
 /// I48 — the **blocking** fiber resume (`cont.resume.block`). Like [`fiber_rt::fiber_resume`], but
 /// when the resumed fiber is still event-parked (`FIBER_PARKED`) it **idles this vCPU's OS thread**
-/// on the domain condvar instead of returning the poll status to the guest, then re-resumes. It is
-/// woken early by any `notify` / teardown broadcast on `futex_cv`; the `KILL_RECHECK` bound makes the
-/// re-poll observe a timed wait's deadline, a kill (epoch), a freeze, or teardown even with no
-/// broadcast — the fiber's own [`fiber_futex_wait`] guards fire at the re-poll and end the wait. So
-/// the guest sees the same `(status, value)` a polling `cont.resume` would, reached by **sleeping
-/// rather than spinning** (the tree-walk oracle and the cooperative bytecode driver idle
-/// equivalently; INVARIANTS.md #9). Advisory still holds: a transient `FIBER_PARKED` (the
-/// park-vs-store recheck) is absorbed by the one extra re-poll here, never surfaced to the guest.
+/// instead of returning the poll status to the guest, then re-resumes: on the fiber's futex wait
+/// cell, or on the run's ring ([`Parking::cv`]) when the fiber's park has no cell. #2757 —
+/// everything that can end the fiber's park wakes it there, and nothing re-checks on a timer: a
+/// `notify` that claims the fiber's futex cell; a host key's or an outside answer's wake, which has
+/// no cell and rings [`Parking::rings`] instead; a kill, a freeze or teardown; and the
+/// fiber's own deadline, which bounds the sleep. The fiber's own [`fiber_futex_wait`] guards fire at
+/// the re-poll and end the wait. So the guest sees the same `(status, value)` a polling
+/// `cont.resume` would, reached by **sleeping rather than spinning** (the tree-walk oracle and the
+/// cooperative bytecode driver idle equivalently; INVARIANTS.md #9). Advisory still holds: a
+/// transient `FIBER_PARKED` (the park-vs-store recheck) is absorbed by the one extra re-poll here,
+/// never surfaced to the guest.
 ///
 /// Re-polling drives the fiber's existing `fiber_futex_wait` loop exactly as the guest's poll loop
 /// does today; the only change is the sleep between polls. Not held: the futex lock is released
@@ -3086,10 +3259,20 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
     #[cfg(not(loom))]
     let mut confirming = false;
     loop {
+        // #2757 — read before the poll: a cell-less wake after it moves this (see the sleep below).
+        #[cfg(not(loom))]
+        let seen = hub.park.rings.load(Ordering::Acquire);
         let value = fiber_rt::fiber_resume(handle, arg, status_out, vm as *const _ as u64);
         // Done (guest suspend / return), a trap in flight, or not event-parked: hand back to the
         // guest exactly as `cont.resume` would (its `status_out`/value are already set).
         if *status_out != FIBER_PARKED_STATUS || vm.ended().is_some() {
+            return value;
+        }
+        // #2757 — a kill ends the idle too: the fiber's own park may not see it (an outside
+        // answer's waits only on the answer and the domain's end), and nothing else would wake a
+        // lone vCPU.
+        if epoch_fired(vm.epoch as usize) {
+            vm.raise(TrapKind::OutOfFuel as i64);
             return value;
         }
         // #2424 — a fiber waiting on an answer from outside the run may be woken although no vCPU
@@ -3117,15 +3300,13 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                 }
             }
         }
-        // Still event-parked: idle on the domain condvar until an event might wake the fiber, then
-        // re-poll. `ParkGuard` counts this vCPU blocked for the deadlock detector; the bounded wait
-        // re-checks a kill / timeout / freeze / teardown within `KILL_RECHECK`. The lock is dropped
-        // (with the returned guard) before the next re-resume — the fiber may take it.
+        // Still event-parked: idle under the run's futex lock until an event might wake the fiber,
+        // then re-poll. `ParkGuard` counts this vCPU blocked for the deadlock detector. The lock is
+        // dropped (with the returned guard) before the next re-resume — the fiber may take it.
         //
-        // `KILL_RECHECK` / `wait_timeout` are the real-build cadence (both absent under loom, which
-        // has no wall clock). loom does not model fibers, so this thunk is never exercised there;
-        // the `#[cfg(loom)]` arm takes the advisory `FIBER_PARKED` downgrade purely so the crate
-        // still compiles under `--cfg loom`.
+        // loom does not model fibers, so this thunk is never exercised there; the `#[cfg(loom)]`
+        // arm takes the advisory `FIBER_PARKED` downgrade purely so the crate still compiles under
+        // `--cfg loom`.
         #[cfg(not(loom))]
         {
             // D66 — this vCPU is idling until its fiber's event fires, so it holds no lane while it
@@ -3139,14 +3320,17 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                 // counting it let a *sibling*'s indefinite wait read `live == parked` and trap a
                 // correct program. Same rule as the OS park (#1625) and the task park, asked of the
                 // one park this vCPU is actually waiting on.
-                let self_resolving = fiber_rt::park_deadline(handle).is_some() || outside;
+                let deadline = fiber_rt::park_deadline(handle);
+                let self_resolving = deadline.is_some() || outside;
                 let cell = fiber_rt::park_cell(handle);
-                let g = lock(&hub.futex);
+                let mut g = lock(&hub.park.futex);
                 // A `notify` that claimed the fiber's wait since the poll above: re-poll at once
-                // rather than idle on a wake already delivered.
+                // rather than idle on a wake already delivered. So too a wake since then that claims
+                // no cell: a host key's, an outside answer's, a kill's or a freeze's (#2757).
                 let claimed = cell
                     .as_ref()
-                    .is_some_and(|c| c.status.load(Ordering::Acquire) != PENDING_WAIT);
+                    .is_some_and(|c| c.status.load(Ordering::Acquire) != PENDING_WAIT)
+                    || hub.park.rings.load(Ordering::Acquire) != seen;
                 // Counted through the fiber's own wait cell, so the `notify` that claims it ends
                 // this park under this lock (`cell_unpark`), as it does an OS waiter's (#1625).
                 // Left to this vCPU to settle on waking, the count outlived the wake: a notifier
@@ -3180,10 +3364,11 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                 // deadlocked. Deciding there trapped a correct program (the cross-vCPU-notify gate,
                 // red on Windows where the peer reliably won that window).
                 //
-                // Requiring the reading to survive one `KILL_RECHECK` and the re-poll that follows
-                // it closes that gap without a second predicate: a granted wake is picked up by the
-                // next `fiber_resume` and leaves this loop, while a genuine deadlock — nothing live
-                // to change the answer — still reads quiescent and fails closed, 20 ms later.
+                // Requiring the reading to survive the re-poll that follows it closes that gap
+                // without a second predicate: a granted wake is picked up by that `fiber_resume`
+                // and leaves this loop, while a genuine deadlock — nothing live to change the
+                // answer — still reads quiescent and fails closed. #2757 — the re-poll comes at
+                // once: the wake it looks for was granted before this reading, so no sleep helps.
                 let quiescent = !self_resolving && !claimed && !hub.peers_live();
                 if quiescent && confirming {
                     drop(g);
@@ -3191,9 +3376,32 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                     return value;
                 }
                 confirming = quiescent;
-                if !claimed {
-                    let _ = hub.futex_cv.wait_timeout(g, KILL_RECHECK);
+                if !claimed && !quiescent {
+                    // Until a wake of the fiber's park, or its own deadline: on the fiber's wait
+                    // cell, which the `notify` that claims it wakes and no other; on the run's ring
+                    // when its park has no cell.
+                    g = match cell.as_deref() {
+                        Some(c) => c.sleep(g, deadline).0,
+                        None => {
+                            hub.park.resting.fetch_add(1, Ordering::AcqRel);
+                            let g = match deadline {
+                                Some(dl) => {
+                                    let left = dl.saturating_duration_since(Instant::now());
+                                    hub.park
+                                        .cv
+                                        .wait_timeout(g, left)
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .0
+                                }
+                                None => hub.park.cv.wait(g).unwrap_or_else(|e| e.into_inner()),
+                            };
+                            hub.park.resting.fetch_sub(1, Ordering::AcqRel);
+                            woke();
+                            g
+                        }
+                    };
                 }
+                drop(g);
             }
             if !dom.lane_acquire(&lane, || {
                 epoch_fired(dom.env().epoch_addr) || vm.ended().is_some()
@@ -3204,7 +3412,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
         }
         #[cfg(loom)]
         {
-            let _ = &hub.futex; // touch the field so it isn't flagged unused under loom
+            let _ = &hub.park; // touch the field so it isn't flagged unused under loom
             return value;
         }
     }
@@ -3219,13 +3427,7 @@ pub(crate) unsafe extern "C" fn thread_notify(sched: *const Domain, phys: u64, c
     let dom = current_domain(sched).hub();
     // The count is **unsigned** "wake up to N" (wasm's notify count is u32; `-1` = wake all);
     // `futex_notify` caps at the real waiter count, so reinterpret the i32 bits as u32.
-    let woken = futex_notify(
-        &dom.futex,
-        &dom.futex_cv,
-        futex_key_of(phys),
-        count as u32,
-        &dom.parked,
-    );
+    let woken = futex_notify(&dom.park, futex_key_of(phys), count as u32, &dom.parked);
     if woken > 0 {
         // D66 — a parked **child-domain task** has no resumer polling it: re-offer the tasks whose
         // cells this notify just filled, so they run again. Nothing else re-offers them (#2757).
@@ -3272,8 +3474,7 @@ impl Drop for CellParkGuard<'_> {
 /// makes a real `notify` distinguishable so the returned status is accurate.
 #[allow(clippy::too_many_arguments)] // a futex park threads its full guest/kill/freeze/deadlock context
 fn futex_wait(
-    futex: &Mutex<HashMap<FutexKey, FutexEntry>>,
-    cv: &Condvar,
+    park: &Parking,
     key: FutexKey,
     still_eq: impl Fn() -> bool,
     deadline: Option<Instant>,
@@ -3292,7 +3493,7 @@ fn futex_wait(
     // same end and unwinds it before the guest observes the status.
     torn_down: impl Fn() -> bool,
 ) -> i32 {
-    let mut g = lock(futex);
+    let mut g = lock(&park.futex);
     if !still_eq() {
         return WAIT_NOT_EQUAL;
     }
@@ -3344,8 +3545,9 @@ fn futex_wait(
         // Owner decision 2026-07-24 (domain teardown; DESIGN.md §12, D37 death-is-revocation): the
         // domain is over — a trap/exit from any vCPU, or the root's completion (the internal
         // DOMAIN_DONE sentinel), is this waiter's domain's end. Return as if woken; the caller's
-        // trailing trap-propagation guard unwinds it. Re-checked on every [`Domain::wake_all_parked`]
-        // broadcast, so a PARKED sibling observes teardown promptly even with no kill-path armed.
+        // trailing trap-propagation guard unwinds it. Re-checked at every wake of the run's parks
+        // ([`Parking::wake_all`]), so a PARKED sibling observes teardown promptly even with no
+        // kill-path armed.
         if torn_down() {
             break WAIT_WOKEN;
         }
@@ -3369,37 +3571,25 @@ fn futex_wait(
                 if !peers_live() {
                     break WAIT_DEADLOCK;
                 }
-                // Real build: a bounded re-check, so an infinite wait still observes a kill, a freeze,
-                // or the last peer exiting even when no `notify` arrives. Under loom there are no
-                // timeouts and none is needed — every state change that could satisfy or refute this
-                // wait notifies this `cv` under this lock — a `notify`, or a peer going non-live
-                // (`child_finished` / `run_child` drop `live` and wake) — so the model re-evaluates
-                // on each wakeup.
-                #[cfg(not(loom))]
-                {
-                    g = cv
-                        .wait_timeout(g, KILL_RECHECK)
-                        .unwrap_or_else(|e| e.into_inner())
-                        .0;
-                }
-                #[cfg(loom)]
-                {
-                    g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
-                }
+                // #2757 — no re-check on a timer, in the real build as under loom: every state change
+                // that could satisfy or refute this wait wakes this cell under this lock. The
+                // `notify` that claims it; a kill or a freeze (the run's wake on its doors); the
+                // domain's end; and the run falling quiescent, at a vCPU's end (`run_child`,
+                // `child_finished`) or a task's park (`ChildExec::wake_vcpus_if_quiescent`). A vCPU's
+                // own park needs no wake: the park that leaves the run quiescent sees it on its first
+                // check, here or in a join.
+                g = cell.sleep(g, None).0;
             }
             // loom's `Condvar` models no timeouts; the loom test only exercises the infinite-wait path
             // (`deadline = None`), so the timed branch is real-build-only.
             #[cfg(not(loom))]
             Some(dl) => {
-                let now = Instant::now();
-                if now >= dl {
+                if Instant::now() >= dl {
                     break WAIT_TIMED_OUT;
                 }
-                let (ng, to) = cv
-                    .wait_timeout(g, dl - now)
-                    .unwrap_or_else(|e| e.into_inner());
+                let (ng, timed_out) = cell.sleep(g, Some(dl));
                 g = ng;
-                if to.timed_out() {
+                if timed_out {
                     // A `notify` that claimed this cell while we slept wins with its own status.
                     let st = cell.status.load(Ordering::Acquire);
                     break if st != PENDING_WAIT {
@@ -3422,49 +3612,42 @@ fn futex_wait(
 /// Futex wake core: claim **exactly** `count` of `key`'s parked waiters — oldest first, OS-thread
 /// vCPUs and event-parked fibers in one arrival order — and return how many there were to claim.
 ///
-/// The `notify_all` that follows is only how the OS waiters are roused to re-check; a waiter this
-/// call did not claim finds its cell still [`PENDING_WAIT`] and parks again. So the returned count is
-/// the number of waiters that will report `WAIT_WOKEN`, which is what the oracle promises and what a
-/// guest handing work out one wake at a time depends on.
+/// Each claimed cell wakes the vCPU sleeping on it, and only those wake (#2757). So the returned
+/// count is the number of waiters that will report `WAIT_WOKEN`, which is what the oracle promises
+/// and what a guest handing work out one wake at a time depends on.
 fn futex_notify(
-    futex: &Mutex<HashMap<FutexKey, FutexEntry>>,
-    cv: &Condvar,
+    park: &Parking,
     key: FutexKey,
     count: u32,
     // #1625: a claimed waiter is runnable, so the claim ends its park — see [`cell_unpark`].
     parked: &AtomicUsize,
 ) -> u32 {
-    let woken = {
-        let mut g = lock(futex);
-        match g.get_mut(&key) {
-            Some(e) if count > 0 => {
-                // Statuses are delivered under this same lock, so a racing poll (fiber) or condvar
-                // wakeup (vCPU) either finds the cell queued or finds its status — never neither.
-                //
-                // **Oldest first** — arrival order, matching both interpreter drivers (owner ruling
-                // 2026-09-22, #1617). `futex_notify_count_jit.rs` makes a fiber register strictly
-                // before a vCPU (a `cont.resume` returns `FIBER_PARKED` only once the fiber is
-                // queued, and the spawn follows), so *which* of the two a `notify(key, 1)` claims
-                // is a deterministic, race-free differential rather than a matter of taste.
-                let take = (count as usize).min(e.waiters.len());
-                for c in e.waiters.drain(..take) {
-                    c.status.store(WAIT_WOKEN, Ordering::Release);
-                    // Runnable as of this store, so it stops counting as parked *now* — under this
-                    // same lock, before any deadlock check can observe the pair (#1625).
-                    cell_unpark(&c.parked, parked);
-                }
-                if e.waiters.is_empty() {
-                    g.remove(&key);
-                }
-                take as u32
+    let mut g = lock(&park.futex);
+    match g.get_mut(&key) {
+        Some(e) if count > 0 => {
+            // Statuses are delivered under this same lock, so a racing poll (fiber) or condvar
+            // wakeup (vCPU) either finds the cell queued or finds its status — never neither.
+            //
+            // **Oldest first** — arrival order, matching both interpreter drivers (owner ruling
+            // 2026-09-22, #1617). `futex_notify_count_jit.rs` makes a fiber register strictly
+            // before a vCPU (a `cont.resume` returns `FIBER_PARKED` only once the fiber is
+            // queued, and the spawn follows), so *which* of the two a `notify(key, 1)` claims
+            // is a deterministic, race-free differential rather than a matter of taste.
+            let take = (count as usize).min(e.waiters.len());
+            for c in e.waiters.drain(..take) {
+                c.status.store(WAIT_WOKEN, Ordering::Release);
+                // Runnable as of this store, so it stops counting as parked *now* — under this
+                // same lock, before any deadlock check can observe the pair (#1625).
+                cell_unpark(&c.parked, parked);
+                c.rouse();
             }
-            _ => 0,
+            if e.waiters.is_empty() {
+                g.remove(&key);
+            }
+            take as u32
         }
-    };
-    if woken > 0 {
-        cv.notify_all();
+        _ => 0,
     }
-    woken
 }
 
 #[cfg(all(test, not(loom)))]
@@ -3496,8 +3679,7 @@ mod loom_tests {
     #[test]
     fn loom_wait_notify_never_hangs() {
         loom::model(|| {
-            let futex = Arc::new(Mutex::new(HashMap::<FutexKey, FutexEntry>::new()));
-            let cv = Arc::new(Condvar::new());
+            let park = Arc::new(Parking::new());
             let word = Arc::new(AtomicU64::new(0)); // the guest futex word
             const KEY: u64 = 0x1000;
 
@@ -3505,24 +3687,18 @@ mod loom_tests {
             // both sides move it and the assertion after the join checks they did so exactly once.
             let parked = Arc::new(AtomicUsize::new(0));
 
-            let (f2, cv2, w2, p2) = (
-                Arc::clone(&futex),
-                Arc::clone(&cv),
-                Arc::clone(&word),
-                Arc::clone(&parked),
-            );
+            let (pk2, w2, p2) = (Arc::clone(&park), Arc::clone(&word), Arc::clone(&parked));
             let producer = loom::thread::spawn(move || {
                 // store then notify (the release/wake pair)
                 w2.store(1, Ordering::SeqCst);
-                futex_notify(&f2, &cv2, FutexKey::Anon(KEY), 1, &p2);
+                futex_notify(&pk2, FutexKey::Anon(KEY), 1, &p2);
             });
 
             // consumer: wait while the word is still 0. Must not hang: either it sees 1 (NOT_EQUAL) or
             // it parks and the notify wakes it (WOKEN). A finite deadline keeps the model bounded, but
             // the invariant is "doesn't time out".
             let status = futex_wait(
-                &futex,
-                &cv,
+                &park,
                 FutexKey::Anon(KEY),
                 || word.load(Ordering::SeqCst) == 0,
                 None,
@@ -3556,8 +3732,7 @@ mod loom_tests {
     #[test]
     fn loom_notify_wakes_exactly_the_waiters_it_claims() {
         loom::model(|| {
-            let futex = Arc::new(Mutex::new(HashMap::<FutexKey, FutexEntry>::new()));
-            let cv = Arc::new(Condvar::new());
+            let park = Arc::new(Parking::new());
             let word = Arc::new(AtomicU64::new(0));
             const KEY: u64 = 0x2000;
 
@@ -3566,16 +3741,10 @@ mod loom_tests {
 
             let waiters: Vec<_> = (0..2)
                 .map(|_| {
-                    let (f, c, w, pk) = (
-                        Arc::clone(&futex),
-                        Arc::clone(&cv),
-                        Arc::clone(&word),
-                        Arc::clone(&parked),
-                    );
+                    let (pa, w, pk) = (Arc::clone(&park), Arc::clone(&word), Arc::clone(&parked));
                     loom::thread::spawn(move || {
                         futex_wait(
-                            &f,
-                            &c,
+                            &pa,
                             FutexKey::Anon(KEY),
                             || w.load(Ordering::SeqCst) == 0,
                             None,
@@ -3590,8 +3759,8 @@ mod loom_tests {
                 .collect();
 
             word.store(1, Ordering::SeqCst);
-            let claimed = futex_notify(&futex, &cv, FutexKey::Anon(KEY), 1, &parked)
-                + futex_notify(&futex, &cv, FutexKey::Anon(KEY), u32::MAX, &parked);
+            let claimed = futex_notify(&park, FutexKey::Anon(KEY), 1, &parked)
+                + futex_notify(&park, FutexKey::Anon(KEY), u32::MAX, &parked);
             let woken = waiters
                 .into_iter()
                 .map(|w| w.join().unwrap())
@@ -3623,30 +3792,28 @@ mod loom_tests {
     /// "peer" (its only possible notifier) goes non-live and signals the cv. Under every interleaving
     /// (peer exits before *or* after the consumer parks) the consumer returns `WAIT_DEADLOCK`. This is
     /// the loom analogue of the real-build `live > parked` quiescence check — here `peers_live` reads a
-    /// modeled live-peer flag. The peer flips the flag + wakes **under the futex lock**, exactly as
-    /// `futex_notify` serializes a wake, so the consumer's check-then-park can never miss the transition.
+    /// modeled live-peer flag. The peer flips the flag, then wakes every park **under the futex lock**
+    /// ([`Parking::wake_all`]), as a vCPU's end does, so the consumer's check-then-park can never miss
+    /// the transition.
     #[test]
     fn loom_deadlock_detection_resolves_when_last_peer_exits() {
         loom::model(|| {
-            let futex = Arc::new(Mutex::new(HashMap::<FutexKey, FutexEntry>::new()));
-            let cv = Arc::new(Condvar::new());
+            let park = Arc::new(Parking::new());
             // A loom atomic (explored by the model); `parked` below stays the std type `futex_wait` takes.
             let peer_live = Arc::new(loom::sync::atomic::AtomicUsize::new(1)); // 1 ⇒ a peer could notify
             const KEY: u64 = 0x2000;
 
-            let (f2, cv2, pl2) = (Arc::clone(&futex), Arc::clone(&cv), Arc::clone(&peer_live));
+            let (pk2, pl2) = (Arc::clone(&park), Arc::clone(&peer_live));
             let peer = loom::thread::spawn(move || {
-                // The peer finishes its computation (can no longer notify). Serialize the state change +
-                // wake under the futex lock, like `futex_notify`, so the consumer can't lose it.
-                let _g = f2.lock().unwrap_or_else(|e| e.into_inner());
+                // The peer finishes its computation (can no longer notify), and wakes the parks, as
+                // `run_child` and `Domain::child_finished` do.
                 pl2.store(0, Ordering::SeqCst);
-                cv2.notify_all();
+                pk2.wake_all();
             });
 
             let parked = AtomicUsize::new(0);
             let status = futex_wait(
-                &futex,
-                &cv,
+                &park,
                 FutexKey::Anon(KEY),
                 || true, // the guest word never changes (always still equals `expected`)
                 None,
@@ -3677,8 +3844,10 @@ mod loom_tests {
     /// waiter that parks second checks `peers_live` *after* its own `ParkGuard` increment, so it
     /// sees `live == parked` and breaks without needing to be woken at all. The first is already
     /// asleep, and loom has no timeouts — what frees it is the second one finishing: dropping `live`
-    /// and notifying the futex condvar, the pairing `Domain::child_finished` and `run_child` do.
-    /// Without that wake the survivor sits at `live(2) > parked(1)` forever.
+    /// and, finding the run quiescent, waking its parks, the pairing `Domain::child_finished` and
+    /// `run_child` do. Without that wake the survivor sits at `live(2) > parked(1)` forever. #2757 —
+    /// an end that leaves the run *not* quiescent wakes no park, and the model pins that this gate
+    /// loses no verdict: a waiter that parks after the end reads the quiescence itself.
     ///
     /// Worth recording because the first attempt got it backwards: I added a notify to `ParkGuard`
     /// on the theory that the sleeping waiter had to learn its peer had blocked, and this model is
@@ -3686,8 +3855,7 @@ mod loom_tests {
     #[test]
     fn loom_a_mutual_deadlock_resolves_for_both_waiters() {
         loom::model(|| {
-            let futex = Arc::new(Mutex::new(HashMap::<FutexKey, FutexEntry>::new()));
-            let cv = Arc::new(Condvar::new());
+            let park = Arc::new(Parking::new());
             // The real predicate's two halves: `live` counts vCPUs that have not finished, `parked`
             // is the shared counter each `ParkGuard` bumps. (`parked` stays the std type
             // `futex_wait` takes, as in the lone-waiter model above.)
@@ -3697,52 +3865,50 @@ mod loom_tests {
             const KEY_B: u64 = 0x3008;
 
             let spawn_waiter = |key: u64,
-                                futex: Arc<Mutex<HashMap<FutexKey, FutexEntry>>>,
-                                cv: Arc<Condvar>,
+                                park: Arc<Parking>,
                                 live: Arc<Mutex<usize>>,
                                 parked: Arc<AtomicUsize>| {
                 loom::thread::spawn(move || {
-                    let status = {
+                    let peers_live = {
                         let (lv, pk) = (Arc::clone(&live), Arc::clone(&parked));
-                        futex_wait(
-                            &futex,
-                            &cv,
-                            FutexKey::Anon(key),
-                            || true, // the word only the *other* waiter would store never changes
-                            None,
-                            0,
-                            None,
-                            &parked,
-                            // The production predicate, verbatim: a notifier must be a live vCPU
-                            // that is not itself parked.
-                            move || {
-                                *lv.lock().unwrap_or_else(|e| e.into_inner())
-                                    > pk.load(Ordering::Acquire)
-                            },
-                            || false, // no domain teardown in this model
-                        )
+                        // The production predicate, verbatim: a notifier must be a live vCPU that
+                        // is not itself parked.
+                        move || {
+                            *lv.lock().unwrap_or_else(|e| e.into_inner())
+                                > pk.load(Ordering::Acquire)
+                        }
                     };
-                    // This vCPU is done. Drop it from `live` and wake the futex waiters, exactly as
-                    // `Domain::child_finished` / `run_child` do — without this the surviving waiter
-                    // never sees the count fall and the model hangs.
+                    let status = futex_wait(
+                        &park,
+                        FutexKey::Anon(key),
+                        || true, // the word only the *other* waiter would store never changes
+                        None,
+                        0,
+                        None,
+                        &parked,
+                        &peers_live,
+                        || false, // no domain teardown in this model
+                    );
+                    // This vCPU is done. Drop it from `live` and, if that leaves the run quiescent,
+                    // wake the parks, exactly as `Domain::child_finished` / `run_child` do — without
+                    // this the surviving waiter never sees the count fall and the model hangs.
                     *live.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
-                    let _g = futex.lock().unwrap_or_else(|e| e.into_inner());
-                    cv.notify_all();
+                    if !peers_live() {
+                        park.wake_all();
+                    }
                     status
                 })
             };
 
             let a = spawn_waiter(
                 KEY_A,
-                Arc::clone(&futex),
-                Arc::clone(&cv),
+                Arc::clone(&park),
                 Arc::clone(&live),
                 Arc::clone(&parked),
             );
             let b = spawn_waiter(
                 KEY_B,
-                Arc::clone(&futex),
-                Arc::clone(&cv),
+                Arc::clone(&park),
                 Arc::clone(&live),
                 Arc::clone(&parked),
             );

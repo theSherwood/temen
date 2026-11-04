@@ -427,7 +427,7 @@ with `RunConfig::jit_code`. Pinned by `crates/temen-run/tests/jit_child_code.rs`
 
 The JIT already has a **1:1 OS-thread executor** (`os_thread_rt.rs`, D56/§12): each
 `thread.spawn` is a real OS thread over the shared window with hardware atomics, and the §5
-kill-path reaches parked siblings (`KILL_RECHECK`). So "async children" reuses that, not new
+kill-path reaches parked siblings (the kill door wakes them, #2757). So "async children" reuses that, not new
 concurrency machinery: `instantiate` spawns the (cached) child on its own OS thread and
 returns; `join` parks the calling fiber on the child's completion cell (as `thread.join`
 does). This is what makes a pipeline work — child A blocks on a pipe/futex while child B

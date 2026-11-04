@@ -115,7 +115,7 @@ mod os_thread_rt;
 pub use os_thread_rt::{
     outside_waker, park_host_call, region_canon_forget_window, region_canon_lookup,
     region_canon_new_owner, region_canon_record, wait_outside, wake_host_parks, wake_host_parks_in,
-    FreezeWatch, HostPark, Parks,
+    wake_on_run_event, FreezeWatch, HostPark, Parks,
 };
 
 /// F3 (FIBER_PARK.md): whether a guest fiber is the current continuation on this OS thread —
@@ -190,6 +190,9 @@ mod vmctx;
 pub use vmctx::{InstanceAddrs, VmCtx};
 mod fuel;
 pub use fuel::{BudgetNode, FuelCell};
+// #2757 slice 3 — the embedder's kill door, and the wakers a store into a run fires.
+mod door;
+pub use door::{Interrupt, Registration};
 // temen#2452 — compiled code kept on disk, so a later process defines it instead of compiling.
 mod code_dir;
 pub use code_dir::CodeDir;
@@ -1497,7 +1500,7 @@ pub fn compile_and_run_with_host_interruptible(
     args: &[i64],
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
-    interrupt: *const AtomicU64,
+    interrupt: &Arc<Interrupt>,
 ) -> Result<JitOutcome, JitError> {
     Ok(run_inner(
         m,
@@ -1562,7 +1565,7 @@ pub fn compile_and_run_with_host_interruptible_fast(
     args: &[i64],
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
-    interrupt: *const AtomicU64,
+    interrupt: &Arc<Interrupt>,
     fast_resolver: FastCapResolver,
     node: Option<std::sync::Arc<dyn BudgetNode>>,
 ) -> Result<JitOutcome, JitError> {
@@ -1832,10 +1835,19 @@ pub fn compile_and_run_capture_reserved_with_host_prots(
 /// so nothing can stop it mid-run, and its controller is retired from the start. A request that lands
 /// after the guest's last poll but before retire freezes nothing: the run sees it at retire and treats
 /// it as never made (see [`CompiledModule::run`]).
+///
+/// # Wakes (#2757)
+/// A request's store wakes the run's parked vCPUs and tasks, so each sees the freeze at once rather
+/// than at a re-check. A request made before the run publishes its window waits for the publish.
 pub struct FreezeController {
-    /// `0` = window not live yet (spin); the address of a live window's freeze word; [`STORING`]
+    /// `0` = window not live yet; the address of a live window's freeze word; [`STORING`]
     /// while a request writes; [`LANDED`] once it wrote; [`RETIRED`] once the run ended.
     word: AtomicUsize,
+    /// The run's wake ([`CompiledModule::run_wake`]), from its publish to its retire. A request
+    /// fires it while it holds [`STORING`], which retire waits out, so the run it names is live.
+    run: Mutex<Option<door::Waker>>,
+    /// Signalled when [`Self::word`] leaves `0`, for a request waiting on the publish.
+    published: std::sync::Condvar,
 }
 
 /// Store `UNWINDING` into the freeze word at `word` — what a request does to the run's window.
@@ -1860,15 +1872,25 @@ impl FreezeController {
     pub fn new() -> Arc<Self> {
         Arc::new(FreezeController {
             word: AtomicUsize::new(0),
+            run: Mutex::new(None),
+            published: std::sync::Condvar::new(),
         })
     }
 
-    /// Request a freeze: spin until the run publishes its window's freeze word, then store
-    /// `UNWINDING` into it. A no-op if the run already ended or another request got there first.
+    /// Request a freeze: wait until the run publishes its window's freeze word, then store
+    /// `UNWINDING` into it and wake the run's parks. A no-op if the run already ended or another
+    /// request got there first.
     pub fn request_freeze(&self) {
         loop {
             match self.word.load(Ordering::Acquire) {
-                0 => std::hint::spin_loop(),          // window not mapped yet
+                0 => {
+                    // The window is not mapped yet: wait for the publish (or a retire), which
+                    // stores the word under this lock and then signals.
+                    let g = self.run.lock().unwrap_or_else(|e| e.into_inner());
+                    if self.word.load(Ordering::Acquire) == 0 {
+                        drop(self.published.wait(g));
+                    }
+                }
                 STORING | LANDED | RETIRED => return, // another request has it, or the run ended
                 word => {
                     if self
@@ -1881,6 +1903,11 @@ impl FreezeController {
                     // SAFETY: `word` was the live window's and `retire` cannot complete while this
                     // request holds `STORING`, so the window is mapped.
                     unsafe { ring(word) };
+                    // #2757 — a parked vCPU or task sees the freeze now, not at a re-check. The run
+                    // is live: retire waits out `STORING`.
+                    if let Some(wake) = &*self.run.lock().unwrap_or_else(|e| e.into_inner()) {
+                        wake();
+                    }
                     self.word.store(LANDED, Ordering::Release);
                     return;
                 }
@@ -1888,16 +1915,21 @@ impl FreezeController {
         }
     }
 
-    /// Run-side: publish the live window's freeze word (the run is now blocked in the guest), or
-    /// retire at once for a window with none, whose run no request can stop.
-    fn publish(&self, word: Option<usize>) {
+    /// Run-side: publish the live window's freeze word (the run is now blocked in the guest) with
+    /// the run's wake, or retire at once for a window with none, whose run no request can stop.
+    fn publish(&self, word: Option<usize>, wake: door::Waker) {
+        let mut run = self.run.lock().unwrap_or_else(|e| e.into_inner());
+        if word.is_some() {
+            *run = Some(wake);
+        }
         self.word.store(word.unwrap_or(RETIRED), Ordering::Release);
+        self.published.notify_all();
     }
 
     /// Run-side: retire the base once the guest returns, so a later `request_freeze` is a no-op.
-    /// Waits out a store in flight. `true` if a request's store landed.
+    /// Waits out a store in flight, then drops the run's wake. `true` if a request's store landed.
     fn retire(&self) -> bool {
-        loop {
+        let landed = loop {
             let cur = self.word.load(Ordering::Acquire);
             if cur == STORING {
                 std::hint::spin_loop();
@@ -1908,9 +1940,13 @@ impl FreezeController {
                 .compare_exchange(cur, RETIRED, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return cur == LANDED;
+                break cur == LANDED;
             }
-        }
+        };
+        // A request waiting for a publish that never came returns now.
+        *self.run.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.published.notify_all();
+        landed
     }
 }
 
@@ -1927,7 +1963,7 @@ mod freeze_controller_tests {
     fn a_request_lands_in_the_live_window_and_retire_reports_it() {
         let w = AtomicI32::new(0);
         let fc = FreezeController::new();
-        fc.publish(word_of(&w));
+        fc.publish(word_of(&w), Box::new(|| {}));
         fc.request_freeze();
         assert_eq!(w.load(Ordering::Relaxed), 1, "UNWINDING stored");
         fc.request_freeze(); // a second request is a no-op
@@ -1939,7 +1975,7 @@ mod freeze_controller_tests {
     #[test]
     fn a_window_without_a_freeze_word_retires_its_controller_at_once() {
         let fc = FreezeController::new();
-        fc.publish(None);
+        fc.publish(None, Box::new(|| {}));
         fc.request_freeze();
         assert!(!fc.retire(), "nothing landed");
     }
@@ -1983,7 +2019,7 @@ mod freeze_controller_tests {
     fn a_request_after_retire_stores_nothing() {
         let w = AtomicI32::new(0);
         let fc = FreezeController::new();
-        fc.publish(word_of(&w));
+        fc.publish(word_of(&w), Box::new(|| {}));
         assert!(!fc.retire(), "nothing landed");
         fc.request_freeze();
         assert_eq!(
@@ -2321,8 +2357,8 @@ struct RunOpts<'a> {
     resolve_module: Option<ModuleResolver>,
     /// The detached-child powerbox builder/releaser ([`GrantChildHooks`], PROCESS.md S2).
     grant_child: Option<GrantChildHooks>,
-    /// §5 async kill-path cell, host-written and polled at safepoints.
-    interrupt: Option<*const AtomicU64>,
+    /// §5 kill door, fired by the host; compiled code polls its cell at safepoints.
+    interrupt: Option<&'a Arc<Interrupt>>,
     /// Safepoint-anchored counted-fuel budget cell (a deterministic guest budget).
     fuel: Option<*mut FuelCell>,
     /// §9/D45 devirtualized fast cap resolver.
@@ -3474,7 +3510,7 @@ impl CompiledModule {
         cap_ctx: *mut core::ffi::c_void,
         reserved_log2: u8,
         resolve_module: Option<ModuleResolver>,
-        interrupt: Option<*const AtomicU64>,
+        interrupt: Option<&Arc<Interrupt>>,
         fuel: Option<*mut FuelCell>,
         fast_resolver: Option<FastCapResolver>,
         node: Option<std::sync::Arc<dyn BudgetNode>>,
@@ -3514,7 +3550,7 @@ impl CompiledModule {
         cap_ctx: *mut core::ffi::c_void,
         reserved_log2: u8,
         resolve_module: Option<ModuleResolver>,
-        interrupt: Option<*const AtomicU64>,
+        interrupt: Option<&Arc<Interrupt>>,
         fuel: Option<*mut FuelCell>,
         fast_resolver: Option<FastCapResolver>,
         node: Option<std::sync::Arc<dyn BudgetNode>>,
@@ -3548,7 +3584,7 @@ impl CompiledModule {
         cap_ctx: *mut core::ffi::c_void,
         reserved_log2: u8,
         resolve_module: Option<ModuleResolver>,
-        interrupt: Option<*const AtomicU64>,
+        interrupt: Option<&Arc<Interrupt>>,
         fuel: Option<*mut FuelCell>,
         fast_resolver: Option<FastCapResolver>,
         node: Option<std::sync::Arc<dyn BudgetNode>>,
@@ -3574,7 +3610,7 @@ impl CompiledModule {
         // emitted — guest code is byte-identical to before). The cell must outlive every run of this
         // module's own instance (it is read from the instance's `VmCtx`); the caller owns it (e.g. an
         // `Arc<AtomicU64>` a watchdog thread sets).
-        let epoch_addr = interrupt.map_or(0, |p| p as i64);
+        let epoch_addr = interrupt.map_or(0, |d| d.cell() as i64);
         // Fuel unification: the address of the host-owned counted-fuel cell the lowering decrements at
         // safepoints (function entries + taken back-edges + `cont.resume`). `0` ⇒ no fuel armed (no
         // fuel checks emitted — guest code byte-identical). The caller owns the `u64` cell (it must
@@ -3591,7 +3627,7 @@ impl CompiledModule {
         #[cfg_attr(not(fiber_rt), allow(unused_mut))]
         let mut instance = InstanceAddrs {
             cap_ctx,
-            epoch: epoch_addr as *const AtomicU64,
+            epoch: epoch_addr as *const Interrupt,
             fuel: fuel_addr as *mut FuelCell,
             sig_armed: signal.as_ref().map_or(core::ptr::null(), |s| s.armed),
             sig_ctx: signal.as_ref().map_or(core::ptr::null_mut(), |s| s.ctx),
@@ -3762,7 +3798,7 @@ impl CompiledModule {
         // `notify` against this domain's futex (via the nursery), so concurrent children — and the
         // parent's own waits, if any — rendezvous in one table (the granted-children pipeline).
         // I48: a fiber-using module needs the `Domain` even without threads — the
-        // `cont.resume.block` thunk (`fiber_resume_block`) idles on `Domain.futex_cv`. (A fiber
+        // `cont.resume.block` thunk (`fiber_resume_block`) idles under `Domain::park`. (A fiber
         // that *parks* already implies `memory.wait` ⇒ `uses_threads`; this also covers a
         // fiber-only module whose blocking resume never reaches the park — the thunk still takes
         // the domain pointer.)
@@ -4676,6 +4712,36 @@ impl CompiledModule {
         }
     }
 
+    /// #2757 — the waker for a store that may end any park of a run of this instance (its kill
+    /// door, a freeze): it wakes the run's parked vCPUs and tasks through its domain, or with no
+    /// domain, the tasks of its nursery. Whoever registers it removes it before the module drops,
+    /// which owns both.
+    fn run_wake(&self) -> door::Waker {
+        #[cfg(fiber_rt)]
+        {
+            let dom = self.park_hub();
+            let nursery = self
+                ._nursery
+                .as_ref()
+                .map_or(0, |n| &**n as *const instantiator_rt::Nursery as usize);
+            Box::new(move || {
+                // SAFETY: the domain and nursery live in the module, which outlives every
+                // registration of this waker (see above).
+                unsafe {
+                    if dom != 0 {
+                        (*(dom as *const os_thread_rt::Domain)).wake_run();
+                    } else if nursery != 0 {
+                        (*(nursery as *const instantiator_rt::Nursery)).wake_tasks();
+                    }
+                }
+            })
+        }
+        #[cfg(not(fiber_rt))]
+        {
+            Box::new(|| {})
+        }
+    }
+
     /// CALLS.md 5c.1c — install the granted-child host callbacks into this module's §14 nursery
     /// (the production twin of the `compile_and_run_*_ex` install; a module with no `Instantiator`
     /// has no nursery and this is a no-op). `None` leaves the granted spawns inert `CapFault`s.
@@ -5025,6 +5091,15 @@ impl CompiledModule {
                 );
             }
         }
+        // #2757 — while this run runs, its kill door wakes it: every parked vCPU and task, which then
+        // sees the kill and unwinds. Nothing re-checks the door on a timer.
+        // SAFETY: an armed instance's `epoch` is its door's cell, which its module or embedder keeps
+        // alive for the run; the domain and nursery the waker names live in `*this`, past the run.
+        let _kill_wake = (!(*this).instance.epoch.is_null()).then(|| {
+            door::Interrupt::of_cell((*this).instance.epoch as usize)
+                .wakers()
+                .register((*this).run_wake())
+        });
 
         // Set if a durable thaw re-seed (below) hit a control-stack alloc failure (I1): the trap cell
         // already carries the `FiberFault`, so we skip the root re-entry and report it post-run.
@@ -5129,7 +5204,10 @@ impl CompiledModule {
         // `request_freeze` can only ever store into the window while it is mapped (freed below).
         if let Some(fc) = &(*this).freeze_ctl {
             let word = (*this).shadow.freeze_word();
-            fc.publish(word.map(|w| mem_base as usize + w as usize));
+            fc.publish(
+                word.map(|w| mem_base as usize + w as usize),
+                (*this).run_wake(),
+            );
         }
         // D66 — the root vCPU takes a lane like any other task before it runs guest code, and gives
         // it back when its computation ends. Without this the root would be exempt from the cap its
@@ -7340,7 +7418,7 @@ block 2 (v7: i32) {
         EMITTED.with(|e| *e.borrow_mut() = Some(Vec::new()));
         // Its refill trampoline compiles now, in a process that has compiled none.
         let mut fuel = FuelCell::fixed(1);
-        let interrupt = AtomicU64::new(0);
+        let interrupt = Interrupt::new();
         let armed = core::sync::atomic::AtomicBool::new(false);
         let mut calls = program(CALLS);
         calls.debug_info = Some(temen_ir::DebugInfo::default());
@@ -7352,7 +7430,7 @@ block 2 (v7: i32) {
                 core::ptr::null_mut(),
                 0,
                 None,
-                Some(&interrupt as *const AtomicU64),
+                Some(&interrupt),
                 Some(&mut *fuel as *mut FuelCell),
                 Some(resolver),
                 None,
@@ -7501,7 +7579,7 @@ block 2 (v7: i32) {
     #[cfg(target_arch = "x86_64")]
     fn validator_is_clean_on_a_signal_armed_compile() {
         let mut fuel = FuelCell::fixed(1);
-        let interrupt = AtomicU64::new(0);
+        let interrupt = Interrupt::new();
         let armed = core::sync::atomic::AtomicBool::new(false);
         let mut calls = program(CALLS);
         calls.debug_info = Some(temen_ir::DebugInfo::default()); // -g, so `trap_capture` is emitted
@@ -7513,7 +7591,7 @@ block 2 (v7: i32) {
             core::ptr::null_mut(),
             0,
             None,
-            Some(&interrupt as *const AtomicU64),
+            Some(&interrupt),
             Some(&mut *fuel as *mut FuelCell),
             Some(resolver),
             None,
@@ -8301,6 +8379,21 @@ pub fn pool_resumes() -> u64 {
     #[cfg(fiber_rt)]
     {
         child_exec::POOL_RESUMES.load(Ordering::Relaxed)
+    }
+    #[cfg(not(fiber_rt))]
+    {
+        0
+    }
+}
+
+/// #2757 — how many times this process's parked vCPUs have woken from a park's sleep: a futex
+/// wait, a join, a lane, a blocking resume. A parked vCPU wakes only when something may end its park,
+/// never on a timer, so a test reads this before and after an idle window to prove a run's parked
+/// vCPUs stay asleep (0 where the thread runtime is unsupported).
+pub fn vcpu_wakes() -> u64 {
+    #[cfg(fiber_rt)]
+    {
+        os_thread_rt::VCPU_WAKES.load(Ordering::Relaxed)
     }
     #[cfg(not(fiber_rt))]
     {
