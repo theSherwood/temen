@@ -66,6 +66,45 @@ fn module(funcs: Vec<Func>) -> Module {
     }
 }
 
+/// #2596 — function bodies checked on threads give the error an in-order pass gives: that of the
+/// lowest-numbered failing function, however the threads interleave. Of 16 functions, 0 to 5 are
+/// long, and 5 fails only at its terminator; 9 is short and fails at once. A thread reaches 9 while
+/// another is still checking 5, so both failures are found, and every thread count must report 5.
+#[test]
+fn threaded_verification_reports_the_lowest_failing_function() {
+    let ok = |n: usize| {
+        let insts = (0..n).map(|_| Inst::ConstI32(1)).collect();
+        func(vec![], vec![], insts, Terminator::Return(vec![]))
+    };
+    let mut funcs: Vec<Func> = (0..16)
+        .map(|i| ok(if i <= 5 { 20_000 } else { 1 }))
+        .collect();
+    // Function 5 branches, after its instructions, to a block it does not have.
+    funcs[5].blocks[0].term = Terminator::Br {
+        target: 3,
+        args: vec![],
+    };
+    // Function 9's entry block takes a parameter its signature does not declare.
+    funcs[9].blocks[0].params = vec![ValType::I32];
+    let m = module(funcs);
+    let want = verify_module(&m);
+    assert!(
+        matches!(want, Err(VerifyError::BlockOutOfRange { func: 5, .. })),
+        "{want:?}"
+    );
+    for threads in [1, 2, 3, 4, 8, 16] {
+        for _ in 0..10 {
+            assert_eq!(
+                temen::verify::verify_module_on(&m, threads),
+                want,
+                "{threads} threads"
+            );
+        }
+    }
+    let valid = module((0..16).map(|_| ok(1)).collect());
+    assert_eq!(temen::verify::verify_module_on(&valid, 8), Ok(()));
+}
+
 /// Part 1 — accept: every spec-row module passes both verifiers.
 #[test]
 fn spec_row_modules_verify_under_both() {
