@@ -1454,6 +1454,72 @@ mod tests {
         }
     }
 
+    /// TEMPORARY (#2708): a junction made as `mklink /J` makes one, in two steps (make the directory,
+    /// then set its reparse point), with the window between them held open for 5 ms, so a walk
+    /// through `link` meets the plain directory every time rather than once in a while.
+    #[cfg(windows)]
+    fn link_dir_forced(target: &Path, link: &Path) -> std::io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+        const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+        // `\\?\C:\..` less its prefix is the print name; `\??\C:\..` is the substitute name.
+        let full: Vec<u16> = std::fs::canonicalize(target)?
+            .as_os_str()
+            .encode_wide()
+            .skip(4)
+            .collect();
+        let subst: Vec<u16> = r"\??\".encode_utf16().chain(full.iter().copied()).collect();
+        let (sl, pl) = (2 * subst.len() as u16, 2 * full.len() as u16);
+        // A REPARSE_DATA_BUFFER: tag, data length, reserved; then the mount point's name offsets
+        // and lengths, and both names, each NUL-terminated.
+        let mut buf = Vec::new();
+        buf.extend(IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+        buf.extend((8 + sl + 2 + pl + 2).to_le_bytes());
+        buf.extend(0u16.to_le_bytes());
+        for v in [0, sl, sl + 2, pl] {
+            buf.extend(v.to_le_bytes());
+        }
+        for w in subst.iter().chain(&[0u16]).chain(&full).chain(&[0u16]) {
+            buf.extend(w.to_le_bytes());
+        }
+        std::fs::create_dir(link)?;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let set = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(link)
+            .and_then(|dir| {
+                let mut n = 0;
+                // SAFETY: `dir` is an open handle and `buf` a whole reparse buffer `buf.len()` long.
+                let ok = unsafe {
+                    DeviceIoControl(
+                        dir.as_raw_handle(),
+                        FSCTL_SET_REPARSE_POINT,
+                        buf.as_ptr().cast(),
+                        buf.len() as u32,
+                        std::ptr::null_mut(),
+                        0,
+                        &mut n,
+                        std::ptr::null_mut(),
+                    )
+                };
+                match ok {
+                    0 => Err(std::io::Error::last_os_error()),
+                    _ => Ok(()),
+                }
+            });
+        if set.is_err() {
+            let _ = std::fs::remove_dir(link); // as `mklink` cleans up after itself
+        }
+        set
+    }
+
     /// Remove the link [`link_dir`] made, not what it points to.
     fn unlink_dir(link: &Path) -> std::io::Result<()> {
         if cfg!(windows) {
@@ -1638,8 +1704,11 @@ mod tests {
             *seen = walks.load(Relaxed);
         }
         // A junction costs a process on Windows, so fewer swaps there.
-        // TEMPORARY (#2708): 4000 Windows swaps, to reproduce the flake on CI; restored before merge.
-        let swaps = if cfg!(windows) { 4000 } else { 500 };
+        let swaps = if cfg!(windows) { 50 } else { 500 };
+        // TEMPORARY (#2708): on Windows the link out is made the way `mklink /J` makes it, with the
+        // window between its two steps held open; removed before merge.
+        #[cfg(windows)]
+        let link_dir = link_dir_forced;
         let walks = std::sync::Arc::new(AtomicU64::new(0));
         let swapper = std::thread::spawn({
             let walks = walks.clone();
