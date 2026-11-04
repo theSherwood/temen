@@ -48,12 +48,11 @@
 //!     fixed 2M iterations a sub-nanosecond kernel's sample ran under a millisecond, and one
 //!     preemption moved it by tens of percent.
 //!   - the JIT and wasm lanes run each kernel at [`LAYOUTS`] code layouts (#2634, #2749): a loop
-//!     that straddles a 64-byte line can run 2× slower on either engine, so each lane is the median
+//!     that straddles a 64-byte line can run 2× slower on either engine, so each lane is the mean
 //!     over layouts that step the loop across a whole line, and the table shows the JIT's spread.
 //!   - every hand-written kernel's loop header exits on its `br_if`'s taken edge and falls through
-//!     to the body, the shape temen's C frontend and wasm transpiler emit (#2754). Cranelift lays a
-//!     branch's else-target out right after it, so a loop written the other way round takes an
-//!     extra jump each iteration that no producer's code pays.
+//!     to the body, the shape temen's C frontend and wasm transpiler emit (#2754). The JIT now lays
+//!     a loop out that way whichever edge its producer put the body on (#2758).
 //!   - *cold start* times the whole path source → first result (n=0, so the loop body never
 //!     runs but the full function is still compiled).
 //!
@@ -856,9 +855,10 @@ const PER_SAMPLE: u32 = 3;
 /// #2634, #2749 — how many code layouts the JIT and wasm lanes time each kernel at ([`padded`],
 /// [`padded_wat`]), two padding units (about 14 bytes) apart. A loop that straddles a 64-byte line can
 /// run 2× slower on either engine, so one layout's time says as much about where the loop landed as
-/// about the code. Five layouts step it across a whole line, and an odd count makes the median one
-/// layout's time rather than a mean of a fast and a slow one. Each lane reports that median; the table
-/// also shows the JIT's spread.
+/// about the code. Five layouts step it across a whole line, and each lane reports their mean, which
+/// code that moves leaves where it was: a move turns the layouts through the line. A median jumps from
+/// the fast time to the slow one once about half of them are slow, as `irreducible`'s did (#2766). The
+/// table also shows the JIT's spread.
 const LAYOUTS: usize = 5;
 // Host-call kernels do real boundary crossings per iteration (≫ a compute op), so they use a
 // smaller iteration span — still large enough that the subtraction isolates per-call cost.
@@ -1821,25 +1821,23 @@ fn padded_wat(wat: &str, units: usize) -> String {
     format!("{head}{memory}{sig}{accesses}{rest}")
 }
 
-/// The median of `v`, which it sorts.
-fn median(v: &mut [f64]) -> f64 {
-    v.sort_by(f64::total_cmp);
-    let n = v.len();
-    (v[(n - 1) / 2] + v[n / 2]) / 2.0
+/// The mean of `v`.
+fn mean(v: &[f64]) -> f64 {
+    v.iter().sum::<f64>() / v.len() as f64
 }
 
 /// Raw per-iteration timings for one kernel (ns for compute, ms for cold start), each the
 /// **min over `reps`** measurements (best observed per engine — the noise floor we compare); for a
-/// lane timed at several [`LAYOUTS`], the median of those per-layout mins.
+/// lane timed at several [`LAYOUTS`], the mean of those per-layout mins.
 struct Raw {
-    /// The JIT lane's per-iteration ns: the median of its [`LAYOUTS`].
+    /// The JIT lane's per-iteration ns: the mean of its [`LAYOUTS`].
     temen_ns: f64,
     /// #2634 — the JIT lane's slowest layout over its fastest.
     temen_spread: f64,
-    /// The wasm32 lane's per-iteration ns: the median of its [`LAYOUTS`] (#2749), or the one time of
+    /// The wasm32 lane's per-iteration ns: the mean of its [`LAYOUTS`] (#2749), or the one time of
     /// pre-compiled bytes.
     w32_ns: f64,
-    /// The wasm64 lane's per-iteration ns, the median of its [`LAYOUTS`] (kernels with a wasm64 form).
+    /// The wasm64 lane's per-iteration ns, the mean of its [`LAYOUTS`] (kernels with a wasm64 form).
     w64_ns: Option<f64>,
     /// The interp lane's per-iteration ns (`Compute` kernels only — `None` for `HostCall`).
     interp_ns: Option<f64>,
@@ -2025,7 +2023,7 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
         temen_cold: f64::INFINITY,
         wmt_cold: f64::INFINITY,
     };
-    // Each layout's best time, per lane; a lane's time is their median.
+    // Each layout's best time, per lane; a lane's time is their mean.
     let mut jit = [f64::INFINITY; LAYOUTS];
     let mut w32 = vec![f64::INFINITY; wasm32.len()];
     let mut w64 = vec![f64::INFINITY; wasm64.as_ref().map_or(0, Vec::len)];
@@ -2071,10 +2069,13 @@ fn measure(engine: &Engine, k: &Resolved, reps: u32, optimize: bool) -> Raw {
         }) * 1e3;
         raw.wmt_cold = raw.wmt_cold.min(wmt_cold);
     }
-    raw.temen_ns = median(&mut jit);
-    raw.temen_spread = jit[LAYOUTS - 1] / jit[0];
-    raw.w32_ns = median(&mut w32);
-    raw.w64_ns = (!w64.is_empty()).then(|| median(&mut w64));
+    raw.temen_ns = mean(&jit);
+    let (fastest, slowest) = jit.iter().fold((f64::INFINITY, 0.0f64), |(lo, hi), &t| {
+        (lo.min(t), hi.max(t))
+    });
+    raw.temen_spread = slowest / fastest;
+    raw.w32_ns = mean(&w32);
+    raw.w64_ns = (!w64.is_empty()).then(|| mean(&w64));
     raw
 }
 
@@ -2259,7 +2260,7 @@ fn print_table(results: &[(Resolved, Raw)]) {
          is temen-faster even vs a cached-memory wasm import — the §7 win. Host kernels have no\n\
          interp/native lane (`—`); their ns/ratio are per *host call*.\n\
          Each lane's span is sized so a sample runs about {sample_ms:.0} ms. The JIT and wasm lanes run\n\
-         each kernel at {LAYOUTS} code layouts and report their median; `spread` is the JIT's slowest\n\
+         each kernel at {LAYOUTS} code layouts and report their mean; `spread` is the JIT's slowest\n\
          layout over its fastest.\n",
         sample_ms = SAMPLE_SECS * 1e3,
     );
