@@ -601,28 +601,35 @@ pub(crate) mod x86 {
                 }
             }
         }
-        /// Loop-header widening (#2535): a fact whose value can grow each iteration must drop to
-        /// `Unknown` at a header, or the fixpoint might not settle. Only `WinPtr` grows — a loop that
-        /// strides a window pointer (`add winptr, stride`) raises its offset every round ([`addr_fact`]
-        /// → `WinPtr(off + stride)`). A `Bounded` does **not** grow: it comes only from an `and` mask
-        /// or a byte zero-extend, a constant bound re-established each iteration — `add`/`sub` on a
-        /// `Bounded` yields `Unknown`, never a wider bound — and `meet` only ever raises it to the
-        /// largest mask constant in the function, a finite ceiling. So widening a `Bounded` would just
-        /// discard the mask that confines a `call.dyn` index or a strided access carried around the
-        /// loop, for no termination gain (#2603). The context-param and `Confined` facts are
-        /// loop-invariant and survive; `meet` still weakens a fact a back edge disagrees on, and
-        /// `verify` rejects any proposal the round cap cut short, so dropping only `WinPtr` stays
-        /// sound and terminating.
-        fn widen(&mut self) {
-            let grows = |f: &Fact| matches!(f, Fact::WinPtr(_));
-            for f in &mut self.regs {
-                if grows(f) {
+        /// Loop-header widening (#2535): the standard widening operator, `self ∇ prev`, with `prev` the
+        /// header's in-state from the previous round. A fact whose value can grow each iteration must
+        /// drop to `Unknown` once it grows, or the fixpoint might not settle. Only `WinPtr` grows — a
+        /// loop that strides a window pointer (`add winptr, stride`) raises its offset every round
+        /// ([`addr_fact`] → `WinPtr(off + stride)`), so a `WinPtr` whose offset **rose since last
+        /// round** is dropped. A `WinPtr` held at the same offset is loop-invariant (a window base kept
+        /// live across the loop) and **survives**: dropping it unconditionally — as this did before —
+        /// loses the fact for the post-loop access through it, a false disagreement the shadow
+        /// validator logs today and a rejection once the gate fails closed (#2536). A `Bounded` does
+        /// **not** grow: it comes only from an `and` mask or a byte zero-extend, a constant bound
+        /// re-established each iteration — `add`/`sub` on a `Bounded` yields `Unknown`, never a wider
+        /// bound — so it never widens. The context-param and `Confined` facts are loop-invariant;
+        /// `meet` still weakens a fact a back edge disagrees on, and `verify` rejects any proposal the
+        /// round cap cut short, so this stays sound and terminating.
+        fn widen_against(&mut self, prev: Option<&State>) {
+            // A `WinPtr` strides iff its offset is strictly above the previous round's at the same
+            // place; a newly-`WinPtr` slot/reg (no prior `WinPtr` there) is not yet growing.
+            let grew = |new: &Fact, old: Option<Fact>| matches!((new, old), (Fact::WinPtr(a), Some(Fact::WinPtr(b))) if *a > b);
+            for (r, f) in self.regs.iter_mut().enumerate() {
+                if grew(f, prev.map(|p| p.regs[r])) {
                     *f = Fact::Unknown;
                 }
             }
             for s in self.slots.iter_mut() {
-                if matches!(s, Some(e) if grows(&e.fact)) {
-                    *s = None;
+                if let Some(e) = s {
+                    let old = prev.map(|p| p.slot_get(e.off));
+                    if grew(&e.fact, old) {
+                        *s = None;
+                    }
                 }
             }
         }
@@ -1085,7 +1092,7 @@ pub(crate) mod x86 {
                 }
                 if let Some(mut s) = cur {
                     if is_header[i] {
-                        s.widen();
+                        s.widen_against(in_st[i].as_ref());
                     }
                     if in_st[i] != Some(s) {
                         in_st[i] = Some(s);
@@ -4554,15 +4561,19 @@ pub(crate) mod x86 {
             assert_eq!(Stack(Some(-8)).meet(Stack(Some(-16))), Stack(None));
             assert_eq!(Stack(Some(-8)).meet(MemBase), Unknown);
 
-            // Widening at a loop header drops only a `WinPtr`, whose offset a strided loop can grow.
-            // The mask-derived `Bounded`, the loop-invariant context-param and `Confined` facts all
-            // survive, so a `call.dyn` index or strided bound carried around a loop keeps its bound
-            // (#2603) and the fixpoint still terminates.
-            let mut s = State::entry(Frame::UNKNOWN);
-            s.regs[8] = Bounded(16);
-            s.regs[9] = conf;
-            s.regs[10] = WinPtr(0x1000);
-            s.widen();
+            // Loop-header widening is the standard `∇` operator: a `WinPtr` whose offset rose since the
+            // previous round is a strided pointer and is dropped; a loop-invariant one (same offset)
+            // and the mask-derived `Bounded`, context-param and `Confined` facts all survive, so an
+            // invariant window base, a `call.dyn` index or a strided bound carried around a loop keeps
+            // its fact (#2603) and the fixpoint still terminates.
+            let mut prev = State::entry(Frame::UNKNOWN);
+            prev.regs[8] = Bounded(16);
+            prev.regs[9] = conf;
+            prev.regs[10] = WinPtr(0x1000); // invariant: same offset this round
+            prev.regs[11] = WinPtr(0x1000); // strided: offset rose this round
+            let mut s = prev; // `State` is `Copy`
+            s.regs[11] = WinPtr(0x2000);
+            s.widen_against(Some(&prev));
             assert_eq!(
                 s.regs[8],
                 Bounded(16),
@@ -4570,10 +4581,24 @@ pub(crate) mod x86 {
             );
             assert_eq!(s.regs[9], conf);
             assert_eq!(
-                s.regs[10], Unknown,
-                "a strided window pointer can grow, so widening drops it"
+                s.regs[10],
+                WinPtr(0x1000),
+                "a loop-invariant window pointer survives"
+            );
+            assert_eq!(
+                s.regs[11], Unknown,
+                "a strided window pointer whose offset grew is dropped"
             );
             assert_eq!(s.regs[reg::RDI as usize], MemBase);
+            // First visit (no previous state): nothing is widened yet.
+            let mut first = State::entry(Frame::UNKNOWN);
+            first.regs[10] = WinPtr(0x1000);
+            first.widen_against(None);
+            assert_eq!(
+                first.regs[10],
+                WinPtr(0x1000),
+                "a newly-seen window pointer is not yet growing"
+            );
         }
 
         // --- the hand-assembled policy tests ---
