@@ -275,15 +275,19 @@ believes.
 **Why it holds.** The validator decodes the bytes itself and recovers the machine CFG from them,
 reading a jump table's targets from the table its `jmp` computes. It abstracts the machine state at
 each point as:
-- a fact per register (`mem_base`, an index `Confined` to `[0, bound) ∪ {guard}`, a pointer into the
-  window or the stack at a known offset, a fn-table record whose type was checked, a vmctx cell, a
-  callee's address, the entry value of a callee-saved register, the caller's `sret` area, …);
+- a fact per register (`mem_base`, an index `Confined` to `[0, bound) ∪ {guard}` or `Bounded` by a
+  plain upper bound, a pointer into the window or the stack at a known offset, a fn-table record whose
+  type was checked, a vmctx cell, the demand-paged access table (#2164), a callee's address, the entry
+  value of a callee-saved register, the caller's `sret` area, …);
 - the flags of the last compare;
 - the spill slots, keyed by their offset from the entry `rsp`;
 - whether the stack-overflow check has run on every path to this point.
 
 A block's out-state can differ by edge: the edge where a fn-table type check holds carries what it
-proves.
+proves, and the taken edge of `cmp idx, K; jb` carries `idx ∈ [0, K)` (a `Bounded` fact — how a
+demand-paged child bounds its access-table index, #2164, since `off < declared` gates the
+`table[off >> page_shift]` read; the shift keeps the bound, and the read must land in the table's
+`pages + 1` bytes).
 
 Only a check is trusted. An untrusted fixpoint proposes a state for each block. One linear pass then
 verifies that the entry contract implies the entry block's state, that every edge's out-state implies

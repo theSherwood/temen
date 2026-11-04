@@ -48,6 +48,11 @@ pub(crate) fn disagreement_count() -> u64 {
 pub(crate) struct WindowLayout {
     pub mask: u64,
     pub guard_offset: u64,
+    /// #2164 — a demand-paged child's access table has one byte per declared window page; its code
+    /// reads `table[off >> page_shift]` before each access (`emit_page_check`). This is that page
+    /// count, so the validator bounds the table read to the table's `pages + 1` bytes. `0` when the
+    /// compile is not demand-paged (no access table exists, and its code emits no such read).
+    pub pages: u64,
 }
 
 /// The GP registers (x86-64 numbering, a bit each) a SysV-family call clobbers: Cranelift's
@@ -404,6 +409,9 @@ pub(crate) mod x86 {
         FnPtr(u32),
         /// A pointer to one of the host cells compiled code reads and writes at fixed offsets.
         Cell(Cell),
+        /// #2164 — a demand-paged child's access table (`vmctx::PAGES`), `pages + 1` read-only bytes.
+        /// Its code reads `table[off >> page_shift]` (a `Bounded` index) before each window access.
+        PageTable,
         /// A pointer into the window, `mem_base + o` with `o ≤ .0`: what `lea r, [mem_base +
         /// confined]` computes for the accesses that share one address.
         WinPtr(u64),
@@ -434,6 +442,15 @@ pub(crate) mod x86 {
                         guard: g,
                     }
                 }
+                // `Bounded(a)` is `[0, a)`, a `Confined` with no guard exception, so it joins a
+                // `Confined` cleanly: `[0, a) ∪ ([0, b) ∪ {g}) = [0, max(a, b)) ∪ {g}`. This keeps a
+                // window index confined when one predecessor refined it to a plain bound (#2164: the
+                // paged access check's `cmp off, declared; jb` edge) and another left it `Confined`.
+                (Fact::Bounded(a), Fact::Confined { bound: b, guard: g })
+                | (Fact::Confined { bound: b, guard: g }, Fact::Bounded(a)) => Fact::Confined {
+                    bound: a.max(b),
+                    guard: g,
+                },
                 (Fact::Stack(_), Fact::Stack(_)) => Fact::Stack(None),
                 (Fact::Record(_), Fact::Record(_)) => Fact::Record(None),
                 (Fact::WinPtr(a), Fact::WinPtr(b)) => Fact::WinPtr(a.max(b)),
@@ -1612,6 +1629,16 @@ pub(crate) mod x86 {
                     };
                     set(&mut state, dst, f);
                 }
+                Eff::Shr { dst, by } => {
+                    // A logical right shift keeps a value bounded: `v < n ⇒ v >> by < ((n−1)>>by)+1`.
+                    let f = match fact(&state, dst) {
+                        Fact::Bounded(n) if n > 0 => {
+                            Fact::Bounded(((n - 1) >> by).saturating_add(1))
+                        }
+                        _ => Fact::Unknown,
+                    };
+                    set(&mut state, dst, f);
+                }
                 Eff::Cmov { dst, cc, w } => {
                     let src = d.operands.rm_reg;
                     let f = cmov_fact(
@@ -1906,6 +1933,29 @@ pub(crate) mod x86 {
                 refine(if cc == 0x4 { &mut taken } else { &mut fall });
             }
         }
+        // A block that ends `cmp reg, K; jb` (unsigned below) proves `reg ∈ [0, K)` on the taken
+        // edge: every register still holding that value becomes `Bounded(K)`. This bounds the
+        // demand-paged access check's table index — `off < declared` gates `table[off >> page_shift]`
+        // (#2164). The stack-overflow check is also `jb`, but it compares against the `stack_limit`
+        // register (`rhs` is not a constant), so its `sc_cmp` branch above, not this, handles it.
+        if let (Some(Kind::DirectJcc { cc: 0x2, .. }), Some(f)) = (term, flags) {
+            if let (Some(s), None, Some(k), None) = (f.lhs.sym, f.lhs.konst, f.rhs.konst, f.rhs.sym)
+            {
+                for (fa, &sy) in taken.regs.iter_mut().zip(&sym) {
+                    if sy == s {
+                        // Refine only an integer-like fact: a `Bounded` tightens to the min, and an
+                        // unconfined/`Confined` value becomes `[0, k)`. A pointer, `Const`, stack or
+                        // table fact is left unchanged (sound — the refinement only adds `< k`), so
+                        // clobbering one a later merge relies on cannot regress other code.
+                        *fa = match *fa {
+                            Fact::Bounded(b) => Fact::Bounded(b.min(k)),
+                            Fact::Unknown | Fact::Confined { .. } => Fact::Bounded(k),
+                            other => other,
+                        };
+                    }
+                }
+            }
+        }
         Out { taken, fall }
     }
 
@@ -2008,20 +2058,15 @@ pub(crate) mod x86 {
     /// or an opaque pointer it only hands to host functions. `None` for any other offset.
     fn vmctx_field(disp: i64) -> Option<(bool, Fact)> {
         use crate::vmctx as v;
-        let opaque = [
-            v::CAP_CTX,
-            v::SIG_CTX,
-            v::SCHED,
-            v::NURSERY,
-            v::SETJMP,
-            v::PAGES,
-        ];
+        let opaque = [v::CAP_CTX, v::SIG_CTX, v::SCHED, v::NURSERY, v::SETJMP];
         Some(match disp {
             0 => (true, Fact::Unknown),
             d if d == i64::from(v::FUEL) => (false, Fact::Cell(Cell::Fuel)),
             d if d == i64::from(v::EPOCH) => (false, Fact::Cell(Cell::Epoch)),
             d if d == i64::from(v::SIG_ARMED) => (false, Fact::Cell(Cell::SigArmed)),
             d if d == i64::from(v::END) => (false, Fact::Cell(Cell::End)),
+            // #2164 — the demand-paged access table (read by `emit_page_check`).
+            d if d == i64::from(v::PAGES) => (false, Fact::PageTable),
             d if opaque.iter().any(|&o| i64::from(o) == d) => (false, Fact::Unknown),
             _ => return None,
         })
@@ -2168,6 +2213,7 @@ pub(crate) mod x86 {
             | Eff::SetByte { dst }
             | Eff::Lea { dst, .. }
             | Eff::Alu { dst, .. }
+            | Eff::Shr { dst, .. }
             | Eff::Cmov { dst, .. } => bit(dst),
             Eff::Push { .. } => bit(reg::RSP),
             Eff::Pop { dst } => bit(reg::RSP) | dst.map_or(0, bit),
@@ -2205,6 +2251,12 @@ pub(crate) mod x86 {
                 if t == i64::from(at) && m.scale == 1 && m.disp == 0 =>
             {
                 Fact::TableTarget { at, n }
+            }
+            // A `Bounded` base plus a non-negative displacement (no index) stays bounded: `v < n`
+            // ⇒ `v + disp < n + disp`. The paged access check forms its last-page index this way
+            // (`lea r, [off + (len − 1)]` before `off >> page_shift`, #2164).
+            (Some(Fact::Bounded(n)), None, None, _) if m.disp >= 0 => {
+                Fact::Bounded(n.saturating_add(m.disp as u64))
             }
             _ => match (
                 window_offset(m, state, ctx.guest.window),
@@ -2375,6 +2427,37 @@ pub(crate) mod x86 {
             return;
         }
 
+        // #2164 — the demand-paged access table: a read of one byte at `table[index]`, the index
+        // bounded below the declared window's page count by the `in_window` check, so within the
+        // table's `pages + 1` bytes. Read-only (the host owns it); the guest's code only tests it.
+        if matches!(base_f, Some(Fact::PageTable)) || matches!(index_f, Some(Fact::PageTable)) {
+            let size = ctx.guest.window.map_or(0, |w| w.pages).saturating_add(1);
+            // The table is the base; the other operand is the index.
+            let idx = if matches!(base_f, Some(Fact::PageTable)) {
+                index_f
+            } else {
+                base_f
+            };
+            let reach = match idx {
+                None => Some(0),
+                Some(f) => max_value(f).and_then(|m| m.checked_mul(scale)),
+            };
+            let hi = reach.and_then(|r| {
+                u64::try_from(mem.disp)
+                    .ok()?
+                    .checked_add(r)?
+                    .checked_add(width)
+            });
+            if write {
+                flag("write to the demand-paged access table".into());
+            } else if !hi.is_some_and(|hi| hi <= size) {
+                flag(format!(
+                    "access-table read reaches +0x{:x}, past the table's 0x{size:x} bytes",
+                    hi.unwrap_or(0)
+                ));
+            }
+            return;
+        }
         // vmctx and the host cells it points to: one field each, at a fixed offset.
         let fields: Option<Vec<(i64, u8, bool)>> = match base_f {
             Some(Fact::Vmctx) => vmctx_field(mem.disp).map(|(w, _)| vec![(mem.disp, 8, w)]),
@@ -2502,6 +2585,10 @@ pub(crate) mod x86 {
         /// A 64-bit `add`/`sub`/`and dst, src`, `src` an immediate, a register, or a memory operand
         /// (the function's constant pool holds a mask too wide for an `imm32`).
         Alu { dst: u8, alu: Alu, src: Opnd },
+        /// A 64-bit `shr dst, by` (logical right shift by an immediate `by < 64`): a `Bounded` value
+        /// stays bounded, `v < n ⇒ v >> by < ((n − 1) >> by) + 1`. The paged access check shifts a
+        /// window offset to a page index this way (#2164). Other shifts clobber `dst` (`WrRm`).
+        Shr { dst: u8, by: u8 },
         /// A 32- or 64-bit `cmp lhs, rhs` (it computes `lhs − rhs`), or a `test r, r`, which sets the
         /// flags `cmp r, 0` does. Writes only the flags.
         Cmp { w: u8, lhs: Opnd, rhs: Opnd },
@@ -2784,6 +2871,9 @@ pub(crate) mod x86 {
         Setcc(bool),
         /// `0x81/0x83 /digit` — the ModRM.reg field (`digit`) picks add/or/.../cmp with `imm`.
         AluImmGroup(u8),
+        /// `0xC0/0xC1 /digit, imm8` — the shift group; `digit == 5` is `shr`, modeled on a 64-bit
+        /// register; every other digit or a narrower/memory operand clobbers the r/m (`WrRm`).
+        ShiftImm(u8),
         /// `0x80/0x82 /digit` — the byte forms, 8-bit whatever the prefixes say (REX.W doesn't widen
         /// a byte operation), so never a tracked value.
         ByteAluImm,
@@ -2933,6 +3023,16 @@ pub(crate) mod x86 {
                     (false, ..) => Eff::WrRm, // narrower, or or/adc/sbb/xor: clobber r/m
                 }
             }
+            I::ShiftImm(digit) => match (digit, mem, osz, rm) {
+                // `shr` (/5) on a 64-bit register: a `Bounded` value stays bounded (#2164).
+                (5, false, 8, Some(dst)) => Eff::Shr {
+                    dst,
+                    by: (immv as u8) & 0x3f,
+                },
+                (_, true, ..) => Eff::NoGp, // RMW on memory (its access is checked); no GP write
+                (_, false, _, Some(_)) => Eff::WrRm, // other shift, or narrower: clobber the r/m
+                _ => Eff::NoGp,
+            },
             I::ByteAluImm if mem => Eff::NoGp,
             I::ByteAluImm => Eff::WrRm,
             I::Group3(digit) => match digit {
@@ -3205,7 +3305,12 @@ pub(crate) mod x86 {
             }
             0x6B => finish_modrm(c, start, p, 1, Normal, E::WrReg).map(|d| d.width(w)), // imul r, r/m, imm8
             0xC0 => finish_modrm(c, start, p, 1, Normal, E::WrRm).map(|d| d.width(w)), // shift r/m8, imm8
-            0xC1 => finish_modrm(c, start, p, 1, Normal, E::WrRm).map(|d| d.width(w)), // shift r/m, imm8
+            0xC1 => {
+                // shift r/m, imm8 — the ModRM.reg field (`digit`) picks the shift; only `shr` (/5)
+                // on a 64-bit register is modeled (#2164), the rest clobber the r/m.
+                let digit = (c.peek()? >> 3) & 0x07;
+                finish_modrm(c, start, p, 1, Normal, E::ShiftImm(digit)).map(|d| d.width(w))
+            }
             0xC6 => keep(finish_modrm(c, start, p, 1, Normal, E::WrRm)).map(|d| d.width(1)), // mov r/m8, imm8
             // ModRM + immZ.
             0x81 => {
@@ -4478,6 +4583,7 @@ pub(crate) mod x86 {
         const WIN: Option<WindowLayout> = Some(WindowLayout {
             mask: 0x1F_FFFF_FFFF,
             guard_offset: 0x20_0000_0000,
+            pages: 0,
         });
 
         /// `mov rax, 0x20_0000_0000` — the guard offset, D63's redirect target (10 bytes).
@@ -6082,6 +6188,7 @@ pub(crate) mod x86 {
             let big = Some(WindowLayout {
                 mask: (1u64 << 37) - 1,
                 guard_offset: 1u64 << 37,
+                pages: 0,
             });
             assert!(check(
                 &bytes,
@@ -6094,6 +6201,7 @@ pub(crate) mod x86 {
             let small = Some(WindowLayout {
                 mask: (1u64 << 15) - 1,
                 guard_offset: 1u64 << 15,
+                pages: 0,
             });
             let f = check(
                 &bytes,
