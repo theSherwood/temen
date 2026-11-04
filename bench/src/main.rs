@@ -103,7 +103,9 @@ struct Kernel {
     name: &'static str,
     /// Our IR text: `func (i64 n) -> (i64)`, entry = function 0.
     ir: &'static str,
-    /// Core wasm32 (`(memory N)`): `(func (export "run") (param i64) (result i64))`.
+    /// Core wasm32 (`(memory N)`): `(func (export "run") (param i64) (result i64))`. A memory
+    /// kernel's accesses sit past the NULL guard `[0, 16384)` (#1094), at the words its IR uses
+    /// (`offset=16384`), so `--from-wasm` runs the same bytes on temen (#2710).
     wat32: &'static str,
     /// Equivalent wasm64 (`(memory i64 N)`). Memory kernels exercise the real wasm64 bounds-check
     /// path; pure-compute kernels still carry a wasm64 twin (with a declared-but-unused memory) so
@@ -333,8 +335,8 @@ block 3 (v20: i64) {
         (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
         (local.set $addr
           (i32.mul (i32.and (i32.wrap_i64 (local.get $i)) (i32.const 1023)) (i32.const 8)))
-        (i64.store (local.get $addr) (local.get $i))
-        (local.set $acc (i64.add (local.get $acc) (i64.load (local.get $addr))))
+        (i64.store offset=16384 (local.get $addr) (local.get $i))
+        (local.set $acc (i64.add (local.get $acc) (i64.load offset=16384 (local.get $addr))))
         (local.set $i (i64.add (local.get $i) (i64.const 1)))
         (br $loop)))
     (local.get $acc)))
@@ -350,8 +352,8 @@ block 3 (v20: i64) {
         (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
         (local.set $addr
           (i64.mul (i64.and (local.get $i) (i64.const 1023)) (i64.const 8)))
-        (i64.store (local.get $addr) (local.get $i))
-        (local.set $acc (i64.add (local.get $acc) (i64.load (local.get $addr))))
+        (i64.store offset=16384 (local.get $addr) (local.get $i))
+        (local.set $acc (i64.add (local.get $acc) (i64.load offset=16384 (local.get $addr))))
         (local.set $i (i64.add (local.get $i) (i64.const 1)))
         (br $loop)))
     (local.get $acc)))
@@ -416,13 +418,13 @@ block 3 (v27: i64) {
     (block $done
       (loop $loop
         (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
-        (i64.store
+        (i64.store offset=16384
           (i32.mul (i32.and (i32.wrap_i64 (i64.mul (local.get $i) (i64.const 2654435761)))
                             (i32.const 1023)) (i32.const 8))
           (local.get $i))
         (local.set $acc
           (i64.add (local.get $acc)
-            (i64.load
+            (i64.load offset=16384
               (i32.mul (i32.and (i32.wrap_i64 (i64.mul (local.get $i) (i64.const 2246822519)))
                                 (i32.const 1023)) (i32.const 8)))))
         (local.set $i (i64.add (local.get $i) (i64.const 1)))
@@ -438,13 +440,13 @@ block 3 (v27: i64) {
     (block $done
       (loop $loop
         (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
-        (i64.store
+        (i64.store offset=16384
           (i64.mul (i64.and (i64.mul (local.get $i) (i64.const 2654435761))
                             (i64.const 1023)) (i64.const 8))
           (local.get $i))
         (local.set $acc
           (i64.add (local.get $acc)
-            (i64.load
+            (i64.load offset=16384
               (i64.mul (i64.and (i64.mul (local.get $i) (i64.const 2246822519))
                                 (i64.const 1023)) (i64.const 8)))))
         (local.set $i (i64.add (local.get $i) (i64.const 1)))
@@ -796,19 +798,19 @@ block 3 (v27: i64) {
 ",
     wat32: r#"
 (module
-  (memory 16)
+  (memory 17)
   (func (export "run") (param $n i64) (result i64)
     (local $acc i64) (local $i i64)
     (block $done
       (loop $loop
         (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
-        (i64.store
+        (i64.store offset=16384
           (i32.mul (i32.and (i32.wrap_i64 (i64.mul (local.get $i) (i64.const 2654435761)))
                             (i32.const 131071)) (i32.const 8))
           (local.get $i))
         (local.set $acc
           (i64.add (local.get $acc)
-            (i64.load
+            (i64.load offset=16384
               (i32.mul (i32.and (i32.wrap_i64 (i64.mul (local.get $i) (i64.const 2246822519)))
                                 (i32.const 131071)) (i32.const 8)))))
         (local.set $i (i64.add (local.get $i) (i64.const 1)))
@@ -818,19 +820,19 @@ block 3 (v27: i64) {
     wat64: Some(
         r#"
 (module
-  (memory i64 16)
+  (memory i64 17)
   (func (export "run") (param $n i64) (result i64)
     (local $acc i64) (local $i i64)
     (block $done
       (loop $loop
         (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
-        (i64.store
+        (i64.store offset=16384
           (i64.mul (i64.and (i64.mul (local.get $i) (i64.const 2654435761))
                             (i64.const 131071)) (i64.const 8))
           (local.get $i))
         (local.set $acc
           (i64.add (local.get $acc)
-            (i64.load
+            (i64.load offset=16384
               (i64.mul (i64.and (i64.mul (local.get $i) (i64.const 2246822519))
                                 (i64.const 131071)) (i64.const 8)))))
         (local.set $i (i64.add (local.get $i) (i64.const 1)))
@@ -1011,6 +1013,9 @@ fn native_cache(n: i64) -> i64 {
     }
     MEM.with(|cell| {
         let mem = &mut **cell.borrow_mut();
+        // Zeroed per call, as each guest run's window is: a later call must not read an earlier
+        // one's stores (#2710). The fixed cost cancels in the span's subtraction.
+        mem.fill(0);
         let mut acc: i64 = 0;
         for i in 0..n {
             let w = (i.wrapping_mul(2654435761) & 131071) as usize;
@@ -1409,7 +1414,7 @@ block 3 (v17: i64) {
     (block $done
       (loop $loop
         (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
-        (local.set $acc (i64.add (local.get $acc) (call $sum (i32.const 0) (i32.const 64))))
+        (local.set $acc (i64.add (local.get $acc) (call $sum (i32.const 16384) (i32.const 64))))
         (local.set $i (i64.add (local.get $i) (i64.const 1)))
         (br $loop)))
     (local.get $acc)))
@@ -1509,8 +1514,8 @@ fn locals_from_c() -> Result<Resolved, String> {
         (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
         (local.set $addr
           (i32.mul (i32.and (i32.wrap_i64 (local.get $i)) (i32.const 255)) (i32.const 8)))
-        (i64.store (local.get $addr) (local.get $i))
-        (local.set $acc (i64.add (local.get $acc) (i64.load (local.get $addr))))
+        (i64.store offset=16384 (local.get $addr) (local.get $i))
+        (local.set $acc (i64.add (local.get $acc) (i64.load offset=16384 (local.get $addr))))
         (local.set $i (i64.add (local.get $i) (i64.const 1)))
         (br $loop)))
     (local.get $acc)))
@@ -1528,8 +1533,8 @@ fn locals_from_c() -> Result<Resolved, String> {
         (br_if $done (i64.ge_s (local.get $i) (local.get $n)))
         (local.set $addr
           (i64.mul (i64.and (local.get $i) (i64.const 255)) (i64.const 8)))
-        (i64.store (local.get $addr) (local.get $i))
-        (local.set $acc (i64.add (local.get $acc) (i64.load (local.get $addr))))
+        (i64.store offset=16384 (local.get $addr) (local.get $i))
+        (local.set $acc (i64.add (local.get $acc) (i64.load offset=16384 (local.get $addr))))
         (local.set $i (i64.add (local.get $i) (i64.const 1)))
         (br $loop)))
     (local.get $acc)))
@@ -2415,8 +2420,10 @@ mod tests {
     /// twin all agree on the result *before* timing — and panics on any trap (`temen_call` /
     /// `temen_host_call`) — so a single-rep pass over every kernel proves none faults or diverges. This
     /// catches the class #1134 hid: a kernel whose memory base lands in the unconditional NULL guard
-    /// `[0, 16384)` (#1094), which traps `MemoryFault` on every guard-enforcing tier. Fast (reps=1) and
-    /// runnable via `cargo test` in `bench/`, unlike the schedule-only `--check` run.
+    /// `[0, 16384)` (#1094), which traps `MemoryFault` on every guard-enforcing tier. It runs the IR
+    /// as written and, as `--from-wasm` does, transpiled from each kernel's WAT twin, whose accesses
+    /// the guard once caught too (#2710). Fast (reps=1) and runnable via `cargo test` in `bench/`,
+    /// unlike the schedule-only `--check` run.
     #[test]
     fn every_kernel_runs_on_every_tier() {
         let mut config = Config::new();
@@ -2424,14 +2431,16 @@ mod tests {
         config.wasm_threads(true);
         config.shared_memory(true);
         let engine = Engine::new(&config).expect("engine");
-        let kernels = resolve_kernels(false);
-        assert!(
-            !kernels.is_empty(),
-            "at least the hand-written kernels resolve"
-        );
-        for k in &kernels {
-            // Panics (fails the test) on any trap or cross-tier result disagreement.
-            let _ = measure(&engine, k, 1, false);
+        for from_wasm in [false, true] {
+            let kernels = resolve_kernels(from_wasm);
+            assert!(
+                !kernels.is_empty(),
+                "at least the hand-written kernels resolve"
+            );
+            for k in &kernels {
+                // Panics (fails the test) on any trap or cross-tier result disagreement.
+                let _ = measure(&engine, k, 1, false);
+            }
         }
     }
 }
