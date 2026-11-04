@@ -13688,7 +13688,7 @@ impl SchedCore {
                 // INVARIANTS #8: its handles are granted into the callee as the queue admits it.
                 let from = &mut super::CallerHost::Cell(&domains[tasks[ti].domain].host);
                 let enqueued =
-                    super::enqueue_live_call(from, &callee, export, op, args, sig.params());
+                    super::enqueue_live_call(from, &callee, export, op, args, sig.params(), None);
                 match enqueued {
                     Err(trap) => complete(tasks, domains, ti, Err(trap)),
                     // A full callee queue is probeable backpressure, the call's failure; the task

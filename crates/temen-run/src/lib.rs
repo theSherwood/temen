@@ -3337,16 +3337,23 @@ unsafe fn live_reply(
         return Some(Reply::Failed(EINVAL));
     };
     drop(guard);
-    let ticket =
-        match temen_interp::enqueue_live_call(caller, callee, export, op, args.to_vec(), params) {
-            Ok((Some(ticket), _)) => ticket,
-            // A full queue / unservable op: probeable backpressure.
-            Ok((None, _)) => return Some(Reply::Failed(EAGAIN)),
-            Err(_) => {
-                vm.raise(TrapKind::CapFault as i64);
-                return None;
-            }
-        };
+    let ticket = match temen_interp::enqueue_live_call(
+        caller,
+        callee,
+        export,
+        op,
+        args.to_vec(),
+        params,
+        None,
+    ) {
+        Ok((Some(ticket), _)) => ticket,
+        // A full queue / unservable op: probeable backpressure.
+        Ok((None, _)) => return Some(Reply::Failed(EAGAIN)),
+        Err(_) => {
+            vm.raise(TrapKind::CapFault as i64);
+            return None;
+        }
+    };
     let guard = callee.lock().unwrap_or_else(|e| e.into_inner());
     ring(&guard); // the callee's serve loop, parked on its empty queue
     await_settle(callee, guard, &bell, ticket, Parks::Fiber, vm)
