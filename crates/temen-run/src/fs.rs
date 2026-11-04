@@ -1601,7 +1601,8 @@ mod tests {
         // through every state the tree passes through, the link out among them, while each step
         // lands in the middle of some walk. A step can fail while the guest holds what it moves
         // (Windows refuses to rename a directory a handle holds open), so it is retried. A step that
-        // waits a minute fails the test rather than hanging it.
+        // waits a minute fails the test rather than hanging it, naming every distinct error it saw
+        // in order: the first is the one that started the failure (#2708).
         fn step(
             walks: &AtomicU64,
             seen: &mut u64,
@@ -1616,17 +1617,29 @@ mod tests {
                 );
                 std::thread::yield_now();
             }
+            let mut errors: Vec<String> = Vec::new();
             loop {
                 match f() {
                     Ok(()) => break,
-                    Err(e) => assert!(std::time::Instant::now() < deadline, "{what}: {e}"),
+                    Err(e) => {
+                        let e = e.to_string();
+                        if !errors.contains(&e) {
+                            errors.push(e);
+                        }
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "{what}: {}",
+                            errors.join(", then: ")
+                        );
+                    }
                 }
                 std::thread::yield_now();
             }
             *seen = walks.load(Relaxed);
         }
         // A junction costs a process on Windows, so fewer swaps there.
-        let swaps = if cfg!(windows) { 50 } else { 500 };
+        // TEMPORARY (#2708): 4000 Windows swaps, to reproduce the flake on CI; restored before merge.
+        let swaps = if cfg!(windows) { 4000 } else { 500 };
         let walks = std::sync::Arc::new(AtomicU64::new(0));
         let swapper = std::thread::spawn({
             let walks = walks.clone();
