@@ -10158,8 +10158,9 @@ fn return_from_fiber(
     if let Some(ticket) = vt.active.dispatch() {
         answer_dispatch(host, fibers, mem, ticket, &vals);
         release_handler(fibers, id);
-        let handler = std::mem::replace(&mut vt.active, resumer);
+        let mut handler = std::mem::replace(&mut vt.active, resumer);
         vt.active.tls = handler.tls;
+        vt.active.profile = handler.profile.take();
         vt.active_id = rid;
         let serving = vt.active.rare();
         serving.serve_count += 1;
@@ -10238,7 +10239,8 @@ fn serve(
         still.push(k);
     }
     vt.active.rare().handlers = still;
-    if let Some((k, vm)) = woken {
+    if let Some((k, mut vm)) = woken {
+        vt.active.lend_tier(&mut vm);
         enter_fiber(vt, fibers, mem, durable, k, vm, dst);
         return Ok(None);
     }
@@ -10287,6 +10289,7 @@ fn serve(
             .map_or(super::ShadowArena::EMPTY, |m| m.shadow_arena())
             .region_base(k + 1);
         vm.rare().dispatch = Some(d.ticket);
+        vt.active.lend_tier(&mut vm);
         enter_fiber(vt, fibers, mem, durable, k, vm, dst);
         return Ok(None);
     }
@@ -12396,10 +12399,14 @@ fn park_running_fiber(
     let handler = vt.active.dispatch().is_some();
     let (rid, resumer, rdst) = vt.chain.pop().expect("a running fiber has a resumer");
     shadow_switch(mem, fiber_sp, &mut vt.root_shadow_sp, durable, k, rid);
-    // `vcpu.tls` is the vCPU's word, not the fiber's: it goes back with execution.
-    let tls = vt.active.tls;
-    fibers[k] = park(std::mem::replace(&mut vt.active, resumer));
-    vt.active.tls = tls;
+    // `vcpu.tls` is the vCPU's word, not the fiber's: it goes back with execution, and so does a
+    // handler's hotness profile, its serve loop's ([`Vm::lend_tier`]).
+    let mut parked = std::mem::replace(&mut vt.active, resumer);
+    vt.active.tls = parked.tls;
+    if handler {
+        vt.active.profile = parked.profile.take();
+    }
+    fibers[k] = park(parked);
     vt.active_id = rid;
     let woken = woken(fibers);
     // #2742 — a handler's park leaves it to its serve loop, its resumer, which goes on serving and
@@ -19735,6 +19742,17 @@ impl Vm {
         self.jit_module = self.module;
         self.profile = None;
         self.jit_entry = Some(leaf.parks);
+    }
+
+    /// #2742 — lend this serve loop's tier-up to handler fiber `to`, which runs as the loop's own
+    /// frames once did: its calls tier up as the loop's would, and the hotness profile goes with
+    /// execution, so the task keeps one ([`Self::tier_up`]). The park or the return that hands
+    /// execution back hands the profile back too.
+    fn lend_tier(&mut self, to: &mut Vm) {
+        to.jit_eligible = self.jit_eligible.clone();
+        to.jit_module = self.jit_module;
+        to.jit_page_checked = self.jit_page_checked;
+        to.profile = self.profile.take();
     }
 
     /// Undo [`Self::tier_up`]: every call interprets.
