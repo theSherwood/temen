@@ -4553,6 +4553,7 @@ fn any_event_parked<'a>(mut fibers: impl Iterator<Item = &'a FiberState>) -> boo
             FiberState::WaitParked { .. }
                 | FiberState::CapParked { .. }
                 | FiberState::HostParked { .. }
+                | FiberState::TicketParked { .. }
         )
     })
 }
@@ -5047,7 +5048,8 @@ fn journal_state(
                 FiberState::Parked { vm, .. }
                 | FiberState::WaitParked { vm, .. }
                 | FiberState::CapParked { vm, .. }
-                | FiberState::HostParked { vm, .. } => vm.clone_slots(),
+                | FiberState::HostParked { vm, .. }
+                | FiberState::TicketParked { vm, .. } => vm.clone_slots(),
                 _ => 0,
             })
             .sum::<u64>()
@@ -9436,6 +9438,21 @@ enum FiberState {
     /// rewound, so the fiber re-executes it when resumed. A `cont.resume` claims it once the op can
     /// proceed ([`HostWait::ready`]) and reports `FIBER_PARKED` without switching until then.
     HostParked { vm: Vm, on: HostWait },
+    /// #2742 — **event-parked on a live call's reply**: the fiber's call through a live offer queued
+    /// on the callee and parked the FIBER, not its task, as the oracle parks it (a fiber waiter in
+    /// its `ticket_waiters`). Not resumable until [`settle_wakes`] claims the reply into `woken`:
+    /// the call's result slots, laid out by the results its op declares, or the trap a reply that
+    /// cannot be completed raises ([`super::complete_call`]). A `cont.resume` meanwhile reports
+    /// `FIBER_PARKED` without switching.
+    TicketParked {
+        vm: Vm,
+        /// The call's first result register in `vm`.
+        dst: u32,
+        sig: super::OpSig,
+        ticket: u64,
+        callee: DomainCell,
+        woken: Option<Result<Vec<i64>, Trap>>,
+    },
     /// Currently on the resume chain (active or an ancestor) — not independently resumable.
     /// `blocking_ip` (I48): `Some(ip)` if this fiber's current resume used `cont.resume.block`, so a
     /// park inside it idles the resumer (rewinding the resumer's cursor to `ip`) instead of returning
@@ -9800,6 +9817,27 @@ fn claim_fiber(
                 unreachable!()
             };
             vm.set(cap_dst, Reg::from_i64(r));
+            Ok(Claim::Continue(vm))
+        }
+        // #2742 — a fiber parked on a live call: once its reply is claimed (`woken`), the resume
+        // lays the call's results into its result registers and continues it. A reply that could
+        // not be completed traps here, in the resumer's step, as the call itself would have.
+        Some(slot @ FiberState::TicketParked { .. }) => {
+            let FiberState::TicketParked { woken, .. } = slot else {
+                unreachable!()
+            };
+            let Some(reply) = woken.take() else {
+                return Ok(blocked());
+            };
+            let FiberState::TicketParked {
+                mut vm, dst, sig, ..
+            } = std::mem::replace(slot, running())
+            else {
+                unreachable!()
+            };
+            for (i, v) in super::result_regs(&reply?, sig.results()).enumerate() {
+                vm.set(dst + i as u32, v);
+            }
             Ok(Claim::Continue(vm))
         }
         Some(FiberState::Done) => Ok(Claim::Spent), // a finished slot keeps its place (#1684)
@@ -10353,10 +10391,16 @@ fn freeze_drive(
     // The tree-walker's classification, before anything is consumed: an unwoken **cap** park would
     // spill the freeze placeholder as the call's result, which its thaw cannot re-derive, so it
     // fails the whole freeze closed.
-    if fibers
-        .iter()
-        .any(|f| matches!(f, FiberState::CapParked { woken: None, .. }))
-    {
+    if fibers.iter().any(|f| {
+        matches!(
+            f,
+            FiberState::CapParked { woken: None, .. }
+                | FiberState::TicketParked {
+                    woken: None | Some(Err(_)),
+                    ..
+                }
+        )
+    }) {
         return Err(Trap::FiberFault);
     }
     let mut frozen = Vec::new();
@@ -10397,6 +10441,18 @@ fn freeze_drive(
                 ..
             } => {
                 vm.set(dst, Reg::from_i64(r));
+                (vm, false)
+            }
+            FiberState::TicketParked {
+                mut vm,
+                dst,
+                sig,
+                woken: Some(Ok(slots)),
+                ..
+            } => {
+                for (i, v) in super::result_regs(&slots, sig.results()).enumerate() {
+                    vm.set(dst + i as u32, v);
+                }
                 (vm, false)
             }
             // A pipe or stdin park's op is rewound (#1952): the unwind re-runs it, and it abandons
@@ -10597,7 +10653,8 @@ fn gc_scan_beneath(
                 if let FiberState::Parked { vm, .. }
                 | FiberState::WaitParked { vm, .. }
                 | FiberState::CapParked { vm, .. }
-                | FiberState::HostParked { vm, .. } = fib
+                | FiberState::HostParked { vm, .. }
+                | FiberState::TicketParked { vm, .. } = fib
                 {
                     scan_vm_roots(vm, source, &mut consider);
                 }
@@ -11982,6 +12039,43 @@ fn host_park_fiber(tasks: &mut [TaskSlot], ti: usize, domains: &mut [Domain], st
     }
 }
 
+/// #2742 — task `ti`'s running fiber (never fiber 0) parks on its live call's reply
+/// ([`FiberState::TicketParked`]), in its task's domain. Nothing rechecks the reply: the call was
+/// only now queued, and a reply that comes before the next settle waits in the callee's results
+/// for [`settle_wakes`] to claim.
+#[allow(clippy::too_many_arguments)]
+fn ticket_park_fiber(
+    tasks: &mut [TaskSlot],
+    ti: usize,
+    domains: &mut [Domain],
+    ticket: u64,
+    callee: DomainCell,
+    dst: u32,
+    sig: super::OpSig,
+) {
+    let durable = domains[0].host.lock_unpoisoned().is_durable();
+    let e = &mut domains[tasks[ti].domain];
+    if let Some(k) = park_running_fiber(
+        &mut tasks[ti].vm.vt,
+        &mut e.fibers.fibers,
+        &mut e.fibers.sp,
+        &mut e.mem,
+        durable,
+        true,
+        |vm| FiberState::TicketParked {
+            vm,
+            dst,
+            sig,
+            ticket,
+            callee,
+            woken: None,
+        },
+        |_| false,
+    ) {
+        tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
+    }
+}
+
 impl TaskState {
     /// #1904 — the [`super::ParkSite`] this state parks at, so a freeze applies the one rule for it
     /// ([`super::ParkSite::freeze_rule`], DURABILITY §4 "One rule per park site"). Exhaustive, so a
@@ -12033,6 +12127,18 @@ fn freeze_step(
         let parked_declined = tasks.iter().enumerate().find_map(|(ti, t)| {
             let site = t.state.park_site()?;
             (freeze_rule_here(site) == FreezeRule::Decline).then_some((site, ti))
+        });
+        // #2742 — a fiber parked on a live call waits on a reply as a task does, so it declines
+        // alike, named by the task idling on it (or the root's).
+        let parked_declined = parked_declined.or_else(|| {
+            let k = (root.fibers.fibers.iter())
+                .position(|f| matches!(f, FiberState::TicketParked { .. }))?;
+            let on =
+                |t: &TaskSlot| matches!(t.state, TaskState::BlockedOnFiber { fiber } if fiber == k);
+            Some((
+                super::ParkSite::Reply,
+                tasks.iter().position(on).unwrap_or(0),
+            ))
         });
         let declined = match (forked_twins.first(), parked_declined) {
             (Some(&twin), _) => Some((DeclineCause::ForkTwin, twin)),
@@ -12429,6 +12535,10 @@ struct Held {
     /// The activations made for calls through the queue since an executor last took them, each with
     /// the task whose call it answers: on executor 2 that task's thread carries it.
     made: Vec<(usize, usize)>,
+    /// The task that made each call into the domain through its queue, by ticket, until an
+    /// activation takes the call ([`serve_resting`]). The call parked the task, or only the fiber
+    /// that made it (#2742), whose task's thread still carries it.
+    callers: std::collections::BTreeMap<u64, usize>,
 }
 
 impl Held {
@@ -12523,15 +12633,8 @@ fn serve_resting(
         let payer = host.lock_unpoisoned().svc_payers.remove(&d.ticket);
         let fuel = payer.map_or_else(|| domains[0].fuel.for_thread(), Fuel::drawn);
         let to = super::AnswerTo::Ticket(d.ticket);
-        // The task parked on the call, whose thread carries it on executor 2.
-        let carrier = tasks.iter().position(|t| match &t.state {
-            TaskState::BlockedTicket { ticket, callee, .. }
-            | TaskState::BlockedPage {
-                ticket,
-                pager: callee,
-            } => *ticket == d.ticket && std::sync::Arc::ptr_eq(callee, host),
-            _ => false,
-        });
+        // The task that made the call, whose thread carries it on executor 2.
+        let carrier = held.callers.remove(&d.ticket);
         let (export, op) = (d.export, d.op);
         let made = activation(
             tasks, domains, held, source, export, op, &d.args, fuel, to, carrier,
@@ -12770,6 +12873,34 @@ fn settle_wakes(
     for (i, trap) in refused {
         complete(tasks, domains, i, Err(trap));
     }
+    // #2742 — a fiber parked on a live call wakes the same way: its reply, laid out for its own
+    // domain's powerbox, waits in the fiber for the resume that delivers it.
+    for e in domains.iter_mut() {
+        for f in e.fibers.fibers.iter_mut() {
+            let FiberState::TicketParked {
+                ticket,
+                callee,
+                sig,
+                woken: woken @ None,
+                ..
+            } = f
+            else {
+                continue;
+            };
+            let reply = {
+                let mut c = callee.lock_unpoisoned();
+                let reply = c.svc_results.remove(ticket);
+                if reply.is_some() {
+                    c.svc_payers.remove(ticket);
+                }
+                reply
+            };
+            if let Some(reply) = reply {
+                let to = &mut super::CallerHost::Cell(&e.host);
+                *woken = Some(super::complete_call(reply, sig.results(), callee, to));
+            }
+        }
+    }
     // #1215 — the default-action TERMINATE, cooperative form (invariant 14). A domain the
     // personality has terminated (a `SIG_DFL` SIGKILL/SIGTERM/SIGINT delivered through the gate,
     // `term_sig` set) must DIE. A task mid-step dies at its next op, through its domain's
@@ -12981,7 +13112,8 @@ fn settle_wakes(
             let woken = match domains[t.domain].fibers.fibers.get(fiber) {
                 Some(
                     FiberState::WaitParked { woken: Some(_), .. }
-                    | FiberState::CapParked { woken: Some(_), .. },
+                    | FiberState::CapParked { woken: Some(_), .. }
+                    | FiberState::TicketParked { woken: Some(_), .. },
                 ) => true,
                 Some(FiberState::HostParked { on, .. }) => {
                     on.ready(&domains[t.domain].host.lock_unpoisoned())
@@ -13926,14 +14058,23 @@ impl SchedCore {
                         if let Some(env) = callee_env {
                             wake_serve_loops(tasks, env);
                         }
-                        tasks[ti].state = TaskState::BlockedTicket {
-                            ticket,
-                            callee,
-                            dst,
-                            sig,
-                        };
-                        // #2695 step 2 — a resting held domain runs the call as an activation.
+                        // #2742 — a fiber's call parks the fiber, not its task, as the oracle parks
+                        // it: the resumer goes on, or idles under a blocking resume, until the reply.
+                        if tasks[ti].vm.vt.active_id != ROOT_FIBER {
+                            ticket_park_fiber(tasks, ti, domains, ticket, callee, dst, sig);
+                        } else {
+                            tasks[ti].state = TaskState::BlockedTicket {
+                                ticket,
+                                callee,
+                                dst,
+                                sig,
+                            };
+                        }
+                        // #2695 step 2 — a call into the held domain names the task that made it,
+                        // whose thread carries the activation that answers it on executor 2; a
+                        // resting domain starts that activation now.
                         if let (Some(h), Some(0)) = (held.as_mut(), callee_env) {
+                            h.callers.insert(ticket, ti);
                             serve_resting(tasks, domains, h, source);
                         }
                     }
@@ -13970,6 +14111,9 @@ impl SchedCore {
                 wake_serve_loops(tasks, pager_env);
                 if let Some(ticket) = ticket {
                     tasks[ti].state = TaskState::BlockedPage { ticket, pager };
+                    if let (Some(h), 0) = (held.as_mut(), pager_env) {
+                        h.callers.insert(ticket, ti);
+                    }
                 }
             }
             Ok(VcpuStop::CapPending { id, dst }) => {
@@ -18790,6 +18934,20 @@ fn teardown_domains(
             }
             for (i, dst, sig) in unanswered {
                 fail_call(tasks, domains, i, dst, sig.results(), super::CAP_REVOKED);
+            }
+            // #2742 — and so does a fiber parked on a call into it, at its resume.
+            for f in domains.iter_mut().flat_map(|e| e.fibers.fibers.iter_mut()) {
+                if let FiberState::TicketParked {
+                    callee,
+                    sig,
+                    woken: woken @ None,
+                    ..
+                } = f
+                {
+                    if std::sync::Arc::ptr_eq(callee, &dying) {
+                        *woken = Some(super::failed_slots(super::CAP_REVOKED, sig.results()));
+                    }
+                }
             }
             for i in stranded {
                 complete(tasks, domains, i, Err(Trap::MemoryFault));
