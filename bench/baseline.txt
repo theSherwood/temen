@@ -7,7 +7,9 @@
 alu,1.016,1.015,1.308,70.683,5.082
 memsum,1.512,1.008,1.225,248.527,1.294
 scatter,1.065,0.696,1.212,320.780,0.937
-simd,2.003,2.010,1.304,178.647,NA
+# simd: projected from the Nov 3 row for #2749 (the JIT lane's median halves: compute 2.0 -> 1.0,
+# interp/jit doubles) until the next nightly's file replaces this one.
+simd,1.000,1.000,1.304,357.800,NA
 float,1.010,1.010,1.321,64.339,1.011
 calli,1.293,1.294,0.863,61.805,1.812
 calli_poly,1.049,1.047,0.785,24.324,1.236
