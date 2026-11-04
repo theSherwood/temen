@@ -57,11 +57,11 @@ fn dispatch_module() -> Module {
             captures: vec![],
             params: vec![I32, I64],
             insts: vec![
-                Inst::CallIndirect {
-                    ty: 0,         // #922: interned at type-section index 0
-                    idx: 0,        // sel
-                    args: vec![1], // x
-                },
+                Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
+                    ty: 0,                // #922: interned at type-section index 0
+                    idx: 0,               // sel
+                    args: vec![1].into(), // x
+                })),
                 Inst::IntBin {
                     ty: IntTy::I64,
                     op: BinOp::Add,
@@ -103,9 +103,7 @@ fn lowering_verifies_and_matches_on_valid_indices() {
 
     // No `call.dyn` survives; the candidate calls are now direct.
     let any_indirect = low.funcs.iter().flat_map(|f| &f.blocks).any(|b| {
-        b.insts
-            .iter()
-            .any(|i| matches!(i, Inst::CallIndirect { .. }))
+        b.insts.iter().any(|i| matches!(i, Inst::CallIndirect(_)))
             || matches!(b.term, Terminator::ReturnCallIndirect { .. })
     });
     assert!(!any_indirect, "no call.dyn should remain after lowering");
@@ -211,11 +209,11 @@ fn branchy_module() -> Module {
                 captures: vec![],
                 params: vec![I32, I64], // sel=0, x=1
                 insts: vec![
-                    Inst::CallIndirect {
+                    Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                         ty: 0, // #922: interned at type-section index 0
                         idx: 0,
-                        args: vec![1],
-                    }, // r = v2
+                        args: vec![1].into(),
+                    })), // r = v2
                     Inst::ConstI64(0), // v3
                     Inst::IntCmp {
                         ty: IntTy::I64,
@@ -325,11 +323,11 @@ fn wide_span_uses_chain_fallback_and_stays_faithful() {
             parent: 0,
             captures: vec![],
             params: vec![I32, I64],
-            insts: vec![Inst::CallIndirect {
+            insts: vec![Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                 ty: 0, // #922: interned at type-section index 0
                 idx: 0,
-                args: vec![1, 1],
-            }],
+                args: vec![1, 1].into(),
+            }))],
             term: Terminator::Return(vec![2]),
         }],
     };
@@ -404,11 +402,11 @@ fn high_index_cluster_uses_offset_table() {
             parent: 0,
             captures: vec![],
             params: vec![I32, I64],
-            insts: vec![Inst::CallIndirect {
+            insts: vec![Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                 ty: 0, // #922: interned at type-section index 0
                 idx: 0,
-                args: vec![1, 1],
-            }],
+                args: vec![1, 1].into(),
+            }))],
             term: Terminator::Return(vec![2]),
         }],
     };
@@ -454,12 +452,12 @@ fn large_tail_uses_shared_continuation() {
         params: vec![I64],
         results: vec![I64],
     };
-    let mut insts = vec![Inst::CallIndirect {
+    let mut insts = vec![Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
         ty: 0, // #922: interned at type-section index 0
         idx: 0,
-        args: vec![1],
-    }]; // r = v2
-        // 10 dependent adds of x into the result → an 11-inst tail after the call (> TAIL_DUP_LIMIT).
+        args: vec![1].into(),
+    }))]; // r = v2
+          // 10 dependent adds of x into the result → an 11-inst tail after the call (> TAIL_DUP_LIMIT).
     for k in 0..10u32 {
         insts.push(Inst::IntBin {
             ty: IntTy::I64,

@@ -266,7 +266,7 @@ fn with_readback(residual: &Module, read_addr: u64) -> (Module, u32) {
                 Inst::ConstI64(read_addr as i64),
                 Inst::Call {
                     func: 0,
-                    args: vec![0, 1, 2],
+                    args: vec![0, 1, 2].into(),
                 },
                 Inst::Load {
                     op: LoadOp::I64,

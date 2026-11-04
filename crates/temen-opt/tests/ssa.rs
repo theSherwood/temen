@@ -185,7 +185,7 @@ fn multi_result_call_identity_and_defs() {
             insts: vec![
                 Inst::Call {
                     func: 1,
-                    args: vec![0],
+                    args: vec![0].into(),
                 }, // v1 = callee(a)
                 Inst::IntBin {
                     ty: IntTy::I32,

@@ -29,6 +29,7 @@
 extern crate alloc;
 
 use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -931,34 +932,24 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
         // Manifest capability call, mirroring `call.cap` but carrying an import *index* (into
         // the module's import section) instead of a bound `(type_id, op)`: dispatch goes through
         // the instance's slot binding — the bytes are never rewritten.
-        Inst::CallImport {
-            import,
-            op,
-            sig,
-            args,
-        } => {
+        Inst::CallImport(c) => {
             out.push(self::op::CALL_IMPORT);
-            write_uleb(out, *import as u64);
+            write_uleb(out, c.import as u64);
             // The consumer-local op immediate (0 for flat imports). No handle operand (v8):
             // the slot binding identifies the capability.
-            write_uleb(out, *op as u64);
+            write_uleb(out, c.op as u64);
             // Interned signature: a single `types` index (FuncType interning, #922).
-            write_uleb(out, *sig as u64);
-            write_idxs(out, args);
+            write_uleb(out, c.sig as u64);
+            write_idxs(out, &c.args);
         }
         // v8 §7/§22 link-form symbolic call: the loader-ABI placeholder (never verifies;
         // `resolve_imports_with` rewrites it before the gate).
-        Inst::CallSym {
-            import,
-            sig,
-            handle,
-            args,
-        } => {
+        Inst::CallSym(c) => {
             out.push(self::op::CALL_SYM);
-            write_uleb(out, *import as u64);
-            write_uleb(out, *sig as u64);
-            write_uleb(out, *handle as u64);
-            write_idxs(out, args);
+            write_uleb(out, c.import as u64);
+            write_uleb(out, c.sig as u64);
+            write_uleb(out, c.handle as u64);
+            write_idxs(out, &c.args);
         }
         // Link-form data addresses (v9): object-dialect only. In the runnable dialect they remain
         // a producer bug (link scaffolding that `link` rewrites to `ConstI64` before a module is
@@ -973,16 +964,16 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_uleb(out, *offset);
             out.push(*tls as u8); // v12 (#1715)
         }
-        Inst::DataSym { name, addend, tls } => {
+        Inst::DataSym(d) => {
             assert!(
                 object,
                 "data.sym is link-form; resolve via link before encode_module"
             );
             out.push(self::op::DATA_SYM);
-            write_uleb(out, name.len() as u64);
-            out.extend_from_slice(name);
-            write_sleb(out, *addend);
-            out.push(*tls as u8); // v12 (#1715)
+            write_uleb(out, d.name.len() as u64);
+            out.extend_from_slice(&d.name);
+            write_sleb(out, d.addend);
+            out.push(d.tls as u8); // v12 (#1715)
         }
         Inst::DataTop => {
             assert!(
@@ -1002,19 +993,13 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
         }
         // v7 dynamic-mode dispatch by type-section reference (§3.5): interface index, op,
         // self-describing sig, runtime handle operand, args.
-        Inst::CallImportDyn {
-            ty,
-            op,
-            sig,
-            handle,
-            args,
-        } => {
+        Inst::CallImportDyn(c) => {
             out.push(self::op::CALL_IMPORT_DYN);
-            write_uleb(out, *ty as u64);
-            write_uleb(out, *op as u64);
-            write_uleb(out, *sig as u64);
-            write_uleb(out, *handle as u64);
-            write_idxs(out, args);
+            write_uleb(out, c.ty as u64);
+            write_uleb(out, c.op as u64);
+            write_uleb(out, c.sig as u64);
+            write_uleb(out, c.handle as u64);
+            write_idxs(out, &c.args);
         }
         // v7 `export.handle` (§3.5): reify own impl export as a capability handle.
         Inst::ExportHandle { export } => {
@@ -1249,27 +1234,21 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             out.push(op::FTOI_TRAP + o.index());
             write_uleb(out, *a as u64);
         }
-        Inst::CallIndirect { ty, idx, args } => {
+        Inst::CallIndirect(c) => {
             out.push(op::CALL_INDIRECT);
             // Interned signature: a single `types` index (FuncType interning, #922).
-            write_uleb(out, *ty as u64);
-            write_uleb(out, *idx as u64);
-            write_idxs(out, args);
+            write_uleb(out, c.ty as u64);
+            write_uleb(out, c.idx as u64);
+            write_idxs(out, &c.args);
         }
-        Inst::CapCall {
-            type_id,
-            op,
-            sig,
-            handle,
-            args,
-        } => {
+        Inst::CapCall(c) => {
             out.push(op::CAP_CALL);
-            write_uleb(out, *type_id as u64);
-            write_uleb(out, *op as u64);
+            write_uleb(out, c.type_id as u64);
+            write_uleb(out, c.op as u64);
             // Interned signature: a single `types` index (FuncType interning, #922).
-            write_uleb(out, *sig as u64);
-            write_uleb(out, *handle as u64);
-            write_idxs(out, args);
+            write_uleb(out, c.sig as u64);
+            write_uleb(out, c.handle as u64);
+            write_idxs(out, &c.args);
         }
         Inst::ContNew { func, sp } => {
             out.push(op::CONT_NEW);
@@ -1586,7 +1565,7 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
         Inst::Shuffle { lanes, a, b } => {
             out.push(op::SIMD);
             out.push(op::simd::SHUFFLE);
-            out.extend_from_slice(lanes);
+            out.extend_from_slice(&lanes[..]);
             write_uleb(out, *a as u64);
             write_uleb(out, *b as u64);
         }
@@ -1829,7 +1808,7 @@ fn decode_simd(c: &mut Cursor) -> Result<Inst, DecodeError> {
             mask: c.idx()?,
         },
         op::simd::SHUFFLE => Inst::Shuffle {
-            lanes: dec_byte16(c)?,
+            lanes: Box::new(dec_byte16(c)?),
             a: c.idx()?,
             b: c.idx()?,
         },
@@ -2648,7 +2627,7 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
         },
         op::CALL => Inst::Call {
             func: c.idx()?,
-            args: decode_idxs(c)?,
+            args: decode_idxs(c)?.into(),
         },
         op::REF_FUNC => Inst::RefFunc { func: c.idx()? },
         op::FMA => {
@@ -2668,31 +2647,31 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             op: FToI::from_index(b - op::FTOI_TRAP).ok_or(DecodeError::BadOpcode(b))?,
             a: c.idx()?,
         },
-        op::CALL_INDIRECT => Inst::CallIndirect {
+        op::CALL_INDIRECT => Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
             // Interned signature: a single `types` index (FuncType interning, #922).
             ty: c.idx()?,
             idx: c.idx()?,
-            args: decode_idxs(c)?,
-        },
-        op::CAP_CALL => Inst::CapCall {
+            args: decode_idxs(c)?.into(),
+        })),
+        op::CAP_CALL => Inst::CapCall(Box::new(temen_ir::CapCall {
             type_id: c.idx()?,
             op: c.idx()?,
             sig: c.idx()?,
             handle: c.idx()?,
-            args: decode_idxs(c)?,
-        },
-        op::CALL_IMPORT => Inst::CallImport {
+            args: decode_idxs(c)?.into(),
+        })),
+        op::CALL_IMPORT => Inst::CallImport(Box::new(temen_ir::CallImport {
             import: c.idx()?,
             op: c.idx()?,
             sig: c.idx()?,
-            args: decode_idxs(c)?,
-        },
-        op::CALL_SYM => Inst::CallSym {
+            args: decode_idxs(c)?.into(),
+        })),
+        op::CALL_SYM => Inst::CallSym(Box::new(temen_ir::CallSym {
             import: c.idx()?,
             sig: c.idx()?,
             handle: c.idx()?,
-            args: decode_idxs(c)?,
-        },
+            args: decode_idxs(c)?.into(),
+        })),
         // v9 link-form data addresses: object-dialect only — in a runnable module these bytes
         // fall through to the BadOpcode arm (the guard fails), exactly as under v8.
         op::DATA_SELF if object => Inst::DataSelf {
@@ -2700,31 +2679,31 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
             tls: c.flag()?,
         },
         op::DATA_SYM if object => {
-            // The name is raw length-prefixed bytes (`Vec<u8>`, matching the IR — not UTF-8
-            // checked, unlike section name strings; the linker compares bytes).
+            // The name is raw length-prefixed bytes (matching the IR — not UTF-8 checked, unlike
+            // section name strings; the linker compares bytes).
             let len = c.count()?;
-            let name = c.take(len)?.to_vec();
+            let name = c.take(len)?.into();
             let addend = c.sleb()?;
-            Inst::DataSym {
+            Inst::DataSym(Box::new(temen_ir::DataSym {
                 name,
                 addend,
                 tls: c.flag()?,
-            }
+            }))
         }
         op::DATA_TOP if object => Inst::DataTop,
         op::REF_SYM if object => {
             let len = c.count()?;
             Inst::RefSym {
-                name: c.take(len)?.to_vec(),
+                name: c.take(len)?.into(),
             }
         }
-        op::CALL_IMPORT_DYN => Inst::CallImportDyn {
+        op::CALL_IMPORT_DYN => Inst::CallImportDyn(Box::new(temen_ir::CallImportDyn {
             ty: c.idx()?,
             op: c.idx()?,
             sig: c.idx()?,
             handle: c.idx()?,
-            args: decode_idxs(c)?,
-        },
+            args: decode_idxs(c)?.into(),
+        })),
         op::EXPORT_HANDLE => Inst::ExportHandle { export: c.idx()? },
         op::CAP_SELF_TYPE_ID => Inst::CapSelfTypeId { ty: c.idx()? },
         op::CAP_SELF_COVERS => Inst::CapSelfCovers {
@@ -3325,23 +3304,23 @@ mod object_tests {
                             offset: 8,
                             tls: false,
                         },
-                        Inst::DataSym {
-                            name: b"g_table".to_vec(),
+                        Inst::DataSym(Box::new(temen_ir::DataSym {
+                            name: b"g_table".to_vec().into(),
                             addend: 12,
                             tls: false,
-                        },
+                        })),
                         Inst::DataTop,
                         Inst::DataSelf {
                             offset: 4,
                             tls: true,
                         },
-                        Inst::DataSym {
-                            name: b"t_other".to_vec(),
+                        Inst::DataSym(Box::new(temen_ir::DataSym {
+                            name: b"t_other".to_vec().into(),
                             addend: 0,
                             tls: true,
-                        },
+                        })),
                         Inst::RefSym {
-                            name: b"f_other".to_vec(),
+                            name: b"f_other".to_vec().into(),
                         },
                     ],
                     term: Terminator::Return(vec![2]),
@@ -4251,7 +4230,7 @@ mod list_tests {
                         Inst::ConstI64(9),
                         Inst::Call {
                             func: 1,
-                            args: vec![0, 2, 3],
+                            args: vec![0, 2, 3].into(),
                         },
                     ],
                     term: Terminator::BrIf {
@@ -4311,12 +4290,8 @@ mod list_tests {
             for b in &f.blocks {
                 assert!(exact(&b.params));
                 assert!(exact(&b.captures));
+                // A call's args are a boxed slice (#2713), exact by construction.
                 assert!(exact(&b.insts));
-                for i in &b.insts {
-                    if let Inst::Call { args, .. } = i {
-                        assert!(exact(args));
-                    }
-                }
                 let mut edges: Vec<&Vec<ValIdx>> = Vec::new();
                 match &b.term {
                     Terminator::BrIf {

@@ -372,7 +372,7 @@ fn embed_and_diff(mut residual: Module, src: &Module, luav: u32, entry: u32) {
             params: vec![ValType::I64, ValType::I64, ValType::I64],
             insts: vec![Inst::Call {
                 func: entry,
-                args: vec![],
+                args: vec![].into(),
             }],
             term: Terminator::Return(vec![]),
         }],

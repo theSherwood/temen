@@ -43,7 +43,7 @@ fn link_and_run(resolver: impl FnMut(&str) -> Option<Resolved>, args: &[i32]) ->
         linked.funcs[1].blocks[0]
             .insts
             .iter()
-            .all(|i| !matches!(i, temen_ir::Inst::CallImport { .. })),
+            .all(|i| !matches!(i, temen_ir::Inst::CallImport(_))),
         "the import must be lowered to a direct call"
     );
     temen_verify::verify_module(&linked).expect("verify linked module");
@@ -135,11 +135,7 @@ block 0 (v0: i32) {
     // The import lowered to a call.cap (not a direct call).
     assert!(linked.funcs[0].blocks[0].insts.iter().any(|i| matches!(
         i,
-        temen_ir::Inst::CapCall {
-            type_id: 0,
-            op: 1,
-            ..
-        }
+        temen_ir::Inst::CapCall(c) if c.type_id == 0 && c.op == 1
     )));
 }
 
@@ -387,7 +383,7 @@ fn cross_unit_data_symbol_resolves() {
             .iter()
             .flat_map(|f| &f.blocks)
             .flat_map(|b| &b.insts)
-            .any(|i| matches!(i, temen_ir::Inst::DataSym { .. })),
+            .any(|i| matches!(i, temen_ir::Inst::DataSym(_))),
         "every data.sym is rewritten to a const at link"
     );
     temen_verify::verify_module(&linked).expect("verify");
@@ -705,7 +701,7 @@ block 0 (v0: i32, v1: i32) {
         "handle const patched to slot 1"
     );
     assert!(
-        matches!(insts[1], temen_ir::Inst::CallIndirect { .. }),
+        matches!(insts[1], temen_ir::Inst::CallIndirect(_)),
         "import lowered to call.dyn, not a direct call"
     );
     temen_verify::verify_module(&linked).expect("verify");

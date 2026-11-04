@@ -1003,7 +1003,7 @@ pub fn fold_simd(inst: &Inst, get: impl Fn(ValIdx) -> Option<Known>) -> Option<K
         Inst::VBitBin { op, a, b } => Known::V128(simd_vbit_bin(op, v(a)?, v(b)?)),
         Inst::VNot { a } => Known::V128(simd_vnot(v(a)?)),
         Inst::Bitselect { a, b, mask } => Known::V128(simd_bitselect(v(a)?, v(b)?, v(mask)?)),
-        Inst::Shuffle { lanes, a, b } => Known::V128(simd_shuffle(&lanes, v(a)?, v(b)?)),
+        Inst::Shuffle { ref lanes, a, b } => Known::V128(simd_shuffle(lanes, v(a)?, v(b)?)),
         Inst::Swizzle { a, b } => Known::V128(simd_swizzle(v(a)?, v(b)?)),
         // Exotic lane ops — each mirrors the matching `temen-interp` `simd_*` helper bit-for-bit (the
         // differential oracle, `tests/specialize.rs::folds_v128_exotic_lane_ops`, cross-checks them).

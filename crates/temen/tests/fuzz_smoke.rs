@@ -185,11 +185,11 @@ block 0 () { v0 = i64.const 7
                     offset: 8,
                     tls: false,
                 },
-                ir::Inst::DataSym {
-                    name: b"g".to_vec(),
+                ir::Inst::DataSym(Box::new(ir::DataSym {
+                    name: b"g"[..].into(),
                     addend: 3,
                     tls: false,
-                },
+                })),
                 ir::Inst::DataTop,
             ],
             term: ir::Terminator::Return(vec![2]),

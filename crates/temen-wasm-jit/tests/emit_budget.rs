@@ -21,7 +21,7 @@ fn wide_module(n_callees: usize, loads_each: usize) -> Module {
     for i in 1..=n_callees {
         insts.push(Inst::Call {
             func: i as u32,
-            args: vec![0],
+            args: vec![0].into(),
         });
     }
     funcs.push(Func {

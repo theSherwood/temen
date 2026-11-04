@@ -109,7 +109,7 @@ fn build_module(win_log2: u8) -> Module {
             params: i64x2(),
             insts: vec![Inst::Call {
                 func: 1,
-                args: vec![0, 1],
+                args: vec![0, 1].into(),
             }],
             term: Terminator::Return(vec![2]),
         }],

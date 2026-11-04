@@ -235,7 +235,7 @@ fn a_program_unit_passes_a_libc_function_as_a_pointer() {
         .flat_map(|f| &f.blocks)
         .flat_map(|b| &b.insts)
         .filter_map(|i| match i {
-            temen_ir::Inst::RefSym { name } => Some(name.as_slice()),
+            temen_ir::Inst::RefSym { name } => Some(&name[..]),
             _ => None,
         })
         .collect();

@@ -443,7 +443,7 @@ fn two_residuals_stitched_at_the_call_boundary() {
             params: vec![ValType::I64, ValType::I64, ValType::I64],
             insts: vec![Inst::Call {
                 func: entry_b,
-                args: vec![],
+                args: vec![].into(),
             }],
             term: Terminator::Return(vec![]),
         }],

@@ -501,7 +501,8 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         Inst::ConstI64(c) => format!("i64.const {c}"),
         // Link-form data addresses (resolved to `i64.const` by `link`): `data.sym "<name>" <addend>`
         // for a cross-unit symbol, `data.self <offset>` for this unit's own data.
-        Inst::DataSym { name, addend, tls } => {
+        Inst::DataSym(d) => {
+            let temen_ir::DataSym { name, addend, tls } = &**d;
             let tls = if *tls { "tls " } else { "" };
             format!("data.sym {tls}\"{}\" {addend}", escape_bytes(name))
         }
@@ -588,7 +589,8 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         Inst::RefFunc { func } => format!("ref.func {func}"),
         // Link-form function reference (resolved to `ref.func` by `link`, #2203).
         Inst::RefSym { name } => format!("ref.sym \"{}\"", escape_bytes(name)),
-        Inst::CallIndirect { ty, idx, args } => {
+        Inst::CallIndirect(c) => {
+            let temen_ir::CallIndirect { ty, idx, args } = &**c;
             let s = sig_of(m, *ty);
             format!(
                 "call.dyn ({}) -> ({}) v{idx}{}",
@@ -600,35 +602,31 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         // §3.6 sugar: the service points print as `svc.poll`/`svc.wait` (greppable, per the
         // design) — pure spelling over `call.cap CAP_SELF_TYPE_ID 9|10`; the ignored handle
         // operand rides along so the round-trip is exact.
-        Inst::CapCall {
-            type_id: temen_ir::CAP_SELF_TYPE_ID,
-            op: op @ (9 | 10),
-            sig,
-            handle,
-            args,
-        } if {
-            let s = sig_of(m, *sig);
-            s.params.is_empty() && s.results == [ValType::I64]
-        } && args.is_empty() =>
+        Inst::CapCall(c)
+            if c.type_id == temen_ir::CAP_SELF_TYPE_ID
+                && matches!(c.op, 9 | 10)
+                && {
+                    let s = sig_of(m, c.sig);
+                    s.params.is_empty() && s.results == [ValType::I64]
+                }
+                && c.args.is_empty() =>
         {
-            let name = if *op == 9 { "svc.poll" } else { "svc.wait" };
-            format!("{name} v{handle}")
+            let name = if c.op == 9 { "svc.poll" } else { "svc.wait" };
+            format!("{name} v{}", c.handle)
         }
         // Wire-rev sugar: the `self.*` reflection ops (their typed `Inst::CapSelf*` fronts were
         // retired to the generic `call.cap CAP_SELF op N`) print as their mnemonics. The ignored
         // const-0 dispatch handle is not spelled — but only when it is the immediately-preceding
         // `i32.const 0`, so the parser re-pairs the two exactly; any other handle (a shared or
         // non-adjacent value) prints as the raw `call.cap` below, which round-trips unaided.
-        Inst::CapCall {
-            type_id: temen_ir::CAP_SELF_TYPE_ID,
-            op: op @ (0..=4 | 17 | 18),
-            sig,
-            handle,
-            args,
-        } if cap_self_sig_matches(*op, &sig_of(m, *sig), args.len())
-            && Some(*handle) == prev_const0 =>
+        Inst::CapCall(c)
+            if c.type_id == temen_ir::CAP_SELF_TYPE_ID
+                && matches!(c.op, 0..=4 | 17 | 18)
+                && cap_self_sig_matches(c.op, &sig_of(m, c.sig), c.args.len())
+                && Some(c.handle) == prev_const0 =>
         {
-            match op {
+            let args = &c.args;
+            match c.op {
                 0 => "self.count".to_string(),
                 4 => "self.attest".to_string(),
                 1 => format!("self.get v{}", args[0]),
@@ -638,13 +636,14 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
                 _ => format!("self.label v{} v{} v{}", args[0], args[1], args[2]),
             }
         }
-        Inst::CapCall {
-            type_id,
-            op,
-            sig,
-            handle,
-            args,
-        } => {
+        Inst::CapCall(c) => {
+            let temen_ir::CapCall {
+                type_id,
+                op,
+                sig,
+                handle,
+                args,
+            } = &**c;
             let s = sig_of(m, *sig);
             format!(
                 "call.cap {type_id} {op} ({}) -> ({}) v{handle}{}",
@@ -657,9 +656,10 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         // The op signature is recovered from the declaration through the type section on
         // re-parse; the op prints by name when the grouped import's interface resolves,
         // numerically otherwise, and not at all for op 0 of a flat import.
-        Inst::CallImport {
-            import, op, args, ..
-        } => {
+        Inst::CallImport(c) => {
+            let temen_ir::CallImport {
+                import, op, args, ..
+            } = &**c;
             let opsel = if *op == 0
                 && matches!(
                     m.imports.get(*import as usize).map(|i| i.shape),
@@ -688,20 +688,16 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         }
         // §7/§22 link-form symbolic call: `call.sym <import> v<handle> (args)` — the loader-ABI
         // placeholder (never verifies; the linker rewrites it).
-        Inst::CallSym {
-            import,
-            handle,
-            args,
-            ..
-        } => format!("call.sym {import} v{handle}{}", arglist(args)),
+        Inst::CallSym(c) => format!("call.sym {} v{}{}", c.import, c.handle, arglist(&c.args)),
         // §3.5 dynamic mode: `call.import.dyn <ty>[.<opname> | op <n>] v<handle> (args)`.
-        Inst::CallImportDyn {
-            ty,
-            op,
-            handle,
-            args,
-            ..
-        } => {
+        Inst::CallImportDyn(c) => {
+            let temen_ir::CallImportDyn {
+                ty,
+                op,
+                handle,
+                args,
+                ..
+            } = &**c;
             let opsel = match m.types.get(*ty as usize) {
                 Some(temen_ir::TypeEntry::Interface(elems)) => match elems.get(*op as usize) {
                     Some(e) => format!(".{}", e.name),
@@ -2588,8 +2584,8 @@ impl<'a> Parser<'a> {
                     }
                     idx
                 };
-                if let Inst::CapCall { handle, .. } = &mut inst {
-                    *handle = handle_idx;
+                if let Inst::CapCall(c) = &mut inst {
+                    c.handle = handle_idx;
                 }
             }
             let n = inst.result_count(&self.fn_results, &self.types);
@@ -2740,13 +2736,13 @@ impl<'a> Parser<'a> {
     /// dispatch handle (the sugar text carries none); the placeholder handle here is overwritten there.
     fn cap_self_capcall(&mut self, op: u32, sig: FuncType, args: Vec<u32>) -> Inst {
         self.pending_self_handle = true;
-        Inst::CapCall {
+        Inst::CapCall(Box::new(temen_ir::CapCall {
             type_id: temen_ir::CAP_SELF_TYPE_ID,
             op,
             sig: self.intern_func_type(sig), // FuncType interning (#922)
             handle: u32::MAX, // placeholder; parse_block points it at the injected i32.const 0
-            args,
-        }
+            args: args.into(),
+        }))
     }
 
     fn parse_inst(&mut self, names: &HashMap<String, u32>) -> Result<Inst, ParseError> {
@@ -2764,7 +2760,10 @@ impl<'a> Parser<'a> {
             let func = u32::try_from(n)
                 .map_err(|_| ParseError(format!("function index out of range: {n}")))?;
             let args = self.parse_value_list(names)?;
-            return Ok(Inst::Call { func, args });
+            return Ok(Inst::Call {
+                func,
+                args: args.into(),
+            });
         }
         // §7 capability / symbolic calls:
         //   manifest:    `call.import <idx>[.<opname> | op <n>] (args)` — sig from the decl;
@@ -2802,12 +2801,12 @@ impl<'a> Parser<'a> {
                     });
                 let handle = self.value(names)?;
                 let args = self.parse_value_list(names)?;
-                return Ok(Inst::CallSym {
+                return Ok(Inst::CallSym(Box::new(temen_ir::CallSym {
                     import: idx as u32,
                     sig: t, // interned index (FuncType interning, #922) — same as the import shape's
                     handle,
-                    args,
-                });
+                    args: args.into(),
+                })));
             }
             if op == "call.sym" {
                 let import = self.parse_u32()?;
@@ -2815,12 +2814,12 @@ impl<'a> Parser<'a> {
                 let sig = self.intern_func_type(sig); // FuncType interning (#922)
                 let handle = self.value(names)?;
                 let args = self.parse_value_list(names)?;
-                return Ok(Inst::CallSym {
+                return Ok(Inst::CallSym(Box::new(temen_ir::CallSym {
                     import,
                     sig,
                     handle,
-                    args,
-                });
+                    args: args.into(),
+                })));
             }
             let import = self.parse_u32()?;
             // Optional op selector: `.name` (resolved through the grouped import's
@@ -2838,12 +2837,12 @@ impl<'a> Parser<'a> {
             let sig = self.import_op_sig(import, opidx)?;
             let sig = self.intern_func_type(sig); // FuncType interning (#922)
             let args = self.parse_value_list(names)?;
-            return Ok(Inst::CallImport {
+            return Ok(Inst::CallImport(Box::new(temen_ir::CallImport {
                 import,
                 op: opidx,
                 sig,
-                args,
-            });
+                args: args.into(),
+            })));
         }
         // Dynamic-mode dispatch by type-section reference (§3.5):
         // `call.import.dyn <ty>[.<opname> | op <n>] v<handle> (args)`.
@@ -2863,13 +2862,13 @@ impl<'a> Parser<'a> {
             let sig = self.intern_func_type(sig); // FuncType interning (#922)
             let handle = self.value(names)?;
             let args = self.parse_value_list(names)?;
-            return Ok(Inst::CallImportDyn {
+            return Ok(Inst::CallImportDyn(Box::new(temen_ir::CallImportDyn {
                 ty,
                 op: opidx,
                 sig,
                 handle,
-                args,
-            });
+                args: args.into(),
+            })));
         }
         if op == "export.handle" {
             let export = self.parse_u32()?;
@@ -2894,7 +2893,7 @@ impl<'a> Parser<'a> {
         // `name` (#2203). Yields an `i32` funcref; `link` rewrites it to `ref.func`.
         if op == "ref.sym" {
             let name = self.parse_str()?;
-            return Ok(Inst::RefSym { name });
+            return Ok(Inst::RefSym { name: name.into() });
         }
         // Link-form data addresses: `data.sym "<name>" <addend>` (a cross-unit data symbol) and
         // `data.self <offset>` (this unit's own data). Both yield an `i64` address; `link` rewrites
@@ -2905,7 +2904,11 @@ impl<'a> Parser<'a> {
             let tls = self.eat_ident("tls")?;
             let name = self.parse_str()?; // raw bytes (Copy-clone friendly Inst field)
             let addend = self.parse_int()?;
-            return Ok(Inst::DataSym { name, addend, tls });
+            return Ok(Inst::DataSym(Box::new(temen_ir::DataSym {
+                name: name.into(),
+                addend,
+                tls,
+            })));
         }
         if op == "data.self" {
             let tls = self.eat_ident("tls")?;
@@ -3032,7 +3035,11 @@ impl<'a> Parser<'a> {
             let idx = self.value(names)?;
             let args = self.parse_value_list(names)?;
             let ty = self.intern_func_type(FuncType { params, results }); // FuncType interning (#922)
-            return Ok(Inst::CallIndirect { ty, idx, args });
+            return Ok(Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
+                ty,
+                idx,
+                args: args.into(),
+            })));
         }
         if op == "svc.poll" || op == "svc.wait" {
             // §3.6 sugar over `call.cap CAP_SELF_TYPE_ID 9|10 () -> (i64) v<h> ()` — the
@@ -3042,13 +3049,13 @@ impl<'a> Parser<'a> {
                 params: vec![],
                 results: vec![ValType::I64],
             }); // FuncType interning (#922)
-            return Ok(Inst::CapCall {
+            return Ok(Inst::CapCall(Box::new(temen_ir::CapCall {
                 type_id: temen_ir::CAP_SELF_TYPE_ID,
                 op: if op == "svc.poll" { 9 } else { 10 },
                 sig,
                 handle,
-                args: vec![],
-            });
+                args: vec![].into(),
+            })));
         }
         if op == "call.cap" {
             let type_id = u32::try_from(self.parse_int()?)
@@ -3061,13 +3068,13 @@ impl<'a> Parser<'a> {
             let handle = self.value(names)?;
             let args = self.parse_value_list(names)?;
             let sig = self.intern_func_type(FuncType { params, results }); // FuncType interning (#922)
-            return Ok(Inst::CapCall {
+            return Ok(Inst::CapCall(Box::new(temen_ir::CapCall {
                 type_id,
                 op: op_index,
                 sig,
                 handle,
-                args,
-            });
+                args: args.into(),
+            })));
         }
         if let Some(cv) = ConvOp::from_name(&op) {
             return Ok(Inst::Convert {
@@ -3299,7 +3306,11 @@ impl<'a> Parser<'a> {
             let lanes = self.parse_byte16()?;
             let a = self.value(names)?;
             let b = self.value(names)?;
-            return Ok(Inst::Shuffle { lanes, a, b });
+            return Ok(Inst::Shuffle {
+                lanes: Box::new(lanes),
+                a,
+                b,
+            });
         }
         if op == "i8x16.swizzle" {
             let a = self.value(names)?;
@@ -3941,7 +3952,7 @@ block 0 (v0: i32) {
         let imports: Vec<_> = insts
             .iter()
             .filter_map(|i| match i {
-                Inst::CallImport { import, .. } => Some(*import),
+                Inst::CallImport(c) => Some(c.import),
                 _ => None,
             })
             .collect();
@@ -4127,12 +4138,12 @@ block 0 (v0: i32) {
         .expect("resolve");
         assert!(r.imports.is_empty());
         let insts = &r.funcs[0].blocks[0].insts;
-        assert!(!insts.iter().any(|i| matches!(i, Inst::CallSym { .. })));
+        assert!(!insts.iter().any(|i| matches!(i, Inst::CallSym(_))));
         // write → call.cap 0 1, exit → call.cap 1 0.
         let caps: Vec<_> = insts
             .iter()
             .filter_map(|i| match i {
-                Inst::CapCall { type_id, op, .. } => Some((*type_id, *op)),
+                Inst::CapCall(c) => Some((c.type_id, c.op)),
                 _ => None,
             })
             .collect();
@@ -4172,7 +4183,7 @@ block 0 (v0: i32) {
             .insts
             .iter()
             .filter_map(|i| match i {
-                Inst::CallSym { import, .. } => Some(*import),
+                Inst::CallSym(c) => Some(c.import),
                 _ => None,
             })
             .collect();
@@ -4501,9 +4512,7 @@ block 0 () {
             .insts
             .iter()
             .filter_map(|i| match i {
-                Inst::CapCall { type_id, op, .. } if *type_id == temen_ir::CAP_SELF_TYPE_ID => {
-                    Some(*op)
-                }
+                Inst::CapCall(c) if c.type_id == temen_ir::CAP_SELF_TYPE_ID => Some(c.op),
                 _ => None,
             })
             .collect();

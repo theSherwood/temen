@@ -303,7 +303,7 @@ fn gc_cut_rolls_the_allocating_loop() {
         for i in &b.insts {
             match i {
                 Inst::Call { .. } => calls += 1,
-                Inst::CallIndirect { .. } => indirect += 1,
+                Inst::CallIndirect(_) => indirect += 1,
                 _ => {}
             }
         }
@@ -404,7 +404,7 @@ fn wrap_with_heap(residual: &Module, entry: u32, w: &[u8], x_addr: u64) -> (Modu
                 Inst::ConstI64(x_addr as i64), // v3
                 Inst::Call {
                     func: entry,
-                    args: vec![0, 1, 2],
+                    args: vec![0, 1, 2].into(),
                 }, // void
                 Inst::Load {
                     op: LoadOp::I64,

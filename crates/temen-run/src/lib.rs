@@ -960,10 +960,7 @@ fn invoke_refuses(funcs: &[temen_ir::Func]) -> bool {
                 b.insts.iter().any(|i| {
                     matches!(
                         i,
-                        temen_ir::Inst::CapCall {
-                            type_id: temen_ir::cap_id::INSTANTIATOR,
-                            ..
-                        }
+                        temen_ir::Inst::CapCall(c) if c.type_id == temen_ir::cap_id::INSTANTIATOR
                     )
                 })
             })
@@ -6280,7 +6277,7 @@ fn module_nests(m: &temen_ir::Module) -> bool {
         f.blocks.iter().any(|b| {
             b.insts
                 .iter()
-                .any(|i| matches!(i, temen_ir::Inst::CapCall { type_id: 6, .. }))
+                .any(|i| matches!(i, temen_ir::Inst::CapCall(c) if c.type_id == 6))
         })
     })
 }
@@ -6293,11 +6290,7 @@ fn spawns_detached(m: &Module) -> bool {
             b.insts.iter().any(|i| {
                 matches!(
                     i,
-                    temen_ir::Inst::CapCall {
-                        type_id: 6,
-                        op: 17,
-                        ..
-                    }
+                    temen_ir::Inst::CapCall(c) if c.type_id == 6 && c.op == 17
                 )
             })
         })
@@ -6312,11 +6305,7 @@ fn has_service_point(m: &Module) -> bool {
             b.insts.iter().any(|i| {
                 matches!(
                     i,
-                    temen_ir::Inst::CapCall {
-                        type_id: temen_ir::CAP_SELF_TYPE_ID,
-                        op: 9 | 10,
-                        ..
-                    }
+                    temen_ir::Inst::CapCall(c) if c.type_id == temen_ir::CAP_SELF_TYPE_ID && matches!(c.op, 9 | 10)
                 )
             })
         })
@@ -6341,11 +6330,7 @@ fn module_serves(m: &Module) -> bool {
                 b.insts.iter().any(|i| {
                     matches!(
                         i,
-                        temen_ir::Inst::CapCall {
-                            type_id: 6,
-                            op: 14,
-                            ..
-                        }
+                        temen_ir::Inst::CapCall(c) if c.type_id == 6 && c.op == 14
                     )
                 })
             })

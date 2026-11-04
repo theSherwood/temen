@@ -320,20 +320,23 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         Inst::AtomicFence { .. } => row(F, F),
 
         // ---- Calls. Direct/indirect calls lower on both JITs. -----------------------------------
-        Inst::Call { .. } | Inst::CallIndirect { .. } => row(F, F),
+        Inst::Call { .. } | Inst::CallIndirect(_) => row(F, F),
         // `call.cap` is a **family**, not one op: generic host caps lower on both interpreters and
         // Cranelift's cap-call thunk, but the process/serve/fork self-namespace ops (encoded as
         // `call.cap` sub-ops) have their own, narrower parity — the fork substrate runs only on the
         // tree-walk oracle today. Classify by `(type_id, op)`. (INVARIANTS.md #9; FORK.md §8.5;
         // ISSUES.md I36.)
-        Inst::CapCall { type_id, op, .. } => parity_capcall(*type_id, *op),
+        Inst::CapCall(c) => {
+            let temen_ir::CapCall { type_id, op, .. } = &**c;
+            parity_capcall(*type_id, *op)
+        },
         // Other host-boundary calls / link forms: Cranelift emits a thunk (or `link` rewrites the
         // data-sym to an `i64.const` and the ref-sym to a `ref.func`); the wasm-JIT leaf-folds
         // every cap op underneath.
-        Inst::CallImport { .. }
-        | Inst::CallImportDyn { .. }
-        | Inst::CallSym { .. }
-        | Inst::DataSym { .. }
+        Inst::CallImport(_)
+        | Inst::CallImportDyn(_)
+        | Inst::CallSym(_)
+        | Inst::DataSym(_)
         | Inst::DataSelf { .. }
         | Inst::DataTop
         | Inst::RefSym { .. }

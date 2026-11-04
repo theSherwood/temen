@@ -8321,18 +8321,10 @@ int f(void) {
     assert!(
         module_has_inst(&m, |i| matches!(
             i,
-            temen_ir::Inst::CapCall {
-                type_id: temen_ir::CAP_SELF_TYPE_ID,
-                op: 0,
-                ..
-            }
+            temen_ir::Inst::CapCall(c) if c.type_id == temen_ir::CAP_SELF_TYPE_ID && c.op == 0
         )) && module_has_inst(&m, |i| matches!(
             i,
-            temen_ir::Inst::CapCall {
-                type_id: temen_ir::CAP_SELF_TYPE_ID,
-                op: 1,
-                ..
-            }
+            temen_ir::Inst::CapCall(c) if c.type_id == temen_ir::CAP_SELF_TYPE_ID && c.op == 1
         )),
         "expected self.count + self.get (as call.cap CAP_SELF 0/1)"
     );
@@ -8457,11 +8449,7 @@ int main(void) { return (__vm_cap(5) == __vm_blocking_handle()) ? 7 : 0; }
             .iter()
             .filter(|i| matches!(
                 i,
-                temen_ir::Inst::CapCall {
-                    type_id: temen_ir::CAP_SELF_TYPE_ID,
-                    op: 2,
-                    ..
-                }
+                temen_ir::Inst::CapCall(c) if c.type_id == temen_ir::CAP_SELF_TYPE_ID && c.op == 2
             ))
             .count(),
         0,
@@ -8533,11 +8521,7 @@ int main(void) {
             .iter()
             .filter(|i| matches!(
                 i,
-                temen_ir::Inst::CapCall {
-                    type_id: temen_ir::CAP_SELF_TYPE_ID,
-                    op: 2,
-                    ..
-                }
+                temen_ir::Inst::CapCall(c) if c.type_id == temen_ir::CAP_SELF_TYPE_ID && c.op == 2
             ))
             .count(),
         0,
@@ -8648,11 +8632,7 @@ fn vm_jit_threads_demo() {
             .iter()
             .filter(|i| matches!(
                 i,
-                temen_ir::Inst::CapCall {
-                    type_id: temen_ir::CAP_SELF_TYPE_ID,
-                    op: 2,
-                    ..
-                }
+                temen_ir::Inst::CapCall(c) if c.type_id == temen_ir::CAP_SELF_TYPE_ID && c.op == 2
             ))
             .count(),
         0,
@@ -8743,11 +8723,7 @@ int main(void) {
             .iter()
             .filter(|i| matches!(
                 i,
-                temen_ir::Inst::CapCall {
-                    type_id: temen_ir::CAP_SELF_TYPE_ID,
-                    op: 2,
-                    ..
-                }
+                temen_ir::Inst::CapCall(c) if c.type_id == temen_ir::CAP_SELF_TYPE_ID && c.op == 2
             ))
             .count(),
         0,

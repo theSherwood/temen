@@ -32,6 +32,7 @@
 //! embedder scale its fuel limit. `debug_info` is dropped (its `(func, block, inst)` positions
 //! would be stale after insertion).
 
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -295,13 +296,13 @@ fn instrument_func(
                         results: vec![],
                     },
                 );
-                insts.push(Inst::CapCall {
+                insts.push(Inst::CapCall(Box::new(temen_ir::CapCall {
                     type_id: spec.type_id,
                     op,
                     sig,
                     handle,
-                    args,
-                });
+                    args: args.into(),
+                })));
                 stats.hooked_ops += 1;
                 stats.inserted_insts += insts.len() - before;
             }
@@ -398,7 +399,7 @@ mod tests {
         let caps = out.funcs[0].blocks[0]
             .insts
             .iter()
-            .filter(|i| matches!(i, Inst::CapCall { .. }))
+            .filter(|i| matches!(i, Inst::CapCall(_)))
             .count();
         assert_eq!(caps, 3);
         temen_verify::verify_module(&out).expect("instrumented module re-verifies");
@@ -467,9 +468,9 @@ mod tests {
                     // Calls clobber conservatively; the callee's own ops carry the hooks.
                     // (`self.resolve`/`label` are now `call.cap CAP_SELF`, covered by `CapCall`.)
                     | Inst::Call { .. }
-                    | Inst::CallIndirect { .. }
-                    | Inst::CallImport { .. }
-                    | Inst::CapCall { .. }
+                    | Inst::CallIndirect(_)
+                    | Inst::CallImport(_)
+                    | Inst::CapCall(_)
                     // Stack switches clobber conservatively, like calls.
                     | Inst::ContResume { .. }
                     | Inst::Suspend { .. }
@@ -569,13 +570,13 @@ mod tests {
             },
             // `self.resolve`/`label` (guest-memory-touching reflection) are now `call.cap
             // CAP_SELF` — represented by the generic `CapCall` in the excluded list.
-            Inst::CapCall {
+            Inst::CapCall(Box::new(temen_ir::CapCall {
                 type_id: temen_ir::CAP_SELF_TYPE_ID,
                 op: 2,
                 sig: 0, // #922: only `effects()` classification is tested here, sig is never resolved
                 handle: 0,
-                args: vec![1, 2],
-            },
+                args: vec![1, 2].into(),
+            })),
         ]
     }
 }

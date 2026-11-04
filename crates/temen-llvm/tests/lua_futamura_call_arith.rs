@@ -308,7 +308,7 @@ fn call_result_feeds_arithmetic() {
             params: vec![ValType::I64; 3],
             insts: vec![Inst::Call {
                 func: e,
-                args: vec![],
+                args: vec![].into(),
             }],
             term: Terminator::Return(vec![]),
         }],

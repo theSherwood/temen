@@ -45,12 +45,12 @@ fn calls_import(slot: u32) -> Func {
             parent: 0,
             captures: vec![],
             params: vec![ValType::I64],
-            insts: vec![Inst::CallImport {
+            insts: vec![Inst::CallImport(Box::new(temen_ir::CallImport {
                 import: slot,
                 op: 0,
                 sig: 0,
-                args: vec![0],
-            }],
+                args: vec![0].into(),
+            }))],
             term: Terminator::Return(vec![1]),
         }],
     }
@@ -145,12 +145,12 @@ fn a_capability_reached_through_a_library_survives_and_still_dispatches() {
                 parent: 0,
                 captures: vec![],
                 params: vec![ValType::I64],
-                insts: vec![Inst::CallSym {
+                insts: vec![Inst::CallSym(Box::new(temen_ir::CallSym {
                     import: 0,
                     sig: 0,
                     handle: 0,
-                    args: vec![0],
-                }],
+                    args: vec![0].into(),
+                }))],
                 term: Terminator::Return(vec![1]),
             }],
         }],
@@ -177,7 +177,8 @@ fn a_capability_reached_through_a_library_survives_and_still_dispatches() {
     for f in &linked.funcs {
         for b in &f.blocks {
             for inst in &b.insts {
-                if let Inst::CallImport { import, .. } = inst {
+                if let Inst::CallImport(c) = inst {
+                    let temen_ir::CallImport { import, .. } = &**c;
                     reached.push(linked.imports[*import as usize].name.clone());
                 }
             }

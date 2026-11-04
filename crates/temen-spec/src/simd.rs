@@ -1174,7 +1174,7 @@ pub fn simd_rows() -> Vec<SimdRow> {
             nan_lanes: None,
             encoding: enc(0x0C),
             build: Box::new(move |v| Inst::Shuffle {
-                lanes,
+                lanes: Box::new(lanes),
                 a: v[0],
                 b: v[1],
             }),

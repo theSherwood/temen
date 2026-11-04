@@ -226,7 +226,7 @@ pub fn struct_rows() -> Vec<StructRow> {
             vec![],
             Inst::Call {
                 func: 1,
-                args: vec![],
+                args: vec![].into(),
             },
             false,
             vec![callee_void.clone()],
@@ -235,11 +235,11 @@ pub fn struct_rows() -> Vec<StructRow> {
     rows.push({
         let mut m = inst_module(
             vec![i32t],
-            Inst::CallIndirect {
+            Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                 ty: 0, // #922: interned type index into the module type section
                 idx: 0,
-                args: vec![],
-            },
+                args: vec![].into(),
+            })),
             false,
             vec![],
         );
@@ -264,13 +264,13 @@ pub fn struct_rows() -> Vec<StructRow> {
     rows.push({
         let mut m = inst_module(
             vec![i32t],
-            Inst::CapCall {
+            Inst::CapCall(Box::new(temen_ir::CapCall {
                 type_id: 0,
                 op: 0,
                 sig: 0, // #922: interned type index into the module type section
                 handle: 0,
-                args: vec![],
-            },
+                args: vec![].into(),
+            })),
             false,
             vec![],
         );
@@ -291,12 +291,12 @@ pub fn struct_rows() -> Vec<StructRow> {
     rows.push({
         let mut m = inst_module(
             vec![i32t],
-            Inst::CallImport {
+            Inst::CallImport(Box::new(temen_ir::CallImport {
                 import: 0,
                 op: 0,
                 sig: 0, // #922: interned type index into the module type section
-                args: vec![],
-            },
+                args: vec![].into(),
+            })),
             false,
             vec![],
         );
@@ -315,12 +315,12 @@ pub fn struct_rows() -> Vec<StructRow> {
     rows.push({
         let mut m = inst_module(
             vec![i32t],
-            Inst::CallSym {
+            Inst::CallSym(Box::new(temen_ir::CallSym {
                 import: 0,
                 sig: 0, // #922: interned type index into the module type section
                 handle: 0,
-                args: vec![],
-            },
+                args: vec![].into(),
+            })),
             false,
             vec![],
         );
@@ -360,11 +360,11 @@ pub fn struct_rows() -> Vec<StructRow> {
         is_term: false,
         module: inst_module(
             vec![],
-            Inst::DataSym {
-                name: b"g".to_vec(),
+            Inst::DataSym(Box::new(temen_ir::DataSym {
+                name: b"g".to_vec().into(),
                 addend: 4,
                 tls: false,
-            },
+            })),
             false,
             vec![],
         ),
@@ -392,11 +392,11 @@ pub fn struct_rows() -> Vec<StructRow> {
         is_term: false,
         module: inst_module(
             vec![],
-            Inst::DataSym {
-                name: b"t".to_vec(),
+            Inst::DataSym(Box::new(temen_ir::DataSym {
+                name: b"t".to_vec().into(),
                 addend: 0,
                 tls: true,
-            },
+            })),
             false,
             vec![],
         ),
@@ -417,7 +417,7 @@ pub fn struct_rows() -> Vec<StructRow> {
         module: inst_module(
             vec![],
             Inst::RefSym {
-                name: b"f".to_vec(),
+                name: b"f".to_vec().into(),
             },
             false,
             vec![],
@@ -788,13 +788,13 @@ pub fn row_home(inst: &Inst) -> RowHome {
         | Inst::V128Load { .. }
         | Inst::V128Store { .. }
         | Inst::Call { .. }
-        | Inst::CallIndirect { .. }
+        | Inst::CallIndirect(_)
         | Inst::RefFunc { .. }
-        | Inst::CapCall { .. }
-        | Inst::CallImport { .. }
-        | Inst::CallImportDyn { .. }
-        | Inst::CallSym { .. }
-        | Inst::DataSym { .. }
+        | Inst::CapCall(_)
+        | Inst::CallImport(_)
+        | Inst::CallImportDyn(_)
+        | Inst::CallSym(_)
+        | Inst::DataSym(_)
         | Inst::DataSelf { .. }
         | Inst::DataTop
         | Inst::RefSym { .. }

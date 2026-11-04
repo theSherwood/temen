@@ -961,7 +961,8 @@ fn block_value_types(
             // A funcref is a plain `i32` (the function index, §3c) — a bare `i32.const`.
             Inst::RefFunc { .. } => tys.push(ValType::I32),
             // Indirect call: results come from the call site's interned signature (#922).
-            Inst::CallIndirect { ty, .. } => {
+            Inst::CallIndirect(c) => {
+                let temen_ir::CallIndirect { ty, .. } = &**c;
                 tys.extend(sig_of(&m.types, *ty).results.iter().copied())
             }
             // ---- §17 SIMD (v128): the in-subset core lane ops (see the opcode helpers above). Each
@@ -1331,15 +1332,10 @@ fn func_uses_page_ops(f: &Func) -> bool {
         b.insts.iter().any(|i| {
             matches!(
                 i,
-                Inst::CapCall {
-                    type_id: cap_id::ADDRESS_SPACE,
-                    op: 1..=2,
-                    ..
-                } | Inst::CapCall {
-                    type_id: cap_id::SHARED_REGION,
-                    op: 0..=1,
-                    ..
-                }
+                Inst::CapCall(c) if matches!(
+                    (c.type_id, c.op),
+                    (cap_id::ADDRESS_SPACE, 1..=2) | (cap_id::SHARED_REGION, 0..=1)
+                )
             )
         })
     })
@@ -1401,14 +1397,7 @@ fn module_uses_gc_roots(m: &Module) -> bool {
 fn func_uses_region_ops(f: &Func) -> bool {
     f.blocks.iter().any(|b| {
         b.insts.iter().any(|i| {
-            matches!(
-                i,
-                Inst::CapCall {
-                    type_id: cap_id::SHARED_REGION,
-                    op: 0..=1,
-                    ..
-                }
-            )
+            matches!(i, Inst::CapCall(c) if matches!((c.type_id, c.op), (cap_id::SHARED_REGION, 0..=1)))
         })
     })
 }
@@ -1424,14 +1413,7 @@ pub fn module_uses_addr_space_page_ops(m: &Module) -> bool {
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|b| {
             b.insts.iter().any(|i| {
-                matches!(
-                    i,
-                    Inst::CapCall {
-                        type_id: cap_id::ADDRESS_SPACE,
-                        op: 0..=2,
-                        ..
-                    }
-                )
+                matches!(i, Inst::CapCall(c) if matches!((c.type_id, c.op), (cap_id::ADDRESS_SPACE, 0..=2)))
             })
         })
     })
@@ -1556,9 +1538,7 @@ fn func_callees(f: &Func) -> Vec<u32> {
 /// through the identity funcref table — an edge direct-call reachability can't see.
 fn func_uses_indirect(f: &Func) -> bool {
     f.blocks.iter().any(|b| {
-        b.insts
-            .iter()
-            .any(|i| matches!(i, Inst::CallIndirect { .. }))
+        b.insts.iter().any(|i| matches!(i, Inst::CallIndirect(_)))
             || matches!(b.term, Terminator::ReturnCallIndirect { .. })
     })
 }
@@ -1668,7 +1648,7 @@ fn starts_or_joins(f: &Func) -> bool {
     f.blocks
         .iter()
         .flat_map(|b| &b.insts)
-        .any(|i| matches!(i, Inst::CapCall { type_id, .. } if *type_id == cap_id::INSTANTIATOR))
+        .any(|i| matches!(i, Inst::CapCall(c) if c.type_id == cap_id::INSTANTIATOR))
 }
 
 /// #744 — whether `f` serves calls or makes one to a server: `svc.wait` parks its task until a
@@ -1679,10 +1659,10 @@ fn starts_or_joins(f: &Func) -> bool {
 /// [`cap_id::GUEST_IMPL_BASE`]; a guest that serves a built-in shape still falls to the bounce's
 /// refusal, as before.
 fn serves_or_calls_a_server(f: &Func) -> bool {
-    f.blocks.iter().flat_map(|b| &b.insts).any(|i| match *i {
-        Inst::CapCall { type_id, op, .. } => {
-            temen_ir::durable_abi::is_serve_op(type_id, op)
-                || (cap_id::GUEST_IMPL_BASE..temen_ir::CAP_DYN_TYPE_ID).contains(&type_id)
+    f.blocks.iter().flat_map(|b| &b.insts).any(|i| match i {
+        Inst::CapCall(c) => {
+            temen_ir::durable_abi::is_serve_op(c.type_id, c.op)
+                || (cap_id::GUEST_IMPL_BASE..temen_ir::CAP_DYN_TYPE_ID).contains(&c.type_id)
         }
         _ => false,
     })
@@ -1744,10 +1724,10 @@ fn interp_leaf(f: &Func) -> bool {
                         | Inst::V128Store { .. }
                         // calls (a true leaf only — transitive tiers are a later refinement),
                         | Inst::Call { .. }
-                        | Inst::CallIndirect { .. }
+                        | Inst::CallIndirect(_)
                         // host/capability ops (no powerbox in the cross-tier callback),
-                        | Inst::CapCall { .. }
-                        | Inst::CallImport { .. }
+                        | Inst::CapCall(_)
+                        | Inst::CallImport(_)
                         | Inst::ImportAttach { .. }
                         // and `gc.roots` (#1546): it would run, and answer with the emitted
                         // caller's frame unscanned — see [`bounce_serviceable`]'s `gc.roots` seed.
@@ -2209,14 +2189,14 @@ pub fn outline_cap_calls(m: &mut Module) {
     for f in &mut m.funcs {
         for b in &mut f.blocks {
             for inst in &mut b.insts {
-                if let Inst::CapCall {
-                    type_id,
-                    op,
-                    sig,
-                    handle,
-                    args,
-                } = inst
-                {
+                if let Inst::CapCall(c) = inst {
+                    let temen_ir::CapCall {
+                        type_id,
+                        op,
+                        sig,
+                        handle,
+                        args,
+                    } = &**c;
                     let g = base + wrappers.len() as u32;
                     let ft = sig_of(&types, *sig); // #922: resolve interned call type index
                                                    // Wrapper signature: (handle: i32, ...sig.params) -> sig.results.
@@ -2233,13 +2213,13 @@ pub fn outline_cap_calls(m: &mut Module) {
                         parent: 0,
                         captures: vec![],
                         params: params.clone(),
-                        insts: vec![Inst::CapCall {
+                        insts: vec![Inst::CapCall(Box::new(temen_ir::CapCall {
                             type_id: *type_id,
                             op: *op,
                             sig: *sig,
                             handle: 0,
-                            args: wrapper_args,
-                        }],
+                            args: wrapper_args.into(),
+                        }))],
                         term: Terminator::Return(ret),
                     };
                     wrappers.push(Func {
@@ -2253,15 +2233,15 @@ pub fn outline_cap_calls(m: &mut Module) {
                     call_args.extend(args.iter().copied());
                     *inst = Inst::Call {
                         func: g,
-                        args: call_args,
+                        args: call_args.into(),
                     };
-                } else if let Inst::CallImport {
-                    import,
-                    op,
-                    sig,
-                    args,
-                } = inst
-                {
+                } else if let Inst::CallImport(c) = inst {
+                    let temen_ir::CallImport {
+                        import,
+                        op,
+                        sig,
+                        args,
+                    } = &**c;
                     let g = base + wrappers.len() as u32;
                     let ft = sig_of(&types, *sig); // #922: resolve interned call type index
                                                    // Wrapper shape (v8): (...sig.params) -> sig.results — no handle operand;
@@ -2275,12 +2255,12 @@ pub fn outline_cap_calls(m: &mut Module) {
                         parent: 0,
                         captures: vec![],
                         params: params.clone(),
-                        insts: vec![Inst::CallImport {
+                        insts: vec![Inst::CallImport(Box::new(temen_ir::CallImport {
                             import: *import,
                             op: *op,
                             sig: *sig,
-                            args: wrapper_args,
-                        }],
+                            args: wrapper_args.into(),
+                        }))],
                         term: Terminator::Return(ret),
                     };
                     wrappers.push(Func {
@@ -2293,13 +2273,13 @@ pub fn outline_cap_calls(m: &mut Module) {
                         func: g,
                         args: call_args,
                     };
-                } else if let Inst::CallSym {
-                    import,
-                    sig,
-                    handle,
-                    args,
-                } = inst
-                {
+                } else if let Inst::CallSym(c) = inst {
+                    let temen_ir::CallSym {
+                        import,
+                        sig,
+                        handle,
+                        args,
+                    } = &**c;
                     let g = base + wrappers.len() as u32;
                     let ft = sig_of(&types, *sig); // #922: resolve interned call type index
                                                    // §7/§22 symbolic call: same shape as the old handle-carrying form —
@@ -2316,12 +2296,12 @@ pub fn outline_cap_calls(m: &mut Module) {
                         parent: 0,
                         captures: vec![],
                         params: params.clone(),
-                        insts: vec![Inst::CallSym {
+                        insts: vec![Inst::CallSym(Box::new(temen_ir::CallSym {
                             import: *import,
                             sig: *sig,
                             handle: 0,
-                            args: wrapper_args,
-                        }],
+                            args: wrapper_args.into(),
+                        }))],
                         term: Terminator::Return(ret),
                     };
                     wrappers.push(Func {
@@ -2334,7 +2314,7 @@ pub fn outline_cap_calls(m: &mut Module) {
                     call_args.extend(args.iter().copied());
                     *inst = Inst::Call {
                         func: g,
-                        args: call_args,
+                        args: call_args.into(),
                     };
                 } else if let Some((operands, op, FuncType { params, results })) =
                     scheduler_op(inst)
@@ -2357,7 +2337,7 @@ pub fn outline_cap_calls(m: &mut Module) {
                     });
                     *inst = Inst::Call {
                         func: g,
-                        args: operands,
+                        args: operands.into(),
                     };
                 }
             }
@@ -3368,7 +3348,7 @@ fn emit_module(
     for &i in emitted {
         for b in &m.funcs[i].blocks {
             for inst in &b.insts {
-                if matches!(inst, Inst::CallImport { .. } | Inst::ImportAttach { .. }) {
+                if matches!(inst, Inst::CallImport(_) | Inst::ImportAttach { .. }) {
                     return Err(Error::Unsupported("import op in an emitted function"));
                 }
             }
@@ -3426,7 +3406,10 @@ fn emit_module(
                 .insts
                 .iter()
                 .filter_map(|inst| match inst {
-                    Inst::CallIndirect { ty, .. } => Some(ty),
+                    Inst::CallIndirect(c) => {
+                        let temen_ir::CallIndirect { ty, .. } = &**c;
+                        Some(ty)
+                    }
                     _ => None,
                 })
                 .chain(match &b.term {
@@ -5075,10 +5058,10 @@ pub fn compile_split_fn(
             for inst in &b.insts {
                 if matches!(
                     inst,
-                    Inst::CallIndirect { .. }
-                        | Inst::CallImport { .. }
-                        | Inst::CapCall { .. }
-                        | Inst::CallSym { .. }
+                    Inst::CallIndirect(_)
+                        | Inst::CallImport(_)
+                        | Inst::CapCall(_)
+                        | Inst::CallSym(_)
                         | Inst::RefFunc { .. }
                 ) {
                     return Err(Error::Unsupported("split-fn: only direct calls"));
@@ -6937,7 +6920,8 @@ fn emit_block_body(
             // `call.dyn` the declared signature: wasm's built-in signature check is the type-id
             // check (a mismatch traps `IndirectCallType`); a null padding slot traps too (an empty
             // interpreter slot). No fuel debit here — the callee debits on entry to its own loop.
-            Inst::CallIndirect { ty, idx, args } => {
+            Inst::CallIndirect(c) => {
+                let temen_ir::CallIndirect { ty, idx, args } = &**c;
                 let ft = sig_of(&m.types, *ty); // #922: resolve interned call type index
                 let n_results = ft.results.len();
                 // #1627: any slot may hold a bounce shim into a collector (see `reaches`).
@@ -7179,7 +7163,7 @@ fn emit_block_body(
                 get(code, cx, *a);
                 get(code, cx, *b);
                 emit_simd(code, 13); // i8x16.shuffle
-                code.extend_from_slice(lanes); // 16 lane-index immediates
+                code.extend_from_slice(&lanes[..]); // 16 lane-index immediates
                 set_result(cx, code, k, &mut next_val);
             }
             Inst::Swizzle { a, b } => {

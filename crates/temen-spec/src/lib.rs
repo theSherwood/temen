@@ -1809,16 +1809,16 @@ pub fn coverage(inst: &Inst) -> Class {
         | Inst::Swizzle { .. } => Class::Pure,
 
         // Slice 7 — typing/encoding rows only (semantics out of scope, SPEC.md).
-        Inst::Call { .. } | Inst::CallIndirect { .. } | Inst::RefFunc { .. } => Class::Control,
+        Inst::Call { .. } | Inst::CallIndirect(_) | Inst::RefFunc { .. } => Class::Control,
         Inst::SetJmp { .. } | Inst::LongJmp { .. } | Inst::GcRoots { .. } => Class::Control,
         Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } | Inst::DurableShadowBase => Class::Control,
-        Inst::CapCall { .. }
-        | Inst::CallImport { .. }
-        | Inst::CallImportDyn { .. }
-        | Inst::CallSym { .. }
+        Inst::CapCall(_)
+        | Inst::CallImport(_)
+        | Inst::CallImportDyn(_)
+        | Inst::CallSym(_)
         // Link forms: resolved by the linker, never executed by the spec — typing + encoding
         // rows in `structural` (object dialect), no `eval`.
-        | Inst::DataSym { .. }
+        | Inst::DataSym(_)
         | Inst::DataSelf { .. }
         | Inst::DataTop
         | Inst::RefSym { .. }

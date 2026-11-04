@@ -17,9 +17,12 @@ fn lowered(name: &str) -> Vec<(u32, u32, usize)> {
         .iter()
         .flat_map(|f| f.blocks.iter().flat_map(|b| b.insts.iter()))
         .filter_map(|i| match i {
-            Inst::CapCall {
-                type_id, op, args, ..
-            } => Some((*type_id, *op, args.len())),
+            Inst::CapCall(c) => {
+                let temen_ir::CapCall {
+                    type_id, op, args, ..
+                } = &**c;
+                Some((*type_id, *op, args.len()))
+            }
             _ => None,
         })
         .collect()

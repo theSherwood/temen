@@ -171,7 +171,7 @@ fn with_readback(residual: &Module, read_addr: u64) -> (Module, u32) {
             Inst::ConstI64(read_addr as i64), // v3
             Inst::Call {
                 func: 0,
-                args: vec![0, 1, 2],
+                args: vec![0, 1, 2].into(),
             }, // void
             Inst::Load {
                 op: LoadOp::I64,
@@ -297,7 +297,7 @@ fn dynamic_counter_rolls_the_real_luav_execute_loop() {
             match i {
                 Inst::Load { .. } => loads += 1,
                 Inst::Call { .. } => calls += 1,
-                Inst::CallIndirect { .. } => indirect += 1,
+                Inst::CallIndirect(_) => indirect += 1,
                 _ => {}
             }
         }

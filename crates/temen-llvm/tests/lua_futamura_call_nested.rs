@@ -416,7 +416,7 @@ fn nested_two_frame_call_stack() {
             params: vec![ValType::I64, ValType::I64, ValType::I64],
             insts: vec![Inst::Call {
                 func: entry,
-                args: vec![],
+                args: vec![].into(),
             }],
             term: Terminator::Return(vec![]),
         }],

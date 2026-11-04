@@ -1549,7 +1549,7 @@ fn build_spawn_shim(wts: u32) -> Func {
     // call wasi_thread_start(tid, start_arg) — a 0-result call (appends no value).
     insts.push(Inst::Call {
         func: wts,
-        args: vec![tid, start_arg],
+        args: vec![tid, start_arg].into(),
     });
     insts.push(Inst::ConstI64(0));
     let ret = next;
@@ -1582,7 +1582,7 @@ fn build_start_wrapper(
         // call start() (produces no value, so it doesn't advance the value counter).
         Inst::Call {
             func: start_ir,
-            args: Vec::new(),
+            args: Vec::new().into(),
         },
         // call the real export with every param in order (values 0..nparams); its results land at
         // values nparams.. .
@@ -2256,12 +2256,12 @@ fn call_op(lo: &mut Lower, func: u32) -> Result<(), Error> {
         args.reverse(); // stack top is the last argument
         let results = sig.results.clone();
         let sig_idx = func_type_index(lo.type_section, &sig); // #922: interned type index
-        let inst = Inst::CallImport {
+        let inst = Inst::CallImport(Box::new(temen_ir::CallImport {
             import: slot,
             op: 0,
             sig: sig_idx,
-            args,
-        };
+            args: args.into(),
+        }));
         let res = lo.emit_call(inst, results.len());
         for (v, t) in res.into_iter().zip(results.iter()) {
             lo.push(v, *t);
@@ -2279,7 +2279,13 @@ fn call_op(lo: &mut Lower, func: u32) -> Result<(), Error> {
         args.push(lo.pop()?.0);
     }
     args.reverse(); // stack top is the last argument
-    let res = lo.emit_call(Inst::Call { func: ir_idx, args }, results.len());
+    let res = lo.emit_call(
+        Inst::Call {
+            func: ir_idx,
+            args: args.into(),
+        },
+        results.len(),
+    );
     for (v, t) in res.into_iter().zip(results.iter()) {
         lo.push(v, *t);
     }
@@ -2390,11 +2396,11 @@ fn call_indirect_op(lo: &mut Lower, type_index: u32, table_index: u32) -> Result
         },
     ); // #922: interned type index
     let res = lo.emit_call(
-        Inst::CallIndirect {
+        Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
             ty,
             idx: funcref,
-            args,
-        },
+            args: args.into(),
+        })),
         results.len(),
     );
     for (v, t) in res.into_iter().zip(results.iter()) {
@@ -4464,7 +4470,11 @@ fn lower_op(lo: &mut Lower, op: Operator, fn_results: &[ValType]) -> Result<(), 
         O::I8x16Shuffle { lanes } => {
             let (b, _) = lo.pop()?;
             let (a, _) = lo.pop()?;
-            let v = lo.emit(Inst::Shuffle { lanes, a, b });
+            let v = lo.emit(Inst::Shuffle {
+                lanes: Box::new(lanes),
+                a,
+                b,
+            });
             lo.push(v, ValType::V128);
         }
         O::I8x16Swizzle => {

@@ -1698,7 +1698,10 @@ impl Spec<'_> {
             arg_pat,
             mem_pat,
         )?;
-        out.push(Inst::Call { func: ridx, args });
+        out.push(Inst::Call {
+            func: ridx,
+            args: args.into(),
+        });
         let nres = self.module.funcs[callee as usize].results.len();
         let results: Vec<Abs> = (0..nres).map(|_| Abs::Dyn(bump(rnext))).collect();
         // The live-out cells are the call's trailing results; rebuild the abstract memory from them.
@@ -1770,7 +1773,10 @@ impl Spec<'_> {
             .iter()
             .map(|&a| materialize(a, out, rnext))
             .collect();
-        out.push(Inst::Call { func: ridx, args });
+        out.push(Inst::Call {
+            func: ridx,
+            args: args.into(),
+        });
         let nres = self.module.funcs[callee as usize].results.len();
         let results: Vec<Abs> = (0..nres).map(|_| Abs::Dyn(bump(rnext))).collect();
         if mode == CutMode::TouchState {
@@ -1819,7 +1825,10 @@ impl Spec<'_> {
             .iter()
             .map(|&a| materialize(a, out, rnext))
             .collect();
-        out.push(Inst::Call { func: ridx, args });
+        out.push(Inst::Call {
+            func: ridx,
+            args: args.into(),
+        });
         let nres = self.module.funcs[callee as usize].results.len();
         // Result 0 is the `CallInfo*`; bind it per the classification, leaving any further results
         // fresh. The emitted IR `Call` produces all `nres` result values regardless of the abstract
@@ -1890,7 +1899,10 @@ impl Spec<'_> {
             .iter()
             .map(|&a| materialize(a, out, rnext))
             .collect();
-        out.push(Inst::Call { func: ridx, args });
+        out.push(Inst::Call {
+            func: ridx,
+            args: args.into(),
+        });
         let nres = self.module.funcs[callee as usize].results.len();
         if let Some(site) = site {
             // The reused frame: L->ci unchanged (re-pinned for robustness), moved slots pinned.
@@ -1987,7 +1999,10 @@ impl Spec<'_> {
             .iter()
             .map(|&a| materialize(a, out, rnext))
             .collect();
-        out.push(Inst::Call { func: ridx, args });
+        out.push(Inst::Call {
+            func: ridx,
+            args: args.into(),
+        });
         let nres = self.module.funcs[callee as usize].results.len();
         let results: Vec<Abs> = (0..nres).map(|_| Abs::Dyn(bump(rnext))).collect();
 
@@ -2078,7 +2093,8 @@ impl Spec<'_> {
             Inst::Call { func, args } => {
                 Some((*func, args.iter().map(|&a| env[a as usize]).collect()))
             }
-            Inst::CallIndirect { ty, idx, args } => {
+            Inst::CallIndirect(c) => {
+                let temen_ir::CallIndirect { ty, idx, args } = &**c;
                 let callee = self
                     .resolve_indirect(*ty, env[*idx as usize])
                     .ok_or_else(|| {
@@ -3494,10 +3510,7 @@ fn imports_a_boundary(f: &Func) -> bool {
     f.blocks.iter().flat_map(|b| &b.insts).any(|i| {
         matches!(
             i,
-            Inst::CallImport { .. }
-                | Inst::CallImportDyn { .. }
-                | Inst::CapCall { .. }
-                | Inst::CallSym { .. }
+            Inst::CallImport(_) | Inst::CallImportDyn(_) | Inst::CapCall(_) | Inst::CallSym(_)
         )
     })
 }
@@ -3529,7 +3542,7 @@ fn direct_callees(f: &Func) -> Result<Vec<u32>, SpecError> {
         for inst in &b.insts {
             match inst {
                 Inst::Call { func, .. } => out.push(*func),
-                Inst::CallIndirect { .. } => return Err(SpecError::Unsupported),
+                Inst::CallIndirect(_) => return Err(SpecError::Unsupported),
                 _ => {}
             }
         }

@@ -339,7 +339,7 @@ fn a_link_unit_takes_the_address_of_another_units_function() {
         .iter()
         .flat_map(|f| &f.blocks)
         .flat_map(|b| &b.insts)
-        .any(|i| matches!(i, temen_ir::Inst::RefSym { name } if name == b"lib_add"));
+        .any(|i| matches!(i, temen_ir::Inst::RefSym { name } if **name == *b"lib_add"));
     assert!(in_code, "the argument is a `ref.sym`");
     assert_eq!(
         taker.data_funcrefs.len(),

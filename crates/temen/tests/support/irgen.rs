@@ -407,7 +407,7 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                 bb.push_multi(
                     Inst::Call {
                         func: j as u32,
-                        args,
+                        args: args.into(),
                     },
                     &cr,
                 );
@@ -426,7 +426,14 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                     let args: Vec<ValIdx> = ty.params.iter().map(|&t| bb.want(t)).collect();
                     let results = ty.results.clone();
                     let ty = bb.g.intern_sig(ty); // #922: interned type index
-                    bb.push_multi(Inst::CallIndirect { ty, idx, args }, &results);
+                    bb.push_multi(
+                        Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
+                            ty,
+                            idx,
+                            args: args.into(),
+                        })),
+                        &results,
+                    );
                 } else {
                     // (b) inert: a 4-param signature no generated function has (they take
                     // ≤ 3), so *any* index type-mismatches ⇒ a guaranteed IndirectCallType
@@ -439,7 +446,11 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                     let idx = bb.want(ValType::I32);
                     let args: Vec<ValIdx> = (0..4).map(|_| bb.want(ValType::I32)).collect();
                     let ty = bb.g.intern_sig(ty); // #922: interned type index
-                    bb.push0(Inst::CallIndirect { ty, idx, args });
+                    bb.push0(Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
+                        ty,
+                        idx,
+                        args: args.into(),
+                    })));
                 }
             }
             18 if bb.g.emit_caps => {
@@ -465,13 +476,13 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                     results: results.clone(),
                 }); // #922: interned type index
                 bb.push_multi(
-                    Inst::CapCall {
+                    Inst::CapCall(Box::new(temen_ir::CapCall {
                         type_id,
                         op,
                         sig,
                         handle,
-                        args,
-                    },
+                        args: args.into(),
+                    })),
                     &results,
                 );
             }
@@ -501,13 +512,13 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                         results: results.clone(),
                     }); // #922: interned type index
                     bb.push_multi(
-                        Inst::CapCall {
+                        Inst::CapCall(Box::new(temen_ir::CapCall {
                             type_id: 5,
                             op,
                             sig,
                             handle,
-                            args: vec![],
-                        },
+                            args: vec![].into(),
+                        })),
                         &results,
                     );
                 } else if op == 1 {
@@ -516,13 +527,13 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                         results: results.clone(),
                     }); // #922: interned type index
                     bb.push_multi(
-                        Inst::CapCall {
+                        Inst::CapCall(Box::new(temen_ir::CapCall {
                             type_id: 5,
                             op,
                             sig,
                             handle,
-                            args: vec![off, len],
-                        },
+                            args: vec![off, len].into(),
+                        })),
                         &results,
                     );
                 } else {
@@ -534,13 +545,13 @@ fn gen_inst(bb: &mut BB, fi: usize, sigs: &[(Vec<ValType>, Vec<ValType>)], has_m
                         results: results.clone(),
                     }); // #922: interned type index
                     bb.push_multi(
-                        Inst::CapCall {
+                        Inst::CapCall(Box::new(temen_ir::CapCall {
                             type_id: 5,
                             op,
                             sig,
                             handle,
-                            args: vec![off, len, prot],
-                        },
+                            args: vec![off, len, prot].into(),
+                        })),
                         &results,
                     );
                 }
@@ -744,7 +755,14 @@ fn gen_simd(bb: &mut BB, has_mem: bool) {
             }
             let a = bb.want(ValType::V128);
             let b = bb.want(ValType::V128);
-            bb.push(Inst::Shuffle { lanes, a, b }, ValType::V128);
+            bb.push(
+                Inst::Shuffle {
+                    lanes: Box::new(lanes),
+                    a,
+                    b,
+                },
+                ValType::V128,
+            );
         }
         9 => {
             let a = bb.want(ValType::V128);

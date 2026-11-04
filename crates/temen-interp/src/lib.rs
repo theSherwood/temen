@@ -605,19 +605,17 @@ impl DebugShared {
     /// A `call.cap`-boundary stop, if armed and `inst` is one.
     fn cap_stop(&self, inst: &Inst) -> Option<StopReason> {
         match inst {
-            Inst::CapCall { type_id, op, .. } if self.cap_stops => Some(StopReason::CapCall {
-                type_id: *type_id,
-                op: *op,
+            Inst::CapCall(c) if self.cap_stops => Some(StopReason::CapCall {
+                type_id: c.type_id,
+                op: c.op,
             }),
             // An executable `call.import` (IMPORTS.md phase 1) is a capability boundary too;
             // reported under the reserved import-dispatch type_id with the import index as the op
             // (the concrete binding is instantiation state, not visible at this layer).
-            Inst::CallImport { import, .. } | Inst::CallSym { import, .. } if self.cap_stops => {
-                Some(StopReason::CapCall {
-                    type_id: temen_ir::CAP_IMPORT_TYPE_ID,
-                    op: *import,
-                })
-            }
+            Inst::CallImport(_) | Inst::CallSym(_) if self.cap_stops => Some(StopReason::CapCall {
+                type_id: temen_ir::CAP_IMPORT_TYPE_ID,
+                op: inst.import_slot()?,
+            }),
             _ => None,
         }
     }
@@ -15510,12 +15508,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     return Ok(Inner::Park(Blocked::Stopped));
                 }
                 let host_call = match &block.insts[frames[top].inst] {
-                    Inst::CapCall {
-                        type_id, op, sig, ..
-                    } if !temen_ir::durable_abi::is_serve_op(*type_id, *op) => Some(*sig),
-                    Inst::CallImport { sig, .. }
-                    | Inst::CallImportDyn { sig, .. }
-                    | Inst::CallSym { sig, .. } => Some(*sig),
+                    Inst::CapCall(c) if !temen_ir::durable_abi::is_serve_op(c.type_id, c.op) => {
+                        Some(c.sig)
+                    }
+                    Inst::CallImport(c) => Some(c.sig),
+                    Inst::CallImportDyn(c) => Some(c.sig),
+                    Inst::CallSym(c) => Some(c.sig),
                     _ => None,
                 };
                 if let Some(sig) = host_call {
@@ -16055,7 +16053,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     });
                     continue 'frames;
                 }
-                Inst::CallIndirect { ty, idx, args } => {
+                Inst::CallIndirect(c) => {
+                    let temen_ir::CallIndirect { ty, idx, args } = &**c;
                     step(fuel, kill.as_deref())?; // fuel unification: function-entry safepoint
                                                   // Dispatch through the module-0 table (new→old; matches the JIT, where every
                                                   // function — parent or unit — is lowered against the parent `fn_table`).
@@ -16084,18 +16083,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // names (`temen_ir::served_contract`). A call declaring another shape, or an
                 // Instantiator op that isn't live, is a `CapFault` before any of them runs, as on
                 // every engine: no arm numbers a result it doesn't push (#2066, #2361).
-                Inst::CapCall {
-                    type_id, op, sig, ..
-                } if !temen_ir::served_shape_ok(*type_id, *op, call_sig(&cur_types, *sig)) => {
+                Inst::CapCall(c)
+                    if !temen_ir::served_shape_ok(c.type_id, c.op, call_sig(&cur_types, c.sig)) =>
+                {
                     return Err(Trap::CapFault);
                 }
-                Inst::CapCall {
-                    type_id: cap_id::INSTANTIATOR,
-                    op,
-                    handle,
-                    args,
-                    ..
-                } => {
+                Inst::CapCall(call) if call.type_id == cap_id::INSTANTIATOR => {
+                    let temen_ir::CapCall {
+                        op, handle, args, ..
+                    } = &**call;
                     // #1578 — DESIGN §22: an **invoked** unit is a seam-free leaf, so the whole
                     // `Instantiator` is unavailable inside a `Jit.invoke` (a non-empty `below` — the
                     // invokers paused beneath this vCPU — is exactly "running inside one"). A spawn
@@ -16660,13 +16656,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // vCPU's `units`/`table`, which the generic host dispatch can't reach). The JIT
                 // mirrors it by writing the unit's natural entry + `type_id` into the same padding
                 // slot (`CompiledModule::install`), so the returned index agrees.
-                Inst::CapCall {
-                    type_id: cap_id::JIT,
-                    op: 3,
-                    handle,
-                    args,
-                    ..
-                } => {
+                Inst::CapCall(c) if c.type_id == cap_id::JIT && c.op == 3 => {
+                    let temen_ir::CapCall { handle, args, .. } = &**c;
                     let h = get_i32(&frames[top].vals, *handle)?;
                     jit_install_body!(h, args)
                 }
@@ -16675,23 +16666,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // `call.dyn` of it traps. Serviced here (it mutates the table). A guest may
                 // only clear slots it installed (`≥ funcs.len()`, the module-0 function count);
                 // `0` on success, `-EINVAL` for a real-function/out-of-range/already-empty slot.
-                Inst::CapCall {
-                    type_id: cap_id::JIT,
-                    op: 4,
-                    handle,
-                    args,
-                    ..
-                } => {
+                Inst::CapCall(c) if c.type_id == cap_id::JIT && c.op == 4 => {
+                    let temen_ir::CapCall { handle, args, .. } = &**c;
                     let h = get_i32(&frames[top].vals, *handle)?;
                     jit_uninstall_body!(h, args)
                 }
-                Inst::CapCall {
-                    type_id: cap_id::JIT,
-                    op: 1,
-                    handle,
-                    args,
-                    sig,
-                } => {
+                Inst::CapCall(c) if c.type_id == cap_id::JIT && c.op == 1 => {
+                    let temen_ir::CapCall {
+                        handle, args, sig, ..
+                    } = &**c;
                     let h = get_i32(&frames[top].vals, *handle)?;
                     jit_invoke_body!(h, args, call_sig(&cur_types, *sig))
                 }
@@ -16715,12 +16698,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // caller (`cap_reply`) or rides the completion cell. Serviced here because
                 // only the eval loop can run guest code; other tiers answer a probeable
                 // `-EINVAL` from host-side dispatch.
-                Inst::CapCall {
-                    type_id: temen_ir::CAP_SELF_TYPE_ID,
-                    op: op @ (CAP_SELF_SVC_POLL | CAP_SELF_SVC_WAIT),
-                    args,
-                    ..
-                } => {
+                Inst::CapCall(c)
+                    if c.type_id == temen_ir::CAP_SELF_TYPE_ID
+                        && matches!(c.op, CAP_SELF_SVC_POLL | CAP_SELF_SVC_WAIT) =>
+                {
+                    let temen_ir::CapCall { args, .. } = &**c;
+                    let op = &c.op;
                     if let Some(sr_) = serve_run.as_ref() {
                         if *cur != sr_.serve_cur {
                             // A nested `svc.*` from *under* the running handler (the serve
@@ -16968,12 +16951,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // `-EINVAL` when not called from within a handler (no `serve_run`, or from the serve loop
                 // itself, `*cur == serve_cur`). A failed clone (non-`Real` scheduler, non-forkable
                 // domain, caller with children/fibers) **degrades to a single reply** — never hangs.
-                Inst::CapCall {
-                    type_id: temen_ir::CAP_SELF_TYPE_ID,
-                    op: CAP_SELF_CLONE_CALLER,
-                    args,
-                    ..
-                } => {
+                Inst::CapCall(c)
+                    if c.type_id == temen_ir::CAP_SELF_TYPE_ID && c.op == CAP_SELF_CLONE_CALLER =>
+                {
+                    let temen_ir::CapCall { args, .. } = &**c;
                     // Arity picks the mode: 2 args = explicit (orig, twin); 0/1 args = pid mode.
                     let (reply_orig, reply_twin) = if args.len() >= 2 {
                         (
@@ -17027,12 +17008,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // optional second arg is `flags`: `WNOHANG` (bit 0) makes it **non-blocking** — a
                 // still-running twin replies `0` at once instead of parking. `-EINVAL` outside a
                 // handler / on a non-`Real` tier (like `clone_caller`).
-                Inst::CapCall {
-                    type_id: temen_ir::CAP_SELF_TYPE_ID,
-                    op: CAP_SELF_REAP,
-                    args,
-                    ..
-                } => {
+                Inst::CapCall(c)
+                    if c.type_id == temen_ir::CAP_SELF_TYPE_ID && c.op == CAP_SELF_REAP =>
+                {
+                    let temen_ir::CapCall { args, .. } = &**c;
                     let pid = match args.first() {
                         Some(a) => get(&frames[top].vals, *a)?.i64(),
                         None => -1,
@@ -17087,12 +17066,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 }
                 // FORK.md §8.6 — `pipe(fds)` (self-namespace op 16): the one mint ([`Host::mint_pipe`]),
                 // on the `Real` scheduler, whose `PipeEnd` parks the pipe's reads and writes need.
-                Inst::CapCall {
-                    type_id: temen_ir::CAP_SELF_TYPE_ID,
-                    op: CAP_SELF_PIPE,
-                    args,
-                    ..
-                } => {
+                Inst::CapCall(c)
+                    if c.type_id == temen_ir::CAP_SELF_TYPE_ID && c.op == CAP_SELF_PIPE =>
+                {
+                    let temen_ir::CapCall { args, .. } = &**c;
                     let fds = match args.first() {
                         Some(a) => get(&frames[top].vals, *a)?.i64() as u64,
                         None => 0,
@@ -17112,11 +17089,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // the differential pin. Reads the counter as it stands at this op (the `call.cap`
                 // self-op charges no fuel of its own, mirroring the other self-ops), so a
                 // read-before/read-after pair meters exactly the work between them under caller-pays.
-                Inst::CapCall {
-                    type_id: temen_ir::CAP_SELF_TYPE_ID,
-                    op: CAP_SELF_FUEL_REMAINING,
-                    ..
-                } => {
+                Inst::CapCall(c)
+                    if c.type_id == temen_ir::CAP_SELF_TYPE_ID
+                        && c.op == CAP_SELF_FUEL_REMAINING =>
+                {
                     frames[top].vals.push(Reg::from_i64(fuel.remaining()));
                 }
                 // FORK.md §8.6 — `exec_module(module, grants_ptr, grants_n, entry, size_log2)`
@@ -17127,12 +17103,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // guest's continuation survives — POSIX `execve` returns only on failure). Increment 1:
                 // non-durable domains only, and only from a clean root computation (no serve handler /
                 // active fibers).
-                Inst::CapCall {
-                    type_id: temen_ir::CAP_SELF_TYPE_ID,
-                    op: CAP_SELF_EXEC,
-                    args,
-                    ..
-                } => {
+                Inst::CapCall(c)
+                    if c.type_id == temen_ir::CAP_SELF_TYPE_ID && c.op == CAP_SELF_EXEC =>
+                {
+                    let temen_ir::CapCall { args, .. } = &**c;
                     let argn = |i: usize| -> Result<i64, Trap> {
                         Ok(get(&frames[top].vals, *args.get(i).ok_or(Trap::Malformed)?)?.i64())
                     };
@@ -17159,13 +17133,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Err(e) => frames[top].vals.push(Reg::from_i64(e)),
                     }
                 }
-                Inst::CapCall {
-                    type_id,
-                    op,
-                    sig,
-                    handle,
-                    args,
-                } => {
+                Inst::CapCall(c) => {
+                    let temen_ir::CapCall {
+                        type_id,
+                        op,
+                        sig,
+                        handle,
+                        args,
+                    } = &**c;
                     // Capability call (§3c): resolve the handle in the host-owned table
                     // (mask + type_id/generation check) and dispatch to the mock host.
                     // Args/results cross as i64 slots (the shared host-dispatch ABI).
@@ -17415,39 +17390,38 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // install/uninstall mutate the shared dispatch table — none reachable from the
                 // generic host dispatch). Route by the instance binding; the vestigial handle
                 // operand is ignored (the binding carries the real handle).
-                Inst::CallImport {
-                    import, sig, args, ..
-                }
-                | Inst::CallSym {
-                    import, sig, args, ..
-                } if matches!(
-                    host.lock_unpoisoned().import_binding(*import),
-                    Some(b) if b.type_id == cap_id::JIT && matches!(b.op, 1 | 3 | 4)
-                ) =>
+                Inst::CallImport(_) | Inst::CallSym(_)
+                    if matches!(
+                        inst.import_slot().and_then(|i| host.lock_unpoisoned().import_binding(i)),
+                        Some(b) if b.type_id == cap_id::JIT && matches!(b.op, 1 | 3 | 4)
+                    ) =>
                 {
+                    let import = inst.import_slot().ok_or(Trap::CapFault)?;
+                    let (sig, args) = inst.host_call().ok_or(Trap::CapFault)?;
                     let b = host
                         .lock_unpoisoned()
-                        .import_binding(*import)
+                        .import_binding(import)
                         .ok_or(Trap::CapFault)?;
                     // The bound op is served here too, so the import's declared shape is held to
                     // its contract as a `call.cap`'s is (#2361).
-                    if !temen_ir::served_shape_ok(b.type_id, b.op, call_sig(&cur_types, *sig)) {
+                    if !temen_ir::served_shape_ok(b.type_id, b.op, call_sig(&cur_types, sig)) {
                         return Err(Trap::CapFault);
                     }
                     let h = b.handle;
                     match b.op {
                         3 => jit_install_body!(h, args),
                         4 => jit_uninstall_body!(h, args),
-                        _ => jit_invoke_body!(h, args, call_sig(&cur_types, *sig)),
+                        _ => jit_invoke_body!(h, args, call_sig(&cur_types, sig)),
                     }
                 }
-                Inst::CallImport {
-                    import,
-                    op,
-                    sig,
-                    args,
-                    ..
-                } => {
+                Inst::CallImport(c) => {
+                    let temen_ir::CallImport {
+                        import,
+                        op,
+                        sig,
+                        args,
+                        ..
+                    } = &**c;
                     let mut argv = Vec::with_capacity(args.len());
                     for a in args {
                         argv.push(get(&frames[top].vals, *a)?.i64());
@@ -17547,9 +17521,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 }
                 // §7/§22 symbolic call: when the instance bound the name, dispatch exactly like
                 // a flat `call.import` (op 0); the legacy handle operand is ignored.
-                Inst::CallSym {
-                    import, sig, args, ..
-                } => {
+                Inst::CallSym(c) => {
+                    let temen_ir::CallSym {
+                        import, sig, args, ..
+                    } = &**c;
                     let mut argv = Vec::with_capacity(args.len());
                     for a in args {
                         argv.push(get(&frames[top].vals, *a)?.i64());
@@ -17652,13 +17627,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 }
                 // §3.5 dynamic-mode dispatch by type-section reference: the reserved dyn entry
                 // packs `(type_idx | op << 16)`; the handle operand is the live handle value.
-                Inst::CallImportDyn {
-                    ty,
-                    op,
-                    sig,
-                    handle,
-                    args,
-                } => {
+                Inst::CallImportDyn(c) => {
+                    let temen_ir::CallImportDyn {
+                        ty,
+                        op,
+                        sig,
+                        handle,
+                        args,
+                    } = &**c;
                     let h = get_i32(&frames[top].vals, *handle)?;
                     let mut argv = Vec::with_capacity(args.len());
                     for a in args {
@@ -19095,10 +19071,10 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         // `DataSym`/`DataSelf` are the data-side link forms — `link` rewrites them to `i64.const`
         // before a module runs, so reaching one here is a malformed (unlinked) module: fail closed.
         // So is `RefSym`, which `link` rewrites to `ref.func`.
-        Inst::CallImport { .. }
-        | Inst::CallImportDyn { .. }
-        | Inst::CallSym { .. }
-        | Inst::DataSym { .. }
+        Inst::CallImport(_)
+        | Inst::CallImportDyn(_)
+        | Inst::CallSym(_)
+        | Inst::DataSym(_)
         | Inst::DataSelf { .. }
         | Inst::DataTop
         | Inst::RefSym { .. }
@@ -19408,8 +19384,8 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         // Handled in `run_func` for the §12 fiber ops (which switch stacks) and in the eval
         // loop for calls/cap-calls; listed for exhaustiveness (no panic).
         Inst::Call { .. }
-        | Inst::CallIndirect { .. }
-        | Inst::CapCall { .. }
+        | Inst::CallIndirect(_)
+        | Inst::CapCall(_)
         | Inst::ContNew { .. }
         | Inst::ContResume { .. }
         | Inst::Suspend { .. }

@@ -1662,62 +1662,55 @@ fn scan_seams<'a>(funcs: impl IntoIterator<Item = &'a Func>) -> Seams {
                     // Every live op (`temen_ir::served_contract`) drives executor children,
                     // scheduler-driven. Every other INSTANTIATOR op traps `CapFault`
                     // (`Op::CapFault`), so it is no seam.
-                    Inst::CapCall {
-                        type_id: super::cap_id::INSTANTIATOR,
-                        op,
-                        ..
-                    } if temen_ir::served_contract(super::cap_id::INSTANTIATOR, *op).is_some() => {
+                    Inst::CapCall(c)
+                        if c.type_id == super::cap_id::INSTANTIATOR
+                            && temen_ir::served_contract(super::cap_id::INSTANTIATOR, c.op)
+                                .is_some() =>
+                    {
                         s.has_instantiate = true
                     }
-                    Inst::CapCall {
-                        type_id: super::cap_id::INSTANTIATOR,
-                        ..
-                    } => {}
+                    Inst::CapCall(c) if c.type_id == super::cap_id::INSTANTIATOR => {}
                     // I38's **timed** `svc.wait` (op 10 with the optional timeout arg) needs
                     // the scheduler's deadline machinery — oracle-only; veto like a park seam
                     // so both fast backends decline the module.
-                    Inst::CapCall {
-                        type_id: temen_ir::CAP_SELF_TYPE_ID,
-                        op: 10,
-                        args,
-                        ..
-                    } if !args.is_empty() => {
+                    Inst::CapCall(c)
+                        if c.type_id == temen_ir::CAP_SELF_TYPE_ID
+                            && c.op == 10
+                            && !c.args.is_empty() =>
+                    {
                         s.has_svc = true;
                         s.has_park_seam = true;
                         s.has_timed_wait = true;
                     }
                     // §3.6 service points (I36 slice 1): svc.poll/svc.wait sites — natively
                     // servable only when nothing in the module could park a handler (below).
-                    Inst::CapCall {
-                        type_id: temen_ir::CAP_SELF_TYPE_ID,
-                        op: 9 | 10,
-                        ..
-                    } => s.has_svc = true,
+                    Inst::CapCall(c)
+                        if c.type_id == temen_ir::CAP_SELF_TYPE_ID && matches!(c.op, 9 | 10) =>
+                    {
+                        s.has_svc = true
+                    }
                     // FORK.md §9 — `clone_caller` (11) / `reap` (12): the fork servicer primitives.
                     // The bytecode engine services both natively (the [`bytecode_serves_fork`] escape
                     // admits the fork topology; the `VcpuStop::CloneCaller`/`Reap` driver arms build
                     // the twin and reap it), so they are the `has_fork` seam — folded for Cranelift
                     // (`svc_park_veto` keeps `has_fork`) but run natively on bytecode.
-                    Inst::CapCall {
-                        type_id: temen_ir::CAP_SELF_TYPE_ID,
-                        op: 11 | 12,
-                        ..
-                    } => s.has_fork = true,
+                    Inst::CapCall(c)
+                        if c.type_id == temen_ir::CAP_SELF_TYPE_ID && matches!(c.op, 11 | 12) =>
+                    {
+                        s.has_fork = true
+                    }
                     // A blocking stream `read` (type 0 op 0) can stdin-park, and an import call
                     // can be *bound* to one at spawn — either inside a handler would need the
                     // tree-walker's FIBER_PARKED (completed-but-not-replied) machinery.
-                    Inst::CapCall {
-                        type_id: super::cap_id::STREAM,
-                        op: 0,
-                        ..
+                    Inst::CapCall(c)
+                        if (c.type_id, c.op) == (super::cap_id::STREAM, 0)
+                            || c.type_id == temen_ir::CAP_IMPORT_TYPE_ID =>
+                    {
+                        s.has_park_seam = true
                     }
-                    | Inst::CapCall {
-                        type_id: temen_ir::CAP_IMPORT_TYPE_ID,
-                        ..
+                    Inst::CallImport(_) | Inst::SetJmp { .. } | Inst::LongJmp { .. } => {
+                        s.has_park_seam = true
                     }
-                    | Inst::CallImport { .. }
-                    | Inst::SetJmp { .. }
-                    | Inst::LongJmp { .. } => s.has_park_seam = true,
                     Inst::ContNew { .. }
                     | Inst::ContResume { .. } // I48: `block` flag is advisory here
                     | Inst::Suspend { .. } => s.has_fiber = true,
@@ -1726,12 +1719,10 @@ fn scan_seams<'a>(funcs: impl IntoIterator<Item = &'a Func>) -> Seams {
                     | Inst::MemoryWait { .. }
                     | Inst::MemoryNotify { .. } => s.has_thread = true,
                     Inst::GcRoots { .. } => s.has_gc = true,
-                    Inst::CallIndirect { .. } | Inst::CallImportDyn { .. } => {
+                    Inst::CallIndirect(_) | Inst::CallImportDyn(_) => {
                         s.has_opaque_call = true
                     }
-                    Inst::CapCall { type_id, .. } if !iface_never_parks(*type_id) => {
-                        s.has_opaque_call = true
-                    }
+                    Inst::CapCall(c) if !iface_never_parks(c.type_id) => s.has_opaque_call = true,
                     _ => {}
                 }
             }
@@ -1790,14 +1781,7 @@ fn may_page_a_child(m: &Module) -> bool {
     m.declares_pager()
         && m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
             b.insts.iter().any(|i| {
-                matches!(
-                    i,
-                    Inst::CapCall {
-                        type_id: super::cap_id::INSTANTIATOR,
-                        op: 17,
-                        ..
-                    }
-                )
+                matches!(i, Inst::CapCall(c) if (c.type_id, c.op) == (super::cap_id::INSTANTIATOR, 17))
             })
         })
 }
@@ -3002,13 +2986,16 @@ fn compile_inst(
         // `call.dyn` through module 0's natural table — self-contained (no install/invoke),
         // so the compile-time signature table resolves it. Cross-module units (install/invoke) are
         // still a later slice; here every reachable slot is a module-0 function.
-        Inst::CallIndirect { ty, idx, args } => Op::CallIndirect {
-            idx: g(*idx),
-            args: args.iter().map(|a| g(*a)).collect(),
-            dst,
-            want_params: view.sig(*ty).params.clone().into(),
-            want_results: view.sig(*ty).results.clone().into(),
-        },
+        Inst::CallIndirect(c) => {
+            let temen_ir::CallIndirect { ty, idx, args } = &**c;
+            Op::CallIndirect {
+                idx: g(*idx),
+                args: args.iter().map(|a| g(*a)).collect(),
+                dst,
+                want_params: view.sig(*ty).params.clone().into(),
+                want_results: view.sig(*ty).results.clone().into(),
+            }
+        }
         // Synchronous capability call: the generic powerbox path (guest suspended, host computes,
         // same activation continues) is driven here via `host.cap_dispatch_slots`. The
         // executor/fiber capability variants — `Instantiator` (child vCPUs), `Yielder` (co-fiber
@@ -3016,13 +3003,14 @@ fn compile_inst(
         // need seams a later slice drives, so reject those (fall back to the tree-walker). These are
         // exactly the `type_id`/`op` combinations `run_inner` matches in dedicated arms ahead of its
         // generic `CapCall` arm.
-        Inst::CapCall {
-            type_id,
-            op,
-            sig,
-            handle,
-            args,
-        } => {
+        Inst::CapCall(c) => {
+            let temen_ir::CapCall {
+                type_id,
+                op,
+                sig,
+                handle,
+                args,
+            } = &**c;
             use super::cap_id;
             match (*type_id, *op) {
                 // The ops below are served here, each delivering at `dst` the results its op's
@@ -3240,51 +3228,60 @@ fn compile_inst(
         // the tree-walker and the JIT thunk do (one shared implementation, three backends in
         // lockstep). No handle operand since v8 (the binding carries the granted handle); the
         // dispatch never read one, so the register is simply absent.
-        Inst::CallImport {
-            import,
-            op,
-            sig,
-            args,
-        } => Op::CapCall {
-            type_id: temen_ir::CAP_IMPORT_TYPE_ID,
-            // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
-            op: *import | (*op << 16),
-            handle: u32::MAX, // no operand (v8); the exec passes 0, the dispatch ignores it
-            params: view.sig(*sig).params.clone().into(),
-            args: args.iter().map(|a| g(*a)).collect(),
-            dst,
-            results: view.sig(*sig).results.clone().into(),
-        },
+        Inst::CallImport(c) => {
+            let temen_ir::CallImport {
+                import,
+                op,
+                sig,
+                args,
+            } = &**c;
+            Op::CapCall {
+                type_id: temen_ir::CAP_IMPORT_TYPE_ID,
+                // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
+                op: *import | (*op << 16),
+                handle: u32::MAX, // no operand (v8); the exec passes 0, the dispatch ignores it
+                params: view.sig(*sig).params.clone().into(),
+                args: args.iter().map(|a| g(*a)).collect(),
+                dst,
+                results: view.sig(*sig).results.clone().into(),
+            }
+        }
         // §7/§22 symbolic call: when bound at instantiation it is a flat import dispatch
         // (op 0); the legacy handle operand is a live register the dispatch ignores.
-        Inst::CallSym {
-            import, sig, args, ..
-        } => Op::CapCall {
-            type_id: temen_ir::CAP_IMPORT_TYPE_ID,
-            op: *import,
-            handle: u32::MAX,
-            params: view.sig(*sig).params.clone().into(),
-            args: args.iter().map(|a| g(*a)).collect(),
-            dst,
-            results: view.sig(*sig).results.clone().into(),
-        },
+        Inst::CallSym(c) => {
+            let temen_ir::CallSym {
+                import, sig, args, ..
+            } = &**c;
+            Op::CapCall {
+                type_id: temen_ir::CAP_IMPORT_TYPE_ID,
+                op: *import,
+                handle: u32::MAX,
+                params: view.sig(*sig).params.clone().into(),
+                args: args.iter().map(|a| g(*a)).collect(),
+                dst,
+                results: view.sig(*sig).results.clone().into(),
+            }
+        }
         // §3.5 dynamic-mode dispatch by type-section reference: the reserved dyn entry packs
         // `(type_idx | op << 16)`; the handle register is live.
-        Inst::CallImportDyn {
-            ty,
-            op,
-            sig,
-            handle,
-            args,
-        } => Op::CapCall {
-            type_id: temen_ir::CAP_DYN_TYPE_ID,
-            op: *ty | (*op << 16),
-            handle: g(*handle),
-            params: view.sig(*sig).params.clone().into(),
-            args: args.iter().map(|a| g(*a)).collect(),
-            dst,
-            results: view.sig(*sig).results.clone().into(),
-        },
+        Inst::CallImportDyn(c) => {
+            let temen_ir::CallImportDyn {
+                ty,
+                op,
+                sig,
+                handle,
+                args,
+            } = &**c;
+            Op::CapCall {
+                type_id: temen_ir::CAP_DYN_TYPE_ID,
+                op: *ty | (*op << 16),
+                handle: g(*handle),
+                params: view.sig(*sig).params.clone().into(),
+                args: args.iter().map(|a| g(*a)).collect(),
+                dst,
+                results: view.sig(*sig).results.clone().into(),
+            }
+        }
         // §3.5 self-namespace extensions (see `Op::CapSelfExt`).
         Inst::ExportHandle { export } => Op::CapSelfExt {
             op: 8 | (*export << 8),
@@ -4189,7 +4186,7 @@ fn outside_reserved_subset(m: &Module) -> bool {
     m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
         b.insts.iter().any(|i| {
             matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. })
-                || matches!(i, Inst::CapCall { type_id, .. } if *type_id == super::cap_id::INSTANTIATOR)
+                || matches!(i, Inst::CapCall(c) if c.type_id == super::cap_id::INSTANTIATOR)
         })
     })
 }
@@ -8774,7 +8771,8 @@ impl ImageCensus {
             .flat_map(|b| &b.insts)
         {
             c.parks |= Self::may_park(i);
-            if let Inst::CapCall { type_id, op, .. } = *i {
+            if let Inst::CapCall(call) = i {
+                let (type_id, op) = (call.type_id, call.op);
                 c.host_call |= type_id == HOST_PROC;
                 c.stream_read |= type_id == STREAM && op == 0;
                 c.stream_write |= type_id == STREAM && op == 1;
@@ -8787,27 +8785,19 @@ impl ImageCensus {
     /// A call that parks other than in a stream call.
     fn may_park(i: &Inst) -> bool {
         use temen_ir::cap_id::{ADDRESS_SPACE, HOST_PROC, STREAM};
-        match *i {
-            Inst::CapCall {
-                type_id: STREAM,
-                op,
-                ..
-            } => op > 2,
-            // A host capability parks as the host's can ([`image_parks`]).
-            Inst::CapCall {
-                type_id: ADDRESS_SPACE | HOST_PROC,
-                ..
-            } => false,
-            // #1954: the self namespace's ops that answer at once — reflection (`count`, `get`,
-            // `type_id`, `covers`, `export.handle`, `list`, `schema`), `resolve`, `label`, `attest`,
-            // `provenance`, `fuel.remaining`, the `pipe` mint and `parallelism`. Its serve, fork,
-            // reap and exec ops park or need the caller's frames.
-            Inst::CapCall {
-                type_id: temen_ir::CAP_SELF_TYPE_ID,
-                op,
-                ..
-            } => !matches!(op & 0xFF, 0..=8 | 13 | 16..=19),
-            Inst::CapCall { .. } | Inst::CallImportDyn { .. } => true,
+        match i {
+            Inst::CapCall(c) => match c.type_id {
+                STREAM => c.op > 2,
+                // A host capability parks as the host's can ([`image_parks`]).
+                ADDRESS_SPACE | HOST_PROC => false,
+                // #1954: the self namespace's ops that answer at once — reflection (`count`, `get`,
+                // `type_id`, `covers`, `export.handle`, `list`, `schema`), `resolve`, `label`,
+                // `attest`, `provenance`, `fuel.remaining`, the `pipe` mint and `parallelism`. Its
+                // serve, fork, reap and exec ops park or need the caller's frames.
+                temen_ir::CAP_SELF_TYPE_ID => !matches!(c.op & 0xFF, 0..=8 | 13 | 16..=19),
+                _ => true,
+            },
+            Inst::CallImportDyn(_) => true,
             _ => false,
         }
     }
@@ -20332,7 +20322,7 @@ mod func_memo_tests {
             Vec::new(),
             vec![Inst::Call {
                 func: 1,
-                args: Vec::new(),
+                args: Vec::new().into(),
             }],
             Terminator::Return(Vec::new()),
         );
@@ -20370,11 +20360,11 @@ mod func_memo_tests {
             vec![ValType::I32],
             vec![
                 Inst::ConstI32(0),
-                Inst::CallIndirect {
+                Inst::CallIndirect(Box::new(temen_ir::CallIndirect {
                     ty: 0,
                     idx: 0,
-                    args: Vec::new(),
-                },
+                    args: Vec::new().into(),
+                })),
             ],
             Terminator::Return(vec![1]),
         );

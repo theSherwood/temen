@@ -345,7 +345,7 @@ fn call_bearing_loop_executes() {
             params: vec![ValType::I64, ValType::I64, ValType::I64],
             insts: vec![Inst::Call {
                 func: entry,
-                args: vec![],
+                args: vec![].into(),
             }],
             term: Terminator::Return(vec![]),
         }],

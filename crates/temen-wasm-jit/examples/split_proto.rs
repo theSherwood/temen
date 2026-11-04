@@ -98,7 +98,7 @@ fn hot_loop(hot_blocks: usize, hot_block_len: usize) -> Func {
         if j == 0 {
             insts.push(Inst::Call {
                 func: 1,
-                args: vec![0],
+                args: vec![0].into(),
             }); // v2 = helper(i)
             insts.push(Inst::IntBin {
                 ty: IntTy::I64,
@@ -458,7 +458,7 @@ fn outlined_dispatcher(k: usize) -> Func {
     for j in 0..k {
         insts.push(Inst::Call {
             func: (1 + j) as u32, // handler h_{j+1}
-            args: vec![acc],
+            args: vec![acc].into(),
         });
         acc = next;
         next += 1;

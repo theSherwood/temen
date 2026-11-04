@@ -63,11 +63,11 @@ fn no_rewrite_manifest_and_call_imports_survive_instantiation() {
     // The name-inline text form is the symbolic spelling (v8: `call.sym`); it survives
     // instantiation unrewritten exactly as an indexed `call.import` would.
     assert!(
-        insts.iter().any(|i| matches!(i, Inst::CallSym { .. })),
+        insts.iter().any(|i| matches!(i, Inst::CallSym(_))),
         "symbolic call instructions survive"
     );
     assert!(
-        !insts.iter().any(|i| matches!(i, Inst::CapCall { .. })),
+        !insts.iter().any(|i| matches!(i, Inst::CapCall(_))),
         "no call.cap was manufactured"
     );
 }
