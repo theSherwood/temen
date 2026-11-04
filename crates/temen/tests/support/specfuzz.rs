@@ -413,6 +413,13 @@ pub fn verify_one(data: &[u8]) {
     let mut mm = m.clone();
     mutate(&mut mm, r.u64());
     let prod = temen::verify::verify_module(&mm).is_ok();
+    // Bodies checked on threads give the answer an in-order pass gives, error and all (#2596).
+    assert_eq!(
+        temen::verify::verify_module_on(&mm, 4),
+        temen::verify::verify_module_on(&mm, 1),
+        "threaded verification disagrees with in-order\n{}",
+        temen::text::print_module(&mm)
+    );
     let refv = temen_spec::verify::verify(&mm).is_ok();
     assert_eq!(
         prod,
