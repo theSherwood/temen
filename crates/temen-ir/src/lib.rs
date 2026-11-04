@@ -4087,7 +4087,12 @@ impl Func {
         }
         first.push(total as u32);
         // Only a param past the entry's can forward, so a function with none has nothing to settle.
-        if self.blocks.iter().skip(1).all(|b| b.params.is_empty()) {
+        // Nor can a function whose every param meets two distinct arguments (its own aside), as
+        // they stand and unresolved, on the edges into it: the fixpoint needs a param that meets
+        // one to start from. That is a raised function's shape (#2586), so it is the common case,
+        // and `none_forward` finds it in one pass. Every param its own is correct for any
+        // function; it is what the fixpoint itself falls back to.
+        if self.blocks.iter().skip(1).all(|b| b.params.is_empty()) || self.none_forward(&first) {
             return Forwards {
                 first,
                 src: vec![Forwards::OWN; total],
@@ -4217,6 +4222,49 @@ impl Func {
             src.fill(Forwards::OWN);
         }
         Forwards { first, src }
+    }
+
+    /// Whether one pass over the blocks in index order shows that no param past the entry meets
+    /// fewer than two distinct arguments ([`Func::forwards`]'s fast path, #2586). The pass walks a
+    /// block's edges only once an edge already walked reaches it, so it sees just edges from
+    /// reachable blocks, as the fixpoint does. A raised function numbers its blocks in reverse
+    /// postorder, so the pass reaches all of them; where it misses one, it cannot tell, and says
+    /// so. Seeing fewer edges only makes a param look more like one that forwards, so a `true`
+    /// here holds for the full analysis too, save for a cycle of params that all forward one value
+    /// while each meets two arguments, which `raise` leaves no function.
+    fn none_forward(&self, first: &[u32]) -> bool {
+        const TWO: u64 = u64::MAX;
+        const NONE: u64 = u64::MAX - 1;
+        let mut one = vec![NONE; first.last().map_or(0, |&f| f as usize)];
+        let mut reached = vec![false; self.blocks.len()];
+        reached[0] = true;
+        for (b, blk) in self.blocks.iter().enumerate() {
+            if !reached[b] {
+                continue;
+            }
+            let mut k = 0;
+            while let Some((t, args)) = blk.term.edge(k) {
+                k += 1;
+                let Some(tb) = self.blocks.get(t as usize) else {
+                    continue;
+                };
+                reached[t as usize] = true;
+                let at = first[t as usize] as usize;
+                for (i, s) in one[at..at + tb.params.len()].iter_mut().enumerate() {
+                    let v = match args.get(i) {
+                        Some(&a) if b == t as usize && a as usize == i => continue,
+                        Some(&a) => (b as u64) << 32 | a as u64,
+                        None => TWO,
+                    };
+                    *s = if *s == NONE || *s == v { v } else { TWO };
+                }
+            }
+        }
+        self.blocks.iter().enumerate().skip(1).all(|(b, blk)| {
+            let at = first[b] as usize;
+            blk.params.is_empty()
+                || (reached[b] && one[at..at + blk.params.len()].iter().all(|&s| s == TWO))
+        })
     }
 }
 
@@ -8696,6 +8744,40 @@ mod forwards_tests {
         assert_eq!(w.source(2, 1), Some((0, 0)));
         assert_eq!(w.source(1, 2), None, "a param the block does not have");
         assert_eq!(w.source(3, 0), None, "a block the function does not have");
+    }
+
+    #[test]
+    fn a_function_of_phis_forwards_nothing() {
+        // A raised function's params are phis (#2586): each meets two values, so the tally alone
+        // settles the function, every param its own.
+        // b0(x): c; br_if x b1(c) b1(x)
+        // b1(p): d; br_if p b1(d) b2()
+        // b2(): return
+        let f = func(vec![
+            blk(1, 1, br_if(0, (1, &[1]), (1, &[0]))),
+            blk(1, 1, br_if(0, (1, &[1]), (2, &[]))),
+            blk(0, 0, Terminator::Return(Vec::new())),
+        ]);
+        assert_eq!(f.forwards().source(1, 0), None, "a phi of two values");
+    }
+
+    #[test]
+    fn a_cycle_whose_params_each_meet_two_arguments_is_its_own() {
+        // The tally's blind spot (#2586): b1 and b2 each enter the other and are each entered
+        // from b0 with the same value, so both always hold `c`, yet each meets two arguments as
+        // they stand. Every param its own is still correct, and `raise` leaves no such cycle.
+        // b0(x): c; br_if x b1(c) b2(c)
+        // b1(p): br b2(p)
+        // b2(q): br_if q b1(q) b3()
+        let f = func(vec![
+            blk(1, 1, br_if(0, (1, &[1]), (2, &[1]))),
+            blk(1, 0, br(2, &[0])),
+            blk(1, 0, br_if(0, (1, &[0]), (3, &[]))),
+            blk(0, 0, Terminator::Return(Vec::new())),
+        ]);
+        let w = f.forwards();
+        assert_eq!(w.source(1, 0), None);
+        assert_eq!(w.source(2, 0), None);
     }
 
     #[test]
