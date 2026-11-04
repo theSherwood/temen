@@ -3900,6 +3900,7 @@ impl CompiledModule {
             window: (mask != 0).then(|| validate::WindowLayout {
                 mask,
                 guard_offset: guard_offset_of(win_reserved as u64),
+                pages: 0, // a root is never demand-paged (#2164): no access table
             }),
             table: table_len as u64,
             types: &dyn_contracts,
@@ -5577,6 +5578,12 @@ impl CompiledModule {
             window: (self.mask != 0).then(|| validate::WindowLayout {
                 mask: self.mask,
                 guard_offset: guard_offset_of(self.win_reserved as u64),
+                // #2164 — a unit of a demand-paged parent checks the same access table.
+                pages: if self.page.is_paged() {
+                    self.page.pages
+                } else {
+                    0
+                },
             }),
             table: self.fn_table_mask + 1,
             types: &dyn_contracts,
@@ -7406,6 +7413,66 @@ block 2 (v7: i32) {
         EMITTED.with(|e| e.borrow_mut().take()).expect("recorded")
     }
 
+    /// #2770 — a demand-paged §14 child (#2164) is machine-code-validator-clean, for a **dynamic**
+    /// window access whose access-table index is bounded only by the page check's `in_window` branch.
+    /// `reserved_log2 > mapped_log2`, so window confinement (bounded by the reservation) does not by
+    /// itself bound the `table[off >> page_shift]` read to the table's `pages + 1` bytes — the bound
+    /// comes from `cmp off, declared; jb`. Regression for the `PageTable` provenance, the `cmp;jb`
+    /// bound refinement, the `shr`-of-`Bounded` transfer, and the `Bounded`/`Confined` meet.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn validator_is_clean_on_a_demand_paged_child() {
+        const DYN_LOAD: &str = "memory 16\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  \
+             v1 = i64.load v0\n  return v1\n  }\n}\n";
+        let m = program(DYN_LOAD);
+        validate::arm_capture();
+        compile_child_windowed(
+            &ChildCompile {
+                funcs: &m.funcs,
+                types: &m.types,
+                entry: 0,
+                mapped_log2: 16,
+                reserved_log2: 20, // reserved ≫ mapped: the branch, not confinement, bounds the index
+                thunk: cap_thunk,
+                addrs: InstanceAddrs {
+                    sched: core::ptr::NonNull::<c_void>::dangling().as_ptr(),
+                    nursery: core::ptr::NonNull::<c_void>::dangling().as_ptr(),
+                    pages: core::ptr::NonNull::<AtomicU8>::dangling().as_ptr(),
+                    ..InstanceAddrs::NONE
+                },
+                impl_exports: &[],
+                table_reserve_log2: 0,
+                shadow: temen_ir::durable_abi::ShadowArena::EMPTY,
+                page_miss: Some(page_miss),
+            },
+            None,
+        )
+        .expect("a paged child's compile");
+        let caps = validate::take_capture();
+        assert!(
+            !caps.is_empty(),
+            "the compile defined no functions to check"
+        );
+        for (i, c) in caps.iter().enumerate() {
+            let guest = validate::Guest {
+                window: c.window,
+                table: c.table,
+                types: &c.types,
+            };
+            let frame = validate::Frame {
+                stack_args: c.contract.and_then(|k| k.pops),
+                sret_results: c.sret_results,
+            };
+            let findings =
+                validate::x86::check(&c.code, &c.relocs, validate::Entry::Guest(&guest), frame);
+            assert!(
+                findings.is_empty(),
+                "demand-paged fn#{i} ({} bytes) flagged: {findings:#?}",
+                c.code.len()
+            );
+        }
+    }
+
     const EMIT_TO: &str = "TEMEN_JIT_EMIT_TO";
 
     /// The half of [`two_processes_emit_the_same_code`] that runs in a process of its own: it
@@ -7878,6 +7945,8 @@ fn compile_child_windowed(
         window: (mask != 0).then(|| validate::WindowLayout {
             mask,
             guard_offset: guard_offset_of(reserved),
+            // #2164 — a demand-paged child's access table covers its declared window's pages.
+            pages: if page.is_paged() { page.pages } else { 0 },
         }),
         table: fn_table_mask + 1,
         types: &dyn_contracts,
