@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 use temen_interp::{
-    maps_pool, reserved_pool, HeldDomain, Host, Reply, RootWindow, Value, MAPS_PER_DOMAIN,
-    MAPS_PER_VCPU,
+    maps_pool, reserved_pool, Executor, HeldDomain, Host, Reply, RootWindow, Value,
+    MAPS_PER_DOMAIN, MAPS_PER_VCPU,
 };
 
 /// The address space a window of the default reservation holds of the pool.
@@ -52,6 +52,13 @@ fn a_held_domain_holds_its_window_until_it_ends() {
         eprintln!("skipped: no address-space pool, or a pool of mappings too small to fill it");
         return;
     }
+    // In turn, on every executor that holds domains: the pool is the process's, so one at a time.
+    for on in [Executor::TreeWalker, Executor::Pump] {
+        holds_its_window_until_it_ends(on, slots);
+    }
+}
+
+fn holds_its_window_until_it_ends(on: Executor, slots: u64) {
     // Other runs of the process hold every window but one.
     let mut others: Vec<Host> = std::iter::from_fn(hold).collect();
     assert_eq!(others.len() as u64, slots, "the pool holds its windows");
@@ -64,8 +71,9 @@ fn a_held_domain_holds_its_window_until_it_ends() {
     // On a thread of its own, so a run that hangs fails the test instead of stalling the suite.
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let (d, results) = HeldDomain::start(m, 0, &[], u64::MAX, host)
+        let (d, results) = HeldDomain::start(on, m, 0, &[], u64::MAX, host)
             .unwrap_or_else(|(t, _)| panic!("the entry ends in {t:?}"));
+        assert_eq!(d.executor(), on, "the domain runs where it was started");
         assert_eq!(
             results,
             vec![Value::I64(1)],
@@ -80,8 +88,8 @@ fn a_held_domain_holds_its_window_until_it_ends() {
     let (while_held, trap, after) = rx
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("the domain ends");
-    assert!(!while_held, "a held domain keeps its window");
+    assert!(!while_held, "a held domain on {on:?} keeps its window");
     assert_eq!(trap, None);
-    assert!(after, "its end hands the window back");
+    assert!(after, "its end on {on:?} hands the window back");
     drop(others);
 }

@@ -2298,37 +2298,77 @@ pub fn run_with_host(
 /// its entry and takes calls until it ends itself (an exit or a trap, by any of its members) or its
 /// embedder ends it ([`HeldDomain::end`], or dropping the handle).
 ///
-/// Between calls it is a process: its threads keep running, on the tree-walker's own workers. A call
-/// ([`HeldDomain::call`]), or a call into it from a domain of its run (a live offer), runs as an
-/// **activation**: a new fiber in the domain at the op's handler, called with exactly the op's
+/// Between calls it is a process: its threads keep running wherever its [`Executor`] runs threads.
+/// A call ([`HeldDomain::call`]), or a call into it from a domain of its run (a live offer), runs as
+/// an **activation**: a new fiber in the domain at the op's handler, called with exactly the op's
 /// arguments, on the caller's thread, which funds it. The domain's calls run one at a time, each
-/// until it parks (`Single`, DESIGN.md §12a); its own threads run beside them. The tree-walker runs
-/// held domains; the other engines do not yet.
+/// until it parks (`Single`, DESIGN.md §12a); its own threads run beside them.
 pub struct HeldDomain {
-    link: Arc<HeldLink>,
-    run: Option<HeldRun>,
+    on: HeldOn,
+}
+
+/// #2695 step 2 — the executor a held domain runs on ([`HeldDomain::start`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Executor {
+    /// The tree-walker, the oracle. Its threads run on its own workers, between calls too.
+    TreeWalker,
+    /// The bytecode engine's cooperative driver, which has no thread of its own: the domain runs only
+    /// on a thread its embedder lends it, by calling in or pumping ([`HeldDomain::pump`]). It holds
+    /// the modules the bytecode engine admits; the tree-walker holds the others (INVARIANTS #9).
+    Pump,
+}
+
+/// Where a [`HeldDomain`] runs.
+enum HeldOn {
+    Tree {
+        link: Arc<HeldLink>,
+        /// The run, until the handle ends it.
+        run: Option<HeldRun>,
+    },
+    Pump(Box<bytecode::HeldPump>),
 }
 
 /// The thread a held domain's run is on, which answers the run and hands the powerbox back.
 type HeldRun = std::thread::JoinHandle<(Result<Vec<Value>, Trap>, Host)>;
 
+/// #2695 step 2 — who holds a domain ([`Host::held`]): the tree-walker's run, through its link, or
+/// the pump ([`bytecode::HeldPump`]).
+pub(crate) enum Holder {
+    Tree(Arc<HeldLink>),
+    Pump,
+}
+
 impl HeldDomain {
-    /// Run `entry` of `m` with `args` over `host`, the domain's powerbox, with `fuel` for the domain's
-    /// own work: its entry and its threads. Once the entry returns, the domain rests and this answers
-    /// the handle and the entry's results. If the domain ends first, it answers the trap that ended
-    /// it and the powerbox. A durable domain cannot be held yet: it is refused with `ThreadFault`.
+    /// Run `entry` of `m` with `args` over `host`, the domain's powerbox, on executor `on`, with
+    /// `fuel` for the domain's own work: its entry and its threads. Once the entry returns, the
+    /// domain rests and this answers the handle and the entry's results. If the domain ends first, it
+    /// answers the trap that ended it and the powerbox. A durable domain cannot be held yet: it is
+    /// refused with `ThreadFault`.
     pub fn start(
+        on: Executor,
         m: Arc<Module>,
         entry: FuncIdx,
         args: &[Value],
         fuel: u64,
-        mut host: Host,
+        host: Host,
     ) -> Result<(HeldDomain, Vec<Value>), (Trap, Box<Host>)> {
+        let mut host = match on {
+            Executor::Pump => match bytecode::HeldPump::start(&m, entry, args, fuel, host) {
+                Ok(Ok((p, results))) => {
+                    let on = HeldOn::Pump(Box::new(p));
+                    return Ok((HeldDomain { on }, results));
+                }
+                Ok(Err(refused)) => return Err(refused),
+                // The pump declines the module, and the oracle holds it.
+                Err(host) => *host,
+            },
+            Executor::TreeWalker => host,
+        };
         if host.is_durable() {
             return Err((Trap::ThreadFault, Box::new(host)));
         }
         let link = Arc::new(HeldLink::default());
-        host.held = Some(Arc::clone(&link));
+        host.held = Some(Holder::Tree(Arc::clone(&link)));
         let (args, ended) = (args.to_vec(), Arc::clone(&link));
         let run = std::thread::spawn(move || {
             let mut fuel = fuel;
@@ -2338,13 +2378,13 @@ impl HeldDomain {
             (r, host)
         });
         match link.wait_rest() {
-            Some(results) => Ok((
-                HeldDomain {
+            Some(results) => {
+                let on = HeldOn::Tree {
                     link,
                     run: Some(run),
-                },
-                results,
-            )),
+                };
+                Ok((HeldDomain { on }, results))
+            }
             None => {
                 let (r, host) = join_held(run);
                 Err((r.err().unwrap_or(Trap::ThreadFault), Box::new(host)))
@@ -2358,7 +2398,11 @@ impl HeldDomain {
     /// or a call of another arity, and `CAP_REVOKED` once the domain has ended, as a call into a dead
     /// domain answers (INVARIANTS #8, rule (i)).
     pub fn call(&self, export: u32, op: u32, args: &[i64], fuel: &mut u64) -> Reply {
-        let Some(sched) = self.link.scheduler() else {
+        let link = match &self.on {
+            HeldOn::Tree { link, .. } => link,
+            HeldOn::Pump(p) => return p.call(export, op, args, fuel),
+        };
+        let Some(sched) = link.scheduler() else {
             return Reply::Failed(CAP_REVOKED);
         };
         let wait = Arc::new(EmbedderReply::default());
@@ -2384,30 +2428,51 @@ impl HeldDomain {
         reply
     }
 
+    /// Let the domain run on this thread until nothing in it can run without something outside it
+    /// acting. Only a domain on the pump needs it: its threads run only on a thread its embedder
+    /// lends it. On the tree-walker they run on their own, and this returns at once.
+    pub fn pump(&self) {
+        if let HeldOn::Pump(p) = &self.on {
+            p.pump();
+        }
+    }
+
+    /// The executor the domain runs on: the one it was started on, or the tree-walker if the pump
+    /// declined its module.
+    pub fn executor(&self) -> Executor {
+        match self.on {
+            HeldOn::Tree { .. } => Executor::TreeWalker,
+            HeldOn::Pump(_) => Executor::Pump,
+        }
+    }
+
     /// End the domain: its threads stop where they are, and its powerbox comes back, with the trap
     /// that ended the domain first if one did.
     pub fn end(mut self) -> (Host, Option<Trap>) {
-        let (r, host) = self.finish();
-        (host, r.err())
+        self.finish().expect("a held domain ends once")
     }
 
-    fn finish(&mut self) -> (Result<Vec<Value>, Trap>, Host) {
-        if let Some(sched) = self.link.scheduler() {
+    /// End the domain unless its handle already has.
+    fn finish(&mut self) -> Option<(Host, Option<Trap>)> {
+        let (link, run) = match &mut self.on {
+            HeldOn::Tree { link, run } => (link, run.take()?),
+            HeldOn::Pump(p) => return p.finish(),
+        };
+        if let Some(sched) = link.scheduler() {
             let mut s = sched.lock();
             s.held_open = false;
             teardown_run(&mut s);
             drop(s);
             sched.work.notify_all();
         }
-        join_held(self.run.take().expect("a held domain ends once"))
+        let (r, host) = join_held(run);
+        Some((host, r.err()))
     }
 }
 
 impl Drop for HeldDomain {
     fn drop(&mut self) {
-        if self.run.is_some() {
-            let _ended = self.finish();
-        }
+        let _ended = self.finish();
     }
 }
 
@@ -7130,6 +7195,11 @@ impl EmbedderReply {
     fn post(&self, reply: Reply, fuel: u64) {
         *self.cell.lock_unpoisoned() = Some((reply, fuel));
         self.ready.notify_all();
+    }
+
+    /// The reply, if it has been posted.
+    fn take(&self) -> Option<(Reply, u64)> {
+        self.cell.lock_unpoisoned().take()
     }
 
     fn wait(&self) -> (Reply, u64) {
@@ -25854,8 +25924,8 @@ pub struct Host {
     /// default ⇒ today's enqueue+park transport, byte-identical. The `handoff-on ≡ handoff-off`
     /// differential pin toggles exactly this.
     handoff: bool,
-    /// #2695 step 2 — the link to the embedder holding this domain ([`HeldDomain`]), while it does.
-    held: Option<Arc<HeldLink>>,
+    /// #2695 step 2 — the embedder holding this domain ([`HeldDomain`]), while it does.
+    held: Option<Holder>,
     /// DURABILITY.md §13.3 — this domain's **stable identity** for every serve-path key
     /// (`svc_waiters`/`svc_timers` keys, fiber waiters' domain field, `svc_wake` targets):
     /// process-unique, minted at construction. The `Arc` pointer it replaces was
@@ -28429,9 +28499,13 @@ impl Host {
         self.handoff
     }
 
-    /// #2695 step 2 — the link to the embedder holding this domain ([`HeldDomain`]), while it does.
+    /// #2695 step 2 — the link to the embedder holding this domain on the tree-walker
+    /// ([`HeldDomain`]), while it does.
     pub(crate) fn held_link(&self) -> Option<Arc<HeldLink>> {
-        self.held.clone()
+        match &self.held {
+            Some(Holder::Tree(link)) => Some(Arc::clone(link)),
+            _ => None,
+        }
     }
 
     /// #1458 — capture every host capability's declared state, positionally over `host_procs`

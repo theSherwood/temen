@@ -8256,6 +8256,7 @@ impl ScheduledDebugRun {
                     (s, _) => s.clone(),
                 },
                 at_bp: ts.at_bp,
+                answers: None, // a debug session holds no domain
                 lease: ts.lease,
                 // #2001 — a live thread is charged again; the task it replaces hands its charge
                 // back as it drops.
@@ -11672,6 +11673,18 @@ struct TaskSlot {
     /// A debug session's: the task is paused on the breakpoint it just reported, so its next step
     /// runs one op past it before a scan looks for the next stop.
     at_bp: bool,
+    /// #2695 step 2 — `Some` on an **activation** of a held domain: a call it runs, at the op's
+    /// handler, on the fuel of the caller it answers. It charges its domain no vCPU.
+    answers: Option<Box<Answers>>,
+}
+
+/// #2695 step 2 — the call an activation of a held domain answers ([`TaskSlot::answers`]).
+struct Answers {
+    /// Where its reply goes: the dispatch's ticket, or the embedder's wait.
+    to: super::AnswerTo,
+    /// The fuel it runs on: what its caller lends it, the caller's node or the embedder's
+    /// allowance. A thread it spawns runs on its domain's own.
+    fuel: Fuel,
 }
 
 impl TaskSlot {
@@ -11688,6 +11701,7 @@ impl TaskSlot {
             lease: None,
             live,
             at_bp: false,
+            answers: None,
         }
     }
 
@@ -12166,6 +12180,9 @@ fn drive(
             CoopStep::JitInvoke { .. } => {
                 unreachable!("Jit.invoke surfacing not enabled on the native driver")
             }
+            CoopStep::Rested(_) | CoopStep::Answered => {
+                unreachable!("only a held run rests")
+            }
         }
     })();
     *host = Host::from_cell(root);
@@ -12225,6 +12242,10 @@ enum CoopStep {
         mapped: u64,
         memory: Option<u32>,
     },
+    /// #2695 step 2 — a held run's entry returned these results: its domain rests ([`Held`]).
+    Rested(Vec<Value>),
+    /// #2695 step 2 — an activation answered its embedder's call ([`super::AnswerTo::Embedder`]).
+    Answered,
 }
 
 /// Where a tier-up's results land ([`Outcome::TierUp`], [`EmitTier::pending_tierup`]).
@@ -12393,6 +12414,105 @@ struct SchedCore {
     /// The scheduler's logical clock, in ns: it moves by the ops of each quantum that runs out
     /// (#2224), and jumps to the earliest `wait` deadline when no task is runnable.
     clock: u64,
+    /// #2695 step 2 — `Some` while the run's embedder holds its root domain ([`HeldPump`]).
+    held: Option<Held>,
+}
+
+/// #2695 step 2 — a run whose root domain its embedder holds past its entry ([`HeldPump`]). Once
+/// the entry returns, the domain rests: each call into it runs as an **activation**, a task of the
+/// domain at the op's handler on its caller's fuel ([`TaskSlot::answers`]), and its threads run on.
+#[derive(Default)]
+struct Held {
+    /// Once the entry has returned, the thread-local word its main thread left: each activation
+    /// starts with it, as the calls of a `Single` domain run as its main thread would run them.
+    rest: Option<i64>,
+    /// The activation that holds the domain's `Single` gate (DESIGN.md §12a): it runs until it
+    /// parks, holding the gate across a quantum's end, while the domain's other calls wait.
+    gate: Option<usize>,
+    /// The slots of activations that have answered, for later ones to take: no one joins an
+    /// activation, so its slot names nothing once it is done.
+    free: Vec<usize>,
+}
+
+impl Held {
+    /// Whether the domain rests: its entry has returned, and calls run as activations.
+    fn rests(held: &Option<Held>) -> bool {
+        held.as_ref().is_some_and(|h| h.rest.is_some())
+    }
+}
+
+/// #2695 step 2 — call op `op` of export `export` with `args` (i64 slots) on the resting held domain,
+/// the run's root, as an **activation**: a new task of the domain at the op's handler, called with
+/// exactly the op's arguments, running on `fuel` and answering `to`. It starts with the thread-local
+/// word the domain's main thread left, and charges the domain no vCPU. The errno of a call the domain
+/// cannot take: `-EINVAL` for an op its export lacks or a call of another arity, `CAP_REVOKED` for a
+/// domain that does not rest.
+#[allow(clippy::too_many_arguments)]
+fn activation(
+    tasks: &mut Vec<TaskSlot>,
+    domains: &[Domain],
+    held: &mut Held,
+    source: &ModuleSource,
+    export: u32,
+    op: u32,
+    args: &[i64],
+    fuel: Fuel,
+    to: super::AnswerTo,
+) -> Result<(), i64> {
+    let tls = held.rest.ok_or(super::CAP_REVOKED)?;
+    let host = domains[0].host.lock_unpoisoned();
+    let unit = source.primary();
+    let func = (host.svc_handler_func(export, op))
+        .filter(|&f| {
+            unit.sigs
+                .get(f as usize)
+                .is_some_and(|(p, _)| p.len() == args.len())
+        })
+        .ok_or(super::EINVAL)? as usize;
+    let vals: Vec<Value> = (unit.sigs[func].0.iter().zip(args))
+        .map(|(&ty, &slot)| slot_to_val(ty, slot))
+        .collect();
+    let mut vt =
+        VTask::new(&unit, func, &vals, Some(host.own_node())).map_err(|_| super::EAGAIN)?;
+    vt.active.tls = tls;
+    let slot = TaskSlot {
+        answers: Some(Box::new(Answers { to, fuel })),
+        ..TaskSlot::new(vt, 0, LiveVcpu::none())
+    };
+    match held.free.pop() {
+        Some(i) => tasks[i] = slot,
+        None => tasks.push(slot),
+    }
+    Ok(())
+}
+
+/// #2695 step 2 — every call queued on the resting held domain as an [`activation`], funded by the
+/// caller its enqueue named ([`super::Host::svc_payers`]): the calls that waited while its entry ran,
+/// and each call made since. A thread of the domain parked in `svc.wait` takes them instead: the
+/// guest chose to serve them so (INVARIANTS #4). A call the domain cannot take is answered at once.
+fn serve_resting(
+    tasks: &mut Vec<TaskSlot>,
+    domains: &[Domain],
+    held: &mut Held,
+    source: &ModuleSource,
+) {
+    let serves = |t: &TaskSlot| t.domain == 0 && matches!(t.state, TaskState::BlockedSvc);
+    if held.rest.is_none() || tasks.iter().any(serves) {
+        return;
+    }
+    let host = &domains[0].host;
+    let queued: Vec<super::SvcDispatch> = host.lock_unpoisoned().svc_queue.drain(..).collect();
+    for d in queued {
+        let payer = host.lock_unpoisoned().svc_payers.remove(&d.ticket);
+        let fuel = payer.map_or_else(|| domains[0].fuel.for_thread(), Fuel::drawn);
+        let to = super::AnswerTo::Ticket(d.ticket);
+        if let Err(errno) = activation(
+            tasks, domains, held, source, d.export, d.op, &d.args, fuel, to,
+        ) {
+            let reply = super::Reply::Failed(errno);
+            host.lock_unpoisoned().svc_results.insert(d.ticket, reply);
+        }
+    }
 }
 
 /// The cooperative pump's state for the host's emitted tier (#926): which programs' calls tier up,
@@ -12963,6 +13083,7 @@ impl SchedCore {
             hooked_twins: std::collections::BTreeSet::new(),
             released: Released::default(),
             clock: 0,
+            held: None,
         })
     }
 }
@@ -13083,6 +13204,7 @@ impl CoopSched {
                 hooked_twins,
                 released,
                 clock,
+                held,
             } = &mut *core;
             let EmitTier {
                 leaf,
@@ -13105,9 +13227,24 @@ impl CoopSched {
             // member's trap/exit is terminal for its whole DOMAIN — run the teardown fixpoint
             // before reading the root's state, so a sibling's trap that killed the root domain
             // surfaces as the run's result (previously the root's timed wait simply outlived it).
-            teardown_domains(tasks, domains, dead_domains);
+            let rests = Held::rests(held);
+            // #2695 step 2 — a resting held domain ends when any of its members exits or traps.
+            if let Some(trap) = teardown_domains(tasks, domains, dead_domains, rests) {
+                return Err(trap);
+            }
+            // #2695 step 2 — a held domain whose entry returned rests instead of ending the run: its
+            // threads run on, the calls that waited during the entry start, and its embedder hears
+            // the entry's results once.
+            if let (Some(h), TaskState::Done(Ok(vals)), false) =
+                (held.as_mut(), &tasks[0].state, rests)
+            {
+                let vals = vals.clone();
+                h.rest = Some(tasks[0].vm.vt.active.tls);
+                serve_resting(tasks, domains, h, source);
+                return Ok(CoopStep::Rested(vals));
+            }
             // The root's result is the run's result (other vCPUs' effects are already reflected in it).
-            if let TaskState::Done(res) = &tasks[0].state {
+            if let (false, TaskState::Done(res)) = (rests, &tasks[0].state) {
                 let res = res.clone();
                 // Freeze driver (DURABILITY.md §12.8 slice 3.1.4): a durable run left in `UNWINDING` has
                 // drained the root's native stack into context 0's region; now flatten the still-parked
@@ -13166,10 +13303,14 @@ impl CoopSched {
             let domain_stopped = |i: usize| !see_through && process_stopped(domains, &tasks[i]);
             // #1157 — round-robin from `last_pick + 1` (wrapping) rather than lowest-index-first.
             let n = tasks.len();
-            let Some(ti) = (1..=n)
-                .map(|k| (last_pick + k) % n)
-                .find(|&i| matches!(tasks[i].state, TaskState::Runnable) && !domain_stopped(i))
-            else {
+            // #2695 step 2 — the held domain's `Single` gate: while one activation holds it, running or
+            // preempted, its other activations wait.
+            let gate = held.as_ref().and_then(|h| h.gate);
+            let gate = gate.filter(|&g| matches!(tasks[g].state, TaskState::Runnable));
+            let gated = |i: usize| tasks[i].answers.is_some() && gate.is_some_and(|g| g != i);
+            let Some(ti) = (1..=n).map(|k| (last_pick + k) % n).find(|&i| {
+                matches!(tasks[i].state, TaskState::Runnable) && !domain_stopped(i) && !gated(i)
+            }) else {
                 // #1904 — bring the parks through a freeze before any timer fires or the run is
                 // called deadlocked.
                 if freeze_step(tasks, forked_twins, &mut domains[0], freeze_on_quiesce) {
@@ -13221,6 +13362,11 @@ impl CoopSched {
                     // terminal and pumps again, and the loop-top settle sees the deposit or the
                     // signal) instead of sleeping this thread on the bell.
                     let bell = domains[0].host.lock_unpoisoned().external_wake();
+                    // #2695 step 2 — a resting held domain is never stalled: its embedder can
+                    // always call in.
+                    if calls.is_empty() && rests {
+                        return Ok(CoopStep::Idle { timer: None });
+                    }
                     if calls.is_empty() {
                         match stalled(tasks, *embedder_pumps, bell.is_some()) {
                             Stalled::Idle => return Ok(CoopStep::Idle { timer: None }),
@@ -13245,6 +13391,12 @@ impl CoopSched {
                 continue;
             };
             last_pick = ti;
+            // #2695 step 2 — an activation takes the gate as it runs: whether it answers the embedder.
+            let activation =
+                (tasks[ti].answers.as_ref()).map(|a| matches!(a.to, super::AnswerTo::Embedder(_)));
+            if let (Some(h), Some(_)) = (held.as_mut(), activation) {
+                h.gate = Some(ti);
+            }
             // #1896 — a leaf's call that asked for a process in its bounce: start it, as the spawn
             // arm starts one for an interpreted caller, before the call runs on (below).
             let leaf_call = tasks[ti]
@@ -13318,10 +13470,13 @@ impl CoopSched {
             let cell = std::sync::Arc::clone(&domains[tasks[ti].domain].host);
             let mut guard = cell.lock_unpoisoned();
             let durable = guard.is_durable();
+            // #2695 step 2 — an activation steps on its caller's fuel, which goes back with its
+            // answer once the step is over.
+            let mut lent = tasks[ti].answers.take();
             let e = &mut domains[tasks[ti].domain];
             let mut ctx = RunCtx {
                 table: &e.table,
-                fuel: &mut e.fuel,
+                fuel: lent.as_mut().map_or(&mut e.fuel, |a| &mut a.fuel),
                 mem: &mut e.mem,
                 durable,
                 host: HostCell::Excl(&mut guard),
@@ -13347,6 +13502,7 @@ impl CoopSched {
                     leaf: Some(LeafCall { dst, results, .. }),
                 } = *s
                 else {
+                    tasks[ti].answers = lent;
                     complete(tasks, domains, ti, Err(Trap::Malformed));
                     continue;
                 };
@@ -13368,6 +13524,7 @@ impl CoopSched {
                 )
                 .map(Nested::done);
                 charge_slice(slice_left, ctx.fuel.can_burn());
+                tasks[ti].answers = lent;
                 let mut made = None;
                 match (done, parked) {
                     (Err(trap), _) => complete(tasks, domains, ti, Err(trap)),
@@ -13425,6 +13582,7 @@ impl CoopSched {
             };
             // The step is over: what follows may lock any domain's cell, this task's included.
             drop(guard);
+            tasks[ti].answers = lent;
             // The first fault recorded wins; the run entry clears the slot beforehand.
             if let Some(a) = fault {
                 super::LAST_CAPTURE_FAULT.with(|c| _ = c.borrow_mut().get_or_insert(a));
@@ -13449,6 +13607,20 @@ impl CoopSched {
             };
             if let Some(step) = core.on_stop(emit, source, ti, stop) {
                 return Ok(step);
+            }
+            // #2695 step 2 — an activation that has answered frees its slot, and the embedder's call
+            // it answered ends the pump: the thread the embedder lent goes back with the answer. One
+            // that trapped ended its domain, which the next round's teardown sees first.
+            if let (Some(embedder), TaskState::Done(res)) = (activation, &core.tasks[ti].state) {
+                let answered = res.is_ok();
+                if let (Some(h), true) = (core.held.as_mut(), answered) {
+                    // It held the gate to its end, and its slot is free for the next activation.
+                    h.gate = None;
+                    h.free.push(ti);
+                }
+                if embedder && answered {
+                    return Ok(CoopStep::Answered);
+                }
             }
             // #1414 D4 — the embedder hears of a call it answers as the call is made, once, while
             // the rest of the run waits for its next pump. A call answered inside its submit is
@@ -13593,6 +13765,7 @@ impl SchedCore {
             forked_twins,
             hooked_twins,
             clock,
+            held,
             ..
         } = self;
         let EmitTier {
@@ -13686,10 +13859,16 @@ impl SchedCore {
                     fail_call(tasks, domains, ti, dst, sig.results(), super::CAP_REVOKED);
                     return None;
                 }
+                // #2695 step 2 — a call made in a held run names who pays for it: the activation that
+                // serves it runs on its caller's fuel, whichever thread starts it.
+                let payer = held.as_ref().and_then(|_| match &tasks[ti].answers {
+                    Some(a) => a.fuel.source(),
+                    None => domains[tasks[ti].domain].fuel.source(),
+                });
                 // INVARIANTS #8: its handles are granted into the callee as the queue admits it.
                 let from = &mut super::CallerHost::Cell(&domains[tasks[ti].domain].host);
                 let enqueued =
-                    super::enqueue_live_call(from, &callee, export, op, args, sig.params(), None);
+                    super::enqueue_live_call(from, &callee, export, op, args, sig.params(), payer);
                 match enqueued {
                     Err(trap) => complete(tasks, domains, ti, Err(trap)),
                     // A full callee queue is probeable backpressure, the call's failure; the task
@@ -13709,6 +13888,10 @@ impl SchedCore {
                             dst,
                             sig,
                         };
+                        // #2695 step 2 — a resting held domain runs the call as an activation.
+                        if let (Some(h), Some(0)) = (held.as_mut(), callee_env) {
+                            serve_resting(tasks, domains, h, source);
+                        }
                     }
                 }
             }
@@ -14053,6 +14236,7 @@ impl SchedCore {
                 // then exec'ing an external command) are serviced; they differ only in where the
                 // rebuilt activation's window/host/table live.
                 let clean = tasks[ti].vm.vt.active.serve_ticket().is_none()
+                    && tasks[ti].answers.is_none()
                     && tasks[ti].vm.vt.active_id == ROOT_FIBER
                     && !domains[0].host.lock_unpoisoned().is_durable();
                 if !clean {
@@ -14147,7 +14331,7 @@ impl SchedCore {
                     tasks[ti].deliver(dst, Reg::from_i64(temen_ir::errno::ENOSYS));
                     return None;
                 }
-                if tasks[ti].vm.vt.active.serve_ticket().is_some() {
+                if tasks[ti].vm.vt.active.serve_ticket().is_some() || tasks[ti].answers.is_some() {
                     tasks[ti].deliver(dst, Reg::from_i64(super::EINVAL));
                     return None;
                 }
@@ -14892,6 +15076,220 @@ struct PumpRun {
     sched: CoopSched,
 }
 
+/// #2695 step 2 — a held domain on the pump ([`super::HeldDomain`]). The pump has no thread of its
+/// own: the domain runs only on a thread its embedder lends it, by calling in ([`Self::call`]) or
+/// pumping ([`Self::pump`]). One lent thread pumps at a time. It lets go at its own call's answer,
+/// and wherever nothing can run until something outside the run acts, when it sleeps on the run's
+/// bell. A call another thread makes meanwhile waits for it to let go.
+pub(crate) struct HeldPump {
+    /// The run, until its embedder ends it.
+    state: std::sync::Mutex<Option<HeldRun>>,
+    /// The run's doorbell, its powerbox's external-wake bell: it rings for a call made, an answer to
+    /// a punted call, an input or a signal. A thread whose call waits sleeps on it.
+    bell: super::Bell,
+}
+
+/// A held domain's run on the pump ([`HeldPump`]).
+struct HeldRun {
+    run: PumpRun,
+    /// The entry's results, once the domain rests and until [`HeldPump::start`] takes them.
+    rested: Option<Vec<Value>>,
+    /// The trap that ended the domain, once one of its members exited or trapped.
+    ended: Option<Trap>,
+}
+
+impl HeldPump {
+    /// Run `entry` of `m` with `args` over `host` on this thread, with `fuel` for the domain's own
+    /// work, until the entry returns and the domain rests: the handle and the entry's results. If
+    /// the domain ends first, the trap that ended it and the powerbox. A durable domain is refused
+    /// with `ThreadFault`. The outer `Err` hands the powerbox back: the pump declines `m`.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn start(
+        m: &Module,
+        entry: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        mut host: Host,
+    ) -> Result<Result<(HeldPump, Vec<Value>), (Trap, Box<Host>)>, Box<Host>> {
+        let Some(c) = compile_module_for(m, true) else {
+            return Err(Box::new(host));
+        };
+        if host.is_durable() {
+            return Ok(Err((Trap::ThreadFault, Box::new(host))));
+        }
+        if entry as usize >= c.progs.len() {
+            return Ok(Err((Trap::Malformed, Box::new(host))));
+        }
+        let source = ModuleSource::shared(std::sync::Arc::new(c));
+        let table = source.root_table(host.jit_table_log2());
+        let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
+        clear_session_fault();
+        if host.external_wake().is_none() {
+            host.arm_external_wake();
+        }
+        let bell = host.external_wake().expect("armed above");
+        host.held = Some(super::Holder::Pump);
+        let Some(node) = host.begin_activation(fuel, RootWindow::of(mem.as_ref())) else {
+            host.held = None;
+            return Ok(Err((Trap::ThreadFault, Box::new(host))));
+        };
+        let root = host.into_cell();
+        let cell = std::sync::Arc::clone(&root);
+        let made = CoopSched::new(
+            &source,
+            table,
+            entry,
+            args,
+            Fuel::drawn(node),
+            &mut mem,
+            cell,
+            None,
+        );
+        let mut sched = match made {
+            Ok(sched) => sched,
+            Err(t) => {
+                let mut host = Host::from_cell(root);
+                host.held = None;
+                return Ok(Err((t, Box::new(host))));
+            }
+        };
+        sched.embedder_pumps = true;
+        sched.core.held = Some(Held::default());
+        let run = HeldRun {
+            run: PumpRun { source, sched },
+            rested: None,
+            ended: None,
+        };
+        let held = HeldPump {
+            state: std::sync::Mutex::new(Some(run)),
+            bell,
+        };
+        let g = held.state.lock_unpoisoned();
+        match held.lend(g, |r| r.rested.take().map(Ok).or(r.ended.map(Err))) {
+            Ok(results) => Ok(Ok((held, results))),
+            Err(trap) => {
+                let (host, _) = held.finish().expect("not yet ended");
+                Ok(Err((trap, Box::new(host))))
+            }
+        }
+    }
+
+    /// [`super::HeldDomain::call`] on the pump: the call runs as an activation, on this thread, which
+    /// pumps the run until the call is answered.
+    pub(crate) fn call(&self, export: u32, op: u32, args: &[i64], fuel: &mut u64) -> super::Reply {
+        let wait = std::sync::Arc::new(super::EmbedderReply::default());
+        let mut g = self.state.lock_unpoisoned();
+        let Some(r) = g.as_mut().filter(|r| r.ended.is_none()) else {
+            return super::Reply::Failed(super::CAP_REVOKED);
+        };
+        let PumpRun { source, sched } = &mut r.run;
+        let core = &mut sched.core;
+        let held = core.held.as_mut().expect("a held run");
+        let to = super::AnswerTo::Embedder(std::sync::Arc::clone(&wait));
+        let lent = Fuel::fixed(*fuel);
+        let made = activation(
+            &mut core.tasks,
+            &core.domains,
+            held,
+            source,
+            export,
+            op,
+            args,
+            lent,
+            to,
+        );
+        if let Err(errno) = made {
+            return super::Reply::Failed(errno);
+        }
+        // The activation answers however it ends: an end of the domain answers it `CAP_REVOKED`.
+        let (reply, left) = self.lend(g, |_| wait.take());
+        *fuel = left;
+        reply
+    }
+
+    /// [`super::HeldDomain::pump`] on the pump: run the domain on this thread until nothing in it can
+    /// run until something outside it acts.
+    pub(crate) fn pump(&self) {
+        let mut g = self.state.lock_unpoisoned();
+        while let Some(r) = g.as_mut().filter(|r| r.ended.is_none()) {
+            if let Ok(CoopStep::Idle { .. }) = Self::step(r) {
+                return;
+            }
+        }
+    }
+
+    /// Lend the run this thread until `done` has what the thread waits for: pump the run while
+    /// nothing else does, and sleep on its bell while nothing in it can run.
+    fn lend<'a, T>(
+        &'a self,
+        mut g: std::sync::MutexGuard<'a, Option<HeldRun>>,
+        mut done: impl FnMut(&mut HeldRun) -> Option<T>,
+    ) -> T {
+        loop {
+            let r = g.as_mut().expect("a run its handle has not ended");
+            if let Some(t) = done(r) {
+                // Another caller may be waiting for the run to let go.
+                drop(g);
+                super::ring(&self.bell);
+                return t;
+            }
+            let Ok(CoopStep::Idle { timer }) = Self::step(r) else {
+                continue;
+            };
+            // Nothing can run until something outside the run acts: an answer to a punted call, a
+            // call another thread makes, an input, a signal, or the time to the next timer.
+            let seen = *self.bell.0.lock_unpoisoned();
+            let core = &r.run.sched.core;
+            let calls: Vec<_> = (outstanding_calls(&core.tasks, &core.domains).into_iter())
+                .map(|(env, id)| (core.domains[env].host.lock_unpoisoned().completions(), id))
+                .collect();
+            drop(g);
+            let since = std::time::Instant::now();
+            let within = timer.map(std::time::Duration::from_nanos);
+            super::Completions::wait_any(&calls, Some((&self.bell, seen)), within);
+            g = self.state.lock_unpoisoned();
+            if let Some(r) = g.as_mut() {
+                let passed = since.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
+                r.run.sched.core.pass_time(passed);
+            }
+        }
+    }
+
+    /// Pump `r` to its next stop, recording what it says of the domain: its rest, or its end.
+    fn step(r: &mut HeldRun) -> Result<CoopStep, Trap> {
+        let step = r.run.sched.pump(&r.run.source, u64::MAX);
+        match &step {
+            Ok(CoopStep::Rested(results)) => r.rested = Some(results.clone()),
+            Err(trap) => r.ended = Some(*trap),
+            _ => {}
+        }
+        step
+    }
+
+    /// [`super::HeldDomain::end`] on the pump: the run ends where it is, and the powerbox comes back,
+    /// with the trap that ended the domain first if one did. What the domain held goes back: its
+    /// window's share of the address space, its children's windows and its pipe ends. `None` once
+    /// the handle has ended it.
+    pub(crate) fn finish(&self) -> Option<(Host, Option<Trap>)> {
+        let r = self.state.lock_unpoisoned().take()?;
+        let HeldRun {
+            run: PumpRun { mut sched, .. },
+            ended,
+            ..
+        } = r;
+        let core = &mut sched.core;
+        refund_ended_windows(&mut core.tasks, &mut core.domains, true);
+        let root = std::sync::Arc::clone(&core.domains[0].host);
+        // The tasks hand their fuel back as they go, before the powerbox does.
+        drop(sched);
+        let mut host = Host::from_cell(root);
+        host.held = None;
+        host.release_memory();
+        host.release_pipe_ends();
+        Some((host, ended))
+    }
+}
+
 /// A session starts with no faulting address recorded: the slot is per run, and the scheduler keeps
 /// the first fault it records, so a leftover from the previous session would stand in for this one's
 /// (and a fault that records none, such as one in emitted code, would report it). Every run is built
@@ -15399,6 +15797,9 @@ impl CoopRun {
                 mapped,
                 memory,
             },
+            Ok(CoopStep::Rested(_) | CoopStep::Answered) => {
+                unreachable!("a run is held only by its handle")
+            }
             Err(t) => CoopEvent::Trapped(t),
         }
     }
@@ -17066,7 +17467,13 @@ impl ThreadRun {
     /// lock, so the run cannot go idle unseen.
     fn settle(&self, g: &mut Threads) {
         let core = &mut g.core;
-        teardown_domains(&mut core.tasks, &mut core.domains, &mut core.dead_domains);
+        let rests = Held::rests(&core.held);
+        teardown_domains(
+            &mut core.tasks,
+            &mut core.domains,
+            &mut core.dead_domains,
+            rests,
+        );
         core.clock = self.now();
         time_out_due(
             &mut core.tasks,
@@ -17363,6 +17770,10 @@ fn complete(tasks: &mut [TaskSlot], envs: &mut [Domain], ti: usize, res: Result<
     while let Some((done, res)) = work.pop() {
         tasks[done].state = TaskState::Done(res.clone());
         tasks[done].live = LiveVcpu::none(); // #2001: its `spawn` goes back
+                                             // #2695 step 2 — an activation answers its call, however it ends.
+        if let Some(a) = tasks[done].answers.take() {
+            answer(*a, &res, &envs[tasks[done].domain]);
+        }
         let joiners: Vec<(usize, i32, u32)> = (0..tasks.len())
             .filter_map(|j| match tasks[j].state {
                 TaskState::BlockedJoin { child, handle, dst } if child == done => {
@@ -17385,6 +17796,30 @@ fn complete(tasks: &mut [TaskSlot], envs: &mut [Domain], ti: usize, res: Result<
                 Err(trap) => work.push((j, Err(trap))),
             }
         }
+    }
+}
+
+/// #2695 step 2 — activation `a` of domain `d` ended with `res`: its reply is every result its
+/// handler returned (INVARIANTS #8), or `CAP_REVOKED` for a trap or an exit, which ends `d`. A reply
+/// to a page request first moves the page's bytes out of `d`'s window (#1862). An embedder hears what
+/// is left of the fuel it lent.
+fn answer(a: Answers, res: &Result<Vec<Value>, Trap>, d: &Domain) {
+    let reply = match res {
+        Ok(vals) => {
+            let mut slots: Vec<i64> = vals.iter().map(|&v| val_to_slot(v)).collect();
+            if let (super::AnswerTo::Ticket(t), Some(first)) = (&a.to, slots.first_mut()) {
+                let mem = d.mem.as_ref().map(|m| m as &dyn super::GuestMem);
+                *first = d.host.lock_unpoisoned().settle_page(*t, *first, mem);
+            }
+            super::Reply::Results(slots)
+        }
+        Err(_) => super::Reply::Failed(super::CAP_REVOKED),
+    };
+    match a.to {
+        super::AnswerTo::Ticket(t) => {
+            d.host.lock_unpoisoned().svc_results.insert(t, reply);
+        }
+        super::AnswerTo::Embedder(w) => w.post(reply, a.fuel.can_burn()),
     }
 }
 
@@ -17908,24 +18343,30 @@ fn time_out_waits(tasks: &mut [TaskSlot], clock: u64) {
 /// root domain's death is read by the caller's loop-top root check — a sibling's trap becomes the
 /// run's result — so the root is never marked dead. Runs before anything is scheduled, so teardown
 /// is "next safepoint" prompt in the cooperative model.
+///
+/// #2695 step 2 — unless the root domain `rests`, held by its embedder past its entry: it then dies
+/// as a child does, once, its callers answered `CAP_REVOKED`, and the trap that ended it is returned.
 fn teardown_domains(
     tasks: &mut [TaskSlot],
     domains: &mut [Domain],
     dead_domains: &mut std::collections::BTreeSet<usize>,
-) {
+    rests: bool,
+) -> Option<Trap> {
+    let mut ended = None;
     loop {
         let hit = tasks.iter().find_map(|t| {
             if let TaskState::Done(Err(trap)) = &t.state {
                 match t.domain {
                     // The root domain: a live member left means the sweep hasn't run yet (once
                     // every member is Done the caller's root check ends the run).
-                    0 if tasks
-                        .iter()
-                        .any(|u| u.domain == 0 && !matches!(u.state, TaskState::Done(_))) =>
+                    0 if !rests
+                        && tasks
+                            .iter()
+                            .any(|u| u.domain == 0 && !matches!(u.state, TaskState::Done(_))) =>
                     {
                         return Some((0, *trap));
                     }
-                    0 => {}
+                    0 if !rests => {}
                     // A child domain is processed exactly once (`dead_domains` is the marker), even
                     // when the trapping member was its only vCPU — a later call through it must
                     // still find it dead (errno, not a deadlock).
@@ -17937,9 +18378,14 @@ fn teardown_domains(
             }
             None
         });
-        let Some((env, trap)) = hit else { return };
-        if env != 0 {
+        let Some((env, trap)) = hit else {
+            return ended;
+        };
+        if env != 0 || rests {
             dead_domains.insert(env);
+        }
+        if env == 0 && rests {
+            ended = Some(trap);
         }
         for i in 0..tasks.len() {
             if tasks[i].domain == env && !matches!(tasks[i].state, TaskState::Done(_)) {
@@ -17950,7 +18396,7 @@ fn teardown_domains(
         // against its host with the probeable errno (queued or admitted — no reply will ever
         // come), and drop the queue. Later calls are refused at the LiveCall arm (`dead_domains`).
         // A fault parked on a page it was to supply is a pagerless one (#2164), and its sink goes.
-        if env != 0 {
+        if env != 0 || rests {
             let dying = std::sync::Arc::clone(&domains[env].host);
             let mut stranded = Vec::new();
             let mut unanswered = Vec::new();
@@ -17978,6 +18424,7 @@ fn teardown_domains(
             }
             let mut h = dying.lock_unpoisoned();
             h.svc_queue.clear();
+            h.svc_payers.clear();
             h.page_sinks.clear();
         }
     }
@@ -19817,7 +20264,15 @@ impl Vm {
                     // re-executes this op (pc deliberately NOT advanced).
                     let mut admitted = false;
                     loop {
-                        let d = host.with(|p| p.svc_queue.pop_front());
+                        // A thread serving the call runs it on its own fuel: the payer a held
+                        // domain names for its activations goes.
+                        let d = host.with(|p| {
+                            let d = p.svc_queue.pop_front();
+                            if let Some(d) = &d {
+                                p.svc_payers.remove(&d.ticket);
+                            }
+                            d
+                        });
                         let Some(d) = d else { break };
                         // The queue only holds servable dispatches (checked at enqueue), so a
                         // missing handler here is host-state corruption: fail closed. Handlers

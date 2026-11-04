@@ -2515,7 +2515,7 @@ metering is read-before minus read-after. Deferred, named-consumer-gated: a per-
 (caller-side D19 attenuation) and an admission fuel floor (gate-side refusal when the caller
 can't fund a handler).
 
-### Held domains — a domain at rest takes calls as a library provider does  [BUILT on the tree-walker, #2695 step 2]
+### Held domains — a domain at rest takes calls as a library provider does  [BUILT on the tree-walker and the pump, #2695 step 2]
 
 A domain its embedder holds (`HeldDomain`) outlives its entry: once the entry returns, it
 **rests**. Its threads keep running, and it ends only when it ends itself (any member's exit or
@@ -2532,7 +2532,7 @@ no running main, so each call into it, from its embedder or from a domain of its
 - **Admitted by the callee's policy**: `Single`, run-to-park, serializes the domain's activations
   against each other, never against its own threads. The tree-walker builds that as a lane of
   width 1 over the activations (D66's mechanism: held across a quantum's end, given back at a
-  park).
+  park); the pump, as a gate its pick checks, with the same rules.
 - **With the thread-local word the domain's main thread left** (`vcpu.tls`). Under `Single` the
   calls run one at a time, as that thread would run them. The caller's word would name the
   caller's memory.
@@ -2543,6 +2543,13 @@ funded by its caller. A thread of the domain parked in `svc.wait` takes calls fi
 there is the guest's choice. A handler's trap ends the domain (INVARIANTS #6). Every call it had
 not answered, and every later one, answers `CAP_REVOKED`, the embedder's included (rule (i)).
 While the domain is held, its run has no stall verdict, since the embedder can always call in.
+
+The executor is the embedder's choice (`Executor`). On the tree-walker the domain's threads run on
+its own workers, between calls too. The bytecode engine's pump has no thread of its own, so a
+domain it holds runs only on a thread its embedder lends it: a call, which runs the domain until
+the call is answered, or a pump, which runs it until nothing in it can run. One lent thread runs
+it at a time. An activation there is a task of the domain on its caller's fuel, which charges no
+vCPU. A module the pump declines is held by the tree-walker (INVARIANTS #9).
 
 ### Invariants this holds
 
