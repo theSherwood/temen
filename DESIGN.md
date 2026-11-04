@@ -310,7 +310,12 @@ found (#2603):
 - A call runs its callee's contract: it clobbers the registers that contract names and the flags, and
   moves `rsp` by what the callee pops (a `Tail` callee its stack arguments). The callee is known only
   from a relocation, a vmctx cell, or a fn-table entry whose type the code checked; any other is
-  rejected.
+  rejected. A fn-table dispatch whose checked type id is out of range is the `NO_MATCH` sentinel no
+  installed record carries (§3c), so that edge is unreachable and the dispatch always traps; it still
+  gets the standard no-pop dispatch contract, so a dead dispatch keeps `rsp` tracked instead of
+  decoding as unidentified and poisoning it through a loop (the async-signal handler dispatch in a
+  module with no handler-typed function is one — else its re-poll back-edge cascaded a whole
+  signal-armed function to a false rejection).
 - A host call's arguments are checked against its contract (#2534): a host function confines guest
   pointers against the window values the code hands it, so an argument the contract tags `WindowBase`
   must be `mem_base`, `Vmctx` must be `vmctx`, and a caller-frame buffer must be a known frame slot,
@@ -356,11 +361,13 @@ found (#2603):
   `stack_limit` — so both the `mov r,rsp; add r,-RED_ZONE` and `lea r,[rsp−RED_ZONE]` forms qualify;
   its not-below edge marks the state checked, and a body call is rejected unless it is. A
   prologue/trap **safepoint** is exempt — a bounded call the same `RED_ZONE` margin covers, like the
-  pre-check register spills (`STACK_GUARD.md`): the fuel refill rides the prologue fuel check
-  *before* the overflow check, and `emit_trap`'s `-g` `trap_capture` call rides each trap path (its
-  safepoint contract lands with the remaining host-call contracts in a later #2534 slice; no
-  validated build emits it, since it needs `-g`). A frame deeper than `RED_ZONE`
-  below entry is rejected, bounding every stack access the frame policy admits.
+  pre-check register spills (`STACK_GUARD.md`), marked `Contract::safepoint`: the fuel refill rides
+  the prologue fuel check *before* the overflow check, and `emit_trap`'s `-g` `trap_capture` call
+  rides each trap path. The async-signal delivery calls (`sig_take`, the guest-handler dispatch,
+  `sig_return`) are **not** exempt: `emit_signal_check` runs *after* the overflow check (#932), so the
+  guard fires before any host call or handler dispatch touches this frame and they are dominated like
+  any body call. A frame deeper than `RED_ZONE` below entry is rejected, bounding every stack access
+  the frame policy admits.
 
 **Spectre.** Window indices are confined only branchlessly (a `cmov`, a mask, a constant), so the
 validator also pins D63's Spectre-v1 hardening (§4).

@@ -67,6 +67,11 @@ pub(crate) struct Contract {
     /// a backend bug — would move the window the host trusts or hand it a forged pointer. Positional
     /// (argument 0 is the first integer register, SysV order); `&[]` = no argument is constrained.
     pub args: &'static [ArgTag],
+    /// A **safepoint** call, exempt from the I5 stack-check-domination rule: a bounded call the
+    /// prologue or a trap path emits before (or independent of) the overflow check, riding the same
+    /// `RED_ZONE` margin as the pre-check register spills (`STACK_GUARD.md`). The fuel refill and the
+    /// `-g` `trap_capture` backtrace call are the two; every other call must be dominated.
+    pub safepoint: bool,
 }
 
 /// What one call argument must be, for the validator to accept the call (#2534). The host confines
@@ -129,6 +134,8 @@ pub(crate) fn contract(sig: &cranelift_codegen::ir::Signature) -> Option<Contrac
         clobbers,
         pops,
         args: &[],
+        // Identified-by-name in `lib.rs` (`callee_contracts`); the signature alone never marks one.
+        safepoint: false,
     })
 }
 
@@ -1716,15 +1723,14 @@ pub(crate) mod x86 {
                     }
                     // A call pushes the return address below the frame and enters a callee that
                     // relies on the limit, so the overflow check must dominate it (I5). The
-                    // exception is a prologue/trap **safepoint**: it rides a path the check does not
-                    // dominate but the same `RED_ZONE` margin covers (like the pre-check register
-                    // spills, `STACK_GUARD.md`). The fuel refill is one — a bounded, host-identified
-                    // `PreserveAll` call in `emit_fuel_check`, which `emit_stack_check` follows. The
-                    // other is `emit_trap`'s `-g` `trap_capture` call on each trap path; it is a host
-                    // call, so its safepoint contract lands with the rest of the host-call contracts
-                    // in PR 3b (#2534), and no validated build emits it (it needs `-g`). The check
-                    // still dominates every body call (they follow it in `cont`).
-                    if !state.checked && callee != Some(FUEL_REFILL) {
+                    // exception is a prologue/trap **safepoint** (`Contract::safepoint`): it rides a
+                    // path the check does not dominate but the same `RED_ZONE` margin covers (like the
+                    // pre-check register spills, `STACK_GUARD.md`). Two carry the flag: the fuel refill
+                    // (a bounded `PreserveAll` call in `emit_fuel_check`, which `emit_stack_check`
+                    // follows) and `emit_trap`'s `-g` `trap_capture` call on each trap path. The signal
+                    // delivery calls are *not* exempt: `emit_signal_check` now follows the stack check
+                    // (#932), so they are dominated like any body call.
+                    if !state.checked && !callee.is_some_and(|c| c.safepoint) {
                         f.push(Finding {
                             at: pos,
                             why: "call not dominated by the stack-overflow check".into(),
@@ -1735,6 +1741,7 @@ pub(crate) mod x86 {
                     clobbers: SYSV_CLOBBERS,
                     pops: None,
                     args: &[],
+                    safepoint: false,
                 });
                 if let Some(f) = findings.as_deref_mut() {
                     check_args(&c, &state, pos, f);
@@ -1938,11 +1945,14 @@ pub(crate) mod x86 {
         clobbers: 0,
         pops: Some(0),
         args: &[ArgTag::Any],
+        // The fuel refill rides the prologue fuel safepoint, before the stack check (I5).
+        safepoint: true,
     };
     const FUEL_REMAINING: Contract = Contract {
         clobbers: SYSV_CLOBBERS,
         pops: Some(0),
         args: &[ArgTag::Any],
+        safepoint: false,
     };
 
     /// What a 64-bit load from `m` yields: the fact a tracked spill slot holds, the code pointer of a
@@ -2044,10 +2054,31 @@ pub(crate) mod x86 {
         };
         match target {
             Fact::FnAddr(c) => Some(c),
-            Fact::FnPtr(ty) => ctx.guest.types.get(ty as usize).copied().flatten(),
+            // A verified fn-table dispatch (§3c): `FnPtr(ty)` was derived from a `Record` whose type
+            // id the code checked, so the callee is a compiled guest function with the standard CC.
+            // An in-range `ty` gives its exact contract (`None` only for an exotic convention — left
+            // unidentified, since its stack pops are unknown and it is reachable). An out-of-range
+            // `ty` is the `NO_MATCH` sentinel (§3c `type_id_of`), which no installed record carries,
+            // so the matched edge is unreachable and the dispatch always traps: give it the standard
+            // no-pop dispatch contract so a dead dispatch keeps `rsp` tracked rather than poisoning it
+            // through a signal re-poll loop (an unidentified fallback's `pops: None` cascades). Sound
+            // because that edge never executes.
+            Fact::FnPtr(ty) => match ctx.guest.types.get(ty as usize) {
+                Some(c) => *c,
+                None => Some(FN_TABLE_DISPATCH),
+            },
             _ => None,
         }
     }
+
+    /// The contract of a verified fn-table dispatch to an out-of-range (`NO_MATCH`) type id — an
+    /// always-trapping dead edge (§3c). The standard guest CC clobbers the SysV set and pops nothing.
+    const FN_TABLE_DISPATCH: Contract = Contract {
+        clobbers: SYSV_CLOBBERS,
+        pops: Some(0),
+        args: &[],
+        safepoint: false,
+    };
 
     /// Where an explicit memory operand points in the stack frame: `Some(Some(off))` for a plain
     /// `[s + disp]` through a stack pointer `s` at a known entry-relative offset, `Some(None)` for any
@@ -4497,6 +4528,7 @@ pub(crate) mod x86 {
             clobbers: SYSV_CLOBBERS,
             pops: Some(0),
             args: &[],
+            safepoint: false,
         };
 
         /// A Tail-CC callee with 16 bytes of stack arguments.
@@ -4504,6 +4536,7 @@ pub(crate) mod x86 {
             clobbers: SYSV_CLOBBERS,
             pops: Some(16),
             args: &[],
+            safepoint: false,
         };
 
         /// The relocation a call or tail call to [`TAIL0`] carries on the `rel32` at `at`.
@@ -4736,6 +4769,7 @@ pub(crate) mod x86 {
                     clobbers: SYSV_CLOBBERS,
                     pops: Some(0),
                     args: &[],
+                    safepoint: false,
                 })
             );
             let preserve = |r: &[types::Type]| {
@@ -4812,6 +4846,7 @@ pub(crate) mod x86 {
                 clobbers: SYSV_CLOBBERS,
                 pops: Some(0),
                 args: &[],
+                safepoint: false,
             });
             assert_eq!(sysv.regs[reg::RDI as usize], Fact::Unknown);
             assert_eq!(sysv.regs[reg::RSP as usize], Fact::Stack(Some(0)));
@@ -4819,12 +4854,14 @@ pub(crate) mod x86 {
                 clobbers: SYSV_CLOBBERS,
                 pops: Some(16),
                 args: &[],
+                safepoint: false,
             });
             assert_eq!(tail.regs[reg::RSP as usize], Fact::Stack(Some(16)));
             let preserve = with(Contract {
                 clobbers: 0,
                 pops: Some(0),
                 args: &[],
+                safepoint: false,
             });
             assert_eq!(preserve.regs[reg::RDI as usize], Fact::MemBase);
             let unknown = [0x48, 0x89, 0xf0, 0xff, 0xd0, 0xc3]; // mov rax, rsi; call rax; ret
@@ -4841,6 +4878,7 @@ pub(crate) mod x86 {
                 clobbers: SYSV_CLOBBERS,
                 pops: Some(0),
                 args: &[ArgTag::Any, ArgTag::WindowBase],
+                safepoint: false,
             };
             let reloc = |at: u32| Reloc {
                 at,
@@ -4904,6 +4942,7 @@ pub(crate) mod x86 {
                         write: true,
                     },
                 ],
+                safepoint: false,
             });
             assert_eq!(
                 status.regs[0],
@@ -4917,6 +4956,7 @@ pub(crate) mod x86 {
                 clobbers: SYSV_CLOBBERS,
                 pops: Some(0),
                 args: &[],
+                safepoint: false,
             });
             assert_eq!(
                 plain.regs[0],
@@ -4976,6 +5016,7 @@ pub(crate) mod x86 {
                     len: 80,
                     write: false,
                 }],
+                safepoint: false,
             });
             assert_eq!(
                 read.regs[0],
@@ -4990,6 +5031,7 @@ pub(crate) mod x86 {
                     len: 80,
                     write: true,
                 }],
+                safepoint: false,
             });
             assert_eq!(
                 write.regs[0],
@@ -5012,6 +5054,7 @@ pub(crate) mod x86 {
                             len: 80,
                             write: false,
                         }],
+                        safepoint: false,
                     }),
                 }],
                 Entry::Guest(&G),
