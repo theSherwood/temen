@@ -331,10 +331,20 @@ found (#2603):
 - A relocation is honored only on a call's `rel32` or a `movabs`'s `imm64`, and the bytes it patches
   are never read as a fact. A jump table's targets hold on every execution because they are derived
   in their block alone, from no assumption, behind the clamp the `cmov` rule confines.
-- An access is checked at its exact width, which the decoder reports and the tests cross-check
-  against iced-x86; where it doesn't know one, the widest.
+- An access is checked at its exact width and direction (read vs write), which the decoder reports;
+  where it doesn't know a width, the widest. Every GP register a form writes is reported too, so a
+  stale fact (`mem_base`, a confined index) cannot survive a real overwrite — including the second
+  destination the BMI VEX forms write in `vvvv` (`mulx`, `blsi`/`blsr`/`blsmsk`) and the lane/mask
+  extracts to a GP register (`pextr*`, `movmskps`, `cvt*2si`, `movd`-to-GP).
+- The decoder's coverage of what Cranelift can emit is pinned by a **completeness oracle** (#2603
+  hole 17): a test synthesizes every form in Cranelift's own x64 assembler DSL
+  (`cranelift-assembler-x64-meta`, what the backend's encoder is generated from) and checks the
+  decoder either rejects it or agrees with iced-x86 on its length, its memory operand and direction,
+  its GP write-set, and its control flow. A Cranelift upgrade that adds an encoding the decoder does
+  not model fails that test, not a user's compile.
 - A form whose address isn't `[base + index·scale + disp]` (fs/gs, `0x67`, `xlat`, `bt* [mem], reg`)
-  is rejected, not modeled.
+  is rejected, not modeled; so is an EVEX compressed-`disp8` operand, whose scale is a per-form
+  property the bytes don't carry (Cranelift's pool/stack operands use `disp0`/`disp32`).
 - The native frame is confined by the overflow check (I5), not the window mask. The check is
   recognized by the facts it compares — a stack pointer `RED_ZONE` below the current `rsp` against
   `stack_limit` — so both the `mov r,rsp; add r,-RED_ZONE` and `lea r,[rsp−RED_ZONE]` forms qualify;

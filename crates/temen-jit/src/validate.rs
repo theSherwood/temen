@@ -2615,6 +2615,7 @@ pub(crate) mod x86 {
         rex_x: bool, // SIB.index extension
         rex_b: bool, // ModRM.rm / SIB.base extension
         rex: bool,   // any REX prefix: byte registers 4–7 are spl–dil with one, ah–bh without
+        vvvv: u8,    // the GP/XMM register VEX/EVEX names in its vvvv field (the BMI ops write it)
     }
 
     impl Pfx {
@@ -3408,15 +3409,34 @@ pub(crate) mod x86 {
                     d
                 });
             }
-            // xadd — writes both; cmpxchg → rax (+ r/m). The even opcode is the byte form.
-            0xC0 | 0xC1 | 0xB0 | 0xB1 => {
-                let intent = if op2 >= 0xC0 {
-                    E::XchgRegRm
-                } else {
-                    E::Wr(bit(0))
-                };
+            // xadd — writes its reg and its r/m. The even opcode is the byte form.
+            0xC0 | 0xC1 => {
                 let w = if op2 & 1 == 0 { 1 } else { osz };
-                return finish_modrm(c, start, p, 0, Normal, intent).map(|d| d.width(w));
+                return finish_modrm(c, start, p, 0, Normal, E::XchgRegRm).map(|d| d.width(w));
+            }
+            // cmpxchg r/m, reg — compares rax with r/m, then writes either r/m (equal) or rax: so it
+            // writes both rax and its r/m destination (a register, or memory for the memory form).
+            0xB0 | 0xB1 => {
+                let w = if op2 & 1 == 0 { 1 } else { osz };
+                let d = finish_modrm(c, start, p, 0, Normal, E::Wr(bit(0)))?.width(w);
+                let eff = Eff::Wr(bit(0) | d.operands.rm_reg.map_or(0, bit));
+                return Some(Decoded { eff, ..d });
+            }
+            // cmpxchg8b/16b m, — compares and conditionally writes rdx:rax (and the memory operand).
+            // (`/1`; Cranelift emits no other `0F C7` form.) `C7` is 16 bytes under REX.W, else 8.
+            0xC7 => {
+                let w = if p.rex_w { 16 } else { 8 };
+                return finish_modrm(c, start, p, 0, Normal, E::Wr(bit(0) | bit(2)))
+                    .map(|d| d.width(w));
+            }
+            // bt/bts/btr/btc r/m, imm8 (`/4`..`/7`): the imm8 bit offset is masked to the operand's
+            // own bits, so the access stays within the operand (unlike the register-offset forms
+            // `A3`/`AB`/`B3`/`BB`, forbidden above). `/4` (bt) only reads; the rest write the r/m.
+            0xBA => {
+                let digit = (c.peek()? >> 3) & 0x07;
+                let intent = if digit == 4 { E::NoGp } else { E::WrRm };
+                let d = finish_modrm(c, start, p, 1, Normal, intent)?.width(osz);
+                return Some(if digit == 4 { d.reads() } else { d });
             }
             0xA2 => {
                 return Some(one(
@@ -3428,23 +3448,39 @@ pub(crate) mod x86 {
             } // cpuid
             0x31 => return Some(one(c, start, Normal, Eff::Wr(bit(0) | bit(2)))), // rdtsc → rax, rdx
             0x77 => return Some(one(c, start, Normal, Eff::NoGp)),                // emms
+            // bswap r32/r64 (`0F C8+r`): byte-reverses a GP register in place (no memory, no flags).
+            0xC8..=0xCF => {
+                let r = (op2 & 0x07) | (u8::from(p.rex_b) << 3);
+                return Some(one(c, start, Normal, Eff::Wr(bit(r))).keep_flags());
+            }
             _ => {}
         }
-        match op2 {
-            // SSE/vector ModRM + imm8 (operands are XMM — no GP write) …
-            0x70..=0x73 | 0xC2 | 0xC4 | 0xC6 => finish_modrm(c, start, p, 1, Normal, E::NoGp),
-            // … except pextrw r32, xmm, imm8, which writes a GP register.
-            0xC5 => finish_modrm(c, start, p, 1, Normal, E::WrReg),
+        // The rest of the 0F map: SSE/SSE2 float+int vector ops and the SSE moves. All take a ModRM
+        // and, in the `imm8` group, a trailing byte; none has a modeled ALU effect. `vector` stamps
+        // the memory direction/width, then `vec_gp_writes` adds the GP destination for the handful
+        // that write one (`cvt*2si` `2C`/`2D`, `movmsk` `50`, `pmovmskb` `D7`, `movd/q`-store `7E`,
+        // `pextrw` `C5`) — the rest are XMM-only.
+        let d = match op2 {
+            0x70..=0x73 | 0xC2 | 0xC4 | 0xC5 | 0xC6 => {
+                finish_modrm(c, start, p, 1, Normal, E::NoGp)?
+            }
             // The SSE moves (movups/movss/movsd, movaps, movd/movq, movdqa/movdqu, movq) leave the
             // flags: a register allocator's spills and moves.
             0x10 | 0x11 | 0x28 | 0x29 | 0x6E | 0x6F | 0x7E | 0x7F | 0xD6 => {
-                keep(finish_modrm(c, start, p, 0, Normal, E::NoGp)).map(|d| d.vector(op2, p))
+                finish_modrm(c, start, p, 0, Normal, E::NoGp)?.keep_flags()
             }
-            // Everything else in the 0F map (SSE/SSE2 float+int vector ops, fences): ModRM, no imm.
-            // A handful move a value into a GP register; those are cross-checked against iced and the
-            // ones the corpus exercises are classified above. The rest are XMM-only (no GP write).
-            _ => finish_modrm(c, start, p, 0, Normal, E::NoGp).map(|d| d.vector(op2, p)),
+            _ => finish_modrm(c, start, p, 0, Normal, E::NoGp)?,
         }
+        .vector(op2, p);
+        let gp = vec_gp_writes(Map::Of, op2, p, &d.operands);
+        Some(if gp != 0 {
+            Decoded {
+                eff: Eff::Wr(gp),
+                ..d
+            }
+        } else {
+            d
+        })
     }
 
     /// Whether an SSE or AVX instruction of the 0F map only reads its memory operand: a load, a
@@ -3465,13 +3501,91 @@ pub(crate) mod x86 {
         }
     }
 
-    /// Whether a `0F38`-map instruction only reads its memory operand. Narrow for now — the only such
-    /// form the corpus exercises is `F6` (`mulx`/`adcx`/`adox`), which reads its memory source (and
-    /// writes GP registers, a #2603 PR-4b concern). The rest of the `0F38`/`0F3A` vector maps, and
-    /// the DSL-driven completeness oracle that proves this classification covers every form Cranelift
-    /// can emit, land with the default-deny flip (PR 4b).
-    fn vec_reads_0f38(op: u8) -> bool {
-        op == 0xF6
+    /// The memory operand of a `0F38`/`0F3A`-map instruction: whether it is only **read**, and how
+    /// many bytes it accesses. Every form Cranelift emits in these maps reads its memory operand
+    /// except the lane *extracts* (`pextr{b,w,d,q}`/`extractps`, `0F3A 14..=17`), which store a lane.
+    /// Most access a full 128-bit vector (`packed`; 256 under VEX.L); the sub-packed forms read one
+    /// lane (`pmovsx`/`pmovzx`, broadcasts, inserts, scalar round/FMA) or a GP word (BMI, `rorx`).
+    /// The default-deny spirit: an unlisted form reads a full vector, the widest access in the map, so
+    /// an unmodeled read is never under-measured. Cross-checked against iced by the completeness
+    /// oracle, so a Cranelift bump that changes a width fails a test, not a user's compile.
+    fn vec_mem_0f38_3a(map: Map, op: u8, p: &Pfx) -> (bool, u8) {
+        let packed = if p.vex_l { 32 } else { 16 };
+        let gpw = if p.rex_w { 8 } else { 4 }; // a BMI op's GP memory source
+        match map {
+            Map::Of38 => match op {
+                // Sign/zero-extending lane loads read a sub-vector: 8/4/2 bytes by the source lanes.
+                0x20..=0x25 | 0x30..=0x35 => (true, [8, 4, 2, 8, 4, 8][usize::from(op & 0x0F) % 6]),
+                0x18 | 0x58 => (true, 4), // vbroadcastss, vpbroadcastd
+                0x59 => (true, 8),        // vpbroadcastq
+                0x78 => (true, 1),        // vpbroadcastb
+                0x79 => (true, 2),        // vpbroadcastw
+                // FMA: packed `ps`/`pd` read a full vector; scalar `ss`/`sd` read one lane (W → sd).
+                0x98..=0x9F | 0xA8..=0xAF | 0xB8..=0xBF if op & 1 == 1 => {
+                    (true, if p.rex_w { 8 } else { 4 })
+                }
+                // BMI (andn/bzhi/mulx/shlx/shrx/sarx) and legacy adcx/adox read a GP memory source.
+                0xF2 | 0xF5 | 0xF6 | 0xF7 => (true, gpw),
+                _ => (true, packed),
+            },
+            Map::Of3a => match op {
+                0x0A => (true, 4),                            // roundss
+                0x0B => (true, 8),                            // roundsd
+                0x14 => (false, 1),                           // pextrb → store 1 byte
+                0x15 => (false, 2),                           // pextrw → store 2
+                0x16 => (false, if p.rex_w { 8 } else { 4 }), // pextrd/pextrq
+                0x17 => (false, 4),                           // extractps → store 4
+                0x20 => (true, 1),                            // pinsrb
+                0x21 => (true, 4),                            // insertps
+                0x22 => (true, if p.rex_w { 8 } else { 4 }),  // pinsrd/pinsrq
+                0xF0 => (true, gpw),                          // rorx (GP source)
+                _ => (true, packed), // roundps/pd, pblendw, palignr, blendv*
+            },
+            // Not called for the 0F map (it uses `vec_reads`/`vec_width`); the sound default —
+            // memory treated as written, width unknown — covers the unreachable case without a panic.
+            Map::Of => (false, 0),
+        }
+    }
+
+    /// The GP registers a vector-map instruction writes, keyed by its ModRM-field register
+    /// (`ops.reg`) and its r/m register (`ops.rm_reg`, `0` for a memory r/m — then it stores to
+    /// memory, no GP write). `0` for the XMM-only majority. A missed GP write would let a stale fact
+    /// (`mem_base`, a confined index) survive a real overwrite, so the completeness oracle checks this
+    /// against iced's write-set for every form. The second GP destination the VEX forms write in
+    /// `vvvv` (`blsi`/`blsr`/`blsmsk`, `mulx`) is added by the caller, which knows `vvvv`.
+    fn vec_gp_writes(map: Map, op: u8, p: &Pfx, ops: &Operands) -> u16 {
+        let reg = ops.reg.map_or(0, bit);
+        let rm = ops.rm_reg.map_or(0, bit);
+        match map {
+            Map::Of => match op {
+                0x2C | 0x2D | 0x50 | 0xD7 => reg, // cvt(t)s{s,d}2si, movmskp{s,d}, pmovmskb → GP
+                0x7E if p.op66 => rm, // movd/movq r/m, xmm (store to a GP reg or memory)
+                0xC5 if p.op66 => reg, // pextrw r32, xmm, imm8
+                _ => 0,
+            },
+            // andn/bzhi/shlx/shrx/sarx write `reg`; mulx writes `reg` and a second dest in `vvvv`;
+            // adcx/adox (legacy `F6`) write `reg`. blsi/blsr/blsmsk (`F3`) write only `vvvv` (their
+            // `reg` field is a `/digit`), so they are not here — the caller adds their `vvvv` write.
+            Map::Of38 => match op {
+                0xF2 | 0xF5 | 0xF6 | 0xF7 => reg,
+                _ => 0,
+            },
+            Map::Of3a => match op {
+                0x14..=0x17 => rm, // pextr{b,w,d,q}/extractps → a GP reg (or a memory store)
+                0xF0 => reg,       // rorx
+                _ => 0,
+            },
+        }
+    }
+
+    /// The `vvvv`-named GP destination of the VEX `0F38` forms that write one: `blsi`/`blsr`/`blsmsk`
+    /// (`F3`, their only destination) and `mulx` (`F6`, its second). A legacy encoding has no `vvvv`,
+    /// and no legacy form in these maps writes one, so this is VEX/EVEX-only.
+    fn vec_gp_writes_vvvv(map: Map, op: u8, p: &Pfx) -> u16 {
+        match (map, op) {
+            (Map::Of38, 0xF3 | 0xF6) => bit(p.vvvv),
+            _ => 0,
+        }
     }
 
     /// The bytes an SSE or AVX instruction of the 0F map accesses through its memory operand, for the
@@ -3522,15 +3636,27 @@ pub(crate) mod x86 {
     fn decode_0f38(c: &mut Cursor, start: usize, p: &Pfx) -> Option<Decoded> {
         let op = c.next()?; // opcode in the 0F38 map — ModRM, no immediate
         let d = finish_modrm(c, start, p, 0, Kind::Normal, EffIntent::NoGp)?;
-        // The `F6` forms (`adcx`/`adox`; `mulx` is VEX) read their memory source; marking it
-        // read-only keeps a rip-relative constant-pool access from being read as a store. The other
-        // `0F38` forms keep the sound default (memory treated as written) until PR 4b's oracle.
-        Some(if vec_reads_0f38(op) { d.reads() } else { d })
+        Some(apply_vec_class(d, Map::Of38, op, p))
     }
 
     fn decode_0f3a(c: &mut Cursor, start: usize, p: &Pfx) -> Option<Decoded> {
-        c.next()?; // opcode in the 0F3A map — all have ModRM + imm8; XMM-only (no GP write)
-        finish_modrm(c, start, p, 1, Kind::Normal, EffIntent::NoGp)
+        let op = c.next()?; // opcode in the 0F3A map — all have ModRM + imm8
+        let d = finish_modrm(c, start, p, 1, Kind::Normal, EffIntent::NoGp)?;
+        Some(apply_vec_class(d, Map::Of3a, op, p))
+    }
+
+    /// Stamp a decoded vector-map instruction with its memory direction/width ([`vec_mem_0f38_3a`])
+    /// and GP write-set ([`vec_gp_writes`] + the `vvvv` destination): the one place the `0F38`/`0F3A`
+    /// classification is applied, shared by the legacy and VEX/EVEX decoders (invariant #15).
+    fn apply_vec_class(d: Decoded, map: Map, op: u8, p: &Pfx) -> Decoded {
+        let (reads, width) = vec_mem_0f38_3a(map, op, p);
+        let gp = vec_gp_writes(map, op, p, &d.operands) | vec_gp_writes_vvvv(map, op, p);
+        Decoded {
+            width,
+            reads_only: reads,
+            eff: if gp != 0 { Eff::Wr(gp) } else { d.eff },
+            ..d
+        }
     }
 
     fn decode_vex2(c: &mut Cursor, start: usize) -> Option<Decoded> {
@@ -3539,6 +3665,7 @@ pub(crate) mod x86 {
         let op = c.next()?;
         let p = Pfx {
             rex_r: (b1 & 0x80) == 0,
+            vvvv: (!(b1 >> 3)) & 0x0F,
             ..vex_pp_l(b1)
         };
         vex_body(c, start, &p, Map::Of, op)
@@ -3554,6 +3681,7 @@ pub(crate) mod x86 {
             rex_x: (b1 & 0x40) == 0,
             rex_b: (b1 & 0x20) == 0,
             rex_w: (b2 & 0x80) != 0,
+            vvvv: (!(b2 >> 3)) & 0x0F,
             ..vex_pp_l(b2)
         };
         let map = match b1 & 0x1f {
@@ -3576,6 +3704,10 @@ pub(crate) mod x86 {
             rex_x: (b0 & 0x40) == 0,
             rex_b: (b0 & 0x20) == 0,
             rex_w: (b1 & 0x80) != 0,
+            // EVEX carries pp/L like VEX; the mandatory prefix picks a scalar/packed width.
+            op66: (b1 & 0x03) == 1,
+            rep: [0, 0, 0xF3, 0xF2][usize::from(b1 & 0x03)],
+            vvvv: (!(b1 >> 3)) & 0x0F,
             ..Pfx::default()
         };
         let map = match b0 & 0x07 {
@@ -3584,6 +3716,18 @@ pub(crate) mod x86 {
             3 => Map::Of3a,
             _ => return Some(UNDECODABLE),
         };
+        // An EVEX `disp8` is *compressed*: the processor scales it by the form's tuple size (table
+        // 2-34/2-35), so the raw byte the ModRM decoder reads is not the real displacement, and the
+        // address the policy would check would be wrong. The scale is a per-form property EVEX does
+        // not carry in the bytes, so reject a compressed-`disp8` operand rather than mis-read it
+        // (`disp0`/`disp32`/rip are not scaled, so they decode exactly). Cranelift emits AVX-512 only
+        // for a few 128-bit element ops, and its pool/stack operands use `disp0`/`disp32`.
+        if (c.peek()? >> 6) == 0b01 {
+            return Some(Decoded {
+                kind: Kind::Forbidden("EVEX compressed disp8 (unknown scale)"),
+                ..UNDECODABLE
+            });
+        }
         // EVEX's L'L can make the operand 512 bits wide, which `vec_width` doesn't model.
         let d = vex_body(c, start, &p, map, op)?;
         Some(Decoded {
@@ -3619,17 +3763,24 @@ pub(crate) mod x86 {
             Map::Of38 => 0,
             Map::Of => usize::from(matches!(op, 0x70..=0x73 | 0xC2 | 0xC4 | 0xC5 | 0xC6)),
         };
-        // VEX/EVEX encode AVX vector ops: their operands are XMM/YMM/ZMM, so no GP register is
-        // written. (The BMI GP-writing VEX ops are not in the corpus; the iced write-set cross-check
-        // would flag one if it appeared, to be classified then.)
+        // Most VEX/EVEX forms are AVX vector ops over XMM/YMM/ZMM (no GP register written); the GP
+        // writers (the float→int converts, the lane/mask extracts, and the BMI ops) are classified
+        // per map — in the 0F map by `vec_gp_writes`, in the 0F38/0F3A maps by `apply_vec_class`.
         let d = finish_modrm(c, start, p, imm, Kind::Normal, EffIntent::NoGp)?;
         let d = match map {
-            Map::Of => d.vector(op, p),
-            // `mulx` (`VEX.F2.0F38.F6`) reads a 4/8-byte GP memory source; the rest of the
-            // `0F38`/`0F3A` vector maps keep the sound default (memory treated as written) until PR
-            // 4b's completeness oracle.
-            Map::Of38 if vec_reads_0f38(op) => d.reads().width(if p.rex_w { 8 } else { 4 }),
-            _ => d,
+            Map::Of => {
+                let d = d.vector(op, p);
+                let gp = vec_gp_writes(Map::Of, op, p, &d.operands);
+                if gp != 0 {
+                    Decoded {
+                        eff: Eff::Wr(gp),
+                        ..d
+                    }
+                } else {
+                    d
+                }
+            }
+            Map::Of38 | Map::Of3a => apply_vec_class(d, map, op, p),
         };
         // The AVX moves (vmovups/vmovaps/vmovdqu/vmovq/…) leave the flags.
         let moves = matches!(map, Map::Of)
@@ -3724,6 +3875,8 @@ pub(crate) mod x86 {
 
     #[cfg(test)]
     mod tests {
+        mod oracle;
+
         use super::*;
         use crate::{compile, validate};
         use cranelift_codegen::binemit::Reloc as R;
@@ -4159,6 +4312,76 @@ pub(crate) mod x86 {
                 d.operands.mem.is_some() && !d.reads_only,
                 "movdqa store stays a write: {d:?}"
             );
+        }
+
+        #[test]
+        fn vector_gp_writes_are_modeled() {
+            // The forms that move a value into a GP register must report that write, or a stale fact
+            // (mem_base, a confined index) would survive the overwrite. (#2603 hole 17; the
+            // completeness oracle checks every form, this pins the corpus-relevant ones by hand.)
+
+            // mulx rax, rbx, [rip] — VEX.LZ.F2.0F38.W1 F6: writes BOTH GP dests (reg=rax, vvvv=rbx).
+            let d = decode(&[0xc4, 0xe2, 0xe3, 0xf6, 0x05, 0, 0, 0, 0], 0);
+            assert_eq!(
+                writes_of(&d),
+                bit(0) | bit(3),
+                "mulx writes rax and rbx: {d:?}"
+            );
+            assert!(
+                d.reads_only && d.width == 8,
+                "mulx reads an 8-byte source: {d:?}"
+            );
+
+            // andn eax, ebx, [rip] — VEX.LZ.0F38.W0 F2: writes reg (rax), reads a 4-byte source.
+            let d = decode(&[0xc4, 0xe2, 0x60, 0xf2, 0x05, 0, 0, 0, 0], 0);
+            assert_eq!(writes_of(&d), bit(0), "andn writes rax: {d:?}");
+            assert!(
+                d.reads_only && d.width == 4,
+                "andn reads a 4-byte source: {d:?}"
+            );
+
+            // blsr ebx, [rip] — VEX.LZ.0F38.W0 F3 /1: the destination is in vvvv (ebx), not reg.
+            let d = decode(&[0xc4, 0xe2, 0x60, 0xf3, 0x0d, 0, 0, 0, 0], 0);
+            assert_eq!(
+                writes_of(&d),
+                bit(3),
+                "blsr writes its vvvv dest rbx: {d:?}"
+            );
+
+            // pextrq rbx, xmm0, 0 — 66 REX.W 0F3A 16 /r ib: writes the GP r/m (rbx).
+            let d = decode(&[0x66, 0x48, 0x0f, 0x3a, 0x16, 0xc3, 0x00], 0);
+            assert_eq!(writes_of(&d), bit(3), "pextrq writes rbx: {d:?}");
+
+            // cvtsd2si rbx, [rip] — F2 REX.W 0F 2D /r: a float→GP-int convert writes the GP reg.
+            let d = decode(&[0xf2, 0x48, 0x0f, 0x2d, 0x1d, 0, 0, 0, 0], 0);
+            assert_eq!(writes_of(&d), bit(3), "cvtsd2si writes rbx: {d:?}");
+
+            // movmskps eax, xmm1 — 0F 50 /r: a lane-mask into a GP reg (no memory).
+            let d = decode(&[0x0f, 0x50, 0xc1], 0);
+            assert_eq!(writes_of(&d), bit(0), "movmskps writes rax: {d:?}");
+
+            // movd r/m32, xmm (store to a GP reg) — 66 0F 7E /r: writes the r/m GP reg (rbx).
+            let d = decode(&[0x66, 0x0f, 0x7e, 0xc3], 0);
+            assert_eq!(writes_of(&d), bit(3), "movd-to-reg writes rbx: {d:?}");
+
+            // cmpxchg rbx, rcx — 0F B1 /r: writes its r/m destination (rbx) and rax.
+            let d = decode(&[0x48, 0x0f, 0xb1, 0xcb], 0);
+            assert_eq!(
+                writes_of(&d),
+                bit(0) | bit(3),
+                "cmpxchg writes rax and rbx: {d:?}"
+            );
+
+            // An EVEX compressed-disp8 memory operand is rejected (its scale is unknown): vaddpd with
+            // a disp8 (ModRM 0x40) must not decode to a trusted access. EVEX.66.0F.W1 58.
+            let d = decode(&[0x62, 0xf1, 0xfd, 0x08, 0x58, 0x40, 0x02], 0);
+            assert!(
+                matches!(d.kind, Kind::Forbidden(_)),
+                "EVEX disp8 rejected (unknown scale): {d:?}"
+            );
+            // Its disp32 form (ModRM 0x05, rip-relative) decodes — the scale applies only to disp8.
+            let d = decode(&[0x62, 0xf1, 0xfd, 0x08, 0x58, 0x05, 0, 0, 0, 0], 0);
+            assert_eq!(d.kind, Kind::Normal, "EVEX disp32 decodes: {d:?}");
         }
 
         /// The abstract lattice's `meet` (the fact true on both paths, and the order the checker
