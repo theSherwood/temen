@@ -12566,30 +12566,29 @@ fn freeze_step(
         *freeze_on_quiesce = false;
         let parked_declined = tasks.iter().enumerate().find_map(|(ti, t)| {
             let site = t.state.park_site()?;
-            (freeze_rule_here(site) == FreezeRule::Decline).then_some((site, ti))
+            (freeze_rule_here(site) == FreezeRule::Decline).then_some((site, ti, None))
         });
         // #2742 — a fiber parked on a live call waits on a reply as a task does, so it declines
-        // alike, named by the task idling on it (or the root's).
+        // alike, named by the task idling on it (or the root's) and, as the oracle names a fiber
+        // park, by its slot.
         let parked_declined = parked_declined.or_else(|| {
             let k = (root.fibers.fibers.iter())
                 .position(|f| matches!(f, FiberState::TicketParked { .. }))?;
             let on =
                 |t: &TaskSlot| matches!(t.state, TaskState::BlockedOnFiber { fiber } if fiber == k);
-            Some((
-                super::ParkSite::Reply,
-                tasks.iter().position(on).unwrap_or(0),
-            ))
+            let ti = tasks.iter().position(on).unwrap_or(0);
+            Some((super::ParkSite::Reply, ti, Some(k)))
         });
         let declined = match (forked_twins.first(), parked_declined) {
-            (Some(&twin), _) => Some((DeclineCause::ForkTwin, twin)),
-            (None, Some((site, ti))) => Some((DeclineCause::Parked(site), ti)),
+            (Some(&twin), _) => Some((DeclineCause::ForkTwin, twin, None)),
+            (None, Some((site, ti, slot))) => Some((DeclineCause::Parked(site), ti, slot)),
             (None, None) => None,
         };
-        if let Some((cause, task)) = declined {
+        if let Some((cause, task, slot)) = declined {
             host.freeze_declined = Some(FreezeDeclined {
                 cause,
                 task: task as u64,
-                slot: None,
+                slot,
             });
             return true;
         }
