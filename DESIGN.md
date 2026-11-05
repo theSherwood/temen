@@ -2525,7 +2525,15 @@ declines to the tree-walker. Observable results and provider state are identical
 backends (§18 oracle); scheduling interleavings are quarantined in the deterministic explorer.
 The two transports — animated (library) and serve-loop (process/live callee) — are **kept on
 purpose** (`OFFER_TRANSPORT.md`): collapsing library instances onto the serve loop would
-pessimize the common synchronous cross-domain call against the §1a yardstick. The lock-held
+pessimize the common synchronous cross-domain call against the §1a yardstick.
+
+**A serve loop runs every handler as a fiber of its own** (#2742; owner, 2026-11-04), on every
+engine: a handler that parks parks alone, and the loop goes on serving, so a call that needs the
+handler's own domain to serve something meanwhile completes. The bytecode engine pays about
+140 ns a dispatch for it over the nested call it replaced (`serving_bench`'s serial live-call
+round trip, +15%). Weighed and set aside (#2771): run a handler inline and promote it to a fiber
+only when it parks. That wins most of the cost back, but it is a second way to run a handler, and
+the JIT cannot do the same, since its frames cannot leave the stack they run on. The lock-held
 nested sub-interpreter, its acyclicity/deadlock argument, and provider-pays fuel all left the
 TCB; the caller's powerbox lock is held only at the two `cap`-slot translation edges.
 

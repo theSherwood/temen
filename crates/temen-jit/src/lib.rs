@@ -11985,10 +11985,14 @@ pub(crate) mod stack_check {
     /// #1983 — the stack limit for guest code entered on the calling thread's **own** stack: the root
     /// (the entry trampoline) and a spawned vCPU's top. The thread stack's low bound plus a quarter of
     /// its size, which stays free for the host code a guest call runs, so unbounded recursion traps
-    /// `StackOverflow` instead of reaching the OS guard page, where the process aborts. `0` (the check
-    /// inert, as a fiber-less stack had it before) when the bounds are unknown or the caller is on
-    /// some other stack, such as a host re-entry from inside a guest fiber. The bounds are looked up
-    /// once per thread.
+    /// `StackOverflow` instead of reaching the OS guard page, where the process aborts. The bounds are
+    /// looked up once per thread.
+    ///
+    /// #2793 — guest code entered by a host re-entry on a **fiber's** stack (a serve handler in a
+    /// pool task, a direct handoff from a fiber, `svc.wait` inside a guest fiber) takes that fiber's
+    /// low bound, the limit the fiber's own entry passes. An arena stack has no guard page, so this
+    /// check is its only overflow defense (STACK_GUARD.md). `0` (the check inert) only when `sp` is on
+    /// neither the thread's stack nor the running fiber's.
     pub(crate) extern "C" fn thread_limit() -> u64 {
         thread_local! {
             static BOUNDS: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
@@ -12002,10 +12006,10 @@ pub(crate) mod stack_check {
         });
         let here = 0u8;
         let sp = &here as *const u8 as u64;
-        if low == 0 || sp <= low || sp > high {
-            return 0;
+        if low != 0 && sp > low && sp <= high {
+            return low + (high - low) / 4;
         }
-        low + (high - low) / 4
+        crate::fiber_rt::running_stack_low(sp).unwrap_or(0)
     }
 
     /// The calling thread's stack as `(low, high)`, or `(0, 0)` where the platform can't say.
