@@ -39,13 +39,20 @@ function ensureTranslator() {
   });
 }
 
+// The exports a host looks up in each kind of guest (#2790): `--keep` ships those as the image's
+// entry points and empties the code nothing they reach calls. A program needs only its `main`; a
+// reactor's page calls `tick` each frame; a warm card runs `warmup` once, then `eval_run` per Run.
+const PROGRAM = 'main';
+const REACTOR = 'main,tick';
+const WARM = 'main,warmup,eval_run';
+
 // clang a C source to bitcode, then translate to a 64 KiB-page `.temen`. Extra clang flags per guest.
-function buildC(name, src, includes = [], defines = []) {
+function buildC(name, src, keep, includes = [], defines = []) {
   const bc = join(ASSETS, `${name}.bc`);
   const temen = join(ASSETS, `${name}.temen`);
   const flags = ['-O2', '-emit-llvm', '-c', '-fno-vectorize', '-fno-slp-vectorize'];
   execFileSync('clang', [...flags, ...defines, ...includes.map((i) => `-I${i}`), src, '-o', bc], { stdio: 'inherit' });
-  execFileSync(TR, [bc, '-o', temen, '--host-page', HOST_PAGE, '--null-guard'], { stdio: 'inherit' });
+  execFileSync(TR, [bc, '-o', temen, '--host-page', HOST_PAGE, '--null-guard', '--keep', keep], { stdio: 'inherit' });
   const size = execFileSync('wc', ['-c', temen]).toString().trim().split(/\s+/)[0];
   console.log(`  ✓ ${name}.temen (${size} B)`);
 }
@@ -63,7 +70,7 @@ ensureTranslator();
 
 // 1) hello — the tiny always-present example (also committed so the playground works out of the box).
 try {
-  buildC('hello_c', join(REPO, 'crates', 'temen-run', 'demos', 'hello.c'));
+  buildC('hello_c', join(REPO, 'crates', 'temen-run', 'demos', 'hello.c'), PROGRAM);
 } catch (e) {
   console.log(`  ✗ hello_c: ${e.message}`);
 }
@@ -71,7 +78,7 @@ try {
 // 1b) gradient — the framebuffer demo: a C guest renders an RGBA image and presents one frame through
 //     the `display` capability; the page blits it to a <canvas>. The output waist Doom will ride.
 try {
-  buildC('gradient', join(REPO, 'crates', 'temen-run', 'demos', 'display', 'gradient.c'));
+  buildC('gradient', join(REPO, 'crates', 'temen-run', 'demos', 'display', 'gradient.c'), PROGRAM);
 } catch (e) {
   console.log(`  ✗ gradient: ${e.message}`);
 }
@@ -80,7 +87,7 @@ try {
 //     requestAnimationFrame, steering a bouncing box with the arrow keys (the `keyboard` cap in, the
 //     `display` cap out). The per-frame run model + input waist Doom rides.
 try {
-  buildC('bounce', join(REPO, 'crates', 'temen-run', 'demos', 'display', 'bounce.c'));
+  buildC('bounce', join(REPO, 'crates', 'temen-run', 'demos', 'display', 'bounce.c'), REACTOR);
 } catch (e) {
   console.log(`  ✗ bounce: ${e.message}`);
 }
@@ -89,7 +96,7 @@ try {
 //     persist the guest's whole memory (heap included) between frames or the glider freezes. The
 //     heap-persistence proof Doom's zone allocator needs.
 try {
-  buildC('life', join(REPO, 'crates', 'temen-run', 'demos', 'display', 'life.c'));
+  buildC('life', join(REPO, 'crates', 'temen-run', 'demos', 'display', 'life.c'), REACTOR);
 } catch (e) {
   console.log(`  ✗ life: ${e.message}`);
 }
@@ -98,7 +105,7 @@ try {
 //     double-precision Mandelbrot for the current (auto-zooming, arrow-steerable) view on the CPU
 //     in-guest and presents it through `display`. Pure f64 + an integer palette — no libm bundled.
 try {
-  buildC('mandelzoom', join(REPO, 'crates', 'temen-run', 'demos', 'display', 'mandelzoom.c'));
+  buildC('mandelzoom', join(REPO, 'crates', 'temen-run', 'demos', 'display', 'mandelzoom.c'), REACTOR);
 } catch (e) {
   console.log(`  ✗ mandelzoom: ${e.message}`);
 }
@@ -106,7 +113,7 @@ try {
 // 1f) gpu_shader — the GPU demo: the guest ships a WGSL fragment shader through the `webgpu` capability
 //     and the browser renders it (a Mandelbrot zoom) each frame on the real GPU via navigator.gpu.
 try {
-  buildC('gpu_shader', join(REPO, 'crates', 'temen-run', 'demos', 'display', 'gpu_shader.c'));
+  buildC('gpu_shader', join(REPO, 'crates', 'temen-run', 'demos', 'display', 'gpu_shader.c'), REACTOR);
 } catch (e) {
   console.log(`  ✗ gpu_shader: ${e.message}`);
 }
@@ -132,7 +139,7 @@ function ensureAmalgamation() {
 }
 if (ensureAmalgamation()) {
   try {
-    buildC('sqlite_repl', join(REPO, 'crates', 'temen-run', 'demos', 'sqlite', 'sqlite_repl.c'), [AMALG]);
+    buildC('sqlite_repl', join(REPO, 'crates', 'temen-run', 'demos', 'sqlite', 'sqlite_repl.c'), PROGRAM, [AMALG]);
   } catch (e) {
     console.log(`  ✗ sqlite_repl: ${e.message}`);
   }
@@ -223,13 +230,13 @@ function buildQuickJS() {
   for (const s of OPENLIBM_SRCS) shared.push(cc(join(OL_DIR, 'src', `${s}.c`), s));
   // Two drivers over the same engine: `qjs_repl` (single `main`, the shipping card) and `qjs_snapshot`
   // (the WASM_AOT.md warm-runtime-snapshot two-phase driver: `main` + `warmup` + `eval_run`).
-  const drivers = [['qjs_repl.c', 'repl', 'qjs_repl.temen'], ['qjs_snapshot.c', 'snapshot', 'qjs_snapshot.temen']];
-  for (const [driverSrc, tag, out] of drivers) {
+  const drivers = [['qjs_repl.c', 'repl', 'qjs_repl.temen', PROGRAM], ['qjs_snapshot.c', 'snapshot', 'qjs_snapshot.temen', WARM]];
+  for (const [driverSrc, tag, out, keep] of drivers) {
     const driverLl = cc(join(demos, 'quickjs', driverSrc), tag);
     const linked = join(ASSETS, `${out.replace('.temen', '')}_linked.ll`);
     execFileSync('llvm-link', ['-S', driverLl, ...shared, '-o', linked], { stdio: 'inherit' });
     const temen = join(ASSETS, out);
-    execFileSync(TR, [linked, '-o', temen, '--host-page', HOST_PAGE, '--null-guard'], { stdio: 'inherit' });
+    execFileSync(TR, [linked, '-o', temen, '--host-page', HOST_PAGE, '--null-guard', '--keep', keep], { stdio: 'inherit' });
     const size = execFileSync('wc', ['-c', temen]).toString().trim().split(/\s+/)[0];
     console.log(`  ✓ ${out} (${size} B)`);
   }
@@ -260,13 +267,13 @@ try {
   const tclScript = join(REPO, 'crates', 'temen-run', 'demos', 'tcl', 'build_bitcode.sh');
   execFileSync('bash', [tclScript], { stdio: 'inherit' });
   const cache = process.env.TEMEN_TCL_CACHE ?? '/tmp/temen_tcl_cache';
-  for (const [linkedName, temenName] of [['tcl_linked.ll', 'tcl_repl.temen'], ['tcl_snapshot_linked.ll', 'tcl_snapshot.temen']]) {
+  for (const [linkedName, temenName, keep] of [['tcl_linked.ll', 'tcl_repl.temen', PROGRAM], ['tcl_snapshot_linked.ll', 'tcl_snapshot.temen', WARM]]) {
     const linked = join(cache, linkedName);
     if (!existsSync(linked)) throw new Error(`build script produced no ${linkedName}`);
     const temen = join(ASSETS, temenName);
     // Tcl is guarded again (#986): its one NULL read was `TclSetupEnv` walking a NULL `environ`
     // (the extern was laid out as zeroed BSS) — `tcl_shim.c` now defines a real empty `environ`.
-    execFileSync(TR, [linked, '-o', temen, '--host-page', HOST_PAGE, '--stub-externs', '--null-guard'], { stdio: 'inherit' });
+    execFileSync(TR, [linked, '-o', temen, '--host-page', HOST_PAGE, '--stub-externs', '--null-guard', '--keep', keep], { stdio: 'inherit' });
     const size = execFileSync('wc', ['-c', temen]).toString().trim().split(/\s+/)[0];
     console.log(`  ✓ ${temenName} (${size} B)`);
   }
@@ -287,11 +294,11 @@ try {
   const mpScript = join(REPO, 'crates', 'temen-run', 'demos', 'micropython', 'build_bitcode.sh');
   execFileSync('bash', [mpScript], { stdio: 'inherit' });
   const cache = process.env.TEMEN_MICROPYTHON_CACHE ?? '/tmp/temen_micropython_cache';
-  for (const [linkedName, temenName] of [['mp_linked.ll', 'micropython_repl.temen'], ['mp_snapshot_linked.ll', 'micropython_snapshot.temen']]) {
+  for (const [linkedName, temenName, keep] of [['mp_linked.ll', 'micropython_repl.temen', PROGRAM], ['mp_snapshot_linked.ll', 'micropython_snapshot.temen', WARM]]) {
     const linked = join(cache, linkedName);
     if (!existsSync(linked)) throw new Error(`build script produced no ${linkedName}`);
     const temen = join(ASSETS, temenName);
-    execFileSync(TR, [linked, '-o', temen, '--host-page', HOST_PAGE, '--stub-externs', '--null-guard'], { stdio: 'inherit' });
+    execFileSync(TR, [linked, '-o', temen, '--host-page', HOST_PAGE, '--stub-externs', '--null-guard', '--keep', keep], { stdio: 'inherit' });
     const size = execFileSync('wc', ['-c', temen]).toString().trim().split(/\s+/)[0];
     console.log(`  ✓ ${temenName} (${size} B)`);
   }

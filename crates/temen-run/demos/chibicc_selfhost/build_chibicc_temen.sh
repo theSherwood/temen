@@ -98,7 +98,7 @@ fi
 # powerbox low scratch shifts one 16 KiB guard up and the module is marked, so a host seeds
 # [0, guard) unmapped and a NULL deref in the compiler traps instead of reading zeros.
 "$TR" "$CACHE/chibicc.linked.bc" -o "$CACHE/chibicc_raw.temen" \
-  --binary --host-page 65536 --null-guard $STUB
+  --binary --host-page 65536 --null-guard $STUB --keep main
 echo "raw temen: $(stat -c%s "$CACHE/chibicc_raw.temen") bytes"
 
 echo "=== [4/4] prep_temen (decode → verify → bytecode-compile gate) ==="
