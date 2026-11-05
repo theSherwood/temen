@@ -17232,10 +17232,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Args/results cross as i64 slots (the shared host-dispatch ABI).
                     // Synchronous in the reference (the async/submit-complete ABI is §12).
                     let h = get_i32(&frames[top].vals, *handle)?;
-                    let mut argv = Vec::with_capacity(args.len());
-                    for a in args {
-                        argv.push(get(&frames[top].vals, *a)?.i64());
-                    }
+                    // #2319 — the call's arg and result slots, on this stack when they fit.
+                    let (mut arg_stack, mut arg_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let argv = arg_slots(&mut arg_stack, &mut arg_heap, &frames[top].vals, args)?;
                     // §3.6 slice 3 — caller-side parking: a call through a live-callee offer
                     // does not dispatch here. It enqueues on the callee's inbound queue, wakes
                     // the callee's `svc.wait` (if parked), and parks THIS fiber until the
@@ -17246,7 +17245,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.live_impl_of(h, *type_id)
                     };
                     if let Some(target) = live {
-                        live_call!(target, *op, argv, *sig);
+                        live_call!(target, *op, argv.to_vec(), *sig);
                     }
                     // CALLS.md increment 3 (slice 1): an **instanced** offer runs its sub-run with
                     // the caller powerbox lock narrowed to the two `cap`-slot translation edges —
@@ -17265,7 +17264,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // this vCPU's registry over the provider's world (`continue 'frames` on a
                         // switch, `-EAGAIN` on a busy instance), or fall through to the byte-identical
                         // 3a `drive_arc` sub-run when it declines (durable caller/provider, `ref.func`).
-                        animate_instanced_offer!(&entry, *op, &argv);
+                        animate_instanced_offer!(&entry, *op, argv);
                         // 6a — the sub-run is retired: the macro handles every non-durable
                         // case (switch / -EAGAIN / park / trap); reaching here is an unknown-op
                         // or arity miss — the retired path's CapFault, fail-closed.
@@ -17281,13 +17280,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // no delivered value, so a host-answered call declines before its embedder
                     // sees it. A pool job runs inline under a tape on either face.
                     let face = (!hg.records_caps()).then_some(&mut pending_id);
-                    let mut results = vec![0; call_sig(&cur_types, *sig).results.len()];
+                    let n_results = call_sig(&cur_types, *sig).results.len();
+                    let (mut res_stack, mut res_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let results = call_slots(&mut res_stack, &mut res_heap, n_results);
                     hg.cap_dispatch_slots_deferring(
                         *type_id,
                         *op,
                         h,
-                        &argv,
-                        &mut results,
+                        argv,
+                        &mut *results,
                         gm,
                         face,
                         Some(&mut unlocked),
@@ -17417,7 +17418,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let t = ParkTransients::drain(&mut hg);
                     let domain = hg.domain_id() as usize;
                     drop(hg);
-                    run_unlocked(unlocked, &argv, &mut results, mem)?;
+                    run_unlocked(unlocked, argv, results, mem)?;
                     if closed {
                         sched.cap_revoke(domain, h, CAP_REVOKED);
                     }
@@ -17457,7 +17458,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if !eintr_done {
                         let results: &[i64] = match &refused {
                             Some(e) => std::slice::from_ref(e),
-                            None => &results,
+                            None => results,
                         };
                         push_results(
                             &mut frames[top].vals,
@@ -17510,10 +17511,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         args,
                         ..
                     } = &**c;
-                    let mut argv = Vec::with_capacity(args.len());
-                    for a in args {
-                        argv.push(get(&frames[top].vals, *a)?.i64());
-                    }
+                    // #2319 — the call's arg and result slots, on this stack when they fit.
+                    let (mut arg_stack, mut arg_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let argv = arg_slots(&mut arg_stack, &mut arg_heap, &frames[top].vals, args)?;
                     // §3.6 slice 4 — a slot bound (e.g. by `import.attach`) to a live-callee
                     // offer routes like the direct form: enqueue on the callee, park this
                     // fiber until the reply. Same backpressure and race story as slice 3.
@@ -17522,7 +17522,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.import_live_target(*import)
                     };
                     if let Some((target, base_op)) = live {
-                        live_call!(target, base_op + *op, argv, *sig);
+                        live_call!(target, base_op + *op, argv.to_vec(), *sig);
                     }
                     // CALLS.md increment 3 (slice 1): an instanced offer bound to this slot runs
                     // with the narrowed powerbox lock (see the `call.cap` arm). Probe reproduces the
@@ -17536,7 +17536,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if let Some((entry, eff_op)) = inst_offer {
                         // CALLS.md 4a — animate the handler in-loop (see the `call.cap` arm), or
                         // fall through to the byte-identical 3a `drive_arc` sub-run on a decline.
-                        animate_instanced_offer!(&entry, eff_op, &argv);
+                        animate_instanced_offer!(&entry, eff_op, argv);
                         // 6a — the sub-run is retired: the macro handles every non-durable
                         // case (switch / -EAGAIN / park / trap); reaching here is an unknown-op
                         // or arity miss — the retired path's CapFault, fail-closed.
@@ -17547,13 +17547,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // §3.5: the reserved import dispatch packs `(slot | consumer_op << 16)`.
                     let packed = *import | (*op << 16);
                     let mut unlocked = None;
-                    let mut results = vec![0; call_sig(&cur_types, *sig).results.len()];
+                    let n_results = call_sig(&cur_types, *sig).results.len();
+                    let (mut res_stack, mut res_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let results = call_slots(&mut res_stack, &mut res_heap, n_results);
                     hg.cap_dispatch_slots_deferring(
                         temen_ir::CAP_IMPORT_TYPE_ID,
                         packed,
                         0,
-                        &argv,
-                        &mut results,
+                        argv,
+                        &mut *results,
                         gm,
                         None,
                         Some(&mut unlocked),
@@ -17567,7 +17569,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // placeholder with nothing to say why, and dropping a pipe park is a false EOF.
                     let t = ParkTransients::drain(&mut hg);
                     drop(hg);
-                    run_unlocked(unlocked, &argv, &mut results, mem)?;
+                    run_unlocked(unlocked, argv, results, mem)?;
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
                     let mut refused = None;
@@ -17600,7 +17602,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if !eintr_done {
                         let results: &[i64] = match &refused {
                             Some(e) => std::slice::from_ref(e),
-                            None => &results,
+                            None => results,
                         };
                         push_results(
                             &mut frames[top].vals,
@@ -17615,10 +17617,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let temen_ir::CallSym {
                         import, sig, args, ..
                     } = &**c;
-                    let mut argv = Vec::with_capacity(args.len());
-                    for a in args {
-                        argv.push(get(&frames[top].vals, *a)?.i64());
-                    }
+                    // #2319 — the call's arg and result slots, on this stack when they fit.
+                    let (mut arg_stack, mut arg_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let argv = arg_slots(&mut arg_stack, &mut arg_heap, &frames[top].vals, args)?;
                     // §3.6 slice 4 (parity with `call.import`): a symbolic slot the instance bound
                     // to a **live-callee** offer routes through caller-parking, not the generic
                     // dispatch — enqueue on the callee, park this fiber until the reply. CallSym is
@@ -17629,7 +17630,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         hg.import_live_target(*import)
                     };
                     if let Some((target, base_op)) = live {
-                        live_call!(target, base_op, argv, *sig);
+                        live_call!(target, base_op, argv.to_vec(), *sig);
                     }
                     // CALLS.md increment 3 (slice 1): a symbolic slot bound to an instanced offer
                     // runs with the narrowed powerbox lock. CallSym is "a flat call.import (op 0)",
@@ -17643,7 +17644,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if let Some((entry, eff_op)) = inst_offer {
                         // CALLS.md 4a — animate the handler in-loop (see the `call.cap` arm), or
                         // fall through to the byte-identical 3a `drive_arc` sub-run on a decline.
-                        animate_instanced_offer!(&entry, eff_op, &argv);
+                        animate_instanced_offer!(&entry, eff_op, argv);
                         // 6a — the sub-run is retired: the macro handles every non-durable
                         // case (switch / -EAGAIN / park / trap); reaching here is an unknown-op
                         // or arity miss — the retired path's CapFault, fail-closed.
@@ -17652,13 +17653,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let mut hg = HostCall::lock(host, sched);
                     let mut unlocked = None;
-                    let mut results = vec![0; call_sig(&cur_types, *sig).results.len()];
+                    let n_results = call_sig(&cur_types, *sig).results.len();
+                    let (mut res_stack, mut res_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let results = call_slots(&mut res_stack, &mut res_heap, n_results);
                     hg.cap_dispatch_slots_deferring(
                         temen_ir::CAP_IMPORT_TYPE_ID,
                         *import,
                         0,
-                        &argv,
-                        &mut results,
+                        argv,
+                        &mut *results,
                         gm,
                         None,
                         Some(&mut unlocked),
@@ -17675,7 +17678,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let _ = hg.take_stdin_parked(); // no stdin parking here (see call.import)
                     let t = ParkTransients::drain(&mut hg);
                     drop(hg);
-                    run_unlocked(unlocked, &argv, &mut results, mem)?;
+                    run_unlocked(unlocked, argv, results, mem)?;
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
                     let mut refused = None;
@@ -17708,7 +17711,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if !eintr_done {
                         let results: &[i64] = match &refused {
                             Some(e) => std::slice::from_ref(e),
-                            None => &results,
+                            None => results,
                         };
                         push_results(
                             &mut frames[top].vals,
@@ -17728,10 +17731,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         args,
                     } = &**c;
                     let h = get_i32(&frames[top].vals, *handle)?;
-                    let mut argv = Vec::with_capacity(args.len());
-                    for a in args {
-                        argv.push(get(&frames[top].vals, *a)?.i64());
-                    }
+                    // #2319 — the call's arg and result slots, on this stack when they fit.
+                    let (mut arg_stack, mut arg_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let argv = arg_slots(&mut arg_stack, &mut arg_heap, &frames[top].vals, args)?;
                     // CALLS.md increment 3 (slice 1): a dynamic-mode call on an instanced offer runs
                     // with the narrowed powerbox lock. Probe interns the self shape `ty` (as the
                     // generic dyn path does) then checks the handle; a miss falls through unchanged.
@@ -17744,7 +17746,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if let Some((entry, eff_op)) = inst_offer {
                         // CALLS.md 4a — animate the handler in-loop (see the `call.cap` arm), or
                         // fall through to the byte-identical 3a `drive_arc` sub-run on a decline.
-                        animate_instanced_offer!(&entry, eff_op, &argv);
+                        animate_instanced_offer!(&entry, eff_op, argv);
                         // 6a — the sub-run is retired: the macro handles every non-durable
                         // case (switch / -EAGAIN / park / trap); reaching here is an unknown-op
                         // or arity miss — the retired path's CapFault, fail-closed.
@@ -17754,13 +17756,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let mut hg = HostCall::lock(host, sched);
                     let packed = *ty | (*op << 16);
                     let mut unlocked = None;
-                    let mut results = vec![0; call_sig(&cur_types, *sig).results.len()];
+                    let n_results = call_sig(&cur_types, *sig).results.len();
+                    let (mut res_stack, mut res_heap) = ([0; CALL_STACK_SLOTS], Vec::new());
+                    let results = call_slots(&mut res_stack, &mut res_heap, n_results);
                     hg.cap_dispatch_slots_deferring(
                         temen_ir::CAP_DYN_TYPE_ID,
                         packed,
                         h,
-                        &argv,
-                        &mut results,
+                        argv,
+                        &mut *results,
                         gm,
                         None,
                         Some(&mut unlocked),
@@ -17772,7 +17776,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                     // #1621 four rounds to find.
                     let t = ParkTransients::drain(&mut hg);
                     drop(hg);
-                    run_unlocked(unlocked, &argv, &mut results, mem)?;
+                    run_unlocked(unlocked, argv, results, mem)?;
                     t.fire_wakes(sched);
                     let mut eintr_done = false;
                     let mut refused = None;
@@ -17805,7 +17809,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if !eintr_done {
                         let results: &[i64] = match &refused {
                             Some(e) => std::slice::from_ref(e),
-                            None => &results,
+                            None => results,
                         };
                         push_results(
                             &mut frames[top].vals,
@@ -23845,6 +23849,25 @@ pub fn put_results(out: &mut [i64], results: &[i64]) -> Result<(), Trap> {
         *o = *r;
     }
     Ok(())
+}
+
+/// #2319 — how many arg or result slots a call keeps on an interpreter's stack ([`call_slots`]).
+const CALL_STACK_SLOTS: usize = 8;
+
+/// #2319 — `n` zeroed slots for a call's args or results, the caller's side of [`put_results`]: in
+/// `stack` when they fit, which covers every call the tree makes, else in `heap`. Both interpreters
+/// keep a call's slots here, so a call allocates nothing for them.
+fn call_slots<'a>(
+    stack: &'a mut [i64; CALL_STACK_SLOTS],
+    heap: &'a mut Vec<i64>,
+    n: usize,
+) -> &'a mut [i64] {
+    if n <= CALL_STACK_SLOTS {
+        &mut stack[..n]
+    } else {
+        heap.resize(n, 0);
+        heap
+    }
 }
 
 /// FORK.md PR 5 / #863 — a host proc's **fork factory**: mints what a `fork()` twin's powerbox
@@ -39166,6 +39189,20 @@ fn poll_kill(kill: Option<&AtomicBool>) -> Result<(), Trap> {
 #[inline]
 fn get(vals: &[Reg], v: ValIdx) -> Result<Reg, Trap> {
     vals.get(v as usize).copied().ok_or(Trap::Malformed)
+}
+
+/// #2319 — a call's `args`, read from `vals` into its arg slots ([`call_slots`]).
+fn arg_slots<'a>(
+    stack: &'a mut [i64; CALL_STACK_SLOTS],
+    heap: &'a mut Vec<i64>,
+    vals: &[Reg],
+    args: &[ValIdx],
+) -> Result<&'a [i64], Trap> {
+    let argv = call_slots(stack, heap, args.len());
+    for (s, a) in argv.iter_mut().zip(args) {
+        *s = get(vals, *a)?.i64();
+    }
+    Ok(argv)
 }
 
 // Typed operand reads: pull the needed scalar out of the (untyped) value slot. The executing

@@ -48,10 +48,10 @@ use temen_ir::{
 };
 
 use super::{
-    bin32, bin64, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32, fun64, i_to_f,
-    intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, Fuel, GuestMem, Host, HostCharge,
-    Lease, LentFuel, LiveFiber, LiveVcpu, LockUnpoisoned, Mem, MemLayout, NodeRef, Reg, RootWindow,
-    Trap, Value, VarValue, WindowSpec,
+    bin32, bin64, call_slots, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32,
+    fun64, i_to_f, intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, Fuel, GuestMem,
+    Host, HostCharge, Lease, LentFuel, LiveFiber, LiveVcpu, LockUnpoisoned, Mem, MemLayout,
+    NodeRef, Reg, RootWindow, Trap, Value, VarValue, WindowSpec, CALL_STACK_SLOTS,
 };
 use crate::moment::{Moment, Refusal};
 
@@ -10326,24 +10326,6 @@ fn process_stopped(envs: &[Domain], t: &TaskSlot) -> bool {
 
 /// The root activation's id in a vCPU's resume chain (it has no fiber handle).
 const ROOT_FIBER: usize = usize::MAX;
-
-/// #2319 — how many arg or result slots a `call.cap` keeps on the engine's stack ([`call_slots`]).
-const CALL_STACK_SLOTS: usize = 8;
-
-/// #2319 — `n` zeroed slots for a call's args or results: in `stack` when they fit, which covers
-/// every call the tree makes, else in `heap`. A call allocates nothing for its slots.
-fn call_slots<'a>(
-    stack: &'a mut [i64; CALL_STACK_SLOTS],
-    heap: &'a mut Vec<i64>,
-    n: usize,
-) -> &'a mut [i64] {
-    if n <= CALL_STACK_SLOTS {
-        &mut stack[..n]
-    } else {
-        heap.resize(n, 0);
-        heap
-    }
-}
 
 /// One vCPU's continuation: its active `Vm` and its resume `chain`. A `thread.spawn` creates a fresh
 /// `VTask`; the scheduler runs them cooperatively over one shared `Mem` (single-threaded, so shared
