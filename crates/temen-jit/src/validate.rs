@@ -478,13 +478,15 @@ pub(crate) mod x86 {
         End,
     }
 
-    /// How many spill slots the state tracks. A function saves its six callee-saved registers to
-    /// slots in the prologue and reloads them in the epilogue (the `Saved` discipline, claim item 4),
-    /// so the cap holds those plus the context-param spills (mem_base and friends) of a high-pressure
-    /// function. Overflow simply stops tracking new slots — sound, since an untracked reload reads
-    /// `Unknown` (a reload of a dropped callee-saved slot then shows as "not restored", a false
-    /// positive, not an unsoundness).
-    const SLOT_CAP: usize = 32;
+    // The tracked spill slots live in a `Vec` (see `State::slots`) keyed by entry-relative offset, so
+    // the count a function can track has no fixed cap. A high-pressure function keeps every one: an
+    // unrolled large copy spills **hundreds** of confined window indices (one chibicc function spills
+    // 532 — #2784), and a fixed cap would drop the overflow and read each later reload as `Unknown`, a
+    // false "unconfined window index" the fail-closed gate (#2536) would reject. The `Vec` is empty at
+    // the many program points with no live spill, where an empty `Vec` neither allocates nor clones a
+    // heap buffer; it grows only where spills are actually live, so the cost is proportional to use.
+    // (An untracked reload still reads `Unknown` — sound — but now only a genuinely untracked store,
+    // never a dropped one, leaves a slot untracked.)
 
     /// One tracked spill slot: the 8-byte value at entry-relative stack offset `off`. Keying by the
     /// offset from the entry `rsp` (not by the instruction's `(base, disp)`) gives a slot one identity
@@ -499,10 +501,10 @@ pub(crate) mod x86 {
     /// whether the prologue's stack-overflow check (`emit_stack_check`, I5) has run on every path
     /// here. `checked` starts false, is set on the safe edge of the recognized check, and meets by
     /// AND, so it holds only where the check dominates — the condition a `call` is required to meet.
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq)]
     struct State {
         regs: [Fact; 16],
-        slots: [Option<Slot>; SLOT_CAP],
+        slots: Vec<Slot>,
         checked: bool,
     }
 
@@ -512,7 +514,7 @@ pub(crate) mod x86 {
         fn top() -> State {
             State {
                 regs: [Fact::Unknown; 16],
-                slots: [None; SLOT_CAP],
+                slots: Vec::new(),
                 checked: false,
             }
         }
@@ -534,7 +536,7 @@ pub(crate) mod x86 {
             }
             State {
                 regs,
-                slots: [None; SLOT_CAP],
+                slots: Vec::new(),
                 checked: false,
             }
         }
@@ -543,14 +545,14 @@ pub(crate) mod x86 {
             for (r, &o) in regs.iter_mut().zip(other.regs.iter()) {
                 *r = r.meet(o);
             }
-            // A slot survives the meet only with a fact both paths imply.
-            let mut slots = [None; SLOT_CAP];
-            let mut n = 0;
-            for s in self.slots.iter().flatten() {
+            // A slot survives the meet only with a fact both paths imply. Keeping only this state's
+            // offsets is complete: an offset the other state tracks but this one does not meets to
+            // `Unknown` here anyway (`slot_get` reads `Unknown` for an untracked offset).
+            let mut slots = Vec::new();
+            for s in &self.slots {
                 let fact = s.fact.meet(other.slot_get(s.off));
-                if fact != Fact::Unknown && n < SLOT_CAP {
-                    slots[n] = Some(Slot { off: s.off, fact });
-                    n += 1;
+                if fact != Fact::Unknown {
+                    slots.push(Slot { off: s.off, fact });
                 }
             }
             // The check dominates a point only if it dominates on both incoming paths.
@@ -564,30 +566,24 @@ pub(crate) mod x86 {
         fn slot_get(&self, off: i64) -> Fact {
             self.slots
                 .iter()
-                .flatten()
                 .find(|s| s.off == off)
                 .map_or(Fact::Unknown, |s| s.fact)
         }
-        /// Record `fact` in the 8-byte slot at `off`, whose bytes the caller has already clobbered.
+        /// Record `fact` in the 8-byte slot at `off`, whose bytes the caller has already clobbered
+        /// (so no slot overlaps `off`, and this cannot leave two slots at one offset).
         fn slot_set(&mut self, off: i64, fact: Fact) {
             if fact == Fact::Unknown {
                 return;
             }
-            if let Some(e) = self.slots.iter_mut().find(|s| s.is_none()) {
-                *e = Some(Slot { off, fact });
-            }
-            // full ⇒ drop (sound: the reload reads Unknown)
+            self.slots.push(Slot { off, fact });
         }
         /// Forget every slot that overlaps the bytes `[lo, hi)`.
         fn clobber(&mut self, lo: i64, hi: i64) {
-            for s in self.slots.iter_mut() {
-                if matches!(s, Some(e) if e.off < hi && lo < e.off.saturating_add(8)) {
-                    *s = None;
-                }
-            }
+            self.slots
+                .retain(|e| !(e.off < hi && lo < e.off.saturating_add(8)));
         }
         fn clear_slots(&mut self) {
-            self.slots = [None; SLOT_CAP];
+            self.slots.clear();
         }
         /// Drop the data spill slots but keep the callee-saved save slots (`Saved(r)`). A call that
         /// is passed a frame pointer may have the host write through it, so a spilled pointer no
@@ -595,11 +591,7 @@ pub(crate) mod x86 {
         /// estate, its address never handed to a callee, so its slots survive every call (#2603 PR
         /// 3). PR 3b's per-argument host contracts replace this with exactly which slot a call writes.
         fn clear_data_slots(&mut self) {
-            for s in self.slots.iter_mut() {
-                if !matches!(s, Some(e) if matches!(e.fact, Fact::Saved(_))) {
-                    *s = None;
-                }
-            }
+            self.slots.retain(|e| matches!(e.fact, Fact::Saved(_)));
         }
         /// Loop-header widening (#2535): the standard widening operator, `self ∇ prev`, with `prev` the
         /// header's in-state from the previous round. A fact whose value can grow each iteration must
@@ -624,14 +616,8 @@ pub(crate) mod x86 {
                     *f = Fact::Unknown;
                 }
             }
-            for s in self.slots.iter_mut() {
-                if let Some(e) = s {
-                    let old = prev.map(|p| p.slot_get(e.off));
-                    if grew(&e.fact, old) {
-                        *s = None;
-                    }
-                }
-            }
+            self.slots
+                .retain(|e| !grew(&e.fact, prev.map(|p| p.slot_get(e.off))));
         }
     }
 
@@ -645,7 +631,6 @@ pub(crate) mod x86 {
             && inn
                 .slots
                 .iter()
-                .flatten()
                 .all(|s| out.slot_get(s.off).meet(s.fact) == s.fact)
             // `checked` is a fact too: a proposal may assert it only where the out-state has it.
             && (!inn.checked || out.checked)
@@ -809,8 +794,8 @@ pub(crate) mod x86 {
         fn edge(&self, out: &Out, i: usize, j: usize) -> State {
             match self.jcc[i] {
                 Some((Some(t), f)) if t == j && f == Some(j) => out.taken.meet(&out.fall),
-                Some((Some(t), _)) if t == j => out.taken,
-                _ => out.fall,
+                Some((Some(t), _)) if t == j => out.taken.clone(),
+                _ => out.fall.clone(),
             }
         }
     }
@@ -1087,19 +1072,22 @@ pub(crate) mod x86 {
                 for &p in &preds[i] {
                     if let Some(po) = &out_st[p] {
                         let e = cfg.edge(po, p, i);
-                        cur = Some(cur.map_or(e, |s| s.meet(&e)));
+                        cur = Some(match cur {
+                            None => e,
+                            Some(s) => s.meet(&e),
+                        });
                     }
                 }
                 if let Some(mut s) = cur {
                     if is_header[i] {
                         s.widen_against(in_st[i].as_ref());
                     }
-                    if in_st[i] != Some(s) {
-                        in_st[i] = Some(s);
+                    if in_st[i].as_ref() != Some(&s) {
+                        in_st[i] = Some(s.clone());
                         changed = true;
                     }
                     let o = transfer_block(&cfg.blocks[i], s, None, ctx, false);
-                    if out_st[i] != Some(o) {
+                    if out_st[i].as_ref() != Some(&o) {
                         out_st[i] = Some(o);
                         changed = true;
                     }
@@ -1122,9 +1110,8 @@ pub(crate) mod x86 {
     fn verify(cfg: &Cfg, states: &[Option<State>], ctx: Ctx, findings: &mut Vec<Finding>) {
         if !states
             .first()
-            .copied()
-            .flatten()
-            .is_some_and(|s| implies(&State::entry(ctx.frame), &s))
+            .and_then(Option::as_ref)
+            .is_some_and(|s| implies(&State::entry(ctx.frame), s))
         {
             findings.push(Finding {
                 at: 0,
@@ -1133,7 +1120,7 @@ pub(crate) mod x86 {
             return;
         }
         for (i, insns) in cfg.blocks.iter().enumerate() {
-            let Some(s) = states[i] else { continue };
+            let Some(s) = states[i].clone() else { continue };
             // Whether this block leaves the function — a `ret`, a direct tail call, or an indirect
             // `jmp` with no jump table (a tail call). `transfer_block` then checks `rsp` and the
             // callee-saved registers at the terminator (claim item 4).
@@ -1158,7 +1145,7 @@ pub(crate) mod x86 {
             }
             for &j in &cfg.succs[i] {
                 let e = cfg.edge(&out, i, j);
-                if !states[j].is_some_and(|sj| implies(&e, &sj)) {
+                if !states[j].as_ref().is_some_and(|sj| implies(&e, sj)) {
                     findings.push(Finding {
                         at: cfg.leaders[j],
                         why: format!(
@@ -1602,6 +1589,15 @@ pub(crate) mod x86 {
                     let f = fact(&state, src);
                     set(&mut state, dst, f);
                 }
+                Eff::Mov32 { dst, src } => {
+                    // `zext32(src)` is `< 2^32`, and `≤ src` when `src` is bounded below `2^32`: the
+                    // move keeps the source's bound, clamped to `2^32` (#2784). An unbounded source
+                    // still yields `Bounded(2^32)` — exactly what a 32-bit write guarantees.
+                    const W32: u64 = 1 << 32;
+                    let b =
+                        max_value(fact(&state, src)).map_or(W32, |m| m.saturating_add(1).min(W32));
+                    set(&mut state, dst, Fact::Bounded(b));
+                }
                 Eff::MovImm { dst, imm } => {
                     let f = match ctx.abs_reloc(pos, &d) {
                         Some(r) => r.callee.map_or(Fact::Unknown, Fact::FnAddr),
@@ -1908,7 +1904,7 @@ pub(crate) mod x86 {
             }
         }
         // Two terminating branches refine one out-edge.
-        let mut taken = state;
+        let mut taken = state.clone();
         let mut fall = state;
         let term = insns.last().map(|&(_, d)| d.kind);
         // The stack-overflow check `cmp (rsp − RED_ZONE), stack_limit; jb trap` proves, on the
@@ -1940,25 +1936,40 @@ pub(crate) mod x86 {
                 refine(if cc == 0x4 { &mut taken } else { &mut fall });
             }
         }
-        // A block that ends `cmp reg, K; jb` (unsigned below) proves `reg ∈ [0, K)` on the taken
-        // edge: every register still holding that value becomes `Bounded(K)`. This bounds the
-        // demand-paged access check's table index — `off < declared` gates `table[off >> page_shift]`
-        // (#2164). The stack-overflow check is also `jb`, but it compares against the `stack_limit`
-        // register (`rhs` is not a constant), so its `sc_cmp` branch above, not this, handles it.
-        if let (Some(Kind::DirectJcc { cc: 0x2, .. }), Some(f)) = (term, flags) {
+        // A block that ends `cmp reg, K; j{b,be,ae,a}` (an unsigned compare against a constant)
+        // proves `reg < bound` on one edge: `jb`/`jbe` on the taken edge, `jae`/`ja` on the
+        // fall-through. Every register still holding that value becomes `Bounded(bound)`. This
+        // bounds a `br_table`/array index (Cranelift lays the in-range code on the fall-through of
+        // `cmp idx, len; jae default`, #2784) and the demand-paged access check's table index
+        // (`off < declared` gates `table[off >> page_shift]`, #2164, which takes the `jb` edge). The
+        // stack-overflow check is also `jb`, but it compares against the `stack_limit` register
+        // (`rhs` is not a constant), so its `sc_cmp` branch above, not this, handles it.
+        if let (Some(Kind::DirectJcc { cc, .. }), Some(f)) = (term, flags) {
             if let (Some(s), None, Some(k), None) = (f.lhs.sym, f.lhs.konst, f.rhs.konst, f.rhs.sym)
             {
-                for (fa, &sy) in taken.regs.iter_mut().zip(&sym) {
-                    if sy == s {
-                        // Refine only an integer-like fact: a `Bounded` tightens to the min, and an
-                        // unconfined/`Confined` value becomes `[0, k)`. A pointer, `Const`, stack or
-                        // table fact is left unchanged (sound — the refinement only adds `< k`), so
-                        // clobbering one a later merge relies on cannot regress other code.
-                        *fa = match *fa {
-                            Fact::Bounded(b) => Fact::Bounded(b.min(k)),
-                            Fact::Unknown | Fact::Confined { .. } => Fact::Bounded(k),
-                            other => other,
-                        };
+                // (refine the taken edge?, the exclusive upper bound). `jbe`/`ja` prove `reg ≤ k`,
+                // i.e. `reg < k + 1` (skipped when `k + 1` overflows — then the bound is trivial).
+                let plan = match cc {
+                    0x2 => Some((true, k)),                      // jb:  reg < k   on taken
+                    0x3 => Some((false, k)),                     // jae: reg < k   on fall-through
+                    0x6 => k.checked_add(1).map(|b| (true, b)),  // jbe: reg < k+1 on taken
+                    0x7 => k.checked_add(1).map(|b| (false, b)), // ja: reg < k+1 on fall-through
+                    _ => None,
+                };
+                if let Some((on_taken, bound)) = plan {
+                    let edge = if on_taken { &mut taken } else { &mut fall };
+                    for (fa, &sy) in edge.regs.iter_mut().zip(&sym) {
+                        if sy == s {
+                            // Refine only an integer-like fact: a `Bounded` tightens to the min, and
+                            // an unconfined/`Confined` value becomes `[0, bound)`. A pointer, `Const`,
+                            // stack or table fact is left unchanged (sound — the refinement only adds
+                            // `< bound`), so clobbering one a later merge relies on cannot regress.
+                            *fa = match *fa {
+                                Fact::Bounded(b) => Fact::Bounded(b.min(bound)),
+                                Fact::Unknown | Fact::Confined { .. } => Fact::Bounded(bound),
+                                other => other,
+                            };
+                        }
                     }
                 }
             }
@@ -1968,7 +1979,7 @@ pub(crate) mod x86 {
 
     /// A block's out-states: `taken` on the edge a terminating `jcc` takes, `fall` on every other.
     /// They differ only where the branch proves something (a fn-table type check).
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq)]
     struct Out {
         taken: State,
         fall: State,
@@ -2213,6 +2224,7 @@ pub(crate) mod x86 {
             Eff::NoGp | Eff::Cmp { .. } | Eff::StoreReg { .. } => 0,
             Eff::MovImm { dst, .. }
             | Eff::MovReg { dst, .. }
+            | Eff::Mov32 { dst, .. }
             | Eff::LoadReg { dst }
             | Eff::LoadSx32 { dst }
             | Eff::LoadZx32 { dst }
@@ -2566,6 +2578,10 @@ pub(crate) mod x86 {
         MovImm { dst: u8, imm: i64 },
         /// A 64-bit `mov dst, src` between GP registers — `dst := fact(src)`.
         MovReg { dst: u8, src: u8 },
+        /// A 32-bit `mov dst, src` between GP registers — `dst := zext32(src)`, which is `< 2^32` and,
+        /// when `src` is `Bounded`/`Confined` below `2^32`, no larger than `src`. So `dst` keeps the
+        /// source's bound (clamped to `2^32`); a spilled/moved window index stays confined (#2784).
+        Mov32 { dst: u8, src: u8 },
         /// A 64-bit GP load `mov dst, [mem]` (mem in `operands.mem`) — `dst := loaded value`, or the
         /// spill slot's fact when `mem` is a tracked frame slot. A narrower load is a `WrReg`.
         LoadReg { dst: u8 },
@@ -2931,12 +2947,15 @@ pub(crate) mod x86 {
                 (Some(dst), _, true) if osz == 8 => Eff::LoadReg { dst },
                 (Some(dst), _, true) if osz == 4 => Eff::LoadZx32 { dst },
                 (Some(dst), Some(src), false) if osz == 8 => Eff::MovReg { dst, src },
-                (Some(_), ..) => Eff::WrReg, // narrower: truncates or zero-extends, so clobber
+                // A 32-bit reg-reg `mov` zero-extends, so it keeps a confined/bounded source bound.
+                (Some(dst), Some(src), false) if osz == 4 => Eff::Mov32 { dst, src },
+                (Some(_), ..) => Eff::WrReg, // narrower: truncates or merges, so clobber
                 _ => Eff::NoGp,
             },
             I::MovToRm => match (reg, rm, mem) {
                 (Some(src), _, true) => Eff::StoreReg { src, w: osz },
                 (Some(src), Some(dst), false) if osz == 8 => Eff::MovReg { dst, src },
+                (Some(src), Some(dst), false) if osz == 4 => Eff::Mov32 { dst, src },
                 (_, Some(_), false) => Eff::WrRm,
                 _ => Eff::NoGp,
             },
@@ -4571,7 +4590,7 @@ pub(crate) mod x86 {
             prev.regs[9] = conf;
             prev.regs[10] = WinPtr(0x1000); // invariant: same offset this round
             prev.regs[11] = WinPtr(0x1000); // strided: offset rose this round
-            let mut s = prev; // `State` is `Copy`
+            let mut s = prev.clone();
             s.regs[11] = WinPtr(0x2000);
             s.widen_against(Some(&prev));
             assert_eq!(
@@ -4822,6 +4841,87 @@ pub(crate) mod x86 {
             let f = findings(&form(0x14));
             assert!(f.is_empty(), "D63 with an offset was flagged: {f:?}");
             assert!(has(&findings(&form(0xf8)), "unconfined index")); // lea r10, [rcx − 8]
+        }
+
+        /// #2784 (G1): a `cmp idx, K; jae out` bounds `idx` on the **fall-through** edge, where
+        /// Cranelift lays the in-range `br_table`/array code. The validator refines that edge (the
+        /// mirror of the `jb`-taken refinement), so a window access through the bounded index on the
+        /// fall-through is confined. Without the `jae` refinement the index is `Unknown` and flagged.
+        #[test]
+        fn policy_a_jae_bounds_the_fall_through_index() {
+            let bytes = [
+                0x41, 0x83, 0xf8, 0x40, // [00] cmp r8d, 0x40
+                0x0f, 0x83, 0x05, 0, 0, 0, // [04] jae +5 (→ 0x0f)
+                0x42, 0x8b, 0x04, 0x87, // [0a] mov eax, [rdi + r8*4]   (fall: r8 < 0x40)
+                0xc3, // [0e] ret
+                0xc3, // [0f] ret  (jae target: out of range)
+            ];
+            assert!(
+                findings(&bytes).is_empty(),
+                "a jae-bounded index was flagged: {:?}",
+                findings(&bytes)
+            );
+            // The same access without the bound is the escape-relevant case, and is flagged.
+            assert!(has(
+                &findings(&[0x42, 0x8b, 0x04, 0x87, 0xc3]),
+                "unconfined index"
+            ));
+        }
+
+        /// #2784 (G2): a 32-bit reg-reg `mov` zero-extends, so it keeps a bounded source bound. Here
+        /// `cmp r8d,K; jae` bounds `r8` on the fall-through, `mov eax, r8d` carries that bound to
+        /// `rax` (as `Bounded(min(K, 2^32))`), and the window access through `rax` is confined.
+        #[test]
+        fn transfer_a_32bit_move_keeps_the_source_bound() {
+            let bytes = [
+                0x41, 0x83, 0xf8, 0x40, // [00] cmp r8d, 0x40
+                0x0f, 0x83, 0x07, 0, 0, 0, // [04] jae +7 (→ 0x11)
+                0x44, 0x89, 0xc0, // [0a] mov eax, r8d        (Mov32: eax = Bounded(0x40))
+                0x8b, 0x0c, 0x87, // [0d] mov ecx, [rdi + rax*4]
+                0xc3, // [10] ret
+                0xc3, // [11] ret  (jae target)
+            ];
+            assert!(
+                findings(&bytes).is_empty(),
+                "a 32-bit move dropped the index bound: {:?}",
+                findings(&bytes)
+            );
+            // A 32-bit move with no source bound still yields `Bounded(2^32)` — a 32-bit write's
+            // guarantee — so a register written by one never reads back as an unbounded pointer.
+            let s = run(&[0x44, 0x89, 0xc0, 0xc3]); // mov eax, r8d; ret  (r8 = Unknown at entry)
+            assert_eq!(s.regs[0], Fact::Bounded(1 << 32));
+        }
+
+        /// #2784 (G3): a function that spills **more than 32** confined window indices to distinct
+        /// frame slots and reloads each keeps every one — the slot store is a `Vec`, not a fixed
+        /// 32-entry array whose overflow would drop a later slot and read its reload as `Unknown`.
+        /// Mirrors the unrolled libc large-copy (one chibicc function spills 532).
+        #[test]
+        fn transfer_many_spilled_confined_indices_all_survive() {
+            const N: i32 = 40; // > the old SLOT_CAP of 32
+            let mut b = vec![
+                0x49, 0x83, 0xe0, 0x3f, // and r8, 0x3f        → r8 = Bounded(0x40)
+                0x48, 0x81, 0xec, 0x80, 0x01, 0,
+                0, // sub rsp, 0x180  (48 slots, within RED_ZONE)
+            ];
+            // Spill r8 to N distinct frame slots.
+            for k in 0..N {
+                b.extend([0x4c, 0x89, 0x84, 0x24]); // mov [rsp + disp32], r8
+                b.extend((8 * k).to_le_bytes());
+            }
+            // Reload each and read the window through it — every reload must stay `Bounded`.
+            for k in 0..N {
+                b.extend([0x4c, 0x8b, 0x8c, 0x24]); // mov r9, [rsp + disp32]
+                b.extend((8 * k).to_le_bytes());
+                b.extend([0x42, 0x8b, 0x04, 0x0f]); // mov eax, [rdi + r9*1]
+            }
+            b.extend([0x48, 0x81, 0xc4, 0x80, 0x01, 0, 0]); // add rsp, 0x180
+            b.push(0xc3); // ret
+            assert!(
+                findings(&b).is_empty(),
+                "a spilled confined index past slot 32 was dropped: {:?}",
+                findings(&b)
+            );
         }
 
         /// Hole 7's `lea` form: a 32-bit `lea` truncates the address, so `lea eax, [rsp + 8]` is no
