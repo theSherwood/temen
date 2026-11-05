@@ -90,8 +90,11 @@ pub mod cap_id {
     /// `len() -> i64` reports the region size; op 3 `page_size() -> i64`; op 5 `close() -> 0 |
     /// -errno` gives the handle up, and with it the domain's hold on the region, which goes when no
     /// domain holds it (`-EBUSY`, changing nothing, while the window still maps it; #2358). Op 4 is
-    /// #1511's. Granting the handle is how two domains come to share memory; an `AddressSpace` mints
-    /// one (its op 5). A backing may be a fresh OS
+    /// #1511's. Op 6 `post(off, badge) -> handle | -errno` mints a **post** to the notification at
+    /// `off` (#1936): a `u64` of bits there and a `u32` sequence word at `off + 8`. On a post, op 7
+    /// `signal() -> 0` ORs `badge` into the bits, bumps the sequence and wakes the word's waiters, and
+    /// op 5 closes it; every other op is `-EINVAL`. Granting the handle is how two domains come to
+    /// share memory; an `AddressSpace` mints one (its op 5). A backing may be a fresh OS
     /// shared object (`memfd`) **or a real host file** (`temen-run`'s `FileBacking`, minted by an
     /// mmap-capable fs cap): mapping the latter aliases the file into the window zero-copy — the
     /// file-backed-mmap bridge (MMAP_CAPABILITY.md §4b).

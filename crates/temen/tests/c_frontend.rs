@@ -2930,6 +2930,33 @@ fn c_region_unmap_builtin() {
     assert_eq!(run_c(C_REGION_UNMAP).as_slice(), [Value::I32(1)]);
 }
 
+// #1936 — the notification builtins (`<temen.h>`): `__vm_post` mints a post to the notification at
+// region byte 64 (`call.cap 4 6`), and `__vm_signal` signals it (`call.cap 4 7`), which ORs the badge
+// into the bits and bumps the sequence. The guest reads both back through its mapping; a zero badge
+// mints nothing.
+const C_POST: &str = "#include <temen.h>\n\
+static char pad[200 * 1024];\n\
+int main(void) {\n\
+  pad[0] = 1; pad[200 * 1024 - 1] = 2;\n\
+  int r = (int)__vm_region_create(1 << 16);\n\
+  if (r < 0) return -1;\n\
+  long g = __vm_region_page_size(r);\n\
+  long base = 256 * 1024;\n\
+  if (__vm_region_map(r, base, 0, g, 3) < 0) return -2;\n\
+  if (__vm_post(r, 64, 0) != -22) return -3;   /* a zero badge signals nothing */\n\
+  int p = (int)__vm_post(r, 64, 6);\n\
+  if (p < 0) return -4;\n\
+  if (__vm_signal(p) != 0 || __vm_signal(p) != 0) return -5;\n\
+  unsigned long bits = *(unsigned long *)(base + 64);\n\
+  unsigned int seq = *(unsigned int *)(base + 72);\n\
+  return bits == 6 && seq == 2 ? 1 : 0;\n\
+}\n";
+
+#[test]
+fn c_post_and_signal_builtins() {
+    assert_eq!(run_c(C_POST).as_slice(), [Value::I32(1)]);
+}
+
 /// §7/§4 — a cap-buffer borrow of a **guest-grown** heap page. The program `malloc`s 128 KiB (past
 /// the 64 KiB initial window, so `malloc` grows the heap into the reserved tail via the Memory cap),
 /// fills it, and `write()`s **that grown buffer** across the §7 trampoline. The interpreter's `Mem`

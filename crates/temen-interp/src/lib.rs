@@ -3234,7 +3234,7 @@ fn relaunch_twin(s: &mut Sched, sched: &Arc<Scheduler>, parent: &VCpu, tt: Thawe
             (Some(mem), Some(live)) => Some((mem, live)),
             _ => {
                 if rejoined {
-                    host.release_memory();
+                    host.release_unsignalled();
                 }
                 None
             }
@@ -3394,7 +3394,10 @@ fn relaunch_detached(
     let (relaunch, lease, mem) = match ready {
         Ok(ready) => ready,
         Err(leased) => {
-            host.drop_restored(&launch, &window, leased);
+            // #1936 — its end post, and its own children's, as their ends would signal them.
+            for w in host.drop_restored(&launch, &window, leased) {
+                notify_locked(s, w.key(), u32::MAX);
+            }
             if launch.joinable {
                 deliver_detached(s, spawner, slot, Err(Trap::ThreadFault));
             }
@@ -3943,8 +3946,10 @@ fn drive_over_cell(
         let resting = std::mem::take(&mut s.resting);
         for r in resting.values() {
             let mut h = r.domain.host.lock_unpoisoned();
-            h.release_memory();
-            h.release_pipe_ends(); // the run is over: no reader or writer is left to wake
+            // The run is over: no reader, writer or waiter is left to wake. An end post is still
+            // signalled, so its bits are there for whoever reads the region next.
+            let _ = h.release_memory();
+            h.release_pipe_ends();
             h.svc_payers.clear();
         }
         let rested = resting.contains_key(&s.root_domain);
@@ -7049,6 +7054,37 @@ fn wake_pipe_batch_locked(s: &mut Sched, woken: Vec<Waiter>) -> u32 {
     n
 }
 
+/// Wake up to `count` waiters parked on `key`, oldest first, under the scheduler's lock: the body of
+/// [`Scheduler::notify`], for a caller that holds the lock already, such as a domain's end, which
+/// wakes its end post's waiters before it stops counting as live (#1936).
+fn notify_locked(s: &mut Sched, key: FutexKey, count: u32) -> u32 {
+    let mut woken: Vec<Waiter> = Vec::new();
+    if let Some(q) = s.wait_waiters.get_mut(&key) {
+        let take = (count as usize).min(q.len());
+        woken.extend(q.drain(..take).map(|(_, v)| v));
+        if q.is_empty() {
+            s.wait_waiters.remove(&key);
+        }
+    }
+    let n = woken.len() as u32;
+    for w in woken {
+        match w {
+            Waiter::VCpu(mut v) => {
+                v.pending = Some(Pending::Wait(WAIT_WOKEN));
+                s.runnable.push_back(v);
+            }
+            // §3.6 5a: a fiber-level waiter — deliver the status into its set-aside
+            // frames and make it claimable; its resumer re-admits it cooperatively
+            // (for a handler fiber, that resumer is the domain's serve loop — 5b).
+            Waiter::Fiber { reg, slot, svc, .. } => {
+                reg.wake_blocked(slot, Reg::from_i32(WAIT_WOKEN));
+                svc_wake_locked(s, svc);
+            }
+        }
+    }
+    n
+}
+
 fn wake_pipe_readers_locked(s: &mut Sched, pipe: u32) -> u32 {
     let woken = s.pipe_waiters.remove(&pipe).unwrap_or_default();
     wake_pipe_batch_locked(s, woken)
@@ -7562,31 +7598,7 @@ impl Scheduler {
     /// [`DetSched::notify`], which has always woken in insertion order, so the model checker
     /// explored an order the real pool never produced.
     fn notify(&self, key: FutexKey, count: u32) -> u32 {
-        let mut s = self.lock();
-        let mut woken: Vec<Waiter> = Vec::new();
-        if let Some(q) = s.wait_waiters.get_mut(&key) {
-            let take = (count as usize).min(q.len());
-            woken.extend(q.drain(..take).map(|(_, v)| v));
-            if q.is_empty() {
-                s.wait_waiters.remove(&key);
-            }
-        }
-        let n = woken.len() as u32;
-        for w in woken {
-            match w {
-                Waiter::VCpu(mut v) => {
-                    v.pending = Some(Pending::Wait(WAIT_WOKEN));
-                    s.runnable.push_back(v);
-                }
-                // §3.6 5a: a fiber-level waiter — deliver the status into its set-aside
-                // frames and make it claimable; its resumer re-admits it cooperatively
-                // (for a handler fiber, that resumer is the domain's serve loop — 5b).
-                Waiter::Fiber { reg, slot, svc, .. } => {
-                    reg.wake_blocked(slot, Reg::from_i32(WAIT_WOKEN));
-                    svc_wake_locked(&mut s, svc);
-                }
-            }
-        }
+        let n = notify_locked(&mut self.lock(), key, count);
         if n > 0 {
             self.work.notify_all();
         }
@@ -9005,8 +9017,12 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     // A detached child killed here ends as surely as one reaching `Done`: its window's bytes go
     // back to the budget that paid for them (lock order sched → host), and what it grew (#1909).
     // Every vCPU of the dying domain passes here; the first hands it back, with the window of a
-    // process that paid for its own (#2106).
-    v.domain.host.lock_unpoisoned().release_memory();
+    // process that paid for its own (#2106), and signals its end post (#1936), whose waiters wake
+    // before this vCPU stops counting as live, so none of them reads the run as deadlocked.
+    let end = v.domain.host.lock_unpoisoned().release_memory();
+    if let Some(w) = end {
+        notify_locked(s, w.key(), u32::MAX);
+    }
     if let Some((cell, lease)) = v.window_lease.take() {
         cell.lock_unpoisoned().release_detached(lease);
     }
@@ -9549,7 +9565,10 @@ fn kill_withheld(s: &mut Sched, domain: usize, host: &Arc<Mutex<Host>>) {
         return;
     };
     let w = s.withheld.remove(&id).expect("found just above");
-    host.lock_unpoisoned().release_memory();
+    let end = host.lock_unpoisoned().release_memory();
+    if let Some(end) = end {
+        notify_locked(s, end.key(), u32::MAX);
+    }
     if let Some((cell, lease)) = w.lease {
         cell.lock_unpoisoned().release_detached(lease);
     }
@@ -10358,13 +10377,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // domain whose *thread* finished (#1917): a `thread.spawn` child shares its domain's
                 // powerbox and so its pipe ends, and a thread's exit closes nothing. The domain's main
                 // vCPU finishing ends the domain, and releases them.
-                let (pipe_eofs, pipe_epipes) = if froze || !main {
-                    (Vec::new(), Vec::new())
+                let (end, (pipe_eofs, pipe_epipes)) = if froze || !main {
+                    (None, (Vec::new(), Vec::new()))
                 } else {
                     let mut h = v.domain.host.lock_unpoisoned();
-                    // #1909, #2106 — and its window goes, with what it held.
-                    h.release_memory();
-                    h.release_pipe_ends()
+                    // #1909, #2106 — and its window goes, with what it held. #1936 — and its end
+                    // post is signalled, its waiters woken below.
+                    (h.release_memory(), h.release_pipe_ends())
                 };
                 // #1217 — a finishing client child releases the parked `svc.wait` of every
                 // service it could have called (its pager, its granted live offers).
@@ -10459,6 +10478,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 }
                 for pipe in &pipe_epipes {
                     wake_pipe_writers_locked(&mut s, *pipe);
+                }
+                // #1936 — under the lock that retires this vCPU, so a waiter it wakes is runnable
+                // before the run can read it as deadlocked.
+                if end.is_some_and(|end| notify_locked(&mut s, end.key(), u32::MAX) > 0) {
+                    sched.work.notify_all();
                 }
                 // #2480 — a call a fiber of the ended domain is parked on wakes no one: it leaves
                 // the wait set, as a dying domain's does at its teardown, so the run's deadlock
@@ -14288,6 +14312,8 @@ pub struct ParkTransients {
     /// A pipe, by its global id, whose parked writers should be woken (a drained-full read, or a
     /// reader-to-zero close).
     pub wake_writers: Option<u32>,
+    /// #1936 — a region word whose futex waiters should be woken: a post's `signal`.
+    pub wake_region: Option<RegionWake>,
     /// A blocking pipe read, by the pipe's **domain-local index**, that found an empty FIFO with
     /// writers open.
     pub read_park: Option<u32>,
@@ -14308,6 +14334,7 @@ impl ParkTransients {
     fn drain(hg: &mut Host) -> Self {
         let wake_readers = hg.take_pipe_wake();
         let wake_writers = hg.take_pipe_wake_writers();
+        let wake_region = hg.take_region_wake();
         let read_park = hg.take_pipe_read_parked();
         let write_park = hg.take_pipe_write_parked();
         let request = hg.take_park_request();
@@ -14329,6 +14356,7 @@ impl ParkTransients {
         Self {
             wake_readers,
             wake_writers,
+            wake_region,
             read_park,
             write_park,
             request,
@@ -14346,6 +14374,9 @@ impl ParkTransients {
         }
         if let Some(pipe) = self.wake_writers {
             sched.wake_pipe_writers(pipe);
+        }
+        if let Some(w) = &self.wake_region {
+            sched.notify(w.key(), u32::MAX);
         }
     }
 }
@@ -16635,7 +16666,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     let issued = children.lock_unpoisoned().table.issue(record);
                                     match issued {
                                         Err(_) => {
-                                            child_host_keep.lock_unpoisoned().release_memory();
+                                            child_host_keep.lock_unpoisoned().release_unsignalled();
                                             undo();
                                             frames[top].vals.push(Reg::from_i32(EMFILE as i32));
                                         }
@@ -16716,7 +16747,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                     // #2268 — and its window's own charge, as it started.
                                                     child_host_keep
                                                         .lock_unpoisoned()
-                                                        .release_memory();
+                                                        .release_unsignalled();
                                                     undo();
                                                     return Err(Trap::ThreadFault);
                                                 }
@@ -20734,6 +20765,57 @@ pub trait SharedBacking: Send + Sync {
 /// A reference to a shared region backing (see [`SharedBacking`]); cloning shares the same object.
 pub type RegionBacking = Arc<dyn SharedBacking>;
 
+/// #1936 — a region word whose futex waiters a signal left to wake: a post's `signal`, which leaves
+/// it as a dispatch transient, as a pipe write leaves its pipe, or a child's end post, which the
+/// domain's end answers ([`Host::release_memory`]). The host has no engine's waiters, so each engine
+/// wakes the word by the key it gives a region word: the interpreters by the backing's address
+/// ([`RegionWake::key`]), the JIT by its OS handle ([`RegionWake::os_key`]). Plain data, taken on
+/// every dispatch: a waiter maps the region, so it holds it, and the identities name a live
+/// backing for as long as any waiter could be parked on the word.
+#[derive(Clone, Copy, Debug)]
+pub struct RegionWake {
+    /// The backing's address, the interpreters' identity for it ([`Mem::site_key`]).
+    ident: u64,
+    /// The backing's OS handle, as a §13 `map` records it ([`Host::region_map`]); `None` for a
+    /// backing with none, which no JIT window maps.
+    os: Option<u64>,
+    /// The word's byte offset in the region: the notification's sequence word.
+    off: u64,
+}
+
+impl RegionWake {
+    /// The interpreters' key for the word: the backing's address and the offset.
+    fn key(&self) -> FutexKey {
+        FutexKey::Region(self.ident, self.off)
+    }
+
+    /// The JIT's key for the word: the backing's OS handle and the offset. `None` when no JIT window
+    /// can map the backing, so no JIT waiter waits on it.
+    pub fn os_key(&self) -> Option<(u64, u64)> {
+        self.os.map(|id| (id, self.off))
+    }
+}
+
+/// #1936 — signal the notification at `off` of `backing`: OR `badge` into its bits, bump its
+/// sequence word, and answer the word to wake. Both are the region's own atomics, so a waiter's
+/// reads see them on every engine. The bits come first: a waiter that sees the new sequence then
+/// finds them.
+fn signal_post(backing: &RegionBacking, off: u64, badge: u64) -> RegionWake {
+    backing.atomic(off, 8, &mut |bits| Some(bits | badge));
+    backing.atomic(off + 8, 4, &mut |seq| {
+        Some(u64::from((seq as u32).wrapping_add(1)))
+    });
+    let os = backing
+        .os_fd()
+        .map(|fd| fd as u64)
+        .or_else(|| backing.os_section().map(|s| s as u64));
+    RegionWake {
+        ident: Arc::as_ptr(backing) as *const u8 as u64,
+        os,
+        off: off + 8,
+    }
+}
+
 /// §4 / S4 — a host-served **pipe's** shared FIFO backing. `Arc<Mutex<…>>` so a pipe end can be
 /// **re-granted into a §14 child** (the child's `Host` clones the `Arc`, aliasing the same queue) and
 /// so concurrent parent/child access — the interpreter runs children on its M:N executor — is
@@ -21405,6 +21487,18 @@ enum Binding {
     /// A §13 `SharedRegion` handle, carrying the index of its backing in [`Host::regions`]. The
     /// backing (not the index) is the shared object; mapping it at several window offsets aliases.
     SharedRegion(u32),
+    /// #1936 — a **post** to the notification at `off` of a §13 region: a `u64` of bits there and a
+    /// `u32` sequence word at `off + 8`. Op 7 `signal` ORs `badge` into the bits, bumps the
+    /// sequence and wakes its waiters ([`signal_post`]); op 5 closes it; every other op answers
+    /// `-EINVAL`, so a post can't map, read or write the region. A region handle's op 6 mints it,
+    /// under the region's interface, as `AddressSpace.sub` mints an attenuated `AddressSpace`. It
+    /// holds `region` as a handle does, so the region lives while a post to it does. `off` is a
+    /// `u32` so `Binding`, which every slot of every table pays for, stays 24 bytes.
+    RegionPost {
+        region: u32,
+        off: u32,
+        badge: u64,
+    },
     /// A §14 `AddressSpace` handle attenuated to the power-of-two window sub-range `[base, base+size)`
     /// in the **holder's own (guest-relative) coordinates** — a child's full-window grant is
     /// `[0, its size)` regardless of where its window sits in an ancestor's. Every op is confined to
@@ -22892,6 +22986,14 @@ pub enum DurableBinding {
     SharedRegion {
         region: u32,
     },
+    /// #1936 — a post to a notification in a §13 region ([`Binding::RegionPost`]): its region, which
+    /// the codec renumbers as a [`Self::SharedRegion`] handle's, and the notification's offset and
+    /// the post's badge.
+    RegionPost {
+        region: u32,
+        off: u32,
+        badge: u64,
+    },
     /// §22 `CompiledCode` handle (DESIGN.md §22): `(domain, unit)` indices into the rebuilt
     /// `jit_tables`, matching [`Binding::JitCode`]. Named only in `invoke`/`release`, so the
     /// index pair is its whole authority — durable once the domain's units are captured.
@@ -22946,6 +23048,22 @@ pub enum DurableBinding {
     Budget {
         node: u32,
     },
+}
+
+impl DurableBinding {
+    /// #2025, #1936 — the host region id this binding names, a region handle's or a post's: what the
+    /// codec renumbers to the region's number in the cut, and back to the id a restore adopts it at.
+    pub fn region_mut(&mut self) -> Option<&mut u32> {
+        match self {
+            Self::SharedRegion { region } | Self::RegionPost { region, .. } => Some(region),
+            _ => None,
+        }
+    }
+
+    /// [`Self::region_mut`], read.
+    pub fn region(mut self) -> Option<u32> {
+        self.region_mut().copied()
+    }
 }
 
 /// #1455 — one named host capability captured for restore, parallel to the `host_procs` table (see
@@ -24735,6 +24853,13 @@ pub const GRANT_SERVE_LIVE_TAG: u32 = 0x8000_0000;
 /// to the thaw's re-bind.
 pub const GRANT_EMPTY: u32 = 0xC000_0000;
 
+/// #1936 — the grant name a spawn's **end post** goes by. A post granted under it is not granted
+/// into the child: it is kept with the child's host ([`Host::end`]), so the child can't see, signal
+/// or pass it on, and signalled when the child ends, however it ends ([`Host::release_memory`]). Any
+/// other handle under the name, or a second record of it, refuses the spawn. An exec refuses it: the
+/// image it starts is the same domain, which keeps its spawner's end post.
+pub const END_GRANT: &str = "end";
+
 /// #2219 — the grant-list rule for a record's name: an empty grant's ([`GRANT_EMPTY`]) is an import
 /// name, `*`, or a prefix ending in one `*`; any other grant's holds no `*` at all.
 fn grant_name_ok(name: &str, handle: i32) -> bool {
@@ -24748,7 +24873,7 @@ fn grant_name_ok(name: &str, handle: i32) -> bool {
 /// entry must pass [`Host::can_grant_entry`]. The tree-walker's powerbox always sits in a cell its
 /// child can call back through.
 fn authorize_eval_grants(host: &Host, list: &[(String, i32)]) -> Result<(), Trap> {
-    if list.iter().all(|(n, h)| host.can_grant_entry(n, *h, true)) {
+    if host.can_grant_list(list, true) {
         Ok(())
     } else {
         Err(Trap::CapFault)
@@ -25731,6 +25856,9 @@ pub struct Host {
     /// FORK.md §8.6 — transient: the last pipe `write` (or a writer-count-to-zero close) landed on this
     /// pipe id, so the eval loop should wake any reader parked on it. Taken by [`Self::take_pipe_wake`].
     pipe_wake: Option<u32>,
+    /// #1936 — transient: the region word whose futex waiters the last op, a post's `signal`, left
+    /// to wake. Taken with the dispatch's other transients ([`ParkTransients::wake_region`]).
+    region_wake: Option<RegionWake>,
     /// FORK.md §8.6 (backpressure) — transient: the last pipe `write` found a full FIFO (readers still
     /// open), so the writer must **park** on this pipe id (the eval loop turns it into a
     /// `Blocked::PipeWrite` and re-issues the write on wake). The write-side twin of `pipe_read_parked`.
@@ -25862,6 +25990,11 @@ pub struct Host {
     /// lands before the end, which then releases it with the rest, or is refused. A reactor's next
     /// activation reopens the domain ([`Host::begin_activation`]).
     ended: bool,
+    /// #1936 — this domain's **end post**: the post its spawner granted it as `end`, kept here rather
+    /// than in its table, so it can't see, signal or pass it on. `(region, off, badge)`, the region
+    /// held in [`Self::regions`] as a post holds it. Signalled once, at the domain's end
+    /// ([`Self::release_memory`]); an exec carries it to the new image, which is the same domain.
+    end: Option<(u32, u32, u64)>,
     /// §4 / S4 **host-served pipe** FIFO backings, indexed by the id a [`Binding::PipeEnd`] carries.
     /// Each is a shared byte queue a `write` end appends to and a `read` end drains. The backing is
     /// `Arc`-shared ([`PipeBacking`]) so an end can be **re-granted into a §14 child** (the child's
@@ -26849,6 +26982,7 @@ impl Host {
             stdin_parked: false,
             pipe_read_parked: None,
             pipe_wake: None,
+            region_wake: None,
             pipe_write_parked: None,
             pipe_wake_writers: None,
             sig_interrupt: false,
@@ -26880,6 +27014,7 @@ impl Host {
             domain_maps: 0,
             reserved: 0,
             ended: false,
+            end: None,
             pipes: Vec::new(),
             lane_cap: -1, // D66 — unbounded by default
             workers: None,
@@ -29051,6 +29186,10 @@ impl Host {
                 Binding::FreezeAuthority => DurableBinding::FreezeAuthority,
                 // #2025: durable here; whether the cut holds every holder is the codec's check.
                 Binding::SharedRegion(region) => DurableBinding::SharedRegion { region },
+                // #1936: a post rides as its region does.
+                Binding::RegionPost { region, off, badge } => {
+                    DurableBinding::RegionPost { region, off, badge }
+                }
                 // #1361: a module grant the restoring host grants again is durable — named by its
                 // content digest, which the thaw resolves against the restoring host's grants (the
                 // same rule a separate-module nested child re-attaches by). Any other grant is
@@ -29161,8 +29300,10 @@ impl Host {
                 // #1502, #1944: a Budget is durable (its node chain rides beside the handles) — a
                 // drain keeps it, the complement of `capture` above.
                 | Binding::Budget(_)
-                // #2025: a region rides with its sharing group, so a drain keeps it.
-                | Binding::SharedRegion(_) => continue,
+                // #2025: a region rides with its sharing group, so a drain keeps it, and a post to
+                // one (#1936).
+                | Binding::SharedRegion(_)
+                | Binding::RegionPost { .. } => continue,
                 // #1361: the complement of `capture` above — a grant that rides a freeze is kept;
                 // any other is still relinquished.
                 Binding::Module(id) if self.module_rides_freeze(id) => continue,
@@ -29279,6 +29420,12 @@ impl Host {
                     Binding::SharedRegion(region)
                 }
                 DurableBinding::SharedRegion { .. } => continue,
+                DurableBinding::RegionPost { region, off, badge }
+                    if self.region(region).is_some() =>
+                {
+                    Binding::RegionPost { region, off, badge }
+                }
+                DurableBinding::RegionPost { .. } => continue,
                 // #1361: re-resolve the module the artifact *names* against what this host has been
                 // granted. `check_modules_for_thaw` validated every carried digest before any slot
                 // was pinned, so this lookup cannot fail here; if a mis-sequenced embedder reached it
@@ -30246,9 +30393,19 @@ impl Host {
     /// charge over ([`Host::prepare_detached_relaunch`]). A domain on the run's own node (a run's
     /// root, and its processes) keeps its regions for the embedder: it reads them after the run, and
     /// a reactor's next call finds them where they were. Every engine calls this where a domain ends,
-    /// under its lock, so it is also where the domain is marked [`Self::ended`] (#2220).
-    pub fn release_memory(&mut self) {
+    /// under its lock, so it is also where the domain is marked [`Self::ended`] (#2220), and where its
+    /// end post is signalled (#1936): the word to wake is answered, once, for the engine to wake its
+    /// waiters on, as a post's `signal` leaves it.
+    #[must_use = "a domain's end post leaves its waiters to wake"]
+    pub fn release_memory(&mut self) -> Option<RegionWake> {
         self.ended = true;
+        let wake = self.end.take().and_then(|(region, off, badge)| {
+            let wake = self
+                .region(region)
+                .map(|b| signal_post(b, off.into(), badge));
+            self.release_hold(region);
+            wake
+        });
         let held = std::mem::take(&mut self.grown) + std::mem::take(&mut self.own_window);
         if held > 0 {
             self.budgets.refund(self.own_budget, BUDGET_MEM, held);
@@ -30260,6 +30417,19 @@ impl Host {
         if self.own_budget != BudgetTree::RUN_NODE {
             self.regions.clear();
         }
+        wake
+    }
+
+    /// #1936 — [`Self::release_memory`] without the end post: what this domain holds goes back, and
+    /// its end post, if it holds one, is dropped unsignalled. For a domain that never ran (a spawn
+    /// that failed after its grants were given, whose result tells the spawner), and for what a JIT
+    /// child holds after its end, which [`Self::release_memory`] already signalled at its root's end.
+    pub fn release_unsignalled(&mut self) {
+        if let Some((region, ..)) = self.end.take() {
+            self.release_hold(region);
+        }
+        let unsignalled = self.release_memory();
+        debug_assert!(unsignalled.is_none());
     }
 
     /// #2430 — this domain, a detached child a thaw restored over `window` to launch by `launch`, is
@@ -30269,7 +30439,16 @@ impl Host {
     /// of its own captured children is dropped the same way. Nothing else would hand these back: the
     /// freeze kept them for the relaunch to take over. Its budget is the one its launch names, since
     /// a refused relaunch may not have registered its names yet.
-    pub fn drop_restored(mut self, launch: &DetachedLaunch, window: &MemLayout, leased: bool) {
+    ///
+    /// #1936 — its end post and its children's are signalled, as their ends would signal them: the
+    /// words to wake are answered for the engine.
+    #[must_use = "an end post leaves its waiters to wake"]
+    pub fn drop_restored(
+        mut self,
+        launch: &DetachedLaunch,
+        window: &MemLayout,
+        leased: bool,
+    ) -> Vec<RegionWake> {
         let map = window.page_map();
         let budget = launch.names.iter().find(|(name, _)| name == "budget");
         if let Some(node) = budget.and_then(|&(_, h)| self.budget_node(h)) {
@@ -30279,12 +30458,15 @@ impl Host {
             }
             (self.own_budget, self.grown) = (node, map.grown_bytes());
         }
+        let mut wakes = Vec::new();
         for child in self.take_thawed_detached() {
-            child
+            let woken = child
                 .host
                 .drop_restored(&child.launch, &child.window, false);
+            wakes.extend(woken);
         }
-        self.release_memory();
+        wakes.extend(self.release_memory());
+        wakes
     }
 
     /// #2268 — hand back what this domain holds of `maps` itself ([`Self::maps`],
@@ -33123,14 +33305,71 @@ impl Host {
             return EBUSY;
         }
         self.close(handle);
-        let named = self
-            .table
-            .iter()
-            .any(|s| matches!(s.entry, Some(Binding::SharedRegion(r)) if r == region));
+        self.release_hold(region);
+        0
+    }
+
+    /// #2358, #1936 — let go of `region` once nothing of this domain names it: a region handle, a
+    /// post to it, or its end post.
+    fn release_hold(&mut self, region: u32) {
+        let named = self.end.is_some_and(|(r, ..)| r == region)
+            || self.table.iter().any(|s| match s.entry {
+                Some(Binding::SharedRegion(r) | Binding::RegionPost { region: r, .. }) => {
+                    r == region
+                }
+                _ => false,
+            });
         if !named {
             self.regions[region as usize] = None;
         }
-        0
+    }
+
+    /// #1936 — SharedRegion op 6 `post(off, badge)` on a handle to `region` (`size` bytes): a post to
+    /// the notification at `off`, its handle or `-errno`. `-EINVAL` for a zero `badge`, which would
+    /// signal nothing, or an `off` not 8-aligned or whose 12 bytes (the bits, then the sequence
+    /// word) leave the region; `-EMFILE` for a full table.
+    fn mint_post(&mut self, region: u32, size: u64, off: u64, badge: u64) -> i64 {
+        let fits = off.is_multiple_of(8) && off.checked_add(12).is_some_and(|end| end <= size);
+        let Ok(off) = u32::try_from(off) else {
+            return EINVAL;
+        };
+        if badge == 0 || !fits {
+            return EINVAL;
+        }
+        let post = Binding::RegionPost { region, off, badge };
+        self.try_grant(cap_id::SHARED_REGION, post)
+            .map_or(EMFILE, i64::from)
+    }
+
+    /// #1936 — what `handle` posts to, when it is a post: its region's backing, the notification's
+    /// offset and the badge.
+    fn resolve_post(&self, handle: i32) -> Option<(RegionBacking, u32, u64)> {
+        match self.resolve(handle, cap_id::SHARED_REGION) {
+            Ok(Binding::RegionPost { region, off, badge }) => {
+                Some((self.region(region)?.clone(), off, badge))
+            }
+            _ => None,
+        }
+    }
+
+    /// #1936 — take the transient region word the last op left to wake ([`Self::region_wake`]).
+    fn take_region_wake(&mut self) -> Option<RegionWake> {
+        self.region_wake.take()
+    }
+
+    /// #1936 — this domain's end post ([`Self::end`]), `(region, off, badge)`, for a freeze to carry:
+    /// its region is one of [`Self::regions`], which the codec numbers as a handle's.
+    pub fn end_post(&self) -> Option<(u32, u32, u64)> {
+        self.end
+    }
+
+    /// #1936 — put back the end post a freeze carried ([`Self::end_post`]), its region the id this
+    /// host adopted it at ([`Host::adopt_region`]). An id naming no region leaves none, as a handle's
+    /// is left closed.
+    pub fn restore_end_post(&mut self, region: u32, off: u32, badge: u64) {
+        if self.region(region).is_some() {
+            self.end = Some((region, off, badge));
+        }
     }
 
     /// Close a handle (§3c): free the slot but keep its generation, so the old handle value is
@@ -33231,8 +33470,21 @@ impl Host {
     /// [`grant_name_ok`], and its handle passes [`Self::can_grant`] or is an empty grant
     /// ([`GRANT_EMPTY`]), which grants nothing and so needs no authority.
     fn can_grant_entry(&self, name: &str, handle: i32, callable: bool) -> bool {
+        if name == END_GRANT {
+            return self.resolve_post(handle).is_some();
+        }
         grant_name_ok(name, handle)
             && (handle as u32 == GRANT_EMPTY || self.can_grant(handle, callable))
+    }
+
+    /// The spawn's check for its whole grant list, which every engine's spawn asks before it builds
+    /// anything: each record passes [`Self::can_grant_entry`], and at most one names the end post
+    /// ([`END_GRANT`]).
+    fn can_grant_list(&self, list: &[(String, i32)], callable: bool) -> bool {
+        list.iter().filter(|(n, _)| n == END_GRANT).count() <= 1
+            && list
+                .iter()
+                .all(|(n, h)| self.can_grant_entry(n, *h, callable))
     }
 
     /// Grant one record [`Self::can_grant_entry`] passed into `child` under its name: a handle as
@@ -33246,6 +33498,12 @@ impl Host {
         handle: i32,
         child: &mut Host,
     ) -> Option<()> {
+        // #1936 — the end post stays with the child's host, out of its table and its directory.
+        if name == END_GRANT {
+            let (backing, off, badge) = self.resolve_post(handle)?;
+            child.end = Some((child.hold_region(backing), off, badge));
+            return Some(());
+        }
         let cg = if handle as u32 == GRANT_EMPTY {
             handle
         } else {
@@ -33328,6 +33586,7 @@ impl Host {
         self.resolve_pipe_end(handle).is_some()
             || self.resolve_live_impl(handle).is_some()
             || self.resolve_region(handle).is_ok()
+            || self.resolve_post(handle).is_some()
             || self.resolve_offer(handle).is_ok()
             // A **blocking** stdin (a driver-parked interactive session) is not re-grantable: its
             // driver pushes input into this host's buffer and parks this host's reader, neither of
@@ -33412,6 +33671,13 @@ impl Host {
         // rendezvous across the domains — the concurrent-pipeline substrate.
         if let Ok(backing) = self.resolve_region(handle) {
             return Some(child.grant_shared_region_backed(backing));
+        }
+        // #1936 — a post re-grants as its region does: the child holds the same backing, through a
+        // post to the same notification, so its signal wakes the same waiters.
+        if let Some((backing, off, badge)) = self.resolve_post(handle) {
+            let region = child.hold_region(backing);
+            let post = Binding::RegionPost { region, off, badge };
+            return Some(child.grant(cap_id::SHARED_REGION, post));
         }
         // A **wired interface offer** (IMPORTS.md §3.2/§3.3): re-granting it is how a parent
         // forwards, wraps, or overrides a capability for a child — the entry (shared function
@@ -33744,10 +34010,7 @@ impl Host {
     ) -> Option<(Host, i32, i32)> {
         // Check every handle first — if any is non-grantable the spawn fails closed, before we mutate
         // anything (a partially-built child would leak a promoted sink / installed pipe).
-        if !grants
-            .iter()
-            .all(|(n, h)| self.can_grant_entry(n, *h, cell.is_some()))
-        {
+        if !self.can_grant_list(grants, cell.is_some()) {
             return None;
         }
         let mut ch = self.child_host();
@@ -33886,7 +34149,9 @@ impl Host {
     /// engine to wake, and its exit hooks fire, so its personality retires it to a zombie its parent
     /// reaps.
     pub fn spawn_failed(&mut self, status: i64) -> (Vec<u32>, Vec<u32>) {
-        self.release_memory();
+        // #1936 — a process or a fork twin has no end post: only a spawn record names one.
+        let no_end_post = self.release_memory();
+        debug_assert!(no_end_post.is_none());
         let zeroed = self.release_pipe_ends();
         for hook in &self.exit_hooks {
             hook(status);
@@ -34223,9 +34488,13 @@ impl Host {
             .then_some(f.params.len())
             .ok_or(EINVAL)?;
         let memory_log2 = g.memory_log2().ok_or(EINVAL)?;
+        // #1936 — the image an exec starts is the same domain, which keeps its spawner's end post, so
+        // its grant list names none.
         if !(0..64).contains(&size_log2)
             || !window_reserved.is_power_of_two()
-            || !grants.iter().all(|(_, h)| self.can_regrant(*h))
+            || !grants
+                .iter()
+                .all(|(n, h)| n != END_GRANT && self.can_regrant(*h))
         {
             return Err(EINVAL);
         }
@@ -34282,6 +34551,14 @@ impl Host {
         }
         (host.own_window, host.leased) = (window, self.leased);
         host.main_vcpu = std::mem::take(&mut self.main_vcpu);
+        // #1936 — and so is its end post: the domain goes on, so its spawner hears of its end later.
+        if let Some((region, off, badge)) = self.end.take() {
+            let backing = self
+                .region(region)
+                .cloned()
+                .expect("an end post holds its region");
+            host.end = Some((host.hold_region(backing), off, badge));
+        }
         // #2268 — and so is the domain's own share of the host's mappings, and its window's: what the
         // caller's held, settled to the image's bound, and to the runs its window starts with once it
         // does ([`Self::start_window`]). #2305 — and the address space the window reserves.
@@ -34298,8 +34575,10 @@ impl Host {
         // new image's grants already bumped their own ends (`install_pipe_end`), so the shared
         // counts never dip through this.
         let zeroed_pipes = self.release_pipe_ends();
-        // #1909 — and the old window goes with it: what it grew is handed back.
-        self.release_memory();
+        // #1909 — and the old window goes with it: what it grew is handed back. Its end post went to
+        // the new image above, so this signals nothing.
+        let signalled = self.release_memory();
+        debug_assert!(signalled.is_none());
         Ok(ExecImage {
             zeroed_pipes,
             host,
@@ -35213,6 +35492,12 @@ impl Host {
                 let Some(backing) = self.region(region).cloned() else {
                     return put_results(out, &[EINVAL]);
                 };
+                // #1936 — `post(off, badge)` mints a handle and touches no window.
+                if op == 6 {
+                    let off = *args.first().unwrap_or(&0) as u64;
+                    let badge = *args.get(1).unwrap_or(&0) as u64;
+                    return put_results(out, &[self.mint_post(region, backing.size(), off, badge)]);
+                }
                 let Some(mem) = mem else {
                     return put_results(out, &[EINVAL]);
                 };
@@ -35257,6 +35542,28 @@ impl Host {
                         2 => backing.size() as i64,
                         3 => mem.region_page_size(),
                         5 => self.close_region(handle, region, mem),
+                        _ => EINVAL,
+                    }],
+                )
+            }
+            Binding::RegionPost { region, off, badge } => {
+                // #1936 — a post signals and closes, and nothing else: it can't map, read or write
+                // its region. The wake is the engine's, so the word is left for it.
+                let Some(backing) = self.region(region).cloned() else {
+                    return put_results(out, &[EINVAL]);
+                };
+                put_results(
+                    out,
+                    &[match op {
+                        7 => {
+                            self.region_wake = Some(signal_post(&backing, off.into(), badge));
+                            0
+                        }
+                        5 => {
+                            self.close(handle);
+                            self.release_hold(region);
+                            0
+                        }
                         _ => EINVAL,
                     }],
                 )
@@ -39530,7 +39837,7 @@ mod growth_tests {
             (WINDOW + 2 * GROWTH) as i64,
             "and charges nothing"
         );
-        twin.release_memory();
+        let _ = twin.release_memory();
         assert_eq!(
             used(&parent, node),
             GROWTH as i64,
@@ -39597,7 +39904,7 @@ mod growth_tests {
             (WINDOW + GROWTH) as i64,
             "the copy's growth is back, and its window is the image's"
         );
-        image.host.release_memory();
+        let _ = image.host.release_memory();
         assert_eq!(
             used(&parent, node),
             GROWTH as i64,
@@ -39625,7 +39932,7 @@ mod growth_tests {
             (4 * WINDOW + GROWTH) as i64,
             "the image's window is charged, and the copy's growth is back"
         );
-        image.host.release_memory();
+        let _ = image.host.release_memory();
         assert_eq!(used(&parent, node), GROWTH as i64);
     }
 
@@ -39673,7 +39980,7 @@ mod growth_tests {
             (WINDOW + GROWTH) as i64,
             "the caller's window past the image's is back, with the copy's growth"
         );
-        image.host.release_memory();
+        let _ = image.host.release_memory();
         assert_eq!(
             used(&parent, node),
             GROWTH as i64,
@@ -39738,7 +40045,7 @@ mod growth_tests {
             "the next activation's window, in place of the last"
         );
         assert_eq!(root.budgets.used(run, BUDGET_SPAWN), 1, "still one");
-        root.release_memory();
+        let _ = root.release_memory();
         assert_eq!(used(&root, run), 0, "the root's end hands its window back");
         assert_eq!(root.budgets.used(run, BUDGET_SPAWN), 0, "and its vCPU");
     }
@@ -39807,7 +40114,7 @@ mod growth_tests {
         assert_eq!(held(&root), (18 * page, 18 * page as i64));
         // An activation counts the window the same way, and its end hands it all back.
         assert_eq!(RootWindow::of(Some(&mem)).grown, 18 * page);
-        root.release_memory();
+        let _ = root.release_memory();
         assert_eq!(used(&root, run), 0);
     }
 
@@ -39935,7 +40242,7 @@ mod growth_tests {
             root.fork_powerbox(3, WINDOW).is_none(),
             "no room for another"
         );
-        twin.release_memory();
+        let _ = twin.release_memory();
         assert_eq!(
             used(&root, run),
             WINDOW as i64,
@@ -40016,7 +40323,7 @@ mod exec_maps_tests {
             2,
             "settled to the runs its window starts with"
         );
-        image.host.release_memory();
+        let _ = image.host.release_memory();
         assert_eq!(maps(&parent, node), 0, "and its end hands them back");
     }
 }
@@ -40376,7 +40683,7 @@ mod region_charge_tests {
             "no room for another byte: the mint is refused"
         );
         assert_eq!(used(&parent, node), REGION as i64, "and charges nothing");
-        child.release_memory();
+        let _ = child.release_memory();
         assert_eq!(
             used(&parent, node),
             0,
@@ -40389,13 +40696,13 @@ mod region_charge_tests {
         let (parent, node, mut child, space) = child(REGION as i64);
         assert!(mint(&mut child, space, REGION) >= 0);
         let mut twin = child.fork_powerbox(7, 0).expect("a simple domain forks");
-        child.release_memory();
+        let _ = child.release_memory();
         assert_eq!(
             used(&parent, node),
             REGION as i64,
             "the twin still holds it"
         );
-        twin.release_memory();
+        let _ = twin.release_memory();
         assert_eq!(
             used(&parent, node),
             0,
@@ -40409,7 +40716,7 @@ mod region_charge_tests {
         let id = child.adopt_region(child.rebuild_region(&[7; 64]).expect("rebuilt"));
         assert_eq!(child.region(id).expect("held").read_byte(63), 7);
         assert_eq!(used(&parent, node), 64);
-        child.release_memory();
+        let _ = child.release_memory();
         assert_eq!(used(&parent, node), 0);
     }
 
@@ -40476,7 +40783,7 @@ mod region_charge_tests {
             REGION as i64,
             "the twin still holds it"
         );
-        twin.release_memory();
+        let _ = twin.release_memory();
         assert_eq!(
             used(&parent, node),
             0,

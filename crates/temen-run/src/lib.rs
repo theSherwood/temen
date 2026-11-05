@@ -589,6 +589,10 @@ unsafe fn cap_thunk_impl(
             // later call.
             let parks = host.take_park_transients();
             let stdin_park = host.take_stdin_parked();
+            // #1936 — a post's signal: its word's waiters wake by the key a §13 `map` gave it.
+            if let Some((backing, off)) = parks.wake_region.as_ref().and_then(|w| w.os_key()) {
+                temen_jit::notify_region(vm, backing, off);
+            }
             // A park the caller waits out runs the op again (invariant 7: the rewound park).
             *park = if serves {
                 let view = gm.as_mut().map(|g| &mut **g as &mut dyn GuestMem);
@@ -1637,7 +1641,9 @@ fn detached_seeds(host: &mut Host) -> Vec<temen_jit::DetachedSeed> {
             // program no longer binds, or #2318 the process's pools have no room for its lease):
             // with what the freeze kept for it and its own captured children, and one its parent
             // can join ends with `ThreadFault`. #2465 — one its parent detached just ends.
-            child.drop_restored(&launch, &window, false);
+            // #1936 — its end post is signalled with no wake: the run has not started, so its
+            // waiters' waits re-issue on the thaw and read the new sequence.
+            let _ = child.drop_restored(&launch, &window, false);
             if launch.joinable {
                 out.push(temen_jit::DetachedSeed::Completed {
                     slot,
@@ -2817,6 +2823,7 @@ pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
         } else {
             budget_mem_give
         },
+        child_ended,
         lane_give: if locked { lane_give_locked } else { lane_give },
         premap_admit: if locked {
             premap_admit_locked
@@ -3897,11 +3904,14 @@ pub unsafe extern "C" fn budget_mem_give(
     runs: u64,
 ) {
     if !child.is_null() {
+        // #1936 — the child's end already went through [`child_ended`], which signalled its end post
+        // when its root ended; what its window held since, and a child that never ran, go back here
+        // without one.
         let child = &*(child as *const Mutex<Host>);
         child
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .release_memory();
+            .release_unsignalled();
     }
     let parent = &mut *(ctx as *mut Host);
     parent.release_detached(temen_interp::Lease {
@@ -3909,6 +3919,21 @@ pub unsafe extern "C" fn budget_mem_give(
         bytes,
         runs,
     });
+}
+
+/// #1936 — [`temen_jit::ChildEnded`]: a detached child's domain ended, at its root's end. What it
+/// holds goes back ([`Host::release_memory`]) and its end post is signalled, its waiters woken in its
+/// run, before the child leaves the run's live count, so none of them reads the run as deadlocked.
+///
+/// # Safety
+/// `child` is a live [`temen_jit::GrantChild::ctx`].
+pub unsafe extern "C" fn child_ended(child: *mut c_void) {
+    let child = &*(child as *const Mutex<Host>);
+    let mut g = child.lock().unwrap_or_else(|e| e.into_inner());
+    let end = g.release_memory();
+    if let Some((backing, off)) = end.as_ref().and_then(|w| w.os_key()) {
+        temen_jit::notify_region_in(g.park_hub(), backing, off);
+    }
 }
 
 /// The by-name builders' grant list: [`temen_interp::read_grant_records`] over the parent's window

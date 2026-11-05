@@ -1816,6 +1816,11 @@ fn scan_seams<'a>(funcs: impl IntoIterator<Item = &'a Func>) -> Seams {
                     | Inst::ThreadJoin { .. }
                     | Inst::MemoryWait { .. }
                     | Inst::MemoryNotify { .. } => s.has_thread = true,
+                    // #1936 — a post's `signal` is a notify: it stops for its driver, which wakes
+                    // the word's waiters ([`Outcome::WakeRegion`]).
+                    Inst::CapCall(c) if (c.type_id, c.op) == (super::cap_id::SHARED_REGION, 7) => {
+                        s.has_thread = true
+                    }
                     Inst::GcRoots { .. } => s.has_gc = true,
                     Inst::CallIndirect(_) | Inst::CallImportDyn(_) => {
                         s.has_opaque_call = true
@@ -2029,7 +2034,7 @@ impl AdmittedChild {
     /// [`AdmittedChild::build`] refuses it: a full domain table, which refuses probeably.
     fn refuse(self, refund: impl FnOnce(Lease)) {
         let mut host = self.host;
-        host.release_memory();
+        host.release_unsignalled();
         refund(self.lease);
     }
 
@@ -2064,7 +2069,7 @@ impl AdmittedChild {
             Err(t) => {
                 // #2268 — its window, if built, started: what it held of `maps` goes back too.
                 let mut host = host;
-                host.release_memory();
+                host.release_unsignalled();
                 refund(lease);
                 Err(t)
             }
@@ -2249,10 +2254,7 @@ fn admit_detached_child(
         None => Vec::new(),
     };
     let cell = host.own_cell();
-    if !glist
-        .iter()
-        .all(|(n, h)| host.can_grant_entry(n, *h, cell.is_some()))
-    {
+    if !host.can_grant_list(&glist, cell.is_some()) {
         return Err(Trap::CapFault);
     }
     let premap_ok = match s.premap {
@@ -5855,15 +5857,21 @@ pub enum SchedBreak {
 /// and exec), and it never replaces their powerboxes, so the child's is still here. `run_ended`: the
 /// run is over, which ends every child still live too, as the oracle's teardown reaps it (#2006).
 fn dbg_refund_ended_windows(tasks: &mut [TaskSlot], envs: &mut [Domain], run_ended: bool) {
+    let mut ends = Vec::new();
     for t in tasks.iter_mut() {
         if run_ended || matches!(t.state, TaskState::Done(_)) {
             if let Some((env, lease)) = t.lease.take() {
                 envs[env].host.lock_unpoisoned().release_detached(lease);
                 if t.domain != 0 {
-                    envs[t.domain].host.lock_unpoisoned().release_memory();
+                    // #1936 — and its end post is signalled, its waiters woken below.
+                    let end = envs[t.domain].host.lock_unpoisoned().release_memory();
+                    ends.extend(end);
                 }
             }
         }
+    }
+    for w in &ends {
+        wake_region(tasks, envs, w);
     }
     // #2112 — a child domain with no task left running has ended, whatever its root did first: its
     // fibers' registry goes, and what they hold with it, as the oracle's goes with the domain.
@@ -6507,6 +6515,10 @@ fn service_advance(
                 let regs = domains.iter_mut().flat_map(|e| e.fibers.fibers.iter_mut());
                 woken += wake_fiber_waiters(regs, key, want - woken);
                 tasks[ti].deliver(dst, Reg::from_i32(woken as i32));
+            }
+            Outcome::WakeRegion(w) => {
+                *turn += 1;
+                wake_region(tasks, domains, &w);
             }
             // §5 detached spawn (op 17): a fresh window of its own as a debug task — the
             // cooperative executor's spawn on this path, so a spawning guest stays steppable through
@@ -9216,6 +9228,8 @@ struct DispatchParks {
     pipe_write: Option<u32>,
     /// A signal interrupted a blocking op: the latch a driver's interrupt path set.
     sig_interrupt: bool,
+    /// #1936 — a post's `signal` left this region word to wake.
+    region: Option<super::RegionWake>,
 }
 
 impl DispatchParks {
@@ -9232,6 +9246,7 @@ impl DispatchParks {
             pipe_read: p.take_pipe_read_parked(),
             pipe_write: p.take_pipe_write_parked(),
             sig_interrupt: p.take_sig_interrupt(),
+            region: p.take_region_wake(),
         };
         // The wake flags a peer's write/close raised need no action at a dispatch site — both drivers
         // poll pipe readiness at their settle — but they are per-op too, so they drain here as well.
@@ -9449,6 +9464,10 @@ enum Outcome {
         count: i32,
         dst: u32,
     },
+    /// #1936 — a post's `signal` left a region word to wake ([`super::RegionWake`]): the driver wakes
+    /// every waiter on it ([`wake_region`]). The op has completed, its result delivered and `pc`
+    /// past it, so the task runs on.
+    WakeRegion(super::RegionWake),
     /// §22 `install`: the `Jit` cap `h` is authority for code-handle `code`; the driver compiles +
     /// installs the unit and writes the slot (or `-ENOSPC`) to `dst`.
     JitInstall {
@@ -11124,6 +11143,7 @@ fn drive_nested(
             o @ (Outcome::ThreadSpawn { .. }
             | Outcome::ThreadJoin { .. }
             | Outcome::MemoryNotify { .. }
+            | Outcome::WakeRegion(_)
             | Outcome::InstantiateDetached { .. }
             | Outcome::ChildOffer { .. }
             | Outcome::ChildCtl { .. }
@@ -11281,6 +11301,8 @@ enum VcpuStop {
         count: i32,
         dst: u32,
     },
+    /// #1936 — [`Outcome::WakeRegion`]: wake every waiter on a region word a post's signal left.
+    WakeRegion(super::RegionWake),
     /// §22 `Jit.install` — the driver (which owns the task's domain) compiles + installs the unit.
     JitInstall {
         h: i32,
@@ -11411,6 +11433,7 @@ impl Outcome {
             // Blocking-stdin park: the scheduler blocks the task until its stdin has bytes.
             Outcome::StdinPark => VcpuStop::StdinPark,
             Outcome::MemoryNotify { base, count, dst } => VcpuStop::Notify { base, count, dst },
+            Outcome::WakeRegion(w) => VcpuStop::WakeRegion(w),
             Outcome::JitInstall { h, code, dst } => VcpuStop::JitInstall { h, code, dst },
             Outcome::JitUninstall { h, slot, dst } => VcpuStop::JitUninstall { h, slot, dst },
             Outcome::JitInvoke {
@@ -11924,7 +11947,9 @@ fn refund_ended_windows(tasks: &mut [TaskSlot], envs: &mut [Domain], run_ended: 
     }
     if run_ended {
         for e in envs.iter_mut().skip(1) {
-            e.host.lock_unpoisoned().release_memory();
+            // The run is over: no waiter is left to wake. An end post is still signalled, so its bits
+            // are there for whoever reads the region next.
+            let _ = e.host.lock_unpoisoned().release_memory();
             e.fibers = FiberTables::default();
         }
     }
@@ -12986,10 +13011,13 @@ fn settle_wakes(
         live[t.domain - 1] |= !matches!(t.state, TaskState::Done(_));
     }
     let mut finished: Vec<usize> = Vec::new();
+    let mut ends = Vec::new();
     for k in 1..domains.len() {
         if seen[k - 1] && !live[k - 1] && released.domains.insert(k) {
             let mut h = domains[k].host.lock_unpoisoned();
-            h.release_memory();
+            // #1936 — its end post is signalled, its waiters woken below, in this settle: before the
+            // run can be read as deadlocked.
+            ends.extend(h.release_memory());
             h.release_pipe_ends();
             // #1217 — a §14 child's end releases every service it held a live offer to, and the
             // pager its faults called (#2164): it can no longer call one, so a `svc.wait` there
@@ -13014,6 +13042,9 @@ fn settle_wakes(
             }
             finished.push(k);
         }
+    }
+    for w in &ends {
+        wake_region(tasks, domains, w);
     }
     // #799/#1080 — a **fork twin** finishing fires its personality exit hooks ONCE (Live →
     // Zombie in the process table), the bytecode port of the tree-walker's death-hook step. It
@@ -14817,6 +14848,8 @@ impl SchedCore {
                 woken += wake_fiber_waiters(regs, key, want - woken);
                 tasks[ti].deliver(dst, Reg::from_i32(woken as i32));
             }
+            // #1936 — a post's signal: its op completed, so the task runs on.
+            Ok(VcpuStop::WakeRegion(w)) => wake_region(tasks, domains, &w),
             // §22 install/uninstall ([`jit_install`], [`jit_uninstall`]) against the TASK's host
             // and its own dispatch table: a §14 child's is `domains[k].table`, so its installs
             // stay out of the parent's `call.dyn` (#1296). #926 slice 2f / #1233: the B2 mirror
@@ -15535,7 +15568,9 @@ impl HeldPump {
         drop(sched);
         let mut host = Host::from_cell(root);
         host.held = None;
-        host.release_memory();
+        // The run's root: no spawn record named it an end post.
+        let no_end_post = host.release_memory();
+        debug_assert!(no_end_post.is_none());
         host.release_pipe_ends();
         Some((host, ended))
     }
@@ -15666,7 +15701,9 @@ impl HeldThreads {
         drop(ThreadRun::finish(run));
         let mut host = Host::from_cell(root);
         host.held = None;
-        host.release_memory();
+        // The run's root: no spawn record named it an end post.
+        let no_end_post = host.release_memory();
+        debug_assert!(no_end_post.is_none());
         host.release_pipe_ends();
         Some((host, ended))
     }
@@ -18849,6 +18886,16 @@ fn wake_waiters<'a>(
     woken
 }
 
+/// #1936 — wake every task and event-parked fiber waiting on region word `w`, in every domain: a
+/// post's `signal` ([`Outcome::WakeRegion`]), or a child's end post at its end. `memory.notify` with
+/// no count, keyed as the word's waiters keyed their parks, whichever window they map it in.
+fn wake_region(tasks: &mut [TaskSlot], domains: &mut [Domain], w: &super::RegionWake) {
+    let key = w.key();
+    wake_waiters(tasks, key, u32::MAX, |env| domains[env].mem.as_ref());
+    let regs = domains.iter_mut().flat_map(|e| e.fibers.fibers.iter_mut());
+    wake_fiber_waiters(regs, key, u32::MAX);
+}
+
 /// The earliest deadline among the tasks' futex waits — what the logical clock advances to when no
 /// task is runnable. An infinite wait has none, so a run whose every waiter is indefinite reaches
 /// its driver's deadlock exit instead of a `WAIT_TIMED_OUT` the guest never asked for (#1638).
@@ -20764,6 +20811,15 @@ impl Vm {
                     } else {
                         self.set_results(base + *dst as usize, res, results);
                         pc += 1;
+                        // #1936 — a post's signal: the op is done, and the driver wakes the word's
+                        // waiters, which only it can reach.
+                        if let Some(w) = parks.region {
+                            self.module = module;
+                            self.cur = cur;
+                            self.base = base;
+                            self.pc = pc;
+                            return Ok(Outcome::WakeRegion(w));
+                        }
                         // #1198 — this syscall STOPPED its own domain (a background terminal read/write
                         // hit `tty_background_check` → SIGTTIN/SIGTTOU default-action stop; or a `^Z`
                         // SIGTSTP). The tree-walker benches a stopped domain at its per-op `stop_flag`

@@ -893,7 +893,9 @@ fn image_start(img: temen_interp::ExecImage) -> (Start<'static>, Host) {
 /// readers, whose blocked readers wake to EOF and writers to `-EPIPE`.
 fn retire(tree: &Tree, host: &mut Host) {
     host.disarm_caller_requests();
-    host.release_memory();
+    // #1936 — a process has no end post: only a spawn record names one.
+    let no_end_post = host.release_memory();
+    debug_assert!(no_end_post.is_none());
     let (eof, epipe) = host.release_pipe_ends();
     if !eof.is_empty() || !epipe.is_empty() {
         tree.ring();

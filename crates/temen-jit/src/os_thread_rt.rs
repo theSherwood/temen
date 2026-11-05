@@ -3424,18 +3424,57 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
 /// # Safety
 /// `sched` is the run's live `Domain`.
 pub(crate) unsafe extern "C" fn thread_notify(sched: *const Domain, phys: u64, count: i32) -> i32 {
-    let dom = current_domain(sched).hub();
     // The count is **unsigned** "wake up to N" (wasm's notify count is u32; `-1` = wake all);
     // `futex_notify` caps at the real waiter count, so reinterpret the i32 bits as u32.
-    let woken = futex_notify(&dom.park, futex_key_of(phys), count as u32, &dom.parked);
+    notify_key(
+        current_domain(sched).hub(),
+        futex_key_of(phys),
+        count as u32,
+    ) as i32
+}
+
+/// #1936 — wake every waiter on byte `off` of the region whose OS handle is `backing` (the identity a
+/// §13 `map` records, [`region_canon_record`]), in `vm`'s run: a post's `signal`, which has no
+/// address in a window to notify at. Returns how many it woke.
+///
+/// # Safety
+/// As [`wake_host_parks`].
+#[cfg(not(loom))]
+pub unsafe fn notify_region(vm: &crate::VmCtx, backing: u64, off: u64) -> u32 {
+    if vm.sched.is_null() {
+        return 0;
+    }
+    let hub = current_domain(vm.sched as *const Domain).hub();
+    notify_key(hub, FutexKey::Region(backing, off), u32::MAX)
+}
+
+/// [`notify_region`] for a waker that holds the run's domain address rather than a call's trap cell
+/// ([`crate::CompiledModule::park_hub`]; `0` ⇒ the run has none, and nothing waits in it): a §14
+/// child's end post, signalled as the child ends.
+///
+/// # Safety
+/// A nonzero `hub` is a live run's domain address, as `park_hub` returned it.
+#[cfg(not(loom))]
+pub unsafe fn notify_region_in(hub: usize, backing: u64, off: u64) -> u32 {
+    if hub == 0 {
+        return 0;
+    }
+    let hub = (*(hub as *const Domain)).hub();
+    notify_key(hub, FutexKey::Region(backing, off), u32::MAX)
+}
+
+/// Wake up to `count` waiters on `key` in the run whose futex table `hub` holds: `atomic.notify`'s
+/// and a post's wake.
+fn notify_key(hub: &Domain, key: FutexKey, count: u32) -> u32 {
+    let woken = futex_notify(&hub.park, key, count, &hub.parked);
     if woken > 0 {
         // D66 — a parked **child-domain task** has no resumer polling it: re-offer the tasks whose
         // cells this notify just filled, so they run again. Nothing else re-offers them (#2757).
         // #1991 — only those: every other parked task would re-check and park again, and with many
         // tasks those re-checks were most of a busy run's work.
-        dom.wake_child_tasks(crate::child_exec::Wake::Resolved);
+        hub.wake_child_tasks(crate::child_exec::Wake::Resolved);
     }
-    woken as i32
+    woken
 }
 
 /// §12.8 concurrent-thaw stage 3: RAII counter for [`Domain::parked`]. Increments while a vCPU is blocked

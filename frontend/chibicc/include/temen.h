@@ -144,6 +144,23 @@ long __vm_region_page_size(int region);
 // (unmap first), or -EBADF for a handle already closed.
 long __vm_region_close(int region);
 
+// --- Notifications (#1936) ---------------------------------------------------------------------
+//
+// A notification is a `u64` of bits at an 8-aligned offset `off` of a region and a `u32` sequence
+// word at `off + 8`. Its waiter maps the region; it reads the sequence, takes the bits with an
+// atomic swap, and if they were 0 waits on the sequence word (`__vm_wait32`) until it moves.
+//
+// Mint a post to the notification at `off` of `region`: a handle that can signal it and nothing
+// else (it can't map, read or write the region), to grant to a poster. Returns the post handle, or
+// -EINVAL for a zero `badge` or an `off` not 8-aligned or whose 12 bytes leave the region. A spawn
+// that grants a post under the name "end" makes it the child's end post: the child never holds it,
+// and temen signals it when the child ends, however it ends.
+long __vm_post(int region, long off, long badge);
+
+// OR the post's badge into the notification's bits, bump its sequence and wake its waiters.
+// Returns 0.
+long __vm_signal(int post);
+
 // --- Guest-driven JIT (iface 11, JIT.md Model A) --------------------------------------------
 //
 // Submit serialized Temen IR (the binary `temen-encode` format) built at runtime in this window;

@@ -1531,6 +1531,35 @@ static int gen_builtin_region_close(Node *node) {
   return r;
 }
 
+// #1936 — a notification's post, on the region handle as the region builtins are:
+//
+//   long __vm_post(int r, long off, long badge);   // a post to the notification at `off` (op 6)
+//   long __vm_signal(int post);                    // OR its badge in, bump, wake (op 7)
+static int gen_builtin_post(Node *node) {
+  int argc = 0;
+  for (Node *a = node->args; a; a = a->next)
+    argc++;
+  if (argc != 3)
+    error_tok(node->tok, "codegen_ir: __vm_post(r, off, badge) expects 3 arguments");
+  Node *a = node->args;
+  int rh = gen_expr(a);
+  int off = widen_i64(gen_expr(a->next), a->next->ty);
+  int badge = widen_i64(gen_expr(a->next->next), a->next->next->ty);
+  int r = nv++;
+  cg("  v%d = call.cap 4 6 (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, rh, off, badge);
+  return r;
+}
+
+static int gen_builtin_signal(Node *node) {
+  Node *a = node->args;
+  if (!a || a->next)
+    error_tok(node->tok, "codegen_ir: __vm_signal(post) expects 1 argument");
+  int ph = gen_expr(a);
+  int r = nv++;
+  cg("  v%d = call.cap 4 7 () -> (i64) v%d ()\n", r, ph);
+  return r;
+}
+
 // FORK.md §8.6 — `__vm_resolve(name_ptr, len) -> handle`: resolve a re-granted powerbox cap by name
 // (`self.resolve`), so the guest can read the raw handle a re-grant registered — a `Stream` handle
 // to place in an `__vm_exec_module` grant list, or the command-module handle to `execve` into. The i32
@@ -2218,6 +2247,10 @@ static int gen_expr(Node *node) {
           return gen_builtin_region_page_size(node);
         if (!strcmp(fname, "__vm_region_close"))
           return gen_builtin_region_close(node);
+        if (!strcmp(fname, "__vm_post"))
+          return gen_builtin_post(node);
+        if (!strcmp(fname, "__vm_signal"))
+          return gen_builtin_signal(node);
         if (!strcmp(fname, "__vm_page_size"))
           return gen_builtin_page_size(node);
         if (!strcmp(fname, "__vm_stream_write"))

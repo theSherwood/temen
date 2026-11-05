@@ -2629,6 +2629,19 @@ One mechanism for every sharing relationship: host↔guest, guest↔guest
   ring buffers are the bulk data path between adjacent or nested domains, with no
   per-message crossing. Generalizes the §9 command rings from host↔guest to
   guest↔guest.
+- **Notifications (#1936).** A notification is a `u64` of bits at an 8-aligned
+  offset of a region and a `u32` sequence word 8 bytes on. Its waiter maps the
+  region: it reads the sequence, swaps the bits out, and when they were 0 waits on
+  the sequence word with `atomic.wait`. A **post** is a signal-only handle to it,
+  minted from a region handle (op 6 `post(off, badge)`): op 7 `signal` ORs the
+  badge into the bits, bumps the sequence and wakes the word's waiters; op 5
+  closes it; every other op is `-EINVAL`, so a poster cannot map, read or write
+  the region, nor clear or forge the waiter's bits. A post is granted, held and
+  frozen as a region handle is. The host leaves the word to wake as a dispatch
+  transient (`RegionWake`), and each engine wakes its futex waiters on it by the
+  key it gives a region word. A spawn names a child's **end post** as a grant
+  called `end`: the child never holds it, and the child's end signals it, however
+  it ends (§14).
 
 ---
 
@@ -2691,6 +2704,15 @@ default above still stands for every handle-gated capability.
   what it holds (attenuation), so **a child's isolation tier can never exceed the parent's** — a
   tier-3 child requires the *host* to grant a real process; a guest cannot manufacture isolation it
   lacks.
+- **A child's end reaches a parent waiting on something else (#1936).** A spawn's grant named
+  `end` must be a post (§13): it is kept with the child's host, out of its table and its name
+  directory, and signalled once when the child's domain ends, however it ends: return, trap, kill
+  or fuel. Every engine signals it where it marks the domain ended (`Host::release_memory`), and
+  wakes its waiters before the child leaves the run's live count, so a waiter is never read as
+  deadlocked. A freeze does not end a child, and a spawn that fails does not signal (its result
+  says so). An exec is the same domain, so it keeps the end post and its grant list may not name
+  one. One waiter can hear every child's end and every other post through one notification, with
+  no poll.
 
 ### New primitives introduced here
 - **`SharedRegion`** (§13): create / map / unmap / grant.

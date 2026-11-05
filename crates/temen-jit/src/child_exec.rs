@@ -78,6 +78,9 @@ thread_local! {
 type LimitedEntry =
     extern "C" fn(*const i64, *mut i64, *mut u8, *const core::ffi::c_void, *mut i64, u64);
 
+/// #1936 — a task's one-shot end: its domain ended, and no freeze captured it ([`crate::ChildEnded`]).
+pub(crate) type Ended = Box<dyn FnOnce() + Send>;
+
 /// A task's one-shot teardown: release the child powerbox, return its lane and its window's bytes.
 /// Its argument says whether a freeze captured the child (#1971): a child that unwound for a freeze
 /// is carried by the artifact, not ended, so its window stays charged, as on the interpreter.
@@ -124,6 +127,8 @@ pub(crate) struct ChildTask {
     /// Runs exactly once, after the last resume, while the window is still alive: releases the
     /// child powerbox and returns the child's lane to the parent.
     teardown: Option<Teardown>,
+    /// #1936 — told once its domain ends ([`Self::end`]).
+    ended: Option<Ended>,
     /// #1469 — the domain the child's own `thread.spawn` vCPUs run in (their handle table, window,
     /// fiber registry and lane chain), sharing the run's futex, park count, lanes and live count.
     /// Built when the task is filed ([`ChildExec::spawn`]), for a child compiled with thread ops.
@@ -155,6 +160,20 @@ pub(crate) struct ChildTask {
 unsafe impl Send for ChildTask {}
 
 impl ChildTask {
+    /// #1936 — tell the task's powerbox, through `ended`, when its domain ends ([`Self::end`]).
+    pub(crate) fn on_end(mut self, ended: Ended) -> ChildTask {
+        self.ended = Some(ended);
+        self
+    }
+
+    /// #1936 — the task's domain has ended, and no freeze captured it: tell its powerbox, once,
+    /// before the task leaves the run's live count or its join can see the end.
+    fn end(&mut self) {
+        if let Some(ended) = self.ended.take() {
+            ended();
+        }
+    }
+
     /// Build a task around a compiled detached child. `init` seeds the fresh window (data segments,
     /// payload) and may protect its pages (a detached child's readonly segments, a thawed one's page
     /// map), `false` when the OS refuses one; `premap` aliases the spawn's pre-mapped region onto it
@@ -267,6 +286,7 @@ impl ChildTask {
             serve_handlers: 0,
             done,
             teardown: Some(teardown),
+            ended: None,
             dom: None,
             node,
             children,
@@ -1234,6 +1254,10 @@ impl ChildExec {
         // #2112 — the child's domain has ended: its fibers' charges go back before its parent can
         // learn of the end, as its window's do in `teardown`.
         task.rt.table().release_charges();
+        // #1936 — and its powerbox hears of it, unless its root already ended (`settle`).
+        if !captured {
+            task.end();
+        }
         if let Some(t) = task.teardown.take() {
             t(captured);
         }
@@ -1270,6 +1294,9 @@ impl ChildExec {
             }
         }
         if !task.root_unwound() {
+            // #1936 — the domain ends with its root, as the oracle's does, so its powerbox hears
+            // of it now, while the task still counts as live.
+            task.end();
             task.done.publish(result, trap, self.domain());
         }
         if let Some(d) = self.domain() {

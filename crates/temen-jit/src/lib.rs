@@ -113,9 +113,9 @@ mod os_thread_rt;
 // only; the loom futex model has no regions (`futex_key_of` is `Anon`-only there).
 #[cfg(not(loom))]
 pub use os_thread_rt::{
-    outside_waker, park_host_call, region_canon_forget_window, region_canon_lookup,
-    region_canon_new_owner, region_canon_record, wait_outside, wake_host_parks, wake_host_parks_in,
-    wake_on_run_event, FreezeWatch, HostPark, Parks,
+    notify_region, notify_region_in, outside_waker, park_host_call, region_canon_forget_window,
+    region_canon_lookup, region_canon_new_owner, region_canon_record, wait_outside,
+    wake_host_parks, wake_host_parks_in, wake_on_run_event, FreezeWatch, HostPark, Parks,
 };
 
 /// F3 (FIBER_PARK.md): whether a guest fiber is the current continuation on this OS thread —
@@ -1171,6 +1171,14 @@ pub type WindowReady = unsafe extern "C" fn(
 pub type ChildBudgetNode =
     unsafe fn(child_ctx: *mut core::ffi::c_void) -> Option<std::sync::Arc<dyn BudgetNode>>;
 
+/// #1936 — a detached child's domain has ended: its root returned or trapped, or a kill or its fuel
+/// ended it, and no freeze captured it. Called once for a child that ran, with its powerbox (a
+/// [`GrantChild::ctx`]), when its root ends: before the child leaves the run's live count and before
+/// its join sees the end. What the end wakes (its end post's waiters) is runnable by then, so none
+/// of them is read as deadlocked, and the end lands where the oracle's does, at the root's end,
+/// even while threads the child spawned still run.
+pub type ChildEnded = unsafe extern "C" fn(child: *mut core::ffi::c_void);
+
 #[derive(Clone, Copy)]
 pub struct GrantChildHooks {
     /// PROCESS.md §5 / #1287 — build a **detached** child's powerbox: the by-name grant list, the
@@ -1183,6 +1191,8 @@ pub struct GrantChildHooks {
     pub budget_mem_take: BudgetMemTaker,
     /// #1587 — its undo for a spawn that fails after the take (see [`BudgetMemGiver`]).
     pub budget_mem_give: BudgetMemGiver,
+    /// #1936 — a detached child's domain ended (see [`ChildEnded`]).
+    pub child_ended: ChildEnded,
     /// D66 — return a reaped detached child's lane (see [`LaneGiver`]).
     pub lane_give: LaneGiver,
     /// A spawn's pre-mapped region — the host sides of one child-side `map` (see [`PremapAdmit`],
