@@ -31,7 +31,10 @@ pub fn try_each<S, T: Send, E: Send>(
             match each(&mut state, i) {
                 Ok(t) => done.push((i, t)),
                 Err(e) => {
-                    failed.fetch_min(i, Relaxed);
+                    // A compare-exchange loop, not `fetch_min`: the LLVM on-ramp, which builds this
+                    // crate into guests (temen-link), has no `atomicrmw umin`.
+                    let lower = |f: usize| (i < f).then_some(i);
+                    let _ = failed.fetch_update(Relaxed, Relaxed, lower);
                     return (done, Some((i, e)));
                 }
             }
