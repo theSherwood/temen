@@ -1103,13 +1103,13 @@ pub(crate) mod x86 {
                     if is_header[i] {
                         s.widen_against(in_st[i].as_ref());
                     }
+                    // A block's out-state is a function of its in-state (`transfer_block` is pure),
+                    // so only a block whose in-state moved is re-run: the same fixpoint, without
+                    // re-transferring every settled block each round.
                     if in_st[i].as_ref() != Some(&s) {
-                        in_st[i] = Some(s.clone());
-                        changed = true;
-                    }
-                    let o = transfer_block(&cfg.blocks[i], s, None, ctx, false);
-                    if out_st[i].as_ref() != Some(&o) {
-                        out_st[i] = Some(o);
+                        out_st[i] =
+                            Some(transfer_block(&cfg.blocks[i], s.clone(), None, ctx, false));
+                        in_st[i] = Some(s);
                         changed = true;
                     }
                 }
