@@ -40,5 +40,5 @@ done < <(grep -E '^declare ' "$CACHE/tl.legal.ll" | grep -oE '@"?[A-Za-z0-9_.$]+
 
 TR="$REPO/crates/temen-llvm/target/release/temen-llvm-translate"
 cargo build -q --release --bin temen-llvm-translate --manifest-path "$REPO/crates/temen-llvm/Cargo.toml"
-"$TR" "$CACHE/tl.legal.ll" -o "$OUT" --binary --host-page 65536 --null-guard
+"$TR" "$CACHE/tl.legal.ll" -o "$OUT" --binary --host-page 65536 --null-guard --keep main
 echo "temen-link: $OUT ($(du -h "$OUT" | cut -f1))"

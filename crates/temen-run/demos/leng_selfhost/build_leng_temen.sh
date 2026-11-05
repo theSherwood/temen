@@ -77,7 +77,8 @@ done < <(grep -E '^declare ' "$CACHE/leng.legal.ll" | grep -oE '@"?[A-Za-z0-9_.$
 echo "[3/4] temen-llvm-translate --binary ..."
 TR="$REPO/crates/temen-llvm/target/release/temen-llvm-translate"
 [ -x "$TR" ] || cargo build --release --bin temen-llvm-translate --manifest-path "$REPO/crates/temen-llvm/Cargo.toml"
-"$TR" "$CACHE/leng.legal.ll" -o "$CACHE/leng_raw.temen" --binary --host-page 65536 --null-guard
+"$TR" "$CACHE/leng.legal.ll" -o "$CACHE/leng_raw.temen" --binary --host-page 65536 --null-guard \
+  --keep main
 
 # [4/4] prep_temen gate: decode → verify (the mandatory TCB floor) → bytecode-compile → re-serialize
 # to the shipped artifact.

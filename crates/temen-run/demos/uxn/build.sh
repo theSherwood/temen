@@ -16,5 +16,6 @@ mkdir -p "$OUT"
 cc -O2 -o "$OUT/uxnasm" "$HERE/uxnasm.c"
 "$OUT/uxnasm" "$HERE/demo.tal" "$OUT/uxn_demo.rom"
 clang -O2 -emit-llvm -c -fno-vectorize -fno-slp-vectorize "$HERE/main.c" -o "$OUT/uxn.bc"
-"$TR" "$OUT/uxn.bc" -o "$OUT/uxn.temen" --host-page 65536 --null-guard
+# The page drives the reactor through `tick` (#2790: `--keep` ships only it and `main` as exports).
+"$TR" "$OUT/uxn.bc" -o "$OUT/uxn.temen" --host-page 65536 --null-guard --keep main,tick
 echo "built $OUT/uxn.temen ($(wc -c < "$OUT/uxn.temen") bytes) + $OUT/uxn_demo.rom ($(wc -c < "$OUT/uxn_demo.rom") bytes)"

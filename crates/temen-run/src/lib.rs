@@ -5612,52 +5612,11 @@ pub struct Run {
 /// predicate (#912); re-exported here for the reference host's callers.
 pub use temen_ir::is_named_powerbox_entry;
 
-/// **Demote** non-entry-point exports to diagnostic names (#907, the `.dynsym`/`.symtab` split — the
-/// `temen-strip` packaging step). Translate exports *every* defined function by its symbol name, so a
-/// shipped `.temen` carries thousands of export entries nothing ever resolves; only the ones in `keep`
-/// (plus, always, `_start`, the powerbox-entry *marker* ([`is_named_powerbox_entry`]), and
-/// `_child`, where the host's child image of the program starts ([`temen_ir::CHILD_EXPORT`])) are
-/// semantic. Each export not kept is removed from [`Module::exports`] and its name recorded in
-/// [`temen_ir::DebugInfo::func_names`] instead — the strippable, verifier-ignored §6 name waist that
-/// backtraces and the wasm-JIT emitter's name section already read — so demotion changes **no**
-/// diagnostic output, only what [`Module::resolve_export`] can reach. An existing `func_names` entry
-/// (a `-g` source name) is never overwritten. Returns the number of exports demoted.
-///
-/// Only sound as an explicit **per-artifact** choice: an embedder that calls a function by its
-/// export name (a reactor's `tick`, say) names it in `keep`, and a linking artifact must keep
-/// everything it publishes.
-pub fn demote_exports(module: &mut Module, keep: &[&str]) -> usize {
-    // `_start` (the powerbox-entry marker) and `_child` (#2219: the host builds the program's child
-    // image from it) are semantics the host resolves — always kept, never demotable to a diagnostic
-    // name. (#1094: the `__null_guard` marker is retired; the NULL guard is unconditional now, so
-    // no export needs preserving for it — a stale one in an old asset is inert.)
-    let semantic = |name: &str| name == "_start" || name == temen_ir::CHILD_EXPORT;
-    let kept: Vec<temen_ir::Export> = module
-        .exports
-        .iter()
-        .filter(|e| semantic(&e.name) || keep.contains(&e.name.as_str()))
-        .cloned()
-        .collect();
-    let demoted: Vec<temen_ir::FuncName> = module
-        .exports
-        .iter()
-        .filter(|e| !semantic(&e.name) && !keep.contains(&e.name.as_str()))
-        .map(|e| temen_ir::FuncName {
-            func: e.func,
-            name: e.name.clone(),
-        })
-        .collect();
-    let n = demoted.len();
-    if n == 0 {
-        return 0;
-    }
-    module.exports = kept;
-    let di = module.debug_info.get_or_insert_with(Default::default);
-    let named: std::collections::HashSet<u32> = di.func_names.iter().map(|f| f.func).collect();
-    di.func_names
-        .extend(demoted.into_iter().filter(|f| !named.contains(&f.func)));
-    n
-}
+/// The `temen-strip` packaging step (#907, #2790), defined once in `temen-ir` so the translator's
+/// `--keep` and `temen-strip` share it: demote the exports no host resolves
+/// ([`temen_ir::demote_exports`]), then empty the code nothing kept reaches
+/// ([`temen_ir::keep_entries`]).
+pub use temen_ir::{demote_exports, keep_entries, KeptEntries};
 
 /// The reference host's capability-import name policy (§7 "Host-defined capabilities &
 /// discoverability") — **re-exported** from `temen_ir`, where the table lives so the native runner,
