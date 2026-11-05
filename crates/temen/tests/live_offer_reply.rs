@@ -643,3 +643,75 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
     let r = run(&caller, &server(AGAIN_TYPES, AGAIN), false);
     assert_eq!(r, Ok(vec![Value::I64(1_001_008)]));
 }
+
+const REC_TYPES: &str = "type 0 func (i64, i64) -> (i64)
+type 1 interface { rec: 0 }
+export 0 interface \"rec\" 1 { rec: 1 }";
+
+/// `rec(h, n)` answers `deep(n)`, which recurses `n` deep.
+const REC: &str = r#"func (i64, i64) -> (i64) {
+block 0 (vh: i64, vn: i64) {
+  vr = call 2 (vn)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vn: i64) {
+  vz = i64.const 0
+  vlast = i64.eq vn vz
+  br_if vlast 1() 2(vn)
+}
+block 1 () {
+  vzero = i64.const 0
+  return vzero
+}
+block 2 (wn: i64) {
+  vone = i64.const 1
+  wn1 = i64.sub wn vone
+  vr = call 2 (wn1)
+  vr1 = i64.add vr vone
+  return vr1
+  }
+}
+"#;
+
+/// The caller's call of `rec(0, 100_000)`, deeper than any engine's stack lets a handler go.
+const REC_CALL: &str = r#"
+  vz = i64.const 0
+  vdepth = i64.const 100000
+  vcall = call.cap 268435456 0 (i64, i64) -> (i64) v7 (vz, vdepth)"#;
+
+/// Fiber func 1 for [`IN_A_FIBER`]: the same call, from inside a fiber.
+const REC_FIBER: &str = r#"
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, voff: i64) {
+  v7 = i32.wrap_i64 voff
+  vz = i64.const 0
+  vdepth = i64.const 100000
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) v7 (vz, vdepth)
+  return vr
+  }
+}
+"#;
+
+/// #2793 — a handler that recurses past its stack traps `StackOverflow` on every engine, so the
+/// callee dies and the call answers `CAP_REVOKED`. The serving child is a pool task on the JIT, so
+/// its handler runs on the task's fiber stack, which has no guard page: the prologue check is its
+/// only defense, and it used to be inert there. The process died with SIGSEGV.
+#[test]
+fn a_handler_recursing_past_its_stack_traps() {
+    let r = run(&caller(REC_CALL, ""), &server(REC_TYPES, REC), false);
+    assert_eq!(r, Ok(vec![Value::I64(CAP_REVOKED)]));
+}
+
+/// #2793 — the same, the call made from a caller's fiber with direct handoff on: a handoff runs the
+/// handler on the caller fiber's own stack, where the check must hold too.
+#[test]
+fn a_handler_recursing_past_its_stack_traps_under_handoff_from_a_fiber() {
+    let r = run(
+        &caller(IN_A_FIBER, REC_FIBER),
+        &server(REC_TYPES, REC),
+        true,
+    );
+    assert_eq!(r, Ok(vec![Value::I64(CAP_REVOKED)]));
+}

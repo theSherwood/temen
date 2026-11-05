@@ -1592,6 +1592,22 @@ pub(crate) fn in_task() -> bool {
     !rt.is_null() && unsafe { (*rt).runs_task() }
 }
 
+/// #2793 — the low bound of the fiber stack `sp` is on, when that is the innermost running fiber's
+/// (a pool task's, or a guest fiber's): the limit its own entry passes its prologue checks. `None`
+/// off every running fiber, as on an OS thread's own stack.
+pub(crate) fn running_stack_low(sp: u64) -> Option<u64> {
+    let rt = current();
+    if rt.is_null() {
+        return None;
+    }
+    // SAFETY: `current()` is this thread's live runtime and the borrow is momentary; a yielder on
+    // its stack is a live resume's, so the control block it reads is too.
+    let low = unsafe { (*(*rt).yielders.last().copied()?).stack_low() };
+    // The running fiber's stack holds `sp` when `sp` is above its low bound and within one stack of
+    // it: no fiber stack is larger than `temen_fiber`'s slot.
+    (sp > low && sp - low <= temen_ir::FIBER_STACK).then_some(low)
+}
+
 pub(crate) fn current_fiber_slot() -> Option<Arc<FiberSlot>> {
     let rt = current();
     if rt.is_null() {
